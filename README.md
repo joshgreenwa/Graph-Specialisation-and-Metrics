@@ -23,6 +23,11 @@ The first component is a ZINC test case with four training notebooks and extract
 - `experiments/zinc/training/csa_zinc_core.py`
 - `experiments/zinc/training/graphgps_zinc_core.py`
 
+The repository also includes controlled synthetic graph tasks:
+
+- `experiments/synthetic/training/marked_tree_path_graphgps.py`
+- `experiments/synthetic/training/structural_symbolic_graphgps.py`
+
 ## Repository Layout
 
 ```text
@@ -31,6 +36,8 @@ The first component is a ZINC test case with four training notebooks and extract
 ├── data/                        # Dataset notes and optional small metadata files
 ├── docs/                        # Project notes and design docs
 ├── experiments/
+│   ├── synthetic/
+│   │   └── training/            # Controlled synthetic task runners
 │   └── zinc/
 │       ├── notebooks/           # Original ZINC notebooks
 │       └── training/            # Extracted scripts from the notebooks

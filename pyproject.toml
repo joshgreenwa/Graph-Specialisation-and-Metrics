@@ -20,6 +20,9 @@ dev = [
   "pytest",
   "ruff",
 ]
+graphbench = [
+  "graphbench-lib",
+]
 
 [tool.ruff]
 line-length = 100

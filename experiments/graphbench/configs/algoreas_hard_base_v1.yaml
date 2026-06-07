@@ -1,0 +1,344 @@
+run:
+  name: graphbench_algoreas_hard_base_v1
+  purpose: interp_base_models_not_full_benchmark_replication
+  active_phase: base_training_only
+  hardware: single_a100_80gb
+  budget_hours: 100_to_150
+  runner: experiments/graphbench/training/official_algoreas_screen_colab.py
+  model_seeds: [0, 1, 2, 3]
+  split_seed: 0
+  default_tasks:
+    - bipartite_matching_hard
+    - flow_hard
+    - mst_hard
+    - maxclique_hard
+    - bridges_hard
+  run_order:
+    - graphormer
+    - graphgps
+    - static_grit
+    - grit
+    - gatedgcn_plus
+    - gin_plus
+    - gcn_plus
+  forbidden_during_base_run:
+    - lr_sweep
+    - size_generalisation
+    - posthoc_feature_changes
+    - changing_model_width_after_results
+
+dataset:
+  graph_format: original_graph
+  edge_token_transform: false
+  difficulty: hard
+  source: official_graphbench_loader
+  train:
+    num_graphs: 40000
+    num_nodes: 16
+    generator_weights: {ER: 1.0, PC: 0.0, NWS: 0.0, BA: 0.0, DBA: 0.0, SBM: 0.0}
+  val:
+    num_graphs: 4000
+    num_nodes: 128
+    generator_weights: {ER: 0.0, PC: 0.2, NWS: 0.2, BA: 0.2, DBA: 0.2, SBM: 0.2}
+  test:
+    num_graphs: 8000
+    num_nodes: 128
+    generator_weights: {ER: 0.0, PC: 0.2, NWS: 0.2, BA: 0.2, DBA: 0.2, SBM: 0.2}
+  cache:
+    cache_converted_graphs: true
+    cache_pe_tensors_on_disk: true
+    pe_cache_dtype: float32
+    pe_cache_root: user_supplied_hpc_or_drive_path
+    pe_tensors_computed_in_collate: fallback_only
+    training_jobs_attach_pe_for_splits: [train, val]
+    final_eval_jobs_attach_pe_for_splits: [train, val, test]
+    reuse_same_splits_across_model_seeds: true
+    precompute_command: >-
+      python experiments/graphbench/training/official_algoreas_screen_colab.py
+      --precompute-pe-only --tasks bipartite_matching_hard,flow_hard,mst_hard,maxclique_hard,bridges_hard
+      --pe-cache-root ${PE_CACHE_ROOT}
+      --device cpu --allow-cpu
+
+tasks:
+  mst:
+    graphbench_id: mst_hard
+    type: edge_binary
+    primary_metric: f1
+    train_generator_params: graphbench_table_19_mst
+    val_test_generator_params: graphbench_table_19_mst_shift
+    edge_features: [edge_weight]
+    node_features: constant_node_type
+  maxclique:
+    graphbench_id: maxclique_hard
+    type: node_binary
+    primary_metric: f1
+    generator_params: graphbench_table_19_max_clique
+    edge_features: [adjacency]
+    node_features: constant_node_type
+  flow:
+    graphbench_id: flow_hard
+    type: graph_regression
+    primary_metric: raw_mae
+    secondary_metrics: [target_z_mae, relative_mae]
+    generator_params: graphbench_table_19_flow
+    edge_features: [directed_capacity_or_weight]
+    node_features: source_sink_role_if_not_already_supplied
+  bipartite_matching:
+    graphbench_id: bipartite_matching_hard
+    report_name: max_matching
+    type: edge_binary
+    primary_metric: f1
+    generator_params: graphbench_table_19_max_matching
+    edge_features: [adjacency]
+    node_features: bipartition_indicator_if_supplied_or_derivable
+  bridges:
+    graphbench_id: bridges_hard
+    type: edge_binary
+    primary_metric: f1
+    generator_params: graphbench_table_19_bridges
+    edge_features: [adjacency]
+    node_features: constant_node_type
+
+preprocessing:
+  topology_for_rwse_rrwp: symmetrized_adjacency
+  directed_edge_attributes: preserve_ordered_pairs_for_flow
+  continuous_edge_attr_normalization:
+    method: train_split_zscore
+    fit_on: present_train_edges_only
+    apply_to: [train, val, test]
+  flow_target_normalization_for_loss:
+    method: train_split_zscore
+    report_metrics_in_raw_units: true
+  rwse:
+    steps: 16
+    external_zscore: false
+    encoder_raw_norm: model_native_batchnorm
+  rrwp:
+    steps: 16
+    include_identity_power: true
+    external_zscore: false
+  spd:
+    graphormer_only: true
+    num_spatial: 512
+    spatial_pos_max: 1024
+    multi_hop_max_dist: 5
+  pe_policy:
+    graphormer: native_degree_spd_multihop_edge_bias
+    graphgps: rwse16_node_pe
+    grit: rrwp16_relative_pair_pe_no_spd
+    static_grit: rrwp16_relative_pair_pe_no_spd
+    gnn_plus: rwse16_node_pe
+  pe_fairness_rationale:
+    graphormer: use_model_native_structural_biases_because_RWSE_RRWP_would_not_be_native
+    graphgps: use_RWSE16_because_it_is_standard_GPS_node_PE_and_shared_with_GNN_plus
+    grit: use_RRWP16_because_GRIT_is_defined_around_relative_pair_PE_no_extra_SPD
+    static_grit: use_same_RRWP16_as_GRIT_to_isolate_pair_state_evolution
+    gnn_plus: use_RWSE16_shared_with_GraphGPS_as_node_PE
+
+training:
+  optimizer: AdamW
+  betas: [0.9, 0.999]
+  weight_decay: 0.1
+  dropout: 0.1
+  attention_dropout: 0.1
+  train_batch_size:
+    graphormer: 1024
+    graphgps: 1024
+    grit: 1024
+    static_grit: 1024
+    gcn_plus: 1024
+    gin_plus: 1024
+    gatedgcn_plus: 1024
+  max_steps: 5000
+  effective_train_graph_exposures: 5120000
+  approximate_train_passes_over_40k_split: 128
+  warmup_steps: 500
+  scheduler: cosine_decay_to_zero
+  grad_clip_norm: 1.0
+  precision: bf16_mixed
+  early_stopping:
+    mode: checkpoint_selection_only_no_training_truncation
+    rationale: fixed_step_budget_is_fairer_than_model_dependent_early_termination
+  checkpointing:
+    eval_watch_subset_size: 1000
+    eval_watch_subset: deterministic_subset_of_hard_validation
+    eval_every_steps: 500
+    eligible_checkpoint_steps: [2500, 3000, 3500, 4000, 4500, 5000]
+    save_major_checkpoints: true
+    select_best_by: primary_val_metric_on_watch_subset
+    final_eval: disabled_during_base_training_run_later_from_checkpoints
+  eval_batch_size:
+    graphormer: 128
+    graphgps: 64
+    grit: 32
+    static_grit: 32
+    gcn_plus: 256
+    gin_plus: 256
+    gatedgcn_plus: 256
+  concise_logging:
+    every_eval: [step, epoch, lr, train_loss, watch_primary, watch_loss, elapsed, steps_per_second, graphs_per_second, peak_cuda_memory_gb]
+
+learning_rates:
+  default_policy: fair_family_fixed
+  rationale: avoids_task_or_model_specific_LR_cherry_picking_under_matched_model_sizes
+  fair_family_fixed:
+    graph_transformer_family:
+      models: [graphormer, graphgps, static_grit, grit]
+      lr: 2.0e-4
+    gnn_plus_family:
+      models: [gcn_plus, gin_plus, gatedgcn_plus]
+      lr: 1.0e-3
+  graphbench_reference_table_available_with_runner_flag: --lr-policy graphbench_table
+  graphbench_reference_table:
+    graph_transformer_family:
+      graphormer: {mst: 3.0e-4, maxclique: 1.0e-4, flow: 1.0e-4, bipartite_matching: 1.0e-4, bridges: 1.0e-4}
+      graphgps: {mst: 3.0e-4, maxclique: 1.0e-4, flow: 1.0e-4, bipartite_matching: 1.0e-4, bridges: 1.0e-4}
+      grit: {mst: 3.0e-4, maxclique: 1.0e-4, flow: 1.0e-4, bipartite_matching: 1.0e-4, bridges: 1.0e-4}
+      static_grit: {mst: 3.0e-4, maxclique: 1.0e-4, flow: 1.0e-4, bipartite_matching: 1.0e-4, bridges: 1.0e-4}
+    gnn_plus_family:
+      gcn_plus: {mst: 2.0e-3, maxclique: 1.0e-3, flow: 2.0e-3, bipartite_matching: 1.0e-3, bridges: 1.0e-3}
+      gin_plus: {mst: 2.0e-3, maxclique: 1.0e-3, flow: 2.0e-3, bipartite_matching: 1.0e-3, bridges: 1.0e-3}
+      gatedgcn_plus: {mst: 2.0e-3, maxclique: 1.0e-3, flow: 2.0e-3, bipartite_matching: 2.0e-3, bridges: 1.0e-3}
+
+models:
+  parameter_matching:
+    target: about_2p2m_trainable_parameters
+    mean_trainable_parameters: 2222288
+    max_deviation_from_mean: 4.4_percent
+    fixed_controls: [layers, attention_heads_for_GT, dropout, PE_policy, optimizer, LR_table]
+  common_gt_controls:
+    layers: 6
+    attention_heads: 8
+    activation: gelu
+    residual: true
+    dropout: 0.1
+    attention_dropout: 0.1
+    ffn_multiplier: 4
+  graphormer:
+    inherits: common_gt_controls
+    d_model: 160
+    head_dim: 20
+    ffn_dim: 640
+    trainable_parameters: 2126213
+    norm_style: graphormer_pre_layernorm_in_local_runner
+    graph_token: true
+    centrality_encoding: in_degree_and_out_degree
+    attention_bias:
+      spd_embedding: true
+      num_spatial: 512
+      spatial_pos_max: 1024
+      edge_type: multi_hop
+      num_edge_dis: 128
+      multi_hop_max_dist: 5
+      direct_edge_attr_bias: linear_to_heads
+    node_pe: none
+    rrwp: false
+    rwse: false
+  graphgps:
+    inherits: common_gt_controls
+    d_model: 128
+    head_dim: 16
+    ffn_dim: 512
+    trainable_parameters: 2222379
+    norm_style: graphgps_batchnorm_style
+    local_branch: gatedgcn
+    global_branch: full_attention
+    node_pe: rwse16
+    pe_encoder: {raw_norm: batchnorm, layers: 2, dim_pe: 128}
+    edge_attr_in_local_branch: true
+    pair_bias_in_global_attention: false
+  grit:
+    inherits: common_gt_controls
+    d_model: 112
+    head_dim: 14
+    ffn_dim: 448
+    pair_dim: 112
+    trainable_parameters: 2232773
+    norm_style: grit_batchnorm_style
+    node_pe: none
+    relative_pair_pe: rrwp16
+    include_spd: false
+    include_degree_scalers: true
+    norm_style: batchnorm_style
+    pair_value_transport: true
+    pair_state_evolution: true
+    edge_attr_pair_input: true
+  static_grit:
+    inherits: grit
+    d_model: 168
+    head_dim: 21
+    ffn_dim: 672
+    pair_dim: 168
+    trainable_parameters: 2288381
+    pair_state_evolution: false
+    pair_state: fixed_encoded_rrwp_plus_edge_attr_reused_each_layer
+  common_gnn_plus_controls:
+    layers: 6
+    activation: relu
+    residual: true
+    ffn: true
+    dropout: 0.1
+    node_pe: rwse16
+    norm_style: graphbench_algorithmic_gnnplus_layernorm
+    edge_feature_integration: true
+  gcn_plus:
+    inherits: common_gnn_plus_controls
+    hidden_dim: 240
+    ffn_dim: 480
+    pe_encoder: {raw_norm: batchnorm, layers: 2, dim_pe: 240}
+    trainable_parameters: 2244533
+    message_passing: gcn_with_edge_feature_integration
+  gin_plus:
+    inherits: common_gnn_plus_controls
+    hidden_dim: 224
+    ffn_dim: 448
+    pe_encoder: {raw_norm: batchnorm, layers: 2, dim_pe: 224}
+    trainable_parameters: 2258571
+    message_passing: gin
+    gin_mlp_layers: 2
+    epsilon: trainable
+  gatedgcn_plus:
+    inherits: common_gnn_plus_controls
+    hidden_dim: 184
+    ffn_dim: 368
+    pe_encoder: {raw_norm: batchnorm, layers: 2, dim_pe: 184}
+    trainable_parameters: 2183165
+    message_passing: residual_gated_gcn
+    edge_state_updates: true
+
+implementation_fidelity:
+  graphormer:
+    required_before_paper_claims:
+      - verify_or_implement_true_multi_hop_edge_encoding_if_claiming_full_Graphormer
+      - otherwise_report_as_Graphormer_style_SPD_degree_direct_edge_bias
+  gnn_plus:
+    target: faithful_GNN_plus_controls_from_official_implementation_where_possible
+    components_required: [edge_features, normalization, dropout, residual_connections, FFN, positional_encoding]
+    local_runner_notes:
+      - GIN_plus_uses_trainable_epsilon
+      - GNN_plus_layers_are_compact_algorithmic_adaptations_and_must_be_cross_checked_against_official_GNNPlus_before_final_paper_wording
+    final_paper_wording_if_not_cross_checked: GNN_plus_style_controls
+
+slurm:
+  execution_unit: one_task_one_model_one_seed
+  precompute_pe_first: true
+  print_jobs_command: >-
+    python experiments/graphbench/training/official_algoreas_screen_colab.py --print-jobs
+  single_job_command: >-
+    python experiments/graphbench/training/official_algoreas_screen_colab.py
+    --array-index ${SLURM_ARRAY_TASK_ID}
+    --dataset-root ${DATASET_ROOT}
+    --pe-cache-root ${PE_CACHE_ROOT}
+    --output-root ${OUTPUT_ROOT}
+    --no-build-missing-pe-cache
+    --require-pe-cache
+  optional_final_eval_command: >-
+    python experiments/graphbench/training/official_algoreas_screen_colab.py
+    --array-index ${SLURM_ARRAY_TASK_ID}
+    --dataset-root ${DATASET_ROOT}
+    --pe-cache-root ${PE_CACHE_ROOT}
+    --output-root ${OUTPUT_ROOT}
+    --no-build-missing-pe-cache
+    --require-pe-cache
+    --final-eval
+  size_generalisation: disabled_for_base_training_run_run_later_from_saved_checkpoints

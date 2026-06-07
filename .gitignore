@@ -28,6 +28,7 @@ data/**/*.pth
 outputs/
 runs/
 wandb/
+experiments/**/results/
 
 # Keep documentation placeholders
 !checkpoints/**/README.md
