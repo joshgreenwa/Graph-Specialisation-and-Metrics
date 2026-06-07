@@ -8,11 +8,11 @@
 
 set -euo pipefail
 
-: "${PROJECT_ROOT:?Set PROJECT_ROOT to the repository root}"
-: "${GRAPHBENCH_OUTPUT_ROOT:?Set GRAPHBENCH_OUTPUT_ROOT to the shared output/checkpoint directory}"
+PROJECT_ROOT="${PROJECT_ROOT:-/rds/user/jgg45/hpc-work/graphbench-algoreas-hpc}"
+GRAPHBENCH_OUTPUT_ROOT="${GRAPHBENCH_OUTPUT_ROOT:-/rds/user/jgg45/hpc-work/graphbench-algoreas-hpc/outputs}"
 
 cd "${PROJECT_ROOT}"
-mkdir -p logs
+mkdir -p logs "${GRAPHBENCH_OUTPUT_ROOT}"
 
 if [[ -n "${ENV_ACTIVATE:-}" ]]; then
   # shellcheck disable=SC1090

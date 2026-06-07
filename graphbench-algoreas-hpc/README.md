@@ -22,13 +22,16 @@ env.example
 Set these before submitting jobs:
 
 ```bash
-export PROJECT_ROOT=/path/to/graphbench-algoreas-hpc
-export GRAPHBENCH_DATASET_ROOT=/path/to/graphbench_datasets
-export GRAPHBENCH_PE_CACHE_ROOT=/path/to/graphbench_pe_cache
-export GRAPHBENCH_OUTPUT_ROOT=/path/to/graphbench_outputs
+export PROJECT_ROOT=/rds/user/jgg45/hpc-work/graphbench-algoreas-hpc
+export GRAPHBENCH_DATASET_ROOT=/rds/user/jgg45/hpc-work/graphbench-algoreas-hpc/datasets
+export GRAPHBENCH_PE_CACHE_ROOT=/rds/user/jgg45/hpc-work/graphbench-algoreas-hpc/pe_cache
+export GRAPHBENCH_OUTPUT_ROOT=/rds/user/jgg45/hpc-work/graphbench-algoreas-hpc/outputs
 export ENV_ACTIVATE=/path/to/venv_or_conda_activate_script  # optional
 export GRAPHBENCH_NUM_WORKERS=4
 ```
+
+The SLURM scripts use these RDS paths as defaults, so exporting them is only
+needed if you want to override the default locations.
 
 The environment must already provide `torch`, `graphbench-lib`, and the usual
 scientific Python stack. The runner does not install packages inside jobs.

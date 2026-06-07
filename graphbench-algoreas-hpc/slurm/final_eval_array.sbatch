@@ -10,13 +10,13 @@
 
 set -euo pipefail
 
-: "${PROJECT_ROOT:?Set PROJECT_ROOT to the repository root}"
-: "${GRAPHBENCH_DATASET_ROOT:?Set GRAPHBENCH_DATASET_ROOT to the shared GraphBench data/cache directory}"
-: "${GRAPHBENCH_PE_CACHE_ROOT:?Set GRAPHBENCH_PE_CACHE_ROOT to the precomputed PE cache directory}"
-: "${GRAPHBENCH_OUTPUT_ROOT:?Set GRAPHBENCH_OUTPUT_ROOT to the shared output/checkpoint directory}"
+PROJECT_ROOT="${PROJECT_ROOT:-/rds/user/jgg45/hpc-work/graphbench-algoreas-hpc}"
+GRAPHBENCH_DATASET_ROOT="${GRAPHBENCH_DATASET_ROOT:-/rds/user/jgg45/hpc-work/graphbench-algoreas-hpc/datasets}"
+GRAPHBENCH_PE_CACHE_ROOT="${GRAPHBENCH_PE_CACHE_ROOT:-/rds/user/jgg45/hpc-work/graphbench-algoreas-hpc/pe_cache}"
+GRAPHBENCH_OUTPUT_ROOT="${GRAPHBENCH_OUTPUT_ROOT:-/rds/user/jgg45/hpc-work/graphbench-algoreas-hpc/outputs}"
 
 cd "${PROJECT_ROOT}"
-mkdir -p logs
+mkdir -p logs "${GRAPHBENCH_DATASET_ROOT}" "${GRAPHBENCH_PE_CACHE_ROOT}" "${GRAPHBENCH_OUTPUT_ROOT}"
 
 if [[ -n "${ENV_ACTIVATE:-}" ]]; then
   # shellcheck disable=SC1090
