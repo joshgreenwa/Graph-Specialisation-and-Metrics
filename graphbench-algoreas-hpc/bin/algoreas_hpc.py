@@ -1639,7 +1639,7 @@ class GatedGCNPlusModel(PaperGNNPlusModel):
         super().__init__(cfg, PaperGatedGCNPlusLayer, use_edge_head=True)
 
 
-def add_external_repo_path(env_name: str, candidates: Sequence[str]) -> None:
+def external_repo_paths(env_name: str, candidates: Sequence[str]) -> list[Path]:
     paths: list[Path] = []
     env_value = os.environ.get(env_name)
     if env_value:
@@ -1647,6 +1647,22 @@ def add_external_repo_path(env_name: str, candidates: Sequence[str]) -> None:
     project_root = Path(os.environ.get("PROJECT_ROOT", Path(__file__).resolve().parents[1])).expanduser()
     for candidate in candidates:
         paths.append(project_root / "external" / candidate)
+    return paths
+
+
+def resolve_external_repo_path(env_name: str, candidates: Sequence[str]) -> Path:
+    paths = external_repo_paths(env_name, candidates)
+    for path in paths:
+        if path.exists():
+            return path.resolve()
+    raise RuntimeError(
+        f"Official repository for {env_name} was not found. Checked: "
+        + ", ".join(str(path) for path in paths)
+    )
+
+
+def add_external_repo_path(env_name: str, candidates: Sequence[str]) -> None:
+    paths = external_repo_paths(env_name, candidates)
     for path in paths:
         if path.exists():
             text = str(path.resolve())
@@ -1663,6 +1679,25 @@ def require_official_import(module_name: str, package_hint: str):
             f"Install or expose {package_hint} in this environment, then rerun "
             "bin/check_official_backends.py for the selected models."
         ) from exc
+
+
+def require_official_file_module(module_name: str, path: Path):
+    path = path.resolve()
+    if module_name in sys.modules:
+        return sys.modules[module_name]
+    if not path.exists():
+        raise RuntimeError(f"Official backend file is missing: {path}")
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Could not load official backend file: {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception:
+        sys.modules.pop(module_name, None)
+        raise
+    return module
 
 
 def ensure_graphgym_cfg_group(cfg_obj, name: str):
@@ -1863,23 +1898,36 @@ class PyGPredictionHeads(nn.Module):
 class OfficialGNNPlusModel(nn.Module):
     def __init__(self, cfg: ScreenConfig, model_name: str) -> None:
         super().__init__()
-        add_external_repo_path("GNNPLUS_ROOT", ("GNNPlus", "tunedGNN-G"))
+        gnnplus_root = resolve_external_repo_path("GNNPLUS_ROOT", ("GNNPlus",))
+        gnnplus_pkg = gnnplus_root / "GNNPlus" if (gnnplus_root / "GNNPlus").exists() else gnnplus_root
         dim = cfg.gnn_hidden_dim
         dim_pe = min(64, max(16, dim // 2))
         configure_gnnplus_graphgym(cfg, dim_pe)
-        rwse_mod = require_official_import("GNNPlus.encoder.kernel_pos_encoder", "official GNN+ repository")
+        rwse_mod = require_official_file_module(
+            "_official_gnnplus_kernel_pos_encoder",
+            gnnplus_pkg / "encoder" / "kernel_pos_encoder.py",
+        )
         if model_name == "gcn_plus":
-            layer_mod = require_official_import("GNNPlus.layer.gcn_conv_layer", "official GNN+ repository")
+            layer_mod = require_official_file_module(
+                "_official_gnnplus_gcn_conv_layer",
+                gnnplus_pkg / "layer" / "gcn_conv_layer.py",
+            )
             layer_cls = layer_mod.GCNConvLayer
             self.uses_edge_attr = False
             self.uses_edge_state_head = False
         elif model_name == "gin_plus":
-            layer_mod = require_official_import("GNNPlus.layer.gine_conv_layer", "official GNN+ repository")
+            layer_mod = require_official_file_module(
+                "_official_gnnplus_gine_conv_layer",
+                gnnplus_pkg / "layer" / "gine_conv_layer.py",
+            )
             layer_cls = layer_mod.GINEConvLayer
             self.uses_edge_attr = True
             self.uses_edge_state_head = False
         elif model_name == "gatedgcn_plus":
-            layer_mod = require_official_import("GNNPlus.layer.gatedgcn_layer", "official GNN+ repository")
+            layer_mod = require_official_file_module(
+                "_official_gnnplus_gatedgcn_layer",
+                gnnplus_pkg / "layer" / "gatedgcn_layer.py",
+            )
             layer_cls = layer_mod.GatedGCNLayer
             self.uses_edge_attr = True
             self.uses_edge_state_head = True

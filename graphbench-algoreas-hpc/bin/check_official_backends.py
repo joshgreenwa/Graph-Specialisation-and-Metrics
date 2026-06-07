@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import importlib
+import json
 import os
 import subprocess
 import sys
@@ -56,6 +57,38 @@ def check_import(module_name: str) -> CheckResult:
         return CheckResult(module_name, True, str(version))
     except Exception as exc:
         return CheckResult(module_name, False, f"{type(exc).__name__}: {exc}")
+
+
+def check_file_import(label: str, path: Path) -> CheckResult:
+    if not path.exists():
+        return CheckResult(label, False, f"missing: {path}")
+    code = """
+import importlib.util
+import json
+import sys
+path = sys.argv[1]
+name = sys.argv[2]
+spec = importlib.util.spec_from_file_location(name, path)
+if spec is None or spec.loader is None:
+    raise RuntimeError(f"could not load spec for {path}")
+module = importlib.util.module_from_spec(spec)
+sys.modules[name] = module
+spec.loader.exec_module(module)
+print(json.dumps({"ok": True}))
+"""
+    try:
+        out = subprocess.check_output(
+            [sys.executable, "-c", code, str(path), f"_preflight_{label.replace('.', '_')}"],
+            text=True,
+            stderr=subprocess.STDOUT,
+        )
+        detail = json.loads(out.strip().splitlines()[-1])
+        return CheckResult(label, bool(detail["ok"]), str(path))
+    except subprocess.CalledProcessError as exc:
+        lines = (exc.output or "").strip().splitlines()
+        return CheckResult(label, False, lines[-1] if lines else f"exit code {exc.returncode}")
+    except Exception as exc:
+        return CheckResult(label, False, f"{type(exc).__name__}: {exc}")
 
 
 def add_path(path: Path) -> None:
@@ -128,14 +161,15 @@ def check_grit(path: Path) -> list[CheckResult]:
 
 def check_gnnplus(path: Path) -> list[CheckResult]:
     results = check_repo("gnnplus", path, EXPECTED_COMMITS["gnnplus"])
-    add_path(path)
-    for module_name in [
-        "GNNPlus.encoder.kernel_pos_encoder",
-        "GNNPlus.layer.gcn_conv_layer",
-        "GNNPlus.layer.gine_conv_layer",
-        "GNNPlus.layer.gatedgcn_layer",
-    ]:
-        results.append(check_import(module_name))
+    pkg = path / "GNNPlus" if (path / "GNNPlus").exists() else path
+    file_checks = {
+        "GNNPlus.encoder.kernel_pos_encoder": pkg / "encoder" / "kernel_pos_encoder.py",
+        "GNNPlus.layer.gcn_conv_layer": pkg / "layer" / "gcn_conv_layer.py",
+        "GNNPlus.layer.gine_conv_layer": pkg / "layer" / "gine_conv_layer.py",
+        "GNNPlus.layer.gatedgcn_layer": pkg / "layer" / "gatedgcn_layer.py",
+    }
+    for label, file_path in file_checks.items():
+        results.append(check_file_import(label, file_path))
     return results
 
 
