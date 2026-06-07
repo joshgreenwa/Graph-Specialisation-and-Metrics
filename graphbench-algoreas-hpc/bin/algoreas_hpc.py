@@ -16,6 +16,7 @@ import math
 import multiprocessing
 import os
 import random
+import shutil
 import sys
 import time
 from collections import defaultdict, deque
@@ -500,6 +501,61 @@ def pe_cache_path(root: Path, namespace: str, task_name: str, split: str, size: 
     return root / RUN_VERSION / namespace / f"{task_name}_{split}_n{size}_seed{seed}_rw{RW_STEPS}_rrwp{RRWP_STEPS}_{dtype_name}.pt"
 
 
+def pe_partial_cache_dir(path: Path) -> Path:
+    return path.with_name(path.name + ".parts")
+
+
+def atomic_torch_save(payload: Mapping[str, object], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f"{path.name}.tmp.{os.getpid()}.{time.time_ns()}")
+    torch.save(dict(payload), tmp_path)
+    os.replace(tmp_path, path)
+
+
+def load_partial_pe_items(
+    part_dir: Path,
+    dataset_len: int,
+    task_name: str,
+    split: str,
+    dtype_name: str,
+    log=print,
+) -> list[Optional[dict[str, torch.Tensor]]]:
+    pe_items: list[Optional[dict[str, torch.Tensor]]] = [None] * dataset_len
+    if not part_dir.exists():
+        return pe_items
+    loaded = 0
+    for part_path in sorted(part_dir.glob("part_*.pt")):
+        try:
+            payload = torch.load(part_path, map_location="cpu", weights_only=False)
+        except Exception as exc:
+            log(f"[pe] Ignoring unreadable partial PE shard {part_path}: {exc}")
+            continue
+        if not isinstance(payload, Mapping):
+            continue
+        if (
+            payload.get("version") != RUN_VERSION
+            or payload.get("task") != task_name
+            or payload.get("split") != split
+            or payload.get("dtype") != dtype_name
+        ):
+            continue
+        indices = payload.get("indices")
+        part_pe = payload.get("pe")
+        if not isinstance(indices, Sequence) or not isinstance(part_pe, Sequence) or len(indices) != len(part_pe):
+            continue
+        for raw_idx, item in zip(indices, part_pe):
+            idx = int(raw_idx)
+            if idx < 0 or idx >= dataset_len or pe_items[idx] is not None:
+                continue
+            if not isinstance(item, Mapping):
+                continue
+            pe_items[idx] = {"spd": item["spd"], "rwse": item["rwse"], "rrwp": item["rrwp"]}
+            loaded += 1
+    if loaded:
+        log(f"[pe] Resumed {loaded}/{dataset_len} graphs from partial shards in {part_dir}")
+    return pe_items
+
+
 def load_pe_cache(
     path: Path,
     dataset: OfficialGraphDataset,
@@ -524,43 +580,101 @@ def load_pe_cache(
     return OfficialGraphDataset(graphs, task_name=dataset.task_name, split=dataset.split)
 
 
-def save_pe_cache(path: Path, dataset: OfficialGraphDataset, dtype_name: str, pe_workers: int = 1, log=print) -> OfficialGraphDataset:
+def save_pe_cache(
+    path: Path,
+    dataset: OfficialGraphDataset,
+    dtype_name: str,
+    pe_workers: int = 1,
+    pe_save_every: int = 500,
+    log=print,
+) -> OfficialGraphDataset:
     dtype = pe_dtype_from_name(dtype_name)
     path.parent.mkdir(parents=True, exist_ok=True)
+    part_dir = pe_partial_cache_dir(path)
     graphs: list[Optional[OfficialGraph]] = [None] * len(dataset)
-    pe_items: list[Optional[dict[str, torch.Tensor]]] = [None] * len(dataset)
+    pe_items = load_partial_pe_items(part_dir, len(dataset), dataset.task_name, dataset.split, dtype_name, log=log)
+    for idx, item in enumerate(pe_items):
+        if item is not None:
+            graphs[idx] = graph_with_pe(dataset.graphs[idx], item["spd"], item["rwse"], item["rrwp"])
+    missing_items = [(idx, graph) for idx, graph in enumerate(dataset.graphs) if pe_items[idx] is None]
     start = time.time()
     progress_every = max(1000, len(dataset) // 10)
+    pe_save_every = max(1, int(pe_save_every))
     pe_workers = max(1, int(pe_workers))
-    log(f"[pe] Building {dataset.task_name}/{dataset.split} PE cache with pe_workers={pe_workers}")
+    log(
+        f"[pe] Building {dataset.task_name}/{dataset.split} PE cache with "
+        f"pe_workers={pe_workers} pe_save_every={pe_save_every} "
+        f"missing={len(missing_items)}/{len(dataset)}"
+    )
+    pending_indices: list[int] = []
+    pending_pe_items: list[dict[str, torch.Tensor]] = []
+
+    def flush_partial() -> None:
+        if not pending_indices:
+            return
+        first = min(pending_indices)
+        last = max(pending_indices)
+        part_path = part_dir / f"part_{time.time_ns()}_{first}_{last}_{len(pending_indices)}.pt"
+        atomic_torch_save(
+            {
+                "version": RUN_VERSION,
+                "task": dataset.task_name,
+                "split": dataset.split,
+                "dtype": dtype_name,
+                "rw_steps": RW_STEPS,
+                "rrwp_steps": RRWP_STEPS,
+                "indices": list(pending_indices),
+                "pe": list(pending_pe_items),
+            },
+            part_path,
+        )
+        log(f"[pe] Saved partial shard {part_path} ({len(pending_indices)} graphs)")
+        pending_indices.clear()
+        pending_pe_items.clear()
+
+    completed_at_start = len(dataset) - len(missing_items)
+    completed = completed_at_start
     if pe_workers == 1:
         iterator = (
             (idx, *compute_graph_pe(graph, dtype))
-            for idx, graph in enumerate(dataset.graphs)
+            for idx, graph in missing_items
         )
-        for done, (idx, spd, rwse, rrwp) in enumerate(iterator, start=1):
+        for done_missing, (idx, spd, rwse, rrwp) in enumerate(iterator, start=1):
             graph = dataset.graphs[idx]
+            item = {"spd": spd, "rwse": rwse, "rrwp": rrwp}
             graphs[idx] = graph_with_pe(graph, spd, rwse, rrwp)
-            pe_items[idx] = {"spd": spd, "rwse": rwse, "rrwp": rrwp}
-            if done == len(dataset) or done % progress_every == 0:
-                log(f"[pe] {dataset.task_name}/{dataset.split}: {done}/{len(dataset)} graphs precomputed")
+            pe_items[idx] = item
+            pending_indices.append(idx)
+            pending_pe_items.append(item)
+            completed = completed_at_start + done_missing
+            if len(pending_indices) >= pe_save_every:
+                flush_partial()
+            if completed == len(dataset) or completed % progress_every == 0:
+                log(f"[pe] {dataset.task_name}/{dataset.split}: {completed}/{len(dataset)} graphs precomputed")
     else:
-        chunk_size = max(1, min(128, len(dataset) // (pe_workers * 8) if len(dataset) else 1))
-        work_items = ((idx, graph, dtype_name) for idx, graph in enumerate(dataset.graphs))
+        chunk_size = max(1, min(128, len(missing_items) // (pe_workers * 8) if missing_items else 1))
+        work_items = ((idx, graph, dtype_name) for idx, graph in missing_items)
         mp_context = multiprocessing.get_context("fork")
         with ProcessPoolExecutor(max_workers=pe_workers, mp_context=mp_context) as executor:
             iterator = executor.map(compute_graph_pe_worker, work_items, chunksize=chunk_size)
-            for done, (idx, spd, rwse, rrwp) in enumerate(iterator, start=1):
+            for done_missing, (idx, spd, rwse, rrwp) in enumerate(iterator, start=1):
                 graph = dataset.graphs[idx]
+                item = {"spd": spd, "rwse": rwse, "rrwp": rrwp}
                 graphs[idx] = graph_with_pe(graph, spd, rwse, rrwp)
-                pe_items[idx] = {"spd": spd, "rwse": rwse, "rrwp": rrwp}
-                if done == len(dataset) or done % progress_every == 0:
-                    log(f"[pe] {dataset.task_name}/{dataset.split}: {done}/{len(dataset)} graphs precomputed")
+                pe_items[idx] = item
+                pending_indices.append(idx)
+                pending_pe_items.append(item)
+                completed = completed_at_start + done_missing
+                if len(pending_indices) >= pe_save_every:
+                    flush_partial()
+                if completed == len(dataset) or completed % progress_every == 0:
+                    log(f"[pe] {dataset.task_name}/{dataset.split}: {completed}/{len(dataset)} graphs precomputed")
+    flush_partial()
     final_graphs = [graph for graph in graphs if graph is not None]
     final_pe_items = [pe for pe in pe_items if pe is not None]
     if len(final_graphs) != len(dataset) or len(final_pe_items) != len(dataset):
         raise RuntimeError(f"incomplete PE cache for {dataset.task_name}/{dataset.split}")
-    torch.save(
+    atomic_torch_save(
         {
             "version": RUN_VERSION,
             "task": dataset.task_name,
@@ -572,6 +686,8 @@ def save_pe_cache(path: Path, dataset: OfficialGraphDataset, dtype_name: str, pe
         },
         path,
     )
+    if part_dir.exists():
+        shutil.rmtree(part_dir)
     elapsed = time.time() - start
     log(f"[pe] Saved {dataset.task_name}/{dataset.split} PE cache to {path} in {elapsed:.1f}s")
     return OfficialGraphDataset(final_graphs, task_name=dataset.task_name, split=dataset.split)
@@ -584,6 +700,7 @@ def attach_or_build_pe_cache(
     namespace: str,
     dtype_name: str,
     pe_workers: int,
+    pe_save_every: int,
     force_recompute: bool,
     build_missing: bool,
     require_present: bool,
@@ -604,7 +721,7 @@ def attach_or_build_pe_cache(
             log(f"[pe] Missing PE cache for {dataset.task_name}/{split}; falling back to on-the-fly collation")
             out[split] = dataset
             continue
-        out[split] = save_pe_cache(path, dataset, dtype_name, pe_workers=pe_workers, log=log)
+        out[split] = save_pe_cache(path, dataset, dtype_name, pe_workers=pe_workers, pe_save_every=pe_save_every, log=log)
     return out
 
 
@@ -2100,6 +2217,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--pe-cache-dtype", choices=("float32", "float16"), default="float32")
     parser.add_argument("--precompute-pe-only", action="store_true", help="Build reusable SPD/RWSE/RRWP caches for selected tasks, then exit.")
     parser.add_argument("--pe-workers", type=int, default=int(os.environ.get("GRAPHBENCH_PE_WORKERS", "1")), help="Parallel worker processes for PE precompute. Use 1 for serial.")
+    parser.add_argument("--pe-save-every", type=int, default=int(os.environ.get("GRAPHBENCH_PE_SAVE_EVERY", "500")), help="Save resumable partial PE shards after this many newly computed graphs per split.")
     parser.add_argument("--force-recompute-pe", action="store_true")
     parser.add_argument("--no-build-missing-pe-cache", action="store_true", help="Use PE caches only when already present; otherwise compute PE in collate.")
     parser.add_argument("--require-pe-cache", action="store_true", help="Fail if a selected split lacks a compatible PE cache.")
@@ -2251,6 +2369,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 namespace=args.pe_cache_namespace,
                 dtype_name=args.pe_cache_dtype,
                 pe_workers=args.pe_workers,
+                pe_save_every=args.pe_save_every,
                 force_recompute=args.force_recompute_pe,
                 build_missing=True,
                 require_present=False,
@@ -2277,6 +2396,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             namespace=args.pe_cache_namespace,
             dtype_name=args.pe_cache_dtype,
             pe_workers=args.pe_workers,
+            pe_save_every=args.pe_save_every,
             force_recompute=args.force_recompute_pe,
             build_missing=not args.no_build_missing_pe_cache,
             require_present=args.require_pe_cache,

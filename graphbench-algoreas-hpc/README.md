@@ -120,6 +120,12 @@ size-generalisation PEs cannot collide.
 Training jobs use `--require-pe-cache`; if a base PE cache is missing, the job
 fails instead of silently recomputing expensive PEs inside the GPU job.
 
+PE precompute writes resumable partial shards under `*.pt.parts/` while a split
+is in progress. If a CPU job times out, rerun the same command without
+`--force-recompute-pe`; completed shards are reused and only missing graphs are
+computed. Once a split finishes, the final `.pt` cache is written and the
+temporary shard directory is removed.
+
 ## Base Protocol
 
 - Tasks: `bipartite_matching_hard`, `flow_hard`, `mst_hard`,
