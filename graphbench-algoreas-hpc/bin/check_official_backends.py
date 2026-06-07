@@ -30,6 +30,7 @@ class CheckResult:
     name: str
     ok: bool
     detail: str
+    required: bool = True
 
 
 def default_project_root() -> Path:
@@ -120,7 +121,6 @@ def check_grit(path: Path) -> list[CheckResult]:
     for module_name in [
         "grit.encoder.rrwp_encoder",
         "grit.layer.grit_layer",
-        "grit.network.grit_model",
     ]:
         results.append(check_import(module_name))
     return results
@@ -130,20 +130,29 @@ def check_gnnplus(path: Path) -> list[CheckResult]:
     results = check_repo("gnnplus", path, EXPECTED_COMMITS["gnnplus"])
     add_path(path)
     for module_name in [
+        "GNNPlus.encoder.kernel_pos_encoder",
         "GNNPlus.layer.gcn_conv_layer",
-        "GNNPlus.layer.gcn_conv_layer_e",
         "GNNPlus.layer.gine_conv_layer",
         "GNNPlus.layer.gatedgcn_layer",
-        "GNNPlus.network.custom_gnn",
     ]:
         results.append(check_import(module_name))
     return results
+
+
+def resolve_existing_path(path: Path, alternatives: list[Path]) -> Path:
+    if path.exists():
+        return path
+    for alt in alternatives:
+        if alt.exists():
+            return alt
+    return path
 
 
 def parse_args() -> argparse.Namespace:
     root = default_project_root()
     external = root / "external"
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--models", default="graphormer,graphgps,static_grit,grit,gatedgcn_plus,gin_plus,gcn_plus")
     parser.add_argument("--graphormer-path", type=Path, default=Path(os.environ.get("GRAPHORMER_ROOT", external / "Graphormer")))
     parser.add_argument("--graphgps-path", type=Path, default=Path(os.environ.get("GRAPHGPS_ROOT", external / "GraphGPS")))
     parser.add_argument("--grit-path", type=Path, default=Path(os.environ.get("GRIT_ROOT", external / "GRIT")))
@@ -153,34 +162,39 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    selected_models = {part.strip() for part in args.models.replace(";", ",").split(",") if part.strip()}
+    needs_graphormer = "graphormer" in selected_models
+    needs_graphgps = "graphgps" in selected_models
+    needs_grit = bool({"grit", "static_grit"} & selected_models)
+    needs_gnnplus = bool({"gcn_plus", "gin_plus", "gatedgcn_plus"} & selected_models)
     checks: list[CheckResult] = []
     checks.append(CheckResult("python", True, sys.version.replace("\n", " ")))
-    for module_name in [
-        "torch",
-        "torch_geometric",
-        "torch_scatter",
-        "torch_sparse",
-        "pyg_lib",
-        "yacs",
-        "torchmetrics",
-        "pytorch_lightning",
-        "performer_pytorch",
-        "tensorboardX",
-        "ogb",
-        "wandb",
-        "graphbench",
-    ]:
+    base_modules = ["torch", "torch_geometric", "torch_scatter", "yacs", "wandb", "graphbench"]
+    if needs_grit:
+        base_modules.extend(["torch_sparse", "ogb", "opt_einsum"])
+    for module_name in base_modules:
         checks.append(check_import(module_name))
-    checks.extend(check_graphormer(args.graphormer_path))
-    checks.extend(check_graphgps(args.graphgps_path))
-    checks.extend(check_grit(args.grit_path))
-    checks.extend(check_gnnplus(args.gnnplus_path))
+    pyg_lib = check_import("pyg_lib")
+    pyg_lib.required = False
+    checks.append(pyg_lib)
+    if needs_graphormer:
+        checks.extend(check_graphormer(args.graphormer_path))
+    if needs_graphgps:
+        checks.extend(check_graphgps(args.graphgps_path))
+    if needs_grit:
+        checks.extend(check_grit(args.grit_path))
+    if needs_gnnplus:
+        gnnplus_path = resolve_existing_path(
+            args.gnnplus_path,
+            [default_project_root() / "external" / "tunedGNN-G"],
+        )
+        checks.extend(check_gnnplus(gnnplus_path))
 
     ok = True
     for result in checks:
-        prefix = "OK" if result.ok else "FAIL"
+        prefix = "OK" if result.ok else ("FAIL" if result.required else "WARN")
         print(f"[{prefix}] {result.name}: {result.detail}")
-        ok = ok and result.ok
+        ok = ok and (result.ok or not result.required)
     if not ok:
         print("\nOfficial backend preflight failed. Do not launch paper training arrays until all FAIL rows are resolved.")
         return 1

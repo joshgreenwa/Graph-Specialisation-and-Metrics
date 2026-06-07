@@ -14,7 +14,7 @@ Pin official sources when building the training environment:
 | Graphormer | `https://github.com/microsoft/Graphormer.git` | `ac154fe4253d076a1c294f14be20dad0351cff3c` |
 | GraphGPS | `https://github.com/rampasek/GraphGPS.git` | `28015707cbab7f8ad72bed0ee872d068ea59c94b` |
 | GRIT | `https://github.com/LiamMa/GRIT.git` | `6c988ea600a606fbb49a2246c64a2d37396b3ab5` |
-| GNN+ | `https://github.com/LUOyk1999/tunedGNN-G.git` | `0e02ad9acc2f1e54b5ad71c051bf5dfb1fcb4f28` |
+| GNN+ | `https://github.com/LUOyk1999/GNNPlus.git` | `0e02ad9acc2f1e54b5ad71c051bf5dfb1fcb4f28` |
 
 ## Verdict
 
@@ -23,9 +23,16 @@ This repository should own only the GraphBench-to-PyG conversion, PE
 precompute/cache, algorithmic heads, loss/metric code, checkpointing, W&B, and
 SLURM orchestration.
 
-Do not report the current local dense classes in `bin/algoreas_hpc.py` as
-faithful Graphormer, GraphGPS, GRIT, or GNN+ models. If they are kept at all,
-label them as smoke-test or style implementations.
+The current runner implements official-backed GRIT/static-GRIT and GNN+ bodies
+by importing upstream GRIT RRWP encoders/layers and upstream GNN+ RWSE/layer
+classes, then attaching local GraphBench task heads. Do not report the local
+dense classes in `bin/algoreas_hpc.py` as faithful Graphormer, GraphGPS, GRIT,
+or GNN+ models. If they are used at all, label them as smoke-test or style
+implementations.
+
+Graphormer and GraphGPS official wrappers are not wired into the Python runner
+yet. The runner deliberately fails early for those model names under
+`--model-backend official`.
 
 ## Required Official Model Paths
 
@@ -121,7 +128,7 @@ because it changes the attention mechanism as well as pair-state evolution.
 
 ### GNN+
 
-Use the official `custom_gnn` network from the GNN+ repository:
+Use the official GNN+ layer classes from the GNN+ repository:
 
 - `GCNConvLayer` for exact GCN+
 - `GINEConvLayer` for GIN+
@@ -149,6 +156,8 @@ Allowed local code:
 - cached RWSE, RRWP, SPD, and Graphormer multi-hop preprocessing tensors
 - algorithmic task heads and metrics
 - training loop, checkpointing, W&B logging, and SLURM scripts
+- lightweight task adapters around official layers, when reported explicitly as
+  official-backed layer/encoder implementations with local GraphBench heads
 
 Not allowed for paper model claims:
 
@@ -169,4 +178,3 @@ path:
 - GRIT/static GRIT: official RRWP node and edge encoders, no SPD
 - GNN+: official RWSE node encoder when comparing against GraphGPS; label this
   as a controlled PE-enhanced GNN+ condition
-

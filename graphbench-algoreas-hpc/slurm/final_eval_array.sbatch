@@ -4,7 +4,7 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=96G
 #SBATCH --time=04:00:00
-#SBATCH --array=0-139%1
+#SBATCH --array=0-99%1
 #SBATCH --output=logs/gb-hpc-eval-%A-%a.out
 #SBATCH --error=logs/gb-hpc-eval-%A-%a.err
 
@@ -23,10 +23,18 @@ if [[ -n "${ENV_ACTIVATE:-}" ]]; then
   source "${ENV_ACTIVATE}"
 fi
 
-python bin/check_official_backends.py
+MODELS="${MODELS:-static_grit,grit,gatedgcn_plus,gin_plus,gcn_plus}"
+TASKS="${TASKS:-bipartite_matching_hard,flow_hard,mst_hard,maxclique_hard,bridges_hard}"
+SEEDS="${SEEDS:-0,1,2,3}"
+
+python bin/check_official_backends.py --models "${MODELS}"
 
 python bin/algoreas_hpc.py \
   --array-index "${SLURM_ARRAY_TASK_ID}" \
+  --tasks "${TASKS}" \
+  --models "${MODELS}" \
+  --seeds "${SEEDS}" \
+  --model-backend official \
   --dataset-root "${GRAPHBENCH_DATASET_ROOT}" \
   --pe-cache-root "${GRAPHBENCH_PE_CACHE_ROOT}" \
   --pe-cache-namespace base_40k4k4k_n64 \

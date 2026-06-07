@@ -6,10 +6,10 @@ algorithmic base training.
 ## Model Fidelity
 
 Paper runs should use official-backed model implementations. The current
-`bin/algoreas_hpc.py` runner is useful for GraphBench loading, PE-cache,
-checkpointing, logging, and SLURM scaffolding, but its local dense model classes
-must not be reported as faithful Graphormer, GraphGPS, GRIT, or GNN+
-implementations.
+`bin/algoreas_hpc.py` runner now exposes official-backed GRIT, static-GRIT,
+GCN+, GIN+, and GatedGCN+ paths through `--model-backend official`. Its local
+dense model classes remain available only for explicit smoke tests and must not
+be reported as faithful Graphormer, GraphGPS, GRIT, or GNN+ implementations.
 
 See `docs/model_fidelity_audit.md` before launching paper runs. The intended
 implementation boundary is:
@@ -71,7 +71,7 @@ python bin/algoreas_hpc.py --print-jobs
 Check official backend imports:
 
 ```bash
-python bin/check_official_backends.py
+python bin/check_official_backends.py --models static_grit,grit,gatedgcn_plus,gin_plus,gcn_plus
 ```
 
 Precompute base PE caches. This is a CPU array over the five tasks and runs one
@@ -81,17 +81,17 @@ task at a time via `%1`:
 sbatch slurm/precompute_pe.sbatch
 ```
 
-Train base models. This is a GPU array over 140 task/model/seed jobs and runs
-one A100 job at a time via `%1`:
+Train base official-backed GRIT/GNN+ models. This is a GPU array over 100
+task/model/seed jobs and runs one A100 job at a time via `%1`:
 
 ```bash
 sbatch slurm/train_base_array.sbatch
 ```
 
-At present this command is intentionally blocked by the Python runner until
-official model backends are wired in. To run only a local smoke test of the
-scaffold, pass `--allow-local-style-models` manually; do not use that flag for
-paper results.
+The script defaults to `MODELS=static_grit,grit,gatedgcn_plus,gin_plus,gcn_plus`.
+Graphormer and GraphGPS official wrappers are not wired into this runner yet;
+local smoke-test variants require `--model-backend local --allow-local-style-models`
+and should not be used for paper results.
 
 Optional full final evaluation from `best.pt`:
 
@@ -138,7 +138,9 @@ temporary shard directory is removed.
 - For compact `n=64` test splits not present in the official tar files, the
   runner generates exactly the requested test count with GraphBench's own
   AlgoReas generator and a fixed split seed.
-- Models: Graphormer, GraphGPS, static-GRIT, GRIT, GatedGCN+, GIN+, GCN+
+- Default official-backed models: static-GRIT, GRIT, GatedGCN+, GIN+, GCN+
+- Graphormer/GraphGPS: preflight-audited but not wired into the official runner
+  path yet
 - Seeds: `0,1,2,3`
 - Training: 5000 steps, batch 1024, 500 warmup, cosine decay
 - Checkpoints: every 500 steps from 2500 to 5000 plus `best.pt`
@@ -154,7 +156,7 @@ Use pinned official sources in the HPC environment:
 git clone --recurse-submodules https://github.com/microsoft/Graphormer.git external/Graphormer
 git clone https://github.com/rampasek/GraphGPS.git external/GraphGPS
 git clone https://github.com/LiamMa/GRIT.git external/GRIT
-git clone https://github.com/LUOyk1999/tunedGNN-G.git external/GNNPlus
+git clone https://github.com/LUOyk1999/GNNPlus.git external/GNNPlus
 ```
 
 Checked commits are recorded in `docs/model_fidelity_audit.md`. Pinning exact
@@ -163,7 +165,7 @@ commits is recommended for paper runs.
 Before launching training arrays, run:
 
 ```bash
-python bin/check_official_backends.py
+python bin/check_official_backends.py --models static_grit,grit,gatedgcn_plus,gin_plus,gcn_plus
 ```
 
 All rows must pass. Environment notes and likely import failures are listed in

@@ -33,7 +33,7 @@ mkdir -p external
 git clone --recurse-submodules https://github.com/microsoft/Graphormer.git external/Graphormer
 git clone https://github.com/rampasek/GraphGPS.git external/GraphGPS
 git clone https://github.com/LiamMa/GRIT.git external/GRIT
-git clone https://github.com/LUOyk1999/tunedGNN-G.git external/GNNPlus
+git clone https://github.com/LUOyk1999/GNNPlus.git external/GNNPlus
 
 git -C external/Graphormer checkout ac154fe4253d076a1c294f14be20dad0351cff3c
 git -C external/Graphormer submodule update --init --recursive
@@ -62,10 +62,13 @@ shim and label it as such in the method section.
 From `graphbench-algoreas-hpc`:
 
 ```bash
-python bin/check_official_backends.py
+python bin/check_official_backends.py --models static_grit,grit,gatedgcn_plus,gin_plus,gcn_plus
 ```
 
-All rows must be `OK` before paper training arrays are launched.
+All required rows must be `OK` before paper training arrays are launched.
+`pyg_lib` may show `WARN`; this is non-fatal for the implemented GRIT/GNN+
+official-backed path. `torch_sparse` must pass for GRIT/static-GRIT because the
+official RRWP edge encoder calls it.
 
 Expected local failure modes if the environment is not ready:
 

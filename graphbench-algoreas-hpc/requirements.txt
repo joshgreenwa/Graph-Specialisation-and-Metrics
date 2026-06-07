@@ -5,3 +5,8 @@ graphbench-lib
 matplotlib
 pyyaml
 wandb
+yacs
+torch_scatter
+torch_sparse
+ogb
+opt_einsum

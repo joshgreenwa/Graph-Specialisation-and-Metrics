@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import importlib
 import json
 import math
 import multiprocessing
@@ -54,7 +55,7 @@ TASK_TYPES = {
 DEFAULT_TASKS = ("bipartite_matching_hard", "flow_hard", "mst_hard", "maxclique_hard", "bridges_hard")
 CALIBRATION_TASKS = ("mst_easy", "bridges_easy", "flow_easy")
 MODEL_NAMES = ("graphormer", "graphgps", "grit", "static_grit", "gcn_plus", "gin_plus", "gatedgcn_plus")
-DEFAULT_MODELS = ("graphormer", "graphgps", "static_grit", "grit", "gatedgcn_plus", "gin_plus", "gcn_plus")
+DEFAULT_MODELS = ("static_grit", "grit", "gatedgcn_plus", "gin_plus", "gcn_plus")
 ALGOREAS_DATASET_NAMES = {
     "topologicalorder": "topologicalorder",
     "bipartite_matching": "bipartitematching",
@@ -308,6 +309,7 @@ def maybe_init_wandb(
     settings: Mapping[str, object],
     task: str,
     model_name: str,
+    model_backend: str,
     cfg: ScreenConfig,
     run_dir: Path,
     n_params: int,
@@ -331,7 +333,7 @@ def maybe_init_wandb(
     project = str(settings.get("project") or "graphbench-algoreas-hpc")
     entity = settings.get("entity") or None
     job_type = "final_eval" if cfg.final_eval else "train"
-    name = f"{task}__{model_name}__seed{cfg.seed}"
+    name = f"{task}__{model_name}__{model_backend}__seed{cfg.seed}"
     if cfg.final_eval:
         name = f"{name}__eval"
     tags = [
@@ -341,6 +343,7 @@ def maybe_init_wandb(
         "base",
         task,
         model_name,
+        model_backend,
         f"seed{cfg.seed}",
     ] + parse_wandb_tags(str(settings.get("tags") or ""))
     wandb_dir = run_dir / "wandb"
@@ -359,6 +362,7 @@ def maybe_init_wandb(
             "run_version": RUN_VERSION,
             "task": task,
             "model": model_name,
+            "model_backend": model_backend,
             "seed": cfg.seed,
             "trainable_parameters": n_params,
             "learning_rate": resolved_lr,
@@ -1635,7 +1639,359 @@ class GatedGCNPlusModel(PaperGNNPlusModel):
         super().__init__(cfg, PaperGatedGCNPlusLayer, use_edge_head=True)
 
 
-def build_model(model_name: str, cfg: ScreenConfig) -> nn.Module:
+def add_external_repo_path(env_name: str, candidates: Sequence[str]) -> None:
+    paths: list[Path] = []
+    env_value = os.environ.get(env_name)
+    if env_value:
+        paths.append(Path(env_value).expanduser())
+    project_root = Path(os.environ.get("PROJECT_ROOT", Path(__file__).resolve().parents[1])).expanduser()
+    for candidate in candidates:
+        paths.append(project_root / "external" / candidate)
+    for path in paths:
+        if path.exists():
+            text = str(path.resolve())
+            if text not in sys.path:
+                sys.path.insert(0, text)
+
+
+def require_official_import(module_name: str, package_hint: str):
+    try:
+        return importlib.import_module(module_name)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Official backend import failed for {module_name!r}. "
+            f"Install or expose {package_hint} in this environment, then rerun "
+            "bin/check_official_backends.py for the selected models."
+        ) from exc
+
+
+def ensure_graphgym_cfg_group(cfg_obj, name: str):
+    from yacs.config import CfgNode as CN  # type: ignore
+
+    if hasattr(cfg_obj, "defrost"):
+        cfg_obj.defrost()
+    if name not in cfg_obj:
+        cfg_obj[name] = CN()
+    return cfg_obj[name]
+
+
+def configure_gnnplus_graphgym(cfg: ScreenConfig, dim_pe: int) -> None:
+    graphgym_config = require_official_import("torch_geometric.graphgym.config", "torch_geometric")
+    graphgym_cfg = graphgym_config.cfg
+    gnn = ensure_graphgym_cfg_group(graphgym_cfg, "gnn")
+    gnn.act = cfg.gnnplus_act
+    share = ensure_graphgym_cfg_group(graphgym_cfg, "share")
+    share.dim_in = NODE_VOCAB
+    pe_cfg = ensure_graphgym_cfg_group(graphgym_cfg, "posenc_RWSE")
+    pe_cfg.enable = True
+    pe_cfg.model = "mlp"
+    pe_cfg.dim_pe = int(dim_pe)
+    pe_cfg.layers = 2
+    pe_cfg.raw_norm_type = "batchnorm"
+    pe_cfg.pass_as_var = False
+    kernel = ensure_graphgym_cfg_group(pe_cfg, "kernel")
+    kernel.times = list(range(1, RW_STEPS + 1))
+    kernel.times_func = ""
+
+
+def grit_layer_cfg(update_e: bool):
+    from yacs.config import CfgNode as CN  # type: ignore
+
+    cfg = CN()
+    cfg.update_e = bool(update_e)
+    cfg.bn_momentum = 0.1
+    cfg.bn_no_runner = False
+    cfg.rezero = False
+    cfg.attn = CN()
+    cfg.attn.use = True
+    cfg.attn.deg_scaler = True
+    cfg.attn.use_bias = False
+    cfg.attn.clamp = 5.0
+    cfg.attn.act = "relu"
+    cfg.attn.edge_enhance = True
+    cfg.attn.sqrt_relu = False
+    cfg.attn.signed_sqrt = False
+    cfg.attn.scaled_attn = False
+    cfg.attn.no_qk = False
+    cfg.attn.graphormer_attn = False
+    cfg.attn.norm_e = True
+    cfg.attn.O_e = True
+    return cfg
+
+
+def node_counts_and_offsets(batch: OfficialBatch) -> tuple[list[int], torch.Tensor]:
+    counts = [int(value) for value in batch.graph_num_nodes.detach().cpu().tolist()]
+    offsets = batch.graph_num_nodes.new_zeros(len(counts))
+    if len(counts) > 1:
+        offsets[1:] = batch.graph_num_nodes.cumsum(0)[:-1]
+    return counts, offsets
+
+
+def flatten_node_type(batch: OfficialBatch) -> torch.Tensor:
+    counts, _ = node_counts_and_offsets(batch)
+    return torch.cat([batch.node_type[i, :n] for i, n in enumerate(counts)], dim=0)
+
+
+def flatten_node_target(batch: OfficialBatch) -> torch.Tensor:
+    counts, _ = node_counts_and_offsets(batch)
+    return torch.cat([batch.node_target[i, :n] for i, n in enumerate(counts)], dim=0)
+
+
+def node_predictions_for_loss(pred: torch.Tensor, batch: OfficialBatch) -> torch.Tensor:
+    if pred.shape == batch.node_target.shape:
+        return pred[batch.node_mask]
+    return pred.reshape(-1)
+
+
+def build_pyg_adapter_batch(
+    batch: OfficialBatch,
+    *,
+    include_rwse: bool,
+    include_rrwp: bool,
+):
+    data_mod = require_official_import("torch_geometric.data", "torch_geometric")
+    Data = data_mod.Data
+    device = batch.node_type.device
+    counts, offsets = node_counts_and_offsets(batch)
+    total_nodes = int(sum(counts))
+    node_type = flatten_node_type(batch)
+    batch_vec = torch.cat(
+        [torch.full((n,), graph_idx, dtype=torch.long, device=device) for graph_idx, n in enumerate(counts)],
+        dim=0,
+    )
+    if batch.edge_batch.numel():
+        edge_offsets = offsets[batch.edge_batch]
+        edge_src_global = edge_offsets + batch.edge_src
+        edge_dst_global = edge_offsets + batch.edge_dst
+        edge_index = torch.stack([edge_src_global, edge_dst_global], dim=0)
+    else:
+        edge_src_global = torch.empty(0, dtype=torch.long, device=device)
+        edge_dst_global = torch.empty(0, dtype=torch.long, device=device)
+        edge_index = torch.empty(2, 0, dtype=torch.long, device=device)
+    data = Data(edge_index=edge_index, num_nodes=total_nodes)
+    data.node_type = node_type
+    data.batch = batch_vec
+    data.graph_num_nodes = batch.graph_num_nodes
+    data.orig_edge_src = edge_src_global
+    data.orig_edge_dst = edge_dst_global
+    data.orig_edge_value = batch.edge_value.float()
+    data.task_type = batch.task_type
+    if include_rwse:
+        data.pestat_RWSE = torch.cat([batch.rwse[i, :n] for i, n in enumerate(counts)], dim=0).float()
+    if include_rrwp:
+        rrwp_node = []
+        rrwp_indices = []
+        rrwp_values = []
+        deg = []
+        for graph_idx, n in enumerate(counts):
+            local_rrwp = batch.rrwp[graph_idx, :n, :n, :RRWP_STEPS].float()
+            arange = torch.arange(n, dtype=torch.long, device=device)
+            rrwp_node.append(local_rrwp[arange, arange])
+            src = arange.repeat_interleave(n) + offsets[graph_idx]
+            dst = arange.repeat(n) + offsets[graph_idx]
+            rrwp_indices.append(torch.stack([src, dst], dim=0))
+            rrwp_values.append(local_rrwp.reshape(n * n, RRWP_STEPS))
+            deg.append(batch.degree[graph_idx, :n].float())
+        data.rrwp = torch.cat(rrwp_node, dim=0)
+        data.rrwp_index = torch.cat(rrwp_indices, dim=1)
+        data.rrwp_val = torch.cat(rrwp_values, dim=0)
+        data.deg = torch.cat(deg, dim=0)
+        data.log_deg = torch.log(data.deg + 1.0)
+    return data
+
+
+def gather_edge_attr_for_pairs(
+    edge_index: torch.Tensor,
+    edge_attr: Optional[torch.Tensor],
+    src: torch.Tensor,
+    dst: torch.Tensor,
+    num_nodes: int,
+) -> Optional[torch.Tensor]:
+    if edge_attr is None or src.numel() == 0:
+        return None
+    keys = edge_index[0].long() * int(num_nodes) + edge_index[1].long()
+    order = torch.argsort(keys)
+    sorted_keys = keys[order]
+    query = src.long() * int(num_nodes) + dst.long()
+    pos = torch.searchsorted(sorted_keys, query)
+    found = (pos < sorted_keys.numel()) & (sorted_keys[pos.clamp(max=max(sorted_keys.numel() - 1, 0))] == query)
+    if not bool(found.all()):
+        missing = int((~found).sum().detach().cpu())
+        raise RuntimeError(f"could not recover {missing} original edge states from official full-pair edge tensor")
+    return edge_attr[order[pos]]
+
+
+class PyGPredictionHeads(nn.Module):
+    def __init__(self, dim: int, edge_dim: int = 0) -> None:
+        super().__init__()
+        self.graph_head = nn.Sequential(nn.LayerNorm(2 * dim), nn.Linear(2 * dim, dim), nn.GELU(), nn.Linear(dim, 1))
+        self.node_head = nn.Sequential(nn.LayerNorm(dim), nn.Linear(dim, dim), nn.GELU(), nn.Linear(dim, 1))
+        edge_in = 4 * dim + edge_dim + 1
+        self.edge_head = nn.Sequential(nn.LayerNorm(edge_in), nn.Linear(edge_in, dim), nn.GELU(), nn.Linear(dim, 1))
+
+    def graph(self, h: torch.Tensor, batch: OfficialBatch) -> torch.Tensor:
+        counts, _ = node_counts_and_offsets(batch)
+        pooled = []
+        offset = 0
+        for n in counts:
+            hg = h[offset : offset + n]
+            pooled.append(torch.cat([hg.mean(dim=0), hg.max(dim=0).values], dim=0))
+            offset += n
+        return self.graph_head(torch.stack(pooled, dim=0)).squeeze(-1)
+
+    def node(self, h: torch.Tensor) -> torch.Tensor:
+        return self.node_head(h).squeeze(-1)
+
+    def edge(
+        self,
+        h: torch.Tensor,
+        batch: OfficialBatch,
+        edge_repr: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        _, offsets = node_counts_and_offsets(batch)
+        src_global = offsets[batch.edge_batch] + batch.edge_src
+        dst_global = offsets[batch.edge_batch] + batch.edge_dst
+        src = h[src_global]
+        dst = h[dst_global]
+        pieces = [src, dst, torch.abs(src - dst), src * dst]
+        if edge_repr is not None:
+            pieces.append(edge_repr)
+        pieces.append(batch.edge_value.unsqueeze(-1).to(h.dtype))
+        return self.edge_head(torch.cat(pieces, dim=-1)).squeeze(-1)
+
+
+class OfficialGNNPlusModel(nn.Module):
+    def __init__(self, cfg: ScreenConfig, model_name: str) -> None:
+        super().__init__()
+        add_external_repo_path("GNNPLUS_ROOT", ("GNNPlus", "tunedGNN-G"))
+        dim = cfg.gnn_hidden_dim
+        dim_pe = min(64, max(16, dim // 2))
+        configure_gnnplus_graphgym(cfg, dim_pe)
+        rwse_mod = require_official_import("GNNPlus.encoder.kernel_pos_encoder", "official GNN+ repository")
+        if model_name == "gcn_plus":
+            layer_mod = require_official_import("GNNPlus.layer.gcn_conv_layer", "official GNN+ repository")
+            layer_cls = layer_mod.GCNConvLayer
+            self.uses_edge_attr = False
+            self.uses_edge_state_head = False
+        elif model_name == "gin_plus":
+            layer_mod = require_official_import("GNNPlus.layer.gine_conv_layer", "official GNN+ repository")
+            layer_cls = layer_mod.GINEConvLayer
+            self.uses_edge_attr = True
+            self.uses_edge_state_head = False
+        elif model_name == "gatedgcn_plus":
+            layer_mod = require_official_import("GNNPlus.layer.gatedgcn_layer", "official GNN+ repository")
+            layer_cls = layer_mod.GatedGCNLayer
+            self.uses_edge_attr = True
+            self.uses_edge_state_head = True
+        else:
+            raise ValueError(model_name)
+        self.rwse_encoder = rwse_mod.RWSENodeEncoder(dim, expand_x=True)
+        self.edge_encoder = nn.Linear(1, dim)
+        layers = []
+        for _ in range(cfg.layers):
+            if model_name == "gatedgcn_plus":
+                layers.append(layer_cls(dim, dim, cfg.dropout, cfg.gnnplus_residual, cfg.gnnplus_ffn, act=cfg.gnnplus_act))
+            else:
+                layers.append(layer_cls(dim, dim, cfg.dropout, cfg.gnnplus_residual, cfg.gnnplus_ffn))
+        self.layers = nn.ModuleList(layers)
+        self.heads = PyGPredictionHeads(dim, edge_dim=dim if self.uses_edge_state_head else 0)
+
+    def forward(self, batch: OfficialBatch) -> torch.Tensor:
+        pyg_batch = build_pyg_adapter_batch(batch, include_rwse=True, include_rrwp=False)
+        pyg_batch.x = F.one_hot(pyg_batch.node_type.long(), num_classes=NODE_VOCAB).float()
+        pyg_batch = self.rwse_encoder(pyg_batch)
+        edge_state = self.edge_encoder(pyg_batch.orig_edge_value.unsqueeze(-1).to(pyg_batch.x.dtype))
+        pyg_batch.edge_attr = edge_state if self.uses_edge_attr else None
+        for layer in self.layers:
+            pyg_batch = layer(pyg_batch)
+        edge_repr = pyg_batch.edge_attr if self.uses_edge_state_head else None
+        if batch.task_type == "edge_binary":
+            return self.heads.edge(pyg_batch.x, batch, edge_repr)
+        if batch.task_type in {"node_binary", "node_regression"}:
+            return self.heads.node(pyg_batch.x)
+        if batch.task_type == "graph_regression":
+            return self.heads.graph(pyg_batch.x, batch)
+        raise ValueError(batch.task_type)
+
+
+class OfficialGRITModel(nn.Module):
+    def __init__(self, cfg: ScreenConfig, evolve_pairs: bool = True) -> None:
+        super().__init__()
+        add_external_repo_path("GRIT_ROOT", ("GRIT",))
+        dim = cfg.hidden_dim
+        grit_layer_mod = require_official_import("grit.layer.grit_layer", "official GRIT repository")
+        rrwp_mod = require_official_import("grit.encoder.rrwp_encoder", "official GRIT repository")
+        layer_cfg = grit_layer_cfg(update_e=evolve_pairs)
+        self.node_encoder = nn.Embedding(NODE_VOCAB, dim)
+        self.edge_encoder = nn.Linear(1, dim)
+        self.rrwp_node_encoder = rrwp_mod.RRWPLinearNodeEncoder(RRWP_STEPS, dim, batchnorm=False, layernorm=False)
+        self.rrwp_edge_encoder = rrwp_mod.RRWPLinearEdgeEncoder(
+            RRWP_STEPS,
+            dim,
+            batchnorm=False,
+            layernorm=False,
+            pad_to_full_graph=True,
+            add_node_attr_as_self_loop=False,
+            overwrite_old_attr=False,
+        )
+        self.layers = nn.ModuleList(
+            grit_layer_mod.GritTransformerLayer(
+                dim,
+                dim,
+                cfg.heads,
+                dropout=cfg.dropout,
+                attn_dropout=cfg.attn_dropout,
+                layer_norm=False,
+                batch_norm=True,
+                residual=True,
+                act="relu",
+                norm_e=True,
+                O_e=True,
+                cfg=layer_cfg,
+            )
+            for _ in range(cfg.layers)
+        )
+        self.heads = PyGPredictionHeads(dim, edge_dim=dim)
+
+    def forward(self, batch: OfficialBatch) -> torch.Tensor:
+        pyg_batch = build_pyg_adapter_batch(batch, include_rwse=False, include_rrwp=True)
+        pyg_batch.x = self.node_encoder(pyg_batch.node_type.long())
+        pyg_batch.edge_attr = self.edge_encoder(pyg_batch.orig_edge_value.unsqueeze(-1).to(pyg_batch.x.dtype))
+        pyg_batch = self.rrwp_node_encoder(pyg_batch)
+        pyg_batch = self.rrwp_edge_encoder(pyg_batch)
+        for layer in self.layers:
+            pyg_batch = layer(pyg_batch)
+        if batch.task_type == "edge_binary":
+            edge_repr = gather_edge_attr_for_pairs(
+                pyg_batch.edge_index,
+                pyg_batch.edge_attr,
+                pyg_batch.orig_edge_src,
+                pyg_batch.orig_edge_dst,
+                int(pyg_batch.num_nodes),
+            )
+            return self.heads.edge(pyg_batch.x, batch, edge_repr)
+        if batch.task_type in {"node_binary", "node_regression"}:
+            return self.heads.node(pyg_batch.x)
+        if batch.task_type == "graph_regression":
+            return self.heads.graph(pyg_batch.x, batch)
+        raise ValueError(batch.task_type)
+
+
+def build_model(model_name: str, cfg: ScreenConfig, backend: str = "official") -> nn.Module:
+    if backend == "official":
+        if model_name == "grit":
+            return OfficialGRITModel(cfg, evolve_pairs=True)
+        if model_name == "static_grit":
+            return OfficialGRITModel(cfg, evolve_pairs=False)
+        if model_name in {"gcn_plus", "gin_plus", "gatedgcn_plus"}:
+            return OfficialGNNPlusModel(cfg, model_name)
+        raise NotImplementedError(
+            f"Official backend for {model_name!r} is not wired in this runner yet. "
+            "Use --models grit,static_grit,gcn_plus,gin_plus,gatedgcn_plus for official-backed runs, "
+            "or pass --model-backend local --allow-local-style-models for smoke tests only."
+        )
+    if backend != "local":
+        raise ValueError(f"unknown model backend {backend!r}")
     if model_name == "graphormer":
         return GraphormerModel(cfg)
     if model_name == "graphgps":
@@ -1691,9 +2047,11 @@ def task_loss(
     if batch.task_type == "edge_binary":
         return F.binary_cross_entropy_with_logits(pred, batch.edge_target.float(), pos_weight=pos_weight)
     if batch.task_type == "node_binary":
-        return F.binary_cross_entropy_with_logits(pred[batch.node_mask], batch.node_target[batch.node_mask].float(), pos_weight=pos_weight)
+        node_pred = node_predictions_for_loss(pred, batch)
+        return F.binary_cross_entropy_with_logits(node_pred, flatten_node_target(batch).float(), pos_weight=pos_weight)
     if batch.task_type == "node_regression":
-        return F.mse_loss(torch.sigmoid(pred[batch.node_mask]), batch.node_target[batch.node_mask].float())
+        node_pred = node_predictions_for_loss(pred, batch)
+        return F.mse_loss(torch.sigmoid(node_pred), flatten_node_target(batch).float())
     if batch.task_type == "graph_regression":
         return F.mse_loss(pred, normalize_graph_target(batch.graph_target, target_stats))
     raise ValueError(batch.task_type)
@@ -1787,11 +2145,11 @@ def evaluate_model(
             preds.append(pred.detach().cpu())
             targets.append(batch.edge_target.detach().cpu())
         elif batch.task_type == "node_binary":
-            preds.append(pred[batch.node_mask].detach().cpu())
-            targets.append(batch.node_target[batch.node_mask].detach().cpu())
+            preds.append(node_predictions_for_loss(pred, batch).detach().cpu())
+            targets.append(flatten_node_target(batch).detach().cpu())
         elif batch.task_type == "node_regression":
-            preds.append(torch.sigmoid(pred[batch.node_mask]).detach().cpu())
-            targets.append(batch.node_target[batch.node_mask].detach().cpu())
+            preds.append(torch.sigmoid(node_predictions_for_loss(pred, batch)).detach().cpu())
+            targets.append(flatten_node_target(batch).detach().cpu())
         elif batch.task_type == "graph_regression":
             preds.append(pred.detach().cpu())
             targets.append(batch.graph_target.detach().cpu())
@@ -1916,19 +2274,26 @@ def train_batch_size_for(model_name: str, cfg: ScreenConfig) -> int:
     return TRAIN_BATCH_SIZE_BY_MODEL[model_name]
 
 
-def resolved_model_configs(models: Sequence[str], cfg: ScreenConfig, preset: str) -> dict[str, dict[str, object]]:
+def resolved_model_configs(models: Sequence[str], cfg: ScreenConfig, preset: str, backend: str) -> dict[str, dict[str, object]]:
     out: dict[str, dict[str, object]] = {}
     for model_name in models:
         model_cfg = model_config_for(model_name, cfg, preset)
-        model = build_model(model_name, model_cfg)
+        model = build_model(model_name, model_cfg, backend=backend)
         out[model_name] = {
             "config": asdict(model_cfg),
+            "model_backend": backend,
             "trainable_parameters": count_parameters(model),
         }
     return out
 
 
-def run_signature(task: str, model_name: str, cfg: ScreenConfig, splits: Mapping[str, OfficialGraphDataset]) -> dict[str, object]:
+def run_signature(
+    task: str,
+    model_name: str,
+    model_backend: str,
+    cfg: ScreenConfig,
+    splits: Mapping[str, OfficialGraphDataset],
+) -> dict[str, object]:
     training_config = asdict(cfg)
     training_config["final_eval"] = False
     return {
@@ -1936,6 +2301,7 @@ def run_signature(task: str, model_name: str, cfg: ScreenConfig, splits: Mapping
         "version": RUN_VERSION,
         "task": task,
         "model": model_name,
+        "model_backend": model_backend,
         "resolved_learning_rate": learning_rate_for(model_name, task, cfg),
         "resolved_train_batch_size": train_batch_size_for(model_name, cfg),
         "resolved_eval_batch_size": eval_batch_size_for(model_name, cfg),
@@ -1957,6 +2323,7 @@ def signature_matches(path: Path, signature: Mapping[str, object]) -> bool:
 def train_one(
     task: str,
     model_name: str,
+    model_backend: str,
     splits: Mapping[str, OfficialGraphDataset],
     cfg: ScreenConfig,
     output_root: Path,
@@ -1969,11 +2336,11 @@ def train_one(
     run_dir = output_root / RUN_NAME / task / model_name / f"seed{cfg.seed}"
     run_dir.mkdir(parents=True, exist_ok=True)
     run_log = RunLogger(run_dir / "run.log")
-    signature = run_signature(task, model_name, cfg, splits)
+    signature = run_signature(task, model_name, model_backend, cfg, splits)
     summary_path = run_dir / "summary.json"
     best_path = run_dir / "best.pt"
     metrics_path = run_dir / "metrics.csv"
-    model = build_model(model_name, cfg).to(device)
+    model = build_model(model_name, cfg, backend=model_backend).to(device)
     n_params = count_parameters(model)
     pos_weight = compute_pos_weight(splits["train"])
     target_stats = compute_target_stats(splits["train"])
@@ -1984,7 +2351,7 @@ def train_one(
     watch_graphs = deterministic_subset(splits["val"], min(cfg.val_watch_size, len(splits["val"])), cfg.split_seed + 4099)
     watch_dataset = OfficialGraphDataset(watch_graphs, task_name=task, split="val_watch")
     run_log(
-        f"[run] task={task} model={model_name} seed={cfg.seed} params={n_params:,} "
+        f"[run] task={task} model={model_name} backend={model_backend} seed={cfg.seed} params={n_params:,} "
         f"lr={resolved_lr:g} train_batch={train_batch_size} eval_batch={eval_batch_size} device={device}"
     )
     run_log(f"[data] stats={json.dumps({k: dataset_stats(v) for k, v in splits.items()}, sort_keys=True)}")
@@ -1994,6 +2361,7 @@ def train_one(
         wandb_settings or {},
         task,
         model_name,
+        model_backend,
         cfg,
         run_dir,
         n_params,
@@ -2167,6 +2535,7 @@ def train_one(
         "task": task,
         "task_type": splits["train"][0].task_type,
         "model": model_name,
+        "model_backend": model_backend,
         "seed": cfg.seed,
         "trainable_parameters": n_params,
         "resolved_learning_rate": resolved_lr,
@@ -2334,6 +2703,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--tasks", type=str, default=",".join(DEFAULT_TASKS))
     parser.add_argument("--include-calibration", action="store_true")
     parser.add_argument("--models", type=str, default=",".join(DEFAULT_MODELS))
+    parser.add_argument(
+        "--model-backend",
+        choices=("official", "local"),
+        default="official",
+        help="official uses upstream GRIT/GNN+ layer/encoder implementations; local is smoke-test only.",
+    )
     parser.add_argument("--seeds", type=str, default="0,1,2,3")
     parser.add_argument("--split-seed", type=int, default=ScreenConfig.split_seed)
     parser.add_argument("--train-size", type=int, default=ScreenConfig.train_size)
@@ -2470,6 +2845,14 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     unknown_models = [model for model in models if model not in MODEL_NAMES]
     if unknown_models:
         raise ValueError(f"unknown model(s): {unknown_models}")
+    if args.model_backend == "official":
+        unsupported_official = [model for model in models if model in {"graphormer", "graphgps"}]
+        if unsupported_official and not (args.print_jobs or args.precompute_pe_only or args.prepare_data_only):
+            raise ValueError(
+                f"official backend is currently wired for GRIT/static-GRIT/GNN+ only; unsupported={unsupported_official}. "
+                "Use --models grit,static_grit,gcn_plus,gin_plus,gatedgcn_plus, or run local smoke tests with "
+                "--model-backend local --allow-local-style-models."
+            )
     seeds = parse_seed_list(args.seeds)
     if args.fast_dev_run:
         seeds = seeds[:1]
@@ -2497,7 +2880,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     if device.type == "cuda":
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
-    log(f"[setup] device={device} tasks={tasks} models={models} seeds={seeds}")
+    log(f"[setup] device={device} tasks={tasks} models={models} backend={args.model_backend} seeds={seeds}")
     log(f"[setup] dataset_root={dataset_root}")
     log(f"[setup] pe_cache_root={pe_cache_root}")
     log(f"[setup] output_root={output_root}")
@@ -2540,7 +2923,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             )
         log("[done] prepared reusable PE caches")
         return
-    if not args.allow_local_style_models:
+    if args.model_backend == "local" and not args.allow_local_style_models:
         raise RuntimeError(
             "Training/eval with local dense style-models is disabled. "
             "Paper runs must use official-backed Graphormer/GraphGPS/GRIT/GNN+ "
@@ -2573,6 +2956,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 summary = train_one(
                     task,
                     model_name,
+                    args.model_backend,
                     splits,
                     model_cfg,
                     output_root,
@@ -2608,10 +2992,11 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 "tasks": tasks,
                 "models": models,
                 "seeds": seeds,
+                "model_backend": args.model_backend,
                 "protocol_config": PROTOCOL_CONFIG,
                 "model_size_preset": args.model_size_preset,
                 "base_config": asdict(base_cfg),
-                "model_configs": resolved_model_configs(models, base_cfg, args.model_size_preset),
+                "model_configs": resolved_model_configs(models, base_cfg, args.model_size_preset, args.model_backend),
                 "version": RUN_VERSION,
             },
         )
