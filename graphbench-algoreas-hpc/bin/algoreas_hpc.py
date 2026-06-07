@@ -2266,6 +2266,15 @@ def make_scheduler(optimizer: torch.optim.Optimizer, warmup_steps: int, total_st
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
+def make_grad_scaler(use_amp: bool):
+    if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):
+        try:
+            return torch.amp.GradScaler("cuda", enabled=use_amp)
+        except TypeError:
+            return torch.amp.GradScaler(enabled=use_amp)
+    return torch.cuda.amp.GradScaler(enabled=use_amp)
+
+
 def dataset_stats(dataset: Dataset[OfficialGraph]) -> dict[str, object]:
     nodes = [dataset[i].num_nodes for i in range(len(dataset))]
     edges = [int(dataset[i].edge_index.size(1)) for i in range(len(dataset))]
@@ -2422,7 +2431,7 @@ def train_one(
         run_log("[resume] matching checkpoint found; skipping training")
     else:
         optimizer = torch.optim.AdamW(model.parameters(), lr=resolved_lr, betas=(0.9, 0.999), weight_decay=cfg.weight_decay)
-        scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+        scaler = make_grad_scaler(use_amp)
         scheduler = make_scheduler(optimizer, cfg.warmup_steps, cfg.max_steps)
         best_score = float("inf")
         best_step = 0
