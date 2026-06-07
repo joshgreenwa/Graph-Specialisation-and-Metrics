@@ -1,0 +1,192 @@
+#!/usr/bin/env python3
+"""Preflight checks for official model backends.
+
+This script is intentionally import-focused. It should be run on the HPC
+environment before launching training arrays, after the official repos and
+compiled PyG dependencies are installed.
+"""
+
+from __future__ import annotations
+
+import argparse
+import importlib
+import os
+import subprocess
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+
+
+EXPECTED_COMMITS = {
+    "graphormer": "ac154fe4253d076a1c294f14be20dad0351cff3c",
+    "graphgps": "28015707cbab7f8ad72bed0ee872d068ea59c94b",
+    "grit": "6c988ea600a606fbb49a2246c64a2d37396b3ab5",
+    "gnnplus": "0e02ad9acc2f1e54b5ad71c051bf5dfb1fcb4f28",
+}
+
+
+@dataclass
+class CheckResult:
+    name: str
+    ok: bool
+    detail: str
+
+
+def default_project_root() -> Path:
+    return Path(os.environ.get("PROJECT_ROOT", Path.cwd())).resolve()
+
+
+def git_commit(path: Path) -> str | None:
+    try:
+        out = subprocess.check_output(
+            ["git", "-C", str(path), "rev-parse", "HEAD"],
+            text=True,
+            stderr=subprocess.STDOUT,
+        )
+        return out.strip()
+    except Exception:
+        return None
+
+
+def check_import(module_name: str) -> CheckResult:
+    try:
+        module = importlib.import_module(module_name)
+        version = getattr(module, "__version__", "no_version")
+        return CheckResult(module_name, True, str(version))
+    except Exception as exc:
+        return CheckResult(module_name, False, f"{type(exc).__name__}: {exc}")
+
+
+def add_path(path: Path) -> None:
+    text = str(path.resolve())
+    if text not in sys.path:
+        sys.path.insert(0, text)
+
+
+def check_repo(name: str, path: Path, expected_commit: str) -> list[CheckResult]:
+    results: list[CheckResult] = []
+    if not path.exists():
+        return [CheckResult(f"{name}.path", False, f"missing: {path}")]
+    results.append(CheckResult(f"{name}.path", True, str(path)))
+    commit = git_commit(path)
+    if commit is None:
+        results.append(CheckResult(f"{name}.git", False, "not a readable git repository"))
+    elif commit != expected_commit:
+        results.append(CheckResult(f"{name}.commit", False, f"{commit} != expected {expected_commit}"))
+    else:
+        results.append(CheckResult(f"{name}.commit", True, commit))
+    return results
+
+
+def check_graphormer(path: Path) -> list[CheckResult]:
+    results = check_repo("graphormer", path, EXPECTED_COMMITS["graphormer"])
+    fairseq_dir = path / "fairseq"
+    if (fairseq_dir / "fairseq").exists() or (fairseq_dir / "setup.py").exists():
+        results.append(CheckResult("graphormer.fairseq_submodule", True, str(fairseq_dir)))
+        add_path(fairseq_dir)
+    else:
+        results.append(
+            CheckResult(
+                "graphormer.fairseq_submodule",
+                False,
+                "missing or empty; clone Graphormer with --recurse-submodules or run git submodule update --init --recursive",
+            )
+        )
+    add_path(path)
+    for module_name in [
+        "graphormer.modules.graphormer_layers",
+        "graphormer.modules.graphormer_graph_encoder_layer",
+        "graphormer.modules.graphormer_graph_encoder",
+    ]:
+        results.append(check_import(module_name))
+    return results
+
+
+def check_graphgps(path: Path) -> list[CheckResult]:
+    results = check_repo("graphgps", path, EXPECTED_COMMITS["graphgps"])
+    add_path(path)
+    for module_name in [
+        "graphgps.encoder.kernel_pos_encoder",
+        "graphgps.layer.gps_layer",
+        "graphgps.network.gps_model",
+    ]:
+        results.append(check_import(module_name))
+    return results
+
+
+def check_grit(path: Path) -> list[CheckResult]:
+    results = check_repo("grit", path, EXPECTED_COMMITS["grit"])
+    add_path(path)
+    for module_name in [
+        "grit.encoder.rrwp_encoder",
+        "grit.layer.grit_layer",
+        "grit.network.grit_model",
+    ]:
+        results.append(check_import(module_name))
+    return results
+
+
+def check_gnnplus(path: Path) -> list[CheckResult]:
+    results = check_repo("gnnplus", path, EXPECTED_COMMITS["gnnplus"])
+    add_path(path)
+    for module_name in [
+        "GNNPlus.layer.gcn_conv_layer",
+        "GNNPlus.layer.gcn_conv_layer_e",
+        "GNNPlus.layer.gine_conv_layer",
+        "GNNPlus.layer.gatedgcn_layer",
+        "GNNPlus.network.custom_gnn",
+    ]:
+        results.append(check_import(module_name))
+    return results
+
+
+def parse_args() -> argparse.Namespace:
+    root = default_project_root()
+    external = root / "external"
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--graphormer-path", type=Path, default=Path(os.environ.get("GRAPHORMER_ROOT", external / "Graphormer")))
+    parser.add_argument("--graphgps-path", type=Path, default=Path(os.environ.get("GRAPHGPS_ROOT", external / "GraphGPS")))
+    parser.add_argument("--grit-path", type=Path, default=Path(os.environ.get("GRIT_ROOT", external / "GRIT")))
+    parser.add_argument("--gnnplus-path", type=Path, default=Path(os.environ.get("GNNPLUS_ROOT", external / "GNNPlus")))
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    checks: list[CheckResult] = []
+    checks.append(CheckResult("python", True, sys.version.replace("\n", " ")))
+    for module_name in [
+        "torch",
+        "torch_geometric",
+        "torch_scatter",
+        "torch_sparse",
+        "pyg_lib",
+        "yacs",
+        "torchmetrics",
+        "pytorch_lightning",
+        "performer_pytorch",
+        "tensorboardX",
+        "ogb",
+        "wandb",
+        "graphbench",
+    ]:
+        checks.append(check_import(module_name))
+    checks.extend(check_graphormer(args.graphormer_path))
+    checks.extend(check_graphgps(args.graphgps_path))
+    checks.extend(check_grit(args.grit_path))
+    checks.extend(check_gnnplus(args.gnnplus_path))
+
+    ok = True
+    for result in checks:
+        prefix = "OK" if result.ok else "FAIL"
+        print(f"[{prefix}] {result.name}: {result.detail}")
+        ok = ok and result.ok
+    if not ok:
+        print("\nOfficial backend preflight failed. Do not launch paper training arrays until all FAIL rows are resolved.")
+        return 1
+    print("\nOfficial backend preflight passed.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

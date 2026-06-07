@@ -23,6 +23,8 @@ if [[ -n "${ENV_ACTIVATE:-}" ]]; then
   source "${ENV_ACTIVATE}"
 fi
 
+python bin/check_official_backends.py
+
 python bin/algoreas_hpc.py \
   --array-index "${SLURM_ARRAY_TASK_ID}" \
   --dataset-root "${GRAPHBENCH_DATASET_ROOT}" \

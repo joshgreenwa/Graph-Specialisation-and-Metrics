@@ -2085,6 +2085,14 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--skip-suite-summary", action="store_true", help="Skip top-level aggregate writes; use for parallel array jobs.")
     parser.add_argument("--prepare-data-only", action="store_true", help="Load/cache selected official splits, then exit before training.")
     parser.add_argument("--fast-dev-run", action="store_true")
+    parser.add_argument(
+        "--allow-local-style-models",
+        action="store_true",
+        help=(
+            "Allow training/eval with the runner's local dense model classes. "
+            "Use only for smoke tests; these are not faithful official model backends."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -2214,6 +2222,13 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             )
         log("[done] prepared reusable PE caches")
         return
+    if not args.allow_local_style_models:
+        raise RuntimeError(
+            "Training/eval with local dense style-models is disabled. "
+            "Paper runs must use official-backed Graphormer/GraphGPS/GRIT/GNN+ "
+            "model implementations; see docs/model_fidelity_audit.md. "
+            "Pass --allow-local-style-models only for local smoke tests."
+        )
     all_summaries = []
     for task in tasks:
         base_cfg = cfg_from_args(args, seeds[0])

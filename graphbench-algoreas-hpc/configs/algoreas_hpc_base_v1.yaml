@@ -5,6 +5,7 @@ run:
   hardware: single_a100_80gb
   budget_hours: 100_to_150
   runner: bin/algoreas_hpc.py
+  runner_status: data_pe_slurm_scaffold_until_official_model_backends_are_enabled
   scheduler: slurm
   execution_unit: one_task_one_model_one_seed
   required_environment:
@@ -46,6 +47,38 @@ run:
     - size_generalisation
     - posthoc_feature_changes
     - changing_model_width_after_results
+
+model_backend_policy:
+  paper_runs_must_use: official_backed_model_implementations
+  local_dense_runner_models: smoke_test_only_not_faithful_model_claims
+  audit_document: docs/model_fidelity_audit.md
+  local_code_may_own:
+    - graphbench_to_pyg_conversion
+    - deterministic_split_subsets
+    - pe_cache_plumbing
+    - task_heads
+    - losses_and_metrics
+    - checkpointing
+    - wandb_logging
+    - slurm_orchestration
+  local_code_must_not_replace:
+    - graphormer_attention_bias_and_encoder_layers
+    - graphgps_gps_layer_and_rwse_encoder_semantics
+    - grit_sparse_attention_rrwp_encoders_degree_scaler_or_edge_updates
+    - gnn_plus_message_passing_layers_norms_residuals_or_ffn_blocks
+  official_sources:
+    graphormer:
+      repo: https://github.com/microsoft/Graphormer.git
+      checked_commit: ac154fe4253d076a1c294f14be20dad0351cff3c
+    graphgps:
+      repo: https://github.com/rampasek/GraphGPS.git
+      checked_commit: 28015707cbab7f8ad72bed0ee872d068ea59c94b
+    grit:
+      repo: https://github.com/LiamMa/GRIT.git
+      checked_commit: 6c988ea600a606fbb49a2246c64a2d37396b3ab5
+    gnn_plus:
+      repo: https://github.com/LUOyk1999/tunedGNN-G.git
+      checked_commit: 0e02ad9acc2f1e54b5ad71c051bf5dfb1fcb4f28
 
 dataset:
   graph_format: original_graph
@@ -227,10 +260,11 @@ learning_rates:
 
 models:
   parameter_matching:
-    target: about_2p2m_trainable_parameters
-    mean_trainable_parameters: 2222288
-    max_deviation_from_mean: 4.4_percent
-    fixed_controls: [layers, attention_heads_for_GT, dropout, PE_policy, optimizer, LR_table]
+    target: official_backend_trainable_parameters_in_same_order_of_magnitude
+    preferred_band: 2m_to_3m_trainable_parameters_after_official_backend_count
+    hard_rule: log_exact_trainable_parameter_count_before_training_and_do_not_resize_after_results
+    note: old_local_runner_parameter_counts_are_not_binding_for_paper_runs
+    fixed_controls: [layers, attention_heads_for_GT, dropout, PE_policy, optimizer, LR_policy]
   common_gt_controls:
     layers: 6
     attention_heads: 8
@@ -238,14 +272,15 @@ models:
     residual: true
     dropout: 0.1
     attention_dropout: 0.1
-    ffn_multiplier: 4
   graphormer:
     inherits: common_gt_controls
     d_model: 160
     head_dim: 20
     ffn_dim: 640
-    trainable_parameters: 2126213
-    norm_style: graphormer_pre_layernorm_in_local_runner
+    ffn_multiplier: 4
+    trainable_parameters: count_from_official_backend_before_training
+    norm_style: graphormer_official_config_explicit_pre_or_post_layernorm
+    official_components: [GraphNodeFeature, GraphAttnBias, GraphormerGraphEncoder, GraphormerGraphEncoderLayer]
     graph_token: true
     centrality_encoding: in_degree_and_out_degree
     attention_bias:
@@ -263,28 +298,32 @@ models:
     inherits: common_gt_controls
     d_model: 128
     head_dim: 16
-    ffn_dim: 512
-    trainable_parameters: 2222379
-    norm_style: graphgps_batchnorm_style
+    ffn_dim: 256
+    ffn_multiplier: 2
+    trainable_parameters: count_from_official_backend_before_training
+    norm_style: graphgps_official_batchnorm
+    official_components: [GPSModel, GPSLayer, CustomGatedGCN, RWSENodeEncoder]
     local_branch: gatedgcn
     global_branch: full_attention
     node_pe: rwse16
-    pe_encoder: {raw_norm: batchnorm, layers: 2, dim_pe: 128}
+    pe_encoder: {raw_norm: batchnorm, layers: 2, dim_pe: 32, attach: concat_into_node_embedding_budget}
     edge_attr_in_local_branch: true
     pair_bias_in_global_attention: false
   grit:
     inherits: common_gt_controls
     d_model: 112
     head_dim: 14
-    ffn_dim: 448
+    ffn_dim: 224
+    ffn_multiplier: 2
     pair_dim: 112
-    trainable_parameters: 2232773
-    norm_style: grit_batchnorm_style
+    trainable_parameters: count_from_official_backend_before_training
+    norm_style: grit_official_batchnorm
+    official_components: [GritTransformer, GritTransformerLayer, MultiHeadAttentionLayerGritSparse, RRWPLinearNodeEncoder, RRWPLinearEdgeEncoder]
     node_pe: none
     relative_pair_pe: rrwp16
     include_spd: false
     include_degree_scalers: true
-    norm_style: batchnorm_style
+    degree_input: official_rrwp_transform_deg_or_log_deg_for_layer_scaler
     pair_value_transport: true
     pair_state_evolution: true
     edge_attr_pair_input: true
@@ -292,60 +331,70 @@ models:
     inherits: grit
     d_model: 168
     head_dim: 21
-    ffn_dim: 672
+    ffn_dim: 336
+    ffn_multiplier: 2
     pair_dim: 168
-    trainable_parameters: 2288381
+    trainable_parameters: count_from_official_backend_before_training
     pair_state_evolution: false
-    pair_state: fixed_encoded_rrwp_plus_edge_attr_reused_each_layer
+    official_ablation: gt.update_e_false
+    pair_state: official_encoded_rrwp_plus_edge_attr_held_static_across_layers
+    not_the_same_as: graphormer_like_attention_ablation
   common_gnn_plus_controls:
     layers: 6
     activation: relu
     residual: true
     ffn: true
+    ffn_multiplier: 2
     dropout: 0.1
     node_pe: rwse16
-    norm_style: graphbench_algorithmic_gnnplus_layernorm
-    edge_feature_integration: true
+    norm_style: gnn_plus_official_batchnorm
+    pe_attach: official_rwse_concat_node_encoder_for_controlled_pe_condition
   gcn_plus:
     inherits: common_gnn_plus_controls
     hidden_dim: 240
     ffn_dim: 480
-    pe_encoder: {raw_norm: batchnorm, layers: 2, dim_pe: 240}
-    trainable_parameters: 2244533
-    message_passing: gcn_with_edge_feature_integration
+    pe_encoder: {raw_norm: batchnorm, layers: 2, dim_pe: 32, attach: concat_into_node_embedding_budget}
+    trainable_parameters: count_from_official_backend_before_training
+    message_passing: official_gcn_plus_or_explicitly_labelled_gcne_plus_if_edge_aware_variant_is_used
   gin_plus:
     inherits: common_gnn_plus_controls
     hidden_dim: 224
     ffn_dim: 448
-    pe_encoder: {raw_norm: batchnorm, layers: 2, dim_pe: 224}
-    trainable_parameters: 2258571
-    message_passing: gin
+    pe_encoder: {raw_norm: batchnorm, layers: 2, dim_pe: 32, attach: concat_into_node_embedding_budget}
+    trainable_parameters: count_from_official_backend_before_training
+    message_passing: official_gine_plus
     gin_mlp_layers: 2
-    epsilon: trainable
+    epsilon: official_pyg_gine_default_unless_explicitly_changed_and_reported
   gatedgcn_plus:
     inherits: common_gnn_plus_controls
     hidden_dim: 184
     ffn_dim: 368
-    pe_encoder: {raw_norm: batchnorm, layers: 2, dim_pe: 184}
-    trainable_parameters: 2183165
-    message_passing: residual_gated_gcn
+    pe_encoder: {raw_norm: batchnorm, layers: 2, dim_pe: 32, attach: concat_into_node_embedding_budget}
+    trainable_parameters: count_from_official_backend_before_training
+    message_passing: official_residual_gated_gcn_plus
     edge_state_updates: true
 
 implementation_fidelity:
+  overall_status: official_backends_required_before_paper_training
   graphormer:
+    target: official_graphormer_modules_not_local_dense_approximation
     required_before_paper_claims:
-      - verify_or_implement_true_multi_hop_edge_encoding_if_claiming_full_Graphormer
-      - otherwise_report_as_Graphormer_style_SPD_degree_direct_edge_bias
+      - use_official_GraphNodeFeature
+      - use_official_GraphAttnBias_with_edge_input_and_edge_dis_encoder
+      - use_official_GraphormerGraphEncoderLayer
   gnn_plus:
-    target: faithful_GNN_plus_controls_from_official_implementation_where_possible
-    components_required: [edge_features, normalization, dropout, residual_connections, FFN, positional_encoding]
-    local_runner_notes:
-      - GIN_plus_uses_trainable_epsilon
-      - GNN_plus_layers_are_compact_algorithmic_adaptations_and_must_be_cross_checked_against_official_GNNPlus_before_final_paper_wording
-    final_paper_wording_if_not_cross_checked: GNN_plus_style_controls
+    target: official_custom_gnn_layers
+    components_required: [BatchNorm1d, dropout, residual_connections, FFN_2x, positional_encoding, exact_message_passing_layer]
+  graphgps:
+    target: official_GPSLayer_and_RWSENodeEncoder
+  grit:
+    target: official_GritTransformerLayer_RRWP_encoders_and_degree_scaler
+  local_runner_allowed_use: smoke_tests_data_cache_slurm_debugging_only
 
 slurm:
   execution_unit: one_task_one_model_one_seed
+  train_eval_status: blocked_until_official_model_backends_are_wired
+  smoke_test_override_only: --allow-local-style-models
   precompute_pe_first: true_one_task_at_a_time
   base_pe_precompute_array: slurm/precompute_pe.sbatch
   base_train_array: slurm/train_base_array.sbatch

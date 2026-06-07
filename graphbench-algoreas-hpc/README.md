@@ -3,12 +3,30 @@
 This repository contains the HPC/SLURM setup for compact hard-OOD GraphBench
 algorithmic base training.
 
+## Model Fidelity
+
+Paper runs should use official-backed model implementations. The current
+`bin/algoreas_hpc.py` runner is useful for GraphBench loading, PE-cache,
+checkpointing, logging, and SLURM scaffolding, but its local dense model classes
+must not be reported as faithful Graphormer, GraphGPS, GRIT, or GNN+
+implementations.
+
+See `docs/model_fidelity_audit.md` before launching paper runs. The intended
+implementation boundary is:
+
+- official repos provide model/layer implementations
+- this repo provides GraphBench adapters, cached PEs, task heads, metrics,
+  checkpointing, W&B, and SLURM orchestration
+
 ## Files
 
 ```bash
 bin/algoreas_hpc.py
 bin/aggregate_hpc_results.py
+bin/check_official_backends.py
 configs/algoreas_hpc_base_v1.yaml
+docs/hpc_environment.md
+docs/model_fidelity_audit.md
 slurm/precompute_pe.sbatch
 slurm/train_base_array.sbatch
 slurm/final_eval_array.sbatch
@@ -50,6 +68,12 @@ Inspect the job table:
 python bin/algoreas_hpc.py --print-jobs
 ```
 
+Check official backend imports:
+
+```bash
+python bin/check_official_backends.py
+```
+
 Precompute base PE caches. This is a CPU array over the five tasks and runs one
 task at a time via `%1`:
 
@@ -63,6 +87,11 @@ one A100 job at a time via `%1`:
 ```bash
 sbatch slurm/train_base_array.sbatch
 ```
+
+At present this command is intentionally blocked by the Python runner until
+official model backends are wired in. To run only a local smoke test of the
+scaffold, pass `--allow-local-style-models` manually; do not use that flag for
+paper results.
 
 Optional full final evaluation from `best.pt`:
 
@@ -103,3 +132,26 @@ fails instead of silently recomputing expensive PEs inside the GPU job.
 - Default LR policy: family-fixed, `2e-4` for transformer-style models and
   `1e-3` for GNN+ models
 - Full train/val/test final eval is separate from base training
+
+## Official Model Backends
+
+Use pinned official sources in the HPC environment:
+
+```bash
+git clone --recurse-submodules https://github.com/microsoft/Graphormer.git external/Graphormer
+git clone https://github.com/rampasek/GraphGPS.git external/GraphGPS
+git clone https://github.com/LiamMa/GRIT.git external/GRIT
+git clone https://github.com/LUOyk1999/tunedGNN-G.git external/GNNPlus
+```
+
+Checked commits are recorded in `docs/model_fidelity_audit.md`. Pinning exact
+commits is recommended for paper runs.
+
+Before launching training arrays, run:
+
+```bash
+python bin/check_official_backends.py
+```
+
+All rows must pass. Environment notes and likely import failures are listed in
+`docs/hpc_environment.md`.
