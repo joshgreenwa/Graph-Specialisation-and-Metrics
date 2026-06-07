@@ -40,10 +40,10 @@ env.example
 Set these before submitting jobs:
 
 ```bash
-export PROJECT_ROOT=/rds/user/jgg45/hpc-work/graphbench-algoreas-hpc
-export GRAPHBENCH_DATASET_ROOT=/rds/user/jgg45/hpc-work/graphbench-algoreas-hpc/datasets
-export GRAPHBENCH_PE_CACHE_ROOT=/rds/user/jgg45/hpc-work/graphbench-algoreas-hpc/pe_cache
-export GRAPHBENCH_OUTPUT_ROOT=/rds/user/jgg45/hpc-work/graphbench-algoreas-hpc/outputs
+export PROJECT_ROOT=/rds/user/jgg45/hpc-work/Graph-Specialisation-and-Metrics/graphbench-algoreas-hpc
+export GRAPHBENCH_DATASET_ROOT=/rds/user/jgg45/hpc-work/graphbench-algoreas/datasets
+export GRAPHBENCH_PE_CACHE_ROOT=/rds/user/jgg45/hpc-work/graphbench-algoreas/pe_cache
+export GRAPHBENCH_OUTPUT_ROOT=/rds/user/jgg45/hpc-work/graphbench-algoreas/outputs
 export ENV_ACTIVATE=/path/to/venv_or_conda_activate_script  # optional
 export GRAPHBENCH_NUM_WORKERS=4
 export WANDB_MODE=online
@@ -110,7 +110,7 @@ sbatch slurm/aggregate_results.sbatch
 Base-training PEs use:
 
 ```bash
---pe-cache-namespace base
+--pe-cache-namespace base_40k4k4k_n64
 ```
 
 Do not reuse this namespace for later size-generalisation runs. Use a separate
@@ -130,7 +130,11 @@ temporary shard directory is removed.
 
 - Tasks: `bipartite_matching_hard`, `flow_hard`, `mst_hard`,
   `maxclique_hard`, `bridges_hard`
-- Splits: `40k/4k/8k`, hard OOD, `n=16` train and `n=128` val/test
+- Splits: `40k/4k/4k`, hard OOD, `n=16/16/64` train/val/test
+- Note: GraphBench's normal hard AlgoReas loader validates at `n=16` and tests
+  most tasks at `n=128` (`flow` at `n=64`). This base run uses a compact
+  `n=64` test for all tasks to reduce PE cost; full `n=128` evaluation can be
+  run later from saved checkpoints.
 - Models: Graphormer, GraphGPS, static-GRIT, GRIT, GatedGCN+, GIN+, GCN+
 - Seeds: `0,1,2,3`
 - Training: 5000 steps, batch 1024, 500 warmup, cosine decay

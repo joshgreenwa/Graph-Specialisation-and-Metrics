@@ -10,10 +10,10 @@
 
 set -euo pipefail
 
-PROJECT_ROOT="${PROJECT_ROOT:-/rds/user/jgg45/hpc-work/graphbench-algoreas-hpc}"
-GRAPHBENCH_DATASET_ROOT="${GRAPHBENCH_DATASET_ROOT:-/rds/user/jgg45/hpc-work/graphbench-algoreas-hpc/datasets}"
-GRAPHBENCH_PE_CACHE_ROOT="${GRAPHBENCH_PE_CACHE_ROOT:-/rds/user/jgg45/hpc-work/graphbench-algoreas-hpc/pe_cache}"
-GRAPHBENCH_OUTPUT_ROOT="${GRAPHBENCH_OUTPUT_ROOT:-/rds/user/jgg45/hpc-work/graphbench-algoreas-hpc/outputs}"
+PROJECT_ROOT="${PROJECT_ROOT:-/rds/user/jgg45/hpc-work/Graph-Specialisation-and-Metrics/graphbench-algoreas-hpc}"
+GRAPHBENCH_DATASET_ROOT="${GRAPHBENCH_DATASET_ROOT:-/rds/user/jgg45/hpc-work/graphbench-algoreas/datasets}"
+GRAPHBENCH_PE_CACHE_ROOT="${GRAPHBENCH_PE_CACHE_ROOT:-/rds/user/jgg45/hpc-work/graphbench-algoreas/pe_cache}"
+GRAPHBENCH_OUTPUT_ROOT="${GRAPHBENCH_OUTPUT_ROOT:-/rds/user/jgg45/hpc-work/graphbench-algoreas/outputs}"
 
 cd "${PROJECT_ROOT}"
 mkdir -p logs "${GRAPHBENCH_DATASET_ROOT}" "${GRAPHBENCH_PE_CACHE_ROOT}" "${GRAPHBENCH_OUTPUT_ROOT}"
@@ -29,8 +29,14 @@ python bin/algoreas_hpc.py \
   --array-index "${SLURM_ARRAY_TASK_ID}" \
   --dataset-root "${GRAPHBENCH_DATASET_ROOT}" \
   --pe-cache-root "${GRAPHBENCH_PE_CACHE_ROOT}" \
-  --pe-cache-namespace base \
+  --pe-cache-namespace base_40k4k4k_n64 \
   --output-root "${GRAPHBENCH_OUTPUT_ROOT}" \
+  --train-size 40000 \
+  --val-size 4000 \
+  --test-size 4000 \
+  --train-node-size 16 \
+  --val-node-size 16 \
+  --test-node-size 64 \
   --pe-cache-dtype float32 \
   --no-build-missing-pe-cache \
   --require-pe-cache \

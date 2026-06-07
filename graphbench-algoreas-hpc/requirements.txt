@@ -1,4 +1,6 @@
 torch
+numpy<2
+torch_geometric>=2.5,<2.7
 graphbench-lib
 matplotlib
 pyyaml

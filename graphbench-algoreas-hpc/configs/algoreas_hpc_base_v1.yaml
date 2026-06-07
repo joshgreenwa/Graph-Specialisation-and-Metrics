@@ -91,18 +91,24 @@ dataset:
     generator_weights: {ER: 1.0, PC: 0.0, NWS: 0.0, BA: 0.0, DBA: 0.0, SBM: 0.0}
   val:
     num_graphs: 4000
-    num_nodes: 128
+    num_nodes: 16
     generator_weights: {ER: 0.0, PC: 0.2, NWS: 0.2, BA: 0.2, DBA: 0.2, SBM: 0.2}
   test:
-    num_graphs: 8000
-    num_nodes: 128
+    num_graphs: 4000
+    num_nodes: 64
     generator_weights: {ER: 0.0, PC: 0.2, NWS: 0.2, BA: 0.2, DBA: 0.2, SBM: 0.2}
+  compact_protocol_note: >-
+    GraphBench's normal hard AlgoReas loader derives validation from n=16
+    training graphs and uses n=128 test graphs for most tasks, with n=64 for
+    flow. This compact base protocol uses n=64 test graphs for all selected
+    tasks to keep PE precompute and base-model training controlled for
+    mechanistic analysis.
   cache:
     cache_converted_graphs: true
     cache_pe_tensors_on_disk: true
     pe_cache_dtype: float32
     pe_cache_root: user_supplied_hpc_shared_filesystem_path
-    base_pe_cache_namespace: base
+    base_pe_cache_namespace: base_40k4k4k_n64
     size_generalisation_pe_cache_namespace: sizegen_later_not_used_by_base_training
     pe_tensors_computed_in_collate: fallback_only
     training_jobs_attach_pe_for_splits: [train, val]
@@ -113,7 +119,9 @@ dataset:
       --precompute-pe-only --tasks ${TASK}
       --dataset-root ${GRAPHBENCH_DATASET_ROOT}
       --pe-cache-root ${GRAPHBENCH_PE_CACHE_ROOT}
-      --pe-cache-namespace base
+      --pe-cache-namespace base_40k4k4k_n64
+      --train-size 40000 --val-size 4000 --test-size 4000
+      --train-node-size 16 --val-node-size 16 --test-node-size 64
       --output-root ${GRAPHBENCH_OUTPUT_ROOT}
       --device cpu --allow-cpu
 
@@ -407,8 +415,10 @@ slurm:
     --array-index ${SLURM_ARRAY_TASK_ID}
     --dataset-root ${GRAPHBENCH_DATASET_ROOT}
     --pe-cache-root ${GRAPHBENCH_PE_CACHE_ROOT}
-    --pe-cache-namespace base
+    --pe-cache-namespace base_40k4k4k_n64
     --output-root ${GRAPHBENCH_OUTPUT_ROOT}
+    --train-size 40000 --val-size 4000 --test-size 4000
+    --train-node-size 16 --val-node-size 16 --test-node-size 64
     --no-build-missing-pe-cache
     --require-pe-cache
   optional_final_eval_command: >-
@@ -416,8 +426,10 @@ slurm:
     --array-index ${SLURM_ARRAY_TASK_ID}
     --dataset-root ${GRAPHBENCH_DATASET_ROOT}
     --pe-cache-root ${GRAPHBENCH_PE_CACHE_ROOT}
-    --pe-cache-namespace base
+    --pe-cache-namespace base_40k4k4k_n64
     --output-root ${GRAPHBENCH_OUTPUT_ROOT}
+    --train-size 40000 --val-size 4000 --test-size 4000
+    --train-node-size 16 --val-node-size 16 --test-node-size 64
     --no-build-missing-pe-cache
     --require-pe-cache
     --final-eval

@@ -17,7 +17,7 @@ conda activate graphbench-algoreas
 
 pip install torch==2.2.0 torchvision==0.17.0 torchaudio==2.2.0 \
   --index-url https://download.pytorch.org/whl/cu118
-pip install torch_geometric==2.3.1
+pip install "numpy<2" "torch_geometric>=2.5,<2.7"
 pip install pyg_lib torch_scatter torch_sparse torch_cluster torch_spline_conv \
   -f https://data.pyg.org/whl/torch-2.2.0+cu118.html
 
@@ -76,4 +76,3 @@ Expected local failure modes if the environment is not ready:
   `--recurse-submodules`.
 - `graphbench` missing: GraphBench loader is not installed.
 - Python 3.13: use a Python 3.10 environment for HPC runs.
-

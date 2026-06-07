@@ -55,6 +55,15 @@ DEFAULT_TASKS = ("bipartite_matching_hard", "flow_hard", "mst_hard", "maxclique_
 CALIBRATION_TASKS = ("mst_easy", "bridges_easy", "flow_easy")
 MODEL_NAMES = ("graphormer", "graphgps", "grit", "static_grit", "gcn_plus", "gin_plus", "gatedgcn_plus")
 DEFAULT_MODELS = ("graphormer", "graphgps", "static_grit", "grit", "gatedgcn_plus", "gin_plus", "gcn_plus")
+ALGOREAS_DATASET_NAMES = {
+    "topologicalorder": "topologicalorder",
+    "bipartite_matching": "bipartitematching",
+    "mst": "mst",
+    "steinertree": "steinertree",
+    "bridges": "bridges",
+    "maxclique": "maxclique",
+    "flow": "flow",
+}
 RW_STEPS = 16
 RRWP_STEPS = 16
 GRAPHORMER_NUM_SPATIAL = 512
@@ -113,8 +122,8 @@ PROTOCOL_CONFIG = {
     "graph_format": "original_graph",
     "edge_token_transform": False,
     "tasks": DEFAULT_TASKS,
-    "split_sizes": {"train": 40000, "val": 4000, "test": 8000},
-    "split_nodes": {"train": 16, "val": 128, "test": 128},
+    "split_sizes": {"train": 40000, "val": 4000, "test": 4000},
+    "split_nodes": {"train": 16, "val": 16, "test": 64},
     "model_size_preset": "paper_matched_about_2p2m_params",
     "lr_policy": "fair_family_fixed",
     "fair_family_learning_rates": FAIR_FAMILY_LRS,
@@ -144,7 +153,10 @@ class ScreenConfig:
     split_seed: int = 0
     train_size: int = 40000
     val_size: int = 4000
-    test_size: int = 8000
+    test_size: int = 4000
+    train_node_size: int = 16
+    val_node_size: int = 16
+    test_node_size: int = 64
     batch_size: int = 0
     eval_batch_size: int = 0
     max_steps: int = 5000
@@ -471,11 +483,25 @@ def compute_graph_pe(graph: OfficialGraph, dtype: torch.dtype) -> tuple[torch.Te
     return spd, rwse.to(dtype), rrwp.to(dtype)
 
 
-def compute_graph_pe_worker(args: tuple[int, OfficialGraph, str]) -> tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]:
-    idx, graph, dtype_name = args
+def compute_graph_pe_from_edge_index(num_nodes: int, edge_index: object, dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    adj = torch.zeros(num_nodes, num_nodes, dtype=torch.float32)
+    edge_index_t = torch.as_tensor(edge_index, dtype=torch.long)
+    src = edge_index_t[0].long()
+    dst = edge_index_t[1].long()
+    adj[src, dst] = 1.0
+    adj[dst, src] = 1.0
+    spd = shortest_path_buckets(adj).to(torch.int16)
+    rwse, rrwp = random_walk_features(adj)
+    return spd, rwse.to(dtype), rrwp.to(dtype)
+
+
+def compute_graph_pe_worker(args: tuple[int, int, object, str]) -> tuple[int, object, object, object]:
+    idx, num_nodes, edge_index, dtype_name = args
     torch.set_num_threads(1)
-    spd, rwse, rrwp = compute_graph_pe(graph, pe_dtype_from_name(dtype_name))
-    return idx, spd, rwse, rrwp
+    spd, rwse, rrwp = compute_graph_pe_from_edge_index(num_nodes, edge_index, pe_dtype_from_name(dtype_name))
+    # Return NumPy arrays instead of tensors. Torch tensor IPC uses shared-memory
+    # file descriptors and can fail on restricted HPC nodes with mmap errors.
+    return idx, spd.numpy(), rwse.numpy(), rrwp.numpy()
 
 
 def graph_with_pe(
@@ -497,8 +523,13 @@ def graph_with_pe(
     )
 
 
-def pe_cache_path(root: Path, namespace: str, task_name: str, split: str, size: int, seed: int, dtype_name: str) -> Path:
-    return root / RUN_VERSION / namespace / f"{task_name}_{split}_n{size}_seed{seed}_rw{RW_STEPS}_rrwp{RRWP_STEPS}_{dtype_name}.pt"
+def pe_cache_path(root: Path, namespace: str, task_name: str, split: str, size: int, node_size: int, seed: int, dtype_name: str) -> Path:
+    return (
+        root
+        / RUN_VERSION
+        / namespace
+        / f"{task_name}_{split}_graphs{size}_nodes{node_size}_seed{seed}_rw{RW_STEPS}_rrwp{RRWP_STEPS}_{dtype_name}.pt"
+    )
 
 
 def pe_partial_cache_dir(path: Path) -> Path:
@@ -653,11 +684,17 @@ def save_pe_cache(
                 log(f"[pe] {dataset.task_name}/{dataset.split}: {completed}/{len(dataset)} graphs precomputed")
     else:
         chunk_size = max(1, min(128, len(missing_items) // (pe_workers * 8) if missing_items else 1))
-        work_items = ((idx, graph, dtype_name) for idx, graph in missing_items)
+        work_items = (
+            (idx, graph.num_nodes, graph.edge_index.cpu().numpy(), dtype_name)
+            for idx, graph in missing_items
+        )
         mp_context = multiprocessing.get_context("fork")
         with ProcessPoolExecutor(max_workers=pe_workers, mp_context=mp_context) as executor:
             iterator = executor.map(compute_graph_pe_worker, work_items, chunksize=chunk_size)
             for done_missing, (idx, spd, rwse, rrwp) in enumerate(iterator, start=1):
+                spd = torch.as_tensor(spd)
+                rwse = torch.as_tensor(rwse)
+                rrwp = torch.as_tensor(rrwp)
                 graph = dataset.graphs[idx]
                 item = {"spd": spd, "rwse": rwse, "rrwp": rrwp}
                 graphs[idx] = graph_with_pe(graph, spd, rwse, rrwp)
@@ -707,10 +744,20 @@ def attach_or_build_pe_cache(
     log=print,
 ) -> dict[str, OfficialGraphDataset]:
     split_sizes = {"train": cfg.train_size, "val": cfg.val_size, "test": cfg.test_size}
+    split_nodes = {"train": cfg.train_node_size, "val": cfg.val_node_size, "test": cfg.test_node_size}
     split_seeds = {"train": 101, "val": 211, "test": 307}
     out: dict[str, OfficialGraphDataset] = {}
     for split, dataset in splits.items():
-        path = pe_cache_path(root, namespace, dataset.task_name, split, split_sizes[split], cfg.split_seed + split_seeds[split], dtype_name)
+        path = pe_cache_path(
+            root,
+            namespace,
+            dataset.task_name,
+            split,
+            split_sizes[split],
+            split_nodes[split],
+            cfg.split_seed + split_seeds[split],
+            dtype_name,
+        )
         cached = None if force_recompute else load_pe_cache(path, dataset, dtype_name, log=log)
         if cached is not None:
             out[split] = cached
@@ -773,8 +820,8 @@ def deterministic_subset(dataset: Sequence[object], size: int, seed: int) -> lis
     return [dataset[i] for i in idxs]
 
 
-def subset_cache_path(root: Path, task_name: str, split: str, size: int, seed: int) -> Path:
-    return root / "_hpc_subset_cache" / f"{task_name}_{split}_n{size}_seed{seed}_{RUN_VERSION}.pt"
+def subset_cache_path(root: Path, task_name: str, split: str, size: int, node_size: int, seed: int) -> Path:
+    return root / "_hpc_subset_cache" / f"{task_name}_{split}_graphs{size}_nodes{node_size}_seed{seed}_{RUN_VERSION}.pt"
 
 
 def load_subset_cache(path: Path, task_name: str, split: str) -> Optional[OfficialGraphDataset]:
@@ -846,6 +893,23 @@ def get_official_split(split_map: Mapping[str, object], split: str) -> object:
     raise KeyError(f"GraphBench loader did not return split={split!r}; available keys={list(split_map.keys())}")
 
 
+def split_task_difficulty(task_name: str) -> tuple[str, str]:
+    for difficulty in DIFFICULTIES:
+        suffix = f"_{difficulty}"
+        if task_name.endswith(suffix):
+            return task_name[: -len(suffix)], difficulty
+    raise ValueError(f"task name must end with one of {DIFFICULTIES}: {task_name}")
+
+
+def algoreas_dataset_name(task_name: str, node_size: int) -> str:
+    task_base, difficulty = split_task_difficulty(task_name)
+    try:
+        dataset_base = ALGOREAS_DATASET_NAMES[task_base]
+    except KeyError as exc:
+        raise ValueError(f"unsupported AlgoReas task for direct node-size loading: {task_name}") from exc
+    return f"algoreas_{dataset_base}_{difficulty}_{node_size}"
+
+
 def load_official_graphbench_task(
     root: Path,
     task_name: str,
@@ -854,11 +918,17 @@ def load_official_graphbench_task(
     log=print,
 ) -> dict[str, OfficialGraphDataset]:
     split_sizes = {"train": cfg.train_size, "val": cfg.val_size, "test": cfg.test_size}
+    split_nodes = {"train": cfg.train_node_size, "val": cfg.val_node_size, "test": cfg.test_node_size}
     split_seeds = {"train": 101, "val": 211, "test": 307}
+    if cfg.train_node_size != cfg.val_node_size:
+        raise ValueError(
+            "GraphBench AlgoReas validation is derived from the training-size dataset; "
+            f"got train_node_size={cfg.train_node_size}, val_node_size={cfg.val_node_size}."
+        )
     cached: dict[str, OfficialGraphDataset] = {}
     if not force_reload:
         for split, size in split_sizes.items():
-            path = subset_cache_path(root, task_name, split, size, cfg.split_seed + split_seeds[split])
+            path = subset_cache_path(root, task_name, split, size, split_nodes[split], cfg.split_seed + split_seeds[split])
             dataset = load_subset_cache(path, task_name, split)
             if dataset is None:
                 cached = {}
@@ -875,21 +945,39 @@ def load_official_graphbench_task(
             return normalize_edge_values_in_splits(cached, log=log)
 
     require_package("graphbench", "graphbench-lib", log=log)
-    from graphbench import Loader  # type: ignore
+    from graphbench.co_helpers.split_dataset import split_dataset  # type: ignore
+    from graphbench.datasets.algoreas import AlgoReasDataset  # type: ignore
 
-    log(f"[data] Loading official GraphBench task={task_name}")
-    loader = Loader(root=str(root), dataset_names=task_name)
-    loaded = loader.load()
-    if len(loaded) != 1:
-        raise RuntimeError(f"expected one loaded task for {task_name}, got {len(loaded)}")
-    split_map = loaded[0]
+    log(
+        f"[data] Loading official GraphBench task={task_name} "
+        f"graphs={split_sizes} nodes={split_nodes}"
+    )
+    train_full = AlgoReasDataset(
+        root=str(root),
+        name=algoreas_dataset_name(task_name, cfg.train_node_size),
+        split="train",
+        generate=False,
+    )
+    train_raw, val_raw, _ = split_dataset(train_full, 0.99, 0.01, 0)
+    test_raw = AlgoReasDataset(
+        root=str(root),
+        name=algoreas_dataset_name(task_name, cfg.test_node_size),
+        split="test",
+        generate=False,
+    )
+    split_map = {"train": train_raw, "val": val_raw, "test": test_raw}
     out = {}
     for split, size in split_sizes.items():
         raw_dataset = get_official_split(split_map, split)
         raw_graphs = deterministic_subset(raw_dataset, size, cfg.split_seed + split_seeds[split])
         graphs = [graph_from_pyg(graph, task_name) for graph in raw_graphs]
         out[split] = OfficialGraphDataset(graphs, task_name=task_name, split=split)
-        save_subset_cache(subset_cache_path(root, task_name, split, size, cfg.split_seed + split_seeds[split]), task_name, split, graphs)
+        save_subset_cache(
+            subset_cache_path(root, task_name, split, size, split_nodes[split], cfg.split_seed + split_seeds[split]),
+            task_name,
+            split,
+            graphs,
+        )
         node_counts = [graph.num_nodes for graph in graphs]
         log(
             f"[data] {task_name}/{split}: selected={len(graphs)} "
@@ -2188,6 +2276,9 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--train-size", type=int, default=ScreenConfig.train_size)
     parser.add_argument("--val-size", type=int, default=ScreenConfig.val_size)
     parser.add_argument("--test-size", type=int, default=ScreenConfig.test_size)
+    parser.add_argument("--train-node-size", type=int, default=ScreenConfig.train_node_size)
+    parser.add_argument("--val-node-size", type=int, default=ScreenConfig.val_node_size)
+    parser.add_argument("--test-node-size", type=int, default=ScreenConfig.test_node_size)
     parser.add_argument("--batch-size", type=int, default=ScreenConfig.batch_size, help="0 uses the A100-oriented per-model train batch table.")
     parser.add_argument("--eval-batch-size", type=int, default=ScreenConfig.eval_batch_size, help="0 uses the A100-oriented per-model eval batch table.")
     parser.add_argument("--max-steps", type=int, default=ScreenConfig.max_steps)
@@ -2213,7 +2304,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--no-gnnplus-ffn", action="store_true")
     parser.add_argument("--dataset-root", type=Path, default=env_path("GRAPHBENCH_DATASET_ROOT"))
     parser.add_argument("--pe-cache-root", type=Path, default=env_path("GRAPHBENCH_PE_CACHE_ROOT"))
-    parser.add_argument("--pe-cache-namespace", default="base", help="Subdirectory namespace under RUN_VERSION, e.g. base or sizegen_n256.")
+    parser.add_argument("--pe-cache-namespace", default="base_40k4k4k_n64", help="Subdirectory namespace under RUN_VERSION, e.g. base_40k4k4k_n64 or sizegen_n256.")
     parser.add_argument("--pe-cache-dtype", choices=("float32", "float16"), default="float32")
     parser.add_argument("--precompute-pe-only", action="store_true", help="Build reusable SPD/RWSE/RRWP caches for selected tasks, then exit.")
     parser.add_argument("--pe-workers", type=int, default=int(os.environ.get("GRAPHBENCH_PE_WORKERS", "1")), help="Parallel worker processes for PE precompute. Use 1 for serial.")
@@ -2256,6 +2347,9 @@ def cfg_from_args(args: argparse.Namespace, seed: int) -> ScreenConfig:
         train_size=args.train_size,
         val_size=args.val_size,
         test_size=args.test_size,
+        train_node_size=args.train_node_size,
+        val_node_size=args.val_node_size,
+        test_node_size=args.test_node_size,
         batch_size=args.batch_size,
         eval_batch_size=args.eval_batch_size,
         max_steps=args.max_steps,
@@ -2344,6 +2438,12 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     log(f"[setup] dataset_root={dataset_root}")
     log(f"[setup] pe_cache_root={pe_cache_root}")
     log(f"[setup] output_root={output_root}")
+    log(
+        "[setup] split_graphs="
+        f"train:{args.train_size} val:{args.val_size} test:{args.test_size} "
+        "split_nodes="
+        f"train:{args.train_node_size} val:{args.val_node_size} test:{args.test_node_size}"
+    )
     log(f"[setup] dataloader_workers={DATALOADER_NUM_WORKERS} pin_memory={DATALOADER_PIN_MEMORY}")
     wandb_settings = {
         "mode": args.wandb_mode,
