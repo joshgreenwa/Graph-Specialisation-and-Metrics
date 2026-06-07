@@ -2275,6 +2275,14 @@ def make_grad_scaler(use_amp: bool):
     return torch.cuda.amp.GradScaler(enabled=use_amp)
 
 
+def model_supports_amp(model_name: str, model_backend: str) -> bool:
+    # Official GRIT attention mixes torch_scatter with autocast-sensitive sparse
+    # edge states; keep it fp32 to avoid dtype mismatches inside scatter_add.
+    if model_backend == "official" and model_name in {"grit", "static_grit"}:
+        return False
+    return True
+
+
 def dataset_stats(dataset: Dataset[OfficialGraph]) -> dict[str, object]:
     nodes = [dataset[i].num_nodes for i in range(len(dataset))]
     edges = [int(dataset[i].edge_index.size(1)) for i in range(len(dataset))]
@@ -2404,12 +2412,13 @@ def train_one(
     resolved_lr = learning_rate_for(model_name, task, cfg)
     train_batch_size = train_batch_size_for(model_name, cfg)
     eval_batch_size = eval_batch_size_for(model_name, cfg)
-    use_amp = cfg.amp and device.type == "cuda"
+    use_amp = cfg.amp and device.type == "cuda" and model_supports_amp(model_name, model_backend)
     watch_graphs = deterministic_subset(splits["val"], min(cfg.val_watch_size, len(splits["val"])), cfg.split_seed + 4099)
     watch_dataset = OfficialGraphDataset(watch_graphs, task_name=task, split="val_watch")
     run_log(
         f"[run] task={task} model={model_name} backend={model_backend} seed={cfg.seed} params={n_params:,} "
-        f"lr={resolved_lr:g} train_batch={train_batch_size} eval_batch={eval_batch_size} device={device}"
+        f"lr={resolved_lr:g} train_batch={train_batch_size} eval_batch={eval_batch_size} "
+        f"device={device} amp={use_amp}"
     )
     run_log(f"[data] stats={json.dumps({k: dataset_stats(v) for k, v in splits.items()}, sort_keys=True)}")
     if target_stats is not None:
