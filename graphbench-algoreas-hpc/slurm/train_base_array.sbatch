@@ -32,4 +32,7 @@ python bin/algoreas_hpc.py \
   --pe-cache-dtype float32 \
   --no-build-missing-pe-cache \
   --require-pe-cache \
-  --num-workers "${GRAPHBENCH_NUM_WORKERS:-4}"
+  --num-workers "${GRAPHBENCH_NUM_WORKERS:-4}" \
+  --wandb-mode "${WANDB_MODE:-online}" \
+  --wandb-project "${WANDB_PROJECT:-graphbench-algoreas-hpc}" \
+  --wandb-tags "${WANDB_TAGS:-base,hpc}"

@@ -28,13 +28,19 @@ export GRAPHBENCH_PE_CACHE_ROOT=/rds/user/jgg45/hpc-work/graphbench-algoreas-hpc
 export GRAPHBENCH_OUTPUT_ROOT=/rds/user/jgg45/hpc-work/graphbench-algoreas-hpc/outputs
 export ENV_ACTIVATE=/path/to/venv_or_conda_activate_script  # optional
 export GRAPHBENCH_NUM_WORKERS=4
+export WANDB_MODE=online
+export WANDB_PROJECT=graphbench-algoreas-hpc
+export WANDB_TAGS=base,hpc
+export WANDB_API_KEY=replace_with_your_wandb_key
 ```
 
 The SLURM scripts use these RDS paths as defaults, so exporting them is only
 needed if you want to override the default locations.
 
-The environment must already provide `torch`, `graphbench-lib`, and the usual
+The environment must already provide `torch`, `graphbench-lib`, `wandb`, and the usual
 scientific Python stack. The runner does not install packages inside jobs.
+W&B logging is enabled by default for train/eval jobs when `WANDB_API_KEY` is
+set. If needed, disable it with `WANDB_MODE=disabled`.
 
 ## Submit Order
 

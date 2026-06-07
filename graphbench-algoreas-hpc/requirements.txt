@@ -2,3 +2,4 @@ torch
 graphbench-lib
 matplotlib
 pyyaml
+wandb

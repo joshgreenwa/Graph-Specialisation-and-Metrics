@@ -285,6 +285,91 @@ class RunLogger:
             handle.write(message + "\n")
 
 
+def parse_wandb_tags(text: str) -> list[str]:
+    return [part.strip() for part in text.replace(";", ",").split(",") if part.strip()]
+
+
+def maybe_init_wandb(
+    settings: Mapping[str, object],
+    task: str,
+    model_name: str,
+    cfg: ScreenConfig,
+    run_dir: Path,
+    n_params: int,
+    resolved_lr: float,
+    train_batch_size: int,
+    eval_batch_size: int,
+    log=print,
+):
+    mode = str(settings.get("mode", "online"))
+    if mode == "disabled":
+        return None
+    if mode == "online" and not os.environ.get("WANDB_API_KEY"):
+        log("[wandb] WANDB_API_KEY is not set; skipping W&B logging")
+        return None
+    try:
+        import wandb  # type: ignore
+    except Exception as exc:
+        log(f"[wandb] wandb is not installed; skipping W&B logging: {exc}")
+        return None
+
+    project = str(settings.get("project") or "graphbench-algoreas-hpc")
+    entity = settings.get("entity") or None
+    job_type = "final_eval" if cfg.final_eval else "train"
+    name = f"{task}__{model_name}__seed{cfg.seed}"
+    if cfg.final_eval:
+        name = f"{name}__eval"
+    tags = [
+        "graphbench",
+        "algorithmic",
+        "hpc",
+        "base",
+        task,
+        model_name,
+        f"seed{cfg.seed}",
+    ] + parse_wandb_tags(str(settings.get("tags") or ""))
+    wandb_dir = run_dir / "wandb"
+    wandb_dir.mkdir(parents=True, exist_ok=True)
+    run = wandb.init(
+        project=project,
+        entity=str(entity) if entity else None,
+        mode=mode,
+        name=name,
+        group=f"{task}/{model_name}",
+        job_type=job_type,
+        dir=str(wandb_dir),
+        tags=tags,
+        config={
+            "run_name": RUN_NAME,
+            "run_version": RUN_VERSION,
+            "task": task,
+            "model": model_name,
+            "seed": cfg.seed,
+            "trainable_parameters": n_params,
+            "learning_rate": resolved_lr,
+            "train_batch_size": train_batch_size,
+            "eval_batch_size": eval_batch_size,
+            "config": asdict(cfg),
+            "protocol": PROTOCOL_CONFIG,
+        },
+        reinit=True,
+    )
+    log(f"[wandb] enabled project={project} mode={mode} run={run.name}")
+    return run
+
+
+def wandb_log(run: object, data: Mapping[str, object], step: Optional[int] = None) -> None:
+    if run is None:
+        return
+    run.log(dict(data), step=step)
+
+
+def wandb_finish(run: object) -> None:
+    if run is None:
+        return
+    run.finish()
+
+
 def require_package(import_name: str, package_name: str, log=print) -> None:
     try:
         __import__(import_name)
@@ -1575,6 +1660,7 @@ def train_one(
     output_root: Path,
     device: torch.device,
     force_retrain: bool,
+    wandb_settings: Optional[Mapping[str, object]] = None,
     log=print,
 ) -> dict[str, object]:
     set_seed(cfg.seed)
@@ -1602,6 +1688,18 @@ def train_one(
     run_log(f"[data] stats={json.dumps({k: dataset_stats(v) for k, v in splits.items()}, sort_keys=True)}")
     if target_stats is not None:
         run_log(f"[target] train graph target normalization={target_stats}")
+    wandb_run = maybe_init_wandb(
+        wandb_settings or {},
+        task,
+        model_name,
+        cfg,
+        run_dir,
+        n_params,
+        resolved_lr,
+        train_batch_size,
+        eval_batch_size,
+        log=run_log,
+    )
     if best_path.exists() and signature_matches(summary_path, signature) and not force_retrain:
         run_log("[resume] matching checkpoint found; skipping training")
     else:
@@ -1683,6 +1781,23 @@ def train_one(
                         f"elapsed={row['seconds']:.1f}s steps/s={steps_per_sec:.3f} "
                         f"graphs/s={graphs_per_sec:.1f} peak_mem_gb={peak_gb:.2f}"
                     )
+                    wandb_log(
+                        wandb_run,
+                        {
+                            "epoch": epoch,
+                            "lr": row["lr"],
+                            "train/loss": row["train_loss"],
+                            "watch/primary": row["val_primary"],
+                            "watch/loss": row["val_loss"],
+                            "watch/f1": row["val_f1"],
+                            "watch/mae": row["val_mae"],
+                            "throughput/steps_per_sec": steps_per_sec,
+                            "throughput/graphs_per_sec": graphs_per_sec,
+                            "system/peak_cuda_memory_gb": peak_gb,
+                            "time/elapsed_seconds": row["seconds"],
+                        },
+                        step=global_step,
+                    )
                     window_loss = 0.0
                     window_graphs = 0
                     improved = score < best_score - cfg.min_delta
@@ -1741,6 +1856,11 @@ def train_one(
             eval_size = eval_batch_size if split != "train" else train_batch_size
             metrics, _ = evaluate_model(model, splits[split], eval_size, device, use_amp, cfg.seed, pos_weight, target_stats)
             split_metrics[split] = metrics
+            wandb_log(
+                wandb_run,
+                {f"{split}/{key}": value for key, value in metrics.items() if isinstance(value, (int, float))},
+                step=int(ckpt.get("step", 0)),
+            )
     summary = {
         "task": task,
         "task_type": splits["train"][0].task_type,
@@ -1768,6 +1888,10 @@ def train_one(
         )
     else:
         run_log(f"[done] final_eval=skipped best_checkpoint={best_path}")
+    if wandb_run is not None:
+        wandb_run.summary["best_step"] = int(ckpt.get("step", 0))
+        wandb_run.summary["best_checkpoint"] = str(best_path)
+    wandb_finish(wandb_run)
     return summary
 
 
@@ -1947,6 +2071,10 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--output-root", type=Path, default=env_path("GRAPHBENCH_OUTPUT_ROOT"))
     parser.add_argument("--num-workers", type=int, default=DATALOADER_NUM_WORKERS)
     parser.add_argument("--no-pin-memory", action="store_true")
+    parser.add_argument("--wandb-mode", choices=("online", "offline", "disabled"), default=os.environ.get("WANDB_MODE", "online"))
+    parser.add_argument("--wandb-project", default=os.environ.get("WANDB_PROJECT", "graphbench-algoreas-hpc"))
+    parser.add_argument("--wandb-entity", default=os.environ.get("WANDB_ENTITY"))
+    parser.add_argument("--wandb-tags", default=os.environ.get("WANDB_TAGS", ""))
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--allow-cpu", action="store_true")
     parser.add_argument("--no-amp", action="store_true")
@@ -2056,6 +2184,13 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     log(f"[setup] pe_cache_root={pe_cache_root}")
     log(f"[setup] output_root={output_root}")
     log(f"[setup] dataloader_workers={DATALOADER_NUM_WORKERS} pin_memory={DATALOADER_PIN_MEMORY}")
+    wandb_settings = {
+        "mode": args.wandb_mode,
+        "project": args.wandb_project,
+        "entity": args.wandb_entity,
+        "tags": args.wandb_tags,
+    }
+    log(f"[setup] wandb_mode={args.wandb_mode} wandb_project={args.wandb_project}")
     if args.prepare_data_only:
         for task in tasks:
             cfg = cfg_from_args(args, seeds[0])
@@ -2100,7 +2235,17 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             cfg = cfg_from_args(args, seed)
             for model_name in models:
                 model_cfg = model_config_for(model_name, cfg, args.model_size_preset)
-                summary = train_one(task, model_name, splits, model_cfg, output_root, device, force_retrain=args.force_retrain, log=log)
+                summary = train_one(
+                    task,
+                    model_name,
+                    splits,
+                    model_cfg,
+                    output_root,
+                    device,
+                    force_retrain=args.force_retrain,
+                    wandb_settings=wandb_settings,
+                    log=log,
+                )
                 all_summaries.append(summary)
     if not args.skip_suite_summary:
         agg = aggregate_rows(all_summaries)

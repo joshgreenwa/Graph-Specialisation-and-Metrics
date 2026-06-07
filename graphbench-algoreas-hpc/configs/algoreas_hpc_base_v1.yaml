@@ -15,6 +15,16 @@ run:
   optional_environment:
     GRAPHBENCH_NUM_WORKERS: "4"
     GRAPHBENCH_PIN_MEMORY: "1"
+    WANDB_MODE: online
+    WANDB_PROJECT: graphbench-algoreas-hpc
+    WANDB_TAGS: base,hpc
+    WANDB_API_KEY: set_in_shell_not_committed
+  wandb:
+    default: enabled_when_WANDB_API_KEY_is_set
+    mode: online
+    project: graphbench-algoreas-hpc
+    tags: [base, hpc]
+    disable_command: export WANDB_MODE=disabled
   model_seeds: [0, 1, 2, 3]
   split_seed: 0
   default_tasks:
