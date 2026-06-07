@@ -901,13 +901,69 @@ def split_task_difficulty(task_name: str) -> tuple[str, str]:
     raise ValueError(f"task name must end with one of {DIFFICULTIES}: {task_name}")
 
 
-def algoreas_dataset_name(task_name: str, node_size: int) -> str:
+def algoreas_dataset_parts(task_name: str) -> tuple[str, str]:
     task_base, difficulty = split_task_difficulty(task_name)
     try:
         dataset_base = ALGOREAS_DATASET_NAMES[task_base]
     except KeyError as exc:
         raise ValueError(f"unsupported AlgoReas task for direct node-size loading: {task_name}") from exc
+    return dataset_base, difficulty
+
+
+def algoreas_dataset_name(task_name: str, node_size: int) -> str:
+    dataset_base, difficulty = algoreas_dataset_parts(task_name)
     return f"algoreas_{dataset_base}_{difficulty}_{node_size}"
+
+
+def seed_generated_algoreas(seed: int) -> None:
+    random.seed(seed)
+    torch.manual_seed(seed)
+    try:
+        import numpy as np  # type: ignore
+
+        np.random.seed(seed % (2**32))
+    except Exception:
+        pass
+
+
+def load_algoreas_split(
+    root: Path,
+    task_name: str,
+    split: str,
+    node_size: int,
+    requested_size: int,
+    seed: int,
+    allow_generated_fallback: bool,
+    log,
+) -> object:
+    from graphbench.datasets.algoreas import AlgoReasDataset  # type: ignore
+
+    name = algoreas_dataset_name(task_name, node_size)
+    try:
+        return AlgoReasDataset(root=str(root), name=name, split=split, generate=False)
+    except FileNotFoundError:
+        if not allow_generated_fallback:
+            raise
+        log(
+            f"[data] Official preprocessed split missing for {task_name}/{split} "
+            f"nodes={node_size}; generating {requested_size} compact graphs with GraphBench generator seed={seed}"
+        )
+        import graphbench.algoreas_helpers.algoreas_utils as algoreas_utils  # type: ignore
+
+        dataset_base, difficulty = algoreas_dataset_parts(task_name)
+        original_samples = dict(algoreas_utils.SAMPLES)
+        seed_generated_algoreas(seed)
+        algoreas_utils.SAMPLES[split] = requested_size
+        try:
+            return algoreas_utils.generate_algoreas_data(
+                name=dataset_base,
+                num_nodes=int(node_size),
+                difficulty=difficulty,
+                split=split,
+            )
+        finally:
+            algoreas_utils.SAMPLES.clear()
+            algoreas_utils.SAMPLES.update(original_samples)
 
 
 def load_official_graphbench_task(
@@ -946,24 +1002,31 @@ def load_official_graphbench_task(
 
     require_package("graphbench", "graphbench-lib", log=log)
     from graphbench.co_helpers.split_dataset import split_dataset  # type: ignore
-    from graphbench.datasets.algoreas import AlgoReasDataset  # type: ignore
 
     log(
         f"[data] Loading official GraphBench task={task_name} "
         f"graphs={split_sizes} nodes={split_nodes}"
     )
-    train_full = AlgoReasDataset(
-        root=str(root),
-        name=algoreas_dataset_name(task_name, cfg.train_node_size),
-        split="train",
-        generate=False,
+    train_full = load_algoreas_split(
+        root,
+        task_name,
+        "train",
+        cfg.train_node_size,
+        cfg.train_size,
+        cfg.split_seed + split_seeds["train"],
+        allow_generated_fallback=False,
+        log=log,
     )
     train_raw, val_raw, _ = split_dataset(train_full, 0.99, 0.01, 0)
-    test_raw = AlgoReasDataset(
-        root=str(root),
-        name=algoreas_dataset_name(task_name, cfg.test_node_size),
-        split="test",
-        generate=False,
+    test_raw = load_algoreas_split(
+        root,
+        task_name,
+        "test",
+        cfg.test_node_size,
+        cfg.test_size,
+        cfg.split_seed + split_seeds["test"],
+        allow_generated_fallback=True,
+        log=log,
     )
     split_map = {"train": train_raw, "val": val_raw, "test": test_raw}
     out = {}

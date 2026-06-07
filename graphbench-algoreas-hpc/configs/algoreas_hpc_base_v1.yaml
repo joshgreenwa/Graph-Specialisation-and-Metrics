@@ -102,7 +102,9 @@ dataset:
     training graphs and uses n=128 test graphs for most tasks, with n=64 for
     flow. This compact base protocol uses n=64 test graphs for all selected
     tasks to keep PE precompute and base-model training controlled for
-    mechanistic analysis.
+    mechanistic analysis. If an official n=64 test file is absent, the runner
+    generates the requested compact test split with GraphBench's own AlgoReas
+    generator and a fixed split seed.
   cache:
     cache_converted_graphs: true
     cache_pe_tensors_on_disk: true

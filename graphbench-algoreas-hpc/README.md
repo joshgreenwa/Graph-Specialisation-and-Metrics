@@ -135,6 +135,9 @@ temporary shard directory is removed.
   most tasks at `n=128` (`flow` at `n=64`). This base run uses a compact
   `n=64` test for all tasks to reduce PE cost; full `n=128` evaluation can be
   run later from saved checkpoints.
+- For compact `n=64` test splits not present in the official tar files, the
+  runner generates exactly the requested test count with GraphBench's own
+  AlgoReas generator and a fixed split seed.
 - Models: Graphormer, GraphGPS, static-GRIT, GRIT, GatedGCN+, GIN+, GCN+
 - Seeds: `0,1,2,3`
 - Training: 5000 steps, batch 1024, 500 warmup, cosine decay
