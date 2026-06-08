@@ -1020,6 +1020,109 @@ def plot_attention_examples(
     save_figure(fig, out_dir, "main_attention_examples")
 
 
+def masked_head_matrices(
+    layer: Any,
+    *,
+    graph_idx: int,
+    head_idx: int,
+    num_nodes: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    attn = layer.attention.detach().cpu()[graph_idx, head_idx, :num_nodes, :num_nodes].float()
+    msg = layer.message.detach().cpu()[graph_idx, head_idx, :num_nodes, :num_nodes].float()
+    mask = layer.mask.detach().cpu()[graph_idx, head_idx, :num_nodes, :num_nodes].bool()
+    transport = torch.sqrt((msg * msg).sum(dim=-1).clamp_min(0.0))
+    realised = attn.clamp_min(0.0) * transport
+    zero = torch.zeros_like(attn)
+    return (
+        torch.where(mask, attn, zero).numpy(),
+        torch.where(mask, transport, zero).numpy(),
+        torch.where(mask, realised, zero).numpy(),
+    )
+
+
+def draw_operator_matrix(
+    ax: plt.Axes,
+    matrix: np.ndarray,
+    *,
+    title: str,
+    cmap: str,
+) -> Any:
+    finite = matrix[np.isfinite(matrix)]
+    vmax = float(np.percentile(finite, 99.0)) if finite.size else 1.0
+    vmax = max(vmax, 1.0e-12)
+    image = ax.imshow(matrix, cmap=cmap, vmin=0.0, vmax=vmax, interpolation="nearest")
+    ax.set_title(f"{title}\nmax {float(np.nanmax(matrix)):.2g}", fontsize=8)
+    ax.set_xticks([])
+    ax.set_yticks([])
+    return image
+
+
+def plot_message_operator_examples(
+    summary: pd.DataFrame,
+    per_graph: pd.DataFrame,
+    metadata: Mapping[str, Any],
+    out_dir: Path,
+    args: argparse.Namespace,
+) -> None:
+    if args.checkpoint is None:
+        return
+    top = select_top_heads(summary, args)
+    if top.empty:
+        return
+    graph_indices = attention_graph_indices(args, metadata, per_graph)
+    graphs, layers, graph_indices = load_attention_example_context(args, metadata, graph_indices)
+    n_graphs = min(len(graphs), args.attention_num_graphs)
+    examples = []
+    for row in top.itertuples(index=False):
+        layer_idx = int(row.layer)
+        head_idx = int(row.head)
+        layer = next(item for item in layers if int(item.layer) == layer_idx)
+        for graph_pos in range(n_graphs):
+            examples.append((layer, layer_idx, head_idx, graph_pos, int(graph_indices[graph_pos])))
+    if not examples:
+        return
+
+    fig, axes = plt.subplots(
+        len(examples),
+        3,
+        figsize=(9.8, 2.35 * len(examples)),
+        squeeze=False,
+        constrained_layout=True,
+    )
+    for row_idx, (layer, layer_idx, head_idx, graph_pos, source_index) in enumerate(examples):
+        n = int(graphs[graph_pos].num_nodes)
+        attention, transport, realised = masked_head_matrices(
+            layer,
+            graph_idx=graph_pos,
+            head_idx=head_idx,
+            num_nodes=n,
+        )
+        score_text = format_content_scores(
+            per_graph,
+            graph_index=source_index,
+            layer=layer_idx,
+            head=head_idx,
+            block=args.attention_select_block,
+            centered=args.attention_select_centered,
+        )
+        panels = [
+            (attention, "attention A_ij", "viridis"),
+            (transport, "transport ||m_ij||", "plasma"),
+            (realised, "realised ||A_ij m_ij||", "magma"),
+        ]
+        for ax, (matrix, title, cmap) in zip(axes[row_idx], panels):
+            draw_operator_matrix(ax, matrix, title=title, cmap=cmap)
+        axes[row_idx, 0].set_ylabel(
+            f"L{layer_idx} H{head_idx} G{source_index}\n{score_text}",
+            rotation=0,
+            ha="right",
+            va="center",
+            labelpad=78,
+            fontsize=7,
+        )
+    save_figure(fig, out_dir, "appendix_message_operator_matrices")
+
+
 def run(args: argparse.Namespace) -> None:
     plt.rcParams.update(STYLE)
     out_dir = ensure_out_dir(args.output_dir)
@@ -1060,6 +1163,7 @@ def run(args: argparse.Namespace) -> None:
         centered=args.centered,
     )
     plot_attention_examples(summary, per_graph, metadata, out_dir, args)
+    plot_message_operator_examples(summary, per_graph, metadata, out_dir, args)
     print(f"[done] wrote figures to {out_dir}", flush=True)
 
 
