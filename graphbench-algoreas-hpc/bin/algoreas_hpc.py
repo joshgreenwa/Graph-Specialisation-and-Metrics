@@ -2238,6 +2238,37 @@ def validation_score(metrics: Mapping[str, float]) -> float:
     return float(metrics["primary"])
 
 
+def finite_metric(metrics: Mapping[str, float], key: str) -> bool:
+    try:
+        return math.isfinite(float(metrics[key]))
+    except Exception:
+        return False
+
+
+def checkpoint_metrics_are_finite(metrics: Mapping[str, float]) -> bool:
+    return finite_metric(metrics, "primary") and finite_metric(metrics, "loss")
+
+
+def checkpoint_payload(
+    model: nn.Module,
+    step: int,
+    epoch: int,
+    val_metrics: Mapping[str, float],
+    signature: Mapping[str, object],
+    n_params: int,
+    target_stats: Optional[Mapping[str, float]],
+) -> dict[str, object]:
+    return {
+        "model": model.state_dict(),
+        "step": step,
+        "epoch": epoch,
+        "val_metrics": dict(val_metrics),
+        "run_signature": signature,
+        "trainable_parameters": n_params,
+        "target_stats": target_stats,
+    }
+
+
 def write_json(path: Path, data: Mapping[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
@@ -2404,6 +2435,7 @@ def train_one(
     signature = run_signature(task, model_name, model_backend, cfg, splits)
     summary_path = run_dir / "summary.json"
     best_path = run_dir / "best.pt"
+    early_best_path = run_dir / "early_valid_best.pt"
     metrics_path = run_dir / "metrics.csv"
     model = build_model(model_name, cfg, backend=model_backend).to(device)
     n_params = count_parameters(model)
@@ -2436,6 +2468,12 @@ def train_one(
         eval_batch_size,
         log=run_log,
     )
+    if force_retrain:
+        for path in [best_path, early_best_path, summary_path]:
+            if path.exists():
+                path.unlink()
+        for path in run_dir.glob("checkpoint_step*.pt"):
+            path.unlink()
     if best_path.exists() and signature_matches(summary_path, signature) and not force_retrain:
         run_log("[resume] matching checkpoint found; skipping training")
     else:
@@ -2444,8 +2482,11 @@ def train_one(
         scheduler = make_scheduler(optimizer, cfg.warmup_steps, cfg.max_steps)
         best_score = float("inf")
         best_step = 0
+        early_best_score = float("inf")
+        early_best_step = 0
         global_step = 0
         epoch = 0
+        stop_training = False
         major_checkpoints: list[str] = []
         window_loss = 0.0
         window_graphs = 0
@@ -2454,11 +2495,11 @@ def train_one(
         with metrics_path.open("w", newline="", encoding="utf-8") as handle:
             writer = csv.DictWriter(handle, fieldnames=fields)
             writer.writeheader()
-            while global_step < cfg.max_steps:
+            while global_step < cfg.max_steps and not stop_training:
                 epoch += 1
                 train_loader = make_loader(splits["train"], train_batch_size, shuffle=True, seed=cfg.seed + epoch)
                 for batch in train_loader:
-                    if global_step >= cfg.max_steps:
+                    if global_step >= cfg.max_steps or stop_training:
                         break
                     batch = batch.to(device)
                     pw = pos_weight.to(device) if pos_weight is not None else None
@@ -2466,6 +2507,13 @@ def train_one(
                     with torch.autocast(device_type="cuda", enabled=use_amp):
                         pred = model(batch)
                         loss = task_loss(pred, batch, pw, target_stats)
+                    if not bool(torch.isfinite(loss.detach()).all()):
+                        run_log(
+                            f"[nonfinite] train loss became non-finite at step={global_step + 1}; "
+                            "stopping and keeping best finite checkpoint"
+                        )
+                        stop_training = True
+                        break
                     scaler.scale(loss).backward()
                     scaler.unscale_(optimizer)
                     torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
@@ -2489,7 +2537,8 @@ def train_one(
                         pos_weight,
                         target_stats,
                     )
-                    score = validation_score(val_metrics)
+                    metrics_finite = checkpoint_metrics_are_finite(val_metrics)
+                    score = validation_score(val_metrics) if metrics_finite else float("inf")
                     row = {
                         "step": global_step,
                         "epoch": epoch,
@@ -2536,52 +2585,45 @@ def train_one(
                     )
                     window_loss = 0.0
                     window_graphs = 0
+                    if not metrics_finite:
+                        run_log(
+                            f"[checkpoint] skipped non-finite watch metrics at step={global_step}: "
+                            f"primary={val_metrics.get('primary')} loss={val_metrics.get('loss')}"
+                        )
+                        continue
+                    if score < early_best_score - cfg.min_delta:
+                        early_best_score = score
+                        early_best_step = global_step
+                        torch.save(
+                            checkpoint_payload(model, global_step, epoch, val_metrics, signature, n_params, target_stats),
+                            early_best_path,
+                        )
                     improved = score < best_score - cfg.min_delta
                     if global_step >= cfg.min_checkpoint_step and improved:
                         best_score = score
                         best_step = global_step
                         torch.save(
-                            {
-                                "model": model.state_dict(),
-                                "step": global_step,
-                                "epoch": epoch,
-                                "val_metrics": val_metrics,
-                                "run_signature": signature,
-                                "trainable_parameters": n_params,
-                                "target_stats": target_stats,
-                            },
+                            checkpoint_payload(model, global_step, epoch, val_metrics, signature, n_params, target_stats),
                             best_path,
                         )
                     if cfg.save_major_checkpoints and global_step >= cfg.min_checkpoint_step:
                         major_path = run_dir / f"checkpoint_step{global_step:05d}.pt"
                         torch.save(
-                            {
-                                "model": model.state_dict(),
-                                "step": global_step,
-                                "epoch": epoch,
-                                "val_metrics": val_metrics,
-                                "run_signature": signature,
-                                "trainable_parameters": n_params,
-                                "target_stats": target_stats,
-                            },
+                            checkpoint_payload(model, global_step, epoch, val_metrics, signature, n_params, target_stats),
                             major_path,
                         )
                         major_checkpoints.append(str(major_path))
                         run_log(f"[checkpoint] saved {major_path.name}")
         if not best_path.exists():
-            run_log("[checkpoint] no eligible best checkpoint was written; saving final model")
-            torch.save(
-                {
-                    "model": model.state_dict(),
-                    "step": global_step,
-                    "epoch": epoch,
-                    "val_metrics": {},
-                    "run_signature": signature,
-                    "trainable_parameters": n_params,
-                    "target_stats": target_stats,
-                },
-                best_path,
-            )
+            if early_best_path.exists():
+                shutil.copy2(early_best_path, best_path)
+                best_step = early_best_step
+                run_log(
+                    f"[checkpoint] no eligible finite checkpoint was written; "
+                    f"using early finite best_step={early_best_step}"
+                )
+            else:
+                raise RuntimeError("no finite checkpoint was produced; inspect training logs for non-finite loss/metrics")
         else:
             run_log(f"[checkpoint] selected best_step={best_step}")
     ckpt = torch.load(best_path, map_location=device, weights_only=False)
