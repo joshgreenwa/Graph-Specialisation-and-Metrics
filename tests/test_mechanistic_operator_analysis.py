@@ -1,10 +1,19 @@
 from dataclasses import dataclass
 
+import pytest
 import torch
 
 from graph_specialisation_metrics.mechanistic_operator_analysis import (
+    OperatorTransportAccumulator,
+    batch_tensor_bytes,
+    build_parser,
+    collate_analysis_batches,
+    ensure_receiver_support,
     flow_operator_masks,
     load_task_transport_responsibility,
+    narrative_claim_row,
+    operator_specificity_summary_rows,
+    ranked_ablation_auc_rows,
     rate_matched_random_masks,
     valid_pair_mask,
 )
@@ -23,6 +32,21 @@ class FakeBatch:
     edge_dst: torch.Tensor
     edge_value: torch.Tensor
     task_type: str = "graph_regression"
+
+
+@dataclass
+class TinyBatch:
+    x: torch.Tensor
+    y: torch.Tensor
+
+    def to(self, device: torch.device) -> "TinyBatch":
+        return TinyBatch(self.x.to(device), self.y.to(device))
+
+
+class TinyRunner:
+    def collate_graphs(self, graphs):
+        del graphs
+        return TinyBatch(torch.zeros(2, 3, dtype=torch.float32), torch.zeros(1, dtype=torch.long))
 
 
 def make_flow_batch() -> FakeBatch:
@@ -96,3 +120,175 @@ def test_task_transport_responsibility_loader_filters_exact_metric_rows(tmp_path
         centered="",
     )
     assert loaded == {(0, 1): 0.75}
+
+
+def test_support_fallback_keeps_each_receiver_nonempty():
+    dst = torch.tensor([0, 0, 1, 1, 2])
+    keep = torch.tensor([False, False, True, False, False])
+    fallback = torch.tensor([True, False, False, False, False])
+
+    repaired = ensure_receiver_support(keep, dst, fallback)
+
+    assert repaired.tolist() == [True, False, True, False, True]
+    for receiver in torch.unique(dst).tolist():
+        assert bool(repaired[dst == receiver].any())
+
+
+def test_base_rate_rows_document_primary_and_random_masks():
+    accumulator = OperatorTransportAccumulator(task_transport_responsibility={})
+    valid = torch.ones(1, 2, 2)
+    masks = {
+        "valid_pair": valid.clone(),
+        "operator": torch.tensor([[[0.0, 1.0], [0.0, 0.0]]]),
+        "random__operator": torch.tensor([[[0.0, 0.0], [1.0, 0.0]]]),
+    }
+
+    accumulator.graph_count = 1
+    accumulator._add_base_rates(masks, valid)
+    rows = {row["operator"]: row for row in accumulator.base_rate_rows()}
+
+    assert rows["operator"]["is_primary_operator"] is True
+    assert rows["random__operator"]["is_primary_operator"] is False
+    assert rows["random__operator"]["matched_operator"] == "operator"
+    assert rows["operator"]["base_rate"] == 0.25
+
+
+def test_specificity_summary_uses_graph_means_not_layer_rows():
+    pd = pytest.importorskip("pandas")
+    merged = pd.DataFrame(
+        [
+            {
+                "graph_index": 0,
+                "operator_real": "cut",
+                "log2_real_over_random_influence_lift": 1.0,
+            },
+            {
+                "graph_index": 0,
+                "operator_real": "cut",
+                "log2_real_over_random_influence_lift": 3.0,
+            },
+            {
+                "graph_index": 1,
+                "operator_real": "cut",
+                "log2_real_over_random_influence_lift": -1.0,
+            },
+        ]
+    )
+
+    rows = operator_specificity_summary_rows(merged, ["influence_lift"])
+
+    assert rows[0]["samples"] == 2
+    assert rows[0]["graph_layer_rows"] == 3
+    assert rows[0]["mean_log2_real_over_random"] == 0.5
+    assert rows[0]["row_mean_log2_real_over_random"] == 1.0
+    assert rows[0]["positive_graph_fraction"] == 0.5
+
+
+def test_ranked_ablation_auc_prefers_paired_graph_mean_drop():
+    rows = [
+        {
+            "ranking": "ots",
+            "ranking_label": "OTS",
+            "ranking_family": "task_weighted_transport",
+            "percent_ablated": 0,
+            "raw_drop": 100.0,
+            "paired_drop_graph_mean": 1.0,
+        },
+        {
+            "ranking": "ots",
+            "ranking_label": "OTS",
+            "ranking_family": "task_weighted_transport",
+            "percent_ablated": 10,
+            "raw_drop": 100.0,
+            "paired_drop_graph_mean": 3.0,
+        },
+    ]
+
+    auc = ranked_ablation_auc_rows(rows)
+
+    assert auc[0]["ranking"] == "ots"
+    assert auc[0]["drop_metric"] == "paired_drop_graph_mean"
+    assert auc[0]["ablation_auc"] == 20.0
+    assert auc[0]["normalised_auc"] == 2.0
+
+
+def test_narrative_claim_row_statuses():
+    strong = narrative_claim_row(
+        "claim",
+        "Claim",
+        "source.csv",
+        "metric",
+        1.0,
+        supports=True,
+        strong=True,
+    )
+    directional = narrative_claim_row(
+        "claim",
+        "Claim",
+        "source.csv",
+        "metric",
+        1.0,
+        supports=True,
+        strong=False,
+    )
+    unsupported = narrative_claim_row(
+        "claim",
+        "Claim",
+        "source.csv",
+        "metric",
+        -1.0,
+        supports=False,
+        strong=False,
+    )
+
+    assert strong["evidence_status"] == "strong_support"
+    assert directional["evidence_status"] == "directional_support"
+    assert unsupported["evidence_status"] == "not_supported"
+
+
+def test_parser_defaults_require_cache_and_enable_batch_cache():
+    args = build_parser().parse_args(["--checkpoint", "ckpt.pt", "--task", "max_flow"])
+
+    assert args.require_pe_cache is True
+    assert args.cache_batches == "auto"
+    assert args.allow_tf32 is True
+    assert args.autocast_dtype == "none"
+
+
+def test_batch_cache_none_avoids_collation():
+    class FailingRunner:
+        def collate_graphs(self, graphs):
+            raise AssertionError("collate should not run")
+
+    batches, mode, estimated = collate_analysis_batches(
+        FailingRunner(),
+        graphs=[object()],
+        graph_indices=[3],
+        batch_size=1,
+        device=torch.device("cpu"),
+        cache_mode="none",
+        gpu_cache_limit_gb=1.0,
+        log=lambda *_args, **_kwargs: None,
+    )
+
+    assert batches == []
+    assert mode == "none"
+    assert estimated == 0
+
+
+def test_cpu_batch_cache_collates_once_and_estimates_tensor_bytes():
+    batches, mode, estimated = collate_analysis_batches(
+        TinyRunner(),
+        graphs=[object(), object()],
+        graph_indices=[5, 7],
+        batch_size=2,
+        device=torch.device("cpu"),
+        cache_mode="cpu",
+        gpu_cache_limit_gb=1.0,
+        log=lambda *_args, **_kwargs: None,
+    )
+
+    assert mode == "cpu"
+    assert len(batches) == 1
+    assert batches[0][0] == [5, 7]
+    assert estimated == batch_tensor_bytes(batches[0][1])

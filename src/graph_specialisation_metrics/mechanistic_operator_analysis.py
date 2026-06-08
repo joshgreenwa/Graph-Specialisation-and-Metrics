@@ -28,6 +28,7 @@ import random
 import sys
 import time
 from collections import defaultdict
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence
@@ -38,6 +39,73 @@ from torch import nn
 
 EPS = 1.0e-12
 PRIMARY_OPERATOR_EXCLUDE_PREFIXES = ("random__",)
+
+
+def is_primary_operator(operator: str) -> bool:
+    return operator != "valid_pair" and not operator.startswith(PRIMARY_OPERATOR_EXCLUDE_PREFIXES)
+
+
+MECHANISM_ABLATION_METADATA: dict[str, dict[str, str]] = {
+    "clean": {
+        "mechanism_axis": "reference",
+        "display_label": "Clean",
+        "claim_tested": "Unablated model performance.",
+    },
+    "local_only_support": {
+        "mechanism_axis": "support",
+        "display_label": "Local-only support",
+        "claim_tested": "Does complete graph support carry useful beyond-GNN computation?",
+    },
+    "global_only_support": {
+        "mechanism_axis": "support_diagnostic",
+        "display_label": "Global-only support",
+        "claim_tested": "Can dense global attention operate without the local graph channel?",
+    },
+    "no_structural_routing": {
+        "mechanism_axis": "routing",
+        "display_label": "No structural routing",
+        "claim_tested": "Does relation information matter as a scalar sender-selection kernel?",
+    },
+    "no_pair_value_transport": {
+        "mechanism_axis": "transport",
+        "display_label": "No pair-value transport",
+        "claim_tested": "Does relation information change the content being transported?",
+    },
+    "frozen_pair_state": {
+        "mechanism_axis": "pair_state",
+        "display_label": "Frozen pair state",
+        "claim_tested": "Does pair-state evolution refine useful graph relations?",
+    },
+    "permuted_pair_state": {
+        "mechanism_axis": "pair_state",
+        "display_label": "Permuted pair state",
+        "claim_tested": "Does pair-state content matter beyond matched marginal structure?",
+    },
+}
+
+RANKING_DISPLAY_LABELS = {
+    "random": "Random",
+    "norm": "Output norm",
+    "attention_mass": "Attention mass",
+    "attention_kernel_alignment": "Attention/operator",
+    "contribution_alignment": "Realised transport/operator",
+    "influence_lift": "Task-weighted operator lift",
+    "global_task_transport": "Global task transport",
+    "transport_lift_global_gate": "Lift x global gate",
+    "ots": "OTS",
+}
+
+RANKING_FAMILIES = {
+    "random": "control",
+    "norm": "control",
+    "attention_mass": "attention_control",
+    "attention_kernel_alignment": "attention_control",
+    "contribution_alignment": "transport",
+    "influence_lift": "task_weighted_transport",
+    "global_task_transport": "transport",
+    "transport_lift_global_gate": "task_weighted_transport",
+    "ots": "task_weighted_transport",
+}
 
 
 def import_module_from_path(path: Path, module_name: str):
@@ -78,6 +146,37 @@ def resolve_device(device: str) -> torch.device:
     if out.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA requested but unavailable")
     return out
+
+
+def configure_torch_runtime(args: argparse.Namespace, device: torch.device) -> dict[str, Any]:
+    """Set GPU runtime options that matter for repeated A100 analysis passes."""
+
+    settings: dict[str, Any] = {
+        "device": str(device),
+        "allow_tf32": False,
+        "float32_matmul_precision": None,
+        "autocast_dtype": args.autocast_dtype,
+    }
+    if device.type != "cuda":
+        return settings
+
+    torch.backends.cuda.matmul.allow_tf32 = bool(args.allow_tf32)
+    torch.backends.cudnn.allow_tf32 = bool(args.allow_tf32)
+    settings["allow_tf32"] = bool(args.allow_tf32)
+    if args.float32_matmul_precision != "default":
+        torch.set_float32_matmul_precision(args.float32_matmul_precision)
+        settings["float32_matmul_precision"] = args.float32_matmul_precision
+    if args.cuda_benchmark:
+        torch.backends.cudnn.benchmark = True
+        settings["cudnn_benchmark"] = True
+    return settings
+
+
+def autocast_context(device: torch.device, dtype_name: str):
+    if device.type != "cuda" or dtype_name == "none":
+        return nullcontext()
+    dtype = {"bfloat16": torch.bfloat16, "float16": torch.float16}[dtype_name]
+    return torch.autocast(device_type="cuda", dtype=dtype)
 
 
 def write_csv(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
@@ -131,6 +230,99 @@ def select_graph_indices(dataset: Any, num_graphs: int, seed: int) -> list[int]:
         return list(range(len(dataset)))
     rng = random.Random(seed)
     return sorted(rng.sample(range(len(dataset)), k=num_graphs))
+
+
+def graph_batches(
+    graphs: Sequence[Any],
+    graph_indices: Sequence[int],
+    batch_size: int,
+) -> list[tuple[list[int], list[Any]]]:
+    out: list[tuple[list[int], list[Any]]] = []
+    for start_idx in range(0, len(graphs), batch_size):
+        end_idx = min(len(graphs), start_idx + batch_size)
+        out.append((list(graph_indices[start_idx:end_idx]), list(graphs[start_idx:end_idx])))
+    return out
+
+
+def batch_tensor_bytes(batch: Any) -> int:
+    total = 0
+    for field in dataclasses.fields(batch):
+        value = getattr(batch, field.name)
+        if torch.is_tensor(value):
+            total += int(value.numel() * value.element_size())
+    return total
+
+
+def batch_device(batch: Any) -> Optional[torch.device]:
+    for field in dataclasses.fields(batch):
+        value = getattr(batch, field.name)
+        if torch.is_tensor(value):
+            return value.device
+    return None
+
+
+def batch_to_device(batch: Any, device: torch.device) -> Any:
+    current = batch_device(batch)
+    if current is not None and current == device:
+        return batch
+    return batch.to(device)
+
+
+def collate_analysis_batches(
+    runner: Any,
+    graphs: Sequence[Any],
+    graph_indices: Sequence[int],
+    *,
+    batch_size: int,
+    device: torch.device,
+    cache_mode: str,
+    gpu_cache_limit_gb: float,
+    log=print,
+) -> tuple[list[tuple[list[int], Any]], str, int]:
+    """Pre-collate selected analysis graphs once.
+
+    Knockouts and ranked-ablation curves rerun the same selected graphs many times.
+    Caching avoids repeatedly rebuilding pair tensors and, when feasible, avoids repeated
+    CPU-to-GPU transfers.
+    """
+
+    if cache_mode == "none":
+        log("[cache] analysis batch cache disabled; batches will be collated on demand")
+        return [], "none", 0
+
+    grouped = graph_batches(graphs, graph_indices, batch_size)
+    cpu_batches: list[tuple[list[int], Any]] = []
+    total_bytes = 0
+    start = time.time()
+    for indices, batch_graphs in grouped:
+        batch = runner.collate_graphs(batch_graphs)
+        total_bytes += batch_tensor_bytes(batch)
+        cpu_batches.append((indices, batch))
+
+    selected_mode = cache_mode
+    if selected_mode == "auto":
+        if device.type == "cuda" and (total_bytes / (1024**3)) <= gpu_cache_limit_gb:
+            selected_mode = "gpu"
+        else:
+            selected_mode = "cpu"
+    if selected_mode not in {"cpu", "gpu"}:
+        raise ValueError(f"unknown batch cache mode {cache_mode!r}")
+    if selected_mode == "gpu" and device.type != "cuda":
+        log("[cache] requested GPU batch cache on non-CUDA device; using CPU cache")
+        selected_mode = "cpu"
+
+    if selected_mode == "gpu":
+        cached = [(indices, batch.to(device)) for indices, batch in cpu_batches]
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+    else:
+        cached = cpu_batches
+
+    log(
+        f"[cache] prepared {len(cached)} analysis batches in {time.time() - start:.1f}s; "
+        f"mode={selected_mode} approx_cpu_bytes={total_bytes / (1024**3):.3f} GiB"
+    )
+    return cached, selected_mode, total_bytes
 
 
 def to_float(value: torch.Tensor | float | int) -> float:
@@ -865,7 +1057,7 @@ class OperatorTransportAccumulator:
         self.graph_count += len(graph_indices)
         self._add_base_rates(masks, valid)
         for record in captures:
-            self._add_layer(record, masks, global_mask)
+            self._add_layer(record, masks, global_mask, graph_indices, valid)
 
     def _add_base_rates(self, masks: Mapping[str, torch.Tensor], valid: torch.Tensor) -> None:
         valid_den = valid.float().sum().item()
@@ -878,6 +1070,8 @@ class OperatorTransportAccumulator:
         record: SparseLayerCapture,
         masks: Mapping[str, torch.Tensor],
         global_mask: torch.Tensor,
+        graph_indices: Sequence[int],
+        valid: torch.Tensor,
     ) -> None:
         grad = view_head_grad(record)
         grad_e = grad[record.dst]
@@ -914,6 +1108,95 @@ class OperatorTransportAccumulator:
                     row["attention_total"] += to_float(attention_total[head])
                     row["global_influence"] += to_float(global_influence[head])
                     row["global_abs_transport"] += to_float(global_contribution[head])
+
+                self._add_graph_rows(
+                    record,
+                    graph_indices,
+                    valid,
+                    name,
+                    mask,
+                    component_name,
+                    influence,
+                    contribution_norm,
+                    attention,
+                    global_values,
+                )
+
+    def _add_graph_rows(
+        self,
+        record: SparseLayerCapture,
+        graph_indices: Sequence[int],
+        valid: torch.Tensor,
+        operator: str,
+        mask: torch.Tensor,
+        component: str,
+        influence: torch.Tensor,
+        contribution_norm: torch.Tensor,
+        attention: torch.Tensor,
+        global_values: torch.Tensor,
+    ) -> None:
+        for local_graph, graph_index in enumerate(graph_indices):
+            edge_mask = record.graph == local_graph
+            if not bool(edge_mask.any()):
+                continue
+            op_values = mask[
+                record.graph[edge_mask],
+                record.local_dst[edge_mask],
+                record.local_src[edge_mask],
+            ].float()
+            influence_g = influence[edge_mask]
+            contribution_g = contribution_norm[edge_mask]
+            attention_g = attention[edge_mask]
+            global_g = global_values[edge_mask]
+            base_rate = safe_div(
+                float((mask[local_graph] * valid[local_graph]).sum().item()),
+                float(valid[local_graph].sum().item()),
+            )
+            influence_total = to_float(influence_g.sum())
+            influence_on = to_float((influence_g * op_values[:, None]).sum())
+            abs_transport_total = to_float(contribution_g.sum())
+            abs_transport_on = to_float((contribution_g * op_values[:, None]).sum())
+            attention_total = to_float(attention_g.sum())
+            attention_on = to_float((attention_g * op_values[:, None]).sum())
+            global_influence = to_float((influence_g * global_g[:, None]).sum())
+            global_abs_transport = to_float((contribution_g * global_g[:, None]).sum())
+            influence_fraction = safe_div(influence_on, influence_total)
+            abs_transport_fraction = safe_div(abs_transport_on, abs_transport_total)
+            attention_fraction = safe_div(attention_on, attention_total)
+            influence_lift = safe_div(influence_fraction, base_rate)
+            global_task_transport = safe_div(global_influence, influence_total)
+            self.graph_rows.append(
+                {
+                    "graph_index": int(graph_index),
+                    "layer": record.layer,
+                    "head": "all",
+                    "heads_aggregated": record.heads,
+                    "aggregation_unit": "graph_layer_all_heads",
+                    "operator": operator,
+                    "transport_component": component,
+                    "base_rate": base_rate,
+                    "influence_fraction": influence_fraction,
+                    "influence_lift": influence_lift,
+                    "abs_transport_fraction": abs_transport_fraction,
+                    "abs_transport_lift": safe_div(abs_transport_fraction, base_rate),
+                    "attention_fraction": attention_fraction,
+                    "attention_lift": safe_div(attention_fraction, base_rate),
+                    "global_task_transport": global_task_transport,
+                    "global_abs_transport": safe_div(global_abs_transport, abs_transport_total),
+                    "transport_lift_global_gate": (
+                        influence_lift * global_task_transport
+                        if math.isfinite(influence_lift)
+                        and math.isfinite(global_task_transport)
+                        else float("nan")
+                    ),
+                    "influence_on_operator": influence_on,
+                    "influence_total": influence_total,
+                    "abs_transport_on_operator": abs_transport_on,
+                    "abs_transport_total": abs_transport_total,
+                    "attention_on_operator": attention_on,
+                    "attention_total": attention_total,
+                }
+            )
 
     def per_head_rows(self) -> list[dict[str, Any]]:
         out: list[dict[str, Any]] = []
@@ -1048,8 +1331,7 @@ class OperatorTransportAccumulator:
             primary = [
                 row
                 for row in rows
-                if not str(row["operator"]).startswith(PRIMARY_OPERATOR_EXCLUDE_PREFIXES)
-                and str(row["operator"]) != "valid_pair"
+                if is_primary_operator(str(row["operator"]))
             ]
             best = max(
                 primary,
@@ -1074,6 +1356,27 @@ class OperatorTransportAccumulator:
                     "global_abs_transport": first["global_abs_transport"],
                     "total_influence": first["influence_total"],
                     "total_abs_transport": first["abs_transport_total"],
+                }
+            )
+        return out
+
+    def base_rate_rows(self) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        for operator, values in sorted(self.base.items()):
+            matched_operator = (
+                operator.replace("random__", "", 1)
+                if operator.startswith("random__")
+                else ""
+            )
+            out.append(
+                {
+                    "operator": operator,
+                    "matched_operator": matched_operator,
+                    "is_primary_operator": is_primary_operator(operator),
+                    "graphs": self.graph_count,
+                    "positive_mass": values["positive"],
+                    "valid_pair_denominator": values["denominator"],
+                    "base_rate": safe_div(values["positive"], values["denominator"]),
                 }
             )
         return out
@@ -1152,6 +1455,27 @@ def sparse_support_masks(pyg_batch: Any, official_batch: Any) -> tuple[torch.Ten
     local_or_self = is_local | is_self
     global_pair = (~is_local) & (~is_self)
     return local_or_self, global_pair
+
+
+def ensure_receiver_support(
+    keep: torch.Tensor,
+    dst: torch.Tensor,
+    fallback: torch.Tensor,
+) -> torch.Tensor:
+    """Avoid all-masked softmax groups by falling back per receiver when needed."""
+
+    keep = keep.bool().clone()
+    fallback = fallback.bool()
+    for receiver in torch.unique(dst.detach().cpu()).tolist():
+        receiver_mask = dst == int(receiver)
+        if bool((keep & receiver_mask).any()):
+            continue
+        receiver_fallback = fallback & receiver_mask
+        if bool(receiver_fallback.any()):
+            keep[receiver_fallback] = True
+        else:
+            keep[receiver_mask] = True
+    return keep
 
 
 def matched_mean_sparse(values: torch.Tensor, strata: torch.Tensor) -> torch.Tensor:
@@ -1264,7 +1588,11 @@ class GRITAblationContext:
                 strata = sparse_pair_strata(pyg_batch, self.current_batch)
                 pair_msg = matched_mean_sparse(pair_msg, strata)
 
-            score = pyg_sparse_softmax(logits.unsqueeze(-1), pyg_batch.edge_index[1], pyg_batch.num_nodes)
+            score = pyg_sparse_softmax(
+                logits.unsqueeze(-1),
+                pyg_batch.edge_index[1],
+                pyg_batch.num_nodes,
+            )
             score = attention_module.dropout(score)
             pyg_batch.attn = score
             if getattr(pyg_batch, "E", None) is not None:
@@ -1296,9 +1624,18 @@ class GRITAblationContext:
         if self.mode in {"local_only_support", "global_only_support"}:
             local_or_self, global_pair = sparse_support_masks(pyg_batch, self.current_batch)
             keep = local_or_self if self.mode == "local_only_support" else global_pair
+            fallback = (
+                local_or_self
+                if self.mode == "global_only_support"
+                else torch.ones_like(keep)
+            )
+            keep = ensure_receiver_support(keep, pyg_batch.edge_index[1].long(), fallback)
             return logits.masked_fill(~keep[:, None], -1.0e9)
         if self.mode == "no_structural_routing":
-            content = pyg_batch.K_h[pyg_batch.edge_index[0]] + pyg_batch.Q_h[pyg_batch.edge_index[1]]
+            content = (
+                pyg_batch.K_h[pyg_batch.edge_index[0]]
+                + pyg_batch.Q_h[pyg_batch.edge_index[1]]
+            )
             content = attention_module.act(content)
             content_logits = torch.einsum("ehd,dhc->ehc", content, attention_module.Aw).squeeze(-1)
             if attention_module.clamp is not None:
@@ -1309,7 +1646,10 @@ class GRITAblationContext:
                 )
             structural_bias = logits - content_logits
             strata = sparse_pair_strata(pyg_batch, self.current_batch)
-            return content_logits + matched_mean_sparse(structural_bias.unsqueeze(-1), strata).squeeze(-1)
+            return content_logits + matched_mean_sparse(
+                structural_bias.unsqueeze(-1),
+                strata,
+            ).squeeze(-1)
         if self.mode in {"frozen_pair_state", "permuted_pair_state"}:
             return logits
         if self.mode == "head_ablation":
@@ -1364,16 +1704,22 @@ def evaluate_primary_series(
     batch_size: int,
     device: torch.device,
     target_stats: Optional[Mapping[str, float]],
+    cached_batches: Optional[Sequence[tuple[Sequence[int], Any]]] = None,
+    autocast_dtype: str = "none",
 ) -> tuple[dict[str, float], list[float]]:
-    loader = runner.make_loader(dataset, batch_size, shuffle=False, seed=0)
     preds: list[torch.Tensor] = []
     targets: list[torch.Tensor] = []
     per_graph: list[float] = []
     start = time.time()
     model.eval()
-    for batch in loader:
-        batch = batch.to(device)
-        pred = model(batch)
+    if cached_batches:
+        iterator = (batch for _indices, batch in cached_batches)
+    else:
+        iterator = runner.make_loader(dataset, batch_size, shuffle=False, seed=0)
+    for batch in iterator:
+        batch = batch_to_device(batch, device)
+        with autocast_context(device, autocast_dtype):
+            pred = model(batch)
         if batch.task_type == "edge_binary":
             preds.append(pred.detach().cpu())
             targets.append(batch.edge_target.detach().cpu())
@@ -1449,6 +1795,33 @@ def primary_drop(clean: Mapping[str, float], ablated: Mapping[str, float]) -> fl
     return float(ablated["primary"]) - float(clean["primary"])
 
 
+def finite_or_nan(value: Any) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return float("nan")
+    return number if math.isfinite(number) else float("nan")
+
+
+def preferred_drop_value(row: Mapping[str, Any]) -> float:
+    paired = finite_or_nan(row.get("paired_drop_graph_mean"))
+    if math.isfinite(paired):
+        return paired
+    return finite_or_nan(row.get("raw_drop"))
+
+
+def paired_drop_series(
+    clean_metrics: Mapping[str, float],
+    clean_series: Sequence[float],
+    ablated_series: Sequence[float],
+) -> list[float]:
+    higher = float(clean_metrics.get("higher_is_better", 0.0)) > 0.5
+    count = min(len(clean_series), len(ablated_series))
+    if higher:
+        return [float(clean_series[i]) - float(ablated_series[i]) for i in range(count)]
+    return [float(ablated_series[i]) - float(clean_series[i]) for i in range(count)]
+
+
 def advantage_removed(
     clean: Mapping[str, float],
     ablated: Mapping[str, float],
@@ -1480,6 +1853,8 @@ def evaluate_with_ablation(
             batch_size=max(1, int(args.eval_batch_size or args.batch_size)),
             device=loaded.device,
             target_stats=loaded.target_stats,
+            cached_batches=loaded.analysis_batches,
+            autocast_dtype=args.autocast_dtype,
         )
     with GRITAblationContext(
         loaded.model,
@@ -1494,6 +1869,8 @@ def evaluate_with_ablation(
             batch_size=max(1, int(args.eval_batch_size or args.batch_size)),
             device=loaded.device,
             target_stats=loaded.target_stats,
+            cached_batches=loaded.analysis_batches,
+            autocast_dtype=args.autocast_dtype,
         )
 
 
@@ -1525,26 +1902,38 @@ def run_knockouts(args: argparse.Namespace, loaded: Optional[LoadedExperiment] =
     rows: list[dict[str, Any]] = [
         {
             "ablation": "clean",
+            **MECHANISM_ABLATION_METADATA["clean"],
             "primary": clean_metrics["primary"],
             "primary_graph_mean": clean_metrics["primary_graph_mean"],
             "primary_ci_low": clean_lo,
             "primary_ci_high": clean_hi,
             "raw_drop": 0.0,
+            "paired_drop_graph_mean": 0.0,
+            "raw_drop_ci_low": 0.0,
+            "raw_drop_ci_high": 0.0,
             "advantage_removed": 0.0,
         }
     ]
     for ablation in ablations:
         print(f"[knockout] evaluating {ablation}", flush=True)
         metrics, series = evaluate_with_ablation(loaded, args, mode=ablation)
+        drop_series = paired_drop_series(clean_metrics, clean_series, series)
+        drop_lo, drop_hi = bootstrap_ci(drop_series, args.random_seed + len(rows))
         lo, hi = bootstrap_ci(series, args.random_seed + len(rows))
+        raw_drop = primary_drop(clean_metrics, metrics)
+        paired_drop = mean_or_nan(drop_series)
         rows.append(
             {
                 "ablation": ablation,
+                **MECHANISM_ABLATION_METADATA[ablation],
                 "primary": metrics["primary"],
                 "primary_graph_mean": metrics["primary_graph_mean"],
                 "primary_ci_low": lo,
                 "primary_ci_high": hi,
-                "raw_drop": primary_drop(clean_metrics, metrics),
+                "raw_drop": raw_drop,
+                "paired_drop_graph_mean": paired_drop,
+                "raw_drop_ci_low": drop_lo,
+                "raw_drop_ci_high": drop_hi,
                 "advantage_removed": advantage_removed(
                     clean_metrics,
                     metrics,
@@ -1566,14 +1955,64 @@ def plot_knockouts(csv_path: Path, figures: Path) -> None:
         return
     df = pd.read_csv(csv_path)
     df = df[df["ablation"] != "clean"]
+    if df.empty:
+        return
+    if "display_label" not in df.columns:
+        df["display_label"] = df["ablation"]
+    if "mechanism_axis" not in df.columns:
+        df["mechanism_axis"] = "mechanism"
     figures.mkdir(parents=True, exist_ok=True)
-    fig, ax = plt.subplots(figsize=(9.2, 4.8), dpi=180)
-    x = range(len(df))
-    ax.bar(x, df["raw_drop"])
+    fig, ax = plt.subplots(figsize=(10.2, 5.2), dpi=180)
+    x = list(range(len(df)))
+    y_col = "paired_drop_graph_mean" if "paired_drop_graph_mean" in df.columns else "raw_drop"
+    y = df[y_col].to_numpy(dtype=float)
+    low = df["raw_drop_ci_low"].to_numpy(dtype=float)
+    high = df["raw_drop_ci_high"].to_numpy(dtype=float)
+    yerr = [
+        torch.as_tensor(y - low).clamp_min(0.0).numpy(),
+        torch.as_tensor(high - y).clamp_min(0.0).numpy(),
+    ]
+    axis_colors = {
+        "support": "#4c78a8",
+        "support_diagnostic": "#9ecae9",
+        "routing": "#f58518",
+        "transport": "#59a14f",
+        "pair_state": "#b279a2",
+    }
+    colors = [axis_colors.get(axis, "#777777") for axis in df["mechanism_axis"].astype(str)]
+    ax.bar(x, y, color=colors)
+    ax.errorbar(
+        x,
+        y,
+        yerr=yerr,
+        fmt="none",
+        ecolor="0.15",
+        elinewidth=1.0,
+        capsize=3,
+    )
     ax.axhline(0.0, color="0.25", linewidth=0.8)
-    ax.set_xticks(list(x), labels=df["ablation"], rotation=30, ha="right")
-    ax.set_ylabel("performance drop")
-    ax.set_title("GraphBench mechanism knockouts")
+    ax.set_xticks(x, labels=df["display_label"], rotation=30, ha="right")
+    ax.set_ylabel("paired graph-mean performance drop")
+    ax.set_title("M2: support-routing-transport knockouts")
+    ax.text(
+        0.01,
+        0.98,
+        (
+            "Hypothesis: pair-value / pair-state ablations should hurt more "
+            "than routing/support controls"
+        ),
+        transform=ax.transAxes,
+        va="top",
+        ha="left",
+        fontsize=8,
+    )
+    handles = [
+        plt.Line2D([0], [0], marker="s", linestyle="", color=color, label=axis)
+        for axis, color in axis_colors.items()
+        if axis in set(df["mechanism_axis"].astype(str))
+    ]
+    if handles:
+        ax.legend(handles=handles, frameon=False, fontsize=8, loc="upper right")
     fig.tight_layout()
     fig.savefig(figures / "mechanism_knockout_drops.png")
     plt.close(fig)
@@ -1584,13 +2023,15 @@ def load_atlas_rows(path: Path) -> list[dict[str, Any]]:
         return [dict(row) for row in csv.DictReader(handle)]
 
 
-def component_scores_from_atlas(rows: Sequence[Mapping[str, Any]]) -> dict[tuple[int, int], dict[str, float]]:
+def component_scores_from_atlas(
+    rows: Sequence[Mapping[str, Any]],
+) -> dict[tuple[int, int], dict[str, float]]:
     scores: dict[tuple[int, int], dict[str, float]] = defaultdict(float_dict)
     for row in rows:
         if row.get("transport_component") != "total":
             continue
         operator = str(row.get("operator", ""))
-        if operator == "valid_pair" or operator.startswith(PRIMARY_OPERATOR_EXCLUDE_PREFIXES):
+        if not is_primary_operator(operator):
             continue
         key = (int(row["layer"]), int(row["head"]))
         scores[key]["attention_mass"] += float(row.get("attention_total", 0.0) or 0.0)
@@ -1637,7 +2078,10 @@ def ranked_components(
     return ranked
 
 
-def selected_head_map(ranked: Sequence[tuple[int, int, float]], percent: float) -> dict[int, set[int]]:
+def selected_head_map(
+    ranked: Sequence[tuple[int, int, float]],
+    percent: float,
+) -> dict[int, set[int]]:
     count = max(1, int(math.ceil(len(ranked) * float(percent) / 100.0)))
     selected: dict[int, set[int]] = defaultdict(set)
     for layer, head, _score in ranked[:count]:
@@ -1645,7 +2089,10 @@ def selected_head_map(ranked: Sequence[tuple[int, int, float]], percent: float) 
     return selected
 
 
-def run_ranked_ablation(args: argparse.Namespace, loaded: Optional[LoadedExperiment] = None) -> None:
+def run_ranked_ablation(
+    args: argparse.Namespace,
+    loaded: Optional[LoadedExperiment] = None,
+) -> None:
     loaded = loaded or load_experiment(args)
     atlas_path = args.atlas_per_head_csv or (args.output_dir / "operator_transport_per_head.csv")
     if not atlas_path.exists():
@@ -1690,24 +2137,40 @@ def run_ranked_ablation(args: argparse.Namespace, loaded: Optional[LoadedExperim
             continue
         for percent in percents:
             selected = selected_head_map(ranked, percent)
-            print(f"[ranked] ranking={ranking} top={percent:g}% heads={sum(len(v) for v in selected.values())}", flush=True)
+            print(
+                f"[ranked] ranking={ranking} top={percent:g}% "
+                f"heads={sum(len(v) for v in selected.values())}",
+                flush=True,
+            )
             metrics, series = evaluate_with_ablation(
                 loaded,
                 args,
                 mode="head_ablation",
                 selected_heads=selected,
             )
+            drop_series = paired_drop_series(clean_metrics, _clean_series, series)
+            drop_lo, drop_hi = bootstrap_ci(
+                drop_series,
+                args.random_seed + int(percent * 17) + len(rows),
+            )
             lo, hi = bootstrap_ci(series, args.random_seed + int(percent * 17) + len(rows))
+            raw_drop = primary_drop(clean_metrics, metrics)
+            paired_drop = mean_or_nan(drop_series)
             rows.append(
                 {
                     "ranking": ranking,
+                    "ranking_label": RANKING_DISPLAY_LABELS.get(ranking, ranking),
+                    "ranking_family": RANKING_FAMILIES.get(ranking, "other"),
                     "percent_ablated": percent,
                     "heads_ablated": sum(len(v) for v in selected.values()),
                     "primary": metrics["primary"],
                     "primary_graph_mean": metrics["primary_graph_mean"],
                     "primary_ci_low": lo,
                     "primary_ci_high": hi,
-                    "raw_drop": primary_drop(clean_metrics, metrics),
+                    "raw_drop": raw_drop,
+                    "paired_drop_graph_mean": paired_drop,
+                    "raw_drop_ci_low": drop_lo,
+                    "raw_drop_ci_high": drop_hi,
                     "advantage_removed": advantage_removed(
                         clean_metrics,
                         metrics,
@@ -1716,9 +2179,46 @@ def run_ranked_ablation(args: argparse.Namespace, loaded: Optional[LoadedExperim
                 }
             )
     out_path = args.output_dir / "metric_ranked_ablation_curves.csv"
+    auc_path = args.output_dir / "metric_ranked_ablation_auc.csv"
     write_csv(out_path, rows)
+    write_csv(auc_path, ranked_ablation_auc_rows(rows))
     plot_ranked_ablation(out_path, args.output_dir / "figures")
+    plot_ranked_ablation_auc(auc_path, args.output_dir / "figures")
     print(f"[done] wrote ranked ablation curves to {out_path}", flush=True)
+
+
+def ranked_ablation_auc_rows(rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    grouped: dict[str, list[tuple[float, float]]] = defaultdict(list)
+    metadata: dict[str, Mapping[str, Any]] = {}
+    for row in rows:
+        ranking = str(row["ranking"])
+        metadata.setdefault(ranking, row)
+        grouped[ranking].append((float(row["percent_ablated"]), preferred_drop_value(row)))
+    out = []
+    for ranking, points in sorted(grouped.items()):
+        points = sorted((x, y) for x, y in points if math.isfinite(y))
+        auc = 0.0
+        for (x0, y0), (x1, y1) in zip(points, points[1:]):
+            auc += 0.5 * (y0 + y1) * (x1 - x0)
+        norm = max(1.0, points[-1][0] - points[0][0]) if points else 1.0
+        row_meta = metadata.get(ranking, {})
+        out.append(
+            {
+                "ranking": ranking,
+                "ranking_label": row_meta.get(
+                    "ranking_label",
+                    RANKING_DISPLAY_LABELS.get(ranking, ranking),
+                ),
+                "ranking_family": row_meta.get(
+                    "ranking_family",
+                    RANKING_FAMILIES.get(ranking, "other"),
+                ),
+                "drop_metric": "paired_drop_graph_mean",
+                "ablation_auc": auc,
+                "normalised_auc": auc / norm,
+            }
+        )
+    return out
 
 
 def plot_ranked_ablation(csv_path: Path, figures: Path) -> None:
@@ -1729,18 +2229,94 @@ def plot_ranked_ablation(csv_path: Path, figures: Path) -> None:
         print(f"[plot] skipped ranked-ablation plot: {exc}", flush=True)
         return
     df = pd.read_csv(csv_path)
+    if df.empty:
+        return
     figures.mkdir(parents=True, exist_ok=True)
     fig, ax = plt.subplots(figsize=(8.8, 5.0), dpi=180)
     for ranking, group in df.groupby("ranking"):
         group = group.sort_values("percent_ablated")
-        ax.plot(group["percent_ablated"], group["raw_drop"], marker="o", label=ranking)
+        y_col = (
+            "paired_drop_graph_mean"
+            if "paired_drop_graph_mean" in group.columns
+            else "raw_drop"
+        )
+        label = group.get("ranking_label", group["ranking"]).iloc[0]
+        ax.plot(group["percent_ablated"], group[y_col], marker="o", label=label)
+        if {"raw_drop_ci_low", "raw_drop_ci_high"}.issubset(group.columns):
+            y = group[y_col].to_numpy(dtype=float)
+            low = group["raw_drop_ci_low"].to_numpy(dtype=float)
+            high = group["raw_drop_ci_high"].to_numpy(dtype=float)
+            ax.fill_between(
+                group["percent_ablated"].to_numpy(dtype=float),
+                y - torch.as_tensor(y - low).clamp_min(0.0).numpy(),
+                y + torch.as_tensor(high - y).clamp_min(0.0).numpy(),
+                alpha=0.12,
+            )
     ax.axhline(0.0, color="0.25", linewidth=0.8)
     ax.set_xlabel("percent layer-head components ablated")
-    ax.set_ylabel("performance drop")
-    ax.set_title("Metric-ranked causal ablation")
+    ax.set_ylabel("paired graph-mean performance drop")
+    ax.set_title("M4: metric-ranked causal ablation")
+    ax.text(
+        0.01,
+        0.98,
+        "Hypothesis: operator/transport rankings degrade performance fastest",
+        transform=ax.transAxes,
+        va="top",
+        ha="left",
+        fontsize=8,
+    )
     ax.legend(frameon=False, fontsize=8)
     fig.tight_layout()
     fig.savefig(figures / "metric_ranked_ablation_curves.png")
+    plt.close(fig)
+
+
+def plot_ranked_ablation_auc(csv_path: Path, figures: Path) -> None:
+    try:
+        import matplotlib.pyplot as plt
+        import pandas as pd
+    except Exception as exc:
+        print(f"[plot] skipped ranked-ablation AUC plot: {exc}", flush=True)
+        return
+    if not csv_path.exists():
+        return
+    df = pd.read_csv(csv_path)
+    if df.empty:
+        return
+    if "ranking_label" not in df.columns:
+        df["ranking_label"] = df["ranking"].map(
+            lambda ranking: RANKING_DISPLAY_LABELS.get(str(ranking), str(ranking))
+        )
+    if "ranking_family" not in df.columns:
+        df["ranking_family"] = df["ranking"].map(
+            lambda ranking: RANKING_FAMILIES.get(str(ranking), "other")
+        )
+    df = df.sort_values("normalised_auc", ascending=False)
+    figures.mkdir(parents=True, exist_ok=True)
+    family_colors = {
+        "control": "#9d9d9d",
+        "attention_control": "#f58518",
+        "transport": "#59a14f",
+        "task_weighted_transport": "#4c78a8",
+    }
+    colors = [family_colors.get(family, "#777777") for family in df["ranking_family"]]
+    labels = df["ranking_label"]
+    x = list(range(len(df)))
+    fig, ax = plt.subplots(figsize=(9.6, 4.8), dpi=180)
+    ax.bar(x, df["normalised_auc"].to_numpy(dtype=float), color=colors)
+    ax.axhline(0.0, color="0.25", linewidth=0.8)
+    ax.set_xticks(x, labels=labels, rotation=30, ha="right")
+    ax.set_ylabel("ablation AUC, paired graph-mean drop")
+    ax.set_title("M4 summary: causal ranking quality")
+    handles = [
+        plt.Line2D([0], [0], marker="s", linestyle="", color=color, label=family)
+        for family, color in family_colors.items()
+        if family in set(df["ranking_family"].astype(str))
+    ]
+    if handles:
+        ax.legend(handles=handles, frameon=False, fontsize=8)
+    fig.tight_layout()
+    fig.savefig(figures / "metric_ranked_ablation_auc.png")
     plt.close(fig)
 
 
@@ -1793,7 +2369,7 @@ def plot_outputs(out_dir: Path) -> None:
     layer_total = layer_df[layer_df["transport_component"] == "total"]
     head_total = head_df[head_df["transport_component"] == "total"]
     layer_primary = layer_total[
-        ~layer_total["operator"].astype(str).str.startswith(PRIMARY_OPERATOR_EXCLUDE_PREFIXES)
+        layer_total["operator"].astype(str).map(is_primary_operator)
     ]
 
     heatmap(
@@ -1851,23 +2427,630 @@ def plot_outputs(out_dir: Path) -> None:
         fig.tight_layout()
         fig.savefig(figures / "operator_lift_random_controls.png")
         plt.close(fig)
+    plot_operator_specificity_evidence(out_dir)
 
 
 def heatmap(df: Any, value: str, path: Path, title: str) -> None:
     import matplotlib.pyplot as plt
 
     pivot = df.pivot_table(index="layer", columns="operator", values=value, aggfunc="mean")
+    if pivot.empty:
+        return
     fig_width = max(8.0, 0.72 * max(1, len(pivot.columns)))
     fig, ax = plt.subplots(figsize=(fig_width, 4.6), dpi=180)
     image = ax.imshow(pivot.values, aspect="auto", cmap="magma")
     ax.set_title(title)
     ax.set_xlabel("operator")
     ax.set_ylabel("layer")
-    ax.set_xticks(range(len(pivot.columns)), labels=[str(c) for c in pivot.columns], rotation=35, ha="right")
+    ax.set_xticks(
+        range(len(pivot.columns)),
+        labels=[str(c) for c in pivot.columns],
+        rotation=35,
+        ha="right",
+    )
     ax.set_yticks(range(len(pivot.index)), labels=[str(i) for i in pivot.index])
     fig.colorbar(image, ax=ax, fraction=0.046, pad=0.04)
     fig.tight_layout()
     fig.savefig(path)
+    plt.close(fig)
+
+
+def finite_float_values(values: Sequence[Any]) -> list[float]:
+    out: list[float] = []
+    for value in values:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(number):
+            out.append(number)
+    return out
+
+
+def mean_or_nan(values: Sequence[float]) -> float:
+    return sum(values) / len(values) if values else float("nan")
+
+
+def median_or_nan(values: Sequence[float]) -> float:
+    if not values:
+        return float("nan")
+    ordered = sorted(values)
+    middle = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[middle]
+    return 0.5 * (ordered[middle - 1] + ordered[middle])
+
+
+def max_finite(values: Sequence[float]) -> float:
+    finite = [value for value in values if math.isfinite(value)]
+    return max(finite) if finite else float("nan")
+
+
+def safe_log2_ratio(real: Any, random_value: Any) -> float:
+    try:
+        numerator = max(float(real), EPS)
+        denominator = max(float(random_value), EPS)
+    except (TypeError, ValueError):
+        return float("nan")
+    ratio = numerator / denominator
+    return math.log2(ratio) if math.isfinite(ratio) else float("nan")
+
+
+def operator_specificity_summary_rows(merged: Any, metrics: Sequence[str]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for operator, group in merged.groupby("operator_real"):
+        for metric in metrics:
+            column = f"log2_real_over_random_{metric}"
+            row_values = finite_float_values(group[column].tolist())
+            graph_values = []
+            for _graph_index, graph_group in group.groupby("graph_index"):
+                values = finite_float_values(graph_group[column].tolist())
+                if values:
+                    graph_values.append(mean_or_nan(values))
+            lo, hi = bootstrap_ci(graph_values, seed=1337 + len(rows), samples=1000)
+            rows.append(
+                {
+                    "operator": operator,
+                    "metric": metric,
+                    "ci_unit": "graph_mean_over_layers",
+                    "samples": len(graph_values),
+                    "graphs": len(graph_values),
+                    "graph_layer_rows": len(row_values),
+                    "mean_log2_real_over_random": mean_or_nan(graph_values),
+                    "median_log2_real_over_random": median_or_nan(graph_values),
+                    "row_mean_log2_real_over_random": mean_or_nan(row_values),
+                    "positive_graph_fraction": safe_div(
+                        sum(1.0 for value in graph_values if value > 0.0),
+                        len(graph_values),
+                    ),
+                    "ci_low": lo,
+                    "ci_high": hi,
+                }
+            )
+    return rows
+
+
+def plot_operator_specificity_evidence(out_dir: Path) -> None:
+    try:
+        import matplotlib.pyplot as plt
+        import pandas as pd
+    except Exception as exc:
+        print(f"[plot] skipped specificity evidence plots: {exc}", flush=True)
+        return
+    path = out_dir / "operator_transport_per_graph.csv"
+    if not path.exists():
+        return
+    df = pd.read_csv(path)
+    df = df[df["transport_component"] == "total"].copy()
+    if df.empty:
+        return
+    real = df[df["operator"].astype(str).map(is_primary_operator)].copy()
+    random_df = df[df["operator"].astype(str).str.startswith("random__")].copy()
+    if real.empty or random_df.empty:
+        return
+    random_df["matched_operator"] = random_df["operator"].astype(str).str.replace(
+        "random__",
+        "",
+        regex=False,
+    )
+    keys = ["graph_index", "layer"]
+    merged = real.merge(
+        random_df,
+        left_on=keys + ["operator"],
+        right_on=keys + ["matched_operator"],
+        suffixes=("_real", "_random"),
+    )
+    if merged.empty:
+        return
+    metrics = [
+        "attention_lift",
+        "abs_transport_lift",
+        "influence_lift",
+        "transport_lift_global_gate",
+    ]
+    for metric in metrics:
+        merged[f"log2_real_over_random_{metric}"] = [
+            safe_log2_ratio(real, random_value)
+            for real, random_value in zip(
+                merged[f"{metric}_real"].tolist(),
+                merged[f"{metric}_random"].tolist(),
+            )
+        ]
+    rows = operator_specificity_summary_rows(merged, metrics)
+    write_csv(out_dir / "operator_specificity_effects.csv", rows)
+
+    figures = out_dir / "figures"
+    figures.mkdir(parents=True, exist_ok=True)
+    summary = pd.DataFrame(rows)
+    influence = summary[summary["metric"] == "influence_lift"].sort_values(
+        "mean_log2_real_over_random",
+        ascending=False,
+    )
+    influence = influence[
+        influence["mean_log2_real_over_random"].map(lambda value: math.isfinite(float(value)))
+    ]
+    if not influence.empty:
+        fig, ax = plt.subplots(figsize=(10.0, 5.2), dpi=180)
+        x = list(range(len(influence)))
+        y = influence["mean_log2_real_over_random"].to_numpy(dtype=float)
+        yerr = [
+            y - influence["ci_low"].to_numpy(dtype=float),
+            influence["ci_high"].to_numpy(dtype=float) - y,
+        ]
+        ax.bar(x, y, color="#4c78a8")
+        ax.errorbar(x, y, yerr=yerr, fmt="none", ecolor="0.15", capsize=3, linewidth=1.0)
+        ax.axhline(0.0, color="0.25", linewidth=0.8)
+        ax.set_xticks(x, labels=influence["operator"], rotation=30, ha="right")
+        ax.set_ylabel("log2(real operator lift / matched random lift)")
+        ax.set_title("M3: operator specificity against matched null")
+        ax.text(
+            0.01,
+            0.98,
+            "Hypothesis: solver-derived operators exceed matched random masks",
+            transform=ax.transAxes,
+            va="top",
+            ha="left",
+            fontsize=8,
+        )
+        fig.tight_layout()
+        fig.savefig(figures / "M3_operator_specificity_effects.png")
+        plt.close(fig)
+
+    heat = merged.pivot_table(
+        index="layer",
+        columns="operator_real",
+        values="log2_real_over_random_influence_lift",
+        aggfunc="mean",
+    )
+    if not heat.empty:
+        fig_width = max(8.0, 0.72 * max(1, len(heat.columns)))
+        fig, ax = plt.subplots(figsize=(fig_width, 4.8), dpi=180)
+        heat_values = torch.as_tensor(heat.to_numpy(dtype=float))
+        finite_abs = heat_values[torch.isfinite(heat_values)].abs()
+        vmax = max(1.0, float(finite_abs.max())) if finite_abs.numel() else 1.0
+        image = ax.imshow(heat.values, aspect="auto", cmap="coolwarm", vmin=-vmax, vmax=vmax)
+        ax.axhline(-0.5, color="none")
+        ax.set_title("M3: layer-wise operator specificity")
+        ax.set_xlabel("operator")
+        ax.set_ylabel("layer")
+        ax.set_xticks(range(len(heat.columns)), labels=heat.columns, rotation=30, ha="right")
+        ax.set_yticks(range(len(heat.index)), labels=[str(i) for i in heat.index])
+        fig.colorbar(
+            image,
+            ax=ax,
+            fraction=0.046,
+            pad=0.04,
+            label="log2 real/random influence lift",
+        )
+        fig.tight_layout()
+        fig.savefig(figures / "M3_operator_specificity_by_layer.png")
+        plt.close(fig)
+
+    comparison_metrics = ["attention_lift", "abs_transport_lift", "influence_lift"]
+    comp = summary[summary["metric"].isin(comparison_metrics)]
+    if not comp.empty:
+        operators = (
+            list(influence["operator"])
+            if not influence.empty
+            else sorted(comp["operator"].unique())
+        )
+        labels = {
+            "attention_lift": "attention",
+            "abs_transport_lift": "realised transport",
+            "influence_lift": "task-weighted influence",
+        }
+        fig, ax = plt.subplots(figsize=(10.2, 5.4), dpi=180)
+        width = 0.24
+        base = torch.arange(len(operators)).float().numpy()
+        for idx, metric in enumerate(comparison_metrics):
+            sub = comp[comp["metric"] == metric].set_index("operator").reindex(operators)
+            x = base + (idx - 1) * width
+            ax.bar(x, sub["mean_log2_real_over_random"], width=width, label=labels[metric])
+        ax.axhline(0.0, color="0.25", linewidth=0.8)
+        ax.set_xticks(base, labels=operators, rotation=30, ha="right")
+        ax.set_ylabel("log2(real / matched random)")
+        ax.set_title("M3 control: attention versus realised/influence transport")
+        ax.legend(frameon=False)
+        fig.tight_layout()
+        fig.savefig(figures / "M3_attention_vs_transport_specificity.png")
+        plt.close(fig)
+    plot_graph_count_convergence(merged, figures)
+
+
+def plot_graph_count_convergence(merged: Any, figures: Path) -> None:
+    try:
+        import matplotlib.pyplot as plt
+    except Exception as exc:
+        print(f"[plot] skipped graph-count convergence plot: {exc}", flush=True)
+        return
+    if "log2_real_over_random_influence_lift" not in merged.columns:
+        return
+    graph_ids = sorted(merged["graph_index"].unique().tolist())
+    if len(graph_ids) < 4:
+        return
+    final = (
+        merged.groupby("operator_real")["log2_real_over_random_influence_lift"]
+        .mean()
+        .sort_values(ascending=False)
+    )
+    operators = final.head(5).index.tolist()
+    checkpoints = sorted(
+        {
+            min(len(graph_ids), k)
+            for k in [4, 8, 16, 32, 64, 128, len(graph_ids)]
+            if k <= len(graph_ids)
+        }
+    )
+    fig, ax = plt.subplots(figsize=(8.8, 4.8), dpi=180)
+    for operator in operators:
+        ys = []
+        for count in checkpoints:
+            keep = set(graph_ids[:count])
+            sub = merged[
+                (merged["operator_real"] == operator)
+                & (merged["graph_index"].isin(keep))
+            ]
+            ys.append(float(sub["log2_real_over_random_influence_lift"].mean()))
+        ax.plot(checkpoints, ys, marker="o", label=operator)
+    ax.axhline(0.0, color="0.25", linewidth=0.8)
+    ax.set_xscale("log", base=2)
+    ax.set_xlabel("graphs included")
+    ax.set_ylabel("mean log2 real/random influence lift")
+    ax.set_title("A1: graph-count stability of operator specificity")
+    ax.legend(frameon=False, fontsize=8)
+    fig.tight_layout()
+    fig.savefig(figures / "A1_graph_count_convergence.png")
+    plt.close(fig)
+
+
+def plot_main_crux_dashboard(out_dir: Path) -> None:
+    try:
+        import matplotlib.pyplot as plt
+        import pandas as pd
+    except Exception as exc:
+        print(f"[plot] skipped main crux dashboard: {exc}", flush=True)
+        return
+    knockout_path = out_dir / "mechanism_knockouts.csv"
+    specificity_path = out_dir / "operator_specificity_effects.csv"
+    ranked_path = out_dir / "metric_ranked_ablation_curves.csv"
+    if not (knockout_path.exists() and specificity_path.exists() and ranked_path.exists()):
+        return
+    knock = pd.read_csv(knockout_path)
+    spec = pd.read_csv(specificity_path)
+    ranked = pd.read_csv(ranked_path)
+    knock = knock[knock["ablation"] != "clean"].copy()
+    spec = spec[spec["metric"] == "influence_lift"].sort_values(
+        "mean_log2_real_over_random",
+        ascending=False,
+    ).head(8)
+
+    figures = out_dir / "figures"
+    figures.mkdir(parents=True, exist_ok=True)
+    fig, axes = plt.subplots(1, 3, figsize=(17.5, 5.2), dpi=180)
+
+    ax = axes[0]
+    x = list(range(len(knock)))
+    knock_y_col = (
+        "paired_drop_graph_mean"
+        if "paired_drop_graph_mean" in knock.columns
+        else "raw_drop"
+    )
+    y = knock[knock_y_col].to_numpy(dtype=float)
+    low = knock["raw_drop_ci_low"].to_numpy(dtype=float)
+    high = knock["raw_drop_ci_high"].to_numpy(dtype=float)
+    yerr = [
+        torch.as_tensor(y - low).clamp_min(0.0).numpy(),
+        torch.as_tensor(high - y).clamp_min(0.0).numpy(),
+    ]
+    ax.bar(x, y, color="#4c78a8")
+    ax.errorbar(x, y, yerr=yerr, fmt="none", ecolor="0.15", capsize=3, linewidth=1)
+    ax.axhline(0, color="0.25", linewidth=0.8)
+    ax.set_xticks(x, labels=knock["ablation"], rotation=35, ha="right", fontsize=8)
+    ax.set_ylabel("paired graph-mean performance drop")
+    ax.set_title("M2. Mechanism knockouts")
+
+    ax = axes[1]
+    x = list(range(len(spec)))
+    y = spec["mean_log2_real_over_random"].to_numpy(dtype=float)
+    yerr = [
+        y - spec["ci_low"].to_numpy(dtype=float),
+        spec["ci_high"].to_numpy(dtype=float) - y,
+    ]
+    ax.bar(x, y, color="#59a14f")
+    ax.errorbar(x, y, yerr=yerr, fmt="none", ecolor="0.15", capsize=3, linewidth=1)
+    ax.axhline(0, color="0.25", linewidth=0.8)
+    ax.set_xticks(x, labels=spec["operator"], rotation=35, ha="right", fontsize=8)
+    ax.set_ylabel("log2 real / matched random")
+    ax.set_title("M3. Operator specificity")
+
+    ax = axes[2]
+    for ranking, group in ranked.groupby("ranking"):
+        group = group.sort_values("percent_ablated")
+        ranked_y_col = (
+            "paired_drop_graph_mean"
+            if "paired_drop_graph_mean" in group.columns
+            else "raw_drop"
+        )
+        ax.plot(group["percent_ablated"], group[ranked_y_col], marker="o", label=ranking)
+    ax.axhline(0, color="0.25", linewidth=0.8)
+    ax.set_xlabel("percent heads ablated")
+    ax.set_ylabel("paired graph-mean performance drop")
+    ax.set_title("M4. Ranked causal validation")
+    ax.legend(frameon=False, fontsize=7)
+
+    fig.suptitle("Mechanistic crux tests: causal necessity, operator specificity, metric adequacy")
+    fig.tight_layout()
+    fig.savefig(figures / "M_main_mechanistic_crux_dashboard.png")
+    plt.close(fig)
+
+
+def write_mechanistic_narrative_outputs(out_dir: Path) -> None:
+    try:
+        import matplotlib.pyplot as plt
+        import pandas as pd
+    except Exception as exc:
+        print(f"[plot] skipped narrative scorecard: {exc}", flush=True)
+        return
+
+    rows: list[dict[str, Any]] = []
+    knockout_path = out_dir / "mechanism_knockouts.csv"
+    if knockout_path.exists():
+        knock = pd.read_csv(knockout_path)
+        if not knock.empty and "ablation" in knock.columns:
+            knock = knock[knock["ablation"] != "clean"].copy()
+            knock["effect"] = [preferred_drop_value(row) for row in knock.to_dict("records")]
+            drops = {
+                str(row["ablation"]): finite_or_nan(row["effect"])
+                for row in knock.to_dict("records")
+            }
+            lows = {
+                str(row["ablation"]): finite_or_nan(row.get("raw_drop_ci_low"))
+                for row in knock.to_dict("records")
+            }
+
+            local_drop = drops.get("local_only_support", float("nan"))
+            rows.append(
+                narrative_claim_row(
+                    "complete_support_necessity",
+                    "Complete support carries useful beyond-GNN computation.",
+                    "mechanism_knockouts.csv",
+                    "paired graph-mean drop, local-only ablation",
+                    local_drop,
+                    supports=math.isfinite(local_drop) and local_drop > 0.0,
+                    strong=math.isfinite(lows.get("local_only_support", float("nan")))
+                    and lows["local_only_support"] > 0.0,
+                )
+            )
+
+            routing_drop = drops.get("no_structural_routing", float("nan"))
+            transport_drop = drops.get("no_pair_value_transport", float("nan"))
+            rows.append(
+                narrative_claim_row(
+                    "transport_beyond_routing",
+                    "Relation-conditioned value transport matters beyond scalar routing.",
+                    "mechanism_knockouts.csv",
+                    "transport ablation drop minus routing ablation drop",
+                    transport_drop - routing_drop,
+                    supports=(
+                        math.isfinite(transport_drop)
+                        and math.isfinite(routing_drop)
+                        and transport_drop > routing_drop
+                    ),
+                    strong=False,
+                )
+            )
+
+            pair_state_drop = max_finite(
+                [
+                    drops.get("frozen_pair_state", float("nan")),
+                    drops.get("permuted_pair_state", float("nan")),
+                ]
+            )
+            rows.append(
+                narrative_claim_row(
+                    "pair_state_content_or_evolution",
+                    "Dense pair-state content or evolution is functionally used.",
+                    "mechanism_knockouts.csv",
+                    "max pair-state ablation drop minus routing ablation drop",
+                    pair_state_drop - routing_drop,
+                    supports=(
+                        math.isfinite(pair_state_drop)
+                        and math.isfinite(routing_drop)
+                        and pair_state_drop > routing_drop
+                    ),
+                    strong=False,
+                )
+            )
+
+    specificity_path = out_dir / "operator_specificity_effects.csv"
+    if specificity_path.exists():
+        spec = pd.read_csv(specificity_path)
+        if not spec.empty and "metric" in spec.columns:
+            influence = spec[spec["metric"] == "influence_lift"].copy()
+            attention = spec[spec["metric"] == "attention_lift"].copy()
+            if not influence.empty:
+                best = influence.sort_values(
+                    "mean_log2_real_over_random",
+                    ascending=False,
+                ).iloc[0]
+                effect = finite_or_nan(best["mean_log2_real_over_random"])
+                ci_low = finite_or_nan(best.get("ci_low"))
+                rows.append(
+                    narrative_claim_row(
+                        "operator_specific_transport",
+                        "Task-weighted realised transport lands on solver-derived operators.",
+                        "operator_specificity_effects.csv",
+                        f"best operator log2 real/random influence lift: {best['operator']}",
+                        effect,
+                        supports=math.isfinite(effect) and effect > 0.0,
+                        strong=math.isfinite(ci_low) and ci_low > 0.0,
+                    )
+                )
+            if not influence.empty and not attention.empty:
+                influence_mean = finite_or_nan(influence["mean_log2_real_over_random"].mean())
+                attention_mean = finite_or_nan(attention["mean_log2_real_over_random"].mean())
+                rows.append(
+                    narrative_claim_row(
+                        "influence_beats_attention_control",
+                        "Task-weighted transport is more specific than attention-only alignment.",
+                        "operator_specificity_effects.csv",
+                        "mean influence specificity minus mean attention specificity",
+                        influence_mean - attention_mean,
+                        supports=(
+                            math.isfinite(influence_mean)
+                            and math.isfinite(attention_mean)
+                            and influence_mean > attention_mean
+                        ),
+                        strong=False,
+                    )
+                )
+
+    auc_path = out_dir / "metric_ranked_ablation_auc.csv"
+    if auc_path.exists():
+        auc = pd.read_csv(auc_path)
+        if not auc.empty and "normalised_auc" in auc.columns:
+            if "ranking_family" not in auc.columns:
+                auc["ranking_family"] = auc["ranking"].map(
+                    lambda ranking: RANKING_FAMILIES.get(str(ranking), "other")
+                )
+            controls = auc[auc["ranking_family"].isin(["control", "attention_control"])]
+            transport = auc[
+                auc["ranking_family"].isin(["transport", "task_weighted_transport"])
+            ]
+            if not controls.empty and not transport.empty:
+                best_transport = finite_or_nan(transport["normalised_auc"].max())
+                best_control = finite_or_nan(controls["normalised_auc"].max())
+                rows.append(
+                    narrative_claim_row(
+                        "metrics_select_causal_components",
+                        "Operator-transport rankings find functional components faster.",
+                        "metric_ranked_ablation_auc.csv",
+                        "best transport-family AUC minus best control-family AUC",
+                        best_transport - best_control,
+                        supports=(
+                            math.isfinite(best_transport)
+                            and math.isfinite(best_control)
+                            and best_transport > best_control
+                        ),
+                        strong=False,
+                    )
+                )
+
+    if not rows:
+        return
+
+    write_csv(out_dir / "mechanistic_narrative_claims.csv", rows)
+    write_narrative_markdown(out_dir / "mechanistic_narrative_summary.md", rows)
+    plot_narrative_scorecard(rows, out_dir / "figures", plt)
+
+
+def narrative_claim_row(
+    claim_id: str,
+    claim: str,
+    source: str,
+    evidence_metric: str,
+    effect_value: float,
+    *,
+    supports: bool,
+    strong: bool,
+) -> dict[str, Any]:
+    if strong:
+        status = "strong_support"
+    elif supports:
+        status = "directional_support"
+    elif math.isfinite(effect_value):
+        status = "not_supported"
+    else:
+        status = "missing"
+    return {
+        "claim_id": claim_id,
+        "claim": claim,
+        "source": source,
+        "evidence_metric": evidence_metric,
+        "effect_value": effect_value,
+        "supports_claim": supports,
+        "evidence_status": status,
+    }
+
+
+def write_narrative_markdown(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines = [
+        "# Mechanistic Narrative Summary",
+        "",
+        "Generated from mechanistic operator analysis CSV outputs.",
+        "",
+        "| Claim | Evidence | Effect | Status |",
+        "|---|---|---:|---|",
+    ]
+    for row in rows:
+        effect = finite_or_nan(row.get("effect_value"))
+        effect_text = "nan" if not math.isfinite(effect) else f"{effect:.4g}"
+        lines.append(
+            "| "
+            + str(row["claim"])
+            + " | "
+            + str(row["evidence_metric"])
+            + " | "
+            + effect_text
+            + " | "
+            + str(row["evidence_status"])
+            + " |"
+        )
+    lines.append("")
+    lines.append(
+        "Interpretation rule: strong support means the effect is positive with an available "
+        "positive lower bootstrap bound; directional support means the sign is aligned but "
+        "the scorecard has not established a bootstrap-sign claim."
+    )
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def plot_narrative_scorecard(rows: Sequence[Mapping[str, Any]], figures: Path, plt: Any) -> None:
+    finite_rows = [row for row in rows if math.isfinite(finite_or_nan(row.get("effect_value")))]
+    if not finite_rows:
+        return
+    figures.mkdir(parents=True, exist_ok=True)
+    labels = [str(row["claim_id"]).replace("_", "\n") for row in finite_rows]
+    values = [finite_or_nan(row["effect_value"]) for row in finite_rows]
+    colors = [
+        {
+            "strong_support": "#4c78a8",
+            "directional_support": "#59a14f",
+            "not_supported": "#d62728",
+            "missing": "#9d9d9d",
+        }.get(str(row["evidence_status"]), "#777777")
+        for row in finite_rows
+    ]
+    x = list(range(len(finite_rows)))
+    fig, ax = plt.subplots(figsize=(10.8, 4.8), dpi=180)
+    ax.bar(x, values, color=colors)
+    ax.axhline(0.0, color="0.25", linewidth=0.8)
+    ax.set_xticks(x, labels=labels, rotation=0, ha="center", fontsize=8)
+    ax.set_ylabel("claim-specific effect")
+    ax.set_title("Mechanistic narrative scorecard")
+    fig.tight_layout()
+    fig.savefig(figures / "M_narrative_scorecard.png")
     plt.close(fig)
 
 
@@ -1877,6 +3060,12 @@ def analysis_protocol_audit() -> dict[str, Any]:
             "whether realised, task-weighted head transport concentrates on "
             "task-relevant graph operators beyond their base rate"
         ),
+        "dissertation_narrative_axes": {
+            "support": "which node pairs may communicate",
+            "routing": "which supported senders receive scalar mass",
+            "transport": "what node or pair-conditioned value is sent",
+            "pair_state": "whether dense pair relations are evolved and used",
+        },
         "recorded_fields": {
             "A": "post-softmax per-head routing A[l,h,i,j]",
             "logits": "reconstructed official GRIT pre-softmax attention logits",
@@ -1903,6 +3092,22 @@ def analysis_protocol_audit() -> dict[str, Any]:
                 "left NaN unless the swap-metric responsibility CSV is supplied"
             ),
         },
+        "output_tables": {
+            "operator_transport_per_head.csv": "layer/head/operator reductions for ranking and OTS",
+            "operator_transport_by_layer.csv": "head-pooled layer/operator atlas values",
+            "operator_transport_per_graph.csv": (
+                "graph-layer rows aggregated over heads for matched-null specificity and stability"
+            ),
+            "operator_mask_base_rates.csv": (
+                "documented operator and matched-random mask base rates"
+            ),
+            "operator_specificity_effects.csv": (
+                "graph-level real-vs-matched-random log2 lift effects with bootstrap CIs"
+            ),
+            "mechanistic_narrative_claims.csv": (
+                "claim-level scorecard aligned to support, routing, transport, and pair-state axes"
+            ),
+        },
         "implemented_controls": (
             "matched random masks preserving SPD bucket, endpoint degree bins, "
             "local/global adjacency, and directed edge/non-edge status"
@@ -1914,9 +3119,18 @@ def analysis_protocol_audit() -> dict[str, Any]:
             "Global task transport should be concentrated in a subset of layers/heads.",
         ],
         "known_scope": [
-            "Official GRIT/static-GRIT are implemented first because their pair transport is explicit.",
-            "Flow masks require explicit source/sink roles in node_type and use deterministic max-flow.",
-            "M1 distillation requires supplied teacher kernels; this script will not fabricate them.",
+            (
+                "Official GRIT/static-GRIT are implemented first because their "
+                "pair transport is explicit."
+            ),
+            (
+                "Flow masks require explicit source/sink roles in node_type and "
+                "use deterministic max-flow."
+            ),
+            (
+                "M1 distillation requires supplied teacher kernels; this script "
+                "will not fabricate them."
+            ),
             "M2 knockouts and M4 ranked ablations are implemented as inference-time GRIT patches.",
             "Pair-set scrubbing and clean/corrupt/patch remain second-phase methods from the memo.",
         ],
@@ -1927,6 +3141,7 @@ def analysis_protocol_audit() -> dict[str, Any]:
 class LoadedExperiment:
     runner: Any
     device: torch.device
+    runtime_settings: Mapping[str, Any]
     checkpoint: Mapping[str, Any]
     cfg: Any
     splits: Mapping[str, Any]
@@ -1934,6 +3149,9 @@ class LoadedExperiment:
     selected_indices: list[int]
     graphs: list[Any]
     subset_dataset: Any
+    analysis_batches: list[tuple[list[int], Any]]
+    batch_cache_mode: str
+    batch_cache_estimated_bytes: int
     model: nn.Module
     target_stats: Optional[Mapping[str, float]]
     pos_weight: Optional[torch.Tensor]
@@ -1942,6 +3160,7 @@ class LoadedExperiment:
 def load_experiment(args: argparse.Namespace) -> LoadedExperiment:
     runner = load_runner(args.runner_path)
     device = resolve_device(args.device)
+    runtime_settings = configure_torch_runtime(args, device)
     checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     if not isinstance(checkpoint, Mapping):
         raise ValueError(f"checkpoint must be a mapping: {args.checkpoint}")
@@ -1968,7 +3187,7 @@ def load_experiment(args: argparse.Namespace) -> LoadedExperiment:
         pe_save_every=args.pe_save_every,
         force_recompute=False,
         build_missing=args.build_missing_pe_cache,
-        require_present=not args.build_missing_pe_cache,
+        require_present=args.require_pe_cache and not args.build_missing_pe_cache,
         log=print,
     )
     dataset = splits[args.split]
@@ -1991,6 +3210,17 @@ def load_experiment(args: argparse.Namespace) -> LoadedExperiment:
             f"missing={missing}, unexpected={unexpected}"
         )
     model.to(device).eval()
+    analysis_batch_size = max(1, int(args.analysis_cache_batch_size or args.batch_size))
+    analysis_batches, batch_cache_mode, batch_cache_estimated_bytes = collate_analysis_batches(
+        runner,
+        graphs,
+        selected_indices,
+        batch_size=analysis_batch_size,
+        device=device,
+        cache_mode=args.cache_batches,
+        gpu_cache_limit_gb=args.gpu_cache_limit_gb,
+        log=print,
+    )
     target_stats = checkpoint.get("target_stats")
     if target_stats is None:
         target_stats = runner.compute_target_stats(splits["train"])
@@ -1998,6 +3228,7 @@ def load_experiment(args: argparse.Namespace) -> LoadedExperiment:
     return LoadedExperiment(
         runner=runner,
         device=device,
+        runtime_settings=runtime_settings,
         checkpoint=checkpoint,
         cfg=cfg,
         splits=splits,
@@ -2005,6 +3236,9 @@ def load_experiment(args: argparse.Namespace) -> LoadedExperiment:
         selected_indices=selected_indices,
         graphs=graphs,
         subset_dataset=subset_dataset,
+        analysis_batches=analysis_batches,
+        batch_cache_mode=batch_cache_mode,
+        batch_cache_estimated_bytes=batch_cache_estimated_bytes,
         model=model,
         target_stats=target_stats,
         pos_weight=pos_weight,
@@ -2027,18 +3261,23 @@ def run_atlas(args: argparse.Namespace, loaded: Optional[LoadedExperiment] = Non
     )
     accumulator = OperatorTransportAccumulator(responsibility)
     start_time = time.time()
-    batch_size = max(1, int(args.batch_size))
+    batch_size = max(1, int(args.analysis_cache_batch_size or args.batch_size))
     teacher_kernels = load_teacher_kernels(args.teacher_kernel_pt)
+    if loaded.analysis_batches:
+        analysis_items = loaded.analysis_batches
+        batches_are_cached = True
+    else:
+        analysis_items = graph_batches(graphs, selected_indices, batch_size)
+        batches_are_cached = False
 
-    for start_idx in range(0, len(graphs), batch_size):
-        end_idx = min(len(graphs), start_idx + batch_size)
-        batch_graphs = graphs[start_idx:end_idx]
-        graph_indices = selected_indices[start_idx:end_idx]
-        batch = runner.collate_graphs(batch_graphs).to(device)
+    for batch_idx, (graph_indices, batch_item) in enumerate(analysis_items):
+        cached_batch = batch_item if batches_are_cached else runner.collate_graphs(batch_item)
+        batch = batch_to_device(cached_batch, device)
         model.zero_grad(set_to_none=True)
         with collector as active_collector:
             with torch.enable_grad():
-                pred = model(batch)
+                with autocast_context(device, args.autocast_dtype):
+                    pred = model(batch)
                 scalar = task_scalar(pred, batch)
                 scalar.backward()
         valid = valid_pair_mask(batch)
@@ -2051,7 +3290,14 @@ def run_atlas(args: argparse.Namespace, loaded: Optional[LoadedExperiment] = Non
         teacher_masks = teacher_operator_masks(teacher_kernels, graph_indices, batch)
         masks.update(teacher_masks)
         if args.random_controls and teacher_masks:
-            masks.update(rate_matched_random_masks(teacher_masks, batch, valid, args.random_seed + start_idx))
+            masks.update(
+                rate_matched_random_masks(
+                    teacher_masks,
+                    batch,
+                    valid,
+                    args.random_seed + start_idx,
+                )
+            )
         global_mask = masks.get("global_nonedge", (valid & ~sparse_edge_mask(batch)).float())
         accumulator.add_batch(
             active_collector.records,
@@ -2061,12 +3307,13 @@ def run_atlas(args: argparse.Namespace, loaded: Optional[LoadedExperiment] = Non
             graph_indices,
         )
         print(
-            f"[analysis] batch={start_idx // batch_size + 1} "
-            f"graphs={start_idx}:{end_idx} scalar={to_float(scalar):.5g}",
+            f"[analysis] batch={batch_idx + 1}/{len(analysis_items)} "
+            f"graphs={graph_indices[0]}:{graph_indices[-1] + 1} scalar={to_float(scalar):.5g}",
             flush=True,
         )
+        active_collector.records.clear()
         del batch, pred, scalar, masks
-        if device.type == "cuda":
+        if args.empty_cache_every_batch and device.type == "cuda":
             torch.cuda.empty_cache()
 
     out_dir = args.output_dir
@@ -2074,8 +3321,11 @@ def run_atlas(args: argparse.Namespace, loaded: Optional[LoadedExperiment] = Non
     per_head = accumulator.per_head_rows()
     by_layer = accumulator.layer_rows()
     head_summary = accumulator.head_summary_rows()
+    base_rates = accumulator.base_rate_rows()
     write_csv(out_dir / "operator_transport_per_head.csv", per_head)
     write_csv(out_dir / "operator_transport_by_layer.csv", by_layer)
+    write_csv(out_dir / "operator_transport_per_graph.csv", accumulator.graph_rows)
+    write_csv(out_dir / "operator_mask_base_rates.csv", base_rates)
     write_csv(out_dir / "head_operator_summary.csv", head_summary)
     metadata = {
         "task": args.task,
@@ -2086,16 +3336,22 @@ def run_atlas(args: argparse.Namespace, loaded: Optional[LoadedExperiment] = Non
         "checkpoint": str(args.checkpoint),
         "num_graphs": len(graphs),
         "batch_size": batch_size,
+        "analysis_batch_cache_mode": loaded.batch_cache_mode,
+        "analysis_batch_cache_estimated_gib": loaded.batch_cache_estimated_bytes / (1024**3),
         "selected_graph_indices": selected_indices,
         "device": str(device),
+        "torch_runtime": dict(loaded.runtime_settings),
         "elapsed_seconds": time.time() - start_time,
         "random_controls": args.random_controls,
         "task_transport_responsibility_source": None
         if args.specialisation_summary_csv is None
         else str(args.specialisation_summary_csv),
         "task_transport_responsibility_rows": len(responsibility),
-        "teacher_kernel_pt": None if args.teacher_kernel_pt is None else str(args.teacher_kernel_pt),
+        "teacher_kernel_pt": None
+        if args.teacher_kernel_pt is None
+        else str(args.teacher_kernel_pt),
         "teacher_kernels": sorted(teacher_kernels.keys()),
+        "operator_mask_base_rate_rows": len(base_rates),
         "analysis_protocol_audit": analysis_protocol_audit(),
     }
     (out_dir / "metadata.json").write_text(
@@ -2134,6 +3390,8 @@ def run(args: argparse.Namespace) -> None:
         run_ranked_ablation(args, loaded)
     if "distillation_calibration" in experiments:
         run_distillation_calibration(args, loaded)
+    plot_main_crux_dashboard(args.output_dir)
+    write_mechanistic_narrative_outputs(args.output_dir)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -2177,6 +3435,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--pe-cache-namespace", default="base_40k4k4k_n64")
     parser.add_argument("--pe-cache-dtype", default="float32", choices=("float32", "float16"))
+    parser.add_argument(
+        "--require-pe-cache",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Require the official GraphBench PE cache by default. Use "
+            "--no-require-pe-cache only for debugging or with --build-missing-pe-cache."
+        ),
+    )
     parser.add_argument("--build-missing-pe-cache", action="store_true")
     parser.add_argument("--pe-workers", type=int, default=1)
     parser.add_argument("--pe-save-every", type=int, default=500)
@@ -2186,6 +3453,61 @@ def build_parser() -> argparse.ArgumentParser:
         default=Path("outputs/mechanistic_operator_analysis"),
     )
     parser.add_argument("--device", default="auto")
+    parser.add_argument(
+        "--cache-batches",
+        default="auto",
+        choices=("auto", "gpu", "cpu", "none"),
+        help=(
+            "Pre-collate selected analysis batches once. auto stores them on GPU when "
+            "they fit under --gpu-cache-limit-gb, otherwise on CPU."
+        ),
+    )
+    parser.add_argument(
+        "--analysis-cache-batch-size",
+        type=int,
+        default=0,
+        help="Batch size for shared cached analysis batches; 0 uses --batch-size.",
+    )
+    parser.add_argument(
+        "--gpu-cache-limit-gb",
+        type=float,
+        default=48.0,
+        help="Maximum approximate cached batch tensor size to keep resident on GPU in auto mode.",
+    )
+    parser.add_argument(
+        "--allow-tf32",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable TF32 matmul/convolution on CUDA GPUs. Recommended for A100 analysis runs.",
+    )
+    parser.add_argument(
+        "--float32-matmul-precision",
+        default="high",
+        choices=("default", "highest", "high", "medium"),
+        help="torch.set_float32_matmul_precision setting used on CUDA.",
+    )
+    parser.add_argument(
+        "--autocast-dtype",
+        default="none",
+        choices=("none", "bfloat16", "float16"),
+        help=(
+            "Optional CUDA autocast dtype. bfloat16 can speed A100 sweeps, while none "
+            "keeps attribution numerics closest to checkpoint dtype."
+        ),
+    )
+    parser.add_argument(
+        "--cuda-benchmark",
+        action="store_true",
+        help="Enable cudnn.benchmark for repeated fixed-shape CUDA workloads.",
+    )
+    parser.add_argument(
+        "--empty-cache-every-batch",
+        action="store_true",
+        help=(
+            "Call torch.cuda.empty_cache() after every atlas batch. Slower; "
+            "use only for OOM triage."
+        ),
+    )
     parser.add_argument("--force-reload-data", action="store_true")
     parser.add_argument("--split-seed", type=int, default=None)
     parser.add_argument("--train-size", type=int, default=None)
