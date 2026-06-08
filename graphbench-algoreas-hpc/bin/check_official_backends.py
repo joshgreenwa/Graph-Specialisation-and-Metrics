@@ -186,7 +186,7 @@ def parse_args() -> argparse.Namespace:
     root = default_project_root()
     external = root / "external"
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--models", default="graphormer,graphgps,static_grit,grit,gatedgcn_plus,gin_plus,gcn_plus")
+    parser.add_argument("--models", default="graphgps,static_grit,grit,gatedgcn_plus,gin_plus,gcn_plus")
     parser.add_argument("--graphormer-path", type=Path, default=Path(os.environ.get("GRAPHORMER_ROOT", external / "Graphormer")))
     parser.add_argument("--graphgps-path", type=Path, default=Path(os.environ.get("GRAPHGPS_ROOT", external / "GraphGPS")))
     parser.add_argument("--grit-path", type=Path, default=Path(os.environ.get("GRIT_ROOT", external / "GRIT")))
@@ -204,6 +204,8 @@ def main() -> int:
     checks: list[CheckResult] = []
     checks.append(CheckResult("python", True, sys.version.replace("\n", " ")))
     base_modules = ["torch", "torch_geometric", "torch_scatter", "yacs", "wandb", "graphbench"]
+    if needs_graphgps:
+        base_modules.append("performer_pytorch")
     if needs_grit:
         base_modules.extend(["torch_sparse", "ogb", "opt_einsum"])
     for module_name in base_modules:

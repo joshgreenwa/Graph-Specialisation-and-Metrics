@@ -55,7 +55,7 @@ TASK_TYPES = {
 DEFAULT_TASKS = ("bipartite_matching_hard", "flow_hard", "mst_hard", "maxclique_hard", "bridges_hard")
 CALIBRATION_TASKS = ("mst_easy", "bridges_easy", "flow_easy")
 MODEL_NAMES = ("graphormer", "graphgps", "grit", "static_grit", "gcn_plus", "gin_plus", "gatedgcn_plus")
-DEFAULT_MODELS = ("static_grit", "grit", "gatedgcn_plus", "gin_plus", "gcn_plus")
+DEFAULT_MODELS = ("graphgps", "static_grit", "grit", "gatedgcn_plus", "gin_plus", "gcn_plus")
 ALGOREAS_DATASET_NAMES = {
     "topologicalorder": "topologicalorder",
     "bipartite_matching": "bipartitematching",
@@ -832,7 +832,12 @@ def load_subset_cache(path: Path, task_name: str, split: str) -> Optional[Offici
     if not path.exists():
         return None
     payload = torch.load(path, map_location="cpu", weights_only=False)
-    if not isinstance(payload, Mapping) or payload.get("version") != RUN_VERSION:
+    if (
+        not isinstance(payload, Mapping)
+        or payload.get("version") != RUN_VERSION
+        or payload.get("task") != task_name
+        or payload.get("split") != split
+    ):
         return None
     graphs = [graph_from_payload(graph) for graph in payload["graphs"]]
     return OfficialGraphDataset(graphs, task_name=task_name, split=split)
@@ -975,8 +980,11 @@ def load_official_graphbench_task(
     task_name: str,
     cfg: ScreenConfig,
     force_reload: bool,
+    require_cache: bool = False,
     log=print,
 ) -> dict[str, OfficialGraphDataset]:
+    if require_cache and force_reload:
+        raise ValueError("--require-subset-cache cannot be combined with --force-reload-data")
     split_sizes = {"train": cfg.train_size, "val": cfg.val_size, "test": cfg.test_size}
     split_nodes = {"train": cfg.train_node_size, "val": cfg.val_node_size, "test": cfg.test_node_size}
     split_seeds = {"train": 101, "val": 211, "test": 307}
@@ -986,15 +994,16 @@ def load_official_graphbench_task(
             f"got train_node_size={cfg.train_node_size}, val_node_size={cfg.val_node_size}."
         )
     cached: dict[str, OfficialGraphDataset] = {}
+    missing_cache_paths: list[Path] = []
     if not force_reload:
         for split, size in split_sizes.items():
             path = subset_cache_path(root, task_name, split, size, split_nodes[split], cfg.split_seed + split_seeds[split])
             dataset = load_subset_cache(path, task_name, split)
             if dataset is None:
-                cached = {}
-                break
+                missing_cache_paths.append(path)
+                continue
             cached[split] = dataset
-        if cached:
+        if not missing_cache_paths:
             log(f"[data] Loaded converted subset cache for {task_name}")
             for split, dataset in cached.items():
                 node_counts = [graph.num_nodes for graph in dataset]
@@ -1003,6 +1012,12 @@ def load_official_graphbench_task(
                         f"nodes={min(node_counts) if node_counts else 0}-{max(node_counts) if node_counts else 0}"
                 )
             return normalize_edge_values_in_splits(cached, log=log)
+    if require_cache:
+        missing = "\n".join(f"  - {path}" for path in missing_cache_paths)
+        raise FileNotFoundError(
+            f"required converted GraphBench subset cache is missing or incompatible for {task_name}:\n{missing}\n"
+            "Run the CPU precompute/prepare step first, then rerun model training with --require-subset-cache."
+        )
 
     require_package("graphbench", "graphbench-lib", log=log)
     from graphbench.co_helpers.split_dataset import split_dataset  # type: ignore
@@ -1710,11 +1725,11 @@ def ensure_graphgym_cfg_group(cfg_obj, name: str):
     return cfg_obj[name]
 
 
-def configure_gnnplus_graphgym(cfg: ScreenConfig, dim_pe: int) -> None:
+def configure_rwse_graphgym(cfg: ScreenConfig, dim_pe: int, act: Optional[str] = None) -> None:
     graphgym_config = require_official_import("torch_geometric.graphgym.config", "torch_geometric")
     graphgym_cfg = graphgym_config.cfg
     gnn = ensure_graphgym_cfg_group(graphgym_cfg, "gnn")
-    gnn.act = cfg.gnnplus_act
+    gnn.act = act or cfg.gnnplus_act
     share = ensure_graphgym_cfg_group(graphgym_cfg, "share")
     share.dim_in = NODE_VOCAB
     pe_cfg = ensure_graphgym_cfg_group(graphgym_cfg, "posenc_RWSE")
@@ -1727,6 +1742,10 @@ def configure_gnnplus_graphgym(cfg: ScreenConfig, dim_pe: int) -> None:
     kernel = ensure_graphgym_cfg_group(pe_cfg, "kernel")
     kernel.times = list(range(1, RW_STEPS + 1))
     kernel.times_func = ""
+
+
+def configure_gnnplus_graphgym(cfg: ScreenConfig, dim_pe: int) -> None:
+    configure_rwse_graphgym(cfg, dim_pe)
 
 
 def grit_layer_cfg(update_e: bool):
@@ -1895,6 +1914,59 @@ class PyGPredictionHeads(nn.Module):
         return self.edge_head(torch.cat(pieces, dim=-1)).squeeze(-1)
 
 
+class OfficialGraphGPSModel(nn.Module):
+    def __init__(self, cfg: ScreenConfig) -> None:
+        super().__init__()
+        add_external_repo_path("GRAPHGPS_ROOT", ("GraphGPS",))
+        dim = cfg.hidden_dim
+        dim_pe = min(32, max(16, dim // 4))
+        configure_rwse_graphgym(cfg, dim_pe, act="relu")
+        rwse_mod = require_official_import(
+            "graphgps.encoder.kernel_pos_encoder",
+            "official GraphGPS repository",
+        )
+        gps_layer_mod = require_official_import(
+            "graphgps.layer.gps_layer",
+            "official GraphGPS repository",
+        )
+        self.rwse_encoder = rwse_mod.RWSENodeEncoder(dim, expand_x=True)
+        self.edge_encoder = nn.Linear(1, dim)
+        self.layers = nn.ModuleList(
+            gps_layer_mod.GPSLayer(
+                dim_h=dim,
+                local_gnn_type="CustomGatedGCN",
+                global_model_type="Transformer",
+                num_heads=cfg.heads,
+                act="relu",
+                pna_degrees=None,
+                equivstable_pe=False,
+                dropout=cfg.dropout,
+                attn_dropout=cfg.attn_dropout,
+                layer_norm=False,
+                batch_norm=True,
+                bigbird_cfg=None,
+                log_attn_weights=False,
+            )
+            for _ in range(cfg.layers)
+        )
+        self.heads = PyGPredictionHeads(dim, edge_dim=dim)
+
+    def forward(self, batch: OfficialBatch) -> torch.Tensor:
+        pyg_batch = build_pyg_adapter_batch(batch, include_rwse=True, include_rrwp=False)
+        pyg_batch.x = F.one_hot(pyg_batch.node_type.long(), num_classes=NODE_VOCAB).float()
+        pyg_batch = self.rwse_encoder(pyg_batch)
+        pyg_batch.edge_attr = self.edge_encoder(pyg_batch.orig_edge_value.unsqueeze(-1).to(pyg_batch.x.dtype))
+        for layer in self.layers:
+            pyg_batch = layer(pyg_batch)
+        if batch.task_type == "edge_binary":
+            return self.heads.edge(pyg_batch.x, batch, pyg_batch.edge_attr)
+        if batch.task_type in {"node_binary", "node_regression"}:
+            return self.heads.node(pyg_batch.x)
+        if batch.task_type == "graph_regression":
+            return self.heads.graph(pyg_batch.x, batch)
+        raise ValueError(batch.task_type)
+
+
 class OfficialGNNPlusModel(nn.Module):
     def __init__(self, cfg: ScreenConfig, model_name: str) -> None:
         super().__init__()
@@ -2027,6 +2099,8 @@ class OfficialGRITModel(nn.Module):
 
 def build_model(model_name: str, cfg: ScreenConfig, backend: str = "official") -> nn.Module:
     if backend == "official":
+        if model_name == "graphgps":
+            return OfficialGraphGPSModel(cfg)
         if model_name == "grit":
             return OfficialGRITModel(cfg, evolve_pairs=True)
         if model_name == "static_grit":
@@ -2035,7 +2109,7 @@ def build_model(model_name: str, cfg: ScreenConfig, backend: str = "official") -
             return OfficialGNNPlusModel(cfg, model_name)
         raise NotImplementedError(
             f"Official backend for {model_name!r} is not wired in this runner yet. "
-            "Use --models grit,static_grit,gcn_plus,gin_plus,gatedgcn_plus for official-backed runs, "
+            "Use --models graphgps,grit,static_grit,gcn_plus,gin_plus,gatedgcn_plus for official-backed runs, "
             "or pass --model-backend local --allow-local-style-models for smoke tests only."
         )
     if backend != "local":
@@ -2815,7 +2889,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         "--model-backend",
         choices=("official", "local"),
         default="official",
-        help="official uses upstream GRIT/GNN+ layer/encoder implementations; local is smoke-test only.",
+        help="official uses upstream GraphGPS/GRIT/GNN+ layer/encoder implementations; local is smoke-test only.",
     )
     parser.add_argument("--seeds", type=str, default="0,1,2,3")
     parser.add_argument("--split-seed", type=int, default=ScreenConfig.split_seed)
@@ -2856,6 +2930,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--pe-workers", type=int, default=int(os.environ.get("GRAPHBENCH_PE_WORKERS", "1")), help="Parallel worker processes for PE precompute. Use 1 for serial.")
     parser.add_argument("--pe-save-every", type=int, default=int(os.environ.get("GRAPHBENCH_PE_SAVE_EVERY", "500")), help="Save resumable partial PE shards after this many newly computed graphs per split.")
     parser.add_argument("--force-recompute-pe", action="store_true")
+    parser.add_argument("--require-subset-cache", action="store_true", help="Fail unless converted GraphBench subset caches already exist; do not load or generate GraphBench splits.")
     parser.add_argument("--no-build-missing-pe-cache", action="store_true", help="Use PE caches only when already present; otherwise compute PE in collate.")
     parser.add_argument("--require-pe-cache", action="store_true", help="Fail if a selected split lacks a compatible PE cache.")
     parser.add_argument("--output-root", type=Path, default=env_path("GRAPHBENCH_OUTPUT_ROOT"))
@@ -2954,11 +3029,11 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     if unknown_models:
         raise ValueError(f"unknown model(s): {unknown_models}")
     if args.model_backend == "official":
-        unsupported_official = [model for model in models if model in {"graphormer", "graphgps"}]
+        unsupported_official = [model for model in models if model in {"graphormer"}]
         if unsupported_official and not (args.print_jobs or args.precompute_pe_only or args.prepare_data_only):
             raise ValueError(
-                f"official backend is currently wired for GRIT/static-GRIT/GNN+ only; unsupported={unsupported_official}. "
-                "Use --models grit,static_grit,gcn_plus,gin_plus,gatedgcn_plus, or run local smoke tests with "
+                f"official backend is currently wired for GraphGPS/GRIT/static-GRIT/GNN+ only; unsupported={unsupported_official}. "
+                "Use --models graphgps,grit,static_grit,gcn_plus,gin_plus,gatedgcn_plus, or run local smoke tests with "
                 "--model-backend local --allow-local-style-models."
             )
     seeds = parse_seed_list(args.seeds)
@@ -3034,14 +3109,22 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     if args.model_backend == "local" and not args.allow_local_style_models:
         raise RuntimeError(
             "Training/eval with local dense style-models is disabled. "
-            "Paper runs must use official-backed Graphormer/GraphGPS/GRIT/GNN+ "
-            "model implementations; see docs/model_fidelity_audit.md. "
+            "Paper runs must use official-backed model implementations; "
+            "GraphGPS/GRIT/GNN+ are wired here and Graphormer remains pending. "
+            "See docs/model_fidelity_audit.md. "
             "Pass --allow-local-style-models only for local smoke tests."
         )
     all_summaries = []
     for task in tasks:
         base_cfg = cfg_from_args(args, seeds[0])
-        splits = load_official_graphbench_task(dataset_root, task, base_cfg, force_reload=args.force_reload_data, log=log)
+        splits = load_official_graphbench_task(
+            dataset_root,
+            task,
+            base_cfg,
+            force_reload=args.force_reload_data,
+            require_cache=args.require_subset_cache,
+            log=log,
+        )
         pe_split_names = ("train", "val", "test") if base_cfg.final_eval else ("train", "val")
         pe_splits = attach_or_build_pe_cache(
             {split: splits[split] for split in pe_split_names},

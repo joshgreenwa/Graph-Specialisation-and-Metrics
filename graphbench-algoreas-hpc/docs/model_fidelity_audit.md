@@ -23,16 +23,16 @@ This repository should own only the GraphBench-to-PyG conversion, PE
 precompute/cache, algorithmic heads, loss/metric code, checkpointing, W&B, and
 SLURM orchestration.
 
-The current runner implements official-backed GRIT/static-GRIT and GNN+ bodies
-by importing upstream GRIT RRWP encoders/layers and upstream GNN+ RWSE/layer
-classes, then attaching local GraphBench task heads. Do not report the local
-dense classes in `bin/algoreas_hpc.py` as faithful Graphormer, GraphGPS, GRIT,
-or GNN+ models. If they are used at all, label them as smoke-test or style
-implementations.
+The current runner implements official-backed GraphGPS, GRIT/static-GRIT, and
+GNN+ bodies by importing upstream GraphGPS RWSE/GPS layers, upstream GRIT RRWP
+encoders/layers, and upstream GNN+ RWSE/layer classes, then attaching local
+GraphBench task heads. Do not report the local dense classes in
+`bin/algoreas_hpc.py` as faithful Graphormer, GraphGPS, GRIT, or GNN+ models. If
+they are used at all, label them as smoke-test or style implementations.
 
-Graphormer and GraphGPS official wrappers are not wired into the Python runner
-yet. The runner deliberately fails early for those model names under
-`--model-backend official`.
+Graphormer official wrappers are not wired into the Python runner yet. The
+runner deliberately fails early for that model name under `--model-backend
+official`.
 
 ## Required Official Model Paths
 
@@ -62,8 +62,8 @@ attention bias. A simplified SPD/direct-edge bias is only Graphormer-style.
 
 ### GraphGPS
 
-Use the official GraphGPS `GPSLayer` and `GPSModel` path. The faithful
-configuration for this project is:
+Use the official GraphGPS `RWSENodeEncoder` and `GPSLayer` path with local
+GraphBench heads. The faithful configuration for this project is:
 
 - `gt.layer_type: CustomGatedGCN+Transformer`
 - `gt.batch_norm: true`

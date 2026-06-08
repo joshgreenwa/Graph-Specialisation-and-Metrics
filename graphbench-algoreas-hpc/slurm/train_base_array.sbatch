@@ -4,7 +4,7 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=96G
 #SBATCH --time=04:00:00
-#SBATCH --array=0-99%1
+#SBATCH --array=0-119%1
 #SBATCH --output=logs/gb-hpc-train-%A-%a.out
 #SBATCH --error=logs/gb-hpc-train-%A-%a.err
 
@@ -23,7 +23,7 @@ if [[ -n "${ENV_ACTIVATE:-}" ]]; then
   source "${ENV_ACTIVATE}"
 fi
 
-MODELS="${MODELS:-static_grit,grit,gatedgcn_plus,gin_plus,gcn_plus}"
+MODELS="${MODELS:-graphgps,static_grit,grit,gatedgcn_plus,gin_plus,gcn_plus}"
 TASKS="${TASKS:-bipartite_matching_hard,flow_hard,mst_hard,maxclique_hard,bridges_hard}"
 SEEDS="${SEEDS:-0,1,2,3}"
 
@@ -46,6 +46,7 @@ python bin/algoreas_hpc.py \
   --val-node-size 16 \
   --test-node-size 64 \
   --pe-cache-dtype float32 \
+  --require-subset-cache \
   --no-build-missing-pe-cache \
   --require-pe-cache \
   --num-workers "${GRAPHBENCH_NUM_WORKERS:-4}" \

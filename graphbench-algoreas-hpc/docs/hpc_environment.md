@@ -62,13 +62,13 @@ shim and label it as such in the method section.
 From `graphbench-algoreas-hpc`:
 
 ```bash
-python bin/check_official_backends.py --models static_grit,grit,gatedgcn_plus,gin_plus,gcn_plus
+python bin/check_official_backends.py --models graphgps,static_grit,grit,gatedgcn_plus,gin_plus,gcn_plus
 ```
 
 All required rows must be `OK` before paper training arrays are launched.
-`pyg_lib` may show `WARN`; this is non-fatal for the implemented GRIT/GNN+
-official-backed path. `torch_sparse` must pass for GRIT/static-GRIT because the
-official RRWP edge encoder calls it.
+`pyg_lib` may show `WARN`; this is non-fatal for the implemented GraphGPS,
+GRIT, and GNN+ official-backed paths. `torch_sparse` must pass for
+GRIT/static-GRIT because the official RRWP edge encoder calls it.
 
 Expected local failure modes if the environment is not ready:
 

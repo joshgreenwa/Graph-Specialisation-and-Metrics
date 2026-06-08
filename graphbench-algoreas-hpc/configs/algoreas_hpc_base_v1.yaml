@@ -5,7 +5,7 @@ run:
   hardware: single_a100_80gb
   budget_hours: 100_to_150
   runner: bin/algoreas_hpc.py
-  runner_status: official_backed_grit_and_gnnplus_enabled_graphormer_graphgps_pending
+  runner_status: official_backed_graphgps_grit_and_gnnplus_enabled_graphormer_pending
   scheduler: slurm
   execution_unit: one_task_one_model_one_seed
   required_environment:
@@ -35,6 +35,7 @@ run:
     - maxclique_hard
     - bridges_hard
   run_order:
+    - graphgps
     - static_grit
     - grit
     - gatedgcn_plus
@@ -42,7 +43,6 @@ run:
     - gcn_plus
   pending_official_runner_models:
     - graphormer
-    - graphgps
   forbidden_during_base_run:
     - lr_sweep
     - size_generalisation
@@ -52,8 +52,8 @@ run:
 model_backend_policy:
   paper_runs_must_use: official_backed_model_implementations
   local_dense_runner_models: smoke_test_only_not_faithful_model_claims
-  implemented_official_runner_models: [static_grit, grit, gatedgcn_plus, gin_plus, gcn_plus]
-  pending_official_runner_models: [graphormer, graphgps]
+  implemented_official_runner_models: [graphgps, static_grit, grit, gatedgcn_plus, gin_plus, gcn_plus]
+  pending_official_runner_models: [graphormer]
   audit_document: docs/model_fidelity_audit.md
   local_code_may_own:
     - graphbench_to_pyg_conversion
@@ -281,7 +281,7 @@ models:
   common_gt_controls:
     layers: 6
     attention_heads: 8
-    activation: gelu
+    activation: model_native
     residual: true
     dropout: 0.1
     attention_dropout: 0.1
@@ -315,7 +315,8 @@ models:
     ffn_multiplier: 2
     trainable_parameters: count_from_official_backend_before_training
     norm_style: graphgps_official_batchnorm
-    official_components: [GPSModel, GPSLayer, CustomGatedGCN, RWSENodeEncoder]
+    official_components: [RWSENodeEncoder, GPSLayer, CustomGatedGCN]
+    activation: relu
     local_branch: gatedgcn
     global_branch: full_attention
     node_pe: rwse16
@@ -388,7 +389,7 @@ models:
     edge_state_updates: true
 
 implementation_fidelity:
-  overall_status: official_backed_grit_and_gnnplus_enabled_graphormer_graphgps_pending
+  overall_status: official_backed_graphgps_grit_and_gnnplus_enabled_graphormer_pending
   graphormer:
     target: official_graphormer_modules_not_local_dense_approximation
     required_before_paper_claims:
@@ -406,7 +407,7 @@ implementation_fidelity:
 
 slurm:
   execution_unit: one_task_one_model_one_seed
-  train_eval_status: enabled_for_static_grit_grit_gatedgcn_plus_gin_plus_gcn_plus
+  train_eval_status: enabled_for_graphgps_static_grit_grit_gatedgcn_plus_gin_plus_gcn_plus
   smoke_test_override_only: --model-backend local --allow-local-style-models
   precompute_pe_first: true_one_task_at_a_time
   base_pe_precompute_array: slurm/precompute_pe.sbatch
@@ -415,7 +416,7 @@ slurm:
   aggregate_job: slurm/aggregate_results.sbatch
   print_jobs_command: >-
     python bin/algoreas_hpc.py --print-jobs
-    --models static_grit,grit,gatedgcn_plus,gin_plus,gcn_plus
+    --models graphgps,static_grit,grit,gatedgcn_plus,gin_plus,gcn_plus
   single_job_command: >-
     python bin/algoreas_hpc.py
     --array-index ${SLURM_ARRAY_TASK_ID}
@@ -426,6 +427,7 @@ slurm:
     --output-root ${GRAPHBENCH_OUTPUT_ROOT}
     --train-size 40000 --val-size 4000 --test-size 4000
     --train-node-size 16 --val-node-size 16 --test-node-size 64
+    --require-subset-cache
     --no-build-missing-pe-cache
     --require-pe-cache
   optional_final_eval_command: >-
@@ -437,6 +439,7 @@ slurm:
     --output-root ${GRAPHBENCH_OUTPUT_ROOT}
     --train-size 40000 --val-size 4000 --test-size 4000
     --train-node-size 16 --val-node-size 16 --test-node-size 64
+    --require-subset-cache
     --no-build-missing-pe-cache
     --require-pe-cache
     --final-eval

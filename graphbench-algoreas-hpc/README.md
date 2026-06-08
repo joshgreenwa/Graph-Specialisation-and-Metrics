@@ -6,8 +6,8 @@ algorithmic base training.
 ## Model Fidelity
 
 Paper runs should use official-backed model implementations. The current
-`bin/algoreas_hpc.py` runner now exposes official-backed GRIT, static-GRIT,
-GCN+, GIN+, and GatedGCN+ paths through `--model-backend official`. Its local
+`bin/algoreas_hpc.py` runner now exposes official-backed GraphGPS, GRIT,
+static-GRIT, GCN+, GIN+, and GatedGCN+ paths through `--model-backend official`. Its local
 dense model classes remain available only for explicit smoke tests and must not
 be reported as faithful Graphormer, GraphGPS, GRIT, or GNN+ implementations.
 
@@ -71,7 +71,7 @@ python bin/algoreas_hpc.py --print-jobs
 Check official backend imports:
 
 ```bash
-python bin/check_official_backends.py --models static_grit,grit,gatedgcn_plus,gin_plus,gcn_plus
+python bin/check_official_backends.py --models graphgps,static_grit,grit,gatedgcn_plus,gin_plus,gcn_plus
 ```
 
 Precompute base PE caches. This is a CPU array over the five tasks and runs one
@@ -81,16 +81,16 @@ task at a time via `%1`:
 sbatch slurm/precompute_pe.sbatch
 ```
 
-Train base official-backed GRIT/GNN+ models. This is a GPU array over 100
+Train base official-backed GraphGPS/GRIT/GNN+ models. This is a GPU array over 120
 task/model/seed jobs and runs one A100 job at a time via `%1`:
 
 ```bash
 sbatch slurm/train_base_array.sbatch
 ```
 
-The script defaults to `MODELS=static_grit,grit,gatedgcn_plus,gin_plus,gcn_plus`.
-Graphormer and GraphGPS official wrappers are not wired into this runner yet;
-local smoke-test variants require `--model-backend local --allow-local-style-models`
+The script defaults to `MODELS=graphgps,static_grit,grit,gatedgcn_plus,gin_plus,gcn_plus`.
+Graphormer official wrappers are not wired into this runner yet; its local
+smoke-test variant requires `--model-backend local --allow-local-style-models`
 and should not be used for paper results.
 
 Optional full final evaluation from `best.pt`:
@@ -117,8 +117,10 @@ Do not reuse this namespace for later size-generalisation runs. Use a separate
 namespace such as `sizegen_n256` or `sizegen_grid_v1` so base PEs and
 size-generalisation PEs cannot collide.
 
-Training jobs use `--require-pe-cache`; if a base PE cache is missing, the job
-fails instead of silently recomputing expensive PEs inside the GPU job.
+Training jobs use `--require-subset-cache`, `--no-build-missing-pe-cache`, and
+`--require-pe-cache`; if a converted GraphBench split cache or base PE cache is
+missing, the job fails instead of loading/generating data or recomputing
+expensive PEs inside the GPU job.
 
 PE precompute writes resumable partial shards under `*.pt.parts/` while a split
 is in progress. If a CPU job times out, rerun the same command without
@@ -138,9 +140,8 @@ temporary shard directory is removed.
 - For compact `n=64` test splits not present in the official tar files, the
   runner generates exactly the requested test count with GraphBench's own
   AlgoReas generator and a fixed split seed.
-- Default official-backed models: static-GRIT, GRIT, GatedGCN+, GIN+, GCN+
-- Graphormer/GraphGPS: preflight-audited but not wired into the official runner
-  path yet
+- Default official-backed models: GraphGPS, static-GRIT, GRIT, GatedGCN+, GIN+, GCN+
+- Graphormer: preflight-audited but not wired into the official runner path yet
 - Seeds: `0,1,2,3`
 - Training: 5000 steps, batch 1024, 500 warmup, cosine decay
 - Checkpoints: every 500 steps from 2500 to 5000 plus `best.pt`
@@ -165,7 +166,7 @@ commits is recommended for paper runs.
 Before launching training arrays, run:
 
 ```bash
-python bin/check_official_backends.py --models static_grit,grit,gatedgcn_plus,gin_plus,gcn_plus
+python bin/check_official_backends.py --models graphgps,static_grit,grit,gatedgcn_plus,gin_plus,gcn_plus
 ```
 
 All rows must pass. Environment notes and likely import failures are listed in
