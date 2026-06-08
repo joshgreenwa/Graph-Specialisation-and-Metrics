@@ -164,6 +164,8 @@ class SparseLayerCapture:
     node_message: torch.Tensor
     pair_message: torch.Tensor
     message: torch.Tensor
+    pair_state_input: Optional[torch.Tensor]
+    pair_state_output: Optional[torch.Tensor]
     head_output: torch.Tensor
     heads: int
     message_dim: int
@@ -223,7 +225,10 @@ class OfficialGRITMechanisticCollector:
         if attn_e.dim() != 2:
             raise RuntimeError(f"expected GRIT attention [E,H], got {tuple(attn_e.shape)}")
         heads = int(attn_e.size(1))
-        node_msg, pair_msg, logits = grit_attention_components(attention_module, pyg_batch)
+        node_msg, pair_msg, logits, _edge_state = grit_attention_components(
+            attention_module,
+            pyg_batch,
+        )
         total_msg = node_msg + pair_msg
         if total_msg.dim() != 3:
             raise RuntimeError(f"expected GRIT message [E,H,D], got {tuple(total_msg.shape)}")
@@ -253,6 +258,12 @@ class OfficialGRITMechanisticCollector:
             node_message=node_msg.detach().float(),
             pair_message=pair_msg.detach().float(),
             message=total_msg.detach().float(),
+            pair_state_input=None
+            if getattr(pyg_batch, "edge_attr", None) is None
+            else pyg_batch.edge_attr.detach().float(),
+            pair_state_output=None
+            if getattr(pyg_batch, "wE", None) is None
+            else pyg_batch.wE.detach().float(),
             head_output=head_output,
             heads=heads,
             message_dim=int(total_msg.size(-1)),
@@ -262,7 +273,7 @@ class OfficialGRITMechanisticCollector:
 def grit_attention_components(
     attention_module: nn.Module,
     pyg_batch: Any,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Reconstruct official GRIT node-value, pair-value and logit tensors.
 
     This mirrors ``MultiHeadAttentionLayerGritSparse.propagate_attention`` from
@@ -297,7 +308,7 @@ def grit_attention_components(
     pair_msg = torch.zeros_like(node_msg)
     if getattr(attention_module, "edge_enhance", False) and getattr(pyg_batch, "E", None) is not None:
         pair_msg = torch.einsum("ehd,dhc->ehc", edge_state_for_value, attention_module.VeRow)
-    return node_msg, pair_msg, logits
+    return node_msg, pair_msg, logits, edge_state_for_value
 
 
 def edge_local_coordinates(
@@ -691,6 +702,55 @@ def make_operator_masks(
     return generic_operator_masks(batch, random_controls, seed)
 
 
+def load_teacher_kernels(path: Optional[Path]) -> dict[str, torch.Tensor]:
+    if path is None:
+        return {}
+    payload = torch.load(path.expanduser(), map_location="cpu", weights_only=False)
+    if torch.is_tensor(payload):
+        return {"teacher_kernel": payload.float()}
+    if isinstance(payload, Mapping):
+        out = {}
+        for key, value in payload.items():
+            if not torch.is_tensor(value):
+                raise ValueError(f"teacher kernel {key!r} is not a tensor")
+            out[str(key)] = value.float()
+        return out
+    raise ValueError("--teacher-kernel-pt must contain a tensor or a mapping of name -> tensor")
+
+
+def teacher_operator_masks(
+    kernels: Mapping[str, torch.Tensor],
+    graph_indices: Sequence[int],
+    batch: Any,
+) -> dict[str, torch.Tensor]:
+    out: dict[str, torch.Tensor] = {}
+    if not kernels:
+        return out
+    bsz, nmax = batch.node_mask.shape
+    for name, kernel in kernels.items():
+        if kernel.dim() == 2:
+            selected = kernel[None, :, :].expand(bsz, -1, -1)
+        elif kernel.dim() == 3:
+            if max(graph_indices, default=-1) < kernel.size(0):
+                selected = kernel[list(graph_indices)]
+            elif kernel.size(0) == bsz:
+                selected = kernel
+            else:
+                raise ValueError(
+                    f"teacher kernel {name!r} first dimension {kernel.size(0)} "
+                    f"does not cover graph indices {graph_indices[:3]}..."
+                )
+        else:
+            raise ValueError(f"teacher kernel {name!r} must have shape [N,N] or [G,N,N]")
+        dense = torch.zeros(bsz, nmax, nmax, dtype=torch.float32, device=batch.node_mask.device)
+        h = min(nmax, selected.size(-2))
+        w = min(nmax, selected.size(-1))
+        dense[:, :h, :w] = selected[:, :h, :w].to(device=batch.node_mask.device, dtype=torch.float32)
+        dense = dense * valid_pair_mask(batch).float()
+        out[f"teacher__{name}"] = dense
+    return out
+
+
 def rate_matched_random_masks(
     masks: Mapping[str, torch.Tensor],
     batch: Any,
@@ -1046,6 +1106,217 @@ def make_collector(model: nn.Module, model_name: str, adapter: str) -> OfficialG
     )
 
 
+def pyg_sparse_softmax(logits: torch.Tensor, index: torch.Tensor, num_nodes: int) -> torch.Tensor:
+    try:
+        from torch_geometric.utils import softmax
+
+        return softmax(logits, index, num_nodes=num_nodes)
+    except Exception:
+        out = torch.zeros_like(logits)
+        for node in torch.unique(index.detach().cpu()).tolist():
+            mask = index == int(node)
+            out[mask] = torch.softmax(logits[mask], dim=0)
+        return out
+
+
+def sparse_pair_strata(pyg_batch: Any, official_batch: Any) -> torch.Tensor:
+    src = pyg_batch.edge_index[0].long()
+    dst = pyg_batch.edge_index[1].long()
+    graph, local_src, local_dst = edge_local_coordinates(
+        src,
+        dst,
+        [int(v) for v in pyg_batch.graph_num_nodes.detach().cpu().tolist()],
+    )
+    degree_bins = degree_bin(official_batch.degree.float())
+    directed = sparse_edge_mask(official_batch).long()
+    local = (official_batch.adj > 0).long()
+    spd = official_batch.spd.long().clamp_min(0).clamp_max(1024)
+    code = directed[graph, local_dst, local_src]
+    code = code * 2 + local[graph, local_dst, local_src]
+    code = code * 2048 + spd[graph, local_dst, local_src]
+    code = code * 16 + degree_bins[graph, local_dst].long()
+    code = code * 16 + degree_bins[graph, local_src].long()
+    return code.to(device=src.device)
+
+
+def sparse_support_masks(pyg_batch: Any, official_batch: Any) -> tuple[torch.Tensor, torch.Tensor]:
+    src = pyg_batch.edge_index[0].long()
+    dst = pyg_batch.edge_index[1].long()
+    graph, local_src, local_dst = edge_local_coordinates(
+        src,
+        dst,
+        [int(v) for v in pyg_batch.graph_num_nodes.detach().cpu().tolist()],
+    )
+    is_self = local_src == local_dst
+    is_local = official_batch.adj[graph, local_dst, local_src] > 0
+    local_or_self = is_local | is_self
+    global_pair = (~is_local) & (~is_self)
+    return local_or_self, global_pair
+
+
+def matched_mean_sparse(values: torch.Tensor, strata: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(values)
+    flat_strata = strata.detach().cpu()
+    for code in torch.unique(flat_strata).tolist():
+        mask = strata == int(code)
+        if bool(mask.any()):
+            out[mask] = values[mask].mean(dim=0, keepdim=True)
+    return out
+
+
+def permute_sparse_within_strata(
+    values: torch.Tensor,
+    strata: torch.Tensor,
+    generator: torch.Generator,
+) -> torch.Tensor:
+    out = values.clone()
+    for code in torch.unique(strata.detach().cpu()).tolist():
+        mask = strata == int(code)
+        idx = torch.nonzero(mask, as_tuple=False).reshape(-1)
+        if idx.numel() <= 1:
+            continue
+        order = torch.randperm(idx.numel(), generator=generator).to(device=idx.device)
+        out[idx] = values[idx[order]]
+    return out
+
+
+class GRITAblationContext:
+    """Inference-time GRIT ablations from the memo.
+
+    The implementation patches only the official GRIT attention modules during
+    the context lifetime. It leaves checkpoint weights unchanged and restores all
+    methods/hooks afterwards.
+    """
+
+    def __init__(
+        self,
+        model: nn.Module,
+        *,
+        mode: str,
+        selected_heads: Optional[Mapping[int, set[int]]] = None,
+        seed: int = 0,
+    ) -> None:
+        self.model = model
+        self.mode = mode
+        self.selected_heads = {int(k): set(v) for k, v in (selected_heads or {}).items()}
+        self.seed = int(seed)
+        self.current_batch: Any = None
+        self.initial_edge_attr: Optional[torch.Tensor] = None
+        self.original_methods: list[tuple[Any, Any]] = []
+        self.handles: list[Any] = []
+        self.generator = torch.Generator(device="cpu").manual_seed(self.seed)
+
+    def __enter__(self) -> "GRITAblationContext":
+        self.handles.append(self.model.register_forward_pre_hook(self._model_pre_hook))
+        for layer_idx, layer in enumerate(self.model.layers):
+            attention = layer.attention
+            original = attention.propagate_attention
+            self.original_methods.append((attention, original))
+            attention.propagate_attention = self._make_propagate(attention, layer_idx)
+            if self.mode in {"frozen_pair_state", "permuted_pair_state"}:
+                self.handles.append(attention.register_forward_pre_hook(self._pair_state_pre_hook))
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        for attention, original in self.original_methods:
+            attention.propagate_attention = original
+        for handle in self.handles:
+            handle.remove()
+        self.original_methods = []
+        self.handles = []
+        self.current_batch = None
+        self.initial_edge_attr = None
+
+    def _model_pre_hook(self, _module: nn.Module, inputs: tuple[Any, ...]) -> None:
+        self.current_batch = inputs[0]
+        self.initial_edge_attr = None
+
+    def _pair_state_pre_hook(self, _module: nn.Module, inputs: tuple[Any, ...]) -> None:
+        pyg_batch = inputs[0]
+        if getattr(pyg_batch, "edge_attr", None) is None:
+            return
+        if self.initial_edge_attr is None:
+            self.initial_edge_attr = pyg_batch.edge_attr.detach().clone()
+        if self.mode == "frozen_pair_state":
+            pyg_batch.edge_attr = self.initial_edge_attr.to(device=pyg_batch.edge_attr.device)
+        elif self.mode == "permuted_pair_state":
+            if self.current_batch is None:
+                raise RuntimeError("missing OfficialBatch for pair-state permutation")
+            strata = sparse_pair_strata(pyg_batch, self.current_batch)
+            pyg_batch.edge_attr = permute_sparse_within_strata(
+                pyg_batch.edge_attr,
+                strata,
+                self.generator,
+            )
+
+    def _make_propagate(self, attention_module: nn.Module, layer_idx: int):
+        def propagate(pyg_batch: Any) -> None:
+            from torch_scatter import scatter
+
+            if self.current_batch is None:
+                raise RuntimeError("missing OfficialBatch during GRIT ablation")
+            node_msg, pair_msg, logits, edge_state = grit_attention_components(
+                attention_module,
+                pyg_batch,
+            )
+            logits = self._ablate_logits(attention_module, pyg_batch, logits)
+            if self.mode == "no_pair_value_transport":
+                strata = sparse_pair_strata(pyg_batch, self.current_batch)
+                pair_msg = matched_mean_sparse(pair_msg, strata)
+
+            score = pyg_sparse_softmax(logits.unsqueeze(-1), pyg_batch.edge_index[1], pyg_batch.num_nodes)
+            score = attention_module.dropout(score)
+            pyg_batch.attn = score
+            if getattr(pyg_batch, "E", None) is not None:
+                pyg_batch.wE = edge_state.flatten(1)
+            message = node_msg + pair_msg
+            weighted = message * score
+            pyg_batch.wV = torch.zeros_like(pyg_batch.V_h)
+            scatter(weighted, pyg_batch.edge_index[1], dim=0, out=pyg_batch.wV, reduce="add")
+            for head in self.selected_heads.get(layer_idx, set()):
+                if 0 <= int(head) < pyg_batch.wV.size(1):
+                    for graph_idx in torch.unique(pyg_batch.batch.detach().cpu()).tolist():
+                        node_mask = pyg_batch.batch == int(graph_idx)
+                        pyg_batch.wV[node_mask, int(head), :] = pyg_batch.wV[
+                            node_mask,
+                            int(head),
+                            :,
+                        ].mean(dim=0, keepdim=True)
+
+        return propagate
+
+    def _ablate_logits(
+        self,
+        attention_module: nn.Module,
+        pyg_batch: Any,
+        logits: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.mode == "clean" or self.mode == "no_pair_value_transport":
+            return logits
+        if self.mode in {"local_only_support", "global_only_support"}:
+            local_or_self, global_pair = sparse_support_masks(pyg_batch, self.current_batch)
+            keep = local_or_self if self.mode == "local_only_support" else global_pair
+            return logits.masked_fill(~keep[:, None], -1.0e9)
+        if self.mode == "no_structural_routing":
+            content = pyg_batch.K_h[pyg_batch.edge_index[0]] + pyg_batch.Q_h[pyg_batch.edge_index[1]]
+            content = attention_module.act(content)
+            content_logits = torch.einsum("ehd,dhc->ehc", content, attention_module.Aw).squeeze(-1)
+            if attention_module.clamp is not None:
+                content_logits = torch.clamp(
+                    content_logits,
+                    min=-float(attention_module.clamp),
+                    max=float(attention_module.clamp),
+                )
+            structural_bias = logits - content_logits
+            strata = sparse_pair_strata(pyg_batch, self.current_batch)
+            return content_logits + matched_mean_sparse(structural_bias.unsqueeze(-1), strata).squeeze(-1)
+        if self.mode in {"frozen_pair_state", "permuted_pair_state"}:
+            return logits
+        if self.mode == "head_ablation":
+            return logits
+        raise ValueError(f"unknown GRIT ablation mode {self.mode!r}")
+
+
 def load_task_transport_responsibility(
     path: Optional[Path],
     *,
@@ -1083,6 +1354,424 @@ def load_task_transport_responsibility(
         )
     return out
 
+
+@torch.no_grad()
+def evaluate_primary_series(
+    runner: Any,
+    model: nn.Module,
+    dataset: Any,
+    *,
+    batch_size: int,
+    device: torch.device,
+    target_stats: Optional[Mapping[str, float]],
+) -> tuple[dict[str, float], list[float]]:
+    loader = runner.make_loader(dataset, batch_size, shuffle=False, seed=0)
+    preds: list[torch.Tensor] = []
+    targets: list[torch.Tensor] = []
+    per_graph: list[float] = []
+    start = time.time()
+    model.eval()
+    for batch in loader:
+        batch = batch.to(device)
+        pred = model(batch)
+        if batch.task_type == "edge_binary":
+            preds.append(pred.detach().cpu())
+            targets.append(batch.edge_target.detach().cpu())
+            for graph_idx in range(batch.num_graphs):
+                mask = batch.edge_batch == graph_idx
+                if bool(mask.any()):
+                    metrics = runner.binary_metrics(
+                        pred[mask].detach().cpu(),
+                        batch.edge_target[mask].detach().cpu(),
+                    )
+                    per_graph.append(float(metrics["f1"]))
+        elif batch.task_type == "node_binary":
+            node_pred = runner.node_predictions_for_loss(pred, batch)
+            preds.append(node_pred.detach().cpu())
+            targets.append(runner.flatten_node_target(batch).detach().cpu())
+            offset = 0
+            flat_target = runner.flatten_node_target(batch)
+            for graph_idx, count in enumerate(batch.graph_num_nodes.detach().cpu().tolist()):
+                count = int(count)
+                metrics = runner.binary_metrics(
+                    node_pred[offset : offset + count].detach().cpu(),
+                    flat_target[offset : offset + count].detach().cpu(),
+                )
+                per_graph.append(float(metrics["f1"]))
+                offset += count
+        elif batch.task_type == "graph_regression":
+            preds.append(pred.detach().cpu())
+            targets.append(batch.graph_target.detach().cpu())
+            pred_raw = runner.denormalize_graph_target(pred.detach().cpu(), target_stats)
+            err = (pred_raw - batch.graph_target.detach().cpu()).abs()
+            per_graph.extend(float(v) for v in err.reshape(-1))
+        else:
+            preds.append(pred.detach().cpu())
+            targets.append(batch.graph_target.detach().cpu())
+    seconds = time.time() - start
+    pred_all = torch.cat(preds) if preds else torch.empty(0)
+    target_all = torch.cat(targets) if targets else torch.empty(0)
+    task_type = dataset[0].task_type
+    if task_type in {"edge_binary", "node_binary"}:
+        metrics = runner.binary_metrics(pred_all, target_all)
+        metrics["primary"] = metrics["f1"]
+        metrics["higher_is_better"] = 1.0
+    elif task_type == "graph_regression":
+        metrics = runner.flow_metrics(pred_all, target_all, target_stats)
+        metrics["primary"] = metrics["raw_mae"]
+        metrics["higher_is_better"] = 0.0
+    else:
+        metrics = runner.regression_metrics(pred_all, target_all)
+        metrics["primary"] = metrics["mae"]
+        metrics["higher_is_better"] = 0.0
+    metrics["primary_graph_mean"] = sum(per_graph) / max(1, len(per_graph))
+    metrics["eval_seconds"] = seconds
+    return metrics, per_graph
+
+
+def bootstrap_ci(values: Sequence[float], seed: int, samples: int = 1000) -> tuple[float, float]:
+    if not values:
+        return float("nan"), float("nan")
+    if len(values) == 1:
+        return values[0], values[0]
+    rng = random.Random(seed)
+    means = []
+    for _ in range(samples):
+        draw = [values[rng.randrange(len(values))] for _ in values]
+        means.append(sum(draw) / len(draw))
+    means.sort()
+    return means[int(0.025 * (len(means) - 1))], means[int(0.975 * (len(means) - 1))]
+
+
+def primary_drop(clean: Mapping[str, float], ablated: Mapping[str, float]) -> float:
+    if float(clean.get("higher_is_better", 0.0)) > 0.5:
+        return float(clean["primary"]) - float(ablated["primary"])
+    return float(ablated["primary"]) - float(clean["primary"])
+
+
+def advantage_removed(
+    clean: Mapping[str, float],
+    ablated: Mapping[str, float],
+    baseline_primary: Optional[float],
+) -> float:
+    if baseline_primary is None or not math.isfinite(float(baseline_primary)):
+        return float("nan")
+    higher = float(clean.get("higher_is_better", 0.0)) > 0.5
+    if higher:
+        denom = float(clean["primary"]) - float(baseline_primary)
+        return primary_drop(clean, ablated) / (denom + EPS)
+    denom = float(baseline_primary) - float(clean["primary"])
+    return primary_drop(clean, ablated) / (denom + EPS)
+
+
+def evaluate_with_ablation(
+    loaded: LoadedExperiment,
+    args: argparse.Namespace,
+    *,
+    mode: str,
+    selected_heads: Optional[Mapping[int, set[int]]] = None,
+) -> tuple[dict[str, float], list[float]]:
+    context_mode = "clean" if mode == "clean" else mode
+    if context_mode == "clean":
+        return evaluate_primary_series(
+            loaded.runner,
+            loaded.model,
+            loaded.subset_dataset,
+            batch_size=max(1, int(args.eval_batch_size or args.batch_size)),
+            device=loaded.device,
+            target_stats=loaded.target_stats,
+        )
+    with GRITAblationContext(
+        loaded.model,
+        mode=context_mode,
+        selected_heads=selected_heads,
+        seed=args.random_seed,
+    ):
+        return evaluate_primary_series(
+            loaded.runner,
+            loaded.model,
+            loaded.subset_dataset,
+            batch_size=max(1, int(args.eval_batch_size or args.batch_size)),
+            device=loaded.device,
+            target_stats=loaded.target_stats,
+        )
+
+
+def run_knockouts(args: argparse.Namespace, loaded: Optional[LoadedExperiment] = None) -> None:
+    loaded = loaded or load_experiment(args)
+    out_dir = args.output_dir
+    out_dir.mkdir(parents=True, exist_ok=True)
+    ablations = parse_csv_list(
+        args.knockout_ablations,
+        default=(
+            "local_only_support",
+            "global_only_support",
+            "no_structural_routing",
+            "no_pair_value_transport",
+            "frozen_pair_state",
+            "permuted_pair_state",
+        ),
+        all_values=(
+            "local_only_support",
+            "global_only_support",
+            "no_structural_routing",
+            "no_pair_value_transport",
+            "frozen_pair_state",
+            "permuted_pair_state",
+        ),
+    )
+    clean_metrics, clean_series = evaluate_with_ablation(loaded, args, mode="clean")
+    clean_lo, clean_hi = bootstrap_ci(clean_series, args.random_seed)
+    rows: list[dict[str, Any]] = [
+        {
+            "ablation": "clean",
+            "primary": clean_metrics["primary"],
+            "primary_graph_mean": clean_metrics["primary_graph_mean"],
+            "primary_ci_low": clean_lo,
+            "primary_ci_high": clean_hi,
+            "raw_drop": 0.0,
+            "advantage_removed": 0.0,
+        }
+    ]
+    for ablation in ablations:
+        print(f"[knockout] evaluating {ablation}", flush=True)
+        metrics, series = evaluate_with_ablation(loaded, args, mode=ablation)
+        lo, hi = bootstrap_ci(series, args.random_seed + len(rows))
+        rows.append(
+            {
+                "ablation": ablation,
+                "primary": metrics["primary"],
+                "primary_graph_mean": metrics["primary_graph_mean"],
+                "primary_ci_low": lo,
+                "primary_ci_high": hi,
+                "raw_drop": primary_drop(clean_metrics, metrics),
+                "advantage_removed": advantage_removed(
+                    clean_metrics,
+                    metrics,
+                    args.baseline_primary,
+                ),
+            }
+        )
+    write_csv(out_dir / "mechanism_knockouts.csv", rows)
+    plot_knockouts(out_dir / "mechanism_knockouts.csv", out_dir / "figures")
+    print(f"[done] wrote knockout results to {out_dir / 'mechanism_knockouts.csv'}", flush=True)
+
+
+def plot_knockouts(csv_path: Path, figures: Path) -> None:
+    try:
+        import matplotlib.pyplot as plt
+        import pandas as pd
+    except Exception as exc:
+        print(f"[plot] skipped knockout plot: {exc}", flush=True)
+        return
+    df = pd.read_csv(csv_path)
+    df = df[df["ablation"] != "clean"]
+    figures.mkdir(parents=True, exist_ok=True)
+    fig, ax = plt.subplots(figsize=(9.2, 4.8), dpi=180)
+    x = range(len(df))
+    ax.bar(x, df["raw_drop"])
+    ax.axhline(0.0, color="0.25", linewidth=0.8)
+    ax.set_xticks(list(x), labels=df["ablation"], rotation=30, ha="right")
+    ax.set_ylabel("performance drop")
+    ax.set_title("GraphBench mechanism knockouts")
+    fig.tight_layout()
+    fig.savefig(figures / "mechanism_knockout_drops.png")
+    plt.close(fig)
+
+
+def load_atlas_rows(path: Path) -> list[dict[str, Any]]:
+    with path.expanduser().open(newline="", encoding="utf-8") as handle:
+        return [dict(row) for row in csv.DictReader(handle)]
+
+
+def component_scores_from_atlas(rows: Sequence[Mapping[str, Any]]) -> dict[tuple[int, int], dict[str, float]]:
+    scores: dict[tuple[int, int], dict[str, float]] = defaultdict(float_dict)
+    for row in rows:
+        if row.get("transport_component") != "total":
+            continue
+        operator = str(row.get("operator", ""))
+        if operator == "valid_pair" or operator.startswith(PRIMARY_OPERATOR_EXCLUDE_PREFIXES):
+            continue
+        key = (int(row["layer"]), int(row["head"]))
+        scores[key]["attention_mass"] += float(row.get("attention_total", 0.0) or 0.0)
+        scores[key]["output_norm"] += float(row.get("abs_transport_total", 0.0) or 0.0)
+        for metric in [
+            "attention_lift",
+            "abs_transport_lift",
+            "influence_lift",
+            "transport_lift_global_gate",
+            "operator_transport_score",
+            "global_task_transport",
+        ]:
+            value = float(row.get(metric, "nan") or "nan")
+            if math.isfinite(value):
+                scores[key][metric] = max(scores[key].get(metric, -float("inf")), value)
+    return scores
+
+
+def ranked_components(
+    scores: Mapping[tuple[int, int], Mapping[str, float]],
+    ranking: str,
+    seed: int,
+) -> list[tuple[int, int, float]]:
+    items = [(layer, head, dict(values)) for (layer, head), values in scores.items()]
+    if ranking == "random":
+        rng = random.Random(seed)
+        rng.shuffle(items)
+        return [(layer, head, float("nan")) for layer, head, _values in items]
+    metric_for_ranking = {
+        "norm": "output_norm",
+        "attention_mass": "attention_mass",
+        "attention_kernel_alignment": "attention_lift",
+        "contribution_alignment": "abs_transport_lift",
+        "influence_lift": "influence_lift",
+        "global_task_transport": "global_task_transport",
+        "transport_lift_global_gate": "transport_lift_global_gate",
+        "ots": "operator_transport_score",
+    }[ranking]
+    ranked = [
+        (layer, head, float(values.get(metric_for_ranking, float("nan"))))
+        for layer, head, values in items
+    ]
+    ranked.sort(key=lambda item: nan_to_neg_inf(item[2]), reverse=True)
+    return ranked
+
+
+def selected_head_map(ranked: Sequence[tuple[int, int, float]], percent: float) -> dict[int, set[int]]:
+    count = max(1, int(math.ceil(len(ranked) * float(percent) / 100.0)))
+    selected: dict[int, set[int]] = defaultdict(set)
+    for layer, head, _score in ranked[:count]:
+        selected[int(layer)].add(int(head))
+    return selected
+
+
+def run_ranked_ablation(args: argparse.Namespace, loaded: Optional[LoadedExperiment] = None) -> None:
+    loaded = loaded or load_experiment(args)
+    atlas_path = args.atlas_per_head_csv or (args.output_dir / "operator_transport_per_head.csv")
+    if not atlas_path.exists():
+        raise RuntimeError(
+            f"missing atlas per-head CSV: {atlas_path}. Run --experiments atlas first "
+            "or pass --atlas-per-head-csv."
+        )
+    scores = component_scores_from_atlas(load_atlas_rows(atlas_path))
+    if not scores:
+        raise RuntimeError(f"no rankable layer/head components found in {atlas_path}")
+    rankings = parse_csv_list(
+        args.rankings,
+        default=(
+            "random",
+            "norm",
+            "attention_mass",
+            "attention_kernel_alignment",
+            "contribution_alignment",
+            "influence_lift",
+            "transport_lift_global_gate",
+            "ots",
+        ),
+        all_values=(
+            "random",
+            "norm",
+            "attention_mass",
+            "attention_kernel_alignment",
+            "contribution_alignment",
+            "influence_lift",
+            "global_task_transport",
+            "transport_lift_global_gate",
+            "ots",
+        ),
+    )
+    percents = [float(value) for value in args.topk_percents.split(",") if value.strip()]
+    clean_metrics, _clean_series = evaluate_with_ablation(loaded, args, mode="clean")
+    rows: list[dict[str, Any]] = []
+    for ranking in rankings:
+        ranked = ranked_components(scores, ranking, args.random_seed)
+        if ranking != "random" and not any(math.isfinite(score) for _l, _h, score in ranked):
+            print(f"[ranked] skipping undefined ranking={ranking}", flush=True)
+            continue
+        for percent in percents:
+            selected = selected_head_map(ranked, percent)
+            print(f"[ranked] ranking={ranking} top={percent:g}% heads={sum(len(v) for v in selected.values())}", flush=True)
+            metrics, series = evaluate_with_ablation(
+                loaded,
+                args,
+                mode="head_ablation",
+                selected_heads=selected,
+            )
+            lo, hi = bootstrap_ci(series, args.random_seed + int(percent * 17) + len(rows))
+            rows.append(
+                {
+                    "ranking": ranking,
+                    "percent_ablated": percent,
+                    "heads_ablated": sum(len(v) for v in selected.values()),
+                    "primary": metrics["primary"],
+                    "primary_graph_mean": metrics["primary_graph_mean"],
+                    "primary_ci_low": lo,
+                    "primary_ci_high": hi,
+                    "raw_drop": primary_drop(clean_metrics, metrics),
+                    "advantage_removed": advantage_removed(
+                        clean_metrics,
+                        metrics,
+                        args.baseline_primary,
+                    ),
+                }
+            )
+    out_path = args.output_dir / "metric_ranked_ablation_curves.csv"
+    write_csv(out_path, rows)
+    plot_ranked_ablation(out_path, args.output_dir / "figures")
+    print(f"[done] wrote ranked ablation curves to {out_path}", flush=True)
+
+
+def plot_ranked_ablation(csv_path: Path, figures: Path) -> None:
+    try:
+        import matplotlib.pyplot as plt
+        import pandas as pd
+    except Exception as exc:
+        print(f"[plot] skipped ranked-ablation plot: {exc}", flush=True)
+        return
+    df = pd.read_csv(csv_path)
+    figures.mkdir(parents=True, exist_ok=True)
+    fig, ax = plt.subplots(figsize=(8.8, 5.0), dpi=180)
+    for ranking, group in df.groupby("ranking"):
+        group = group.sort_values("percent_ablated")
+        ax.plot(group["percent_ablated"], group["raw_drop"], marker="o", label=ranking)
+    ax.axhline(0.0, color="0.25", linewidth=0.8)
+    ax.set_xlabel("percent layer-head components ablated")
+    ax.set_ylabel("performance drop")
+    ax.set_title("Metric-ranked causal ablation")
+    ax.legend(frameon=False, fontsize=8)
+    fig.tight_layout()
+    fig.savefig(figures / "metric_ranked_ablation_curves.png")
+    plt.close(fig)
+
+
+def run_distillation_calibration(
+    args: argparse.Namespace,
+    loaded: Optional[LoadedExperiment] = None,
+) -> None:
+    if args.teacher_kernel_pt is None:
+        raise RuntimeError(
+            "distillation_calibration requires --teacher-kernel-pt. The memo's M1 "
+            "experiment depends on a teacher/operator kernel K_t; this script will "
+            "not fabricate one from GraphBench labels."
+        )
+    loaded = loaded or load_experiment(args)
+    kernels = load_teacher_kernels(args.teacher_kernel_pt)
+    out_dir = args.output_dir
+    out_dir.mkdir(parents=True, exist_ok=True)
+    run_atlas(args, loaded)
+    run_ranked_ablation(args, loaded)
+    metadata = {
+        "teacher_kernel_pt": str(args.teacher_kernel_pt),
+        "status": (
+            "teacher kernels used as known O_k masks for M1 calibration; "
+            "atlas alignment and metric-ranked ablation data were generated"
+        ),
+        "teacher_kernels": sorted(kernels.keys()),
+    }
+    (out_dir / "distillation_calibration_metadata.json").write_text(
+        json.dumps(metadata, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
 
 def plot_outputs(out_dir: Path) -> None:
     try:
@@ -1227,13 +1916,30 @@ def analysis_protocol_audit() -> dict[str, Any]:
         "known_scope": [
             "Official GRIT/static-GRIT are implemented first because their pair transport is explicit.",
             "Flow masks require explicit source/sink roles in node_type and use deterministic max-flow.",
-            "M1 distillation, M2 mechanism knockouts, M4 ranked causal ablation, and pair-set patching "
-            "are not silently approximated by this atlas script.",
+            "M1 distillation requires supplied teacher kernels; this script will not fabricate them.",
+            "M2 knockouts and M4 ranked ablations are implemented as inference-time GRIT patches.",
+            "Pair-set scrubbing and clean/corrupt/patch remain second-phase methods from the memo.",
         ],
     }
 
 
-def run(args: argparse.Namespace) -> None:
+@dataclass
+class LoadedExperiment:
+    runner: Any
+    device: torch.device
+    checkpoint: Mapping[str, Any]
+    cfg: Any
+    splits: Mapping[str, Any]
+    dataset: Any
+    selected_indices: list[int]
+    graphs: list[Any]
+    subset_dataset: Any
+    model: nn.Module
+    target_stats: Optional[Mapping[str, float]]
+    pos_weight: Optional[torch.Tensor]
+
+
+def load_experiment(args: argparse.Namespace) -> LoadedExperiment:
     runner = load_runner(args.runner_path)
     device = resolve_device(args.device)
     checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
@@ -1270,6 +1976,11 @@ def run(args: argparse.Namespace) -> None:
     graphs = [dataset[i] for i in selected_indices]
     if not graphs:
         raise RuntimeError(f"no graphs selected from {args.task}/{args.split}")
+    subset_dataset = runner.OfficialGraphDataset(
+        graphs,
+        task_name=args.task,
+        split=f"{args.split}_selected",
+    )
 
     model = runner.build_model(args.model, cfg, backend=args.model_backend)
     state = checkpoint.get("model", checkpoint)
@@ -1280,6 +1991,33 @@ def run(args: argparse.Namespace) -> None:
             f"missing={missing}, unexpected={unexpected}"
         )
     model.to(device).eval()
+    target_stats = checkpoint.get("target_stats")
+    if target_stats is None:
+        target_stats = runner.compute_target_stats(splits["train"])
+    pos_weight = runner.compute_pos_weight(splits["train"])
+    return LoadedExperiment(
+        runner=runner,
+        device=device,
+        checkpoint=checkpoint,
+        cfg=cfg,
+        splits=splits,
+        dataset=dataset,
+        selected_indices=selected_indices,
+        graphs=graphs,
+        subset_dataset=subset_dataset,
+        model=model,
+        target_stats=target_stats,
+        pos_weight=pos_weight,
+    )
+
+
+def run_atlas(args: argparse.Namespace, loaded: Optional[LoadedExperiment] = None) -> None:
+    loaded = loaded or load_experiment(args)
+    runner = loaded.runner
+    device = loaded.device
+    graphs = loaded.graphs
+    selected_indices = loaded.selected_indices
+    model = loaded.model
     collector = make_collector(model, args.model, args.adapter)
     responsibility = load_task_transport_responsibility(
         args.specialisation_summary_csv,
@@ -1290,6 +2028,7 @@ def run(args: argparse.Namespace) -> None:
     accumulator = OperatorTransportAccumulator(responsibility)
     start_time = time.time()
     batch_size = max(1, int(args.batch_size))
+    teacher_kernels = load_teacher_kernels(args.teacher_kernel_pt)
 
     for start_idx in range(0, len(graphs), batch_size):
         end_idx = min(len(graphs), start_idx + batch_size)
@@ -1302,13 +2041,17 @@ def run(args: argparse.Namespace) -> None:
                 pred = model(batch)
                 scalar = task_scalar(pred, batch)
                 scalar.backward()
+        valid = valid_pair_mask(batch)
         masks = make_operator_masks(
             args.task,
             batch,
             random_controls=args.random_controls,
             seed=args.random_seed + start_idx,
         )
-        valid = valid_pair_mask(batch)
+        teacher_masks = teacher_operator_masks(teacher_kernels, graph_indices, batch)
+        masks.update(teacher_masks)
+        if args.random_controls and teacher_masks:
+            masks.update(rate_matched_random_masks(teacher_masks, batch, valid, args.random_seed + start_idx))
         global_mask = masks.get("global_nonedge", (valid & ~sparse_edge_mask(batch)).float())
         accumulator.add_batch(
             active_collector.records,
@@ -1351,6 +2094,8 @@ def run(args: argparse.Namespace) -> None:
         if args.specialisation_summary_csv is None
         else str(args.specialisation_summary_csv),
         "task_transport_responsibility_rows": len(responsibility),
+        "teacher_kernel_pt": None if args.teacher_kernel_pt is None else str(args.teacher_kernel_pt),
+        "teacher_kernels": sorted(teacher_kernels.keys()),
         "analysis_protocol_audit": analysis_protocol_audit(),
     }
     (out_dir / "metadata.json").write_text(
@@ -1364,16 +2109,49 @@ def run(args: argparse.Namespace) -> None:
     )
 
 
+def run(args: argparse.Namespace) -> None:
+    loaded = load_experiment(args)
+    if args.experiments == "all":
+        experiments = ("atlas", "knockouts", "ranked_ablation")
+    else:
+        experiments = parse_csv_list(
+            args.experiments,
+            default=("atlas",),
+            all_values=("atlas", "knockouts", "ranked_ablation", "distillation_calibration"),
+        )
+    if "distillation_calibration" in experiments:
+        run_distillation_calibration(args, loaded)
+        experiments = tuple(
+            item
+            for item in experiments
+            if item not in {"distillation_calibration", "atlas", "ranked_ablation"}
+        )
+    if "atlas" in experiments:
+        run_atlas(args, loaded)
+    if "knockouts" in experiments:
+        run_knockouts(args, loaded)
+    if "ranked_ablation" in experiments:
+        run_ranked_ablation(args, loaded)
+    if "distillation_calibration" in experiments:
+        run_distillation_calibration(args, loaded)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--task", required=True)
+    parser.add_argument(
+        "--experiments",
+        default="atlas",
+        help="Comma list: atlas,knockouts,ranked_ablation,distillation_calibration,all",
+    )
     parser.add_argument("--model", default="grit")
     parser.add_argument("--model-backend", default="official", choices=("official", "local"))
     parser.add_argument("--adapter", default="auto", choices=("auto", "official_grit"))
     parser.add_argument("--split", default="val", choices=("train", "val", "test"))
     parser.add_argument("--num-graphs", type=int, default=32)
     parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--eval-batch-size", type=int, default=0)
     parser.add_argument("--graph-seed", type=int, default=0)
     parser.add_argument("--model-seed", type=int, default=None)
     parser.add_argument("--runner-path", type=Path, default=None)
@@ -1418,6 +2196,42 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--test-node-size", type=int, default=None)
     parser.add_argument("--random-controls", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--random-seed", type=int, default=0)
+    parser.add_argument(
+        "--knockout-ablations",
+        default="all",
+        help=(
+            "Comma list: local_only_support,global_only_support,no_structural_routing,"
+            "no_pair_value_transport,frozen_pair_state,permuted_pair_state,all"
+        ),
+    )
+    parser.add_argument(
+        "--baseline-primary",
+        type=float,
+        default=None,
+        help="Optional matched GNN+/baseline primary score for advantage_removed normalisation.",
+    )
+    parser.add_argument(
+        "--atlas-per-head-csv",
+        type=Path,
+        default=None,
+        help="Existing operator_transport_per_head.csv for ranked ablation.",
+    )
+    parser.add_argument(
+        "--rankings",
+        default="all",
+        help=(
+            "Comma list: random,norm,attention_mass,attention_kernel_alignment,"
+            "contribution_alignment,influence_lift,global_task_transport,"
+            "transport_lift_global_gate,ots,all"
+        ),
+    )
+    parser.add_argument("--topk-percents", default="5,10,20,40")
+    parser.add_argument(
+        "--teacher-kernel-pt",
+        type=Path,
+        default=None,
+        help="Optional tensor or dict[str,tensor] of known teacher/operator kernels.",
+    )
     parser.add_argument(
         "--specialisation-summary-csv",
         type=Path,
