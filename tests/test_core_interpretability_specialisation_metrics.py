@@ -12,6 +12,7 @@ from graph_specialisation_metrics.core_interpretability_specialisation_metrics i
     masked_key_field,
     masked_softmax_permutation_weights,
     moved_mass_by_query,
+    normalized_attention_entropy,
     output_from_fields,
     select_graph_indices,
 )
@@ -105,6 +106,10 @@ def test_core_tensor_formulas_are_self_consistent():
     uniform = torch.ones_like(attn) / nodes
     centered_uniform = cosine_by_query(uniform, uniform, mask, centered=True)
     assert torch.allclose(centered_uniform, torch.zeros_like(centered_uniform), atol=1.0e-6)
+
+    entropy, entropy_valid = normalized_attention_entropy(uniform, mask)
+    assert entropy_valid.all()
+    assert torch.allclose(entropy, torch.ones_like(entropy), atol=1.0e-6)
 
 
 @dataclass
@@ -209,6 +214,7 @@ def test_metric_engine_smoke_covers_all_metric_families_and_preserves_graph_indi
     assert "transport_invariant" in summary_metrics
     assert "output_routing_responsibility" in summary_metrics
     assert "global_routing_gate" in summary_metrics
+    assert "attention_entropy" in summary_metrics
 
 
 def test_select_graph_indices_is_sorted_reproducible_and_handles_full_dataset():

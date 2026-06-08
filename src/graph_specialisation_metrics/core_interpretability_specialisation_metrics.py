@@ -403,6 +403,23 @@ def output_from_fields(attn: torch.Tensor, msg: torch.Tensor, mask: torch.Tensor
     return (a.unsqueeze(-1) * m).sum(dim=3)
 
 
+def normalized_attention_entropy(
+    attn: torch.Tensor,
+    mask: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    m = expand_mask(mask, attn)
+    probs = masked_key_field(attn, m)
+    row_mass = probs.sum(dim=3, keepdim=True).clamp_min(EPS)
+    probs = probs / row_mass
+    log_probs = torch.where(probs > 0, torch.log(probs.clamp_min(EPS)), torch.zeros_like(probs))
+    entropy = -(probs * log_probs).sum(dim=3)
+    support = m.sum(dim=3).to(entropy.dtype)
+    normalizer = torch.log(support.clamp_min(2.0))
+    normalized = entropy / normalizer.clamp_min(EPS)
+    valid = support > 1
+    return normalized, valid
+
+
 class OnlineAlphaAccumulator:
     """Online softmax-weighted accumulator over sampled permutations.
 
@@ -835,6 +852,7 @@ class SpecialisationMetricEngine:
                 del variant_layers
 
         for clean in clean_layers:
+            self._add_attention_entropy(clean, graph_indices)
             for block, block_mask in block_membership.items():
                 self._add_gates(clean, batch, block, block_mask, graph_indices)
         self._finalize_field_cache(field_cache, graph_indices)
@@ -1108,6 +1126,26 @@ class SpecialisationMetricEngine:
             alpha_tau=None,
         )
 
+    def _add_attention_entropy(
+        self,
+        clean: LayerFields,
+        graph_indices: Sequence[int],
+    ) -> None:
+        entropy, valid = normalized_attention_entropy(clean.attention, clean.mask)
+        node_valid = clean.node_mask[:, None, :].expand(-1, clean.attention.size(1), -1)
+        self.acc.add_query_scores(
+            entropy,
+            valid & node_valid,
+            graph_indices=graph_indices,
+            layer=clean.layer,
+            metric="attention_entropy",
+            field="routing",
+            intervention="none",
+            block="all",
+            centered=None,
+            alpha_tau=None,
+        )
+
     def results(self) -> ResultBundle:
         return ResultBundle(
             per_graph_rows=self.acc.per_graph_rows,
@@ -1195,6 +1233,12 @@ def metric_protocol_audit() -> dict[str, Any]:
                 "attention is stored separately so output is sum_j A_ij m_ij"
             ),
             "source": "official GRIT GritTransformerLayer forward hooks",
+        },
+        "attention_entropy": {
+            "definition": "mean query entropy normalised by log(valid key count)",
+            "range": "0=delta-like routing, 1=uniform over valid keys",
+            "intervention": "none",
+            "block": "all",
         },
         "known_ambiguities_resolved": [
             {

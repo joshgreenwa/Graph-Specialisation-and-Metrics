@@ -194,6 +194,33 @@ def plot_transport_heatmaps(
     save_figure(fig, out_dir, "appendix_transport_heatmaps")
 
 
+def plot_centered_appendix(summary: pd.DataFrame, out_dir: Path, *, block: str) -> None:
+    specs = [
+        ("routing_invariant", "content", "Routing invariant | content"),
+        ("routing_follow", "content", "Routing follows | content"),
+        ("routing_invariant", "structure", "Routing invariant | structure"),
+        ("routing_follow", "structure", "Routing follows | structure"),
+        ("transport_invariant", "content", "Transport invariant | content"),
+        ("transport_follow", "content", "Transport follows | content"),
+        ("transport_invariant", "structure", "Transport invariant | structure"),
+        ("transport_follow", "structure", "Transport follows | structure"),
+    ]
+    fig, axes = plt.subplots(2, 4, figsize=(10.6, 4.8), constrained_layout=True)
+    images = []
+    for ax, (metric, intervention, title) in zip(axes.flat, specs):
+        frame = metric_frame(
+            summary,
+            metric=metric,
+            intervention=intervention,
+            block=block,
+            centered=True,
+        )
+        images.append(draw_heatmap(ax, frame, title=title, vmin=-1.0, vmax=1.0, cmap="coolwarm"))
+    if any(image is not None for image in images):
+        fig.colorbar(next(image for image in images if image is not None), ax=axes, shrink=0.82)
+    save_figure(fig, out_dir, "appendix_centered_score_heatmaps")
+
+
 def paired_metric_points(
     summary: pd.DataFrame,
     *,
@@ -225,6 +252,7 @@ def plot_scatter_panels(
     *,
     block: str,
     centered: bool,
+    stem: str = "main_specialisation_scatter",
 ) -> None:
     fig, axes = plt.subplots(2, 3, figsize=(8.4, 5.2), constrained_layout=True)
     fields = ["routing", "transport"]
@@ -295,7 +323,7 @@ def plot_scatter_panels(
         ax.set_title(f"Realised output | {intervention}")
     if image is not None:
         fig.colorbar(image, ax=axes, shrink=0.82, label="Layer")
-    save_figure(fig, out_dir, "main_specialisation_scatter")
+    save_figure(fig, out_dir, stem)
 
 
 def plot_layer_trends(summary: pd.DataFrame, out_dir: Path, *, block: str, centered: bool) -> None:
@@ -436,6 +464,28 @@ def plot_output_heatmaps(summary: pd.DataFrame, out_dir: Path, *, block: str) ->
         if image is not None:
             fig.colorbar(image, ax=ax, fraction=0.046)
     save_figure(fig, out_dir, "appendix_output_response_heatmaps")
+
+
+def plot_entropy_heatmap(summary: pd.DataFrame, out_dir: Path) -> None:
+    frame = metric_frame(
+        summary,
+        metric="attention_entropy",
+        intervention="none",
+        block="all",
+        centered=None,
+    )
+    fig, ax = plt.subplots(figsize=(4.8, 3.2), constrained_layout=True)
+    image = draw_heatmap(
+        ax,
+        frame,
+        title="Attention entropy",
+        vmin=0.0,
+        vmax=1.0,
+        cmap="magma",
+    )
+    if image is not None:
+        fig.colorbar(image, ax=ax, shrink=0.82, label="Normalised entropy")
+    save_figure(fig, out_dir, "appendix_attention_entropy_heatmap")
 
 
 def plot_locality(summary: pd.DataFrame, out_dir: Path, *, centered: bool) -> None:
@@ -682,7 +732,32 @@ def graph_to_networkx(graph: Any) -> nx.Graph:
     return g
 
 
-def load_attention_example_context(args: argparse.Namespace, metadata: Mapping[str, Any]):
+def parse_int_csv(text: str) -> list[int]:
+    return [int(part.strip()) for part in text.split(",") if part.strip()]
+
+
+def attention_graph_indices(
+    args: argparse.Namespace,
+    metadata: Mapping[str, Any],
+    per_graph: pd.DataFrame,
+) -> list[int]:
+    if args.attention_graph_indices:
+        return parse_int_csv(args.attention_graph_indices)[: args.attention_num_graphs]
+    if "graph_index" in per_graph and not per_graph.empty:
+        values = sorted(int(value) for value in per_graph["graph_index"].dropna().unique())
+        if values:
+            return values[: args.attention_num_graphs]
+    selected = metadata.get("selected_graph_indices")
+    if isinstance(selected, Sequence) and not isinstance(selected, str):
+        return [int(value) for value in selected[: args.attention_num_graphs]]
+    return []
+
+
+def load_attention_example_context(
+    args: argparse.Namespace,
+    metadata: Mapping[str, Any],
+    graph_indices: Sequence[int],
+):
     runner = load_runner(args.runner_path)
     checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     cfg = build_screen_config(runner, args, checkpoint)
@@ -706,7 +781,11 @@ def load_attention_example_context(args: argparse.Namespace, metadata: Mapping[s
         require_present=True,
         log=print,
     )
-    graphs = select_graphs(splits[args.split], args.attention_num_graphs, args.graph_seed)
+    if graph_indices:
+        graphs = [splits[args.split][int(index)] for index in graph_indices]
+    else:
+        graphs = select_graphs(splits[args.split], args.attention_num_graphs, args.graph_seed)
+        graph_indices = list(range(len(graphs)))
     model = runner.build_model(
         args.model or str(metadata.get("model")),
         cfg,
@@ -724,7 +803,7 @@ def load_attention_example_context(args: argparse.Namespace, metadata: Mapping[s
         max_nodes=max(graph.num_nodes for graph in graphs),
     )
     layers = collector.collect(batch)
-    return graphs, layers
+    return graphs, layers, list(graph_indices)
 
 
 def select_top_heads(summary: pd.DataFrame, args: argparse.Namespace) -> pd.DataFrame:
@@ -748,25 +827,48 @@ def draw_attention_weighted_graph(
     title: str,
 ) -> None:
     g = graph_to_networkx(graph)
-    pos = nx.spring_layout(g, seed=17)
     n = int(graph.num_nodes)
+    pos = nx.spring_layout(
+        g,
+        seed=17,
+        k=2.6 / np.sqrt(max(n, 1)),
+        iterations=200,
+        scale=1.0,
+    )
     attn = attention[:n, :n].float().clamp_min(0.0)
     key_mass = attn.sum(dim=0).numpy()
     query_mass = attn.sum(dim=1).numpy()
     node_weight = 0.5 * (key_mass + query_mass)
     denom = max(float(node_weight.max()), 1.0e-8)
-    edge_weight = []
-    for src, dst in g.edges():
+    edges = list(g.edges())
+    edge_scores = []
+    for src, dst in edges:
         weight = float(0.5 * (attn[src, dst] + attn[dst, src]))
-        edge_weight.append(0.35 + 5.0 * weight)
-    nx.draw_networkx_edges(g, pos, width=edge_weight, alpha=0.42, edge_color="0.25", ax=ax)
+        edge_scores.append(weight)
+    nx.draw_networkx_edges(g, pos, width=0.25, alpha=0.08, edge_color="0.35", ax=ax)
+    if edges:
+        top_k = min(len(edges), 80)
+        order = np.argsort(edge_scores)[-top_k:]
+        top_edges = [edges[idx] for idx in order]
+        top_scores = np.array([edge_scores[idx] for idx in order])
+        score_max = max(float(top_scores.max()), 1.0e-8)
+        top_widths = 0.35 + 3.2 * top_scores / score_max
+        nx.draw_networkx_edges(
+            g,
+            pos,
+            edgelist=top_edges,
+            width=top_widths,
+            alpha=0.62,
+            edge_color="#264653",
+            ax=ax,
+        )
     nx.draw_networkx_nodes(
         g,
         pos,
-        node_size=45 + 390 * node_weight / denom,
+        node_size=20 + 120 * node_weight / denom,
         node_color=node_weight,
         cmap="viridis",
-        linewidths=0.25,
+        linewidths=0.18,
         edgecolors="white",
         ax=ax,
     )
@@ -774,8 +876,86 @@ def draw_attention_weighted_graph(
     ax.set_axis_off()
 
 
+def graph_metric_score(
+    per_graph: pd.DataFrame,
+    *,
+    graph_index: int,
+    layer: int,
+    head: int,
+    metric: str,
+    block: str,
+    centered: bool,
+) -> float:
+    frame = per_graph[
+        (per_graph["graph_index"] == graph_index)
+        & (per_graph["layer"] == layer)
+        & (per_graph["head"] == head)
+        & (per_graph["metric"] == metric)
+        & (per_graph["intervention"] == "content")
+        & (per_graph["block"] == block)
+        & (per_graph["centered"] == centered)
+    ]
+    if frame.empty:
+        return float("nan")
+    return float(frame["score"].mean())
+
+
+def format_content_scores(
+    per_graph: pd.DataFrame,
+    *,
+    graph_index: int,
+    layer: int,
+    head: int,
+    block: str,
+    centered: bool,
+) -> str:
+    scores = {
+        "R sym": graph_metric_score(
+            per_graph,
+            graph_index=graph_index,
+            layer=layer,
+            head=head,
+            metric="routing_follow",
+            block=block,
+            centered=centered,
+        ),
+        "R inv": graph_metric_score(
+            per_graph,
+            graph_index=graph_index,
+            layer=layer,
+            head=head,
+            metric="routing_invariant",
+            block=block,
+            centered=centered,
+        ),
+        "T sym": graph_metric_score(
+            per_graph,
+            graph_index=graph_index,
+            layer=layer,
+            head=head,
+            metric="transport_follow",
+            block=block,
+            centered=centered,
+        ),
+        "T inv": graph_metric_score(
+            per_graph,
+            graph_index=graph_index,
+            layer=layer,
+            head=head,
+            metric="transport_invariant",
+            block=block,
+            centered=centered,
+        ),
+    }
+    return " | ".join(
+        f"{name} {value:.2f}" if np.isfinite(value) else f"{name} n/a"
+        for name, value in scores.items()
+    )
+
+
 def plot_attention_examples(
     summary: pd.DataFrame,
+    per_graph: pd.DataFrame,
     metadata: Mapping[str, Any],
     out_dir: Path,
     args: argparse.Namespace,
@@ -786,39 +966,52 @@ def plot_attention_examples(
     if top.empty:
         print("[attention] no heads matched selection; skipping examples", flush=True)
         return
-    graphs, layers = load_attention_example_context(args, metadata)
+    graph_indices = attention_graph_indices(args, metadata, per_graph)
+    graphs, layers, graph_indices = load_attention_example_context(args, metadata, graph_indices)
     n_heads = len(top)
     n_graphs = min(len(graphs), args.attention_num_graphs)
     fig, axes = plt.subplots(
         n_heads,
         2 * n_graphs,
-        figsize=(3.0 * n_graphs, 2.0 * n_heads),
+        figsize=(4.6 * n_graphs, 3.0 * n_heads),
         squeeze=False,
         constrained_layout=True,
+        gridspec_kw={"width_ratios": [1.35, 1.0] * n_graphs},
     )
     for row_idx, row in enumerate(top.itertuples(index=False)):
         layer = next(item for item in layers if int(item.layer) == int(row.layer))
         attn = layer.attention.detach().cpu()
+        layer_idx = int(row.layer)
+        head_idx = int(row.head)
         for graph_idx in range(n_graphs):
             graph_ax = axes[row_idx, 2 * graph_idx]
             mat_ax = axes[row_idx, 2 * graph_idx + 1]
             graph = graphs[graph_idx]
+            source_index = int(graph_indices[graph_idx])
             n = int(graph.num_nodes)
-            head_attn = attn[graph_idx, int(row.head), :n, :n]
+            head_attn = attn[graph_idx, head_idx, :n, :n]
+            score_text = format_content_scores(
+                per_graph,
+                graph_index=source_index,
+                layer=layer_idx,
+                head=head_idx,
+                block=args.attention_select_block,
+                centered=args.attention_select_centered,
+            )
             draw_attention_weighted_graph(
                 graph_ax,
                 graph,
                 head_attn,
-                title=f"G{graph_idx} graph",
+                title=f"graph index {source_index}",
             )
             image = mat_ax.imshow(head_attn, cmap="viridis", vmin=0.0)
-            mat_ax.set_title(f"G{graph_idx} attention")
+            mat_ax.set_title(score_text, fontsize=7)
             mat_ax.set_xlabel("key")
             mat_ax.set_ylabel("query")
             mat_ax.tick_params(length=2)
             fig.colorbar(image, ax=mat_ax, fraction=0.046)
         axes[row_idx, 0].set_ylabel(
-            f"L{int(row.layer)} H{int(row.head)}\nmean={float(row.mean):.3f}",
+            f"L{layer_idx} H{head_idx}\nselected mean={float(row.mean):.3f}",
             rotation=0,
             ha="right",
             va="center",
@@ -834,10 +1027,19 @@ def run(args: argparse.Namespace) -> None:
     plot_main_heatmaps(summary, out_dir, block=args.block, centered=args.centered)
     plot_scatter_panels(summary, out_dir, block=args.block, centered=args.centered)
     plot_layer_trends(summary, out_dir, block=args.block, centered=args.centered)
+    plot_centered_appendix(summary, out_dir, block=args.block)
+    plot_scatter_panels(
+        summary,
+        out_dir,
+        block=args.block,
+        centered=True,
+        stem="appendix_centered_specialisation_scatter",
+    )
     plot_transport_heatmaps(summary, out_dir, block=args.block, centered=args.centered)
     plot_variation(summary, out_dir, block=args.block, centered=args.centered)
     plot_variation_scatter(summary, out_dir, block=args.block, centered=args.centered)
     plot_output_heatmaps(summary, out_dir, block=args.block)
+    plot_entropy_heatmap(summary, out_dir)
     plot_locality(summary, out_dir, centered=args.centered)
     plot_support_partition_trends(summary, out_dir, centered=args.centered)
     plot_graph_convergence(per_graph, out_dir, block=args.block, centered=args.centered)
@@ -857,7 +1059,7 @@ def run(args: argparse.Namespace) -> None:
         block=args.compare_block,
         centered=args.centered,
     )
-    plot_attention_examples(summary, metadata, out_dir, args)
+    plot_attention_examples(summary, per_graph, metadata, out_dir, args)
     print(f"[done] wrote figures to {out_dir}", flush=True)
 
 
@@ -908,6 +1110,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", default="auto")
     parser.add_argument("--attention-heads", type=int, default=4)
     parser.add_argument("--attention-num-graphs", type=int, default=4)
+    parser.add_argument(
+        "--attention-graph-indices",
+        default="",
+        help="Optional comma list of dataset graph indices for attention examples.",
+    )
     parser.add_argument("--attention-select-metric", default="routing_follow")
     parser.add_argument("--attention-select-intervention", default="content")
     parser.add_argument("--attention-select-block", default="all")
