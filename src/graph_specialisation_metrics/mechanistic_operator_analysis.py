@@ -3273,6 +3273,7 @@ def run_atlas(args: argparse.Namespace, loaded: Optional[LoadedExperiment] = Non
     for batch_idx, (graph_indices, batch_item) in enumerate(analysis_items):
         cached_batch = batch_item if batches_are_cached else runner.collate_graphs(batch_item)
         batch = batch_to_device(cached_batch, device)
+        batch_seed = args.random_seed + batch_idx
         model.zero_grad(set_to_none=True)
         with collector as active_collector:
             with torch.enable_grad():
@@ -3285,7 +3286,7 @@ def run_atlas(args: argparse.Namespace, loaded: Optional[LoadedExperiment] = Non
             args.task,
             batch,
             random_controls=args.random_controls,
-            seed=args.random_seed + start_idx,
+            seed=batch_seed,
         )
         teacher_masks = teacher_operator_masks(teacher_kernels, graph_indices, batch)
         masks.update(teacher_masks)
@@ -3295,7 +3296,7 @@ def run_atlas(args: argparse.Namespace, loaded: Optional[LoadedExperiment] = Non
                     teacher_masks,
                     batch,
                     valid,
-                    args.random_seed + start_idx,
+                    batch_seed,
                 )
             )
         global_mask = masks.get("global_nonedge", (valid & ~sparse_edge_mask(batch)).float())
