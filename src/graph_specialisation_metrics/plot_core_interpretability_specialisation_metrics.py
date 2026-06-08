@@ -367,6 +367,77 @@ def plot_variation(summary: pd.DataFrame, out_dir: Path, *, block: str, centered
     save_figure(fig, out_dir, "appendix_between_graph_variation")
 
 
+def plot_variation_scatter(
+    summary: pd.DataFrame,
+    out_dir: Path,
+    *,
+    block: str,
+    centered: bool,
+) -> None:
+    specs = [
+        ("routing_follow", "content", "Routing follows content"),
+        ("routing_follow", "structure", "Routing follows structure"),
+        ("transport_follow", "content", "Transport follows content"),
+        ("transport_follow", "structure", "Transport follows structure"),
+    ]
+    fig, axes = plt.subplots(2, 2, figsize=(6.8, 4.7), constrained_layout=True)
+    image = None
+    for ax, (metric, intervention, title) in zip(axes.flat, specs):
+        frame = metric_frame(
+            summary,
+            metric=metric,
+            intervention=intervention,
+            block=block,
+            centered=centered,
+        )
+        if frame.empty:
+            ax.text(0.5, 0.5, "missing", ha="center", va="center")
+            ax.set_axis_off()
+            continue
+        image = ax.scatter(
+            frame["mean"],
+            frame["std_between_graphs"],
+            c=frame["layer"],
+            cmap="viridis",
+            s=28,
+            edgecolor="white",
+            linewidth=0.35,
+        )
+        ax.set_xlabel("Mean score")
+        ax.set_ylabel("Across-graph SD")
+        ax.set_title(title)
+        ax.set_xlim(-0.04, 1.04)
+        ax.set_ylim(bottom=-0.01)
+    if image is not None:
+        fig.colorbar(image, ax=axes, shrink=0.82, label="Layer")
+    save_figure(fig, out_dir, "appendix_variation_scatter")
+
+
+def plot_output_heatmaps(summary: pd.DataFrame, out_dir: Path, *, block: str) -> None:
+    specs = [
+        ("output_routing_responsibility", "content", "Routing resp. | content"),
+        ("output_transport_responsibility", "content", "Transport resp. | content"),
+        ("output_sensitivity", "content", "Sensitivity | content"),
+        ("output_routing_responsibility", "structure", "Routing resp. | structure"),
+        ("output_transport_responsibility", "structure", "Transport resp. | structure"),
+        ("output_sensitivity", "structure", "Sensitivity | structure"),
+    ]
+    fig, axes = plt.subplots(2, 3, figsize=(8.8, 4.8), constrained_layout=True)
+    for ax, (metric, intervention, title) in zip(axes.flat, specs):
+        frame = metric_frame(
+            summary,
+            metric=metric,
+            intervention=intervention,
+            block=block,
+            centered=None,
+        )
+        vmax = 1.0 if metric != "output_sensitivity" else None
+        image = draw_heatmap(ax, frame, title=title, vmin=0.0, vmax=vmax)
+        if image is not None:
+            fig.colorbar(image, ax=ax, fraction=0.046)
+    save_figure(fig, out_dir, "appendix_output_response_heatmaps")
+
+
 def plot_locality(summary: pd.DataFrame, out_dir: Path, *, centered: bool) -> None:
     fig, axes = plt.subplots(2, 2, figsize=(6.8, 4.7), constrained_layout=True)
     specs = [
@@ -388,6 +459,94 @@ def plot_locality(summary: pd.DataFrame, out_dir: Path, *, centered: bool) -> No
     if any(image is not None for image in images):
         fig.colorbar(next(image for image in images if image is not None), ax=axes, shrink=0.82)
     save_figure(fig, out_dir, "appendix_locality_globality")
+
+
+def plot_support_partition_trends(summary: pd.DataFrame, out_dir: Path, *, centered: bool) -> None:
+    specs = [
+        ("routing_follow", "content", "Routing follows content"),
+        ("routing_follow", "structure", "Routing follows structure"),
+        ("transport_follow", "content", "Transport follows content"),
+        ("transport_follow", "structure", "Transport follows structure"),
+    ]
+    colors = {"all": "0.25", "local": "#2a9d8f", "global": "#e76f51"}
+    fig, axes = plt.subplots(2, 2, figsize=(6.8, 4.7), constrained_layout=True)
+    for ax, (metric, intervention, title) in zip(axes.flat, specs):
+        for block, color in colors.items():
+            frame = metric_frame(
+                summary,
+                metric=metric,
+                intervention=intervention,
+                block=block,
+                centered=centered,
+            )
+            if frame.empty:
+                continue
+            layer = frame.groupby("layer")["mean"].agg(["mean", "sem"]).reset_index()
+            ax.errorbar(
+                layer["layer"],
+                layer["mean"],
+                yerr=layer["sem"].fillna(0.0),
+                marker="o",
+                linewidth=1.2,
+                capsize=2.0,
+                color=color,
+                label=block,
+            )
+        ax.set_title(title)
+        ax.set_xlabel("Layer")
+        ax.set_ylabel("Mean over heads")
+        ax.set_ylim(-0.04, 1.04)
+    handles, labels = axes.flat[0].get_legend_handles_labels()
+    if handles:
+        fig.legend(handles, labels, frameon=False, loc="upper center", ncol=3)
+    save_figure(fig, out_dir, "appendix_support_partition_trends")
+
+
+def plot_graph_convergence(
+    per_graph: pd.DataFrame,
+    out_dir: Path,
+    *,
+    block: str,
+    centered: bool,
+) -> None:
+    if per_graph.empty or "graph_index" not in per_graph:
+        return
+    specs = [
+        ("routing_follow", "content", centered, "Routing follows content"),
+        ("routing_follow", "structure", centered, "Routing follows structure"),
+        ("transport_follow", "content", centered, "Transport follows content"),
+        ("transport_follow", "structure", centered, "Transport follows structure"),
+        ("output_sensitivity", "content", None, "Output sensitivity | content"),
+        ("output_sensitivity", "structure", None, "Output sensitivity | structure"),
+    ]
+    fig, axes = plt.subplots(2, 3, figsize=(8.8, 4.8), constrained_layout=True)
+    for ax, (metric, intervention, cflag, title) in zip(axes.flat, specs):
+        frame = per_graph[
+            (per_graph["metric"] == metric)
+            & (per_graph["intervention"] == intervention)
+            & (per_graph["block"] == block)
+        ].copy()
+        if cflag is None:
+            frame = frame[frame["centered"].isna()]
+        else:
+            frame = frame[frame["centered"] == cflag]
+        if frame.empty:
+            ax.text(0.5, 0.5, "missing", ha="center", va="center")
+            ax.set_axis_off()
+            continue
+        by_graph = frame.groupby("graph_index")["score"].mean().sort_index()
+        values = by_graph.to_numpy(dtype=float)
+        counts = np.arange(1, len(values) + 1)
+        cumulative = np.cumsum(values) / counts
+        ax.plot(counts, cumulative, color="#264653", linewidth=1.5)
+        final = float(np.nanmean(values))
+        sem = float(pd.Series(values).sem()) if len(values) > 1 else 0.0
+        ax.axhline(final, color="0.55", linewidth=0.9, linestyle="--")
+        ax.fill_between(counts, final - sem, final + sem, color="0.85", alpha=0.7)
+        ax.set_title(title)
+        ax.set_xlabel("Graphs")
+        ax.set_ylabel("Cumulative mean")
+    save_figure(fig, out_dir, "appendix_graph_count_convergence")
 
 
 def parse_convergence_dirs(items: Sequence[str]) -> list[tuple[float, Path]]:
@@ -581,6 +740,40 @@ def select_top_heads(summary: pd.DataFrame, args: argparse.Namespace) -> pd.Data
     return frame.sort_values("mean", ascending=False).head(args.attention_heads)
 
 
+def draw_attention_weighted_graph(
+    ax: plt.Axes,
+    graph: Any,
+    attention: torch.Tensor,
+    *,
+    title: str,
+) -> None:
+    g = graph_to_networkx(graph)
+    pos = nx.spring_layout(g, seed=17)
+    n = int(graph.num_nodes)
+    attn = attention[:n, :n].float().clamp_min(0.0)
+    key_mass = attn.sum(dim=0).numpy()
+    query_mass = attn.sum(dim=1).numpy()
+    node_weight = 0.5 * (key_mass + query_mass)
+    denom = max(float(node_weight.max()), 1.0e-8)
+    edge_weight = []
+    for src, dst in g.edges():
+        weight = float(0.5 * (attn[src, dst] + attn[dst, src]))
+        edge_weight.append(0.35 + 5.0 * weight)
+    nx.draw_networkx_edges(g, pos, width=edge_weight, alpha=0.42, edge_color="0.25", ax=ax)
+    nx.draw_networkx_nodes(
+        g,
+        pos,
+        node_size=45 + 390 * node_weight / denom,
+        node_color=node_weight,
+        cmap="viridis",
+        linewidths=0.25,
+        edgecolors="white",
+        ax=ax,
+    )
+    ax.set_title(title)
+    ax.set_axis_off()
+
+
 def plot_attention_examples(
     summary: pd.DataFrame,
     metadata: Mapping[str, Any],
@@ -598,8 +791,8 @@ def plot_attention_examples(
     n_graphs = min(len(graphs), args.attention_num_graphs)
     fig, axes = plt.subplots(
         n_heads,
-        n_graphs + 1,
-        figsize=(2.2 * (n_graphs + 1), 2.0 * n_heads),
+        2 * n_graphs,
+        figsize=(3.0 * n_graphs, 2.0 * n_heads),
         squeeze=False,
         constrained_layout=True,
     )
@@ -607,51 +800,47 @@ def plot_attention_examples(
         layer = next(item for item in layers if int(item.layer) == int(row.layer))
         attn = layer.attention.detach().cpu()
         for graph_idx in range(n_graphs):
-            ax = axes[row_idx, graph_idx]
+            graph_ax = axes[row_idx, 2 * graph_idx]
+            mat_ax = axes[row_idx, 2 * graph_idx + 1]
             graph = graphs[graph_idx]
-            g = graph_to_networkx(graph)
-            pos = nx.spring_layout(g, seed=17)
             n = int(graph.num_nodes)
             head_attn = attn[graph_idx, int(row.head), :n, :n]
-            node_weight = head_attn.sum(dim=0).numpy()
-            edge_weight = []
-            for src, dst in g.edges():
-                weight = float(0.5 * (head_attn[src, dst] + head_attn[dst, src]))
-                edge_weight.append(0.4 + 4.0 * weight)
-            nx.draw_networkx_edges(g, pos, width=edge_weight, alpha=0.45, ax=ax)
-            nx.draw_networkx_nodes(
-                g,
-                pos,
-                node_size=50 + 350 * node_weight / max(float(node_weight.max()), 1.0e-8),
-                node_color=node_weight,
-                cmap="viridis",
-                ax=ax,
+            draw_attention_weighted_graph(
+                graph_ax,
+                graph,
+                head_attn,
+                title=f"G{graph_idx} graph",
             )
-            ax.set_title(f"graph {graph_idx}")
-            ax.set_axis_off()
-        ax = axes[row_idx, -1]
-        image = ax.imshow(
-            attn[0, int(row.head), : graphs[0].num_nodes, : graphs[0].num_nodes],
-            cmap="viridis",
-            vmin=0.0,
+            image = mat_ax.imshow(head_attn, cmap="viridis", vmin=0.0)
+            mat_ax.set_title(f"G{graph_idx} attention")
+            mat_ax.set_xlabel("key")
+            mat_ax.set_ylabel("query")
+            mat_ax.tick_params(length=2)
+            fig.colorbar(image, ax=mat_ax, fraction=0.046)
+        axes[row_idx, 0].set_ylabel(
+            f"L{int(row.layer)} H{int(row.head)}\nmean={float(row.mean):.3f}",
+            rotation=0,
+            ha="right",
+            va="center",
+            labelpad=32,
         )
-        ax.set_title(f"L{int(row.layer)} H{int(row.head)}")
-        ax.set_xlabel("key")
-        ax.set_ylabel("query")
-        fig.colorbar(image, ax=ax, fraction=0.046)
     save_figure(fig, out_dir, "main_attention_examples")
 
 
 def run(args: argparse.Namespace) -> None:
     plt.rcParams.update(STYLE)
     out_dir = ensure_out_dir(args.output_dir)
-    summary, _per_graph, metadata = read_metric_dir(args.metric_dir)
+    summary, per_graph, metadata = read_metric_dir(args.metric_dir)
     plot_main_heatmaps(summary, out_dir, block=args.block, centered=args.centered)
     plot_scatter_panels(summary, out_dir, block=args.block, centered=args.centered)
     plot_layer_trends(summary, out_dir, block=args.block, centered=args.centered)
     plot_transport_heatmaps(summary, out_dir, block=args.block, centered=args.centered)
     plot_variation(summary, out_dir, block=args.block, centered=args.centered)
+    plot_variation_scatter(summary, out_dir, block=args.block, centered=args.centered)
+    plot_output_heatmaps(summary, out_dir, block=args.block)
     plot_locality(summary, out_dir, centered=args.centered)
+    plot_support_partition_trends(summary, out_dir, centered=args.centered)
+    plot_graph_convergence(per_graph, out_dir, block=args.block, centered=args.centered)
     plot_convergence(
         parse_convergence_dirs(args.convergence_dirs),
         out_dir,

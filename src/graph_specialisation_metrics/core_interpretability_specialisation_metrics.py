@@ -1133,6 +1133,95 @@ def write_csv(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
             writer.writerow(dict(row))
 
 
+def metric_protocol_audit() -> dict[str, Any]:
+    """Machine-readable notes tying the implementation to the Section 3 metrics."""
+
+    return {
+        "routing_metric": {
+            "field": "A_i,:",
+            "follow_reference": "A_i,: P_pi",
+            "invariant_reference": "A_i,:",
+            "similarity": "masked cosine over keys",
+            "centered_variant": "subtract masked key mean before cosine",
+        },
+        "transport_metric": {
+            "field": "m_i,: = M(h_j, r_ij)",
+            "follow_reference": "P_pi m_i,: implemented as key-axis gather",
+            "invariant_reference": "m_i,:",
+            "similarity": "masked Frobenius cosine over key-message field",
+            "centered_variant": "subtract masked key mean per message channel before cosine",
+        },
+        "alpha_weighting": {
+            "normalization_axis": "sampled transpositions per graph/head/query",
+            "routing_logit": "0.5 * ||A_i,: - A_i,: P_pi||_1 / tau",
+            "transport_logit": "0.5 * ||m_i,: - P_pi m_i,:||_F / tau",
+            "computed_from": "clean unintervened field",
+            "shared_across": "content and structural variants for the same field",
+            "implementation": "streaming log-sum-exp; no per-permutation activation cache",
+        },
+        "permutation_family": {
+            "family": "within-graph node transpositions",
+            "block_policy": (
+                "all samples a graph-level transposition; local/global scores use the same "
+                "sample and keep only queries for which both swapped nodes lie in the query block"
+            ),
+            "local_block": "N(i), excluding self",
+            "global_block": "V \\ (N(i) union {i})",
+        },
+        "interventions": {
+            "content": "permute symbolic node_type rows; keep all topology-derived tensors fixed",
+            "structure": (
+                "permute topology-derived node and pair tensors jointly; keep symbolic node_type "
+                "fixed. For official GRIT this includes degree, RRWP, sparse edge endpoints, and "
+                "edge values attached to their structural edge identities"
+            ),
+            "coordinate_convention": (
+                "queries remain in fixed output coordinates; equivariant references are key-side "
+                "fields Q_i,: P_pi, matching the draft's fixed-query view"
+            ),
+        },
+        "realised_output_metric": {
+            "decomposition": "Delta o_i = (A'_i,: - A_i,:) m_bar_i,: + A_bar_i,: (m'_i,: - m_i,:)",
+            "routing_responsibility": "||delta_A|| / (||delta_A|| + ||delta_m||)",
+            "transport_responsibility": "||delta_m|| / (||delta_A|| + ||delta_m||)",
+            "sensitivity": "mean_pi ||Delta o_i|| / (||o_i|| + eps)",
+            "alpha_weighted": False,
+            "centered_variant": "not computed by default, matching Section 3",
+        },
+        "grit_adapter": {
+            "attention": "post-softmax per-head sparse GRIT attention densified to [B,H,N,N]",
+            "transport": (
+                "pre-attention message V_h[src] plus GRIT edge_enhance relation term when present; "
+                "attention is stored separately so output is sum_j A_ij m_ij"
+            ),
+            "source": "official GRIT GritTransformerLayer forward hooks",
+        },
+        "known_ambiguities_resolved": [
+            {
+                "ambiguity": "whether structural swaps should also reindex query rows",
+                "resolution": (
+                    "no; all scores are from a fixed-query coordinate system and only compare "
+                    "key fields against Q_i,: and Q_i,: P_pi"
+                ),
+            },
+            {
+                "ambiguity": "whether output metric should reuse alpha weights",
+                "resolution": (
+                    "no; Section 3 states Metric 3 is norm-pooled across swaps, "
+                    "not alpha-weighted"
+                ),
+            },
+            {
+                "ambiguity": "whether local/global alpha is over all swaps or within-block swaps",
+                "resolution": (
+                    "within-block per query; implemented as rejection over the sampled graph-level "
+                    "transpositions and normalised over valid sampled swaps"
+                ),
+            },
+        ],
+    }
+
+
 def checkpoint_config_kwargs(runner: Any, checkpoint: Mapping[str, Any]) -> dict[str, Any]:
     signature = checkpoint.get("run_signature", {})
     cfg = signature.get("config", {}) if isinstance(signature, Mapping) else {}
@@ -1302,11 +1391,17 @@ def run(args: argparse.Namespace) -> ResultBundle:
         "interventions": list(options.interventions),
         "blocks": list(options.blocks),
         "centered": list(options.centered),
+        "selected_graph_indices": selected_indices,
+        "metric_protocol_audit": metric_protocol_audit(),
         "elapsed_seconds": time.time() - start,
         "device": str(device),
     }
     (out_dir / "metadata.json").write_text(
         json.dumps(metadata, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    (out_dir / "theory_alignment.json").write_text(
+        json.dumps(metric_protocol_audit(), indent=2, sort_keys=True),
         encoding="utf-8",
     )
     print(
