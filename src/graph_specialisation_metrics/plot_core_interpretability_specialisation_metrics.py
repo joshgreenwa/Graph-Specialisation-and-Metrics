@@ -10,10 +10,8 @@ a model checkpoint when optional attention-example figures are requested.
 from __future__ import annotations
 
 import argparse
-import importlib.util
 import json
 import os
-import sys
 from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence
 
@@ -24,9 +22,7 @@ import pandas as pd
 import torch
 
 from graph_specialisation_metrics.core_interpretability_specialisation_metrics import (
-    OfficialGRITFieldCollector,
     build_screen_config,
-    find_default_runner_path,
     load_runner,
     make_collector,
     resolve_device,
@@ -518,17 +514,6 @@ def plot_comparison(
     save_figure(fig, out_dir, "comparison_layer_trends")
 
 
-def import_module_from_path(path: Path, module_name: str):
-    path = path.expanduser().resolve()
-    spec = importlib.util.spec_from_file_location(module_name, path)
-    if spec is None or spec.loader is None:
-        raise RuntimeError(f"could not import module from {path}")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = module
-    spec.loader.exec_module(module)
-    return module
-
-
 def graph_to_networkx(graph: Any) -> nx.Graph:
     g = nx.Graph()
     g.add_nodes_from(range(int(graph.num_nodes)))
@@ -738,6 +723,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--attention-select-intervention", default="content")
     parser.add_argument("--attention-select-block", default="all")
     parser.add_argument("--attention-select-centered", action="store_true", default=True)
+    parser.add_argument(
+        "--attention-select-uncentered",
+        dest="attention_select_centered",
+        action="store_false",
+    )
     parser.add_argument("--train-size", type=int, default=None)
     parser.add_argument("--val-size", type=int, default=None)
     parser.add_argument("--test-size", type=int, default=None)

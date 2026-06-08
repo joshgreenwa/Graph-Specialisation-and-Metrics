@@ -1162,11 +1162,15 @@ def build_screen_config(
     return runner.ScreenConfig(**values)
 
 
-def select_graphs(dataset: Any, num_graphs: int, seed: int) -> list[Any]:
+def select_graph_indices(dataset: Any, num_graphs: int, seed: int) -> list[int]:
     if num_graphs <= 0 or num_graphs >= len(dataset):
-        return [dataset[i] for i in range(len(dataset))]
+        return list(range(len(dataset)))
     rng = random.Random(seed)
-    return [dataset[i] for i in sorted(rng.sample(range(len(dataset)), k=num_graphs))]
+    return sorted(rng.sample(range(len(dataset)), k=num_graphs))
+
+
+def select_graphs(dataset: Any, num_graphs: int, seed: int) -> list[Any]:
+    return [dataset[i] for i in select_graph_indices(dataset, num_graphs, seed)]
 
 
 def make_collector(
@@ -1218,7 +1222,8 @@ def run(args: argparse.Namespace) -> ResultBundle:
         log=log,
     )
     dataset = splits[args.split]
-    graphs = select_graphs(dataset, args.num_graphs, args.graph_seed)
+    selected_indices = select_graph_indices(dataset, args.num_graphs, args.graph_seed)
+    graphs = [dataset[i] for i in selected_indices]
     if not graphs:
         raise RuntimeError(f"no graphs selected from {args.task}/{args.split}")
 
@@ -1265,7 +1270,7 @@ def run(args: argparse.Namespace) -> ResultBundle:
     for start_idx in range(0, len(graphs), batch_size):
         end_idx = min(len(graphs), start_idx + batch_size)
         batch_graphs = graphs[start_idx:end_idx]
-        graph_indices = list(range(start_idx, end_idx))
+        graph_indices = selected_indices[start_idx:end_idx]
         batch = runner.collate_graphs(batch_graphs).to(device)
         print(
             f"[metrics] batch={start_idx // batch_size + 1} "
