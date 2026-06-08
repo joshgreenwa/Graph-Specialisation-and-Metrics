@@ -403,6 +403,108 @@ def output_from_fields(attn: torch.Tensor, msg: torch.Tensor, mask: torch.Tensor
     return (a.unsqueeze(-1) * m).sum(dim=3)
 
 
+class OnlineAlphaAccumulator:
+    """Online softmax-weighted accumulator over sampled permutations.
+
+    For each graph/head/query cell, this maintains a numerically stable
+    log-sum-exp normalizer and weighted score sums. Memory is independent of the
+    number of sampled permutations.
+    """
+
+    def __init__(self, centered_options: Sequence[bool]) -> None:
+        self.centered_options = tuple(centered_options)
+        self.initialized = False
+        self.max_logit: torch.Tensor
+        self.weight_sum: torch.Tensor
+        self.weight_sq_sum: torch.Tensor
+        self.valid_any: torch.Tensor
+        self.moved_sum: torch.Tensor
+        self.moved_count: torch.Tensor
+        self.invariant_sum: dict[bool, torch.Tensor] = {}
+        self.follow_sum: dict[bool, torch.Tensor] = {}
+
+    def _init_like(self, template: torch.Tensor) -> None:
+        self.max_logit = torch.full_like(template, -torch.inf)
+        self.weight_sum = torch.zeros_like(template)
+        self.weight_sq_sum = torch.zeros_like(template)
+        self.valid_any = torch.zeros_like(template, dtype=torch.bool)
+        self.moved_sum = torch.zeros_like(template)
+        self.moved_count = torch.zeros_like(template)
+        self.invariant_sum = {
+            centered: torch.zeros_like(template) for centered in self.centered_options
+        }
+        self.follow_sum = {
+            centered: torch.zeros_like(template) for centered in self.centered_options
+        }
+        self.initialized = True
+
+    def update(
+        self,
+        moved: torch.Tensor,
+        valid_alpha: torch.Tensor,
+        valid_score: torch.Tensor,
+        invariant_scores: Mapping[bool, torch.Tensor],
+        follow_scores: Mapping[bool, torch.Tensor],
+        alpha_tau: float,
+    ) -> None:
+        moved = moved.detach()
+        valid = (valid_alpha & valid_score).detach()
+        if not self.initialized:
+            self._init_like(moved.float())
+        logits = moved.float() / float(alpha_tau)
+        old_max = self.max_logit
+        candidate_max = torch.maximum(old_max, logits)
+        new_max = torch.where(valid, candidate_max, old_max)
+        old_scale = torch.where(
+            torch.isfinite(old_max),
+            torch.exp(old_max - new_max),
+            torch.zeros_like(old_max),
+        )
+        new_scale = torch.where(valid, torch.exp(logits - new_max), torch.zeros_like(logits))
+        self.max_logit = new_max
+        self.weight_sum = self.weight_sum * old_scale + new_scale
+        self.weight_sq_sum = self.weight_sq_sum * torch.square(old_scale) + torch.square(new_scale)
+        self.valid_any |= valid
+        self.moved_sum += torch.where(valid, moved.float(), torch.zeros_like(moved.float()))
+        self.moved_count += valid.to(self.moved_count.dtype)
+        for centered in self.centered_options:
+            self.invariant_sum[centered] = (
+                self.invariant_sum[centered] * old_scale
+                + new_scale * invariant_scores[centered].detach().float()
+            )
+            self.follow_sum[centered] = (
+                self.follow_sum[centered] * old_scale
+                + new_scale * follow_scores[centered].detach().float()
+            )
+
+    def finalize(self) -> dict[str, Any]:
+        if not self.initialized:
+            raise RuntimeError("cannot finalize an empty OnlineAlphaAccumulator")
+        denom = self.weight_sum.clamp_min(EPS)
+        valid = self.valid_any
+        moved_mean = self.moved_sum / self.moved_count.clamp_min(1.0)
+        alpha_max = torch.where(valid, 1.0 / denom, torch.zeros_like(denom))
+        effective_perms = torch.where(
+            valid,
+            torch.square(self.weight_sum) / self.weight_sq_sum.clamp_min(EPS),
+            torch.zeros_like(denom),
+        )
+        return {
+            "valid_any": valid,
+            "moved_mean": moved_mean,
+            "alpha_max": alpha_max,
+            "effective_perms": effective_perms,
+            "invariant": {
+                centered: self.invariant_sum[centered] / denom
+                for centered in self.centered_options
+            },
+            "follow": {
+                centered: self.follow_sum[centered] / denom
+                for centered in self.centered_options
+            },
+        }
+
+
 class MetricAccumulator:
     def __init__(self, *, write_query_scores: bool = False) -> None:
         self.write_query_scores = write_query_scores
@@ -630,7 +732,7 @@ class SpecialisationMetricEngine:
         block_membership = {
             block: block_key_membership(batch, block) for block in self.options.blocks
         }
-        field_cache: dict[tuple[int, str, str, str], dict[str, Any]] = {}
+        field_cache: dict[tuple[int, str, str, str], OnlineAlphaAccumulator] = {}
         output_cache: dict[tuple[int, str, str], dict[str, torch.Tensor]] = {}
 
         for _perm_idx in range(self.options.num_permutations):
@@ -740,7 +842,7 @@ class SpecialisationMetricEngine:
 
     def _append_field_cache(
         self,
-        cache: dict[tuple[int, str, str, str], dict[str, Any]],
+        cache: dict[tuple[int, str, str, str], OnlineAlphaAccumulator],
         clean: LayerFields,
         variant: LayerFields,
         perm_pos: torch.Tensor,
@@ -779,54 +881,48 @@ class SpecialisationMetricEngine:
         )
         item = cache.setdefault(
             (clean.layer, block, intervention, field_name),
-            {
-                "moved": [],
-                "valid_alpha": [],
-                "valid_score": [],
-                "invariant": {centered: [] for centered in self.options.centered},
-                "follow": {centered: [] for centered in self.options.centered},
-            },
+            OnlineAlphaAccumulator(self.options.centered),
         )
-        item["moved"].append(moved.detach())
-        item["valid_alpha"].append((valid_alpha & query_valid).detach())
-        item["valid_score"].append(valid_score.detach())
+        invariant_scores = {}
+        follow_scores = {}
         for centered in self.options.centered:
-            item["invariant"][centered].append(
-                cosine_by_query(variant_field, clean_field, stable_mask, centered=centered).detach()
+            invariant_scores[centered] = cosine_by_query(
+                variant_field,
+                clean_field,
+                stable_mask,
+                centered=centered,
             )
-            item["follow"][centered].append(
-                cosine_by_query(variant_field, ref, follow_mask, centered=centered).detach()
+            follow_scores[centered] = cosine_by_query(
+                variant_field,
+                ref,
+                follow_mask,
+                centered=centered,
             )
+        item.update(
+            moved,
+            valid_alpha & query_valid,
+            valid_score,
+            invariant_scores,
+            follow_scores,
+            self.options.alpha_tau,
+        )
 
     def _finalize_field_cache(
         self,
-        cache: Mapping[tuple[int, str, str, str], Mapping[str, Any]],
+        cache: Mapping[tuple[int, str, str, str], OnlineAlphaAccumulator],
         graph_indices: Sequence[int],
     ) -> None:
         for (layer, block, intervention, field_name), item in cache.items():
-            moved_stack = torch.stack(list(item["moved"]), dim=0)
-            valid_alpha = torch.stack(list(item["valid_alpha"]), dim=0)
-            valid_any = torch.stack(list(item["valid_score"]), dim=0).any(dim=0)
-            alpha = masked_softmax_permutation_weights(
-                moved_stack,
-                valid_alpha,
-                self.options.alpha_tau,
-            )
-            alpha_max = alpha.max(dim=0).values
-            effective_perms = 1.0 / torch.square(alpha).sum(dim=0).clamp_min(EPS)
-            moved_mean = masked_mean(moved_stack, valid_alpha, dim=0)
+            final = item.finalize()
+            valid_any = final["valid_any"]
             extra = {
-                "moved_mass_mean": masked_mean(moved_mean, valid_any, dim=2),
-                "alpha_max_mean": masked_mean(alpha_max, valid_any, dim=2),
-                "effective_perms_mean": masked_mean(effective_perms, valid_any, dim=2),
+                "moved_mass_mean": masked_mean(final["moved_mean"], valid_any, dim=2),
+                "alpha_max_mean": masked_mean(final["alpha_max"], valid_any, dim=2),
+                "effective_perms_mean": masked_mean(final["effective_perms"], valid_any, dim=2),
             }
             for centered in self.options.centered:
-                invariant = (
-                    alpha * torch.stack(list(item["invariant"][centered]), dim=0)
-                ).sum(dim=0)
-                follow = (alpha * torch.stack(list(item["follow"][centered]), dim=0)).sum(dim=0)
                 self.acc.add_query_scores(
-                    invariant,
+                    final["invariant"][centered],
                     valid_any,
                     graph_indices=graph_indices,
                     layer=layer,
@@ -839,7 +935,7 @@ class SpecialisationMetricEngine:
                     extra=extra,
                 )
                 self.acc.add_query_scores(
-                    follow,
+                    final["follow"][centered],
                     valid_any,
                     graph_indices=graph_indices,
                     layer=layer,
