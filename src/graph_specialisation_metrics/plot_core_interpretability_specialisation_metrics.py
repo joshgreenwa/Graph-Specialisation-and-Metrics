@@ -446,6 +446,78 @@ def plot_convergence(
     save_figure(fig, out_dir, "appendix_metric_convergence")
 
 
+def parse_label_dirs(items: Sequence[str]) -> list[tuple[str, Path]]:
+    parsed = []
+    for item in items:
+        if "=" in item:
+            label, path = item.split("=", 1)
+        else:
+            path = item
+            label = Path(path).name
+        parsed.append((label, Path(path)))
+    return parsed
+
+
+def plot_comparison(
+    compare_dirs: Sequence[tuple[str, Path]],
+    out_dir: Path,
+    *,
+    metric: str,
+    intervention: str,
+    block: str,
+    centered: bool,
+) -> None:
+    if not compare_dirs:
+        return
+    loaded = []
+    for label, path in compare_dirs:
+        summary, _per_graph, _meta = read_metric_dir(path)
+        frame = metric_frame(
+            summary,
+            metric=metric,
+            intervention=intervention,
+            block=block,
+            centered=centered,
+        )
+        if not frame.empty:
+            loaded.append((label, frame))
+    if not loaded:
+        return
+
+    fig, axes = plt.subplots(
+        1,
+        len(loaded),
+        figsize=(2.6 * len(loaded), 2.6),
+        squeeze=False,
+        constrained_layout=True,
+    )
+    images = []
+    for ax, (label, frame) in zip(axes.flat, loaded):
+        images.append(draw_heatmap(ax, frame, title=label))
+    if any(image is not None for image in images):
+        fig.colorbar(next(image for image in images if image is not None), ax=axes, shrink=0.8)
+    save_figure(fig, out_dir, "comparison_heatmaps")
+
+    fig, ax = plt.subplots(figsize=(5.2, 3.2))
+    for label, frame in loaded:
+        layer = frame.groupby("layer")["mean"].agg(["mean", "sem"]).reset_index()
+        ax.errorbar(
+            layer["layer"],
+            layer["mean"],
+            yerr=layer["sem"].fillna(0.0),
+            marker="o",
+            linewidth=1.2,
+            capsize=2.0,
+            label=label,
+        )
+    ax.set_xlabel("Layer")
+    ax.set_ylabel(metric.replace("_", " "))
+    ax.set_ylim(-0.04, 1.04)
+    ax.legend(frameon=False)
+    ax.set_title("Model comparison")
+    save_figure(fig, out_dir, "comparison_layer_trends")
+
+
 def import_module_from_path(path: Path, module_name: str):
     path = path.expanduser().resolve()
     spec = importlib.util.spec_from_file_location(module_name, path)
@@ -603,6 +675,14 @@ def run(args: argparse.Namespace) -> None:
         block=args.convergence_block,
         centered=args.centered,
     )
+    plot_comparison(
+        parse_label_dirs(args.compare_dirs),
+        out_dir,
+        metric=args.compare_metric,
+        intervention=args.compare_intervention,
+        block=args.compare_block,
+        centered=args.centered,
+    )
     plot_attention_examples(summary, metadata, out_dir, args)
     print(f"[done] wrote figures to {out_dir}", flush=True)
 
@@ -618,6 +698,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--convergence-metric", default="routing_follow")
     parser.add_argument("--convergence-intervention", default="content")
     parser.add_argument("--convergence-block", default="all")
+    parser.add_argument("--compare-dirs", nargs="*", default=[])
+    parser.add_argument("--compare-metric", default="routing_follow")
+    parser.add_argument("--compare-intervention", default="content")
+    parser.add_argument("--compare-block", default="all")
     parser.add_argument("--checkpoint", type=Path, default=None)
     parser.add_argument("--task", default=None)
     parser.add_argument("--model", default=None)
