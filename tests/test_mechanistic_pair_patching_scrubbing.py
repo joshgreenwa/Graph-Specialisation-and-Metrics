@@ -8,7 +8,10 @@ from graph_specialisation_metrics.mechanistic_pair_patching_scrubbing import (
     LayerActivation,
     add_control_lift,
     align_source_positions,
+    apply_analysis_preset,
     assert_nonzero_sparse_coverage,
+    build_parser,
+    estimate_intervention_forwards,
     outside_control_mask,
     safe_restoration,
     select_pairs,
@@ -189,3 +192,72 @@ def test_summary_lift_uses_matched_random_control_mean():
 
     assert operator_row["matched_random_mean"] == 0.2
     assert operator_row["control_normalised_lift"] == pytest.approx(0.4)
+
+
+def test_core_fast_preset_sets_task_aware_compact_defaults():
+    argv = [
+        "--checkpoint",
+        "ckpt.pt",
+        "--task",
+        "flow_hard",
+        "--analysis-preset",
+        "core_fast",
+    ]
+    args = build_parser().parse_args(argv)
+
+    apply_analysis_preset(args, argv)
+
+    assert args.num_pairs == 64
+    assert args.num_graphs == 768
+    assert args.patch_targets == "routing_logits,pair_value,pair_state"
+    assert args.operator_masks == "saturated_edge,min_cut_crossing_edge,shortest_st_path_edge"
+    assert args.matched_random_controls == 2
+    assert args.include_wrong_source_control is False
+
+
+def test_preset_respects_explicit_overrides():
+    argv = [
+        "--checkpoint",
+        "ckpt.pt",
+        "--task",
+        "flow_hard",
+        "--analysis-preset",
+        "core_fast",
+        "--num-pairs",
+        "12",
+        "--operator-masks",
+        "saturated_edge",
+    ]
+    args = build_parser().parse_args(argv)
+
+    apply_analysis_preset(args, argv)
+
+    assert args.num_pairs == 12
+    assert args.operator_masks == "saturated_edge"
+    assert args.patch_targets == "routing_logits,pair_value,pair_state"
+
+
+def test_intervention_forward_estimate_scales_with_heads_only_in_per_head_mode():
+    layer_level = estimate_intervention_forwards(
+        pairs=10,
+        layers=3,
+        heads=8,
+        head_mode="layer",
+        targets=3,
+        operators=3,
+        controls_per_operator=3,
+        experiments=2,
+    )
+    per_head = estimate_intervention_forwards(
+        pairs=10,
+        layers=3,
+        heads=8,
+        head_mode="per_head",
+        targets=3,
+        operators=3,
+        controls_per_operator=3,
+        experiments=2,
+    )
+
+    assert layer_level == 1620
+    assert per_head == 8 * layer_level

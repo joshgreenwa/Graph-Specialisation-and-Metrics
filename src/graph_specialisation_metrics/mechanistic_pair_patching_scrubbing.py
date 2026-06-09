@@ -13,6 +13,7 @@ import json
 import math
 import random
 import subprocess
+import sys
 import time
 from collections import defaultdict
 from contextlib import nullcontext
@@ -29,6 +30,19 @@ from graph_specialisation_metrics import mechanistic_operator_analysis as moa
 EPS = 1.0e-12
 PATCH_TARGETS = ("routing_logits", "attention", "pair_value", "pair_state", "head_output")
 EXPERIMENTS = ("pair_patching", "pair_scrubbing")
+ANALYSIS_PRESETS = ("custom", "pilot", "core_fast")
+FLOW_CORE_OPERATORS = (
+    "saturated_edge",
+    "min_cut_crossing_edge",
+    "shortest_st_path_edge",
+)
+BIPARTITE_CORE_OPERATORS = (
+    "optimum_matching_edge",
+    "alternating_forest_edge",
+    "unmatched_feasible_edge",
+)
+CORE_PATCH_TARGETS = ("routing_logits", "pair_value", "pair_state")
+PILOT_PATCH_TARGETS = ("pair_value", "pair_state")
 
 
 @dataclass(frozen=True)
@@ -109,6 +123,74 @@ def parse_csv(raw: str, *, all_values: Sequence[str]) -> tuple[str, ...]:
     if unknown:
         raise ValueError(f"unknown values {unknown}; expected {list(all_values)} or all")
     return values
+
+
+def cli_supplied(argv: Sequence[str], *names: str) -> bool:
+    return any(item == name or item.startswith(f"{name}=") for item in argv for name in names)
+
+
+def task_core_operators(task: str) -> str:
+    if "flow" in task:
+        return ",".join(FLOW_CORE_OPERATORS)
+    if "bipartite" in task or "matching" in task:
+        return ",".join(BIPARTITE_CORE_OPERATORS)
+    return "directed_edge,global_nonedge"
+
+
+def apply_analysis_preset(args: argparse.Namespace, argv: Sequence[str]) -> None:
+    preset = getattr(args, "analysis_preset", "custom")
+    if preset == "custom":
+        return
+    if preset == "pilot":
+        defaults = {
+            "experiments": "pair_patching",
+            "num_graphs": 384,
+            "num_pairs": 24,
+            "patch_targets": ",".join(PILOT_PATCH_TARGETS),
+            "operator_masks": task_core_operators(args.task),
+            "matched_random_controls": 1,
+            "include_outside_operator_control": False,
+            "include_wrong_operator_control": False,
+            "include_wrong_source_control": False,
+        }
+    elif preset == "core_fast":
+        defaults = {
+            "experiments": "pair_patching,pair_scrubbing",
+            "num_graphs": 768,
+            "num_pairs": 64,
+            "patch_targets": ",".join(CORE_PATCH_TARGETS),
+            "operator_masks": task_core_operators(args.task),
+            "matched_random_controls": 2,
+            "include_outside_operator_control": False,
+            "include_wrong_operator_control": False,
+            "include_wrong_source_control": False,
+        }
+    else:
+        raise ValueError(f"unknown analysis preset {preset!r}")
+
+    flag_by_dest = {
+        "experiments": ("--experiments",),
+        "num_graphs": ("--num-graphs",),
+        "num_pairs": ("--num-pairs",),
+        "patch_targets": ("--patch-targets",),
+        "operator_masks": ("--operator-masks",),
+        "matched_random_controls": ("--matched-random-controls",),
+        "include_outside_operator_control": (
+            "--include-outside-operator-control",
+            "--no-include-outside-operator-control",
+        ),
+        "include_wrong_operator_control": (
+            "--include-wrong-operator-control",
+            "--no-include-wrong-operator-control",
+        ),
+        "include_wrong_source_control": (
+            "--include-wrong-source-control",
+            "--no-include-wrong-source-control",
+        ),
+    }
+    for dest, value in defaults.items():
+        if not cli_supplied(argv, *flag_by_dest[dest]):
+            setattr(args, dest, value)
 
 
 def jsonable(value: Any) -> Any:
@@ -894,6 +976,37 @@ def layer_head_items(records: Mapping[int, LayerActivation], head_mode: str) -> 
     return items
 
 
+def estimated_controls_per_operator(args: argparse.Namespace) -> int:
+    count = 1 + max(0, int(args.matched_random_controls))
+    count += int(bool(args.include_outside_operator_control))
+    count += int(bool(args.include_wrong_operator_control))
+    count += int(bool(args.include_wrong_source_control))
+    return count
+
+
+def estimate_intervention_forwards(
+    *,
+    pairs: int,
+    layers: int,
+    heads: int,
+    head_mode: str,
+    targets: int,
+    operators: int,
+    controls_per_operator: int,
+    experiments: int,
+) -> int:
+    head_factor = int(heads) if head_mode == "per_head" else 1
+    return (
+        int(pairs)
+        * int(layers)
+        * head_factor
+        * int(targets)
+        * int(operators)
+        * int(controls_per_operator)
+        * int(experiments)
+    )
+
+
 def append_patch_rows(
     args: argparse.Namespace,
     loaded: moa.LoadedExperiment,
@@ -1233,6 +1346,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise RuntimeError("paired patching/scrubbing currently supports --model-backend official only")
     if args.model not in {"grit", "static_grit"}:
         raise RuntimeError("paired patching/scrubbing currently supports --model grit or --model static_grit only")
+    if args.analysis_preset not in ANALYSIS_PRESETS:
+        raise RuntimeError(f"unknown --analysis-preset {args.analysis_preset!r}")
     parse_csv(args.experiments, all_values=EXPERIMENTS)
     parse_csv(args.patch_targets, all_values=PATCH_TARGETS)
     if args.autocast_dtype != "none" and not args.allow_autocast_for_interventions:
@@ -1263,6 +1378,45 @@ def run(args: argparse.Namespace) -> None:
     moa.write_csv(out_dir / "paired_graphs.csv", pair_rows(pairs))
 
     experiments = set(parse_csv(args.experiments, all_values=EXPERIMENTS))
+    first_batch = single_graph_batch(loaded, pairs[0].clean_position)
+    _first_pred, first_records = capture_prediction(args, loaded, first_batch)
+    first_masks = moa.make_operator_masks(args.task, first_batch, random_controls=False, seed=args.random_seed)
+    requested_operators = primary_operator_names(first_masks, args.operator_masks)
+    nonempty_first_operators = [
+        name for name in requested_operators if bool((first_masks[name] > 0).any())
+    ]
+    if not nonempty_first_operators:
+        raise RuntimeError(f"no nonempty operator masks matched --operator-masks {args.operator_masks!r}")
+    first_layer = next(iter(first_records.values()))
+    planned_forwards = estimate_intervention_forwards(
+        pairs=len(pairs),
+        layers=len(first_records),
+        heads=first_layer.heads,
+        head_mode=args.head_mode,
+        targets=len(parse_csv(args.patch_targets, all_values=PATCH_TARGETS)),
+        operators=len(requested_operators),
+        controls_per_operator=estimated_controls_per_operator(args),
+        experiments=len(experiments),
+    )
+    print(
+        "[plan] "
+        f"preset={args.analysis_preset} pairs={len(pairs)} layers={len(first_records)} "
+        f"heads={first_layer.heads} head_mode={args.head_mode} "
+        f"targets={args.patch_targets} operators={','.join(requested_operators)} "
+        f"nonempty_first_graph={','.join(nonempty_first_operators)} "
+        f"controls_per_operator<={estimated_controls_per_operator(args)} "
+        f"intervention_forwards<={planned_forwards}",
+        flush=True,
+    )
+    if planned_forwards > args.max_interventions and not args.allow_large_sweep:
+        raise RuntimeError(
+            f"planned intervention forwards ({planned_forwards}) exceed --max-interventions "
+            f"({args.max_interventions}). Use --analysis-preset pilot/core_fast, reduce "
+            "--num-pairs/--matched-random-controls/targets/operators, or pass "
+            "--allow-large-sweep deliberately."
+        )
+    del first_batch, _first_pred, first_records, first_masks
+
     patch_rows: list[dict[str, Any]] = []
     scrub_rows: list[dict[str, Any]] = []
     for pair_idx, pair in enumerate(pairs):
@@ -1397,6 +1551,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--num-pairs", type=int, default=128)
     parser.add_argument(
+        "--analysis-preset",
+        default="custom",
+        choices=ANALYSIS_PRESETS,
+        help=(
+            "custom preserves explicit flags; pilot is a very small patching-only "
+            "proof-of-life run; core_fast tests the core patching+scrubbing hypotheses "
+            "with task-aware operators, three patch targets, and matched-random controls."
+        ),
+    )
+    parser.add_argument(
         "--pair-batch-size",
         type=int,
         default=1,
@@ -1417,6 +1581,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-target-delta", type=float, default=None)
     parser.add_argument("--adaptive-delta-quantile", type=float, default=0.25)
     parser.add_argument("--min-restoration-denominator", type=float, default=1.0e-6)
+    parser.add_argument(
+        "--max-interventions",
+        type=int,
+        default=50_000,
+        help="Fail before the expensive loop if the planned intervention forward count exceeds this cap.",
+    )
+    parser.add_argument(
+        "--allow-large-sweep",
+        action="store_true",
+        help="Allow runs above --max-interventions. Use only for deliberate exhaustive sweeps.",
+    )
     parser.add_argument("--head-mode", choices=("layer", "per_head"), default="layer")
     parser.add_argument("--include-outside-operator-control", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--include-wrong-operator-control", action=argparse.BooleanOptionalAction, default=True)
@@ -1432,6 +1607,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
+    apply_analysis_preset(args, sys.argv[1:])
     if args.pair_batch_size != 1:
         print("[warn] --pair-batch-size is currently reserved; processing pairs sequentially", flush=True)
     run(args)
