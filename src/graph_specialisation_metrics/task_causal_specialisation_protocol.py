@@ -2911,7 +2911,7 @@ def build_parser() -> argparse.ArgumentParser:
         num_graphs=64,
         batch_size=16,
         analysis_cache_batch_size=16,
-        autocast_dtype="bfloat16",
+        autocast_dtype="none",
         cache_batches="cpu",
     )
     parser.add_argument("--analysis-preset", default="lightweight", choices=ANALYSIS_PRESETS)
@@ -2953,8 +2953,20 @@ def validate_args(args: argparse.Namespace) -> None:
         raise RuntimeError("--selection-fraction must lie strictly between 0 and 1")
 
 
+def enforce_grit_precision(args: argparse.Namespace) -> None:
+    requested = str(getattr(args, "autocast_dtype", "none") or "none").lower()
+    if requested not in {"", "none", "false", "off"}:
+        print(
+            "[precision] official GRIT uses torch_scatter paths that require matching "
+            f"accumulator/message dtypes; disabling autocast requested as {requested!r}.",
+            flush=True,
+        )
+        args.autocast_dtype = "none"
+
+
 def run(args: argparse.Namespace) -> None:
     validate_args(args)
+    enforce_grit_precision(args)
     start = time.time()
     stages = parse_csv(args.stages, all_values=STAGES)
     if args.stages == "all":
