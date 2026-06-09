@@ -45,6 +45,7 @@ from typing import Any, Iterable, Mapping, Optional, Sequence
 os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 
 import matplotlib.pyplot as plt
+from matplotlib.backends.backend_pdf import PdfPages
 import numpy as np
 import torch
 import torch.nn as nn
@@ -2531,26 +2532,246 @@ def plot_counterfactual_summary(cfg: Mapping[str, Any]) -> None:
     plt.close(fig)
 
 
+def specialisation_centered_key(row: Mapping[str, Any]) -> str:
+    value = str(row.get("centered", "")).strip().lower()
+    if value in {"true", "1", "yes"}:
+        return "centered"
+    if value in {"false", "0", "no"}:
+        return "uncentered"
+    return "none"
+
+
+def specialisation_task(row: Mapping[str, Any], cfg: Mapping[str, Any]) -> str:
+    return str(row.get("task") or cfg.get("task") or "")
+
+
+def specialisation_score_index(
+    rows: Sequence[Mapping[str, Any]],
+    cfg: Mapping[str, Any],
+) -> dict[tuple[str, str, str, str, str, int, int], dict[str, float]]:
+    index: dict[tuple[str, str, str, str, str, int, int], dict[str, float]] = defaultdict(dict)
+    for row in rows:
+        metric = str(row.get("metric", ""))
+        if metric not in {"routing_follow", "routing_invariant", "transport_follow", "transport_invariant"}:
+            continue
+        try:
+            layer = int(row["layer"])
+            head = int(row["head"])
+            value = metric_value(row)
+        except Exception:
+            continue
+        if not math.isfinite(value):
+            continue
+        key = (
+            specialisation_task(row, cfg),
+            str(row.get("field", "")),
+            str(row.get("intervention", "")),
+            str(row.get("block", "")),
+            specialisation_centered_key(row),
+            layer,
+            head,
+        )
+        index[key][metric] = value
+    return index
+
+
+def specialisation_grid(
+    index: Mapping[tuple[str, str, str, str, str, int, int], Mapping[str, float]],
+    *,
+    task: str,
+    field: str,
+    intervention: str,
+    centered: str,
+    layers: Sequence[int],
+    heads: Sequence[int],
+    metric: str,
+    block: str = "all",
+    subtract_metric: Optional[str] = None,
+) -> np.ndarray:
+    grid = np.full((len(layers), len(heads)), np.nan, dtype=float)
+    for layer_idx, layer in enumerate(layers):
+        for head_idx, head in enumerate(heads):
+            values = index.get((task, field, intervention, block, centered, layer, head), {})
+            value = values.get(metric, float("nan"))
+            if subtract_metric is not None and math.isfinite(value):
+                value = value - values.get(subtract_metric, float("nan"))
+            grid[layer_idx, head_idx] = value
+    return grid
+
+
+def annotate_specialisation_heatmap(ax: Any, values: np.ndarray) -> None:
+    if values.size > 96:
+        return
+    for layer_idx in range(values.shape[0]):
+        for head_idx in range(values.shape[1]):
+            value = values[layer_idx, head_idx]
+            if math.isfinite(float(value)):
+                ax.text(head_idx, layer_idx, f"{value:.2f}", ha="center", va="center", fontsize=7)
+
+
+def plot_specialisation_heatmap_page(
+    pdf: PdfPages,
+    index: Mapping[tuple[str, str, str, str, str, int, int], Mapping[str, float]],
+    *,
+    task: str,
+    centered: str,
+    layers: Sequence[int],
+    heads: Sequence[int],
+    mode: str,
+) -> None:
+    combos = (
+        ("routing", "content"),
+        ("routing", "structure"),
+        ("transport", "content"),
+        ("transport", "structure"),
+    )
+    fig, axes = plt.subplots(2, 2, figsize=(11.5, 7.2), sharex=True, sharey=True)
+    fig.suptitle(f"{task}: {centered} specialisation {mode}", fontsize=13)
+    cmap_name = "viridis" if mode == "follow scores" else "coolwarm"
+    for ax, (field, intervention) in zip(axes.reshape(-1), combos):
+        metric = f"{field}_follow"
+        subtract = None if mode == "follow scores" else f"{field}_invariant"
+        values = specialisation_grid(
+            index,
+            task=task,
+            field=field,
+            intervention=intervention,
+            centered=centered,
+            layers=layers,
+            heads=heads,
+            metric=metric,
+            subtract_metric=subtract,
+        )
+        masked = np.ma.masked_invalid(values)
+        if mode == "follow scores":
+            vmin, vmax = 0.0, 1.0
+        else:
+            vmax = max(0.2, float(np.nanmax(np.abs(values))) if np.isfinite(values).any() else 0.2)
+            vmin = -vmax
+        cmap = plt.get_cmap(cmap_name).copy()
+        cmap.set_bad("#eeeeee")
+        im = ax.imshow(masked, aspect="auto", cmap=cmap, vmin=vmin, vmax=vmax)
+        annotate_specialisation_heatmap(ax, values)
+        ax.set_title(f"{field} / {intervention}", fontsize=10)
+        ax.set_xticks(np.arange(len(heads)))
+        ax.set_xticklabels([str(head) for head in heads], fontsize=8)
+        ax.set_yticks(np.arange(len(layers)))
+        ax.set_yticklabels([str(layer) for layer in layers], fontsize=8)
+        ax.set_xlabel("head")
+        ax.set_ylabel("layer")
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.03)
+    fig.tight_layout(rect=(0, 0, 1, 0.95))
+    pdf.savefig(fig)
+    plt.close(fig)
+
+
+def plot_specialisation_scatter_page(
+    pdf: PdfPages,
+    index: Mapping[tuple[str, str, str, str, str, int, int], Mapping[str, float]],
+    *,
+    task: str,
+    centered: str,
+    layers: Sequence[int],
+    heads: Sequence[int],
+) -> None:
+    combos = (
+        ("routing", "content"),
+        ("routing", "structure"),
+        ("transport", "content"),
+        ("transport", "structure"),
+    )
+    fig, axes = plt.subplots(2, 2, figsize=(11.5, 7.2), sharex=True, sharey=True)
+    fig.suptitle(f"{task}: {centered} follow vs invariant", fontsize=13)
+    layer_colors = {layer: plt.get_cmap("tab10")(idx % 10) for idx, layer in enumerate(layers)}
+    for ax, (field, intervention) in zip(axes.reshape(-1), combos):
+        points = []
+        for layer in layers:
+            for head in heads:
+                values = index.get((task, field, intervention, "all", centered, layer, head), {})
+                follow = values.get(f"{field}_follow", float("nan"))
+                invariant = values.get(f"{field}_invariant", float("nan"))
+                if math.isfinite(follow) and math.isfinite(invariant):
+                    points.append((invariant, follow, layer, head, follow - invariant))
+        if points:
+            xs = [point[0] for point in points]
+            ys = [point[1] for point in points]
+            colors = [layer_colors[point[2]] for point in points]
+            ax.scatter(xs, ys, c=colors, s=48, edgecolors="black", linewidths=0.35, alpha=0.9)
+            lower = min(-0.05, min(xs), min(ys)) - 0.03
+            upper = max(1.0, max(xs), max(ys)) + 0.03
+            ax.plot([lower, upper], [lower, upper], color="black", linestyle="--", linewidth=0.8)
+            for invariant, follow, layer, head, _gap in sorted(points, key=lambda item: item[4], reverse=True)[:3]:
+                ax.annotate(
+                    f"L{layer}H{head}",
+                    (invariant, follow),
+                    textcoords="offset points",
+                    xytext=(4, 4),
+                    fontsize=8,
+                )
+            ax.set_xlim(lower, upper)
+            ax.set_ylim(lower, upper)
+        ax.set_title(f"{field} / {intervention}", fontsize=10)
+        ax.set_xlabel("invariant score")
+        ax.set_ylabel("follow score")
+        ax.grid(True, linewidth=0.4, alpha=0.35)
+    handles = [
+        plt.Line2D([0], [0], marker="o", color="w", label=f"layer {layer}", markerfacecolor=color, markeredgecolor="black", markersize=7)
+        for layer, color in layer_colors.items()
+    ]
+    if handles:
+        fig.legend(handles=handles, loc="lower center", ncol=min(len(handles), 6), frameon=False)
+    fig.tight_layout(rect=(0, 0.05, 1, 0.95))
+    pdf.savefig(fig)
+    plt.close(fig)
+
+
 def plot_specialisation_atlas(cfg: Mapping[str, Any]) -> None:
     rows = read_csv_dicts(metrics_dir(cfg) / "specialisation_scores.csv")
     if not rows:
         return
+    index = specialisation_score_index(rows, cfg)
+    if not index:
+        return
     out = figures_main_dir(cfg) / "fig2_specialisation_atlas.pdf"
     out.parent.mkdir(parents=True, exist_ok=True)
-    fig, ax = plt.subplots(figsize=(8, 4))
-    plot_rows = [row for row in rows if row.get("metric") in {"routing_follow", "transport_follow"} and row.get("block") == "all"]
-    if not plot_rows:
-        plt.close(fig)
-        return
-    labels = [f"{row.get('task')}\nL{row.get('layer')}H{row.get('head')}\n{row.get('metric')}" for row in plot_rows[:40]]
-    values = [float(row.get("mean", row.get("value", 0.0)) or 0.0) for row in plot_rows[:40]]
-    ax.bar(np.arange(len(values)), values, color="#805ad5")
-    ax.set_xticks(np.arange(len(values)))
-    ax.set_xticklabels(labels, rotation=90, fontsize=6)
-    ax.set_ylabel("specialisation score")
-    fig.tight_layout()
-    fig.savefig(out)
-    plt.close(fig)
+    tasks = sorted({key[0] for key in index if key[0]})
+    centered_values = [value for value in ("uncentered", "centered") if any(key[4] == value for key in index)]
+    with PdfPages(out) as pdf:
+        for task in tasks:
+            task_keys = [key for key in index if key[0] == task]
+            layers = sorted({key[5] for key in task_keys})
+            heads = sorted({key[6] for key in task_keys})
+            if not layers or not heads:
+                continue
+            for centered in centered_values:
+                if not any(key[0] == task and key[4] == centered for key in index):
+                    continue
+                plot_specialisation_heatmap_page(
+                    pdf,
+                    index,
+                    task=task,
+                    centered=centered,
+                    layers=layers,
+                    heads=heads,
+                    mode="follow scores",
+                )
+                plot_specialisation_heatmap_page(
+                    pdf,
+                    index,
+                    task=task,
+                    centered=centered,
+                    layers=layers,
+                    heads=heads,
+                    mode="follow - invariant",
+                )
+                plot_specialisation_scatter_page(
+                    pdf,
+                    index,
+                    task=task,
+                    centered=centered,
+                    layers=layers,
+                    heads=heads,
+                )
 
 
 def plot_patching_summaries(cfg: Mapping[str, Any]) -> None:
@@ -2684,6 +2905,9 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--backend", choices=("official", "local"))
     p.add_argument("--checkpoint", type=Path)
 
+    p = sub.add_parser("plot-specialisation")
+    common(p)
+
     p = sub.add_parser("run-patching")
     common(p)
     p.add_argument("--device", default="auto")
@@ -2721,6 +2945,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         evaluate_counterfactuals(cfg, task, device_name=args.device, checkpoint=args.checkpoint, backend=args.backend)
     elif args.command == "run-specialisation":
         run_specialisation(cfg, task, device_name=args.device, checkpoint=args.checkpoint, backend=args.backend)
+    elif args.command == "plot-specialisation":
+        plot_specialisation_atlas(cfg)
     elif args.command == "run-patching":
         run_patching(cfg, task, device_name=args.device, checkpoint=args.checkpoint, backend=args.backend)
     elif args.command == "run-sequence":
