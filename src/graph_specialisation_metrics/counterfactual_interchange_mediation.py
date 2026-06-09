@@ -2806,6 +2806,27 @@ def is_true_csv(value: Any) -> bool:
     return str(value).strip().lower() in {"true", "1", "yes"}
 
 
+def is_ranked_top_group(value: Any) -> bool:
+    text = str(value).strip()
+    if not text.startswith("top"):
+        return False
+    try:
+        int(text[3:])
+    except Exception:
+        return False
+    return True
+
+
+def ranked_top_group_size(value: Any) -> int:
+    text = str(value).strip()
+    if not text.startswith("top"):
+        return 1
+    try:
+        return int(text[3:])
+    except Exception:
+        return 1
+
+
 def finite_metric_values(rows: Sequence[Mapping[str, Any]], metric: str) -> list[float]:
     values = []
     for row in rows:
@@ -2912,8 +2933,6 @@ def plot_cumulative_head_recovery(cfg: Mapping[str, Any], rows: Sequence[Mapping
 
 def plot_routing_transport_specificity(cfg: Mapping[str, Any], rows: Sequence[Mapping[str, Any]]) -> None:
     tasks = patch_plot_tasks(rows)
-    if not tasks:
-        return
     out = figures_main_dir(cfg) / "fig5_routing_transport_specificity.pdf"
     out.parent.mkdir(parents=True, exist_ok=True)
     family_palette = {
@@ -2926,17 +2945,44 @@ def plot_routing_transport_specificity(cfg: Mapping[str, Any], rows: Sequence[Ma
         "resid_contribution": "^",
         "pair_state": "D",
     }
+    pages_written = 0
     with PdfPages(out) as pdf:
+        if not tasks:
+            fig, ax = plt.subplots(figsize=(7, 3.8))
+            ax.axis("off")
+            ax.text(0.5, 0.55, "No patch rows found in patch_group_metrics.csv", ha="center", va="center", fontsize=12)
+            ax.text(0.5, 0.42, str(metrics_dir(cfg) / "patch_group_metrics.csv"), ha="center", va="center", fontsize=8)
+            pdf.savefig(fig)
+            plt.close(fig)
+            pages_written += 1
         for task in tasks:
             plot_rows = [
                 row
                 for row in rows
                 if row.get("task") == task
                 and row.get("effect_bin") == "high"
-                and str(row.get("group_name")) in {"top1", "top2", "top4"}
+                and is_ranked_top_group(row.get("group_name"))
                 and not is_true_csv(row.get("is_control", ""))
             ]
             if not plot_rows:
+                fig, ax = plt.subplots(figsize=(7, 3.8))
+                ax.axis("off")
+                group_counts: dict[str, int] = defaultdict(int)
+                control_counts: dict[str, int] = defaultdict(int)
+                for row in rows:
+                    if row.get("task") != task or row.get("effect_bin") != "high":
+                        continue
+                    group_counts[str(row.get("group_name", ""))] += 1
+                    control_counts[str(row.get("is_control", ""))] += 1
+                groups = ", ".join(f"{name}:{count}" for name, count in sorted(group_counts.items())[:12])
+                controls = ", ".join(f"{name}:{count}" for name, count in sorted(control_counts.items()))
+                ax.text(0.5, 0.68, f"{task}: no non-control top-k rows for fig5", ha="center", va="center", fontsize=12)
+                ax.text(0.5, 0.50, f"group_name counts: {groups or 'none'}", ha="center", va="center", fontsize=8)
+                ax.text(0.5, 0.39, f"is_control counts: {controls or 'none'}", ha="center", va="center", fontsize=8)
+                ax.text(0.5, 0.25, "Expected group_name values like top1, top2, top4 with is_control=False.", ha="center", va="center", fontsize=8)
+                pdf.savefig(fig)
+                plt.close(fig)
+                pages_written += 1
                 continue
             fig, axes = plt.subplots(1, 2, figsize=(11.5, 4.8))
             fig.suptitle(f"{task}: matched pathway specificity", fontsize=13)
@@ -2964,7 +3010,7 @@ def plot_routing_transport_specificity(cfg: Mapping[str, Any], rows: Sequence[Ma
                         family = str(row.get("family", ""))
                         component = str(row.get("component", ""))
                         group_name = str(row.get("group_name", ""))
-                        size = int(group_name.replace("top", "") or 1) if group_name.startswith("top") else 1
+                        size = ranked_top_group_size(group_name)
                         ax.scatter(
                             wrong,
                             matched,
@@ -3004,6 +3050,8 @@ def plot_routing_transport_specificity(cfg: Mapping[str, Any], rows: Sequence[Ma
             fig.tight_layout(rect=(0, 0.12, 1, 0.92))
             pdf.savefig(fig)
             plt.close(fig)
+            pages_written += 1
+    print(f"[plot-patching] wrote {out} pages={pages_written}", flush=True)
 
 
 def run_sequence(
