@@ -30,7 +30,7 @@ from graph_specialisation_metrics import mechanistic_operator_analysis as moa
 EPS = 1.0e-12
 PATCH_TARGETS = ("routing_logits", "attention", "pair_value", "pair_state", "head_output")
 EXPERIMENTS = ("pair_patching", "pair_scrubbing")
-ANALYSIS_PRESETS = ("custom", "pilot", "core_fast", "confirmatory_1h")
+ANALYSIS_PRESETS = ("custom", "pilot", "core_fast", "confirmatory_1h", "h2_validation")
 FLOW_CORE_OPERATORS = (
     "saturated_edge",
     "min_cut_crossing_edge",
@@ -43,6 +43,8 @@ BIPARTITE_CORE_OPERATORS = (
 )
 CORE_PATCH_TARGETS = ("routing_logits", "pair_value", "pair_state")
 PILOT_PATCH_TARGETS = ("pair_value", "pair_state")
+H2_FLOW_OPERATORS = ("saturated_edge", "min_cut_crossing_edge")
+H2_BIPARTITE_OPERATORS = ("optimum_matching_edge", "alternating_forest_edge")
 
 
 @dataclass(frozen=True)
@@ -137,6 +139,14 @@ def task_core_operators(task: str) -> str:
     return "directed_edge,global_nonedge"
 
 
+def task_h2_operators(task: str) -> str:
+    if "flow" in task:
+        return ",".join(H2_FLOW_OPERATORS)
+    if "bipartite" in task or "matching" in task:
+        return ",".join(H2_BIPARTITE_OPERATORS)
+    return task_core_operators(task)
+
+
 def apply_analysis_preset(args: argparse.Namespace, argv: Sequence[str]) -> None:
     preset = getattr(args, "analysis_preset", "custom")
     if preset == "custom":
@@ -172,6 +182,18 @@ def apply_analysis_preset(args: argparse.Namespace, argv: Sequence[str]) -> None
             "num_pairs": 128,
             "patch_targets": ",".join(CORE_PATCH_TARGETS),
             "operator_masks": task_core_operators(args.task),
+            "matched_random_controls": 4,
+            "include_outside_operator_control": False,
+            "include_wrong_operator_control": False,
+            "include_wrong_source_control": False,
+        }
+    elif preset == "h2_validation":
+        defaults = {
+            "experiments": "pair_scrubbing",
+            "num_graphs": 2048,
+            "num_pairs": 256,
+            "patch_targets": "pair_value,pair_state",
+            "operator_masks": task_h2_operators(args.task),
             "matched_random_controls": 4,
             "include_outside_operator_control": False,
             "include_wrong_operator_control": False,
@@ -1326,13 +1348,27 @@ def hypothesis_operator_groups(task: str) -> dict[str, tuple[str, ...]]:
     return {"core": core}
 
 
+def requested_hypothesis_operators(args: argparse.Namespace) -> tuple[str, ...]:
+    if args.operator_masks == "all":
+        return tuple(task_core_operators(args.task).split(","))
+    return tuple(item.strip() for item in str(args.operator_masks).split(",") if item.strip())
+
+
+def keep_requested(values: Sequence[str], requested: Sequence[str]) -> tuple[str, ...]:
+    requested_set = set(requested)
+    return tuple(value for value in values if value in requested_set)
+
+
 def make_hypothesis_outputs(
     args: argparse.Namespace,
     patch_rows: Sequence[Mapping[str, Any]],
     scrub_rows: Sequence[Mapping[str, Any]],
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     groups = hypothesis_operator_groups(args.task)
-    core = groups["core"]
+    requested_operators = requested_hypothesis_operators(args)
+    core = keep_requested(groups["core"], requested_operators)
+    if not core:
+        core = requested_operators
     requested_targets = set(parse_csv(args.patch_targets, all_values=PATCH_TARGETS))
     content_targets = tuple(target for target in ("pair_value", "pair_state") if target in requested_targets)
     routing_targets = tuple(target for target in ("routing_logits",) if target in requested_targets)
@@ -1499,6 +1535,12 @@ def make_hypothesis_outputs(
             )
         )
     if "flow" in args.task and content_targets:
+        bottleneck = keep_requested(groups["bottleneck"], requested_operators)
+        path = keep_requested(groups["path"], requested_operators)
+    else:
+        bottleneck = ()
+        path = ()
+    if "flow" in args.task and content_targets and bottleneck and path:
         hypotheses.append(
             add_difference_hypothesis(
                 hypothesis_id="H5_patch_bottleneck_exceeds_path",
@@ -1506,9 +1548,9 @@ def make_hypothesis_outputs(
                 rows=patch_rows,
                 metric="restoration",
                 target_field="patch_target",
-                positive_operators=groups["bottleneck"],
+                positive_operators=bottleneck,
                 positive_targets=content_targets,
-                negative_operators=groups["path"],
+                negative_operators=path,
                 negative_targets=content_targets,
                 seed_offset=509,
             )
@@ -2008,7 +2050,8 @@ def build_parser() -> argparse.ArgumentParser:
             "proof-of-life run; core_fast tests the core patching+scrubbing hypotheses "
             "with task-aware operators, three patch targets, and matched-random controls; "
             "confirmatory_1h roughly triples core_fast evidence while staying under the "
-            "default intervention cap."
+            "default intervention cap; h2_validation runs only the scrub-necessity test "
+            "on content fields and causal bottleneck operators."
         ),
     )
     parser.add_argument(

@@ -2150,6 +2150,361 @@ def add_control_gain(
     return summary
 
 
+def site_key_from_values(site_family: Any, patch_target: Any, layer: Any, head: Any) -> tuple[str, str, int, int]:
+    return (str(site_family), str(patch_target), csv_int(layer, -1), csv_int(head, -1))
+
+
+def site_key(row: Mapping[str, Any]) -> tuple[str, str, int, int]:
+    return site_key_from_values(
+        row.get("site_family"),
+        row.get("patch_target", PATCH_TARGET_BY_SITE.get(str(row.get("site_family")), "")),
+        row.get("layer"),
+        row.get("head"),
+    )
+
+
+def graph_lift_at_k(labels: Sequence[int], scores: Sequence[float]) -> float:
+    pairs = [(int(y), float(s)) for y, s in zip(labels, scores) if math.isfinite(float(s))]
+    positives = sum(y for y, _score in pairs)
+    if positives <= 0 or positives >= len(pairs):
+        return float("nan")
+    pairs.sort(key=lambda item: item[1], reverse=True)
+    precision = sum(y for y, _score in pairs[:positives]) / positives
+    base = positives / len(pairs)
+    return precision / max(EPS, base)
+
+
+def site_selection_rows(out_dir: Path) -> list[SiteSelection]:
+    path = out_dir / "site_selection.json"
+    if not path.exists():
+        return []
+    return load_site_selection(path)
+
+
+def h1_alignment_hypothesis_rows(out_dir: Path, *, seed: int, bootstrap_samples: int) -> list[dict[str, Any]]:
+    unit_path = out_dir / "sensitivity_units.csv"
+    score_path = out_dir / "clean_internal_scores.csv"
+    metric_path = out_dir / "alignment_metrics.csv"
+    if not unit_path.exists() or not score_path.exists() or not metric_path.exists():
+        return []
+
+    unit_rows = read_rows(unit_path)
+    score_rows = read_rows(score_path)
+    metric_rows = read_rows(metric_path)
+    selected_sites = site_selection_rows(out_dir)
+    if not selected_sites:
+        eval_internal = [
+            row
+            for row in metric_rows
+            if row.get("partition") == "evaluation" and row.get("scorer") == "internal"
+        ]
+        eval_internal.sort(key=lambda row: finite_float(row.get("auprc"), -1.0e9), reverse=True)
+        selected_sites = [
+            SiteSelection(
+                site_family=str(row.get("site_family")),
+                patch_target=PATCH_TARGET_BY_SITE.get(str(row.get("site_family")), ""),
+                layer=csv_int(row.get("layer"), -1),
+                head=csv_int(row.get("head"), -1),
+                selection_metric="fallback_eval_top",
+                selection_value=finite_float(row.get("auprc")),
+                baseline_value=finite_float(row.get("best_baseline_auprc")),
+                gain=finite_float(row.get("auprc_gain_vs_best_baseline")),
+            )
+            for row in eval_internal[:3]
+        ]
+
+    selection_baselines = [
+        row
+        for row in metric_rows
+        if row.get("partition") == "selection" and row.get("scorer") == "baseline"
+    ]
+    if not selection_baselines:
+        selection_baselines = [
+            row
+            for row in metric_rows
+            if row.get("partition") == "evaluation" and row.get("scorer") == "baseline"
+        ]
+    selection_baselines.sort(key=lambda row: finite_float(row.get("auprc"), -1.0e9), reverse=True)
+    baseline_family = str(selection_baselines[0].get("site_family")) if selection_baselines else "random"
+
+    unit_by_id = {str(row.get("unit_id")): row for row in unit_rows}
+    eval_units = {
+        str(row.get("unit_id")): row
+        for row in unit_rows
+        if row.get("partition") == "evaluation"
+    }
+
+    rows: list[dict[str, Any]] = []
+    for site_idx, site in enumerate(selected_sites):
+        site_scores = [
+            row
+            for row in score_rows
+            if str(row.get("site_family")) == site.site_family
+            and csv_int(row.get("layer"), -999) == site.layer
+            and csv_int(row.get("head"), -999) == site.head
+            and str(row.get("unit_id")) in eval_units
+        ]
+        by_graph: dict[str, list[tuple[int, float, float]]] = defaultdict(list)
+        for score_row in site_scores:
+            unit = unit_by_id.get(str(score_row.get("unit_id")))
+            if unit is None or unit.get("partition") != "evaluation":
+                continue
+            label = csv_int(unit.get("critical"))
+            internal_score = csv_float(score_row.get("normalised_score", score_row.get("score")), float("nan"))
+            if baseline_family == "random":
+                baseline_score = (
+                    int(hashlib.sha256(str(unit.get("unit_id")).encode("utf-8")).hexdigest()[:12], 16)
+                    / float(16**12)
+                )
+            else:
+                baseline_score = csv_float(unit.get(baseline_family), float("nan"))
+            by_graph[str(unit.get("graph_id"))].append((label, internal_score, baseline_score))
+
+        auprc_diffs: list[float] = []
+        lift_diffs: list[float] = []
+        internal_auprc: list[float] = []
+        baseline_auprc: list[float] = []
+        internal_lift: list[float] = []
+        baseline_lift: list[float] = []
+        for triples in by_graph.values():
+            labels = [label for label, _internal, _baseline in triples]
+            pos = sum(labels)
+            if pos <= 0 or pos >= len(labels):
+                continue
+            internal_scores = [score for _label, score, _baseline in triples]
+            baseline_scores = [score for _label, _internal, score in triples]
+            ap_internal = average_precision(labels, internal_scores)
+            ap_baseline = average_precision(labels, baseline_scores)
+            lift_internal = graph_lift_at_k(labels, internal_scores)
+            lift_baseline = graph_lift_at_k(labels, baseline_scores)
+            if math.isfinite(ap_internal) and math.isfinite(ap_baseline):
+                auprc_diffs.append(ap_internal - ap_baseline)
+                internal_auprc.append(ap_internal)
+                baseline_auprc.append(ap_baseline)
+            if math.isfinite(lift_internal) and math.isfinite(lift_baseline):
+                lift_diffs.append(lift_internal - lift_baseline)
+                internal_lift.append(lift_internal)
+                baseline_lift.append(lift_baseline)
+
+        auprc_lo, auprc_hi = bootstrap_ci(auprc_diffs, seed + site_idx, bootstrap_samples)
+        lift_lo, lift_hi = bootstrap_ci(lift_diffs, seed + 10_000 + site_idx, bootstrap_samples)
+        mean_diff = sum(auprc_diffs) / len(auprc_diffs) if auprc_diffs else float("nan")
+        rows.append(
+            {
+                "hypothesis": "H1",
+                "test": "alignment_beats_preselected_proxy",
+                "site_family": site.site_family,
+                "patch_target": site.patch_target,
+                "layer": site.layer,
+                "head": site.head,
+                "comparison": f"internal minus {baseline_family}",
+                "metric": "per_graph_auprc_difference",
+                "n_graphs": len(auprc_diffs),
+                "effect_mean": mean_diff,
+                "ci_low": auprc_lo,
+                "ci_high": auprc_hi,
+                "internal_mean": sum(internal_auprc) / len(internal_auprc) if internal_auprc else float("nan"),
+                "control_mean": sum(baseline_auprc) / len(baseline_auprc) if baseline_auprc else float("nan"),
+                "secondary_metric": "per_graph_lift_at_k_difference",
+                "secondary_effect_mean": sum(lift_diffs) / len(lift_diffs) if lift_diffs else float("nan"),
+                "secondary_ci_low": lift_lo,
+                "secondary_ci_high": lift_hi,
+                "secondary_internal_mean": sum(internal_lift) / len(internal_lift) if internal_lift else float("nan"),
+                "secondary_control_mean": sum(baseline_lift) / len(baseline_lift) if baseline_lift else float("nan"),
+                "model_response_pass_rate": float("nan"),
+                "support_status": "strong_support"
+                if mean_diff > 0 and auprc_lo > 0
+                else ("directional_support" if mean_diff > 0 else "not_supported"),
+                "selection_basis": site.selection_metric,
+            }
+        )
+    return rows
+
+
+def paired_source_effect_rows(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    hypothesis: str,
+    test: str,
+    metric: str,
+    seed: int,
+    bootstrap_samples: int,
+    require_model_response_pass: bool = False,
+) -> list[dict[str, Any]]:
+    by_site_group: dict[tuple[tuple[str, str, int, int], str], dict[str, list[float]]] = defaultdict(lambda: defaultdict(list))
+    group_pass: dict[str, int] = {}
+    for row in rows:
+        group = str(row.get("group_id"))
+        if not group:
+            continue
+        group_pass[group] = max(group_pass.get(group, 0), csv_int(row.get("model_response_pass")))
+        if require_model_response_pass and csv_int(row.get("model_response_pass")) <= 0:
+            continue
+        value = finite_float(row.get(metric))
+        if not math.isfinite(value):
+            continue
+        by_site_group[(site_key(row), group)][str(row.get("source_type"))].append(value)
+
+    by_site: dict[tuple[str, str, int, int], list[tuple[str, float, float]]] = defaultdict(list)
+    for (key, group), source_values in by_site_group.items():
+        causal = source_values.get("causal", [])
+        matched = source_values.get("matched_control", [])
+        if not causal or not matched:
+            continue
+        causal_mean = sum(causal) / len(causal)
+        matched_mean = sum(matched) / len(matched)
+        by_site[key].append((group, causal_mean, matched_mean))
+
+    out: list[dict[str, Any]] = []
+    for idx, (key, triples) in enumerate(sorted(by_site.items())):
+        diffs = [causal - matched for _group, causal, matched in triples]
+        mean = sum(diffs) / len(diffs)
+        lo, hi = bootstrap_ci(diffs, seed + idx, bootstrap_samples)
+        all_groups = {str(row.get("group_id")) for row in rows if site_key(row) == key and row.get("group_id")}
+        pass_rate = (
+            sum(group_pass.get(group, 0) for group in all_groups) / max(1, len(all_groups))
+            if all_groups
+            else float("nan")
+        )
+        site_family, patch_target, layer, head = key
+        status = "strong_support" if mean > 0 and lo > 0 else ("directional_support" if mean > 0 else "not_supported")
+        if require_model_response_pass and (not math.isfinite(pass_rate) or pass_rate < 0.25):
+            status = "not_supported_low_model_response"
+        out.append(
+            {
+                "hypothesis": hypothesis,
+                "test": test,
+                "site_family": site_family,
+                "patch_target": patch_target,
+                "layer": layer,
+                "head": head,
+                "comparison": "causal minus matched_control",
+                "metric": f"paired_{metric}_difference",
+                "n_groups": len(diffs),
+                "effect_mean": mean,
+                "ci_low": lo,
+                "ci_high": hi,
+                "internal_mean": sum(causal for _group, causal, _matched in triples) / len(triples),
+                "control_mean": sum(matched for _group, _causal, matched in triples) / len(triples),
+                "model_response_pass_rate": pass_rate,
+                "support_status": status,
+                "selection_basis": "preselected_site_selection_json",
+            }
+        )
+    return out
+
+
+def write_hypothesis_report(out_dir: Path, rows: Sequence[Mapping[str, Any]]) -> None:
+    grouped: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
+    for row in rows:
+        grouped[str(row.get("hypothesis"))].append(row)
+    lines = [
+        "# Hypothesis-Centred Evidence Report",
+        "",
+        "This report separates confirmatory tests from exploratory site ranking. Effects are paired where possible and bootstrapped over graphs or perturbation groups.",
+        "",
+        "| Hypothesis | Direct Test | Site | Comparison | n | Effect | 95% CI | Status |",
+        "|---|---|---|---|---:|---:|---|---|",
+    ]
+    for hypothesis in ("H1", "H2", "H3"):
+        candidates = grouped.get(hypothesis, [])
+        candidates = sorted(candidates, key=lambda row: finite_float(row.get("effect_mean"), -1.0e9), reverse=True)
+        if not candidates:
+            lines.append(f"| {hypothesis} | no completed test rows |  |  | 0 | nan | nan | not_available |")
+            continue
+        row = candidates[0]
+        site = compact_site_label(row)
+        n = row.get("n_graphs", row.get("n_groups", ""))
+        effect = finite_float(row.get("effect_mean"))
+        ci = f"[{finite_float(row.get('ci_low')):.4g}, {finite_float(row.get('ci_high')):.4g}]"
+        lines.append(
+            f"| {hypothesis} | {row.get('test')} | {site} | {row.get('comparison')} | "
+            f"{n} | {effect:.4g} | {ci} | {row.get('support_status')} |"
+        )
+    lines.extend(
+        [
+            "",
+            "Interpretation:",
+            "",
+            "- H1 tests whether a preselected internal score beats the best proxy baseline on evaluation graphs.",
+            "- H2 tests whether perturbing solver-causal units changes selected fields more than matched non-causal controls.",
+            "- H3 tests whether patching activations from causal perturbations mediates the model's own counterfactual shift more than matched controls; low model-response pass rate blocks a positive claim.",
+        ]
+    )
+    (out_dir / "hypothesis_evidence.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def plot_hypothesis_effects(out_dir: Path) -> None:
+    path = out_dir / "hypothesis_tests.csv"
+    if not path.exists() or path.stat().st_size == 0:
+        return
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import pandas as pd
+    except Exception as exc:
+        print(f"[plot] skipped hypothesis figures because plotting imports failed: {exc}", flush=True)
+        return
+    df = pd.read_csv(path)
+    if df.empty:
+        return
+    for hypothesis, title, xlabel in [
+        ("H1", "H1: internal alignment beyond proxy baseline", "AUPRC difference"),
+        ("H2", "H2: task-causal field response", "field-change difference"),
+        ("H3", "H3: activation-mediated restoration", "mediation difference"),
+    ]:
+        sub = df[df["hypothesis"].eq(hypothesis)].copy()
+        if sub.empty:
+            continue
+        sub["label"] = sub.apply(compact_site_label, axis=1)
+        ranked_barh(
+            plt,
+            sub,
+            value_col="effect_mean",
+            label_col="label",
+            title=title,
+            xlabel=xlabel,
+            path=out_dir / f"{hypothesis.lower()}_hypothesis_test.png",
+            top_n=12,
+            zero_line=True,
+        )
+
+
+def write_hypothesis_outputs(out_dir: Path, *, seed: int, bootstrap_samples: int) -> None:
+    rows: list[dict[str, Any]] = []
+    rows.extend(h1_alignment_hypothesis_rows(out_dir, seed=seed, bootstrap_samples=bootstrap_samples))
+    field_path = out_dir / "field_response.csv"
+    if field_path.exists():
+        rows.extend(
+            paired_source_effect_rows(
+                read_rows(field_path),
+                hypothesis="H2",
+                test="causal_field_change_exceeds_matched_control",
+                metric="field_change",
+                seed=seed + 20_000,
+                bootstrap_samples=bootstrap_samples,
+            )
+        )
+    patch_path = out_dir / "patching_results.csv"
+    if patch_path.exists():
+        rows.extend(
+            paired_source_effect_rows(
+                read_rows(patch_path),
+                hypothesis="H3",
+                test="causal_patch_mediates_model_counterfactual_more_than_matched_control",
+                metric="mediation",
+                seed=seed + 30_000,
+                bootstrap_samples=bootstrap_samples,
+                require_model_response_pass=True,
+            )
+        )
+    moa.write_csv(out_dir / "hypothesis_tests.csv", rows)
+    write_hypothesis_report(out_dir, rows)
+    plot_hypothesis_effects(out_dir)
+
+
 def run_figures_and_summaries(args: argparse.Namespace) -> None:
     out_dir = args.output_dir
     field_rows = read_rows(out_dir / "field_response.csv") if (out_dir / "field_response.csv").exists() else []
@@ -2173,6 +2528,7 @@ def run_figures_and_summaries(args: argparse.Namespace) -> None:
     moa.write_csv(out_dir / "field_response_summary.csv", field_summary)
     moa.write_csv(out_dir / "patching_summary.csv", patch_summary)
     write_claim_summary(out_dir, field_summary, patch_summary)
+    write_hypothesis_outputs(out_dir, seed=args.random_seed, bootstrap_samples=args.bootstrap_samples)
     plot_outputs(out_dir)
 
 
@@ -2223,6 +2579,150 @@ def write_claim_summary(
     (out_dir / "claim_summary.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+DISPLAY_SITE_FAMILY = {
+    "attention_mass": "attention mass",
+    "routing_influence": "routing",
+    "pair_value_influence": "pair value",
+    "pair_state_influence": "pair state",
+    "node_endpoint_influence": "node endpoints",
+    "mincut_crossing_e": "min-cut crossing",
+    "saturated_e": "saturated edge",
+    "capacity_solver": "capacity",
+    "source_distance_tail": "source dist",
+    "sink_distance_head": "sink dist",
+    "tail_degree_bucket": "tail degree",
+    "head_degree_bucket": "head degree",
+    "random": "random",
+}
+
+
+def display_site_family(value: Any) -> str:
+    text = str(value)
+    return DISPLAY_SITE_FAMILY.get(text, text.replace("_", " "))
+
+
+def compact_site_label(row: Mapping[str, Any]) -> str:
+    family = display_site_family(row.get("site_family", ""))
+    layer = csv_int(row.get("layer"), -1)
+    head = csv_int(row.get("head"), -1)
+    if layer < 0:
+        return family
+    label = f"{family} L{layer}"
+    if head >= 0:
+        label += f" H{head}"
+    return label
+
+
+def ranked_barh(
+    plt: Any,
+    df: Any,
+    *,
+    value_col: str,
+    label_col: str,
+    title: str,
+    xlabel: str,
+    path: Path,
+    top_n: int = 16,
+    zero_line: bool = False,
+) -> None:
+    if df.empty or value_col not in df:
+        return
+    plot_df = df.dropna(subset=[value_col]).sort_values(value_col, ascending=False).head(top_n)
+    if plot_df.empty:
+        return
+    plot_df = plot_df.sort_values(value_col, ascending=True)
+    height = max(4.0, 0.38 * len(plot_df) + 1.2)
+    fig, ax = plt.subplots(figsize=(9.5, height))
+    colors = ["#4c78a8" if value >= 0 else "#c44e52" for value in plot_df[value_col]]
+    ax.barh(plot_df[label_col], plot_df[value_col], color=colors)
+    if zero_line:
+        ax.axvline(0.0, color="black", linewidth=0.8)
+    ax.set_xlabel(xlabel)
+    ax.set_title(title)
+    ax.grid(axis="x", alpha=0.25, linewidth=0.7)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    fig.tight_layout()
+    fig.savefig(path, dpi=240)
+    plt.close(fig)
+
+
+def control_comparison_plot(
+    plt: Any,
+    df: Any,
+    *,
+    value_col: str,
+    rank_col: Optional[str] = None,
+    title: str,
+    ylabel: str,
+    path: Path,
+    top_n: int = 5,
+) -> None:
+    if df.empty or value_col not in df:
+        return
+    rank_col = rank_col or value_col
+    if rank_col not in df:
+        rank_col = value_col
+    causal = df[df["source_type"].eq("causal")].copy()
+    causal = causal.dropna(subset=[rank_col]).sort_values(rank_col, ascending=False).head(top_n)
+    if causal.empty:
+        return
+    keys = ["site_family", "patch_target", "layer", "head"]
+    selected = causal[keys]
+    merged = df.merge(selected, on=keys, how="inner").copy()
+    if merged.empty:
+        return
+    source_order = [
+        "causal",
+        "matched_control",
+        "high_attention_control",
+        "wrong_graph_control",
+    ]
+    merged["source_type"] = merged["source_type"].astype(str)
+    merged = merged[merged["source_type"].isin(source_order)]
+    merged["site_label"] = merged.apply(compact_site_label, axis=1)
+    site_labels = [compact_site_label(row) for row in causal.to_dict("records")]
+    x = list(range(len(site_labels)))
+    width = 0.18
+    offsets = {
+        "causal": -1.5 * width,
+        "matched_control": -0.5 * width,
+        "high_attention_control": 0.5 * width,
+        "wrong_graph_control": 1.5 * width,
+    }
+    colours = {
+        "causal": "#4c78a8",
+        "matched_control": "#f58518",
+        "high_attention_control": "#54a24b",
+        "wrong_graph_control": "#b279a2",
+    }
+    fig, ax = plt.subplots(figsize=(max(8.5, 1.35 * len(site_labels)), 4.8))
+    for source in source_order:
+        sub = merged[merged["source_type"].eq(source)].set_index("site_label").reindex(site_labels)
+        if sub.empty:
+            continue
+        xs = [idx + offsets[source] for idx in x]
+        ys = sub[value_col].astype(float).tolist()
+        ax.bar(xs, ys, width=width, label=source.replace("_", " "), color=colours[source])
+        if {"ci_low", "ci_high"}.issubset(sub.columns):
+            lo = sub["ci_low"].astype(float).tolist()
+            hi = sub["ci_high"].astype(float).tolist()
+            lower = [max(0.0, y - l) if math.isfinite(l) else 0.0 for y, l in zip(ys, lo)]
+            upper = [max(0.0, h - y) if math.isfinite(h) else 0.0 for y, h in zip(ys, hi)]
+            ax.errorbar(xs, ys, yerr=[lower, upper], fmt="none", ecolor="black", elinewidth=0.8, capsize=2)
+    ax.axhline(0.0, color="black", linewidth=0.8)
+    ax.set_xticks(x, labels=site_labels, rotation=25, ha="right")
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
+    ax.grid(axis="y", alpha=0.25, linewidth=0.7)
+    ax.legend(frameon=False, ncols=2)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    fig.tight_layout()
+    fig.savefig(path, dpi=240)
+    plt.close(fig)
+
+
 def plot_outputs(out_dir: Path) -> None:
     try:
         import matplotlib
@@ -2237,52 +2737,87 @@ def plot_outputs(out_dir: Path) -> None:
     alignment_path = out_dir / "alignment_metrics.csv"
     if alignment_path.exists() and alignment_path.stat().st_size > 0:
         df = pd.read_csv(alignment_path)
-        sub = df[df["partition"].eq("evaluation")].copy()
-        if not sub.empty:
-            sub = sub.sort_values("auprc", ascending=False).head(20)
-            labels = sub["site_family"].astype(str) + "\nL" + sub["layer"].astype(str) + " H" + sub["head"].astype(str)
-            fig, ax = plt.subplots(figsize=(max(8, 0.45 * len(sub)), 4.5))
-            ax.bar(labels, sub["auprc"])
-            ax.set_ylabel("AUPRC")
-            ax.set_title("Task-causal alignment")
-            ax.tick_params(axis="x", rotation=60)
-            fig.tight_layout()
-            fig.savefig(out_dir / "alignment_auprc.png", dpi=200)
-            plt.close(fig)
+        eval_df = df[df["partition"].eq("evaluation")].copy()
+        if not eval_df.empty:
+            eval_df["label"] = eval_df.apply(compact_site_label, axis=1)
+            internal = eval_df[eval_df["scorer"].eq("internal")].copy()
+            baselines = eval_df[eval_df["scorer"].eq("baseline")].copy()
+            ranked_barh(
+                plt,
+                internal,
+                value_col="auprc_gain_vs_best_baseline",
+                label_col="label",
+                title="Task-causal alignment: internal sites",
+                xlabel="AUPRC gain vs best proxy baseline",
+                path=out_dir / "alignment_auprc.png",
+                top_n=16,
+                zero_line=True,
+            )
+            ranked_barh(
+                plt,
+                baselines,
+                value_col="auprc",
+                label_col="label",
+                title="Task-causal alignment: proxy baselines",
+                xlabel="AUPRC",
+                path=out_dir / "alignment_proxy_baselines.png",
+                top_n=12,
+                zero_line=False,
+            )
 
     field_path = out_dir / "field_response_summary.csv"
     if field_path.exists() and field_path.stat().st_size > 0:
         df = pd.read_csv(field_path)
         sub = df[df["source_type"].eq("causal")].copy()
         if not sub.empty and "field_change_gain_vs_matched_control" in sub:
-            sub = sub.sort_values("field_change_gain_vs_matched_control", ascending=False).head(20)
-            labels = sub["site_family"].astype(str) + "\nL" + sub["layer"].astype(str) + " H" + sub["head"].astype(str)
-            fig, ax = plt.subplots(figsize=(max(8, 0.45 * len(sub)), 4.5))
-            ax.bar(labels, sub["field_change_gain_vs_matched_control"])
-            ax.axhline(0.0, color="black", linewidth=0.8)
-            ax.set_ylabel("field change minus matched control")
-            ax.set_title("Task-causal field response")
-            ax.tick_params(axis="x", rotation=60)
-            fig.tight_layout()
-            fig.savefig(out_dir / "field_response_gain.png", dpi=200)
-            plt.close(fig)
+            sub["label"] = sub.apply(compact_site_label, axis=1)
+            ranked_barh(
+                plt,
+                sub,
+                value_col="field_change_gain_vs_matched_control",
+                label_col="label",
+                title="Task-causal field response",
+                xlabel="field change minus matched control",
+                path=out_dir / "field_response_gain.png",
+                top_n=16,
+                zero_line=True,
+            )
+            control_comparison_plot(
+                plt,
+                df,
+                value_col="mean",
+                rank_col="field_change_gain_vs_matched_control",
+                title="Field response by control",
+                ylabel="relative field change",
+                path=out_dir / "field_response_controls.png",
+            )
 
     patch_path = out_dir / "patching_summary.csv"
     if patch_path.exists() and patch_path.stat().st_size > 0:
         df = pd.read_csv(patch_path)
         sub = df[df["source_type"].eq("causal")].copy()
         if not sub.empty and "mediation_gain_vs_matched_control" in sub:
-            sub = sub.sort_values("mediation_gain_vs_matched_control", ascending=False).head(20)
-            labels = sub["site_family"].astype(str) + "\nL" + sub["layer"].astype(str) + " H" + sub["head"].astype(str)
-            fig, ax = plt.subplots(figsize=(max(8, 0.45 * len(sub)), 4.5))
-            ax.bar(labels, sub["mediation_gain_vs_matched_control"])
-            ax.axhline(0.0, color="black", linewidth=0.8)
-            ax.set_ylabel("mediation minus matched control")
-            ax.set_title("Activation-mediated restoration")
-            ax.tick_params(axis="x", rotation=60)
-            fig.tight_layout()
-            fig.savefig(out_dir / "patching_mediation_gain.png", dpi=200)
-            plt.close(fig)
+            sub["label"] = sub.apply(compact_site_label, axis=1)
+            ranked_barh(
+                plt,
+                sub,
+                value_col="mediation_gain_vs_matched_control",
+                label_col="label",
+                title="Activation-mediated restoration",
+                xlabel="mediation minus matched control",
+                path=out_dir / "patching_mediation_gain.png",
+                top_n=16,
+                zero_line=True,
+            )
+            control_comparison_plot(
+                plt,
+                df,
+                value_col="mean",
+                rank_col="mediation_gain_vs_matched_control",
+                title="Mediation by control",
+                ylabel="mediation",
+                path=out_dir / "patching_mediation_controls.png",
+            )
 
 
 def metadata(args: argparse.Namespace, loaded: Optional[moa.LoadedExperiment], start: float) -> dict[str, Any]:

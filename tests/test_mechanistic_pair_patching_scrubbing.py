@@ -247,6 +247,37 @@ def test_confirmatory_1h_preset_increases_pairs_and_controls_under_cap():
     assert planned < args.max_interventions
 
 
+def test_h2_validation_preset_runs_scrubbing_only_on_content_bottlenecks():
+    argv = [
+        "--checkpoint",
+        "ckpt.pt",
+        "--task",
+        "flow_hard",
+        "--analysis-preset",
+        "h2_validation",
+    ]
+    args = build_parser().parse_args(argv)
+
+    apply_analysis_preset(args, argv)
+    planned = estimate_intervention_forwards(
+        pairs=args.num_pairs,
+        layers=6,
+        heads=8,
+        head_mode=args.head_mode,
+        targets=2,
+        operators=2,
+        controls_per_operator=1 + args.matched_random_controls,
+        experiments=1,
+    )
+
+    assert args.experiments == "pair_scrubbing"
+    assert args.num_pairs == 256
+    assert args.patch_targets == "pair_value,pair_state"
+    assert args.operator_masks == "saturated_edge,min_cut_crossing_edge"
+    assert planned == 30720
+    assert planned < args.max_interventions
+
+
 def test_preset_respects_explicit_overrides():
     argv = [
         "--checkpoint",
@@ -359,6 +390,49 @@ def test_hypothesis_summary_uses_pair_level_control_normalised_means():
     assert h1["pairs"] == 2
     assert h3["effect"] == pytest.approx(0.4)
     assert {row["pair_id"] for row in pair_rows if row["hypothesis_id"] == h1["hypothesis_id"]} == {0, 1}
+
+
+def test_hypothesis_summary_respects_requested_operator_subset():
+    argv = [
+        "--checkpoint",
+        "ckpt.pt",
+        "--task",
+        "flow_hard",
+        "--analysis-preset",
+        "h2_validation",
+    ]
+    args = build_parser().parse_args(argv)
+    apply_analysis_preset(args, argv)
+    scrub_rows = []
+    for pair_id in [0, 1]:
+        scrub_rows.extend(
+            [
+                {
+                    "pair_id": pair_id,
+                    "operator": "saturated_edge",
+                    "scrub_target": "pair_value",
+                    "layer": 0,
+                    "head": -1,
+                    "control_type": "operator",
+                    "drop": 0.10,
+                },
+                {
+                    "pair_id": pair_id,
+                    "operator": "saturated_edge",
+                    "scrub_target": "pair_value",
+                    "layer": 0,
+                    "head": -1,
+                    "control_type": "matched_random",
+                    "drop": 0.03,
+                },
+            ]
+        )
+
+    hypothesis_rows, _pair_rows = make_hypothesis_outputs(args, [], scrub_rows)
+    h2 = next(row for row in hypothesis_rows if row["hypothesis_id"] == "H2_scrub_solver_content_necessity")
+
+    assert h2["operators"] == "saturated_edge,min_cut_crossing_edge"
+    assert h2["effect"] == pytest.approx(0.07)
 
 
 def test_operator_target_matrix_is_layer_averaged_not_best_layer():
