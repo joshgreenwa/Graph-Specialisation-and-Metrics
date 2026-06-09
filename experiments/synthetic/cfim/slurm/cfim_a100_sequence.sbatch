@@ -28,6 +28,7 @@ mkdir -p logs "${CFIM_ARTIFACT_ROOT}"
 export PYTHONPATH="${PROJECT_ROOT}/src:${PYTHONPATH:-}"
 export MPLBACKEND=Agg
 export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-8}"
+export CUBLAS_WORKSPACE_CONFIG="${CUBLAS_WORKSPACE_CONFIG:-:4096:8}"
 export CFIM_ARTIFACT_ROOT
 
 TASKS=(ppr_diffusion nearest_anchor_voronoi)

@@ -40,6 +40,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional, Sequence
 
+# Required when strict PyTorch deterministic algorithms are enabled and CUDA
+# matmul reaches CuBLAS before the shell has set a workspace policy.
+os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
