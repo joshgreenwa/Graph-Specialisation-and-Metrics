@@ -156,17 +156,17 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "weight_decay": 1.0e-5,
         "batch_size_graphs": 64,
         "eval_batch_size_graphs": 256,
-        "max_steps": 30000,
-        "warmup_steps": 1000,
+        "max_steps": 5000,
+        "warmup_steps": 250,
         "lr_schedule": "cosine_decay_to_10_percent",
         "gradient_clip_norm": 1.0,
         "loss": "mse_node_mean",
-        "eval_every_steps": 500,
-        "checkpoint_every_steps": 2500,
+        "eval_every_steps": 250,
+        "checkpoint_every_steps": 0,
         "select_checkpoint": "lowest_val_relmse",
-        "early_stop_val_relmse": 0.01,
-        "early_stop_min_steps": 3000,
-        "early_stop_patience_evals": 3,
+        "early_stop_val_relmse": 0.005,
+        "early_stop_min_steps": 1500,
+        "early_stop_patience_evals": 4,
         "mixed_precision": False,
         "deterministic_algorithms": True,
         "deterministic_warn_only": False,
@@ -277,7 +277,7 @@ def load_config(path: Path | None, *, task: str | None = None, fast_dev_run: boo
         cfg["training"]["max_steps"] = 2
         cfg["training"]["warmup_steps"] = 1
         cfg["training"]["eval_every_steps"] = 1
-        cfg["training"]["checkpoint_every_steps"] = 2
+        cfg["training"]["checkpoint_every_steps"] = 0
         cfg["cf_eval_budget"]["graphs_per_task"] = 4
         cfg["cf_eval_budget"]["interventions_per_graph_per_family"] = 3
         cfg["cf_eval_budget"]["bin_allocation"] = {"null": 0, "low": 1, "medium": 1, "high": 1}
@@ -1496,7 +1496,8 @@ def train(cfg: Mapping[str, Any], task: str, *, device_name: str = "auto", backe
                         flush=True,
                     )
                     break
-        if step % int(cfg["training"]["checkpoint_every_steps"]) == 0:
+        checkpoint_every = int(cfg["training"].get("checkpoint_every_steps", 0))
+        if checkpoint_every > 0 and step % checkpoint_every == 0:
             save_checkpoint(run_dir / f"checkpoint_step{step:06d}.pt", model, cfg, task, step, best_rel, optimizer)
     save_checkpoint(run_dir / "final.pt", model, cfg, task, last_step, best_rel, optimizer)
     best_path = run_dir / "best.pt"
