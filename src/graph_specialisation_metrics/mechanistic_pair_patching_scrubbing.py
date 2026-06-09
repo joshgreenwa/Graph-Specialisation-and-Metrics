@@ -30,7 +30,7 @@ from graph_specialisation_metrics import mechanistic_operator_analysis as moa
 EPS = 1.0e-12
 PATCH_TARGETS = ("routing_logits", "attention", "pair_value", "pair_state", "head_output")
 EXPERIMENTS = ("pair_patching", "pair_scrubbing")
-ANALYSIS_PRESETS = ("custom", "pilot", "core_fast")
+ANALYSIS_PRESETS = ("custom", "pilot", "core_fast", "confirmatory_1h")
 FLOW_CORE_OPERATORS = (
     "saturated_edge",
     "min_cut_crossing_edge",
@@ -161,6 +161,18 @@ def apply_analysis_preset(args: argparse.Namespace, argv: Sequence[str]) -> None
             "patch_targets": ",".join(CORE_PATCH_TARGETS),
             "operator_masks": task_core_operators(args.task),
             "matched_random_controls": 2,
+            "include_outside_operator_control": False,
+            "include_wrong_operator_control": False,
+            "include_wrong_source_control": False,
+        }
+    elif preset == "confirmatory_1h":
+        defaults = {
+            "experiments": "pair_patching,pair_scrubbing",
+            "num_graphs": 1536,
+            "num_pairs": 128,
+            "patch_targets": ",".join(CORE_PATCH_TARGETS),
+            "operator_masks": task_core_operators(args.task),
+            "matched_random_controls": 4,
             "include_outside_operator_control": False,
             "include_wrong_operator_control": False,
             "include_wrong_source_control": False,
@@ -1223,6 +1235,317 @@ def add_control_lift(summary: list[dict[str, Any]], *, target_field: str) -> lis
     return summary
 
 
+def mean_or_nan(values: Sequence[float]) -> float:
+    finite = [float(value) for value in values if math.isfinite(float(value))]
+    return sum(finite) / len(finite) if finite else float("nan")
+
+
+def support_status(values: Sequence[float], seed: int) -> tuple[float, float, float, str]:
+    finite = [float(value) for value in values if math.isfinite(float(value))]
+    if not finite:
+        return float("nan"), float("nan"), float("nan"), "not_run"
+    mean = sum(finite) / len(finite)
+    lo, hi = moa.bootstrap_ci(finite, seed, samples=1000)
+    status = (
+        "strong_support"
+        if mean > 0 and lo > 0
+        else ("directional_support" if mean > 0 else "not_supported")
+    )
+    return mean, lo, hi, status
+
+
+def pair_control_means(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    metric: str,
+    target_field: str,
+    operators: Sequence[str],
+    targets: Sequence[str],
+    control_type: str,
+) -> dict[int, float]:
+    operator_set = set(operators)
+    target_set = set(targets)
+    grouped: dict[int, list[float]] = defaultdict(list)
+    for row in rows:
+        if row.get("control_type") != control_type:
+            continue
+        if str(row.get("operator")) not in operator_set:
+            continue
+        if str(row.get(target_field)) not in target_set:
+            continue
+        value = finite_float(row.get(metric))
+        if math.isfinite(value):
+            grouped[int(row["pair_id"])].append(value)
+    return {pair_id: mean_or_nan(values) for pair_id, values in grouped.items()}
+
+
+def pair_lift_series(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    metric: str,
+    target_field: str,
+    operators: Sequence[str],
+    targets: Sequence[str],
+) -> dict[int, float]:
+    real = pair_control_means(
+        rows,
+        metric=metric,
+        target_field=target_field,
+        operators=operators,
+        targets=targets,
+        control_type="operator",
+    )
+    random_control = pair_control_means(
+        rows,
+        metric=metric,
+        target_field=target_field,
+        operators=operators,
+        targets=targets,
+        control_type="matched_random",
+    )
+    out: dict[int, float] = {}
+    for pair_id in sorted(set(real) & set(random_control)):
+        out[pair_id] = real[pair_id] - random_control[pair_id]
+    return out
+
+
+def hypothesis_operator_groups(task: str) -> dict[str, tuple[str, ...]]:
+    core = tuple(task_core_operators(task).split(","))
+    if "flow" in task:
+        return {
+            "core": core,
+            "bottleneck": ("saturated_edge", "min_cut_crossing_edge"),
+            "path": ("shortest_st_path_edge",),
+        }
+    if "bipartite" in task or "matching" in task:
+        return {
+            "core": core,
+            "solution": ("optimum_matching_edge",),
+            "search": ("alternating_forest_edge", "unmatched_feasible_edge"),
+        }
+    return {"core": core}
+
+
+def make_hypothesis_outputs(
+    args: argparse.Namespace,
+    patch_rows: Sequence[Mapping[str, Any]],
+    scrub_rows: Sequence[Mapping[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    groups = hypothesis_operator_groups(args.task)
+    core = groups["core"]
+    requested_targets = set(parse_csv(args.patch_targets, all_values=PATCH_TARGETS))
+    content_targets = tuple(target for target in ("pair_value", "pair_state") if target in requested_targets)
+    routing_targets = tuple(target for target in ("routing_logits",) if target in requested_targets)
+    pair_rows_out: list[dict[str, Any]] = []
+
+    def add_lift_hypothesis(
+        *,
+        hypothesis_id: str,
+        claim: str,
+        rows: Sequence[Mapping[str, Any]],
+        metric: str,
+        target_field: str,
+        operators: Sequence[str],
+        targets: Sequence[str],
+        seed_offset: int,
+    ) -> dict[str, Any]:
+        series = pair_lift_series(
+            rows,
+            metric=metric,
+            target_field=target_field,
+            operators=operators,
+            targets=targets,
+        )
+        for pair_id, effect in sorted(series.items()):
+            pair_rows_out.append(
+                {
+                    "hypothesis_id": hypothesis_id,
+                    "pair_id": pair_id,
+                    "pair_effect": effect,
+                    "metric": metric,
+                    "comparison": "operator_minus_matched_random",
+                }
+            )
+        mean, lo, hi, status = support_status(list(series.values()), args.random_seed + seed_offset)
+        return {
+            "hypothesis_id": hypothesis_id,
+            "claim": claim,
+            "experiment": "patching" if target_field == "patch_target" else "scrubbing",
+            "metric": metric,
+            "comparison": "operator minus matched random",
+            "operators": ",".join(operators),
+            "targets": ",".join(targets),
+            "aggregation": "pre-specified pair mean over requested layers/operators/targets",
+            "effect": mean,
+            "ci_low": lo,
+            "ci_high": hi,
+            "pairs": len(series),
+            "status": status,
+            "confirmatory": True,
+        }
+
+    def add_difference_hypothesis(
+        *,
+        hypothesis_id: str,
+        claim: str,
+        rows: Sequence[Mapping[str, Any]],
+        metric: str,
+        target_field: str,
+        positive_operators: Sequence[str],
+        positive_targets: Sequence[str],
+        negative_operators: Sequence[str],
+        negative_targets: Sequence[str],
+        seed_offset: int,
+    ) -> dict[str, Any]:
+        positive = pair_lift_series(
+            rows,
+            metric=metric,
+            target_field=target_field,
+            operators=positive_operators,
+            targets=positive_targets,
+        )
+        negative = pair_lift_series(
+            rows,
+            metric=metric,
+            target_field=target_field,
+            operators=negative_operators,
+            targets=negative_targets,
+        )
+        common = sorted(set(positive) & set(negative))
+        values = {pair_id: positive[pair_id] - negative[pair_id] for pair_id in common}
+        for pair_id, effect in values.items():
+            pair_rows_out.append(
+                {
+                    "hypothesis_id": hypothesis_id,
+                    "pair_id": pair_id,
+                    "pair_effect": effect,
+                    "metric": metric,
+                    "comparison": "difference_of_control_normalised_effects",
+                }
+            )
+        mean, lo, hi, status = support_status(list(values.values()), args.random_seed + seed_offset)
+        return {
+            "hypothesis_id": hypothesis_id,
+            "claim": claim,
+            "experiment": "patching" if target_field == "patch_target" else "scrubbing",
+            "metric": metric,
+            "comparison": "positive effect minus negative effect after matched-random subtraction",
+            "operators": ",".join(positive_operators),
+            "targets": ",".join(positive_targets),
+            "negative_operators": ",".join(negative_operators),
+            "negative_targets": ",".join(negative_targets),
+            "aggregation": "pre-specified pair mean over requested layers/operators/targets",
+            "effect": mean,
+            "ci_low": lo,
+            "ci_high": hi,
+            "pairs": len(values),
+            "status": status,
+            "confirmatory": True,
+        }
+
+    hypotheses: list[dict[str, Any]] = []
+    if content_targets:
+        hypotheses.append(
+            add_lift_hypothesis(
+                hypothesis_id="H1_patch_solver_content_rescue",
+                claim="Clean solver-pair content activations causally rescue corrupt graph predictions.",
+                rows=patch_rows,
+                metric="restoration",
+                target_field="patch_target",
+                operators=core,
+                targets=content_targets,
+                seed_offset=101,
+            )
+        )
+        hypotheses.append(
+            add_lift_hypothesis(
+                hypothesis_id="H2_scrub_solver_content_necessity",
+                claim="Matched scrubbing of solver-pair content damages clean predictions.",
+                rows=scrub_rows,
+                metric="drop",
+                target_field="scrub_target",
+                operators=core,
+                targets=content_targets,
+                seed_offset=211,
+            )
+        )
+    if content_targets and routing_targets:
+        hypotheses.append(
+            add_difference_hypothesis(
+                hypothesis_id="H3_patch_content_exceeds_routing",
+                claim="Relation-conditioned content rescue exceeds scalar routing rescue.",
+                rows=patch_rows,
+                metric="restoration",
+                target_field="patch_target",
+                positive_operators=core,
+                positive_targets=content_targets,
+                negative_operators=core,
+                negative_targets=routing_targets,
+                seed_offset=307,
+            )
+        )
+        hypotheses.append(
+            add_difference_hypothesis(
+                hypothesis_id="H4_scrub_content_exceeds_routing",
+                claim="Relation-conditioned content scrubbing damage exceeds scalar routing scrubbing damage.",
+                rows=scrub_rows,
+                metric="drop",
+                target_field="scrub_target",
+                positive_operators=core,
+                positive_targets=content_targets,
+                negative_operators=core,
+                negative_targets=routing_targets,
+                seed_offset=401,
+            )
+        )
+    if "flow" in args.task and content_targets:
+        hypotheses.append(
+            add_difference_hypothesis(
+                hypothesis_id="H5_patch_bottleneck_exceeds_path",
+                claim="Max-flow bottleneck/cut pairs rescue more than shortest-path pairs.",
+                rows=patch_rows,
+                metric="restoration",
+                target_field="patch_target",
+                positive_operators=groups["bottleneck"],
+                positive_targets=content_targets,
+                negative_operators=groups["path"],
+                negative_targets=content_targets,
+                seed_offset=509,
+            )
+        )
+    return hypotheses, pair_rows_out
+
+
+def write_hypothesis_markdown(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
+    lines = [
+        "# Confirmatory Mechanistic Hypothesis Summary",
+        "",
+        "Primary effects are pre-specified pair-level means over requested layers, operators, and targets. "
+        "Matched-random controls are evaluated on the same graph pairs. Layer-localized maxima are not used "
+        "for support calls.",
+        "",
+        "| Hypothesis | Direct Test | Effect | 95% CI | Pairs | Status |",
+        "|---|---|---:|---:|---:|---|",
+    ]
+    for row in rows:
+        effect = finite_float(row.get("effect"))
+        lo = finite_float(row.get("ci_low"))
+        hi = finite_float(row.get("ci_high"))
+        lines.append(
+            f"| {row.get('hypothesis_id')} | {row.get('claim')} | "
+            f"{effect:.4g} | [{lo:.4g}, {hi:.4g}] | {int(row.get('pairs', 0))} | "
+            f"{row.get('status')} |"
+        )
+    lines.extend(
+        [
+            "",
+            "Status rule: strong support requires a positive mean effect and positive bootstrap lower bound. "
+            "Directional support means the mean has the predicted sign but the lower bound does not.",
+        ]
+    )
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
 def write_claim_summary(out_dir: Path, patch_summary: Sequence[Mapping[str, Any]], scrub_summary: Sequence[Mapping[str, Any]]) -> None:
     best_patch = max(
         (row for row in patch_summary if row.get("control_type") == "operator"),
@@ -1264,6 +1587,115 @@ def write_claim_summary(out_dir: Path, patch_summary: Sequence[Mapping[str, Any]
         ]
     )
     (out_dir / "claim_summary.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def matrix_rows_from_raw(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    metric: str,
+    target_field: str,
+) -> list[dict[str, Any]]:
+    operators = sorted({str(row.get("operator")) for row in rows if row.get("control_type") == "operator"})
+    targets = sorted({str(row.get(target_field)) for row in rows if row.get("control_type") == "operator"})
+    out: list[dict[str, Any]] = []
+    for operator in operators:
+        for target in targets:
+            series = pair_lift_series(
+                rows,
+                metric=metric,
+                target_field=target_field,
+                operators=(operator,),
+                targets=(target,),
+            )
+            if not series:
+                continue
+            mean, lo, hi, status = support_status(list(series.values()), seed=len(out) + 17)
+            out.append(
+                {
+                    "operator": operator,
+                    target_field: target,
+                    "effect": mean,
+                    "ci_low": lo,
+                    "ci_high": hi,
+                    "pairs": len(series),
+                    "status": status,
+                }
+            )
+    return out
+
+
+def plot_hypothesis_dashboard(
+    out_dir: Path,
+    hypothesis_rows: Sequence[Mapping[str, Any]],
+    patch_matrix_rows: Sequence[Mapping[str, Any]],
+    scrub_matrix_rows: Sequence[Mapping[str, Any]],
+) -> None:
+    try:
+        import matplotlib.pyplot as plt
+        import pandas as pd
+    except Exception as exc:
+        print(f"[plot] skipped hypothesis dashboard because pandas/matplotlib import failed: {exc}", flush=True)
+        return
+
+    fig, axes = plt.subplots(1, 3, figsize=(16.0, 5.2), gridspec_kw={"width_ratios": [1.1, 1.0, 1.0]})
+    hyp = pd.DataFrame(list(hypothesis_rows))
+    ax = axes[0]
+    if hyp.empty:
+        ax.text(0.5, 0.5, "No confirmatory hypotheses available", ha="center", va="center")
+        ax.axis("off")
+    else:
+        hyp = hyp.copy()
+        hyp["short"] = hyp["hypothesis_id"].str.replace("_", "\n", regex=False)
+        y = range(len(hyp))
+        effects = hyp["effect"].astype(float).fillna(0.0)
+        lo = hyp["ci_low"].astype(float).fillna(effects)
+        hi = hyp["ci_high"].astype(float).fillna(effects)
+        xerr = [effects - lo, hi - effects]
+        colors = hyp["status"].map(
+            {
+                "strong_support": "#2ca02c",
+                "directional_support": "#ffbf00",
+                "not_supported": "#d62728",
+                "not_run": "#8c8c8c",
+            }
+        ).fillna("#8c8c8c")
+        ax.barh(list(y), effects, color=colors)
+        ax.errorbar(effects, list(y), xerr=xerr, fmt="none", color="black", linewidth=1.0, capsize=3)
+        ax.axvline(0.0, color="black", linewidth=0.8)
+        ax.set_yticks(list(y))
+        ax.set_yticklabels(hyp["short"], fontsize=8)
+        ax.invert_yaxis()
+        ax.set_xlabel("pre-specified paired effect")
+        ax.set_title("Confirmatory hypothesis tests")
+
+    def heatmap(ax, matrix_rows: Sequence[Mapping[str, Any]], target_field: str, title: str) -> None:
+        df = pd.DataFrame(list(matrix_rows))
+        if df.empty:
+            ax.text(0.5, 0.5, "No data", ha="center", va="center")
+            ax.axis("off")
+            return
+        pivot = df.pivot(index="operator", columns=target_field, values="effect").fillna(0.0)
+        values = pivot.to_numpy(dtype=float)
+        vmax = max(1.0e-9, abs(values).max())
+        im = ax.imshow(values, cmap="coolwarm", vmin=-vmax, vmax=vmax, aspect="auto")
+        ax.set_xticks(range(pivot.shape[1]))
+        ax.set_xticklabels(pivot.columns, rotation=35, ha="right", fontsize=8)
+        ax.set_yticks(range(pivot.shape[0]))
+        ax.set_yticklabels(pivot.index, fontsize=8)
+        ax.set_title(title)
+        for row_idx in range(pivot.shape[0]):
+            for col_idx in range(pivot.shape[1]):
+                value = values[row_idx, col_idx]
+                color = "white" if abs(value) > 0.5 * vmax else "black"
+                ax.text(col_idx, row_idx, f"{value:.2g}", ha="center", va="center", fontsize=7, color=color)
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+    heatmap(axes[1], patch_matrix_rows, "patch_target", "Patching: operator minus matched random")
+    heatmap(axes[2], scrub_matrix_rows, "scrub_target", "Scrubbing: operator minus matched random")
+    fig.suptitle("Paired graph patching and pair-set scrubbing: pre-specified tests", y=1.02)
+    fig.tight_layout()
+    fig.savefig(out_dir / "main_pair_patch_scrub_dashboard.png", dpi=250, bbox_inches="tight")
+    plt.close(fig)
 
 
 def plot_outputs(out_dir: Path) -> None:
@@ -1503,6 +1935,22 @@ def run(args: argparse.Namespace) -> None:
     )
     moa.write_csv(out_dir / "patching_summary.csv", patch_summary)
     moa.write_csv(out_dir / "scrubbing_summary.csv", scrub_summary)
+    hypothesis_rows, hypothesis_pair_rows = make_hypothesis_outputs(args, patch_rows, scrub_rows)
+    patch_matrix_rows = matrix_rows_from_raw(
+        patch_rows,
+        metric="restoration",
+        target_field="patch_target",
+    )
+    scrub_matrix_rows = matrix_rows_from_raw(
+        scrub_rows,
+        metric="drop",
+        target_field="scrub_target",
+    )
+    moa.write_csv(out_dir / "hypothesis_summary.csv", hypothesis_rows)
+    moa.write_csv(out_dir / "hypothesis_effects_by_pair.csv", hypothesis_pair_rows)
+    moa.write_csv(out_dir / "patching_operator_target_matrix.csv", patch_matrix_rows)
+    moa.write_csv(out_dir / "scrubbing_operator_target_matrix.csv", scrub_matrix_rows)
+    write_hypothesis_markdown(out_dir / "hypothesis_summary.md", hypothesis_rows)
     write_claim_summary(out_dir, patch_summary, scrub_summary)
     metadata = {
         "task": args.task,
@@ -1528,6 +1976,7 @@ def run(args: argparse.Namespace) -> None:
         ),
     }
     (out_dir / "metadata.json").write_text(json.dumps(metadata, indent=2, sort_keys=True), encoding="utf-8")
+    plot_hypothesis_dashboard(out_dir, hypothesis_rows, patch_matrix_rows, scrub_matrix_rows)
     plot_outputs(out_dir)
     print(
         f"[done] wrote {len(patch_rows)} patch rows and {len(scrub_rows)} scrub rows to {out_dir}",
@@ -1557,7 +2006,9 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "custom preserves explicit flags; pilot is a very small patching-only "
             "proof-of-life run; core_fast tests the core patching+scrubbing hypotheses "
-            "with task-aware operators, three patch targets, and matched-random controls."
+            "with task-aware operators, three patch targets, and matched-random controls; "
+            "confirmatory_1h roughly triples core_fast evidence while staying under the "
+            "default intervention cap."
         ),
     )
     parser.add_argument(

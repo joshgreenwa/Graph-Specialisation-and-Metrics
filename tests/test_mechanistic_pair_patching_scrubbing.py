@@ -12,6 +12,8 @@ from graph_specialisation_metrics.mechanistic_pair_patching_scrubbing import (
     assert_nonzero_sparse_coverage,
     build_parser,
     estimate_intervention_forwards,
+    make_hypothesis_outputs,
+    matrix_rows_from_raw,
     outside_control_mask,
     safe_restoration,
     select_pairs,
@@ -215,6 +217,36 @@ def test_core_fast_preset_sets_task_aware_compact_defaults():
     assert args.include_wrong_source_control is False
 
 
+def test_confirmatory_1h_preset_increases_pairs_and_controls_under_cap():
+    argv = [
+        "--checkpoint",
+        "ckpt.pt",
+        "--task",
+        "flow_hard",
+        "--analysis-preset",
+        "confirmatory_1h",
+    ]
+    args = build_parser().parse_args(argv)
+
+    apply_analysis_preset(args, argv)
+    planned = estimate_intervention_forwards(
+        pairs=args.num_pairs,
+        layers=3,
+        heads=8,
+        head_mode=args.head_mode,
+        targets=3,
+        operators=3,
+        controls_per_operator=1 + args.matched_random_controls,
+        experiments=2,
+    )
+
+    assert args.num_pairs == 128
+    assert args.num_graphs == 1536
+    assert args.matched_random_controls == 4
+    assert planned == 34560
+    assert planned < args.max_interventions
+
+
 def test_preset_respects_explicit_overrides():
     argv = [
         "--checkpoint",
@@ -261,3 +293,114 @@ def test_intervention_forward_estimate_scales_with_heads_only_in_per_head_mode()
 
     assert layer_level == 1620
     assert per_head == 8 * layer_level
+
+
+def test_hypothesis_summary_uses_pair_level_control_normalised_means():
+    argv = [
+        "--checkpoint",
+        "ckpt.pt",
+        "--task",
+        "flow_hard",
+        "--analysis-preset",
+        "core_fast",
+    ]
+    args = build_parser().parse_args(argv)
+    apply_analysis_preset(args, argv)
+    patch_rows = []
+    scrub_rows = []
+    for pair_id in [0, 1]:
+        for layer in [0, 1]:
+            patch_rows.extend(
+                [
+                    {
+                        "pair_id": pair_id,
+                        "operator": "saturated_edge",
+                        "patch_target": "pair_value",
+                        "layer": layer,
+                        "head": -1,
+                        "control_type": "operator",
+                        "restoration": 0.8,
+                    },
+                    {
+                        "pair_id": pair_id,
+                        "operator": "saturated_edge",
+                        "patch_target": "pair_value",
+                        "layer": layer,
+                        "head": -1,
+                        "control_type": "matched_random",
+                        "restoration": 0.3,
+                    },
+                    {
+                        "pair_id": pair_id,
+                        "operator": "saturated_edge",
+                        "patch_target": "routing_logits",
+                        "layer": layer,
+                        "head": -1,
+                        "control_type": "operator",
+                        "restoration": 0.4,
+                    },
+                    {
+                        "pair_id": pair_id,
+                        "operator": "saturated_edge",
+                        "patch_target": "routing_logits",
+                        "layer": layer,
+                        "head": -1,
+                        "control_type": "matched_random",
+                        "restoration": 0.3,
+                    },
+                ]
+            )
+
+    hypothesis_rows, pair_rows = make_hypothesis_outputs(args, patch_rows, scrub_rows)
+    h1 = next(row for row in hypothesis_rows if row["hypothesis_id"] == "H1_patch_solver_content_rescue")
+    h3 = next(row for row in hypothesis_rows if row["hypothesis_id"] == "H3_patch_content_exceeds_routing")
+
+    assert h1["effect"] == pytest.approx(0.5)
+    assert h1["pairs"] == 2
+    assert h3["effect"] == pytest.approx(0.4)
+    assert {row["pair_id"] for row in pair_rows if row["hypothesis_id"] == h1["hypothesis_id"]} == {0, 1}
+
+
+def test_operator_target_matrix_is_layer_averaged_not_best_layer():
+    rows = [
+        {
+            "pair_id": 0,
+            "operator": "saturated_edge",
+            "patch_target": "pair_value",
+            "layer": 0,
+            "head": -1,
+            "control_type": "operator",
+            "restoration": 1.0,
+        },
+        {
+            "pair_id": 0,
+            "operator": "saturated_edge",
+            "patch_target": "pair_value",
+            "layer": 1,
+            "head": -1,
+            "control_type": "operator",
+            "restoration": 0.0,
+        },
+        {
+            "pair_id": 0,
+            "operator": "saturated_edge",
+            "patch_target": "pair_value",
+            "layer": 0,
+            "head": -1,
+            "control_type": "matched_random",
+            "restoration": 0.2,
+        },
+        {
+            "pair_id": 0,
+            "operator": "saturated_edge",
+            "patch_target": "pair_value",
+            "layer": 1,
+            "head": -1,
+            "control_type": "matched_random",
+            "restoration": 0.2,
+        },
+    ]
+
+    matrix = matrix_rows_from_raw(rows, metric="restoration", target_field="patch_target")
+
+    assert matrix[0]["effect"] == pytest.approx(0.3)
