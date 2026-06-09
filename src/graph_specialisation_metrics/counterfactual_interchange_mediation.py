@@ -2798,16 +2798,211 @@ def plot_patching_summaries(cfg: Mapping[str, Any]) -> None:
     fig.tight_layout()
     fig.savefig(out)
     plt.close(fig)
-    for name in [
-        "fig4_cumulative_head_recovery.pdf",
-        "fig5_routing_transport_specificity.pdf",
-    ]:
-        target = figures_main_dir(cfg) / name
-        if not target.exists():
-            fig, ax = plt.subplots(figsize=(4, 3))
-            ax.axis("off")
-            ax.text(0.5, 0.5, "Generated from patch metrics after full ranking controls", ha="center", va="center")
-            fig.savefig(target)
+    plot_cumulative_head_recovery(cfg, rows)
+    plot_routing_transport_specificity(cfg, rows)
+
+
+def is_true_csv(value: Any) -> bool:
+    return str(value).strip().lower() in {"true", "1", "yes"}
+
+
+def finite_metric_values(rows: Sequence[Mapping[str, Any]], metric: str) -> list[float]:
+    values = []
+    for row in rows:
+        try:
+            value = float(row[metric])
+        except Exception:
+            continue
+        if math.isfinite(value):
+            values.append(value)
+    return values
+
+
+def patch_group_rows(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    task: str,
+    family: str,
+    component: str,
+    group_name: str,
+) -> list[Mapping[str, Any]]:
+    return [
+        row
+        for row in rows
+        if row.get("task") == task
+        and row.get("family") == family
+        and row.get("component") == component
+        and row.get("group_name") == group_name
+        and row.get("effect_bin") == "high"
+    ]
+
+
+def median_metric(rows: Sequence[Mapping[str, Any]], metric: str) -> float:
+    return median(finite_metric_values(rows, metric))
+
+
+def patch_plot_tasks(rows: Sequence[Mapping[str, Any]]) -> list[str]:
+    return sorted({str(row.get("task", "")) for row in rows if row.get("task")})
+
+
+def plot_cumulative_head_recovery(cfg: Mapping[str, Any], rows: Sequence[Mapping[str, Any]]) -> None:
+    tasks = patch_plot_tasks(rows)
+    if not tasks:
+        return
+    out = figures_main_dir(cfg) / "fig4_cumulative_head_recovery.pdf"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    group_sizes = [1, 2, 4]
+    with PdfPages(out) as pdf:
+        for task in tasks:
+            families = [family for family in (PPR_FAMILIES if task == "ppr_diffusion" else VORONOI_FAMILIES) if any(row.get("task") == task and row.get("family") == family for row in rows)]
+            components = sorted({str(row.get("component")) for row in rows if row.get("task") == task and row.get("component")})
+            if not families or not components:
+                continue
+            fig, axes = plt.subplots(
+                len(families),
+                len(components),
+                figsize=(max(9.5, 3.2 * len(components)), max(3.4, 2.7 * len(families))),
+                sharex=True,
+                sharey=True,
+                squeeze=False,
+            )
+            fig.suptitle(f"{task}: cumulative grouped patch recovery", fontsize=13)
+            for row_idx, family in enumerate(families):
+                for col_idx, component in enumerate(components):
+                    ax = axes[row_idx][col_idx]
+                    top = [
+                        median_metric(
+                            patch_group_rows(rows, task=task, family=family, component=component, group_name=f"top{size}"),
+                            "TCM",
+                        )
+                        for size in group_sizes
+                    ]
+                    random_control = [
+                        median_metric(
+                            patch_group_rows(rows, task=task, family=family, component=component, group_name=f"random{size}"),
+                            "TCM",
+                        )
+                        for size in group_sizes
+                    ]
+                    mismatch = [
+                        median_metric(
+                            patch_group_rows(rows, task=task, family=family, component=component, group_name=f"mismatched_top{size}"),
+                            "TCM",
+                        )
+                        for size in group_sizes
+                    ]
+                    ax.plot(group_sizes, top, marker="o", linewidth=2.0, color="#2b6cb0", label="ranked top-k")
+                    if any(math.isfinite(value) for value in random_control):
+                        ax.plot(group_sizes, random_control, marker="s", linestyle="--", color="#718096", label="random control")
+                    if any(math.isfinite(value) for value in mismatch):
+                        ax.plot(group_sizes, mismatch, marker="^", linestyle=":", color="#c05621", label="mismatched control")
+                    ax.axhline(0.0, color="black", linewidth=0.7)
+                    ax.set_title(f"{family}\n{component}", fontsize=9)
+                    ax.set_xticks(group_sizes)
+                    ax.set_xlabel("patched heads")
+                    ax.set_ylabel("median TCM")
+                    ax.grid(True, linewidth=0.35, alpha=0.35)
+            handles, labels = axes[0][0].get_legend_handles_labels()
+            if handles:
+                fig.legend(handles, labels, loc="lower center", ncol=min(3, len(handles)), frameon=False)
+            fig.tight_layout(rect=(0, 0.08, 1, 0.93))
+            pdf.savefig(fig)
+            plt.close(fig)
+
+
+def plot_routing_transport_specificity(cfg: Mapping[str, Any], rows: Sequence[Mapping[str, Any]]) -> None:
+    tasks = patch_plot_tasks(rows)
+    if not tasks:
+        return
+    out = figures_main_dir(cfg) / "fig5_routing_transport_specificity.pdf"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    family_palette = {
+        family: plt.get_cmap("tab10")(idx % 10)
+        for idx, family in enumerate(ALL_FAMILIES)
+    }
+    component_markers = {
+        "attn_probs": "o",
+        "message_pre_weight": "s",
+        "resid_contribution": "^",
+        "pair_state": "D",
+    }
+    with PdfPages(out) as pdf:
+        for task in tasks:
+            plot_rows = [
+                row
+                for row in rows
+                if row.get("task") == task
+                and row.get("effect_bin") == "high"
+                and str(row.get("group_name")) in {"top1", "top2", "top4"}
+                and not is_true_csv(row.get("is_control", ""))
+            ]
+            if not plot_rows:
+                continue
+            fig, axes = plt.subplots(1, 2, figsize=(11.5, 4.8))
+            fig.suptitle(f"{task}: matched pathway specificity", fontsize=13)
+            for ax, metric, wrong_metric, label in [
+                (axes[0], "TCMA", "wrong_pathway_TCMA", "alignment"),
+                (axes[1], "TCM", "wrong_pathway_TCM", "effect recovery"),
+            ]:
+                points = []
+                for row in plot_rows:
+                    try:
+                        matched = float(row[metric])
+                        wrong = float(row[wrong_metric])
+                    except Exception:
+                        continue
+                    if not (math.isfinite(matched) and math.isfinite(wrong)):
+                        continue
+                    points.append((wrong, matched, row))
+                if points:
+                    xs = [point[0] for point in points]
+                    ys = [point[1] for point in points]
+                    lower = min(-0.1, min(xs), min(ys)) - 0.05
+                    upper = max(1.0, max(xs), max(ys)) + 0.05
+                    ax.plot([lower, upper], [lower, upper], color="black", linestyle="--", linewidth=0.8)
+                    for wrong, matched, row in points:
+                        family = str(row.get("family", ""))
+                        component = str(row.get("component", ""))
+                        group_name = str(row.get("group_name", ""))
+                        size = int(group_name.replace("top", "") or 1) if group_name.startswith("top") else 1
+                        ax.scatter(
+                            wrong,
+                            matched,
+                            s=35 + 18 * size,
+                            marker=component_markers.get(component, "o"),
+                            color=family_palette.get(family, "#2b6cb0"),
+                            edgecolors="black",
+                            linewidths=0.35,
+                            alpha=0.85,
+                        )
+                    for wrong, matched, row in sorted(points, key=lambda item: item[1] - item[0], reverse=True)[:5]:
+                        ax.annotate(
+                            f"{row.get('family')}\n{row.get('component')} {row.get('group_name')}",
+                            (wrong, matched),
+                            textcoords="offset points",
+                            xytext=(4, 4),
+                            fontsize=7,
+                        )
+                    ax.set_xlim(lower, upper)
+                    ax.set_ylim(lower, upper)
+                ax.set_title(label)
+                ax.set_xlabel(f"wrong-pathway {metric}")
+                ax.set_ylabel(f"matched-pathway {metric}")
+                ax.grid(True, linewidth=0.35, alpha=0.35)
+            family_handles = [
+                plt.Line2D([0], [0], marker="o", color="w", label=family, markerfacecolor=family_palette.get(family, "#2b6cb0"), markeredgecolor="black", markersize=7)
+                for family in sorted({str(row.get("family")) for row in plot_rows if row.get("family")})
+            ]
+            component_handles = [
+                plt.Line2D([0], [0], marker=marker, color="black", label=component, linestyle="None", markersize=7)
+                for component, marker in component_markers.items()
+                if any(row.get("component") == component for row in plot_rows)
+            ]
+            handles = family_handles + component_handles
+            if handles:
+                fig.legend(handles=handles, loc="lower center", ncol=min(4, len(handles)), frameon=False, fontsize=8)
+            fig.tight_layout(rect=(0, 0.12, 1, 0.92))
+            pdf.savefig(fig)
             plt.close(fig)
 
 
@@ -2914,6 +3109,9 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--backend", choices=("official", "local"))
     p.add_argument("--checkpoint", type=Path)
 
+    p = sub.add_parser("plot-patching")
+    common(p)
+
     p = sub.add_parser("run-sequence")
     common(p)
     p.add_argument("--device", default="auto")
@@ -2949,6 +3147,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         plot_specialisation_atlas(cfg)
     elif args.command == "run-patching":
         run_patching(cfg, task, device_name=args.device, checkpoint=args.checkpoint, backend=args.backend)
+    elif args.command == "plot-patching":
+        plot_patching_summaries(cfg)
     elif args.command == "run-sequence":
         run_sequence(
             cfg,
