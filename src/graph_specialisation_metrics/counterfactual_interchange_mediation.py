@@ -159,7 +159,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "learning_rate": 3.0e-4,
         "weight_decay": 1.0e-5,
         "batch_size_graphs": 64,
-        "eval_batch_size_graphs": 256,
+        "eval_batch_size_graphs": 1024,
         "max_steps": 5000,
         "warmup_steps": 250,
         "lr_schedule": "cosine_decay_to_10_percent",
@@ -198,13 +198,17 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
     "cf_eval_budget": {
         "graphs_per_task": 1024,
+        "candidate_sample_limit_per_graph_family": 256,
         "interventions_per_graph_per_family": 16,
         "bin_allocation": {"null": 2, "low": 2, "medium": 4, "high": 8},
+        "progress_every_graphs": 25,
     },
     "patch_eval_budget": {
         "graphs_per_task": 256,
+        "candidate_sample_limit_per_graph_family": 256,
         "interventions_per_graph_per_family": 16,
         "bin_allocation": {"null": 2, "low": 2, "medium": 4, "high": 8},
+        "progress_every_graphs": 25,
     },
     "minimum_clean_performance": {
         "test_id_relmse_max": 0.02,
@@ -218,8 +222,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "cf_relmse_clean_multiplier_max": 2.0,
     },
     "specialisation": {
-        "num_permutations": 128,
-        "batch_size_graphs": 16,
+        "num_permutations": 32,
+        "batch_size_graphs": 64,
         "metrics": "routing,transport,output",
         "interventions": "content,structure",
         "blocks": "all,local,global",
@@ -230,10 +234,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "minimum_score_for_candidate": 0.25,
     },
     "patching": {
-        "max_interventions_per_family": 256,
-        "components": ["attn_probs", "message_pre_weight", "resid_contribution", "pair_state"],
+        "max_interventions_per_family": 32,
+        "components": ["attn_probs", "message_pre_weight", "resid_contribution"],
         "group_sizes": [1, 2, 4],
-        "random_groups_per_size": 100,
+        "random_groups_per_size": 10,
         "batch_size_graphs": 1,
         "allow_failed_gate_patching": False,
     },
@@ -1553,10 +1557,20 @@ def build_interventions(cfg: Mapping[str, Any], task: str, kind: str, *, force: 
     rng = random.Random(int(cfg["seeds"]["intervention_seed"]) + (0 if kind == "cf_eval" else 10000))
     selected_records = []
     manifest_rows = []
-    for base in records:
+    candidate_limit = int(budget.get("candidate_sample_limit_per_graph_family", 0))
+    progress_every = max(1, int(budget.get("progress_every_graphs", 25)))
+    print(
+        f"[interventions] start task={task} kind={kind} graphs={len(records)} "
+        f"families={','.join(families)} candidate_limit={candidate_limit or 'all'}",
+        flush=True,
+    )
+    for graph_idx, base in enumerate(records, start=1):
         for family in families:
             candidates = []
-            for u, v in candidate_pairs_for_family(base, family):
+            pairs = candidate_pairs_for_family(base, family)
+            if candidate_limit > 0 and len(pairs) > candidate_limit:
+                pairs = rng.sample(pairs, k=candidate_limit)
+            for u, v in pairs:
                 source = source_for_intervention(base, family, u, v, cfg)
                 deltas = pathway_deltas(base, source)
                 candidates.append(
@@ -1613,6 +1627,12 @@ def build_interventions(cfg: Mapping[str, Any], task: str, kind: str, *, force: 
                         "kind": kind,
                     }
                 )
+        if graph_idx == 1 or graph_idx % progress_every == 0 or graph_idx == len(records):
+            print(
+                f"[interventions] task={task} kind={kind} graphs={graph_idx}/{len(records)} "
+                f"selected={len(selected_records)}",
+                flush=True,
+            )
     out_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(selected_records, out_path)
     existing = [row for row in read_csv_dicts(manifest_path) if row.get("kind") != kind]
@@ -1655,6 +1675,8 @@ def mediation_metrics(delta_patch: torch.Tensor, target: torch.Tensor, delta_tot
 def clean_performance(cfg: Mapping[str, Any], task: str, model: nn.Module, device: torch.device) -> list[dict[str, Any]]:
     rows = []
     for split in ("test_id", "test_ood_64"):
+        split_start = time.time()
+        print(f"[clean] start task={task} split={split}", flush=True)
         records = load_records(data_dir(cfg, task) / f"{split}.pt")
         metrics, preds = evaluate_records(
             model,
@@ -1664,6 +1686,11 @@ def clean_performance(cfg: Mapping[str, Any], task: str, model: nn.Module, devic
         )
         torch.save({"pred": preds, "metrics": metrics}, checkpoint_dir(cfg, task) / f"{split}_predictions_best.pt")
         rows.append({"task": task, "split": split, **metrics})
+        print(
+            f"[clean] done task={task} split={split} relmse_mean={metrics['relmse_mean']:.6g} "
+            f"elapsed={time.time() - split_start:.1f}s",
+            flush=True,
+        )
     return rows
 
 
@@ -1685,6 +1712,13 @@ def evaluate_counterfactuals(
     interventions = torch.load(intervention_dir(cfg, task) / "cf_eval_interventions.pt", map_location="cpu", weights_only=False)
     rows = []
     batch_size = int(cfg["training"]["eval_batch_size_graphs"])
+    total_chunks = max(1, math.ceil(len(interventions) / batch_size))
+    print(
+        f"[counterfactuals] start task={task} interventions={len(interventions)} "
+        f"batch_size={batch_size} chunks={total_chunks}",
+        flush=True,
+    )
+    start_time = time.time()
     for start in range(0, len(interventions), batch_size):
         chunk = interventions[start : start + batch_size]
         base_batch = collate_records([row["base_graph"] for row in chunk]).to(device)
@@ -1715,6 +1749,14 @@ def evaluate_counterfactuals(
                     **metrics,
                 }
             )
+        chunk_idx = start // batch_size + 1
+        elapsed = time.time() - start_time
+        rate = len(rows) / max(elapsed, 1.0)
+        print(
+            f"[counterfactuals] task={task} chunk={chunk_idx}/{total_chunks} rows={len(rows)} "
+            f"rate={rate:.1f}/s elapsed={elapsed:.1f}s",
+            flush=True,
+        )
     cf_path = metrics_dir(cfg) / "counterfactual_metrics.csv"
     old = [row for row in read_csv_dicts(cf_path) if row.get("task") != task]
     write_csv(cf_path, old + rows)
@@ -1838,10 +1880,22 @@ def run_specialisation(
     )
     engine = SpecialisationMetricEngine(collector, options)
     batch_size = int(scfg["batch_size_graphs"])
+    print(
+        f"[specialisation] start task={task} graphs={len(records)} batch_size={batch_size} "
+        f"permutations={options.num_permutations}",
+        flush=True,
+    )
+    start_time = time.time()
     for start in range(0, len(records), batch_size):
         batch = collate_records(records[start : start + batch_size]).to(device)
         engine.compute_batch(batch, graph_indices=list(range(start, min(start + batch_size, len(records)))))
-        print(f"[specialisation] task={task} graphs={min(start + batch_size, len(records))}/{len(records)}", flush=True)
+        done = min(start + batch_size, len(records))
+        elapsed = time.time() - start_time
+        print(
+            f"[specialisation] task={task} graphs={done}/{len(records)} "
+            f"elapsed={elapsed:.1f}s",
+            flush=True,
+        )
     result = engine.results()
     summary_rows = [dict(row, task=task) for row in result.summary_rows]
     per_graph_rows = [dict(row, task=task) for row in result.per_graph_rows]
@@ -2284,7 +2338,13 @@ def run_patching(
             by_family[row["family"]].append(row)
     selected = [row for family_rows in by_family.values() for row in family_rows]
     specs = patch_specs_from_scores(run_cfg, task, model)
+    print(
+        f"[patching] start task={task} interventions={len(selected)} specs={len(specs)} "
+        f"components={','.join(run_cfg['patching']['components'])}",
+        flush=True,
+    )
     rows = []
+    start_time = time.time()
     for idx, intervention in enumerate(selected):
         base_batch = collate_records([intervention["base_graph"]]).to(device)
         source_batch = collate_records([intervention["source_graph"]]).to(device)
@@ -2331,7 +2391,13 @@ def run_patching(
                     "wrong_pathway_TCMA": wrong["TCMA"],
                 }
             )
-        print(f"[patching] task={task} intervention={idx + 1}/{len(selected)} rows={len(rows)}", flush=True)
+        elapsed = time.time() - start_time
+        rate = (idx + 1) / max(elapsed, 1.0)
+        print(
+            f"[patching] task={task} intervention={idx + 1}/{len(selected)} "
+            f"family={intervention['family']} rows={len(rows)} rate={rate:.2f}/s elapsed={elapsed:.1f}s",
+            flush=True,
+        )
     single = [row for row in rows if row["group_name"] == "single_head"]
     grouped = [row for row in rows if row["group_name"] != "single_head"]
     single_path = metrics_dir(cfg) / "patch_single_head_metrics.csv"
@@ -2534,18 +2600,28 @@ def run_sequence(
     force_data: bool,
     force_interventions: bool,
 ) -> None:
+    sequence_start = time.time()
+    print(f"[sequence] start task={task} skip_training={skip_training}", flush=True)
+    print(f"[sequence] stage=cache-data task={task}", flush=True)
     cache_data(cfg, task, force=force_data)
     if not skip_training:
+        print(f"[sequence] stage=train task={task}", flush=True)
         train(cfg, task, device_name=device_name, backend=backend)
+    print(f"[sequence] stage=build-interventions kind=cf_eval task={task}", flush=True)
     build_interventions(cfg, task, "cf_eval", force=force_interventions)
+    print(f"[sequence] stage=build-interventions kind=patch_eval task={task}", flush=True)
     build_interventions(cfg, task, "patch_eval", force=force_interventions)
+    print(f"[sequence] stage=evaluate-counterfactuals task={task}", flush=True)
     evaluate_counterfactuals(cfg, task, device_name=device_name, backend=backend)
     if (backend or cfg["model"].get("backend", "official")) == "official":
+        print(f"[sequence] stage=run-specialisation task={task}", flush=True)
         run_specialisation(cfg, task, device_name=device_name, backend=backend)
         if bool(cfg["patching"].get("allow_failed_gate_patching", False)) or task_clean_gate(cfg, task):
+            print(f"[sequence] stage=run-patching task={task}", flush=True)
             run_patching(cfg, task, device_name=device_name, backend=backend)
         else:
             print(f"[patching] skipped for {task}: clean gate failed", flush=True)
+    print(f"[sequence] done task={task} elapsed={time.time() - sequence_start:.1f}s", flush=True)
 
 
 def write_default_configs(output_dir: Path) -> None:
