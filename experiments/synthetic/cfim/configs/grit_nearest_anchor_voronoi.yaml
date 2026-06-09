@@ -85,14 +85,17 @@ training:
   weight_decay: 1.0e-05
   batch_size_graphs: 64
   eval_batch_size_graphs: 256
-  max_steps: 200000
-  warmup_steps: 5000
+  max_steps: 30000
+  warmup_steps: 1000
   lr_schedule: cosine_decay_to_10_percent
   gradient_clip_norm: 1.0
   loss: mse_node_mean
-  eval_every_steps: 2000
-  checkpoint_every_steps: 10000
+  eval_every_steps: 500
+  checkpoint_every_steps: 2500
   select_checkpoint: lowest_val_relmse
+  early_stop_val_relmse: 0.01
+  early_stop_min_steps: 3000
+  early_stop_patience_evals: 3
   mixed_precision: false
   deterministic_algorithms: true
   deterministic_warn_only: false

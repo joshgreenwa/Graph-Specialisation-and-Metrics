@@ -156,14 +156,17 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "weight_decay": 1.0e-5,
         "batch_size_graphs": 64,
         "eval_batch_size_graphs": 256,
-        "max_steps": 200000,
-        "warmup_steps": 5000,
+        "max_steps": 30000,
+        "warmup_steps": 1000,
         "lr_schedule": "cosine_decay_to_10_percent",
         "gradient_clip_norm": 1.0,
         "loss": "mse_node_mean",
-        "eval_every_steps": 2000,
-        "checkpoint_every_steps": 10000,
+        "eval_every_steps": 500,
+        "checkpoint_every_steps": 2500,
         "select_checkpoint": "lowest_val_relmse",
+        "early_stop_val_relmse": 0.01,
+        "early_stop_min_steps": 3000,
+        "early_stop_patience_evals": 3,
         "mixed_precision": False,
         "deterministic_algorithms": True,
         "deterministic_warn_only": False,
@@ -1434,7 +1437,10 @@ def train(cfg: Mapping[str, Any], task: str, *, device_name: str = "auto", backe
     batch_size = int(cfg["training"]["batch_size_graphs"])
     eval_batch = int(cfg["training"]["eval_batch_size_graphs"])
     start_time = time.time()
+    last_step = 0
+    early_stop_hits = 0
     for step in range(1, max_steps + 1):
+        last_step = step
         model.train()
         lr = lr_for_step(
             float(cfg["training"]["learning_rate"]),
@@ -1475,12 +1481,27 @@ def train(cfg: Mapping[str, Any], task: str, *, device_name: str = "auto", backe
                 f"val_relmse={row['val_relmse']:.6g} best={best_rel:.6g}",
                 flush=True,
             )
+            early_target = float(cfg["training"].get("early_stop_val_relmse", 0.0))
+            early_min_steps = int(cfg["training"].get("early_stop_min_steps", max_steps + 1))
+            early_patience = int(cfg["training"].get("early_stop_patience_evals", 0))
+            if early_target > 0.0 and early_patience > 0 and step >= early_min_steps:
+                if float(metrics["relmse_mean"]) <= early_target:
+                    early_stop_hits += 1
+                else:
+                    early_stop_hits = 0
+                if early_stop_hits >= early_patience:
+                    print(
+                        f"[early-stop] task={task} step={step} "
+                        f"val_relmse={metrics['relmse_mean']:.6g} target={early_target:.6g}",
+                        flush=True,
+                    )
+                    break
         if step % int(cfg["training"]["checkpoint_every_steps"]) == 0:
             save_checkpoint(run_dir / f"checkpoint_step{step:06d}.pt", model, cfg, task, step, best_rel, optimizer)
-    save_checkpoint(run_dir / "final.pt", model, cfg, task, max_steps, best_rel, optimizer)
+    save_checkpoint(run_dir / "final.pt", model, cfg, task, last_step, best_rel, optimizer)
     best_path = run_dir / "best.pt"
     if not best_path.exists():
-        save_checkpoint(best_path, model, cfg, task, max_steps, best_rel, optimizer)
+        save_checkpoint(best_path, model, cfg, task, last_step, best_rel, optimizer)
     manifest = {
         "task": task,
         "model": "grit",
