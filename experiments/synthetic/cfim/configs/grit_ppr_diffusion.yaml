@@ -128,7 +128,7 @@ splits:
     n: 32
 cf_eval_budget:
   graphs_per_task: 1024
-  candidate_sample_limit_per_graph_family: 256
+  candidate_sample_limit_per_graph_family: 64
   interventions_per_graph_per_family: 16
   bin_allocation:
     'null': 2

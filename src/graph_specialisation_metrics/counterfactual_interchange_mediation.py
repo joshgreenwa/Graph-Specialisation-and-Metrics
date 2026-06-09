@@ -198,7 +198,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
     "cf_eval_budget": {
         "graphs_per_task": 1024,
-        "candidate_sample_limit_per_graph_family": 256,
+        "candidate_sample_limit_per_graph_family": 64,
         "interventions_per_graph_per_family": 16,
         "bin_allocation": {"null": 2, "low": 2, "medium": 4, "high": 8},
         "progress_every_graphs": 25,
