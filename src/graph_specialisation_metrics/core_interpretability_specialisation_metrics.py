@@ -210,7 +210,17 @@ def clone_batch_with(batch: Any, **kwargs: Any) -> Any:
 
 
 def make_content_swapped_batch(batch: Any, perm_pos: torch.Tensor) -> Any:
-    return clone_batch_with(batch, node_type=gather_node_axis(batch.node_type, perm_pos))
+    updates: dict[str, torch.Tensor] = {}
+    if hasattr(batch, "node_type"):
+        updates["node_type"] = gather_node_axis(batch.node_type, perm_pos)
+    for name in ("x", "payload", "anchor_indicator", "anchor_priority"):
+        if hasattr(batch, name):
+            value = getattr(batch, name)
+            if isinstance(value, torch.Tensor):
+                updates[name] = gather_node_axis(value, perm_pos)
+    if not updates:
+        raise TypeError("content swap requires at least one node-level content tensor")
+    return clone_batch_with(batch, **updates)
 
 
 def permute_sparse_edges(batch: Any, perm_pos: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
