@@ -1704,8 +1704,8 @@ def evaluate_counterfactuals(
 ) -> None:
     device = choose_device(device_name)
     configure_runtime(cfg, device)
-    model, run_cfg = load_model_from_checkpoint(cfg, task, checkpoint, device, backend=backend)
-    clean_rows = clean_performance(run_cfg, task, model, device)
+    model, _run_cfg = load_model_from_checkpoint(cfg, task, checkpoint, device, backend=backend)
+    clean_rows = clean_performance(cfg, task, model, device)
     clean_path = metrics_dir(cfg) / "clean_performance.csv"
     old_clean = [row for row in read_csv_dicts(clean_path) if row.get("task") != task]
     write_csv(clean_path, old_clean + clean_rows)
@@ -1864,7 +1864,7 @@ def run_specialisation(
         raise RuntimeError("specialisation metrics require the official GRIT backend")
     device = choose_device(device_name)
     configure_runtime(cfg, device)
-    model, run_cfg = load_model_from_checkpoint(cfg, task, checkpoint, device, backend=backend)
+    model, _run_cfg = load_model_from_checkpoint(cfg, task, checkpoint, device, backend=backend)
     records = load_records(data_dir(cfg, task) / "patch_eval.pt")
     max_nodes = max(int(row["n"]) for row in records)
     collector = OfficialGRITFieldCollector(model, max_nodes=max_nodes)
@@ -2329,7 +2329,7 @@ def run_patching(
         raise RuntimeError("interchange patching requires official GRIT backend")
     device = choose_device(device_name)
     configure_runtime(cfg, device)
-    model, run_cfg = load_model_from_checkpoint(cfg, task, checkpoint, device, backend=backend)
+    model, _run_cfg = load_model_from_checkpoint(cfg, task, checkpoint, device, backend=backend)
     interventions = torch.load(intervention_dir(cfg, task) / "patch_eval_interventions.pt", map_location="cpu", weights_only=False)
     max_per_family = int(cfg["patching"]["max_interventions_per_family"])
     by_family: dict[str, list[dict[str, Any]]] = defaultdict(list)
@@ -2337,10 +2337,10 @@ def run_patching(
         if row["effect_bin"] in {"high", "null"} and len(by_family[row["family"]]) < max_per_family:
             by_family[row["family"]].append(row)
     selected = [row for family_rows in by_family.values() for row in family_rows]
-    specs = patch_specs_from_scores(run_cfg, task, model)
+    specs = patch_specs_from_scores(cfg, task, model)
     print(
         f"[patching] start task={task} interventions={len(selected)} specs={len(specs)} "
-        f"components={','.join(run_cfg['patching']['components'])}",
+        f"components={','.join(cfg['patching']['components'])}",
         flush=True,
     )
     rows = []
