@@ -9,6 +9,7 @@ from graph_specialisation_metrics.counterfactual_interchange_mediation import (
     load_config,
     make_graph_record,
     pathway_deltas,
+    response_predictivity_contrast_rows,
     response_feature_sets,
     source_for_intervention,
 )
@@ -108,3 +109,23 @@ def test_response_predictivity_grouped_cv_finds_simple_signal():
     assert summary["folds"] == 4
     assert summary["groups"] == 12
     assert summary["r2_mean"] > 0.95
+
+
+def test_response_predictivity_contrasts_mark_matched_sets():
+    rows = [
+        {"family": "ppr_payload_swap", "target": "teacher_pathway_norm", "feature_set": "intercept_only", "r2_mean": "0.0"},
+        {"family": "ppr_payload_swap", "target": "teacher_pathway_norm", "feature_set": "transport_scores", "r2_mean": "0.8", "pearson_oof": "0.9", "spearman_oof": "0.85"},
+        {"family": "ppr_payload_swap", "target": "teacher_pathway_norm", "feature_set": "routing_scores", "r2_mean": "0.3"},
+        {"family": "ppr_payload_swap", "target": "teacher_pathway_norm", "feature_set": "all_scores", "r2_mean": "0.95"},
+        {"family": "ppr_payload_swap", "target": "student_teacher_pathway_projection", "feature_set": "intercept_only", "r2_mean": "0.0"},
+        {"family": "ppr_payload_swap", "target": "student_teacher_pathway_projection", "feature_set": "transport_scores", "r2_mean": "0.7"},
+        {"family": "ppr_payload_swap", "target": "student_teacher_pathway_projection", "feature_set": "routing_scores", "r2_mean": "0.2"},
+        {"family": "ppr_payload_swap", "target": "student_teacher_pathway_projection", "feature_set": "all_scores", "r2_mean": "0.9"},
+    ]
+    contrasts = response_predictivity_contrast_rows(rows, "ppr_diffusion")
+    teacher = next(row for row in contrasts if row["target"] == "teacher_pathway_norm")
+    student = next(row for row in contrasts if row["target"] == "student_teacher_pathway_projection")
+    assert teacher["matched_feature_set"] == "transport_scores"
+    assert teacher["mismatched_feature_set"] == "routing_scores"
+    assert teacher["matched_minus_mismatched_r2"] == 0.5
+    assert student["matched_minus_intercept_r2"] == 0.7

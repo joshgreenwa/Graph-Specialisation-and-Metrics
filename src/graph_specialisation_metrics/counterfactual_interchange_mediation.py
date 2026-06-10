@@ -2906,8 +2906,10 @@ def run_response_predictivity(
     write_csv(summary_path, summary_rows)
     write_csv(coef_path, coefficient_rows)
     plot_response_predictivity_summary(cfg, task)
+    contrast_path = write_response_predictivity_contrasts(cfg, task)
     print(
-        f"[response-predictivity] wrote features={feature_path} cv={summary_path} coefficients={coef_path}",
+        f"[response-predictivity] wrote features={feature_path} cv={summary_path} "
+        f"coefficients={coef_path} contrasts={contrast_path}",
         flush=True,
     )
 
@@ -3615,6 +3617,151 @@ def plot_response_predictivity_summary(cfg: Mapping[str, Any], task: str) -> Non
             plt.close(fig)
 
 
+def response_cv_row(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    family: str,
+    target: str,
+    feature_set: str,
+) -> Optional[Mapping[str, Any]]:
+    for row in rows:
+        if (
+            row.get("family") == family
+            and row.get("target") == target
+            and row.get("feature_set") == feature_set
+        ):
+            return row
+    return None
+
+
+def response_cv_float(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    family: str,
+    target: str,
+    feature_set: str,
+    key: str,
+) -> float:
+    row = response_cv_row(rows, family=family, target=target, feature_set=feature_set)
+    if row is None:
+        return float("nan")
+    try:
+        return float(row[key])
+    except Exception:
+        return float("nan")
+
+
+def response_predictivity_contrast_rows(
+    rows: Sequence[Mapping[str, Any]],
+    task: str,
+) -> list[dict[str, Any]]:
+    targets = ["teacher_pathway_norm", "student_teacher_pathway_projection"]
+    families = [
+        family
+        for family in (PPR_FAMILIES if task == "ppr_diffusion" else VORONOI_FAMILIES)
+        if any(row.get("family") == family for row in rows)
+    ]
+    out = []
+    for family in families:
+        matched = "transport_scores" if PATHWAY_BY_FAMILY[family] == "M" else "routing_scores"
+        mismatched = "routing_scores" if matched == "transport_scores" else "transport_scores"
+        for target in targets:
+            intercept_r2 = response_cv_float(rows, family=family, target=target, feature_set="intercept_only", key="r2_mean")
+            matched_r2 = response_cv_float(rows, family=family, target=target, feature_set=matched, key="r2_mean")
+            mismatched_r2 = response_cv_float(rows, family=family, target=target, feature_set=mismatched, key="r2_mean")
+            all_r2 = response_cv_float(rows, family=family, target=target, feature_set="all_scores", key="r2_mean")
+            out.append(
+                {
+                    "task": task,
+                    "family": family,
+                    "pathway_target": PATHWAY_BY_FAMILY[family],
+                    "target": target,
+                    "matched_feature_set": matched,
+                    "mismatched_feature_set": mismatched,
+                    "intercept_r2_mean": intercept_r2,
+                    "matched_r2_mean": matched_r2,
+                    "mismatched_r2_mean": mismatched_r2,
+                    "all_r2_mean": all_r2,
+                    "matched_minus_intercept_r2": matched_r2 - intercept_r2,
+                    "matched_minus_mismatched_r2": matched_r2 - mismatched_r2,
+                    "all_minus_matched_r2": all_r2 - matched_r2,
+                    "matched_pearson_oof": response_cv_float(rows, family=family, target=target, feature_set=matched, key="pearson_oof"),
+                    "matched_spearman_oof": response_cv_float(rows, family=family, target=target, feature_set=matched, key="spearman_oof"),
+                }
+            )
+    return out
+
+
+def plot_response_predictivity_contrasts(
+    cfg: Mapping[str, Any],
+    task: str,
+    contrast_rows: Sequence[Mapping[str, Any]],
+) -> None:
+    if not contrast_rows:
+        return
+    out = figures_main_dir(cfg) / f"fig7_response_predictivity_teacher_student_{task}.pdf"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    targets = ["teacher_pathway_norm", "student_teacher_pathway_projection"]
+    target_labels = {
+        "teacher_pathway_norm": "teacher effect",
+        "student_teacher_pathway_projection": "student teacher-aligned effect",
+    }
+    families = [
+        family
+        for family in (PPR_FAMILIES if task == "ppr_diffusion" else VORONOI_FAMILIES)
+        if any(row.get("family") == family for row in contrast_rows)
+    ]
+    fig, axes = plt.subplots(
+        1,
+        len(families),
+        figsize=(max(7.5, 4.2 * len(families)), 4.4),
+        sharey=True,
+        squeeze=False,
+    )
+    fig.suptitle(f"{task}: matched score predictivity for teacher vs student targets", fontsize=12)
+    for ax, family in zip(axes.reshape(-1), families):
+        family_rows = [row for row in contrast_rows if row.get("family") == family]
+        x = np.arange(len(targets), dtype=float)
+        matched_delta = []
+        specificity_delta = []
+        all_delta = []
+        for target in targets:
+            row = next((item for item in family_rows if item.get("target") == target), None)
+            if row is None:
+                matched_delta.append(float("nan"))
+                specificity_delta.append(float("nan"))
+                all_delta.append(float("nan"))
+                continue
+            matched_delta.append(float(row["matched_minus_intercept_r2"]))
+            specificity_delta.append(float(row["matched_minus_mismatched_r2"]))
+            all_delta.append(float(row["all_minus_matched_r2"]))
+        width = 0.24
+        ax.bar(x - width, matched_delta, width=width, label="matched - intercept", color="#2b6cb0")
+        ax.bar(x, specificity_delta, width=width, label="matched - mismatched", color="#2f855a")
+        ax.bar(x + width, all_delta, width=width, label="all - matched", color="#805ad5")
+        ax.axhline(0.0, color="black", linewidth=0.8)
+        ax.set_title(family)
+        ax.set_xticks(x)
+        ax.set_xticklabels([target_labels[target] for target in targets], rotation=15, ha="right", fontsize=8)
+        ax.set_ylabel("held-out R2 difference")
+        ax.grid(axis="y", linewidth=0.35, alpha=0.35)
+    handles, labels = axes[0][0].get_legend_handles_labels()
+    if handles:
+        fig.legend(handles, labels, loc="lower center", ncol=min(3, len(handles)), frameon=False)
+    fig.tight_layout(rect=(0, 0.13, 1, 0.91))
+    fig.savefig(out)
+    plt.close(fig)
+
+
+def write_response_predictivity_contrasts(cfg: Mapping[str, Any], task: str) -> Path:
+    rows = read_csv_dicts(metrics_dir(cfg) / f"response_predictivity_cv_{task}.csv")
+    out = metrics_dir(cfg) / f"response_predictivity_contrasts_{task}.csv"
+    contrast_rows = response_predictivity_contrast_rows(rows, task)
+    write_csv(out, contrast_rows)
+    plot_response_predictivity_contrasts(cfg, task, contrast_rows)
+    return out
+
+
 def run_sequence(
     cfg: Mapping[str, Any],
     task: str,
@@ -3735,6 +3882,9 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--ridge-alpha", type=float)
     p.add_argument("--centered", action="store_true")
 
+    p = sub.add_parser("plot-response-predictivity")
+    common(p)
+
     p = sub.add_parser("run-sequence")
     common(p)
     p.add_argument("--device", default="auto")
@@ -3788,6 +3938,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             ridge_alpha=args.ridge_alpha,
             centered=True if args.centered else None,
         )
+    elif args.command == "plot-response-predictivity":
+        plot_response_predictivity_summary(cfg, task)
+        contrast_path = write_response_predictivity_contrasts(cfg, task)
+        print(f"[plot-response-predictivity] wrote contrasts={contrast_path}", flush=True)
     elif args.command == "run-sequence":
         run_sequence(
             cfg,
