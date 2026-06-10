@@ -242,6 +242,16 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "batch_size_graphs": 1,
         "allow_failed_gate_patching": False,
     },
+    "response_predictivity": {
+        "intervention_kind": "cf_eval",
+        "families": [],
+        "max_interventions_per_family": 4096,
+        "batch_size_graphs": 64,
+        "folds": 5,
+        "ridge_alpha": 1.0,
+        "centered": False,
+        "seed": 7001,
+    },
     "bootstrap": {"resamples": 2000, "confidence_interval": 95, "seed": 6060},
 }
 
@@ -2411,6 +2421,497 @@ def run_patching(
     plot_patching_summaries(cfg)
 
 
+def collect_official_fields_and_prediction(
+    model: nn.Module,
+    batch: CFIMBatch,
+    *,
+    max_nodes: int,
+) -> tuple[torch.Tensor, list[Any]]:
+    from graph_specialisation_metrics.core_interpretability_specialisation_metrics import OfficialGRITFieldCollector
+
+    collector = OfficialGRITFieldCollector(model, max_nodes=max_nodes)
+    records: list[Any] = []
+    handles = []
+
+    def make_hook(layer_idx: int):
+        def hook(module: nn.Module, inputs: tuple[Any, ...], _outputs: Any) -> None:
+            pyg_batch = inputs[0]
+            records.append(collector._densify(layer_idx, module, pyg_batch, batch.node_mask))
+
+        return hook
+
+    model.eval()
+    for layer_idx, layer in enumerate(model.layers):
+        handles.append(layer.attention.register_forward_hook(make_hook(layer_idx)))
+    try:
+        with torch.no_grad():
+            pred = model(batch)
+    finally:
+        for handle in handles:
+            handle.remove()
+    records.sort(key=lambda item: item.layer)
+    if not records:
+        raise RuntimeError("no official GRIT fields collected for response predictivity")
+    return pred.detach(), records
+
+
+def masked_query_mean(scores: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
+    weights = valid.to(scores.dtype)
+    return (scores * weights).sum(dim=2) / weights.sum(dim=2).clamp_min(1.0)
+
+
+def exact_response_score_features(
+    clean_layers: Sequence[Any],
+    source_layers: Sequence[Any],
+    base_batch: CFIMBatch,
+    perm_pos: torch.Tensor,
+    swap_u: torch.Tensor,
+    swap_v: torch.Tensor,
+    *,
+    centered: bool,
+) -> dict[str, torch.Tensor]:
+    from graph_specialisation_metrics.core_interpretability_specialisation_metrics import (
+        block_key_membership,
+        cosine_by_query,
+        expand_mask,
+        key_swap_field,
+        transposition_valid_for_block,
+    )
+
+    block_mask = block_key_membership(base_batch, "all")
+    out: dict[str, torch.Tensor] = {}
+    for clean, source in zip(clean_layers, source_layers):
+        for field_name, clean_field, source_field in [
+            ("routing", clean.attention, source.attention),
+            ("transport", clean.message, source.message),
+        ]:
+            ref = key_swap_field(clean_field, perm_pos)
+            clean_mask = expand_mask(clean.mask, clean_field)
+            source_mask = expand_mask(source.mask, source_field)
+            ref_mask = key_swap_field(clean_mask.long(), perm_pos).bool()
+            block_m = block_mask[:, None, :, :].to(device=clean_field.device)
+            if block_m.size(1) == 1 and clean_field.size(1) != 1:
+                block_m = block_m.expand(-1, clean_field.size(1), -1, -1)
+            query_valid = transposition_valid_for_block(block_mask, swap_u, swap_v).to(device=clean_field.device)
+            if query_valid.size(1) == 1 and clean_field.size(1) != 1:
+                query_valid = query_valid.expand(-1, clean_field.size(1), -1)
+            stable_mask = clean_mask & source_mask & block_m
+            follow_mask = ref_mask & source_mask & block_m
+            valid_score = (stable_mask.any(dim=3) | follow_mask.any(dim=3)) & query_valid
+            invariant = cosine_by_query(source_field, clean_field, stable_mask, centered=centered)
+            follow = cosine_by_query(source_field, ref, follow_mask, centered=centered)
+            out[f"L{clean.layer}_{field_name}_invariant"] = masked_query_mean(invariant, valid_score)
+            out[f"L{clean.layer}_{field_name}_follow"] = masked_query_mean(follow, valid_score)
+    return out
+
+
+def select_response_predictivity_interventions(
+    cfg: Mapping[str, Any],
+    task: str,
+    *,
+    kind: str,
+    families: Sequence[str],
+    max_per_family: int,
+    seed: int,
+) -> list[dict[str, Any]]:
+    path = intervention_dir(cfg, task) / f"{kind}_interventions.pt"
+    interventions = torch.load(path, map_location="cpu", weights_only=False)
+    rng = random.Random(int(seed))
+    selected: list[dict[str, Any]] = []
+    for family in families:
+        rows = [row for row in interventions if row.get("family") == family]
+        if max_per_family > 0 and len(rows) > max_per_family:
+            by_bin: dict[str, list[dict[str, Any]]] = defaultdict(list)
+            for row in rows:
+                by_bin[str(row.get("effect_bin", ""))].append(row)
+            quota = max(1, max_per_family // max(1, len(by_bin)))
+            sampled: list[dict[str, Any]] = []
+            for bin_rows in by_bin.values():
+                pool = list(bin_rows)
+                rng.shuffle(pool)
+                sampled.extend(pool[:quota])
+            if len(sampled) < max_per_family:
+                used = {str(row.get("intervention_id")) for row in sampled}
+                remainder = [row for row in rows if str(row.get("intervention_id")) not in used]
+                rng.shuffle(remainder)
+                sampled.extend(remainder[: max_per_family - len(sampled)])
+            rows = sampled[:max_per_family]
+        selected.extend(rows)
+    selected.sort(key=lambda row: (str(row.get("family")), str(row.get("graph_id")), str(row.get("intervention_id"))))
+    return selected
+
+
+def effect_targets_for_intervention(
+    row: Mapping[str, Any],
+    y_base: torch.Tensor,
+    y_source: torch.Tensor,
+) -> dict[str, float]:
+    n = int(row["base_graph"]["n"])
+    family = str(row["family"])
+    pathway = PATHWAY_BY_FAMILY[family]
+    deltas = pathway_deltas(row["base_graph"], row["source_graph"])
+    teacher_path = deltas[pathway][:n].float()
+    teacher_total = deltas["total"][:n].float()
+    student = (y_source[:n] - y_base[:n]).detach().cpu().float()
+    path_flat = teacher_path.reshape(-1)
+    total_flat = teacher_total.reshape(-1)
+    student_flat = student.reshape(-1)
+    path_norm = torch.linalg.vector_norm(path_flat).clamp_min(EPS)
+    total_norm = torch.linalg.vector_norm(total_flat).clamp_min(EPS)
+    student_norm = torch.linalg.vector_norm(student_flat).clamp_min(EPS)
+    dot_path = torch.dot(student_flat, path_flat)
+    dot_total = torch.dot(student_flat, total_flat)
+    return {
+        "teacher_pathway_norm": float(path_norm),
+        "teacher_total_norm": float(total_norm),
+        "student_delta_norm": float(student_norm),
+        "student_teacher_pathway_projection": float(dot_path / path_norm),
+        "student_teacher_pathway_beta": float(dot_path / path_norm.square().clamp_min(EPS)),
+        "student_teacher_pathway_cea": float(dot_path / (student_norm * path_norm).clamp_min(EPS)),
+        "student_teacher_total_projection": float(dot_total / total_norm),
+        "student_teacher_total_beta": float(dot_total / total_norm.square().clamp_min(EPS)),
+        "student_teacher_total_cea": float(dot_total / (student_norm * total_norm).clamp_min(EPS)),
+    }
+
+
+def compute_response_predictivity_table(
+    cfg: Mapping[str, Any],
+    task: str,
+    *,
+    interventions: Sequence[Mapping[str, Any]],
+    model: nn.Module,
+    device: torch.device,
+    batch_size: int,
+    centered: bool,
+) -> list[dict[str, Any]]:
+    max_nodes = max(int(row["base_graph"]["n"]) for row in interventions)
+    rows: list[dict[str, Any]] = []
+    total_chunks = max(1, math.ceil(len(interventions) / int(batch_size)))
+    start_time = time.time()
+    for start in range(0, len(interventions), int(batch_size)):
+        chunk = list(interventions[start : start + int(batch_size)])
+        base_batch = collate_records([row["base_graph"] for row in chunk]).to(device)
+        source_batch = collate_records([row["source_graph"] for row in chunk]).to(device)
+        perm_pos = torch.stack(
+            [transposition_perm(int(row["base_graph"]["n"]), int(row["u"]), int(row["v"])) for row in chunk],
+            dim=0,
+        ).to(device)
+        swap_u = torch.tensor([int(row["u"]) for row in chunk], dtype=torch.long, device=device)
+        swap_v = torch.tensor([int(row["v"]) for row in chunk], dtype=torch.long, device=device)
+        y_base, clean_layers = collect_official_fields_and_prediction(model, base_batch, max_nodes=max_nodes)
+        y_source, source_layers = collect_official_fields_and_prediction(model, source_batch, max_nodes=max_nodes)
+        features = exact_response_score_features(
+            clean_layers,
+            source_layers,
+            base_batch,
+            perm_pos,
+            swap_u,
+            swap_v,
+            centered=centered,
+        )
+        feature_cpu = {name: value.detach().cpu() for name, value in features.items()}
+        for idx, row in enumerate(chunk):
+            target_values = effect_targets_for_intervention(row, y_base[idx], y_source[idx])
+            out = {
+                "task": task,
+                "intervention_id": row["intervention_id"],
+                "graph_id": row["graph_id"],
+                "family": row["family"],
+                "effect_bin": row["effect_bin"],
+                "pathway_target": row["pathway_target"],
+                "u": int(row["u"]),
+                "v": int(row["v"]),
+                "centered": bool(centered),
+                **target_values,
+            }
+            for name, tensor in feature_cpu.items():
+                for head in range(tensor.size(1)):
+                    out[f"{name}_H{head}"] = float(tensor[idx, head])
+            rows.append(out)
+        chunk_idx = start // int(batch_size) + 1
+        elapsed = time.time() - start_time
+        print(
+            f"[response-predictivity] features task={task} chunk={chunk_idx}/{total_chunks} "
+            f"rows={len(rows)} elapsed={elapsed:.1f}s",
+            flush=True,
+        )
+    return rows
+
+
+def numeric_matrix(rows: Sequence[Mapping[str, Any]], columns: Sequence[str]) -> np.ndarray:
+    if not columns:
+        return np.empty((len(rows), 0), dtype=np.float64)
+    matrix = np.empty((len(rows), len(columns)), dtype=np.float64)
+    for row_idx, row in enumerate(rows):
+        for col_idx, col in enumerate(columns):
+            try:
+                value = float(row[col])
+            except Exception:
+                value = float("nan")
+            matrix[row_idx, col_idx] = value
+    return matrix
+
+
+def rank_values(values: np.ndarray) -> np.ndarray:
+    order = np.argsort(values, kind="mergesort")
+    ranks = np.empty_like(order, dtype=np.float64)
+    ranks[order] = np.arange(len(values), dtype=np.float64)
+    return ranks
+
+
+def pearson_corr(a: np.ndarray, b: np.ndarray) -> float:
+    if len(a) < 2:
+        return float("nan")
+    aa = a - float(np.mean(a))
+    bb = b - float(np.mean(b))
+    denom = math.sqrt(float(np.dot(aa, aa) * np.dot(bb, bb)))
+    if denom <= EPS:
+        return float("nan")
+    return float(np.dot(aa, bb) / denom)
+
+
+def spearman_corr(a: np.ndarray, b: np.ndarray) -> float:
+    return pearson_corr(rank_values(a), rank_values(b))
+
+
+def grouped_folds(groups: Sequence[str], folds: int, seed: int) -> list[set[str]]:
+    unique = sorted(set(groups))
+    rng = random.Random(int(seed))
+    rng.shuffle(unique)
+    k = max(2, min(int(folds), len(unique)))
+    out = [set() for _ in range(k)]
+    for idx, group in enumerate(unique):
+        out[idx % k].add(group)
+    return out
+
+
+def fit_ridge_standardized(
+    x_train: np.ndarray,
+    y_train: np.ndarray,
+    x_test: np.ndarray,
+    *,
+    alpha: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+    if x_train.shape[1] == 0:
+        pred = np.full(x_test.shape[0], float(np.mean(y_train)), dtype=np.float64)
+        return pred, np.empty(0), np.empty(0), float(np.mean(y_train))
+    mean = np.nanmean(x_train, axis=0)
+    std = np.nanstd(x_train, axis=0)
+    std = np.where(std < 1.0e-8, 1.0, std)
+    xtr = np.nan_to_num((x_train - mean) / std)
+    xte = np.nan_to_num((x_test - mean) / std)
+    y_mean = float(np.mean(y_train))
+    yc = y_train - y_mean
+    gram = xtr.T @ xtr
+    rhs = xtr.T @ yc
+    weights = np.linalg.solve(gram + float(alpha) * np.eye(gram.shape[0]), rhs)
+    pred = xte @ weights + y_mean
+    return pred, weights, mean, y_mean
+
+
+def cv_ridge_summary(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    feature_columns: Sequence[str],
+    target_column: str,
+    folds: int,
+    alpha: float,
+    seed: int,
+) -> dict[str, Any]:
+    groups = [str(row["graph_id"]) for row in rows]
+    fold_groups = grouped_folds(groups, folds, seed)
+    x = numeric_matrix(rows, feature_columns)
+    y = np.asarray([float(row[target_column]) for row in rows], dtype=np.float64)
+    fold_rows = []
+    predictions = np.full(len(rows), np.nan, dtype=np.float64)
+    for fold_idx, held_groups in enumerate(fold_groups):
+        test_mask = np.asarray([group in held_groups for group in groups], dtype=bool)
+        train_mask = ~test_mask
+        if not bool(test_mask.any()) or not bool(train_mask.any()):
+            continue
+        pred, _weights, _mean, _y_mean = fit_ridge_standardized(
+            x[train_mask],
+            y[train_mask],
+            x[test_mask],
+            alpha=alpha,
+        )
+        predictions[test_mask] = pred
+        y_test = y[test_mask]
+        sse = float(np.square(y_test - pred).sum())
+        sst = float(np.square(y_test - float(np.mean(y_test))).sum())
+        r2 = float("nan") if sst <= EPS else 1.0 - sse / sst
+        fold_rows.append(
+            {
+                "fold": fold_idx,
+                "r2": r2,
+                "pearson": pearson_corr(y_test, pred),
+                "spearman": spearman_corr(y_test, pred),
+                "n_test": int(test_mask.sum()),
+                "groups_test": len(held_groups),
+            }
+        )
+    valid = np.isfinite(predictions)
+    return {
+        "n": len(rows),
+        "groups": len(set(groups)),
+        "folds": len(fold_rows),
+        "r2_mean": float(np.nanmean([row["r2"] for row in fold_rows])) if fold_rows else float("nan"),
+        "r2_std": float(np.nanstd([row["r2"] for row in fold_rows])) if fold_rows else float("nan"),
+        "pearson_oof": pearson_corr(y[valid], predictions[valid]) if bool(valid.any()) else float("nan"),
+        "spearman_oof": spearman_corr(y[valid], predictions[valid]) if bool(valid.any()) else float("nan"),
+        "target_mean": float(np.mean(y)),
+        "target_std": float(np.std(y)),
+    }
+
+
+def final_ridge_coefficients(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    feature_columns: Sequence[str],
+    target_column: str,
+    alpha: float,
+) -> list[dict[str, Any]]:
+    if not feature_columns:
+        return []
+    x = numeric_matrix(rows, feature_columns)
+    y = np.asarray([float(row[target_column]) for row in rows], dtype=np.float64)
+    _pred, weights, _mean, _y_mean = fit_ridge_standardized(x, y, x, alpha=alpha)
+    return [
+        {"feature": feature, "standardized_coefficient": float(weight)}
+        for feature, weight in zip(feature_columns, weights)
+    ]
+
+
+def response_feature_sets(feature_columns: Sequence[str]) -> dict[str, list[str]]:
+    return {
+        "intercept_only": [],
+        "all_scores": list(feature_columns),
+        "routing_scores": [col for col in feature_columns if "_routing_" in col],
+        "transport_scores": [col for col in feature_columns if "_transport_" in col],
+        "follow_scores": [col for col in feature_columns if "_follow_" in col],
+        "invariant_scores": [col for col in feature_columns if "_invariant_" in col],
+    }
+
+
+def run_response_predictivity(
+    cfg: Mapping[str, Any],
+    task: str,
+    *,
+    device_name: str = "auto",
+    checkpoint: Optional[Path] = None,
+    backend: Optional[str] = None,
+    families: Optional[Sequence[str]] = None,
+    kind: Optional[str] = None,
+    max_interventions_per_family: Optional[int] = None,
+    batch_size: Optional[int] = None,
+    folds: Optional[int] = None,
+    ridge_alpha: Optional[float] = None,
+    centered: Optional[bool] = None,
+) -> None:
+    if (backend or cfg["model"].get("backend", "official")) != "official":
+        raise RuntimeError("response predictivity currently requires official GRIT fields")
+    pcfg = cfg.get("response_predictivity", {})
+    default_families = PPR_FAMILIES if task == "ppr_diffusion" else VORONOI_FAMILIES
+    selected_families = list(families or pcfg.get("families") or default_families)
+    selected_kind = str(kind or pcfg.get("intervention_kind", "cf_eval"))
+    max_per_family = int(max_interventions_per_family if max_interventions_per_family is not None else pcfg.get("max_interventions_per_family", 4096))
+    batch = int(batch_size if batch_size is not None else pcfg.get("batch_size_graphs", 64))
+    n_folds = int(folds if folds is not None else pcfg.get("folds", 5))
+    alpha = float(ridge_alpha if ridge_alpha is not None else pcfg.get("ridge_alpha", 1.0))
+    use_centered = bool(centered if centered is not None else pcfg.get("centered", False))
+    seed = int(pcfg.get("seed", 7001))
+    device = choose_device(device_name)
+    configure_runtime(cfg, device)
+    model, _run_cfg = load_model_from_checkpoint(cfg, task, checkpoint, device, backend=backend)
+    interventions = select_response_predictivity_interventions(
+        cfg,
+        task,
+        kind=selected_kind,
+        families=selected_families,
+        max_per_family=max_per_family,
+        seed=seed,
+    )
+    print(
+        f"[response-predictivity] start task={task} kind={selected_kind} "
+        f"families={','.join(selected_families)} interventions={len(interventions)} "
+        f"batch_size={batch}",
+        flush=True,
+    )
+    rows = compute_response_predictivity_table(
+        cfg,
+        task,
+        interventions=interventions,
+        model=model,
+        device=device,
+        batch_size=batch,
+        centered=use_centered,
+    )
+    feature_path = metrics_dir(cfg) / f"response_predictivity_features_{task}.csv"
+    write_csv(feature_path, rows)
+    feature_columns = sorted([key for key in rows[0] if key.startswith("L") and ("_routing_" in key or "_transport_" in key)]) if rows else []
+    targets = [
+        "teacher_pathway_norm",
+        "student_teacher_pathway_projection",
+        "student_delta_norm",
+    ]
+    feature_sets = response_feature_sets(feature_columns)
+    summary_rows = []
+    coefficient_rows = []
+    for family in selected_families:
+        family_rows = [row for row in rows if row.get("family") == family]
+        if not family_rows:
+            continue
+        matched_set = "transport_scores" if PATHWAY_BY_FAMILY[family] == "M" else "routing_scores"
+        mismatched_set = "routing_scores" if matched_set == "transport_scores" else "transport_scores"
+        for target in targets:
+            for set_name, cols in feature_sets.items():
+                summary = cv_ridge_summary(
+                    family_rows,
+                    feature_columns=cols,
+                    target_column=target,
+                    folds=n_folds,
+                    alpha=alpha,
+                    seed=seed,
+                )
+                summary_rows.append(
+                    {
+                        "task": task,
+                        "family": family,
+                        "target": target,
+                        "feature_set": set_name,
+                        "matched_set": set_name == matched_set,
+                        "mismatched_set": set_name == mismatched_set,
+                        "ridge_alpha": alpha,
+                        **summary,
+                    }
+                )
+                for coef in final_ridge_coefficients(
+                    family_rows,
+                    feature_columns=cols,
+                    target_column=target,
+                    alpha=alpha,
+                ):
+                    coefficient_rows.append(
+                        {
+                            "task": task,
+                            "family": family,
+                            "target": target,
+                            "feature_set": set_name,
+                            "ridge_alpha": alpha,
+                            **coef,
+                        }
+                    )
+    summary_path = metrics_dir(cfg) / f"response_predictivity_cv_{task}.csv"
+    coef_path = metrics_dir(cfg) / f"response_predictivity_coefficients_{task}.csv"
+    write_csv(summary_path, summary_rows)
+    write_csv(coef_path, coefficient_rows)
+    plot_response_predictivity_summary(cfg, task)
+    print(
+        f"[response-predictivity] wrote features={feature_path} cv={summary_path} coefficients={coef_path}",
+        flush=True,
+    )
+
+
 def write_mediation_decisions(cfg: Mapping[str, Any]) -> None:
     rows = read_csv_dicts(metrics_dir(cfg) / "patch_group_metrics.csv")
     decisions = []
@@ -3054,6 +3555,66 @@ def plot_routing_transport_specificity(cfg: Mapping[str, Any], rows: Sequence[Ma
     print(f"[plot-patching] wrote {out} pages={pages_written}", flush=True)
 
 
+def plot_response_predictivity_summary(cfg: Mapping[str, Any], task: str) -> None:
+    rows = read_csv_dicts(metrics_dir(cfg) / f"response_predictivity_cv_{task}.csv")
+    if not rows:
+        return
+    out = figures_main_dir(cfg) / f"fig6_response_predictivity_{task}.pdf"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    targets = [
+        "teacher_pathway_norm",
+        "student_teacher_pathway_projection",
+        "student_delta_norm",
+    ]
+    feature_sets = ["intercept_only", "routing_scores", "transport_scores", "all_scores"]
+    families = [family for family in (PPR_FAMILIES if task == "ppr_diffusion" else VORONOI_FAMILIES) if any(row.get("family") == family for row in rows)]
+    if not families:
+        return
+    with PdfPages(out) as pdf:
+        for target in targets:
+            fig, axes = plt.subplots(
+                1,
+                len(families),
+                figsize=(max(7.0, 4.0 * len(families)), 4.2),
+                sharey=True,
+                squeeze=False,
+            )
+            fig.suptitle(f"{task}: grouped-CV response predictivity ({target})", fontsize=12)
+            for ax, family in zip(axes.reshape(-1), families):
+                values = []
+                labels = []
+                colors = []
+                matched = "transport_scores" if PATHWAY_BY_FAMILY[family] == "M" else "routing_scores"
+                for feature_set in feature_sets:
+                    subset = [
+                        row
+                        for row in rows
+                        if row.get("family") == family
+                        and row.get("target") == target
+                        and row.get("feature_set") == feature_set
+                    ]
+                    if not subset:
+                        continue
+                    try:
+                        value = float(subset[0]["r2_mean"])
+                    except Exception:
+                        value = float("nan")
+                    values.append(value)
+                    labels.append(feature_set.replace("_scores", "").replace("_", "\n"))
+                    colors.append("#2b6cb0" if feature_set == matched else ("#718096" if feature_set == "intercept_only" else "#805ad5"))
+                x = np.arange(len(values))
+                ax.bar(x, values, color=colors)
+                ax.axhline(0.0, color="black", linewidth=0.8)
+                ax.set_title(family)
+                ax.set_xticks(x)
+                ax.set_xticklabels(labels, fontsize=8)
+                ax.set_ylabel("mean held-out R2")
+                ax.grid(axis="y", linewidth=0.35, alpha=0.35)
+            fig.tight_layout(rect=(0, 0, 1, 0.92))
+            pdf.savefig(fig)
+            plt.close(fig)
+
+
 def run_sequence(
     cfg: Mapping[str, Any],
     task: str,
@@ -3092,6 +3653,7 @@ def write_default_configs(output_dir: Path) -> None:
     for task in TASKS:
         cfg = copy.deepcopy(DEFAULT_CONFIG)
         cfg["task"] = task
+        cfg["response_predictivity"]["families"] = list(PPR_FAMILIES if task == "ppr_diffusion" else VORONOI_FAMILIES)
         cfg["run"] = {
             "name": f"cfim_grit_{task}_seed1001",
             "hardware": "single_a100_80gb",
@@ -3160,6 +3722,19 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p = sub.add_parser("plot-patching")
     common(p)
 
+    p = sub.add_parser("run-response-predictivity")
+    common(p)
+    p.add_argument("--device", default="auto")
+    p.add_argument("--backend", choices=("official", "local"))
+    p.add_argument("--checkpoint", type=Path)
+    p.add_argument("--families", default="")
+    p.add_argument("--intervention-kind", choices=("cf_eval", "patch_eval"))
+    p.add_argument("--max-interventions-per-family", type=int)
+    p.add_argument("--batch-size", type=int)
+    p.add_argument("--folds", type=int)
+    p.add_argument("--ridge-alpha", type=float)
+    p.add_argument("--centered", action="store_true")
+
     p = sub.add_parser("run-sequence")
     common(p)
     p.add_argument("--device", default="auto")
@@ -3197,6 +3772,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         run_patching(cfg, task, device_name=args.device, checkpoint=args.checkpoint, backend=args.backend)
     elif args.command == "plot-patching":
         plot_patching_summaries(cfg)
+    elif args.command == "run-response-predictivity":
+        families = parse_csv_tuple(args.families) if args.families else None
+        run_response_predictivity(
+            cfg,
+            task,
+            device_name=args.device,
+            checkpoint=args.checkpoint,
+            backend=args.backend,
+            families=families,
+            kind=args.intervention_kind,
+            max_interventions_per_family=args.max_interventions_per_family,
+            batch_size=args.batch_size,
+            folds=args.folds,
+            ridge_alpha=args.ridge_alpha,
+            centered=True if args.centered else None,
+        )
     elif args.command == "run-sequence":
         run_sequence(
             cfg,

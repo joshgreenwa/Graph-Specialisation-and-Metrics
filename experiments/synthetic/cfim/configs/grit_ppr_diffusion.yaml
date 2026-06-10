@@ -179,6 +179,17 @@ patching:
   random_groups_per_size: 10
   batch_size_graphs: 1
   allow_failed_gate_patching: false
+response_predictivity:
+  intervention_kind: cf_eval
+  families:
+  - ppr_payload_swap
+  - ppr_struct_swap
+  max_interventions_per_family: 4096
+  batch_size_graphs: 64
+  folds: 5
+  ridge_alpha: 1.0
+  centered: false
+  seed: 7001
 bootstrap:
   resamples: 2000
   confidence_interval: 95

@@ -5,9 +5,11 @@ from graph_specialisation_metrics.core_interpretability_specialisation_metrics i
 )
 from graph_specialisation_metrics.counterfactual_interchange_mediation import (
     collate_records,
+    cv_ridge_summary,
     load_config,
     make_graph_record,
     pathway_deltas,
+    response_feature_sets,
     source_for_intervention,
 )
 
@@ -71,3 +73,38 @@ def test_content_swap_moves_continuous_x_payload_fields():
     assert torch.allclose(swapped.x[:, 0], batch.x[:, 1])
     assert torch.allclose(swapped.payload[:, 1], batch.payload[:, 0])
     assert torch.allclose(swapped.adj, batch.adj)
+
+
+def test_response_predictivity_grouped_cv_finds_simple_signal():
+    rows = []
+    for graph_idx in range(12):
+        for item_idx in range(4):
+            signal = graph_idx * 0.1 + item_idx * 0.25
+            rows.append(
+                {
+                    "graph_id": f"g{graph_idx}",
+                    "L0_routing_follow_H0": signal,
+                    "L0_routing_invariant_H0": 1.0 - signal * 0.1,
+                    "L0_transport_follow_H0": 0.05 * item_idx,
+                    "teacher_pathway_norm": 2.0 * signal + 0.5,
+                }
+            )
+
+    feature_sets = response_feature_sets(
+        [
+            "L0_routing_follow_H0",
+            "L0_routing_invariant_H0",
+            "L0_transport_follow_H0",
+        ]
+    )
+    summary = cv_ridge_summary(
+        rows,
+        feature_columns=feature_sets["routing_scores"],
+        target_column="teacher_pathway_norm",
+        folds=4,
+        alpha=0.01,
+        seed=7,
+    )
+    assert summary["folds"] == 4
+    assert summary["groups"] == 12
+    assert summary["r2_mean"] > 0.95
