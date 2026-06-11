@@ -16,6 +16,7 @@ from graph_specialisation_metrics.counterfactual_interchange_mediation import (
     load_records,
     make_graph_record,
     model_name_for_checkpoint,
+    payload_gating_controls,
     pathway_deltas,
     response_predictivity_contrast_rows,
     response_feature_sets,
@@ -159,3 +160,17 @@ def test_cached_train_pool_is_written_for_opt_in_training():
     records = load_records(tmp_path / "data" / "ppr_diffusion" / "train_pool.pt")
     assert len(records) == 6
     assert records[0]["graph_id"].startswith("ppr_diffusion_train_pool_")
+
+
+def test_payload_gating_controls_recover_teacher_payload_effect():
+    cfg = tiny_cfg("nearest_anchor_voronoi")
+    graph = make_graph_record("nearest_anchor_voronoi", 10, 321, cfg)
+    anchors = torch.nonzero(graph["anchor_indicator"] > 0.5, as_tuple=False).reshape(-1)
+    u = int(anchors[0])
+    v = int(torch.nonzero(graph["anchor_indicator"] < 0.5, as_tuple=False)[0])
+    source = source_for_intervention(graph, "voronoi_payload_swap", u, v, cfg)
+    row = {"base_graph": graph, "source_graph": source, "family": "voronoi_payload_swap", "u": u, "v": v}
+    controls = payload_gating_controls(row)
+    teacher_norm = torch.linalg.vector_norm(pathway_deltas(graph, source)["M"]).item()
+    assert abs(controls["ctrl_km_product_l2"] - teacher_norm) < 1.0e-5
+    assert controls["ctrl_num_anchor_swapped"] == 1.0

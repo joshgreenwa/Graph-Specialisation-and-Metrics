@@ -3032,6 +3032,161 @@ def response_feature_sets(feature_columns: Sequence[str]) -> dict[str, list[str]
     }
 
 
+def payload_gating_controls(row: Mapping[str, Any]) -> dict[str, float]:
+    base = row["base_graph"]
+    n = int(base["n"])
+    u = int(row["u"])
+    v = int(row["v"])
+    k = base["teacher"]["K"].float()
+    m = base["teacher"]["M"].float()
+    ku = k[:n, u].float()
+    kv = k[:n, v].float()
+    k_col_diff_l2 = torch.linalg.vector_norm(ku - kv)
+    m_delta_l2 = torch.linalg.vector_norm(m[v].float() - m[u].float())
+    degree = base["struct"]["degree"].float()
+    spd = base["struct"]["shortest_path_distance"]
+    anchor_indicator = base.get("anchor_indicator")
+    if anchor_indicator is None:
+        u_is_anchor = 0.0
+        v_is_anchor = 0.0
+    else:
+        u_is_anchor = float(anchor_indicator[u].item() > 0.5)
+        v_is_anchor = float(anchor_indicator[v].item() > 0.5)
+    try:
+        same_query_anchor = float(int(torch.argmax(k[u]).item()) == int(torch.argmax(k[v]).item()))
+    except Exception:
+        same_query_anchor = float("nan")
+    spd_uv = int(spd[u, v])
+    return {
+        "ctrl_k_col_u_mass": float(ku.sum().item()),
+        "ctrl_k_col_v_mass": float(kv.sum().item()),
+        "ctrl_k_col_mass_sum": float((ku.sum() + kv.sum()).item()),
+        "ctrl_k_col_mass_absdiff": float(torch.abs(ku.sum() - kv.sum()).item()),
+        "ctrl_k_col_diff_l2": float(k_col_diff_l2.item()),
+        "ctrl_k_col_dot": float(torch.dot(ku, kv).item()),
+        "ctrl_m_delta_l2": float(m_delta_l2.item()),
+        "ctrl_km_product_l2": float((k_col_diff_l2 * m_delta_l2).item()),
+        "ctrl_u_is_anchor": u_is_anchor,
+        "ctrl_v_is_anchor": v_is_anchor,
+        "ctrl_num_anchor_swapped": u_is_anchor + v_is_anchor,
+        "ctrl_degree_u": float(degree[u].item()),
+        "ctrl_degree_v": float(degree[v].item()),
+        "ctrl_degree_absdiff": float(torch.abs(degree[u] - degree[v]).item()),
+        "ctrl_spd_uv": float(spd_uv if spd_uv >= 0 else 1.0e6),
+        "ctrl_same_query_anchor": same_query_anchor,
+        "ctrl_k_row_diff_l2": float(torch.linalg.vector_norm(k[u].float() - k[v].float()).item()),
+    }
+
+
+def gating_control_feature_sets(score_columns: Sequence[str], control_columns: Sequence[str]) -> dict[str, list[str]]:
+    response_sets = response_feature_sets(score_columns)
+    k_controls = [col for col in control_columns if col.startswith("ctrl_k_") or col in {"ctrl_u_is_anchor", "ctrl_v_is_anchor", "ctrl_num_anchor_swapped", "ctrl_same_query_anchor"}]
+    m_controls = [col for col in control_columns if col.startswith("ctrl_m_")]
+    structural_controls = [col for col in control_columns if col.startswith("ctrl_degree_") or col == "ctrl_spd_uv"]
+    km_controls = list(dict.fromkeys(k_controls + m_controls + ["ctrl_km_product_l2"]))
+    return {
+        "intercept_only": [],
+        "teacher_k_controls": k_controls,
+        "teacher_m_controls": m_controls,
+        "teacher_struct_controls": structural_controls,
+        "teacher_km_controls": km_controls,
+        "routing_scores": response_sets["routing_scores"],
+        "transport_scores": response_sets["transport_scores"],
+        "transport_plus_k_controls": response_sets["transport_scores"] + k_controls,
+        "transport_plus_km_controls": response_sets["transport_scores"] + km_controls,
+        "routing_plus_k_controls": response_sets["routing_scores"] + k_controls,
+        "routing_plus_km_controls": response_sets["routing_scores"] + km_controls,
+        "all_scores": response_sets["all_scores"],
+        "all_scores_plus_km_controls": response_sets["all_scores"] + km_controls,
+    }
+
+
+def run_payload_gating_controls(
+    cfg: Mapping[str, Any],
+    task: str,
+    *,
+    family: Optional[str] = None,
+    kind: str = "cf_eval",
+    folds: Optional[int] = None,
+    ridge_alpha: Optional[float] = None,
+) -> None:
+    selected_family = family or ("ppr_payload_swap" if task == "ppr_diffusion" else "voronoi_payload_swap")
+    if selected_family not in {"ppr_payload_swap", "voronoi_payload_swap"}:
+        raise ValueError("payload gating controls are defined for ppr_payload_swap or voronoi_payload_swap")
+    feature_path = metrics_dir(cfg) / f"response_predictivity_features_{task}.csv"
+    feature_rows = [
+        row
+        for row in read_csv_dicts(feature_path)
+        if row.get("family") == selected_family
+    ]
+    if not feature_rows:
+        raise RuntimeError(f"no response predictivity features found for {selected_family} at {feature_path}")
+    interventions = torch.load(intervention_dir(cfg, task) / f"{kind}_interventions.pt", map_location="cpu", weights_only=False)
+    intervention_by_id = {
+        str(row["intervention_id"]): row
+        for row in interventions
+        if row.get("family") == selected_family
+    }
+    rows = []
+    missing = 0
+    for feature_row in feature_rows:
+        intervention = intervention_by_id.get(str(feature_row["intervention_id"]))
+        if intervention is None:
+            missing += 1
+            continue
+        merged = dict(feature_row)
+        merged.update(payload_gating_controls(intervention))
+        rows.append(merged)
+    if missing:
+        print(f"[payload-gating] skipped missing_interventions={missing}", flush=True)
+    if not rows:
+        raise RuntimeError(f"no joined rows for {selected_family}")
+    score_columns = sorted([key for key in rows[0] if key.startswith("L") and ("_routing_" in key or "_transport_" in key)])
+    control_columns = sorted([key for key in rows[0] if key.startswith("ctrl_")])
+    feature_sets = gating_control_feature_sets(score_columns, control_columns)
+    targets = [
+        "teacher_pathway_norm",
+        "student_teacher_pathway_projection",
+        "student_delta_norm",
+    ]
+    pcfg = cfg.get("response_predictivity", {})
+    n_folds = int(folds if folds is not None else pcfg.get("folds", 5))
+    alpha = float(ridge_alpha if ridge_alpha is not None else pcfg.get("ridge_alpha", 1.0))
+    seed = int(pcfg.get("seed", 7001))
+    summary_rows = []
+    for target in targets:
+        for set_name, cols in feature_sets.items():
+            summary = cv_ridge_summary(
+                rows,
+                feature_columns=cols,
+                target_column=target,
+                folds=n_folds,
+                alpha=alpha,
+                seed=seed,
+            )
+            summary_rows.append(
+                {
+                    "task": task,
+                    "family": selected_family,
+                    "target": target,
+                    "feature_set": set_name,
+                    "ridge_alpha": alpha,
+                    "features": len(cols),
+                    **summary,
+                }
+            )
+    safe_family = selected_family.replace("/", "_")
+    joined_path = metrics_dir(cfg) / f"payload_gating_controls_features_{task}_{safe_family}.csv"
+    cv_path = metrics_dir(cfg) / f"payload_gating_controls_cv_{task}_{safe_family}.csv"
+    write_csv(joined_path, rows)
+    write_csv(cv_path, summary_rows)
+    print(
+        f"[payload-gating] wrote features={joined_path} cv={cv_path} rows={len(rows)} "
+        f"score_features={len(score_columns)} controls={len(control_columns)}",
+        flush=True,
+    )
+
+
 def run_response_predictivity(
     cfg: Mapping[str, Any],
     task: str,
@@ -4201,6 +4356,13 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--ridge-alpha", type=float)
     p.add_argument("--centered", action="store_true")
 
+    p = sub.add_parser("run-payload-gating-controls")
+    common(p)
+    p.add_argument("--family")
+    p.add_argument("--intervention-kind", choices=("cf_eval", "patch_eval"), default="cf_eval")
+    p.add_argument("--folds", type=int)
+    p.add_argument("--ridge-alpha", type=float)
+
     p = sub.add_parser("plot-response-predictivity")
     common(p)
 
@@ -4261,6 +4423,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         plot_response_predictivity_summary(cfg, task)
         contrast_path = write_response_predictivity_contrasts(cfg, task)
         print(f"[plot-response-predictivity] wrote contrasts={contrast_path}", flush=True)
+    elif args.command == "run-payload-gating-controls":
+        run_payload_gating_controls(
+            cfg,
+            task,
+            family=args.family,
+            kind=args.intervention_kind,
+            folds=args.folds,
+            ridge_alpha=args.ridge_alpha,
+        )
     elif args.command == "run-sequence":
         run_sequence(
             cfg,
