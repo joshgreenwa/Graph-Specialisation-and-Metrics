@@ -3101,6 +3101,97 @@ def gating_control_feature_sets(score_columns: Sequence[str], control_columns: S
     }
 
 
+def plot_payload_gating_controls(
+    cfg: Mapping[str, Any],
+    task: str,
+    family: str,
+    summary_rows: Sequence[Mapping[str, Any]],
+) -> Path:
+    out = figures_main_dir(cfg) / f"fig8_payload_gating_controls_{task}_{family}.pdf"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    targets = [
+        "teacher_pathway_norm",
+        "student_teacher_pathway_projection",
+        "student_delta_norm",
+    ]
+    target_labels = {
+        "teacher_pathway_norm": "teacher pathway norm",
+        "student_teacher_pathway_projection": "student teacher-aligned",
+        "student_delta_norm": "student delta norm",
+    }
+    feature_order = [
+        "intercept_only",
+        "teacher_k_controls",
+        "teacher_m_controls",
+        "teacher_km_controls",
+        "transport_scores",
+        "routing_scores",
+        "transport_plus_k_controls",
+        "transport_plus_km_controls",
+        "all_scores",
+        "all_scores_plus_km_controls",
+    ]
+    label_map = {
+        "intercept_only": "intercept",
+        "teacher_k_controls": "K controls",
+        "teacher_m_controls": "M controls",
+        "teacher_km_controls": "K+M controls",
+        "transport_scores": "transport",
+        "routing_scores": "routing",
+        "transport_plus_k_controls": "transport+K",
+        "transport_plus_km_controls": "transport+K+M",
+        "all_scores": "all scores",
+        "all_scores_plus_km_controls": "all+K+M",
+    }
+    colors = {
+        "intercept_only": "#a0aec0",
+        "teacher_k_controls": "#2f855a",
+        "teacher_m_controls": "#38a169",
+        "teacher_km_controls": "#276749",
+        "transport_scores": "#805ad5",
+        "routing_scores": "#2b6cb0",
+        "transport_plus_k_controls": "#d69e2e",
+        "transport_plus_km_controls": "#b7791f",
+        "all_scores": "#4a5568",
+        "all_scores_plus_km_controls": "#1a202c",
+    }
+    fig, axes = plt.subplots(1, len(targets), figsize=(17, 5.2), sharey=True, squeeze=False)
+    fig.suptitle(f"{task} / {family}: do teacher K-gating controls explain payload-swap predictivity?", fontsize=12)
+    for ax, target in zip(axes.reshape(-1), targets):
+        values = []
+        labels = []
+        bar_colors = []
+        for feature_set in feature_order:
+            row = next(
+                (
+                    item
+                    for item in summary_rows
+                    if item.get("target") == target and item.get("feature_set") == feature_set
+                ),
+                None,
+            )
+            if row is None:
+                continue
+            values.append(float(row["r2_mean"]))
+            labels.append(label_map.get(feature_set, feature_set))
+            bar_colors.append(colors.get(feature_set, "#718096"))
+        x = np.arange(len(values), dtype=float)
+        ax.bar(x, values, color=bar_colors)
+        ax.axhline(0.0, color="black", linewidth=0.8)
+        ax.set_title(target_labels.get(target, target), fontsize=10)
+        ax.set_xticks(x)
+        ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=8)
+        ax.set_ylabel("mean held-out R2")
+        ax.grid(axis="y", linewidth=0.35, alpha=0.35)
+        if values:
+            top = max(max(values) + 0.08, 0.1)
+            ax.set_ylim(min(-0.05, min(values) - 0.05), min(1.05, top))
+    fig.tight_layout(rect=(0, 0, 1, 0.92))
+    fig.savefig(out)
+    plt.close(fig)
+    return out
+
+
 def run_payload_gating_controls(
     cfg: Mapping[str, Any],
     task: str,
@@ -3180,8 +3271,9 @@ def run_payload_gating_controls(
     cv_path = metrics_dir(cfg) / f"payload_gating_controls_cv_{task}_{safe_family}.csv"
     write_csv(joined_path, rows)
     write_csv(cv_path, summary_rows)
+    fig_path = plot_payload_gating_controls(cfg, task, safe_family, summary_rows)
     print(
-        f"[payload-gating] wrote features={joined_path} cv={cv_path} rows={len(rows)} "
+        f"[payload-gating] wrote features={joined_path} cv={cv_path} figure={fig_path} rows={len(rows)} "
         f"score_features={len(score_columns)} controls={len(control_columns)}",
         flush=True,
     )
