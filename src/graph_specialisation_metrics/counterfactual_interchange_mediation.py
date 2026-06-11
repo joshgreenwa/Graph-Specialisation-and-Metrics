@@ -78,6 +78,13 @@ FUNCTIONAL_STRATUM_LABELS = {
     "dL1_to_2L": "L < d <= 2L",
     "d_gt_2L": "d > 2L",
 }
+FUNCTIONAL_NODE_STRATA = ("self", "d1", "d2_to_L", "d_gt_L")
+FUNCTIONAL_NODE_STRATUM_LABELS = {
+    "self": "i in {u,v}",
+    "d1": "D_i = 1",
+    "d2_to_L": "2 <= D_i <= L",
+    "d_gt_L": "D_i > L",
+}
 PATHWAY_BY_FAMILY = {
     "ppr_payload_swap": "M",
     "ppr_struct_swap": "K",
@@ -455,6 +462,14 @@ def functional_metrics_dir(cfg: Mapping[str, Any]) -> Path:
 
 def functional_figures_dir(cfg: Mapping[str, Any]) -> Path:
     return functional_root_dir(cfg) / "figures"
+
+
+def functional_node_swaps_dir(cfg: Mapping[str, Any], task: str) -> Path:
+    return functional_root_dir(cfg) / "node_swaps" / task
+
+
+def functional_node_responses_dir(cfg: Mapping[str, Any], task: str) -> Path:
+    return functional_root_dir(cfg) / "node_responses" / task
 
 
 def set_all_seeds(seed: int) -> None:
@@ -3709,6 +3724,673 @@ def plot_functional_responses(cfg: Mapping[str, Any], *, tasks: Sequence[str] | 
     print(f"[functional-plot] wrote figures={fig_dir}", flush=True)
 
 
+def node_distance_stratum(query_idx: int, u: int, v: int, distance_to_swap: int, gnn_depth: int = 2) -> str:
+    if int(query_idx) in {int(u), int(v)}:
+        return "self"
+    d = int(distance_to_swap)
+    depth = max(1, int(gnn_depth))
+    if d == 1:
+        return "d1"
+    if 2 <= d <= depth:
+        return "d2_to_L"
+    return "d_gt_L"
+
+
+def functional_node_swap_cache_path(cfg: Mapping[str, Any], task: str, seed: int) -> Path:
+    return functional_node_swaps_dir(cfg, task) / f"node_content_swaps_seed{int(seed)}.pt"
+
+
+def functional_node_response_table_path(cfg: Mapping[str, Any], task: str, seed: int) -> Path:
+    return functional_node_responses_dir(cfg, task) / f"functional_e1n_node_response_table_seed{int(seed)}.csv"
+
+
+def functional_node_graph_stats_path(cfg: Mapping[str, Any], task: str, seed: int) -> Path:
+    return functional_node_responses_dir(cfg, task) / f"functional_e1n_graph_stratum_stats_seed{int(seed)}.csv"
+
+
+def functional_node_validity_path(cfg: Mapping[str, Any], task: str, seed: int) -> Path:
+    return functional_node_responses_dir(cfg, task) / f"functional_e1n_validity_seed{int(seed)}.csv"
+
+
+def sample_functional_node_swaps_from_records(
+    records: Sequence[Mapping[str, Any]],
+    task: str,
+    *,
+    family: str | None = None,
+    num_graphs: int = 200,
+    swaps_per_graph: int = 200,
+    seed: int = 9301,
+) -> list[dict[str, Any]]:
+    selected_records = list(records)[: int(num_graphs)]
+    family = family or default_functional_family(task)
+    rng = random.Random(int(seed))
+    swaps: list[dict[str, Any]] = []
+    for graph_idx, base in enumerate(selected_records):
+        pairs = candidate_pairs_for_family(base, family)
+        if len(pairs) > int(swaps_per_graph):
+            pairs = rng.sample(pairs, k=int(swaps_per_graph))
+        else:
+            pairs = list(pairs)
+            rng.shuffle(pairs)
+        pairs.sort(key=lambda pair: (int(pair[0]), int(pair[1])))
+        for swap_idx, (u, v) in enumerate(pairs):
+            swaps.append(
+                {
+                    "task": task,
+                    "family": family,
+                    "graph_index": graph_idx,
+                    "graph_id": str(base["graph_id"]),
+                    "swap_id": f"{base['graph_id']}__{family}_{int(u)}_{int(v)}",
+                    "swap_index": swap_idx,
+                    "u": int(u),
+                    "v": int(v),
+                }
+            )
+    return swaps
+
+
+def build_functional_node_swaps(
+    cfg: Mapping[str, Any],
+    task: str,
+    *,
+    family: str | None = None,
+    num_graphs: int = 200,
+    swaps_per_graph: int = 200,
+    seed: int = 9301,
+    force: bool = False,
+) -> Path:
+    cache_data(cfg, task, force=False)
+    out_path = functional_node_swap_cache_path(cfg, task, seed)
+    if out_path.exists() and not force:
+        print(f"[functional-node-swaps] using existing {out_path}", flush=True)
+        return out_path
+    records = load_records(data_dir(cfg, task) / "test_id.pt")[: int(num_graphs)]
+    family = family or default_functional_family(task)
+    swaps = sample_functional_node_swaps_from_records(
+        records,
+        task,
+        family=family,
+        num_graphs=num_graphs,
+        swaps_per_graph=swaps_per_graph,
+        seed=seed,
+    )
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "task": task,
+            "family": family,
+            "seed": int(seed),
+            "num_graphs": int(num_graphs),
+            "swaps_per_graph": int(swaps_per_graph),
+            "base_records": records,
+            "swaps": swaps,
+            "created_utc": datetime.now(timezone.utc).isoformat(),
+            "git_commit": git_commit(),
+        },
+        out_path,
+    )
+    print(
+        f"[functional-node-swaps] wrote {out_path} graphs={len(records)} swaps={len(swaps)}",
+        flush=True,
+    )
+    return out_path
+
+
+def empty_node_stat_accumulator(task: str, graph_id: str, stratum: str) -> dict[str, Any]:
+    return {
+        "task": task,
+        "graph_id": graph_id,
+        "stratum": stratum,
+        "observations": 0,
+        "channel_n": 0,
+        "dy_norm_sum": 0.0,
+        "grit_norm_sum": 0.0,
+        "gcn_plus_norm_sum": 0.0,
+        "grit_cos_sum": 0.0,
+        "grit_cos_count": 0,
+        "gcn_plus_cos_sum": 0.0,
+        "gcn_plus_cos_count": 0,
+        "silent_count": 0,
+        "grit_silent_norm_sum": 0.0,
+        "gcn_plus_silent_norm_sum": 0.0,
+        "gcn_plus_max_norm": 0.0,
+        "sum_y": 0.0,
+        "sum_y2": 0.0,
+        "sum_grit": 0.0,
+        "sum_grit2": 0.0,
+        "sum_gcn_plus": 0.0,
+        "sum_gcn_plus2": 0.0,
+        "sum_grit_y": 0.0,
+        "sum_gcn_plus_y": 0.0,
+        "sum_grit_gcn_plus": 0.0,
+    }
+
+
+def update_node_stat_accumulator(
+    acc: dict[str, Any],
+    *,
+    dy: torch.Tensor,
+    grit_delta: torch.Tensor,
+    gcn_delta: torch.Tensor,
+    epsilon: float,
+) -> None:
+    dy = dy.float()
+    grit_delta = grit_delta.float()
+    gcn_delta = gcn_delta.float()
+    dy_norm = float(torch.linalg.vector_norm(dy).item())
+    grit_norm = float(torch.linalg.vector_norm(grit_delta).item())
+    gcn_norm = float(torch.linalg.vector_norm(gcn_delta).item())
+    acc["observations"] += 1
+    acc["channel_n"] += int(dy.numel())
+    acc["dy_norm_sum"] += dy_norm
+    acc["grit_norm_sum"] += grit_norm
+    acc["gcn_plus_norm_sum"] += gcn_norm
+    acc["gcn_plus_max_norm"] = max(float(acc["gcn_plus_max_norm"]), gcn_norm)
+    if dy_norm > float(epsilon):
+        _, grit_cos = projection_and_cosine(grit_delta, dy)
+        _, gcn_cos = projection_and_cosine(gcn_delta, dy)
+        acc["grit_cos_sum"] += grit_cos
+        acc["grit_cos_count"] += 1
+        acc["gcn_plus_cos_sum"] += gcn_cos
+        acc["gcn_plus_cos_count"] += 1
+    else:
+        acc["silent_count"] += 1
+        acc["grit_silent_norm_sum"] += grit_norm
+        acc["gcn_plus_silent_norm_sum"] += gcn_norm
+    y = dy.detach().cpu().numpy().astype(np.float64, copy=False)
+    grit = grit_delta.detach().cpu().numpy().astype(np.float64, copy=False)
+    gcn = gcn_delta.detach().cpu().numpy().astype(np.float64, copy=False)
+    acc["sum_y"] += float(y.sum())
+    acc["sum_y2"] += float(np.dot(y, y))
+    acc["sum_grit"] += float(grit.sum())
+    acc["sum_grit2"] += float(np.dot(grit, grit))
+    acc["sum_gcn_plus"] += float(gcn.sum())
+    acc["sum_gcn_plus2"] += float(np.dot(gcn, gcn))
+    acc["sum_grit_y"] += float(np.dot(grit, y))
+    acc["sum_gcn_plus_y"] += float(np.dot(gcn, y))
+    acc["sum_grit_gcn_plus"] += float(np.dot(grit, gcn))
+
+
+def teacher_channel_std(records: Sequence[Mapping[str, Any]]) -> float:
+    values = torch.cat([record["teacher"]["Y"].float().reshape(-1) for record in records])
+    return float(values.std(unbiased=False).item())
+
+
+def run_functional_node_responses(
+    cfg: Mapping[str, Any],
+    task: str,
+    *,
+    swaps_path: Path | None = None,
+    seed: int = 9301,
+    device_name: str = "auto",
+    batch_size: int = 1024,
+    gnn_depth: int = 2,
+    grit_config: Path | None = None,
+    gcn_plus_config: Path | None = None,
+    grit_checkpoint: Path | None = None,
+    gcn_plus_checkpoint: Path | None = None,
+    store_node_rows: bool = True,
+    leakage_tol: float = 1.0e-5,
+    fail_on_gcn_leakage: bool = False,
+    fast_dev_run: bool = False,
+) -> tuple[Path, Path, Path]:
+    device = choose_device(device_name)
+    configure_runtime(cfg, device)
+    swaps_path = swaps_path or functional_node_swap_cache_path(cfg, task, seed)
+    cache = load_functional_swap_cache(swaps_path)
+    base_records: list[dict[str, Any]] = list(cache["base_records"])
+    swaps: list[dict[str, Any]] = list(cache["swaps"])
+    if fast_dev_run:
+        swaps = swaps[: min(len(swaps), 16)]
+    grit_cfg = load_stage1_model_config(cfg, task, model_name="grit", config_path=grit_config, fast_dev_run=fast_dev_run)
+    gcn_cfg = load_stage1_model_config(cfg, task, model_name="gcn_plus", config_path=gcn_plus_config, fast_dev_run=fast_dev_run)
+    grit, _ = load_model_from_checkpoint(grit_cfg, task, grit_checkpoint, device, backend="official")
+    gcn_plus, _ = load_model_from_checkpoint(gcn_cfg, task, gcn_plus_checkpoint, device, backend="official_gnnplus")
+    models = {"grit": grit, "gcn_plus": gcn_plus}
+    epsilon = 1.0e-6 * max(teacher_channel_std(base_records), 1.0e-12)
+    print(
+        f"[functional-e1n] task={task} swaps={len(swaps)} graphs={len(base_records)} "
+        f"epsilon={epsilon:.3e} device={device} batch_size={batch_size}",
+        flush=True,
+    )
+    base_outputs = {
+        model_name: predict_node_outputs(model, base_records, batch_size=batch_size, device=device)
+        for model_name, model in models.items()
+    }
+    out_dir = functional_node_responses_dir(cfg, task)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    node_table_path = functional_node_response_table_path(cfg, task, seed)
+    stats_path = functional_node_graph_stats_path(cfg, task, seed)
+    validity_path = functional_node_validity_path(cfg, task, seed)
+    node_fields = [
+        "task",
+        "graph_id",
+        "swap_id",
+        "u",
+        "v",
+        "query_i",
+        "D_i",
+        "stratum",
+        "dy_norm",
+        "grit_delta_norm",
+        "gcn_plus_delta_norm",
+        "grit_teacher_projection",
+        "gcn_plus_teacher_projection",
+        "grit_teacher_cosine",
+        "gcn_plus_teacher_cosine",
+    ]
+    node_handle = None
+    node_writer = None
+    if store_node_rows:
+        node_handle = node_table_path.open("w", newline="", encoding="utf-8")
+        node_writer = csv.DictWriter(node_handle, fieldnames=node_fields)
+        node_writer.writeheader()
+    graph_stats: dict[tuple[str, str], dict[str, Any]] = {}
+    chunks = max(1, math.ceil(len(swaps) / int(batch_size)))
+    start_time = time.time()
+    beyond_l_gcn_max = 0.0
+    beyond_l_gcn_violations = 0
+    for start in range(0, len(swaps), int(batch_size)):
+        chunk_swaps = swaps[start : start + int(batch_size)]
+        source_records = [
+            source_for_intervention(
+                base_records[int(row["graph_index"])],
+                str(row["family"]),
+                int(row["u"]),
+                int(row["v"]),
+                cfg,
+            )
+            for row in chunk_swaps
+        ]
+        source_outputs = {
+            model_name: predict_node_outputs(model, source_records, batch_size=batch_size, device=device)
+            for model_name, model in models.items()
+        }
+        for row_idx, swap in enumerate(chunk_swaps):
+            graph_index = int(swap["graph_index"])
+            base = base_records[graph_index]
+            source = source_records[row_idx]
+            n = int(base["n"])
+            u = int(swap["u"])
+            v = int(swap["v"])
+            dy_nodes = source["teacher"]["Y"].float()[:n] - base["teacher"]["Y"].float()[:n]
+            grit_delta_nodes = source_outputs["grit"][row_idx].float() - base_outputs["grit"][graph_index].float()
+            gcn_delta_nodes = source_outputs["gcn_plus"][row_idx].float() - base_outputs["gcn_plus"][graph_index].float()
+            spd = base["struct"]["shortest_path_distance"]
+            dist_to_swapped = torch.minimum(spd[:n, u], spd[:n, v])
+            for query_idx in range(n):
+                d_i = int(dist_to_swapped[query_idx])
+                stratum = node_distance_stratum(query_idx, u, v, d_i, gnn_depth)
+                key = (str(base["graph_id"]), stratum)
+                if key not in graph_stats:
+                    graph_stats[key] = empty_node_stat_accumulator(task, str(base["graph_id"]), stratum)
+                dy = dy_nodes[query_idx]
+                grit_delta = grit_delta_nodes[query_idx]
+                gcn_delta = gcn_delta_nodes[query_idx]
+                update_node_stat_accumulator(graph_stats[key], dy=dy, grit_delta=grit_delta, gcn_delta=gcn_delta, epsilon=epsilon)
+                gcn_norm = float(torch.linalg.vector_norm(gcn_delta).item())
+                if stratum == "d_gt_L":
+                    beyond_l_gcn_max = max(beyond_l_gcn_max, gcn_norm)
+                    if gcn_norm > float(leakage_tol):
+                        beyond_l_gcn_violations += 1
+                if node_writer is not None:
+                    grit_projection, grit_cosine = projection_and_cosine(grit_delta, dy)
+                    gcn_projection, gcn_cosine = projection_and_cosine(gcn_delta, dy)
+                    node_writer.writerow(
+                        {
+                            "task": task,
+                            "graph_id": str(base["graph_id"]),
+                            "swap_id": str(swap["swap_id"]),
+                            "u": u,
+                            "v": v,
+                            "query_i": query_idx,
+                            "D_i": d_i,
+                            "stratum": stratum,
+                            "dy_norm": float(torch.linalg.vector_norm(dy).item()),
+                            "grit_delta_norm": float(torch.linalg.vector_norm(grit_delta).item()),
+                            "gcn_plus_delta_norm": gcn_norm,
+                            "grit_teacher_projection": grit_projection,
+                            "gcn_plus_teacher_projection": gcn_projection,
+                            "grit_teacher_cosine": grit_cosine,
+                            "gcn_plus_teacher_cosine": gcn_cosine,
+                        }
+                    )
+        chunk_idx = start // int(batch_size) + 1
+        elapsed = time.time() - start_time
+        print(
+            f"[functional-e1n] task={task} chunk={chunk_idx}/{chunks} swaps_done={min(start + int(batch_size), len(swaps))} "
+            f"elapsed={elapsed:.1f}s beyond_L_gcn_max={beyond_l_gcn_max:.3e}",
+            flush=True,
+        )
+    if node_handle is not None:
+        node_handle.close()
+    elif node_table_path.exists():
+        node_table_path.unlink()
+    write_csv(stats_path, list(graph_stats.values()))
+    validity_rows = [
+        {
+            "task": task,
+            "seed": int(seed),
+            "gnn_depth": int(gnn_depth),
+            "epsilon": epsilon,
+            "leakage_tol": float(leakage_tol),
+            "beyond_L_gcn_max_norm": beyond_l_gcn_max,
+            "beyond_L_gcn_violations": beyond_l_gcn_violations,
+            "status": "pass" if beyond_l_gcn_violations == 0 else "fail",
+        }
+    ]
+    write_csv(validity_path, validity_rows)
+    print(
+        f"[functional-e1n] wrote node_rows={node_table_path if store_node_rows else 'disabled'} "
+        f"stats={stats_path} validity={validity_path}",
+        flush=True,
+    )
+    if fail_on_gcn_leakage and beyond_l_gcn_violations > 0:
+        raise RuntimeError(
+            f"E1-N GCN+ beyond-L leakage failed: max={beyond_l_gcn_max:.6g}, "
+            f"violations={beyond_l_gcn_violations}, tol={leakage_tol}"
+        )
+    return node_table_path, stats_path, validity_path
+
+
+def combine_node_graph_stats(rows: Sequence[Mapping[str, Any]]) -> dict[str, float]:
+    fields = [
+        "observations",
+        "channel_n",
+        "dy_norm_sum",
+        "grit_norm_sum",
+        "gcn_plus_norm_sum",
+        "grit_cos_sum",
+        "grit_cos_count",
+        "gcn_plus_cos_sum",
+        "gcn_plus_cos_count",
+        "silent_count",
+        "grit_silent_norm_sum",
+        "gcn_plus_silent_norm_sum",
+        "sum_y",
+        "sum_y2",
+        "sum_grit",
+        "sum_grit2",
+        "sum_gcn_plus",
+        "sum_gcn_plus2",
+        "sum_grit_y",
+        "sum_gcn_plus_y",
+        "sum_grit_gcn_plus",
+    ]
+    out = {field: 0.0 for field in fields}
+    out["gcn_plus_max_norm"] = 0.0
+    for row in rows:
+        for field in fields:
+            out[field] += float(row.get(field, 0.0))
+        out["gcn_plus_max_norm"] = max(out["gcn_plus_max_norm"], float(row.get("gcn_plus_max_norm", 0.0)))
+    return out
+
+
+def corr_from_sufficient(n: float, sum_x: float, sum_y: float, sum_x2: float, sum_y2: float, sum_xy: float) -> float:
+    if n < 2:
+        return float("nan")
+    cov = sum_xy - (sum_x * sum_y / n)
+    vx = sum_x2 - (sum_x * sum_x / n)
+    vy = sum_y2 - (sum_y * sum_y / n)
+    denom = math.sqrt(max(vx, 0.0) * max(vy, 0.0))
+    if denom <= EPS:
+        return float("nan")
+    return float(cov / denom)
+
+
+def pcorr_from_sufficient(combined: Mapping[str, float]) -> float:
+    n = float(combined["channel_n"])
+    r_xy = corr_from_sufficient(
+        n,
+        float(combined["sum_grit"]),
+        float(combined["sum_y"]),
+        float(combined["sum_grit2"]),
+        float(combined["sum_y2"]),
+        float(combined["sum_grit_y"]),
+    )
+    r_zy = corr_from_sufficient(
+        n,
+        float(combined["sum_gcn_plus"]),
+        float(combined["sum_y"]),
+        float(combined["sum_gcn_plus2"]),
+        float(combined["sum_y2"]),
+        float(combined["sum_gcn_plus_y"]),
+    )
+    r_xz = corr_from_sufficient(
+        n,
+        float(combined["sum_grit"]),
+        float(combined["sum_gcn_plus"]),
+        float(combined["sum_grit2"]),
+        float(combined["sum_gcn_plus2"]),
+        float(combined["sum_grit_gcn_plus"]),
+    )
+    if not all(np.isfinite([r_xy, r_zy, r_xz])):
+        return float("nan")
+    denom = math.sqrt(max(1.0 - r_xz * r_xz, 0.0) * max(1.0 - r_zy * r_zy, 0.0))
+    if denom <= EPS:
+        return float("nan")
+    return float((r_xy - r_xz * r_zy) / denom)
+
+
+def node_stat_value(rows: Sequence[Mapping[str, Any]], stat: str) -> float:
+    combined = combine_node_graph_stats(rows)
+    obs = max(float(combined["observations"]), 1.0)
+    channel_n = float(combined["channel_n"])
+    if stat == "occupancy":
+        return float(combined["observations"])
+    if stat == "oracle_demand_mean":
+        return float(combined["dy_norm_sum"] / obs)
+    if stat == "grit_delta_norm_mean":
+        return float(combined["grit_norm_sum"] / obs)
+    if stat == "gcn_plus_delta_norm_mean":
+        return float(combined["gcn_plus_norm_sum"] / obs)
+    if stat == "grit_channel_corr":
+        return corr_from_sufficient(
+            channel_n,
+            combined["sum_grit"],
+            combined["sum_y"],
+            combined["sum_grit2"],
+            combined["sum_y2"],
+            combined["sum_grit_y"],
+        )
+    if stat == "gcn_plus_channel_corr":
+        return corr_from_sufficient(
+            channel_n,
+            combined["sum_gcn_plus"],
+            combined["sum_y"],
+            combined["sum_gcn_plus2"],
+            combined["sum_y2"],
+            combined["sum_gcn_plus_y"],
+        )
+    if stat == "grit_excess_partial_corr":
+        return pcorr_from_sufficient(combined)
+    if stat == "grit_cosine_mean":
+        count = float(combined["grit_cos_count"])
+        return float(combined["grit_cos_sum"] / count) if count > 0 else float("nan")
+    if stat == "gcn_plus_cosine_mean":
+        count = float(combined["gcn_plus_cos_count"])
+        return float(combined["gcn_plus_cos_sum"] / count) if count > 0 else float("nan")
+    if stat == "grit_spurious_silent_norm_mean":
+        count = float(combined["silent_count"])
+        return float(combined["grit_silent_norm_sum"] / count) if count > 0 else float("nan")
+    if stat == "gcn_plus_spurious_silent_norm_mean":
+        count = float(combined["silent_count"])
+        return float(combined["gcn_plus_silent_norm_sum"] / count) if count > 0 else float("nan")
+    if stat == "gcn_plus_max_norm":
+        return float(combined["gcn_plus_max_norm"])
+    raise ValueError(stat)
+
+
+def summarise_functional_node_responses(
+    cfg: Mapping[str, Any],
+    *,
+    tasks: Sequence[str] | None = None,
+    seed: int = 9301,
+    bootstrap_resamples: int = 1000,
+    bootstrap_seed: int = 9401,
+) -> tuple[Path, Path]:
+    tasks = list(tasks or TASKS)
+    rows: list[dict[str, str]] = []
+    validity_rows: list[dict[str, str]] = []
+    for task in tasks:
+        stats_path = functional_node_graph_stats_path(cfg, task, seed)
+        validity_path = functional_node_validity_path(cfg, task, seed)
+        if not stats_path.exists():
+            raise FileNotFoundError(f"E1-N graph stats not found: {stats_path}")
+        rows.extend(read_csv_dicts(stats_path))
+        if validity_path.exists():
+            validity_rows.extend(read_csv_dicts(validity_path))
+    grouped: dict[tuple[str, str], list[Mapping[str, Any]]] = defaultdict(list)
+    for row in rows:
+        grouped[(str(row["task"]), str(row["stratum"]))].append(row)
+    stat_names = [
+        "occupancy",
+        "oracle_demand_mean",
+        "grit_delta_norm_mean",
+        "gcn_plus_delta_norm_mean",
+        "grit_channel_corr",
+        "gcn_plus_channel_corr",
+        "grit_excess_partial_corr",
+        "grit_cosine_mean",
+        "gcn_plus_cosine_mean",
+        "grit_spurious_silent_norm_mean",
+        "gcn_plus_spurious_silent_norm_mean",
+        "gcn_plus_max_norm",
+    ]
+    summary_rows = []
+    for (task, stratum), group_rows in sorted(grouped.items()):
+        graphs = len({str(row["graph_id"]) for row in group_rows})
+        for stat_name in stat_names:
+            point, lo, hi = cluster_bootstrap_ci(
+                group_rows,
+                lambda sample, name=stat_name: node_stat_value(sample, name),
+                resamples=bootstrap_resamples,
+                seed=bootstrap_seed + stable_int_seed(task, stratum, stat_name) % 100000,
+            )
+            summary_rows.append(
+                {
+                    "task": task,
+                    "stratum": stratum,
+                    "stratum_label": FUNCTIONAL_NODE_STRATUM_LABELS.get(stratum, stratum),
+                    "graphs": graphs,
+                    "stat": stat_name,
+                    "mean": point,
+                    "ci_low": lo,
+                    "ci_high": hi,
+                }
+            )
+    metrics = functional_metrics_dir(cfg)
+    summary_path = metrics / "functional_e1n_node_fingerprint_stats.csv"
+    validity_out = metrics / "functional_e1n_validity.csv"
+    write_csv(summary_path, summary_rows)
+    write_csv(validity_out, validity_rows)
+    print(f"[functional-e1n-summary] wrote summary={summary_path} validity={validity_out}", flush=True)
+    return summary_path, validity_out
+
+
+def plot_functional_node_responses(cfg: Mapping[str, Any], *, tasks: Sequence[str] | None = None) -> None:
+    tasks = list(tasks or TASKS)
+    fig_dir = functional_figures_dir(cfg)
+    fig_dir.mkdir(parents=True, exist_ok=True)
+    rows = read_csv_dicts(functional_metrics_dir(cfg) / "functional_e1n_node_fingerprint_stats.csv")
+    validity_rows = read_csv_dicts(functional_metrics_dir(cfg) / "functional_e1n_validity.csv")
+    if not rows:
+        raise FileNotFoundError("E1-N summary CSV is missing or empty; run summarise-functional-node-responses first")
+    indexed = rows_by_task_stratum(rows)
+    strata = list(FUNCTIONAL_NODE_STRATA)
+    x = np.arange(len(strata), dtype=np.float64)
+    colors = {"grit": "#1b7f79", "gcn_plus": "#b24c3d", "oracle": "#3f6f8f"}
+
+    fig, axes = plt.subplots(2, max(1, len(tasks)), figsize=(5.4 * max(1, len(tasks)), 7.2), sharex=True)
+    axes_arr = np.asarray(axes).reshape(2, -1)
+    for col, task in enumerate(tasks):
+        ax_occ = axes_arr[0, col]
+        ax_oracle = axes_arr[1, col]
+        occ = np.asarray([get_metric_value(indexed.get((task, s), {}), "occupancy") for s in strata])
+        demand = np.asarray([get_metric_value(indexed.get((task, s), {}), "oracle_demand_mean") for s in strata])
+        ax_occ.bar(x, occ, color="#6b6f7a", width=0.68)
+        ax_oracle.bar(x, demand, color=colors["oracle"], width=0.68)
+        ax_occ.set_title(task)
+        ax_occ.set_ylabel("Node observations")
+        ax_oracle.set_ylabel("Mean ||Δy_i||")
+        for ax in (ax_occ, ax_oracle):
+            ax.set_xticks(x)
+            ax.set_xticklabels([FUNCTIONAL_NODE_STRATUM_LABELS[s] for s in strata], rotation=25, ha="right")
+            ax.grid(axis="y", alpha=0.25)
+    fig.tight_layout()
+    fig.savefig(fig_dir / "functional_e1n_node_oracle_demand_occupancy.pdf")
+    plt.close(fig)
+
+    fig, axes = plt.subplots(2, max(1, len(tasks)), figsize=(5.4 * max(1, len(tasks)), 7.2), sharex=True)
+    axes_arr = np.asarray(axes).reshape(2, -1)
+    for col, task in enumerate(tasks):
+        ax_mag = axes_arr[0, col]
+        ax_corr = axes_arr[1, col]
+        for offset, model_name in [(-0.18, "grit"), (0.18, "gcn_plus")]:
+            norm = np.asarray([get_metric_value(indexed.get((task, s), {}), f"{model_name}_delta_norm_mean") for s in strata])
+            corr_name = "grit_channel_corr" if model_name == "grit" else "gcn_plus_channel_corr"
+            corr = np.asarray([get_metric_value(indexed.get((task, s), {}), corr_name) for s in strata])
+            ax_mag.bar(x + offset, norm, width=0.34, label=model_name, color=colors[model_name])
+            ax_corr.bar(x + offset, corr, width=0.34, label=model_name, color=colors[model_name])
+        ax_mag.set_title(task)
+        ax_mag.set_ylabel("Mean ||Δf_i||")
+        ax_corr.set_ylabel("corr(Δf_i,c, Δy_i,c)")
+        ax_corr.axhline(0.0, color="black", lw=0.8)
+        for ax in (ax_mag, ax_corr):
+            ax.set_xticks(x)
+            ax.set_xticklabels([FUNCTIONAL_NODE_STRATUM_LABELS[s] for s in strata], rotation=25, ha="right")
+            ax.grid(axis="y", alpha=0.25)
+    axes_arr[0, 0].legend(frameon=False)
+    fig.tight_layout()
+    fig.savefig(fig_dir / "functional_e1n_node_response_magnitude_alignment.pdf")
+    plt.close(fig)
+
+    fig, axes = plt.subplots(1, max(1, len(tasks)), figsize=(5.2 * max(1, len(tasks)), 3.9), sharey=True)
+    axes_list = np.atleast_1d(axes)
+    for ax, task in zip(axes_list, tasks):
+        vals = np.asarray([get_metric_value(indexed.get((task, s), {}), "grit_excess_partial_corr") for s in strata])
+        ax.bar(x, vals, color=colors["grit"], width=0.68)
+        ax.axhline(0.0, color="black", lw=0.8)
+        ax.set_title(task)
+        ax.set_ylabel("pcorr(GRIT, teacher | GCN+)")
+        ax.set_xticks(x)
+        ax.set_xticklabels([FUNCTIONAL_NODE_STRATUM_LABELS[s] for s in strata], rotation=25, ha="right")
+        ax.grid(axis="y", alpha=0.25)
+    fig.tight_layout()
+    fig.savefig(fig_dir / "functional_e1n_node_excess_alignment.pdf")
+    plt.close(fig)
+
+    fig, axes = plt.subplots(1, max(1, len(tasks)), figsize=(5.2 * max(1, len(tasks)), 3.9), sharey=False)
+    axes_list = np.atleast_1d(axes)
+    for ax, task in zip(axes_list, tasks):
+        gt_signal = get_metric_value(indexed.get((task, "d_gt_L"), {}), "grit_channel_corr")
+        gcn_leak = get_metric_value(indexed.get((task, "d_gt_L"), {}), "gcn_plus_max_norm")
+        spurious = get_metric_value(indexed.get((task, "d_gt_L"), {}), "grit_spurious_silent_norm_mean")
+        ax.bar([0, 1, 2], [gt_signal, gcn_leak, spurious], color=[colors["grit"], colors["gcn_plus"], "#6b6f7a"])
+        ax.axhline(0.0, color="black", lw=0.8)
+        ax.set_xticks([0, 1, 2])
+        ax.set_xticklabels(["GRIT corr\nbeyond L", "GCN+ max\nleakage", "GRIT silent\nnorm"], rotation=20, ha="right")
+        ax.set_title(task)
+        ax.grid(axis="y", alpha=0.25)
+    fig.tight_layout()
+    fig.savefig(fig_dir / "functional_e1n_beyond_l_validity_and_signal.pdf")
+    plt.close(fig)
+
+    if validity_rows:
+        fig, ax = plt.subplots(figsize=(5.6, 3.4))
+        labels = [str(row["task"]) for row in validity_rows]
+        vals = [float(row.get("beyond_L_gcn_max_norm", "nan")) for row in validity_rows]
+        ax.bar(np.arange(len(vals)), vals, color="#b24c3d")
+        ax.set_xticks(np.arange(len(vals)))
+        ax.set_xticklabels(labels, rotation=20, ha="right")
+        ax.set_ylabel("max ||Δf_GCN+,i|| for D_i > L")
+        ax.grid(axis="y", alpha=0.25)
+        fig.tight_layout()
+        fig.savefig(fig_dir / "functional_e1n_gcn_beyond_l_validity.pdf")
+        plt.close(fig)
+    print(f"[functional-e1n-plot] wrote figures={fig_dir}", flush=True)
+
+
 def grouped_folds(groups: Sequence[str], folds: int, seed: int) -> list[set[str]]:
     unique = sorted(set(groups))
     rng = random.Random(int(seed))
@@ -5305,6 +5987,61 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--bootstrap-seed", type=int, default=9201)
     p.add_argument("--force-swaps", action="store_true")
 
+    p = sub.add_parser("build-functional-node-swaps")
+    common(p)
+    p.add_argument("--family")
+    p.add_argument("--num-graphs", type=int, default=200)
+    p.add_argument("--swaps-per-graph", type=int, default=200)
+    p.add_argument("--seed", type=int, default=9301)
+    p.add_argument("--force", action="store_true")
+
+    p = sub.add_parser("run-functional-node-responses")
+    common(p)
+    p.add_argument("--swaps-path", type=Path)
+    p.add_argument("--seed", type=int, default=9301)
+    p.add_argument("--device", default="auto")
+    p.add_argument("--batch-size", type=int, default=1024)
+    p.add_argument("--gnn-depth", type=int, default=2)
+    p.add_argument("--grit-config", type=Path)
+    p.add_argument("--gcn-plus-config", type=Path)
+    p.add_argument("--grit-checkpoint", type=Path)
+    p.add_argument("--gcn-plus-checkpoint", type=Path)
+    p.add_argument("--no-store-node-rows", action="store_true")
+    p.add_argument("--leakage-tol", type=float, default=1.0e-5)
+    p.add_argument("--fail-on-gcn-leakage", action="store_true")
+
+    p = sub.add_parser("summarise-functional-node-responses")
+    common(p)
+    p.add_argument("--all-tasks", action="store_true")
+    p.add_argument("--seed", type=int, default=9301)
+    p.add_argument("--bootstrap-resamples", type=int, default=1000)
+    p.add_argument("--bootstrap-seed", type=int, default=9401)
+
+    p = sub.add_parser("plot-functional-node-responses")
+    common(p)
+    p.add_argument("--all-tasks", action="store_true")
+
+    p = sub.add_parser("run-functional-stage1-node")
+    common(p)
+    p.add_argument("--all-tasks", action="store_true")
+    p.add_argument("--family")
+    p.add_argument("--num-graphs", type=int, default=200)
+    p.add_argument("--swaps-per-graph", type=int, default=200)
+    p.add_argument("--seed", type=int, default=9301)
+    p.add_argument("--device", default="auto")
+    p.add_argument("--batch-size", type=int, default=1024)
+    p.add_argument("--gnn-depth", type=int, default=2)
+    p.add_argument("--grit-config", type=Path)
+    p.add_argument("--gcn-plus-config", type=Path)
+    p.add_argument("--grit-checkpoint", type=Path)
+    p.add_argument("--gcn-plus-checkpoint", type=Path)
+    p.add_argument("--no-store-node-rows", action="store_true")
+    p.add_argument("--leakage-tol", type=float, default=1.0e-5)
+    p.add_argument("--fail-on-gcn-leakage", action="store_true")
+    p.add_argument("--bootstrap-resamples", type=int, default=1000)
+    p.add_argument("--bootstrap-seed", type=int, default=9401)
+    p.add_argument("--force-swaps", action="store_true")
+
     p = sub.add_parser("run-sequence")
     common(p)
     p.add_argument("--device", default="auto")
@@ -5327,6 +6064,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "summarise-functional-responses",
         "plot-functional-responses",
         "run-functional-stage1",
+        "summarise-functional-node-responses",
+        "plot-functional-node-responses",
+        "run-functional-stage1-node",
     }
     load_task = args.task
     if load_task is None and args.command in functional_all_task_commands and args.config is None:
@@ -5443,6 +6183,83 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             bootstrap_seed=args.bootstrap_seed,
         )
         plot_functional_responses(cfg, tasks=tasks, seed=args.seed)
+    elif args.command == "build-functional-node-swaps":
+        build_functional_node_swaps(
+            cfg,
+            task,
+            family=args.family,
+            num_graphs=4 if args.fast_dev_run and args.num_graphs == 200 else args.num_graphs,
+            swaps_per_graph=4 if args.fast_dev_run and args.swaps_per_graph == 200 else args.swaps_per_graph,
+            seed=args.seed,
+            force=args.force,
+        )
+    elif args.command == "run-functional-node-responses":
+        run_functional_node_responses(
+            cfg,
+            task,
+            swaps_path=args.swaps_path,
+            seed=args.seed,
+            device_name=args.device,
+            batch_size=args.batch_size,
+            gnn_depth=args.gnn_depth,
+            grit_config=args.grit_config,
+            gcn_plus_config=args.gcn_plus_config,
+            grit_checkpoint=args.grit_checkpoint,
+            gcn_plus_checkpoint=args.gcn_plus_checkpoint,
+            store_node_rows=not args.no_store_node_rows,
+            leakage_tol=args.leakage_tol,
+            fail_on_gcn_leakage=args.fail_on_gcn_leakage,
+            fast_dev_run=bool(args.fast_dev_run),
+        )
+    elif args.command == "summarise-functional-node-responses":
+        tasks = TASKS if args.all_tasks or args.task is None else (task,)
+        summarise_functional_node_responses(
+            cfg,
+            tasks=tasks,
+            seed=args.seed,
+            bootstrap_resamples=args.bootstrap_resamples,
+            bootstrap_seed=args.bootstrap_seed,
+        )
+    elif args.command == "plot-functional-node-responses":
+        tasks = TASKS if args.all_tasks or args.task is None else (task,)
+        plot_functional_node_responses(cfg, tasks=tasks)
+    elif args.command == "run-functional-stage1-node":
+        tasks = TASKS if args.all_tasks or args.task is None else (task,)
+        for task_name in tasks:
+            task_cfg = load_config(args.config, task=task_name, fast_dev_run=bool(args.fast_dev_run))
+            build_functional_node_swaps(
+                task_cfg,
+                task_name,
+                family=args.family,
+                num_graphs=4 if args.fast_dev_run and args.num_graphs == 200 else args.num_graphs,
+                swaps_per_graph=4 if args.fast_dev_run and args.swaps_per_graph == 200 else args.swaps_per_graph,
+                seed=args.seed,
+                force=args.force_swaps,
+            )
+            run_functional_node_responses(
+                task_cfg,
+                task_name,
+                seed=args.seed,
+                device_name=args.device,
+                batch_size=args.batch_size,
+                gnn_depth=args.gnn_depth,
+                grit_config=args.grit_config,
+                gcn_plus_config=args.gcn_plus_config,
+                grit_checkpoint=args.grit_checkpoint,
+                gcn_plus_checkpoint=args.gcn_plus_checkpoint,
+                store_node_rows=not args.no_store_node_rows,
+                leakage_tol=args.leakage_tol,
+                fail_on_gcn_leakage=args.fail_on_gcn_leakage,
+                fast_dev_run=bool(args.fast_dev_run),
+            )
+        summarise_functional_node_responses(
+            cfg,
+            tasks=tasks,
+            seed=args.seed,
+            bootstrap_resamples=args.bootstrap_resamples,
+            bootstrap_seed=args.bootstrap_seed,
+        )
+        plot_functional_node_responses(cfg, tasks=tasks)
     elif args.command == "run-payload-gating-controls":
         run_payload_gating_controls(
             cfg,

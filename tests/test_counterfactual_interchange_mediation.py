@@ -11,6 +11,8 @@ from graph_specialisation_metrics.counterfactual_interchange_mediation import (
     checkpoint_dir,
     cluster_bootstrap_ci,
     collate_records,
+    combine_node_graph_stats,
+    corr_from_sufficient,
     cv_ridge_summary,
     distance_stratum,
     gnnplus_default_config,
@@ -24,8 +26,12 @@ from graph_specialisation_metrics.counterfactual_interchange_mediation import (
     partial_corr,
     response_predictivity_contrast_rows,
     response_feature_sets,
+    sample_functional_node_swaps_from_records,
     sample_functional_swaps_from_records,
+    node_distance_stratum,
     source_for_intervention,
+    update_node_stat_accumulator,
+    empty_node_stat_accumulator,
 )
 
 
@@ -130,6 +136,59 @@ def test_functional_graph_sum_response_delta_matches_manual_teacher_delta():
     delta = graph_sum_response_delta(base, source)
     manual = source["teacher"]["Y"].sum(dim=0) - base["teacher"]["Y"].sum(dim=0)
     assert torch.allclose(delta, manual)
+
+
+def test_functional_node_distance_strata_for_two_layer_gnn():
+    assert node_distance_stratum(0, 0, 5, 0, gnn_depth=2) == "self"
+    assert node_distance_stratum(5, 0, 5, 0, gnn_depth=2) == "self"
+    assert node_distance_stratum(3, 0, 5, 1, gnn_depth=2) == "d1"
+    assert node_distance_stratum(3, 0, 5, 2, gnn_depth=2) == "d2_to_L"
+    assert node_distance_stratum(3, 0, 5, 3, gnn_depth=2) == "d_gt_L"
+
+
+def test_functional_node_swap_sampler_is_deterministic():
+    cfg = tiny_cfg("ppr_diffusion")
+    records = [make_graph_record("ppr_diffusion", 8, 700 + idx, cfg) for idx in range(2)]
+    first = sample_functional_node_swaps_from_records(
+        records,
+        "ppr_diffusion",
+        family="ppr_payload_swap",
+        num_graphs=2,
+        swaps_per_graph=5,
+        seed=123,
+    )
+    second = sample_functional_node_swaps_from_records(
+        records,
+        "ppr_diffusion",
+        family="ppr_payload_swap",
+        num_graphs=2,
+        swaps_per_graph=5,
+        seed=123,
+    )
+    assert first == second
+    counts = {}
+    for row in first:
+        counts[row["graph_id"]] = counts.get(row["graph_id"], 0) + 1
+    assert sorted(counts.values()) == [5, 5]
+
+
+def test_functional_node_sufficient_stats_recover_channel_correlation():
+    acc = empty_node_stat_accumulator("ppr_diffusion", "g0", "d_gt_L")
+    for value in [0.5, 1.0, 1.5, 2.0]:
+        dy = torch.tensor([value, -value])
+        grit = 2.0 * dy
+        gcn = torch.zeros_like(dy)
+        update_node_stat_accumulator(acc, dy=dy, grit_delta=grit, gcn_delta=gcn, epsilon=0.0)
+    combined = combine_node_graph_stats([acc])
+    corr = corr_from_sufficient(
+        combined["channel_n"],
+        combined["sum_grit"],
+        combined["sum_y"],
+        combined["sum_grit2"],
+        combined["sum_y2"],
+        combined["sum_grit_y"],
+    )
+    assert corr > 0.999
 
 
 def test_partial_corr_residualizes_linear_confound():
