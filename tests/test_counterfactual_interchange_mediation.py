@@ -9,17 +9,22 @@ from graph_specialisation_metrics.core_interpretability_specialisation_metrics i
 from graph_specialisation_metrics.counterfactual_interchange_mediation import (
     cache_data,
     checkpoint_dir,
+    cluster_bootstrap_ci,
     collate_records,
     cv_ridge_summary,
+    distance_stratum,
     gnnplus_default_config,
+    graph_sum_response_delta,
     load_config,
     load_records,
     make_graph_record,
     model_name_for_checkpoint,
     payload_gating_controls,
     pathway_deltas,
+    partial_corr,
     response_predictivity_contrast_rows,
     response_feature_sets,
+    sample_functional_swaps_from_records,
     source_for_intervention,
 )
 
@@ -83,6 +88,74 @@ def test_content_swap_moves_continuous_x_payload_fields():
     assert torch.allclose(swapped.x[:, 0], batch.x[:, 1])
     assert torch.allclose(swapped.payload[:, 1], batch.payload[:, 0])
     assert torch.allclose(swapped.adj, batch.adj)
+
+
+def test_functional_distance_strata_for_two_layer_gnn():
+    assert distance_stratum(1, gnn_depth=2) == "d1"
+    assert distance_stratum(2, gnn_depth=2) == "d2_to_L"
+    assert distance_stratum(3, gnn_depth=2) == "dL1_to_2L"
+    assert distance_stratum(4, gnn_depth=2) == "dL1_to_2L"
+    assert distance_stratum(5, gnn_depth=2) == "d_gt_2L"
+
+
+def test_functional_sampler_is_deterministic_and_respects_stratum_caps():
+    cfg = tiny_cfg("ppr_diffusion")
+    records = [make_graph_record("ppr_diffusion", 8, 500 + idx, cfg) for idx in range(3)]
+    kwargs = {
+        "family": "ppr_payload_swap",
+        "num_graphs": 3,
+        "swaps_per_stratum": 2,
+        "gnn_depth": 2,
+        "seed": 77,
+    }
+    first = sample_functional_swaps_from_records(records, cfg, "ppr_diffusion", **kwargs)
+    second = sample_functional_swaps_from_records(records, cfg, "ppr_diffusion", **kwargs)
+
+    fields = ["graph_id", "u", "v", "d_uv", "stratum", "dy_norm"]
+    assert [{field: row[field] for field in fields} for row in first] == [
+        {field: row[field] for field in fields} for row in second
+    ]
+    counts = {}
+    for row in first:
+        key = (row["graph_id"], row["stratum"])
+        counts[key] = counts.get(key, 0) + 1
+    assert counts
+    assert max(counts.values()) <= 2
+
+
+def test_functional_graph_sum_response_delta_matches_manual_teacher_delta():
+    cfg = tiny_cfg("ppr_diffusion")
+    base = make_graph_record("ppr_diffusion", 8, 601, cfg)
+    source = source_for_intervention(base, "ppr_payload_swap", 0, 1, cfg)
+    delta = graph_sum_response_delta(base, source)
+    manual = source["teacher"]["Y"].sum(dim=0) - base["teacher"]["Y"].sum(dim=0)
+    assert torch.allclose(delta, manual)
+
+
+def test_partial_corr_residualizes_linear_confound():
+    z = torch.linspace(-2.0, 2.0, steps=40).numpy()
+    signal = torch.sin(torch.linspace(0.0, 6.0, steps=40)).numpy()
+    x = 10.0 * z + signal
+    y = -4.0 * z + 2.0 * signal
+    assert partial_corr(x, y, z) > 0.99
+
+
+def test_cluster_bootstrap_samples_whole_graph_groups():
+    rows = []
+    for graph_idx, value in enumerate([1.0, 2.0, 3.0]):
+        for _ in range(2):
+            rows.append({"graph_id": f"g{graph_idx}", "value": value})
+
+    def stat(sample_rows):
+        per_graph_counts = {}
+        for row in sample_rows:
+            per_graph_counts[row["graph_id"]] = per_graph_counts.get(row["graph_id"], 0) + 1
+        assert all(count % 2 == 0 for count in per_graph_counts.values())
+        return sum(float(row["value"]) for row in sample_rows) / len(sample_rows)
+
+    point, low, high = cluster_bootstrap_ci(rows, stat, resamples=50, seed=3)
+    assert point == 2.0
+    assert low <= point <= high
 
 
 def test_response_predictivity_grouped_cv_finds_simple_signal():
