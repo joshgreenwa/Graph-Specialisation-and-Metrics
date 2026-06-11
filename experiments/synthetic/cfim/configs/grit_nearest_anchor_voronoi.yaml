@@ -41,6 +41,7 @@ feature_dimensions:
   marker_dim: 2
   node_input_dim_ppr: 16
   node_input_dim_voronoi: 18
+  node_input_dim_local_mean_gcn: 16
   target_dim: 16
 teachers:
   ppr:
@@ -51,6 +52,9 @@ teachers:
     n_anchors: 4
     min_anchor_distance: 2
     teacher_seed: 271828
+  local_mean_gcn:
+    teacher_seed: 161803
+    include_self: true
 model:
   name: grit
   backend: official
@@ -102,6 +106,9 @@ training:
   dataloader_workers: 4
   pin_memory: true
   allow_tf32: false
+  use_cached_train_data: false
+  train_cache_graphs: 0
+  progress_every_steps: 0
 seeds:
   graph_train_seed: 1729
   graph_val_seed: 1730
@@ -110,6 +117,7 @@ seeds:
   graph_patch_eval_seed: 1733
   teacher_ppr_seed: 314159
   teacher_voronoi_seed: 271828
+  teacher_local_mean_gcn_seed: 161803
   model_init_seed: 1001
   training_order_seed: 1002
   intervention_seed: 2001

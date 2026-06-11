@@ -16,6 +16,7 @@ from graph_specialisation_metrics.counterfactual_interchange_mediation import (
     cv_ridge_summary,
     distance_stratum,
     gnnplus_default_config,
+    local_mean_kernel,
     graph_sum_response_delta,
     load_config,
     load_records,
@@ -81,6 +82,19 @@ def test_voronoi_teacher_kernel_and_marker_pathway():
     assert torch.allclose(source["teacher"]["M"], graph["teacher"]["M"])
     assert torch.linalg.vector_norm(deltas["M"]) == 0
     assert torch.allclose(deltas["K"], deltas["total"], atol=1.0e-6)
+
+
+def test_local_mean_gcn_teacher_is_one_hop_local_for_payload_swaps():
+    cfg = tiny_cfg("local_mean_gcn")
+    graph = make_graph_record("local_mean_gcn", 8, 789, cfg)
+    source = source_for_intervention(graph, "local_mean_payload_swap", 0, 1, cfg)
+    delta = source["teacher"]["Y"] - graph["teacher"]["Y"]
+    dist = torch.minimum(
+        graph["struct"]["shortest_path_distance"][:, 0],
+        graph["struct"]["shortest_path_distance"][:, 1],
+    )
+    assert torch.linalg.vector_norm(delta[dist > 1]) < 1.0e-6
+    assert torch.allclose(graph["teacher"]["K"], local_mean_kernel(graph["struct"]["adjacency"]))
 
 
 def test_content_swap_moves_continuous_x_payload_fields():

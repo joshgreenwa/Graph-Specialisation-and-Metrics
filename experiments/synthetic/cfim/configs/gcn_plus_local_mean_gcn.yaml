@@ -56,13 +56,13 @@ teachers:
     teacher_seed: 161803
     include_self: true
 model:
-  name: grit
-  backend: official
+  name: gcn_plus
+  backend: official_gnnplus
   num_layers: 2
-  hidden_dim: 128
+  hidden_dim: 192
   num_heads: 8
   head_dim: 16
-  ffn_hidden_dim: 256
+  ffn_hidden_dim: 384
   pair_hidden_dim: 64
   input_dropout: 0.0
   attention_dropout: 0.0
@@ -74,21 +74,35 @@ model:
   use_rrwp: true
   rrwp_steps: 16
   use_shortest_path_bias: false
-  use_edge_type: true
+  use_edge_type: false
   use_degree_features: true
   use_pair_value_transport: true
   use_pair_state_evolution: true
   output_head: node_regression_linear
   official_source:
-    repo: https://github.com/LiamMa/GRIT
-    checked_commit: 6c988ea600a606fbb49a2246c64a2d37396b3ab5
-    config_family: GRIT-RRWP
+    repo: https://github.com/LUOyk1999/GNNPlus
+    checked_commit: 0e02ad9acc2f1e54b5ad71c051bf5dfb1fcb4f28
+    config_family: GNN+
+    paper: https://arxiv.org/abs/2502.09263
+  dropout: 0.1
+  residual: true
+  ffn: true
+  use_rwse: true
+  parameter_match:
+    reference_model: grit
+    reference_layers: 2
+    reference_hidden_dim: 128
+    note: hidden_dim=192 is chosen to approximately match the parameter budget of
+      the 2-layer GRIT-128 teacher-student baseline.
+  gnnplus:
+    layer_type: gcn
+    official_name: GCN+
 training:
   optimizer: adamw
-  learning_rate: 0.0003
+  learning_rate: 0.001
   weight_decay: 1.0e-05
-  batch_size_graphs: 64
-  eval_batch_size_graphs: 1024
+  batch_size_graphs: 512
+  eval_batch_size_graphs: 4096
   max_steps: 5000
   warmup_steps: 250
   lr_schedule: cosine_decay_to_10_percent
@@ -106,9 +120,9 @@ training:
   dataloader_workers: 4
   pin_memory: true
   allow_tf32: false
-  use_cached_train_data: false
-  train_cache_graphs: 0
-  progress_every_steps: 0
+  use_cached_train_data: true
+  train_cache_graphs: 32768
+  progress_every_steps: 25
 seeds:
   graph_train_seed: 1729
   graph_val_seed: 1730
@@ -190,8 +204,8 @@ patching:
 response_predictivity:
   intervention_kind: cf_eval
   families:
-  - ppr_payload_swap
-  - ppr_struct_swap
+  - local_mean_payload_swap
+  - local_mean_struct_swap
   max_interventions_per_family: 4096
   batch_size_graphs: 64
   folds: 5
@@ -202,8 +216,9 @@ bootstrap:
   resamples: 2000
   confidence_interval: 95
   seed: 6060
-task: ppr_diffusion
+task: local_mean_gcn
 run:
-  name: cfim_grit_ppr_diffusion_seed1001
+  name: cfim_gcn_plus_local_mean_gcn_seed1001
   hardware: single_a100_80gb
-  model_note: 2-layer official-backed GRIT-RRWP with continuous node-regression head
+  model_note: 2-layer official GCN+ adapter using the GNNPlus repository layers, RWSE/degree
+    inputs, residuals, BatchNorm, dropout, and FFN.

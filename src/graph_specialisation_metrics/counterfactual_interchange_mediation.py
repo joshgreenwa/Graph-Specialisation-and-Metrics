@@ -3,8 +3,8 @@
 This module implements the first CFIM experiment sequence described in
 ``counterfactual_interchange_mediation_plan.md``:
 
-* deterministic graph/data caches for ``ppr_diffusion`` and
-  ``nearest_anchor_voronoi``;
+* deterministic graph/data caches for ``ppr_diffusion``,
+  ``nearest_anchor_voronoi`` and ``local_mean_gcn``;
 * frozen teacher operators with stored ``K``, ``M``, ``b`` and ``Y``;
 * official-backed GRIT training for continuous node regression;
 * effect-aware graph counterfactual intervention caches;
@@ -61,7 +61,7 @@ else:
     _YAML_IMPORT_ERROR = None
 
 
-TASKS = ("ppr_diffusion", "nearest_anchor_voronoi")
+TASKS = ("ppr_diffusion", "nearest_anchor_voronoi", "local_mean_gcn")
 MODEL_BACKENDS = ("official", "official_gnnplus", "local")
 PPR_FAMILIES = ("ppr_payload_swap", "ppr_struct_swap")
 VORONOI_FAMILIES = (
@@ -69,7 +69,8 @@ VORONOI_FAMILIES = (
     "voronoi_struct_swap",
     "voronoi_payload_swap",
 )
-ALL_FAMILIES = PPR_FAMILIES + VORONOI_FAMILIES
+LOCAL_MEAN_GCN_FAMILIES = ("local_mean_payload_swap", "local_mean_struct_swap")
+ALL_FAMILIES = PPR_FAMILIES + VORONOI_FAMILIES + LOCAL_MEAN_GCN_FAMILIES
 FUNCTIONAL_MODELS = ("grit", "gcn_plus")
 FUNCTIONAL_STRATA = ("d1", "d2_to_L", "dL1_to_2L", "d_gt_2L")
 FUNCTIONAL_STRATUM_LABELS = {
@@ -98,8 +99,10 @@ PATHWAY_BY_FAMILY = {
     "voronoi_anchor_marker_swap": "K",
     "voronoi_struct_swap": "K",
     "voronoi_payload_swap": "M",
+    "local_mean_payload_swap": "M",
+    "local_mean_struct_swap": "K",
 }
-TEACHER_SEEDS = {"ppr_diffusion": 314159, "nearest_anchor_voronoi": 271828}
+TEACHER_SEEDS = {"ppr_diffusion": 314159, "nearest_anchor_voronoi": 271828, "local_mean_gcn": 161803}
 SPLIT_SEEDS = {
     "train": 1729,
     "val": 1730,
@@ -143,11 +146,13 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "marker_dim": 2,
         "node_input_dim_ppr": 16,
         "node_input_dim_voronoi": 18,
+        "node_input_dim_local_mean_gcn": 16,
         "target_dim": 16,
     },
     "teachers": {
         "ppr": {"alpha": 0.15, "truncation": 8, "teacher_seed": 314159},
         "voronoi": {"n_anchors": 4, "min_anchor_distance": 2, "teacher_seed": 271828},
+        "local_mean_gcn": {"teacher_seed": 161803, "include_self": True},
     },
     "model": {
         "name": "grit",
@@ -214,6 +219,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "graph_patch_eval_seed": 1733,
         "teacher_ppr_seed": 314159,
         "teacher_voronoi_seed": 271828,
+        "teacher_local_mean_gcn_seed": 161803,
         "model_init_seed": 1001,
         "training_order_seed": 1002,
         "intervention_seed": 2001,
@@ -664,6 +670,14 @@ def ppr_kernel(adj: torch.Tensor, alpha: float, truncation: int) -> torch.Tensor
     return kernel / normalizer
 
 
+def local_mean_kernel(adj: torch.Tensor, *, include_self: bool = True) -> torch.Tensor:
+    n = int(adj.size(0))
+    kernel = adj.float()
+    if bool(include_self):
+        kernel = kernel + torch.eye(n, dtype=torch.float32)
+    return kernel / kernel.sum(dim=1, keepdim=True).clamp_min(1.0)
+
+
 def voronoi_kernel(
     dist: torch.Tensor,
     anchor_indicator: torch.Tensor,
@@ -730,6 +744,11 @@ def make_teacher(
         w = orthogonal_teacher_matrix(payload_dim, int(tc["teacher_seed"]))[:, :target_dim]
         k = ppr_kernel(struct["adjacency"], float(tc["alpha"]), int(tc["truncation"]))
         m = payload @ w
+    elif task == "local_mean_gcn":
+        tc = cfg["teachers"]["local_mean_gcn"]
+        w = orthogonal_teacher_matrix(payload_dim, int(tc["teacher_seed"]))[:, :target_dim]
+        k = local_mean_kernel(struct["adjacency"], include_self=bool(tc.get("include_self", True)))
+        m = payload @ w
     elif task == "nearest_anchor_voronoi":
         if anchor_indicator is None or anchor_priority is None:
             raise ValueError("voronoi teacher requires anchors")
@@ -753,7 +772,7 @@ def make_graph_record(task: str, n: int, seed: int, cfg: Mapping[str, Any], grap
     payload = torch.from_numpy(rng.normal(size=(int(n), payload_dim)).astype(np.float32))
     anchor_indicator = None
     anchor_priority = None
-    if task == "ppr_diffusion":
+    if task in {"ppr_diffusion", "local_mean_gcn"}:
         x = payload.clone()
     elif task == "nearest_anchor_voronoi":
         tc = cfg["teachers"]["voronoi"]
@@ -823,7 +842,7 @@ def clone_record_with(
         out["anchor_indicator"] = anchor_indicator.float()
     if anchor_priority is not None:
         out["anchor_priority"] = anchor_priority.float()
-    if task == "ppr_diffusion":
+    if task in {"ppr_diffusion", "local_mean_gcn"}:
         out["x"] = out["payload"].float()
     elif task == "nearest_anchor_voronoi":
         out["x"] = torch.cat(
@@ -860,11 +879,11 @@ def source_for_intervention(base: Mapping[str, Any], family: str, u: int, v: int
     n = int(base["n"])
     perm = transposition_perm(n, int(u), int(v))
     graph_id = f"{base['graph_id']}__{family}_{int(u)}_{int(v)}"
-    if family in {"ppr_payload_swap", "voronoi_payload_swap"}:
+    if family in {"ppr_payload_swap", "voronoi_payload_swap", "local_mean_payload_swap"}:
         payload = base["payload"].clone()
         payload[[int(u), int(v)]] = payload[[int(v), int(u)]]
         return clone_record_with(base, cfg, graph_id=graph_id, payload=payload)
-    if family in {"ppr_struct_swap", "voronoi_struct_swap"}:
+    if family in {"ppr_struct_swap", "voronoi_struct_swap", "local_mean_struct_swap"}:
         edge_type_dense = apply_pair_permutation(base["struct"]["edge_type_dense"], perm)
         return clone_record_with(base, cfg, graph_id=graph_id, edge_type_dense=edge_type_dense)
     if family == "voronoi_anchor_marker_swap":
@@ -903,6 +922,16 @@ def candidate_pairs_for_family(base: Mapping[str, Any], family: str) -> list[tup
         anchors = set(torch.nonzero(base["anchor_indicator"] > 0.5, as_tuple=False).reshape(-1).tolist())
         return [(u, v) for u in sorted(anchors) for v in range(n) if v not in anchors]
     return [(u, v) for u in range(n) for v in range(u + 1, n)]
+
+
+def task_families(task: str) -> tuple[str, ...]:
+    if task == "ppr_diffusion":
+        return PPR_FAMILIES
+    if task == "nearest_anchor_voronoi":
+        return VORONOI_FAMILIES
+    if task == "local_mean_gcn":
+        return LOCAL_MEAN_GCN_FAMILIES
+    raise ValueError(task)
 
 
 def frob_norm(value: torch.Tensor) -> float:
@@ -1487,6 +1516,8 @@ def input_dim_for_task(cfg: Mapping[str, Any], task: str) -> int:
         return int(dims["node_input_dim_ppr"])
     if task == "nearest_anchor_voronoi":
         return int(dims["node_input_dim_voronoi"])
+    if task == "local_mean_gcn":
+        return int(dims["node_input_dim_local_mean_gcn"])
     raise ValueError(task)
 
 
@@ -1877,7 +1908,7 @@ def build_interventions(cfg: Mapping[str, Any], task: str, kind: str, *, force: 
     records = load_records(data_dir(cfg, task) / f"{source_split}.pt")
     budget = cfg["cf_eval_budget"] if kind == "cf_eval" else cfg["patch_eval_budget"]
     records = records[: int(budget["graphs_per_task"])]
-    families = PPR_FAMILIES if task == "ppr_diffusion" else VORONOI_FAMILIES
+    families = task_families(task)
     rng = random.Random(int(cfg["seeds"]["intervention_seed"]) + (0 if kind == "cf_eval" else 10000))
     selected_records = []
     manifest_rows = []
@@ -2133,7 +2164,7 @@ def write_counterfactual_decisions(cfg: Mapping[str, Any]) -> None:
     gate = cfg["counterfactual_correctness_gate"]
     for model_name in model_names:
         for task in TASKS:
-            families = PPR_FAMILIES if task == "ppr_diffusion" else VORONOI_FAMILIES
+            families = task_families(task)
             clean_pass = task_clean_gate(cfg, task, model_name=model_name)
             for family in families:
                 subset = [
@@ -2540,7 +2571,7 @@ def load_head_rankings(
     ]
     fallback = (list(all_heads), "fallback_layer_head_order")
     out: dict[str, tuple[list[tuple[int, int]], str]] = {}
-    for family in PPR_FAMILIES if task == "ppr_diffusion" else VORONOI_FAMILIES:
+    for family in task_families(task):
         intervention, metric, score_name = ranking_metric_for_family(family)
         scored = []
         for row in rows:
@@ -2571,7 +2602,7 @@ def patch_specs_from_scores(cfg: Mapping[str, Any], task: str, model: nn.Module)
     rankings = load_head_rankings(cfg, task, all_heads)
     rng = random.Random(int(cfg["seeds"]["intervention_seed"]) + 303)
     specs = []
-    for family in (PPR_FAMILIES if task == "ppr_diffusion" else VORONOI_FAMILIES):
+    for family in (task_families(task)):
         ranked_heads, score_name = rankings.get(family, (all_heads, "fallback_layer_head_order"))
         mismatched_family = next(
             other for other in rankings if other != family
@@ -3085,6 +3116,8 @@ def default_functional_family(task: str) -> str:
         return "ppr_payload_swap"
     if task == "nearest_anchor_voronoi":
         return "voronoi_payload_swap"
+    if task == "local_mean_gcn":
+        return "local_mean_payload_swap"
     raise ValueError(task)
 
 
@@ -4895,7 +4928,7 @@ def run_payload_gating_controls(
     folds: Optional[int] = None,
     ridge_alpha: Optional[float] = None,
 ) -> None:
-    selected_family = family or ("ppr_payload_swap" if task == "ppr_diffusion" else "voronoi_payload_swap")
+    selected_family = family or (default_functional_family(task))
     if selected_family not in {"ppr_payload_swap", "voronoi_payload_swap"}:
         raise ValueError("payload gating controls are defined for ppr_payload_swap or voronoi_payload_swap")
     feature_path = metrics_dir(cfg) / f"response_predictivity_features_{task}.csv"
@@ -4991,7 +5024,7 @@ def run_response_predictivity(
     if (backend or cfg["model"].get("backend", "official")) != "official":
         raise RuntimeError("response predictivity currently requires official GRIT fields")
     pcfg = cfg.get("response_predictivity", {})
-    default_families = PPR_FAMILIES if task == "ppr_diffusion" else VORONOI_FAMILIES
+    default_families = task_families(task)
     selected_families = list(families or pcfg.get("families") or default_families)
     selected_kind = str(kind or pcfg.get("intervention_kind", "cf_eval"))
     max_per_family = int(max_interventions_per_family if max_interventions_per_family is not None else pcfg.get("max_interventions_per_family", 4096))
@@ -5098,7 +5131,7 @@ def write_mediation_decisions(cfg: Mapping[str, Any]) -> None:
     rows = read_csv_dicts(metrics_dir(cfg) / "patch_group_metrics.csv")
     decisions = []
     for task in TASKS:
-        families = PPR_FAMILIES if task == "ppr_diffusion" else VORONOI_FAMILIES
+        families = task_families(task)
         for family in families:
             subset = [
                 row
@@ -5191,7 +5224,7 @@ def plot_counterfactual_summary(cfg: Mapping[str, Any]) -> None:
     model_names = sorted({metric_model_name(row) for row in rows})
     for model_name in model_names:
         for task in TASKS:
-            families = PPR_FAMILIES if task == "ppr_diffusion" else VORONOI_FAMILIES
+            families = task_families(task)
             for family in families:
                 subset = [
                     row
@@ -5475,7 +5508,7 @@ def plot_patching_summaries(cfg: Mapping[str, Any]) -> None:
     labels = []
     values = []
     for task in TASKS:
-        families = PPR_FAMILIES if task == "ppr_diffusion" else VORONOI_FAMILIES
+        families = task_families(task)
         for family in families:
             subset = [row for row in rows if row.get("task") == task and row.get("family") == family and row.get("effect_bin") == "high"]
             if subset:
@@ -5567,7 +5600,7 @@ def plot_cumulative_head_recovery(cfg: Mapping[str, Any], rows: Sequence[Mapping
     group_sizes = [1, 2, 4]
     with PdfPages(out) as pdf:
         for task in tasks:
-            families = [family for family in (PPR_FAMILIES if task == "ppr_diffusion" else VORONOI_FAMILIES) if any(row.get("task") == task and row.get("family") == family for row in rows)]
+            families = [family for family in (task_families(task)) if any(row.get("task") == task and row.get("family") == family for row in rows)]
             components = sorted({str(row.get("component")) for row in rows if row.get("task") == task and row.get("component")})
             if not families or not components:
                 continue
@@ -5758,7 +5791,7 @@ def plot_response_predictivity_summary(cfg: Mapping[str, Any], task: str) -> Non
         "student_delta_norm",
     ]
     feature_sets = ["intercept_only", "routing_scores", "transport_scores", "all_scores"]
-    families = [family for family in (PPR_FAMILIES if task == "ppr_diffusion" else VORONOI_FAMILIES) if any(row.get("family") == family for row in rows)]
+    families = [family for family in (task_families(task)) if any(row.get("family") == family for row in rows)]
     if not families:
         return
     with PdfPages(out) as pdf:
@@ -5847,7 +5880,7 @@ def response_predictivity_contrast_rows(
     targets = ["teacher_pathway_norm", "student_teacher_pathway_projection"]
     families = [
         family
-        for family in (PPR_FAMILIES if task == "ppr_diffusion" else VORONOI_FAMILIES)
+        for family in (task_families(task))
         if any(row.get("family") == family for row in rows)
     ]
     out = []
@@ -5897,7 +5930,7 @@ def plot_response_predictivity_contrasts(
     }
     families = [
         family
-        for family in (PPR_FAMILIES if task == "ppr_diffusion" else VORONOI_FAMILIES)
+        for family in (task_families(task))
         if any(row.get("family") == family for row in contrast_rows)
     ]
     fig, axes = plt.subplots(
@@ -5989,7 +6022,7 @@ def write_default_configs(output_dir: Path) -> None:
     for task in TASKS:
         cfg = copy.deepcopy(DEFAULT_CONFIG)
         cfg["task"] = task
-        cfg["response_predictivity"]["families"] = list(PPR_FAMILIES if task == "ppr_diffusion" else VORONOI_FAMILIES)
+        cfg["response_predictivity"]["families"] = list(task_families(task))
         cfg["run"] = {
             "name": f"cfim_grit_{task}_seed1001",
             "hardware": "single_a100_80gb",
@@ -6058,7 +6091,7 @@ def gnnplus_default_config(task: str, *, layer_type: str = "gcn") -> dict[str, A
             "progress_every_steps": 25,
         },
     )
-    cfg["response_predictivity"]["families"] = list(PPR_FAMILIES if task == "ppr_diffusion" else VORONOI_FAMILIES)
+    cfg["response_predictivity"]["families"] = list(task_families(task))
     cfg["run"] = {
         "name": f"cfim_gcn_plus_{task}_seed1001",
         "hardware": "single_a100_80gb",
