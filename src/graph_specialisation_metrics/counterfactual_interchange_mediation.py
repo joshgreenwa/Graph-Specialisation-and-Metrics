@@ -1265,6 +1265,7 @@ def setup_gnnplus_graphgym_cfg(model_cfg: Mapping[str, Any]) -> None:
     graphgym_config = require_import("torch_geometric.graphgym.config", "torch_geometric GraphGym")
     graphgym_register = require_import("torch_geometric.graphgym.register", "torch_geometric GraphGym")
     yacs_config = require_import("yacs.config", "yacs")
+    allow_graphgym_duplicate_registration(graphgym_register)
     cfg = graphgym_config.cfg
     if hasattr(cfg, "defrost"):
         cfg.defrost()
@@ -1282,6 +1283,20 @@ def setup_gnnplus_graphgym_cfg(model_cfg: Mapping[str, Any]) -> None:
             pass
     if cfg.gnn.act not in graphgym_register.act_dict:
         raise RuntimeError(f"GNNPlus activation {cfg.gnn.act!r} is not registered with GraphGym")
+
+
+def allow_graphgym_duplicate_registration(graphgym_register: Any) -> None:
+    if getattr(graphgym_register, "_cfim_duplicate_registration_ok", False):
+        return
+    original_register_base = graphgym_register.register_base
+
+    def register_base_idempotent(mapping: dict[str, Any], key: str, module: Any) -> None:
+        if key in mapping:
+            return
+        return original_register_base(mapping, key, module)
+
+    graphgym_register.register_base = register_base_idempotent
+    graphgym_register._cfim_duplicate_registration_ok = True
 
 
 class CFIMOfficialGNNPlusModel(nn.Module):
