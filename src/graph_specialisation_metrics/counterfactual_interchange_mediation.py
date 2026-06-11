@@ -85,6 +85,13 @@ FUNCTIONAL_NODE_STRATUM_LABELS = {
     "d2_to_L": "2 <= D_i <= L",
     "d_gt_L": "D_i > L",
 }
+RHO_FAR_BINS = ("q1", "q2", "q3", "q4")
+RHO_FAR_BIN_LABELS = {
+    "q1": "Q1 low rho_far",
+    "q2": "Q2",
+    "q3": "Q3",
+    "q4": "Q4 high rho_far",
+}
 PATHWAY_BY_FAMILY = {
     "ppr_payload_swap": "M",
     "ppr_struct_swap": "K",
@@ -3043,6 +3050,26 @@ def graph_sum_response_delta(base: Mapping[str, Any], source: Mapping[str, Any])
     return graph_sum_teacher(source) - graph_sum_teacher(base)
 
 
+def teacher_far_response_fraction(
+    base: Mapping[str, Any],
+    source: Mapping[str, Any],
+    u: int,
+    v: int,
+    *,
+    gnn_depth: int = 2,
+) -> float:
+    n = int(base["n"])
+    dy_nodes = source["teacher"]["Y"].float()[:n] - base["teacher"]["Y"].float()[:n]
+    node_mass = dy_nodes.square().sum(dim=1)
+    total = float(node_mass.sum().item())
+    if total <= EPS:
+        return 0.0
+    spd = base["struct"]["shortest_path_distance"]
+    dist_to_swapped = torch.minimum(spd[:n, int(u)], spd[:n, int(v)])
+    far_mass = float(node_mass[dist_to_swapped > int(gnn_depth)].sum().item())
+    return float(far_mass / total)
+
+
 def effective_resistance_matrix(record: Mapping[str, Any]) -> torch.Tensor:
     adj = record["struct"]["adjacency"].float()
     degree = torch.diag(adj.sum(dim=1))
@@ -3104,6 +3131,7 @@ def sample_functional_swaps_from_records(
                 source = source_for_intervention(base, family, u, v, cfg)
                 dy = graph_sum_response_delta(base, source)
                 swap_id = f"{base['graph_id']}__{family}_{u}_{v}"
+                rho_far = teacher_far_response_fraction(base, source, u, v, gnn_depth=gnn_depth)
                 swaps.append(
                     {
                         "task": task,
@@ -3119,6 +3147,7 @@ def sample_functional_swaps_from_records(
                         "R_eff_uv": r_eff,
                         "dy": dy.detach().cpu(),
                         "dy_norm": float(torch.linalg.vector_norm(dy.float()).item()),
+                        "rho_far": rho_far,
                     }
                 )
     return swaps
@@ -3350,6 +3379,12 @@ def run_functional_responses(
                 "stratum": str(swap["stratum"]),
                 "R_eff_uv": float(swap["R_eff_uv"]),
                 "dy_norm": float(swap["dy_norm"]),
+                "rho_far": float(
+                    swap.get(
+                        "rho_far",
+                        teacher_far_response_fraction(base, source_records[row_idx], int(swap["u"]), int(swap["v"]), gnn_depth=gnn_depth),
+                    )
+                ),
             }
             for dim_idx, value in enumerate(dy.tolist()):
                 out[f"dy_{dim_idx}"] = float(value)
@@ -3394,6 +3429,105 @@ def numeric_column(rows: Sequence[Mapping[str, Any]], column: str) -> np.ndarray
         except Exception:
             values.append(float("nan"))
     return np.asarray(values, dtype=np.float64)
+
+
+def enrich_functional_rows_with_rho_far(
+    cfg: Mapping[str, Any],
+    task: str,
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    seed: int = 9101,
+    gnn_depth: int = 2,
+) -> list[dict[str, Any]]:
+    all_present = True
+    for row in rows:
+        try:
+            all_present = all_present and np.isfinite(float(row.get("rho_far", "nan")))
+        except Exception:
+            all_present = False
+            break
+    if all_present:
+        return [dict(row) for row in rows]
+    cache = load_functional_swap_cache(functional_swap_cache_path(cfg, task, seed))
+    base_records: list[dict[str, Any]] = list(cache["base_records"])
+    swaps_by_id = {str(row["swap_id"]): row for row in cache["swaps"]}
+    out = []
+    for row in rows:
+        enriched = dict(row)
+        try:
+            rho_far = float(enriched.get("rho_far", "nan"))
+        except Exception:
+            rho_far = float("nan")
+        if not np.isfinite(rho_far):
+            swap = swaps_by_id.get(str(enriched["swap_id"]))
+            if swap is None:
+                graph_index = int(enriched["graph_index"])
+                family = str(enriched["family"])
+                u = int(enriched["u"])
+                v = int(enriched["v"])
+            else:
+                graph_index = int(swap["graph_index"])
+                family = str(swap["family"])
+                u = int(swap["u"])
+                v = int(swap["v"])
+            base = base_records[graph_index]
+            source = source_for_intervention(base, family, u, v, cfg)
+            rho_far = teacher_far_response_fraction(base, source, u, v, gnn_depth=gnn_depth)
+        enriched["rho_far"] = rho_far
+        out.append(enriched)
+    return out
+
+
+def assign_rho_far_quartiles(rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    by_task: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        by_task[str(row["task"])].append(dict(row))
+    out = []
+    for task_rows in by_task.values():
+        finite = []
+        for idx, row in enumerate(task_rows):
+            try:
+                value = float(row["rho_far"])
+            except Exception:
+                value = float("nan")
+            if np.isfinite(value):
+                finite.append((value, idx))
+        finite.sort(key=lambda item: (item[0], item[1]))
+        n = len(finite)
+        for rank, (_value, idx) in enumerate(finite):
+            q_idx = min(3, int(rank * 4 / max(1, n)))
+            task_rows[idx]["rho_far_bin"] = RHO_FAR_BINS[q_idx]
+            task_rows[idx]["rho_far_bin_label"] = RHO_FAR_BIN_LABELS[RHO_FAR_BINS[q_idx]]
+        for row in task_rows:
+            row.setdefault("rho_far_bin", "missing")
+            row.setdefault("rho_far_bin_label", "missing")
+            out.append(row)
+    return out
+
+
+def rho_far_histogram_rows(rows: Sequence[Mapping[str, Any]], *, bins: int = 10) -> list[dict[str, Any]]:
+    out = []
+    for task in sorted({str(row["task"]) for row in rows}):
+        vals = np.asarray([float(row["rho_far"]) for row in rows if str(row["task"]) == task], dtype=np.float64)
+        vals = vals[np.isfinite(vals)]
+        if vals.size == 0:
+            continue
+        counts, edges = np.histogram(vals, bins=int(bins), range=(0.0, 1.0))
+        for idx, count in enumerate(counts):
+            out.append(
+                {
+                    "task": task,
+                    "bin": idx,
+                    "rho_far_low": float(edges[idx]),
+                    "rho_far_high": float(edges[idx + 1]),
+                    "count": int(count),
+                    "fraction": float(count / max(1, vals.size)),
+                    "rho_far_mean": float(vals.mean()),
+                    "rho_far_median": float(np.median(vals)),
+                    "rho_far_unique_rounded_3dp": int(len(set(np.round(vals, 3).tolist()))),
+                }
+            )
+    return out
 
 
 def row_graph_ids(rows: Sequence[Mapping[str, Any]]) -> list[str]:
@@ -3476,9 +3610,10 @@ def summarise_functional_responses(
     *,
     tasks: Sequence[str] | None = None,
     seed: int = 9101,
+    gnn_depth: int = 2,
     bootstrap_resamples: int = 1000,
     bootstrap_seed: int = 9201,
-) -> tuple[Path, Path, Path, Path]:
+) -> tuple[Path, Path, Path, Path, Path, Path]:
     tasks = list(tasks or TASKS)
     all_rows: list[dict[str, str]] = []
     for task in tasks:
@@ -3488,13 +3623,18 @@ def summarise_functional_responses(
         rows = read_csv_dicts(path)
         if not rows:
             raise RuntimeError(f"functional response table is empty: {path}")
-        all_rows.extend(rows)
+        all_rows.extend(enrich_functional_rows_with_rho_far(cfg, task, rows, seed=seed, gnn_depth=gnn_depth))
     stat_fns = functional_stat_functions()
     grouped: dict[tuple[str, str], list[Mapping[str, Any]]] = defaultdict(list)
     for row in all_rows:
         grouped[(str(row["task"]), str(row["stratum"]))].append(row)
+    rho_rows = assign_rho_far_quartiles(all_rows)
+    rho_grouped: dict[tuple[str, str], list[Mapping[str, Any]]] = defaultdict(list)
+    for row in rho_rows:
+        rho_grouped[(str(row["task"]), str(row["rho_far_bin"]))].append(row)
     e0_rows = []
     e1_rows = []
+    e1_rho_rows = []
     validity_rows = []
     for (task, stratum), rows in sorted(grouped.items()):
         graphs = len(set(row_graph_ids(rows)))
@@ -3537,6 +3677,34 @@ def summarise_functional_responses(
                     "ci_high": hi,
                 }
             )
+    for (task, rho_bin), rows in sorted(rho_grouped.items()):
+        graphs = len(set(row_graph_ids(rows)))
+        rho_values = numeric_column(rows, "rho_far")
+        for stat_name, stat_fn in stat_fns.items():
+            if stat_name.startswith("gcn_far"):
+                continue
+            point, lo, hi = cluster_bootstrap_ci(
+                rows,
+                stat_fn,
+                resamples=bootstrap_resamples,
+                seed=bootstrap_seed + stable_int_seed(task, rho_bin, stat_name) % 100000,
+            )
+            e1_rho_rows.append(
+                {
+                    "task": task,
+                    "rho_far_bin": rho_bin,
+                    "rho_far_bin_label": RHO_FAR_BIN_LABELS.get(rho_bin, rho_bin),
+                    "rho_far_low": float(np.nanmin(rho_values)) if rho_values.size else float("nan"),
+                    "rho_far_high": float(np.nanmax(rho_values)) if rho_values.size else float("nan"),
+                    "rho_far_mean": float(np.nanmean(rho_values)) if rho_values.size else float("nan"),
+                    "graphs": graphs,
+                    "swaps": len(rows),
+                    "stat": stat_name,
+                    "mean": point,
+                    "ci_low": lo,
+                    "ci_high": hi,
+                }
+            )
     clean_rows = []
     for task in tasks:
         clean_path = functional_responses_dir(cfg, task) / f"functional_clean_context_seed{int(seed)}.csv"
@@ -3546,17 +3714,22 @@ def summarise_functional_responses(
     metrics = functional_metrics_dir(cfg)
     e0_path = metrics / "functional_e0_task_anatomy.csv"
     e1_path = metrics / "functional_e1_fingerprint_stats.csv"
+    e1_rho_path = metrics / "functional_e1_fingerprint_rhofar_stats.csv"
+    rho_hist_path = metrics / "functional_e0_rho_far_histogram.csv"
     clean_out = metrics / "functional_e1_clean_performance_context.csv"
     validity_path = metrics / "functional_e1_gcn_receptive_field_validity.csv"
     write_csv(e0_path, e0_rows)
     write_csv(e1_path, e1_rows)
+    write_csv(e1_rho_path, e1_rho_rows)
+    write_csv(rho_hist_path, rho_far_histogram_rows(all_rows))
     write_csv(clean_out, clean_rows)
     write_csv(validity_path, validity_rows)
     print(
-        f"[functional-summary] wrote e0={e0_path} e1={e1_path} clean={clean_out} validity={validity_path}",
+        f"[functional-summary] wrote e0={e0_path} e1={e1_path} e1_rho={e1_rho_path} "
+        f"rho_hist={rho_hist_path} clean={clean_out} validity={validity_path}",
         flush=True,
     )
-    return e0_path, e1_path, clean_out, validity_path
+    return e0_path, e1_path, e1_rho_path, rho_hist_path, clean_out, validity_path
 
 
 def rows_by_task_stratum(rows: Sequence[Mapping[str, Any]]) -> dict[tuple[str, str], dict[str, Mapping[str, Any]]]:
@@ -3585,6 +3758,8 @@ def plot_functional_responses(cfg: Mapping[str, Any], *, tasks: Sequence[str] | 
     fig_dir.mkdir(parents=True, exist_ok=True)
     e0_rows = read_csv_dicts(functional_metrics_dir(cfg) / "functional_e0_task_anatomy.csv")
     e1_rows = read_csv_dicts(functional_metrics_dir(cfg) / "functional_e1_fingerprint_stats.csv")
+    e1_rho_rows = read_csv_dicts(functional_metrics_dir(cfg) / "functional_e1_fingerprint_rhofar_stats.csv")
+    rho_hist_rows = read_csv_dicts(functional_metrics_dir(cfg) / "functional_e0_rho_far_histogram.csv")
     clean_rows = read_csv_dicts(functional_metrics_dir(cfg) / "functional_e1_clean_performance_context.csv")
     validity_rows = read_csv_dicts(functional_metrics_dir(cfg) / "functional_e1_gcn_receptive_field_validity.csv")
     if not e0_rows or not e1_rows or not clean_rows:
@@ -3592,9 +3767,10 @@ def plot_functional_responses(cfg: Mapping[str, Any], *, tasks: Sequence[str] | 
     strata = list(FUNCTIONAL_STRATA)
     x = np.arange(len(strata), dtype=np.float64)
 
-    fig, axes = plt.subplots(1, max(1, len(tasks)), figsize=(5.2 * max(1, len(tasks)), 3.7), sharey=True)
-    axes_list = np.atleast_1d(axes)
-    for ax, task in zip(axes_list, tasks):
+    fig, axes = plt.subplots(2, max(1, len(tasks)), figsize=(5.2 * max(1, len(tasks)), 6.8), sharex=False)
+    axes_arr = np.asarray(axes).reshape(2, -1)
+    for col, task in enumerate(tasks):
+        ax = axes_arr[0, col]
         rows = {str(row["stratum"]): row for row in e0_rows if row.get("task") == task}
         means = np.asarray([float(rows[s]["dy_norm_mean"]) if s in rows else np.nan for s in strata])
         lows = np.asarray([float(rows[s]["dy_norm_ci_low"]) if s in rows else np.nan for s in strata])
@@ -3606,6 +3782,23 @@ def plot_functional_responses(cfg: Mapping[str, Any], *, tasks: Sequence[str] | 
         ax.set_xticklabels([FUNCTIONAL_STRATUM_LABELS[s] for s in strata], rotation=25, ha="right")
         ax.set_ylabel("Oracle ||Δy||")
         ax.grid(axis="y", alpha=0.25)
+        ax_hist = axes_arr[1, col]
+        hist = [row for row in rho_hist_rows if row.get("task") == task]
+        if hist:
+            lows_h = np.asarray([float(row["rho_far_low"]) for row in hist])
+            highs_h = np.asarray([float(row["rho_far_high"]) for row in hist])
+            mids = 0.5 * (lows_h + highs_h)
+            widths = highs_h - lows_h
+            fractions = np.asarray([float(row["fraction"]) for row in hist])
+            ax_hist.bar(mids, fractions, width=widths * 0.92, color="#6b6f7a", align="center")
+            mean_val = float(hist[0].get("rho_far_mean", "nan"))
+            median_val = float(hist[0].get("rho_far_median", "nan"))
+            ax_hist.axvline(mean_val, color="#1b7f79", lw=1.2, label="mean")
+            ax_hist.axvline(median_val, color="#b24c3d", lw=1.2, linestyle="--", label="median")
+        ax_hist.set_xlim(0.0, 1.0)
+        ax_hist.set_xlabel("rho_far: teacher response mass beyond L hops")
+        ax_hist.set_ylabel("Swap fraction")
+        ax_hist.grid(axis="y", alpha=0.25)
     fig.tight_layout()
     fig.savefig(fig_dir / "functional_e0_task_anatomy_content_swaps.pdf")
     plt.close(fig)
@@ -3635,9 +3828,13 @@ def plot_functional_responses(cfg: Mapping[str, Any], *, tasks: Sequence[str] | 
     fig.savefig(fig_dir / "functional_e1_response_magnitude_alignment.pdf")
     plt.close(fig)
 
-    fig, axes = plt.subplots(1, max(1, len(tasks)), figsize=(5.4 * max(1, len(tasks)), 3.9), sharey=True)
-    axes_list = np.atleast_1d(axes)
-    for ax, task in zip(axes_list, tasks):
+    rho_indexed: dict[tuple[str, str], dict[str, Mapping[str, Any]]] = defaultdict(dict)
+    for row in e1_rho_rows:
+        rho_indexed[(str(row["task"]), str(row["rho_far_bin"]))][str(row["stat"])] = row
+    fig, axes = plt.subplots(2, max(1, len(tasks)), figsize=(5.6 * max(1, len(tasks)), 7.4), sharey=True)
+    axes_arr = np.asarray(axes).reshape(2, -1)
+    for col, task in enumerate(tasks):
+        ax = axes_arr[0, col]
         for offset, stat_name, label, color in [
             (-0.18, "grit_excess_partial_corr", "GRIT | GCN+", "#1b7f79"),
             (0.18, "gcn_plus_converse_partial_corr", "GCN+ | GRIT", "#b24c3d"),
@@ -3653,7 +3850,26 @@ def plot_functional_responses(cfg: Mapping[str, Any], *, tasks: Sequence[str] | 
         ax.set_xticks(x)
         ax.set_xticklabels([FUNCTIONAL_STRATUM_LABELS[s] for s in strata], rotation=25, ha="right")
         ax.grid(axis="y", alpha=0.25)
-    axes_list[0].legend(frameon=False)
+        ax.set_xlabel("site-distance stratum d(u,v)")
+        ax_rho = axes_arr[1, col]
+        rho_x = np.arange(len(RHO_FAR_BINS), dtype=np.float64)
+        for offset, stat_name, label, color in [
+            (-0.18, "grit_excess_partial_corr", "GRIT | GCN+", "#1b7f79"),
+            (0.18, "gcn_plus_converse_partial_corr", "GCN+ | GRIT", "#b24c3d"),
+        ]:
+            vals = np.asarray([get_metric_value(rho_indexed.get((task, s), {}), stat_name) for s in RHO_FAR_BINS])
+            lows = np.asarray([get_metric_value(rho_indexed.get((task, s), {}), stat_name, "ci_low") for s in RHO_FAR_BINS])
+            highs = np.asarray([get_metric_value(rho_indexed.get((task, s), {}), stat_name, "ci_high") for s in RHO_FAR_BINS])
+            ax_rho.bar(rho_x + offset, vals, width=0.34, label=label, color=color)
+            ax_rho.errorbar(rho_x + offset, vals, yerr=nonnegative_ci_yerr(vals, lows, highs), fmt="none", color="black", lw=0.8)
+        ax_rho.axhline(0.0, color="black", lw=0.8)
+        ax_rho.set_title(f"{task}: binned by rho_far")
+        ax_rho.set_ylabel("Partial correlation")
+        ax_rho.set_xticks(rho_x)
+        ax_rho.set_xticklabels([RHO_FAR_BIN_LABELS[s] for s in RHO_FAR_BINS], rotation=25, ha="right")
+        ax_rho.set_xlabel("consequence-range quartile")
+        ax_rho.grid(axis="y", alpha=0.25)
+    axes_arr[0, 0].legend(frameon=False)
     fig.tight_layout()
     fig.savefig(fig_dir / "functional_e1_excess_alignment.pdf")
     plt.close(fig)
@@ -5961,6 +6177,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     common(p)
     p.add_argument("--all-tasks", action="store_true")
     p.add_argument("--seed", type=int, default=9101)
+    p.add_argument("--gnn-depth", type=int, default=2)
     p.add_argument("--bootstrap-resamples", type=int, default=1000)
     p.add_argument("--bootstrap-seed", type=int, default=9201)
 
@@ -6142,6 +6359,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             cfg,
             tasks=tasks,
             seed=args.seed,
+            gnn_depth=args.gnn_depth,
             bootstrap_resamples=args.bootstrap_resamples,
             bootstrap_seed=args.bootstrap_seed,
         )
@@ -6179,6 +6397,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             cfg,
             tasks=tasks,
             seed=args.seed,
+            gnn_depth=args.gnn_depth,
             bootstrap_resamples=args.bootstrap_resamples,
             bootstrap_seed=args.bootstrap_seed,
         )

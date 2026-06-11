@@ -30,6 +30,7 @@ from graph_specialisation_metrics.counterfactual_interchange_mediation import (
     sample_functional_swaps_from_records,
     node_distance_stratum,
     source_for_intervention,
+    teacher_far_response_fraction,
     update_node_stat_accumulator,
     empty_node_stat_accumulator,
 )
@@ -136,6 +137,19 @@ def test_functional_graph_sum_response_delta_matches_manual_teacher_delta():
     delta = graph_sum_response_delta(base, source)
     manual = source["teacher"]["Y"].sum(dim=0) - base["teacher"]["Y"].sum(dim=0)
     assert torch.allclose(delta, manual)
+
+
+def test_teacher_far_response_fraction_matches_manual_node_mass_ratio():
+    cfg = tiny_cfg("ppr_diffusion")
+    base = make_graph_record("ppr_diffusion", 8, 602, cfg)
+    u, v = 0, 1
+    source = source_for_intervention(base, "ppr_payload_swap", u, v, cfg)
+    rho_far = teacher_far_response_fraction(base, source, u, v, gnn_depth=2)
+    dy_nodes = source["teacher"]["Y"] - base["teacher"]["Y"]
+    mass = dy_nodes.square().sum(dim=1)
+    dist = torch.minimum(base["struct"]["shortest_path_distance"][:, u], base["struct"]["shortest_path_distance"][:, v])
+    manual = float(mass[dist > 2].sum().item() / mass.sum().item()) if float(mass.sum().item()) > 0 else 0.0
+    assert abs(rho_far - manual) < 1.0e-8
 
 
 def test_functional_node_distance_strata_for_two_layer_gnn():
