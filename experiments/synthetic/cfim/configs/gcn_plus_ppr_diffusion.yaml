@@ -30,6 +30,8 @@ model:
     paper: https://arxiv.org/abs/2502.09263
     config_family: GNN+
 training:
+  batch_size_graphs: 128
+  eval_batch_size_graphs: 2048
   learning_rate: 0.001
   weight_decay: 1.0e-05
   max_steps: 5000

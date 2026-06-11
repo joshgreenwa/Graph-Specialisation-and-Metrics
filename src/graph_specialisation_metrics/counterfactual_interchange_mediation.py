@@ -3990,6 +3990,8 @@ def gnnplus_default_config(task: str, *, layer_type: str = "gcn") -> dict[str, A
     cfg["training"] = deep_update(
         cfg["training"],
         {
+            "batch_size_graphs": 128,
+            "eval_batch_size_graphs": 2048,
             "learning_rate": 1.0e-3,
             "weight_decay": 1.0e-5,
             "max_steps": 5000,
