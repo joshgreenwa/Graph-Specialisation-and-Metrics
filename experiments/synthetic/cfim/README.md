@@ -39,7 +39,9 @@ The `gcn_plus_*.yaml` configs use the official GNNPlus `GCNConvLayer` class
 with the CFIM node-regression data and training loop. They keep the GRIT depth
 fixed at two layers and set `hidden_dim=192` to approximate the parameter budget
 of the two-layer GRIT-128 baseline while preserving RWSE/degree inputs,
-BatchNorm, dropout, residual connections, and FFN blocks.
+BatchNorm, dropout, residual connections, and FFN blocks. They opt into a shared
+`data/<task>/train_pool.pt` cache and use larger graph batches than GRIT because
+GCN+ is sparse/local and otherwise CPU graph generation dominates runtime.
 
 The job uses `PYTHONPATH=${PROJECT_ROOT}/src` and launches:
 
@@ -107,6 +109,15 @@ Checkpoints are written separately from GRIT:
 ```text
 artifacts/cfim/checkpoints/gcn_plus/<task>/seed_1001/best.pt
 ```
+
+The first GCN+ training run for a task will also create:
+
+```text
+artifacts/cfim/data/<task>/train_pool.pt
+```
+
+Subsequent GCN+ runs reuse this train pool instead of regenerating training
+graphs online.
 
 After training, evaluate clean and counterfactual performance with:
 

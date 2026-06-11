@@ -179,6 +179,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "dataloader_workers": 4,
         "pin_memory": True,
         "allow_tf32": False,
+        "use_cached_train_data": False,
+        "train_cache_graphs": 0,
+        "progress_every_steps": 0,
     },
     "seeds": {
         "graph_train_seed": 1729,
@@ -294,6 +297,7 @@ def load_config(path: Path | None, *, task: str | None = None, fast_dev_run: boo
         cfg["splits"]["patch_eval"]["num_graphs"] = 4
         cfg["training"]["batch_size_graphs"] = 4
         cfg["training"]["eval_batch_size_graphs"] = 8
+        cfg["training"]["train_cache_graphs"] = min(int(cfg["training"].get("train_cache_graphs", 0)), 16)
         cfg["training"]["max_steps"] = 2
         cfg["training"]["warmup_steps"] = 1
         cfg["training"]["eval_every_steps"] = 1
@@ -1479,6 +1483,20 @@ def generate_split_records(task: str, split: str, cfg: Mapping[str, Any]) -> lis
     ]
 
 
+def generate_train_pool_records(task: str, cfg: Mapping[str, Any], count: int) -> list[dict[str, Any]]:
+    gcfg = cfg["graph_generator"]
+    n_min = int(gcfg["n_train_min"])
+    n_max = int(gcfg["n_train_max"])
+    base_seed = int(cfg["seeds"]["graph_train_seed"])
+    rng = np.random.default_rng(base_seed)
+    records = []
+    for idx in range(int(count)):
+        n = int(rng.integers(n_min, n_max + 1))
+        seed = base_seed + idx
+        records.append(make_graph_record(task, n, seed, cfg, graph_id=f"{task}_train_pool_{idx:06d}"))
+    return records
+
+
 def cache_data(cfg: Mapping[str, Any], task: str, *, force: bool = False) -> None:
     out_dir = data_dir(cfg, task)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -1506,6 +1524,40 @@ def cache_data(cfg: Mapping[str, Any], task: str, *, force: bool = False) -> Non
                 "sha256": sha256_file(path),
             }
         )
+    train_cache_graphs = int(cfg["training"].get("train_cache_graphs", 0))
+    if bool(cfg["training"].get("use_cached_train_data", False)) and train_cache_graphs > 0:
+        path = out_dir / "train_pool.pt"
+        if path.exists() and not force:
+            manifest_rows.append(
+                {
+                    "split": "train_pool",
+                    "path": str(path),
+                    "graphs": train_cache_graphs,
+                    "nodes_min": int(cfg["graph_generator"]["n_train_min"]),
+                    "nodes_max": int(cfg["graph_generator"]["n_train_max"]),
+                    "edges_mean": "",
+                    "sha256": "",
+                    "bytes": int(path.stat().st_size),
+                }
+            )
+        else:
+            print(f"[data] generating {task}/train_pool graphs={train_cache_graphs}", flush=True)
+            records = generate_train_pool_records(task, cfg, train_cache_graphs)
+            save_records(path, records)
+            nodes = [int(row["n"]) for row in records]
+            edges = [int(row["edge_index"].size(1) // 2) for row in records]
+            manifest_rows.append(
+                {
+                    "split": "train_pool",
+                    "path": str(path),
+                    "graphs": len(records),
+                    "nodes_min": min(nodes) if nodes else 0,
+                    "nodes_max": max(nodes) if nodes else 0,
+                    "edges_mean": float(np.mean(edges)) if edges else 0.0,
+                    "sha256": sha256_file(path),
+                    "bytes": int(path.stat().st_size),
+                }
+            )
     write_json(
         out_dir / "data_manifest.json",
         {
@@ -1530,6 +1582,11 @@ def online_train_batch(cfg: Mapping[str, Any], task: str, rng: np.random.Generat
         seed = seed_base + int(rng.integers(0, 2**31 - 1))
         records.append(make_graph_record(task, n, seed, cfg, graph_id=f"{task}_train_seed{seed}"))
     return records
+
+
+def cached_train_batch(records: Sequence[Mapping[str, Any]], rng: np.random.Generator, batch_size: int) -> list[Mapping[str, Any]]:
+    indices = rng.integers(0, len(records), size=int(batch_size))
+    return [records[int(idx)] for idx in indices]
 
 
 def lr_for_step(base_lr: float, step: int, warmup_steps: int, max_steps: int) -> float:
@@ -1574,6 +1631,13 @@ def train(cfg: Mapping[str, Any], task: str, *, device_name: str = "auto", backe
     write_yaml(train_cfg_path, cfg)
     write_yaml(resolved_cfg_path, cfg)
     val_records = load_records(data_dir(cfg, task) / "val.pt")
+    train_records: Optional[list[dict[str, Any]]] = None
+    if bool(cfg["training"].get("use_cached_train_data", False)):
+        train_path = data_dir(cfg, task) / "train_pool.pt"
+        train_records = load_records(train_path)
+        if not train_records:
+            raise RuntimeError(f"cached training is enabled but {train_path} is empty")
+        print(f"[data] using cached train_pool={train_path} graphs={len(train_records)}", flush=True)
     model = build_model(cfg, task, backend=backend).to(device)
     params_trainable = parameter_count(model, trainable_only=True)
     params_total = parameter_count(model, trainable_only=False)
@@ -1594,6 +1658,7 @@ def train(cfg: Mapping[str, Any], task: str, *, device_name: str = "auto", backe
     max_steps = int(cfg["training"]["max_steps"])
     batch_size = int(cfg["training"]["batch_size_graphs"])
     eval_batch = int(cfg["training"]["eval_batch_size_graphs"])
+    progress_every = int(cfg["training"].get("progress_every_steps", 0))
     start_time = time.time()
     last_step = 0
     early_stop_hits = 0
@@ -1607,7 +1672,10 @@ def train(cfg: Mapping[str, Any], task: str, *, device_name: str = "auto", backe
             max_steps,
         )
         set_optimizer_lr(optimizer, lr)
-        batch_records = online_train_batch(cfg, task, rng, batch_size)
+        if train_records is not None:
+            batch_records = cached_train_batch(train_records, rng, batch_size)
+        else:
+            batch_records = online_train_batch(cfg, task, rng, batch_size)
         batch = collate_records(batch_records).to(device)
         optimizer.zero_grad(set_to_none=True)
         pred = model(batch)
@@ -1615,7 +1683,15 @@ def train(cfg: Mapping[str, Any], task: str, *, device_name: str = "auto", backe
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), float(cfg["training"]["gradient_clip_norm"]))
         optimizer.step()
-        if step % int(cfg["training"]["eval_every_steps"]) == 0 or step == 1 or step == max_steps:
+        do_eval = step % int(cfg["training"]["eval_every_steps"]) == 0 or step == 1 or step == max_steps
+        if progress_every > 0 and step % progress_every == 0 and not do_eval:
+            elapsed = time.time() - start_time
+            print(
+                f"[train-progress] model={model_name_for_checkpoint(cfg)} task={task} step={step}/{max_steps} "
+                f"loss={float(loss.detach().cpu()):.6g} lr={lr:.4g} sec_per_step={elapsed / max(step, 1):.3f}",
+                flush=True,
+            )
+        if do_eval:
             metrics, val_pred = evaluate_records(model, val_records, batch_size=eval_batch, device=device)
             improved = metrics["relmse_mean"] < best_rel
             if improved:
@@ -4025,8 +4101,8 @@ def gnnplus_default_config(task: str, *, layer_type: str = "gcn") -> dict[str, A
     cfg["training"] = deep_update(
         cfg["training"],
         {
-            "batch_size_graphs": 128,
-            "eval_batch_size_graphs": 2048,
+            "batch_size_graphs": 512,
+            "eval_batch_size_graphs": 4096,
             "learning_rate": 1.0e-3,
             "weight_decay": 1.0e-5,
             "max_steps": 5000,
@@ -4036,6 +4112,9 @@ def gnnplus_default_config(task: str, *, layer_type: str = "gcn") -> dict[str, A
             "early_stop_val_relmse": 0.005,
             "early_stop_min_steps": 1500,
             "early_stop_patience_evals": 4,
+            "use_cached_train_data": True,
+            "train_cache_graphs": 32768,
+            "progress_every_steps": 25,
         },
     )
     cfg["response_predictivity"]["families"] = list(PPR_FAMILIES if task == "ppr_diffusion" else VORONOI_FAMILIES)

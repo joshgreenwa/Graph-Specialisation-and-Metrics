@@ -7,11 +7,13 @@ from graph_specialisation_metrics.core_interpretability_specialisation_metrics i
     make_content_swapped_batch,
 )
 from graph_specialisation_metrics.counterfactual_interchange_mediation import (
+    cache_data,
     checkpoint_dir,
     collate_records,
     cv_ridge_summary,
     gnnplus_default_config,
     load_config,
+    load_records,
     make_graph_record,
     model_name_for_checkpoint,
     pathway_deltas,
@@ -145,3 +147,15 @@ def test_gnnplus_config_uses_separate_checkpoint_namespace():
     assert cfg["model"]["gnnplus"]["layer_type"] == "gcn"
     assert model_name_for_checkpoint(cfg) == "gcn_plus"
     assert checkpoint_dir(cfg, "ppr_diffusion") == tmp_path / "checkpoints" / "gcn_plus" / "ppr_diffusion" / "seed_1001"
+
+
+def test_cached_train_pool_is_written_for_opt_in_training():
+    tmp_path = Path(tempfile.mkdtemp())
+    cfg = load_config(None, task="ppr_diffusion", fast_dev_run=True)
+    cfg["artifacts"]["root"] = str(tmp_path)
+    cfg["training"]["use_cached_train_data"] = True
+    cfg["training"]["train_cache_graphs"] = 6
+    cache_data(cfg, "ppr_diffusion", force=True)
+    records = load_records(tmp_path / "data" / "ppr_diffusion" / "train_pool.pt")
+    assert len(records) == 6
+    assert records[0]["graph_id"].startswith("ppr_diffusion_train_pool_")
