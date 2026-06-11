@@ -26,6 +26,7 @@ import csv
 import dataclasses
 import hashlib
 import importlib
+import importlib.util
 import json
 import math
 import os
@@ -1094,6 +1095,16 @@ def external_repo_paths(env_name: str, candidates: Sequence[str]) -> list[Path]:
     return paths
 
 
+def resolve_external_repo_path(env_name: str, candidates: Sequence[str]) -> Path:
+    for path in external_repo_paths(env_name, candidates):
+        if path.exists():
+            return path.resolve()
+    raise RuntimeError(
+        f"Official repository for {env_name} was not found. Checked: "
+        + ", ".join(str(path) for path in external_repo_paths(env_name, candidates))
+    )
+
+
 def add_external_repo_path(env_name: str, candidates: Sequence[str]) -> None:
     for path in external_repo_paths(env_name, candidates):
         if path.exists():
@@ -1111,6 +1122,25 @@ def require_import(module_name: str, package_hint: str):
             f"Official backend import failed for {module_name!r}. Install or expose "
             f"{package_hint}. For GRIT set GRIT_ROOT; for GNNPlus set GNNPLUS_ROOT."
         ) from exc
+
+
+def require_official_file_module(module_name: str, path: Path):
+    path = path.resolve()
+    if module_name in sys.modules:
+        return sys.modules[module_name]
+    if not path.exists():
+        raise RuntimeError(f"Official backend file is missing: {path}")
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Could not load official backend file: {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception:
+        sys.modules.pop(module_name, None)
+        raise
+    return module
 
 
 def grit_layer_cfg(update_e: bool):
@@ -1308,23 +1338,24 @@ class CFIMOfficialGNNPlusModel(nn.Module):
     """
 
     LAYER_MODULES = {
-        "gcn": ("GNNPlus.layer.gcn_conv_layer", "GCNConvLayer", False),
-        "gcne": ("GNNPlus.layer.gcn_conv_layer_e", "GCNConvLayer", True),
-        "gine": ("GNNPlus.layer.gine_conv_layer", "GINEConvLayer", True),
-        "gatedgcn": ("GNNPlus.layer.gatedgcn_layer", "GatedGCNLayer", True),
+        "gcn": ("gcn_conv_layer.py", "_official_gnnplus_gcn_conv_layer", "GCNConvLayer", False),
+        "gcne": ("gcn_conv_layer_e.py", "_official_gnnplus_gcn_conv_layer_e", "GCNConvLayer", True),
+        "gine": ("gine_conv_layer.py", "_official_gnnplus_gine_conv_layer", "GINEConvLayer", True),
+        "gatedgcn": ("gatedgcn_layer.py", "_official_gnnplus_gatedgcn_layer", "GatedGCNLayer", True),
     }
 
     def __init__(self, cfg: Mapping[str, Any], input_dim: int, edge_attr_dim: int = 3) -> None:
         super().__init__()
-        add_external_repo_path("GNNPLUS_ROOT", ("GNNPlus",))
+        gnnplus_root = resolve_external_repo_path("GNNPLUS_ROOT", ("GNNPlus",))
+        gnnplus_pkg = gnnplus_root / "GNNPlus" if (gnnplus_root / "GNNPlus").exists() else gnnplus_root
         model_cfg = cfg["model"]
         gnnplus_cfg = model_cfg.get("gnnplus", {})
         layer_type = str(gnnplus_cfg.get("layer_type", "gcn")).lower()
         if layer_type not in self.LAYER_MODULES:
             raise ValueError(f"unsupported GNNPlus layer_type {layer_type!r}; expected one of {sorted(self.LAYER_MODULES)}")
         setup_gnnplus_graphgym_cfg(model_cfg)
-        module_name, class_name, edge_aware = self.LAYER_MODULES[layer_type]
-        layer_mod = require_import(module_name, "official GNNPlus repository")
+        file_name, module_name, class_name, edge_aware = self.LAYER_MODULES[layer_type]
+        layer_mod = require_official_file_module(module_name, gnnplus_pkg / "layer" / file_name)
         layer_cls = getattr(layer_mod, class_name)
 
         dim = int(model_cfg["hidden_dim"])
