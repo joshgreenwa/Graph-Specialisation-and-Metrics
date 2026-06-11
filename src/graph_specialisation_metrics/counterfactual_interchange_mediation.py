@@ -404,6 +404,10 @@ def model_name_for_checkpoint(cfg: Mapping[str, Any]) -> str:
     return str(cfg.get("model", {}).get("name", "grit"))
 
 
+def metric_model_name(row: Mapping[str, Any]) -> str:
+    return str(row.get("model") or "grit")
+
+
 def intervention_dir(cfg: Mapping[str, Any], task: str) -> Path:
     return artifact_root(cfg) / "interventions" / task
 
@@ -1822,9 +1826,10 @@ def mediation_metrics(delta_patch: torch.Tensor, target: torch.Tensor, delta_tot
 
 def clean_performance(cfg: Mapping[str, Any], task: str, model: nn.Module, device: torch.device) -> list[dict[str, Any]]:
     rows = []
+    model_name = model_name_for_checkpoint(cfg)
     for split in ("test_id", "test_ood_64"):
         split_start = time.time()
-        print(f"[clean] start task={task} split={split}", flush=True)
+        print(f"[clean] start model={model_name} task={task} split={split}", flush=True)
         records = load_records(data_dir(cfg, task) / f"{split}.pt")
         metrics, preds = evaluate_records(
             model,
@@ -1833,9 +1838,9 @@ def clean_performance(cfg: Mapping[str, Any], task: str, model: nn.Module, devic
             device=device,
         )
         torch.save({"pred": preds, "metrics": metrics}, checkpoint_dir(cfg, task) / f"{split}_predictions_best.pt")
-        rows.append({"task": task, "split": split, **metrics})
+        rows.append({"model": model_name, "task": task, "split": split, **metrics})
         print(
-            f"[clean] done task={task} split={split} relmse_mean={metrics['relmse_mean']:.6g} "
+            f"[clean] done model={model_name} task={task} split={split} relmse_mean={metrics['relmse_mean']:.6g} "
             f"elapsed={time.time() - split_start:.1f}s",
             flush=True,
         )
@@ -1853,9 +1858,14 @@ def evaluate_counterfactuals(
     device = choose_device(device_name)
     configure_runtime(cfg, device)
     model, _run_cfg = load_model_from_checkpoint(cfg, task, checkpoint, device, backend=backend)
+    model_name = model_name_for_checkpoint(cfg)
     clean_rows = clean_performance(cfg, task, model, device)
     clean_path = metrics_dir(cfg) / "clean_performance.csv"
-    old_clean = [row for row in read_csv_dicts(clean_path) if row.get("task") != task]
+    old_clean = [
+        row
+        for row in read_csv_dicts(clean_path)
+        if not (row.get("task") == task and metric_model_name(row) == model_name)
+    ]
     write_csv(clean_path, old_clean + clean_rows)
     interventions = torch.load(intervention_dir(cfg, task) / "cf_eval_interventions.pt", map_location="cpu", weights_only=False)
     rows = []
@@ -1884,6 +1894,7 @@ def evaluate_counterfactuals(
             metrics = effect_metrics(pred_s - pred_b, deltas["total"])
             rows.append(
                 {
+                    "model": model_name,
                     "task": task,
                     "intervention_id": row["intervention_id"],
                     "graph_id": row["graph_id"],
@@ -1906,7 +1917,11 @@ def evaluate_counterfactuals(
             flush=True,
         )
     cf_path = metrics_dir(cfg) / "counterfactual_metrics.csv"
-    old = [row for row in read_csv_dicts(cf_path) if row.get("task") != task]
+    old = [
+        row
+        for row in read_csv_dicts(cf_path)
+        if not (row.get("task") == task and metric_model_name(row) == model_name)
+    ]
     write_csv(cf_path, old + rows)
     write_counterfactual_decisions(cfg)
     plot_counterfactual_summary(cfg)
@@ -1917,9 +1932,14 @@ def median(values: Sequence[float]) -> float:
     return float(np.median(clean)) if clean else float("nan")
 
 
-def task_clean_gate(cfg: Mapping[str, Any], task: str) -> bool:
+def task_clean_gate(cfg: Mapping[str, Any], task: str, model_name: Optional[str] = None) -> bool:
+    selected_model = model_name or model_name_for_checkpoint(cfg)
     path = metrics_dir(cfg) / "clean_performance.csv"
-    rows = [row for row in read_csv_dicts(path) if row.get("task") == task]
+    rows = [
+        row
+        for row in read_csv_dicts(path)
+        if row.get("task") == task and metric_model_name(row) == selected_model
+    ]
     by_split = {row["split"]: float(row["relmse_mean"]) for row in rows}
     gate = cfg["minimum_clean_performance"]
     return (
@@ -1931,47 +1951,53 @@ def task_clean_gate(cfg: Mapping[str, Any], task: str) -> bool:
 def write_counterfactual_decisions(cfg: Mapping[str, Any]) -> None:
     rows = read_csv_dicts(metrics_dir(cfg) / "counterfactual_metrics.csv")
     clean_rows = read_csv_dicts(metrics_dir(cfg) / "clean_performance.csv")
-    clean_by_task = {
-        row["task"]: float(row["relmse_mean"])
+    clean_by_task_model = {
+        (row["task"], metric_model_name(row)): float(row["relmse_mean"])
         for row in clean_rows
         if row.get("split") == "test_id" and row.get("relmse_mean")
     }
+    model_names = sorted({metric_model_name(row) for row in rows}) or [model_name_for_checkpoint(cfg)]
     decisions = []
     gate = cfg["counterfactual_correctness_gate"]
-    for task in TASKS:
-        families = PPR_FAMILIES if task == "ppr_diffusion" else VORONOI_FAMILIES
-        clean_pass = task_clean_gate(cfg, task)
-        for family in families:
-            subset = [
-                row
-                for row in rows
-                if row.get("task") == task and row.get("family") == family and row.get("effect_bin") == "high"
-            ]
-            cea = median([float(row["CEA"]) for row in subset]) if subset else float("nan")
-            cee = median([float(row["CEE"]) for row in subset]) if subset else float("nan")
-            beta = median([float(row["beta_T"]) for row in subset]) if subset else float("nan")
-            cf_rel = median([float(row["cf_relmse"]) for row in subset]) if subset else float("nan")
-            clean_rel = clean_by_task.get(task, float("inf"))
-            passed = (
-                clean_pass
-                and cea >= float(gate["median_CEA_min"])
-                and cee <= float(gate["median_CEE_max"])
-                and float(gate["median_beta_T_min"]) <= beta <= float(gate["median_beta_T_max"])
-                and cf_rel <= float(gate["cf_relmse_clean_multiplier_max"]) * clean_rel + 1.0e-6
-            )
-            decisions.append(
-                {
-                    "task": task,
-                    "family": family,
-                    "hypothesis": "H1_counterfactual_functional_correctness",
-                    "decision": "supported" if passed else ("not_supported" if clean_pass else "not_testable_due_to_failed_upstream_gate"),
-                    "evidence_metric": "high_bin_median_CEA_CEE_beta",
-                    "estimate": cea,
-                    "ci_low": "",
-                    "ci_high": "",
-                    "notes": f"median_CEA={cea:.4g}; median_CEE={cee:.4g}; median_beta_T={beta:.4g}; clean_gate={clean_pass}",
-                }
-            )
+    for model_name in model_names:
+        for task in TASKS:
+            families = PPR_FAMILIES if task == "ppr_diffusion" else VORONOI_FAMILIES
+            clean_pass = task_clean_gate(cfg, task, model_name=model_name)
+            for family in families:
+                subset = [
+                    row
+                    for row in rows
+                    if row.get("task") == task
+                    and metric_model_name(row) == model_name
+                    and row.get("family") == family
+                    and row.get("effect_bin") == "high"
+                ]
+                cea = median([float(row["CEA"]) for row in subset]) if subset else float("nan")
+                cee = median([float(row["CEE"]) for row in subset]) if subset else float("nan")
+                beta = median([float(row["beta_T"]) for row in subset]) if subset else float("nan")
+                cf_rel = median([float(row["cf_relmse"]) for row in subset]) if subset else float("nan")
+                clean_rel = clean_by_task_model.get((task, model_name), float("inf"))
+                passed = (
+                    clean_pass
+                    and cea >= float(gate["median_CEA_min"])
+                    and cee <= float(gate["median_CEE_max"])
+                    and float(gate["median_beta_T_min"]) <= beta <= float(gate["median_beta_T_max"])
+                    and cf_rel <= float(gate["cf_relmse_clean_multiplier_max"]) * clean_rel + 1.0e-6
+                )
+                decisions.append(
+                    {
+                        "model": model_name,
+                        "task": task,
+                        "family": family,
+                        "hypothesis": "H1_counterfactual_functional_correctness",
+                        "decision": "supported" if passed else ("not_supported" if clean_pass else "not_testable_due_to_failed_upstream_gate"),
+                        "evidence_metric": "high_bin_median_CEA_CEE_beta",
+                        "estimate": cea,
+                        "ci_low": "",
+                        "ci_high": "",
+                        "notes": f"median_CEA={cea:.4g}; median_CEE={cee:.4g}; median_beta_T={beta:.4g}; clean_gate={clean_pass}",
+                    }
+                )
     path = metrics_dir(cfg) / "hypothesis_decisions.csv"
     old = [row for row in read_csv_dicts(path) if row.get("hypothesis") != "H1_counterfactual_functional_correctness"]
     write_csv(path, old + decisions)
@@ -3145,14 +3171,23 @@ def plot_counterfactual_summary(cfg: Mapping[str, Any]) -> None:
     labels = []
     cea = []
     beta = []
-    for task in TASKS:
-        families = PPR_FAMILIES if task == "ppr_diffusion" else VORONOI_FAMILIES
-        for family in families:
-            subset = [row for row in rows if row.get("task") == task and row.get("family") == family and row.get("effect_bin") == "high"]
-            if subset:
-                labels.append(f"{task}\n{family}")
-                cea.append(median([float(row["CEA"]) for row in subset]))
-                beta.append(median([float(row["beta_T"]) for row in subset]))
+    model_names = sorted({metric_model_name(row) for row in rows})
+    for model_name in model_names:
+        for task in TASKS:
+            families = PPR_FAMILIES if task == "ppr_diffusion" else VORONOI_FAMILIES
+            for family in families:
+                subset = [
+                    row
+                    for row in rows
+                    if metric_model_name(row) == model_name
+                    and row.get("task") == task
+                    and row.get("family") == family
+                    and row.get("effect_bin") == "high"
+                ]
+                if subset:
+                    labels.append(f"{model_name}\n{task}\n{family}")
+                    cea.append(median([float(row["CEA"]) for row in subset]))
+                    beta.append(median([float(row["beta_T"]) for row in subset]))
     if not labels:
         return
     fig, axes = plt.subplots(1, 2, figsize=(max(8, len(labels) * 1.1), 4), sharex=True)
