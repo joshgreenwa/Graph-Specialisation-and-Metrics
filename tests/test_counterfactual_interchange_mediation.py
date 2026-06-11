@@ -1,4 +1,5 @@
 import tempfile
+import csv
 from pathlib import Path
 
 import torch
@@ -34,6 +35,20 @@ from graph_specialisation_metrics.counterfactual_interchange_mediation import (
     teacher_far_response_fraction,
     update_node_stat_accumulator,
     empty_node_stat_accumulator,
+    assign_task_quantile_bins,
+    functional_node_graph_stats_path,
+    functional_node_validity_path,
+    functional_q1_gate_features_path,
+    functional_q1_graph_coupling_points_path,
+    functional_q1_gate_quartile_stats_path,
+    functional_response_table_path,
+    functional_responses_dir,
+    functional_validity_gate_path,
+    Q1LayerFields,
+    q1_gate_scope_values,
+    read_csv_dicts,
+    summarise_functional_q1_gates,
+    summarise_functional_validity_gate,
 )
 
 
@@ -243,6 +258,184 @@ def test_cluster_bootstrap_samples_whole_graph_groups():
     point, low, high = cluster_bootstrap_ci(rows, stat, resamples=50, seed=3)
     assert point == 2.0
     assert low <= point <= high
+
+
+def test_q1_gate_scope_values_match_manual_attention_and_transport():
+    attn = torch.tensor(
+        [
+            [
+                [0.2, 0.2, 0.2, 0.2, 0.2],
+                [0.2, 0.2, 0.2, 0.2, 0.2],
+                [0.2, 0.2, 0.2, 0.2, 0.2],
+                [0.2, 0.2, 0.2, 0.2, 0.2],
+                [0.1, 0.2, 0.3, 0.2, 0.2],
+            ]
+        ]
+    )
+    msg = torch.ones(1, 5, 5, 1)
+    mask = torch.ones(1, 5, 5, dtype=torch.bool)
+    spd = torch.tensor(
+        [
+            [0, 1, 2, 3, 4],
+            [1, 0, 1, 2, 3],
+            [2, 1, 0, 1, 2],
+            [3, 2, 1, 0, 1],
+            [4, 3, 2, 1, 0],
+        ]
+    )
+    layer = Q1LayerFields(layer=0, attention=attn, message=msg, mask=mask)
+    values = q1_gate_scope_values([layer], spd, u=0, v=1, gnn_depth=2)
+
+    assert abs(values["route_swap_far_mass"] - 0.3) < 1.0e-7
+    assert abs(values["transport_swap_far_share"] - 0.3) < 1.0e-7
+    assert abs(values["route_global_far_share"] - 0.22) < 1.0e-7
+    assert abs(values["transport_global_far_share"] - 0.22) < 1.0e-7
+    assert values["far_query_count"] == 1.0
+
+
+def test_q1_quantile_bins_are_task_local_and_deterministic():
+    rows = []
+    for task in ["a", "b"]:
+        for idx, value in enumerate([0.0, 1.0, 2.0, 3.0]):
+            rows.append({"task": task, "graph_id": f"{task}{idx}", "gate": value + (10.0 if task == "b" else 0.0)})
+    binned = assign_task_quantile_bins(
+        rows,
+        value_column="gate",
+        bin_column="gate_bin",
+        label_column="gate_label",
+        bin_labels={"q1": "low", "q2": "mid-low", "q3": "mid-high", "q4": "high"},
+    )
+    by_task = {task: [row["gate_bin"] for row in binned if row["task"] == task] for task in ["a", "b"]}
+    assert by_task["a"] == ["q1", "q2", "q3", "q4"]
+    assert by_task["b"] == ["q1", "q2", "q3", "q4"]
+
+
+def write_test_csv(path: Path, rows: list[dict[str, object]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def test_q1_summary_preserves_graph_grouping(tmp_path):
+    cfg = load_config(None, task="ppr_diffusion", fast_dev_run=True)
+    cfg["artifacts"]["root"] = str(tmp_path)
+    rows = []
+    for graph_idx in range(4):
+        for swap_idx in range(4):
+            dy = 0.2 * graph_idx + 0.1 * swap_idx
+            rows.append(
+                {
+                    "task": "ppr_diffusion",
+                    "family": "ppr_payload_swap",
+                    "graph_id": f"g{graph_idx}",
+                    "graph_index": graph_idx,
+                    "swap_id": f"s{graph_idx}_{swap_idx}",
+                    "u": 0,
+                    "v": 1,
+                    "d_uv": 3,
+                    "stratum": "dL1_to_2L",
+                    "R_eff_uv": 0.5,
+                    "rho_far": 0.25 * swap_idx,
+                    "dy_norm": dy,
+                    "grit_delta_norm": dy + 0.1,
+                    "gcn_plus_delta_norm": dy * 0.5,
+                    "grit_teacher_projection": 2.0 * dy + graph_idx,
+                    "gcn_plus_teacher_projection": dy + 0.1 * swap_idx,
+                    "grit_teacher_cosine": 0.8,
+                    "gcn_plus_teacher_cosine": 0.4,
+                    "layer": "all",
+                    "head": "all",
+                    "clean_route_swap_far_mass": dy,
+                    "clean_transport_swap_far_share": 1.0 - 0.1 * swap_idx,
+                    "clean_route_global_far_share": 0.2,
+                    "clean_transport_global_far_share": 0.3,
+                    "source_route_swap_far_mass": dy + 0.01,
+                    "source_transport_swap_far_share": 1.0 - 0.1 * swap_idx,
+                    "source_route_global_far_share": 0.2,
+                    "source_transport_global_far_share": 0.3,
+                    "delta_route_swap_far_mass": 0.01,
+                    "delta_transport_swap_far_share": 0.0,
+                    "delta_route_global_far_share": 0.0,
+                    "delta_transport_global_far_share": 0.0,
+                    "far_query_count": 3,
+                    "valid_far_query_head_count": 24,
+                    "layer_count": 2,
+                    "head_count": 16,
+                }
+            )
+    write_test_csv(functional_q1_gate_features_path(cfg, "ppr_diffusion", 9501), rows)
+    summarise_functional_q1_gates(
+        cfg,
+        tasks=["ppr_diffusion"],
+        seed=9501,
+        bootstrap_resamples=5,
+        min_swaps_per_bin=2,
+        min_swaps_per_graph=4,
+    )
+    points = read_csv_dicts(functional_q1_graph_coupling_points_path(cfg))
+    quartiles = read_csv_dicts(functional_q1_gate_quartile_stats_path(cfg))
+    assert {row["graph_id"] for row in points} == {"g0", "g1", "g2", "g3"}
+    assert any(row["stat"] == "grit_excess_partial_corr" for row in quartiles)
+
+
+def test_functional_validity_gate_statuses_from_synthetic_artifacts(tmp_path):
+    cfg = load_config(None, task="local_mean_gcn", fast_dev_run=True)
+    cfg["artifacts"]["root"] = str(tmp_path)
+    task = "local_mean_gcn"
+    for path in [
+        functional_response_table_path(cfg, task, 9101),
+        functional_responses_dir(cfg, task) / "functional_clean_context_seed9101.csv",
+        functional_node_graph_stats_path(cfg, task, 9301),
+        functional_node_validity_path(cfg, task, 9301),
+    ]:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("ok\n", encoding="utf-8")
+    metrics = tmp_path / "function" / "metrics"
+    write_test_csv(metrics / "functional_e1_fingerprint_stats.csv", [{"task": task, "stratum": "d1", "stat": "dy_norm_mean", "mean": 1.0}])
+    rho_rows = []
+    for idx, bin_name in enumerate(["q1", "q2", "q3", "q4"]):
+        rho_rows.append(
+            {
+                "task": task,
+                "rho_far_bin": bin_name,
+                "stat": "dy_norm_mean",
+                "swaps": 120,
+                "rho_far_low": 0.1 * idx,
+                "rho_far_high": 0.1 * idx + 0.05,
+                "mean": 1.0,
+            }
+        )
+    write_test_csv(metrics / "functional_e1_fingerprint_rhofar_stats.csv", rho_rows)
+    write_test_csv(
+        metrics / "functional_e1_clean_performance_context.csv",
+        [
+            {"task": task, "model": "grit", "node_relmse_mean": 0.01, "graph_sum_relmse": 0.01},
+            {"task": task, "model": "gcn_plus", "node_relmse_mean": 0.03, "graph_sum_relmse": 0.02},
+        ],
+    )
+    write_test_csv(
+        metrics / "functional_e1n_node_fingerprint_stats.csv",
+        [
+            {"task": task, "stratum": "d_gt_L", "stat": "oracle_demand_mean", "mean": 0.0},
+            {"task": task, "stratum": "d_gt_L", "stat": "grit_spurious_silent_norm_mean", "mean": 0.02},
+            {"task": task, "stratum": "d_gt_L", "stat": "grit_excess_partial_corr", "mean": 0.5},
+        ],
+    )
+    write_test_csv(
+        metrics / "functional_e1n_validity.csv",
+        [{"task": task, "beyond_L_gcn_violations": 0, "beyond_L_gcn_max_norm": 0.0}],
+    )
+
+    summarise_functional_validity_gate(cfg, tasks=[task])
+    rows = read_csv_dicts(functional_validity_gate_path(cfg))
+    clean_grit = next(row for row in rows if row["check"] == "Clean performance: grit")
+    clean_gcn = next(row for row in rows if row["check"] == "Clean performance: gcn_plus")
+    local_signal = next(row for row in rows if row["check"] == "Local control GRIT beyond-L signal")
+    assert clean_grit["status"] == "pass"
+    assert clean_gcn["status"] == "warn"
+    assert local_signal["status"] == "fail"
 
 
 def test_response_predictivity_grouped_cv_finds_simple_signal():

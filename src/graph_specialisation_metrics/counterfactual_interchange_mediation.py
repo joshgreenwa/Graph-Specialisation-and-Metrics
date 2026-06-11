@@ -93,6 +93,17 @@ RHO_FAR_BIN_LABELS = {
     "q3": "Q3",
     "q4": "Q4 high rho_far",
 }
+Q1_GATE_BINS = ("q1", "q2", "q3", "q4")
+Q1_GATE_BIN_LABELS = {
+    "q1": "Q1 low gate",
+    "q2": "Q2",
+    "q3": "Q3",
+    "q4": "Q4 high gate",
+}
+Q1_PRIMARY_GATES = {
+    "routing": "clean_route_swap_far_mass",
+    "transport": "clean_transport_swap_far_share",
+}
 PATHWAY_BY_FAMILY = {
     "ppr_payload_swap": "M",
     "ppr_struct_swap": "K",
@@ -483,6 +494,34 @@ def functional_node_swaps_dir(cfg: Mapping[str, Any], task: str) -> Path:
 
 def functional_node_responses_dir(cfg: Mapping[str, Any], task: str) -> Path:
     return functional_root_dir(cfg) / "node_responses" / task
+
+
+def functional_q1_dir(cfg: Mapping[str, Any], task: str) -> Path:
+    return functional_root_dir(cfg) / "q1" / task
+
+
+def functional_q1_gate_features_path(cfg: Mapping[str, Any], task: str, seed: int) -> Path:
+    return functional_q1_dir(cfg, task) / f"functional_q1_gate_features_seed{int(seed)}.csv"
+
+
+def functional_validity_gate_path(cfg: Mapping[str, Any]) -> Path:
+    return functional_metrics_dir(cfg) / "functional_validity_gate.csv"
+
+
+def functional_q1_gate_quartile_stats_path(cfg: Mapping[str, Any]) -> Path:
+    return functional_metrics_dir(cfg) / "functional_q1_gate_quartile_stats.csv"
+
+
+def functional_q1_graph_coupling_points_path(cfg: Mapping[str, Any]) -> Path:
+    return functional_metrics_dir(cfg) / "functional_q1_graph_coupling_points.csv"
+
+
+def functional_q1_graph_coupling_stats_path(cfg: Mapping[str, Any]) -> Path:
+    return functional_metrics_dir(cfg) / "functional_q1_graph_coupling_stats.csv"
+
+
+def functional_q1_gate_contrast_stats_path(cfg: Mapping[str, Any]) -> Path:
+    return functional_metrics_dir(cfg) / "functional_q1_gate_contrast_stats.csv"
 
 
 def set_all_seeds(seed: int) -> None:
@@ -3337,6 +3376,489 @@ def clean_performance_context_rows(
     return rows
 
 
+def finite_float(value: Any, default: float = float("nan")) -> float:
+    try:
+        out = float(value)
+    except Exception:
+        return default
+    return out if math.isfinite(out) else default
+
+
+def validity_status(value: float, *, pass_if: Any, warn_if: Any | None = None) -> str:
+    if math.isnan(value):
+        return "fail"
+    if bool(pass_if(value)):
+        return "pass"
+    if warn_if is not None and bool(warn_if(value)):
+        return "warn"
+    return "fail"
+
+
+def metric_summary_value(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    task: str,
+    stratum: str,
+    stat: str,
+    field: str = "mean",
+) -> float:
+    for row in rows:
+        if row.get("task") == task and row.get("stratum") == stratum and row.get("stat") == stat:
+            return finite_float(row.get(field))
+    return float("nan")
+
+
+def summarise_functional_validity_gate(
+    cfg: Mapping[str, Any],
+    *,
+    tasks: Sequence[str] | None = None,
+    e1g_seed: int = 9101,
+    e1n_seed: int = 9301,
+    gnn_depth: int = 2,
+) -> Path:
+    tasks = list(tasks or TASKS)
+    metrics = functional_metrics_dir(cfg)
+    e1_path = metrics / "functional_e1_fingerprint_stats.csv"
+    e1_rho_path = metrics / "functional_e1_fingerprint_rhofar_stats.csv"
+    clean_path = metrics / "functional_e1_clean_performance_context.csv"
+    e1n_path = metrics / "functional_e1n_node_fingerprint_stats.csv"
+    e1n_validity_path = metrics / "functional_e1n_validity.csv"
+    required_global = [e1_path, e1_rho_path, clean_path, e1n_path, e1n_validity_path]
+    e1_rows = read_csv_dicts(e1_path) if e1_path.exists() else []
+    e1_rho_rows = read_csv_dicts(e1_rho_path) if e1_rho_path.exists() else []
+    clean_rows = read_csv_dicts(clean_path) if clean_path.exists() else []
+    e1n_rows = read_csv_dicts(e1n_path) if e1n_path.exists() else []
+    e1n_validity_rows = read_csv_dicts(e1n_validity_path) if e1n_validity_path.exists() else []
+    out_rows: list[dict[str, Any]] = []
+
+    def add(
+        task: str,
+        check: str,
+        why: str,
+        observed: str,
+        rule: str,
+        status: str,
+        failed: str,
+    ) -> None:
+        out_rows.append(
+            {
+                "task": task,
+                "check": check,
+                "why_it_matters": why,
+                "observed_value": observed,
+                "pass_rule": rule,
+                "status": status,
+                "interpretation_if_failed": failed,
+            }
+        )
+
+    for task in tasks:
+        task_files = [
+            functional_response_table_path(cfg, task, e1g_seed),
+            functional_responses_dir(cfg, task) / f"functional_clean_context_seed{int(e1g_seed)}.csv",
+            functional_node_graph_stats_path(cfg, task, e1n_seed),
+            functional_node_validity_path(cfg, task, e1n_seed),
+        ]
+        missing = [str(path) for path in required_global + task_files if not path.exists()]
+        empty = [
+            str(path)
+            for path in required_global + task_files
+            if path.exists() and path.stat().st_size == 0
+        ]
+        status = "pass" if not missing and not empty else "fail"
+        observed = "all required files present" if status == "pass" else f"missing={len(missing)} empty={len(empty)}"
+        add(
+            task,
+            "Stage 1 artifacts",
+            "Q1 reuses E1-G responses, E1-N theorem checks, and clean context.",
+            observed,
+            "all required CSV/PT artifacts exist and are non-empty",
+            status,
+            "Q1 can only be run as a diagnostic; first regenerate missing Stage 1 outputs.",
+        )
+
+        for model_name in FUNCTIONAL_MODELS:
+            clean = next(
+                (row for row in clean_rows if row.get("task") == task and row.get("model") == model_name),
+                None,
+            )
+            node_rel = finite_float(clean.get("node_relmse_mean") if clean is not None else None)
+            graph_rel = finite_float(clean.get("graph_sum_relmse") if clean is not None else None)
+            clean_status = validity_status(
+                node_rel,
+                pass_if=lambda value: value <= 0.02,
+                warn_if=lambda value: value <= 0.05,
+            )
+            add(
+                task,
+                f"Clean performance: {model_name}",
+                "Functional response comparisons require both students to be competent on clean graphs.",
+                f"node_relmse_mean={node_rel:.4g}; graph_sum_relmse={graph_rel:.4g}",
+                "pass <= 0.02; warn <= 0.05; fail > 0.05",
+                clean_status,
+                "Alignment/excess may mostly reflect undertraining rather than mechanism.",
+            )
+
+        validity = next((row for row in e1n_validity_rows if row.get("task") == task), None)
+        violations = finite_float(validity.get("beyond_L_gcn_violations") if validity is not None else None)
+        max_norm = finite_float(validity.get("beyond_L_gcn_max_norm") if validity is not None else None)
+        leakage_status = "pass" if violations == 0.0 else "fail"
+        add(
+            task,
+            "GCN+ beyond-L leakage",
+            "The E1-N theorem-null only holds if the GCN+ is silent beyond its receptive field.",
+            f"violations={violations:.0f}; max_norm={max_norm:.4g}; L={int(gnn_depth)}",
+            "beyond_L_gcn_violations == 0",
+            leakage_status,
+            "Beyond-L GRIT advantage is not interpretable as certified dense-support use.",
+        )
+
+        usable_bins = []
+        for bin_name in RHO_FAR_BINS:
+            bin_rows = [row for row in e1_rho_rows if row.get("task") == task and row.get("rho_far_bin") == bin_name]
+            if not bin_rows:
+                continue
+            swaps = max(finite_float(row.get("swaps"), 0.0) for row in bin_rows)
+            low = min(finite_float(row.get("rho_far_low")) for row in bin_rows)
+            high = max(finite_float(row.get("rho_far_high")) for row in bin_rows)
+            if swaps >= 100 and math.isfinite(low) and math.isfinite(high) and high >= low:
+                usable_bins.append((bin_name, swaps, low, high))
+        if len(usable_bins) >= 4:
+            rho_status = "pass"
+        elif len(usable_bins) >= 2:
+            rho_status = "warn"
+        else:
+            rho_status = "fail"
+        ranges = "; ".join(f"{name}:{low:.2f}-{high:.2f},n={int(swaps)}" for name, swaps, low, high in usable_bins)
+        add(
+            task,
+            "rho_far bins usable",
+            "Consequence-range rebinning is only meaningful when bins have enough non-degenerate mass.",
+            ranges or "no usable rho_far bins",
+            "pass: 4 bins with >=100 swaps; warn: >=2 bins; fail: <2 bins",
+            rho_status,
+            "rho_far-conditioned Q1 should be ignored or treated as underpowered.",
+        )
+
+    if "local_mean_gcn" in tasks:
+        local_demand = metric_summary_value(
+            e1n_rows,
+            task="local_mean_gcn",
+            stratum="d_gt_L",
+            stat="oracle_demand_mean",
+        )
+        local_status = validity_status(
+            local_demand,
+            pass_if=lambda value: value <= 1.0e-6,
+            warn_if=lambda value: value <= 1.0e-4,
+        )
+        add(
+            "local_mean_gcn",
+            "Local control beyond-L oracle demand",
+            "The local teacher should not require a response outside the GCN+ receptive field.",
+            f"E||dy_i||={local_demand:.4g}",
+            "pass <= 1e-6; warn <= 1e-4",
+            local_status,
+            "The negative control is not local under this intervention dictionary.",
+        )
+        local_spurious = metric_summary_value(
+            e1n_rows,
+            task="local_mean_gcn",
+            stratum="d_gt_L",
+            stat="grit_spurious_silent_norm_mean",
+        )
+        local_excess = metric_summary_value(
+            e1n_rows,
+            task="local_mean_gcn",
+            stratum="d_gt_L",
+            stat="grit_excess_partial_corr",
+        )
+        finite_excess_ok = (not math.isfinite(local_excess)) or abs(local_excess) <= 0.20
+        finite_excess_warn = (not math.isfinite(local_excess)) or abs(local_excess) <= 0.40
+        if local_spurious <= 1.0e-3 and finite_excess_ok:
+            status = "pass"
+        elif local_spurious <= 1.0e-2 and finite_excess_warn:
+            status = "warn"
+        else:
+            status = "fail"
+        add(
+            "local_mean_gcn",
+            "Local control GRIT beyond-L signal",
+            "GRIT should not show strong global functional sensitivity when the teacher is local.",
+            f"spurious_norm={local_spurious:.4g}; excess={local_excess:.4g}",
+            "pass: spurious <= 1e-3 and |excess| <= 0.20 if finite",
+            status,
+            "Q1 gate-excess coupling may reflect generic global sensitivity rather than task-relevant computation.",
+        )
+
+    if "nearest_anchor_voronoi" in tasks:
+        vor_demand = metric_summary_value(
+            e1n_rows,
+            task="nearest_anchor_voronoi",
+            stratum="d_gt_L",
+            stat="oracle_demand_mean",
+        )
+        vor_status = validity_status(
+            vor_demand,
+            pass_if=lambda value: value >= 1.0e-3,
+            warn_if=lambda value: value >= 1.0e-5,
+        )
+        add(
+            "nearest_anchor_voronoi",
+            "Voronoi beyond-L oracle demand",
+            "The global positive case must actually require beyond-local node responses.",
+            f"E||dy_i||={vor_demand:.4g}",
+            "pass >= 1e-3; warn >= 1e-5",
+            vor_status,
+            "A null Q1 result would be uninformative because the teacher barely demands global response.",
+        )
+
+    path = functional_validity_gate_path(cfg)
+    write_csv(path, out_rows)
+    print(f"[functional-validity] wrote {path}", flush=True)
+    return path
+
+
+def wrap_cell(text: Any, width: int) -> str:
+    words = str(text).split()
+    lines: list[str] = []
+    cur: list[str] = []
+    for word in words:
+        if sum(len(part) for part in cur) + len(cur) + len(word) > width and cur:
+            lines.append(" ".join(cur))
+            cur = [word]
+        else:
+            cur.append(word)
+    if cur:
+        lines.append(" ".join(cur))
+    return "\n".join(lines)
+
+
+def plot_functional_validity_gate(cfg: Mapping[str, Any], *, tasks: Sequence[str] | None = None) -> Path:
+    tasks = list(tasks or TASKS)
+    rows = read_csv_dicts(functional_validity_gate_path(cfg))
+    if not rows:
+        raise FileNotFoundError("functional validity gate CSV is missing or empty")
+    out = functional_figures_dir(cfg) / "functional_validity_gate_table.pdf"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    status_colors = {"pass": "#d9f0e3", "warn": "#fff1c7", "fail": "#f7d6d0"}
+    columns = ["Check", "Why it matters", "Observed value", "Pass rule", "Status", "Interpretation if failed"]
+    keys = ["check", "why_it_matters", "observed_value", "pass_rule", "status", "interpretation_if_failed"]
+    widths = [22, 30, 28, 26, 8, 34]
+    with PdfPages(out) as pdf:
+        for task in tasks:
+            task_rows = [row for row in rows if row.get("task") == task]
+            if not task_rows:
+                continue
+            height = max(4.2, 0.78 * len(task_rows) + 1.3)
+            fig, ax = plt.subplots(figsize=(16.0, height))
+            ax.axis("off")
+            ax.set_title(f"{task}: Stage A validity gate", fontsize=13, loc="left", pad=8)
+            cell_text = [[wrap_cell(row.get(key, ""), width) for key, width in zip(keys, widths)] for row in task_rows]
+            table = ax.table(
+                cellText=cell_text,
+                colLabels=columns,
+                cellLoc="left",
+                colLoc="left",
+                loc="upper left",
+                colWidths=[0.13, 0.20, 0.17, 0.18, 0.07, 0.25],
+            )
+            table.auto_set_font_size(False)
+            table.set_fontsize(7.8)
+            for (row_idx, col_idx), cell in table.get_celld().items():
+                cell.set_edgecolor("#d0d4dc")
+                cell.set_linewidth(0.4)
+                if row_idx == 0:
+                    cell.set_facecolor("#edf2f7")
+                    cell.set_text_props(weight="bold")
+                else:
+                    status = str(task_rows[row_idx - 1].get("status", ""))
+                    if col_idx == 4:
+                        cell.set_facecolor(status_colors.get(status, "#ffffff"))
+                        cell.set_text_props(weight="bold")
+                    else:
+                        cell.set_facecolor("#ffffff")
+            table.scale(1.0, 2.3)
+            fig.tight_layout()
+            pdf.savefig(fig)
+            plt.close(fig)
+    print(f"[functional-validity-plot] wrote {out}", flush=True)
+    return out
+
+
+@dataclass
+class Q1LayerFields:
+    layer: int
+    attention: torch.Tensor
+    message: torch.Tensor
+    mask: torch.Tensor
+
+
+def q1_layers_for_graph(collected_layers: Sequence[Any], batch_idx: int) -> list[Q1LayerFields]:
+    return [
+        Q1LayerFields(
+            layer=int(layer.layer),
+            attention=layer.attention[int(batch_idx)].detach().cpu().float(),
+            message=layer.message[int(batch_idx)].detach().cpu().float(),
+            mask=layer.mask[int(batch_idx)].detach().cpu().bool(),
+        )
+        for layer in collected_layers
+    ]
+
+
+def q1_gate_scope_values(
+    layers: Sequence[Q1LayerFields],
+    spd: torch.Tensor,
+    *,
+    u: int,
+    v: int,
+    gnn_depth: int = 2,
+    layer_scope: int | None = None,
+    head_scope: int | None = None,
+) -> dict[str, float]:
+    n = int(spd.size(0))
+    u = int(u)
+    v = int(v)
+    dist_to_swap = torch.minimum(spd[:n, u], spd[:n, v])
+    far_query = dist_to_swap > int(gnn_depth)
+    pair_far = spd[:n, :n] > int(gnn_depth)
+    swap_key = torch.zeros(n, dtype=torch.bool)
+    swap_key[u] = True
+    swap_key[v] = True
+
+    route_swap_num = 0.0
+    route_swap_den = 0.0
+    route_global_num = 0.0
+    route_global_den = 0.0
+    trans_swap_num = 0.0
+    trans_swap_den = 0.0
+    trans_global_num = 0.0
+    trans_global_den = 0.0
+    selected_layers = 0
+    selected_heads = 0
+    valid_far_queries = 0
+
+    for layer in layers:
+        if layer_scope is not None and int(layer.layer) != int(layer_scope):
+            continue
+        attn = layer.attention[:, :n, :n].float()
+        msg = layer.message[:, :n, :n].float()
+        mask = layer.mask[:, :n, :n].bool()
+        if head_scope is not None:
+            attn = attn[int(head_scope) : int(head_scope) + 1]
+            msg = msg[int(head_scope) : int(head_scope) + 1]
+            mask = mask[int(head_scope) : int(head_scope) + 1]
+        if attn.numel() == 0:
+            continue
+        selected_layers += 1
+        selected_heads += int(attn.size(0))
+        query_valid = mask.any(dim=2) & far_query[None, :]
+        valid_far_queries += int(query_valid.sum().item())
+        swap_mass = (attn * mask.to(attn.dtype) * swap_key[None, None, :].to(attn.dtype)).sum(dim=2)
+        route_swap_num += float((swap_mass * query_valid.to(attn.dtype)).sum().item())
+        route_swap_den += float(query_valid.sum().item())
+
+        pair_mask = mask & pair_far[None, :, :]
+        route_global_num += float((attn * pair_mask.to(attn.dtype)).sum().item())
+        route_global_den += float((attn * mask.to(attn.dtype)).sum().item())
+
+        msg_norm = torch.linalg.vector_norm(msg, dim=-1)
+        weighted = attn * msg_norm * mask.to(attn.dtype)
+        far_query_mask = far_query[None, :, None]
+        swap_pair_mask = far_query_mask & swap_key[None, None, :]
+        trans_swap_num += float(weighted[swap_pair_mask.expand_as(weighted)].sum().item())
+        trans_swap_den += float(weighted[far_query_mask & mask].sum().item())
+        trans_global_num += float(weighted[pair_mask].sum().item())
+        trans_global_den += float(weighted[mask].sum().item())
+
+    return {
+        "route_swap_far_mass": route_swap_num / route_swap_den if route_swap_den > 0 else float("nan"),
+        "transport_swap_far_share": trans_swap_num / trans_swap_den if trans_swap_den > 0 else float("nan"),
+        "route_global_far_share": route_global_num / route_global_den if route_global_den > 0 else float("nan"),
+        "transport_global_far_share": trans_global_num / trans_global_den if trans_global_den > 0 else float("nan"),
+        "far_query_count": float(int(far_query.sum().item())),
+        "valid_far_query_head_count": float(valid_far_queries),
+        "layer_count": float(selected_layers),
+        "head_count": float(selected_heads),
+    }
+
+
+def q1_scope_rows_for_swap(
+    *,
+    task: str,
+    response_row: Mapping[str, Any],
+    swap: Mapping[str, Any],
+    base: Mapping[str, Any],
+    clean_layers: Sequence[Q1LayerFields],
+    source_layers: Sequence[Q1LayerFields],
+    gnn_depth: int,
+    store_head_gates: bool,
+) -> list[dict[str, Any]]:
+    scopes: list[tuple[str, str, int | None, int | None]] = [("all", "all", None, None)]
+    layer_ids = [int(layer.layer) for layer in clean_layers]
+    for layer_idx in layer_ids:
+        scopes.append((str(layer_idx), "all", layer_idx, None))
+    if store_head_gates and clean_layers:
+        heads = int(clean_layers[0].attention.size(0))
+        for layer_idx in layer_ids:
+            for head_idx in range(heads):
+                scopes.append((str(layer_idx), str(head_idx), layer_idx, head_idx))
+
+    spd = base["struct"]["shortest_path_distance"]
+    u = int(swap["u"])
+    v = int(swap["v"])
+    out_rows: list[dict[str, Any]] = []
+    base_payload = {
+        "task": task,
+        "family": str(response_row.get("family", swap.get("family", ""))),
+        "graph_id": str(response_row.get("graph_id", swap.get("graph_id", ""))),
+        "graph_index": int(swap["graph_index"]),
+        "swap_id": str(response_row.get("swap_id", swap.get("swap_id", ""))),
+        "u": u,
+        "v": v,
+        "d_uv": int(response_row.get("d_uv", swap.get("d_uv", -1))),
+        "stratum": str(response_row.get("stratum", swap.get("stratum", ""))),
+        "R_eff_uv": finite_float(response_row.get("R_eff_uv", swap.get("R_eff_uv"))),
+        "rho_far": finite_float(response_row.get("rho_far", swap.get("rho_far"))),
+        "dy_norm": finite_float(response_row.get("dy_norm")),
+        "grit_delta_norm": finite_float(response_row.get("grit_delta_norm")),
+        "gcn_plus_delta_norm": finite_float(response_row.get("gcn_plus_delta_norm")),
+        "grit_teacher_projection": finite_float(response_row.get("grit_teacher_projection")),
+        "gcn_plus_teacher_projection": finite_float(response_row.get("gcn_plus_teacher_projection")),
+        "grit_teacher_cosine": finite_float(response_row.get("grit_teacher_cosine")),
+        "gcn_plus_teacher_cosine": finite_float(response_row.get("gcn_plus_teacher_cosine")),
+    }
+    for layer_label, head_label, layer_scope, head_scope in scopes:
+        clean = q1_gate_scope_values(
+            clean_layers,
+            spd,
+            u=u,
+            v=v,
+            gnn_depth=gnn_depth,
+            layer_scope=layer_scope,
+            head_scope=head_scope,
+        )
+        source = q1_gate_scope_values(
+            source_layers,
+            spd,
+            u=u,
+            v=v,
+            gnn_depth=gnn_depth,
+            layer_scope=layer_scope,
+            head_scope=head_scope,
+        )
+        row = dict(base_payload)
+        row.update({"layer": layer_label, "head": head_label})
+        for key in ("route_swap_far_mass", "transport_swap_far_share", "route_global_far_share", "transport_global_far_share"):
+            row[f"clean_{key}"] = clean[key]
+            row[f"source_{key}"] = source[key]
+            row[f"delta_{key}"] = source[key] - clean[key] if math.isfinite(source[key]) and math.isfinite(clean[key]) else float("nan")
+        for key in ("far_query_count", "valid_far_query_head_count", "layer_count", "head_count"):
+            row[key] = clean[key]
+        out_rows.append(row)
+    return out_rows
+
+
 def run_functional_responses(
     cfg: Mapping[str, Any],
     task: str,
@@ -3454,6 +3976,101 @@ def run_functional_responses(
     return out_path, clean_path
 
 
+def run_functional_q1_gates(
+    cfg: Mapping[str, Any],
+    task: str,
+    *,
+    swaps_path: Path | None = None,
+    response_path: Path | None = None,
+    seed: int = 9501,
+    e1g_seed: int = 9101,
+    device_name: str = "auto",
+    batch_size: int = 512,
+    gnn_depth: int = 2,
+    grit_config: Path | None = None,
+    grit_checkpoint: Path | None = None,
+    store_head_gates: bool = False,
+    fast_dev_run: bool = False,
+) -> Path:
+    device = choose_device(device_name)
+    configure_runtime(cfg, device)
+    swaps_path = swaps_path or functional_swap_cache_path(cfg, task, e1g_seed)
+    response_path = response_path or functional_response_table_path(cfg, task, e1g_seed)
+    cache = load_functional_swap_cache(swaps_path)
+    base_records: list[dict[str, Any]] = list(cache["base_records"])
+    swaps: list[dict[str, Any]] = list(cache["swaps"])
+    if fast_dev_run:
+        swaps = swaps[: min(len(swaps), 48)]
+    response_rows = read_csv_dicts(response_path)
+    if not response_rows:
+        raise FileNotFoundError(f"functional response table missing or empty: {response_path}")
+    response_by_key = {(str(row["graph_id"]), str(row["swap_id"])): row for row in response_rows}
+    grit_cfg = load_stage1_model_config(cfg, task, model_name="grit", config_path=grit_config, fast_dev_run=fast_dev_run)
+    model, _ = load_model_from_checkpoint(grit_cfg, task, grit_checkpoint, device, backend="official")
+    max_nodes = max(int(row["n"]) for row in base_records)
+
+    print(
+        f"[functional-q1-gates] task={task} swaps={len(swaps)} graphs={len(base_records)} "
+        f"device={device} batch_size={batch_size} store_head_gates={store_head_gates}",
+        flush=True,
+    )
+    base_layer_cache: dict[int, list[Q1LayerFields]] = {}
+    for start in range(0, len(base_records), int(batch_size)):
+        chunk = base_records[start : start + int(batch_size)]
+        batch = collate_records(chunk).to(device)
+        _pred, layers = collect_official_fields_and_prediction(model, batch, max_nodes=max_nodes)
+        for local_idx, _record in enumerate(chunk):
+            base_layer_cache[start + local_idx] = q1_layers_for_graph(layers, local_idx)
+
+    rows: list[dict[str, Any]] = []
+    chunks = max(1, math.ceil(len(swaps) / int(batch_size)))
+    start_time = time.time()
+    for start in range(0, len(swaps), int(batch_size)):
+        chunk_swaps = swaps[start : start + int(batch_size)]
+        source_records = [
+            source_for_intervention(
+                base_records[int(row["graph_index"])],
+                str(row["family"]),
+                int(row["u"]),
+                int(row["v"]),
+                cfg,
+            )
+            for row in chunk_swaps
+        ]
+        source_batch = collate_records(source_records).to(device)
+        _pred, source_layers = collect_official_fields_and_prediction(model, source_batch, max_nodes=max_nodes)
+        for local_idx, swap in enumerate(chunk_swaps):
+            graph_index = int(swap["graph_index"])
+            key = (str(swap["graph_id"]), str(swap["swap_id"]))
+            response = response_by_key.get(key)
+            if response is None:
+                raise KeyError(f"missing response row for graph_id={key[0]} swap_id={key[1]}")
+            source_q1_layers = q1_layers_for_graph(source_layers, local_idx)
+            rows.extend(
+                q1_scope_rows_for_swap(
+                    task=task,
+                    response_row=response,
+                    swap=swap,
+                    base=base_records[graph_index],
+                    clean_layers=base_layer_cache[graph_index],
+                    source_layers=source_q1_layers,
+                    gnn_depth=gnn_depth,
+                    store_head_gates=store_head_gates,
+                )
+            )
+        chunk_idx = start // int(batch_size) + 1
+        elapsed = time.time() - start_time
+        print(
+            f"[functional-q1-gates] task={task} chunk={chunk_idx}/{chunks} "
+            f"swaps_done={min(start + int(batch_size), len(swaps))} rows={len(rows)} elapsed={elapsed:.1f}s",
+            flush=True,
+        )
+    out = functional_q1_gate_features_path(cfg, task, seed)
+    write_csv(out, rows)
+    print(f"[functional-q1-gates] wrote {out}", flush=True)
+    return out
+
+
 def numeric_column(rows: Sequence[Mapping[str, Any]], column: str) -> np.ndarray:
     values = []
     for row in rows:
@@ -3462,6 +4079,303 @@ def numeric_column(rows: Sequence[Mapping[str, Any]], column: str) -> np.ndarray
         except Exception:
             values.append(float("nan"))
     return np.asarray(values, dtype=np.float64)
+
+
+def projection_advantage_mean(rows: Sequence[Mapping[str, Any]]) -> float:
+    return float(
+        np.nanmean(
+            numeric_column(rows, "grit_teacher_projection")
+            - numeric_column(rows, "gcn_plus_teacher_projection")
+        )
+    )
+
+
+def q1_stat_functions() -> dict[str, Any]:
+    base = functional_stat_functions()
+    names = [
+        "dy_norm_mean",
+        "grit_delta_norm_mean",
+        "gcn_plus_delta_norm_mean",
+        "grit_excess_partial_corr",
+        "gcn_plus_converse_partial_corr",
+    ]
+    fns = {name: base[name] for name in names}
+    fns["projection_advantage_mean"] = projection_advantage_mean
+    return fns
+
+
+def assign_task_quantile_bins(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    value_column: str,
+    bin_column: str,
+    label_column: str,
+    bin_labels: Mapping[str, str],
+) -> list[dict[str, Any]]:
+    by_task: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        by_task[str(row["task"])].append(dict(row))
+    out: list[dict[str, Any]] = []
+    for _task, task_rows in sorted(by_task.items()):
+        finite_pairs = []
+        for idx, row in enumerate(task_rows):
+            value = finite_float(row.get(value_column))
+            if math.isfinite(value):
+                finite_pairs.append((idx, value))
+        if not finite_pairs:
+            for row in task_rows:
+                row[bin_column] = "missing"
+                row[label_column] = "missing"
+            out.extend(task_rows)
+            continue
+        values = np.asarray([value for _idx, value in finite_pairs], dtype=np.float64)
+        if len(np.unique(values)) < 2:
+            for idx, _value in finite_pairs:
+                task_rows[idx][bin_column] = "q1"
+                task_rows[idx][label_column] = bin_labels.get("q1", "q1")
+        else:
+            edges = np.quantile(values, [0.25, 0.50, 0.75])
+            for idx, value in finite_pairs:
+                q_idx = int(np.searchsorted(edges, value, side="right"))
+                q_idx = min(max(q_idx, 0), len(Q1_GATE_BINS) - 1)
+                bin_name = Q1_GATE_BINS[q_idx]
+                task_rows[idx][bin_column] = bin_name
+                task_rows[idx][label_column] = bin_labels.get(bin_name, bin_name)
+        for row in task_rows:
+            row.setdefault(bin_column, "missing")
+            row.setdefault(label_column, "missing")
+        out.extend(task_rows)
+    return out
+
+
+def q1_scope_all_rows(rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        dict(row)
+        for row in rows
+        if str(row.get("layer")) == "all" and str(row.get("head")) == "all"
+    ]
+
+
+def q1_graph_excess(row_group: Sequence[Mapping[str, Any]]) -> float:
+    if len(row_group) < 3:
+        return float("nan")
+    return partial_corr(
+        numeric_column(row_group, "grit_teacher_projection"),
+        numeric_column(row_group, "dy_norm"),
+        numeric_column(row_group, "gcn_plus_teacher_projection"),
+    )
+
+
+def summarise_functional_q1_gates(
+    cfg: Mapping[str, Any],
+    *,
+    tasks: Sequence[str] | None = None,
+    seed: int = 9501,
+    bootstrap_resamples: int = 1000,
+    bootstrap_seed: int = 9601,
+    min_swaps_per_bin: int = 100,
+    min_swaps_per_graph: int = 20,
+) -> tuple[Path, Path, Path]:
+    tasks = list(tasks or TASKS)
+    rows: list[dict[str, Any]] = []
+    for task in tasks:
+        path = functional_q1_gate_features_path(cfg, task, seed)
+        if not path.exists():
+            raise FileNotFoundError(f"Q1 gate feature table not found: {path}")
+        task_rows = read_csv_dicts(path)
+        if not task_rows:
+            raise RuntimeError(f"Q1 gate feature table is empty: {path}")
+        rows.extend(task_rows)
+    scope_rows = q1_scope_all_rows(rows)
+    stat_fns = q1_stat_functions()
+    quartile_rows: list[dict[str, Any]] = []
+
+    def add_quartile_stats(
+        base_rows: Sequence[Mapping[str, Any]],
+        *,
+        gate_type: str,
+        gate_metric: str,
+        conditioning: str,
+        seed_offset: int,
+    ) -> None:
+        binned = assign_task_quantile_bins(
+            base_rows,
+            value_column=gate_metric,
+            bin_column="q1_gate_bin",
+            label_column="q1_gate_bin_label",
+            bin_labels=Q1_GATE_BIN_LABELS,
+        )
+        grouped: dict[tuple[str, str], list[Mapping[str, Any]]] = defaultdict(list)
+        for row in binned:
+            if str(row.get("q1_gate_bin")) in Q1_GATE_BINS:
+                grouped[(str(row["task"]), str(row["q1_gate_bin"]))].append(row)
+        for (task, gate_bin), group in sorted(grouped.items()):
+            graphs = len({str(row["graph_id"]) for row in group})
+            gate_values = numeric_column(group, gate_metric)
+            status = "ok" if len(group) >= int(min_swaps_per_bin) and graphs >= 2 else "underpowered"
+            for stat_name, stat_fn in stat_fns.items():
+                point, lo, hi = cluster_bootstrap_ci(
+                    group,
+                    stat_fn,
+                    resamples=bootstrap_resamples,
+                    seed=bootstrap_seed + seed_offset + stable_int_seed(task, gate_type, conditioning, gate_bin, stat_name) % 100000,
+                )
+                quartile_rows.append(
+                    {
+                        "task": task,
+                        "gate_type": gate_type,
+                        "gate_metric": gate_metric,
+                        "conditioning": conditioning,
+                        "gate_bin": gate_bin,
+                        "gate_bin_label": Q1_GATE_BIN_LABELS.get(gate_bin, gate_bin),
+                        "graphs": graphs,
+                        "swaps": len(group),
+                        "gate_low": float(np.nanmin(gate_values)) if gate_values.size else float("nan"),
+                        "gate_high": float(np.nanmax(gate_values)) if gate_values.size else float("nan"),
+                        "gate_mean": float(np.nanmean(gate_values)) if gate_values.size else float("nan"),
+                        "stat": stat_name,
+                        "mean": point,
+                        "ci_low": lo,
+                        "ci_high": hi,
+                        "status": status,
+                    }
+                )
+
+    for gate_type, gate_metric in Q1_PRIMARY_GATES.items():
+        add_quartile_stats(scope_rows, gate_type=gate_type, gate_metric=gate_metric, conditioning="all", seed_offset=0)
+    rho_rows = assign_rho_far_quartiles(scope_rows)
+    for rho_bin in RHO_FAR_BINS:
+        subset = [row for row in rho_rows if str(row.get("rho_far_bin")) == rho_bin]
+        if not subset:
+            continue
+        for gate_type, gate_metric in Q1_PRIMARY_GATES.items():
+            add_quartile_stats(
+                subset,
+                gate_type=gate_type,
+                gate_metric=gate_metric,
+                conditioning=f"rho_far:{rho_bin}",
+                seed_offset=10000 + stable_int_seed(rho_bin) % 100000,
+            )
+
+    graph_points: list[dict[str, Any]] = []
+    by_task_graph: dict[tuple[str, str], list[Mapping[str, Any]]] = defaultdict(list)
+    for row in scope_rows:
+        by_task_graph[(str(row["task"]), str(row["graph_id"]))].append(row)
+    for (task, graph_id), group in sorted(by_task_graph.items()):
+        swaps = len(group)
+        graph_excess = q1_graph_excess(group) if swaps >= int(min_swaps_per_graph) else float("nan")
+        for gate_type, gate_metric in Q1_PRIMARY_GATES.items():
+            values = numeric_column(group, gate_metric)
+            gate_mean = float(np.nanmean(values)) if values.size else float("nan")
+            status = (
+                "ok"
+                if swaps >= int(min_swaps_per_graph) and math.isfinite(graph_excess) and math.isfinite(gate_mean)
+                else "underpowered"
+            )
+            graph_points.append(
+                {
+                    "task": task,
+                    "graph_id": graph_id,
+                    "gate_type": gate_type,
+                    "gate_metric": gate_metric,
+                    "graph_gate_mean": gate_mean,
+                    "graph_gate_std": float(np.nanstd(values)) if values.size else float("nan"),
+                    "graph_excess_partial_corr": graph_excess,
+                    "swaps": swaps,
+                    "status": status,
+                }
+            )
+
+    graph_stats: list[dict[str, Any]] = []
+    for task in tasks:
+        for gate_type, gate_metric in Q1_PRIMARY_GATES.items():
+            group = [
+                row
+                for row in graph_points
+                if row["task"] == task and row["gate_type"] == gate_type and row["status"] == "ok"
+            ]
+            for stat_name, stat_fn in [
+                (
+                    "pearson",
+                    lambda sample: pearson_corr(
+                        numeric_column(sample, "graph_gate_mean"),
+                        numeric_column(sample, "graph_excess_partial_corr"),
+                    ),
+                ),
+                (
+                    "spearman",
+                    lambda sample: spearman_corr(
+                        numeric_column(sample, "graph_gate_mean"),
+                        numeric_column(sample, "graph_excess_partial_corr"),
+                    ),
+                ),
+            ]:
+                point, lo, hi = cluster_bootstrap_ci(
+                    group,
+                    stat_fn,
+                    resamples=bootstrap_resamples,
+                    seed=bootstrap_seed + stable_int_seed(task, gate_type, stat_name) % 100000,
+                )
+                graph_stats.append(
+                    {
+                        "task": task,
+                        "gate_type": gate_type,
+                        "gate_metric": gate_metric,
+                        "stat": stat_name,
+                        "graphs": len(group),
+                        "mean": point,
+                        "ci_low": lo,
+                        "ci_high": hi,
+                        "status": "ok" if len(group) >= 3 else "underpowered",
+                    }
+                )
+
+    contrast_rows: list[dict[str, Any]] = []
+    for task in tasks:
+        task_points = [row for row in graph_points if row["task"] == task and row["status"] == "ok"]
+
+        def contrast_stat(sample: Sequence[Mapping[str, Any]], *, corr: str) -> float:
+            route = [row for row in sample if row["gate_type"] == "routing"]
+            transport = [row for row in sample if row["gate_type"] == "transport"]
+            fn = spearman_corr if corr == "spearman" else pearson_corr
+            r_route = fn(numeric_column(route, "graph_gate_mean"), numeric_column(route, "graph_excess_partial_corr"))
+            r_trans = fn(numeric_column(transport, "graph_gate_mean"), numeric_column(transport, "graph_excess_partial_corr"))
+            return float(r_route - r_trans)
+
+        for corr_name in ("pearson", "spearman"):
+            point, lo, hi = cluster_bootstrap_ci(
+                task_points,
+                lambda sample, name=corr_name: contrast_stat(sample, corr=name),
+                resamples=bootstrap_resamples,
+                seed=bootstrap_seed + stable_int_seed(task, "route_minus_transport", corr_name) % 100000,
+            )
+            contrast_rows.append(
+                {
+                    "task": task,
+                    "contrast": "routing_minus_transport",
+                    "stat": corr_name,
+                    "graphs": len({str(row["graph_id"]) for row in task_points}),
+                    "mean": point,
+                    "ci_low": lo,
+                    "ci_high": hi,
+                    "status": "ok" if len({str(row["graph_id"]) for row in task_points}) >= 3 else "underpowered",
+                }
+            )
+
+    quartile_path = functional_q1_gate_quartile_stats_path(cfg)
+    points_path = functional_q1_graph_coupling_points_path(cfg)
+    stats_path = functional_q1_graph_coupling_stats_path(cfg)
+    contrast_path = functional_q1_gate_contrast_stats_path(cfg)
+    write_csv(quartile_path, quartile_rows)
+    write_csv(points_path, graph_points)
+    write_csv(stats_path, graph_stats)
+    write_csv(contrast_path, contrast_rows)
+    print(
+        f"[functional-q1-summary] wrote quartiles={quartile_path} points={points_path} "
+        f"stats={stats_path} contrasts={contrast_path}",
+        flush=True,
+    )
+    return quartile_path, points_path, stats_path
 
 
 def enrich_functional_rows_with_rho_far(
@@ -4638,6 +5552,190 @@ def plot_functional_node_responses(cfg: Mapping[str, Any], *, tasks: Sequence[st
         fig.savefig(fig_dir / "functional_e1n_gcn_beyond_l_validity.pdf")
         plt.close(fig)
     print(f"[functional-e1n-plot] wrote figures={fig_dir}", flush=True)
+
+
+def q1_stat_row(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    task: str,
+    gate_type: str,
+    stat: str,
+    field: str = "mean",
+) -> float:
+    for row in rows:
+        if row.get("task") == task and row.get("gate_type") == gate_type and row.get("stat") == stat:
+            return finite_float(row.get(field))
+    return float("nan")
+
+
+def status_rank(status: str) -> int:
+    return {"pass": 0, "warn": 1, "fail": 2}.get(str(status), 2)
+
+
+def worst_status(statuses: Sequence[str]) -> str:
+    if not statuses:
+        return "fail"
+    return max(statuses, key=status_rank)
+
+
+def plot_functional_q1_gates(cfg: Mapping[str, Any], *, tasks: Sequence[str] | None = None) -> None:
+    tasks = list(tasks or TASKS)
+    fig_dir = functional_figures_dir(cfg)
+    fig_dir.mkdir(parents=True, exist_ok=True)
+    quartile_rows = read_csv_dicts(functional_q1_gate_quartile_stats_path(cfg))
+    points = read_csv_dicts(functional_q1_graph_coupling_points_path(cfg))
+    graph_stats = read_csv_dicts(functional_q1_graph_coupling_stats_path(cfg))
+    contrast_rows = read_csv_dicts(functional_q1_gate_contrast_stats_path(cfg))
+    if not quartile_rows or not points or not graph_stats:
+        raise FileNotFoundError("Q1 summary CSVs are missing or empty; run summarise-functional-q1-gates first")
+
+    colors = {"routing": "#2b6cb0", "transport": "#805ad5"}
+    x = np.arange(len(Q1_GATE_BINS), dtype=np.float64)
+    fig, axes = plt.subplots(
+        max(1, len(tasks)),
+        2,
+        figsize=(10.5, 3.3 * max(1, len(tasks))),
+        sharex=True,
+        sharey=True,
+        squeeze=False,
+    )
+    for row_idx, task in enumerate(tasks):
+        for col_idx, gate_type in enumerate(("routing", "transport")):
+            ax = axes[row_idx, col_idx]
+            vals = []
+            lows = []
+            highs = []
+            labels = []
+            statuses = []
+            for gate_bin in Q1_GATE_BINS:
+                subset = [
+                    row
+                    for row in quartile_rows
+                    if row.get("task") == task
+                    and row.get("gate_type") == gate_type
+                    and row.get("conditioning") == "all"
+                    and row.get("gate_bin") == gate_bin
+                    and row.get("stat") == "grit_excess_partial_corr"
+                ]
+                row = subset[0] if subset else {}
+                vals.append(finite_float(row.get("mean")))
+                lows.append(finite_float(row.get("ci_low")))
+                highs.append(finite_float(row.get("ci_high")))
+                labels.append(Q1_GATE_BIN_LABELS.get(gate_bin, gate_bin).replace(" gate", ""))
+                statuses.append(str(row.get("status", "missing")))
+            vals_arr = np.asarray(vals, dtype=np.float64)
+            lows_arr = np.asarray(lows, dtype=np.float64)
+            highs_arr = np.asarray(highs, dtype=np.float64)
+            ax.errorbar(
+                x,
+                vals_arr,
+                yerr=nonnegative_ci_yerr(vals_arr, lows_arr, highs_arr),
+                marker="o",
+                color=colors[gate_type],
+                linewidth=1.4,
+                capsize=3,
+            )
+            for xi, status in zip(x, statuses):
+                if status == "underpowered":
+                    ax.text(xi, 0.02, "u", ha="center", va="bottom", fontsize=8, color="#b24c3d")
+            ax.axhline(0.0, color="black", linewidth=0.8)
+            ax.set_title(f"{task}: {gate_type}")
+            ax.set_xticks(x)
+            ax.set_xticklabels(labels, rotation=20, ha="right")
+            ax.set_ylabel("pcorr(GRIT, teacher | GCN+)")
+            ax.grid(axis="y", alpha=0.25)
+    fig.suptitle("Q1: functional excess by GRIT global gate quartile", fontsize=13)
+    fig.tight_layout(rect=(0, 0, 1, 0.96))
+    fig.savefig(fig_dir / "functional_q1_gate_excess_quartiles.pdf")
+    plt.close(fig)
+
+    fig, axes = plt.subplots(1, max(1, len(tasks)), figsize=(4.6 * max(1, len(tasks)), 3.9), sharey=True)
+    axes_list = np.atleast_1d(axes)
+    for ax, task in zip(axes_list, tasks):
+        vals = np.asarray([q1_stat_row(graph_stats, task=task, gate_type=g, stat="pearson") for g in ("routing", "transport")])
+        lows = np.asarray([q1_stat_row(graph_stats, task=task, gate_type=g, stat="pearson", field="ci_low") for g in ("routing", "transport")])
+        highs = np.asarray([q1_stat_row(graph_stats, task=task, gate_type=g, stat="pearson", field="ci_high") for g in ("routing", "transport")])
+        ax.bar([0, 1], vals, yerr=nonnegative_ci_yerr(vals, lows, highs), capsize=3, color=[colors["routing"], colors["transport"]])
+        contrast = next((row for row in contrast_rows if row.get("task") == task and row.get("stat") == "pearson"), None)
+        diff = finite_float(contrast.get("mean") if contrast is not None else None)
+        ax.text(0.5, 0.96, f"route - transport = {diff:.2f}", ha="center", va="top", transform=ax.transAxes, fontsize=8)
+        ax.axhline(0.0, color="black", linewidth=0.8)
+        ax.set_xticks([0, 1])
+        ax.set_xticklabels(["routing", "transport"])
+        ax.set_title(task)
+        ax.set_ylabel("corr(graph gate, graph excess)")
+        ax.grid(axis="y", alpha=0.25)
+    fig.tight_layout()
+    fig.savefig(fig_dir / "functional_q1_route_vs_transport.pdf")
+    plt.close(fig)
+
+    fig, axes = plt.subplots(max(1, len(tasks)), 2, figsize=(10.0, 3.3 * max(1, len(tasks))), squeeze=False)
+    for row_idx, task in enumerate(tasks):
+        for col_idx, gate_type in enumerate(("routing", "transport")):
+            ax = axes[row_idx, col_idx]
+            subset = [
+                row
+                for row in points
+                if row.get("task") == task and row.get("gate_type") == gate_type and row.get("status") == "ok"
+            ]
+            gate = numeric_column(subset, "graph_gate_mean")
+            excess = numeric_column(subset, "graph_excess_partial_corr")
+            ax.scatter(gate, excess, s=18, alpha=0.68, color=colors[gate_type], edgecolor="none")
+            finite = np.isfinite(gate) & np.isfinite(excess)
+            if int(finite.sum()) >= 2:
+                coef = np.polyfit(gate[finite], excess[finite], deg=1)
+                xs = np.linspace(float(np.nanmin(gate[finite])), float(np.nanmax(gate[finite])), 100)
+                ax.plot(xs, coef[0] * xs + coef[1], color="#2d3748", linewidth=1.0)
+            ax.axhline(0.0, color="black", linewidth=0.8)
+            ax.set_title(f"{task}: {gate_type}")
+            ax.set_xlabel("mean graph gate")
+            ax.set_ylabel("graph-level excess")
+            ax.grid(alpha=0.25)
+    fig.tight_layout()
+    fig.savefig(fig_dir / "functional_q1_graph_coupling_scatter.pdf")
+    plt.close(fig)
+
+    validity_rows = read_csv_dicts(functional_validity_gate_path(cfg)) if functional_validity_gate_path(cfg).exists() else []
+    summary_rows = []
+    for task in tasks:
+        statuses = [str(row.get("status", "fail")) for row in validity_rows if row.get("task") == task]
+        summary_rows.append(
+            [
+                task,
+                worst_status(statuses),
+                f"{q1_stat_row(graph_stats, task=task, gate_type='routing', stat='pearson'):.2f}",
+                f"{q1_stat_row(graph_stats, task=task, gate_type='transport', stat='pearson'):.2f}",
+                f"{next((finite_float(row.get('mean')) for row in contrast_rows if row.get('task') == task and row.get('stat') == 'pearson'), float('nan')):.2f}",
+            ]
+        )
+    fig, ax = plt.subplots(figsize=(9.2, max(2.6, 0.65 * len(summary_rows) + 1.4)))
+    ax.axis("off")
+    ax.set_title("Q1 validity and headline graph-coupling summary", fontsize=13, loc="left", pad=8)
+    table = ax.table(
+        cellText=summary_rows,
+        colLabels=["Task", "Validity", "routing corr", "transport corr", "route - transport"],
+        cellLoc="left",
+        colLoc="left",
+        loc="upper left",
+        colWidths=[0.30, 0.14, 0.18, 0.20, 0.18],
+    )
+    table.auto_set_font_size(False)
+    table.set_fontsize(9)
+    for (row_idx, col_idx), cell in table.get_celld().items():
+        cell.set_edgecolor("#d0d4dc")
+        cell.set_linewidth(0.4)
+        if row_idx == 0:
+            cell.set_facecolor("#edf2f7")
+            cell.set_text_props(weight="bold")
+        elif col_idx == 1:
+            status = summary_rows[row_idx - 1][1]
+            cell.set_facecolor({"pass": "#d9f0e3", "warn": "#fff1c7", "fail": "#f7d6d0"}.get(status, "#ffffff"))
+            cell.set_text_props(weight="bold")
+    table.scale(1.0, 1.6)
+    fig.tight_layout()
+    fig.savefig(fig_dir / "functional_q1_validity_plus_result_summary.pdf")
+    plt.close(fig)
+    print(f"[functional-q1-plot] wrote figures={fig_dir}", flush=True)
 
 
 def grouped_folds(groups: Sequence[str], folds: int, seed: int) -> list[set[str]]:
@@ -6292,6 +7390,60 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--bootstrap-seed", type=int, default=9401)
     p.add_argument("--force-swaps", action="store_true")
 
+    p = sub.add_parser("summarise-functional-validity-gate")
+    common(p)
+    p.add_argument("--all-tasks", action="store_true")
+    p.add_argument("--e1g-seed", type=int, default=9101)
+    p.add_argument("--e1n-seed", type=int, default=9301)
+    p.add_argument("--gnn-depth", type=int, default=2)
+
+    p = sub.add_parser("plot-functional-validity-gate")
+    common(p)
+    p.add_argument("--all-tasks", action="store_true")
+
+    p = sub.add_parser("run-functional-q1-gates")
+    common(p)
+    p.add_argument("--swaps-path", type=Path)
+    p.add_argument("--response-path", type=Path)
+    p.add_argument("--seed", type=int, default=9501)
+    p.add_argument("--e1g-seed", type=int, default=9101)
+    p.add_argument("--device", default="auto")
+    p.add_argument("--batch-size", type=int, default=512)
+    p.add_argument("--gnn-depth", type=int, default=2)
+    p.add_argument("--grit-config", type=Path)
+    p.add_argument("--grit-checkpoint", type=Path)
+    p.add_argument("--store-head-gates", action="store_true")
+
+    p = sub.add_parser("summarise-functional-q1-gates")
+    common(p)
+    p.add_argument("--all-tasks", action="store_true")
+    p.add_argument("--seed", type=int, default=9501)
+    p.add_argument("--bootstrap-resamples", type=int, default=1000)
+    p.add_argument("--bootstrap-seed", type=int, default=9601)
+    p.add_argument("--min-swaps-per-bin", type=int, default=100)
+    p.add_argument("--min-swaps-per-graph", type=int, default=20)
+
+    p = sub.add_parser("plot-functional-q1-gates")
+    common(p)
+    p.add_argument("--all-tasks", action="store_true")
+
+    p = sub.add_parser("run-functional-q1-stage")
+    common(p)
+    p.add_argument("--all-tasks", action="store_true")
+    p.add_argument("--seed", type=int, default=9501)
+    p.add_argument("--e1g-seed", type=int, default=9101)
+    p.add_argument("--e1n-seed", type=int, default=9301)
+    p.add_argument("--device", default="auto")
+    p.add_argument("--batch-size", type=int, default=512)
+    p.add_argument("--gnn-depth", type=int, default=2)
+    p.add_argument("--grit-config", type=Path)
+    p.add_argument("--grit-checkpoint", type=Path)
+    p.add_argument("--store-head-gates", action="store_true")
+    p.add_argument("--bootstrap-resamples", type=int, default=1000)
+    p.add_argument("--bootstrap-seed", type=int, default=9601)
+    p.add_argument("--min-swaps-per-bin", type=int, default=100)
+    p.add_argument("--min-swaps-per-graph", type=int, default=20)
+
     p = sub.add_parser("run-sequence")
     common(p)
     p.add_argument("--device", default="auto")
@@ -6317,6 +7469,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "summarise-functional-node-responses",
         "plot-functional-node-responses",
         "run-functional-stage1-node",
+        "summarise-functional-validity-gate",
+        "plot-functional-validity-gate",
+        "summarise-functional-q1-gates",
+        "plot-functional-q1-gates",
+        "run-functional-q1-stage",
     }
     load_task = args.task
     if load_task is None and args.command in functional_all_task_commands and args.config is None:
@@ -6512,6 +7669,83 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             bootstrap_seed=args.bootstrap_seed,
         )
         plot_functional_node_responses(cfg, tasks=tasks)
+    elif args.command == "summarise-functional-validity-gate":
+        tasks = TASKS if args.all_tasks or args.task is None else (task,)
+        summarise_functional_validity_gate(
+            cfg,
+            tasks=tasks,
+            e1g_seed=args.e1g_seed,
+            e1n_seed=args.e1n_seed,
+            gnn_depth=args.gnn_depth,
+        )
+    elif args.command == "plot-functional-validity-gate":
+        tasks = TASKS if args.all_tasks or args.task is None else (task,)
+        plot_functional_validity_gate(cfg, tasks=tasks)
+    elif args.command == "run-functional-q1-gates":
+        run_functional_q1_gates(
+            cfg,
+            task,
+            swaps_path=args.swaps_path,
+            response_path=args.response_path,
+            seed=args.seed,
+            e1g_seed=args.e1g_seed,
+            device_name=args.device,
+            batch_size=args.batch_size,
+            gnn_depth=args.gnn_depth,
+            grit_config=args.grit_config,
+            grit_checkpoint=args.grit_checkpoint,
+            store_head_gates=args.store_head_gates,
+            fast_dev_run=bool(args.fast_dev_run),
+        )
+    elif args.command == "summarise-functional-q1-gates":
+        tasks = TASKS if args.all_tasks or args.task is None else (task,)
+        summarise_functional_q1_gates(
+            cfg,
+            tasks=tasks,
+            seed=args.seed,
+            bootstrap_resamples=args.bootstrap_resamples,
+            bootstrap_seed=args.bootstrap_seed,
+            min_swaps_per_bin=args.min_swaps_per_bin,
+            min_swaps_per_graph=args.min_swaps_per_graph,
+        )
+    elif args.command == "plot-functional-q1-gates":
+        tasks = TASKS if args.all_tasks or args.task is None else (task,)
+        plot_functional_q1_gates(cfg, tasks=tasks)
+    elif args.command == "run-functional-q1-stage":
+        tasks = TASKS if args.all_tasks or args.task is None else (task,)
+        summarise_functional_validity_gate(
+            cfg,
+            tasks=tasks,
+            e1g_seed=args.e1g_seed,
+            e1n_seed=args.e1n_seed,
+            gnn_depth=args.gnn_depth,
+        )
+        plot_functional_validity_gate(cfg, tasks=tasks)
+        for task_name in tasks:
+            task_cfg = load_config(args.config, task=task_name, fast_dev_run=bool(args.fast_dev_run))
+            run_functional_q1_gates(
+                task_cfg,
+                task_name,
+                seed=args.seed,
+                e1g_seed=args.e1g_seed,
+                device_name=args.device,
+                batch_size=args.batch_size,
+                gnn_depth=args.gnn_depth,
+                grit_config=args.grit_config,
+                grit_checkpoint=args.grit_checkpoint,
+                store_head_gates=args.store_head_gates,
+                fast_dev_run=bool(args.fast_dev_run),
+            )
+        summarise_functional_q1_gates(
+            cfg,
+            tasks=tasks,
+            seed=args.seed,
+            bootstrap_resamples=args.bootstrap_resamples,
+            bootstrap_seed=args.bootstrap_seed,
+            min_swaps_per_bin=args.min_swaps_per_bin,
+            min_swaps_per_graph=args.min_swaps_per_graph,
+        )
+        plot_functional_q1_gates(cfg, tasks=tasks)
     elif args.command == "run-payload-gating-controls":
         run_payload_gating_controls(
             cfg,
