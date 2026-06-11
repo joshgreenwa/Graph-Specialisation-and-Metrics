@@ -61,6 +61,7 @@ else:
 
 
 TASKS = ("ppr_diffusion", "nearest_anchor_voronoi")
+MODEL_BACKENDS = ("official", "official_gnnplus", "local")
 PPR_FAMILIES = ("ppr_payload_swap", "ppr_struct_swap")
 VORONOI_FAMILIES = (
     "voronoi_anchor_marker_swap",
@@ -396,7 +397,11 @@ def data_dir(cfg: Mapping[str, Any], task: str) -> Path:
 
 def checkpoint_dir(cfg: Mapping[str, Any], task: str, seed: int | None = None) -> Path:
     seed = int(seed if seed is not None else cfg["seeds"]["model_init_seed"])
-    return artifact_root(cfg) / "checkpoints" / "grit" / task / f"seed_{seed}"
+    return artifact_root(cfg) / "checkpoints" / model_name_for_checkpoint(cfg) / task / f"seed_{seed}"
+
+
+def model_name_for_checkpoint(cfg: Mapping[str, Any]) -> str:
+    return str(cfg.get("model", {}).get("name", "grit"))
 
 
 def intervention_dir(cfg: Mapping[str, Any], task: str) -> Path:
@@ -1068,7 +1073,7 @@ def require_import(module_name: str, package_hint: str):
     except Exception as exc:
         raise RuntimeError(
             f"Official backend import failed for {module_name!r}. Install or expose "
-            f"{package_hint}; for GRIT set GRIT_ROOT and run the repository preflight."
+            f"{package_hint}. For GRIT set GRIT_ROOT; for GNNPlus set GNNPLUS_ROOT."
         ) from exc
 
 
@@ -1200,6 +1205,120 @@ class CFIMOfficialGRITModel(nn.Module):
         return pack_flat_nodes(batch, self.output_head(pyg_batch.x))
 
 
+def build_sparse_pyg_batch(batch: CFIMBatch):
+    data_mod = require_import("torch_geometric.data", "torch_geometric")
+    data = data_mod.Data(num_nodes=int(batch.graph_num_nodes.sum().item()))
+    device = batch.x.device
+    counts, offsets = node_counts_and_offsets(batch)
+    data.batch = torch.cat(
+        [torch.full((n,), idx, dtype=torch.long, device=device) for idx, n in enumerate(counts)],
+        dim=0,
+    )
+    if batch.edge_batch.numel():
+        edge_offsets = offsets[batch.edge_batch]
+        data.edge_index = torch.stack([edge_offsets + batch.edge_src, edge_offsets + batch.edge_dst], dim=0)
+        data.orig_edge_attr = batch.edge_attr.float()
+    else:
+        data.edge_index = torch.empty(2, 0, dtype=torch.long, device=device)
+        data.orig_edge_attr = torch.empty(0, batch.edge_attr.size(-1), dtype=torch.float32, device=device)
+    data.graph_num_nodes = batch.graph_num_nodes
+    return data
+
+
+def setup_gnnplus_graphgym_cfg(model_cfg: Mapping[str, Any]) -> None:
+    graphgym_config = require_import("torch_geometric.graphgym.config", "torch_geometric GraphGym")
+    graphgym_register = require_import("torch_geometric.graphgym.register", "torch_geometric GraphGym")
+    yacs_config = require_import("yacs.config", "yacs")
+    cfg = graphgym_config.cfg
+    if hasattr(cfg, "defrost"):
+        cfg.defrost()
+    if hasattr(cfg, "set_new_allowed"):
+        cfg.set_new_allowed(True)
+    if not hasattr(cfg, "gnn"):
+        cfg.gnn = yacs_config.CfgNode(new_allowed=True)
+    elif hasattr(cfg.gnn, "set_new_allowed"):
+        cfg.gnn.set_new_allowed(True)
+    cfg.gnn.act = str(model_cfg.get("activation", "relu"))
+    if cfg.gnn.act not in graphgym_register.act_dict:
+        try:
+            importlib.import_module("GNNPlus.act.example")
+        except Exception:
+            pass
+    if cfg.gnn.act not in graphgym_register.act_dict:
+        raise RuntimeError(f"GNNPlus activation {cfg.gnn.act!r} is not registered with GraphGym")
+
+
+class CFIMOfficialGNNPlusModel(nn.Module):
+    """Thin teacher-student adapter around the official GNNPlus layer classes.
+
+    The upstream GNNPlus repository is GraphGym/GPS-oriented and targets graph-level
+    heads.  This wrapper keeps its official message-passing layers, but reuses the
+    CFIM node-regression data, training loop, and checkpoint format.
+    """
+
+    LAYER_MODULES = {
+        "gcn": ("GNNPlus.layer.gcn_conv_layer", "GCNConvLayer", False),
+        "gcne": ("GNNPlus.layer.gcn_conv_layer_e", "GCNConvLayer", True),
+        "gine": ("GNNPlus.layer.gine_conv_layer", "GINEConvLayer", True),
+        "gatedgcn": ("GNNPlus.layer.gatedgcn_layer", "GatedGCNLayer", True),
+    }
+
+    def __init__(self, cfg: Mapping[str, Any], input_dim: int, edge_attr_dim: int = 3) -> None:
+        super().__init__()
+        add_external_repo_path("GNNPLUS_ROOT", ("GNNPlus",))
+        model_cfg = cfg["model"]
+        gnnplus_cfg = model_cfg.get("gnnplus", {})
+        layer_type = str(gnnplus_cfg.get("layer_type", "gcn")).lower()
+        if layer_type not in self.LAYER_MODULES:
+            raise ValueError(f"unsupported GNNPlus layer_type {layer_type!r}; expected one of {sorted(self.LAYER_MODULES)}")
+        setup_gnnplus_graphgym_cfg(model_cfg)
+        module_name, class_name, edge_aware = self.LAYER_MODULES[layer_type]
+        layer_mod = require_import(module_name, "official GNNPlus repository")
+        layer_cls = getattr(layer_mod, class_name)
+
+        dim = int(model_cfg["hidden_dim"])
+        self.layer_type = layer_type
+        self.edge_aware = bool(edge_aware)
+        self.rwse_steps = int(model_cfg.get("rrwp_steps", cfg["structural_features"]["rrwp"]["steps"]))
+        self.use_rwse = bool(model_cfg.get("use_rwse", model_cfg.get("use_rrwp", True)))
+        self.use_degree_features = bool(model_cfg.get("use_degree_features", True))
+        node_dim = int(input_dim)
+        if self.use_rwse:
+            node_dim += self.rwse_steps
+        if self.use_degree_features:
+            node_dim += 1
+        self.input_dropout = nn.Dropout(float(model_cfg.get("input_dropout", 0.0)))
+        self.input_encoder = nn.Linear(node_dim, dim)
+        self.edge_encoder = nn.Linear(int(edge_attr_dim), dim) if self.edge_aware else None
+        dropout = float(model_cfg.get("dropout", model_cfg.get("residual_dropout", 0.0)))
+        residual = bool(model_cfg.get("residual", True))
+        ffn = bool(model_cfg.get("ffn", True))
+        self.layers = nn.ModuleList(
+            layer_cls(dim, dim, dropout=dropout, residual=residual, ffn=ffn)
+            for _ in range(int(model_cfg["num_layers"]))
+        )
+        self.output_head = nn.Linear(dim, int(cfg["feature_dimensions"]["target_dim"]))
+
+    def node_features(self, batch: CFIMBatch) -> torch.Tensor:
+        pieces = [flatten_nodes(batch, batch.x.float())]
+        if self.use_rwse:
+            pieces.append(flatten_nodes(batch, batch.rwse[..., : self.rwse_steps].float()))
+        if self.use_degree_features:
+            pieces.append(torch.log1p(flatten_nodes(batch, batch.degree[..., None].float())))
+        return torch.cat(pieces, dim=-1)
+
+    def forward(self, batch: CFIMBatch) -> torch.Tensor:
+        pyg_batch = build_sparse_pyg_batch(batch)
+        pyg_batch.x = self.input_encoder(self.input_dropout(self.node_features(batch)))
+        if self.edge_encoder is not None:
+            pyg_batch.edge_attr = self.edge_encoder(pyg_batch.orig_edge_attr.to(pyg_batch.x.dtype))
+        else:
+            pyg_batch.edge_attr = pyg_batch.orig_edge_attr
+        for layer in self.layers:
+            pyg_batch = layer(pyg_batch)
+        return pack_flat_nodes(batch, self.output_head(pyg_batch.x))
+
+
 class LocalGRITStyleLayer(nn.Module):
     def __init__(self, dim: int, heads: int, pair_dim: int, dropout: float) -> None:
         super().__init__()
@@ -1272,9 +1391,18 @@ def build_model(cfg: Mapping[str, Any], task: str, backend: str | None = None) -
     input_dim = input_dim_for_task(cfg, task)
     if selected == "official":
         return CFIMOfficialGRITModel(cfg, input_dim=input_dim)
+    if selected == "official_gnnplus":
+        return CFIMOfficialGNNPlusModel(cfg, input_dim=input_dim)
     if selected == "local":
         return CFIMLocalGRITStyleModel(cfg, input_dim=input_dim)
     raise ValueError(f"unknown model backend {selected!r}")
+
+
+def parameter_count(model: nn.Module, *, trainable_only: bool = True) -> int:
+    params = model.parameters()
+    if trainable_only:
+        return int(sum(param.numel() for param in params if param.requires_grad))
+    return int(sum(param.numel() for param in params))
 
 
 def masked_mse(pred: torch.Tensor, target: torch.Tensor, node_mask: torch.Tensor) -> torch.Tensor:
@@ -1443,6 +1571,13 @@ def train(cfg: Mapping[str, Any], task: str, *, device_name: str = "auto", backe
     write_yaml(resolved_cfg_path, cfg)
     val_records = load_records(data_dir(cfg, task) / "val.pt")
     model = build_model(cfg, task, backend=backend).to(device)
+    params_trainable = parameter_count(model, trainable_only=True)
+    params_total = parameter_count(model, trainable_only=False)
+    print(
+        f"[model] name={model_name_for_checkpoint(cfg)} backend={backend or cfg['model'].get('backend', 'official')} "
+        f"trainable_params={params_trainable} total_params={params_total}",
+        flush=True,
+    )
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=float(cfg["training"]["learning_rate"]),
@@ -1524,13 +1659,15 @@ def train(cfg: Mapping[str, Any], task: str, *, device_name: str = "auto", backe
         save_checkpoint(best_path, model, cfg, task, last_step, best_rel, optimizer)
     manifest = {
         "task": task,
-        "model": "grit",
+        "model": model_name_for_checkpoint(cfg),
         "model_seed": seed,
         "teacher_seed": TEACHER_SEEDS[task],
         "git_commit": git_commit(),
         "dirty_git_state": dirty_git_state(),
         "best_step": best_step,
         "best_val_relmse": best_rel,
+        "trainable_parameters": params_trainable,
+        "total_parameters": params_total,
         "checkpoint_sha256": sha256_file(best_path),
         "config_sha256": sha256_file(resolved_cfg_path),
         "created_utc": datetime.now(timezone.utc).isoformat(),
@@ -3807,6 +3944,70 @@ def write_default_configs(output_dir: Path) -> None:
             "model_note": "2-layer official-backed GRIT-RRWP with continuous node-regression head",
         }
         write_yaml(output_dir / f"grit_{task}.yaml", cfg)
+        write_yaml(output_dir / f"gcn_plus_{task}.yaml", gnnplus_default_config(task, layer_type="gcn"))
+
+
+def gnnplus_default_config(task: str, *, layer_type: str = "gcn") -> dict[str, Any]:
+    cfg = copy.deepcopy(DEFAULT_CONFIG)
+    cfg["task"] = task
+    cfg["model"] = deep_update(
+        cfg["model"],
+        {
+            "name": "gcn_plus" if layer_type == "gcn" else f"{layer_type}_plus",
+            "backend": "official_gnnplus",
+            "num_layers": 2,
+            "hidden_dim": 192,
+            "ffn_hidden_dim": 384,
+            "input_dropout": 0.0,
+            "dropout": 0.1,
+            "residual_dropout": 0.1,
+            "ffn_dropout": 0.1,
+            "activation": "relu",
+            "residual": True,
+            "ffn": True,
+            "use_rwse": True,
+            "use_degree_features": True,
+            "use_edge_type": False,
+            "output_head": "node_regression_linear",
+            "parameter_match": {
+                "reference_model": "grit",
+                "reference_layers": 2,
+                "reference_hidden_dim": 128,
+                "note": "hidden_dim=192 is chosen to approximately match the parameter budget of the 2-layer GRIT-128 teacher-student baseline.",
+            },
+            "gnnplus": {
+                "layer_type": layer_type,
+                "official_name": "GCN+" if layer_type == "gcn" else f"{layer_type.upper()}+",
+            },
+            "official_source": {
+                "repo": "https://github.com/LUOyk1999/GNNPlus",
+                "checked_commit": "0e02ad9acc2f1e54b5ad71c051bf5dfb1fcb4f28",
+                "paper": "https://arxiv.org/abs/2502.09263",
+                "config_family": "GNN+",
+            },
+        },
+    )
+    cfg["training"] = deep_update(
+        cfg["training"],
+        {
+            "learning_rate": 1.0e-3,
+            "weight_decay": 1.0e-5,
+            "max_steps": 5000,
+            "warmup_steps": 250,
+            "eval_every_steps": 250,
+            "checkpoint_every_steps": 0,
+            "early_stop_val_relmse": 0.005,
+            "early_stop_min_steps": 1500,
+            "early_stop_patience_evals": 4,
+        },
+    )
+    cfg["response_predictivity"]["families"] = list(PPR_FAMILIES if task == "ppr_diffusion" else VORONOI_FAMILIES)
+    cfg["run"] = {
+        "name": f"cfim_gcn_plus_{task}_seed1001",
+        "hardware": "single_a100_80gb",
+        "model_note": "2-layer official GCN+ adapter using the GNNPlus repository layers, RWSE/degree inputs, residuals, BatchNorm, dropout, and FFN.",
+    }
+    return cfg
 
 
 def print_hpc_commands(config_dir: Path) -> None:
@@ -3814,6 +4015,8 @@ def print_hpc_commands(config_dir: Path) -> None:
         cfg_path = config_dir / f"grit_{task}.yaml"
         print(f"# {task}")
         print(f"python -m graph_specialisation_metrics.counterfactual_interchange_mediation run-sequence --config {cfg_path} --task {task} --device cuda --backend official")
+        gnn_cfg_path = config_dir / f"gcn_plus_{task}.yaml"
+        print(f"python -m graph_specialisation_metrics.counterfactual_interchange_mediation train --config {gnn_cfg_path} --task {task} --device cuda --backend official_gnnplus")
 
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
@@ -3838,7 +4041,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p = sub.add_parser("train")
     common(p)
     p.add_argument("--device", default="auto")
-    p.add_argument("--backend", choices=("official", "local"))
+    p.add_argument("--backend", choices=MODEL_BACKENDS)
 
     p = sub.add_parser("build-interventions")
     common(p)
@@ -3848,13 +4051,13 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p = sub.add_parser("evaluate-counterfactuals")
     common(p)
     p.add_argument("--device", default="auto")
-    p.add_argument("--backend", choices=("official", "local"))
+    p.add_argument("--backend", choices=MODEL_BACKENDS)
     p.add_argument("--checkpoint", type=Path)
 
     p = sub.add_parser("run-specialisation")
     common(p)
     p.add_argument("--device", default="auto")
-    p.add_argument("--backend", choices=("official", "local"))
+    p.add_argument("--backend", choices=MODEL_BACKENDS)
     p.add_argument("--checkpoint", type=Path)
 
     p = sub.add_parser("plot-specialisation")
@@ -3863,7 +4066,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p = sub.add_parser("run-patching")
     common(p)
     p.add_argument("--device", default="auto")
-    p.add_argument("--backend", choices=("official", "local"))
+    p.add_argument("--backend", choices=MODEL_BACKENDS)
     p.add_argument("--checkpoint", type=Path)
 
     p = sub.add_parser("plot-patching")
@@ -3872,7 +4075,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p = sub.add_parser("run-response-predictivity")
     common(p)
     p.add_argument("--device", default="auto")
-    p.add_argument("--backend", choices=("official", "local"))
+    p.add_argument("--backend", choices=MODEL_BACKENDS)
     p.add_argument("--checkpoint", type=Path)
     p.add_argument("--families", default="")
     p.add_argument("--intervention-kind", choices=("cf_eval", "patch_eval"))
@@ -3888,7 +4091,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p = sub.add_parser("run-sequence")
     common(p)
     p.add_argument("--device", default="auto")
-    p.add_argument("--backend", choices=("official", "local"))
+    p.add_argument("--backend", choices=MODEL_BACKENDS)
     p.add_argument("--skip-training", action="store_true")
     p.add_argument("--force-data", action="store_true")
     p.add_argument("--force-interventions", action="store_true")

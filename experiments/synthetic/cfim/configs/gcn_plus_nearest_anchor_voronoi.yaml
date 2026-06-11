@@ -1,0 +1,50 @@
+task: nearest_anchor_voronoi
+model:
+  name: gcn_plus
+  backend: official_gnnplus
+  num_layers: 2
+  hidden_dim: 192
+  ffn_hidden_dim: 384
+  input_dropout: 0.0
+  dropout: 0.1
+  residual_dropout: 0.1
+  ffn_dropout: 0.1
+  activation: relu
+  residual: true
+  ffn: true
+  use_rwse: true
+  use_degree_features: true
+  use_edge_type: false
+  output_head: node_regression_linear
+  parameter_match:
+    reference_model: grit
+    reference_layers: 2
+    reference_hidden_dim: 128
+    note: hidden_dim=192 approximately matches the 2-layer GRIT-128 parameter budget while keeping depth fixed.
+  gnnplus:
+    layer_type: gcn
+    official_name: GCN+
+  official_source:
+    repo: https://github.com/LUOyk1999/GNNPlus
+    checked_commit: 0e02ad9acc2f1e54b5ad71c051bf5dfb1fcb4f28
+    paper: https://arxiv.org/abs/2502.09263
+    config_family: GNN+
+training:
+  learning_rate: 0.001
+  weight_decay: 1.0e-05
+  max_steps: 5000
+  warmup_steps: 250
+  eval_every_steps: 250
+  checkpoint_every_steps: 0
+  early_stop_val_relmse: 0.005
+  early_stop_min_steps: 1500
+  early_stop_patience_evals: 4
+response_predictivity:
+  families:
+  - voronoi_anchor_marker_swap
+  - voronoi_struct_swap
+  - voronoi_payload_swap
+run:
+  name: cfim_gcn_plus_nearest_anchor_voronoi_seed1001
+  hardware: single_a100_80gb
+  model_note: 2-layer official GCN+ adapter using GNNPlus repository layers with RWSE/degree inputs, residuals, BatchNorm, dropout, and FFN.

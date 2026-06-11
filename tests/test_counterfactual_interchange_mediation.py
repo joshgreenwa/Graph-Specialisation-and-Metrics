@@ -1,13 +1,19 @@
+import tempfile
+from pathlib import Path
+
 import torch
 
 from graph_specialisation_metrics.core_interpretability_specialisation_metrics import (
     make_content_swapped_batch,
 )
 from graph_specialisation_metrics.counterfactual_interchange_mediation import (
+    checkpoint_dir,
     collate_records,
     cv_ridge_summary,
+    gnnplus_default_config,
     load_config,
     make_graph_record,
+    model_name_for_checkpoint,
     pathway_deltas,
     response_predictivity_contrast_rows,
     response_feature_sets,
@@ -129,3 +135,13 @@ def test_response_predictivity_contrasts_mark_matched_sets():
     assert teacher["mismatched_feature_set"] == "routing_scores"
     assert teacher["matched_minus_mismatched_r2"] == 0.5
     assert student["matched_minus_intercept_r2"] == 0.7
+
+
+def test_gnnplus_config_uses_separate_checkpoint_namespace():
+    tmp_path = Path(tempfile.mkdtemp())
+    cfg = gnnplus_default_config("ppr_diffusion", layer_type="gcn")
+    cfg["artifacts"]["root"] = str(tmp_path)
+    assert cfg["model"]["backend"] == "official_gnnplus"
+    assert cfg["model"]["gnnplus"]["layer_type"] == "gcn"
+    assert model_name_for_checkpoint(cfg) == "gcn_plus"
+    assert checkpoint_dir(cfg, "ppr_diffusion") == tmp_path / "checkpoints" / "gcn_plus" / "ppr_diffusion" / "seed_1001"

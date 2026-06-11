@@ -26,6 +26,21 @@ The official GRIT repository should be pinned to:
 6c988ea600a606fbb49a2246c64a2d37396b3ab5
 ```
 
+For GNN+ baselines, expose the official GNNPlus repository:
+
+```bash
+git clone https://github.com/LUOyk1999/GNNPlus "$PROJECT_ROOT/external/GNNPlus"
+cd "$PROJECT_ROOT/external/GNNPlus"
+git checkout 0e02ad9acc2f1e54b5ad71c051bf5dfb1fcb4f28
+export GNNPLUS_ROOT="$PROJECT_ROOT/external/GNNPlus"
+```
+
+The `gcn_plus_*.yaml` configs use the official GNNPlus `GCNConvLayer` class
+with the CFIM node-regression data and training loop. They keep the GRIT depth
+fixed at two layers and set `hidden_dim=192` to approximate the parameter budget
+of the two-layer GRIT-128 baseline while preserving RWSE/degree inputs,
+BatchNorm, dropout, residual connections, and FFN blocks.
+
 The job uses `PYTHONPATH=${PROJECT_ROOT}/src` and launches:
 
 ```bash
@@ -68,3 +83,37 @@ PYTHONPATH=src python -m graph_specialisation_metrics.counterfactual_interchange
 ```
 
 The local backend is not paper-faithful and should not be reported as GRIT.
+
+## Official GCN+ Baseline
+
+Train parameter-matched official GCN+ on the two teacher-student tasks:
+
+```bash
+python -m graph_specialisation_metrics.counterfactual_interchange_mediation train \
+  --config experiments/synthetic/cfim/configs/gcn_plus_ppr_diffusion.yaml \
+  --task ppr_diffusion \
+  --device cuda \
+  --backend official_gnnplus
+
+python -m graph_specialisation_metrics.counterfactual_interchange_mediation train \
+  --config experiments/synthetic/cfim/configs/gcn_plus_nearest_anchor_voronoi.yaml \
+  --task nearest_anchor_voronoi \
+  --device cuda \
+  --backend official_gnnplus
+```
+
+Checkpoints are written separately from GRIT:
+
+```text
+artifacts/cfim/checkpoints/gcn_plus/<task>/seed_1001/best.pt
+```
+
+After training, evaluate clean and counterfactual performance with:
+
+```bash
+python -m graph_specialisation_metrics.counterfactual_interchange_mediation evaluate-counterfactuals \
+  --config experiments/synthetic/cfim/configs/gcn_plus_ppr_diffusion.yaml \
+  --task ppr_diffusion \
+  --device cuda \
+  --backend official_gnnplus
+```
