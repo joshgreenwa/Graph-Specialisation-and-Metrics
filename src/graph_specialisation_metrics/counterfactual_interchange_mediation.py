@@ -1349,7 +1349,7 @@ class CFIMOfficialGRITModel(nn.Module):
         )
         self.output_head = nn.Linear(dim, int(cfg["feature_dimensions"]["target_dim"]))
 
-    def forward(self, batch: CFIMBatch) -> torch.Tensor:
+    def node_states(self, batch: CFIMBatch) -> torch.Tensor:
         pyg_batch = build_pyg_adapter_batch(batch, self.rrwp_steps)
         flat_x = flatten_nodes(batch, batch.x.float())
         pyg_batch.x = self.input_encoder(flat_x)
@@ -1358,7 +1358,13 @@ class CFIMOfficialGRITModel(nn.Module):
         pyg_batch = self.rrwp_edge_encoder(pyg_batch)
         for layer in self.layers:
             pyg_batch = layer(pyg_batch)
-        return pack_flat_nodes(batch, self.output_head(pyg_batch.x))
+        return pack_flat_nodes(batch, pyg_batch.x)
+
+    def readout_from_states(self, batch: CFIMBatch, states: torch.Tensor) -> torch.Tensor:
+        return self.output_head(states) * batch.node_mask.unsqueeze(-1)
+
+    def forward(self, batch: CFIMBatch) -> torch.Tensor:
+        return self.readout_from_states(batch, self.node_states(batch))
 
 
 def build_sparse_pyg_batch(batch: CFIMBatch):
@@ -1479,7 +1485,7 @@ class CFIMOfficialGNNPlusModel(nn.Module):
             pieces.append(torch.log1p(flatten_nodes(batch, batch.degree[..., None].float())))
         return torch.cat(pieces, dim=-1)
 
-    def forward(self, batch: CFIMBatch) -> torch.Tensor:
+    def node_states(self, batch: CFIMBatch) -> torch.Tensor:
         pyg_batch = build_sparse_pyg_batch(batch)
         pyg_batch.x = self.input_encoder(self.input_dropout(self.node_features(batch)))
         if self.edge_encoder is not None:
@@ -1488,7 +1494,13 @@ class CFIMOfficialGNNPlusModel(nn.Module):
             pyg_batch.edge_attr = pyg_batch.orig_edge_attr
         for layer in self.layers:
             pyg_batch = layer(pyg_batch)
-        return pack_flat_nodes(batch, self.output_head(pyg_batch.x))
+        return pack_flat_nodes(batch, pyg_batch.x)
+
+    def readout_from_states(self, batch: CFIMBatch, states: torch.Tensor) -> torch.Tensor:
+        return self.output_head(states) * batch.node_mask.unsqueeze(-1)
+
+    def forward(self, batch: CFIMBatch) -> torch.Tensor:
+        return self.readout_from_states(batch, self.node_states(batch))
 
 
 class LocalGRITStyleLayer(nn.Module):
@@ -1541,12 +1553,18 @@ class CFIMLocalGRITStyleModel(nn.Module):
         )
         self.output_head = nn.Linear(dim, int(cfg["feature_dimensions"]["target_dim"]))
 
-    def forward(self, batch: CFIMBatch) -> torch.Tensor:
+    def node_states(self, batch: CFIMBatch) -> torch.Tensor:
         h = self.input_encoder(batch.x.float()) * batch.node_mask.unsqueeze(-1)
         pair = torch.cat([batch.rrwp.float(), batch.pair_xi.float()], dim=-1)
         for layer in self.layers:
             h = layer(h, pair, batch.node_mask)
-        return self.output_head(h) * batch.node_mask.unsqueeze(-1)
+        return h
+
+    def readout_from_states(self, batch: CFIMBatch, states: torch.Tensor) -> torch.Tensor:
+        return self.output_head(states) * batch.node_mask.unsqueeze(-1)
+
+    def forward(self, batch: CFIMBatch) -> torch.Tensor:
+        return self.readout_from_states(batch, self.node_states(batch))
 
 
 def input_dim_for_task(cfg: Mapping[str, Any], task: str) -> int:

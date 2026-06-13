@@ -1,7 +1,9 @@
 import tempfile
 import csv
+import random
 from pathlib import Path
 
+import numpy as np
 import torch
 
 from graph_specialisation_metrics.core_interpretability_specialisation_metrics import (
@@ -49,6 +51,17 @@ from graph_specialisation_metrics.counterfactual_interchange_mediation import (
     read_csv_dicts,
     summarise_functional_q1_gates,
     summarise_functional_validity_gate,
+)
+from graph_specialisation_metrics.long_range_functional_analysis import (
+    bucket_for_distance,
+    content_relayout_record,
+    content_swap_record,
+    parse_distance_buckets,
+    per_node_linear_readout_deltas,
+    sample_far_block_partner_swaps,
+    sample_lr_swaps,
+    type_compatible_far_relayout,
+    weighted_corr,
 )
 
 
@@ -124,6 +137,84 @@ def test_content_swap_moves_continuous_x_payload_fields():
     assert torch.allclose(swapped.x[:, 0], batch.x[:, 1])
     assert torch.allclose(swapped.payload[:, 1], batch.payload[:, 0])
     assert torch.allclose(swapped.adj, batch.adj)
+
+
+def test_long_range_content_swap_exchanges_all_symbolic_fields_only():
+    cfg = tiny_cfg("nearest_anchor_voronoi")
+    graph = make_graph_record("nearest_anchor_voronoi", 10, 1234, cfg)
+    u, v = 0, 1
+    swapped = content_swap_record(graph, u, v, cfg)
+    assert torch.allclose(swapped["payload"][u], graph["payload"][v])
+    assert torch.allclose(swapped["payload"][v], graph["payload"][u])
+    assert swapped["anchor_indicator"][u] == graph["anchor_indicator"][v]
+    assert swapped["anchor_indicator"][v] == graph["anchor_indicator"][u]
+    assert swapped["anchor_priority"][u] == graph["anchor_priority"][v]
+    assert swapped["anchor_priority"][v] == graph["anchor_priority"][u]
+    assert torch.allclose(swapped["struct"]["adjacency"], graph["struct"]["adjacency"])
+    assert torch.allclose(swapped["struct"]["shortest_path_distance"], graph["struct"]["shortest_path_distance"])
+
+
+def test_long_range_bucket_parser_and_sampler_are_deterministic():
+    cfg = tiny_cfg("ppr_diffusion")
+    graph = make_graph_record("ppr_diffusion", 8, 1235, cfg)
+    buckets = parse_distance_buckets("1,2,3,4,5-6,7-9,10+")
+    assert [bucket_for_distance(d, buckets) for d in [1, 2, 5, 8, 12]] == ["1", "2", "5-6", "7-9", "10+"]
+    kwargs = {
+        "record": graph,
+        "focal_nodes": [0],
+        "buckets": buckets,
+        "broad_random": 5,
+        "targeted_per_bucket": 2,
+    }
+    first = sample_lr_swaps(**kwargs, rng=random.Random(5))
+    second = sample_lr_swaps(**kwargs, rng=random.Random(5))
+    assert first == second
+    assert len({row["swap_id"] for row in first}) == len(first)
+    assert all(row["type_class_u"] == row["type_class_v"] for row in first)
+
+
+def test_long_range_relayout_is_type_compatible_and_moves_symbolic_content():
+    cfg = tiny_cfg("ppr_diffusion")
+    graph = make_graph_record("ppr_diffusion", 8, 1236, cfg)
+    far_nodes = list(range(graph["n"]))
+    old_to_new = type_compatible_far_relayout(graph, far_nodes, random.Random(9))
+    for old, new in old_to_new.items():
+        assert graph["struct"]["degree"][old] == graph["struct"]["degree"][new]
+    relayout = content_relayout_record(graph, old_to_new, cfg, graph_id="relayout")
+    moved = [old for old, new in old_to_new.items() if old != new]
+    if moved:
+        old = moved[0]
+        new = old_to_new[old]
+        assert torch.allclose(relayout["payload"][new], graph["payload"][old])
+    assert torch.allclose(relayout["struct"]["adjacency"], graph["struct"]["adjacency"])
+
+
+def test_long_range_rq4_partner_swaps_are_type_compatible_and_deterministic():
+    cfg = tiny_cfg("ppr_diffusion")
+    graph = make_graph_record("ppr_diffusion", 10, 1237, cfg)
+    far_nodes = list(range(graph["n"]))
+    first = sample_far_block_partner_swaps(graph, far_nodes, partners_per_source=2, rng=random.Random(11))
+    second = sample_far_block_partner_swaps(graph, far_nodes, partners_per_source=2, rng=random.Random(11))
+    assert first == second
+    assert all(row["type_class_u"] == row["type_class_v"] for row in first)
+    assert len({row["swap_id"] for row in first}) == len(first)
+
+
+def test_long_range_linear_readout_p1_p2_identity():
+    y_clean = torch.tensor([[1.0, 2.0], [3.0, -1.0], [0.5, 0.25]])
+    y_source = torch.tensor([[2.0, 1.0], [3.5, 1.0], [-1.0, 0.0]])
+    p1, p2 = per_node_linear_readout_deltas(y_clean, y_source)
+    assert torch.allclose(p1, y_source - y_clean)
+    assert torch.allclose(p2, y_clean - y_source)
+    assert torch.allclose(p1.sum(dim=0), y_source.sum(dim=0) - y_clean.sum(dim=0))
+    assert torch.allclose(p1, -p2)
+
+
+def test_long_range_weighted_corr_uses_positive_finite_weights():
+    x = np.array([0.0, 1.0, 2.0, np.nan])
+    y = np.array([0.0, 2.0, 4.0, 10.0])
+    w = np.array([1.0, 0.0, 1.0, 1.0])
+    assert weighted_corr(x, y, w) > 0.999
 
 
 def test_functional_distance_strata_for_two_layer_gnn():
