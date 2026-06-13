@@ -311,6 +311,9 @@ def sample_lr_swaps(
     buckets: Sequence[DistanceBucket],
     broad_random: int,
     targeted_per_bucket: int,
+    sampler_mode: str = "default",
+    voronoi_anchor_swaps_per_bucket: int = 0,
+    allow_cross_type_anchor_swaps: bool = True,
     rng: random.Random,
 ) -> list[dict[str, Any]]:
     n = int(record["n"])
@@ -322,10 +325,23 @@ def sample_lr_swaps(
     rng.shuffle(candidates)
     selected: dict[tuple[int, int], dict[str, Any]] = {}
 
-    def add_pair(u: int, v: int, source: str, focal: int | None = None, bucket: str | None = None) -> None:
+    def add_pair(
+        u: int,
+        v: int,
+        source: str,
+        focal: int | None = None,
+        bucket: str | None = None,
+        distance_basis: str | None = None,
+        anchor_role: str | None = None,
+    ) -> None:
         key = tuple(sorted((int(u), int(v))))
         if key in selected:
             selected[key]["sample_source"] = selected[key]["sample_source"] + f"+{source}"
+            if focal is not None and selected[key]["target_focal"] == "":
+                selected[key]["target_focal"] = int(focal)
+                selected[key]["target_bucket"] = "" if bucket is None else bucket
+                selected[key]["distance_basis"] = "" if distance_basis is None else distance_basis
+                selected[key]["anchor_role"] = "" if anchor_role is None else anchor_role
             return
         selected[key] = {
             "u": key[0],
@@ -333,6 +349,8 @@ def sample_lr_swaps(
             "sample_source": source,
             "target_focal": "" if focal is None else int(focal),
             "target_bucket": "" if bucket is None else bucket,
+            "distance_basis": "" if distance_basis is None else distance_basis,
+            "anchor_role": "" if anchor_role is None else anchor_role,
         }
 
     for u, v in candidates[: int(broad_random)]:
@@ -348,7 +366,46 @@ def sample_lr_swaps(
                     pool.append((u, v))
             rng.shuffle(pool)
             for u, v in pool[: int(targeted_per_bucket)]:
-                add_pair(u, v, "targeted_bucket_equidistant", int(focal), bucket.name)
+                add_pair(u, v, "targeted_bucket_equidistant", int(focal), bucket.name, "equidistant_swap_shell", "")
+
+    if sampler_mode == "voronoi_anchor_aware":
+        if record["task"] != "nearest_anchor_voronoi":
+            raise ValueError("voronoi_anchor_aware sampler is only valid for nearest_anchor_voronoi")
+        anchors = torch.nonzero(record["anchor_indicator"] > 0.5, as_tuple=False).reshape(-1).tolist()
+        anchor_set = {int(node) for node in anchors}
+
+        def allowed(u: int, v: int) -> bool:
+            return bool(allow_cross_type_anchor_swaps) or type_compatibility_class(record, u) == type_compatibility_class(record, v)
+
+        for focal in focal_nodes:
+            assigned_anchor = int(torch.argmax(record["teacher"]["K"][int(focal)]).item())
+            for bucket in buckets:
+                pool = []
+                for partner in range(n):
+                    if int(partner) == assigned_anchor:
+                        continue
+                    if not bucket.contains(int(spd[int(focal), int(partner)])):
+                        continue
+                    if not allowed(assigned_anchor, int(partner)):
+                        continue
+                    if int(partner) in anchor_set:
+                        role = "assigned_anchor_vs_competing_anchor"
+                    else:
+                        role = "assigned_anchor_vs_non_anchor"
+                    pool.append((assigned_anchor, int(partner), role))
+                rng.shuffle(pool)
+                for u, v, role in pool[: int(voronoi_anchor_swaps_per_bucket)]:
+                    add_pair(
+                        u,
+                        v,
+                        "voronoi_anchor_aware",
+                        int(focal),
+                        bucket.name,
+                        "focal_to_anchor_partner",
+                        role,
+                    )
+    elif sampler_mode != "default":
+        raise ValueError(f"unknown long-range sampler mode: {sampler_mode}")
 
     rows = []
     for swap_idx, row in enumerate(selected.values()):
@@ -468,6 +525,9 @@ def compute_graph_cache(
     focal_count: int,
     broad_random: int,
     targeted_per_bucket: int,
+    sampler_mode: str,
+    voronoi_anchor_swaps_per_bucket: int,
+    allow_cross_type_anchor_swaps: bool,
     batch_size: int,
     device: torch.device,
 ) -> dict[str, Any]:
@@ -479,6 +539,9 @@ def compute_graph_cache(
         buckets=buckets,
         broad_random=broad_random,
         targeted_per_bucket=targeted_per_bucket,
+        sampler_mode=sampler_mode,
+        voronoi_anchor_swaps_per_bucket=voronoi_anchor_swaps_per_bucket,
+        allow_cross_type_anchor_swaps=allow_cross_type_anchor_swaps,
         rng=rng,
     )
     clean_states, clean_outputs = model_states_and_outputs(model, [record], batch_size=1, device=device)
@@ -553,7 +616,14 @@ def compute_graph_cache(
         for focal in focal_nodes:
             du = int(spd[int(focal), int(swap["u"])])
             dv = int(spd[int(focal), int(swap["v"])])
-            bucket = bucket_for_distance(du, buckets) if bucket_for_distance(du, buckets) == bucket_for_distance(dv, buckets) else None
+            target_focal = swap.get("target_focal", "")
+            target_bucket = str(swap.get("target_bucket", ""))
+            if target_focal != "" and int(target_focal) == int(focal) and target_bucket:
+                bucket = target_bucket
+                distance_basis = str(swap.get("distance_basis", "focal_to_anchor_partner"))
+            else:
+                bucket = bucket_for_distance(du, buckets) if bucket_for_distance(du, buckets) == bucket_for_distance(dv, buckets) else None
+                distance_basis = "equidistant_swap_shell"
             if bucket is None:
                 continue
             effect_rows.append(
@@ -567,6 +637,9 @@ def compute_graph_cache(
                     "distance_bucket": bucket,
                     "d_u_focal": du,
                     "d_v_focal": dv,
+                    "distance_basis": distance_basis,
+                    "sample_source": str(swap.get("sample_source", "")),
+                    "anchor_role": str(swap.get("anchor_role", "")),
                     "feature_l2": feature_l2,
                     "oracle_node_delta": float(node_oracle[int(focal)]),
                     "model_node_delta": float(node_model[int(focal)]),
@@ -648,6 +721,9 @@ def build_long_range_cache(
     focal_nodes: int = 3,
     broad_random_swaps: int = 160,
     targeted_swaps_per_bucket: int = 12,
+    sampler_mode: str = "default",
+    voronoi_anchor_swaps_per_bucket: int = 0,
+    allow_cross_type_anchor_swaps: bool = True,
     batch_size: int = 512,
     device_name: str = "auto",
     config_path: Path | None = None,
@@ -666,6 +742,7 @@ def build_long_range_cache(
     print(
         f"[long-range-cache] start task={task} split={split} graphs={len(records)} "
         f"broad_random={int(broad_random_swaps)} targeted_per_bucket={int(targeted_swaps_per_bucket)} "
+        f"sampler_mode={sampler_mode} voronoi_anchor_per_bucket={int(voronoi_anchor_swaps_per_bucket)} "
         f"batch_size={int(batch_size)} device={device}",
         flush=True,
     )
@@ -696,6 +773,9 @@ def build_long_range_cache(
                 focal_count=focal_nodes,
                 broad_random=broad_random_swaps,
                 targeted_per_bucket=targeted_swaps_per_bucket,
+                sampler_mode=sampler_mode,
+                voronoi_anchor_swaps_per_bucket=voronoi_anchor_swaps_per_bucket,
+                allow_cross_type_anchor_swaps=allow_cross_type_anchor_swaps,
                 batch_size=batch_size,
                 device=device,
             )
@@ -722,6 +802,9 @@ def build_long_range_cache(
             "centrality_measure": "betweenness_centrality",
             "normaliser": "symbolic_feature_l2",
             "type_compatibility_class": "degree",
+            "sampler_mode": sampler_mode,
+            "voronoi_anchor_swaps_per_bucket": int(voronoi_anchor_swaps_per_bucket),
+            "allow_cross_type_anchor_swaps": bool(allow_cross_type_anchor_swaps),
             "readout_definition": "sum over node-regression outputs for pooled P1/P2 diagnostics; direct node outputs for node-level primary deltas",
             "checkpoint": str(checkpoint) if checkpoint is not None else "default best.pt",
             "graphs": manifest_graphs,
@@ -1809,6 +1892,9 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--focal-nodes", type=int, default=3)
     p.add_argument("--broad-random-swaps", type=int, default=160)
     p.add_argument("--targeted-swaps-per-bucket", type=int, default=12)
+    p.add_argument("--sampler-mode", choices=("default", "voronoi_anchor_aware"), default="default")
+    p.add_argument("--voronoi-anchor-swaps-per-bucket", type=int, default=0)
+    p.add_argument("--strict-type-compatible-anchor-swaps", action="store_true")
     p.add_argument("--batch-size", type=int, default=512)
     p.add_argument("--device", default="auto")
     p.add_argument("--model-config", type=Path)
@@ -1862,6 +1948,9 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--focal-nodes", type=int, default=3)
     p.add_argument("--broad-random-swaps", type=int, default=160)
     p.add_argument("--targeted-swaps-per-bucket", type=int, default=12)
+    p.add_argument("--sampler-mode", choices=("default", "voronoi_anchor_aware"), default="default")
+    p.add_argument("--voronoi-anchor-swaps-per-bucket", type=int, default=0)
+    p.add_argument("--strict-type-compatible-anchor-swaps", action="store_true")
     p.add_argument("--batch-size", type=int, default=512)
     p.add_argument("--device", default="auto")
     p.add_argument("--model-config", type=Path)
@@ -1897,6 +1986,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             focal_nodes=args.focal_nodes,
             broad_random_swaps=args.broad_random_swaps,
             targeted_swaps_per_bucket=args.targeted_swaps_per_bucket,
+            sampler_mode=args.sampler_mode,
+            voronoi_anchor_swaps_per_bucket=args.voronoi_anchor_swaps_per_bucket,
+            allow_cross_type_anchor_swaps=not bool(args.strict_type_compatible_anchor_swaps),
             batch_size=args.batch_size,
             device_name=args.device,
             config_path=args.model_config,
@@ -1953,6 +2045,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             focal_nodes=args.focal_nodes,
             broad_random_swaps=args.broad_random_swaps,
             targeted_swaps_per_bucket=args.targeted_swaps_per_bucket,
+            sampler_mode=args.sampler_mode,
+            voronoi_anchor_swaps_per_bucket=args.voronoi_anchor_swaps_per_bucket,
+            allow_cross_type_anchor_swaps=not bool(args.strict_type_compatible_anchor_swaps),
             batch_size=args.batch_size,
             device_name=args.device,
             config_path=args.model_config,

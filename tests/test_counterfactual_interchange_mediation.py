@@ -173,6 +173,30 @@ def test_long_range_bucket_parser_and_sampler_are_deterministic():
     assert all(row["type_class_u"] == row["type_class_v"] for row in first)
 
 
+def test_long_range_voronoi_anchor_aware_sampler_targets_assigned_anchor():
+    cfg = tiny_cfg("nearest_anchor_voronoi")
+    graph = make_graph_record("nearest_anchor_voronoi", 10, 12355, cfg)
+    buckets = parse_distance_buckets("1,2,3,4,5-6,7-9,10+")
+    focal = 0
+    assigned_anchor = int(torch.argmax(graph["teacher"]["K"][focal]).item())
+    rows = sample_lr_swaps(
+        graph,
+        focal_nodes=[focal],
+        buckets=buckets,
+        broad_random=0,
+        targeted_per_bucket=0,
+        sampler_mode="voronoi_anchor_aware",
+        voronoi_anchor_swaps_per_bucket=4,
+        rng=random.Random(19),
+    )
+    targeted = [row for row in rows if "voronoi_anchor_aware" in row["sample_source"]]
+    assert targeted
+    assert any(assigned_anchor in {row["u"], row["v"]} for row in targeted)
+    assert all(row["target_focal"] == focal for row in targeted)
+    assert all(row["target_bucket"] for row in targeted)
+    assert {row["distance_basis"] for row in targeted} == {"focal_to_anchor_partner"}
+
+
 def test_long_range_relayout_is_type_compatible_and_moves_symbolic_content():
     cfg = tiny_cfg("ppr_diffusion")
     graph = make_graph_record("ppr_diffusion", 8, 1236, cfg)
