@@ -1,7 +1,7 @@
 #!/bin/bash
-#SBATCH -J min-order-full
-#SBATCH -o logs/min-order-full-%j.out
-#SBATCH -e logs/min-order-full-%j.err
+#SBATCH -J min-order-v2
+#SBATCH -o logs/min-order-v2-%j.out
+#SBATCH -e logs/min-order-v2-%j.err
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
@@ -23,18 +23,16 @@ mkdir -p logs
 
 python -u -m graph_specialisation_metrics.minimal_order_dissociation_experiment run-all \
   --output-root "${MOD_OUTPUT_ROOT}" \
-  --tasks "${MOD_TASKS:-add,rel}" \
-  --models "${MOD_MODELS:-mpnn,mpnn_vn,gt,nope_gt}" \
+  --tasks "${MOD_TASKS:-add,prod,gap}" \
+  --models "${MOD_MODELS:-mpnn,mpnn_vn,nope_gt,gt_route,gt_full}" \
   --seeds "${MOD_SEEDS:-1001,1002,1003}" \
   --n-nodes "${MOD_N_NODES:-32}" \
   --receptive-radius "${MOD_RECEPTIVE_RADIUS:-4}" \
-  --alphabet-size "${MOD_ALPHABET_SIZE:-4}" \
   --train-size "${MOD_TRAIN_SIZE:-5000}" \
   --val-size "${MOD_VAL_SIZE:-1000}" \
   --test-size "${MOD_TEST_SIZE:-1000}" \
   --data-seed "${MOD_DATA_SEED:-7001}" \
   --hidden-dim "${MOD_HIDDEN_DIM:-128}" \
-  --gt-layers "${MOD_GT_LAYERS:-3}" \
   --gt-heads "${MOD_GT_HEADS:-4}" \
   --batch-size "${MOD_BATCH_SIZE:-1024}" \
   --eval-batch-size "${MOD_EVAL_BATCH_SIZE:-2048}" \
@@ -44,5 +42,6 @@ python -u -m graph_specialisation_metrics.minimal_order_dissociation_experiment 
   --weight-decay "${MOD_WEIGHT_DECAY:-0.0001}" \
   --resamples-per-site "${MOD_RESAMPLES_PER_SITE:-4}" \
   --rq3-seed "${MOD_RQ3_SEED:-8101}" \
+  --min-oracle-effect "${MOD_MIN_ORACLE_EFFECT:-0.0001}" \
   --log-every "${MOD_LOG_EVERY:-20}" \
   --device cuda
