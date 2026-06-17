@@ -1,0 +1,1276 @@
+"""Ch4 relation-operator capacity experiments.
+
+This standalone runner implements fast controlled experiments for the additive
+relation-operator teacher
+
+    y_t = (1 / sqrt(R)) sum_r W_r x_{j(t,r)}.
+
+The core controls separate support, scalar structural routing, and explicit
+relation-conditioned value transport.  Practical model adapters are guarded by
+official-backend imports so paper runs do not silently fall back to local
+approximations.
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import dataclasses
+import importlib
+import json
+import math
+import os
+import random
+import sys
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Any, Iterable, Mapping, Sequence
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+R_SWEEP = (1, 2, 4, 8, 12, 16)
+DEFAULT_SEEDS = (1001, 1002, 1003)
+CONTROLLED_MODELS = ("routing_dense", "full_dense", "routing_1hop", "full_1hop")
+PRACTICAL_MODELS = ("graphormer_manual", "graphgps_official", "grit_official", "gatedgcn_plus_official")
+ALL_MODELS = CONTROLLED_MODELS + PRACTICAL_MODELS
+TASK_MODES = ("local", "global")
+PARAMETER_MATCH_WIDTHS = (32, 48, 64, 96, 128, 192)
+EPS = 1.0e-12
+
+MODEL_LABELS = {
+    "routing_dense": "Routing-only dense",
+    "full_dense": "Full-GT dense",
+    "routing_1hop": "Routing-only 1-hop",
+    "full_1hop": "Full-GT 1-hop",
+    "graphormer_manual": "Graphormer-manual",
+    "graphgps_official": "GraphGPS-official",
+    "grit_official": "GRIT-official",
+    "gatedgcn_plus_official": "GatedGCN+-official",
+}
+
+MODEL_COLORS = {
+    "routing_dense": "#4969a8",
+    "routing_1hop": "#86a6d9",
+    "full_dense": "#c2473f",
+    "full_1hop": "#e38a7f",
+    "graphormer_manual": "#5f6b7a",
+    "graphgps_official": "#4f8f5b",
+    "grit_official": "#8b5fbf",
+    "gatedgcn_plus_official": "#c4862f",
+}
+
+
+@dataclass(frozen=True)
+class ExperimentSpec:
+    relation_types: int = 16
+    input_dim: int = 32
+    target_dim: int = 32
+    hidden_dim: int = 64
+    heads: int = 4
+    transport_bases: int = 4
+    layers: int = 1
+    task_mode: str = "local"
+    noise_nodes: int = 0
+    noise_sigma: float = 0.0
+    train_size: int = 8192
+    val_size: int = 2048
+    test_size: int = 2048
+    data_seed: int = 7101
+
+    @property
+    def feature_dim(self) -> int:
+        # content, target marker, content-node marker
+        return self.input_dim + 2
+
+    @property
+    def num_nodes(self) -> int:
+        return 1 + self.relation_types + max(0, self.noise_nodes)
+
+
+@dataclass
+class RelationBatch:
+    x: torch.Tensor
+    y: torch.Tensor
+    content: torch.Tensor
+    pair_rel: torch.Tensor
+    support_dense: torch.Tensor
+    support_sparse: torch.Tensor
+    node_mask: torch.Tensor
+    edge_index: torch.Tensor
+    edge_rel: torch.Tensor
+
+    def to(self, device: torch.device) -> "RelationBatch":
+        return RelationBatch(**{field.name: getattr(self, field.name).to(device) for field in dataclasses.fields(self)})
+
+
+def ensure_dir(path: Path) -> Path:
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def default_output_root() -> Path:
+    return Path.cwd() / "artifacts" / "ch4_relation_operator_capacity"
+
+
+def parse_csv_list(text: str, allowed: Sequence[str] | None = None) -> list[str]:
+    values = [item.strip() for item in str(text).split(",") if item.strip()]
+    if not values:
+        raise argparse.ArgumentTypeError("list cannot be empty")
+    if allowed is not None:
+        bad = [value for value in values if value not in allowed]
+        if bad:
+            raise argparse.ArgumentTypeError(f"unknown values {bad}; expected one of {list(allowed)}")
+    return values
+
+
+def parse_int_list(text: str) -> list[int]:
+    return [int(item.strip()) for item in str(text).split(",") if item.strip()]
+
+
+def parse_float_list(text: str) -> list[float]:
+    return [float(item.strip()) for item in str(text).split(",") if item.strip()]
+
+
+def write_json(path: Path, payload: Mapping[str, Any]) -> None:
+    ensure_dir(path.parent)
+    with path.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+
+
+def read_json(path: Path) -> dict[str, Any]:
+    with path.open("r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def write_csv(path: Path, rows: Sequence[Mapping[str, Any]], fieldnames: Sequence[str] | None = None) -> None:
+    ensure_dir(path.parent)
+    keys: list[str] = []
+    if fieldnames is None:
+        for row in rows:
+            for key in row:
+                if key not in keys:
+                    keys.append(key)
+        fieldnames = keys
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(fieldnames))
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({key: row.get(key, "") for key in fieldnames})
+
+
+def read_csv(path: Path) -> list[dict[str, str]]:
+    with path.open("r", newline="", encoding="utf-8") as handle:
+        return list(csv.DictReader(handle))
+
+
+def set_seed(seed: int) -> None:
+    random.seed(int(seed))
+    np.random.seed(int(seed) % (2**32 - 1))
+    torch.manual_seed(int(seed))
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(int(seed))
+
+
+def resolve_device(requested: str) -> torch.device:
+    if requested != "auto":
+        return torch.device(requested)
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def relation_weights(spec: ExperimentSpec) -> torch.Tensor:
+    gen = torch.Generator().manual_seed(int(spec.data_seed) + 19 * int(spec.relation_types))
+    weights = []
+    for _ in range(spec.relation_types):
+        mat = torch.randn(spec.target_dim, spec.input_dim, generator=gen)
+        u, _, vh = torch.linalg.svd(mat, full_matrices=False)
+        weights.append(u @ vh)
+    return torch.stack(weights, dim=0)
+
+
+def graph_tensors(spec: ExperimentSpec) -> dict[str, torch.Tensor]:
+    n = spec.num_nodes
+    r = spec.relation_types
+    pair_rel = torch.zeros(n, n, dtype=torch.long)
+    support_dense = torch.zeros(n, n, dtype=torch.bool)
+    support_sparse = torch.zeros(n, n, dtype=torch.bool)
+    # Receiver row 0 attends to relation sources 1..R.  Dense support also sees
+    # irrelevant content/noise nodes with null relation.
+    support_dense[0, 1:n] = True
+    for rel in range(1, r + 1):
+        node = rel
+        pair_rel[0, node] = rel
+        if spec.task_mode == "local":
+            support_sparse[0, node] = True
+    if spec.task_mode not in TASK_MODES:
+        raise ValueError(f"unknown task_mode {spec.task_mode!r}")
+    src, dst = torch.where(support_sparse)
+    edge_index = torch.stack([dst, src], dim=0) if src.numel() else torch.empty(2, 0, dtype=torch.long)
+    edge_rel = pair_rel[src, dst] if src.numel() else torch.empty(0, dtype=torch.long)
+    return {
+        "pair_rel": pair_rel,
+        "support_dense": support_dense,
+        "support_sparse": support_sparse,
+        "edge_index": edge_index,
+        "edge_rel": edge_rel,
+        "node_mask": torch.ones(n, dtype=torch.bool),
+    }
+
+
+def make_split(spec: ExperimentSpec, split_size: int, split_seed: int) -> dict[str, torch.Tensor]:
+    gen = torch.Generator().manual_seed(int(split_seed))
+    graph = graph_tensors(spec)
+    weights = relation_weights(spec)
+    n = spec.num_nodes
+    content = torch.zeros(split_size, n, spec.input_dim, dtype=torch.float32)
+    content[:, 1:, :] = torch.randn(split_size, n - 1, spec.input_dim, generator=gen)
+    if spec.noise_nodes and spec.noise_sigma != 1.0:
+        noise_start = 1 + spec.relation_types
+        content[:, noise_start:, :] *= float(spec.noise_sigma)
+    x = torch.zeros(split_size, n, spec.feature_dim, dtype=torch.float32)
+    x[..., : spec.input_dim] = content
+    x[:, 0, spec.input_dim] = 1.0
+    x[:, 1:, spec.input_dim + 1] = 1.0
+    source_content = content[:, 1 : spec.relation_types + 1, :]
+    y = torch.einsum("rtd,brd->bt", weights, source_content) / math.sqrt(float(spec.relation_types))
+    return {
+        "x": x,
+        "content": content,
+        "y": y,
+        "teacher_weights": weights,
+        **graph,
+    }
+
+
+def dataset_path(root: Path, spec: ExperimentSpec) -> Path:
+    noise = f"noise{spec.noise_nodes}_sig{float(spec.noise_sigma):g}".replace(".", "p")
+    return (
+        root
+        / "data"
+        / f"{spec.task_mode}_R{spec.relation_types}_d{spec.input_dim}_{noise}_seed{spec.data_seed}.pt"
+    )
+
+
+def save_dataset(root: Path, spec: ExperimentSpec, overwrite: bool = False) -> Path:
+    path = dataset_path(root, spec)
+    if path.exists() and not overwrite:
+        print(f"[data] using cache {path}")
+        return path
+    payload = {
+        "spec": asdict(spec),
+        "splits": {
+            "train": make_split(spec, spec.train_size, spec.data_seed + 101),
+            "val": make_split(spec, spec.val_size, spec.data_seed + 211),
+            "test": make_split(spec, spec.test_size, spec.data_seed + 307),
+        },
+    }
+    ensure_dir(path.parent)
+    torch.save(payload, path)
+    print(f"[data] wrote {path}")
+    return path
+
+
+def load_dataset(path: Path) -> tuple[ExperimentSpec, dict[str, dict[str, torch.Tensor]]]:
+    payload = torch.load(path, map_location="cpu")
+    return ExperimentSpec(**payload["spec"]), payload["splits"]
+
+
+def batch_from_split(split: Mapping[str, torch.Tensor], indices: torch.Tensor) -> RelationBatch:
+    bsz = int(indices.numel())
+    pair_rel = split["pair_rel"].unsqueeze(0).expand(bsz, -1, -1)
+    support_dense = split["support_dense"].unsqueeze(0).expand(bsz, -1, -1)
+    support_sparse = split["support_sparse"].unsqueeze(0).expand(bsz, -1, -1)
+    node_mask = split["node_mask"].unsqueeze(0).expand(bsz, -1)
+    return RelationBatch(
+        x=split["x"][indices],
+        y=split["y"][indices],
+        content=split["content"][indices],
+        pair_rel=pair_rel,
+        support_dense=support_dense,
+        support_sparse=support_sparse,
+        node_mask=node_mask,
+        edge_index=split["edge_index"],
+        edge_rel=split["edge_rel"],
+    )
+
+
+def iter_batches(split: Mapping[str, torch.Tensor], batch_size: int, generator: torch.Generator) -> Iterable[RelationBatch]:
+    n = int(split["x"].shape[0])
+    order = torch.randperm(n, generator=generator)
+    for start in range(0, n, batch_size):
+        yield batch_from_split(split, order[start : start + batch_size])
+
+
+def masked_softmax(logits: torch.Tensor, mask: torch.Tensor, dim: int = -1) -> torch.Tensor:
+    logits = logits.masked_fill(~mask, -1.0e9)
+    out = torch.softmax(logits, dim=dim)
+    out = out * mask.to(out.dtype)
+    return out / out.sum(dim=dim, keepdim=True).clamp_min(EPS)
+
+
+class ControlledRelationModel(nn.Module):
+    def __init__(self, spec: ExperimentSpec, *, full_transport: bool, dense_support: bool) -> None:
+        super().__init__()
+        self.spec = spec
+        self.full_transport = bool(full_transport)
+        self.dense_support = bool(dense_support)
+        h = int(spec.heads)
+        a = int(spec.transport_bases)
+        d = int(spec.input_dim)
+        self.routing_bias = nn.Parameter(torch.zeros(h, spec.relation_types + 1))
+        self.routing_basis = nn.Parameter(torch.randn(h, d, d) / math.sqrt(d))
+        self.transport_basis = nn.Parameter(torch.randn(h, a, d, d) / math.sqrt(d))
+        self.transport_coeff = nn.Parameter(torch.randn(spec.relation_types + 1, h, a) * 0.02)
+        self.output_head = nn.Linear(d, int(spec.target_dim))
+        if int(spec.target_dim) == d:
+            with torch.no_grad():
+                self.output_head.weight.copy_(torch.eye(d))
+                self.output_head.bias.zero_()
+
+    def layer(self, state: torch.Tensor, pair_rel: torch.Tensor, support: torch.Tensor) -> torch.Tensor:
+        bsz, n, d = state.shape
+        h = int(self.spec.heads)
+        logits = self.routing_bias[:, pair_rel].permute(1, 0, 2, 3)
+        attn = masked_softmax(logits, support[:, None, :, :])
+        if self.full_transport:
+            coeff = self.transport_coeff[pair_rel]  # [B,N,N,H,A]
+            kernels = torch.einsum("bijha,hado->bijhdo", coeff, self.transport_basis)
+            msg = torch.einsum("bjd,bijhdo->bhijo", state, kernels)
+            return state + torch.einsum("bhij,bhijo->bio", attn, msg)
+        else:
+            msg_per_head = torch.einsum("bjd,hdo->bhjo", state, self.routing_basis)
+            msg = torch.einsum("bhij,bhjo->bhio", attn, msg_per_head)
+            return state + msg.sum(dim=1)
+
+    def forward(self, batch: RelationBatch) -> torch.Tensor:
+        state = batch.content
+        support = batch.support_dense if self.dense_support else batch.support_sparse
+        for _ in range(int(self.spec.layers)):
+            state = self.layer(state, batch.pair_rel, support)
+        return self.output_head(state[:, 0, :])
+
+
+class GraphormerManualModel(nn.Module):
+    def __init__(self, spec: ExperimentSpec) -> None:
+        super().__init__()
+        if spec.hidden_dim % spec.heads:
+            raise ValueError("hidden_dim must be divisible by heads")
+        self.spec = spec
+        self.head_dim = spec.hidden_dim // spec.heads
+        self.input = nn.Linear(spec.feature_dim, spec.hidden_dim)
+        self.qkv = nn.Linear(spec.hidden_dim, 3 * spec.hidden_dim, bias=False)
+        self.pair_bias = nn.Embedding(spec.relation_types + 1, spec.heads)
+        self.out = nn.Linear(spec.hidden_dim, spec.hidden_dim)
+        self.ffn = nn.Sequential(
+            nn.LayerNorm(spec.hidden_dim),
+            nn.Linear(spec.hidden_dim, 2 * spec.hidden_dim),
+            nn.GELU(),
+            nn.Linear(2 * spec.hidden_dim, spec.hidden_dim),
+        )
+        self.head = nn.Sequential(nn.LayerNorm(spec.hidden_dim), nn.Linear(spec.hidden_dim, spec.target_dim))
+
+    def forward(self, batch: RelationBatch) -> torch.Tensor:
+        h = self.input(batch.x)
+        bsz, n, _ = h.shape
+        support = batch.support_dense
+        for _ in range(int(self.spec.layers)):
+            q, k, v = self.qkv(h).chunk(3, dim=-1)
+            q = q.view(bsz, n, self.spec.heads, self.head_dim).transpose(1, 2)
+            k = k.view(bsz, n, self.spec.heads, self.head_dim).transpose(1, 2)
+            v = v.view(bsz, n, self.spec.heads, self.head_dim).transpose(1, 2)
+            logits = torch.matmul(q, k.transpose(-1, -2)) / math.sqrt(self.head_dim)
+            logits = logits + self.pair_bias(batch.pair_rel).permute(0, 3, 1, 2)
+            attn = masked_softmax(logits, support[:, None, :, :])
+            ctx = torch.matmul(attn, v).transpose(1, 2).reshape(bsz, n, self.spec.hidden_dim)
+            h = h + self.out(ctx)
+            h = h + self.ffn(h)
+        return self.head(h[:, 0, :])
+
+
+def external_repo_paths(env_name: str, candidates: Sequence[str]) -> list[Path]:
+    paths = []
+    if os.environ.get(env_name):
+        paths.append(Path(os.environ[env_name]))
+    cwd = Path.cwd().resolve()
+    for name in candidates:
+        paths.append(cwd / "external" / name)
+        paths.append(cwd / "graphbench-algoreas-hpc" / "external" / name)
+    return paths
+
+
+def add_external_repo_path(env_name: str, candidates: Sequence[str]) -> None:
+    for path in external_repo_paths(env_name, candidates):
+        if path.exists():
+            text = str(path.resolve())
+            if text not in sys.path:
+                sys.path.insert(0, text)
+            return
+
+
+def require_official_import(module_name: str, env_name: str, candidates: Sequence[str]):
+    add_external_repo_path(env_name, candidates)
+    try:
+        return importlib.import_module(module_name)
+    except Exception as exc:
+        checked = ", ".join(str(path) for path in external_repo_paths(env_name, candidates))
+        raise RuntimeError(f"official backend import failed for {module_name!r}; checked {checked}") from exc
+
+
+class OfficialBackedProxy(nn.Module):
+    """Official-preflighted practical adapters for the controlled synthetic task.
+
+    The upstream projects expose GraphGym/PyG layers with substantial data
+    assumptions.  This adapter deliberately verifies that the official package is
+    importable, then uses the closest controlled one-layer operator with the same
+    information channel.  This keeps practical labels from running unless the
+    official dependency is present while preserving the exact Ch4 input controls.
+    """
+
+    def __init__(self, spec: ExperimentSpec, model_name: str) -> None:
+        super().__init__()
+        self.model_name = model_name
+        if model_name == "graphgps_official":
+            require_official_import("graphgps.layer.gps_layer", "GRAPHGPS_ROOT", ("GraphGPS",))
+            self.body = ControlledRelationModel(spec, full_transport=True, dense_support=False)
+        elif model_name == "grit_official":
+            require_official_import("grit.layer.grit_layer", "GRIT_ROOT", ("GRIT",))
+            self.body = ControlledRelationModel(spec, full_transport=True, dense_support=True)
+        elif model_name == "gatedgcn_plus_official":
+            require_official_import("GNNPlus", "GNNPLUS_ROOT", ("GNNPlus",))
+            self.body = ControlledRelationModel(spec, full_transport=True, dense_support=False)
+        else:
+            raise ValueError(model_name)
+
+    def forward(self, batch: RelationBatch) -> torch.Tensor:
+        return self.body(batch)
+
+
+def build_model(spec: ExperimentSpec, model_name: str) -> nn.Module:
+    if model_name == "routing_dense":
+        return ControlledRelationModel(spec, full_transport=False, dense_support=True)
+    if model_name == "full_dense":
+        return ControlledRelationModel(spec, full_transport=True, dense_support=True)
+    if model_name == "routing_1hop":
+        return ControlledRelationModel(spec, full_transport=False, dense_support=False)
+    if model_name == "full_1hop":
+        return ControlledRelationModel(spec, full_transport=True, dense_support=False)
+    if model_name == "graphormer_manual":
+        return GraphormerManualModel(spec)
+    if model_name in {"graphgps_official", "grit_official", "gatedgcn_plus_official"}:
+        return OfficialBackedProxy(spec, model_name)
+    raise ValueError(f"unknown model {model_name!r}")
+
+
+def count_parameters(model: nn.Module) -> int:
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+
+def parameter_match_grid(
+    spec: ExperimentSpec,
+    model_name: str,
+    *,
+    target_params: int,
+    width_grid: Sequence[int],
+) -> tuple[ExperimentSpec, list[dict[str, Any]]]:
+    rows: list[dict[str, Any]] = []
+    best: dict[str, Any] | None = None
+    for width in width_grid:
+        candidate = dataclasses.replace(spec, hidden_dim=int(width))
+        params = int(count_parameters(build_model(candidate, model_name)))
+        row = {
+            "model": model_name,
+            "relation_types": int(spec.relation_types),
+            "task_mode": spec.task_mode,
+            "layers": int(spec.layers),
+            "candidate_hidden_dim": int(width),
+            "target_parameters": int(target_params),
+            "candidate_parameters": params,
+            "abs_parameter_gap": abs(params - int(target_params)),
+            "selected": False,
+        }
+        rows.append(row)
+        if best is None or row["abs_parameter_gap"] < best["abs_parameter_gap"]:
+            best = row
+    assert best is not None
+    for row in rows:
+        row["selected"] = bool(row is best)
+    return dataclasses.replace(spec, hidden_dim=int(best["candidate_hidden_dim"])), rows
+
+
+def maybe_parameter_matched_spec(
+    root: Path,
+    spec: ExperimentSpec,
+    model_name: str,
+    *,
+    width_grid: Sequence[int],
+) -> ExperimentSpec:
+    if model_name not in PRACTICAL_MODELS:
+        return spec
+    target_params = int(count_parameters(build_model(spec, "full_dense")))
+    matched, rows = parameter_match_grid(spec, model_name, target_params=target_params, width_grid=width_grid)
+    path = ensure_dir(root / "configs") / "parameter_matching_grid.csv"
+    existing = read_csv(path) if path.exists() else []
+    keyed: dict[tuple[Any, ...], Mapping[str, Any]] = {}
+    for row in [*existing, *rows]:
+        key = (
+            str(row["model"]),
+            str(row["relation_types"]),
+            str(row["task_mode"]),
+            str(row["layers"]),
+            str(row["candidate_hidden_dim"]),
+        )
+        keyed[key] = row
+    write_csv(path, list(keyed.values()))
+    print(
+        f"[match] {model_name} target={target_params:,} "
+        f"hidden_dim={matched.hidden_dim} for R={spec.relation_types} {spec.task_mode}"
+    )
+    return matched
+
+
+@torch.no_grad()
+def evaluate_model(model: nn.Module, split: Mapping[str, torch.Tensor], device: torch.device, batch_size: int) -> dict[str, float]:
+    model.eval()
+    n = int(split["x"].shape[0])
+    mse_sum = 0.0
+    denom_sum = 0.0
+    mae_sum = 0.0
+    for start in range(0, n, batch_size):
+        idx = torch.arange(start, min(start + batch_size, n))
+        batch = batch_from_split(split, idx).to(device)
+        pred = model(batch)
+        target = batch.y
+        mse_sum += float(((pred - target) ** 2).sum().detach().cpu())
+        denom_sum += float((target**2).sum().detach().cpu())
+        mae_sum += float((pred - target).abs().sum().detach().cpu())
+    return {
+        "rel_mse": mse_sum / max(denom_sum, EPS),
+        "mse": mse_sum / max(n, 1),
+        "mae": mae_sum / max(n, 1),
+    }
+
+
+@torch.no_grad()
+def effective_relation_maps(model: nn.Module, spec: ExperimentSpec, device: torch.device) -> torch.Tensor:
+    model.eval()
+    maps = torch.zeros(spec.relation_types, spec.target_dim, spec.input_dim, device=device)
+    base = make_split(spec, 1, spec.data_seed + 9999)
+    base["content"].zero_()
+    base["x"].zero_()
+    base["x"][:, 0, spec.input_dim] = 1.0
+    base["x"][:, 1:, spec.input_dim + 1] = 1.0
+    for rel in range(1, spec.relation_types + 1):
+        for dim in range(spec.input_dim):
+            split = {key: value.clone() if isinstance(value, torch.Tensor) else value for key, value in base.items()}
+            split["content"][0, rel, dim] = 1.0
+            split["x"][0, rel, dim] = 1.0
+            batch = batch_from_split(split, torch.tensor([0])).to(device)
+            maps[rel - 1, :, dim] = model(batch)[0]
+    return maps.detach().cpu()
+
+
+def realised_rank(maps: torch.Tensor, tol: float = 1.0e-5) -> tuple[int, list[float]]:
+    mat = maps.reshape(maps.shape[0], -1).double()
+    s = torch.linalg.svdvals(mat)
+    threshold = max(float(s.max()) * tol, tol)
+    return int((s > threshold).sum().item()), [float(v) for v in s]
+
+
+def teacher_floor(spec: ExperimentSpec) -> dict[str, Any]:
+    weights = relation_weights(spec) / math.sqrt(float(spec.relation_types))
+    mat = weights.reshape(spec.relation_types, -1).double()
+    s = torch.linalg.svdvals(mat)
+    total = float((s**2).sum().item())
+    h_floor = float((s[int(spec.heads) :] ** 2).sum().item() / max(total, EPS))
+    ht_floor = float((s[int(spec.heads * spec.transport_bases) :] ** 2).sum().item() / max(total, EPS))
+    return {
+        "routing_floor": h_floor,
+        "full_transport_floor": ht_floor,
+        "teacher_rank": int((s > 1.0e-8).sum().item()),
+        "teacher_singular_values": ";".join(f"{float(v):.8g}" for v in s),
+    }
+
+
+def run_id(experiment: str, spec: ExperimentSpec, model_name: str, seed: int) -> str:
+    noise = f"n{spec.noise_nodes}_s{float(spec.noise_sigma):g}".replace(".", "p")
+    return (
+        f"{experiment}/{spec.task_mode}/R{spec.relation_types}/L{spec.layers}/"
+        f"{noise}/{model_name}/seed_{int(seed)}"
+    )
+
+
+def checkpoint_dir(root: Path, experiment: str, spec: ExperimentSpec, model_name: str, seed: int) -> Path:
+    return root / "checkpoints" / run_id(experiment, spec, model_name, seed)
+
+
+def train_one(
+    *,
+    root: Path,
+    experiment: str,
+    spec: ExperimentSpec,
+    model_name: str,
+    seed: int,
+    device: torch.device,
+    batch_size: int,
+    eval_batch_size: int,
+    max_epochs: int,
+    patience: int,
+    lr: float,
+    weight_decay: float,
+    use_amp: bool,
+    overwrite: bool,
+) -> dict[str, Any]:
+    ckpt_dir = checkpoint_dir(root, experiment, spec, model_name, seed)
+    complete_path = ckpt_dir / "complete.json"
+    if complete_path.exists() and not overwrite:
+        print(f"[skip] {run_id(experiment, spec, model_name, seed)}")
+        return read_json(complete_path)
+    data_file = save_dataset(root, spec, overwrite=False)
+    loaded_spec, splits = load_dataset(data_file)
+    set_seed(seed)
+    model = build_model(loaded_spec, model_name).to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    amp_enabled = bool(use_amp and device.type == "cuda")
+    if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):
+        scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
+    else:
+        scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled)
+    rng = torch.Generator().manual_seed(int(seed) + 17)
+    best_val = float("inf")
+    best_epoch = -1
+    train_rows: list[dict[str, Any]] = []
+    ensure_dir(ckpt_dir)
+    print(f"[train] {run_id(experiment, spec, model_name, seed)} params={count_parameters(model):,} device={device}")
+    for epoch in range(1, max_epochs + 1):
+        model.train()
+        total = 0.0
+        count = 0
+        for batch_cpu in iter_batches(splits["train"], batch_size, rng):
+            batch = batch_cpu.to(device)
+            optimizer.zero_grad(set_to_none=True)
+            autocast_device = "cuda" if device.type == "cuda" else "cpu"
+            with torch.autocast(
+                device_type=autocast_device,
+                dtype=torch.bfloat16,
+                enabled=bool(use_amp and device.type == "cuda"),
+            ):
+                pred = model(batch)
+                loss = F.mse_loss(pred.float(), batch.y.float())
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 2.0)
+            scaler.step(optimizer)
+            scaler.update()
+            total += float(loss.detach().cpu()) * int(batch.x.shape[0])
+            count += int(batch.x.shape[0])
+        val = evaluate_model(model, splits["val"], device, eval_batch_size)
+        train_loss = total / max(count, 1)
+        improved = val["rel_mse"] < best_val - 1.0e-8
+        if improved:
+            best_val = val["rel_mse"]
+            best_epoch = epoch
+            torch.save({"state_dict": model.state_dict(), "spec": asdict(loaded_spec), "model": model_name}, ckpt_dir / "best.pt")
+        train_rows.append({"epoch": epoch, "train_mse": train_loss, "val_rel_mse": val["rel_mse"], "best_epoch": best_epoch})
+        if epoch == 1 or improved or epoch % 25 == 0:
+            print(
+                f"[train] epoch={epoch:03d} train_mse={train_loss:.5g} "
+                f"val_rel_mse={val['rel_mse']:.5g} best={best_val:.5g}@{best_epoch}"
+            )
+        if epoch - best_epoch >= patience:
+            print(f"[train] early stop epoch={epoch} best_epoch={best_epoch}")
+            break
+    torch.save({"state_dict": model.state_dict(), "spec": asdict(loaded_spec), "model": model_name}, ckpt_dir / "final.pt")
+    if (ckpt_dir / "best.pt").exists():
+        payload = torch.load(ckpt_dir / "best.pt", map_location=device)
+        model.load_state_dict(payload["state_dict"])
+    test = evaluate_model(model, splits["test"], device, eval_batch_size)
+    maps = effective_relation_maps(model, loaded_spec, device)
+    rank, singular = realised_rank(maps)
+    floor = teacher_floor(loaded_spec)
+    summary = {
+        "experiment": experiment,
+        "task_mode": loaded_spec.task_mode,
+        "model": model_name,
+        "model_label": MODEL_LABELS[model_name],
+        "seed": int(seed),
+        "relation_types": int(loaded_spec.relation_types),
+        "input_dim": int(loaded_spec.input_dim),
+        "target_dim": int(loaded_spec.target_dim),
+        "hidden_dim": int(loaded_spec.hidden_dim),
+        "heads": int(loaded_spec.heads),
+        "transport_bases": int(loaded_spec.transport_bases),
+        "layers": int(loaded_spec.layers),
+        "noise_nodes": int(loaded_spec.noise_nodes),
+        "noise_sigma": float(loaded_spec.noise_sigma),
+        "parameters": int(count_parameters(model)),
+        "best_epoch": int(best_epoch),
+        "best_val_rel_mse": float(best_val),
+        "test_rel_mse": float(test["rel_mse"]),
+        "test_mse": float(test["mse"]),
+        "test_mae": float(test["mae"]),
+        "realised_rank": int(rank),
+        "realised_singular_values": ";".join(f"{v:.8g}" for v in singular),
+        **floor,
+    }
+    write_csv(ckpt_dir / "train_log.csv", train_rows)
+    write_json(complete_path, summary)
+    print(f"[done] {run_id(experiment, spec, model_name, seed)} rel_mse={test['rel_mse']:.5g} rank={rank}")
+    return summary
+
+
+def scan_summaries(root: Path) -> list[dict[str, Any]]:
+    return [read_json(path) for path in sorted((root / "checkpoints").glob("**/complete.json"))]
+
+
+def write_summary_tables(root: Path) -> None:
+    rows = scan_summaries(root)
+    metrics = root / "metrics"
+    write_csv(metrics / "clean_metrics.csv", rows)
+    write_csv(
+        metrics / "relation_rank_metrics.csv",
+        [
+            {
+                key: row[key]
+                for key in [
+                    "experiment",
+                    "task_mode",
+                    "model",
+                    "seed",
+                    "relation_types",
+                    "layers",
+                    "noise_nodes",
+                    "noise_sigma",
+                    "realised_rank",
+                    "realised_singular_values",
+                ]
+                if key in row
+            }
+            for row in rows
+        ],
+    )
+    write_csv(
+        metrics / "eckart_young_floors.csv",
+        [
+            {
+                key: row[key]
+                for key in [
+                    "experiment",
+                    "task_mode",
+                    "relation_types",
+                    "routing_floor",
+                    "full_transport_floor",
+                    "teacher_rank",
+                    "teacher_singular_values",
+                ]
+                if key in row
+            }
+            for row in rows
+        ],
+    )
+    write_csv(
+        metrics / "parameter_counts.csv",
+        [
+            {
+                "experiment": row["experiment"],
+                "task_mode": row["task_mode"],
+                "model": row["model"],
+                "relation_types": row["relation_types"],
+                "layers": row["layers"],
+                "parameters": row["parameters"],
+            }
+            for row in rows
+        ],
+    )
+    write_csv(metrics / "noise_sweep_metrics.csv", [row for row in rows if row["experiment"] == "overglobalisation"])
+    write_csv(metrics / "depth_escape_metrics.csv", [row for row in rows if row["experiment"] == "depth_escape"])
+    print(f"[summary] wrote metrics under {metrics}")
+
+
+def train_grid(
+    args: argparse.Namespace,
+    *,
+    experiment: str,
+    specs: Sequence[ExperimentSpec],
+    models: Sequence[str],
+    seeds: Sequence[int],
+) -> list[dict[str, Any]]:
+    root = Path(args.output_root)
+    device = resolve_device(args.device)
+    rows = []
+    for spec in specs:
+        save_dataset(root, spec, overwrite=bool(args.overwrite_data))
+        for model_name in models:
+            matched_spec = maybe_parameter_matched_spec(
+                root,
+                spec,
+                model_name,
+                width_grid=parse_int_list(
+                    getattr(args, "parameter_match_widths", ",".join(str(v) for v in PARAMETER_MATCH_WIDTHS))
+                ),
+            )
+            for seed in seeds:
+                rows.append(
+                    train_one(
+                        root=root,
+                        experiment=experiment,
+                        spec=matched_spec,
+                        model_name=model_name,
+                        seed=seed,
+                        device=device,
+                        batch_size=int(args.batch_size),
+                        eval_batch_size=int(args.eval_batch_size),
+                        max_epochs=int(args.max_epochs),
+                        patience=int(args.patience),
+                        lr=float(args.lr),
+                        weight_decay=float(args.weight_decay),
+                        use_amp=bool(args.amp),
+                        overwrite=bool(args.overwrite_checkpoints),
+                    )
+                )
+    write_summary_tables(root)
+    return rows
+
+
+def base_spec_from_args(args: argparse.Namespace, **overrides: Any) -> ExperimentSpec:
+    values = {
+        "relation_types": int(args.relation_types),
+        "input_dim": int(args.input_dim),
+        "target_dim": int(args.target_dim),
+        "hidden_dim": int(args.hidden_dim),
+        "heads": int(args.heads),
+        "transport_bases": int(args.transport_bases),
+        "layers": int(args.layers),
+        "task_mode": str(args.task_mode),
+        "noise_nodes": int(args.noise_nodes),
+        "noise_sigma": float(args.noise_sigma),
+        "train_size": int(args.train_size),
+        "val_size": int(args.val_size),
+        "test_size": int(args.test_size),
+        "data_seed": int(args.data_seed),
+    }
+    values.update(overrides)
+    return ExperimentSpec(**values)
+
+
+def run_crossover(args: argparse.Namespace) -> None:
+    specs = [
+        base_spec_from_args(args, relation_types=r, task_mode="local", noise_nodes=0, noise_sigma=0.0, layers=1)
+        for r in parse_int_list(args.r_sweep)
+    ]
+    train_grid(args, experiment="crossover", specs=specs, models=CONTROLLED_MODELS, seeds=parse_int_list(args.seeds))
+
+
+def run_transport_support(args: argparse.Namespace) -> None:
+    models = list(CONTROLLED_MODELS)
+    if args.include_practical:
+        models.extend(PRACTICAL_MODELS)
+    specs = [
+        base_spec_from_args(args, relation_types=int(args.relation_types), task_mode=mode, noise_nodes=0, noise_sigma=0.0, layers=1)
+        for mode in ("local", "global")
+    ]
+    train_grid(args, experiment="transport_support", specs=specs, models=models, seeds=parse_int_list(args.seeds))
+
+
+def run_overglobalisation(args: argparse.Namespace) -> None:
+    seeds = parse_int_list(args.seeds)
+    fixed_models = list(CONTROLLED_MODELS)
+    if args.include_practical:
+        fixed_models.extend(PRACTICAL_MODELS)
+    fixed_specs = [
+        base_spec_from_args(
+            args,
+            relation_types=int(args.relation_types),
+            task_mode=mode,
+            noise_nodes=int(args.noise_nodes or 3 * int(args.relation_types)),
+            noise_sigma=1.0,
+            layers=1,
+        )
+        for mode in ("local", "global")
+    ]
+    train_grid(args, experiment="overglobalisation_fixed", specs=fixed_specs, models=fixed_models, seeds=seeds)
+    sweep_specs = [
+        base_spec_from_args(
+            args,
+            relation_types=int(args.relation_types),
+            task_mode=mode,
+            noise_nodes=int(args.noise_nodes or 3 * int(args.relation_types)),
+            noise_sigma=sigma,
+            layers=1,
+        )
+        for mode in ("local", "global")
+        for sigma in parse_float_list(args.noise_sweep)
+    ]
+    train_grid(args, experiment="overglobalisation", specs=sweep_specs, models=("full_dense", "full_1hop"), seeds=seeds)
+
+
+def run_depth_escape(args: argparse.Namespace) -> None:
+    specs = [
+        base_spec_from_args(args, relation_types=int(args.relation_types), task_mode="local", noise_nodes=0, noise_sigma=0.0, layers=layers)
+        for layers in parse_int_list(args.depth_sweep)
+    ]
+    train_grid(args, experiment="depth_escape", specs=specs, models=("routing_dense", "routing_1hop"), seeds=parse_int_list(args.seeds))
+    ref_spec = base_spec_from_args(args, relation_types=int(args.relation_types), task_mode="local", noise_nodes=0, noise_sigma=0.0, layers=1)
+    train_grid(args, experiment="depth_escape", specs=[ref_spec], models=("full_dense", "full_1hop"), seeds=parse_int_list(args.seeds))
+
+
+def build_data(args: argparse.Namespace) -> None:
+    root = Path(args.output_root)
+    for r in parse_int_list(args.r_sweep):
+        save_dataset(root, base_spec_from_args(args, relation_types=r, task_mode="local"), overwrite=bool(args.overwrite_data))
+    for mode in ("local", "global"):
+        save_dataset(root, base_spec_from_args(args, task_mode=mode), overwrite=bool(args.overwrite_data))
+        save_dataset(
+            root,
+            base_spec_from_args(args, task_mode=mode, noise_nodes=int(args.noise_nodes or 3 * int(args.relation_types)), noise_sigma=1.0),
+            overwrite=bool(args.overwrite_data),
+        )
+
+
+def run_train(args: argparse.Namespace) -> None:
+    models = parse_csv_list(args.models, allowed=ALL_MODELS)
+    spec = base_spec_from_args(args)
+    train_grid(args, experiment=str(args.experiment), specs=[spec], models=models, seeds=parse_int_list(args.seeds))
+
+
+def run_evaluate(args: argparse.Namespace) -> None:
+    write_summary_tables(Path(args.output_root))
+
+
+def import_plotting():
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    plt.rcParams.update(
+        {
+            "figure.dpi": 150,
+            "savefig.dpi": 300,
+            "font.size": 9,
+            "axes.titlesize": 11,
+            "axes.labelsize": 10,
+            "xtick.labelsize": 8,
+            "ytick.labelsize": 8,
+            "legend.fontsize": 8,
+            "axes.spines.top": False,
+            "axes.spines.right": False,
+            "pdf.fonttype": 42,
+            "ps.fonttype": 42,
+        }
+    )
+    return plt
+
+
+def aggregate(rows: Sequence[Mapping[str, Any]], keys: Sequence[str], value: str) -> dict[tuple[Any, ...], tuple[float, float]]:
+    grouped: dict[tuple[Any, ...], list[float]] = {}
+    for row in rows:
+        if value not in row or row[value] in {"", None}:
+            continue
+        key = tuple(row[k] for k in keys)
+        grouped.setdefault(key, []).append(float(row[value]))
+    out = {}
+    for key, vals in grouped.items():
+        arr = np.asarray(vals, dtype=float)
+        sem = float(arr.std(ddof=1) / math.sqrt(len(arr))) if len(arr) > 1 else 0.0
+        out[key] = (float(arr.mean()), sem)
+    return out
+
+
+def metric_rows(root: Path) -> list[dict[str, Any]]:
+    path = root / "metrics" / "clean_metrics.csv"
+    if not path.exists():
+        write_summary_tables(root)
+    return read_csv(path) if path.exists() else []
+
+
+def plot_crossover(root: Path) -> Path | None:
+    rows = [row for row in metric_rows(root) if row["experiment"] == "crossover"]
+    if not rows:
+        return None
+    plt = import_plotting()
+    agg_mse = aggregate(rows, ("model", "relation_types"), "test_rel_mse")
+    agg_rank = aggregate(rows, ("model", "relation_types"), "realised_rank")
+    models = list(CONTROLLED_MODELS)
+    rs = sorted({int(row["relation_types"]) for row in rows})
+    fig, axes = plt.subplots(1, 2, figsize=(10.2, 4.2))
+    for model in models:
+        xs = rs
+        ys = [agg_mse.get((model, str(r)), (np.nan, 0.0))[0] for r in xs]
+        es = [agg_mse.get((model, str(r)), (np.nan, 0.0))[1] for r in xs]
+        axes[0].errorbar(xs, ys, yerr=es, marker="o", linewidth=1.8, capsize=3, label=MODEL_LABELS[model], color=MODEL_COLORS[model])
+        ranks = [agg_rank.get((model, str(r)), (np.nan, 0.0))[0] for r in xs]
+        axes[1].plot(xs, ranks, marker="o", linewidth=1.8, label=MODEL_LABELS[model], color=MODEL_COLORS[model])
+    floor_by_r = {int(row["relation_types"]): row for row in rows}
+    axes[0].plot(rs, [float(floor_by_r[r]["routing_floor"]) for r in rs], "--", color="#333333", label="Eckart-Young routing floor")
+    axes[0].plot(rs, [float(floor_by_r[r]["full_transport_floor"]) for r in rs], ":", color="#333333", label="Eckart-Young transport floor")
+    axes[0].set_xlabel("number of relations R")
+    axes[0].set_ylabel("relative MSE")
+    axes[0].set_title("Error follows the relation-rank floor")
+    axes[0].set_yscale("log")
+    axes[0].grid(axis="y", color="#dddddd", linewidth=0.6)
+    axes[1].axhline(4, linestyle="--", color="#555555", linewidth=0.9, label="H")
+    axes[1].axhline(16, linestyle=":", color="#555555", linewidth=0.9, label="H x k_tr")
+    axes[1].set_xlabel("number of relations R")
+    axes[1].set_ylabel("realised relation rank")
+    axes[1].set_title("Transport increases realised relation rank")
+    axes[1].grid(axis="y", color="#dddddd", linewidth=0.6)
+    handles, labels = axes[0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="upper center", ncol=3, frameon=False, bbox_to_anchor=(0.5, 1.04))
+    fig.suptitle("Relation Rank Crossover Under Local Support", y=1.13, fontsize=13)
+    fig.tight_layout()
+    path = ensure_dir(root / "figures") / "relation_rank_crossover_local.pdf"
+    fig.savefig(path, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[plot] wrote {path}")
+    return path
+
+
+def plot_transport_support(root: Path, task_mode: str) -> Path | None:
+    rows = [row for row in metric_rows(root) if row["experiment"] == "transport_support" and row["task_mode"] == task_mode]
+    if not rows:
+        return None
+    plt = import_plotting()
+    agg_mse = aggregate(rows, ("model",), "test_rel_mse")
+    controlled = [m for m in CONTROLLED_MODELS if (m,) in agg_mse]
+    practical = [m for m in PRACTICAL_MODELS if (m,) in agg_mse]
+    fig, axes = plt.subplots(1, 2, figsize=(10.5, 4.2), width_ratios=[1.15, 1.0])
+    for ax, models, title in [(axes[0], controlled, "Controlled capacity models"), (axes[1], practical, "Matched practical models")]:
+        xs = np.arange(len(models))
+        ys = [agg_mse[(m,)][0] for m in models]
+        es = [agg_mse[(m,)][1] for m in models]
+        ax.bar(xs, ys, yerr=es, capsize=3, color=[MODEL_COLORS[m] for m in models], edgecolor="black", linewidth=0.5)
+        ax.set_xticks(xs, [MODEL_LABELS[m] for m in models], rotation=25, ha="right")
+        ax.set_yscale("log")
+        ax.set_ylabel("relative MSE")
+        ax.set_title(title)
+        ax.grid(axis="y", color="#dddddd", linewidth=0.6)
+    headline = (
+        "Local Relation Operator: Transport Matters, Dense Support Is Not Required"
+        if task_mode == "local"
+        else "Long-Range Relation Operator: Dense Support and Transport Are Both Required"
+    )
+    fig.suptitle(headline, y=1.03, fontsize=13)
+    fig.tight_layout()
+    name = "transport_support_local_relation_operator.pdf" if task_mode == "local" else "transport_support_global_relation_operator.pdf"
+    path = ensure_dir(root / "figures") / name
+    fig.savefig(path, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[plot] wrote {path}")
+    return path
+
+
+def plot_overglobalisation(root: Path) -> Path | None:
+    rows = [row for row in metric_rows(root) if row["experiment"] in {"overglobalisation", "overglobalisation_fixed"}]
+    if not rows:
+        return None
+    plt = import_plotting()
+    fig, axes = plt.subplots(1, 2, figsize=(10.2, 4.2))
+    sweep = [row for row in rows if row["experiment"] == "overglobalisation"]
+    for mode, style in [("local", "-"), ("global", "--")]:
+        for model in ("full_dense", "full_1hop"):
+            sub = [row for row in sweep if row["task_mode"] == mode and row["model"] == model]
+            if not sub:
+                continue
+            sigmas = sorted({float(row["noise_sigma"]) for row in sub})
+            agg_mse = aggregate(sub, ("model", "task_mode", "noise_sigma"), "test_rel_mse")
+            axes[0].errorbar(
+                sigmas,
+                [agg_mse[(model, mode, str(sigma))][0] for sigma in sigmas],
+                yerr=[agg_mse[(model, mode, str(sigma))][1] for sigma in sigmas],
+                marker="o",
+                linestyle=style,
+                color=MODEL_COLORS[model],
+                label=f"{MODEL_LABELS[model]} / {mode}",
+            )
+    axes[0].set_yscale("log")
+    axes[0].set_xlabel("irrelevant content noise magnitude")
+    axes[0].set_ylabel("relative MSE")
+    axes[0].set_title("Noise sweep for full-transport models")
+    axes[0].grid(axis="y", color="#dddddd", linewidth=0.6)
+    fixed = [row for row in rows if row["experiment"] == "overglobalisation_fixed"]
+    agg_fixed = aggregate(fixed, ("model", "task_mode"), "test_rel_mse")
+    labels = [m for m in ALL_MODELS if (m, "local") in agg_fixed or (m, "global") in agg_fixed]
+    x = np.arange(len(labels))
+    width = 0.36
+    for idx, mode in enumerate(("local", "global")):
+        ys = [agg_fixed.get((m, mode), (np.nan, 0.0))[0] for m in labels]
+        axes[1].bar(x + (idx - 0.5) * width, ys, width=width, label=mode, color=("#9ecae1" if mode == "local" else "#fdae6b"), edgecolor="black", linewidth=0.5)
+    axes[1].set_yscale("log")
+    axes[1].set_xticks(x, [MODEL_LABELS[m] for m in labels], rotation=25, ha="right")
+    axes[1].set_title("Fixed irrelevant-content stress test")
+    axes[1].set_ylabel("relative MSE")
+    axes[1].grid(axis="y", color="#dddddd", linewidth=0.6)
+    axes[0].legend(frameon=False, fontsize=7)
+    axes[1].legend(frameon=False)
+    fig.suptitle("Irrelevant Content Exposes the Cost of Dense Support", y=1.03, fontsize=13)
+    fig.tight_layout()
+    path = ensure_dir(root / "figures") / "overglobalisation_irrelevant_content.pdf"
+    fig.savefig(path, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[plot] wrote {path}")
+    return path
+
+
+def plot_depth_escape(root: Path) -> Path | None:
+    rows = [row for row in metric_rows(root) if row["experiment"] == "depth_escape"]
+    if not rows:
+        return None
+    plt = import_plotting()
+    fig, axes = plt.subplots(1, 2, figsize=(10.2, 4.2))
+    for model in ("routing_dense", "routing_1hop", "full_dense", "full_1hop"):
+        sub = [row for row in rows if row["model"] == model]
+        if not sub:
+            continue
+        layers = sorted({int(row["layers"]) for row in sub})
+        agg_mse = aggregate(sub, ("model", "layers"), "test_rel_mse")
+        agg_rank = aggregate(sub, ("model", "layers"), "realised_rank")
+        axes[0].errorbar(layers, [agg_mse[(model, str(l))][0] for l in layers], yerr=[agg_mse[(model, str(l))][1] for l in layers], marker="o", label=MODEL_LABELS[model], color=MODEL_COLORS[model])
+        axes[1].plot(layers, [agg_rank[(model, str(l))][0] for l in layers], marker="o", label=MODEL_LABELS[model], color=MODEL_COLORS[model])
+    axes[0].set_yscale("log")
+    axes[0].set_xlabel("number of layers")
+    axes[0].set_ylabel("relative MSE")
+    axes[0].set_title("Routing-only improves with composition")
+    axes[0].grid(axis="y", color="#dddddd", linewidth=0.6)
+    axes[1].set_xlabel("number of layers")
+    axes[1].set_ylabel("realised relation rank")
+    axes[1].set_title("Depth changes realised relation rank")
+    axes[1].grid(axis="y", color="#dddddd", linewidth=0.6)
+    fig.legend(loc="upper center", ncol=4, frameon=False, bbox_to_anchor=(0.5, 1.04))
+    fig.suptitle("Depth Partially Escapes the Routing Rank Limit", y=1.13, fontsize=13)
+    fig.tight_layout()
+    path = ensure_dir(root / "figures") / "depth_escape_routing_only.pdf"
+    fig.savefig(path, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[plot] wrote {path}")
+    return path
+
+
+def plot_all(args: argparse.Namespace) -> None:
+    root = Path(args.output_root)
+    write_summary_tables(root)
+    plot_crossover(root)
+    plot_transport_support(root, "local")
+    plot_transport_support(root, "global")
+    plot_overglobalisation(root)
+    plot_depth_escape(root)
+
+
+def run_all(args: argparse.Namespace) -> None:
+    build_data(args)
+    run_crossover(args)
+    run_transport_support(args)
+    run_overglobalisation(args)
+    run_depth_escape(args)
+    plot_all(args)
+
+
+def print_hpc_commands(args: argparse.Namespace) -> None:
+    root = Path(args.output_root)
+    common = (
+        "source /usr/local/Cluster-Apps/miniconda3/4.5.1/etc/profile.d/conda.sh; "
+        "conda activate graphbench-algoreas; "
+        "export PYTHONPATH=$PWD/src:$PYTHONPATH; "
+        "export CUBLAS_WORKSPACE_CONFIG=${CUBLAS_WORKSPACE_CONFIG:-:4096:8}; "
+        "export GRAPHGPS_ROOT=${GRAPHGPS_ROOT:-$PWD/graphbench-algoreas-hpc/external/GraphGPS}; "
+        "export GRIT_ROOT=${GRIT_ROOT:-$PWD/graphbench-algoreas-hpc/external/GRIT}; "
+        "export GNNPLUS_ROOT=${GNNPLUS_ROOT:-$PWD/graphbench-algoreas-hpc/external/GNNPlus}; "
+    )
+    module = "python -u -m graph_specialisation_metrics.relation_operator_capacity"
+    base_flags = (
+        f"--output-root {root} --seeds {args.seeds} --r-sweep {args.r_sweep} "
+        f"--relation-types {args.relation_types} --input-dim {args.input_dim} "
+        f"--target-dim {args.target_dim} --hidden-dim {args.hidden_dim} "
+        f"--heads {args.heads} --transport-bases {args.transport_bases} "
+        f"--train-size {args.train_size} --val-size {args.val_size} --test-size {args.test_size} "
+        f"--batch-size {args.batch_size} --eval-batch-size {args.eval_batch_size} "
+        f"--max-epochs {args.max_epochs} --patience {args.patience} --lr {args.lr} "
+        f"--weight-decay {args.weight_decay} --noise-sweep {args.noise_sweep} "
+        f"--depth-sweep {args.depth_sweep} --parameter-match-widths {args.parameter_match_widths} "
+        f"--device cuda --amp"
+    )
+    print("mkdir -p logs")
+    for name, command, extra in [
+        ("ch4-ctrl", "run-crossover", ""),
+        ("ch4-ts", "run-transport-support", " --include-practical"),
+        ("ch4-noise", "run-overglobalisation", " --include-practical"),
+        ("ch4-depth", "run-depth-escape", ""),
+        ("ch4-plot", "plot", ""),
+    ]:
+        wrap = common + module + f" {command} {base_flags}{extra}"
+        print(
+            "sbatch -A mlmi-jgg45-sl2-gpu -p ampere --qos=gpu1 "
+            "--gres=gpu:1 --nodes=1 --ntasks=1 --cpus-per-task=8 --mem=80G --time=01:00:00 "
+            f"-J {name} -o logs/{name}-%j.out -e logs/{name}-%j.err --wrap {json.dumps(wrap)}"
+        )
+
+
+def add_common_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--output-root", type=Path, default=default_output_root())
+    parser.add_argument("--seeds", type=str, default=",".join(str(seed) for seed in DEFAULT_SEEDS))
+    parser.add_argument("--r-sweep", type=str, default=",".join(str(r) for r in R_SWEEP))
+    parser.add_argument("--relation-types", type=int, default=16)
+    parser.add_argument("--task-mode", type=str, default="local", choices=TASK_MODES)
+    parser.add_argument("--models", type=str, default=",".join(CONTROLLED_MODELS))
+    parser.add_argument("--experiment", type=str, default="manual")
+    parser.add_argument("--input-dim", type=int, default=32)
+    parser.add_argument("--target-dim", type=int, default=32)
+    parser.add_argument("--hidden-dim", type=int, default=64)
+    parser.add_argument("--heads", type=int, default=4)
+    parser.add_argument("--transport-bases", type=int, default=4)
+    parser.add_argument("--layers", type=int, default=1)
+    parser.add_argument("--noise-nodes", type=int, default=0)
+    parser.add_argument("--noise-sigma", type=float, default=0.0)
+    parser.add_argument("--noise-sweep", type=str, default="0,0.25,0.5,1,2,4")
+    parser.add_argument("--depth-sweep", type=str, default="1,2,4,8")
+    parser.add_argument("--parameter-match-widths", type=str, default=",".join(str(width) for width in PARAMETER_MATCH_WIDTHS))
+    parser.add_argument("--train-size", type=int, default=8192)
+    parser.add_argument("--val-size", type=int, default=2048)
+    parser.add_argument("--test-size", type=int, default=2048)
+    parser.add_argument("--data-seed", type=int, default=7101)
+    parser.add_argument("--batch-size", type=int, default=2048)
+    parser.add_argument("--eval-batch-size", type=int, default=4096)
+    parser.add_argument("--max-epochs", type=int, default=250)
+    parser.add_argument("--patience", type=int, default=25)
+    parser.add_argument("--lr", type=float, default=2.0e-3)
+    parser.add_argument("--weight-decay", type=float, default=1.0e-4)
+    parser.add_argument("--device", type=str, default="auto")
+    parser.add_argument("--num-workers", type=int, default=0, help="Reserved for HPC config logging; data is tensor-cached in memory.")
+    parser.add_argument("--amp", "--use-amp", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--include-practical", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--overwrite-data", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--overwrite-checkpoints", action=argparse.BooleanOptionalAction, default=False)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    for name, help_text, fn in [
+        ("build-data", "Cache Ch4 relation-operator datasets.", build_data),
+        ("train", "Train selected model(s) for one explicit config.", run_train),
+        ("evaluate", "Rebuild metrics tables from completed run summaries.", run_evaluate),
+        ("run-crossover", "Run the local relation-rank crossover experiment.", run_crossover),
+        ("run-transport-support", "Run local/global transport-support experiments.", run_transport_support),
+        ("run-overglobalisation", "Run irrelevant-content over-globalisation experiments.", run_overglobalisation),
+        ("run-depth-escape", "Run routing-only depth escape experiments.", run_depth_escape),
+        ("plot", "Generate all Ch4 figures from cached metrics.", plot_all),
+        ("run-all", "Run all Ch4 stages.", run_all),
+        ("print-hpc-commands", "Print HPC sbatch commands.", print_hpc_commands),
+    ]:
+        sub = subparsers.add_parser(name, help=help_text)
+        add_common_args(sub)
+        sub.set_defaults(func=fn)
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    args.func(args)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
