@@ -88,8 +88,8 @@ MODEL_COLORS = {
 CAPACITY_MODEL_DESCRIPTIONS = {
     "capacity_routing_only": "Relation labels affect only scalar attention scores; values use shared linear maps.",
     "capacity_transport_only": "Attention is unstructured/uniform; relation labels select low-rank value-transport maps.",
-    "capacity_additive_value_bias": "Attention is unstructured/uniform; relation labels add a value bias independent of content.",
-    "capacity_multiplicative_value_gate": "Attention is unstructured/uniform; relation labels gate transported value channels multiplicatively.",
+    "capacity_additive_value_bias": "Relation labels affect scalar attention and add a value bias independent of content.",
+    "capacity_multiplicative_value_gate": "Relation labels affect scalar attention and gate transported value channels multiplicatively.",
     "capacity_full_relation_transport": "Relation labels affect scalar attention and low-rank value-transport maps.",
 }
 
@@ -422,10 +422,10 @@ class CapacityRelationModel(nn.Module):
 
     def relation_attention(self, pair_rel: torch.Tensor, support: torch.Tensor) -> torch.Tensor:
         bsz, n, _ = pair_rel.shape
-        if self.variant in {"capacity_routing_only", "capacity_full_relation_transport"}:
-            logits = self.routing_bias[:, pair_rel].permute(1, 0, 2, 3)
-        else:
+        if self.variant == "capacity_transport_only":
             logits = torch.zeros((bsz, int(self.spec.heads), n, n), dtype=torch.float32, device=pair_rel.device)
+        else:
+            logits = self.routing_bias[:, pair_rel].permute(1, 0, 2, 3)
         return masked_softmax(logits, support[:, None, :, :])
 
     def shared_value_message(self, state: torch.Tensor, attn: torch.Tensor) -> torch.Tensor:
@@ -967,13 +967,14 @@ def effective_relation_maps(model: nn.Module, spec: ExperimentSpec, device: torc
     base["x"].zero_()
     base["x"][:, 0, spec.input_dim] = 1.0
     base["x"][:, 1:, spec.input_dim + 1] = 1.0
+    baseline = model(batch_from_split(base, torch.tensor([0])).to(device))[0]
     for rel in range(1, spec.relation_types + 1):
         for dim in range(spec.input_dim):
             split = {key: value.clone() if isinstance(value, torch.Tensor) else value for key, value in base.items()}
             split["content"][0, rel, dim] = 1.0
             split["x"][0, rel, dim] = 1.0
             batch = batch_from_split(split, torch.tensor([0])).to(device)
-            maps[rel - 1, :, dim] = model(batch)[0]
+            maps[rel - 1, :, dim] = model(batch)[0] - baseline
     return maps.detach().cpu()
 
 
