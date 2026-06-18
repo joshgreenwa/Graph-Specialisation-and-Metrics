@@ -44,6 +44,8 @@ CAPACITY_CROSSOVER_MODELS = (
     "capacity_transport_only",
     "capacity_additive_value_bias",
     "capacity_multiplicative_value_gate",
+    "capacity_additive_value_bias_routed",
+    "capacity_multiplicative_value_gate_routed",
     "capacity_full_relation_transport",
 )
 ALL_MODELS = tuple(dict.fromkeys(CONTROLLED_MODELS + PRACTICAL_MODELS + OFFICIAL_GRIT_MODELS + CAPACITY_CROSSOVER_MODELS))
@@ -65,6 +67,8 @@ MODEL_LABELS = {
     "capacity_transport_only": "Transport-only",
     "capacity_additive_value_bias": "Additive value bias",
     "capacity_multiplicative_value_gate": "Multiplicative value gate",
+    "capacity_additive_value_bias_routed": "Additive value bias + routing",
+    "capacity_multiplicative_value_gate_routed": "Multiplicative value gate + routing",
     "capacity_full_relation_transport": "Full relation transport",
 }
 
@@ -82,14 +86,18 @@ MODEL_COLORS = {
     "capacity_transport_only": "#4f8f5b",
     "capacity_additive_value_bias": "#7f7f7f",
     "capacity_multiplicative_value_gate": "#c4862f",
+    "capacity_additive_value_bias_routed": "#4d4d4d",
+    "capacity_multiplicative_value_gate_routed": "#9c6b1f",
     "capacity_full_relation_transport": "#c2473f",
 }
 
 CAPACITY_MODEL_DESCRIPTIONS = {
     "capacity_routing_only": "Relation labels affect only scalar attention scores; values use shared linear maps.",
     "capacity_transport_only": "Attention is unstructured/uniform; relation labels select low-rank value-transport maps.",
-    "capacity_additive_value_bias": "Relation labels affect scalar attention and add a value bias independent of content.",
-    "capacity_multiplicative_value_gate": "Relation labels affect scalar attention and gate transported value channels multiplicatively.",
+    "capacity_additive_value_bias": "Attention is unstructured/uniform; relation labels add a value bias independent of content.",
+    "capacity_multiplicative_value_gate": "Attention is unstructured/uniform; relation labels gate transported value channels multiplicatively.",
+    "capacity_additive_value_bias_routed": "Relation labels affect scalar attention and add a value bias independent of content.",
+    "capacity_multiplicative_value_gate_routed": "Relation labels affect scalar attention and gate transported value channels multiplicatively.",
     "capacity_full_relation_transport": "Relation labels affect scalar attention and low-rank value-transport maps.",
 }
 
@@ -422,10 +430,16 @@ class CapacityRelationModel(nn.Module):
 
     def relation_attention(self, pair_rel: torch.Tensor, support: torch.Tensor) -> torch.Tensor:
         bsz, n, _ = pair_rel.shape
-        if self.variant == "capacity_transport_only":
-            logits = torch.zeros((bsz, int(self.spec.heads), n, n), dtype=torch.float32, device=pair_rel.device)
-        else:
+        routed_variants = {
+            "capacity_routing_only",
+            "capacity_additive_value_bias_routed",
+            "capacity_multiplicative_value_gate_routed",
+            "capacity_full_relation_transport",
+        }
+        if self.variant in routed_variants:
             logits = self.routing_bias[:, pair_rel].permute(1, 0, 2, 3)
+        else:
+            logits = torch.zeros((bsz, int(self.spec.heads), n, n), dtype=torch.float32, device=pair_rel.device)
         return masked_softmax(logits, support[:, None, :, :])
 
     def shared_value_message(self, state: torch.Tensor, attn: torch.Tensor) -> torch.Tensor:
@@ -449,12 +463,12 @@ class CapacityRelationModel(nn.Module):
             ctx = self.shared_value_message(state, attn)
         elif self.variant == "capacity_transport_only":
             ctx = self.low_rank_transport_message(state, pair_rel, attn)
-        elif self.variant == "capacity_additive_value_bias":
+        elif self.variant in {"capacity_additive_value_bias", "capacity_additive_value_bias_routed"}:
             shared = torch.einsum("bjd,hdo->bhjo", state, self.routing_basis)
             bias = self.additive_value_bias[pair_rel].permute(0, 3, 1, 2, 4)
             msg = shared[:, :, None, :, :] + bias
             ctx = torch.einsum("bhij,bhijd->bhid", attn, msg)
-        elif self.variant == "capacity_multiplicative_value_gate":
+        elif self.variant in {"capacity_multiplicative_value_gate", "capacity_multiplicative_value_gate_routed"}:
             shared = torch.einsum("bjd,hdo->bhjo", state, self.routing_basis)
             gate = self.value_gate[pair_rel].permute(0, 3, 1, 2, 4)
             msg = shared[:, :, None, :, :] * gate
