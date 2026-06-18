@@ -1274,11 +1274,36 @@ def run_crossover(args: argparse.Namespace) -> None:
     train_grid(args, experiment="crossover", specs=specs, models=CONTROLLED_MODELS, seeds=parse_int_list(args.seeds))
 
 
+def capacity_crossover_specs_from_args(args: argparse.Namespace) -> list[ExperimentSpec]:
+    relation_counts = parse_int_list(args.r_sweep)
+    total_nodes = int(args.n_nodes)
+    min_nodes = 1 + max(relation_counts)
+    if total_nodes < min_nodes:
+        raise ValueError(
+            f"--n-nodes={total_nodes} is too small for max R={max(relation_counts)}; "
+            f"need at least {min_nodes} nodes"
+        )
+    specs = []
+    for r in relation_counts:
+        # Keep graph size and dense-support size fixed across R.  The padded
+        # nodes are zero-valued null distractors with relation label 0, so R
+        # changes relation demand rather than graph size.
+        null_distractors = total_nodes - 1 - int(r)
+        specs.append(
+            base_spec_from_args(
+                args,
+                relation_types=int(r),
+                task_mode="global",
+                noise_nodes=null_distractors,
+                noise_sigma=0.0,
+                layers=1,
+            )
+        )
+    return specs
+
+
 def run_capacity_crossover(args: argparse.Namespace) -> None:
-    specs = [
-        base_spec_from_args(args, relation_types=r, task_mode="global", noise_nodes=0, noise_sigma=0.0, layers=1)
-        for r in parse_int_list(args.r_sweep)
-    ]
+    specs = capacity_crossover_specs_from_args(args)
     train_grid(
         args,
         experiment="capacity_crossover_global",
@@ -1508,6 +1533,18 @@ def plot_capacity_crossover(root: Path) -> Path | None:
     rows = [row for row in metric_rows(root) if row["experiment"] == "capacity_crossover_global"]
     if not rows:
         return None
+    by_total_nodes: dict[int, list[dict[str, Any]]] = {}
+    for row in rows:
+        total_nodes = 1 + int(row["relation_types"]) + int(row.get("noise_nodes", 0))
+        by_total_nodes.setdefault(total_nodes, []).append(row)
+    if len(by_total_nodes) > 1:
+        complete_counts = {
+            total_nodes: len({(row["model"], row["relation_types"], row["seed"]) for row in grouped})
+            for total_nodes, grouped in by_total_nodes.items()
+        }
+        selected_nodes = max(complete_counts, key=lambda key: (complete_counts[key], key))
+        print(f"[plot] capacity crossover found multiple graph sizes; using N={selected_nodes}")
+        rows = by_total_nodes[selected_nodes]
     write_capacity_model_table(root)
     plt = import_plotting()
     agg_mse = aggregate(rows, ("model", "relation_types"), "test_rel_mse")
@@ -1516,6 +1553,7 @@ def plot_capacity_crossover(root: Path) -> Path | None:
     first = rows[0]
     heads = int(first.get("heads", 4))
     input_dim = int(first.get("input_dim", 32))
+    total_nodes = 1 + int(first["relation_types"]) + int(first.get("noise_nodes", 0))
     fig, axes = plt.subplots(1, 2, figsize=(10.2, 4.2))
     for model in CAPACITY_CROSSOVER_MODELS:
         xs = rs
@@ -1561,7 +1599,7 @@ def plot_capacity_crossover(root: Path) -> Path | None:
             handles.append(handle)
             labels.append(label)
     fig.legend(handles, labels, loc="upper center", ncol=3, frameon=False, bbox_to_anchor=(0.5, 1.05))
-    fig.suptitle(f"Dense Global Relation-Operator Capacity (H={heads}, d={input_dim})", y=1.15, fontsize=13)
+    fig.suptitle(f"Dense Global Relation-Operator Capacity (N={total_nodes}, H={heads}, d={input_dim})", y=1.15, fontsize=13)
     fig.tight_layout()
     path = ensure_dir(root / "figures") / "relation_rank_crossover_global_capacity_h4.pdf"
     fig.savefig(path, bbox_inches="tight")
@@ -1907,8 +1945,8 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--n-nodes",
         type=int,
-        default=32,
-        help="Accepted for SLURM wrapper compatibility; Ch4 node count is determined by R plus irrelevant-content nodes.",
+        default=16,
+        help="Total nodes for capacity-crossover padding; other Ch4 stages use R plus irrelevant-content nodes.",
     )
     parser.add_argument("--hidden-dim", type=int, default=64)
     parser.add_argument("--heads", type=int, default=4)

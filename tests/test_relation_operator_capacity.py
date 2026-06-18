@@ -8,6 +8,7 @@ from graph_specialisation_metrics.relation_operator_capacity import (
     ExperimentSpec,
     batch_from_split,
     build_model,
+    capacity_crossover_specs_from_args,
     count_parameters,
     effective_relation_maps,
     graph_tensors,
@@ -72,6 +73,36 @@ def test_capacity_crossover_rank_ceilings_hold_for_global_variants():
     full = build_model(spec, "capacity_full_relation_transport").to(device).eval()
     full_rank, _ = realised_rank(effective_relation_maps(full, spec, device))
     assert full_rank <= spec.heads * spec.transport_bases
+
+
+def test_capacity_crossover_keeps_graph_size_fixed_with_null_distractors():
+    class Args:
+        r_sweep = "2,4,5,6,8"
+        n_nodes = 16
+        relation_types = 8
+        input_dim = 3
+        target_dim = 3
+        hidden_dim = 8
+        heads = 2
+        transport_bases = 2
+        layers = 1
+        task_mode = "global"
+        noise_nodes = 0
+        noise_sigma = 0.0
+        train_size = 4
+        val_size = 2
+        test_size = 2
+        data_seed = 7101
+
+    specs = capacity_crossover_specs_from_args(Args())
+    assert [spec.num_nodes for spec in specs] == [16, 16, 16, 16, 16]
+    for spec in specs:
+        assert spec.noise_nodes == 15 - spec.relation_types
+        split = make_split(spec, 1, 123)
+        null_start = 1 + spec.relation_types
+        if null_start < spec.num_nodes:
+            assert torch.allclose(split["content"][:, null_start:, :], torch.zeros_like(split["content"][:, null_start:, :]))
+            assert torch.all(split["pair_rel"][0, null_start:] == 0)
 
 
 def test_sparse_one_hop_cannot_access_global_non_edge_sources_at_one_layer():
