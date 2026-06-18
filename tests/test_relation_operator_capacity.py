@@ -3,6 +3,7 @@ import math
 import torch
 
 from graph_specialisation_metrics.relation_operator_capacity import (
+    CAPACITY_CROSSOVER_MODELS,
     CONTROLLED_MODELS,
     ExperimentSpec,
     batch_from_split,
@@ -55,6 +56,22 @@ def test_controlled_rank_ceilings_hold_for_realised_relation_maps():
     full = build_model(full_spec, "full_dense").to(device).eval()
     full_rank, _ = realised_rank(effective_relation_maps(full, full_spec, device))
     assert full_rank <= full_spec.heads * full_spec.transport_bases
+
+
+def test_capacity_crossover_rank_ceilings_hold_for_global_variants():
+    device = torch.device("cpu")
+    spec = ExperimentSpec(relation_types=6, input_dim=3, target_dim=3, heads=2, transport_bases=3, task_mode="global")
+    routing = build_model(spec, "capacity_routing_only").to(device).eval()
+    routing_rank, _ = realised_rank(effective_relation_maps(routing, spec, device))
+    assert routing_rank <= spec.heads
+
+    transport = build_model(spec, "capacity_transport_only").to(device).eval()
+    transport_rank, _ = realised_rank(effective_relation_maps(transport, spec, device))
+    assert transport_rank <= spec.heads * spec.transport_bases
+
+    full = build_model(spec, "capacity_full_relation_transport").to(device).eval()
+    full_rank, _ = realised_rank(effective_relation_maps(full, spec, device))
+    assert full_rank <= spec.heads * spec.transport_bases
 
 
 def test_sparse_one_hop_cannot_access_global_non_edge_sources_at_one_layer():
@@ -171,12 +188,59 @@ def test_smoke_plot_generation_writes_required_figures(tmp_path):
                                 "teacher_singular_values": "1;0.5",
                             },
                         )
+    for relation_types in [2, 4]:
+        for model in CAPACITY_CROSSOVER_MODELS:
+            path = (
+                tmp_path
+                / "checkpoints"
+                / "capacity_crossover_global"
+                / "global"
+                / f"R{relation_types}"
+                / "L1"
+                / "n0_s0"
+                / model
+                / "seed_1001"
+                / "complete.json"
+            )
+            write_json(
+                path,
+                {
+                    "experiment": "capacity_crossover_global",
+                    "task_mode": "global",
+                    "model": model,
+                    "model_label": model,
+                    "seed": 1001,
+                    "relation_types": relation_types,
+                    "input_dim": 32,
+                    "target_dim": 32,
+                    "hidden_dim": 32,
+                    "heads": 4,
+                    "transport_bases": 4,
+                    "layers": 1,
+                    "noise_nodes": 0,
+                    "noise_sigma": 0.0,
+                    "parameters": 10,
+                    "best_epoch": 1,
+                    "best_val_rel_mse": 0.1,
+                    "test_rel_mse": 0.1 + 0.01 * relation_types,
+                    "test_mse": 0.1,
+                    "test_mae": 0.1,
+                    "realised_rank": min(relation_types, 4),
+                    "realised_singular_values": "1;0.5",
+                    "routing_floor": 0.1,
+                    "full_transport_floor": 0.0,
+                    "teacher_rank": relation_types,
+                    "teacher_singular_values": "1;0.5",
+                },
+            )
+
     class Args:
         output_root = tmp_path
 
     plot_all(Args())
     expected = [
         "relation_rank_crossover_local.pdf",
+        "relation_rank_crossover_global_capacity_h4.pdf",
         "transport_support_local_relation_operator.pdf",
         "transport_support_global_relation_operator.pdf",
         "overglobalisation_irrelevant_content.pdf",

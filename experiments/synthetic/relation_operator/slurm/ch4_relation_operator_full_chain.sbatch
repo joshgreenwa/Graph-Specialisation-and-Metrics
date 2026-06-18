@@ -26,6 +26,7 @@ mkdir -p logs
 COMMON_FLAGS=(
   --output-root "${CH4_OUTPUT_ROOT}"
   --seeds "${CH4_SEEDS:-1001,1002,1003}"
+  --r-sweep "${CH4_R_SWEEP:-1,2,4,8,12,16}"
   --noise-sweep "${CH4_NOISE_SWEEP:-0,0.25,0.5,1,2,4}"
   --relation-types "${CH4_RELATION_TYPES:-16}"
   --train-size "${CH4_TRAIN_SIZE:-8192}"
@@ -85,6 +86,12 @@ case "${CH4_STAGE}" in
     python -u -m graph_specialisation_metrics.relation_operator_capacity run-crossover \
       "${COMMON_FLAGS[@]}"
     ;;
+  capacity-crossover)
+    python -u -m graph_specialisation_metrics.relation_operator_capacity run-capacity-crossover \
+      "${COMMON_FLAGS[@]}"
+    python -u -m graph_specialisation_metrics.relation_operator_capacity plot \
+      --output-root "${CH4_OUTPUT_ROOT}"
+    ;;
   transport-support)
     python -u -m graph_specialisation_metrics.relation_operator_capacity run-transport-support \
       "${COMMON_FLAGS[@]}" "${PRACTICAL_FLAGS[@]}"
@@ -110,7 +117,7 @@ case "${CH4_STAGE}" in
       "${COMMON_FLAGS[@]}"
     ;;
   *)
-    echo "Unknown CH4_STAGE=${CH4_STAGE}. Use full, controlled, practical, plot, crossover, transport-support, transport-support-official, overglobalisation, overglobalisation-grit, or depth-escape." >&2
+    echo "Unknown CH4_STAGE=${CH4_STAGE}. Use full, controlled, practical, plot, crossover, capacity-crossover, transport-support, transport-support-official, overglobalisation, overglobalisation-grit, or depth-escape." >&2
     exit 2
     ;;
 esac

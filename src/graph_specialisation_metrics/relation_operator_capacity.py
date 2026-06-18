@@ -39,7 +39,14 @@ DEFAULT_SEEDS = (1001, 1002, 1003)
 CONTROLLED_MODELS = ("routing_dense", "full_dense", "routing_1hop", "full_1hop")
 PRACTICAL_MODELS = ("graphormer_manual", "graphgps_official", "grit_official", "gatedgcn_plus_official")
 OFFICIAL_GRIT_MODELS = ("grit_official", "grit_1hop_official")
-ALL_MODELS = tuple(dict.fromkeys(CONTROLLED_MODELS + PRACTICAL_MODELS + OFFICIAL_GRIT_MODELS))
+CAPACITY_CROSSOVER_MODELS = (
+    "capacity_routing_only",
+    "capacity_transport_only",
+    "capacity_additive_value_bias",
+    "capacity_multiplicative_value_gate",
+    "capacity_full_relation_transport",
+)
+ALL_MODELS = tuple(dict.fromkeys(CONTROLLED_MODELS + PRACTICAL_MODELS + OFFICIAL_GRIT_MODELS + CAPACITY_CROSSOVER_MODELS))
 TASK_MODES = ("local", "global")
 PARAMETER_MATCH_WIDTHS = (32, 48, 64, 96, 128, 192)
 EPS = 1.0e-12
@@ -54,6 +61,11 @@ MODEL_LABELS = {
     "grit_official": "Official GRIT dense",
     "grit_1hop_official": "Official GRIT 1-hop",
     "gatedgcn_plus_official": "Official GatedGCN+",
+    "capacity_routing_only": "Routing-only",
+    "capacity_transport_only": "Transport-only",
+    "capacity_additive_value_bias": "Additive value bias",
+    "capacity_multiplicative_value_gate": "Multiplicative value gate",
+    "capacity_full_relation_transport": "Full relation transport",
 }
 
 MODEL_COLORS = {
@@ -66,6 +78,19 @@ MODEL_COLORS = {
     "grit_official": "#8b5fbf",
     "grit_1hop_official": "#b89ad9",
     "gatedgcn_plus_official": "#c4862f",
+    "capacity_routing_only": "#4969a8",
+    "capacity_transport_only": "#4f8f5b",
+    "capacity_additive_value_bias": "#7f7f7f",
+    "capacity_multiplicative_value_gate": "#c4862f",
+    "capacity_full_relation_transport": "#c2473f",
+}
+
+CAPACITY_MODEL_DESCRIPTIONS = {
+    "capacity_routing_only": "Relation labels affect only scalar attention scores; values use shared linear maps.",
+    "capacity_transport_only": "Attention is unstructured/uniform; relation labels select low-rank value-transport maps.",
+    "capacity_additive_value_bias": "Attention is unstructured/uniform; relation labels add a value bias independent of content.",
+    "capacity_multiplicative_value_gate": "Attention is unstructured/uniform; relation labels gate transported value channels multiplicatively.",
+    "capacity_full_relation_transport": "Relation labels affect scalar attention and low-rank value-transport maps.",
 }
 
 
@@ -361,6 +386,89 @@ class ControlledRelationModel(nn.Module):
         support = batch.support_dense if self.dense_support else batch.support_sparse
         for _ in range(int(self.spec.layers)):
             state = self.layer(state, batch.pair_rel, support)
+        return self.output_head(state[:, 0, :])
+
+
+class CapacityRelationModel(nn.Module):
+    """Dense global capacity variants for the clean relation-rank crossover.
+
+    These variants intentionally differ only in where the relation label enters:
+    scalar routing, value transport, additive value bias, diagonal value gating,
+    or scalar routing plus value transport.  The task uses dense support so the
+    experiment isolates relation-conditioned capacity rather than reach.
+    """
+
+    def __init__(self, spec: ExperimentSpec, *, variant: str) -> None:
+        super().__init__()
+        if variant not in CAPACITY_CROSSOVER_MODELS:
+            raise ValueError(f"unknown capacity variant {variant!r}")
+        self.spec = spec
+        self.variant = variant
+        h = int(spec.heads)
+        a = int(spec.transport_bases)
+        d = int(spec.input_dim)
+        r = int(spec.relation_types)
+        self.routing_bias = nn.Parameter(torch.zeros(h, r + 1))
+        self.routing_basis = nn.Parameter(torch.randn(h, d, d) / math.sqrt(d))
+        self.transport_basis = nn.Parameter(torch.randn(h, a, d, d) / math.sqrt(d))
+        self.transport_coeff = nn.Parameter(torch.randn(r + 1, h, a) * 0.02)
+        self.additive_value_bias = nn.Parameter(torch.zeros(r + 1, h, d))
+        self.value_gate = nn.Parameter(torch.ones(r + 1, h, d))
+        self.output_head = nn.Linear(d, int(spec.target_dim))
+        if int(spec.target_dim) == d:
+            with torch.no_grad():
+                self.output_head.weight.copy_(torch.eye(d))
+                self.output_head.bias.zero_()
+
+    def relation_attention(self, pair_rel: torch.Tensor, support: torch.Tensor) -> torch.Tensor:
+        bsz, n, _ = pair_rel.shape
+        if self.variant in {"capacity_routing_only", "capacity_full_relation_transport"}:
+            logits = self.routing_bias[:, pair_rel].permute(1, 0, 2, 3)
+        else:
+            logits = torch.zeros((bsz, int(self.spec.heads), n, n), dtype=torch.float32, device=pair_rel.device)
+        return masked_softmax(logits, support[:, None, :, :])
+
+    def shared_value_message(self, state: torch.Tensor, attn: torch.Tensor) -> torch.Tensor:
+        msg_per_head = torch.einsum("bjd,hdo->bhjo", state, self.routing_basis)
+        return torch.einsum("bhij,bhjo->bhio", attn, msg_per_head)
+
+    def low_rank_transport_message(self, state: torch.Tensor, pair_rel: torch.Tensor, attn: torch.Tensor) -> torch.Tensor:
+        bsz, _, d = state.shape
+        h = int(self.spec.heads)
+        ctx = state.new_zeros((bsz, h, pair_rel.shape[1], d))
+        coeff = self.transport_coeff[pair_rel]
+        for basis_idx in range(int(self.spec.transport_bases)):
+            basis_msg = torch.einsum("bjd,hdo->bhjo", state, self.transport_basis[:, basis_idx])
+            pair_weight = attn * coeff[..., basis_idx].permute(0, 3, 1, 2)
+            ctx = ctx + torch.einsum("bhij,bhjo->bhio", pair_weight, basis_msg)
+        return ctx
+
+    def layer(self, state: torch.Tensor, pair_rel: torch.Tensor, support: torch.Tensor) -> torch.Tensor:
+        attn = self.relation_attention(pair_rel, support)
+        if self.variant == "capacity_routing_only":
+            ctx = self.shared_value_message(state, attn)
+        elif self.variant == "capacity_transport_only":
+            ctx = self.low_rank_transport_message(state, pair_rel, attn)
+        elif self.variant == "capacity_additive_value_bias":
+            shared = torch.einsum("bjd,hdo->bhjo", state, self.routing_basis)
+            bias = self.additive_value_bias[pair_rel].permute(0, 3, 1, 2, 4)
+            msg = shared[:, :, None, :, :] + bias
+            ctx = torch.einsum("bhij,bhijd->bhid", attn, msg)
+        elif self.variant == "capacity_multiplicative_value_gate":
+            shared = torch.einsum("bjd,hdo->bhjo", state, self.routing_basis)
+            gate = self.value_gate[pair_rel].permute(0, 3, 1, 2, 4)
+            msg = shared[:, :, None, :, :] * gate
+            ctx = torch.einsum("bhij,bhijd->bhid", attn, msg)
+        elif self.variant == "capacity_full_relation_transport":
+            ctx = self.low_rank_transport_message(state, pair_rel, attn)
+        else:
+            raise ValueError(f"unknown capacity variant {self.variant!r}")
+        return state + ctx.sum(dim=1)
+
+    def forward(self, batch: RelationBatch) -> torch.Tensor:
+        state = batch.content
+        for _ in range(int(self.spec.layers)):
+            state = self.layer(state, batch.pair_rel, batch.support_dense)
         return self.output_head(state[:, 0, :])
 
 
@@ -738,6 +846,8 @@ class OfficialGNNPlusGatedGCNRelationModel(nn.Module):
 
 
 def build_model(spec: ExperimentSpec, model_name: str) -> nn.Module:
+    if model_name in CAPACITY_CROSSOVER_MODELS:
+        return CapacityRelationModel(spec, variant=model_name)
     if model_name == "routing_dense":
         return ControlledRelationModel(spec, full_transport=False, dense_support=True)
     if model_name == "full_dense":
@@ -1164,6 +1274,20 @@ def run_crossover(args: argparse.Namespace) -> None:
     train_grid(args, experiment="crossover", specs=specs, models=CONTROLLED_MODELS, seeds=parse_int_list(args.seeds))
 
 
+def run_capacity_crossover(args: argparse.Namespace) -> None:
+    specs = [
+        base_spec_from_args(args, relation_types=r, task_mode="global", noise_nodes=0, noise_sigma=0.0, layers=1)
+        for r in parse_int_list(args.r_sweep)
+    ]
+    train_grid(
+        args,
+        experiment="capacity_crossover_global",
+        specs=specs,
+        models=CAPACITY_CROSSOVER_MODELS,
+        seeds=parse_int_list(args.seeds),
+    )
+
+
 def run_transport_support(args: argparse.Namespace) -> None:
     models = list(CONTROLLED_MODELS)
     if args.include_practical:
@@ -1360,6 +1484,86 @@ def plot_crossover(root: Path) -> Path | None:
     fig.suptitle("Relation Rank Crossover Under Local Support", y=1.13, fontsize=13)
     fig.tight_layout()
     path = ensure_dir(root / "figures") / "relation_rank_crossover_local.pdf"
+    fig.savefig(path, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[plot] wrote {path}")
+    return path
+
+
+def write_capacity_model_table(root: Path) -> Path:
+    rows = [
+        {
+            "model": model,
+            "display_name": MODEL_LABELS[model],
+            "description": CAPACITY_MODEL_DESCRIPTIONS[model],
+        }
+        for model in CAPACITY_CROSSOVER_MODELS
+    ]
+    path = ensure_dir(root / "metrics") / "capacity_crossover_model_table.csv"
+    write_csv(path, rows)
+    return path
+
+
+def plot_capacity_crossover(root: Path) -> Path | None:
+    rows = [row for row in metric_rows(root) if row["experiment"] == "capacity_crossover_global"]
+    if not rows:
+        return None
+    write_capacity_model_table(root)
+    plt = import_plotting()
+    agg_mse = aggregate(rows, ("model", "relation_types"), "test_rel_mse")
+    agg_rank = aggregate(rows, ("model", "relation_types"), "realised_rank")
+    rs = sorted({int(row["relation_types"]) for row in rows})
+    first = rows[0]
+    heads = int(first.get("heads", 4))
+    input_dim = int(first.get("input_dim", 32))
+    fig, axes = plt.subplots(1, 2, figsize=(10.2, 4.2))
+    for model in CAPACITY_CROSSOVER_MODELS:
+        xs = rs
+        ys = [agg_mse.get((model, str(r)), (np.nan, 0.0))[0] for r in xs]
+        es = [agg_mse.get((model, str(r)), (np.nan, 0.0))[1] for r in xs]
+        axes[0].errorbar(
+            xs,
+            ys,
+            yerr=es,
+            marker="o",
+            linewidth=1.9,
+            capsize=3,
+            label=MODEL_LABELS[model],
+            color=MODEL_COLORS[model],
+        )
+        ranks = [agg_rank.get((model, str(r)), (np.nan, 0.0))[0] for r in xs]
+        axes[1].plot(xs, ranks, marker="o", linewidth=1.9, label=MODEL_LABELS[model], color=MODEL_COLORS[model])
+    floor_by_r: dict[int, Mapping[str, Any]] = {}
+    for row in rows:
+        floor_by_r.setdefault(int(row["relation_types"]), row)
+    axes[0].plot(
+        rs,
+        [float(floor_by_r[r]["routing_floor"]) for r in rs],
+        "--",
+        color="#222222",
+        linewidth=1.4,
+        label="Routing-only lower bound",
+    )
+    axes[0].set_xlabel("number of relations R")
+    axes[0].set_ylabel("relative MSE")
+    axes[0].set_title("Error versus relation count")
+    axes[0].set_yscale("log")
+    axes[0].grid(axis="y", color="#dddddd", linewidth=0.6)
+    axes[1].axhline(heads, linestyle="--", color="#555555", linewidth=1.0, label=f"H={heads} routing ceiling")
+    axes[1].set_xlabel("number of relations R")
+    axes[1].set_ylabel("realised relation rank")
+    axes[1].set_title("Effective rank of the learned operator")
+    axes[1].grid(axis="y", color="#dddddd", linewidth=0.6)
+    handles, labels = axes[0].get_legend_handles_labels()
+    rank_handles, rank_labels = axes[1].get_legend_handles_labels()
+    for handle, label in zip(rank_handles, rank_labels, strict=True):
+        if label not in labels:
+            handles.append(handle)
+            labels.append(label)
+    fig.legend(handles, labels, loc="upper center", ncol=3, frameon=False, bbox_to_anchor=(0.5, 1.05))
+    fig.suptitle(f"Dense Global Relation-Operator Capacity (H={heads}, d={input_dim})", y=1.15, fontsize=13)
+    fig.tight_layout()
+    path = ensure_dir(root / "figures") / "relation_rank_crossover_global_capacity_h4.pdf"
     fig.savefig(path, bbox_inches="tight")
     plt.close(fig)
     print(f"[plot] wrote {path}")
@@ -1628,6 +1832,7 @@ def plot_all(args: argparse.Namespace) -> None:
     root = Path(args.output_root)
     write_summary_tables(root)
     plot_crossover(root)
+    plot_capacity_crossover(root)
     plot_crossover_with_grit(root)
     plot_transport_support(root, "local")
     plot_transport_support(root, "global")
@@ -1673,6 +1878,7 @@ def print_hpc_commands(args: argparse.Namespace) -> None:
     print("mkdir -p logs")
     for name, command, extra in [
         ("ch4-ctrl", "run-crossover", ""),
+        ("ch4-capacity", "run-capacity-crossover", " --seeds 1001 --r-sweep 2,4,5,6,8 --hidden-dim 32"),
         ("ch4-ts", "run-transport-support", " --include-practical"),
         ("ch4-ts-official", "run-transport-support-official", ""),
         ("ch4-noise", "run-overglobalisation", " --include-practical"),
@@ -1739,6 +1945,7 @@ def build_parser() -> argparse.ArgumentParser:
         ("train", "Train selected model(s) for one explicit config.", run_train),
         ("evaluate", "Rebuild metrics tables from completed run summaries.", run_evaluate),
         ("run-crossover", "Run the local relation-rank crossover experiment.", run_crossover),
+        ("run-capacity-crossover", "Run the clean dense global capacity crossover experiment.", run_capacity_crossover),
         ("run-transport-support", "Run local/global transport-support experiments.", run_transport_support),
         ("run-transport-support-official", "Run official GraphGPS/GRIT/GNN+ transport-support experiments.", run_transport_support_official),
         ("run-overglobalisation", "Run irrelevant-content over-globalisation experiments.", run_overglobalisation),
