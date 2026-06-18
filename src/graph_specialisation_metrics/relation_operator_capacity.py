@@ -1218,6 +1218,12 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--experiment", type=str, default="manual")
     parser.add_argument("--input-dim", type=int, default=32)
     parser.add_argument("--target-dim", type=int, default=32)
+    parser.add_argument(
+        "--n-nodes",
+        type=int,
+        default=32,
+        help="Accepted for SLURM wrapper compatibility; Ch4 node count is determined by R plus irrelevant-content nodes.",
+    )
     parser.add_argument("--hidden-dim", type=int, default=64)
     parser.add_argument("--heads", type=int, default=4)
     parser.add_argument("--transport-bases", type=int, default=4)
