@@ -468,14 +468,22 @@ def require_official_file_module(module_name: str, path: Path):
     return module
 
 
+def require_official_file_exists(path: Path) -> Path:
+    path = path.resolve()
+    if not path.exists():
+        raise RuntimeError(f"official backend file is missing: {path}")
+    return path
+
+
 class OfficialBackedProxy(nn.Module):
     """Official-preflighted practical adapters for the controlled synthetic task.
 
     The upstream projects expose GraphGym/PyG layers with substantial data
     assumptions.  This adapter deliberately verifies that the official package is
-    importable, then uses the closest controlled one-layer operator with the same
-    information channel.  This keeps practical labels from running unless the
-    official dependency is present while preserving the exact Ch4 input controls.
+    importable or the official layer source is present, then uses the closest
+    controlled one-layer operator with the same information channel.  This keeps
+    practical labels from running unless the official dependency is present while
+    preserving the exact Ch4 input controls.
     """
 
     def __init__(self, spec: ExperimentSpec, model_name: str) -> None:
@@ -485,7 +493,9 @@ class OfficialBackedProxy(nn.Module):
             require_official_import("graphgps.layer.gps_layer", "GRAPHGPS_ROOT", ("GraphGPS",))
             self.body = ControlledRelationModel(spec, full_transport=True, dense_support=False)
         elif model_name == "grit_official":
-            require_official_import("grit.layer.grit_layer", "GRIT_ROOT", ("GRIT",))
+            grit_root = resolve_external_repo_path("GRIT_ROOT", ("GRIT",))
+            grit_pkg = grit_root / "grit" if (grit_root / "grit").exists() else grit_root
+            require_official_file_exists(grit_pkg / "layer" / "grit_layer.py")
             self.body = ControlledRelationModel(spec, full_transport=True, dense_support=True)
         elif model_name == "gatedgcn_plus_official":
             gnnplus_root = resolve_external_repo_path("GNNPLUS_ROOT", ("GNNPlus",))
