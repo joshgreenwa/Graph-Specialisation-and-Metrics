@@ -41,12 +41,11 @@ PRACTICAL_MODELS = ("graphormer_manual", "graphgps_official", "grit_official", "
 OFFICIAL_GRIT_MODELS = ("grit_official", "grit_1hop_official")
 CAPACITY_CROSSOVER_MODELS = (
     "capacity_routing_only",
-    "capacity_additive_value_bias_routed",
     "capacity_multiplicative_value_gate",
     "capacity_multiplicative_value_gate_routed",
     "capacity_full_relation_transport",
 )
-LEGACY_CAPACITY_MODELS = ("capacity_transport_only", "capacity_additive_value_bias")
+LEGACY_CAPACITY_MODELS = ("capacity_transport_only", "capacity_additive_value_bias", "capacity_additive_value_bias_routed")
 CAPACITY_MODEL_NAMES = tuple(dict.fromkeys(CAPACITY_CROSSOVER_MODELS + LEGACY_CAPACITY_MODELS))
 ALL_MODELS = tuple(dict.fromkeys(CONTROLLED_MODELS + PRACTICAL_MODELS + OFFICIAL_GRIT_MODELS + CAPACITY_MODEL_NAMES))
 TASK_MODES = ("local", "global")
@@ -1614,7 +1613,6 @@ def plot_capacity_crossover(root: Path, target_nodes: int | None = None) -> Path
     relmse_line_order = [
         "capacity_routing_only",
         "capacity_multiplicative_value_gate",
-        "capacity_additive_value_bias_routed",
         "capacity_multiplicative_value_gate_routed",
         "capacity_full_relation_transport",
     ]
