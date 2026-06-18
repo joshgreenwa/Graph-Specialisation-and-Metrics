@@ -353,6 +353,34 @@ def load_dataset(path: Path) -> tuple[ExperimentSpec, dict[str, dict[str, torch.
     return ExperimentSpec(**payload["spec"]), payload["splits"]
 
 
+def split_from_content(spec: ExperimentSpec, content: torch.Tensor) -> dict[str, torch.Tensor]:
+    content = content.detach().cpu().float()
+    if content.ndim != 3:
+        raise ValueError(f"content must have shape [B,N,D], got {tuple(content.shape)}")
+    bsz, n, d = content.shape
+    if n != spec.num_nodes or d != spec.input_dim:
+        raise ValueError(
+            f"content shape {tuple(content.shape)} does not match spec N={spec.num_nodes}, D={spec.input_dim}"
+        )
+    x = torch.zeros(bsz, n, spec.feature_dim, dtype=torch.float32)
+    x[..., : spec.input_dim] = content
+    x[:, 0, spec.input_dim] = 1.0
+    x[:, 1:, spec.input_dim + 1] = 1.0
+    return {
+        "x": x,
+        "content": content,
+        "y": teacher_output_from_content(spec, content),
+        "teacher_weights": relation_weights(spec),
+        **graph_tensors(spec),
+    }
+
+
+def teacher_output_from_content(spec: ExperimentSpec, content: torch.Tensor) -> torch.Tensor:
+    weights = relation_weights(spec).to(content.device, content.dtype)
+    source_content = content[:, 1 : spec.relation_types + 1, :]
+    return torch.einsum("rtd,brd->bt", weights, source_content) / math.sqrt(float(spec.relation_types))
+
+
 def batch_from_split(split: Mapping[str, torch.Tensor], indices: torch.Tensor) -> RelationBatch:
     bsz = int(indices.numel())
     pair_rel = split["pair_rel"].unsqueeze(0).expand(bsz, -1, -1)
@@ -1019,6 +1047,150 @@ def evaluate_model(model: nn.Module, split: Mapping[str, torch.Tensor], device: 
 
 
 @torch.no_grad()
+def predict_model_from_content(
+    model: nn.Module,
+    spec: ExperimentSpec,
+    content: torch.Tensor,
+    device: torch.device,
+    batch_size: int,
+) -> torch.Tensor:
+    model.eval()
+    preds = []
+    for start in range(0, int(content.shape[0]), int(batch_size)):
+        split = split_from_content(spec, content[start : start + int(batch_size)])
+        idx = torch.arange(int(split["x"].shape[0]))
+        preds.append(model(batch_from_split(split, idx).to(device)).detach().cpu())
+    return torch.cat(preds, dim=0)
+
+
+@torch.no_grad()
+def predict_oracle_from_content(spec: ExperimentSpec, content: torch.Tensor, batch_size: int) -> torch.Tensor:
+    preds = []
+    for start in range(0, int(content.shape[0]), int(batch_size)):
+        preds.append(teacher_output_from_content(spec, content[start : start + int(batch_size)]).detach().cpu())
+    return torch.cat(preds, dim=0)
+
+
+def source_map_partner_pairs(
+    spec: ExperimentSpec,
+    *,
+    partners_per_source: int,
+    partner_mode: str,
+    seed: int,
+) -> dict[int, list[int]]:
+    rng = np.random.default_rng(int(seed))
+    content_nodes = list(range(1, spec.num_nodes))
+    distractors = list(range(1 + int(spec.relation_types), spec.num_nodes))
+    out: dict[int, list[int]] = {}
+    for source in content_nodes:
+        if partner_mode == "distractors" and len(distractors) > 1:
+            candidates = [node for node in distractors if node != source]
+        elif partner_mode == "all_content":
+            candidates = [node for node in content_nodes if node != source]
+        else:
+            candidates = [node for node in content_nodes if node != source]
+        if not candidates:
+            out[source] = []
+            continue
+        if len(candidates) > int(partners_per_source):
+            sampled = rng.choice(candidates, size=int(partners_per_source), replace=False).tolist()
+        else:
+            sampled = list(candidates)
+        out[source] = [int(node) for node in sampled]
+    return out
+
+
+@torch.no_grad()
+def compute_node_level_source_map(
+    *,
+    spec: ExperimentSpec,
+    base_content: torch.Tensor,
+    predictor: Any,
+    batch_size: int,
+    partners_per_source: int,
+    partner_mode: str,
+    seed: int,
+) -> tuple[np.ndarray, list[dict[str, Any]]]:
+    """Partner-marginalised source map for the focal receiver node 0.
+
+    This is the node-level source-map branch from the functional-analysis spec:
+    no P1/P2 patching is used because the Ch4 relation-operator output is
+    already the focal receiver's output.  Each source entry is the RMS direct
+    delta over swaps (w,p), normalised by swapped-content distance.
+    """
+
+    base_content = base_content.detach().cpu().float()
+    if base_content.ndim != 2:
+        raise ValueError(f"base_content must have shape [N,D], got {tuple(base_content.shape)}")
+    base_pred = predictor(base_content.unsqueeze(0), batch_size=batch_size)[0]
+    partners_by_source = source_map_partner_pairs(
+        spec,
+        partners_per_source=int(partners_per_source),
+        partner_mode=str(partner_mode),
+        seed=int(seed),
+    )
+    scores = np.zeros(spec.num_nodes, dtype=float)
+    rows: list[dict[str, Any]] = []
+    for source, partners in partners_by_source.items():
+        if not partners:
+            rows.append(
+                {
+                    "source_node": int(source),
+                    "partner_node": "",
+                    "normalised_delta": "",
+                    "raw_delta_norm": "",
+                    "content_distance": "",
+                }
+            )
+            continue
+        swapped = base_content.unsqueeze(0).repeat(len(partners), 1, 1)
+        for idx, partner in enumerate(partners):
+            swapped[idx, source, :] = base_content[partner, :]
+            swapped[idx, partner, :] = base_content[source, :]
+        pred = predictor(swapped, batch_size=batch_size)
+        delta = torch.linalg.vector_norm(pred - base_pred.unsqueeze(0), dim=1)
+        distances = torch.tensor(
+            [
+                float(torch.linalg.vector_norm(base_content[source] - base_content[partner]).item())
+                for partner in partners
+            ],
+            dtype=torch.float32,
+        ).clamp_min(1.0e-8)
+        normalised = (delta.cpu() / distances).numpy()
+        scores[source] = float(np.sqrt(np.mean(np.square(normalised)))) if normalised.size else 0.0
+        for partner, raw_delta, content_distance, normalised_delta in zip(
+            partners,
+            delta.cpu().numpy(),
+            distances.cpu().numpy(),
+            normalised,
+            strict=True,
+        ):
+            rows.append(
+                {
+                    "source_node": int(source),
+                    "partner_node": int(partner),
+                    "normalised_delta": float(normalised_delta),
+                    "raw_delta_norm": float(raw_delta),
+                    "content_distance": float(content_distance),
+                }
+            )
+    return scores, rows
+
+
+def load_model_checkpoint(root: Path, experiment: str, spec: ExperimentSpec, model_name: str, seed: int, device: torch.device) -> tuple[nn.Module, ExperimentSpec]:
+    ckpt_path = checkpoint_dir(root, experiment, spec, model_name, seed) / "best.pt"
+    if not ckpt_path.exists():
+        raise FileNotFoundError(f"checkpoint not found for source-map validation: {ckpt_path}")
+    payload = torch.load(ckpt_path, map_location=device)
+    ckpt_spec = ExperimentSpec(**payload.get("spec", asdict(spec)))
+    ckpt_model = str(payload.get("model", model_name))
+    model = build_model(ckpt_spec, ckpt_model).to(device)
+    model.load_state_dict(payload["state_dict"])
+    model.eval()
+    return model, ckpt_spec
+
+
+@torch.no_grad()
 def effective_relation_maps(model: nn.Module, spec: ExperimentSpec, device: torch.device) -> torch.Tensor:
     model.eval()
     maps = torch.zeros(spec.relation_types, spec.target_dim, spec.input_dim, device=device)
@@ -1514,6 +1686,246 @@ def run_train(args: argparse.Namespace) -> None:
 
 def run_evaluate(args: argparse.Namespace) -> None:
     write_summary_tables(Path(args.output_root))
+
+
+def node_type_for_source(spec: ExperimentSpec, node: int) -> str:
+    if int(node) == 0:
+        return "focal_receiver"
+    if 1 <= int(node) <= int(spec.relation_types):
+        return "relation_source"
+    return "null_distractor"
+
+
+def normalise_scores(scores: np.ndarray) -> np.ndarray:
+    denom = float(np.nanmax(scores)) if np.isfinite(scores).any() else 0.0
+    return np.asarray(scores, dtype=float) / max(denom, EPS)
+
+
+def source_null_ratio(spec: ExperimentSpec, scores: np.ndarray) -> float:
+    relation = np.asarray(scores[1 : int(spec.relation_types) + 1], dtype=float)
+    distractor = np.asarray(scores[int(spec.relation_types) + 1 :], dtype=float)
+    if not len(distractor):
+        return float("inf")
+    return float(np.nanmean(relation) / max(float(np.nanmean(distractor)), EPS))
+
+
+def relation_graph_layout(spec: ExperimentSpec) -> dict[int, tuple[float, float]]:
+    positions: dict[int, tuple[float, float]] = {0: (0.0, 0.0)}
+    r = int(spec.relation_types)
+    if r:
+        angles = np.linspace(math.pi / 2, math.pi / 2 + 2 * math.pi, r, endpoint=False)
+        for idx, angle in enumerate(angles, start=1):
+            positions[idx] = (1.18 * math.cos(float(angle)), 1.18 * math.sin(float(angle)))
+    distractors = list(range(r + 1, spec.num_nodes))
+    if distractors:
+        offset = math.pi / max(len(distractors), 1)
+        angles = np.linspace(math.pi / 2 + offset, math.pi / 2 + 2 * math.pi + offset, len(distractors), endpoint=False)
+        for node, angle in zip(distractors, angles, strict=True):
+            positions[node] = (2.08 * math.cos(float(angle)), 2.08 * math.sin(float(angle)))
+    return positions
+
+
+def draw_source_map_graph(ax: Any, spec: ExperimentSpec, scores: np.ndarray, title: str, subtitle: str) -> Any:
+    plt = import_plotting()
+    positions = relation_graph_layout(spec)
+    values = normalise_scores(scores)
+    cmap = plt.get_cmap("viridis")
+    for node in range(1, int(spec.relation_types) + 1):
+        x0, y0 = positions[0]
+        x1, y1 = positions[node]
+        ax.plot([x0, x1], [y0, y1], color="#b8b8b8", linewidth=1.0, zorder=0)
+    xs = [positions[node][0] for node in range(spec.num_nodes)]
+    ys = [positions[node][1] for node in range(spec.num_nodes)]
+    edge_colours = []
+    line_widths = []
+    for node in range(spec.num_nodes):
+        kind = node_type_for_source(spec, node)
+        edge_colours.append("#111111" if kind in {"focal_receiver", "relation_source"} else "#a0a0a0")
+        line_widths.append(1.3 if kind in {"focal_receiver", "relation_source"} else 0.6)
+    scatter = ax.scatter(
+        xs,
+        ys,
+        c=values,
+        cmap=cmap,
+        vmin=0.0,
+        vmax=1.0,
+        s=116,
+        edgecolors=edge_colours,
+        linewidths=line_widths,
+        zorder=2,
+    )
+    ax.scatter([positions[0][0]], [positions[0][1]], c="#ffffff", s=38, edgecolors="#111111", linewidths=0.8, zorder=3)
+    ax.text(positions[0][0], positions[0][1], "j", ha="center", va="center", fontsize=8, zorder=4)
+    for node in range(1, int(spec.relation_types) + 1):
+        x, y = positions[node]
+        ax.text(x, y, str(node), ha="center", va="center", fontsize=6.8, color="#ffffff", zorder=4)
+    ax.set_title(title, fontsize=10, pad=8)
+    ax.text(0.5, -0.06, subtitle, transform=ax.transAxes, ha="center", va="top", fontsize=7.3, color="#4a4a4a")
+    ax.set_aspect("equal")
+    ax.set_xticks([])
+    ax.set_yticks([])
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+    ax.set_xlim(-2.45, 2.45)
+    ax.set_ylim(-2.45, 2.45)
+    return scatter
+
+
+def plot_source_map_validation_figure(
+    *,
+    root: Path,
+    spec: ExperimentSpec,
+    graph_index: int,
+    experiment: str,
+    maps: Sequence[tuple[str, str, np.ndarray]],
+) -> Path:
+    plt = import_plotting()
+    oracle_scores = next(scores for label, kind, scores in maps if kind == "oracle")
+    panels: list[tuple[str, np.ndarray, str]] = []
+    panels.append(("Oracle source map", oracle_scores, "ground-truth relation dependence"))
+    oracle_norm = normalise_scores(oracle_scores)
+    for label, kind, scores in maps:
+        if kind == "oracle":
+            continue
+        panels.append((label, scores, f"source/null={source_null_ratio(spec, scores):.1f}"))
+        residual = np.abs(normalise_scores(scores) - oracle_norm)
+        panels.append((f"{label} mismatch", residual, "absolute difference from oracle pattern"))
+    fig_width = max(7.0, 2.25 * len(panels))
+    fig, axes = plt.subplots(1, len(panels), figsize=(fig_width, 3.15), squeeze=False)
+    last_scatter = None
+    for ax, (title, scores, subtitle) in zip(axes[0], panels, strict=True):
+        last_scatter = draw_source_map_graph(ax, spec, scores, title, subtitle)
+    cbar = fig.colorbar(last_scatter, ax=list(axes[0]), fraction=0.028, pad=0.012)
+    cbar.set_label("within-panel relative influence", fontsize=8)
+    fig.suptitle(
+        f"Node-Level Source Maps for the Relation Operator (focal receiver j=0, graph {graph_index})",
+        y=1.04,
+        fontsize=13,
+    )
+    fig.text(
+        0.5,
+        0.01,
+        "Node colour is partner-marginalised RMS response to content swaps, normalised by swapped-content distance. "
+        "Black-outlined numbered nodes are true relation sources.",
+        ha="center",
+        va="bottom",
+        fontsize=8,
+        color="#333333",
+    )
+    fig.subplots_adjust(left=0.02, right=0.94, bottom=0.20, top=0.82, wspace=0.08)
+    noise = f"n{spec.noise_nodes}_s{float(spec.noise_sigma):g}".replace(".", "p")
+    path = (
+        ensure_dir(root / "figures")
+        / f"source_map_validation_{experiment}_{spec.task_mode}_R{spec.relation_types}_{noise}.pdf"
+    )
+    fig.savefig(path, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[plot] wrote {path}")
+    return path
+
+
+def run_source_map_validation(args: argparse.Namespace) -> None:
+    root = Path(args.output_root)
+    device = resolve_device(args.device)
+    models = parse_csv_list(args.models, allowed=ALL_MODELS)
+    seed = parse_int_list(args.seeds)[0]
+    base_spec = base_spec_from_args(args)
+    data_file = save_dataset(root, base_spec, overwrite=bool(args.overwrite_data))
+    data_spec, splits = load_dataset(data_file)
+    graph_index = int(args.source_map_graph_index)
+    if graph_index < 0 or graph_index >= int(splits["test"]["content"].shape[0]):
+        raise ValueError(f"--source-map-graph-index={graph_index} is outside the test split")
+    if str(args.source_map_partner_mode) == "distractors" and int(data_spec.noise_nodes) < 2:
+        print("[source-map] warning: fewer than two distractor nodes; falling back to all-content partners where needed")
+    base_content = splits["test"]["content"][graph_index]
+    batch_size = int(args.eval_batch_size)
+    partner_count = int(args.source_map_partners)
+    partner_mode = str(args.source_map_partner_mode)
+    source_seed = int(args.data_seed) + 4049 + graph_index
+    maps: list[tuple[str, str, np.ndarray]] = []
+    node_rows: list[dict[str, Any]] = []
+    pair_rows: list[dict[str, Any]] = []
+
+    oracle_scores, oracle_pair_rows = compute_node_level_source_map(
+        spec=data_spec,
+        base_content=base_content,
+        predictor=lambda content, batch_size: predict_oracle_from_content(data_spec, content, batch_size),
+        batch_size=batch_size,
+        partners_per_source=partner_count,
+        partner_mode=partner_mode,
+        seed=source_seed,
+    )
+    maps.append(("Oracle", "oracle", oracle_scores))
+    for row in oracle_pair_rows:
+        pair_rows.append({"map": "oracle", "model": "oracle", **row})
+
+    for node, score in enumerate(oracle_scores):
+        node_rows.append(
+            {
+                "map": "oracle",
+                "model": "oracle",
+                "experiment": str(args.experiment),
+                "task_mode": data_spec.task_mode,
+                "graph_index": graph_index,
+                "source_node": int(node),
+                "node_type": node_type_for_source(data_spec, node),
+                "score": float(score),
+                "score_normalised": float(normalise_scores(oracle_scores)[node]),
+                "partner_mode": partner_mode,
+                "partners_per_source": partner_count,
+            }
+        )
+
+    for model_name in models:
+        model, ckpt_spec = load_model_checkpoint(root, str(args.experiment), base_spec, model_name, seed, device)
+        scores, model_pair_rows = compute_node_level_source_map(
+            spec=ckpt_spec,
+            base_content=base_content,
+            predictor=lambda content, batch_size, m=model, s=ckpt_spec: predict_model_from_content(
+                m, s, content, device, batch_size
+            ),
+            batch_size=batch_size,
+            partners_per_source=partner_count,
+            partner_mode=partner_mode,
+            seed=source_seed,
+        )
+        label = MODEL_LABELS[model_name]
+        maps.append((label, "model", scores))
+        for row in model_pair_rows:
+            pair_rows.append({"map": label, "model": model_name, **row})
+        norm = normalise_scores(scores)
+        for node, score in enumerate(scores):
+            node_rows.append(
+                {
+                    "map": label,
+                    "model": model_name,
+                    "experiment": str(args.experiment),
+                    "task_mode": ckpt_spec.task_mode,
+                    "graph_index": graph_index,
+                    "source_node": int(node),
+                    "node_type": node_type_for_source(ckpt_spec, node),
+                    "score": float(score),
+                    "score_normalised": float(norm[node]),
+                    "partner_mode": partner_mode,
+                    "partners_per_source": partner_count,
+                }
+            )
+
+    metrics_dir = ensure_dir(root / "metrics")
+    noise = f"n{data_spec.noise_nodes}_s{float(data_spec.noise_sigma):g}".replace(".", "p")
+    node_csv = metrics_dir / f"source_map_validation_{args.experiment}_{data_spec.task_mode}_R{data_spec.relation_types}_{noise}.csv"
+    pair_csv = metrics_dir / f"source_map_validation_pairs_{args.experiment}_{data_spec.task_mode}_R{data_spec.relation_types}_{noise}.csv"
+    write_csv(node_csv, node_rows)
+    write_csv(pair_csv, pair_rows)
+    print(f"[source-map] wrote {node_csv}")
+    print(f"[source-map] wrote {pair_csv}")
+    plot_source_map_validation_figure(
+        root=root,
+        spec=data_spec,
+        graph_index=graph_index,
+        experiment=str(args.experiment),
+        maps=maps,
+    )
 
 
 def import_plotting():
@@ -2301,6 +2713,18 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--data-seed", type=int, default=7101)
     parser.add_argument("--batch-size", type=int, default=2048)
     parser.add_argument("--eval-batch-size", type=int, default=4096)
+    parser.add_argument("--source-map-graph-index", type=int, default=0)
+    parser.add_argument("--source-map-partners", type=int, default=16)
+    parser.add_argument(
+        "--source-map-partner-mode",
+        type=str,
+        default="distractors",
+        choices=("distractors", "all_content"),
+        help=(
+            "Partner pool for Ch4 source-map validation. 'distractors' uses null distractor partners where possible, "
+            "which cleanly validates relation-source recovery on the synthetic task."
+        ),
+    )
     parser.add_argument("--max-epochs", type=int, default=250)
     parser.add_argument("--patience", type=int, default=25)
     parser.add_argument("--lr", type=float, default=2.0e-3)
@@ -2327,6 +2751,7 @@ def build_parser() -> argparse.ArgumentParser:
         ("run-overglobalisation", "Run irrelevant-content over-globalisation experiments.", run_overglobalisation),
         ("run-overglobalisation-grit", "Run official GRIT dense-vs-1-hop over-globalisation experiment.", run_overglobalisation_grit),
         ("run-depth-escape", "Run routing-only depth escape experiments.", run_depth_escape),
+        ("plot-source-map-validation", "Plot Ch4 node-level source-map validation from trained checkpoints.", run_source_map_validation),
         ("plot", "Generate all Ch4 figures from cached metrics.", plot_all),
         ("run-all", "Run all Ch4 stages.", run_all),
         ("print-hpc-commands", "Print HPC sbatch commands.", print_hpc_commands),
