@@ -2465,11 +2465,11 @@ def plot_overglobalisation_probe(root: Path) -> Path | None:
         ("capacity_routing_1hop", "1-hop support", "#c2473f", "--"),
     ]
     panels = [
-        ("overglobalisation_probe", "Distractor-only noise", "Noise is applied only to null content nodes."),
-        ("overglobalisation_uniform_probe", "Signal-preserving uniform noise", "Source nodes are signal+noise; teacher uses the noisy sources."),
+        ("overglobalisation_probe", "Distractor-only noise"),
+        ("overglobalisation_uniform_probe", "Signal-preserving uniform noise"),
     ]
 
-    def plot_panel(ax: Any, rows: Sequence[Mapping[str, Any]], title: str, note: str, *, legend: bool) -> None:
+    def plot_panel(ax: Any, rows: Sequence[Mapping[str, Any]], title: str, *, legend: bool) -> None:
         agg_mse = aggregate(rows, ("model", "noise_sigma"), "test_rel_mse")
         plotted = False
         for model, label, color, linestyle in models:
@@ -2493,16 +2493,15 @@ def plot_overglobalisation_probe(root: Path) -> Path | None:
         ax.set_xlabel("noise magnitude")
         ax.set_title(title)
         ax.grid(axis="y", color="#dddddd", linewidth=0.6)
-        ax.text(0.02, 0.96, note, transform=ax.transAxes, ha="left", va="top", fontsize=7, color="#4a4a4a")
         if legend and plotted:
             ax.legend(frameon=False, loc="upper left")
         if not plotted:
             ax.text(0.5, 0.5, "no completed runs", transform=ax.transAxes, ha="center", va="center", color="#777777")
 
     fig, axes = plt.subplots(1, 2, figsize=(10.2, 4.1), sharey=True)
-    for idx, (ax, (experiment, title, note)) in enumerate(zip(axes, panels, strict=True)):
+    for idx, (ax, (experiment, title)) in enumerate(zip(axes, panels, strict=True)):
         rows = [row for row in all_rows if row["experiment"] == experiment]
-        plot_panel(ax, rows, title, note, legend=(idx == 0))
+        plot_panel(ax, rows, title, legend=(idx == 0))
     axes[0].set_ylabel("relative MSE")
     fig.suptitle("Over-Globalisation in a Local Routing Task (R=4, N=32)", y=1.03, fontsize=13)
     fig.tight_layout()
@@ -2518,7 +2517,6 @@ def plot_overglobalisation_probe(root: Path) -> Path | None:
             ax,
             distractor_rows,
             "Local Routing Task Under Irrelevant Content",
-            "Noise is applied only to null content nodes.",
             legend=True,
         )
         ax.set_ylabel("relative MSE")
