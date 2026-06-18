@@ -1634,7 +1634,7 @@ def plot_capacity_crossover(root: Path, target_nodes: int | None = None) -> Path
         "--",
         color="#222222",
         linewidth=1.4,
-        label="Routing-only lower bound",
+        label=f"Rank-{heads} approximation floor",
     )
     axes[0].set_xlabel("number of relations R")
     axes[0].set_ylabel("relative MSE")
