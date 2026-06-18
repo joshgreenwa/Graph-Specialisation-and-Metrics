@@ -27,6 +27,7 @@ COMMON_FLAGS=(
   --output-root "${CH4_OUTPUT_ROOT}"
   --seeds "${CH4_SEEDS:-1001,1002,1003}"
   --noise-sweep "${CH4_NOISE_SWEEP:-0,0.25,0.5,1,2,4}"
+  --relation-types "${CH4_RELATION_TYPES:-16}"
   --train-size "${CH4_TRAIN_SIZE:-8192}"
   --val-size "${CH4_VAL_SIZE:-2048}"
   --test-size "${CH4_TEST_SIZE:-2048}"
