@@ -1625,8 +1625,6 @@ def plot_capacity_crossover(root: Path, target_nodes: int | None = None) -> Path
             label=MODEL_LABELS[model],
             color=MODEL_COLORS[model],
         )
-        ranks = [agg_rank.get((model, str(r)), (np.nan, 0.0))[0] for r in xs]
-        axes[1].plot(xs, ranks, marker="o", linewidth=1.9, label=MODEL_LABELS[model], color=MODEL_COLORS[model])
     floor_by_r: dict[int, Mapping[str, Any]] = {}
     for row in rows:
         floor_by_r.setdefault(int(row["relation_types"]), row)
@@ -1643,17 +1641,32 @@ def plot_capacity_crossover(root: Path, target_nodes: int | None = None) -> Path
     axes[0].set_title("Error versus relation count")
     axes[0].set_yscale("log")
     axes[0].grid(axis="y", color="#dddddd", linewidth=0.6)
-    axes[1].axhline(heads, linestyle="--", color="#555555", linewidth=1.0, label=f"H={heads} routing ceiling")
+    rank_values = np.full((len(completed_models), len(rs)), np.nan, dtype=float)
+    rank_fraction = np.full_like(rank_values, np.nan)
+    for row_idx, model in enumerate(completed_models):
+        for col_idx, r in enumerate(rs):
+            rank = agg_rank.get((model, str(r)), (np.nan, 0.0))[0]
+            rank_values[row_idx, col_idx] = rank
+            rank_fraction[row_idx, col_idx] = rank / max(float(r), EPS)
+    heat = np.ma.masked_invalid(rank_fraction)
+    image = axes[1].imshow(heat, aspect="auto", vmin=0.0, vmax=1.0, cmap="viridis")
+    axes[1].set_xticks(np.arange(len(rs)), [str(r) for r in rs])
+    axes[1].set_yticks(np.arange(len(completed_models)), [MODEL_LABELS[model] for model in completed_models])
     axes[1].set_xlabel("number of relations R")
-    axes[1].set_ylabel("realised relation rank")
-    axes[1].set_title("Effective rank of the learned operator")
-    axes[1].grid(axis="y", color="#dddddd", linewidth=0.6)
+    axes[1].set_title("Realised rank as fraction of demand")
+    for row_idx in range(len(completed_models)):
+        for col_idx in range(len(rs)):
+            rank = rank_values[row_idx, col_idx]
+            if np.isfinite(rank):
+                frac = rank_fraction[row_idx, col_idx]
+                text_color = "white" if frac < 0.55 else "black"
+                axes[1].text(col_idx, row_idx, f"{rank:.0f}", ha="center", va="center", color=text_color, fontsize=8)
+    for spine in axes[1].spines.values():
+        spine.set_visible(False)
+    axes[1].tick_params(axis="both", length=0)
+    cbar = fig.colorbar(image, ax=axes[1], fraction=0.046, pad=0.03)
+    cbar.set_label("realised rank / R")
     handles, labels = axes[0].get_legend_handles_labels()
-    rank_handles, rank_labels = axes[1].get_legend_handles_labels()
-    for handle, label in zip(rank_handles, rank_labels, strict=True):
-        if label not in labels:
-            handles.append(handle)
-            labels.append(label)
     fig.legend(handles, labels, loc="upper center", ncol=3, frameon=False, bbox_to_anchor=(0.5, 1.05))
     fig.suptitle(f"Dense Global Relation-Operator Capacity (N={total_nodes}, H={heads}, d={input_dim})", y=1.15, fontsize=13)
     fig.tight_layout()
