@@ -1912,6 +1912,13 @@ def plot_support_reach_practical(root: Path) -> Path | None:
         return None
     plt = import_plotting()
     models = [model for model in SUPPORT_REACH_PRACTICAL_MODELS if any(row["model"] == model for row in rows)]
+    display_labels = {
+        "graphormer_manual": "Graphormer",
+        "graphgps_official": "GraphGPS",
+        "grit_official": "GRIT\n(dense)",
+        "grit_1hop_official": "GRIT\n(1-hop)",
+        "gatedgcn_plus_official": "GatedGCN+",
+    }
     agg_mse = aggregate(rows, ("task_mode", "model"), "test_rel_mse")
     fig, axes = plt.subplots(1, 2, figsize=(9.8, 4.1), sharey=True)
     for ax, mode in zip(axes, ("local", "global"), strict=True):
@@ -1921,18 +1928,20 @@ def plot_support_reach_practical(root: Path) -> Path | None:
         ax.bar(
             x,
             vals,
+            width=0.68,
             yerr=err,
             capsize=3,
             color=[MODEL_COLORS[model] for model in models],
             edgecolor="black",
             linewidth=0.5,
         )
-        ax.set_xticks(x, [MODEL_LABELS[model] for model in models], rotation=25, ha="right")
-        ax.set_xlabel("practical model")
+        ax.set_xticks(x, [display_labels.get(model, MODEL_LABELS[model]) for model in models])
+        ax.set_xlabel("practical architecture")
         ax.set_title("Local relation task" if mode == "local" else "Long-range relation task")
         ax.grid(axis="y", color="#dddddd", linewidth=0.6)
+        ax.set_axisbelow(True)
     axes[0].set_ylabel("relative MSE")
-    fig.suptitle("Practical Architectures on the Relation-Support Test (R=8, N=10)", y=1.04, fontsize=13)
+    fig.suptitle("Practical Architectures: Support and Reach (R=8, N=10)", y=1.04, fontsize=13)
     fig.tight_layout()
     path = ensure_dir(root / "figures") / "transport_support_practical_relation_operator.pdf"
     fig.savefig(path, bbox_inches="tight")
