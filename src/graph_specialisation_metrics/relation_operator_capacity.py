@@ -1544,7 +1544,7 @@ def write_capacity_model_table(root: Path) -> Path:
     return path
 
 
-def plot_capacity_crossover(root: Path) -> Path | None:
+def plot_capacity_crossover(root: Path, target_nodes: int | None = None) -> Path | None:
     rows = [row for row in metric_rows(root) if row["experiment"] == "capacity_crossover_global"]
     if not rows:
         return None
@@ -1552,7 +1552,15 @@ def plot_capacity_crossover(root: Path) -> Path | None:
     for row in rows:
         total_nodes = 1 + int(row["relation_types"]) + int(row.get("noise_nodes", 0))
         by_total_nodes.setdefault(total_nodes, []).append(row)
-    if len(by_total_nodes) > 1:
+    if target_nodes is not None and target_nodes in by_total_nodes:
+        if len(by_total_nodes) > 1:
+            print(f"[plot] capacity crossover found multiple graph sizes; using requested N={target_nodes}")
+        rows = by_total_nodes[int(target_nodes)]
+    elif target_nodes is not None and len(by_total_nodes) > 1:
+        available = ", ".join(str(n) for n in sorted(by_total_nodes))
+        print(f"[plot] capacity crossover requested N={target_nodes}, but available graph sizes are {available}; skipping")
+        return None
+    elif len(by_total_nodes) > 1:
         complete_counts = {
             total_nodes: len({(row["model"], row["relation_types"], row["seed"]) for row in grouped})
             for total_nodes, grouped in by_total_nodes.items()
@@ -1890,7 +1898,7 @@ def plot_all(args: argparse.Namespace) -> None:
     root = Path(args.output_root)
     write_summary_tables(root)
     plot_crossover(root)
-    plot_capacity_crossover(root)
+    plot_capacity_crossover(root, target_nodes=getattr(args, "n_nodes", None))
     plot_crossover_with_grit(root)
     plot_transport_support(root, "local")
     plot_transport_support(root, "global")
