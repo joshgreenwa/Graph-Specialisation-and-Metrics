@@ -420,8 +420,27 @@ def resolve_external_repo_path(env_name: str, candidates: Sequence[str]) -> Path
     raise RuntimeError(f"official backend path for {env_name} was not found; checked {checked}")
 
 
+def allow_graphgym_duplicate_registration() -> None:
+    try:
+        graphgym_register = importlib.import_module("torch_geometric.graphgym.register")
+    except Exception:
+        return
+    if getattr(graphgym_register, "_ch4_duplicate_registration_ok", False):
+        return
+    original_register_base = graphgym_register.register_base
+
+    def register_base_idempotent(mapping: dict[str, Any], key: str, module: Any) -> None:
+        if key in mapping:
+            return
+        return original_register_base(mapping, key, module)
+
+    graphgym_register.register_base = register_base_idempotent
+    graphgym_register._ch4_duplicate_registration_ok = True
+
+
 def require_official_import(module_name: str, env_name: str, candidates: Sequence[str]):
     add_external_repo_path(env_name, candidates)
+    allow_graphgym_duplicate_registration()
     try:
         return importlib.import_module(module_name)
     except Exception as exc:
@@ -440,6 +459,7 @@ def require_official_file_module(module_name: str, path: Path):
         raise RuntimeError(f"could not load official backend file: {path}")
     module = importlib.util.module_from_spec(spec)
     sys.modules[module_name] = module
+    allow_graphgym_duplicate_registration()
     try:
         spec.loader.exec_module(module)
     except Exception:
