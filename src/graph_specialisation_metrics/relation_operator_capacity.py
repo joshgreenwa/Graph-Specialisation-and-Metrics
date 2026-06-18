@@ -982,7 +982,10 @@ def train_one(
         payload = torch.load(ckpt_dir / "best.pt", map_location=device)
         model.load_state_dict(payload["state_dict"])
     test = evaluate_model(model, splits["test"], device, eval_batch_size)
-    if isinstance(model, (OfficialGRITRelationModel, OfficialGraphGPSRelationModel, OfficialGNNPlusGatedGCNRelationModel)):
+    if isinstance(model, OfficialGRITRelationModel) and experiment == "grit_r_local_diagnostic":
+        maps = effective_relation_maps(model, loaded_spec, device)
+        rank, singular = realised_rank(maps)
+    elif isinstance(model, (OfficialGRITRelationModel, OfficialGraphGPSRelationModel, OfficialGNNPlusGatedGCNRelationModel)):
         rank, singular = -1, []
     else:
         maps = effective_relation_maps(model, loaded_spec, device)
@@ -1372,6 +1375,7 @@ def plot_crossover_with_grit(root: Path) -> Path | None:
     agg_mse = aggregate(rows, ("model", "relation_types"), "test_rel_mse")
     agg_rank = aggregate(rows, ("model", "relation_types"), "realised_rank")
     agg_grit = aggregate(grit_rows, ("model", "relation_types"), "test_rel_mse")
+    agg_grit_rank = aggregate(grit_rows, ("model", "relation_types"), "realised_rank")
     models = list(CONTROLLED_MODELS)
     rs = sorted({int(row["relation_types"]) for row in rows})
     grit_rs = sorted({int(row["relation_types"]) for row in grit_rows})
@@ -1390,6 +1394,16 @@ def plot_crossover_with_grit(root: Path) -> Path | None:
         color=MODEL_COLORS[grit_model],
         label="Official GRIT (1 seed)",
     )
+    grit_rank_x = [r for r in grit_rs if agg_grit_rank.get((grit_model, str(r)), (-1.0, 0.0))[0] >= 0]
+    if grit_rank_x:
+        axes[1].plot(
+            grit_rank_x,
+            [agg_grit_rank[(grit_model, str(r))][0] for r in grit_rank_x],
+            marker="D",
+            linewidth=2.3,
+            color=MODEL_COLORS[grit_model],
+            label="Official GRIT empirical rank",
+        )
     floor_by_r = {int(row["relation_types"]): row for row in rows}
     axes[0].plot(rs, [float(floor_by_r[r]["routing_floor"]) for r in rs], "--", color="#333333", label="Eckart-Young routing floor")
     axes[0].plot(rs, [float(floor_by_r[r]["full_transport_floor"]) for r in rs], ":", color="#333333", label="Eckart-Young transport floor")
@@ -1402,7 +1416,7 @@ def plot_crossover_with_grit(root: Path) -> Path | None:
     axes[1].axhline(16, linestyle=":", color="#555555", linewidth=0.9, label="H x k_tr")
     axes[1].set_xlabel("number of relations R")
     axes[1].set_ylabel("realised relation rank")
-    axes[1].set_title("Controlled realised rank")
+    axes[1].set_title("Realised/effective relation rank")
     axes[1].grid(axis="y", color="#dddddd", linewidth=0.6)
     handles, labels = axes[0].get_legend_handles_labels()
     fig.legend(handles, labels, loc="upper center", ncol=3, frameon=False, bbox_to_anchor=(0.5, 1.04))
