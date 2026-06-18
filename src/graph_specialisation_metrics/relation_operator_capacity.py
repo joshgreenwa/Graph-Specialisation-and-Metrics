@@ -1570,7 +1570,12 @@ def plot_capacity_crossover(root: Path) -> Path | None:
     input_dim = int(first.get("input_dim", 32))
     total_nodes = 1 + int(first["relation_types"]) + int(first.get("noise_nodes", 0))
     fig, axes = plt.subplots(1, 2, figsize=(10.2, 4.2))
-    for model in CAPACITY_CROSSOVER_MODELS:
+    completed_models = [
+        model
+        for model in CAPACITY_CROSSOVER_MODELS
+        if any((model, str(r)) in agg_mse for r in rs)
+    ]
+    for model in completed_models:
         xs = rs
         ys = [agg_mse.get((model, str(r)), (np.nan, 0.0))[0] for r in xs]
         es = [agg_mse.get((model, str(r)), (np.nan, 0.0))[1] for r in xs]
