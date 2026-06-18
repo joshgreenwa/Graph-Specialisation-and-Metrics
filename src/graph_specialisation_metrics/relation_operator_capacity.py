@@ -1423,7 +1423,7 @@ def run_transport_support_official(args: argparse.Namespace) -> None:
         args,
         experiment="transport_support_official",
         specs=specs,
-        models=("graphgps_official", "grit_official", "gatedgcn_plus_official"),
+        models=SUPPORT_REACH_PRACTICAL_MODELS,
         seeds=parse_int_list(args.seeds),
     )
 
@@ -1934,7 +1934,15 @@ def plot_support_reach_controlled(root: Path) -> Path | None:
 
 
 def plot_support_reach_practical(root: Path) -> Path | None:
-    rows = [row for row in metric_rows(root) if row["experiment"] == "support_reach_practical"]
+    # The polished 4.2.2 support/reach figure was added after an earlier
+    # official-only runner had already produced checkpoints under
+    # transport_support_official.  Treat both namespaces as the same practical
+    # evidence source so plotting can be refreshed from completed checkpoints.
+    rows = [
+        row
+        for row in metric_rows(root)
+        if row["experiment"] in {"support_reach_practical", "transport_support_official"}
+    ]
     if not rows:
         return None
     plt = import_plotting()
