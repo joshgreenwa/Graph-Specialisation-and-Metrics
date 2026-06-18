@@ -41,8 +41,8 @@ PRACTICAL_MODELS = ("graphormer_manual", "graphgps_official", "grit_official", "
 OFFICIAL_GRIT_MODELS = ("grit_official", "grit_1hop_official")
 CAPACITY_CROSSOVER_MODELS = (
     "capacity_routing_only",
-    "capacity_multiplicative_value_gate",
     "capacity_additive_value_bias_routed",
+    "capacity_multiplicative_value_gate",
     "capacity_multiplicative_value_gate_routed",
     "capacity_full_relation_transport",
 )
