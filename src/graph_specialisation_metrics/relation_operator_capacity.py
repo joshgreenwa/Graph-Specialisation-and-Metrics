@@ -1611,7 +1611,15 @@ def plot_capacity_crossover(root: Path, target_nodes: int | None = None) -> Path
         for model in CAPACITY_CROSSOVER_MODELS
         if any((model, str(r)) in agg_mse for r in rs)
     ]
-    for model in completed_models:
+    relmse_line_order = [
+        "capacity_routing_only",
+        "capacity_multiplicative_value_gate",
+        "capacity_additive_value_bias_routed",
+        "capacity_multiplicative_value_gate_routed",
+        "capacity_full_relation_transport",
+    ]
+    completed_line_models = [model for model in relmse_line_order if model in completed_models]
+    for model in completed_line_models:
         xs = rs
         ys = [agg_mse.get((model, str(r)), (np.nan, 0.0))[0] for r in xs]
         es = [agg_mse.get((model, str(r)), (np.nan, 0.0))[1] for r in xs]
