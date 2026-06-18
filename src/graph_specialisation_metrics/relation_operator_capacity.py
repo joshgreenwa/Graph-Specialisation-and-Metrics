@@ -1506,17 +1506,7 @@ def plot_crossover(root: Path) -> Path | None:
         return None
     plt = import_plotting()
     agg_mse = aggregate(rows, ("model", "relation_types"), "test_rel_mse")
-    capacity_rank_rows = [
-        {
-            **row,
-            "capacity_plot_rank": numerical_rank_from_singular_values(
-                singular_values_from_text(row.get("realised_singular_values")),
-                tol=1.0e-4,
-            ),
-        }
-        for row in rows
-    ]
-    agg_rank = aggregate(capacity_rank_rows, ("model", "relation_types"), "capacity_plot_rank")
+    agg_rank = aggregate(rows, ("model", "relation_types"), "realised_rank")
     models = list(CONTROLLED_MODELS)
     rs = sorted({int(row["relation_types"]) for row in rows})
     fig, axes = plt.subplots(1, 2, figsize=(10.2, 4.2))
@@ -1593,7 +1583,17 @@ def plot_capacity_crossover(root: Path, target_nodes: int | None = None) -> Path
     write_capacity_model_table(root)
     plt = import_plotting()
     agg_mse = aggregate(rows, ("model", "relation_types"), "test_rel_mse")
-    agg_rank = aggregate(rows, ("model", "relation_types"), "realised_rank")
+    capacity_rank_rows = [
+        {
+            **row,
+            "capacity_plot_rank": numerical_rank_from_singular_values(
+                singular_values_from_text(row.get("realised_singular_values")),
+                tol=1.0e-4,
+            ),
+        }
+        for row in rows
+    ]
+    agg_rank = aggregate(capacity_rank_rows, ("model", "relation_types"), "capacity_plot_rank")
     rs = sorted({int(row["relation_types"]) for row in rows})
     first = rows[0]
     heads = int(first.get("heads", 4))
