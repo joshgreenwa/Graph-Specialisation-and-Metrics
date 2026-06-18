@@ -510,7 +510,7 @@ def official_grit_layer_cfg():
     cfg.rezero = False
     cfg.attn = cn(new_allowed=True)
     cfg.attn.use = True
-    cfg.attn.deg_scaler = False
+    cfg.attn.deg_scaler = True
     cfg.attn.use_bias = False
     cfg.attn.clamp = 5.0
     cfg.attn.act = "relu"
@@ -582,6 +582,8 @@ class OfficialGRITRelationModel(nn.Module):
         data.edge_index = torch.stack([src, dst], dim=0)
         data.edge_attr = self.edge_encoder(rel.long())
         data.batch = torch.arange(bsz, device=device).repeat_interleave(n)
+        data.deg = torch.bincount(dst, minlength=bsz * n).float()
+        data.log_deg = torch.log(data.deg + 1.0).view(-1, 1)
         return data
 
     def forward(self, batch: RelationBatch) -> torch.Tensor:
