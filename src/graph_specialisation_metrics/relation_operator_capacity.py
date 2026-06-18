@@ -1473,8 +1473,10 @@ def plot_overglobalisation(root: Path) -> Path | None:
     axes[1].set_title("Fixed irrelevant-content stress test")
     axes[1].set_ylabel("relative MSE")
     axes[1].grid(axis="y", color="#dddddd", linewidth=0.6)
-    axes[0].legend(frameon=False, fontsize=7)
-    axes[1].legend(frameon=False)
+    for ax in axes:
+        handles, labels = ax.get_legend_handles_labels()
+        if handles:
+            ax.legend(handles, labels, frameon=False, fontsize=7)
     fig.suptitle("Irrelevant Content Exposes the Cost of Dense Support", y=1.03, fontsize=13)
     fig.tight_layout()
     path = ensure_dir(root / "figures") / "overglobalisation_irrelevant_content.pdf"
