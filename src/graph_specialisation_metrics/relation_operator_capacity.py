@@ -64,6 +64,7 @@ LEGACY_CAPACITY_MODELS = ("capacity_transport_only", "capacity_additive_value_bi
 CAPACITY_MODEL_NAMES = tuple(dict.fromkeys(CAPACITY_CROSSOVER_MODELS + SUPPORT_REACH_CONTROLLED_MODELS + LEGACY_CAPACITY_MODELS))
 ALL_MODELS = tuple(dict.fromkeys(CONTROLLED_MODELS + PRACTICAL_MODELS + OFFICIAL_GRIT_MODELS + CAPACITY_MODEL_NAMES))
 TASK_MODES = ("local", "global")
+CONTENT_NOISE_MODES = ("distractor", "uniform_signal")
 PARAMETER_MATCH_WIDTHS = (32, 48, 64, 96, 128, 192)
 EPS = 1.0e-12
 
@@ -134,6 +135,7 @@ class ExperimentSpec:
     task_mode: str = "local"
     noise_nodes: int = 0
     noise_sigma: float = 0.0
+    content_noise_mode: str = "distractor"
     train_size: int = 8192
     val_size: int = 2048
     test_size: int = 2048
@@ -284,17 +286,30 @@ def make_split(spec: ExperimentSpec, split_size: int, split_seed: int) -> dict[s
     graph = graph_tensors(spec)
     weights = relation_weights(spec)
     n = spec.num_nodes
+    r = spec.relation_types
+    sigma = float(spec.noise_sigma)
     content = torch.zeros(split_size, n, spec.input_dim, dtype=torch.float32)
-    content[:, 1:, :] = torch.randn(split_size, n - 1, spec.input_dim, generator=gen)
-    if spec.noise_nodes and spec.noise_sigma != 1.0:
-        noise_start = 1 + spec.relation_types
-        content[:, noise_start:, :] *= float(spec.noise_sigma)
+    if spec.content_noise_mode == "distractor":
+        content[:, 1:, :] = torch.randn(split_size, n - 1, spec.input_dim, generator=gen)
+        if spec.noise_nodes and sigma != 1.0:
+            noise_start = 1 + r
+            content[:, noise_start:, :] *= sigma
+    elif spec.content_noise_mode == "uniform_signal":
+        source_signal = torch.randn(split_size, r, spec.input_dim, generator=gen)
+        if sigma != 0.0:
+            source_signal = source_signal + sigma * torch.randn(split_size, r, spec.input_dim, generator=gen)
+        content[:, 1 : r + 1, :] = source_signal
+        if spec.noise_nodes:
+            noise_start = 1 + r
+            content[:, noise_start:, :] = sigma * torch.randn(split_size, spec.noise_nodes, spec.input_dim, generator=gen)
+    else:
+        raise ValueError(f"unknown content_noise_mode {spec.content_noise_mode!r}")
     x = torch.zeros(split_size, n, spec.feature_dim, dtype=torch.float32)
     x[..., : spec.input_dim] = content
     x[:, 0, spec.input_dim] = 1.0
     x[:, 1:, spec.input_dim + 1] = 1.0
-    source_content = content[:, 1 : spec.relation_types + 1, :]
-    y = torch.einsum("rtd,brd->bt", weights, source_content) / math.sqrt(float(spec.relation_types))
+    source_content = content[:, 1 : r + 1, :]
+    y = torch.einsum("rtd,brd->bt", weights, source_content) / math.sqrt(float(r))
     return {
         "x": x,
         "content": content,
@@ -306,10 +321,11 @@ def make_split(spec: ExperimentSpec, split_size: int, split_seed: int) -> dict[s
 
 def dataset_path(root: Path, spec: ExperimentSpec) -> Path:
     noise = f"noise{spec.noise_nodes}_sig{float(spec.noise_sigma):g}".replace(".", "p")
+    mode = "" if spec.content_noise_mode == "distractor" else f"_{spec.content_noise_mode}"
     return (
         root
         / "data"
-        / f"{spec.task_mode}_R{spec.relation_types}_d{spec.input_dim}_{noise}_seed{spec.data_seed}.pt"
+        / f"{spec.task_mode}_R{spec.relation_types}_d{spec.input_dim}_{noise}{mode}_seed{spec.data_seed}.pt"
     )
 
 
@@ -1058,6 +1074,8 @@ def teacher_floor(spec: ExperimentSpec) -> dict[str, Any]:
 
 def run_id(experiment: str, spec: ExperimentSpec, model_name: str, seed: int) -> str:
     noise = f"n{spec.noise_nodes}_s{float(spec.noise_sigma):g}".replace(".", "p")
+    if spec.content_noise_mode != "distractor":
+        noise = f"{noise}_{spec.content_noise_mode}"
     return (
         f"{experiment}/{spec.task_mode}/R{spec.relation_types}/L{spec.layers}/"
         f"{noise}/{model_name}/seed_{int(seed)}"
@@ -1179,6 +1197,7 @@ def train_one(
         "layers": int(loaded_spec.layers),
         "noise_nodes": int(loaded_spec.noise_nodes),
         "noise_sigma": float(loaded_spec.noise_sigma),
+        "content_noise_mode": str(loaded_spec.content_noise_mode),
         "parameters": int(count_parameters(model)),
         "best_epoch": int(best_epoch),
         "best_val_rel_mse": float(best_val),
@@ -1217,6 +1236,7 @@ def write_summary_tables(root: Path) -> None:
                     "layers",
                     "noise_nodes",
                     "noise_sigma",
+                    "content_noise_mode",
                     "realised_rank",
                     "realised_singular_values",
                 ]
@@ -1320,6 +1340,7 @@ def base_spec_from_args(args: argparse.Namespace, **overrides: Any) -> Experimen
         "task_mode": str(args.task_mode),
         "noise_nodes": int(args.noise_nodes),
         "noise_sigma": float(args.noise_sigma),
+        "content_noise_mode": str(args.content_noise_mode),
         "train_size": int(args.train_size),
         "val_size": int(args.val_size),
         "test_size": int(args.test_size),
@@ -2011,43 +2032,83 @@ def plot_overglobalisation(root: Path) -> Path | None:
 
 
 def plot_overglobalisation_probe(root: Path) -> Path | None:
-    rows = [row for row in metric_rows(root) if row["experiment"] == "overglobalisation_probe"]
-    if not rows:
+    all_rows = [
+        row
+        for row in metric_rows(root)
+        if row["experiment"] in {"overglobalisation_probe", "overglobalisation_uniform_probe"}
+    ]
+    if not all_rows:
         return None
     plt = import_plotting()
     models = [
         ("capacity_routing_only", "Dense support", "#4f78b5", "-"),
         ("capacity_routing_1hop", "1-hop support", "#c2473f", "--"),
     ]
-    fig, ax = plt.subplots(1, 1, figsize=(5.8, 4.1))
-    agg_mse = aggregate(rows, ("model", "noise_sigma"), "test_rel_mse")
-    for model, label, color, linestyle in models:
-        sigmas = sorted({float(row["noise_sigma"]) for row in rows if row["model"] == model})
-        if not sigmas:
-            continue
-        ax.errorbar(
-            sigmas,
-            [agg_mse.get((model, f"{sigma:g}"), agg_mse.get((model, str(sigma)), (np.nan, 0.0)))[0] for sigma in sigmas],
-            yerr=[agg_mse.get((model, f"{sigma:g}"), agg_mse.get((model, str(sigma)), (np.nan, 0.0)))[1] for sigma in sigmas],
-            marker="o",
-            linewidth=2.0,
-            capsize=3,
-            color=color,
-            linestyle=linestyle,
-            label=label,
-        )
-    ax.set_xlabel("irrelevant content noise magnitude")
-    ax.set_ylabel("relative MSE")
-    ax.set_title("Local Routing Task Under Irrelevant Content")
-    ax.grid(axis="y", color="#dddddd", linewidth=0.6)
-    ax.legend(frameon=False, loc="upper left")
-    fig.suptitle("Dense Support Can Expose Local Computation to Distractors (R=4, N=32)", y=1.03, fontsize=13)
+    panels = [
+        ("overglobalisation_probe", "Distractor-only noise", "Noise is applied only to null content nodes."),
+        ("overglobalisation_uniform_probe", "Signal-preserving uniform noise", "Source nodes are signal+noise; teacher uses the noisy sources."),
+    ]
+
+    def plot_panel(ax: Any, rows: Sequence[Mapping[str, Any]], title: str, note: str, *, legend: bool) -> None:
+        agg_mse = aggregate(rows, ("model", "noise_sigma"), "test_rel_mse")
+        plotted = False
+        for model, label, color, linestyle in models:
+            sigmas = sorted({float(row["noise_sigma"]) for row in rows if row["model"] == model})
+            if not sigmas:
+                continue
+            means = [agg_mse.get((model, f"{sigma:g}"), agg_mse.get((model, str(sigma)), (np.nan, 0.0)))[0] for sigma in sigmas]
+            errors = [agg_mse.get((model, f"{sigma:g}"), agg_mse.get((model, str(sigma)), (np.nan, 0.0)))[1] for sigma in sigmas]
+            ax.errorbar(
+                sigmas,
+                means,
+                yerr=errors,
+                marker="o",
+                linewidth=2.0,
+                capsize=3,
+                color=color,
+                linestyle=linestyle,
+                label=label,
+            )
+            plotted = True
+        ax.set_xlabel("noise magnitude")
+        ax.set_title(title)
+        ax.grid(axis="y", color="#dddddd", linewidth=0.6)
+        ax.text(0.02, 0.96, note, transform=ax.transAxes, ha="left", va="top", fontsize=7, color="#4a4a4a")
+        if legend and plotted:
+            ax.legend(frameon=False, loc="upper left")
+        if not plotted:
+            ax.text(0.5, 0.5, "no completed runs", transform=ax.transAxes, ha="center", va="center", color="#777777")
+
+    fig, axes = plt.subplots(1, 2, figsize=(10.2, 4.1), sharey=True)
+    for idx, (ax, (experiment, title, note)) in enumerate(zip(axes, panels, strict=True)):
+        rows = [row for row in all_rows if row["experiment"] == experiment]
+        plot_panel(ax, rows, title, note, legend=(idx == 0))
+    axes[0].set_ylabel("relative MSE")
+    fig.suptitle("Over-Globalisation in a Local Routing Task (R=4, N=32)", y=1.03, fontsize=13)
     fig.tight_layout()
-    path = ensure_dir(root / "figures") / "overglobalisation_probe_routing_only_noise_sweep.pdf"
-    fig.savefig(path, bbox_inches="tight")
+    comparison_path = ensure_dir(root / "figures") / "overglobalisation_probe_noise_comparison.pdf"
+    fig.savefig(comparison_path, bbox_inches="tight")
     plt.close(fig)
-    print(f"[plot] wrote {path}")
-    return path
+    print(f"[plot] wrote {comparison_path}")
+
+    distractor_rows = [row for row in all_rows if row["experiment"] == "overglobalisation_probe"]
+    if distractor_rows:
+        fig, ax = plt.subplots(1, 1, figsize=(5.8, 4.1))
+        plot_panel(
+            ax,
+            distractor_rows,
+            "Local Routing Task Under Irrelevant Content",
+            "Noise is applied only to null content nodes.",
+            legend=True,
+        )
+        ax.set_ylabel("relative MSE")
+        fig.suptitle("Dense Support Can Expose Local Computation to Distractors (R=4, N=32)", y=1.03, fontsize=13)
+        fig.tight_layout()
+        old_path = ensure_dir(root / "figures") / "overglobalisation_probe_routing_only_noise_sweep.pdf"
+        fig.savefig(old_path, bbox_inches="tight")
+        plt.close(fig)
+        print(f"[plot] wrote {old_path}")
+    return comparison_path
 
 
 def plot_overglobalisation_grit(root: Path) -> Path | None:
@@ -2213,6 +2274,16 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--layers", type=int, default=1)
     parser.add_argument("--noise-nodes", type=int, default=0)
     parser.add_argument("--noise-sigma", type=float, default=0.0)
+    parser.add_argument(
+        "--content-noise-mode",
+        type=str,
+        default="distractor",
+        choices=CONTENT_NOISE_MODES,
+        help=(
+            "How content noise is applied. 'distractor' preserves clean source nodes and scales null distractors; "
+            "'uniform_signal' adds noise to source signals and recomputes the teacher from the noisy sources."
+        ),
+    )
     parser.add_argument("--noise-sweep", type=str, default="0,0.25,0.5,1,2,4")
     parser.add_argument("--depth-sweep", type=str, default="1,2,4,8")
     parser.add_argument("--parameter-match-widths", type=str, default=",".join(str(width) for width in PARAMETER_MATCH_WIDTHS))
