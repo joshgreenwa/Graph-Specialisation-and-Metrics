@@ -339,9 +339,14 @@ class ControlledRelationModel(nn.Module):
         attn = masked_softmax(logits, support[:, None, :, :])
         if self.full_transport:
             coeff = self.transport_coeff[pair_rel]  # [B,N,N,H,A]
-            kernels = torch.einsum("bijha,hado->bijhdo", coeff, self.transport_basis)
-            msg = torch.einsum("bjd,bijhdo->bhijo", state, kernels)
-            return state + torch.einsum("bhij,bhijo->bio", attn, msg)
+            ctx = state.new_zeros((bsz, h, n, d))
+            # Contract over the small transport-basis axis without materialising
+            # a [B,N,N,H,D,D] relation kernel for every query/source pair.
+            for basis_idx in range(int(self.spec.transport_bases)):
+                basis_msg = torch.einsum("bjd,hdo->bhjo", state, self.transport_basis[:, basis_idx])
+                pair_weight = attn * coeff[..., basis_idx].permute(0, 3, 1, 2)
+                ctx = ctx + torch.einsum("bhij,bhjo->bhio", pair_weight, basis_msg)
+            return state + ctx.sum(dim=1)
         else:
             msg_per_head = torch.einsum("bjd,hdo->bhjo", state, self.routing_basis)
             msg = torch.einsum("bhij,bhjo->bhio", attn, msg_per_head)
