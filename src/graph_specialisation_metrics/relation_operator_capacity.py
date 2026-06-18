@@ -1131,6 +1131,7 @@ def compute_node_level_source_map(
     )
     scores = np.zeros(spec.num_nodes, dtype=float)
     rows: list[dict[str, Any]] = []
+    pair_records: list[tuple[int, int]] = []
     for source, partners in partners_by_source.items():
         if not partners:
             rows.append(
@@ -1143,37 +1144,42 @@ def compute_node_level_source_map(
                 }
             )
             continue
-        swapped = base_content.unsqueeze(0).repeat(len(partners), 1, 1)
-        for idx, partner in enumerate(partners):
-            swapped[idx, source, :] = base_content[partner, :]
-            swapped[idx, partner, :] = base_content[source, :]
-        pred = predictor(swapped, batch_size=batch_size)
-        delta = torch.linalg.vector_norm(pred - base_pred.unsqueeze(0), dim=1)
-        distances = torch.tensor(
-            [
-                float(torch.linalg.vector_norm(base_content[source] - base_content[partner]).item())
-                for partner in partners
-            ],
-            dtype=torch.float32,
-        ).clamp_min(1.0e-8)
-        normalised = (delta.cpu() / distances).numpy()
-        scores[source] = float(np.sqrt(np.mean(np.square(normalised)))) if normalised.size else 0.0
-        for partner, raw_delta, content_distance, normalised_delta in zip(
-            partners,
-            delta.cpu().numpy(),
-            distances.cpu().numpy(),
-            normalised,
-            strict=True,
-        ):
-            rows.append(
-                {
-                    "source_node": int(source),
-                    "partner_node": int(partner),
-                    "normalised_delta": float(normalised_delta),
-                    "raw_delta_norm": float(raw_delta),
-                    "content_distance": float(content_distance),
-                }
-            )
+        for partner in partners:
+            pair_records.append((int(source), int(partner)))
+    if not pair_records:
+        return scores, rows
+
+    swapped = base_content.unsqueeze(0).repeat(len(pair_records), 1, 1)
+    distances = []
+    for idx, (source, partner) in enumerate(pair_records):
+        swapped[idx, source, :] = base_content[partner, :]
+        swapped[idx, partner, :] = base_content[source, :]
+        distances.append(float(torch.linalg.vector_norm(base_content[source] - base_content[partner]).item()))
+    pred = predictor(swapped, batch_size=batch_size)
+    delta = torch.linalg.vector_norm(pred - base_pred.unsqueeze(0), dim=1).cpu()
+    distance_tensor = torch.tensor(distances, dtype=torch.float32).clamp_min(1.0e-8)
+    normalised = (delta / distance_tensor).numpy()
+    by_source: dict[int, list[float]] = {}
+    for (source, partner), raw_delta, content_distance, normalised_delta in zip(
+        pair_records,
+        delta.numpy(),
+        distance_tensor.numpy(),
+        normalised,
+        strict=True,
+    ):
+        by_source.setdefault(source, []).append(float(normalised_delta))
+        rows.append(
+            {
+                "source_node": int(source),
+                "partner_node": int(partner),
+                "normalised_delta": float(normalised_delta),
+                "raw_delta_norm": float(raw_delta),
+                "content_distance": float(content_distance),
+            }
+        )
+    for source, values in by_source.items():
+        arr = np.asarray(values, dtype=float)
+        scores[source] = float(np.sqrt(np.mean(np.square(arr)))) if arr.size else 0.0
     return scores, rows
 
 
@@ -1926,6 +1932,205 @@ def run_source_map_validation(args: argparse.Namespace) -> None:
         experiment=str(args.experiment),
         maps=maps,
     )
+
+
+def cosine_np(a: np.ndarray, b: np.ndarray) -> float:
+    a = np.asarray(a, dtype=float)
+    b = np.asarray(b, dtype=float)
+    denom = float(np.linalg.norm(a) * np.linalg.norm(b))
+    if denom <= EPS:
+        return float("nan")
+    return float(np.dot(a, b) / denom)
+
+
+def source_map_mass_fractions(spec: ExperimentSpec, scores: np.ndarray) -> tuple[float, float]:
+    values = np.asarray(scores, dtype=float)
+    non_focal = values[1:]
+    denom = float(np.sum(non_focal**2))
+    if denom <= EPS:
+        return float("nan"), float("nan")
+    source = float(np.sum(values[1 : int(spec.relation_types) + 1] ** 2) / denom)
+    distractor = float(np.sum(values[int(spec.relation_types) + 1 :] ** 2) / denom)
+    return source, distractor
+
+
+def complete_summary_for(root: Path, experiment: str, spec: ExperimentSpec, model_name: str, seed: int) -> dict[str, Any] | None:
+    path = checkpoint_dir(root, experiment, spec, model_name, seed) / "complete.json"
+    return read_json(path) if path.exists() else None
+
+
+def plot_source_map_robustness(root: Path, rows: Sequence[Mapping[str, Any]], experiment: str, spec: ExperimentSpec) -> Path:
+    plt = import_plotting()
+    models = [
+        ("capacity_routing_only", "Dense support", "#4f78b5", "-"),
+        ("capacity_routing_1hop", "1-hop support", "#c2473f", "--"),
+    ]
+    fig, axes = plt.subplots(1, 3, figsize=(11.0, 3.55))
+    metrics = [
+        ("test_rel_mse", "relative MSE", None),
+        ("oracle_alignment_mean", "oracle source-map alignment", (0.0, 1.03)),
+        ("distractor_mass_mean", "distractor mass fraction", (0.0, 1.03)),
+    ]
+    for ax, (metric, ylabel, ylim) in zip(axes, metrics, strict=True):
+        for model, label, color, linestyle in models:
+            sub = sorted([row for row in rows if row["model"] == model], key=lambda row: float(row["noise_sigma"]))
+            if not sub:
+                continue
+            x = [float(row["noise_sigma"]) for row in sub]
+            y = [float(row[metric]) for row in sub]
+            yerr_key = metric.replace("_mean", "_sem")
+            yerr = [float(row.get(yerr_key, 0.0) or 0.0) for row in sub]
+            ax.errorbar(
+                x,
+                y,
+                yerr=yerr if any(value > 0 for value in yerr) else None,
+                marker="o",
+                linewidth=2.0,
+                capsize=3,
+                color=color,
+                linestyle=linestyle,
+                label=label,
+            )
+        ax.set_xlabel("distractor noise magnitude")
+        ax.set_ylabel(ylabel)
+        if ylim is not None:
+            ax.set_ylim(*ylim)
+        ax.grid(axis="y", color="#dddddd", linewidth=0.6)
+    axes[0].legend(frameon=False, loc="upper left")
+    fig.suptitle("Source-Map Robustness Diagnostic for a Local Routing Task", y=1.04, fontsize=13)
+    fig.tight_layout()
+    noise = f"n{spec.noise_nodes}".replace(".", "p")
+    path = ensure_dir(root / "figures") / f"source_map_robustness_{experiment}_{spec.task_mode}_R{spec.relation_types}_{noise}.pdf"
+    fig.savefig(path, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[plot] wrote {path}")
+    return path
+
+
+def run_source_map_robustness(args: argparse.Namespace) -> None:
+    root = Path(args.output_root)
+    device = resolve_device(args.device)
+    models = parse_csv_list(args.models, allowed=ALL_MODELS)
+    seed = parse_int_list(args.seeds)[0]
+    sigmas = parse_float_list(args.noise_sweep)
+    graph_count = int(args.source_map_graphs)
+    batch_size = int(args.eval_batch_size)
+    partner_count = int(args.source_map_partners)
+    partner_mode = str(args.source_map_partner_mode)
+    rows: list[dict[str, Any]] = []
+    pair_rows: list[dict[str, Any]] = []
+    for sigma in sigmas:
+        spec = base_spec_from_args(args, noise_sigma=float(sigma))
+        data_file = save_dataset(root, spec, overwrite=bool(args.overwrite_data))
+        data_spec, splits = load_dataset(data_file)
+        n_graphs = min(graph_count, int(splits["test"]["content"].shape[0]))
+        graph_indices = list(range(n_graphs))
+        oracle_maps: dict[int, np.ndarray] = {}
+        for graph_index in graph_indices:
+            base_content = splits["test"]["content"][graph_index]
+            oracle_scores, _ = compute_node_level_source_map(
+                spec=data_spec,
+                base_content=base_content,
+                predictor=lambda content, batch_size, s=data_spec: predict_oracle_from_content(s, content, batch_size),
+                batch_size=batch_size,
+                partners_per_source=partner_count,
+                partner_mode=partner_mode,
+                seed=int(args.data_seed) + 4049 + graph_index,
+            )
+            oracle_maps[graph_index] = oracle_scores
+        for model_name in models:
+            summary = complete_summary_for(root, str(args.experiment), data_spec, model_name, seed)
+            if summary is None:
+                print(f"[source-map-robustness] missing checkpoint summary for sigma={sigma:g} model={model_name}; skipping")
+                continue
+            model, ckpt_spec = load_model_checkpoint(root, str(args.experiment), data_spec, model_name, seed, device)
+            per_graph_alignment = []
+            per_graph_source_mass = []
+            per_graph_distractor_mass = []
+            for graph_index in graph_indices:
+                base_content = splits["test"]["content"][graph_index]
+                scores, _ = compute_node_level_source_map(
+                    spec=ckpt_spec,
+                    base_content=base_content,
+                    predictor=lambda content, batch_size, m=model, s=ckpt_spec: predict_model_from_content(
+                        m, s, content, device, batch_size
+                    ),
+                    batch_size=batch_size,
+                    partners_per_source=partner_count,
+                    partner_mode=partner_mode,
+                    seed=int(args.data_seed) + 4049 + graph_index,
+                )
+                oracle_scores = oracle_maps[graph_index]
+                mask = np.arange(ckpt_spec.num_nodes) != 0
+                alignment = cosine_np(scores[mask], oracle_scores[mask])
+                source_mass, distractor_mass = source_map_mass_fractions(ckpt_spec, scores)
+                per_graph_alignment.append(alignment)
+                per_graph_source_mass.append(source_mass)
+                per_graph_distractor_mass.append(distractor_mass)
+                for node, score in enumerate(scores):
+                    pair_rows.append(
+                        {
+                            "experiment": str(args.experiment),
+                            "task_mode": ckpt_spec.task_mode,
+                            "noise_sigma": float(sigma),
+                            "model": model_name,
+                            "graph_index": int(graph_index),
+                            "source_node": int(node),
+                            "node_type": node_type_for_source(ckpt_spec, node),
+                            "score": float(score),
+                            "score_normalised": float(normalise_scores(scores)[node]),
+                        }
+                    )
+
+            def mean_sem(values: Sequence[float]) -> tuple[float, float]:
+                arr = np.asarray([value for value in values if np.isfinite(value)], dtype=float)
+                if not len(arr):
+                    return float("nan"), float("nan")
+                sem = float(arr.std(ddof=1) / math.sqrt(len(arr))) if len(arr) > 1 else 0.0
+                return float(arr.mean()), sem
+
+            alignment_mean, alignment_sem = mean_sem(per_graph_alignment)
+            source_mass_mean, source_mass_sem = mean_sem(per_graph_source_mass)
+            distractor_mass_mean, distractor_mass_sem = mean_sem(per_graph_distractor_mass)
+            rows.append(
+                {
+                    "experiment": str(args.experiment),
+                    "task_mode": ckpt_spec.task_mode,
+                    "relation_types": int(ckpt_spec.relation_types),
+                    "noise_nodes": int(ckpt_spec.noise_nodes),
+                    "noise_sigma": float(sigma),
+                    "model": model_name,
+                    "model_label": MODEL_LABELS[model_name],
+                    "seed": int(seed),
+                    "graphs": int(n_graphs),
+                    "partners_per_source": int(partner_count),
+                    "partner_mode": partner_mode,
+                    "test_rel_mse": float(summary["test_rel_mse"]),
+                    "oracle_alignment_mean": alignment_mean,
+                    "oracle_alignment_sem": alignment_sem,
+                    "source_mass_mean": source_mass_mean,
+                    "source_mass_sem": source_mass_sem,
+                    "distractor_mass_mean": distractor_mass_mean,
+                    "distractor_mass_sem": distractor_mass_sem,
+                }
+            )
+            print(
+                f"[source-map-robustness] sigma={sigma:g} {model_name} "
+                f"align={alignment_mean:.3f} distractor_mass={distractor_mass_mean:.3f} "
+                f"relMSE={float(summary['test_rel_mse']):.4g}"
+            )
+    if not rows:
+        raise RuntimeError("no source-map robustness rows were produced")
+    metrics_dir = ensure_dir(root / "metrics")
+    base = base_spec_from_args(args)
+    noise = f"n{base.noise_nodes}".replace(".", "p")
+    summary_csv = metrics_dir / f"source_map_robustness_{args.experiment}_{base.task_mode}_R{base.relation_types}_{noise}.csv"
+    node_csv = metrics_dir / f"source_map_robustness_nodes_{args.experiment}_{base.task_mode}_R{base.relation_types}_{noise}.csv"
+    write_csv(summary_csv, rows)
+    write_csv(node_csv, pair_rows)
+    print(f"[source-map-robustness] wrote {summary_csv}")
+    print(f"[source-map-robustness] wrote {node_csv}")
+    plot_source_map_robustness(root, rows, str(args.experiment), base)
 
 
 def import_plotting():
@@ -2712,6 +2917,7 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--batch-size", type=int, default=2048)
     parser.add_argument("--eval-batch-size", type=int, default=4096)
     parser.add_argument("--source-map-graph-index", type=int, default=0)
+    parser.add_argument("--source-map-graphs", type=int, default=8)
     parser.add_argument("--source-map-partners", type=int, default=16)
     parser.add_argument(
         "--source-map-partner-mode",
@@ -2750,6 +2956,7 @@ def build_parser() -> argparse.ArgumentParser:
         ("run-overglobalisation-grit", "Run official GRIT dense-vs-1-hop over-globalisation experiment.", run_overglobalisation_grit),
         ("run-depth-escape", "Run routing-only depth escape experiments.", run_depth_escape),
         ("plot-source-map-validation", "Plot Ch4 node-level source-map validation from trained checkpoints.", run_source_map_validation),
+        ("plot-source-map-robustness", "Plot Ch4 source-map robustness diagnostic across noise levels.", run_source_map_robustness),
         ("plot", "Generate all Ch4 figures from cached metrics.", plot_all),
         ("run-all", "Run all Ch4 stages.", run_all),
         ("print-hpc-commands", "Print HPC sbatch commands.", print_hpc_commands),
