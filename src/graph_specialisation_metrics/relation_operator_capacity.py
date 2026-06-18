@@ -992,11 +992,23 @@ def effective_relation_maps(model: nn.Module, spec: ExperimentSpec, device: torc
     return maps.detach().cpu()
 
 
-def realised_rank(maps: torch.Tensor, tol: float = 1.0e-5) -> tuple[int, list[float]]:
+def realised_rank(maps: torch.Tensor, tol: float = 1.0e-4) -> tuple[int, list[float]]:
     mat = maps.reshape(maps.shape[0], -1).double()
     s = torch.linalg.svdvals(mat)
     threshold = max(float(s.max()) * tol, tol)
     return int((s > threshold).sum().item()), [float(v) for v in s]
+
+
+def singular_values_from_text(text: Any) -> list[float]:
+    return [float(item) for item in str(text or "").split(";") if item]
+
+
+def numerical_rank_from_singular_values(values: Sequence[float], tol: float = 1.0e-4) -> float:
+    if not values:
+        return float("nan")
+    smax = max(abs(float(value)) for value in values)
+    threshold = max(smax * float(tol), float(tol))
+    return float(sum(abs(float(value)) > threshold for value in values))
 
 
 def teacher_floor(spec: ExperimentSpec) -> dict[str, Any]:
@@ -1494,7 +1506,17 @@ def plot_crossover(root: Path) -> Path | None:
         return None
     plt = import_plotting()
     agg_mse = aggregate(rows, ("model", "relation_types"), "test_rel_mse")
-    agg_rank = aggregate(rows, ("model", "relation_types"), "realised_rank")
+    capacity_rank_rows = [
+        {
+            **row,
+            "capacity_plot_rank": numerical_rank_from_singular_values(
+                singular_values_from_text(row.get("realised_singular_values")),
+                tol=1.0e-4,
+            ),
+        }
+        for row in rows
+    ]
+    agg_rank = aggregate(capacity_rank_rows, ("model", "relation_types"), "capacity_plot_rank")
     models = list(CONTROLLED_MODELS)
     rs = sorted({int(row["relation_types"]) for row in rows})
     fig, axes = plt.subplots(1, 2, figsize=(10.2, 4.2))
