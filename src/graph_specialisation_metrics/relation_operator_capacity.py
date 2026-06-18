@@ -1896,7 +1896,7 @@ def plot_support_reach_controlled(root: Path) -> Path | None:
         ax.set_title("Local relation task" if mode == "local" else "Long-range relation task")
         ax.grid(axis="y", color="#dddddd", linewidth=0.6)
     axes[0].set_ylabel("relative MSE")
-    axes[1].legend(frameon=False, loc="upper left")
+    axes[0].legend(frameon=False, loc="upper left")
     fig.suptitle("Transport Controls Capacity; Support Controls Reach (R=8, N=10, H=4)", y=1.04, fontsize=13)
     fig.tight_layout()
     path = ensure_dir(root / "figures") / "transport_support_controlled_relation_operator.pdf"
