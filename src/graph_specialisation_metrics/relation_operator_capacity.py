@@ -41,14 +41,14 @@ PRACTICAL_MODELS = ("graphormer_manual", "graphgps_official", "grit_official", "
 OFFICIAL_GRIT_MODELS = ("grit_official", "grit_1hop_official")
 CAPACITY_CROSSOVER_MODELS = (
     "capacity_routing_only",
-    "capacity_transport_only",
-    "capacity_additive_value_bias",
     "capacity_multiplicative_value_gate",
     "capacity_additive_value_bias_routed",
     "capacity_multiplicative_value_gate_routed",
     "capacity_full_relation_transport",
 )
-ALL_MODELS = tuple(dict.fromkeys(CONTROLLED_MODELS + PRACTICAL_MODELS + OFFICIAL_GRIT_MODELS + CAPACITY_CROSSOVER_MODELS))
+LEGACY_CAPACITY_MODELS = ("capacity_transport_only", "capacity_additive_value_bias")
+CAPACITY_MODEL_NAMES = tuple(dict.fromkeys(CAPACITY_CROSSOVER_MODELS + LEGACY_CAPACITY_MODELS))
+ALL_MODELS = tuple(dict.fromkeys(CONTROLLED_MODELS + PRACTICAL_MODELS + OFFICIAL_GRIT_MODELS + CAPACITY_MODEL_NAMES))
 TASK_MODES = ("local", "global")
 PARAMETER_MATCH_WIDTHS = (32, 48, 64, 96, 128, 192)
 EPS = 1.0e-12
@@ -66,9 +66,9 @@ MODEL_LABELS = {
     "capacity_routing_only": "Routing-only",
     "capacity_transport_only": "Transport-only",
     "capacity_additive_value_bias": "Additive value bias",
-    "capacity_multiplicative_value_gate": "Multiplicative value gate",
-    "capacity_additive_value_bias_routed": "Additive value bias + routing",
-    "capacity_multiplicative_value_gate_routed": "Multiplicative value gate + routing",
+    "capacity_multiplicative_value_gate": "Multiplicative value gate only",
+    "capacity_additive_value_bias_routed": "Routing + additive value bias",
+    "capacity_multiplicative_value_gate_routed": "Routing + multiplicative value gate",
     "capacity_full_relation_transport": "Full relation transport",
 }
 
@@ -408,7 +408,7 @@ class CapacityRelationModel(nn.Module):
 
     def __init__(self, spec: ExperimentSpec, *, variant: str) -> None:
         super().__init__()
-        if variant not in CAPACITY_CROSSOVER_MODELS:
+        if variant not in CAPACITY_MODEL_NAMES:
             raise ValueError(f"unknown capacity variant {variant!r}")
         self.spec = spec
         self.variant = variant
@@ -860,7 +860,7 @@ class OfficialGNNPlusGatedGCNRelationModel(nn.Module):
 
 
 def build_model(spec: ExperimentSpec, model_name: str) -> nn.Module:
-    if model_name in CAPACITY_CROSSOVER_MODELS:
+    if model_name in CAPACITY_MODEL_NAMES:
         return CapacityRelationModel(spec, variant=model_name)
     if model_name == "routing_dense":
         return ControlledRelationModel(spec, full_transport=False, dense_support=True)
@@ -1331,11 +1331,17 @@ def capacity_crossover_specs_from_args(args: argparse.Namespace) -> list[Experim
 
 def run_capacity_crossover(args: argparse.Namespace) -> None:
     specs = capacity_crossover_specs_from_args(args)
+    default_models_arg = ",".join(CONTROLLED_MODELS)
+    models = (
+        list(CAPACITY_CROSSOVER_MODELS)
+        if str(args.models) == default_models_arg
+        else parse_csv_list(args.models, allowed=CAPACITY_MODEL_NAMES)
+    )
     train_grid(
         args,
         experiment="capacity_crossover_global",
         specs=specs,
-        models=CAPACITY_CROSSOVER_MODELS,
+        models=models,
         seeds=parse_int_list(args.seeds),
     )
 
@@ -1966,7 +1972,7 @@ def print_hpc_commands(args: argparse.Namespace) -> None:
     print("mkdir -p logs")
     for name, command, extra in [
         ("ch4-ctrl", "run-crossover", ""),
-        ("ch4-capacity", "run-capacity-crossover", " --seeds 1001 --r-sweep 2,4,5,6,8 --hidden-dim 32"),
+        ("ch4-capacity", "run-capacity-crossover", " --seeds 1001 --r-sweep 2,4,5,6,8 --n-nodes 10 --hidden-dim 32"),
         ("ch4-ts", "run-transport-support", " --include-practical"),
         ("ch4-ts-official", "run-transport-support-official", ""),
         ("ch4-noise", "run-overglobalisation", " --include-practical"),
