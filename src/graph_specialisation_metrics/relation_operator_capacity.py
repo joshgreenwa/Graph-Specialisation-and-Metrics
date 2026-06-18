@@ -1995,6 +1995,46 @@ def plot_overglobalisation(root: Path) -> Path | None:
     return path
 
 
+def plot_overglobalisation_probe(root: Path) -> Path | None:
+    rows = [row for row in metric_rows(root) if row["experiment"] == "overglobalisation_probe"]
+    if not rows:
+        return None
+    plt = import_plotting()
+    models = [
+        ("capacity_routing_only", "Dense support", "#4f78b5", "-"),
+        ("capacity_routing_1hop", "1-hop support", "#c2473f", "--"),
+    ]
+    fig, ax = plt.subplots(1, 1, figsize=(5.8, 4.1))
+    agg_mse = aggregate(rows, ("model", "noise_sigma"), "test_rel_mse")
+    for model, label, color, linestyle in models:
+        sigmas = sorted({float(row["noise_sigma"]) for row in rows if row["model"] == model})
+        if not sigmas:
+            continue
+        ax.errorbar(
+            sigmas,
+            [agg_mse.get((model, f"{sigma:g}"), agg_mse.get((model, str(sigma)), (np.nan, 0.0)))[0] for sigma in sigmas],
+            yerr=[agg_mse.get((model, f"{sigma:g}"), agg_mse.get((model, str(sigma)), (np.nan, 0.0)))[1] for sigma in sigmas],
+            marker="o",
+            linewidth=2.0,
+            capsize=3,
+            color=color,
+            linestyle=linestyle,
+            label=label,
+        )
+    ax.set_xlabel("irrelevant content noise magnitude")
+    ax.set_ylabel("relative MSE")
+    ax.set_title("Local Routing Task Under Irrelevant Content")
+    ax.grid(axis="y", color="#dddddd", linewidth=0.6)
+    ax.legend(frameon=False, loc="upper left")
+    fig.suptitle("Dense Support Can Expose Local Computation to Distractors (R=4, N=32)", y=1.03, fontsize=13)
+    fig.tight_layout()
+    path = ensure_dir(root / "figures") / "overglobalisation_probe_routing_only_noise_sweep.pdf"
+    fig.savefig(path, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[plot] wrote {path}")
+    return path
+
+
 def plot_overglobalisation_grit(root: Path) -> Path | None:
     rows = [row for row in metric_rows(root) if row["experiment"] == "overglobalisation_grit_official"]
     if not rows:
@@ -2079,6 +2119,7 @@ def plot_all(args: argparse.Namespace) -> None:
     plot_support_reach_controlled(root)
     plot_support_reach_practical(root)
     plot_overglobalisation(root)
+    plot_overglobalisation_probe(root)
     plot_overglobalisation_grit(root)
     plot_depth_escape(root)
 
