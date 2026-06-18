@@ -45,8 +45,23 @@ CAPACITY_CROSSOVER_MODELS = (
     "capacity_multiplicative_value_gate_routed",
     "capacity_full_relation_transport",
 )
+SUPPORT_REACH_CONTROLLED_MODELS = (
+    "capacity_routing_only",
+    "capacity_routing_1hop",
+    "capacity_multiplicative_value_gate_routed",
+    "capacity_multiplicative_value_gate_routed_1hop",
+    "capacity_full_relation_transport",
+    "capacity_full_relation_transport_1hop",
+)
+SUPPORT_REACH_PRACTICAL_MODELS = (
+    "graphormer_manual",
+    "graphgps_official",
+    "grit_official",
+    "grit_1hop_official",
+    "gatedgcn_plus_official",
+)
 LEGACY_CAPACITY_MODELS = ("capacity_transport_only", "capacity_additive_value_bias", "capacity_additive_value_bias_routed")
-CAPACITY_MODEL_NAMES = tuple(dict.fromkeys(CAPACITY_CROSSOVER_MODELS + LEGACY_CAPACITY_MODELS))
+CAPACITY_MODEL_NAMES = tuple(dict.fromkeys(CAPACITY_CROSSOVER_MODELS + SUPPORT_REACH_CONTROLLED_MODELS + LEGACY_CAPACITY_MODELS))
 ALL_MODELS = tuple(dict.fromkeys(CONTROLLED_MODELS + PRACTICAL_MODELS + OFFICIAL_GRIT_MODELS + CAPACITY_MODEL_NAMES))
 TASK_MODES = ("local", "global")
 PARAMETER_MATCH_WIDTHS = (32, 48, 64, 96, 128, 192)
@@ -57,11 +72,11 @@ MODEL_LABELS = {
     "full_dense": "Full-GT dense",
     "routing_1hop": "Routing-only 1-hop",
     "full_1hop": "Full-GT 1-hop",
-    "graphormer_manual": "Graphormer-manual",
-    "graphgps_official": "Official GraphGPS",
-    "grit_official": "Official GRIT dense",
-    "grit_1hop_official": "Official GRIT 1-hop",
-    "gatedgcn_plus_official": "Official GatedGCN+",
+    "graphormer_manual": "Graphormer",
+    "graphgps_official": "GraphGPS",
+    "grit_official": "GRIT",
+    "grit_1hop_official": "GRIT 1-hop",
+    "gatedgcn_plus_official": "GatedGCN+",
     "capacity_routing_only": "Routing-only",
     "capacity_transport_only": "Transport-only",
     "capacity_additive_value_bias": "Additive value bias",
@@ -69,6 +84,9 @@ MODEL_LABELS = {
     "capacity_additive_value_bias_routed": "Routing + additive value bias",
     "capacity_multiplicative_value_gate_routed": "Routing + multiplicative value gate",
     "capacity_full_relation_transport": "Full relation transport",
+    "capacity_routing_1hop": "Routing-only 1-hop",
+    "capacity_multiplicative_value_gate_routed_1hop": "Routing + multiplicative 1-hop",
+    "capacity_full_relation_transport_1hop": "Full relation transport 1-hop",
 }
 
 MODEL_COLORS = {
@@ -88,6 +106,9 @@ MODEL_COLORS = {
     "capacity_additive_value_bias_routed": "#4d4d4d",
     "capacity_multiplicative_value_gate_routed": "#9c6b1f",
     "capacity_full_relation_transport": "#c2473f",
+    "capacity_routing_1hop": "#86a6d9",
+    "capacity_multiplicative_value_gate_routed_1hop": "#d2a456",
+    "capacity_full_relation_transport_1hop": "#e38a7f",
 }
 
 CAPACITY_MODEL_DESCRIPTIONS = {
@@ -405,12 +426,13 @@ class CapacityRelationModel(nn.Module):
     experiment isolates relation-conditioned capacity rather than reach.
     """
 
-    def __init__(self, spec: ExperimentSpec, *, variant: str) -> None:
+    def __init__(self, spec: ExperimentSpec, *, variant: str, dense_support: bool = True) -> None:
         super().__init__()
         if variant not in CAPACITY_MODEL_NAMES:
             raise ValueError(f"unknown capacity variant {variant!r}")
         self.spec = spec
         self.variant = variant
+        self.dense_support = bool(dense_support)
         h = int(spec.heads)
         a = int(spec.transport_bases)
         d = int(spec.input_dim)
@@ -480,8 +502,9 @@ class CapacityRelationModel(nn.Module):
 
     def forward(self, batch: RelationBatch) -> torch.Tensor:
         state = batch.content
+        support = batch.support_dense if self.dense_support else batch.support_sparse
         for _ in range(int(self.spec.layers)):
-            state = self.layer(state, batch.pair_rel, batch.support_dense)
+            state = self.layer(state, batch.pair_rel, support)
         return self.output_head(state[:, 0, :])
 
 
@@ -859,8 +882,16 @@ class OfficialGNNPlusGatedGCNRelationModel(nn.Module):
 
 
 def build_model(spec: ExperimentSpec, model_name: str) -> nn.Module:
+    support_aliases = {
+        "capacity_routing_1hop": ("capacity_routing_only", False),
+        "capacity_multiplicative_value_gate_routed_1hop": ("capacity_multiplicative_value_gate_routed", False),
+        "capacity_full_relation_transport_1hop": ("capacity_full_relation_transport", False),
+    }
+    if model_name in support_aliases:
+        variant, dense_support = support_aliases[model_name]
+        return CapacityRelationModel(spec, variant=variant, dense_support=dense_support)
     if model_name in CAPACITY_MODEL_NAMES:
-        return CapacityRelationModel(spec, variant=model_name)
+        return CapacityRelationModel(spec, variant=model_name, dense_support=True)
     if model_name == "routing_dense":
         return ControlledRelationModel(spec, full_transport=False, dense_support=True)
     if model_name == "full_dense":
@@ -1814,6 +1845,102 @@ def plot_transport_support_official(root: Path) -> Path | None:
     return path
 
 
+def plot_support_reach_controlled(root: Path) -> Path | None:
+    rows = [row for row in metric_rows(root) if row["experiment"] == "support_reach_controlled"]
+    if not rows:
+        return None
+    plt = import_plotting()
+    pairs = [
+        ("Routing-only", "capacity_routing_only", "capacity_routing_1hop"),
+        (
+            "Routing +\nmultiplicative gate",
+            "capacity_multiplicative_value_gate_routed",
+            "capacity_multiplicative_value_gate_routed_1hop",
+        ),
+        ("Full relation\ntransport", "capacity_full_relation_transport", "capacity_full_relation_transport_1hop"),
+    ]
+    agg_mse = aggregate(rows, ("task_mode", "model"), "test_rel_mse")
+    fig, axes = plt.subplots(1, 2, figsize=(9.8, 4.1), sharey=True)
+    width = 0.34
+    for ax, mode in zip(axes, ("local", "global"), strict=True):
+        x = np.arange(len(pairs))
+        dense_vals = [agg_mse.get((mode, dense), (np.nan, 0.0))[0] for _, dense, _ in pairs]
+        dense_err = [agg_mse.get((mode, dense), (np.nan, 0.0))[1] for _, dense, _ in pairs]
+        sparse_vals = [agg_mse.get((mode, sparse), (np.nan, 0.0))[0] for _, _, sparse in pairs]
+        sparse_err = [agg_mse.get((mode, sparse), (np.nan, 0.0))[1] for _, _, sparse in pairs]
+        ax.bar(
+            x - width / 2,
+            dense_vals,
+            width=width,
+            yerr=dense_err,
+            capsize=3,
+            color="#4f78b5",
+            edgecolor="black",
+            linewidth=0.5,
+            label="Dense support",
+        )
+        ax.bar(
+            x + width / 2,
+            sparse_vals,
+            width=width,
+            yerr=sparse_err,
+            capsize=3,
+            color="#ffffff",
+            edgecolor="#4f78b5",
+            hatch="///",
+            linewidth=0.9,
+            label="1-hop support",
+        )
+        ax.set_xticks(x, [label for label, _, _ in pairs])
+        ax.set_xlabel("model mechanism")
+        ax.set_title("Local relation task" if mode == "local" else "Long-range relation task")
+        ax.grid(axis="y", color="#dddddd", linewidth=0.6)
+    axes[0].set_ylabel("relative MSE")
+    axes[1].legend(frameon=False, loc="upper left")
+    fig.suptitle("Transport Controls Capacity; Support Controls Reach (R=8, N=10, H=4)", y=1.04, fontsize=13)
+    fig.tight_layout()
+    path = ensure_dir(root / "figures") / "transport_support_controlled_relation_operator.pdf"
+    fig.savefig(path, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[plot] wrote {path}")
+    return path
+
+
+def plot_support_reach_practical(root: Path) -> Path | None:
+    rows = [row for row in metric_rows(root) if row["experiment"] == "support_reach_practical"]
+    if not rows:
+        return None
+    plt = import_plotting()
+    models = [model for model in SUPPORT_REACH_PRACTICAL_MODELS if any(row["model"] == model for row in rows)]
+    agg_mse = aggregate(rows, ("task_mode", "model"), "test_rel_mse")
+    fig, axes = plt.subplots(1, 2, figsize=(9.8, 4.1), sharey=True)
+    for ax, mode in zip(axes, ("local", "global"), strict=True):
+        x = np.arange(len(models))
+        vals = [agg_mse.get((mode, model), (np.nan, 0.0))[0] for model in models]
+        err = [agg_mse.get((mode, model), (np.nan, 0.0))[1] for model in models]
+        ax.bar(
+            x,
+            vals,
+            yerr=err,
+            capsize=3,
+            color=[MODEL_COLORS[model] for model in models],
+            edgecolor="black",
+            linewidth=0.5,
+        )
+        ax.set_xticks(x, [MODEL_LABELS[model] for model in models], rotation=25, ha="right")
+        ax.set_xlabel("practical model")
+        ax.set_title("Local relation task" if mode == "local" else "Long-range relation task")
+        ax.grid(axis="y", color="#dddddd", linewidth=0.6)
+    axes[0].set_ylabel("relative MSE")
+    fig.suptitle("Practical Architectures on the Relation-Support Test (R=8, N=10)", y=1.04, fontsize=13)
+    fig.tight_layout()
+    path = ensure_dir(root / "figures") / "transport_support_practical_relation_operator.pdf"
+    fig.savefig(path, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[plot] wrote {path}")
+    return path
+
+
 def plot_overglobalisation(root: Path) -> Path | None:
     rows = [row for row in metric_rows(root) if row["experiment"] in {"overglobalisation", "overglobalisation_fixed"}]
     if not rows:
@@ -1949,6 +2076,8 @@ def plot_all(args: argparse.Namespace) -> None:
     plot_transport_support(root, "local")
     plot_transport_support(root, "global")
     plot_transport_support_official(root)
+    plot_support_reach_controlled(root)
+    plot_support_reach_practical(root)
     plot_overglobalisation(root)
     plot_overglobalisation_grit(root)
     plot_depth_escape(root)
