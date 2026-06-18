@@ -17,6 +17,7 @@ import argparse
 import csv
 import dataclasses
 import importlib
+import importlib.util
 import json
 import math
 import os
@@ -411,6 +412,14 @@ def add_external_repo_path(env_name: str, candidates: Sequence[str]) -> None:
             return
 
 
+def resolve_external_repo_path(env_name: str, candidates: Sequence[str]) -> Path:
+    for path in external_repo_paths(env_name, candidates):
+        if path.exists():
+            return path.resolve()
+    checked = ", ".join(str(path) for path in external_repo_paths(env_name, candidates))
+    raise RuntimeError(f"official backend path for {env_name} was not found; checked {checked}")
+
+
 def require_official_import(module_name: str, env_name: str, candidates: Sequence[str]):
     add_external_repo_path(env_name, candidates)
     try:
@@ -418,6 +427,25 @@ def require_official_import(module_name: str, env_name: str, candidates: Sequenc
     except Exception as exc:
         checked = ", ".join(str(path) for path in external_repo_paths(env_name, candidates))
         raise RuntimeError(f"official backend import failed for {module_name!r}; checked {checked}") from exc
+
+
+def require_official_file_module(module_name: str, path: Path):
+    path = path.resolve()
+    if module_name in sys.modules:
+        return sys.modules[module_name]
+    if not path.exists():
+        raise RuntimeError(f"official backend file is missing: {path}")
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"could not load official backend file: {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception:
+        sys.modules.pop(module_name, None)
+        raise
+    return module
 
 
 class OfficialBackedProxy(nn.Module):
@@ -440,7 +468,12 @@ class OfficialBackedProxy(nn.Module):
             require_official_import("grit.layer.grit_layer", "GRIT_ROOT", ("GRIT",))
             self.body = ControlledRelationModel(spec, full_transport=True, dense_support=True)
         elif model_name == "gatedgcn_plus_official":
-            require_official_import("GNNPlus", "GNNPLUS_ROOT", ("GNNPlus",))
+            gnnplus_root = resolve_external_repo_path("GNNPLUS_ROOT", ("GNNPlus",))
+            gnnplus_pkg = gnnplus_root / "GNNPlus" if (gnnplus_root / "GNNPlus").exists() else gnnplus_root
+            require_official_file_module(
+                "_ch4_official_gnnplus_gatedgcn_layer",
+                gnnplus_pkg / "layer" / "gatedgcn_layer.py",
+            )
             self.body = ControlledRelationModel(spec, full_transport=True, dense_support=False)
         else:
             raise ValueError(model_name)
