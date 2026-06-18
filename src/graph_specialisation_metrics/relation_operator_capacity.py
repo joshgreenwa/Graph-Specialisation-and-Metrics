@@ -23,6 +23,7 @@ import math
 import os
 import random
 import sys
+import types
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
@@ -37,7 +38,8 @@ R_SWEEP = (1, 2, 4, 8, 12, 16)
 DEFAULT_SEEDS = (1001, 1002, 1003)
 CONTROLLED_MODELS = ("routing_dense", "full_dense", "routing_1hop", "full_1hop")
 PRACTICAL_MODELS = ("graphormer_manual", "graphgps_official", "grit_official", "gatedgcn_plus_official")
-ALL_MODELS = CONTROLLED_MODELS + PRACTICAL_MODELS
+OFFICIAL_GRIT_MODELS = ("grit_official", "grit_1hop_official")
+ALL_MODELS = tuple(dict.fromkeys(CONTROLLED_MODELS + PRACTICAL_MODELS + OFFICIAL_GRIT_MODELS))
 TASK_MODES = ("local", "global")
 PARAMETER_MATCH_WIDTHS = (32, 48, 64, 96, 128, 192)
 EPS = 1.0e-12
@@ -48,9 +50,10 @@ MODEL_LABELS = {
     "routing_1hop": "Routing-only 1-hop",
     "full_1hop": "Full-GT 1-hop",
     "graphormer_manual": "Graphormer-manual",
-    "graphgps_official": "GraphGPS-official",
-    "grit_official": "GRIT-official",
-    "gatedgcn_plus_official": "GatedGCN+-official",
+    "graphgps_official": "GraphGPS source-checked",
+    "grit_official": "Official GRIT dense",
+    "grit_1hop_official": "Official GRIT 1-hop",
+    "gatedgcn_plus_official": "GatedGCN+ source-checked",
 }
 
 MODEL_COLORS = {
@@ -61,6 +64,7 @@ MODEL_COLORS = {
     "graphormer_manual": "#5f6b7a",
     "graphgps_official": "#4f8f5b",
     "grit_official": "#8b5fbf",
+    "grit_1hop_official": "#b89ad9",
     "gatedgcn_plus_official": "#c4862f",
 }
 
@@ -480,6 +484,114 @@ def require_official_file_exists(path: Path) -> Path:
     return path
 
 
+def load_official_grit_layer_module():
+    grit_root = resolve_external_repo_path("GRIT_ROOT", ("GRIT",))
+    grit_pkg = grit_root / "grit" if (grit_root / "grit").exists() else grit_root
+    require_official_file_exists(grit_pkg / "utils.py")
+    require_official_file_exists(grit_pkg / "layer" / "grit_layer.py")
+
+    # Avoid GRIT's package-level __init__.py because it imports GraphGym config
+    # decorators that are not robust in this environment.  We still execute the
+    # official utility and layer source files.
+    grit_stub = types.ModuleType("grit")
+    grit_stub.__path__ = [str(grit_pkg)]
+    sys.modules["grit"] = grit_stub
+    require_official_file_module("grit.utils", grit_pkg / "utils.py")
+    return require_official_file_module("_ch4_official_grit_layer", grit_pkg / "layer" / "grit_layer.py")
+
+
+def official_grit_layer_cfg():
+    yacs_config = require_official_import("yacs.config", "YACS", ())
+    cn = yacs_config.CfgNode
+    cfg = cn(new_allowed=True)
+    cfg.update_e = True
+    cfg.bn_momentum = 0.1
+    cfg.bn_no_runner = False
+    cfg.rezero = False
+    cfg.attn = cn(new_allowed=True)
+    cfg.attn.use = True
+    cfg.attn.deg_scaler = False
+    cfg.attn.use_bias = False
+    cfg.attn.clamp = 5.0
+    cfg.attn.act = "relu"
+    cfg.attn.edge_enhance = True
+    cfg.attn.sqrt_relu = False
+    cfg.attn.signed_sqrt = True
+    cfg.attn.scaled_attn = False
+    cfg.attn.no_qk = False
+    cfg.attn.graphormer_attn = False
+    return cfg
+
+
+class OfficialGRITRelationModel(nn.Module):
+    """Actual official GRIT layer body for the Ch4 relation-operator task."""
+
+    def __init__(self, spec: ExperimentSpec, *, dense_support: bool) -> None:
+        super().__init__()
+        if int(spec.hidden_dim) % int(spec.heads):
+            raise ValueError("hidden_dim must be divisible by heads for official GRIT")
+        grit_layer_mod = load_official_grit_layer_module()
+        self.spec = spec
+        self.dense_support = bool(dense_support)
+        dim = int(spec.hidden_dim)
+        self.input_encoder = nn.Linear(spec.feature_dim, dim)
+        self.edge_encoder = nn.Embedding(spec.relation_types + 1, dim)
+        cfg = official_grit_layer_cfg()
+        self.layers = nn.ModuleList(
+            grit_layer_mod.GritTransformerLayer(
+                dim,
+                dim,
+                int(spec.heads),
+                dropout=0.0,
+                attn_dropout=0.0,
+                layer_norm=True,
+                batch_norm=False,
+                residual=True,
+                act="relu",
+                norm_e=True,
+                O_e=True,
+                cfg=cfg,
+            )
+            for _ in range(int(spec.layers))
+        )
+        self.output_head = nn.Sequential(nn.LayerNorm(dim), nn.Linear(dim, int(spec.target_dim)))
+
+    def _support_for_batch(self, batch: RelationBatch) -> torch.Tensor:
+        bsz, n, _ = batch.content.shape
+        if self.dense_support:
+            support = torch.ones((bsz, n, n), dtype=torch.bool, device=batch.content.device)
+        else:
+            support = batch.support_sparse.clone()
+        diag = torch.arange(n, device=batch.content.device)
+        support[:, diag, diag] = True
+        return support
+
+    def _pyg_batch(self, batch: RelationBatch):
+        data_mod = require_official_import("torch_geometric.data", "torch_geometric", ())
+        bsz, n, _ = batch.x.shape
+        device = batch.x.device
+        support0 = self._support_for_batch(batch)[0]
+        receiver, sender = torch.where(support0)
+        offsets = torch.arange(bsz, device=device, dtype=torch.long) * n
+        src = (sender.unsqueeze(0) + offsets.unsqueeze(1)).reshape(-1)
+        dst = (receiver.unsqueeze(0) + offsets.unsqueeze(1)).reshape(-1)
+        rel = batch.pair_rel[0, receiver, sender].repeat(bsz)
+
+        data = data_mod.Data(num_nodes=bsz * n)
+        data.x = self.input_encoder(batch.x.reshape(bsz * n, -1).float())
+        data.edge_index = torch.stack([src, dst], dim=0)
+        data.edge_attr = self.edge_encoder(rel.long())
+        data.batch = torch.arange(bsz, device=device).repeat_interleave(n)
+        return data
+
+    def forward(self, batch: RelationBatch) -> torch.Tensor:
+        pyg_batch = self._pyg_batch(batch)
+        for layer in self.layers:
+            pyg_batch = layer(pyg_batch)
+        states = pyg_batch.x.view(batch.x.shape[0], batch.x.shape[1], -1)
+        return self.output_head(states[:, 0, :])
+
+
 class OfficialBackedProxy(nn.Module):
     """Official-preflighted practical adapters for the controlled synthetic task.
 
@@ -528,7 +640,11 @@ def build_model(spec: ExperimentSpec, model_name: str) -> nn.Module:
         return ControlledRelationModel(spec, full_transport=True, dense_support=False)
     if model_name == "graphormer_manual":
         return GraphormerManualModel(spec)
-    if model_name in {"graphgps_official", "grit_official", "gatedgcn_plus_official"}:
+    if model_name == "grit_official":
+        return OfficialGRITRelationModel(spec, dense_support=True)
+    if model_name == "grit_1hop_official":
+        return OfficialGRITRelationModel(spec, dense_support=False)
+    if model_name in {"graphgps_official", "gatedgcn_plus_official"}:
         return OfficialBackedProxy(spec, model_name)
     raise ValueError(f"unknown model {model_name!r}")
 
@@ -576,7 +692,7 @@ def maybe_parameter_matched_spec(
     *,
     width_grid: Sequence[int],
 ) -> ExperimentSpec:
-    if model_name not in PRACTICAL_MODELS:
+    if model_name not in {"graphormer_manual", "graphgps_official", "gatedgcn_plus_official"}:
         return spec
     target_params = int(count_parameters(build_model(spec, "full_dense")))
     matched, rows = parameter_match_grid(spec, model_name, target_params=target_params, width_grid=width_grid)
@@ -756,8 +872,11 @@ def train_one(
         payload = torch.load(ckpt_dir / "best.pt", map_location=device)
         model.load_state_dict(payload["state_dict"])
     test = evaluate_model(model, splits["test"], device, eval_batch_size)
-    maps = effective_relation_maps(model, loaded_spec, device)
-    rank, singular = realised_rank(maps)
+    if isinstance(model, OfficialGRITRelationModel):
+        rank, singular = -1, []
+    else:
+        maps = effective_relation_maps(model, loaded_spec, device)
+        rank, singular = realised_rank(maps)
     floor = teacher_floor(loaded_spec)
     summary = {
         "experiment": experiment,
@@ -975,6 +1094,29 @@ def run_overglobalisation(args: argparse.Namespace) -> None:
     train_grid(args, experiment="overglobalisation", specs=sweep_specs, models=("full_dense", "full_1hop"), seeds=seeds)
 
 
+def run_overglobalisation_grit(args: argparse.Namespace) -> None:
+    seeds = parse_int_list(args.seeds)
+    specs = [
+        base_spec_from_args(
+            args,
+            relation_types=int(args.relation_types),
+            task_mode=mode,
+            noise_nodes=int(args.noise_nodes or 3 * int(args.relation_types)),
+            noise_sigma=sigma,
+            layers=1,
+        )
+        for mode in ("local", "global")
+        for sigma in parse_float_list(args.noise_sweep)
+    ]
+    train_grid(
+        args,
+        experiment="overglobalisation_grit_official",
+        specs=specs,
+        models=OFFICIAL_GRIT_MODELS,
+        seeds=seeds,
+    )
+
+
 def run_depth_escape(args: argparse.Namespace) -> None:
     specs = [
         base_spec_from_args(args, relation_types=int(args.relation_types), task_mode="local", noise_nodes=0, noise_sigma=0.0, layers=layers)
@@ -1183,6 +1325,44 @@ def plot_overglobalisation(root: Path) -> Path | None:
     return path
 
 
+def plot_overglobalisation_grit(root: Path) -> Path | None:
+    rows = [row for row in metric_rows(root) if row["experiment"] == "overglobalisation_grit_official"]
+    if not rows:
+        return None
+    plt = import_plotting()
+    fig, axes = plt.subplots(1, 2, figsize=(9.2, 4.0), sharey=True)
+    for ax, mode in zip(axes, ("local", "global"), strict=True):
+        for model in OFFICIAL_GRIT_MODELS:
+            sub = [row for row in rows if row["task_mode"] == mode and row["model"] == model]
+            if not sub:
+                continue
+            sigmas = sorted({float(row["noise_sigma"]) for row in sub})
+            agg_mse = aggregate(sub, ("model", "task_mode", "noise_sigma"), "test_rel_mse")
+            ax.errorbar(
+                sigmas,
+                [agg_mse[(model, mode, str(sigma))][0] for sigma in sigmas],
+                yerr=[agg_mse[(model, mode, str(sigma))][1] for sigma in sigmas],
+                marker="o",
+                linewidth=2.0,
+                capsize=3,
+                color=MODEL_COLORS[model],
+                label=MODEL_LABELS[model],
+            )
+        ax.set_title("Local teacher" if mode == "local" else "Long-range teacher")
+        ax.set_xlabel("irrelevant content noise magnitude")
+        ax.set_yscale("log")
+        ax.grid(axis="y", color="#dddddd", linewidth=0.6)
+    axes[0].set_ylabel("relative MSE")
+    axes[1].legend(frameon=False, loc="best")
+    fig.suptitle("Official GRIT: Dense Support Increases Irrelevant-Content Sensitivity", y=1.04, fontsize=13)
+    fig.tight_layout()
+    path = ensure_dir(root / "figures") / "overglobalisation_official_grit_dense_vs_1hop.pdf"
+    fig.savefig(path, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[plot] wrote {path}")
+    return path
+
+
 def plot_depth_escape(root: Path) -> Path | None:
     rows = [row for row in metric_rows(root) if row["experiment"] == "depth_escape"]
     if not rows:
@@ -1224,6 +1404,7 @@ def plot_all(args: argparse.Namespace) -> None:
     plot_transport_support(root, "local")
     plot_transport_support(root, "global")
     plot_overglobalisation(root)
+    plot_overglobalisation_grit(root)
     plot_depth_escape(root)
 
 
@@ -1265,6 +1446,7 @@ def print_hpc_commands(args: argparse.Namespace) -> None:
         ("ch4-ctrl", "run-crossover", ""),
         ("ch4-ts", "run-transport-support", " --include-practical"),
         ("ch4-noise", "run-overglobalisation", " --include-practical"),
+        ("ch4-grit-noise", "run-overglobalisation-grit", " --seeds 1001 --noise-sweep 0,0.5,1,2"),
         ("ch4-depth", "run-depth-escape", ""),
         ("ch4-plot", "plot", ""),
     ]:
@@ -1329,6 +1511,7 @@ def build_parser() -> argparse.ArgumentParser:
         ("run-crossover", "Run the local relation-rank crossover experiment.", run_crossover),
         ("run-transport-support", "Run local/global transport-support experiments.", run_transport_support),
         ("run-overglobalisation", "Run irrelevant-content over-globalisation experiments.", run_overglobalisation),
+        ("run-overglobalisation-grit", "Run official GRIT dense-vs-1-hop over-globalisation experiment.", run_overglobalisation_grit),
         ("run-depth-escape", "Run routing-only depth escape experiments.", run_depth_escape),
         ("plot", "Generate all Ch4 figures from cached metrics.", plot_all),
         ("run-all", "Run all Ch4 stages.", run_all),

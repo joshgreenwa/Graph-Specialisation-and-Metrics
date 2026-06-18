@@ -25,12 +25,15 @@ mkdir -p logs
 
 COMMON_FLAGS=(
   --output-root "${CH4_OUTPUT_ROOT}"
+  --seeds "${CH4_SEEDS:-1001,1002,1003}"
+  --noise-sweep "${CH4_NOISE_SWEEP:-0,0.25,0.5,1,2,4}"
   --train-size "${CH4_TRAIN_SIZE:-8192}"
   --val-size "${CH4_VAL_SIZE:-2048}"
   --test-size "${CH4_TEST_SIZE:-2048}"
   --n-nodes "${CH4_N_NODES:-32}"
   --input-dim "${CH4_INPUT_DIM:-32}"
   --target-dim "${CH4_TARGET_DIM:-32}"
+  --hidden-dim "${CH4_HIDDEN_DIM:-64}"
   --heads "${CH4_HEADS:-4}"
   --transport-bases "${CH4_TRANSPORT_BASES:-4}"
   --batch-size "${CH4_BATCH_SIZE:-2048}"
@@ -84,12 +87,18 @@ case "${CH4_STAGE}" in
     python -u -m graph_specialisation_metrics.relation_operator_capacity run-overglobalisation \
       "${COMMON_FLAGS[@]}" "${PRACTICAL_FLAGS[@]}"
     ;;
+  overglobalisation-grit)
+    python -u -m graph_specialisation_metrics.relation_operator_capacity run-overglobalisation-grit \
+      "${COMMON_FLAGS[@]}"
+    python -u -m graph_specialisation_metrics.relation_operator_capacity plot \
+      --output-root "${CH4_OUTPUT_ROOT}"
+    ;;
   depth-escape)
     python -u -m graph_specialisation_metrics.relation_operator_capacity run-depth-escape \
       "${COMMON_FLAGS[@]}"
     ;;
   *)
-    echo "Unknown CH4_STAGE=${CH4_STAGE}. Use full, controlled, practical, plot, crossover, transport-support, overglobalisation, or depth-escape." >&2
+    echo "Unknown CH4_STAGE=${CH4_STAGE}. Use full, controlled, practical, plot, crossover, transport-support, overglobalisation, overglobalisation-grit, or depth-escape." >&2
     exit 2
     ;;
 esac
