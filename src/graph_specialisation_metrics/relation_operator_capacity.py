@@ -1096,6 +1096,12 @@ def train_one(
     model = build_model(loaded_spec, model_name).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     amp_enabled = bool(use_amp and device.type == "cuda")
+    if isinstance(model, OfficialGRITRelationModel) and amp_enabled:
+        # Official GRIT's attention path scatters into a float32 output tensor.
+        # Autocast can make the scattered message bf16, which torch_scatter
+        # rejects because source and output dtypes differ.
+        amp_enabled = False
+        print("[train] disabling AMP for official GRIT to keep torch_scatter dtypes consistent")
     if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):
         scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
     else:
@@ -1117,7 +1123,7 @@ def train_one(
             with torch.autocast(
                 device_type=autocast_device,
                 dtype=torch.bfloat16,
-                enabled=bool(use_amp and device.type == "cuda"),
+                enabled=amp_enabled,
             ):
                 pred = model(batch)
                 loss = F.mse_loss(pred.float(), batch.y.float())
