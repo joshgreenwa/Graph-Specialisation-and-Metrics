@@ -89,6 +89,12 @@ case "${CH4_STAGE}" in
     python -u -m graph_specialisation_metrics.relation_operator_capacity run-transport-support \
       "${COMMON_FLAGS[@]}" "${PRACTICAL_FLAGS[@]}"
     ;;
+  transport-support-official)
+    python -u -m graph_specialisation_metrics.relation_operator_capacity run-transport-support-official \
+      "${COMMON_FLAGS[@]}"
+    python -u -m graph_specialisation_metrics.relation_operator_capacity plot \
+      --output-root "${CH4_OUTPUT_ROOT}"
+    ;;
   overglobalisation)
     python -u -m graph_specialisation_metrics.relation_operator_capacity run-overglobalisation \
       "${COMMON_FLAGS[@]}" "${PRACTICAL_FLAGS[@]}"
@@ -104,7 +110,7 @@ case "${CH4_STAGE}" in
       "${COMMON_FLAGS[@]}"
     ;;
   *)
-    echo "Unknown CH4_STAGE=${CH4_STAGE}. Use full, controlled, practical, plot, crossover, transport-support, overglobalisation, overglobalisation-grit, or depth-escape." >&2
+    echo "Unknown CH4_STAGE=${CH4_STAGE}. Use full, controlled, practical, plot, crossover, transport-support, transport-support-official, overglobalisation, overglobalisation-grit, or depth-escape." >&2
     exit 2
     ;;
 esac

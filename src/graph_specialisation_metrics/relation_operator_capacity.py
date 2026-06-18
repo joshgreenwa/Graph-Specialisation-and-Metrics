@@ -50,10 +50,10 @@ MODEL_LABELS = {
     "routing_1hop": "Routing-only 1-hop",
     "full_1hop": "Full-GT 1-hop",
     "graphormer_manual": "Graphormer-manual",
-    "graphgps_official": "GraphGPS source-checked",
+    "graphgps_official": "Official GraphGPS",
     "grit_official": "Official GRIT dense",
     "grit_1hop_official": "Official GRIT 1-hop",
-    "gatedgcn_plus_official": "GatedGCN+ source-checked",
+    "gatedgcn_plus_official": "Official GatedGCN+",
 }
 
 MODEL_COLORS = {
@@ -484,6 +484,55 @@ def require_official_file_exists(path: Path) -> Path:
     return path
 
 
+def setup_graphgym_activation(act: str = "relu") -> None:
+    try:
+        graphgym_config = importlib.import_module("torch_geometric.graphgym.config")
+        graphgym_register = importlib.import_module("torch_geometric.graphgym.register")
+        yacs_config = importlib.import_module("yacs.config")
+    except Exception:
+        return
+    allow_graphgym_duplicate_registration()
+    cfg = graphgym_config.cfg
+    if hasattr(cfg, "defrost"):
+        cfg.defrost()
+    if hasattr(cfg, "set_new_allowed"):
+        cfg.set_new_allowed(True)
+    if not hasattr(cfg, "gnn"):
+        cfg.gnn = yacs_config.CfgNode(new_allowed=True)
+    elif hasattr(cfg.gnn, "set_new_allowed"):
+        cfg.gnn.set_new_allowed(True)
+    cfg.gnn.act = str(act)
+    if str(act) not in graphgym_register.act_dict:
+        graphgym_register.act_dict[str(act)] = getattr(torch.nn, "ReLU")
+
+
+def support_edge_triples(
+    batch: RelationBatch,
+    *,
+    dense_support: bool,
+    include_self_loops: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    bsz, n, _ = batch.x.shape
+    device = batch.x.device
+    support = batch.support_dense if dense_support else batch.support_sparse
+    support0 = support[0].clone()
+    if include_self_loops:
+        diag = torch.arange(n, device=device)
+        support0[diag, diag] = True
+    receiver, sender = torch.where(support0)
+    offsets = torch.arange(bsz, device=device, dtype=torch.long) * n
+    src = (sender.unsqueeze(0) + offsets.unsqueeze(1)).reshape(-1)
+    dst = (receiver.unsqueeze(0) + offsets.unsqueeze(1)).reshape(-1)
+    rel = batch.pair_rel[0, receiver, sender].repeat(bsz)
+    return src, dst, rel.long()
+
+
+def relation_attn_bias(batch: RelationBatch, embedding: nn.Embedding, heads: int) -> torch.Tensor:
+    bsz, n, _ = batch.x.shape
+    bias = embedding(batch.pair_rel.long()).permute(0, 3, 1, 2).contiguous()
+    return bias.view(bsz * int(heads), n, n)
+
+
 def load_official_grit_layer_module():
     grit_root = resolve_external_repo_path("GRIT_ROOT", ("GRIT",))
     grit_pkg = grit_root / "grit" if (grit_root / "grit").exists() else grit_root
@@ -570,12 +619,7 @@ class OfficialGRITRelationModel(nn.Module):
         data_mod = require_official_import("torch_geometric.data", "torch_geometric", ())
         bsz, n, _ = batch.x.shape
         device = batch.x.device
-        support0 = self._support_for_batch(batch)[0]
-        receiver, sender = torch.where(support0)
-        offsets = torch.arange(bsz, device=device, dtype=torch.long) * n
-        src = (sender.unsqueeze(0) + offsets.unsqueeze(1)).reshape(-1)
-        dst = (receiver.unsqueeze(0) + offsets.unsqueeze(1)).reshape(-1)
-        rel = batch.pair_rel[0, receiver, sender].repeat(bsz)
+        src, dst, rel = support_edge_triples(batch, dense_support=self.dense_support, include_self_loops=True)
 
         data = data_mod.Data(num_nodes=bsz * n)
         data.x = self.input_encoder(batch.x.reshape(bsz * n, -1).float())
@@ -594,41 +638,103 @@ class OfficialGRITRelationModel(nn.Module):
         return self.output_head(states[:, 0, :])
 
 
-class OfficialBackedProxy(nn.Module):
-    """Official-preflighted practical adapters for the controlled synthetic task.
+class OfficialGraphGPSRelationModel(nn.Module):
+    """Actual official GPSLayer for relation-only Ch4 comparisons."""
 
-    The upstream projects expose GraphGym/PyG layers with substantial data
-    assumptions.  This adapter deliberately verifies that the official package is
-    importable or the official layer source is present, then uses the closest
-    controlled one-layer operator with the same information channel.  This keeps
-    practical labels from running unless the official dependency is present while
-    preserving the exact Ch4 input controls.
-    """
-
-    def __init__(self, spec: ExperimentSpec, model_name: str) -> None:
+    def __init__(self, spec: ExperimentSpec) -> None:
         super().__init__()
-        self.model_name = model_name
-        if model_name == "graphgps_official":
-            require_official_import("graphgps.layer.gps_layer", "GRAPHGPS_ROOT", ("GraphGPS",))
-            self.body = ControlledRelationModel(spec, full_transport=True, dense_support=False)
-        elif model_name == "grit_official":
-            grit_root = resolve_external_repo_path("GRIT_ROOT", ("GRIT",))
-            grit_pkg = grit_root / "grit" if (grit_root / "grit").exists() else grit_root
-            require_official_file_exists(grit_pkg / "layer" / "grit_layer.py")
-            self.body = ControlledRelationModel(spec, full_transport=True, dense_support=True)
-        elif model_name == "gatedgcn_plus_official":
-            gnnplus_root = resolve_external_repo_path("GNNPLUS_ROOT", ("GNNPlus",))
-            gnnplus_pkg = gnnplus_root / "GNNPlus" if (gnnplus_root / "GNNPlus").exists() else gnnplus_root
-            require_official_file_module(
-                "_ch4_official_gnnplus_gatedgcn_layer",
-                gnnplus_pkg / "layer" / "gatedgcn_layer.py",
+        if int(spec.hidden_dim) % int(spec.heads):
+            raise ValueError("hidden_dim must be divisible by heads for official GraphGPS")
+        setup_graphgym_activation("relu")
+        gps_layer_mod = require_official_import("graphgps.layer.gps_layer", "GRAPHGPS_ROOT", ("GraphGPS",))
+        self.spec = spec
+        dim = int(spec.hidden_dim)
+        self.input_encoder = nn.Linear(spec.feature_dim, dim)
+        self.edge_encoder = nn.Embedding(spec.relation_types + 1, dim)
+        self.attn_bias_encoder = nn.Embedding(spec.relation_types + 1, int(spec.heads))
+        self.layers = nn.ModuleList(
+            gps_layer_mod.GPSLayer(
+                dim_h=dim,
+                local_gnn_type="GINE",
+                global_model_type="BiasedTransformer",
+                num_heads=int(spec.heads),
+                act="relu",
+                pna_degrees=None,
+                equivstable_pe=False,
+                dropout=0.0,
+                attn_dropout=0.0,
+                layer_norm=True,
+                batch_norm=False,
+                bigbird_cfg=None,
+                log_attn_weights=False,
             )
-            self.body = ControlledRelationModel(spec, full_transport=True, dense_support=False)
-        else:
-            raise ValueError(model_name)
+            for _ in range(int(spec.layers))
+        )
+        self.output_head = nn.Sequential(nn.LayerNorm(dim), nn.Linear(dim, int(spec.target_dim)))
 
     def forward(self, batch: RelationBatch) -> torch.Tensor:
-        return self.body(batch)
+        data_mod = require_official_import("torch_geometric.data", "torch_geometric", ())
+        bsz, n, _ = batch.x.shape
+        src, dst, rel = support_edge_triples(batch, dense_support=False, include_self_loops=True)
+        data = data_mod.Data(num_nodes=bsz * n)
+        data.x = self.input_encoder(batch.x.reshape(bsz * n, -1).float())
+        data.edge_index = torch.stack([src, dst], dim=0)
+        data.edge_attr = self.edge_encoder(rel)
+        data.batch = torch.arange(bsz, device=batch.x.device).repeat_interleave(n)
+        data.attn_bias = relation_attn_bias(batch, self.attn_bias_encoder, int(self.spec.heads)).to(data.x.dtype)
+        for layer in self.layers:
+            data = layer(data)
+        states = data.x.view(bsz, n, -1)
+        return self.output_head(states[:, 0, :])
+
+
+def load_official_gnnplus_gatedgcn_module():
+    setup_graphgym_activation("relu")
+    gnnplus_root = resolve_external_repo_path("GNNPLUS_ROOT", ("GNNPlus",))
+    gnnplus_pkg = gnnplus_root / "GNNPlus" if (gnnplus_root / "GNNPlus").exists() else gnnplus_root
+    return require_official_file_module(
+        "_ch4_official_gnnplus_gatedgcn_layer",
+        gnnplus_pkg / "layer" / "gatedgcn_layer.py",
+    )
+
+
+class OfficialGNNPlusGatedGCNRelationModel(nn.Module):
+    """Actual official GNN+ GatedGCN layer for sparse relation-only Ch4 comparisons."""
+
+    def __init__(self, spec: ExperimentSpec) -> None:
+        super().__init__()
+        gated_mod = load_official_gnnplus_gatedgcn_module()
+        self.spec = spec
+        dim = int(spec.hidden_dim)
+        self.input_encoder = nn.Linear(spec.feature_dim, dim)
+        self.edge_encoder = nn.Embedding(spec.relation_types + 1, dim)
+        self.layers = nn.ModuleList(
+            gated_mod.GatedGCNLayer(
+                dim,
+                dim,
+                dropout=0.0,
+                residual=True,
+                ffn=True,
+                act="relu",
+                equivstable_pe=False,
+            )
+            for _ in range(int(spec.layers))
+        )
+        self.output_head = nn.Sequential(nn.LayerNorm(dim), nn.Linear(dim, int(spec.target_dim)))
+
+    def forward(self, batch: RelationBatch) -> torch.Tensor:
+        data_mod = require_official_import("torch_geometric.data", "torch_geometric", ())
+        bsz, n, _ = batch.x.shape
+        src, dst, rel = support_edge_triples(batch, dense_support=False, include_self_loops=True)
+        data = data_mod.Data(num_nodes=bsz * n)
+        data.x = self.input_encoder(batch.x.reshape(bsz * n, -1).float())
+        data.edge_index = torch.stack([src, dst], dim=0)
+        data.edge_attr = self.edge_encoder(rel)
+        data.batch = torch.arange(bsz, device=batch.x.device).repeat_interleave(n)
+        for layer in self.layers:
+            data = layer(data)
+        states = data.x.view(bsz, n, -1)
+        return self.output_head(states[:, 0, :])
 
 
 def build_model(spec: ExperimentSpec, model_name: str) -> nn.Module:
@@ -646,8 +752,10 @@ def build_model(spec: ExperimentSpec, model_name: str) -> nn.Module:
         return OfficialGRITRelationModel(spec, dense_support=True)
     if model_name == "grit_1hop_official":
         return OfficialGRITRelationModel(spec, dense_support=False)
-    if model_name in {"graphgps_official", "gatedgcn_plus_official"}:
-        return OfficialBackedProxy(spec, model_name)
+    if model_name == "graphgps_official":
+        return OfficialGraphGPSRelationModel(spec)
+    if model_name == "gatedgcn_plus_official":
+        return OfficialGNNPlusGatedGCNRelationModel(spec)
     raise ValueError(f"unknown model {model_name!r}")
 
 
@@ -874,7 +982,7 @@ def train_one(
         payload = torch.load(ckpt_dir / "best.pt", map_location=device)
         model.load_state_dict(payload["state_dict"])
     test = evaluate_model(model, splits["test"], device, eval_batch_size)
-    if isinstance(model, OfficialGRITRelationModel):
+    if isinstance(model, (OfficialGRITRelationModel, OfficialGraphGPSRelationModel, OfficialGNNPlusGatedGCNRelationModel)):
         rank, singular = -1, []
     else:
         maps = effective_relation_maps(model, loaded_spec, device)
@@ -1062,6 +1170,20 @@ def run_transport_support(args: argparse.Namespace) -> None:
         for mode in ("local", "global")
     ]
     train_grid(args, experiment="transport_support", specs=specs, models=models, seeds=parse_int_list(args.seeds))
+
+
+def run_transport_support_official(args: argparse.Namespace) -> None:
+    specs = [
+        base_spec_from_args(args, relation_types=int(args.relation_types), task_mode=mode, noise_nodes=0, noise_sigma=0.0, layers=1)
+        for mode in ("local", "global")
+    ]
+    train_grid(
+        args,
+        experiment="transport_support_official",
+        specs=specs,
+        models=("graphgps_official", "grit_official", "gatedgcn_plus_official"),
+        seeds=parse_int_list(args.seeds),
+    )
 
 
 def run_overglobalisation(args: argparse.Namespace) -> None:
@@ -1275,6 +1397,41 @@ def plot_transport_support(root: Path, task_mode: str) -> Path | None:
     return path
 
 
+def plot_transport_support_official(root: Path) -> Path | None:
+    rows = [row for row in metric_rows(root) if row["experiment"] == "transport_support_official"]
+    if not rows:
+        return None
+    plt = import_plotting()
+    models = ["graphgps_official", "grit_official", "gatedgcn_plus_official"]
+    agg_mse = aggregate(rows, ("task_mode", "model"), "test_rel_mse")
+    fig, axes = plt.subplots(1, 2, figsize=(9.6, 4.1), sharey=True)
+    for ax, mode in zip(axes, ("local", "global"), strict=True):
+        xs = np.arange(len(models))
+        ys = [agg_mse.get((mode, model), (np.nan, 0.0))[0] for model in models]
+        es = [agg_mse.get((mode, model), (np.nan, 0.0))[1] for model in models]
+        ax.bar(
+            xs,
+            ys,
+            yerr=es,
+            capsize=3,
+            color=[MODEL_COLORS[model] for model in models],
+            edgecolor="black",
+            linewidth=0.5,
+        )
+        ax.set_xticks(xs, [MODEL_LABELS[model] for model in models], rotation=25, ha="right")
+        ax.set_yscale("log")
+        ax.set_title("Local relation operator" if mode == "local" else "Long-range relation operator")
+        ax.grid(axis="y", color="#dddddd", linewidth=0.6)
+    axes[0].set_ylabel("relative MSE")
+    fig.suptitle("Official Practical Layers on the Relation Operator", y=1.03, fontsize=13)
+    fig.tight_layout()
+    path = ensure_dir(root / "figures") / "transport_support_official_practical_relation_operator.pdf"
+    fig.savefig(path, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[plot] wrote {path}")
+    return path
+
+
 def plot_overglobalisation(root: Path) -> Path | None:
     rows = [row for row in metric_rows(root) if row["experiment"] in {"overglobalisation", "overglobalisation_fixed"}]
     if not rows:
@@ -1405,6 +1562,7 @@ def plot_all(args: argparse.Namespace) -> None:
     plot_crossover(root)
     plot_transport_support(root, "local")
     plot_transport_support(root, "global")
+    plot_transport_support_official(root)
     plot_overglobalisation(root)
     plot_overglobalisation_grit(root)
     plot_depth_escape(root)
@@ -1447,6 +1605,7 @@ def print_hpc_commands(args: argparse.Namespace) -> None:
     for name, command, extra in [
         ("ch4-ctrl", "run-crossover", ""),
         ("ch4-ts", "run-transport-support", " --include-practical"),
+        ("ch4-ts-official", "run-transport-support-official", ""),
         ("ch4-noise", "run-overglobalisation", " --include-practical"),
         ("ch4-grit-noise", "run-overglobalisation-grit", " --seeds 1001 --noise-sweep 0,0.5,1,2"),
         ("ch4-depth", "run-depth-escape", ""),
@@ -1512,6 +1671,7 @@ def build_parser() -> argparse.ArgumentParser:
         ("evaluate", "Rebuild metrics tables from completed run summaries.", run_evaluate),
         ("run-crossover", "Run the local relation-rank crossover experiment.", run_crossover),
         ("run-transport-support", "Run local/global transport-support experiments.", run_transport_support),
+        ("run-transport-support-official", "Run official GraphGPS/GRIT/GNN+ transport-support experiments.", run_transport_support_official),
         ("run-overglobalisation", "Run irrelevant-content over-globalisation experiments.", run_overglobalisation),
         ("run-overglobalisation-grit", "Run official GRIT dense-vs-1-hop over-globalisation experiment.", run_overglobalisation_grit),
         ("run-depth-escape", "Run routing-only depth escape experiments.", run_depth_escape),
