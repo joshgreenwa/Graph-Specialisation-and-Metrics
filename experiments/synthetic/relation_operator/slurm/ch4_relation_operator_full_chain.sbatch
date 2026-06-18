@@ -44,8 +44,13 @@ COMMON_FLAGS=(
   --weight-decay "${CH4_WEIGHT_DECAY:-0.0001}"
   --num-workers "${CH4_NUM_WORKERS:-8}"
   --device "${CH4_DEVICE:-cuda}"
-  --use-amp
 )
+
+if [[ "${CH4_USE_AMP:-1}" == "1" || "${CH4_USE_AMP:-true}" == "true" ]]; then
+  COMMON_FLAGS+=(--use-amp)
+else
+  COMMON_FLAGS+=(--no-amp)
+fi
 
 PRACTICAL_FLAGS=()
 if [[ "${CH4_INCLUDE_PRACTICAL:-0}" == "1" || "${CH4_INCLUDE_PRACTICAL:-false}" == "true" ]]; then
