@@ -1639,7 +1639,6 @@ def plot_capacity_crossover(root: Path, target_nodes: int | None = None) -> Path
     axes[0].set_xlabel("number of relations R")
     axes[0].set_ylabel("relative MSE")
     axes[0].set_title("Error versus relation count")
-    axes[0].set_yscale("log")
     axes[0].grid(axis="y", color="#dddddd", linewidth=0.6)
     rank_values = np.full((len(completed_models), len(rs)), np.nan, dtype=float)
     rank_fraction = np.full_like(rank_values, np.nan)
