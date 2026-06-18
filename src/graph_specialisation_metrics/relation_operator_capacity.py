@@ -1363,6 +1363,58 @@ def plot_crossover(root: Path) -> Path | None:
     return path
 
 
+def plot_crossover_with_grit(root: Path) -> Path | None:
+    rows = [row for row in metric_rows(root) if row["experiment"] == "crossover"]
+    grit_rows = [row for row in metric_rows(root) if row["experiment"] == "grit_r_local_diagnostic"]
+    if not rows or not grit_rows:
+        return None
+    plt = import_plotting()
+    agg_mse = aggregate(rows, ("model", "relation_types"), "test_rel_mse")
+    agg_rank = aggregate(rows, ("model", "relation_types"), "realised_rank")
+    agg_grit = aggregate(grit_rows, ("model", "relation_types"), "test_rel_mse")
+    models = list(CONTROLLED_MODELS)
+    rs = sorted({int(row["relation_types"]) for row in rows})
+    grit_rs = sorted({int(row["relation_types"]) for row in grit_rows})
+    fig, axes = plt.subplots(1, 2, figsize=(10.6, 4.2))
+    for model in models:
+        ys = [agg_mse.get((model, str(r)), (np.nan, 0.0))[0] for r in rs]
+        es = [agg_mse.get((model, str(r)), (np.nan, 0.0))[1] for r in rs]
+        axes[0].errorbar(rs, ys, yerr=es, marker="o", linewidth=1.8, capsize=3, label=MODEL_LABELS[model], color=MODEL_COLORS[model])
+        axes[1].plot(rs, [agg_rank.get((model, str(r)), (np.nan, 0.0))[0] for r in rs], marker="o", linewidth=1.8, label=MODEL_LABELS[model], color=MODEL_COLORS[model])
+    grit_model = "grit_official"
+    axes[0].plot(
+        grit_rs,
+        [agg_grit.get((grit_model, str(r)), (np.nan, 0.0))[0] for r in grit_rs],
+        marker="D",
+        linewidth=2.3,
+        color=MODEL_COLORS[grit_model],
+        label="Official GRIT (1 seed)",
+    )
+    floor_by_r = {int(row["relation_types"]): row for row in rows}
+    axes[0].plot(rs, [float(floor_by_r[r]["routing_floor"]) for r in rs], "--", color="#333333", label="Eckart-Young routing floor")
+    axes[0].plot(rs, [float(floor_by_r[r]["full_transport_floor"]) for r in rs], ":", color="#333333", label="Eckart-Young transport floor")
+    axes[0].set_xlabel("number of relations R")
+    axes[0].set_ylabel("relative MSE")
+    axes[0].set_title("Official GRIT overlaid on controlled capacity curves")
+    axes[0].set_yscale("log")
+    axes[0].grid(axis="y", color="#dddddd", linewidth=0.6)
+    axes[1].axhline(4, linestyle="--", color="#555555", linewidth=0.9, label="H")
+    axes[1].axhline(16, linestyle=":", color="#555555", linewidth=0.9, label="H x k_tr")
+    axes[1].set_xlabel("number of relations R")
+    axes[1].set_ylabel("realised relation rank")
+    axes[1].set_title("Controlled realised rank")
+    axes[1].grid(axis="y", color="#dddddd", linewidth=0.6)
+    handles, labels = axes[0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="upper center", ncol=3, frameon=False, bbox_to_anchor=(0.5, 1.04))
+    fig.suptitle("Relation Rank Crossover Under Local Support", y=1.13, fontsize=13)
+    fig.tight_layout()
+    path = ensure_dir(root / "figures") / "relation_rank_crossover_local_with_official_grit.pdf"
+    fig.savefig(path, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[plot] wrote {path}")
+    return path
+
+
 def plot_transport_support(root: Path, task_mode: str) -> Path | None:
     rows = [row for row in metric_rows(root) if row["experiment"] == "transport_support" and row["task_mode"] == task_mode]
     if not rows:
@@ -1562,6 +1614,7 @@ def plot_all(args: argparse.Namespace) -> None:
     root = Path(args.output_root)
     write_summary_tables(root)
     plot_crossover(root)
+    plot_crossover_with_grit(root)
     plot_transport_support(root, "local")
     plot_transport_support(root, "global")
     plot_transport_support_official(root)
