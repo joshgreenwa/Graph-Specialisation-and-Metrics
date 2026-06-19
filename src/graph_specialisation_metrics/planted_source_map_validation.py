@@ -578,6 +578,29 @@ class LocalRoutingOnlyProfileModel(nn.Module):
         return self.output(mixed / math.sqrt(float(h)))
 
 
+class DenseRoutingOnlyProfileModel(nn.Module):
+    def __init__(self, n_nodes: int, *, feature_dim: int, heads: int) -> None:
+        super().__init__()
+        n = int(n_nodes)
+        d = int(feature_dim)
+        h = int(heads)
+        support = ~np.eye(n, dtype=bool)
+        self.register_buffer("support", torch.as_tensor(support, dtype=torch.bool))
+        self.logits = nn.Parameter(torch.zeros(h, n, n))
+        self.values = nn.Parameter(torch.randn(h, d, d) / math.sqrt(float(d)))
+        self.output = nn.Linear(d, d, bias=False)
+        with torch.no_grad():
+            self.output.weight.copy_(torch.eye(d))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = int(self.values.shape[0])
+        logits = self.logits.masked_fill(~self.support.unsqueeze(0), -1.0e9)
+        attn = torch.softmax(logits, dim=-1)
+        msg = torch.einsum("bjd,hdo->bhjo", x, self.values)
+        mixed = torch.einsum("hij,bhjo->bio", attn, msg)
+        return self.output(mixed / math.sqrt(float(h)))
+
+
 def resolve_torch_device(requested: str) -> torch.device:
     if requested != "auto":
         return torch.device(requested)
@@ -783,17 +806,34 @@ def plot_distance_profile(
     profiles: Mapping[str, tuple[np.ndarray, np.ndarray]],
     metrics: Sequence[Mapping[str, Any]],
     config: DistanceProfileConfig,
+    *,
+    filename: str = "gpi_distance_profile_trained_models.pdf",
+    title: str = "GPI Source Maps Reveal Learned Long-Range Dependence",
 ) -> Path:
     plt = import_plotting()
     fig, ax = plt.subplots(1, 1, figsize=(6.6, 4.05))
     styles = {
-        "Oracle": ("#111111", "-", 2.4),
-        "Full relation transport": ("#c2473f", "-", 2.2),
-        "Local routing-only": ("#4f78b5", "--", 2.2),
+        "Full relation transport": {"color": "#c2473f", "linestyle": "-", "marker": "o", "linewidth": 2.2},
+        "Dense routing-only": {"color": "#d28b2a", "linestyle": "-", "marker": "s", "linewidth": 2.0},
+        "Reach-limited routing-only": {"color": "#4f78b5", "linestyle": "--", "marker": "^", "linewidth": 2.0},
+        "Oracle": {"color": "#111111", "linestyle": ":", "marker": "o", "linewidth": 2.2},
     }
-    for label, (xs, ys) in profiles.items():
-        color, linestyle, linewidth = styles[label]
-        ax.plot(xs, ys, marker="o", color=color, linestyle=linestyle, linewidth=linewidth, label=label)
+    for label in ["Full relation transport", "Dense routing-only", "Reach-limited routing-only", "Oracle"]:
+        if label not in profiles:
+            continue
+        xs, ys = profiles[label]
+        style = styles[label]
+        kwargs = dict(
+            color=style["color"],
+            linestyle=style["linestyle"],
+            marker=style["marker"],
+            linewidth=style["linewidth"],
+            label=label,
+            markersize=4.8,
+        )
+        if label == "Oracle":
+            kwargs.update(markerfacecolor="white", markeredgewidth=1.2, zorder=10)
+        ax.plot(xs, ys, **kwargs)
     ax.axvline(int(config.far_offset), color="#777777", linestyle=":", linewidth=1.2)
     ax.text(
         int(config.far_offset) + 0.12,
@@ -806,11 +846,11 @@ def plot_distance_profile(
         color="#555555",
     )
     ax.set_xlabel("hop distance from receiver")
-    ax.set_ylabel("source-map mass (baseline-corrected)")
+    ax.set_ylabel("share of baseline-corrected source-map mass")
     ax.set_ylim(bottom=0.0)
     ax.grid(axis="y", color="#dddddd", linewidth=0.6)
     ax.legend(frameon=False, loc="upper right")
-    ax.set_title("GPI Source Maps Reveal Learned Long-Range Dependence")
+    ax.set_title(title)
     text = ""
     if metrics:
         validation = metrics[0]
@@ -821,7 +861,7 @@ def plot_distance_profile(
         )
         ax.text(0.02, 0.02, text, transform=ax.transAxes, ha="left", va="bottom", fontsize=8, color="#333333")
     fig.tight_layout()
-    path = ensure_dir(root / "figures") / "gpi_distance_profile_trained_models.pdf"
+    path = ensure_dir(root / "figures") / filename
     fig.savefig(path, bbox_inches="tight")
     plt.close(fig)
     print(f"[plot] wrote {path}")
@@ -836,6 +876,11 @@ def run_distance_profile(config: DistanceProfileConfig) -> None:
     val_x, val_y = make_torch_dataset(teacher, size=int(config.val_size), seed=int(config.seed) + 2, device=device)
     test_x, test_y = make_torch_dataset(teacher, size=int(config.test_size), seed=int(config.seed) + 3, device=device)
     full = FullTransportProfileModel(int(config.n_nodes), int(config.feature_dim)).to(device)
+    dense = DenseRoutingOnlyProfileModel(
+        int(config.n_nodes),
+        feature_dim=int(config.feature_dim),
+        heads=int(config.heads),
+    ).to(device)
     local = LocalRoutingOnlyProfileModel(
         teacher.distances,
         feature_dim=int(config.feature_dim),
@@ -853,6 +898,16 @@ def run_distance_profile(config: DistanceProfileConfig) -> None:
         device=device,
         checkpoint_path=ckpt_root / "full_relation_transport.pt",
     )
+    dense_summary = train_profile_model(
+        model=dense,
+        train_x=train_x,
+        train_y=train_y,
+        val_x=val_x,
+        val_y=val_y,
+        config=config,
+        device=device,
+        checkpoint_path=ckpt_root / "dense_routing_only.pt",
+    )
     local_summary = train_profile_model(
         model=local,
         train_x=train_x,
@@ -864,8 +919,10 @@ def run_distance_profile(config: DistanceProfileConfig) -> None:
         checkpoint_path=ckpt_root / "local_routing_only.pt",
     )
     full_test = rel_mse_torch(full, test_x, test_y, int(config.batch_size))
+    dense_test = rel_mse_torch(dense, test_x, test_y, int(config.batch_size))
     local_test = rel_mse_torch(local, test_x, test_y, int(config.batch_size))
     print(f"[profile] full_transport test_rel_mse={full_test:.5g}")
+    print(f"[profile] dense_routing_only test_rel_mse={dense_test:.5g}")
     print(f"[profile] local_routing_only test_rel_mse={local_test:.5g}")
 
     oracle_predict = lambda x: evaluate_teacher(
@@ -891,6 +948,14 @@ def run_distance_profile(config: DistanceProfileConfig) -> None:
         partners_per_source=int(config.source_map_partners),
         seed=int(config.seed) + 7001,
     )
+    dense_map = compute_swap_source_map_from_predictor(
+        n_nodes=int(config.n_nodes),
+        feature_dim=int(config.feature_dim),
+        predictor=torch_model_predictor(dense, device, int(config.batch_size)),
+        backgrounds=int(config.source_map_backgrounds),
+        partners_per_source=int(config.source_map_partners),
+        seed=int(config.seed) + 7001,
+    )
     local_map = compute_swap_source_map_from_predictor(
         n_nodes=int(config.n_nodes),
         feature_dim=int(config.feature_dim),
@@ -900,13 +965,15 @@ def run_distance_profile(config: DistanceProfileConfig) -> None:
         seed=int(config.seed) + 7001,
     )
     profiles = {
-        "Oracle": distance_mass_profile(oracle_map, teacher.distances),
         "Full relation transport": distance_mass_profile(full_map, teacher.distances),
-        "Local routing-only": distance_mass_profile(local_map, teacher.distances),
+        "Dense routing-only": distance_mass_profile(dense_map, teacher.distances),
+        "Reach-limited routing-only": distance_mass_profile(local_map, teacher.distances),
+        "Oracle": distance_mass_profile(oracle_map, teacher.distances),
     }
     metric_rows = []
     for model, summary, test, source_map in [
         ("full_relation_transport", full_summary, full_test, full_map),
+        ("dense_routing_only", dense_summary, dense_test, dense_map),
         ("local_routing_only", local_summary, local_test, local_map),
     ]:
         row = summarise_source_map(
@@ -935,15 +1002,43 @@ def run_distance_profile(config: DistanceProfileConfig) -> None:
         )
     ]
     write_csv(root / "metrics" / "gpi_distance_profile_metrics.csv", [*oracle_metrics, *metric_rows])
+    profile_rows = []
+    for label, (xs, ys) in profiles.items():
+        model = label.lower().replace(" ", "_").replace("-", "_")
+        for distance, mass_share in zip(xs, ys, strict=True):
+            profile_rows.append({"model": model, "distance": int(distance), "mass_share": float(mass_share)})
+    write_csv(root / "metrics" / "gpi_distance_profile_by_distance.csv", profile_rows)
     np.savez_compressed(
         ensure_dir(root / "arrays") / "gpi_distance_profile_arrays.npz",
         distances=teacher.distances,
         functional_mask=teacher.functional_mask,
         oracle_source_map=oracle_map,
         full_transport_source_map=full_map,
+        dense_routing_source_map=dense_map,
         local_routing_source_map=local_map,
     )
-    plot_distance_profile(root, teacher, profiles, oracle_metrics, config)
+    headline_profiles = {
+        key: profiles[key]
+        for key in ["Full relation transport", "Reach-limited routing-only", "Oracle"]
+    }
+    plot_distance_profile(
+        root,
+        teacher,
+        headline_profiles,
+        oracle_metrics,
+        config,
+        filename="gpi_distance_profile_trained_models.pdf",
+        title="GPI Source Maps Reveal Learned Long-Range Dependence",
+    )
+    plot_distance_profile(
+        root,
+        teacher,
+        profiles,
+        oracle_metrics,
+        config,
+        filename="gpi_distance_profile_dense_routing_control.pdf",
+        title="GPI Source Maps Separate Reach From Correct Transport",
+    )
 
 
 def run_validation(config: ValidationConfig) -> tuple[list[dict[str, Any]], dict[str, np.ndarray]]:
