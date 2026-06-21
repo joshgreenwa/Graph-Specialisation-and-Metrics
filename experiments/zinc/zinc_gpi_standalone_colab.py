@@ -7798,17 +7798,15 @@ def gpi_distances(batch, n: int) -> np.ndarray:
         np.fill_diagonal(dist, 0.0)
         return dist
     if isinstance(batch, CSABatchAdapter):
-        spd = batch.b.spd[0, :n, :n].detach().cpu().numpy().astype(float)
-        spd[spd < 0] = np.inf
-        np.fill_diagonal(spd, 0.0)
-        return spd
+        return distances_from_edge_index(batch.b.edge_index, n)
     if isinstance(batch, V19BatchAdapter):
-        spd = batch.b.spd[0, :n, :n].detach().cpu().numpy().astype(float)
-        spd[spd < 0] = np.inf
-        np.fill_diagonal(spd, 0.0)
-        return spd
+        return distances_from_edge_index(batch.b.edge_index, n)
+    return distances_from_edge_index(batch.edge_index, n)
+
+
+def distances_from_edge_index(edge_index: torch.Tensor, n: int) -> np.ndarray:
     import networkx as _nx
-    edge_index = batch.edge_index.detach().cpu()
+    edge_index = edge_index.detach().cpu()
     g = _nx.Graph()
     g.add_nodes_from(range(n))
     for u, v in edge_index.t().tolist():
@@ -7819,6 +7817,11 @@ def gpi_distances(batch, n: int) -> np.ndarray:
         for target, d in lengths.items():
             dist[int(source), int(target)] = float(d)
     return dist
+
+
+def repeat_edge_attr_for_swaps(edge_attr: torch.Tensor, edge_count: int, repeats: int) -> torch.Tensor:
+    base = edge_attr[:edge_count]
+    return base.repeat((int(repeats),) + (1,) * (base.dim() - 1))
 
 
 def gpi_graph_edges(batch, n: int) -> List[Tuple[int, int]]:
@@ -7889,7 +7892,7 @@ def make_swapped_batch(batch, records: Sequence[Tuple[int, int, float]]):
             x[offset + partner] = tmp
         offsets = (torch.arange(q, dtype=b.edge_index.dtype).view(q, 1, 1) * n)
         edge_index = (b.edge_index[:, :edge_count].unsqueeze(0) + offsets).permute(1, 0, 2).reshape(2, q * edge_count)
-        edge_attr = b.edge_attr[:edge_count].repeat(q)
+        edge_attr = repeat_edge_attr_for_swaps(b.edge_attr, edge_count, q)
         rwse = b.rwse[:n].repeat(q, 1)
         degree = b.degree[:n].repeat(q)
         batch_index = torch.arange(q).repeat_interleave(n)
@@ -7923,7 +7926,7 @@ def make_swapped_batch(batch, records: Sequence[Tuple[int, int, float]]):
             x[offset + partner] = tmp
         offsets = (torch.arange(q, dtype=b.edge_index.dtype).view(q, 1, 1) * n)
         edge_index = (b.edge_index[:, :edge_count].unsqueeze(0) + offsets).permute(1, 0, 2).reshape(2, q * edge_count)
-        edge_attr = b.edge_attr[:edge_count].repeat(q)
+        edge_attr = repeat_edge_attr_for_swaps(b.edge_attr, edge_count, q)
         rwse = b.rwse[:n].repeat(q, 1)
         degree = b.degree[:n].repeat(q)
         degree_log = b.degree_log[:n].repeat(q)
