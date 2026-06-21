@@ -8080,6 +8080,14 @@ def attention_faithfulness_rows(records: Sequence[Dict[str, Any]]) -> pd.DataFra
     return pd.DataFrame(rows)
 
 
+def import_plotting():
+    import matplotlib
+    if not os.environ.get("DISPLAY"):
+        matplotlib.use("Agg", force=True)
+    import matplotlib.pyplot as plt
+    return plt
+
+
 def plot_distance_profile(summary: pd.DataFrame, out_dir: Path) -> None:
     plt = import_plotting()
     df = summary[summary["matrix"] == "source_share"].copy()
