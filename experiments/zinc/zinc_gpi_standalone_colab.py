@@ -619,6 +619,44 @@ def safe_torch_load(path, map_location=None):
         return torch.load(path, map_location=map_location)
 
 
+def _is_pyg_zinc_processed_file(path: Any) -> bool:
+    text = str(path)
+    return (
+        text.endswith("/processed/train.pt")
+        or text.endswith("/processed/val.pt")
+        or text.endswith("/processed/test.pt")
+        or text.endswith("\\processed\\train.pt")
+        or text.endswith("\\processed\\val.pt")
+        or text.endswith("\\processed\\test.pt")
+    )
+
+
+def load_pyg_zinc_dataset(root: str | Path, split: str):
+    """Load PyG ZINC across old/new processed-cache tuple formats.
+
+    Some Drive caches were written by newer PyG versions as
+    ``(data, slices, data_cls)`` while older GraphGPS-era PyG code unpacks only
+    ``(data, slices)`` inside ``torch_geometric.datasets.ZINC.__init__``. The
+    model checkpoints were trained with the older GraphGym stack, so keep that
+    stack but make processed-cache reads backwards compatible.
+    """
+    from torch_geometric.datasets import ZINC
+
+    original_load = torch.load
+
+    def compat_load(path, *args, **kwargs):
+        out = original_load(path, *args, **kwargs)
+        if _is_pyg_zinc_processed_file(path) and isinstance(out, tuple) and len(out) >= 3:
+            return out[0], out[1]
+        return out
+
+    torch.load = compat_load  # type: ignore[assignment]
+    try:
+        return ZINC(root=str(root), subset=True, split=str(split))
+    finally:
+        torch.load = original_load  # type: ignore[assignment]
+
+
 def in_colab() -> bool:
     try:
         import google.colab  # type: ignore  # noqa: F401
@@ -1309,8 +1347,7 @@ def _graphormer_load_or_build_split(split: str, data_root: Path,
     print(f"[graphormer:data] Cache miss; building {split} from PyG ZINC")
     safe_mkdir(cache_dir)
     safe_mkdir(data_root)
-    from torch_geometric.datasets import ZINC
-    ds = ZINC(root=str(data_root), subset=True, split=split)
+    ds = load_pyg_zinc_dataset(data_root, split)
     records = [_graphormer_preprocess_one(d, multi_hop_max_dist=cfg.multi_hop_max_dist)
                for d in ds]
     torch.save(records, cache_file)
@@ -1745,10 +1782,9 @@ def _csa_load_or_build_splits(cache_path: Path, data_dir: Path):
     safe_mkdir(cache_path.parent)
     root = data_dir / "ZINC"
     safe_mkdir(root)
-    from torch_geometric.datasets import ZINC
-    train = ZINC(root=str(root), subset=True, split="train")
-    val = ZINC(root=str(root), subset=True, split="val")
-    test = ZINC(root=str(root), subset=True, split="test")
+    train = load_pyg_zinc_dataset(root, "train")
+    val = load_pyg_zinc_dataset(root, "val")
+    test = load_pyg_zinc_dataset(root, "test")
     splits = {
         "train": [_csa_compute_pair_features(d) for d in train],
         "val":   [_csa_compute_pair_features(d) for d in val],
@@ -2106,11 +2142,10 @@ def _v19_load_or_build_splits(cache_path: Path, data_dir: Path):
     print(f"[v19:data] Cache miss; building ZINC pair features at {cache_path}")
     safe_mkdir(cache_path.parent)
     safe_mkdir(data_dir)
-    from torch_geometric.datasets import ZINC
     raw = {
-        "train": ZINC(root=str(data_dir), subset=True, split="train"),
-        "val": ZINC(root=str(data_dir), subset=True, split="val"),
-        "test": ZINC(root=str(data_dir), subset=True, split="test"),
+        "train": load_pyg_zinc_dataset(data_dir, "train"),
+        "val": load_pyg_zinc_dataset(data_dir, "val"),
+        "test": load_pyg_zinc_dataset(data_dir, "test"),
     }
     splits = {}
     t0 = time.time()
