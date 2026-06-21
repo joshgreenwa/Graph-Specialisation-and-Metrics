@@ -646,11 +646,18 @@ def load_pyg_zinc_dataset(root: str | Path, split: str):
 
     def compat_load(path, *args, **kwargs):
         out = original_load(path, *args, **kwargs)
-        if _is_pyg_zinc_processed_file(path) and isinstance(out, tuple) and len(out) >= 3:
-            data, slices, data_cls = out[:3]
-            if isinstance(data, dict) and hasattr(data_cls, "from_dict"):
-                data = data_cls.from_dict(data)
-            return data, slices
+        if _is_pyg_zinc_processed_file(path) and isinstance(out, tuple):
+            if len(out) >= 3:
+                data, slices, data_cls = out[:3]
+                if isinstance(data, dict) and hasattr(data_cls, "from_dict"):
+                    data = data_cls.from_dict(data)
+                return data, slices
+            if len(out) == 2 and isinstance(out[0], dict):
+                try:
+                    from torch_geometric.data import Data
+                    return Data.from_dict(out[0]), out[1]
+                except Exception:
+                    return out
         return out
 
     torch.load = compat_load  # type: ignore[assignment]
