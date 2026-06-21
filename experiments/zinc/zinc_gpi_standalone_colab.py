@@ -688,8 +688,12 @@ def ensure_runtime_dependencies(cfg: RunConfig) -> None:
              "pip", "setuptools", "wheel"])
     wheel_url = _torch_pyg_wheel_url()
     print(f"[deps] PyG wheel index: {wheel_url}")
+    # Modern PyG wheel indexes do not always ship torch-spline-conv
+    # (e.g. torch 2.11 + CUDA 12.8), and this ZINC inference pipeline does not
+    # use spline convolutions. Keep the install to the extensions required by
+    # GraphGym/GRIT/GraphGPS.
     _pip_install(["pyg-lib", "torch-scatter", "torch-sparse", "torch-cluster",
-                  "torch-spline-conv", "-f", wheel_url])
+                  "-f", wheel_url])
     _pip_install([f"torch-geometric=={cfg.pyg_version}"])
     _pip_install(["yacs==0.1.8", "pytorch-lightning==1.9.5",
                   "torchmetrics==0.11.4", "performer-pytorch==1.1.4",
