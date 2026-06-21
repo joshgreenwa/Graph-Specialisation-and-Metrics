@@ -647,7 +647,10 @@ def load_pyg_zinc_dataset(root: str | Path, split: str):
     def compat_load(path, *args, **kwargs):
         out = original_load(path, *args, **kwargs)
         if _is_pyg_zinc_processed_file(path) and isinstance(out, tuple) and len(out) >= 3:
-            return out[0], out[1]
+            data, slices, data_cls = out[:3]
+            if isinstance(data, dict) and hasattr(data_cls, "from_dict"):
+                data = data_cls.from_dict(data)
+            return data, slices
         return out
 
     torch.load = compat_load  # type: ignore[assignment]
@@ -7866,11 +7869,76 @@ def make_swapped_batch(batch, records: Sequence[Tuple[int, int, float]]):
             x[row, source] = x[row, partner]
             x[row, partner] = tmp
         return GraphormerBatchAdapter(new_d)
-    if isinstance(batch, (CSABatchAdapter, V19BatchAdapter)):
-        raise NotImplementedError(
-            "CSA/v19 GPI batching is not implemented in this first Colab analysis. "
-            "Use --models graphormer,grit,graphgps or add a dense-adapter repeat path."
-        )
+    if isinstance(batch, CSABatchAdapter):
+        q = len(records)
+        b = batch.b
+        n = int(batch.counts[0].item())
+        edge_count = int(b.edge_index.size(1))
+        x = b.x[:n].repeat(q).clone()
+        for row, (source, partner, _norm) in enumerate(records):
+            offset = row * n
+            tmp = x[offset + source].clone()
+            x[offset + source] = x[offset + partner]
+            x[offset + partner] = tmp
+        offsets = (torch.arange(q, dtype=b.edge_index.dtype).view(q, 1, 1) * n)
+        edge_index = (b.edge_index[:, :edge_count].unsqueeze(0) + offsets).permute(1, 0, 2).reshape(2, q * edge_count)
+        edge_attr = b.edge_attr[:edge_count].repeat(q)
+        rwse = b.rwse[:n].repeat(q, 1)
+        degree = b.degree[:n].repeat(q)
+        batch_index = torch.arange(q).repeat_interleave(n)
+        node_pos = torch.arange(n).repeat(q)
+        fields = {
+            "x": x,
+            "edge_index": edge_index,
+            "edge_attr": edge_attr,
+            "y": b.y[:1].repeat(q),
+            "rwse": rwse,
+            "pair_xi": b.pair_xi[:1, :n, :n].repeat(q, 1, 1, 1),
+            "degree": degree,
+            "batch_index": batch_index,
+            "node_pos": node_pos,
+            "node_mask": b.node_mask[:1, :n].repeat(q, 1),
+            "pair_mask": b.pair_mask[:1, :n, :n].repeat(q, 1, 1),
+            "num_graphs": q,
+            "max_nodes": n,
+        }
+        return CSABatchAdapter(StaticAnchorBatch(**fields))
+    if isinstance(batch, V19BatchAdapter):
+        q = len(records)
+        b = batch.b
+        n = int(batch.counts[0].item())
+        edge_count = int(b.edge_index.size(1))
+        x = b.x[:n].repeat(q).clone()
+        for row, (source, partner, _norm) in enumerate(records):
+            offset = row * n
+            tmp = x[offset + source].clone()
+            x[offset + source] = x[offset + partner]
+            x[offset + partner] = tmp
+        offsets = (torch.arange(q, dtype=b.edge_index.dtype).view(q, 1, 1) * n)
+        edge_index = (b.edge_index[:, :edge_count].unsqueeze(0) + offsets).permute(1, 0, 2).reshape(2, q * edge_count)
+        edge_attr = b.edge_attr[:edge_count].repeat(q)
+        rwse = b.rwse[:n].repeat(q, 1)
+        degree = b.degree[:n].repeat(q)
+        degree_log = b.degree_log[:n].repeat(q)
+        batch_index = torch.arange(q).repeat_interleave(n)
+        node_pos = torch.arange(n).repeat(q)
+        fields = {
+            "x": x,
+            "edge_index": edge_index,
+            "edge_attr": edge_attr,
+            "y": b.y[:1].repeat(q),
+            "rwse": rwse,
+            "pair_xi": b.pair_xi[:1, :n, :n].repeat(q, 1, 1, 1),
+            "degree": degree,
+            "degree_log": degree_log,
+            "batch_index": batch_index,
+            "node_pos": node_pos,
+            "node_mask": b.node_mask[:1, :n].repeat(q, 1),
+            "pair_mask": b.pair_mask[:1, :n, :n].repeat(q, 1, 1),
+            "num_graphs": q,
+            "max_nodes": n,
+        }
+        return V19BatchAdapter(V19VariantABatch(**fields))
     from torch_geometric.data import Batch as PyGBatch
     data = batch.to_data_list()[0]
     variants = []
