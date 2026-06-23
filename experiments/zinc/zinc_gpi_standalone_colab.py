@@ -995,10 +995,18 @@ def configure_graphgym(spec: ModelSpec, run_cfg: RunConfig, device: torch.device
             "accelerator", device_str,
             "out_dir", out_dir,
             "name_tag", spec.name_tag]
+    if spec.family == "graphgps":
+        # GraphGPS ZINC is GPS+RWSE. In a single Colab process, GraphGym's
+        # global cfg/registry can retain GRIT's RRWP defaults after another
+        # model import. GraphGPS' posenc_stats.py does not support RRWP, so
+        # explicitly keep the practical model on the trained RWSE-only config.
+        opts.extend(["posenc_RRWP.enable", "False", "posenc_RWSE.enable", "True"])
     args_ns = SimpleNamespace(cfg_file=str(cfg_path), opts=opts)
     if spec.family == "grit":
         cfg.work_dir = str(repo_dir)
     load_cfg(cfg, args_ns)
+    if spec.family == "graphgps":
+        _disable_graphgps_rrwp_cfg(cfg)
     cfg.accelerator = device_str
     cfg.seed = run_cfg.seed
     cfg.run_id = 0
@@ -1013,6 +1021,22 @@ def configure_graphgym(spec: ModelSpec, run_cfg: RunConfig, device: torch.device
     model = model.to(device)
     model.eval()
     return cfg, loaders, model
+
+
+def _disable_graphgps_rrwp_cfg(cfg_obj: Any) -> None:
+    for name in ("posenc_RRWP", "posenc_RRWPLinear", "rrwp"):
+        node = getattr(cfg_obj, name, None)
+        if node is not None and hasattr(node, "enable"):
+            try:
+                node.enable = False
+            except Exception:
+                pass
+    node = getattr(cfg_obj, "posenc_RWSE", None)
+    if node is not None and hasattr(node, "enable"):
+        try:
+            node.enable = True
+        except Exception:
+            pass
 
 
 def split_loader(loaders, split: str):
