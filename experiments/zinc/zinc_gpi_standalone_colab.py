@@ -8202,7 +8202,7 @@ class GraphOutputPatcher:
         context = state.context or {}
         family = context.get("family") if isinstance(context, Mapping) else None
         if family == "graphormer":
-            node_mask = state.node_mask.to(device=h_dense.device, dtype=torch.bool)
+            node_mask = _align_node_mask_to_dense(state.node_mask, h_dense)
             node_h = h_dense * node_mask.unsqueeze(-1).to(h_dense.dtype)
             if context.get("pooling") == "sum":
                 graph_repr = node_h.sum(dim=1)
@@ -8221,10 +8221,12 @@ class GraphOutputPatcher:
         return get_model_pred(self.graphgym_head(batch)).to(h_dense.device)
 
     def _readout_csa_from_dense(self, h_dense: torch.Tensor, node_mask: torch.Tensor) -> torch.Tensor:
+        node_mask = _align_node_mask_to_dense(node_mask, h_dense)
         pooled = (h_dense * node_mask.unsqueeze(-1).to(h_dense.dtype)).sum(dim=1)
         return self.model.readout(pooled).view(-1)
 
     def _readout_v19_from_dense(self, h_dense: torch.Tensor, node_mask: torch.Tensor) -> torch.Tensor:
+        node_mask = _align_node_mask_to_dense(node_mask, h_dense)
         pooled = (h_dense * node_mask.unsqueeze(-1).to(h_dense.dtype)).sum(dim=1)
         return self.model.readout(pooled).view(-1)
 
@@ -8239,6 +8241,27 @@ def _build_p1_p2_dense_states(clean_h: torch.Tensor, swap_h: torch.Tensor) -> Tu
     clean_base[rows, node_idx, :] = swap_h[swap_rows, node_idx, :]
     swap_base[rows, node_idx, :] = clean_h[0, node_idx, :].expand(Q * N, D)
     return clean_base, swap_base
+
+
+def _align_node_mask_to_dense(node_mask: torch.Tensor, h_dense: torch.Tensor) -> torch.Tensor:
+    """Match a [B,N] node mask to an expanded patched-state tensor.
+
+    P1/P2 readout patching expands each graph state into one row per patched
+    receiver. For clean background P1, the mask may be [1,N]; for corrupted
+    background P2, it may be [Q,N] while h_dense is [Q*N,N,D]. This helper
+    preserves the original graph masks without assuming all molecules have the
+    same number of valid atoms.
+    """
+    mask = node_mask.to(device=h_dense.device, dtype=torch.bool)
+    if mask.size(0) == h_dense.size(0):
+        return mask
+    if mask.size(0) == 1:
+        return mask.expand(h_dense.size(0), -1)
+    if h_dense.size(0) % mask.size(0) == 0:
+        return mask.repeat_interleave(h_dense.size(0) // mask.size(0), dim=0)
+    raise RuntimeError(
+        f"Cannot align node mask {tuple(mask.shape)} to dense states {tuple(h_dense.shape)}"
+    )
 
 
 def _build_single_node_p1_states(clean_h: torch.Tensor, variant_h: torch.Tensor,
