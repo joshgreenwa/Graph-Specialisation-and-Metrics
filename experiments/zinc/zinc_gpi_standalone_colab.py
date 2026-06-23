@@ -995,12 +995,6 @@ def configure_graphgym(spec: ModelSpec, run_cfg: RunConfig, device: torch.device
             "accelerator", device_str,
             "out_dir", out_dir,
             "name_tag", spec.name_tag]
-    if spec.family == "graphgps":
-        # GraphGPS ZINC is GPS+RWSE. In a single Colab process, GraphGym's
-        # global cfg/registry can retain GRIT's RRWP defaults after another
-        # model import. GraphGPS' posenc_stats.py does not support RRWP, so
-        # explicitly keep the practical model on the trained RWSE-only config.
-        opts.extend(["posenc_RRWP.enable", "False", "posenc_RWSE.enable", "True"])
     args_ns = SimpleNamespace(cfg_file=str(cfg_path), opts=opts)
     if spec.family == "grit":
         cfg.work_dir = str(repo_dir)
@@ -1024,6 +1018,10 @@ def configure_graphgym(spec: ModelSpec, run_cfg: RunConfig, device: torch.device
 
 
 def _disable_graphgps_rrwp_cfg(cfg_obj: Any) -> None:
+    try:
+        cfg_obj.defrost()
+    except Exception:
+        pass
     for name in ("posenc_RRWP", "posenc_RRWPLinear", "rrwp"):
         node = getattr(cfg_obj, name, None)
         if node is not None and hasattr(node, "enable"):
@@ -1037,6 +1035,40 @@ def _disable_graphgps_rrwp_cfg(cfg_obj: Any) -> None:
             node.enable = True
         except Exception:
             pass
+    _remove_rrwp_from_cfg_tree(cfg_obj)
+
+
+def _remove_rrwp_from_cfg_tree(node: Any, path: str = "") -> None:
+    if not hasattr(node, "items"):
+        return
+    try:
+        items = list(node.items())
+    except Exception:
+        return
+    for key, value in items:
+        key_s = str(key)
+        child_path = f"{path}.{key_s}" if path else key_s
+        if hasattr(value, "items"):
+            if "RRWP" in key_s.upper() and hasattr(value, "enable"):
+                try:
+                    value.enable = False
+                except Exception:
+                    pass
+            _remove_rrwp_from_cfg_tree(value, child_path)
+            continue
+        if isinstance(value, (list, tuple)) and any(str(v) == "RRWP" for v in value):
+            filtered = [v for v in value if str(v) != "RRWP"]
+            try:
+                node[key] = filtered if isinstance(value, list) else tuple(filtered)
+                print(f"[graphgps] removed RRWP from cfg.{child_path}: {value} -> {filtered}")
+            except Exception:
+                pass
+        elif isinstance(value, str) and value == "RRWP":
+            try:
+                node[key] = "RWSE"
+                print(f"[graphgps] replaced cfg.{child_path}=RRWP with RWSE")
+            except Exception:
+                pass
 
 
 def split_loader(loaders, split: str):
