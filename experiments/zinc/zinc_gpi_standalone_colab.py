@@ -7614,6 +7614,11 @@ class ZincGPIConfig:
     far_floor_hops: int = 4
     bootstrap_samples: int = 500
     focal_examples: int = 4
+    run_relationship_interactions: bool = False
+    relationship_max_molecules: int = 100
+    relationship_pairs_per_graph: int = 16
+    relationship_min_hops: int = 3
+    relationship_min_source_separation: int = 2
     force_recompute: bool = False
     auto_mount_drive: bool = True
     auto_clone_repos: bool = True
@@ -7641,6 +7646,17 @@ def parse_gpi_args() -> ZincGPIConfig:
     p.add_argument("--far-floor-hops", type=int, default=ZincGPIConfig.far_floor_hops)
     p.add_argument("--bootstrap-samples", type=int, default=ZincGPIConfig.bootstrap_samples)
     p.add_argument("--focal-examples", type=int, default=ZincGPIConfig.focal_examples)
+    p.add_argument("--run-relationship-interactions", action="store_true",
+                   default=ZincGPIConfig.run_relationship_interactions,
+                   help="Run disjoint A/B/AB swap non-additivity analysis for distant source pairs.")
+    p.add_argument("--relationship-max-molecules", type=int,
+                   default=ZincGPIConfig.relationship_max_molecules)
+    p.add_argument("--relationship-pairs-per-graph", type=int,
+                   default=ZincGPIConfig.relationship_pairs_per_graph)
+    p.add_argument("--relationship-min-hops", type=int,
+                   default=ZincGPIConfig.relationship_min_hops)
+    p.add_argument("--relationship-min-source-separation", type=int,
+                   default=ZincGPIConfig.relationship_min_source_separation)
     p.add_argument("--force-recompute", action="store_true")
     p.add_argument("--no-auto-mount-drive", dest="auto_mount_drive", action="store_false")
     p.add_argument("--auto-clone-repos", action="store_true", default=True)
@@ -7686,6 +7702,11 @@ def parse_gpi_args() -> ZincGPIConfig:
         far_floor_hops=args.far_floor_hops,
         bootstrap_samples=args.bootstrap_samples,
         focal_examples=args.focal_examples,
+        run_relationship_interactions=args.run_relationship_interactions,
+        relationship_max_molecules=args.relationship_max_molecules,
+        relationship_pairs_per_graph=args.relationship_pairs_per_graph,
+        relationship_min_hops=args.relationship_min_hops,
+        relationship_min_source_separation=args.relationship_min_source_separation,
         force_recompute=args.force_recompute,
         auto_mount_drive=args.auto_mount_drive,
         auto_clone_repos=args.auto_clone_repos,
@@ -8220,6 +8241,194 @@ def _build_p1_p2_dense_states(clean_h: torch.Tensor, swap_h: torch.Tensor) -> Tu
     return clean_base, swap_base
 
 
+def _build_single_node_p1_states(clean_h: torch.Tensor, variant_h: torch.Tensor,
+                                 focal: int) -> torch.Tensor:
+    Q, N, D = variant_h.shape
+    out = clean_h[:1].expand(Q, N, D).clone()
+    out[:, int(focal), :] = variant_h[:, int(focal), :]
+    return out
+
+
+def _highest_degree_focal(batch, n: int) -> int:
+    edges = gpi_graph_edges(batch, n)
+    degree = np.zeros(n, dtype=int)
+    for u, v in edges:
+        if 0 <= int(u) < n:
+            degree[int(u)] += 1
+        if 0 <= int(v) < n:
+            degree[int(v)] += 1
+    return int(np.argmax(degree)) if degree.size else 0
+
+
+def sample_relationship_swap_records(
+    x: torch.Tensor,
+    dist: np.ndarray,
+    focal: int,
+    pairs_per_graph: int,
+    min_hops: int,
+    min_source_separation: int,
+    rng: np.random.Generator,
+) -> List[Dict[str, Any]]:
+    n = int(x.shape[0])
+    nodes = np.arange(n)
+    far = [
+        int(i) for i in nodes
+        if int(i) != int(focal)
+        and np.isfinite(dist[int(focal), int(i)])
+        and dist[int(focal), int(i)] >= float(min_hops)
+    ]
+    if len(far) < 2:
+        return []
+
+    def _partner(source: int, blocked: set[int]) -> Optional[Tuple[int, float]]:
+        candidates = [
+            int(p) for p in nodes
+            if int(p) not in blocked
+            and int(p) != int(source)
+            and float(torch.norm(x[int(source)] - x[int(p)]).item()) > 1.0e-12
+        ]
+        if not candidates:
+            return None
+        p = int(rng.choice(candidates))
+        norm = float(torch.norm(x[int(source)] - x[p]).item())
+        return p, max(norm, 1.0e-12)
+
+    out: List[Dict[str, Any]] = []
+    attempts = max(200, int(pairs_per_graph) * 100)
+    seen: set[Tuple[int, int, int, int]] = set()
+    for _ in range(attempts):
+        if len(out) >= int(pairs_per_graph):
+            break
+        a, b = [int(v) for v in rng.choice(far, size=2, replace=False)]
+        if not np.isfinite(dist[a, b]) or dist[a, b] < float(min_source_separation):
+            continue
+        blocked = {int(focal), a, b}
+        pa = _partner(a, blocked)
+        if pa is None:
+            continue
+        blocked.add(pa[0])
+        pb = _partner(b, blocked)
+        if pb is None:
+            continue
+        key = (a, pa[0], b, pb[0])
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({
+            "source_a": a,
+            "partner_a": pa[0],
+            "xnorm_a": pa[1],
+            "source_b": b,
+            "partner_b": pb[0],
+            "xnorm_b": pb[1],
+            "d_focal_a": float(dist[int(focal), a]),
+            "d_focal_b": float(dist[int(focal), b]),
+            "d_a_b": float(dist[a, b]) if np.isfinite(dist[a, b]) else float("nan"),
+        })
+    return out
+
+
+def make_multi_swapped_batch(batch, records: Sequence[Sequence[Tuple[int, int, float]]]):
+    if isinstance(batch, GraphormerBatchAdapter):
+        q = len(records)
+        new_d: Dict[str, torch.Tensor] = {}
+        for key, value in batch.d.items():
+            if torch.is_tensor(value) and value.dim() > 0 and int(value.size(0)) == 1:
+                reps = [q] + [1] * (value.dim() - 1)
+                new_d[key] = value.repeat(*reps).clone()
+            elif torch.is_tensor(value):
+                new_d[key] = value.clone()
+            else:
+                new_d[key] = value
+        x = new_d["x"]
+        for row, swaps in enumerate(records):
+            for source, partner, _norm in swaps:
+                tmp = x[row, int(source)].clone()
+                x[row, int(source)] = x[row, int(partner)]
+                x[row, int(partner)] = tmp
+        return GraphormerBatchAdapter(new_d)
+    if isinstance(batch, CSABatchAdapter):
+        q = len(records)
+        b = batch.b
+        n = int(batch.counts[0].item())
+        edge_count = int(b.edge_index.size(1))
+        x = b.x[:n].repeat(q).clone()
+        for row, swaps in enumerate(records):
+            offset = row * n
+            for source, partner, _norm in swaps:
+                tmp = x[offset + int(source)].clone()
+                x[offset + int(source)] = x[offset + int(partner)]
+                x[offset + int(partner)] = tmp
+        offsets = (torch.arange(q, dtype=b.edge_index.dtype).view(q, 1, 1) * n)
+        edge_index = (b.edge_index[:, :edge_count].unsqueeze(0) + offsets).permute(1, 0, 2).reshape(2, q * edge_count)
+        edge_attr = repeat_edge_attr_for_swaps(b.edge_attr, edge_count, q)
+        batch_index = torch.arange(q).repeat_interleave(n)
+        node_pos = torch.arange(n).repeat(q)
+        fields = {
+            "x": x,
+            "edge_index": edge_index,
+            "edge_attr": edge_attr,
+            "y": b.y[:1].repeat(q),
+            "rwse": b.rwse[:n].repeat(q, 1),
+            "pair_xi": b.pair_xi[:1, :n, :n].repeat(q, 1, 1, 1),
+            "degree": b.degree[:n].repeat(q),
+            "batch_index": batch_index,
+            "node_pos": node_pos,
+            "node_mask": b.node_mask[:1, :n].repeat(q, 1),
+            "pair_mask": b.pair_mask[:1, :n, :n].repeat(q, 1, 1),
+            "num_graphs": q,
+            "max_nodes": n,
+        }
+        return CSABatchAdapter(StaticAnchorBatch(**fields))
+    if isinstance(batch, V19BatchAdapter):
+        q = len(records)
+        b = batch.b
+        n = int(batch.counts[0].item())
+        edge_count = int(b.edge_index.size(1))
+        x = b.x[:n].repeat(q).clone()
+        for row, swaps in enumerate(records):
+            offset = row * n
+            for source, partner, _norm in swaps:
+                tmp = x[offset + int(source)].clone()
+                x[offset + int(source)] = x[offset + int(partner)]
+                x[offset + int(partner)] = tmp
+        offsets = (torch.arange(q, dtype=b.edge_index.dtype).view(q, 1, 1) * n)
+        edge_index = (b.edge_index[:, :edge_count].unsqueeze(0) + offsets).permute(1, 0, 2).reshape(2, q * edge_count)
+        edge_attr = repeat_edge_attr_for_swaps(b.edge_attr, edge_count, q)
+        batch_index = torch.arange(q).repeat_interleave(n)
+        node_pos = torch.arange(n).repeat(q)
+        fields = {
+            "x": x,
+            "edge_index": edge_index,
+            "edge_attr": edge_attr,
+            "y": b.y[:1].repeat(q),
+            "rwse": b.rwse[:n].repeat(q, 1),
+            "pair_xi": b.pair_xi[:1, :n, :n].repeat(q, 1, 1, 1),
+            "degree": b.degree[:n].repeat(q),
+            "degree_log": b.degree_log[:n].repeat(q),
+            "batch_index": batch_index,
+            "node_pos": node_pos,
+            "node_mask": b.node_mask[:1, :n].repeat(q, 1),
+            "pair_mask": b.pair_mask[:1, :n, :n].repeat(q, 1, 1),
+            "num_graphs": q,
+            "max_nodes": n,
+        }
+        return V19BatchAdapter(V19VariantABatch(**fields))
+    from torch_geometric.data import Batch as PyGBatch
+    data = batch.to_data_list()[0]
+    variants = []
+    for swaps in records:
+        d = data.clone()
+        x = d.x.clone()
+        for source, partner, _norm in swaps:
+            tmp = x[int(source)].clone()
+            x[int(source)] = x[int(partner)]
+            x[int(partner)] = tmp
+        d.x = x
+        variants.append(d)
+    return PyGBatch.from_data_list(variants)
+
+
 def target_from_collect(collected: Mapping[str, Any], n: int) -> tuple[torch.Tensor, torch.Tensor]:
     layers = collected.get("layers") or []
     if not layers:
@@ -8440,6 +8649,273 @@ def run_gpi_for_model(spec: ModelSpec, run_cfg: RunConfig, gpi_cfg: ZincGPIConfi
     torch.save(records, cache)
     print(f"[gpi:{spec.name}] wrote cache {cache}")
     return records
+
+
+def _safe_ratio(numer: float, denom: float) -> float:
+    denom = float(denom)
+    return float(numer) / max(abs(denom), 1.0e-12)
+
+
+def run_relationship_interactions_for_model(
+    spec: ModelSpec,
+    run_cfg: RunConfig,
+    gpi_cfg: ZincGPIConfig,
+    device: torch.device,
+    out_dir: Path,
+) -> pd.DataFrame:
+    model_dir = safe_mkdir(out_dir / spec.name)
+    cache = model_dir / (
+        f"relationship_interactions_{gpi_cfg.split}_n{gpi_cfg.relationship_max_molecules}_"
+        f"q{gpi_cfg.relationship_pairs_per_graph}_d{gpi_cfg.relationship_min_hops}_"
+        f"sep{gpi_cfg.relationship_min_source_separation}_seed{gpi_cfg.seed}.csv"
+    )
+    if cache.exists() and not gpi_cfg.force_recompute:
+        print(f"[rel:{spec.name}] loading cache {cache}")
+        return pd.read_csv(cache)
+
+    cfg_obj, loaders, model = configure_model(spec, run_cfg, device)
+    ckpt = find_checkpoint(spec.run_root, spec.ckpt_path)
+    load_checkpoint(model, ckpt, device)
+    loader = split_loader(loaders, gpi_cfg.split)
+    patcher = GraphOutputPatcher(model, spec.family, None)
+    rng = np.random.default_rng(int(gpi_cfg.seed) + 50521)
+    rows: List[Dict[str, Any]] = []
+
+    try:
+        for graph_idx, batch in enumerate(loader):
+            if graph_idx >= int(gpi_cfg.relationship_max_molecules):
+                break
+            n = gpi_num_nodes(batch)
+            x = gpi_node_features(batch, n)
+            dist = gpi_distances(batch, n)
+            focal = _highest_degree_focal(batch, n)
+            pairs = sample_relationship_swap_records(
+                x=x,
+                dist=dist,
+                focal=focal,
+                pairs_per_graph=int(gpi_cfg.relationship_pairs_per_graph),
+                min_hops=int(gpi_cfg.relationship_min_hops),
+                min_source_separation=int(gpi_cfg.relationship_min_source_separation),
+                rng=rng,
+            )
+            if not pairs:
+                continue
+
+            clean_state = patcher.capture(batch.clone().to(device))
+            a_recs = [[(p["source_a"], p["partner_a"], p["xnorm_a"])] for p in pairs]
+            b_recs = [[(p["source_b"], p["partner_b"], p["xnorm_b"])] for p in pairs]
+            ab_recs = [
+                [
+                    (p["source_a"], p["partner_a"], p["xnorm_a"]),
+                    (p["source_b"], p["partner_b"], p["xnorm_b"]),
+                ]
+                for p in pairs
+            ]
+            state_a = patcher.capture(make_multi_swapped_batch(batch, a_recs).to(device))
+            state_b = patcher.capture(make_multi_swapped_batch(batch, b_recs).to(device))
+            state_ab = patcher.capture(make_multi_swapped_batch(batch, ab_recs).to(device))
+
+            y0 = clean_state.pred.detach().view(-1)[0]
+            da = state_a.pred.detach().view(-1) - y0
+            db = state_b.pred.detach().view(-1) - y0
+            dab = state_ab.pred.detach().view(-1) - y0
+            out_inter = dab - da - db
+
+            p1a = p1b = p1ab = p1_inter = None
+            if (clean_state.patchable and state_a.patchable and state_b.patchable
+                    and state_ab.patchable and clean_state.h is not None
+                    and state_a.h is not None and state_b.h is not None
+                    and state_ab.h is not None):
+                h_a = _build_single_node_p1_states(clean_state.h, state_a.h, focal)
+                h_b = _build_single_node_p1_states(clean_state.h, state_b.h, focal)
+                h_ab = _build_single_node_p1_states(clean_state.h, state_ab.h, focal)
+                p1a = patcher.readout(clean_state, h_a).detach().view(-1) - y0
+                p1b = patcher.readout(clean_state, h_b).detach().view(-1) - y0
+                p1ab = patcher.readout(clean_state, h_ab).detach().view(-1) - y0
+                p1_inter = p1ab - p1a - p1b
+
+            for k, p in enumerate(pairs):
+                out_add = float(abs(da[k]).item() + abs(db[k]).item())
+                row = {
+                    "model": spec.name,
+                    "family": spec.family,
+                    "graph_idx": int(graph_idx),
+                    "n": int(n),
+                    "focal": int(focal),
+                    "patch_status": "p1_p2" if clean_state.patchable else "direct_output_only",
+                    "patch_reason": clean_state.reason,
+                    "source_a": int(p["source_a"]),
+                    "partner_a": int(p["partner_a"]),
+                    "source_b": int(p["source_b"]),
+                    "partner_b": int(p["partner_b"]),
+                    "d_focal_a": float(p["d_focal_a"]),
+                    "d_focal_b": float(p["d_focal_b"]),
+                    "d_a_b": float(p["d_a_b"]),
+                    "clean_pred": float(y0.detach().cpu().item()),
+                    "delta_a": float(da[k].detach().cpu().item()),
+                    "delta_b": float(db[k].detach().cpu().item()),
+                    "delta_ab": float(dab[k].detach().cpu().item()),
+                    "output_interaction": float(out_inter[k].detach().cpu().item()),
+                    "output_interaction_abs": float(abs(out_inter[k]).detach().cpu().item()),
+                    "output_additive_abs": out_add,
+                    "output_interaction_ratio": _safe_ratio(abs(out_inter[k]).detach().cpu().item(), out_add),
+                }
+                if p1_inter is not None and p1a is not None and p1b is not None and p1ab is not None:
+                    p1_add = float(abs(p1a[k]).detach().cpu().item() + abs(p1b[k]).detach().cpu().item())
+                    row.update({
+                        "p1_delta_a": float(p1a[k].detach().cpu().item()),
+                        "p1_delta_b": float(p1b[k].detach().cpu().item()),
+                        "p1_delta_ab": float(p1ab[k].detach().cpu().item()),
+                        "p1_interaction": float(p1_inter[k].detach().cpu().item()),
+                        "p1_interaction_abs": float(abs(p1_inter[k]).detach().cpu().item()),
+                        "p1_additive_abs": p1_add,
+                        "p1_interaction_ratio": _safe_ratio(abs(p1_inter[k]).detach().cpu().item(), p1_add),
+                    })
+                else:
+                    row.update({
+                        "p1_delta_a": float("nan"),
+                        "p1_delta_b": float("nan"),
+                        "p1_delta_ab": float("nan"),
+                        "p1_interaction": float("nan"),
+                        "p1_interaction_abs": float("nan"),
+                        "p1_additive_abs": float("nan"),
+                        "p1_interaction_ratio": float("nan"),
+                    })
+                rows.append(row)
+
+            if (graph_idx + 1) % max(int(gpi_cfg.verbose_every), 1) == 0:
+                print(
+                    f"[rel:{spec.name}] {graph_idx + 1}/{gpi_cfg.relationship_max_molecules} graphs "
+                    f"| rows={len(rows)}"
+                )
+    finally:
+        del model
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    df = pd.DataFrame(rows)
+    df.to_csv(cache, index=False)
+    print(f"[rel:{spec.name}] wrote {cache}")
+    return df
+
+
+def bootstrap_relationship_summary(df: pd.DataFrame, *, samples: int, seed: int) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame()
+    rng = np.random.default_rng(int(seed))
+    metrics = [
+        ("output_interaction_ratio", "Output-level non-additivity ratio"),
+        ("output_interaction_abs", "Output-level absolute interaction"),
+        ("p1_interaction_ratio", "Focal P1 non-additivity ratio"),
+        ("p1_interaction_abs", "Focal P1 absolute interaction"),
+    ]
+    rows = []
+    for model, msub in df.groupby("model"):
+        graph_ids = msub["graph_idx"].drop_duplicates().to_numpy()
+        for metric, label in metrics:
+            if metric not in msub:
+                continue
+            per_graph = (
+                msub.groupby("graph_idx")[metric]
+                .mean(numeric_only=True)
+                .replace([np.inf, -np.inf], np.nan)
+                .dropna()
+            )
+            vals = per_graph.to_numpy(dtype=float)
+            mean = float(vals.mean()) if vals.size else float("nan")
+            if vals.size and samples > 0:
+                boots = []
+                for _ in range(int(samples)):
+                    idx = rng.integers(0, vals.size, size=vals.size)
+                    boots.append(float(vals[idx].mean()))
+                lo, hi = np.quantile(boots, [0.025, 0.975]).tolist()
+            else:
+                lo = hi = mean
+            rows.append({
+                "model": model,
+                "metric": metric,
+                "label": label,
+                "mean": mean,
+                "ci_low": float(lo),
+                "ci_high": float(hi),
+                "graphs": int(vals.size),
+                "rows": int(msub[metric].notna().sum()),
+            })
+    return pd.DataFrame(rows)
+
+
+def plot_relationship_interactions(rows: pd.DataFrame, summary: pd.DataFrame, out_dir: Path) -> None:
+    if rows.empty or summary.empty:
+        print("[plot] no relationship-interaction rows; skipping interaction figure")
+        return
+    plt = import_plotting()
+    models = list(rows["model"].drop_duplicates())
+    fig, axes = plt.subplots(1, 2, figsize=(11.2, 4.1))
+
+    metric_order = ["output_interaction_ratio", "p1_interaction_ratio"]
+    metric_label = {
+        "output_interaction_ratio": "Output",
+        "p1_interaction_ratio": "Focal P1",
+    }
+    width = 0.36
+    x = np.arange(len(models))
+    colors = {"output_interaction_ratio": "#4f78b5", "p1_interaction_ratio": "#c2473f"}
+    for offset, metric in zip([-width / 2, width / 2], metric_order):
+        sub = summary[summary["metric"] == metric].set_index("model")
+        vals = np.array([float(sub.loc[m, "mean"]) if m in sub.index else np.nan for m in models])
+        lo = np.array([float(sub.loc[m, "ci_low"]) if m in sub.index else np.nan for m in models])
+        hi = np.array([float(sub.loc[m, "ci_high"]) if m in sub.index else np.nan for m in models])
+        err = np.vstack([np.maximum(vals - lo, 0), np.maximum(hi - vals, 0)])
+        axes[0].bar(x + offset, vals, width=width, color=colors[metric],
+                    label=metric_label[metric], yerr=err, capsize=3, alpha=0.9)
+    axes[0].set_xticks(x)
+    axes[0].set_xticklabels(models, rotation=25, ha="right")
+    axes[0].set_ylabel(r"$|\delta_{AB}-\delta_A-\delta_B| / (|\delta_A|+|\delta_B|)$")
+    axes[0].set_title("Non-additivity of two distant swaps")
+    axes[0].grid(axis="y", color="#dddddd", linewidth=0.6)
+    axes[0].legend(frameon=False)
+
+    patchable = rows[rows["p1_delta_ab"].notna()].copy()
+    if patchable.empty:
+        axes[1].text(0.5, 0.5, "Focal P1 patching unavailable", ha="center", va="center",
+                     transform=axes[1].transAxes)
+        axes[1].set_axis_off()
+    else:
+        colors_model = {
+            "graphormer_slim": "#4f78b5",
+            "grit_rrwp": "#c2473f",
+            "graphgps_gps_rwse": "#3b8b5f",
+            "csa_sym": "#8f63b8",
+            "v19": "#555555",
+        }
+        max_points = 5000
+        rng = np.random.default_rng(3301)
+        if len(patchable) > max_points:
+            patchable = patchable.iloc[rng.choice(len(patchable), size=max_points, replace=False)]
+        minv, maxv = float("inf"), float("-inf")
+        for model, sub in patchable.groupby("model"):
+            xs = (sub["p1_delta_a"] + sub["p1_delta_b"]).to_numpy(dtype=float)
+            ys = sub["p1_delta_ab"].to_numpy(dtype=float)
+            minv = min(minv, float(np.nanmin(xs)), float(np.nanmin(ys)))
+            maxv = max(maxv, float(np.nanmax(xs)), float(np.nanmax(ys)))
+            axes[1].scatter(xs, ys, s=9, alpha=0.35, linewidths=0,
+                            color=colors_model.get(model), label=model)
+        if np.isfinite(minv) and np.isfinite(maxv):
+            pad = 0.05 * max(maxv - minv, 1.0e-12)
+            axes[1].plot([minv - pad, maxv + pad], [minv - pad, maxv + pad],
+                         color="#222222", linewidth=1.0, linestyle="--")
+        axes[1].set_xlabel(r"additive focal effect $P1_A + P1_B$")
+        axes[1].set_ylabel(r"observed focal effect $P1_{AB}$")
+        axes[1].set_title("Does the focal node combine distant sources?")
+        axes[1].grid(color="#eeeeee", linewidth=0.5)
+        axes[1].legend(frameon=False, fontsize=8)
+
+    fig.suptitle("Relationship Test: Single vs Joint Distant Content Swaps", y=1.03)
+    fig.tight_layout()
+    path = safe_mkdir(out_dir / "figures") / "zinc_gpi_relationship_interactions.pdf"
+    fig.savefig(path, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[plot] wrote {path}")
 
 
 def distance_bins_from_records(records: Sequence[Dict[str, Any]], matrix_key: str) -> pd.DataFrame:
@@ -8788,6 +9264,14 @@ def write_gpi_method_notes(out_dir: Path) -> None:
             "far-floor baseline correction, and per-molecule share normalisation. Direct "
             "graph-output source vectors are feature-normalised and share-normalised over sources."
         ),
+        "relationship_interactions": (
+            "Optional --run-relationship-interactions samples two disjoint distant content swaps "
+            "A and B around a highest-degree focal atom, evaluates A, B, and AB, and reports "
+            "delta_AB - delta_A - delta_B. The output-level statistic tests graph-prediction "
+            "non-additivity; the focal P1 statistic patches only the focal node into a clean "
+            "readout background and tests whether that node combines the two distant sources "
+            "non-additively."
+        ),
     }
     with (safe_mkdir(out_dir) / "methodology_notes.json").open("w", encoding="utf-8") as handle:
         json.dump(notes, handle, indent=2)
@@ -8809,6 +9293,7 @@ def run_zinc_gpi_main() -> None:
     records_by_model: Dict[str, List[Dict[str, Any]]] = {}
     all_profile_rows = []
     all_faithfulness = []
+    relationship_frames = []
     for spec in specs:
         print("\n" + "#" * 80)
         print(f"[gpi] running {spec.name}")
@@ -8818,6 +9303,11 @@ def run_zinc_gpi_main() -> None:
                     "last_attention_share", "rollout_attention_share"]:
             all_profile_rows.append(distance_bins_from_records(records, key))
         all_faithfulness.append(attention_faithfulness_rows(records))
+        if gpi_cfg.run_relationship_interactions:
+            print(f"[rel] running distant A/B/AB swap interactions for {spec.name}")
+            relationship_frames.append(
+                run_relationship_interactions_for_model(spec, run_cfg, gpi_cfg, device, out_dir)
+            )
     profile_rows = pd.concat(all_profile_rows, ignore_index=True) if all_profile_rows else pd.DataFrame()
     profile_rows.to_csv(out_dir / "zinc_gpi_distance_profile_rows.csv", index=False)
     profile_summary = bootstrap_profile(
@@ -8840,6 +9330,16 @@ def run_zinc_gpi_main() -> None:
     plot_attention_overlay(profile_summary, out_dir)
     plot_attention_scatter(records_by_model, out_dir)
     plot_focal_maps(records_by_model, out_dir, gpi_cfg.focal_examples)
+    if relationship_frames:
+        rel_rows = pd.concat(relationship_frames, ignore_index=True)
+        rel_rows.to_csv(out_dir / "zinc_gpi_relationship_interactions_rows.csv", index=False)
+        rel_summary = bootstrap_relationship_summary(
+            rel_rows,
+            samples=int(gpi_cfg.bootstrap_samples),
+            seed=int(gpi_cfg.seed) + 951,
+        )
+        rel_summary.to_csv(out_dir / "zinc_gpi_relationship_interactions_summary.csv", index=False)
+        plot_relationship_interactions(rel_rows, rel_summary, out_dir)
     print(f"\n[done] ZINC GPI outputs at {out_dir}")
 
 
