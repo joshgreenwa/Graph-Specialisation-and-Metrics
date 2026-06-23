@@ -606,6 +606,13 @@ def safe_mkdir(path) -> Path:
     return p
 
 
+def ensure_writable_dir(path: Any, *, label: str = "directory") -> Path:
+    p = safe_mkdir(path)
+    if not p.is_dir():
+        raise OSError(f"{label} is not a directory after creation attempt: {p}")
+    return p
+
+
 def set_seed(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
@@ -628,7 +635,7 @@ def cache_file_ready(path: Any) -> bool:
 
 def atomic_torch_save(obj: Any, path: Any) -> None:
     p = Path(path)
-    safe_mkdir(p.parent)
+    ensure_writable_dir(p.parent, label="cache parent")
     tmp = p.with_name(f".{p.name}.tmp-{os.getpid()}")
     torch.save(obj, tmp)
     os.replace(tmp, p)
@@ -636,7 +643,7 @@ def atomic_torch_save(obj: Any, path: Any) -> None:
 
 def atomic_to_csv(df: pd.DataFrame, path: Any, **kwargs) -> None:
     p = Path(path)
-    safe_mkdir(p.parent)
+    ensure_writable_dir(p.parent, label="CSV parent")
     tmp = p.with_name(f".{p.name}.tmp-{os.getpid()}")
     df.to_csv(tmp, **kwargs)
     os.replace(tmp, p)
@@ -10215,7 +10222,7 @@ def run_zinc_gpi_main() -> None:
     mount_drive_if_needed(gpi_cfg.auto_mount_drive)
     run_cfg = build_gpi_run_config(gpi_cfg)
     ensure_runtime_dependencies(run_cfg)
-    out_dir = safe_mkdir(gpi_cfg.out_dir)
+    out_dir = ensure_writable_dir(gpi_cfg.out_dir, label="ZINC GPI output root")
     write_gpi_method_notes(out_dir)
     device = torch.device(gpi_cfg.device if (gpi_cfg.device != "cuda" or torch.cuda.is_available()) else "cpu")
     specs = select_gpi_specs(run_cfg, gpi_cfg.models)
@@ -10252,6 +10259,7 @@ def run_zinc_gpi_main() -> None:
             for key, frame in carriage_result.items():
                 if key in carriage_frames and frame is not None and not frame.empty:
                     carriage_frames[key].append(frame)
+    out_dir = ensure_writable_dir(out_dir, label="ZINC GPI output root")
     profile_rows = pd.concat(all_profile_rows, ignore_index=True) if all_profile_rows else pd.DataFrame()
     atomic_to_csv(profile_rows, out_dir / "zinc_gpi_distance_profile_rows.csv", index=False)
     profile_summary = bootstrap_profile(
