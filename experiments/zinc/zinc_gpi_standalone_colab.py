@@ -621,6 +621,49 @@ def safe_torch_load(path, map_location=None):
         return torch.load(path, map_location=map_location)
 
 
+def cache_file_ready(path: Any) -> bool:
+    p = Path(path)
+    return p.exists() and p.is_file() and p.stat().st_size > 0
+
+
+def atomic_torch_save(obj: Any, path: Any) -> None:
+    p = Path(path)
+    safe_mkdir(p.parent)
+    tmp = p.with_name(f".{p.name}.tmp-{os.getpid()}")
+    torch.save(obj, tmp)
+    os.replace(tmp, p)
+
+
+def atomic_to_csv(df: pd.DataFrame, path: Any, **kwargs) -> None:
+    p = Path(path)
+    safe_mkdir(p.parent)
+    tmp = p.with_name(f".{p.name}.tmp-{os.getpid()}")
+    df.to_csv(tmp, **kwargs)
+    os.replace(tmp, p)
+
+
+def load_torch_cache_or_none(path: Any, *, map_location=None):
+    p = Path(path)
+    if not cache_file_ready(p):
+        return None
+    try:
+        return safe_torch_load(p, map_location=map_location)
+    except Exception as exc:
+        print(f"[cache] ignoring unreadable torch cache {p}: {exc}")
+        return None
+
+
+def load_csv_cache_or_none(path: Any) -> Optional[pd.DataFrame]:
+    p = Path(path)
+    if not cache_file_ready(p):
+        return None
+    try:
+        return pd.read_csv(p)
+    except Exception as exc:
+        print(f"[cache] ignoring unreadable CSV cache {p}: {exc}")
+        return None
+
+
 def _is_pyg_zinc_processed_file(path: Any) -> bool:
     text = str(path)
     return (
@@ -8836,9 +8879,11 @@ def run_gpi_for_model(spec: ModelSpec, run_cfg: RunConfig, gpi_cfg: ZincGPIConfi
         f"gpi_cache_{gpi_cfg.split}_n{gpi_cfg.max_molecules}_"
         f"k{gpi_cfg.partners_per_source}_seed{gpi_cfg.seed}_{gpi_cfg.target}.pt"
     )
-    if cache.exists() and not gpi_cfg.force_recompute:
-        print(f"[gpi:{spec.name}] loading cache {cache}")
-        return safe_torch_load(cache, map_location="cpu")
+    if not gpi_cfg.force_recompute:
+        cached = load_torch_cache_or_none(cache, map_location="cpu")
+        if cached is not None:
+            print(f"[gpi:{spec.name}] loading cache {cache}")
+            return cached
     cfg_obj, loaders, model = configure_model(spec, run_cfg, device)
     ckpt = find_checkpoint(spec.run_root, spec.ckpt_path)
     load_checkpoint(model, ckpt, device)
@@ -8860,7 +8905,7 @@ def run_gpi_for_model(spec: ModelSpec, run_cfg: RunConfig, gpi_cfg: ZincGPIConfi
         del model
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-    torch.save(records, cache)
+    atomic_torch_save(records, cache)
     print(f"[gpi:{spec.name}] wrote cache {cache}")
     return records
 
@@ -8883,9 +8928,11 @@ def run_relationship_interactions_for_model(
         f"q{gpi_cfg.relationship_pairs_per_graph}_d{gpi_cfg.relationship_min_hops}_"
         f"sep{gpi_cfg.relationship_min_source_separation}_seed{gpi_cfg.seed}.csv"
     )
-    if cache.exists() and not gpi_cfg.force_recompute:
-        print(f"[rel:{spec.name}] loading cache {cache}")
-        return pd.read_csv(cache)
+    if not gpi_cfg.force_recompute:
+        cached = load_csv_cache_or_none(cache)
+        if cached is not None:
+            print(f"[rel:{spec.name}] loading cache {cache}")
+            return cached
 
     cfg_obj, loaders, model = configure_model(spec, run_cfg, device)
     ckpt = find_checkpoint(spec.run_root, spec.ckpt_path)
@@ -9008,7 +9055,7 @@ def run_relationship_interactions_for_model(
             torch.cuda.empty_cache()
 
     df = pd.DataFrame(rows)
-    df.to_csv(cache, index=False)
+    atomic_to_csv(df, cache, index=False)
     print(f"[rel:{spec.name}] wrote {cache}")
     return df
 
@@ -9280,9 +9327,11 @@ def run_carriage_analysis_for_model(
         "profile": model_dir / f"{prefix}_distance_profile_rows.csv",
         "attention": model_dir / f"{prefix}_attention_rows.csv",
     }
-    if all(p.exists() for p in paths.values()) and not gpi_cfg.force_recompute:
-        print(f"[carriage:{spec.name}] loading cached CSVs")
-        return {k: pd.read_csv(p) for k, p in paths.items()}
+    if not gpi_cfg.force_recompute:
+        cached = {k: load_csv_cache_or_none(p) for k, p in paths.items()}
+        if all(df is not None for df in cached.values()):
+            print(f"[carriage:{spec.name}] loading cached CSVs")
+            return {k: df for k, df in cached.items() if df is not None}
 
     cfg_obj, loaders, model = configure_model(spec, run_cfg, device)
     ckpt = find_checkpoint(spec.run_root, spec.ckpt_path)
@@ -9436,7 +9485,7 @@ def run_carriage_analysis_for_model(
         "attention": pd.DataFrame(attention_rows),
     }
     for key, df in dfs.items():
-        df.to_csv(paths[key], index=False)
+        atomic_to_csv(df, paths[key], index=False)
         print(f"[carriage:{spec.name}] wrote {paths[key]}")
     return dfs
 
@@ -9594,7 +9643,7 @@ def plot_carriage_outputs(
                  attention_far_mass=("attention_far_mass", "mean"),
                  graphs=("graph_idx", "nunique"))
         )
-        attn_summary.to_csv(out_dir / "zinc_gpi_carriage_attention_summary.csv", index=False)
+        atomic_to_csv(attn_summary, out_dir / "zinc_gpi_carriage_attention_summary.csv", index=False)
         fig, axes = plt.subplots(1, 2, figsize=(10.4, 4.0))
         for attention, sub in attn_summary.groupby("attention"):
             axes[0].scatter(
@@ -9881,7 +9930,7 @@ def write_source_map_availability(records_by_model: Mapping[str, Sequence[Dict[s
             "reason": "; ".join(reasons[:3]),
         })
     path = safe_mkdir(out_dir) / "zinc_gpi_source_map_availability.csv"
-    pd.DataFrame(rows).to_csv(path, index=False)
+    atomic_to_csv(pd.DataFrame(rows), path, index=False)
     print(f"[summary] wrote {path}")
 
 
@@ -10199,22 +10248,22 @@ def run_zinc_gpi_main() -> None:
                 if key in carriage_frames and frame is not None and not frame.empty:
                     carriage_frames[key].append(frame)
     profile_rows = pd.concat(all_profile_rows, ignore_index=True) if all_profile_rows else pd.DataFrame()
-    profile_rows.to_csv(out_dir / "zinc_gpi_distance_profile_rows.csv", index=False)
+    atomic_to_csv(profile_rows, out_dir / "zinc_gpi_distance_profile_rows.csv", index=False)
     profile_summary = bootstrap_profile(
         profile_rows,
         samples=int(gpi_cfg.bootstrap_samples),
         seed=int(gpi_cfg.seed) + 409,
     )
-    profile_summary.to_csv(out_dir / "zinc_gpi_distance_profile_summary.csv", index=False)
+    atomic_to_csv(profile_summary, out_dir / "zinc_gpi_distance_profile_summary.csv", index=False)
     faith = pd.concat(all_faithfulness, ignore_index=True) if all_faithfulness else pd.DataFrame()
-    faith.to_csv(out_dir / "zinc_gpi_attention_faithfulness_rows.csv", index=False)
+    atomic_to_csv(faith, out_dir / "zinc_gpi_attention_faithfulness_rows.csv", index=False)
     if not faith.empty:
         faith_summary = (
             faith.groupby(["model", "attention"], as_index=False)
             .agg(receiver_spearman_mean=("receiver_spearman_mean", "mean"),
                  graphs=("graph_idx", "nunique"))
         )
-        faith_summary.to_csv(out_dir / "zinc_gpi_attention_faithfulness_summary.csv", index=False)
+        atomic_to_csv(faith_summary, out_dir / "zinc_gpi_attention_faithfulness_summary.csv", index=False)
     write_source_map_availability(records_by_model, out_dir)
     plot_distance_profile(profile_summary, out_dir)
     plot_direct_output_distance_profile(profile_summary, out_dir)
@@ -10225,35 +10274,35 @@ def run_zinc_gpi_main() -> None:
     plot_direct_output_source_maps(records_by_model, out_dir, gpi_cfg.focal_examples)
     if relationship_frames:
         rel_rows = pd.concat(relationship_frames, ignore_index=True)
-        rel_rows.to_csv(out_dir / "zinc_gpi_relationship_interactions_rows.csv", index=False)
+        atomic_to_csv(rel_rows, out_dir / "zinc_gpi_relationship_interactions_rows.csv", index=False)
         rel_summary = bootstrap_relationship_summary(
             rel_rows,
             samples=int(gpi_cfg.bootstrap_samples),
             seed=int(gpi_cfg.seed) + 951,
         )
-        rel_summary.to_csv(out_dir / "zinc_gpi_relationship_interactions_summary.csv", index=False)
+        atomic_to_csv(rel_summary, out_dir / "zinc_gpi_relationship_interactions_summary.csv", index=False)
         plot_relationship_interactions(rel_rows, rel_summary, out_dir)
     if gpi_cfg.run_carriage_analysis:
         carriage_graph = pd.concat(carriage_frames["graph"], ignore_index=True) if carriage_frames["graph"] else pd.DataFrame()
         carriage_linear = pd.concat(carriage_frames["linear"], ignore_index=True) if carriage_frames["linear"] else pd.DataFrame()
         carriage_profile = pd.concat(carriage_frames["profile"], ignore_index=True) if carriage_frames["profile"] else pd.DataFrame()
         carriage_attention = pd.concat(carriage_frames["attention"], ignore_index=True) if carriage_frames["attention"] else pd.DataFrame()
-        carriage_graph.to_csv(out_dir / "zinc_gpi_carriage_graph_stats.csv", index=False)
-        carriage_linear.to_csv(out_dir / "zinc_gpi_carriage_linearisation_rows.csv", index=False)
-        carriage_profile.to_csv(out_dir / "zinc_gpi_carriage_distance_profile_rows.csv", index=False)
-        carriage_attention.to_csv(out_dir / "zinc_gpi_carriage_attention_rows.csv", index=False)
+        atomic_to_csv(carriage_graph, out_dir / "zinc_gpi_carriage_graph_stats.csv", index=False)
+        atomic_to_csv(carriage_linear, out_dir / "zinc_gpi_carriage_linearisation_rows.csv", index=False)
+        atomic_to_csv(carriage_profile, out_dir / "zinc_gpi_carriage_distance_profile_rows.csv", index=False)
+        atomic_to_csv(carriage_attention, out_dir / "zinc_gpi_carriage_attention_rows.csv", index=False)
         carriage_graph_summary = bootstrap_carriage_graph_summary(
             carriage_graph,
             samples=int(gpi_cfg.bootstrap_samples),
             seed=int(gpi_cfg.seed) + 1201,
         )
-        carriage_graph_summary.to_csv(out_dir / "zinc_gpi_carriage_graph_summary.csv", index=False)
+        atomic_to_csv(carriage_graph_summary, out_dir / "zinc_gpi_carriage_graph_summary.csv", index=False)
         carriage_profile_summary = bootstrap_profile(
             carriage_profile,
             samples=int(gpi_cfg.bootstrap_samples),
             seed=int(gpi_cfg.seed) + 1202,
         )
-        carriage_profile_summary.to_csv(out_dir / "zinc_gpi_carriage_distance_profile_summary.csv", index=False)
+        atomic_to_csv(carriage_profile_summary, out_dir / "zinc_gpi_carriage_distance_profile_summary.csv", index=False)
         plot_carriage_outputs(
             carriage_graph_summary,
             carriage_profile_summary,
