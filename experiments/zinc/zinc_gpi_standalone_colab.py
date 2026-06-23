@@ -8945,6 +8945,42 @@ def distance_bins_from_records(records: Sequence[Dict[str, Any]], matrix_key: st
     return pd.DataFrame(rows)
 
 
+def direct_output_distance_bins_from_records(records: Sequence[Dict[str, Any]]) -> pd.DataFrame:
+    """Task-level source influence, binned by distance from a focal hub atom.
+
+    Direct graph-output maps have no receiver index, so there is no true
+    receiver-source distance. For a compact dataset-level diagnostic we bin
+    source atoms by distance to the same focal atom used in direct source-map
+    visualisations: the highest-degree atom in the molecular graph.
+    """
+    rows = []
+    for rec in records:
+        vec = np.asarray(rec.get("direct_graph_output_source_share", []), dtype=float)
+        if vec.ndim != 1 or vec.size == 0:
+            continue
+        n = int(rec["n"])
+        dist = np.asarray(rec["distances"], dtype=float)
+        degree = np.zeros(n, dtype=int)
+        for u, v in rec.get("edges", []):
+            degree[int(u)] += 1
+            degree[int(v)] += 1
+        focal = int(np.argmax(degree)) if degree.size else 0
+        valid = np.isfinite(dist[focal]) & (np.arange(n) != focal)
+        for d in sorted(set(dist[focal, valid].astype(int).tolist())):
+            mask = valid & (dist[focal] == float(d))
+            rows.append({
+                "model": rec["model"],
+                "graph_idx": int(rec["graph_idx"]),
+                "n": n,
+                "distance": int(d),
+                "mass_share": float(vec[mask].sum()),
+                "pair_count": int(mask.sum()),
+                "matrix": "direct_graph_output_source_share",
+                "focal": focal,
+            })
+    return pd.DataFrame(rows)
+
+
 def bootstrap_profile(df: pd.DataFrame, *, samples: int, seed: int) -> pd.DataFrame:
     if df.empty:
         return df
@@ -9050,6 +9086,37 @@ def plot_distance_profile(summary: pd.DataFrame, out_dir: Path) -> None:
     print(f"[plot] wrote {path}")
 
 
+def plot_direct_output_distance_profile(summary: pd.DataFrame, out_dir: Path) -> None:
+    plt = import_plotting()
+    df = summary[summary["matrix"] == "direct_graph_output_source_share"].copy()
+    if df.empty:
+        print("[plot] no direct graph-output source rows; skipping direct-output distance profile")
+        return
+    fig, ax = plt.subplots(figsize=(6.7, 4.1))
+    colors = {
+        "graphormer_slim": "#4f78b5",
+        "grit_rrwp": "#c2473f",
+        "graphgps_gps_rwse": "#3b8b5f",
+        "csa_sym": "#8f63b8",
+        "v19": "#555555",
+    }
+    for model, g in df.groupby("model"):
+        g = g.sort_values("distance")
+        color = colors.get(model, None)
+        ax.plot(g["distance"], g["mean"], marker="o", linewidth=2.1, color=color, label=model)
+        ax.fill_between(g["distance"], g["ci_low"], g["ci_high"], color=color, alpha=0.14)
+    ax.set_title("ZINC GPI: Direct Graph-Output Source Dependence")
+    ax.set_xlabel("hop distance from highest-degree atom")
+    ax.set_ylabel("share of direct output source-map mass")
+    ax.grid(axis="y", color="#dddddd", linewidth=0.6)
+    ax.legend(frameon=False)
+    fig.tight_layout()
+    path = safe_mkdir(out_dir / "figures") / "zinc_gpi_direct_graph_output_distance_profile.pdf"
+    fig.savefig(path, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[plot] wrote {path}")
+
+
 def plot_p1_p2_profiles(summary: pd.DataFrame, out_dir: Path) -> None:
     plt = import_plotting()
     keep = summary[summary["matrix"].isin(["source_p1_share", "source_p2_share"])].copy()
@@ -9081,6 +9148,36 @@ def plot_p1_p2_profiles(summary: pd.DataFrame, out_dir: Path) -> None:
     fig.savefig(path, bbox_inches="tight")
     plt.close(fig)
     print(f"[plot] wrote {path}")
+
+
+def write_source_map_availability(records_by_model: Mapping[str, Sequence[Dict[str, Any]]],
+                                  out_dir: Path) -> None:
+    rows = []
+    for model, records in records_by_model.items():
+        if not records:
+            rows.append({
+                "model": model,
+                "graphs": 0,
+                "p1_p2_graphs": 0,
+                "direct_output_graphs": 0,
+                "primary_status": "empty",
+                "reason": "",
+            })
+            continue
+        p1 = sum(1 for r in records if r.get("patch_status") == "p1_p2")
+        direct = sum(1 for r in records if "direct_graph_output_source_share" in r)
+        reasons = sorted(set(str(r.get("patch_reason", "")) for r in records if r.get("patch_reason")))
+        rows.append({
+            "model": model,
+            "graphs": len(records),
+            "p1_p2_graphs": p1,
+            "direct_output_graphs": direct,
+            "primary_status": "p1_p2" if p1 else "direct_output_only",
+            "reason": "; ".join(reasons[:3]),
+        })
+    path = safe_mkdir(out_dir) / "zinc_gpi_source_map_availability.csv"
+    pd.DataFrame(rows).to_csv(path, index=False)
+    print(f"[summary] wrote {path}")
 
 
 def plot_attention_overlay(summary: pd.DataFrame, out_dir: Path) -> None:
@@ -9235,6 +9332,72 @@ def plot_focal_maps(records_by_model: Mapping[str, Sequence[Dict[str, Any]]], ou
     print(f"[plot] wrote {path}")
 
 
+def plot_direct_output_source_maps(records_by_model: Mapping[str, Sequence[Dict[str, Any]]],
+                                   out_dir: Path, examples: int) -> None:
+    if examples <= 0 or not records_by_model:
+        return
+    plt = import_plotting()
+    import networkx as _nx
+    models = [
+        m for m, records in records_by_model.items()
+        if any("direct_graph_output_source_share" in r for r in records)
+    ]
+    if not models:
+        print("[plot] no direct graph-output source maps; skipping direct source-map gallery")
+        return
+    shared_graphs = set(int(r["graph_idx"]) for r in records_by_model[models[0]])
+    for model in models[1:]:
+        shared_graphs &= set(int(r["graph_idx"]) for r in records_by_model[model])
+    graph_ids = sorted(shared_graphs)[:int(examples)]
+    if not graph_ids:
+        return
+    lookup = {
+        model: {int(r["graph_idx"]): r for r in records}
+        for model, records in records_by_model.items()
+    }
+    fig, axes = plt.subplots(len(models), len(graph_ids),
+                             figsize=(3.3 * len(graph_ids), 3.0 * len(models)),
+                             squeeze=False)
+    for row, model in enumerate(models):
+        for col, gid in enumerate(graph_ids):
+            rec = lookup[model][gid]
+            n = int(rec["n"])
+            g = _nx.Graph()
+            g.add_nodes_from(range(n))
+            g.add_edges_from(rec["edges"])
+            if g.number_of_edges() == 0:
+                continue
+            influence = np.asarray(rec["direct_graph_output_source_share"], dtype=float).copy()
+            vmax = float(max(influence.max(), 1.0e-12))
+            degree = dict(g.degree())
+            focal = max(degree, key=degree.get)
+            pos = _nx.spring_layout(g, seed=gid, iterations=80)
+            ax = axes[row, col]
+            _nx.draw_networkx_edges(g, pos, ax=ax, width=0.8, alpha=0.45, edge_color="#777777")
+            _nx.draw_networkx_nodes(
+                g, pos, ax=ax,
+                node_color=influence,
+                cmap="magma",
+                vmin=0.0,
+                vmax=vmax,
+                node_size=90,
+                linewidths=[1.8 if node == focal else 0.3 for node in g.nodes],
+                edgecolors=["#111111" if node == focal else "#ffffff" for node in g.nodes],
+            )
+            ax.set_axis_off()
+            if row == 0:
+                ax.set_title(f"molecule {gid}")
+            if col == 0:
+                ax.text(-0.05, 0.5, model, rotation=90, va="center", ha="right",
+                        transform=ax.transAxes, fontsize=10)
+    fig.suptitle("Direct Graph-Output Source Maps", y=1.02)
+    fig.tight_layout()
+    path = safe_mkdir(out_dir / "figures") / "zinc_gpi_direct_graph_output_source_maps.pdf"
+    fig.savefig(path, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[plot] wrote {path}")
+
+
 def write_gpi_method_notes(out_dir: Path) -> None:
     notes = {
         "target_used": (
@@ -9302,6 +9465,7 @@ def run_zinc_gpi_main() -> None:
         for key in ["source_p1_share", "source_p2_share",
                     "last_attention_share", "rollout_attention_share"]:
             all_profile_rows.append(distance_bins_from_records(records, key))
+        all_profile_rows.append(direct_output_distance_bins_from_records(records))
         all_faithfulness.append(attention_faithfulness_rows(records))
         if gpi_cfg.run_relationship_interactions:
             print(f"[rel] running distant A/B/AB swap interactions for {spec.name}")
@@ -9325,11 +9489,14 @@ def run_zinc_gpi_main() -> None:
                  graphs=("graph_idx", "nunique"))
         )
         faith_summary.to_csv(out_dir / "zinc_gpi_attention_faithfulness_summary.csv", index=False)
+    write_source_map_availability(records_by_model, out_dir)
     plot_distance_profile(profile_summary, out_dir)
+    plot_direct_output_distance_profile(profile_summary, out_dir)
     plot_p1_p2_profiles(profile_summary, out_dir)
     plot_attention_overlay(profile_summary, out_dir)
     plot_attention_scatter(records_by_model, out_dir)
     plot_focal_maps(records_by_model, out_dir, gpi_cfg.focal_examples)
+    plot_direct_output_source_maps(records_by_model, out_dir, gpi_cfg.focal_examples)
     if relationship_frames:
         rel_rows = pd.concat(relationship_frames, ignore_index=True)
         rel_rows.to_csv(out_dir / "zinc_gpi_relationship_interactions_rows.csv", index=False)
