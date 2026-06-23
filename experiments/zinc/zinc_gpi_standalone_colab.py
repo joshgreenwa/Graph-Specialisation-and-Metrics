@@ -7675,6 +7675,11 @@ class ZincGPIConfig:
     relationship_pairs_per_graph: int = 16
     relationship_min_hops: int = 3
     relationship_min_source_separation: int = 2
+    run_carriage_analysis: bool = False
+    carriage_max_molecules: int = 100
+    carriage_partners_per_source: int = 16
+    carriage_far_hops: int = 3
+    carriage_null_samples: int = 100
     force_recompute: bool = False
     auto_mount_drive: bool = True
     auto_clone_repos: bool = True
@@ -7713,6 +7718,17 @@ def parse_gpi_args() -> ZincGPIConfig:
                    default=ZincGPIConfig.relationship_min_hops)
     p.add_argument("--relationship-min-source-separation", type=int,
                    default=ZincGPIConfig.relationship_min_source_separation)
+    p.add_argument("--run-carriage-analysis", action="store_true",
+                   default=ZincGPIConfig.run_carriage_analysis,
+                   help="Run gradient-weighted final-state carriage matrix C[i,j] analysis.")
+    p.add_argument("--carriage-max-molecules", type=int,
+                   default=ZincGPIConfig.carriage_max_molecules)
+    p.add_argument("--carriage-partners-per-source", type=int,
+                   default=ZincGPIConfig.carriage_partners_per_source)
+    p.add_argument("--carriage-far-hops", type=int,
+                   default=ZincGPIConfig.carriage_far_hops)
+    p.add_argument("--carriage-null-samples", type=int,
+                   default=ZincGPIConfig.carriage_null_samples)
     p.add_argument("--force-recompute", action="store_true")
     p.add_argument("--no-auto-mount-drive", dest="auto_mount_drive", action="store_false")
     p.add_argument("--auto-clone-repos", action="store_true", default=True)
@@ -7763,6 +7779,11 @@ def parse_gpi_args() -> ZincGPIConfig:
         relationship_pairs_per_graph=args.relationship_pairs_per_graph,
         relationship_min_hops=args.relationship_min_hops,
         relationship_min_source_separation=args.relationship_min_source_separation,
+        run_carriage_analysis=args.run_carriage_analysis,
+        carriage_max_molecules=args.carriage_max_molecules,
+        carriage_partners_per_source=args.carriage_partners_per_source,
+        carriage_far_hops=args.carriage_far_hops,
+        carriage_null_samples=args.carriage_null_samples,
         force_recompute=args.force_recompute,
         auto_mount_drive=args.auto_mount_drive,
         auto_clone_repos=args.auto_clone_repos,
@@ -8191,6 +8212,120 @@ class GraphOutputPatcher:
         return GraphOutputState(
             pred=pred, h=h[:, 1:, :], node_mask=node_mask,
             context={"family": "graphormer", "pooling": self.model.cfg.graph_pooling},
+            patchable=True,
+        )
+
+    def capture_grad(self, batch) -> Tuple[GraphOutputState, Optional[torch.Tensor]]:
+        """Capture final node states and clean output gradient wrt those states."""
+        native = unwrap_model_batch(batch)
+        with self._without_probe_layers():
+            if isinstance(self.model, StandaloneGraphormer):
+                state = self._capture_graphormer_grad(native)
+            elif isinstance(self.model, StaticAnchorZincModel):
+                state = self._capture_csa_grad(native)
+            elif isinstance(self.model, V19VariantAZincModel):
+                state = self._capture_v19_grad(native)
+            else:
+                state = self._capture_graphgym_grad(native)
+        if not state.patchable or state.h is None:
+            return state, None
+        grad = torch.autograd.grad(
+            state.pred.sum(),
+            state.h,
+            retain_graph=False,
+            create_graph=False,
+            allow_unused=True,
+        )[0]
+        if grad is None:
+            grad = torch.zeros_like(state.h)
+        return state, grad.detach()
+
+    def _capture_graphormer_grad(self, batch: Mapping[str, torch.Tensor]) -> GraphOutputState:
+        h = self.model.graph_node_feature(batch)
+        if self.model.emb_layer_norm is not None:
+            h = self.model.emb_layer_norm(h)
+        h = self.model.emb_dropout(h)
+        attn_bias = self.model.build_attn_bias(batch)
+        for layer in self.model.layers:
+            h = layer(h, attn_bias)
+        node_mask = batch["node_mask"].bool()
+        if self.model.cfg.graph_pooling == "graph_token":
+            pred = self.model.output_projection(h)[:, 0, :].view(-1)
+            return GraphOutputState(
+                pred=pred, h=None, node_mask=node_mask, context=None,
+                patchable=False,
+                reason="graph_token_readout_has_no_node_pooling_stage",
+            )
+        h_nodes = h[:, 1:, :]
+        node_h = h_nodes * node_mask.unsqueeze(-1).to(h_nodes.dtype)
+        if self.model.cfg.graph_pooling == "sum":
+            graph_repr = node_h.sum(dim=1)
+        elif self.model.cfg.graph_pooling == "mean":
+            denom = node_mask.sum(dim=1, keepdim=True).clamp(min=1).to(h_nodes.dtype)
+            graph_repr = node_h.sum(dim=1) / denom
+        else:
+            raise RuntimeError(f"Unsupported Graphormer pooling for carriage: {self.model.cfg.graph_pooling}")
+        pred = self.model.output_projection(graph_repr).view(-1)
+        return GraphOutputState(
+            pred=pred, h=h_nodes, node_mask=node_mask,
+            context={"family": "graphormer", "pooling": self.model.cfg.graph_pooling},
+            patchable=True,
+        )
+
+    def _capture_csa_grad(self, batch: StaticAnchorBatch) -> GraphOutputState:
+        h = self.model.atom_emb(batch.x)
+        edge_msg = self.model.bond_emb(batch.edge_attr)
+        bond_sum = h.new_zeros(h.shape)
+        if batch.edge_index.numel() > 0:
+            bond_sum.index_add_(0, batch.edge_index[1], edge_msg)
+        h = h + bond_sum + self.model.rwse_proj(batch.rwse)
+        for layer in self.model.layers:
+            h = layer(h, batch)
+        h = self.model.final_bn(h)
+        h_dense, node_mask = dense_flat_node_states(h, batch.batch_index)
+        pred = self._readout_csa_from_dense(h_dense, node_mask)
+        return GraphOutputState(pred=pred, h=h_dense, node_mask=node_mask,
+                                context={"family": "csa"}, patchable=True)
+
+    def _capture_v19_grad(self, batch: V19VariantABatch) -> GraphOutputState:
+        h = self.model.atom_emb(batch.x)
+        edge_msg = self.model.bond_emb(batch.edge_attr)
+        bond_sum = h.new_zeros(h.shape)
+        if batch.edge_index.numel() > 0:
+            bond_sum.index_add_(0, batch.edge_index[1], edge_msg)
+        h = h + bond_sum + self.model.rwse_proj(batch.rwse)
+        z_pair = batch.pair_xi.new_zeros(batch.pair_xi.shape[:-1] + (V19_P_LATENT_PAIR,))
+        for layer in self.model.layers:
+            h, z_pair = layer(h, z_pair, batch, collect_diag=False)
+        h = self.model.final_bn(h)
+        h_dense, node_mask = dense_flat_node_states(h, batch.batch_index)
+        pred = self._readout_v19_from_dense(h_dense, node_mask)
+        return GraphOutputState(pred=pred, h=h_dense, node_mask=node_mask,
+                                context={"family": "v19"}, patchable=True)
+
+    def _capture_graphgym_grad(self, batch) -> GraphOutputState:
+        assert self.graphgym_head is not None
+        captured: Dict[str, Any] = {}
+
+        def _pre_hook(_mod, args):
+            if args:
+                captured["batch"] = args[0]
+
+        handle = self.graphgym_head.register_forward_pre_hook(_pre_hook)
+        try:
+            out = self.model(batch)
+        finally:
+            handle.remove()
+        pred = get_model_pred(out).to(batch.x.device)
+        head_batch = captured.get("batch")
+        if head_batch is None or not hasattr(head_batch, "x") or not hasattr(head_batch, "batch"):
+            return GraphOutputState(
+                pred=pred, h=None, node_mask=None, context=None, patchable=False,
+                reason="graphgym_head_input_not_batch_with_x_and_batch",
+            )
+        h_dense, node_mask = dense_flat_node_states(head_batch.x, head_batch.batch)
+        return GraphOutputState(
+            pred=pred, h=h_dense, node_mask=node_mask, context=head_batch,
             patchable=True,
         )
 
@@ -8997,6 +9132,497 @@ def plot_relationship_interactions(rows: pd.DataFrame, summary: pd.DataFrame, ou
     print(f"[plot] wrote {path}")
 
 
+def _effective_rank_stats(mat: np.ndarray) -> Dict[str, float]:
+    arr = np.asarray(mat, dtype=float)
+    if arr.size == 0 or not np.any(arr):
+        return {
+            "effective_rank": 0.0,
+            "rank99": 0.0,
+            "top1_energy_share": 0.0,
+            "fro_norm": 0.0,
+        }
+    s = np.linalg.svd(arr, compute_uv=False)
+    energy = s ** 2
+    total = float(energy.sum())
+    if total <= 0:
+        return {
+            "effective_rank": 0.0,
+            "rank99": 0.0,
+            "top1_energy_share": 0.0,
+            "fro_norm": 0.0,
+        }
+    pr = float(total ** 2 / max(float((energy ** 2).sum()), 1.0e-12))
+    cume = np.cumsum(energy) / total
+    rank99 = int(np.searchsorted(cume, 0.99) + 1)
+    return {
+        "effective_rank": pr,
+        "rank99": float(rank99),
+        "top1_energy_share": float(energy[0] / total),
+        "fro_norm": float(np.sqrt(total)),
+    }
+
+
+def _distance_bin_share_rows_for_matrix(
+    model: str,
+    graph_idx: int,
+    n: int,
+    dist: np.ndarray,
+    mat: np.ndarray,
+    matrix_name: str,
+) -> List[Dict[str, Any]]:
+    rows = []
+    valid = np.isfinite(dist) & (dist > 0)
+    for d in sorted(set(dist[valid].astype(int).tolist())):
+        mask = valid & (dist == float(d))
+        rows.append({
+            "model": model,
+            "graph_idx": int(graph_idx),
+            "n": int(n),
+            "distance": int(d),
+            "mass_share": float(np.asarray(mat)[mask].sum()),
+            "pair_count": int(mask.sum()),
+            "matrix": matrix_name,
+        })
+    return rows
+
+
+def _carriage_rank_null(
+    mat: np.ndarray,
+    dist: np.ndarray,
+    far_hops: int,
+    null_samples: int,
+    rng: np.random.Generator,
+) -> Dict[str, float]:
+    valid = np.isfinite(dist) & (dist > 0)
+    far = valid & (dist >= float(far_hops))
+    far_mat = np.where(far, mat, 0.0)
+    obs = _effective_rank_stats(far_mat)
+    null_top1 = []
+    null_erank = []
+    null_rank99 = []
+    for _ in range(int(null_samples)):
+        shuffled = np.zeros_like(far_mat)
+        for i in range(mat.shape[0]):
+            idx = np.flatnonzero(far[i])
+            if idx.size:
+                vals = np.asarray(mat[i, idx], dtype=float).copy()
+                rng.shuffle(vals)
+                shuffled[i, idx] = vals
+        st = _effective_rank_stats(shuffled)
+        null_top1.append(st["top1_energy_share"])
+        null_erank.append(st["effective_rank"])
+        null_rank99.append(st["rank99"])
+    out = {
+        "far_effective_rank": obs["effective_rank"],
+        "far_rank99": obs["rank99"],
+        "far_top1_energy_share": obs["top1_energy_share"],
+        "far_fro_norm": obs["fro_norm"],
+    }
+    if null_top1:
+        out.update({
+            "null_far_effective_rank_mean": float(np.mean(null_erank)),
+            "null_far_rank99_mean": float(np.mean(null_rank99)),
+            "null_far_top1_energy_share_mean": float(np.mean(null_top1)),
+            "far_top1_minus_null": float(obs["top1_energy_share"] - np.mean(null_top1)),
+        })
+    else:
+        out.update({
+            "null_far_effective_rank_mean": float("nan"),
+            "null_far_rank99_mean": float("nan"),
+            "null_far_top1_energy_share_mean": float("nan"),
+            "far_top1_minus_null": float("nan"),
+        })
+    return out
+
+
+def _linearisation_stats(rows: List[Dict[str, Any]]) -> Dict[str, float]:
+    if not rows:
+        return {
+            "linearisation_r2": float("nan"),
+            "linearisation_pearson": float("nan"),
+            "linearisation_abs_residual_mean": float("nan"),
+            "linearisation_abs_measured_mean": float("nan"),
+            "linearisation_residual_ratio": float("nan"),
+        }
+    measured = np.array([r["measured_delta"] for r in rows], dtype=float)
+    pred = np.array([r["carriage_pred_delta"] for r in rows], dtype=float)
+    resid = measured - pred
+    denom = float(((measured - measured.mean()) ** 2).sum())
+    r2 = 1.0 - float((resid ** 2).sum()) / max(denom, 1.0e-12)
+    pear = float(np.corrcoef(measured, pred)[0, 1]) if np.std(measured) > 0 and np.std(pred) > 0 else float("nan")
+    abs_resid = float(np.mean(np.abs(resid)))
+    abs_measured = float(np.mean(np.abs(measured)))
+    return {
+        "linearisation_r2": r2,
+        "linearisation_pearson": pear,
+        "linearisation_abs_residual_mean": abs_resid,
+        "linearisation_abs_measured_mean": abs_measured,
+        "linearisation_residual_ratio": _safe_ratio(abs_resid, abs_measured),
+    }
+
+
+def run_carriage_analysis_for_model(
+    spec: ModelSpec,
+    run_cfg: RunConfig,
+    gpi_cfg: ZincGPIConfig,
+    device: torch.device,
+    out_dir: Path,
+) -> Dict[str, pd.DataFrame]:
+    model_dir = safe_mkdir(out_dir / spec.name)
+    prefix = (
+        f"carriage_{gpi_cfg.split}_n{gpi_cfg.carriage_max_molecules}_"
+        f"k{gpi_cfg.carriage_partners_per_source}_far{gpi_cfg.carriage_far_hops}_"
+        f"seed{gpi_cfg.seed}"
+    )
+    paths = {
+        "graph": model_dir / f"{prefix}_graph_stats.csv",
+        "linear": model_dir / f"{prefix}_linearisation_rows.csv",
+        "profile": model_dir / f"{prefix}_distance_profile_rows.csv",
+        "attention": model_dir / f"{prefix}_attention_rows.csv",
+    }
+    if all(p.exists() for p in paths.values()) and not gpi_cfg.force_recompute:
+        print(f"[carriage:{spec.name}] loading cached CSVs")
+        return {k: pd.read_csv(p) for k, p in paths.items()}
+
+    cfg_obj, loaders, model = configure_model(spec, run_cfg, device)
+    ckpt = find_checkpoint(spec.run_root, spec.ckpt_path)
+    load_checkpoint(model, ckpt, device)
+    loader = split_loader(loaders, gpi_cfg.split)
+    probe = AttentionProbeManager(model, spec.family)
+    patcher = GraphOutputPatcher(model, spec.family, probe)
+    rng = np.random.default_rng(int(gpi_cfg.seed) + 77031)
+    graph_rows: List[Dict[str, Any]] = []
+    linear_rows: List[Dict[str, Any]] = []
+    profile_rows: List[Dict[str, Any]] = []
+    attention_rows: List[Dict[str, Any]] = []
+
+    try:
+        for graph_idx, batch in enumerate(loader):
+            if graph_idx >= int(gpi_cfg.carriage_max_molecules):
+                break
+            n = gpi_num_nodes(batch)
+            x = gpi_node_features(batch, n)
+            dist = gpi_distances(batch, n)
+            records = sample_swap_records(x, int(gpi_cfg.carriage_partners_per_source), rng)
+            if not records:
+                continue
+
+            clean_batch = batch.clone().to(device)
+            clean_state, grad = patcher.capture_grad(clean_batch)
+            if not clean_state.patchable or clean_state.h is None or grad is None:
+                graph_rows.append({
+                    "model": spec.name,
+                    "family": spec.family,
+                    "graph_idx": int(graph_idx),
+                    "n": int(n),
+                    "status": "skipped",
+                    "reason": clean_state.reason,
+                })
+                continue
+            grad0 = grad[0].detach()
+            h0 = clean_state.h[:1].detach()
+            y0 = clean_state.pred.detach().view(-1)[0]
+            clean_collect = probe.forward_collect(batch.clone().to(device))
+            layers = clean_collect.get("layers") or []
+            last_attn = attention_from_layer(layers[-1])[:n, :n]
+            rollout = attention_rollout_from_layers(layers, n)
+
+            c_sq = np.zeros((n, n), dtype=float)
+            c_signed = np.zeros((n, n), dtype=float)
+            counts = np.zeros(n, dtype=float)
+            graph_linear: List[Dict[str, Any]] = []
+            for start in range(0, len(records), int(gpi_cfg.source_batch_size)):
+                chunk = records[start:start + int(gpi_cfg.source_batch_size)]
+                swapped = make_swapped_batch(batch, chunk).to(device)
+                swap_state = patcher.capture(swapped)
+                if not swap_state.patchable or swap_state.h is None:
+                    continue
+                delta_h = swap_state.h[:, :n, :].detach() - h0[:, :n, :]
+                carriage = torch.einsum("qnd,nd->qn", delta_h, grad0[:n, :])
+                pred_delta = carriage.sum(dim=1).detach().cpu().numpy()
+                measured_delta = (swap_state.pred.detach().view(-1) - y0).cpu().numpy()
+                carriage_np = carriage.detach().cpu().numpy()
+                for row, (source, partner, xnorm) in enumerate(chunk):
+                    scale = max(float(xnorm), 1.0e-12)
+                    c = carriage_np[row] / scale
+                    c_sq[:, int(source)] += c ** 2
+                    c_signed[:, int(source)] += c
+                    counts[int(source)] += 1.0
+                    rec = {
+                        "model": spec.name,
+                        "family": spec.family,
+                        "graph_idx": int(graph_idx),
+                        "source": int(source),
+                        "partner": int(partner),
+                        "xnorm": float(scale),
+                        "measured_delta": float(measured_delta[row] / scale),
+                        "carriage_pred_delta": float(pred_delta[row] / scale),
+                    }
+                    rec["residual_delta"] = rec["measured_delta"] - rec["carriage_pred_delta"]
+                    graph_linear.append(rec)
+                    linear_rows.append(rec)
+
+            denom = np.maximum(counts[None, :], 1.0)
+            c_rms = np.sqrt(c_sq / denom)
+            c_mean = c_signed / denom
+            c_corrected = floor_correct_source_map_zinc(c_rms, dist, int(gpi_cfg.carriage_far_hops))
+            c_share = share_normalize(c_corrected, dist)
+            c_signed_share = share_normalize(np.abs(c_mean), dist)
+            profile_rows.extend(_distance_bin_share_rows_for_matrix(
+                spec.name, graph_idx, n, dist, c_share, "carriage_rms_share"
+            ))
+            profile_rows.extend(_distance_bin_share_rows_for_matrix(
+                spec.name, graph_idx, n, dist, c_signed_share, "carriage_abs_signed_mean_share"
+            ))
+
+            valid = np.isfinite(dist) & (dist > 0)
+            far = valid & (dist >= float(gpi_cfg.carriage_far_hops))
+            attn_last_share = attention_share(last_attn, dist)
+            attn_roll_share = attention_share(rollout, dist)
+            for attn_name, attn_mat in [
+                ("last_attention_share", attn_last_share),
+                ("rollout_attention_share", attn_roll_share),
+            ]:
+                corrs = []
+                for receiver in range(n):
+                    mask = valid[receiver]
+                    if mask.sum() >= 3 and np.std(c_share[receiver, mask]) > 0 and np.std(attn_mat[receiver, mask]) > 0:
+                        corrs.append(_spearman(c_share[receiver, mask], attn_mat[receiver, mask]))
+                attention_rows.append({
+                    "model": spec.name,
+                    "family": spec.family,
+                    "graph_idx": int(graph_idx),
+                    "attention": attn_name,
+                    "receiver_spearman_mean": float(np.nanmean(corrs)) if corrs else float("nan"),
+                    "carriage_far_mass": float(c_share[far].sum()),
+                    "attention_far_mass": float(attn_mat[far].sum()),
+                })
+
+            st_all = _effective_rank_stats(c_share)
+            st_far = _carriage_rank_null(
+                c_share, dist, int(gpi_cfg.carriage_far_hops),
+                int(gpi_cfg.carriage_null_samples), rng
+            )
+            lin = _linearisation_stats(graph_linear)
+            graph_rows.append({
+                "model": spec.name,
+                "family": spec.family,
+                "graph_idx": int(graph_idx),
+                "n": int(n),
+                "status": "ok",
+                "reason": "",
+                "swaps": int(len(graph_linear)),
+                "effective_rank": st_all["effective_rank"],
+                "rank99": st_all["rank99"],
+                "top1_energy_share": st_all["top1_energy_share"],
+                **st_far,
+                **lin,
+            })
+            if (graph_idx + 1) % max(int(gpi_cfg.verbose_every), 1) == 0:
+                print(
+                    f"[carriage:{spec.name}] {graph_idx + 1}/{gpi_cfg.carriage_max_molecules} graphs "
+                    f"| rows={len(linear_rows)}"
+                )
+    finally:
+        probe.close()
+        del model
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    dfs = {
+        "graph": pd.DataFrame(graph_rows),
+        "linear": pd.DataFrame(linear_rows),
+        "profile": pd.DataFrame(profile_rows),
+        "attention": pd.DataFrame(attention_rows),
+    }
+    for key, df in dfs.items():
+        df.to_csv(paths[key], index=False)
+        print(f"[carriage:{spec.name}] wrote {paths[key]}")
+    return dfs
+
+
+def bootstrap_carriage_graph_summary(df: pd.DataFrame, *, samples: int, seed: int) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame()
+    rng = np.random.default_rng(int(seed))
+    metrics = [
+        "linearisation_r2",
+        "linearisation_pearson",
+        "linearisation_residual_ratio",
+        "effective_rank",
+        "far_effective_rank",
+        "far_rank99",
+        "far_top1_energy_share",
+        "far_top1_minus_null",
+    ]
+    rows = []
+    ok = df[df.get("status", "ok") == "ok"].copy()
+    for model, msub in ok.groupby("model"):
+        for metric in metrics:
+            if metric not in msub:
+                continue
+            vals = msub[metric].replace([np.inf, -np.inf], np.nan).dropna().to_numpy(dtype=float)
+            mean = float(vals.mean()) if vals.size else float("nan")
+            if vals.size and samples > 0:
+                boots = []
+                for _ in range(int(samples)):
+                    idx = rng.integers(0, vals.size, size=vals.size)
+                    boots.append(float(vals[idx].mean()))
+                lo, hi = np.quantile(boots, [0.025, 0.975]).tolist()
+            else:
+                lo = hi = mean
+            rows.append({
+                "model": model,
+                "metric": metric,
+                "mean": mean,
+                "ci_low": float(lo),
+                "ci_high": float(hi),
+                "graphs": int(vals.size),
+            })
+    return pd.DataFrame(rows)
+
+
+def plot_carriage_outputs(
+    graph_summary: pd.DataFrame,
+    profile_summary: pd.DataFrame,
+    linear_rows: pd.DataFrame,
+    attention_rows: pd.DataFrame,
+    out_dir: Path,
+) -> None:
+    plt = import_plotting()
+    fig_dir = safe_mkdir(out_dir / "figures")
+    colors = {
+        "graphormer_slim": "#4f78b5",
+        "grit_rrwp": "#c2473f",
+        "graphgps_gps_rwse": "#3b8b5f",
+        "csa_sym": "#8f63b8",
+        "v19": "#555555",
+    }
+
+    prof = profile_summary[profile_summary["matrix"] == "carriage_rms_share"].copy()
+    if not prof.empty:
+        fig, ax = plt.subplots(figsize=(6.7, 4.1))
+        for model, g in prof.groupby("model"):
+            g = g.sort_values("distance")
+            color = colors.get(model)
+            ax.plot(g["distance"], g["mean"], marker="o", linewidth=2.1, color=color, label=model)
+            ax.fill_between(g["distance"], g["ci_low"], g["ci_high"], color=color, alpha=0.14)
+        ax.set_title("Gradient-Weighted Carriage by Receiver-Source Distance")
+        ax.set_xlabel("hop distance between carrier node and source atom")
+        ax.set_ylabel("share of carriage matrix mass")
+        ax.grid(axis="y", color="#dddddd", linewidth=0.6)
+        ax.legend(frameon=False)
+        fig.tight_layout()
+        path = fig_dir / "zinc_gpi_carriage_distance_profile.pdf"
+        fig.savefig(path, bbox_inches="tight")
+        plt.close(fig)
+        print(f"[plot] wrote {path}")
+
+    if not linear_rows.empty:
+        fig, axes = plt.subplots(1, 2, figsize=(10.5, 4.1))
+        sample = linear_rows.copy()
+        if len(sample) > 8000:
+            sample = sample.sample(8000, random_state=17)
+        for model, sub in sample.groupby("model"):
+            axes[0].scatter(
+                sub["measured_delta"], sub["carriage_pred_delta"],
+                s=8, alpha=0.28, linewidths=0, color=colors.get(model), label=model
+            )
+        finite = sample[["measured_delta", "carriage_pred_delta"]].replace([np.inf, -np.inf], np.nan).dropna()
+        if not finite.empty:
+            mn = float(finite.min().min())
+            mx = float(finite.max().max())
+            pad = 0.05 * max(mx - mn, 1.0e-12)
+            axes[0].plot([mn - pad, mx + pad], [mn - pad, mx + pad], color="#222222", linestyle="--", linewidth=1)
+        axes[0].set_xlabel("measured finite-swap output delta")
+        axes[0].set_ylabel(r"first-order $\sum_i g_i \cdot \Delta h_i$")
+        axes[0].set_title("Linearisation Check")
+        axes[0].grid(color="#eeeeee", linewidth=0.5)
+        axes[0].legend(frameon=False, fontsize=8)
+
+        sub = graph_summary[graph_summary["metric"] == "linearisation_residual_ratio"].copy()
+        if not sub.empty:
+            x = np.arange(len(sub))
+            vals = sub["mean"].to_numpy(dtype=float)
+            lo = sub["ci_low"].to_numpy(dtype=float)
+            hi = sub["ci_high"].to_numpy(dtype=float)
+            axes[1].bar(x, vals, color=[colors.get(m, "#777777") for m in sub["model"]], yerr=np.vstack([vals - lo, hi - vals]), capsize=3)
+            axes[1].set_xticks(x)
+            axes[1].set_xticklabels(sub["model"], rotation=25, ha="right")
+            axes[1].set_ylabel("mean |residual| / mean |measured delta|")
+            axes[1].set_title("Higher-Order Residual")
+            axes[1].grid(axis="y", color="#dddddd", linewidth=0.6)
+        fig.suptitle("Does the Carriage Matrix Reconstruct Output Changes?", y=1.03)
+        fig.tight_layout()
+        path = fig_dir / "zinc_gpi_carriage_linearisation.pdf"
+        fig.savefig(path, bbox_inches="tight")
+        plt.close(fig)
+        print(f"[plot] wrote {path}")
+
+    rank_metrics = ["far_effective_rank", "far_top1_energy_share", "far_top1_minus_null"]
+    rank = graph_summary[graph_summary["metric"].isin(rank_metrics)].copy()
+    if not rank.empty:
+        fig, axes = plt.subplots(1, 3, figsize=(12.0, 3.8), squeeze=False)
+        titles = {
+            "far_effective_rank": "Far-Matrix Effective Rank",
+            "far_top1_energy_share": "Top Singular Direction Share",
+            "far_top1_minus_null": "Top Share Above Distance Null",
+        }
+        for ax, metric in zip(axes[0], rank_metrics):
+            sub = rank[rank["metric"] == metric]
+            x = np.arange(len(sub))
+            vals = sub["mean"].to_numpy(dtype=float)
+            lo = sub["ci_low"].to_numpy(dtype=float)
+            hi = sub["ci_high"].to_numpy(dtype=float)
+            ax.bar(x, vals, color=[colors.get(m, "#777777") for m in sub["model"]], yerr=np.vstack([vals - lo, hi - vals]), capsize=3)
+            ax.set_xticks(x)
+            ax.set_xticklabels(sub["model"], rotation=25, ha="right")
+            ax.set_title(titles[metric])
+            ax.grid(axis="y", color="#dddddd", linewidth=0.6)
+        fig.suptitle("Structure of Long-Range Carriage", y=1.04)
+        fig.tight_layout()
+        path = fig_dir / "zinc_gpi_carriage_rank_null.pdf"
+        fig.savefig(path, bbox_inches="tight")
+        plt.close(fig)
+        print(f"[plot] wrote {path}")
+
+    if not attention_rows.empty:
+        attn_summary = (
+            attention_rows.groupby(["model", "attention"], as_index=False)
+            .agg(receiver_spearman_mean=("receiver_spearman_mean", "mean"),
+                 carriage_far_mass=("carriage_far_mass", "mean"),
+                 attention_far_mass=("attention_far_mass", "mean"),
+                 graphs=("graph_idx", "nunique"))
+        )
+        attn_summary.to_csv(out_dir / "zinc_gpi_carriage_attention_summary.csv", index=False)
+        fig, axes = plt.subplots(1, 2, figsize=(10.4, 4.0))
+        for attention, sub in attn_summary.groupby("attention"):
+            axes[0].scatter(
+                sub["attention_far_mass"], sub["carriage_far_mass"],
+                s=50, label=attention.replace("_", " "), alpha=0.85
+            )
+            for r in sub.itertuples(index=False):
+                axes[0].text(r.attention_far_mass, r.carriage_far_mass, r.model, fontsize=7)
+        axes[0].set_xlabel("attention far-mass")
+        axes[0].set_ylabel("carriage far-mass")
+        axes[0].set_title("Does Far Attention Carry Output-Relevant Signal?")
+        axes[0].grid(color="#eeeeee", linewidth=0.5)
+        axes[0].legend(frameon=False, fontsize=8)
+        sub = attn_summary[attn_summary["attention"] == "rollout_attention_share"].copy()
+        x = np.arange(len(sub))
+        axes[1].bar(x, sub["receiver_spearman_mean"], color=[colors.get(m, "#777777") for m in sub["model"]])
+        axes[1].set_xticks(x)
+        axes[1].set_xticklabels(sub["model"], rotation=25, ha="right")
+        axes[1].set_ylabel("Spearman(attention rollout, carriage)")
+        axes[1].set_title("Attention Faithfulness to Carriage")
+        axes[1].grid(axis="y", color="#dddddd", linewidth=0.6)
+        fig.tight_layout()
+        path = fig_dir / "zinc_gpi_carriage_attention_faithfulness.pdf"
+        fig.savefig(path, bbox_inches="tight")
+        plt.close(fig)
+        print(f"[plot] wrote {path}")
+
+
 def distance_bins_from_records(records: Sequence[Dict[str, Any]], matrix_key: str) -> pd.DataFrame:
     rows = []
     for rec in records:
@@ -9514,6 +10140,15 @@ def write_gpi_method_notes(out_dir: Path) -> None:
             "readout background and tests whether that node combines the two distant sources "
             "non-additively."
         ),
+        "carriage_matrix": (
+            "Optional --run-carriage-analysis builds C[i,j] = g_i dot delta h_i(j), where "
+            "g_i is the gradient of the graph prediction with respect to the final node state "
+            "of carrier i and delta h_i(j) is the final-state change caused by content swaps "
+            "at source j. It reports source-carrier distance profiles, first-order "
+            "reconstruction of measured graph-output deltas, far-submatrix rank against a "
+            "distance-preserving source-label shuffle null, and observational attention-vs-"
+            "carriage faithfulness."
+        ),
     }
     with (safe_mkdir(out_dir) / "methodology_notes.json").open("w", encoding="utf-8") as handle:
         json.dump(notes, handle, indent=2)
@@ -9536,6 +10171,12 @@ def run_zinc_gpi_main() -> None:
     all_profile_rows = []
     all_faithfulness = []
     relationship_frames = []
+    carriage_frames: Dict[str, List[pd.DataFrame]] = {
+        "graph": [],
+        "linear": [],
+        "profile": [],
+        "attention": [],
+    }
     for spec in specs:
         print("\n" + "#" * 80)
         print(f"[gpi] running {spec.name}")
@@ -9551,6 +10192,12 @@ def run_zinc_gpi_main() -> None:
             relationship_frames.append(
                 run_relationship_interactions_for_model(spec, run_cfg, gpi_cfg, device, out_dir)
             )
+        if gpi_cfg.run_carriage_analysis:
+            print(f"[carriage] running gradient-weighted carriage analysis for {spec.name}")
+            carriage_result = run_carriage_analysis_for_model(spec, run_cfg, gpi_cfg, device, out_dir)
+            for key, frame in carriage_result.items():
+                if key in carriage_frames and frame is not None and not frame.empty:
+                    carriage_frames[key].append(frame)
     profile_rows = pd.concat(all_profile_rows, ignore_index=True) if all_profile_rows else pd.DataFrame()
     profile_rows.to_csv(out_dir / "zinc_gpi_distance_profile_rows.csv", index=False)
     profile_summary = bootstrap_profile(
@@ -9586,6 +10233,34 @@ def run_zinc_gpi_main() -> None:
         )
         rel_summary.to_csv(out_dir / "zinc_gpi_relationship_interactions_summary.csv", index=False)
         plot_relationship_interactions(rel_rows, rel_summary, out_dir)
+    if gpi_cfg.run_carriage_analysis:
+        carriage_graph = pd.concat(carriage_frames["graph"], ignore_index=True) if carriage_frames["graph"] else pd.DataFrame()
+        carriage_linear = pd.concat(carriage_frames["linear"], ignore_index=True) if carriage_frames["linear"] else pd.DataFrame()
+        carriage_profile = pd.concat(carriage_frames["profile"], ignore_index=True) if carriage_frames["profile"] else pd.DataFrame()
+        carriage_attention = pd.concat(carriage_frames["attention"], ignore_index=True) if carriage_frames["attention"] else pd.DataFrame()
+        carriage_graph.to_csv(out_dir / "zinc_gpi_carriage_graph_stats.csv", index=False)
+        carriage_linear.to_csv(out_dir / "zinc_gpi_carriage_linearisation_rows.csv", index=False)
+        carriage_profile.to_csv(out_dir / "zinc_gpi_carriage_distance_profile_rows.csv", index=False)
+        carriage_attention.to_csv(out_dir / "zinc_gpi_carriage_attention_rows.csv", index=False)
+        carriage_graph_summary = bootstrap_carriage_graph_summary(
+            carriage_graph,
+            samples=int(gpi_cfg.bootstrap_samples),
+            seed=int(gpi_cfg.seed) + 1201,
+        )
+        carriage_graph_summary.to_csv(out_dir / "zinc_gpi_carriage_graph_summary.csv", index=False)
+        carriage_profile_summary = bootstrap_profile(
+            carriage_profile,
+            samples=int(gpi_cfg.bootstrap_samples),
+            seed=int(gpi_cfg.seed) + 1202,
+        )
+        carriage_profile_summary.to_csv(out_dir / "zinc_gpi_carriage_distance_profile_summary.csv", index=False)
+        plot_carriage_outputs(
+            carriage_graph_summary,
+            carriage_profile_summary,
+            carriage_linear,
+            carriage_attention,
+            out_dir,
+        )
     print(f"\n[done] ZINC GPI outputs at {out_dir}")
 
 
