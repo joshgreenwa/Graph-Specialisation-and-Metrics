@@ -8367,6 +8367,7 @@ class GraphOutputPatcher:
                 reason="graphgym_head_input_not_batch_with_x_and_batch",
             )
         h_dense, node_mask = dense_flat_node_states(head_batch.x, head_batch.batch)
+        pred = self._readout_graphgym_from_dense(head_batch, h_dense).to(batch.x.device)
         return GraphOutputState(
             pred=pred, h=h_dense, node_mask=node_mask, context=head_batch,
             patchable=True,
@@ -8451,8 +8452,7 @@ class GraphOutputPatcher:
         if family == "v19":
             return self._readout_v19_from_dense(h_dense, state.node_mask.to(h_dense.device))
         assert self.graphgym_head is not None
-        batch = _clone_shallow_batch_for_readout(state.context, h_dense)
-        return get_model_pred(self.graphgym_head(batch)).to(h_dense.device)
+        return self._readout_graphgym_from_dense(state.context, h_dense)
 
     def _readout_csa_from_dense(self, h_dense: torch.Tensor, node_mask: torch.Tensor) -> torch.Tensor:
         node_mask = _align_node_mask_to_dense(node_mask, h_dense)
@@ -8463,6 +8463,11 @@ class GraphOutputPatcher:
         node_mask = _align_node_mask_to_dense(node_mask, h_dense)
         pooled = (h_dense * node_mask.unsqueeze(-1).to(h_dense.dtype)).sum(dim=1)
         return self.model.readout(pooled).view(-1)
+
+    def _readout_graphgym_from_dense(self, context: Any, h_dense: torch.Tensor) -> torch.Tensor:
+        assert self.graphgym_head is not None
+        batch = _clone_shallow_batch_for_readout(context, h_dense)
+        return get_model_pred(self.graphgym_head(batch)).to(h_dense.device)
 
 
 def _build_p1_p2_dense_states(clean_h: torch.Tensor, swap_h: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -9317,7 +9322,7 @@ def run_carriage_analysis_for_model(
 ) -> Dict[str, pd.DataFrame]:
     model_dir = safe_mkdir(out_dir / spec.name)
     prefix = (
-        f"carriage_{gpi_cfg.split}_n{gpi_cfg.carriage_max_molecules}_"
+        f"carriage_v2_{gpi_cfg.split}_n{gpi_cfg.carriage_max_molecules}_"
         f"k{gpi_cfg.carriage_partners_per_source}_far{gpi_cfg.carriage_far_hops}_"
         f"seed{gpi_cfg.seed}"
     )
