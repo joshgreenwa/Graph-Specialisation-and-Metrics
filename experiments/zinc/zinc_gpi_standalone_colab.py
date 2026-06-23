@@ -149,12 +149,14 @@ import importlib
 import json
 import math
 import os
+import copy
 import random
 import re
 import subprocess
 import sys
 import time
 import warnings
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import MethodType, SimpleNamespace
@@ -2731,6 +2733,7 @@ class AttentionProbeManager:
         self.layer_modules: List[nn.Module] = []
         self.caches: List[Dict[str, Any]] = []
         self.current_ablation_plan: Optional[Dict[str, Any]] = None
+        self.collect_layers_enabled: bool = True
         self._patch()
 
     def _patch(self) -> None:
@@ -2868,14 +2871,15 @@ class AttentionProbeManager:
                     concat = head_out.transpose(1, 2).contiguous().view(B, N, E)
                     out = mha_self.out_proj(concat)
                     out = out.masked_fill(~node_mask.unsqueeze(-1), 0.0)
-                    manager.caches.append({
-                        "layer": int(mha_self._probe_layer_idx),
-                        "logits": logits.detach(),
-                        "node_mask": node_mask.detach(),
-                        "logit_mask": (node_mask[:, None, :, None]
-                                       & node_mask[:, None, None, :]).detach(),
-                        "value_output": head_out.detach(),
-                    })
+                    if manager.collect_layers_enabled:
+                        manager.caches.append({
+                            "layer": int(mha_self._probe_layer_idx),
+                            "logits": logits.detach(),
+                            "node_mask": node_mask.detach(),
+                            "logit_mask": (node_mask[:, None, :, None]
+                                           & node_mask[:, None, None, :]).detach(),
+                            "value_output": head_out.detach(),
+                        })
                     if need_weights:
                         w = attn if not average_attn_weights else attn.mean(dim=1)
                         return out, w.detach()
@@ -2958,20 +2962,21 @@ class AttentionProbeManager:
                 node_block = scores[:, :, 1:, 1:]
                 finite = torch.isfinite(node_block).all(dim=1, keepdim=True)
                 # finite is [B, 1, N, N] after the all-over-heads reduction.
-                manager.caches.append({
-                    "layer": int(mha_self._probe_layer_idx),
-                    "logits": node_block.detach(),
-                    "content_logits": content_scores[:, :, 1:, 1:].detach(),
-                    "bias_logits": attn_bias[:, :, 1:, 1:].detach(),
-                    # node_mask: any row in finite mask that has at least one
-                    # valid key.
-                    "node_mask": finite.squeeze(1).any(dim=-1).detach(),
-                    "logit_mask": finite.detach(),
-                    "value_output": head_out[:, :, 1:, :].detach(),
-                    "value_output_no_bias_attn": head_out_no_bias[:, :, 1:, :].detach(),
-                    "value_output_no_struct_value": head_out[:, :, 1:, :].detach(),
-                    "value_output_no_struct_all": head_out_no_bias[:, :, 1:, :].detach(),
-                })
+                if manager.collect_layers_enabled:
+                    manager.caches.append({
+                        "layer": int(mha_self._probe_layer_idx),
+                        "logits": node_block.detach(),
+                        "content_logits": content_scores[:, :, 1:, 1:].detach(),
+                        "bias_logits": attn_bias[:, :, 1:, 1:].detach(),
+                        # node_mask: any row in finite mask that has at least one
+                        # valid key.
+                        "node_mask": finite.squeeze(1).any(dim=-1).detach(),
+                        "logit_mask": finite.detach(),
+                        "value_output": head_out[:, :, 1:, :].detach(),
+                        "value_output_no_bias_attn": head_out_no_bias[:, :, 1:, :].detach(),
+                        "value_output_no_struct_value": head_out[:, :, 1:, :].detach(),
+                        "value_output_no_struct_all": head_out_no_bias[:, :, 1:, :].detach(),
+                    })
                 return out
 
             self.handles.append((module, original))
@@ -3064,18 +3069,19 @@ class AttentionProbeManager:
                 node_mask = batch.node_mask
                 logit_mask = (node_mask[:, None, :, None]
                               & node_mask[:, None, None, :])
-                manager.caches.append({
-                    "layer": int(layer_self._probe_layer_idx),
-                    "logits": logits_masked.detach(),
-                    "content_logits": content_logits.detach(),
-                    "bias_logits": bias.detach(),
-                    "node_mask": node_mask.detach(),
-                    "logit_mask": logit_mask.detach(),
-                    "value_output": value_output.detach(),
-                    "value_output_no_bias_attn": out_no_bias_attn.detach(),
-                    "value_output_no_struct_value": out_no_struct_value.detach(),
-                    "value_output_no_struct_all": out_no_struct_all.detach(),
-                })
+                if manager.collect_layers_enabled:
+                    manager.caches.append({
+                        "layer": int(layer_self._probe_layer_idx),
+                        "logits": logits_masked.detach(),
+                        "content_logits": content_logits.detach(),
+                        "bias_logits": bias.detach(),
+                        "node_mask": node_mask.detach(),
+                        "logit_mask": logit_mask.detach(),
+                        "value_output": value_output.detach(),
+                        "value_output_no_bias_attn": out_no_bias_attn.detach(),
+                        "value_output_no_struct_value": out_no_struct_value.detach(),
+                        "value_output_no_struct_all": out_no_struct_all.detach(),
+                    })
                 return h_out
 
             self.handles.append((module, original))
@@ -3243,18 +3249,19 @@ class AttentionProbeManager:
                 node_mask = batch.node_mask
                 logit_mask = (node_mask[:, None, :, None]
                               & node_mask[:, None, None, :])
-                manager.caches.append({
-                    "layer": int(layer_self._probe_layer_idx),
-                    "logits": logits_masked.detach(),
-                    "content_logits": content_logits.detach(),
-                    "bias_logits": bias.detach(),
-                    "node_mask": node_mask.detach(),
-                    "logit_mask": logit_mask.detach(),
-                    "value_output": value_output.detach(),
-                    "value_output_no_bias_attn": out_no_bias_attn.detach(),
-                    "value_output_no_struct_value": out_no_struct_value.detach(),
-                    "value_output_no_struct_all": out_no_struct_all.detach(),
-                })
+                if manager.collect_layers_enabled:
+                    manager.caches.append({
+                        "layer": int(layer_self._probe_layer_idx),
+                        "logits": logits_masked.detach(),
+                        "content_logits": content_logits.detach(),
+                        "bias_logits": bias.detach(),
+                        "node_mask": node_mask.detach(),
+                        "logit_mask": logit_mask.detach(),
+                        "value_output": value_output.detach(),
+                        "value_output_no_bias_attn": out_no_bias_attn.detach(),
+                        "value_output_no_struct_value": out_no_struct_value.detach(),
+                        "value_output_no_struct_all": out_no_struct_all.detach(),
+                    })
                 return h_out, z_next
 
             self.handles.append((module, original))
@@ -3394,18 +3401,19 @@ class AttentionProbeManager:
                     dense_no_struct_all, _ = dense_value_output_from_flat_heads(
                         wV_no_struct_all, batch.batch
                     )
-                    manager.caches.append({
-                        "layer": int(attn_self._probe_layer_idx),
-                        "logits": dense_logits.detach(),
-                        "content_logits": dense_content.detach(),
-                        "bias_logits": dense_bias.detach(),
-                        "node_mask": node_mask.detach(),
-                        "logit_mask": edge_mask.detach(),
-                        "value_output": dense_value.detach(),
-                        "value_output_no_bias_attn": dense_no_bias_value.detach(),
-                        "value_output_no_struct_value": dense_no_struct_value.detach(),
-                        "value_output_no_struct_all": dense_no_struct_all.detach(),
-                    })
+                    if manager.collect_layers_enabled:
+                        manager.caches.append({
+                            "layer": int(attn_self._probe_layer_idx),
+                            "logits": dense_logits.detach(),
+                            "content_logits": dense_content.detach(),
+                            "bias_logits": dense_bias.detach(),
+                            "node_mask": node_mask.detach(),
+                            "logit_mask": edge_mask.detach(),
+                            "value_output": dense_value.detach(),
+                            "value_output_no_bias_attn": dense_no_bias_value.detach(),
+                            "value_output_no_struct_value": dense_no_struct_value.detach(),
+                            "value_output_no_struct_all": dense_no_struct_all.detach(),
+                        })
                     return batch.wV, batch.get("wE", None)
 
                 self.handles.append((module, original))
@@ -3416,6 +3424,8 @@ class AttentionProbeManager:
                         collect_layers: bool = True) -> Dict[str, Any]:
         self.caches = []
         self.current_ablation_plan = ablation_plan
+        prev_collect = self.collect_layers_enabled
+        self.collect_layers_enabled = collect_layers
         try:
             out = self.model(unwrap_model_batch(batch))
             pred = get_model_pred(out).detach().cpu()
@@ -3430,6 +3440,7 @@ class AttentionProbeManager:
             layers_cpu = detach_to_cpu_tree(layers)
             return {"pred": pred, "layers": layers_cpu}
         finally:
+            self.collect_layers_enabled = prev_collect
             self.current_ablation_plan = None
             self.caches = []
 
@@ -7599,7 +7610,7 @@ class ZincGPIConfig:
     num_workers: int = 0
     seed: int = 123
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
-    target: str = "last_value"
+    target: str = "graph_output_patch"
     far_floor_hops: int = 4
     bootstrap_samples: int = 500
     focal_examples: int = 4
@@ -7626,7 +7637,7 @@ def parse_gpi_args() -> ZincGPIConfig:
     p.add_argument("--num-workers", type=int, default=ZincGPIConfig.num_workers)
     p.add_argument("--seed", type=int, default=ZincGPIConfig.seed)
     p.add_argument("--device", type=str, default=ZincGPIConfig.device)
-    p.add_argument("--target", type=str, choices=["last_value"], default=ZincGPIConfig.target)
+    p.add_argument("--target", type=str, choices=["graph_output_patch", "last_value"], default=ZincGPIConfig.target)
     p.add_argument("--far-floor-hops", type=int, default=ZincGPIConfig.far_floor_hops)
     p.add_argument("--bootstrap-samples", type=int, default=ZincGPIConfig.bootstrap_samples)
     p.add_argument("--focal-examples", type=int, default=ZincGPIConfig.focal_examples)
@@ -7963,6 +7974,252 @@ def make_swapped_batch(batch, records: Sequence[Tuple[int, int, float]]):
     return PyGBatch.from_data_list(variants)
 
 
+@dataclass
+class GraphOutputState:
+    pred: torch.Tensor
+    h: Optional[torch.Tensor]
+    node_mask: Optional[torch.Tensor]
+    context: Any
+    patchable: bool
+    reason: str = ""
+
+
+def dense_flat_node_states(x: torch.Tensor, batch_vec: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    node_mask = dense_node_mask(batch_vec)
+    B, N = node_mask.shape
+    D = int(x.size(-1))
+    out = x.new_zeros((B, N, D))
+    if x.numel() > 0:
+        pos = node_positions_from_batch(batch_vec)
+        out[batch_vec, pos, :] = x
+    return out, node_mask
+
+
+def _set_attr_if_possible(obj: Any, key: str, value: Any) -> None:
+    try:
+        setattr(obj, key, value)
+    except Exception:
+        pass
+
+
+def _clone_shallow_batch_for_readout(template: Any, h_dense: torch.Tensor) -> Any:
+    """Create a lightweight PyG/GraphGym batch for graph-head-only calls."""
+    B, N, D = h_dense.shape
+    out = copy.copy(template)
+    device = h_dense.device
+    out.x = h_dense.reshape(B * N, D)
+    out.batch = torch.arange(B, device=device, dtype=torch.long).repeat_interleave(N)
+    out.ptr = torch.arange(B + 1, device=device, dtype=torch.long) * N
+    _set_attr_if_possible(out, "_num_graphs", int(B))
+    _set_attr_if_possible(out, "num_graphs", int(B))
+    return out
+
+
+def _find_graphgym_graph_head(model: nn.Module) -> nn.Module:
+    def _resolve(path: str) -> Optional[nn.Module]:
+        cur: Any = model
+        for part in path.split("."):
+            if not hasattr(cur, part):
+                return None
+            cur = getattr(cur, part)
+        return cur if isinstance(cur, nn.Module) else None
+
+    for path in ("post_mp", "model.post_mp", "head", "model.head", "heads", "model.heads"):
+        mod = _resolve(path)
+        if mod is not None:
+            return mod
+
+    candidates: List[Tuple[int, str, nn.Module]] = []
+    for name, mod in model.named_modules():
+        if not name:
+            continue
+        cls = mod.__class__.__name__.lower()
+        lname = name.lower()
+        if lname.endswith("post_mp") or ("head" in cls and "linear" not in cls):
+            score = 0
+            if "graph" in cls:
+                score -= 10
+            if lname.endswith("post_mp"):
+                score -= 5
+            score += name.count(".")
+            candidates.append((score, name, mod))
+    if not candidates:
+        raise RuntimeError(
+            "Could not locate a GraphGym graph readout head for P1/P2 patching."
+        )
+    candidates.sort(key=lambda x: (x[0], x[1]))
+    return candidates[0][2]
+
+
+class GraphOutputPatcher:
+    """Final-state P1/P2 patcher for graph-level readouts.
+
+    For node-pooled models, P1/P2 are computed by replacing one final node state
+    and re-running the actual trained graph readout. Graph-token readouts do not
+    expose a node-pooled readout; those models are marked non-patchable and only
+    receive the direct graph-output source sensitivity.
+    """
+
+    def __init__(self, model: nn.Module, family: str,
+                 probe: Optional[AttentionProbeManager] = None):
+        self.model = model
+        self.family = family
+        self.probe = probe
+        self.graphgym_head: Optional[nn.Module] = None
+        if family in ("graphgps", "grit"):
+            self.graphgym_head = _find_graphgym_graph_head(model)
+
+    @contextmanager
+    def _without_probe_layers(self):
+        if self.probe is None:
+            yield
+            return
+        prev = self.probe.collect_layers_enabled
+        self.probe.collect_layers_enabled = False
+        self.probe.caches = []
+        try:
+            yield
+        finally:
+            self.probe.collect_layers_enabled = prev
+            self.probe.caches = []
+
+    @torch.no_grad()
+    def capture(self, batch) -> GraphOutputState:
+        native = unwrap_model_batch(batch)
+        with self._without_probe_layers():
+            if isinstance(self.model, StandaloneGraphormer):
+                return self._capture_graphormer(native)
+            if isinstance(self.model, StaticAnchorZincModel):
+                return self._capture_csa(native)
+            if isinstance(self.model, V19VariantAZincModel):
+                return self._capture_v19(native)
+            return self._capture_graphgym(native)
+
+    def _capture_graphormer(self, batch: Mapping[str, torch.Tensor]) -> GraphOutputState:
+        h = self.model.graph_node_feature(batch)
+        if self.model.emb_layer_norm is not None:
+            h = self.model.emb_layer_norm(h)
+        h = self.model.emb_dropout(h)
+        attn_bias = self.model.build_attn_bias(batch)
+        for layer in self.model.layers:
+            h = layer(h, attn_bias)
+        pred = self.model(batch).view(-1)
+        node_mask = batch["node_mask"].bool()
+        if self.model.cfg.graph_pooling == "graph_token":
+            return GraphOutputState(
+                pred=pred, h=None, node_mask=node_mask, context=None,
+                patchable=False,
+                reason="graph_token_readout_has_no_node_pooling_stage",
+            )
+        return GraphOutputState(
+            pred=pred, h=h[:, 1:, :], node_mask=node_mask,
+            context={"family": "graphormer", "pooling": self.model.cfg.graph_pooling},
+            patchable=True,
+        )
+
+    def _capture_csa(self, batch: StaticAnchorBatch) -> GraphOutputState:
+        h = self.model.atom_emb(batch.x)
+        edge_msg = self.model.bond_emb(batch.edge_attr)
+        bond_sum = h.new_zeros(h.shape)
+        if batch.edge_index.numel() > 0:
+            bond_sum.index_add_(0, batch.edge_index[1], edge_msg)
+        h = h + bond_sum + self.model.rwse_proj(batch.rwse)
+        for layer in self.model.layers:
+            h = layer(h, batch)
+        h = self.model.final_bn(h)
+        h_dense, node_mask = dense_flat_node_states(h, batch.batch_index)
+        pred = self._readout_csa_from_dense(h_dense, node_mask)
+        return GraphOutputState(pred=pred, h=h_dense, node_mask=node_mask,
+                                context={"family": "csa"}, patchable=True)
+
+    def _capture_v19(self, batch: V19VariantABatch) -> GraphOutputState:
+        h = self.model.atom_emb(batch.x)
+        edge_msg = self.model.bond_emb(batch.edge_attr)
+        bond_sum = h.new_zeros(h.shape)
+        if batch.edge_index.numel() > 0:
+            bond_sum.index_add_(0, batch.edge_index[1], edge_msg)
+        h = h + bond_sum + self.model.rwse_proj(batch.rwse)
+        z_pair = batch.pair_xi.new_zeros(batch.pair_xi.shape[:-1] + (V19_P_LATENT_PAIR,))
+        for layer in self.model.layers:
+            h, z_pair = layer(h, z_pair, batch, collect_diag=False)
+        h = self.model.final_bn(h)
+        h_dense, node_mask = dense_flat_node_states(h, batch.batch_index)
+        pred = self._readout_v19_from_dense(h_dense, node_mask)
+        return GraphOutputState(pred=pred, h=h_dense, node_mask=node_mask,
+                                context={"family": "v19"}, patchable=True)
+
+    def _capture_graphgym(self, batch) -> GraphOutputState:
+        assert self.graphgym_head is not None
+        captured: Dict[str, Any] = {}
+
+        def _pre_hook(_mod, args):
+            if args:
+                captured["batch"] = args[0]
+
+        handle = self.graphgym_head.register_forward_pre_hook(_pre_hook)
+        try:
+            out = self.model(batch)
+        finally:
+            handle.remove()
+        pred = get_model_pred(out).to(batch.x.device)
+        head_batch = captured.get("batch")
+        if head_batch is None or not hasattr(head_batch, "x") or not hasattr(head_batch, "batch"):
+            return GraphOutputState(
+                pred=pred, h=None, node_mask=None, context=None, patchable=False,
+                reason="graphgym_head_input_not_batch_with_x_and_batch",
+            )
+        h_dense, node_mask = dense_flat_node_states(head_batch.x, head_batch.batch)
+        return GraphOutputState(
+            pred=pred, h=h_dense, node_mask=node_mask, context=head_batch,
+            patchable=True,
+        )
+
+    @torch.no_grad()
+    def readout(self, state: GraphOutputState, h_dense: torch.Tensor) -> torch.Tensor:
+        if not state.patchable:
+            raise RuntimeError(f"Cannot patch this model: {state.reason}")
+        context = state.context or {}
+        family = context.get("family") if isinstance(context, Mapping) else None
+        if family == "graphormer":
+            node_mask = state.node_mask.to(device=h_dense.device, dtype=torch.bool)
+            node_h = h_dense * node_mask.unsqueeze(-1).to(h_dense.dtype)
+            if context.get("pooling") == "sum":
+                graph_repr = node_h.sum(dim=1)
+            elif context.get("pooling") == "mean":
+                denom = node_mask.sum(dim=1, keepdim=True).clamp(min=1).to(h_dense.dtype)
+                graph_repr = node_h.sum(dim=1) / denom
+            else:
+                raise RuntimeError(f"Unsupported Graphormer pooling for patching: {context.get('pooling')}")
+            return self.model.output_projection(graph_repr).view(-1)
+        if family == "csa":
+            return self._readout_csa_from_dense(h_dense, state.node_mask.to(h_dense.device))
+        if family == "v19":
+            return self._readout_v19_from_dense(h_dense, state.node_mask.to(h_dense.device))
+        assert self.graphgym_head is not None
+        batch = _clone_shallow_batch_for_readout(state.context, h_dense)
+        return get_model_pred(self.graphgym_head(batch)).to(h_dense.device)
+
+    def _readout_csa_from_dense(self, h_dense: torch.Tensor, node_mask: torch.Tensor) -> torch.Tensor:
+        pooled = (h_dense * node_mask.unsqueeze(-1).to(h_dense.dtype)).sum(dim=1)
+        return self.model.readout(pooled).view(-1)
+
+    def _readout_v19_from_dense(self, h_dense: torch.Tensor, node_mask: torch.Tensor) -> torch.Tensor:
+        pooled = (h_dense * node_mask.unsqueeze(-1).to(h_dense.dtype)).sum(dim=1)
+        return self.model.readout(pooled).view(-1)
+
+
+def _build_p1_p2_dense_states(clean_h: torch.Tensor, swap_h: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    Q, N, D = swap_h.shape
+    clean_base = clean_h[:1].expand(Q * N, N, D).clone()
+    swap_base = swap_h.repeat_interleave(N, dim=0).clone()
+    rows = torch.arange(Q * N, device=swap_h.device)
+    node_idx = torch.arange(N, device=swap_h.device).repeat(Q)
+    swap_rows = torch.arange(Q, device=swap_h.device).repeat_interleave(N)
+    clean_base[rows, node_idx, :] = swap_h[swap_rows, node_idx, :]
+    swap_base[rows, node_idx, :] = clean_h[0, node_idx, :].expand(Q * N, D)
+    return clean_base, swap_base
+
+
 def target_from_collect(collected: Mapping[str, Any], n: int) -> tuple[torch.Tensor, torch.Tensor]:
     layers = collected.get("layers") or []
     if not layers:
@@ -8029,7 +8286,14 @@ def attention_share(attn: np.ndarray, dist: np.ndarray) -> np.ndarray:
     return share_normalize(np.maximum(a, 0.0), dist)
 
 
-def compute_one_graph_gpi(spec: ModelSpec, probe: AttentionProbeManager, batch_cpu,
+def _normalise_source_vector(vec: np.ndarray) -> np.ndarray:
+    arr = np.maximum(np.asarray(vec, dtype=float), 0.0)
+    total = float(arr.sum())
+    return arr / total if total > 0 else arr
+
+
+def compute_one_graph_gpi(spec: ModelSpec, probe: AttentionProbeManager,
+                          patcher: GraphOutputPatcher, batch_cpu,
                           device: torch.device, graph_idx: int,
                           cfg: ZincGPIConfig, rng: np.random.Generator) -> Dict[str, Any]:
     n = gpi_num_nodes(batch_cpu)
@@ -8038,24 +8302,81 @@ def compute_one_graph_gpi(spec: ModelSpec, probe: AttentionProbeManager, batch_c
     records = sample_swap_records(x, cfg.partners_per_source, rng)
     if not records:
         raise RuntimeError(f"{spec.name} graph {graph_idx}: no valid swap records")
-    clean = probe.forward_collect(batch_cpu.clone().to(device))
-    clean_target, node_mask = target_from_collect(clean, n)
-    raw = np.zeros((n, n), dtype=float)
+    clean_collect = probe.forward_collect(batch_cpu.clone().to(device))
+    raw_direct = np.zeros(n, dtype=float)
     counts = np.zeros(n, dtype=float)
+    patch_status = "last_value_proxy" if cfg.target == "last_value" else "graph_output_patch"
+    patch_reason = ""
+    raw_p1 = np.zeros((n, n), dtype=float)
+    raw_p2 = np.zeros((n, n), dtype=float)
+    raw_legacy = np.zeros((n, n), dtype=float)
+    clean_state: Optional[GraphOutputState] = None
+    clean_target: Optional[torch.Tensor] = None
+
+    if cfg.target == "last_value":
+        clean_target, _node_mask = target_from_collect(clean_collect, n)
+    else:
+        clean_state = patcher.capture(batch_cpu.clone().to(device))
+        patch_status = "p1_p2" if clean_state.patchable else "direct_output_only"
+        patch_reason = clean_state.reason
+
     for start in range(0, len(records), int(cfg.source_batch_size)):
         chunk = records[start:start + int(cfg.source_batch_size)]
         swapped = make_swapped_batch(batch_cpu, chunk).to(device)
-        pert = probe.forward_collect(swapped)
-        pert_target, _ = target_from_collect(pert, n)
-        delta = pert_target - clean_target
-        norms = torch.linalg.norm(delta, dim=-1).numpy()
+        if cfg.target == "last_value":
+            pert = probe.forward_collect(swapped)
+            pert_target, _ = target_from_collect(pert, n)
+            delta = pert_target - clean_target
+            norms = torch.linalg.norm(delta, dim=-1).numpy()
+            for row, (source, _partner, xnorm) in enumerate(chunk):
+                raw_legacy[:, source] += (norms[row] / max(float(xnorm), 1.0e-12)) ** 2
+                counts[source] += 1.0
+            continue
+
+        assert clean_state is not None
+        swap_state = patcher.capture(swapped)
+        direct = torch.abs(swap_state.pred - clean_state.pred[0]).detach().cpu().numpy()
         for row, (source, _partner, xnorm) in enumerate(chunk):
-            raw[:, source] += (norms[row] / max(float(xnorm), 1.0e-12)) ** 2
+            raw_direct[source] += (float(direct[row]) / max(float(xnorm), 1.0e-12)) ** 2
             counts[source] += 1.0
-    raw = np.sqrt(raw / np.maximum(counts[None, :], 1.0))
-    corrected = floor_correct_source_map_zinc(raw, dist, cfg.far_floor_hops)
-    source_share = share_normalize(corrected, dist)
-    layers = clean.get("layers") or []
+        if clean_state.patchable and swap_state.patchable and clean_state.h is not None and swap_state.h is not None:
+            p1_h, p2_h = _build_p1_p2_dense_states(clean_state.h, swap_state.h)
+            p1_pred = patcher.readout(clean_state, p1_h).reshape(len(chunk), n)
+            p2_pred = patcher.readout(swap_state, p2_h).reshape(len(chunk), n)
+            p1 = torch.abs(p1_pred - clean_state.pred[0]).detach().cpu().numpy()
+            p2 = torch.abs(p2_pred - swap_state.pred.detach().view(-1, 1)).detach().cpu().numpy()
+            for row, (source, _partner, xnorm) in enumerate(chunk):
+                scale = max(float(xnorm), 1.0e-12)
+                raw_p1[:, source] += (p1[row] / scale) ** 2
+                raw_p2[:, source] += (p2[row] / scale) ** 2
+
+    denom = np.maximum(counts, 1.0)
+    raw_direct = np.sqrt(raw_direct / denom)
+    if cfg.target == "last_value":
+        raw = np.sqrt(raw_legacy / np.maximum(counts[None, :], 1.0))
+        corrected = floor_correct_source_map_zinc(raw, dist, cfg.far_floor_hops)
+        source_share = share_normalize(corrected, dist)
+        source_p1 = corrected
+        source_p2 = np.zeros_like(corrected)
+        source_p1_share = source_share
+        source_p2_share = np.zeros_like(source_share)
+    elif patch_status == "p1_p2":
+        raw_p1 = np.sqrt(raw_p1 / np.maximum(counts[None, :], 1.0))
+        raw_p2 = np.sqrt(raw_p2 / np.maximum(counts[None, :], 1.0))
+        source_p1 = floor_correct_source_map_zinc(raw_p1, dist, cfg.far_floor_hops)
+        source_p2 = floor_correct_source_map_zinc(raw_p2, dist, cfg.far_floor_hops)
+        source_p1_share = share_normalize(source_p1, dist)
+        source_p2_share = share_normalize(source_p2, dist)
+        source_share = source_p1_share
+    else:
+        source_p1 = np.zeros((n, n), dtype=float)
+        source_p2 = np.zeros((n, n), dtype=float)
+        source_p1_share = np.zeros((n, n), dtype=float)
+        source_p2_share = np.zeros((n, n), dtype=float)
+        source_share = source_p1_share
+
+    direct_source_share = _normalise_source_vector(raw_direct)
+    layers = clean_collect.get("layers") or []
     last_attn = attention_from_layer(layers[-1])[:n, :n]
     rollout = attention_rollout_from_layers(layers, n)
     last_share = attention_share(last_attn, dist)
@@ -8065,10 +8386,19 @@ def compute_one_graph_gpi(spec: ModelSpec, probe: AttentionProbeManager, batch_c
         "model": spec.name,
         "family": spec.family,
         "n": int(n),
+        "target": str(cfg.target),
+        "patch_status": patch_status,
+        "patch_reason": patch_reason,
         "distances": dist,
-        "raw_source_map": raw,
-        "source_map": corrected,
+        "raw_source_map": source_p1,
+        "source_map": source_p1,
         "source_share": source_share,
+        "source_p1_map": source_p1,
+        "source_p2_map": source_p2,
+        "source_p1_share": source_p1_share,
+        "source_p2_share": source_p2_share,
+        "direct_graph_output_source_map": raw_direct,
+        "direct_graph_output_source_share": direct_source_share,
         "last_attention_share": last_share,
         "rollout_attention_share": rollout_share,
         "edges": gpi_graph_edges(batch_cpu, n),
@@ -8091,13 +8421,14 @@ def run_gpi_for_model(spec: ModelSpec, run_cfg: RunConfig, gpi_cfg: ZincGPIConfi
     load_checkpoint(model, ckpt, device)
     loader = split_loader(loaders, gpi_cfg.split)
     probe = AttentionProbeManager(model, spec.family)
+    patcher = GraphOutputPatcher(model, spec.family, probe)
     records: List[Dict[str, Any]] = []
     rng = np.random.default_rng(int(gpi_cfg.seed) + 10007)
     try:
         for graph_idx, batch in enumerate(loader):
             if graph_idx >= int(gpi_cfg.max_molecules):
                 break
-            rec = compute_one_graph_gpi(spec, probe, batch, device, graph_idx, gpi_cfg, rng)
+            rec = compute_one_graph_gpi(spec, probe, patcher, batch, device, graph_idx, gpi_cfg, rng)
             records.append(rec)
             if (graph_idx + 1) % max(int(gpi_cfg.verbose_every), 1) == 0:
                 print(f"[gpi:{spec.name}] {graph_idx + 1}/{gpi_cfg.max_molecules} graphs")
@@ -8114,7 +8445,14 @@ def run_gpi_for_model(spec: ModelSpec, run_cfg: RunConfig, gpi_cfg: ZincGPIConfi
 def distance_bins_from_records(records: Sequence[Dict[str, Any]], matrix_key: str) -> pd.DataFrame:
     rows = []
     for rec in records:
+        if matrix_key in {"source_share", "source_p1_share", "source_p2_share"}:
+            if rec.get("target") == "graph_output_patch" and rec.get("patch_status") != "p1_p2":
+                continue
+        if matrix_key not in rec:
+            continue
         mat = np.asarray(rec[matrix_key], dtype=float)
+        if mat.ndim != 2:
+            continue
         dist = np.asarray(rec["distances"], dtype=float)
         valid = np.isfinite(dist) & (dist > 0)
         for d in sorted(set(dist[valid].astype(int).tolist())):
@@ -8174,7 +8512,9 @@ def _spearman(x: np.ndarray, y: np.ndarray) -> float:
 def attention_faithfulness_rows(records: Sequence[Dict[str, Any]]) -> pd.DataFrame:
     rows = []
     for rec in records:
-        source = np.asarray(rec["source_share"], dtype=float)
+        if rec.get("target") == "graph_output_patch" and rec.get("patch_status") != "p1_p2":
+            continue
+        source = np.asarray(rec.get("source_p1_share", rec["source_share"]), dtype=float)
         dist = np.asarray(rec["distances"], dtype=float)
         valid_base = np.isfinite(dist) & (dist > 0)
         for attn_key in ["last_attention_share", "rollout_attention_share"]:
@@ -8203,8 +8543,11 @@ def import_plotting():
 
 def plot_distance_profile(summary: pd.DataFrame, out_dir: Path) -> None:
     plt = import_plotting()
-    df = summary[summary["matrix"] == "source_share"].copy()
+    df = summary[summary["matrix"] == "source_p1_share"].copy()
     if df.empty:
+        df = summary[summary["matrix"] == "source_share"].copy()
+    if df.empty:
+        print("[plot] no patchable P1 source-map rows; skipping distance profile")
         return
     fig, ax = plt.subplots(figsize=(6.7, 4.1))
     colors = {
@@ -8219,9 +8562,9 @@ def plot_distance_profile(summary: pd.DataFrame, out_dir: Path) -> None:
         color = colors.get(model, None)
         ax.plot(g["distance"], g["mean"], marker="o", linewidth=2.1, color=color, label=model)
         ax.fill_between(g["distance"], g["ci_low"], g["ci_high"], color=color, alpha=0.14)
-    ax.set_title("ZINC GPI: Functional Dependence by Molecular Distance")
+    ax.set_title("ZINC GPI: Graph-Output P1 Dependence by Molecular Distance")
     ax.set_xlabel("hop distance between receiver and source atom")
-    ax.set_ylabel("share of baseline-corrected source-map mass")
+    ax.set_ylabel("share of baseline-corrected P1 source-map mass")
     ax.grid(axis="y", color="#dddddd", linewidth=0.6)
     ax.legend(frameon=False)
     fig.tight_layout()
@@ -8231,19 +8574,54 @@ def plot_distance_profile(summary: pd.DataFrame, out_dir: Path) -> None:
     print(f"[plot] wrote {path}")
 
 
+def plot_p1_p2_profiles(summary: pd.DataFrame, out_dir: Path) -> None:
+    plt = import_plotting()
+    keep = summary[summary["matrix"].isin(["source_p1_share", "source_p2_share"])].copy()
+    if keep.empty:
+        print("[plot] no P1/P2 rows; skipping P1/P2 profile")
+        return
+    models = list(keep["model"].drop_duplicates())
+    fig, axes = plt.subplots(1, len(models), figsize=(5.0 * len(models), 3.8), squeeze=False)
+    style = {
+        "source_p1_share": ("P1: inserted into clean readout", "#111111", "-"),
+        "source_p2_share": ("P2: removed from corrupted readout", "#c2473f", "--"),
+    }
+    for ax, model in zip(axes[0], models):
+        sub = keep[keep["model"] == model]
+        for matrix, g in sub.groupby("matrix"):
+            label, color, ls = style[matrix]
+            g = g.sort_values("distance")
+            ax.plot(g["distance"], g["mean"], marker="o", linewidth=2.0,
+                    color=color, linestyle=ls, label=label)
+            ax.fill_between(g["distance"], g["ci_low"], g["ci_high"], color=color, alpha=0.12)
+        ax.set_title(model)
+        ax.set_xlabel("hop distance")
+        ax.grid(axis="y", color="#dddddd", linewidth=0.6)
+    axes[0, 0].set_ylabel("source-map mass share")
+    axes[0, -1].legend(frameon=False, fontsize=8)
+    fig.suptitle("Graph-Output Source Maps: P1 Carriage vs P2 Uniqueness", y=1.03)
+    fig.tight_layout()
+    path = safe_mkdir(out_dir / "figures") / "zinc_gpi_p1_p2_distance_profile.pdf"
+    fig.savefig(path, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[plot] wrote {path}")
+
+
 def plot_attention_overlay(summary: pd.DataFrame, out_dir: Path) -> None:
     plt = import_plotting()
-    keep = summary[summary["matrix"].isin(["source_share", "last_attention_share", "rollout_attention_share"])].copy()
+    keep = summary[summary["matrix"].isin(["source_p1_share", "source_share", "last_attention_share", "rollout_attention_share"])].copy()
     if keep.empty:
         return
     models = list(keep["model"].drop_duplicates())
     fig, axes = plt.subplots(1, len(models), figsize=(5.2 * len(models), 3.9), squeeze=False)
     label_map = {
+        "source_p1_share": "GPI P1 source map",
         "source_share": "GPI source map",
         "last_attention_share": "last-layer attention",
         "rollout_attention_share": "attention rollout",
     }
     style = {
+        "source_p1_share": ("#111111", "-"),
         "source_share": ("#111111", "-"),
         "last_attention_share": ("#c2473f", "--"),
         "rollout_attention_share": ("#4f78b5", ":"),
@@ -8274,10 +8652,13 @@ def plot_attention_scatter(records_by_model: Mapping[str, Sequence[Dict[str, Any
     rng = np.random.default_rng(2027)
     models = list(records_by_model)
     fig, axes = plt.subplots(1, len(models), figsize=(5.0 * len(models), 4.0), squeeze=False)
+    sc = None
     for ax, model in zip(axes[0], models):
         xs, ys, cs = [], [], []
         for rec in records_by_model[model]:
-            source = np.asarray(rec["source_share"], dtype=float)
+            if rec.get("target") == "graph_output_patch" and rec.get("patch_status") != "p1_p2":
+                continue
+            source = np.asarray(rec.get("source_p1_share", rec["source_share"]), dtype=float)
             attn = np.asarray(rec["rollout_attention_share"], dtype=float)
             dist = np.asarray(rec["distances"], dtype=float)
             valid = np.isfinite(dist) & (dist > 0)
@@ -8289,13 +8670,19 @@ def plot_attention_scatter(records_by_model: Mapping[str, Sequence[Dict[str, Any
             xs = np.asarray(xs)[idx]
             ys = np.asarray(ys)[idx]
             cs = np.asarray(cs)[idx]
+        if len(xs) == 0:
+            ax.text(0.5, 0.5, "P1/P2 not available", ha="center", va="center",
+                    transform=ax.transAxes, fontsize=9)
+            ax.set_axis_off()
+            continue
         sc = ax.scatter(xs, ys, c=cs, s=7, alpha=0.35, cmap="viridis", linewidths=0)
         ax.set_title(model)
         ax.set_xlabel("attention rollout mass")
         ax.grid(color="#eeeeee", linewidth=0.5)
     axes[0, 0].set_ylabel("GPI source-map mass")
-    cbar = fig.colorbar(sc, ax=axes.ravel().tolist(), shrink=0.82)
-    cbar.set_label("hop distance")
+    if sc is not None:
+        cbar = fig.colorbar(sc, ax=axes.ravel().tolist(), shrink=0.82)
+        cbar.set_label("hop distance")
     fig.suptitle("Attention Is Tested Against Causal Source Maps", y=1.02)
     fig.tight_layout()
     path = safe_mkdir(out_dir / "figures") / "zinc_gpi_attention_source_scatter.pdf"
@@ -8311,6 +8698,14 @@ def plot_focal_maps(records_by_model: Mapping[str, Sequence[Dict[str, Any]]], ou
     plt = import_plotting()
     import networkx as _nx
     models = list(records_by_model)
+    models = [
+        m for m in models
+        if any(not (r.get("target") == "graph_output_patch" and r.get("patch_status") != "p1_p2")
+               for r in records_by_model[m])
+    ]
+    if not models:
+        print("[plot] no patchable P1 source maps; skipping focal maps")
+        return
     shared_graphs = set(int(r["graph_idx"]) for r in records_by_model[models[0]])
     for model in models[1:]:
         shared_graphs &= set(int(r["graph_idx"]) for r in records_by_model[model])
@@ -8335,7 +8730,7 @@ def plot_focal_maps(records_by_model: Mapping[str, Sequence[Dict[str, Any]]], ou
                 continue
             degree = dict(g.degree())
             focal = max(degree, key=degree.get)
-            influence = np.asarray(rec["source_share"], dtype=float)[focal].copy()
+            influence = np.asarray(rec.get("source_p1_share", rec["source_share"]), dtype=float)[focal].copy()
             vmax = float(max(influence.max(), 1.0e-12))
             pos = _nx.spring_layout(g, seed=gid, iterations=80)
             ax = axes[row, col]
@@ -8356,7 +8751,7 @@ def plot_focal_maps(records_by_model: Mapping[str, Sequence[Dict[str, Any]]], ou
             if col == 0:
                 ax.text(-0.05, 0.5, model, rotation=90, va="center", ha="right",
                         transform=ax.transAxes, fontsize=10)
-    fig.suptitle("Focal-Atom GPI Source Maps", y=1.02)
+    fig.suptitle("Focal-Atom Graph-Output P1 Source Maps", y=1.02)
     fig.tight_layout()
     path = safe_mkdir(out_dir / "figures") / "zinc_gpi_focal_source_maps.pdf"
     fig.savefig(path, bbox_inches="tight")
@@ -8367,10 +8762,17 @@ def plot_focal_maps(records_by_model: Mapping[str, Sequence[Dict[str, Any]]], ou
 def write_gpi_method_notes(out_dir: Path) -> None:
     notes = {
         "target_used": (
-            "Node-level source maps use the last attention layer's per-head value output "
-            "as the receiver representation. The protocol asks for final pre-pool h_i; "
-            "this is the closest uniform target exposed by the existing Graphormer/GRIT "
-            "probe path without architecture-specific readout hooks."
+            "Default source maps use graph-output P1/P2 patching on final pre-readout "
+            "node states. For a content swap s=(w,p), P1 patches h_j^s into the clean "
+            "final-state set and reruns the trained readout; P2 patches h_j^clean into "
+            "the corrupted final-state set and reruns the same readout. Source maps are "
+            "RMS over partners."
+        ),
+        "graph_token_exception": (
+            "Graph-token readouts, such as the default standalone Graphormer checkpoint, "
+            "do not expose a node-pooled readout stage. For these models the cache stores "
+            "direct graph-output source sensitivity, and P1/P2 receiver-source figures skip "
+            "the model instead of fabricating a pooled patch."
         ),
         "attention_rollout": (
             "Rollout is computed from mean-head attention with a 0.5 residual mixture per layer. "
@@ -8382,8 +8784,9 @@ def write_gpi_method_notes(out_dir: Path) -> None:
             "this should be implemented as a separate controlled pass if needed."
         ),
         "normalisation": (
-            "All GPI maps use RMS content swaps, feature-distance normalisation, per-receiver "
-            "far-floor baseline correction, and per-molecule share normalisation."
+            "P1/P2 GPI maps use RMS content swaps, feature-distance normalisation, per-receiver "
+            "far-floor baseline correction, and per-molecule share normalisation. Direct "
+            "graph-output source vectors are feature-normalised and share-normalised over sources."
         ),
     }
     with (safe_mkdir(out_dir) / "methodology_notes.json").open("w", encoding="utf-8") as handle:
@@ -8411,7 +8814,8 @@ def run_zinc_gpi_main() -> None:
         print(f"[gpi] running {spec.name}")
         records = run_gpi_for_model(spec, run_cfg, gpi_cfg, device, out_dir)
         records_by_model[spec.name] = records
-        for key in ["source_share", "last_attention_share", "rollout_attention_share"]:
+        for key in ["source_p1_share", "source_p2_share",
+                    "last_attention_share", "rollout_attention_share"]:
             all_profile_rows.append(distance_bins_from_records(records, key))
         all_faithfulness.append(attention_faithfulness_rows(records))
     profile_rows = pd.concat(all_profile_rows, ignore_index=True) if all_profile_rows else pd.DataFrame()
@@ -8432,6 +8836,7 @@ def run_zinc_gpi_main() -> None:
         )
         faith_summary.to_csv(out_dir / "zinc_gpi_attention_faithfulness_summary.csv", index=False)
     plot_distance_profile(profile_summary, out_dir)
+    plot_p1_p2_profiles(profile_summary, out_dir)
     plot_attention_overlay(profile_summary, out_dir)
     plot_attention_scatter(records_by_model, out_dir)
     plot_focal_maps(records_by_model, out_dir, gpi_cfg.focal_examples)
