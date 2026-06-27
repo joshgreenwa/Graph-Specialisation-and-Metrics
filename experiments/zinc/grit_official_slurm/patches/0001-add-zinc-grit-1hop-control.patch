@@ -1,0 +1,196 @@
+diff --git a/configs/GRIT/zinc-GRIT-RRWP-1hop.yaml b/configs/GRIT/zinc-GRIT-RRWP-1hop.yaml
+new file mode 100644
+index 0000000..2bb6c45
+--- /dev/null
++++ b/configs/GRIT/zinc-GRIT-RRWP-1hop.yaml
+@@ -0,0 +1,91 @@
++# Parameter-matched 1-hop sparse-control variant of the official ZINC GRIT RRWP config.
++#
++# This file intentionally keeps the official ZINC subset model, optimizer,
++# training schedule, RRWP dimensions, and decoder settings. The only scientific
++# intervention is `gt.attn.sparsity: one_hop`, which selects the masked RRWP edge
++# encoder added by the local patch. That encoder keeps attention/message passing
++# on original molecular bonds plus self-loops after RRWP encoding instead of the
++# official complete-graph attention. The trainable parameter count remains
++# 473,473, matching the official GRIT ZINC RRWP config.
++out_dir: results
++metric_best: mae
++metric_agg: argmin
++tensorboard_each_run: True
++accelerator: "cuda:0"
++mlflow:
++  use: False
++  project: Exp
++  name: zinc-GRIT-RRWP-1hop
++wandb:
++  use: False
++  project: ZINC
++dataset:
++  format: PyG-ZINC
++  name: subset
++  task: graph
++  task_type: regression
++  transductive: False
++  node_encoder: True
++  node_encoder_name: TypeDictNode
++  node_encoder_num_types: 21
++  node_encoder_bn: False
++  edge_encoder: True
++  edge_encoder_name: TypeDictEdge
++  edge_encoder_num_types: 4
++  edge_encoder_bn: False
++posenc_RRWP:
++  enable: True
++  ksteps: 21
++  add_identity: True
++  add_node_attr: False
++  add_inverse: False
++train:
++  mode: custom
++  batch_size: 32
++  eval_period: 1
++  enable_ckpt: True
++  ckpt_best: True
++  ckpt_clean: True
++model:
++  type: GritTransformer
++  loss_fun: l1
++  edge_decoding: dot
++  graph_pooling: add
++gt:
++  layer_type: GritTransformer
++  layers: 10
++  n_heads: 8
++  dim_hidden: 64
++  dropout: 0.0
++  layer_norm: False
++  batch_norm: True
++  update_e: True
++  attn_dropout: 0.2
++  attn:
++    clamp: 5.
++    act: 'relu'
++    full_attn: False
++    sparsity: one_hop
++    edge_enhance: True
++    O_e: True
++    norm_e: True
++    fwl: False
++gnn:
++  head: san_graph
++  layers_pre_mp: 0
++  layers_post_mp: 3
++  dim_inner: 64
++  batchnorm: True
++  act: relu
++  dropout: 0.0
++  agg: mean
++  normalize_adj: False
++optim:
++  clip_grad_norm: True
++  optimizer: adamW
++  weight_decay: 1e-5
++  base_lr: 1e-3
++  max_epoch: 2000
++  num_warmup_epochs: 50
++  scheduler: cosine_with_warmup
++  min_lr: 1e-6
+diff --git a/grit/config/gt_config.py b/grit/config/gt_config.py
+index 78df362..4f22476 100644
+--- a/grit/config/gt_config.py
++++ b/grit/config/gt_config.py
+@@ -80,9 +80,10 @@ def set_cfg_gt(cfg):
+     cfg.gt.attn.deg_scaler = True
+     cfg.gt.attn.use_bias = False
+     cfg.gt.attn.clamp = 5.
+-    cfg.gt.attn.act = "relu"
+-    cfg.gt.attn.full_attn = True
+-    cfg.gt.attn.norm_e = True
+-    cfg.gt.attn.O_e = True
+-    cfg.gt.attn.edge_enhance = True
++    cfg.gt.attn.act = "relu"
++    cfg.gt.attn.full_attn = True
++    cfg.gt.attn.sparsity = "full"
++    cfg.gt.attn.norm_e = True
++    cfg.gt.attn.O_e = True
++    cfg.gt.attn.edge_enhance = True
+ 
+diff --git a/grit/encoder/rrwp_encoder.py b/grit/encoder/rrwp_encoder.py
+index 4241e8c..a852128 100644
+--- a/grit/encoder/rrwp_encoder.py
++++ b/grit/encoder/rrwp_encoder.py
+@@ -218,8 +218,9 @@ class RRWPLinearEdgeMaskedEncoder(torch.nn.Module):
+             warnings.warn("batchnorm/layernorm might ruin some properties of pe on providing shortest-path distance info ")
+ 
+         self.fc = nn.Linear(emb_dim, out_dim, bias=use_bias)
+-        torch.nn.init.xavier_uniform_(self.fc.weight)
+-        self.fill_value = 0.
++        torch.nn.init.xavier_uniform_(self.fc.weight)
++        self.pad_to_full_graph = False
++        self.fill_value = 0.
+ 
+         padding = torch.ones(1, out_dim, dtype=torch.float) * fill_value
+         self.register_buffer("padding", padding)
+@@ -283,11 +284,12 @@ class RRWPLinearEdgeMaskedEncoder(torch.nn.Module):
+         batch.edge_index, batch.edge_attr = out_idx, out_val
+         return batch
+ 
+-    def __repr__(self):
+-        return f"{self.__class__.__name__}" \
+-               f"(pad_to_full_graph={self.pad_to_full_graph}," \
+-               f"fill_value={self.fill_value}," \
+-               f"{self.fc.__repr__()})"
++    def __repr__(self):
++        return f"{self.__class__.__name__}" \
++               f"(pad_to_full_graph={self.pad_to_full_graph}," \
++               f"fill_value={self.fill_value}," \
++               f"mask_index_name={self.mask_index_name}," \
++               f"{self.fc.__repr__()})"
+ 
+ 
+ 
+diff --git a/grit/network/grit_model.py b/grit/network/grit_model.py
+index 456ac7b..08b7e9b 100644
+--- a/grit/network/grit_model.py
++++ b/grit/network/grit_model.py
+@@ -64,16 +64,30 @@ class GritTransformer(torch.nn.Module):
+         self.ablation = True
+         self.ablation = False
+ 
+-        if cfg.posenc_RRWP.enable:
+-            self.rrwp_abs_encoder = register.node_encoder_dict["rrwp_linear"]\
+-                (cfg.posenc_RRWP.ksteps, cfg.gnn.dim_inner)
+-            rel_pe_dim = cfg.posenc_RRWP.ksteps
+-            self.rrwp_rel_encoder = register.edge_encoder_dict["rrwp_linear"] \
+-                (rel_pe_dim, cfg.gnn.dim_edge,
+-                 pad_to_full_graph=cfg.gt.attn.full_attn,
+-                 add_node_attr_as_self_loop=False,
+-                 fill_value=0.
+-                 )
++        if cfg.posenc_RRWP.enable:
++            self.rrwp_abs_encoder = register.node_encoder_dict["rrwp_linear"]\
++                (cfg.posenc_RRWP.ksteps, cfg.gnn.dim_inner)
++            rel_pe_dim = cfg.posenc_RRWP.ksteps
++            attn_sparsity = cfg.gt.attn.get("sparsity", "full")
++            if attn_sparsity == "full":
++                self.rrwp_rel_encoder = register.edge_encoder_dict["rrwp_linear"] \
++                    (rel_pe_dim, cfg.gnn.dim_edge,
++                     pad_to_full_graph=cfg.gt.attn.full_attn,
++                     add_node_attr_as_self_loop=False,
++                     fill_value=0.
++                     )
++            elif attn_sparsity == "one_hop":
++                self.rrwp_rel_encoder = register.edge_encoder_dict["masked_rrwp_linear"] \
++                    (rel_pe_dim, cfg.gnn.dim_edge,
++                     add_node_attr_as_self_loop=False,
++                     fill_value=0.,
++                     mask_index_name="edge_index",
++                     )
++            else:
++                raise ValueError(
++                    f"Unsupported cfg.gt.attn.sparsity={attn_sparsity!r}; "
++                    "expected 'full' or 'one_hop'."
++                )
+ 
+ 
+         if cfg.gnn.layers_pre_mp > 0:
