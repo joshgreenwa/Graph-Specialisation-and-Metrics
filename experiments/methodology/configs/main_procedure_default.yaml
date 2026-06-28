@@ -1,0 +1,69 @@
+artifact_root: artifacts/main_procedure
+
+dataset:
+  name: ZINC
+  split: official_subset
+  task: molecular_regression
+
+seeds: [41, 42, 43]
+primary_tau: 3
+far_thresholds: [2, 3, 4]
+
+perturbation:
+  carriage_primary: integrated_gradients
+  ig_baseline: mean_node_embedding
+  ig_steps: 32
+  swap_partners: 8
+
+models:
+  dense_grit:
+    adapter: official_grit
+    variant: official
+    role: treatment
+    official_repo: https://github.com/LiamMa/GRIT
+    repo_path: external/GRIT
+    artifact_root: /rds/user/jgg45/hpc-work/grit_zinc_results/official
+    config_path:
+    checkpoint_path:
+  grit_1hop:
+    adapter: official_grit
+    variant: 1hop
+    role: parameter_matched_control
+    official_repo: https://github.com/LiamMa/GRIT
+    repo_path: external/GRIT
+    artifact_root: /rds/user/jgg45/hpc-work/grit_zinc_results/1hop
+    config_path:
+    checkpoint_path:
+  gin:
+    adapter: pyg_gin
+    role: local_validation_reference
+    artifact_root: /rds/user/jgg45/hpc-work/grit_zinc_results/gin_reference
+  gcn:
+    adapter: pyg_gcn
+    role: local_validation_reference
+    artifact_root: /rds/user/jgg45/hpc-work/grit_zinc_results/gcn_reference
+
+steps:
+  "0":
+    name: measurement_model_validation
+    sample_graphs: 200
+  "1":
+    name: performance_gap
+    reach_sweep: [1, 2, 3, 5, dense]
+  "2":
+    name: usage_vs_causal_usage
+    sample_graphs: 200
+  "3":
+    name: distance_resolved_overfitting
+    sample_graphs: 200
+  "4":
+    name: mediator_patching
+    sample_graphs: 100
+    max_far_pairs_per_graph: 64
+  "5":
+    name: non_composable_gap_attribution
+    sample_graphs: 200
+    interaction_pairs: 1000
+
+figures:
+  dpi: 180

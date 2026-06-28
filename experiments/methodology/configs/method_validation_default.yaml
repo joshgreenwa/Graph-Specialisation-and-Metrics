@@ -1,0 +1,41 @@
+artifact_root: artifacts/method_validation
+seed: 41
+device: auto
+
+carriage:
+  num_graphs: 500
+  num_nodes: 20
+  feature_dim: 8
+  planted_set_size: 3
+  min_planted_pair_distance: 3
+  analysis_graphs: 200
+  ig_steps: 32
+  train_epochs: 250
+  learning_rate: 0.001
+  fit_mse_fraction_target_variance: 0.01
+  small_gt:
+    layers: 3
+    hidden_dim: 64
+    heads: 4
+
+patching:
+  chain_lengths: [4, 5, 6, 7, 8]
+  feature_dim: 8
+  branch_attachments: [2, 3, 4]
+
+rank:
+  matrix_size: 40
+  planted_ranks: [1, 2, 3, 5, 8]
+  noise_levels: [0.05, 0.2]
+  matrices_per_setting: 50
+  energy: 0.99
+  null_permutations: 32
+
+interaction:
+  feature_dim: 8
+  pairs: 1000
+  min_denominator: 1.0e-8
+
+figures:
+  dpi: 180
+  bootstrap_draws: 1000
