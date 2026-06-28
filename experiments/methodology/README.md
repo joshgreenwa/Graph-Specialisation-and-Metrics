@@ -16,6 +16,22 @@ python -m graph_specialisation_metrics.main_procedure run \
   --steps 0,1 --dry-run --force
 ```
 
+## Colab synthetic validation
+
+The standalone Colab runner mounts Drive, clones this GitHub repo with the Colab
+secret `diss_key`, caches prepared synthetic data and the trained validation
+model on Drive, and writes all artifacts/figures to Drive.
+
+```bash
+python experiments/methodology/colab_method_validation_core.py --mode core
+```
+
+For a quick smoke test:
+
+```bash
+python experiments/methodology/colab_method_validation_core.py --mode fast-dev
+```
+
 ## HPC launch pattern
 
 Run from the already-activated `graphbench-algoreas` environment:
