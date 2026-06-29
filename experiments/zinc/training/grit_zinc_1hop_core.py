@@ -883,6 +883,18 @@ def _insert_after(path: Path, anchor: str, insertion: str, marker: str, label: s
     return True
 
 
+def _replace_if_present(path: Path, old: str, new: str, label: str) -> bool:
+    text = _read_text_preserve_newlines(path)
+    newline = _native_newline(text)
+    old_native = old.replace("\n", newline)
+    new_native = new.replace("\n", newline)
+    if old_native not in text:
+        return False
+    _write_text_preserve_newlines(path, text.replace(old_native, new_native, 1))
+    log(f"[patch] {label}: updated")
+    return True
+
+
 def apply_parameter_matched_onehop_patch(repo_dir: Path, drive_dir: Path) -> None:
     """Apply the local 1-hop support-restriction patch to an official GRIT clone.
 
@@ -1014,6 +1026,35 @@ def apply_parameter_matched_onehop_patch(repo_dir: Path, drive_dir: Path) -> Non
         marker="import os\nimport time",
         label="custom train recovery checkpoint import",
     )
+    old_epoch_recovery_block = (
+        "\n"
+        "            if os.environ.get('GRIT_FORCE_EPOCH_CKPT', '0') == '1' and cfg.train.enable_ckpt:\n"
+        "                save_ckpt(model, optimizer, scheduler, cur_epoch)\n"
+        "                logging.info('Forced recovery checkpoint saved: %s', get_ckpt_path(get_ckpt_epoch(cur_epoch)))\n"
+    )
+    new_recovery_block = (
+        "\n"
+        "            if os.environ.get('GRIT_FORCE_RECOVERY_CKPT', '0') == '1' and cfg.train.enable_ckpt:\n"
+        "                try:\n"
+        "                    recovery_period = int(os.environ.get('GRIT_RECOVERY_CKPT_PERIOD', '100'))\n"
+        "                except ValueError:\n"
+        "                    recovery_period = 100\n"
+        "                recovery_period = max(0, recovery_period)\n"
+        "                recovery_reason = None\n"
+        "                if best_epoch == cur_epoch:\n"
+        "                    recovery_reason = 'new_best'\n"
+        "                elif recovery_period and cur_epoch > 0 and cur_epoch % recovery_period == 0:\n"
+        "                    recovery_reason = f'period_{recovery_period}'\n"
+        "                if recovery_reason is not None:\n"
+        "                    save_ckpt(model, optimizer, scheduler, cur_epoch)\n"
+        "                    logging.info('Forced recovery checkpoint saved (%s): %s', recovery_reason, get_ckpt_path(get_ckpt_epoch(cur_epoch)))\n"
+    )
+    _replace_if_present(
+        custom_train,
+        old_epoch_recovery_block,
+        new_recovery_block,
+        "custom train recovery checkpoint semantics",
+    )
     _insert_after(
         custom_train,
         anchor=(
@@ -1027,14 +1068,9 @@ def apply_parameter_matched_onehop_patch(repo_dir: Path, drive_dir: Path) -> Non
             "                f\"-----------------------------------------------------------\"\n"
             "            )\n"
         ),
-        insertion=(
-            "\n"
-            "            if os.environ.get('GRIT_FORCE_EPOCH_CKPT', '0') == '1' and cfg.train.enable_ckpt:\n"
-            "                save_ckpt(model, optimizer, scheduler, cur_epoch)\n"
-            "                logging.info('Forced recovery checkpoint saved: %s', get_ckpt_path(get_ckpt_epoch(cur_epoch)))\n"
-        ),
-        marker="GRIT_FORCE_EPOCH_CKPT",
-        label="custom train guaranteed epoch checkpoint",
+        insertion=new_recovery_block,
+        marker="GRIT_FORCE_RECOVERY_CKPT",
+        label="custom train guaranteed recovery checkpoint",
     )
 
     patch_note = drive_dir / "patches" / "zinc_grit_rrwp_1hop_patch.txt"
@@ -1131,7 +1167,7 @@ def build_training_command(args: argparse.Namespace, drive_dir: Path) -> List[st
     results_dir.mkdir(parents=True, exist_ok=True)
     dataset_dir.mkdir(parents=True, exist_ok=True)
     ckpt_best = not args.checkpoint_every_epoch
-    ckpt_clean = False if (args.keep_all_checkpoints or args.checkpoint_every_epoch) else True
+    ckpt_clean = False if (args.keep_all_checkpoints or args.checkpoint_every_epoch or args.guaranteed_checkpoints) else True
 
     # Only runtime/storage/logging overrides. Model/dataset/task/optimizer hyperparams
     # remain matched to configs/GRIT/zinc-GRIT-RRWP.yaml except for the explicit
@@ -1432,11 +1468,17 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         action="store_true",
         default=True,
         help=(
-            "Patch official GRIT custom_train.py to call GraphGym save_ckpt at the end of every epoch. "
-            "Default: enabled for Colab recovery. This changes only storage/recovery behavior."
+            "Patch official GRIT custom_train.py to call GraphGym save_ckpt when validation reaches a new best "
+            "and at periodic recovery epochs. Default: enabled for Colab recovery. This changes only storage/recovery behavior."
         ),
     )
     p.add_argument("--no-guaranteed-checkpoints", action="store_false", dest="guaranteed_checkpoints")
+    p.add_argument(
+        "--recovery-ckpt-period",
+        type=int,
+        default=100,
+        help="When --guaranteed-checkpoints is enabled, also save recovery checkpoints at official epochs divisible by this value. Default: 100. Use 0 to disable periodic recovery checkpoints.",
+    )
     argv = list(sys.argv[1:] if argv is None else argv)
     argv = _strip_colab_kernel_args(argv)
     return p.parse_args(argv)
@@ -1478,9 +1520,16 @@ def main(argv: Sequence[str] | None = None) -> None:
     wrapper_log = args.drive_dir / "wrapper_logs" / f"grit_zinc_1hop_seed{args.seed}_{time.strftime('%Y%m%d_%H%M%S')}.log"
     train_env = env_with_py312_compat(compat_shim_dir)
     if args.guaranteed_checkpoints:
-        train_env["GRIT_FORCE_EPOCH_CKPT"] = "1"
-        log("[checkpoint-guarantee] Enabled: official GRIT will save a compatible recovery checkpoint at the end of every epoch.")
+        train_env["GRIT_FORCE_RECOVERY_CKPT"] = "1"
+        train_env["GRIT_RECOVERY_CKPT_PERIOD"] = str(max(0, int(args.recovery_ckpt_period)))
+        train_env.pop("GRIT_FORCE_EPOCH_CKPT", None)
+        log(
+            "[checkpoint-guarantee] Enabled: official GRIT will save compatible recovery checkpoints "
+            f"on each new best and at official epochs divisible by {max(0, int(args.recovery_ckpt_period))}."
+        )
     else:
+        train_env.pop("GRIT_FORCE_RECOVERY_CKPT", None)
+        train_env.pop("GRIT_RECOVERY_CKPT_PERIOD", None)
         train_env.pop("GRIT_FORCE_EPOCH_CKPT", None)
         log("[checkpoint-guarantee] Disabled: using only official GraphGym checkpoint policy.")
     rc = run_streaming_to_console_and_log(
