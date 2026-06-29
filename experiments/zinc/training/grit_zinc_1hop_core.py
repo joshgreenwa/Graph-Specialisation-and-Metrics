@@ -429,6 +429,8 @@ class ConsoleFilter:
             "Parsed RWSE", "Parsed RRWP", "Precomputing Positional Encoding statistics", "Computing RRWP", "Precomputing RRWP",
             "Start from epoch", "Checkpoint found", "Task done",
             "Avg time per epoch", "Total train loop time",
+            "Forced numbered recovery checkpoint saved",
+            "Stable recovery checkpoint copied",
         )
         if stripped.startswith(setup_prefixes):
             return True
@@ -1021,10 +1023,26 @@ def apply_parameter_matched_onehop_patch(repo_dir: Path, drive_dir: Path) -> Non
         new=(
             "import logging\n"
             "import os\n"
+            "import shutil\n"
             "import time\n"
         ),
-        marker="import os\nimport time",
+        marker="import os\nimport shutil\nimport time",
         label="custom train recovery checkpoint import",
+    )
+    _replace_if_present(
+        custom_train,
+        old=(
+            "import logging\n"
+            "import os\n"
+            "import time\n"
+        ),
+        new=(
+            "import logging\n"
+            "import os\n"
+            "import shutil\n"
+            "import time\n"
+        ),
+        label="custom train recovery checkpoint shutil import",
     )
     old_epoch_recovery_block = (
         "\n"
@@ -1032,7 +1050,7 @@ def apply_parameter_matched_onehop_patch(repo_dir: Path, drive_dir: Path) -> Non
         "                save_ckpt(model, optimizer, scheduler, cur_epoch)\n"
         "                logging.info('Forced recovery checkpoint saved: %s', get_ckpt_path(get_ckpt_epoch(cur_epoch)))\n"
     )
-    new_recovery_block = (
+    old_period_recovery_block = (
         "\n"
         "            if os.environ.get('GRIT_FORCE_RECOVERY_CKPT', '0') == '1' and cfg.train.enable_ckpt:\n"
         "                try:\n"
@@ -1049,11 +1067,91 @@ def apply_parameter_matched_onehop_patch(repo_dir: Path, drive_dir: Path) -> Non
         "                    save_ckpt(model, optimizer, scheduler, cur_epoch)\n"
         "                    logging.info('Forced recovery checkpoint saved (%s): %s', recovery_reason, get_ckpt_path(get_ckpt_epoch(cur_epoch)))\n"
     )
+    old_stable_recovery_block = (
+        "\n"
+        "            if os.environ.get('GRIT_FORCE_RECOVERY_CKPT', '0') == '1' and cfg.train.enable_ckpt:\n"
+        "                try:\n"
+        "                    recovery_period = int(os.environ.get('GRIT_RECOVERY_CKPT_PERIOD', '100'))\n"
+        "                except ValueError:\n"
+        "                    recovery_period = 100\n"
+        "                recovery_period = max(0, recovery_period)\n"
+        "                recovery_reason = None\n"
+        "                if best_epoch == cur_epoch:\n"
+        "                    recovery_reason = 'new_best'\n"
+        "                elif recovery_period and cur_epoch > 0 and cur_epoch % recovery_period == 0:\n"
+        "                    recovery_reason = f'period_{recovery_period}'\n"
+        "                if recovery_reason is not None:\n"
+        "                    save_ckpt(model, optimizer, scheduler, cur_epoch)\n"
+        "                    recovery_path = get_ckpt_path(get_ckpt_epoch(cur_epoch))\n"
+        "                    logging.info('Forced numbered recovery checkpoint saved (%s): %s', recovery_reason, recovery_path)\n"
+        "                    recovery_dir = os.environ.get('GRIT_RECOVERY_CKPT_DIR', '')\n"
+        "                    if recovery_dir:\n"
+        "                        os.makedirs(recovery_dir, exist_ok=True)\n"
+        "                        shutil.copy2(recovery_path, os.path.join(recovery_dir, 'latest.ckpt'))\n"
+        "                        with open(os.path.join(recovery_dir, 'latest_epoch.txt'), 'w', encoding='utf-8') as f:\n"
+        "                            f.write(f'{cur_epoch}\\n')\n"
+        "                        if recovery_reason == 'new_best':\n"
+        "                            shutil.copy2(recovery_path, os.path.join(recovery_dir, 'best.ckpt'))\n"
+        "                            with open(os.path.join(recovery_dir, 'best_epoch.txt'), 'w', encoding='utf-8') as f:\n"
+        "                                f.write(f'{cur_epoch}\\n')\n"
+        "                        elif recovery_reason.startswith('period_'):\n"
+        "                            shutil.copy2(recovery_path, os.path.join(recovery_dir, f'{recovery_reason}_epoch{cur_epoch}.ckpt'))\n"
+        "                        logging.info('Stable recovery checkpoint copied (%s): %s', recovery_reason, recovery_dir)\n"
+    )
+    new_recovery_block = (
+        "\n"
+        "            if os.environ.get('GRIT_FORCE_RECOVERY_CKPT', '0') == '1' and cfg.train.enable_ckpt:\n"
+        "                try:\n"
+        "                    recovery_period = int(os.environ.get('GRIT_RECOVERY_CKPT_PERIOD', '100'))\n"
+        "                except ValueError:\n"
+        "                    recovery_period = 100\n"
+        "                recovery_period = max(0, recovery_period)\n"
+        "                recovery_reason = None\n"
+        "                if os.environ.get('GRIT_SAVE_FIRST_RECOVERY_CKPT', '1') == '1' and cur_epoch == start_epoch:\n"
+        "                    recovery_reason = 'first_after_resume'\n"
+        "                elif best_epoch == cur_epoch:\n"
+        "                    recovery_reason = 'new_best'\n"
+        "                elif recovery_period and cur_epoch > 0 and cur_epoch % recovery_period == 0:\n"
+        "                    recovery_reason = f'period_{recovery_period}'\n"
+        "                if recovery_reason is not None:\n"
+        "                    save_ckpt(model, optimizer, scheduler, cur_epoch)\n"
+        "                    recovery_path = get_ckpt_path(get_ckpt_epoch(cur_epoch))\n"
+        "                    logging.info('Forced numbered recovery checkpoint saved (%s): %s', recovery_reason, recovery_path)\n"
+        "                    recovery_dir = os.environ.get('GRIT_RECOVERY_CKPT_DIR', '')\n"
+        "                    if recovery_dir:\n"
+        "                        os.makedirs(recovery_dir, exist_ok=True)\n"
+        "                        shutil.copy2(recovery_path, os.path.join(recovery_dir, 'latest.ckpt'))\n"
+        "                        with open(os.path.join(recovery_dir, 'latest_epoch.txt'), 'w', encoding='utf-8') as f:\n"
+        "                            f.write(f'{cur_epoch}\\n')\n"
+        "                        if recovery_reason == 'new_best':\n"
+        "                            shutil.copy2(recovery_path, os.path.join(recovery_dir, 'best.ckpt'))\n"
+        "                            with open(os.path.join(recovery_dir, 'best_epoch.txt'), 'w', encoding='utf-8') as f:\n"
+        "                                f.write(f'{cur_epoch}\\n')\n"
+        "                        elif recovery_reason == 'first_after_resume':\n"
+        "                            shutil.copy2(recovery_path, os.path.join(recovery_dir, 'first_after_resume.ckpt'))\n"
+        "                            with open(os.path.join(recovery_dir, 'first_after_resume_epoch.txt'), 'w', encoding='utf-8') as f:\n"
+        "                                f.write(f'{cur_epoch}\\n')\n"
+        "                        elif recovery_reason.startswith('period_'):\n"
+        "                            shutil.copy2(recovery_path, os.path.join(recovery_dir, f'{recovery_reason}_epoch{cur_epoch}.ckpt'))\n"
+        "                        logging.info('Stable recovery checkpoint copied (%s): %s', recovery_reason, recovery_dir)\n"
+    )
     _replace_if_present(
         custom_train,
         old_epoch_recovery_block,
         new_recovery_block,
         "custom train recovery checkpoint semantics",
+    )
+    _replace_if_present(
+        custom_train,
+        old_period_recovery_block,
+        new_recovery_block,
+        "custom train stable best checkpoint semantics",
+    )
+    _replace_if_present(
+        custom_train,
+        old_stable_recovery_block,
+        new_recovery_block,
+        "custom train first-resume checkpoint semantics",
     )
     _insert_after(
         custom_train,
@@ -1093,6 +1191,35 @@ def apply_parameter_matched_onehop_patch(repo_dir: Path, drive_dir: Path) -> Non
 
 def install_grit_editable(repo_dir: Path) -> None:
     pip_install(["-e", str(repo_dir)])
+
+
+def verify_recovery_checkpoint_patch(repo_dir: Path) -> None:
+    custom_train = repo_dir / "grit" / "train" / "custom_train.py"
+    text = custom_train.read_text(encoding="utf-8", errors="replace")
+    required = [
+        "GRIT_FORCE_RECOVERY_CKPT",
+        "GRIT_RECOVERY_CKPT_DIR",
+        "GRIT_SAVE_FIRST_RECOVERY_CKPT",
+        "first_after_resume.ckpt",
+        "best.ckpt",
+        "latest.ckpt",
+        "Stable recovery checkpoint copied",
+        "Forced numbered recovery checkpoint saved",
+    ]
+    missing = [token for token in required if token not in text]
+    if missing:
+        raise RuntimeError(
+            "Recovery checkpoint patch is not active in the official GRIT checkout. "
+            f"Missing tokens in {custom_train}: {missing}. "
+            "Restart Colab with the latest standalone grit_zinc_1hop_core.py and pass --force-fresh-repo."
+        )
+    lines = text.splitlines()
+    hit = next(i for i, line in enumerate(lines) if "GRIT_FORCE_RECOVERY_CKPT" in line)
+    lo = max(0, hit - 2)
+    hi = min(len(lines), hit + 22)
+    log("[checkpoint-guarantee] Verified recovery checkpoint patch in official GRIT custom_train.py:")
+    for line_no in range(lo, hi):
+        log(f"[checkpoint-guarantee:source] {line_no + 1:04d}: {lines[line_no]}")
 
 
 def get_nested(d: Mapping, path: Sequence[str]):
@@ -1353,6 +1480,11 @@ def write_checkpoint_audit(drive_dir: Path, wrapper_log: Path, seed: int) -> Pat
     return audit_path
 
 
+def safe_path_fragment(value: str) -> str:
+    fragment = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value)).strip("._")
+    return fragment or "run"
+
+
 def print_environment_summary(drive_dir: Path, repo_dir: Path, commit: str) -> None:
     log("\n[env] Runtime summary")
     log(f"  platform: {platform.platform()}")
@@ -1512,6 +1644,7 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     commit = clone_or_update_repo(args.repo_dir, args.repo_url, args.branch, args.commit or None, args.force_fresh_repo)
     apply_parameter_matched_onehop_patch(args.repo_dir, args.drive_dir)
+    verify_recovery_checkpoint_patch(args.repo_dir)
     install_grit_editable(args.repo_dir)
     validate_official_config(args.repo_dir, args.allow_upstream_config_drift)
     print_environment_summary(args.drive_dir, args.repo_dir, commit)
@@ -1520,16 +1653,25 @@ def main(argv: Sequence[str] | None = None) -> None:
     wrapper_log = args.drive_dir / "wrapper_logs" / f"grit_zinc_1hop_seed{args.seed}_{time.strftime('%Y%m%d_%H%M%S')}.log"
     train_env = env_with_py312_compat(compat_shim_dir)
     if args.guaranteed_checkpoints:
+        recovery_dir = args.drive_dir / "results" / "_recovery_checkpoints" / f"seed{args.seed}_{safe_path_fragment(args.name_tag)}"
+        recovery_dir.mkdir(parents=True, exist_ok=True)
         train_env["GRIT_FORCE_RECOVERY_CKPT"] = "1"
         train_env["GRIT_RECOVERY_CKPT_PERIOD"] = str(max(0, int(args.recovery_ckpt_period)))
+        train_env["GRIT_RECOVERY_CKPT_DIR"] = str(recovery_dir)
+        train_env["GRIT_SAVE_FIRST_RECOVERY_CKPT"] = "1"
         train_env.pop("GRIT_FORCE_EPOCH_CKPT", None)
         log(
             "[checkpoint-guarantee] Enabled: official GRIT will save compatible recovery checkpoints "
-            f"on each new best and at official epochs divisible by {max(0, int(args.recovery_ckpt_period))}."
+            f"after the first completed epoch, on each new best, and at official epochs divisible by {max(0, int(args.recovery_ckpt_period))}."
         )
+        log(f"[checkpoint-guarantee] Stable best checkpoint path: {recovery_dir / 'best.ckpt'}")
+        log(f"[checkpoint-guarantee] Stable latest checkpoint path: {recovery_dir / 'latest.ckpt'}")
+        log(f"[checkpoint-guarantee] First-resume checkpoint path: {recovery_dir / 'first_after_resume.ckpt'}")
     else:
         train_env.pop("GRIT_FORCE_RECOVERY_CKPT", None)
         train_env.pop("GRIT_RECOVERY_CKPT_PERIOD", None)
+        train_env.pop("GRIT_RECOVERY_CKPT_DIR", None)
+        train_env.pop("GRIT_SAVE_FIRST_RECOVERY_CKPT", None)
         train_env.pop("GRIT_FORCE_EPOCH_CKPT", None)
         log("[checkpoint-guarantee] Disabled: using only official GraphGym checkpoint policy.")
     rc = run_streaming_to_console_and_log(
