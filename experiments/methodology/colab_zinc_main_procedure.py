@@ -39,6 +39,7 @@ DEFAULT_SECRET_NAME = "dissertation_key"
 DEFAULT_DRIVE_ROOT = "/content/drive/MyDrive/graph_specialisation_metrics/zinc_main_procedure_colab"
 DEFAULT_DENSE_DRIVE_DIR = "/content/drive/MyDrive/grit_zinc_official"
 DEFAULT_ONEHOP_DRIVE_DIR = "/content/drive/MyDrive/grit_zinc_1hop"
+DEFAULT_PYG_VERSION = "2.2.0"
 
 OFFICIAL_GRIT_REPO = "https://github.com/LiamMa/GRIT.git"
 OFFICIAL_GRIT_COMMIT = "6c988ea600a606fbb49a2246c64a2d37396b3ab5"
@@ -154,9 +155,31 @@ def run_cmd(
     safe_display: str | None = None,
     check: bool = True,
     env: Mapping[str, str] | None = None,
+    stream: bool = False,
 ) -> subprocess.CompletedProcess[str]:
     display = safe_display or " ".join(str(c) for c in cmd)
     print(f"[cmd] {display}", flush=True)
+    if stream:
+        merged_env = dict(env) if env is not None else None
+        proc = subprocess.Popen(
+            [str(c) for c in cmd],
+            cwd=str(cwd) if cwd is not None else None,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            env=merged_env,
+            bufsize=1,
+        )
+        assert proc.stdout is not None
+        lines: list[str] = []
+        for line in proc.stdout:
+            lines.append(line)
+            print(line, end="", flush=True)
+        returncode = proc.wait()
+        stdout = "".join(lines)
+        if check and returncode != 0:
+            raise RuntimeError(f"command failed with exit code {returncode}: {display}")
+        return subprocess.CompletedProcess([str(c) for c in cmd], returncode, stdout=stdout, stderr=None)
     proc = subprocess.run(
         [str(c) for c in cmd],
         cwd=str(cwd) if cwd is not None else None,
@@ -170,6 +193,10 @@ def run_cmd(
     if check and proc.returncode != 0:
         raise RuntimeError(f"command failed with exit code {proc.returncode}: {display}")
     return proc
+
+
+def pip_install(args: Sequence[str], *, check: bool = True) -> subprocess.CompletedProcess[str]:
+    return run_cmd([sys.executable, "-m", "pip", "install", *args], check=check)
 
 
 def write_json(path: Path, payload: Mapping[str, Any]) -> Path:
@@ -292,8 +319,120 @@ def clone_or_update_repo(
     run_cmd(["git", "-C", str(repo_dir), "remote", "set-url", "origin", repo_url])
 
 
-def install_repo(repo_dir: Path) -> None:
+def write_py312_compat_shim(base_dir: Path) -> Path:
+    """Create a subprocess-local compatibility shim for old GRIT/PyG deps."""
+
+    shim_dir = base_dir / "python312_compat"
+    shim_dir.mkdir(parents=True, exist_ok=True)
+    sitecustomize = shim_dir / "sitecustomize.py"
+    sitecustomize.write_text(
+        r'''
+import importlib.machinery
+import os
+import pkgutil
+import site
+import sys
+import sysconfig
+
+_preferred = []
+for _p in list(site.getsitepackages()) + [
+    sysconfig.get_paths().get("purelib", ""),
+    sysconfig.get_paths().get("platlib", ""),
+]:
+    if _p and os.path.isdir(_p) and "/usr/local/" in _p and _p not in _preferred:
+        _preferred.append(_p)
+for _p in reversed(_preferred):
+    if _p in sys.path:
+        sys.path.remove(_p)
+    sys.path.insert(1, _p)
+
+if not hasattr(pkgutil, "ImpImporter"):
+    class _CompatImpImporter:
+        pass
+    pkgutil.ImpImporter = _CompatImpImporter
+
+if not hasattr(importlib.machinery.FileFinder, "find_module"):
+    def _compat_find_module(self, fullname, path=None):
+        spec = self.find_spec(fullname)
+        return None if spec is None else spec.loader
+    importlib.machinery.FileFinder.find_module = _compat_find_module
+
+try:
+    import torch
+    _orig_torch_load = torch.load
+    def _compat_torch_load(*args, **kwargs):
+        if "weights_only" not in kwargs:
+            kwargs["weights_only"] = False
+        return _orig_torch_load(*args, **kwargs)
+    if getattr(torch.load, "__name__", "") != "_compat_torch_load":
+        torch.load = _compat_torch_load
+except Exception:
+    pass
+
+_mod = sys.modules.get("pkg_resources")
+_mod_file = getattr(_mod, "__file__", "") if _mod is not None else ""
+if _mod_file.startswith("/usr/lib/python3/dist-packages/"):
+    del sys.modules["pkg_resources"]
+
+try:
+    import inspect
+    import numpy as _np
+    import sklearn.metrics as _sk_metrics
+    _mse_sig = inspect.signature(_sk_metrics.mean_squared_error)
+    if "squared" not in _mse_sig.parameters:
+        _orig_mean_squared_error = _sk_metrics.mean_squared_error
+        def _compat_mean_squared_error(y_true, y_pred, *, sample_weight=None, multioutput="uniform_average", squared=True):
+            mse = _orig_mean_squared_error(y_true, y_pred, sample_weight=sample_weight, multioutput=multioutput)
+            return mse if squared else _np.sqrt(mse)
+        _sk_metrics.mean_squared_error = _compat_mean_squared_error
+except Exception:
+    pass
+'''.lstrip(),
+        encoding="utf-8",
+    )
+    print(f"[compat] wrote Python compatibility shim: {sitecustomize}", flush=True)
+    return shim_dir
+
+
+def env_with_py312_compat(shim_dir: Path | None) -> dict[str, str]:
+    env = os.environ.copy()
+    if shim_dir is not None:
+        old = env.get("PYTHONPATH", "")
+        env["PYTHONPATH"] = str(shim_dir) + ((os.pathsep + old) if old else "")
+    return env
+
+
+def install_repo(repo_dir: Path, *, pyg_version: str) -> None:
+    run_cmd([sys.executable, "-m", "pip", "install", "--upgrade", "pip", "setuptools", "wheel"])
     run_cmd([sys.executable, "-m", "pip", "install", "-q", "pyyaml", "networkx", "matplotlib", "numpy", "scipy", "pandas"])
+
+    import importlib
+
+    torch = importlib.import_module("torch")
+    torch_version = str(torch.__version__).split("+")[0]
+    cuda_version = getattr(torch.version, "cuda", None)
+    cuda_tag = "cu" + cuda_version.replace(".", "") if cuda_version else "cpu"
+    pyg_wheel_url = f"https://data.pyg.org/whl/torch-{torch_version}+{cuda_tag}.html"
+    print(f"[deps] Python: {sys.version.split()[0]} | torch: {torch.__version__} | CUDA: {cuda_version}", flush=True)
+    print(f"[deps] PyG wheel index: {pyg_wheel_url}", flush=True)
+
+    pip_install(["pyg-lib", "torch-scatter", "torch-sparse", "torch-cluster", "-f", pyg_wheel_url])
+    spline_proc = pip_install(["torch-spline-conv", "-f", pyg_wheel_url], check=False)
+    if spline_proc.returncode != 0:
+        print("[deps-warning] torch-spline-conv wheel unavailable; continuing because GRIT ZINC RRWP does not require it.", flush=True)
+    pip_install([f"torch-geometric=={pyg_version}"])
+    pip_install(
+        [
+            "yacs==0.1.8",
+            "pytorch-lightning==1.9.5",
+            "torchmetrics==0.9.1",
+            "opt_einsum>=3.3",
+            "tensorboardX>=2.6,<2.7",
+            "ogb==1.3.6",
+            "wandb>=0.16,<0.18",
+            "scikit-learn>=1.0",
+        ]
+    )
     run_cmd([sys.executable, "-m", "pip", "install", "-q", "-e", str(repo_dir), "--no-deps"])
     for path in [str(repo_dir), str(repo_dir / "src")]:
         if path not in sys.path:
@@ -484,6 +623,53 @@ def checkpoint_candidates(root: Path) -> list[Path]:
     return sorted(set(out), key=lambda p: (p.stat().st_mtime, str(p)), reverse=True)
 
 
+def checkpoint_epoch(path: Path) -> int | None:
+    text = str(path).lower()
+    for pattern in (
+        r"epoch[=_-]?(\d+)",
+        r"ep[=_-]?(\d+)",
+        r"ckpt[=_-]?(\d+)",
+        r"/(\d+)\.ckpt$",
+        r"/(\d+)\.(?:pt|pth)$",
+    ):
+        match = re.search(pattern, text)
+        if match:
+            return int(match.group(1))
+    try:
+        return int(path.stem)
+    except Exception:
+        return None
+
+
+def best_epoch_from_training_logs(source_drive_dir: Path, label: str) -> int | None:
+    _, summary = parse_grit_training_logs(wrapper_logs(source_drive_dir), label)
+    best_epoch = summary.get("best_epoch")
+    return int(best_epoch) if best_epoch is not None else None
+
+
+def checkpoint_from_audit(source_drive_dir: Path) -> Path | None:
+    for audit_path in [source_drive_dir / "latest_checkpoint_audit.json"]:
+        if not audit_path.exists():
+            continue
+        try:
+            with audit_path.open("r", encoding="utf-8") as f:
+                audit = json.load(f)
+        except Exception:
+            continue
+        for key in ("best_epoch_checkpoint_matches",):
+            paths = audit.get(key) or []
+            for raw_path in paths:
+                path = Path(raw_path)
+                if path.exists():
+                    return path
+        raw_latest = audit.get("latest_checkpoint_by_mtime")
+        if raw_latest:
+            latest = Path(raw_latest)
+            if latest.exists():
+                return latest
+    return None
+
+
 def choose_checkpoint(results_root: Path, label: str) -> Path:
     candidates = checkpoint_candidates(results_root)
     if not candidates:
@@ -491,8 +677,28 @@ def choose_checkpoint(results_root: Path, label: str) -> Path:
             f"No checkpoint found for {label} under {results_root}. "
             "The training run must have saved at least one best checkpoint first."
         )
+
+    source_drive_dir = results_root.parent
+    audited = checkpoint_from_audit(source_drive_dir)
+    if audited is not None and audited in candidates:
+        print(f"[checkpoint] {label}: {audited} (from latest_checkpoint_audit.json)", flush=True)
+        return audited
+
+    best_epoch = best_epoch_from_training_logs(source_drive_dir, label)
+    if best_epoch is not None:
+        matching = [path for path in candidates if checkpoint_epoch(path) == best_epoch]
+        if matching:
+            chosen = matching[0]
+            print(f"[checkpoint] {label}: {chosen} (matched parsed best epoch {best_epoch})", flush=True)
+            return chosen
+        print(
+            f"[checkpoint-warning] {label}: parsed best epoch {best_epoch}, "
+            "but no checkpoint filename matched that epoch; falling back to newest checkpoint by mtime.",
+            flush=True,
+        )
+
     chosen = candidates[0]
-    print(f"[checkpoint] {label}: {chosen}", flush=True)
+    print(f"[checkpoint] {label}: {chosen} (newest by mtime; epoch={checkpoint_epoch(chosen)})", flush=True)
     return chosen
 
 
@@ -689,7 +895,7 @@ def write_yaml(path: Path, payload: Mapping[str, Any]) -> Path:
     return path
 
 
-def run_main_procedure(repo_dir: Path, config_path: Path, *, force: bool, dry_run: bool) -> Path:
+def run_main_procedure(repo_dir: Path, config_path: Path, *, force: bool, dry_run: bool, env: Mapping[str, str] | None = None) -> Path:
     cmd = [
         sys.executable,
         "-m",
@@ -704,7 +910,7 @@ def run_main_procedure(repo_dir: Path, config_path: Path, *, force: bool, dry_ru
         cmd.append("--force")
     if dry_run:
         cmd.append("--dry-run")
-    proc = run_cmd(cmd, cwd=repo_dir, check=True)
+    proc = run_cmd(cmd, cwd=repo_dir, check=True, env=env, stream=True)
     match = re.search(r"\[done\] main procedure artifacts: (.+)", proc.stdout)
     if not match:
         raise RuntimeError("main_procedure did not report an artifact root")
@@ -795,7 +1001,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--dense-drive-dir", type=Path, default=Path(DEFAULT_DENSE_DRIVE_DIR))
     parser.add_argument("--onehop-drive-dir", type=Path, default=Path(DEFAULT_ONEHOP_DRIVE_DIR))
     parser.add_argument("--single-seed", type=int, default=0)
-    parser.add_argument("--force", action="store_true", help="Force rerun of main_procedure artifact generation.")
+    parser.add_argument(
+        "--prepared-id",
+        default="zinc_single_seed_current",
+        help="Stable prepared-artifact namespace. Keep fixed across Colab restarts to resume cached analysis.",
+    )
+    parser.add_argument("--pyg-version", default=DEFAULT_PYG_VERSION)
+    parser.add_argument("--force", action="store_true", help="Force rerun of main_procedure artifact generation instead of resuming completed steps.")
     parser.add_argument("--force-official-grit-reclone", action="store_true")
     parser.add_argument("--dry-run", action="store_true", help="Only run main_procedure discovery/status mode.")
     parser.add_argument("--allow-incomplete", action="store_true", help="Do not raise if checkpoints/dependencies are missing or a preflight is requested.")
@@ -824,7 +1036,9 @@ def main(argv: Sequence[str] | None = None) -> None:
         clone_or_update_repo(args.repo_url, args.branch, args.repo_dir, token, args.github_username)
     else:
         print(f"[git] using existing repo: {args.repo_dir}", flush=True)
-    install_repo(args.repo_dir)
+    compat_shim_dir = write_py312_compat_shim(args.drive_root)
+    analysis_env = env_with_py312_compat(compat_shim_dir)
+    install_repo(args.repo_dir, pyg_version=str(args.pyg_version))
 
     dense_repo, onehop_repo, dense_cfg, onehop_cfg = prepare_grit_repos(
         args.repo_dir,
@@ -836,7 +1050,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     dense_ckpt = choose_checkpoint(dense_results, "dense_grit")
     onehop_ckpt = choose_checkpoint(onehop_results, "grit_1hop")
 
-    prepared = args.drive_root / "prepared_model_artifacts" / time.strftime("%Y%m%d_%H%M%S")
+    prepared = args.drive_root / "prepared_model_artifacts" / str(args.prepared_id)
+    print(f"[prepared] using stable prepared artifact root: {prepared}", flush=True)
     dense_pointer = prepare_model_artifact(
         model="dense_grit",
         source_drive_dir=args.dense_drive_dir,
@@ -874,7 +1089,13 @@ def main(argv: Sequence[str] | None = None) -> None:
     )
 
     print(f"[config] wrote {config_path}", flush=True)
-    artifact_root = run_main_procedure(args.repo_dir, config_path, force=bool(args.force), dry_run=bool(args.dry_run))
+    artifact_root = run_main_procedure(
+        args.repo_dir,
+        config_path,
+        force=bool(args.force),
+        dry_run=bool(args.dry_run),
+        env=analysis_env,
+    )
     completion = assess_completion(artifact_root)
     write_methodology_fidelity_audit(
         args.drive_root / "methodology_fidelity_audit.json",
@@ -890,9 +1111,19 @@ def main(argv: Sequence[str] | None = None) -> None:
     print(f"[done] fidelity audit: {args.drive_root / 'methodology_fidelity_audit.json'}", flush=True)
 
     if completion.get("incomplete_steps") and not args.allow_incomplete:
+        incomplete_summary = {
+            step: {
+                "status": status.get("status"),
+                "name": status.get("name"),
+                "error": status.get("error"),
+            }
+            for step, status in completion.get("incomplete_steps", {}).items()
+            if isinstance(status, Mapping)
+        }
         raise SystemExit(
             "The current repo did not complete the full markdown procedure. "
-            "Artifacts were written; inspect methodology_fidelity_audit.json for the missing or failed step. "
+            f"Incomplete steps: {json.dumps(incomplete_summary, sort_keys=True)}. "
+            "Artifacts were written; inspect methodology_fidelity_audit.json for full details. "
             "Pass --allow-incomplete for discovery/preflight only."
         )
 

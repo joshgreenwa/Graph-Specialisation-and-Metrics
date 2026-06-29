@@ -13,6 +13,7 @@ import csv
 import json
 import math
 import re
+import time
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -373,23 +374,73 @@ def write_step_status(step: str, artifact_root: Path, status: Mapping[str, Any])
     write_json(artifact_root / "metrics" / f"step{step}_status.json", status)
 
 
+def read_step_status(step: str, artifact_root: Path) -> dict[str, Any] | None:
+    path = artifact_root / "metrics" / f"step{step}_status.json"
+    if not path.exists():
+        return None
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            payload = json.load(f)
+        return dict(payload) if isinstance(payload, Mapping) else None
+    except Exception:
+        return None
+
+
+def load_cached_step_statuses(steps: Sequence[str], artifact_root: Path) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for step in steps:
+        status = read_step_status(step, artifact_root)
+        if status is not None:
+            out[step] = status
+    return out
+
+
+def step_is_complete(status: Mapping[str, Any] | None) -> bool:
+    return bool(status) and str(status.get("status")) == "complete"
+
+
+def progress(message: str) -> None:
+    print(f"[main:{time.strftime('%H:%M:%S')}] {message}", flush=True)
+
+
 def run_main(config: Mapping[str, Any], *, steps: Sequence[str], dry_run: bool = False, force: bool = False) -> Path:
     artifact_root = ensure_dir(Path(str(config["artifact_root"])) / config_hash(config))
-    if (artifact_root / "manifest.json").exists() and not force and not dry_run:
+    cached_statuses = {} if force else load_cached_step_statuses(steps, artifact_root)
+    if (
+        (artifact_root / "manifest.json").exists()
+        and not force
+        and not dry_run
+        and all(step_is_complete(cached_statuses.get(step)) for step in steps)
+    ):
+        progress(f"using cached artifact root: {artifact_root}")
         return artifact_root
+    progress(f"artifact root: {artifact_root}")
     ensure_dir(artifact_root / "metrics")
     ensure_dir(artifact_root / "tensors")
     ensure_dir(artifact_root / "figures")
     write_yaml(artifact_root / "config.yaml", config)
 
+    progress("discovering model artifacts")
     discovery = [discover_model_artifacts(name, cfg) for name, cfg in config["models"].items()]
     write_json(artifact_root / "metrics" / "artifact_discovery.json", {"models": discovery})
+    for item in discovery:
+        progress(
+            f"discovered {item.get('model')}: "
+            f"{len(item.get('checkpoint_candidates', []))} checkpoint(s), "
+            f"{len(item.get('config_candidates', []))} config(s)"
+        )
+    progress("running adapter checks")
     adapter_checks = run_adapter_checks(config, discovery)
     write_json(artifact_root / "metrics" / "adapter_checks.json", adapter_checks)
+    progress(f"adapter checks complete: parameter_match={adapter_checks.get('parameter_match')}")
 
-    status_by_step: dict[str, Any] = {}
+    status_by_step: dict[str, Any] = dict(cached_statuses)
     if dry_run:
         for step in steps:
+            if not force and step_is_complete(status_by_step.get(step)):
+                progress(f"Step {step} already complete; skipping dry-run rewrite")
+                continue
+            progress(f"dry-run status for Step {step}: {config['steps'][step]['name']}")
             status = {
                 "status": "dry_run_only",
                 "step": step,
@@ -398,34 +449,40 @@ def run_main(config: Mapping[str, Any], *, steps: Sequence[str], dry_run: bool =
             }
             write_step_status(step, artifact_root, status)
             status_by_step[step] = status
+            write_json(artifact_root / "metrics" / "main_status.json", status_by_step)
     else:
         intervention_steps = [step for step in steps if step in {"0", "2", "3", "4", "5"}]
-        intervention_status: dict[str, Any] = {}
-        if intervention_steps:
-            try:
-                intervention_status = run_intervention_steps(config, discovery, artifact_root, intervention_steps)
-            except Exception as exc:
-                intervention_status = {
-                    step: {
+        for step in steps:
+            if not force and step_is_complete(status_by_step.get(step)):
+                progress(f"Step {step} already complete; reusing cached outputs")
+                continue
+            if step == "1":
+                progress("starting Step 1: performance_gap")
+                status = run_step_1(discovery, artifact_root, config)
+            elif step in intervention_steps:
+                try:
+                    progress(f"starting GRIT intervention Step {step}: {config['steps'][step]['name']}")
+                    step_status = run_intervention_steps(config, discovery, artifact_root, [step])
+                    status = step_status.get(step, {"status": "unknown_step", "step": step})
+                    progress(f"GRIT intervention Step {step} finished")
+                except Exception as exc:
+                    progress(f"GRIT intervention Step {step} failed: {exc}")
+                    status = {
                         "status": "failed",
                         "step": step,
                         "name": config["steps"][step]["name"],
                         "error": str(exc),
                         "methodology_core_available": True,
                     }
-                    for step in intervention_steps
-                }
-        for step in steps:
-            if step == "1":
-                status = run_step_1(discovery, artifact_root, config)
-            elif step in intervention_status:
-                status = intervention_status[step]
             else:  # pragma: no cover
                 status = {"status": "unknown_step", "step": step}
             write_step_status(step, artifact_root, status)
             status_by_step[step] = status
+            write_json(artifact_root / "metrics" / "main_status.json", status_by_step)
+            progress(f"Step {step} status: {status.get('status')}")
 
     write_json(artifact_root / "metrics" / "main_status.json", status_by_step)
+    progress("writing manifest")
     write_manifest(
         artifact_root,
         run_type="main_procedure",

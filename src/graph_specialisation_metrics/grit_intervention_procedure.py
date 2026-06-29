@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import math
 import random
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence
@@ -48,6 +49,21 @@ class ModelRun:
     adapter: OfficialGRITAdapter
     role: str
     variant: str
+
+
+def progress(message: str) -> None:
+    print(f"[intervention:{time.strftime('%H:%M:%S')}] {message}", flush=True)
+
+
+def progress_interval(total: int, target_messages: int = 10) -> int:
+    total = max(1, int(total))
+    return max(1, total // max(1, target_messages))
+
+
+def progress_graph(step: str, model: str, graph_idx: int, total: int, *, split: str = "test") -> None:
+    interval = progress_interval(total)
+    if graph_idx == 0 or graph_idx + 1 == total or (graph_idx + 1) % interval == 0:
+        progress(f"{step} {model} {split} graph {graph_idx + 1}/{total}")
 
 
 def safe_float(value: Any) -> float:
@@ -390,6 +406,7 @@ def render_bar(rows: Sequence[Mapping[str, Any]], artifact_root: Path, filename:
 
 
 def run_step0(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[str, Any]) -> dict[str, Any]:
+    progress("Step 0 start: measurement-model validation")
     cfg = config["steps"]["0"]
     sample_graphs = int(cfg.get("sample_graphs", 200))
     ig_steps = int(config["perturbation"].get("ig_steps", 32))
@@ -402,10 +419,12 @@ def run_step0(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
     tensors: dict[str, Any] = {}
     for model in models:
         graphs = select_graphs(model.adapter, "test", sample_graphs)
+        progress(f"Step 0 {model.name}: selected {len(graphs)} test graph(s), IG steps={ig_steps}, swap_partners={swap_partners}")
         baseline = mean_encoded_baseline(model.adapter, graphs)
         pred_vals: list[float] = []
         measured_vals: list[float] = []
         for graph_idx, graph in enumerate(graphs):
+            progress_graph("Step 0", model.name, graph_idx, len(graphs))
             gid = graph_identity("test", graph_idx, graph)
             dist = distance_matrix(graph)
             result = carriage_ig(model.adapter, graph, baseline, steps=ig_steps)
@@ -477,6 +496,7 @@ def run_step0(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
                 "graphs": len(graphs),
             }
         )
+        progress(f"Step 0 {model.name}: complete, reconstruction_rows={len([r for r in recon_rows if r.get('model') == model.name])}")
     write_csv(artifact_root / "metrics" / "step0_reconstruction.csv", recon_rows)
     write_csv(artifact_root / "metrics" / "step0_profile_agreement.csv", profile_rows)
     write_csv(artifact_root / "metrics" / "step0_summary.csv", summaries)
@@ -496,6 +516,7 @@ def run_step0(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
         dpi=dpi,
     )
     render_distance_profile(profile_rows, artifact_root, "step0_swap_vs_ig_profiles", "Step 0: estimator agreement, swap vs IG", dpi=dpi)
+    progress("Step 0 complete: metrics, tensors, and figures written")
     return {"status": "complete", "models": [m.name for m in models], "summary": summaries}
 
 
@@ -524,6 +545,7 @@ def render_step0_reconstruction(rows: Sequence[Mapping[str, Any]], artifact_root
 
 
 def run_step2(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[str, Any]) -> dict[str, Any]:
+    progress("Step 2 start: usage vs causal usage")
     cfg = config["steps"]["2"]
     sample_graphs = int(cfg.get("sample_graphs", 200))
     ig_steps = int(config["perturbation"].get("ig_steps", 32))
@@ -536,8 +558,10 @@ def run_step2(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
     tensors: dict[str, Any] = {}
     for model in models:
         graphs = select_graphs(model.adapter, "test", sample_graphs)
+        progress(f"Step 2 {model.name}: selected {len(graphs)} test graph(s), IG steps={ig_steps}, tau={tau}")
         baseline = mean_encoded_baseline(model.adapter, graphs)
         for graph_idx, graph in enumerate(graphs):
+            progress_graph("Step 2", model.name, graph_idx, len(graphs))
             gid = graph_identity("test", graph_idx, graph)
             dist = distance_matrix(graph)
             result = carriage_ig(model.adapter, graph, baseline, steps=ig_steps)
@@ -576,6 +600,7 @@ def run_step2(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
     final_channel_rows = [r for r in channel_rows if bool(r.get("headline_final_layer"))]
     render_distance_profile(final_channel_rows, artifact_root, "step2_channel_split_distance", "Step 2: final-layer carriage by channel and distance", dpi=dpi)
     render_layer_resolved_channel_split(channel_rows, artifact_root, dpi=dpi)
+    progress("Step 2 complete: metrics, tensors, and figures written")
     return {"status": "complete", "models": [m.name for m in models], "profile_rows": len(profile_rows), "faithfulness_rows": len(faith_rows)}
 
 
@@ -771,6 +796,7 @@ def render_step2_faithfulness(rows: Sequence[Mapping[str, Any]], artifact_root: 
     plt.close(fig)
 
 def run_step3(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[str, Any]) -> dict[str, Any]:
+    progress("Step 3 start: train/test distance-resolved overfitting")
     dense_models = [m for m in models if m.name == "dense_grit"] or list(models[:1])
     if not dense_models:
         return {"status": "skipped_no_dense_grit"}
@@ -782,8 +808,10 @@ def run_step3(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
     rows: list[dict[str, Any]] = []
     for split in ["train", "test"]:
         graphs = select_graphs(model.adapter, split, sample_graphs)
+        progress(f"Step 3 {model.name}: selected {len(graphs)} {split} graph(s), IG steps={ig_steps}")
         baseline = mean_encoded_baseline(model.adapter, graphs)
         for graph_idx, graph in enumerate(graphs):
+            progress_graph("Step 3", model.name, graph_idx, len(graphs), split=split)
             gid = graph_identity(split, graph_idx, graph)
             dist = distance_matrix(graph)
             c = carriage_ig(model.adapter, graph, baseline, steps=ig_steps)["carriage"]
@@ -793,6 +821,7 @@ def run_step3(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
     gap_rows = train_test_gap_rows(rows, int(config.get("primary_tau", 3)))
     write_csv(artifact_root / "metrics" / "step3_train_minus_test_gap.csv", gap_rows)
     render_step3(rows, gap_rows, artifact_root, dpi=dpi)
+    progress("Step 3 complete: metrics and figures written")
     return {"status": "complete", "model": model.name, "profile_rows": len(rows)}
 
 
@@ -914,6 +943,7 @@ def patched_ig_pair(
 
 
 def run_step4(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[str, Any]) -> dict[str, Any]:
+    progress("Step 4 start: mediator patching")
     cfg = config["steps"]["4"]
     sample_graphs = int(cfg.get("sample_graphs", 100))
     max_pairs = int(cfg.get("max_far_pairs_per_graph", 64))
@@ -927,8 +957,10 @@ def run_step4(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
     tensors: dict[str, Any] = {}
     for model in models:
         graphs = select_graphs(model.adapter, "test", sample_graphs)
+        progress(f"Step 4 {model.name}: selected {len(graphs)} test graph(s), max_far_pairs_per_graph={max_pairs}, IG steps={ig_steps}")
         baseline = mean_encoded_baseline(model.adapter, graphs)
         for graph_idx, graph in enumerate(graphs):
+            progress_graph("Step 4", model.name, graph_idx, len(graphs))
             gid = graph_identity("test", graph_idx, graph)
             dist = distance_matrix(graph)
             result = carriage_ig(model.adapter, graph, baseline, steps=ig_steps)
@@ -938,6 +970,9 @@ def run_step4(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
             selected = far_pairs(dist, selection_tau, max_pairs=max_pairs, seed=seed + graph_idx)
             direct_matrix = torch.zeros_like(c)
             for pair_idx, (carrier, source) in enumerate(selected):
+                pair_interval = progress_interval(len(selected), target_messages=4)
+                if pair_idx == 0 or pair_idx + 1 == len(selected) or (pair_idx + 1) % pair_interval == 0:
+                    progress(f"Step 4 {model.name} graph {graph_idx + 1}/{len(graphs)}: patched pair {pair_idx + 1}/{len(selected)}")
                 cut = mediator_cut(graph, carrier, source)
                 if not cut:
                     continue
@@ -1003,6 +1038,7 @@ def run_step4(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
     write_csv(artifact_root / "metrics" / "step4_mediator_validation_summary.csv", validation_summary)
     atomic_torch_save(artifact_root / "tensors" / "step4_mediator_patching.pt", tensors)
     render_step4(rows, depth_rows, validation_summary, artifact_root, dpi=dpi)
+    progress("Step 4 complete: metrics, tensors, and figures written")
     return {"status": "complete", "patch_rows": len(rows), "depth_rows": len(depth_rows)}
 
 
@@ -1074,6 +1110,7 @@ def render_step4(rows: Sequence[Mapping[str, Any]], depth_rows: Sequence[Mapping
 
 
 def run_step5(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[str, Any]) -> dict[str, Any]:
+    progress("Step 5 start: non-composable gap attribution")
     dense = next((m for m in models if m.name == "dense_grit"), None)
     onehop = next((m for m in models if m.name == "grit_1hop"), None)
     if dense is None or onehop is None:
@@ -1096,6 +1133,7 @@ def run_step5(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
     interaction_rows: list[dict[str, Any]] = []
     rng = random.Random(seed)
     for graph_idx, graph in enumerate(graphs):
+        progress_graph("Step 5", dense.name, graph_idx, len(graphs))
         gid = graph_identity("test", graph_idx, graph)
         dist = distance_matrix(graph)
         result = carriage_ig(dense.adapter, graph, dense_base, steps=ig_steps)
@@ -1104,7 +1142,10 @@ def run_step5(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
         readout_grad = result["readout_gradient"]
         direct = torch.zeros_like(c)
         selected = far_pairs(dist, selection_tau, max_pairs=max_pairs, seed=seed + graph_idx)
-        for carrier, source in selected:
+        for pair_idx, (carrier, source) in enumerate(selected):
+            pair_interval = progress_interval(len(selected), target_messages=4)
+            if pair_idx == 0 or pair_idx + 1 == len(selected) or (pair_idx + 1) % pair_interval == 0:
+                progress(f"Step 5 dense_grit graph {graph_idx + 1}/{len(graphs)}: patched pair {pair_idx + 1}/{len(selected)}")
             cut = mediator_cut(graph, carrier, source)
             if not cut:
                 continue
@@ -1172,6 +1213,7 @@ def run_step5(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
     write_csv(artifact_root / "metrics" / "step5_vnode_decision.csv", [vnode_decision])
     render_step5(gap_rows, rank_rows, interaction_rows, artifact_root, dpi=dpi)
     render_step5_vnode_decision(vnode_decision, artifact_root, dpi=dpi)
+    progress("Step 5 complete: metrics, tensors, and figures written")
     return {"status": "complete", "gap_rows": len(gap_rows), "rank_rows": len(rank_rows), "interaction_rows": len(interaction_rows)}
 
 
@@ -1428,8 +1470,10 @@ def render_step5_vnode_decision(decision: Mapping[str, Any], artifact_root: Path
 
 
 def run_intervention_steps(config: Mapping[str, Any], discovery: Sequence[Mapping[str, Any]], artifact_root: Path, steps: Sequence[str]) -> dict[str, Any]:
+    progress(f"instantiating official GRIT adapters for steps: {','.join(steps)}")
     models = instantiate_official_models(config, discovery)
     if not models:
+        progress("no official GRIT model artifacts available for intervention steps")
         return {
             step: {
                 "status": "waiting_for_official_grit_artifacts",
@@ -1455,8 +1499,11 @@ def run_intervention_steps(config: Mapping[str, Any], discovery: Sequence[Mappin
         if step not in runners:
             continue
         try:
+            progress(f"running Step {step}: {config['steps'][step]['name']}")
             status[step] = runners[step]()
+            progress(f"finished Step {step}: {status[step].get('status')}")
         except Exception as exc:
+            progress(f"failed Step {step}: {exc}")
             status[step] = {
                 "status": "failed",
                 "step": step,

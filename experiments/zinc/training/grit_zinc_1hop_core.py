@@ -50,6 +50,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import json
 import os
 import platform
 import re
@@ -864,6 +865,24 @@ def _replace_exact(path: Path, old: str, new: str, marker: str, label: str) -> b
     return True
 
 
+def _insert_after(path: Path, anchor: str, insertion: str, marker: str, label: str) -> bool:
+    text = _read_text_preserve_newlines(path)
+    if marker in text:
+        log(f"[patch] {label}: already present")
+        return False
+    newline = _native_newline(text)
+    anchor_native = anchor.replace("\n", newline)
+    insertion_native = insertion.replace("\n", newline)
+    if anchor_native not in text:
+        raise RuntimeError(
+            f"Could not apply 1-hop patch insertion `{label}` to {path}. "
+            "The official GRIT source differs from the pinned layout."
+        )
+    _write_text_preserve_newlines(path, text.replace(anchor_native, anchor_native + insertion_native, 1))
+    log(f"[patch] {label}: applied")
+    return True
+
+
 def apply_parameter_matched_onehop_patch(repo_dir: Path, drive_dir: Path) -> None:
     """Apply the local 1-hop support-restriction patch to an official GRIT clone.
 
@@ -980,6 +999,44 @@ def apply_parameter_matched_onehop_patch(repo_dir: Path, drive_dir: Path) -> Non
         label="GritTransformer RRWP sparsity switch",
     )
 
+    custom_train = repo_dir / "grit" / "train" / "custom_train.py"
+    _replace_exact(
+        custom_train,
+        old=(
+            "import logging\n"
+            "import time\n"
+        ),
+        new=(
+            "import logging\n"
+            "import os\n"
+            "import time\n"
+        ),
+        marker="import os\nimport time",
+        label="custom train recovery checkpoint import",
+    )
+    _insert_after(
+        custom_train,
+        anchor=(
+            "            logging.info(\n"
+            "                f\"> Epoch {cur_epoch}: took {full_epoch_times[-1]:.1f}s \"\n"
+            "                f\"(avg {np.mean(full_epoch_times):.1f}s) | \"\n"
+            "                f\"Best so far: epoch {best_epoch}\\t\"\n"
+            "                f\"train_loss: {perf[0][best_epoch]['loss']:.4f} {best_train}\\t\"\n"
+            "                f\"val_loss: {perf[1][best_epoch]['loss']:.4f} {best_val}\\t\" \n"
+            "                f\"test_loss: {perf[2][best_epoch]['loss']:.4f} {best_test}\\n\"\n"
+            "                f\"-----------------------------------------------------------\"\n"
+            "            )\n"
+        ),
+        insertion=(
+            "\n"
+            "            if os.environ.get('GRIT_FORCE_EPOCH_CKPT', '0') == '1' and cfg.train.enable_ckpt:\n"
+            "                save_ckpt(model, optimizer, scheduler, cur_epoch)\n"
+            "                logging.info('Forced recovery checkpoint saved: %s', get_ckpt_path(get_ckpt_epoch(cur_epoch)))\n"
+        ),
+        marker="GRIT_FORCE_EPOCH_CKPT",
+        label="custom train guaranteed epoch checkpoint",
+    )
+
     patch_note = drive_dir / "patches" / "zinc_grit_rrwp_1hop_patch.txt"
     patch_note.parent.mkdir(parents=True, exist_ok=True)
     patch_note.write_text(
@@ -1073,13 +1130,16 @@ def build_training_command(args: argparse.Namespace, drive_dir: Path) -> List[st
     dataset_dir = drive_dir / "datasets"
     results_dir.mkdir(parents=True, exist_ok=True)
     dataset_dir.mkdir(parents=True, exist_ok=True)
+    ckpt_best = not args.checkpoint_every_epoch
+    ckpt_clean = False if (args.keep_all_checkpoints or args.checkpoint_every_epoch) else True
 
     # Only runtime/storage/logging overrides. Model/dataset/task/optimizer hyperparams
     # remain matched to configs/GRIT/zinc-GRIT-RRWP.yaml except for the explicit
     # 1-hop attention-support intervention in OFFICIAL_CFG. max_epoch=2000 and
     # eval_period=1 are repeated defensively because the requested run length is exact
-    # and these are also the paper/config values. Checkpoint mode is deliberately NOT
-    # overridden: the official GRIT config uses ckpt_best=True and ckpt_clean=True.
+    # and these are also the paper/config values. By default checkpoint mode matches
+    # the official ZINC config. Optional Colab recovery flags change storage policy
+    # only, not the model/data/optimizer/schedule.
     cmd = [
         sys.executable,
         "-u",
@@ -1104,6 +1164,12 @@ def build_training_command(args: argparse.Namespace, drive_dir: Path) -> List[st
         "1",
         "train.enable_ckpt",
         "True",
+        "train.ckpt_period",
+        str(args.ckpt_period),
+        "train.ckpt_best",
+        "True" if ckpt_best else "False",
+        "train.ckpt_clean",
+        "True" if ckpt_clean else "False",
         "train.auto_resume",
         "True" if args.auto_resume else "False",
         "num_threads",
@@ -1112,6 +1178,143 @@ def build_training_command(args: argparse.Namespace, drive_dir: Path) -> List[st
     if args.accelerator:
         cmd.extend(["accelerator", args.accelerator])
     return cmd
+
+
+def checkpoint_candidates(root: Path) -> list[Path]:
+    patterns = ["*.ckpt", "*checkpoint*.pt", "*checkpoint*.pth", "best*.pt", "best*.pth", "model*.pt"]
+    out: list[Path] = []
+    if root.exists():
+        for pattern in patterns:
+            out.extend(path for path in root.rglob(pattern) if path.is_file())
+    return sorted(set(out), key=lambda p: (p.stat().st_mtime, str(p)), reverse=True)
+
+
+def checkpoint_epoch(path: Path) -> int | None:
+    text = str(path).lower()
+    for pattern in (
+        r"epoch[=_-]?(\d+)",
+        r"ep[=_-]?(\d+)",
+        r"ckpt[=_-]?(\d+)",
+        r"/(\d+)\.ckpt$",
+        r"/(\d+)\.(?:pt|pth)$",
+    ):
+        match = re.search(pattern, text)
+        if match:
+            return int(match.group(1))
+    try:
+        return int(path.stem)
+    except Exception:
+        return None
+
+
+def parse_training_summary_from_logs(log_paths: Sequence[Path]) -> dict:
+    by_epoch: dict[int, dict[str, dict]] = {}
+    for path in log_paths:
+        try:
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except Exception:
+            continue
+        for line in lines:
+            stripped = line.strip()
+            for split in ("train", "val", "test"):
+                prefix = f"{split}: "
+                if not stripped.startswith(prefix):
+                    continue
+                payload = stripped[len(prefix):]
+                if not payload.startswith("{"):
+                    continue
+                try:
+                    stats = ast.literal_eval(payload)
+                    epoch = int(stats.get("epoch"))
+                except Exception:
+                    continue
+                by_epoch.setdefault(epoch, {})[split] = stats
+
+    best_epoch: int | None = None
+    best_val_mae = float("inf")
+    for epoch, splits in sorted(by_epoch.items()):
+        val = splits.get("val", {})
+        try:
+            val_mae = float(val.get("mae", val.get("loss", float("inf"))))
+        except Exception:
+            val_mae = float("inf")
+        if val_mae < best_val_mae:
+            best_epoch = epoch
+            best_val_mae = val_mae
+
+    best_splits = by_epoch.get(best_epoch, {}) if best_epoch is not None else {}
+    return {
+        "history_epochs": len(by_epoch),
+        "best_epoch": best_epoch,
+        "best_train": best_splits.get("train", {}),
+        "best_val": best_splits.get("val", {}),
+        "best_test": best_splits.get("test", {}),
+        "log_files": [str(path) for path in log_paths],
+    }
+
+
+def write_checkpoint_audit(drive_dir: Path, wrapper_log: Path, seed: int) -> Path:
+    result_root = drive_dir / "results"
+    log_root = drive_dir / "wrapper_logs"
+    log_paths = []
+    if wrapper_log.exists():
+        log_paths.append(wrapper_log)
+    if log_root.exists():
+        log_paths.extend(path for path in log_root.rglob("*.log") if path.is_file())
+    log_paths = sorted(set(log_paths), key=lambda p: (p.stat().st_mtime, str(p)), reverse=True)
+    summary = parse_training_summary_from_logs(log_paths)
+
+    candidates = checkpoint_candidates(result_root)
+    best_epoch = summary.get("best_epoch")
+    matching_best = [
+        path for path in candidates
+        if best_epoch is not None and checkpoint_epoch(path) == int(best_epoch)
+    ]
+    latest = candidates[0] if candidates else None
+    audit = {
+        "seed": seed,
+        "drive_dir": str(drive_dir),
+        "results_root": str(result_root),
+        "best_epoch_from_logs": best_epoch,
+        "best_val": summary.get("best_val", {}),
+        "best_test": summary.get("best_test", {}),
+        "latest_checkpoint_by_mtime": str(latest) if latest else None,
+        "latest_checkpoint_epoch": checkpoint_epoch(latest) if latest else None,
+        "best_epoch_checkpoint_matches": [str(path) for path in matching_best],
+        "checkpoint_candidates": [
+            {
+                "path": str(path),
+                "epoch": checkpoint_epoch(path),
+                "mtime": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(path.stat().st_mtime)),
+                "bytes": path.stat().st_size,
+            }
+            for path in candidates
+        ],
+        "parsed_logs": summary.get("log_files", []),
+        "history_epochs": summary.get("history_epochs", 0),
+    }
+    audit_path = drive_dir / f"checkpoint_audit_seed{seed}.json"
+    audit_path.parent.mkdir(parents=True, exist_ok=True)
+    with audit_path.open("w", encoding="utf-8") as f:
+        json.dump(audit, f, indent=2, sort_keys=True)
+    latest_audit = drive_dir / "latest_checkpoint_audit.json"
+    with latest_audit.open("w", encoding="utf-8") as f:
+        json.dump(audit, f, indent=2, sort_keys=True)
+
+    log(f"[checkpoint-audit] best_epoch_from_logs={best_epoch}")
+    if matching_best:
+        log(f"[checkpoint-audit] matching best checkpoint: {matching_best[0]}")
+    elif best_epoch is not None:
+        log(
+            "[checkpoint-audit:WARNING] No checkpoint filename matched the parsed best epoch. "
+            "GraphGym may have kept a generic best checkpoint, or checkpoint cleaning may have removed older files."
+        )
+    if latest:
+        log(f"[checkpoint-audit] latest checkpoint by mtime: {latest} (epoch={checkpoint_epoch(latest)})")
+    else:
+        log("[checkpoint-audit:WARNING] No checkpoint files found under Drive results root.")
+    log(f"[checkpoint-audit] wrote: {audit_path}")
+    return audit_path
 
 
 def print_environment_summary(drive_dir: Path, repo_dir: Path, commit: str) -> None:
@@ -1193,6 +1396,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--repeat", type=int, default=1)
     p.add_argument("--name-tag", type=str, default="ColabDrive.1hop.GRITwRRWP")
+    p.add_argument("--ckpt-period", type=int, default=1, help="GraphGym checkpoint period in epochs. Default: 1 for reliable Colab/Drive recovery.")
     p.add_argument("--num-threads", type=int, default=4)
     p.add_argument("--pyg-version", type=str, default="2.2.0")
     p.add_argument("--skip-install", action="store_true", help="Do not pip-install dependencies.")
@@ -1206,6 +1410,33 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     p.add_argument("--accelerator", type=str, default="cuda:0", help="Runtime device override passed to GRIT. Default: cuda:0 for Colab GPU.")
     p.add_argument("--auto-resume", action="store_true", default=True, help="Resume from existing run directory/checkpoints if available. Default: true.")
     p.add_argument("--no-auto-resume", action="store_false", dest="auto_resume")
+    p.add_argument(
+        "--keep-all-checkpoints",
+        action="store_true",
+        help=(
+            "Set train.ckpt_clean=False so GraphGym does not remove older checkpoint files. "
+            "Useful for Colab/Drive audit runs; default keeps the official ZINC config behavior."
+        ),
+    )
+    p.add_argument(
+        "--checkpoint-every-epoch",
+        action="store_true",
+        help=(
+            "Storage-only recovery mode: set train.ckpt_best=False, train.ckpt_clean=False, "
+            "and save every --ckpt-period epochs. This guarantees checkpoint file updates in "
+            "Colab/Drive but no longer exactly matches the official checkpointing policy."
+        ),
+    )
+    p.add_argument(
+        "--guaranteed-checkpoints",
+        action="store_true",
+        default=True,
+        help=(
+            "Patch official GRIT custom_train.py to call GraphGym save_ckpt at the end of every epoch. "
+            "Default: enabled for Colab recovery. This changes only storage/recovery behavior."
+        ),
+    )
+    p.add_argument("--no-guaranteed-checkpoints", action="store_false", dest="guaranteed_checkpoints")
     argv = list(sys.argv[1:] if argv is None else argv)
     argv = _strip_colab_kernel_args(argv)
     return p.parse_args(argv)
@@ -1246,6 +1477,12 @@ def main(argv: Sequence[str] | None = None) -> None:
     cmd = build_training_command(args, args.drive_dir)
     wrapper_log = args.drive_dir / "wrapper_logs" / f"grit_zinc_1hop_seed{args.seed}_{time.strftime('%Y%m%d_%H%M%S')}.log"
     train_env = env_with_py312_compat(compat_shim_dir)
+    if args.guaranteed_checkpoints:
+        train_env["GRIT_FORCE_EPOCH_CKPT"] = "1"
+        log("[checkpoint-guarantee] Enabled: official GRIT will save a compatible recovery checkpoint at the end of every epoch.")
+    else:
+        train_env.pop("GRIT_FORCE_EPOCH_CKPT", None)
+        log("[checkpoint-guarantee] Disabled: using only official GraphGym checkpoint policy.")
     rc = run_streaming_to_console_and_log(
         cmd,
         cwd=args.repo_dir,
@@ -1260,6 +1497,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         raise SystemExit(rc)
 
     log("\n[done] Training process completed successfully.")
+    write_checkpoint_audit(args.drive_dir, wrapper_log, args.seed)
     log(f"[done] Results/checkpoints root: {args.drive_dir / 'results'}")
     log(f"[done] Wrapper log: {wrapper_log}")
 
