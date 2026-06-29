@@ -34,6 +34,7 @@ from graph_specialisation_metrics.method_core import (
     write_manifest,
     write_yaml,
 )
+from graph_specialisation_metrics.grit_intervention_procedure import run_intervention_steps
 
 
 METHOD_VALIDATION_MD = Path("/Users/joshgreen/Downloads/method_validation.md")
@@ -341,12 +342,18 @@ def run_adapter_checks(config: Mapping[str, Any], discovery: Sequence[Mapping[st
                     config_path=Path(str(dense_config)),
                     checkpoint_path=Path(str(dense_disc["checkpoint_candidates"][0])),
                     variant="official",
+                    dataset_dir=Path(str(dense_cfg["dataset_dir"])) if dense_cfg.get("dataset_dir") else None,
+                    device=str(config.get("device", "cpu")),
+                    seed=int(config.get("seeds", [0])[0]),
                 )
                 onehop = OfficialGRITAdapter(
                     repo_path=Path(str(hop_cfg.get("repo_path", "external/GRIT"))),
                     config_path=Path(str(hop_config)),
                     checkpoint_path=Path(str(hop_disc["checkpoint_candidates"][0])),
                     variant="1hop",
+                    dataset_dir=Path(str(hop_cfg["dataset_dir"])) if hop_cfg.get("dataset_dir") else None,
+                    device=str(config.get("device", "cpu")),
+                    seed=int(config.get("seeds", [0])[0]),
                 )
                 matched, dense_params, onehop_params = parameter_count_close(dense, onehop)
                 status.update(
@@ -392,27 +399,27 @@ def run_main(config: Mapping[str, Any], *, steps: Sequence[str], dry_run: bool =
             write_step_status(step, artifact_root, status)
             status_by_step[step] = status
     else:
+        intervention_steps = [step for step in steps if step in {"0", "2", "3", "4", "5"}]
+        intervention_status: dict[str, Any] = {}
+        if intervention_steps:
+            try:
+                intervention_status = run_intervention_steps(config, discovery, artifact_root, intervention_steps)
+            except Exception as exc:
+                intervention_status = {
+                    step: {
+                        "status": "failed",
+                        "step": step,
+                        "name": config["steps"][step]["name"],
+                        "error": str(exc),
+                        "methodology_core_available": True,
+                    }
+                    for step in intervention_steps
+                }
         for step in steps:
             if step == "1":
                 status = run_step_1(discovery, artifact_root, config)
-            elif step == "0":
-                status = {
-                    "status": "requires_trained_model_intervention_hooks",
-                    "implemented_outputs": [
-                        "carriage reconstruction",
-                        "swap-vs-IG profile agreement",
-                        "GCN/GIN mediator-collapse gate",
-                    ],
-                    "ready_inputs": discovery,
-                }
-            elif step in {"2", "3", "4", "5"}:
-                status = {
-                    "status": "requires_trained_model_intervention_hooks",
-                    "step": step,
-                    "name": config["steps"][step]["name"],
-                    "methodology_core_available": True,
-                    "artifact_cache_contract": ["metrics/*.csv", "metrics/*.json", "tensors/*.pt", "figures/*.png", "figures/*.pdf"],
-                }
+            elif step in intervention_status:
+                status = intervention_status[step]
             else:  # pragma: no cover
                 status = {"status": "unknown_step", "step": step}
             write_step_status(step, artifact_root, status)

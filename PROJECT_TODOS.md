@@ -20,9 +20,9 @@ HPC is currently down. Use this file as the launch order once it returns.
   - Current implementation uses row-wise source shuffling, which matches the main procedure's distance-preserving source-label null.
   - Action needed: confirm that row-wise/distance-preserving source shuffling is the intended null for both validation and Step 5.
 
-- [ ] Implement official GRIT forward/attention/patch hooks before running main Steps 0 and 2-5 as paper-claim analysis.
-  - Current main runner is ready for artifact discovery, parameter-count checking, manifest/config/status outputs, and Step 1 plots from training stats.
-  - It intentionally writes `requires_trained_model_intervention_hooks` for Steps 0 and 2-5 rather than inventing results.
+- [ ] Verify the official GRIT forward/attention/patch hooks on a real official-GRIT environment with trained dense and 1-hop checkpoints before treating Steps 0 and 2-5 as paper-claim analysis.
+  - Current main runner now implements Steps 0 and 2-5 for official GRIT adapters.
+  - Local smoke tests can only verify imports/status behavior; the full hooks still need Colab/HPC execution with the official GRIT dependencies and checkpoints.
 
 - [ ] Verify official ZINC training outputs include all later analysis inputs.
   - Required later: checkpoints, per-epoch train/val stats, test metrics, config copies, dense and 1-hop parameter counts, seed, split identity, and checkpoint path.
@@ -273,10 +273,38 @@ tail -f \
   "${RESULTS_DIR}/slurm_submit_logs/grit-zinc-3seed-${GRIT_3SEED_JOB_ID}"_*.err
 ```
 
-## 7. Later Main Procedure Steps
+## 7. Main Procedure Steps 0 and 2-5 After Checkpoints Exist
 
-- [ ] Do not launch Steps 0 and 2-5 as scientific runs until official GRIT intervention hooks are implemented and tested.
-- [ ] Once hooks are implemented, run in order: Step 0 gate, Step 1 final aggregation, Step 2, Step 3, Step 4, Step 5.
+- [ ] First run each step on the single seed-41 dense/1-hop checkpoints and inspect the metrics/figures before scaling.
+- [ ] Run in order: Step 0 gate, Step 1 final aggregation, Step 2, Step 3, Step 4, Step 5.
+- [ ] If any intervention step fails, keep the artifacts and inspect `metrics/step*_status.json`; the runner records failures per step instead of aborting the full suite.
+
+Single command for the full one-seed ZINC procedure once both checkpoints exist:
+
+```bash
+export MAIN_ZINC_FULL_JOB_ID=$(
+  sbatch --parsable \
+    --export=ALL,PYTHON_BIN="${PYTHON_BIN}",PROJECT_ROOT="${PROJECT_ROOT}",CONFIG_PATH=experiments/methodology/configs/zinc_main_procedure.yaml,OUTPUT_ROOT="${MAIN_RESULTS_DIR}/zinc",STEP_OVERRIDE=all \
+    -A mlmi-jgg45-sl2-gpu -p ampere --qos=gpu1 \
+    -N 1 --ntasks=1 --gres=gpu:1 \
+    --time=04:00:00 \
+    --array=1 \
+    --job-name=main-zinc-full-s41 \
+    --output="${MAIN_RESULTS_DIR}/slurm_submit_logs/%x-%A_%a.out" \
+    --error="${MAIN_RESULTS_DIR}/slurm_submit_logs/%x-%A_%a.err" \
+    experiments/methodology/slurm/main_procedure_array.sbatch
+)
+echo "MAIN_ZINC_FULL_JOB_ID=${MAIN_ZINC_FULL_JOB_ID}"
+```
+
+Tail the full one-seed procedure:
+
+```bash
+tail -f \
+  "${MAIN_RESULTS_DIR}/slurm_submit_logs/main-zinc-full-s41-${MAIN_ZINC_FULL_JOB_ID}_1.out" \
+  "${MAIN_RESULTS_DIR}/slurm_submit_logs/main-zinc-full-s41-${MAIN_ZINC_FULL_JOB_ID}_1.err"
+```
+
 - [ ] Re-render figures from cached metrics after each methodology/plotting update:
 
 ```bash

@@ -23,6 +23,7 @@ models:
     official_repo: https://github.com/LiamMa/GRIT
     repo_path: /rds/user/jgg45/hpc-work/grit_official_repo/GRIT
     artifact_root: /rds/user/jgg45/hpc-work/grit_zinc_results/official
+    dataset_dir: /rds/user/jgg45/hpc-work/grit_zinc_results/datasets
     config_path:
     checkpoint_path:
   grit_1hop:
@@ -32,6 +33,7 @@ models:
     official_repo: https://github.com/LiamMa/GRIT
     repo_path: /rds/user/jgg45/hpc-work/grit_official_repo/GRIT
     artifact_root: /rds/user/jgg45/hpc-work/grit_zinc_results/1hop
+    dataset_dir: /rds/user/jgg45/hpc-work/grit_zinc_results/datasets
     config_path:
     checkpoint_path:
   gin:

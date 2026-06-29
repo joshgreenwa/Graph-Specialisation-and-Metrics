@@ -19,11 +19,21 @@ python -m graph_specialisation_metrics.main_procedure run \
 ## Colab synthetic validation
 
 The standalone Colab runner mounts Drive, clones this GitHub repo with the Colab
-secret `diss_key`, caches prepared synthetic data and the trained validation
+secret `dissertation_key`, caches prepared synthetic data and the trained validation
 model on Drive, and writes all artifacts/figures to Drive.
 
 ```bash
 python experiments/methodology/colab_method_validation_core.py --mode core
+```
+
+If the methodology branch lives on a fork or feature branch, point Colab at that
+repository/branch explicitly:
+
+```bash
+python experiments/methodology/colab_method_validation_core.py --mode core \
+  --repo-url https://github.com/YOUR_USER/Graph-Specialisation-and-Metrics.git \
+  --branch YOUR_BRANCH \
+  --github-username YOUR_USER
 ```
 
 For a quick smoke test:

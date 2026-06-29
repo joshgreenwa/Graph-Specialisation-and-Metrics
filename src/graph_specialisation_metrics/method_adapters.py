@@ -9,9 +9,11 @@ from __future__ import annotations
 import importlib
 import json
 import math
+import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Optional, Sequence
 
 import torch
@@ -321,9 +323,10 @@ def chain_graph_with_branches(
 class OfficialGRITAdapter:
     """Strict loader facade for the LiamMa/GRIT implementation.
 
-    The adapter validates result metadata and can count checkpoint parameters
-    without importing the official repo.  Forward execution requires the official
-    checkout to be importable and must be wired to the concrete GRIT task wrapper.
+    The adapter keeps all GRIT-specific code behind the model-agnostic
+    methodology interface. It imports the official checkout, loads the official
+    GraphGym config/model/checkpoint, and uses forward hooks to expose final node
+    states, per-layer attention maps, channel fields, and mediator patch points.
     """
 
     repo_path: Path
@@ -331,14 +334,22 @@ class OfficialGRITAdapter:
     checkpoint_path: Path
     variant: str = "official"
     official_commit: Optional[str] = None
+    dataset_dir: Optional[Path] = None
+    device: str | torch.device = "cpu"
+    seed: Optional[int] = None
 
     def __post_init__(self) -> None:
         self.repo_path = Path(self.repo_path)
         self.config_path = Path(self.config_path)
         self.checkpoint_path = Path(self.checkpoint_path)
+        self.dataset_dir = Path(self.dataset_dir) if self.dataset_dir is not None else None
+        self.device = torch.device(self.device)
+        self._model: Optional[nn.Module] = None
+        self._loaders: Optional[Sequence[Any]] = None
+        self._official_imported = False
         self.info = AdapterInfo(
             name=f"grit_{self.variant}",
-            version="official-loader.v1",
+            version="official-hooks.v1",
             implementation="LiamMa/GRIT official checkout",
             official_repo="https://github.com/LiamMa/GRIT",
             official_commit=self.official_commit,
@@ -351,7 +362,32 @@ class OfficialGRITAdapter:
             raise FileNotFoundError(f"missing GRIT checkpoint: {self.checkpoint_path}")
 
     def _load_checkpoint_payload(self) -> Any:
-        return torch.load(self.checkpoint_path, map_location="cpu")
+        try:
+            return torch.load(self.checkpoint_path, map_location="cpu", weights_only=False)
+        except TypeError:
+            return torch.load(self.checkpoint_path, map_location="cpu")
+
+    @staticmethod
+    def _extract_state_dict(payload: Any) -> dict[str, torch.Tensor]:
+        if isinstance(payload, dict):
+            for key in (
+                "state_dict",
+                "model_state_dict",
+                "model",
+                "model_state",
+                "module",
+                "net",
+            ):
+                value = payload.get(key)
+                if isinstance(value, dict):
+                    return {
+                        str(k).replace("module.", "", 1): v
+                        for k, v in value.items()
+                        if isinstance(v, torch.Tensor)
+                    }
+            if payload and all(isinstance(v, torch.Tensor) for v in payload.values()):
+                return {str(k).replace("module.", "", 1): v for k, v in payload.items()}
+        raise RuntimeError("could not read a model state_dict from checkpoint payload")
 
     def parameter_count(self) -> int:
         payload = self._load_checkpoint_payload()
@@ -359,9 +395,7 @@ class OfficialGRITAdapter:
             for key in ("parameter_count", "param_count", "num_parameters", "n_parameters"):
                 if key in payload:
                     return int(payload[key])
-        state = payload.get("state_dict", payload.get("model_state_dict", payload)) if isinstance(payload, dict) else payload
-        if not isinstance(state, dict):
-            raise RuntimeError(f"could not read state dict from {self.checkpoint_path}")
+        state = self._extract_state_dict(payload)
         total = 0
         buffer_markers = ("running_mean", "running_var", "num_batches_tracked", "tracked")
         for key, value in state.items():
@@ -372,23 +406,391 @@ class OfficialGRITAdapter:
         return total
 
     def _import_official(self) -> None:
+        if self._official_imported:
+            return
         if not self.repo_path.exists():
             raise FileNotFoundError(f"missing official GRIT checkout: {self.repo_path}")
-        sys.path.insert(0, str(self.repo_path))
+        repo_str = str(self.repo_path)
+        if repo_str not in sys.path:
+            sys.path.insert(0, repo_str)
         try:
-            importlib.import_module("graphgps")
+            importlib.import_module("grit")
+            importlib.import_module("torch_geometric")
         except Exception as exc:
             raise RuntimeError(
                 "official GRIT execution requires the LiamMa/GRIT checkout and its environment; "
-                f"failed importing graphgps from {self.repo_path}: {exc}"
+                f"failed importing GRIT/PyG from {self.repo_path}: {exc}"
             ) from exc
+        self._official_imported = True
+
+    def _configure_official(self) -> Any:
+        self._import_official()
+        from torch_geometric.graphgym.config import cfg, load_cfg, set_cfg
+
+        set_cfg(cfg)
+        cfg.set_new_allowed(True)
+        opts: list[str] = []
+        if self.dataset_dir is not None:
+            opts.extend(["dataset.dir", str(self.dataset_dir)])
+        if self.seed is not None:
+            opts.extend(["seed", str(int(self.seed))])
+        opts.extend(["train.auto_resume", "False"])
+        args = SimpleNamespace(
+            cfg_file=str(self.config_path),
+            opts=opts,
+            repeat=1,
+            mark_done=False,
+        )
+        cfg.work_dir = str(self.repo_path)
+        load_cfg(cfg, args)
+        cfg.cfg_file = str(self.config_path)
+        cfg.device = str(self.device)
+        cfg.accelerator = str(self.device)
+        return cfg
+
+    @staticmethod
+    def _load_state_dict_into_model(model: nn.Module, state: dict[str, torch.Tensor]) -> None:
+        model_state = model.state_dict()
+        prefixes = ["", "model.", "module.", "model.module.", "module.model."]
+        best_prefix = ""
+        best_matches = -1
+        for prefix in prefixes:
+            matches = sum(1 for key in model_state if prefix + key in state)
+            if matches > best_matches:
+                best_matches = matches
+                best_prefix = prefix
+        remapped = {
+            key: state[best_prefix + key]
+            for key in model_state
+            if best_prefix + key in state and tuple(state[best_prefix + key].shape) == tuple(model_state[key].shape)
+        }
+        if not remapped:
+            # Fall back to stripping common wrapper prefixes from checkpoint keys.
+            stripped: dict[str, torch.Tensor] = {}
+            for key, value in state.items():
+                k = str(key)
+                for prefix in ("model.", "module.", "model.module.", "module.model."):
+                    if k.startswith(prefix):
+                        k = k[len(prefix):]
+                        break
+                if k in model_state and tuple(value.shape) == tuple(model_state[k].shape):
+                    stripped[k] = value
+            remapped = stripped
+        missing, unexpected = model.load_state_dict(remapped, strict=False)
+        if len(remapped) == 0:
+            raise RuntimeError("no checkpoint tensors matched the official GRIT model")
+        if len(missing) > max(4, len(model_state) // 10):
+            raise RuntimeError(
+                f"checkpoint/model mismatch: loaded {len(remapped)} tensors, "
+                f"missing {len(missing)}, unexpected {len(unexpected)}"
+            )
+
+    def load_model(self) -> nn.Module:
+        if self._model is not None:
+            return self._model
+        cfg = self._configure_official()
+        from torch_geometric import seed_everything
+        from torch_geometric.graphgym.model_builder import create_model
+
+        if self.seed is not None:
+            seed_everything(int(self.seed))
+        # Official GRIT/GraphGym creates loaders before the model because loader
+        # construction sets shared input/output dimensions in the global cfg.
+        self.load_zinc_loaders()
+        model = create_model()
+        payload = self._load_checkpoint_payload()
+        state = self._extract_state_dict(payload)
+        self._load_state_dict_into_model(model, state)
+        model = model.to(torch.device(cfg.device))
+        model.eval()
+        self._model = model
+        return model
+
+    @staticmethod
+    def _clone_pyg_data(data: Any) -> Any:
+        if hasattr(data, "clone"):
+            return data.clone()
+        import copy
+
+        return copy.deepcopy(data)
+
+    def _graph_to_data(self, graph: Any) -> Any:
+        self._import_official()
+        if isinstance(graph, GraphBatchView):
+            from torch_geometric.data import Data
+
+            data = Data(x=graph.x, edge_index=graph.edge_index)
+            if graph.y is not None:
+                data.y = graph.y
+            if graph.batch is not None:
+                data.batch = graph.batch
+            if graph.distances is not None:
+                data.distances = graph.distances
+            for key, value in dict(graph.metadata or {}).items():
+                if key not in {"x", "edge_index", "batch", "y"}:
+                    setattr(data, key, value)
+        else:
+            data = self._clone_pyg_data(graph)
+        if not hasattr(data, "batch") or data.batch is None:
+            data.batch = torch.zeros(int(data.x.size(0)), dtype=torch.long)
+        return data.to(self.device) if hasattr(data, "to") else data
+
+    def load_zinc_loaders(self) -> Sequence[Any]:
+        if self._loaders is not None:
+            return self._loaders
+        self._configure_official()
+        from torch_geometric.graphgym.loader import create_loader
+
+        self._loaders = create_loader()
+        return self._loaders
+
+    def load_zinc_split(self, split: str, *, limit: Optional[int] = None) -> list[Any]:
+        loaders = self.load_zinc_loaders()
+        split_map = {"train": 0, "val": 1, "valid": 1, "validation": 1, "test": 2}
+        if split not in split_map:
+            raise ValueError(f"unknown ZINC split {split!r}; expected train/val/test")
+        dataset = loaders[split_map[split]].dataset
+        n = len(dataset) if limit is None else min(int(limit), len(dataset))
+        return [dataset[i] for i in range(n)]
+
+    @staticmethod
+    def _attention_to_dense(edge_index: torch.Tensor, attn: torch.Tensor, num_nodes: int) -> torch.Tensor:
+        values = attn.detach()
+        if values.dim() == 3 and values.size(-1) == 1:
+            values = values.squeeze(-1)
+        if values.dim() == 1:
+            values = values.unsqueeze(-1)
+        # GRIT uses edge_index[0]=source, edge_index[1]=destination. Return
+        # [heads, destination, source], matching A[i,j] = receiver i reads source j.
+        dense = values.new_zeros((values.size(1), int(num_nodes), int(num_nodes)))
+        dense[:, edge_index[1].long(), edge_index[0].long()] = values.t()
+        return dense
+
+    def _run_with_hooks(
+        self,
+        graph: Any,
+        *,
+        content_override: Optional[torch.Tensor] = None,
+        clean_cache: Optional[ForwardCache] = None,
+        clamp_nodes: Sequence[int] = (),
+        clamp_until_layer: Optional[int] = None,
+        retain_grad: bool = False,
+    ) -> ForwardCache:
+        model = self.load_model()
+        data = self._graph_to_data(graph)
+        captures: dict[str, Any] = {
+            "attention": [],
+            "attention_edges": [],
+            "layer_input_node_states": [],
+            "layer_output_node_states": [],
+            "layer_input_edge_attr": [],
+            "layer_output_edge_attr": [],
+            "layer_output_node_state_tensors": [],
+            "channel_fields": [],
+            "encoded_node_states": None,
+            "final_node_states": None,
+        }
+        handles: list[Any] = []
+        clamp = torch.as_tensor(list(clamp_nodes), dtype=torch.long, device=self.device)
+        clean_inputs = None
+        if clean_cache is not None and clean_cache.extras is not None:
+            clean_inputs = clean_cache.extras.get("layer_input_node_states")
+
+        def layer_index_from_name(name: str) -> Optional[int]:
+            match = re.search(r"(?:^|\\.)layers\\.(\\d+)(?:\\.|$)", name)
+            return int(match.group(1)) if match else None
+
+        def feature_encoder_post_hook(module: nn.Module, inputs: tuple[Any, ...], output: Any) -> Any:
+            batch = output
+            if not hasattr(batch, "x") or not isinstance(batch.x, torch.Tensor):
+                return output
+            if content_override is not None:
+                override = content_override.to(device=batch.x.device, dtype=batch.x.dtype)
+                if tuple(override.shape) != tuple(batch.x.shape):
+                    raise ValueError(
+                        f"content_override shape {tuple(override.shape)} does not match encoded node content {tuple(batch.x.shape)}"
+                    )
+                batch.x = override
+            if retain_grad and getattr(batch.x, "requires_grad", False):
+                batch.x.retain_grad()
+            captures["encoded_node_states"] = batch.x
+            return batch
+
+        def make_layer_pre_hook(layer_idx: int):
+            def hook(module: nn.Module, inputs: tuple[Any, ...]) -> None:
+                if not inputs:
+                    return
+                batch = inputs[0]
+                if hasattr(batch, "x") and isinstance(batch.x, torch.Tensor):
+                    captures["layer_input_node_states"].append(batch.x.detach().clone())
+                    if getattr(batch.x, "requires_grad", False):
+                        batch.x.retain_grad()
+                    if batch.get("edge_attr", None) is not None:
+                        captures["layer_input_edge_attr"].append(batch.edge_attr.detach().clone())
+                should_clamp = (
+                    clamp.numel() > 0
+                    and clean_inputs is not None
+                    and layer_idx < len(clean_inputs)
+                    and (clamp_until_layer is None or layer_idx <= int(clamp_until_layer))
+                )
+                if should_clamp:
+                    patched = batch.x.clone()
+                    patched[clamp] = clean_inputs[layer_idx].to(device=patched.device, dtype=patched.dtype)[clamp]
+                    batch.x = patched
+            return hook
+
+        def make_layer_post_hook(layer_idx: int):
+            def hook(module: nn.Module, inputs: tuple[Any, ...], output: Any) -> None:
+                batch = output
+                if hasattr(batch, "x") and isinstance(batch.x, torch.Tensor):
+                    if retain_grad and getattr(batch.x, "requires_grad", False):
+                        batch.x.retain_grad()
+                        captures["layer_output_node_state_tensors"].append(batch.x)
+                    captures["layer_output_node_states"].append(batch.x.detach().clone())
+                if hasattr(batch, "edge_attr") and isinstance(batch.edge_attr, torch.Tensor):
+                    captures["layer_output_edge_attr"].append(batch.edge_attr.detach().clone())
+            return hook
+
+        def post_mp_pre_hook(module: nn.Module, inputs: tuple[Any, ...]) -> None:
+            if inputs:
+                batch = inputs[0]
+                if hasattr(batch, "x") and isinstance(batch.x, torch.Tensor):
+                    if retain_grad:
+                        batch.x.retain_grad()
+                    captures["final_node_states"] = batch.x
+
+        def attention_post_hook(module: nn.Module, inputs: tuple[Any, ...], output: Any) -> None:
+            if not inputs:
+                return
+            batch = inputs[0]
+            if getattr(batch, "attn", None) is not None:
+                edge_index = batch.edge_index.detach().clone()
+                attn = batch.attn.detach().clone()
+                captures["attention_edges"].append(edge_index)
+                captures["attention"].append(self._attention_to_dense(edge_index, attn, int(batch.num_nodes)))
+                fields = {
+                    "edge_index": edge_index,
+                    "attn": attn,
+                    "edge_attr": batch.edge_attr.detach().clone() if getattr(batch, "edge_attr", None) is not None else None,
+                    "Q_h": batch.Q_h.detach().clone() if getattr(batch, "Q_h", None) is not None else None,
+                    "K_h": batch.K_h.detach().clone() if getattr(batch, "K_h", None) is not None else None,
+                    "V_h": batch.V_h.detach().clone() if getattr(batch, "V_h", None) is not None else None,
+                    "wV": batch.wV.detach().clone() if getattr(batch, "wV", None) is not None else None,
+                    "E": batch.E.detach().clone() if getattr(batch, "E", None) is not None else None,
+                    "wE": batch.wE.detach().clone() if getattr(batch, "wE", None) is not None else None,
+                    "edge_enhance": bool(getattr(module, "edge_enhance", False)),
+                    "VeRow": module.VeRow.detach().clone() if getattr(module, "VeRow", None) is not None else None,
+                }
+                captures["channel_fields"].append(fields)
+
+        for name, module in model.named_modules():
+            cls_name = module.__class__.__name__
+            layer_idx = layer_index_from_name(name)
+            if cls_name == "FeatureEncoder":
+                handles.append(module.register_forward_hook(feature_encoder_post_hook))
+            elif cls_name == "GritTransformerLayer" and layer_idx is not None:
+                handles.append(module.register_forward_pre_hook(make_layer_pre_hook(layer_idx)))
+                handles.append(module.register_forward_hook(make_layer_post_hook(layer_idx)))
+            elif cls_name == "MultiHeadAttentionLayerGritSparse":
+                handles.append(module.register_forward_hook(attention_post_hook))
+            elif name.endswith("post_mp") or cls_name == "SANGraphHead":
+                handles.append(module.register_forward_pre_hook(post_mp_pre_hook))
+
+        try:
+            output = model(data)
+        finally:
+            for handle in handles:
+                handle.remove()
+
+        if isinstance(output, tuple):
+            prediction = output[0]
+        else:
+            prediction = output
+        if isinstance(prediction, torch.Tensor):
+            prediction_tensor = prediction.view(-1)
+        else:
+            raise RuntimeError(f"official GRIT forward returned unsupported prediction type {type(prediction)!r}")
+        final_states = captures["final_node_states"]
+        if final_states is None:
+            raise RuntimeError("could not capture final GRIT node states before graph readout")
+        extras = {
+            "encoded_node_states": captures["encoded_node_states"],
+            "layer_input_node_states": captures["layer_input_node_states"],
+            "layer_output_node_states": captures["layer_output_node_states"],
+            "layer_output_node_state_tensors": captures["layer_output_node_state_tensors"],
+            "layer_input_edge_attr": captures["layer_input_edge_attr"],
+            "layer_output_edge_attr": captures["layer_output_edge_attr"],
+            "attention_edges": captures["attention_edges"],
+            "raw_output": output,
+        }
+        return ForwardCache(
+            prediction=prediction_tensor,
+            final_node_states=final_states,
+            attention=captures["attention"],
+            channel_fields={"layers": captures["channel_fields"]},
+            extras=extras,
+        )
 
     def forward(self, graph: GraphBatchView) -> ForwardCache:
-        self._import_official()
-        raise NotImplementedError(
-            "OfficialGRITAdapter validates official artifacts now; task-specific forward hooks "
-            "must be connected once trained GRIT checkpoints are present."
-        )
+        with torch.no_grad():
+            return self._run_with_hooks(graph)
+
+    def forward_with_grad(self, graph: Any) -> ForwardCache:
+        model = self.load_model()
+        model.zero_grad(set_to_none=True)
+        return self._run_with_hooks(graph, retain_grad=True)
+
+    def encoded_node_states(self, graph: Any) -> torch.Tensor:
+        cache = self.forward(graph)
+        encoded = None if cache.extras is None else cache.extras.get("encoded_node_states")
+        if not isinstance(encoded, torch.Tensor):
+            raise RuntimeError("could not capture encoded GRIT node content after FeatureEncoder")
+        return encoded.detach().clone()
+
+    def forward_from_encoded_content(self, graph: Any, encoded_content: torch.Tensor, *, retain_grad: bool = False) -> ForwardCache:
+        if retain_grad:
+            self.load_model().zero_grad(set_to_none=True)
+        return self._run_with_hooks(graph, content_override=encoded_content, retain_grad=retain_grad)
+
+    def readout_gradient(self, graph: Any, *, target_index: int = 0) -> tuple[ForwardCache, torch.Tensor]:
+        """Return ``(cache, d prediction / d final_node_states)`` for one graph.
+
+        Official ZINC GRIT uses sum-pool + MLP, so this gradient is expected to
+        be direction-uniform across nodes. We compute it rather than assuming it
+        so future official configs with different readouts remain supported.
+        """
+        cache = self.forward_with_grad(graph)
+        pred = cache.prediction.reshape(-1)[int(target_index)]
+        pred.backward(retain_graph=False)
+        grad = cache.final_node_states.grad
+        if grad is None:
+            raise RuntimeError("GRIT final node states did not receive a readout gradient")
+        if cache.extras is not None:
+            layer_grads = []
+            for tensor in cache.extras.get("layer_output_node_state_tensors", []):
+                layer_grads.append(tensor.grad.detach().clone() if tensor.grad is not None else torch.zeros_like(tensor).detach())
+            cache.extras["layer_output_node_gradients"] = layer_grads
+        return cache, grad.detach().clone()
+
+    def readout_gradient_from_encoded_content(
+        self,
+        graph: Any,
+        encoded_content: torch.Tensor,
+        *,
+        target_index: int = 0,
+    ) -> tuple[ForwardCache, torch.Tensor]:
+        cache = self.forward_from_encoded_content(graph, encoded_content, retain_grad=True)
+        pred = cache.prediction.reshape(-1)[int(target_index)]
+        pred.backward(retain_graph=False)
+        grad = cache.final_node_states.grad
+        if grad is None:
+            raise RuntimeError("GRIT final node states did not receive a readout gradient")
+        if cache.extras is not None:
+            layer_grads = []
+            for tensor in cache.extras.get("layer_output_node_state_tensors", []):
+                layer_grads.append(tensor.grad.detach().clone() if tensor.grad is not None else torch.zeros_like(tensor).detach())
+            cache.extras["layer_output_node_gradients"] = layer_grads
+        return cache, grad.detach().clone()
 
     def predict(self, graph: GraphBatchView) -> torch.Tensor:
         return self.forward(graph).prediction
@@ -401,9 +803,37 @@ class OfficialGRITAdapter:
         graph: GraphBatchView,
         clamp_nodes: Sequence[int],
         clean_cache: Optional[ForwardCache] = None,
+        clamp_until_layer: Optional[int] = None,
     ) -> ForwardCache:
-        self._import_official()
-        raise NotImplementedError("Official GRIT hidden-state patch hooks require checkpoint-specific wiring")
+        if clean_cache is None:
+            clean_cache = self.forward(graph)
+        with torch.no_grad():
+            return self._run_with_hooks(
+                graph,
+                clean_cache=clean_cache,
+                clamp_nodes=clamp_nodes,
+                clamp_until_layer=clamp_until_layer,
+            )
+
+    def patch_hidden_states_from_encoded_content(
+        self,
+        graph: Any,
+        encoded_content: torch.Tensor,
+        clamp_nodes: Sequence[int],
+        clean_cache: Optional[ForwardCache] = None,
+        clamp_until_layer: Optional[int] = None,
+        retain_grad: bool = False,
+    ) -> ForwardCache:
+        if clean_cache is None:
+            clean_cache = self.forward(graph)
+        return self._run_with_hooks(
+            graph,
+            content_override=encoded_content,
+            clean_cache=clean_cache,
+            clamp_nodes=clamp_nodes,
+            clamp_until_layer=clamp_until_layer,
+            retain_grad=retain_grad,
+        )
 
     def metadata(self) -> dict[str, Any]:
         config_payload: dict[str, Any]
@@ -422,6 +852,8 @@ class OfficialGRITAdapter:
             "repo_path": str(self.repo_path),
             "config_path": str(self.config_path),
             "checkpoint_path": str(self.checkpoint_path),
+            "dataset_dir": str(self.dataset_dir) if self.dataset_dir is not None else None,
+            "device": str(self.device),
             "variant": self.variant,
             "config": config_payload,
             "parameter_count": self.parameter_count(),
