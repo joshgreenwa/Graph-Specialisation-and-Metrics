@@ -1006,6 +1006,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default="zinc_single_seed_current",
         help="Stable prepared-artifact namespace. Keep fixed across Colab restarts to resume cached analysis.",
     )
+    parser.add_argument(
+        "--refresh-model-artifacts",
+        action="store_true",
+        help="Rediscover checkpoints and rewrite prepared model pointers. Omit this during resume so the config hash remains stable.",
+    )
     parser.add_argument("--pyg-version", default=DEFAULT_PYG_VERSION)
     parser.add_argument("--force", action="store_true", help="Force rerun of main_procedure artifact generation instead of resuming completed steps.")
     parser.add_argument("--force-official-grit-reclone", action="store_true")
@@ -1045,27 +1050,45 @@ def main(argv: Sequence[str] | None = None) -> None:
         args.drive_root,
         force=bool(args.force_official_grit_reclone),
     )
-    dense_results = args.dense_drive_dir / "results"
-    onehop_results = args.onehop_drive_dir / "results"
-    dense_ckpt = choose_checkpoint(dense_results, "dense_grit")
-    onehop_ckpt = choose_checkpoint(onehop_results, "grit_1hop")
-
     prepared = args.drive_root / "prepared_model_artifacts" / str(args.prepared_id)
     print(f"[prepared] using stable prepared artifact root: {prepared}", flush=True)
-    dense_pointer = prepare_model_artifact(
-        model="dense_grit",
-        source_drive_dir=args.dense_drive_dir,
-        config_path=dense_cfg,
-        checkpoint_path=dense_ckpt,
-        prepared_root=prepared / "dense_grit",
+    dense_pointer_path = prepared / "dense_grit" / "artifact_pointer.json"
+    onehop_pointer_path = prepared / "grit_1hop" / "artifact_pointer.json"
+    reuse_prepared = (
+        not args.refresh_model_artifacts
+        and dense_pointer_path.exists()
+        and onehop_pointer_path.exists()
     )
-    onehop_pointer = prepare_model_artifact(
-        model="grit_1hop",
-        source_drive_dir=args.onehop_drive_dir,
-        config_path=onehop_cfg,
-        checkpoint_path=onehop_ckpt,
-        prepared_root=prepared / "grit_1hop",
-    )
+    if reuse_prepared:
+        dense_pointer = load_json(dense_pointer_path)
+        onehop_pointer = load_json(onehop_pointer_path)
+        dense_ckpt = Path(str(dense_pointer["checkpoint_path"]))
+        onehop_ckpt = Path(str(onehop_pointer["checkpoint_path"]))
+        if dense_ckpt.exists() and onehop_ckpt.exists():
+            print(f"[prepared] reusing dense checkpoint: {dense_ckpt}", flush=True)
+            print(f"[prepared] reusing 1-hop checkpoint: {onehop_ckpt}", flush=True)
+        else:
+            print("[prepared-warning] saved checkpoint pointer missing on Drive; refreshing model artifacts", flush=True)
+            reuse_prepared = False
+    if not reuse_prepared:
+        dense_results = args.dense_drive_dir / "results"
+        onehop_results = args.onehop_drive_dir / "results"
+        dense_ckpt = choose_checkpoint(dense_results, "dense_grit")
+        onehop_ckpt = choose_checkpoint(onehop_results, "grit_1hop")
+        dense_pointer = prepare_model_artifact(
+            model="dense_grit",
+            source_drive_dir=args.dense_drive_dir,
+            config_path=dense_cfg,
+            checkpoint_path=dense_ckpt,
+            prepared_root=prepared / "dense_grit",
+        )
+        onehop_pointer = prepare_model_artifact(
+            model="grit_1hop",
+            source_drive_dir=args.onehop_drive_dir,
+            config_path=onehop_cfg,
+            checkpoint_path=onehop_ckpt,
+            prepared_root=prepared / "grit_1hop",
+        )
 
     cfg = build_zinc_config(
         artifact_root=args.drive_root,
