@@ -35,7 +35,7 @@ from graph_specialisation_metrics.method_core import (
     write_manifest,
     write_yaml,
 )
-from graph_specialisation_metrics.grit_intervention_procedure import run_intervention_steps
+from graph_specialisation_metrics.grit_intervention_procedure import instantiate_official_models, run_intervention_steps
 
 
 METHOD_VALIDATION_MD = Path("/Users/joshgreen/Downloads/method_validation.md")
@@ -57,6 +57,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "ig_baseline": "mean_node_embedding",
         "ig_steps": 32,
         "swap_partners": 8,
+        "batched_vjp": True,
     },
     "models": {
         "dense_grit": {
@@ -752,6 +753,22 @@ def run_main(config: Mapping[str, Any], *, steps: Sequence[str], dry_run: bool =
             write_json(artifact_root / "metrics" / "main_status.json", status_by_step)
     else:
         intervention_steps = [step for step in steps if step in {"0", "2", "3", "4", "5"}]
+        pending_intervention_steps = [
+            step for step in intervention_steps if force or not step_is_complete(status_by_step.get(step))
+        ]
+        intervention_models = None
+        intervention_model_error: Exception | None = None
+        if pending_intervention_steps:
+            try:
+                progress(
+                    "instantiating official GRIT adapters once for intervention steps: "
+                    f"{','.join(pending_intervention_steps)}"
+                )
+                intervention_models = instantiate_official_models(config, discovery)
+                model_names = ", ".join(model.name for model in intervention_models) if intervention_models else "none found"
+                progress(f"official GRIT adapters ready: {model_names}")
+            except Exception as exc:
+                intervention_model_error = exc
         for step in steps:
             if not force and step_is_complete(status_by_step.get(step)):
                 progress(f"Step {step} already complete; reusing cached outputs")
@@ -761,8 +778,16 @@ def run_main(config: Mapping[str, Any], *, steps: Sequence[str], dry_run: bool =
                 status = run_step_1(discovery, artifact_root, config)
             elif step in intervention_steps:
                 try:
+                    if intervention_model_error is not None:
+                        raise intervention_model_error
                     progress(f"starting GRIT intervention Step {step}: {config['steps'][step]['name']}")
-                    step_status = run_intervention_steps(config, discovery, artifact_root, [step])
+                    step_status = run_intervention_steps(
+                        config,
+                        discovery,
+                        artifact_root,
+                        [step],
+                        models=intervention_models,
+                    )
                     status = step_status.get(step, {"status": "unknown_step", "step": step})
                     progress(f"GRIT intervention Step {step} finished")
                 except Exception as exc:

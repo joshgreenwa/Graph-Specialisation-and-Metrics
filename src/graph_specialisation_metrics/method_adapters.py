@@ -7,6 +7,7 @@ or fail loudly.  Validation-only adapters are marked as such in their manifest.
 from __future__ import annotations
 
 import importlib
+import contextlib
 import json
 import math
 import re
@@ -600,6 +601,10 @@ class OfficialGRITAdapter:
         clamp_nodes: Sequence[int] = (),
         clamp_until_layer: Optional[int] = None,
         retain_grad: bool = False,
+        capture_attention: bool = True,
+        capture_channels: bool = True,
+        capture_layer_inputs: bool = True,
+        capture_layer_outputs: bool = True,
     ) -> ForwardCache:
         model = self.load_model()
         data = self._graph_to_data(graph)
@@ -652,10 +657,11 @@ class OfficialGRITAdapter:
                     return
                 batch = inputs[0]
                 if hasattr(batch, "x") and isinstance(batch.x, torch.Tensor):
-                    captures["layer_input_node_states"].append(batch.x.detach().clone())
-                    if getattr(batch.x, "requires_grad", False):
+                    if capture_layer_inputs:
+                        captures["layer_input_node_states"].append(batch.x.detach().clone())
+                    if retain_grad and capture_layer_inputs and getattr(batch.x, "requires_grad", False):
                         batch.x.retain_grad()
-                    if batch.get("edge_attr", None) is not None:
+                    if capture_layer_inputs and batch.get("edge_attr", None) is not None:
                         captures["layer_input_edge_attr"].append(batch.edge_attr.detach().clone())
                 should_clamp = (
                     clamp.numel() > 0
@@ -673,11 +679,12 @@ class OfficialGRITAdapter:
             def hook(module: nn.Module, inputs: tuple[Any, ...], output: Any) -> None:
                 batch = output
                 if hasattr(batch, "x") and isinstance(batch.x, torch.Tensor):
-                    if retain_grad and getattr(batch.x, "requires_grad", False):
+                    if retain_grad and capture_layer_outputs and getattr(batch.x, "requires_grad", False):
                         batch.x.retain_grad()
                         captures["layer_output_node_state_tensors"].append(batch.x)
-                    captures["layer_output_node_states"].append(batch.x.detach().clone())
-                if hasattr(batch, "edge_attr") and isinstance(batch.edge_attr, torch.Tensor):
+                    if capture_layer_outputs:
+                        captures["layer_output_node_states"].append(batch.x.detach().clone())
+                if capture_layer_outputs and hasattr(batch, "edge_attr") and isinstance(batch.edge_attr, torch.Tensor):
                     captures["layer_output_edge_attr"].append(batch.edge_attr.detach().clone())
             return hook
 
@@ -693,25 +700,27 @@ class OfficialGRITAdapter:
             if not inputs:
                 return
             batch = inputs[0]
-            if getattr(batch, "attn", None) is not None:
+            if getattr(batch, "attn", None) is not None and (capture_attention or capture_channels):
                 edge_index = batch.edge_index.detach().clone()
                 attn = batch.attn.detach().clone()
-                captures["attention_edges"].append(edge_index)
-                captures["attention"].append(self._attention_to_dense(edge_index, attn, int(batch.num_nodes)))
-                fields = {
-                    "edge_index": edge_index,
-                    "attn": attn,
-                    "edge_attr": batch.edge_attr.detach().clone() if getattr(batch, "edge_attr", None) is not None else None,
-                    "Q_h": batch.Q_h.detach().clone() if getattr(batch, "Q_h", None) is not None else None,
-                    "K_h": batch.K_h.detach().clone() if getattr(batch, "K_h", None) is not None else None,
-                    "V_h": batch.V_h.detach().clone() if getattr(batch, "V_h", None) is not None else None,
-                    "wV": batch.wV.detach().clone() if getattr(batch, "wV", None) is not None else None,
-                    "E": batch.E.detach().clone() if getattr(batch, "E", None) is not None else None,
-                    "wE": batch.wE.detach().clone() if getattr(batch, "wE", None) is not None else None,
-                    "edge_enhance": bool(getattr(module, "edge_enhance", False)),
-                    "VeRow": module.VeRow.detach().clone() if getattr(module, "VeRow", None) is not None else None,
-                }
-                captures["channel_fields"].append(fields)
+                if capture_attention:
+                    captures["attention_edges"].append(edge_index)
+                    captures["attention"].append(self._attention_to_dense(edge_index, attn, int(batch.num_nodes)))
+                if capture_channels:
+                    fields = {
+                        "edge_index": edge_index,
+                        "attn": attn,
+                        "edge_attr": batch.edge_attr.detach().clone() if getattr(batch, "edge_attr", None) is not None else None,
+                        "Q_h": batch.Q_h.detach().clone() if getattr(batch, "Q_h", None) is not None else None,
+                        "K_h": batch.K_h.detach().clone() if getattr(batch, "K_h", None) is not None else None,
+                        "V_h": batch.V_h.detach().clone() if getattr(batch, "V_h", None) is not None else None,
+                        "wV": batch.wV.detach().clone() if getattr(batch, "wV", None) is not None else None,
+                        "E": batch.E.detach().clone() if getattr(batch, "E", None) is not None else None,
+                        "wE": batch.wE.detach().clone() if getattr(batch, "wE", None) is not None else None,
+                        "edge_enhance": bool(getattr(module, "edge_enhance", False)),
+                        "VeRow": module.VeRow.detach().clone() if getattr(module, "VeRow", None) is not None else None,
+                    }
+                    captures["channel_fields"].append(fields)
 
         for name, module in model.named_modules():
             cls_name = module.__class__.__name__
@@ -740,7 +749,7 @@ class OfficialGRITAdapter:
             prediction_tensor = prediction.view(-1)
         else:
             raise RuntimeError(f"official GRIT forward returned unsupported prediction type {type(prediction)!r}")
-        if captures["attention"] and not captures["layer_output_node_states"]:
+        if capture_layer_outputs and captures["attention"] and not captures["layer_output_node_states"]:
             raise RuntimeError(
                 "captured GRIT attention maps but no GritTransformerLayer outputs; "
                 "layer hook registration failed, so layer-resolved and mediator-patching analyses would be invalid"
@@ -772,22 +781,56 @@ class OfficialGRITAdapter:
         with torch.no_grad():
             return self._run_with_hooks(graph)
 
+    def forward_minimal(self, graph: Any) -> ForwardCache:
+        with torch.inference_mode():
+            return self._run_with_hooks(
+                graph,
+                capture_attention=False,
+                capture_channels=False,
+                capture_layer_inputs=False,
+                capture_layer_outputs=False,
+            )
+
     def forward_with_grad(self, graph: Any) -> ForwardCache:
         model = self.load_model()
         model.zero_grad(set_to_none=True)
         return self._run_with_hooks(graph, retain_grad=True)
 
     def encoded_node_states(self, graph: Any) -> torch.Tensor:
-        cache = self.forward(graph)
+        cache = self.forward_minimal(graph)
         encoded = None if cache.extras is None else cache.extras.get("encoded_node_states")
         if not isinstance(encoded, torch.Tensor):
             raise RuntimeError("could not capture encoded GRIT node content after FeatureEncoder")
         return encoded.detach().clone()
 
-    def forward_from_encoded_content(self, graph: Any, encoded_content: torch.Tensor, *, retain_grad: bool = False) -> ForwardCache:
+    def forward_from_encoded_content(
+        self,
+        graph: Any,
+        encoded_content: torch.Tensor,
+        *,
+        retain_grad: bool = False,
+        capture_attention: bool = False,
+        capture_channels: bool = False,
+        capture_layer_inputs: bool = False,
+        capture_layer_outputs: bool = False,
+    ) -> ForwardCache:
         if retain_grad:
             self.load_model().zero_grad(set_to_none=True)
-        return self._run_with_hooks(graph, content_override=encoded_content, retain_grad=retain_grad)
+        context = (
+            torch.inference_mode()
+            if not retain_grad and not bool(getattr(encoded_content, "requires_grad", False))
+            else contextlib.nullcontext()
+        )
+        with context:
+            return self._run_with_hooks(
+                graph,
+                content_override=encoded_content,
+                retain_grad=retain_grad,
+                capture_attention=capture_attention,
+                capture_channels=capture_channels,
+                capture_layer_inputs=capture_layer_inputs,
+                capture_layer_outputs=capture_layer_outputs,
+            )
 
     def readout_gradient(self, graph: Any, *, target_index: int = 0) -> tuple[ForwardCache, torch.Tensor]:
         """Return ``(cache, d prediction / d final_node_states)`` for one graph.
@@ -806,8 +849,20 @@ class OfficialGRITAdapter:
         encoded_content: torch.Tensor,
         *,
         target_index: int = 0,
+        capture_attention: bool = False,
+        capture_channels: bool = False,
+        capture_layer_inputs: bool = False,
+        capture_layer_outputs: bool = False,
     ) -> tuple[ForwardCache, torch.Tensor]:
-        cache = self.forward_from_encoded_content(graph, encoded_content, retain_grad=True)
+        cache = self.forward_from_encoded_content(
+            graph,
+            encoded_content,
+            retain_grad=True,
+            capture_attention=capture_attention,
+            capture_channels=capture_channels,
+            capture_layer_inputs=capture_layer_inputs,
+            capture_layer_outputs=capture_layer_outputs,
+        )
         grad = self._populate_readout_gradients(cache, target_index=target_index)
         return cache, grad
 
@@ -869,7 +924,7 @@ class OfficialGRITAdapter:
         return final_grad.detach().clone()
 
     def predict(self, graph: GraphBatchView) -> torch.Tensor:
-        return self.forward(graph).prediction
+        return self.forward_minimal(graph).prediction
 
     def attention_maps(self, graph: GraphBatchView) -> Optional[list[torch.Tensor]]:
         return self.forward(graph).attention
@@ -889,6 +944,10 @@ class OfficialGRITAdapter:
                 clean_cache=clean_cache,
                 clamp_nodes=clamp_nodes,
                 clamp_until_layer=clamp_until_layer,
+                capture_attention=False,
+                capture_channels=False,
+                capture_layer_inputs=False,
+                capture_layer_outputs=False,
             )
 
     def patch_hidden_states_from_encoded_content(
@@ -909,6 +968,10 @@ class OfficialGRITAdapter:
             clamp_nodes=clamp_nodes,
             clamp_until_layer=clamp_until_layer,
             retain_grad=retain_grad,
+            capture_attention=False,
+            capture_channels=False,
+            capture_layer_inputs=False,
+            capture_layer_outputs=False,
         )
 
     def metadata(self) -> dict[str, Any]:

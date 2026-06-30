@@ -113,12 +113,13 @@ def distance_matrix(graph: Any) -> torch.Tensor:
 
 
 def far_pairs(dist: torch.Tensor, tau: int, *, max_pairs: Optional[int] = None, seed: int = 0) -> list[tuple[int, int]]:
-    pairs = [
-        (int(i), int(j))
-        for i in range(dist.size(0))
-        for j in range(dist.size(1))
-        if i != j and bool(torch.isfinite(dist[i, j])) and float(dist[i, j].item()) > float(tau)
-    ]
+    dist_cpu = dist.detach().cpu().float()
+    mask = torch.isfinite(dist_cpu) & (dist_cpu > float(tau))
+    if dist_cpu.dim() != 2:
+        return []
+    diag = torch.eye(dist_cpu.size(0), dist_cpu.size(1), dtype=torch.bool)
+    mask = mask & ~diag
+    pairs = [(int(i), int(j)) for i, j in mask.nonzero(as_tuple=False).tolist()]
     rng = random.Random(int(seed))
     rng.shuffle(pairs)
     return pairs[: int(max_pairs)] if max_pairs is not None else pairs
@@ -192,6 +193,10 @@ def far_thresholds(config: Mapping[str, Any]) -> list[int]:
     return sorted(set(values))
 
 
+def carriage_ig_uses_batched_vjp(config: Mapping[str, Any]) -> bool:
+    return bool(config.get("perturbation", {}).get("batched_vjp", True))
+
+
 def mean_encoded_baseline(adapter: OfficialGRITAdapter, graphs: Sequence[Any], *, max_graphs: int = 32) -> torch.Tensor:
     chunks = []
     for graph in list(graphs)[: int(max_graphs)]:
@@ -256,6 +261,11 @@ def carriage_ig(
     steps: int,
     target_index: int = 0,
     baseline_override: Optional[torch.Tensor] = None,
+    batched_vjp: bool = True,
+    capture_attention: bool = False,
+    capture_channels: bool = False,
+    capture_layer_inputs: bool = False,
+    capture_layer_outputs: bool = False,
 ) -> dict[str, Any]:
     """Compute markdown carriage C[i,j] using encoded-content IG.
 
@@ -276,15 +286,41 @@ def carriage_ig(
         graph,
         clean_encoded.detach().clone(),
         target_index=target_index,
+        capture_attention=capture_attention,
+        capture_channels=capture_channels,
+        capture_layer_inputs=capture_layer_inputs,
+        capture_layer_outputs=capture_layer_outputs,
     )
     n = int(clean_encoded.size(0))
     carriage = clean_encoded.new_zeros((n, n))
+    use_batched_vjp = bool(batched_vjp)
+    batched_vjp_error: str | None = None
     for alpha_idx in range(1, int(steps) + 1):
         alpha = float(alpha_idx) / float(steps)
         point = (base + alpha * delta).detach().requires_grad_(True)
         cache = adapter.forward_from_encoded_content(graph, point, retain_grad=False)
+        carrier_scores = (cache.final_node_states * readout_grad).sum(dim=-1)
+        if use_batched_vjp:
+            try:
+                eye = torch.eye(n, device=carrier_scores.device, dtype=carrier_scores.dtype)
+                (batched_grad,) = torch.autograd.grad(
+                    carrier_scores,
+                    point,
+                    grad_outputs=eye,
+                    is_grads_batched=True,
+                    retain_graph=False,
+                    create_graph=False,
+                )
+                carriage += torch.einsum("csd,sd->cs", batched_grad.detach(), delta) / float(steps)
+                continue
+            except (RuntimeError, TypeError) as exc:
+                use_batched_vjp = False
+                batched_vjp_error = str(exc)
+                point = (base + alpha * delta).detach().requires_grad_(True)
+                cache = adapter.forward_from_encoded_content(graph, point, retain_grad=False)
+                carrier_scores = (cache.final_node_states * readout_grad).sum(dim=-1)
         for carrier in range(n):
-            scalar = (cache.final_node_states[carrier] * readout_grad[carrier]).sum()
+            scalar = carrier_scores[carrier]
             (grad,) = torch.autograd.grad(scalar, point, retain_graph=carrier < n - 1, create_graph=False)
             carriage[carrier] += (grad.detach() * delta).sum(dim=-1) / float(steps)
     pred_clean = float(clean_cache.prediction.reshape(-1)[target_index].detach().cpu().item())
@@ -297,6 +333,8 @@ def carriage_ig(
         "prediction": pred_clean,
         "baseline_prediction": pred_base,
         "clean_cache": clean_cache,
+        "batched_vjp_used": use_batched_vjp,
+        "batched_vjp_error": batched_vjp_error,
     }
 
 
@@ -665,6 +703,7 @@ def run_step0(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
     sample_graphs = int(cfg.get("sample_graphs", 200))
     ig_steps = int(config["perturbation"].get("ig_steps", 32))
     swap_partners = int(config["perturbation"].get("swap_partners", 8))
+    batched_vjp = carriage_ig_uses_batched_vjp(config)
     seed = int(config.get("seeds", [0])[0])
     dpi = int(config["figures"]["dpi"])
     recon_rows: list[dict[str, Any]] = []
@@ -687,7 +726,13 @@ def run_step0(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
             progress_graph("Step 0", model.name, graph_idx, len(graphs))
             gid = graph_identity("test", graph_idx, graph)
             dist = distance_matrix(graph)
-            result = carriage_ig(model.adapter, graph, baseline, steps=ig_steps)
+            result = carriage_ig(
+                model.adapter,
+                graph,
+                baseline,
+                steps=ig_steps,
+                batched_vjp=batched_vjp,
+            )
             c_ig = result["carriage"]
             encoded = result["clean_encoded"].to(model.adapter.device)
             base = result["baseline"].to(model.adapter.device)
@@ -757,7 +802,7 @@ def run_step0(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
                 )
             profile_rows.extend(carriage_profile_rows(model.name, gid, c_ig, dist, "ig_carriage"))
             profile_rows.extend(carriage_profile_rows(model.name, gid, c_swap, dist, "swap_carriage"))
-        model_sweep_rows, model_sweep_summary = step0_ig_step_sweep(model, graphs, baseline, cfg, seed=seed)
+        model_sweep_rows, model_sweep_summary = step0_ig_step_sweep(model, graphs, baseline, cfg, seed=seed, batched_vjp=batched_vjp)
         sweep_rows.extend(model_sweep_rows)
         sweep_summary_rows.extend(model_sweep_summary)
         model_matched_rows, model_matched_summary = step0_matched_swap_target(model, graphs, baseline, cfg, seed=seed)
@@ -919,6 +964,7 @@ def step0_ig_step_sweep(
     cfg: Mapping[str, Any],
     *,
     seed: int,
+    batched_vjp: bool = True,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     step_values = [int(v) for v in cfg.get("ig_step_sweep", [])]
     baseline_kinds = [str(v) for v in cfg.get("baseline_sweep", ["mean_node_embedding"])]
@@ -946,6 +992,7 @@ def step0_ig_step_sweep(
                     mean_baseline,
                     steps=steps,
                     baseline_override=base,
+                    batched_vjp=batched_vjp,
                 )
                 c = result["carriage"]
                 for source in range(c.size(1)):
@@ -1317,6 +1364,7 @@ def run_step2(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
     sample_graphs = int(cfg.get("sample_graphs", 200))
     ig_steps = int(config["perturbation"].get("ig_steps", 32))
     swap_partners = int(config["perturbation"].get("swap_partners", 8))
+    batched_vjp = carriage_ig_uses_batched_vjp(config)
     include_swap_attention_check = bool(cfg.get("compare_attention_to_swaps", True))
     run_layer_channel_split = bool(cfg.get("run_layer_channel_split", True))
     tau = int(config.get("primary_tau", 3))
@@ -1341,7 +1389,16 @@ def run_step2(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
             progress_graph("Step 2", model.name, graph_idx, len(graphs))
             gid = graph_identity("test", graph_idx, graph)
             dist = distance_matrix(graph)
-            result = carriage_ig(model.adapter, graph, baseline, steps=ig_steps)
+            result = carriage_ig(
+                model.adapter,
+                graph,
+                baseline,
+                steps=ig_steps,
+                batched_vjp=batched_vjp,
+                capture_attention=True,
+                capture_channels=run_layer_channel_split,
+                capture_layer_outputs=run_layer_channel_split,
+            )
             c_ig = result["carriage"]
             cache = result["clean_cache"]
             tensors[f"step2/{model.name}/{gid}/carriage"] = c_ig
@@ -1477,7 +1534,12 @@ def layer_channel_split_rows(model: ModelRun, graph: Any, result: Mapping[str, A
     for source in range(n):
         pert = encoded.detach().clone()
         pert[source] = baseline[source]
-        cache = model.adapter.forward_from_encoded_content(graph, pert, retain_grad=False)
+        cache = model.adapter.forward_from_encoded_content(
+            graph,
+            pert,
+            retain_grad=False,
+            capture_channels=True,
+        )
         pert_layers = (cache.channel_fields or {}).get("layers", [])
         for layer_idx, clean in enumerate(clean_layers):
             if layer_idx >= len(pert_layers):
@@ -1662,6 +1724,7 @@ def run_step3(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
     cfg = config["steps"]["3"]
     sample_graphs = int(cfg.get("sample_graphs", 200))
     ig_steps = int(config["perturbation"].get("ig_steps", 32))
+    batched_vjp = carriage_ig_uses_batched_vjp(config)
     dpi = int(config["figures"]["dpi"])
     seed = int(config.get("seeds", [0])[0])
     rows: list[dict[str, Any]] = []
@@ -1673,7 +1736,7 @@ def run_step3(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
             progress_graph("Step 3", model.name, graph_idx, len(graphs), split=split)
             gid = graph_identity(split, graph_idx, graph)
             dist = distance_matrix(graph)
-            c = carriage_ig(model.adapter, graph, baseline, steps=ig_steps)["carriage"]
+            c = carriage_ig(model.adapter, graph, baseline, steps=ig_steps, batched_vjp=batched_vjp)["carriage"]
             for row in distance_profile(c.abs(), dist):
                 rows.append({"model": model.name, "split": split, "graph_id": gid, **row})
     write_csv(artifact_root / "metrics" / "step3_train_test_profiles.csv", rows)
@@ -1857,6 +1920,7 @@ def run_step4(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
     tau = int(config.get("primary_tau", 3))
     selection_tau = min(far_thresholds(config))
     ig_steps = int(config["perturbation"].get("ig_steps", 32))
+    batched_vjp = carriage_ig_uses_batched_vjp(config)
     seed = int(config.get("seeds", [0])[0])
     dpi = int(config["figures"]["dpi"])
     rows: list[dict[str, Any]] = []
@@ -1885,7 +1949,14 @@ def run_step4(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
             progress_graph("Step 4", model.name, graph_idx, len(graphs))
             gid = graph_identity("test", graph_idx, graph)
             dist = distance_matrix(graph)
-            result = carriage_ig(model.adapter, graph, baseline, steps=ig_steps)
+            result = carriage_ig(
+                model.adapter,
+                graph,
+                baseline,
+                steps=ig_steps,
+                batched_vjp=batched_vjp,
+                capture_layer_inputs=True,
+            )
             c = result["carriage"]
             clean_cache = result["clean_cache"]
             readout_grad = result["readout_gradient"]
@@ -2237,6 +2308,7 @@ def run_step5(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
     thresholds = far_thresholds(config)
     selection_tau = min(thresholds)
     ig_steps = int(config["perturbation"].get("ig_steps", 32))
+    batched_vjp = carriage_ig_uses_batched_vjp(config)
     seed = int(config.get("seeds", [0])[0])
     dpi = int(config["figures"]["dpi"])
     graphs = select_graphs(dense.adapter, "test", sample_graphs, seed=seed)
@@ -2250,7 +2322,14 @@ def run_step5(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
         progress_graph("Step 5", dense.name, graph_idx, len(graphs))
         gid = graph_identity("test", graph_idx, graph)
         dist = distance_matrix(graph)
-        result = carriage_ig(dense.adapter, graph, dense_base, steps=ig_steps)
+        result = carriage_ig(
+            dense.adapter,
+            graph,
+            dense_base,
+            steps=ig_steps,
+            batched_vjp=batched_vjp,
+            capture_layer_inputs=True,
+        )
         c = result["carriage"]
         clean_cache = result["clean_cache"]
         readout_grad = result["readout_gradient"]
@@ -2678,9 +2757,19 @@ def render_step5_vnode_decision(decision: Mapping[str, Any], artifact_root: Path
     plt.close(fig)
 
 
-def run_intervention_steps(config: Mapping[str, Any], discovery: Sequence[Mapping[str, Any]], artifact_root: Path, steps: Sequence[str]) -> dict[str, Any]:
-    progress(f"instantiating official GRIT adapters for steps: {','.join(steps)}")
-    models = instantiate_official_models(config, discovery)
+def run_intervention_steps(
+    config: Mapping[str, Any],
+    discovery: Sequence[Mapping[str, Any]],
+    artifact_root: Path,
+    steps: Sequence[str],
+    *,
+    models: Optional[Sequence[ModelRun]] = None,
+) -> dict[str, Any]:
+    if models is None:
+        progress(f"instantiating official GRIT adapters for steps: {','.join(steps)}")
+        models = instantiate_official_models(config, discovery)
+    else:
+        progress(f"reusing official GRIT adapters for steps: {','.join(steps)}")
     if not models:
         progress("no official GRIT model artifacts available for intervention steps")
         return {

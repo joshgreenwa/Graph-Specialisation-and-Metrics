@@ -866,6 +866,7 @@ def build_zinc_config(
             "ig_baseline": "mean_node_embedding",
             "ig_steps": 32,
             "swap_partners": 8,
+            "batched_vjp": True,
         },
         "models": models,
         "steps": {
