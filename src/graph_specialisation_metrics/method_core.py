@@ -481,27 +481,6 @@ def distance_profile(values: torch.Tensor, distances: torch.Tensor, *, max_dista
     return rows
 
 
-def attention_rollout(attention_layers: Sequence[torch.Tensor]) -> torch.Tensor:
-    """Compose attention layers with residual mixing.
-
-    Each input can be [N,N] or [H,N,N].  Heads are averaged.
-    """
-
-    rollout: Optional[torch.Tensor] = None
-    for attention in attention_layers:
-        attn = attention
-        if attn.dim() == 3:
-            attn = attn.mean(dim=0)
-        if attn.dim() != 2 or attn.size(0) != attn.size(1):
-            raise ValueError(f"attention layer must be [N,N] or [H,N,N], got {tuple(attention.shape)}")
-        ident = torch.eye(attn.size(0), dtype=attn.dtype, device=attn.device)
-        mixed = 0.5 * attn + 0.5 * ident
-        rollout = mixed if rollout is None else mixed @ rollout
-    if rollout is None:
-        raise ValueError("attention_rollout requires at least one layer")
-    return rollout
-
-
 def integrated_gradients_output(
     predict_fn: Callable[[torch.Tensor], torch.Tensor],
     x: torch.Tensor,

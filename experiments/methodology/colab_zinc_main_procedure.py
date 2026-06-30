@@ -869,12 +869,36 @@ def build_zinc_config(
         },
         "models": models,
         "steps": {
-            "0": {"name": "measurement_model_validation", "sample_graphs": 200},
+            "0": {
+                "name": "measurement_model_validation",
+                "sample_graphs": 200,
+                "ig_step_sweep": [16, 32, 64, 128, 256],
+                "diagnostic_sample_graphs": 16,
+                "baseline_sweep": ["mean_node_embedding", "zero_embedding"],
+                "matched_target_ig_steps": 64,
+                "matched_target_sources_per_graph": 4,
+                "matched_target_partners_per_source": 2,
+            },
             "1": {"name": "performance_gap", "reach_sweep": [1, 2, 3, 5, "dense"]},
-            "2": {"name": "usage_vs_causal_usage", "sample_graphs": 200},
+            "2": {"name": "usage_vs_causal_usage", "sample_graphs": 200, "compare_attention_to_swaps": True},
             "3": {"name": "distance_resolved_overfitting", "sample_graphs": 200},
-            "4": {"name": "mediator_patching", "sample_graphs": 100, "max_far_pairs_per_graph": 64},
-            "5": {"name": "non_composable_gap_attribution", "sample_graphs": 200, "interaction_pairs": 1000},
+            "4": {
+                "name": "mediator_patching",
+                "sample_graphs": 100,
+                "max_far_pairs_per_graph": 64,
+                "depth_pairs_per_graph": 8,
+                "min_effect_abs": 1.0e-6,
+                "run_analytic_patching_check": True,
+                "run_clamp_negative_control": True,
+                "composed_reference_max_direct_fraction": 0.20,
+            },
+            "5": {
+                "name": "non_composable_gap_attribution",
+                "sample_graphs": 200,
+                "max_far_pairs_per_graph": 64,
+                "interaction_pairs": 1000,
+                "min_effect_abs": 1.0e-6,
+            },
         },
         "figures": {"dpi": 180},
         "colab_notes": {
@@ -915,6 +939,36 @@ def run_main_procedure(repo_dir: Path, config_path: Path, *, force: bool, dry_ru
     if not match:
         raise RuntimeError("main_procedure did not report an artifact root")
     return Path(match.group(1).strip())
+
+
+def run_onehop_locality_preflight(
+    repo_dir: Path,
+    config_path: Path,
+    drive_root: Path,
+    *,
+    sample_graphs: int,
+    tolerance: float,
+    env: Mapping[str, str] | None = None,
+) -> Path:
+    output = drive_root / "preflight" / "onehop_locality_certification.json"
+    cmd = [
+        sys.executable,
+        "-m",
+        "graph_specialisation_metrics.main_procedure",
+        "verify-onehop",
+        "--config",
+        str(config_path),
+        "--output",
+        str(output),
+        "--sample-graphs",
+        str(int(sample_graphs)),
+        "--tolerance",
+        str(float(tolerance)),
+    ]
+    print("[preflight] certifying 1-hop GRIT direct attention/routing locality", flush=True)
+    run_cmd(cmd, cwd=repo_dir, check=True, env=env, stream=True)
+    print(f"[preflight] 1-hop locality certification written to {output}", flush=True)
+    return output
 
 
 def load_json(path: Path) -> dict[str, Any]:
@@ -960,7 +1014,10 @@ def write_methodology_fidelity_audit(
     if not include_local_references:
         notes.append("GCN/GIN local validation reference omitted by default because only dense GRIT and 1-hop GRIT checkpoints were requested.")
     if completion.get("incomplete_steps"):
-        notes.append("One or more required steps did not complete. Inspect completion.status_by_step for missing checkpoints, dependency errors, or failed intervention execution.")
+        notes.append(
+            "One or more required steps did not complete. Inspect completion.status_by_step for missing checkpoints, "
+            "dependency errors, or failed intervention execution."
+        )
     audit = {
         "markdown_steps_required": MARKDOWN_REQUIRED_STEPS,
         "config_steps": config.get("steps"),
@@ -1017,6 +1074,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--dry-run", action="store_true", help="Only run main_procedure discovery/status mode.")
     parser.add_argument("--allow-incomplete", action="store_true", help="Do not raise if checkpoints/dependencies are missing or a preflight is requested.")
     parser.add_argument("--include-local-references", action="store_true", help="Include placeholder GCN/GIN entries required by the markdown gate.")
+    parser.add_argument("--skip-onehop-locality-check", action="store_true", help="Skip the hard preflight that certifies the 1-hop control is local.")
+    parser.add_argument("--onehop-locality-check-graphs", type=int, default=4, help="Number of ZINC test graphs used for the 1-hop locality preflight.")
+    parser.add_argument("--onehop-locality-tolerance", type=float, default=1.0e-12, help="Allowed direct attention mass at molecular distance > 1.")
     parser.add_argument("--skip-git", action="store_true", help="Use an already-cloned repo-dir.")
     argv = list(sys.argv[1:] if argv is None else argv)
     cleaned: list[str] = []
@@ -1112,6 +1172,24 @@ def main(argv: Sequence[str] | None = None) -> None:
     )
 
     print(f"[config] wrote {config_path}", flush=True)
+    if not args.skip_onehop_locality_check:
+        try:
+            run_onehop_locality_preflight(
+                args.repo_dir,
+                config_path,
+                args.drive_root,
+                sample_graphs=int(args.onehop_locality_check_graphs),
+                tolerance=float(args.onehop_locality_tolerance),
+                env=analysis_env,
+            )
+        except Exception as exc:
+            write_json(
+                args.drive_root / "preflight" / "onehop_locality_certification_failed.json",
+                {"status": "failed", "error": str(exc), "config_path": str(config_path)},
+            )
+            if not args.allow_incomplete:
+                raise
+            print(f"[preflight-warning] 1-hop locality certification failed but --allow-incomplete is set: {exc}", flush=True)
     artifact_root = run_main_procedure(
         args.repo_dir,
         config_path,

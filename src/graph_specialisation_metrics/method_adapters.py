@@ -446,6 +446,24 @@ class OfficialGRITAdapter:
         cfg.cfg_file = str(self.config_path)
         cfg.device = str(self.device)
         cfg.accelerator = str(self.device)
+        if "1hop" in str(self.variant).lower() or "one_hop" in str(self.variant).lower():
+            attn_cfg = getattr(cfg.gt, "attn", None)
+            sparsity = ""
+            full_attn = None
+            if attn_cfg is not None:
+                try:
+                    sparsity = str(attn_cfg.get("sparsity", ""))
+                except Exception:
+                    sparsity = str(getattr(attn_cfg, "sparsity", ""))
+                try:
+                    full_attn = bool(attn_cfg.get("full_attn"))
+                except Exception:
+                    full_attn = bool(getattr(attn_cfg, "full_attn", True))
+            if sparsity != "one_hop" or full_attn is not False:
+                raise RuntimeError(
+                    "1-hop GRIT adapter loaded a config that does not declare the 1-hop attention control: "
+                    f"gt.attn.sparsity={sparsity!r}, gt.attn.full_attn={full_attn!r}, config={self.config_path}"
+                )
         return cfg
 
     @staticmethod
@@ -560,6 +578,13 @@ class OfficialGRITAdapter:
             values = values.squeeze(-1)
         if values.dim() == 1:
             values = values.unsqueeze(-1)
+        if values.dim() != 2:
+            raise RuntimeError(f"expected sparse GRIT attention with shape [E,H], got {tuple(values.shape)}")
+        if int(values.size(0)) != int(edge_index.size(1)):
+            raise RuntimeError(
+                f"attention/edge support mismatch: attention has {values.size(0)} rows "
+                f"but edge_index has {edge_index.size(1)} edges"
+            )
         # GRIT uses edge_index[0]=source, edge_index[1]=destination. Return
         # [heads, destination, source], matching A[i,j] = receiver i reads source j.
         dense = values.new_zeros((values.size(1), int(num_nodes), int(num_nodes)))
@@ -595,9 +620,14 @@ class OfficialGRITAdapter:
         clean_inputs = None
         if clean_cache is not None and clean_cache.extras is not None:
             clean_inputs = clean_cache.extras.get("layer_input_node_states")
+        if clamp.numel() > 0 and clean_cache is not None and not clean_inputs:
+            raise RuntimeError(
+                "mediator patching requested clamped nodes, but the clean GRIT cache "
+                "does not contain layer inputs; patching would be a no-op"
+            )
 
         def layer_index_from_name(name: str) -> Optional[int]:
-            match = re.search(r"(?:^|\\.)layers\\.(\\d+)(?:\\.|$)", name)
+            match = re.search(r"(?:^|\.)layers\.(\d+)(?:\.|$)", name)
             return int(match.group(1)) if match else None
 
         def feature_encoder_post_hook(module: nn.Module, inputs: tuple[Any, ...], output: Any) -> Any:
@@ -710,6 +740,13 @@ class OfficialGRITAdapter:
             prediction_tensor = prediction.view(-1)
         else:
             raise RuntimeError(f"official GRIT forward returned unsupported prediction type {type(prediction)!r}")
+        if captures["attention"] and not captures["layer_output_node_states"]:
+            raise RuntimeError(
+                "captured GRIT attention maps but no GritTransformerLayer outputs; "
+                "layer hook registration failed, so layer-resolved and mediator-patching analyses would be invalid"
+            )
+        if captures["attention"] and len(captures["attention"]) != len(captures["attention_edges"]):
+            raise RuntimeError("captured GRIT attention maps without matching sparse edge supports")
         final_states = captures["final_node_states"]
         if final_states is None:
             raise RuntimeError("could not capture final GRIT node states before graph readout")
@@ -760,17 +797,8 @@ class OfficialGRITAdapter:
         so future official configs with different readouts remain supported.
         """
         cache = self.forward_with_grad(graph)
-        pred = cache.prediction.reshape(-1)[int(target_index)]
-        pred.backward(retain_graph=False)
-        grad = cache.final_node_states.grad
-        if grad is None:
-            raise RuntimeError("GRIT final node states did not receive a readout gradient")
-        if cache.extras is not None:
-            layer_grads = []
-            for tensor in cache.extras.get("layer_output_node_state_tensors", []):
-                layer_grads.append(tensor.grad.detach().clone() if tensor.grad is not None else torch.zeros_like(tensor).detach())
-            cache.extras["layer_output_node_gradients"] = layer_grads
-        return cache, grad.detach().clone()
+        grad = self._populate_readout_gradients(cache, target_index=target_index)
+        return cache, grad
 
     def readout_gradient_from_encoded_content(
         self,
@@ -780,17 +808,65 @@ class OfficialGRITAdapter:
         target_index: int = 0,
     ) -> tuple[ForwardCache, torch.Tensor]:
         cache = self.forward_from_encoded_content(graph, encoded_content, retain_grad=True)
+        grad = self._populate_readout_gradients(cache, target_index=target_index)
+        return cache, grad
+
+    def _populate_readout_gradients(self, cache: ForwardCache, *, target_index: int = 0) -> torch.Tensor:
         pred = cache.prediction.reshape(-1)[int(target_index)]
-        pred.backward(retain_graph=False)
-        grad = cache.final_node_states.grad
-        if grad is None:
-            raise RuntimeError("GRIT final node states did not receive a readout gradient")
+        if cache.final_node_states is None:
+            raise RuntimeError("GRIT final node states were not captured")
+        layer_tensors = []
         if cache.extras is not None:
-            layer_grads = []
-            for tensor in cache.extras.get("layer_output_node_state_tensors", []):
-                layer_grads.append(tensor.grad.detach().clone() if tensor.grad is not None else torch.zeros_like(tensor).detach())
+            layer_tensors = list(cache.extras.get("layer_output_node_state_tensors", []))
+        tensors: list[torch.Tensor] = []
+        positions: dict[int, int] = {}
+        for tensor in [cache.final_node_states, *layer_tensors]:
+            if not isinstance(tensor, torch.Tensor):
+                continue
+            ident = id(tensor)
+            if ident not in positions:
+                positions[ident] = len(tensors)
+                tensors.append(tensor)
+        grads = torch.autograd.grad(
+            pred,
+            tensors,
+            retain_graph=False,
+            create_graph=False,
+            allow_unused=True,
+        )
+        by_id = {id(tensor): grad for tensor, grad in zip(tensors, grads)}
+        final_grad = by_id.get(id(cache.final_node_states))
+        if final_grad is None:
+            raise RuntimeError("GRIT final node states did not receive a readout gradient")
+        if cache.extras is not None and layer_tensors:
+            layer_grads: list[torch.Tensor] = []
+            layer_norms: list[float] = []
+            missing_layers: list[int] = []
+            zero_layers: list[int] = []
+            for layer_idx, tensor in enumerate(layer_tensors):
+                grad = by_id.get(id(tensor))
+                if grad is None:
+                    missing_layers.append(layer_idx)
+                    continue
+                detached = grad.detach().clone()
+                norm = float(torch.linalg.vector_norm(detached).detach().cpu().item())
+                if norm <= 0.0:
+                    zero_layers.append(layer_idx)
+                layer_grads.append(detached)
+                layer_norms.append(norm)
+            if missing_layers:
+                raise RuntimeError(
+                    "GRIT layer-resolved readout gradients were missing for layer(s) "
+                    f"{missing_layers}; refusing to substitute zeros"
+                )
+            if zero_layers:
+                raise RuntimeError(
+                    "GRIT layer-resolved readout gradients had zero norm for layer(s) "
+                    f"{zero_layers}; layer-resolved channel split would be artificial"
+                )
             cache.extras["layer_output_node_gradients"] = layer_grads
-        return cache, grad.detach().clone()
+            cache.extras["layer_output_node_gradient_norms"] = layer_norms
+        return final_grad.detach().clone()
 
     def predict(self, graph: GraphBatchView) -> torch.Tensor:
         return self.forward(graph).prediction

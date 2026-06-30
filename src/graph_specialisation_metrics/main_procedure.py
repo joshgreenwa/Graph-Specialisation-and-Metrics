@@ -91,12 +91,36 @@ DEFAULT_CONFIG: dict[str, Any] = {
         },
     },
     "steps": {
-        "0": {"name": "measurement_model_validation", "sample_graphs": 200},
+        "0": {
+            "name": "measurement_model_validation",
+            "sample_graphs": 200,
+            "ig_step_sweep": [16, 32, 64, 128, 256],
+            "diagnostic_sample_graphs": 16,
+            "baseline_sweep": ["mean_node_embedding", "zero_embedding"],
+            "matched_target_ig_steps": 64,
+            "matched_target_sources_per_graph": 4,
+            "matched_target_partners_per_source": 2,
+        },
         "1": {"name": "performance_gap", "reach_sweep": [1, 2, 3, 5, "dense"]},
-        "2": {"name": "usage_vs_causal_usage", "sample_graphs": 200},
+        "2": {"name": "usage_vs_causal_usage", "sample_graphs": 200, "compare_attention_to_swaps": True},
         "3": {"name": "distance_resolved_overfitting", "sample_graphs": 200},
-        "4": {"name": "mediator_patching", "sample_graphs": 100, "max_far_pairs_per_graph": 64},
-        "5": {"name": "non_composable_gap_attribution", "sample_graphs": 200, "interaction_pairs": 1000},
+        "4": {
+            "name": "mediator_patching",
+            "sample_graphs": 100,
+            "max_far_pairs_per_graph": 64,
+            "depth_pairs_per_graph": 8,
+            "min_effect_abs": 1.0e-6,
+            "run_analytic_patching_check": True,
+            "run_clamp_negative_control": True,
+            "composed_reference_max_direct_fraction": 0.20,
+        },
+        "5": {
+            "name": "non_composable_gap_attribution",
+            "sample_graphs": 200,
+            "max_far_pairs_per_graph": 64,
+            "interaction_pairs": 1000,
+            "min_effect_abs": 1.0e-6,
+        },
     },
     "figures": {"dpi": 180},
 }
@@ -106,7 +130,14 @@ FAST_DEV_OVERRIDES: dict[str, Any] = {
     "artifact_root": "artifacts/main_procedure_fast_dev",
     "seeds": [41],
     "steps": {
-        "0": {"sample_graphs": 8},
+        "0": {
+            "sample_graphs": 8,
+            "ig_step_sweep": [4, 8],
+            "diagnostic_sample_graphs": 2,
+            "matched_target_ig_steps": 8,
+            "matched_target_sources_per_graph": 2,
+            "matched_target_partners_per_source": 1,
+        },
         "1": {"reach_sweep": [1, "dense"]},
         "2": {"sample_graphs": 8},
         "3": {"sample_graphs": 8},
@@ -172,7 +203,20 @@ def discover_model_artifacts(model_name: str, model_cfg: Mapping[str, Any]) -> d
         root,
         ["*checkpoint*.pt", "*checkpoint*.pth", "*.ckpt", "best*.pt", "best*.pth", "model*.pt"],
     )
-    stats = find_files(root, ["*stats*.json", "*metrics*.json", "*history*.json", "*stats*.csv", "*metrics*.csv", "*history*.csv"])
+    stats = find_files(
+        root,
+        [
+            "*stats*.json",
+            "*metrics*.json",
+            "*history*.json",
+            "*summary*.json",
+            "training_summary.json",
+            "*stats*.csv",
+            "*metrics*.csv",
+            "*history*.csv",
+            "*summary*.csv",
+        ],
+    )
     return {
         "model": model_name,
         "role": model_cfg.get("role"),
@@ -182,7 +226,7 @@ def discover_model_artifacts(model_name: str, model_cfg: Mapping[str, Any]) -> d
         "exists": root.exists(),
         "config_candidates": [str(path) for path in configs[:10] if path.exists()],
         "checkpoint_candidates": [str(path) for path in checkpoints[:10] if path.exists()],
-        "stats_candidates": [str(path) for path in stats[:20] if path.exists()],
+        "stats_candidates": [str(path) for path in stats[:100] if path.exists()],
         "num_configs": len([p for p in configs if p.exists()]),
         "num_checkpoints": len([p for p in checkpoints if p.exists()]),
         "num_stats": len([p for p in stats if p.exists()]),
@@ -232,21 +276,97 @@ def extract_history_rows(model: str, stats_path: Path) -> list[dict[str, Any]]:
     return rows
 
 
+def metric_source_kind(stats_path: Path) -> str:
+    name = stats_path.name.lower()
+    if "summary" in name or "best" in name:
+        return "summary"
+    if stats_path.suffix.lower() == ".csv":
+        return "history_csv"
+    return "history_json"
+
+
+def best_validation_row(rows: Sequence[Mapping[str, Any]]) -> tuple[Mapping[str, Any] | None, str]:
+    keyed: list[tuple[float, int, Mapping[str, Any]]] = []
+    for idx, row in enumerate(rows):
+        val = extract_metric_from_payload(row, ["best_val_mae", "val_mae", "valid_mae", "val_loss", "valid_loss", "val"])
+        if math.isfinite(val):
+            keyed.append((val, idx, row))
+    if keyed:
+        keyed.sort(key=lambda item: (item[0], item[1]))
+        return keyed[0][2], "history_best_val"
+    for row in reversed(list(rows)):
+        has_metric = any(
+            math.isfinite(extract_metric_from_payload(row, keys))
+            for keys in (
+                ["best_test_mae", "test_mae", "mae_test", "test_loss", "test"],
+                ["best_val_mae", "val_mae", "valid_mae", "val_loss", "valid_loss", "val"],
+                ["best_train_mae", "train_mae", "train_loss", "train"],
+            )
+        )
+        if has_metric:
+            return row, "history_final"
+    return None, "history_empty"
+
+
+def choose_preferred_metric_rows(rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    grouped: dict[tuple[str, int | str], list[Mapping[str, Any]]] = {}
+    for row in rows:
+        seed = row.get("seed")
+        seed_key: int | str = int(seed) if isinstance(seed, int) else "unknown"
+        grouped.setdefault((str(row.get("model")), seed_key), []).append(row)
+    out: list[dict[str, Any]] = []
+    source_rank = {"summary": 0, "history_best_val": 1, "history_final": 2, "history_csv": 3, "history_json": 4}
+    for _, items in sorted(grouped.items()):
+        def sort_key(item: Mapping[str, Any]) -> tuple[int, float]:
+            val = safe_float(item.get("val_metric"))
+            return (source_rank.get(str(item.get("source_kind")), 99), val if math.isfinite(val) else float("inf"))
+
+        best = dict(sorted(items, key=sort_key)[0])
+        best["selection_rule"] = "prefer_training_summary_then_best_validation_row"
+        out.append(best)
+    return out
+
+
 def extract_test_metric(model: str, stats_path: Path) -> dict[str, Any] | None:
     try:
         payload = read_json(stats_path) if stats_path.suffix.lower() != ".csv" else read_csv_rows(stats_path)
     except Exception:
         return None
-    test = extract_metric_from_payload(payload, ["test_mae", "mae_test", "test_loss", "test", "best_test_mae"])
-    val = extract_metric_from_payload(payload, ["val_mae", "valid_mae", "best_val_mae", "val_loss", "valid_loss"])
-    train = extract_metric_from_payload(payload, ["train_mae", "train_loss"])
+    source_kind = metric_source_kind(stats_path)
+    selected_payload: Any = payload
+    if isinstance(payload, list):
+        selected, row_kind = best_validation_row([row for row in payload if isinstance(row, Mapping)])
+        if selected is None:
+            return None
+        selected_payload = selected
+        source_kind = row_kind
+    elif isinstance(payload, Mapping) and source_kind != "summary":
+        for key in ("history", "epochs", "stats"):
+            history = payload.get(key)
+            if isinstance(history, list):
+                selected, row_kind = best_validation_row([row for row in history if isinstance(row, Mapping)])
+                if selected is not None:
+                    selected_payload = selected
+                    source_kind = row_kind
+                break
+    test = extract_metric_from_payload(selected_payload, ["best_test_mae", "test_mae", "mae_test", "test_loss", "test"])
+    val = extract_metric_from_payload(selected_payload, ["best_val_mae", "val_mae", "valid_mae", "val_loss", "valid_loss", "val"])
+    train = extract_metric_from_payload(selected_payload, ["best_train_mae", "train_mae", "train_loss", "train"])
     if not any(math.isfinite(v) for v in [test, val, train]):
         return None
     seed = None
     match = re.search(r"(?:seed|s)(\d+)", str(stats_path), flags=re.IGNORECASE)
     if match:
         seed = int(match.group(1))
-    return {"model": model, "seed": seed, "test_metric": test, "val_metric": val, "train_metric": train, "source": str(stats_path)}
+    return {
+        "model": model,
+        "seed": seed,
+        "test_metric": test,
+        "val_metric": val,
+        "train_metric": train,
+        "source": str(stats_path),
+        "source_kind": source_kind,
+    }
 
 
 def run_step_1(discovery: Sequence[Mapping[str, Any]], artifact_root: Path, config: Mapping[str, Any]) -> dict[str, Any]:
@@ -260,6 +380,7 @@ def run_step_1(discovery: Sequence[Mapping[str, Any]], artifact_root: Path, conf
             if metric is not None:
                 metric_rows.append(metric)
             history_rows.extend(extract_history_rows(model, path))
+    metric_rows = choose_preferred_metric_rows(metric_rows)
     write_csv(artifact_root / "metrics" / "step1_test_metrics.csv", metric_rows)
     write_csv(artifact_root / "metrics" / "step1_training_history.csv", history_rows)
     render_step_1_figures(metric_rows, history_rows, artifact_root, config)
@@ -291,7 +412,7 @@ def render_step_1_figures(
             fig, ax = plt.subplots(figsize=(7.2, 4.4), constrained_layout=True)
             ax.bar(models, means, yerr=stds, color=["#4c78a8", "#f58518", "#54a24b", "#b279a2"][: len(models)], capsize=4)
             ax.set_title("Step 1: test error by model")
-            ax.set_ylabel("Test metric (lower is better)")
+            ax.set_ylabel("Test MAE")
             ax.set_xlabel("Model")
             for tick in ax.get_xticklabels():
                 tick.set_rotation(15)
@@ -314,8 +435,8 @@ def render_step_1_figures(
             if any(math.isfinite(v) for v in val):
                 ax.plot(x, val, linewidth=1.5, linestyle="--", label=f"{model} val")
         ax.set_title("Step 1: training and validation curves")
-        ax.set_xlabel("Epoch/step")
-        ax.set_ylabel("Loss/metric")
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel("L1 / MAE loss")
         ax.legend(frameon=False, fontsize=8)
         fig.savefig(figures / "step1_training_validation_loss.png", dpi=dpi)
         fig.savefig(figures / "step1_training_validation_loss.pdf")
@@ -368,6 +489,114 @@ def run_adapter_checks(config: Mapping[str, Any], discovery: Sequence[Mapping[st
             except Exception as exc:
                 status["parameter_match_error"] = str(exc)
     return status
+
+
+def verify_onehop_locality(
+    config: Mapping[str, Any],
+    *,
+    output: Path,
+    sample_graphs: int = 4,
+    tolerance: float = 1.0e-12,
+) -> dict[str, Any]:
+    """Certify that the 1-hop GRIT checkpoint has no direct non-local attention.
+
+    This is intentionally a hard preflight for the 1-hop control: every captured
+    attention layer must use only self/neighbor molecular pairs, and its direct
+    attention mass on pairs with molecular distance > 1 must be zero up to the
+    provided numerical tolerance.
+    """
+
+    from graph_specialisation_metrics.grit_intervention_procedure import (
+        attention_support_audit_rows,
+        attention_support_failures,
+        distance_matrix,
+        graph_identity,
+        instantiate_official_models,
+        select_graphs,
+    )
+
+    progress("1-hop locality preflight: discovering model artifacts")
+    discovery = [discover_model_artifacts(name, cfg) for name, cfg in config["models"].items()]
+    models = instantiate_official_models(config, discovery)
+    onehop = next((m for m in models if m.name == "grit_1hop" or m.variant == "1hop"), None)
+    if onehop is None:
+        raise RuntimeError("1-hop locality preflight failed: no loadable grit_1hop official adapter was found")
+
+    seed = int(config.get("seeds", [0])[0])
+    graphs = select_graphs(onehop.adapter, "test", int(sample_graphs), seed=seed)
+    if not graphs:
+        raise RuntimeError("1-hop locality preflight failed: no test graphs were available")
+
+    rows: list[dict[str, Any]] = []
+    progress(f"1-hop locality preflight: checking {len(graphs)} graph(s)")
+    for graph_idx, graph in enumerate(graphs):
+        gid = graph_identity("test", graph_idx, graph)
+        dist = distance_matrix(graph)
+        cache = onehop.adapter.forward(graph)
+        rows.extend(
+            attention_support_audit_rows(
+                cache,
+                dist,
+                onehop.name,
+                gid,
+                expected_max_direct_distance=1,
+            )
+        )
+
+    csv_path = output.with_suffix(".csv")
+    write_csv(csv_path, rows)
+    if not rows:
+        raise RuntimeError("1-hop locality preflight failed: no attention layers were captured")
+
+    support_failures = list(attention_support_failures(rows))
+    mass_failures = [
+        row
+        for row in rows
+        if math.isfinite(safe_float(row.get("direct_attention_mass_distance_gt1")))
+        and safe_float(row.get("direct_attention_mass_distance_gt1")) > float(tolerance)
+    ]
+    max_distance = max(
+        [safe_float(row.get("max_direct_attention_distance")) for row in rows if math.isfinite(safe_float(row.get("max_direct_attention_distance")))]
+        or [float("nan")]
+    )
+    max_nonlocal_mass = max(
+        [safe_float(row.get("direct_attention_mass_distance_gt1")) for row in rows if math.isfinite(safe_float(row.get("direct_attention_mass_distance_gt1")))]
+        or [float("nan")]
+    )
+    total_nonlocal_edges = int(sum(max(0.0, safe_float(row.get("direct_edges_distance_gt1", 0))) for row in rows))
+    total_expected_violations = int(sum(max(0.0, safe_float(row.get("expected_distance_violating_edges", 0))) for row in rows))
+    summary = {
+        "status": "pass" if not support_failures and not mass_failures else "failed",
+        "model": onehop.name,
+        "variant": onehop.variant,
+        "sample_graphs": len(graphs),
+        "attention_layers_checked": len(rows),
+        "expected_max_direct_distance": 1,
+        "tolerance": float(tolerance),
+        "max_direct_attention_distance": max_distance,
+        "max_direct_attention_mass_distance_gt1": max_nonlocal_mass,
+        "total_direct_edges_distance_gt1": total_nonlocal_edges,
+        "total_expected_distance_violating_edges": total_expected_violations,
+        "support_failures": len(support_failures),
+        "mass_failures": len(mass_failures),
+        "csv_path": str(csv_path),
+    }
+    write_json(output, summary)
+    progress(
+        "1-hop locality preflight: "
+        f"status={summary['status']} max_distance={summary['max_direct_attention_distance']} "
+        f"max_nonlocal_mass={summary['max_direct_attention_mass_distance_gt1']}"
+    )
+    if support_failures or mass_failures:
+        first = (support_failures or mass_failures)[0]
+        raise RuntimeError(
+            "1-hop locality preflight failed: grit_1hop has direct non-local attention/routing. "
+            f"First failure graph={first.get('graph_id')} layer={first.get('layer')} "
+            f"max_distance={first.get('max_direct_attention_distance')} "
+            f"nonlocal_mass={first.get('direct_attention_mass_distance_gt1')}. "
+            f"Audit written to {output} and {csv_path}."
+        )
+    return summary
 
 
 def write_step_status(step: str, artifact_root: Path, status: Mapping[str, Any]) -> None:
@@ -525,6 +754,11 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--fast-dev-run", action="store_true")
     run.add_argument("--dry-run", action="store_true")
     run.add_argument("--force", action="store_true")
+    verify = sub.add_parser("verify-onehop", help="Certify that grit_1hop has no direct non-local attention/routing.")
+    verify.add_argument("--config", type=str, required=True)
+    verify.add_argument("--output", type=str, required=True)
+    verify.add_argument("--sample-graphs", type=int, default=4)
+    verify.add_argument("--tolerance", type=float, default=1.0e-12)
     return parser
 
 
@@ -539,6 +773,16 @@ def main(argv: Sequence[str] | None = None) -> None:
             force=bool(args.force),
         )
         print(f"[done] main procedure artifacts: {root}", flush=True)
+    elif args.command == "verify-onehop":
+        config = load_config(args.config, fast_dev_run=False, output_root=None)
+        summary = verify_onehop_locality(
+            config,
+            output=Path(args.output),
+            sample_graphs=int(args.sample_graphs),
+            tolerance=float(args.tolerance),
+        )
+        print(f"[done] 1-hop locality certification: {args.output}", flush=True)
+        print(json.dumps(summary, indent=2, sort_keys=True), flush=True)
     else:  # pragma: no cover
         raise ValueError(args.command)
 

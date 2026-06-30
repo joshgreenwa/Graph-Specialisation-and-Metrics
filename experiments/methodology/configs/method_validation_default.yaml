@@ -10,6 +10,7 @@ carriage:
   min_planted_pair_distance: 3
   analysis_graphs: 200
   ig_steps: 32
+  swap_partners: 8
   train_epochs: 250
   learning_rate: 0.001
   fit_mse_fraction_target_variance: 0.01

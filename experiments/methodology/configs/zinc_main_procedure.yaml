@@ -49,12 +49,19 @@ steps:
   "0":
     name: measurement_model_validation
     sample_graphs: 200
+    ig_step_sweep: [16, 32, 64, 128, 256]
+    diagnostic_sample_graphs: 16
+    baseline_sweep: [mean_node_embedding, zero_embedding]
+    matched_target_ig_steps: 64
+    matched_target_sources_per_graph: 4
+    matched_target_partners_per_source: 2
   "1":
     name: performance_gap
     reach_sweep: [1, 2, 3, 5, dense]
   "2":
     name: usage_vs_causal_usage
     sample_graphs: 200
+    compare_attention_to_swaps: true
   "3":
     name: distance_resolved_overfitting
     sample_graphs: 200
@@ -62,10 +69,17 @@ steps:
     name: mediator_patching
     sample_graphs: 100
     max_far_pairs_per_graph: 64
+    depth_pairs_per_graph: 8
+    min_effect_abs: 1.0e-6
+    run_analytic_patching_check: true
+    run_clamp_negative_control: true
+    composed_reference_max_direct_fraction: 0.20
   "5":
     name: non_composable_gap_attribution
     sample_graphs: 200
+    max_far_pairs_per_graph: 64
     interaction_pairs: 1000
+    min_effect_abs: 1.0e-6
 
 figures:
   dpi: 180

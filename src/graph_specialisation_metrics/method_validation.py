@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import copy
 import math
+import random
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -71,6 +72,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "min_planted_pair_distance": 3,
         "analysis_graphs": 200,
         "ig_steps": 32,
+        "swap_partners": 8,
         "train_epochs": 250,
         "learning_rate": 0.001,
         "small_gt": {"layers": 3, "hidden_dim": 64, "heads": 4},
@@ -105,6 +107,7 @@ FAST_DEV_OVERRIDES: dict[str, Any] = {
         "num_nodes": 14,
         "analysis_graphs": 12,
         "ig_steps": 8,
+        "swap_partners": 3,
         "train_epochs": 45,
         "small_gt": {"layers": 2, "hidden_dim": 32, "heads": 4},
     },
@@ -366,6 +369,90 @@ def plot_carriage(rows: Sequence[Mapping[str, Any]], history: Sequence[Mapping[s
     return {"r2": float(r2), "auroc": float(auc)}
 
 
+def carriage_estimator_bakeoff_rows(
+    adapter: Any,
+    graphs: Sequence[GraphBatchView],
+    *,
+    baseline: torch.Tensor,
+    cfg: Mapping[str, Any],
+    device: torch.device,
+    seed: int,
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    partners = int(cfg.get("swap_partners", 8))
+    for graph_idx, raw_graph in enumerate(graphs[: int(cfg["analysis_graphs"])]):
+        graph = graph_to_device(raw_graph, device)
+        planted = set(int(v) for v in (graph.metadata or {}).get("planted_nodes", []))
+        base = baseline.expand_as(graph.x).to(device=device, dtype=graph.x.dtype)
+
+        def predict_from_x(x_new: torch.Tensor) -> torch.Tensor:
+            return adapter.predict(graph.clone_with(x=x_new))
+
+        ig = integrated_gradients_output(
+            predict_from_x,
+            graph.x,
+            base,
+            steps=int(cfg["ig_steps"]),
+        )
+        ig_scores = ig.sum(dim=-1).detach().abs().cpu()
+        clean = float(adapter.predict(graph).detach().cpu().reshape(-1)[0].item())
+        swap_scores = []
+        for node in range(graph.num_nodes):
+            choices = [idx for idx in range(graph.num_nodes) if idx != node]
+            rng = random.Random(int(seed) + graph_idx * 1009 + node * 9173)
+            rng.shuffle(choices)
+            vals = []
+            for partner in choices[: max(1, min(partners, len(choices)))]:
+                x_new = graph.x.detach().clone()
+                x_new[node] = graph.x[int(partner)]
+                pred = float(adapter.predict(graph.clone_with(x=x_new)).detach().cpu().reshape(-1)[0].item())
+                denom = float(torch.linalg.vector_norm(graph.x[node] - graph.x[int(partner)]).detach().cpu().item())
+                vals.append((pred - clean) / max(denom, 1.0e-12))
+            swap_scores.append(float(np.sqrt(np.mean(np.square(vals)))) if vals else 0.0)
+        score_by_estimator = {
+            "ig": ig_scores.numpy().astype(float),
+            "swap": np.asarray(swap_scores, dtype=float),
+        }
+        for estimator, scores in score_by_estimator.items():
+            norm = float(np.sum(np.abs(scores)))
+            for node, score in enumerate(scores):
+                rows.append(
+                    {
+                        "graph_index": graph_idx,
+                        "node": int(node),
+                        "estimator": estimator,
+                        "planted": int(node in planted),
+                        "influence_score": float(score),
+                        "normalised_influence_score": float(abs(score) / max(norm, 1.0e-12)),
+                    }
+                )
+    return rows
+
+
+def plot_carriage_estimator_bakeoff(rows: Sequence[Mapping[str, Any]], out_dir: Path, cfg: Mapping[str, Any]) -> list[dict[str, float]]:
+    summary: list[dict[str, float]] = []
+    for estimator in sorted(set(str(r["estimator"]) for r in rows)):
+        est_rows = [r for r in rows if str(r["estimator"]) == estimator]
+        labels = np.asarray([int(r["planted"]) for r in est_rows], dtype=bool)
+        scores = np.asarray([float(r["normalised_influence_score"]) for r in est_rows], dtype=np.float64)
+        summary.append({"estimator": estimator, "auroc": float(auroc_score(labels, scores)), "rows": float(len(est_rows))})
+    if summary:
+        figures = ensure_dir(out_dir / "figures")
+        fig, ax = plt.subplots(figsize=(6.8, 4.2), constrained_layout=True)
+        labels = [str(r["estimator"]).upper() for r in summary]
+        values = [float(r["auroc"]) for r in summary]
+        ax.bar(labels, values, color=["#4c78a8", "#f58518"][: len(labels)])
+        ax.set_ylim(0.0, 1.0)
+        ax.axhline(0.5, color="#555555", linestyle="--", linewidth=1)
+        ax.set_title("Validation 1b: known-source ranking, IG vs swap")
+        ax.set_xlabel("Estimator")
+        ax.set_ylabel("AUROC for planted atoms")
+        fig.savefig(figures / "validation_carriage_estimator_bakeoff.png", dpi=int(cfg["figures"]["dpi"]))
+        fig.savefig(figures / "validation_carriage_estimator_bakeoff.pdf")
+        plt.close(fig)
+    return summary
+
+
 def run_carriage_check(cfg: Mapping[str, Any], out_dir: Path, device: torch.device, seed: int) -> dict[str, float]:
     graphs, weight = make_carriage_dataset(cfg["carriage"], seed)
     adapter, history = train_small_gt(graphs, cfg["carriage"], device=device, seed=seed)
@@ -380,6 +467,19 @@ def run_carriage_check(cfg: Mapping[str, Any], out_dir: Path, device: torch.devi
     write_csv(out_dir / "metrics" / "carriage_reconstruction.csv", rows)
     write_csv(out_dir / "metrics" / "carriage_training.csv", history)
     metrics = plot_carriage(rows, history, out_dir, cfg)
+    bakeoff_rows = carriage_estimator_bakeoff_rows(
+        adapter,
+        graphs,
+        baseline=baseline,
+        cfg=cfg["carriage"],
+        device=device,
+        seed=seed,
+    )
+    bakeoff_summary = plot_carriage_estimator_bakeoff(bakeoff_rows, out_dir, cfg)
+    write_csv(out_dir / "metrics" / "carriage_estimator_bakeoff.csv", bakeoff_rows)
+    write_csv(out_dir / "metrics" / "carriage_estimator_bakeoff_summary.csv", bakeoff_summary)
+    for row in bakeoff_summary:
+        metrics[f"{row['estimator']}_source_ranking_auroc"] = float(row["auroc"])
     write_json(out_dir / "metrics" / "carriage_summary.json", metrics)
     tensor_payload["target_weight"] = weight
     atomic_torch_save(out_dir / "tensors" / "carriage_check.pt", tensor_payload)

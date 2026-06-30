@@ -8723,18 +8723,6 @@ def attention_from_layer(layer: Mapping[str, Any]) -> np.ndarray:
     return attn.mean(dim=1)[0].numpy()
 
 
-def attention_rollout_from_layers(layers: Sequence[Mapping[str, Any]], n: int) -> np.ndarray:
-    rollout = np.eye(n, dtype=float)
-    for layer in layers:
-        a = attention_from_layer(layer)[:n, :n]
-        a = np.where(np.isfinite(a), a, 0.0)
-        a = 0.5 * a + 0.5 * np.eye(n, dtype=float)
-        row_sum = a.sum(axis=1, keepdims=True)
-        a = a / np.maximum(row_sum, 1.0e-12)
-        rollout = a @ rollout
-    return rollout
-
-
 def floor_correct_source_map_zinc(raw: np.ndarray, dist: np.ndarray, far_floor_hops: int) -> np.ndarray:
     raw2 = np.asarray(raw, dtype=float) ** 2
     corrected = np.zeros_like(raw2)
@@ -8856,9 +8844,7 @@ def compute_one_graph_gpi(spec: ModelSpec, probe: AttentionProbeManager,
     direct_source_share = _normalise_source_vector(raw_direct)
     layers = clean_collect.get("layers") or []
     last_attn = attention_from_layer(layers[-1])[:n, :n]
-    rollout = attention_rollout_from_layers(layers, n)
     last_share = attention_share(last_attn, dist)
-    rollout_share = attention_share(rollout, dist)
     return {
         "graph_idx": int(graph_idx),
         "model": spec.name,
@@ -8878,7 +8864,6 @@ def compute_one_graph_gpi(spec: ModelSpec, probe: AttentionProbeManager,
         "direct_graph_output_source_map": raw_direct,
         "direct_graph_output_source_share": direct_source_share,
         "last_attention_share": last_share,
-        "rollout_attention_share": rollout_share,
         "edges": gpi_graph_edges(batch_cpu, n),
         "atom_features": x.numpy(),
     }
@@ -9386,7 +9371,6 @@ def run_carriage_analysis_for_model(
             clean_collect = probe.forward_collect(batch.clone().to(device))
             layers = clean_collect.get("layers") or []
             last_attn = attention_from_layer(layers[-1])[:n, :n]
-            rollout = attention_rollout_from_layers(layers, n)
 
             c_sq = np.zeros((n, n), dtype=float)
             c_signed = np.zeros((n, n), dtype=float)
@@ -9439,10 +9423,8 @@ def run_carriage_analysis_for_model(
             valid = np.isfinite(dist) & (dist > 0)
             far = valid & (dist >= float(gpi_cfg.carriage_far_hops))
             attn_last_share = attention_share(last_attn, dist)
-            attn_roll_share = attention_share(rollout, dist)
             for attn_name, attn_mat in [
                 ("last_attention_share", attn_last_share),
-                ("rollout_attention_share", attn_roll_share),
             ]:
                 corrs = []
                 for receiver in range(n):
@@ -9669,12 +9651,12 @@ def plot_carriage_outputs(
         axes[0].set_title("Does Far Attention Carry Output-Relevant Signal?")
         axes[0].grid(color="#eeeeee", linewidth=0.5)
         axes[0].legend(frameon=False, fontsize=8)
-        sub = attn_summary[attn_summary["attention"] == "rollout_attention_share"].copy()
+        sub = attn_summary[attn_summary["attention"] == "last_attention_share"].copy()
         x = np.arange(len(sub))
         axes[1].bar(x, sub["receiver_spearman_mean"], color=[colors.get(m, "#777777") for m in sub["model"]])
         axes[1].set_xticks(x)
         axes[1].set_xticklabels(sub["model"], rotation=25, ha="right")
-        axes[1].set_ylabel("Spearman(attention rollout, carriage)")
+        axes[1].set_ylabel("Spearman(direct attention, carriage)")
         axes[1].set_title("Attention Faithfulness to Carriage")
         axes[1].grid(axis="y", color="#dddddd", linewidth=0.6)
         fig.tight_layout()
@@ -9795,7 +9777,7 @@ def attention_faithfulness_rows(records: Sequence[Dict[str, Any]]) -> pd.DataFra
         source = np.asarray(rec.get("source_p1_share", rec["source_share"]), dtype=float)
         dist = np.asarray(rec["distances"], dtype=float)
         valid_base = np.isfinite(dist) & (dist > 0)
-        for attn_key in ["last_attention_share", "rollout_attention_share"]:
+        for attn_key in ["last_attention_share"]:
             attn = np.asarray(rec[attn_key], dtype=float)
             corrs = []
             for receiver in range(int(rec["n"])):
@@ -9948,7 +9930,7 @@ def write_source_map_availability(records_by_model: Mapping[str, Sequence[Dict[s
 
 def plot_attention_overlay(summary: pd.DataFrame, out_dir: Path) -> None:
     plt = import_plotting()
-    keep = summary[summary["matrix"].isin(["source_p1_share", "source_share", "last_attention_share", "rollout_attention_share"])].copy()
+    keep = summary[summary["matrix"].isin(["source_p1_share", "source_share", "last_attention_share"])].copy()
     if keep.empty:
         return
     models = list(keep["model"].drop_duplicates())
@@ -9957,13 +9939,11 @@ def plot_attention_overlay(summary: pd.DataFrame, out_dir: Path) -> None:
         "source_p1_share": "GPI P1 source map",
         "source_share": "GPI source map",
         "last_attention_share": "last-layer attention",
-        "rollout_attention_share": "attention rollout",
     }
     style = {
         "source_p1_share": ("#111111", "-"),
         "source_share": ("#111111", "-"),
         "last_attention_share": ("#c2473f", "--"),
-        "rollout_attention_share": ("#4f78b5", ":"),
     }
     for ax, model in zip(axes[0], models):
         sub = keep[keep["model"] == model]
@@ -9998,7 +9978,7 @@ def plot_attention_scatter(records_by_model: Mapping[str, Sequence[Dict[str, Any
             if rec.get("target") == "graph_output_patch" and rec.get("patch_status") != "p1_p2":
                 continue
             source = np.asarray(rec.get("source_p1_share", rec["source_share"]), dtype=float)
-            attn = np.asarray(rec["rollout_attention_share"], dtype=float)
+            attn = np.asarray(rec["last_attention_share"], dtype=float)
             dist = np.asarray(rec["distances"], dtype=float)
             valid = np.isfinite(dist) & (dist > 0)
             xs.extend(attn[valid].tolist())
@@ -10016,7 +9996,7 @@ def plot_attention_scatter(records_by_model: Mapping[str, Sequence[Dict[str, Any
             continue
         sc = ax.scatter(xs, ys, c=cs, s=7, alpha=0.35, cmap="viridis", linewidths=0)
         ax.set_title(model)
-        ax.set_xlabel("attention rollout mass")
+        ax.set_xlabel("direct attention mass")
         ax.grid(color="#eeeeee", linewidth=0.5)
     axes[0, 0].set_ylabel("GPI source-map mass")
     if sc is not None:
@@ -10179,9 +10159,9 @@ def write_gpi_method_notes(out_dir: Path) -> None:
             "direct graph-output source sensitivity, and P1/P2 receiver-source figures skip "
             "the model instead of fabricating a pooled patch."
         ),
-        "attention_rollout": (
-            "Rollout is computed from mean-head attention with a 0.5 residual mixture per layer. "
-            "Last-layer attention is reported separately."
+        "attention": (
+            "Attention diagnostics use direct last-layer attention only. "
+            "No chained attention quantity is computed."
         ),
         "sparsification_backstop": (
             "Not run in this first standalone script. Graphormer's graph token and GRIT's "
@@ -10207,7 +10187,7 @@ def write_gpi_method_notes(out_dir: Path) -> None:
             "of carrier i and delta h_i(j) is the final-state change caused by content swaps "
             "at source j. It reports source-carrier distance profiles, first-order "
             "reconstruction of measured graph-output deltas, far-submatrix rank against a "
-            "distance-preserving source-label shuffle null, and observational attention-vs-"
+            "distance-preserving source-label shuffle null, and observational direct-attention-vs-"
             "carriage faithfulness."
         ),
     }
@@ -10243,8 +10223,7 @@ def run_zinc_gpi_main() -> None:
         print(f"[gpi] running {spec.name}")
         records = run_gpi_for_model(spec, run_cfg, gpi_cfg, device, out_dir)
         records_by_model[spec.name] = records
-        for key in ["source_p1_share", "source_p2_share",
-                    "last_attention_share", "rollout_attention_share"]:
+        for key in ["source_p1_share", "source_p2_share", "last_attention_share"]:
             all_profile_rows.append(distance_bins_from_records(records, key))
         all_profile_rows.append(direct_output_distance_bins_from_records(records))
         all_faithfulness.append(attention_faithfulness_rows(records))
