@@ -62,6 +62,7 @@ steps:
     name: usage_vs_causal_usage
     sample_graphs: 200
     compare_attention_to_swaps: true
+    run_layer_channel_split: true
   "3":
     name: distance_resolved_overfitting
     sample_graphs: 200

@@ -102,7 +102,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "matched_target_partners_per_source": 2,
         },
         "1": {"name": "performance_gap", "reach_sweep": [1, 2, 3, 5, "dense"]},
-        "2": {"name": "usage_vs_causal_usage", "sample_graphs": 200, "compare_attention_to_swaps": True},
+        "2": {
+            "name": "usage_vs_causal_usage",
+            "sample_graphs": 200,
+            "compare_attention_to_swaps": True,
+            "run_layer_channel_split": True,
+        },
         "3": {"name": "distance_resolved_overfitting", "sample_graphs": 200},
         "4": {
             "name": "mediator_patching",
@@ -129,20 +134,86 @@ DEFAULT_CONFIG: dict[str, Any] = {
 FAST_DEV_OVERRIDES: dict[str, Any] = {
     "artifact_root": "artifacts/main_procedure_fast_dev",
     "seeds": [41],
+    "perturbation": {
+        "ig_steps": 4,
+        "swap_partners": 1,
+    },
     "steps": {
         "0": {
-            "sample_graphs": 8,
+            "sample_graphs": 2,
             "ig_step_sweep": [4, 8],
-            "diagnostic_sample_graphs": 2,
-            "matched_target_ig_steps": 8,
-            "matched_target_sources_per_graph": 2,
+            "diagnostic_sample_graphs": 1,
+            "matched_target_ig_steps": 4,
+            "matched_target_sources_per_graph": 1,
             "matched_target_partners_per_source": 1,
         },
         "1": {"reach_sweep": [1, "dense"]},
-        "2": {"sample_graphs": 8},
-        "3": {"sample_graphs": 8},
-        "4": {"sample_graphs": 4, "max_far_pairs_per_graph": 4},
-        "5": {"sample_graphs": 8, "interaction_pairs": 32},
+        "2": {"sample_graphs": 2, "compare_attention_to_swaps": False, "run_layer_channel_split": False},
+        "3": {"sample_graphs": 2},
+        "4": {"sample_graphs": 1, "max_far_pairs_per_graph": 1, "depth_pairs_per_graph": 0},
+        "5": {"sample_graphs": 2, "max_far_pairs_per_graph": 2, "interaction_pairs": 16},
+    },
+}
+
+
+ANALYSIS_PRESET_OVERRIDES: dict[str, dict[str, Any]] = {
+    "full": {},
+    "smoke": FAST_DEV_OVERRIDES,
+    "pilot": {
+        "seeds": [41],
+        "perturbation": {
+            "ig_steps": 8,
+            "swap_partners": 2,
+        },
+        "steps": {
+            "0": {
+                "sample_graphs": 8,
+                "ig_step_sweep": [8, 16],
+                "diagnostic_sample_graphs": 2,
+                "baseline_sweep": ["mean_node_embedding"],
+                "matched_target_ig_steps": 8,
+                "matched_target_sources_per_graph": 2,
+                "matched_target_partners_per_source": 1,
+            },
+            "1": {"reach_sweep": [1, "dense"]},
+            "2": {"sample_graphs": 8, "compare_attention_to_swaps": False, "run_layer_channel_split": False},
+            "3": {"sample_graphs": 8},
+            "4": {
+                "sample_graphs": 4,
+                "max_far_pairs_per_graph": 2,
+                "depth_pairs_per_graph": 0,
+                "run_clamp_negative_control": True,
+            },
+            "5": {"sample_graphs": 8, "max_far_pairs_per_graph": 2, "interaction_pairs": 64},
+        },
+    },
+    "medium": {
+        "seeds": [41],
+        "perturbation": {
+            "ig_steps": 16,
+            "swap_partners": 2,
+        },
+        "steps": {
+            "0": {
+                "sample_graphs": 16,
+                "ig_step_sweep": [8, 16, 32],
+                "diagnostic_sample_graphs": 4,
+                "baseline_sweep": ["mean_node_embedding", "zero_embedding"],
+                "matched_target_ig_steps": 16,
+                "matched_target_sources_per_graph": 2,
+                "matched_target_partners_per_source": 1,
+            },
+            "1": {"reach_sweep": [1, "dense"]},
+            "2": {"sample_graphs": 16, "compare_attention_to_swaps": False, "run_layer_channel_split": False},
+            "3": {"sample_graphs": 16},
+            "4": {
+                "sample_graphs": 8,
+                "max_far_pairs_per_graph": 4,
+                "depth_pairs_per_graph": 0,
+                "run_clamp_negative_control": True,
+            },
+            "5": {"sample_graphs": 16, "max_far_pairs_per_graph": 4, "interaction_pairs": 128},
+        },
     },
 }
 
@@ -733,12 +804,24 @@ def run_main(config: Mapping[str, Any], *, steps: Sequence[str], dry_run: bool =
     return artifact_root
 
 
-def load_config(path: str | None, *, fast_dev_run: bool, output_root: str | None) -> dict[str, Any]:
+def load_config(
+    path: str | None,
+    *,
+    fast_dev_run: bool,
+    output_root: str | None,
+    analysis_preset: str = "full",
+) -> dict[str, Any]:
     cfg = copy.deepcopy(DEFAULT_CONFIG)
     if path:
         cfg = deep_update(cfg, read_yaml(path))
-    if fast_dev_run:
-        cfg = deep_update(cfg, FAST_DEV_OVERRIDES)
+    configured_artifact_root = cfg.get("artifact_root") if path else None
+    preset = "smoke" if fast_dev_run and analysis_preset == "full" else str(analysis_preset)
+    if preset not in ANALYSIS_PRESET_OVERRIDES:
+        raise ValueError(f"unknown analysis preset {preset!r}; expected one of {sorted(ANALYSIS_PRESET_OVERRIDES)}")
+    if preset != "full":
+        cfg = deep_update(cfg, ANALYSIS_PRESET_OVERRIDES[preset])
+        if configured_artifact_root is not None:
+            cfg["artifact_root"] = configured_artifact_root
     if output_root:
         cfg["artifact_root"] = output_root
     return cfg
@@ -751,6 +834,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--config", type=str, default=None)
     run.add_argument("--steps", type=str, default="all")
     run.add_argument("--output-root", type=str, default=None)
+    run.add_argument("--analysis-preset", choices=sorted(ANALYSIS_PRESET_OVERRIDES), default="full")
     run.add_argument("--fast-dev-run", action="store_true")
     run.add_argument("--dry-run", action="store_true")
     run.add_argument("--force", action="store_true")
@@ -765,7 +849,12 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
     if args.command == "run":
-        config = load_config(args.config, fast_dev_run=bool(args.fast_dev_run), output_root=args.output_root)
+        config = load_config(
+            args.config,
+            fast_dev_run=bool(args.fast_dev_run),
+            output_root=args.output_root,
+            analysis_preset=str(args.analysis_preset),
+        )
         root = run_main(
             config,
             steps=parse_steps(args.steps),
@@ -774,7 +863,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         )
         print(f"[done] main procedure artifacts: {root}", flush=True)
     elif args.command == "verify-onehop":
-        config = load_config(args.config, fast_dev_run=False, output_root=None)
+        config = load_config(args.config, fast_dev_run=False, output_root=None, analysis_preset="full")
         summary = verify_onehop_locality(
             config,
             output=Path(args.output),

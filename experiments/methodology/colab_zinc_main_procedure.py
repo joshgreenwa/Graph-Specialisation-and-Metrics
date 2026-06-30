@@ -880,7 +880,12 @@ def build_zinc_config(
                 "matched_target_partners_per_source": 2,
             },
             "1": {"name": "performance_gap", "reach_sweep": [1, 2, 3, 5, "dense"]},
-            "2": {"name": "usage_vs_causal_usage", "sample_graphs": 200, "compare_attention_to_swaps": True},
+            "2": {
+                "name": "usage_vs_causal_usage",
+                "sample_graphs": 200,
+                "compare_attention_to_swaps": True,
+                "run_layer_channel_split": True,
+            },
             "3": {"name": "distance_resolved_overfitting", "sample_graphs": 200},
             "4": {
                 "name": "mediator_patching",
@@ -919,7 +924,17 @@ def write_yaml(path: Path, payload: Mapping[str, Any]) -> Path:
     return path
 
 
-def run_main_procedure(repo_dir: Path, config_path: Path, *, force: bool, dry_run: bool, env: Mapping[str, str] | None = None) -> Path:
+def run_main_procedure(
+    repo_dir: Path,
+    config_path: Path,
+    *,
+    steps: str,
+    force: bool,
+    analysis_preset: str,
+    fast_dev_run: bool,
+    dry_run: bool,
+    env: Mapping[str, str] | None = None,
+) -> Path:
     cmd = [
         sys.executable,
         "-m",
@@ -928,10 +943,14 @@ def run_main_procedure(repo_dir: Path, config_path: Path, *, force: bool, dry_ru
         "--config",
         str(config_path),
         "--steps",
-        "all",
+        str(steps),
+        "--analysis-preset",
+        str(analysis_preset),
     ]
     if force:
         cmd.append("--force")
+    if fast_dev_run:
+        cmd.append("--fast-dev-run")
     if dry_run:
         cmd.append("--dry-run")
     proc = run_cmd(cmd, cwd=repo_dir, check=True, env=env, stream=True)
@@ -1069,6 +1088,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Rediscover checkpoints and rewrite prepared model pointers. Omit this during resume so the config hash remains stable.",
     )
     parser.add_argument("--pyg-version", default=DEFAULT_PYG_VERSION)
+    parser.add_argument("--steps", default="all", help="Main procedure steps to run, e.g. all or 0 or 0,2,4.")
+    parser.add_argument(
+        "--analysis-preset",
+        choices=["full", "medium", "pilot", "smoke"],
+        default="full",
+        help="Bound expensive intervention counts. Use pilot/medium for analysis runs before full paper settings.",
+    )
+    parser.add_argument("--fast-dev-run", action="store_true", help="Use the main procedure fast-dev overrides for a quicker smoke run.")
     parser.add_argument("--force", action="store_true", help="Force rerun of main_procedure artifact generation instead of resuming completed steps.")
     parser.add_argument("--force-official-grit-reclone", action="store_true")
     parser.add_argument("--dry-run", action="store_true", help="Only run main_procedure discovery/status mode.")
@@ -1193,7 +1220,10 @@ def main(argv: Sequence[str] | None = None) -> None:
     artifact_root = run_main_procedure(
         args.repo_dir,
         config_path,
+        steps=str(args.steps),
         force=bool(args.force),
+        analysis_preset=str(args.analysis_preset),
+        fast_dev_run=bool(args.fast_dev_run),
         dry_run=bool(args.dry_run),
         env=analysis_env,
     )

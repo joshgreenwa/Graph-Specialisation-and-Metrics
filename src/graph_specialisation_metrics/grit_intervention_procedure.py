@@ -1318,6 +1318,7 @@ def run_step2(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
     ig_steps = int(config["perturbation"].get("ig_steps", 32))
     swap_partners = int(config["perturbation"].get("swap_partners", 8))
     include_swap_attention_check = bool(cfg.get("compare_attention_to_swaps", True))
+    run_layer_channel_split = bool(cfg.get("run_layer_channel_split", True))
     tau = int(config.get("primary_tau", 3))
     seed = int(config.get("seeds", [0])[0])
     dpi = int(config["figures"]["dpi"])
@@ -1332,7 +1333,8 @@ def run_step2(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
         graphs = select_graphs(model.adapter, "test", sample_graphs, seed=seed)
         progress(
             f"Step 2 {model.name}: selected {len(graphs)} test graph(s), "
-            f"IG steps={ig_steps}, swap_check={include_swap_attention_check}, tau={tau}"
+            f"IG steps={ig_steps}, swap_check={include_swap_attention_check}, "
+            f"layer_channel_split={run_layer_channel_split}, tau={tau}"
         )
         baseline = mean_encoded_baseline(model.adapter, graphs)
         for graph_idx, graph in enumerate(graphs):
@@ -1399,7 +1401,8 @@ def run_step2(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
                                     "carriage_far_mass": far_mass(c_ig, dist, threshold),
                                 }
                             )
-            channel_rows.extend(layer_channel_split_rows(model, graph, result, dist, gid, tau))
+            if run_layer_channel_split:
+                channel_rows.extend(layer_channel_split_rows(model, graph, result, dist, gid, tau))
     write_csv(artifact_root / "metrics" / "step2_profiles.csv", profile_rows)
     write_csv(artifact_root / "metrics" / "step2_attention_faithfulness.csv", faith_rows)
     write_csv(artifact_root / "metrics" / "step2_far_threshold_sensitivity.csv", threshold_rows)
@@ -1809,9 +1812,21 @@ def patched_ig_pair(
     clamp_nodes: Sequence[int],
     steps: int,
     clamp_until_layer: Optional[int] = None,
+    clean_encoded_override: Optional[torch.Tensor] = None,
+    baseline_override: Optional[torch.Tensor] = None,
 ) -> float:
-    clean_encoded = adapter.encoded_node_states(graph).detach()
-    base = expanded_baseline(clean_encoded, mean_baseline)
+    clean_encoded = (
+        clean_encoded_override.detach().to(adapter.device)
+        if clean_encoded_override is not None
+        else adapter.encoded_node_states(graph).detach()
+    )
+    base = (
+        baseline_override.detach().to(device=adapter.device, dtype=clean_encoded.dtype)
+        if baseline_override is not None
+        else expanded_baseline(clean_encoded, mean_baseline)
+    )
+    if tuple(base.shape) != tuple(clean_encoded.shape):
+        base = base.expand_as(clean_encoded)
     delta = clean_encoded - base
     total = 0.0
     for alpha_idx in range(1, int(steps) + 1):
@@ -1874,6 +1889,8 @@ def run_step4(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
             c = result["carriage"]
             clean_cache = result["clean_cache"]
             readout_grad = result["readout_gradient"]
+            clean_encoded = result["clean_encoded"].to(model.adapter.device)
+            base_encoded = result["baseline"].to(model.adapter.device)
             selected = far_pairs(dist, selection_tau, max_pairs=max_pairs, seed=seed + graph_idx)
             direct_matrix = torch.zeros_like(c)
             for pair_idx, (carrier, source) in enumerate(selected):
@@ -1893,6 +1910,8 @@ def run_step4(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
                     source=source,
                     clamp_nodes=cut,
                     steps=ig_steps,
+                    clean_encoded_override=clean_encoded,
+                    baseline_override=base_encoded,
                 )
                 direct_matrix[carrier, source] = direct
                 unclamped = float(c[carrier, source].item())
@@ -1935,6 +1954,8 @@ def run_step4(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
                             source=source,
                             clamp_nodes=[off_path],
                             steps=ig_steps,
+                            clean_encoded_override=clean_encoded,
+                            baseline_override=base_encoded,
                         )
                         control_fraction, control_nontrivial = direct_fraction_value(
                             control_direct,
@@ -1960,7 +1981,7 @@ def run_step4(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
                                 "nontrivial_effect": control_nontrivial,
                             }
                         )
-                if pair_idx < max(1, depth_pairs):
+                if depth_pairs > 0 and pair_idx < depth_pairs:
                     layer_count = len((clean_cache.extras or {}).get("layer_input_node_states", []))
                     for layer in range(layer_count):
                         depth_direct = patched_ig_pair(
@@ -1974,6 +1995,8 @@ def run_step4(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
                             clamp_nodes=cut,
                             steps=ig_steps,
                             clamp_until_layer=layer,
+                            clean_encoded_override=clean_encoded,
+                            baseline_override=base_encoded,
                         )
                         depth_fraction, depth_nontrivial = direct_fraction_value(
                             depth_direct,
@@ -2231,6 +2254,8 @@ def run_step5(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
         c = result["carriage"]
         clean_cache = result["clean_cache"]
         readout_grad = result["readout_gradient"]
+        clean_encoded = result["clean_encoded"].to(dense.adapter.device)
+        base_encoded = result["baseline"].to(dense.adapter.device)
         direct = torch.full_like(c, float("nan"))
         selected = far_pairs(dist, selection_tau, max_pairs=max_pairs, seed=seed + graph_idx)
         for pair_idx, (carrier, source) in enumerate(selected):
@@ -2250,6 +2275,8 @@ def run_step5(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
                 source=source,
                 clamp_nodes=cut,
                 steps=ig_steps,
+                clean_encoded_override=clean_encoded,
+                baseline_override=base_encoded,
             )
         r_nc_by_tau = {int(threshold): r_nc_estimate(direct, dist, int(threshold)) for threshold in thresholds}
         r_nc = safe_float(r_nc_by_tau[int(tau)].get("r_nc"))
