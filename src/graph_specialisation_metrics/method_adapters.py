@@ -782,7 +782,7 @@ class OfficialGRITAdapter:
             return self._run_with_hooks(graph)
 
     def forward_minimal(self, graph: Any) -> ForwardCache:
-        with torch.inference_mode():
+        with torch.no_grad():
             return self._run_with_hooks(
                 graph,
                 capture_attention=False,
@@ -817,7 +817,7 @@ class OfficialGRITAdapter:
         if retain_grad:
             self.load_model().zero_grad(set_to_none=True)
         context = (
-            torch.inference_mode()
+            torch.no_grad()
             if not retain_grad and not bool(getattr(encoded_content, "requires_grad", False))
             else contextlib.nullcontext()
         )

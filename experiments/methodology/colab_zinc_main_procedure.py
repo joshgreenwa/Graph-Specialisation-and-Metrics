@@ -402,8 +402,28 @@ def env_with_py312_compat(shim_dir: Path | None) -> dict[str, str]:
     return env
 
 
+def apply_colab_repo_hotfixes(repo_dir: Path) -> None:
+    """Apply small runner-side fixes before installing the cloned repo.
+
+    This keeps the notebook usable even when the selected GitHub branch lags
+    behind the local Colab runner file.
+    """
+    adapters = repo_dir / "src" / "graph_specialisation_metrics" / "method_adapters.py"
+    if not adapters.exists():
+        print(f"[hotfix-warning] missing expected adapter source: {adapters}", flush=True)
+        return
+    text = adapters.read_text(encoding="utf-8")
+    fixed = text.replace("torch.inference_mode()", "torch.no_grad()")
+    if fixed != text:
+        adapters.write_text(fixed, encoding="utf-8")
+        print("[hotfix] replaced unsafe torch.inference_mode() with torch.no_grad() in method_adapters.py", flush=True)
+    else:
+        print("[hotfix] method_adapters.py already avoids torch.inference_mode()", flush=True)
+
+
 def install_repo(repo_dir: Path, *, pyg_version: str) -> None:
-    run_cmd([sys.executable, "-m", "pip", "install", "--upgrade", "pip", "setuptools", "wheel"])
+    apply_colab_repo_hotfixes(repo_dir)
+    run_cmd([sys.executable, "-m", "pip", "install", "--upgrade", "pip", "setuptools<82", "wheel"])
     run_cmd([sys.executable, "-m", "pip", "install", "-q", "pyyaml", "networkx", "matplotlib", "numpy", "scipy", "pandas"])
 
     import importlib
