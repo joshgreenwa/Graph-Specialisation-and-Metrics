@@ -402,10 +402,7 @@ if not hasattr(_colab_dgl_fn, "copy_dst") and hasattr(_colab_dgl_fn, "copy_v"):
 try:
     import dgl.heterograph as _colab_dgl_heterograph
     if not hasattr(_colab_dgl_heterograph, "DGLHeteroGraph"):
-        if hasattr(_colab_dgl_heterograph, "DGLGraph"):
-            _colab_dgl_heterograph.DGLHeteroGraph = _colab_dgl_heterograph.DGLGraph
-        elif hasattr(dgl, "DGLGraph"):
-            _colab_dgl_heterograph.DGLHeteroGraph = dgl.DGLGraph
+        _colab_dgl_heterograph.DGLHeteroGraph = type(dgl.graph(([], [])))
 except Exception:
     pass
 # COLAB_GIN_ZINC_DGL_COMPAT_END
@@ -426,6 +423,7 @@ except Exception:
     if "COLAB_GIN_ZINC_PATCH_START" in text:
         path.write_text(text, encoding="utf-8")
         print("[patch] Colab compatibility/checkpoint/log patches already present.", flush=True)
+        patch_official_molecule_loader(repo_dir)
         return
 
     marker = "    epoch_train_MAEs, epoch_val_MAEs = [], [] \n"
@@ -499,6 +497,40 @@ except Exception:
     text = text.replace(marker, inject, 1)
     path.write_text(text, encoding="utf-8")
     print("[patch] Added Drive-friendly best/latest checkpoint and CSV logging patch.", flush=True)
+    patch_official_molecule_loader(repo_dir)
+
+
+def patch_official_molecule_loader(repo_dir: Path) -> None:
+    path = repo_dir / "data" / "molecules.py"
+    text = path.read_text(encoding="utf-8")
+    marker = "import dgl\n"
+    patch = """import dgl
+
+# COLAB_GIN_ZINC_MOLECULE_PICKLE_COMPAT_START: official ZINC.pkl was serialized
+# under an older DGL class name. Install the alias in the dataset loader module
+# immediately before pickle.load sees graph objects.
+try:
+    import dgl.heterograph as _colab_dgl_heterograph
+    if not hasattr(_colab_dgl_heterograph, "DGLHeteroGraph"):
+        _colab_dgl_heterograph.DGLHeteroGraph = type(dgl.graph(([], [])))
+except Exception:
+    pass
+# COLAB_GIN_ZINC_MOLECULE_PICKLE_COMPAT_END
+"""
+    pattern = re.compile(
+        r"import dgl\n\n# COLAB_GIN_ZINC_MOLECULE_PICKLE_COMPAT_START:.*?# COLAB_GIN_ZINC_MOLECULE_PICKLE_COMPAT_END\n",
+        re.DOTALL,
+    )
+    if "COLAB_GIN_ZINC_MOLECULE_PICKLE_COMPAT_START" in text:
+        text, replaced = pattern.subn(patch, text, count=1)
+        if replaced != 1:
+            raise RuntimeError("could not replace existing molecule pickle compatibility patch")
+    else:
+        if marker not in text:
+            raise RuntimeError("could not patch official molecule loader: import dgl marker not found")
+        text = text.replace(marker, patch, 1)
+    path.write_text(text, encoding="utf-8")
+    print("[patch] Added official ZINC.pkl DGL class-name compatibility patch.", flush=True)
 
 
 def write_runtime_config(
