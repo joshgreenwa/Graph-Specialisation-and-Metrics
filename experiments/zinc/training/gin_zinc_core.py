@@ -169,6 +169,103 @@ def run_streaming_to_log(cmd: Sequence[str], *, cwd: Path, log_path: Path, env: 
         raise CommandError(f"training failed with exit code {code}; see {log_path}")
 
 
+def running_in_colab() -> bool:
+    try:
+        import google.colab  # type: ignore  # noqa: F401
+    except Exception:
+        return False
+    return True
+
+
+def path_is_mountpoint(path: Path) -> bool:
+    try:
+        if os.path.ismount(path):
+            return True
+    except Exception:
+        pass
+    try:
+        mounts = Path("/proc/mounts").read_text(encoding="utf-8", errors="replace").splitlines()
+    except Exception:
+        return False
+    target = str(path)
+    return any(len(line.split()) >= 2 and line.split()[1] == target for line in mounts)
+
+
+def assert_drive_writable(drive_root: Path) -> None:
+    if not running_in_colab():
+        return
+    drive_mount = Path("/content/drive")
+    try:
+        drive_root.resolve().relative_to(drive_mount.resolve())
+    except Exception:
+        return
+    if not path_is_mountpoint(drive_mount):
+        raise RuntimeError(
+            "/content/drive is not a mounted Google Drive filesystem. Refusing to train because outputs "
+            "would be written to ephemeral Colab disk. Run drive.mount('/content/drive', force_remount=True) "
+            "or rerun this script from a fresh runtime."
+        )
+    my_drive = drive_mount / "MyDrive"
+    if not my_drive.exists():
+        raise RuntimeError("/content/drive is mounted, but /content/drive/MyDrive is missing.")
+    drive_root.mkdir(parents=True, exist_ok=True)
+    probe = drive_root / ".drive_write_probe"
+    token = f"gin-zinc-drive-probe-{time.time()}"
+    probe.write_text(token, encoding="utf-8")
+    observed = probe.read_text(encoding="utf-8")
+    if observed != token:
+        raise RuntimeError(f"Google Drive write probe failed at {probe}")
+    probe.unlink(missing_ok=True)
+    print(f"[drive-check] verified mounted, writable Drive root: {drive_root}", flush=True)
+
+
+def stash_unmounted_drive_root(drive_root: Path) -> Path | None:
+    if not running_in_colab():
+        return None
+    drive_mount = Path("/content/drive")
+    try:
+        drive_root.resolve().relative_to(drive_mount.resolve())
+    except Exception:
+        return None
+    if path_is_mountpoint(drive_mount) or not drive_root.exists():
+        return None
+    try:
+        has_contents = any(drive_root.iterdir())
+    except Exception:
+        has_contents = False
+    if not has_contents:
+        return None
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    stash_root = Path("/content/gin_zinc_unmounted_drive_recovery")
+    stash_root.mkdir(parents=True, exist_ok=True)
+    stash = stash_root / f"{drive_root.name}_{stamp}"
+    print(
+        f"[drive-recovery] Found outputs under unmounted fake Drive path {drive_root}. "
+        f"Moving them aside before mounting real Drive: {stash}",
+        flush=True,
+    )
+    shutil.move(str(drive_root), str(stash))
+    return stash
+
+
+def restore_shadow_to_drive(stash: Path | None, drive_root: Path) -> None:
+    if stash is None:
+        return
+    if not stash.exists():
+        print(f"[drive-recovery-warning] Recovery stash disappeared: {stash}", flush=True)
+        return
+    print(f"[drive-recovery] Copying recovered local outputs into real Drive: {drive_root}", flush=True)
+    shutil.copytree(stash, drive_root, dirs_exist_ok=True)
+    marker = drive_root / "RECOVERED_FROM_UNMOUNTED_COLAB_DRIVE.txt"
+    marker.write_text(
+        "This directory was recovered from a local /content/drive shadow path created before Google Drive was mounted.\n"
+        f"Recovery stash: {stash}\n"
+        f"Recovered at: {time.strftime('%Y-%m-%d %H:%M:%S')}\n",
+        encoding="utf-8",
+    )
+    print(f"[drive-recovery] Recovery complete. Marker: {marker}", flush=True)
+
+
 def mount_drive() -> None:
     try:
         from google.colab import drive  # type: ignore
@@ -176,9 +273,6 @@ def mount_drive() -> None:
         print("[drive] google.colab is unavailable; assuming Drive is already mounted or not needed.", flush=True)
         return
     mountpoint = Path("/content/drive")
-    if (mountpoint / "MyDrive").exists():
-        print("[drive] Google Drive already mounted at /content/drive.", flush=True)
-        return
     print("[drive] Mounting Google Drive at /content/drive ...", flush=True)
     try:
         drive.mount("/content/drive", force_remount=False)
@@ -934,6 +1028,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--allow-config-drift", action="store_true")
     parser.add_argument("--allow-param-count-drift", action="store_true")
     parser.add_argument("--dry-run", action="store_true", help="Prepare repo/config/data but do not train.")
+    parser.add_argument(
+        "--recover-shadow-only",
+        action="store_true",
+        help=(
+            "Recover artifacts from a previous run that accidentally wrote to a local, unmounted "
+            "/content/drive shadow directory, then exit without launching training."
+        ),
+    )
     return parser
 
 
@@ -950,13 +1052,25 @@ def main(argv: Sequence[str] | None = None) -> None:
         args.install_mode = "none"
 
     drive_root = Path(args.drive_root)
+    shadow_root = stash_unmounted_drive_root(drive_root)
+    mount_drive()
+    assert_drive_writable(drive_root)
+    restore_shadow_to_drive(shadow_root, drive_root)
+    if args.recover_shadow_only:
+        if shadow_root is None:
+            print(
+                "[drive-recovery] No unmounted local shadow outputs were visible. If Drive is already mounted, "
+                "unmount it first to reveal any hidden local /content/drive files.",
+                flush=True,
+            )
+        print("[drive-recovery] Recovery-only mode complete; training was not launched.", flush=True)
+        return
     repo_dir = Path(args.repo_dir)
     run_dir = drive_root / "results" / args.run_id
     official_out_dir = run_dir / "official_out"
     raw_log_path = run_dir / "logs" / "raw_training.log"
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    mount_drive()
     install_dependencies(args.install_mode)
     official_commit = clone_or_update_repo(repo_dir, force=args.force_clone, pin_commit=not args.no_pin)
 

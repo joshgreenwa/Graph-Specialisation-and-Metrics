@@ -238,6 +238,54 @@ def weighted_direct_fraction(rows: Sequence[Mapping[str, Any]], *, seed: int, dr
     return {"mean": point, "ci_low": float(lo), "ci_high": float(hi), "pairs": len(clean)}
 
 
+def bounded_direct_far_mass_share(
+    direct: torch.Tensor,
+    carriage: torch.Tensor,
+    dist: torch.Tensor,
+    threshold: int,
+) -> dict[str, Any]:
+    """Observed, bounded direct far mass for the rung-funnel summary.
+
+    `r_nc_size_scaled_sum_estimate` is useful as a size-controlled estimate, but it
+    is not a share. For the funnel, count only measured far pairs and bound each
+    pair's direct mass by its original carriage mass so the displayed rung is a
+    conservative surviving-mass share.
+    """
+    far_mask = torch.isfinite(dist) & (dist > int(threshold))
+    measured_mask = far_mask & torch.isfinite(direct)
+    total_pairs = int(far_mask.sum().item())
+    measured_pairs = int(measured_mask.sum().item())
+    total_carriage_mass = float(carriage.detach().abs().sum().item())
+    if measured_pairs == 0 or total_carriage_mass <= EPS:
+        return {
+            "direct_far_share_bounded": float("nan"),
+            "direct_far_share_raw": float("nan"),
+            "direct_far_fraction_measured_unclamped": float("nan"),
+            "direct_far_mass_bounded": float("nan"),
+            "direct_far_mass_raw": float("nan"),
+            "measured_unclamped_far_mass": float("nan"),
+            "measured_far_pairs": measured_pairs,
+            "total_far_pairs": total_pairs,
+            "measured_pair_coverage": float(measured_pairs / total_pairs) if total_pairs else float("nan"),
+        }
+    direct_abs = direct.detach().abs()[measured_mask]
+    carriage_abs = carriage.detach().abs()[measured_mask]
+    raw_direct_mass = float(direct_abs.sum().item())
+    bounded_direct_mass = float(torch.minimum(direct_abs, carriage_abs).sum().item())
+    measured_unclamped_mass = float(carriage_abs.sum().item())
+    return {
+        "direct_far_share_bounded": bounded_direct_mass / max(total_carriage_mass, EPS),
+        "direct_far_share_raw": raw_direct_mass / max(total_carriage_mass, EPS),
+        "direct_far_fraction_measured_unclamped": bounded_direct_mass / max(measured_unclamped_mass, EPS),
+        "direct_far_mass_bounded": bounded_direct_mass,
+        "direct_far_mass_raw": raw_direct_mass,
+        "measured_unclamped_far_mass": measured_unclamped_mass,
+        "measured_far_pairs": measured_pairs,
+        "total_far_pairs": total_pairs,
+        "measured_pair_coverage": float(measured_pairs / total_pairs) if total_pairs else float("nan"),
+    }
+
+
 def signal_gate_enabled(config: Mapping[str, Any], step: str) -> bool:
     return bool(config.get("steps", {}).get(str(step), {}).get("signal_gate", True))
 
@@ -3257,6 +3305,58 @@ def render_step4_clamp_negative_control(rows: Sequence[Mapping[str, Any]], artif
     plt.close(fig)
 
 
+def render_step4_direct_fraction_by_distance(rows: Sequence[Mapping[str, Any]], artifact_root: Path, *, dpi: int) -> None:
+    grouped: dict[tuple[str, int], list[Mapping[str, Any]]] = {}
+    for row in rows:
+        if str(row.get("clamp_type", "cut")) != "cut" or not row_is_nontrivial(row):
+            continue
+        distance = safe_float(row.get("distance"))
+        if not math.isfinite(distance):
+            continue
+        grouped.setdefault((str(row.get("model")), int(round(distance))), []).append(row)
+    summaries: list[dict[str, Any]] = []
+    for idx, ((model, distance), group_rows) in enumerate(sorted(grouped.items())):
+        stats = weighted_direct_fraction(group_rows, seed=6100 + idx, draws=500)
+        mean = safe_float(stats.get("mean"))
+        if not math.isfinite(mean):
+            continue
+        summaries.append(
+            {
+                "model": model,
+                "distance": distance,
+                "mean": mean,
+                "ci_low": safe_float(stats.get("ci_low")),
+                "ci_high": safe_float(stats.get("ci_high")),
+                "pairs": int(stats.get("pairs", 0)),
+            }
+        )
+    if not summaries:
+        return
+    models = sorted({str(r["model"]) for r in summaries})
+    offsets = np.linspace(-0.12, 0.12, num=max(1, len(models))) if len(models) > 1 else np.asarray([0.0])
+    fig, ax = plt.subplots(figsize=(8.4, 4.8), constrained_layout=True)
+    for model_idx, model in enumerate(models):
+        model_rows = [r for r in summaries if str(r["model"]) == model]
+        xs = np.asarray([safe_float(r["distance"]) + float(offsets[model_idx]) for r in model_rows], dtype=float)
+        means = np.asarray([safe_float(r["mean"]) for r in model_rows], dtype=float)
+        lows = np.asarray([safe_float(r["ci_low"]) for r in model_rows], dtype=float)
+        highs = np.asarray([safe_float(r["ci_high"]) for r in model_rows], dtype=float)
+        yerr = np.vstack([np.maximum(0.0, means - lows), np.maximum(0.0, highs - means)])
+        ax.errorbar(xs, means, yerr=yerr, fmt="o", capsize=3, label=model)
+        for x_val, y_val, row in zip(xs, means, model_rows):
+            if int(row.get("pairs", 0)) < 3:
+                ax.text(x_val, y_val, f"n={int(row.get('pairs', 0))}", fontsize=7, ha="center", va="bottom")
+    ax.axhline(1.0, color="#555555", linestyle="--", linewidth=1, label="No clamp effect")
+    ax.set_title("Step 4: direct fraction by distance (signal-gated pairs)")
+    ax.set_xlabel("Molecular hop distance")
+    ax.set_ylabel("Direct fraction = |C^clamp| / |C^unclamp|")
+    ax.legend(frameon=False, fontsize=8)
+    figures = ensure_dir(artifact_root / "figures")
+    fig.savefig(figures / "step4_direct_fraction_by_distance.png", dpi=dpi)
+    fig.savefig(figures / "step4_direct_fraction_by_distance.pdf")
+    plt.close(fig)
+
+
 def render_step4(
     rows: Sequence[Mapping[str, Any]],
     depth_rows: Sequence[Mapping[str, Any]],
@@ -3284,23 +3384,7 @@ def render_step4(
         fig.savefig(figures / "step4_mediator_patching_validation.pdf")
         plt.close(fig)
     if rows:
-        by_model_distance: dict[tuple[str, int], list[float]] = {}
-        for row in rows:
-            value = safe_float(row["direct_fraction"])
-            if str(row.get("clamp_type", "cut")) == "cut" and row_is_nontrivial(row) and math.isfinite(value):
-                by_model_distance.setdefault((str(row["model"]), int(safe_float(row["distance"]))), []).append(value)
-        prof = [
-            {"model": model, "quantity": "direct_fraction", "distance": dist, "share": float(np.nanmean(vals)), "mass": float(np.nanmean(vals))}
-            for (model, dist), vals in sorted(by_model_distance.items())
-        ]
-        render_distance_profile(
-            prof,
-            artifact_root,
-            "step4_direct_fraction_by_distance",
-            "Step 4: direct fraction of far carriage by distance",
-            ylabel="Direct fraction = |C^clamp| / |C^unclamp|",
-            dpi=dpi,
-        )
+        render_step4_direct_fraction_by_distance(rows, artifact_root, dpi=dpi)
         render_step4_clamp_negative_control(rows, artifact_root, dpi=dpi)
     if depth_rows:
         by_layer: dict[tuple[str, int], list[float]] = {}
@@ -3532,13 +3616,13 @@ def run_step5(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
                 attention_far = far_mass(attention_last, dist, tau)
             carriage_far = far_mass(c, dist, tau)
             total_carriage_mass = float(c.detach().abs().sum().item())
-            direct_far_sum = safe_float(r_nc_by_tau[int(tau)].get("r_nc_size_scaled_sum_estimate"))
-            direct_far_share = direct_far_sum / max(total_carriage_mass, EPS)
+            direct_share_stats = bounded_direct_far_mass_share(direct, c, dist, tau)
+            direct_far_share = safe_float(direct_share_stats.get("direct_far_share_bounded"))
             for rung_index, (rung, value, denominator) in enumerate(
                 [
                     ("attention", attention_far, "own_attention_mass"),
                     ("carriage", carriage_far, "own_carriage_mass"),
-                    ("direct_carriage", direct_far_share, "total_carriage_mass"),
+                    ("direct_carriage", direct_far_share, "bounded_measured_direct_mass_over_total_carriage_mass"),
                 ]
             ):
                 rung_rows.append(
@@ -3553,6 +3637,15 @@ def run_step5(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
                         "denominator": denominator,
                         "r_nc": r_nc_by_tau[int(tau)].get("r_nc"),
                         "total_carriage_mass": total_carriage_mass,
+                        "direct_far_share_raw": direct_share_stats.get("direct_far_share_raw"),
+                        "direct_far_share_bounded": direct_share_stats.get("direct_far_share_bounded"),
+                        "direct_far_fraction_measured_unclamped": direct_share_stats.get("direct_far_fraction_measured_unclamped"),
+                        "direct_far_mass_raw": direct_share_stats.get("direct_far_mass_raw"),
+                        "direct_far_mass_bounded": direct_share_stats.get("direct_far_mass_bounded"),
+                        "measured_unclamped_far_mass": direct_share_stats.get("measured_unclamped_far_mass"),
+                        "measured_far_pairs": direct_share_stats.get("measured_far_pairs"),
+                        "total_far_pairs": direct_share_stats.get("total_far_pairs"),
+                        "measured_pair_coverage": direct_share_stats.get("measured_pair_coverage"),
                         "attention_available": bool(clean_cache.attention),
                         "signal_gate_enabled": use_signal_gate,
                     }
@@ -3911,12 +4004,18 @@ def gap_regression_summary(gap_rows: Sequence[Mapping[str, Any]]) -> dict[str, A
     return {"n": int(mask.sum()), "pearson_r": corr, "slope": float(slope), "intercept": float(intercept)}
 
 
-def rank_summary_rows(rank_rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+def rank_summary_rows(rank_rows: Sequence[Mapping[str, Any]], *, min_sampled_pairs: int = 3) -> list[dict[str, Any]]:
     primary = [r for r in rank_rows if bool(r.get("primary_tau", True))]
     rows = primary or list(rank_rows)
     out = []
     for model in sorted(set(str(r.get("model")) for r in rows)):
-        model_rows = [r for r in rows if str(r.get("model")) == model]
+        model_rows = [
+            r
+            for r in rows
+            if str(r.get("model")) == model
+            and str(r.get("status", "")).startswith("complete")
+            and int(safe_float(r.get("sampled_pairs")) if math.isfinite(safe_float(r.get("sampled_pairs"))) else 0) >= int(min_sampled_pairs)
+        ]
         for metric in ["effective_rank", "top_singular_share", "above_null_margin"]:
             values = [safe_float(r.get(metric)) for r in model_rows]
             values = [v for v in values if math.isfinite(v)]
@@ -3932,6 +4031,7 @@ def rank_summary_rows(rank_rows: Sequence[Mapping[str, Any]]) -> list[dict[str, 
                     "ci_high": hi,
                     "n": len(values),
                     "tau": model_rows[0].get("tau", "") if model_rows else "",
+                    "min_sampled_pairs": int(min_sampled_pairs),
                 }
             )
     return out
@@ -4010,6 +4110,34 @@ def render_step5(
             fig.savefig(figures / "step5_structure_non_composable_carriage.png", dpi=dpi)
             fig.savefig(figures / "step5_structure_non_composable_carriage.pdf")
             plt.close(fig)
+        else:
+            models = sorted({str(r.get("model")) for r in rank_rows})
+            complete_rows = sum(1 for r in rank_rows if str(r.get("status", "")).startswith("complete"))
+            fig, ax = plt.subplots(figsize=(8.0, 3.8), constrained_layout=True)
+            ax.axis("off")
+            ax.text(
+                0.5,
+                0.58,
+                "No model had enough signal-gated far pairs for a rank summary.",
+                ha="center",
+                va="center",
+                fontsize=13,
+                transform=ax.transAxes,
+            )
+            ax.text(
+                0.5,
+                0.38,
+                f"Models checked: {', '.join(models) if models else 'none'}; complete rows before pair-count gate: {complete_rows}.",
+                ha="center",
+                va="center",
+                fontsize=10,
+                color="#555555",
+                transform=ax.transAxes,
+            )
+            fig.suptitle("Step 5: structure of non-composable long-range carriage")
+            fig.savefig(figures / "step5_structure_non_composable_carriage.png", dpi=dpi)
+            fig.savefig(figures / "step5_structure_non_composable_carriage.pdf")
+            plt.close(fig)
     if interaction_rows:
         summary = non_additivity_summary_rows(interaction_rows)
         if summary:
@@ -4066,6 +4194,7 @@ def render_step5_rung_funnel(rows: Sequence[Mapping[str, Any]], artifact_root: P
     models = sorted({str(r.get("model")) for r in clean_rows})
     x = np.arange(len(rung_order), dtype=float)
     fig, ax = plt.subplots(figsize=(7.4, 4.8), constrained_layout=True)
+    all_means: list[float] = []
     for model in models:
         means = []
         for rung in rung_order:
@@ -4076,13 +4205,15 @@ def render_step5_rung_funnel(rows: Sequence[Mapping[str, Any]], artifact_root: P
             ]
             vals = [v for v in vals if math.isfinite(v)]
             means.append(float(np.nanmean(vals)) if vals else float("nan"))
+        all_means.extend([v for v in means if math.isfinite(v)])
         ax.plot(x, means, marker="o", linewidth=2.0, label=model)
     ax.set_title("From reading to non-composable transport: far-mass surviving each rung")
     ax.set_xlabel("Rung")
-    ax.set_ylabel("Far-mass share")
+    ax.set_ylabel("Far-mass share (direct rung is observed and bounded)")
     ax.set_xticks(x)
     ax.set_xticklabels([rung_labels[r] for r in rung_order])
-    ax.set_ylim(bottom=0)
+    upper = max(all_means + [1.0])
+    ax.set_ylim(0, 1.05 if upper <= 1.05 else upper * 1.08)
     ax.legend(frameon=False, fontsize=8)
     figures = ensure_dir(artifact_root / "figures")
     fig.savefig(figures / "step5_rung_funnel.png", dpi=dpi)

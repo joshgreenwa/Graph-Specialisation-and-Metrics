@@ -915,49 +915,94 @@ def first_existing(paths: Sequence[Path]) -> Path | None:
     return None
 
 
+def newest_files(root: Path, pattern: str) -> list[Path]:
+    if not root.exists():
+        return []
+    return sorted((p for p in root.glob(pattern) if p.is_file()), key=lambda p: p.stat().st_mtime, reverse=True)
+
+
+def newest_rglob_files(root: Path, pattern: str) -> list[Path]:
+    if not root.exists():
+        return []
+    return sorted((p for p in root.rglob(pattern) if p.is_file()), key=lambda p: p.stat().st_mtime, reverse=True)
+
+
 def discover_gin_artifact(gin_drive_dir: Path) -> dict[str, Path | None]:
     latest_outputs = gin_drive_dir / "latest_outputs"
-    run_root = gin_drive_dir / "results" / "gin_zinc_500k_seed41"
-    official_out = run_root / "official_out"
-    checkpoint = first_existing(
+    default_run_root = gin_drive_dir / "results" / "gin_zinc_500k_seed41"
+    official_out_roots = [default_run_root / "official_out"]
+    results_root = gin_drive_dir / "results"
+    if results_root.exists():
+        official_out_roots.extend(sorted(results_root.glob("*/official_out"), key=lambda p: p.stat().st_mtime if p.exists() else 0, reverse=True))
+    official_out_roots = list(dict.fromkeys(official_out_roots))
+    checkpoint_candidates = [
+        latest_outputs / "gin_zinc_seed41_best_checkpoint_pkl.pt",
+        latest_outputs / "gin_zinc_seed41_best_checkpoint_pkl.pkl",
+        *newest_files(latest_outputs, "*best*checkpoint*.pt"),
+        *newest_files(latest_outputs, "*best*checkpoint*.pkl"),
+        *newest_files(latest_outputs, "*best*state_dict*.pt"),
+        *newest_files(latest_outputs, "*best*state_dict*.pkl"),
+    ]
+    for official_out in official_out_roots:
+        checkpoint_candidates.extend(newest_rglob_files(official_out / "checkpoints", "best_val_mae_state_dict.pkl"))
+    checkpoint_candidates.extend(
         [
-            latest_outputs / "gin_zinc_seed41_best_checkpoint_pkl.pt",
-            latest_outputs / "gin_zinc_seed41_best_checkpoint_pkl.pkl",
-            *sorted(official_out.glob("checkpoints/**/best_val_mae_state_dict.pkl"), key=lambda p: str(p)),
             latest_outputs / "gin_zinc_seed41_latest_checkpoint_pkl.pt",
             latest_outputs / "gin_zinc_seed41_latest_checkpoint_pkl.pkl",
-            *sorted(official_out.glob("checkpoints/**/latest_state_dict.pkl"), key=lambda p: str(p)),
-            *sorted(official_out.glob("checkpoints/**/*.pkl"), key=lambda p: str(p)),
+            *newest_files(latest_outputs, "*latest*checkpoint*.pt"),
+            *newest_files(latest_outputs, "*latest*checkpoint*.pkl"),
+            *newest_files(latest_outputs, "*latest*state_dict*.pt"),
+            *newest_files(latest_outputs, "*latest*state_dict*.pkl"),
         ]
     )
+    for official_out in official_out_roots:
+        checkpoint_candidates.extend(newest_rglob_files(official_out / "checkpoints", "latest_state_dict.pkl"))
+        checkpoint_candidates.extend(newest_rglob_files(official_out / "checkpoints", "*.pkl"))
+    checkpoint = first_existing(
+        checkpoint_candidates
+    )
+    config_candidates = [
+        latest_outputs / "molecules_graph_regression_GIN_ZINC_500k.runtime.json",
+        *newest_files(latest_outputs, "*.runtime.json"),
+        *newest_files(latest_outputs, "*GIN*ZINC*.json"),
+        *newest_files(gin_drive_dir, "**/*GIN*ZINC*.runtime.json"),
+        default_run_root / "configs" / "molecules_graph_regression_GIN_ZINC_500k.runtime.json",
+    ]
+    for run_cfg_dir in sorted((gin_drive_dir / "results").glob("*/configs")) if (gin_drive_dir / "results").exists() else []:
+        config_candidates.extend(newest_files(run_cfg_dir, "*.runtime.json"))
+        config_candidates.extend(newest_files(run_cfg_dir, "*GIN*ZINC*.json"))
     config = newest_existing(
-        [
-            latest_outputs / "molecules_graph_regression_GIN_ZINC_500k.runtime.json",
-            run_root / "configs" / "molecules_graph_regression_GIN_ZINC_500k.runtime.json",
-            *official_out.glob("configs/config_*.txt"),
-        ]
+        config_candidates
     )
+    history_candidates = [
+        latest_outputs / "gin_zinc_seed41_history_csv.csv",
+        *newest_files(latest_outputs, "*history*.csv"),
+    ]
+    best_json_candidates = [
+        latest_outputs / "gin_zinc_seed41_best_json.json",
+        *newest_files(latest_outputs, "*best*.json"),
+    ]
+    for official_out in official_out_roots:
+        history_candidates.extend(newest_files(official_out / "results", "*_history.csv"))
+        best_json_candidates.extend(newest_files(official_out / "results", "*_best.json"))
     history = newest_existing(
-        [
-            latest_outputs / "gin_zinc_seed41_history_csv.csv",
-            *official_out.glob("results/*_history.csv"),
-        ]
+        history_candidates
     )
     best_json = newest_existing(
-        [
-            latest_outputs / "gin_zinc_seed41_best_json.json",
-            *official_out.glob("results/*_best.json"),
-        ]
+        best_json_candidates
     )
-    raw_summary = newest_existing([run_root / "training_summary.json"])
+    raw_summary = newest_existing([latest_outputs / "training_summary.json", default_run_root / "training_summary.json"])
     return {
         "checkpoint": checkpoint,
         "config": config,
         "history": history,
         "best_json": best_json,
         "training_summary": raw_summary,
-        "run_root": run_root if run_root.exists() else None,
-        "official_out": official_out if official_out.exists() else None,
+        "run_root": default_run_root if default_run_root.exists() else None,
+        "official_out": next((root for root in official_out_roots if root.exists()), None),
+        "searched_official_out_roots": [str(root) for root in official_out_roots],
+        "checkpoint_candidates": [str(path) for path in checkpoint_candidates[:20]],
+        "config_candidates": [str(path) for path in config_candidates[:20]],
     }
 
 
@@ -1364,6 +1409,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--allow-incomplete", action="store_true", help="Do not raise if checkpoints/dependencies are missing or a preflight is requested.")
     parser.add_argument("--include-local-references", action="store_true", help="Include placeholder GCN/GIN entries required by the markdown gate.")
     parser.add_argument("--skip-gin-reference", action="store_true", help="Do not include the default official Benchmarking-GNNs GIN ZINC reference even if present on Drive.")
+    parser.add_argument("--allow-missing-gin-reference", action="store_true", help="Allow the run to continue if the default trained GIN reference cannot be discovered.")
     parser.add_argument("--skip-onehop-locality-check", action="store_true", help="Skip the hard preflight that certifies the 1-hop control is local.")
     parser.add_argument("--onehop-locality-check-graphs", type=int, default=4, help="Number of ZINC test graphs used for the 1-hop locality preflight.")
     parser.add_argument("--onehop-locality-tolerance", type=float, default=1.0e-12, help="Allowed direct attention mass at molecular distance > 1.")
@@ -1460,6 +1506,14 @@ def main(argv: Sequence[str] | None = None) -> None:
             print("[prepared-warning] saved GIN pointer missing checkpoint/config/repo; rediscovering GIN artifacts", flush=True)
     if not args.skip_gin_reference and gin_pointer is None:
         gin_artifact = discover_gin_artifact(args.gin_drive_dir)
+        print(
+            "[gin-discovery] "
+            f"checkpoint={gin_artifact.get('checkpoint')} "
+            f"config={gin_artifact.get('config')} "
+            f"history={gin_artifact.get('history')} "
+            f"best_json={gin_artifact.get('best_json')}",
+            flush=True,
+        )
         if gin_artifact.get("checkpoint") is not None and gin_artifact.get("config") is not None:
             gin_repo = clone_official_gin(args.gin_repo_dir, force=bool(args.force_official_gin_reclone))
             gin_pointer = prepare_gin_model_artifact(
@@ -1473,11 +1527,27 @@ def main(argv: Sequence[str] | None = None) -> None:
                 gin_cfg = Path(str(gin_pointer["config_path"]))
                 print(f"[prepared] using official GIN checkpoint: {gin_ckpt}", flush=True)
         else:
-            print(
-                f"[prepared] no complete official GIN artifact found under {args.gin_drive_dir}; "
-                "GIN reference will be omitted unless --include-local-references requests placeholders.",
-                flush=True,
+            details = {
+                "status": "missing_gin_reference",
+                "gin_drive_dir": str(args.gin_drive_dir),
+                "checkpoint": str(gin_artifact.get("checkpoint")) if gin_artifact.get("checkpoint") is not None else None,
+                "config": str(gin_artifact.get("config")) if gin_artifact.get("config") is not None else None,
+                "searched_official_out_roots": gin_artifact.get("searched_official_out_roots", []),
+                "checkpoint_candidates": gin_artifact.get("checkpoint_candidates", []),
+                "config_candidates": gin_artifact.get("config_candidates", []),
+            }
+            write_json(args.drive_root / "preflight" / "gin_reference_discovery_failed.json", details)
+            message = (
+                f"No complete official GIN artifact found under {args.gin_drive_dir}. "
+                f"checkpoint={details['checkpoint']} config={details['config']}. "
+                f"Wrote discovery details to {args.drive_root / 'preflight' / 'gin_reference_discovery_failed.json'}."
             )
+            if not args.allow_missing_gin_reference and not args.include_local_references:
+                raise RuntimeError(
+                    message
+                    + " Pass --allow-missing-gin-reference to continue without GIN, or --skip-gin-reference to intentionally omit it."
+                )
+            print(f"[prepared-warning] {message} Continuing because missing GIN is explicitly allowed.", flush=True)
 
     cfg = build_zinc_config(
         artifact_root=args.drive_root,
@@ -1500,6 +1570,13 @@ def main(argv: Sequence[str] | None = None) -> None:
         include_local_references=bool(args.include_local_references),
     )
     config_path = write_yaml(args.drive_root / "configs" / "zinc_main_procedure_colab.yaml", cfg)
+    model_names = sorted((cfg.get("models") or {}).keys())
+    print(f"[config] models included: {', '.join(model_names)}", flush=True)
+    if "gin" not in model_names and not args.skip_gin_reference and not args.allow_missing_gin_reference:
+        raise RuntimeError(
+            "GIN was not included in the generated methodology config. "
+            "This should only happen with --skip-gin-reference or --allow-missing-gin-reference."
+        )
     write_json(
         args.drive_root / "prepared_model_artifacts" / "latest_pointers.json",
         {
