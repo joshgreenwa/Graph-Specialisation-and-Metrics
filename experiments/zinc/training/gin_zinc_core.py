@@ -399,12 +399,17 @@ if not hasattr(_colab_dgl_fn, "copy_dst") and hasattr(_colab_dgl_fn, "copy_v"):
         out = kwargs.get("out", out)
         return _colab_dgl_fn.copy_v(dst, out)
     _colab_dgl_fn.copy_dst = _colab_copy_dst
-try:
-    import dgl.heterograph as _colab_dgl_heterograph
-    if not hasattr(_colab_dgl_heterograph, "DGLHeteroGraph"):
-        _colab_dgl_heterograph.DGLHeteroGraph = type(dgl.graph(([], [])))
-except Exception:
-    pass
+import importlib as _colab_importlib
+import sys as _colab_sys
+_colab_dgl_heterograph = _colab_importlib.import_module("dgl.heterograph")
+if not hasattr(_colab_dgl_heterograph, "DGLHeteroGraph"):
+    if hasattr(_colab_dgl_heterograph, "DGLGraph"):
+        _colab_dgl_heterograph.DGLHeteroGraph = _colab_dgl_heterograph.DGLGraph
+    else:
+        import torch as _colab_torch
+        _empty = _colab_torch.tensor([], dtype=_colab_torch.int64)
+        _colab_dgl_heterograph.DGLHeteroGraph = type(dgl.graph((_empty, _empty)))
+_colab_sys.modules["dgl.heterograph"].DGLHeteroGraph = _colab_dgl_heterograph.DGLHeteroGraph
 # COLAB_GIN_ZINC_DGL_COMPAT_END
 """
     compat_pattern = re.compile(
@@ -509,12 +514,17 @@ def patch_official_molecule_loader(repo_dir: Path) -> None:
 # COLAB_GIN_ZINC_MOLECULE_PICKLE_COMPAT_START: official ZINC.pkl was serialized
 # under an older DGL class name. Install the alias in the dataset loader module
 # immediately before pickle.load sees graph objects.
-try:
-    import dgl.heterograph as _colab_dgl_heterograph
-    if not hasattr(_colab_dgl_heterograph, "DGLHeteroGraph"):
-        _colab_dgl_heterograph.DGLHeteroGraph = type(dgl.graph(([], [])))
-except Exception:
-    pass
+import importlib as _colab_importlib
+import sys as _colab_sys
+_colab_dgl_heterograph = _colab_importlib.import_module("dgl.heterograph")
+if not hasattr(_colab_dgl_heterograph, "DGLHeteroGraph"):
+    if hasattr(_colab_dgl_heterograph, "DGLGraph"):
+        _colab_dgl_heterograph.DGLHeteroGraph = _colab_dgl_heterograph.DGLGraph
+    else:
+        import torch as _colab_torch
+        _empty = _colab_torch.tensor([], dtype=_colab_torch.int64)
+        _colab_dgl_heterograph.DGLHeteroGraph = type(dgl.graph((_empty, _empty)))
+_colab_sys.modules["dgl.heterograph"].DGLHeteroGraph = _colab_dgl_heterograph.DGLHeteroGraph
 # COLAB_GIN_ZINC_MOLECULE_PICKLE_COMPAT_END
 """
     pattern = re.compile(
@@ -531,6 +541,20 @@ except Exception:
         text = text.replace(marker, patch, 1)
     path.write_text(text, encoding="utf-8")
     print("[patch] Added official ZINC.pkl DGL class-name compatibility patch.", flush=True)
+
+
+def verify_official_runtime_compat(repo_dir: Path) -> None:
+    code = r"""
+import importlib
+import dgl
+import data.molecules
+hg = importlib.import_module("dgl.heterograph")
+cls = getattr(hg, "DGLHeteroGraph", None)
+print("[compat] dgl", dgl.__version__, "DGLHeteroGraph_alias", cls is not None, "alias_class", getattr(cls, "__name__", None))
+if cls is None:
+    raise RuntimeError("DGLHeteroGraph alias was not installed")
+"""
+    run_cmd([sys.executable, "-c", code], cwd=repo_dir)
 
 
 def write_runtime_config(
@@ -711,6 +735,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     validate_official_config(official_cfg_path, allow_drift=args.allow_config_drift)
     ensure_zinc_data(repo_dir, drive_root, force=args.force_data)
     patch_official_training_script(repo_dir)
+    if not (args.dry_run and args.install_mode == "none"):
+        verify_official_runtime_compat(repo_dir)
 
     runtime_config = write_runtime_config(
         official_cfg_path,
