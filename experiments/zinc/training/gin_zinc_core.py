@@ -152,6 +152,13 @@ def run_streaming_to_log(cmd: Sequence[str], *, cwd: Path, log_path: Path, env: 
         code = proc.wait()
         log_f.write(f"===== command exited {code} {time.strftime('%Y-%m-%d %H:%M:%S')} =====\n")
     if code != 0:
+        try:
+            lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+            tail = "\n".join(lines[-120:])
+            print("[error] training failed; last 120 raw log lines follow:", flush=True)
+            print(tail, flush=True)
+        except Exception as exc:
+            print(f"[error] training failed and log tail could not be read: {exc}", flush=True)
         raise CommandError(f"training failed with exit code {code}; see {log_path}")
 
 
@@ -161,8 +168,18 @@ def mount_drive() -> None:
     except Exception:
         print("[drive] google.colab is unavailable; assuming Drive is already mounted or not needed.", flush=True)
         return
+    mountpoint = Path("/content/drive")
+    if (mountpoint / "MyDrive").exists():
+        print("[drive] Google Drive already mounted at /content/drive.", flush=True)
+        return
     print("[drive] Mounting Google Drive at /content/drive ...", flush=True)
-    drive.mount("/content/drive")
+    try:
+        drive.mount("/content/drive", force_remount=False)
+    except ValueError as exc:
+        if "Mountpoint must not already contain files" not in str(exc):
+            raise
+        print("[drive-warning] /content/drive is non-empty before mount; retrying with force_remount=True.", flush=True)
+        drive.mount("/content/drive", force_remount=True)
 
 
 def install_dependencies(mode: str) -> None:
@@ -235,6 +252,8 @@ def install_dependencies(mode: str) -> None:
             "scipy",
             "networkx",
             "pandas",
+            "scikit-learn",
+            "ogb",
         ]
     )
     run_cmd(
@@ -343,8 +362,70 @@ def ensure_zinc_data(repo_dir: Path, drive_root: Path, *, force: bool) -> Path:
 def patch_official_training_script(repo_dir: Path) -> None:
     path = repo_dir / "main_molecules_graph_regression.py"
     text = path.read_text(encoding="utf-8")
+    dgl_marker = "import dgl\n"
+    dgl_patch = """import dgl
+
+# COLAB_GIN_ZINC_DGL_COMPAT_START: DGL renamed these helpers after the
+# official Benchmarking-GNNs release. Alias only missing names so official model
+# code can import unchanged under modern Colab DGL.
+import dgl.function as _colab_dgl_fn
+if not hasattr(_colab_dgl_fn, "copy_src") and hasattr(_colab_dgl_fn, "copy_u"):
+    def _colab_copy_src(src=None, out=None, *args, **kwargs):
+        if args:
+            src = args[0]
+            if len(args) > 1:
+                out = args[1]
+        src = kwargs.get("src", src)
+        out = kwargs.get("out", out)
+        return _colab_dgl_fn.copy_u(src, out)
+    _colab_dgl_fn.copy_src = _colab_copy_src
+if not hasattr(_colab_dgl_fn, "copy_edge") and hasattr(_colab_dgl_fn, "copy_e"):
+    def _colab_copy_edge(edge=None, out=None, *args, **kwargs):
+        if args:
+            edge = args[0]
+            if len(args) > 1:
+                out = args[1]
+        edge = kwargs.get("edge", edge)
+        out = kwargs.get("out", out)
+        return _colab_dgl_fn.copy_e(edge, out)
+    _colab_dgl_fn.copy_edge = _colab_copy_edge
+if not hasattr(_colab_dgl_fn, "copy_dst") and hasattr(_colab_dgl_fn, "copy_v"):
+    def _colab_copy_dst(dst=None, out=None, *args, **kwargs):
+        if args:
+            dst = args[0]
+            if len(args) > 1:
+                out = args[1]
+        dst = kwargs.get("dst", dst)
+        out = kwargs.get("out", out)
+        return _colab_dgl_fn.copy_v(dst, out)
+    _colab_dgl_fn.copy_dst = _colab_copy_dst
+try:
+    import dgl.heterograph as _colab_dgl_heterograph
+    if not hasattr(_colab_dgl_heterograph, "DGLHeteroGraph"):
+        if hasattr(_colab_dgl_heterograph, "DGLGraph"):
+            _colab_dgl_heterograph.DGLHeteroGraph = _colab_dgl_heterograph.DGLGraph
+        elif hasattr(dgl, "DGLGraph"):
+            _colab_dgl_heterograph.DGLHeteroGraph = dgl.DGLGraph
+except Exception:
+    pass
+# COLAB_GIN_ZINC_DGL_COMPAT_END
+"""
+    compat_pattern = re.compile(
+        r"import dgl\n\n# COLAB_GIN_ZINC_DGL_COMPAT_START:.*?# COLAB_GIN_ZINC_DGL_COMPAT_END\n",
+        re.DOTALL,
+    )
+    if "COLAB_GIN_ZINC_DGL_COMPAT_START" in text:
+        text, replaced = compat_pattern.subn(dgl_patch, text, count=1)
+        if replaced != 1:
+            raise RuntimeError("could not replace existing DGL compatibility patch")
+    else:
+        if dgl_marker not in text:
+            raise RuntimeError("could not patch official training script: import dgl marker not found")
+        text = text.replace(dgl_marker, dgl_patch, 1)
+
     if "COLAB_GIN_ZINC_PATCH_START" in text:
-        print("[patch] Colab checkpoint/log patch already present.", flush=True)
+        path.write_text(text, encoding="utf-8")
+        print("[patch] Colab compatibility/checkpoint/log patches already present.", flush=True)
         return
 
     marker = "    epoch_train_MAEs, epoch_val_MAEs = [], [] \n"
