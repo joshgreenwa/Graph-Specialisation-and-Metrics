@@ -12,6 +12,7 @@ from __future__ import annotations
 import math
 import random
 import time
+import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence
@@ -237,6 +238,143 @@ def weighted_direct_fraction(rows: Sequence[Mapping[str, Any]], *, seed: int, dr
     return {"mean": point, "ci_low": float(lo), "ci_high": float(hi), "pairs": len(clean)}
 
 
+def signal_gate_enabled(config: Mapping[str, Any], step: str) -> bool:
+    return bool(config.get("steps", {}).get(str(step), {}).get("signal_gate", True))
+
+
+def signal_gate_quantile(config: Mapping[str, Any], step: str) -> float:
+    return float(config.get("steps", {}).get(str(step), {}).get("signal_gate_quantile", 0.90))
+
+
+def distance_bin_signal_floor(
+    carriage: torch.Tensor,
+    dist: torch.Tensor,
+    carrier: int,
+    source: int,
+    *,
+    quantile: float,
+    min_floor: float,
+    reference_floor: float = float("nan"),
+) -> float:
+    d = dist.detach().cpu().float()[int(carrier), int(source)]
+    if not torch.isfinite(d):
+        return float("inf")
+    dist_cpu = dist.detach().cpu().float()
+    carriage_abs = carriage.detach().cpu().abs()
+    mask = torch.isfinite(dist_cpu) & (dist_cpu.round().long() == int(round(float(d.item()))))
+    if dist_cpu.dim() == 2:
+        diag = torch.eye(dist_cpu.size(0), dist_cpu.size(1), dtype=torch.bool)
+        mask = mask & ~diag
+    values = carriage_abs[mask]
+    finite_values = values[torch.isfinite(values)]
+    floors = [float(min_floor)]
+    if finite_values.numel():
+        q = min(max(float(quantile), 0.0), 1.0)
+        floors.append(float(torch.quantile(finite_values.float(), q).item()))
+    if math.isfinite(float(reference_floor)):
+        floors.append(float(reference_floor))
+    return max(floors)
+
+
+def pair_passes_signal_gate(
+    carriage: torch.Tensor,
+    dist: torch.Tensor,
+    carrier: int,
+    source: int,
+    *,
+    enabled: bool,
+    quantile: float,
+    min_floor: float,
+    reference_floor: float = float("nan"),
+) -> tuple[bool, float, float]:
+    effect = abs(float(carriage[int(carrier), int(source)].detach().cpu().item()))
+    floor = distance_bin_signal_floor(
+        carriage,
+        dist,
+        carrier,
+        source,
+        quantile=quantile,
+        min_floor=min_floor,
+        reference_floor=reference_floor,
+    )
+    if not enabled:
+        return True, floor, effect
+    return bool(math.isfinite(effect) and effect > floor), floor, effect
+
+
+def model_message_passing_depth(adapter: Any) -> Optional[int]:
+    try:
+        model = adapter.load_model()
+    except Exception:
+        return None
+    if hasattr(model, "n_layers"):
+        try:
+            return int(getattr(model, "n_layers"))
+        except Exception:
+            return None
+    count = 0
+    try:
+        for module in model.modules():
+            if module.__class__.__name__ == "GritTransformerLayer":
+                count += 1
+    except Exception:
+        return None
+    return count or None
+
+
+def empirical_onehop_noise_floor(
+    models: Sequence[ModelRun],
+    artifact_root: Path,
+    config: Mapping[str, Any],
+    *,
+    sample_graphs: int,
+    split: str,
+    ig_steps: int,
+    seed: int,
+    batched_vjp: bool,
+    min_floor: float,
+    quantile: float,
+) -> float:
+    onehop = next((m for m in models if "1hop" in m.name.lower() or "1hop" in str(m.variant).lower()), None)
+    if onehop is None:
+        return float(min_floor)
+    depth = model_message_passing_depth(onehop.adapter)
+    if depth is None or depth <= 0:
+        return float(min_floor)
+    graphs = select_graphs(onehop.adapter, split, sample_graphs, seed=seed)
+    if not graphs:
+        return float(min_floor)
+    baseline = mean_encoded_baseline(onehop.adapter, select_baseline_graphs(onehop.adapter, split, config, sample_graphs, seed=seed))
+    values: list[torch.Tensor] = []
+    for graph_idx, graph in enumerate(graphs):
+        gid = graph_identity(split, graph_idx, graph)
+        dist = distance_matrix(graph)
+        result = carriage_ig_cached(
+            onehop,
+            graph,
+            baseline,
+            artifact_root,
+            config,
+            split=split,
+            graph_id=gid,
+            steps=ig_steps,
+            batched_vjp=batched_vjp,
+        )
+        mask = torch.isfinite(dist) & (dist > float(depth))
+        if dist.dim() == 2:
+            diag = torch.eye(dist.size(0), dist.size(1), dtype=torch.bool)
+            mask = mask & ~diag
+        vals = result["carriage"].detach().abs()[mask]
+        vals = vals[torch.isfinite(vals)]
+        if vals.numel():
+            values.append(vals.float().cpu())
+    if not values:
+        return float(min_floor)
+    joined = torch.cat(values)
+    q = min(max(float(quantile), 0.0), 1.0)
+    return max(float(min_floor), float(torch.quantile(joined, q).item()))
+
+
 def r_nc_estimate(direct: torch.Tensor, dist: torch.Tensor, threshold: int) -> dict[str, Any]:
     far_mask = torch.isfinite(dist) & (dist > int(threshold))
     measured_mask = far_mask & torch.isfinite(direct)
@@ -248,13 +386,15 @@ def r_nc_estimate(direct: torch.Tensor, dist: torch.Tensor, threshold: int) -> d
     scaled_sum = mean_abs * float(total_pairs) if math.isfinite(mean_abs) else float("nan")
     coverage = float(measured_pairs / total_pairs) if total_pairs else float("nan")
     return {
-        "r_nc": scaled_sum,
+        "r_nc": mean_abs,
         "r_nc_raw_sample_sum": raw_sum,
         "r_nc_mean_abs_sampled_pair": mean_abs,
+        "r_nc_size_scaled_sum_estimate": scaled_sum,
         "r_nc_sampled_pairs": measured_pairs,
         "r_nc_total_far_pairs": total_pairs,
         "r_nc_pair_coverage": coverage,
         "r_nc_scaled_from_sample": measured_pairs != total_pairs,
+        "r_nc_definition": "mean_abs_direct_carriage_per_measured_far_pair",
     }
 
 
@@ -274,6 +414,16 @@ def swap_partner_policy(config: Mapping[str, Any]) -> str:
     return str(config.get("perturbation", {}).get("swap_partner_policy", "different_type")).strip().lower()
 
 
+def baseline_sample_graphs(config: Mapping[str, Any], fallback: int) -> int:
+    raw = config.get("perturbation", {}).get("baseline_sample_graphs", fallback)
+    value = int(raw)
+    return int(fallback) if value <= 0 else value
+
+
+def select_baseline_graphs(adapter: Any, split: str, config: Mapping[str, Any], fallback: int, *, seed: int) -> list[Any]:
+    return select_graphs(adapter, split, baseline_sample_graphs(config, fallback), seed=seed)
+
+
 def mean_encoded_baseline(adapter: OfficialGRITAdapter, graphs: Sequence[Any], *, max_graphs: int = 32) -> torch.Tensor:
     chunks = []
     for graph in list(graphs)[: int(max_graphs)]:
@@ -287,6 +437,138 @@ def mean_encoded_baseline(adapter: OfficialGRITAdapter, graphs: Sequence[Any], *
 def expanded_baseline(encoded: torch.Tensor, mean_baseline: torch.Tensor) -> torch.Tensor:
     base = mean_baseline.to(device=encoded.device, dtype=encoded.dtype)
     return base.expand_as(encoded)
+
+
+def tensor_digest(tensor: torch.Tensor) -> str:
+    cpu = tensor.detach().cpu().contiguous()
+    h = hashlib.sha256()
+    h.update(str(tuple(cpu.shape)).encode("utf-8"))
+    h.update(str(cpu.dtype).encode("utf-8"))
+    h.update(cpu.numpy().tobytes())
+    return h.hexdigest()[:20]
+
+
+def cache_safe_name(value: str) -> str:
+    return "".join(ch if ch.isalnum() or ch in {"-", "_", "."} else "_" for ch in str(value))
+
+
+def adapter_cache_fingerprint(adapter: Any) -> str:
+    h = hashlib.sha256()
+    for attr in ("checkpoint_path", "config_path"):
+        path = getattr(adapter, attr, None)
+        if path is None:
+            continue
+        p = Path(str(path))
+        h.update(str(p).encode("utf-8"))
+        try:
+            stat = p.stat()
+        except OSError:
+            continue
+        h.update(str(stat.st_size).encode("utf-8"))
+        h.update(str(stat.st_mtime_ns).encode("utf-8"))
+    return h.hexdigest()[:16]
+
+
+def carriage_cache_enabled(config: Mapping[str, Any]) -> bool:
+    runtime = config.get("runtime", {})
+    if bool(runtime.get("force_recompute_carriage", runtime.get("force_recompute", False))):
+        return False
+    return bool(runtime.get("reuse_intervention_carriage", True))
+
+
+def carriage_cache_file(
+    artifact_root: Path,
+    *,
+    model: str,
+    split: str,
+    graph_id: str,
+    steps: int,
+    clean_encoded: torch.Tensor,
+    baseline: torch.Tensor,
+    model_fingerprint: str = "",
+) -> Path:
+    clean_hash = tensor_digest(clean_encoded)
+    baseline_hash = tensor_digest(baseline)
+    model_hash = cache_safe_name(model_fingerprint or "model-unknown")
+    filename = (
+        f"{cache_safe_name(graph_id)}__ig{int(steps)}__"
+        f"{model_hash}__"
+        f"clean-{clean_hash}__base-{baseline_hash}.pt"
+    )
+    return artifact_root / "tensors" / "carriage_cache" / cache_safe_name(model) / cache_safe_name(split) / filename
+
+
+def load_cached_carriage(
+    artifact_root: Path,
+    config: Mapping[str, Any],
+    *,
+    model: str,
+    split: str,
+    graph_id: str,
+    steps: int,
+    clean_encoded: torch.Tensor,
+    baseline: torch.Tensor,
+    model_fingerprint: str = "",
+) -> Optional[torch.Tensor]:
+    if not carriage_cache_enabled(config):
+        return None
+    path = carriage_cache_file(
+        artifact_root,
+        model=model,
+        split=split,
+        graph_id=graph_id,
+        steps=steps,
+        clean_encoded=clean_encoded,
+        baseline=baseline,
+        model_fingerprint=model_fingerprint,
+    )
+    if not path.exists():
+        return None
+    try:
+        payload = torch.load(path, map_location="cpu", weights_only=False)
+    except TypeError:
+        payload = torch.load(path, map_location="cpu")
+    carriage = payload.get("carriage") if isinstance(payload, Mapping) else None
+    if not isinstance(carriage, torch.Tensor):
+        return None
+    return carriage.detach().cpu()
+
+
+def write_cached_carriage(
+    artifact_root: Path,
+    *,
+    model: str,
+    split: str,
+    graph_id: str,
+    steps: int,
+    clean_encoded: torch.Tensor,
+    baseline: torch.Tensor,
+    carriage: torch.Tensor,
+    model_fingerprint: str = "",
+) -> None:
+    path = carriage_cache_file(
+        artifact_root,
+        model=model,
+        split=split,
+        graph_id=graph_id,
+        steps=steps,
+        clean_encoded=clean_encoded,
+        baseline=baseline,
+        model_fingerprint=model_fingerprint,
+    )
+    atomic_torch_save(
+        path,
+        {
+            "model": model,
+            "split": split,
+            "graph_id": graph_id,
+            "ig_steps": int(steps),
+            "model_fingerprint": model_fingerprint,
+            "clean_encoded_sha256": tensor_digest(clean_encoded),
+            "baseline_sha256": tensor_digest(baseline),
+            "carriage": carriage.detach().cpu(),
+        },
+    )
 
 
 def encoded_baseline(
@@ -330,6 +612,45 @@ def output_ig_source_endpoint(
     return total
 
 
+def clean_readout_state_from_baseline(
+    adapter: OfficialGRITAdapter,
+    graph: Any,
+    mean_baseline: torch.Tensor,
+    *,
+    target_index: int = 0,
+    baseline_override: Optional[torch.Tensor] = None,
+    capture_attention: bool = False,
+    capture_channels: bool = False,
+    capture_layer_inputs: bool = False,
+    capture_layer_outputs: bool = False,
+) -> dict[str, Any]:
+    clean_encoded = adapter.encoded_node_states(graph).detach()
+    base = (
+        baseline_override.to(device=clean_encoded.device, dtype=clean_encoded.dtype)
+        if baseline_override is not None
+        else expanded_baseline(clean_encoded, mean_baseline)
+    )
+    if tuple(base.shape) != tuple(clean_encoded.shape):
+        base = base.expand_as(clean_encoded)
+    clean_cache, readout_grad = adapter.readout_gradient_from_encoded_content(
+        graph,
+        clean_encoded.detach().clone(),
+        target_index=target_index,
+        capture_attention=capture_attention,
+        capture_channels=capture_channels,
+        capture_layer_inputs=capture_layer_inputs,
+        capture_layer_outputs=capture_layer_outputs,
+    )
+    pred_clean = float(clean_cache.prediction.reshape(-1)[target_index].detach().cpu().item())
+    return {
+        "clean_encoded": clean_encoded.detach().cpu(),
+        "baseline": base.detach().cpu(),
+        "readout_gradient": readout_grad.detach().cpu(),
+        "prediction": pred_clean,
+        "clean_cache": clean_cache,
+    }
+
+
 def carriage_ig(
     adapter: OfficialGRITAdapter,
     graph: Any,
@@ -343,6 +664,7 @@ def carriage_ig(
     capture_channels: bool = False,
     capture_layer_inputs: bool = False,
     capture_layer_outputs: bool = False,
+    clean_state: Optional[Mapping[str, Any]] = None,
 ) -> dict[str, Any]:
     """Compute markdown carriage C[i,j] using encoded-content IG.
 
@@ -350,24 +672,26 @@ def carriage_ig(
     ``g_i · h_i^L`` with respect to each encoded source ``j`` along the
     baseline-to-input path, where ``g_i`` is the clean readout gradient.
     """
-    clean_encoded = adapter.encoded_node_states(graph).detach()
-    base = (
-        baseline_override.to(device=clean_encoded.device, dtype=clean_encoded.dtype)
-        if baseline_override is not None
-        else expanded_baseline(clean_encoded, mean_baseline)
+    state = (
+        dict(clean_state)
+        if clean_state is not None
+        else clean_readout_state_from_baseline(
+            adapter,
+            graph,
+            mean_baseline,
+            target_index=target_index,
+            baseline_override=baseline_override,
+            capture_attention=capture_attention,
+            capture_channels=capture_channels,
+            capture_layer_inputs=capture_layer_inputs,
+            capture_layer_outputs=capture_layer_outputs,
+        )
     )
-    if tuple(base.shape) != tuple(clean_encoded.shape):
-        base = base.expand_as(clean_encoded)
+    clean_encoded = state["clean_encoded"].to(adapter.device)
+    base = state["baseline"].to(adapter.device)
     delta = clean_encoded - base
-    clean_cache, readout_grad = adapter.readout_gradient_from_encoded_content(
-        graph,
-        clean_encoded.detach().clone(),
-        target_index=target_index,
-        capture_attention=capture_attention,
-        capture_channels=capture_channels,
-        capture_layer_inputs=capture_layer_inputs,
-        capture_layer_outputs=capture_layer_outputs,
-    )
+    clean_cache = state["clean_cache"]
+    readout_grad = state["readout_gradient"].to(adapter.device)
     n = int(clean_encoded.size(0))
     carriage = clean_encoded.new_zeros((n, n))
     use_batched_vjp = bool(batched_vjp)
@@ -400,19 +724,98 @@ def carriage_ig(
             scalar = carrier_scores[carrier]
             (grad,) = torch.autograd.grad(scalar, point, retain_graph=carrier < n - 1, create_graph=False)
             carriage[carrier] += (grad.detach() * delta).sum(dim=-1) / float(steps)
-    pred_clean = float(clean_cache.prediction.reshape(-1)[target_index].detach().cpu().item())
     pred_base = float(predict_scalar_from_encoded(adapter, graph, base).detach().cpu().item())
     return {
         "carriage": carriage.detach().cpu(),
         "clean_encoded": clean_encoded.detach().cpu(),
         "baseline": base.detach().cpu(),
         "readout_gradient": readout_grad.detach().cpu(),
-        "prediction": pred_clean,
+        "prediction": state["prediction"],
         "baseline_prediction": pred_base,
         "clean_cache": clean_cache,
         "batched_vjp_used": use_batched_vjp,
         "batched_vjp_error": batched_vjp_error,
     }
+
+
+def carriage_ig_cached(
+    model: ModelRun,
+    graph: Any,
+    mean_baseline: torch.Tensor,
+    artifact_root: Path,
+    config: Mapping[str, Any],
+    *,
+    split: str,
+    graph_id: str,
+    steps: int,
+    target_index: int = 0,
+    batched_vjp: bool = True,
+    capture_attention: bool = False,
+    capture_channels: bool = False,
+    capture_layer_inputs: bool = False,
+    capture_layer_outputs: bool = False,
+) -> dict[str, Any]:
+    state = clean_readout_state_from_baseline(
+        model.adapter,
+        graph,
+        mean_baseline,
+        target_index=target_index,
+        capture_attention=capture_attention,
+        capture_channels=capture_channels,
+        capture_layer_inputs=capture_layer_inputs,
+        capture_layer_outputs=capture_layer_outputs,
+    )
+    model_fingerprint = adapter_cache_fingerprint(model.adapter)
+    cached = load_cached_carriage(
+        artifact_root,
+        config,
+        model=model.name,
+        split=split,
+        graph_id=graph_id,
+        steps=steps,
+        clean_encoded=state["clean_encoded"],
+        baseline=state["baseline"],
+        model_fingerprint=model_fingerprint,
+    )
+    if cached is not None:
+        return {
+            "carriage": cached,
+            "clean_encoded": state["clean_encoded"],
+            "baseline": state["baseline"],
+            "readout_gradient": state["readout_gradient"],
+            "prediction": state["prediction"],
+            "baseline_prediction": float("nan"),
+            "clean_cache": state["clean_cache"],
+            "batched_vjp_used": bool(batched_vjp),
+            "batched_vjp_error": None,
+            "carriage_cache_hit": True,
+        }
+    result = carriage_ig(
+        model.adapter,
+        graph,
+        mean_baseline,
+        steps=steps,
+        target_index=target_index,
+        batched_vjp=batched_vjp,
+        capture_attention=capture_attention,
+        capture_channels=capture_channels,
+        capture_layer_inputs=capture_layer_inputs,
+        capture_layer_outputs=capture_layer_outputs,
+        clean_state=state,
+    )
+    result["carriage_cache_hit"] = False
+    write_cached_carriage(
+        artifact_root,
+        model=model.name,
+        split=split,
+        graph_id=graph_id,
+        steps=steps,
+        clean_encoded=result["clean_encoded"],
+        baseline=result["baseline"],
+        carriage=result["carriage"],
+        model_fingerprint=model_fingerprint,
+    )
+    return result
 
 
 def carriage_swap(
@@ -828,20 +1231,26 @@ def run_step0(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
     for model in models:
         graphs = select_graphs(model.adapter, "test", sample_graphs, seed=seed)
         progress(f"Step 0 {model.name}: selected {len(graphs)} test graph(s), IG steps={ig_steps}, swap_partners={swap_partners}")
-        baseline = mean_encoded_baseline(model.adapter, graphs)
+        baseline = mean_encoded_baseline(model.adapter, select_baseline_graphs(model.adapter, "test", config, sample_graphs, seed=seed))
         pred_vals: list[float] = []
         measured_vals: list[float] = []
+        cache_hits = 0
         for graph_idx, graph in enumerate(graphs):
             progress_graph("Step 0", model.name, graph_idx, len(graphs))
             gid = graph_identity("test", graph_idx, graph)
             dist = distance_matrix(graph)
-            result = carriage_ig(
-                model.adapter,
+            result = carriage_ig_cached(
+                model,
                 graph,
                 baseline,
+                artifact_root,
+                config,
+                split="test",
+                graph_id=gid,
                 steps=ig_steps,
                 batched_vjp=batched_vjp,
             )
+            cache_hits += int(bool(result.get("carriage_cache_hit")))
             c_ig = result["carriage"]
             encoded = result["clean_encoded"].to(model.adapter.device)
             base = result["baseline"].to(model.adapter.device)
@@ -946,6 +1355,8 @@ def run_step0(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
             }
         )
         progress(f"Step 0 {model.name}: complete, reconstruction_rows={len([r for r in recon_rows if r.get('model') == model.name])}")
+        if cache_hits:
+            progress(f"Step 0 {model.name}: reused cached IG carriage for {cache_hits}/{len(graphs)} graph(s)")
     write_csv(artifact_root / "metrics" / "step0_reconstruction.csv", recon_rows)
     write_csv(artifact_root / "metrics" / "step0_profile_agreement.csv", profile_rows)
     write_csv(artifact_root / "metrics" / "step0_reconstruction_residual_diagnostics.csv", residual_rows)
@@ -1568,21 +1979,27 @@ def run_step2(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
             f"IG steps={ig_steps}, swap_check={include_swap_attention_check}, "
             f"layer_channel_split={run_layer_channel_split}, tau={tau}"
         )
-        baseline = mean_encoded_baseline(model.adapter, graphs)
+        baseline = mean_encoded_baseline(model.adapter, select_baseline_graphs(model.adapter, "test", config, sample_graphs, seed=seed))
+        cache_hits = 0
         for graph_idx, graph in enumerate(graphs):
             progress_graph("Step 2", model.name, graph_idx, len(graphs))
             gid = graph_identity("test", graph_idx, graph)
             dist = distance_matrix(graph)
-            result = carriage_ig(
-                model.adapter,
+            result = carriage_ig_cached(
+                model,
                 graph,
                 baseline,
+                artifact_root,
+                config,
+                split="test",
+                graph_id=gid,
                 steps=ig_steps,
                 batched_vjp=batched_vjp,
                 capture_attention=True,
                 capture_channels=run_layer_channel_split,
                 capture_layer_outputs=run_layer_channel_split,
             )
+            cache_hits += int(bool(result.get("carriage_cache_hit")))
             c_ig = result["carriage"]
             cache = result["clean_cache"]
             tensors[f"step2/{model.name}/{gid}/carriage"] = c_ig
@@ -1645,6 +2062,8 @@ def run_step2(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
                             )
             if run_layer_channel_split:
                 channel_rows.extend(layer_channel_split_rows(model, graph, result, dist, gid, tau))
+        if cache_hits:
+            progress(f"Step 2 {model.name}: reused cached IG carriage for {cache_hits}/{len(graphs)} graph(s)")
     write_csv(artifact_root / "metrics" / "step2_profiles.csv", profile_rows)
     write_csv(artifact_root / "metrics" / "step2_attention_faithfulness.csv", faith_rows)
     write_csv(artifact_root / "metrics" / "step2_far_threshold_sensitivity.csv", threshold_rows)
@@ -2028,14 +2447,29 @@ def run_step3(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
         for split in ["train", "test"]:
             graphs = select_graphs(model.adapter, split, sample_graphs, seed=seed)
             progress(f"Step 3 {model.name}: selected {len(graphs)} {split} graph(s), IG steps={ig_steps}")
-            baseline = mean_encoded_baseline(model.adapter, graphs)
+            baseline = mean_encoded_baseline(model.adapter, select_baseline_graphs(model.adapter, split, config, sample_graphs, seed=seed))
+            cache_hits = 0
             for graph_idx, graph in enumerate(graphs):
                 progress_graph("Step 3", model.name, graph_idx, len(graphs), split=split)
                 gid = graph_identity(split, graph_idx, graph)
                 dist = distance_matrix(graph)
-                c = carriage_ig(model.adapter, graph, baseline, steps=ig_steps, batched_vjp=batched_vjp)["carriage"]
+                result = carriage_ig_cached(
+                    model,
+                    graph,
+                    baseline,
+                    artifact_root,
+                    config,
+                    split=split,
+                    graph_id=gid,
+                    steps=ig_steps,
+                    batched_vjp=batched_vjp,
+                )
+                cache_hits += int(bool(result.get("carriage_cache_hit")))
+                c = result["carriage"]
                 for row in distance_profile(c.abs(), dist):
                     rows.append({"model": model.name, "split": split, "graph_id": gid, **row})
+            if cache_hits:
+                progress(f"Step 3 {model.name} {split}: reused cached IG carriage for {cache_hits}/{len(graphs)} graph(s)")
     write_csv(artifact_root / "metrics" / "step3_train_test_profiles.csv", rows)
     gap_rows = train_test_gap_rows(rows, int(config.get("primary_tau", 3)))
     write_csv(artifact_root / "metrics" / "step3_train_minus_test_gap.csv", gap_rows)
@@ -2254,6 +2688,8 @@ def run_step4(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
     max_pairs = optional_pair_limit(cfg.get("max_far_pairs_per_graph", 64), 64)
     depth_pairs = int(cfg.get("depth_pairs_per_graph", 8))
     min_effect_abs = float(cfg.get("min_effect_abs", 1.0e-6))
+    use_signal_gate = signal_gate_enabled(config, "4")
+    gate_quantile = signal_gate_quantile(config, "4")
     clamp_mode = str(cfg.get("clamp_mode", "detach")).strip().lower()
     run_clamp_negative_control = bool(cfg.get("run_clamp_negative_control", True))
     composed_reference_max_direct_fraction = float(cfg.get("composed_reference_max_direct_fraction", 0.20))
@@ -2266,6 +2702,7 @@ def run_step4(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
     rows: list[dict[str, Any]] = []
     depth_rows: list[dict[str, Any]] = []
     tensors: dict[str, Any] = {}
+    signal_gate_rows: list[dict[str, Any]] = []
     analytic_patching_check: dict[str, Any] = {"status": "not_run"}
     if bool(cfg.get("run_analytic_patching_check", True)):
         try:
@@ -2277,6 +2714,22 @@ def run_step4(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
         except Exception as exc:
             analytic_patching_check = {"status": "failed", "error": str(exc)}
         write_json(artifact_root / "metrics" / "step4_analytic_patching_check_summary.json", analytic_patching_check)
+    onehop_floor = empirical_onehop_noise_floor(
+        models,
+        artifact_root,
+        config,
+        sample_graphs=sample_graphs,
+        split="test",
+        ig_steps=ig_steps,
+        seed=seed,
+        batched_vjp=batched_vjp,
+        min_floor=min_effect_abs,
+        quantile=gate_quantile,
+    ) if use_signal_gate else float(min_effect_abs)
+    progress(
+        f"Step 4 signal gate: enabled={use_signal_gate}, quantile={gate_quantile:.2f}, "
+        f"onehop_empirical_floor={onehop_floor:.3g}"
+    )
     for model in models:
         graphs = select_graphs(model.adapter, "test", sample_graphs, seed=seed)
         max_pairs_label = "all" if max_pairs is None else str(max_pairs)
@@ -2284,30 +2737,63 @@ def run_step4(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
             f"Step 4 {model.name}: selected {len(graphs)} test graph(s), "
             f"max_far_pairs_per_graph={max_pairs_label}, IG steps={ig_steps}"
         )
-        baseline = mean_encoded_baseline(model.adapter, graphs)
+        baseline = mean_encoded_baseline(model.adapter, select_baseline_graphs(model.adapter, "test", config, sample_graphs, seed=seed))
+        cache_hits = 0
         for graph_idx, graph in enumerate(graphs):
             progress_graph("Step 4", model.name, graph_idx, len(graphs))
             gid = graph_identity("test", graph_idx, graph)
             dist = distance_matrix(graph)
-            result = carriage_ig(
-                model.adapter,
+            result = carriage_ig_cached(
+                model,
                 graph,
                 baseline,
+                artifact_root,
+                config,
+                split="test",
+                graph_id=gid,
                 steps=ig_steps,
                 batched_vjp=batched_vjp,
                 capture_layer_inputs=True,
             )
+            cache_hits += int(bool(result.get("carriage_cache_hit")))
             c = result["carriage"]
             clean_cache = result["clean_cache"]
             readout_grad = result["readout_gradient"]
             clean_encoded = result["clean_encoded"].to(model.adapter.device)
             base_encoded = result["baseline"].to(model.adapter.device)
             selected = far_pairs(dist, selection_tau, max_pairs=max_pairs, seed=seed + graph_idx)
-            direct_matrix = torch.zeros_like(c)
+            direct_matrix = torch.full_like(c, float("nan"))
+            accepted_pair_idx = 0
             for pair_idx, (carrier, source) in enumerate(selected):
                 pair_interval = progress_interval(len(selected), target_messages=4)
                 if pair_idx == 0 or pair_idx + 1 == len(selected) or (pair_idx + 1) % pair_interval == 0:
                     progress(f"Step 4 {model.name} graph {graph_idx + 1}/{len(graphs)}: patched pair {pair_idx + 1}/{len(selected)}")
+                gate_pass, signal_floor, effect_abs = pair_passes_signal_gate(
+                    c,
+                    dist,
+                    carrier,
+                    source,
+                    enabled=use_signal_gate,
+                    quantile=gate_quantile,
+                    min_floor=min_effect_abs,
+                    reference_floor=onehop_floor,
+                )
+                signal_gate_rows.append(
+                    {
+                        "model": model.name,
+                        "graph_id": gid,
+                        "carrier": carrier,
+                        "source": source,
+                        "distance": float(dist[carrier, source].item()),
+                        "effect_abs": effect_abs,
+                        "signal_floor": signal_floor,
+                        "signal_gate_pass": gate_pass,
+                        "signal_gate_quantile": gate_quantile,
+                        "onehop_empirical_floor": onehop_floor,
+                    }
+                )
+                if not gate_pass:
+                    continue
                 cut = mediator_cut(graph, carrier, source)
                 if not cut:
                     continue
@@ -2349,6 +2835,10 @@ def run_step4(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
                         "direct_fraction": direct_fraction,
                         "effect_abs": abs(unclamped),
                         "min_effect_abs": min_effect_abs,
+                        "signal_floor": signal_floor,
+                        "signal_gate_pass": gate_pass,
+                        "signal_gate_quantile": gate_quantile,
+                        "onehop_empirical_floor": onehop_floor,
                         "nontrivial_effect": nontrivial_effect,
                     }
                 )
@@ -2402,10 +2892,14 @@ def run_step4(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
                                 "direct_fraction": control_fraction,
                                 "effect_abs": abs(unclamped),
                                 "min_effect_abs": min_effect_abs,
+                                "signal_floor": signal_floor,
+                                "signal_gate_pass": gate_pass,
+                                "signal_gate_quantile": gate_quantile,
+                                "onehop_empirical_floor": onehop_floor,
                                 "nontrivial_effect": control_nontrivial,
                             }
                         )
-                if depth_pairs > 0 and pair_idx < depth_pairs:
+                if depth_pairs > 0 and accepted_pair_idx < depth_pairs:
                     layer_count = len((clean_cache.extras or {}).get("layer_input_node_states", []))
                     for layer in range(layer_count):
                         depth_direct = patched_ig_pair(
@@ -2444,12 +2938,20 @@ def run_step4(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
                                 "direct_fraction": depth_fraction,
                                 "effect_abs": abs(unclamped),
                                 "min_effect_abs": min_effect_abs,
+                                "signal_floor": signal_floor,
+                                "signal_gate_pass": gate_pass,
+                                "signal_gate_quantile": gate_quantile,
+                                "onehop_empirical_floor": onehop_floor,
                                 "nontrivial_effect": depth_nontrivial,
                             }
                         )
+                accepted_pair_idx += 1
             tensors[f"step4/{model.name}/{gid}/unclamped_carriage"] = c
             tensors[f"step4/{model.name}/{gid}/direct_carriage"] = direct_matrix
+        if cache_hits:
+            progress(f"Step 4 {model.name}: reused cached IG carriage for {cache_hits}/{len(graphs)} graph(s)")
     write_csv(artifact_root / "metrics" / "step4_mediator_patching.csv", rows)
+    write_csv(artifact_root / "metrics" / "step4_signal_gate.csv", signal_gate_rows)
     write_csv(artifact_root / "metrics" / "step4_depth_schedule.csv", depth_rows)
     validation_summary = mediator_validation_summary(rows)
     write_csv(artifact_root / "metrics" / "step4_mediator_validation_summary.csv", validation_summary)
@@ -2494,6 +2996,11 @@ def run_step4(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
         "status": status,
         "patch_rows": len(rows),
         "depth_rows": len(depth_rows),
+        "signal_gate_rows": len(signal_gate_rows),
+        "signal_gate_pass_rows": len([r for r in signal_gate_rows if bool(r.get("signal_gate_pass"))]),
+        "signal_gate_enabled": use_signal_gate,
+        "signal_gate_quantile": gate_quantile,
+        "onehop_empirical_floor": onehop_floor,
         "clamp_negative_control_rows": len([r for r in rows if str(r.get("clamp_type")) == "random_off_path"]),
         "analytic_patching_check": analytic_patching_check,
         "composed_reference_failures": composed_reference_failures,
@@ -2507,11 +3014,16 @@ def run_step4(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
 
 
 def is_composed_reference_model(model_name: str, models: Sequence[ModelRun]) -> bool:
-    lowered = str(model_name).lower()
-    if "1hop" in lowered or "gin" in lowered or "gcn" in lowered:
-        return True
-    model = next((m for m in models if m.name == model_name), None)
-    return bool(model is not None and "validation_reference" in str(model.role))
+    """Return whether a trained model should be used as a hard clamp validator.
+
+    Trained 1-hop/GIN/GCN references are useful local-mechanism context, but
+    their far carriage can be at the measurement floor on ZINC. The hard
+    composed-reference validator is therefore the analytic patching check, not
+    a noisy trained reference ratio.
+    """
+
+    _ = model_name, models
+    return False
 
 
 def mediator_validation_summary(rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
@@ -2535,7 +3047,11 @@ def mediator_validation_summary(rows: Sequence[Mapping[str, Any]]) -> list[dict[
                 "ci_high": stats["ci_high"],
                 "pairs": stats["pairs"],
                 "aggregation": "carriage_weighted",
-                "validation_role": "secondary_composed_reference" if "1hop" in model else "treatment_context",
+                "validation_role": (
+                    "local_reference_context_not_hard_validator"
+                    if any(token in model.lower() for token in ("1hop", "gin", "gcn"))
+                    else "dense_signal_context"
+                ),
             }
         )
     return out
@@ -2873,6 +3389,8 @@ def run_step5(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
     max_pairs = optional_pair_limit(cfg.get("max_far_pairs_per_graph", config["steps"]["4"].get("max_far_pairs_per_graph", 64)), 64)
     interaction_pairs = int(cfg.get("interaction_pairs", 1000))
     min_effect_abs = float(cfg.get("min_effect_abs", 1.0e-6))
+    use_signal_gate = signal_gate_enabled(config, "5")
+    gate_quantile = signal_gate_quantile(config, "5")
     clamp_mode = str(cfg.get("clamp_mode", config["steps"]["4"].get("clamp_mode", "detach"))).strip().lower()
     partner_policy = swap_partner_policy(config)
     tau = int(config.get("primary_tau", 3))
@@ -2902,9 +3420,30 @@ def run_step5(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
     rank_rows: list[dict[str, Any]] = []
     interaction_rows: list[dict[str, Any]] = []
     rung_rows: list[dict[str, Any]] = []
+    signal_gate_rows: list[dict[str, Any]] = []
     worked_example: Optional[dict[str, Any]] = None
     worked_example_score = 0.0
     rng = random.Random(seed)
+    onehop_floor = (
+        empirical_onehop_noise_floor(
+            analysis_models,
+            artifact_root,
+            config,
+            sample_graphs=sample_graphs,
+            split="test",
+            ig_steps=ig_steps,
+            seed=seed,
+            batched_vjp=batched_vjp,
+            min_floor=min_effect_abs,
+            quantile=gate_quantile,
+        )
+        if use_signal_gate
+        else float(min_effect_abs)
+    )
+    progress(
+        f"Step 5 signal gate: enabled={use_signal_gate}, quantile={gate_quantile:.2f}, "
+        f"onehop_empirical_floor={onehop_floor:.3g}"
+    )
     for model in analysis_models:
         graphs = select_graphs(model.adapter, "test", sample_graphs, seed=seed)
         max_pairs_label = "all" if max_pairs is None else str(max_pairs)
@@ -2912,20 +3451,26 @@ def run_step5(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
             f"Step 5 {model.name}: selected {len(graphs)} test graph(s), "
             f"max_far_pairs_per_graph={max_pairs_label}, IG steps={ig_steps}"
         )
-        baseline = mean_encoded_baseline(model.adapter, graphs)
+        baseline = mean_encoded_baseline(model.adapter, select_baseline_graphs(model.adapter, "test", config, sample_graphs, seed=seed))
+        cache_hits = 0
         for graph_idx, graph in enumerate(graphs):
             progress_graph("Step 5", model.name, graph_idx, len(graphs))
             gid = graph_identity("test", graph_idx, graph)
             dist = distance_matrix(graph)
-            result = carriage_ig(
-                model.adapter,
+            result = carriage_ig_cached(
+                model,
                 graph,
                 baseline,
+                artifact_root,
+                config,
+                split="test",
+                graph_id=gid,
                 steps=ig_steps,
                 batched_vjp=batched_vjp,
                 capture_layer_inputs=True,
                 capture_attention=("grit" in model.name.lower()),
             )
+            cache_hits += int(bool(result.get("carriage_cache_hit")))
             c = result["carriage"]
             clean_cache = result["clean_cache"]
             readout_grad = result["readout_gradient"]
@@ -2937,6 +3482,32 @@ def run_step5(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
                 pair_interval = progress_interval(len(selected), target_messages=4)
                 if pair_idx == 0 or pair_idx + 1 == len(selected) or (pair_idx + 1) % pair_interval == 0:
                     progress(f"Step 5 {model.name} graph {graph_idx + 1}/{len(graphs)}: patched pair {pair_idx + 1}/{len(selected)}")
+                gate_pass, signal_floor, effect_abs = pair_passes_signal_gate(
+                    c,
+                    dist,
+                    carrier,
+                    source,
+                    enabled=use_signal_gate,
+                    quantile=gate_quantile,
+                    min_floor=min_effect_abs,
+                    reference_floor=onehop_floor,
+                )
+                signal_gate_rows.append(
+                    {
+                        "model": model.name,
+                        "graph_id": gid,
+                        "carrier": carrier,
+                        "source": source,
+                        "distance": float(dist[carrier, source].item()),
+                        "effect_abs": effect_abs,
+                        "signal_floor": signal_floor,
+                        "signal_gate_pass": gate_pass,
+                        "signal_gate_quantile": gate_quantile,
+                        "onehop_empirical_floor": onehop_floor,
+                    }
+                )
+                if not gate_pass:
+                    continue
                 cut = mediator_cut(graph, carrier, source)
                 if not cut:
                     continue
@@ -2961,7 +3532,8 @@ def run_step5(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
                 attention_far = far_mass(attention_last, dist, tau)
             carriage_far = far_mass(c, dist, tau)
             total_carriage_mass = float(c.detach().abs().sum().item())
-            direct_far_share = safe_float(r_nc_by_tau[int(tau)].get("r_nc")) / max(total_carriage_mass, EPS)
+            direct_far_sum = safe_float(r_nc_by_tau[int(tau)].get("r_nc_size_scaled_sum_estimate"))
+            direct_far_share = direct_far_sum / max(total_carriage_mass, EPS)
             for rung_index, (rung, value, denominator) in enumerate(
                 [
                     ("attention", attention_far, "own_attention_mass"),
@@ -2982,6 +3554,7 @@ def run_step5(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
                         "r_nc": r_nc_by_tau[int(tau)].get("r_nc"),
                         "total_carriage_mass": total_carriage_mass,
                         "attention_available": bool(clean_cache.attention),
+                        "signal_gate_enabled": use_signal_gate,
                     }
                 )
             if model.name == dense.name and clean_cache.attention and torch.isfinite(direct).any():
@@ -3032,10 +3605,15 @@ def run_step5(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
                     "r_nc": r_nc,
                     "r_nc_raw_sample_sum": r_nc_by_tau[int(tau)].get("r_nc_raw_sample_sum"),
                     "r_nc_mean_abs_sampled_pair": r_nc_by_tau[int(tau)].get("r_nc_mean_abs_sampled_pair"),
+                    "r_nc_size_scaled_sum_estimate": r_nc_by_tau[int(tau)].get("r_nc_size_scaled_sum_estimate"),
                     "r_nc_sampled_pairs": r_nc_by_tau[int(tau)].get("r_nc_sampled_pairs"),
                     "r_nc_total_far_pairs": r_nc_by_tau[int(tau)].get("r_nc_total_far_pairs"),
                     "r_nc_pair_coverage": r_nc_by_tau[int(tau)].get("r_nc_pair_coverage"),
                     "r_nc_scaled_from_sample": r_nc_by_tau[int(tau)].get("r_nc_scaled_from_sample"),
+                    "r_nc_definition": r_nc_by_tau[int(tau)].get("r_nc_definition"),
+                    "signal_gate_enabled": use_signal_gate,
+                    "signal_gate_quantile": gate_quantile,
+                    "onehop_empirical_floor": onehop_floor,
                     "clamp_mode": clamp_mode,
                     "dense_error": dense_err,
                     "onehop_error": onehop_err,
@@ -3046,6 +3624,7 @@ def run_step5(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
                 for threshold, stats in r_nc_by_tau.items():
                     gap_row[f"r_nc_tau_{threshold}"] = stats.get("r_nc")
                     gap_row[f"r_nc_tau_{threshold}_coverage"] = stats.get("r_nc_pair_coverage")
+                    gap_row[f"r_nc_tau_{threshold}_size_scaled_sum_estimate"] = stats.get("r_nc_size_scaled_sum_estimate")
                 gap_rows.append(gap_row)
             for threshold in thresholds:
                 far_mask = torch.isfinite(dist) & (dist > threshold)
@@ -3061,17 +3640,23 @@ def run_step5(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
                     "primary_tau": threshold == tau,
                     "r_nc": r_nc_by_tau[int(threshold)].get("r_nc"),
                     "r_nc_raw_sample_sum": r_nc_by_tau[int(threshold)].get("r_nc_raw_sample_sum"),
+                    "r_nc_mean_abs_sampled_pair": r_nc_by_tau[int(threshold)].get("r_nc_mean_abs_sampled_pair"),
+                    "r_nc_size_scaled_sum_estimate": r_nc_by_tau[int(threshold)].get("r_nc_size_scaled_sum_estimate"),
+                    "r_nc_definition": r_nc_by_tau[int(threshold)].get("r_nc_definition"),
                     "sampled_pairs": sampled_pairs,
                     "total_far_pairs": total_pairs,
                     "pair_coverage": coverage,
+                    "signal_gate_enabled": use_signal_gate,
+                    "signal_gate_quantile": gate_quantile,
+                    "onehop_empirical_floor": onehop_floor,
                     "clamp_mode": clamp_mode,
                 }
-                if total_pairs > 0 and sampled_pairs == total_pairs:
+                if total_pairs > 0 and sampled_pairs > 0:
                     far_matrix = torch.zeros_like(direct)
-                    far_matrix[far_mask] = direct[far_mask]
+                    far_matrix[measured_mask] = direct[measured_mask]
                     row.update(
                         {
-                            "status": "complete",
+                            "status": "complete_sampled_signal_pairs",
                             "effective_rank": effective_rank(far_matrix),
                             "top_singular_share": top_singular_share(far_matrix),
                             "above_null_margin": distance_preserving_above_null_margin(far_matrix, dist, seed=seed + graph_idx + threshold),
@@ -3080,7 +3665,7 @@ def run_step5(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
                 else:
                     row.update(
                         {
-                            "status": "skipped_incomplete_direct_matrix",
+                            "status": "skipped_no_signal_pairs",
                             "effective_rank": float("nan"),
                             "top_singular_share": float("nan"),
                             "above_null_margin": float("nan"),
@@ -3101,10 +3686,13 @@ def run_step5(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
                     partner_policy=partner_policy,
                 )
             )
+        if cache_hits:
+            progress(f"Step 5 {model.name}: reused cached IG carriage for {cache_hits}/{len(graphs)} graph(s)")
     write_csv(artifact_root / "metrics" / "step5_gap_vs_rnc.csv", gap_rows)
     write_csv(artifact_root / "metrics" / "step5_far_carriage_rank.csv", rank_rows)
     write_csv(artifact_root / "metrics" / "step5_non_additivity.csv", interaction_rows)
     write_csv(artifact_root / "metrics" / "step5_rung_funnel.csv", rung_rows)
+    write_csv(artifact_root / "metrics" / "step5_signal_gate.csv", signal_gate_rows)
     write_json(artifact_root / "metrics" / "step5_gap_regression.json", gap_regression_summary(gap_rows))
     write_csv(artifact_root / "metrics" / "step5_far_carriage_rank_summary.csv", rank_summary_rows(rank_rows))
     write_csv(artifact_root / "metrics" / "step5_non_additivity_summary.csv", non_additivity_summary_rows(interaction_rows))
@@ -3132,7 +3720,7 @@ def run_step5(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
             },
         )
     progress("Step 5 complete: metrics, tensors, and figures written")
-    rank_complete = sum(1 for row in rank_rows if str(row.get("status")) == "complete")
+    rank_complete = sum(1 for row in rank_rows if str(row.get("status")).startswith("complete"))
     return {
         "status": "complete",
         "models": [model.name for model in analysis_models],
@@ -3143,6 +3731,11 @@ def run_step5(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
         "rank_skipped_rows": len(rank_rows) - rank_complete,
         "interaction_rows": len(interaction_rows),
         "rung_rows": len(rung_rows),
+        "signal_gate_rows": len(signal_gate_rows),
+        "signal_gate_pass_rows": len([r for r in signal_gate_rows if bool(r.get("signal_gate_pass"))]),
+        "signal_gate_enabled": use_signal_gate,
+        "signal_gate_quantile": gate_quantile,
+        "onehop_empirical_floor": onehop_floor,
         "worked_molecule_example": worked_example is not None,
     }
 
@@ -3382,7 +3975,7 @@ def render_step5(
                 ax.plot(xs, coef[0] * xs + coef[1], color="#f58518", label=f"r={corr:.2f}")
                 ax.legend(frameon=False)
             ax.set_title("Step 5: performance gap vs non-composable carriage")
-            ax.set_xlabel("R_nc = Σ_{d>τ} |C^clamp|")
+            ax.set_xlabel("R_nc = mean |C^clamp| over signal-gated far pairs")
             ax.set_ylabel("1-hop error - dense error")
             fig.savefig(figures / "step5_gap_vs_rnc.png", dpi=dpi)
             fig.savefig(figures / "step5_gap_vs_rnc.pdf")

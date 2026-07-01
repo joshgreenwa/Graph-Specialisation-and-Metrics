@@ -56,6 +56,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "carriage_primary": "integrated_gradients",
         "ig_baseline": "mean_node_embedding",
         "ig_steps": 32,
+        "baseline_sample_graphs": 200,
         "swap_partners": 8,
         "batched_vjp": True,
         "swap_partner_policy": "different_type",
@@ -120,6 +121,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "max_far_pairs_per_graph": 64,
             "depth_pairs_per_graph": 8,
             "min_effect_abs": 1.0e-6,
+            "signal_gate": True,
+            "signal_gate_quantile": 0.90,
             "clamp_mode": "detach",
             "run_analytic_patching_check": True,
             "run_clamp_negative_control": True,
@@ -131,6 +134,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "max_far_pairs_per_graph": "all",
             "interaction_pairs": 1000,
             "min_effect_abs": 1.0e-6,
+            "signal_gate": True,
+            "signal_gate_quantile": 0.90,
             "clamp_mode": "detach",
             "reference_models": ["dense_grit", "grit_1hop", "gin"],
         },
@@ -144,6 +149,7 @@ FAST_DEV_OVERRIDES: dict[str, Any] = {
     "seeds": [41],
     "perturbation": {
         "ig_steps": 4,
+        "baseline_sample_graphs": 2,
         "swap_partners": 1,
     },
     "steps": {
@@ -171,6 +177,7 @@ ANALYSIS_PRESET_OVERRIDES: dict[str, dict[str, Any]] = {
         "seeds": [41],
         "perturbation": {
             "ig_steps": 8,
+            "baseline_sample_graphs": 8,
             "swap_partners": 2,
         },
         "steps": {
@@ -199,6 +206,7 @@ ANALYSIS_PRESET_OVERRIDES: dict[str, dict[str, Any]] = {
         "seeds": [41],
         "perturbation": {
             "ig_steps": 16,
+            "baseline_sample_graphs": 16,
             "swap_partners": 2,
         },
         "steps": {
@@ -723,6 +731,9 @@ def progress(message: str) -> None:
 
 def run_main(config: Mapping[str, Any], *, steps: Sequence[str], dry_run: bool = False, force: bool = False) -> Path:
     artifact_root = ensure_dir(Path(str(config["artifact_root"])) / config_hash(config))
+    run_config = copy.deepcopy(dict(config))
+    run_config.setdefault("runtime", {})
+    run_config["runtime"]["force_rerun_steps"] = bool(force)
     cached_statuses = {} if force else load_cached_step_statuses(steps, artifact_root)
     if (
         (artifact_root / "manifest.json").exists()
@@ -739,7 +750,7 @@ def run_main(config: Mapping[str, Any], *, steps: Sequence[str], dry_run: bool =
     write_yaml(artifact_root / "config.yaml", config)
 
     progress("discovering model artifacts")
-    discovery = [discover_model_artifacts(name, cfg) for name, cfg in config["models"].items()]
+    discovery = [discover_model_artifacts(name, cfg) for name, cfg in run_config["models"].items()]
     write_json(artifact_root / "metrics" / "artifact_discovery.json", {"models": discovery})
     for item in discovery:
         progress(
@@ -758,11 +769,11 @@ def run_main(config: Mapping[str, Any], *, steps: Sequence[str], dry_run: bool =
             if not force and step_is_complete(status_by_step.get(step)):
                 progress(f"Step {step} already complete; skipping dry-run rewrite")
                 continue
-            progress(f"dry-run status for Step {step}: {config['steps'][step]['name']}")
+            progress(f"dry-run status for Step {step}: {run_config['steps'][step]['name']}")
             status = {
                 "status": "dry_run_only",
                 "step": step,
-                "name": config["steps"][step]["name"],
+                "name": run_config["steps"][step]["name"],
                 "required_artifacts_discovered": discovery,
             }
             write_step_status(step, artifact_root, status)
@@ -781,7 +792,7 @@ def run_main(config: Mapping[str, Any], *, steps: Sequence[str], dry_run: bool =
                     "instantiating intervention adapters once for steps: "
                     f"{','.join(pending_intervention_steps)}"
                 )
-                intervention_models = instantiate_official_models(config, discovery)
+                intervention_models = instantiate_official_models(run_config, discovery)
                 model_names = ", ".join(model.name for model in intervention_models) if intervention_models else "none found"
                 progress(f"intervention adapters ready: {model_names}")
             except Exception as exc:
@@ -792,14 +803,14 @@ def run_main(config: Mapping[str, Any], *, steps: Sequence[str], dry_run: bool =
                 continue
             if step == "1":
                 progress("starting Step 1: performance_gap")
-                status = run_step_1(discovery, artifact_root, config)
+                status = run_step_1(discovery, artifact_root, run_config)
             elif step in intervention_steps:
                 try:
                     if intervention_model_error is not None:
                         raise intervention_model_error
-                    progress(f"starting intervention Step {step}: {config['steps'][step]['name']}")
+                    progress(f"starting intervention Step {step}: {run_config['steps'][step]['name']}")
                     step_status = run_intervention_steps(
-                        config,
+                        run_config,
                         discovery,
                         artifact_root,
                         [step],
@@ -812,7 +823,7 @@ def run_main(config: Mapping[str, Any], *, steps: Sequence[str], dry_run: bool =
                     status = {
                         "status": "failed",
                         "step": step,
-                        "name": config["steps"][step]["name"],
+                        "name": run_config["steps"][step]["name"],
                         "error": str(exc),
                         "methodology_core_available": True,
                     }
