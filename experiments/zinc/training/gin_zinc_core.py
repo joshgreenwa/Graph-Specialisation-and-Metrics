@@ -11,10 +11,12 @@ configuration:
         --config configs/molecules_graph_regression_GIN_ZINC_500k.json
 
 The default config is the official 500k-parameter ZINC config from the
-Benchmarking-GNNs paper/repository. The script only changes non-scientific
-runtime behavior for Colab: dependency setup, mounted Drive paths, clean epoch
-prints, and extra best/latest checkpoint copies. The official rolling epoch
-checkpoints are still written by the official training script.
+Benchmarking-GNNs paper/repository. The official config is validated before
+launch, then the runtime copy defaults to 2000 epochs to match the GRIT/1-hop
+GRIT ZINC training schedule used in this project. The script otherwise only
+changes Colab/runtime behavior: dependency setup, mounted Drive paths, clean
+epoch prints, and extra best/latest checkpoint copies. The official rolling
+epoch checkpoints are still written by the official training script.
 
 Suggested Colab usage:
 
@@ -55,6 +57,11 @@ OFFICIAL_COMMIT = "b6c407712fa576e9699555e1e035d1e327ccae6c"
 OFFICIAL_CONFIG = "configs/molecules_graph_regression_GIN_ZINC_500k.json"
 OFFICIAL_ZINC_URL = "https://data.dgl.ai/dataset/benchmarking-gnns/ZINC.pkl"
 EXPECTED_OFFICIAL_PARAMS = 509_549
+DEFAULT_RUNTIME_EPOCHS = 2_000
+DEFAULT_RUNTIME_MAX_TIME = 0.0
+DEFAULT_RUNTIME_LR_SCHEDULE = "cosine_warmup"
+DEFAULT_RUNTIME_WARMUP_EPOCHS = 50
+DEFAULT_RUNTIME_COSINE_MIN_LR = 1.0e-6
 
 EXPECTED_CONFIG_VALUES: dict[tuple[str, ...], Any] = {
     ("model",): "GIN",
@@ -426,6 +433,8 @@ _colab_sys.modules["dgl.heterograph"].DGLHeteroGraph = _colab_dgl_heterograph.DG
         text = text.replace(dgl_marker, dgl_patch, 1)
 
     if "COLAB_GIN_ZINC_PATCH_START" in text:
+        text = patch_official_lr_schedule_text(text)
+        text = patch_official_no_early_stop_text(text)
         text = patch_official_checkpoint_cleanup_text(text)
         path.write_text(text, encoding="utf-8")
         print("[patch] Colab compatibility/checkpoint/log patches already present.", flush=True)
@@ -496,15 +505,159 @@ _colab_sys.modules["dgl.heterograph"].DGLHeteroGraph = _colab_dgl_heterograph.DG
                     ), flush=True)
                 # COLAB_GIN_ZINC_PATCH_END
 
-                scheduler.step(epoch_val_loss)
+                # COLAB_GIN_ZINC_LR_STEP_START: validation-triggered LR changes are
+                # used only for the untouched official plateau schedule. The default
+                # project runtime uses a GRIT-matched epoch schedule.
+                if lr_schedule_type == 'plateau':
+                    scheduler.step(epoch_val_loss)
+                # COLAB_GIN_ZINC_LR_STEP_END
 """
     if marker not in text:
         raise RuntimeError("could not patch official training script: scheduler marker not found")
     text = text.replace(marker, inject, 1)
+    text = patch_official_lr_schedule_text(text)
+    text = patch_official_no_early_stop_text(text)
     text = patch_official_checkpoint_cleanup_text(text)
     path.write_text(text, encoding="utf-8")
     print("[patch] Added Drive-friendly best/latest checkpoint and CSV logging patch.", flush=True)
     patch_official_molecule_loader(repo_dir)
+
+
+def patch_official_lr_schedule_text(text: str) -> str:
+    if "COLAB_GIN_ZINC_LR_SCHEDULE_START" not in text:
+        old = """\
+    optimizer = optim.Adam(model.parameters(), lr=params['init_lr'], weight_decay=params['weight_decay'])
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min',
+                                                     factor=params['lr_reduce_factor'],
+                                                     patience=params['lr_schedule_patience'],
+                                                     verbose=True)
+"""
+        new = """\
+    optimizer = optim.Adam(model.parameters(), lr=params['init_lr'], weight_decay=params['weight_decay'])
+    # COLAB_GIN_ZINC_LR_SCHEDULE_START: keep the official optimizer and default
+    # LR=1e-3, but use the same kind of epoch schedule as GRIT ZINC by default:
+    # 50 warmup epochs followed by cosine decay to 1e-6. Set
+    # params['lr_schedule']='plateau' to recover the untouched official scheduler,
+    # or 'fixed' for a constant LR.
+    lr_schedule_type = str(params.get('lr_schedule', 'cosine_warmup'))
+    base_lr = float(params['init_lr'])
+    warmup_epochs = int(params.get('warmup_epochs', 50))
+    cosine_min_lr = float(params.get('cosine_min_lr', 1e-6))
+
+    def _colab_epoch_lr(epoch):
+        if lr_schedule_type == 'fixed':
+            return base_lr
+        if lr_schedule_type == 'cosine_warmup':
+            if warmup_epochs > 0 and epoch < warmup_epochs:
+                return base_lr * float(epoch + 1) / float(warmup_epochs)
+            cosine_epochs = max(1, int(params['epochs']) - warmup_epochs)
+            progress = min(1.0, max(0.0, float(epoch - warmup_epochs) / float(cosine_epochs)))
+            return cosine_min_lr + 0.5 * (base_lr - cosine_min_lr) * (1.0 + np.cos(np.pi * progress))
+        return base_lr
+
+    def _colab_set_epoch_lr(epoch):
+        if lr_schedule_type in ['fixed', 'cosine_warmup']:
+            lr = float(_colab_epoch_lr(epoch))
+            for group in optimizer.param_groups:
+                group['lr'] = lr
+
+    scheduler = None
+    if lr_schedule_type == 'plateau':
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min',
+                                                         factor=params['lr_reduce_factor'],
+                                                         patience=params['lr_schedule_patience'],
+                                                         verbose=True)
+    elif lr_schedule_type not in ['fixed', 'cosine_warmup']:
+        raise ValueError("unknown lr_schedule: {}".format(lr_schedule_type))
+    print("[lr] schedule={} base_lr={} warmup_epochs={} cosine_min_lr={}".format(
+        lr_schedule_type, base_lr, warmup_epochs, cosine_min_lr
+    ))
+    # COLAB_GIN_ZINC_LR_SCHEDULE_END
+"""
+        if old not in text:
+            raise RuntimeError("could not patch official optimizer/scheduler block")
+        text = text.replace(old, new, 1)
+
+    if "COLAB_GIN_ZINC_LR_EPOCH_START" not in text:
+        old = """\
+                t.set_description('Epoch %d' % epoch)
+
+                start = time.time()
+"""
+        new = """\
+                t.set_description('Epoch %d' % epoch)
+
+                # COLAB_GIN_ZINC_LR_EPOCH_START
+                _colab_set_epoch_lr(epoch)
+                # COLAB_GIN_ZINC_LR_EPOCH_END
+
+                start = time.time()
+"""
+        if old not in text:
+            raise RuntimeError("could not patch official epoch LR hook")
+        text = text.replace(old, new, 1)
+
+    if "COLAB_GIN_ZINC_LR_STEP_START" not in text:
+        old = "                scheduler.step(epoch_val_loss)\n"
+        new = """\
+                # COLAB_GIN_ZINC_LR_STEP_START: validation-triggered LR changes are
+                # used only for the untouched official plateau schedule. The default
+                # project runtime uses a GRIT-matched epoch schedule.
+                if lr_schedule_type == 'plateau':
+                    scheduler.step(epoch_val_loss)
+                # COLAB_GIN_ZINC_LR_STEP_END
+"""
+        if old in text:
+            text = text.replace(old, new, 1)
+
+    return text
+
+
+def patch_official_no_early_stop_text(text: str) -> str:
+    if "COLAB_GIN_ZINC_NO_TIME_STOP_START" not in text:
+        old = """\
+                # Stop training after params['max_time'] hours
+                if time.time()-t0 > params['max_time']*3600:
+                    print('-' * 89)
+                    print("Max_time for training elapsed {:.2f} hours, so stopping".format(params['max_time']))
+                    break
+"""
+        new = """\
+                # COLAB_GIN_ZINC_NO_TIME_STOP_START: max_time <= 0 disables this
+                # official wall-time stop so the run continues to the requested
+                # epoch count unless interrupted.
+                max_time_hours = float(params.get('max_time', 0) or 0)
+                if max_time_hours > 0 and time.time()-t0 > max_time_hours*3600:
+                    print('-' * 89)
+                    print("Max_time for training elapsed {:.2f} hours, so stopping".format(max_time_hours))
+                    break
+                # COLAB_GIN_ZINC_NO_TIME_STOP_END
+"""
+        if old not in text:
+            raise RuntimeError("could not patch official max_time stop block")
+        text = text.replace(old, new, 1)
+
+    if "COLAB_GIN_ZINC_NO_MIN_LR_STOP_START" not in text:
+        old = """\
+                if optimizer.param_groups[0]['lr'] < params['min_lr']:
+                    print("\\n!! LR EQUAL TO MIN LR SET.")
+                    break
+"""
+        new = """\
+                # COLAB_GIN_ZINC_NO_MIN_LR_STOP_START: min_lr <= 0 disables this
+                # official LR-based stop so training continues to the requested
+                # epoch count.
+                min_lr_stop = float(params.get('min_lr', 0) or 0)
+                if min_lr_stop > 0 and optimizer.param_groups[0]['lr'] < min_lr_stop:
+                    print("\\n!! LR EQUAL TO MIN LR SET.")
+                    break
+                # COLAB_GIN_ZINC_NO_MIN_LR_STOP_END
+"""
+        if old not in text:
+            raise RuntimeError("could not patch official min_lr stop block")
+        text = text.replace(old, new, 1)
+
+    return text
 
 
 def patch_official_checkpoint_cleanup_text(text: str) -> str:
@@ -619,6 +772,9 @@ def write_runtime_config(
     max_time: float | None,
     gpu_id: int,
     print_epoch_interval: int | None,
+    lr_schedule: str,
+    warmup_epochs: int,
+    cosine_min_lr: float,
 ) -> Path:
     cfg = load_json(official_cfg_path)
     cfg["gpu"]["use"] = True
@@ -628,8 +784,11 @@ def write_runtime_config(
         cfg["params"]["seed"] = int(seed)
     if epochs is not None:
         cfg["params"]["epochs"] = int(epochs)
-    if max_time is not None:
-        cfg["params"]["max_time"] = float(max_time)
+    cfg["params"]["max_time"] = float(DEFAULT_RUNTIME_MAX_TIME if max_time is None else max_time)
+    cfg["params"]["min_lr"] = 0.0
+    cfg["params"]["lr_schedule"] = str(lr_schedule)
+    cfg["params"]["warmup_epochs"] = int(warmup_epochs)
+    cfg["params"]["cosine_min_lr"] = float(cosine_min_lr)
     if print_epoch_interval is not None:
         cfg["params"]["print_epoch_interval"] = int(print_epoch_interval)
     config_dir = run_dir / "configs"
@@ -746,8 +905,26 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--run-id", default="gin_zinc_500k_seed41")
     parser.add_argument("--gpu-id", type=int, default=0)
     parser.add_argument("--seed", type=int, default=41)
-    parser.add_argument("--epochs", type=int, default=None, help="Override official 1000 epochs only for debugging.")
-    parser.add_argument("--max-time", type=float, default=None, help="Override official 12 hour max_time.")
+    parser.add_argument(
+        "--epochs",
+        type=int,
+        default=DEFAULT_RUNTIME_EPOCHS,
+        help="Runtime training epochs. Defaults to 2000 for GRIT schedule fairness; pass 1000 for the untouched official GIN config schedule.",
+    )
+    parser.add_argument(
+        "--max-time",
+        type=float,
+        default=None,
+        help="Optional wall-time stop in hours. Defaults to disabled so training continues to --epochs.",
+    )
+    parser.add_argument(
+        "--lr-schedule",
+        choices=["cosine_warmup", "fixed", "plateau"],
+        default=DEFAULT_RUNTIME_LR_SCHEDULE,
+        help="Default cosine_warmup matches GRIT ZINC's warmup+cosine schedule style. Use fixed for constant LR or plateau for official GIN ReduceLROnPlateau.",
+    )
+    parser.add_argument("--warmup-epochs", type=int, default=DEFAULT_RUNTIME_WARMUP_EPOCHS)
+    parser.add_argument("--cosine-min-lr", type=float, default=DEFAULT_RUNTIME_COSINE_MIN_LR)
     parser.add_argument("--print-epoch-interval", type=int, default=5)
     parser.add_argument("--install-mode", choices=["compatible", "current", "none"], default="compatible")
     parser.add_argument("--skip-install", action="store_true", help="Alias for --install-mode none.")
@@ -799,6 +976,9 @@ def main(argv: Sequence[str] | None = None) -> None:
         max_time=args.max_time,
         gpu_id=args.gpu_id,
         print_epoch_interval=args.print_epoch_interval,
+        lr_schedule=args.lr_schedule,
+        warmup_epochs=args.warmup_epochs,
+        cosine_min_lr=args.cosine_min_lr,
     )
 
     manifest = {
@@ -812,6 +992,10 @@ def main(argv: Sequence[str] | None = None) -> None:
         "run_dir": str(run_dir),
         "official_out_dir": str(official_out_dir),
         "seed": args.seed,
+        "epochs": args.epochs,
+        "lr_schedule": args.lr_schedule,
+        "warmup_epochs": args.warmup_epochs,
+        "cosine_min_lr": args.cosine_min_lr,
         "expected_parameter_count": EXPECTED_OFFICIAL_PARAMS,
     }
     (run_dir / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
