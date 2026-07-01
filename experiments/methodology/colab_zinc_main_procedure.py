@@ -698,7 +698,7 @@ def best_epoch_from_training_logs(source_drive_dir: Path, label: str) -> int | N
     return int(best_epoch) if best_epoch is not None else None
 
 
-def checkpoint_from_audit(source_drive_dir: Path) -> Path | None:
+def checkpoint_from_audit(source_drive_dir: Path, *, allow_latest: bool = False) -> Path | None:
     for audit_path in [source_drive_dir / "latest_checkpoint_audit.json"]:
         if not audit_path.exists():
             continue
@@ -713,12 +713,29 @@ def checkpoint_from_audit(source_drive_dir: Path) -> Path | None:
                 path = Path(raw_path)
                 if path.exists():
                     return path
-        raw_latest = audit.get("latest_checkpoint_by_mtime")
+        raw_latest = audit.get("latest_checkpoint_by_mtime") if allow_latest else None
         if raw_latest:
             latest = Path(raw_latest)
             if latest.exists():
                 return latest
     return None
+
+
+def best_named_checkpoint_candidates(candidates: Sequence[Path]) -> list[Path]:
+    def score(path: Path) -> tuple[int, float, str]:
+        lowered = str(path).lower()
+        name = path.name.lower()
+        if name in {"best.ckpt", "best.pt", "best.pth"}:
+            priority = 0
+        elif "best" in name:
+            priority = 1
+        elif "best" in lowered and "latest" not in name:
+            priority = 2
+        else:
+            priority = 99
+        return (priority, -path.stat().st_mtime, str(path))
+
+    return [path for path in sorted(candidates, key=score) if score(path)[0] < 99]
 
 
 def choose_checkpoint(results_root: Path, label: str) -> Path:
@@ -730,7 +747,7 @@ def choose_checkpoint(results_root: Path, label: str) -> Path:
         )
 
     source_drive_dir = results_root.parent
-    audited = checkpoint_from_audit(source_drive_dir)
+    audited = checkpoint_from_audit(source_drive_dir, allow_latest=False)
     if audited is not None and audited in candidates:
         print(f"[checkpoint] {label}: {audited} (from latest_checkpoint_audit.json)", flush=True)
         return audited
@@ -747,6 +764,17 @@ def choose_checkpoint(results_root: Path, label: str) -> Path:
             "but no checkpoint filename matched that epoch; falling back to newest checkpoint by mtime.",
             flush=True,
         )
+
+    best_named = best_named_checkpoint_candidates(candidates)
+    if best_named:
+        chosen = best_named[0]
+        print(f"[checkpoint] {label}: {chosen} (best-named checkpoint preferred over latest)", flush=True)
+        return chosen
+
+    audited_latest = checkpoint_from_audit(source_drive_dir, allow_latest=True)
+    if audited_latest is not None and audited_latest in candidates:
+        print(f"[checkpoint] {label}: {audited_latest} (latest checkpoint from audit fallback)", flush=True)
+        return audited_latest
 
     chosen = candidates[0]
     print(f"[checkpoint] {label}: {chosen} (newest by mtime; epoch={checkpoint_epoch(chosen)})", flush=True)

@@ -20,6 +20,7 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import networkx as nx
 import numpy as np
 import torch
 
@@ -1385,7 +1386,7 @@ def render_step2_profiles(rows: Sequence[Mapping[str, Any]], artifact_root: Path
         direct_rows,
         artifact_root,
         "step2_direct_attention_distance",
-        "Step 2: direct attention support by molecular distance",
+        "Step 2: last-layer attention and carriage by molecular distance",
         dpi=dpi,
     )
 
@@ -1429,7 +1430,7 @@ def render_step2_profiles(rows: Sequence[Mapping[str, Any]], artifact_root: Path
         hi = np.asarray([safe_float(r.get("hi")) for r in items], dtype=float)
         if np.isfinite(lo).any() and np.isfinite(hi).any():
             ax.fill_between(x, lo, hi, alpha=0.10)
-    ax.set_title("Step 2: direct attention vs carriage by molecular distance")
+    ax.set_title("Step 2: last-layer attention vs carriage by molecular distance")
     ax.set_xlabel("Molecular hop distance")
     ax.set_ylabel("Share of own mass by distance (each series sums to 1)")
     ax.legend(frameon=False, fontsize=7)
@@ -1466,7 +1467,7 @@ def render_attention_mean_distance(rows: Sequence[Mapping[str, Any]], artifact_r
         ax.plot(x, y, marker="o", linewidth=1.5, label=model)
         ax.fill_between(x, lo, hi, alpha=0.12)
     ax.axhline(1.0, color="#555555", linestyle="--", linewidth=1, label="1-hop")
-    ax.set_title("Step 2: mean direct attention distance by layer")
+    ax.set_title("Step 2: mean attention distance by layer")
     ax.set_xlabel("GRIT attention layer")
     ax.set_ylabel("Mean attention distance (molecular hops)")
     ax.legend(frameon=False, fontsize=8)
@@ -1509,11 +1510,11 @@ def render_attention_support_audit(rows: Sequence[Mapping[str, Any]], artifact_r
         axes[0].plot(x, max_distance, marker="o", linewidth=1.5, label=model)
         axes[1].plot(x, far_mass, marker="o", linewidth=1.5, label=model)
     axes[0].axhline(1.0, color="#555555", linestyle="--", linewidth=1, label="1-hop limit")
-    axes[0].set_title("Direct attention support")
+    axes[0].set_title("Per-layer attention support")
     axes[0].set_xlabel("GRIT attention layer")
     axes[0].set_ylabel("Max molecular hop distance")
     axes[1].axhline(0.0, color="#555555", linestyle="--", linewidth=1, label="1-hop expected")
-    axes[1].set_title("Non-local direct attention mass")
+    axes[1].set_title("Non-local per-layer attention mass")
     axes[1].set_xlabel("GRIT attention layer")
     axes[1].set_ylabel("Mass at distance > 1")
     for ax in axes:
@@ -1662,6 +1663,7 @@ def run_step2(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
     return {
         "status": "complete" if not support_failures else "complete_with_attention_support_violations",
         "models": [m.name for m in models],
+        "attention_policy": "rollout_omitted_by_design; reads=last_layer_head_averaged_attention plus per_layer_attention_diagnostics; carries=carriage",
         "profile_rows": len(profile_rows),
         "faithfulness_rows": len(faith_rows),
         "support_audit_rows": len(support_rows),
@@ -1955,9 +1957,9 @@ def render_step2_faithfulness(rows: Sequence[Mapping[str, Any]], artifact_root: 
         ax.set_yticks(y)
         ax.set_yticklabels(labels, fontsize=7)
         ax.set_title(title)
-        ax.set_xlabel("Spearman(direct attention, |C|), per-molecule mean")
+        ax.set_xlabel("Spearman(last-layer attention, |C|), per-molecule mean")
     figures = ensure_dir(artifact_root / "figures")
-    fig.suptitle("Step 2: direct attention faithfulness to carriage")
+    fig.suptitle("Step 2: last-layer attention faithfulness to carriage")
     fig.savefig(figures / "step2_attention_faithfulness.png", dpi=dpi)
     fig.savefig(figures / "step2_attention_faithfulness.pdf")
     plt.close(fig)
@@ -1967,8 +1969,8 @@ def render_step2_faithfulness(rows: Sequence[Mapping[str, Any]], artifact_root: 
         marker = "o" if str(r.get("carriage_estimator")) == "ig" else "s"
         ax.scatter([r["attention_far_mass"]], [r["carriage_far_mass"]], s=55, marker=marker, label=r["label"])
     ax.plot([0, 1], [0, 1], "--", color="#555555")
-    ax.set_title("Step 2: far-mass, attention vs carriage")
-    ax.set_xlabel(f"Attention far-mass ({far_text})")
+    ax.set_title("Step 2: far-mass, last-layer attention vs carriage")
+    ax.set_xlabel(f"Last-layer attention far-mass ({far_text})")
     ax.set_ylabel(f"Carriage far-mass ({far_text})")
     ax.legend(frameon=False, fontsize=6, loc="best")
     fig.savefig(figures / "step2_far_mass_attention_vs_carriage.png", dpi=dpi)
@@ -2089,6 +2091,31 @@ def render_step3(rows: Sequence[Mapping[str, Any]], gap_rows: Sequence[Mapping[s
 
 def mediator_cut(graph: Any, target: int, source: int) -> list[int]:
     return minimum_vertex_cut(pyg_graph_view(graph), int(target), int(source))
+
+
+def cut_disconnects_pair(graph: Any, target: int, source: int, cut: Sequence[int]) -> bool:
+    """Return whether removing ``cut`` disconnects source from target on bonds."""
+
+    target = int(target)
+    source = int(source)
+    cut_nodes = [int(v) for v in cut if int(v) not in {target, source}]
+    if target == source or not cut_nodes:
+        return False
+    g = graph_to_networkx(pyg_graph_view(graph), undirected=True)
+    g.remove_nodes_from(cut_nodes)
+    if target not in g or source not in g:
+        return True
+    return not nx.has_path(g, source, target)
+
+
+def mediator_cut_class(cut: Sequence[int], disconnects_pair: bool) -> str:
+    if not cut:
+        return "empty_cut"
+    if not disconnects_pair:
+        return "cut_failed"
+    if len(cut) == 1:
+        return "single_node_cut"
+    return "multi_node_cut"
 
 
 def random_off_path_node(
@@ -2234,6 +2261,8 @@ def run_step4(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
                 cut = mediator_cut(graph, carrier, source)
                 if not cut:
                     continue
+                disconnects_pair = cut_disconnects_pair(graph, carrier, source, cut)
+                cut_class = mediator_cut_class(cut, disconnects_pair)
                 direct = patched_ig_pair(
                     model.adapter,
                     graph,
@@ -2260,6 +2289,8 @@ def run_step4(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
                         "source": source,
                         "distance": float(dist[carrier, source].item()),
                         "cut_size": len(cut),
+                        "cut_disconnects_pair": disconnects_pair,
+                        "cut_class": cut_class,
                         "clamp_nodes": ",".join(str(v) for v in cut),
                         "clamp_mode": clamp_mode,
                         "unclamped": unclamped,
@@ -2308,6 +2339,11 @@ def run_step4(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
                                 "source": source,
                                 "distance": float(dist[carrier, source].item()),
                                 "cut_size": 1,
+                                "original_cut_size": len(cut),
+                                "original_cut_disconnects_pair": disconnects_pair,
+                                "original_cut_class": cut_class,
+                                "cut_disconnects_pair": False,
+                                "cut_class": "random_off_path_control",
                                 "clamp_nodes": str(off_path),
                                 "clamp_mode": clamp_mode,
                                 "unclamped": unclamped,
@@ -2349,6 +2385,9 @@ def run_step4(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
                                 "carrier": carrier,
                                 "source": source,
                                 "distance": float(dist[carrier, source].item()),
+                                "cut_size": len(cut),
+                                "cut_disconnects_pair": disconnects_pair,
+                                "cut_class": cut_class,
                                 "clamp_until_layer": layer,
                                 "clamp_mode": clamp_mode,
                                 "direct": depth_direct,
@@ -2366,8 +2405,13 @@ def run_step4(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
     write_csv(artifact_root / "metrics" / "step4_mediator_validation_summary.csv", validation_summary)
     clamp_control_summary = clamp_negative_control_summary(rows)
     write_csv(artifact_root / "metrics" / "step4_clamp_negative_control_summary.csv", clamp_control_summary)
+    cut_class_summary = mediator_cut_class_summary(rows)
+    write_csv(artifact_root / "metrics" / "step4_mediator_cut_class_summary.csv", cut_class_summary)
+    single_cut_summary = mediator_single_cut_diagnostic(rows, models)
+    write_csv(artifact_root / "metrics" / "step4_single_cut_composed_reference_diagnostic.csv", single_cut_summary)
     atomic_torch_save(artifact_root / "tensors" / "step4_mediator_patching.pt", tensors)
     render_step4(rows, depth_rows, validation_summary, artifact_root, dpi=dpi)
+    render_step4_cut_class_summary(cut_class_summary, artifact_root, dpi=dpi)
     composed_reference_failures = [
         dict(row)
         for row in validation_summary
@@ -2375,9 +2419,24 @@ def run_step4(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
         and math.isfinite(safe_float(row.get("mean_direct_fraction")))
         and safe_float(row.get("mean_direct_fraction")) > composed_reference_max_direct_fraction
     ]
+    single_cut_composed_reference_failures = [
+        dict(row)
+        for row in single_cut_summary
+        if str(row.get("validation_role")) == "composed_reference"
+        and math.isfinite(safe_float(row.get("mean_direct_fraction")))
+        and safe_float(row.get("mean_direct_fraction")) > composed_reference_max_direct_fraction
+    ]
+    cut_disconnect_failures = [
+        dict(row)
+        for row in rows
+        if str(row.get("clamp_type", "cut")) == "cut"
+        and not bool(row.get("cut_disconnects_pair"))
+    ]
     status = "complete"
     if analytic_patching_check.get("status") == "failed":
         status = "complete_with_failed_analytic_patching_check"
+    elif single_cut_composed_reference_failures:
+        status = "complete_with_failed_single_cut_composed_reference_check"
     elif composed_reference_failures:
         status = "complete_with_failed_composed_reference_check"
     progress(f"Step 4 complete: status={status}, metrics, tensors, and figures written")
@@ -2388,6 +2447,10 @@ def run_step4(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
         "clamp_negative_control_rows": len([r for r in rows if str(r.get("clamp_type")) == "random_off_path"]),
         "analytic_patching_check": analytic_patching_check,
         "composed_reference_failures": composed_reference_failures,
+        "single_cut_composed_reference_failures": single_cut_composed_reference_failures,
+        "cut_disconnect_failure_rows": len(cut_disconnect_failures),
+        "cut_class_summary_rows": len(cut_class_summary),
+        "single_cut_diagnostic_rows": len(single_cut_summary),
         "composed_reference_max_direct_fraction": composed_reference_max_direct_fraction,
         "clamp_mode": clamp_mode,
     }
@@ -2455,6 +2518,130 @@ def clamp_negative_control_summary(rows: Sequence[Mapping[str, Any]]) -> list[di
                 }
             )
     return out
+
+
+def mediator_cut_class_summary(rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    cut_rows = [
+        r
+        for r in rows
+        if str(r.get("clamp_type", "cut")) == "cut"
+        and row_is_nontrivial(r)
+    ]
+    for model in sorted({str(r.get("model")) for r in cut_rows}):
+        for cut_class in ["single_node_cut", "multi_node_cut", "cut_failed", "empty_cut"]:
+            model_rows = [
+                r
+                for r in cut_rows
+                if str(r.get("model")) == model and str(r.get("cut_class", "")) == cut_class
+            ]
+            stats = weighted_direct_fraction(model_rows, seed=4100 + len(out), draws=500)
+            if int(stats.get("pairs", 0)) <= 0:
+                continue
+            out.append(
+                {
+                    "model": model,
+                    "cut_class": cut_class,
+                    "mean_direct_fraction": stats["mean"],
+                    "ci_low": stats["ci_low"],
+                    "ci_high": stats["ci_high"],
+                    "pairs": stats["pairs"],
+                    "mean_cut_size": float(np.nanmean([safe_float(r.get("cut_size")) for r in model_rows])),
+                    "cut_disconnect_failures": sum(not bool(r.get("cut_disconnects_pair")) for r in model_rows),
+                    "aggregation": "carriage_weighted",
+                }
+            )
+    return out
+
+
+def mediator_single_cut_diagnostic(rows: Sequence[Mapping[str, Any]], models: Sequence[ModelRun]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for model in sorted({str(r.get("model")) for r in rows}):
+        model_rows = [
+            r
+            for r in rows
+            if str(r.get("model")) == model
+            and str(r.get("clamp_type", "cut")) == "cut"
+            and str(r.get("cut_class")) == "single_node_cut"
+            and bool(r.get("cut_disconnects_pair"))
+            and row_is_nontrivial(r)
+        ]
+        stats = weighted_direct_fraction(model_rows, seed=4300 + len(out), draws=500)
+        role = "composed_reference" if is_composed_reference_model(model, models) else "treatment_context"
+        out.append(
+            {
+                "model": model,
+                "validation_role": role,
+                "diagnostic": "single_node_cut_pairs",
+                "status": "no_pairs" if int(stats.get("pairs", 0)) <= 0 else "complete",
+                "mean_direct_fraction": stats["mean"],
+                "ci_low": stats["ci_low"],
+                "ci_high": stats["ci_high"],
+                "pairs": stats["pairs"],
+                "aggregation": "carriage_weighted",
+                "interpretation": (
+                    "If a bond-local composed reference remains near 1 on this subset, "
+                    "the clamp is not severing path-composed carriage even when the cut is valid."
+                ),
+            }
+        )
+    return out
+
+
+def render_step4_cut_class_summary(summary: Sequence[Mapping[str, Any]], artifact_root: Path, *, dpi: int) -> None:
+    clean = [
+        r
+        for r in summary
+        if math.isfinite(safe_float(r.get("mean_direct_fraction")))
+        and safe_float(r.get("pairs")) > 0
+    ]
+    if not clean:
+        return
+    models = sorted({str(r.get("model")) for r in clean})
+    classes = [c for c in ["single_node_cut", "multi_node_cut", "cut_failed"] if any(str(r.get("cut_class")) == c for r in clean)]
+    if not models or not classes:
+        return
+    x = np.arange(len(models), dtype=float)
+    width = min(0.8 / max(1, len(classes)), 0.28)
+    fig, ax = plt.subplots(figsize=(8.4, 4.8), constrained_layout=True)
+    labels = {
+        "single_node_cut": "Single-node cut",
+        "multi_node_cut": "Multi-node cut",
+        "cut_failed": "Cut did not separate",
+    }
+    for idx, cut_class in enumerate(classes):
+        values = []
+        err_low = []
+        err_high = []
+        for model in models:
+            row = next((r for r in clean if str(r.get("model")) == model and str(r.get("cut_class")) == cut_class), None)
+            mean = safe_float(row.get("mean_direct_fraction")) if row else float("nan")
+            lo = safe_float(row.get("ci_low")) if row else float("nan")
+            hi = safe_float(row.get("ci_high")) if row else float("nan")
+            values.append(mean)
+            err_low.append(max(0.0, mean - lo) if math.isfinite(mean) and math.isfinite(lo) else 0.0)
+            err_high.append(max(0.0, hi - mean) if math.isfinite(mean) and math.isfinite(hi) else 0.0)
+        offset = (idx - (len(classes) - 1) / 2.0) * width
+        ax.bar(
+            x + offset,
+            [0.0 if not math.isfinite(v) else v for v in values],
+            width=width,
+            yerr=np.vstack([err_low, err_high]),
+            capsize=3,
+            label=labels.get(cut_class, cut_class),
+        )
+    ax.axhline(0.0, color="#555555", linewidth=1)
+    ax.axhline(1.0, color="#888888", linestyle="--", linewidth=1, label="No path blocked")
+    ax.set_title("Step 4: direct fraction by verified cut class")
+    ax.set_xlabel("Model")
+    ax.set_ylabel("Carriage-weighted direct fraction")
+    ax.set_xticks(x)
+    ax.set_xticklabels(models, rotation=15, ha="right")
+    ax.legend(frameon=False, fontsize=8)
+    figures = ensure_dir(artifact_root / "figures")
+    fig.savefig(figures / "step4_direct_fraction_by_cut_class.png", dpi=dpi)
+    fig.savefig(figures / "step4_direct_fraction_by_cut_class.pdf")
+    plt.close(fig)
 
 
 def render_step4_clamp_negative_control(rows: Sequence[Mapping[str, Any]], artifact_root: Path, *, dpi: int) -> None:
