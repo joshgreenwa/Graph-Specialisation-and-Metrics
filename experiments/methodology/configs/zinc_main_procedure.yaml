@@ -76,6 +76,10 @@ steps:
     sample_graphs: 100
     max_far_pairs_per_graph: 64
     depth_pairs_per_graph: 8
+    all_distance: true
+    min_distance: 2
+    stratify_by_distance: true
+    onset_fraction_threshold: 0.50
     min_effect_abs: 1.0e-6
     clamp_mode: detach
     run_analytic_patching_check: true

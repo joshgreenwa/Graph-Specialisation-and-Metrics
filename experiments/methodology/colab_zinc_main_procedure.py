@@ -1144,6 +1144,12 @@ def build_zinc_config(
             "artifact_root": str(artifact_root / "missing_gcn_reference"),
         }
 
+    step5_reference_models = ["dense_grit", "grit_1hop"]
+    if "gin" in models:
+        step5_reference_models.append("gin")
+    if "gcn" in models:
+        step5_reference_models.append("gcn")
+
     return {
         "artifact_root": str(artifact_root / "artifacts"),
         "dataset": {"name": "ZINC", "split": "official_subset", "task": "molecular_regression"},
@@ -1184,6 +1190,10 @@ def build_zinc_config(
                 "sample_graphs": 100,
                 "max_far_pairs_per_graph": 64,
                 "depth_pairs_per_graph": 8,
+                "all_distance": True,
+                "min_distance": 2,
+                "stratify_by_distance": True,
+                "onset_fraction_threshold": 0.50,
                 "min_effect_abs": 1.0e-6,
                 "signal_gate": True,
                 "signal_gate_quantile": 0.90,
@@ -1201,7 +1211,7 @@ def build_zinc_config(
                 "signal_gate": True,
                 "signal_gate_quantile": 0.90,
                 "clamp_mode": "detach",
-                "reference_models": ["dense_grit", "grit_1hop", "gin"],
+                "reference_models": step5_reference_models,
             },
         },
         "figures": {"dpi": 180},
@@ -1409,7 +1419,18 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--allow-incomplete", action="store_true", help="Do not raise if checkpoints/dependencies are missing or a preflight is requested.")
     parser.add_argument("--include-local-references", action="store_true", help="Include placeholder GCN/GIN entries required by the markdown gate.")
     parser.add_argument("--skip-gin-reference", action="store_true", help="Do not include the default official Benchmarking-GNNs GIN ZINC reference even if present on Drive.")
-    parser.add_argument("--allow-missing-gin-reference", action="store_true", help="Allow the run to continue if the default trained GIN reference cannot be discovered.")
+    parser.add_argument(
+        "--allow-missing-gin-reference",
+        action="store_true",
+        default=True,
+        help="Allow the run to continue if the default trained GIN reference cannot be discovered. Default: true.",
+    )
+    parser.add_argument(
+        "--require-gin-reference",
+        dest="allow_missing_gin_reference",
+        action="store_false",
+        help="Fail if the trained official Benchmarking-GNNs GIN reference is missing.",
+    )
     parser.add_argument("--skip-onehop-locality-check", action="store_true", help="Skip the hard preflight that certifies the 1-hop control is local.")
     parser.add_argument("--onehop-locality-check-graphs", type=int, default=4, help="Number of ZINC test graphs used for the 1-hop locality preflight.")
     parser.add_argument("--onehop-locality-tolerance", type=float, default=1.0e-12, help="Allowed direct attention mass at molecular distance > 1.")
@@ -1506,15 +1527,15 @@ def main(argv: Sequence[str] | None = None) -> None:
             print("[prepared-warning] saved GIN pointer missing checkpoint/config/repo; rediscovering GIN artifacts", flush=True)
     if not args.skip_gin_reference and gin_pointer is None:
         gin_artifact = discover_gin_artifact(args.gin_drive_dir)
-        print(
-            "[gin-discovery] "
-            f"checkpoint={gin_artifact.get('checkpoint')} "
-            f"config={gin_artifact.get('config')} "
-            f"history={gin_artifact.get('history')} "
-            f"best_json={gin_artifact.get('best_json')}",
-            flush=True,
-        )
         if gin_artifact.get("checkpoint") is not None and gin_artifact.get("config") is not None:
+            print(
+                "[gin-discovery] "
+                f"checkpoint={gin_artifact.get('checkpoint')} "
+                f"config={gin_artifact.get('config')} "
+                f"history={gin_artifact.get('history')} "
+                f"best_json={gin_artifact.get('best_json')}",
+                flush=True,
+            )
             gin_repo = clone_official_gin(args.gin_repo_dir, force=bool(args.force_official_gin_reclone))
             gin_pointer = prepare_gin_model_artifact(
                 source_drive_dir=args.gin_drive_dir,
@@ -1537,17 +1558,14 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "config_candidates": gin_artifact.get("config_candidates", []),
             }
             write_json(args.drive_root / "preflight" / "gin_reference_discovery_failed.json", details)
-            message = (
-                f"No complete official GIN artifact found under {args.gin_drive_dir}. "
-                f"checkpoint={details['checkpoint']} config={details['config']}. "
-                f"Wrote discovery details to {args.drive_root / 'preflight' / 'gin_reference_discovery_failed.json'}."
-            )
+            message = f"No complete official GIN artifact found under {args.gin_drive_dir}."
             if not args.allow_missing_gin_reference and not args.include_local_references:
                 raise RuntimeError(
                     message
+                    + f" Wrote discovery details to {args.drive_root / 'preflight' / 'gin_reference_discovery_failed.json'}."
                     + " Pass --allow-missing-gin-reference to continue without GIN, or --skip-gin-reference to intentionally omit it."
                 )
-            print(f"[prepared-warning] {message} Continuing because missing GIN is explicitly allowed.", flush=True)
+            print("[gin] optional reference unavailable; continuing with dense_grit and grit_1hop only.", flush=True)
 
     cfg = build_zinc_config(
         artifact_root=args.drive_root,
@@ -1575,7 +1593,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     if "gin" not in model_names and not args.skip_gin_reference and not args.allow_missing_gin_reference:
         raise RuntimeError(
             "GIN was not included in the generated methodology config. "
-            "This should only happen with --skip-gin-reference or --allow-missing-gin-reference."
+            "This should only happen with --skip-gin-reference or default optional-GIN handling."
         )
     write_json(
         args.drive_root / "prepared_model_artifacts" / "latest_pointers.json",

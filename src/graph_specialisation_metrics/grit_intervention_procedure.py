@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import math
 import random
+import re
 import time
 import hashlib
 from dataclasses import dataclass
@@ -137,6 +138,47 @@ def far_pairs(dist: torch.Tensor, tau: int, *, max_pairs: Optional[int] = None, 
     mask = mask & ~diag
     pairs = [(int(i), int(j)) for i, j in mask.nonzero(as_tuple=False).tolist()]
     rng = random.Random(int(seed))
+    rng.shuffle(pairs)
+    return pairs[: int(max_pairs)] if max_pairs is not None else pairs
+
+
+def distance_pairs(
+    dist: torch.Tensor,
+    *,
+    min_distance: int = 2,
+    max_distance: Optional[int] = None,
+    max_pairs: Optional[int] = None,
+    seed: int = 0,
+    stratify_by_distance: bool = True,
+) -> list[tuple[int, int]]:
+    dist_cpu = dist.detach().cpu().float()
+    if dist_cpu.dim() != 2:
+        return []
+    mask = torch.isfinite(dist_cpu) & (dist_cpu >= float(min_distance))
+    if max_distance is not None:
+        mask = mask & (dist_cpu <= float(max_distance))
+    diag = torch.eye(dist_cpu.size(0), dist_cpu.size(1), dtype=torch.bool)
+    mask = mask & ~diag
+    pairs = [(int(i), int(j)) for i, j in mask.nonzero(as_tuple=False).tolist()]
+    rng = random.Random(int(seed))
+    if max_pairs is not None and stratify_by_distance and pairs:
+        by_distance: dict[int, list[tuple[int, int]]] = {}
+        for i, j in pairs:
+            by_distance.setdefault(int(round(float(dist_cpu[i, j].item()))), []).append((i, j))
+        for values in by_distance.values():
+            rng.shuffle(values)
+        distances = sorted(by_distance)
+        rng.shuffle(distances)
+        quota = max(1, int(max_pairs) // max(1, len(distances)))
+        selected: list[tuple[int, int]] = []
+        leftovers: list[tuple[int, int]] = []
+        for distance in distances:
+            values = by_distance[distance]
+            selected.extend(values[:quota])
+            leftovers.extend(values[quota:])
+        rng.shuffle(leftovers)
+        selected.extend(leftovers)
+        return selected[: int(max_pairs)]
     rng.shuffle(pairs)
     return pairs[: int(max_pairs)] if max_pairs is not None else pairs
 
@@ -2742,7 +2784,19 @@ def run_step4(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
     run_clamp_negative_control = bool(cfg.get("run_clamp_negative_control", True))
     composed_reference_max_direct_fraction = float(cfg.get("composed_reference_max_direct_fraction", 0.20))
     tau = int(config.get("primary_tau", 3))
-    selection_tau = min(far_thresholds(config))
+    if bool(cfg.get("all_distance", True)):
+        min_distance = 2
+    else:
+        min_distance = int(cfg.get("min_distance", 2))
+    min_distance = max(2, int(min_distance))
+    stratify_by_distance = bool(cfg.get("stratify_by_distance", True))
+    max_distance_raw = cfg.get("max_distance")
+    max_distance = (
+        None
+        if max_distance_raw is None or str(max_distance_raw).strip().lower() in {"", "none", "all", "null"}
+        else int(max_distance_raw)
+    )
+    onset_fraction_threshold = float(cfg.get("onset_fraction_threshold", 0.50))
     ig_steps = int(config["perturbation"].get("ig_steps", 32))
     batched_vjp = carriage_ig_uses_batched_vjp(config)
     seed = int(config.get("seeds", [0])[0])
@@ -2783,7 +2837,7 @@ def run_step4(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
         max_pairs_label = "all" if max_pairs is None else str(max_pairs)
         progress(
             f"Step 4 {model.name}: selected {len(graphs)} test graph(s), "
-            f"max_far_pairs_per_graph={max_pairs_label}, IG steps={ig_steps}"
+            f"distance>= {min_distance}, max_pairs_per_graph={max_pairs_label}, IG steps={ig_steps}"
         )
         baseline = mean_encoded_baseline(model.adapter, select_baseline_graphs(model.adapter, "test", config, sample_graphs, seed=seed))
         cache_hits = 0
@@ -2809,7 +2863,14 @@ def run_step4(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
             readout_grad = result["readout_gradient"]
             clean_encoded = result["clean_encoded"].to(model.adapter.device)
             base_encoded = result["baseline"].to(model.adapter.device)
-            selected = far_pairs(dist, selection_tau, max_pairs=max_pairs, seed=seed + graph_idx)
+            selected = distance_pairs(
+                dist,
+                min_distance=min_distance,
+                max_distance=max_distance,
+                max_pairs=max_pairs,
+                seed=seed + graph_idx,
+                stratify_by_distance=stratify_by_distance,
+            )
             direct_matrix = torch.full_like(c, float("nan"))
             accepted_pair_idx = 0
             for pair_idx, (carrier, source) in enumerate(selected):
@@ -2838,6 +2899,8 @@ def run_step4(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
                         "signal_gate_pass": gate_pass,
                         "signal_gate_quantile": gate_quantile,
                         "onehop_empirical_floor": onehop_floor,
+                        "patch_min_distance": min_distance,
+                        "patch_max_distance": max_distance if max_distance is not None else "",
                     }
                 )
                 if not gate_pass:
@@ -2887,6 +2950,8 @@ def run_step4(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
                         "signal_gate_pass": gate_pass,
                         "signal_gate_quantile": gate_quantile,
                         "onehop_empirical_floor": onehop_floor,
+                        "patch_min_distance": min_distance,
+                        "patch_max_distance": max_distance if max_distance is not None else "",
                         "nontrivial_effect": nontrivial_effect,
                     }
                 )
@@ -2944,6 +3009,8 @@ def run_step4(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
                                 "signal_gate_pass": gate_pass,
                                 "signal_gate_quantile": gate_quantile,
                                 "onehop_empirical_floor": onehop_floor,
+                                "patch_min_distance": min_distance,
+                                "patch_max_distance": max_distance if max_distance is not None else "",
                                 "nontrivial_effect": control_nontrivial,
                             }
                         )
@@ -2990,6 +3057,8 @@ def run_step4(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
                                 "signal_gate_pass": gate_pass,
                                 "signal_gate_quantile": gate_quantile,
                                 "onehop_empirical_floor": onehop_floor,
+                                "patch_min_distance": min_distance,
+                                "patch_max_distance": max_distance if max_distance is not None else "",
                                 "nontrivial_effect": depth_nontrivial,
                             }
                         )
@@ -3005,12 +3074,24 @@ def run_step4(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
     write_csv(artifact_root / "metrics" / "step4_mediator_validation_summary.csv", validation_summary)
     clamp_control_summary = clamp_negative_control_summary(rows)
     write_csv(artifact_root / "metrics" / "step4_clamp_negative_control_summary.csv", clamp_control_summary)
+    clamp_d2_summary = clamp_negative_control_summary(rows, distance=2)
+    write_csv(artifact_root / "metrics" / "step4_clamp_validation_d2_summary.csv", clamp_d2_summary)
     cut_class_summary = mediator_cut_class_summary(rows)
     write_csv(artifact_root / "metrics" / "step4_mediator_cut_class_summary.csv", cut_class_summary)
     single_cut_summary = mediator_single_cut_diagnostic(rows, models)
     write_csv(artifact_root / "metrics" / "step4_single_cut_composed_reference_diagnostic.csv", single_cut_summary)
     atomic_torch_save(artifact_root / "tensors" / "step4_mediator_patching.pt", tensors)
-    render_step4(rows, depth_rows, validation_summary, artifact_root, dpi=dpi)
+    onset_rows = onset_depth_rows(depth_rows, threshold=onset_fraction_threshold)
+    write_csv(artifact_root / "metrics" / "step4_onset_depth_by_distance.csv", onset_rows)
+    render_step4(
+        rows,
+        depth_rows,
+        validation_summary,
+        artifact_root,
+        dpi=dpi,
+        onset_rows=onset_rows,
+        signal_gate_rows=signal_gate_rows,
+    )
     render_step4_cut_class_summary(cut_class_summary, artifact_root, dpi=dpi)
     composed_reference_failures = [
         dict(row)
@@ -3049,7 +3130,13 @@ def run_step4(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
         "signal_gate_enabled": use_signal_gate,
         "signal_gate_quantile": gate_quantile,
         "onehop_empirical_floor": onehop_floor,
+        "patch_min_distance": min_distance,
+        "patch_max_distance": max_distance if max_distance is not None else "",
+        "stratify_by_distance": stratify_by_distance,
+        "onset_fraction_threshold": onset_fraction_threshold,
+        "onset_rows": len(onset_rows),
         "clamp_negative_control_rows": len([r for r in rows if str(r.get("clamp_type")) == "random_off_path"]),
+        "clamp_validation_d2_rows": len(clamp_d2_summary),
         "analytic_patching_check": analytic_patching_check,
         "composed_reference_failures": composed_reference_failures,
         "single_cut_composed_reference_failures": single_cut_composed_reference_failures,
@@ -3105,7 +3192,7 @@ def mediator_validation_summary(rows: Sequence[Mapping[str, Any]]) -> list[dict[
     return out
 
 
-def clamp_negative_control_summary(rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+def clamp_negative_control_summary(rows: Sequence[Mapping[str, Any]], *, distance: Optional[int] = None) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     clamp_types = ["cut", "random_off_path"]
     for model in sorted(set(str(r.get("model")) for r in rows)):
@@ -3116,6 +3203,7 @@ def clamp_negative_control_summary(rows: Sequence[Mapping[str, Any]]) -> list[di
                 if str(r.get("model")) == model
                 and str(r.get("clamp_type", "cut")) == clamp_type
                 and row_is_nontrivial(r)
+                and (distance is None or int(round(safe_float(r.get("distance")))) == int(distance))
             ]
             stats = weighted_direct_fraction(model_rows, seed=3700 + len(out), draws=500)
             if int(stats.get("pairs", 0)) <= 0:
@@ -3129,6 +3217,7 @@ def clamp_negative_control_summary(rows: Sequence[Mapping[str, Any]]) -> list[di
                     "ci_high": stats["ci_high"],
                     "pairs": stats["pairs"],
                     "aggregation": "carriage_weighted",
+                    "distance": distance if distance is not None else "",
                 }
             )
     return out
@@ -3305,6 +3394,95 @@ def render_step4_clamp_negative_control(rows: Sequence[Mapping[str, Any]], artif
     plt.close(fig)
 
 
+def render_step4_clamp_validation_d2(rows: Sequence[Mapping[str, Any]], artifact_root: Path, *, dpi: int) -> None:
+    summary = clamp_negative_control_summary(rows, distance=2)
+    if not summary:
+        return
+    models = sorted({str(r.get("model")) for r in summary})
+    clamp_types = ["cut", "random_off_path"]
+    labels = {"cut": "Cut clamp", "random_off_path": "Random off-path clamp"}
+    x = np.arange(len(models), dtype=float)
+    width = 0.34
+    fig, ax = plt.subplots(figsize=(8.2, 4.8), constrained_layout=True)
+    for idx, clamp_type in enumerate(clamp_types):
+        values = []
+        err_low = []
+        err_high = []
+        for model in models:
+            row = next((r for r in summary if str(r.get("model")) == model and str(r.get("clamp_type")) == clamp_type), None)
+            mean = safe_float(row.get("mean_direct_fraction")) if row else float("nan")
+            lo = safe_float(row.get("ci_low")) if row else float("nan")
+            hi = safe_float(row.get("ci_high")) if row else float("nan")
+            values.append(mean)
+            err_low.append(max(0.0, mean - lo) if math.isfinite(mean) and math.isfinite(lo) else 0.0)
+            err_high.append(max(0.0, hi - mean) if math.isfinite(mean) and math.isfinite(hi) else 0.0)
+        offset = (idx - 0.5) * width
+        ax.bar(
+            x + offset,
+            [0.0 if not math.isfinite(v) else v for v in values],
+            width=width,
+            yerr=np.vstack([err_low, err_high]),
+            capsize=4,
+            label=labels.get(clamp_type, clamp_type),
+        )
+    ax.axhline(0.0, color="#777777", linewidth=1, label="Fully composed")
+    ax.axhline(1.0, color="#555555", linestyle="--", linewidth=1, label="No clamp effect")
+    ax.set_title("Clamp validation on real signal: direct fraction on d=2 pairs (cut vs off-path)")
+    ax.set_xlabel("Model")
+    ax.set_ylabel("Carriage-weighted direct fraction")
+    ax.set_xticks(x)
+    ax.set_xticklabels(models, rotation=15, ha="right")
+    ax.legend(frameon=False, fontsize=8)
+    figures = ensure_dir(artifact_root / "figures")
+    fig.savefig(figures / "step4_clamp_validation_d2.png", dpi=dpi)
+    fig.savefig(figures / "step4_clamp_validation_d2.pdf")
+    plt.close(fig)
+
+
+def render_step4_signal_magnitude_by_distance(rows: Sequence[Mapping[str, Any]], artifact_root: Path, *, dpi: int) -> None:
+    clean = [
+        r
+        for r in rows
+        if math.isfinite(safe_float(r.get("distance")))
+        and math.isfinite(safe_float(r.get("effect_abs")))
+        and safe_float(r.get("effect_abs")) >= 0.0
+    ]
+    if not clean:
+        return
+    graph_max: dict[tuple[str, str], float] = {}
+    for row in clean:
+        key = (str(row.get("model")), str(row.get("graph_id")))
+        graph_max[key] = max(graph_max.get(key, 0.0), safe_float(row.get("effect_abs")))
+    grouped: dict[tuple[str, int], list[float]] = {}
+    floor_grouped: dict[int, list[float]] = {}
+    for row in clean:
+        key = (str(row.get("model")), str(row.get("graph_id")))
+        denom = max(graph_max.get(key, 0.0), EPS)
+        distance = int(round(safe_float(row.get("distance"))))
+        grouped.setdefault((str(row.get("model")), distance), []).append(safe_float(row.get("effect_abs")) / denom)
+        floor = safe_float(row.get("signal_floor")) / denom
+        if math.isfinite(floor):
+            floor_grouped.setdefault(distance, []).append(floor)
+    fig, ax = plt.subplots(figsize=(8.2, 4.8), constrained_layout=True)
+    for model in sorted({model for model, _ in grouped}):
+        distances = sorted(distance for m, distance in grouped if m == model)
+        values = [float(np.nanmean(grouped[(model, distance)])) for distance in distances]
+        ax.plot(distances, values, marker="o", linewidth=1.8, label=model)
+    if floor_grouped:
+        distances = sorted(floor_grouped)
+        floor_values = [float(np.nanmedian(floor_grouped[distance])) for distance in distances]
+        ax.plot(distances, floor_values, linestyle="--", linewidth=1.4, color="#555555", label="signal gate floor")
+    ax.set_title("Carriage magnitude vs distance: signal above noise")
+    ax.set_xlabel("Molecular hop distance")
+    ax.set_ylabel("|C| / per-graph max")
+    ax.set_ylim(bottom=0.0)
+    ax.legend(frameon=False, fontsize=8)
+    figures = ensure_dir(artifact_root / "figures")
+    fig.savefig(figures / "step4_carriage_signal_by_distance.png", dpi=dpi)
+    fig.savefig(figures / "step4_carriage_signal_by_distance.pdf")
+    plt.close(fig)
+
+
 def render_step4_direct_fraction_by_distance(rows: Sequence[Mapping[str, Any]], artifact_root: Path, *, dpi: int) -> None:
     grouped: dict[tuple[str, int], list[Mapping[str, Any]]] = {}
     for row in rows:
@@ -3347,7 +3525,7 @@ def render_step4_direct_fraction_by_distance(rows: Sequence[Mapping[str, Any]], 
             if int(row.get("pairs", 0)) < 3:
                 ax.text(x_val, y_val, f"n={int(row.get('pairs', 0))}", fontsize=7, ha="center", va="bottom")
     ax.axhline(1.0, color="#555555", linestyle="--", linewidth=1, label="No clamp effect")
-    ax.set_title("Step 4: direct fraction by distance (signal-gated pairs)")
+    ax.set_title("Composed vs direct carriage by molecular distance (d >= 2)")
     ax.set_xlabel("Molecular hop distance")
     ax.set_ylabel("Direct fraction = |C^clamp| / |C^unclamp|")
     ax.legend(frameon=False, fontsize=8)
@@ -3364,6 +3542,8 @@ def render_step4(
     artifact_root: Path,
     *,
     dpi: int,
+    onset_rows: Sequence[Mapping[str, Any]] = (),
+    signal_gate_rows: Sequence[Mapping[str, Any]] = (),
 ) -> None:
     if validation_summary:
         labels = [str(r["model"]) for r in validation_summary]
@@ -3383,7 +3563,10 @@ def render_step4(
         fig.savefig(figures / "step4_mediator_patching_validation.png", dpi=dpi)
         fig.savefig(figures / "step4_mediator_patching_validation.pdf")
         plt.close(fig)
+    if signal_gate_rows:
+        render_step4_signal_magnitude_by_distance(signal_gate_rows, artifact_root, dpi=dpi)
     if rows:
+        render_step4_clamp_validation_d2(rows, artifact_root, dpi=dpi)
         render_step4_direct_fraction_by_distance(rows, artifact_root, dpi=dpi)
         render_step4_clamp_negative_control(rows, artifact_root, dpi=dpi)
     if depth_rows:
@@ -3407,15 +3590,95 @@ def render_step4(
         fig.savefig(figures / "step4_depth_resolved_direct_carriage.pdf")
         plt.close(fig)
         render_step4_depth_by_distance(depth_rows, artifact_root, dpi=dpi)
+        render_step4_onset_depth_by_distance(onset_rows, artifact_root, dpi=dpi)
+
+
+def onset_depth_rows(rows: Sequence[Mapping[str, Any]], *, threshold: float = 0.50) -> list[dict[str, Any]]:
+    grouped: dict[tuple[str, int, int], list[float]] = {}
+    for row in rows:
+        if not row_is_nontrivial(row):
+            continue
+        distance = safe_float(row.get("distance"))
+        layer = safe_float(row.get("clamp_until_layer"))
+        value = safe_float(row.get("direct_fraction"))
+        if not (math.isfinite(distance) and math.isfinite(layer) and math.isfinite(value)):
+            continue
+        grouped.setdefault((str(row.get("model")), int(round(distance)), int(layer)), []).append(value)
+    out: list[dict[str, Any]] = []
+    for model, distance in sorted({(model, distance) for model, distance, _ in grouped}):
+        layer_values = {
+            layer: float(np.nanmean(grouped[(model, distance, layer)]))
+            for layer in sorted(layer for m, d, layer in grouped if m == model and d == distance)
+        }
+        onset = next((layer for layer, value in layer_values.items() if math.isfinite(value) and value >= float(threshold)), None)
+        out.append(
+            {
+                "model": model,
+                "distance": distance,
+                "onset_layer": onset if onset is not None else float("nan"),
+                "threshold": float(threshold),
+                "status": "complete" if onset is not None else "no_onset_above_threshold",
+                "layers_evaluated": len(layer_values),
+                "max_direct_fraction": max([v for v in layer_values.values() if math.isfinite(v)] or [float("nan")]),
+            }
+        )
+    return out
 
 
 def depth_distance_band(distance: float) -> str:
     if not math.isfinite(distance):
         return "unknown"
     d = int(round(float(distance)))
+    if d <= 3:
+        return "d=2-3"
     if d <= 6:
-        return f"d={d}"
+        return "d=4-6"
     return "d>=7"
+
+
+def depth_band_sort_key(band: str) -> int:
+    if band == "d=2-3":
+        return 2
+    if band == "d=4-6":
+        return 4
+    if band == "d>=7":
+        return 7
+    match = re.search(r"\d+", str(band))
+    return int(match.group(0)) if match else 99
+
+
+def render_step4_onset_depth_by_distance(rows: Sequence[Mapping[str, Any]], artifact_root: Path, *, dpi: int) -> None:
+    clean = [
+        r
+        for r in rows
+        if math.isfinite(safe_float(r.get("distance")))
+        and math.isfinite(safe_float(r.get("onset_layer")))
+    ]
+    if not clean:
+        return
+    fig, ax = plt.subplots(figsize=(6.8, 5.0), constrained_layout=True)
+    all_distances: list[float] = []
+    all_onsets: list[float] = []
+    for model in sorted({str(r.get("model")) for r in clean}):
+        model_rows = sorted([r for r in clean if str(r.get("model")) == model], key=lambda r: safe_float(r.get("distance")))
+        x = np.asarray([safe_float(r.get("distance")) for r in model_rows], dtype=float)
+        y = np.asarray([safe_float(r.get("onset_layer")) for r in model_rows], dtype=float)
+        all_distances.extend([float(v) for v in x if math.isfinite(float(v))])
+        all_onsets.extend([float(v) for v in y if math.isfinite(float(v))])
+        ax.plot(x, y, marker="o", linewidth=1.6, label=model)
+    if all_distances:
+        lim_min = max(0.0, min(all_distances) - 0.5)
+        lim_max = max(max(all_distances + all_onsets), 1.0) + 0.5
+        ax.plot([lim_min, lim_max], [lim_min, lim_max], "--", color="#555555", linewidth=1.0, label="y = distance")
+        ax.set_xlim(lim_min, lim_max)
+    ax.set_title("Onset depth vs distance: composition staircase vs direct routing")
+    ax.set_xlabel("Molecular hop distance")
+    ax.set_ylabel("First clamp depth with surviving direct fraction >= threshold")
+    ax.legend(frameon=False, fontsize=8)
+    figures = ensure_dir(artifact_root / "figures")
+    fig.savefig(figures / "step4_onset_depth_vs_distance.png", dpi=dpi)
+    fig.savefig(figures / "step4_onset_depth_vs_distance.pdf")
+    plt.close(fig)
 
 
 def render_step4_depth_by_distance(rows: Sequence[Mapping[str, Any]], artifact_root: Path, *, dpi: int) -> None:
@@ -3446,7 +3709,7 @@ def render_step4_depth_by_distance(rows: Sequence[Mapping[str, Any]], artifact_r
             band = depth_distance_band(safe_float(row.get("distance")))
             layer = int(safe_float(row.get("clamp_until_layer")))
             grouped.setdefault((band, layer), []).append(safe_float(row.get("direct_fraction")))
-        bands = sorted({band for band, _ in grouped}, key=lambda b: (99 if ">=" in b else int(b.split("=")[1])))
+        bands = sorted({band for band, _ in grouped}, key=depth_band_sort_key)
         for band in bands:
             layers = sorted(layer for b, layer in grouped if b == band)
             y = [float(np.nanmean(grouped[(band, layer)])) for layer in layers]
