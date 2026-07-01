@@ -39,11 +39,16 @@ DEFAULT_SECRET_NAME = "dissertation_key"
 DEFAULT_DRIVE_ROOT = "/content/drive/MyDrive/graph_specialisation_metrics/zinc_main_procedure_colab"
 DEFAULT_DENSE_DRIVE_DIR = "/content/drive/MyDrive/grit_zinc_official"
 DEFAULT_ONEHOP_DRIVE_DIR = "/content/drive/MyDrive/grit_zinc_1hop"
+DEFAULT_GIN_DRIVE_DIR = "/content/drive/MyDrive/gin_zinc_official"
+DEFAULT_GIN_REPO_DIR = "/content/benchmarking-gnns_analysis"
 DEFAULT_PYG_VERSION = "2.2.0"
 
 OFFICIAL_GRIT_REPO = "https://github.com/LiamMa/GRIT.git"
 OFFICIAL_GRIT_COMMIT = "6c988ea600a606fbb49a2246c64a2d37396b3ab5"
+OFFICIAL_GIN_REPO = "https://github.com/graphdeeplearning/benchmarking-gnns.git"
+OFFICIAL_GIN_COMMIT = "b6c407712fa576e9699555e1e035d1e327ccae6c"
 EXPECTED_GRIT_PARAMS = 473_473
+EXPECTED_OFFICIAL_GIN_PARAMS = 509_549
 ONE_HOP_CFG_TEXT = """\
 # Parameter-matched 1-hop sparse-control variant of the official ZINC GRIT RRWP config.
 #
@@ -484,6 +489,13 @@ def install_repo(repo_dir: Path, *, pyg_version: str) -> None:
             "scikit-learn>=1.0",
         ]
     )
+    dgl_proc = pip_install(["torchdata", "dgl"], check=False)
+    if dgl_proc.returncode != 0:
+        print(
+            "[deps-warning] DGL install failed; dense/1-hop GRIT can still run, "
+            "but the official Benchmarking-GNNs GIN reference will require DGL.",
+            flush=True,
+        )
     run_cmd([sys.executable, "-m", "pip", "install", "-q", "-e", str(repo_dir), "--no-deps"])
     for path in [str(repo_dir), str(repo_dir / "src")]:
         if path not in sys.path:
@@ -500,6 +512,19 @@ def clone_official_grit(repo_dir: Path, *, force: bool = False) -> None:
         run_cmd(["git", "fetch", "origin"], cwd=repo_dir)
         run_cmd(["git", "checkout", OFFICIAL_GRIT_COMMIT], cwd=repo_dir)
     print(f"[grit] official checkout {repo_dir} @ {OFFICIAL_GRIT_COMMIT}", flush=True)
+
+
+def clone_official_gin(repo_dir: Path, *, force: bool = False) -> Path:
+    if force and repo_dir.exists():
+        shutil.rmtree(repo_dir)
+    if not (repo_dir / ".git").exists():
+        run_cmd(["git", "clone", OFFICIAL_GIN_REPO, str(repo_dir)])
+    current = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=str(repo_dir), text=True).strip()
+    if current != OFFICIAL_GIN_COMMIT:
+        run_cmd(["git", "fetch", "origin"], cwd=repo_dir)
+        run_cmd(["git", "checkout", OFFICIAL_GIN_COMMIT], cwd=repo_dir)
+    print(f"[gin] official Benchmarking-GNNs checkout {repo_dir} @ {OFFICIAL_GIN_COMMIT}", flush=True)
+    return repo_dir
 
 
 def _read_text_preserve_newlines(path: Path) -> str:
@@ -878,19 +903,149 @@ def prepare_model_artifact(
     return pointer
 
 
+def newest_existing(paths: Sequence[Path]) -> Path | None:
+    existing = [path for path in paths if path.exists() and path.is_file()]
+    return max(existing, key=lambda p: p.stat().st_mtime) if existing else None
+
+
+def first_existing(paths: Sequence[Path]) -> Path | None:
+    for path in paths:
+        if path.exists() and path.is_file():
+            return path
+    return None
+
+
+def discover_gin_artifact(gin_drive_dir: Path) -> dict[str, Path | None]:
+    latest_outputs = gin_drive_dir / "latest_outputs"
+    run_root = gin_drive_dir / "results" / "gin_zinc_500k_seed41"
+    official_out = run_root / "official_out"
+    checkpoint = first_existing(
+        [
+            latest_outputs / "gin_zinc_seed41_best_checkpoint_pkl.pt",
+            latest_outputs / "gin_zinc_seed41_best_checkpoint_pkl.pkl",
+            *sorted(official_out.glob("checkpoints/**/best_val_mae_state_dict.pkl"), key=lambda p: str(p)),
+            latest_outputs / "gin_zinc_seed41_latest_checkpoint_pkl.pt",
+            latest_outputs / "gin_zinc_seed41_latest_checkpoint_pkl.pkl",
+            *sorted(official_out.glob("checkpoints/**/latest_state_dict.pkl"), key=lambda p: str(p)),
+            *sorted(official_out.glob("checkpoints/**/*.pkl"), key=lambda p: str(p)),
+        ]
+    )
+    config = newest_existing(
+        [
+            latest_outputs / "molecules_graph_regression_GIN_ZINC_500k.runtime.json",
+            run_root / "configs" / "molecules_graph_regression_GIN_ZINC_500k.runtime.json",
+            *official_out.glob("configs/config_*.txt"),
+        ]
+    )
+    history = newest_existing(
+        [
+            latest_outputs / "gin_zinc_seed41_history_csv.csv",
+            *official_out.glob("results/*_history.csv"),
+        ]
+    )
+    best_json = newest_existing(
+        [
+            latest_outputs / "gin_zinc_seed41_best_json.json",
+            *official_out.glob("results/*_best.json"),
+        ]
+    )
+    raw_summary = newest_existing([run_root / "training_summary.json"])
+    return {
+        "checkpoint": checkpoint,
+        "config": config,
+        "history": history,
+        "best_json": best_json,
+        "training_summary": raw_summary,
+        "run_root": run_root if run_root.exists() else None,
+        "official_out": official_out if official_out.exists() else None,
+    }
+
+
+def prepare_gin_model_artifact(
+    *,
+    source_drive_dir: Path,
+    repo_path: Path,
+    artifact: Mapping[str, Path | None],
+    prepared_root: Path,
+) -> dict[str, Any] | None:
+    checkpoint = artifact.get("checkpoint")
+    config = artifact.get("config")
+    if checkpoint is None or config is None:
+        return None
+    prepared_root.mkdir(parents=True, exist_ok=True)
+    history_path = artifact.get("history")
+    metrics_csv = None
+    if history_path is not None and history_path.exists():
+        metrics_csv = prepared_root / "metrics" / "history_metrics.csv"
+        metrics_csv.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(history_path, metrics_csv)
+    best_payload: dict[str, Any] = {}
+    best_json = artifact.get("best_json")
+    if best_json is not None and best_json.exists():
+        try:
+            best_payload = load_json(best_json)
+        except Exception:
+            best_payload = {}
+    raw_summary_payload: dict[str, Any] = {}
+    raw_summary = artifact.get("training_summary")
+    if raw_summary is not None and raw_summary.exists():
+        try:
+            raw_summary_payload = load_json(raw_summary)
+        except Exception:
+            raw_summary_payload = {}
+    summary = {
+        "model": "gin",
+        "adapter": "official_benchmarking_gnns_gin",
+        "official_repo": OFFICIAL_GIN_REPO,
+        "official_commit": OFFICIAL_GIN_COMMIT,
+        "expected_parameter_count": EXPECTED_OFFICIAL_GIN_PARAMS,
+        "observed_parameter_count": raw_summary_payload.get("observed_parameter_count"),
+        "best_epoch": best_payload.get("best_epoch"),
+        "best_val_mae": best_payload.get("best_val_mae"),
+        "best_test_mae": best_payload.get("test_mae_at_best_val_epoch"),
+        "best_train_mae": best_payload.get("train_mae_at_best_val_epoch"),
+        "checkpoint_path": str(checkpoint),
+        "config_path": str(config),
+        "history_csv": str(history_path) if history_path is not None else None,
+    }
+    summary_json = write_json(prepared_root / "metrics" / "training_summary.json", summary)
+    pointer = {
+        "model": "gin",
+        "adapter": "official_benchmarking_gnns_gin",
+        "source_drive_dir": str(source_drive_dir),
+        "repo_path": str(repo_path),
+        "config_path": str(config),
+        "checkpoint_path": str(checkpoint),
+        "prepared_root": str(prepared_root),
+        "metrics_csv": str(metrics_csv) if metrics_csv is not None else None,
+        "summary_json": str(summary_json),
+        "history_rows": "" if metrics_csv is None else "see_metrics_csv",
+        "official_repo": OFFICIAL_GIN_REPO,
+        "official_commit": OFFICIAL_GIN_COMMIT,
+        "expected_parameter_count": EXPECTED_OFFICIAL_GIN_PARAMS,
+    }
+    write_json(prepared_root / "artifact_pointer.json", pointer)
+    return pointer
+
+
 def build_zinc_config(
     *,
     artifact_root: Path,
     dense_prepared: Path,
     onehop_prepared: Path,
+    gin_prepared: Path | None,
     dense_dataset_dir: Path,
     onehop_dataset_dir: Path,
+    gin_dataset_dir: Path | None,
     dense_repo: Path,
     onehop_repo: Path,
+    gin_repo: Path | None,
     dense_cfg: Path,
     onehop_cfg: Path,
+    gin_cfg: Path | None,
     dense_ckpt: Path,
     onehop_ckpt: Path,
+    gin_ckpt: Path | None,
     single_seed: int,
     include_local_references: bool,
 ) -> dict[str, Any]:
@@ -918,22 +1073,31 @@ def build_zinc_config(
             "checkpoint_path": str(onehop_ckpt),
         },
     }
+    if gin_prepared is not None and gin_repo is not None and gin_cfg is not None and gin_ckpt is not None:
+        models["gin"] = {
+            "adapter": "official_benchmarking_gnns_gin",
+            "role": "local_validation_reference",
+            "official_repo": OFFICIAL_GIN_REPO,
+            "official_commit": OFFICIAL_GIN_COMMIT,
+            "repo_path": str(gin_repo),
+            "artifact_root": str(gin_prepared),
+            "dataset_dir": str(gin_dataset_dir or dense_dataset_dir),
+            "config_path": str(gin_cfg),
+            "checkpoint_path": str(gin_ckpt),
+        }
     if include_local_references:
-        models.update(
-            {
-                "gin": {
+        if "gin" not in models:
+            models["gin"] = {
                     "adapter": "pyg_gin",
                     "role": "local_validation_reference",
                     "artifact_root": str(artifact_root / "missing_gin_reference"),
                     "dataset_dir": str(dense_dataset_dir),
-                },
-                "gcn": {
-                    "adapter": "pyg_gcn",
-                    "role": "local_validation_reference",
-                    "artifact_root": str(artifact_root / "missing_gcn_reference"),
-                },
             }
-        )
+        models["gcn"] = {
+            "adapter": "pyg_gcn",
+            "role": "local_validation_reference",
+            "artifact_root": str(artifact_root / "missing_gcn_reference"),
+        }
 
     return {
         "artifact_root": str(artifact_root / "artifacts"),
@@ -996,6 +1160,7 @@ def build_zinc_config(
             "markdown_default_requires_three_seeds": True,
             "dense_default_drive_dir": DEFAULT_DENSE_DRIVE_DIR,
             "onehop_default_drive_dir": DEFAULT_ONEHOP_DRIVE_DIR,
+            "gin_default_drive_dir": DEFAULT_GIN_DRIVE_DIR,
         },
     }
 
@@ -1115,8 +1280,12 @@ def write_methodology_fidelity_audit(
         notes.append("Single-seed run requested; markdown default requires three seeds for paper claims.")
     else:
         notes.append("Single-seed run requested by user; this deliberately deviates from the markdown's 3-seed final protocol.")
+    model_names = set((config.get("models") or {}).keys())
     if not include_local_references:
-        notes.append("GCN/GIN local validation reference omitted by default because only dense GRIT and 1-hop GRIT checkpoints were requested.")
+        if "gin" in model_names:
+            notes.append("Official Benchmarking-GNNs GIN ZINC reference included from default Drive artifacts; GCN remains omitted until trained/wired.")
+        else:
+            notes.append("GCN/GIN local validation references omitted because trained reference checkpoints were not available/requested.")
     if completion.get("incomplete_steps"):
         notes.append(
             "One or more required steps did not complete. Inspect completion.status_by_step for missing checkpoints, "
@@ -1161,6 +1330,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--drive-root", type=Path, default=Path(DEFAULT_DRIVE_ROOT))
     parser.add_argument("--dense-drive-dir", type=Path, default=Path(DEFAULT_DENSE_DRIVE_DIR))
     parser.add_argument("--onehop-drive-dir", type=Path, default=Path(DEFAULT_ONEHOP_DRIVE_DIR))
+    parser.add_argument("--gin-drive-dir", type=Path, default=Path(DEFAULT_GIN_DRIVE_DIR))
+    parser.add_argument("--gin-repo-dir", type=Path, default=Path(DEFAULT_GIN_REPO_DIR))
     parser.add_argument("--single-seed", type=int, default=0)
     parser.add_argument(
         "--prepared-id",
@@ -1183,9 +1354,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--fast-dev-run", action="store_true", help="Use the main procedure fast-dev overrides for a quicker smoke run.")
     parser.add_argument("--force", action="store_true", help="Force rerun of main_procedure artifact generation instead of resuming completed steps.")
     parser.add_argument("--force-official-grit-reclone", action="store_true")
+    parser.add_argument("--force-official-gin-reclone", action="store_true")
     parser.add_argument("--dry-run", action="store_true", help="Only run main_procedure discovery/status mode.")
     parser.add_argument("--allow-incomplete", action="store_true", help="Do not raise if checkpoints/dependencies are missing or a preflight is requested.")
     parser.add_argument("--include-local-references", action="store_true", help="Include placeholder GCN/GIN entries required by the markdown gate.")
+    parser.add_argument("--skip-gin-reference", action="store_true", help="Do not include the default official Benchmarking-GNNs GIN ZINC reference even if present on Drive.")
     parser.add_argument("--skip-onehop-locality-check", action="store_true", help="Skip the hard preflight that certifies the 1-hop control is local.")
     parser.add_argument("--onehop-locality-check-graphs", type=int, default=4, help="Number of ZINC test graphs used for the 1-hop locality preflight.")
     parser.add_argument("--onehop-locality-tolerance", type=float, default=1.0e-12, help="Allowed direct attention mass at molecular distance > 1.")
@@ -1226,6 +1399,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     print(f"[prepared] using stable prepared artifact root: {prepared}", flush=True)
     dense_pointer_path = prepared / "dense_grit" / "artifact_pointer.json"
     onehop_pointer_path = prepared / "grit_1hop" / "artifact_pointer.json"
+    gin_pointer_path = prepared / "gin" / "artifact_pointer.json"
     reuse_prepared = (
         not args.refresh_model_artifacts
         and dense_pointer_path.exists()
@@ -1262,25 +1436,73 @@ def main(argv: Sequence[str] | None = None) -> None:
             prepared_root=prepared / "grit_1hop",
         )
 
+    gin_pointer: dict[str, Any] | None = None
+    gin_repo: Path | None = None
+    gin_cfg: Path | None = None
+    gin_ckpt: Path | None = None
+    if not args.skip_gin_reference and not args.refresh_model_artifacts and gin_pointer_path.exists():
+        candidate = load_json(gin_pointer_path)
+        candidate_ckpt = Path(str(candidate.get("checkpoint_path", "")))
+        candidate_cfg = Path(str(candidate.get("config_path", "")))
+        candidate_repo = Path(str(candidate.get("repo_path", args.gin_repo_dir)))
+        if candidate_ckpt.exists() and candidate_cfg.exists() and candidate_repo.exists():
+            gin_pointer = candidate
+            gin_ckpt = candidate_ckpt
+            gin_cfg = candidate_cfg
+            gin_repo = candidate_repo
+            print(f"[prepared] reusing GIN checkpoint: {gin_ckpt}", flush=True)
+        else:
+            print("[prepared-warning] saved GIN pointer missing checkpoint/config/repo; rediscovering GIN artifacts", flush=True)
+    if not args.skip_gin_reference and gin_pointer is None:
+        gin_artifact = discover_gin_artifact(args.gin_drive_dir)
+        if gin_artifact.get("checkpoint") is not None and gin_artifact.get("config") is not None:
+            gin_repo = clone_official_gin(args.gin_repo_dir, force=bool(args.force_official_gin_reclone))
+            gin_pointer = prepare_gin_model_artifact(
+                source_drive_dir=args.gin_drive_dir,
+                repo_path=gin_repo,
+                artifact=gin_artifact,
+                prepared_root=prepared / "gin",
+            )
+            if gin_pointer is not None:
+                gin_ckpt = Path(str(gin_pointer["checkpoint_path"]))
+                gin_cfg = Path(str(gin_pointer["config_path"]))
+                print(f"[prepared] using official GIN checkpoint: {gin_ckpt}", flush=True)
+        else:
+            print(
+                f"[prepared] no complete official GIN artifact found under {args.gin_drive_dir}; "
+                "GIN reference will be omitted unless --include-local-references requests placeholders.",
+                flush=True,
+            )
+
     cfg = build_zinc_config(
         artifact_root=args.drive_root,
         dense_prepared=prepared / "dense_grit",
         onehop_prepared=prepared / "grit_1hop",
+        gin_prepared=(prepared / "gin") if gin_pointer is not None else None,
         dense_dataset_dir=args.dense_drive_dir / "datasets",
         onehop_dataset_dir=args.onehop_drive_dir / "datasets",
+        gin_dataset_dir=args.dense_drive_dir / "datasets",
         dense_repo=dense_repo,
         onehop_repo=onehop_repo,
+        gin_repo=gin_repo,
         dense_cfg=dense_cfg,
         onehop_cfg=onehop_cfg,
+        gin_cfg=gin_cfg,
         dense_ckpt=dense_ckpt,
         onehop_ckpt=onehop_ckpt,
+        gin_ckpt=gin_ckpt,
         single_seed=args.single_seed,
         include_local_references=bool(args.include_local_references),
     )
     config_path = write_yaml(args.drive_root / "configs" / "zinc_main_procedure_colab.yaml", cfg)
     write_json(
         args.drive_root / "prepared_model_artifacts" / "latest_pointers.json",
-        {"dense_grit": dense_pointer, "grit_1hop": onehop_pointer, "config_path": str(config_path)},
+        {
+            "dense_grit": dense_pointer,
+            "grit_1hop": onehop_pointer,
+            "gin": gin_pointer,
+            "config_path": str(config_path),
+        },
     )
 
     print(f"[config] wrote {config_path}", flush=True)

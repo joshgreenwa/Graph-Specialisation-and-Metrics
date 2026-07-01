@@ -1473,6 +1473,395 @@ class OfficialPyGGINAdapter:
         }
 
 
+@dataclass
+class OfficialBenchmarkingGNNsGINAdapter:
+    """Adapter for the official Benchmarking-GNNs DGL GIN ZINC model.
+
+    The training notebook saves the official ``GINNet`` state dict from
+    graphdeeplearning/benchmarking-gnns. This adapter imports that official
+    implementation from ``repo_path`` and exposes the same intervention surface
+    used by the GRIT analysis. Because the official GIN readout sums predictions
+    from every layer, the exposed node readout state concatenates the input
+    embedding plus all GIN-layer node states.
+    """
+
+    repo_path: Path
+    config_path: Path
+    checkpoint_path: Path
+    dataset_dir: Optional[Path] = None
+    device: str | torch.device = "cpu"
+    seed: Optional[int] = None
+    official_commit: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        self.repo_path = Path(self.repo_path)
+        self.config_path = Path(self.config_path)
+        self.checkpoint_path = Path(self.checkpoint_path)
+        self.dataset_dir = Path(self.dataset_dir) if self.dataset_dir is not None else None
+        self.device = torch.device(self.device)
+        self._model: Optional[nn.Module] = None
+        self.info = AdapterInfo(
+            name="benchmarking_gnns_gin_zinc",
+            version="benchmarking-gnns-official-zinc.v1",
+            implementation="Official Benchmarking-GNNs DGL GINNet for ZINC",
+            official_repo="https://github.com/graphdeeplearning/benchmarking-gnns",
+            official_commit=self.official_commit,
+            validation_only=False,
+            dev_only=False,
+        )
+        if not self.repo_path.exists():
+            raise FileNotFoundError(f"missing Benchmarking-GNNs repo: {self.repo_path}")
+        if not self.config_path.exists():
+            raise FileNotFoundError(f"missing Benchmarking-GNNs GIN config: {self.config_path}")
+        if not self.checkpoint_path.exists():
+            raise FileNotFoundError(f"missing Benchmarking-GNNs GIN checkpoint: {self.checkpoint_path}")
+
+    @staticmethod
+    def _install_dgl_compat() -> None:
+        try:
+            import dgl  # noqa: F401
+            import dgl.function as dgl_fn
+        except Exception as exc:  # pragma: no cover - optional dependency.
+            raise RuntimeError("DGL is required for the official Benchmarking-GNNs GIN adapter") from exc
+
+        if not hasattr(dgl_fn, "copy_src") and hasattr(dgl_fn, "copy_u"):
+            def copy_src(src: str | None = None, out: str | None = None, **kwargs: Any) -> Any:
+                src = kwargs.get("src", src)
+                out = kwargs.get("out", out)
+                if src is None or out is None:
+                    raise TypeError("copy_src requires src and out")
+                return dgl_fn.copy_u(src, out)
+
+            dgl_fn.copy_src = copy_src  # type: ignore[attr-defined]
+        if not hasattr(dgl_fn, "copy_edge") and hasattr(dgl_fn, "copy_e"):
+            def copy_edge(edge: str | None = None, out: str | None = None, **kwargs: Any) -> Any:
+                edge = kwargs.get("edge", edge)
+                out = kwargs.get("out", out)
+                if edge is None or out is None:
+                    raise TypeError("copy_edge requires edge and out")
+                return dgl_fn.copy_e(edge, out)
+
+            dgl_fn.copy_edge = copy_edge  # type: ignore[attr-defined]
+        if not hasattr(dgl_fn, "copy_dst") and hasattr(dgl_fn, "copy_v"):
+            def copy_dst(dst: str | None = None, out: str | None = None, **kwargs: Any) -> Any:
+                dst = kwargs.get("dst", dst)
+                out = kwargs.get("out", out)
+                if dst is None or out is None:
+                    raise TypeError("copy_dst requires dst and out")
+                return dgl_fn.copy_v(dst, out)
+
+            dgl_fn.copy_dst = copy_dst  # type: ignore[attr-defined]
+
+    def _config_payload(self) -> dict[str, Any]:
+        with self.config_path.open("r", encoding="utf-8") as f:
+            payload = json.load(f)
+        if not isinstance(payload, dict):
+            raise RuntimeError(f"Benchmarking-GNNs GIN config must be a mapping: {self.config_path}")
+        return payload
+
+    def _net_params(self) -> dict[str, Any]:
+        payload = self._config_payload()
+        cfg = dict(payload.get("net_params", {}))
+        cfg.setdefault("num_atom_type", 28)
+        cfg.setdefault("num_bond_type", 4)
+        cfg.setdefault("device", self.device)
+        cfg.setdefault("gpu_id", 0 if self.device.type == "cuda" else -1)
+        cfg.setdefault("batch_size", int(payload.get("params", {}).get("batch_size", 128)))
+        return cfg
+
+    def _load_checkpoint_payload(self) -> Any:
+        try:
+            return torch.load(self.checkpoint_path, map_location="cpu", weights_only=False)
+        except TypeError:
+            return torch.load(self.checkpoint_path, map_location="cpu")
+
+    @staticmethod
+    def _extract_state_dict(payload: Any) -> dict[str, torch.Tensor]:
+        if isinstance(payload, nn.Module):
+            return payload.state_dict()
+        return OfficialGRITAdapter._extract_state_dict(payload)
+
+    def _gin_net_class(self) -> type[nn.Module]:
+        self._install_dgl_compat()
+        repo_str = str(self.repo_path)
+        if repo_str not in sys.path:
+            sys.path.insert(0, repo_str)
+        module = importlib.import_module("nets.molecules_graph_regression.gin_net")
+        return module.GINNet
+
+    def load_model(self) -> nn.Module:
+        if self._model is not None:
+            return self._model
+        payload = self._load_checkpoint_payload()
+        if isinstance(payload, nn.Module):
+            model = payload
+        else:
+            model = self._gin_net_class()(self._net_params())
+            state = self._extract_state_dict(payload)
+            OfficialGRITAdapter._load_state_dict_into_model(model, state)
+        model = model.to(self.device)
+        model.eval()
+        self._model = model
+        return model
+
+    def parameter_count(self) -> int:
+        model = self.load_model()
+        return sum(int(p.numel()) for p in model.parameters() if p.requires_grad)
+
+    @staticmethod
+    def atom_index(x: torch.Tensor) -> torch.Tensor:
+        if x.dim() == 2 and x.size(-1) >= 1:
+            x = x[:, 0]
+        if x.dim() != 1:
+            raise ValueError(f"expected ZINC atom indices shaped [N] or [N,1], got {tuple(x.shape)}")
+        return x.long().view(-1).clamp_min(0)
+
+    def _clone_pyg_data(self, graph: Any) -> Any:
+        if hasattr(graph, "clone"):
+            return graph.clone()
+        import copy
+
+        return copy.deepcopy(graph)
+
+    def _graph_to_data(self, graph: Any) -> Any:
+        if isinstance(graph, GraphBatchView):
+            data = SimpleNamespace(x=graph.x, edge_index=graph.edge_index, y=graph.y)
+        else:
+            data = self._clone_pyg_data(graph)
+        return data
+
+    def _graph_to_dgl(self, graph: Any) -> Any:
+        self._install_dgl_compat()
+        import dgl
+
+        data = self._graph_to_data(graph)
+        edge_index = data.edge_index.detach().long().cpu()
+        num_nodes = int(data.x.size(0))
+        g = dgl.graph((edge_index[0], edge_index[1]), num_nodes=num_nodes)
+        return g.to(self.device)
+
+    def load_zinc_split(self, split: str, *, limit: Optional[int] = None) -> list[Any]:
+        try:
+            from torch_geometric.datasets import ZINC
+        except Exception as exc:  # pragma: no cover - depends on optional env.
+            raise RuntimeError("PyTorch Geometric is required to load ZINC graphs for the GIN adapter") from exc
+        split_map = {"train": "train", "val": "val", "valid": "val", "validation": "val", "test": "test"}
+        if split not in split_map:
+            raise ValueError(f"unknown ZINC split {split!r}; expected train/val/test")
+        root = self.dataset_dir
+        if root is None:
+            payload = self._config_payload()
+            raw_root = payload.get("dataset_dir") or payload.get("data_dir") or payload.get("root")
+            root = Path(str(raw_root)) if raw_root else self.checkpoint_path.parent / "datasets"
+        dataset = ZINC(root=str(root), subset=True, split=split_map[split])
+        n = len(dataset) if limit is None else min(int(limit), len(dataset))
+        return [dataset[i] for i in range(n)]
+
+    def encoded_node_states(self, graph: Any) -> torch.Tensor:
+        model = self.load_model()
+        data = self._graph_to_data(graph)
+        x = self.atom_index(data.x).to(self.device)
+        with torch.no_grad():
+            encoded = model.embedding_h(x)
+        return encoded.detach().clone()
+
+    def _official_forward_from_encoded(
+        self,
+        graph: Any,
+        encoded: torch.Tensor,
+        *,
+        clamp_nodes: Sequence[int] = (),
+        clean_layer_inputs: Optional[Sequence[torch.Tensor]] = None,
+        clamp_until_layer: Optional[int] = None,
+        clamp_mode: str = "detach",
+        capture_layer_inputs: bool = False,
+        capture_layer_outputs: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
+        model = self.load_model()
+        g = self._graph_to_dgl(graph)
+        h = encoded.to(self.device)
+        clamp = torch.as_tensor(list(clamp_nodes), dtype=torch.long, device=self.device)
+        clamp_mode = str(clamp_mode or "detach").strip().lower()
+        if clamp_mode not in {"detach", "overwrite"}:
+            raise ValueError(f"unsupported clamp_mode={clamp_mode!r}; expected 'detach' or 'overwrite'")
+        if clamp_mode == "overwrite" and clamp.numel() > 0 and clean_layer_inputs is None:
+            raise RuntimeError("overwrite clamp requires clean_layer_inputs")
+        extras: dict[str, Any] = {
+            "layer_input_node_states": [],
+            "layer_output_node_states": [],
+            "layer_output_node_state_tensors": [],
+        }
+        hidden_rep = [h]
+        for layer_idx in range(int(model.n_layers)):
+            if capture_layer_inputs:
+                extras["layer_input_node_states"].append(h.detach().clone())
+            should_clamp = clamp.numel() > 0 and (clamp_until_layer is None or layer_idx <= int(clamp_until_layer))
+            if should_clamp:
+                patched = h.clone()
+                if clamp_mode == "overwrite":
+                    assert clean_layer_inputs is not None
+                    if layer_idx >= len(clean_layer_inputs):
+                        raise RuntimeError(f"missing clean GIN layer input for layer {layer_idx}")
+                    patched[clamp] = clean_layer_inputs[layer_idx].to(device=patched.device, dtype=patched.dtype)[clamp]
+                else:
+                    patched[clamp] = patched[clamp].detach()
+                h = patched
+            h = model.ginlayers[layer_idx](g, h)
+            hidden_rep.append(h)
+            if capture_layer_outputs:
+                extras["layer_output_node_states"].append(h.detach().clone())
+                extras["layer_output_node_state_tensors"].append(h)
+
+        score = None
+        for layer_idx, h_layer in enumerate(hidden_rep):
+            pooled = model.pool(g, h_layer)
+            pred = model.linears_prediction[layer_idx](pooled)
+            score = pred if score is None else score + pred
+        assert score is not None
+        readout_states = torch.cat(hidden_rep, dim=-1)
+        return score.view(-1), readout_states, extras
+
+    def forward_from_encoded_content(
+        self,
+        graph: Any,
+        encoded_content: torch.Tensor,
+        *,
+        retain_grad: bool = False,
+        capture_attention: bool = False,
+        capture_channels: bool = False,
+        capture_layer_inputs: bool = False,
+        capture_layer_outputs: bool = False,
+    ) -> ForwardCache:
+        _ = capture_attention, capture_channels
+        model = self.load_model()
+        if retain_grad:
+            model.zero_grad(set_to_none=True)
+        encoded = encoded_content.to(device=self.device)
+        context = (
+            torch.no_grad()
+            if not retain_grad and not bool(getattr(encoded, "requires_grad", False))
+            else contextlib.nullcontext()
+        )
+        with context:
+            pred, readout_states, extras = self._official_forward_from_encoded(
+                graph,
+                encoded,
+                capture_layer_inputs=capture_layer_inputs,
+                capture_layer_outputs=capture_layer_outputs,
+            )
+        extras["encoded_node_states"] = encoded
+        extras["raw_output"] = pred
+        extras["readout_state_kind"] = "concat_input_and_all_gin_layers"
+        return ForwardCache(prediction=pred, final_node_states=readout_states, attention=None, channel_fields=None, extras=extras)
+
+    def forward_minimal(self, graph: Any) -> ForwardCache:
+        encoded = self.encoded_node_states(graph)
+        return self.forward_from_encoded_content(graph, encoded, retain_grad=False)
+
+    def forward(self, graph: GraphBatchView) -> ForwardCache:
+        return self.forward_minimal(graph)
+
+    def readout_gradient_from_encoded_content(
+        self,
+        graph: Any,
+        encoded_content: torch.Tensor,
+        *,
+        target_index: int = 0,
+        capture_attention: bool = False,
+        capture_channels: bool = False,
+        capture_layer_inputs: bool = False,
+        capture_layer_outputs: bool = False,
+    ) -> tuple[ForwardCache, torch.Tensor]:
+        cache = self.forward_from_encoded_content(
+            graph,
+            encoded_content,
+            retain_grad=True,
+            capture_attention=capture_attention,
+            capture_channels=capture_channels,
+            capture_layer_inputs=capture_layer_inputs,
+            capture_layer_outputs=capture_layer_outputs,
+        )
+        pred = cache.prediction.reshape(-1)[int(target_index)]
+        (grad,) = torch.autograd.grad(
+            pred,
+            cache.final_node_states,
+            retain_graph=False,
+            create_graph=False,
+            allow_unused=False,
+        )
+        return cache, grad.detach().clone()
+
+    def predict(self, graph: GraphBatchView) -> torch.Tensor:
+        return self.forward_minimal(graph).prediction
+
+    def attention_maps(self, graph: GraphBatchView) -> None:
+        return None
+
+    def patch_hidden_states_from_encoded_content(
+        self,
+        graph: Any,
+        encoded_content: torch.Tensor,
+        clamp_nodes: Sequence[int],
+        clean_cache: Optional[ForwardCache] = None,
+        clamp_until_layer: Optional[int] = None,
+        clamp_mode: str = "detach",
+        retain_grad: bool = False,
+    ) -> ForwardCache:
+        model = self.load_model()
+        if retain_grad:
+            model.zero_grad(set_to_none=True)
+        clean_inputs = None
+        if clean_cache is not None and clean_cache.extras is not None:
+            clean_inputs = clean_cache.extras.get("layer_input_node_states")
+        encoded = encoded_content.to(device=self.device)
+        pred, readout_states, extras = self._official_forward_from_encoded(
+            graph,
+            encoded,
+            clamp_nodes=clamp_nodes,
+            clean_layer_inputs=clean_inputs,
+            clamp_until_layer=clamp_until_layer,
+            clamp_mode=clamp_mode,
+            capture_layer_inputs=False,
+            capture_layer_outputs=False,
+        )
+        extras["encoded_node_states"] = encoded
+        extras["raw_output"] = pred
+        extras["readout_state_kind"] = "concat_input_and_all_gin_layers"
+        return ForwardCache(prediction=pred, final_node_states=readout_states, attention=None, channel_fields=None, extras=extras)
+
+    def patch_hidden_states(
+        self,
+        graph: GraphBatchView,
+        clamp_nodes: Sequence[int],
+        clean_cache: Optional[ForwardCache] = None,
+        clamp_until_layer: Optional[int] = None,
+        clamp_mode: str = "detach",
+    ) -> ForwardCache:
+        encoded = self.encoded_node_states(graph)
+        with torch.no_grad():
+            return self.patch_hidden_states_from_encoded_content(
+                graph,
+                encoded,
+                clamp_nodes,
+                clean_cache=clean_cache,
+                clamp_until_layer=clamp_until_layer,
+                clamp_mode=clamp_mode,
+                retain_grad=False,
+            )
+
+    def metadata(self) -> dict[str, Any]:
+        return {
+            "repo_path": str(self.repo_path),
+            "config_path": str(self.config_path),
+            "checkpoint_path": str(self.checkpoint_path),
+            "dataset_dir": str(self.dataset_dir) if self.dataset_dir is not None else None,
+            "device": str(self.device),
+            "parameter_count": self.parameter_count(),
+            "config": self._config_payload(),
+            "readout_state_kind": "concat_input_and_all_gin_layers",
+        }
+
+
 def parameter_count_close(a: ModelAdapter, b: ModelAdapter) -> tuple[bool, int, int]:
     pa = int(a.parameter_count())
     pb = int(b.parameter_count())

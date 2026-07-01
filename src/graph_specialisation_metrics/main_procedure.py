@@ -280,7 +280,17 @@ def discover_model_artifacts(model_name: str, model_cfg: Mapping[str, Any]) -> d
     configs = [Path(config_path)] if config_path else find_files(root, ["*.yaml", "*.yml", "config.json"])
     checkpoints = [Path(checkpoint_path)] if checkpoint_path else find_files(
         root,
-        ["*checkpoint*.pt", "*checkpoint*.pth", "*.ckpt", "best*.pt", "best*.pth", "model*.pt"],
+        [
+            "*checkpoint*.pt",
+            "*checkpoint*.pth",
+            "*checkpoint*.pkl",
+            "*state_dict*.pkl",
+            "*.ckpt",
+            "best*.pt",
+            "best*.pth",
+            "best*.pkl",
+            "model*.pt",
+        ],
     )
     stats = find_files(
         root,

@@ -24,7 +24,11 @@ import networkx as nx
 import numpy as np
 import torch
 
-from graph_specialisation_metrics.method_adapters import OfficialGRITAdapter, OfficialPyGGINAdapter
+from graph_specialisation_metrics.method_adapters import (
+    OfficialBenchmarkingGNNsGINAdapter,
+    OfficialGRITAdapter,
+    OfficialPyGGINAdapter,
+)
 from graph_specialisation_metrics.method_core import (
     EPS,
     all_pair_distances_or_compute,
@@ -455,7 +459,9 @@ def attention_profiles(cache: Any, dist: torch.Tensor, model: str) -> tuple[list
     tensors: dict[str, torch.Tensor] = {}
     if not cache.attention:
         return rows, tensors
+    first = cache.attention[0].detach().cpu().mean(dim=0)
     last = cache.attention[-1].detach().cpu().mean(dim=0)
+    tensors["attention_first"] = first
     tensors["attention_last"] = last
     for row in distance_profile(last.abs(), dist):
         rows.append({"model": model, "quantity": "attention_last", **row})
@@ -609,7 +615,7 @@ def attention_faithfulness_rows(
     d = dist.reshape(-1).numpy()
     finite = np.isfinite(d)
     for quantity, tensor in attention_tensors.items():
-        if quantity != "attention_last":
+        if quantity not in {"attention_first", "attention_last"}:
             continue
         a = tensor.abs().reshape(-1).numpy()
         far = finite & (d > tau)
@@ -706,6 +712,16 @@ def instantiate_official_models(config: Mapping[str, Any], discovery: Sequence[M
                 dataset_dir=Path(str(model_cfg["dataset_dir"])) if model_cfg.get("dataset_dir") else None,
                 device=device,
                 seed=seed,
+            )
+        elif adapter_kind in {"benchmarking_gnns_gin", "official_benchmarking_gnns_gin", "official_dgl_gin"}:
+            adapter = OfficialBenchmarkingGNNsGINAdapter(
+                repo_path=Path(str(model_cfg.get("repo_path", "external/benchmarking-gnns"))),
+                config_path=Path(str(model_cfg.get("config_path") or entry["config_candidates"][0])),
+                checkpoint_path=Path(str(model_cfg.get("checkpoint_path") or entry["checkpoint_candidates"][0])),
+                dataset_dir=Path(str(model_cfg["dataset_dir"])) if model_cfg.get("dataset_dir") else None,
+                device=device,
+                seed=seed,
+                official_commit=str(model_cfg.get("official_commit", "")) or None,
             )
         else:
             continue
@@ -1600,7 +1616,7 @@ def run_step2(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
                 )
                 tensors[f"step2/{model.name}/{gid}/swap_carriage"] = c_swap
                 profile_rows.extend(carriage_profile_rows(model.name, gid, c_swap, dist, "swap_carriage"))
-            if "attention_last" in attn_tensors:
+            if any(quantity in attn_tensors for quantity in ("attention_last", "attention_first")):
                 faith_rows.extend(attention_faithfulness_rows(model.name, gid, attn_tensors, c_ig, dist, tau, carriage_estimator="ig"))
                 if c_swap is not None:
                     faith_rows.extend(
@@ -1615,7 +1631,7 @@ def run_step2(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
                         )
                     )
                 for threshold in far_thresholds(config):
-                    for quantity in ["attention_last"]:
+                    for quantity in ["attention_last", "attention_first"]:
                         if quantity in attn_tensors:
                             threshold_rows.append(
                                 {
@@ -1652,6 +1668,15 @@ def run_step2(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
     render_attention_mean_distance(mean_distance_rows, artifact_root, dpi=dpi)
     render_attention_support_audit(support_rows, artifact_root, dpi=dpi)
     render_step2_faithfulness(faith_rows, artifact_root, dpi=dpi)
+    render_step2_faithfulness(
+        faith_rows,
+        artifact_root,
+        dpi=dpi,
+        attention_quantity="attention_first",
+        attention_label="first-layer attention",
+        faithfulness_stem="step2_first_layer_attention_faithfulness",
+        far_mass_stem="step2_far_mass_first_layer_attention_vs_carriage",
+    )
     final_channel_rows = [r for r in channel_rows if bool(r.get("headline_final_layer"))]
     render_distance_profile(final_channel_rows, artifact_root, "step2_channel_split_distance", "Step 2: final-layer carriage by channel and distance", dpi=dpi)
     render_layer_resolved_channel_split(channel_rows, artifact_root, dpi=dpi)
@@ -1663,7 +1688,7 @@ def run_step2(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
     return {
         "status": "complete" if not support_failures else "complete_with_attention_support_violations",
         "models": [m.name for m in models],
-        "attention_policy": "rollout_omitted_by_design; reads=last_layer_head_averaged_attention plus per_layer_attention_diagnostics; carries=carriage",
+        "attention_policy": "rollout_omitted_by_design; reads=last_layer_head_averaged_attention plus first_layer/per_layer_attention_diagnostics; carries=carriage",
         "profile_rows": len(profile_rows),
         "faithfulness_rows": len(faith_rows),
         "support_audit_rows": len(support_rows),
@@ -1914,7 +1939,17 @@ def render_head_resolved_carriage(rows: Sequence[Mapping[str, Any]], artifact_ro
     plt.close(fig)
 
 
-def render_step2_faithfulness(rows: Sequence[Mapping[str, Any]], artifact_root: Path, *, dpi: int) -> None:
+def render_step2_faithfulness(
+    rows: Sequence[Mapping[str, Any]],
+    artifact_root: Path,
+    *,
+    dpi: int,
+    attention_quantity: str = "attention_last",
+    attention_label: str = "last-layer attention",
+    faithfulness_stem: str = "step2_attention_faithfulness",
+    far_mass_stem: str = "step2_far_mass_attention_vs_carriage",
+) -> None:
+    rows = [r for r in rows if str(r.get("attention_quantity", "attention_last")) == attention_quantity]
     if not rows:
         return
     far_bins = sorted({str(r.get("distance_bin")) for r in rows if str(r.get("distance_bin", "")).startswith(">")})
@@ -1935,7 +1970,7 @@ def render_step2_faithfulness(rows: Sequence[Mapping[str, Any]], artifact_root: 
                         "model": model,
                         "carriage_estimator": estimator,
                         "attention_quantity": quantity,
-                        "label": f"{model} {quantity.replace('attention_', '')} vs {estimator}",
+                        "label": f"{model} {attention_label.replace(' attention', '')} vs {estimator}",
                         "spearman_overall": float(np.nanmean([safe_float(r["spearman"]) for r in overall])),
                         "spearman_far": float(np.nanmean([safe_float(r["spearman"]) for r in far])),
                         "attention_far_mass": float(np.nanmean([safe_float(r["attention_far_mass"]) for r in overall])),
@@ -1957,11 +1992,11 @@ def render_step2_faithfulness(rows: Sequence[Mapping[str, Any]], artifact_root: 
         ax.set_yticks(y)
         ax.set_yticklabels(labels, fontsize=7)
         ax.set_title(title)
-        ax.set_xlabel("Spearman(last-layer attention, |C|), per-molecule mean")
+        ax.set_xlabel(f"Spearman({attention_label}, |C|), per-molecule mean")
     figures = ensure_dir(artifact_root / "figures")
-    fig.suptitle("Step 2: last-layer attention faithfulness to carriage")
-    fig.savefig(figures / "step2_attention_faithfulness.png", dpi=dpi)
-    fig.savefig(figures / "step2_attention_faithfulness.pdf")
+    fig.suptitle(f"Step 2: {attention_label} faithfulness to carriage")
+    fig.savefig(figures / f"{faithfulness_stem}.png", dpi=dpi)
+    fig.savefig(figures / f"{faithfulness_stem}.pdf")
     plt.close(fig)
 
     fig, ax = plt.subplots(figsize=(6.8, 5.2), constrained_layout=True)
@@ -1969,20 +2004,19 @@ def render_step2_faithfulness(rows: Sequence[Mapping[str, Any]], artifact_root: 
         marker = "o" if str(r.get("carriage_estimator")) == "ig" else "s"
         ax.scatter([r["attention_far_mass"]], [r["carriage_far_mass"]], s=55, marker=marker, label=r["label"])
     ax.plot([0, 1], [0, 1], "--", color="#555555")
-    ax.set_title("Step 2: far-mass, last-layer attention vs carriage")
-    ax.set_xlabel(f"Last-layer attention far-mass ({far_text})")
+    ax.set_title(f"Step 2: far-mass, {attention_label} vs carriage")
+    ax.set_xlabel(f"{attention_label.capitalize()} far-mass ({far_text})")
     ax.set_ylabel(f"Carriage far-mass ({far_text})")
     ax.legend(frameon=False, fontsize=6, loc="best")
-    fig.savefig(figures / "step2_far_mass_attention_vs_carriage.png", dpi=dpi)
-    fig.savefig(figures / "step2_far_mass_attention_vs_carriage.pdf")
+    fig.savefig(figures / f"{far_mass_stem}.png", dpi=dpi)
+    fig.savefig(figures / f"{far_mass_stem}.pdf")
     plt.close(fig)
 
 def run_step3(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[str, Any]) -> dict[str, Any]:
     progress("Step 3 start: train/test distance-resolved overfitting")
-    dense_models = [m for m in models if m.name == "dense_grit"] or list(models[:1])
-    if not dense_models:
-        return {"status": "skipped_no_dense_grit"}
-    model = dense_models[0]
+    analysis_models = [m for m in models if "grit" in m.name.lower()] or list(models)
+    if not analysis_models:
+        return {"status": "skipped_no_models"}
     cfg = config["steps"]["3"]
     sample_graphs = int(cfg.get("sample_graphs", 200))
     ig_steps = int(config["perturbation"].get("ig_steps", 32))
@@ -1990,57 +2024,70 @@ def run_step3(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
     dpi = int(config["figures"]["dpi"])
     seed = int(config.get("seeds", [0])[0])
     rows: list[dict[str, Any]] = []
-    for split in ["train", "test"]:
-        graphs = select_graphs(model.adapter, split, sample_graphs, seed=seed)
-        progress(f"Step 3 {model.name}: selected {len(graphs)} {split} graph(s), IG steps={ig_steps}")
-        baseline = mean_encoded_baseline(model.adapter, graphs)
-        for graph_idx, graph in enumerate(graphs):
-            progress_graph("Step 3", model.name, graph_idx, len(graphs), split=split)
-            gid = graph_identity(split, graph_idx, graph)
-            dist = distance_matrix(graph)
-            c = carriage_ig(model.adapter, graph, baseline, steps=ig_steps, batched_vjp=batched_vjp)["carriage"]
-            for row in distance_profile(c.abs(), dist):
-                rows.append({"model": model.name, "split": split, "graph_id": gid, **row})
+    for model in analysis_models:
+        for split in ["train", "test"]:
+            graphs = select_graphs(model.adapter, split, sample_graphs, seed=seed)
+            progress(f"Step 3 {model.name}: selected {len(graphs)} {split} graph(s), IG steps={ig_steps}")
+            baseline = mean_encoded_baseline(model.adapter, graphs)
+            for graph_idx, graph in enumerate(graphs):
+                progress_graph("Step 3", model.name, graph_idx, len(graphs), split=split)
+                gid = graph_identity(split, graph_idx, graph)
+                dist = distance_matrix(graph)
+                c = carriage_ig(model.adapter, graph, baseline, steps=ig_steps, batched_vjp=batched_vjp)["carriage"]
+                for row in distance_profile(c.abs(), dist):
+                    rows.append({"model": model.name, "split": split, "graph_id": gid, **row})
     write_csv(artifact_root / "metrics" / "step3_train_test_profiles.csv", rows)
     gap_rows = train_test_gap_rows(rows, int(config.get("primary_tau", 3)))
     write_csv(artifact_root / "metrics" / "step3_train_minus_test_gap.csv", gap_rows)
     render_step3(rows, gap_rows, artifact_root, dpi=dpi)
     progress("Step 3 complete: metrics and figures written")
-    return {"status": "complete", "model": model.name, "profile_rows": len(rows)}
+    return {"status": "complete", "models": [m.name for m in analysis_models], "profile_rows": len(rows)}
 
 
 def train_test_gap_rows(rows: Sequence[Mapping[str, Any]], tau: int) -> list[dict[str, Any]]:
-    distances = sorted({int(safe_float(r["distance"])) for r in rows if math.isfinite(safe_float(r["distance"]))})
     out = []
-    for d in distances:
-        train = [safe_float(r["share"]) for r in rows if r.get("split") == "train" and int(safe_float(r["distance"])) == d]
-        test = [safe_float(r["share"]) for r in rows if r.get("split") == "test" and int(safe_float(r["distance"])) == d]
-        if train and test:
-            gap, lo, hi = bootstrap_gap_ci(train, test, seed=1000 + int(d))
+    for model in sorted({str(r.get("model")) for r in rows}):
+        model_rows = [r for r in rows if str(r.get("model")) == model]
+        distances = sorted({int(safe_float(r["distance"])) for r in model_rows if math.isfinite(safe_float(r["distance"]))})
+        for d in distances:
+            train = [
+                safe_float(r["share"])
+                for r in model_rows
+                if r.get("split") == "train" and int(safe_float(r["distance"])) == d
+            ]
+            test = [
+                safe_float(r["share"])
+                for r in model_rows
+                if r.get("split") == "test" and int(safe_float(r["distance"])) == d
+            ]
+            if train and test:
+                gap, lo, hi = bootstrap_gap_ci(train, test, seed=1000 + int(d) + 97 * len(out))
+                out.append(
+                    {
+                        "model": model,
+                        "distance": d,
+                        "train_share": float(np.nanmean(train)),
+                        "test_share": float(np.nanmean(test)),
+                        "gap": gap,
+                        "gap_ci_low": lo,
+                        "gap_ci_high": hi,
+                    }
+                )
+        far_train = [safe_float(r["share"]) for r in model_rows if r.get("split") == "train" and safe_float(r["distance"]) > tau]
+        far_test = [safe_float(r["share"]) for r in model_rows if r.get("split") == "test" and safe_float(r["distance"]) > tau]
+        if far_train and far_test:
+            gap, lo, hi = bootstrap_gap_ci(far_train, far_test, seed=2000 + int(tau) + 97 * len(out))
             out.append(
                 {
-                    "distance": d,
-                    "train_share": float(np.nanmean(train)),
-                    "test_share": float(np.nanmean(test)),
+                    "model": model,
+                    "distance": f">{tau}",
+                    "train_share": float(np.nanmean(far_train)),
+                    "test_share": float(np.nanmean(far_test)),
                     "gap": gap,
                     "gap_ci_low": lo,
                     "gap_ci_high": hi,
                 }
             )
-    far_train = [safe_float(r["share"]) for r in rows if r.get("split") == "train" and safe_float(r["distance"]) > tau]
-    far_test = [safe_float(r["share"]) for r in rows if r.get("split") == "test" and safe_float(r["distance"]) > tau]
-    if far_train and far_test:
-        gap, lo, hi = bootstrap_gap_ci(far_train, far_test, seed=2000 + int(tau))
-        out.append(
-            {
-                "distance": f">{tau}",
-                "train_share": float(np.nanmean(far_train)),
-                "test_share": float(np.nanmean(far_test)),
-                "gap": gap,
-                "gap_ci_low": lo,
-                "gap_ci_high": hi,
-            }
-        )
     return out
 
 
@@ -2063,7 +2110,7 @@ def bootstrap_gap_ci(train: Sequence[float], test: Sequence[float], *, seed: int
 
 def render_step3(rows: Sequence[Mapping[str, Any]], gap_rows: Sequence[Mapping[str, Any]], artifact_root: Path, *, dpi: int) -> None:
     render_distance_profile(
-        [{**r, "model": str(r["split"]), "quantity": "carriage"} for r in rows],
+        [{**r, "model": f"{r['model']} {r['split']}", "quantity": "carriage"} for r in rows],
         artifact_root,
         "step3_train_vs_test_carriage",
         "Step 3: carriage by distance, train vs test",
@@ -2071,18 +2118,21 @@ def render_step3(rows: Sequence[Mapping[str, Any]], gap_rows: Sequence[Mapping[s
     )
     numeric = [r for r in gap_rows if isinstance(r.get("distance"), int)]
     if numeric:
-        fig, ax = plt.subplots(figsize=(7.0, 4.4), constrained_layout=True)
-        x = np.asarray([safe_float(r["distance"]) for r in numeric], dtype=float)
-        y = np.asarray([safe_float(r["gap"]) for r in numeric], dtype=float)
-        lo = np.asarray([safe_float(r.get("gap_ci_low")) for r in numeric], dtype=float)
-        hi = np.asarray([safe_float(r.get("gap_ci_high")) for r in numeric], dtype=float)
-        err_low = np.maximum(0.0, y - lo)
-        err_high = np.maximum(0.0, hi - y)
-        ax.errorbar(x, y, yerr=np.vstack([err_low, err_high]), marker="o", capsize=3)
+        fig, ax = plt.subplots(figsize=(7.6, 4.6), constrained_layout=True)
+        for model in sorted({str(r.get("model")) for r in numeric}):
+            model_rows = sorted([r for r in numeric if str(r.get("model")) == model], key=lambda r: safe_float(r["distance"]))
+            x = np.asarray([safe_float(r["distance"]) for r in model_rows], dtype=float)
+            y = np.asarray([safe_float(r["gap"]) for r in model_rows], dtype=float)
+            lo = np.asarray([safe_float(r.get("gap_ci_low")) for r in model_rows], dtype=float)
+            hi = np.asarray([safe_float(r.get("gap_ci_high")) for r in model_rows], dtype=float)
+            err_low = np.maximum(0.0, y - lo)
+            err_high = np.maximum(0.0, hi - y)
+            ax.errorbar(x, y, yerr=np.vstack([err_low, err_high]), marker="o", capsize=3, label=model)
         ax.axhline(0, color="#555555", linestyle="--", linewidth=1)
         ax.set_title("Step 3: train-minus-test carriage gap")
         ax.set_xlabel("Molecular hop distance")
         ax.set_ylabel("Train share - test share")
+        ax.legend(frameon=False, fontsize=8)
         figures = ensure_dir(artifact_root / "figures")
         fig.savefig(figures / "step3_train_minus_test_gap.png", dpi=dpi)
         fig.savefig(figures / "step3_train_minus_test_gap.pdf")
