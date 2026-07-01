@@ -600,6 +600,7 @@ class OfficialGRITAdapter:
         clean_cache: Optional[ForwardCache] = None,
         clamp_nodes: Sequence[int] = (),
         clamp_until_layer: Optional[int] = None,
+        clamp_mode: str = "detach",
         retain_grad: bool = False,
         capture_attention: bool = True,
         capture_channels: bool = True,
@@ -622,10 +623,13 @@ class OfficialGRITAdapter:
         }
         handles: list[Any] = []
         clamp = torch.as_tensor(list(clamp_nodes), dtype=torch.long, device=self.device)
+        clamp_mode = str(clamp_mode or "detach").strip().lower()
+        if clamp_mode not in {"detach", "overwrite"}:
+            raise ValueError(f"unsupported clamp_mode={clamp_mode!r}; expected 'detach' or 'overwrite'")
         clean_inputs = None
         if clean_cache is not None and clean_cache.extras is not None:
             clean_inputs = clean_cache.extras.get("layer_input_node_states")
-        if clamp.numel() > 0 and clean_cache is not None and not clean_inputs:
+        if clamp_mode == "overwrite" and clamp.numel() > 0 and not clean_inputs:
             raise RuntimeError(
                 "mediator patching requested clamped nodes, but the clean GRIT cache "
                 "does not contain layer inputs; patching would be a no-op"
@@ -663,15 +667,15 @@ class OfficialGRITAdapter:
                         batch.x.retain_grad()
                     if capture_layer_inputs and batch.get("edge_attr", None) is not None:
                         captures["layer_input_edge_attr"].append(batch.edge_attr.detach().clone())
-                should_clamp = (
-                    clamp.numel() > 0
-                    and clean_inputs is not None
-                    and layer_idx < len(clean_inputs)
-                    and (clamp_until_layer is None or layer_idx <= int(clamp_until_layer))
-                )
+                should_clamp = clamp.numel() > 0 and (clamp_until_layer is None or layer_idx <= int(clamp_until_layer))
+                if clamp_mode == "overwrite":
+                    should_clamp = should_clamp and clean_inputs is not None and layer_idx < len(clean_inputs)
                 if should_clamp:
                     patched = batch.x.clone()
-                    patched[clamp] = clean_inputs[layer_idx].to(device=patched.device, dtype=patched.dtype)[clamp]
+                    if clamp_mode == "overwrite":
+                        patched[clamp] = clean_inputs[layer_idx].to(device=patched.device, dtype=patched.dtype)[clamp]
+                    else:
+                        patched[clamp] = patched[clamp].detach()
                     batch.x = patched
             return hook
 
@@ -935,6 +939,7 @@ class OfficialGRITAdapter:
         clamp_nodes: Sequence[int],
         clean_cache: Optional[ForwardCache] = None,
         clamp_until_layer: Optional[int] = None,
+        clamp_mode: str = "detach",
     ) -> ForwardCache:
         if clean_cache is None:
             clean_cache = self.forward(graph)
@@ -944,6 +949,7 @@ class OfficialGRITAdapter:
                 clean_cache=clean_cache,
                 clamp_nodes=clamp_nodes,
                 clamp_until_layer=clamp_until_layer,
+                clamp_mode=clamp_mode,
                 capture_attention=False,
                 capture_channels=False,
                 capture_layer_inputs=False,
@@ -957,6 +963,7 @@ class OfficialGRITAdapter:
         clamp_nodes: Sequence[int],
         clean_cache: Optional[ForwardCache] = None,
         clamp_until_layer: Optional[int] = None,
+        clamp_mode: str = "detach",
         retain_grad: bool = False,
     ) -> ForwardCache:
         if clean_cache is None:
@@ -967,6 +974,7 @@ class OfficialGRITAdapter:
             clean_cache=clean_cache,
             clamp_nodes=clamp_nodes,
             clamp_until_layer=clamp_until_layer,
+            clamp_mode=clamp_mode,
             retain_grad=retain_grad,
             capture_attention=False,
             capture_channels=False,
@@ -1058,6 +1066,411 @@ def make_pyg_adapter(
         ),
         device=device,
     )
+
+
+class PyGZINCGINRegressor(nn.Module):
+    """ZINC graph regressor built from PyG's official ``GINConv`` layer.
+
+    This is the local-reference model used by the dissertation method. It is
+    deliberately local: atom content is embedded once, messages follow molecular
+    bonds only, and there is no attention or global positional encoding.
+    """
+
+    def __init__(
+        self,
+        *,
+        num_atom_types: int = 32,
+        hidden_dim: int = 64,
+        layers: int = 5,
+        dropout: float = 0.0,
+        train_eps: bool = True,
+    ) -> None:
+        super().__init__()
+        try:
+            from torch_geometric.nn import GINConv, global_add_pool
+        except Exception as exc:  # pragma: no cover - depends on optional env.
+            raise RuntimeError("PyTorch Geometric is required for the official PyG GIN adapter") from exc
+        self.global_add_pool = global_add_pool
+        self.atom_encoder = nn.Embedding(int(num_atom_types), int(hidden_dim))
+        self.convs = nn.ModuleList()
+        self.norms = nn.ModuleList()
+        self.dropout = float(dropout)
+        for _ in range(int(layers)):
+            mlp = nn.Sequential(
+                nn.Linear(int(hidden_dim), int(hidden_dim)),
+                nn.ReLU(),
+                nn.Linear(int(hidden_dim), int(hidden_dim)),
+            )
+            self.convs.append(GINConv(mlp, train_eps=bool(train_eps)))
+            self.norms.append(nn.BatchNorm1d(int(hidden_dim)))
+        self.head = nn.Sequential(
+            nn.Linear(int(hidden_dim), int(hidden_dim)),
+            nn.ReLU(),
+            nn.Linear(int(hidden_dim), 1),
+        )
+
+    @staticmethod
+    def atom_index(x: torch.Tensor) -> torch.Tensor:
+        if x.dim() == 2 and x.size(-1) >= 1:
+            x = x[:, 0]
+        if x.dim() != 1:
+            raise ValueError(f"expected ZINC atom indices shaped [N] or [N,1], got {tuple(x.shape)}")
+        return x.long().view(-1).clamp_min(0)
+
+    def encode_atoms(self, x: torch.Tensor) -> torch.Tensor:
+        return self.atom_encoder(self.atom_index(x))
+
+    def forward_from_encoded(
+        self,
+        encoded: torch.Tensor,
+        edge_index: torch.Tensor,
+        batch: torch.Tensor,
+        *,
+        clamp_nodes: Sequence[int] = (),
+        clean_layer_inputs: Optional[Sequence[torch.Tensor]] = None,
+        clamp_until_layer: Optional[int] = None,
+        clamp_mode: str = "detach",
+        capture_layer_inputs: bool = False,
+        capture_layer_outputs: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
+        h = encoded
+        clamp = torch.as_tensor(list(clamp_nodes), dtype=torch.long, device=h.device)
+        clamp_mode = str(clamp_mode or "detach").strip().lower()
+        if clamp_mode not in {"detach", "overwrite"}:
+            raise ValueError(f"unsupported clamp_mode={clamp_mode!r}; expected 'detach' or 'overwrite'")
+        if clamp_mode == "overwrite" and clamp.numel() > 0 and clean_layer_inputs is None:
+            raise RuntimeError("overwrite clamp requires clean_layer_inputs")
+        extras: dict[str, Any] = {
+            "layer_input_node_states": [],
+            "layer_output_node_states": [],
+            "layer_output_node_state_tensors": [],
+        }
+        for layer_idx, (conv, norm) in enumerate(zip(self.convs, self.norms)):
+            if capture_layer_inputs:
+                extras["layer_input_node_states"].append(h.detach().clone())
+            should_clamp = clamp.numel() > 0 and (clamp_until_layer is None or layer_idx <= int(clamp_until_layer))
+            if should_clamp:
+                patched = h.clone()
+                if clamp_mode == "overwrite":
+                    assert clean_layer_inputs is not None
+                    if layer_idx >= len(clean_layer_inputs):
+                        raise RuntimeError(f"missing clean GIN layer input for layer {layer_idx}")
+                    patched[clamp] = clean_layer_inputs[layer_idx].to(device=patched.device, dtype=patched.dtype)[clamp]
+                else:
+                    patched[clamp] = patched[clamp].detach()
+                h = patched
+            h = conv(h, edge_index.long())
+            h = norm(h)
+            h = F.relu(h)
+            h = F.dropout(h, p=self.dropout, training=self.training)
+            if capture_layer_outputs:
+                extras["layer_output_node_states"].append(h.detach().clone())
+                extras["layer_output_node_state_tensors"].append(h)
+        pooled = self.global_add_pool(h, batch.long())
+        pred = self.head(pooled).view(-1)
+        return pred, h, extras
+
+    def forward(self, data: Any) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
+        batch = data.batch if hasattr(data, "batch") and data.batch is not None else torch.zeros(data.x.size(0), dtype=torch.long, device=data.x.device)
+        encoded = self.encode_atoms(data.x)
+        return self.forward_from_encoded(
+            encoded,
+            data.edge_index,
+            batch,
+            capture_layer_inputs=False,
+            capture_layer_outputs=False,
+        )
+
+
+@dataclass
+class OfficialPyGGINAdapter:
+    """Strict adapter for a trained PyG-GIN ZINC local reference.
+
+    It uses PyTorch Geometric's official ``GINConv`` layer and PyG's official
+    ZINC subset loader. The checkpoint is expected to come from the same local
+    reference architecture; this model is a validation anchor, not the
+    parameter-matched GRIT control.
+    """
+
+    config_path: Path
+    checkpoint_path: Path
+    dataset_dir: Optional[Path] = None
+    device: str | torch.device = "cpu"
+    seed: Optional[int] = None
+
+    def __post_init__(self) -> None:
+        self.config_path = Path(self.config_path)
+        self.checkpoint_path = Path(self.checkpoint_path)
+        self.dataset_dir = Path(self.dataset_dir) if self.dataset_dir is not None else None
+        self.device = torch.device(self.device)
+        self._model: Optional[nn.Module] = None
+        self.info = AdapterInfo(
+            name="pyg_gin_zinc",
+            version="pyg-official-ginconv-zinc.v1",
+            implementation="PyTorch Geometric official GINConv local ZINC reference",
+            official_repo="https://github.com/pyg-team/pytorch_geometric",
+            validation_only=False,
+            dev_only=False,
+        )
+        if not self.config_path.exists():
+            raise FileNotFoundError(f"missing PyG GIN config: {self.config_path}")
+        if not self.checkpoint_path.exists():
+            raise FileNotFoundError(f"missing PyG GIN checkpoint: {self.checkpoint_path}")
+
+    def _config_payload(self) -> dict[str, Any]:
+        try:
+            import yaml
+
+            with self.config_path.open("r", encoding="utf-8") as f:
+                payload = yaml.safe_load(f) or {}
+        except Exception:
+            with self.config_path.open("r", encoding="utf-8") as f:
+                payload = json.load(f)
+        if not isinstance(payload, dict):
+            raise RuntimeError(f"PyG GIN config must be a mapping: {self.config_path}")
+        return payload
+
+    def _model_cfg(self) -> dict[str, Any]:
+        payload = self._config_payload()
+        cfg = payload.get("model", payload.get("gin", payload))
+        return dict(cfg) if isinstance(cfg, dict) else {}
+
+    def _load_checkpoint_payload(self) -> Any:
+        try:
+            return torch.load(self.checkpoint_path, map_location="cpu", weights_only=False)
+        except TypeError:
+            return torch.load(self.checkpoint_path, map_location="cpu")
+
+    @staticmethod
+    def _extract_state_dict(payload: Any) -> dict[str, torch.Tensor]:
+        if isinstance(payload, nn.Module):
+            return payload.state_dict()
+        return OfficialGRITAdapter._extract_state_dict(payload)
+
+    def _build_model(self) -> PyGZINCGINRegressor:
+        cfg = self._model_cfg()
+        return PyGZINCGINRegressor(
+            num_atom_types=int(cfg.get("num_atom_types", cfg.get("atom_vocab_size", 32))),
+            hidden_dim=int(cfg.get("hidden_dim", cfg.get("dim_hidden", cfg.get("gnn_hidden_dim", 64)))),
+            layers=int(cfg.get("layers", cfg.get("num_layers", cfg.get("gnn_layers", 5)))),
+            dropout=float(cfg.get("dropout", 0.0)),
+            train_eps=bool(cfg.get("train_eps", True)),
+        )
+
+    def load_model(self) -> PyGZINCGINRegressor:
+        if self._model is not None:
+            return self._model  # type: ignore[return-value]
+        payload = self._load_checkpoint_payload()
+        if isinstance(payload, nn.Module):
+            model = payload
+        else:
+            model = self._build_model()
+            state = self._extract_state_dict(payload)
+            OfficialGRITAdapter._load_state_dict_into_model(model, state)
+        model = model.to(self.device)
+        model.eval()
+        self._model = model
+        return model  # type: ignore[return-value]
+
+    def parameter_count(self) -> int:
+        payload = self._load_checkpoint_payload()
+        if isinstance(payload, dict):
+            for key in ("parameter_count", "param_count", "num_parameters", "n_parameters"):
+                if key in payload:
+                    return int(payload[key])
+        model = self.load_model()
+        return sum(int(p.numel()) for p in model.parameters() if p.requires_grad)
+
+    @staticmethod
+    def _clone_pyg_data(data: Any) -> Any:
+        if hasattr(data, "clone"):
+            return data.clone()
+        import copy
+
+        return copy.deepcopy(data)
+
+    def _graph_to_data(self, graph: Any) -> Any:
+        try:
+            from torch_geometric.data import Data
+        except Exception as exc:  # pragma: no cover - depends on optional env.
+            raise RuntimeError("PyTorch Geometric is required for the official PyG GIN adapter") from exc
+        if isinstance(graph, GraphBatchView):
+            data = Data(x=graph.x, edge_index=graph.edge_index)
+            if graph.y is not None:
+                data.y = graph.y
+            if graph.batch is not None:
+                data.batch = graph.batch
+        else:
+            data = self._clone_pyg_data(graph)
+        if not hasattr(data, "batch") or data.batch is None:
+            data.batch = torch.zeros(int(data.x.size(0)), dtype=torch.long)
+        return data.to(self.device) if hasattr(data, "to") else data
+
+    def load_zinc_split(self, split: str, *, limit: Optional[int] = None) -> list[Any]:
+        try:
+            from torch_geometric.datasets import ZINC
+        except Exception as exc:  # pragma: no cover - depends on optional env.
+            raise RuntimeError("PyTorch Geometric is required to load the ZINC reference split") from exc
+        split_map = {"train": "train", "val": "val", "valid": "val", "validation": "val", "test": "test"}
+        if split not in split_map:
+            raise ValueError(f"unknown ZINC split {split!r}; expected train/val/test")
+        root = self.dataset_dir
+        if root is None:
+            payload = self._config_payload()
+            raw_root = payload.get("dataset_dir") or payload.get("data_dir") or payload.get("root")
+            root = Path(str(raw_root)) if raw_root else self.checkpoint_path.parent / "datasets"
+        dataset = ZINC(root=str(root), subset=True, split=split_map[split])
+        n = len(dataset) if limit is None else min(int(limit), len(dataset))
+        return [dataset[i] for i in range(n)]
+
+    def encoded_node_states(self, graph: Any) -> torch.Tensor:
+        model = self.load_model()
+        data = self._graph_to_data(graph)
+        with torch.no_grad():
+            encoded = model.encode_atoms(data.x)
+        return encoded.detach().clone()
+
+    def forward_from_encoded_content(
+        self,
+        graph: Any,
+        encoded_content: torch.Tensor,
+        *,
+        retain_grad: bool = False,
+        capture_attention: bool = False,
+        capture_channels: bool = False,
+        capture_layer_inputs: bool = False,
+        capture_layer_outputs: bool = False,
+    ) -> ForwardCache:
+        _ = capture_attention, capture_channels
+        model = self.load_model()
+        if retain_grad:
+            model.zero_grad(set_to_none=True)
+        data = self._graph_to_data(graph)
+        batch = data.batch if hasattr(data, "batch") and data.batch is not None else torch.zeros(data.x.size(0), dtype=torch.long, device=self.device)
+        encoded = encoded_content.to(device=self.device)
+        context = (
+            torch.no_grad()
+            if not retain_grad and not bool(getattr(encoded, "requires_grad", False))
+            else contextlib.nullcontext()
+        )
+        with context:
+            pred, final_states, extras = model.forward_from_encoded(
+                encoded,
+                data.edge_index,
+                batch,
+                capture_layer_inputs=capture_layer_inputs,
+                capture_layer_outputs=capture_layer_outputs,
+            )
+        extras["encoded_node_states"] = encoded
+        extras["raw_output"] = pred
+        return ForwardCache(prediction=pred, final_node_states=final_states, attention=None, channel_fields=None, extras=extras)
+
+    def forward_minimal(self, graph: Any) -> ForwardCache:
+        encoded = self.encoded_node_states(graph)
+        return self.forward_from_encoded_content(graph, encoded, retain_grad=False)
+
+    def forward(self, graph: GraphBatchView) -> ForwardCache:
+        return self.forward_minimal(graph)
+
+    def readout_gradient_from_encoded_content(
+        self,
+        graph: Any,
+        encoded_content: torch.Tensor,
+        *,
+        target_index: int = 0,
+        capture_attention: bool = False,
+        capture_channels: bool = False,
+        capture_layer_inputs: bool = False,
+        capture_layer_outputs: bool = False,
+    ) -> tuple[ForwardCache, torch.Tensor]:
+        cache = self.forward_from_encoded_content(
+            graph,
+            encoded_content,
+            retain_grad=True,
+            capture_attention=capture_attention,
+            capture_channels=capture_channels,
+            capture_layer_inputs=capture_layer_inputs,
+            capture_layer_outputs=capture_layer_outputs,
+        )
+        pred = cache.prediction.reshape(-1)[int(target_index)]
+        (grad,) = torch.autograd.grad(
+            pred,
+            cache.final_node_states,
+            retain_graph=False,
+            create_graph=False,
+            allow_unused=False,
+        )
+        return cache, grad.detach().clone()
+
+    def predict(self, graph: GraphBatchView) -> torch.Tensor:
+        return self.forward_minimal(graph).prediction
+
+    def attention_maps(self, graph: GraphBatchView) -> None:
+        return None
+
+    def patch_hidden_states_from_encoded_content(
+        self,
+        graph: Any,
+        encoded_content: torch.Tensor,
+        clamp_nodes: Sequence[int],
+        clean_cache: Optional[ForwardCache] = None,
+        clamp_until_layer: Optional[int] = None,
+        clamp_mode: str = "detach",
+        retain_grad: bool = False,
+    ) -> ForwardCache:
+        model = self.load_model()
+        if retain_grad:
+            model.zero_grad(set_to_none=True)
+        data = self._graph_to_data(graph)
+        batch = data.batch if hasattr(data, "batch") and data.batch is not None else torch.zeros(data.x.size(0), dtype=torch.long, device=self.device)
+        clean_inputs = None
+        if clean_cache is not None and clean_cache.extras is not None:
+            clean_inputs = clean_cache.extras.get("layer_input_node_states")
+        encoded = encoded_content.to(device=self.device)
+        pred, final_states, extras = model.forward_from_encoded(
+            encoded,
+            data.edge_index,
+            batch,
+            clamp_nodes=clamp_nodes,
+            clean_layer_inputs=clean_inputs,
+            clamp_until_layer=clamp_until_layer,
+            clamp_mode=clamp_mode,
+            capture_layer_inputs=False,
+            capture_layer_outputs=False,
+        )
+        extras["encoded_node_states"] = encoded
+        extras["raw_output"] = pred
+        return ForwardCache(prediction=pred, final_node_states=final_states, attention=None, channel_fields=None, extras=extras)
+
+    def patch_hidden_states(
+        self,
+        graph: GraphBatchView,
+        clamp_nodes: Sequence[int],
+        clean_cache: Optional[ForwardCache] = None,
+        clamp_until_layer: Optional[int] = None,
+        clamp_mode: str = "detach",
+    ) -> ForwardCache:
+        encoded = self.encoded_node_states(graph)
+        with torch.no_grad():
+            return self.patch_hidden_states_from_encoded_content(
+                graph,
+                encoded,
+                clamp_nodes,
+                clean_cache=clean_cache,
+                clamp_until_layer=clamp_until_layer,
+                clamp_mode=clamp_mode,
+                retain_grad=False,
+            )
+
+    def metadata(self) -> dict[str, Any]:
+        return {
+            "config_path": str(self.config_path),
+            "checkpoint_path": str(self.checkpoint_path),
+            "dataset_dir": str(self.dataset_dir) if self.dataset_dir is not None else None,
+            "device": str(self.device),
+            "parameter_count": self.parameter_count(),
+            "config": self._config_payload(),
+        }
 
 
 def parameter_count_close(a: ModelAdapter, b: ModelAdapter) -> tuple[bool, int, int]:

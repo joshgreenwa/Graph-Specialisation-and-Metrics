@@ -23,7 +23,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
-from graph_specialisation_metrics.method_adapters import OfficialGRITAdapter
+from graph_specialisation_metrics.method_adapters import OfficialGRITAdapter, OfficialPyGGINAdapter
 from graph_specialisation_metrics.method_core import (
     EPS,
     all_pair_distances_or_compute,
@@ -36,6 +36,7 @@ from graph_specialisation_metrics.method_core import (
     minimum_vertex_cut,
     r2_score,
     spearman_corr,
+    shortest_path_distance_matrix,
     top_singular_share,
     write_csv,
     write_json,
@@ -45,7 +46,7 @@ from graph_specialisation_metrics.method_core import (
 @dataclass
 class ModelRun:
     name: str
-    adapter: OfficialGRITAdapter
+    adapter: Any
     role: str
     variant: str
 
@@ -107,6 +108,15 @@ def pyg_graph_view(graph: Any):
 
 
 def distance_matrix(graph: Any) -> torch.Tensor:
+    """Return molecular hop distance, not GRIT structural/RRWP fields.
+
+    Official GRIT data objects may contain a ``distances`` tensor used by the
+    model preprocessing. The dissertation figures are explicitly by molecular
+    hop distance, so the canonical source is always the molecular ``edge_index``
+    when it is available.
+    """
+    if hasattr(graph, "edge_index") and isinstance(graph.edge_index, torch.Tensor):
+        return shortest_path_distance_matrix(pyg_graph_view(graph)).detach().cpu().float()
     if hasattr(graph, "distances") and isinstance(graph.distances, torch.Tensor):
         return graph.distances.detach().cpu().float()
     return all_pair_distances_or_compute(pyg_graph_view(graph)).cpu()
@@ -139,8 +149,37 @@ def split_seed_offset(split: str) -> int:
     return sum((idx + 1) * ord(ch) for idx, ch in enumerate(str(split)))
 
 
-def deterministic_partners(n: int, source: int, partners: int, seed: int) -> list[int]:
+def node_type_signatures(graph: Any) -> Optional[list[Any]]:
+    x = getattr(graph, "x", None)
+    if not isinstance(x, torch.Tensor) or x.ndim == 0:
+        return None
+    x_cpu = x.detach().cpu()
+    if x_cpu.ndim == 1:
+        return [int(v.item()) if float(v.item()).is_integer() else float(v.item()) for v in x_cpu]
+    if x_cpu.ndim == 2 and x_cpu.size(1) == 1:
+        return [int(v.item()) if float(v.item()).is_integer() else float(v.item()) for v in x_cpu[:, 0]]
+    signatures = []
+    for row in x_cpu:
+        values = row.tolist()
+        signatures.append(tuple(int(v) if float(v).is_integer() else float(v) for v in values))
+    return signatures
+
+
+def deterministic_partners(
+    n: int,
+    source: int,
+    partners: int,
+    seed: int,
+    *,
+    type_signatures: Optional[Sequence[Any]] = None,
+    require_different_type: bool = False,
+) -> list[int]:
     choices = [p for p in range(int(n)) if p != int(source)]
+    if require_different_type and type_signatures is not None and int(source) < len(type_signatures):
+        source_type = type_signatures[int(source)]
+        different = [p for p in choices if p < len(type_signatures) and type_signatures[p] != source_type]
+        if different:
+            choices = different
     rng = random.Random(int(seed) + int(source) * 1009)
     rng.shuffle(choices)
     return choices[: max(1, min(int(partners), len(choices)))]
@@ -162,6 +201,35 @@ def row_is_nontrivial(row: Mapping[str, Any], *, default: bool = True) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in {"true", "1", "yes", "y"}
     return bool(value)
+
+
+def weighted_direct_fraction(rows: Sequence[Mapping[str, Any]], *, seed: int, draws: int = 500) -> dict[str, Any]:
+    clean = [
+        r
+        for r in rows
+        if row_is_nontrivial(r)
+        and math.isfinite(safe_float(r.get("direct")))
+        and math.isfinite(safe_float(r.get("unclamped")))
+        and abs(safe_float(r.get("unclamped"))) > EPS
+    ]
+    if not clean:
+        return {"mean": float("nan"), "ci_low": float("nan"), "ci_high": float("nan"), "pairs": 0}
+
+    def ratio(items: Sequence[Mapping[str, Any]]) -> float:
+        numerator = sum(abs(safe_float(item.get("direct"))) for item in items)
+        denominator = sum(abs(safe_float(item.get("unclamped"))) for item in items)
+        return float(numerator / max(denominator, EPS))
+
+    point = ratio(clean)
+    if len(clean) < 2:
+        return {"mean": point, "ci_low": point, "ci_high": point, "pairs": len(clean)}
+    rng = np.random.default_rng(int(seed))
+    samples = []
+    for _ in range(int(draws)):
+        idx = rng.integers(0, len(clean), size=len(clean))
+        samples.append(ratio([clean[int(i)] for i in idx]))
+    lo, hi = np.percentile(np.asarray(samples, dtype=float), [2.5, 97.5])
+    return {"mean": point, "ci_low": float(lo), "ci_high": float(hi), "pairs": len(clean)}
 
 
 def r_nc_estimate(direct: torch.Tensor, dist: torch.Tensor, threshold: int) -> dict[str, Any]:
@@ -195,6 +263,10 @@ def far_thresholds(config: Mapping[str, Any]) -> list[int]:
 
 def carriage_ig_uses_batched_vjp(config: Mapping[str, Any]) -> bool:
     return bool(config.get("perturbation", {}).get("batched_vjp", True))
+
+
+def swap_partner_policy(config: Mapping[str, Any]) -> str:
+    return str(config.get("perturbation", {}).get("swap_partner_policy", "different_type")).strip().lower()
 
 
 def mean_encoded_baseline(adapter: OfficialGRITAdapter, graphs: Sequence[Any], *, max_graphs: int = 32) -> torch.Tensor:
@@ -346,6 +418,7 @@ def carriage_swap(
     *,
     partners: int,
     seed: int,
+    partner_policy: str = "different_type",
 ) -> torch.Tensor:
     n = int(clean_encoded.size(0))
     clean_cache = adapter.forward_from_encoded_content(graph, clean_encoded.to(adapter.device), retain_grad=False)
@@ -353,18 +426,26 @@ def carriage_swap(
     out = clean_encoded.new_zeros((n, n), device=adapter.device)
     encoded_device = clean_encoded.to(adapter.device)
     grad_device = readout_grad.to(adapter.device)
+    type_signatures = node_type_signatures(graph)
+    require_different_type = str(partner_policy).strip().lower() in {"different_type", "different-type", "different_atom_type"}
     for source in range(n):
-        choices = deterministic_partners(n, source, partners, seed)
-        sum_sq = clean_h.new_zeros(clean_h.shape)
+        choices = deterministic_partners(
+            n,
+            source,
+            partners,
+            seed,
+            type_signatures=type_signatures,
+            require_different_type=require_different_type,
+        )
+        sum_delta_h = clean_h.new_zeros(clean_h.shape)
         for partner in choices:
             pert = encoded_device.detach().clone()
             pert[source] = encoded_device[partner]
             cache = adapter.forward_from_encoded_content(graph, pert, retain_grad=False)
             delta_h = cache.final_node_states.detach() - clean_h
-            denom = torch.linalg.vector_norm(encoded_device[source] - encoded_device[partner]).clamp_min(EPS)
-            sum_sq += (delta_h / denom).pow(2)
-        rms_delta_h = torch.sqrt(sum_sq / float(len(choices)))
-        out[:, source] = (rms_delta_h * grad_device).sum(dim=-1)
+            sum_delta_h += delta_h
+        mean_delta_h = sum_delta_h / float(len(choices))
+        out[:, source] = (mean_delta_h * grad_device).sum(dim=-1)
     return out.detach().cpu()
 
 
@@ -585,7 +666,7 @@ def far_mass(matrix: torch.Tensor, dist: torch.Tensor, tau: int) -> float:
     return float(matrix.detach().abs()[mask].sum().item() / max(total, EPS))
 
 
-def select_graphs(adapter: OfficialGRITAdapter, split: str, sample_graphs: int, *, seed: int = 0) -> list[Any]:
+def select_graphs(adapter: Any, split: str, sample_graphs: int, *, seed: int = 0) -> list[Any]:
     graphs = adapter.load_zinc_split(split, limit=None)
     if int(sample_graphs) <= 0 or int(sample_graphs) >= len(graphs):
         return list(graphs)
@@ -601,22 +682,32 @@ def instantiate_official_models(config: Mapping[str, Any], discovery: Sequence[M
     device = str(config.get("device", "cuda" if torch.cuda.is_available() else "cpu"))
     seed = int(config.get("seeds", [0])[0])
     for entry in discovery:
-        if entry.get("adapter") != "official_grit":
-            continue
         if not entry.get("checkpoint_candidates") or not entry.get("config_candidates"):
             continue
         name = str(entry["model"])
         model_cfg = config["models"][name]
-        adapter = OfficialGRITAdapter(
-            repo_path=Path(str(model_cfg.get("repo_path", "external/GRIT"))),
-            config_path=Path(str(model_cfg.get("config_path") or entry["config_candidates"][0])),
-            checkpoint_path=Path(str(model_cfg.get("checkpoint_path") or entry["checkpoint_candidates"][0])),
-            variant=str(model_cfg.get("variant", name)),
-            official_commit=str(model_cfg.get("official_commit", "")) or None,
-            dataset_dir=Path(str(model_cfg["dataset_dir"])) if model_cfg.get("dataset_dir") else None,
-            device=device,
-            seed=seed,
-        )
+        adapter_kind = str(entry.get("adapter", model_cfg.get("adapter", ""))).strip().lower()
+        if adapter_kind == "official_grit":
+            adapter = OfficialGRITAdapter(
+                repo_path=Path(str(model_cfg.get("repo_path", "external/GRIT"))),
+                config_path=Path(str(model_cfg.get("config_path") or entry["config_candidates"][0])),
+                checkpoint_path=Path(str(model_cfg.get("checkpoint_path") or entry["checkpoint_candidates"][0])),
+                variant=str(model_cfg.get("variant", name)),
+                official_commit=str(model_cfg.get("official_commit", "")) or None,
+                dataset_dir=Path(str(model_cfg["dataset_dir"])) if model_cfg.get("dataset_dir") else None,
+                device=device,
+                seed=seed,
+            )
+        elif adapter_kind in {"pyg_gin", "official_pyg_gin"}:
+            adapter = OfficialPyGGINAdapter(
+                config_path=Path(str(model_cfg.get("config_path") or entry["config_candidates"][0])),
+                checkpoint_path=Path(str(model_cfg.get("checkpoint_path") or entry["checkpoint_candidates"][0])),
+                dataset_dir=Path(str(model_cfg["dataset_dir"])) if model_cfg.get("dataset_dir") else None,
+                device=device,
+                seed=seed,
+            )
+        else:
+            continue
         out.append(ModelRun(name=name, adapter=adapter, role=str(model_cfg.get("role", "")), variant=str(model_cfg.get("variant", ""))))
     return out
 
@@ -704,6 +795,7 @@ def run_step0(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
     ig_steps = int(config["perturbation"].get("ig_steps", 32))
     swap_partners = int(config["perturbation"].get("swap_partners", 8))
     batched_vjp = carriage_ig_uses_batched_vjp(config)
+    partner_policy = swap_partner_policy(config)
     seed = int(config.get("seeds", [0])[0])
     dpi = int(config["figures"]["dpi"])
     recon_rows: list[dict[str, Any]] = []
@@ -747,6 +839,7 @@ def run_step0(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
                 result["readout_gradient"],
                 partners=swap_partners,
                 seed=seed + graph_idx,
+                partner_policy=partner_policy,
             )
             tensors[f"step0/{model.name}/{gid}/carriage_ig"] = c_ig
             tensors[f"step0/{model.name}/{gid}/carriage_swap"] = c_swap
@@ -782,7 +875,15 @@ def run_step0(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
                 )
                 pred_vals.append(predicted)
                 measured_vals.append(measured)
-                for partner in deterministic_partners(c_ig.size(1), source, swap_partners, seed + graph_idx):
+                type_signatures = node_type_signatures(graph)
+                for partner in deterministic_partners(
+                    c_ig.size(1),
+                    source,
+                    swap_partners,
+                    seed + graph_idx,
+                    type_signatures=type_signatures,
+                    require_different_type=partner_policy in {"different_type", "different-type", "different_atom_type"},
+                ):
                     swap_pert = encoded.detach().clone()
                     swap_pert[source] = encoded[int(partner)]
                     swap_cache = model.adapter.forward_from_encoded_content(graph, swap_pert, retain_grad=False)
@@ -805,7 +906,14 @@ def run_step0(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
         model_sweep_rows, model_sweep_summary = step0_ig_step_sweep(model, graphs, baseline, cfg, seed=seed, batched_vjp=batched_vjp)
         sweep_rows.extend(model_sweep_rows)
         sweep_summary_rows.extend(model_sweep_summary)
-        model_matched_rows, model_matched_summary = step0_matched_swap_target(model, graphs, baseline, cfg, seed=seed)
+        model_matched_rows, model_matched_summary = step0_matched_swap_target(
+            model,
+            graphs,
+            baseline,
+            cfg,
+            seed=seed,
+            partner_policy=partner_policy,
+        )
         matched_rows.extend(model_matched_rows)
         matched_summary_rows.extend(model_matched_summary)
         finite_rows = [r for r in recon_rows if r.get("model") == model.name and r.get("perturbation") == "finite_content_swap"]
@@ -1038,6 +1146,7 @@ def step0_matched_swap_target(
     cfg: Mapping[str, Any],
     *,
     seed: int,
+    partner_policy: str = "different_type",
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     matched_steps = int(cfg.get("matched_target_ig_steps", 0))
     sources_per_graph = int(cfg.get("matched_target_sources_per_graph", 0))
@@ -1056,8 +1165,17 @@ def step0_matched_swap_target(
         sources = list(range(encoded.size(0)))
         rng = random.Random(int(seed) + 7919 * (graph_idx + 1))
         rng.shuffle(sources)
+        type_signatures = node_type_signatures(graph)
+        require_different_type = partner_policy in {"different_type", "different-type", "different_atom_type"}
         for source in sources[: min(sources_per_graph, len(sources))]:
-            partners = deterministic_partners(encoded.size(0), source, partners_per_source, seed + 3571 * graph_idx)
+            partners = deterministic_partners(
+                encoded.size(0),
+                source,
+                partners_per_source,
+                seed + 3571 * graph_idx,
+                type_signatures=type_signatures,
+                require_different_type=require_different_type,
+            )
             for partner in partners:
                 endpoint = encoded.detach().clone()
                 endpoint[int(source)] = encoded[int(partner)]
@@ -1358,6 +1476,54 @@ def render_attention_mean_distance(rows: Sequence[Mapping[str, Any]], artifact_r
     plt.close(fig)
 
 
+def render_attention_support_audit(rows: Sequence[Mapping[str, Any]], artifact_root: Path, *, dpi: int) -> None:
+    clean = [
+        r
+        for r in rows
+        if math.isfinite(safe_float(r.get("layer")))
+        and math.isfinite(safe_float(r.get("max_direct_attention_distance")))
+        and math.isfinite(safe_float(r.get("direct_attention_mass_distance_gt1")))
+    ]
+    if not clean:
+        return
+    grouped: dict[tuple[str, int], list[Mapping[str, Any]]] = {}
+    for row in clean:
+        grouped.setdefault((str(row.get("model")), int(safe_float(row.get("layer")))), []).append(row)
+    summary: dict[str, list[dict[str, float]]] = {}
+    for (model, layer), items in grouped.items():
+        max_distance_values = [safe_float(r.get("max_direct_attention_distance")) for r in items]
+        far_mass_values = [safe_float(r.get("direct_attention_mass_distance_gt1")) for r in items]
+        summary.setdefault(model, []).append(
+            {
+                "layer": float(layer),
+                "max_distance": float(np.nanmax(max_distance_values)),
+                "far_mass": float(np.nanmean(far_mass_values)),
+            }
+        )
+    fig, axes = plt.subplots(1, 2, figsize=(10.5, 4.2), constrained_layout=True)
+    for model, items in sorted(summary.items()):
+        items = sorted(items, key=lambda r: safe_float(r["layer"]))
+        x = np.asarray([safe_float(r["layer"]) for r in items], dtype=float)
+        max_distance = np.asarray([safe_float(r["max_distance"]) for r in items], dtype=float)
+        far_mass = np.asarray([safe_float(r["far_mass"]) for r in items], dtype=float)
+        axes[0].plot(x, max_distance, marker="o", linewidth=1.5, label=model)
+        axes[1].plot(x, far_mass, marker="o", linewidth=1.5, label=model)
+    axes[0].axhline(1.0, color="#555555", linestyle="--", linewidth=1, label="1-hop limit")
+    axes[0].set_title("Direct attention support")
+    axes[0].set_xlabel("GRIT attention layer")
+    axes[0].set_ylabel("Max molecular hop distance")
+    axes[1].axhline(0.0, color="#555555", linestyle="--", linewidth=1, label="1-hop expected")
+    axes[1].set_title("Non-local direct attention mass")
+    axes[1].set_xlabel("GRIT attention layer")
+    axes[1].set_ylabel("Mass at distance > 1")
+    for ax in axes:
+        ax.legend(frameon=False, fontsize=8)
+    figures = ensure_dir(artifact_root / "figures")
+    fig.savefig(figures / "step2_attention_support_audit.png", dpi=dpi)
+    fig.savefig(figures / "step2_attention_support_audit.pdf")
+    plt.close(fig)
+
+
 def run_step2(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[str, Any]) -> dict[str, Any]:
     progress("Step 2 start: usage vs causal usage")
     cfg = config["steps"]["2"]
@@ -1365,6 +1531,7 @@ def run_step2(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
     ig_steps = int(config["perturbation"].get("ig_steps", 32))
     swap_partners = int(config["perturbation"].get("swap_partners", 8))
     batched_vjp = carriage_ig_uses_batched_vjp(config)
+    partner_policy = swap_partner_policy(config)
     include_swap_attention_check = bool(cfg.get("compare_attention_to_swaps", True))
     run_layer_channel_split = bool(cfg.get("run_layer_channel_split", True))
     tau = int(config.get("primary_tau", 3))
@@ -1428,6 +1595,7 @@ def run_step2(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
                     result["readout_gradient"].to(model.adapter.device),
                     partners=swap_partners,
                     seed=seed + 1009 * graph_idx,
+                    partner_policy=partner_policy,
                 )
                 tensors[f"step2/{model.name}/{gid}/swap_carriage"] = c_swap
                 profile_rows.extend(carriage_profile_rows(model.name, gid, c_swap, dist, "swap_carriage"))
@@ -1464,6 +1632,8 @@ def run_step2(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
     write_csv(artifact_root / "metrics" / "step2_attention_faithfulness.csv", faith_rows)
     write_csv(artifact_root / "metrics" / "step2_far_threshold_sensitivity.csv", threshold_rows)
     write_csv(artifact_root / "metrics" / "step2_channel_split.csv", channel_rows)
+    head_rows = [r for r in channel_rows if str(r.get("quantity")) == "head_far_carriage"]
+    write_csv(artifact_root / "metrics" / "step2_head_resolved_carriage.csv", head_rows)
     write_csv(artifact_root / "metrics" / "step2_attention_support_audit.csv", support_rows)
     write_csv(artifact_root / "metrics" / "step2_attention_mean_distance.csv", mean_distance_rows)
     atomic_torch_save(artifact_root / "tensors" / "step2_usage_carriage.pt", tensors)
@@ -1479,10 +1649,12 @@ def run_step2(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
     )
     render_step2_profiles(profile_rows, artifact_root, dpi=dpi)
     render_attention_mean_distance(mean_distance_rows, artifact_root, dpi=dpi)
+    render_attention_support_audit(support_rows, artifact_root, dpi=dpi)
     render_step2_faithfulness(faith_rows, artifact_root, dpi=dpi)
     final_channel_rows = [r for r in channel_rows if bool(r.get("headline_final_layer"))]
     render_distance_profile(final_channel_rows, artifact_root, "step2_channel_split_distance", "Step 2: final-layer carriage by channel and distance", dpi=dpi)
     render_layer_resolved_channel_split(channel_rows, artifact_root, dpi=dpi)
+    render_head_resolved_carriage(head_rows, artifact_root, dpi=dpi)
     if support_failures:
         progress(f"Step 2 completed with {len(support_failures)} attention-support audit violation row(s)")
     else:
@@ -1493,6 +1665,7 @@ def run_step2(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
         "profile_rows": len(profile_rows),
         "faithfulness_rows": len(faith_rows),
         "support_audit_rows": len(support_rows),
+        "head_resolved_rows": len(head_rows),
         "attention_mean_distance_rows": len(mean_distance_rows),
         "attention_support_violations": len(support_failures),
     }
@@ -1531,6 +1704,7 @@ def layer_channel_split_rows(model: ModelRun, graph: Any, result: Mapping[str, A
         layer_idx: {"routing": torch.zeros((n, n)), "transport": torch.zeros((n, n)), "cross": torch.zeros((n, n))}
         for layer_idx in range(len(clean_layers))
     }
+    head_masses_by_layer: dict[int, dict[int, torch.Tensor]] = {}
     for source in range(n):
         pert = encoded.detach().clone()
         pert[source] = baseline[source]
@@ -1571,16 +1745,39 @@ def layer_channel_split_rows(model: ModelRun, graph: Any, result: Mapping[str, A
                 routing_vec = (clean_msg[e] * da[e].view(-1, 1)).reshape(-1)
                 transport_vec = (dv[e] * attn[e].view(-1, 1)).reshape(-1)
                 cross_vec = (dv[e] * da[e].view(-1, 1)).reshape(-1)
+                heads = int(clean_msg.size(1))
+                head_dim = int(clean_msg.size(2))
+                if layer_idx not in head_masses_by_layer:
+                    head_masses_by_layer[layer_idx] = {head: torch.zeros((n, n)) for head in range(heads)}
                 g = grad[receiver].reshape(-1)
                 if g.numel() == routing_vec.numel():
                     masses_by_layer[layer_idx]["routing"][receiver, source] += float(torch.dot(g, routing_vec).detach().cpu().item())
                     masses_by_layer[layer_idx]["transport"][receiver, source] += float(torch.dot(g, transport_vec).detach().cpu().item())
                     masses_by_layer[layer_idx]["cross"][receiver, source] += float(torch.dot(g, cross_vec).detach().cpu().item())
+                    g_heads = g.view(heads, head_dim)
+                    for head in range(heads):
+                        head_vec = (
+                            clean_msg[e, head] * da[e, head]
+                            + dv[e, head] * attn[e, head]
+                            + dv[e, head] * da[e, head]
+                        )
+                        head_masses_by_layer[layer_idx][head][receiver, source] += float(
+                            torch.dot(g_heads[head], head_vec).detach().cpu().item()
+                        )
                 else:
                     # Fallback if GRIT's output projection changes hidden shape.
                     masses_by_layer[layer_idx]["routing"][receiver, source] += float(torch.linalg.vector_norm(routing_vec).detach().cpu().item())
                     masses_by_layer[layer_idx]["transport"][receiver, source] += float(torch.linalg.vector_norm(transport_vec).detach().cpu().item())
                     masses_by_layer[layer_idx]["cross"][receiver, source] += float(torch.linalg.vector_norm(cross_vec).detach().cpu().item())
+                    for head in range(heads):
+                        head_vec = (
+                            clean_msg[e, head] * da[e, head]
+                            + dv[e, head] * attn[e, head]
+                            + dv[e, head] * da[e, head]
+                        )
+                        head_masses_by_layer[layer_idx][head][receiver, source] += float(
+                            torch.linalg.vector_norm(head_vec).detach().cpu().item()
+                        )
     rows: list[dict[str, Any]] = []
     for layer_idx, masses in masses_by_layer.items():
         for quantity, matrix in masses.items():
@@ -1598,6 +1795,25 @@ def layer_channel_split_rows(model: ModelRun, graph: Any, result: Mapping[str, A
                     "distance": f">{tau}",
                     "mass": float(matrix.abs()[torch.isfinite(dist) & (dist > tau)].sum().item()),
                     "share": far_mass(matrix, dist, tau),
+                }
+            )
+    far_mask = torch.isfinite(dist) & (dist > tau)
+    for layer_idx, by_head in sorted(head_masses_by_layer.items()):
+        total_far = sum(float(matrix.abs()[far_mask].sum().item()) for matrix in by_head.values())
+        for head, matrix in sorted(by_head.items()):
+            head_far = float(matrix.abs()[far_mask].sum().item())
+            rows.append(
+                {
+                    "model": model.name,
+                    "graph_id": graph_id,
+                    "quantity": "head_far_carriage",
+                    "layer": layer_idx,
+                    "headline_final_layer": layer_idx == last_layer,
+                    "head": int(head),
+                    "distance": f">{tau}",
+                    "mass": head_far,
+                    "share": head_far / max(total_far, EPS),
+                    "far_mass_within_head": far_mass(matrix, dist, tau),
                 }
             )
     return rows
@@ -1649,6 +1865,50 @@ def render_layer_resolved_channel_split(rows: Sequence[Mapping[str, Any]], artif
     figures = ensure_dir(artifact_root / "figures")
     fig.savefig(figures / "step2_layer_resolved_channel_split.png", dpi=dpi)
     fig.savefig(figures / "step2_layer_resolved_channel_split.pdf")
+    plt.close(fig)
+
+
+def render_head_resolved_carriage(rows: Sequence[Mapping[str, Any]], artifact_root: Path, *, dpi: int) -> None:
+    final_rows = [
+        r
+        for r in rows
+        if bool(r.get("headline_final_layer"))
+        and str(r.get("quantity")) == "head_far_carriage"
+        and math.isfinite(safe_float(r.get("head")))
+        and math.isfinite(safe_float(r.get("mass")))
+    ]
+    if not final_rows:
+        return
+    models = sorted({str(r.get("model")) for r in final_rows})
+    heads = sorted({int(safe_float(r.get("head"))) for r in final_rows})
+    if not models or not heads:
+        return
+    x = np.arange(len(heads), dtype=float)
+    width = min(0.8 / max(1, len(models)), 0.35)
+    fig, ax = plt.subplots(figsize=(8.2, 4.8), constrained_layout=True)
+    for model_idx, model in enumerate(models):
+        masses = []
+        for head in heads:
+            vals = [
+                safe_float(r.get("mass"))
+                for r in final_rows
+                if str(r.get("model")) == model and int(safe_float(r.get("head"))) == head
+            ]
+            vals = [v for v in vals if math.isfinite(v)]
+            masses.append(float(np.nansum(vals)) if vals else 0.0)
+        total = max(float(np.nansum(masses)), EPS)
+        values = [v / total for v in masses]
+        offset = (model_idx - (len(models) - 1) / 2.0) * width
+        ax.bar(x + offset, values, width=width, label=model)
+    ax.set_title("Which heads carry the long-range signal: far carriage by attention head")
+    ax.set_xlabel("Final GRIT attention head")
+    ax.set_ylabel("Share of final-layer far channel carriage")
+    ax.set_xticks(x)
+    ax.set_xticklabels([str(head) for head in heads])
+    ax.legend(frameon=False, fontsize=8)
+    figures = ensure_dir(artifact_root / "figures")
+    fig.savefig(figures / "step2_head_resolved_far_carriage.png", dpi=dpi)
+    fig.savefig(figures / "step2_head_resolved_far_carriage.pdf")
     plt.close(fig)
 
 
@@ -1875,6 +2135,7 @@ def patched_ig_pair(
     clamp_nodes: Sequence[int],
     steps: int,
     clamp_until_layer: Optional[int] = None,
+    clamp_mode: str = "detach",
     clean_encoded_override: Optional[torch.Tensor] = None,
     baseline_override: Optional[torch.Tensor] = None,
 ) -> float:
@@ -1900,6 +2161,7 @@ def patched_ig_pair(
             clamp_nodes=clamp_nodes,
             clean_cache=clean_cache,
             clamp_until_layer=clamp_until_layer,
+            clamp_mode=clamp_mode,
             retain_grad=False,
         )
         scalar = (cache.final_node_states[int(carrier)] * readout_grad.to(adapter.device)[int(carrier)]).sum()
@@ -1915,6 +2177,7 @@ def run_step4(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
     max_pairs = optional_pair_limit(cfg.get("max_far_pairs_per_graph", 64), 64)
     depth_pairs = int(cfg.get("depth_pairs_per_graph", 8))
     min_effect_abs = float(cfg.get("min_effect_abs", 1.0e-6))
+    clamp_mode = str(cfg.get("clamp_mode", "detach")).strip().lower()
     run_clamp_negative_control = bool(cfg.get("run_clamp_negative_control", True))
     composed_reference_max_direct_fraction = float(cfg.get("composed_reference_max_direct_fraction", 0.20))
     tau = int(config.get("primary_tau", 3))
@@ -1981,6 +2244,7 @@ def run_step4(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
                     source=source,
                     clamp_nodes=cut,
                     steps=ig_steps,
+                    clamp_mode=clamp_mode,
                     clean_encoded_override=clean_encoded,
                     baseline_override=base_encoded,
                 )
@@ -1997,6 +2261,7 @@ def run_step4(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
                         "distance": float(dist[carrier, source].item()),
                         "cut_size": len(cut),
                         "clamp_nodes": ",".join(str(v) for v in cut),
+                        "clamp_mode": clamp_mode,
                         "unclamped": unclamped,
                         "direct": direct,
                         "composed": unclamped - direct,
@@ -2025,6 +2290,7 @@ def run_step4(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
                             source=source,
                             clamp_nodes=[off_path],
                             steps=ig_steps,
+                            clamp_mode=clamp_mode,
                             clean_encoded_override=clean_encoded,
                             baseline_override=base_encoded,
                         )
@@ -2043,6 +2309,7 @@ def run_step4(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
                                 "distance": float(dist[carrier, source].item()),
                                 "cut_size": 1,
                                 "clamp_nodes": str(off_path),
+                                "clamp_mode": clamp_mode,
                                 "unclamped": unclamped,
                                 "direct": control_direct,
                                 "composed": unclamped - control_direct,
@@ -2066,6 +2333,7 @@ def run_step4(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
                             clamp_nodes=cut,
                             steps=ig_steps,
                             clamp_until_layer=layer,
+                            clamp_mode=clamp_mode,
                             clean_encoded_override=clean_encoded,
                             baseline_override=base_encoded,
                         )
@@ -2082,6 +2350,7 @@ def run_step4(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
                                 "source": source,
                                 "distance": float(dist[carrier, source].item()),
                                 "clamp_until_layer": layer,
+                                "clamp_mode": clamp_mode,
                                 "direct": depth_direct,
                                 "direct_fraction": depth_fraction,
                                 "effect_abs": abs(unclamped),
@@ -2102,7 +2371,7 @@ def run_step4(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
     composed_reference_failures = [
         dict(row)
         for row in validation_summary
-        if "1hop" in str(row.get("model", "")).lower()
+        if is_composed_reference_model(str(row.get("model", "")), models)
         and math.isfinite(safe_float(row.get("mean_direct_fraction")))
         and safe_float(row.get("mean_direct_fraction")) > composed_reference_max_direct_fraction
     ]
@@ -2120,30 +2389,39 @@ def run_step4(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
         "analytic_patching_check": analytic_patching_check,
         "composed_reference_failures": composed_reference_failures,
         "composed_reference_max_direct_fraction": composed_reference_max_direct_fraction,
+        "clamp_mode": clamp_mode,
     }
+
+
+def is_composed_reference_model(model_name: str, models: Sequence[ModelRun]) -> bool:
+    lowered = str(model_name).lower()
+    if "1hop" in lowered or "gin" in lowered or "gcn" in lowered:
+        return True
+    model = next((m for m in models if m.name == model_name), None)
+    return bool(model is not None and "validation_reference" in str(model.role))
 
 
 def mediator_validation_summary(rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
     out = []
     for model in sorted(set(str(r.get("model")) for r in rows)):
-        vals = [
-            safe_float(r.get("direct_fraction"))
+        model_rows = [
+            r
             for r in rows
             if str(r.get("model")) == model
             and str(r.get("clamp_type", "cut")) == "cut"
             and row_is_nontrivial(r)
         ]
-        vals = [v for v in vals if math.isfinite(v)]
-        if not vals:
+        stats = weighted_direct_fraction(model_rows, seed=3000 + len(out), draws=500)
+        if int(stats.get("pairs", 0)) <= 0:
             continue
-        mean, lo, hi = bootstrap_ci(vals, seed=3000 + len(out), draws=500)
         out.append(
             {
                 "model": model,
-                "mean_direct_fraction": mean,
-                "ci_low": lo,
-                "ci_high": hi,
-                "pairs": len(vals),
+                "mean_direct_fraction": stats["mean"],
+                "ci_low": stats["ci_low"],
+                "ci_high": stats["ci_high"],
+                "pairs": stats["pairs"],
+                "aggregation": "carriage_weighted",
                 "validation_role": "secondary_composed_reference" if "1hop" in model else "treatment_context",
             }
         )
@@ -2155,25 +2433,25 @@ def clamp_negative_control_summary(rows: Sequence[Mapping[str, Any]]) -> list[di
     clamp_types = ["cut", "random_off_path"]
     for model in sorted(set(str(r.get("model")) for r in rows)):
         for clamp_type in clamp_types:
-            vals = [
-                safe_float(r.get("direct_fraction"))
+            model_rows = [
+                r
                 for r in rows
                 if str(r.get("model")) == model
                 and str(r.get("clamp_type", "cut")) == clamp_type
                 and row_is_nontrivial(r)
             ]
-            vals = [v for v in vals if math.isfinite(v)]
-            if not vals:
+            stats = weighted_direct_fraction(model_rows, seed=3700 + len(out), draws=500)
+            if int(stats.get("pairs", 0)) <= 0:
                 continue
-            mean, lo, hi = bootstrap_ci(vals, seed=3700 + len(out), draws=500)
             out.append(
                 {
                     "model": model,
                     "clamp_type": clamp_type,
-                    "mean_direct_fraction": mean,
-                    "ci_low": lo,
-                    "ci_high": hi,
-                    "pairs": len(vals),
+                    "mean_direct_fraction": stats["mean"],
+                    "ci_low": stats["ci_low"],
+                    "ci_high": stats["ci_high"],
+                    "pairs": stats["pairs"],
+                    "aggregation": "carriage_weighted",
                 }
             )
     return out
@@ -2216,7 +2494,7 @@ def render_step4_clamp_negative_control(rows: Sequence[Mapping[str, Any]], artif
     ax.axhline(1.0, color="#555555", linestyle="--", linewidth=1, label="No effect from clamp")
     ax.set_title("Step 4: clamp negative control")
     ax.set_xlabel("Model")
-    ax.set_ylabel("Direct fraction = |C^clamp| / |C^unclamp|")
+    ax.set_ylabel("Carriage-weighted direct fraction")
     ax.set_xticks(x)
     ax.set_xticklabels(models, rotation=15, ha="right")
     ax.legend(frameon=False, fontsize=8)
@@ -2244,7 +2522,7 @@ def render_step4(
         ax.axhline(0, color="#555555", linewidth=1)
         ax.set_title("Mediator-patching instrument check (composed reference must be ≈ 0)")
         ax.set_xlabel("Model")
-        ax.set_ylabel("Mean direct fraction = |C^clamp| / |C^unclamp|")
+        ax.set_ylabel("Carriage-weighted direct fraction")
         for tick in ax.get_xticklabels():
             tick.set_rotation(20)
             tick.set_ha("right")
@@ -2291,6 +2569,60 @@ def render_step4(
         fig.savefig(figures / "step4_depth_resolved_direct_carriage.png", dpi=dpi)
         fig.savefig(figures / "step4_depth_resolved_direct_carriage.pdf")
         plt.close(fig)
+        render_step4_depth_by_distance(depth_rows, artifact_root, dpi=dpi)
+
+
+def depth_distance_band(distance: float) -> str:
+    if not math.isfinite(distance):
+        return "unknown"
+    d = int(round(float(distance)))
+    if d <= 6:
+        return f"d={d}"
+    return "d>=7"
+
+
+def render_step4_depth_by_distance(rows: Sequence[Mapping[str, Any]], artifact_root: Path, *, dpi: int) -> None:
+    clean_rows = [
+        r
+        for r in rows
+        if row_is_nontrivial(r)
+        and math.isfinite(safe_float(r.get("direct_fraction")))
+        and math.isfinite(safe_float(r.get("clamp_until_layer")))
+        and math.isfinite(safe_float(r.get("distance")))
+    ]
+    if not clean_rows:
+        return
+    models = sorted({str(r.get("model")) for r in clean_rows})
+    if not models:
+        return
+    fig, axes = plt.subplots(
+        1,
+        len(models),
+        figsize=(max(5.6, 4.4 * len(models)), 4.8),
+        constrained_layout=True,
+        squeeze=False,
+    )
+    for ax, model in zip(axes[0], models):
+        model_rows = [r for r in clean_rows if str(r.get("model")) == model]
+        grouped: dict[tuple[str, int], list[float]] = {}
+        for row in model_rows:
+            band = depth_distance_band(safe_float(row.get("distance")))
+            layer = int(safe_float(row.get("clamp_until_layer")))
+            grouped.setdefault((band, layer), []).append(safe_float(row.get("direct_fraction")))
+        bands = sorted({band for band, _ in grouped}, key=lambda b: (99 if ">=" in b else int(b.split("=")[1])))
+        for band in bands:
+            layers = sorted(layer for b, layer in grouped if b == band)
+            y = [float(np.nanmean(grouped[(band, layer)])) for layer in layers]
+            ax.plot(layers, y, marker="o", linewidth=1.4, label=band)
+        ax.set_title(model)
+        ax.set_xlabel("Clamp through layer")
+        ax.set_ylabel("Direct fraction = |C^clamp| / |C^unclamp|")
+        ax.legend(frameon=False, fontsize=8)
+    fig.suptitle("How reach is built: surviving direct carriage vs clamp depth, by hop distance")
+    figures = ensure_dir(artifact_root / "figures")
+    fig.savefig(figures / "step4_depth_resolved_direct_carriage_by_distance.png", dpi=dpi)
+    fig.savefig(figures / "step4_depth_resolved_direct_carriage_by_distance.pdf")
+    plt.close(fig)
 
 
 def run_step5(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[str, Any]) -> dict[str, Any]:
@@ -2304,6 +2636,8 @@ def run_step5(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
     max_pairs = optional_pair_limit(cfg.get("max_far_pairs_per_graph", config["steps"]["4"].get("max_far_pairs_per_graph", 64)), 64)
     interaction_pairs = int(cfg.get("interaction_pairs", 1000))
     min_effect_abs = float(cfg.get("min_effect_abs", 1.0e-6))
+    clamp_mode = str(cfg.get("clamp_mode", config["steps"]["4"].get("clamp_mode", "detach"))).strip().lower()
+    partner_policy = swap_partner_policy(config)
     tau = int(config.get("primary_tau", 3))
     thresholds = far_thresholds(config)
     selection_tau = min(thresholds)
@@ -2311,140 +2645,268 @@ def run_step5(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
     batched_vjp = carriage_ig_uses_batched_vjp(config)
     seed = int(config.get("seeds", [0])[0])
     dpi = int(config["figures"]["dpi"])
-    graphs = select_graphs(dense.adapter, "test", sample_graphs, seed=seed)
-    dense_base = mean_encoded_baseline(dense.adapter, graphs)
-    onehop_base = mean_encoded_baseline(onehop.adapter, select_graphs(onehop.adapter, "test", sample_graphs, seed=seed))
+    requested_models = list(cfg.get("structure_models", cfg.get("reference_models", ["dense_grit", "grit_1hop", "gin"])))
+    if "dense_grit" not in requested_models:
+        requested_models.insert(0, "dense_grit")
+    by_name = {model.name: model for model in models}
+    analysis_models: list[ModelRun] = []
+    seen_names: set[str] = set()
+    for name in requested_models:
+        model = by_name.get(str(name))
+        if model is not None and model.name not in seen_names:
+            analysis_models.append(model)
+            seen_names.add(model.name)
+    if dense.name not in seen_names:
+        analysis_models.insert(0, dense)
+    missing_requested = [str(name) for name in requested_models if str(name) not in by_name]
+    if missing_requested:
+        progress(f"Step 5: optional reference model(s) not loaded and skipped: {', '.join(missing_requested)}")
     gap_rows: list[dict[str, Any]] = []
     rank_rows: list[dict[str, Any]] = []
     interaction_rows: list[dict[str, Any]] = []
+    rung_rows: list[dict[str, Any]] = []
+    worked_example: Optional[dict[str, Any]] = None
+    worked_example_score = 0.0
     rng = random.Random(seed)
-    for graph_idx, graph in enumerate(graphs):
-        progress_graph("Step 5", dense.name, graph_idx, len(graphs))
-        gid = graph_identity("test", graph_idx, graph)
-        dist = distance_matrix(graph)
-        result = carriage_ig(
-            dense.adapter,
-            graph,
-            dense_base,
-            steps=ig_steps,
-            batched_vjp=batched_vjp,
-            capture_layer_inputs=True,
+    for model in analysis_models:
+        graphs = select_graphs(model.adapter, "test", sample_graphs, seed=seed)
+        max_pairs_label = "all" if max_pairs is None else str(max_pairs)
+        progress(
+            f"Step 5 {model.name}: selected {len(graphs)} test graph(s), "
+            f"max_far_pairs_per_graph={max_pairs_label}, IG steps={ig_steps}"
         )
-        c = result["carriage"]
-        clean_cache = result["clean_cache"]
-        readout_grad = result["readout_gradient"]
-        clean_encoded = result["clean_encoded"].to(dense.adapter.device)
-        base_encoded = result["baseline"].to(dense.adapter.device)
-        direct = torch.full_like(c, float("nan"))
-        selected = far_pairs(dist, selection_tau, max_pairs=max_pairs, seed=seed + graph_idx)
-        for pair_idx, (carrier, source) in enumerate(selected):
-            pair_interval = progress_interval(len(selected), target_messages=4)
-            if pair_idx == 0 or pair_idx + 1 == len(selected) or (pair_idx + 1) % pair_interval == 0:
-                progress(f"Step 5 dense_grit graph {graph_idx + 1}/{len(graphs)}: patched pair {pair_idx + 1}/{len(selected)}")
-            cut = mediator_cut(graph, carrier, source)
-            if not cut:
-                continue
-            direct[carrier, source] = patched_ig_pair(
-                dense.adapter,
+        baseline = mean_encoded_baseline(model.adapter, graphs)
+        for graph_idx, graph in enumerate(graphs):
+            progress_graph("Step 5", model.name, graph_idx, len(graphs))
+            gid = graph_identity("test", graph_idx, graph)
+            dist = distance_matrix(graph)
+            result = carriage_ig(
+                model.adapter,
                 graph,
-                dense_base,
-                clean_cache,
-                readout_grad,
-                carrier=carrier,
-                source=source,
-                clamp_nodes=cut,
+                baseline,
                 steps=ig_steps,
-                clean_encoded_override=clean_encoded,
-                baseline_override=base_encoded,
+                batched_vjp=batched_vjp,
+                capture_layer_inputs=True,
+                capture_attention=("grit" in model.name.lower()),
             )
-        r_nc_by_tau = {int(threshold): r_nc_estimate(direct, dist, int(threshold)) for threshold in thresholds}
-        r_nc = safe_float(r_nc_by_tau[int(tau)].get("r_nc"))
-        y = graph_label(graph)
-        dense_pred = float(result["prediction"])
-        try:
-            onehop_pred = float(onehop.adapter.predict(graph).reshape(-1)[0].detach().cpu().item())
-        except Exception:
-            onehop_pred = float("nan")
-        dense_err = abs(dense_pred - y) if math.isfinite(y) else float("nan")
-        onehop_err = abs(onehop_pred - y) if math.isfinite(y) and math.isfinite(onehop_pred) else float("nan")
-        gap_row = {
-            "graph_id": gid,
-            "tau": tau,
-            "r_nc": r_nc,
-            "r_nc_raw_sample_sum": r_nc_by_tau[int(tau)].get("r_nc_raw_sample_sum"),
-            "r_nc_mean_abs_sampled_pair": r_nc_by_tau[int(tau)].get("r_nc_mean_abs_sampled_pair"),
-            "r_nc_sampled_pairs": r_nc_by_tau[int(tau)].get("r_nc_sampled_pairs"),
-            "r_nc_total_far_pairs": r_nc_by_tau[int(tau)].get("r_nc_total_far_pairs"),
-            "r_nc_pair_coverage": r_nc_by_tau[int(tau)].get("r_nc_pair_coverage"),
-            "r_nc_scaled_from_sample": r_nc_by_tau[int(tau)].get("r_nc_scaled_from_sample"),
-            "dense_error": dense_err,
-            "onehop_error": onehop_err,
-            "onehop_minus_dense_error": onehop_err - dense_err if math.isfinite(onehop_err) and math.isfinite(dense_err) else float("nan"),
-        }
-        for threshold, stats in r_nc_by_tau.items():
-            gap_row[f"r_nc_tau_{threshold}"] = stats.get("r_nc")
-            gap_row[f"r_nc_tau_{threshold}_coverage"] = stats.get("r_nc_pair_coverage")
-        gap_rows.append(gap_row)
-        for threshold in thresholds:
-            far_mask = torch.isfinite(dist) & (dist > threshold)
-            measured_mask = far_mask & torch.isfinite(direct)
-            total_pairs = int(far_mask.sum().item())
-            sampled_pairs = int(measured_mask.sum().item())
-            coverage = float(sampled_pairs / total_pairs) if total_pairs else float("nan")
-            row = {
-                "model": dense.name,
-                "graph_id": gid,
-                "tau": threshold,
-                "primary_tau": threshold == tau,
-                "r_nc": r_nc_by_tau[int(threshold)].get("r_nc"),
-                "r_nc_raw_sample_sum": r_nc_by_tau[int(threshold)].get("r_nc_raw_sample_sum"),
-                "sampled_pairs": sampled_pairs,
-                "total_far_pairs": total_pairs,
-                "pair_coverage": coverage,
-            }
-            if total_pairs > 0 and sampled_pairs == total_pairs:
-                far_matrix = torch.zeros_like(direct)
-                far_matrix[far_mask] = direct[far_mask]
-                row.update(
+            c = result["carriage"]
+            clean_cache = result["clean_cache"]
+            readout_grad = result["readout_gradient"]
+            clean_encoded = result["clean_encoded"].to(model.adapter.device)
+            base_encoded = result["baseline"].to(model.adapter.device)
+            direct = torch.full_like(c, float("nan"))
+            selected = far_pairs(dist, selection_tau, max_pairs=max_pairs, seed=seed + graph_idx)
+            for pair_idx, (carrier, source) in enumerate(selected):
+                pair_interval = progress_interval(len(selected), target_messages=4)
+                if pair_idx == 0 or pair_idx + 1 == len(selected) or (pair_idx + 1) % pair_interval == 0:
+                    progress(f"Step 5 {model.name} graph {graph_idx + 1}/{len(graphs)}: patched pair {pair_idx + 1}/{len(selected)}")
+                cut = mediator_cut(graph, carrier, source)
+                if not cut:
+                    continue
+                direct[carrier, source] = patched_ig_pair(
+                    model.adapter,
+                    graph,
+                    baseline,
+                    clean_cache,
+                    readout_grad,
+                    carrier=carrier,
+                    source=source,
+                    clamp_nodes=cut,
+                    steps=ig_steps,
+                    clamp_mode=clamp_mode,
+                    clean_encoded_override=clean_encoded,
+                    baseline_override=base_encoded,
+                )
+            r_nc_by_tau = {int(threshold): r_nc_estimate(direct, dist, int(threshold)) for threshold in thresholds}
+            attention_far = float("nan")
+            if clean_cache.attention:
+                attention_last = clean_cache.attention[-1].detach().cpu().mean(dim=0)
+                attention_far = far_mass(attention_last, dist, tau)
+            carriage_far = far_mass(c, dist, tau)
+            total_carriage_mass = float(c.detach().abs().sum().item())
+            direct_far_share = safe_float(r_nc_by_tau[int(tau)].get("r_nc")) / max(total_carriage_mass, EPS)
+            for rung_index, (rung, value, denominator) in enumerate(
+                [
+                    ("attention", attention_far, "own_attention_mass"),
+                    ("carriage", carriage_far, "own_carriage_mass"),
+                    ("direct_carriage", direct_far_share, "total_carriage_mass"),
+                ]
+            ):
+                rung_rows.append(
                     {
-                        "status": "complete",
-                        "effective_rank": effective_rank(far_matrix),
-                        "top_singular_share": top_singular_share(far_matrix),
-                        "above_null_margin": distance_preserving_above_null_margin(far_matrix, dist, seed=seed + graph_idx + threshold),
+                        "model": model.name,
+                        "role": model.role,
+                        "graph_id": gid,
+                        "tau": tau,
+                        "rung_index": rung_index,
+                        "rung": rung,
+                        "far_mass": value,
+                        "denominator": denominator,
+                        "r_nc": r_nc_by_tau[int(tau)].get("r_nc"),
+                        "total_carriage_mass": total_carriage_mass,
+                        "attention_available": bool(clean_cache.attention),
                     }
                 )
-            else:
-                row.update(
-                    {
-                        "status": "skipped_incomplete_direct_matrix",
-                        "effective_rank": float("nan"),
-                        "top_singular_share": float("nan"),
-                        "above_null_margin": float("nan"),
+            if model.name == dense.name and clean_cache.attention and torch.isfinite(direct).any():
+                finite_direct = direct.detach().abs()
+                finite_direct[~torch.isfinite(direct)] = 0.0
+                carrier, source = (int(v) for v in torch.nonzero(finite_direct == finite_direct.max(), as_tuple=False)[0].tolist())
+                score = float(finite_direct[carrier, source].item())
+                if score > worked_example_score and torch.isfinite(dist[carrier, source]):
+                    cut = mediator_cut(graph, carrier, source)
+                    unclamped = float(c[carrier, source].item())
+                    direct_fraction, nontrivial = direct_fraction_value(
+                        float(direct[carrier, source].item()),
+                        unclamped,
+                        min_effect_abs=min_effect_abs,
+                    )
+                    worked_example_score = score
+                    worked_example = {
+                        "model": model.name,
+                        "graph_id": gid,
+                        "edge_index": graph.edge_index.detach().cpu().clone(),
+                        "attention": clean_cache.attention[-1].detach().cpu().mean(dim=0),
+                        "carriage": c.detach().cpu().clone(),
+                        "direct": direct.detach().cpu().clone(),
+                        "dist": dist.detach().cpu().clone(),
+                        "carrier": carrier,
+                        "source": source,
+                        "cut": cut,
+                        "distance": float(dist[carrier, source].item()),
+                        "direct_value": float(direct[carrier, source].item()),
+                        "unclamped_value": unclamped,
+                        "direct_fraction": direct_fraction,
+                        "nontrivial_effect": nontrivial,
                     }
+            if model.name == dense.name:
+                r_nc = safe_float(r_nc_by_tau[int(tau)].get("r_nc"))
+                y = graph_label(graph)
+                dense_pred = float(result["prediction"])
+                try:
+                    onehop_pred = float(onehop.adapter.predict(graph).reshape(-1)[0].detach().cpu().item())
+                except Exception:
+                    onehop_pred = float("nan")
+                dense_err = abs(dense_pred - y) if math.isfinite(y) else float("nan")
+                onehop_err = abs(onehop_pred - y) if math.isfinite(y) and math.isfinite(onehop_pred) else float("nan")
+                gap_row = {
+                    "graph_id": gid,
+                    "tau": tau,
+                    "r_nc_model": dense.name,
+                    "r_nc": r_nc,
+                    "r_nc_raw_sample_sum": r_nc_by_tau[int(tau)].get("r_nc_raw_sample_sum"),
+                    "r_nc_mean_abs_sampled_pair": r_nc_by_tau[int(tau)].get("r_nc_mean_abs_sampled_pair"),
+                    "r_nc_sampled_pairs": r_nc_by_tau[int(tau)].get("r_nc_sampled_pairs"),
+                    "r_nc_total_far_pairs": r_nc_by_tau[int(tau)].get("r_nc_total_far_pairs"),
+                    "r_nc_pair_coverage": r_nc_by_tau[int(tau)].get("r_nc_pair_coverage"),
+                    "r_nc_scaled_from_sample": r_nc_by_tau[int(tau)].get("r_nc_scaled_from_sample"),
+                    "clamp_mode": clamp_mode,
+                    "dense_error": dense_err,
+                    "onehop_error": onehop_err,
+                    "onehop_minus_dense_error": onehop_err - dense_err if math.isfinite(onehop_err) and math.isfinite(dense_err) else float("nan"),
+                    "gap_treatment": dense.name,
+                    "gap_control": onehop.name,
+                }
+                for threshold, stats in r_nc_by_tau.items():
+                    gap_row[f"r_nc_tau_{threshold}"] = stats.get("r_nc")
+                    gap_row[f"r_nc_tau_{threshold}_coverage"] = stats.get("r_nc_pair_coverage")
+                gap_rows.append(gap_row)
+            for threshold in thresholds:
+                far_mask = torch.isfinite(dist) & (dist > threshold)
+                measured_mask = far_mask & torch.isfinite(direct)
+                total_pairs = int(far_mask.sum().item())
+                sampled_pairs = int(measured_mask.sum().item())
+                coverage = float(sampled_pairs / total_pairs) if total_pairs else float("nan")
+                row = {
+                    "model": model.name,
+                    "role": model.role,
+                    "graph_id": gid,
+                    "tau": threshold,
+                    "primary_tau": threshold == tau,
+                    "r_nc": r_nc_by_tau[int(threshold)].get("r_nc"),
+                    "r_nc_raw_sample_sum": r_nc_by_tau[int(threshold)].get("r_nc_raw_sample_sum"),
+                    "sampled_pairs": sampled_pairs,
+                    "total_far_pairs": total_pairs,
+                    "pair_coverage": coverage,
+                    "clamp_mode": clamp_mode,
+                }
+                if total_pairs > 0 and sampled_pairs == total_pairs:
+                    far_matrix = torch.zeros_like(direct)
+                    far_matrix[far_mask] = direct[far_mask]
+                    row.update(
+                        {
+                            "status": "complete",
+                            "effective_rank": effective_rank(far_matrix),
+                            "top_singular_share": top_singular_share(far_matrix),
+                            "above_null_margin": distance_preserving_above_null_margin(far_matrix, dist, seed=seed + graph_idx + threshold),
+                        }
+                    )
+                else:
+                    row.update(
+                        {
+                            "status": "skipped_incomplete_direct_matrix",
+                            "effective_rank": float("nan"),
+                            "top_singular_share": float("nan"),
+                            "above_null_margin": float("nan"),
+                        }
+                    )
+                rank_rows.append(row)
+            per_graph_interactions = max(1, interaction_pairs // max(1, sample_graphs))
+            pairs = far_pairs(dist, tau, max_pairs=per_graph_interactions, seed=seed + 1000 + graph_idx)
+            interaction_rows.extend(
+                non_additivity_rows(
+                    model,
+                    graph,
+                    baseline,
+                    pairs,
+                    gid,
+                    rng,
+                    min_effect_abs=min_effect_abs,
+                    partner_policy=partner_policy,
                 )
-            rank_rows.append(row)
-        pairs = far_pairs(dist, tau, max_pairs=max(1, interaction_pairs // max(1, sample_graphs)), seed=seed + 1000 + graph_idx)
-        interaction_rows.extend(non_additivity_rows(dense, graph, dense_base, pairs, gid, rng, min_effect_abs=min_effect_abs))
+            )
     write_csv(artifact_root / "metrics" / "step5_gap_vs_rnc.csv", gap_rows)
     write_csv(artifact_root / "metrics" / "step5_far_carriage_rank.csv", rank_rows)
     write_csv(artifact_root / "metrics" / "step5_non_additivity.csv", interaction_rows)
+    write_csv(artifact_root / "metrics" / "step5_rung_funnel.csv", rung_rows)
     write_json(artifact_root / "metrics" / "step5_gap_regression.json", gap_regression_summary(gap_rows))
     write_csv(artifact_root / "metrics" / "step5_far_carriage_rank_summary.csv", rank_summary_rows(rank_rows))
     write_csv(artifact_root / "metrics" / "step5_non_additivity_summary.csv", non_additivity_summary_rows(interaction_rows))
-    vnode_decision = summarize_vnode_decision(rank_rows, interaction_rows)
+    vnode_decision = summarize_vnode_decision(rank_rows, interaction_rows, model=dense.name)
     write_json(artifact_root / "metrics" / "step5_vnode_decision.json", vnode_decision)
     write_csv(artifact_root / "metrics" / "step5_vnode_decision.csv", [vnode_decision])
     render_step5(gap_rows, rank_rows, interaction_rows, artifact_root, dpi=dpi)
     render_step5_vnode_decision(vnode_decision, artifact_root, dpi=dpi)
+    render_step5_rung_funnel(rung_rows, artifact_root, dpi=dpi)
+    if worked_example is not None:
+        render_worked_molecule_example(worked_example, artifact_root, dpi=dpi)
+        write_json(
+            artifact_root / "metrics" / "step5_worked_molecule_example.json",
+            {
+                key: value
+                for key, value in worked_example.items()
+                if key
+                not in {
+                    "edge_index",
+                    "attention",
+                    "carriage",
+                    "direct",
+                    "dist",
+                }
+            },
+        )
     progress("Step 5 complete: metrics, tensors, and figures written")
     rank_complete = sum(1 for row in rank_rows if str(row.get("status")) == "complete")
     return {
         "status": "complete",
+        "models": [model.name for model in analysis_models],
+        "missing_optional_reference_models": missing_requested,
         "gap_rows": len(gap_rows),
         "rank_rows": len(rank_rows),
         "rank_complete_rows": rank_complete,
         "rank_skipped_rows": len(rank_rows) - rank_complete,
         "interaction_rows": len(interaction_rows),
+        "rung_rows": len(rung_rows),
+        "worked_molecule_example": worked_example is not None,
     }
 
 
@@ -2457,11 +2919,24 @@ def non_additivity_rows(
     rng: random.Random,
     *,
     min_effect_abs: float = 1.0e-6,
+    partner_policy: str = "different_type",
 ) -> list[dict[str, Any]]:
     encoded = model.adapter.encoded_node_states(graph).detach().to(model.adapter.device)
     clean = float(predict_scalar_from_encoded(model.adapter, graph, encoded).detach().cpu().item())
     rows = []
     seen: set[tuple[int, int]] = set()
+    type_signatures = node_type_signatures(graph)
+    require_different_type = str(partner_policy).strip().lower() in {"different_type", "different-type", "different_atom_type"}
+
+    def partner_candidates(source: int, blocked: set[int]) -> list[int]:
+        choices = [idx for idx in range(encoded.size(0)) if idx not in blocked]
+        if require_different_type and type_signatures is not None and int(source) < len(type_signatures):
+            source_type = type_signatures[int(source)]
+            different = [idx for idx in choices if idx < len(type_signatures) and type_signatures[idx] != source_type]
+            if different:
+                return different
+        return choices
+
     for a, b in pairs:
         if a == b:
             continue
@@ -2469,8 +2944,8 @@ def non_additivity_rows(
         if key in seen:
             continue
         seen.add(key)
-        candidates_a = [idx for idx in range(encoded.size(0)) if idx not in {int(a), int(b)}]
-        candidates_b = [idx for idx in range(encoded.size(0)) if idx not in {int(a), int(b)}]
+        candidates_a = partner_candidates(int(a), {int(a), int(b)})
+        candidates_b = partner_candidates(int(b), {int(a), int(b)})
         if not candidates_a or not candidates_b:
             continue
         partner_a = rng.choice(candidates_a)
@@ -2504,6 +2979,7 @@ def non_additivity_rows(
                 "min_effect_abs": min_effect_abs,
                 "nontrivial_effect": nontrivial,
                 "perturbation": "finite_content_swap",
+                "partner_policy": partner_policy,
             }
         )
     return rows
@@ -2539,11 +3015,20 @@ def distance_preserving_above_null_margin(
     return float(observed - float(np.mean(null_values)))
 
 
-def summarize_vnode_decision(rank_rows: Sequence[Mapping[str, Any]], interaction_rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
-    primary_rank_rows = [r for r in rank_rows if bool(r.get("primary_tau", True))]
+def summarize_vnode_decision(
+    rank_rows: Sequence[Mapping[str, Any]],
+    interaction_rows: Sequence[Mapping[str, Any]],
+    *,
+    model: str = "dense_grit",
+) -> dict[str, Any]:
+    primary_rank_rows = [
+        r
+        for r in rank_rows
+        if bool(r.get("primary_tau", True)) and str(r.get("model")) == str(model)
+    ]
     if primary_rank_rows:
         rank_rows = primary_rank_rows
-    non_add = np.asarray([safe_float(r.get("non_additivity")) for r in interaction_rows], dtype=float)
+    non_add = np.asarray([safe_float(r.get("non_additivity")) for r in interaction_rows if str(r.get("model")) == str(model)], dtype=float)
     non_add = non_add[np.isfinite(non_add)]
     top_share = np.asarray([safe_float(r.get("top_singular_share")) for r in rank_rows], dtype=float)
     top_share = top_share[np.isfinite(top_share)]
@@ -2568,6 +3053,7 @@ def summarize_vnode_decision(rank_rows: Sequence[Mapping[str, Any]], interaction
         decision = "source_specific_interactions_exceed_rank1_broadcast"
     return {
         "decision": decision,
+        "model": model,
         "non_additivity_threshold": threshold,
         "mean_non_additivity": mean_non_add,
         "median_non_additivity": median_non_add,
@@ -2599,22 +3085,25 @@ def rank_summary_rows(rank_rows: Sequence[Mapping[str, Any]]) -> list[dict[str, 
     primary = [r for r in rank_rows if bool(r.get("primary_tau", True))]
     rows = primary or list(rank_rows)
     out = []
-    for metric in ["effective_rank", "top_singular_share", "above_null_margin"]:
-        values = [safe_float(r.get(metric)) for r in rows]
-        values = [v for v in values if math.isfinite(v)]
-        if not values:
-            continue
-        mean, lo, hi = bootstrap_ci(values, seed=4100 + len(out), draws=1000)
-        out.append(
-            {
-                "metric": metric,
-                "mean": mean,
-                "ci_low": lo,
-                "ci_high": hi,
-                "n": len(values),
-                "tau": rows[0].get("tau", "") if rows else "",
-            }
-        )
+    for model in sorted(set(str(r.get("model")) for r in rows)):
+        model_rows = [r for r in rows if str(r.get("model")) == model]
+        for metric in ["effective_rank", "top_singular_share", "above_null_margin"]:
+            values = [safe_float(r.get(metric)) for r in model_rows]
+            values = [v for v in values if math.isfinite(v)]
+            if not values:
+                continue
+            mean, lo, hi = bootstrap_ci(values, seed=4100 + len(out), draws=1000)
+            out.append(
+                {
+                    "model": model,
+                    "metric": metric,
+                    "mean": mean,
+                    "ci_low": lo,
+                    "ci_high": hi,
+                    "n": len(values),
+                    "tau": model_rows[0].get("tau", "") if model_rows else "",
+                }
+            )
     return out
 
 
@@ -2669,21 +3158,23 @@ def render_step5(
                 "top_singular_share": ("Top singular share", "Share (0-1)"),
                 "above_null_margin": ("Above-null margin", "Share margin (0-1)"),
             }
-            fig, axes = plt.subplots(1, len(summary), figsize=(4.0 * len(summary), 4.4), constrained_layout=True)
+            metrics = [m for m in ["effective_rank", "top_singular_share", "above_null_margin"] if any(str(r.get("metric")) == m for r in summary)]
+            fig, axes = plt.subplots(1, len(metrics), figsize=(4.6 * len(metrics), 4.4), constrained_layout=True)
             axes_arr = np.atleast_1d(axes)
-            for ax, row in zip(axes_arr, summary):
-                metric = str(row["metric"])
+            for ax, metric in zip(axes_arr, metrics):
                 label, ylabel = metric_labels.get(metric, (metric.replace("_", " "), "Value"))
-                mean = safe_float(row["mean"])
-                lo = safe_float(row["ci_low"])
-                hi = safe_float(row["ci_high"])
-                yerr = [[max(0.0, mean - lo)], [max(0.0, hi - mean)]]
-                ax.bar([label], [mean], yerr=yerr, capsize=4, color="#4c78a8")
+                metric_rows = [r for r in summary if str(r.get("metric")) == metric]
+                models = [str(r.get("model")) for r in metric_rows]
+                means = np.asarray([safe_float(r.get("mean")) for r in metric_rows], dtype=float)
+                lows = np.asarray([safe_float(r.get("ci_low")) for r in metric_rows], dtype=float)
+                highs = np.asarray([safe_float(r.get("ci_high")) for r in metric_rows], dtype=float)
+                yerr = np.vstack([np.maximum(0.0, means - lows), np.maximum(0.0, highs - means)])
+                ax.bar(models, means, yerr=yerr, capsize=4, color="#4c78a8")
                 ax.axhline(0, color="#555555", linewidth=1)
                 ax.set_title(label)
                 ax.set_ylabel(ylabel)
                 for tick in ax.get_xticklabels():
-                    tick.set_rotation(12)
+                    tick.set_rotation(18)
                     tick.set_ha("right")
             fig.suptitle("Step 5: structure of non-composable long-range carriage")
             fig.savefig(figures / "step5_structure_non_composable_carriage.png", dpi=dpi)
@@ -2708,17 +3199,139 @@ def render_step5(
             plt.close(fig)
         fig, ax = plt.subplots(figsize=(5.4, 5.0), constrained_layout=True)
         scatter_rows = [r for r in interaction_rows if row_is_nontrivial(r)]
-        sx = [safe_float(r["delta_a"]) + safe_float(r["delta_b"]) for r in scatter_rows]
-        sy = [safe_float(r["delta_ab"]) for r in scatter_rows]
-        ax.scatter(sx, sy, s=12, alpha=0.5)
-        lim = max([abs(v) for v in sx + sy if math.isfinite(v)] + [1.0e-6])
+        sx_all: list[float] = []
+        sy_all: list[float] = []
+        for model in sorted(set(str(r.get("model")) for r in scatter_rows)):
+            model_rows = [r for r in scatter_rows if str(r.get("model")) == model]
+            sx = [safe_float(r["delta_a"]) + safe_float(r["delta_b"]) for r in model_rows]
+            sy = [safe_float(r["delta_ab"]) for r in model_rows]
+            sx_all.extend(sx)
+            sy_all.extend(sy)
+            ax.scatter(sx, sy, s=12, alpha=0.5, label=model)
+        lim = max([abs(v) for v in sx_all + sy_all if math.isfinite(v)] + [1.0e-6])
         ax.plot([-lim, lim], [-lim, lim], "--", color="#555555")
         ax.set_title("Step 5: additivity of distant sources")
         ax.set_xlabel("delta_A + delta_B")
         ax.set_ylabel("delta_AB")
+        ax.legend(frameon=False, fontsize=8)
         fig.savefig(figures / "step5_additivity_scatter.png", dpi=dpi)
         fig.savefig(figures / "step5_additivity_scatter.pdf")
         plt.close(fig)
+
+
+def render_step5_rung_funnel(rows: Sequence[Mapping[str, Any]], artifact_root: Path, *, dpi: int) -> None:
+    clean_rows = [
+        r
+        for r in rows
+        if math.isfinite(safe_float(r.get("rung_index")))
+    ]
+    if not clean_rows:
+        return
+    rung_order = ["attention", "carriage", "direct_carriage"]
+    rung_labels = {
+        "attention": "attention",
+        "carriage": "carriage",
+        "direct_carriage": "direct carriage",
+    }
+    models = sorted({str(r.get("model")) for r in clean_rows})
+    x = np.arange(len(rung_order), dtype=float)
+    fig, ax = plt.subplots(figsize=(7.4, 4.8), constrained_layout=True)
+    for model in models:
+        means = []
+        for rung in rung_order:
+            vals = [
+                safe_float(r.get("far_mass"))
+                for r in clean_rows
+                if str(r.get("model")) == model and str(r.get("rung")) == rung
+            ]
+            vals = [v for v in vals if math.isfinite(v)]
+            means.append(float(np.nanmean(vals)) if vals else float("nan"))
+        ax.plot(x, means, marker="o", linewidth=2.0, label=model)
+    ax.set_title("From reading to non-composable transport: far-mass surviving each rung")
+    ax.set_xlabel("Rung")
+    ax.set_ylabel("Far-mass share")
+    ax.set_xticks(x)
+    ax.set_xticklabels([rung_labels[r] for r in rung_order])
+    ax.set_ylim(bottom=0)
+    ax.legend(frameon=False, fontsize=8)
+    figures = ensure_dir(artifact_root / "figures")
+    fig.savefig(figures / "step5_rung_funnel.png", dpi=dpi)
+    fig.savefig(figures / "step5_rung_funnel.pdf")
+    plt.close(fig)
+
+
+def render_worked_molecule_example(example: Mapping[str, Any], artifact_root: Path, *, dpi: int) -> None:
+    try:
+        import networkx as nx
+    except Exception:
+        return
+    edge_index = example.get("edge_index")
+    attention = example.get("attention")
+    carriage = example.get("carriage")
+    direct = example.get("direct")
+    if not isinstance(edge_index, torch.Tensor) or not isinstance(carriage, torch.Tensor):
+        return
+    n = int(carriage.size(0))
+    carrier = int(example.get("carrier", 0))
+    source = int(example.get("source", 0))
+    cut = [int(v) for v in example.get("cut", [])]
+    graph = nx.Graph()
+    graph.add_nodes_from(range(n))
+    for src, dst in edge_index.t().detach().cpu().long().tolist():
+        graph.add_edge(int(src), int(dst))
+    pos = nx.spring_layout(graph, seed=17)
+    fig, axes = plt.subplots(1, 3, figsize=(14.0, 4.6), constrained_layout=True)
+
+    ax = axes[0]
+    if isinstance(attention, torch.Tensor):
+        mat = attention.detach().cpu().float().numpy()
+        im = ax.imshow(mat, cmap="magma", aspect="auto")
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="attention")
+    else:
+        ax.text(0.5, 0.5, "No attention map", ha="center", va="center")
+    ax.set_title("Direct attention map")
+    ax.set_xlabel("Source atom")
+    ax.set_ylabel("Receiving atom")
+
+    ax = axes[1]
+    source_strength = carriage.detach().abs().cpu()[carrier].float().numpy()
+    node_colors = [float(source_strength[idx]) for idx in range(n)]
+    nx.draw_networkx_edges(graph, pos, ax=ax, edge_color="#999999", width=1.2)
+    nodes = nx.draw_networkx_nodes(graph, pos, ax=ax, node_color=node_colors, cmap="viridis", node_size=260)
+    nx.draw_networkx_labels(graph, pos, ax=ax, font_size=8)
+    fig.colorbar(nodes, ax=ax, fraction=0.046, pad=0.04, label=f"|C[{carrier}, source]|")
+    ax.set_title(f"Carriage source-map into atom {carrier}")
+    ax.set_axis_off()
+
+    ax = axes[2]
+    colors = []
+    for node in range(n):
+        if node == carrier:
+            colors.append("#4c78a8")
+        elif node == source:
+            colors.append("#e45756")
+        elif node in cut:
+            colors.append("#f58518")
+        else:
+            colors.append("#dddddd")
+    widths = []
+    for u, v in graph.edges():
+        on_pair_edge = {u, v}.issubset({carrier, source})
+        widths.append(2.4 if on_pair_edge else 1.2)
+    nx.draw_networkx_edges(graph, pos, ax=ax, edge_color="#999999", width=widths)
+    nx.draw_networkx_nodes(graph, pos, ax=ax, node_color=colors, edgecolors="#333333", linewidths=0.6, node_size=300)
+    nx.draw_networkx_labels(graph, pos, ax=ax, font_size=8)
+    direct_value = safe_float(example.get("direct_value"))
+    direct_fraction = safe_float(example.get("direct_fraction"))
+    distance = safe_float(example.get("distance"))
+    ax.set_title(f"Far pair d={distance:.0f}, direct={direct_value:.3g}, fraction={direct_fraction:.2g}")
+    ax.set_axis_off()
+
+    fig.suptitle("A single molecule: attention, carriage, and a surviving long-range shortcut")
+    figures = ensure_dir(artifact_root / "figures")
+    fig.savefig(figures / "step5_worked_molecule_shortcut.png", dpi=dpi)
+    fig.savefig(figures / "step5_worked_molecule_shortcut.pdf")
+    plt.close(fig)
 
 
 def render_step5_vnode_decision(decision: Mapping[str, Any], artifact_root: Path, *, dpi: int) -> None:

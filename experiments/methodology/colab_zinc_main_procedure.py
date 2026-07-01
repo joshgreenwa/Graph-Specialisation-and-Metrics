@@ -420,6 +420,37 @@ def apply_colab_repo_hotfixes(repo_dir: Path) -> None:
     else:
         print("[hotfix] method_adapters.py already avoids torch.inference_mode()", flush=True)
 
+    intervention = repo_dir / "src" / "graph_specialisation_metrics" / "grit_intervention_procedure.py"
+    if not intervention.exists():
+        print(f"[hotfix-warning] missing expected intervention source: {intervention}", flush=True)
+        return
+    text = intervention.read_text(encoding="utf-8")
+    fixed = text
+    if "shortest_path_distance_matrix," not in fixed:
+        fixed = fixed.replace(
+            "    spearman_corr,\n",
+            "    spearman_corr,\n    shortest_path_distance_matrix,\n",
+        )
+    old_distance_helper = '''def distance_matrix(graph: Any) -> torch.Tensor:
+    if hasattr(graph, "distances") and isinstance(graph.distances, torch.Tensor):
+        return graph.distances.detach().cpu().float()
+    return all_pair_distances_or_compute(pyg_graph_view(graph)).cpu()
+'''
+    new_distance_helper = '''def distance_matrix(graph: Any) -> torch.Tensor:
+    """Return molecular hop distance, not GRIT structural/RRWP fields."""
+    if hasattr(graph, "edge_index") and isinstance(graph.edge_index, torch.Tensor):
+        return shortest_path_distance_matrix(pyg_graph_view(graph)).detach().cpu().float()
+    if hasattr(graph, "distances") and isinstance(graph.distances, torch.Tensor):
+        return graph.distances.detach().cpu().float()
+    return all_pair_distances_or_compute(pyg_graph_view(graph)).cpu()
+'''
+    fixed = fixed.replace(old_distance_helper, new_distance_helper)
+    if fixed != text:
+        intervention.write_text(fixed, encoding="utf-8")
+        print("[hotfix] forced molecular-hop distance helper in grit_intervention_procedure.py", flush=True)
+    else:
+        print("[hotfix] grit_intervention_procedure.py already uses molecular-hop distances", flush=True)
+
 
 def install_repo(repo_dir: Path, *, pyg_version: str) -> None:
     apply_colab_repo_hotfixes(repo_dir)
@@ -866,6 +897,7 @@ def build_zinc_config(
                     "adapter": "pyg_gin",
                     "role": "local_validation_reference",
                     "artifact_root": str(artifact_root / "missing_gin_reference"),
+                    "dataset_dir": str(dense_dataset_dir),
                 },
                 "gcn": {
                     "adapter": "pyg_gcn",
@@ -887,6 +919,7 @@ def build_zinc_config(
             "ig_steps": 32,
             "swap_partners": 8,
             "batched_vjp": True,
+            "swap_partner_policy": "different_type",
         },
         "models": models,
         "steps": {
@@ -914,6 +947,7 @@ def build_zinc_config(
                 "max_far_pairs_per_graph": 64,
                 "depth_pairs_per_graph": 8,
                 "min_effect_abs": 1.0e-6,
+                "clamp_mode": "detach",
                 "run_analytic_patching_check": True,
                 "run_clamp_negative_control": True,
                 "composed_reference_max_direct_fraction": 0.20,
@@ -921,9 +955,11 @@ def build_zinc_config(
             "5": {
                 "name": "non_composable_gap_attribution",
                 "sample_graphs": 200,
-                "max_far_pairs_per_graph": 64,
+                "max_far_pairs_per_graph": "all",
                 "interaction_pairs": 1000,
                 "min_effect_abs": 1.0e-6,
+                "clamp_mode": "detach",
+                "reference_models": ["dense_grit", "grit_1hop", "gin"],
             },
         },
         "figures": {"dpi": 180},

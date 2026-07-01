@@ -58,6 +58,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "ig_steps": 32,
         "swap_partners": 8,
         "batched_vjp": True,
+        "swap_partner_policy": "different_type",
     },
     "models": {
         "dense_grit": {
@@ -84,6 +85,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "adapter": "pyg_gin",
             "role": "local_validation_reference",
             "artifact_root": "/rds/user/jgg45/hpc-work/grit_zinc_results/gin_reference",
+            "dataset_dir": "/rds/user/jgg45/hpc-work/grit_zinc_results/datasets",
+            "config_path": None,
+            "checkpoint_path": None,
         },
         "gcn": {
             "adapter": "pyg_gcn",
@@ -116,6 +120,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "max_far_pairs_per_graph": 64,
             "depth_pairs_per_graph": 8,
             "min_effect_abs": 1.0e-6,
+            "clamp_mode": "detach",
             "run_analytic_patching_check": True,
             "run_clamp_negative_control": True,
             "composed_reference_max_direct_fraction": 0.20,
@@ -123,9 +128,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "5": {
             "name": "non_composable_gap_attribution",
             "sample_graphs": 200,
-            "max_far_pairs_per_graph": 64,
+            "max_far_pairs_per_graph": "all",
             "interaction_pairs": 1000,
             "min_effect_abs": 1.0e-6,
+            "clamp_mode": "detach",
+            "reference_models": ["dense_grit", "grit_1hop", "gin"],
         },
     },
     "figures": {"dpi": 180},
@@ -761,12 +768,12 @@ def run_main(config: Mapping[str, Any], *, steps: Sequence[str], dry_run: bool =
         if pending_intervention_steps:
             try:
                 progress(
-                    "instantiating official GRIT adapters once for intervention steps: "
+                    "instantiating intervention adapters once for steps: "
                     f"{','.join(pending_intervention_steps)}"
                 )
                 intervention_models = instantiate_official_models(config, discovery)
                 model_names = ", ".join(model.name for model in intervention_models) if intervention_models else "none found"
-                progress(f"official GRIT adapters ready: {model_names}")
+                progress(f"intervention adapters ready: {model_names}")
             except Exception as exc:
                 intervention_model_error = exc
         for step in steps:
@@ -780,7 +787,7 @@ def run_main(config: Mapping[str, Any], *, steps: Sequence[str], dry_run: bool =
                 try:
                     if intervention_model_error is not None:
                         raise intervention_model_error
-                    progress(f"starting GRIT intervention Step {step}: {config['steps'][step]['name']}")
+                    progress(f"starting intervention Step {step}: {config['steps'][step]['name']}")
                     step_status = run_intervention_steps(
                         config,
                         discovery,
@@ -789,9 +796,9 @@ def run_main(config: Mapping[str, Any], *, steps: Sequence[str], dry_run: bool =
                         models=intervention_models,
                     )
                     status = step_status.get(step, {"status": "unknown_step", "step": step})
-                    progress(f"GRIT intervention Step {step} finished")
+                    progress(f"intervention Step {step} finished")
                 except Exception as exc:
-                    progress(f"GRIT intervention Step {step} failed: {exc}")
+                    progress(f"intervention Step {step} failed: {exc}")
                     status = {
                         "status": "failed",
                         "step": step,

@@ -15,6 +15,7 @@ perturbation:
   ig_steps: 32
   swap_partners: 8
   batched_vjp: true
+  swap_partner_policy: different_type
 
 models:
   dense_grit:
@@ -41,6 +42,9 @@ models:
     adapter: pyg_gin
     role: local_validation_reference
     artifact_root: /rds/user/jgg45/hpc-work/grit_zinc_results/gin_reference
+    dataset_dir: /rds/user/jgg45/hpc-work/grit_zinc_results/datasets
+    config_path:
+    checkpoint_path:
   gcn:
     adapter: pyg_gcn
     role: local_validation_reference
@@ -73,15 +77,18 @@ steps:
     max_far_pairs_per_graph: 64
     depth_pairs_per_graph: 8
     min_effect_abs: 1.0e-6
+    clamp_mode: detach
     run_analytic_patching_check: true
     run_clamp_negative_control: true
     composed_reference_max_direct_fraction: 0.20
   "5":
     name: non_composable_gap_attribution
     sample_graphs: 200
-    max_far_pairs_per_graph: 64
+    max_far_pairs_per_graph: all
     interaction_pairs: 1000
     min_effect_abs: 1.0e-6
+    clamp_mode: detach
+    reference_models: [dense_grit, grit_1hop, gin]
 
 figures:
   dpi: 180
