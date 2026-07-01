@@ -426,6 +426,7 @@ _colab_sys.modules["dgl.heterograph"].DGLHeteroGraph = _colab_dgl_heterograph.DG
         text = text.replace(dgl_marker, dgl_patch, 1)
 
     if "COLAB_GIN_ZINC_PATCH_START" in text:
+        text = patch_official_checkpoint_cleanup_text(text)
         path.write_text(text, encoding="utf-8")
         print("[patch] Colab compatibility/checkpoint/log patches already present.", flush=True)
         patch_official_molecule_loader(repo_dir)
@@ -500,9 +501,41 @@ _colab_sys.modules["dgl.heterograph"].DGLHeteroGraph = _colab_dgl_heterograph.DG
     if marker not in text:
         raise RuntimeError("could not patch official training script: scheduler marker not found")
     text = text.replace(marker, inject, 1)
+    text = patch_official_checkpoint_cleanup_text(text)
     path.write_text(text, encoding="utf-8")
     print("[patch] Added Drive-friendly best/latest checkpoint and CSV logging patch.", flush=True)
     patch_official_molecule_loader(repo_dir)
+
+
+def patch_official_checkpoint_cleanup_text(text: str) -> str:
+    if "COLAB_GIN_ZINC_CKPT_CLEANUP_START" in text:
+        return text
+    old = """\
+                files = glob.glob(ckpt_dir + '/*.pkl')
+                for file in files:
+                    epoch_nb = file.split('_')[-1]
+                    epoch_nb = int(epoch_nb.split('.')[0])
+                    if epoch_nb < epoch-1:
+                        os.remove(file)
+"""
+    new = """\
+                # COLAB_GIN_ZINC_CKPT_CLEANUP_START: official cleanup assumes every
+                # .pkl file is named epoch_N.pkl. Keep that behavior for official
+                # epoch checkpoints, but ignore extra best/latest state dicts.
+                files = glob.glob(ckpt_dir + '/*.pkl')
+                for file in files:
+                    base_name = os.path.basename(file)
+                    if not (base_name.startswith('epoch_') and base_name.endswith('.pkl')):
+                        continue
+                    epoch_nb = base_name.split('_')[-1]
+                    epoch_nb = int(epoch_nb.split('.')[0])
+                    if epoch_nb < epoch-1:
+                        os.remove(file)
+                # COLAB_GIN_ZINC_CKPT_CLEANUP_END
+"""
+    if old not in text:
+        raise RuntimeError("could not patch official checkpoint cleanup block")
+    return text.replace(old, new, 1)
 
 
 def patch_official_molecule_loader(repo_dir: Path) -> None:
@@ -539,8 +572,27 @@ _colab_sys.modules["dgl.heterograph"].DGLHeteroGraph = _colab_dgl_heterograph.DG
         if marker not in text:
             raise RuntimeError("could not patch official molecule loader: import dgl marker not found")
         text = text.replace(marker, patch, 1)
+    text = patch_official_molecule_collate_text(text)
     path.write_text(text, encoding="utf-8")
-    print("[patch] Added official ZINC.pkl DGL class-name compatibility patch.", flush=True)
+    print("[patch] Added official ZINC.pkl DGL compatibility/collate patch.", flush=True)
+
+
+def patch_official_molecule_collate_text(text: str) -> str:
+    if "COLAB_GIN_ZINC_LABEL_SHAPE_START" in text:
+        return text
+    old = "        labels = torch.tensor(np.array(labels)).unsqueeze(1)\n"
+    new = """\
+        # COLAB_GIN_ZINC_LABEL_SHAPE_START: modern unpickling returns scalar
+        # targets as small tensors in some Colab/DGL stacks. Flatten to the
+        # official regression shape [batch, 1] so L1/MAE does not broadcast.
+        labels = torch.as_tensor(np.array(labels), dtype=torch.float32).reshape(-1, 1)
+        # COLAB_GIN_ZINC_LABEL_SHAPE_END
+"""
+    count = text.count(old)
+    if count < 1:
+        raise RuntimeError("could not patch official molecule label collation")
+    return text.replace(old, new)
+
 
 
 def verify_official_runtime_compat(repo_dir: Path) -> None:
