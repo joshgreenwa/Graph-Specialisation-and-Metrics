@@ -1834,9 +1834,10 @@ __all__ = []
         capture_layer_inputs: bool = False,
         capture_layer_outputs: bool = False,
     ) -> tuple[ForwardCache, torch.Tensor]:
+        encoded_for_grad = encoded_content.to(device=self.device).detach().clone().requires_grad_(True)
         cache = self.forward_from_encoded_content(
             graph,
-            encoded_content,
+            encoded_for_grad,
             retain_grad=True,
             capture_attention=capture_attention,
             capture_channels=capture_channels,
@@ -1845,6 +1846,13 @@ __all__ = []
         )
         pred = cache.prediction.reshape(-1)[int(target_index)]
         readout_tensors = list((cache.extras or {}).get("readout_state_tensors", []))
+        readout_tensors = [tensor for tensor in readout_tensors if isinstance(tensor, torch.Tensor)]
+        non_grad_tensors = [idx for idx, tensor in enumerate(readout_tensors) if not tensor.requires_grad]
+        if non_grad_tensors:
+            raise RuntimeError(
+                "GIN readout-gradient pass found readout tensor(s) without gradients enabled: "
+                f"{non_grad_tensors}"
+            )
         if readout_tensors:
             grads = torch.autograd.grad(
                 pred,
@@ -1859,13 +1867,7 @@ __all__ = []
             ]
             grad = torch.cat(pieces, dim=-1)
         else:
-            (grad,) = torch.autograd.grad(
-                pred,
-                cache.final_node_states,
-                retain_graph=False,
-                create_graph=False,
-                allow_unused=False,
-            )
+            raise RuntimeError("GIN readout-gradient pass did not expose any gradient-enabled readout tensors")
         return cache, grad.detach().clone()
 
     def predict(self, graph: GraphBatchView) -> torch.Tensor:

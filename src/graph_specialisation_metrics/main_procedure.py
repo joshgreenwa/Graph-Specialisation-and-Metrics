@@ -177,6 +177,35 @@ FAST_DEV_OVERRIDES: dict[str, Any] = {
 ANALYSIS_PRESET_OVERRIDES: dict[str, dict[str, Any]] = {
     "full": {},
     "smoke": FAST_DEV_OVERRIDES,
+    "quick": {
+        "seeds": [41],
+        "perturbation": {
+            "ig_steps": 4,
+            "baseline_sample_graphs": 4,
+            "swap_partners": 0,
+        },
+        "steps": {
+            "0": {
+                "sample_graphs": 4,
+                "ig_step_sweep": [4],
+                "diagnostic_sample_graphs": 1,
+                "baseline_sweep": ["mean_node_embedding"],
+                "matched_target_ig_steps": 0,
+                "matched_target_sources_per_graph": 0,
+                "matched_target_partners_per_source": 0,
+            },
+            "1": {"reach_sweep": [1, "dense"]},
+            "2": {"sample_graphs": 4, "compare_attention_to_swaps": False, "run_layer_channel_split": False},
+            "3": {"sample_graphs": 4},
+            "4": {
+                "sample_graphs": 2,
+                "max_far_pairs_per_graph": 1,
+                "depth_pairs_per_graph": 0,
+                "run_clamp_negative_control": False,
+            },
+            "5": {"sample_graphs": 4, "max_far_pairs_per_graph": 1, "interaction_pairs": 16},
+        },
+    },
     "pilot": {
         "seeds": [41],
         "perturbation": {

@@ -518,6 +518,29 @@ def apply_colab_repo_hotfixes(repo_dir: Path) -> None:
     gin_marker = "class OfficialBenchmarkingGNNsGINAdapter:"
     if gin_marker in fixed:
         prefix, gin_part = fixed.split(gin_marker, 1)
+        if "encoded_for_grad = encoded_content.to(device=self.device).detach().clone().requires_grad_(True)" not in gin_part:
+            old_gin_cache = '''        cache = self.forward_from_encoded_content(
+            graph,
+            encoded_content,
+            retain_grad=True,
+            capture_attention=capture_attention,
+            capture_channels=capture_channels,
+            capture_layer_inputs=capture_layer_inputs,
+            capture_layer_outputs=capture_layer_outputs,
+        )
+'''
+            new_gin_cache = '''        encoded_for_grad = encoded_content.to(device=self.device).detach().clone().requires_grad_(True)
+        cache = self.forward_from_encoded_content(
+            graph,
+            encoded_for_grad,
+            retain_grad=True,
+            capture_attention=capture_attention,
+            capture_channels=capture_channels,
+            capture_layer_inputs=capture_layer_inputs,
+            capture_layer_outputs=capture_layer_outputs,
+        )
+'''
+            gin_part = gin_part.replace(old_gin_cache, new_gin_cache, 1)
         if "readout_state_tensors" not in gin_part:
             old_extras = '''        extras: dict[str, Any] = {
             "layer_input_node_states": [],
@@ -553,6 +576,13 @@ def apply_colab_repo_hotfixes(repo_dir: Path) -> None:
         return cache, grad.detach().clone()
 '''
             new_gin_grad = '''        readout_tensors = list((cache.extras or {}).get("readout_state_tensors", []))
+        readout_tensors = [tensor for tensor in readout_tensors if isinstance(tensor, torch.Tensor)]
+        non_grad_tensors = [idx for idx, tensor in enumerate(readout_tensors) if not tensor.requires_grad]
+        if non_grad_tensors:
+            raise RuntimeError(
+                "GIN readout-gradient pass found readout tensor(s) without gradients enabled: "
+                f"{non_grad_tensors}"
+            )
         if readout_tensors:
             grads = torch.autograd.grad(
                 pred,
@@ -567,19 +597,30 @@ def apply_colab_repo_hotfixes(repo_dir: Path) -> None:
             ]
             grad = torch.cat(pieces, dim=-1)
         else:
-            (grad,) = torch.autograd.grad(
-                pred,
-                cache.final_node_states,
-                retain_graph=False,
-                create_graph=False,
-                allow_unused=False,
-            )
+            raise RuntimeError("GIN readout-gradient pass did not expose any gradient-enabled readout tensors")
         return cache, grad.detach().clone()
 '''
             gin_part = gin_part.replace(old_extras, new_extras, 1)
             gin_part = gin_part.replace(old_readout_return, new_readout_return, 1)
             gin_part = gin_part.replace(old_gin_grad, new_gin_grad, 1)
-            fixed = prefix + gin_marker + gin_part
+        if "non_grad_tensors = [idx for idx, tensor in enumerate(readout_tensors) if not tensor.requires_grad]" not in gin_part:
+            gin_part = gin_part.replace(
+                '''        readout_tensors = list((cache.extras or {}).get("readout_state_tensors", []))
+        if readout_tensors:
+''',
+                '''        readout_tensors = list((cache.extras or {}).get("readout_state_tensors", []))
+        readout_tensors = [tensor for tensor in readout_tensors if isinstance(tensor, torch.Tensor)]
+        non_grad_tensors = [idx for idx, tensor in enumerate(readout_tensors) if not tensor.requires_grad]
+        if non_grad_tensors:
+            raise RuntimeError(
+                "GIN readout-gradient pass found readout tensor(s) without gradients enabled: "
+                f"{non_grad_tensors}"
+            )
+        if readout_tensors:
+''',
+                1,
+            )
+        fixed = prefix + gin_marker + gin_part
     if fixed != text:
         adapters.write_text(fixed, encoding="utf-8")
         print("[hotfix] updated method_adapters.py for Colab compatibility", flush=True)
@@ -1490,6 +1531,11 @@ def run_main_procedure(
     dry_run: bool,
     env: Mapping[str, str] | None = None,
 ) -> Path:
+    preset = str(analysis_preset)
+    main_source = repo_dir / "src" / "graph_specialisation_metrics" / "main_procedure.py"
+    if preset == "quick" and main_source.exists() and '"quick"' not in main_source.read_text(encoding="utf-8"):
+        print("[preset] cloned repo does not expose quick yet; using smoke for this fast run", flush=True)
+        preset = "smoke"
     cmd = [
         sys.executable,
         "-m",
@@ -1500,7 +1546,7 @@ def run_main_procedure(
         "--steps",
         str(steps),
         "--analysis-preset",
-        str(analysis_preset),
+        preset,
     ]
     if force:
         cmd.append("--force")
@@ -1652,8 +1698,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--steps", default="all", help="Main procedure steps to run, e.g. all or 0 or 0,2,4.")
     parser.add_argument(
         "--analysis-preset",
-        choices=["full", "medium", "pilot", "smoke"],
-        default="full",
+        choices=["full", "medium", "pilot", "quick", "smoke"],
+        default="quick",
         help="Bound expensive intervention counts. Use pilot/medium for analysis runs before full paper settings.",
     )
     parser.add_argument("--fast-dev-run", action="store_true", help="Use the main procedure fast-dev overrides for a quicker smoke run.")

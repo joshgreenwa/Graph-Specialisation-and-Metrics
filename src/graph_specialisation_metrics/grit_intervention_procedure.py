@@ -919,6 +919,8 @@ def carriage_swap(
     partner_policy: str = "different_type",
 ) -> torch.Tensor:
     n = int(clean_encoded.size(0))
+    if int(partners) <= 0:
+        return clean_encoded.new_zeros((n, n))
     clean_cache = adapter.forward_from_encoded_content(graph, clean_encoded.to(adapter.device), retain_grad=False)
     clean_h = clean_cache.final_node_states.detach()
     out = clean_encoded.new_zeros((n, n), device=adapter.device)
