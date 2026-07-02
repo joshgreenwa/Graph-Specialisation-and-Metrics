@@ -10,6 +10,7 @@ import importlib
 import contextlib
 import json
 import math
+import os
 import re
 import sys
 from dataclasses import dataclass
@@ -1518,11 +1519,29 @@ class OfficialBenchmarkingGNNsGINAdapter:
 
     @staticmethod
     def _install_dgl_compat() -> None:
+        os.environ.setdefault("DGLBACKEND", "pytorch")
         try:
             import dgl  # noqa: F401
             import dgl.function as dgl_fn
         except Exception as exc:  # pragma: no cover - optional dependency.
-            raise RuntimeError("DGL is required for the official Benchmarking-GNNs GIN adapter") from exc
+            message = f"{type(exc).__name__}: {exc}"
+            if "graphbolt" in message.lower() and OfficialBenchmarkingGNNsGINAdapter._patch_dgl_graphbolt_import():
+                for module_name in list(sys.modules):
+                    if module_name == "dgl" or module_name.startswith("dgl."):
+                        sys.modules.pop(module_name, None)
+                try:
+                    import dgl  # noqa: F401
+                    import dgl.function as dgl_fn
+                except Exception as retry_exc:  # pragma: no cover - optional dependency.
+                    raise RuntimeError(
+                        "DGL import failed for the official Benchmarking-GNNs GIN adapter: "
+                        f"{type(retry_exc).__name__}: {retry_exc}"
+                    ) from retry_exc
+            else:
+                raise RuntimeError(
+                    "DGL import failed for the official Benchmarking-GNNs GIN adapter: "
+                    f"{message}"
+                ) from exc
 
         if not hasattr(dgl_fn, "copy_src") and hasattr(dgl_fn, "copy_u"):
             def copy_src(src: str | None = None, out: str | None = None, **kwargs: Any) -> Any:
@@ -1551,6 +1570,40 @@ class OfficialBenchmarkingGNNsGINAdapter:
                 return dgl_fn.copy_v(dst, out)
 
             dgl_fn.copy_dst = copy_dst  # type: ignore[attr-defined]
+
+    @staticmethod
+    def _patch_dgl_graphbolt_import() -> bool:
+        try:
+            import site
+            import sysconfig
+        except Exception:
+            return False
+        roots: list[Path] = []
+        for raw in [*site.getsitepackages(), sysconfig.get_paths().get("purelib", ""), sysconfig.get_paths().get("platlib", "")]:
+            if raw:
+                root = Path(str(raw))
+                if root not in roots:
+                    roots.append(root)
+        replacement = '''try:
+    load_graphbolt()
+except FileNotFoundError as exc:
+    import warnings
+    warnings.warn(f"Skipping unavailable DGL GraphBolt extension: {exc}")
+'''
+        patched = False
+        for root in roots:
+            init_py = root / "dgl" / "graphbolt" / "__init__.py"
+            if not init_py.exists():
+                continue
+            text = init_py.read_text(encoding="utf-8")
+            if "Skipping unavailable DGL GraphBolt extension" in text:
+                patched = True
+                continue
+            if "\nload_graphbolt()\n" not in text:
+                continue
+            init_py.write_text(text.replace("\nload_graphbolt()\n", "\n" + replacement), encoding="utf-8")
+            patched = True
+        return patched
 
     def _config_payload(self) -> dict[str, Any]:
         with self.config_path.open("r", encoding="utf-8") as f:

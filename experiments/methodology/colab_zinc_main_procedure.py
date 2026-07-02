@@ -204,6 +204,47 @@ def pip_install(args: Sequence[str], *, check: bool = True) -> subprocess.Comple
     return run_cmd([sys.executable, "-m", "pip", "install", *args], check=check)
 
 
+def patch_dgl_graphbolt_import() -> bool:
+    """Let DGL import on Colab Torch versions that lack a GraphBolt binary.
+
+    The official Benchmarking-GNNs GIN path uses DGLGraph/message passing, not
+    GraphBolt. Current Colab Torch wheels can be newer than DGL's packaged
+    GraphBolt extension, causing ``import dgl`` to fail before the GIN code is
+    reached. We make that optional extension best-effort after installation.
+    """
+
+    import site
+    import sysconfig
+
+    roots: list[Path] = []
+    for raw in [*site.getsitepackages(), sysconfig.get_paths().get("purelib", ""), sysconfig.get_paths().get("platlib", "")]:
+        if raw:
+            root = Path(str(raw))
+            if root not in roots:
+                roots.append(root)
+    patched = False
+    replacement = '''try:
+    load_graphbolt()
+except FileNotFoundError as exc:
+    import warnings
+    warnings.warn(f"Skipping unavailable DGL GraphBolt extension: {exc}")
+'''
+    for root in roots:
+        init_py = root / "dgl" / "graphbolt" / "__init__.py"
+        if not init_py.exists():
+            continue
+        text = init_py.read_text(encoding="utf-8")
+        if "Skipping unavailable DGL GraphBolt extension" in text:
+            patched = True
+            continue
+        if "\nload_graphbolt()\n" not in text:
+            continue
+        init_py.write_text(text.replace("\nload_graphbolt()\n", "\n" + replacement), encoding="utf-8")
+        print(f"[deps] patched optional DGL GraphBolt loader: {init_py}", flush=True)
+        patched = True
+    return patched
+
+
 def write_json(path: Path, payload: Mapping[str, Any]) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as f:
@@ -419,11 +460,57 @@ def apply_colab_repo_hotfixes(repo_dir: Path) -> None:
         return
     text = adapters.read_text(encoding="utf-8")
     fixed = text.replace("torch.inference_mode()", "torch.no_grad()")
+    if "import os\n" not in fixed:
+        fixed = fixed.replace("import math\n", "import math\nimport os\n", 1)
+    dgl_start = fixed.find("    @staticmethod\n    def _install_dgl_compat")
+    dgl_end = fixed.find("\n    def _config_payload", dgl_start)
+    if dgl_start != -1 and dgl_end != -1 and "DGL import failed for the official Benchmarking-GNNs GIN adapter" not in fixed[dgl_start:dgl_end]:
+        new_dgl_compat = '''    @staticmethod
+    def _install_dgl_compat() -> None:
+        os.environ.setdefault("DGLBACKEND", "pytorch")
+        try:
+            import dgl  # noqa: F401
+            import dgl.function as dgl_fn
+        except Exception as exc:  # pragma: no cover - optional dependency.
+            raise RuntimeError(
+                "DGL import failed for the official Benchmarking-GNNs GIN adapter: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+
+        if not hasattr(dgl_fn, "copy_src") and hasattr(dgl_fn, "copy_u"):
+            def copy_src(src: str | None = None, out: str | None = None, **kwargs: Any) -> Any:
+                src = kwargs.get("src", src)
+                out = kwargs.get("out", out)
+                if src is None or out is None:
+                    raise TypeError("copy_src requires src and out")
+                return dgl_fn.copy_u(src, out)
+
+            dgl_fn.copy_src = copy_src  # type: ignore[attr-defined]
+        if not hasattr(dgl_fn, "copy_edge") and hasattr(dgl_fn, "copy_e"):
+            def copy_edge(edge: str | None = None, out: str | None = None, **kwargs: Any) -> Any:
+                edge = kwargs.get("edge", edge)
+                out = kwargs.get("out", out)
+                if edge is None or out is None:
+                    raise TypeError("copy_edge requires edge and out")
+                return dgl_fn.copy_e(edge, out)
+
+            dgl_fn.copy_edge = copy_edge  # type: ignore[attr-defined]
+        if not hasattr(dgl_fn, "copy_dst") and hasattr(dgl_fn, "copy_v"):
+            def copy_dst(dst: str | None = None, out: str | None = None, **kwargs: Any) -> Any:
+                dst = kwargs.get("dst", dst)
+                out = kwargs.get("out", out)
+                if dst is None or out is None:
+                    raise TypeError("copy_dst requires dst and out")
+                return dgl_fn.copy_v(dst, out)
+
+            dgl_fn.copy_dst = copy_dst  # type: ignore[attr-defined]
+'''
+        fixed = fixed[:dgl_start] + new_dgl_compat + fixed[dgl_end:]
     if fixed != text:
         adapters.write_text(fixed, encoding="utf-8")
-        print("[hotfix] replaced unsafe torch.inference_mode() with torch.no_grad() in method_adapters.py", flush=True)
+        print("[hotfix] updated method_adapters.py for Colab compatibility", flush=True)
     else:
-        print("[hotfix] method_adapters.py already avoids torch.inference_mode()", flush=True)
+        print("[hotfix] method_adapters.py already has required Colab compatibility", flush=True)
 
     intervention = repo_dir / "src" / "graph_specialisation_metrics" / "grit_intervention_procedure.py"
     if not intervention.exists():
@@ -450,15 +537,82 @@ def apply_colab_repo_hotfixes(repo_dir: Path) -> None:
     return all_pair_distances_or_compute(pyg_graph_view(graph)).cpu()
 '''
     fixed = fixed.replace(old_distance_helper, new_distance_helper)
+    if "skip_failed_optional_adapters" not in fixed:
+        fn_start = fixed.find("def instantiate_official_models(")
+        fn_end = fixed.find("\ndef render_distance_profile(", fn_start)
+        if fn_start != -1 and fn_end != -1:
+            new_instantiate = '''def instantiate_official_models(config: Mapping[str, Any], discovery: Sequence[Mapping[str, Any]]) -> list[ModelRun]:
+    out: list[ModelRun] = []
+    device = str(config.get("device", "cuda" if torch.cuda.is_available() else "cpu"))
+    seed = int(config.get("seeds", [0])[0])
+    runtime_cfg = config.get("runtime", {}) if isinstance(config.get("runtime", {}), Mapping) else {}
+    skip_failed_optional = bool(runtime_cfg.get("skip_failed_optional_adapters", True))
+    for entry in discovery:
+        if not entry.get("checkpoint_candidates") or not entry.get("config_candidates"):
+            continue
+        name = str(entry["model"])
+        model_cfg = config["models"][name]
+        adapter_kind = str(entry.get("adapter", model_cfg.get("adapter", ""))).strip().lower()
+        model_device = str(model_cfg.get("device", device))
+        role = str(model_cfg.get("role", ""))
+        is_optional_reference = any(token in role.lower() for token in ("reference", "validation")) or name.lower() in {"gin", "gcn"}
+        try:
+            if adapter_kind == "official_grit":
+                adapter = OfficialGRITAdapter(
+                    repo_path=Path(str(model_cfg.get("repo_path", "external/GRIT"))),
+                    config_path=Path(str(model_cfg.get("config_path") or entry["config_candidates"][0])),
+                    checkpoint_path=Path(str(model_cfg.get("checkpoint_path") or entry["checkpoint_candidates"][0])),
+                    variant=str(model_cfg.get("variant", name)),
+                    official_commit=str(model_cfg.get("official_commit", "")) or None,
+                    dataset_dir=Path(str(model_cfg["dataset_dir"])) if model_cfg.get("dataset_dir") else None,
+                    device=model_device,
+                    seed=seed,
+                )
+            elif adapter_kind in {"pyg_gin", "official_pyg_gin"}:
+                adapter = OfficialPyGGINAdapter(
+                    config_path=Path(str(model_cfg.get("config_path") or entry["config_candidates"][0])),
+                    checkpoint_path=Path(str(model_cfg.get("checkpoint_path") or entry["checkpoint_candidates"][0])),
+                    dataset_dir=Path(str(model_cfg["dataset_dir"])) if model_cfg.get("dataset_dir") else None,
+                    device=model_device,
+                    seed=seed,
+                )
+            elif adapter_kind in {"benchmarking_gnns_gin", "official_benchmarking_gnns_gin", "official_dgl_gin"}:
+                adapter = OfficialBenchmarkingGNNsGINAdapter(
+                    repo_path=Path(str(model_cfg.get("repo_path", "external/benchmarking-gnns"))),
+                    config_path=Path(str(model_cfg.get("config_path") or entry["config_candidates"][0])),
+                    checkpoint_path=Path(str(model_cfg.get("checkpoint_path") or entry["checkpoint_candidates"][0])),
+                    dataset_dir=Path(str(model_cfg["dataset_dir"])) if model_cfg.get("dataset_dir") else None,
+                    device=model_device,
+                    seed=seed,
+                    official_commit=str(model_cfg.get("official_commit", "")) or None,
+                )
+            else:
+                continue
+            if is_optional_reference and bool(model_cfg.get("validate_on_load", True)):
+                _ = adapter.parameter_count()
+                if adapter_kind in {"benchmarking_gnns_gin", "official_benchmarking_gnns_gin", "official_dgl_gin"}:
+                    smoke_graphs = adapter.load_zinc_split("test", limit=1)
+                    if smoke_graphs:
+                        _ = adapter.forward(smoke_graphs[0])
+        except Exception as exc:
+            if is_optional_reference and skip_failed_optional:
+                progress(f"skipping optional reference adapter {name}: {type(exc).__name__}: {exc}")
+                continue
+            raise
+        out.append(ModelRun(name=name, adapter=adapter, role=role, variant=str(model_cfg.get("variant", ""))))
+    return out
+'''
+            fixed = fixed[:fn_start] + new_instantiate + fixed[fn_end:]
     if fixed != text:
         intervention.write_text(fixed, encoding="utf-8")
-        print("[hotfix] forced molecular-hop distance helper in grit_intervention_procedure.py", flush=True)
+        print("[hotfix] updated grit_intervention_procedure.py for molecular distances and optional references", flush=True)
     else:
-        print("[hotfix] grit_intervention_procedure.py already uses molecular-hop distances", flush=True)
+        print("[hotfix] grit_intervention_procedure.py already has required Colab compatibility", flush=True)
 
 
 def install_repo(repo_dir: Path, *, pyg_version: str) -> None:
     apply_colab_repo_hotfixes(repo_dir)
+    os.environ.setdefault("DGLBACKEND", "pytorch")
     run_cmd([sys.executable, "-m", "pip", "install", "--upgrade", "pip", "setuptools<82", "wheel"])
     run_cmd([sys.executable, "-m", "pip", "install", "-q", "pyyaml", "networkx", "matplotlib", "numpy", "scipy", "pandas"])
 
@@ -489,11 +643,26 @@ def install_repo(repo_dir: Path, *, pyg_version: str) -> None:
             "scikit-learn>=1.0",
         ]
     )
-    dgl_proc = pip_install(["torchdata", "dgl"], check=False)
-    if dgl_proc.returncode != 0:
+    dgl_proc = pip_install(["torchdata==0.8.0", "--no-deps"], check=False)
+    if dgl_proc.returncode == 0:
+        dgl_proc = pip_install(["dgl==2.1.0"], check=False)
+    if dgl_proc.returncode == 0:
+        patch_dgl_graphbolt_import()
+    if dgl_proc.returncode == 0:
+        dgl_verify = run_cmd(
+            [
+                sys.executable,
+                "-c",
+                "import torchdata.datapipes.iter; import dgl; import dgl.function; print('[deps] DGL import check passed')",
+            ],
+            check=False,
+        )
+    else:
+        dgl_verify = dgl_proc
+    if dgl_proc.returncode != 0 or dgl_verify.returncode != 0:
         print(
-            "[deps-warning] DGL install failed; dense/1-hop GRIT can still run, "
-            "but the official Benchmarking-GNNs GIN reference will require DGL.",
+            "[deps-warning] DGL install/import failed; dense/1-hop GRIT can still run. "
+            "The official Benchmarking-GNNs GIN reference will be attempted and skipped if unusable.",
             flush=True,
         )
     run_cmd([sys.executable, "-m", "pip", "install", "-q", "-e", str(repo_dir), "--no-deps"])
@@ -1124,6 +1293,7 @@ def build_zinc_config(
             "role": "local_validation_reference",
             "official_repo": OFFICIAL_GIN_REPO,
             "official_commit": OFFICIAL_GIN_COMMIT,
+            "device": "cpu",
             "repo_path": str(gin_repo),
             "artifact_root": str(gin_prepared),
             "dataset_dir": str(gin_dataset_dir or dense_dataset_dir),
@@ -1133,10 +1303,10 @@ def build_zinc_config(
     if include_local_references:
         if "gin" not in models:
             models["gin"] = {
-                    "adapter": "pyg_gin",
-                    "role": "local_validation_reference",
-                    "artifact_root": str(artifact_root / "missing_gin_reference"),
-                    "dataset_dir": str(dense_dataset_dir),
+                "adapter": "pyg_gin",
+                "role": "local_validation_reference",
+                "artifact_root": str(artifact_root / "missing_gin_reference"),
+                "dataset_dir": str(dense_dataset_dir),
             }
         models["gcn"] = {
             "adapter": "pyg_gcn",
@@ -1166,6 +1336,7 @@ def build_zinc_config(
             "swap_partner_policy": "different_type",
         },
         "models": models,
+        "runtime": {"skip_failed_optional_adapters": True},
         "steps": {
             "0": {
                 "name": "measurement_model_validation",
@@ -1429,7 +1600,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--require-gin-reference",
         dest="allow_missing_gin_reference",
         action="store_false",
-        help="Fail if the trained official Benchmarking-GNNs GIN reference is missing.",
+        help="Fail if the trained official Benchmarking-GNNs GIN reference is missing or cannot be loaded.",
     )
     parser.add_argument("--skip-onehop-locality-check", action="store_true", help="Skip the hard preflight that certifies the 1-hop control is local.")
     parser.add_argument("--onehop-locality-check-graphs", type=int, default=4, help="Number of ZINC test graphs used for the 1-hop locality preflight.")
@@ -1587,6 +1758,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         single_seed=args.single_seed,
         include_local_references=bool(args.include_local_references),
     )
+    if not args.allow_missing_gin_reference:
+        cfg.setdefault("runtime", {})["skip_failed_optional_adapters"] = False
     config_path = write_yaml(args.drive_root / "configs" / "zinc_main_procedure_colab.yaml", cfg)
     model_names = sorted((cfg.get("models") or {}).keys())
     print(f"[config] models included: {', '.join(model_names)}", flush=True)

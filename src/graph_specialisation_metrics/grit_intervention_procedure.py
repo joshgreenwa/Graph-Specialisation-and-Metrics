@@ -1181,44 +1181,61 @@ def instantiate_official_models(config: Mapping[str, Any], discovery: Sequence[M
     out: list[ModelRun] = []
     device = str(config.get("device", "cuda" if torch.cuda.is_available() else "cpu"))
     seed = int(config.get("seeds", [0])[0])
+    runtime_cfg = config.get("runtime", {}) if isinstance(config.get("runtime", {}), Mapping) else {}
+    skip_failed_optional = bool(runtime_cfg.get("skip_failed_optional_adapters", True))
     for entry in discovery:
         if not entry.get("checkpoint_candidates") or not entry.get("config_candidates"):
             continue
         name = str(entry["model"])
         model_cfg = config["models"][name]
         adapter_kind = str(entry.get("adapter", model_cfg.get("adapter", ""))).strip().lower()
-        if adapter_kind == "official_grit":
-            adapter = OfficialGRITAdapter(
-                repo_path=Path(str(model_cfg.get("repo_path", "external/GRIT"))),
-                config_path=Path(str(model_cfg.get("config_path") or entry["config_candidates"][0])),
-                checkpoint_path=Path(str(model_cfg.get("checkpoint_path") or entry["checkpoint_candidates"][0])),
-                variant=str(model_cfg.get("variant", name)),
-                official_commit=str(model_cfg.get("official_commit", "")) or None,
-                dataset_dir=Path(str(model_cfg["dataset_dir"])) if model_cfg.get("dataset_dir") else None,
-                device=device,
-                seed=seed,
-            )
-        elif adapter_kind in {"pyg_gin", "official_pyg_gin"}:
-            adapter = OfficialPyGGINAdapter(
-                config_path=Path(str(model_cfg.get("config_path") or entry["config_candidates"][0])),
-                checkpoint_path=Path(str(model_cfg.get("checkpoint_path") or entry["checkpoint_candidates"][0])),
-                dataset_dir=Path(str(model_cfg["dataset_dir"])) if model_cfg.get("dataset_dir") else None,
-                device=device,
-                seed=seed,
-            )
-        elif adapter_kind in {"benchmarking_gnns_gin", "official_benchmarking_gnns_gin", "official_dgl_gin"}:
-            adapter = OfficialBenchmarkingGNNsGINAdapter(
-                repo_path=Path(str(model_cfg.get("repo_path", "external/benchmarking-gnns"))),
-                config_path=Path(str(model_cfg.get("config_path") or entry["config_candidates"][0])),
-                checkpoint_path=Path(str(model_cfg.get("checkpoint_path") or entry["checkpoint_candidates"][0])),
-                dataset_dir=Path(str(model_cfg["dataset_dir"])) if model_cfg.get("dataset_dir") else None,
-                device=device,
-                seed=seed,
-                official_commit=str(model_cfg.get("official_commit", "")) or None,
-            )
-        else:
-            continue
-        out.append(ModelRun(name=name, adapter=adapter, role=str(model_cfg.get("role", "")), variant=str(model_cfg.get("variant", ""))))
+        model_device = str(model_cfg.get("device", device))
+        role = str(model_cfg.get("role", ""))
+        is_optional_reference = any(token in role.lower() for token in ("reference", "validation")) or name.lower() in {"gin", "gcn"}
+        try:
+            if adapter_kind == "official_grit":
+                adapter = OfficialGRITAdapter(
+                    repo_path=Path(str(model_cfg.get("repo_path", "external/GRIT"))),
+                    config_path=Path(str(model_cfg.get("config_path") or entry["config_candidates"][0])),
+                    checkpoint_path=Path(str(model_cfg.get("checkpoint_path") or entry["checkpoint_candidates"][0])),
+                    variant=str(model_cfg.get("variant", name)),
+                    official_commit=str(model_cfg.get("official_commit", "")) or None,
+                    dataset_dir=Path(str(model_cfg["dataset_dir"])) if model_cfg.get("dataset_dir") else None,
+                    device=model_device,
+                    seed=seed,
+                )
+            elif adapter_kind in {"pyg_gin", "official_pyg_gin"}:
+                adapter = OfficialPyGGINAdapter(
+                    config_path=Path(str(model_cfg.get("config_path") or entry["config_candidates"][0])),
+                    checkpoint_path=Path(str(model_cfg.get("checkpoint_path") or entry["checkpoint_candidates"][0])),
+                    dataset_dir=Path(str(model_cfg["dataset_dir"])) if model_cfg.get("dataset_dir") else None,
+                    device=model_device,
+                    seed=seed,
+                )
+            elif adapter_kind in {"benchmarking_gnns_gin", "official_benchmarking_gnns_gin", "official_dgl_gin"}:
+                adapter = OfficialBenchmarkingGNNsGINAdapter(
+                    repo_path=Path(str(model_cfg.get("repo_path", "external/benchmarking-gnns"))),
+                    config_path=Path(str(model_cfg.get("config_path") or entry["config_candidates"][0])),
+                    checkpoint_path=Path(str(model_cfg.get("checkpoint_path") or entry["checkpoint_candidates"][0])),
+                    dataset_dir=Path(str(model_cfg["dataset_dir"])) if model_cfg.get("dataset_dir") else None,
+                    device=model_device,
+                    seed=seed,
+                    official_commit=str(model_cfg.get("official_commit", "")) or None,
+                )
+            else:
+                continue
+            if is_optional_reference and bool(model_cfg.get("validate_on_load", True)):
+                _ = adapter.parameter_count()
+                if adapter_kind in {"benchmarking_gnns_gin", "official_benchmarking_gnns_gin", "official_dgl_gin"}:
+                    smoke_graphs = adapter.load_zinc_split("test", limit=1)
+                    if smoke_graphs:
+                        _ = adapter.forward(smoke_graphs[0])
+        except Exception as exc:
+            if is_optional_reference and skip_failed_optional:
+                progress(f"skipping optional reference adapter {name}: {type(exc).__name__}: {exc}")
+                continue
+            raise
+        out.append(ModelRun(name=name, adapter=adapter, role=role, variant=str(model_cfg.get("variant", ""))))
     return out
 
 
