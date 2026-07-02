@@ -1750,6 +1750,7 @@ __all__ = []
             "layer_input_node_states": [],
             "layer_output_node_states": [],
             "layer_output_node_state_tensors": [],
+            "readout_state_tensors": [],
         }
         hidden_rep = [h]
         for layer_idx in range(int(model.n_layers)):
@@ -1779,6 +1780,7 @@ __all__ = []
             score = pred if score is None else score + pred
         assert score is not None
         readout_states = torch.cat(hidden_rep, dim=-1)
+        extras["readout_state_tensors"] = hidden_rep
         return score.view(-1), readout_states, extras
 
     def forward_from_encoded_content(
@@ -1842,13 +1844,28 @@ __all__ = []
             capture_layer_outputs=capture_layer_outputs,
         )
         pred = cache.prediction.reshape(-1)[int(target_index)]
-        (grad,) = torch.autograd.grad(
-            pred,
-            cache.final_node_states,
-            retain_graph=False,
-            create_graph=False,
-            allow_unused=False,
-        )
+        readout_tensors = list((cache.extras or {}).get("readout_state_tensors", []))
+        if readout_tensors:
+            grads = torch.autograd.grad(
+                pred,
+                readout_tensors,
+                retain_graph=False,
+                create_graph=False,
+                allow_unused=True,
+            )
+            pieces = [
+                (torch.zeros_like(tensor) if grad is None else grad)
+                for tensor, grad in zip(readout_tensors, grads)
+            ]
+            grad = torch.cat(pieces, dim=-1)
+        else:
+            (grad,) = torch.autograd.grad(
+                pred,
+                cache.final_node_states,
+                retain_graph=False,
+                create_graph=False,
+                allow_unused=False,
+            )
         return cache, grad.detach().clone()
 
     def predict(self, graph: GraphBatchView) -> torch.Tensor:

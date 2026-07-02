@@ -515,6 +515,71 @@ def apply_colab_repo_hotfixes(repo_dir: Path) -> None:
             dgl_fn.copy_dst = copy_dst  # type: ignore[attr-defined]
 '''
         fixed = fixed[:dgl_start] + new_dgl_compat + fixed[dgl_end:]
+    gin_marker = "class OfficialBenchmarkingGNNsGINAdapter:"
+    if gin_marker in fixed:
+        prefix, gin_part = fixed.split(gin_marker, 1)
+        if "readout_state_tensors" not in gin_part:
+            old_extras = '''        extras: dict[str, Any] = {
+            "layer_input_node_states": [],
+            "layer_output_node_states": [],
+            "layer_output_node_state_tensors": [],
+        }
+        hidden_rep = [h]
+'''
+            new_extras = '''        extras: dict[str, Any] = {
+            "layer_input_node_states": [],
+            "layer_output_node_states": [],
+            "layer_output_node_state_tensors": [],
+            "readout_state_tensors": [],
+        }
+        hidden_rep = [h]
+'''
+            old_readout_return = '''        assert score is not None
+        readout_states = torch.cat(hidden_rep, dim=-1)
+        return score.view(-1), readout_states, extras
+'''
+            new_readout_return = '''        assert score is not None
+        readout_states = torch.cat(hidden_rep, dim=-1)
+        extras["readout_state_tensors"] = hidden_rep
+        return score.view(-1), readout_states, extras
+'''
+            old_gin_grad = '''        (grad,) = torch.autograd.grad(
+            pred,
+            cache.final_node_states,
+            retain_graph=False,
+            create_graph=False,
+            allow_unused=False,
+        )
+        return cache, grad.detach().clone()
+'''
+            new_gin_grad = '''        readout_tensors = list((cache.extras or {}).get("readout_state_tensors", []))
+        if readout_tensors:
+            grads = torch.autograd.grad(
+                pred,
+                readout_tensors,
+                retain_graph=False,
+                create_graph=False,
+                allow_unused=True,
+            )
+            pieces = [
+                (torch.zeros_like(tensor) if grad is None else grad)
+                for tensor, grad in zip(readout_tensors, grads)
+            ]
+            grad = torch.cat(pieces, dim=-1)
+        else:
+            (grad,) = torch.autograd.grad(
+                pred,
+                cache.final_node_states,
+                retain_graph=False,
+                create_graph=False,
+                allow_unused=False,
+            )
+        return cache, grad.detach().clone()
+'''
+            gin_part = gin_part.replace(old_extras, new_extras, 1)
+            gin_part = gin_part.replace(old_readout_return, new_readout_return, 1)
+            gin_part = gin_part.replace(old_gin_grad, new_gin_grad, 1)
+            fixed = prefix + gin_marker + gin_part
     if fixed != text:
         adapters.write_text(fixed, encoding="utf-8")
         print("[hotfix] updated method_adapters.py for Colab compatibility", flush=True)
