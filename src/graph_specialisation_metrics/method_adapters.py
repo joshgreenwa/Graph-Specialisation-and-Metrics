@@ -1525,7 +1525,9 @@ class OfficialBenchmarkingGNNsGINAdapter:
             import dgl.function as dgl_fn
         except Exception as exc:  # pragma: no cover - optional dependency.
             message = f"{type(exc).__name__}: {exc}"
-            if "graphbolt" in message.lower() and OfficialBenchmarkingGNNsGINAdapter._patch_dgl_graphbolt_import():
+            lower_message = message.lower()
+            graphbolt_related = "graphbolt" in lower_message or "datapipe function name copy_to" in lower_message
+            if graphbolt_related and OfficialBenchmarkingGNNsGINAdapter._patch_dgl_graphbolt_import():
                 for module_name in list(sys.modules):
                     if module_name == "dgl" or module_name.startswith("dgl."):
                         sys.modules.pop(module_name, None)
@@ -1584,11 +1586,15 @@ class OfficialBenchmarkingGNNsGINAdapter:
                 root = Path(str(raw))
                 if root not in roots:
                     roots.append(root)
-        replacement = '''try:
-    load_graphbolt()
-except FileNotFoundError as exc:
-    import warnings
-    warnings.warn(f"Skipping unavailable DGL GraphBolt extension: {exc}")
+        stub = '''"""Compatibility stub for optional DGL GraphBolt.
+
+The official Benchmarking-GNNs GIN adapter uses ordinary DGL graphs and message
+passing, not GraphBolt. Some DGL wheels do not ship a GraphBolt extension for
+the active torch version, so importing the real GraphBolt module fails before
+DGL itself can be used.
+"""
+
+__all__ = []
 '''
         patched = False
         for root in roots:
@@ -1596,12 +1602,13 @@ except FileNotFoundError as exc:
             if not init_py.exists():
                 continue
             text = init_py.read_text(encoding="utf-8")
-            if "Skipping unavailable DGL GraphBolt extension" in text:
+            if "Compatibility stub for optional DGL GraphBolt" in text:
                 patched = True
                 continue
-            if "\nload_graphbolt()\n" not in text:
-                continue
-            init_py.write_text(text.replace("\nload_graphbolt()\n", "\n" + replacement), encoding="utf-8")
+            backup = init_py.with_suffix(".py.original_graphbolt")
+            if not backup.exists():
+                backup.write_text(text, encoding="utf-8")
+            init_py.write_text(stub, encoding="utf-8")
             patched = True
         return patched
 

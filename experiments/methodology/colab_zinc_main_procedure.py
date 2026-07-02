@@ -210,7 +210,8 @@ def patch_dgl_graphbolt_import() -> bool:
     The official Benchmarking-GNNs GIN path uses DGLGraph/message passing, not
     GraphBolt. Current Colab Torch wheels can be newer than DGL's packaged
     GraphBolt extension, causing ``import dgl`` to fail before the GIN code is
-    reached. We make that optional extension best-effort after installation.
+    reached. Stubbing GraphBolt is narrower than changing the DGL version and
+    prevents partial failed imports from registering torchdata DataPipes twice.
     """
 
     import site
@@ -223,25 +224,33 @@ def patch_dgl_graphbolt_import() -> bool:
             if root not in roots:
                 roots.append(root)
     patched = False
-    replacement = '''try:
-    load_graphbolt()
-except FileNotFoundError as exc:
-    import warnings
-    warnings.warn(f"Skipping unavailable DGL GraphBolt extension: {exc}")
+    stub = '''"""Colab compatibility stub for optional DGL GraphBolt.
+
+The dissertation GIN reference uses ordinary DGL graphs and message passing,
+not GraphBolt. The pip DGL wheel can lack a GraphBolt extension for Colab's
+newer torch build, so importing the real module fails before DGL itself is
+usable. This stub is written by colab_zinc_main_procedure.py after installing
+DGL.
+"""
+
+__all__ = []
 '''
     for root in roots:
         init_py = root / "dgl" / "graphbolt" / "__init__.py"
         if not init_py.exists():
             continue
         text = init_py.read_text(encoding="utf-8")
-        if "Skipping unavailable DGL GraphBolt extension" in text:
+        if "Colab compatibility stub for optional DGL GraphBolt" in text:
             patched = True
             continue
-        if "\nload_graphbolt()\n" not in text:
-            continue
-        init_py.write_text(text.replace("\nload_graphbolt()\n", "\n" + replacement), encoding="utf-8")
-        print(f"[deps] patched optional DGL GraphBolt loader: {init_py}", flush=True)
+        backup = init_py.with_suffix(".py.original_graphbolt")
+        if not backup.exists():
+            backup.write_text(text, encoding="utf-8")
+        init_py.write_text(stub, encoding="utf-8")
+        print(f"[deps] stubbed optional DGL GraphBolt package: {init_py}", flush=True)
         patched = True
+    if not patched:
+        print("[deps-warning] DGL GraphBolt package was not found to patch.", flush=True)
     return patched
 
 
