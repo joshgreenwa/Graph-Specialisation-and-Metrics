@@ -3030,7 +3030,12 @@ def run_step4(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
                         "patch_max_distance": max_distance if max_distance is not None else "",
                     }
                 )
-                if not gate_pass:
+                # Do NOT hard-gate on the noise floor. Patch every selected (distance-stratified,
+                # capped) pair whose unclamped carriage is above the trivial-zero threshold, and let
+                # the ratio-of-sums aggregation (weighted_direct_fraction) down-weight noise by
+                # magnitude. Skipping only truly-zero pairs (|C| < min_effect_abs) avoids 0/0 without
+                # discarding real-but-small signal, and keeps the estimator on ALL measured samples.
+                if abs(float(c[carrier, source].item())) < float(min_effect_abs):
                     continue
                 cut = mediator_cut(graph, carrier, source)
                 if not cut:
@@ -4011,7 +4016,8 @@ def run_step5(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
                         "reference_floor_cap_fraction": gate_floor_cap_fraction,
                     }
                 )
-                if not gate_pass:
+                # Patch all measured samples (see Step 4): skip only truly-zero unclamped carriage.
+                if abs(float(c[carrier, source].item())) < float(min_effect_abs):
                     continue
                 cut = mediator_cut(graph, carrier, source)
                 if not cut:
@@ -4190,18 +4196,9 @@ def run_step5(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
             candidate_pairs = far_pairs(dist, tau, max_pairs=per_graph_interactions * 4, seed=seed + 1000 + graph_idx)
             pairs: list[tuple[int, int]] = []
             for carrier, source in candidate_pairs:
-                gate_pass, _, _ = pair_passes_signal_gate(
-                    c,
-                    dist,
-                    carrier,
-                    source,
-                    enabled=use_signal_gate,
-                    quantile=gate_quantile,
-                    min_floor=min_effect_abs,
-                    reference_floor=onehop_floor,
-                    reference_floor_cap_fraction=gate_floor_cap_fraction,
-                )
-                if gate_pass:
+                # Measure non-additivity only on pairs with real (non-trivial) carriage, using the
+                # same trivial-zero threshold as patching rather than the aggressive noise gate.
+                if abs(float(c[carrier, source].item())) >= float(min_effect_abs):
                     pairs.append((carrier, source))
                 if len(pairs) >= per_graph_interactions:
                     break
