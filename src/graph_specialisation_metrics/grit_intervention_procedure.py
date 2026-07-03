@@ -4346,6 +4346,17 @@ def run_step5(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
     vnode_decision = summarize_vnode_decision(rank_rows, interaction_rows, model=dense.name)
     write_json(artifact_root / "metrics" / "step5_vnode_decision.json", vnode_decision)
     write_csv(artifact_root / "metrics" / "step5_vnode_decision.csv", [vnode_decision])
+    signal_vs_noise = render_step5_signal_vs_noise(rank_rows, artifact_root, dpi=dpi)
+    write_json(artifact_root / "metrics" / "step5_signal_vs_noise.json", signal_vs_noise)
+    if signal_vs_noise.get("status") == "computed":
+        progress(
+            "Step 5 signal-vs-noise (dense far carriage): observed_top_share="
+            f"{safe_float(signal_vs_noise.get('observed_top_share_mean')):.3f} vs null="
+            f"{safe_float(signal_vs_noise.get('null_top_share_mean')):.3f}; above-null margin="
+            f"{safe_float(signal_vs_noise.get('above_null_margin_mean')):.3f} "
+            f"[{safe_float(signal_vs_noise.get('above_null_margin_ci_low')):.3f}, "
+            f"{safe_float(signal_vs_noise.get('above_null_margin_ci_high')):.3f}] -> {signal_vs_noise.get('verdict')}"
+        )
     render_step5(gap_rows, rank_rows, interaction_rows, artifact_root, dpi=dpi)
     render_step5_vnode_decision(vnode_decision, artifact_root, dpi=dpi)
     render_step5_rung_funnel(rung_rows, artifact_root, dpi=dpi)
@@ -4726,6 +4737,73 @@ def non_additivity_summary_rows(
         mean, lo, hi = bootstrap_ci(values, seed=5100 + len(out), draws=1000)
         out.append({"model": model, "mean_non_additivity": mean, "ci_low": lo, "ci_high": hi, "pairs": len(values)})
     return out
+
+
+def render_step5_signal_vs_noise(rank_rows: Sequence[Mapping[str, Any]], artifact_root: Path, *, dpi: int) -> dict[str, Any]:
+    """Standalone signal-vs-noise verdict for dense far carriage.
+
+    Compares the observed far-carriage structure (top singular-value share) against
+    a distance-preserving shuffle null (source labels permuted within each distance
+    bin). If the observed structure exceeds the null with a CI that excludes zero,
+    the far carriage carries resolvable signal above chance; if the margin CI
+    includes zero, what is there is at the noise floor — "nothing above noise".
+    """
+    rows = [r for r in rank_rows if bool(r.get("primary_tau", True))] or list(rank_rows)
+    pairs = [
+        (safe_float(r.get("top_singular_share")), safe_float(r.get("above_null_margin")))
+        for r in rows
+        if math.isfinite(safe_float(r.get("top_singular_share"))) and math.isfinite(safe_float(r.get("above_null_margin")))
+    ]
+    if len(pairs) < 2:
+        return {"status": "insufficient_far_carriage_rows", "n": len(pairs)}
+    obs_v = [o for o, _ in pairs]
+    null_v = [max(0.0, o - m) for o, m in pairs]  # null share = observed - margin
+    marg_v = [m for _, m in pairs]
+    o_mean, o_lo, o_hi = bootstrap_ci(obs_v, seed=8123, draws=1000)
+    n_mean, n_lo, n_hi = bootstrap_ci(null_v, seed=8124, draws=1000)
+    m_mean, m_lo, m_hi = bootstrap_ci(marg_v, seed=8125, draws=1000)
+    signal = bool(math.isfinite(m_lo) and m_lo > 0.0)
+    verdict = (
+        "structured signal ABOVE noise (margin CI excludes 0)"
+        if signal
+        else "at the noise floor (margin CI includes 0): nothing resolvable above noise"
+    )
+    figures = ensure_dir(artifact_root / "figures")
+    fig, ax = plt.subplots(figsize=(6.8, 4.8), constrained_layout=True)
+    labels = ["observed\nfar carriage", "distance-preserving\nshuffle null"]
+    means = [o_mean, n_mean]
+    errs = np.vstack(
+        [
+            [max(0.0, o_mean - o_lo), max(0.0, n_mean - n_lo)],
+            [max(0.0, o_hi - o_mean), max(0.0, n_hi - n_mean)],
+        ]
+    )
+    ax.bar(labels, means, yerr=errs, capsize=4, color=["#4c78a8", "#999999"])
+    ax.set_ylabel("Top singular-value share (structure)")
+    ax.set_ylim(0.0, 1.05)
+    ax.set_title(f"Dense far carriage: signal vs noise\n{verdict}", fontsize=10)
+    ax.text(
+        0.5,
+        min(1.02, max(means) + 0.08),
+        f"above-null margin = {m_mean:.3f} [{m_lo:.3f}, {m_hi:.3f}]  (n={len(pairs)} graphs)",
+        ha="center",
+        fontsize=9,
+        transform=ax.get_xaxis_transform(),
+    )
+    fig.savefig(figures / "step5_signal_vs_noise.png", dpi=dpi)
+    fig.savefig(figures / "step5_signal_vs_noise.pdf")
+    plt.close(fig)
+    return {
+        "status": "computed",
+        "n_graphs": len(pairs),
+        "observed_top_share_mean": o_mean,
+        "null_top_share_mean": n_mean,
+        "above_null_margin_mean": m_mean,
+        "above_null_margin_ci_low": m_lo,
+        "above_null_margin_ci_high": m_hi,
+        "signal_above_noise": signal,
+        "verdict": verdict,
+    }
 
 
 def render_step5(
