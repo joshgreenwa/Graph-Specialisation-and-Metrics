@@ -3228,6 +3228,18 @@ def run_step4(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
             )
     validation_summary = mediator_validation_summary(rows)
     write_csv(artifact_root / "metrics" / "step4_mediator_validation_summary.csv", validation_summary)
+    excess_summary = noncomposable_excess_summary(validation_summary)
+    write_csv(artifact_root / "metrics" / "step4_noncomposable_excess_over_composed.csv", excess_summary)
+    render_step4_noncomposable_excess(excess_summary, artifact_root, dpi=dpi)
+    for excess_row in excess_summary:
+        progress(
+            f"Step 4 non-composable excess {excess_row['model']} vs {excess_row['composed_reference']}: "
+            f"direct_fraction={safe_float(excess_row['direct_fraction']):.3f} - "
+            f"composed_floor={safe_float(excess_row['composed_floor']):.3f} = "
+            f"excess={safe_float(excess_row['excess_over_composed']):.3f} "
+            f"[{safe_float(excess_row['excess_ci_low']):.3f}, {safe_float(excess_row['excess_ci_high']):.3f}] "
+            f"-> {excess_row['verdict']}"
+        )
     clamp_control_summary = clamp_negative_control_summary(rows)
     write_csv(artifact_root / "metrics" / "step4_clamp_negative_control_summary.csv", clamp_control_summary)
     clamp_d2_summary = clamp_negative_control_summary(rows, distance=2)
@@ -3347,6 +3359,84 @@ def mediator_validation_summary(rows: Sequence[Mapping[str, Any]]) -> list[dict[
             }
         )
     return out
+
+
+def noncomposable_excess_summary(validation_summary: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Excess direct (non-composable) carriage fraction over the composed reference.
+
+    The composed models (GIN / 1-hop), whose far carriage is composed by
+    construction, give the empirical "fully composed" direct-fraction level (~0). A
+    treatment model (dense GRIT) with genuine attention shortcuts sits ABOVE it;
+    one at the composed level has no non-composable transport (clean null). This is
+    the per-model-appropriate noise floor for direct carriage, and it turns the
+    outcome decision into a single signed margin with a CI.
+    """
+
+    def is_composed(name: str) -> bool:
+        return any(tok in name.lower() for tok in ("gin", "gcn", "1hop", "one_hop"))
+
+    composed = [r for r in validation_summary if is_composed(str(r.get("model")))]
+    treatment = [r for r in validation_summary if not is_composed(str(r.get("model")))]
+    if not composed or not treatment:
+        return []
+    floor_row = min(composed, key=lambda r: safe_float(r.get("mean_direct_fraction")))
+    floor = safe_float(floor_row.get("mean_direct_fraction"))
+    floor_hi = safe_float(floor_row.get("ci_high"))
+    floor_ref = floor_hi if math.isfinite(floor_hi) else floor
+    out: list[dict[str, Any]] = []
+    for r in treatment:
+        dense_df = safe_float(r.get("mean_direct_fraction"))
+        excess = dense_df - floor
+        excess_low = safe_float(r.get("ci_low")) - floor_ref
+        excess_high = safe_float(r.get("ci_high")) - floor
+        out.append(
+            {
+                "model": str(r.get("model")),
+                "composed_reference": str(floor_row.get("model")),
+                "direct_fraction": dense_df,
+                "composed_floor": floor,
+                "excess_over_composed": excess,
+                "excess_ci_low": excess_low,
+                "excess_ci_high": excess_high,
+                "pairs": int(r.get("pairs", 0)),
+                "verdict": (
+                    "non_composable_transport_above_composed_floor"
+                    if math.isfinite(excess_low) and excess_low > 0
+                    else "at_or_below_composed_floor_consistent_with_clean_null"
+                ),
+            }
+        )
+    return out
+
+
+def render_step4_noncomposable_excess(summary: Sequence[Mapping[str, Any]], artifact_root: Path, *, dpi: int) -> None:
+    if not summary:
+        return
+    labels = [str(r["model"]) for r in summary]
+    excess = np.asarray([safe_float(r["excess_over_composed"]) for r in summary], dtype=float)
+    lo = np.asarray([safe_float(r["excess_ci_low"]) for r in summary], dtype=float)
+    hi = np.asarray([safe_float(r["excess_ci_high"]) for r in summary], dtype=float)
+    fig, ax = plt.subplots(figsize=(6.6, 4.6), constrained_layout=True)
+    ax.bar(
+        labels,
+        excess,
+        yerr=np.vstack([np.maximum(0.0, excess - lo), np.maximum(0.0, hi - excess)]),
+        capsize=4,
+        color="#4c78a8",
+    )
+    ax.axhline(0.0, color="#555555", linewidth=1, label="Composed floor (no non-composable transport)")
+    ref = str(summary[0].get("composed_reference", "composed"))
+    ax.set_title(f"Non-composable transport: direct fraction above composed floor [{ref}]")
+    ax.set_xlabel("Treatment model")
+    ax.set_ylabel("Excess direct fraction over composed reference")
+    ax.legend(frameon=False, fontsize=8)
+    for tick in ax.get_xticklabels():
+        tick.set_rotation(15)
+        tick.set_ha("right")
+    figures = ensure_dir(artifact_root / "figures")
+    fig.savefig(figures / "step4_noncomposable_excess.png", dpi=dpi)
+    fig.savefig(figures / "step4_noncomposable_excess.pdf")
+    plt.close(fig)
 
 
 def clamp_negative_control_summary(rows: Sequence[Mapping[str, Any]], *, distance: Optional[int] = None) -> list[dict[str, Any]]:
@@ -3611,25 +3701,19 @@ def render_step4_signal_magnitude_by_distance(rows: Sequence[Mapping[str, Any]],
         key = (str(row.get("model")), str(row.get("graph_id")))
         graph_max[key] = max(graph_max.get(key, 0.0), safe_float(row.get("effect_abs")))
     grouped: dict[tuple[str, int], list[float]] = {}
-    floor_grouped: dict[int, list[float]] = {}
     for row in clean:
         key = (str(row.get("model")), str(row.get("graph_id")))
         denom = max(graph_max.get(key, 0.0), EPS)
         distance = int(round(safe_float(row.get("distance"))))
         grouped.setdefault((str(row.get("model")), distance), []).append(safe_float(row.get("effect_abs")) / denom)
-        floor = safe_float(row.get("signal_floor")) / denom
-        if math.isfinite(floor):
-            floor_grouped.setdefault(distance, []).append(floor)
     fig, ax = plt.subplots(figsize=(8.2, 4.8), constrained_layout=True)
     for model in sorted({model for model, _ in grouped}):
         distances = sorted(distance for m, distance in grouped if m == model)
         values = [float(np.nanmean(grouped[(model, distance)])) for distance in distances]
         ax.plot(distances, values, marker="o", linewidth=1.8, label=model)
-    if floor_grouped:
-        distances = sorted(floor_grouped)
-        floor_values = [float(np.nanmedian(floor_grouped[distance])) for distance in distances]
-        ax.plot(distances, floor_values, linestyle="--", linewidth=1.4, color="#555555", label="signal gate floor")
-    ax.set_title("Carriage magnitude vs distance: signal above noise")
+    # No gate-floor line: the hard signal gate was removed; noise is handled by the
+    # ratio-of-sums aggregation and the composed reference (GIN), not a per-pair floor.
+    ax.set_title("Carriage magnitude vs distance (per-graph normalised)")
     ax.set_xlabel("Molecular hop distance")
     ax.set_ylabel("|C| / per-graph max")
     ax.set_ylim(bottom=0.0)
