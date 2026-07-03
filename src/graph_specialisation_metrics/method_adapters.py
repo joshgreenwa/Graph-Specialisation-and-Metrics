@@ -613,6 +613,7 @@ class OfficialGRITAdapter:
         captures: dict[str, Any] = {
             "attention": [],
             "attention_edges": [],
+            "attention_edge_weights": [],
             "layer_input_node_states": [],
             "layer_output_node_states": [],
             "layer_input_edge_attr": [],
@@ -710,6 +711,7 @@ class OfficialGRITAdapter:
                 attn = batch.attn.detach().clone()
                 if capture_attention:
                     captures["attention_edges"].append(edge_index)
+                    captures["attention_edge_weights"].append(attn)
                     captures["attention"].append(self._attention_to_dense(edge_index, attn, int(batch.num_nodes)))
                 if capture_channels:
                     fields = {
@@ -761,6 +763,8 @@ class OfficialGRITAdapter:
             )
         if captures["attention"] and len(captures["attention"]) != len(captures["attention_edges"]):
             raise RuntimeError("captured GRIT attention maps without matching sparse edge supports")
+        if captures["attention"] and len(captures["attention"]) != len(captures["attention_edge_weights"]):
+            raise RuntimeError("captured GRIT attention maps without matching sparse edge weights")
         final_states = captures["final_node_states"]
         if final_states is None:
             raise RuntimeError("could not capture final GRIT node states before graph readout")
@@ -772,6 +776,7 @@ class OfficialGRITAdapter:
             "layer_input_edge_attr": captures["layer_input_edge_attr"],
             "layer_output_edge_attr": captures["layer_output_edge_attr"],
             "attention_edges": captures["attention_edges"],
+            "attention_edge_weights": captures["attention_edge_weights"],
             "raw_output": output,
         }
         return ForwardCache(

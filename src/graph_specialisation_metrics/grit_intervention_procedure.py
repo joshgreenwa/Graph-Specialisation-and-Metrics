@@ -336,6 +336,19 @@ def signal_gate_quantile(config: Mapping[str, Any], step: str) -> float:
     return float(config.get("steps", {}).get(str(step), {}).get("signal_gate_quantile", 0.90))
 
 
+def signal_gate_reference_floor_cap_fraction(config: Mapping[str, Any], step: str) -> float:
+    """Cap global reference floors so they cannot silently remove all signal.
+
+    The empirical 1-hop floor is useful as a noise reference, but it is a
+    single absolute value pooled across graphs. On small molecules it can be
+    larger than a graph's entire carriage scale, which makes every dense pair
+    fail the gate and empties Step 4/5. The cap keeps the floor local to the
+    current graph while preserving a small absolute minimum.
+    """
+
+    return float(config.get("steps", {}).get(str(step), {}).get("signal_gate_reference_floor_cap_fraction", 0.05))
+
+
 def distance_bin_signal_floor(
     carriage: torch.Tensor,
     dist: torch.Tensor,
@@ -345,6 +358,7 @@ def distance_bin_signal_floor(
     quantile: float,
     min_floor: float,
     reference_floor: float = float("nan"),
+    reference_floor_cap_fraction: float = 0.05,
 ) -> float:
     d = dist.detach().cpu().float()[int(carrier), int(source)]
     if not torch.isfinite(d):
@@ -355,7 +369,13 @@ def distance_bin_signal_floor(
     # construction and perversely keeps only sparse outliers, so it is not used.
     floors = [float(min_floor)]
     if math.isfinite(float(reference_floor)):
-        floors.append(float(reference_floor))
+        abs_values = carriage.detach().abs().float()
+        abs_values = abs_values[torch.isfinite(abs_values)]
+        if abs_values.numel():
+            local_cap = float(reference_floor_cap_fraction) * float(abs_values.max().item())
+            floors.append(min(float(reference_floor), max(float(min_floor), local_cap)))
+        else:
+            floors.append(float(reference_floor))
     return max(floors)
 
 
@@ -369,6 +389,7 @@ def pair_passes_signal_gate(
     quantile: float,
     min_floor: float,
     reference_floor: float = float("nan"),
+    reference_floor_cap_fraction: float = 0.05,
 ) -> tuple[bool, float, float]:
     effect = abs(float(carriage[int(carrier), int(source)].detach().cpu().item()))
     floor = distance_bin_signal_floor(
@@ -379,6 +400,7 @@ def pair_passes_signal_gate(
         quantile=quantile,
         min_floor=min_floor,
         reference_floor=reference_floor,
+        reference_floor_cap_fraction=reference_floor_cap_fraction,
     )
     if not enabled:
         return True, floor, effect
@@ -956,28 +978,71 @@ def attention_profiles(cache: Any, dist: torch.Tensor, model: str) -> tuple[list
     return rows, tensors
 
 
+def sparse_attention_layer_weights(cache: Any, layer_idx: int) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+    """Return ``(edge_index, abs_attention_by_edge_head)`` for one layer if available."""
+
+    extras = cache.extras or {}
+    edges = list(extras.get("attention_edges", []) or [])
+    weights = list(extras.get("attention_edge_weights", []) or [])
+    if layer_idx >= len(edges) or layer_idx >= len(weights):
+        return None
+    edge_index = edges[layer_idx].detach().cpu().long()
+    values = weights[layer_idx].detach().abs().cpu().float()
+    if values.dim() == 3 and values.size(-1) == 1:
+        values = values.squeeze(-1)
+    if values.dim() == 1:
+        values = values.unsqueeze(-1)
+    if values.dim() != 2:
+        raise RuntimeError(f"attention layer {layer_idx} has unsupported sparse weight shape {tuple(values.shape)}")
+    if int(values.size(0)) != int(edge_index.size(1)):
+        raise RuntimeError(
+            f"attention layer {layer_idx} has {values.size(0)} attention rows but "
+            f"{edge_index.size(1)} sparse edges"
+        )
+    return edge_index, values
+
+
 def attention_mean_distance_rows(cache: Any, dist: torch.Tensor, model: str, graph_id: str) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     dist_cpu = dist.detach().cpu().float()
-    finite = torch.isfinite(dist_cpu)
-    for layer_idx, matrix in enumerate(list(cache.attention or [])):
-        weights = matrix.detach().abs().cpu().float()
-        if weights.dim() == 2:
-            weights = weights.unsqueeze(0)
-        if weights.dim() != 3 or tuple(weights.shape[-2:]) != tuple(dist_cpu.shape):
-            raise RuntimeError(
-                f"attention mean-distance requires attention shaped [heads,n,n]; "
-                f"layer {layer_idx} has shape {tuple(weights.shape)} for distance shape {tuple(dist_cpu.shape)}"
-            )
-        masked_weights = weights * finite.unsqueeze(0)
-        denom = masked_weights.sum(dim=-1)
-        numerator = (masked_weights * dist_cpu.unsqueeze(0)).sum(dim=-1)
-        valid = denom > EPS
-        if not bool(valid.any()):
-            mean_distance = float("nan")
-            head_query_count = 0
+    layer_count = max(len(list(cache.attention or [])), len(list((cache.extras or {}).get("attention_edges", []) or [])))
+    for layer_idx in range(layer_count):
+        sparse = sparse_attention_layer_weights(cache, layer_idx)
+        if sparse is not None:
+            edge_index, values = sparse
+            src = edge_index[0].long()
+            dst = edge_index[1].long()
+            edge_dist = dist_cpu[dst, src]
+            finite_edges = torch.isfinite(edge_dist)
+            values = values * finite_edges.float().unsqueeze(-1)
+            # Average first over each receiver/head query, then over heads.
+            by_head = values.t().contiguous()
+            heads = by_head.size(0)
+            num_nodes = int(dist_cpu.size(0))
+            dst_index = dst.unsqueeze(0).expand(heads, -1)
+            denom = by_head.new_zeros((heads, num_nodes))
+            numerator = by_head.new_zeros((heads, num_nodes))
+            denom.scatter_add_(1, dst_index, by_head)
+            numerator.scatter_add_(1, dst_index, by_head * edge_dist.nan_to_num(0.0).unsqueeze(0))
+            valid = denom > EPS
+            mean_distance = float((numerator[valid] / denom[valid]).mean().item()) if bool(valid.any()) else float("nan")
+            head_query_count = int(valid.sum().item())
         else:
-            mean_distance = float((numerator[valid] / denom[valid]).mean().item())
+            matrix = list(cache.attention or [])[layer_idx]
+            weights = matrix.detach().abs().cpu().float()
+            finite = torch.isfinite(dist_cpu)
+            if weights.dim() == 2:
+                weights = weights.unsqueeze(0)
+            if weights.dim() != 3 or tuple(weights.shape[-2:]) != tuple(dist_cpu.shape):
+                raise RuntimeError(
+                    f"attention mean-distance requires attention shaped [heads,n,n]; "
+                    f"layer {layer_idx} has shape {tuple(weights.shape)} for distance shape {tuple(dist_cpu.shape)}"
+                )
+            masked_weights = weights * finite.unsqueeze(0)
+            denom = masked_weights.sum(dim=-1)
+            numerator = (masked_weights * dist_cpu.unsqueeze(0)).sum(dim=-1)
+            valid = denom > EPS
+            mean_distance = float((numerator[valid] / denom[valid]).mean().item()) if bool(valid.any()) else float("nan")
             head_query_count = int(valid.sum().item())
         rows.append(
             {
@@ -1010,31 +1075,38 @@ def attention_support_audit_rows(
     rows: list[dict[str, Any]] = []
     dist_cpu = dist.detach().cpu()
     far_mask_gt1 = torch.isfinite(dist_cpu) & (dist_cpu > 1)
-    for layer_idx, matrix in enumerate(attention):
-        mat = matrix.detach().abs().cpu()
-        if mat.dim() == 3:
-            mat_for_mass = mat.sum(dim=0)
-        elif mat.dim() == 2:
-            mat_for_mass = mat
-        else:
-            raise RuntimeError(f"attention layer {layer_idx} has unsupported shape {tuple(mat.shape)}")
-        total_mass = float(mat_for_mass.sum().item())
-        far_mass_gt1 = float(mat_for_mass[far_mask_gt1].sum().item() / max(total_mass, EPS))
-        edge_index = edges[layer_idx].detach().cpu().long() if layer_idx < len(edges) else None
-        if edge_index is not None and edge_index.numel():
+    layer_count = max(len(attention), len(edges))
+    for layer_idx in range(layer_count):
+        sparse = sparse_attention_layer_weights(cache, layer_idx)
+        if sparse is not None:
+            edge_index, values = sparse
+            edge_mass = values.reshape(values.size(0), -1).sum(dim=-1)
             src = edge_index[0].long()
             dst = edge_index[1].long()
             edge_dist = dist_cpu[dst, src]
             finite = torch.isfinite(edge_dist)
-            max_edge_distance = float(edge_dist[finite].max().item()) if bool(finite.any()) else float("nan")
-            edge_count = int(edge_index.size(1))
-            far_edge_count_gt1 = int(((edge_dist > 1) & finite).sum().item())
+            support = finite & (edge_mass > EPS)
+            total_mass = float(edge_mass[finite].sum().item()) if bool(finite.any()) else 0.0
+            far_mass_gt1 = float(edge_mass[finite & (edge_dist > 1)].sum().item() / max(total_mass, EPS))
+            max_edge_distance = float(edge_dist[support].max().item()) if bool(support.any()) else float("nan")
+            edge_count = int(support.sum().item())
+            far_edge_count_gt1 = int((support & (edge_dist > 1)).sum().item())
             expected_violation_edges = (
-                int(((edge_dist > int(expected_max_direct_distance)) & finite).sum().item())
+                int((support & (edge_dist > int(expected_max_direct_distance))).sum().item())
                 if expected_max_direct_distance is not None
                 else 0
             )
         else:
+            matrix = attention[layer_idx]
+            mat = matrix.detach().abs().cpu()
+            if mat.dim() == 3:
+                mat_for_mass = mat.sum(dim=0)
+            elif mat.dim() == 2:
+                mat_for_mass = mat
+            else:
+                raise RuntimeError(f"attention layer {layer_idx} has unsupported shape {tuple(mat.shape)}")
+            total_mass = float(mat_for_mass.sum().item())
+            far_mass_gt1 = float(mat_for_mass[far_mask_gt1].sum().item() / max(total_mass, EPS))
             support = mat_for_mass > EPS
             support_dist = dist_cpu[support]
             finite = torch.isfinite(support_dist)
@@ -2224,9 +2296,12 @@ def run_step2(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
             "first_failure": dict(support_failures[0]) if support_failures else None,
         },
     )
+    render_attention_support_audit(support_rows, artifact_root, dpi=dpi)
+    if support_failures:
+        progress(f"Step 2 failed attention-support audit with {len(support_failures)} violating row(s)")
+        assert_attention_support_audit(support_rows)
     render_step2_profiles(profile_rows, artifact_root, dpi=dpi)
     render_attention_mean_distance(mean_distance_rows, artifact_root, dpi=dpi)
-    render_attention_support_audit(support_rows, artifact_root, dpi=dpi)
     render_step2_faithfulness(faith_rows, artifact_root, dpi=dpi)
     render_step2_faithfulness(
         faith_rows,
@@ -2241,12 +2316,9 @@ def run_step2(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
     render_distance_profile(final_channel_rows, artifact_root, "step2_channel_split_distance", "Step 2: final-layer carriage by channel and distance", dpi=dpi)
     render_layer_resolved_channel_split(channel_rows, artifact_root, dpi=dpi)
     render_head_resolved_carriage(head_rows, artifact_root, dpi=dpi)
-    if support_failures:
-        progress(f"Step 2 completed with {len(support_failures)} attention-support audit violation row(s)")
-    else:
-        progress("Step 2 complete: metrics, tensors, and figures written")
+    progress("Step 2 complete: metrics, tensors, and figures written")
     return {
-        "status": "complete" if not support_failures else "complete_with_attention_support_violations",
+        "status": "complete",
         "models": [m.name for m in models],
         "attention_policy": "rollout_omitted_by_design; reads=last_layer_head_averaged_attention plus first_layer/per_layer_attention_diagnostics; carries=carriage",
         "profile_rows": len(profile_rows),
@@ -2831,6 +2903,7 @@ def run_step4(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
     min_effect_abs = float(cfg.get("min_effect_abs", 1.0e-6))
     use_signal_gate = signal_gate_enabled(config, "4")
     gate_quantile = signal_gate_quantile(config, "4")
+    gate_floor_cap_fraction = signal_gate_reference_floor_cap_fraction(config, "4")
     clamp_mode = str(cfg.get("clamp_mode", "detach")).strip().lower()
     run_clamp_negative_control = bool(cfg.get("run_clamp_negative_control", True))
     composed_reference_max_direct_fraction = float(cfg.get("composed_reference_max_direct_fraction", 0.20))
@@ -2881,7 +2954,8 @@ def run_step4(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
     ) if use_signal_gate else float(min_effect_abs)
     progress(
         f"Step 4 signal gate: enabled={use_signal_gate}, quantile={gate_quantile:.2f}, "
-        f"onehop_empirical_floor={onehop_floor:.3g}"
+        f"onehop_empirical_floor={onehop_floor:.3g}, "
+        f"reference_floor_cap_fraction={gate_floor_cap_fraction:.3g}"
     )
     for model in models:
         graphs = select_graphs(model.adapter, "test", sample_graphs, seed=seed)
@@ -2937,6 +3011,7 @@ def run_step4(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
                     quantile=gate_quantile,
                     min_floor=min_effect_abs,
                     reference_floor=onehop_floor,
+                    reference_floor_cap_fraction=gate_floor_cap_fraction,
                 )
                 signal_gate_rows.append(
                     {
@@ -2950,6 +3025,7 @@ def run_step4(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
                         "signal_gate_pass": gate_pass,
                         "signal_gate_quantile": gate_quantile,
                         "onehop_empirical_floor": onehop_floor,
+                        "reference_floor_cap_fraction": gate_floor_cap_fraction,
                         "patch_min_distance": min_distance,
                         "patch_max_distance": max_distance if max_distance is not None else "",
                     }
@@ -3001,6 +3077,7 @@ def run_step4(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
                         "signal_gate_pass": gate_pass,
                         "signal_gate_quantile": gate_quantile,
                         "onehop_empirical_floor": onehop_floor,
+                        "reference_floor_cap_fraction": gate_floor_cap_fraction,
                         "patch_min_distance": min_distance,
                         "patch_max_distance": max_distance if max_distance is not None else "",
                         "nontrivial_effect": nontrivial_effect,
@@ -3060,6 +3137,7 @@ def run_step4(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
                                 "signal_gate_pass": gate_pass,
                                 "signal_gate_quantile": gate_quantile,
                                 "onehop_empirical_floor": onehop_floor,
+                                "reference_floor_cap_fraction": gate_floor_cap_fraction,
                                 "patch_min_distance": min_distance,
                                 "patch_max_distance": max_distance if max_distance is not None else "",
                                 "nontrivial_effect": control_nontrivial,
@@ -3108,6 +3186,7 @@ def run_step4(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
                                 "signal_gate_pass": gate_pass,
                                 "signal_gate_quantile": gate_quantile,
                                 "onehop_empirical_floor": onehop_floor,
+                                "reference_floor_cap_fraction": gate_floor_cap_fraction,
                                 "patch_min_distance": min_distance,
                                 "patch_max_distance": max_distance if max_distance is not None else "",
                                 "nontrivial_effect": depth_nontrivial,
@@ -3811,6 +3890,7 @@ def run_step5(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
     min_effect_abs = float(cfg.get("min_effect_abs", 1.0e-6))
     use_signal_gate = signal_gate_enabled(config, "5")
     gate_quantile = signal_gate_quantile(config, "5")
+    gate_floor_cap_fraction = signal_gate_reference_floor_cap_fraction(config, "5")
     clamp_mode = str(cfg.get("clamp_mode", config["steps"]["4"].get("clamp_mode", "detach"))).strip().lower()
     partner_policy = swap_partner_policy(config)
     tau = int(config.get("primary_tau", 3))
@@ -3860,10 +3940,12 @@ def run_step5(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
         if use_signal_gate
         else float(min_effect_abs)
     )
-    non_additivity_effect_floor = max(float(min_effect_abs), float(onehop_floor))
+    non_additivity_effect_floor = float(cfg.get("non_additivity_min_effect_abs", min_effect_abs))
     progress(
         f"Step 5 signal gate: enabled={use_signal_gate}, quantile={gate_quantile:.2f}, "
-        f"onehop_empirical_floor={onehop_floor:.3g}, non_additivity_effect_floor={non_additivity_effect_floor:.3g}"
+        f"onehop_empirical_floor={onehop_floor:.3g}, "
+        f"reference_floor_cap_fraction={gate_floor_cap_fraction:.3g}, "
+        f"non_additivity_effect_floor={non_additivity_effect_floor:.3g}"
     )
     for model in analysis_models:
         graphs = select_graphs(model.adapter, "test", sample_graphs, seed=seed)
@@ -3912,6 +3994,7 @@ def run_step5(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
                     quantile=gate_quantile,
                     min_floor=min_effect_abs,
                     reference_floor=onehop_floor,
+                    reference_floor_cap_fraction=gate_floor_cap_fraction,
                 )
                 signal_gate_rows.append(
                     {
@@ -3925,6 +4008,7 @@ def run_step5(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
                         "signal_gate_pass": gate_pass,
                         "signal_gate_quantile": gate_quantile,
                         "onehop_empirical_floor": onehop_floor,
+                        "reference_floor_cap_fraction": gate_floor_cap_fraction,
                     }
                 )
                 if not gate_pass:
@@ -4103,7 +4187,24 @@ def run_step5(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
                     )
                 rank_rows.append(row)
             per_graph_interactions = max(1, interaction_pairs // max(1, sample_graphs))
-            pairs = far_pairs(dist, tau, max_pairs=per_graph_interactions, seed=seed + 1000 + graph_idx)
+            candidate_pairs = far_pairs(dist, tau, max_pairs=per_graph_interactions * 4, seed=seed + 1000 + graph_idx)
+            pairs: list[tuple[int, int]] = []
+            for carrier, source in candidate_pairs:
+                gate_pass, _, _ = pair_passes_signal_gate(
+                    c,
+                    dist,
+                    carrier,
+                    source,
+                    enabled=use_signal_gate,
+                    quantile=gate_quantile,
+                    min_floor=min_effect_abs,
+                    reference_floor=onehop_floor,
+                    reference_floor_cap_fraction=gate_floor_cap_fraction,
+                )
+                if gate_pass:
+                    pairs.append((carrier, source))
+                if len(pairs) >= per_graph_interactions:
+                    break
             interaction_rows.extend(
                 non_additivity_rows(
                     model,

@@ -469,6 +469,23 @@ def apply_colab_repo_hotfixes(repo_dir: Path) -> None:
         return
     text = adapters.read_text(encoding="utf-8")
     fixed = text.replace("torch.inference_mode()", "torch.no_grad()")
+    if '"attention_edge_weights": []' not in fixed:
+        fixed = fixed.replace('"attention_edges": [],\n', '"attention_edges": [],\n            "attention_edge_weights": [],\n', 1)
+        fixed = fixed.replace(
+            'captures["attention_edges"].append(edge_index)\n                    captures["attention"].append(',
+            'captures["attention_edges"].append(edge_index)\n                    captures["attention_edge_weights"].append(attn)\n                    captures["attention"].append(',
+            1,
+        )
+        fixed = fixed.replace(
+            'if captures["attention"] and len(captures["attention"]) != len(captures["attention_edges"]):\n            raise RuntimeError("captured GRIT attention maps without matching sparse edge supports")\n',
+            'if captures["attention"] and len(captures["attention"]) != len(captures["attention_edges"]):\n            raise RuntimeError("captured GRIT attention maps without matching sparse edge supports")\n        if captures["attention"] and len(captures["attention"]) != len(captures["attention_edge_weights"]):\n            raise RuntimeError("captured GRIT attention maps without matching sparse edge weights")\n',
+            1,
+        )
+        fixed = fixed.replace(
+            '"attention_edges": captures["attention_edges"],\n',
+            '"attention_edges": captures["attention_edges"],\n            "attention_edge_weights": captures["attention_edge_weights"],\n',
+            1,
+        )
     if "import os\n" not in fixed:
         fixed = fixed.replace("import math\n", "import math\nimport os\n", 1)
     dgl_start = fixed.find("    @staticmethod\n    def _install_dgl_compat")
@@ -633,6 +650,219 @@ def apply_colab_repo_hotfixes(repo_dir: Path) -> None:
         return
     text = intervention.read_text(encoding="utf-8")
     fixed = text
+    if "COLAB_HOTFIX_ATTENTION_SUPPORT_AND_SIGNAL_GATE_20260703" not in fixed:
+        fixed += r'''
+
+# COLAB_HOTFIX_ATTENTION_SUPPORT_AND_SIGNAL_GATE_20260703
+import json as _colab_hotfix_json
+
+
+def signal_gate_reference_floor_cap_fraction(config, step):
+    return float(config.get("steps", {}).get(str(step), {}).get("signal_gate_reference_floor_cap_fraction", 0.05))
+
+
+def distance_bin_signal_floor(
+    carriage,
+    dist,
+    carrier,
+    source,
+    *,
+    quantile,
+    min_floor,
+    reference_floor=float("nan"),
+    reference_floor_cap_fraction=0.05,
+):
+    d = dist.detach().cpu().float()[int(carrier), int(source)]
+    if not torch.isfinite(d):
+        return float("inf")
+    floors = [float(min_floor)]
+    if math.isfinite(float(reference_floor)):
+        abs_values = carriage.detach().abs().float()
+        abs_values = abs_values[torch.isfinite(abs_values)]
+        if abs_values.numel():
+            local_cap = float(reference_floor_cap_fraction) * float(abs_values.max().item())
+            floors.append(min(float(reference_floor), max(float(min_floor), local_cap)))
+        else:
+            floors.append(float(reference_floor))
+    return max(floors)
+
+
+def pair_passes_signal_gate(
+    carriage,
+    dist,
+    carrier,
+    source,
+    *,
+    enabled,
+    quantile,
+    min_floor,
+    reference_floor=float("nan"),
+    reference_floor_cap_fraction=0.05,
+):
+    effect = abs(float(carriage[int(carrier), int(source)].detach().cpu().item()))
+    floor = distance_bin_signal_floor(
+        carriage,
+        dist,
+        carrier,
+        source,
+        quantile=quantile,
+        min_floor=min_floor,
+        reference_floor=reference_floor,
+        reference_floor_cap_fraction=reference_floor_cap_fraction,
+    )
+    if not enabled:
+        return True, floor, effect
+    return bool(math.isfinite(effect) and effect > floor), floor, effect
+
+
+def sparse_attention_layer_weights(cache, layer_idx):
+    extras = cache.extras or {}
+    edges = list(extras.get("attention_edges", []) or [])
+    weights = list(extras.get("attention_edge_weights", []) or [])
+    if layer_idx >= len(edges) or layer_idx >= len(weights):
+        return None
+    edge_index = edges[layer_idx].detach().cpu().long()
+    values = weights[layer_idx].detach().abs().cpu().float()
+    if values.dim() == 3 and values.size(-1) == 1:
+        values = values.squeeze(-1)
+    if values.dim() == 1:
+        values = values.unsqueeze(-1)
+    if values.dim() != 2:
+        raise RuntimeError(f"attention layer {layer_idx} has unsupported sparse weight shape {tuple(values.shape)}")
+    if int(values.size(0)) != int(edge_index.size(1)):
+        raise RuntimeError(
+            f"attention layer {layer_idx} has {values.size(0)} attention rows but "
+            f"{edge_index.size(1)} sparse edges"
+        )
+    return edge_index, values
+
+
+def attention_mean_distance_rows(cache, dist, model, graph_id):
+    rows = []
+    dist_cpu = dist.detach().cpu().float()
+    layer_count = max(len(list(cache.attention or [])), len(list((cache.extras or {}).get("attention_edges", []) or [])))
+    for layer_idx in range(layer_count):
+        sparse = sparse_attention_layer_weights(cache, layer_idx)
+        if sparse is not None:
+            edge_index, values = sparse
+            src = edge_index[0].long()
+            dst = edge_index[1].long()
+            edge_dist = dist_cpu[dst, src]
+            finite_edges = torch.isfinite(edge_dist)
+            values = values * finite_edges.float().unsqueeze(-1)
+            by_head = values.t().contiguous()
+            heads = by_head.size(0)
+            dst_index = dst.unsqueeze(0).expand(heads, -1)
+            denom = by_head.new_zeros((heads, int(dist_cpu.size(0))))
+            numerator = by_head.new_zeros((heads, int(dist_cpu.size(0))))
+            denom.scatter_add_(1, dst_index, by_head)
+            numerator.scatter_add_(1, dst_index, by_head * edge_dist.nan_to_num(0.0).unsqueeze(0))
+            valid = denom > EPS
+            mean_distance = float((numerator[valid] / denom[valid]).mean().item()) if bool(valid.any()) else float("nan")
+            head_query_count = int(valid.sum().item())
+        else:
+            matrix = list(cache.attention or [])[layer_idx]
+            weights = matrix.detach().abs().cpu().float()
+            finite = torch.isfinite(dist_cpu)
+            if weights.dim() == 2:
+                weights = weights.unsqueeze(0)
+            if weights.dim() != 3 or tuple(weights.shape[-2:]) != tuple(dist_cpu.shape):
+                raise RuntimeError(
+                    f"attention mean-distance requires attention shaped [heads,n,n]; "
+                    f"layer {layer_idx} has shape {tuple(weights.shape)} for distance shape {tuple(dist_cpu.shape)}"
+                )
+            masked_weights = weights * finite.unsqueeze(0)
+            denom = masked_weights.sum(dim=-1)
+            numerator = (masked_weights * dist_cpu.unsqueeze(0)).sum(dim=-1)
+            valid = denom > EPS
+            mean_distance = float((numerator[valid] / denom[valid]).mean().item()) if bool(valid.any()) else float("nan")
+            head_query_count = int(valid.sum().item())
+        rows.append({"model": model, "graph_id": graph_id, "layer": layer_idx, "mean_attention_distance": mean_distance, "head_query_count": head_query_count})
+    return rows
+
+
+def attention_support_audit_rows(cache, dist, model, graph_id, *, expected_max_direct_distance=None):
+    attention = list(cache.attention or [])
+    edges = list((cache.extras or {}).get("attention_edges", []) or [])
+    rows = []
+    dist_cpu = dist.detach().cpu()
+    far_mask_gt1 = torch.isfinite(dist_cpu) & (dist_cpu > 1)
+    layer_count = max(len(attention), len(edges))
+    for layer_idx in range(layer_count):
+        sparse = sparse_attention_layer_weights(cache, layer_idx)
+        if sparse is not None:
+            edge_index, values = sparse
+            edge_mass = values.reshape(values.size(0), -1).sum(dim=-1)
+            src = edge_index[0].long()
+            dst = edge_index[1].long()
+            edge_dist = dist_cpu[dst, src]
+            finite = torch.isfinite(edge_dist)
+            support = finite & (edge_mass > EPS)
+            total_mass = float(edge_mass[finite].sum().item()) if bool(finite.any()) else 0.0
+            far_mass_gt1 = float(edge_mass[finite & (edge_dist > 1)].sum().item() / max(total_mass, EPS))
+            max_edge_distance = float(edge_dist[support].max().item()) if bool(support.any()) else float("nan")
+            edge_count = int(support.sum().item())
+            far_edge_count_gt1 = int((support & (edge_dist > 1)).sum().item())
+            expected_violation_edges = (
+                int((support & (edge_dist > int(expected_max_direct_distance))).sum().item())
+                if expected_max_direct_distance is not None
+                else 0
+            )
+        else:
+            matrix = attention[layer_idx]
+            mat = matrix.detach().abs().cpu()
+            if mat.dim() == 3:
+                mat_for_mass = mat.sum(dim=0)
+            elif mat.dim() == 2:
+                mat_for_mass = mat
+            else:
+                raise RuntimeError(f"attention layer {layer_idx} has unsupported shape {tuple(mat.shape)}")
+            total_mass = float(mat_for_mass.sum().item())
+            far_mass_gt1 = float(mat_for_mass[far_mask_gt1].sum().item() / max(total_mass, EPS))
+            support = mat_for_mass > EPS
+            support_dist = dist_cpu[support]
+            finite = torch.isfinite(support_dist)
+            max_edge_distance = float(support_dist[finite].max().item()) if bool(finite.any()) else float("nan")
+            edge_count = int(support.sum().item())
+            far_edge_count_gt1 = int(((support_dist > 1) & finite).sum().item())
+            expected_violation_edges = (
+                int(((support_dist > int(expected_max_direct_distance)) & finite).sum().item())
+                if expected_max_direct_distance is not None
+                else 0
+            )
+        rows.append(
+            {
+                "model": model,
+                "graph_id": graph_id,
+                "layer": layer_idx,
+                "edge_count": edge_count,
+                "max_direct_attention_distance": max_edge_distance,
+                "direct_edges_distance_gt1": far_edge_count_gt1,
+                "direct_attention_mass_distance_gt1": far_mass_gt1,
+                "expected_max_direct_distance": "" if expected_max_direct_distance is None else int(expected_max_direct_distance),
+                "expected_distance_violating_edges": expected_violation_edges,
+                "passes_expected_direct_support": expected_violation_edges == 0,
+            }
+        )
+    return rows
+
+
+_colab_original_run_step2 = run_step2
+def run_step2(models, artifact_root, config):
+    result = _colab_original_run_step2(models, artifact_root, config)
+    summary_path = Path(artifact_root) / "metrics" / "step2_attention_support_summary.json"
+    if summary_path.exists():
+        try:
+            payload = _colab_hotfix_json.loads(summary_path.read_text())
+            if payload.get("status") == "failed_attention_support_audit":
+                first = payload.get("first_failure")
+                raise RuntimeError(f"Step 2 attention-support audit failed; first failure: {first}")
+        except RuntimeError:
+            raise
+        except Exception:
+            pass
+    return result
+'''
     if "shortest_path_distance_matrix," not in fixed:
         fixed = fixed.replace(
             "    spearman_corr,\n",
@@ -770,13 +1000,43 @@ def apply_colab_repo_hotfixes(repo_dir: Path) -> None:
         f"onehop_empirical_floor={onehop_floor:.3g}"
     )
 '''
-    new_step5_floor_progress = '''    non_additivity_effect_floor = max(float(min_effect_abs), float(onehop_floor))
+    new_step5_floor_progress = '''    non_additivity_effect_floor = float(cfg.get("non_additivity_min_effect_abs", min_effect_abs))
     progress(
         f"Step 5 signal gate: enabled={use_signal_gate}, quantile={gate_quantile:.2f}, "
         f"onehop_empirical_floor={onehop_floor:.3g}, non_additivity_effect_floor={non_additivity_effect_floor:.3g}"
     )
 '''
     fixed = fixed.replace(old_step5_floor_progress, new_step5_floor_progress)
+    fixed = fixed.replace(
+        '''            per_graph_interactions = max(1, interaction_pairs // max(1, sample_graphs))
+            pairs = far_pairs(dist, tau, max_pairs=per_graph_interactions, seed=seed + 1000 + graph_idx)
+            interaction_rows.extend(
+                non_additivity_rows(
+''',
+        '''            per_graph_interactions = max(1, interaction_pairs // max(1, sample_graphs))
+            candidate_pairs = far_pairs(dist, tau, max_pairs=per_graph_interactions * 4, seed=seed + 1000 + graph_idx)
+            pairs = []
+            for carrier, source in candidate_pairs:
+                gate_pass, _, _ = pair_passes_signal_gate(
+                    c,
+                    dist,
+                    carrier,
+                    source,
+                    enabled=use_signal_gate,
+                    quantile=gate_quantile,
+                    min_floor=min_effect_abs,
+                    reference_floor=onehop_floor,
+                    reference_floor_cap_fraction=signal_gate_reference_floor_cap_fraction(config, "5"),
+                )
+                if gate_pass:
+                    pairs.append((carrier, source))
+                if len(pairs) >= per_graph_interactions:
+                    break
+            interaction_rows.extend(
+                non_additivity_rows(
+''',
+        1,
+    )
     fixed = fixed.replace(
         '''                    min_effect_abs=min_effect_abs,
                     partner_policy=partner_policy,
