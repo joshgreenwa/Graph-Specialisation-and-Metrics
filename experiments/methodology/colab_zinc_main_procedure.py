@@ -2130,9 +2130,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--steps", default="all", help="Main procedure steps to run, e.g. all or 0 or 0,2,4.")
     parser.add_argument(
         "--analysis-preset",
-        choices=["full", "medium", "pilot", "quick", "smoke"],
         default="medium",
-        help="Bound expensive intervention counts. Use pilot/medium for analysis runs before full paper settings.",
+        help=(
+            "Bound expensive intervention counts (e.g. quick/pilot/medium/high/full). "
+            "Not restricted here so new presets need no runner change; the value is validated "
+            "downstream by graph_specialisation_metrics.main_procedure against ANALYSIS_PRESET_OVERRIDES."
+        ),
     )
     parser.add_argument("--fast-dev-run", action="store_true", help="Use the main procedure fast-dev overrides for a quicker smoke run.")
     parser.add_argument(
