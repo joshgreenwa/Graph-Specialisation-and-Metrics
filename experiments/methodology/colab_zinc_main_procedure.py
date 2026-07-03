@@ -652,6 +652,178 @@ def apply_colab_repo_hotfixes(repo_dir: Path) -> None:
     return all_pair_distances_or_compute(pyg_graph_view(graph)).cpu()
 '''
     fixed = fixed.replace(old_distance_helper, new_distance_helper)
+    render_start = fixed.find("def render_step0_reconstruction(")
+    render_end = fixed.find("\ndef render_step0_pairwise_ig_vs_swap", render_start)
+    if render_start != -1 and render_end != -1 and "xlabel: str = \"Predicted" not in fixed[render_start:render_end]:
+        new_render_step0_reconstruction = '''def render_step0_reconstruction(
+    rows: Sequence[Mapping[str, Any]],
+    artifact_root: Path,
+    *,
+    filename: str,
+    title: str,
+    dpi: int,
+    xlabel: str = "Predicted Δŷ = Σᵢ C[i,j] (prediction units)",
+    ylabel: str = "Measured Δŷ (prediction units)",
+) -> None:
+    if not rows:
+        return
+    grouped: dict[str, list[Mapping[str, Any]]] = {}
+    for row in rows:
+        grouped.setdefault(str(row["model"]), []).append(row)
+    models = sorted(grouped)
+    fig, axes = plt.subplots(1, len(models), figsize=(5.2 * len(models), 5.0), squeeze=False, constrained_layout=True)
+    for ax, model in zip(axes[0], models):
+        items = grouped[model]
+        x = [safe_float(r["predicted_delta"]) for r in items]
+        y = [safe_float(r["measured_delta"]) for r in items]
+        finite_vals = [v for v in [*x, *y] if math.isfinite(v)]
+        lim = max([abs(v) for v in finite_vals] + [1.0e-6])
+        ax.scatter(x, y, s=10, alpha=0.45, edgecolors="none")
+        ax.plot([-lim, lim], [-lim, lim], "--", color="#555555", linewidth=1)
+        ax.set_title(f"{model} R2={r2_score(y, x):.2f}")
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel(ylabel)
+    fig.suptitle(title)
+    figures = ensure_dir(artifact_root / "figures")
+    fig.savefig(figures / f"{filename}.png", dpi=dpi)
+    fig.savefig(figures / f"{filename}.pdf")
+    plt.close(fig)
+
+'''
+        fixed = fixed[:render_start] + new_render_step0_reconstruction + fixed[render_end + 1 :]
+    old_step0_render_calls = '''    render_step0_reconstruction(
+        [r for r in recon_rows if r.get("perturbation") == "finite_content_swap"],
+        artifact_root,
+        filename="step0_carriage_reconstruction",
+        title="Step 0a: carriage vs finite-swap Δŷ",
+        dpi=dpi,
+    )
+    render_step0_reconstruction(
+        [r for r in recon_rows if r.get("perturbation") == "ig_baseline_replacement"],
+        artifact_root,
+        filename="step0_ig_baseline_reconstruction",
+        title="Step 0b: carriage vs baseline-replacement Δŷ",
+        dpi=dpi,
+    )
+'''
+    new_step0_render_calls = '''    endpoint_swap_rows = [r for r in matched_rows if str(r.get("estimator")) == "endpoint_ig"]
+    finite_linearization_rows = [r for r in recon_rows if r.get("perturbation") == "finite_content_swap"]
+    render_step0_reconstruction(
+        endpoint_swap_rows if endpoint_swap_rows else finite_linearization_rows,
+        artifact_root,
+        filename="step0_carriage_reconstruction",
+        title="Step 0a: matched endpoint IG vs finite-swap Δŷ" if endpoint_swap_rows else "Step 0a diagnostic: clean readout linearization vs finite-swap Δŷ",
+        xlabel="Predicted Δŷ from endpoint IG (prediction units)" if endpoint_swap_rows else "Predicted Δŷ from clean readout linearization",
+        ylabel="Measured finite-swap Δŷ (prediction units)",
+        dpi=dpi,
+    )
+    if endpoint_swap_rows and finite_linearization_rows:
+        render_step0_reconstruction(
+            finite_linearization_rows,
+            artifact_root,
+            filename="step0_clean_readout_linearization_swap",
+            title="Step 0 diagnostic: clean readout linearization vs finite-swap Δŷ",
+            xlabel="Predicted Δŷ from clean readout linearization",
+            ylabel="Measured finite-swap Δŷ (prediction units)",
+            dpi=dpi,
+        )
+    render_step0_reconstruction(
+        [r for r in recon_rows if r.get("perturbation") == "ig_baseline_replacement"],
+        artifact_root,
+        filename="step0_ig_baseline_reconstruction",
+        title="Step 0b diagnostic: all-baseline carriage vs one-node baseline Δŷ",
+        xlabel="Predicted Δŷ = Σᵢ C[i,j] from all-baseline path",
+        ylabel="Measured one-node baseline Δŷ (prediction units)",
+        dpi=dpi,
+    )
+'''
+    fixed = fixed.replace(old_step0_render_calls, new_step0_render_calls)
+    old_matched_bar = '''        values = [safe_float(r["r2"]) for r in matched_summary]
+        ax.barh(np.arange(len(labels)), values, color="#4c78a8")
+        ax.set_yticks(np.arange(len(labels)), labels, fontsize=7)
+        ax.axvline(0, color="#555555", linewidth=1)
+        ax.set_title("Step 0: matched swap-target reconstruction")
+        ax.set_xlabel("R2 against measured swap effect")
+'''
+    new_matched_bar = '''        values = [safe_float(r["r2"]) for r in matched_summary]
+        clipped_values = [min(1.0, max(-1.0, v)) if math.isfinite(v) else float("nan") for v in values]
+        ax.barh(np.arange(len(labels)), clipped_values, color="#4c78a8")
+        ax.set_yticks(np.arange(len(labels)), labels, fontsize=7)
+        ax.axvline(0, color="#555555", linewidth=1)
+        ax.set_title("Step 0: matched swap-target reconstruction")
+        ax.set_xlabel("R2 against measured swap effect (display clipped to [-1, 1])")
+        for idx, (value, shown) in enumerate(zip(values, clipped_values)):
+            if math.isfinite(value) and value != shown:
+                ax.text(
+                    shown,
+                    idx,
+                    f" actual {value:.1f}",
+                    va="center",
+                    ha="right" if shown < 0 else "left",
+                    fontsize=6,
+                    color="#333333",
+                )
+'''
+    fixed = fixed.replace(old_matched_bar, new_matched_bar)
+    old_step5_floor_progress = '''    progress(
+        f"Step 5 signal gate: enabled={use_signal_gate}, quantile={gate_quantile:.2f}, "
+        f"onehop_empirical_floor={onehop_floor:.3g}"
+    )
+'''
+    new_step5_floor_progress = '''    non_additivity_effect_floor = max(float(min_effect_abs), float(onehop_floor))
+    progress(
+        f"Step 5 signal gate: enabled={use_signal_gate}, quantile={gate_quantile:.2f}, "
+        f"onehop_empirical_floor={onehop_floor:.3g}, non_additivity_effect_floor={non_additivity_effect_floor:.3g}"
+    )
+'''
+    fixed = fixed.replace(old_step5_floor_progress, new_step5_floor_progress)
+    fixed = fixed.replace(
+        '''                    min_effect_abs=min_effect_abs,
+                    partner_policy=partner_policy,
+                )
+            )
+        if cache_hits:
+''',
+        '''                    min_effect_abs=non_additivity_effect_floor,
+                    partner_policy=partner_policy,
+                )
+            )
+        if cache_hits:
+''',
+        1,
+    )
+    fixed = fixed.replace(
+        '''    write_csv(artifact_root / "metrics" / "step5_far_carriage_rank_summary.csv", rank_summary_rows(rank_rows))
+    write_csv(artifact_root / "metrics" / "step5_non_additivity_summary.csv", non_additivity_summary_rows(interaction_rows))
+''',
+        '''    write_csv(artifact_root / "metrics" / "step5_far_carriage_rank_summary.csv", rank_summary_rows([r for r in rank_rows if str(r.get("model")) == dense.name]))
+    write_csv(artifact_root / "metrics" / "step5_non_additivity_summary.csv", non_additivity_summary_rows([r for r in interaction_rows if str(r.get("model")) == dense.name and row_is_nontrivial(r, default=False)]))
+''',
+    )
+    fixed = fixed.replace(
+        '''        summary = rank_summary_rows(rank_rows)
+''',
+        '''        summary = rank_summary_rows([r for r in rank_rows if str(r.get("model")) == "dense_grit"])
+''',
+    )
+    fixed = fixed.replace(
+        '''        summary = non_additivity_summary_rows(interaction_rows)
+''',
+        '''        summary = non_additivity_summary_rows([r for r in interaction_rows if str(r.get("model")) == "dense_grit" and row_is_nontrivial(r, default=False)])
+''',
+    )
+    fixed = fixed.replace(
+        '''            fig.suptitle("Step 5: structure of non-composable long-range carriage")
+''',
+        '''            fig.suptitle("Step 5: dense structure of non-composable long-range carriage")
+''',
+    )
+    fixed = fixed.replace(
+        '''            ax.set_title("Step 5: distant-source non-additivity")
+''',
+        '''            ax.set_title("Step 5: dense distant-source non-additivity after signal gate")
+''',
+    )
     if "skip_failed_optional_adapters" not in fixed:
         fn_start = fixed.find("def instantiate_official_models(")
         fn_end = fixed.find("\ndef render_distance_profile(", fn_start)
@@ -1699,11 +1871,16 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--analysis-preset",
         choices=["full", "medium", "pilot", "quick", "smoke"],
-        default="quick",
+        default="medium",
         help="Bound expensive intervention counts. Use pilot/medium for analysis runs before full paper settings.",
     )
     parser.add_argument("--fast-dev-run", action="store_true", help="Use the main procedure fast-dev overrides for a quicker smoke run.")
-    parser.add_argument("--force", action="store_true", help="Force rerun of main_procedure artifact generation instead of resuming completed steps.")
+    parser.add_argument(
+        "--force",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Force rerun of main_procedure artifact generation. Use --no-force to resume completed steps.",
+    )
     parser.add_argument("--force-official-grit-reclone", action="store_true")
     parser.add_argument("--force-official-gin-reclone", action="store_true")
     parser.add_argument("--dry-run", action="store_true", help="Only run main_procedure discovery/status mode.")

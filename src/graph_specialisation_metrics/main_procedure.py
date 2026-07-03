@@ -767,6 +767,10 @@ def run_main(config: Mapping[str, Any], *, steps: Sequence[str], dry_run: bool =
     run_config = copy.deepcopy(dict(config))
     run_config.setdefault("runtime", {})
     run_config["runtime"]["force_rerun_steps"] = bool(force)
+    # --force also busts the per-artifact carriage cache so intervention steps recompute
+    # IG carriage from scratch (not just re-render figures from cached tensors). This flag
+    # lives under runtime, which is not part of config_hash, so artifact_root is unchanged.
+    run_config["runtime"]["force_recompute_carriage"] = bool(force)
     cached_statuses = {} if force else load_cached_step_statuses(steps, artifact_root)
     if (
         (artifact_root / "manifest.json").exists()

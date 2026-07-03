@@ -1469,18 +1469,34 @@ def run_step0(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
     write_csv(artifact_root / "metrics" / "step0_pairwise_ig_vs_swap_carriage.csv", pair_agreement_rows)
     write_csv(artifact_root / "metrics" / "step0_summary.csv", summaries)
     atomic_torch_save(artifact_root / "tensors" / "step0_carriage.pt", tensors)
+    endpoint_swap_rows = [r for r in matched_rows if str(r.get("estimator")) == "endpoint_ig"]
+    finite_linearization_rows = [r for r in recon_rows if r.get("perturbation") == "finite_content_swap"]
     render_step0_reconstruction(
-        [r for r in recon_rows if r.get("perturbation") == "finite_content_swap"],
+        endpoint_swap_rows if endpoint_swap_rows else finite_linearization_rows,
         artifact_root,
         filename="step0_carriage_reconstruction",
-        title="Step 0a: carriage vs finite-swap Δŷ",
+        title="Step 0a: matched endpoint IG vs finite-swap Δŷ" if endpoint_swap_rows else "Step 0a diagnostic: clean readout linearization vs finite-swap Δŷ",
+        xlabel="Predicted Δŷ from endpoint IG (prediction units)" if endpoint_swap_rows else "Predicted Δŷ from clean readout linearization",
+        ylabel="Measured finite-swap Δŷ (prediction units)",
         dpi=dpi,
     )
+    if endpoint_swap_rows and finite_linearization_rows:
+        render_step0_reconstruction(
+            finite_linearization_rows,
+            artifact_root,
+            filename="step0_clean_readout_linearization_swap",
+            title="Step 0 diagnostic: clean readout linearization vs finite-swap Δŷ",
+            xlabel="Predicted Δŷ from clean readout linearization",
+            ylabel="Measured finite-swap Δŷ (prediction units)",
+            dpi=dpi,
+        )
     render_step0_reconstruction(
         [r for r in recon_rows if r.get("perturbation") == "ig_baseline_replacement"],
         artifact_root,
         filename="step0_ig_baseline_reconstruction",
-        title="Step 0b: carriage vs baseline-replacement Δŷ",
+        title="Step 0b diagnostic: all-baseline carriage vs one-node baseline Δŷ",
+        xlabel="Predicted Δŷ = Σᵢ C[i,j] from all-baseline path",
+        ylabel="Measured one-node baseline Δŷ (prediction units)",
         dpi=dpi,
     )
     render_distance_profile(profile_rows, artifact_root, "step0_swap_vs_ig_profiles", "Step 0: estimator agreement, swap vs IG", dpi=dpi)
@@ -1529,24 +1545,35 @@ def pairwise_ig_swap_rows(
     return rows
 
 
-def render_step0_reconstruction(rows: Sequence[Mapping[str, Any]], artifact_root: Path, *, filename: str, title: str, dpi: int) -> None:
+def render_step0_reconstruction(
+    rows: Sequence[Mapping[str, Any]],
+    artifact_root: Path,
+    *,
+    filename: str,
+    title: str,
+    dpi: int,
+    xlabel: str = "Predicted Δŷ = Σᵢ C[i,j] (prediction units)",
+    ylabel: str = "Measured Δŷ (prediction units)",
+) -> None:
     if not rows:
         return
-    fig, ax = plt.subplots(figsize=(5.8, 5.2), constrained_layout=True)
     grouped: dict[str, list[Mapping[str, Any]]] = {}
     for row in rows:
         grouped.setdefault(str(row["model"]), []).append(row)
-    for model, items in sorted(grouped.items()):
+    models = sorted(grouped)
+    fig, axes = plt.subplots(1, len(models), figsize=(5.2 * len(models), 5.0), squeeze=False, constrained_layout=True)
+    for ax, model in zip(axes[0], models):
+        items = grouped[model]
         x = [safe_float(r["predicted_delta"]) for r in items]
         y = [safe_float(r["measured_delta"]) for r in items]
-        ax.scatter(x, y, s=10, alpha=0.45, label=f"{model} R2={r2_score(y, x):.2f}", edgecolors="none")
-    vals = [safe_float(r[k]) for r in rows for k in ("predicted_delta", "measured_delta")]
-    lim = max([abs(v) for v in vals if math.isfinite(v)] + [1.0e-6])
-    ax.plot([-lim, lim], [-lim, lim], "--", color="#555555", linewidth=1)
-    ax.set_title(title)
-    ax.set_xlabel("Predicted Δŷ = Σᵢ C[i,j] (prediction units)")
-    ax.set_ylabel("Measured Δŷ (prediction units)")
-    ax.legend(frameon=False, fontsize=8)
+        finite_vals = [v for v in [*x, *y] if math.isfinite(v)]
+        lim = max([abs(v) for v in finite_vals] + [1.0e-6])
+        ax.scatter(x, y, s=10, alpha=0.45, edgecolors="none")
+        ax.plot([-lim, lim], [-lim, lim], "--", color="#555555", linewidth=1)
+        ax.set_title(f"{model} R2={r2_score(y, x):.2f}")
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel(ylabel)
+    fig.suptitle(title)
     figures = ensure_dir(artifact_root / "figures")
     fig.savefig(figures / f"{filename}.png", dpi=dpi)
     fig.savefig(figures / f"{filename}.pdf")
@@ -1851,11 +1878,23 @@ def render_step0_diagnostics(
         fig, ax = plt.subplots(figsize=(7.2, 4.5), constrained_layout=True)
         labels = [f"{r['model']} {str(r['estimator']).replace('_', ' ')}" for r in matched_summary]
         values = [safe_float(r["r2"]) for r in matched_summary]
-        ax.barh(np.arange(len(labels)), values, color="#4c78a8")
+        clipped_values = [min(1.0, max(-1.0, v)) if math.isfinite(v) else float("nan") for v in values]
+        ax.barh(np.arange(len(labels)), clipped_values, color="#4c78a8")
         ax.set_yticks(np.arange(len(labels)), labels, fontsize=7)
         ax.axvline(0, color="#555555", linewidth=1)
         ax.set_title("Step 0: matched swap-target reconstruction")
-        ax.set_xlabel("R2 against measured swap effect")
+        ax.set_xlabel("R2 against measured swap effect (display clipped to [-1, 1])")
+        for idx, (value, shown) in enumerate(zip(values, clipped_values)):
+            if math.isfinite(value) and value != shown:
+                ax.text(
+                    shown,
+                    idx,
+                    f" actual {value:.1f}",
+                    va="center",
+                    ha="right" if shown < 0 else "left",
+                    fontsize=6,
+                    color="#333333",
+                )
         fig.savefig(figures / "step0_matched_swap_target.png", dpi=dpi)
         fig.savefig(figures / "step0_matched_swap_target.pdf")
         plt.close(fig)
@@ -3821,9 +3860,10 @@ def run_step5(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
         if use_signal_gate
         else float(min_effect_abs)
     )
+    non_additivity_effect_floor = max(float(min_effect_abs), float(onehop_floor))
     progress(
         f"Step 5 signal gate: enabled={use_signal_gate}, quantile={gate_quantile:.2f}, "
-        f"onehop_empirical_floor={onehop_floor:.3g}"
+        f"onehop_empirical_floor={onehop_floor:.3g}, non_additivity_effect_floor={non_additivity_effect_floor:.3g}"
     )
     for model in analysis_models:
         graphs = select_graphs(model.adapter, "test", sample_graphs, seed=seed)
@@ -4072,7 +4112,7 @@ def run_step5(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
                     pairs,
                     gid,
                     rng,
-                    min_effect_abs=min_effect_abs,
+                    min_effect_abs=non_additivity_effect_floor,
                     partner_policy=partner_policy,
                 )
             )
@@ -4084,8 +4124,8 @@ def run_step5(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
     write_csv(artifact_root / "metrics" / "step5_rung_funnel.csv", rung_rows)
     write_csv(artifact_root / "metrics" / "step5_signal_gate.csv", signal_gate_rows)
     write_json(artifact_root / "metrics" / "step5_gap_regression.json", gap_regression_summary(gap_rows))
-    write_csv(artifact_root / "metrics" / "step5_far_carriage_rank_summary.csv", rank_summary_rows(rank_rows))
-    write_csv(artifact_root / "metrics" / "step5_non_additivity_summary.csv", non_additivity_summary_rows(interaction_rows))
+    write_csv(artifact_root / "metrics" / "step5_far_carriage_rank_summary.csv", rank_summary_rows(rank_rows, models=[dense.name]))
+    write_csv(artifact_root / "metrics" / "step5_non_additivity_summary.csv", non_additivity_summary_rows(interaction_rows, models=[dense.name]))
     vnode_decision = summarize_vnode_decision(rank_rows, interaction_rows, model=dense.name)
     write_json(artifact_root / "metrics" / "step5_vnode_decision.json", vnode_decision)
     write_csv(artifact_root / "metrics" / "step5_vnode_decision.csv", [vnode_decision])
@@ -4244,11 +4284,29 @@ def summarize_vnode_decision(
     primary_rank_rows = [
         r
         for r in rank_rows
-        if bool(r.get("primary_tau", True)) and str(r.get("model")) == str(model)
+        if bool(r.get("primary_tau", True))
+        and str(r.get("model")) == str(model)
+        and str(r.get("status", "")).startswith("complete")
+        and int(safe_float(r.get("sampled_pairs")) if math.isfinite(safe_float(r.get("sampled_pairs"))) else 0) >= 3
     ]
     if primary_rank_rows:
         rank_rows = primary_rank_rows
-    non_add = np.asarray([safe_float(r.get("non_additivity")) for r in interaction_rows if str(r.get("model")) == str(model)], dtype=float)
+    else:
+        rank_rows = [
+            r
+            for r in rank_rows
+            if str(r.get("model")) == str(model)
+            and str(r.get("status", "")).startswith("complete")
+            and int(safe_float(r.get("sampled_pairs")) if math.isfinite(safe_float(r.get("sampled_pairs"))) else 0) >= 3
+        ]
+    non_add = np.asarray(
+        [
+            safe_float(r.get("non_additivity"))
+            for r in interaction_rows
+            if str(r.get("model")) == str(model) and row_is_nontrivial(r, default=False)
+        ],
+        dtype=float,
+    )
     non_add = non_add[np.isfinite(non_add)]
     top_share = np.asarray([safe_float(r.get("top_singular_share")) for r in rank_rows], dtype=float)
     top_share = top_share[np.isfinite(top_share)]
@@ -4301,9 +4359,17 @@ def gap_regression_summary(gap_rows: Sequence[Mapping[str, Any]]) -> dict[str, A
     return {"n": int(mask.sum()), "pearson_r": corr, "slope": float(slope), "intercept": float(intercept)}
 
 
-def rank_summary_rows(rank_rows: Sequence[Mapping[str, Any]], *, min_sampled_pairs: int = 3) -> list[dict[str, Any]]:
+def rank_summary_rows(
+    rank_rows: Sequence[Mapping[str, Any]],
+    *,
+    min_sampled_pairs: int = 3,
+    models: Optional[Sequence[str]] = None,
+) -> list[dict[str, Any]]:
     primary = [r for r in rank_rows if bool(r.get("primary_tau", True))]
     rows = primary or list(rank_rows)
+    if models is not None:
+        allowed = {str(model) for model in models}
+        rows = [r for r in rows if str(r.get("model")) in allowed]
     out = []
     for model in sorted(set(str(r.get("model")) for r in rows)):
         model_rows = [
@@ -4334,10 +4400,17 @@ def rank_summary_rows(rank_rows: Sequence[Mapping[str, Any]], *, min_sampled_pai
     return out
 
 
-def non_additivity_summary_rows(interaction_rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+def non_additivity_summary_rows(
+    interaction_rows: Sequence[Mapping[str, Any]],
+    *,
+    models: Optional[Sequence[str]] = None,
+) -> list[dict[str, Any]]:
     out = []
+    allowed = {str(model) for model in models} if models is not None else None
     for model in sorted(set(str(r.get("model")) for r in interaction_rows)):
-        values = [safe_float(r.get("non_additivity")) for r in interaction_rows if str(r.get("model")) == model]
+        if allowed is not None and model not in allowed:
+            continue
+        values = [safe_float(r.get("non_additivity")) for r in interaction_rows if str(r.get("model")) == model and row_is_nontrivial(r, default=False)]
         values = [v for v in values if math.isfinite(v)]
         if not values:
             continue
@@ -4378,7 +4451,7 @@ def render_step5(
             fig.savefig(figures / "step5_gap_vs_rnc.pdf")
             plt.close(fig)
     if rank_rows:
-        summary = rank_summary_rows(rank_rows)
+        summary = rank_summary_rows(rank_rows, models=["dense_grit"])
         if summary:
             metric_labels = {
                 "effective_rank": ("Effective rank", "Effective rank (count)"),
@@ -4403,19 +4476,19 @@ def render_step5(
                 for tick in ax.get_xticklabels():
                     tick.set_rotation(18)
                     tick.set_ha("right")
-            fig.suptitle("Step 5: structure of non-composable long-range carriage")
+            fig.suptitle("Step 5: dense structure of non-composable long-range carriage")
             fig.savefig(figures / "step5_structure_non_composable_carriage.png", dpi=dpi)
             fig.savefig(figures / "step5_structure_non_composable_carriage.pdf")
             plt.close(fig)
         else:
-            models = sorted({str(r.get("model")) for r in rank_rows})
-            complete_rows = sum(1 for r in rank_rows if str(r.get("status", "")).startswith("complete"))
+            dense_rows = [r for r in rank_rows if str(r.get("model")) == "dense_grit"]
+            complete_rows = sum(1 for r in dense_rows if str(r.get("status", "")).startswith("complete"))
             fig, ax = plt.subplots(figsize=(8.0, 3.8), constrained_layout=True)
             ax.axis("off")
             ax.text(
                 0.5,
                 0.58,
-                "No model had enough signal-gated far pairs for a rank summary.",
+                "Dense GRIT did not have enough signal-gated far pairs for a rank summary.",
                 ha="center",
                 va="center",
                 fontsize=13,
@@ -4424,19 +4497,19 @@ def render_step5(
             ax.text(
                 0.5,
                 0.38,
-                f"Models checked: {', '.join(models) if models else 'none'}; complete rows before pair-count gate: {complete_rows}.",
+                f"Complete dense rows before pair-count gate: {complete_rows}. 1-hop/GIN are floor references, not rank targets.",
                 ha="center",
                 va="center",
                 fontsize=10,
                 color="#555555",
                 transform=ax.transAxes,
             )
-            fig.suptitle("Step 5: structure of non-composable long-range carriage")
+            fig.suptitle("Step 5: dense structure of non-composable long-range carriage")
             fig.savefig(figures / "step5_structure_non_composable_carriage.png", dpi=dpi)
             fig.savefig(figures / "step5_structure_non_composable_carriage.pdf")
             plt.close(fig)
     if interaction_rows:
-        summary = non_additivity_summary_rows(interaction_rows)
+        summary = non_additivity_summary_rows(interaction_rows, models=["dense_grit"])
         if summary:
             labels = [str(r["model"]) for r in summary]
             y = np.asarray([safe_float(r["mean_non_additivity"]) for r in summary], dtype=float)
@@ -4444,7 +4517,7 @@ def render_step5(
             hi = np.asarray([safe_float(r["ci_high"]) for r in summary], dtype=float)
             fig, ax = plt.subplots(figsize=(6.6, 4.4), constrained_layout=True)
             ax.bar(labels, y, yerr=np.vstack([np.maximum(0.0, y - lo), np.maximum(0.0, hi - y)]), capsize=4, color="#f58518")
-            ax.set_title("Step 5: distant-source non-additivity")
+            ax.set_title("Step 5: dense distant-source non-additivity after signal gate")
             ax.set_ylabel("Non-additivity ratio")
             for tick in ax.get_xticklabels():
                 tick.set_rotation(15)
