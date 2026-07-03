@@ -264,6 +264,40 @@ ANALYSIS_PRESET_OVERRIDES: dict[str, dict[str, Any]] = {
             "5": {"sample_graphs": 16, "max_far_pairs_per_graph": 4, "interaction_pairs": 128},
         },
     },
+    "high": {
+        # A step up from "medium" for tighter confidence intervals without going to the
+        # full 200-graph run: ~3x the molecules and far-pairs, IG steps 16->32 (past the
+        # Step-0 under-convergence point), the depth schedule enabled, and a wider IG-step
+        # sweep so the noise-floor-vs-steps question is answerable in one run. Still a
+        # single analysis seed (multi-seed needs retrained checkpoints, which we do not have).
+        "seeds": [41],
+        "perturbation": {
+            "ig_steps": 32,
+            "baseline_sample_graphs": 32,
+            "swap_partners": 4,
+        },
+        "steps": {
+            "0": {
+                "sample_graphs": 48,
+                "ig_step_sweep": [16, 32, 64],
+                "diagnostic_sample_graphs": 8,
+                "baseline_sweep": ["mean_node_embedding", "zero_embedding"],
+                "matched_target_ig_steps": 32,
+                "matched_target_sources_per_graph": 4,
+                "matched_target_partners_per_source": 2,
+            },
+            "1": {"reach_sweep": [1, "dense"]},
+            "2": {"sample_graphs": 48, "compare_attention_to_swaps": False, "run_layer_channel_split": False},
+            "3": {"sample_graphs": 48},
+            "4": {
+                "sample_graphs": 24,
+                "max_far_pairs_per_graph": 12,
+                "depth_pairs_per_graph": 4,
+                "run_clamp_negative_control": True,
+            },
+            "5": {"sample_graphs": 48, "max_far_pairs_per_graph": 12, "interaction_pairs": 256},
+        },
+    },
 }
 
 
