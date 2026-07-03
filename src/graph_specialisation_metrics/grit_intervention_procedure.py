@@ -3205,8 +3205,11 @@ def run_step4(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
     write_csv(artifact_root / "metrics" / "step4_mediator_patching.csv", rows)
     write_csv(artifact_root / "metrics" / "step4_signal_gate.csv", signal_gate_rows)
     write_csv(artifact_root / "metrics" / "step4_depth_schedule.csv", depth_rows)
-    # Log gate pass-rate per model so an over-aggressive gate cannot silently empty
-    # the Step 4 figures (as happened when the floor was the signal quantile).
+    # Report the informational noise-floor pass-rate per model. NOTE: this gate no longer
+    # FILTERS anything — all patched pairs enter the ratio-of-sums estimator regardless — so a
+    # 0% pass-rate does NOT empty the figures. It only flags that a model's far carriage is small
+    # relative to the (cross-model, IG-step-sensitive) 1-hop floor; confirm signal vs noise via the
+    # composed reference (GIN) and more IG steps, not this rate.
     gate_by_model: dict[str, list[bool]] = {}
     for gate_row in signal_gate_rows:
         gate_by_model.setdefault(str(gate_row.get("model")), []).append(bool(gate_row.get("signal_gate_pass")))
@@ -3217,14 +3220,14 @@ def run_step4(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
         rate = (n_pass / len(flags)) if flags else float("nan")
         gate_pass_by_model[model.name] = {"considered": len(flags), "passed": n_pass, "pass_rate": rate}
         progress(
-            f"Step 4 signal gate {model.name}: {n_pass}/{len(flags)} pairs passed "
-            f"({rate:.1%}) at floor={onehop_floor:.3g}"
+            f"Step 4 noise-floor pass-rate (informational only, does NOT filter) {model.name}: "
+            f"{n_pass}/{len(flags)} above floor={onehop_floor:.3g} ({rate:.1%})"
         )
         if flags and n_pass == 0:
             progress(
-                f"[WARN] Step 4 {model.name}: ZERO pairs passed the signal gate — the gate is "
-                "too aggressive or this model has no above-noise carriage; its Step 4 figures will "
-                "be empty. Check onehop_floor and min_effect_abs before interpreting."
+                f"[INFO] Step 4 {model.name}: 0 pairs exceed the informational noise floor, but its "
+                "figures are NOT empty (all patched pairs enter the estimator). This flags small far "
+                "carriage relative to that floor; judge signal vs noise via GIN (composed ~0) and IG steps."
             )
     validation_summary = mediator_validation_summary(rows)
     write_csv(artifact_root / "metrics" / "step4_mediator_validation_summary.csv", validation_summary)
