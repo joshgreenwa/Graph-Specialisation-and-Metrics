@@ -4202,6 +4202,21 @@ def run_step5(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
                     onehop_pred = float("nan")
                 dense_err = abs(dense_pred - y) if math.isfinite(y) else float("nan")
                 onehop_err = abs(onehop_pred - y) if math.isfinite(y) and math.isfinite(onehop_pred) else float("nan")
+                # Self-ablation (dense as its own control): remove the measured non-composable
+                # (direct) far carriage from dense's own prediction, keeping everything a GNN could
+                # compose. Reconstruction identity ŷ = ŷ_base + Σ C[i,j] => the direct far
+                # contribution is the SIGNED sum of C^clamp[i,j] over d>τ pairs. If ablating it
+                # pushes dense's error toward 1-hop's, the non-composable transport is the causal
+                # source of the advantage; if error barely moves, it is present but not load-bearing.
+                far_signed_mask = torch.isfinite(dist) & (dist > int(tau)) & torch.isfinite(direct)
+                signed_direct_far = float(direct[far_signed_mask].sum().item()) if bool(far_signed_mask.any()) else 0.0
+                dense_ablated_pred = dense_pred - signed_direct_far
+                dense_ablated_err = abs(dense_ablated_pred - y) if math.isfinite(y) else float("nan")
+                ablation_minus_dense_error = (
+                    dense_ablated_err - dense_err
+                    if math.isfinite(dense_ablated_err) and math.isfinite(dense_err)
+                    else float("nan")
+                )
                 gap_row = {
                     "graph_id": gid,
                     "tau": tau,
@@ -4224,6 +4239,10 @@ def run_step5(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
                     "onehop_minus_dense_error": onehop_err - dense_err if math.isfinite(onehop_err) and math.isfinite(dense_err) else float("nan"),
                     "gap_treatment": dense.name,
                     "gap_control": onehop.name,
+                    "signed_direct_far_carriage": signed_direct_far,
+                    "dense_ablated_prediction": dense_ablated_pred,
+                    "dense_ablated_error": dense_ablated_err,
+                    "ablation_minus_dense_error": ablation_minus_dense_error,
                 }
                 for threshold, stats in r_nc_by_tau.items():
                     gap_row[f"r_nc_tau_{threshold}"] = stats.get("r_nc")
@@ -4306,6 +4325,19 @@ def run_step5(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
     write_csv(artifact_root / "metrics" / "step5_rung_funnel.csv", rung_rows)
     write_csv(artifact_root / "metrics" / "step5_signal_gate.csv", signal_gate_rows)
     write_json(artifact_root / "metrics" / "step5_gap_regression.json", gap_regression_summary(gap_rows))
+    ablation = self_ablation_summary(gap_rows)
+    write_json(artifact_root / "metrics" / "step5_self_ablation.json", ablation)
+    render_step5_self_ablation(ablation, gap_rows, artifact_root, dpi=dpi)
+    if int(ablation.get("n", 0)) > 0:
+        progress(
+            "Step 5 self-ablation: dense_err="
+            f"{safe_float(ablation.get('mean_dense_error')):.4f}, ablated_err="
+            f"{safe_float(ablation.get('mean_dense_ablated_error')):.4f}, onehop_err="
+            f"{safe_float(ablation.get('mean_onehop_error')):.4f}; ablation_penalty="
+            f"{safe_float(ablation.get('ablation_penalty')):.4f} "
+            f"[{safe_float(ablation.get('ablation_penalty_ci_low')):.4f}, {safe_float(ablation.get('ablation_penalty_ci_high')):.4f}] "
+            f"-> {ablation.get('verdict')}"
+        )
     write_csv(artifact_root / "metrics" / "step5_far_carriage_rank_summary.csv", rank_summary_rows(rank_rows, models=[dense.name]))
     write_csv(artifact_root / "metrics" / "step5_non_additivity_summary.csv", non_additivity_summary_rows(interaction_rows, models=[dense.name]))
     vnode_decision = summarize_vnode_decision(rank_rows, interaction_rows, model=dense.name)
@@ -4528,6 +4560,98 @@ def summarize_vnode_decision(
             "high non-additivity means a single pooled global node cannot reproduce source-specific pair coupling."
         ),
     }
+
+
+def self_ablation_summary(gap_rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """Causal self-ablation: does removing dense's non-composable far carriage hurt test error?
+
+    Compares three per-molecule errors: dense (intact), dense with the measured
+    non-composable far carriage subtracted from its own prediction, and the trained
+    1-hop control. dense is its own control, so the ablation isolates the shortcuts
+    (no cross-model optimisation confound). If the ablation penalty recovers the
+    trained-1hop gap, the non-composable transport is the causal source of the
+    advantage; if it is ~0, the transport is present but not load-bearing.
+    """
+    dense = np.asarray([safe_float(r.get("dense_error")) for r in gap_rows], dtype=float)
+    ablated = np.asarray([safe_float(r.get("dense_ablated_error")) for r in gap_rows], dtype=float)
+    onehop = np.asarray([safe_float(r.get("onehop_error")) for r in gap_rows], dtype=float)
+    rnc = np.asarray([safe_float(r.get("r_nc")) for r in gap_rows], dtype=float)
+    effect = np.asarray([safe_float(r.get("ablation_minus_dense_error")) for r in gap_rows], dtype=float)
+    mask = np.isfinite(dense) & np.isfinite(ablated) & np.isfinite(onehop)
+    n = int(mask.sum())
+    if n == 0:
+        return {"n": 0, "status": "no_scored_molecules"}
+    d, a, o = dense[mask], ablated[mask], onehop[mask]
+    ablation_penalty = float(np.mean(a) - np.mean(d))
+    onehop_penalty = float(np.mean(o) - np.mean(d))
+    rng = np.random.default_rng(9090)
+    pen_samples = []
+    for _ in range(1000):
+        idx = rng.integers(0, n, size=n)
+        pen_samples.append(float(np.mean(a[idx]) - np.mean(d[idx])))
+    pen_lo, pen_hi = (float(v) for v in np.percentile(pen_samples, [2.5, 97.5]))
+    reg_mask = np.isfinite(rnc) & np.isfinite(effect)
+    slope = corr = float("nan")
+    if int(reg_mask.sum()) >= 2 and float(np.std(rnc[reg_mask])) > EPS:
+        slope = float(np.polyfit(rnc[reg_mask], effect[reg_mask], 1)[0])
+        corr = float(np.corrcoef(rnc[reg_mask], effect[reg_mask])[0, 1])
+    recovers = float(ablation_penalty / onehop_penalty) if abs(onehop_penalty) > EPS else float("nan")
+    if pen_lo <= 0.0:
+        verdict = "ablation_penalty_ci_includes_zero_not_load_bearing"
+    elif math.isfinite(recovers) and recovers >= 0.5:
+        verdict = "ablation_recovers_onehop_gap_noncomposable_transport_is_causal"
+    else:
+        verdict = "ablation_hurts_but_below_onehop_gap_partial_contribution"
+    return {
+        "n": n,
+        "mean_dense_error": float(np.mean(d)),
+        "mean_dense_ablated_error": float(np.mean(a)),
+        "mean_onehop_error": float(np.mean(o)),
+        "ablation_penalty": ablation_penalty,
+        "ablation_penalty_ci_low": pen_lo,
+        "ablation_penalty_ci_high": pen_hi,
+        "onehop_penalty": onehop_penalty,
+        "ablation_recovers_onehop_fraction": recovers,
+        "ablation_effect_vs_rnc_slope": slope,
+        "ablation_effect_vs_rnc_pearson": corr,
+        "verdict": verdict,
+    }
+
+
+def render_step5_self_ablation(summary: Mapping[str, Any], gap_rows: Sequence[Mapping[str, Any]], artifact_root: Path, *, dpi: int) -> None:
+    if int(summary.get("n", 0)) <= 0:
+        return
+    figures = ensure_dir(artifact_root / "figures")
+    labels = ["dense", "dense\n(shortcuts ablated)", "1-hop (trained)"]
+    means = [safe_float(summary.get("mean_dense_error")), safe_float(summary.get("mean_dense_ablated_error")), safe_float(summary.get("mean_onehop_error"))]
+    fig, ax = plt.subplots(figsize=(6.8, 4.6), constrained_layout=True)
+    ax.bar(labels, means, color=["#4c78a8", "#f58518", "#54a24b"])
+    ax.axhline(safe_float(summary.get("mean_dense_error")), color="#555555", linestyle="--", linewidth=1, label="dense baseline")
+    ax.set_title("Self-ablation: test error with non-composable transport removed")
+    ax.set_ylabel("Mean |prediction - target| (test)")
+    ax.legend(frameon=False, fontsize=8)
+    fig.savefig(figures / "step5_self_ablation_error.png", dpi=dpi)
+    fig.savefig(figures / "step5_self_ablation_error.pdf")
+    plt.close(fig)
+
+    x = np.asarray([safe_float(r.get("r_nc")) for r in gap_rows], dtype=float)
+    yv = np.asarray([safe_float(r.get("ablation_minus_dense_error")) for r in gap_rows], dtype=float)
+    m = np.isfinite(x) & np.isfinite(yv)
+    if int(m.sum()) >= 2:
+        fig, ax = plt.subplots(figsize=(5.8, 4.8), constrained_layout=True)
+        ax.scatter(x[m], yv[m], s=18, alpha=0.65)
+        if float(np.std(x[m])) > EPS:
+            coef = np.polyfit(x[m], yv[m], 1)
+            xs = np.linspace(float(x[m].min()), float(x[m].max()), 100)
+            ax.plot(xs, coef[0] * xs + coef[1], color="#f58518", label=f"pearson={safe_float(summary.get('ablation_effect_vs_rnc_pearson')):.2f}")
+            ax.legend(frameon=False)
+        ax.axhline(0.0, color="#555555", linewidth=1)
+        ax.set_title("Self-ablation penalty vs non-composable carriage")
+        ax.set_xlabel("R_nc (per molecule)")
+        ax.set_ylabel("Ablated error - dense error")
+        fig.savefig(figures / "step5_self_ablation_vs_rnc.png", dpi=dpi)
+        fig.savefig(figures / "step5_self_ablation_vs_rnc.pdf")
+        plt.close(fig)
 
 
 def gap_regression_summary(gap_rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
