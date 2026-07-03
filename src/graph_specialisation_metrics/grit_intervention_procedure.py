@@ -349,18 +349,11 @@ def distance_bin_signal_floor(
     d = dist.detach().cpu().float()[int(carrier), int(source)]
     if not torch.isfinite(d):
         return float("inf")
-    dist_cpu = dist.detach().cpu().float()
-    carriage_abs = carriage.detach().cpu().abs()
-    mask = torch.isfinite(dist_cpu) & (dist_cpu.round().long() == int(round(float(d.item()))))
-    if dist_cpu.dim() == 2:
-        diag = torch.eye(dist_cpu.size(0), dist_cpu.size(1), dtype=torch.bool)
-        mask = mask & ~diag
-    values = carriage_abs[mask]
-    finite_values = values[torch.isfinite(values)]
+    # Gate against the NOISE floor (empirical 1-hop-beyond-receptive-field level,
+    # passed in as ``reference_floor``), NOT the observed carriage distribution at
+    # this distance. A quantile of the signal itself rejects ~90% of real pairs by
+    # construction and perversely keeps only sparse outliers, so it is not used.
     floors = [float(min_floor)]
-    if finite_values.numel():
-        q = min(max(float(quantile), 0.0), 1.0)
-        floors.append(float(torch.quantile(finite_values.float(), q).item()))
     if math.isfinite(float(reference_floor)):
         floors.append(float(reference_floor))
     return max(floors)
@@ -3089,6 +3082,27 @@ def run_step4(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
     write_csv(artifact_root / "metrics" / "step4_mediator_patching.csv", rows)
     write_csv(artifact_root / "metrics" / "step4_signal_gate.csv", signal_gate_rows)
     write_csv(artifact_root / "metrics" / "step4_depth_schedule.csv", depth_rows)
+    # Log gate pass-rate per model so an over-aggressive gate cannot silently empty
+    # the Step 4 figures (as happened when the floor was the signal quantile).
+    gate_by_model: dict[str, list[bool]] = {}
+    for gate_row in signal_gate_rows:
+        gate_by_model.setdefault(str(gate_row.get("model")), []).append(bool(gate_row.get("signal_gate_pass")))
+    gate_pass_by_model: dict[str, dict[str, Any]] = {}
+    for model in models:
+        flags = gate_by_model.get(model.name, [])
+        n_pass = sum(1 for f in flags if f)
+        rate = (n_pass / len(flags)) if flags else float("nan")
+        gate_pass_by_model[model.name] = {"considered": len(flags), "passed": n_pass, "pass_rate": rate}
+        progress(
+            f"Step 4 signal gate {model.name}: {n_pass}/{len(flags)} pairs passed "
+            f"({rate:.1%}) at floor={onehop_floor:.3g}"
+        )
+        if flags and n_pass == 0:
+            progress(
+                f"[WARN] Step 4 {model.name}: ZERO pairs passed the signal gate — the gate is "
+                "too aggressive or this model has no above-noise carriage; its Step 4 figures will "
+                "be empty. Check onehop_floor and min_effect_abs before interpreting."
+            )
     validation_summary = mediator_validation_summary(rows)
     write_csv(artifact_root / "metrics" / "step4_mediator_validation_summary.csv", validation_summary)
     clamp_control_summary = clamp_negative_control_summary(rows)
@@ -3146,6 +3160,7 @@ def run_step4(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
         "depth_rows": len(depth_rows),
         "signal_gate_rows": len(signal_gate_rows),
         "signal_gate_pass_rows": len([r for r in signal_gate_rows if bool(r.get("signal_gate_pass"))]),
+        "signal_gate_pass_by_model": gate_pass_by_model,
         "signal_gate_enabled": use_signal_gate,
         "signal_gate_quantile": gate_quantile,
         "onehop_empirical_floor": onehop_floor,
