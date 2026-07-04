@@ -44,6 +44,17 @@ def test_sparse1hop_grit_k4_parameter_matched_global_tokens_match_official_count
     assert model.virtual_edge_encoder is None
 
 
+def test_sparse1hop_grit_k1_parameter_matched_global_tokens_match_official_count() -> None:
+    model = Sparse1HopGRIT(
+        zinc_sparse1hop_grit_config(num_global_tokens=1, parameter_match_global_tokens=True)
+    )
+    assert parameter_count(model) == OFFICIAL_ZINC_GRIT_RRWP_PARAMS
+    assert "global_token" in dict(model.named_buffers())
+    assert model.global_token.shape == (1, 64)
+    assert model.global_token.requires_grad is False
+    assert model.virtual_edge_encoder is None
+
+
 def test_sparse1hop_grit_forward_backward_with_global_tokens() -> None:
     torch.manual_seed(0)
     model = Sparse1HopGRIT(zinc_sparse1hop_grit_config(num_global_tokens=4))
