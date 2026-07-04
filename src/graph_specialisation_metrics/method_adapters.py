@@ -440,13 +440,27 @@ class OfficialGRITAdapter:
             import torch_geometric.graphgym.register as graphgym_register
         except Exception:
             return
-        if getattr(graphgym_register, "_gsm_grit_reregistration_ok", False):
+        if getattr(graphgym_register, "_gsm_grit_reregistration_ok", False) and getattr(
+            graphgym_register.register_base, "_gsm_supports_decorator", False
+        ):
             return
-        original_register_base = graphgym_register.register_base
+        original_register_base = getattr(
+            graphgym_register,
+            "_gsm_original_register_base",
+            graphgym_register.register_base,
+        )
 
-        def register_base_replace(mapping: dict[str, Any], key: str, module: Any) -> None:
+        def register_base_replace(mapping: dict[str, Any], key: str, module: Any = None) -> Any:
+            def decorator(obj: Any) -> Any:
+                mapping[key] = obj
+                return obj
+
+            if module is None:
+                return decorator
             mapping[key] = module
+            return module
 
+        register_base_replace._gsm_supports_decorator = True  # type: ignore[attr-defined]
         graphgym_register._gsm_original_register_base = original_register_base
         graphgym_register.register_base = register_base_replace
         graphgym_register._gsm_grit_reregistration_ok = True
