@@ -3,6 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 EXP_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+REPO_ROOT="$(cd "${EXP_DIR}/../../.." && pwd)"
 
 GRIT_REPO_URL="${GRIT_REPO_URL:-https://github.com/LiamMa/GRIT.git}"
 GRIT_COMMIT="${GRIT_COMMIT:-6c988ea600a606fbb49a2246c64a2d37396b3ab5}"
@@ -26,6 +27,21 @@ if git -C "${GRIT_REPO_DIR}" apply --ignore-whitespace --whitespace=nowarn --che
 else
   echo "Patch failed to apply cleanly: ${GRIT_PATCH}" >&2
   exit 2
+fi
+
+if [[ "${GRIT_ENABLE_LOCAL_RRWP_VARIANT:-1}" == "1" ]]; then
+  PATCH_NOTE_DIR="${GRIT_LOCAL_RRWP_PATCH_NOTE_DIR:-${GRIT_WORK_ROOT}/patch_notes}"
+  PYTHON_BIN="${PYTHON_BIN:-python}"
+  PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}" "${PYTHON_BIN}" - "${GRIT_REPO_DIR}" "${PATCH_NOTE_DIR}" <<'PY'
+from pathlib import Path
+import sys
+
+from experiments.zinc.training.grit_zinc_1hop_localrrwp_core import (
+    apply_parameter_matched_onehop_localrrwp_patch,
+)
+
+apply_parameter_matched_onehop_localrrwp_patch(Path(sys.argv[1]), Path(sys.argv[2]))
+PY
 fi
 
 git -C "${GRIT_REPO_DIR}" rev-parse HEAD >&2

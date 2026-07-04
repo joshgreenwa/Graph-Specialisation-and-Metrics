@@ -7,12 +7,14 @@ This setup trains the official GRIT ZINC subset configuration and a 1-hop sparse
 - Official config used unchanged for the baseline: `configs/GRIT/zinc-GRIT-RRWP.yaml`
 - Expected trainable parameters for both runs: `473,473`
 
-The official baseline uses complete-graph GRIT attention after RRWP edge padding. The 1-hop control keeps the same ZINC subset config, depth, hidden width, heads, RRWP dimensions, optimizer, schedule, and trainable modules, but switches the RRWP edge encoder to an existing masked path so each layer attends only over original molecular bonds plus self-loops. This is a parameter-matched control for global complete-graph attention, not a new tuned model.
+The official baseline uses complete-graph GRIT attention after RRWP edge padding. The `1hop` control keeps the same ZINC subset config, depth, hidden width, heads, RRWP dimensions, optimizer, schedule, and trainable modules, but switches the RRWP edge encoder to an existing masked path so each layer attends only over original molecular bonds plus self-loops. This is a parameter-matched control for global complete-graph attention, not a new tuned model.
+
+The stricter `1hop-localrrwp` control additionally truncates RRWP values to local information only: it keeps the official 21-dimensional RRWP encoder for parameter matching, but zeroes channels above identity plus one-step random walks and keeps relative RRWP support on molecular bonds plus self only. Use a separate `DATA_DIR` for this variant so PyG does not reuse processed full-RRWP tensors from another run.
 
 ## Files
 
 - `patches/0001-add-zinc-grit-1hop-control.patch`: patch applied to the pinned official GRIT repo.
-- `scripts/prepare_grit_repo.sh`: clones the official repo, checks out the pinned commit, and applies the patch.
+- `scripts/prepare_grit_repo.sh`: clones the official repo, checks out the pinned commit, and applies the 1-hop plus local-RRWP patches.
 - `scripts/run_grit_zinc_slurm.py`: launches GRIT and aborts if the logged parameter count differs from `473,473`.
 - `slurm/train_grit_zinc_single.sbatch`: one GPU job for one variant/seed.
 - `slurm/train_grit_zinc_array.sbatch`: 8-job array for `official` and `1hop` across seeds `41 42 43 44`.
@@ -43,10 +45,22 @@ sbatch --export=ALL,CONDA_ENV=grit-zinc-py39-cu113,GRIT_VARIANT=official,SEED=41
 sbatch --export=ALL,CONDA_ENV=grit-zinc-py39-cu113,GRIT_VARIANT=1hop,SEED=41,DATA_DIR=/path/to/datasets,RESULTS_DIR=/path/to/results experiments/zinc/grit_official_slurm/slurm/train_grit_zinc_single.sbatch
 ```
 
+Strict 1-hop local-RRWP control, one seed:
+
+```bash
+sbatch --export=ALL,CONDA_ENV=grit-zinc-py39-cu113,GRIT_VARIANT=1hop-localrrwp,SEED=41,DATA_DIR=/path/to/localrrwp-datasets,RESULTS_DIR=/path/to/localrrwp-results experiments/zinc/grit_official_slurm/slurm/train_grit_zinc_single.sbatch
+```
+
 Both variants across four seeds:
 
 ```bash
 sbatch --export=ALL,CONDA_ENV=grit-zinc-py39-cu113,DATA_DIR=/path/to/datasets,RESULTS_DIR=/path/to/results experiments/zinc/grit_official_slurm/slurm/train_grit_zinc_array.sbatch
+```
+
+Only the strict local-RRWP variant across three seeds:
+
+```bash
+sbatch --export=ALL,CONDA_ENV=grit-zinc-py39-cu113,GRIT_VARIANTS="1hop-localrrwp",SEEDS="41 42 43",DATA_DIR=/path/to/localrrwp-datasets,RESULTS_DIR=/path/to/localrrwp-results experiments/zinc/grit_official_slurm/slurm/train_grit_zinc_array.sbatch
 ```
 
 `DATA_DIR` is passed to GRIT as `dataset.dir`; PyG will place the ZINC data under that root. `RESULTS_DIR` defaults to `experiments/zinc/grit_official_slurm/results`, which is ignored by the repository.

@@ -14,7 +14,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 IFS=' ' read -r -a SEED_LIST <<< "${SEEDS:-41 42 43 44}"
-VARIANT_LIST=(official 1hop)
+IFS=' ' read -r -a VARIANT_LIST <<< "${GRIT_VARIANTS:-official 1hop}"
 N_SEEDS="${#SEED_LIST[@]}"
 TASK_ID="${SLURM_ARRAY_TASK_ID:-0}"
 VARIANT_INDEX=$((TASK_ID / N_SEEDS))

@@ -15,10 +15,12 @@ from pathlib import Path
 CFG_BY_VARIANT = {
     "official": "configs/GRIT/zinc-GRIT-RRWP.yaml",
     "1hop": "configs/GRIT/zinc-GRIT-RRWP-1hop.yaml",
+    "1hop-localrrwp": "configs/GRIT/zinc-GRIT-RRWP-1hop-localrrwp.yaml",
 }
 NAME_TAG_BY_VARIANT = {
     "official": "slurm.official.GRITwRRWP",
     "1hop": "slurm.1hop.GRITwRRWP",
+    "1hop-localrrwp": "slurm.1hopLocalRRWP.GRITwRRWP",
 }
 EXPECTED_PARAMS = 473_473
 PARAM_RE = re.compile(r"Num parameters:\s*([0-9,]+)")
