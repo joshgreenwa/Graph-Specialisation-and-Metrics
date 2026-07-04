@@ -129,6 +129,20 @@ def distance_matrix(graph: Any) -> torch.Tensor:
     return all_pair_distances_or_compute(pyg_graph_view(graph)).cpu()
 
 
+def graph_distance_summary(dist: torch.Tensor) -> dict[str, float]:
+    values = dist.detach().cpu().float()
+    finite = values[torch.isfinite(values)]
+    if finite.numel() == 0:
+        return {"graph_diameter": float("nan"), "graph_mean_distance": float("nan")}
+    finite = finite[finite > 0]
+    if finite.numel() == 0:
+        return {"graph_diameter": 0.0, "graph_mean_distance": 0.0}
+    return {
+        "graph_diameter": float(finite.max().item()),
+        "graph_mean_distance": float(finite.mean().item()),
+    }
+
+
 def far_pairs(dist: torch.Tensor, tau: int, *, max_pairs: Optional[int] = None, seed: int = 0) -> list[tuple[int, int]]:
     dist_cpu = dist.detach().cpu().float()
     mask = torch.isfinite(dist_cpu) & (dist_cpu > float(tau))
@@ -3498,7 +3512,12 @@ def noncomposable_excess_summary(validation_summary: Sequence[Mapping[str, Any]]
     treatment = [r for r in validation_summary if not is_composed(str(r.get("model")))]
     if not composed or not treatment:
         return []
-    floor_row = min(composed, key=lambda r: safe_float(r.get("mean_direct_fraction")))
+    matched = [r for r in composed if str(r.get("model")) == "grit_1hop"]
+    if matched:
+        floor_row = matched[0]
+    else:
+        onehop_like = [r for r in composed if "1hop" in str(r.get("model")).lower() or "one_hop" in str(r.get("model")).lower()]
+        floor_row = onehop_like[0] if onehop_like else min(composed, key=lambda r: safe_float(r.get("mean_direct_fraction")))
     floor = safe_float(floor_row.get("mean_direct_fraction"))
     floor_hi = safe_float(floor_row.get("ci_high"))
     floor_ref = floor_hi if math.isfinite(floor_hi) else floor
@@ -3543,11 +3562,11 @@ def render_step4_noncomposable_excess(summary: Sequence[Mapping[str, Any]], arti
         capsize=4,
         color="#4c78a8",
     )
-    ax.axhline(0.0, color="#555555", linewidth=1, label="Composed floor (no non-composable transport)")
+    ax.axhline(0.0, color="#555555", linewidth=1, label="Matched 1-hop floor")
     ref = str(summary[0].get("composed_reference", "composed"))
-    ax.set_title(f"Non-composable transport: direct fraction above composed floor [{ref}]")
+    ax.set_title("Excess non-composable carriage over the matched 1-hop control")
     ax.set_xlabel("Treatment model")
-    ax.set_ylabel("Excess direct fraction over composed reference")
+    ax.set_ylabel(f"Excess direct fraction over {ref}")
     ax.legend(frameon=False, fontsize=8)
     for tick in ax.get_xticklabels():
         tick.set_rotation(15)
@@ -4142,18 +4161,64 @@ def render_step4_signal_magnitude_by_distance(rows: Sequence[Mapping[str, Any]],
         distance = int(round(safe_float(row.get("distance"))))
         grouped.setdefault((str(row.get("model")), distance), []).append(safe_float(row.get("effect_abs")) / denom)
     fig, ax = plt.subplots(figsize=(8.2, 4.8), constrained_layout=True)
+    half_rows: list[dict[str, Any]] = []
     for model in sorted({model for model, _ in grouped}):
         distances = sorted(distance for m, distance in grouped if m == model)
         values = [float(np.nanmean(grouped[(model, distance)])) for distance in distances]
         ax.plot(distances, values, marker="o", linewidth=1.8, label=model)
+        value_arr = np.asarray(values, dtype=float)
+        finite_mask = np.isfinite(value_arr)
+        if distances and values and finite_mask.any():
+            finite_indices = np.flatnonzero(finite_mask)
+            peak_idx = int(finite_indices[int(np.nanargmax(value_arr[finite_mask]))])
+            peak = float(value_arr[peak_idx])
+            threshold = 0.25 * peak
+            half_distance = float("nan")
+            for distance, value in zip(distances[peak_idx:], values[peak_idx:]):
+                if math.isfinite(value) and value <= threshold:
+                    half_distance = float(distance)
+                    break
+            half_rows.append(
+                {
+                    "model": model,
+                    "peak_distance": distances[peak_idx],
+                    "peak_normalized_carriage": peak,
+                    "threshold_fraction_of_peak": 0.25,
+                    "half_distance": half_distance,
+                    "max_observed_distance": max(distances),
+                }
+            )
+            if math.isfinite(half_distance):
+                ax.axvline(half_distance, color=ax.lines[-1].get_color(), linestyle=":", linewidth=0.9, alpha=0.65)
+                ax.text(
+                    half_distance,
+                    threshold,
+                    f"{model} hd={half_distance:.0f}",
+                    fontsize=7,
+                    rotation=90,
+                    va="bottom",
+                    ha="right",
+                    color=ax.lines[-1].get_color(),
+                )
+            else:
+                ax.text(
+                    distances[-1],
+                    values[-1],
+                    f"{model} hd>{distances[-1]}",
+                    fontsize=7,
+                    va="bottom",
+                    ha="right",
+                    color=ax.lines[-1].get_color(),
+                )
     # No gate-floor line: the hard signal gate was removed; noise is handled by the
     # ratio-of-sums aggregation and the composed reference (GIN), not a per-pair floor.
-    ax.set_title("Carriage magnitude vs distance (per-graph normalised)")
+    ax.set_title("Over-squashing: carriage magnitude vs distance by model (half-distance annotated)")
     ax.set_xlabel("Molecular hop distance")
     ax.set_ylabel("|C| / per-graph max")
     ax.set_ylim(bottom=0.0)
     ax.legend(frameon=False, fontsize=8)
     figures = ensure_dir(artifact_root / "figures")
+    write_csv(artifact_root / "metrics" / "step4_carriage_half_distance.csv", half_rows)
     fig.savefig(figures / "step4_carriage_signal_by_distance.png", dpi=dpi)
     fig.savefig(figures / "step4_carriage_signal_by_distance.pdf")
     plt.close(fig)
@@ -4233,7 +4298,7 @@ def render_step4(
         fig, ax = plt.subplots(figsize=(7.0, 4.4), constrained_layout=True)
         ax.bar(labels, y, yerr=np.vstack([np.maximum(0.0, y - lo), np.maximum(0.0, hi - y)]), capsize=4, color="#4c78a8")
         ax.axhline(0, color="#555555", linewidth=1)
-        ax.set_title("Mediator-patching instrument check (composed reference must be ≈ 0)")
+        ax.set_title("Non-composable long-range carriage is dense-only (dense > 1-hop ≈ local-RRWP ≈ GIN ≈ 0)")
         ax.set_xlabel("Model")
         ax.set_ylabel("Carriage-weighted direct fraction")
         for tick in ax.get_xticklabels():
@@ -4636,6 +4701,7 @@ def run_step5(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
                         "nontrivial_effect": nontrivial,
                     }
             if model.name == dense.name:
+                graph_stats = graph_distance_summary(dist)
                 r_nc = safe_float(r_nc_by_tau[int(tau)].get("r_nc"))
                 y = graph_label(graph)
                 dense_pred = float(result["prediction"])
@@ -4645,6 +4711,20 @@ def run_step5(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
                     onehop_pred = float("nan")
                 dense_err = abs(dense_pred - y) if math.isfinite(y) else float("nan")
                 onehop_err = abs(onehop_pred - y) if math.isfinite(y) and math.isfinite(onehop_pred) else float("nan")
+                optional_reference_errors: dict[str, float] = {}
+                for ref_name in ("gin", "grit_1hop_localrrwp"):
+                    ref_model = by_name.get(ref_name)
+                    if ref_model is None:
+                        continue
+                    try:
+                        ref_pred = float(ref_model.adapter.predict(graph).reshape(-1)[0].detach().cpu().item())
+                    except Exception:
+                        ref_pred = float("nan")
+                    optional_reference_errors[ref_name] = (
+                        abs(ref_pred - y)
+                        if math.isfinite(y) and math.isfinite(ref_pred)
+                        else float("nan")
+                    )
                 # Self-ablation (dense as its own control): remove the measured non-composable
                 # (direct) far carriage from dense's own prediction, keeping everything a GNN could
                 # compose. Reconstruction identity ŷ = ŷ_base + Σ C[i,j] => the direct far
@@ -4673,6 +4753,9 @@ def run_step5(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
                     "r_nc_pair_coverage": r_nc_by_tau[int(tau)].get("r_nc_pair_coverage"),
                     "r_nc_scaled_from_sample": r_nc_by_tau[int(tau)].get("r_nc_scaled_from_sample"),
                     "r_nc_definition": r_nc_by_tau[int(tau)].get("r_nc_definition"),
+                    "graph_num_nodes": graph_num_nodes(graph),
+                    "graph_diameter": graph_stats.get("graph_diameter"),
+                    "graph_mean_distance": graph_stats.get("graph_mean_distance"),
                     "signal_gate_enabled": use_signal_gate,
                     "signal_gate_quantile": gate_quantile,
                     "onehop_empirical_floor": onehop_floor,
@@ -4687,6 +4770,18 @@ def run_step5(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
                     "dense_ablated_error": dense_ablated_err,
                     "ablation_minus_dense_error": ablation_minus_dense_error,
                 }
+                for ref_name, ref_err in optional_reference_errors.items():
+                    gap_row[f"{ref_name}_error"] = ref_err
+                    gap_row[f"{ref_name}_minus_dense_error"] = (
+                        ref_err - dense_err
+                        if math.isfinite(ref_err) and math.isfinite(dense_err)
+                        else float("nan")
+                    )
+                    gap_row[f"{ref_name}_minus_onehop_error"] = (
+                        ref_err - onehop_err
+                        if math.isfinite(ref_err) and math.isfinite(onehop_err)
+                        else float("nan")
+                    )
                 for threshold, stats in r_nc_by_tau.items():
                     gap_row[f"r_nc_tau_{threshold}"] = stats.get("r_nc")
                     gap_row[f"r_nc_tau_{threshold}_coverage"] = stats.get("r_nc_pair_coverage")
@@ -4771,6 +4866,7 @@ def run_step5(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
     ablation = self_ablation_summary(gap_rows)
     write_json(artifact_root / "metrics" / "step5_self_ablation.json", ablation)
     render_step5_self_ablation(ablation, gap_rows, artifact_root, dpi=dpi)
+    render_step5_gap_structural_severity(gap_rows, artifact_root, dpi=dpi)
     if int(ablation.get("n", 0)) > 0:
         progress(
             "Step 5 self-ablation: dense_err="
@@ -5108,15 +5204,83 @@ def render_step5_self_ablation(summary: Mapping[str, Any], gap_rows: Sequence[Ma
         plt.close(fig)
 
 
+def render_step5_gap_structural_severity(gap_rows: Sequence[Mapping[str, Any]], artifact_root: Path, *, dpi: int) -> None:
+    if not gap_rows:
+        return
+    diameter = np.asarray([safe_float(r.get("graph_diameter")) for r in gap_rows], dtype=float)
+    gin_minus_onehop = np.asarray([safe_float(r.get("gin_minus_onehop_error")) for r in gap_rows], dtype=float)
+    r_nc = np.asarray([safe_float(r.get("r_nc")) for r in gap_rows], dtype=float)
+    onehop_minus_dense = np.asarray([safe_float(r.get("onehop_minus_dense_error")) for r in gap_rows], dtype=float)
+
+    figures = ensure_dir(artifact_root / "figures")
+    fig, axes = plt.subplots(1, 2, figsize=(11.2, 4.8), constrained_layout=True)
+
+    def scatter_with_fit(ax: Any, x: np.ndarray, y: np.ndarray, *, xlabel: str, ylabel: str, title: str) -> None:
+        mask = np.isfinite(x) & np.isfinite(y)
+        if not mask.any():
+            ax.text(0.5, 0.5, "Not available", ha="center", va="center", transform=ax.transAxes)
+            ax.set_axis_off()
+            ax.set_title(title)
+            return
+        ax.scatter(x[mask], y[mask], s=22, alpha=0.68)
+        ax.axhline(0.0, color="#777777", linewidth=1)
+        if mask.sum() >= 2 and float(np.nanmax(x[mask]) - np.nanmin(x[mask])) > 0.0:
+            corr = float(np.corrcoef(x[mask], y[mask])[0, 1])
+            coef = np.polyfit(x[mask], y[mask], 1)
+            xs = np.linspace(float(np.nanmin(x[mask])), float(np.nanmax(x[mask])), 100)
+            ax.plot(xs, coef[0] * xs + coef[1], color="#f58518", label=f"r={corr:.2f}")
+            ax.legend(frameon=False, fontsize=8)
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel(ylabel)
+        ax.set_title(title)
+
+    scatter_with_fit(
+        axes[0],
+        diameter,
+        gin_minus_onehop,
+        xlabel="Graph diameter",
+        ylabel="GIN error - 1-hop error",
+        title="RRWP-tier advantage vs graph bottleneck",
+    )
+    scatter_with_fit(
+        axes[1],
+        r_nc,
+        onehop_minus_dense,
+        xlabel="R_nc = mean |C^clamp| over far pairs",
+        ylabel="1-hop error - dense error",
+        title="Dense advantage vs long-range demand",
+    )
+    fig.suptitle("Where each gap lives: RRWP-tier advantage vs graph bottleneck; dense advantage vs long-range demand")
+    fig.savefig(figures / "step5_gap_structural_severity.png", dpi=dpi)
+    fig.savefig(figures / "step5_gap_structural_severity.pdf")
+    plt.close(fig)
+
+
 def gap_regression_summary(gap_rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     x = np.asarray([safe_float(r.get("r_nc")) for r in gap_rows], dtype=float)
-    y = np.asarray([safe_float(r.get("onehop_minus_dense_error")) for r in gap_rows], dtype=float)
-    mask = np.isfinite(x) & np.isfinite(y)
-    if mask.sum() < 2:
-        return {"n": int(mask.sum()), "pearson_r": float("nan"), "slope": float("nan"), "intercept": float("nan")}
-    slope, intercept = np.polyfit(x[mask], y[mask], 1)
-    corr = float(np.corrcoef(x[mask], y[mask])[0, 1])
-    return {"n": int(mask.sum()), "pearson_r": corr, "slope": float(slope), "intercept": float(intercept)}
+
+    def regress(key: str) -> dict[str, Any]:
+        y = np.asarray([safe_float(r.get(key)) for r in gap_rows], dtype=float)
+        mask = np.isfinite(x) & np.isfinite(y)
+        if mask.sum() < 2:
+            return {"n": int(mask.sum()), "pearson_r": float("nan"), "slope": float("nan"), "intercept": float("nan")}
+        slope, intercept = np.polyfit(x[mask], y[mask], 1)
+        corr = float(np.corrcoef(x[mask], y[mask])[0, 1])
+        return {"n": int(mask.sum()), "pearson_r": corr, "slope": float(slope), "intercept": float(intercept)}
+
+    standard = regress("onehop_minus_dense_error")
+    out = {
+        "n": standard["n"],
+        "pearson_r": standard["pearson_r"],
+        "slope": standard["slope"],
+        "intercept": standard["intercept"],
+        "reference": "grit_1hop",
+        "matched_1hop": standard,
+    }
+    local_key = "grit_1hop_localrrwp_minus_dense_error"
+    if any(math.isfinite(safe_float(r.get(local_key))) for r in gap_rows):
+        out["local_rrwp_1hop"] = regress(local_key)
+    return out
 
 
 def rank_summary_rows(
@@ -5204,9 +5368,9 @@ def render_step5_signal_vs_noise(rank_rows: Sequence[Mapping[str, Any]], artifac
     m_mean, m_lo, m_hi = bootstrap_ci(marg_v, seed=8125, draws=1000)
     signal = bool(math.isfinite(m_lo) and m_lo > 0.0)
     verdict = (
-        "structured signal ABOVE noise (margin CI excludes 0)"
+        "low-rank structure above distance-preserving null"
         if signal
-        else "at the noise floor (margin CI includes 0): nothing resolvable above noise"
+        else "no low-rank structure above distance-preserving null"
     )
     figures = ensure_dir(artifact_root / "figures")
     fig, ax = plt.subplots(figsize=(6.8, 4.8), constrained_layout=True)
@@ -5221,7 +5385,7 @@ def render_step5_signal_vs_noise(rank_rows: Sequence[Mapping[str, Any]], artifac
     ax.bar(labels, means, yerr=errs, capsize=4, color=["#4c78a8", "#999999"])
     ax.set_ylabel("Top singular-value share (structure)")
     ax.set_ylim(0.0, 1.05)
-    ax.set_title(f"Dense far carriage: signal vs noise\n{verdict}", fontsize=10)
+    ax.set_title(f"Dense far carriage structure vs shuffle null\nhigh-rank ≠ noise; see self-ablation — {verdict}", fontsize=10)
     ax.text(
         0.5,
         min(1.02, max(means) + 0.08),
@@ -5260,20 +5424,29 @@ def render_step5(
         rank_rows = primary_rank_rows
     if gap_rows:
         x = np.asarray([safe_float(r["r_nc"]) for r in gap_rows], dtype=float)
-        y = np.asarray([safe_float(r["onehop_minus_dense_error"]) for r in gap_rows], dtype=float)
-        mask = np.isfinite(x) & np.isfinite(y)
-        if mask.any():
+        series = [
+            ("1-hop global RRWP - dense", np.asarray([safe_float(r["onehop_minus_dense_error"]) for r in gap_rows], dtype=float), "#4c78a8"),
+        ]
+        local_y = np.asarray([safe_float(r.get("grit_1hop_localrrwp_minus_dense_error")) for r in gap_rows], dtype=float)
+        if np.isfinite(local_y).any():
+            series.append(("1-hop local PE - dense", local_y, "#54a24b"))
+        if any((np.isfinite(x) & np.isfinite(y)).any() for _, y, _ in series):
             fig, ax = plt.subplots(figsize=(5.8, 4.8), constrained_layout=True)
-            ax.scatter(x[mask], y[mask], s=18, alpha=0.65)
-            corr = float(np.corrcoef(x[mask], y[mask])[0, 1]) if mask.sum() >= 2 else float("nan")
-            if mask.sum() >= 2:
-                coef = np.polyfit(x[mask], y[mask], 1)
-                xs = np.linspace(float(x[mask].min()), float(x[mask].max()), 100)
-                ax.plot(xs, coef[0] * xs + coef[1], color="#f58518", label=f"r={corr:.2f}")
+            for label, y, color in series:
+                mask = np.isfinite(x) & np.isfinite(y)
+                if not mask.any():
+                    continue
+                ax.scatter(x[mask], y[mask], s=18, alpha=0.65, color=color, label=label)
+                corr = float(np.corrcoef(x[mask], y[mask])[0, 1]) if mask.sum() >= 2 else float("nan")
+                if mask.sum() >= 2:
+                    coef = np.polyfit(x[mask], y[mask], 1)
+                    xs = np.linspace(float(x[mask].min()), float(x[mask].max()), 100)
+                    ax.plot(xs, coef[0] * xs + coef[1], color=color, linestyle="--", linewidth=1.0, label=f"{label} fit r={corr:.2f}")
+            if ax.get_legend_handles_labels()[0]:
                 ax.legend(frameon=False)
             ax.set_title("Step 5: performance gap vs non-composable carriage")
             ax.set_xlabel("R_nc = mean |C^clamp| over signal-gated far pairs")
-            ax.set_ylabel("1-hop error - dense error")
+            ax.set_ylabel("Reference error - dense error")
             fig.savefig(figures / "step5_gap_vs_rnc.png", dpi=dpi)
             fig.savefig(figures / "step5_gap_vs_rnc.pdf")
             plt.close(fig)

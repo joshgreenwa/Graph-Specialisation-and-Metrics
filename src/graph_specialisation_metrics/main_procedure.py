@@ -589,17 +589,59 @@ def render_step_1_figures(
             if math.isfinite(value):
                 grouped.setdefault(str(row["model"]), []).append(value)
         if grouped:
-            models = sorted(grouped)
+            ladder_order = ["gin", "grit_1hop_localrrwp", "grit_1hop", "dense_grit"]
+            ladder_labels = {
+                "gin": "GIN",
+                "grit_1hop_localrrwp": "1-hop\n(local PE)",
+                "grit_1hop": "1-hop\n(global RRWP)",
+                "dense_grit": "dense\nGRIT",
+            }
+            mechanism_by_pair = {
+                ("gin", "grit_1hop_localrrwp"): "+arch",
+                ("grit_1hop_localrrwp", "grit_1hop"): "+global RRWP",
+                ("grit_1hop", "dense_grit"): "+global attention",
+            }
+            models = [m for m in ladder_order if m in grouped]
+            models.extend(sorted(m for m in grouped if m not in set(models)))
             means = [float(np.mean(grouped[m])) for m in models]
             stds = [float(np.std(grouped[m], ddof=1)) if len(grouped[m]) > 1 else 0.0 for m in models]
-            fig, ax = plt.subplots(figsize=(7.2, 4.4), constrained_layout=True)
-            ax.bar(models, means, yerr=stds, color=["#4c78a8", "#f58518", "#54a24b", "#b279a2"][: len(models)], capsize=4)
-            ax.set_title("Step 1: test error by model")
+            x = np.arange(len(models), dtype=float)
+            fig, ax = plt.subplots(figsize=(max(7.8, 1.25 * len(models)), 4.8), constrained_layout=True)
+            ax.bar(x, means, yerr=stds, color=["#4c78a8", "#f58518", "#54a24b", "#b279a2", "#72b7b2"][: len(models)], capsize=4)
+            ax.set_title("Test MAE decomposition: GIN → 1-hop (local PE) → 1-hop (global RRWP) → dense GRIT")
             ax.set_ylabel("Test MAE")
             ax.set_xlabel("Model")
+            ax.set_xticks(x)
+            ax.set_xticklabels([ladder_labels.get(m, m) for m in models])
             for tick in ax.get_xticklabels():
                 tick.set_rotation(15)
                 tick.set_ha("right")
+            top = max([m + s for m, s in zip(means, stds)] + [0.0])
+            span = max(1.0e-6, top - min(means + [top]))
+            y_base = top + 0.08 * max(top, span)
+            for idx in range(len(models) - 1):
+                pair = (models[idx], models[idx + 1])
+                mechanism = mechanism_by_pair.get(pair)
+                if mechanism is None:
+                    continue
+                improvement = means[idx] - means[idx + 1]
+                y = y_base + 0.06 * max(top, span) * (idx % 2)
+                ax.annotate(
+                    "",
+                    xy=(idx + 1, y),
+                    xytext=(idx, y),
+                    arrowprops={"arrowstyle": "<->", "linewidth": 0.9, "color": "#555555"},
+                )
+                ax.text(
+                    idx + 0.5,
+                    y + 0.02 * max(top, span),
+                    f"{mechanism}\nΔMAE={improvement:+.3f}",
+                    ha="center",
+                    va="bottom",
+                    fontsize=8,
+                )
+            if len(models) >= 2:
+                ax.set_ylim(top=max(top * 1.22, y_base * 1.08))
             fig.savefig(figures / "step1_test_error_dense_vs_1hop.png", dpi=dpi)
             fig.savefig(figures / "step1_test_error_dense_vs_1hop.pdf")
             plt.close(fig)
