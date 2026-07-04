@@ -34,6 +34,7 @@ import csv
 import json
 import math
 import os
+import importlib
 from pathlib import Path
 import shutil
 import subprocess
@@ -43,7 +44,7 @@ from typing import Any, Mapping, Sequence
 
 
 DEFAULT_REPO_URL = "https://github.com/joshgreenwa/Graph-Specialisation-and-Metrics.git"
-DEFAULT_BRANCH = "main"
+DEFAULT_BRANCH = "codex/cfim-grit-experiments"
 DEFAULT_DRIVE_DIR = "/content/drive/MyDrive/sparse1hop_grit_zinc"
 DEFAULT_OFFICIAL_1HOP_DIR = "/content/drive/MyDrive/grit_zinc_1hop"
 
@@ -56,8 +57,14 @@ def log(msg: str) -> None:
     print(msg, flush=True)
 
 
-def run_cmd(cmd: Sequence[str], *, cwd: Path | None = None, check: bool = True) -> subprocess.CompletedProcess:
-    printable = " ".join(map(str, cmd))
+def run_cmd(
+    cmd: Sequence[str],
+    *,
+    cwd: Path | None = None,
+    check: bool = True,
+    safe_display: str | None = None,
+) -> subprocess.CompletedProcess:
+    printable = safe_display or " ".join(map(str, cmd))
     log(f"[cmd] {printable}")
     proc = subprocess.run(list(map(str, cmd)), cwd=str(cwd) if cwd else None, text=True, check=False)
     if check and proc.returncode != 0:
@@ -111,29 +118,55 @@ def install_dependencies(skip_install: bool) -> None:
 
 
 def clone_or_update_repo(repo_url: str, branch: str, repo_dir: Path, secret_name: str, skip_git: bool) -> None:
+    src_path = str(repo_dir / "src")
     if skip_git:
-        sys.path.insert(0, str(repo_dir / "src"))
+        if src_path not in sys.path:
+            sys.path.insert(0, src_path)
         return
     token = get_colab_secret(secret_name)
     url = authenticated_url(repo_url, token)
     safe = "<token-authenticated-url>" if token else repo_url
-    if repo_dir.exists():
+    if (repo_dir / ".git").exists():
         log(f"[git] updating {repo_dir}")
+        run_cmd(
+            ["git", "-C", str(repo_dir), "remote", "set-url", "origin", url],
+            safe_display=f"git -C {repo_dir} remote set-url origin {safe}",
+        )
         run_cmd(["git", "-C", str(repo_dir), "fetch", "origin", branch])
         run_cmd(["git", "-C", str(repo_dir), "checkout", branch])
         run_cmd(["git", "-C", str(repo_dir), "pull", "--ff-only", "origin", branch])
+        run_cmd(["git", "-C", str(repo_dir), "remote", "set-url", "origin", repo_url])
     else:
+        if repo_dir.exists():
+            shutil.rmtree(repo_dir)
         log(f"[git] cloning {safe} branch={branch} -> {repo_dir}")
-        run_cmd(["git", "clone", "--branch", branch, url, str(repo_dir)])
+        run_cmd(
+            ["git", "clone", "--branch", branch, url, str(repo_dir)],
+            safe_display=f"git clone --branch {branch} {safe} {repo_dir}",
+        )
         run_cmd(["git", "-C", str(repo_dir), "remote", "set-url", "origin", repo_url])
     run_cmd([sys.executable, "-m", "pip", "install", "-q", "-e", str(repo_dir), "--no-deps"])
-    sys.path.insert(0, str(repo_dir / "src"))
+    if src_path in sys.path:
+        sys.path.remove(src_path)
+    sys.path.insert(0, src_path)
+    for module_name in list(sys.modules):
+        if module_name == "graph_specialisation_metrics" or module_name.startswith("graph_specialisation_metrics."):
+            del sys.modules[module_name]
+    importlib.invalidate_caches()
+    log(f"[git] active repo branch={branch}; cleared stale graph_specialisation_metrics imports")
 
 
 def ensure_imports() -> None:
     import torch  # noqa: F401
     import torch_geometric  # noqa: F401
-    from graph_specialisation_metrics.sparse1hop_grit import Sparse1HopGRIT  # noqa: F401
+    try:
+        from graph_specialisation_metrics.sparse1hop_grit import Sparse1HopGRIT  # noqa: F401
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError(
+            "Could not import graph_specialisation_metrics.sparse1hop_grit. "
+            "The Sparse1HopGRIT implementation is on branch "
+            f"{DEFAULT_BRANCH!r}; rerun with --branch {DEFAULT_BRANCH} or use the updated Colab file."
+        ) from exc
 
 
 class Sparse1HopRRWP:
