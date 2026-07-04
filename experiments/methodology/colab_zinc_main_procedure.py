@@ -568,6 +568,118 @@ def apply_colab_repo_hotfixes(repo_dir: Path) -> None:
         return
     text = adapters.read_text(encoding="utf-8")
     fixed = text.replace("torch.inference_mode()", "torch.no_grad()")
+    if "_active_grit_repo: ClassVar[Optional[Path]]" not in fixed:
+        fixed = fixed.replace(
+            "from typing import Any, Optional, Sequence",
+            "from typing import Any, ClassVar, Optional, Sequence",
+            1,
+        )
+        fixed = fixed.replace(
+            "    seed: Optional[int] = None\n\n    def __post_init__(self) -> None:\n",
+            "    seed: Optional[int] = None\n\n"
+            "    _active_grit_repo: ClassVar[Optional[Path]] = None\n\n"
+            "    def __post_init__(self) -> None:\n",
+            1,
+        )
+        old_import_official = '''    def _import_official(self) -> None:
+        if self._official_imported:
+            return
+        if not self.repo_path.exists():
+            raise FileNotFoundError(f"missing official GRIT checkout: {self.repo_path}")
+        repo_str = str(self.repo_path)
+        if repo_str not in sys.path:
+            sys.path.insert(0, repo_str)
+        try:
+            importlib.import_module("grit")
+            importlib.import_module("torch_geometric")
+        except Exception as exc:
+            raise RuntimeError(
+                "official GRIT execution requires the LiamMa/GRIT checkout and its environment; "
+                f"failed importing GRIT/PyG from {self.repo_path}: {exc}"
+            ) from exc
+        self._official_imported = True
+'''
+        new_import_official = '''    @staticmethod
+    def _path_is_relative_to(path: Path, root: Path) -> bool:
+        try:
+            path.resolve().relative_to(root.resolve())
+            return True
+        except ValueError:
+            return False
+
+    @classmethod
+    def _grit_module_is_from_repo(cls, repo_path: Path) -> bool:
+        grit_module = sys.modules.get("grit")
+        if grit_module is None:
+            return False
+        module_file = getattr(grit_module, "__file__", None)
+        if module_file:
+            return cls._path_is_relative_to(Path(module_file), repo_path)
+        module_paths = getattr(grit_module, "__path__", [])
+        return any(cls._path_is_relative_to(Path(path), repo_path) for path in module_paths)
+
+    @staticmethod
+    def _evict_grit_modules() -> None:
+        for module_name in list(sys.modules):
+            if module_name == "grit" or module_name.startswith("grit."):
+                del sys.modules[module_name]
+
+    @staticmethod
+    def _allow_graphgym_grit_reregistration() -> None:
+        try:
+            import torch_geometric.graphgym.register as graphgym_register
+        except Exception:
+            return
+        if getattr(graphgym_register, "_gsm_grit_reregistration_ok", False):
+            return
+        original_register_base = graphgym_register.register_base
+
+        def register_base_replace(mapping: dict[str, Any], key: str, module: Any) -> None:
+            mapping[key] = module
+
+        graphgym_register._gsm_original_register_base = original_register_base
+        graphgym_register.register_base = register_base_replace
+        graphgym_register._gsm_grit_reregistration_ok = True
+
+    def _import_official(self) -> None:
+        if not self.repo_path.exists():
+            raise FileNotFoundError(f"missing official GRIT checkout: {self.repo_path}")
+        resolved_repo = self.repo_path.resolve()
+        repo_str = str(resolved_repo)
+        sys.path = [path for path in sys.path if path != repo_str]
+        sys.path.insert(0, repo_str)
+        active_repo = self.__class__._active_grit_repo
+        module_matches_repo = self.__class__._grit_module_is_from_repo(resolved_repo)
+        if self._official_imported and active_repo == resolved_repo and module_matches_repo:
+            return
+        if active_repo != resolved_repo or not module_matches_repo:
+            self.__class__._evict_grit_modules()
+        try:
+            importlib.import_module("torch_geometric")
+            self.__class__._allow_graphgym_grit_reregistration()
+            importlib.import_module("grit")
+        except Exception as exc:
+            raise RuntimeError(
+                "official GRIT execution requires the LiamMa/GRIT checkout and its environment; "
+                f"failed importing GRIT/PyG from {self.repo_path}: {exc}"
+            ) from exc
+        if not self.__class__._grit_module_is_from_repo(resolved_repo):
+            loaded = getattr(sys.modules.get("grit"), "__file__", "<unknown>")
+            raise RuntimeError(
+                "official GRIT import resolved to the wrong checkout: "
+                f"wanted {resolved_repo}, loaded {loaded}"
+            )
+        self.__class__._active_grit_repo = resolved_repo
+        self._official_imported = True
+'''
+        if old_import_official in fixed:
+            fixed = fixed.replace(old_import_official, new_import_official, 1)
+        else:
+            print(
+                "[hotfix-warning] could not locate old OfficialGRITAdapter._import_official block; "
+                "assuming the cloned repo already handles multiple GRIT checkouts",
+                flush=True,
+            )
     if "allowed_1hop_sparsity" not in fixed:
         fixed = fixed.replace(
             '            if sparsity != "one_hop" or full_attn is not False:\n',
@@ -1322,6 +1434,12 @@ def install_repo(repo_dir: Path, *, pyg_version: str) -> None:
     for path in [str(repo_dir), str(repo_dir / "src")]:
         if path not in sys.path:
             sys.path.insert(0, path)
+    stale_prefixes = ("graph_specialisation_metrics", "grit")
+    for module_name in list(sys.modules):
+        if module_name in stale_prefixes or any(module_name.startswith(prefix + ".") for prefix in stale_prefixes):
+            del sys.modules[module_name]
+    importlib.invalidate_caches()
+    print("[deps] cleared stale graph_specialisation_metrics/grit imports after editable install", flush=True)
 
 
 def clone_official_grit(repo_dir: Path, *, force: bool = False) -> None:

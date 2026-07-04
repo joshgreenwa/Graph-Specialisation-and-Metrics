@@ -16,7 +16,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Optional, Sequence
+from typing import Any, ClassVar, Optional, Sequence
 
 import torch
 import torch.nn as nn
@@ -340,6 +340,8 @@ class OfficialGRITAdapter:
     device: str | torch.device = "cpu"
     seed: Optional[int] = None
 
+    _active_grit_repo: ClassVar[Optional[Path]] = None
+
     def __post_init__(self) -> None:
         self.repo_path = Path(self.repo_path)
         self.config_path = Path(self.config_path)
@@ -407,22 +409,77 @@ class OfficialGRITAdapter:
                 total += int(value.numel())
         return total
 
-    def _import_official(self) -> None:
-        if self._official_imported:
+    @staticmethod
+    def _path_is_relative_to(path: Path, root: Path) -> bool:
+        try:
+            path.resolve().relative_to(root.resolve())
+            return True
+        except ValueError:
+            return False
+
+    @classmethod
+    def _grit_module_is_from_repo(cls, repo_path: Path) -> bool:
+        grit_module = sys.modules.get("grit")
+        if grit_module is None:
+            return False
+        module_file = getattr(grit_module, "__file__", None)
+        if module_file:
+            return cls._path_is_relative_to(Path(module_file), repo_path)
+        module_paths = getattr(grit_module, "__path__", [])
+        return any(cls._path_is_relative_to(Path(path), repo_path) for path in module_paths)
+
+    @staticmethod
+    def _evict_grit_modules() -> None:
+        for module_name in list(sys.modules):
+            if module_name == "grit" or module_name.startswith("grit."):
+                del sys.modules[module_name]
+
+    @staticmethod
+    def _allow_graphgym_grit_reregistration() -> None:
+        try:
+            import torch_geometric.graphgym.register as graphgym_register
+        except Exception:
             return
+        if getattr(graphgym_register, "_gsm_grit_reregistration_ok", False):
+            return
+        original_register_base = graphgym_register.register_base
+
+        def register_base_replace(mapping: dict[str, Any], key: str, module: Any) -> None:
+            mapping[key] = module
+
+        graphgym_register._gsm_original_register_base = original_register_base
+        graphgym_register.register_base = register_base_replace
+        graphgym_register._gsm_grit_reregistration_ok = True
+
+    def _import_official(self) -> None:
         if not self.repo_path.exists():
             raise FileNotFoundError(f"missing official GRIT checkout: {self.repo_path}")
-        repo_str = str(self.repo_path)
-        if repo_str not in sys.path:
-            sys.path.insert(0, repo_str)
+        resolved_repo = self.repo_path.resolve()
+        repo_str = str(resolved_repo)
+        sys.path = [path for path in sys.path if path != repo_str]
+        sys.path.insert(0, repo_str)
+        active_repo = self.__class__._active_grit_repo
+        module_matches_repo = self.__class__._grit_module_is_from_repo(resolved_repo)
+        if self._official_imported and active_repo == resolved_repo and module_matches_repo:
+            return
+        if active_repo != resolved_repo or not module_matches_repo:
+            self.__class__._evict_grit_modules()
         try:
-            importlib.import_module("grit")
             importlib.import_module("torch_geometric")
+            self.__class__._allow_graphgym_grit_reregistration()
+            importlib.import_module("grit")
         except Exception as exc:
             raise RuntimeError(
                 "official GRIT execution requires the LiamMa/GRIT checkout and its environment; "
                 f"failed importing GRIT/PyG from {self.repo_path}: {exc}"
             ) from exc
+        if not self.__class__._grit_module_is_from_repo(resolved_repo):
+            loaded = getattr(sys.modules.get("grit"), "__file__", "<unknown>")
+            raise RuntimeError(
+                "official GRIT import resolved to the wrong checkout: "
+                f"wanted {resolved_repo}, loaded {loaded}"
+            )
+        self.__class__._active_grit_repo = resolved_repo
         self._official_imported = True
 
     def _configure_official(self) -> Any:
