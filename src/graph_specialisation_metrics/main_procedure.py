@@ -123,6 +123,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "sample_graphs": 200,
             "compare_attention_to_swaps": True,
             "run_layer_channel_split": True,
+            "run_attention_erasure": True,
+            "erasure_models": ["dense_grit"],
+            "erasure_sample_graphs": 64,
+            "erasure_fractions": [0.0, 0.05, 0.10, 0.20, 0.35, 0.50],
+            "erasure_include_near_control": True,
         },
         "3": {"name": "distance_resolved_overfitting", "sample_graphs": 200},
         "4": {
@@ -179,7 +184,7 @@ FAST_DEV_OVERRIDES: dict[str, Any] = {
             "matched_target_partners_per_source": 1,
         },
         "1": {"reach_sweep": [1, "dense"]},
-        "2": {"sample_graphs": 2, "compare_attention_to_swaps": False, "run_layer_channel_split": False},
+        "2": {"sample_graphs": 2, "compare_attention_to_swaps": False, "run_layer_channel_split": False, "erasure_sample_graphs": 2},
         "3": {"sample_graphs": 2},
         "4": {"sample_graphs": 1, "max_far_pairs_per_graph": 1, "depth_pairs_per_graph": 0},
         "5": {"sample_graphs": 2, "max_far_pairs_per_graph": 2, "interaction_pairs": 16},
@@ -208,7 +213,7 @@ ANALYSIS_PRESET_OVERRIDES: dict[str, dict[str, Any]] = {
                 "matched_target_partners_per_source": 0,
             },
             "1": {"reach_sweep": [1, "dense"]},
-            "2": {"sample_graphs": 4, "compare_attention_to_swaps": False, "run_layer_channel_split": False},
+            "2": {"sample_graphs": 4, "compare_attention_to_swaps": False, "run_layer_channel_split": False, "erasure_sample_graphs": 2},
             "3": {"sample_graphs": 4},
             "4": {
                 "sample_graphs": 2,
@@ -238,7 +243,7 @@ ANALYSIS_PRESET_OVERRIDES: dict[str, dict[str, Any]] = {
                 "matched_target_partners_per_source": 1,
             },
             "1": {"reach_sweep": [1, "dense"]},
-            "2": {"sample_graphs": 8, "compare_attention_to_swaps": False, "run_layer_channel_split": False},
+            "2": {"sample_graphs": 8, "compare_attention_to_swaps": False, "run_layer_channel_split": False, "erasure_sample_graphs": 4},
             "3": {"sample_graphs": 8},
             "4": {
                 "sample_graphs": 4,
@@ -268,7 +273,7 @@ ANALYSIS_PRESET_OVERRIDES: dict[str, dict[str, Any]] = {
                 "matched_target_partners_per_source": 1,
             },
             "1": {"reach_sweep": [1, "dense"]},
-            "2": {"sample_graphs": 16, "compare_attention_to_swaps": False, "run_layer_channel_split": False},
+            "2": {"sample_graphs": 16, "compare_attention_to_swaps": False, "run_layer_channel_split": False, "erasure_sample_graphs": 8},
             "3": {"sample_graphs": 16},
             "4": {
                 "sample_graphs": 8,
@@ -304,7 +309,7 @@ ANALYSIS_PRESET_OVERRIDES: dict[str, dict[str, Any]] = {
                 "matched_target_partners_per_source": 2,
             },
             "1": {"reach_sweep": [1, "dense"]},
-            "2": {"sample_graphs": 48, "compare_attention_to_swaps": False, "run_layer_channel_split": False},
+            "2": {"sample_graphs": 48, "compare_attention_to_swaps": False, "run_layer_channel_split": False, "erasure_sample_graphs": 24},
             "3": {"sample_graphs": 48},
             "4": {
                 "sample_graphs": 24,
@@ -574,6 +579,34 @@ def run_step_1(discovery: Sequence[Mapping[str, Any]], artifact_root: Path, conf
     }
 
 
+def canonical_step1_model_name(model: str) -> str:
+    """Map common model-label variants onto the Step 1 decomposition keys."""
+    raw = str(model)
+    normalised = re.sub(r"[^a-z0-9]+", "_", raw.lower()).strip("_")
+    compact = normalised.replace("_", "")
+    if normalised == "gin" or compact == "gin":
+        return "gin"
+    if "local" in normalised and "rrwp" in normalised and ("1hop" in compact or "onehop" in compact):
+        return "grit_1hop_localrrwp"
+    if normalised in {"grit_1hop_localrrwp", "grit_1hop_local_rrwp", "one_hop_local_rrwp"}:
+        return "grit_1hop_localrrwp"
+    if normalised in {
+        "grit_1hop",
+        "grit_1_hop",
+        "one_hop",
+        "onehop",
+        "one_hop_global_rrwp",
+        "grit_1hop_global_rrwp",
+        "grit_1_hop_global_rrwp",
+    }:
+        return "grit_1hop"
+    if ("1hop" in compact or "onehop" in compact) and "rrwp" in compact:
+        return "grit_1hop"
+    if normalised in {"dense_grit", "grit_dense", "official_grit", "official", "dense"}:
+        return "dense_grit"
+    return raw
+
+
 def render_step_1_figures(
     metric_rows: Sequence[Mapping[str, Any]],
     history_rows: Sequence[Mapping[str, Any]],
@@ -587,63 +620,103 @@ def render_step_1_figures(
         for row in metric_rows:
             value = safe_float(row.get("test_metric"))
             if math.isfinite(value):
-                grouped.setdefault(str(row["model"]), []).append(value)
+                grouped.setdefault(canonical_step1_model_name(str(row["model"])), []).append(value)
         if grouped:
             ladder_order = ["gin", "grit_1hop_localrrwp", "grit_1hop", "dense_grit"]
             ladder_labels = {
                 "gin": "GIN",
-                "grit_1hop_localrrwp": "1-hop\n(local PE)",
-                "grit_1hop": "1-hop\n(global RRWP)",
-                "dense_grit": "dense\nGRIT",
+                "grit_1hop_localrrwp": "1-hop GRIT\nlocal RRWP",
+                "grit_1hop": "1-hop GRIT\nglobal RRWP",
+                "dense_grit": "dense GRIT",
             }
             mechanism_by_pair = {
-                ("gin", "grit_1hop_localrrwp"): "+arch",
-                ("grit_1hop_localrrwp", "grit_1hop"): "+global RRWP",
-                ("grit_1hop", "dense_grit"): "+global attention",
+                ("gin", "grit_1hop_localrrwp"): "arch",
+                ("grit_1hop_localrrwp", "grit_1hop"): "global RRWP",
+                ("grit_1hop", "dense_grit"): "global attention",
             }
-            models = [m for m in ladder_order if m in grouped]
-            models.extend(sorted(m for m in grouped if m not in set(models)))
-            means = [float(np.mean(grouped[m])) for m in models]
-            stds = [float(np.std(grouped[m], ddof=1)) if len(grouped[m]) > 1 else 0.0 for m in models]
-            x = np.arange(len(models), dtype=float)
-            fig, ax = plt.subplots(figsize=(max(7.8, 1.25 * len(models)), 4.8), constrained_layout=True)
-            ax.bar(x, means, yerr=stds, color=["#4c78a8", "#f58518", "#54a24b", "#b279a2", "#72b7b2"][: len(models)], capsize=4)
-            ax.set_title("Test MAE decomposition: GIN → 1-hop (local PE) → 1-hop (global RRWP) → dense GRIT")
-            ax.set_ylabel("Test MAE")
-            ax.set_xlabel("Model")
-            ax.set_xticks(x)
-            ax.set_xticklabels([ladder_labels.get(m, m) for m in models])
-            for tick in ax.get_xticklabels():
-                tick.set_rotation(15)
-                tick.set_ha("right")
-            top = max([m + s for m, s in zip(means, stds)] + [0.0])
-            span = max(1.0e-6, top - min(means + [top]))
-            y_base = top + 0.08 * max(top, span)
-            for idx in range(len(models) - 1):
-                pair = (models[idx], models[idx + 1])
-                mechanism = mechanism_by_pair.get(pair)
-                if mechanism is None:
-                    continue
-                improvement = means[idx] - means[idx + 1]
-                y = y_base + 0.06 * max(top, span) * (idx % 2)
-                ax.annotate(
-                    "",
-                    xy=(idx + 1, y),
-                    xytext=(idx, y),
-                    arrowprops={"arrowstyle": "<->", "linewidth": 0.9, "color": "#555555"},
-                )
-                ax.text(
-                    idx + 0.5,
-                    y + 0.02 * max(top, span),
-                    f"{mechanism}\nΔMAE={improvement:+.3f}",
-                    ha="center",
-                    va="bottom",
-                    fontsize=8,
-                )
-            if len(models) >= 2:
-                ax.set_ylim(top=max(top * 1.22, y_base * 1.08))
+            configured_models = {
+                canonical_step1_model_name(str(model_name))
+                for model_name in (config.get("models", {}) or {}).keys()
+            }
+            if any(model in grouped or model in configured_models for model in ladder_order):
+                models = list(ladder_order)
+            else:
+                models = []
+            models.extend(sorted(model for model in grouped if model not in set(models)))
+
+            mean_by_model = {model: float(np.mean(values)) for model, values in grouped.items()}
+            std_by_model = {
+                model: float(np.std(values, ddof=1)) if len(values) > 1 else 0.0
+                for model, values in grouped.items()
+            }
+            finite_values = [
+                mean_by_model[model] + std_by_model.get(model, 0.0)
+                for model in models
+                if model in mean_by_model and math.isfinite(mean_by_model[model])
+            ]
+            xmax = max(finite_values + [0.1])
+            pad = 0.025 * xmax
+            y = np.arange(len(models), dtype=float)
+            fig_height = max(4.8, 0.72 * len(models) + 2.2)
+            fig, ax = plt.subplots(figsize=(9.4, fig_height))
+            palette = {
+                "gin": "#4c78a8",
+                "grit_1hop_localrrwp": "#72b7b2",
+                "grit_1hop": "#f58518",
+                "dense_grit": "#54a24b",
+            }
+            missing_models: list[str] = []
+            for idx, model in enumerate(models):
+                label = ladder_labels.get(model, model)
+                value = mean_by_model.get(model, float("nan"))
+                err = std_by_model.get(model, 0.0)
+                if math.isfinite(value):
+                    ax.barh(
+                        y[idx],
+                        value,
+                        xerr=err,
+                        color=palette.get(model, "#b279a2"),
+                        alpha=0.92,
+                        capsize=4,
+                    )
+                    ax.text(value + pad, y[idx], f"{value:.3f}", va="center", ha="left", fontsize=9)
+                else:
+                    missing_models.append(label.replace("\n", " "))
+                    ax.barh(
+                        y[idx],
+                        max(0.015 * xmax, 0.002),
+                        color="#eeeeee",
+                        edgecolor="#888888",
+                        hatch="//",
+                    )
+                    ax.text(max(0.03 * xmax, 0.003), y[idx], "metric missing", va="center", ha="left", fontsize=9, color="#555555")
+            ax.set_title("Step 1: ZINC test MAE by model", pad=14)
+            ax.set_xlabel("Test MAE (lower is better)")
+            ax.set_yticks(y)
+            ax.set_yticklabels([ladder_labels.get(model, model) for model in models])
+            ax.invert_yaxis()
+            ax.set_xlim(0.0, xmax * 1.28)
+            ax.grid(axis="x", alpha=0.25)
+            ax.spines["top"].set_visible(False)
+            ax.spines["right"].set_visible(False)
+
+            gap_lines: list[str] = []
+            for left, right in mechanism_by_pair:
+                if left in mean_by_model and right in mean_by_model:
+                    improvement = mean_by_model[left] - mean_by_model[right]
+                    left_label = ladder_labels.get(left, left).replace("\n", " ")
+                    right_label = ladder_labels.get(right, right).replace("\n", " ")
+                    gap_lines.append(f"{mechanism_by_pair[(left, right)]}: {left_label} to {right_label}, dMAE={improvement:+.3f}")
+            note_lines = ["Decomposition order: GIN to 1-hop local RRWP to 1-hop global RRWP to dense GRIT."]
+            if gap_lines:
+                note_lines.extend(gap_lines)
+            if missing_models:
+                note_lines.append("Missing metric: " + ", ".join(missing_models) + ".")
+            bottom = min(0.36, 0.14 + 0.035 * len(note_lines))
+            fig.subplots_adjust(left=0.28, right=0.98, top=0.88, bottom=bottom)
+            fig.text(0.28, 0.03, "\n".join(note_lines), ha="left", va="bottom", fontsize=8.5)
             fig.savefig(figures / "step1_test_error_dense_vs_1hop.png", dpi=dpi)
-            fig.savefig(figures / "step1_test_error_dense_vs_1hop.pdf")
+            fig.savefig(figures / "step1_test_error_dense_vs_1hop.pdf", bbox_inches="tight")
             plt.close(fig)
     if history_rows:
         fig, ax = plt.subplots(figsize=(8.2, 4.6), constrained_layout=True)

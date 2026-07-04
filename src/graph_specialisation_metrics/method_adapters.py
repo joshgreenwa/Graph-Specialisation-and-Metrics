@@ -24,6 +24,7 @@ import torch.nn.functional as F
 
 from graph_specialisation_metrics.method_core import (
     AdapterInfo,
+    EPS,
     ForwardCache,
     GraphBatchView,
     ModelAdapter,
@@ -670,6 +671,7 @@ class OfficialGRITAdapter:
         graph: Any,
         *,
         content_override: Optional[torch.Tensor] = None,
+        attention_erasure_masks: Optional[Mapping[int, torch.Tensor]] = None,
         clean_cache: Optional[ForwardCache] = None,
         clamp_nodes: Sequence[int] = (),
         clamp_until_layer: Optional[int] = None,
@@ -708,6 +710,12 @@ class OfficialGRITAdapter:
                 "mediator patching requested clamped nodes, but the clean GRIT cache "
                 "does not contain layer inputs; patching would be a no-op"
             )
+        erase_masks = {
+            int(layer): mask.detach().to(device=self.device).bool()
+            for layer, mask in dict(attention_erasure_masks or {}).items()
+            if isinstance(mask, torch.Tensor)
+        }
+        original_attention_methods: list[tuple[Any, Any]] = []
 
         def layer_index_from_name(name: str) -> Optional[int]:
             match = re.search(r"(?:^|\.)layers\.(\d+)(?:\.|$)", name)
@@ -801,6 +809,55 @@ class OfficialGRITAdapter:
                     }
                     captures["channel_fields"].append(fields)
 
+        def make_erased_propagate(attention_module: nn.Module, layer_idx: int):
+            def propagate(batch: Any) -> None:
+                from torch_scatter import scatter
+                from graph_specialisation_metrics.mechanistic_operator_analysis import (
+                    grit_attention_components,
+                    pyg_sparse_softmax,
+                )
+
+                node_msg, pair_msg, logits, edge_state = grit_attention_components(attention_module, batch)
+                score = pyg_sparse_softmax(logits.unsqueeze(-1), batch.edge_index[1], int(batch.num_nodes))
+                if score.dim() == 3 and score.size(-1) == 1:
+                    score_2d = score.squeeze(-1)
+                elif score.dim() == 2:
+                    score_2d = score
+                else:
+                    raise RuntimeError(f"unsupported GRIT attention score shape during erasure: {tuple(score.shape)}")
+
+                dense_mask = erase_masks.get(int(layer_idx))
+                if dense_mask is not None:
+                    src = batch.edge_index[0].long()
+                    dst = batch.edge_index[1].long()
+                    if dense_mask.dim() != 2:
+                        raise RuntimeError(
+                            f"attention erasure mask for layer {layer_idx} must be [dst,src], got {tuple(dense_mask.shape)}"
+                        )
+                    if int(src.max().detach().cpu().item()) >= dense_mask.size(1) or int(dst.max().detach().cpu().item()) >= dense_mask.size(0):
+                        raise RuntimeError(
+                            f"attention erasure mask for layer {layer_idx} shape {tuple(dense_mask.shape)} "
+                            f"does not cover sparse edge indices"
+                        )
+                    remove = dense_mask[dst, src]
+                    if bool(remove.any()):
+                        score_2d = score_2d.clone()
+                        score_2d[remove] = 0.0
+                        denom = score_2d.new_zeros((int(batch.num_nodes), int(score_2d.size(1))))
+                        denom.index_add_(0, dst, score_2d)
+                        score_2d = score_2d / denom[dst].clamp_min(EPS)
+
+                score = attention_module.dropout(score_2d.unsqueeze(-1))
+                batch.attn = score
+                if getattr(batch, "E", None) is not None:
+                    batch.wE = edge_state.flatten(1)
+                message = node_msg + pair_msg
+                weighted = message * score
+                batch.wV = torch.zeros_like(batch.V_h)
+                scatter(weighted, batch.edge_index[1], dim=0, out=batch.wV, reduce="add")
+
+            return propagate
+
         for name, module in model.named_modules():
             cls_name = module.__class__.__name__
             layer_idx = layer_index_from_name(name)
@@ -810,6 +867,9 @@ class OfficialGRITAdapter:
                 handles.append(module.register_forward_pre_hook(make_layer_pre_hook(layer_idx)))
                 handles.append(module.register_forward_hook(make_layer_post_hook(layer_idx)))
             elif cls_name == "MultiHeadAttentionLayerGritSparse":
+                if layer_idx is not None and int(layer_idx) in erase_masks:
+                    original_attention_methods.append((module, module.propagate_attention))
+                    module.propagate_attention = make_erased_propagate(module, int(layer_idx))
                 handles.append(module.register_forward_hook(attention_post_hook))
             elif name.endswith("post_mp") or cls_name == "SANGraphHead":
                 handles.append(module.register_forward_pre_hook(post_mp_pre_hook))
@@ -817,6 +877,8 @@ class OfficialGRITAdapter:
         try:
             output = model(data)
         finally:
+            for module, original in original_attention_methods:
+                module.propagate_attention = original
             for handle in handles:
                 handle.remove()
 
@@ -867,6 +929,21 @@ class OfficialGRITAdapter:
         with torch.no_grad():
             return self._run_with_hooks(
                 graph,
+                capture_attention=False,
+                capture_channels=False,
+                capture_layer_inputs=False,
+                capture_layer_outputs=False,
+            )
+
+    def forward_with_attention_erasure(
+        self,
+        graph: Any,
+        attention_erasure_masks: Mapping[int, torch.Tensor],
+    ) -> ForwardCache:
+        with torch.no_grad():
+            return self._run_with_hooks(
+                graph,
+                attention_erasure_masks=attention_erasure_masks,
                 capture_attention=False,
                 capture_channels=False,
                 capture_layer_inputs=False,

@@ -1,7 +1,11 @@
 import csv
 import json
 
-from graph_specialisation_metrics.main_procedure import choose_preferred_metric_rows, extract_test_metric
+from graph_specialisation_metrics.main_procedure import (
+    canonical_step1_model_name,
+    choose_preferred_metric_rows,
+    extract_test_metric,
+)
 
 
 def test_extract_test_metric_uses_best_validation_row_for_history_csv(tmp_path):
@@ -37,3 +41,10 @@ def test_training_summary_preferred_over_history(tmp_path):
     assert len(selected) == 1
     assert selected[0]["source_kind"] == "summary"
     assert selected[0]["test_metric"] == 0.09
+
+
+def test_step1_model_aliases_include_local_rrwp_control():
+    assert canonical_step1_model_name("1-hop GRIT (local RRWP)") == "grit_1hop_localrrwp"
+    assert canonical_step1_model_name("grit_1hop_local_rrwp") == "grit_1hop_localrrwp"
+    assert canonical_step1_model_name("1-hop GRIT (global RRWP)") == "grit_1hop"
+    assert canonical_step1_model_name("dense GRIT") == "dense_grit"

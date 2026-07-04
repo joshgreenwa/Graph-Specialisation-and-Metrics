@@ -460,7 +460,14 @@ def clone_or_update_repo(
         )
         run_cmd(["git", "-C", str(repo_dir), "fetch", "origin", branch])
         run_cmd(["git", "-C", str(repo_dir), "checkout", branch])
-        run_cmd(["git", "-C", str(repo_dir), "pull", "--ff-only", "origin", branch])
+        # Hard-reset to the fetched remote HEAD instead of `pull --ff-only`. This runner applies
+        # in-place hotfixes to the cloned tree (e.g. main_procedure.py), leaving tracked files
+        # dirty; `pull --ff-only` then refuses to advance and the clone silently goes stale, so a
+        # re-run executes OLD code. `reset --hard origin/<branch>` guarantees the tracked source
+        # (grit_intervention_procedure.py, main_procedure.py, ...) matches the pushed branch
+        # exactly. Untracked paths (official GRIT/GIN checkouts, datasets) are left intact, and the
+        # hotfixes re-apply fresh on each run.
+        run_cmd(["git", "-C", str(repo_dir), "reset", "--hard", f"origin/{branch}"])
         run_cmd(["git", "-C", str(repo_dir), "remote", "set-url", "origin", repo_url])
         return
 
@@ -1425,6 +1432,178 @@ def run_step2(models, artifact_root, config):
     else:
         print("[hotfix] grit_intervention_procedure.py already has required Colab compatibility", flush=True)
 
+    main_procedure = repo_dir / "src" / "graph_specialisation_metrics" / "main_procedure.py"
+    if not main_procedure.exists():
+        print(f"[hotfix-warning] missing expected main procedure source: {main_procedure}", flush=True)
+        return
+    text = main_procedure.read_text(encoding="utf-8")
+    if "COLAB_HOTFIX_STEP1_LADDER_RENDERER_20260704" not in text and "metric missing" not in text:
+        insertion_point = text.rfind('\nif __name__ == "__main__":')
+        if insertion_point == -1:
+            insertion_point = len(text)
+        step1_hotfix = r'''
+
+# COLAB_HOTFIX_STEP1_LADDER_RENDERER_20260704
+def canonical_step1_model_name(model: str) -> str:
+    raw = str(model)
+    normalised = re.sub(r"[^a-z0-9]+", "_", raw.lower()).strip("_")
+    compact = normalised.replace("_", "")
+    if normalised == "gin" or compact == "gin":
+        return "gin"
+    if "local" in normalised and "rrwp" in normalised and ("1hop" in compact or "onehop" in compact):
+        return "grit_1hop_localrrwp"
+    if normalised in {"grit_1hop_localrrwp", "grit_1hop_local_rrwp", "one_hop_local_rrwp"}:
+        return "grit_1hop_localrrwp"
+    if normalised in {
+        "grit_1hop",
+        "grit_1_hop",
+        "one_hop",
+        "onehop",
+        "one_hop_global_rrwp",
+        "grit_1hop_global_rrwp",
+        "grit_1_hop_global_rrwp",
+    }:
+        return "grit_1hop"
+    if ("1hop" in compact or "onehop" in compact) and "rrwp" in compact:
+        return "grit_1hop"
+    if normalised in {"dense_grit", "grit_dense", "official_grit", "official", "dense"}:
+        return "dense_grit"
+    return raw
+
+
+def render_step_1_figures(metric_rows, history_rows, artifact_root, config):
+    figures = ensure_dir(artifact_root / "figures")
+    dpi = int(config.get("figures", {}).get("dpi", 150))
+    if metric_rows:
+        grouped = {}
+        for row in metric_rows:
+            value = safe_float(row.get("test_metric"))
+            if math.isfinite(value):
+                grouped.setdefault(canonical_step1_model_name(str(row["model"])), []).append(value)
+        if grouped:
+            ladder_order = ["gin", "grit_1hop_localrrwp", "grit_1hop", "dense_grit"]
+            ladder_labels = {
+                "gin": "GIN",
+                "grit_1hop_localrrwp": "1-hop GRIT\nlocal RRWP",
+                "grit_1hop": "1-hop GRIT\nglobal RRWP",
+                "dense_grit": "dense GRIT",
+            }
+            mechanism_by_pair = {
+                ("gin", "grit_1hop_localrrwp"): "arch",
+                ("grit_1hop_localrrwp", "grit_1hop"): "global RRWP",
+                ("grit_1hop", "dense_grit"): "global attention",
+            }
+            configured_models = {
+                canonical_step1_model_name(str(model_name))
+                for model_name in (config.get("models", {}) or {}).keys()
+            }
+            if any(model in grouped or model in configured_models for model in ladder_order):
+                models = list(ladder_order)
+            else:
+                models = []
+            models.extend(sorted(model for model in grouped if model not in set(models)))
+            mean_by_model = {model: float(np.mean(values)) for model, values in grouped.items()}
+            std_by_model = {
+                model: float(np.std(values, ddof=1)) if len(values) > 1 else 0.0
+                for model, values in grouped.items()
+            }
+            finite_values = [
+                mean_by_model[model] + std_by_model.get(model, 0.0)
+                for model in models
+                if model in mean_by_model and math.isfinite(mean_by_model[model])
+            ]
+            xmax = max(finite_values + [0.1])
+            pad = 0.025 * xmax
+            y = np.arange(len(models), dtype=float)
+            fig_height = max(4.8, 0.72 * len(models) + 2.2)
+            fig, ax = plt.subplots(figsize=(9.4, fig_height))
+            palette = {
+                "gin": "#4c78a8",
+                "grit_1hop_localrrwp": "#72b7b2",
+                "grit_1hop": "#f58518",
+                "dense_grit": "#54a24b",
+            }
+            missing_models = []
+            for idx, model in enumerate(models):
+                label = ladder_labels.get(model, model)
+                value = mean_by_model.get(model, float("nan"))
+                err = std_by_model.get(model, 0.0)
+                if math.isfinite(value):
+                    ax.barh(y[idx], value, xerr=err, color=palette.get(model, "#b279a2"), alpha=0.92, capsize=4)
+                    ax.text(value + pad, y[idx], f"{value:.3f}", va="center", ha="left", fontsize=9)
+                else:
+                    missing_models.append(label.replace("\n", " "))
+                    ax.barh(
+                        y[idx],
+                        max(0.015 * xmax, 0.002),
+                        color="#eeeeee",
+                        edgecolor="#888888",
+                        hatch="//",
+                    )
+                    ax.text(
+                        max(0.03 * xmax, 0.003),
+                        y[idx],
+                        "metric missing",
+                        va="center",
+                        ha="left",
+                        fontsize=9,
+                        color="#555555",
+                    )
+            ax.set_title("Step 1: ZINC test MAE by model", pad=14)
+            ax.set_xlabel("Test MAE (lower is better)")
+            ax.set_yticks(y)
+            ax.set_yticklabels([ladder_labels.get(model, model) for model in models])
+            ax.invert_yaxis()
+            ax.set_xlim(0.0, xmax * 1.28)
+            ax.grid(axis="x", alpha=0.25)
+            ax.spines["top"].set_visible(False)
+            ax.spines["right"].set_visible(False)
+            gap_lines = []
+            for left, right in mechanism_by_pair:
+                if left in mean_by_model and right in mean_by_model:
+                    improvement = mean_by_model[left] - mean_by_model[right]
+                    left_label = ladder_labels.get(left, left).replace("\n", " ")
+                    right_label = ladder_labels.get(right, right).replace("\n", " ")
+                    gap_lines.append(f"{mechanism_by_pair[(left, right)]}: {left_label} to {right_label}, dMAE={improvement:+.3f}")
+            note_lines = ["Decomposition order: GIN to 1-hop local RRWP to 1-hop global RRWP to dense GRIT."]
+            if gap_lines:
+                note_lines.extend(gap_lines)
+            if missing_models:
+                note_lines.append("Missing metric: " + ", ".join(missing_models) + ".")
+            bottom = min(0.36, 0.14 + 0.035 * len(note_lines))
+            fig.subplots_adjust(left=0.28, right=0.98, top=0.88, bottom=bottom)
+            fig.text(0.28, 0.03, "\n".join(note_lines), ha="left", va="bottom", fontsize=8.5)
+            fig.savefig(figures / "step1_test_error_dense_vs_1hop.png", dpi=dpi)
+            fig.savefig(figures / "step1_test_error_dense_vs_1hop.pdf", bbox_inches="tight")
+            plt.close(fig)
+    if history_rows:
+        fig, ax = plt.subplots(figsize=(8.2, 4.6), constrained_layout=True)
+        by_model = {}
+        for row in history_rows:
+            by_model.setdefault(str(row["model"]), []).append(row)
+        for model, rows in sorted(by_model.items()):
+            rows_sorted = sorted(rows, key=lambda r: safe_float(r.get("step")))
+            x = [safe_float(r.get("step")) for r in rows_sorted]
+            train = [safe_float(r.get("train")) for r in rows_sorted]
+            val = [safe_float(r.get("val")) for r in rows_sorted]
+            if any(math.isfinite(v) for v in train):
+                ax.plot(x, train, linewidth=1.5, label=f"{model} train")
+            if any(math.isfinite(v) for v in val):
+                ax.plot(x, val, linewidth=1.5, linestyle="--", label=f"{model} val")
+        ax.set_title("Step 1: training and validation curves")
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel("L1 / MAE loss")
+        ax.legend(frameon=False, fontsize=8)
+        fig.savefig(figures / "step1_training_validation_loss.png", dpi=dpi)
+        fig.savefig(figures / "step1_training_validation_loss.pdf")
+        plt.close(fig)
+'''
+        text = text[:insertion_point] + step1_hotfix + text[insertion_point:]
+        main_procedure.write_text(text, encoding="utf-8")
+        print("[hotfix] updated main_procedure.py Step 1 ladder renderer", flush=True)
+    else:
+        print("[hotfix] main_procedure.py already has required Step 1 renderer", flush=True)
+
 
 def install_repo(repo_dir: Path, *, pyg_version: str) -> None:
     apply_colab_repo_hotfixes(repo_dir)
@@ -2362,6 +2541,11 @@ def build_zinc_config(
                 "sample_graphs": 200,
                 "compare_attention_to_swaps": True,
                 "run_layer_channel_split": True,
+                "run_attention_erasure": True,
+                "erasure_models": ["dense_grit"],
+                "erasure_sample_graphs": 64,
+                "erasure_fractions": [0.0, 0.05, 0.10, 0.20, 0.35, 0.50],
+                "erasure_include_near_control": True,
             },
             "3": {"name": "distance_resolved_overfitting", "sample_graphs": 200},
             "4": {

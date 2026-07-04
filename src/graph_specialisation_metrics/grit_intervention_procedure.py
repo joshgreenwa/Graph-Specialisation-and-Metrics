@@ -211,6 +211,11 @@ def split_seed_offset(split: str) -> int:
     return sum((idx + 1) * ord(ch) for idx, ch in enumerate(str(split)))
 
 
+def stable_int_hash(value: Any) -> int:
+    digest = hashlib.sha256(str(value).encode("utf-8")).hexdigest()
+    return int(digest[:8], 16)
+
+
 def node_type_signatures(graph: Any) -> Optional[list[Any]]:
     x = getattr(graph, "x", None)
     if not isinstance(x, torch.Tensor) or x.ndim == 0:
@@ -1234,6 +1239,136 @@ def attention_faithfulness_rows(
     return rows
 
 
+def _attention_erasure_mask_from_ranking(
+    *,
+    edge_index: torch.Tensor,
+    dist: torch.Tensor,
+    carriage: torch.Tensor,
+    attention_values: torch.Tensor,
+    fraction: float,
+    tau: int,
+    region: str,
+    ranker: str,
+    seed: int,
+) -> tuple[torch.Tensor, int, int]:
+    """Build a dense [dst,src] mask for removing ranked sparse attention edges."""
+
+    dist_cpu = dist.detach().cpu().float()
+    src = edge_index[0].detach().cpu().long()
+    dst = edge_index[1].detach().cpu().long()
+    edge_dist = dist_cpu[dst, src]
+    finite = torch.isfinite(edge_dist)
+    if region == "far":
+        candidates = finite & (edge_dist > float(tau))
+    elif region == "near":
+        candidates = finite & (edge_dist > 0.0) & (edge_dist <= float(tau))
+    else:
+        raise ValueError(f"unknown attention-erasure region {region!r}")
+    candidate_indices = candidates.nonzero(as_tuple=False).flatten()
+    available = int(candidate_indices.numel())
+    remove_count = int(round(max(0.0, min(1.0, float(fraction))) * available))
+    dense_mask = torch.zeros_like(dist_cpu, dtype=torch.bool)
+    if available == 0 or remove_count <= 0:
+        return dense_mask, available, 0
+    remove_count = min(remove_count, available)
+    if ranker == "attention":
+        values = attention_values.detach().abs().cpu().float()
+        if values.dim() == 2:
+            score = values.mean(dim=1)
+        elif values.dim() == 1:
+            score = values
+        else:
+            raise RuntimeError(f"unsupported attention values for erasure ranking: {tuple(values.shape)}")
+        ranking_scores = score[candidate_indices]
+        order = torch.argsort(ranking_scores, descending=True, stable=True)
+        selected = candidate_indices[order[:remove_count]]
+    elif ranker == "carriage":
+        c = carriage.detach().abs().cpu().float()
+        ranking_scores = c[dst[candidate_indices], src[candidate_indices]]
+        order = torch.argsort(ranking_scores, descending=True, stable=True)
+        selected = candidate_indices[order[:remove_count]]
+    elif ranker == "random":
+        generator = torch.Generator(device="cpu").manual_seed(int(seed))
+        order = torch.randperm(available, generator=generator)
+        selected = candidate_indices[order[:remove_count]]
+    else:
+        raise ValueError(f"unknown attention-erasure ranker {ranker!r}")
+    dense_mask[dst[selected], src[selected]] = True
+    return dense_mask, available, int(selected.numel())
+
+
+def attention_erasure_rows(
+    model: ModelRun,
+    graph: Any,
+    graph_id: str,
+    cache: Any,
+    carriage: torch.Tensor,
+    dist: torch.Tensor,
+    *,
+    tau: int,
+    fractions: Sequence[float],
+    include_near_control: bool,
+    seed: int,
+) -> list[dict[str, Any]]:
+    if not hasattr(model.adapter, "forward_with_attention_erasure"):
+        return []
+    edges = list((cache.extras or {}).get("attention_edges", []) or [])
+    if edges:
+        last_layer = len(edges) - 1
+    else:
+        last_layer = len(list(cache.attention or [])) - 1
+    if last_layer < 0:
+        return []
+    sparse = sparse_attention_layer_weights(cache, last_layer)
+    if sparse is None:
+        return []
+    edge_index, attention_values = sparse
+    clean_pred = float(cache.prediction.reshape(-1)[0].detach().cpu().item())
+    rows: list[dict[str, Any]] = []
+    regions = ["far"] + (["near"] if include_near_control else [])
+    for region in regions:
+        for fraction in fractions:
+            for ranker in ("attention", "carriage", "random"):
+                mask, available, removed = _attention_erasure_mask_from_ranking(
+                    edge_index=edge_index,
+                    dist=dist,
+                    carriage=carriage,
+                    attention_values=attention_values,
+                    fraction=float(fraction),
+                    tau=tau,
+                    region=region,
+                    ranker=ranker,
+                    seed=seed + 7919 * stable_int_hash(graph_id) + 101 * int(round(float(fraction) * 1000)),
+                )
+                if available == 0:
+                    erased_pred = float("nan")
+                    delta = float("nan")
+                elif removed == 0:
+                    erased_pred = clean_pred
+                    delta = 0.0
+                else:
+                    erased = model.adapter.forward_with_attention_erasure(graph, {int(last_layer): mask})
+                    erased_pred = float(erased.prediction.reshape(-1)[0].detach().cpu().item())
+                    delta = abs(erased_pred - clean_pred)
+                rows.append(
+                    {
+                        "model": model.name,
+                        "graph_id": graph_id,
+                        "attention_layer": last_layer,
+                        "region": region,
+                        "ranker": ranker,
+                        "tau": tau,
+                        "fraction_removed": float(fraction),
+                        "edges_available": available,
+                        "edges_removed": removed,
+                        "prediction_clean": clean_pred,
+                        "prediction_erased": erased_pred,
+                        "abs_delta_prediction": delta,
+                    }
+                )
+    return rows
+
+
 def carriage_profile_rows(model: str, graph_id: str, carriage: torch.Tensor, dist: torch.Tensor, quantity: str) -> list[dict[str, Any]]:
     rows = []
     for row in distance_profile(carriage.abs(), dist):
@@ -2189,6 +2324,11 @@ def run_step2(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
     partner_policy = swap_partner_policy(config)
     include_swap_attention_check = bool(cfg.get("compare_attention_to_swaps", True))
     run_layer_channel_split = bool(cfg.get("run_layer_channel_split", True))
+    run_attention_erasure = bool(cfg.get("run_attention_erasure", True))
+    erasure_models = {str(name) for name in cfg.get("erasure_models", ["dense_grit"])}
+    erasure_sample_graphs = int(cfg.get("erasure_sample_graphs", min(sample_graphs, 64)))
+    erasure_fractions = [float(value) for value in cfg.get("erasure_fractions", [0.0, 0.05, 0.10, 0.20, 0.35, 0.50])]
+    erasure_include_near_control = bool(cfg.get("erasure_include_near_control", True))
     tau = int(config.get("primary_tau", 3))
     seed = int(config.get("seeds", [0])[0])
     dpi = int(config["figures"]["dpi"])
@@ -2196,6 +2336,7 @@ def run_step2(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
     faith_rows: list[dict[str, Any]] = []
     threshold_rows: list[dict[str, Any]] = []
     channel_rows: list[dict[str, Any]] = []
+    erasure_rows: list[dict[str, Any]] = []
     support_rows: list[dict[str, Any]] = []
     mean_distance_rows: list[dict[str, Any]] = []
     tensors: dict[str, Any] = {}
@@ -2289,6 +2430,44 @@ def run_step2(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
                             )
             if run_layer_channel_split:
                 channel_rows.extend(layer_channel_split_rows(model, graph, result, dist, gid, tau))
+            if (
+                run_attention_erasure
+                and model.name in erasure_models
+                and graph_idx < max(0, erasure_sample_graphs)
+                and any(quantity in attn_tensors for quantity in ("attention_last",))
+            ):
+                try:
+                    erasure_rows.extend(
+                        attention_erasure_rows(
+                            model,
+                            graph,
+                            gid,
+                            cache,
+                            c_ig,
+                            dist,
+                            tau=tau,
+                            fractions=erasure_fractions,
+                            include_near_control=erasure_include_near_control,
+                            seed=seed + 9973 * graph_idx,
+                        )
+                    )
+                except Exception as exc:
+                    erasure_rows.append(
+                        {
+                            "model": model.name,
+                            "graph_id": gid,
+                            "region": "error",
+                            "ranker": "error",
+                            "tau": tau,
+                            "fraction_removed": float("nan"),
+                            "edges_available": 0,
+                            "edges_removed": 0,
+                            "prediction_clean": float("nan"),
+                            "prediction_erased": float("nan"),
+                            "abs_delta_prediction": float("nan"),
+                            "error": f"{type(exc).__name__}: {exc}",
+                        }
+                    )
         if cache_hits:
             progress(f"Step 2 {model.name}: reused cached IG carriage for {cache_hits}/{len(graphs)} graph(s)")
     write_csv(artifact_root / "metrics" / "step2_profiles.csv", profile_rows)
@@ -2297,6 +2476,7 @@ def run_step2(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
     write_csv(artifact_root / "metrics" / "step2_channel_split.csv", channel_rows)
     head_rows = [r for r in channel_rows if str(r.get("quantity")) == "head_far_carriage"]
     write_csv(artifact_root / "metrics" / "step2_head_resolved_carriage.csv", head_rows)
+    write_csv(artifact_root / "metrics" / "step2_attention_erasure.csv", erasure_rows)
     write_csv(artifact_root / "metrics" / "step2_attention_support_audit.csv", support_rows)
     write_csv(artifact_root / "metrics" / "step2_attention_mean_distance.csv", mean_distance_rows)
     atomic_torch_save(artifact_root / "tensors" / "step2_usage_carriage.pt", tensors)
@@ -2341,6 +2521,7 @@ def run_step2(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
     render_distance_profile(final_channel_rows, artifact_root, "step2_channel_split_distance", "Step 2: final-layer carriage by channel and distance", dpi=dpi)
     render_layer_resolved_channel_split(channel_rows, artifact_root, dpi=dpi)
     render_head_resolved_carriage(head_rows, artifact_root, dpi=dpi)
+    render_step2_attention_erasure(erasure_rows, artifact_root, dpi=dpi)
     progress("Step 2 complete: metrics, tensors, and figures written")
     return {
         "status": "complete" if not support_failures else "complete_with_attention_support_violations",
@@ -2348,6 +2529,7 @@ def run_step2(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
         "attention_policy": "rollout_omitted_by_design; reads=last_layer_head_averaged_attention plus first_layer/per_layer_attention_diagnostics; carries=carriage",
         "profile_rows": len(profile_rows),
         "faithfulness_rows": len(faith_rows),
+        "attention_erasure_rows": len(erasure_rows),
         "support_audit_rows": len(support_rows),
         "head_resolved_rows": len(head_rows),
         "attention_mean_distance_rows": len(mean_distance_rows),
@@ -2668,6 +2850,71 @@ def render_step2_faithfulness(
     fig.savefig(figures / f"{far_mass_stem}.png", dpi=dpi)
     fig.savefig(figures / f"{far_mass_stem}.pdf")
     plt.close(fig)
+
+
+def render_step2_attention_erasure(rows: Sequence[Mapping[str, Any]], artifact_root: Path, *, dpi: int) -> None:
+    clean = [
+        r
+        for r in rows
+        if math.isfinite(safe_float(r.get("fraction_removed")))
+        and math.isfinite(safe_float(r.get("abs_delta_prediction")))
+        and int(safe_float(r.get("edges_available"))) > 0
+    ]
+    if not clean:
+        return
+    figures = ensure_dir(artifact_root / "figures")
+    regions = ["far"]
+    if any(str(r.get("region")) == "near" for r in clean):
+        regions.append("near")
+    fig, axes = plt.subplots(1, len(regions), figsize=(6.4 * len(regions), 4.6), squeeze=False, constrained_layout=True)
+    palette = {"attention": "#4c78a8", "carriage": "#f58518", "random": "#6b7280"}
+    labels = {"attention": "attention-ranked", "carriage": "carriage-ranked", "random": "random"}
+    for ax, region in zip(axes[0], regions):
+        region_rows = [r for r in clean if str(r.get("region")) == region]
+        for ranker in ("attention", "carriage", "random"):
+            rank_rows = [r for r in region_rows if str(r.get("ranker")) == ranker]
+            fractions = sorted({safe_float(r.get("fraction_removed")) for r in rank_rows})
+            xs: list[float] = []
+            means: list[float] = []
+            lows: list[float] = []
+            highs: list[float] = []
+            for fraction in fractions:
+                values = [
+                    safe_float(r.get("abs_delta_prediction"))
+                    for r in rank_rows
+                    if abs(safe_float(r.get("fraction_removed")) - fraction) < 1e-9
+                ]
+                values = [v for v in values if math.isfinite(v)]
+                if not values:
+                    continue
+                mean, lo, hi = bootstrap_ci(
+                    values,
+                    seed=9200 + int(round(fraction * 1000)) + 31 * len(ranker) + len(region),
+                    draws=500,
+                )
+                xs.append(fraction)
+                means.append(mean)
+                lows.append(lo)
+                highs.append(hi)
+            if xs:
+                x = np.asarray(xs, dtype=float)
+                y = np.asarray(means, dtype=float)
+                lo = np.asarray(lows, dtype=float)
+                hi = np.asarray(highs, dtype=float)
+                ax.plot(x, y, marker="o", linewidth=1.8, color=palette[ranker], label=labels[ranker])
+                ax.fill_between(x, lo, hi, color=palette[ranker], alpha=0.16, linewidth=0)
+        title = "Far edges (d > tau)" if region == "far" else "Near edges (0 < d <= tau)"
+        ax.set_title(title)
+        ax.set_xlabel("Fraction of edges removed")
+        ax.set_ylabel("Mean absolute prediction change")
+        ax.set_xlim(-0.01, 0.51)
+        ax.grid(alpha=0.25)
+        ax.legend(frameon=False, fontsize=9)
+    fig.suptitle("Faithfulness by erasure: prediction change vs edges removed - dense GRIT", fontsize=13)
+    fig.savefig(figures / "step2_attention_erasure_faithfulness.png", dpi=dpi)
+    fig.savefig(figures / "step2_attention_erasure_faithfulness.pdf")
+    plt.close(fig)
+
 
 def run_step3(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[str, Any]) -> dict[str, Any]:
     progress("Step 3 start: train/test distance-resolved overfitting")
@@ -4704,6 +4951,11 @@ def run_step5(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
                 graph_stats = graph_distance_summary(dist)
                 r_nc = safe_float(r_nc_by_tau[int(tau)].get("r_nc"))
                 y = graph_label(graph)
+                # result["prediction"] is dense's clean forward from encoded content; by
+                # construction it equals dense.adapter.predict(graph) (content_override is injected
+                # at the FeatureEncoder capture point in _run_with_hooks, so predict and this
+                # reconstruction share the exact same forward). This is dense's true model
+                # prediction -- there is no reconstruction gap to correct for here.
                 dense_pred = float(result["prediction"])
                 try:
                     onehop_pred = float(onehop.adapter.predict(graph).reshape(-1)[0].detach().cpu().item())
@@ -4766,6 +5018,7 @@ def run_step5(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
                     "gap_treatment": dense.name,
                     "gap_control": onehop.name,
                     "signed_direct_far_carriage": signed_direct_far,
+                    "dense_prediction": dense_pred,
                     "dense_ablated_prediction": dense_ablated_pred,
                     "dense_ablated_error": dense_ablated_err,
                     "ablation_minus_dense_error": ablation_minus_dense_error,
@@ -4868,13 +5121,17 @@ def run_step5(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
     render_step5_self_ablation(ablation, gap_rows, artifact_root, dpi=dpi)
     render_step5_gap_structural_severity(gap_rows, artifact_root, dpi=dpi)
     if int(ablation.get("n", 0)) > 0:
+        order_sig = bool(ablation.get("dense_onehop_order_significant", False))
         progress(
-            "Step 5 self-ablation: dense_err="
+            f"Step 5 self-ablation (n={int(ablation.get('n', 0))} molecules): dense_err="
             f"{safe_float(ablation.get('mean_dense_error')):.4f}, ablated_err="
             f"{safe_float(ablation.get('mean_dense_ablated_error')):.4f}, onehop_err="
             f"{safe_float(ablation.get('mean_onehop_error')):.4f}; ablation_penalty="
             f"{safe_float(ablation.get('ablation_penalty')):.4f} "
-            f"[{safe_float(ablation.get('ablation_penalty_ci_low')):.4f}, {safe_float(ablation.get('ablation_penalty_ci_high')):.4f}] "
+            f"[{safe_float(ablation.get('ablation_penalty_ci_low')):.4f}, {safe_float(ablation.get('ablation_penalty_ci_high')):.4f}]; "
+            f"onehop-dense={safe_float(ablation.get('onehop_minus_dense_error_mean')):.4f} "
+            f"[{safe_float(ablation.get('onehop_minus_dense_error_ci_low')):.4f}, {safe_float(ablation.get('onehop_minus_dense_error_ci_high')):.4f}] "
+            f"({'order significant' if order_sig else 'order NOT separable at this n'}) "
             f"-> {ablation.get('verdict')}"
         )
     write_csv(artifact_root / "metrics" / "step5_far_carriage_rank_summary.csv", rank_summary_rows(rank_rows, models=[dense.name]))
@@ -5134,12 +5391,35 @@ def self_ablation_summary(gap_rows: Sequence[Mapping[str, Any]]) -> dict[str, An
     d, a, o = dense[mask], ablated[mask], onehop[mask]
     ablation_penalty = float(np.mean(a) - np.mean(d))
     onehop_penalty = float(np.mean(o) - np.mean(d))
+    # Paired bootstrap over molecules: resample once per draw and recompute every mean on the
+    # same resample, so the three bars and their contrasts share sampling noise. At the small
+    # sample sizes used by the lighter presets (medium = 16 molecules) this is what tells the
+    # dense-vs-1hop order apart from noise instead of over-reading three bare means.
     rng = np.random.default_rng(9090)
-    pen_samples = []
-    for _ in range(1000):
+    boot_d: list[float] = []
+    boot_a: list[float] = []
+    boot_o: list[float] = []
+    pen_samples: list[float] = []
+    gap_samples: list[float] = []
+    for _ in range(2000):
         idx = rng.integers(0, n, size=n)
-        pen_samples.append(float(np.mean(a[idx]) - np.mean(d[idx])))
-    pen_lo, pen_hi = (float(v) for v in np.percentile(pen_samples, [2.5, 97.5]))
+        md, ma, mo = float(np.mean(d[idx])), float(np.mean(a[idx])), float(np.mean(o[idx]))
+        boot_d.append(md)
+        boot_a.append(ma)
+        boot_o.append(mo)
+        pen_samples.append(ma - md)
+        gap_samples.append(mo - md)  # 1-hop minus dense; > 0 means dense is better
+
+    def _ci(samples: list[float]) -> tuple[float, float]:
+        lo, hi = np.percentile(samples, [2.5, 97.5])
+        return float(lo), float(hi)
+
+    pen_lo, pen_hi = _ci(pen_samples)
+    dense_ci = _ci(boot_d)
+    ablated_ci = _ci(boot_a)
+    onehop_ci = _ci(boot_o)
+    gap_lo, gap_hi = _ci(gap_samples)
+    dense_onehop_order_significant = bool(gap_lo > 0.0 or gap_hi < 0.0)
     reg_mask = np.isfinite(rnc) & np.isfinite(effect)
     slope = corr = float("nan")
     if int(reg_mask.sum()) >= 2 and float(np.std(rnc[reg_mask])) > EPS:
@@ -5155,8 +5435,18 @@ def self_ablation_summary(gap_rows: Sequence[Mapping[str, Any]]) -> dict[str, An
     return {
         "n": n,
         "mean_dense_error": float(np.mean(d)),
+        "mean_dense_error_ci_low": dense_ci[0],
+        "mean_dense_error_ci_high": dense_ci[1],
         "mean_dense_ablated_error": float(np.mean(a)),
+        "mean_dense_ablated_error_ci_low": ablated_ci[0],
+        "mean_dense_ablated_error_ci_high": ablated_ci[1],
         "mean_onehop_error": float(np.mean(o)),
+        "mean_onehop_error_ci_low": onehop_ci[0],
+        "mean_onehop_error_ci_high": onehop_ci[1],
+        "onehop_minus_dense_error_mean": float(np.mean(o) - np.mean(d)),
+        "onehop_minus_dense_error_ci_low": gap_lo,
+        "onehop_minus_dense_error_ci_high": gap_hi,
+        "dense_onehop_order_significant": dense_onehop_order_significant,
         "ablation_penalty": ablation_penalty,
         "ablation_penalty_ci_low": pen_lo,
         "ablation_penalty_ci_high": pen_hi,
@@ -5174,10 +5464,31 @@ def render_step5_self_ablation(summary: Mapping[str, Any], gap_rows: Sequence[Ma
     figures = ensure_dir(artifact_root / "figures")
     labels = ["dense", "dense\n(shortcuts ablated)", "1-hop (trained)"]
     means = [safe_float(summary.get("mean_dense_error")), safe_float(summary.get("mean_dense_ablated_error")), safe_float(summary.get("mean_onehop_error"))]
+    ci_low = [safe_float(summary.get("mean_dense_error_ci_low")), safe_float(summary.get("mean_dense_ablated_error_ci_low")), safe_float(summary.get("mean_onehop_error_ci_low"))]
+    ci_high = [safe_float(summary.get("mean_dense_error_ci_high")), safe_float(summary.get("mean_dense_ablated_error_ci_high")), safe_float(summary.get("mean_onehop_error_ci_high"))]
+    yerr_lo = [max(0.0, m - lo) if math.isfinite(lo) else 0.0 for m, lo in zip(means, ci_low)]
+    yerr_hi = [max(0.0, hi - m) if math.isfinite(hi) else 0.0 for m, hi in zip(means, ci_high)]
+    n = int(summary.get("n", 0))
+    gap_mean = safe_float(summary.get("onehop_minus_dense_error_mean"))
+    if bool(summary.get("dense_onehop_order_significant", False)):
+        order_note = "dense < 1-hop (95% CI)" if gap_mean > 0 else "1-hop < dense (95% CI)"
+    else:
+        order_note = "dense vs 1-hop NOT separable (95% CI overlap)"
     fig, ax = plt.subplots(figsize=(6.8, 4.6), constrained_layout=True)
-    ax.bar(labels, means, color=["#4c78a8", "#f58518", "#54a24b"])
+    ax.bar(
+        labels,
+        means,
+        yerr=[yerr_lo, yerr_hi],
+        capsize=5,
+        color=["#4c78a8", "#f58518", "#54a24b"],
+        error_kw={"ecolor": "#333333", "elinewidth": 1.2},
+    )
     ax.axhline(safe_float(summary.get("mean_dense_error")), color="#555555", linestyle="--", linewidth=1, label="dense baseline")
-    ax.set_title("Self-ablation: test error with non-composable transport removed")
+    ax.set_title(
+        "Self-ablation: test error with non-composable transport removed\n"
+        f"n={n} molecules (bootstrap 95% CI); {order_note}",
+        fontsize=10,
+    )
     ax.set_ylabel("Mean |prediction - target| (test)")
     ax.legend(frameon=False, fontsize=8)
     fig.savefig(figures / "step5_self_ablation_error.png", dpi=dpi)
