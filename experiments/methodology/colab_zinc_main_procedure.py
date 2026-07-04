@@ -39,6 +39,7 @@ DEFAULT_SECRET_NAME = "dissertation_key"
 DEFAULT_DRIVE_ROOT = "/content/drive/MyDrive/graph_specialisation_metrics/zinc_main_procedure_colab"
 DEFAULT_DENSE_DRIVE_DIR = "/content/drive/MyDrive/grit_zinc_official"
 DEFAULT_ONEHOP_DRIVE_DIR = "/content/drive/MyDrive/grit_zinc_1hop"
+DEFAULT_ONEHOP_LOCALRRWP_DRIVE_DIR = "/content/drive/MyDrive/grit_zinc_1hop_localrrwp"
 DEFAULT_GIN_DRIVE_DIR = "/content/drive/MyDrive/gin_zinc_official"
 DEFAULT_GIN_REPO_DIR = "/content/benchmarking-gnns_analysis"
 DEFAULT_PYG_VERSION = "2.2.0"
@@ -118,6 +119,104 @@ gt:
     act: 'relu'
     full_attn: False
     sparsity: one_hop
+    edge_enhance: True
+    O_e: True
+    norm_e: True
+    fwl: False
+gnn:
+  head: san_graph
+  layers_pre_mp: 0
+  layers_post_mp: 3
+  dim_inner: 64
+  batchnorm: True
+  act: relu
+  dropout: 0.0
+  agg: mean
+  normalize_adj: False
+optim:
+  clip_grad_norm: True
+  optimizer: adamW
+  weight_decay: 1e-5
+  base_lr: 1e-3
+  max_epoch: 2000
+  num_warmup_epochs: 50
+  scheduler: cosine_with_warmup
+  min_lr: 1e-6
+"""
+
+LOCAL_RRWP_CFG_TEXT = """\
+# Parameter-matched strictly-local 1-hop GRIT RRWP ZINC control.
+#
+# This variant keeps the official ZINC subset architecture, training schedule,
+# RRWP dimensionality, and decoder settings. Compared with the dense official
+# GRIT config, it makes two scientific restrictions:
+#
+#   1. attention/message passing is restricted to molecular bonds plus self;
+#   2. RRWP values are truncated to identity + one-step random-walk channels.
+#
+# The 21-dimensional RRWP linear encoders are kept, but channels above the
+# one-step horizon are zeroed before encoding. This preserves the official
+# trainable parameter count while preventing multi-hop structural PE leakage.
+out_dir: results
+metric_best: mae
+metric_agg: argmin
+tensorboard_each_run: True
+accelerator: "cuda:0"
+mlflow:
+  use: False
+  project: Exp
+  name: zinc-GRIT-RRWP-1hop-localrrwp
+wandb:
+  use: False
+  project: ZINC
+dataset:
+  format: PyG-ZINC
+  name: subset
+  task: graph
+  task_type: regression
+  transductive: False
+  node_encoder: True
+  node_encoder_name: TypeDictNode
+  node_encoder_num_types: 21
+  node_encoder_bn: False
+  edge_encoder: True
+  edge_encoder_name: TypeDictEdge
+  edge_encoder_num_types: 4
+  edge_encoder_bn: False
+posenc_RRWP:
+  enable: True
+  ksteps: 21
+  add_identity: True
+  add_node_attr: False
+  add_inverse: False
+  local_horizon: 1
+train:
+  mode: custom
+  batch_size: 32
+  eval_period: 1
+  enable_ckpt: True
+  ckpt_best: True
+  ckpt_clean: True
+model:
+  type: GritTransformer
+  loss_fun: l1
+  edge_decoding: dot
+  graph_pooling: add
+gt:
+  layer_type: GritTransformer
+  layers: 10
+  n_heads: 8
+  dim_hidden: 64
+  dropout: 0.0
+  layer_norm: False
+  batch_norm: True
+  update_e: True
+  attn_dropout: 0.2
+  attn:
+    clamp: 5.
+    act: 'relu'
+    full_attn: False
+    sparsity: one_hop_local_rrwp
     edge_enhance: True
     O_e: True
     norm_e: True
@@ -469,6 +568,13 @@ def apply_colab_repo_hotfixes(repo_dir: Path) -> None:
         return
     text = adapters.read_text(encoding="utf-8")
     fixed = text.replace("torch.inference_mode()", "torch.no_grad()")
+    if "allowed_1hop_sparsity" not in fixed:
+        fixed = fixed.replace(
+            '            if sparsity != "one_hop" or full_attn is not False:\n',
+            '            allowed_1hop_sparsity = {"one_hop", "one_hop_local_rrwp"}\n'
+            '            if sparsity not in allowed_1hop_sparsity or full_attn is not False:\n',
+            1,
+        )
     if '"attention_edge_weights": []' not in fixed:
         fixed = fixed.replace('"attention_edges": [],\n', '"attention_edges": [],\n            "attention_edge_weights": [],\n', 1)
         fixed = fixed.replace(
@@ -1276,6 +1382,24 @@ def _replace_exact(path: Path, old: str, new: str, marker: str, label: str) -> b
     return True
 
 
+def _insert_after(path: Path, anchor: str, insertion: str, marker: str, label: str) -> bool:
+    text = _read_text_preserve_newlines(path)
+    if marker in text:
+        print(f"[patch] {label}: already present", flush=True)
+        return False
+    newline = _native_newline(text)
+    anchor_native = anchor.replace("\n", newline)
+    insertion_native = insertion.replace("\n", newline)
+    if anchor_native not in text:
+        raise RuntimeError(
+            f"Could not apply patch segment `{label}` to {path}. "
+            "The official GRIT source differs from the pinned layout."
+        )
+    _write_text_preserve_newlines(path, text.replace(anchor_native, anchor_native + insertion_native, 1))
+    print(f"[patch] {label}: applied", flush=True)
+    return True
+
+
 def apply_embedded_parameter_matched_onehop_patch(repo_dir: Path, drive_root: Path) -> None:
     """Apply the parameter-matched 1-hop GRIT patch without repo helper imports."""
     print("\n[patch] Applying embedded parameter-matched 1-hop GRIT control patch.", flush=True)
@@ -1390,20 +1514,164 @@ def apply_embedded_parameter_matched_onehop_patch(repo_dir: Path, drive_root: Pa
     )
 
 
-def prepare_grit_repos(repo_dir: Path, drive_root: Path, force: bool = False) -> tuple[Path, Path, Path, Path]:
+def apply_embedded_parameter_matched_onehop_localrrwp_patch(repo_dir: Path, drive_root: Path) -> None:
+    """Apply the strict local-PE 1-hop GRIT patch without repo helper imports."""
+    apply_embedded_parameter_matched_onehop_patch(repo_dir, drive_root)
+    print("\n[patch] Applying embedded strictly-local RRWP extension.", flush=True)
+
+    cfg_path = repo_dir / "configs" / "GRIT" / "zinc-GRIT-RRWP-1hop-localrrwp.yaml"
+    current_cfg = _read_text_preserve_newlines(cfg_path) if cfg_path.exists() else ""
+    if current_cfg != LOCAL_RRWP_CFG_TEXT:
+        _write_text_preserve_newlines(cfg_path, LOCAL_RRWP_CFG_TEXT)
+        print(f"[patch] wrote exact local-RRWP ZINC config: {cfg_path}", flush=True)
+    else:
+        print(f"[patch] exact local-RRWP ZINC config already present: {cfg_path}", flush=True)
+
+    _insert_after(
+        repo_dir / "grit" / "config" / "posenc_config.py",
+        anchor="    cfg.posenc_RRWP.spd = False\n",
+        insertion="    cfg.posenc_RRWP.local_horizon = -1\n",
+        marker="cfg.posenc_RRWP.local_horizon",
+        label="RRWP local_horizon config default",
+    )
+    rrwp_transform = repo_dir / "grit" / "transform" / "rrwp.py"
+    _replace_exact(
+        rrwp_transform,
+        old=(
+            '                  add_identity=True,\n'
+            '                  spd=False,\n'
+            '                  **kwargs\n'
+            '                  ):\n'
+        ),
+        new=(
+            '                  add_identity=True,\n'
+            '                  spd=False,\n'
+            '                  local_horizon=None,\n'
+            '                  local_edge_index_attr="rrwp_local_edge_index",\n'
+            '                  **kwargs\n'
+            '                  ):\n'
+        ),
+        marker="local_edge_index_attr=",
+        label="RRWP local_horizon transform args",
+    )
+    _insert_after(
+        rrwp_transform,
+        anchor="    edge_index, edge_weight = data.edge_index, data.edge_weight\n",
+        insertion=(
+            "\n"
+            "    if local_horizon is None:\n"
+            "        try:\n"
+            "            local_horizon = int(getattr(cfg.posenc_RRWP, 'local_horizon', -1))\n"
+            "        except Exception:\n"
+            "            local_horizon = -1\n"
+            "    if local_horizon is not None:\n"
+            "        local_horizon = int(local_horizon)\n"
+            "    if local_horizon is not None and local_horizon >= 0 and local_edge_index_attr:\n"
+            "        data[local_edge_index_attr] = edge_index.clone()\n"
+        ),
+        marker="data[local_edge_index_attr] = edge_index.clone()",
+        label="preserve molecular edge support for local RRWP",
+    )
+    _insert_after(
+        rrwp_transform,
+        anchor="    pe = torch.stack(pe_list, dim=-1) # n x n x k\n",
+        insertion=(
+            "\n"
+            "    if local_horizon is not None and local_horizon >= 0:\n"
+            "        # With add_identity=True, channel 0 is I and channel k is P^k.\n"
+            "        # For local_horizon=1, keep only I and one-step random-walk PE.\n"
+            "        keep_channels = local_horizon + 1 if add_identity else local_horizon\n"
+            "        keep_channels = max(0, min(int(keep_channels), pe.size(-1)))\n"
+            "        if keep_channels < pe.size(-1):\n"
+            "            pe[..., keep_channels:] = 0\n"
+        ),
+        marker="keep_channels = local_horizon + 1 if add_identity else local_horizon",
+        label="truncate RRWP channels to local horizon",
+    )
+    _insert_after(
+        repo_dir / "grit" / "transform" / "posenc_stats.py",
+        anchor="                            spd=param.spd, # by default False\n",
+        insertion="                            local_horizon=param.get('local_horizon', -1),\n",
+        marker="local_horizon=param.get('local_horizon'",
+        label="pass RRWP local_horizon to transform",
+    )
+    _replace_exact(
+        repo_dir / "grit" / "network" / "grit_model.py",
+        old=(
+            '            elif attn_sparsity == "one_hop":\n'
+            '                self.rrwp_rel_encoder = register.edge_encoder_dict["masked_rrwp_linear"] \\\n'
+            '                    (rel_pe_dim, cfg.gnn.dim_edge,\n'
+            '                     add_node_attr_as_self_loop=False,\n'
+            '                     fill_value=0.,\n'
+            '                     mask_index_name="edge_index",\n'
+            '                     )\n'
+        ),
+        new=(
+            '            elif attn_sparsity in ("one_hop", "one_hop_local_rrwp"):\n'
+            '                mask_index_name = "rrwp_local_edge_index" if attn_sparsity == "one_hop_local_rrwp" else "edge_index"\n'
+            '                self.rrwp_rel_encoder = register.edge_encoder_dict["masked_rrwp_linear"] \\\n'
+            '                    (rel_pe_dim, cfg.gnn.dim_edge,\n'
+            '                     add_node_attr_as_self_loop=False,\n'
+            '                     fill_value=0.,\n'
+            '                     mask_index_name=mask_index_name,\n'
+            '                     )\n'
+        ),
+        marker='attn_sparsity in ("one_hop", "one_hop_local_rrwp")',
+        label="GritTransformer local-RRWP mask selector",
+    )
+    _replace_exact(
+        repo_dir / "grit" / "network" / "grit_model.py",
+        old="                    \"expected 'full' or 'one_hop'.\"\n",
+        new="                    \"expected 'full', 'one_hop', or 'one_hop_local_rrwp'.\"\n",
+        marker="one_hop_local_rrwp'.",
+        label="GritTransformer local-RRWP error text",
+    )
+    write_json(
+        drive_root / "patches" / "zinc_grit_rrwp_1hop_localrrwp_patch.json",
+        {
+            "official_repo": OFFICIAL_GRIT_REPO,
+            "official_commit": OFFICIAL_GRIT_COMMIT,
+            "local_rrwp_config": str(cfg_path),
+            "parameter_count_guard": EXPECTED_GRIT_PARAMS,
+            "scientific_change": "gt.attn.sparsity=one_hop_local_rrwp and posenc_RRWP.local_horizon=1",
+            "support": "molecular bonds plus self; RRWP channels above one step zeroed",
+            "parameter_matching": "RRWP encoder dimensionality remains ksteps=21",
+        },
+    )
+
+
+def prepare_grit_repos(
+    repo_dir: Path,
+    drive_root: Path,
+    force: bool = False,
+    *,
+    include_localrrwp: bool = False,
+) -> tuple[Path, Path, Path | None, Path, Path, Path | None]:
     dense_repo = Path("/content/GRIT_dense_analysis")
     onehop_repo = Path("/content/GRIT_1hop_analysis")
+    localrrwp_repo = Path("/content/GRIT_1hop_localrrwp_analysis") if include_localrrwp else None
     clone_official_grit(dense_repo, force=force)
     clone_official_grit(onehop_repo, force=force)
+    if localrrwp_repo is not None:
+        clone_official_grit(localrrwp_repo, force=force)
 
     apply_embedded_parameter_matched_onehop_patch(onehop_repo, drive_root)
+    if localrrwp_repo is not None:
+        apply_embedded_parameter_matched_onehop_localrrwp_patch(localrrwp_repo, drive_root)
     dense_cfg = dense_repo / "configs" / "GRIT" / "zinc-GRIT-RRWP.yaml"
     onehop_cfg = onehop_repo / "configs" / "GRIT" / "zinc-GRIT-RRWP-1hop.yaml"
+    localrrwp_cfg = (
+        localrrwp_repo / "configs" / "GRIT" / "zinc-GRIT-RRWP-1hop-localrrwp.yaml"
+        if localrrwp_repo is not None
+        else None
+    )
     if not dense_cfg.exists():
         raise FileNotFoundError(f"missing dense GRIT config: {dense_cfg}")
     if not onehop_cfg.exists():
         raise FileNotFoundError(f"missing 1-hop GRIT config: {onehop_cfg}")
-    return dense_repo, onehop_repo, dense_cfg, onehop_cfg
+    if localrrwp_cfg is not None and not localrrwp_cfg.exists():
+        raise FileNotFoundError(f"missing local-RRWP 1-hop GRIT config: {localrrwp_cfg}")
+    return dense_repo, onehop_repo, localrrwp_repo, dense_cfg, onehop_cfg, localrrwp_cfg
 
 
 def checkpoint_candidates(root: Path) -> list[Path]:
@@ -1794,18 +2062,23 @@ def build_zinc_config(
     artifact_root: Path,
     dense_prepared: Path,
     onehop_prepared: Path,
+    onehop_localrrwp_prepared: Path | None,
     gin_prepared: Path | None,
     dense_dataset_dir: Path,
     onehop_dataset_dir: Path,
+    onehop_localrrwp_dataset_dir: Path | None,
     gin_dataset_dir: Path | None,
     dense_repo: Path,
     onehop_repo: Path,
+    onehop_localrrwp_repo: Path | None,
     gin_repo: Path | None,
     dense_cfg: Path,
     onehop_cfg: Path,
+    onehop_localrrwp_cfg: Path | None,
     gin_cfg: Path | None,
     dense_ckpt: Path,
     onehop_ckpt: Path,
+    onehop_localrrwp_ckpt: Path | None,
     gin_ckpt: Path | None,
     single_seed: int,
     include_local_references: bool,
@@ -1834,6 +2107,23 @@ def build_zinc_config(
             "checkpoint_path": str(onehop_ckpt),
         },
     }
+    if (
+        onehop_localrrwp_prepared is not None
+        and onehop_localrrwp_repo is not None
+        and onehop_localrrwp_cfg is not None
+        and onehop_localrrwp_ckpt is not None
+    ):
+        models["grit_1hop_localrrwp"] = {
+            "adapter": "official_grit",
+            "variant": "1hop_localrrwp",
+            "role": "strict_local_pe_parameter_matched_control",
+            "official_repo": "https://github.com/LiamMa/GRIT",
+            "repo_path": str(onehop_localrrwp_repo),
+            "artifact_root": str(onehop_localrrwp_prepared),
+            "dataset_dir": str(onehop_localrrwp_dataset_dir or dense_dataset_dir),
+            "config_path": str(onehop_localrrwp_cfg),
+            "checkpoint_path": str(onehop_localrrwp_ckpt),
+        }
     if gin_prepared is not None and gin_repo is not None and gin_cfg is not None and gin_ckpt is not None:
         models["gin"] = {
             "adapter": "official_benchmarking_gnns_gin",
@@ -1862,6 +2152,8 @@ def build_zinc_config(
         }
 
     step5_reference_models = ["dense_grit", "grit_1hop"]
+    if "grit_1hop_localrrwp" in models:
+        step5_reference_models.append("grit_1hop_localrrwp")
     if "gin" in models:
         step5_reference_models.append("gin")
     if "gcn" in models:
@@ -1918,6 +2210,9 @@ def build_zinc_config(
                 "clamp_mode": "detach",
                 "run_analytic_patching_check": True,
                 "run_clamp_negative_control": True,
+                "run_clamp_mode_comparison": True,
+                "clamp_mode_comparison_modes": ["detach", "overwrite"],
+                "clamp_mode_comparison_max_pairs_per_model": 16,
                 "composed_reference_max_direct_fraction": 0.20,
             },
             "5": {
@@ -1938,6 +2233,7 @@ def build_zinc_config(
             "markdown_default_requires_three_seeds": True,
             "dense_default_drive_dir": DEFAULT_DENSE_DRIVE_DIR,
             "onehop_default_drive_dir": DEFAULT_ONEHOP_DRIVE_DIR,
+            "onehop_localrrwp_default_drive_dir": DEFAULT_ONEHOP_LOCALRRWP_DRIVE_DIR,
             "gin_default_drive_dir": DEFAULT_GIN_DRIVE_DIR,
         },
     }
@@ -2113,6 +2409,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--drive-root", type=Path, default=Path(DEFAULT_DRIVE_ROOT))
     parser.add_argument("--dense-drive-dir", type=Path, default=Path(DEFAULT_DENSE_DRIVE_DIR))
     parser.add_argument("--onehop-drive-dir", type=Path, default=Path(DEFAULT_ONEHOP_DRIVE_DIR))
+    parser.add_argument("--onehop-localrrwp-drive-dir", type=Path, default=Path(DEFAULT_ONEHOP_LOCALRRWP_DRIVE_DIR))
     parser.add_argument("--gin-drive-dir", type=Path, default=Path(DEFAULT_GIN_DRIVE_DIR))
     parser.add_argument("--gin-repo-dir", type=Path, default=Path(DEFAULT_GIN_REPO_DIR))
     parser.add_argument("--single-seed", type=int, default=0)
@@ -2193,16 +2490,36 @@ def main(argv: Sequence[str] | None = None) -> None:
     analysis_env = env_with_py312_compat(compat_shim_dir)
     install_repo(args.repo_dir, pyg_version=str(args.pyg_version))
 
-    dense_repo, onehop_repo, dense_cfg, onehop_cfg = prepare_grit_repos(
-        args.repo_dir,
-        args.drive_root,
-        force=bool(args.force_official_grit_reclone),
-    )
     prepared = args.drive_root / "prepared_model_artifacts" / str(args.prepared_id)
     print(f"[prepared] using stable prepared artifact root: {prepared}", flush=True)
     dense_pointer_path = prepared / "dense_grit" / "artifact_pointer.json"
     onehop_pointer_path = prepared / "grit_1hop" / "artifact_pointer.json"
+    onehop_localrrwp_pointer_path = prepared / "grit_1hop_localrrwp" / "artifact_pointer.json"
     gin_pointer_path = prepared / "gin" / "artifact_pointer.json"
+
+    localrrwp_results = args.onehop_localrrwp_drive_dir / "results"
+    localrrwp_checkpoint_seen = bool(checkpoint_candidates(localrrwp_results))
+    if not localrrwp_checkpoint_seen and onehop_localrrwp_pointer_path.exists() and not args.refresh_model_artifacts:
+        try:
+            candidate = load_json(onehop_localrrwp_pointer_path)
+            localrrwp_checkpoint_seen = Path(str(candidate.get("checkpoint_path", ""))).exists()
+        except Exception:
+            localrrwp_checkpoint_seen = False
+    if localrrwp_checkpoint_seen:
+        print(f"[localrrwp] checkpoint candidate found under {localrrwp_results}; local-PE 1-hop GRIT will be included.", flush=True)
+    else:
+        print(
+            f"[localrrwp] no checkpoint found under {localrrwp_results}; "
+            "local-PE 1-hop GRIT will be skipped until training saves one.",
+            flush=True,
+        )
+
+    dense_repo, onehop_repo, onehop_localrrwp_repo, dense_cfg, onehop_cfg, onehop_localrrwp_cfg = prepare_grit_repos(
+        args.repo_dir,
+        args.drive_root,
+        force=bool(args.force_official_grit_reclone),
+        include_localrrwp=localrrwp_checkpoint_seen,
+    )
     reuse_prepared = (
         not args.refresh_model_artifacts
         and dense_pointer_path.exists()
@@ -2238,6 +2555,42 @@ def main(argv: Sequence[str] | None = None) -> None:
             checkpoint_path=onehop_ckpt,
             prepared_root=prepared / "grit_1hop",
         )
+
+    onehop_localrrwp_pointer: dict[str, Any] | None = None
+    onehop_localrrwp_ckpt: Path | None = None
+    if onehop_localrrwp_repo is not None and onehop_localrrwp_cfg is not None:
+        if not args.refresh_model_artifacts and onehop_localrrwp_pointer_path.exists():
+            candidate = load_json(onehop_localrrwp_pointer_path)
+            candidate_ckpt = Path(str(candidate.get("checkpoint_path", "")))
+            candidate_cfg = Path(str(candidate.get("config_path", "")))
+            if candidate_ckpt.exists() and candidate_cfg.exists():
+                onehop_localrrwp_pointer = candidate
+                onehop_localrrwp_ckpt = candidate_ckpt
+                print(f"[prepared] reusing local-PE 1-hop checkpoint: {onehop_localrrwp_ckpt}", flush=True)
+            else:
+                print("[prepared-warning] saved local-PE 1-hop pointer missing checkpoint/config; rediscovering", flush=True)
+        if onehop_localrrwp_pointer is None:
+            try:
+                onehop_localrrwp_ckpt = choose_checkpoint(localrrwp_results, "grit_1hop_localrrwp")
+                onehop_localrrwp_pointer = prepare_model_artifact(
+                    model="grit_1hop_localrrwp",
+                    source_drive_dir=args.onehop_localrrwp_drive_dir,
+                    config_path=onehop_localrrwp_cfg,
+                    checkpoint_path=onehop_localrrwp_ckpt,
+                    prepared_root=prepared / "grit_1hop_localrrwp",
+                )
+                print(f"[prepared] using local-PE 1-hop checkpoint: {onehop_localrrwp_ckpt}", flush=True)
+            except FileNotFoundError as exc:
+                write_json(
+                    args.drive_root / "preflight" / "onehop_localrrwp_discovery_failed.json",
+                    {
+                        "status": "missing_onehop_localrrwp_checkpoint",
+                        "drive_dir": str(args.onehop_localrrwp_drive_dir),
+                        "results_dir": str(localrrwp_results),
+                        "error": str(exc),
+                    },
+                )
+                print(f"[localrrwp] optional local-PE 1-hop unavailable; continuing without it: {exc}", flush=True)
 
     gin_pointer: dict[str, Any] | None = None
     gin_repo: Path | None = None
@@ -2302,18 +2655,23 @@ def main(argv: Sequence[str] | None = None) -> None:
         artifact_root=args.drive_root,
         dense_prepared=prepared / "dense_grit",
         onehop_prepared=prepared / "grit_1hop",
+        onehop_localrrwp_prepared=(prepared / "grit_1hop_localrrwp") if onehop_localrrwp_pointer is not None else None,
         gin_prepared=(prepared / "gin") if gin_pointer is not None else None,
         dense_dataset_dir=args.dense_drive_dir / "datasets",
         onehop_dataset_dir=args.onehop_drive_dir / "datasets",
+        onehop_localrrwp_dataset_dir=args.onehop_localrrwp_drive_dir / "datasets",
         gin_dataset_dir=args.dense_drive_dir / "datasets",
         dense_repo=dense_repo,
         onehop_repo=onehop_repo,
+        onehop_localrrwp_repo=onehop_localrrwp_repo,
         gin_repo=gin_repo,
         dense_cfg=dense_cfg,
         onehop_cfg=onehop_cfg,
+        onehop_localrrwp_cfg=onehop_localrrwp_cfg,
         gin_cfg=gin_cfg,
         dense_ckpt=dense_ckpt,
         onehop_ckpt=onehop_ckpt,
+        onehop_localrrwp_ckpt=onehop_localrrwp_ckpt,
         gin_ckpt=gin_ckpt,
         single_seed=args.single_seed,
         include_local_references=bool(args.include_local_references),
@@ -2333,6 +2691,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         {
             "dense_grit": dense_pointer,
             "grit_1hop": onehop_pointer,
+            "grit_1hop_localrrwp": onehop_localrrwp_pointer,
             "gin": gin_pointer,
             "config_path": str(config_path),
         },

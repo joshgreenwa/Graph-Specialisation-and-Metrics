@@ -82,6 +82,16 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "config_path": None,
             "checkpoint_path": None,
         },
+        "grit_1hop_localrrwp": {
+            "adapter": "official_grit",
+            "variant": "1hop_localrrwp",
+            "role": "strict_local_pe_parameter_matched_control",
+            "official_repo": "https://github.com/LiamMa/GRIT",
+            "repo_path": "external/GRIT",
+            "artifact_root": "/rds/user/jgg45/hpc-work/grit_zinc_results/1hop_localrrwp",
+            "config_path": None,
+            "checkpoint_path": None,
+        },
         "gin": {
             "adapter": "pyg_gin",
             "role": "local_validation_reference",
@@ -130,6 +140,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "clamp_mode": "detach",
             "run_analytic_patching_check": True,
             "run_clamp_negative_control": True,
+            "run_clamp_mode_comparison": True,
+            "clamp_mode_comparison_modes": ["detach", "overwrite"],
+            "clamp_mode_comparison_max_pairs_per_model": 16,
             "composed_reference_max_direct_fraction": 0.20,
         },
         "5": {
@@ -141,7 +154,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "signal_gate": True,
             "signal_gate_quantile": 0.90,
             "clamp_mode": "detach",
-            "reference_models": ["dense_grit", "grit_1hop", "gin"],
+            "reference_models": ["dense_grit", "grit_1hop", "grit_1hop_localrrwp", "gin"],
         },
     },
     "figures": {"dpi": 180},
@@ -202,6 +215,7 @@ ANALYSIS_PRESET_OVERRIDES: dict[str, dict[str, Any]] = {
                 "max_far_pairs_per_graph": 1,
                 "depth_pairs_per_graph": 0,
                 "run_clamp_negative_control": False,
+                "run_clamp_mode_comparison": False,
             },
             "5": {"sample_graphs": 4, "max_far_pairs_per_graph": 1, "interaction_pairs": 16},
         },
@@ -231,6 +245,7 @@ ANALYSIS_PRESET_OVERRIDES: dict[str, dict[str, Any]] = {
                 "max_far_pairs_per_graph": 2,
                 "depth_pairs_per_graph": 0,
                 "run_clamp_negative_control": True,
+                "run_clamp_mode_comparison": False,
             },
             "5": {"sample_graphs": 8, "max_far_pairs_per_graph": 2, "interaction_pairs": 64},
         },
@@ -258,8 +273,10 @@ ANALYSIS_PRESET_OVERRIDES: dict[str, dict[str, Any]] = {
             "4": {
                 "sample_graphs": 8,
                 "max_far_pairs_per_graph": 4,
-                "depth_pairs_per_graph": 0,
+                "depth_pairs_per_graph": 2,
                 "run_clamp_negative_control": True,
+                "run_clamp_mode_comparison": True,
+                "clamp_mode_comparison_max_pairs_per_model": 4,
             },
             "5": {"sample_graphs": 16, "max_far_pairs_per_graph": 4, "interaction_pairs": 128},
         },
@@ -294,6 +311,8 @@ ANALYSIS_PRESET_OVERRIDES: dict[str, dict[str, Any]] = {
                 "max_far_pairs_per_graph": 12,
                 "depth_pairs_per_graph": 4,
                 "run_clamp_negative_control": True,
+                "run_clamp_mode_comparison": True,
+                "clamp_mode_comparison_max_pairs_per_model": 12,
             },
             "5": {"sample_graphs": 48, "max_far_pairs_per_graph": 12, "interaction_pairs": 256},
         },
@@ -682,30 +701,38 @@ def verify_onehop_locality(
     progress("1-hop locality preflight: discovering model artifacts")
     discovery = [discover_model_artifacts(name, cfg) for name, cfg in config["models"].items()]
     models = instantiate_official_models(config, discovery)
-    onehop = next((m for m in models if m.name == "grit_1hop" or m.variant == "1hop"), None)
-    if onehop is None:
-        raise RuntimeError("1-hop locality preflight failed: no loadable grit_1hop official adapter was found")
+    onehop_models = [
+        m
+        for m in models
+        if "1hop" in m.name.lower() or "1hop" in str(m.variant).lower() or "one_hop" in str(m.variant).lower()
+    ]
+    if not onehop_models:
+        raise RuntimeError("1-hop locality preflight failed: no loadable 1-hop official GRIT adapter was found")
 
     seed = int(config.get("seeds", [0])[0])
-    graphs = select_graphs(onehop.adapter, "test", int(sample_graphs), seed=seed)
-    if not graphs:
-        raise RuntimeError("1-hop locality preflight failed: no test graphs were available")
-
     rows: list[dict[str, Any]] = []
-    progress(f"1-hop locality preflight: checking {len(graphs)} graph(s)")
-    for graph_idx, graph in enumerate(graphs):
-        gid = graph_identity("test", graph_idx, graph)
-        dist = distance_matrix(graph)
-        cache = onehop.adapter.forward(graph)
-        rows.extend(
-            attention_support_audit_rows(
-                cache,
-                dist,
-                onehop.name,
-                gid,
-                expected_max_direct_distance=1,
+    checked_models: list[str] = []
+    sample_counts: dict[str, int] = {}
+    for onehop in onehop_models:
+        graphs = select_graphs(onehop.adapter, "test", int(sample_graphs), seed=seed)
+        if not graphs:
+            raise RuntimeError(f"1-hop locality preflight failed: no test graphs were available for {onehop.name}")
+        checked_models.append(onehop.name)
+        sample_counts[onehop.name] = len(graphs)
+        progress(f"1-hop locality preflight: checking {onehop.name} on {len(graphs)} graph(s)")
+        for graph_idx, graph in enumerate(graphs):
+            gid = graph_identity("test", graph_idx, graph)
+            dist = distance_matrix(graph)
+            cache = onehop.adapter.forward(graph)
+            rows.extend(
+                attention_support_audit_rows(
+                    cache,
+                    dist,
+                    onehop.name,
+                    gid,
+                    expected_max_direct_distance=1,
+                )
             )
-        )
 
     csv_path = output.with_suffix(".csv")
     write_csv(csv_path, rows)
@@ -731,9 +758,8 @@ def verify_onehop_locality(
     total_expected_violations = int(sum(max(0.0, safe_float(row.get("expected_distance_violating_edges", 0))) for row in rows))
     summary = {
         "status": "pass" if not support_failures and not mass_failures else "failed",
-        "model": onehop.name,
-        "variant": onehop.variant,
-        "sample_graphs": len(graphs),
+        "models": checked_models,
+        "sample_graphs_by_model": sample_counts,
         "attention_layers_checked": len(rows),
         "expected_max_direct_distance": 1,
         "tolerance": float(tolerance),
@@ -754,8 +780,8 @@ def verify_onehop_locality(
     if support_failures or mass_failures:
         first = (support_failures or mass_failures)[0]
         raise RuntimeError(
-            "1-hop locality preflight failed: grit_1hop has direct non-local attention/routing. "
-            f"First failure graph={first.get('graph_id')} layer={first.get('layer')} "
+            "1-hop locality preflight failed: a 1-hop GRIT control has direct non-local attention/routing. "
+            f"First failure model={first.get('model')} graph={first.get('graph_id')} layer={first.get('layer')} "
             f"max_distance={first.get('max_direct_attention_distance')} "
             f"nonlocal_mass={first.get('direct_attention_mass_distance_gt1')}. "
             f"Audit written to {output} and {csv_path}."

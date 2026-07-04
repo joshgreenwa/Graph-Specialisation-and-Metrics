@@ -2917,6 +2917,19 @@ def run_step4(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
     gate_floor_cap_fraction = signal_gate_reference_floor_cap_fraction(config, "4")
     clamp_mode = str(cfg.get("clamp_mode", "detach")).strip().lower()
     run_clamp_negative_control = bool(cfg.get("run_clamp_negative_control", True))
+    run_clamp_mode_comparison = bool(cfg.get("run_clamp_mode_comparison", False))
+    clamp_mode_comparison_modes = [
+        str(mode).strip().lower()
+        for mode in cfg.get("clamp_mode_comparison_modes", ["detach", "overwrite"])
+        if str(mode).strip()
+    ]
+    clamp_mode_comparison_modes = [mode for mode in clamp_mode_comparison_modes if mode in {"detach", "overwrite"}]
+    if not clamp_mode_comparison_modes:
+        clamp_mode_comparison_modes = [clamp_mode]
+    clamp_mode_comparison_max_pairs_per_model = optional_pair_limit(
+        cfg.get("clamp_mode_comparison_max_pairs_per_model", 16),
+        16,
+    )
     composed_reference_max_direct_fraction = float(cfg.get("composed_reference_max_direct_fraction", 0.20))
     tau = int(config.get("primary_tau", 3))
     if bool(cfg.get("all_distance", True)):
@@ -2938,6 +2951,7 @@ def run_step4(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
     dpi = int(config["figures"]["dpi"])
     rows: list[dict[str, Any]] = []
     depth_rows: list[dict[str, Any]] = []
+    clamp_mode_rows: list[dict[str, Any]] = []
     tensors: dict[str, Any] = {}
     signal_gate_rows: list[dict[str, Any]] = []
     analytic_patching_check: dict[str, Any] = {"status": "not_run"}
@@ -2977,6 +2991,7 @@ def run_step4(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
         )
         baseline = mean_encoded_baseline(model.adapter, select_baseline_graphs(model.adapter, "test", config, sample_graphs, seed=seed))
         cache_hits = 0
+        clamp_mode_pairs_used = 0
         for graph_idx, graph in enumerate(graphs):
             progress_graph("Step 4", model.name, graph_idx, len(graphs))
             gid = graph_identity("test", graph_idx, graph)
@@ -3099,6 +3114,8 @@ def run_step4(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
                         "nontrivial_effect": nontrivial_effect,
                     }
                 )
+                off_path: int | None = None
+                primary_off_path_direct: Optional[float] = None
                 if run_clamp_negative_control:
                     off_path = random_off_path_node(
                         dist,
@@ -3122,6 +3139,7 @@ def run_step4(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
                             clean_encoded_override=clean_encoded,
                             baseline_override=base_encoded,
                         )
+                        primary_off_path_direct = control_direct
                         control_fraction, control_nontrivial = direct_fraction_value(
                             control_direct,
                             unclamped,
@@ -3159,6 +3177,73 @@ def run_step4(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
                                 "nontrivial_effect": control_nontrivial,
                             }
                         )
+                if run_clamp_mode_comparison and (
+                    clamp_mode_comparison_max_pairs_per_model is None
+                    or clamp_mode_pairs_used < int(clamp_mode_comparison_max_pairs_per_model)
+                ):
+                    comparison_specs: list[tuple[str, Sequence[int], Optional[float]]] = [
+                        ("cut", cut, direct if clamp_mode in clamp_mode_comparison_modes else None)
+                    ]
+                    if run_clamp_negative_control and off_path is not None:
+                        comparison_specs.append(
+                            (
+                                "random_off_path",
+                                [off_path],
+                                primary_off_path_direct if clamp_mode in clamp_mode_comparison_modes else None,
+                            )
+                        )
+                    for compare_mode in clamp_mode_comparison_modes:
+                        for compare_clamp_type, compare_nodes, cached_value in comparison_specs:
+                            if compare_mode == clamp_mode and cached_value is not None:
+                                compare_direct = float(cached_value)
+                            else:
+                                compare_direct = patched_ig_pair(
+                                    model.adapter,
+                                    graph,
+                                    baseline,
+                                    clean_cache,
+                                    readout_grad,
+                                    carrier=carrier,
+                                    source=source,
+                                    clamp_nodes=compare_nodes,
+                                    steps=ig_steps,
+                                    clamp_mode=compare_mode,
+                                    clean_encoded_override=clean_encoded,
+                                    baseline_override=base_encoded,
+                                )
+                            compare_fraction, compare_nontrivial = direct_fraction_value(
+                                compare_direct,
+                                unclamped,
+                                min_effect_abs=min_effect_abs,
+                            )
+                            clamp_mode_rows.append(
+                                {
+                                    "model": model.name,
+                                    "graph_id": gid,
+                                    "clamp_type": compare_clamp_type,
+                                    "carrier": carrier,
+                                    "source": source,
+                                    "distance": float(dist[carrier, source].item()),
+                                    "cut_size": len(compare_nodes),
+                                    "original_cut_size": len(cut),
+                                    "original_cut_disconnects_pair": disconnects_pair,
+                                    "original_cut_class": cut_class,
+                                    "cut_disconnects_pair": disconnects_pair if compare_clamp_type == "cut" else False,
+                                    "cut_class": cut_class if compare_clamp_type == "cut" else "random_off_path_control",
+                                    "clamp_nodes": ",".join(str(v) for v in compare_nodes),
+                                    "clamp_mode": compare_mode,
+                                    "unclamped": unclamped,
+                                    "direct": compare_direct,
+                                    "composed": unclamped - compare_direct,
+                                    "direct_fraction": compare_fraction,
+                                    "effect_abs": abs(unclamped),
+                                    "min_effect_abs": min_effect_abs,
+                                    "signal_floor": signal_floor,
+                                    "signal_gate_pass": gate_pass,
+                                    "nontrivial_effect": compare_nontrivial,
+                                }
+                            )
+                    clamp_mode_pairs_used += 1
                 if depth_pairs > 0 and accepted_pair_idx < depth_pairs:
                     layer_count = len((clean_cache.extras or {}).get("layer_input_node_states", []))
                     for layer in range(layer_count):
@@ -3194,7 +3279,9 @@ def run_step4(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
                                 "cut_class": cut_class,
                                 "clamp_until_layer": layer,
                                 "clamp_mode": clamp_mode,
+                                "unclamped": unclamped,
                                 "direct": depth_direct,
+                                "composed": unclamped - depth_direct,
                                 "direct_fraction": depth_fraction,
                                 "effect_abs": abs(unclamped),
                                 "min_effect_abs": min_effect_abs,
@@ -3216,6 +3303,7 @@ def run_step4(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
     write_csv(artifact_root / "metrics" / "step4_mediator_patching.csv", rows)
     write_csv(artifact_root / "metrics" / "step4_signal_gate.csv", signal_gate_rows)
     write_csv(artifact_root / "metrics" / "step4_depth_schedule.csv", depth_rows)
+    write_csv(artifact_root / "metrics" / "step4_clamp_mode_comparison.csv", clamp_mode_rows)
     # Report the informational noise-floor pass-rate per model. NOTE: this gate no longer
     # FILTERS anything — all patched pairs enter the ratio-of-sums estimator regardless — so a
     # 0% pass-rate does NOT empty the figures. It only flags that a model's far carriage is small
@@ -3256,6 +3344,14 @@ def run_step4(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
         )
     clamp_control_summary = clamp_negative_control_summary(rows)
     write_csv(artifact_root / "metrics" / "step4_clamp_negative_control_summary.csv", clamp_control_summary)
+    verified_separating_summary = verified_separating_cut_summary(rows)
+    write_csv(artifact_root / "metrics" / "step4_verified_separating_cuts_summary.csv", verified_separating_summary)
+    clamp_mode_summary = clamp_mode_comparison_summary(clamp_mode_rows)
+    write_csv(artifact_root / "metrics" / "step4_clamp_mode_comparison_summary.csv", clamp_mode_summary)
+    depth_magnitude_summary = depth_magnitude_summary_rows(depth_rows)
+    write_csv(artifact_root / "metrics" / "step4_depth_magnitude_summary.csv", depth_magnitude_summary)
+    interference_summary = pathway_interference_summary(rows)
+    write_csv(artifact_root / "metrics" / "step4_pathway_interference_summary.csv", interference_summary)
     clamp_d2_summary = clamp_negative_control_summary(rows, distance=2)
     write_csv(artifact_root / "metrics" / "step4_clamp_validation_d2_summary.csv", clamp_d2_summary)
     cut_class_summary = mediator_cut_class_summary(rows)
@@ -3273,6 +3369,10 @@ def run_step4(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
         dpi=dpi,
         onset_rows=onset_rows,
         signal_gate_rows=signal_gate_rows,
+        verified_separating_summary=verified_separating_summary,
+        clamp_mode_summary=clamp_mode_summary,
+        depth_magnitude_summary=depth_magnitude_summary,
+        interference_summary=interference_summary,
     )
     render_step4_cut_class_summary(cut_class_summary, artifact_root, dpi=dpi)
     composed_reference_failures = [
@@ -3319,6 +3419,11 @@ def run_step4(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
         "onset_fraction_threshold": onset_fraction_threshold,
         "onset_rows": len(onset_rows),
         "clamp_negative_control_rows": len([r for r in rows if str(r.get("clamp_type")) == "random_off_path"]),
+        "clamp_mode_comparison_rows": len(clamp_mode_rows),
+        "clamp_mode_comparison_enabled": run_clamp_mode_comparison,
+        "verified_separating_cut_rows": len(verified_separating_summary),
+        "depth_magnitude_rows": len(depth_magnitude_summary),
+        "pathway_interference_rows": len(interference_summary),
         "clamp_validation_d2_rows": len(clamp_d2_summary),
         "analytic_patching_check": analytic_patching_check,
         "composed_reference_failures": composed_reference_failures,
@@ -3481,6 +3586,138 @@ def clamp_negative_control_summary(rows: Sequence[Mapping[str, Any]], *, distanc
                     "distance": distance if distance is not None else "",
                 }
             )
+    return out
+
+
+def verified_separating_cut_summary(rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for model in sorted(set(str(r.get("model")) for r in rows)):
+        model_rows = [
+            r
+            for r in rows
+            if str(r.get("model")) == model
+            and str(r.get("clamp_type", "cut")) == "cut"
+            and bool(r.get("cut_disconnects_pair"))
+            and row_is_nontrivial(r)
+        ]
+        stats = weighted_direct_fraction(model_rows, seed=3900 + len(out), draws=500)
+        if int(stats.get("pairs", 0)) <= 0:
+            continue
+        out.append(
+            {
+                "model": model,
+                "condition": "verified_separating_cuts_only",
+                "mean_direct_fraction": stats["mean"],
+                "ci_low": stats["ci_low"],
+                "ci_high": stats["ci_high"],
+                "pairs": stats["pairs"],
+                "aggregation": "carriage_weighted",
+                "interpretation": "For a bond-local composed model, faithful cut clamps should be near zero on verified separators.",
+            }
+        )
+    return out
+
+
+def clamp_mode_comparison_summary(rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    if not rows:
+        return out
+    models = sorted({str(r.get("model")) for r in rows})
+    clamp_modes = sorted({str(r.get("clamp_mode")) for r in rows})
+    clamp_types = [t for t in ["cut", "random_off_path"] if any(str(r.get("clamp_type")) == t for r in rows)]
+    for model in models:
+        for clamp_mode in clamp_modes:
+            for clamp_type in clamp_types:
+                model_rows = [
+                    r
+                    for r in rows
+                    if str(r.get("model")) == model
+                    and str(r.get("clamp_mode")) == clamp_mode
+                    and str(r.get("clamp_type")) == clamp_type
+                    and row_is_nontrivial(r)
+                ]
+                stats = weighted_direct_fraction(model_rows, seed=3950 + len(out), draws=500)
+                if int(stats.get("pairs", 0)) <= 0:
+                    continue
+                out.append(
+                    {
+                        "model": model,
+                        "clamp_mode": clamp_mode,
+                        "clamp_type": clamp_type,
+                        "mean_direct_fraction": stats["mean"],
+                        "ci_low": stats["ci_low"],
+                        "ci_high": stats["ci_high"],
+                        "pairs": stats["pairs"],
+                        "aggregation": "carriage_weighted",
+                    }
+                )
+    return out
+
+
+def depth_magnitude_summary_rows(rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    grouped: dict[tuple[str, str, int], list[Mapping[str, Any]]] = {}
+    for row in rows:
+        layer = safe_float(row.get("clamp_until_layer"))
+        direct = safe_float(row.get("direct"))
+        unclamped = safe_float(row.get("unclamped"))
+        distance = safe_float(row.get("distance"))
+        if not (math.isfinite(layer) and math.isfinite(direct) and math.isfinite(unclamped) and math.isfinite(distance)):
+            continue
+        if not row_is_nontrivial(row):
+            continue
+        band = depth_distance_band(distance)
+        grouped.setdefault((str(row.get("model")), band, int(layer)), []).append(row)
+    out: list[dict[str, Any]] = []
+    for (model, band, layer), group in sorted(grouped.items(), key=lambda item: (item[0][0], depth_band_sort_key(item[0][1]), item[0][2])):
+        direct_abs = [abs(safe_float(r.get("direct"))) for r in group]
+        unclamped_abs = [abs(safe_float(r.get("unclamped"))) for r in group]
+        direct_signed = [safe_float(r.get("direct")) for r in group]
+        unclamped_signed = [safe_float(r.get("unclamped")) for r in group]
+        out.append(
+            {
+                "model": model,
+                "distance_band": band,
+                "clamp_until_layer": layer,
+                "mean_abs_direct_clamped": float(np.nanmean(direct_abs)),
+                "mean_abs_unclamped": float(np.nanmean(unclamped_abs)),
+                "mean_signed_direct_clamped": float(np.nanmean(direct_signed)),
+                "mean_signed_unclamped": float(np.nanmean(unclamped_signed)),
+                "pairs": len(group),
+            }
+        )
+    return out
+
+
+def pathway_interference_summary(rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    grouped: dict[tuple[str, str], list[Mapping[str, Any]]] = {}
+    for row in rows:
+        if str(row.get("clamp_type", "cut")) != "cut" or not row_is_nontrivial(row):
+            continue
+        direct = safe_float(row.get("direct"))
+        through = safe_float(row.get("composed"))
+        distance = safe_float(row.get("distance"))
+        if not (math.isfinite(direct) and math.isfinite(through) and math.isfinite(distance)):
+            continue
+        grouped.setdefault((str(row.get("model")), depth_distance_band(distance)), []).append(row)
+    out: list[dict[str, Any]] = []
+    for (model, band), group in sorted(grouped.items(), key=lambda item: (item[0][0], depth_band_sort_key(item[0][1]))):
+        direct_vals = np.asarray([safe_float(r.get("direct")) for r in group], dtype=float)
+        through_vals = np.asarray([safe_float(r.get("composed")) for r in group], dtype=float)
+        unclamped_vals = np.asarray([safe_float(r.get("unclamped")) for r in group], dtype=float)
+        opposite = np.asarray([float(d * t < 0.0) for d, t in zip(direct_vals, through_vals)], dtype=float)
+        out.append(
+            {
+                "model": model,
+                "distance_band": band,
+                "mean_around_cut_C_clamp": float(np.nanmean(direct_vals)),
+                "mean_through_cut_C_through": float(np.nanmean(through_vals)),
+                "mean_unclamped_total": float(np.nanmean(unclamped_vals)),
+                "mean_abs_around_cut": float(np.nanmean(np.abs(direct_vals))),
+                "mean_abs_through_cut": float(np.nanmean(np.abs(through_vals))),
+                "opposite_sign_share": float(np.nanmean(opposite)) if opposite.size else float("nan"),
+                "pairs": len(group),
+            }
+        )
     return out
 
 
@@ -3700,6 +3937,190 @@ def render_step4_clamp_validation_d2(rows: Sequence[Mapping[str, Any]], artifact
     plt.close(fig)
 
 
+def render_step4_verified_separating_cuts(summary: Sequence[Mapping[str, Any]], artifact_root: Path, *, dpi: int) -> None:
+    clean = [r for r in summary if math.isfinite(safe_float(r.get("mean_direct_fraction")))]
+    if not clean:
+        return
+    labels = [str(r.get("model")) for r in clean]
+    y = np.asarray([safe_float(r.get("mean_direct_fraction")) for r in clean], dtype=float)
+    lo = np.asarray([safe_float(r.get("ci_low")) for r in clean], dtype=float)
+    hi = np.asarray([safe_float(r.get("ci_high")) for r in clean], dtype=float)
+    fig, ax = plt.subplots(figsize=(7.4, 4.8), constrained_layout=True)
+    ax.bar(
+        labels,
+        y,
+        yerr=np.vstack([np.maximum(0.0, y - lo), np.maximum(0.0, hi - y)]),
+        capsize=4,
+        color="#4c78a8",
+    )
+    ax.axhline(0.0, color="#777777", linewidth=1, label="Fully composed")
+    ax.axhline(1.0, color="#555555", linestyle="--", linewidth=1, label="No clamp effect")
+    ax.set_title("Direct fraction on verified separating cuts — 1-hop must be ≈ 0 if the clamp is faithful")
+    ax.set_xlabel("Model")
+    ax.set_ylabel("Direct fraction = |C^clamp| / |C^unclamp|")
+    for tick in ax.get_xticklabels():
+        tick.set_rotation(15)
+        tick.set_ha("right")
+    ax.legend(frameon=False, fontsize=8)
+    figures = ensure_dir(artifact_root / "figures")
+    fig.savefig(figures / "step4_verified_separating_cuts_direct_fraction.png", dpi=dpi)
+    fig.savefig(figures / "step4_verified_separating_cuts_direct_fraction.pdf")
+    plt.close(fig)
+
+
+def render_step4_clamp_mode_comparison(summary: Sequence[Mapping[str, Any]], artifact_root: Path, *, dpi: int) -> None:
+    clean = [r for r in summary if math.isfinite(safe_float(r.get("mean_direct_fraction")))]
+    if not clean:
+        return
+    labels = []
+    y = []
+    lo = []
+    hi = []
+    colors = []
+    color_by_type = {"cut": "#4c78a8", "random_off_path": "#f58518"}
+    for row in clean:
+        clamp_type = str(row.get("clamp_type"))
+        clamp_label = "cut" if clamp_type == "cut" else "off-path"
+        labels.append(f"{row.get('model')}\n{row.get('clamp_mode')} {clamp_label}")
+        mean = safe_float(row.get("mean_direct_fraction"))
+        y.append(mean)
+        lo.append(safe_float(row.get("ci_low")))
+        hi.append(safe_float(row.get("ci_high")))
+        colors.append(color_by_type.get(clamp_type, "#999999"))
+    y_arr = np.asarray(y, dtype=float)
+    lo_arr = np.asarray(lo, dtype=float)
+    hi_arr = np.asarray(hi, dtype=float)
+    fig, ax = plt.subplots(figsize=(max(8.0, 0.62 * len(labels)), 5.2), constrained_layout=True)
+    ax.bar(
+        np.arange(len(labels)),
+        y_arr,
+        yerr=np.vstack([np.maximum(0.0, y_arr - lo_arr), np.maximum(0.0, hi_arr - y_arr)]),
+        capsize=3,
+        color=colors,
+    )
+    ax.axhline(1.0, color="#555555", linestyle="--", linewidth=1, label="No clamp effect")
+    ax.set_title("Clamp specificity: cut vs off-path clamp, and detach vs overwrite")
+    ax.set_xlabel("Condition")
+    ax.set_ylabel("Carriage-weighted direct fraction")
+    ax.set_xticks(np.arange(len(labels)))
+    ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=8)
+    from matplotlib.patches import Patch
+
+    handles = [
+        Patch(facecolor=color_by_type["cut"], label="Cut clamp"),
+        Patch(facecolor=color_by_type["random_off_path"], label="Random off-path clamp"),
+    ]
+    ax.legend(handles=handles, frameon=False, fontsize=8)
+    figures = ensure_dir(artifact_root / "figures")
+    fig.savefig(figures / "step4_clamp_specificity_detach_vs_overwrite.png", dpi=dpi)
+    fig.savefig(figures / "step4_clamp_specificity_detach_vs_overwrite.pdf")
+    plt.close(fig)
+
+
+def render_step4_depth_magnitude(summary: Sequence[Mapping[str, Any]], artifact_root: Path, *, dpi: int) -> None:
+    clean = [
+        r
+        for r in summary
+        if math.isfinite(safe_float(r.get("clamp_until_layer")))
+        and math.isfinite(safe_float(r.get("mean_abs_direct_clamped")))
+        and math.isfinite(safe_float(r.get("mean_abs_unclamped")))
+    ]
+    if not clean:
+        return
+    models = sorted({str(r.get("model")) for r in clean})
+    fig, axes = plt.subplots(
+        len(models),
+        1,
+        figsize=(8.6, max(4.6, 3.4 * len(models))),
+        constrained_layout=True,
+        squeeze=False,
+    )
+    for ax, model in zip(axes[:, 0], models):
+        model_rows = [r for r in clean if str(r.get("model")) == model]
+        bands = sorted({str(r.get("distance_band")) for r in model_rows}, key=depth_band_sort_key)
+        for band in bands:
+            band_rows = sorted(
+                [r for r in model_rows if str(r.get("distance_band")) == band],
+                key=lambda r: safe_float(r.get("clamp_until_layer")),
+            )
+            xs = np.asarray([safe_float(r.get("clamp_until_layer")) for r in band_rows], dtype=float)
+            direct = np.asarray([safe_float(r.get("mean_abs_direct_clamped")) for r in band_rows], dtype=float)
+            unclamped = np.asarray([safe_float(r.get("mean_abs_unclamped")) for r in band_rows], dtype=float)
+            line = ax.plot(xs, direct, marker="o", linewidth=1.8, label=f"{band}: |C^clamp|")[0]
+            ax.plot(xs, unclamped, linestyle="--", linewidth=1.4, color=line.get_color(), label=f"{band}: |C^unclamp|")
+        ax.set_title(str(model))
+        ax.set_xlabel("Clamp through layer")
+        ax.set_ylabel("Mean absolute carriage")
+        ax.set_ylim(bottom=0.0)
+        ax.legend(frameon=False, fontsize=7, ncol=2)
+    fig.suptitle("Direct vs total carriage magnitude by clamp depth (is the ratio driven by |C^clamp| rising?)")
+    figures = ensure_dir(artifact_root / "figures")
+    fig.savefig(figures / "step4_direct_vs_total_magnitude_by_clamp_depth.png", dpi=dpi)
+    fig.savefig(figures / "step4_direct_vs_total_magnitude_by_clamp_depth.pdf")
+    plt.close(fig)
+
+
+def render_step4_pathway_interference(
+    rows: Sequence[Mapping[str, Any]],
+    summary: Sequence[Mapping[str, Any]],
+    artifact_root: Path,
+    *,
+    dpi: int,
+) -> None:
+    clean_rows = [
+        r
+        for r in rows
+        if str(r.get("clamp_type", "cut")) == "cut"
+        and row_is_nontrivial(r)
+        and math.isfinite(safe_float(r.get("direct")))
+        and math.isfinite(safe_float(r.get("composed")))
+    ]
+    if not clean_rows and not summary:
+        return
+    figures = ensure_dir(artifact_root / "figures")
+    if clean_rows:
+        fig, ax = plt.subplots(figsize=(6.8, 5.6), constrained_layout=True)
+        models = sorted({str(r.get("model")) for r in clean_rows})
+        for model in models:
+            model_rows = [r for r in clean_rows if str(r.get("model")) == model]
+            x = np.asarray([safe_float(r.get("direct")) for r in model_rows], dtype=float)
+            y = np.asarray([safe_float(r.get("composed")) for r in model_rows], dtype=float)
+            ax.scatter(x, y, s=18, alpha=0.68, label=model)
+        ax.axhline(0.0, color="#777777", linewidth=1)
+        ax.axvline(0.0, color="#777777", linewidth=1)
+        ax.set_title("Through-cut vs around-cut carriage: opposite signs ⇒ ratio > 1")
+        ax.set_xlabel("Around-cut carriage C^clamp")
+        ax.set_ylabel("Through-cut carriage C^through = C^unclamp - C^clamp")
+        ax.legend(frameon=False, fontsize=8)
+        fig.savefig(figures / "step4_pathway_interference_scatter.png", dpi=dpi)
+        fig.savefig(figures / "step4_pathway_interference_scatter.pdf")
+        plt.close(fig)
+    clean_summary = [r for r in summary if math.isfinite(safe_float(r.get("mean_around_cut_C_clamp")))]
+    if clean_summary:
+        labels = [f"{r.get('model')} {r.get('distance_band')}" for r in clean_summary]
+        around = np.asarray([safe_float(r.get("mean_around_cut_C_clamp")) for r in clean_summary], dtype=float)
+        through = np.asarray([safe_float(r.get("mean_through_cut_C_through")) for r in clean_summary], dtype=float)
+        x = np.arange(len(labels), dtype=float)
+        width = 0.36
+        fig, ax = plt.subplots(figsize=(max(8.0, 0.5 * len(labels)), 5.0), constrained_layout=True)
+        ax.bar(x - width / 2.0, around, width=width, label="Around-cut C^clamp")
+        ax.bar(x + width / 2.0, through, width=width, label="Through-cut C^through")
+        ax.axhline(0.0, color="#555555", linewidth=1)
+        ax.set_title("Through-cut vs around-cut carriage by distance band")
+        ax.set_xlabel("Model and distance band")
+        ax.set_ylabel("Signed carriage")
+        ax.set_xticks(x)
+        ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=8)
+        ax.legend(frameon=False, fontsize=8)
+        for idx, row in enumerate(clean_summary):
+            share = safe_float(row.get("opposite_sign_share"))
+            if math.isfinite(share):
+                ax.text(idx, max(around[idx], through[idx], 0.0), f"opp={share:.0%}", fontsize=7, ha="center", va="bottom")
+        fig.savefig(figures / "step4_pathway_interference_bars.png", dpi=dpi)
+        fig.savefig(figures / "step4_pathway_interference_bars.pdf")
+        plt.close(fig)
+
+
 def render_step4_signal_magnitude_by_distance(rows: Sequence[Mapping[str, Any]], artifact_root: Path, *, dpi: int) -> None:
     clean = [
         r
@@ -3799,6 +4220,10 @@ def render_step4(
     dpi: int,
     onset_rows: Sequence[Mapping[str, Any]] = (),
     signal_gate_rows: Sequence[Mapping[str, Any]] = (),
+    verified_separating_summary: Sequence[Mapping[str, Any]] = (),
+    clamp_mode_summary: Sequence[Mapping[str, Any]] = (),
+    depth_magnitude_summary: Sequence[Mapping[str, Any]] = (),
+    interference_summary: Sequence[Mapping[str, Any]] = (),
 ) -> None:
     if validation_summary:
         labels = [str(r["model"]) for r in validation_summary]
@@ -3824,7 +4249,11 @@ def render_step4(
         render_step4_clamp_validation_d2(rows, artifact_root, dpi=dpi)
         render_step4_direct_fraction_by_distance(rows, artifact_root, dpi=dpi)
         render_step4_clamp_negative_control(rows, artifact_root, dpi=dpi)
+        render_step4_verified_separating_cuts(verified_separating_summary, artifact_root, dpi=dpi)
+        render_step4_clamp_mode_comparison(clamp_mode_summary, artifact_root, dpi=dpi)
+        render_step4_pathway_interference(rows, interference_summary, artifact_root, dpi=dpi)
     if depth_rows:
+        render_step4_depth_magnitude(depth_magnitude_summary, artifact_root, dpi=dpi)
         by_layer: dict[tuple[str, int], list[float]] = {}
         for row in depth_rows:
             value = safe_float(row["direct_fraction"])

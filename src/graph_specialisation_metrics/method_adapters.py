@@ -461,7 +461,8 @@ class OfficialGRITAdapter:
                     full_attn = bool(attn_cfg.get("full_attn"))
                 except Exception:
                     full_attn = bool(getattr(attn_cfg, "full_attn", True))
-            if sparsity != "one_hop" or full_attn is not False:
+            allowed_1hop_sparsity = {"one_hop", "one_hop_local_rrwp"}
+            if sparsity not in allowed_1hop_sparsity or full_attn is not False:
                 raise RuntimeError(
                     "1-hop GRIT adapter loaded a config that does not declare the 1-hop attention control: "
                     f"gt.attn.sparsity={sparsity!r}, gt.attn.full_attn={full_attn!r}, config={self.config_path}"

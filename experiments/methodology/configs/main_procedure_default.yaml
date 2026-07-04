@@ -38,6 +38,16 @@ models:
     dataset_dir: /rds/user/jgg45/hpc-work/grit_zinc_results/datasets
     config_path:
     checkpoint_path:
+  grit_1hop_localrrwp:
+    adapter: official_grit
+    variant: 1hop_localrrwp
+    role: strict_local_pe_parameter_matched_control
+    official_repo: https://github.com/LiamMa/GRIT
+    repo_path: external/GRIT
+    artifact_root: /rds/user/jgg45/hpc-work/grit_zinc_results/1hop_localrrwp
+    dataset_dir: /rds/user/jgg45/hpc-work/grit_zinc_results/datasets
+    config_path:
+    checkpoint_path:
   gin:
     adapter: pyg_gin
     role: local_validation_reference
@@ -84,6 +94,9 @@ steps:
     clamp_mode: detach
     run_analytic_patching_check: true
     run_clamp_negative_control: true
+    run_clamp_mode_comparison: true
+    clamp_mode_comparison_modes: [detach, overwrite]
+    clamp_mode_comparison_max_pairs_per_model: 16
     composed_reference_max_direct_fraction: 0.20
   "5":
     name: non_composable_gap_attribution
@@ -92,7 +105,7 @@ steps:
     interaction_pairs: 1000
     min_effect_abs: 1.0e-6
     clamp_mode: detach
-    reference_models: [dense_grit, grit_1hop, gin]
+    reference_models: [dense_grit, grit_1hop, grit_1hop_localrrwp, gin]
 
 figures:
   dpi: 180
