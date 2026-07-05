@@ -671,6 +671,7 @@ class OfficialGRITAdapter:
         graph: Any,
         *,
         content_override: Optional[torch.Tensor] = None,
+        edge_attr_override: Optional[torch.Tensor] = None,
         attention_erasure_masks: Optional[Mapping[int, torch.Tensor]] = None,
         clean_cache: Optional[ForwardCache] = None,
         clamp_nodes: Sequence[int] = (),
@@ -695,6 +696,8 @@ class OfficialGRITAdapter:
             "layer_output_node_state_tensors": [],
             "channel_fields": [],
             "encoded_node_states": None,
+            "encoded_edge_attr": None,
+            "encoded_edge_index": None,
             "final_node_states": None,
         }
         handles: list[Any] = []
@@ -735,6 +738,21 @@ class OfficialGRITAdapter:
             if retain_grad and getattr(batch.x, "requires_grad", False):
                 batch.x.retain_grad()
             captures["encoded_node_states"] = batch.x
+            # Structural (pair-RRWP) intervention point: batch.edge_attr is the initial relative
+            # structural encoding that seeds the evolving GRIT bias. Overriding it here perturbs the
+            # pair-structure while leaving node content (batch.x) intact, enabling a structural
+            # carriage that mirrors content carriage (which perturbs raw x pre-encoder).
+            if isinstance(getattr(batch, "edge_attr", None), torch.Tensor):
+                if edge_attr_override is not None:
+                    ea = edge_attr_override.to(device=batch.edge_attr.device, dtype=batch.edge_attr.dtype)
+                    if tuple(ea.shape) != tuple(batch.edge_attr.shape):
+                        raise ValueError(
+                            f"edge_attr_override shape {tuple(ea.shape)} does not match encoded edge attr {tuple(batch.edge_attr.shape)}"
+                        )
+                    batch.edge_attr = ea
+                captures["encoded_edge_attr"] = batch.edge_attr
+            if isinstance(getattr(batch, "edge_index", None), torch.Tensor):
+                captures["encoded_edge_index"] = batch.edge_index
             return batch
 
         def make_layer_pre_hook(layer_idx: int):
@@ -904,6 +922,8 @@ class OfficialGRITAdapter:
             raise RuntimeError("could not capture final GRIT node states before graph readout")
         extras = {
             "encoded_node_states": captures["encoded_node_states"],
+            "encoded_edge_attr": captures["encoded_edge_attr"],
+            "encoded_edge_index": captures["encoded_edge_index"],
             "layer_input_node_states": captures["layer_input_node_states"],
             "layer_output_node_states": captures["layer_output_node_states"],
             "layer_output_node_state_tensors": captures["layer_output_node_state_tensors"],
@@ -925,10 +945,11 @@ class OfficialGRITAdapter:
         with torch.no_grad():
             return self._run_with_hooks(graph)
 
-    def forward_minimal(self, graph: Any) -> ForwardCache:
+    def forward_minimal(self, graph: Any, *, edge_attr_override: Optional[torch.Tensor] = None) -> ForwardCache:
         with torch.no_grad():
             return self._run_with_hooks(
                 graph,
+                edge_attr_override=edge_attr_override,
                 capture_attention=False,
                 capture_channels=False,
                 capture_layer_inputs=False,

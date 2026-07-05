@@ -1581,15 +1581,40 @@ def render_step_1_figures(metric_rows, history_rows, artifact_root, config):
         by_model = {}
         for row in history_rows:
             by_model.setdefault(str(row["model"]), []).append(row)
+        visible_values = []
         for model, rows in sorted(by_model.items()):
             rows_sorted = sorted(rows, key=lambda r: safe_float(r.get("step")))
             x = [safe_float(r.get("step")) for r in rows_sorted]
             train = [safe_float(r.get("train")) for r in rows_sorted]
             val = [safe_float(r.get("val")) for r in rows_sorted]
+            visible_values.extend(v for v in train + val if math.isfinite(v) and v >= 0.0)
             if any(math.isfinite(v) for v in train):
                 ax.plot(x, train, linewidth=1.5, label=f"{model} train")
             if any(math.isfinite(v) for v in val):
                 ax.plot(x, val, linewidth=1.5, linestyle="--", label=f"{model} val")
+        if visible_values:
+            values = np.asarray(visible_values, dtype=float)
+            q90 = float(np.nanpercentile(values, 90))
+            q95 = float(np.nanpercentile(values, 95))
+            median = float(np.nanmedian(values))
+            robust_upper = max(q95, 1.35 * q90, 3.0 * median, 0.12)
+            finite_max = float(np.nanmax(values))
+            y_upper = min(finite_max, robust_upper)
+            clipped = int(np.sum(values > y_upper))
+            if clipped > 0 and y_upper < finite_max:
+                ax.set_ylim(0.0, y_upper * 1.03)
+                ax.text(
+                    0.99,
+                    0.98,
+                    f"y-axis clipped at {y_upper:.3f}; {clipped} high-loss point(s) above range",
+                    ha="right",
+                    va="top",
+                    transform=ax.transAxes,
+                    fontsize=8,
+                    color="#555555",
+                )
+            else:
+                ax.set_ylim(bottom=0.0)
         ax.set_title("Step 1: training and validation curves")
         ax.set_xlabel("Epoch")
         ax.set_ylabel("L1 / MAE loss")
@@ -2580,6 +2605,13 @@ def build_zinc_config(
                 "reference_models": step5_reference_models,
                 "load_bearing_ablation_fractions": [0.0, 0.05, 0.10, 0.25, 0.50, 1.0],
                 "load_bearing_random_draws": 8,
+                "distance_binned_ablation_bins": [
+                    {"label": "d=2-3", "min": 2, "max": 3},
+                    {"label": "d=4-6", "min": 4, "max": 6},
+                    {"label": "d=7-10", "min": 7, "max": 10},
+                    {"label": "d=11-14", "min": 11, "max": 14},
+                    {"label": "d>14", "min": 15, "max": None},
+                ],
             },
         },
         "figures": {"dpi": 180},

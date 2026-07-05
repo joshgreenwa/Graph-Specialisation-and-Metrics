@@ -128,6 +128,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "erasure_sample_graphs": 64,
             "erasure_fractions": [0.0, 0.05, 0.10, 0.20, 0.35, 0.50],
             "erasure_include_near_control": True,
+            "run_swap_correlation": True,
+            "swap_correlation_sample_graphs": 32,
+            "run_task_mae_retention": True,
+            "task_mae_retention_fractions": [0.0, 0.05, 0.10, 0.25, 0.50, 0.75, 1.0],
         },
         "3": {"name": "distance_resolved_overfitting", "sample_graphs": 200},
         "4": {
@@ -149,6 +153,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "clamp_mode_comparison_modes": ["detach", "overwrite"],
             "clamp_mode_comparison_max_pairs_per_model": 16,
             "composed_reference_max_direct_fraction": 0.20,
+            "run_symbolic_structural_carriage": True,
+            "symbolic_structural_sample_graphs": 6,
+            "symbolic_structural_max_sources": "all",
+            "symbolic_structural_min_distance": 1,
         },
         "5": {
             "name": "non_composable_gap_attribution",
@@ -723,15 +731,42 @@ def render_step_1_figures(
         by_model: dict[str, list[Mapping[str, Any]]] = {}
         for row in history_rows:
             by_model.setdefault(str(row["model"]), []).append(row)
+        visible_values: list[float] = []
         for model, rows in sorted(by_model.items()):
             rows_sorted = sorted(rows, key=lambda r: safe_float(r.get("step")))
             x = [safe_float(r.get("step")) for r in rows_sorted]
             train = [safe_float(r.get("train")) for r in rows_sorted]
             val = [safe_float(r.get("val")) for r in rows_sorted]
+            visible_values.extend(v for v in train + val if math.isfinite(v) and v >= 0.0)
             if any(math.isfinite(v) for v in train):
                 ax.plot(x, train, linewidth=1.5, label=f"{model} train")
             if any(math.isfinite(v) for v in val):
                 ax.plot(x, val, linewidth=1.5, linestyle="--", label=f"{model} val")
+        if visible_values:
+            values = np.asarray(visible_values, dtype=float)
+            q90 = float(np.nanpercentile(values, 90))
+            q95 = float(np.nanpercentile(values, 95))
+            median = float(np.nanmedian(values))
+            # Early training spikes can be orders of magnitude larger than the converged MAE.
+            # Show the region where nearly all epochs live, but keep enough headroom for val curves.
+            robust_upper = max(q95, 1.35 * q90, 3.0 * median, 0.12)
+            finite_max = float(np.nanmax(values))
+            y_upper = min(finite_max, robust_upper)
+            clipped = int(np.sum(values > y_upper))
+            if clipped > 0 and y_upper < finite_max:
+                ax.set_ylim(0.0, y_upper * 1.03)
+                ax.text(
+                    0.99,
+                    0.98,
+                    f"y-axis clipped at {y_upper:.3f}; {clipped} high-loss point(s) above range",
+                    ha="right",
+                    va="top",
+                    transform=ax.transAxes,
+                    fontsize=8,
+                    color="#555555",
+                )
+            else:
+                ax.set_ylim(bottom=0.0)
         ax.set_title("Step 1: training and validation curves")
         ax.set_xlabel("Epoch")
         ax.set_ylabel("L1 / MAE loss")
