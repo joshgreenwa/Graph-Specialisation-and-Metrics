@@ -1,38 +1,93 @@
-"""A/B test: does full-IG-through-the-readout carriage improve Step-0b fidelity to the measured
-one-node-baseline output delta?
+"""Fully standalone A/B test: does full-IG-through-the-readout carriage improve Step-0b
+fidelity to the measured one-node-baseline output delta?
 
-Background
-----------
-Carriage is C[i,j] = g_i . Delta h_i(j). By default g_i (the readout gradient) is frozen at the
-clean value, so the reconstruction Sum_i C[i,j] only *approximates* the true single-node output
-delta when the readout MLP is nonlinear. The `carriage_readout_ig` toggle re-evaluates g along the
-IG path (full IG through the readout), making the reconstruction exact. This script measures, per
-model, the Step-0b R^2 (predicted `Sum_i C[i,j]` vs the *measured* one-node-baseline delta y) for
-BOTH the frozen-g carriage and the readout-IG carriage, so you can see whether the toggle improves
-fidelity -- and by how much.
+PASTE THIS WHOLE FILE INTO ONE COLAB CELL AND RUN IT (the ``main([...])`` at the bottom fires).
+No prior runner run is needed. The cell:
 
-Environment
------------
-Run in the SAME Colab session as colab_zinc_main_procedure.py (deps installed, Drive mounted,
-checkpoints present). Point --config at the config YAML the runner wrote (it holds the discovered
-model checkpoint paths), e.g.:
+  1. mounts Drive,
+  2. bootstrap-clones the methodology repo with the ``dissertation_key`` Colab secret,
+  3. delegates the ENTIRE environment build to the methodology runner
+     (``colab_zinc_main_procedure.main``): it installs torch/PyG + deps, editable-installs
+     the package, clones and patches the external GRIT checkout, discovers the trained ZINC
+     checkpoints on Drive, and writes the analysis config -- but we stop it right after the
+     config is written, before any analysis steps run,
+  4. loads that config in-process and compares, per model, the Step-0b R^2 -- predicted
+     ``Sum_i C[i,j]`` vs the *measured* one-node-baseline delta y -- for BOTH the frozen-g
+     carriage and the readout-IG carriage.
 
-    /content/drive/MyDrive/graph_specialisation_metrics/zinc_main_procedure_colab/configs/zinc_main_procedure_colab.yaml
-
-Usage (Colab cell)
-------------------
-    !python /content/Graph-Specialisation-and-Metrics/experiments/methodology/test_readout_ig_ab.py \
-        --config <that yaml path> --sample-graphs 8 --ig-steps 32
-
-This reuses only forward passes + the existing carriage function; it does not write any artifacts.
+It reads only forward passes and writes no analysis artifacts (the runner does write its
+usual config/prepared-pointer files on Drive as a side effect of setup).
 """
 
 from __future__ import annotations
 
 import argparse
+import importlib
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 from typing import Sequence
+from urllib.parse import quote
+
+REPO_URL = "https://github.com/joshgreenwa/Graph-Specialisation-and-Metrics.git"
+BRANCH = "codex/cfim-grit-experiments"
+REPO_DIR = "/content/Graph-Specialisation-and-Metrics"
+DRIVE_ROOT = "/content/drive/MyDrive/graph_specialisation_metrics/zinc_main_procedure_colab"
+SECRET_NAME = "dissertation_key"
+
+
+# --------------------------------------------------------------------------------------
+# Minimal bootstrap (mount + clone) -- just enough to import the methodology runner, which
+# then performs the full, tested environment build for us.
+# --------------------------------------------------------------------------------------
+def _mount_drive() -> None:
+    try:
+        from google.colab import drive  # type: ignore
+
+        drive.mount("/content/drive", force_remount=False)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[drive] skipping mount ({exc})")
+
+
+def _get_token(secret_name: str) -> str | None:
+    try:
+        from google.colab import userdata  # type: ignore
+
+        tok = userdata.get(secret_name)
+        if tok:
+            return str(tok)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[secret] userdata.get({secret_name!r}) failed: {exc}")
+    import os
+
+    return os.environ.get(secret_name)
+
+
+def _run(cmd: list[str]) -> None:
+    subprocess.run(cmd, check=True)
+
+
+def _clone_bootstrap(repo_url: str, branch: str, repo_dir: Path, token: str | None, username: str | None) -> None:
+    if token:
+        cred = f"{quote(str(username), safe='')}:{quote(token, safe='')}" if username else quote(token, safe="")
+        authed = repo_url.replace("https://", f"https://{cred}@", 1)
+    else:
+        print("[git] no token found; attempting anonymous clone/update (fails on private repos)")
+        authed = repo_url
+    if (repo_dir / ".git").exists():
+        print(f"[git] updating {repo_dir} -> origin/{branch} (hard reset)")
+        _run(["git", "-C", str(repo_dir), "remote", "set-url", "origin", authed])
+        _run(["git", "-C", str(repo_dir), "fetch", "origin", branch])
+        _run(["git", "-C", str(repo_dir), "checkout", branch])
+        _run(["git", "-C", str(repo_dir), "reset", "--hard", f"origin/{branch}"])
+        _run(["git", "-C", str(repo_dir), "remote", "set-url", "origin", repo_url])
+    else:
+        if repo_dir.exists():
+            shutil.rmtree(repo_dir)
+        print(f"[git] cloning {branch} -> {repo_dir}")
+        _run(["git", "clone", "--branch", branch, "--single-branch", authed, str(repo_dir)])
+        _run(["git", "-C", str(repo_dir), "remote", "set-url", "origin", repo_url])
 
 
 def _r2(measured: list[float], predicted: list[float]) -> float:
@@ -45,39 +100,119 @@ def _r2(measured: list[float], predicted: list[float]) -> float:
         return float("nan")
     y, p = y[mask], p[mask]
     ss_tot = float(((y - y.mean()) ** 2).sum())
-    ss_res = float(((y - p) ** 2).sum())
     if ss_tot <= 0.0:
         return float("nan")
-    return 1.0 - ss_res / ss_tot
+    return 1.0 - float(((y - p) ** 2).sum()) / ss_tot
+
+
+class _StopBeforeSteps(Exception):
+    """Sentinel used to halt the methodology runner right after it writes the config."""
+
+
+def _build_environment_and_config(args: argparse.Namespace) -> Path:
+    """Set up the full Colab environment by REUSING the methodology runner, then return the
+    path to the config it wrote.
+
+    We bootstrap-clone the repo (so the runner module is importable), then run the runner's
+    own ``main()`` -- which installs deps, editable-installs the package, clones+patches the
+    external GRIT checkout, discovers the ZINC checkpoints, and writes the analysis config --
+    but we monkeypatch its step-runner to raise ``_StopBeforeSteps`` so it stops exactly at
+    the step boundary (the config is written just before that). This reuses the runner's exact,
+    tested setup with zero duplication instead of forking ~700 lines of discovery/config logic.
+    """
+    repo = Path(args.repo_dir)
+    _clone_bootstrap(args.repo_url, args.branch, repo, _get_token(args.secret_name), args.github_username)
+
+    methodology_dir = str(repo / "experiments" / "methodology")
+    if methodology_dir not in sys.path:
+        sys.path.insert(0, methodology_dir)
+    import colab_zinc_main_procedure as runner  # noqa: WPS433  (import from the fresh clone)
+
+    importlib.reload(runner)  # pick up freshly-pulled runner code on re-runs in a long-lived kernel
+
+    def _stop(*_a: object, **_k: object) -> None:
+        raise _StopBeforeSteps()
+
+    runner.run_main_procedure = _stop  # type: ignore[assignment]
+    runner.run_onehop_locality_preflight = lambda *_a, **_k: None  # type: ignore[assignment]
+
+    runner_argv = [
+        "--skip-git",  # reuse the bootstrap clone above (no second clone / token needed)
+        "--repo-dir", str(repo),
+        "--drive-root", str(args.drive_root),
+        "--branch", str(args.branch),
+        "--repo-url", str(args.repo_url),
+        "--secret-name", str(args.secret_name),
+        "--skip-onehop-locality-check",  # read-only A/B: no need to certify 1-hop locality
+    ]
+    print("[setup] delegating full environment build to the methodology runner (deps + GRIT + config)...", flush=True)
+    try:
+        runner.main(runner_argv)
+    except _StopBeforeSteps:
+        pass  # setup finished; the config is on Drive and the steps were intentionally skipped
+
+    config_path = Path(args.drive_root) / "configs" / "zinc_main_procedure_colab.yaml"
+    if not config_path.exists():
+        raise SystemExit(f"[setup] runner finished but no config was written at {config_path}")
+    print(f"[setup] environment ready; using config {config_path}", flush=True)
+    return config_path
 
 
 def main(argv: Sequence[str] | None = None) -> None:
-    ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--repo-src", default="/content/Graph-Specialisation-and-Metrics/src")
-    ap.add_argument("--config", required=True, help="Config YAML the runner wrote (holds checkpoint paths).")
+    ap = argparse.ArgumentParser(description="Readout-IG vs frozen-g carriage: Step-0b R^2 A/B (fully standalone).")
+    ap.add_argument("--repo-url", default=REPO_URL)
+    ap.add_argument("--branch", default=BRANCH)
+    ap.add_argument("--repo-dir", default=REPO_DIR)
+    ap.add_argument("--drive-root", default=DRIVE_ROOT)
+    ap.add_argument("--secret-name", default=SECRET_NAME)
+    ap.add_argument("--github-username", default=None)
+    ap.add_argument(
+        "--config",
+        default=None,
+        help="Skip the runner setup and use this already-written config (e.g. after a prior runner run in the same session).",
+    )
     ap.add_argument("--sample-graphs", type=int, default=8)
     ap.add_argument("--ig-steps", type=int, default=32)
     ap.add_argument("--seed", type=int, default=41)
     args = ap.parse_args(argv)
 
-    sys.path.insert(0, args.repo_src)
-    import torch  # noqa: F401  (ensures torch is importable before the heavy imports)
-    from graph_specialisation_metrics.main_procedure import discover_model_artifacts, load_config
-    from graph_specialisation_metrics.grit_intervention_procedure import (
-        carriage_ig,
-        expanded_baseline,
-        instantiate_official_models,
-        mean_encoded_baseline,
-        predict_scalar_from_encoded,
-        select_baseline_graphs,
-        select_graphs,
-    )
+    _mount_drive()
 
-    config = load_config(args.config, fast_dev_run=False, output_root=None, analysis_preset="full")
+    repo = Path(args.repo_dir)
+    if args.config:
+        config_path = Path(args.config)
+        print(f"[setup] --config given; assuming the environment is already set up, using {config_path}", flush=True)
+    else:
+        config_path = _build_environment_and_config(args)
+
+    src = str(repo / "src")
+    if src not in sys.path:
+        sys.path.insert(0, src)
+    importlib.invalidate_caches()
+
+    try:
+        from graph_specialisation_metrics.main_procedure import discover_model_artifacts, load_config
+        from graph_specialisation_metrics.grit_intervention_procedure import (
+            carriage_ig,
+            expanded_baseline,
+            instantiate_official_models,
+            mean_encoded_baseline,
+            predict_scalar_from_encoded,
+            select_baseline_graphs,
+            select_graphs,
+        )
+    except ModuleNotFoundError as exc:  # noqa: BLE001
+        raise SystemExit(
+            f"[import] failed after setup: {exc}\n"
+            "  The methodology runner should have installed deps + editable-installed the package.\n"
+            f"  Check the setup log above for a pip/GRIT error, and that --repo-dir ({repo}) is the clone."
+        )
+
+    config = load_config(str(config_path), fast_dev_run=False, output_root=None, analysis_preset="full")
     discovery = [discover_model_artifacts(name, cfg) for name, cfg in config["models"].items()]
     models = instantiate_official_models(config, discovery)
 
-    print(f"\nStep-0b A/B: predicted Sum_i C[i,j]  vs  measured one-node-baseline delta y")
+    print("\nStep-0b A/B: predicted Sum_i C[i,j]  vs  measured one-node-baseline delta y")
     print(f"(ig_steps={args.ig_steps}, sample_graphs={args.sample_graphs})\n")
     print(f"{'model':24s} {'n_src':>6s} {'R2 frozen-g':>12s} {'R2 readout-IG':>14s} {'improvement':>12s}")
     print("-" * 72)
@@ -101,25 +236,29 @@ def main(argv: Sequence[str] | None = None) -> None:
                 clean_pred = float(predict_scalar_from_encoded(model.adapter, graph, enc).detach().cpu().item())
                 c_frozen = carriage_ig(model.adapter, graph, baseline, steps=args.ig_steps, readout_ig=False)["carriage"]
                 c_rig = carriage_ig(model.adapter, graph, baseline, steps=args.ig_steps, readout_ig=True)["carriage"]
-                n = int(enc.size(0))
-                for j in range(n):
+                for j in range(int(enc.size(0))):
                     pert = enc.detach().clone()
                     pert[j] = base[j]
                     pj = float(predict_scalar_from_encoded(model.adapter, graph, pert).detach().cpu().item())
-                    measured.append(clean_pred - pj)                 # one-node baseline delta y (Step-0b convention)
+                    measured.append(clean_pred - pj)  # Step-0b convention
                     pred_frozen.append(float(c_frozen[:, j].sum().item()))
                     pred_rig.append(float(c_rig[:, j].sum().item()))
             except Exception as exc:  # noqa: BLE001
                 print(f"  {model.name} graph {gi}: failed ({type(exc).__name__}: {exc})")
         if len(measured) >= 3:
-            r2f = _r2(measured, pred_frozen)
-            r2r = _r2(measured, pred_rig)
+            r2f, r2r = _r2(measured, pred_frozen), _r2(measured, pred_rig)
             print(f"{model.name:24s} {len(measured):6d} {r2f:12.3f} {r2r:14.3f} {r2r - r2f:+12.3f}")
         else:
             print(f"{model.name:24s} insufficient data ({len(measured)})")
-    print("\nHigher R2 = carriage tracks the measured single-node delta y better. readout-IG should")
-    print("match or beat frozen-g; the residual gap for dense is the (informative) non-additivity.")
+    print("\nHigher R2 = carriage tracks the measured single-node delta y better; readout-IG should")
+    print("match or beat frozen-g. Any residual dense gap is the (informative) non-additivity.")
 
 
+# --- run it (fires when you paste this file into a Colab cell). First run does the full
+#     environment build via the runner (a few minutes); pass --config <path> on later runs
+#     in the same session to skip setup. ---
 if __name__ == "__main__":
-    main()
+    main([
+        "--sample-graphs", "8",
+        "--ig-steps", "32",
+    ])
