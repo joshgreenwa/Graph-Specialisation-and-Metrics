@@ -546,6 +546,12 @@ def carriage_ig_uses_batched_vjp(config: Mapping[str, Any]) -> bool:
     return bool(config.get("perturbation", {}).get("batched_vjp", True))
 
 
+def carriage_ig_uses_readout_ig(config: Mapping[str, Any]) -> bool:
+    """Whether to integrate the readout gradient along the IG path (full IG through the readout)
+    instead of freezing it at the clean value."""
+    return bool(config.get("perturbation", {}).get("carriage_readout_ig", False))
+
+
 def swap_partner_policy(config: Mapping[str, Any]) -> str:
     return str(config.get("perturbation", {}).get("swap_partner_policy", "different_type")).strip().lower()
 
@@ -796,6 +802,7 @@ def carriage_ig(
     target_index: int = 0,
     baseline_override: Optional[torch.Tensor] = None,
     batched_vjp: bool = True,
+    readout_ig: bool = False,
     capture_attention: bool = False,
     capture_channels: bool = False,
     capture_layer_inputs: bool = False,
@@ -804,9 +811,12 @@ def carriage_ig(
 ) -> dict[str, Any]:
     """Compute markdown carriage C[i,j] using encoded-content IG.
 
-    For each carrier ``i`` this integrates the gradient of
-    ``g_i · h_i^L`` with respect to each encoded source ``j`` along the
-    baseline-to-input path, where ``g_i`` is the clean readout gradient.
+    For each carrier ``i`` this integrates the gradient of ``g_i · h_i^L`` with respect to each
+    encoded source ``j`` along the baseline-to-input path. With ``readout_ig=False`` (default) the
+    readout gradient ``g_i`` is frozen at the clean value (a linearised readout). With
+    ``readout_ig=True`` the readout gradient is re-evaluated (and detached) at every path point --
+    full IG through the readout -- which makes the reconstruction ``Sum C == y_clean - y_base``
+    exact instead of first-order, at the cost of one extra backward pass per IG step.
     """
     state = (
         dict(clean_state)
@@ -832,11 +842,21 @@ def carriage_ig(
     carriage = clean_encoded.new_zeros((n, n))
     use_batched_vjp = bool(batched_vjp)
     batched_vjp_error: str | None = None
+    def _step_readout_grad(cache: Any) -> torch.Tensor:
+        # Frozen readout gradient (clean) unless readout_ig: then re-evaluate g at this path point,
+        # detached so it acts as a constant cotangent for the h->e VJP below.
+        if not readout_ig:
+            return readout_grad
+        pred_alpha = cache.prediction.reshape(-1)[int(target_index)]
+        (g_alpha,) = torch.autograd.grad(pred_alpha, cache.final_node_states, retain_graph=True, create_graph=False)
+        return g_alpha.detach()
+
     for alpha_idx in range(1, int(steps) + 1):
         alpha = float(alpha_idx) / float(steps)
         point = (base + alpha * delta).detach().requires_grad_(True)
         cache = adapter.forward_from_encoded_content(graph, point, retain_grad=False)
-        carrier_scores = (cache.final_node_states * readout_grad).sum(dim=-1)
+        step_grad = _step_readout_grad(cache)
+        carrier_scores = (cache.final_node_states * step_grad).sum(dim=-1)
         if use_batched_vjp:
             try:
                 eye = torch.eye(n, device=carrier_scores.device, dtype=carrier_scores.dtype)
@@ -855,7 +875,8 @@ def carriage_ig(
                 batched_vjp_error = str(exc)
                 point = (base + alpha * delta).detach().requires_grad_(True)
                 cache = adapter.forward_from_encoded_content(graph, point, retain_grad=False)
-                carrier_scores = (cache.final_node_states * readout_grad).sum(dim=-1)
+                step_grad = _step_readout_grad(cache)
+                carrier_scores = (cache.final_node_states * step_grad).sum(dim=-1)
         for carrier in range(n):
             scalar = carrier_scores[carrier]
             (grad,) = torch.autograd.grad(scalar, point, retain_graph=carrier < n - 1, create_graph=False)
@@ -902,6 +923,10 @@ def carriage_ig_cached(
         capture_layer_outputs=capture_layer_outputs,
     )
     model_fingerprint = adapter_cache_fingerprint(model.adapter)
+    readout_ig = carriage_ig_uses_readout_ig(config)
+    if readout_ig:
+        # Distinct cache key: readout-IG carriage differs from the frozen-g carriage.
+        model_fingerprint = f"{model_fingerprint}-readoutig"
     cached = load_cached_carriage(
         artifact_root,
         config,
@@ -933,6 +958,7 @@ def carriage_ig_cached(
         steps=steps,
         target_index=target_index,
         batched_vjp=batched_vjp,
+        readout_ig=readout_ig,
         capture_attention=capture_attention,
         capture_channels=capture_channels,
         capture_layer_inputs=capture_layer_inputs,
@@ -1309,13 +1335,8 @@ def _attention_erasure_mask_from_ranking(
     region: str,
     ranker: str,
     seed: int,
-    keep_top: bool = False,
 ) -> tuple[torch.Tensor, int, int]:
-    """Build a dense [dst,src] mask for erasing ranked sparse attention edges.
-
-    ``keep_top=False`` (comprehensiveness): erase the top ``fraction`` of candidates.
-    ``keep_top=True`` (sufficiency): keep the top ``fraction`` and erase the rest.
-    """
+    """Build a dense [dst,src] mask for removing ranked sparse attention edges."""
 
     dist_cpu = dist.detach().cpu().float()
     src = edge_index[0].detach().cpu().long()
@@ -1330,34 +1351,31 @@ def _attention_erasure_mask_from_ranking(
         raise ValueError(f"unknown attention-erasure region {region!r}")
     candidate_indices = candidates.nonzero(as_tuple=False).flatten()
     available = int(candidate_indices.numel())
-    frac = max(0.0, min(1.0, float(fraction)))
-    keep_count = int(round(frac * available)) if keep_top else available - int(round(frac * available))
-    n_erase = available - keep_count
+    remove_count = int(round(max(0.0, min(1.0, float(fraction))) * available))
     dense_mask = torch.zeros_like(dist_cpu, dtype=torch.bool)
-    if available == 0 or n_erase <= 0:
+    if available == 0 or remove_count <= 0:
         return dense_mask, available, 0
-    n_erase = min(n_erase, available)
-    if ranker in ("attention", "carriage"):
-        if ranker == "attention":
-            values = attention_values.detach().abs().cpu().float()
-            if values.dim() == 2:
-                score = values.mean(dim=1)
-            elif values.dim() == 1:
-                score = values
-            else:
-                raise RuntimeError(f"unsupported attention values for erasure ranking: {tuple(values.shape)}")
-            ranking_scores = score[candidate_indices]
+    remove_count = min(remove_count, available)
+    if ranker == "attention":
+        values = attention_values.detach().abs().cpu().float()
+        if values.dim() == 2:
+            score = values.mean(dim=1)
+        elif values.dim() == 1:
+            score = values
         else:
-            c = carriage.detach().abs().cpu().float()
-            ranking_scores = c[dst[candidate_indices], src[candidate_indices]]
+            raise RuntimeError(f"unsupported attention values for erasure ranking: {tuple(values.shape)}")
+        ranking_scores = score[candidate_indices]
         order = torch.argsort(ranking_scores, descending=True, stable=True)
-        # remove mode erases the top n_erase; keep mode erases the bottom n_erase (keeps the top).
-        erase_order = order[order.numel() - n_erase:] if keep_top else order[:n_erase]
-        selected = candidate_indices[erase_order]
+        selected = candidate_indices[order[:remove_count]]
+    elif ranker == "carriage":
+        c = carriage.detach().abs().cpu().float()
+        ranking_scores = c[dst[candidate_indices], src[candidate_indices]]
+        order = torch.argsort(ranking_scores, descending=True, stable=True)
+        selected = candidate_indices[order[:remove_count]]
     elif ranker == "random":
         generator = torch.Generator(device="cpu").manual_seed(int(seed))
-        perm = torch.randperm(available, generator=generator)
-        selected = candidate_indices[perm[:n_erase]]
+        order = torch.randperm(available, generator=generator)
+        selected = candidate_indices[order[:remove_count]]
     else:
         raise ValueError(f"unknown attention-erasure ranker {ranker!r}")
     dense_mask[dst[selected], src[selected]] = True
@@ -1431,88 +1449,6 @@ def attention_erasure_rows(
                         "prediction_clean": clean_pred,
                         "prediction_erased": erased_pred,
                         "abs_delta_prediction": delta,
-                    }
-                )
-    return rows
-
-
-def attention_sufficiency_rows(
-    model: ModelRun,
-    graph: Any,
-    graph_id: str,
-    cache: Any,
-    carriage: torch.Tensor,
-    dist: torch.Tensor,
-    *,
-    tau: int,
-    fractions: Sequence[float],
-    include_near_control: bool,
-    seed: int,
-) -> list[dict[str, Any]]:
-    """Sufficiency against the true label: keep only the top-``fraction`` relationships (ranked by
-    attention / carriage / random), erase the rest, and record task MAE ``|pred - y|``. A ranker
-    whose kept edges retain low MAE with a smaller rationale identifies the task-relevant
-    relationships better -- and unlike comprehensiveness, keeping edges has no mechanical bias
-    toward attention, so a carriage win here is non-circular.
-    """
-    if not hasattr(model.adapter, "forward_with_attention_erasure"):
-        return []
-    edges = list((cache.extras or {}).get("attention_edges", []) or [])
-    if edges:
-        last_layer = len(edges) - 1
-    else:
-        last_layer = len(list(cache.attention or [])) - 1
-    if last_layer < 0:
-        return []
-    sparse = sparse_attention_layer_weights(cache, last_layer)
-    if sparse is None:
-        return []
-    edge_index, attention_values = sparse
-    clean_pred = float(cache.prediction.reshape(-1)[0].detach().cpu().item())
-    y = graph_label(graph)
-    clean_mae = abs(clean_pred - y) if math.isfinite(y) else float("nan")
-    rows: list[dict[str, Any]] = []
-    regions = ["far"] + (["near"] if include_near_control else [])
-    for region in regions:
-        for fraction in fractions:  # fraction KEPT
-            for ranker in ("attention", "carriage", "random"):
-                mask, available, erased = _attention_erasure_mask_from_ranking(
-                    edge_index=edge_index,
-                    dist=dist,
-                    carriage=carriage,
-                    attention_values=attention_values,
-                    fraction=float(fraction),
-                    tau=tau,
-                    region=region,
-                    ranker=ranker,
-                    keep_top=True,
-                    seed=seed + 6131 * stable_int_hash(graph_id) + 103 * int(round(float(fraction) * 1000)),
-                )
-                if available == 0:
-                    kept_pred = float("nan")
-                    task_mae = float("nan")
-                elif erased == 0:
-                    kept_pred = clean_pred
-                    task_mae = clean_mae
-                else:
-                    out = model.adapter.forward_with_attention_erasure(graph, {int(last_layer): mask})
-                    kept_pred = float(out.prediction.reshape(-1)[0].detach().cpu().item())
-                    task_mae = abs(kept_pred - y) if math.isfinite(y) else float("nan")
-                rows.append(
-                    {
-                        "model": model.name,
-                        "graph_id": graph_id,
-                        "attention_layer": last_layer,
-                        "region": region,
-                        "ranker": ranker,
-                        "tau": tau,
-                        "fraction_kept": float(fraction),
-                        "edges_available": available,
-                        "edges_erased": erased,
-                        "prediction_clean": clean_pred,
-                        "prediction_kept": kept_pred,
-                        "clean_mae": clean_mae,
-                        "task_mae": task_mae,
                     }
                 )
     return rows
@@ -1640,257 +1576,6 @@ def attention_graph_vs_carriage_ablation_rows(
                     }
                 )
     return rows
-
-
-def attention_pair_vs_carriage_ablation_rows(
-    model: ModelRun,
-    graph: Any,
-    graph_id: str,
-    cache: Any,
-    c_ig: torch.Tensor,
-    dist: torch.Tensor,
-    *,
-    tau: int,
-    fractions: Sequence[float],
-    include_near_control: bool,
-    seed: int,
-) -> list[dict[str, Any]]:
-    """Pair-level fair comparison: rank source->carrier PAIRS by a plain **mean attention** value
-    (averaged over all heads and layers) vs |carriage|, take the top fraction of pairs, ablate the
-    source nodes they implicate at the INPUT (content corruption), and record task MAE vs the true
-    label. This is the simpler sibling of the attention-graph ablation -- it selects pairs directly
-    with a mean-attention value rather than the attention-graph construction.
-
-    Note: ablation is per-source, so different selectors' top-k pairs can implicate different numbers
-    of source nodes; ``sources_ablated`` is recorded per point so the budget can be inspected.
-    """
-    if not hasattr(model.adapter, "forward_minimal") or not isinstance(getattr(graph, "x", None), torch.Tensor):
-        return []
-    layers = list(getattr(cache, "attention", None) or [])
-    if not layers:
-        return []
-    mats: list[torch.Tensor] = []
-    for layer in layers:
-        t = layer.detach().cpu().float()
-        if t.dim() == 3:
-            t = t.mean(dim=0)
-        if t.dim() != 2 or t.size(0) != t.size(1):
-            return []
-        mats.append(t)
-    if any(m.shape != mats[0].shape for m in mats):
-        return []
-    mean_attn = torch.stack(mats, dim=0).mean(dim=0).abs()  # [N,N] plain mean attention per pair
-    n = min(int(mean_attn.size(0)), int(c_ig.size(0)), int(dist.size(0)))
-    if n < 2:
-        return []
-    a = mean_attn[:n, :n]
-    carr = c_ig[:n, :n].detach().abs().cpu()
-    d = dist[:n, :n].detach().cpu()
-    y = graph_label(graph)
-    if not math.isfinite(y):
-        return []
-    try:
-        clean_pred = float(model.adapter.forward_minimal(graph).prediction.reshape(-1)[0].detach().cpu().item())
-    except Exception:
-        return []
-    clean_mae = abs(clean_pred - y)
-    rng = random.Random(f"{seed}:pair:{graph_id}")
-    rows: list[dict[str, Any]] = []
-    regions = ["far"] + (["near"] if include_near_control else [])
-    for region in regions:
-        if region == "far":
-            region_mask = torch.isfinite(d) & (d > float(tau))
-        else:
-            region_mask = torch.isfinite(d) & (d > 0.0) & (d <= float(tau))
-        idx = torch.nonzero(region_mask, as_tuple=False)
-        if int(idx.size(0)) < 2:
-            continue
-        pairs = [(int(r[0].item()), int(r[1].item())) for r in idx]
-        att_scores = [float(a[i, j].item()) for (i, j) in pairs]
-        carr_scores = [float(carr[i, j].item()) for (i, j) in pairs]
-        order_att = sorted(range(len(pairs)), key=lambda p: att_scores[p], reverse=True)
-        order_carr = sorted(range(len(pairs)), key=lambda p: carr_scores[p], reverse=True)
-        order_rand = list(range(len(pairs)))
-        rng.shuffle(order_rand)
-        rankings = {"attention_mean": order_att, "carriage": order_carr, "random": order_rand}
-        total = len(pairs)
-        for fraction in fractions:
-            k = int(round(max(0.0, min(1.0, float(fraction))) * total))
-            for selector, order in rankings.items():
-                if k <= 0:
-                    ablated_pred = clean_pred
-                    task_mae = clean_mae
-                    n_src = 0
-                    n_pairs = 0
-                else:
-                    selected_pairs = [pairs[p] for p in order[:k]]
-                    sources = {j for (_, j) in selected_pairs}
-                    corrupted = _clone_graph_corrupt_sources(graph, sources, rng)
-                    if corrupted is None:
-                        continue
-                    try:
-                        ablated_pred = float(model.adapter.forward_minimal(corrupted).prediction.reshape(-1)[0].detach().cpu().item())
-                    except Exception:
-                        continue
-                    task_mae = abs(ablated_pred - y)
-                    n_src = len(sources)
-                    n_pairs = len(selected_pairs)
-                rows.append(
-                    {
-                        "model": model.name,
-                        "graph_id": graph_id,
-                        "region": region,
-                        "selector": selector,
-                        "fraction_pairs": float(fraction),
-                        "pairs_selected": n_pairs,
-                        "sources_ablated": n_src,
-                        "candidate_pairs": total,
-                        "prediction_clean": clean_pred,
-                        "prediction_ablated": ablated_pred,
-                        "clean_mae": clean_mae,
-                        "task_mae": task_mae,
-                        "delta_mae": task_mae - clean_mae,
-                    }
-                )
-    return rows
-
-
-def attention_carriage_swap_rows(
-    model_name: str,
-    graph_id: str,
-    attn_tensors: Mapping[str, torch.Tensor],
-    c_ig: torch.Tensor,
-    c_swap: torch.Tensor,
-    dist: torch.Tensor,
-    tau: int,
-    *,
-    quantity: str = "attention_last",
-) -> list[dict[str, Any]]:
-    """Per-pair (attention, IG carriage, discrete swap effect) for the swap-correlation figure.
-
-    The swap effect is the measured output change from a discrete content swap -- a real
-    intervention neither attention (softmax weights) nor IG carriage is computed from -- so it
-    serves as the external causal ground truth both readouts are scored against.
-    """
-    attn = attn_tensors.get(quantity)
-    if not isinstance(attn, torch.Tensor):
-        return []
-    n = min(int(attn.size(0)), int(c_ig.size(0)), int(c_swap.size(0)), int(dist.size(0)))
-    a = attn.detach().abs().cpu()
-    ig = c_ig.detach().abs().cpu()
-    sw = c_swap.detach().abs().cpu()
-    d = dist.detach().cpu()
-    rows: list[dict[str, Any]] = []
-    for i in range(n):
-        for j in range(n):
-            if i == j:
-                continue
-            dij = float(d[i, j].item())
-            if not math.isfinite(dij) or dij <= 0.0:
-                continue
-            rows.append(
-                {
-                    "model": model_name,
-                    "graph_id": graph_id,
-                    "carrier": i,
-                    "source": j,
-                    "distance": int(round(dij)),
-                    "region": "far" if dij > float(tau) else "near",
-                    "attention": float(a[i, j].item()),
-                    "carriage_ig": float(ig[i, j].item()),
-                    "swap_effect": float(sw[i, j].item()),
-                }
-            )
-    return rows
-
-
-def _rankdata_avg(a: np.ndarray) -> np.ndarray:
-    """Average-tie ranks (scipy-free)."""
-    a = np.asarray(a, dtype=float)
-    n = a.size
-    order = np.argsort(a, kind="mergesort")
-    sorted_a = a[order]
-    ranks = np.empty(n, dtype=float)
-    out = np.empty(n, dtype=float)
-    i = 0
-    while i < n:
-        j = i
-        while j + 1 < n and sorted_a[j + 1] == sorted_a[i]:
-            j += 1
-        ranks[i : j + 1] = (i + j) / 2.0 + 1.0
-        i = j + 1
-    out[order] = ranks
-    return out
-
-
-def _spearman(x: np.ndarray, y: np.ndarray) -> float:
-    x = np.asarray(x, dtype=float)
-    y = np.asarray(y, dtype=float)
-    mask = np.isfinite(x) & np.isfinite(y)
-    if int(mask.sum()) < 3:
-        return float("nan")
-    xr = _rankdata_avg(x[mask])
-    yr = _rankdata_avg(y[mask])
-    if float(np.std(xr)) < EPS or float(np.std(yr)) < EPS:
-        return float("nan")
-    return float(np.corrcoef(xr, yr)[0, 1])
-
-
-def swap_correlation_summary(rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
-    """Rank-correlation of attention vs IG carriage with the discrete swap effect, by model/region.
-
-    Bootstraps over graphs (not pairs) so the CI reflects graph-level, not within-graph, sampling.
-    """
-    summary: list[dict[str, Any]] = []
-    models = sorted({str(r.get("model")) for r in rows})
-    for model in models:
-        for region in ("far", "near"):
-            sub = [r for r in rows if str(r.get("model")) == model and str(r.get("region")) == region]
-            if len(sub) < 3:
-                continue
-            att = np.asarray([safe_float(r.get("attention")) for r in sub], dtype=float)
-            ig = np.asarray([safe_float(r.get("carriage_ig")) for r in sub], dtype=float)
-            sw = np.asarray([safe_float(r.get("swap_effect")) for r in sub], dtype=float)
-            gids = np.asarray([str(r.get("graph_id")) for r in sub])
-            rho_att = _spearman(att, sw)
-            rho_ig = _spearman(ig, sw)
-            unique_gids = sorted(set(gids.tolist()))
-            att_boot: list[float] = []
-            ig_boot: list[float] = []
-            if len(unique_gids) >= 2:
-                rng = np.random.default_rng(4242)
-                gid_to_idx = {g: np.flatnonzero(gids == g) for g in unique_gids}
-                for _ in range(500):
-                    chosen = rng.choice(unique_gids, size=len(unique_gids), replace=True)
-                    idx = np.concatenate([gid_to_idx[g] for g in chosen])
-                    att_boot.append(_spearman(att[idx], sw[idx]))
-                    ig_boot.append(_spearman(ig[idx], sw[idx]))
-
-            def _ci(vals: list[float]) -> tuple[float, float]:
-                clean = [v for v in vals if math.isfinite(v)]
-                if len(clean) < 10:
-                    return float("nan"), float("nan")
-                lo, hi = np.percentile(clean, [2.5, 97.5])
-                return float(lo), float(hi)
-
-            att_lo, att_hi = _ci(att_boot)
-            ig_lo, ig_hi = _ci(ig_boot)
-            summary.append(
-                {
-                    "model": model,
-                    "region": region,
-                    "n_pairs": len(sub),
-                    "n_graphs": len(unique_gids),
-                    "spearman_attention_vs_swap": rho_att,
-                    "spearman_attention_ci_low": att_lo,
-                    "spearman_attention_ci_high": att_hi,
-                    "spearman_carriage_vs_swap": rho_ig,
-                    "spearman_carriage_ci_low": ig_lo,
-                    "spearman_carriage_ci_high": ig_hi,
-                    "carriage_minus_attention": (rho_ig - rho_att) if (math.isfinite(rho_ig) and math.isfinite(rho_att)) else float("nan"),
-                }
-            )
-    return summary
 
 
 def carriage_profile_rows(model: str, graph_id: str, carriage: torch.Tensor, dist: torch.Tensor, quantity: str) -> list[dict[str, Any]]:
@@ -2853,17 +2538,11 @@ def run_step2(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
     erasure_sample_graphs = int(cfg.get("erasure_sample_graphs", min(sample_graphs, 64)))
     erasure_fractions = [float(value) for value in cfg.get("erasure_fractions", [0.0, 0.05, 0.10, 0.20, 0.35, 0.50])]
     erasure_include_near_control = bool(cfg.get("erasure_include_near_control", True))
-    run_swap_correlation = bool(cfg.get("run_swap_correlation", True))
-    swap_correlation_sample_graphs = int(cfg.get("swap_correlation_sample_graphs", 32))
-    run_task_mae_retention = bool(cfg.get("run_task_mae_retention", True))
-    task_mae_retention_fractions = [float(v) for v in cfg.get("task_mae_retention_fractions", [0.0, 0.05, 0.10, 0.25, 0.50, 0.75, 1.0])]
     run_attention_graph_ablation = bool(cfg.get("run_attention_graph_ablation", True))
     attention_graph_aggregation = str(cfg.get("attention_graph_aggregation", "mean"))
     attention_graph_ablation_models = {str(name) for name in cfg.get("attention_graph_ablation_models", cfg.get("erasure_models", ["dense_grit"]))}
     attention_graph_ablation_sample_graphs = int(cfg.get("attention_graph_ablation_sample_graphs", 16))
     attention_graph_ablation_fractions = [float(v) for v in cfg.get("attention_graph_ablation_fractions", [0.0, 0.1, 0.2, 0.3, 0.5])]
-    run_attention_pair_ablation = bool(cfg.get("run_attention_pair_ablation", True))
-    attention_pair_ablation_fractions = [float(v) for v in cfg.get("attention_pair_ablation_fractions", [0.0, 0.02, 0.05, 0.1, 0.2, 0.4])]
     tau = int(config.get("primary_tau", 3))
     seed = int(config.get("seeds", [0])[0])
     dpi = int(config["figures"]["dpi"])
@@ -2872,10 +2551,7 @@ def run_step2(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
     threshold_rows: list[dict[str, Any]] = []
     channel_rows: list[dict[str, Any]] = []
     erasure_rows: list[dict[str, Any]] = []
-    swap_corr_rows: list[dict[str, Any]] = []
-    sufficiency_rows: list[dict[str, Any]] = []
     ag_ablation_rows: list[dict[str, Any]] = []
-    ag_pair_rows: list[dict[str, Any]] = []
     support_rows: list[dict[str, Any]] = []
     mean_distance_rows: list[dict[str, Any]] = []
     tensors: dict[str, Any] = {}
@@ -2928,13 +2604,7 @@ def run_step2(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
                 )
             )
             c_swap = None
-            # Compute the discrete swap carriage when the swap-vs-attention check is on OR when the
-            # swap-correlation figure needs it (bounded to its own graph sample), so that figure is
-            # produced even under presets that disable compare_attention_to_swaps (medium/high/...).
-            compute_swap = include_swap_attention_check or (
-                run_swap_correlation and graph_idx < max(0, swap_correlation_sample_graphs)
-            )
-            if compute_swap:
+            if include_swap_attention_check:
                 c_swap = carriage_swap(
                     model.adapter,
                     graph,
@@ -2945,11 +2615,10 @@ def run_step2(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
                     partner_policy=partner_policy,
                 )
                 tensors[f"step2/{model.name}/{gid}/swap_carriage"] = c_swap
-                if include_swap_attention_check:
-                    profile_rows.extend(carriage_profile_rows(model.name, gid, c_swap, dist, "swap_carriage"))
+                profile_rows.extend(carriage_profile_rows(model.name, gid, c_swap, dist, "swap_carriage"))
             if any(quantity in attn_tensors for quantity in ("attention_last", "attention_first")):
                 faith_rows.extend(attention_faithfulness_rows(model.name, gid, attn_tensors, c_ig, dist, tau, carriage_estimator="ig"))
-                if include_swap_attention_check and c_swap is not None:
+                if c_swap is not None:
                     faith_rows.extend(
                         attention_faithfulness_rows(
                             model.name,
@@ -2975,38 +2644,6 @@ def run_step2(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
                                 }
                             )
             if (
-                run_swap_correlation
-                and c_swap is not None
-                and "attention_last" in attn_tensors
-                and graph_idx < max(0, swap_correlation_sample_graphs)
-            ):
-                swap_corr_rows.extend(
-                    attention_carriage_swap_rows(model.name, gid, attn_tensors, c_ig, c_swap, dist, tau)
-                )
-            if (
-                run_task_mae_retention
-                and model.name in erasure_models
-                and graph_idx < max(0, erasure_sample_graphs)
-                and "attention_last" in attn_tensors
-            ):
-                try:
-                    sufficiency_rows.extend(
-                        attention_sufficiency_rows(
-                            model,
-                            graph,
-                            gid,
-                            cache,
-                            c_ig,
-                            dist,
-                            tau=tau,
-                            fractions=task_mae_retention_fractions,
-                            include_near_control=erasure_include_near_control,
-                            seed=seed + 4441 * graph_idx,
-                        )
-                    )
-                except Exception as exc:
-                    progress(f"  {model.name} graph {graph_idx}: task-MAE retention failed ({exc})")
-            if (
                 run_attention_graph_ablation
                 and model.name in attention_graph_ablation_models
                 and graph_idx < max(0, attention_graph_ablation_sample_graphs)
@@ -3030,29 +2667,6 @@ def run_step2(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
                     )
                 except Exception as exc:
                     progress(f"  {model.name} graph {graph_idx}: attention-graph ablation failed ({exc})")
-            if (
-                run_attention_pair_ablation
-                and model.name in attention_graph_ablation_models
-                and graph_idx < max(0, attention_graph_ablation_sample_graphs)
-                and cache.attention
-            ):
-                try:
-                    ag_pair_rows.extend(
-                        attention_pair_vs_carriage_ablation_rows(
-                            model,
-                            graph,
-                            gid,
-                            cache,
-                            c_ig,
-                            dist,
-                            tau=tau,
-                            fractions=attention_pair_ablation_fractions,
-                            include_near_control=erasure_include_near_control,
-                            seed=seed + 6607 * graph_idx,
-                        )
-                    )
-                except Exception as exc:
-                    progress(f"  {model.name} graph {graph_idx}: attention-pair ablation failed ({exc})")
             if run_layer_channel_split:
                 channel_rows.extend(layer_channel_split_rows(model, graph, result, dist, gid, tau))
             if (
@@ -3147,17 +2761,8 @@ def run_step2(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
     render_layer_resolved_channel_split(channel_rows, artifact_root, dpi=dpi)
     render_head_resolved_carriage(head_rows, artifact_root, dpi=dpi)
     render_step2_attention_erasure(erasure_rows, artifact_root, dpi=dpi)
-    write_csv(artifact_root / "metrics" / "step2_swap_correlation_pairs.csv", swap_corr_rows)
-    swap_corr_summary = swap_correlation_summary(swap_corr_rows)
-    write_csv(artifact_root / "metrics" / "step2_swap_correlation_summary.csv", swap_corr_summary)
-    write_csv(artifact_root / "metrics" / "step2_task_mae_retention.csv", sufficiency_rows)
     write_csv(artifact_root / "metrics" / "step2_attention_graph_vs_carriage_ablation.csv", ag_ablation_rows)
-    write_csv(artifact_root / "metrics" / "step2_attention_pair_vs_carriage_ablation.csv", ag_pair_rows)
-    render_step2_swap_correlation(swap_corr_summary, artifact_root, dpi=dpi)
-    render_step2_swap_correlation_scatter(swap_corr_rows, artifact_root, dpi=dpi)
-    render_step2_task_mae_retention(sufficiency_rows, artifact_root, dpi=dpi)
     render_step2_attention_graph_ablation(ag_ablation_rows, artifact_root, dpi=dpi)
-    render_step2_attention_pair_ablation(ag_pair_rows, artifact_root, dpi=dpi)
     progress("Step 2 complete: metrics, tensors, and figures written")
     return {
         "status": "complete" if not support_failures else "complete_with_attention_support_violations",
@@ -3166,10 +2771,7 @@ def run_step2(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
         "profile_rows": len(profile_rows),
         "faithfulness_rows": len(faith_rows),
         "attention_erasure_rows": len(erasure_rows),
-        "swap_correlation_pairs": len(swap_corr_rows),
-        "task_mae_retention_rows": len(sufficiency_rows),
         "attention_graph_ablation_rows": len(ag_ablation_rows),
-        "attention_pair_ablation_rows": len(ag_pair_rows),
         "support_audit_rows": len(support_rows),
         "head_resolved_rows": len(head_rows),
         "attention_mean_distance_rows": len(mean_distance_rows),
@@ -3667,134 +3269,6 @@ def bootstrap_gap_ci(train: Sequence[float], test: Sequence[float], *, seed: int
     return float(np.mean(train_arr) - np.mean(test_arr)), float(lo), float(hi)
 
 
-def render_step2_swap_correlation(summary: Sequence[Mapping[str, Any]], artifact_root: Path, *, dpi: int) -> None:
-    if not summary:
-        return
-
-    def _err(point: float, lo: float, hi: float) -> tuple[float, float]:
-        if not (math.isfinite(point) and math.isfinite(lo) and math.isfinite(hi)):
-            return 0.0, 0.0
-        return max(0.0, point - lo), max(0.0, hi - point)
-
-    models = sorted({str(r.get("model")) for r in summary})
-    regions = ["near", "far"]
-    fig, axes = plt.subplots(1, len(models), figsize=(4.8 * len(models), 4.4), constrained_layout=True, squeeze=False)
-    for ax, model in zip(axes[0], models):
-        by_region = {str(r.get("region")): r for r in summary if str(r.get("model")) == model}
-        xs = np.arange(len(regions))
-        width = 0.38
-        att = [safe_float(by_region.get(reg, {}).get("spearman_attention_vs_swap")) for reg in regions]
-        car = [safe_float(by_region.get(reg, {}).get("spearman_carriage_vs_swap")) for reg in regions]
-        att_e = [_err(a, safe_float(by_region.get(reg, {}).get("spearman_attention_ci_low")), safe_float(by_region.get(reg, {}).get("spearman_attention_ci_high"))) for a, reg in zip(att, regions)]
-        car_e = [_err(c, safe_float(by_region.get(reg, {}).get("spearman_carriage_ci_low")), safe_float(by_region.get(reg, {}).get("spearman_carriage_ci_high"))) for c, reg in zip(car, regions)]
-        ax.bar(xs - width / 2, att, width, yerr=np.array(att_e).T, capsize=4, color="#4c78a8", label="attention")
-        ax.bar(xs + width / 2, car, width, yerr=np.array(car_e).T, capsize=4, color="#f58518", label="carriage (IG)")
-        ax.axhline(0.0, color="#777777", linewidth=1)
-        ax.set_xticks(xs)
-        ax.set_xticklabels(regions)
-        ax.set_ylim(-0.1, 1.0)
-        ax.set_title(model, fontsize=10)
-        ax.set_ylabel("Spearman(readout, true swap effect)")
-        ax.legend(frameon=False, fontsize=8)
-    fig.suptitle("Faithfulness to the true swap effect: carriage vs attention (higher = better predictor of the real intervention)")
-    figures = ensure_dir(artifact_root / "figures")
-    fig.savefig(figures / "step2_swap_correlation.png", dpi=dpi)
-    fig.savefig(figures / "step2_swap_correlation.pdf")
-    plt.close(fig)
-
-
-def render_step2_swap_correlation_scatter(rows: Sequence[Mapping[str, Any]], artifact_root: Path, *, dpi: int, max_points: int = 4000) -> None:
-    if not rows:
-        return
-    models = sorted({str(r.get("model")) for r in rows})
-    model = "dense_grit" if "dense_grit" in models else models[0]
-    sub = [r for r in rows if str(r.get("model")) == model and str(r.get("region")) == "far"]
-    region_label = "far pairs (d>tau)"
-    if len(sub) < 10:
-        sub = [r for r in rows if str(r.get("model")) == model]
-        region_label = "all pairs"
-    if len(sub) < 3:
-        return
-    att = np.asarray([safe_float(r.get("attention")) for r in sub], dtype=float)
-    ig = np.asarray([safe_float(r.get("carriage_ig")) for r in sub], dtype=float)
-    sw = np.asarray([safe_float(r.get("swap_effect")) for r in sub], dtype=float)
-    n = len(sub)
-    idx = np.random.default_rng(0).choice(n, size=max_points, replace=False) if n > max_points else np.arange(n)
-    fig, axes = plt.subplots(1, 2, figsize=(11.5, 4.8), constrained_layout=True)
-    for ax, (vals, name, color) in zip(axes, [(att, "attention", "#4c78a8"), (ig, "carriage (IG)", "#f58518")]):
-        ax.scatter(vals[idx], sw[idx], s=6, alpha=0.35, color=color, edgecolors="none")
-        rho = _spearman(vals, sw)
-        ax.set_xlabel(f"{name}  (|value|)")
-        ax.set_ylabel("true swap effect  |Δŷ|")
-        ax.set_title(f"{name} vs swap   Spearman={rho:.2f}")
-    fig.suptitle(f"Predicting the true swap effect — {model}, {region_label}")
-    figures = ensure_dir(artifact_root / "figures")
-    fig.savefig(figures / "step2_swap_correlation_scatter.png", dpi=dpi)
-    fig.savefig(figures / "step2_swap_correlation_scatter.pdf")
-    plt.close(fig)
-
-
-def render_step2_task_mae_retention(rows: Sequence[Mapping[str, Any]], artifact_root: Path, *, dpi: int) -> None:
-    clean = [
-        r
-        for r in rows
-        if str(r.get("ranker")) in ("attention", "carriage", "random")
-        and math.isfinite(safe_float(r.get("task_mae")))
-        and math.isfinite(safe_float(r.get("fraction_kept")))
-    ]
-    if not clean:
-        return
-    models = sorted({str(r.get("model")) for r in clean})
-    model = "dense_grit" if "dense_grit" in models else models[0]
-    msub = [r for r in clean if str(r.get("model")) == model]
-    regions = sorted({str(r.get("region")) for r in msub}, reverse=True)  # far, then near
-    colors = {"attention": "#4c78a8", "carriage": "#f58518", "random": "#7f7f7f"}
-    fig, axes = plt.subplots(1, len(regions), figsize=(6.6 * len(regions), 4.6), constrained_layout=True, squeeze=False)
-    for ax, region in zip(axes[0], regions):
-        rsub = [r for r in msub if str(r.get("region")) == region]
-        for ranker in ("attention", "carriage", "random"):
-            pts: dict[float, list[float]] = {}
-            for r in rsub:
-                if str(r.get("ranker")) != ranker:
-                    continue
-                pts.setdefault(safe_float(r.get("fraction_kept")), []).append(safe_float(r.get("task_mae")))
-            fracs = sorted(f for f in pts if math.isfinite(f))
-            if not fracs:
-                continue
-            means = [float(np.nanmean(pts[f])) for f in fracs]
-            los: list[float] = []
-            his: list[float] = []
-            for f in fracs:
-                arr = np.asarray([v for v in pts[f] if math.isfinite(v)], dtype=float)
-                if arr.size >= 5:
-                    rng = np.random.default_rng(11)
-                    bs = [float(np.mean(rng.choice(arr, size=arr.size, replace=True))) for _ in range(300)]
-                    lo, hi = np.percentile(bs, [2.5, 97.5])
-                    los.append(float(lo))
-                    his.append(float(hi))
-                else:
-                    los.append(float("nan"))
-                    his.append(float("nan"))
-            ax.plot(fracs, means, marker="o", linewidth=1.8, color=colors[ranker], label=ranker)
-            lo_arr = np.asarray(los)
-            hi_arr = np.asarray(his)
-            m = np.isfinite(lo_arr) & np.isfinite(hi_arr)
-            if m.any():
-                ax.fill_between(np.asarray(fracs)[m], lo_arr[m], hi_arr[m], color=colors[ranker], alpha=0.15)
-        clean_mae_vals = [safe_float(r.get("clean_mae")) for r in rsub if math.isfinite(safe_float(r.get("clean_mae")))]
-        if clean_mae_vals:
-            ax.axhline(float(np.mean(clean_mae_vals)), color="#555555", linestyle="--", linewidth=1, label="clean MAE (keep all)")
-        ax.set_title(f"{region} edges")
-        ax.set_xlabel("fraction of relationships kept (top-k)")
-        ax.set_ylabel("task MAE  |pred - y|")
-        ax.legend(frameon=False, fontsize=8)
-    fig.suptitle(f"Task-MAE retention (sufficiency): keep top-k ranked by carriage vs attention vs random — {model} (lower = better)")
-    figures = ensure_dir(artifact_root / "figures")
-    fig.savefig(figures / "step2_task_mae_retention.png", dpi=dpi)
-    fig.savefig(figures / "step2_task_mae_retention.pdf")
-    plt.close(fig)
-
-
 def render_step2_attention_graph_ablation(rows: Sequence[Mapping[str, Any]], artifact_root: Path, *, dpi: int) -> None:
     clean = [
         r
@@ -3858,71 +3332,6 @@ def render_step2_attention_graph_ablation(rows: Sequence[Mapping[str, Any]], art
     figures = ensure_dir(artifact_root / "figures")
     fig.savefig(figures / "step2_attention_graph_vs_carriage_ablation.png", dpi=dpi)
     fig.savefig(figures / "step2_attention_graph_vs_carriage_ablation.pdf")
-    plt.close(fig)
-
-
-def render_step2_attention_pair_ablation(rows: Sequence[Mapping[str, Any]], artifact_root: Path, *, dpi: int) -> None:
-    clean = [
-        r
-        for r in rows
-        if str(r.get("selector")) in ("attention_mean", "carriage", "random")
-        and math.isfinite(safe_float(r.get("task_mae")))
-        and math.isfinite(safe_float(r.get("fraction_pairs")))
-    ]
-    if not clean:
-        return
-    models = sorted({str(r.get("model")) for r in clean})
-    model = "dense_grit" if "dense_grit" in models else models[0]
-    msub = [r for r in clean if str(r.get("model")) == model]
-    regions = sorted({str(r.get("region")) for r in msub}, reverse=True)  # far, then near
-    colors = {"carriage": "#f58518", "attention_mean": "#4c78a8", "random": "#7f7f7f"}
-    labels = {"carriage": "carriage", "attention_mean": "mean attention", "random": "random"}
-    fig, axes = plt.subplots(1, len(regions), figsize=(6.6 * len(regions), 4.6), constrained_layout=True, squeeze=False)
-    for ax, region in zip(axes[0], regions):
-        rsub = [r for r in msub if str(r.get("region")) == region]
-        for selector in ("attention_mean", "carriage", "random"):
-            pts: dict[float, list[float]] = {}
-            for r in rsub:
-                if str(r.get("selector")) != selector:
-                    continue
-                pts.setdefault(safe_float(r.get("fraction_pairs")), []).append(safe_float(r.get("task_mae")))
-            fracs = sorted(f for f in pts if math.isfinite(f))
-            if not fracs:
-                continue
-            means = [float(np.nanmean(pts[f])) for f in fracs]
-            los: list[float] = []
-            his: list[float] = []
-            for f in fracs:
-                arr = np.asarray([v for v in pts[f] if math.isfinite(v)], dtype=float)
-                if arr.size >= 5:
-                    rng = np.random.default_rng(17)
-                    bs = [float(np.mean(rng.choice(arr, size=arr.size, replace=True))) for _ in range(300)]
-                    lo, hi = np.percentile(bs, [2.5, 97.5])
-                    los.append(float(lo))
-                    his.append(float(hi))
-                else:
-                    los.append(float("nan"))
-                    his.append(float("nan"))
-            ax.plot(fracs, means, marker="o", linewidth=1.8, color=colors[selector], label=labels[selector])
-            lo_arr = np.asarray(los)
-            hi_arr = np.asarray(his)
-            m = np.isfinite(lo_arr) & np.isfinite(hi_arr)
-            if m.any():
-                ax.fill_between(np.asarray(fracs)[m], lo_arr[m], hi_arr[m], color=colors[selector], alpha=0.15)
-        clean_mae_vals = [safe_float(r.get("clean_mae")) for r in rsub if math.isfinite(safe_float(r.get("clean_mae")))]
-        if clean_mae_vals:
-            ax.axhline(float(np.mean(clean_mae_vals)), color="#555555", linestyle="--", linewidth=1, label="clean MAE")
-        ax.set_title(f"{region} pairs")
-        ax.set_xlabel("fraction of pairs selected (sources corrupted)")
-        ax.set_ylabel("task MAE  |pred - y|")
-        ax.legend(frameon=False, fontsize=8)
-    fig.suptitle(
-        f"Top-k pair selection: mean attention vs carriage — input-content ablation vs task MAE "
-        f"({model}; higher = selected pairs more task-critical)"
-    )
-    figures = ensure_dir(artifact_root / "figures")
-    fig.savefig(figures / "step2_attention_pair_vs_carriage_ablation.png", dpi=dpi)
-    fig.savefig(figures / "step2_attention_pair_vs_carriage_ablation.pdf")
     plt.close(fig)
 
 
