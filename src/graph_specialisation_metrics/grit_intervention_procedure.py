@@ -81,6 +81,12 @@ def safe_float(value: Any) -> float:
     return out if math.isfinite(out) else float("nan")
 
 
+def nanmean_or_nan(values: Sequence[Any]) -> float:
+    arr = np.asarray([safe_float(value) for value in values], dtype=float)
+    arr = arr[np.isfinite(arr)]
+    return float(np.mean(arr)) if arr.size else float("nan")
+
+
 def stable_seed(*parts: Any, base: int = 0) -> int:
     payload = "::".join(str(part) for part in parts).encode("utf-8")
     digest = hashlib.sha256(payload).hexdigest()
@@ -1003,6 +1009,53 @@ def attention_profiles(cache: Any, dist: torch.Tensor, model: str) -> tuple[list
     return rows, tensors
 
 
+def attention_graph(cache: Any, *, aggregation: str = "mean") -> Optional[torch.Tensor]:
+    """Attention graph (El, Choudhury, Lio & Joshi, 2025, arXiv:2502.12352): aggregate the
+    per-layer, head-averaged attention of a graph transformer into a single [receiver, source]
+    information-flow matrix over the input nodes.
+
+    Works for any adapter that captures per-layer attention (GRIT dense and masked 1-hop; the 1-hop
+    graph is bond-local by construction, so its far-range entries are ~0). ``aggregation``:
+      * ``mean`` (default) / ``sum`` / ``max`` -- per-edge statistic across layers (robust, no
+        rollout heuristics);
+      * ``rollout`` -- Abnar & Zuidema multi-hop flow: product of row-normalised (0.5*A + 0.5*I)
+        across layers, modelling information propagation through the stack.
+    Returns [N,N] with entry [i,j] = aggregated attention flow from source j to receiver i, or
+    ``None`` if no attention was captured.
+    """
+    layers = list(getattr(cache, "attention", None) or [])
+    if not layers:
+        return None
+    mats: list[torch.Tensor] = []
+    for layer in layers:
+        t = layer.detach().cpu().float()
+        if t.dim() == 3:  # [heads, N, N] -> head-average
+            t = t.mean(dim=0)
+        if t.dim() != 2 or t.size(0) != t.size(1):
+            return None
+        mats.append(t)
+    if any(m.shape != mats[0].shape for m in mats):
+        return None
+    n = int(mats[0].size(0))
+    agg = str(aggregation).lower()
+    if agg in ("mean", "sum", "max"):
+        stack = torch.stack(mats, dim=0)
+        if agg == "mean":
+            return stack.mean(dim=0)
+        if agg == "sum":
+            return stack.sum(dim=0)
+        return stack.amax(dim=0)
+    if agg == "rollout":
+        eye = torch.eye(n)
+        g: Optional[torch.Tensor] = None
+        for a in mats:
+            m = 0.5 * a + 0.5 * eye
+            m = m / m.sum(dim=1, keepdim=True).clamp_min(EPS)
+            g = m if g is None else m @ g
+        return g
+    raise ValueError(f"unknown attention-graph aggregation {aggregation!r}; expected mean/sum/max/rollout")
+
+
 def sparse_attention_layer_weights(cache: Any, layer_idx: int) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
     """Return ``(edge_index, abs_attention_by_edge_head)`` for one layer if available."""
 
@@ -1460,6 +1513,243 @@ def attention_sufficiency_rows(
                         "prediction_kept": kept_pred,
                         "clean_mae": clean_mae,
                         "task_mae": task_mae,
+                    }
+                )
+    return rows
+
+
+def _clone_graph_corrupt_sources(graph: Any, sources: Sequence[int], rng: random.Random) -> Optional[Any]:
+    """Clone ``graph`` with the raw content of every node in ``sources`` swapped for a donor node's
+    (drawn from the non-corrupted set). Topology is untouched, so RRWP recomputes from the same
+    structure -> a pure, routing-agnostic content ablation of those source nodes.
+    """
+    x = getattr(graph, "x", None)
+    if not isinstance(x, torch.Tensor) or not hasattr(graph, "clone"):
+        return None
+    n = int(x.size(0))
+    src_set = {int(s) for s in sources}
+    donor_pool = [k for k in range(n) if k not in src_set] or list(range(n))
+    try:
+        clone = graph.clone()
+    except Exception:
+        return None
+    base = x.detach()
+    new_x = base.clone()
+    for j in src_set:
+        donor = donor_pool[rng.randrange(len(donor_pool))]
+        new_x[j] = base[donor]
+    clone.x = new_x
+    return clone
+
+
+def attention_graph_vs_carriage_ablation_rows(
+    model: ModelRun,
+    graph: Any,
+    graph_id: str,
+    cache: Any,
+    c_ig: torch.Tensor,
+    dist: torch.Tensor,
+    *,
+    tau: int,
+    fractions: Sequence[float],
+    include_near_control: bool,
+    aggregation: str,
+    seed: int,
+) -> list[dict[str, Any]]:
+    """Fair attention-vs-carriage comparison: rank *source nodes* by attention-graph importance vs
+    carriage importance vs random, ablate the top fraction at the INPUT (content corruption), and
+    record task MAE against the true label.
+
+    The ablation modality is content (routing-agnostic), so it is not rigged toward attention the
+    way attention-edge erasure is; the attention side uses the whole-network attention graph (El et
+    al. 2025) rather than one layer, matching carriage's global, all-layers nature. All selectors
+    ablate the SAME number of source nodes at each fraction, so the budget is controlled.
+    """
+    if not hasattr(model.adapter, "forward_minimal") or not isinstance(getattr(graph, "x", None), torch.Tensor):
+        return []
+    graph_attn = attention_graph(cache, aggregation=aggregation)
+    if graph_attn is None:
+        return []
+    n = min(int(graph_attn.size(0)), int(c_ig.size(0)), int(dist.size(0)))
+    if n < 2:
+        return []
+    g_attn = graph_attn[:n, :n].detach().abs().cpu()
+    carr = c_ig[:n, :n].detach().abs().cpu()
+    d = dist[:n, :n].detach().cpu()
+    y = graph_label(graph)
+    if not math.isfinite(y):
+        return []
+    try:
+        clean_pred = float(model.adapter.forward_minimal(graph).prediction.reshape(-1)[0].detach().cpu().item())
+    except Exception:
+        return []
+    clean_mae = abs(clean_pred - y)
+    rng = random.Random(f"{seed}:{graph_id}")
+    rows: list[dict[str, Any]] = []
+    regions = ["far"] + (["near"] if include_near_control else [])
+    for region in regions:
+        if region == "far":
+            region_mask = torch.isfinite(d) & (d > float(tau))
+        else:
+            region_mask = torch.isfinite(d) & (d > 0.0) & (d <= float(tau))
+        region_f = region_mask.float()
+        att_src = (g_attn * region_f).sum(dim=0)  # sum over receivers i -> per-source importance
+        carr_src = (carr * region_f).sum(dim=0)
+        candidates = torch.nonzero(region_mask.any(dim=0), as_tuple=False).flatten().tolist()
+        if len(candidates) < 2:
+            continue
+        rankings = {
+            "attention_graph": sorted(candidates, key=lambda j: float(att_src[int(j)]), reverse=True),
+            "carriage": sorted(candidates, key=lambda j: float(carr_src[int(j)]), reverse=True),
+        }
+        random_order = list(candidates)
+        rng.shuffle(random_order)
+        rankings["random"] = random_order
+        for fraction in fractions:
+            k = int(round(max(0.0, min(1.0, float(fraction))) * len(candidates)))
+            for selector, order in rankings.items():
+                if k <= 0:
+                    ablated_pred = clean_pred
+                    task_mae = clean_mae
+                    n_src = 0
+                else:
+                    corrupted = _clone_graph_corrupt_sources(graph, order[:k], rng)
+                    if corrupted is None:
+                        continue
+                    try:
+                        ablated_pred = float(model.adapter.forward_minimal(corrupted).prediction.reshape(-1)[0].detach().cpu().item())
+                    except Exception:
+                        continue
+                    task_mae = abs(ablated_pred - y)
+                    n_src = int(k)
+                rows.append(
+                    {
+                        "model": model.name,
+                        "graph_id": graph_id,
+                        "region": region,
+                        "selector": selector,
+                        "aggregation": aggregation,
+                        "fraction_ablated": float(fraction),
+                        "sources_ablated": n_src,
+                        "candidate_sources": len(candidates),
+                        "prediction_clean": clean_pred,
+                        "prediction_ablated": ablated_pred,
+                        "clean_mae": clean_mae,
+                        "task_mae": task_mae,
+                        "delta_mae": task_mae - clean_mae,
+                    }
+                )
+    return rows
+
+
+def attention_pair_vs_carriage_ablation_rows(
+    model: ModelRun,
+    graph: Any,
+    graph_id: str,
+    cache: Any,
+    c_ig: torch.Tensor,
+    dist: torch.Tensor,
+    *,
+    tau: int,
+    fractions: Sequence[float],
+    include_near_control: bool,
+    seed: int,
+) -> list[dict[str, Any]]:
+    """Pair-level fair comparison: rank source->carrier PAIRS by a plain **mean attention** value
+    (averaged over all heads and layers) vs |carriage|, take the top fraction of pairs, ablate the
+    source nodes they implicate at the INPUT (content corruption), and record task MAE vs the true
+    label. This is the simpler sibling of the attention-graph ablation -- it selects pairs directly
+    with a mean-attention value rather than the attention-graph construction.
+
+    Note: ablation is per-source, so different selectors' top-k pairs can implicate different numbers
+    of source nodes; ``sources_ablated`` is recorded per point so the budget can be inspected.
+    """
+    if not hasattr(model.adapter, "forward_minimal") or not isinstance(getattr(graph, "x", None), torch.Tensor):
+        return []
+    layers = list(getattr(cache, "attention", None) or [])
+    if not layers:
+        return []
+    mats: list[torch.Tensor] = []
+    for layer in layers:
+        t = layer.detach().cpu().float()
+        if t.dim() == 3:
+            t = t.mean(dim=0)
+        if t.dim() != 2 or t.size(0) != t.size(1):
+            return []
+        mats.append(t)
+    if any(m.shape != mats[0].shape for m in mats):
+        return []
+    mean_attn = torch.stack(mats, dim=0).mean(dim=0).abs()  # [N,N] plain mean attention per pair
+    n = min(int(mean_attn.size(0)), int(c_ig.size(0)), int(dist.size(0)))
+    if n < 2:
+        return []
+    a = mean_attn[:n, :n]
+    carr = c_ig[:n, :n].detach().abs().cpu()
+    d = dist[:n, :n].detach().cpu()
+    y = graph_label(graph)
+    if not math.isfinite(y):
+        return []
+    try:
+        clean_pred = float(model.adapter.forward_minimal(graph).prediction.reshape(-1)[0].detach().cpu().item())
+    except Exception:
+        return []
+    clean_mae = abs(clean_pred - y)
+    rng = random.Random(f"{seed}:pair:{graph_id}")
+    rows: list[dict[str, Any]] = []
+    regions = ["far"] + (["near"] if include_near_control else [])
+    for region in regions:
+        if region == "far":
+            region_mask = torch.isfinite(d) & (d > float(tau))
+        else:
+            region_mask = torch.isfinite(d) & (d > 0.0) & (d <= float(tau))
+        idx = torch.nonzero(region_mask, as_tuple=False)
+        if int(idx.size(0)) < 2:
+            continue
+        pairs = [(int(r[0].item()), int(r[1].item())) for r in idx]
+        att_scores = [float(a[i, j].item()) for (i, j) in pairs]
+        carr_scores = [float(carr[i, j].item()) for (i, j) in pairs]
+        order_att = sorted(range(len(pairs)), key=lambda p: att_scores[p], reverse=True)
+        order_carr = sorted(range(len(pairs)), key=lambda p: carr_scores[p], reverse=True)
+        order_rand = list(range(len(pairs)))
+        rng.shuffle(order_rand)
+        rankings = {"attention_mean": order_att, "carriage": order_carr, "random": order_rand}
+        total = len(pairs)
+        for fraction in fractions:
+            k = int(round(max(0.0, min(1.0, float(fraction))) * total))
+            for selector, order in rankings.items():
+                if k <= 0:
+                    ablated_pred = clean_pred
+                    task_mae = clean_mae
+                    n_src = 0
+                    n_pairs = 0
+                else:
+                    selected_pairs = [pairs[p] for p in order[:k]]
+                    sources = {j for (_, j) in selected_pairs}
+                    corrupted = _clone_graph_corrupt_sources(graph, sources, rng)
+                    if corrupted is None:
+                        continue
+                    try:
+                        ablated_pred = float(model.adapter.forward_minimal(corrupted).prediction.reshape(-1)[0].detach().cpu().item())
+                    except Exception:
+                        continue
+                    task_mae = abs(ablated_pred - y)
+                    n_src = len(sources)
+                    n_pairs = len(selected_pairs)
+                rows.append(
+                    {
+                        "model": model.name,
+                        "graph_id": graph_id,
+                        "region": region,
+                        "selector": selector,
+                        "fraction_pairs": float(fraction),
+                        "pairs_selected": n_pairs,
+                        "sources_ablated": n_src,
+                        "candidate_pairs": total,
+                        "prediction_clean": clean_pred,
+                        "prediction_ablated": ablated_pred,
+                        "clean_mae": clean_mae,
+                        "task_mae": task_mae,
+                        "delta_mae": task_mae - clean_mae,
                     }
                 )
     return rows
@@ -2567,6 +2857,13 @@ def run_step2(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
     swap_correlation_sample_graphs = int(cfg.get("swap_correlation_sample_graphs", 32))
     run_task_mae_retention = bool(cfg.get("run_task_mae_retention", True))
     task_mae_retention_fractions = [float(v) for v in cfg.get("task_mae_retention_fractions", [0.0, 0.05, 0.10, 0.25, 0.50, 0.75, 1.0])]
+    run_attention_graph_ablation = bool(cfg.get("run_attention_graph_ablation", True))
+    attention_graph_aggregation = str(cfg.get("attention_graph_aggregation", "mean"))
+    attention_graph_ablation_models = {str(name) for name in cfg.get("attention_graph_ablation_models", cfg.get("erasure_models", ["dense_grit"]))}
+    attention_graph_ablation_sample_graphs = int(cfg.get("attention_graph_ablation_sample_graphs", 16))
+    attention_graph_ablation_fractions = [float(v) for v in cfg.get("attention_graph_ablation_fractions", [0.0, 0.1, 0.2, 0.3, 0.5])]
+    run_attention_pair_ablation = bool(cfg.get("run_attention_pair_ablation", True))
+    attention_pair_ablation_fractions = [float(v) for v in cfg.get("attention_pair_ablation_fractions", [0.0, 0.02, 0.05, 0.1, 0.2, 0.4])]
     tau = int(config.get("primary_tau", 3))
     seed = int(config.get("seeds", [0])[0])
     dpi = int(config["figures"]["dpi"])
@@ -2577,6 +2874,8 @@ def run_step2(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
     erasure_rows: list[dict[str, Any]] = []
     swap_corr_rows: list[dict[str, Any]] = []
     sufficiency_rows: list[dict[str, Any]] = []
+    ag_ablation_rows: list[dict[str, Any]] = []
+    ag_pair_rows: list[dict[str, Any]] = []
     support_rows: list[dict[str, Any]] = []
     mean_distance_rows: list[dict[str, Any]] = []
     tensors: dict[str, Any] = {}
@@ -2707,6 +3006,53 @@ def run_step2(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
                     )
                 except Exception as exc:
                     progress(f"  {model.name} graph {graph_idx}: task-MAE retention failed ({exc})")
+            if (
+                run_attention_graph_ablation
+                and model.name in attention_graph_ablation_models
+                and graph_idx < max(0, attention_graph_ablation_sample_graphs)
+                and cache.attention
+            ):
+                try:
+                    ag_ablation_rows.extend(
+                        attention_graph_vs_carriage_ablation_rows(
+                            model,
+                            graph,
+                            gid,
+                            cache,
+                            c_ig,
+                            dist,
+                            tau=tau,
+                            fractions=attention_graph_ablation_fractions,
+                            include_near_control=erasure_include_near_control,
+                            aggregation=attention_graph_aggregation,
+                            seed=seed + 5501 * graph_idx,
+                        )
+                    )
+                except Exception as exc:
+                    progress(f"  {model.name} graph {graph_idx}: attention-graph ablation failed ({exc})")
+            if (
+                run_attention_pair_ablation
+                and model.name in attention_graph_ablation_models
+                and graph_idx < max(0, attention_graph_ablation_sample_graphs)
+                and cache.attention
+            ):
+                try:
+                    ag_pair_rows.extend(
+                        attention_pair_vs_carriage_ablation_rows(
+                            model,
+                            graph,
+                            gid,
+                            cache,
+                            c_ig,
+                            dist,
+                            tau=tau,
+                            fractions=attention_pair_ablation_fractions,
+                            include_near_control=erasure_include_near_control,
+                            seed=seed + 6607 * graph_idx,
+                        )
+                    )
+                except Exception as exc:
+                    progress(f"  {model.name} graph {graph_idx}: attention-pair ablation failed ({exc})")
             if run_layer_channel_split:
                 channel_rows.extend(layer_channel_split_rows(model, graph, result, dist, gid, tau))
             if (
@@ -2805,9 +3151,13 @@ def run_step2(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
     swap_corr_summary = swap_correlation_summary(swap_corr_rows)
     write_csv(artifact_root / "metrics" / "step2_swap_correlation_summary.csv", swap_corr_summary)
     write_csv(artifact_root / "metrics" / "step2_task_mae_retention.csv", sufficiency_rows)
+    write_csv(artifact_root / "metrics" / "step2_attention_graph_vs_carriage_ablation.csv", ag_ablation_rows)
+    write_csv(artifact_root / "metrics" / "step2_attention_pair_vs_carriage_ablation.csv", ag_pair_rows)
     render_step2_swap_correlation(swap_corr_summary, artifact_root, dpi=dpi)
     render_step2_swap_correlation_scatter(swap_corr_rows, artifact_root, dpi=dpi)
     render_step2_task_mae_retention(sufficiency_rows, artifact_root, dpi=dpi)
+    render_step2_attention_graph_ablation(ag_ablation_rows, artifact_root, dpi=dpi)
+    render_step2_attention_pair_ablation(ag_pair_rows, artifact_root, dpi=dpi)
     progress("Step 2 complete: metrics, tensors, and figures written")
     return {
         "status": "complete" if not support_failures else "complete_with_attention_support_violations",
@@ -2818,6 +3168,8 @@ def run_step2(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
         "attention_erasure_rows": len(erasure_rows),
         "swap_correlation_pairs": len(swap_corr_rows),
         "task_mae_retention_rows": len(sufficiency_rows),
+        "attention_graph_ablation_rows": len(ag_ablation_rows),
+        "attention_pair_ablation_rows": len(ag_pair_rows),
         "support_audit_rows": len(support_rows),
         "head_resolved_rows": len(head_rows),
         "attention_mean_distance_rows": len(mean_distance_rows),
@@ -3440,6 +3792,137 @@ def render_step2_task_mae_retention(rows: Sequence[Mapping[str, Any]], artifact_
     figures = ensure_dir(artifact_root / "figures")
     fig.savefig(figures / "step2_task_mae_retention.png", dpi=dpi)
     fig.savefig(figures / "step2_task_mae_retention.pdf")
+    plt.close(fig)
+
+
+def render_step2_attention_graph_ablation(rows: Sequence[Mapping[str, Any]], artifact_root: Path, *, dpi: int) -> None:
+    clean = [
+        r
+        for r in rows
+        if str(r.get("selector")) in ("attention_graph", "carriage", "random")
+        and math.isfinite(safe_float(r.get("task_mae")))
+        and math.isfinite(safe_float(r.get("fraction_ablated")))
+    ]
+    if not clean:
+        return
+    models = sorted({str(r.get("model")) for r in clean})
+    model = "dense_grit" if "dense_grit" in models else models[0]
+    msub = [r for r in clean if str(r.get("model")) == model]
+    regions = sorted({str(r.get("region")) for r in msub}, reverse=True)  # far, then near
+    aggregation = str(msub[0].get("aggregation", "mean")) if msub else "mean"
+    colors = {"carriage": "#f58518", "attention_graph": "#4c78a8", "random": "#7f7f7f"}
+    labels = {"carriage": "carriage", "attention_graph": "attention graph", "random": "random"}
+    fig, axes = plt.subplots(1, len(regions), figsize=(6.6 * len(regions), 4.6), constrained_layout=True, squeeze=False)
+    for ax, region in zip(axes[0], regions):
+        rsub = [r for r in msub if str(r.get("region")) == region]
+        for selector in ("attention_graph", "carriage", "random"):
+            pts: dict[float, list[float]] = {}
+            for r in rsub:
+                if str(r.get("selector")) != selector:
+                    continue
+                pts.setdefault(safe_float(r.get("fraction_ablated")), []).append(safe_float(r.get("task_mae")))
+            fracs = sorted(f for f in pts if math.isfinite(f))
+            if not fracs:
+                continue
+            means = [float(np.nanmean(pts[f])) for f in fracs]
+            los: list[float] = []
+            his: list[float] = []
+            for f in fracs:
+                arr = np.asarray([v for v in pts[f] if math.isfinite(v)], dtype=float)
+                if arr.size >= 5:
+                    rng = np.random.default_rng(13)
+                    bs = [float(np.mean(rng.choice(arr, size=arr.size, replace=True))) for _ in range(300)]
+                    lo, hi = np.percentile(bs, [2.5, 97.5])
+                    los.append(float(lo))
+                    his.append(float(hi))
+                else:
+                    los.append(float("nan"))
+                    his.append(float("nan"))
+            ax.plot(fracs, means, marker="o", linewidth=1.8, color=colors[selector], label=labels[selector])
+            lo_arr = np.asarray(los)
+            hi_arr = np.asarray(his)
+            m = np.isfinite(lo_arr) & np.isfinite(hi_arr)
+            if m.any():
+                ax.fill_between(np.asarray(fracs)[m], lo_arr[m], hi_arr[m], color=colors[selector], alpha=0.15)
+        clean_mae_vals = [safe_float(r.get("clean_mae")) for r in rsub if math.isfinite(safe_float(r.get("clean_mae")))]
+        if clean_mae_vals:
+            ax.axhline(float(np.mean(clean_mae_vals)), color="#555555", linestyle="--", linewidth=1, label="clean MAE")
+        ax.set_title(f"{region} sources")
+        ax.set_xlabel("fraction of source nodes corrupted")
+        ax.set_ylabel("task MAE  |pred - y|")
+        ax.legend(frameon=False, fontsize=8)
+    fig.suptitle(
+        f"Attention-graph vs carriage selection — input-content ablation vs task MAE "
+        f"({model}, agg={aggregation}; higher = selected content more task-critical)"
+    )
+    figures = ensure_dir(artifact_root / "figures")
+    fig.savefig(figures / "step2_attention_graph_vs_carriage_ablation.png", dpi=dpi)
+    fig.savefig(figures / "step2_attention_graph_vs_carriage_ablation.pdf")
+    plt.close(fig)
+
+
+def render_step2_attention_pair_ablation(rows: Sequence[Mapping[str, Any]], artifact_root: Path, *, dpi: int) -> None:
+    clean = [
+        r
+        for r in rows
+        if str(r.get("selector")) in ("attention_mean", "carriage", "random")
+        and math.isfinite(safe_float(r.get("task_mae")))
+        and math.isfinite(safe_float(r.get("fraction_pairs")))
+    ]
+    if not clean:
+        return
+    models = sorted({str(r.get("model")) for r in clean})
+    model = "dense_grit" if "dense_grit" in models else models[0]
+    msub = [r for r in clean if str(r.get("model")) == model]
+    regions = sorted({str(r.get("region")) for r in msub}, reverse=True)  # far, then near
+    colors = {"carriage": "#f58518", "attention_mean": "#4c78a8", "random": "#7f7f7f"}
+    labels = {"carriage": "carriage", "attention_mean": "mean attention", "random": "random"}
+    fig, axes = plt.subplots(1, len(regions), figsize=(6.6 * len(regions), 4.6), constrained_layout=True, squeeze=False)
+    for ax, region in zip(axes[0], regions):
+        rsub = [r for r in msub if str(r.get("region")) == region]
+        for selector in ("attention_mean", "carriage", "random"):
+            pts: dict[float, list[float]] = {}
+            for r in rsub:
+                if str(r.get("selector")) != selector:
+                    continue
+                pts.setdefault(safe_float(r.get("fraction_pairs")), []).append(safe_float(r.get("task_mae")))
+            fracs = sorted(f for f in pts if math.isfinite(f))
+            if not fracs:
+                continue
+            means = [float(np.nanmean(pts[f])) for f in fracs]
+            los: list[float] = []
+            his: list[float] = []
+            for f in fracs:
+                arr = np.asarray([v for v in pts[f] if math.isfinite(v)], dtype=float)
+                if arr.size >= 5:
+                    rng = np.random.default_rng(17)
+                    bs = [float(np.mean(rng.choice(arr, size=arr.size, replace=True))) for _ in range(300)]
+                    lo, hi = np.percentile(bs, [2.5, 97.5])
+                    los.append(float(lo))
+                    his.append(float(hi))
+                else:
+                    los.append(float("nan"))
+                    his.append(float("nan"))
+            ax.plot(fracs, means, marker="o", linewidth=1.8, color=colors[selector], label=labels[selector])
+            lo_arr = np.asarray(los)
+            hi_arr = np.asarray(his)
+            m = np.isfinite(lo_arr) & np.isfinite(hi_arr)
+            if m.any():
+                ax.fill_between(np.asarray(fracs)[m], lo_arr[m], hi_arr[m], color=colors[selector], alpha=0.15)
+        clean_mae_vals = [safe_float(r.get("clean_mae")) for r in rsub if math.isfinite(safe_float(r.get("clean_mae")))]
+        if clean_mae_vals:
+            ax.axhline(float(np.mean(clean_mae_vals)), color="#555555", linestyle="--", linewidth=1, label="clean MAE")
+        ax.set_title(f"{region} pairs")
+        ax.set_xlabel("fraction of pairs selected (sources corrupted)")
+        ax.set_ylabel("task MAE  |pred - y|")
+        ax.legend(frameon=False, fontsize=8)
+    fig.suptitle(
+        f"Top-k pair selection: mean attention vs carriage — input-content ablation vs task MAE "
+        f"({model}; higher = selected pairs more task-critical)"
+    )
+    figures = ensure_dir(artifact_root / "figures")
+    fig.savefig(figures / "step2_attention_pair_vs_carriage_ablation.png", dpi=dpi)
+    fig.savefig(figures / "step2_attention_pair_vs_carriage_ablation.pdf")
     plt.close(fig)
 
 
@@ -5691,12 +6174,19 @@ def run_step5(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
     total_carriage_ablation_rows: list[dict[str, Any]] = []
     component_carriage_ablation_rows: list[dict[str, Any]] = []
     distance_binned_ablation_rows: list[dict[str, Any]] = []
+    dense_control_excess_ablation_rows: list[dict[str, Any]] = []
+    graph_carriage_records: dict[tuple[str, str], dict[str, Any]] = {}
     worked_example: Optional[dict[str, Any]] = None
     worked_example_score = 0.0
     rng = random.Random(seed)
     load_bearing_fractions = ablation_fractions(cfg.get("load_bearing_ablation_fractions"))
     load_bearing_random_draws = int(cfg.get("load_bearing_random_draws", 8))
     distance_bins = distance_ablation_bins(cfg.get("distance_binned_ablation_bins"))
+    dense_control_model = str(cfg.get("dense_excess_control_model", "grit_1hop"))
+    dense_excess_bins = far_only_distance_bins(
+        distance_ablation_bins(cfg.get("dense_excess_distance_bins", cfg.get("distance_binned_ablation_bins"))),
+        tau=tau,
+    )
     onehop_floor = (
         empirical_onehop_noise_floor(
             analysis_models,
@@ -5728,6 +6218,10 @@ def run_step5(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
     progress(
         "Step 5 distance-binned ablation bins="
         f"{', '.join(str(b.get('label')) for b in distance_bins)}"
+    )
+    progress(
+        "Step 5 dense-minus-control distance ablation: "
+        f"control={dense_control_model}, bins={', '.join(str(b.get('label')) for b in dense_excess_bins)}"
     )
     for model in analysis_models:
         graphs = select_graphs(model.adapter, "test", sample_graphs, seed=seed)
@@ -5922,6 +6416,14 @@ def run_step5(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
                 dist=dist,
                 bins=distance_bins,
             )
+            graph_carriage_records[(model.name, gid)] = {
+                "model": model.name,
+                "graph_id": gid,
+                "prediction": float(model_pred),
+                "target": float(y),
+                "carriage": c.detach().cpu().clone(),
+                "dist": dist.detach().cpu().clone(),
+            }
             if model.name == dense.name:
                 graph_stats = graph_distance_summary(dist)
                 r_nc = safe_float(r_nc_by_tau[int(tau)].get("r_nc"))
@@ -6092,6 +6594,14 @@ def run_step5(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
     write_csv(artifact_root / "metrics" / "step5_total_carriage_ablation.csv", total_carriage_ablation_rows)
     write_csv(artifact_root / "metrics" / "step5_component_carriage_ablation.csv", component_carriage_ablation_rows)
     write_csv(artifact_root / "metrics" / "step5_distance_binned_total_carriage_ablation.csv", distance_binned_ablation_rows)
+    append_dense_control_excess_distance_ablation_rows(
+        dense_control_excess_ablation_rows,
+        records=graph_carriage_records,
+        dense_model=dense.name,
+        control_model=dense_control_model,
+        bins=dense_excess_bins,
+    )
+    write_csv(artifact_root / "metrics" / "step5_dense_minus_control_distance_ablation.csv", dense_control_excess_ablation_rows)
     total_carriage_ablation_summary = carriage_ablation_summary_rows(
         total_carriage_ablation_rows,
         extra_keys=["ranker", "component"],
@@ -6106,9 +6616,17 @@ def run_step5(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
         distance_binned_ablation_rows,
         seed=9500,
     )
+    dense_control_excess_ablation_summary = dense_control_excess_distance_ablation_summary_rows(
+        dense_control_excess_ablation_rows,
+        seed=9700,
+    )
     write_csv(artifact_root / "metrics" / "step5_total_carriage_ablation_summary.csv", total_carriage_ablation_summary)
     write_csv(artifact_root / "metrics" / "step5_component_carriage_ablation_summary.csv", component_carriage_ablation_summary)
     write_csv(artifact_root / "metrics" / "step5_distance_binned_total_carriage_ablation_summary.csv", distance_binned_ablation_summary)
+    write_csv(
+        artifact_root / "metrics" / "step5_dense_minus_control_distance_ablation_summary.csv",
+        dense_control_excess_ablation_summary,
+    )
     write_json(artifact_root / "metrics" / "step5_gap_regression.json", gap_regression_summary(gap_rows))
     ablation = self_ablation_summary(gap_rows)
     write_json(artifact_root / "metrics" / "step5_self_ablation.json", ablation)
@@ -6121,6 +6639,11 @@ def run_step5(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
     )
     render_step5_distance_binned_total_carriage_ablation(
         distance_binned_ablation_summary,
+        artifact_root,
+        dpi=dpi,
+    )
+    render_step5_dense_control_excess_distance_ablation(
+        dense_control_excess_ablation_summary,
         artifact_root,
         dpi=dpi,
     )
@@ -6192,6 +6715,8 @@ def run_step5(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
         "total_carriage_ablation_rows": len(total_carriage_ablation_rows),
         "component_carriage_ablation_rows": len(component_carriage_ablation_rows),
         "distance_binned_ablation_rows": len(distance_binned_ablation_rows),
+        "dense_control_excess_ablation_rows": len(dense_control_excess_ablation_rows),
+        "dense_control_excess_control_model": dense_control_model,
         "signal_gate_enabled": use_signal_gate,
         "signal_gate_quantile": gate_quantile,
         "onehop_empirical_floor": onehop_floor,
@@ -6431,6 +6956,25 @@ def distance_ablation_bins(values: Any = None) -> list[dict[str, Any]]:
     return out or distance_ablation_bins(None)
 
 
+def far_only_distance_bins(bins: Sequence[Mapping[str, Any]], *, tau: int) -> list[dict[str, Any]]:
+    """Keep only distance bins that sit strictly beyond the dissertation far threshold."""
+
+    out: list[dict[str, Any]] = []
+    threshold = int(tau)
+    for spec in bins:
+        low = int(spec.get("min", 0))
+        high_raw = spec.get("max")
+        high = None if high_raw in (None, "", "none", "None") else int(high_raw)
+        if high is not None and high <= threshold:
+            continue
+        clipped_low = max(low, threshold + 1)
+        label = str(spec.get("label") or (f"d>{clipped_low - 1}" if high is None else f"d={clipped_low}-{high}"))
+        if clipped_low != low:
+            label = f"d>{threshold}" if high is None else f"d={clipped_low}-{high}"
+        out.append({"label": label, "min": clipped_low, "max": high})
+    return out or [{"label": f"d>{threshold}", "min": threshold + 1, "max": None}]
+
+
 def top_fraction_count(total: int, fraction: float) -> int:
     total = max(0, int(total))
     f = min(1.0, max(0.0, float(fraction)))
@@ -6612,6 +7156,97 @@ def append_distance_binned_total_carriage_ablation_rows(
         )
 
 
+def append_dense_control_excess_distance_ablation_rows(
+    rows: list[dict[str, Any]],
+    *,
+    records: Mapping[tuple[str, str], Mapping[str, Any]],
+    dense_model: str,
+    control_model: str,
+    bins: Sequence[Mapping[str, Any]],
+) -> None:
+    """Remove dense-specific excess carriage over a matched 1-hop control by distance bin.
+
+    This is the distance-localised version of the performance-gap question.  It does not ask
+    whether dense uses long-range carriage in isolation; it asks whether the part of dense's
+    carriage that is absent from the matched 1-hop solution improves dense's own test error.
+    """
+
+    dense_ids = {gid for model, gid in records if model == dense_model}
+    control_ids = {gid for model, gid in records if model == control_model}
+    for gid in sorted(dense_ids.intersection(control_ids)):
+        dense_record = records.get((dense_model, gid))
+        control_record = records.get((control_model, gid))
+        if dense_record is None or control_record is None:
+            continue
+        dense_c = dense_record.get("carriage")
+        control_c = control_record.get("carriage")
+        dist = dense_record.get("dist")
+        if not isinstance(dense_c, torch.Tensor) or not isinstance(control_c, torch.Tensor) or not isinstance(dist, torch.Tensor):
+            continue
+        if tuple(dense_c.shape) != tuple(control_c.shape):
+            continue
+        prediction = safe_float(dense_record.get("prediction"))
+        target = safe_float(dense_record.get("target"))
+        if not (math.isfinite(prediction) and math.isfinite(target)):
+            continue
+        dense_c = dense_c.detach().cpu()
+        control_c = control_c.detach().cpu()
+        dist = dist.detach().cpu()
+        excess = dense_c - control_c
+        finite = torch.isfinite(dist) & torch.isfinite(excess)
+        base_error = abs(prediction - target)
+        for bin_index, spec in enumerate(bins):
+            low = int(spec.get("min", 0))
+            high_raw = spec.get("max")
+            high = None if high_raw in (None, "", "none", "None") else int(high_raw)
+            label = str(spec.get("label") or (f"d>{low - 1}" if high is None else f"d={low}-{high}"))
+            mask = finite & (dist >= low)
+            if high is not None:
+                mask = mask & (dist <= high)
+            pair_count = int(mask.sum().item())
+            if pair_count:
+                dense_values = dense_c[mask].reshape(-1).detach().cpu().numpy().astype(float)
+                control_values = control_c[mask].reshape(-1).detach().cpu().numpy().astype(float)
+                excess_values = excess[mask].reshape(-1).detach().cpu().numpy().astype(float)
+                signed_dense = float(np.sum(dense_values))
+                signed_control = float(np.sum(control_values))
+                signed_excess = float(np.sum(excess_values))
+                abs_excess = float(np.sum(np.abs(excess_values)))
+                mean_abs_excess_pair = float(np.mean(np.abs(excess_values)))
+            else:
+                signed_dense = 0.0
+                signed_control = 0.0
+                signed_excess = 0.0
+                abs_excess = 0.0
+                mean_abs_excess_pair = float("nan")
+            ablated_prediction = prediction - signed_excess
+            ablated_error = abs(ablated_prediction - target)
+            rows.append(
+                {
+                    "dense_model": dense_model,
+                    "control_model": control_model,
+                    "graph_id": gid,
+                    "distance_bin": label,
+                    "distance_bin_index": int(bin_index),
+                    "distance_min": low,
+                    "distance_max": "" if high is None else high,
+                    "pair_count": pair_count,
+                    "dense_prediction": prediction,
+                    "target": target,
+                    "dense_error": base_error,
+                    "ablated_prediction": ablated_prediction,
+                    "ablated_error": ablated_error,
+                    "delta_mae": ablated_error - base_error,
+                    "signed_dense_carriage": signed_dense,
+                    "signed_control_carriage": signed_control,
+                    "signed_dense_minus_control_carriage": signed_excess,
+                    "abs_dense_minus_control_carriage": abs_excess,
+                    "mean_abs_dense_minus_control_carriage_per_pair": mean_abs_excess_pair,
+                    "ablation_type": "ig_completeness_dense_minus_control_distance_binned_carriage",
+                }
+            )
+
+
 def append_component_carriage_ablation_rows(
     rows: list[dict[str, Any]],
     *,
@@ -6772,6 +7407,62 @@ def distance_binned_carriage_ablation_summary_rows(
     return out
 
 
+def dense_control_excess_distance_ablation_summary_rows(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    seed: int = 9700,
+) -> list[dict[str, Any]]:
+    clean = [
+        r
+        for r in rows
+        if math.isfinite(safe_float(r.get("delta_mae")))
+        and math.isfinite(safe_float(r.get("distance_bin_index")))
+    ]
+    if not clean:
+        return []
+    grouped: dict[tuple[int, str], list[Mapping[str, Any]]] = {}
+    for row in clean:
+        grouped.setdefault(
+            (int(safe_float(row.get("distance_bin_index"))), str(row.get("distance_bin"))),
+            [],
+        ).append(row)
+    out: list[dict[str, Any]] = []
+    for idx, ((bin_index, label), group_rows) in enumerate(sorted(grouped.items(), key=lambda item: item[0][0])):
+        deltas = [safe_float(r.get("delta_mae")) for r in group_rows]
+        deltas = [v for v in deltas if math.isfinite(v)]
+        if not deltas:
+            continue
+        mean_delta, lo, hi = bootstrap_ci(deltas, seed=seed + idx, draws=1000)
+        out.append(
+            {
+                "dense_model": str(group_rows[0].get("dense_model", "dense_grit")),
+                "control_model": str(group_rows[0].get("control_model", "grit_1hop")),
+                "distance_bin_index": bin_index,
+                "distance_bin": label,
+                "distance_min": group_rows[0].get("distance_min"),
+                "distance_max": group_rows[0].get("distance_max"),
+                "mean_delta_mae": mean_delta,
+                "ci_low": lo,
+                "ci_high": hi,
+                "n_molecules": len(deltas),
+                "mean_pair_count": nanmean_or_nan([r.get("pair_count") for r in group_rows]),
+                "mean_signed_dense_carriage": nanmean_or_nan([r.get("signed_dense_carriage") for r in group_rows]),
+                "mean_signed_control_carriage": nanmean_or_nan([r.get("signed_control_carriage") for r in group_rows]),
+                "mean_signed_dense_minus_control_carriage": nanmean_or_nan(
+                    [r.get("signed_dense_minus_control_carriage") for r in group_rows]
+                ),
+                "mean_abs_dense_minus_control_carriage": nanmean_or_nan(
+                    [r.get("abs_dense_minus_control_carriage") for r in group_rows]
+                ),
+                "mean_abs_dense_minus_control_carriage_per_pair": nanmean_or_nan(
+                    [r.get("mean_abs_dense_minus_control_carriage_per_pair") for r in group_rows]
+                ),
+                "mean_dense_error": nanmean_or_nan([r.get("dense_error") for r in group_rows]),
+            }
+        )
+    return out
+
+
 def self_ablation_summary(gap_rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     """Causal self-ablation: does removing dense's non-composable far carriage hurt test error?
 
@@ -6918,6 +7609,68 @@ def render_step5_self_ablation(summary: Mapping[str, Any], gap_rows: Sequence[Ma
         plt.close(fig)
 
 
+def _model_is_grit_family(model: str) -> bool:
+    text = str(model).lower()
+    return "grit" in text
+
+
+def _apply_grit_focused_ylim(
+    ax: Any,
+    *,
+    focus_values: Sequence[float],
+    all_values: Sequence[float],
+    positive_floor_zero: bool = False,
+    pad_fraction: float = 0.14,
+) -> None:
+    """Keep plot scale readable for GRIT-family comparisons while allowing GIN to clip."""
+
+    focus = np.asarray([safe_float(v) for v in focus_values], dtype=float)
+    focus = focus[np.isfinite(focus)]
+    all_arr = np.asarray([safe_float(v) for v in all_values], dtype=float)
+    all_arr = all_arr[np.isfinite(all_arr)]
+    if focus.size == 0:
+        return
+    lo = float(np.nanmin(focus))
+    hi = float(np.nanmax(focus))
+    if positive_floor_zero:
+        lo = min(0.0, lo)
+    else:
+        lo = min(0.0, lo)
+        hi = max(0.0, hi)
+    span = max(hi - lo, abs(hi), abs(lo), 1.0e-6)
+    lo_plot = lo - pad_fraction * span
+    hi_plot = hi + pad_fraction * span
+    if positive_floor_zero:
+        lo_plot = min(0.0, lo_plot)
+    if not (math.isfinite(lo_plot) and math.isfinite(hi_plot) and hi_plot > lo_plot):
+        return
+    ax.set_ylim(lo_plot, hi_plot)
+    clipped_high = bool(all_arr.size and np.nanmax(all_arr) > hi_plot)
+    clipped_low = bool(all_arr.size and np.nanmin(all_arr) < lo_plot)
+    if clipped_high:
+        ax.text(
+            0.985,
+            0.965,
+            "non-GRIT clipped above axis",
+            transform=ax.transAxes,
+            ha="right",
+            va="top",
+            fontsize=8,
+            color="#555555",
+        )
+    if clipped_low:
+        ax.text(
+            0.985,
+            0.035,
+            "non-GRIT clipped below axis",
+            transform=ax.transAxes,
+            ha="right",
+            va="bottom",
+            fontsize=8,
+            color="#555555",
+        )
+
+
 def render_step5_load_bearing_carriage_ablation(
     total_summary: Sequence[Mapping[str, Any]],
     component_summary: Sequence[Mapping[str, Any]],
@@ -6944,6 +7697,8 @@ def render_step5_load_bearing_carriage_ablation(
         "gcn": "#72b7b2",
     }
     ranker_labels = {"carriage": "carriage-ranked", "random_far_pairs": "random far pairs"}
+    panel_a_all_values: list[float] = []
+    panel_a_focus_values: list[float] = []
     for model in present_models:
         for ranker, linestyle in [("carriage", "-"), ("random_far_pairs", "--")]:
             rows = [
@@ -6964,6 +7719,13 @@ def render_step5_load_bearing_carriage_ablation(
             label = f"{model} {ranker_labels.get(ranker, ranker)}"
             color = palette.get(model)
             ax.plot(x[mask], y[mask], marker="o", linewidth=2.0 if ranker == "carriage" else 1.4, linestyle=linestyle, color=color, label=label)
+            panel_a_all_values.extend([float(v) for v in y[mask] if math.isfinite(float(v))])
+            panel_a_all_values.extend([float(v) for v in lo[mask] if math.isfinite(float(v))])
+            panel_a_all_values.extend([float(v) for v in hi[mask] if math.isfinite(float(v))])
+            if _model_is_grit_family(model):
+                panel_a_focus_values.extend([float(v) for v in y[mask] if math.isfinite(float(v))])
+                panel_a_focus_values.extend([float(v) for v in lo[mask] if math.isfinite(float(v))])
+                panel_a_focus_values.extend([float(v) for v in hi[mask] if math.isfinite(float(v))])
             ci_mask = mask & np.isfinite(lo) & np.isfinite(hi)
             if ci_mask.any() and ranker == "carriage":
                 ax.fill_between(x[ci_mask], lo[ci_mask], hi[ci_mask], color=color, alpha=0.14, linewidth=0)
@@ -6971,6 +7733,7 @@ def render_step5_load_bearing_carriage_ablation(
     ax.set_title("Panel A: total long-range carriage removal")
     ax.set_xlabel("Fraction of far pairs removed (d > τ)")
     ax.set_ylabel("Δ test MAE (positive = worse)")
+    _apply_grit_focused_ylim(ax, focus_values=panel_a_focus_values, all_values=panel_a_all_values)
     if ax.get_legend_handles_labels()[0]:
         ax.legend(frameon=False, fontsize=7, ncol=1)
 
@@ -6993,6 +7756,8 @@ def render_step5_load_bearing_carriage_ablation(
         }
         x = np.arange(len(models), dtype=float)
         width = 0.36
+        panel_b_all_values: list[float] = []
+        panel_b_focus_values: list[float] = []
         for offset, component in zip([-width / 2, width / 2], components):
             rows = [next((r for r in endpoint if str(r.get("model")) == model and str(r.get("component")) == component), None) for model in models]
             means = np.asarray([safe_float(r.get("mean_delta_mae")) if r is not None else float("nan") for r in rows], dtype=float)
@@ -7001,11 +7766,20 @@ def render_step5_load_bearing_carriage_ablation(
             mask = np.isfinite(means)
             yerr = np.vstack([np.maximum(0.0, means - lows), np.maximum(0.0, highs - means)])
             ax.bar(x[mask] + offset, means[mask], width=width, yerr=yerr[:, mask], capsize=3, label=component_labels[component])
+            panel_b_all_values.extend([float(v) for v in means[mask] if math.isfinite(float(v))])
+            panel_b_all_values.extend([float(v) for v in lows[mask] if math.isfinite(float(v))])
+            panel_b_all_values.extend([float(v) for v in highs[mask] if math.isfinite(float(v))])
+            for model_name, mean, low, high in zip(models, means, lows, highs):
+                if _model_is_grit_family(model_name):
+                    for value in (mean, low, high):
+                        if math.isfinite(float(value)):
+                            panel_b_focus_values.append(float(value))
         ax.axhline(0.0, color="#555555", linewidth=1)
         ax.set_xticks(x)
         ax.set_xticklabels(models, rotation=18, ha="right")
         ax.set_ylabel("Δ test MAE at all measured far pairs")
         ax.set_title("Panel B: composable vs non-composable component")
+        _apply_grit_focused_ylim(ax, focus_values=panel_b_focus_values, all_values=panel_b_all_values)
         ax.legend(frameon=False, fontsize=8)
     else:
         ax.axis("off")
@@ -7072,6 +7846,10 @@ def render_step5_distance_binned_total_carriage_ablation(
         "gcn": "#72b7b2",
     }
     fig, axes = plt.subplots(1, 2, figsize=(13.2, 5.0), constrained_layout=True)
+    effect_all_values: list[float] = []
+    effect_focus_values: list[float] = []
+    mass_all_values: list[float] = []
+    mass_focus_values: list[float] = []
     for model in models:
         model_rows = {int(safe_float(r.get("distance_bin_index"))): r for r in rows if str(r.get("model")) == model}
         means = np.asarray([safe_float(model_rows.get(idx, {}).get("mean_delta_mae")) for idx, _ in bin_rows], dtype=float)
@@ -7081,6 +7859,13 @@ def render_step5_distance_binned_total_carriage_ablation(
         if finite.any():
             color = palette.get(model)
             axes[0].plot(x[finite], means[finite], marker="o", linewidth=2.0, label=model, color=color)
+            effect_all_values.extend([float(v) for v in means[finite] if math.isfinite(float(v))])
+            effect_all_values.extend([float(v) for v in lows[finite] if math.isfinite(float(v))])
+            effect_all_values.extend([float(v) for v in highs[finite] if math.isfinite(float(v))])
+            if _model_is_grit_family(model):
+                effect_focus_values.extend([float(v) for v in means[finite] if math.isfinite(float(v))])
+                effect_focus_values.extend([float(v) for v in lows[finite] if math.isfinite(float(v))])
+                effect_focus_values.extend([float(v) for v in highs[finite] if math.isfinite(float(v))])
             ci = finite & np.isfinite(lows) & np.isfinite(highs)
             if ci.any():
                 axes[0].fill_between(x[ci], lows[ci], highs[ci], color=color, alpha=0.13, linewidth=0)
@@ -7088,12 +7873,16 @@ def render_step5_distance_binned_total_carriage_ablation(
         finite_mass = np.isfinite(abs_mass)
         if finite_mass.any():
             axes[1].plot(x[finite_mass], abs_mass[finite_mass], marker="o", linewidth=2.0, label=model, color=palette.get(model))
+            mass_all_values.extend([float(v) for v in abs_mass[finite_mass] if math.isfinite(float(v))])
+            if _model_is_grit_family(model):
+                mass_focus_values.extend([float(v) for v in abs_mass[finite_mass] if math.isfinite(float(v))])
     axes[0].axhline(0.0, color="#555555", linewidth=1)
     axes[0].set_title("Prediction effect by distance band")
     axes[0].set_xlabel("Molecular hop distance bin")
     axes[0].set_ylabel("Δ test MAE after removing bin (positive = worse)")
     axes[0].set_xticks(x)
     axes[0].set_xticklabels(bin_labels, rotation=15, ha="right")
+    _apply_grit_focused_ylim(axes[0], focus_values=effect_focus_values, all_values=effect_all_values)
     axes[0].legend(frameon=False, fontsize=8)
 
     axes[1].set_title("Total absolute carriage removed")
@@ -7101,11 +7890,84 @@ def render_step5_distance_binned_total_carriage_ablation(
     axes[1].set_ylabel("Mean Σ|C[i,j]| removed (prediction units)")
     axes[1].set_xticks(x)
     axes[1].set_xticklabels(bin_labels, rotation=15, ha="right")
+    _apply_grit_focused_ylim(axes[1], focus_values=mass_focus_values, all_values=mass_all_values, positive_floor_zero=True)
     axes[1].legend(frameon=False, fontsize=8)
     fig.suptitle("Step 5: distance-binned total-carriage ablation")
     figures = ensure_dir(artifact_root / "figures")
     fig.savefig(figures / "step5_distance_binned_total_carriage_ablation.png", dpi=dpi)
     fig.savefig(figures / "step5_distance_binned_total_carriage_ablation.pdf")
+    plt.close(fig)
+
+
+def render_step5_dense_control_excess_distance_ablation(
+    summary_rows: Sequence[Mapping[str, Any]],
+    artifact_root: Path,
+    *,
+    dpi: int,
+) -> None:
+    if not summary_rows:
+        return
+    rows = [
+        r
+        for r in summary_rows
+        if math.isfinite(safe_float(r.get("distance_bin_index")))
+        and math.isfinite(safe_float(r.get("mean_delta_mae")))
+    ]
+    if not rows:
+        return
+    rows = sorted(rows, key=lambda r: int(safe_float(r.get("distance_bin_index"))))
+    labels = [str(r.get("distance_bin")) for r in rows]
+    x = np.arange(len(rows), dtype=float)
+    means = np.asarray([safe_float(r.get("mean_delta_mae")) for r in rows], dtype=float)
+    lows = np.asarray([safe_float(r.get("ci_low")) for r in rows], dtype=float)
+    highs = np.asarray([safe_float(r.get("ci_high")) for r in rows], dtype=float)
+    abs_excess = np.asarray([safe_float(r.get("mean_abs_dense_minus_control_carriage")) for r in rows], dtype=float)
+    pair_counts = np.asarray([safe_float(r.get("mean_pair_count")) for r in rows], dtype=float)
+    control = str(rows[0].get("control_model", "grit_1hop"))
+    dense_model = str(rows[0].get("dense_model", "dense_grit"))
+
+    figures = ensure_dir(artifact_root / "figures")
+    fig, axes = plt.subplots(1, 2, figsize=(12.8, 4.9), constrained_layout=True)
+    ax = axes[0]
+    yerr = np.vstack([np.maximum(0.0, means - lows), np.maximum(0.0, highs - means)])
+    ax.bar(x, means, yerr=yerr, capsize=4, color="#4c78a8")
+    ax.axhline(0.0, color="#555555", linewidth=1)
+    ax.set_title("MAE effect of removing dense-only carriage")
+    ax.set_xlabel("Molecular hop distance bin")
+    ax.set_ylabel("Δ dense test MAE (positive = worse)")
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=15, ha="right")
+    for xi, yi, n_pairs in zip(x, means, pair_counts):
+        if math.isfinite(float(n_pairs)):
+            ax.text(
+                float(xi),
+                float(yi) if math.isfinite(float(yi)) else 0.0,
+                f"pairs≈{n_pairs:.0f}",
+                ha="center",
+                va="bottom" if safe_float(yi) >= 0 else "top",
+                fontsize=7,
+                color="#444444",
+            )
+
+    ax = axes[1]
+    ax.bar(x, abs_excess, color="#f58518")
+    ax.set_title("Magnitude of dense-minus-control carriage removed")
+    ax.set_xlabel("Molecular hop distance bin")
+    ax.set_ylabel("Mean Σ|C_dense - C_control| (prediction units)")
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=15, ha="right")
+    ax.set_ylim(bottom=0.0)
+
+    fig.suptitle(
+        f"Step 5: distance-localised dense advantage ({dense_model} minus {control})",
+        fontsize=14,
+    )
+    fig.savefig(figures / "step5_dense_minus_control_distance_ablation.png", dpi=dpi)
+    fig.savefig(figures / "step5_dense_minus_control_distance_ablation.pdf")
+    # Alias with the default control in the filename for easier notebook discovery.
+    if control == "grit_1hop":
+        fig.savefig(figures / "step5_dense_minus_1hop_distance_ablation.png", dpi=dpi)
+        fig.savefig(figures / "step5_dense_minus_1hop_distance_ablation.pdf")
     plt.close(fig)
 
 
