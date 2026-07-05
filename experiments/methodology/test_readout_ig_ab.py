@@ -105,6 +105,28 @@ def _r2(measured: list[float], predicted: list[float]) -> float:
     return 1.0 - float(((y - p) ** 2).sum()) / ss_tot
 
 
+def _apply_torch_load_compat() -> None:
+    """Match the runner subprocess's py312 compat shim: default ``torch.load`` to
+    ``weights_only=False``.
+
+    The trusted GRIT/GIN checkpoints pickle ``torch_geometric.data.Data`` objects, which
+    torch>=2.6 refuses under its new ``weights_only=True`` default. The runner applies this
+    same patch via a ``sitecustomize.py`` on the subprocess PYTHONPATH; because we run the
+    A/B in-process we must apply it here too, or every checkpoint load raises UnpicklingError.
+    """
+    import torch
+
+    if getattr(torch.load, "__name__", "") == "_compat_torch_load":
+        return
+    _orig_torch_load = torch.load
+
+    def _compat_torch_load(*args: object, **kwargs: object):  # noqa: ANN202
+        kwargs.setdefault("weights_only", False)
+        return _orig_torch_load(*args, **kwargs)
+
+    torch.load = _compat_torch_load  # type: ignore[assignment]
+
+
 class _StopBeforeSteps(Exception):
     """Sentinel used to halt the methodology runner right after it writes the config."""
 
@@ -189,6 +211,17 @@ def main(argv: Sequence[str] | None = None) -> None:
     if src not in sys.path:
         sys.path.insert(0, src)
     importlib.invalidate_caches()
+
+    # Patch torch.load BEFORE importing the package (which imports PyG). The failing checkpoint
+    # load is PyG's *internal* dataset torch.load (it unpickles torch_geometric.data.Data), which
+    # under torch>=2.6 defaults to weights_only=True. The runner's sitecustomize shim patches at
+    # interpreter startup ahead of any PyG import, so we mirror that ordering here.
+    try:
+        import torch  # noqa: F401
+
+        _apply_torch_load_compat()
+    except ModuleNotFoundError:
+        pass  # the package import below will surface a clear deps error
 
     try:
         from graph_specialisation_metrics.main_procedure import discover_model_artifacts, load_config
