@@ -926,6 +926,47 @@ def apply_colab_repo_hotfixes(repo_dir: Path) -> None:
         return
     text = intervention.read_text(encoding="utf-8")
     fixed = text
+    if "compute_swap = include_swap_attention_check or (" not in fixed:
+        fixed = fixed.replace(
+            '''            c_swap = None
+            if include_swap_attention_check:
+''',
+            '''            c_swap = None
+            # Compute the discrete swap carriage when the swap-vs-attention check is on OR when the
+            # swap-correlation figure needs it (bounded to its own graph sample), so that figure is
+            # produced even under presets that disable compare_attention_to_swaps (medium/high/...).
+            compute_swap = include_swap_attention_check or (
+                run_swap_correlation and graph_idx < max(0, swap_correlation_sample_graphs)
+            )
+            if compute_swap:
+''',
+            1,
+        )
+        fixed = fixed.replace(
+            '''                tensors[f"step2/{model.name}/{gid}/swap_carriage"] = c_swap
+                profile_rows.extend(carriage_profile_rows(model.name, gid, c_swap, dist, "swap_carriage"))
+''',
+            '''                tensors[f"step2/{model.name}/{gid}/swap_carriage"] = c_swap
+                if include_swap_attention_check:
+                    profile_rows.extend(carriage_profile_rows(model.name, gid, c_swap, dist, "swap_carriage"))
+''',
+            1,
+        )
+        fixed = fixed.replace(
+            '''                if c_swap is not None:
+''',
+            '''                if include_swap_attention_check and c_swap is not None:
+''',
+            1,
+        )
+    fixed = fixed.replace(
+        '''            mean = float(np.mean(values))
+            low, high = bootstrap_ci(values, seed=7300 + stable_int_hash(f"{model}:{distance}"), draws=500)
+''',
+        '''            mean, low, high = bootstrap_ci(values, seed=7300 + stable_int_hash(f"{model}:{distance}"), draws=500)
+''',
+        1,
+    )
     if "COLAB_HOTFIX_ATTENTION_SUPPORT_AND_SIGNAL_GATE_20260703" not in fixed:
         fixed += r'''
 

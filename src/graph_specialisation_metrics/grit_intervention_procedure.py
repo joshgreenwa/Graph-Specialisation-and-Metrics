@@ -2629,7 +2629,13 @@ def run_step2(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
                 )
             )
             c_swap = None
-            if include_swap_attention_check:
+            # Compute the discrete swap carriage when the swap-vs-attention check is on OR when the
+            # swap-correlation figure needs it (bounded to its own graph sample), so that figure is
+            # produced even under presets that disable compare_attention_to_swaps (medium/high/...).
+            compute_swap = include_swap_attention_check or (
+                run_swap_correlation and graph_idx < max(0, swap_correlation_sample_graphs)
+            )
+            if compute_swap:
                 c_swap = carriage_swap(
                     model.adapter,
                     graph,
@@ -2640,10 +2646,11 @@ def run_step2(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
                     partner_policy=partner_policy,
                 )
                 tensors[f"step2/{model.name}/{gid}/swap_carriage"] = c_swap
-                profile_rows.extend(carriage_profile_rows(model.name, gid, c_swap, dist, "swap_carriage"))
+                if include_swap_attention_check:
+                    profile_rows.extend(carriage_profile_rows(model.name, gid, c_swap, dist, "swap_carriage"))
             if any(quantity in attn_tensors for quantity in ("attention_last", "attention_first")):
                 faith_rows.extend(attention_faithfulness_rows(model.name, gid, attn_tensors, c_ig, dist, tau, carriage_estimator="ig"))
-                if c_swap is not None:
+                if include_swap_attention_check and c_swap is not None:
                     faith_rows.extend(
                         attention_faithfulness_rows(
                             model.name,
@@ -5195,8 +5202,7 @@ def render_step4_mean_abs_carriage_by_distance(rows: Sequence[Mapping[str, Any]]
                 highs.append(float("nan"))
                 counts.append(0)
                 continue
-            mean = float(np.mean(values))
-            low, high = bootstrap_ci(values, seed=7300 + stable_int_hash(f"{model}:{distance}"), draws=500)
+            mean, low, high = bootstrap_ci(values, seed=7300 + stable_int_hash(f"{model}:{distance}"), draws=500)
             means.append(mean)
             lows.append(low)
             highs.append(high)
