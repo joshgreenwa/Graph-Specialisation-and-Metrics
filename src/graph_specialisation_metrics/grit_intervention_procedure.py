@@ -81,6 +81,12 @@ def safe_float(value: Any) -> float:
     return out if math.isfinite(out) else float("nan")
 
 
+def stable_seed(*parts: Any, base: int = 0) -> int:
+    payload = "::".join(str(part) for part in parts).encode("utf-8")
+    digest = hashlib.sha256(payload).hexdigest()
+    return (int(digest[:8], 16) + int(base)) % (2**32 - 1)
+
+
 def graph_label(graph: Any) -> float:
     y = getattr(graph, "y", None)
     if isinstance(y, torch.Tensor) and y.numel():
@@ -3307,6 +3313,7 @@ def run_step4(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
                         "carrier": carrier,
                         "source": source,
                         "distance": float(dist[carrier, source].item()),
+                        "carriage": float(c[carrier, source].item()),
                         "effect_abs": effect_abs,
                         "signal_floor": signal_floor,
                         "signal_gate_pass": gate_pass,
@@ -3628,6 +3635,7 @@ def run_step4(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
         validation_summary,
         artifact_root,
         dpi=dpi,
+        tau=tau,
         onset_rows=onset_rows,
         signal_gate_rows=signal_gate_rows,
         verified_separating_summary=verified_separating_summary,
@@ -4471,6 +4479,227 @@ def render_step4_signal_magnitude_by_distance(rows: Sequence[Mapping[str, Any]],
     plt.close(fig)
 
 
+def render_step4_mean_abs_carriage_by_distance(rows: Sequence[Mapping[str, Any]], artifact_root: Path, *, dpi: int) -> None:
+    clean = [
+        r
+        for r in rows
+        if math.isfinite(safe_float(r.get("distance")))
+        and math.isfinite(safe_float(r.get("effect_abs")))
+        and safe_float(r.get("effect_abs")) >= 0.0
+    ]
+    if not clean:
+        return
+    grouped: dict[tuple[str, int], list[float]] = {}
+    for row in clean:
+        distance = int(round(safe_float(row.get("distance"))))
+        grouped.setdefault((str(row.get("model")), distance), []).append(safe_float(row.get("effect_abs")))
+    summary_rows: list[dict[str, Any]] = []
+    fig, ax = plt.subplots(figsize=(8.2, 4.8), constrained_layout=True)
+    for model in sorted({model for model, _ in grouped}):
+        distances = sorted(distance for m, distance in grouped if m == model)
+        means: list[float] = []
+        lows: list[float] = []
+        highs: list[float] = []
+        counts: list[int] = []
+        for distance in distances:
+            values = np.asarray(grouped[(model, distance)], dtype=float)
+            values = values[np.isfinite(values)]
+            if values.size == 0:
+                means.append(float("nan"))
+                lows.append(float("nan"))
+                highs.append(float("nan"))
+                counts.append(0)
+                continue
+            mean = float(np.mean(values))
+            low, high = bootstrap_ci(values, seed=7300 + stable_int_hash(f"{model}:{distance}"), draws=500)
+            means.append(mean)
+            lows.append(low)
+            highs.append(high)
+            counts.append(int(values.size))
+            summary_rows.append(
+                {
+                    "model": model,
+                    "distance": distance,
+                    "mean_abs_carriage": mean,
+                    "ci_low": low,
+                    "ci_high": high,
+                    "n_pairs": int(values.size),
+                }
+            )
+        ax.plot(distances, means, marker="o", linewidth=1.8, label=model)
+        mean_arr = np.asarray(means, dtype=float)
+        low_arr = np.asarray(lows, dtype=float)
+        high_arr = np.asarray(highs, dtype=float)
+        finite = np.isfinite(mean_arr) & np.isfinite(low_arr) & np.isfinite(high_arr)
+        if finite.any():
+            ax.fill_between(
+                np.asarray(distances, dtype=float)[finite],
+                low_arr[finite],
+                high_arr[finite],
+                alpha=0.12,
+            )
+    ax.set_title("Mean carriage magnitude vs molecular distance")
+    ax.set_xlabel("Molecular hop distance")
+    ax.set_ylabel("Mean |C[i,j]| (prediction units)")
+    ax.set_ylim(bottom=0.0)
+    ax.legend(frameon=False, fontsize=8)
+    figures = ensure_dir(artifact_root / "figures")
+    write_csv(artifact_root / "metrics" / "step4_mean_abs_carriage_by_distance.csv", summary_rows)
+    fig.savefig(figures / "step4_mean_abs_carriage_by_distance.png", dpi=dpi)
+    fig.savefig(figures / "step4_mean_abs_carriage_by_distance.pdf")
+    plt.close(fig)
+
+
+def _pearson_corr_values(x: Sequence[float], y: Sequence[float]) -> float:
+    x_arr = np.asarray(x, dtype=float)
+    y_arr = np.asarray(y, dtype=float)
+    mask = np.isfinite(x_arr) & np.isfinite(y_arr)
+    x_arr = x_arr[mask]
+    y_arr = y_arr[mask]
+    if x_arr.size < 3:
+        return float("nan")
+    if float(np.std(x_arr)) <= EPS or float(np.std(y_arr)) <= EPS:
+        return float("nan")
+    return float(np.corrcoef(x_arr, y_arr)[0, 1])
+
+
+def render_step4_dense_onehop_carriage_agreement(
+    rows: Sequence[Mapping[str, Any]],
+    artifact_root: Path,
+    *,
+    dpi: int,
+    tau: int,
+) -> None:
+    records: dict[str, dict[tuple[str, int, int], Mapping[str, Any]]] = {"dense_grit": {}, "grit_1hop": {}}
+    for row in rows:
+        model = str(row.get("model"))
+        if model not in records:
+            continue
+        distance = safe_float(row.get("distance"))
+        if not math.isfinite(distance) or distance <= float(tau):
+            continue
+        carriage = safe_float(row.get("carriage", row.get("unclamped")))
+        if not math.isfinite(carriage):
+            continue
+        key = (str(row.get("graph_id")), int(row.get("carrier")), int(row.get("source")))
+        records[model][key] = row
+
+    matched_keys = sorted(set(records["dense_grit"]).intersection(records["grit_1hop"]))
+    if not matched_keys:
+        return
+
+    pair_rows: list[dict[str, Any]] = []
+    for key in matched_keys:
+        dense_row = records["dense_grit"][key]
+        hop_row = records["grit_1hop"][key]
+        dense_c = safe_float(dense_row.get("carriage", dense_row.get("unclamped")))
+        hop_c = safe_float(hop_row.get("carriage", hop_row.get("unclamped")))
+        distance = int(round(safe_float(dense_row.get("distance"))))
+        if not (math.isfinite(dense_c) and math.isfinite(hop_c) and math.isfinite(float(distance))):
+            continue
+        pair_rows.append(
+            {
+                "graph_id": key[0],
+                "carrier": key[1],
+                "source": key[2],
+                "distance": distance,
+                "dense_carriage": dense_c,
+                "onehop_carriage": hop_c,
+                "abs_difference": abs(dense_c - hop_c),
+            }
+        )
+    if not pair_rows:
+        return
+
+    distances = np.asarray([int(r["distance"]) for r in pair_rows], dtype=int)
+    dense = np.asarray([safe_float(r["dense_carriage"]) for r in pair_rows], dtype=float)
+    onehop = np.asarray([safe_float(r["onehop_carriage"]) for r in pair_rows], dtype=float)
+    finite = np.isfinite(dense) & np.isfinite(onehop) & np.isfinite(distances.astype(float))
+    dense = dense[finite]
+    onehop = onehop[finite]
+    distances = distances[finite]
+    pair_rows = [r for r, keep in zip(pair_rows, finite.tolist()) if keep]
+    if dense.size < 3:
+        return
+
+    summary_rows: list[dict[str, Any]] = []
+    for distance in sorted(set(int(d) for d in distances.tolist())):
+        mask = distances == distance
+        d_dense = dense[mask]
+        d_onehop = onehop[mask]
+        summary_rows.append(
+            {
+                "distance": distance,
+                "n_pairs": int(mask.sum()),
+                "pearson": _pearson_corr_values(d_dense, d_onehop),
+                "spearman": spearman_corr(d_dense.tolist(), d_onehop.tolist()) if int(mask.sum()) >= 3 else float("nan"),
+                "mean_abs_dense": float(np.mean(np.abs(d_dense))) if d_dense.size else float("nan"),
+                "mean_abs_onehop": float(np.mean(np.abs(d_onehop))) if d_onehop.size else float("nan"),
+                "mean_abs_difference": float(np.mean(np.abs(d_dense - d_onehop))) if d_dense.size else float("nan"),
+            }
+        )
+    overall = {
+        "distance": "all",
+        "n_pairs": int(dense.size),
+        "pearson": _pearson_corr_values(dense, onehop),
+        "spearman": spearman_corr(dense.tolist(), onehop.tolist()),
+        "mean_abs_dense": float(np.mean(np.abs(dense))),
+        "mean_abs_onehop": float(np.mean(np.abs(onehop))),
+        "mean_abs_difference": float(np.mean(np.abs(dense - onehop))),
+    }
+
+    metrics = ensure_dir(artifact_root / "metrics")
+    figures = ensure_dir(artifact_root / "figures")
+    write_csv(metrics / "step4_dense_vs_1hop_carriage_agreement_pairs.csv", pair_rows)
+    write_csv(metrics / "step4_dense_vs_1hop_carriage_agreement_by_distance.csv", [overall, *summary_rows])
+
+    fig, axes = plt.subplots(1, 2, figsize=(12.0, 5.0), constrained_layout=True)
+    ax = axes[0]
+    scatter = ax.scatter(
+        dense,
+        onehop,
+        c=distances.astype(float),
+        cmap="viridis",
+        s=18,
+        alpha=0.68,
+        edgecolors="none",
+    )
+    lo = float(np.nanmin([np.nanmin(dense), np.nanmin(onehop)]))
+    hi = float(np.nanmax([np.nanmax(dense), np.nanmax(onehop)]))
+    if math.isfinite(lo) and math.isfinite(hi):
+        pad = 0.05 * max(abs(lo), abs(hi), EPS)
+        ax.plot([lo - pad, hi + pad], [lo - pad, hi + pad], linestyle="--", color="#555555", linewidth=1.2)
+        ax.set_xlim(lo - pad, hi + pad)
+        ax.set_ylim(lo - pad, hi + pad)
+    ax.axhline(0.0, color="#888888", linewidth=0.8)
+    ax.axvline(0.0, color="#888888", linewidth=0.8)
+    ax.set_title("Per-pair carriage: dense vs 1-hop")
+    ax.set_xlabel("Dense GRIT C[i,j] (prediction units)")
+    ax.set_ylabel("1-hop GRIT C[i,j] (prediction units)")
+    cbar = fig.colorbar(scatter, ax=ax)
+    cbar.set_label("Molecular hop distance")
+
+    ax = axes[1]
+    distance_values = [int(r["distance"]) for r in summary_rows if isinstance(r.get("distance"), int)]
+    pearson_values = [safe_float(r.get("pearson")) for r in summary_rows if isinstance(r.get("distance"), int)]
+    spearman_values = [safe_float(r.get("spearman")) for r in summary_rows if isinstance(r.get("distance"), int)]
+    ax.plot(distance_values, pearson_values, marker="o", linewidth=1.8, label="Pearson")
+    ax.plot(distance_values, spearman_values, marker="s", linewidth=1.8, label="Spearman")
+    ax.axhline(0.0, color="#777777", linewidth=0.9)
+    ax.set_ylim(-1.05, 1.05)
+    ax.set_title("Agreement by distance")
+    ax.set_xlabel("Molecular hop distance")
+    ax.set_ylabel("Correlation of signed C[i,j]")
+    ax.legend(frameon=False)
+    fig.suptitle(
+        "Dense vs 1-hop carriage agreement: same computation or alternative solution?",
+        fontsize=15,
+    )
+    fig.savefig(figures / "step4_dense_vs_1hop_carriage_agreement.png", dpi=dpi)
+    fig.savefig(figures / "step4_dense_vs_1hop_carriage_agreement.pdf")
+    plt.close(fig)
+
+
 def render_step4_direct_fraction_by_distance(rows: Sequence[Mapping[str, Any]], artifact_root: Path, *, dpi: int) -> None:
     grouped: dict[tuple[str, int], list[Mapping[str, Any]]] = {}
     for row in rows:
@@ -4530,6 +4759,7 @@ def render_step4(
     artifact_root: Path,
     *,
     dpi: int,
+    tau: int = 3,
     onset_rows: Sequence[Mapping[str, Any]] = (),
     signal_gate_rows: Sequence[Mapping[str, Any]] = (),
     verified_separating_summary: Sequence[Mapping[str, Any]] = (),
@@ -4557,6 +4787,8 @@ def render_step4(
         plt.close(fig)
     if signal_gate_rows:
         render_step4_signal_magnitude_by_distance(signal_gate_rows, artifact_root, dpi=dpi)
+        render_step4_mean_abs_carriage_by_distance(signal_gate_rows, artifact_root, dpi=dpi)
+        render_step4_dense_onehop_carriage_agreement(signal_gate_rows, artifact_root, dpi=dpi, tau=tau)
     if rows:
         render_step4_clamp_validation_d2(rows, artifact_root, dpi=dpi)
         render_step4_direct_fraction_by_distance(rows, artifact_root, dpi=dpi)
@@ -4765,9 +4997,13 @@ def run_step5(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
     interaction_rows: list[dict[str, Any]] = []
     rung_rows: list[dict[str, Any]] = []
     signal_gate_rows: list[dict[str, Any]] = []
+    total_carriage_ablation_rows: list[dict[str, Any]] = []
+    component_carriage_ablation_rows: list[dict[str, Any]] = []
     worked_example: Optional[dict[str, Any]] = None
     worked_example_score = 0.0
     rng = random.Random(seed)
+    load_bearing_fractions = ablation_fractions(cfg.get("load_bearing_ablation_fractions"))
+    load_bearing_random_draws = int(cfg.get("load_bearing_random_draws", 8))
     onehop_floor = (
         empirical_onehop_noise_floor(
             analysis_models,
@@ -4790,6 +5026,11 @@ def run_step5(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
         f"onehop_empirical_floor={onehop_floor:.3g}, "
         f"reference_floor_cap_fraction={gate_floor_cap_fraction:.3g}, "
         f"non_additivity_effect_floor={non_additivity_effect_floor:.3g}"
+    )
+    progress(
+        "Step 5 load-bearing ablation: IG-completeness removal fractions="
+        f"{', '.join(f'{f:g}' for f in load_bearing_fractions)}, "
+        f"random_draws={load_bearing_random_draws}"
     )
     for model in analysis_models:
         graphs = select_graphs(model.adapter, "test", sample_graphs, seed=seed)
@@ -4947,16 +5188,42 @@ def run_step5(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
                         "direct_fraction": direct_fraction,
                         "nontrivial_effect": nontrivial,
                     }
+            y = graph_label(graph)
+            model_pred = float(result["prediction"])
+            append_total_carriage_ablation_rows(
+                total_carriage_ablation_rows,
+                model=model,
+                graph_id=gid,
+                prediction=model_pred,
+                target=y,
+                carriage=c,
+                dist=dist,
+                tau=tau,
+                fractions=load_bearing_fractions,
+                random_draws=load_bearing_random_draws,
+                seed=seed,
+            )
+            append_component_carriage_ablation_rows(
+                component_carriage_ablation_rows,
+                model=model,
+                graph_id=gid,
+                prediction=model_pred,
+                target=y,
+                carriage=c,
+                direct=direct,
+                dist=dist,
+                tau=tau,
+                fractions=load_bearing_fractions,
+            )
             if model.name == dense.name:
                 graph_stats = graph_distance_summary(dist)
                 r_nc = safe_float(r_nc_by_tau[int(tau)].get("r_nc"))
-                y = graph_label(graph)
                 # result["prediction"] is dense's clean forward from encoded content; by
                 # construction it equals dense.adapter.predict(graph) (content_override is injected
                 # at the FeatureEncoder capture point in _run_with_hooks, so predict and this
                 # reconstruction share the exact same forward). This is dense's true model
                 # prediction -- there is no reconstruction gap to correct for here.
-                dense_pred = float(result["prediction"])
+                dense_pred = model_pred
                 try:
                     onehop_pred = float(onehop.adapter.predict(graph).reshape(-1)[0].detach().cpu().item())
                 except Exception:
@@ -5115,10 +5382,30 @@ def run_step5(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
     write_csv(artifact_root / "metrics" / "step5_non_additivity.csv", interaction_rows)
     write_csv(artifact_root / "metrics" / "step5_rung_funnel.csv", rung_rows)
     write_csv(artifact_root / "metrics" / "step5_signal_gate.csv", signal_gate_rows)
+    write_csv(artifact_root / "metrics" / "step5_total_carriage_ablation.csv", total_carriage_ablation_rows)
+    write_csv(artifact_root / "metrics" / "step5_component_carriage_ablation.csv", component_carriage_ablation_rows)
+    total_carriage_ablation_summary = carriage_ablation_summary_rows(
+        total_carriage_ablation_rows,
+        extra_keys=["ranker", "component"],
+        seed=9100,
+    )
+    component_carriage_ablation_summary = carriage_ablation_summary_rows(
+        component_carriage_ablation_rows,
+        extra_keys=["component"],
+        seed=9300,
+    )
+    write_csv(artifact_root / "metrics" / "step5_total_carriage_ablation_summary.csv", total_carriage_ablation_summary)
+    write_csv(artifact_root / "metrics" / "step5_component_carriage_ablation_summary.csv", component_carriage_ablation_summary)
     write_json(artifact_root / "metrics" / "step5_gap_regression.json", gap_regression_summary(gap_rows))
     ablation = self_ablation_summary(gap_rows)
     write_json(artifact_root / "metrics" / "step5_self_ablation.json", ablation)
     render_step5_self_ablation(ablation, gap_rows, artifact_root, dpi=dpi)
+    render_step5_load_bearing_carriage_ablation(
+        total_carriage_ablation_summary,
+        component_carriage_ablation_summary,
+        artifact_root,
+        dpi=dpi,
+    )
     render_step5_gap_structural_severity(gap_rows, artifact_root, dpi=dpi)
     if int(ablation.get("n", 0)) > 0:
         order_sig = bool(ablation.get("dense_onehop_order_significant", False))
@@ -5184,6 +5471,8 @@ def run_step5(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
         "rung_rows": len(rung_rows),
         "signal_gate_rows": len(signal_gate_rows),
         "signal_gate_pass_rows": len([r for r in signal_gate_rows if bool(r.get("signal_gate_pass"))]),
+        "total_carriage_ablation_rows": len(total_carriage_ablation_rows),
+        "component_carriage_ablation_rows": len(component_carriage_ablation_rows),
         "signal_gate_enabled": use_signal_gate,
         "signal_gate_quantile": gate_quantile,
         "onehop_empirical_floor": onehop_floor,
@@ -5369,6 +5658,255 @@ def summarize_vnode_decision(
     }
 
 
+def ablation_fractions(values: Any) -> list[float]:
+    if values is None:
+        values = [0.0, 0.05, 0.10, 0.25, 0.50, 1.0]
+    if isinstance(values, str):
+        raw = [part.strip() for part in values.split(",") if part.strip()]
+    elif isinstance(values, Sequence):
+        raw = list(values)
+    else:
+        raw = [values]
+    out = []
+    for value in raw:
+        f = safe_float(value)
+        if not math.isfinite(f):
+            continue
+        out.append(min(1.0, max(0.0, f)))
+    out = sorted(set(out))
+    if 0.0 not in out:
+        out.insert(0, 0.0)
+    return out or [0.0, 0.05, 0.10, 0.25, 0.50, 1.0]
+
+
+def top_fraction_count(total: int, fraction: float) -> int:
+    total = max(0, int(total))
+    f = min(1.0, max(0.0, float(fraction)))
+    if total == 0 or f <= 0.0:
+        return 0
+    if f >= 1.0:
+        return total
+    return max(1, int(math.ceil(total * f)))
+
+
+def append_total_carriage_ablation_rows(
+    rows: list[dict[str, Any]],
+    *,
+    model: ModelRun,
+    graph_id: str,
+    prediction: float,
+    target: float,
+    carriage: torch.Tensor,
+    dist: torch.Tensor,
+    tau: int,
+    fractions: Sequence[float],
+    random_draws: int,
+    seed: int,
+) -> None:
+    """Attribution-space removal of total long-range carriage C_unclamp.
+
+    This is the cross-model "is long-range usage load-bearing?" test. It does not
+    use the mediator clamp: IG completeness gives yhat - yhat_base = sum C, so
+    subtracting selected signed C entries is the on-attribution counterfactual for
+    removing those pair contributions while leaving all other contributions intact.
+    """
+    if not (math.isfinite(prediction) and math.isfinite(target)):
+        return
+    c = carriage.detach().cpu()
+    d = dist.detach().cpu()
+    far_mask = torch.isfinite(d) & (d > int(tau)) & torch.isfinite(c)
+    pair_index = torch.nonzero(far_mask, as_tuple=False)
+    if pair_index.numel() == 0:
+        return
+    values = c[far_mask].reshape(-1)
+    order = torch.argsort(values.abs(), descending=True)
+    ordered_values = values[order].detach().cpu().numpy().astype(float)
+    all_values = values.detach().cpu().numpy().astype(float)
+    total_pairs = int(all_values.size)
+    base_error = abs(float(prediction) - float(target))
+    for fraction in fractions:
+        k = top_fraction_count(total_pairs, float(fraction))
+        ranked_sum = float(np.sum(ordered_values[:k])) if k else 0.0
+        ranked_abs = float(np.sum(np.abs(ordered_values[:k]))) if k else 0.0
+        ablated_pred = float(prediction) - ranked_sum
+        ablated_error = abs(ablated_pred - float(target))
+        rows.append(
+            {
+                "model": model.name,
+                "role": model.role,
+                "graph_id": graph_id,
+                "tau": int(tau),
+                "ranker": "carriage",
+                "component": "total_carriage",
+                "fraction_removed": float(fraction),
+                "actual_fraction_removed": float(k / total_pairs) if total_pairs else float("nan"),
+                "removed_pairs": int(k),
+                "total_far_pairs": int(total_pairs),
+                "prediction": float(prediction),
+                "target": float(target),
+                "baseline_error": float(base_error),
+                "ablated_prediction": float(ablated_pred),
+                "ablated_error": float(ablated_error),
+                "delta_mae": float(ablated_error - base_error),
+                "signed_removed_carriage": ranked_sum,
+                "abs_removed_carriage": ranked_abs,
+                "random_draws": 0,
+                "ablation_type": "ig_completeness_total_carriage",
+            }
+        )
+        if random_draws <= 0:
+            continue
+        rng = np.random.default_rng(stable_seed(model.name, graph_id, tau, fraction, "random_total_carriage", base=seed))
+        random_deltas: list[float] = []
+        random_preds: list[float] = []
+        random_abs: list[float] = []
+        for _ in range(int(random_draws)):
+            if k == 0:
+                selected = np.asarray([], dtype=int)
+            else:
+                selected = rng.choice(total_pairs, size=k, replace=False)
+            removed = float(np.sum(all_values[selected])) if k else 0.0
+            removed_abs = float(np.sum(np.abs(all_values[selected]))) if k else 0.0
+            random_pred = float(prediction) - removed
+            random_error = abs(random_pred - float(target))
+            random_deltas.append(float(random_error - base_error))
+            random_preds.append(random_pred)
+            random_abs.append(removed_abs)
+        rows.append(
+            {
+                "model": model.name,
+                "role": model.role,
+                "graph_id": graph_id,
+                "tau": int(tau),
+                "ranker": "random_far_pairs",
+                "component": "total_carriage",
+                "fraction_removed": float(fraction),
+                "actual_fraction_removed": float(k / total_pairs) if total_pairs else float("nan"),
+                "removed_pairs": int(k),
+                "total_far_pairs": int(total_pairs),
+                "prediction": float(prediction),
+                "target": float(target),
+                "baseline_error": float(base_error),
+                "ablated_prediction": float(np.mean(random_preds)) if random_preds else float(prediction),
+                "ablated_error": float(base_error + np.mean(random_deltas)) if random_deltas else float(base_error),
+                "delta_mae": float(np.mean(random_deltas)) if random_deltas else 0.0,
+                "signed_removed_carriage": float("nan"),
+                "abs_removed_carriage": float(np.mean(random_abs)) if random_abs else 0.0,
+                "random_draws": int(random_draws),
+                "ablation_type": "ig_completeness_total_carriage_random_control",
+            }
+        )
+
+
+def append_component_carriage_ablation_rows(
+    rows: list[dict[str, Any]],
+    *,
+    model: ModelRun,
+    graph_id: str,
+    prediction: float,
+    target: float,
+    carriage: torch.Tensor,
+    direct: torch.Tensor,
+    dist: torch.Tensor,
+    tau: int,
+    fractions: Sequence[float],
+) -> None:
+    """Decompose total carriage into non-composable and composable components.
+
+    The direct matrix is C_clamp from the detach mediator clamp. It is used only
+    for this mechanism decomposition; the cross-model load-bearing test uses the
+    total C_unclamp matrix above.
+    """
+    if not (math.isfinite(prediction) and math.isfinite(target)):
+        return
+    c = carriage.detach().cpu()
+    direct_c = direct.detach().cpu()
+    d = dist.detach().cpu()
+    measured_mask = torch.isfinite(d) & (d > int(tau)) & torch.isfinite(c) & torch.isfinite(direct_c)
+    if not bool(measured_mask.any()):
+        return
+    total_values = c[measured_mask].reshape(-1)
+    direct_values = direct_c[measured_mask].reshape(-1)
+    composed_values = total_values - direct_values
+    order = torch.argsort(total_values.abs(), descending=True)
+    arrays = {
+        "total_measured_carriage": total_values[order].detach().cpu().numpy().astype(float),
+        "non_composable_carriage": direct_values[order].detach().cpu().numpy().astype(float),
+        "composable_carriage": composed_values[order].detach().cpu().numpy().astype(float),
+    }
+    total_pairs = int(total_values.numel())
+    base_error = abs(float(prediction) - float(target))
+    for fraction in fractions:
+        k = top_fraction_count(total_pairs, float(fraction))
+        for component, values in arrays.items():
+            removed = float(np.sum(values[:k])) if k else 0.0
+            removed_abs = float(np.sum(np.abs(values[:k]))) if k else 0.0
+            ablated_pred = float(prediction) - removed
+            ablated_error = abs(ablated_pred - float(target))
+            rows.append(
+                {
+                    "model": model.name,
+                    "role": model.role,
+                    "graph_id": graph_id,
+                    "tau": int(tau),
+                    "component": component,
+                    "fraction_removed": float(fraction),
+                    "actual_fraction_removed": float(k / total_pairs) if total_pairs else float("nan"),
+                    "removed_pairs": int(k),
+                    "measured_far_pairs": int(total_pairs),
+                    "prediction": float(prediction),
+                    "target": float(target),
+                    "baseline_error": float(base_error),
+                    "ablated_prediction": float(ablated_pred),
+                    "ablated_error": float(ablated_error),
+                    "delta_mae": float(ablated_error - base_error),
+                    "signed_removed_carriage": removed,
+                    "abs_removed_carriage": removed_abs,
+                    "ranked_by": "abs_total_measured_carriage",
+                    "ablation_type": "ig_completeness_component_carriage",
+                }
+            )
+
+
+def carriage_ablation_summary_rows(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    extra_keys: Sequence[str],
+    seed: int = 8800,
+) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    if not rows:
+        return out
+    groups: dict[tuple[Any, ...], list[Mapping[str, Any]]] = {}
+    keys = ["model", *extra_keys, "fraction_removed"]
+    for row in rows:
+        value = safe_float(row.get("delta_mae"))
+        if not math.isfinite(value):
+            continue
+        key = tuple(row.get(k) for k in keys)
+        groups.setdefault(key, []).append(row)
+    for idx, (key, group_rows) in enumerate(sorted(groups.items(), key=lambda item: tuple(str(v) for v in item[0]))):
+        values = [safe_float(r.get("delta_mae")) for r in group_rows]
+        values = [v for v in values if math.isfinite(v)]
+        if not values:
+            continue
+        mean, lo, hi = bootstrap_ci(values, seed=seed + idx, draws=1000)
+        row = {name: value for name, value in zip(keys, key)}
+        row.update(
+            {
+                "mean_delta_mae": mean,
+                "ci_low": lo,
+                "ci_high": hi,
+                "n_molecules": len(values),
+                "mean_removed_pairs": float(np.mean([safe_float(r.get("removed_pairs")) for r in group_rows])),
+                "mean_abs_removed_carriage": float(np.nanmean([safe_float(r.get("abs_removed_carriage")) for r in group_rows])),
+                "mean_baseline_error": float(np.nanmean([safe_float(r.get("baseline_error")) for r in group_rows])),
+            }
+        )
+        out.append(row)
+    return out
+
+
 def self_ablation_summary(gap_rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     """Causal self-ablation: does removing dense's non-composable far carriage hurt test error?
 
@@ -5513,6 +6051,121 @@ def render_step5_self_ablation(summary: Mapping[str, Any], gap_rows: Sequence[Ma
         fig.savefig(figures / "step5_self_ablation_vs_rnc.png", dpi=dpi)
         fig.savefig(figures / "step5_self_ablation_vs_rnc.pdf")
         plt.close(fig)
+
+
+def render_step5_load_bearing_carriage_ablation(
+    total_summary: Sequence[Mapping[str, Any]],
+    component_summary: Sequence[Mapping[str, Any]],
+    artifact_root: Path,
+    *,
+    dpi: int,
+) -> None:
+    if not total_summary and not component_summary:
+        return
+    figures = ensure_dir(artifact_root / "figures")
+    fig, axes = plt.subplots(1, 2, figsize=(13.2, 5.0), constrained_layout=True)
+    ax = axes[0]
+    model_order = ["dense_grit", "grit_1hop_localrrwp", "grit_1hop", "ginplus", "gin", "gcn"]
+    present_models = sorted(
+        {str(r.get("model")) for r in total_summary},
+        key=lambda name: (model_order.index(name) if name in model_order else len(model_order), name),
+    )
+    palette = {
+        "dense_grit": "#4c78a8",
+        "grit_1hop_localrrwp": "#54a24b",
+        "grit_1hop": "#f58518",
+        "ginplus": "#b279a2",
+        "gin": "#e45756",
+        "gcn": "#72b7b2",
+    }
+    ranker_labels = {"carriage": "carriage-ranked", "random_far_pairs": "random far pairs"}
+    for model in present_models:
+        for ranker, linestyle in [("carriage", "-"), ("random_far_pairs", "--")]:
+            rows = [
+                r
+                for r in total_summary
+                if str(r.get("model")) == model and str(r.get("ranker")) == ranker
+            ]
+            rows = sorted(rows, key=lambda r: safe_float(r.get("fraction_removed")))
+            if not rows:
+                continue
+            x = np.asarray([safe_float(r.get("fraction_removed")) for r in rows], dtype=float)
+            y = np.asarray([safe_float(r.get("mean_delta_mae")) for r in rows], dtype=float)
+            lo = np.asarray([safe_float(r.get("ci_low")) for r in rows], dtype=float)
+            hi = np.asarray([safe_float(r.get("ci_high")) for r in rows], dtype=float)
+            mask = np.isfinite(x) & np.isfinite(y)
+            if not mask.any():
+                continue
+            label = f"{model} {ranker_labels.get(ranker, ranker)}"
+            color = palette.get(model)
+            ax.plot(x[mask], y[mask], marker="o", linewidth=2.0 if ranker == "carriage" else 1.4, linestyle=linestyle, color=color, label=label)
+            ci_mask = mask & np.isfinite(lo) & np.isfinite(hi)
+            if ci_mask.any() and ranker == "carriage":
+                ax.fill_between(x[ci_mask], lo[ci_mask], hi[ci_mask], color=color, alpha=0.14, linewidth=0)
+    ax.axhline(0.0, color="#555555", linewidth=1)
+    ax.set_title("Panel A: total long-range carriage removal")
+    ax.set_xlabel("Fraction of far pairs removed (d > τ)")
+    ax.set_ylabel("Δ test MAE (positive = worse)")
+    if ax.get_legend_handles_labels()[0]:
+        ax.legend(frameon=False, fontsize=7, ncol=1)
+
+    ax = axes[1]
+    endpoint = [
+        r
+        for r in component_summary
+        if abs(safe_float(r.get("fraction_removed")) - 1.0) < 1.0e-9
+        and str(r.get("component")) in {"composable_carriage", "non_composable_carriage"}
+    ]
+    if endpoint:
+        models = sorted(
+            {str(r.get("model")) for r in endpoint},
+            key=lambda name: (model_order.index(name) if name in model_order else len(model_order), name),
+        )
+        components = ["composable_carriage", "non_composable_carriage"]
+        component_labels = {
+            "composable_carriage": "composable\n(C - C^clamp)",
+            "non_composable_carriage": "non-composable\n(C^clamp)",
+        }
+        x = np.arange(len(models), dtype=float)
+        width = 0.36
+        for offset, component in zip([-width / 2, width / 2], components):
+            rows = [next((r for r in endpoint if str(r.get("model")) == model and str(r.get("component")) == component), None) for model in models]
+            means = np.asarray([safe_float(r.get("mean_delta_mae")) if r is not None else float("nan") for r in rows], dtype=float)
+            lows = np.asarray([safe_float(r.get("ci_low")) if r is not None else float("nan") for r in rows], dtype=float)
+            highs = np.asarray([safe_float(r.get("ci_high")) if r is not None else float("nan") for r in rows], dtype=float)
+            mask = np.isfinite(means)
+            yerr = np.vstack([np.maximum(0.0, means - lows), np.maximum(0.0, highs - means)])
+            ax.bar(x[mask] + offset, means[mask], width=width, yerr=yerr[:, mask], capsize=3, label=component_labels[component])
+        ax.axhline(0.0, color="#555555", linewidth=1)
+        ax.set_xticks(x)
+        ax.set_xticklabels(models, rotation=18, ha="right")
+        ax.set_ylabel("Δ test MAE at all measured far pairs")
+        ax.set_title("Panel B: composable vs non-composable component")
+        ax.legend(frameon=False, fontsize=8)
+    else:
+        ax.axis("off")
+        ax.text(
+            0.5,
+            0.55,
+            "No detach-clamped component rows were available.",
+            ha="center",
+            va="center",
+            transform=ax.transAxes,
+        )
+        ax.text(
+            0.5,
+            0.40,
+            "Panel B needs measured C^clamp values from Step 5 patching.",
+            ha="center",
+            va="center",
+            color="#555555",
+            fontsize=9,
+            transform=ax.transAxes,
+        )
+    fig.suptitle("Step 5: load-bearing long-range carriage by IG completeness ablation")
+    fig.savefig(figures / "step5_load_bearing_carriage_ablation.png", dpi=dpi)
+    fig.savefig(figures / "step5_load_bearing_carriage_ablation.pdf")
+    plt.close(fig)
 
 
 def render_step5_gap_structural_severity(gap_rows: Sequence[Mapping[str, Any]], artifact_root: Path, *, dpi: int) -> None:

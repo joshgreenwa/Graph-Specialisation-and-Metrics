@@ -2578,6 +2578,8 @@ def build_zinc_config(
                 "signal_gate_quantile": 0.90,
                 "clamp_mode": "detach",
                 "reference_models": step5_reference_models,
+                "load_bearing_ablation_fractions": [0.0, 0.05, 0.10, 0.25, 0.50, 1.0],
+                "load_bearing_random_draws": 8,
             },
         },
         "figures": {"dpi": 180},
