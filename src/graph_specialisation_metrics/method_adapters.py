@@ -607,6 +607,47 @@ class OfficialGRITAdapter:
 
         return copy.deepcopy(data)
 
+    @staticmethod
+    def _data_keys(data: Any) -> list[str]:
+        keys: list[str] = []
+        try:
+            keys.extend([str(key) for key in data.keys()])
+        except Exception:
+            pass
+        try:
+            keys.extend([str(key) for key in data.to_dict().keys()])
+        except Exception:
+            pass
+        if hasattr(data, "__dict__"):
+            keys.extend([str(key) for key in vars(data).keys() if not str(key).startswith("_")])
+        return sorted(set(keys))
+
+    @staticmethod
+    def _get_data_tensor(data: Any, names: Sequence[str]) -> tuple[Optional[str], Optional[torch.Tensor]]:
+        keys = set(OfficialGRITAdapter._data_keys(data))
+        for name in names:
+            value = None
+            if name in keys:
+                try:
+                    value = data[name]
+                except Exception:
+                    value = None
+            if value is None and hasattr(data, name):
+                try:
+                    value = getattr(data, name)
+                except Exception:
+                    value = None
+            if isinstance(value, torch.Tensor):
+                return name, value
+        return None, None
+
+    @staticmethod
+    def _set_data_tensor(data: Any, key: str, value: torch.Tensor) -> None:
+        try:
+            data[key] = value
+        except Exception:
+            setattr(data, key, value)
+
     def _graph_to_data(self, graph: Any) -> Any:
         self._import_official()
         if isinstance(graph, GraphBatchView):
@@ -704,10 +745,19 @@ class OfficialGRITAdapter:
             "raw_rrwp_val": None,
             "raw_rrwp_index": None,
             "raw_rrwp_local_edge_index": None,
+            "raw_rrwp_key": None,
+            "raw_rrwp_val_key": None,
+            "raw_rrwp_index_key": None,
+            "raw_rrwp_local_edge_index_key": None,
+            "data_keys": self._data_keys(data),
             "final_node_states": None,
         }
-        raw_rrwp = getattr(data, "rrwp", None)
+        raw_rrwp_key, raw_rrwp = self._get_data_tensor(
+            data,
+            ("rrwp", "pestat_RRWP", "pestat_rrwp", "RWSE", "rwse"),
+        )
         if isinstance(raw_rrwp, torch.Tensor):
+            captures["raw_rrwp_key"] = raw_rrwp_key
             captures["raw_rrwp"] = raw_rrwp.detach().clone()
             if rrwp_node_override is not None:
                 override = rrwp_node_override.to(device=raw_rrwp.device, dtype=raw_rrwp.dtype)
@@ -715,12 +765,19 @@ class OfficialGRITAdapter:
                     raise ValueError(
                         f"rrwp_node_override shape {tuple(override.shape)} does not match raw rrwp {tuple(raw_rrwp.shape)}"
                     )
-                data.rrwp = override
+                self._set_data_tensor(data, str(raw_rrwp_key), override)
         elif rrwp_node_override is not None:
-            raise ValueError("rrwp_node_override was supplied, but this graph has no raw data.rrwp tensor")
+            raise ValueError(
+                "rrwp_node_override was supplied, but this graph has no supported raw node RRWP tensor; "
+                f"available keys={captures['data_keys']}"
+            )
 
-        raw_rrwp_val = getattr(data, "rrwp_val", None)
+        raw_rrwp_val_key, raw_rrwp_val = self._get_data_tensor(
+            data,
+            ("rrwp_val", "rrwp_values", "rrwp_value", "pestat_RRWP_val", "pestat_rrwp_val"),
+        )
         if isinstance(raw_rrwp_val, torch.Tensor):
+            captures["raw_rrwp_val_key"] = raw_rrwp_val_key
             captures["raw_rrwp_val"] = raw_rrwp_val.detach().clone()
             if rrwp_val_override is not None:
                 override = rrwp_val_override.to(device=raw_rrwp_val.device, dtype=raw_rrwp_val.dtype)
@@ -728,15 +785,26 @@ class OfficialGRITAdapter:
                     raise ValueError(
                         f"rrwp_val_override shape {tuple(override.shape)} does not match raw rrwp_val {tuple(raw_rrwp_val.shape)}"
                     )
-                data.rrwp_val = override
+                self._set_data_tensor(data, str(raw_rrwp_val_key), override)
         elif rrwp_val_override is not None:
-            raise ValueError("rrwp_val_override was supplied, but this graph has no raw data.rrwp_val tensor")
+            raise ValueError(
+                "rrwp_val_override was supplied, but this graph has no supported raw pair RRWP value tensor; "
+                f"available keys={captures['data_keys']}"
+            )
 
-        raw_rrwp_index = getattr(data, "rrwp_index", None)
+        raw_rrwp_index_key, raw_rrwp_index = self._get_data_tensor(
+            data,
+            ("rrwp_index", "rrwp_idx", "pestat_RRWP_index", "pestat_rrwp_index"),
+        )
         if isinstance(raw_rrwp_index, torch.Tensor):
+            captures["raw_rrwp_index_key"] = raw_rrwp_index_key
             captures["raw_rrwp_index"] = raw_rrwp_index.detach().clone()
-        raw_rrwp_local_edge_index = getattr(data, "rrwp_local_edge_index", None)
+        raw_rrwp_local_edge_index_key, raw_rrwp_local_edge_index = self._get_data_tensor(
+            data,
+            ("rrwp_local_edge_index", "local_edge_index", "edge_index"),
+        )
         if isinstance(raw_rrwp_local_edge_index, torch.Tensor):
+            captures["raw_rrwp_local_edge_index_key"] = raw_rrwp_local_edge_index_key
             captures["raw_rrwp_local_edge_index"] = raw_rrwp_local_edge_index.detach().clone()
         handles: list[Any] = []
         clamp = torch.as_tensor(list(clamp_nodes), dtype=torch.long, device=self.device)

@@ -5208,6 +5208,53 @@ def _rrwp_endpoint_nodes(rrwp_index: torch.Tensor, pair_mask: torch.Tensor, n_no
     return endpoints.long()
 
 
+def _available_graph_keys(graph: Any) -> list[str]:
+    keys: list[str] = []
+    try:
+        keys.extend([str(key) for key in graph.keys()])
+    except Exception:
+        pass
+    try:
+        keys.extend([str(key) for key in graph.to_dict().keys()])
+    except Exception:
+        pass
+    if hasattr(graph, "__dict__"):
+        keys.extend([str(key) for key in vars(graph).keys() if not str(key).startswith("_")])
+    return sorted(set(keys))
+
+
+def _graph_tensor_field(graph: Any, names: Sequence[str]) -> tuple[Optional[str], Optional[torch.Tensor]]:
+    keys = set(_available_graph_keys(graph))
+    for name in names:
+        value = None
+        if name in keys:
+            try:
+                value = graph[name]
+            except Exception:
+                value = None
+        if value is None and hasattr(graph, name):
+            try:
+                value = getattr(graph, name)
+            except Exception:
+                value = None
+        if isinstance(value, torch.Tensor):
+            return name, value
+    return None, None
+
+
+def _dense_pair_rrwp_to_sparse(rrwp: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    dense = rrwp.detach()
+    if dense.dim() != 3:
+        raise ValueError(f"expected dense pair RRWP [N,N,K], got {tuple(dense.shape)}")
+    n = int(dense.size(0))
+    rows = torch.arange(n, dtype=torch.long)
+    dst, src = torch.meshgrid(rows, rows, indexing="ij")
+    # Official RRWP sparse index convention is [source, destination].
+    index = torch.stack([src.reshape(-1), dst.reshape(-1)], dim=0)
+    values = dense.reshape(n * n, int(dense.size(-1)))
+    return index, values
+
+
 def rrwp_distance_ablation_rows_for_graph(
     model: ModelRun,
     graph: Any,
@@ -5236,6 +5283,36 @@ def rrwp_distance_ablation_rows_for_graph(
     raw_rrwp = extras.get("raw_rrwp")
     raw_rrwp_val = extras.get("raw_rrwp_val")
     raw_rrwp_index = extras.get("raw_rrwp_index")
+    raw_rrwp_key = extras.get("raw_rrwp_key")
+    raw_rrwp_val_key = extras.get("raw_rrwp_val_key")
+    raw_rrwp_index_key = extras.get("raw_rrwp_index_key")
+    data_keys = list(extras.get("data_keys") or [])
+    graph_keys = _available_graph_keys(graph)
+    if not isinstance(raw_rrwp, torch.Tensor):
+        raw_rrwp_key, raw_rrwp = _graph_tensor_field(graph, ("rrwp", "pestat_RRWP", "pestat_rrwp", "RWSE", "rwse"))
+    if not isinstance(raw_rrwp_val, torch.Tensor):
+        raw_rrwp_val_key, raw_rrwp_val = _graph_tensor_field(
+            graph,
+            ("rrwp_val", "rrwp_values", "rrwp_value", "pestat_RRWP_val", "pestat_rrwp_val"),
+        )
+    if not isinstance(raw_rrwp_index, torch.Tensor):
+        raw_rrwp_index_key, raw_rrwp_index = _graph_tensor_field(
+            graph,
+            ("rrwp_index", "rrwp_idx", "pestat_RRWP_index", "pestat_rrwp_index"),
+        )
+    dense_pair_rrwp = False
+    raw_rrwp_dense_pair: Optional[torch.Tensor] = None
+    if (
+        not isinstance(raw_rrwp_val, torch.Tensor)
+        and not isinstance(raw_rrwp_index, torch.Tensor)
+        and isinstance(raw_rrwp, torch.Tensor)
+        and raw_rrwp.dim() == 3
+    ):
+        raw_rrwp_dense_pair = raw_rrwp.detach()
+        raw_rrwp_index, raw_rrwp_val = _dense_pair_rrwp_to_sparse(raw_rrwp.detach().cpu())
+        raw_rrwp_val_key = raw_rrwp_key
+        raw_rrwp_index_key = f"{raw_rrwp_key}_dense_index"
+        dense_pair_rrwp = True
     if not (
         isinstance(raw_rrwp_val, torch.Tensor)
         and isinstance(raw_rrwp_index, torch.Tensor)
@@ -5244,8 +5321,20 @@ def rrwp_distance_ablation_rows_for_graph(
         and int(raw_rrwp_index.size(0)) == 2
         and int(raw_rrwp_val.size(0)) == int(raw_rrwp_index.size(1))
     ):
-        return [], {"status": "missing_raw_rrwp_pair_fields", "model": model.name, "graph_id": gid}
-    if not isinstance(raw_rrwp, torch.Tensor) or raw_rrwp.dim() != 2:
+        return [], {
+            "status": "missing_raw_rrwp_pair_fields",
+            "model": model.name,
+            "graph_id": gid,
+            "cache_data_keys": ",".join(data_keys),
+            "graph_keys": ",".join(graph_keys),
+            "raw_rrwp_key": raw_rrwp_key or "",
+            "raw_rrwp_val_key": raw_rrwp_val_key or "",
+            "raw_rrwp_index_key": raw_rrwp_index_key or "",
+            "raw_rrwp_shape": tuple(raw_rrwp.shape) if isinstance(raw_rrwp, torch.Tensor) else "",
+            "raw_rrwp_val_shape": tuple(raw_rrwp_val.shape) if isinstance(raw_rrwp_val, torch.Tensor) else "",
+            "raw_rrwp_index_shape": tuple(raw_rrwp_index.shape) if isinstance(raw_rrwp_index, torch.Tensor) else "",
+        }
+    if not isinstance(raw_rrwp, torch.Tensor) or raw_rrwp.dim() != 2 or dense_pair_rrwp:
         raw_rrwp = None
     clean_pred = safe_float(clean_cache.prediction.detach().reshape(-1)[0].cpu().item())
     target = graph_label(graph)
@@ -5262,14 +5351,25 @@ def rrwp_distance_ablation_rows_for_graph(
         for ablation_type in ablation_types:
             node_override = None
             pair_override = None
-            if ablation_type in {"node", "both"} and isinstance(raw_rrwp, torch.Tensor):
+            if dense_pair_rrwp and isinstance(raw_rrwp_dense_pair, torch.Tensor):
+                if ablation_type == "node":
+                    continue
+                flat = raw_rrwp_dense_pair.detach().reshape(-1, int(raw_rrwp_dense_pair.size(-1)))
+                flat_override = _rrwp_replace_channels(
+                    flat,
+                    pair_rows,
+                    channel_start=channel_start,
+                    replacement=replacement,
+                )
+                node_override = flat_override.reshape_as(raw_rrwp_dense_pair)
+            elif ablation_type in {"node", "both"} and isinstance(raw_rrwp, torch.Tensor):
                 node_override = _rrwp_replace_channels(
                     raw_rrwp,
                     endpoint_nodes,
                     channel_start=channel_start,
                     replacement=replacement,
                 )
-            if ablation_type in {"pair", "both"}:
+            if (not dense_pair_rrwp) and ablation_type in {"pair", "both"}:
                 pair_override = _rrwp_replace_channels(
                     raw_rrwp_val,
                     pair_rows,
@@ -5322,6 +5422,10 @@ def rrwp_distance_ablation_rows_for_graph(
                     "ablated_prediction": ablated_pred,
                     "delta_pred": ablated_pred - clean_pred,
                     "abs_delta_pred": abs(ablated_pred - clean_pred),
+                    "raw_rrwp_key": raw_rrwp_key or "",
+                    "raw_rrwp_val_key": raw_rrwp_val_key or "",
+                    "raw_rrwp_index_key": raw_rrwp_index_key or "",
+                    "dense_pair_rrwp": dense_pair_rrwp,
                     "target": target,
                     "clean_mae": clean_mae,
                     "ablated_mae": ablated_mae,
