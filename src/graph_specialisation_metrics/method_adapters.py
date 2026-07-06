@@ -671,6 +671,8 @@ class OfficialGRITAdapter:
         graph: Any,
         *,
         content_override: Optional[torch.Tensor] = None,
+        rrwp_node_override: Optional[torch.Tensor] = None,
+        rrwp_val_override: Optional[torch.Tensor] = None,
         edge_attr_override: Optional[torch.Tensor] = None,
         attention_erasure_masks: Optional[Mapping[int, torch.Tensor]] = None,
         clean_cache: Optional[ForwardCache] = None,
@@ -698,8 +700,44 @@ class OfficialGRITAdapter:
             "encoded_node_states": None,
             "encoded_edge_attr": None,
             "encoded_edge_index": None,
+            "raw_rrwp": None,
+            "raw_rrwp_val": None,
+            "raw_rrwp_index": None,
+            "raw_rrwp_local_edge_index": None,
             "final_node_states": None,
         }
+        raw_rrwp = getattr(data, "rrwp", None)
+        if isinstance(raw_rrwp, torch.Tensor):
+            captures["raw_rrwp"] = raw_rrwp.detach().clone()
+            if rrwp_node_override is not None:
+                override = rrwp_node_override.to(device=raw_rrwp.device, dtype=raw_rrwp.dtype)
+                if tuple(override.shape) != tuple(raw_rrwp.shape):
+                    raise ValueError(
+                        f"rrwp_node_override shape {tuple(override.shape)} does not match raw rrwp {tuple(raw_rrwp.shape)}"
+                    )
+                data.rrwp = override
+        elif rrwp_node_override is not None:
+            raise ValueError("rrwp_node_override was supplied, but this graph has no raw data.rrwp tensor")
+
+        raw_rrwp_val = getattr(data, "rrwp_val", None)
+        if isinstance(raw_rrwp_val, torch.Tensor):
+            captures["raw_rrwp_val"] = raw_rrwp_val.detach().clone()
+            if rrwp_val_override is not None:
+                override = rrwp_val_override.to(device=raw_rrwp_val.device, dtype=raw_rrwp_val.dtype)
+                if tuple(override.shape) != tuple(raw_rrwp_val.shape):
+                    raise ValueError(
+                        f"rrwp_val_override shape {tuple(override.shape)} does not match raw rrwp_val {tuple(raw_rrwp_val.shape)}"
+                    )
+                data.rrwp_val = override
+        elif rrwp_val_override is not None:
+            raise ValueError("rrwp_val_override was supplied, but this graph has no raw data.rrwp_val tensor")
+
+        raw_rrwp_index = getattr(data, "rrwp_index", None)
+        if isinstance(raw_rrwp_index, torch.Tensor):
+            captures["raw_rrwp_index"] = raw_rrwp_index.detach().clone()
+        raw_rrwp_local_edge_index = getattr(data, "rrwp_local_edge_index", None)
+        if isinstance(raw_rrwp_local_edge_index, torch.Tensor):
+            captures["raw_rrwp_local_edge_index"] = raw_rrwp_local_edge_index.detach().clone()
         handles: list[Any] = []
         clamp = torch.as_tensor(list(clamp_nodes), dtype=torch.long, device=self.device)
         clamp_mode = str(clamp_mode or "detach").strip().lower()
@@ -945,10 +983,19 @@ class OfficialGRITAdapter:
         with torch.no_grad():
             return self._run_with_hooks(graph)
 
-    def forward_minimal(self, graph: Any, *, edge_attr_override: Optional[torch.Tensor] = None) -> ForwardCache:
+    def forward_minimal(
+        self,
+        graph: Any,
+        *,
+        rrwp_node_override: Optional[torch.Tensor] = None,
+        rrwp_val_override: Optional[torch.Tensor] = None,
+        edge_attr_override: Optional[torch.Tensor] = None,
+    ) -> ForwardCache:
         with torch.no_grad():
             return self._run_with_hooks(
                 graph,
+                rrwp_node_override=rrwp_node_override,
+                rrwp_val_override=rrwp_val_override,
                 edge_attr_override=edge_attr_override,
                 capture_attention=False,
                 capture_channels=False,

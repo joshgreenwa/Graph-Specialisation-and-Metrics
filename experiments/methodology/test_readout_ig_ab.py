@@ -105,6 +105,19 @@ def _r2(measured: list[float], predicted: list[float]) -> float:
     return 1.0 - float(((y - p) ** 2).sum()) / ss_tot
 
 
+def _relerr(measured: list[float], predicted: list[float]) -> float:
+    """Mean |predicted - measured| / (|measured| + eps) -- reconstruction rel-error per graph."""
+    import numpy as np
+
+    y = np.asarray(measured, dtype=float)
+    p = np.asarray(predicted, dtype=float)
+    mask = np.isfinite(y) & np.isfinite(p)
+    if int(mask.sum()) < 1:
+        return float("nan")
+    y, p = y[mask], p[mask]
+    return float(np.mean(np.abs(p - y) / (np.abs(y) + 1e-6)))
+
+
 def _apply_torch_load_compat() -> None:
     """Match the runner subprocess's py312 compat shim: default ``torch.load`` to
     ``weights_only=False``.
@@ -245,10 +258,17 @@ def main(argv: Sequence[str] | None = None) -> None:
     discovery = [discover_model_artifacts(name, cfg) for name, cfg in config["models"].items()]
     models = instantiate_official_models(config, discovery)
 
-    print("\nStep-0b A/B: predicted Sum_i C[i,j]  vs  measured one-node-baseline delta y")
+    print("\nreadout-IG vs frozen-g carriage -- TWO different targets:")
+    print("  (A) Step-0b PER-SOURCE marginal: predicted Sum_i C[i,j]  vs  measured single-node-baseline dy_j")
+    print("      -> tests additivity/necessity; NOT what readout-IG optimises.")
+    print("  (B) JOINT completeness: Sum_ij C  vs  measured all-baseline dy  (mean rel-error per graph)")
+    print("      -> readout-IG's actual guarantee; should be ~0 for readout-IG on every model.")
     print(f"(ig_steps={args.ig_steps}, sample_graphs={args.sample_graphs})\n")
-    print(f"{'model':24s} {'n_src':>6s} {'R2 frozen-g':>12s} {'R2 readout-IG':>14s} {'improvement':>12s}")
-    print("-" * 72)
+    print(
+        f"{'model':22s} {'n_src':>6s} | {'(A)R2 frozen':>12s} {'(A)R2 rIG':>10s} | "
+        f"{'(B)relerr frozen':>16s} {'(B)relerr rIG':>13s}"
+    )
+    print("-" * 92)
     for model in models:
         try:
             graphs = select_graphs(model.adapter, "test", args.sample_graphs, seed=args.seed)
@@ -257,34 +277,48 @@ def main(argv: Sequence[str] | None = None) -> None:
                 select_baseline_graphs(model.adapter, "test", config, args.sample_graphs, seed=args.seed),
             )
         except Exception as exc:  # noqa: BLE001
-            print(f"{model.name:24s} skipped ({type(exc).__name__}: {exc})")
+            print(f"{model.name:22s} skipped ({type(exc).__name__}: {exc})")
             continue
         measured: list[float] = []
         pred_frozen: list[float] = []
         pred_rig: list[float] = []
+        joint_meas: list[float] = []
+        joint_frozen: list[float] = []
+        joint_rig: list[float] = []
         for gi, graph in enumerate(graphs):
             try:
                 enc = model.adapter.encoded_node_states(graph).to(model.adapter.device)
                 base = expanded_baseline(enc, baseline.to(model.adapter.device))
                 clean_pred = float(predict_scalar_from_encoded(model.adapter, graph, enc).detach().cpu().item())
+                base_pred = float(predict_scalar_from_encoded(model.adapter, graph, base).detach().cpu().item())
                 c_frozen = carriage_ig(model.adapter, graph, baseline, steps=args.ig_steps, readout_ig=False)["carriage"]
                 c_rig = carriage_ig(model.adapter, graph, baseline, steps=args.ig_steps, readout_ig=True)["carriage"]
+                joint_meas.append(clean_pred - base_pred)  # (B) all-baseline dy
+                joint_frozen.append(float(c_frozen.sum().item()))
+                joint_rig.append(float(c_rig.sum().item()))
                 for j in range(int(enc.size(0))):
                     pert = enc.detach().clone()
                     pert[j] = base[j]
                     pj = float(predict_scalar_from_encoded(model.adapter, graph, pert).detach().cpu().item())
-                    measured.append(clean_pred - pj)  # Step-0b convention
+                    measured.append(clean_pred - pj)  # (A) single-node-baseline dy_j
                     pred_frozen.append(float(c_frozen[:, j].sum().item()))
                     pred_rig.append(float(c_rig[:, j].sum().item()))
             except Exception as exc:  # noqa: BLE001
                 print(f"  {model.name} graph {gi}: failed ({type(exc).__name__}: {exc})")
-        if len(measured) >= 3:
+        if len(measured) >= 3 and len(joint_meas) >= 1:
             r2f, r2r = _r2(measured, pred_frozen), _r2(measured, pred_rig)
-            print(f"{model.name:24s} {len(measured):6d} {r2f:12.3f} {r2r:14.3f} {r2r - r2f:+12.3f}")
+            ef, er = _relerr(joint_meas, joint_frozen), _relerr(joint_meas, joint_rig)
+            print(f"{model.name:22s} {len(measured):6d} | {r2f:12.3f} {r2r:10.3f} | {ef:16.3f} {er:13.3f}")
         else:
-            print(f"{model.name:24s} insufficient data ({len(measured)})")
-    print("\nHigher R2 = carriage tracks the measured single-node delta y better; readout-IG should")
-    print("match or beat frozen-g. Any residual dense gap is the (informative) non-additivity.")
+            print(f"{model.name:22s} insufficient data (src={len(measured)}, graphs={len(joint_meas)})")
+    print("\nHow to read this:")
+    print("  * (B) relerr rIG ~ 0 everywhere  => readout-IG is computing exactly what it should (exact")
+    print("    reconstruction); the negative (A) R2 is therefore NOT a bug.")
+    print("  * (A): readout-IG only helps the PER-SOURCE marginal where the model is non-additive (dense).")
+    print("    For near-additive models (1-hop) it can hurt (A) -- it integrates the readout gradient")
+    print("    through the out-of-distribution mean-baseline region. frozen-g stays at the clean point.")
+    print("  => For steps 4-5 (per-node causal usage) frozen-g is the safer default; readout-IG is the")
+    print("     right tool when you specifically need exact completeness of the joint reconstruction.")
 
 
 # --- run it (fires when you paste this file into a Colab cell). First run does the full

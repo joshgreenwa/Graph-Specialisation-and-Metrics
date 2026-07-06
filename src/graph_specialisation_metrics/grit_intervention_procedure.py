@@ -3978,6 +3978,13 @@ def run_step4(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
             run_symbolic_structural_probe(models, artifact_root, config)
         except Exception as exc:
             progress(f"Step 4 symbolic/structural probe failed: {exc}")
+    rrwp_ablation_status: dict[str, Any] = {"status": "skipped"}
+    if bool(cfg.get("run_rrwp_distance_ablation", False)):
+        try:
+            rrwp_ablation_status = run_rrwp_distance_ablation_probe(models, artifact_root, config)
+        except Exception as exc:
+            rrwp_ablation_status = {"status": "failed", "error": str(exc)}
+            progress(f"Step 4 RRWP distance-bin ablation failed: {exc}")
     progress(f"Step 4 complete: status={status}, metrics, tensors, and figures written")
     return {
         "status": status,
@@ -4009,6 +4016,7 @@ def run_step4(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
         "single_cut_diagnostic_rows": len(single_cut_summary),
         "composed_reference_max_direct_fraction": composed_reference_max_direct_fraction,
         "clamp_mode": clamp_mode,
+        "rrwp_distance_ablation": rrwp_ablation_status,
     }
 
 
@@ -4861,9 +4869,10 @@ def symbolic_structural_carriage_rows(
     carriage, but with a discrete on-manifold patch instead of IG so they are directly comparable:
       * content   : swap node j's raw content for a donor node's (topology/RRWP unchanged) -> pure
         content perturbation.
-      * structure : override the initial pair-RRWP encoding (batch.edge_attr) on edges incident to
-        j (node content unchanged) -> pure pair-structure perturbation. Available only for the
-        GRIT-family adapters that expose ``encoded_edge_attr``/``encoded_edge_index``.
+      * structure : override raw RRWP values incident to j before the official RRWP encoders run
+        (node content unchanged) -> structural-PE perturbation. Available for GRIT-family adapters
+        that expose raw ``rrwp``/``rrwp_val`` tensors. If raw RRWP is unavailable, this falls back to
+        the older encoded-edge perturbation so legacy artifacts still render.
     Emits one row per (carrier i, source j) with the pair's molecular distance.
     """
     adapter = model.adapter
@@ -4909,17 +4918,62 @@ def symbolic_structural_carriage_rows(
             contribs = (g * (h_clean - h.detach())).sum(dim=-1)
             _emit_carriage_rows(rows, model, gid, j, contribs, dist, min_distance=min_distance, factor="content")
 
-    # --- structural carriage: override pair-RRWP on edges incident to j (GRIT-family only) ---
+    # --- structural carriage: override raw RRWP incident to j before RRWP encoding (GRIT-family only) ---
     extras = getattr(clean_cache, "extras", None) or {}
-    edge_attr0 = extras.get("encoded_edge_attr")
-    edge_index0 = extras.get("encoded_edge_index")
+    raw_rrwp0 = extras.get("raw_rrwp")
+    raw_rrwp_val0 = extras.get("raw_rrwp_val")
+    raw_rrwp_index0 = extras.get("raw_rrwp_index")
+    edge_attr0 = None
+    edge_index0 = None
+    used_raw_rrwp = False
     if (
-        isinstance(edge_attr0, torch.Tensor)
-        and isinstance(edge_index0, torch.Tensor)
-        and edge_attr0.dim() == 2
-        and edge_index0.dim() == 2
-        and int(edge_attr0.size(0)) == int(edge_index0.size(1))
+        isinstance(raw_rrwp_val0, torch.Tensor)
+        and isinstance(raw_rrwp_index0, torch.Tensor)
+        and raw_rrwp_val0.dim() == 2
+        and raw_rrwp_index0.dim() == 2
+        and int(raw_rrwp_val0.size(0)) == int(raw_rrwp_index0.size(1))
     ):
+        used_raw_rrwp = True
+        rrwp_val0 = raw_rrwp_val0.detach()
+        rrwp_index = raw_rrwp_index0.detach()
+        mean_rrwp_val = rrwp_val0.mean(dim=0, keepdim=True)
+        rrwp_node0 = raw_rrwp0.detach() if isinstance(raw_rrwp0, torch.Tensor) and raw_rrwp0.dim() == 2 else None
+        mean_rrwp_node = rrwp_node0.mean(dim=0, keepdim=True) if isinstance(rrwp_node0, torch.Tensor) else None
+        src_e, dst_e = rrwp_index[0], rrwp_index[1]
+        for j in sources:
+            incident = (src_e == int(j)) | (dst_e == int(j))
+            if not bool(incident.any()) and rrwp_node0 is None:
+                continue
+            rrwp_val = rrwp_val0.clone()
+            if bool(incident.any()):
+                rrwp_val[incident] = mean_rrwp_val.to(rrwp_val.dtype)
+            rrwp_node = None
+            if isinstance(rrwp_node0, torch.Tensor) and int(j) < int(rrwp_node0.size(0)):
+                rrwp_node = rrwp_node0.clone()
+                rrwp_node[int(j)] = mean_rrwp_node.to(rrwp_node.dtype)
+            try:
+                cache = adapter.forward_minimal(graph, rrwp_node_override=rrwp_node, rrwp_val_override=rrwp_val)
+            except Exception:
+                continue
+            h = getattr(cache, "final_node_states", None)
+            if not isinstance(h, torch.Tensor) or tuple(h.shape) != tuple(h_clean.shape):
+                continue
+            contribs = (g * (h_clean - h.detach())).sum(dim=-1)
+            _emit_carriage_rows(rows, model, gid, j, contribs, dist, min_distance=min_distance, factor="structure")
+    if not used_raw_rrwp:
+        # Legacy fallback: perturb the already-encoded edge state if raw RRWP is not exposed.
+        edge_attr0 = extras.get("encoded_edge_attr")
+        edge_index0 = extras.get("encoded_edge_index")
+        if not (
+            isinstance(edge_attr0, torch.Tensor)
+            and isinstance(edge_index0, torch.Tensor)
+            and edge_attr0.dim() == 2
+            and edge_index0.dim() == 2
+            and int(edge_attr0.size(0)) == int(edge_index0.size(1))
+        ):
+            edge_attr0 = None
+            edge_index0 = None
+    if isinstance(edge_attr0, torch.Tensor) and isinstance(edge_index0, torch.Tensor):
         edge_attr0 = edge_attr0.detach()
         ei = edge_index0.detach()
         mean_ea = edge_attr0.mean(dim=0, keepdim=True)
@@ -5027,7 +5081,7 @@ def render_symbolic_structural_by_distance(rows: Sequence[Mapping[str, Any]], ar
     panels = [
         ("content_ig", "Content (IG method)"),
         ("content", "Content (swap method)"),
-        ("structure", "Structure (swap method)"),
+        ("structure", "Structure (raw RRWP perturbation)"),
     ]
     fig, axes = plt.subplots(1, 3, figsize=(18.0, 4.8), constrained_layout=True)
     for ax, (factor, title) in zip(axes, panels):
@@ -5056,11 +5110,573 @@ def render_symbolic_structural_by_distance(rows: Sequence[Mapping[str, Any]], ar
         ax.set_ylabel("|carriage| / per-graph max")
         ax.set_ylim(bottom=0.0)
         ax.legend(frameon=False, fontsize=8)
-    fig.suptitle("Carriage by distance: IG vs swap content (method validation) + swap structure (normalized per graph)")
+    fig.suptitle("Carriage by distance: IG vs swap content + raw-RRWP structure (normalized per graph)")
     figures = ensure_dir(artifact_root / "figures")
     fig.savefig(figures / "step4_symbolic_structural_carriage_by_distance.png", dpi=dpi)
     fig.savefig(figures / "step4_symbolic_structural_carriage_by_distance.pdf")
     plt.close(fig)
+
+    fig_abs, axes_abs = plt.subplots(1, 3, figsize=(18.0, 4.8), constrained_layout=True)
+    for ax, (factor, title) in zip(axes_abs, panels):
+        sub = [r for r in clean if str(r.get("factor")) == factor]
+        if not sub:
+            ax.text(0.5, 0.5, "Not available", ha="center", va="center", transform=ax.transAxes)
+            ax.set_axis_off()
+            ax.set_title(title)
+            continue
+        grouped: dict[tuple[str, int], list[float]] = {}
+        for r in sub:
+            distance = int(round(safe_float(r.get("distance"))))
+            grouped.setdefault((str(r.get("model")), distance), []).append(safe_float(r.get("effect_abs")))
+        for model in sorted({m for m, _ in grouped}):
+            distances = sorted(distance for m, distance in grouped if m == model)
+            values = [float(np.nanmean(grouped[(model, distance)])) for distance in distances]
+            ax.plot(distances, values, marker="o", linewidth=1.8, label=model)
+        ax.set_title(title)
+        ax.set_xlabel("Molecular hop distance")
+        ax.set_ylabel("Mean |carriage| (prediction units)")
+        ax.set_ylim(bottom=0.0)
+        ax.legend(frameon=False, fontsize=8)
+    fig_abs.suptitle("Carriage by distance: absolute IG/swap content and raw-RRWP structure effects")
+    fig_abs.savefig(figures / "step4_symbolic_structural_carriage_absolute_by_distance.png", dpi=dpi)
+    fig_abs.savefig(figures / "step4_symbolic_structural_carriage_absolute_by_distance.pdf")
+    plt.close(fig_abs)
+
+
+def rrwp_distance_ablation_types(raw: Any) -> list[str]:
+    if raw is None:
+        raw = ["node", "pair", "both"]
+    if isinstance(raw, str):
+        values = [part.strip().lower() for part in raw.split(",") if part.strip()]
+    elif isinstance(raw, Sequence):
+        values = [str(part).strip().lower() for part in raw if str(part).strip()]
+    else:
+        values = [str(raw).strip().lower()]
+    allowed = {"node", "pair", "both"}
+    out = [value for value in values if value in allowed]
+    return out or ["node", "pair", "both"]
+
+
+def _rrwp_replace_channels(tensor: torch.Tensor, rows: torch.Tensor, *, channel_start: int, replacement: str) -> torch.Tensor:
+    out = tensor.detach().clone()
+    if out.dim() != 2 or int(out.size(0)) == 0 or int(out.size(1)) <= int(channel_start):
+        return out
+    row_idx = rows.detach().cpu().long().reshape(-1)
+    row_idx = row_idx[(row_idx >= 0) & (row_idx < int(out.size(0)))]
+    if row_idx.numel() == 0:
+        return out
+    start = max(0, min(int(channel_start), int(out.size(1))))
+    mode = str(replacement).strip().lower()
+    if mode in {"mean", "dataset_mean", "graph_mean"}:
+        repl = out[:, start:].mean(dim=0, keepdim=True)
+        out[row_idx, start:] = repl.to(dtype=out.dtype, device=out.device)
+    else:
+        out[row_idx, start:] = 0
+    return out
+
+
+def _rrwp_distance_bin_pair_mask(
+    rrwp_index: torch.Tensor,
+    dist: torch.Tensor,
+    spec: Mapping[str, Any],
+) -> torch.Tensor:
+    if rrwp_index.dim() != 2 or int(rrwp_index.size(0)) != 2:
+        return torch.zeros(0, dtype=torch.bool)
+    pair_index = rrwp_index.detach().cpu().long()
+    src = pair_index[0]
+    dst = pair_index[1]
+    n = int(dist.size(0))
+    valid = (src >= 0) & (dst >= 0) & (src < n) & (dst < n)
+    pair_dist = torch.full((int(pair_index.size(1)),), float("inf"), dtype=torch.float32)
+    if bool(valid.any()):
+        pair_dist[valid] = dist.detach().cpu().float()[dst[valid], src[valid]]
+    low = int(spec.get("min", 0))
+    high_raw = spec.get("max")
+    high = None if high_raw in (None, "", "none", "None") else int(high_raw)
+    mask = torch.isfinite(pair_dist) & (pair_dist >= float(low))
+    if high is not None:
+        mask = mask & (pair_dist <= float(high))
+    return mask
+
+
+def _rrwp_endpoint_nodes(rrwp_index: torch.Tensor, pair_mask: torch.Tensor, n_nodes: int) -> torch.Tensor:
+    if pair_mask.numel() == 0 or not bool(pair_mask.any()):
+        return torch.zeros(0, dtype=torch.long)
+    pair_index = rrwp_index.detach().cpu().long()
+    endpoints = torch.unique(pair_index[:, pair_mask].reshape(-1))
+    endpoints = endpoints[(endpoints >= 0) & (endpoints < int(n_nodes))]
+    return endpoints.long()
+
+
+def rrwp_distance_ablation_rows_for_graph(
+    model: ModelRun,
+    graph: Any,
+    gid: str,
+    *,
+    bins: Sequence[Mapping[str, Any]],
+    ablation_types: Sequence[str],
+    channel_start: int,
+    replacement: str,
+) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+    """Ablate raw GRIT RRWP channels by distance bin before official RRWP encoders run.
+
+    The intervention is split into node RRWP, pair RRWP, and both.  Channels before
+    ``channel_start`` are left untouched so the default preserves self and one-hop
+    terms while removing longer-range structural encodings.
+    """
+
+    adapter = model.adapter
+    if not hasattr(adapter, "forward_minimal"):
+        return [], None
+    try:
+        clean_cache = adapter.forward_minimal(graph)
+    except Exception as exc:
+        return [], {"status": "failed_clean_forward", "model": model.name, "graph_id": gid, "error": str(exc)}
+    extras = getattr(clean_cache, "extras", None) or {}
+    raw_rrwp = extras.get("raw_rrwp")
+    raw_rrwp_val = extras.get("raw_rrwp_val")
+    raw_rrwp_index = extras.get("raw_rrwp_index")
+    if not (
+        isinstance(raw_rrwp_val, torch.Tensor)
+        and isinstance(raw_rrwp_index, torch.Tensor)
+        and raw_rrwp_val.dim() == 2
+        and raw_rrwp_index.dim() == 2
+        and int(raw_rrwp_index.size(0)) == 2
+        and int(raw_rrwp_val.size(0)) == int(raw_rrwp_index.size(1))
+    ):
+        return [], {"status": "missing_raw_rrwp_pair_fields", "model": model.name, "graph_id": gid}
+    if not isinstance(raw_rrwp, torch.Tensor) or raw_rrwp.dim() != 2:
+        raw_rrwp = None
+    clean_pred = safe_float(clean_cache.prediction.detach().reshape(-1)[0].cpu().item())
+    target = graph_label(graph)
+    dist = distance_matrix(graph).detach().cpu().float()
+    n_nodes = graph_num_nodes(graph)
+    rows: list[dict[str, Any]] = []
+    for spec in bins:
+        label = str(spec.get("label") or "")
+        pair_mask = _rrwp_distance_bin_pair_mask(raw_rrwp_index, dist, spec)
+        pair_rows = torch.nonzero(pair_mask, as_tuple=False).reshape(-1).long()
+        endpoint_nodes = _rrwp_endpoint_nodes(raw_rrwp_index, pair_mask, n_nodes)
+        if pair_rows.numel() == 0 and endpoint_nodes.numel() == 0:
+            continue
+        for ablation_type in ablation_types:
+            node_override = None
+            pair_override = None
+            if ablation_type in {"node", "both"} and isinstance(raw_rrwp, torch.Tensor):
+                node_override = _rrwp_replace_channels(
+                    raw_rrwp,
+                    endpoint_nodes,
+                    channel_start=channel_start,
+                    replacement=replacement,
+                )
+            if ablation_type in {"pair", "both"}:
+                pair_override = _rrwp_replace_channels(
+                    raw_rrwp_val,
+                    pair_rows,
+                    channel_start=channel_start,
+                    replacement=replacement,
+                )
+            if node_override is None and pair_override is None:
+                continue
+            try:
+                ablated_cache = adapter.forward_minimal(
+                    graph,
+                    rrwp_node_override=node_override,
+                    rrwp_val_override=pair_override,
+                )
+                ablated_pred = safe_float(ablated_cache.prediction.detach().reshape(-1)[0].cpu().item())
+            except Exception as exc:
+                rows.append(
+                    {
+                        "model": model.name,
+                        "role": model.role,
+                        "graph_id": gid,
+                        "distance_bin": label,
+                        "distance_min": int(spec.get("min", 0)),
+                        "distance_max": spec.get("max") if spec.get("max") is not None else "",
+                        "ablation_type": ablation_type,
+                        "status": "failed_ablation_forward",
+                        "error": str(exc),
+                        "n_pair_entries": int(pair_rows.numel()),
+                        "n_endpoint_nodes": int(endpoint_nodes.numel()),
+                    }
+                )
+                continue
+            clean_mae = abs(clean_pred - target) if math.isfinite(target) else float("nan")
+            ablated_mae = abs(ablated_pred - target) if math.isfinite(target) else float("nan")
+            rows.append(
+                {
+                    "model": model.name,
+                    "role": model.role,
+                    "graph_id": gid,
+                    "distance_bin": label,
+                    "distance_min": int(spec.get("min", 0)),
+                    "distance_max": spec.get("max") if spec.get("max") is not None else "",
+                    "ablation_type": ablation_type,
+                    "status": "complete",
+                    "channel_start": int(channel_start),
+                    "replacement": replacement,
+                    "n_pair_entries": int(pair_rows.numel()),
+                    "n_endpoint_nodes": int(endpoint_nodes.numel()),
+                    "clean_prediction": clean_pred,
+                    "ablated_prediction": ablated_pred,
+                    "delta_pred": ablated_pred - clean_pred,
+                    "abs_delta_pred": abs(ablated_pred - clean_pred),
+                    "target": target,
+                    "clean_mae": clean_mae,
+                    "ablated_mae": ablated_mae,
+                    "delta_mae": ablated_mae - clean_mae if math.isfinite(clean_mae) and math.isfinite(ablated_mae) else float("nan"),
+                }
+            )
+    return rows, {"status": "complete", "model": model.name, "graph_id": gid, "rows": len(rows)}
+
+
+def graph_rrwp_contrast_metric_row(
+    graph: Any,
+    gid: str,
+    *,
+    tau: int,
+    seed: int,
+    max_cut_pairs: int,
+) -> dict[str, Any]:
+    dist = distance_matrix(graph).detach().cpu().float()
+    n_nodes = graph_num_nodes(graph)
+    edge_index = getattr(graph, "edge_index", None)
+    undirected_edges: set[tuple[int, int]] = set()
+    if isinstance(edge_index, torch.Tensor) and edge_index.dim() == 2:
+        for u, v in edge_index.detach().cpu().long().t().tolist():
+            if int(u) == int(v):
+                continue
+            a, b = sorted((int(u), int(v)))
+            undirected_edges.add((a, b))
+    summary = graph_distance_summary(dist)
+    try:
+        nx_graph = graph_to_networkx(pyg_graph_view(graph), undirected=True)
+        articulation_count = len(list(nx.articulation_points(nx_graph))) if n_nodes else 0
+    except Exception:
+        articulation_count = 0
+    sampled = far_pairs(dist, tau, max_pairs=max_cut_pairs, seed=seed)
+    cut_sizes: list[int] = []
+    cut_disconnects: list[bool] = []
+    for carrier, source in sampled:
+        try:
+            cut = minimum_vertex_cut(pyg_graph_view(graph), int(carrier), int(source))
+            cut_sizes.append(len(cut))
+            cut_disconnects.append(cut_disconnects_pair(graph, int(carrier), int(source), cut))
+        except Exception:
+            continue
+    finite = dist[torch.isfinite(dist) & (dist > 0)]
+    far_possible = int(((torch.isfinite(dist) & (dist > float(tau))).sum()).item())
+    return {
+        "graph_id": gid,
+        "n_nodes": n_nodes,
+        "n_edges_undirected": len(undirected_edges),
+        "mean_degree": float((2 * len(undirected_edges)) / max(n_nodes, 1)),
+        "graph_diameter": summary["graph_diameter"],
+        "graph_mean_distance": summary["graph_mean_distance"],
+        "distance_std": float(finite.std(unbiased=False).item()) if finite.numel() else float("nan"),
+        "articulation_fraction": float(articulation_count / max(n_nodes, 1)),
+        "far_pair_count": far_possible,
+        "sampled_cut_pairs": len(cut_sizes),
+        "mean_far_cut_size": float(np.mean(cut_sizes)) if cut_sizes else float("nan"),
+        "single_cut_fraction": float(np.mean([size == 1 for size in cut_sizes])) if cut_sizes else float("nan"),
+        "verified_cut_fraction": float(np.mean(cut_disconnects)) if cut_disconnects else float("nan"),
+    }
+
+
+def summarize_rrwp_ablation_for_contrast(rows: Sequence[Mapping[str, Any]]) -> dict[tuple[str, str], dict[str, Any]]:
+    out: dict[tuple[str, str], dict[str, Any]] = {}
+    for row in rows:
+        if str(row.get("status")) != "complete":
+            continue
+        key = (str(row.get("model")), str(row.get("graph_id")))
+        entry = out.setdefault(
+            key,
+            {
+                "model": str(row.get("model")),
+                "graph_id": str(row.get("graph_id")),
+                "clean_prediction": safe_float(row.get("clean_prediction")),
+                "target": safe_float(row.get("target")),
+                "clean_mae": safe_float(row.get("clean_mae")),
+            },
+        )
+        ablation_type = str(row.get("ablation_type"))
+        abs_delta = safe_float(row.get("abs_delta_pred"))
+        delta_mae = safe_float(row.get("delta_mae"))
+        prefix = f"{ablation_type}_rrwp"
+        entry[f"{prefix}_effect_sum"] = safe_float(entry.get(f"{prefix}_effect_sum", 0.0)) + (abs_delta if math.isfinite(abs_delta) else 0.0)
+        entry[f"{prefix}_delta_mae_sum"] = safe_float(entry.get(f"{prefix}_delta_mae_sum", 0.0)) + (delta_mae if math.isfinite(delta_mae) else 0.0)
+        entry[f"{prefix}_rows"] = int(entry.get(f"{prefix}_rows", 0)) + 1
+    for entry in out.values():
+        for ablation_type in ("node", "pair", "both"):
+            prefix = f"{ablation_type}_rrwp"
+            rows_n = max(1, int(entry.get(f"{prefix}_rows", 0)))
+            entry[f"{prefix}_effect_mean"] = safe_float(entry.get(f"{prefix}_effect_sum", 0.0)) / rows_n
+            entry[f"{prefix}_delta_mae_mean"] = safe_float(entry.get(f"{prefix}_delta_mae_sum", 0.0)) / rows_n
+    return out
+
+
+def global_vs_local_rrwp_contrast_rows(
+    ablation_rows: Sequence[Mapping[str, Any]],
+    graph_metric_rows: Sequence[Mapping[str, Any]],
+    *,
+    global_model: str,
+    local_model: str,
+) -> list[dict[str, Any]]:
+    summary = summarize_rrwp_ablation_for_contrast(ablation_rows)
+    metrics = {str(row.get("graph_id")): dict(row) for row in graph_metric_rows}
+    gids = sorted({gid for model, gid in summary if model == global_model} & {gid for model, gid in summary if model == local_model})
+    rows: list[dict[str, Any]] = []
+    for gid in gids:
+        glob = summary[(global_model, gid)]
+        loc = summary[(local_model, gid)]
+        global_mae = safe_float(glob.get("clean_mae"))
+        local_mae = safe_float(loc.get("clean_mae"))
+        if not (math.isfinite(global_mae) and math.isfinite(local_mae)):
+            continue
+        row = {
+            "graph_id": gid,
+            "global_model": global_model,
+            "local_model": local_model,
+            "global_clean_mae": global_mae,
+            "local_clean_mae": local_mae,
+            "local_minus_global_mae": local_mae - global_mae,
+            "global_prediction": safe_float(glob.get("clean_prediction")),
+            "local_prediction": safe_float(loc.get("clean_prediction")),
+            "target": safe_float(glob.get("target")),
+        }
+        for ablation_type in ("node", "pair", "both"):
+            for suffix in ("effect_sum", "effect_mean", "delta_mae_sum", "delta_mae_mean", "rows"):
+                row[f"global_{ablation_type}_rrwp_{suffix}"] = glob.get(f"{ablation_type}_rrwp_{suffix}", 0)
+                row[f"local_{ablation_type}_rrwp_{suffix}"] = loc.get(f"{ablation_type}_rrwp_{suffix}", 0)
+                if suffix != "rows":
+                    row[f"global_minus_local_{ablation_type}_rrwp_{suffix}"] = (
+                        safe_float(glob.get(f"{ablation_type}_rrwp_{suffix}", 0.0))
+                        - safe_float(loc.get(f"{ablation_type}_rrwp_{suffix}", 0.0))
+                    )
+        row.update(metrics.get(gid, {}))
+        rows.append(row)
+    return rows
+
+
+def render_step4_rrwp_distance_bin_ablation(rows: Sequence[Mapping[str, Any]], artifact_root: Path, *, dpi: int) -> None:
+    clean = [
+        r
+        for r in rows
+        if str(r.get("status")) == "complete"
+        and math.isfinite(safe_float(r.get("abs_delta_pred")))
+        and str(r.get("distance_bin"))
+    ]
+    figures = ensure_dir(artifact_root / "figures")
+    if not clean:
+        fig, ax = plt.subplots(figsize=(8.0, 4.4), constrained_layout=True)
+        ax.text(0.5, 0.5, "No raw-RRWP ablation rows were available.", ha="center", va="center", transform=ax.transAxes)
+        ax.set_axis_off()
+        fig.savefig(figures / "step4_rrwp_distance_bin_ablation.png", dpi=dpi)
+        fig.savefig(figures / "step4_rrwp_distance_bin_ablation.pdf")
+        plt.close(fig)
+        return
+    ablation_types = [t for t in ("node", "pair", "both") if any(str(r.get("ablation_type")) == t for r in clean)]
+    fig, axes = plt.subplots(1, len(ablation_types), figsize=(5.6 * len(ablation_types), 4.8), constrained_layout=True)
+    if len(ablation_types) == 1:
+        axes = [axes]
+    for ax, ablation_type in zip(axes, ablation_types):
+        sub = [r for r in clean if str(r.get("ablation_type")) == ablation_type]
+        labels = sorted(
+            {str(r.get("distance_bin")) for r in sub},
+            key=lambda label: min([int(safe_float(r.get("distance_min"))) for r in sub if str(r.get("distance_bin")) == label] or [999]),
+        )
+        x = np.arange(len(labels), dtype=float)
+        for model in sorted({str(r.get("model")) for r in sub}):
+            means: list[float] = []
+            lows: list[float] = []
+            highs: list[float] = []
+            for label in labels:
+                vals = [safe_float(r.get("abs_delta_pred")) for r in sub if str(r.get("model")) == model and str(r.get("distance_bin")) == label]
+                vals = [v for v in vals if math.isfinite(v)]
+                if not vals:
+                    means.append(float("nan"))
+                    lows.append(float("nan"))
+                    highs.append(float("nan"))
+                    continue
+                mean, lo, hi = bootstrap_ci(
+                    vals,
+                    seed=stable_seed("rrwp_ablation", ablation_type, model, label),
+                    draws=500,
+                )
+                means.append(mean)
+                lows.append(lo)
+                highs.append(hi)
+            y = np.asarray(means, dtype=float)
+            ax.plot(x, y, marker="o", linewidth=1.8, label=model)
+            lo_arr = np.asarray(lows, dtype=float)
+            hi_arr = np.asarray(highs, dtype=float)
+            mask = np.isfinite(y) & np.isfinite(lo_arr) & np.isfinite(hi_arr)
+            if bool(mask.any()):
+                ax.fill_between(x[mask], lo_arr[mask], hi_arr[mask], alpha=0.12)
+        ax.set_title(f"{ablation_type} RRWP")
+        ax.set_xticks(x)
+        ax.set_xticklabels(labels, rotation=20, ha="right")
+        ax.set_xlabel("Molecular hop distance bin")
+        ax.set_ylabel("Mean |Δŷ| from RRWP ablation")
+        ax.set_ylim(bottom=0.0)
+        ax.legend(frameon=False, fontsize=8)
+    fig.suptitle("Distance-bin structural ablation: node RRWP, pair RRWP, and both")
+    fig.savefig(figures / "step4_rrwp_distance_bin_ablation.png", dpi=dpi)
+    fig.savefig(figures / "step4_rrwp_distance_bin_ablation.pdf")
+    plt.close(fig)
+
+
+def render_step4_global_vs_local_rrwp_paired_contrast(
+    rows: Sequence[Mapping[str, Any]],
+    artifact_root: Path,
+    *,
+    dpi: int,
+    global_model: str,
+    local_model: str,
+) -> None:
+    figures = ensure_dir(artifact_root / "figures")
+    predictors = [
+        ("global_both_rrwp_effect_sum", "Global-RRWP ablation effect\n(both, sum |Δŷ|)"),
+        ("global_pair_rrwp_effect_sum", "Pair-RRWP ablation effect\n(sum |Δŷ|)"),
+        ("global_node_rrwp_effect_sum", "Node-RRWP ablation effect\n(sum |Δŷ|)"),
+        ("graph_diameter", "Graph diameter"),
+        ("articulation_fraction", "Articulation-point fraction"),
+        ("single_cut_fraction", "Single-cut far-pair fraction"),
+    ]
+    y_key = "local_minus_global_mae"
+    fig, axes = plt.subplots(2, 3, figsize=(14.5, 8.0), constrained_layout=True)
+    clean_rows = [r for r in rows if math.isfinite(safe_float(r.get(y_key)))]
+    if not clean_rows:
+        axes = np.asarray(axes).reshape(-1)
+        axes[0].text(
+            0.5,
+            0.5,
+            f"No paired {global_model} vs {local_model} rows were available.",
+            ha="center",
+            va="center",
+            transform=axes[0].transAxes,
+        )
+        for ax in axes:
+            ax.set_axis_off()
+        fig.savefig(figures / "step4_global_vs_local_rrwp_paired_contrast.png", dpi=dpi)
+        fig.savefig(figures / "step4_global_vs_local_rrwp_paired_contrast.pdf")
+        plt.close(fig)
+        return
+    for ax, (x_key, label) in zip(np.asarray(axes).reshape(-1), predictors):
+        xs = np.asarray([safe_float(r.get(x_key)) for r in clean_rows], dtype=float)
+        ys = np.asarray([safe_float(r.get(y_key)) for r in clean_rows], dtype=float)
+        mask = np.isfinite(xs) & np.isfinite(ys)
+        if mask.sum() == 0:
+            ax.text(0.5, 0.5, "Not available", ha="center", va="center", transform=ax.transAxes)
+            ax.set_axis_off()
+            continue
+        ax.scatter(xs[mask], ys[mask], s=28, alpha=0.75)
+        r_text = "r=n/a"
+        if mask.sum() >= 3 and np.nanstd(xs[mask]) > 0 and np.nanstd(ys[mask]) > 0:
+            corr = float(np.corrcoef(xs[mask], ys[mask])[0, 1])
+            coef = np.polyfit(xs[mask], ys[mask], deg=1)
+            x_line = np.linspace(float(xs[mask].min()), float(xs[mask].max()), 100)
+            y_line = coef[0] * x_line + coef[1]
+            ax.plot(x_line, y_line, color="#444444", linestyle="--", linewidth=1)
+            r_text = f"r={corr:.2f}"
+        ax.axhline(0, color="#777777", linewidth=1, linestyle=":")
+        ax.set_title(label)
+        ax.set_xlabel(label.replace("\n", " "))
+        ax.set_ylabel(f"{local_model} MAE - {global_model} MAE")
+        ax.text(0.03, 0.95, r_text, transform=ax.transAxes, ha="left", va="top", fontsize=9)
+    fig.suptitle("Global vs local RRWP: paired molecule contrast")
+    fig.savefig(figures / "step4_global_vs_local_rrwp_paired_contrast.png", dpi=dpi)
+    fig.savefig(figures / "step4_global_vs_local_rrwp_paired_contrast.pdf")
+    plt.close(fig)
+
+
+def run_rrwp_distance_ablation_probe(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[str, Any]) -> dict[str, Any]:
+    """Step-4 raw RRWP ablation probe for global-vs-local structural reasoning."""
+
+    cfg = config["steps"]["4"]
+    sample_graphs = int(cfg.get("rrwp_ablation_sample_graphs", min(24, int(cfg.get("sample_graphs", 24)))))
+    channel_start = int(cfg.get("rrwp_ablation_channel_start", 2))
+    replacement = str(cfg.get("rrwp_ablation_replacement", "zero"))
+    ablation_types = rrwp_distance_ablation_types(cfg.get("rrwp_ablation_types"))
+    bins = distance_ablation_bins(cfg.get("rrwp_ablation_distance_bins"))
+    seed = int(config.get("seeds", [0])[0])
+    tau = int(config.get("primary_tau", 3))
+    dpi = int(config["figures"]["dpi"])
+    max_cut_pairs = int(cfg.get("rrwp_graph_metric_cut_pairs", 32))
+    global_model = str(cfg.get("rrwp_contrast_global_model", "grit_1hop"))
+    local_model = str(cfg.get("rrwp_contrast_local_model", "grit_1hop_localrrwp"))
+    rows: list[dict[str, Any]] = []
+    graph_metric_rows_by_gid: dict[str, dict[str, Any]] = {}
+    skip_rows: list[dict[str, Any]] = []
+    progress(
+        f"Step 4 RRWP distance-bin ablation: sample_graphs={sample_graphs}, "
+        f"types={','.join(ablation_types)}, channel_start={channel_start}, replacement={replacement}"
+    )
+    for model in models:
+        try:
+            graphs = select_graphs(model.adapter, "test", sample_graphs, seed=seed)
+        except Exception as exc:
+            skip_rows.append({"model": model.name, "status": "failed_graph_load", "error": str(exc)})
+            continue
+        progress(f"Step 4 RRWP ablation {model.name}: {len(graphs)} graph(s)")
+        for graph_idx, graph in enumerate(graphs):
+            gid = graph_identity("test", graph_idx, graph)
+            if gid not in graph_metric_rows_by_gid:
+                graph_metric_rows_by_gid[gid] = graph_rrwp_contrast_metric_row(
+                    graph,
+                    gid,
+                    tau=tau,
+                    seed=seed + graph_idx,
+                    max_cut_pairs=max_cut_pairs,
+                )
+            graph_rows, status = rrwp_distance_ablation_rows_for_graph(
+                model,
+                graph,
+                gid,
+                bins=bins,
+                ablation_types=ablation_types,
+                channel_start=channel_start,
+                replacement=replacement,
+            )
+            rows.extend(graph_rows)
+            if status is not None and status.get("status") != "complete":
+                skip_rows.append(status)
+            progress_graph("Step 4 RRWP ablation", model.name, graph_idx, len(graphs))
+    graph_metric_rows = list(graph_metric_rows_by_gid.values())
+    contrast_rows = global_vs_local_rrwp_contrast_rows(
+        rows,
+        graph_metric_rows,
+        global_model=global_model,
+        local_model=local_model,
+    )
+    write_csv(artifact_root / "metrics" / "step4_rrwp_distance_bin_ablation.csv", rows)
+    write_csv(artifact_root / "metrics" / "step4_rrwp_distance_bin_ablation_skips.csv", skip_rows)
+    write_csv(artifact_root / "metrics" / "step4_rrwp_graph_metrics.csv", graph_metric_rows)
+    write_csv(artifact_root / "metrics" / "step4_global_vs_local_rrwp_paired_contrast.csv", contrast_rows)
+    render_step4_rrwp_distance_bin_ablation(rows, artifact_root, dpi=dpi)
+    render_step4_global_vs_local_rrwp_paired_contrast(
+        contrast_rows,
+        artifact_root,
+        dpi=dpi,
+        global_model=global_model,
+        local_model=local_model,
+    )
+    complete_rows = [r for r in rows if str(r.get("status")) == "complete"]
+    progress(
+        f"Step 4 RRWP distance-bin ablation: wrote {len(complete_rows)} complete rows, "
+        f"{len(contrast_rows)} paired contrast rows, {len(skip_rows)} skips"
+    )
+    return {
+        "status": "complete" if complete_rows else "no_rows",
+        "rows": len(rows),
+        "complete_rows": len(complete_rows),
+        "skip_rows": len(skip_rows),
+        "graph_metric_rows": len(graph_metric_rows),
+        "paired_contrast_rows": len(contrast_rows),
+        "global_model": global_model,
+        "local_model": local_model,
+    }
 
 
 def render_step4_mean_abs_carriage_by_distance(rows: Sequence[Mapping[str, Any]], artifact_root: Path, *, dpi: int) -> None:
