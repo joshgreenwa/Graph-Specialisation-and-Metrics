@@ -58,6 +58,26 @@ class ModelRun:
     variant: str
 
 
+MODEL_LABELS = {
+    "dense_grit": "dense GRIT",
+    "grit_1hop": "1-hop GRIT\n(global RRWP)",
+    "grit_1hop_localrrwp": "1-hop GRIT\n(local RRWP)",
+    "gin": "GIN",
+}
+
+
+def model_label(model_name: str) -> str:
+    return MODEL_LABELS.get(str(model_name), str(model_name).replace("_", " "))
+
+
+def ordered_model_names(names: Sequence[str]) -> list[str]:
+    preferred = ["dense_grit", "grit_1hop", "grit_1hop_localrrwp", "gin"]
+    present = {str(name) for name in names}
+    out = [name for name in preferred if name in present]
+    out.extend(sorted(present - set(out)))
+    return out
+
+
 def progress(message: str) -> None:
     print(f"[intervention:{time.strftime('%H:%M:%S')}] {message}", flush=True)
 
@@ -5161,14 +5181,15 @@ def render_symbolic_structural_by_distance(rows: Sequence[Mapping[str, Any]], ar
         ("both_rrwp", "Node + pair RRWP carriage"),
     ]
     figures = ensure_dir(artifact_root / "figures")
-    fig, axes = plt.subplots(2, 2, figsize=(13.5, 8.4), constrained_layout=True)
-    for ax, (factor, title) in zip(np.asarray(axes).reshape(-1), panels):
+    available_panels = [(factor, title) for factor, title in panels if any(str(r.get("factor")) == factor for r in clean)]
+    if not available_panels:
+        return
+    ncols = min(2, len(available_panels))
+    nrows = int(math.ceil(len(available_panels) / max(ncols, 1)))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(6.7 * ncols, 4.2 * nrows), constrained_layout=True)
+    axes_flat = np.asarray(axes).reshape(-1)
+    for ax, (factor, title) in zip(axes_flat, available_panels):
         sub = [r for r in clean if str(r.get("factor")) == factor]
-        if not sub:
-            ax.text(0.5, 0.5, "Not available", ha="center", va="center", transform=ax.transAxes)
-            ax.set_axis_off()
-            ax.set_title(title)
-            continue
         graph_distance_sums: dict[tuple[str, str, int], float] = {}
         graph_totals: dict[tuple[str, str], float] = {}
         for r in sub:
@@ -5186,25 +5207,23 @@ def render_symbolic_structural_by_distance(rows: Sequence[Mapping[str, Any]], ar
         for model in sorted({m for m, _ in grouped}):
             distances = sorted(distance for m, distance in grouped if m == model)
             values = [float(np.nanmean(grouped[(model, distance)])) for distance in distances]
-            ax.plot(distances, values, marker="o", linewidth=1.8, label=model)
+            ax.plot(distances, values, marker="o", linewidth=1.8, label=model_label(model))
         ax.set_title(title)
         ax.set_xlabel("Molecular hop distance")
         ax.set_ylabel("Share of own |carriage| by distance")
         ax.set_ylim(bottom=0.0, top=1.0)
         ax.legend(frameon=False, fontsize=8)
+    for ax in axes_flat[len(available_panels):]:
+        ax.set_axis_off()
     fig.suptitle("Source-specific carriage by distance: content vs long-RRWP structure")
     fig.savefig(figures / "step4_symbolic_structural_carriage_by_distance.png", dpi=dpi)
     fig.savefig(figures / "step4_symbolic_structural_carriage_by_distance.pdf")
     plt.close(fig)
 
-    fig_abs, axes_abs = plt.subplots(2, 2, figsize=(13.5, 8.4), constrained_layout=True)
-    for ax, (factor, title) in zip(np.asarray(axes_abs).reshape(-1), panels):
+    fig_abs, axes_abs = plt.subplots(nrows, ncols, figsize=(6.7 * ncols, 4.2 * nrows), constrained_layout=True)
+    axes_abs_flat = np.asarray(axes_abs).reshape(-1)
+    for ax, (factor, title) in zip(axes_abs_flat, available_panels):
         sub = [r for r in clean if str(r.get("factor")) == factor]
-        if not sub:
-            ax.text(0.5, 0.5, "Not available", ha="center", va="center", transform=ax.transAxes)
-            ax.set_axis_off()
-            ax.set_title(title)
-            continue
         grouped: dict[tuple[str, int], list[float]] = {}
         for r in sub:
             distance = int(round(safe_float(r.get("distance"))))
@@ -5212,12 +5231,14 @@ def render_symbolic_structural_by_distance(rows: Sequence[Mapping[str, Any]], ar
         for model in sorted({m for m, _ in grouped}):
             distances = sorted(distance for m, distance in grouped if m == model)
             values = [float(np.nanmean(grouped[(model, distance)])) for distance in distances]
-            ax.plot(distances, values, marker="o", linewidth=1.8, label=model)
+            ax.plot(distances, values, marker="o", linewidth=1.8, label=model_label(model))
         ax.set_title(title)
         ax.set_xlabel("Molecular hop distance")
         ax.set_ylabel("Mean |carriage| (prediction units)")
         ax.set_ylim(bottom=0.0)
         ax.legend(frameon=False, fontsize=8)
+    for ax in axes_abs_flat[len(available_panels):]:
+        ax.set_axis_off()
     fig_abs.suptitle("Source-specific carriage by distance: absolute content and long-RRWP effects")
     fig_abs.savefig(figures / "step4_symbolic_structural_carriage_absolute_by_distance.png", dpi=dpi)
     fig_abs.savefig(figures / "step4_symbolic_structural_carriage_absolute_by_distance.pdf")
@@ -5237,7 +5258,7 @@ def render_symbolic_structural_by_distance(rows: Sequence[Mapping[str, Any]], ar
     total_rows: list[dict[str, Any]] = []
     fig_tot, ax_tot = plt.subplots(figsize=(10.5, 5.0), constrained_layout=True)
     factors = [factor for factor, _ in panels if any(key[0] == factor for key in totals)]
-    model_names = sorted({model for _factor, model in totals})
+    model_names = ordered_model_names([model for _factor, model in totals])
     x = np.arange(len(factors), dtype=float)
     width = 0.8 / max(len(model_names), 1)
     for idx, model_name in enumerate(model_names):
@@ -5269,7 +5290,7 @@ def render_symbolic_structural_by_distance(rows: Sequence[Mapping[str, Any]], ar
             np.maximum(0.0, y - np.asarray(lows, dtype=float)),
             np.maximum(0.0, np.asarray(highs, dtype=float) - y),
         ])
-        ax_tot.bar(pos, y, width=width, yerr=yerr, capsize=2.5, label=model_name, alpha=0.9)
+        ax_tot.bar(pos, y, width=width, yerr=yerr, capsize=2.5, label=model_label(model_name), alpha=0.9)
     ax_tot.set_xticks(x)
     ax_tot.set_xticklabels([dict(panels).get(factor, factor) for factor in factors], rotation=15, ha="right")
     ax_tot.set_ylabel("Total |carriage| per graph (prediction units)")
@@ -5305,8 +5326,8 @@ def render_symbolic_structural_by_distance(rows: Sequence[Mapping[str, Any]], ar
             key = (model, str(r.get("graph_id")), factor, distance)
             per_graph_distance[key] = per_graph_distance.get(key, 0.0) + value
         contrast_rows: list[dict[str, Any]] = []
-        fig_con, axes_con = plt.subplots(1, 3, figsize=(14.0, 4.4), constrained_layout=True)
-        for ax, (factor, title) in zip(np.asarray(axes_con).reshape(-1), contrast_factors):
+        panel_payload: list[tuple[str, str, dict[int, list[float]]]] = []
+        for factor, title in contrast_factors:
             paired_values: dict[int, list[float]] = {}
             graph_distance_keys = {
                 (graph_id, distance)
@@ -5319,6 +5340,13 @@ def render_symbolic_structural_by_distance(rows: Sequence[Mapping[str, Any]], ar
                 if g_val is None or l_val is None:
                     continue
                 paired_values.setdefault(distance, []).append(g_val - l_val)
+            if paired_values:
+                panel_payload.append((factor, title, paired_values))
+        if not panel_payload:
+            return
+        fig_con, axes_con = plt.subplots(1, len(panel_payload), figsize=(5.0 * len(panel_payload), 4.4), constrained_layout=True)
+        axes_con_flat = np.asarray(axes_con).reshape(-1)
+        for ax, (factor, title, paired_values) in zip(axes_con_flat, panel_payload):
             distances = sorted(paired_values)
             means: list[float] = []
             lows: list[float] = []
@@ -5346,15 +5374,14 @@ def render_symbolic_structural_by_distance(rows: Sequence[Mapping[str, Any]], ar
                         "graphs": len(vals),
                     }
                 )
-            if distances:
-                x = np.asarray(distances, dtype=float)
-                y = np.asarray(means, dtype=float)
-                lo_arr = np.asarray(lows, dtype=float)
-                hi_arr = np.asarray(highs, dtype=float)
-                ax.plot(x, y, marker="o", linewidth=1.8)
-                mask = np.isfinite(y) & np.isfinite(lo_arr) & np.isfinite(hi_arr)
-                if bool(mask.any()):
-                    ax.fill_between(x[mask], lo_arr[mask], hi_arr[mask], alpha=0.14)
+            x = np.asarray(distances, dtype=float)
+            y = np.asarray(means, dtype=float)
+            lo_arr = np.asarray(lows, dtype=float)
+            hi_arr = np.asarray(highs, dtype=float)
+            ax.plot(x, y, marker="o", linewidth=1.8)
+            mask = np.isfinite(y) & np.isfinite(lo_arr) & np.isfinite(hi_arr)
+            if bool(mask.any()):
+                ax.fill_between(x[mask], lo_arr[mask], hi_arr[mask], alpha=0.14)
             ax.axhline(0.0, color="#666666", linestyle="--", linewidth=1)
             ax.set_title(title)
             ax.set_xlabel("Molecular hop distance")
@@ -5829,64 +5856,85 @@ def render_step4_rrwp_distance_bin_ablation(rows: Sequence[Mapping[str, Any]], a
         r
         for r in rows
         if str(r.get("status")) == "complete"
+        and str(r.get("ablation_type")) == "pair"
         and math.isfinite(safe_float(r.get("abs_delta_pred")))
         and str(r.get("distance_bin"))
     ]
     figures = ensure_dir(artifact_root / "figures")
     if not clean:
         fig, ax = plt.subplots(figsize=(8.0, 4.4), constrained_layout=True)
-        ax.text(0.5, 0.5, "No raw-RRWP ablation rows were available.", ha="center", va="center", transform=ax.transAxes)
+        ax.text(0.5, 0.5, "No pair-RRWP distance-bin ablation rows were available.", ha="center", va="center", transform=ax.transAxes)
         ax.set_axis_off()
         fig.savefig(figures / "step4_rrwp_distance_bin_ablation.png", dpi=dpi)
         fig.savefig(figures / "step4_rrwp_distance_bin_ablation.pdf")
         plt.close(fig)
         return
-    ablation_types = [t for t in ("node", "pair", "both") if any(str(r.get("ablation_type")) == t for r in clean)]
-    fig, axes = plt.subplots(1, len(ablation_types), figsize=(5.6 * len(ablation_types), 4.8), constrained_layout=True)
-    if len(ablation_types) == 1:
-        axes = [axes]
-    for ax, ablation_type in zip(axes, ablation_types):
-        sub = [r for r in clean if str(r.get("ablation_type")) == ablation_type]
-        labels = sorted(
-            {str(r.get("distance_bin")) for r in sub},
-            key=lambda label: min([int(safe_float(r.get("distance_min"))) for r in sub if str(r.get("distance_bin")) == label] or [999]),
-        )
-        x = np.arange(len(labels), dtype=float)
-        for model in sorted({str(r.get("model")) for r in sub}):
-            means: list[float] = []
-            lows: list[float] = []
-            highs: list[float] = []
-            for label in labels:
-                vals = [safe_float(r.get("abs_delta_pred")) for r in sub if str(r.get("model")) == model and str(r.get("distance_bin")) == label]
-                vals = [v for v in vals if math.isfinite(v)]
-                if not vals:
-                    means.append(float("nan"))
-                    lows.append(float("nan"))
-                    highs.append(float("nan"))
-                    continue
-                mean, lo, hi = bootstrap_ci(
-                    vals,
-                    seed=stable_seed("rrwp_ablation", ablation_type, model, label),
-                    draws=500,
-                )
-                means.append(mean)
-                lows.append(lo)
-                highs.append(hi)
-            y = np.asarray(means, dtype=float)
-            ax.plot(x, y, marker="o", linewidth=1.8, label=model)
-            lo_arr = np.asarray(lows, dtype=float)
-            hi_arr = np.asarray(highs, dtype=float)
-            mask = np.isfinite(y) & np.isfinite(lo_arr) & np.isfinite(hi_arr)
-            if bool(mask.any()):
-                ax.fill_between(x[mask], lo_arr[mask], hi_arr[mask], alpha=0.12)
-        ax.set_title(f"{ablation_type} RRWP")
-        ax.set_xticks(x)
-        ax.set_xticklabels(labels, rotation=20, ha="right")
-        ax.set_xlabel("Molecular hop distance bin")
-        ax.set_ylabel("Mean |Δŷ| from RRWP ablation")
-        ax.set_ylim(bottom=0.0)
-        ax.legend(frameon=False, fontsize=8)
-    fig.suptitle("Distance-bin structural ablation: node RRWP, pair RRWP, and both")
+    labels = sorted(
+        {str(r.get("distance_bin")) for r in clean},
+        key=lambda label: min([int(safe_float(r.get("distance_min"))) for r in clean if str(r.get("distance_bin")) == label] or [999]),
+    )
+    x = np.arange(len(labels), dtype=float)
+    summary_rows: list[dict[str, Any]] = []
+    fig, ax = plt.subplots(figsize=(8.8, 5.0), constrained_layout=True)
+    for model in ordered_model_names([str(r.get("model")) for r in clean]):
+        means: list[float] = []
+        lows: list[float] = []
+        highs: list[float] = []
+        for label in labels:
+            vals = [
+                safe_float(r.get("abs_delta_pred"))
+                for r in clean
+                if str(r.get("model")) == model and str(r.get("distance_bin")) == label
+            ]
+            vals = [v for v in vals if math.isfinite(v)]
+            if not vals:
+                means.append(float("nan"))
+                lows.append(float("nan"))
+                highs.append(float("nan"))
+                continue
+            mean, lo, hi = bootstrap_ci(
+                vals,
+                seed=stable_seed("rrwp_pair_distance_ablation", model, label),
+                draws=500,
+            )
+            means.append(mean)
+            lows.append(lo)
+            highs.append(hi)
+            summary_rows.append(
+                {
+                    "model": model,
+                    "distance_bin": label,
+                    "mean_abs_delta_pred": mean,
+                    "ci_low": lo,
+                    "ci_high": hi,
+                    "graphs": len(vals),
+                }
+            )
+        y = np.asarray(means, dtype=float)
+        ax.plot(x, y, marker="o", linewidth=1.8, label=model_label(model))
+        lo_arr = np.asarray(lows, dtype=float)
+        hi_arr = np.asarray(highs, dtype=float)
+        mask = np.isfinite(y) & np.isfinite(lo_arr) & np.isfinite(hi_arr)
+        if bool(mask.any()):
+            ax.fill_between(x[mask], lo_arr[mask], hi_arr[mask], alpha=0.12)
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=20, ha="right")
+    ax.set_xlabel("Molecular hop distance bin")
+    ax.set_ylabel("Mean |Δŷ| from pair-RRWP long-channel removal")
+    ax.set_ylim(bottom=0.0)
+    ax.legend(frameon=False, fontsize=8)
+    ax.set_title("Pair-RRWP structural sensitivity by distance")
+    ax.text(
+        0.01,
+        -0.24,
+        "Node RRWP is graph/node-level, so distance-binned node ablation is intentionally omitted.",
+        transform=ax.transAxes,
+        ha="left",
+        va="top",
+        fontsize=9,
+        color="#555555",
+    )
+    write_csv(artifact_root / "metrics" / "step4_pair_rrwp_distance_bin_ablation_summary.csv", summary_rows)
     fig.savefig(figures / "step4_rrwp_distance_bin_ablation.png", dpi=dpi)
     fig.savefig(figures / "step4_rrwp_distance_bin_ablation.pdf")
     plt.close(fig)
@@ -6143,8 +6191,7 @@ def render_step4_global_rrwp_channel_ablation(rows: Sequence[Mapping[str, Any]],
         fig.savefig(figures / "step4_global_to_local_rrwp_ablation.pdf")
         plt.close(fig)
         return
-    order = [m for m in ("dense_grit", "grit_1hop", "grit_1hop_localrrwp") if any(str(r.get("model")) == m for r in clean)]
-    order.extend(sorted({str(r.get("model")) for r in clean} - set(order)))
+    order = ordered_model_names([str(r.get("model")) for r in clean])
     factors = [f for f in ("node", "pair", "both") if any(str(r.get("ablation_type")) == f for r in clean)]
     labels = {"node": "node\nRRWP", "pair": "pair\nRRWP", "both": "node+pair\nRRWP"}
     fig, axes = plt.subplots(1, 2, figsize=(12.0, 4.8), constrained_layout=True)
@@ -6190,7 +6237,7 @@ def render_step4_global_rrwp_channel_ablation(rows: Sequence[Mapping[str, Any]],
                 np.maximum(0.0, y - np.asarray(lows, dtype=float)),
                 np.maximum(0.0, np.asarray(highs, dtype=float) - y),
             ])
-            ax.bar(pos, y, width=width, yerr=yerr, capsize=2.5, label=model_name, alpha=0.9)
+            ax.bar(pos, y, width=width, yerr=yerr, capsize=2.5, label=model_label(model_name), alpha=0.9)
         ax.axhline(0, color="#555555", linewidth=1, linestyle=":")
         ax.set_xticks(x)
         ax.set_xticklabels([labels.get(f, f) for f in factors])
@@ -6213,7 +6260,10 @@ def run_rrwp_distance_ablation_probe(models: Sequence[ModelRun], artifact_root: 
     run_global_channel_ablation = bool(cfg.get("run_global_rrwp_channel_ablation", True))
     channel_start = int(cfg.get("rrwp_ablation_channel_start", 2))
     replacement = str(cfg.get("rrwp_ablation_replacement", "zero"))
-    ablation_types = rrwp_distance_ablation_types(cfg.get("rrwp_ablation_types"))
+    distance_ablation_types = rrwp_distance_ablation_types(cfg.get("rrwp_distance_ablation_types", ["pair"]))
+    global_channel_ablation_types = rrwp_distance_ablation_types(
+        cfg.get("global_rrwp_channel_ablation_types", cfg.get("rrwp_ablation_types"))
+    )
     bins = distance_ablation_bins(cfg.get("rrwp_ablation_distance_bins"))
     seed = int(config.get("seeds", [0])[0])
     tau = int(config.get("primary_tau", 3))
@@ -6228,7 +6278,7 @@ def run_rrwp_distance_ablation_probe(models: Sequence[ModelRun], artifact_root: 
     skip_rows: list[dict[str, Any]] = []
     progress(
         f"Step 4 RRWP distance-bin ablation: sample_graphs={sample_graphs}, "
-        f"types={','.join(ablation_types)}, channel_start={channel_start}, replacement={replacement}"
+        f"types={','.join(distance_ablation_types)}, channel_start={channel_start}, replacement={replacement}"
     )
     model_complete_counts: dict[str, int] = {}
     for model in models:
@@ -6256,7 +6306,7 @@ def run_rrwp_distance_ablation_probe(models: Sequence[ModelRun], artifact_root: 
                 gid,
                 pair_id=pair_id,
                 bins=bins,
-                ablation_types=ablation_types,
+                ablation_types=distance_ablation_types,
                 channel_start=channel_start,
                 replacement=replacement,
             )
@@ -6271,7 +6321,7 @@ def run_rrwp_distance_ablation_probe(models: Sequence[ModelRun], artifact_root: 
     if run_global_channel_ablation:
         progress(
             f"Step 4 global-to-local RRWP channel ablation: sample_graphs={global_channel_sample_graphs}, "
-            f"types={','.join(ablation_types)}, channel_start={channel_start}, replacement={replacement}"
+            f"types={','.join(global_channel_ablation_types)}, channel_start={channel_start}, replacement={replacement}"
         )
         for model in models:
             try:
@@ -6288,7 +6338,7 @@ def run_rrwp_distance_ablation_probe(models: Sequence[ModelRun], artifact_root: 
                     graph,
                     gid,
                     pair_id=pair_id,
-                    ablation_types=ablation_types,
+                    ablation_types=global_channel_ablation_types,
                     channel_start=channel_start,
                     replacement=replacement,
                 )

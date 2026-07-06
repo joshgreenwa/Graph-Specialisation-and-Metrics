@@ -166,6 +166,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "rrwp_ablation_channel_start": 2,
             "rrwp_ablation_replacement": "zero",
             "rrwp_ablation_types": ["node", "pair", "both"],
+            "rrwp_distance_ablation_types": ["pair"],
+            "global_rrwp_channel_ablation_types": ["node", "pair", "both"],
             "run_global_rrwp_channel_ablation": True,
             "global_rrwp_channel_ablation_sample_graphs": 48,
             "rrwp_ablation_distance_bins": [
