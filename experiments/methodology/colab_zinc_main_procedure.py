@@ -20,6 +20,7 @@ import argparse
 import ast
 import csv
 import json
+import math
 import os
 import re
 import shutil
@@ -1036,6 +1037,130 @@ def checkpoint_from_audit(source_drive_dir: Path, *, allow_latest: bool = False)
     return None
 
 
+def latest_checkpoint_audit(source_drive_dir: Path) -> dict[str, Any]:
+    audit_path = source_drive_dir / "latest_checkpoint_audit.json"
+    if not audit_path.exists():
+        return {}
+    try:
+        return load_json(audit_path)
+    except Exception:
+        return {}
+
+
+def finite_float_or_none(value: Any) -> float | None:
+    try:
+        out = float(value)
+    except Exception:
+        return None
+    return out if math.isfinite(out) else None
+
+
+def mapping_metric_value(payload: Any, keys: Sequence[str]) -> float | None:
+    if not isinstance(payload, Mapping):
+        return finite_float_or_none(payload)
+    for key in keys:
+        if key not in payload:
+            continue
+        value = payload.get(key)
+        if isinstance(value, Mapping):
+            nested = mapping_metric_value(value, ("mae", "loss", "value"))
+            if nested is not None:
+                return nested
+        else:
+            parsed = finite_float_or_none(value)
+            if parsed is not None:
+                return parsed
+    return None
+
+
+def has_prepared_test_metric(pointer: Mapping[str, Any]) -> bool:
+    summary_json = Path(str(pointer.get("summary_json", "")))
+    if not summary_json.exists():
+        return False
+    try:
+        summary = load_json(summary_json)
+    except Exception:
+        return False
+    return mapping_metric_value(
+        summary,
+        ("best_test_mae", "test_mae", "mae_test", "test_loss", "test"),
+    ) is not None
+
+
+def newest_mtime(paths: Sequence[Path]) -> float:
+    mtimes = []
+    for path in paths:
+        try:
+            if path.exists() and path.is_file():
+                mtimes.append(path.stat().st_mtime)
+        except Exception:
+            continue
+    return max(mtimes) if mtimes else 0.0
+
+
+def source_training_artifact_files(source_drive_dir: Path) -> list[Path]:
+    out: list[Path] = []
+    for root in (source_drive_dir / "results", source_drive_dir / "wrapper_logs"):
+        if not root.exists():
+            continue
+        for pattern in ("*.ckpt", "*.pt", "*.pth", "*.json", "*.csv", "*.log", "*.out"):
+            out.extend(path for path in root.rglob(pattern) if path.is_file())
+    out.extend(path for path in source_drive_dir.glob("checkpoint_audit*.json") if path.is_file())
+    latest_audit = source_drive_dir / "latest_checkpoint_audit.json"
+    if latest_audit.exists():
+        out.append(latest_audit)
+    return sorted(set(out), key=lambda p: str(p))
+
+
+def prepared_artifact_files(pointer_path: Path, pointer: Mapping[str, Any]) -> list[Path]:
+    out = [pointer_path]
+    for key in ("metrics_csv", "summary_json"):
+        raw = pointer.get(key)
+        if raw:
+            out.append(Path(str(raw)))
+    prepared_root = pointer.get("prepared_root")
+    if prepared_root:
+        root = Path(str(prepared_root))
+        out.extend(path for path in root.rglob("*") if path.is_file())
+    return sorted(set(out), key=lambda p: str(p))
+
+
+def same_path(left: Path, right: Path) -> bool:
+    return os.path.normpath(str(left)) == os.path.normpath(str(right))
+
+
+def augment_grit_summary_from_audit(summary: dict[str, Any], source_drive_dir: Path, checkpoint_path: Path) -> dict[str, Any]:
+    audit = latest_checkpoint_audit(source_drive_dir)
+    if not audit:
+        return summary
+
+    if summary.get("best_epoch") is None and audit.get("best_epoch_from_logs") is not None:
+        summary["best_epoch"] = audit.get("best_epoch_from_logs")
+
+    for summary_prefix, audit_key in (
+        ("best_train", "best_train"),
+        ("best_val", "best_val"),
+        ("best_test", "best_test"),
+    ):
+        split = audit.get(audit_key)
+        if not isinstance(split, Mapping):
+            continue
+        mae_key = f"{summary_prefix}_mae"
+        loss_key = f"{summary_prefix}_loss"
+        if finite_float_or_none(summary.get(mae_key)) is None and finite_float_or_none(split.get("mae")) is not None:
+            summary[mae_key] = split.get("mae")
+        if finite_float_or_none(summary.get(loss_key)) is None and finite_float_or_none(split.get("loss")) is not None:
+            summary[loss_key] = split.get("loss")
+
+    summary["checkpoint_path"] = str(checkpoint_path)
+    summary["checkpoint_epoch"] = checkpoint_epoch(checkpoint_path)
+    summary["checkpoint_audit"] = str(source_drive_dir / "latest_checkpoint_audit.json")
+    summary["audit_best_epoch_from_logs"] = audit.get("best_epoch_from_logs")
+    summary["audit_latest_checkpoint_by_mtime"] = audit.get("latest_checkpoint_by_mtime")
+    summary["audit_best_epoch_checkpoint_matches"] = audit.get("best_epoch_checkpoint_matches", [])
+    return summary
+
+
 def best_named_checkpoint_candidates(candidates: Sequence[Path]) -> list[Path]:
     def score(path: Path) -> tuple[int, float, str]:
         lowered = str(path).lower()
@@ -1063,7 +1188,7 @@ def choose_checkpoint(results_root: Path, label: str) -> Path:
 
     source_drive_dir = results_root.parent
     audited = checkpoint_from_audit(source_drive_dir, allow_latest=False)
-    if audited is not None and audited in candidates:
+    if audited is not None:
         print(f"[checkpoint] {label}: {audited} (from latest_checkpoint_audit.json)", flush=True)
         return audited
 
@@ -1087,7 +1212,7 @@ def choose_checkpoint(results_root: Path, label: str) -> Path:
         return chosen
 
     audited_latest = checkpoint_from_audit(source_drive_dir, allow_latest=True)
-    if audited_latest is not None and audited_latest in candidates:
+    if audited_latest is not None:
         print(f"[checkpoint] {label}: {audited_latest} (latest checkpoint from audit fallback)", flush=True)
         return audited_latest
 
@@ -1176,6 +1301,7 @@ def prepare_model_artifact(
     prepared_root.mkdir(parents=True, exist_ok=True)
     logs = wrapper_logs(source_drive_dir)
     rows, summary = parse_grit_training_logs(logs, model)
+    summary = augment_grit_summary_from_audit(summary, source_drive_dir, checkpoint_path)
     metrics_csv = write_csv(prepared_root / "metrics" / "history_metrics.csv", rows)
     summary_json = write_json(prepared_root / "metrics" / "training_summary.json", summary)
     pointer = {
@@ -1525,11 +1651,19 @@ def build_zinc_config(
                 "clamp_mode_comparison_modes": ["detach", "overwrite"],
                 "clamp_mode_comparison_max_pairs_per_model": 16,
                 "composed_reference_max_direct_fraction": 0.20,
+                "run_symbolic_structural_carriage": True,
+                "symbolic_structural_sample_graphs": 6,
+                "symbolic_structural_max_sources": "all",
+                "symbolic_structural_min_distance": 1,
+                "symbolic_structural_rrwp_channel_start": 2,
+                "symbolic_structural_rrwp_replacement": "zero",
                 "run_rrwp_distance_ablation": True,
                 "rrwp_ablation_sample_graphs": 24,
                 "rrwp_ablation_channel_start": 2,
                 "rrwp_ablation_replacement": "zero",
                 "rrwp_ablation_types": ["node", "pair", "both"],
+                "run_global_rrwp_channel_ablation": True,
+                "global_rrwp_channel_ablation_sample_graphs": 48,
                 "rrwp_ablation_distance_bins": [
                     {"label": "d=2-3", "min": 2, "max": 3},
                     {"label": "d=4-6", "min": 4, "max": 6},
@@ -1901,19 +2035,47 @@ def main(argv: Sequence[str] | None = None) -> None:
     onehop_localrrwp_pointer: dict[str, Any] | None = None
     onehop_localrrwp_ckpt: Path | None = None
     if onehop_localrrwp_repo is not None and onehop_localrrwp_cfg is not None:
+        desired_localrrwp_ckpt: Path | None = None
         if not args.refresh_model_artifacts and onehop_localrrwp_pointer_path.exists():
             candidate = load_json(onehop_localrrwp_pointer_path)
             candidate_ckpt = Path(str(candidate.get("checkpoint_path", "")))
             candidate_cfg = Path(str(candidate.get("config_path", "")))
             if candidate_ckpt.exists() and candidate_cfg.exists():
-                onehop_localrrwp_pointer = candidate
-                onehop_localrrwp_ckpt = candidate_ckpt
-                print(f"[prepared] reusing local-PE 1-hop checkpoint: {onehop_localrrwp_ckpt}", flush=True)
+                refresh_reasons: list[str] = []
+                try:
+                    desired_localrrwp_ckpt = choose_checkpoint(localrrwp_results, "grit_1hop_localrrwp")
+                    if not same_path(candidate_ckpt, desired_localrrwp_ckpt):
+                        refresh_reasons.append(
+                            f"best checkpoint changed from {candidate_ckpt} to {desired_localrrwp_ckpt}"
+                        )
+                except FileNotFoundError as exc:
+                    refresh_reasons.append(f"checkpoint rediscovery failed: {exc}")
+
+                if not has_prepared_test_metric(candidate):
+                    refresh_reasons.append("cached training summary has no finite test metric")
+
+                source_mtime = newest_mtime(source_training_artifact_files(args.onehop_localrrwp_drive_dir))
+                prepared_mtime = newest_mtime(prepared_artifact_files(onehop_localrrwp_pointer_path, candidate))
+                if source_mtime > prepared_mtime + 1.0:
+                    refresh_reasons.append("source checkpoint/log/audit files are newer than prepared metrics")
+
+                if refresh_reasons:
+                    print(
+                        "[prepared] refreshing local-PE 1-hop artifact: "
+                        + "; ".join(refresh_reasons),
+                        flush=True,
+                    )
+                    onehop_localrrwp_ckpt = desired_localrrwp_ckpt
+                else:
+                    onehop_localrrwp_pointer = candidate
+                    onehop_localrrwp_ckpt = candidate_ckpt
+                    print(f"[prepared] reusing local-PE 1-hop checkpoint: {onehop_localrrwp_ckpt}", flush=True)
             else:
                 print("[prepared-warning] saved local-PE 1-hop pointer missing checkpoint/config; rediscovering", flush=True)
         if onehop_localrrwp_pointer is None:
             try:
-                onehop_localrrwp_ckpt = choose_checkpoint(localrrwp_results, "grit_1hop_localrrwp")
+                if onehop_localrrwp_ckpt is None:
+                    onehop_localrrwp_ckpt = choose_checkpoint(localrrwp_results, "grit_1hop_localrrwp")
                 onehop_localrrwp_pointer = prepare_model_artifact(
                     model="grit_1hop_localrrwp",
                     source_drive_dir=args.onehop_localrrwp_drive_dir,
