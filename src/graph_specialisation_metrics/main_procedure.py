@@ -208,6 +208,15 @@ DEFAULT_CONFIG: dict[str, Any] = {
                 {"label": "d>14", "min": 15, "max": None},
             ],
         },
+        "6": {
+            "name": "beneficial_carriage",
+            "sample_graphs": 60,
+            "donors": 4,
+            "max_distance": 8,
+            "resamplers": ["matched", "marginal"],
+            "whole_band": False,
+            "splits": ["test", "train"],
+        },
     },
     "figures": {"dpi": 180},
 }
@@ -235,6 +244,7 @@ FAST_DEV_OVERRIDES: dict[str, Any] = {
         "3": {"sample_graphs": 2},
         "4": {"sample_graphs": 1, "max_far_pairs_per_graph": 1, "depth_pairs_per_graph": 0},
         "5": {"sample_graphs": 2, "max_far_pairs_per_graph": 2, "interaction_pairs": 16},
+        "6": {"sample_graphs": 2, "donors": 2, "max_distance": 4, "splits": ["test"]},
     },
 }
 
@@ -270,6 +280,7 @@ ANALYSIS_PRESET_OVERRIDES: dict[str, dict[str, Any]] = {
                 "run_clamp_mode_comparison": False,
             },
             "5": {"sample_graphs": 4, "max_far_pairs_per_graph": 1, "interaction_pairs": 16},
+            "6": {"sample_graphs": 8, "donors": 3, "max_distance": 6, "splits": ["test"]},
         },
     },
     "pilot": {
@@ -300,6 +311,7 @@ ANALYSIS_PRESET_OVERRIDES: dict[str, dict[str, Any]] = {
                 "run_clamp_mode_comparison": False,
             },
             "5": {"sample_graphs": 8, "max_far_pairs_per_graph": 2, "interaction_pairs": 64},
+            "6": {"sample_graphs": 12, "donors": 4, "max_distance": 8, "splits": ["test", "train"]},
         },
     },
     "medium": {
@@ -331,6 +343,7 @@ ANALYSIS_PRESET_OVERRIDES: dict[str, dict[str, Any]] = {
                 "clamp_mode_comparison_max_pairs_per_model": 4,
             },
             "5": {"sample_graphs": 16, "max_far_pairs_per_graph": 4, "interaction_pairs": 128},
+            "6": {"sample_graphs": 24, "donors": 4, "max_distance": 8, "resamplers": ["matched", "marginal"], "splits": ["test", "train"]},
         },
     },
     "high": {
@@ -367,6 +380,7 @@ ANALYSIS_PRESET_OVERRIDES: dict[str, dict[str, Any]] = {
                 "clamp_mode_comparison_max_pairs_per_model": 12,
             },
             "5": {"sample_graphs": 48, "max_far_pairs_per_graph": 12, "interaction_pairs": 256},
+            "6": {"sample_graphs": 48, "donors": 6, "max_distance": 8, "splits": ["test", "train"]},
         },
     },
 }
@@ -384,11 +398,11 @@ def deep_update(base: dict[str, Any], updates: Mapping[str, Any]) -> dict[str, A
 
 def parse_steps(raw: str | None) -> list[str]:
     if raw is None or raw.strip() in {"", "all"}:
-        return [str(i) for i in range(6)]
+        return [str(i) for i in range(7)]
     out = [item.strip() for item in raw.split(",") if item.strip()]
-    bad = [item for item in out if item not in {str(i) for i in range(6)}]
+    bad = [item for item in out if item not in {str(i) for i in range(7)}]
     if bad:
-        raise ValueError(f"unknown step ids {bad}; expected 0,1,2,3,4,5")
+        raise ValueError(f"unknown step ids {bad}; expected 0,1,2,3,4,5,6")
     return out
 
 
@@ -1066,7 +1080,7 @@ def run_main(config: Mapping[str, Any], *, steps: Sequence[str], dry_run: bool =
             status_by_step[step] = status
             write_json(artifact_root / "metrics" / "main_status.json", status_by_step)
     else:
-        intervention_steps = [step for step in steps if step in {"0", "2", "3", "4", "5"}]
+        intervention_steps = [step for step in steps if step in {"0", "2", "3", "4", "5", "6"}]
         pending_intervention_steps = [
             step for step in intervention_steps if force or not step_is_complete(status_by_step.get(step))
         ]

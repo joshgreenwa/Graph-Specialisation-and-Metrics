@@ -46,13 +46,38 @@ Tensor = torch.Tensor
 # ======================================================================================
 # Task generation (pure numpy/torch; fixed node count n so graphs batch cleanly)
 # ======================================================================================
-def _dumbbell_adj(n: int, bridge_edges: int, rng: np.random.Generator) -> np.ndarray:
-    """Two equal cliques joined by ``bridge_edges`` bridge edges. The bridge is the bottleneck."""
+def _add_cluster_edges(nodes: np.ndarray, degree: int, adj: np.ndarray, rng: np.random.Generator) -> None:
+    """Wire ``nodes`` into a connected ~``degree``-regular block (in place).
+
+    A random spanning path guarantees connectivity; random stub-pairing adds the rest of the
+    target degree. Using the SAME routine for both graph types means dumbbell and wellconnected
+    have matched local density and differ only in the bottleneck.
+    """
+    nodes = np.asarray(nodes)
+    m = len(nodes)
+    if m <= 1:
+        return
+    degree = int(min(degree, m - 1))
+    perm = rng.permutation(nodes)                      # spanning path -> connected
+    for i in range(m - 1):
+        u, v = int(perm[i]), int(perm[i + 1])
+        adj[u, v] = adj[v, u] = 1.0
+    extra = max(0, degree - 2)                          # path already gives ~degree 2
+    if extra > 0:
+        stubs = np.repeat(nodes, extra)
+        rng.shuffle(stubs)
+        for i in range(0, len(stubs) - 1, 2):
+            u, v = int(stubs[i]), int(stubs[i + 1])
+            if u != v:
+                adj[u, v] = adj[v, u] = 1.0
+
+
+def _dumbbell_adj(n: int, cluster_degree: int, bridge_edges: int, rng: np.random.Generator) -> np.ndarray:
+    """Two equal ~cluster_degree-regular blocks joined by ``bridge_edges`` bridge edges."""
     half = n // 2
     adj = np.zeros((n, n), dtype=np.float32)
-    for lo, hi in ((0, half), (half, n)):
-        adj[lo:hi, lo:hi] = 1.0
-    np.fill_diagonal(adj, 0.0)
+    _add_cluster_edges(np.arange(half), cluster_degree, adj, rng)
+    _add_cluster_edges(np.arange(half, n), cluster_degree, adj, rng)
     a_nodes = rng.permutation(half)[:bridge_edges]
     b_nodes = half + rng.permutation(n - half)[:bridge_edges]
     for a, b in zip(a_nodes, b_nodes):
@@ -61,26 +86,27 @@ def _dumbbell_adj(n: int, bridge_edges: int, rng: np.random.Generator) -> np.nda
 
 
 def _wellconnected_adj(n: int, degree: int, rng: np.random.Generator) -> np.ndarray:
-    """Random near-regular graph: low diameter, no bottleneck (the alignment control)."""
-    degree = min(degree, n - 1)
-    for _ in range(200):
-        adj = np.zeros((n, n), dtype=np.float32)
-        stubs = np.repeat(np.arange(n), degree)
-        rng.shuffle(stubs)
-        ok = True
-        for i in range(0, len(stubs) - 1, 2):
-            u, v = int(stubs[i]), int(stubs[i + 1])
-            if u == v or adj[u, v]:
-                ok = False
-                break
-            adj[u, v] = adj[v, u] = 1.0
-        if ok:
-            return adj
-    # fallback: ring + a few chords (always connected)
+    """One ~degree-regular block over all nodes: same local density as a dumbbell cluster, no bottleneck."""
     adj = np.zeros((n, n), dtype=np.float32)
-    for i in range(n):
-        adj[i, (i + 1) % n] = adj[(i + 1) % n, i] = 1.0
+    _add_cluster_edges(np.arange(n), degree, adj, rng)
     return adj
+
+
+def _bfs_distances(adj: np.ndarray, src: int) -> np.ndarray:
+    """Shortest-path hop distances from ``src`` (unreachable -> -1)."""
+    n = adj.shape[0]
+    dist = np.full(n, -1, dtype=np.int64)
+    dist[src] = 0
+    frontier = [src]
+    while frontier:
+        nxt = []
+        for u in frontier:
+            for v in np.nonzero(adj[u])[0]:
+                if dist[v] < 0:
+                    dist[v] = dist[u] + 1
+                    nxt.append(int(v))
+        frontier = nxt
+    return dist
 
 
 def _rrwp(adj: np.ndarray, steps: int) -> np.ndarray:
@@ -121,6 +147,7 @@ def make_batch(
     seed: int,
     device: torch.device,
     addressing: str = "content",
+    target_distance: int | None = None,
 ) -> Batch:
     """Feature layout: [key(K) | value(V) | query-key(K) | is_query(1) | anchor_flag(1)].
 
@@ -138,7 +165,7 @@ def make_batch(
     xs, adjs, rrwps, qmasks, labels, tidx = [], [], [], [], [], []
     for _ in range(batch_size):
         if graph == "dumbbell":
-            adj = _dumbbell_adj(n, bridge_edges, rng)
+            adj = _dumbbell_adj(n, degree, bridge_edges, rng)
         elif graph == "wellconnected":
             adj = _wellconnected_adj(n, degree, rng)
         else:
@@ -153,11 +180,27 @@ def make_batch(
         tgt = np.full(n, -1, dtype=np.int64)
 
         if addressing == "content":
-            # queries in cluster A retrieve distinct targets in cluster B (content match)
-            r = min(rank, half)
-            q_nodes = rng.permutation(half)[:r]
-            t_nodes = half + rng.permutation(n - half)[:r]
-            for q, t in zip(q_nodes, t_nodes):
+            if target_distance is None:
+                # cross-cluster (dumbbell) pairing: a fixed non-local retrieval
+                r = min(rank, half)
+                pairs = list(zip([int(v) for v in rng.permutation(half)[:r]],
+                                 [int(half + v) for v in rng.permutation(n - half)[:r]]))
+            else:
+                # plant each content target at BFS distance `target_distance` from its query
+                pairs = []
+                used_q: set[int] = set()
+                for _try in range(80):
+                    if len(pairs) >= rank:
+                        break
+                    q = int(rng.integers(0, n))
+                    if q in used_q:
+                        continue
+                    dist = _bfs_distances(adj, q)
+                    cand = [int(c) for c in np.nonzero(dist == target_distance)[0] if c != q]
+                    if cand:
+                        pairs.append((q, int(rng.choice(cand))))
+                        used_q.add(q)
+            for q, t in pairs:
                 qmask[q] = True
                 x[q, q_dim] = 1.0                                    # is_query flag
                 x[q, key_vocab + value_vocab + keys[t]] = 1.0        # query = target's key
@@ -242,11 +285,14 @@ class BottleneckRetriever(nn.Module):
         rrwp_steps: int = 8,
         dropout: float = 0.0,
         dense: bool = True,
+        vnode: bool = False,
     ) -> None:
         super().__init__()
         self.dense = dense
+        self.use_vnode = vnode
         self.encoder = nn.Linear(in_dim, dim)
         self.rrwp_node = nn.Linear(rrwp_steps, dim)  # node RRWP = diagonal of the pair tensor
+        self.vnode_emb = nn.Parameter(torch.zeros(1, 1, dim)) if vnode else None
         self.layers = nn.ModuleList(
             RRWPAttentionLayer(dim, heads, rrwp_steps, dropout) for _ in range(layers)
         )
@@ -256,14 +302,27 @@ class BottleneckRetriever(nn.Module):
         b, n = batch.x.shape[:2]
         node_rrwp = batch.rrwp[torch.arange(b)[:, None], torch.arange(n)[None], torch.arange(n)[None]]
         h = self.encoder(batch.x) + self.rrwp_node(node_rrwp)
+        rrwp = batch.rrwp
         # 1-hop attends to edges + self; dense attends everywhere.
-        mask = None
-        if not self.dense:
+        if self.dense:
+            mask = None
+        else:
             eye = torch.eye(n, device=batch.adj.device).unsqueeze(0)
             mask = ((batch.adj + eye) > 0).float()
+        if self.use_vnode:
+            # append one global token: every real node <-> vnode, vnode <-> all. A single
+            # low-rank global channel -- expected to help routing but bottleneck at high rank.
+            h = torch.cat([h, self.vnode_emb.expand(b, 1, -1)], dim=1)             # [B, n+1, dim]
+            rrwp = F.pad(rrwp, (0, 0, 0, 1, 0, 1))                                 # zero RRWP for vnode pairs
+            base = mask if mask is not None else torch.ones(b, n, n, device=h.device)
+            big = torch.zeros(b, n + 1, n + 1, device=h.device, dtype=base.dtype)
+            big[:, :n, :n] = base
+            big[:, :n, n] = 1.0   # real nodes read the vnode
+            big[:, n, :] = 1.0    # vnode reads everything (and itself)
+            mask = big
         for layer in self.layers:
-            h = layer(h, batch.rrwp, mask)
-        return h
+            h = layer(h, rrwp, mask)
+        return h[:, :n] if self.use_vnode else h
 
     def forward(self, batch: Batch) -> Tensor:
         return self.head(self.node_states(batch))
@@ -283,9 +342,16 @@ def _loss_and_acc(logits: Tensor, batch: Batch) -> tuple[Tensor, float, int]:
     return loss, acc, int(qm.sum())
 
 
+MODEL_SPECS = {
+    "dense": dict(dense=True, vnode=False),
+    "1hop": dict(dense=False, vnode=False),
+    "1hop_vnode": dict(dense=False, vnode=True),
+}
+
+
 def train_one(
     *,
-    dense: bool,
+    model_name: str,
     graph: str,
     cfg: dict,
     device: torch.device,
@@ -301,14 +367,14 @@ def train_one(
         layers=cfg["layers"],
         rrwp_steps=cfg["rrwp_steps"],
         dropout=cfg["dropout"],
-        dense=dense,
+        **MODEL_SPECS[model_name],
     ).to(device)
     opt = torch.optim.Adam(model.parameters(), lr=cfg["lr"])
     sample = lambda s: make_batch(
         cfg["batch_size"], graph=graph, n=cfg["n"], rank=cfg["rank"],
         key_vocab=cfg["key_vocab"], value_vocab=cfg["value_vocab"], rrwp_steps=cfg["rrwp_steps"],
         bridge_edges=cfg["bridge_edges"], degree=cfg["degree"], seed=s, device=device,
-        addressing=cfg["addressing"],
+        addressing=cfg["addressing"], target_distance=cfg.get("target_distance"),
     )
     model.train()
     log = []
@@ -335,24 +401,27 @@ def train_one(
 
 def run_sweep(cfg: dict, device: torch.device) -> list[dict]:
     rows = []
+    distances = cfg.get("distances", [None])
     for addressing in cfg["addressings"]:
         for graph in cfg["graphs"]:
-            for rank in cfg["ranks"]:
-                for dense in (True, False):
-                    run_cfg = {**cfg, "rank": rank, "addressing": addressing}
-                    accs, params = [], None
-                    for seed in range(cfg["seeds"]):
-                        _, res = train_one(dense=dense, graph=graph, cfg=run_cfg, device=device, seed=seed)
-                        accs.append(res["val_acc"])
-                        params = res["params"]
-                    rows.append({
-                        "addressing": addressing, "graph": graph, "rank": rank,
-                        "model": "dense" if dense else "1hop",
-                        "val_acc_mean": float(np.nanmean(accs)), "val_acc_std": float(np.nanstd(accs)),
-                        "seeds": cfg["seeds"], "params": params,
-                    })
-                    print(f"  [{addressing:10s} {graph:13s} rank={rank:2d} {'dense' if dense else '1hop ':5s}] "
-                          f"acc={rows[-1]['val_acc_mean']:.3f} +/- {rows[-1]['val_acc_std']:.3f}", flush=True)
+            for dist in distances:
+                for rank in cfg["ranks"]:
+                    for model_name in cfg["models"]:
+                        run_cfg = {**cfg, "rank": rank, "addressing": addressing, "target_distance": dist}
+                        accs, params = [], None
+                        for seed in range(cfg["seeds"]):
+                            _, res = train_one(model_name=model_name, graph=graph, cfg=run_cfg, device=device, seed=seed)
+                            accs.append(res["val_acc"])
+                            params = res["params"]
+                        rows.append({
+                            "addressing": addressing, "graph": graph,
+                            "distance": dist, "rank": rank, "model": model_name,
+                            "val_acc_mean": float(np.nanmean(accs)), "val_acc_std": float(np.nanstd(accs)),
+                            "seeds": cfg["seeds"], "params": params,
+                        })
+                        dstr = f"d={dist}" if dist is not None else "d=far"
+                        print(f"  [{addressing:10s} {graph:13s} {dstr:6s} rank={rank:2d} {model_name:11s}] "
+                              f"acc={rows[-1]['val_acc_mean']:.3f} +/- {rows[-1]['val_acc_std']:.3f}", flush=True)
     return rows
 
 
@@ -361,6 +430,14 @@ def plot_breakaway(rows: list[dict], out_path: Path) -> Path:
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
+    has_dist = any(r.get("distance") is not None for r in rows)
+    xkey = "distance" if has_dist else "rank"
+    xlabel = "query->target distance (hops)" if has_dist else "rank  (# simultaneous retrievals)"
+    model_styles = {
+        "dense": dict(marker="o", color="#1f77b4"),
+        "1hop": dict(marker="s", color="#d62728"),
+        "1hop_vnode": dict(marker="^", color="#2ca02c"),
+    }
     addressings = sorted({r.get("addressing", "content") for r in rows})
     graphs = sorted({r["graph"] for r in rows})
     fig, axes = plt.subplots(
@@ -370,25 +447,23 @@ def plot_breakaway(rows: list[dict], out_path: Path) -> Path:
     for ai, addressing in enumerate(addressings):
         for gi, graph in enumerate(graphs):
             ax = axes[ai][gi]
-            for model, style in (("dense", dict(marker="o", color="#1f77b4")),
-                                 ("1hop", dict(marker="s", color="#d62728"))):
+            for model, style in model_styles.items():
                 pts = sorted(
                     [r for r in rows if r.get("addressing", "content") == addressing
-                     and r["graph"] == graph and r["model"] == model],
-                    key=lambda r: r["rank"],
+                     and r["graph"] == graph and r["model"] == model and r.get(xkey) is not None],
+                    key=lambda r: r[xkey],
                 )
                 if not pts:
                     continue
-                ax.errorbar([p["rank"] for p in pts], [p["val_acc_mean"] for p in pts],
+                ax.errorbar([p[xkey] for p in pts], [p["val_acc_mean"] for p in pts],
                             yerr=[p["val_acc_std"] for p in pts], label=model, capsize=3, **style)
-            expect = "deviate" if addressing == "content" else "align"
-            ax.set_title(f"{addressing} / {graph}  (expect {expect})")
-            ax.set_xlabel("rank  (# simultaneous retrievals)")
+            ax.set_title(f"{addressing} / {graph}")
+            ax.set_xlabel(xlabel)
             ax.set_ylabel("retrieval accuracy")
             ax.set_ylim(0, 1.02)
             ax.grid(alpha=0.3)
             ax.legend()
-    fig.suptitle("Dense vs 1-hop attention: content addressing (deviate) vs structural (align)")
+    fig.suptitle(f"dense vs 1-hop vs 1-hop+VNode: retrieval accuracy vs {xkey}")
     fig.tight_layout()
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path, dpi=140)
@@ -405,6 +480,8 @@ def default_config() -> dict:
         "key_vocab": 16, "value_vocab": 8, "bridge_edges": 1, "degree": 6,
         "addressings": ["content", "structural"],
         "graphs": ["dumbbell", "wellconnected"], "ranks": [1, 2, 4, 8],
+        "models": ["dense", "1hop", "1hop_vnode"],
+        "distances": [None],  # set e.g. [1,2,3,4] to sweep query->target distance (the reach axis)
         "batch_size": 64, "steps": 400, "eval_batches": 8, "lr": 1e-3, "seeds": 2,
     }
 
@@ -420,12 +497,16 @@ def main(argv: Sequence[str] | None = None) -> dict:
     ap.add_argument("--ranks", type=int, nargs="+", default=None)
     ap.add_argument("--graphs", nargs="+", default=None)
     ap.add_argument("--addressings", nargs="+", default=None)
+    ap.add_argument("--models", nargs="+", default=None, help="subset of: dense 1hop 1hop_vnode")
+    ap.add_argument("--distances", type=int, nargs="+", default=None,
+                    help="query->target hop distances to sweep (the reach axis); omit for the default far placement")
+    ap.add_argument("--degree", type=int, default=None, help="shared cluster degree (local density)")
     ap.add_argument("--fast-dev-run", action="store_true")
     ap.add_argument("--device", default="auto")
     args = ap.parse_args(argv)
 
     cfg = default_config()
-    for key in ("n", "layers", "steps", "seeds", "ranks", "graphs", "addressings"):
+    for key in ("n", "layers", "steps", "seeds", "ranks", "graphs", "addressings", "models", "distances", "degree"):
         if getattr(args, key) is not None:
             cfg[key] = getattr(args, key)
     if args.fast_dev_run:
@@ -454,19 +535,22 @@ def main(argv: Sequence[str] | None = None) -> dict:
     fig_path = plot_breakaway(rows, out_dir / "breakaway.png")
     print(f"[figure] wrote {fig_path}", flush=True)
 
-    # headline: dense-minus-1hop gap at max rank for each (addressing, graph)
-    def gap(addressing: str, graph: str, rank: int) -> float:
-        pick = lambda m: next((r for r in rows if r.get("addressing", "content") == addressing
-                               and r["graph"] == graph and r["model"] == m and r["rank"] == rank), None)
-        d, s = pick("dense"), pick("1hop")
-        return (d["val_acc_mean"] - s["val_acc_mean"]) if d and s else float("nan")
+    # headline: model accuracies across the swept axis for each (addressing, graph)
+    has_dist = any(r.get("distance") is not None for r in rows)
+    xkey = "distance" if has_dist else "rank"
+    xs = sorted({r[xkey] for r in rows if r.get(xkey) is not None})
 
-    rmax = max(cfg["ranks"])
-    print(f"\n[headline] dense - 1hop accuracy gap at rank={rmax}:")
+    def acc(addressing: str, graph: str, model: str, xval) -> float:
+        r = next((r for r in rows if r.get("addressing", "content") == addressing and r["graph"] == graph
+                  and r["model"] == model and r.get(xkey) == xval), None)
+        return r["val_acc_mean"] if r else float("nan")
+
+    print(f"\n[headline] accuracy by model (x-axis = {xkey}):")
     for addressing in cfg["addressings"]:
-        expect = "expect a LARGE gap (deviate)" if addressing == "content" else "expect ~0 (align)"
         for graph in cfg["graphs"]:
-            print(f"  {addressing:10s} / {graph:13s}: {gap(addressing, graph, rmax):+.3f}   ({expect})")
+            cells = [f"{xkey}={xval} [" + " ".join(f"{m}={acc(addressing, graph, m, xval):.2f}" for m in cfg["models"]) + "]"
+                     for xval in xs]
+            print(f"  {addressing:10s}/{graph:13s}  " + "   ".join(cells))
 
     return {"out_dir": str(out_dir), "cache": str(cache_path), "figure": str(fig_path), "rows": rows}
 

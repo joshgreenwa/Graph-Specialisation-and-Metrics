@@ -91,9 +91,11 @@ def main(argv: Sequence[str] | None = None) -> None:
     ap.add_argument("--run-name", default="first_run")
     ap.add_argument("--steps", type=int, default=1500)
     ap.add_argument("--seeds", type=int, default=3)
-    ap.add_argument("--ranks", type=int, nargs="+", default=[1, 2, 4, 8])
+    ap.add_argument("--ranks", type=int, nargs="+", default=[1])
     ap.add_argument("--graphs", nargs="+", default=["dumbbell", "wellconnected"])
-    ap.add_argument("--addressings", nargs="+", default=["content", "structural"])
+    ap.add_argument("--addressings", nargs="+", default=["content"])
+    ap.add_argument("--models", nargs="+", default=["dense", "1hop", "1hop_vnode"])
+    ap.add_argument("--distances", type=int, nargs="+", default=[1, 2, 3, 4])
     ap.add_argument("--fast-dev-run", action="store_true")
     ap.add_argument("--skip-clone", action="store_true")
     args = ap.parse_args(argv)
@@ -127,7 +129,10 @@ def main(argv: Sequence[str] | None = None) -> None:
         "--ranks", *[str(r) for r in args.ranks],
         "--graphs", *[str(g) for g in args.graphs],
         "--addressings", *[str(a) for a in args.addressings],
+        "--models", *[str(m) for m in args.models],
     ]
+    if args.distances:
+        inner += ["--distances", *[str(d) for d in args.distances]]
     if args.fast_dev_run:
         inner.append("--fast-dev-run")
 
@@ -138,13 +143,18 @@ def main(argv: Sequence[str] | None = None) -> None:
     print(f"  out_dir: {result['out_dir']}")
 
 
-# --- fires on paste. First real run trains the sweep (~minutes on a Colab GPU); pass
-#     --fast-dev-run first to check the plumbing, or bump --steps/--seeds for tighter curves. ---
+# --- fires on paste. Default = the DISTANCE-trend figure: content retrieval, all 3 models,
+#     query->target distance 1..4 (the reach axis). Expect dense flat at ~1.0, 1-hop high at
+#     d=1 and falling as distance grows, and 1-hop+VNode somewhere in between (its failure point
+#     is what we're hunting). Pass --fast-dev-run first to check plumbing. ---
 if __name__ == "__main__":
     main([
-        "--run-name", "first_run",
+        "--run-name", "distance_trend_v1",
         "--steps", "1500",
         "--seeds", "3",
-        "--ranks", "1", "2", "4", "8",
+        "--ranks", "1",
+        "--distances", "1", "2", "3", "4",
+        "--addressings", "content",
         "--graphs", "dumbbell", "wellconnected",
+        "--models", "dense", "1hop", "1hop_vnode",
     ])

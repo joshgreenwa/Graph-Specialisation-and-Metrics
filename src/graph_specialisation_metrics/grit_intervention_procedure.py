@@ -65,6 +65,16 @@ MODEL_LABELS = {
     "gin": "GIN",
 }
 
+MODEL_PLOT_ORDER = ["dense_grit", "grit_1hop_localrrwp", "grit_1hop", "ginplus", "gin", "gcn"]
+MODEL_PALETTE = {
+    "dense_grit": "#4c78a8",
+    "grit_1hop_localrrwp": "#54a24b",
+    "grit_1hop": "#f58518",
+    "ginplus": "#b279a2",
+    "gin": "#e45756",
+    "gcn": "#72b7b2",
+}
+
 
 def model_label(model_name: str) -> str:
     return MODEL_LABELS.get(str(model_name), str(model_name).replace("_", " "))
@@ -5294,7 +5304,7 @@ def render_symbolic_structural_by_distance(rows: Sequence[Mapping[str, Any]], ar
     ax_tot.set_xticks(x)
     ax_tot.set_xticklabels([dict(panels).get(factor, factor) for factor in factors], rotation=15, ha="right")
     ax_tot.set_ylabel("Total |carriage| per graph (prediction units)")
-    ax_tot.set_title("How much content/RRWP carriage each model uses")
+    ax_tot.set_title("Diagnostic total carriage: content and pair-RRWP effects")
     ax_tot.legend(frameon=False, fontsize=8)
     write_csv(artifact_root / "metrics" / "step4_symbolic_structural_component_totals.csv", total_rows)
     fig_tot.savefig(figures / "step4_symbolic_structural_component_totals.png", dpi=dpi)
@@ -5344,7 +5354,8 @@ def render_symbolic_structural_by_distance(rows: Sequence[Mapping[str, Any]], ar
                 panel_payload.append((factor, title, paired_values))
         if not panel_payload:
             return
-        fig_con, axes_con = plt.subplots(1, len(panel_payload), figsize=(5.0 * len(panel_payload), 4.4), constrained_layout=True)
+        fig_width = 6.8 if len(panel_payload) == 1 else 4.8 * len(panel_payload)
+        fig_con, axes_con = plt.subplots(1, len(panel_payload), figsize=(fig_width, 4.6), constrained_layout=True)
         axes_con_flat = np.asarray(axes_con).reshape(-1)
         for ax, (factor, title, paired_values) in zip(axes_con_flat, panel_payload):
             distances = sorted(paired_values)
@@ -5386,7 +5397,10 @@ def render_symbolic_structural_by_distance(rows: Sequence[Mapping[str, Any]], ar
             ax.set_title(title)
             ax.set_xlabel("Molecular hop distance")
             ax.set_ylabel("Global 1-hop - local 1-hop\nmean |RRWP carriage|")
-        fig_con.suptitle("Where global RRWP changes structural carriage relative to local RRWP")
+        if len(panel_payload) == 1:
+            fig_con.suptitle("Diagnostic: global-minus-local RRWP carriage contrast")
+        else:
+            fig_con.suptitle("Where global RRWP changes structural carriage relative to local RRWP")
         write_csv(artifact_root / "metrics" / "step4_symbolic_global_vs_local_rrwp_contrast.csv", contrast_rows)
         fig_con.savefig(figures / "step4_symbolic_global_vs_local_rrwp_contrast.png", dpi=dpi)
         fig_con.savefig(figures / "step4_symbolic_global_vs_local_rrwp_contrast.pdf")
@@ -6180,6 +6194,102 @@ def rrwp_global_channel_ablation_rows_for_graph(
     return rows, {"status": "complete", "model": model.name, "graph_id": gid, "pair_id": stable_pair_id, "rows": len(rows)}
 
 
+def _global_rrwp_channel_order(clean: Sequence[Mapping[str, Any]]) -> list[str]:
+    order = sorted(
+        {str(r.get("model")) for r in clean},
+        key=lambda name: (MODEL_PLOT_ORDER.index(name) if name in MODEL_PLOT_ORDER else len(MODEL_PLOT_ORDER), name),
+    )
+    if "grit_1hop" in order and "grit_1hop_localrrwp" not in order:
+        insert_at = order.index("grit_1hop")
+        order.insert(insert_at, "grit_1hop_localrrwp")
+    return order
+
+
+def _render_step4_global_rrwp_channel_ablation_main(
+    rows: Sequence[Mapping[str, Any]],
+    artifact_root: Path,
+    *,
+    dpi: int,
+) -> None:
+    figures = ensure_dir(artifact_root / "figures")
+    clean = [r for r in rows if str(r.get("status")) == "complete"]
+    if not clean:
+        return
+    factors = [f for f in ("node", "pair", "both") if any(str(r.get("ablation_type")) == f for r in clean)]
+    if not factors:
+        return
+    order = _global_rrwp_channel_order(clean)
+    labels = {"node": "node\nRRWP", "pair": "pair\nRRWP", "both": "node + pair\nRRWP"}
+    fig, ax = plt.subplots(figsize=(8.8, 5.0), constrained_layout=True)
+    x = np.arange(len(factors), dtype=float)
+    width = 0.8 / max(len(order), 1)
+    all_values: list[float] = []
+    for idx, model_name in enumerate(order):
+        means: list[float] = []
+        lows: list[float] = []
+        highs: list[float] = []
+        missing: list[bool] = []
+        for factor in factors:
+            vals = [
+                safe_float(r.get("abs_delta_pred"))
+                for r in clean
+                if str(r.get("model")) == model_name and str(r.get("ablation_type")) == factor
+            ]
+            vals = [v for v in vals if math.isfinite(v)]
+            if vals:
+                mean, lo, hi = bootstrap_ci(vals, seed=stable_seed("global_rrwp_channel_main", model_name, factor), draws=500)
+                missing.append(False)
+                all_values.extend([mean, lo, hi])
+            else:
+                mean, lo, hi = 0.0, 0.0, 0.0
+                missing.append(True)
+            means.append(mean)
+            lows.append(lo)
+            highs.append(hi)
+        pos = x - 0.4 + width / 2 + idx * width
+        y = np.asarray(means, dtype=float)
+        yerr = np.vstack([
+            np.maximum(0.0, y - np.asarray(lows, dtype=float)),
+            np.maximum(0.0, np.asarray(highs, dtype=float) - y),
+        ])
+        bars = ax.bar(
+            pos,
+            y,
+            width=width,
+            yerr=yerr,
+            capsize=2.5,
+            label=model_label(model_name),
+            color=MODEL_PALETTE.get(model_name),
+            alpha=0.9,
+        )
+        for bar, is_missing in zip(bars, missing):
+            if is_missing:
+                bar.set_facecolor("white")
+                bar.set_edgecolor(MODEL_PALETTE.get(model_name, "#888888"))
+                bar.set_hatch("//")
+                bar.set_linewidth(1.2)
+    ax.axhline(0.0, color="#555555", linewidth=1)
+    ax.set_xticks(x)
+    ax.set_xticklabels([labels.get(f, f) for f in factors])
+    ax.set_ylabel("Prediction disruption, mean |Δŷ|")
+    ax.set_title("Global RRWP dependence in 1-hop GRIT")
+    ax.legend(frameon=False, fontsize=8)
+    ax.text(
+        0.01,
+        -0.20,
+        "Long RRWP channels are removed beyond self/1-hop; hatched zero bars mean no matching long channel was available.",
+        transform=ax.transAxes,
+        ha="left",
+        va="top",
+        fontsize=9,
+        color="#555555",
+    )
+    ax.set_ylim(bottom=0.0)
+    fig.savefig(figures / "step4_global_to_local_rrwp_ablation_main.png", dpi=dpi)
+    fig.savefig(figures / "step4_global_to_local_rrwp_ablation_main.pdf")
+    plt.close(fig)
+
+
 def render_step4_global_rrwp_channel_ablation(rows: Sequence[Mapping[str, Any]], artifact_root: Path, *, dpi: int) -> None:
     figures = ensure_dir(artifact_root / "figures")
     clean = [r for r in rows if str(r.get("status")) == "complete"]
@@ -6191,7 +6301,7 @@ def render_step4_global_rrwp_channel_ablation(rows: Sequence[Mapping[str, Any]],
         fig.savefig(figures / "step4_global_to_local_rrwp_ablation.pdf")
         plt.close(fig)
         return
-    order = ordered_model_names([str(r.get("model")) for r in clean])
+    order = _global_rrwp_channel_order(clean)
     factors = [f for f in ("node", "pair", "both") if any(str(r.get("ablation_type")) == f for r in clean)]
     labels = {"node": "node\nRRWP", "pair": "pair\nRRWP", "both": "node+pair\nRRWP"}
     fig, axes = plt.subplots(1, 2, figsize=(12.0, 4.8), constrained_layout=True)
@@ -6199,8 +6309,8 @@ def render_step4_global_rrwp_channel_ablation(rows: Sequence[Mapping[str, Any]],
     width = 0.8 / max(len(order), 1)
     summary_rows: list[dict[str, Any]] = []
     for ax, value_key, ylabel, title in (
-        (axes[0], "delta_mae", "Δ test MAE estimate (positive = worse)", "Does removing long RRWP hurt?"),
-        (axes[1], "abs_delta_pred", "Mean |Δŷ|", "Prediction sensitivity to long RRWP"),
+        (axes[0], "delta_mae", "Estimated Δ test MAE (positive = worse)", "Does long-RRWP removal damage the prediction?"),
+        (axes[1], "abs_delta_pred", "Prediction disruption, mean |Δŷ|", "Sensitivity to long RRWP"),
     ):
         for idx, model_name in enumerate(order):
             means: list[float] = []
@@ -6216,7 +6326,7 @@ def render_step4_global_rrwp_channel_ablation(rows: Sequence[Mapping[str, Any]],
                 if vals:
                     mean, lo, hi = bootstrap_ci(vals, seed=stable_seed("global_rrwp_channel", value_key, model_name, factor), draws=500)
                 else:
-                    mean, lo, hi = float("nan"), float("nan"), float("nan")
+                    mean, lo, hi = (0.0, 0.0, 0.0) if model_name == "grit_1hop_localrrwp" else (float("nan"), float("nan"), float("nan"))
                 means.append(mean)
                 lows.append(lo)
                 highs.append(hi)
@@ -6237,7 +6347,23 @@ def render_step4_global_rrwp_channel_ablation(rows: Sequence[Mapping[str, Any]],
                 np.maximum(0.0, y - np.asarray(lows, dtype=float)),
                 np.maximum(0.0, np.asarray(highs, dtype=float) - y),
             ])
-            ax.bar(pos, y, width=width, yerr=yerr, capsize=2.5, label=model_label(model_name), alpha=0.9)
+            bars = ax.bar(
+                pos,
+                y,
+                width=width,
+                yerr=yerr,
+                capsize=2.5,
+                label=model_label(model_name),
+                color=MODEL_PALETTE.get(model_name),
+                alpha=0.9,
+            )
+            for bar, factor, mean in zip(bars, factors, means):
+                has_rows = any(str(r.get("model")) == model_name and str(r.get("ablation_type")) == factor for r in clean)
+                if not has_rows and math.isfinite(float(mean)):
+                    bar.set_facecolor("white")
+                    bar.set_edgecolor(MODEL_PALETTE.get(model_name, "#888888"))
+                    bar.set_hatch("//")
+                    bar.set_linewidth(1.2)
         ax.axhline(0, color="#555555", linewidth=1, linestyle=":")
         ax.set_xticks(x)
         ax.set_xticklabels([labels.get(f, f) for f in factors])
@@ -6249,6 +6375,7 @@ def render_step4_global_rrwp_channel_ablation(rows: Sequence[Mapping[str, Any]],
     fig.savefig(figures / "step4_global_to_local_rrwp_ablation.png", dpi=dpi)
     fig.savefig(figures / "step4_global_to_local_rrwp_ablation.pdf")
     plt.close(fig)
+    _render_step4_global_rrwp_channel_ablation_main(rows, artifact_root, dpi=dpi)
 
 
 def run_rrwp_distance_ablation_probe(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[str, Any]) -> dict[str, Any]:
@@ -8415,6 +8542,176 @@ def _apply_grit_focused_ylim(
         )
 
 
+def _ordered_models_for_rows(rows: Sequence[Mapping[str, Any]], *, grit_only: bool = False) -> list[str]:
+    models = {str(r.get("model")) for r in rows if str(r.get("model")) not in {"", "None"}}
+    if grit_only:
+        models = {model for model in models if _model_is_grit_family(model)}
+    return sorted(
+        models,
+        key=lambda name: (MODEL_PLOT_ORDER.index(name) if name in MODEL_PLOT_ORDER else len(MODEL_PLOT_ORDER), name),
+    )
+
+
+def _render_step5_load_bearing_main(
+    total_summary: Sequence[Mapping[str, Any]],
+    artifact_root: Path,
+    *,
+    dpi: int,
+) -> None:
+    """Clean headline panel for cross-model load-bearing long-range carriage.
+
+    The two-panel diagnostic figure is still written by
+    ``render_step5_load_bearing_carriage_ablation``. This figure keeps only the
+    interpretable cross-model test: removing total far carriage ranked by |C|,
+    with random far-pair removal as the ERASER-style control.
+    """
+
+    rows = [
+        r
+        for r in total_summary
+        if str(r.get("ranker")) in {"carriage", "random_far_pairs"}
+        and _model_is_grit_family(str(r.get("model")))
+        and math.isfinite(safe_float(r.get("fraction_removed")))
+        and math.isfinite(safe_float(r.get("mean_delta_mae")))
+    ]
+    if not rows:
+        return
+    figures = ensure_dir(artifact_root / "figures")
+    fig, ax = plt.subplots(figsize=(8.6, 5.2), constrained_layout=True)
+    all_values: list[float] = []
+    focus_values: list[float] = []
+    for model in _ordered_models_for_rows(rows, grit_only=True):
+        for ranker, linestyle, linewidth, marker in (
+            ("carriage", "-", 2.2, "o"),
+            ("random_far_pairs", "--", 1.6, "s"),
+        ):
+            sub = sorted(
+                [r for r in rows if str(r.get("model")) == model and str(r.get("ranker")) == ranker],
+                key=lambda r: safe_float(r.get("fraction_removed")),
+            )
+            if not sub:
+                continue
+            x = np.asarray([safe_float(r.get("fraction_removed")) for r in sub], dtype=float)
+            y = np.asarray([safe_float(r.get("mean_delta_mae")) for r in sub], dtype=float)
+            lo = np.asarray([safe_float(r.get("ci_low")) for r in sub], dtype=float)
+            hi = np.asarray([safe_float(r.get("ci_high")) for r in sub], dtype=float)
+            mask = np.isfinite(x) & np.isfinite(y)
+            if not mask.any():
+                continue
+            color = MODEL_PALETTE.get(model)
+            label_suffix = "|C|-ranked" if ranker == "carriage" else "random"
+            ax.plot(
+                x[mask],
+                y[mask],
+                marker=marker,
+                linestyle=linestyle,
+                linewidth=linewidth,
+                color=color,
+                label=f"{model_label(model)} {label_suffix}",
+            )
+            values = [float(v) for v in list(y[mask]) + list(lo[mask]) + list(hi[mask]) if math.isfinite(float(v))]
+            all_values.extend(values)
+            focus_values.extend(values)
+            ci_mask = mask & np.isfinite(lo) & np.isfinite(hi)
+            if ci_mask.any() and ranker == "carriage":
+                ax.fill_between(x[ci_mask], lo[ci_mask], hi[ci_mask], color=color, alpha=0.13, linewidth=0)
+    ax.axhline(0.0, color="#555555", linewidth=1)
+    ax.set_title("Load-bearing far carriage: ranked IG-completeness ablation")
+    ax.set_xlabel("Fraction of far pairs removed (d > τ)")
+    ax.set_ylabel("Estimated Δ test MAE (positive = worse)")
+    _apply_grit_focused_ylim(ax, focus_values=focus_values, all_values=all_values)
+    ax.legend(frameon=False, fontsize=8, ncol=1)
+    ax.text(
+        0.01,
+        -0.20,
+        "Solid lines remove the largest |C[i,j]| far pairs first; dashed lines remove random far pairs.",
+        transform=ax.transAxes,
+        ha="left",
+        va="top",
+        fontsize=9,
+        color="#555555",
+    )
+    fig.savefig(figures / "step5_load_bearing_carriage_ablation_main.png", dpi=dpi)
+    fig.savefig(figures / "step5_load_bearing_carriage_ablation_main.pdf")
+    plt.close(fig)
+
+
+def _render_step5_distance_binned_main(
+    summary_rows: Sequence[Mapping[str, Any]],
+    artifact_root: Path,
+    *,
+    dpi: int,
+) -> None:
+    rows = [
+        r
+        for r in summary_rows
+        if _model_is_grit_family(str(r.get("model")))
+        and math.isfinite(safe_float(r.get("distance_bin_index")))
+        and math.isfinite(safe_float(r.get("mean_delta_mae")))
+    ]
+    if not rows:
+        return
+    figures = ensure_dir(artifact_root / "figures")
+    bin_rows = sorted(
+        {
+            (int(safe_float(r.get("distance_bin_index"))), str(r.get("distance_bin")))
+            for r in rows
+        },
+        key=lambda item: item[0],
+    )
+    x = np.arange(len(bin_rows), dtype=float)
+    fig, axes = plt.subplots(1, 2, figsize=(12.2, 4.9), constrained_layout=True)
+    effect_values: list[float] = []
+    mass_values: list[float] = []
+    for model in _ordered_models_for_rows(rows, grit_only=True):
+        model_rows = {int(safe_float(r.get("distance_bin_index"))): r for r in rows if str(r.get("model")) == model}
+        y = np.asarray([safe_float(model_rows.get(idx, {}).get("mean_delta_mae")) for idx, _ in bin_rows], dtype=float)
+        lo = np.asarray([safe_float(model_rows.get(idx, {}).get("ci_low")) for idx, _ in bin_rows], dtype=float)
+        hi = np.asarray([safe_float(model_rows.get(idx, {}).get("ci_high")) for idx, _ in bin_rows], dtype=float)
+        mass = np.asarray([safe_float(model_rows.get(idx, {}).get("mean_abs_removed_carriage")) for idx, _ in bin_rows], dtype=float)
+        color = MODEL_PALETTE.get(model)
+        mask = np.isfinite(y)
+        if mask.any():
+            axes[0].plot(x[mask], y[mask], marker="o", linewidth=2.0, color=color, label=model_label(model))
+            effect_values.extend([float(v) for v in list(y[mask]) + list(lo[mask]) + list(hi[mask]) if math.isfinite(float(v))])
+            ci_mask = mask & np.isfinite(lo) & np.isfinite(hi)
+            if ci_mask.any():
+                axes[0].fill_between(x[ci_mask], lo[ci_mask], hi[ci_mask], color=color, alpha=0.13, linewidth=0)
+        mass_mask = np.isfinite(mass)
+        if mass_mask.any():
+            axes[1].plot(x[mass_mask], mass[mass_mask], marker="o", linewidth=2.0, color=color, label=model_label(model))
+            mass_values.extend([float(v) for v in mass[mass_mask] if math.isfinite(float(v))])
+    labels = [label for _, label in bin_rows]
+    axes[0].axhline(0.0, color="#555555", linewidth=1)
+    axes[0].set_title("Prediction penalty by distance band")
+    axes[0].set_xlabel("Molecular hop distance bin")
+    axes[0].set_ylabel("Estimated Δ test MAE after removing band")
+    axes[0].set_xticks(x)
+    axes[0].set_xticklabels(labels, rotation=15, ha="right")
+    _apply_grit_focused_ylim(axes[0], focus_values=effect_values, all_values=effect_values)
+    axes[0].legend(frameon=False, fontsize=8)
+    axes[1].set_title("How much carriage was removed")
+    axes[1].set_xlabel("Molecular hop distance bin")
+    axes[1].set_ylabel("Mean Σ|C[i,j]| removed")
+    axes[1].set_xticks(x)
+    axes[1].set_xticklabels(labels, rotation=15, ha="right")
+    _apply_grit_focused_ylim(axes[1], focus_values=mass_values, all_values=mass_values, positive_floor_zero=True)
+    axes[1].legend(frameon=False, fontsize=8)
+    fig.suptitle("Distance-binned load-bearing carriage in the GRIT family")
+    fig.text(
+        0.02,
+        0.01,
+        "d=2-3 is near/mid-range; dissertation long-range claims should focus on d>=4.",
+        ha="left",
+        va="bottom",
+        fontsize=9,
+        color="#555555",
+    )
+    fig.savefig(figures / "step5_distance_binned_total_carriage_ablation_grit_only.png", dpi=dpi)
+    fig.savefig(figures / "step5_distance_binned_total_carriage_ablation_grit_only.pdf")
+    plt.close(fig)
+
+
 def render_step5_load_bearing_carriage_ablation(
     total_summary: Sequence[Mapping[str, Any]],
     component_summary: Sequence[Mapping[str, Any]],
@@ -8427,19 +8724,12 @@ def render_step5_load_bearing_carriage_ablation(
     figures = ensure_dir(artifact_root / "figures")
     fig, axes = plt.subplots(1, 2, figsize=(13.2, 5.0), constrained_layout=True)
     ax = axes[0]
-    model_order = ["dense_grit", "grit_1hop_localrrwp", "grit_1hop", "ginplus", "gin", "gcn"]
+    model_order = MODEL_PLOT_ORDER
     present_models = sorted(
         {str(r.get("model")) for r in total_summary},
         key=lambda name: (model_order.index(name) if name in model_order else len(model_order), name),
     )
-    palette = {
-        "dense_grit": "#4c78a8",
-        "grit_1hop_localrrwp": "#54a24b",
-        "grit_1hop": "#f58518",
-        "ginplus": "#b279a2",
-        "gin": "#e45756",
-        "gcn": "#72b7b2",
-    }
+    palette = MODEL_PALETTE
     ranker_labels = {"carriage": "carriage-ranked", "random_far_pairs": "random far pairs"}
     panel_a_all_values: list[float] = []
     panel_a_focus_values: list[float] = []
@@ -8549,6 +8839,7 @@ def render_step5_load_bearing_carriage_ablation(
     fig.savefig(figures / "step5_load_bearing_carriage_ablation.png", dpi=dpi)
     fig.savefig(figures / "step5_load_bearing_carriage_ablation.pdf")
     plt.close(fig)
+    _render_step5_load_bearing_main(total_summary, artifact_root, dpi=dpi)
 
 
 def render_step5_distance_binned_total_carriage_ablation(
@@ -8567,7 +8858,7 @@ def render_step5_distance_binned_total_carriage_ablation(
     ]
     if not rows:
         return
-    model_order = ["dense_grit", "grit_1hop_localrrwp", "grit_1hop", "ginplus", "gin", "gcn"]
+    model_order = MODEL_PLOT_ORDER
     models = sorted(
         {str(r.get("model")) for r in rows},
         key=lambda name: (model_order.index(name) if name in model_order else len(model_order), name),
@@ -8581,14 +8872,7 @@ def render_step5_distance_binned_total_carriage_ablation(
     )
     bin_labels = [label for _, label in bin_rows]
     x = np.arange(len(bin_rows), dtype=float)
-    palette = {
-        "dense_grit": "#4c78a8",
-        "grit_1hop_localrrwp": "#54a24b",
-        "grit_1hop": "#f58518",
-        "ginplus": "#b279a2",
-        "gin": "#e45756",
-        "gcn": "#72b7b2",
-    }
+    palette = MODEL_PALETTE
     fig, axes = plt.subplots(1, 2, figsize=(13.2, 5.0), constrained_layout=True)
     effect_all_values: list[float] = []
     effect_focus_values: list[float] = []
@@ -8602,7 +8886,7 @@ def render_step5_distance_binned_total_carriage_ablation(
         finite = np.isfinite(means)
         if finite.any():
             color = palette.get(model)
-            axes[0].plot(x[finite], means[finite], marker="o", linewidth=2.0, label=model, color=color)
+            axes[0].plot(x[finite], means[finite], marker="o", linewidth=2.0, label=model_label(model), color=color)
             effect_all_values.extend([float(v) for v in means[finite] if math.isfinite(float(v))])
             effect_all_values.extend([float(v) for v in lows[finite] if math.isfinite(float(v))])
             effect_all_values.extend([float(v) for v in highs[finite] if math.isfinite(float(v))])
@@ -8616,7 +8900,7 @@ def render_step5_distance_binned_total_carriage_ablation(
         abs_mass = np.asarray([safe_float(model_rows.get(idx, {}).get("mean_abs_removed_carriage")) for idx, _ in bin_rows], dtype=float)
         finite_mass = np.isfinite(abs_mass)
         if finite_mass.any():
-            axes[1].plot(x[finite_mass], abs_mass[finite_mass], marker="o", linewidth=2.0, label=model, color=palette.get(model))
+            axes[1].plot(x[finite_mass], abs_mass[finite_mass], marker="o", linewidth=2.0, label=model_label(model), color=palette.get(model))
             mass_all_values.extend([float(v) for v in abs_mass[finite_mass] if math.isfinite(float(v))])
             if _model_is_grit_family(model):
                 mass_focus_values.extend([float(v) for v in abs_mass[finite_mass] if math.isfinite(float(v))])
@@ -8641,6 +8925,7 @@ def render_step5_distance_binned_total_carriage_ablation(
     fig.savefig(figures / "step5_distance_binned_total_carriage_ablation.png", dpi=dpi)
     fig.savefig(figures / "step5_distance_binned_total_carriage_ablation.pdf")
     plt.close(fig)
+    _render_step5_distance_binned_main(summary_rows, artifact_root, dpi=dpi)
 
 
 def render_step5_dense_control_excess_distance_ablation(
@@ -9212,6 +9497,151 @@ def render_step5_vnode_decision(decision: Mapping[str, Any], artifact_root: Path
     plt.close(fig)
 
 
+class _GRITBeneficialBackend:
+    """Adapts an official GRIT ModelRun to the beneficial_carriage.FBCBackend protocol.
+
+    Resampling is at the encoded-content level (same unit as carriage): replace one node's encoded
+    state with a donor's and forward through the frozen readout. Distances are cached per graph.
+    """
+
+    def __init__(self, model: ModelRun) -> None:
+        self.adapter = model.adapter
+        self._dist: dict[int, torch.Tensor] = {}
+
+    def _dm(self, graph: Any) -> torch.Tensor:
+        key = id(graph)
+        if key not in self._dist:
+            self._dist[key] = torch.as_tensor(distance_matrix(graph)).long()
+        return self._dist[key]
+
+    def encoded(self, graph: Any) -> torch.Tensor:
+        return self.adapter.encoded_node_states(graph).detach()
+
+    def predict(self, graph: Any, encoded: torch.Tensor) -> float:
+        return float(predict_scalar_from_encoded(self.adapter, graph, encoded).detach().cpu().item())
+
+    def label(self, graph: Any) -> float:
+        y = getattr(graph, "y", None)
+        if y is None:
+            return float("nan")
+        return float(torch.as_tensor(y).reshape(-1)[0].item())
+
+    def distances(self, graph: Any) -> torch.Tensor:
+        return self._dm(graph)
+
+    def degree(self, graph: Any) -> torch.Tensor:
+        return (self._dm(graph) == 1).sum(dim=1).float()
+
+    def signature(self, graph: Any, node: int) -> tuple[int, int]:
+        x = getattr(graph, "x", None)
+        atom = 0
+        if x is not None:
+            xt = torch.as_tensor(x)
+            xt = xt.reshape(int(xt.shape[0]), -1)
+            atom = int(xt[node, 0].item())
+        deg = int((self._dm(graph)[node] == 1).sum().item())
+        return (atom, deg)
+
+
+def render_step6(rows: Sequence[Mapping[str, Any]], artifact_root: Path, *, dpi: int) -> None:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    figures = artifact_root / "figures"
+    figures.mkdir(parents=True, exist_ok=True)
+    if not rows:
+        return
+    models = sorted({str(r["model"]) for r in rows})
+
+    def sel(model: str, split: str, mode: str, scope: str = "single_source") -> list[Mapping[str, Any]]:
+        return sorted(
+            [r for r in rows if r["model"] == model and r["split"] == split
+             and r["resampler"] == mode and r.get("scope", "single_source") == scope],
+            key=lambda r: r["distance"],
+        )
+
+    fig, axes = plt.subplots(1, 2, figsize=(13, 4.6))
+    ax = axes[0]
+    for model in models:
+        pts = sel(model, "test", "matched")
+        if not pts:
+            continue
+        d = [p["distance"] for p in pts]
+        b = [p["B"] for p in pts]
+        yerr = [[p["B"] - p["B_lo"] for p in pts], [p["B_hi"] - p["B"] for p in pts]]
+        ax.errorbar(d, b, yerr=yerr, marker="o", capsize=3, label=model)
+    ax.axhline(0, color="k", lw=0.8, ls=":")
+    ax.set_title("Beneficial carriage B(d): test, matched resampler")
+    ax.set_xlabel("distance from focal node (hops)")
+    ax.set_ylabel("B(d): loss increase when true content is resampled")
+    ax.grid(alpha=0.3)
+    ax.legend()
+
+    ax = axes[1]
+    m0 = models[0]
+    for mode, ls in (("matched", "-"), ("marginal", "--")):
+        pts = sel(m0, "test", mode)
+        if pts:
+            ax.plot([p["distance"] for p in pts], [p["B"] for p in pts], ls, marker="s", label=f"B {mode}")
+    ptsf = sel(m0, "test", "matched")
+    if ptsf:
+        ax.plot([p["distance"] for p in ptsf], [p["F"] for p in ptsf], ":", marker="^", color="gray", label="F (functional)")
+    ax.axhline(0, color="k", lw=0.8, ls=":")
+    ax.set_title(f"{m0}: functional F(d) vs beneficial B(d) (matched vs marginal = the artifact)")
+    ax.set_xlabel("distance from focal node (hops)")
+    ax.grid(alpha=0.3)
+    ax.legend()
+    fig.suptitle("Step 6: functional (F) vs beneficial (B) carriage by distance")
+    fig.tight_layout()
+    fig.savefig(figures / "step6_beneficial_carriage.png", dpi=dpi)
+    fig.savefig(figures / "step6_beneficial_carriage.pdf")
+    plt.close(fig)
+
+
+def run_step6(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[str, Any]) -> dict[str, Any]:
+    """Beneficial carriage B(d): does distance-d content help the task, not just move the output?"""
+    from . import beneficial_carriage as _bc
+
+    progress("Step 6 start: beneficial carriage B(d)")
+    analysis_models = [m for m in models if "grit" in m.name.lower()] or list(models)
+    if not analysis_models:
+        return {"status": "skipped_no_models"}
+    cfg = dict(config["steps"].get("6", {}))
+    sample_graphs = int(cfg.get("sample_graphs", 60))
+    donors = int(cfg.get("donors", 4))
+    max_d = int(cfg.get("max_distance", 6))
+    modes = list(cfg.get("resamplers", ["matched", "marginal"]))
+    whole_band = bool(cfg.get("whole_band", False))
+    splits = list(cfg.get("splits", ["test", "train"]))
+    dpi = int(config["figures"]["dpi"])
+    seed = int(config.get("seeds", [0])[0])
+    rows: list[dict[str, Any]] = []
+    for model in analysis_models:
+        backend = _GRITBeneficialBackend(model)
+        for split in splits:
+            graphs = select_graphs(model.adapter, split, sample_graphs, seed=seed)
+            progress(f"Step 6 {model.name} {split}: {len(graphs)} graphs, donors={donors}, resamplers={modes}")
+            rows.extend(
+                _bc.beneficial_carriage_rows(
+                    backend, graphs, model=model.name, split=split, modes=modes,
+                    donors=donors, max_d=max_d, whole_band=whole_band, seed=seed + 7,
+                )
+            )
+            if whole_band:
+                rows.extend(
+                    _bc.beneficial_carriage_rows(
+                        backend, graphs, model=model.name, split=split, modes=["matched"],
+                        donors=donors, max_d=max_d, whole_band=True, seed=seed + 11,
+                    )
+                )
+    write_csv(artifact_root / "metrics" / "step6_beneficial_carriage.csv", rows)
+    render_step6(rows, artifact_root, dpi=dpi)
+    progress("Step 6 complete: metrics and figures written")
+    return {"status": "complete", "models": [m.name for m in analysis_models], "rows": len(rows)}
+
+
 def run_intervention_steps(
     config: Mapping[str, Any],
     discovery: Sequence[Mapping[str, Any]],
@@ -9245,6 +9675,7 @@ def run_intervention_steps(
         "3": lambda: run_step3(models, artifact_root, config),
         "4": lambda: run_step4(models, artifact_root, config),
         "5": lambda: run_step5(models, artifact_root, config),
+        "6": lambda: run_step6(models, artifact_root, config),
     }
     for step in steps:
         if step == "1":
