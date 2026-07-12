@@ -5046,6 +5046,7 @@ def symbolic_structural_carriage_rows(
     max_sources: Optional[int] = None,
     rrwp_channel_start: int = 2,
     rrwp_replacement: str = "zero",
+    donor_samples: int = 4,
     ig_baseline: Optional[torch.Tensor] = None,
     artifact_root: Optional[Path] = None,
     config: Optional[Mapping[str, Any]] = None,
@@ -5108,36 +5109,101 @@ def symbolic_structural_carriage_rows(
     if max_sources is not None and len(sources) > int(max_sources):
         sources = sorted(rng.sample(sources, int(max_sources)))
     rows: list[dict[str, Any]] = []
+    donor_k = max(1, int(donor_samples))
 
-    # --- content (symbolic) carriage: swap raw node content for a donor's ---
+    def _distinct_donors(focal: int, k: int) -> list[int]:
+        """Up to k distinct donor nodes != focal (for K-donor averaged swaps)."""
+        out: list[int] = []
+        seen: set[int] = set()
+        tries = 0
+        while len(out) < min(k, n - 1) and tries < 8 * max(1, k):
+            cand = rng.randrange(n)
+            if cand != focal and cand not in seen:
+                seen.add(cand)
+                out.append(cand)
+            tries += 1
+        return out
+
+    # --- content (symbolic) carriage: swap raw node content for donor nodes' (K-donor averaged) ---
+    # Averaging the readout-projected effect over K distinct donors de-noises the single-donor swap
+    # and makes it less hostage to one random donor -- tightening agreement with the IG estimator.
     if isinstance(getattr(graph, "x", None), torch.Tensor):
         for j in sources:
-            donor = rng.randrange(n)
-            tries = 0
-            while donor == j and n > 1 and tries < 8:
-                donor = rng.randrange(n)
-                tries += 1
-            corrupted = _clone_graph_with_swapped_content(graph, j, donor)
-            if corrupted is None:
-                continue
-            try:
-                cache = adapter.forward_minimal(corrupted)
-            except Exception:
-                continue
-            h = getattr(cache, "final_node_states", None)
-            if not isinstance(h, torch.Tensor) or tuple(h.shape) != tuple(h_clean.shape):
-                continue
-            contribs = (g * (h_clean - h.detach())).sum(dim=-1)
-            _emit_carriage_rows(rows, model, gid, j, contribs, dist, min_distance=min_distance, benefit_sign=benefit_sign, factor="content")
+            acc: Optional[torch.Tensor] = None
+            got = 0
+            for donor in _distinct_donors(j, donor_k):
+                corrupted = _clone_graph_with_swapped_content(graph, j, donor)
+                if corrupted is None:
+                    continue
+                try:
+                    cache = adapter.forward_minimal(corrupted)
+                except Exception:
+                    continue
+                h = getattr(cache, "final_node_states", None)
+                if not isinstance(h, torch.Tensor) or tuple(h.shape) != tuple(h_clean.shape):
+                    continue
+                c = (g * (h_clean - h.detach())).sum(dim=-1)
+                acc = c if acc is None else acc + c
+                got += 1
+            if acc is not None and got:
+                _emit_carriage_rows(rows, model, gid, j, acc / float(got), dist, min_distance=min_distance, benefit_sign=benefit_sign, factor="content")
 
     # --- structural carriage: source-specific raw RRWP perturbations before RRWP encoding ---
+    # Node-RRWP (diagonal, fed to the node encoder) and pair-RRWP (off-diagonal, fed to the edge/
+    # attention encoder) are SEPARATE model inputs, so they are perturbed independently. Crucially the
+    # node swap is NOT gated behind pair exposure: sparse models expose pair RRWP as ``edge_rrwp``
+    # rather than ``rrwp_val``/``rrwp_index``, which previously skipped the whole branch and dropped
+    # the Node RRWP column. Donor-mode swaps are averaged over ``struct_k`` random donors to de-noise,
+    # matching the multi-donor content swap. (The primary structural estimator remains the IG method
+    # below; these swaps are the on-manifold cross-check.)
     extras = getattr(clean_cache, "extras", None) or {}
     raw_rrwp0 = extras.get("raw_rrwp")
     raw_rrwp_val0 = extras.get("raw_rrwp_val")
     raw_rrwp_index0 = extras.get("raw_rrwp_index")
-    edge_attr0 = None
-    edge_index0 = None
-    used_raw_rrwp = False
+    struct_k = donor_k if rrwp_replacement == "donor" else 1
+
+    def _swap_contribs(**override_kwargs: Any) -> Optional[torch.Tensor]:
+        try:
+            cache = adapter.forward_minimal(graph, **override_kwargs)
+        except Exception:  # noqa: BLE001
+            return None
+        h = getattr(cache, "final_node_states", None)
+        if not isinstance(h, torch.Tensor) or tuple(h.shape) != tuple(h_clean.shape):
+            return None
+        return (g * (h_clean - h.detach())).sum(dim=-1)
+
+    def _avg_swap(make_override: Any, k: int) -> Optional[torch.Tensor]:
+        """Average readout-projected swap effect over up to k (re-drawn) overrides."""
+        acc: Optional[torch.Tensor] = None
+        got = 0
+        for _ in range(max(1, int(k))):
+            ov = make_override()
+            if ov is None:
+                continue
+            c = _swap_contribs(**ov)
+            if c is None:
+                continue
+            acc = c if acc is None else acc + c
+            got += 1
+        return (acc / float(got)) if (acc is not None and got) else None
+
+    # node-RRWP swap: independent of pair exposure (gated only on the raw node RRWP tensor)
+    if isinstance(raw_rrwp0, torch.Tensor) and raw_rrwp0.dim() == 2:
+        rrwp_node0 = raw_rrwp0.detach()
+        for j in sources:
+            if int(j) >= int(rrwp_node0.size(0)):
+                continue
+            src_row = torch.as_tensor([int(j)], dtype=torch.long)
+            c = _avg_swap(
+                lambda sr=src_row: {"rrwp_node_override": _rrwp_replace_channels(
+                    rrwp_node0, sr, channel_start=rrwp_channel_start, replacement=rrwp_replacement, rng=rng)},
+                struct_k,
+            )
+            if c is not None:
+                _emit_carriage_rows(rows, model, gid, j, c, dist, min_distance=min_distance, benefit_sign=benefit_sign, factor="node_rrwp")
+
+    # pair-RRWP swap: sparse (val+index) -> dense (3-D) -> legacy encoded-edge fallback
+    used_pair = False
     if (
         isinstance(raw_rrwp_val0, torch.Tensor)
         and isinstance(raw_rrwp_index0, torch.Tensor)
@@ -5145,82 +5211,22 @@ def symbolic_structural_carriage_rows(
         and raw_rrwp_index0.dim() == 2
         and int(raw_rrwp_val0.size(0)) == int(raw_rrwp_index0.size(1))
     ):
-        used_raw_rrwp = True
+        used_pair = True
         rrwp_val0 = raw_rrwp_val0.detach()
-        rrwp_index = raw_rrwp_index0.detach()
-        rrwp_node0 = raw_rrwp0.detach() if isinstance(raw_rrwp0, torch.Tensor) and raw_rrwp0.dim() == 2 else None
-        src_e, dst_e = rrwp_index[0], rrwp_index[1]
+        src_e = raw_rrwp_index0.detach()[0]
         for j in sources:
-            outgoing = (src_e == int(j))
-            if not bool(outgoing.any()) and rrwp_node0 is None:
+            outgoing_rows = torch.nonzero((src_e == int(j)).detach().cpu().bool(), as_tuple=False).reshape(-1).long()
+            if outgoing_rows.numel() == 0:
                 continue
-            source_row = torch.as_tensor([int(j)], dtype=torch.long)
-            outgoing_rows = torch.nonzero(outgoing.detach().cpu().bool(), as_tuple=False).reshape(-1).long()
-            variants: list[tuple[str, Optional[torch.Tensor], Optional[torch.Tensor]]] = []
-            if isinstance(rrwp_node0, torch.Tensor) and int(j) < int(rrwp_node0.size(0)):
-                variants.append(
-                    (
-                        "node_rrwp",
-                        _rrwp_replace_channels(
-                            rrwp_node0,
-                            source_row,
-                            channel_start=rrwp_channel_start,
-                            replacement=rrwp_replacement,
-                            rng=rng,
-                        ),
-                        None,
-                    )
-                )
-            if outgoing_rows.numel():
-                variants.append(
-                    (
-                        "pair_rrwp",
-                        None,
-                        _rrwp_replace_channels(
-                            rrwp_val0,
-                            outgoing_rows,
-                            channel_start=rrwp_channel_start,
-                            replacement=rrwp_replacement,
-                            rng=rng,
-                        ),
-                    )
-                )
-            if (
-                isinstance(rrwp_node0, torch.Tensor)
-                and int(j) < int(rrwp_node0.size(0))
-                and outgoing_rows.numel()
-            ):
-                variants.append(
-                    (
-                        "both_rrwp",
-                        _rrwp_replace_channels(
-                            rrwp_node0,
-                            source_row,
-                            channel_start=rrwp_channel_start,
-                            replacement=rrwp_replacement,
-                            rng=rng,
-                        ),
-                        _rrwp_replace_channels(
-                            rrwp_val0,
-                            outgoing_rows,
-                            channel_start=rrwp_channel_start,
-                            replacement=rrwp_replacement,
-                            rng=rng,
-                        ),
-                    )
-                )
-            for factor, rrwp_node, rrwp_val in variants:
-                try:
-                    cache = adapter.forward_minimal(graph, rrwp_node_override=rrwp_node, rrwp_val_override=rrwp_val)
-                except Exception:
-                    continue
-                h = getattr(cache, "final_node_states", None)
-                if not isinstance(h, torch.Tensor) or tuple(h.shape) != tuple(h_clean.shape):
-                    continue
-                contribs = (g * (h_clean - h.detach())).sum(dim=-1)
-                _emit_carriage_rows(rows, model, gid, j, contribs, dist, min_distance=min_distance, benefit_sign=benefit_sign, factor=factor)
+            c = _avg_swap(
+                lambda orows=outgoing_rows: {"rrwp_val_override": _rrwp_replace_channels(
+                    rrwp_val0, orows, channel_start=rrwp_channel_start, replacement=rrwp_replacement, rng=rng)},
+                struct_k,
+            )
+            if c is not None:
+                _emit_carriage_rows(rows, model, gid, j, c, dist, min_distance=min_distance, benefit_sign=benefit_sign, factor="pair_rrwp")
     elif isinstance(raw_rrwp0, torch.Tensor) and raw_rrwp0.dim() == 3:
-        used_raw_rrwp = True
+        used_pair = True
         dense_pair = raw_rrwp0.detach()
         rrwp_index, _ = _dense_pair_rrwp_to_sparse(dense_pair.detach().cpu())
         src_e = rrwp_index[0]
@@ -5229,55 +5235,38 @@ def symbolic_structural_carriage_rows(
             outgoing_rows = torch.nonzero((src_e == int(j)).detach().cpu().bool(), as_tuple=False).reshape(-1).long()
             if outgoing_rows.numel() == 0:
                 continue
-            flat_override = _rrwp_replace_channels(
-                flat,
-                outgoing_rows,
-                channel_start=rrwp_channel_start,
-                replacement=rrwp_replacement,
-                            rng=rng,
+            c = _avg_swap(
+                lambda orows=outgoing_rows: {"rrwp_node_override": _rrwp_replace_channels(
+                    flat, orows, channel_start=rrwp_channel_start, replacement=rrwp_replacement, rng=rng).reshape_as(dense_pair)},
+                struct_k,
             )
-            try:
-                cache = adapter.forward_minimal(graph, rrwp_node_override=flat_override.reshape_as(dense_pair))
-            except Exception:
-                continue
-            h = getattr(cache, "final_node_states", None)
-            if not isinstance(h, torch.Tensor) or tuple(h.shape) != tuple(h_clean.shape):
-                continue
-            contribs = (g * (h_clean - h.detach())).sum(dim=-1)
-            _emit_carriage_rows(rows, model, gid, j, contribs, dist, min_distance=min_distance, benefit_sign=benefit_sign, factor="pair_rrwp")
-    if not used_raw_rrwp:
-        # Legacy fallback: perturb the already-encoded edge state if raw RRWP is not exposed.
+            if c is not None:
+                _emit_carriage_rows(rows, model, gid, j, c, dist, min_distance=min_distance, benefit_sign=benefit_sign, factor="pair_rrwp")
+    if not used_pair:
+        # Legacy fallback: perturb the already-encoded edge state if raw pair RRWP is not exposed
+        # (mean-replacement is deterministic, so no donor averaging).
         edge_attr0 = extras.get("encoded_edge_attr")
         edge_index0 = extras.get("encoded_edge_index")
-        if not (
+        if (
             isinstance(edge_attr0, torch.Tensor)
             and isinstance(edge_index0, torch.Tensor)
             and edge_attr0.dim() == 2
             and edge_index0.dim() == 2
             and int(edge_attr0.size(0)) == int(edge_index0.size(1))
         ):
-            edge_attr0 = None
-            edge_index0 = None
-    if isinstance(edge_attr0, torch.Tensor) and isinstance(edge_index0, torch.Tensor):
-        edge_attr0 = edge_attr0.detach()
-        ei = edge_index0.detach()
-        mean_ea = edge_attr0.mean(dim=0, keepdim=True)
-        src_e, dst_e = ei[0], ei[1]
-        for j in sources:
-            incident = (src_e == int(j)) | (dst_e == int(j))
-            if not bool(incident.any()):
-                continue
-            ea = edge_attr0.clone()
-            ea[incident] = mean_ea.to(ea.dtype)
-            try:
-                cache = adapter.forward_minimal(graph, edge_attr_override=ea)
-            except Exception:
-                continue
-            h = getattr(cache, "final_node_states", None)
-            if not isinstance(h, torch.Tensor) or tuple(h.shape) != tuple(h_clean.shape):
-                continue
-            contribs = (g * (h_clean - h.detach())).sum(dim=-1)
-            _emit_carriage_rows(rows, model, gid, j, contribs, dist, min_distance=min_distance, benefit_sign=benefit_sign, factor="pair_rrwp")
+            edge_attr0 = edge_attr0.detach()
+            ei = edge_index0.detach()
+            mean_ea = edge_attr0.mean(dim=0, keepdim=True)
+            src_e, dst_e = ei[0], ei[1]
+            for j in sources:
+                incident = (src_e == int(j)) | (dst_e == int(j))
+                if not bool(incident.any()):
+                    continue
+                ea = edge_attr0.clone()
+                ea[incident] = mean_ea.to(ea.dtype)
+                c = _swap_contribs(edge_attr_override=ea)
+                if c is not None:
+                    _emit_carriage_rows(rows, model, gid, j, c, dist, min_distance=min_distance, benefit_sign=benefit_sign, factor="pair_rrwp")
 
     # --- IG-aligned structural carriage (HEADLINE; mirrors carriage_ig, completeness-checked) ---
     # Functional = structural_carriage_ig; beneficial = same with loss_label (the proper integrated
@@ -5325,6 +5314,19 @@ def symbolic_structural_carriage_rows(
             if isinstance(c_ig, torch.Tensor) and c_ig.dim() == 2 and int(c_ig.size(0)) == n:
                 for j in sources:
                     _emit_carriage_rows(rows, model, gid, j, c_ig[:, int(j)], dist, min_distance=min_distance, factor="content_ig", mode="functional")
+                if completeness_out is not None:
+                    # content-IG completeness: Sum C == y_hat_clean - y_hat_base (exact with readout_ig)
+                    try:
+                        rec = float(c_ig.sum().item())
+                        pred_clean = float(torch.as_tensor(res_f.get("prediction")).reshape(-1)[0].item())
+                        pred_base = float(res_f.get("baseline_prediction"))
+                        completeness_out.append({
+                            "model": model.name, "graph_id": gid, "target_kind": "content",
+                            "reconstruction_sum": rec, "completeness_target": pred_clean - pred_base,
+                            "abs_error": abs(rec - (pred_clean - pred_base)),
+                        })
+                    except Exception:  # noqa: BLE001
+                        pass
             else:
                 progress(f"  {model.name} graph {gid}: content_ig functional produced no valid carriage")
         except Exception as exc:  # noqa: BLE001
@@ -5351,7 +5353,10 @@ def run_symbolic_structural_probe(models: Sequence[ModelRun], artifact_root: Pat
     max_sources = None if raw_max_sources in (None, "all", "", "None") else int(raw_max_sources)
     min_distance = int(cfg.get("symbolic_structural_min_distance", 1))
     rrwp_channel_start = int(cfg.get("symbolic_structural_rrwp_channel_start", cfg.get("rrwp_ablation_channel_start", 2)))
-    rrwp_replacement = str(cfg.get("symbolic_structural_rrwp_replacement", cfg.get("rrwp_ablation_replacement", "zero")))
+    # Default to on-manifold DONOR replacement (a real other row's channels) rather than zeroing, so
+    # the structural swap is the on-manifold cross-check aligned with the content donor-swap.
+    rrwp_replacement = str(cfg.get("symbolic_structural_rrwp_replacement", "donor"))
+    donor_samples = int(cfg.get("symbolic_structural_donor_samples", 4))
     seed = int(config.get("seeds", [0])[0])
     dpi = int(config["figures"]["dpi"])
     rows: list[dict[str, Any]] = []
@@ -5360,9 +5365,9 @@ def run_symbolic_structural_probe(models: Sequence[ModelRun], artifact_root: Pat
         try:
             graphs = select_graphs(model.adapter, "test", sample_graphs, seed=seed)
         except Exception as exc:
-            progress(f"Step 4 symbolic/structural: skip {model.name} ({exc})")
+            progress(f"Step 7 symbolic/structural: skip {model.name} ({exc})")
             continue
-        progress(f"Step 4 symbolic/structural probe {model.name}: {len(graphs)} graph(s), max_sources={max_sources}")
+        progress(f"Step 7 symbolic/structural probe {model.name}: {len(graphs)} graph(s), max_sources={max_sources}")
         try:
             ig_baseline = mean_encoded_baseline(
                 model.adapter, select_baseline_graphs(model.adapter, "test", config, sample_graphs, seed=seed)
@@ -5383,6 +5388,7 @@ def run_symbolic_structural_probe(models: Sequence[ModelRun], artifact_root: Pat
                         max_sources=max_sources,
                         rrwp_channel_start=rrwp_channel_start,
                         rrwp_replacement=rrwp_replacement,
+                        donor_samples=donor_samples,
                         ig_baseline=ig_baseline,
                         artifact_root=artifact_root,
                         config=config,
@@ -5392,17 +5398,30 @@ def run_symbolic_structural_probe(models: Sequence[ModelRun], artifact_root: Pat
             except Exception as exc:
                 progress(f"  {model.name} graph {graph_idx}: symbolic/structural failed ({exc})")
     if not rows:
-        progress("Step 4 symbolic/structural: no rows produced")
+        progress("Step 7 symbolic/structural: no rows produced")
         return {"status": "no_rows", "rows": 0}
     write_csv(artifact_root / "metrics" / "step7_symbolic_structural_carriage.csv", rows)
+    completeness_note: Optional[str] = None
     if completeness_rows:
         write_csv(artifact_root / "metrics" / "step7_structural_carriage_ig_completeness.csv", completeness_rows)
-        errs = [safe_float(r["abs_error"]) for r in completeness_rows if math.isfinite(safe_float(r.get("abs_error")))]
-        tgts = [abs(safe_float(r["completeness_target"])) for r in completeness_rows]
-        if errs:
-            rel = float(np.mean(errs)) / (float(np.mean(tgts)) + 1e-9)
-            progress(f"Step 7 structural IG completeness: mean|sumC - (yhat_clean-yhat_base)|={np.mean(errs):.3e} "
-                     f"(rel~{rel:.3f}); should be ~0 -- this is the IG-over-RRWP self-test on real GRIT")
+
+        def _rel(kinds: set[str]) -> Optional[float]:
+            e = [safe_float(r["abs_error"]) for r in completeness_rows
+                 if str(r.get("target_kind")) in kinds and math.isfinite(safe_float(r.get("abs_error")))]
+            t = [abs(safe_float(r["completeness_target"])) for r in completeness_rows
+                 if str(r.get("target_kind")) in kinds]
+            return None if not e else float(np.mean(e)) / (float(np.mean(t)) + 1e-9)
+
+        def _fmt(x: Optional[float]) -> str:
+            return "n/a" if x is None else f"{x:.1e}"
+
+        rel_c, rel_s = _rel({"content"}), _rel({"node", "pair"})
+        completeness_note = (
+            f"IG completeness rel-err -- content: {_fmt(rel_c)}   structural: {_fmt(rel_s)}   "
+            "(Sum C == y_hat_clean - y_hat_base; ~0 certifies IG as the anchor)"
+        )
+        progress(f"Step 7 IG completeness: content rel~{_fmt(rel_c)}, structural rel~{_fmt(rel_s)} "
+                 "(should be ~0 -- the IG self-test on real GRIT)")
     # --- coverage diagnostics: which (model, factor, mode) combos actually produced rows? ---
     # This is the antidote to silent single-model panels: the CSV + log say exactly which models
     # are present/missing per factor, so a dropout is a data-availability fact, not a mystery.
@@ -5430,20 +5449,50 @@ def run_symbolic_structural_probe(models: Sequence[ModelRun], artifact_root: Pat
         miss = [m for m in all_models if m not in have]
         if have or miss:
             progress(f"Step 7 coverage [{fac} functional]: have {have or '-'}; MISSING {miss or '-'}")
+    write_csv(artifact_root / "metrics" / "step7_carriage_by_distance_summary.csv", step7_by_distance_summary_rows(rows))
     render_symbolic_structural_by_distance(rows, artifact_root, dpi=dpi)
     render_step7_funcbenef_grid(rows, artifact_root, dpi=dpi, method="ig")
     render_step7_funcbenef_grid(rows, artifact_root, dpi=dpi, method="swap")
-    render_carriage_functional_vs_beneficial(rows, artifact_root, dpi=dpi)
+    render_carriage_functional_vs_beneficial(rows, artifact_root, dpi=dpi, completeness_note=completeness_note)
     n_struct = len([r for r in rows if str(r.get("factor")) in {"node_rrwp", "pair_rrwp", "both_rrwp", "structure"}])
     progress(f"Step 7 symbolic/structural: wrote {len(rows)} rows ({n_struct} structural)")
     return {"status": "complete", "rows": len(rows), "structural_rows": n_struct}
 
 
+def _bootstrap_mean_ci(
+    values: Sequence[float], rng: np.random.Generator, *, n_boot: int = 1000, alpha: float = 0.05
+) -> tuple[float, float, float, int]:
+    """(mean, ci_lo, ci_hi, n) for one bucket via percentile bootstrap. n<2 -> degenerate CI = mean."""
+    x = np.asarray([float(v) for v in values if math.isfinite(float(v))], dtype=float)
+    n = int(x.size)
+    if n == 0:
+        return float("nan"), float("nan"), float("nan"), 0
+    mean = float(x.mean())
+    if n == 1:
+        return mean, mean, mean, 1
+    idx = rng.integers(0, n, size=(int(n_boot), n))
+    boot = x[idx].mean(axis=1)
+    lo = float(np.percentile(boot, 100.0 * alpha / 2.0))
+    hi = float(np.percentile(boot, 100.0 * (1.0 - alpha / 2.0)))
+    return mean, lo, hi, n
+
+
 def _step7_series(
-    rows: Sequence[Mapping[str, Any]], factor: str, model: str, mode: str, value_key: str
-) -> tuple[list[int], list[float]]:
-    """Mean value_key by integer carrier<->source distance for one (factor, model, mode). Returns
-    (distances, means); empty lists if that combo produced no finite rows (caller flags it missing)."""
+    rows: Sequence[Mapping[str, Any]],
+    factor: str,
+    model: str,
+    mode: str,
+    value_key: str,
+    *,
+    rng: Optional[np.random.Generator] = None,
+    n_boot: int = 1000,
+) -> tuple[list[int], list[float], list[float], list[float], list[int]]:
+    """Per-distance (distances, means, ci_lo, ci_hi, counts) for one (factor, model, mode).
+
+    Means are over all (carrier, source) pairs at each integer carrier<->source distance; CIs are
+    percentile bootstrap over those pairs, so the band WIDTH is the visual per-distance sample-size
+    signal (wide = few pairs = noisy, e.g. the far tail). Empty lists if the combo produced no rows.
+    """
     by: dict[int, list[float]] = {}
     for r in rows:
         if str(r.get("factor")) != factor or str(r.get("model")) != model or str(r.get("mode")) != mode:
@@ -5454,7 +5503,38 @@ def _step7_series(
             continue
         by.setdefault(int(round(d)), []).append(v)
     ds = sorted(by)
-    return ds, [float(np.nanmean(by[d])) for d in ds]
+    if rng is None:
+        rng = np.random.default_rng(0)
+    means: list[float] = []
+    los: list[float] = []
+    his: list[float] = []
+    ns: list[int] = []
+    for d in ds:
+        m_, lo_, hi_, n_ = _bootstrap_mean_ci(by[d], rng, n_boot=n_boot)
+        means.append(m_)
+        los.append(lo_)
+        his.append(hi_)
+        ns.append(n_)
+    return ds, means, los, his, ns
+
+
+def step7_by_distance_summary_rows(rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Flat (factor, model, mode, distance, mean, ci_lo, ci_hi, n) table backing the curve figures --
+    the quantitative per-distance sample counts + CIs so divergences can be read off numerically."""
+    rng = np.random.default_rng(12345)
+    factors = ["content_ig", "node_rrwp_ig", "pair_rrwp_ig", "content", "node_rrwp", "pair_rrwp", "both_rrwp"]
+    models = ordered_model_names(sorted({str(r.get("model")) for r in rows}))
+    out: list[dict[str, Any]] = []
+    for factor in factors:
+        for model in models:
+            for mode, vk in (("functional", "effect_abs"), ("beneficial", "effect_signed")):
+                ds, means, los, his, ns = _step7_series(rows, factor, model, mode, vk, rng=rng)
+                for d, m_, lo_, hi_, n_ in zip(ds, means, los, his, ns):
+                    out.append({
+                        "factor": factor, "model": model, "mode": mode, "distance": int(d),
+                        "mean": m_, "ci_lo": lo_, "ci_hi": hi_, "n_pairs": int(n_),
+                    })
+    return out
 
 
 # Row layout shared by the Step-7 core curve figures: (mode, value column, y-label, panel prefix).
@@ -5464,15 +5544,17 @@ _STEP7_FUNCBENEF_ROWS = [
 ]
 
 
-def render_carriage_functional_vs_beneficial(rows: Sequence[Mapping[str, Any]], artifact_root: Path, *, dpi: int) -> None:
+def render_carriage_functional_vs_beneficial(
+    rows: Sequence[Mapping[str, Any]], artifact_root: Path, *, dpi: int, completeness_note: Optional[str] = None
+) -> None:
     """HEADLINE method comparison (the core Step-7 figure).
 
     Functional (top row) vs beneficial (bottom row) carriage by distance, for content and node/pair
-    structural carriage (columns), overlaying the IG estimator (solid, circles) and the finite-swap
-    estimator (dashed, squares) for every model (colour). One figure that shows at a glance: (i) the
-    two estimators agree, and (ii) transport can be functionally far-reaching yet beneficial only
-    short-range -- for BOTH content and structure. Models with no data in a panel are annotated in
-    red rather than silently dropped.
+    structural carriage (columns), overlaying the IG estimator (solid + shaded 95% bootstrap CI) and
+    the finite-swap estimator (dashed mean line) for every model (colour). IG is the anchor (its CI is
+    shaded); the swap line falling inside the IG band = the two estimators agree at that distance,
+    outside = a significant divergence. Shows at a glance that transport is functionally far-reaching
+    yet beneficial only short-range, for BOTH content and structure. Missing models annotated in red.
     """
     from matplotlib.lines import Line2D
 
@@ -5488,6 +5570,7 @@ def render_carriage_functional_vs_beneficial(rows: Sequence[Mapping[str, Any]], 
     models = ordered_model_names(sorted({str(r["model"]) for r in rows if str(r.get("factor")) in involved}))
     if not models:
         return
+    rng = np.random.default_rng(7)
     palette = plt.cm.tab10.colors
     color = {m: palette[i % len(palette)] for i, m in enumerate(models)}
     fig, axes = plt.subplots(2, len(triples), figsize=(4.9 * len(triples), 8.0), squeeze=False)
@@ -5495,13 +5578,17 @@ def render_carriage_functional_vs_beneficial(rows: Sequence[Mapping[str, Any]], 
         for ridx, (mode, vk, ylab, sub) in enumerate(_STEP7_FUNCBENEF_ROWS):
             ax = axes[ridx][c]
             missing: list[str] = []
+            nmax = 0
             for m in models:
-                ds_i, ys_i = _step7_series(rows, fi, m, mode, vk)
-                ds_s, ys_s = _step7_series(rows, fs, m, mode, vk)
+                ds_i, ys_i, lo_i, hi_i, ns_i = _step7_series(rows, fi, m, mode, vk, rng=rng)
+                ds_s, ys_s, _, _, ns_s = _step7_series(rows, fs, m, mode, vk, rng=rng)
                 if ds_i:
+                    ax.fill_between(ds_i, lo_i, hi_i, color=color[m], alpha=0.15, lw=0)
                     ax.plot(ds_i, ys_i, "-o", ms=3.5, lw=1.8, color=color[m])
+                    nmax = max([nmax, *ns_i])
                 if ds_s:
-                    ax.plot(ds_s, ys_s, "--s", ms=3.5, lw=1.4, alpha=0.75, color=color[m])
+                    ax.plot(ds_s, ys_s, "--s", ms=3.0, lw=1.3, alpha=0.8, color=color[m])
+                    nmax = max([nmax, *ns_s])
                 if not ds_i and not ds_s:
                     missing.append(model_label(m))
             if mode == "beneficial":
@@ -5515,13 +5602,15 @@ def render_carriage_functional_vs_beneficial(rows: Sequence[Mapping[str, Any]], 
                         ha="right", va="bottom", fontsize=6.5, color="crimson")
     handles = [Line2D([0], [0], color=color[m], lw=2, label=model_label(m)) for m in models]
     handles += [
-        Line2D([0], [0], color="0.25", ls="-", marker="o", ms=4, label="IG"),
-        Line2D([0], [0], color="0.25", ls="--", marker="s", ms=4, label="finite-swap"),
+        Line2D([0], [0], color="0.25", ls="-", marker="o", ms=4, label="IG (shaded = 95% CI)"),
+        Line2D([0], [0], color="0.25", ls="--", marker="s", ms=4, label="finite-swap (mean)"),
     ]
     fig.legend(handles=handles, loc="upper center", ncol=min(len(handles), 5), fontsize=8,
                frameon=False, bbox_to_anchor=(0.5, 1.0))
     fig.suptitle("Functional vs beneficial carriage: IG vs finite-swap, content + node/pair structural", y=0.965)
-    fig.tight_layout(rect=(0, 0, 1, 0.93))
+    if completeness_note:
+        fig.text(0.5, 0.005, completeness_note, ha="center", va="bottom", fontsize=7.5, color="0.35")
+    fig.tight_layout(rect=(0, 0.02, 1, 0.93))
     figures = ensure_dir(artifact_root / "figures")
     fig.savefig(figures / "step7_functional_vs_beneficial_carriage.png", dpi=dpi, bbox_inches="tight")
     fig.savefig(figures / "step7_functional_vs_beneficial_carriage.pdf", bbox_inches="tight")
@@ -5530,11 +5619,10 @@ def render_carriage_functional_vs_beneficial(rows: Sequence[Mapping[str, Any]], 
 
 def render_step7_funcbenef_grid(rows: Sequence[Mapping[str, Any]], artifact_root: Path, *, dpi: int, method: str) -> None:
     """Core Step-7 per-estimator figure: functional (top) vs beneficial (bottom) carriage by distance,
-    for content and node/pair structural carriage (columns), models overlaid.
-
-    ``method="ig"`` uses the IG factors (content_ig / node_rrwp_ig / pair_rrwp_ig); ``method="swap"``
-    uses the finite-swap factors (content / node_rrwp / pair_rrwp). Missing models are annotated in red.
-    Companion to the combined IG-vs-swap headline; kept separate so each estimator reads cleanly.
+    for content and node/pair structural carriage (columns), models overlaid, with shaded 95%
+    bootstrap CIs (band width = per-distance sample size). ``method="ig"`` uses the IG factors
+    (content_ig / node_rrwp_ig / pair_rrwp_ig); ``method="swap"`` uses the finite-swap factors
+    (content / node_rrwp / pair_rrwp). Missing models are annotated in red.
     """
     fac_by_method = {
         "ig": [("content_ig", "Content"), ("node_rrwp_ig", "Node RRWP"), ("pair_rrwp_ig", "Pair RRWP")],
@@ -5547,6 +5635,7 @@ def render_step7_funcbenef_grid(rows: Sequence[Mapping[str, Any]], artifact_root
     models = ordered_model_names(sorted({str(r["model"]) for r in rows if str(r.get("factor")) in col_factors}))
     if not models:
         return
+    rng = np.random.default_rng(11)
     palette = plt.cm.tab10.colors
     color = {m: palette[i % len(palette)] for i, m in enumerate(models)}
     method_name = "IG" if method == "ig" else "finite-swap"
@@ -5555,10 +5644,15 @@ def render_step7_funcbenef_grid(rows: Sequence[Mapping[str, Any]], artifact_root
         for ridx, (mode, vk, ylab, sub) in enumerate(_STEP7_FUNCBENEF_ROWS):
             ax = axes[ridx][c]
             missing: list[str] = []
+            n_lo = math.inf
+            n_hi = 0
             for m in models:
-                ds, ys = _step7_series(rows, factor, m, mode, vk)
+                ds, ys, lo, hi, ns = _step7_series(rows, factor, m, mode, vk, rng=rng)
                 if ds:
+                    ax.fill_between(ds, lo, hi, color=color[m], alpha=0.18, lw=0)
                     ax.plot(ds, ys, marker="o", ms=4, lw=1.8, color=color[m], label=model_label(m))
+                    n_lo = min(n_lo, min(ns))
+                    n_hi = max(n_hi, max(ns))
                 else:
                     missing.append(model_label(m))
             if mode == "beneficial":
@@ -5567,11 +5661,15 @@ def render_step7_funcbenef_grid(rows: Sequence[Mapping[str, Any]], artifact_root
             ax.set_xlabel("carrier<->source distance (hops)")
             ax.set_ylabel(ylab)
             ax.grid(alpha=0.3)
+            if math.isfinite(n_lo) and n_hi:
+                ax.text(0.98, 0.97, f"n/hop: {int(n_lo)}–{int(n_hi)}", transform=ax.transAxes,
+                        ha="right", va="top", fontsize=6.5, color="0.4")
             if missing:
                 ax.text(0.98, 0.03, "no data: " + ", ".join(missing), transform=ax.transAxes,
                         ha="right", va="bottom", fontsize=6.5, color="crimson")
     axes[0][0].legend(fontsize=8, loc="best")
-    fig.suptitle(f"Functional vs beneficial carriage by distance -- {method_name} method (content + node/pair structural)")
+    fig.suptitle(f"Functional vs beneficial carriage by distance -- {method_name} method "
+                 f"(content + node/pair structural; shaded = 95% bootstrap CI)")
     fig.tight_layout()
     figures = ensure_dir(artifact_root / "figures")
     fig.savefig(figures / f"step7_functional_vs_beneficial_{method}.png", dpi=dpi)
