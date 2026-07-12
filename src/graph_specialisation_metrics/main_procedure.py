@@ -242,7 +242,7 @@ FAST_DEV_OVERRIDES: dict[str, Any] = {
         "1": {"reach_sweep": [1, "dense"]},
         "2": {"sample_graphs": 2, "compare_attention_to_swaps": False, "run_layer_channel_split": False, "erasure_sample_graphs": 2},
         "3": {"sample_graphs": 2},
-        "4": {"sample_graphs": 1, "max_far_pairs_per_graph": 1, "depth_pairs_per_graph": 0},
+        "4": {"sample_graphs": 1, "max_far_pairs_per_graph": 1, "depth_pairs_per_graph": 0, "run_structural_carriage_ig": False},
         "5": {"sample_graphs": 2, "max_far_pairs_per_graph": 2, "interaction_pairs": 16},
         "6": {"sample_graphs": 2, "donors": 2, "max_distance": 4, "splits": ["test"], "run_loss_carriage": False},
     },

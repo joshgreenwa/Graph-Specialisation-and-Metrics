@@ -4905,6 +4905,7 @@ def _emit_carriage_rows(
     min_distance: int,
     factor: str,
     benefit_sign: Optional[float] = None,
+    mode: str = "functional",
 ) -> None:
     """Emit per-(carrier, source) carriage rows.
 
@@ -4932,10 +4933,107 @@ def _emit_carriage_rows(
             "distance": int(round(d)),
             "factor": factor,
         }
-        rows.append({**base, "effect_abs": abs(val), "effect_signed": val, "mode": "functional"})
+        rows.append({**base, "effect_abs": abs(val), "effect_signed": val, "mode": mode})
         if benefit_sign is not None:
             bval = val * float(benefit_sign)
             rows.append({**base, "effect_abs": abs(bval), "effect_signed": bval, "mode": "beneficial"})
+
+
+def structural_carriage_ig(
+    adapter: Any,
+    graph: Any,
+    *,
+    target_kind: str,          # "node" (node-RRWP) or "pair" (pair-RRWP)
+    steps: int,
+    target_index: int = 0,
+    readout_ig: bool = False,
+    loss_label: Optional[float] = None,
+) -> Optional[dict[str, Any]]:
+    """IG structural carriage over the RRWP input -- the headline analog of ``carriage_ig``.
+
+    Identical construction to the content carriage (integrate g_i.h_i^L along a baseline->clean path,
+    VJP onto carriers, project by g), but the integration variable is the RAW RRWP (node or pair)
+    instead of the encoded content, and the baseline is the graph-mean RRWP. ``loss_label`` gives the
+    beneficial version (project by sign(y_hat(alpha)-y) => sum telescopes to L(clean)-L(base)),
+    exactly like B_IG. Returns C_struct[carrier, source] plus a completeness check.
+    """
+    if not hasattr(adapter, "readout_gradient") or not hasattr(adapter, "_run_with_hooks"):
+        return None
+    try:
+        clean_cache, g = adapter.readout_gradient(graph, target_index=target_index)
+    except Exception:  # noqa: BLE001
+        return None
+    h_clean = getattr(clean_cache, "final_node_states", None)
+    if not isinstance(h_clean, torch.Tensor) or not isinstance(g, torch.Tensor):
+        return None
+    h_clean = h_clean.detach()
+    g = g.detach().to(h_clean)
+    n = int(h_clean.size(0))
+    extras = getattr(clean_cache, "extras", None) or {}
+    if target_kind == "node":
+        rrwp_clean = extras.get("raw_rrwp")
+        override_kw = "rrwp_node_override"
+        row_src = torch.arange(n)
+    else:
+        rrwp_clean = extras.get("raw_rrwp_val")
+        rrwp_index = extras.get("raw_rrwp_index")
+        override_kw = "rrwp_val_override"
+        if not isinstance(rrwp_index, torch.Tensor) or rrwp_index.dim() != 2:
+            return None
+        row_src = rrwp_index[0].detach().cpu().long()
+    if not isinstance(rrwp_clean, torch.Tensor) or rrwp_clean.dim() != 2:
+        return None
+    rrwp_clean = rrwp_clean.detach()
+    base = rrwp_clean.mean(dim=0, keepdim=True).expand_as(rrwp_clean)  # graph-mean RRWP baseline
+    delta = rrwp_clean - base
+    y = None if loss_label is None else float(loss_label)
+    yhat_clean = float(clean_cache.prediction.reshape(-1)[target_index].detach().cpu().item())
+    carriage = h_clean.new_zeros((n, n))
+    row_src = row_src.to(carriage.device)
+    yhat_base = None
+    for alpha_idx in range(1, int(steps) + 1):
+        alpha = float(alpha_idx) / float(steps)
+        point = (base + alpha * delta).detach().requires_grad_(True)
+        cache = adapter._run_with_hooks(
+            graph, capture_attention=False, capture_channels=False,
+            capture_layer_inputs=False, capture_layer_outputs=False, **{override_kw: point},
+        )
+        h = getattr(cache, "final_node_states", None)
+        if not isinstance(h, torch.Tensor):
+            return None
+        pred_a = cache.prediction.reshape(-1)[target_index]
+        if readout_ig:
+            (g_a,) = torch.autograd.grad(pred_a, h, retain_graph=True, create_graph=False)
+            g_step = g_a.detach()
+        else:
+            g_step = g
+        if y is not None:
+            g_step = g_step * (1.0 if float(pred_a.detach().cpu().item()) >= y else -1.0)
+        carrier_scores = (h * g_step).sum(dim=-1)
+        for i in range(n):
+            (grad,) = torch.autograd.grad(carrier_scores[i], point, retain_graph=(i < n - 1), create_graph=False)
+            per_row = (grad.detach() * delta).sum(dim=-1)
+            carriage[i].index_add_(0, row_src, per_row.to(carriage.device))
+    carriage = carriage / float(steps)
+    # completeness: with frozen g and no loss projection, sum carriage == y_hat_clean - y_hat_base
+    try:
+        base_cache = adapter._run_with_hooks(
+            graph, capture_attention=False, capture_channels=False,
+            capture_layer_inputs=False, capture_layer_outputs=False,
+            **{override_kw: base.detach()},
+        )
+        yhat_base = float(base_cache.prediction.reshape(-1)[target_index].detach().cpu().item())
+    except Exception:  # noqa: BLE001
+        yhat_base = None
+    recon = float(carriage.sum().item())
+    return {
+        "carriage": carriage.detach().cpu(),
+        "target_kind": target_kind,
+        "yhat_clean": yhat_clean,
+        "yhat_base": yhat_base,
+        "reconstruction_sum": recon,
+        "completeness_target": (None if yhat_base is None else (yhat_clean - yhat_base)),
+    }
 
 
 def symbolic_structural_carriage_rows(
@@ -4951,6 +5049,7 @@ def symbolic_structural_carriage_rows(
     ig_baseline: Optional[torch.Tensor] = None,
     artifact_root: Optional[Path] = None,
     config: Optional[Mapping[str, Any]] = None,
+    completeness_out: Optional[list[dict[str, Any]]] = None,
 ) -> list[dict[str, Any]]:
     """Levelled discrete content (symbolic) vs structural (RRWP) carriage for one graph.
 
@@ -5173,6 +5272,41 @@ def symbolic_structural_carriage_rows(
             contribs = (g * (h_clean - h.detach())).sum(dim=-1)
             _emit_carriage_rows(rows, model, gid, j, contribs, dist, min_distance=min_distance, benefit_sign=benefit_sign, factor="pair_rrwp")
 
+    # --- IG-aligned structural carriage (HEADLINE; mirrors carriage_ig, completeness-checked) ---
+    # Functional = structural_carriage_ig; beneficial = same with loss_label (the proper integrated
+    # loss-carriage, exactly like content B_IG -- not the first-order benefit_sign shortcut).
+    if config is not None:
+        cfg4 = (config.get("steps", {}) or {}).get("4", {}) or {}
+        if bool(cfg4.get("run_structural_carriage_ig", True)):
+            ig_steps = int(config["perturbation"].get("ig_steps", 32))
+            struct_readout_ig = carriage_ig_uses_readout_ig(config)
+            yv = None
+            if _yl is not None:
+                try:
+                    yv = float(torch.as_tensor(_yl).reshape(-1)[0].item())
+                except Exception:  # noqa: BLE001
+                    yv = None
+            for tkind, fac in (("node", "node_rrwp_ig"), ("pair", "pair_rrwp_ig")):
+                res = structural_carriage_ig(adapter, graph, target_kind=tkind, steps=ig_steps, readout_ig=struct_readout_ig)
+                if res is None:
+                    continue
+                if completeness_out is not None and res.get("completeness_target") is not None:
+                    rec = float(res["reconstruction_sum"])
+                    tgt = float(res["completeness_target"])
+                    completeness_out.append({
+                        "model": model.name, "graph_id": gid, "target_kind": tkind,
+                        "reconstruction_sum": rec, "completeness_target": tgt, "abs_error": abs(rec - tgt),
+                    })
+                c_f = res["carriage"]
+                for j in sources:
+                    _emit_carriage_rows(rows, model, gid, j, c_f[:, int(j)], dist, min_distance=min_distance, factor=fac, mode="functional")
+                if yv is not None:
+                    resb = structural_carriage_ig(adapter, graph, target_kind=tkind, steps=ig_steps, readout_ig=struct_readout_ig, loss_label=yv)
+                    if resb is not None:
+                        c_b = resb["carriage"]
+                        for j in sources:
+                            _emit_carriage_rows(rows, model, gid, j, c_b[:, int(j)], dist, min_distance=min_distance, factor=fac, mode="beneficial")
+
     # --- content carriage via the existing IG method (validation reference for the swap panel) ---
     if ig_baseline is not None and artifact_root is not None and config is not None:
         try:
@@ -5209,6 +5343,7 @@ def run_symbolic_structural_probe(models: Sequence[ModelRun], artifact_root: Pat
     seed = int(config.get("seeds", [0])[0])
     dpi = int(config["figures"]["dpi"])
     rows: list[dict[str, Any]] = []
+    completeness_rows: list[dict[str, Any]] = []
     for model in models:
         try:
             graphs = select_graphs(model.adapter, "test", sample_graphs, seed=seed)
@@ -5236,10 +5371,10 @@ def run_symbolic_structural_probe(models: Sequence[ModelRun], artifact_root: Pat
                         max_sources=max_sources,
                         rrwp_channel_start=rrwp_channel_start,
                         rrwp_replacement=rrwp_replacement,
-                            rng=rng,
                         ig_baseline=ig_baseline,
                         artifact_root=artifact_root,
                         config=config,
+                        completeness_out=completeness_rows,
                     )
                 )
             except Exception as exc:
@@ -5248,6 +5383,14 @@ def run_symbolic_structural_probe(models: Sequence[ModelRun], artifact_root: Pat
         progress("Step 4 symbolic/structural: no rows produced")
         return {"status": "no_rows", "rows": 0}
     write_csv(artifact_root / "metrics" / "step4_symbolic_structural_carriage.csv", rows)
+    if completeness_rows:
+        write_csv(artifact_root / "metrics" / "step4_structural_carriage_ig_completeness.csv", completeness_rows)
+        errs = [safe_float(r["abs_error"]) for r in completeness_rows if math.isfinite(safe_float(r.get("abs_error")))]
+        tgts = [abs(safe_float(r["completeness_target"])) for r in completeness_rows]
+        if errs:
+            rel = float(np.mean(errs)) / (float(np.mean(tgts)) + 1e-9)
+            progress(f"Step 4 structural IG completeness: mean|sumC - (yhat_clean-yhat_base)|={np.mean(errs):.3e} "
+                     f"(rel~{rel:.3f}); should be ~0 -- this is the IG-over-RRWP self-test on real GRIT")
     render_symbolic_structural_by_distance(rows, artifact_root, dpi=dpi)
     render_symbolic_structural_beneficial(rows, artifact_root, dpi=dpi)
     n_struct = len([r for r in rows if str(r.get("factor")) in {"node_rrwp", "pair_rrwp", "both_rrwp", "structure"}])
@@ -5269,7 +5412,11 @@ def render_symbolic_structural_beneficial(rows: Sequence[Mapping[str, Any]], art
     ]
     if not ben:
         return
-    factors = [("content", "Content"), ("node_rrwp", "Node RRWP"), ("pair_rrwp", "Pair RRWP"), ("both_rrwp", "Node+Pair RRWP")]
+    factors = [
+        ("node_rrwp_ig", "Node RRWP (IG)"), ("pair_rrwp_ig", "Pair RRWP (IG)"),   # headline (IG-aligned)
+        ("content", "Content (swap)"), ("node_rrwp", "Node RRWP (swap)"),
+        ("pair_rrwp", "Pair RRWP (swap)"), ("both_rrwp", "Node+Pair (swap)"),
+    ]
     factors = [(f, t) for f, t in factors if any(str(r.get("factor")) == f for r in ben)]
     if not factors:
         return
@@ -5308,10 +5455,12 @@ def render_symbolic_structural_by_distance(rows: Sequence[Mapping[str, Any]], ar
     if not clean:
         return
     panels = [
-        ("content_ig", "Content carriage"),
-        ("node_rrwp", "Node RRWP carriage"),
-        ("pair_rrwp", "Pair RRWP carriage"),
-        ("both_rrwp", "Node + pair RRWP carriage"),
+        ("content_ig", "Content carriage (IG)"),
+        ("node_rrwp_ig", "Node RRWP carriage (IG)"),
+        ("pair_rrwp_ig", "Pair RRWP carriage (IG)"),
+        ("node_rrwp", "Node RRWP carriage (swap)"),
+        ("pair_rrwp", "Pair RRWP carriage (swap)"),
+        ("both_rrwp", "Node + pair RRWP carriage (swap)"),
     ]
     figures = ensure_dir(artifact_root / "figures")
     available_panels = [(factor, title) for factor, title in panels if any(str(r.get("factor")) == factor for r in clean)]
