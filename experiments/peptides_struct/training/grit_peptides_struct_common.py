@@ -330,7 +330,7 @@ def parse_args(base: Any, argv: Sequence[str] | None, *, onehop: bool) -> argpar
     parser.add_argument("--repeat", type=int, default=1)
     parser.add_argument("--name-tag", type=str, default=default_tag)
     parser.add_argument("--max-epoch", type=int, default=200, help="Default matches the official Peptides-struct config.")
-    parser.add_argument("--ckpt-period", type=int, default=1, help="Storage checkpoint period. Default 1 for Colab recovery.")
+    parser.add_argument("--ckpt-period", type=int, default=100, help="Official GraphGym checkpoint period; stable recovery checkpoints still save first/new-best/latest.")
     parser.add_argument("--num-threads", type=int, default=4)
     parser.add_argument("--pyg-version", type=str, default="2.2.0")
     parser.add_argument("--skip-install", action="store_true")
@@ -395,8 +395,17 @@ def run_training(variant: str, argv: Sequence[str] | None = None) -> None:
         base.log("[deps] Skipping dependency installation (--skip-install).")
 
     commit = base.clone_or_update_repo(args.repo_dir, args.repo_url, args.branch, args.commit or None, args.force_fresh_repo)
+    # The official GRIT checkout is a generated dependency under /content (or
+    # the user-provided repo-dir), while checkpoints/results live in Drive.
+    # Reset it before applying our training-loop/control patches so rerunning a
+    # Colab cell against an already-patched checkout is deterministic.
+    base.run_cmd(["git", "reset", "--hard", commit], cwd=args.repo_dir)
     if onehop:
         base.apply_parameter_matched_onehop_patch(args.repo_dir, args.drive_dir)
+        base.log(
+            "[patch] Peptides-struct note: the reused patch helper may mention ZINC in a provenance filename/log label; "
+            "the config validated below is the Peptides-struct 1-hop global-RRWP config."
+        )
         base.verify_recovery_checkpoint_patch(args.repo_dir)
     elif args.guaranteed_checkpoints:
         base.apply_recovery_checkpoint_patch(args.repo_dir)
