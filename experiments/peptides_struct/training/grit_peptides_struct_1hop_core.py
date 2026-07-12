@@ -61,6 +61,18 @@ def _get_secret(name: str) -> str | None:
     return os.environ.get(name)
 
 
+def _premount_default_drive() -> None:
+    if not _in_colab():
+        return
+    try:
+        from google.colab import drive  # type: ignore
+
+        print("[drive] Pre-mounting Google Drive at /content/drive before repository setup ...", flush=True)
+        drive.mount("/content/drive", force_remount=False)
+    except Exception as exc:
+        raise RuntimeError("Failed to mount Google Drive before Peptides GRIT setup") from exc
+
+
 def _auth_url(repo_url: str, token: str | None) -> str:
     if not token or not repo_url.startswith("https://github.com/"):
         return repo_url
@@ -137,6 +149,7 @@ def _split_bootstrap_args(argv: Sequence[str] | None) -> tuple[argparse.Namespac
 
 def main(argv: Sequence[str] | None = None) -> None:
     bootstrap, rest = _split_bootstrap_args(argv)
+    _premount_default_drive()
     _bootstrap_project_repo(
         bootstrap.project_repo_url,
         bootstrap.project_branch,
