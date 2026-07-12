@@ -688,7 +688,8 @@ def run_training(variant: str, argv: Sequence[str] | None = None) -> None:
         train_env.pop("GRIT_FORCE_EPOCH_CKPT", None)
         base.log(
             "[checkpoint-guarantee] Enabled: official GRIT will save compatible recovery checkpoints "
-            f"after the first completed epoch, on each new best, and at official epochs divisible by {max(0, int(args.recovery_ckpt_period))}."
+            f"after every completed epoch. The first completed epoch after resume is also copied to first_after_resume.ckpt; "
+            f"new best epochs update best.ckpt; epochs divisible by {max(0, int(args.recovery_ckpt_period))} get numbered snapshots."
         )
         base.log(f"[checkpoint-guarantee] Stable best checkpoint path: {recovery_dir / 'best.ckpt'}")
         base.log(f"[checkpoint-guarantee] Stable latest checkpoint path: {recovery_dir / 'latest.ckpt'}")
