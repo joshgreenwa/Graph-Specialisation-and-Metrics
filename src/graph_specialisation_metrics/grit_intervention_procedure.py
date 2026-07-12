@@ -5357,6 +5357,7 @@ def run_symbolic_structural_probe(models: Sequence[ModelRun], artifact_root: Pat
     # the structural swap is the on-manifold cross-check aligned with the content donor-swap.
     rrwp_replacement = str(cfg.get("symbolic_structural_rrwp_replacement", "donor"))
     donor_samples = int(cfg.get("symbolic_structural_donor_samples", 4))
+    reach_tau = int(cfg.get("reach_far_distance_tau", 3))
     seed = int(config.get("seeds", [0])[0])
     dpi = int(config["figures"]["dpi"])
     rows: list[dict[str, Any]] = []
@@ -5450,10 +5451,14 @@ def run_symbolic_structural_probe(models: Sequence[ModelRun], artifact_root: Pat
         if have or miss:
             progress(f"Step 7 coverage [{fac} functional]: have {have or '-'}; MISSING {miss or '-'}")
     write_csv(artifact_root / "metrics" / "step7_carriage_by_distance_summary.csv", step7_by_distance_summary_rows(rows))
+    write_csv(artifact_root / "metrics" / "step7_carriage_reach_summary.csv", step7_reach_summary_rows(rows, tau=reach_tau))
+    write_csv(artifact_root / "metrics" / "step7_method_agreement_summary.csv", step7_method_agreement_rows(rows))
     render_symbolic_structural_by_distance(rows, artifact_root, dpi=dpi)
     render_step7_funcbenef_grid(rows, artifact_root, dpi=dpi, method="ig")
     render_step7_funcbenef_grid(rows, artifact_root, dpi=dpi, method="swap")
     render_carriage_functional_vs_beneficial(rows, artifact_root, dpi=dpi, completeness_note=completeness_note)
+    render_step7_reach_summary(rows, artifact_root, dpi=dpi, tau=reach_tau)
+    render_step7_method_agreement(rows, artifact_root, dpi=dpi, completeness_note=completeness_note)
     n_struct = len([r for r in rows if str(r.get("factor")) in {"node_rrwp", "pair_rrwp", "both_rrwp", "structure"}])
     progress(f"Step 7 symbolic/structural: wrote {len(rows)} rows ({n_struct} structural)")
     return {"status": "complete", "rows": len(rows), "structural_rows": n_struct}
@@ -5674,6 +5679,224 @@ def render_step7_funcbenef_grid(rows: Sequence[Mapping[str, Any]], artifact_root
     figures = ensure_dir(artifact_root / "figures")
     fig.savefig(figures / f"step7_functional_vs_beneficial_{method}.png", dpi=dpi)
     fig.savefig(figures / f"step7_functional_vs_beneficial_{method}.pdf")
+    plt.close(fig)
+
+
+# IG structural factors (the completeness-checked anchor) used by the reach + agreement summaries.
+_STEP7_IG_FACTORS = [("content_ig", "Content"), ("node_rrwp_ig", "Node RRWP"), ("pair_rrwp_ig", "Pair RRWP")]
+_STEP7_IG_SWAP_PAIRS = [("content_ig", "content", "Content"),
+                        ("node_rrwp_ig", "node_rrwp", "Node RRWP"),
+                        ("pair_rrwp_ig", "pair_rrwp", "Pair RRWP")]
+
+
+def _step7_pairs(rows: Sequence[Mapping[str, Any]], factor: str, model: str, mode: str, value_key: str) -> list[tuple[int, float]]:
+    """Raw (integer distance, value) pairs for one (factor, model, mode) -- backs the reach bootstrap."""
+    out: list[tuple[int, float]] = []
+    for r in rows:
+        if str(r.get("factor")) != factor or str(r.get("model")) != model or str(r.get("mode")) != mode:
+            continue
+        d = safe_float(r.get("distance"))
+        v = safe_float(r.get(value_key))
+        if math.isfinite(d) and math.isfinite(v):
+            out.append((int(round(d)), v))
+    return out
+
+
+def _reach_stats(pairs: Sequence[tuple[int, float]], tau: int, rng: np.random.Generator, *, n_boot: int = 800) -> Optional[dict[str, float]]:
+    """Mass-weighted carriage reach + long-range fraction (>= tau) with percentile-bootstrap CIs.
+
+    reach = sum(d * |c|) / sum(|c|)  (mean carrier<->source distance weighted by |carriage| mass);
+    far_frac = fraction of |carriage| mass at distance >= tau. Both are computed over the SAME
+    (carrier, source) pair set for every model (common graph geometry), so model differences are
+    model-driven, not geometry -- and neither involves an ablation, so both are confound-free.
+    """
+    if not pairs:
+        return None
+    d = np.asarray([p[0] for p in pairs], dtype=float)
+    w = np.abs(np.asarray([p[1] for p in pairs], dtype=float))
+    tot = float(w.sum())
+    if tot <= 0.0:
+        return None
+    reach = float((d * w).sum() / tot)
+    far = float(w[d >= tau].sum() / tot)
+    n = len(pairs)
+    idx = rng.integers(0, n, size=(int(n_boot), n))
+    dd, ww = d[idx], w[idx]
+    tt = ww.sum(axis=1)
+    tt[tt <= 0] = np.nan
+    rb = (dd * ww).sum(axis=1) / tt
+    fb = (ww * (dd >= tau)).sum(axis=1) / tt
+
+    def _ci(a: np.ndarray) -> tuple[float, float]:
+        a = a[np.isfinite(a)]
+        return (float(np.percentile(a, 2.5)), float(np.percentile(a, 97.5))) if a.size else (float("nan"), float("nan"))
+
+    r_lo, r_hi = _ci(rb)
+    f_lo, f_hi = _ci(fb)
+    return {"reach": reach, "reach_lo": r_lo, "reach_hi": r_hi,
+            "far_frac": far, "far_lo": f_lo, "far_hi": f_hi, "n_pairs": float(n), "total_mass": tot}
+
+
+def step7_reach_summary_rows(rows: Sequence[Mapping[str, Any]], *, tau: int = 3) -> list[dict[str, Any]]:
+    """Per (model, IG factor) carriage reach + long-range fraction -- the quantitative backing for the
+    dense-vs-1hop and global-vs-local contrasts (uses the completeness-checked IG functional carriage)."""
+    rng = np.random.default_rng(2024)
+    models = ordered_model_names(sorted({str(r.get("model")) for r in rows}))
+    out: list[dict[str, Any]] = []
+    for factor, _ in _STEP7_IG_FACTORS:
+        for m in models:
+            st = _reach_stats(_step7_pairs(rows, factor, m, "functional", "effect_abs"), tau, rng)
+            if st is not None:
+                out.append({"factor": factor, "model": m, "mode": "functional", "tau": int(tau), **st})
+    return out
+
+
+def render_step7_reach_summary(rows: Sequence[Mapping[str, Any]], artifact_root: Path, *, dpi: int, tau: int = 3) -> None:
+    """CORE contrast figure: how far each model transports content vs node/pair structure.
+
+    Left: mean carriage distance (reach). Right: long-range fraction (share of |carriage| at
+    distance >= tau). Grouped by IG factor (Content / Node RRWP / Pair RRWP), bars per model, with
+    95% bootstrap CIs. Answers at a glance: (i) dense GT reaches further than 1-hop (the core
+    difference), and (ii) global-RRWP 1-hop vs local-RRWP 1-hop differ specifically on PAIR RRWP
+    reach -- the node/pair split isolating what the global RRWP buys. Confound-free (no ablation).
+    """
+    stats = step7_reach_summary_rows(rows, tau=tau)
+    if not stats:
+        return
+    factors = [(f, t) for f, t in _STEP7_IG_FACTORS if any(s["factor"] == f for s in stats)]
+    models = ordered_model_names(sorted({str(s["model"]) for s in stats}))
+    if not factors or not models:
+        return
+    by = {(str(s["factor"]), str(s["model"])): s for s in stats}
+    palette = plt.cm.tab10.colors
+    color = {m: palette[i % len(palette)] for i, m in enumerate(models)}
+    fig, axes = plt.subplots(1, 2, figsize=(6.6 + 1.2 * len(factors), 5.0), squeeze=False)
+    metrics = [("reach", "reach_lo", "reach_hi", "mean carriage distance (hops)"),
+               ("far_frac", "far_lo", "far_hi", f"long-range fraction (|carriage| at d>={tau})")]
+    x = np.arange(len(factors))
+    width = 0.8 / max(1, len(models))
+    for ax, (mkey, lo_k, hi_k, ylab) in zip(axes[0], metrics):
+        for i, m in enumerate(models):
+            xs = x + (i - (len(models) - 1) / 2.0) * width
+            heights, yerr_lo, yerr_hi = [], [], []
+            for f, _ in factors:
+                s = by.get((f, m))
+                v = float(s[mkey]) if s else 0.0
+                heights.append(v)
+                yerr_lo.append(0.0 if not s else max(0.0, v - float(s[lo_k])))
+                yerr_hi.append(0.0 if not s else max(0.0, float(s[hi_k]) - v))
+            ax.bar(xs, heights, width=width * 0.95, color=color[m], label=model_label(m),
+                   yerr=[yerr_lo, yerr_hi], capsize=2.5, error_kw={"lw": 0.9, "alpha": 0.8})
+        ax.set_xticks(x)
+        ax.set_xticklabels([t for _, t in factors])
+        ax.set_ylabel(ylab)
+        ax.grid(axis="y", alpha=0.3)
+    axes[0][0].legend(fontsize=8, loc="best")
+    fig.suptitle("Carriage reach: how far each model transports content vs node/pair structure (IG functional; 95% CI)")
+    fig.tight_layout()
+    figures = ensure_dir(artifact_root / "figures")
+    fig.savefig(figures / "step7_carriage_reach_summary.png", dpi=dpi)
+    fig.savefig(figures / "step7_carriage_reach_summary.pdf")
+    plt.close(fig)
+
+
+def step7_method_agreement_rows(rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Pearson r + OLS slope of finite-swap vs IG, per (factor, mode), pooled over (model, distance)
+    means -- the quantitative IG<->swap consistency check (r~1, slope~1 => the two estimators agree)."""
+    models = ordered_model_names(sorted({str(r.get("model")) for r in rows}))
+    out: list[dict[str, Any]] = []
+    for fi, fs, _ in _STEP7_IG_SWAP_PAIRS:
+        for mode, vk in (("functional", "effect_abs"), ("beneficial", "effect_signed")):
+            xs: list[float] = []
+            ys: list[float] = []
+            for m in models:
+                di, mi, *_ = _step7_series(rows, fi, m, mode, vk)
+                dsw, msw, *_ = _step7_series(rows, fs, m, mode, vk)
+                ig_map = dict(zip(di, mi))
+                sw_map = dict(zip(dsw, msw))
+                for d in sorted(set(ig_map) & set(sw_map)):
+                    xs.append(ig_map[d])
+                    ys.append(sw_map[d])
+            rec: dict[str, Any] = {"factor": fi, "mode": mode, "n_points": len(xs)}
+            if len(xs) >= 3 and np.std(xs) > 0 and np.std(ys) > 0:
+                rec["pearson_r"] = float(np.corrcoef(xs, ys)[0, 1])
+                rec["slope"] = float(np.polyfit(xs, ys, 1)[0])
+            else:
+                rec["pearson_r"] = float("nan")
+                rec["slope"] = float("nan")
+            out.append(rec)
+    return out
+
+
+def render_step7_method_agreement(
+    rows: Sequence[Mapping[str, Any]], artifact_root: Path, *, dpi: int, completeness_note: Optional[str] = None
+) -> None:
+    """Q1 -- IG vs finite-swap consistency. Scatter of swap mean (y) against IG mean (x) across every
+    (model, distance) point, per factor (columns) and mode (rows), with the y=x line and Pearson r +
+    OLS slope annotated. Points on y=x with r~1 => the two estimators agree; systematic departures
+    localise where (which factor / near vs far) they diverge. IG is the anchor (it is completeness-
+    exact, Sum C == y_hat_clean - y_hat_base); the swap is the on-manifold corroboration.
+    """
+    triples = [(fi, fs, t) for fi, fs, t in _STEP7_IG_SWAP_PAIRS
+               if any(str(r.get("factor")) == fi for r in rows) and any(str(r.get("factor")) == fs for r in rows)]
+    if not triples:
+        return
+    models = ordered_model_names(sorted({str(r["model"]) for r in rows}))
+    palette = plt.cm.tab10.colors
+    color = {m: palette[i % len(palette)] for i, m in enumerate(models)}
+    # Precompute matched (IG, swap) points per (mode, factor, model); drop mode-rows with no data.
+    all_modes = [("functional", "effect_abs", "Functional"), ("beneficial", "effect_signed", "Beneficial")]
+    pts: dict[tuple[str, str, str], list[tuple[float, float]]] = {}
+    for mode, vk, _ in all_modes:
+        for fi, fs, _t in triples:
+            for m in models:
+                di, mi, *_ = _step7_series(rows, fi, m, mode, vk)
+                dsw, msw, *_ = _step7_series(rows, fs, m, mode, vk)
+                ig_map, sw_map = dict(zip(di, mi)), dict(zip(dsw, msw))
+                common = sorted(set(ig_map) & set(sw_map))
+                if common:
+                    pts[(mode, fi, m)] = [(ig_map[d], sw_map[d]) for d in common]
+    modes = [(mode, vk, sub) for mode, vk, sub in all_modes
+             if any((mode, fi, m) in pts for fi, _fs, _t in triples for m in models)]
+    if not modes:
+        return
+    fig, axes = plt.subplots(len(modes), len(triples), figsize=(4.6 * len(triples), 4.2 * len(modes)), squeeze=False)
+    for c, (fi, fs, title) in enumerate(triples):
+        for ridx, (mode, vk, sub) in enumerate(modes):
+            ax = axes[ridx][c]
+            xs: list[float] = []
+            ys: list[float] = []
+            for m in models:
+                mpts = pts.get((mode, fi, m))
+                if mpts:
+                    ax.scatter([p[0] for p in mpts], [p[1] for p in mpts],
+                               s=22, color=color[m], alpha=0.8, edgecolors="none",
+                               label=(model_label(m) if ridx == 0 and c == 0 else None))
+                    xs.extend(p[0] for p in mpts)
+                    ys.extend(p[1] for p in mpts)
+            if xs:
+                lo, hi = min(xs + ys), max(xs + ys)
+                pad = 0.05 * (hi - lo + 1e-9)
+                ax.plot([lo - pad, hi + pad], [lo - pad, hi + pad], "k:", lw=0.8)
+                if len(xs) >= 3 and np.std(xs) > 0 and np.std(ys) > 0:
+                    r = float(np.corrcoef(xs, ys)[0, 1])
+                    slope = float(np.polyfit(xs, ys, 1)[0])
+                    ax.text(0.03, 0.97, f"r = {r:.2f}\nslope = {slope:.2f}\nn = {len(xs)}",
+                            transform=ax.transAxes, va="top", ha="left", fontsize=8,
+                            bbox=dict(boxstyle="round", fc="white", ec="0.7", alpha=0.8))
+            ax.set_title(f"{sub}: {title}")
+            ax.set_xlabel("IG mean (anchor)")
+            ax.set_ylabel("finite-swap mean")
+            ax.grid(alpha=0.3)
+    if any(axes[0][0].get_legend_handles_labels()[1]):
+        axes[0][0].legend(fontsize=7, loc="lower right")
+    fig.suptitle("IG vs finite-swap agreement (points on y=x, r~1 => estimators consistent)", y=0.99)
+    if completeness_note:
+        fig.text(0.5, 0.005, completeness_note, ha="center", va="bottom", fontsize=7.5, color="0.35")
+    fig.tight_layout(rect=(0, 0.02, 1, 0.97))
+    figures = ensure_dir(artifact_root / "figures")
+    fig.savefig(figures / "step7_ig_vs_swap_agreement.png", dpi=dpi, bbox_inches="tight")
+    fig.savefig(figures / "step7_ig_vs_swap_agreement.pdf", bbox_inches="tight")
     plt.close(fig)
 
 

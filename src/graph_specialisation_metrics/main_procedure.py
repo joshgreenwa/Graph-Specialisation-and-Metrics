@@ -202,14 +202,21 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "symbolic_structural_rrwp_channel_start": 2,
             "symbolic_structural_rrwp_replacement": "donor",
             "symbolic_structural_donor_samples": 4,
-            "run_rrwp_distance_ablation": True,
+            "reach_far_distance_tau": 3,
+            # Off-manifold RRWP-zeroing ablations are DISABLED by default: zeroing long RRWP channels
+            # pushes the model off its training distribution, so the resulting MAE change conflates
+            # "information used" with off-manifold shock (a confounded inference-time ablation). The
+            # on-manifold carriage (IG anchor + donor swap) + the reach summary answer the same
+            # dense-vs-1hop / global-vs-local questions without the confound. Flip to True only if a
+            # supplementary (clearly-labelled off-manifold) ablation is wanted.
+            "run_rrwp_distance_ablation": False,
             "rrwp_ablation_sample_graphs": 24,
             "rrwp_ablation_channel_start": 2,
             "rrwp_ablation_replacement": "zero",
             "rrwp_ablation_types": ["node", "pair", "both"],
             "rrwp_distance_ablation_types": ["pair"],
             "global_rrwp_channel_ablation_types": ["node", "pair", "both"],
-            "run_global_rrwp_channel_ablation": True,
+            "run_global_rrwp_channel_ablation": False,  # off-manifold; see run_rrwp_distance_ablation note above
             "global_rrwp_channel_ablation_sample_graphs": 48,
             "rrwp_ablation_distance_bins": [
                 {"label": "d=2-3", "min": 2, "max": 3},
