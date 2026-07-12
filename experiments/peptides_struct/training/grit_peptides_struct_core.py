@@ -67,9 +67,19 @@ def _auth_url(repo_url: str, token: str | None) -> str:
 
 
 def _copy_sidecar_common(repo_dir: Path) -> None:
-    sidecar = Path(__file__).with_name("grit_peptides_struct_common.py")
+    candidates: list[Path] = []
+    file_value = globals().get("__file__")
+    if file_value:
+        candidates.append(Path(file_value).with_name("grit_peptides_struct_common.py"))
+    candidates.extend([
+        Path.cwd() / "grit_peptides_struct_common.py",
+        Path("/content/grit_peptides_struct_common.py"),
+    ])
+    sidecar = next((p for p in candidates if p.exists()), None)
+    if sidecar is None:
+        return
     target = repo_dir / "experiments" / "peptides_struct" / "training" / "grit_peptides_struct_common.py"
-    if sidecar.exists() and sidecar.resolve() != target.resolve():
+    if sidecar.resolve() != target.resolve():
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(sidecar, target)
         print(f"[bootstrap] using sidecar Peptides helper: {sidecar} -> {target}", flush=True)
