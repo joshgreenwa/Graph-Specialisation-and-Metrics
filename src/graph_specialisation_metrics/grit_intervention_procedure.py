@@ -5318,7 +5318,15 @@ def symbolic_structural_carriage_rows(
             for tkind, fac in (("node", "node_rrwp_ig"), ("pair", "pair_rrwp_ig")):
                 res = structural_carriage_ig(adapter, graph, target_kind=tkind, steps=ig_steps, readout_ig=struct_readout_ig)
                 if res is None:
-                    progress(f"  {model.name} graph {gid}: {fac} unavailable (no raw RRWP or _run_with_hooks)")
+                    def _shp(key: str) -> Any:
+                        t = extras.get(key)
+                        return tuple(t.shape) if isinstance(t, torch.Tensor) else None
+                    progress(
+                        f"  {model.name} graph {gid}: {fac} unavailable -- raw_rrwp={_shp('raw_rrwp')} "
+                        f"raw_rrwp_val={_shp('raw_rrwp_val')} raw_rrwp_index={_shp('raw_rrwp_index')} "
+                        f"encoded_edge_attr={_shp('encoded_edge_attr')} hooks={hasattr(adapter, '_run_with_hooks')} "
+                        f"keys={sorted(k for k, v in extras.items() if v is not None)[:12]}"
+                    )
                     continue
                 if completeness_out is not None and res.get("completeness_target") is not None:
                     rec = float(res["reconstruction_sum"])
