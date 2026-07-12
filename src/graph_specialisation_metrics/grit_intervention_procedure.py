@@ -5382,9 +5382,9 @@ def run_symbolic_structural_probe(models: Sequence[ModelRun], artifact_root: Pat
     if not rows:
         progress("Step 4 symbolic/structural: no rows produced")
         return {"status": "no_rows", "rows": 0}
-    write_csv(artifact_root / "metrics" / "step4_symbolic_structural_carriage.csv", rows)
+    write_csv(artifact_root / "metrics" / "step7_symbolic_structural_carriage.csv", rows)
     if completeness_rows:
-        write_csv(artifact_root / "metrics" / "step4_structural_carriage_ig_completeness.csv", completeness_rows)
+        write_csv(artifact_root / "metrics" / "step7_structural_carriage_ig_completeness.csv", completeness_rows)
         errs = [safe_float(r["abs_error"]) for r in completeness_rows if math.isfinite(safe_float(r.get("abs_error")))]
         tgts = [abs(safe_float(r["completeness_target"])) for r in completeness_rows]
         if errs:
@@ -5443,8 +5443,8 @@ def render_carriage_functional_vs_beneficial(rows: Sequence[Mapping[str, Any]], 
     fig.suptitle("Functional (dashed) vs beneficial (solid) carriage: content + structural, by distance")
     fig.tight_layout()
     figures = ensure_dir(artifact_root / "figures")
-    fig.savefig(figures / "step4_functional_vs_beneficial_carriage.png", dpi=dpi)
-    fig.savefig(figures / "step4_functional_vs_beneficial_carriage.pdf")
+    fig.savefig(figures / "step7_functional_vs_beneficial_carriage.png", dpi=dpi)
+    fig.savefig(figures / "step7_functional_vs_beneficial_carriage.pdf")
     plt.close(fig)
 
 
@@ -5490,8 +5490,8 @@ def render_symbolic_structural_beneficial(rows: Sequence[Mapping[str, Any]], art
     fig.suptitle("Beneficial structural carriage by distance (local vs global RRWP discriminator)")
     fig.tight_layout()
     figures = ensure_dir(artifact_root / "figures")
-    fig.savefig(figures / "step4_beneficial_structural_carriage.png", dpi=dpi)
-    fig.savefig(figures / "step4_beneficial_structural_carriage.pdf")
+    fig.savefig(figures / "step7_beneficial_structural_carriage.png", dpi=dpi)
+    fig.savefig(figures / "step7_beneficial_structural_carriage.pdf")
     plt.close(fig)
 
 
@@ -5548,8 +5548,8 @@ def render_symbolic_structural_by_distance(rows: Sequence[Mapping[str, Any]], ar
     for ax in axes_flat[len(available_panels):]:
         ax.set_axis_off()
     fig.suptitle("Source-specific carriage by distance: content vs long-RRWP structure")
-    fig.savefig(figures / "step4_symbolic_structural_carriage_by_distance.png", dpi=dpi)
-    fig.savefig(figures / "step4_symbolic_structural_carriage_by_distance.pdf")
+    fig.savefig(figures / "step7_symbolic_structural_carriage_by_distance.png", dpi=dpi)
+    fig.savefig(figures / "step7_symbolic_structural_carriage_by_distance.pdf")
     plt.close(fig)
 
     fig_abs, axes_abs = plt.subplots(nrows, ncols, figsize=(6.7 * ncols, 4.2 * nrows), constrained_layout=True)
@@ -5572,8 +5572,8 @@ def render_symbolic_structural_by_distance(rows: Sequence[Mapping[str, Any]], ar
     for ax in axes_abs_flat[len(available_panels):]:
         ax.set_axis_off()
     fig_abs.suptitle("Source-specific carriage by distance: absolute content and long-RRWP effects")
-    fig_abs.savefig(figures / "step4_symbolic_structural_carriage_absolute_by_distance.png", dpi=dpi)
-    fig_abs.savefig(figures / "step4_symbolic_structural_carriage_absolute_by_distance.pdf")
+    fig_abs.savefig(figures / "step7_symbolic_structural_carriage_absolute_by_distance.png", dpi=dpi)
+    fig_abs.savefig(figures / "step7_symbolic_structural_carriage_absolute_by_distance.pdf")
     plt.close(fig_abs)
 
     totals: dict[tuple[str, str], list[float]] = {}
@@ -5628,9 +5628,9 @@ def render_symbolic_structural_by_distance(rows: Sequence[Mapping[str, Any]], ar
     ax_tot.set_ylabel("Total |carriage| per graph (prediction units)")
     ax_tot.set_title("Diagnostic total carriage: content and pair-RRWP effects")
     ax_tot.legend(frameon=False, fontsize=8)
-    write_csv(artifact_root / "metrics" / "step4_symbolic_structural_component_totals.csv", total_rows)
-    fig_tot.savefig(figures / "step4_symbolic_structural_component_totals.png", dpi=dpi)
-    fig_tot.savefig(figures / "step4_symbolic_structural_component_totals.pdf")
+    write_csv(artifact_root / "metrics" / "step7_symbolic_structural_component_totals.csv", total_rows)
+    fig_tot.savefig(figures / "step7_symbolic_structural_component_totals.png", dpi=dpi)
+    fig_tot.savefig(figures / "step7_symbolic_structural_component_totals.pdf")
     plt.close(fig_tot)
 
     global_model = "grit_1hop"
@@ -5723,9 +5723,9 @@ def render_symbolic_structural_by_distance(rows: Sequence[Mapping[str, Any]], ar
             fig_con.suptitle("Diagnostic: global-minus-local RRWP carriage contrast")
         else:
             fig_con.suptitle("Where global RRWP changes structural carriage relative to local RRWP")
-        write_csv(artifact_root / "metrics" / "step4_symbolic_global_vs_local_rrwp_contrast.csv", contrast_rows)
-        fig_con.savefig(figures / "step4_symbolic_global_vs_local_rrwp_contrast.png", dpi=dpi)
-        fig_con.savefig(figures / "step4_symbolic_global_vs_local_rrwp_contrast.pdf")
+        write_csv(artifact_root / "metrics" / "step7_symbolic_global_vs_local_rrwp_contrast.csv", contrast_rows)
+        fig_con.savefig(figures / "step7_symbolic_global_vs_local_rrwp_contrast.png", dpi=dpi)
+        fig_con.savefig(figures / "step7_symbolic_global_vs_local_rrwp_contrast.pdf")
         plt.close(fig_con)
 
 
@@ -6208,7 +6208,7 @@ def global_vs_local_rrwp_contrast_rows(
     return rows
 
 
-def render_step4_rrwp_distance_bin_ablation(rows: Sequence[Mapping[str, Any]], artifact_root: Path, *, dpi: int) -> None:
+def render_step7_rrwp_distance_bin_ablation(rows: Sequence[Mapping[str, Any]], artifact_root: Path, *, dpi: int) -> None:
     clean = [
         r
         for r in rows
@@ -6222,8 +6222,8 @@ def render_step4_rrwp_distance_bin_ablation(rows: Sequence[Mapping[str, Any]], a
         fig, ax = plt.subplots(figsize=(8.0, 4.4), constrained_layout=True)
         ax.text(0.5, 0.5, "No pair-RRWP distance-bin ablation rows were available.", ha="center", va="center", transform=ax.transAxes)
         ax.set_axis_off()
-        fig.savefig(figures / "step4_rrwp_distance_bin_ablation.png", dpi=dpi)
-        fig.savefig(figures / "step4_rrwp_distance_bin_ablation.pdf")
+        fig.savefig(figures / "step7_rrwp_distance_bin_ablation.png", dpi=dpi)
+        fig.savefig(figures / "step7_rrwp_distance_bin_ablation.pdf")
         plt.close(fig)
         return
     labels = sorted(
@@ -6291,13 +6291,13 @@ def render_step4_rrwp_distance_bin_ablation(rows: Sequence[Mapping[str, Any]], a
         fontsize=9,
         color="#555555",
     )
-    write_csv(artifact_root / "metrics" / "step4_pair_rrwp_distance_bin_ablation_summary.csv", summary_rows)
-    fig.savefig(figures / "step4_rrwp_distance_bin_ablation.png", dpi=dpi)
-    fig.savefig(figures / "step4_rrwp_distance_bin_ablation.pdf")
+    write_csv(artifact_root / "metrics" / "step7_pair_rrwp_distance_bin_ablation_summary.csv", summary_rows)
+    fig.savefig(figures / "step7_rrwp_distance_bin_ablation.png", dpi=dpi)
+    fig.savefig(figures / "step7_rrwp_distance_bin_ablation.pdf")
     plt.close(fig)
 
 
-def render_step4_global_vs_local_rrwp_paired_contrast(
+def render_step7_global_vs_local_rrwp_paired_contrast(
     rows: Sequence[Mapping[str, Any]],
     artifact_root: Path,
     *,
@@ -6329,8 +6329,8 @@ def render_step4_global_vs_local_rrwp_paired_contrast(
         )
         for ax in axes:
             ax.set_axis_off()
-        fig.savefig(figures / "step4_global_vs_local_rrwp_paired_contrast.png", dpi=dpi)
-        fig.savefig(figures / "step4_global_vs_local_rrwp_paired_contrast.pdf")
+        fig.savefig(figures / "step7_global_vs_local_rrwp_paired_contrast.png", dpi=dpi)
+        fig.savefig(figures / "step7_global_vs_local_rrwp_paired_contrast.pdf")
         plt.close(fig)
         return
     for ax, (x_key, label) in zip(np.asarray(axes).reshape(-1), predictors):
@@ -6356,8 +6356,8 @@ def render_step4_global_vs_local_rrwp_paired_contrast(
         ax.set_ylabel(f"{local_model} MAE - {global_model} MAE")
         ax.text(0.03, 0.95, r_text, transform=ax.transAxes, ha="left", va="top", fontsize=9)
     fig.suptitle("Global vs local RRWP: paired molecule contrast")
-    fig.savefig(figures / "step4_global_vs_local_rrwp_paired_contrast.png", dpi=dpi)
-    fig.savefig(figures / "step4_global_vs_local_rrwp_paired_contrast.pdf")
+    fig.savefig(figures / "step7_global_vs_local_rrwp_paired_contrast.png", dpi=dpi)
+    fig.savefig(figures / "step7_global_vs_local_rrwp_paired_contrast.pdf")
     plt.close(fig)
 
 
@@ -6628,8 +6628,8 @@ def _render_step4_global_rrwp_channel_ablation_main(
         color="#555555",
     )
     ax.set_ylim(bottom=0.0)
-    fig.savefig(figures / "step4_global_to_local_rrwp_ablation_main.png", dpi=dpi)
-    fig.savefig(figures / "step4_global_to_local_rrwp_ablation_main.pdf")
+    fig.savefig(figures / "step7_global_to_local_rrwp_ablation_main.png", dpi=dpi)
+    fig.savefig(figures / "step7_global_to_local_rrwp_ablation_main.pdf")
     plt.close(fig)
 
 
@@ -6640,8 +6640,8 @@ def render_step4_global_rrwp_channel_ablation(rows: Sequence[Mapping[str, Any]],
         fig, ax = plt.subplots(figsize=(8.0, 4.2), constrained_layout=True)
         ax.text(0.5, 0.5, "No long-RRWP channel ablation rows were available.", ha="center", va="center", transform=ax.transAxes)
         ax.set_axis_off()
-        fig.savefig(figures / "step4_global_to_local_rrwp_ablation.png", dpi=dpi)
-        fig.savefig(figures / "step4_global_to_local_rrwp_ablation.pdf")
+        fig.savefig(figures / "step7_global_to_local_rrwp_ablation.png", dpi=dpi)
+        fig.savefig(figures / "step7_global_to_local_rrwp_ablation.pdf")
         plt.close(fig)
         return
     order = _global_rrwp_channel_order(clean)
@@ -6714,9 +6714,9 @@ def render_step4_global_rrwp_channel_ablation(rows: Sequence[Mapping[str, Any]],
         ax.set_title(title)
         ax.legend(frameon=False, fontsize=8)
     fig.suptitle("Global-to-local RRWP ablation: which long structural channels matter?")
-    write_csv(artifact_root / "metrics" / "step4_global_to_local_rrwp_ablation_summary.csv", summary_rows)
-    fig.savefig(figures / "step4_global_to_local_rrwp_ablation.png", dpi=dpi)
-    fig.savefig(figures / "step4_global_to_local_rrwp_ablation.pdf")
+    write_csv(artifact_root / "metrics" / "step7_global_to_local_rrwp_ablation_summary.csv", summary_rows)
+    fig.savefig(figures / "step7_global_to_local_rrwp_ablation.png", dpi=dpi)
+    fig.savefig(figures / "step7_global_to_local_rrwp_ablation.pdf")
     plt.close(fig)
     _render_step4_global_rrwp_channel_ablation_main(rows, artifact_root, dpi=dpi)
 
@@ -6824,14 +6824,14 @@ def run_rrwp_distance_ablation_probe(models: Sequence[ModelRun], artifact_root: 
         global_model=global_model,
         local_model=local_model,
     )
-    write_csv(artifact_root / "metrics" / "step4_rrwp_distance_bin_ablation.csv", rows)
-    write_csv(artifact_root / "metrics" / "step4_rrwp_distance_bin_ablation_skips.csv", skip_rows)
-    write_csv(artifact_root / "metrics" / "step4_rrwp_graph_metrics.csv", graph_metric_rows)
-    write_csv(artifact_root / "metrics" / "step4_global_vs_local_rrwp_paired_contrast.csv", contrast_rows)
-    write_csv(artifact_root / "metrics" / "step4_global_to_local_rrwp_ablation.csv", global_channel_rows)
-    write_csv(artifact_root / "metrics" / "step4_global_to_local_rrwp_ablation_skips.csv", global_channel_skip_rows)
-    render_step4_rrwp_distance_bin_ablation(rows, artifact_root, dpi=dpi)
-    render_step4_global_vs_local_rrwp_paired_contrast(
+    write_csv(artifact_root / "metrics" / "step7_rrwp_distance_bin_ablation.csv", rows)
+    write_csv(artifact_root / "metrics" / "step7_rrwp_distance_bin_ablation_skips.csv", skip_rows)
+    write_csv(artifact_root / "metrics" / "step7_rrwp_graph_metrics.csv", graph_metric_rows)
+    write_csv(artifact_root / "metrics" / "step7_global_vs_local_rrwp_paired_contrast.csv", contrast_rows)
+    write_csv(artifact_root / "metrics" / "step7_global_to_local_rrwp_ablation.csv", global_channel_rows)
+    write_csv(artifact_root / "metrics" / "step7_global_to_local_rrwp_ablation_skips.csv", global_channel_skip_rows)
+    render_step7_rrwp_distance_bin_ablation(rows, artifact_root, dpi=dpi)
+    render_step7_global_vs_local_rrwp_paired_contrast(
         contrast_rows,
         artifact_root,
         dpi=dpi,

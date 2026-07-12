@@ -431,13 +431,13 @@ def main(argv: Sequence[str] | None = None) -> None:
     print(f"[done] latest outputs: {latest}", flush=True)
     print("[done] key figures:", flush=True)
     for rel in [
-        "figures/step4_global_to_local_rrwp_ablation_main.png",
-        "figures/step4_global_to_local_rrwp_ablation.png",
-        "figures/step4_rrwp_distance_bin_ablation.png",
-        "figures/step4_symbolic_structural_carriage_absolute_by_distance.png",
-        "figures/step4_symbolic_structural_carriage_by_distance.png",
-        "figures/step4_symbolic_global_vs_local_rrwp_contrast.png",
-        "figures/step4_global_vs_local_rrwp_paired_contrast.png",
+        "figures/step7_global_to_local_rrwp_ablation_main.png",
+        "figures/step7_global_to_local_rrwp_ablation.png",
+        "figures/step7_rrwp_distance_bin_ablation.png",
+        "figures/step7_symbolic_structural_carriage_absolute_by_distance.png",
+        "figures/step7_symbolic_structural_carriage_by_distance.png",
+        "figures/step7_symbolic_global_vs_local_rrwp_contrast.png",
+        "figures/step7_global_vs_local_rrwp_paired_contrast.png",
     ]:
         path = latest / rel
         print(f"  [{'ok' if path.exists() else 'missing'}] {path}", flush=True)
