@@ -5393,9 +5393,59 @@ def run_symbolic_structural_probe(models: Sequence[ModelRun], artifact_root: Pat
                      f"(rel~{rel:.3f}); should be ~0 -- this is the IG-over-RRWP self-test on real GRIT")
     render_symbolic_structural_by_distance(rows, artifact_root, dpi=dpi)
     render_symbolic_structural_beneficial(rows, artifact_root, dpi=dpi)
+    render_carriage_functional_vs_beneficial(rows, artifact_root, dpi=dpi)
     n_struct = len([r for r in rows if str(r.get("factor")) in {"node_rrwp", "pair_rrwp", "both_rrwp", "structure"}])
     progress(f"Step 4 symbolic/structural: wrote {len(rows)} rows ({n_struct} structural)")
     return {"status": "complete", "rows": len(rows), "structural_rows": n_struct}
+
+
+def render_carriage_functional_vs_beneficial(rows: Sequence[Mapping[str, Any]], artifact_root: Path, *, dpi: int) -> None:
+    """Headline dissociation: functional (dashed, |carriage|, left axis) vs beneficial (solid, signed,
+    right axis; <0 = beneficial) for content and structural carriage, by distance, models overlaid.
+
+    Shows in one figure the thesis claim -- transport can be functionally far-reaching yet only
+    beneficial short-range -- for BOTH symbolic (content) and structural (node/pair RRWP) carriage,
+    using the IG-aligned factors so functional and beneficial are the same estimator.
+    """
+    factor_titles = [("content_ig", "Content"), ("node_rrwp_ig", "Node RRWP"), ("pair_rrwp_ig", "Pair RRWP")]
+    factor_titles = [(f, t) for f, t in factor_titles if any(str(r.get("factor")) == f for r in rows)]
+    if not factor_titles:
+        return
+    models = sorted({str(r["model"]) for r in rows})
+    colors = plt.cm.tab10.colors
+    fig, axes = plt.subplots(1, len(factor_titles), figsize=(5.2 * len(factor_titles), 4.4), squeeze=False)
+    for ax, (factor, title) in zip(axes[0], factor_titles):
+        ax2 = ax.twinx()
+        for k, model in enumerate(models):
+            col = colors[k % len(colors)]
+            f_by: dict[int, list[float]] = {}
+            b_by: dict[int, list[float]] = {}
+            for r in rows:
+                if str(r.get("factor")) != factor or not math.isfinite(safe_float(r.get("distance"))):
+                    continue
+                d = int(safe_float(r["distance"]))
+                if str(r.get("mode")) == "functional":
+                    f_by.setdefault(d, []).append(safe_float(r.get("effect_abs")))
+                elif str(r.get("mode")) == "beneficial":
+                    b_by.setdefault(d, []).append(safe_float(r.get("effect_signed")))
+            fd, bd = sorted(f_by), sorted(b_by)
+            if fd:
+                ax.plot(fd, [float(np.nanmean(f_by[d])) for d in fd], "--", color=col, alpha=0.6, label=f"{model} func")
+            if bd:
+                ax2.plot(bd, [float(np.nanmean(b_by[d])) for d in bd], "-o", color=col, ms=4, label=f"{model} benef")
+        ax2.axhline(0, color="k", lw=0.6, ls=":")
+        ax.set_title(title)
+        ax.set_xlabel("carrier<->source distance (hops)")
+        ax.set_ylabel("functional |carriage|  (dashed)")
+        ax2.set_ylabel("beneficial  (solid; <0 = beneficial)")
+        ax.grid(alpha=0.3)
+    axes[0][0].legend(fontsize=7, loc="upper right")
+    fig.suptitle("Functional (dashed) vs beneficial (solid) carriage: content + structural, by distance")
+    fig.tight_layout()
+    figures = ensure_dir(artifact_root / "figures")
+    fig.savefig(figures / "step4_functional_vs_beneficial_carriage.png", dpi=dpi)
+    fig.savefig(figures / "step4_functional_vs_beneficial_carriage.pdf")
+    plt.close(fig)
 
 
 def render_symbolic_structural_beneficial(rows: Sequence[Mapping[str, Any]], artifact_root: Path, *, dpi: int) -> None:
