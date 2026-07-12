@@ -160,7 +160,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "symbolic_structural_max_sources": "all",
             "symbolic_structural_min_distance": 1,
             "symbolic_structural_rrwp_channel_start": 2,
-            "symbolic_structural_rrwp_replacement": "zero",
+            "symbolic_structural_rrwp_replacement": "donor",
             "run_rrwp_distance_ablation": True,
             "rrwp_ablation_sample_graphs": 24,
             "rrwp_ablation_channel_start": 2,
