@@ -4970,38 +4970,74 @@ def structural_carriage_ig(
     g = g.detach().to(h_clean)
     n = int(h_clean.size(0))
     extras = getattr(clean_cache, "extras", None) or {}
-    if target_kind == "node":
-        rrwp_clean = extras.get("raw_rrwp")
+    raw_node = extras.get("raw_rrwp")
+    raw_val = extras.get("raw_rrwp_val")
+    raw_index = extras.get("raw_rrwp_index")
+
+    # --- resolve the RRWP integration variable into a common FLAT form so one code path serves the
+    # sparse node ([n,K]), sparse pair ([E,K]+index) AND dense ([n,n,K]) representations. For the
+    # dense tensor, node RRWP = the diagonal, pair RRWP = the off-diagonal (mirrors the sparse split);
+    # only the selected slots are perturbed (delta zeroed elsewhere), and attribution maps slot (a,b)
+    # to source a. ``active`` also drops padded slots (a>=n or b>=n) so a padded [maxN,maxN,K] is safe.
+    if isinstance(raw_node, torch.Tensor) and raw_node.dim() == 3:
+        dp = raw_node.detach()
+        nn, kk = int(dp.size(0)), int(dp.size(-1))
+        rrwp_flat = dp.reshape(nn * nn, kk)
+        a_idx = torch.arange(nn).repeat_interleave(nn)
+        b_idx = torch.arange(nn).repeat(nn)
+        row_src = a_idx.clone()
+        diag = a_idx == b_idx
+        active = (diag if target_kind == "node" else ~diag) & (a_idx < n) & (b_idx < n)
+        dense_shape = tuple(dp.shape)
         override_kw = "rrwp_node_override"
-        row_src = torch.arange(n)
-    else:
-        rrwp_clean = extras.get("raw_rrwp_val")
-        rrwp_index = extras.get("raw_rrwp_index")
-        override_kw = "rrwp_val_override"
-        if not isinstance(rrwp_index, torch.Tensor) or rrwp_index.dim() != 2:
+
+        def to_override(pf: torch.Tensor) -> dict[str, torch.Tensor]:
+            return {override_kw: pf.reshape(dense_shape)}
+    elif target_kind == "node":
+        if not isinstance(raw_node, torch.Tensor) or raw_node.dim() != 2:
             return None
-        row_src = rrwp_index[0].detach().cpu().long()
-    if not isinstance(rrwp_clean, torch.Tensor) or rrwp_clean.dim() != 2:
+        rrwp_flat = raw_node.detach()
+        row_src = torch.arange(int(rrwp_flat.size(0)))
+        active = row_src < n
+        override_kw = "rrwp_node_override"
+
+        def to_override(pf: torch.Tensor) -> dict[str, torch.Tensor]:
+            return {override_kw: pf}
+    else:  # sparse pair (rrwp_val + rrwp_index)
+        if (not isinstance(raw_val, torch.Tensor) or raw_val.dim() != 2
+                or not isinstance(raw_index, torch.Tensor) or raw_index.dim() != 2):
+            return None
+        rrwp_flat = raw_val.detach()
+        row_src = raw_index[0].detach().cpu().long()
+        active = row_src < n
+        override_kw = "rrwp_val_override"
+
+        def to_override(pf: torch.Tensor) -> dict[str, torch.Tensor]:
+            return {override_kw: pf}
+
+    if int(rrwp_flat.size(0)) == 0 or not bool(active.any()):
         return None
-    rrwp_clean = rrwp_clean.detach()
-    base = rrwp_clean.mean(dim=0, keepdim=True).expand_as(rrwp_clean)  # graph-mean RRWP baseline
-    delta = rrwp_clean - base
+    base = rrwp_flat.mean(dim=0, keepdim=True).expand_as(rrwp_flat)  # graph-mean RRWP baseline
+    delta = (rrwp_flat - base) * active.to(rrwp_flat.dtype).unsqueeze(-1)  # perturb active slots only
+    active_idx = active.nonzero(as_tuple=False).reshape(-1)
+    add_src = row_src.to(h_clean.device)[active_idx]
     y = None if loss_label is None else float(loss_label)
     yhat_clean = float(clean_cache.prediction.reshape(-1)[target_index].detach().cpu().item())
     carriage = h_clean.new_zeros((n, n))
-    row_src = row_src.to(carriage.device)
-    yhat_base = None
+    yhat_endpoint = None
     for alpha_idx in range(1, int(steps) + 1):
         alpha = float(alpha_idx) / float(steps)
         point = (base + alpha * delta).detach().requires_grad_(True)
         cache = adapter._run_with_hooks(
             graph, capture_attention=False, capture_channels=False,
-            capture_layer_inputs=False, capture_layer_outputs=False, **{override_kw: point},
+            capture_layer_inputs=False, capture_layer_outputs=False, **to_override(point),
         )
         h = getattr(cache, "final_node_states", None)
         if not isinstance(h, torch.Tensor):
             return None
         pred_a = cache.prediction.reshape(-1)[target_index]
+        if alpha_idx == int(steps):
+            yhat_endpoint = float(pred_a.detach().cpu().item())
         if readout_ig:
             (g_a,) = torch.autograd.grad(pred_a, h, retain_graph=True, create_graph=False)
             g_step = g_a.detach()
@@ -5013,26 +5049,29 @@ def structural_carriage_ig(
         for i in range(n):
             (grad,) = torch.autograd.grad(carrier_scores[i], point, retain_graph=(i < n - 1), create_graph=False)
             per_row = (grad.detach() * delta).sum(dim=-1)
-            carriage[i].index_add_(0, row_src, per_row.to(carriage.device))
+            carriage[i].index_add_(0, add_src, per_row[active_idx].to(carriage.device))
     carriage = carriage / float(steps)
-    # completeness: with frozen g and no loss projection, sum carriage == y_hat_clean - y_hat_base
+    # completeness: sum carriage telescopes to y_hat(endpoint) - y_hat(base), where the endpoint is
+    # the alpha=1 point (active slots at clean, others at baseline) -- exact with readout_ig.
+    yhat_base = None
     try:
         base_cache = adapter._run_with_hooks(
             graph, capture_attention=False, capture_channels=False,
-            capture_layer_inputs=False, capture_layer_outputs=False,
-            **{override_kw: base.detach()},
+            capture_layer_inputs=False, capture_layer_outputs=False, **to_override(base.detach()),
         )
         yhat_base = float(base_cache.prediction.reshape(-1)[target_index].detach().cpu().item())
     except Exception:  # noqa: BLE001
         yhat_base = None
     recon = float(carriage.sum().item())
+    target = None if (yhat_base is None or yhat_endpoint is None) else (yhat_endpoint - yhat_base)
     return {
         "carriage": carriage.detach().cpu(),
         "target_kind": target_kind,
         "yhat_clean": yhat_clean,
         "yhat_base": yhat_base,
+        "yhat_endpoint": yhat_endpoint,
         "reconstruction_sum": recon,
-        "completeness_target": (None if yhat_base is None else (yhat_clean - yhat_base)),
+        "completeness_target": target,
     }
 
 
