@@ -364,6 +364,182 @@ def apply_peptides_dataset_compat_patch(base: Any, repo_dir: Path) -> None:
         base.log("[dataset-compat] Peptides loader compatibility patch already present.")
 
 
+def apply_peptides_streaming_rrwp_patch(base: Any, repo_dir: Path) -> None:
+    """Patch GRIT's PE preprocessing to avoid Colab system-RAM OOM.
+
+    Official GRIT computes exactly the requested RRWP tensors, but its helper
+    first builds a Python list containing every transformed graph, then collates
+    the whole list. Peptides-struct with RRWP-24 is large enough that this list
+    exceeds Colab high-RAM limits. This patch keeps the official transform and
+    config unchanged, but collates transformed graphs in chunks and disables
+    PyG's separated-graph cache afterwards so the epoch does not duplicate the
+    already-large collated RRWP tensors in RAM.
+    """
+    path = repo_dir / "grit" / "transform" / "transforms.py"
+    if not path.exists():
+        raise FileNotFoundError(f"Official GRIT transforms.py not found: {path}")
+    text = path.read_text(encoding="utf-8", errors="replace")
+    marker = "def _grit_colab_streaming_get_no_cache("
+    if marker in text:
+        base.log("[memory] Streaming RRWP pre-transform patch already present.")
+        return
+
+    patch = r'''
+
+# ---- Colab Peptides-struct memory patch ------------------------------------
+# This overrides the earlier pre_transform_in_memory definition with a
+# memory-stable implementation. It applies the same transform_func to every graph
+# and stores the same collated InMemoryDataset tensors; it only avoids keeping a
+# full Python list of transformed Data objects and avoids PyG's per-graph cache.
+
+def _grit_colab_streaming_get_no_cache(self, idx):
+    import copy as _copy
+    from torch_geometric.data.separate import separate as _separate
+
+    if self.len() == 1:
+        return _copy.copy(self.data)
+    return _separate(
+        cls=self.data.__class__,
+        batch=self.data,
+        idx=idx,
+        slice_dict=self.slices,
+        decrement=False,
+    )
+
+
+def _grit_colab_collate_chunk(data_list):
+    from torch_geometric.data.collate import collate as _pyg_collate
+
+    data, slices, _ = _pyg_collate(
+        data_list[0].__class__,
+        data_list=data_list,
+        increment=False,
+        add_batch=False,
+    )
+    return data, slices
+
+
+def _grit_colab_merge_slice_dicts(slice_parts):
+    merged = {}
+    for key in slice_parts[0].keys():
+        pieces = []
+        offset = None
+        for slices in slice_parts:
+            current = slices[key]
+            if offset is None:
+                pieces.append(current)
+            else:
+                pieces.append(current[1:] + offset)
+            offset = pieces[-1][-1]
+        merged[key] = torch.cat(pieces, dim=0)
+    return merged
+
+
+def _grit_colab_merge_data_chunks(data_parts):
+    out = data_parts[0].__class__()
+    out.stores_as(data_parts[0])
+
+    def _key_bytes(key):
+        total = 0
+        for data in data_parts:
+            value = data[key]
+            if torch.is_tensor(value):
+                total += value.numel() * value.element_size()
+        return total
+
+    # Merge the largest tensors first, then immediately remove them from the
+    # chunk objects. This keeps the peak closer to one full collated dataset
+    # plus the largest single attribute, instead of two full datasets.
+    for key in sorted(list(data_parts[0].keys), key=_key_bytes, reverse=True):
+        values = [data[key] for data in data_parts]
+        first = values[0]
+        if torch.is_tensor(first):
+            cat_dim = data_parts[0].__cat_dim__(key, first, data_parts[0]._store)
+            if cat_dim is None or first.dim() == 0:
+                cat_dim = 0
+            out[key] = torch.cat(values, dim=cat_dim)
+        elif isinstance(first, (int, float)):
+            out[key] = values
+        else:
+            out[key] = sum(values, []) if isinstance(first, list) else values
+        for data in data_parts:
+            try:
+                del data[key]
+            except Exception:
+                pass
+    return out
+
+
+def pre_transform_in_memory(dataset, transform_func, show_progress=False, cfg=dict(), posenc_mode=False):
+    """Memory-stable replacement for GRIT's original helper.
+
+    The transform itself is unchanged. For Peptides-struct RRWP-24 this avoids
+    the peak RAM cost of holding every transformed graph object at once.
+    """
+    if transform_func is None:
+        return dataset
+
+    import gc as _gc
+    import os as _os
+    import types as _types
+
+    chunk_size = int(_os.environ.get("GRIT_PE_STREAM_CHUNK_SIZE", "128"))
+    chunk_size = max(1, chunk_size)
+    data_parts = []
+    slice_parts = []
+    current = []
+
+    iterator = tqdm(
+        range(len(dataset)),
+        disable=not show_progress,
+        mininterval=10,
+        miniters=max(1, len(dataset) // 20),
+    )
+    for i in iterator:
+        transformed = transform_func(dataset.get(i))
+        if transformed is not None:
+            current.append(transformed)
+        if len(current) >= chunk_size:
+            data, slices = _grit_colab_collate_chunk(current)
+            data_parts.append(data)
+            slice_parts.append(slices)
+            current.clear()
+            _gc.collect()
+
+    if current:
+        data, slices = _grit_colab_collate_chunk(current)
+        data_parts.append(data)
+        slice_parts.append(slices)
+        current.clear()
+
+    if not data_parts:
+        dataset._indices = None
+        dataset._data_list = None
+        return dataset
+
+    dataset._indices = None
+    dataset._data_list = None
+    dataset.data = _grit_colab_merge_data_chunks(data_parts)
+    dataset.slices = _grit_colab_merge_slice_dicts(slice_parts)
+    data_parts.clear()
+    slice_parts.clear()
+    _gc.collect()
+
+    # PyG InMemoryDataset caches every separated graph on first access. That is
+    # normally helpful, but with Peptides RRWP it duplicates the huge collated
+    # tensors over the first epoch. Disable only for this dataset instance.
+    dataset.get = _types.MethodType(_grit_colab_streaming_get_no_cache, dataset)
+    dataset._data_list = None
+    return dataset
+'''.rstrip()
+
+    path.write_text(text.rstrip() + "\n" + patch + "\n", encoding="utf-8")
+    base.log(
+        "[memory] Patched GRIT pre_transform_in_memory for streaming RRWP collation "
+        "(same RRWP values/config; lower Colab peak RAM)."
+    )
+
+
 def parse_args(base: Any, argv: Sequence[str] | None, *, onehop: bool) -> argparse.Namespace:
     description = (
         "Train parameter-matched 1-hop global-RRWP GRIT on Peptides-struct in Colab."
@@ -420,6 +596,7 @@ def parse_args(base: Any, argv: Sequence[str] | None, *, onehop: bool) -> argpar
     parser.add_argument("--guaranteed-checkpoints", action="store_true", default=True)
     parser.add_argument("--no-guaranteed-checkpoints", action="store_false", dest="guaranteed_checkpoints")
     parser.add_argument("--recovery-ckpt-period", type=int, default=100)
+    parser.add_argument("--rrwp-stream-chunk-size", type=int, default=128, help="Chunk size for Colab-safe Peptides RRWP preprocessing.")
     parser.add_argument("--dry-run", action="store_true", help="Prepare/validate and print the train command without launching.")
     clean_argv = base._strip_colab_kernel_args(list(sys.argv[1:] if argv is None else argv))
     return parser.parse_args(clean_argv)
@@ -473,6 +650,7 @@ def run_training(variant: str, argv: Sequence[str] | None = None) -> None:
     # Colab cell against an already-patched checkout is deterministic.
     base.run_cmd(["git", "reset", "--hard", commit], cwd=args.repo_dir)
     apply_peptides_dataset_compat_patch(base, args.repo_dir)
+    apply_peptides_streaming_rrwp_patch(base, args.repo_dir)
     if onehop:
         base.apply_parameter_matched_onehop_patch(args.repo_dir, args.drive_dir)
         base.log(
@@ -499,6 +677,7 @@ def run_training(variant: str, argv: Sequence[str] | None = None) -> None:
     label = "grit_peptides_struct_1hop" if onehop else "grit_peptides_struct"
     wrapper_log = args.drive_dir / "wrapper_logs" / f"{label}_seed{args.seed}_{time.strftime('%Y%m%d_%H%M%S')}.log"
     train_env = base.env_with_py312_compat(compat_shim_dir)
+    train_env["GRIT_PE_STREAM_CHUNK_SIZE"] = str(max(1, int(args.rrwp_stream_chunk_size)))
     if args.guaranteed_checkpoints:
         recovery_dir = args.drive_dir / "results" / "_recovery_checkpoints" / f"seed{args.seed}_{base.safe_path_fragment(args.name_tag)}"
         recovery_dir.mkdir(parents=True, exist_ok=True)
