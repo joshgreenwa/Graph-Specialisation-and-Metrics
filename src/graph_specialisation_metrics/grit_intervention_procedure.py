@@ -833,6 +833,7 @@ def carriage_ig(
     baseline_override: Optional[torch.Tensor] = None,
     batched_vjp: bool = True,
     readout_ig: bool = False,
+    loss_label: Optional[float] = None,
     capture_attention: bool = False,
     capture_channels: bool = False,
     capture_layer_inputs: bool = False,
@@ -876,10 +877,18 @@ def carriage_ig(
         # Frozen readout gradient (clean) unless readout_ig: then re-evaluate g at this path point,
         # detached so it acts as a constant cotangent for the h->e VJP below.
         if not readout_ig:
-            return readout_grad
-        pred_alpha = cache.prediction.reshape(-1)[int(target_index)]
-        (g_alpha,) = torch.autograd.grad(pred_alpha, cache.final_node_states, retain_graph=True, create_graph=False)
-        return g_alpha.detach()
+            g = readout_grad
+        else:
+            pred_alpha = cache.prediction.reshape(-1)[int(target_index)]
+            (g_alpha,) = torch.autograd.grad(pred_alpha, cache.final_node_states, retain_graph=True, create_graph=False)
+            g = g_alpha.detach()
+        if loss_label is not None:
+            # Loss-carriage: attribute L=|y_hat-y| instead of y_hat, i.e. project by dL/dy_hat =
+            # sign(y_hat(alpha)-y). Sum C_L then telescopes to L(clean)-L(base): a beneficial
+            # (loss-reducing) carriage is negative. Same IG/baseline/readout/transport axis as C(d).
+            pa = float(cache.prediction.reshape(-1)[int(target_index)].detach().cpu().item())
+            g = g * (1.0 if pa >= float(loss_label) else -1.0)
+        return g
 
     for alpha_idx in range(1, int(steps) + 1):
         alpha = float(alpha_idx) / float(steps)
@@ -9532,15 +9541,40 @@ class _GRITBeneficialBackend:
     def degree(self, graph: Any) -> torch.Tensor:
         return (self._dm(graph) == 1).sum(dim=1).float()
 
-    def signature(self, graph: Any, node: int) -> tuple[int, int]:
+    @staticmethod
+    def _atoms(graph: Any) -> Optional[torch.Tensor]:
         x = getattr(graph, "x", None)
-        atom = 0
-        if x is not None:
-            xt = torch.as_tensor(x)
-            xt = xt.reshape(int(xt.shape[0]), -1)
-            atom = int(xt[node, 0].item())
-        deg = int((self._dm(graph)[node] == 1).sum().item())
-        return (atom, deg)
+        if x is None:
+            return None
+        xt = torch.as_tensor(x)
+        return xt.reshape(int(xt.shape[0]), -1)[:, 0].long()
+
+    def signature(self, graph: Any, node: int) -> tuple[int, tuple[int, ...]]:
+        # ENVIRONMENT only (degree + neighbour-atom multiset), NOT the node's own atom -- matched
+        # donors must share context while their content is free to vary, else the resample is a no-op.
+        neighbours = (self._dm(graph)[node] == 1).nonzero(as_tuple=True)[0].tolist()
+        atoms = self._atoms(graph)
+        neigh_atoms = tuple(sorted(int(atoms[k].item()) for k in neighbours)) if atoms is not None else ()
+        return (len(neighbours), neigh_atoms)
+
+    def donor_token(self, graph: Any, node: int) -> int:
+        atoms = self._atoms(graph)
+        return int(atoms[node].item()) if atoms is not None else 0
+
+    def apply_donor(self, graph: Any, encoded: torch.Tensor, source: int, donor_atom: int) -> torch.Tensor:
+        # Symbolic-only resample: swap the source atom to a matched-environment donor's and re-encode.
+        # Structure is untouched, so node-RRWP is unchanged -- only the source's atom embedding moves.
+        clone = graph.clone()
+        xt = torch.as_tensor(clone.x).clone()
+        if xt.dim() == 1:
+            xt[source] = int(donor_atom)
+        else:
+            xt[source, 0] = int(donor_atom)
+        clone.x = xt
+        re_enc = self.adapter.encoded_node_states(clone).detach().to(encoded)
+        pert = encoded.clone()
+        pert[source] = re_enc[source]
+        return pert
 
 
 def render_step6(rows: Sequence[Mapping[str, Any]], artifact_root: Path, *, dpi: int) -> None:
@@ -9600,6 +9634,42 @@ def render_step6(rows: Sequence[Mapping[str, Any]], artifact_root: Path, *, dpi:
     plt.close(fig)
 
 
+def render_step6_ig(rows: Sequence[Mapping[str, Any]], artifact_root: Path, *, dpi: int) -> None:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    figures = artifact_root / "figures"
+    figures.mkdir(parents=True, exist_ok=True)
+    if not rows:
+        return
+    models = sorted({str(r["model"]) for r in rows})
+    fig, axes = plt.subplots(1, len(models), figsize=(5.6 * len(models), 4.4), squeeze=False)
+    for ax, model in zip(axes[0], models):
+        pts = sorted([r for r in rows if r["model"] == model], key=lambda r: r["distance"])
+        d = [p["distance"] for p in pts]
+        l1 = ax.plot(d, [p["C_functional_share"] for p in pts], "o-", color="#1f77b4",
+                     label="C(d) functional (|C| share)")
+        ax.set_xlabel("transport distance d(i,j) (hops)")
+        ax.set_ylabel("functional carriage share", color="#1f77b4")
+        ax.tick_params(axis="y", labelcolor="#1f77b4")
+        ax.set_ylim(bottom=0)
+        ax2 = ax.twinx()
+        l2 = ax2.plot(d, [p["B_ig_loss_carriage"] for p in pts], "s--", color="#d62728",
+                      label="B_IG(d) loss-carriage (signed)")
+        ax2.axhline(0, color="k", lw=0.7, ls=":")
+        ax2.set_ylabel("loss-carriage  (<0 = beneficial)", color="#d62728")
+        ax2.tick_params(axis="y", labelcolor="#d62728")
+        ax.set_title(str(model))
+        ax.legend(l1 + l2, [ln.get_label() for ln in l1 + l2], loc="upper right", fontsize=8)
+    fig.suptitle("Step 6 (IG-aligned): functional C(d) vs loss-carriage B_IG(d) by transport distance")
+    fig.tight_layout()
+    fig.savefig(figures / "step6_ig_loss_carriage.png", dpi=dpi)
+    fig.savefig(figures / "step6_ig_loss_carriage.pdf")
+    plt.close(fig)
+
+
 def run_step6(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[str, Any]) -> dict[str, Any]:
     """Beneficial carriage B(d): does distance-d content help the task, not just move the output?"""
     from . import beneficial_carriage as _bc
@@ -9638,8 +9708,48 @@ def run_step6(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
                 )
     write_csv(artifact_root / "metrics" / "step6_beneficial_carriage.csv", rows)
     render_step6(rows, artifact_root, dpi=dpi)
+
+    # IG-aligned pair: functional carriage C(d) vs loss-carriage B_IG(d), BOTH on the transport
+    # (carrier<->source) distance axis, same IG/baseline/readout -- directly comparable to Step 3.
+    ig_rows: list[dict[str, Any]] = []
+    if bool(cfg.get("run_loss_carriage", True)):
+        ig_sample = int(cfg.get("ig_sample_graphs", 8))
+        ig_steps = int(config["perturbation"].get("ig_steps", 16))
+        readout_ig = carriage_ig_uses_readout_ig(config)
+        for model in analysis_models:
+            graphs = select_graphs(model.adapter, "test", ig_sample, seed=seed)
+            baseline = mean_encoded_baseline(model.adapter, select_baseline_graphs(model.adapter, "test", config, ig_sample, seed=seed))
+            func_acc: dict[int, float] = {}
+            loss_acc: dict[int, float] = {}
+            ng = 0
+            for graph in graphs:
+                yl = getattr(graph, "y", None)
+                if yl is None:
+                    continue
+                y = float(torch.as_tensor(yl).reshape(-1)[0].item())
+                dist = torch.as_tensor(distance_matrix(graph)).long()
+                cf = carriage_ig(model.adapter, graph, baseline, steps=ig_steps, readout_ig=readout_ig)["carriage"]
+                cl = carriage_ig(model.adapter, graph, baseline, steps=ig_steps, readout_ig=readout_ig, loss_label=y)["carriage"]
+                for d in range(0, max_d + 1):
+                    m = dist == d
+                    if bool(m.any()):
+                        func_acc[d] = func_acc.get(d, 0.0) + float(cf.abs()[m].sum().item())
+                        loss_acc[d] = loss_acc.get(d, 0.0) + float(cl[m].sum().item())
+                ng += 1
+            tot_func = sum(func_acc.values()) or 1.0
+            for d in sorted(set(func_acc) | set(loss_acc)):
+                ig_rows.append({
+                    "model": model.name, "distance": int(d), "n_graphs": ng,
+                    "C_functional_share": func_acc.get(d, 0.0) / tot_func,      # |C| share (like Step 3)
+                    "B_ig_loss_carriage": loss_acc.get(d, 0.0) / max(ng, 1),    # signed: <0 = loss-reducing (beneficial)
+                })
+        if ig_rows:
+            write_csv(artifact_root / "metrics" / "step6_ig_loss_carriage.csv", ig_rows)
+            render_step6_ig(ig_rows, artifact_root, dpi=dpi)
+
     progress("Step 6 complete: metrics and figures written")
-    return {"status": "complete", "models": [m.name for m in analysis_models], "rows": len(rows)}
+    return {"status": "complete", "models": [m.name for m in analysis_models],
+            "rows": len(rows), "ig_rows": len(ig_rows)}
 
 
 def run_intervention_steps(
