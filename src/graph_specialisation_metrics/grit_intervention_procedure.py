@@ -5087,14 +5087,21 @@ def symbolic_structural_carriage_rows(
     dist = distance_matrix(graph).detach().cpu()
     rng = random.Random(f"{seed}:{gid}")
     # Shared loss projection for beneficial carriage (content + structure): sign(y_hat_clean - y).
+    # ``yv`` is the label itself, reused by the IG loss-carriage (content_ig + structural IG) so
+    # their beneficial carriage is the proper integrated loss-carriage, not the first-order shortcut.
     benefit_sign: Optional[float] = None
+    yv: Optional[float] = None
     _yl = getattr(graph, "y", None)
     _yhat = getattr(clean_cache, "prediction", None)
-    if _yl is not None and isinstance(_yhat, torch.Tensor):
+    if _yl is not None:
         try:
-            _yv = float(torch.as_tensor(_yl).reshape(-1)[0].item())
+            yv = float(torch.as_tensor(_yl).reshape(-1)[0].item())
+        except Exception:  # noqa: BLE001
+            yv = None
+    if yv is not None and isinstance(_yhat, torch.Tensor):
+        try:
             _yhatv = float(_yhat.reshape(-1)[0].item())
-            benefit_sign = 1.0 if _yhatv >= _yv else -1.0
+            benefit_sign = 1.0 if _yhatv >= yv else -1.0
         except Exception:  # noqa: BLE001
             benefit_sign = None
     sources = list(range(n))
@@ -5276,19 +5283,14 @@ def symbolic_structural_carriage_rows(
     # Functional = structural_carriage_ig; beneficial = same with loss_label (the proper integrated
     # loss-carriage, exactly like content B_IG -- not the first-order benefit_sign shortcut).
     if config is not None:
-        cfg4 = (config.get("steps", {}) or {}).get("4", {}) or {}
-        if bool(cfg4.get("run_structural_carriage_ig", True)):
+        cfg_sub = (config.get("steps", {}) or {}).get("7") or (config.get("steps", {}) or {}).get("4") or {}
+        if bool(cfg_sub.get("run_structural_carriage_ig", True)):
             ig_steps = int(config["perturbation"].get("ig_steps", 32))
             struct_readout_ig = carriage_ig_uses_readout_ig(config)
-            yv = None
-            if _yl is not None:
-                try:
-                    yv = float(torch.as_tensor(_yl).reshape(-1)[0].item())
-                except Exception:  # noqa: BLE001
-                    yv = None
             for tkind, fac in (("node", "node_rrwp_ig"), ("pair", "pair_rrwp_ig")):
                 res = structural_carriage_ig(adapter, graph, target_kind=tkind, steps=ig_steps, readout_ig=struct_readout_ig)
                 if res is None:
+                    progress(f"  {model.name} graph {gid}: {fac} unavailable (no raw RRWP or _run_with_hooks)")
                     continue
                 if completeness_out is not None and res.get("completeness_target") is not None:
                     rec = float(res["reconstruction_sum"])
@@ -5307,27 +5309,37 @@ def symbolic_structural_carriage_rows(
                         for j in sources:
                             _emit_carriage_rows(rows, model, gid, j, c_b[:, int(j)], dist, min_distance=min_distance, factor=fac, mode="beneficial")
 
-    # --- content carriage via the existing IG method (validation reference for the swap panel) ---
-    if ig_baseline is not None and artifact_root is not None and config is not None:
+    # --- content carriage via the IG method (HEADLINE; same estimator/convention as structural IG) ---
+    # Functional = carriage_ig; beneficial = carriage_ig(loss_label=yv) -> the proper integrated
+    # loss-carriage (sum telescopes to L(clean)-L(base); <0 = beneficial), EXACTLY like the structural
+    # IG and Step-6 content B_IG -- NOT the first-order benefit_sign shortcut (that is reserved for the
+    # finite-swap factors, which cannot be path-integrated). Failures are logged, never swallowed, so a
+    # model dropping out of content_ig is visible instead of silently producing a single-model panel.
+    if ig_baseline is not None and config is not None:
+        ig_steps = int(config["perturbation"].get("ig_steps", 32))
+        r_ig = carriage_ig_uses_readout_ig(config)
+        b_vjp = carriage_ig_uses_batched_vjp(config)
         try:
-            ig_steps = int(config["perturbation"].get("ig_steps", 32))
-            result = carriage_ig_cached(
-                model,
-                graph,
-                ig_baseline,
-                artifact_root,
-                config,
-                split="test",
-                graph_id=gid,
-                steps=ig_steps,
-                batched_vjp=carriage_ig_uses_batched_vjp(config),
-            )
-            c_ig = result.get("carriage")
+            res_f = carriage_ig(adapter, graph, ig_baseline, steps=ig_steps, readout_ig=r_ig, batched_vjp=b_vjp)
+            c_ig = res_f.get("carriage")
             if isinstance(c_ig, torch.Tensor) and c_ig.dim() == 2 and int(c_ig.size(0)) == n:
                 for j in sources:
-                    _emit_carriage_rows(rows, model, gid, j, c_ig[:, int(j)], dist, min_distance=min_distance, benefit_sign=benefit_sign, factor="content_ig")
-        except Exception:
-            pass
+                    _emit_carriage_rows(rows, model, gid, j, c_ig[:, int(j)], dist, min_distance=min_distance, factor="content_ig", mode="functional")
+            else:
+                progress(f"  {model.name} graph {gid}: content_ig functional produced no valid carriage")
+        except Exception as exc:  # noqa: BLE001
+            progress(f"  {model.name} graph {gid}: content_ig functional FAILED ({type(exc).__name__}: {exc})")
+        if yv is not None:
+            try:
+                res_b = carriage_ig(adapter, graph, ig_baseline, steps=ig_steps, readout_ig=r_ig, batched_vjp=b_vjp, loss_label=yv)
+                c_igb = res_b.get("carriage")
+                if isinstance(c_igb, torch.Tensor) and c_igb.dim() == 2 and int(c_igb.size(0)) == n:
+                    for j in sources:
+                        _emit_carriage_rows(rows, model, gid, j, c_igb[:, int(j)], dist, min_distance=min_distance, factor="content_ig", mode="beneficial")
+            except Exception as exc:  # noqa: BLE001
+                progress(f"  {model.name} graph {gid}: content_ig beneficial FAILED ({type(exc).__name__}: {exc})")
+    elif ig_baseline is None:
+        progress(f"  {model.name} graph {gid}: content_ig skipped (no IG baseline available for this model)")
     return rows
 
 
@@ -5389,109 +5401,181 @@ def run_symbolic_structural_probe(models: Sequence[ModelRun], artifact_root: Pat
         tgts = [abs(safe_float(r["completeness_target"])) for r in completeness_rows]
         if errs:
             rel = float(np.mean(errs)) / (float(np.mean(tgts)) + 1e-9)
-            progress(f"Step 4 structural IG completeness: mean|sumC - (yhat_clean-yhat_base)|={np.mean(errs):.3e} "
+            progress(f"Step 7 structural IG completeness: mean|sumC - (yhat_clean-yhat_base)|={np.mean(errs):.3e} "
                      f"(rel~{rel:.3f}); should be ~0 -- this is the IG-over-RRWP self-test on real GRIT")
+    # --- coverage diagnostics: which (model, factor, mode) combos actually produced rows? ---
+    # This is the antidote to silent single-model panels: the CSV + log say exactly which models
+    # are present/missing per factor, so a dropout is a data-availability fact, not a mystery.
+    coverage: dict[tuple[str, str, str], dict[str, float]] = {}
+    for r in rows:
+        key = (str(r.get("model")), str(r.get("factor")), str(r.get("mode")))
+        d = safe_float(r.get("distance"))
+        cur = coverage.setdefault(key, {"count": 0.0, "dmin": math.inf, "dmax": -math.inf})
+        cur["count"] += 1.0
+        if math.isfinite(d):
+            cur["dmin"] = min(cur["dmin"], d)
+            cur["dmax"] = max(cur["dmax"], d)
+    cov_rows = [
+        {
+            "model": m, "factor": f, "mode": md, "rows": int(v["count"]),
+            "distance_min": (None if not math.isfinite(v["dmin"]) else int(v["dmin"])),
+            "distance_max": (None if not math.isfinite(v["dmax"]) else int(v["dmax"])),
+        }
+        for (m, f, md), v in sorted(coverage.items())
+    ]
+    write_csv(artifact_root / "metrics" / "step7_carriage_coverage.csv", cov_rows)
+    all_models = ordered_model_names(sorted({str(r.get("model")) for r in rows}))
+    for fac in ("content_ig", "node_rrwp_ig", "pair_rrwp_ig", "content", "node_rrwp", "pair_rrwp", "both_rrwp"):
+        have = [m for m in all_models if (m, fac, "functional") in coverage]
+        miss = [m for m in all_models if m not in have]
+        if have or miss:
+            progress(f"Step 7 coverage [{fac} functional]: have {have or '-'}; MISSING {miss or '-'}")
     render_symbolic_structural_by_distance(rows, artifact_root, dpi=dpi)
-    render_symbolic_structural_beneficial(rows, artifact_root, dpi=dpi)
+    render_step7_funcbenef_grid(rows, artifact_root, dpi=dpi, method="ig")
+    render_step7_funcbenef_grid(rows, artifact_root, dpi=dpi, method="swap")
     render_carriage_functional_vs_beneficial(rows, artifact_root, dpi=dpi)
     n_struct = len([r for r in rows if str(r.get("factor")) in {"node_rrwp", "pair_rrwp", "both_rrwp", "structure"}])
-    progress(f"Step 4 symbolic/structural: wrote {len(rows)} rows ({n_struct} structural)")
+    progress(f"Step 7 symbolic/structural: wrote {len(rows)} rows ({n_struct} structural)")
     return {"status": "complete", "rows": len(rows), "structural_rows": n_struct}
 
 
-def render_carriage_functional_vs_beneficial(rows: Sequence[Mapping[str, Any]], artifact_root: Path, *, dpi: int) -> None:
-    """Headline dissociation: functional (dashed, |carriage|, left axis) vs beneficial (solid, signed,
-    right axis; <0 = beneficial) for content and structural carriage, by distance, models overlaid.
+def _step7_series(
+    rows: Sequence[Mapping[str, Any]], factor: str, model: str, mode: str, value_key: str
+) -> tuple[list[int], list[float]]:
+    """Mean value_key by integer carrier<->source distance for one (factor, model, mode). Returns
+    (distances, means); empty lists if that combo produced no finite rows (caller flags it missing)."""
+    by: dict[int, list[float]] = {}
+    for r in rows:
+        if str(r.get("factor")) != factor or str(r.get("model")) != model or str(r.get("mode")) != mode:
+            continue
+        d = safe_float(r.get("distance"))
+        v = safe_float(r.get(value_key))
+        if not (math.isfinite(d) and math.isfinite(v)):
+            continue
+        by.setdefault(int(round(d)), []).append(v)
+    ds = sorted(by)
+    return ds, [float(np.nanmean(by[d])) for d in ds]
 
-    Shows in one figure the thesis claim -- transport can be functionally far-reaching yet only
-    beneficial short-range -- for BOTH symbolic (content) and structural (node/pair RRWP) carriage,
-    using the IG-aligned factors so functional and beneficial are the same estimator.
+
+# Row layout shared by the Step-7 core curve figures: (mode, value column, y-label, panel prefix).
+_STEP7_FUNCBENEF_ROWS = [
+    ("functional", "effect_abs", "mean |carriage|", "Functional"),
+    ("beneficial", "effect_signed", "mean carriage  (<0 = beneficial)", "Beneficial"),
+]
+
+
+def render_carriage_functional_vs_beneficial(rows: Sequence[Mapping[str, Any]], artifact_root: Path, *, dpi: int) -> None:
+    """HEADLINE method comparison (the core Step-7 figure).
+
+    Functional (top row) vs beneficial (bottom row) carriage by distance, for content and node/pair
+    structural carriage (columns), overlaying the IG estimator (solid, circles) and the finite-swap
+    estimator (dashed, squares) for every model (colour). One figure that shows at a glance: (i) the
+    two estimators agree, and (ii) transport can be functionally far-reaching yet beneficial only
+    short-range -- for BOTH content and structure. Models with no data in a panel are annotated in
+    red rather than silently dropped.
     """
-    factor_titles = [("content_ig", "Content"), ("node_rrwp_ig", "Node RRWP"), ("pair_rrwp_ig", "Pair RRWP")]
-    factor_titles = [(f, t) for f, t in factor_titles if any(str(r.get("factor")) == f for r in rows)]
-    if not factor_titles:
+    from matplotlib.lines import Line2D
+
+    triples = [
+        ("content_ig", "content", "Content"),
+        ("node_rrwp_ig", "node_rrwp", "Node RRWP"),
+        ("pair_rrwp_ig", "pair_rrwp", "Pair RRWP"),
+    ]
+    triples = [(fi, fs, t) for fi, fs, t in triples if any(str(r.get("factor")) in (fi, fs) for r in rows)]
+    if not triples:
         return
-    models = sorted({str(r["model"]) for r in rows})
-    colors = plt.cm.tab10.colors
-    fig, axes = plt.subplots(1, len(factor_titles), figsize=(5.2 * len(factor_titles), 4.4), squeeze=False)
-    for ax, (factor, title) in zip(axes[0], factor_titles):
-        ax2 = ax.twinx()
-        for k, model in enumerate(models):
-            col = colors[k % len(colors)]
-            f_by: dict[int, list[float]] = {}
-            b_by: dict[int, list[float]] = {}
-            for r in rows:
-                if str(r.get("factor")) != factor or not math.isfinite(safe_float(r.get("distance"))):
-                    continue
-                d = int(safe_float(r["distance"]))
-                if str(r.get("mode")) == "functional":
-                    f_by.setdefault(d, []).append(safe_float(r.get("effect_abs")))
-                elif str(r.get("mode")) == "beneficial":
-                    b_by.setdefault(d, []).append(safe_float(r.get("effect_signed")))
-            fd, bd = sorted(f_by), sorted(b_by)
-            if fd:
-                ax.plot(fd, [float(np.nanmean(f_by[d])) for d in fd], "--", color=col, alpha=0.6, label=f"{model} func")
-            if bd:
-                ax2.plot(bd, [float(np.nanmean(b_by[d])) for d in bd], "-o", color=col, ms=4, label=f"{model} benef")
-        ax2.axhline(0, color="k", lw=0.6, ls=":")
-        ax.set_title(title)
-        ax.set_xlabel("carrier<->source distance (hops)")
-        ax.set_ylabel("functional |carriage|  (dashed)")
-        ax2.set_ylabel("beneficial  (solid; <0 = beneficial)")
-        ax.grid(alpha=0.3)
-    axes[0][0].legend(fontsize=7, loc="upper right")
-    fig.suptitle("Functional (dashed) vs beneficial (solid) carriage: content + structural, by distance")
-    fig.tight_layout()
+    involved = {f for fi, fs, _ in triples for f in (fi, fs)}
+    models = ordered_model_names(sorted({str(r["model"]) for r in rows if str(r.get("factor")) in involved}))
+    if not models:
+        return
+    palette = plt.cm.tab10.colors
+    color = {m: palette[i % len(palette)] for i, m in enumerate(models)}
+    fig, axes = plt.subplots(2, len(triples), figsize=(4.9 * len(triples), 8.0), squeeze=False)
+    for c, (fi, fs, title) in enumerate(triples):
+        for ridx, (mode, vk, ylab, sub) in enumerate(_STEP7_FUNCBENEF_ROWS):
+            ax = axes[ridx][c]
+            missing: list[str] = []
+            for m in models:
+                ds_i, ys_i = _step7_series(rows, fi, m, mode, vk)
+                ds_s, ys_s = _step7_series(rows, fs, m, mode, vk)
+                if ds_i:
+                    ax.plot(ds_i, ys_i, "-o", ms=3.5, lw=1.8, color=color[m])
+                if ds_s:
+                    ax.plot(ds_s, ys_s, "--s", ms=3.5, lw=1.4, alpha=0.75, color=color[m])
+                if not ds_i and not ds_s:
+                    missing.append(model_label(m))
+            if mode == "beneficial":
+                ax.axhline(0, color="k", lw=0.7, ls=":")
+            ax.set_title(f"{sub}: {title}")
+            ax.set_xlabel("carrier<->source distance (hops)")
+            ax.set_ylabel(ylab)
+            ax.grid(alpha=0.3)
+            if missing:
+                ax.text(0.98, 0.03, "no data: " + ", ".join(missing), transform=ax.transAxes,
+                        ha="right", va="bottom", fontsize=6.5, color="crimson")
+    handles = [Line2D([0], [0], color=color[m], lw=2, label=model_label(m)) for m in models]
+    handles += [
+        Line2D([0], [0], color="0.25", ls="-", marker="o", ms=4, label="IG"),
+        Line2D([0], [0], color="0.25", ls="--", marker="s", ms=4, label="finite-swap"),
+    ]
+    fig.legend(handles=handles, loc="upper center", ncol=min(len(handles), 5), fontsize=8,
+               frameon=False, bbox_to_anchor=(0.5, 1.0))
+    fig.suptitle("Functional vs beneficial carriage: IG vs finite-swap, content + node/pair structural", y=0.965)
+    fig.tight_layout(rect=(0, 0, 1, 0.93))
     figures = ensure_dir(artifact_root / "figures")
-    fig.savefig(figures / "step7_functional_vs_beneficial_carriage.png", dpi=dpi)
-    fig.savefig(figures / "step7_functional_vs_beneficial_carriage.pdf")
+    fig.savefig(figures / "step7_functional_vs_beneficial_carriage.png", dpi=dpi, bbox_inches="tight")
+    fig.savefig(figures / "step7_functional_vs_beneficial_carriage.pdf", bbox_inches="tight")
     plt.close(fig)
 
 
-def render_symbolic_structural_beneficial(rows: Sequence[Mapping[str, Any]], artifact_root: Path, *, dpi: int) -> None:
-    """Beneficial structural carriage B_struct(d) by distance, per factor, models overlaid.
+def render_step7_funcbenef_grid(rows: Sequence[Mapping[str, Any]], artifact_root: Path, *, dpi: int, method: str) -> None:
+    """Core Step-7 per-estimator figure: functional (top) vs beneficial (bottom) carriage by distance,
+    for content and node/pair structural carriage (columns), models overlaid.
 
-    Signed (mean effect_signed of mode="beneficial"): < 0 = loss-reducing = beneficial, matching the
-    content loss-carriage convention. Overlaying grit_1hop (global RRWP) vs grit_1hop_localrrwp is the
-    causal-level local-vs-global discriminator.
+    ``method="ig"`` uses the IG factors (content_ig / node_rrwp_ig / pair_rrwp_ig); ``method="swap"``
+    uses the finite-swap factors (content / node_rrwp / pair_rrwp). Missing models are annotated in red.
+    Companion to the combined IG-vs-swap headline; kept separate so each estimator reads cleanly.
     """
-    ben = [
-        r for r in rows
-        if str(r.get("mode")) == "beneficial"
-        and math.isfinite(safe_float(r.get("distance"))) and math.isfinite(safe_float(r.get("effect_signed")))
-    ]
-    if not ben:
+    fac_by_method = {
+        "ig": [("content_ig", "Content"), ("node_rrwp_ig", "Node RRWP"), ("pair_rrwp_ig", "Pair RRWP")],
+        "swap": [("content", "Content"), ("node_rrwp", "Node RRWP"), ("pair_rrwp", "Pair RRWP")],
+    }
+    cols = [(f, t) for f, t in fac_by_method.get(method, []) if any(str(r.get("factor")) == f for r in rows)]
+    if not cols:
         return
-    factors = [
-        ("node_rrwp_ig", "Node RRWP (IG)"), ("pair_rrwp_ig", "Pair RRWP (IG)"),   # headline (IG-aligned)
-        ("content", "Content (swap)"), ("node_rrwp", "Node RRWP (swap)"),
-        ("pair_rrwp", "Pair RRWP (swap)"), ("both_rrwp", "Node+Pair (swap)"),
-    ]
-    factors = [(f, t) for f, t in factors if any(str(r.get("factor")) == f for r in ben)]
-    if not factors:
+    col_factors = {f for f, _ in cols}
+    models = ordered_model_names(sorted({str(r["model"]) for r in rows if str(r.get("factor")) in col_factors}))
+    if not models:
         return
-    models = sorted({str(r["model"]) for r in ben})
-    fig, axes = plt.subplots(1, len(factors), figsize=(5.0 * len(factors), 4.2), squeeze=False)
-    for ax, (factor, title) in zip(axes[0], factors):
-        for model in models:
-            byd: dict[int, list[float]] = {}
-            for r in ben:
-                if str(r.get("factor")) == factor and str(r["model"]) == model:
-                    byd.setdefault(int(safe_float(r["distance"])), []).append(safe_float(r["effect_signed"]))
-            ds = sorted(byd)
-            if ds:
-                ax.plot(ds, [float(np.mean(byd[d])) for d in ds], marker="o", label=model)
-        ax.axhline(0, color="k", lw=0.7, ls=":")
-        ax.set_title(f"Beneficial {title}")
-        ax.set_xlabel("carrier<->source distance (hops)")
-        ax.set_ylabel("B_struct (signed; <0 = beneficial)")
-        ax.grid(alpha=0.3)
-        ax.legend(fontsize=8)
-    fig.suptitle("Beneficial structural carriage by distance (local vs global RRWP discriminator)")
+    palette = plt.cm.tab10.colors
+    color = {m: palette[i % len(palette)] for i, m in enumerate(models)}
+    method_name = "IG" if method == "ig" else "finite-swap"
+    fig, axes = plt.subplots(2, len(cols), figsize=(4.9 * len(cols), 8.0), squeeze=False)
+    for c, (factor, title) in enumerate(cols):
+        for ridx, (mode, vk, ylab, sub) in enumerate(_STEP7_FUNCBENEF_ROWS):
+            ax = axes[ridx][c]
+            missing: list[str] = []
+            for m in models:
+                ds, ys = _step7_series(rows, factor, m, mode, vk)
+                if ds:
+                    ax.plot(ds, ys, marker="o", ms=4, lw=1.8, color=color[m], label=model_label(m))
+                else:
+                    missing.append(model_label(m))
+            if mode == "beneficial":
+                ax.axhline(0, color="k", lw=0.7, ls=":")
+            ax.set_title(f"{sub}: {title}")
+            ax.set_xlabel("carrier<->source distance (hops)")
+            ax.set_ylabel(ylab)
+            ax.grid(alpha=0.3)
+            if missing:
+                ax.text(0.98, 0.03, "no data: " + ", ".join(missing), transform=ax.transAxes,
+                        ha="right", va="bottom", fontsize=6.5, color="crimson")
+    axes[0][0].legend(fontsize=8, loc="best")
+    fig.suptitle(f"Functional vs beneficial carriage by distance -- {method_name} method (content + node/pair structural)")
     fig.tight_layout()
     figures = ensure_dir(artifact_root / "figures")
-    fig.savefig(figures / "step7_beneficial_structural_carriage.png", dpi=dpi)
-    fig.savefig(figures / "step7_beneficial_structural_carriage.pdf")
+    fig.savefig(figures / f"step7_functional_vs_beneficial_{method}.png", dpi=dpi)
+    fig.savefig(figures / f"step7_functional_vs_beneficial_{method}.pdf")
     plt.close(fig)
 
 
