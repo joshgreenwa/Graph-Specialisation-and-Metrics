@@ -163,4 +163,10 @@ def main(argv: Sequence[str] | None = None) -> None:
 
 
 if __name__ == "__main__":
-    main()
+    main([
+        "--seed", "41",
+        "--name-tag", "ColabDrive.1hop.GRITwRRWP.peptides_struct.s41",
+        "--console-epoch-period", "1",
+        "--rrwp-stream-chunk-size", "32",
+        "--force-fresh-repo",
+    ])
