@@ -5332,8 +5332,8 @@ def symbolic_structural_carriage_rows(
 
 
 def run_symbolic_structural_probe(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[str, Any]) -> dict[str, Any]:
-    """Opt-in Step-4 probe: discrete content vs structural carriage by distance (sanity check)."""
-    cfg = config["steps"]["4"]
+    """Step-7 substrate probe: symbolic (content) vs structural (RRWP) carriage by distance."""
+    cfg = config["steps"].get("7") or config["steps"].get("4") or {}
     sample_graphs = int(cfg.get("symbolic_structural_sample_graphs", min(8, int(cfg.get("sample_graphs", 8)))))
     raw_max_sources = cfg.get("symbolic_structural_max_sources", None)
     max_sources = None if raw_max_sources in (None, "all", "", "None") else int(raw_max_sources)
@@ -6722,9 +6722,9 @@ def render_step4_global_rrwp_channel_ablation(rows: Sequence[Mapping[str, Any]],
 
 
 def run_rrwp_distance_ablation_probe(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[str, Any]) -> dict[str, Any]:
-    """Step-4 raw RRWP ablation probe for global-vs-local structural reasoning."""
+    """Step-7 raw RRWP ablation probe for global-vs-local structural reasoning."""
 
-    cfg = config["steps"]["4"]
+    cfg = config["steps"].get("7") or config["steps"].get("4") or {}
     sample_graphs = int(cfg.get("rrwp_ablation_sample_graphs", min(24, int(cfg.get("sample_graphs", 24)))))
     global_channel_sample_graphs = int(cfg.get("global_rrwp_channel_ablation_sample_graphs", sample_graphs))
     run_global_channel_ablation = bool(cfg.get("run_global_rrwp_channel_ablation", True))
@@ -10097,6 +10097,34 @@ def run_step6(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
             "rows": len(rows), "ig_rows": len(ig_rows)}
 
 
+def run_step7(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[str, Any]) -> dict[str, Any]:
+    """Step 7: symbolic (content) vs structural (RRWP) carriage -- the SUBSTRATE axis.
+
+    Moved out of Step 4 (which is composability / mediator patching): content vs node/pair RRWP,
+    local vs global RRWP, functional + beneficial, IG (headline) + on-manifold swap (cross-check).
+    Runs the symbolic/structural probe and the raw-RRWP ablations (distance-binned + global-channel).
+    """
+    cfg = config["steps"].get("7", {})
+    status: dict[str, Any] = {}
+    if bool(cfg.get("run_symbolic_structural_carriage", True)):
+        try:
+            status["symbolic_structural"] = run_symbolic_structural_probe(models, artifact_root, config)
+        except Exception as exc:  # noqa: BLE001
+            progress(f"Step 7 symbolic/structural probe failed: {exc}")
+            status["symbolic_structural"] = {"status": "failed", "error": str(exc)}
+    if bool(cfg.get("run_rrwp_distance_ablation", True)):
+        try:
+            status["rrwp_ablation"] = run_rrwp_distance_ablation_probe(models, artifact_root, config)
+        except Exception as exc:  # noqa: BLE001
+            progress(f"Step 7 RRWP ablation probe failed: {exc}")
+            status["rrwp_ablation"] = {"status": "failed", "error": str(exc)}
+    progress("Step 7 complete: symbolic vs structural carriage (substrate)")
+    return {
+        "status": "complete",
+        **{k: (v.get("status") if isinstance(v, dict) else v) for k, v in status.items()},
+    }
+
+
 def run_intervention_steps(
     config: Mapping[str, Any],
     discovery: Sequence[Mapping[str, Any]],
@@ -10131,6 +10159,7 @@ def run_intervention_steps(
         "4": lambda: run_step4(models, artifact_root, config),
         "5": lambda: run_step5(models, artifact_root, config),
         "6": lambda: run_step6(models, artifact_root, config),
+        "7": lambda: run_step7(models, artifact_root, config),
     }
     for step in steps:
         if step == "1":

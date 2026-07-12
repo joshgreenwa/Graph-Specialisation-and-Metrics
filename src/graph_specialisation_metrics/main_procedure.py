@@ -155,31 +155,6 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "clamp_mode_comparison_modes": ["detach", "overwrite"],
             "clamp_mode_comparison_max_pairs_per_model": 16,
             "composed_reference_max_direct_fraction": 0.20,
-            "run_symbolic_structural_carriage": True,
-            "symbolic_structural_sample_graphs": 6,
-            "symbolic_structural_max_sources": "all",
-            "symbolic_structural_min_distance": 1,
-            "symbolic_structural_rrwp_channel_start": 2,
-            "symbolic_structural_rrwp_replacement": "donor",
-            "run_rrwp_distance_ablation": True,
-            "rrwp_ablation_sample_graphs": 24,
-            "rrwp_ablation_channel_start": 2,
-            "rrwp_ablation_replacement": "zero",
-            "rrwp_ablation_types": ["node", "pair", "both"],
-            "rrwp_distance_ablation_types": ["pair"],
-            "global_rrwp_channel_ablation_types": ["node", "pair", "both"],
-            "run_global_rrwp_channel_ablation": True,
-            "global_rrwp_channel_ablation_sample_graphs": 48,
-            "rrwp_ablation_distance_bins": [
-                {"label": "d=2-3", "min": 2, "max": 3},
-                {"label": "d=4-6", "min": 4, "max": 6},
-                {"label": "d=7-10", "min": 7, "max": 10},
-                {"label": "d=11-14", "min": 11, "max": 14},
-                {"label": "d>14", "min": 15, "max": None},
-            ],
-            "rrwp_contrast_global_model": "grit_1hop",
-            "rrwp_contrast_local_model": "grit_1hop_localrrwp",
-            "rrwp_graph_metric_cut_pairs": 32,
         },
         "5": {
             "name": "non_composable_gap_attribution",
@@ -217,6 +192,35 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "whole_band": False,
             "splits": ["test", "train"],
         },
+        "7": {
+            "name": "symbolic_vs_structural_carriage",
+            "run_symbolic_structural_carriage": True,
+            "run_structural_carriage_ig": True,
+            "symbolic_structural_sample_graphs": 6,
+            "symbolic_structural_max_sources": "all",
+            "symbolic_structural_min_distance": 1,
+            "symbolic_structural_rrwp_channel_start": 2,
+            "symbolic_structural_rrwp_replacement": "donor",
+            "run_rrwp_distance_ablation": True,
+            "rrwp_ablation_sample_graphs": 24,
+            "rrwp_ablation_channel_start": 2,
+            "rrwp_ablation_replacement": "zero",
+            "rrwp_ablation_types": ["node", "pair", "both"],
+            "rrwp_distance_ablation_types": ["pair"],
+            "global_rrwp_channel_ablation_types": ["node", "pair", "both"],
+            "run_global_rrwp_channel_ablation": True,
+            "global_rrwp_channel_ablation_sample_graphs": 48,
+            "rrwp_ablation_distance_bins": [
+                {"label": "d=2-3", "min": 2, "max": 3},
+                {"label": "d=4-6", "min": 4, "max": 6},
+                {"label": "d=7-10", "min": 7, "max": 10},
+                {"label": "d=11-14", "min": 11, "max": 14},
+                {"label": "d>14", "min": 15, "max": None},
+            ],
+            "rrwp_contrast_global_model": "grit_1hop",
+            "rrwp_contrast_local_model": "grit_1hop_localrrwp",
+            "rrwp_graph_metric_cut_pairs": 32,
+        },
     },
     "figures": {"dpi": 180},
 }
@@ -245,6 +249,7 @@ FAST_DEV_OVERRIDES: dict[str, Any] = {
         "4": {"sample_graphs": 1, "max_far_pairs_per_graph": 1, "depth_pairs_per_graph": 0, "run_structural_carriage_ig": False},
         "5": {"sample_graphs": 2, "max_far_pairs_per_graph": 2, "interaction_pairs": 16},
         "6": {"sample_graphs": 2, "donors": 2, "max_distance": 4, "splits": ["test"], "run_loss_carriage": False},
+        "7": {"run_symbolic_structural_carriage": False, "run_rrwp_distance_ablation": False, "run_global_rrwp_channel_ablation": False},
     },
 }
 
@@ -398,11 +403,11 @@ def deep_update(base: dict[str, Any], updates: Mapping[str, Any]) -> dict[str, A
 
 def parse_steps(raw: str | None) -> list[str]:
     if raw is None or raw.strip() in {"", "all"}:
-        return [str(i) for i in range(7)]
+        return [str(i) for i in range(8)]
     out = [item.strip() for item in raw.split(",") if item.strip()]
-    bad = [item for item in out if item not in {str(i) for i in range(7)}]
+    bad = [item for item in out if item not in {str(i) for i in range(8)}]
     if bad:
-        raise ValueError(f"unknown step ids {bad}; expected 0,1,2,3,4,5,6")
+        raise ValueError(f"unknown step ids {bad}; expected 0,1,2,3,4,5,6,7")
     return out
 
 
@@ -1080,7 +1085,7 @@ def run_main(config: Mapping[str, Any], *, steps: Sequence[str], dry_run: bool =
             status_by_step[step] = status
             write_json(artifact_root / "metrics" / "main_status.json", status_by_step)
     else:
-        intervention_steps = [step for step in steps if step in {"0", "2", "3", "4", "5", "6"}]
+        intervention_steps = [step for step in steps if step in {"0", "2", "3", "4", "5", "6", "7"}]
         pending_intervention_steps = [
             step for step in intervention_steps if force or not step_is_complete(status_by_step.get(step))
         ]
