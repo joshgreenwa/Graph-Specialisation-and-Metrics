@@ -66,6 +66,15 @@ def _auth_url(repo_url: str, token: str | None) -> str:
     return f"https://x-access-token:{quote(token, safe='')}@github.com/{suffix}"
 
 
+def _copy_sidecar_common(repo_dir: Path) -> None:
+    sidecar = Path(__file__).with_name("grit_peptides_struct_common.py")
+    target = repo_dir / "experiments" / "peptides_struct" / "training" / "grit_peptides_struct_common.py"
+    if sidecar.exists() and sidecar.resolve() != target.resolve():
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(sidecar, target)
+        print(f"[bootstrap] using sidecar Peptides helper: {sidecar} -> {target}", flush=True)
+
+
 def _bootstrap_project_repo(repo_url: str, branch: str, repo_dir: Path, secret_name: str, *, skip_git: bool) -> None:
     local_root = Path(__file__).resolve().parents[3] if "__file__" in globals() else None
     if local_root and (local_root / "src" / "graph_specialisation_metrics").exists():
@@ -74,6 +83,7 @@ def _bootstrap_project_repo(repo_url: str, branch: str, repo_dir: Path, secret_n
                 sys.path.insert(0, path)
         return
     if skip_git:
+        _copy_sidecar_common(repo_dir)
         for path in [str(repo_dir), str(repo_dir / "src")]:
             if path not in sys.path:
                 sys.path.insert(0, path)
@@ -95,6 +105,7 @@ def _bootstrap_project_repo(repo_url: str, branch: str, repo_dir: Path, secret_n
             shutil.rmtree(repo_dir)
         _run(["git", "clone", "--branch", branch, "--single-branch", authed, str(repo_dir)], safe=f"git clone --branch {branch} <token-authenticated-url> {repo_dir}")
         _run(["git", "-C", str(repo_dir), "remote", "set-url", "origin", repo_url])
+    _copy_sidecar_common(repo_dir)
     for path in [str(repo_dir), str(repo_dir / "src")]:
         if path not in sys.path:
             sys.path.insert(0, path)

@@ -293,6 +293,74 @@ def make_build_training_command(base: Any, *, cfg_path: str):
     return build
 
 
+def install_peptides_dependencies(base: Any) -> None:
+    """Install Peptides-specific runtime dependencies missing from ZINC runs."""
+    base.log("\n[deps] Installing Peptides-struct extras: RDKit for OGB SMILES featurization.")
+    proc = base.run_cmd([sys.executable, "-m", "pip", "install", "rdkit"], check=False)
+    if proc.returncode != 0:
+        base.log("[deps-warning] `rdkit` wheel install failed; trying legacy `rdkit-pypi` package.")
+        proc = base.run_cmd([sys.executable, "-m", "pip", "install", "rdkit-pypi"], check=False)
+    if proc.returncode != 0:
+        raise RuntimeError(
+            "Peptides-struct requires RDKit for OGB SMILES featurization, but neither "
+            "`pip install rdkit` nor `pip install rdkit-pypi` succeeded in this runtime."
+        )
+
+    base.run_cmd(
+        [
+            sys.executable,
+            "-c",
+            (
+                "from rdkit import Chem; "
+                "from ogb.utils.features import smiles2graph; "
+                "assert Chem.MolFromSmiles('CCO') is not None; "
+                "assert smiles2graph('CCO')['num_nodes'] == 3; "
+                "print('Peptides deps OK: RDKit + ogb.utils.features.smiles2graph')"
+            ),
+        ]
+    )
+
+
+def apply_peptides_dataset_compat_patch(base: Any, repo_dir: Path) -> None:
+    """Patch official Peptides dataset files for modern OGB and Colab automation.
+
+    This is a data-loader compatibility patch only. It does not alter the model,
+    PE/RRWP construction, optimizer, loss, metric, or training schedule.
+    """
+    patched_any = False
+    for rel in [
+        Path("grit/loader/dataset/peptides_functional.py"),
+        Path("grit/loader/dataset/peptides_structural.py"),
+    ]:
+        path = repo_dir / rel
+        if not path.exists():
+            raise FileNotFoundError(f"Official Peptides dataset file not found: {path}")
+        text = path.read_text(encoding="utf-8", errors="replace")
+        original = text
+        text = text.replace(
+            "from ogb.utils import smiles2graph\n",
+            (
+                "try:\n"
+                "    from ogb.utils import smiles2graph\n"
+                "except ImportError:\n"
+                "    from ogb.utils.features import smiles2graph\n"
+            ),
+            1,
+        )
+        text = text.replace(
+            "        if decide_download(self.url):\n",
+            "        if True:  # Colab runner: non-interactive official dataset download.\n",
+            1,
+        )
+        if text != original:
+            path.write_text(text, encoding="utf-8")
+            patched_any = True
+            base.log(f"[dataset-compat] Patched Peptides loader for modern OGB/non-interactive Colab download: {path}")
+
+    if not patched_any:
+        base.log("[dataset-compat] Peptides loader compatibility patch already present.")
+
+
 def parse_args(base: Any, argv: Sequence[str] | None, *, onehop: bool) -> argparse.Namespace:
     description = (
         "Train parameter-matched 1-hop global-RRWP GRIT on Peptides-struct in Colab."
@@ -391,6 +459,7 @@ def run_training(variant: str, argv: Sequence[str] | None = None) -> None:
 
     if not args.skip_install:
         base.install_dependencies(args)
+        install_peptides_dependencies(base)
     else:
         base.log("[deps] Skipping dependency installation (--skip-install).")
 
@@ -400,6 +469,7 @@ def run_training(variant: str, argv: Sequence[str] | None = None) -> None:
     # Reset it before applying our training-loop/control patches so rerunning a
     # Colab cell against an already-patched checkout is deterministic.
     base.run_cmd(["git", "reset", "--hard", commit], cwd=args.repo_dir)
+    apply_peptides_dataset_compat_patch(base, args.repo_dir)
     if onehop:
         base.apply_parameter_matched_onehop_patch(args.repo_dir, args.drive_dir)
         base.log(
