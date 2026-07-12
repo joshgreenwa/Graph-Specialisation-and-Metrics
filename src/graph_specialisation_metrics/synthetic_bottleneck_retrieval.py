@@ -298,31 +298,37 @@ class BottleneckRetriever(nn.Module):
         )
         self.head = nn.Linear(dim, value_vocab)
 
-    def node_states(self, batch: Batch) -> Tensor:
+    def encode(self, batch: Batch) -> Tensor:
+        """Post-encoder node state h0 = content embedding + node-RRWP (the IG resample unit)."""
         b, n = batch.x.shape[:2]
         node_rrwp = batch.rrwp[torch.arange(b)[:, None], torch.arange(n)[None], torch.arange(n)[None]]
-        h = self.encoder(batch.x) + self.rrwp_node(node_rrwp)
+        return self.encoder(batch.x) + self.rrwp_node(node_rrwp)
+
+    def propagate(self, batch: Batch, h0: Tensor) -> Tensor:
+        """Run the attention stack from a given h0 -- lets IG integrate over the encoded content."""
+        b, n = h0.shape[:2]
         rrwp = batch.rrwp
-        # 1-hop attends to edges + self; dense attends everywhere.
         if self.dense:
             mask = None
         else:
             eye = torch.eye(n, device=batch.adj.device).unsqueeze(0)
             mask = ((batch.adj + eye) > 0).float()
+        h = h0
         if self.use_vnode:
-            # append one global token: every real node <-> vnode, vnode <-> all. A single
-            # low-rank global channel -- expected to help routing but bottleneck at high rank.
-            h = torch.cat([h, self.vnode_emb.expand(b, 1, -1)], dim=1)             # [B, n+1, dim]
-            rrwp = F.pad(rrwp, (0, 0, 0, 1, 0, 1))                                 # zero RRWP for vnode pairs
+            h = torch.cat([h, self.vnode_emb.expand(b, 1, -1)], dim=1)
+            rrwp = F.pad(rrwp, (0, 0, 0, 1, 0, 1))
             base = mask if mask is not None else torch.ones(b, n, n, device=h.device)
             big = torch.zeros(b, n + 1, n + 1, device=h.device, dtype=base.dtype)
             big[:, :n, :n] = base
-            big[:, :n, n] = 1.0   # real nodes read the vnode
-            big[:, n, :] = 1.0    # vnode reads everything (and itself)
+            big[:, :n, n] = 1.0
+            big[:, n, :] = 1.0
             mask = big
         for layer in self.layers:
             h = layer(h, rrwp, mask)
         return h[:, :n] if self.use_vnode else h
+
+    def node_states(self, batch: Batch) -> Tensor:
+        return self.propagate(batch, self.encode(batch))
 
     def forward(self, batch: Batch) -> Tensor:
         return self.head(self.node_states(batch))
@@ -486,10 +492,87 @@ def default_config() -> dict:
     }
 
 
+def ig_loss_carriage_decay(model: nn.Module, batch: Batch, *, steps: int = 32, max_d: int = 6) -> dict[int, float]:
+    """B_IG positive control: IG attribution of the query loss to each source's encoded content,
+    banded by query->source transport distance. Negative = loss-reducing (beneficial). On the
+    bottleneck task the planted target's content (far) should be strongly beneficial for a model
+    that can transport it (dense) and ~0 for one that cannot (1-hop)."""
+    device = batch.x.device
+    model.eval()
+    h0 = model.encode(batch).detach()
+    base = h0.mean(dim=1, keepdim=True).expand_as(h0)   # in-distribution-ish baseline: mean over nodes
+    b, n, _ = h0.shape
+    ig = torch.zeros(b, n, device=device)
+    for a in range(1, steps + 1):
+        pt = (base + (a / steps) * (h0 - base)).detach().requires_grad_(True)
+        logits = model.head(model.propagate(batch, pt))
+        loss = F.cross_entropy(logits[batch.qmask], batch.label[batch.qmask], reduction="sum")
+        (g,) = torch.autograd.grad(loss, pt)
+        ig += (g.detach() * (h0 - base)).sum(dim=-1) / steps
+    adj = batch.adj.cpu().numpy()
+    qm = batch.qmask.cpu().numpy()
+    ig_np = ig.cpu().numpy()
+    bins: dict[int, list[float]] = {}
+    for gi in range(b):
+        qs = np.nonzero(qm[gi])[0]
+        if len(qs) != 1:  # rank-1 only, so query->source distance is unambiguous
+            continue
+        d_from_q = _bfs_distances(adj[gi], int(qs[0]))
+        for j in range(n):
+            dd = int(d_from_q[j])
+            if 0 <= dd <= max_d:
+                bins.setdefault(dd, []).append(float(ig_np[gi, j]))
+    return {d: float(np.mean(v)) for d, v in sorted(bins.items())}
+
+
+def run_positive_control(cfg: dict, device: torch.device, out_dir: Path) -> dict:
+    """Train dense + 1-hop on content retrieval with the target planted at a fixed distance, then
+    check B_IG(d) spikes (negative) at that distance for dense and stays ~0 for 1-hop."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    td = int(cfg.get("target_distance") or 3)
+    max_d = max(int(cfg.get("max_distance", 6)), td + 1)
+    results: dict[str, dict[int, float]] = {}
+    for model_name in ("dense", "1hop"):
+        run_cfg = {**cfg, "rank": 1, "addressing": "content", "target_distance": td}
+        model, res = train_one(model_name=model_name, graph="dumbbell", cfg=run_cfg, device=device, seed=0)
+        batch = make_batch(cfg["batch_size"], graph="dumbbell", n=cfg["n"], rank=1,
+                           key_vocab=cfg["key_vocab"], value_vocab=cfg["value_vocab"], rrwp_steps=cfg["rrwp_steps"],
+                           bridge_edges=cfg["bridge_edges"], degree=cfg["degree"], seed=777, device=device,
+                           addressing="content", target_distance=td)
+        results[model_name] = ig_loss_carriage_decay(model, batch, steps=32, max_d=max_d)
+        print(f"  [positive-control {model_name}] val_acc={res['val_acc']:.3f}  B_IG(target d={td})="
+              f"{results[model_name].get(td, float('nan')):+.4f}", flush=True)
+
+    fig, ax = plt.subplots(figsize=(6.4, 4.4))
+    for model_name, style in (("dense", dict(marker="o", color="#1f77b4")), ("1hop", dict(marker="s", color="#d62728"))):
+        dec = results[model_name]
+        ds = sorted(dec)
+        ax.plot(ds, [dec[d] for d in ds], label=model_name, **style)
+    ax.axvline(td, color="k", ls=":", lw=0.8, label=f"planted target d={td}")
+    ax.axhline(0, color="gray", ls=":", lw=0.8)
+    ax.set_xlabel("query->source transport distance (hops)")
+    ax.set_ylabel("B_IG loss-carriage  (<0 = beneficial)")
+    ax.set_title("B_IG positive control: beneficial far carriage where the target lives (dense only)")
+    ax.grid(alpha=0.3)
+    ax.legend()
+    fig.tight_layout()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    fig_path = out_dir / "positive_control_bIG.png"
+    fig.savefig(fig_path, dpi=140)
+    plt.close(fig)
+    (out_dir / "positive_control_bIG.json").write_text(json.dumps({"target_distance": td, "results": results}, indent=2))
+    print(f"[positive-control] wrote {fig_path}", flush=True)
+    return {"target_distance": td, "results": results, "figure": str(fig_path)}
+
+
 def main(argv: Sequence[str] | None = None) -> dict:
     ap = argparse.ArgumentParser(description="Dense vs 1-hop attention breakaway on bottleneck retrieval.")
     ap.add_argument("--out-dir", default="experiments/synthetic/results/bottleneck_retrieval")
     ap.add_argument("--run-name", default=None)
+    ap.add_argument("--positive-control", action="store_true", help="Run the B_IG loss-carriage positive control instead of the sweep.")
     ap.add_argument("--n", type=int, default=None)
     ap.add_argument("--layers", type=int, default=None)
     ap.add_argument("--steps", type=int, default=None)
@@ -519,6 +602,10 @@ def main(argv: Sequence[str] | None = None) -> dict:
     run_name = args.run_name or time.strftime("run_%Y%m%d_%H%M%S")
     out_dir = Path(args.out_dir) / run_name
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    if getattr(args, "positive_control", False):
+        print(f"[positive-control] device={device}", flush=True)
+        return run_positive_control(cfg, device, out_dir)
 
     cache_path = out_dir / "results.json"
     if cache_path.exists():

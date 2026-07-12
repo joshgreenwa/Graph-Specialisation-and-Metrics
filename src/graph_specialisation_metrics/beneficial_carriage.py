@@ -65,6 +65,43 @@ def _same_token(a: Any, b: Any) -> bool:
     return a == b
 
 
+def build_signature_means(backend: FBCBackend, graphs: Sequence[Any]) -> tuple[dict[Hashable, Tensor], Tensor | None]:
+    """Per-environment mean encoded content -- the on-manifold analog of the global mean baseline.
+
+    baseline[j] = E[content | environment(j)] instead of E[content], so the IG path runs from a
+    *plausible* content given j's neighbourhood to the true content, rather than from the OOD grand
+    mean. Used for the loss-carriage's in-distribution baseline.
+    """
+    sums: dict[Hashable, Tensor] = {}
+    counts: dict[Hashable, int] = {}
+    glob: Tensor | None = None
+    gn = 0
+    for g in graphs:
+        enc = backend.encoded(g).detach()
+        for node in range(int(enc.size(0))):
+            sig = backend.signature(g, node)
+            v = enc[node]
+            sums[sig] = v.clone() if sig not in sums else sums[sig] + v
+            counts[sig] = counts.get(sig, 0) + 1
+            glob = v.clone() if glob is None else glob + v
+            gn += 1
+    means = {s: sums[s] / counts[s] for s in sums}
+    return means, (glob / max(gn, 1) if glob is not None else None)
+
+
+def matched_baseline(backend: FBCBackend, graph: Any, sig_means: dict[Hashable, Tensor],
+                     glob_mean: Tensor | None) -> Tensor:
+    enc = backend.encoded(graph).detach()
+    base = enc.clone()
+    for node in range(int(enc.size(0))):
+        sig = backend.signature(graph, node)
+        if sig in sig_means:
+            base[node] = sig_means[sig].to(base)
+        elif glob_mean is not None:
+            base[node] = glob_mean.to(base)
+    return base
+
+
 def focal_node(backend: FBCBackend, graph: Any) -> int:
     return int(torch.as_tensor(backend.degree(graph)).argmax().item())
 

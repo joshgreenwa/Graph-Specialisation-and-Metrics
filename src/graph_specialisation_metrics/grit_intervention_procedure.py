@@ -9716,9 +9716,16 @@ def run_step6(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
         ig_sample = int(cfg.get("ig_sample_graphs", 8))
         ig_steps = int(config["perturbation"].get("ig_steps", 16))
         readout_ig = carriage_ig_uses_readout_ig(config)
+        baseline_mode = str(cfg.get("loss_carriage_baseline", "matched"))  # in-distribution by default
         for model in analysis_models:
+            backend = _GRITBeneficialBackend(model)
             graphs = select_graphs(model.adapter, "test", ig_sample, seed=seed)
-            baseline = mean_encoded_baseline(model.adapter, select_baseline_graphs(model.adapter, "test", config, ig_sample, seed=seed))
+            base_graphs = select_baseline_graphs(model.adapter, "test", config, ig_sample, seed=seed)
+            baseline = mean_encoded_baseline(model.adapter, base_graphs)
+            sig_means = glob_mean = None
+            if baseline_mode == "matched":
+                sig_means, glob_mean = _bc.build_signature_means(backend, base_graphs)
+            progress(f"Step 6 {model.name}: loss-carriage on {len(graphs)} graph(s), baseline={baseline_mode}")
             func_acc: dict[int, float] = {}
             loss_acc: dict[int, float] = {}
             ng = 0
@@ -9728,8 +9735,12 @@ def run_step6(models: Sequence[ModelRun], artifact_root: Path, config: Mapping[s
                     continue
                 y = float(torch.as_tensor(yl).reshape(-1)[0].item())
                 dist = torch.as_tensor(distance_matrix(graph)).long()
-                cf = carriage_ig(model.adapter, graph, baseline, steps=ig_steps, readout_ig=readout_ig)["carriage"]
-                cl = carriage_ig(model.adapter, graph, baseline, steps=ig_steps, readout_ig=readout_ig, loss_label=y)["carriage"]
+                base_override = (_bc.matched_baseline(backend, graph, sig_means, glob_mean)
+                                 if baseline_mode == "matched" else None)
+                cf = carriage_ig(model.adapter, graph, baseline, steps=ig_steps, readout_ig=readout_ig,
+                                 baseline_override=base_override)["carriage"]
+                cl = carriage_ig(model.adapter, graph, baseline, steps=ig_steps, readout_ig=readout_ig,
+                                 baseline_override=base_override, loss_label=y)["carriage"]
                 for d in range(0, max_d + 1):
                     m = dist == d
                     if bool(m.any()):
