@@ -452,7 +452,9 @@ def train_one(
     log = []
     for step in range(cfg["steps"]):
         batch = sample(seed * 100003 + step)
-        loss, acc, _ = _loss_and_acc(model(batch), batch)
+        loss, acc, nq = _loss_and_acc(model(batch), batch)
+        if nq == 0:  # no query placeable at this distance in the whole batch -> zero has no grad_fn
+            continue
         opt.zero_grad()
         loss.backward()
         opt.step()
@@ -646,7 +648,7 @@ def _rrwp_perturbed(rrwp: Tensor, source: int, *, kind: str, start: int, replace
     incident to it (row+col), preserving the diagonal node-RRWP. donor/mean/zero replacements."""
     r = rrwp.clone()
     n = r.size(1)
-    idx = torch.arange(n)
+    idx = torch.arange(n, device=r.device)
     off = idx != source
     if kind == "node":
         if replacement == "donor":
@@ -661,7 +663,7 @@ def _rrwp_perturbed(rrwp: Tensor, source: int, *, kind: str, start: int, replace
             r[0, source, off, start:] = rrwp[0, donor, off, start:]
             r[0, off, source, start:] = rrwp[0, off, donor, start:]
         elif replacement == "mean":
-            eye = torch.eye(n, dtype=torch.bool)
+            eye = torch.eye(n, dtype=torch.bool, device=r.device)
             m = rrwp[0][~eye][:, start:].mean(0)
             r[0, source, off, start:] = m
             r[0, off, source, start:] = m
@@ -698,11 +700,12 @@ def _ig_carriage(model: nn.Module, b1: Batch, factor: str, mode: str, *, start: 
                  steps: int) -> tuple[Tensor, dict[str, float]]:
     """Per-source carriage c[j] via IG over the substrate; completeness = sum c vs S(1)-S(0)."""
     n = b1.x.size(1)
+    dev = b1.x.device
     if factor == "content_ig":
         h0 = model.encode(b1).detach()
         base = h0.mean(dim=1, keepdim=True).expand_as(h0).contiguous()
         delta = h0 - base
-        c = torch.zeros(n)
+        c = torch.zeros(n, device=dev)
         for a in range(1, steps + 1):
             pt = (base + (a / steps) * delta).detach().requires_grad_(True)
             (grad,) = torch.autograd.grad(_readout_scalar(model.head(model.propagate(b1, pt)), b1, mode), pt)
@@ -710,12 +713,12 @@ def _ig_carriage(model: nn.Module, b1: Batch, factor: str, mode: str, *, start: 
         with torch.no_grad():
             s0 = float(_readout_scalar(model.head(model.propagate(b1, base)), b1, mode).item())
             s1 = float(_readout_scalar(model.head(model.propagate(b1, (base + delta))), b1, mode).item())
-        return c, {"recon": float(c.sum().item()), "target": s1 - s0}
+        return c.cpu(), {"recon": float(c.sum().item()), "target": s1 - s0}
 
     K = b1.rrwp.size(-1)
     flat_clean = b1.rrwp.detach().reshape(n * n, K)
-    a_idx = torch.arange(n).repeat_interleave(n)
-    b_idx = torch.arange(n).repeat(n)
+    a_idx = torch.arange(n, device=dev).repeat_interleave(n)
+    b_idx = torch.arange(n, device=dev).repeat(n)
     diag = a_idx == b_idx
     if factor == "node_rrwp_ig":
         active, src = diag, a_idx
@@ -725,7 +728,7 @@ def _ig_carriage(model: nn.Module, b1: Batch, factor: str, mode: str, *, start: 
     if bool(active.any()) and K > start:
         base_flat[active, start:] = flat_clean[active, start:].mean(0)
     delta_flat = flat_clean - base_flat
-    c = torch.zeros(n)
+    c = torch.zeros(n, device=dev)
     for a in range(1, steps + 1):
         pt = (base_flat + (a / steps) * delta_flat).detach().requires_grad_(True)
         logits = model.head(model.node_states(b1, pt.reshape(1, n, n, K)))
@@ -735,7 +738,7 @@ def _ig_carriage(model: nn.Module, b1: Batch, factor: str, mode: str, *, start: 
     with torch.no_grad():
         s0 = float(_readout_scalar(model.head(model.node_states(b1, base_flat.reshape(1, n, n, K))), b1, mode).item())
         s1 = float(_readout_scalar(model.head(model.node_states(b1, flat_clean.reshape(1, n, n, K))), b1, mode).item())
-    return c, {"recon": float(c.sum().item()), "target": s1 - s0}
+    return c.cpu(), {"recon": float(c.sum().item()), "target": s1 - s0}
 
 
 def carriage_rows_for_graph(model: nn.Module, model_name: str, b1: Batch, gid: str, *,
