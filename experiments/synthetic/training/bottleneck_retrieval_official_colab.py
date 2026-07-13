@@ -79,6 +79,33 @@ def _clone_or_update(repo_url: str, branch: str, repo_dir: Path, token: str | No
         _run(["git", "-C", str(repo_dir), "remote", "set-url", "origin", repo_url])
 
 
+def _install_pyg_stack() -> None:
+    """Install torch_geometric + the compiled PyG extensions GRIT's layers need (torch_scatter/
+    torch_sparse), matched to the runtime's torch+CUDA build. Mirrors the ZINC/peptides GRIT colabs:
+    `pip install torch_geometric` does NOT pull these C++ extensions, so `import grit.layer.grit_layer`
+    fails with `No module named 'torch_scatter'` without this step."""
+    import torch  # already present in Colab
+
+    torch_version = str(torch.__version__).split("+")[0]
+    cuda = getattr(torch.version, "cuda", None)
+    cuda_tag = ("cu" + cuda.replace(".", "")) if cuda else "cpu"
+    wheel_url = f"https://data.pyg.org/whl/torch-{torch_version}+{cuda_tag}.html"
+    print(f"[deps] torch={torch.__version__} cuda={cuda} | PyG wheel index: {wheel_url}", flush=True)
+    _run([sys.executable, "-m", "pip", "install", "-q", "torch_geometric", "yacs", "ogb", "einops"], check=False)
+    # Optional accelerators -- best effort (the RRWP GRIT layer does not require them).
+    for pkg in ("pyg-lib", "torch-spline-conv", "torch-cluster"):
+        _run([sys.executable, "-m", "pip", "install", "-q", pkg, "-f", wheel_url], check=False)
+    # Required by GRIT's attention/message passing.
+    for pkg in ("torch-scatter", "torch-sparse"):
+        rc = _run([sys.executable, "-m", "pip", "install", "-q", pkg, "-f", wheel_url], check=False)
+        if rc != 0:
+            raise SystemExit(
+                f"[deps] Required PyG extension {pkg!r} failed to install from {wheel_url}. "
+                "This Colab torch/CUDA build has no matching prebuilt wheel; switch to a runtime with "
+                "a PyG-supported torch (e.g. a slightly older torch), then re-run."
+            )
+
+
 def _setup_official_grit(grit_dir: Path, *, install: bool) -> None:
     """Clone official GRIT at the pinned commit and expose it for ``import grit.*``."""
     if not (grit_dir / ".git").exists():
@@ -87,8 +114,7 @@ def _setup_official_grit(grit_dir: Path, *, install: bool) -> None:
         _run(["git", "clone", OFFICIAL_GRIT_URL, str(grit_dir)])
     _run(["git", "-C", str(grit_dir), "checkout", OFFICIAL_GRIT_COMMIT])
     if install:
-        # torch_geometric (+ the scatter/sparse extras GRIT layers need) must match the Colab torch.
-        _run([sys.executable, "-m", "pip", "install", "-q", "torch_geometric", "yacs", "ogb"], check=False)
+        _install_pyg_stack()
         _run([sys.executable, "-m", "pip", "install", "-q", "-e", str(grit_dir), "--no-deps"], check=False)
     os.environ["GRIT_ROOT"] = str(grit_dir)
     if str(grit_dir) not in sys.path:
@@ -114,6 +140,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     ap.add_argument("--carriage", action="store_true")
     ap.add_argument("--skip-sweep", action="store_true")
     ap.add_argument("--force-retrain", action="store_true")
+    ap.add_argument("--force-carriage", action="store_true", help="recompute carriage even if cached cells exist on Drive")
     ap.add_argument("--carriage-graphs", nargs="+", default=["dumbbell", "expander", "wellconnected"])
     ap.add_argument("--carriage-target-distance", type=int, default=3)
     ap.add_argument("--carriage-graphs-count", type=int, default=12)
@@ -137,6 +164,11 @@ def main(argv: Sequence[str] | None = None) -> None:
     src = str(repo / "src")
     if src not in sys.path:
         sys.path.insert(0, src)
+    # Drop any already-imported package modules so a warm Colab kernel picks up the freshly reset repo
+    # (otherwise `from ... import` returns the stale cached module and repo updates are ignored).
+    for _m in [m for m in list(sys.modules) if m == "graph_specialisation_metrics"
+               or m.startswith("graph_specialisation_metrics.")]:
+        del sys.modules[_m]
     importlib.invalidate_caches()
 
     try:
@@ -163,6 +195,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         inner.append("--skip-sweep")
     if args.force_retrain:
         inner.append("--force-retrain")
+    if args.force_carriage:
+        inner.append("--force-carriage")
     if args.fast_dev_run:
         inner.append("--fast-dev-run")
 

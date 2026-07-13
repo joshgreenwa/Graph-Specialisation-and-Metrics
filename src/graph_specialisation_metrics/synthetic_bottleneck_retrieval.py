@@ -783,50 +783,125 @@ def carriage_rows_for_graph(model: nn.Module, model_name: str, b1: Batch, gid: s
     return rows
 
 
-def run_carriage_suite(cfg: dict, device: torch.device, out_dir: Path, *,
-                       ckpt_dir: Path | None = None, force_retrain: bool = False) -> dict:
-    """Train (cached) the models on each carriage graph at the planted target distance, then compute
-    the full symbolic/structural x swap/IG x functional/beneficial carriage suite and render figures."""
-    td = int(cfg.get("carriage_target_distance") or cfg.get("target_distance") or 3)
-    graphs = list(cfg.get("carriage_graphs") or cfg.get("graphs") or ["dumbbell"])
-    models = list(cfg.get("models") or ["dense", "1hop"])
-    n_graphs = int(cfg.get("carriage_graphs_count", 12))
+def ensure_colab_drive_out_dir(out_dir: Path, *, subdir: str) -> Path:
+    """In Colab: mount Drive and redirect a local/ephemeral out-dir onto Drive so EVERYTHING (models,
+    carriage caches, figures) survives runtime restarts. No-op outside Colab or if already on Drive."""
+    try:
+        import google.colab  # type: ignore  # noqa: F401
+    except Exception:
+        return out_dir
+    try:
+        from google.colab import drive  # type: ignore
+
+        drive.mount("/content/drive", force_remount=False)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[drive] mount failed ({exc}); using {out_dir} (NOT persistent!)", flush=True)
+        return out_dir
+    if str(out_dir).startswith("/content/drive"):
+        return out_dir
+    new = Path("/content/drive/MyDrive/graph_specialisation_metrics") / subdir
+    print(f"[drive] redirecting out-dir to Drive for persistence: {out_dir} -> {new}", flush=True)
+    return new
+
+
+def _carriage_cell_fingerprint(cfg: dict, graph: str, model_name: str, td: int) -> str:
+    import hashlib
+
+    keys = ("n", "key_vocab", "value_vocab", "rrwp_steps", "degree", "bridge_edges",
+            "carriage_graphs_count", "carriage_channel_start", "carriage_ig_steps",
+            "carriage_rrwp_replacement", "carriage_donor_samples", "carriage_min_distance")
+    payload = {"graph": graph, "model": model_name, "td": int(td), **{k: cfg.get(k) for k in keys}}
+    return hashlib.sha1(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()[:16]
+
+
+def compute_carriage_rows(model: nn.Module, model_name: str, graph: str, cfg: dict, td: int,
+                          device: torch.device, *, cache_dir: Path | None = None,
+                          force: bool = False) -> tuple[list[dict], list[dict], bool]:
+    """Per-(graph, model) carriage rows, cached to ``cache_dir`` (Drive). Returns (rows, completeness,
+    loaded_from_cache) so a mid-run disconnect never loses a completed cell."""
+    path = None
+    if cache_dir is not None:
+        fp = _carriage_cell_fingerprint(cfg, graph, model_name, td)
+        path = Path(cache_dir) / f"{graph}__{model_name}__{fp}.json"
+        if path.exists() and not force:
+            d = json.loads(path.read_text())
+            return d["rows"], d["completeness"], True
     start = int(cfg.get("carriage_channel_start", 2))
     ig_steps = int(cfg.get("carriage_ig_steps", 24))
     replacement = str(cfg.get("carriage_rrwp_replacement", "donor"))
     donors = int(cfg.get("carriage_donor_samples", 4))
     min_distance = int(cfg.get("carriage_min_distance", 1))
+    n_graphs = int(cfg.get("carriage_graphs_count", 12))
+    probe = make_batch(n_graphs, graph=graph, n=cfg["n"], rank=1, key_vocab=cfg["key_vocab"],
+                       value_vocab=cfg["value_vocab"], rrwp_steps=cfg["rrwp_steps"],
+                       bridge_edges=cfg["bridge_edges"], degree=cfg["degree"], seed=90210,
+                       device=device, addressing="content", target_distance=td)
+    rng = np.random.default_rng(1234)
+    rows: list[dict] = []
+    completeness: list[dict] = []
+    for gi in range(n_graphs):
+        b1 = _slice_graph(probe, gi)
+        for r in carriage_rows_for_graph(model, model_name, b1, f"{graph}:{gi}", start=start,
+                                         ig_steps=ig_steps, replacement=replacement, donors=donors,
+                                         min_distance=min_distance, rng=rng,
+                                         completeness_out=completeness):
+            r["graph"] = graph
+            rows.append(r)
+    if path is not None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"rows": rows, "completeness": completeness}))
+    return rows, completeness, False
 
+
+def collect_carriage(cfg: dict, device: torch.device, out_dir: Path, *, graphs: Sequence[str],
+                     models: Sequence[str], td: int, train_fn, ckpt_dir: Path | None,
+                     force_retrain: bool, force_carriage: bool) -> tuple[list[dict], list[dict], list[dict]]:
+    """Shared model-agnostic carriage driver: per cell, load-or-train the model (ckpt cache) then
+    load-or-compute its carriage rows (carriage cache). ``train_fn`` supplies the model backend."""
+    cache_dir = Path(out_dir) / "carriage_cache"
     rows: list[dict] = []
     completeness: list[dict] = []
     accs: list[dict] = []
     for graph in graphs:
         run_cfg = {**cfg, "rank": 1, "addressing": "content", "target_distance": td}
         for model_name in models:
-            model, res = train_one(model_name=model_name, graph=graph, cfg=run_cfg, device=device,
-                                   seed=0, ckpt_dir=ckpt_dir, force_retrain=force_retrain)
+            model, res = train_fn(model_name=model_name, graph=graph, cfg=run_cfg, device=device,
+                                  seed=0, ckpt_dir=ckpt_dir, force_retrain=force_retrain)
             model.eval()
-            accs_flag = "cache" if res.get("loaded_from_cache") else "trained"
-            accs_row = {"graph": graph, "model": model_name, "val_acc": res.get("val_acc"),
-                        "train_acc": res.get("train_acc"), "source": accs_flag}
-            accs.append(accs_row)
+            accs.append({"graph": graph, "model": model_name, "val_acc": res.get("val_acc"),
+                         "train_acc": res.get("train_acc"),
+                         "source": "cache" if res.get("loaded_from_cache") else "trained"})
+            cell_rows, cell_comp, cached = compute_carriage_rows(
+                model, model_name, graph, cfg, td, device, cache_dir=cache_dir, force=force_carriage)
+            rows.extend(cell_rows)
+            completeness.extend(cell_comp)
             print(f"  [carriage {graph:13s} {model_name:11s}] val={res.get('val_acc'):.3f} "
-                  f"train={res.get('train_acc', float('nan')):.3f} ({accs_flag})", flush=True)
-            probe = make_batch(n_graphs, graph=graph, n=cfg["n"], rank=1, key_vocab=cfg["key_vocab"],
-                               value_vocab=cfg["value_vocab"], rrwp_steps=cfg["rrwp_steps"],
-                               bridge_edges=cfg["bridge_edges"], degree=cfg["degree"], seed=90210,
-                               device=device, addressing="content", target_distance=td)
-            rng = np.random.default_rng(1234)
-            for gi in range(n_graphs):
-                b1 = _slice_graph(probe, gi)
-                gid = f"{graph}:{gi}"
-                for r in carriage_rows_for_graph(model, model_name, b1, gid, start=start, ig_steps=ig_steps,
-                                                 replacement=replacement, donors=donors,
-                                                 min_distance=min_distance, rng=rng,
-                                                 completeness_out=completeness):
-                    r["graph"] = graph
-                    rows.append(r)
+                  f"train={res.get('train_acc', float('nan')):.3f} "
+                  f"model={'cache' if res.get('loaded_from_cache') else 'trained'} "
+                  f"carriage={'cache' if cached else 'computed'} ({len(cell_rows)} rows)", flush=True)
+    return rows, completeness, accs
 
+
+def run_carriage_suite(cfg: dict, device: torch.device, out_dir: Path, *,
+                       ckpt_dir: Path | None = None, force_retrain: bool = False,
+                       force_carriage: bool = False) -> dict:
+    """Train (cached) the models on each carriage graph at the planted target distance, then compute
+    the full symbolic/structural x swap/IG x functional/beneficial carriage suite and render figures.
+    Both the trained models and the per-cell carriage rows are cached under ``out_dir`` (Drive), so a
+    restarted runtime reloads everything and only regenerates the (cheap) figures."""
+    td = int(cfg.get("carriage_target_distance") or cfg.get("target_distance") or 3)
+    graphs = list(cfg.get("carriage_graphs") or cfg.get("graphs") or ["dumbbell"])
+    models = list(cfg.get("models") or ["dense", "1hop"])
+    start = int(cfg.get("carriage_channel_start", 2))
+    ig_steps = int(cfg.get("carriage_ig_steps", 24))
+    replacement = str(cfg.get("carriage_rrwp_replacement", "donor"))
+    donors = int(cfg.get("carriage_donor_samples", 4))
+    n_graphs = int(cfg.get("carriage_graphs_count", 12))
+
+    rows, completeness, accs = collect_carriage(
+        cfg, device, out_dir, graphs=graphs, models=models, td=td, train_fn=train_one,
+        ckpt_dir=ckpt_dir, force_retrain=force_retrain, force_carriage=force_carriage,
+    )
     out_dir.mkdir(parents=True, exist_ok=True)
     payload = {"config": {"target_distance": td, "graphs": graphs, "models": models,
                           "channel_start": start, "ig_steps": ig_steps, "replacement": replacement,
@@ -1028,6 +1103,8 @@ def main(argv: Sequence[str] | None = None) -> dict:
     ap.add_argument("--ig-steps", type=int, default=None)
     ap.add_argument("--rrwp-replacement", default=None, choices=["donor", "mean", "zero"])
     ap.add_argument("--donor-samples", type=int, default=None)
+    ap.add_argument("--force-carriage", action="store_true", help="recompute carriage even if cached cells exist")
+    ap.add_argument("--no-drive", action="store_true", help="do not auto-redirect the out-dir onto Google Drive in Colab")
     ap.add_argument("--fast-dev-run", action="store_true")
     ap.add_argument("--device", default="auto")
     args = ap.parse_args(argv)
@@ -1052,16 +1129,20 @@ def main(argv: Sequence[str] | None = None) -> dict:
         (args.device if args.device != "auto" else "cpu")
     )
     run_name = args.run_name or time.strftime("run_%Y%m%d_%H%M%S")
-    out_dir = Path(args.out_dir) / run_name
+    out_root = Path(args.out_dir) if args.no_drive else ensure_colab_drive_out_dir(
+        Path(args.out_dir), subdir=Path(args.out_dir).name)
+    out_dir = out_root / run_name
     out_dir.mkdir(parents=True, exist_ok=True)
     ckpt_dir = out_dir / "checkpoints"
+    print(f"[persist] all models/carriage/figures under: {out_dir}", flush=True)
 
     run_carriage = bool(getattr(args, "carriage", False) or getattr(args, "positive_control", False))
     carriage_result: dict | None = None
     if run_carriage:
         print(f"[carriage] device={device}", flush=True)
         carriage_result = run_carriage_suite(cfg, device, out_dir / "carriage", ckpt_dir=ckpt_dir,
-                                             force_retrain=args.force_retrain)
+                                             force_retrain=args.force_retrain,
+                                             force_carriage=args.force_carriage)
     if args.skip_sweep:
         return {"out_dir": str(out_dir), "carriage": carriage_result,
                 "figures": (carriage_result or {}).get("figures", [])}

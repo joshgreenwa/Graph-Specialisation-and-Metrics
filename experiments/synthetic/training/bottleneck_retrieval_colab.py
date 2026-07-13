@@ -100,6 +100,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     ap.add_argument("--carriage", action="store_true", help="also run the symbolic/structural carriage suite (swap+IG, functional+beneficial)")
     ap.add_argument("--skip-sweep", action="store_true", help="carriage only; skip the accuracy breakaway sweep")
     ap.add_argument("--force-retrain", action="store_true", help="ignore cached Drive checkpoints and retrain")
+    ap.add_argument("--force-carriage", action="store_true", help="recompute carriage even if cached cells exist on Drive")
     ap.add_argument("--carriage-graphs", nargs="+", default=["dumbbell", "expander", "wellconnected"])
     ap.add_argument("--carriage-target-distance", type=int, default=3)
     ap.add_argument("--carriage-graphs-count", type=int, default=12)
@@ -122,6 +123,11 @@ def main(argv: Sequence[str] | None = None) -> None:
     src = str(repo / "src")
     if src not in sys.path:
         sys.path.insert(0, src)
+    # Drop any already-imported package modules so a warm Colab kernel picks up the freshly reset repo
+    # (otherwise `from ... import` returns the stale cached module and repo updates are ignored).
+    for _m in [m for m in list(sys.modules) if m == "graph_specialisation_metrics"
+               or m.startswith("graph_specialisation_metrics.")]:
+        del sys.modules[_m]
     importlib.invalidate_caches()
 
     try:
@@ -157,6 +163,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         inner.append("--skip-sweep")
     if args.force_retrain:
         inner.append("--force-retrain")
+    if args.force_carriage:
+        inner.append("--force-carriage")
     if args.fast_dev_run:
         inner.append("--fast-dev-run")
 

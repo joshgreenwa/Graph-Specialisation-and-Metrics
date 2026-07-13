@@ -42,7 +42,9 @@ from graph_specialisation_metrics.synthetic_bottleneck_retrieval import (
     _loss_and_acc,
     _slice_graph,
     carriage_rows_for_graph,
+    collect_carriage,
     default_config,
+    ensure_colab_drive_out_dir,
     make_batch,
     plot_breakaway,
     plot_carriage_suite,
@@ -271,50 +273,22 @@ def run_sweep(cfg: dict, device: torch.device, *, ckpt_dir: Path | None = None,
 
 
 def run_carriage_suite(cfg: dict, device: torch.device, out_dir: Path, *,
-                       ckpt_dir: Path | None = None, force_retrain: bool = False) -> dict:
+                       ckpt_dir: Path | None = None, force_retrain: bool = False,
+                       force_carriage: bool = False) -> dict:
     td = int(cfg.get("carriage_target_distance") or cfg.get("target_distance") or 3)
     graphs = list(cfg.get("carriage_graphs") or cfg.get("graphs") or ["dumbbell"])
     models = list(cfg.get("models") or ["dense", "1hop"])
-    n_graphs = int(cfg.get("carriage_graphs_count", 12))
-    start = int(cfg.get("carriage_channel_start", 2))
-    ig_steps = int(cfg.get("carriage_ig_steps", 24))
-    replacement = str(cfg.get("carriage_rrwp_replacement", "donor"))
-    donors = int(cfg.get("carriage_donor_samples", 4))
-    min_distance = int(cfg.get("carriage_min_distance", 1))
-
-    rows: list[dict] = []
-    completeness: list[dict] = []
-    accs: list[dict] = []
-    for graph in graphs:
-        run_cfg = {**cfg, "rank": 1, "addressing": "content", "target_distance": td}
-        for model_name in models:
-            model, res = train_one(model_name=model_name, graph=graph, cfg=run_cfg, device=device,
-                                   seed=0, ckpt_dir=ckpt_dir, force_retrain=force_retrain)
-            model.eval()
-            flag = "cache" if res.get("loaded_from_cache") else "trained"
-            accs.append({"graph": graph, "model": model_name, "val_acc": res.get("val_acc"),
-                         "train_acc": res.get("train_acc"), "source": flag})
-            print(f"  [official carriage {graph:13s} {model_name:6s}] val={res.get('val_acc'):.3f} "
-                  f"train={res.get('train_acc', float('nan')):.3f} ({flag})", flush=True)
-            probe = make_batch(n_graphs, graph=graph, n=cfg["n"], rank=1, key_vocab=cfg["key_vocab"],
-                               value_vocab=cfg["value_vocab"], rrwp_steps=cfg["rrwp_steps"],
-                               bridge_edges=cfg["bridge_edges"], degree=cfg["degree"], seed=90210,
-                               device=device, addressing="content", target_distance=td)
-            rng = np.random.default_rng(1234)
-            for gi in range(n_graphs):
-                b1 = _slice_graph(probe, gi)
-                gid = f"{graph}:{gi}"
-                for r in carriage_rows_for_graph(model, model_name, b1, gid, start=start, ig_steps=ig_steps,
-                                                 replacement=replacement, donors=donors,
-                                                 min_distance=min_distance, rng=rng,
-                                                 completeness_out=completeness):
-                    r["graph"] = graph
-                    rows.append(r)
-
+    rows, completeness, accs = collect_carriage(
+        cfg, device, out_dir, graphs=graphs, models=models, td=td, train_fn=train_one,
+        ckpt_dir=ckpt_dir, force_retrain=force_retrain, force_carriage=force_carriage,
+    )
     out_dir.mkdir(parents=True, exist_ok=True)
     payload = {"backend": "official_grit", "config": {"target_distance": td, "graphs": graphs, "models": models,
-               "channel_start": start, "ig_steps": ig_steps, "replacement": replacement,
-               "donor_samples": donors, "n_graphs": n_graphs}, "rows": rows,
+               "channel_start": int(cfg.get("carriage_channel_start", 2)),
+               "ig_steps": int(cfg.get("carriage_ig_steps", 24)),
+               "replacement": str(cfg.get("carriage_rrwp_replacement", "donor")),
+               "donor_samples": int(cfg.get("carriage_donor_samples", 4)),
+               "n_graphs": int(cfg.get("carriage_graphs_count", 12))}, "rows": rows,
                "completeness": completeness, "accuracy": accs}
     (out_dir / "carriage_rows.json").write_text(json.dumps(payload, indent=2))
     figs = plot_carriage_suite(rows, accs, td, out_dir)
@@ -350,6 +324,8 @@ def main(argv: Sequence[str] | None = None) -> dict:
     ap.add_argument("--ig-steps", type=int, default=None)
     ap.add_argument("--rrwp-replacement", default=None, choices=["donor", "mean", "zero"])
     ap.add_argument("--donor-samples", type=int, default=None)
+    ap.add_argument("--force-carriage", action="store_true", help="recompute carriage even if cached cells exist")
+    ap.add_argument("--no-drive", action="store_true", help="do not auto-redirect the out-dir onto Google Drive in Colab")
     ap.add_argument("--fast-dev-run", action="store_true")
     ap.add_argument("--device", default="auto")
     args = ap.parse_args(argv)
@@ -378,15 +354,19 @@ def main(argv: Sequence[str] | None = None) -> dict:
         (args.device if args.device != "auto" else "cpu")
     )
     run_name = args.run_name or time.strftime("official_run_%Y%m%d_%H%M%S")
-    out_dir = Path(args.out_dir) / run_name
+    out_root = Path(args.out_dir) if args.no_drive else ensure_colab_drive_out_dir(
+        Path(args.out_dir), subdir=Path(args.out_dir).name)
+    out_dir = out_root / run_name
     out_dir.mkdir(parents=True, exist_ok=True)
     ckpt_dir = out_dir / "checkpoints"
+    print(f"[persist] all models/carriage/figures under: {out_dir}", flush=True)
 
     carriage_result = None
     if args.carriage:
         print(f"[official carriage] device={device}", flush=True)
         carriage_result = run_carriage_suite(cfg, device, out_dir / "carriage", ckpt_dir=ckpt_dir,
-                                             force_retrain=args.force_retrain)
+                                             force_retrain=args.force_retrain,
+                                             force_carriage=args.force_carriage)
     if args.skip_sweep:
         return {"out_dir": str(out_dir), "carriage": carriage_result,
                 "figures": (carriage_result or {}).get("figures", [])}
