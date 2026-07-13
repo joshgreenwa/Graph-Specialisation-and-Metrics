@@ -456,6 +456,8 @@ def train_one(
     )
     model.train()
     log = []
+    _t0 = time.time()
+    _every = max(1, cfg["steps"] // 10)
     for step in range(cfg["steps"]):
         batch = sample(seed * 100003 + step)
         loss, acc, nq = _loss_and_acc(model(batch), batch)
@@ -464,8 +466,11 @@ def train_one(
         opt.zero_grad()
         loss.backward()
         opt.step()
-        if step % max(1, cfg["steps"] // 10) == 0 or step == cfg["steps"] - 1:
+        if step % _every == 0 or step == cfg["steps"] - 1:
             log.append({"step": step, "loss": float(loss.item()), "train_acc": acc})
+            rate = (step + 1) / max(time.time() - _t0, 1e-6)
+            print(f"    [{model_name}/{graph} s{seed}] step {step + 1}/{cfg['steps']} "
+                  f"loss={loss.item():.4f} acc={acc:.3f} ({rate:.1f} it/s)", flush=True)
     # eval on fresh graphs; also record final TRAIN accuracy (the routing-vs-memorisation guardrail)
     model.eval()
     accs, train_accs = [], []
@@ -1174,9 +1179,15 @@ def main(argv: Sequence[str] | None = None) -> dict:
     # PHASE=train: the GPU-heavy pass. Train + cache EVERY model (sweep + carriage) to Drive; no
     # analysis. Safe to interrupt/resume -- each finished model is checkpointed as it completes.
     if phase == "train":
-        print(f"[train] device={device}: training all sweep + carriage models -> {ckpt_dir}", flush=True)
-        rows = run_sweep(cfg, device, ckpt_dir=ckpt_dir, force_retrain=args.force_retrain)
-        cache_path.write_text(json.dumps({"config": cfg, "rows": rows, "device": str(device)}, indent=2))
+        n_car = len(cfg.get("carriage_graphs") or cfg["graphs"]) * len(cfg["models"])
+        if args.skip_sweep:
+            print(f"[train] --skip-sweep: training only the {n_car} CARRIAGE models -> {ckpt_dir}", flush=True)
+        else:
+            n_sweep = (len(cfg["addressings"]) * len(cfg["graphs"]) * len(cfg.get("distances", [None]))
+                       * len(cfg["ranks"]) * len(cfg["models"]) * cfg["seeds"])
+            print(f"[train] device={device}: training {n_sweep} sweep + {n_car} carriage models -> {ckpt_dir}", flush=True)
+            rows = run_sweep(cfg, device, ckpt_dir=ckpt_dir, force_retrain=args.force_retrain)
+            cache_path.write_text(json.dumps({"config": cfg, "rows": rows, "device": str(device)}, indent=2))
         train_carriage_models(cfg, device, ckpt_dir, train_fn=train_one, force_retrain=args.force_retrain)
         print(f"[train] done. Run --phase analyze later to compute carriage + figures from these.", flush=True)
         return {"out_dir": str(out_dir), "phase": "train", "cache": str(cache_path)}

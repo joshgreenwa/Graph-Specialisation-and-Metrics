@@ -699,6 +699,7 @@ def render_step_1_figures(
 ) -> None:
     figures = ensure_dir(artifact_root / "figures")
     dpi = int(config["figures"]["dpi"])
+    dataset_name = str((config.get("dataset", {}) or {}).get("name", "dataset"))
     if metric_rows:
         grouped: dict[str, list[float]] = {}
         for row in metric_rows:
@@ -774,7 +775,7 @@ def render_step_1_figures(
                         hatch="//",
                     )
                     ax.text(max(0.03 * xmax, 0.003), y[idx], "metric missing", va="center", ha="left", fontsize=9, color="#555555")
-            ax.set_title("Step 1: ZINC test MAE by model", pad=14)
+            ax.set_title(f"Step 1: {dataset_name} test MAE by model", pad=14)
             ax.set_xlabel("Test MAE (lower is better)")
             ax.set_yticks(y)
             ax.set_yticklabels([ladder_labels.get(model, model) for model in models])
