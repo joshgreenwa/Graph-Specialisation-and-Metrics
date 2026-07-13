@@ -618,14 +618,15 @@ def default_config() -> dict:
 # ======================================================================================
 IG_FACTORS = ("content_ig", "node_rrwp_ig", "pair_rrwp_ig")
 SWAP_FACTORS = ("content", "node_rrwp", "pair_rrwp")
-# Self node-RRWP: the carrier's OWN global-PE fingerprint, decomposed by walk-length r (the scale
-# axis inside a node's node-RRWP). Routed (j != carrier) source-at-distance carriage MISSES this, so
-# it is a separate factor whose x-axis is r, not graph distance. High-r mass = the global structure
-# that local-RRWP truncation would remove -- the mechanism behind 1hop+global RRWP ~ dense.
-SELF_IG_FACTOR = "node_rrwp_self_ig"
-SELF_SWAP_FACTOR = "node_rrwp_self"
-SELF_FACTORS = (SELF_SWAP_FACTOR, SELF_IG_FACTOR)
-CARRIAGE_FACTORS = SWAP_FACTORS + IG_FACTORS + SELF_FACTORS
+# RRWP carriage is a 2D object over (source node j, walk-length channel r). Beyond the by-DISTANCE
+# marginal (factors above), we also emit the by-WALK-LENGTH (scale) marginal -- which structural
+# scales of the per-node/pair RRWP the focal node collectively uses (high-r mass = the global
+# structure local-RRWP truncation removes) -- and the (distance x scale) JOINT. Both estimators.
+STRUCTURAL_KINDS = (("node", "node_rrwp"), ("pair", "pair_rrwp"))
+SCALE_IG_FACTORS = {"node": "node_rrwp_scale_ig", "pair": "pair_rrwp_scale_ig"}
+JOINT_IG_FACTORS = {"node": "node_rrwp_joint_ig", "pair": "pair_rrwp_joint_ig"}
+SCALE_SWAP_FACTORS = {"node": "node_rrwp_scale", "pair": "pair_rrwp_scale"}
+CARRIAGE_FACTORS = SWAP_FACTORS + IG_FACTORS
 CARRIAGE_MODES = ("functional", "beneficial")
 
 
@@ -759,59 +760,54 @@ def _ig_carriage(model: nn.Module, b1: Batch, factor: str, mode: str, *, start: 
     return c.cpu(), {"recon": float(c.sum().item()), "target": s1 - s0}
 
 
-def _self_node_rrwp_ig(model: nn.Module, b1: Batch, q: int, mode: str, *, steps: int) -> tuple[Tensor, dict]:
-    """Per-walk-length IG carriage of the query carrier's OWN node-RRWP diagonal. Returns c[K] over
-    channels r (graph-mean per-channel baseline); sum_r c telescopes to S(clean_qq) - S(base_qq)."""
+def _structural_ig_joint(model: nn.Module, b1: Batch, target_kind: str, mode: str, *,
+                         steps: int) -> tuple[Tensor, dict[str, float]]:
+    """Channel-resolved structural IG: integrate the RRWP (node diagonal or pair off-diagonal) over
+    ALL walk-length channels from the per-channel graph-mean baseline, attributing per (source, r).
+    Returns joint[source, channel] (sum_{j,r} telescopes to S(clean)-S(base)). The by-distance and
+    by-scale marginals are joint.sum(dim=1) (per source) and joint.sum(dim=0) (per channel)."""
     n = int(b1.x.size(1))
-    K = int(b1.rrwp.size(-1))
     dev = b1.x.device
-    idx = torch.arange(n, device=dev)
-    rrwp0 = b1.rrwp.detach()
-    diag = rrwp0[0, idx, idx]                       # [n, K]
-    base_q = diag.mean(dim=0)                        # per-channel graph-mean baseline [K]
-    delta_q = diag[q] - base_q                       # [K]
-    c = torch.zeros(K, device=dev)
+    K = int(b1.rrwp.size(-1))
+    flat_clean = b1.rrwp.detach().reshape(n * n, K)
+    a_idx = torch.arange(n, device=dev).repeat_interleave(n)
+    b_idx = torch.arange(n, device=dev).repeat(n)
+    diag = a_idx == b_idx
+    active, src = (diag, a_idx) if target_kind == "node" else (~diag, b_idx)  # pair -> source = key node b
+    base_flat = flat_clean.clone()
+    if bool(active.any()):
+        base_flat[active] = flat_clean[active].mean(dim=0)  # per-channel mean over active slots, ALL channels
+    delta_flat = flat_clean - base_flat
+    joint = torch.zeros(n, K, device=dev)
     for a in range(1, steps + 1):
-        pt_q = (base_q + (a / steps) * delta_q).detach().requires_grad_(True)
-        r = rrwp0.clone()
-        r[0, q, q, :] = pt_q                         # differentiable index assignment
-        logits = model.head(model.node_states(b1, r))
-        (grad,) = torch.autograd.grad(_readout_scalar(logits, b1, mode), pt_q)
-        c += grad.detach() * delta_q / steps
+        pt = (base_flat + (a / steps) * delta_flat).detach().requires_grad_(True)
+        logits = model.head(model.node_states(b1, pt.reshape(1, n, n, K)))
+        (grad,) = torch.autograd.grad(_readout_scalar(logits, b1, mode), pt)
+        contrib = grad.detach() * delta_flat  # [n*n, K]
+        joint.index_add_(0, src[active], contrib[active] / steps)
     with torch.no_grad():
-        r0 = rrwp0.clone(); r0[0, q, q, :] = base_q
-        s0 = float(_readout_scalar(model.head(model.node_states(b1, r0)), b1, mode).item())
-        s1 = float(_readout_scalar(model.head(model.node_states(b1, rrwp0)), b1, mode).item())
-    return c.cpu(), {"recon": float(c.sum().item()), "target": s1 - s0}
+        s0 = float(_readout_scalar(model.head(model.node_states(b1, base_flat.reshape(1, n, n, K))), b1, mode).item())
+        s1 = float(_readout_scalar(model.head(model.node_states(b1, flat_clean.reshape(1, n, n, K))), b1, mode).item())
+    return joint.cpu(), {"recon": float(joint.sum().item()), "target": s1 - s0}
 
 
-def _self_node_rrwp_swap(model: nn.Module, b1: Batch, q: int, mode: str, *, replacement: str,
-                         donors: int, rng: np.random.Generator) -> Tensor:
-    """Per-walk-length finite-swap carriage of the query carrier's OWN node-RRWP (one channel at a
-    time; frozen readout gradient). Returns c[K] over channels r."""
+def _swap_scale(model: nn.Module, b1: Batch, target_kind: str, mode: str) -> Tensor:
+    """Finite-swap scale marginal: replace channel r (across ALL node/pair slots) with its graph-mean
+    and measure the frozen-readout carriage. Returns c[K] over walk-lengths -- the swap cross-check on
+    the IG scale marginal."""
     h_clean, g = _readout_gradient(model, b1, mode)
     n = int(b1.x.size(1))
     K = int(b1.rrwp.size(-1))
-    idx = torch.arange(n, device=b1.x.device)
-    rrwp0 = b1.rrwp
-    diag = rrwp0[0, idx, idx]
-    base_q = diag.mean(dim=0)
-    k = donors if replacement == "donor" else 1
+    dev = b1.x.device
+    eye = torch.eye(n, dtype=torch.bool, device=dev)
+    active = (eye if target_kind == "node" else ~eye).reshape(-1)
+    mean_ch = b1.rrwp.detach().reshape(n * n, K)[active].mean(dim=0)  # [K]
     c = torch.zeros(K)
     for r_ch in range(K):
-        acc, got = 0.0, 0
-        for _ in range(max(1, k)):
-            r = rrwp0.clone()
-            if replacement == "donor":
-                r[0, q, q, r_ch] = rrwp0[0, _draw_donor(rng, n, q), _draw_donor(rng, n, q), r_ch]
-            elif replacement == "mean":
-                r[0, q, q, r_ch] = base_q[r_ch]
-            else:
-                r[0, q, q, r_ch] = 0.0
-            h = model.node_states(b1, r).detach()
-            acc += float((g * (h_clean - h)).sum().item())
-            got += 1
-        c[r_ch] = acc / max(got, 1)
+        r = b1.rrwp.clone()
+        r.reshape(1, n * n, K)[0, active, r_ch] = mean_ch[r_ch]
+        h = model.node_states(b1, r).detach()
+        c[r_ch] = float((g * (h_clean - h)).sum().item())
     return c
 
 
@@ -839,21 +835,36 @@ def carriage_rows_for_graph(model: nn.Module, model_name: str, b1: Batch, gid: s
                 continue
             v = float(c[j].item())
             rows.append({
-                "model": model_name, "graph_id": gid, "carrier": q, "source": j,
-                "distance": d, "is_target": int(j == tgt), "factor": factor, "mode": mode,
+                "model": model_name, "graph_id": gid, "carrier": q, "source": j, "distance": d,
+                "scale": None, "is_target": int(j == tgt), "factor": factor, "mode": mode,
                 "effect_signed": v, "effect_abs": abs(v),
             })
 
-    def emit_self(factor: str, mode: str, c: Tensor) -> None:
-        # Per-walk-length rows for the carrier's OWN node-RRWP: x-axis is the channel r (scale),
-        # stored in ``distance`` so the by-scale line plots work; ``scale`` is explicit.
+    def emit_scale(factor: str, mode: str, c: Tensor) -> None:
+        # by walk-length marginal: one row per channel r (aggregated over all sources).
         for r_ch in range(int(c.numel())):
             v = float(c[r_ch].item())
             rows.append({
-                "model": model_name, "graph_id": gid, "carrier": q, "source": q,
-                "distance": int(r_ch), "scale": int(r_ch), "is_target": 0,
-                "factor": factor, "mode": mode, "effect_signed": v, "effect_abs": abs(v),
+                "model": model_name, "graph_id": gid, "carrier": q, "source": None, "distance": None,
+                "scale": int(r_ch), "is_target": 0, "factor": factor, "mode": mode,
+                "effect_signed": v, "effect_abs": abs(v),
             })
+
+    def emit_joint(factor: str, mode: str, joint: Tensor) -> None:
+        # (distance x scale): one row per (source j -> distance d, channel r).
+        for j in range(int(joint.size(0))):
+            if j == q:
+                continue
+            d = int(d_from_q[j])
+            if d < min_distance or d < 0:
+                continue
+            for r_ch in range(int(joint.size(1))):
+                v = float(joint[j, r_ch].item())
+                rows.append({
+                    "model": model_name, "graph_id": gid, "carrier": q, "source": j, "distance": d,
+                    "scale": int(r_ch), "is_target": int(j == tgt), "factor": factor, "mode": mode,
+                    "effect_signed": v, "effect_abs": abs(v),
+                })
 
     for mode in CARRIAGE_MODES:
         for factor in SWAP_FACTORS:
@@ -865,14 +876,15 @@ def carriage_rows_for_graph(model: nn.Module, model_name: str, b1: Batch, gid: s
             if completeness_out is not None and math.isfinite(comp["target"]):
                 completeness_out.append({"model": model_name, "graph_id": gid, "factor": factor,
                                          "mode": mode, **comp, "abs_error": abs(comp["recon"] - comp["target"])})
-        # self node-RRWP, decomposed by walk-length r (IG + swap)
-        c_self_ig, comp_self = _self_node_rrwp_ig(model, b1, q, mode, steps=ig_steps)
-        emit_self(SELF_IG_FACTOR, mode, c_self_ig)
-        if completeness_out is not None and math.isfinite(comp_self["target"]):
-            completeness_out.append({"model": model_name, "graph_id": gid, "factor": SELF_IG_FACTOR,
-                                     "mode": mode, **comp_self, "abs_error": abs(comp_self["recon"] - comp_self["target"])})
-        emit_self(SELF_SWAP_FACTOR, mode,
-                  _self_node_rrwp_swap(model, b1, q, mode, replacement=replacement, donors=donors, rng=rng))
+        # structural RRWP by walk-length (scale) + (distance x scale) joint -- node and pair
+        for kind, _base in STRUCTURAL_KINDS:
+            joint, comp = _structural_ig_joint(model, b1, kind, mode, steps=ig_steps)  # [n, K]
+            emit_scale(SCALE_IG_FACTORS[kind], mode, joint.sum(dim=0))                  # by walk-length (IG)
+            emit_joint(JOINT_IG_FACTORS[kind], mode, joint)                             # distance x scale (IG)
+            emit_scale(SCALE_SWAP_FACTORS[kind], mode, _swap_scale(model, b1, kind, mode))  # by walk-length (swap)
+            if completeness_out is not None and math.isfinite(comp["target"]):
+                completeness_out.append({"model": model_name, "graph_id": gid, "factor": JOINT_IG_FACTORS[kind],
+                                         "mode": mode, **comp, "abs_error": abs(comp["recon"] - comp["target"])})
     return rows
 
 
@@ -1066,6 +1078,38 @@ def _profile(rows: Sequence[dict], *, factor: str, mode: str, model: str, graph:
     return ds, [float(np.mean(by_d[d])) for d in ds]
 
 
+def _scale_profile(rows: Sequence[dict], *, factor: str, mode: str, model: str, graph: str,
+                   value: str = "effect_abs") -> tuple[list[int], list[float]]:
+    """Mean carriage by walk-length r for one (factor, mode, model, graph)."""
+    sub = [r for r in rows if r["factor"] == factor and r["mode"] == mode and r["model"] == model
+           and r["graph"] == graph and r.get("scale") is not None]
+    by_r: dict[int, list[float]] = {}
+    for r in sub:
+        by_r.setdefault(int(r["scale"]), []).append(float(r[value]))
+    rs = sorted(by_r)
+    return rs, [float(np.mean(by_r[x])) for x in rs]
+
+
+def _joint_grid(rows: Sequence[dict], *, factor: str, mode: str, model: str, graph: str,
+                value: str = "effect_abs") -> tuple[Any, list[int], list[int]]:
+    """(distance x walk-length) mean-carriage grid for one (factor, mode, model, graph)."""
+    sub = [r for r in rows if r["factor"] == factor and r["mode"] == mode and r["model"] == model
+           and r["graph"] == graph and r.get("scale") is not None and r.get("distance") is not None]
+    if not sub:
+        return None, [], []
+    ds = sorted({int(r["distance"]) for r in sub})
+    rs = sorted({int(r["scale"]) for r in sub})
+    di = {d: i for i, d in enumerate(ds)}
+    ri = {x: i for i, x in enumerate(rs)}
+    acc = np.zeros((len(ds), len(rs)))
+    cnt = np.zeros((len(ds), len(rs)))
+    for r in sub:
+        i, j = di[int(r["distance"])], ri[int(r["scale"])]
+        acc[i, j] += float(r[value])
+        cnt[i, j] += 1.0
+    return acc / np.maximum(cnt, 1.0), ds, rs
+
+
 def plot_carriage_suite(rows: Sequence[dict], accs: Sequence[dict], target_distance: int,
                         out_dir: Path) -> list[str]:
     import matplotlib
@@ -1153,7 +1197,7 @@ def plot_carriage_suite(rows: Sequence[dict], accs: Sequence[dict], target_dista
     #     expander vs wellconnected) + accuracy -- does an expander recover what the dumbbell loses?
     far_by = {}  # (graph, model, substrate) -> mean beneficial carriage at d >= target
     for r in rows:
-        if r["mode"] != "beneficial" or int(r["distance"]) < target_distance:
+        if r["mode"] != "beneficial" or r.get("distance") is None or int(r["distance"]) < target_distance:
             continue
         sub = {"content_ig": "content", "pair_rrwp_ig": "pair_rrwp", "node_rrwp_ig": "node_rrwp"}.get(r["factor"])
         if sub is None:
@@ -1190,6 +1234,45 @@ def plot_carriage_suite(rows: Sequence[dict], accs: Sequence[dict], target_dista
     ax.legend(frameon=False)
     ax.set_title("Train vs val accuracy (train>>val = routing failure, not undertraining)")
     save(fig, "carriage_accuracy_guardrail.png")
+
+    # (6) RRWP carriage by WALK-LENGTH r (scale marginal, aggregated over sources): which structural
+    #     scales the focal node collectively uses. High-r mass = global structure local-RRWP truncates.
+    fig, axes = plt.subplots(2, 2, figsize=(12, 8.5), constrained_layout=True)
+    for col, (kind, ktitle) in enumerate([("node", "Node RRWP"), ("pair", "Pair RRWP")]):
+        for ri_, (mode, val) in enumerate([("functional", "effect_abs"), ("beneficial", "effect_signed")]):
+            ax = axes[ri_][col]
+            for model in models:
+                color = _MODEL_STYLE.get(model, {}).get("color")
+                rs, ys = _scale_profile(rows, factor=SCALE_IG_FACTORS[kind], mode=mode, model=model, graph=primary, value=val)
+                if rs:
+                    ax.plot(rs, ys, marker="o", label=f"{model} (IG)", color=color)
+                rs2, ys2 = _scale_profile(rows, factor=SCALE_SWAP_FACTORS[kind], mode=mode, model=model, graph=primary, value=val)
+                if rs2:
+                    ax.plot(rs2, ys2, marker="x", ls="--", alpha=0.55, color=color, label=f"{model} (swap)")
+            ax.axhline(0, color="gray", ls=":", lw=0.7)
+            ax.set_title(f"{ktitle} -- {mode}")
+            ax.set_xlabel("RRWP walk-length r (structural scale)")
+            ax.set_ylabel("|carriage|" if mode == "functional" else "beneficial (signed<0=good)")
+            ax.grid(alpha=0.3)
+            ax.legend(frameon=False, fontsize=7)
+    fig.suptitle(f"RRWP carriage by walk-length ({primary}); solid=IG, dashed=swap cross-check")
+    save(fig, "carriage_rrwp_by_scale.png")
+
+    # (7) Node-RRWP (distance x walk-length) JOINT heatmap, functional, per model on the primary graph.
+    fig, axes = plt.subplots(1, len(models), figsize=(5.0 * max(len(models), 1), 4.4), squeeze=False, constrained_layout=True)
+    for mi, model in enumerate(models):
+        ax = axes[0][mi]
+        grid, ds, rs = _joint_grid(rows, factor=JOINT_IG_FACTORS["node"], mode="functional", model=model, graph=primary)
+        if grid is not None:
+            im = ax.imshow(grid, aspect="auto", origin="lower", cmap="viridis")
+            ax.set_xticks(range(len(rs))); ax.set_xticklabels(rs)
+            ax.set_yticks(range(len(ds))); ax.set_yticklabels(ds)
+            fig.colorbar(im, ax=ax, shrink=0.85, label="mean |carriage|")
+        ax.set_title(model)
+        ax.set_xlabel("walk-length r")
+        ax.set_ylabel("source distance d")
+    fig.suptitle(f"Node-RRWP carriage joint: distance x walk-length, functional ({primary})")
+    save(fig, "carriage_node_rrwp_joint.png")
     return figs
 
 
