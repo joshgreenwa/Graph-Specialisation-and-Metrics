@@ -14,6 +14,7 @@ import random
 import re
 import time
 import hashlib
+import gc
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence
@@ -90,6 +91,18 @@ def ordered_model_names(names: Sequence[str]) -> list[str]:
 
 def progress(message: str) -> None:
     print(f"[intervention:{time.strftime('%H:%M:%S')}] {message}", flush=True)
+
+
+def free_gpu_memory() -> None:
+    """Drop Python references and return cached CUDA blocks to the allocator. Called between graphs
+    and models so a large model's peak (e.g. dense_grit on peptides-struct, ~150-node graphs) does
+    not stay cached and OOM the next model. Cheap relative to per-graph IG; no-op on CPU."""
+    gc.collect()
+    if torch.cuda.is_available():
+        try:
+            torch.cuda.empty_cache()
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def progress_interval(total: int, target_messages: int = 10) -> int:
@@ -5429,12 +5442,12 @@ def symbolic_structural_carriage_rows(
         if bool(cfg_sub.get("run_structural_carriage_ig", True)):
             ig_steps = int(config["perturbation"].get("ig_steps", 32))
             struct_readout_ig = carriage_ig_uses_readout_ig(config) if readout_ig is None else bool(readout_ig)
-            # Batched VJP is ATTEMPTED by default (trades spare RAM for a ~n x speedup). It runs
-            # through the hooked forward, which may not be vmap-compatible on GRIT -- now SAFE: on any
-            # failure structural_carriage_ig rebuilds a fresh graph, uses the per-carrier loop, and
-            # reports batched_error, so the log shows whether batching actually engaged. Set
-            # steps.7.structural_batched_vjp=false to skip the attempt entirely.
-            struct_bvjp = bool(cfg_sub.get("structural_batched_vjp", True))
+            # Batched VJP is OFF by default: official GRIT's forward uses an in-place aten::scatter_
+            # that vmap/is_grads_batched cannot handle, so the attempt ALWAYS fails on these models --
+            # and on large graphs (peptides-struct, ~150 nodes) the n x grad allocation it makes before
+            # failing is itself an OOM trigger. Opt in via steps.7.structural_batched_vjp for a model
+            # whose forward is vmap-safe; the re-forward fallback keeps it safe either way.
+            struct_bvjp = bool(cfg_sub.get("structural_batched_vjp", False))
             for tkind, fac in (("node", "node_rrwp_ig"), ("pair", "pair_rrwp_ig")):
                 res = structural_carriage_ig(adapter, graph, target_kind=tkind, steps=ig_steps, readout_ig=struct_readout_ig, batched_vjp=struct_bvjp)
                 if res is None:
@@ -5583,6 +5596,9 @@ def run_symbolic_structural_probe(models: Sequence[ModelRun], artifact_root: Pat
                 )
             except Exception as exc:
                 progress(f"  {model.name} graph {graph_idx}: symbolic/structural failed ({exc})")
+            free_gpu_memory()  # release this graph's activations before the next (peptides OOM guard)
+        del graphs
+        free_gpu_memory()  # release cached blocks before the next model starts (dense -> 1-hop OOM)
     if not rows:
         progress("Step 7 symbolic/structural: no rows produced")
         return {"status": "no_rows", "rows": 0}
