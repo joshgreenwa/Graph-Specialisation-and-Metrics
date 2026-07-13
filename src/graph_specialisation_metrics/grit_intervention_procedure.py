@@ -5100,6 +5100,7 @@ def symbolic_structural_carriage_rows(
     rrwp_channel_start: int = 2,
     rrwp_replacement: str = "zero",
     donor_samples: int = 4,
+    readout_ig: Optional[bool] = None,
     ig_baseline: Optional[torch.Tensor] = None,
     artifact_root: Optional[Path] = None,
     config: Optional[Mapping[str, Any]] = None,
@@ -5328,7 +5329,7 @@ def symbolic_structural_carriage_rows(
         cfg_sub = (config.get("steps", {}) or {}).get("7") or (config.get("steps", {}) or {}).get("4") or {}
         if bool(cfg_sub.get("run_structural_carriage_ig", True)):
             ig_steps = int(config["perturbation"].get("ig_steps", 32))
-            struct_readout_ig = carriage_ig_uses_readout_ig(config)
+            struct_readout_ig = carriage_ig_uses_readout_ig(config) if readout_ig is None else bool(readout_ig)
             for tkind, fac in (("node", "node_rrwp_ig"), ("pair", "pair_rrwp_ig")):
                 res = structural_carriage_ig(adapter, graph, target_kind=tkind, steps=ig_steps, readout_ig=struct_readout_ig)
                 if res is None:
@@ -5367,7 +5368,7 @@ def symbolic_structural_carriage_rows(
     # model dropping out of content_ig is visible instead of silently producing a single-model panel.
     if ig_baseline is not None and config is not None:
         ig_steps = int(config["perturbation"].get("ig_steps", 32))
-        r_ig = carriage_ig_uses_readout_ig(config)
+        r_ig = carriage_ig_uses_readout_ig(config) if readout_ig is None else bool(readout_ig)
         b_vjp = carriage_ig_uses_batched_vjp(config)
         try:
             res_f = carriage_ig(adapter, graph, ig_baseline, steps=ig_steps, readout_ig=r_ig, batched_vjp=b_vjp)
@@ -5419,6 +5420,10 @@ def run_symbolic_structural_probe(models: Sequence[ModelRun], artifact_root: Pat
     rrwp_replacement = str(cfg.get("symbolic_structural_rrwp_replacement", "donor"))
     donor_samples = int(cfg.get("symbolic_structural_donor_samples", 4))
     reach_tau = int(cfg.get("reach_far_distance_tau", 3))
+    # Step-7-scoped readout_ig: None -> inherit the global perturbation flag; True -> exact IG
+    # completeness (Sum C == yhat_clean - yhat_base ~ 0) at ~2x cost, without disturbing other steps.
+    _rio = cfg.get("carriage_readout_ig", None)
+    step7_readout_ig = None if _rio is None else bool(_rio)
     seed = int(config.get("seeds", [0])[0])
     dpi = int(config["figures"]["dpi"])
     rows: list[dict[str, Any]] = []
@@ -5451,6 +5456,7 @@ def run_symbolic_structural_probe(models: Sequence[ModelRun], artifact_root: Pat
                         rrwp_channel_start=rrwp_channel_start,
                         rrwp_replacement=rrwp_replacement,
                         donor_samples=donor_samples,
+                        readout_ig=step7_readout_ig,
                         ig_baseline=ig_baseline,
                         artifact_root=artifact_root,
                         config=config,
