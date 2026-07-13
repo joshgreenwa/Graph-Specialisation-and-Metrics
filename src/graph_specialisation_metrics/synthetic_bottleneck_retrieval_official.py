@@ -39,7 +39,10 @@ from graph_specialisation_metrics.synthetic_bottleneck_retrieval import (
     Batch,
     _bfs_distances,
     _ckpt_fingerprint,
+    _ckpt_stem,
+    _find_checkpoint_by_stem,
     _loss_and_acc,
+    _missing_ckpt_message,
     _slice_graph,
     carriage_rows_for_graph,
     collect_carriage,
@@ -182,26 +185,32 @@ def train_one(*, model_name: str, graph: str, cfg: dict, device: torch.device, s
               ckpt_dir: Path | None = None, force_retrain: bool = False,
               load_only: bool = False) -> tuple[nn.Module, dict]:
     torch.manual_seed(seed)
-    ckpt_path = None
+    ckpt_dir = Path(ckpt_dir) if ckpt_dir is not None else None
+    # official variant: model key carries the 'official_' prefix in BOTH the filename and the hash
+    stem = _ckpt_stem("", f"official_{model_name}", graph, cfg, seed)
+    fp = _ckpt_fingerprint(f"official_{model_name}", graph, cfg, seed)
     if ckpt_dir is not None:
-        fp = _ckpt_fingerprint(f"official_{model_name}", graph, cfg, seed)
-        ckpt_path = Path(ckpt_dir) / (
-            f"official_{model_name}__{graph}__{cfg.get('addressing')}__r{cfg.get('rank')}"
-            f"__d{cfg.get('target_distance')}__s{seed}__{fp}.pt"
-        )
-        if ckpt_path.exists() and not force_retrain:
+        chosen = _find_checkpoint_by_stem(ckpt_dir, stem, fp)
+        if chosen is not None and not force_retrain:
             model = build_model(model_name, cfg, device)
-            payload = torch.load(ckpt_path, map_location=device, weights_only=False)
-            model.load_state_dict(payload["state_dict"])
-            model.eval()
-            meta = dict(payload.get("meta", {}))
-            meta["loaded_from_cache"] = True
-            return model, meta
+            try:
+                payload = torch.load(chosen, map_location=device, weights_only=False)
+                model.load_state_dict(payload["state_dict"])
+            except Exception as exc:  # noqa: BLE001 -- architecture mismatch etc.
+                if load_only:
+                    raise RuntimeError(
+                        f"[analyze] found '{chosen.name}' but its weights do not fit the current model "
+                        f"(architecture/config differs): {exc}. Pass the SAME architecture args used at "
+                        "training (--n --layers --dim --heads --rrwp-steps)."
+                    ) from exc
+                chosen = None  # train phase: fall through and retrain
+            else:
+                model.eval()
+                meta = dict(payload.get("meta", {}))
+                meta["loaded_from_cache"] = True
+                return model, meta
     if load_only:  # analyze phase: never train; the model must already be on Drive
-        raise RuntimeError(
-            f"[analyze] no pretrained checkpoint for official_{model_name}/{graph} (seed {seed}) at "
-            f"{ckpt_path}. Run the train phase first (--phase train)."
-        )
+        raise RuntimeError(_missing_ckpt_message(ckpt_dir, stem))
     model = build_model(model_name, cfg, device)
 
     opt = torch.optim.Adam(model.parameters(), lr=cfg["lr"])
@@ -247,10 +256,10 @@ def train_one(*, model_name: str, graph: str, cfg: dict, device: torch.device, s
         "params": int(sum(p.numel() for p in model.parameters())),
         "loaded_from_cache": False,
     }
-    if ckpt_path is not None:
-        ckpt_path.parent.mkdir(parents=True, exist_ok=True)
+    if ckpt_dir is not None:
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
         torch.save({"state_dict": model.state_dict(), "meta": meta, "model_name": f"official_{model_name}",
-                    "graph": graph, "seed": seed}, ckpt_path)
+                    "graph": graph, "seed": seed}, ckpt_dir / f"{stem}__{fp}.pt")
     return model, meta
 
 

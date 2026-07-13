@@ -407,6 +407,50 @@ def _ckpt_fingerprint(model_name: str, graph: str, cfg: dict, seed: int) -> str:
     return hashlib.sha1(blob.encode()).hexdigest()[:16]
 
 
+def _ckpt_stem(prefix: str, model_name: str, graph: str, cfg: dict, seed: int) -> str:
+    """Semantic checkpoint key: everything except the trailing config-hash."""
+    return (f"{prefix}{model_name}__{graph}__{cfg.get('addressing')}__r{cfg.get('rank')}"
+            f"__d{cfg.get('target_distance')}__s{seed}")
+
+
+def _ckpt_filename(prefix: str, model_name: str, graph: str, cfg: dict, seed: int) -> str:
+    return f"{_ckpt_stem(prefix, model_name, graph, cfg, seed)}__{_ckpt_fingerprint(model_name, graph, cfg, seed)}.pt"
+
+
+def _find_checkpoint_by_stem(ckpt_dir: Path, stem: str, fp: str):
+    """Locate a checkpoint by its SEMANTIC key ``stem`` (model/graph/addressing/rank/distance/seed),
+    preferring the exact config-hash ``fp`` but falling back to ANY hash -- so a changed config default
+    never silently blocks a load (a drift warning is printed)."""
+    exact = ckpt_dir / f"{stem}__{fp}.pt"
+    if exact.exists():
+        return exact
+    matches = sorted(ckpt_dir.glob(f"{stem}__*.pt")) if ckpt_dir.exists() else []
+    if matches:
+        print(f"[cache] config-fingerprint drift for {stem}: loading {matches[0].name} (config differs from "
+              "this run's defaults, but model/graph/addressing/rank/distance/seed match).", flush=True)
+        return matches[0]
+    return None
+
+
+def _missing_ckpt_message(ckpt_dir: Path | None, stem: str) -> str:
+    present = sorted(p.name for p in ckpt_dir.glob("*.pt")) if (ckpt_dir is not None and ckpt_dir.exists()) else []
+    is_official = stem.startswith("official_")
+    mismatched = [nm for nm in present if nm.startswith("official_") != is_official]
+    hint = ""
+    if mismatched:
+        if is_official:
+            hint = (" NOTE: this directory contains non-'official_' (pure-torch) checkpoints -- run the analysis "
+                    "from the PURE-TORCH file synthetic_bottleneck_retrieval.py instead.")
+        else:
+            hint = (" NOTE: this directory contains 'official_*' checkpoints from the OFFICIAL-GRIT variant -- those "
+                    "are a different model; run synthetic_bottleneck_retrieval_official.py instead (this pure-torch "
+                    "file cannot load them).")
+    more = f"  (+{len(present) - 12} more)" if len(present) > 12 else ""
+    return (f"[analyze] no checkpoint matching '{stem}__*.pt' in {ckpt_dir}.\n"
+            f"  present .pt files: {present[:12]}{more}.{hint}\n"
+            "  If nothing is present, run --phase train first; if only the config differs, it is now loaded anyway.")
+
+
 def train_one(
     *,
     model_name: str,
@@ -430,22 +474,30 @@ def train_one(
         dropout=cfg["dropout"],
         **MODEL_SPECS[model_name],
     ).to(device)
-    ckpt_path = None
+    ckpt_dir = Path(ckpt_dir) if ckpt_dir is not None else None
+    stem = _ckpt_stem("", model_name, graph, cfg, seed)
+    fp = _ckpt_fingerprint(model_name, graph, cfg, seed)
     if ckpt_dir is not None:
-        fp = _ckpt_fingerprint(model_name, graph, cfg, seed)
-        ckpt_path = Path(ckpt_dir) / f"{model_name}__{graph}__{cfg.get('addressing')}__r{cfg.get('rank')}__d{cfg.get('target_distance')}__s{seed}__{fp}.pt"
-        if ckpt_path.exists() and not force_retrain:
-            payload = torch.load(ckpt_path, map_location=device, weights_only=False)
-            model.load_state_dict(payload["state_dict"])
-            model.eval()
-            meta = payload.get("meta", {})
-            meta["loaded_from_cache"] = True
-            return model, meta
+        chosen = _find_checkpoint_by_stem(ckpt_dir, stem, fp)
+        if chosen is not None and not force_retrain:
+            try:
+                payload = torch.load(chosen, map_location=device, weights_only=False)
+                model.load_state_dict(payload["state_dict"])
+            except Exception as exc:  # noqa: BLE001 -- architecture mismatch etc.
+                if load_only:
+                    raise RuntimeError(
+                        f"[analyze] found '{chosen.name}' but its weights do not fit the current model "
+                        f"(architecture/config differs): {exc}. Pass the SAME architecture args used at "
+                        "training (--n --layers --dim --heads --rrwp-steps)."
+                    ) from exc
+                chosen = None  # train phase: fall through and retrain
+            else:
+                model.eval()
+                meta = dict(payload.get("meta", {}))
+                meta["loaded_from_cache"] = True
+                return model, meta
     if load_only:  # analyze phase: never train; the model must already be on Drive
-        raise RuntimeError(
-            f"[analyze] no pretrained checkpoint for {model_name}/{graph} (seed {seed}) at {ckpt_path}. "
-            "Run the train phase first (--phase train)."
-        )
+        raise RuntimeError(_missing_ckpt_message(ckpt_dir, stem))
 
     opt = torch.optim.Adam(model.parameters(), lr=cfg["lr"])
     sample = lambda s: make_batch(
@@ -491,8 +543,9 @@ def train_one(
         "params": int(sum(p.numel() for p in model.parameters())),
         "loaded_from_cache": False,
     }
-    if ckpt_path is not None:
-        ckpt_path.parent.mkdir(parents=True, exist_ok=True)
+    if ckpt_dir is not None:
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
+        ckpt_path = ckpt_dir / _ckpt_filename("", model_name, graph, cfg, seed)
         torch.save({"state_dict": model.state_dict(), "meta": meta,
                     "cfg": {k: cfg[k] for k in CKPT_KEYS if k in cfg},
                     "model_name": model_name, "graph": graph, "seed": seed}, ckpt_path)
