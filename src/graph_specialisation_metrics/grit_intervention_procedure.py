@@ -5003,14 +5003,28 @@ def structural_carriage_ig(
 
         def to_override(pf: torch.Tensor) -> dict[str, torch.Tensor]:
             return {override_kw: pf}
-    else:  # sparse pair (rrwp_val + rrwp_index)
-        if (not isinstance(raw_val, torch.Tensor) or raw_val.dim() != 2
-                or not isinstance(raw_index, torch.Tensor) or raw_index.dim() != 2):
-            return None
-        rrwp_flat = raw_val.detach()
-        row_src = raw_index[0].detach().cpu().long()
+    else:  # pair -- raw sparse pair (rrwp_val + rrwp_index) if exposed, else the encoded-edge channel
+        if (isinstance(raw_val, torch.Tensor) and raw_val.dim() == 2
+                and isinstance(raw_index, torch.Tensor) and raw_index.dim() == 2):
+            rrwp_flat = raw_val.detach()
+            row_src = raw_index[0].detach().cpu().long()
+            override_kw = "rrwp_val_override"
+        else:
+            # These GRIT models consume RRWP inside their encoders and do NOT expose a raw RRWP tensor
+            # at hook time. batch.edge_attr (the encoded relative structural encoding, post RRWP-edge-
+            # encoder) is the adapter's DESIGNED pair-RRWP intervention point -- the same substrate the
+            # finite swap perturbs, applied differentiably -- so IG and swap stay directly comparable.
+            # It perturbs pair structure while leaving node content intact.
+            enc_attr = extras.get("encoded_edge_attr")
+            enc_index = extras.get("encoded_edge_index")
+            if (not isinstance(enc_attr, torch.Tensor) or enc_attr.dim() != 2
+                    or not isinstance(enc_index, torch.Tensor) or enc_index.dim() != 2
+                    or int(enc_index.size(1)) != int(enc_attr.size(0))):
+                return None
+            rrwp_flat = enc_attr.detach()
+            row_src = enc_index[0].detach().cpu().long()
+            override_kw = "edge_attr_override"
         active = row_src < n
-        override_kw = "rrwp_val_override"
 
         def to_override(pf: torch.Tensor) -> dict[str, torch.Tensor]:
             return {override_kw: pf}
