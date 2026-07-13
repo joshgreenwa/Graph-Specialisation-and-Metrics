@@ -5031,10 +5031,18 @@ def structural_carriage_ig(
 
     if int(rrwp_flat.size(0)) == 0 or not bool(active.any()):
         return None
+    # Pin the integration variable + all index/mask tensors to the MODEL's device. The slot indices
+    # (row_src) and the active mask are built with torch.arange / bool ops on CPU, so on GPU they must
+    # be moved or every downstream op (delta multiply, advanced indexing, index_add) hits a
+    # cross-device error. (_run_with_hooks re-homes the override to the raw tensor's device itself.)
+    device = h_clean.device
+    rrwp_flat = rrwp_flat.to(device)
+    row_src = row_src.to(device=device, dtype=torch.long)
+    active = active.to(device=device)
     base = rrwp_flat.mean(dim=0, keepdim=True).expand_as(rrwp_flat)  # graph-mean RRWP baseline
     delta = (rrwp_flat - base) * active.to(rrwp_flat.dtype).unsqueeze(-1)  # perturb active slots only
     active_idx = active.nonzero(as_tuple=False).reshape(-1)
-    add_src = row_src.to(h_clean.device)[active_idx]
+    add_src = row_src[active_idx]
     y = None if loss_label is None else float(loss_label)
     yhat_clean = float(clean_cache.prediction.reshape(-1)[target_index].detach().cpu().item())
     carriage = h_clean.new_zeros((n, n))
