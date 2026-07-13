@@ -196,18 +196,20 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "name": "symbolic_vs_structural_carriage",
             "run_symbolic_structural_carriage": True,
             "run_structural_carriage_ig": True,
-            # Base = the "full" tier (presets below downscale for medium/pilot/quick, high sits between
-            # medium and full). Step 7 was historically stuck at 6 graphs; scaled to match the other
-            # steps so the bootstrap CIs on the carriage/reach/agreement figures are tight.
-            "symbolic_structural_sample_graphs": 48,
+            # Base = the "full" tier (presets below downscale). Step 7 was historically stuck at 6
+            # graphs; scaled up for tighter bootstrap CIs, but bounded by the per-carrier IG loop
+            # (~n x ig_steps backward/graph; batched VJP is not vmap-safe through the hooked forward),
+            # so full = 24 graphs (~1.2h), high = 16 (~0.8h) -- still 3-4x the old CIs, and reliable.
+            "symbolic_structural_sample_graphs": 24,
             "symbolic_structural_max_sources": "all",
             "symbolic_structural_min_distance": 1,
             "symbolic_structural_rrwp_channel_start": 2,
             "symbolic_structural_rrwp_replacement": "donor",
             "symbolic_structural_donor_samples": 8,
-            # Exact IG completeness (Sum C == yhat_clean - yhat_base ~ 0) certifies IG as the anchor and
-            # makes the beneficial loss-carriage exact; ~2x cost, so downscaled presets turn it off.
-            "carriage_readout_ig": True,
+            # readout_ig (re-evaluated readout gradient) is OFF: on ZINC it only moved IG completeness
+            # ~0.32 -> ~0.25 (a distant mean baseline means IG never reaches ~0 here) while ~doubling
+            # cost. Not worth it -- report completeness as an IG-faithfulness number, not a pass/fail.
+            "carriage_readout_ig": False,
             "reach_far_distance_tau": 3,
             # Off-manifold RRWP-zeroing ablations are DISABLED by default: zeroing long RRWP channels
             # pushes the model off its training distribution, so the resulting MAE change conflates
@@ -365,7 +367,7 @@ ANALYSIS_PRESET_OVERRIDES: dict[str, dict[str, Any]] = {
             },
             "5": {"sample_graphs": 16, "max_far_pairs_per_graph": 4, "interaction_pairs": 128},
             "6": {"sample_graphs": 24, "donors": 4, "max_distance": 8, "resamplers": ["matched", "marginal"], "splits": ["test", "train"]},
-            "7": {"symbolic_structural_sample_graphs": 16, "symbolic_structural_donor_samples": 4, "carriage_readout_ig": False},
+            "7": {"symbolic_structural_sample_graphs": 10, "symbolic_structural_donor_samples": 4, "carriage_readout_ig": False},
         },
     },
     "high": {
@@ -403,7 +405,7 @@ ANALYSIS_PRESET_OVERRIDES: dict[str, dict[str, Any]] = {
             },
             "5": {"sample_graphs": 48, "max_far_pairs_per_graph": 12, "interaction_pairs": 256},
             "6": {"sample_graphs": 48, "donors": 6, "max_distance": 8, "splits": ["test", "train"]},
-            "7": {"symbolic_structural_sample_graphs": 32, "symbolic_structural_donor_samples": 6, "carriage_readout_ig": True},
+            "7": {"symbolic_structural_sample_graphs": 16, "symbolic_structural_donor_samples": 6, "carriage_readout_ig": False},
         },
     },
 }

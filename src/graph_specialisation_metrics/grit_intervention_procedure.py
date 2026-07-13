@@ -5358,7 +5358,11 @@ def symbolic_structural_carriage_rows(
         if bool(cfg_sub.get("run_structural_carriage_ig", True)):
             ig_steps = int(config["perturbation"].get("ig_steps", 32))
             struct_readout_ig = carriage_ig_uses_readout_ig(config) if readout_ig is None else bool(readout_ig)
-            struct_bvjp = carriage_ig_uses_batched_vjp(config)
+            # Batched VJP is OFF by default for structural carriage: it runs through _run_with_hooks
+            # (edge_attr_override), whose hooked forward is NOT vmap-compatible on real GRIT
+            # (is_grads_batched raised, freeing the graph and breaking the run). The per-carrier loop
+            # is the proven path. Opt back in via steps.7.structural_batched_vjp only after validating.
+            struct_bvjp = bool(cfg_sub.get("structural_batched_vjp", False))
             for tkind, fac in (("node", "node_rrwp_ig"), ("pair", "pair_rrwp_ig")):
                 res = structural_carriage_ig(adapter, graph, target_kind=tkind, steps=ig_steps, readout_ig=struct_readout_ig, batched_vjp=struct_bvjp)
                 if res is None:
