@@ -5049,45 +5049,58 @@ def structural_carriage_ig(
     carriage = h_clean.new_zeros((n, n))
     yhat_endpoint = None
     use_batched_vjp = bool(batched_vjp)
-    for alpha_idx in range(1, int(steps) + 1):
-        alpha = float(alpha_idx) / float(steps)
-        point = (base + alpha * delta).detach().requires_grad_(True)
-        cache = adapter._run_with_hooks(
+    batched_error: Optional[str] = None
+
+    def _forward_step(alpha_val: float):
+        """Fresh perturbed forward -> (leaf point, pred_value, carrier_scores). Re-runnable, so a
+        failed batched pass (which may free the graph) can be safely retried for the loop path."""
+        pt = (base + alpha_val * delta).detach().requires_grad_(True)
+        cache_ = adapter._run_with_hooks(
             graph, capture_attention=False, capture_channels=False,
-            capture_layer_inputs=False, capture_layer_outputs=False, **to_override(point),
+            capture_layer_inputs=False, capture_layer_outputs=False, **to_override(pt),
         )
-        h = getattr(cache, "final_node_states", None)
-        if not isinstance(h, torch.Tensor):
+        h_ = getattr(cache_, "final_node_states", None)
+        if not isinstance(h_, torch.Tensor):
             return None
-        pred_a = cache.prediction.reshape(-1)[target_index]
-        if alpha_idx == int(steps):
-            yhat_endpoint = float(pred_a.detach().cpu().item())
+        pred_ = cache_.prediction.reshape(-1)[target_index]
         if readout_ig:
-            (g_a,) = torch.autograd.grad(pred_a, h, retain_graph=True, create_graph=False)
-            g_step = g_a.detach()
+            (g_a,) = torch.autograd.grad(pred_, h_, retain_graph=True, create_graph=False)
+            g_step_ = g_a.detach()
         else:
-            g_step = g
+            g_step_ = g
         if y is not None:
-            g_step = g_step * (1.0 if float(pred_a.detach().cpu().item()) >= y else -1.0)
-        carrier_scores = (h * g_step).sum(dim=-1)
+            g_step_ = g_step_ * (1.0 if float(pred_.detach().cpu().item()) >= y else -1.0)
+        return pt, float(pred_.detach().cpu().item()), (h_ * g_step_).sum(dim=-1)
+
+    for alpha_idx in range(1, int(steps) + 1):
+        step_out = _forward_step(float(alpha_idx) / float(steps))
+        if step_out is None:
+            return None
+        point, pred_val, carrier_scores = step_out
+        if alpha_idx == int(steps):
+            yhat_endpoint = pred_val
         if use_batched_vjp:
             try:
-                # One batched VJP computes d carrier_scores[i] / d point for ALL carriers i at once
-                # (is_grads_batched), replacing the O(n) autograd.grad loop -- the ~n x speedup that
-                # makes the structural IG affordable at high sample sizes. retain_graph=True so the
-                # per-carrier loop below can still traverse the graph if the batched pass fails (some
-                # GRIT ops are not vmap-compatible); catch EVERYTHING so a batched failure can never
-                # crash the probe -- it just falls back to the (slower but proven) loop.
+                # ONE batched VJP (is_grads_batched) computes d carrier_scores[i] / d point for ALL
+                # carriers at once -- the ~n x speedup (trades RAM for time; ideal when RAM is spare).
+                # retain_graph=False frees it on success; on ANY failure we record the error and
+                # REBUILD a fresh forward graph before the per-carrier loop, so a batched failure can
+                # never corrupt the fallback ("backward through the graph a second time").
                 eye = torch.eye(n, device=carrier_scores.device, dtype=carrier_scores.dtype)
                 (bgrad,) = torch.autograd.grad(
                     carrier_scores, point, grad_outputs=eye, is_grads_batched=True,
-                    retain_graph=True, create_graph=False,
+                    retain_graph=False, create_graph=False,
                 )
                 per_slot = (bgrad.detach() * delta).sum(dim=-1)          # [n_carrier, S]
                 carriage.index_add_(1, add_src, per_slot[:, active_idx])  # accumulate active slots by source
                 continue
-            except Exception:  # noqa: BLE001 -- any batched-grad failure -> proven per-carrier loop
+            except Exception as exc:  # noqa: BLE001
+                batched_error = f"{type(exc).__name__}: {exc}"
                 use_batched_vjp = False
+                step_out = _forward_step(float(alpha_idx) / float(steps))  # fresh graph for the loop
+                if step_out is None:
+                    return None
+                point, _pv, carrier_scores = step_out
         for i in range(n):
             (grad,) = torch.autograd.grad(carrier_scores[i], point, retain_graph=(i < n - 1), create_graph=False)
             per_row = (grad.detach() * delta).sum(dim=-1)
@@ -5114,6 +5127,8 @@ def structural_carriage_ig(
         "yhat_endpoint": yhat_endpoint,
         "reconstruction_sum": recon,
         "completeness_target": target,
+        "batched_used": bool(use_batched_vjp),
+        "batched_error": batched_error,
     }
 
 
@@ -5358,11 +5373,12 @@ def symbolic_structural_carriage_rows(
         if bool(cfg_sub.get("run_structural_carriage_ig", True)):
             ig_steps = int(config["perturbation"].get("ig_steps", 32))
             struct_readout_ig = carriage_ig_uses_readout_ig(config) if readout_ig is None else bool(readout_ig)
-            # Batched VJP is OFF by default for structural carriage: it runs through _run_with_hooks
-            # (edge_attr_override), whose hooked forward is NOT vmap-compatible on real GRIT
-            # (is_grads_batched raised, freeing the graph and breaking the run). The per-carrier loop
-            # is the proven path. Opt back in via steps.7.structural_batched_vjp only after validating.
-            struct_bvjp = bool(cfg_sub.get("structural_batched_vjp", False))
+            # Batched VJP is ATTEMPTED by default (trades spare RAM for a ~n x speedup). It runs
+            # through the hooked forward, which may not be vmap-compatible on GRIT -- now SAFE: on any
+            # failure structural_carriage_ig rebuilds a fresh graph, uses the per-carrier loop, and
+            # reports batched_error, so the log shows whether batching actually engaged. Set
+            # steps.7.structural_batched_vjp=false to skip the attempt entirely.
+            struct_bvjp = bool(cfg_sub.get("structural_batched_vjp", True))
             for tkind, fac in (("node", "node_rrwp_ig"), ("pair", "pair_rrwp_ig")):
                 res = structural_carriage_ig(adapter, graph, target_kind=tkind, steps=ig_steps, readout_ig=struct_readout_ig, batched_vjp=struct_bvjp)
                 if res is None:
@@ -5376,6 +5392,10 @@ def symbolic_structural_carriage_rows(
                         f"keys={sorted(k for k, v in extras.items() if v is not None)[:12]}"
                     )
                     continue
+                if res.get("batched_error") and not getattr(symbolic_structural_carriage_rows, "_batched_warned", False):
+                    progress(f"  structural IG batched VJP unavailable -> per-carrier fallback (safe, slower) "
+                             f"[{res['batched_error']}]; set steps.7.structural_batched_vjp=false to skip the attempt")
+                    symbolic_structural_carriage_rows._batched_warned = True  # log once per process
                 if completeness_out is not None and res.get("completeness_target") is not None:
                     rec = float(res["reconstruction_sum"])
                     tgt = float(res["completeness_target"])
