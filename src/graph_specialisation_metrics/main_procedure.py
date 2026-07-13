@@ -367,7 +367,8 @@ ANALYSIS_PRESET_OVERRIDES: dict[str, dict[str, Any]] = {
             },
             "5": {"sample_graphs": 16, "max_far_pairs_per_graph": 4, "interaction_pairs": 128},
             "6": {"sample_graphs": 24, "donors": 4, "max_distance": 8, "resamplers": ["matched", "marginal"], "splits": ["test", "train"]},
-            "7": {"symbolic_structural_sample_graphs": 10, "symbolic_structural_donor_samples": 4, "carriage_readout_ig": False},
+            "7": {"symbolic_structural_sample_graphs": 10, "symbolic_structural_donor_samples": 4,
+                  "carriage_readout_ig": False, "run_structural_carriage_ig": False},
         },
     },
     "high": {
@@ -405,7 +406,13 @@ ANALYSIS_PRESET_OVERRIDES: dict[str, dict[str, Any]] = {
             },
             "5": {"sample_graphs": 48, "max_far_pairs_per_graph": 12, "interaction_pairs": 256},
             "6": {"sample_graphs": 48, "donors": 6, "max_distance": 8, "splits": ["test", "train"]},
-            "7": {"symbolic_structural_sample_graphs": 16, "symbolic_structural_donor_samples": 6, "carriage_readout_ig": False},
+            # Structural IG (pair_rrwp_ig/node_rrwp_ig) OFF for high: it can only run the per-carrier
+            # loop (GRIT's forward uses in-place scatter_, which vmap/is_grads_batched cannot batch),
+            # which is the slow path. Content IG (batched, fast) + the pair-RRWP SWAP still give the
+            # content headline and a fast structural signal, so high stays quick with 32 graphs.
+            # full re-enables structural IG for the definitive (slower) run.
+            "7": {"symbolic_structural_sample_graphs": 32, "symbolic_structural_donor_samples": 6,
+                  "carriage_readout_ig": False, "run_structural_carriage_ig": False},
         },
     },
 }
