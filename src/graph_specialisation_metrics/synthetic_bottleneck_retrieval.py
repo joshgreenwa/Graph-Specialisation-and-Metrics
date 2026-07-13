@@ -618,7 +618,14 @@ def default_config() -> dict:
 # ======================================================================================
 IG_FACTORS = ("content_ig", "node_rrwp_ig", "pair_rrwp_ig")
 SWAP_FACTORS = ("content", "node_rrwp", "pair_rrwp")
-CARRIAGE_FACTORS = SWAP_FACTORS + IG_FACTORS
+# Self node-RRWP: the carrier's OWN global-PE fingerprint, decomposed by walk-length r (the scale
+# axis inside a node's node-RRWP). Routed (j != carrier) source-at-distance carriage MISSES this, so
+# it is a separate factor whose x-axis is r, not graph distance. High-r mass = the global structure
+# that local-RRWP truncation would remove -- the mechanism behind 1hop+global RRWP ~ dense.
+SELF_IG_FACTOR = "node_rrwp_self_ig"
+SELF_SWAP_FACTOR = "node_rrwp_self"
+SELF_FACTORS = (SELF_SWAP_FACTOR, SELF_IG_FACTOR)
+CARRIAGE_FACTORS = SWAP_FACTORS + IG_FACTORS + SELF_FACTORS
 CARRIAGE_MODES = ("functional", "beneficial")
 
 
@@ -752,6 +759,62 @@ def _ig_carriage(model: nn.Module, b1: Batch, factor: str, mode: str, *, start: 
     return c.cpu(), {"recon": float(c.sum().item()), "target": s1 - s0}
 
 
+def _self_node_rrwp_ig(model: nn.Module, b1: Batch, q: int, mode: str, *, steps: int) -> tuple[Tensor, dict]:
+    """Per-walk-length IG carriage of the query carrier's OWN node-RRWP diagonal. Returns c[K] over
+    channels r (graph-mean per-channel baseline); sum_r c telescopes to S(clean_qq) - S(base_qq)."""
+    n = int(b1.x.size(1))
+    K = int(b1.rrwp.size(-1))
+    dev = b1.x.device
+    idx = torch.arange(n, device=dev)
+    rrwp0 = b1.rrwp.detach()
+    diag = rrwp0[0, idx, idx]                       # [n, K]
+    base_q = diag.mean(dim=0)                        # per-channel graph-mean baseline [K]
+    delta_q = diag[q] - base_q                       # [K]
+    c = torch.zeros(K, device=dev)
+    for a in range(1, steps + 1):
+        pt_q = (base_q + (a / steps) * delta_q).detach().requires_grad_(True)
+        r = rrwp0.clone()
+        r[0, q, q, :] = pt_q                         # differentiable index assignment
+        logits = model.head(model.node_states(b1, r))
+        (grad,) = torch.autograd.grad(_readout_scalar(logits, b1, mode), pt_q)
+        c += grad.detach() * delta_q / steps
+    with torch.no_grad():
+        r0 = rrwp0.clone(); r0[0, q, q, :] = base_q
+        s0 = float(_readout_scalar(model.head(model.node_states(b1, r0)), b1, mode).item())
+        s1 = float(_readout_scalar(model.head(model.node_states(b1, rrwp0)), b1, mode).item())
+    return c.cpu(), {"recon": float(c.sum().item()), "target": s1 - s0}
+
+
+def _self_node_rrwp_swap(model: nn.Module, b1: Batch, q: int, mode: str, *, replacement: str,
+                         donors: int, rng: np.random.Generator) -> Tensor:
+    """Per-walk-length finite-swap carriage of the query carrier's OWN node-RRWP (one channel at a
+    time; frozen readout gradient). Returns c[K] over channels r."""
+    h_clean, g = _readout_gradient(model, b1, mode)
+    n = int(b1.x.size(1))
+    K = int(b1.rrwp.size(-1))
+    idx = torch.arange(n, device=b1.x.device)
+    rrwp0 = b1.rrwp
+    diag = rrwp0[0, idx, idx]
+    base_q = diag.mean(dim=0)
+    k = donors if replacement == "donor" else 1
+    c = torch.zeros(K)
+    for r_ch in range(K):
+        acc, got = 0.0, 0
+        for _ in range(max(1, k)):
+            r = rrwp0.clone()
+            if replacement == "donor":
+                r[0, q, q, r_ch] = rrwp0[0, _draw_donor(rng, n, q), _draw_donor(rng, n, q), r_ch]
+            elif replacement == "mean":
+                r[0, q, q, r_ch] = base_q[r_ch]
+            else:
+                r[0, q, q, r_ch] = 0.0
+            h = model.node_states(b1, r).detach()
+            acc += float((g * (h_clean - h)).sum().item())
+            got += 1
+        c[r_ch] = acc / max(got, 1)
+    return c
+
+
 def carriage_rows_for_graph(model: nn.Module, model_name: str, b1: Batch, gid: str, *,
                             start: int, ig_steps: int, replacement: str, donors: int,
                             min_distance: int, rng: np.random.Generator,
@@ -781,6 +844,17 @@ def carriage_rows_for_graph(model: nn.Module, model_name: str, b1: Batch, gid: s
                 "effect_signed": v, "effect_abs": abs(v),
             })
 
+    def emit_self(factor: str, mode: str, c: Tensor) -> None:
+        # Per-walk-length rows for the carrier's OWN node-RRWP: x-axis is the channel r (scale),
+        # stored in ``distance`` so the by-scale line plots work; ``scale`` is explicit.
+        for r_ch in range(int(c.numel())):
+            v = float(c[r_ch].item())
+            rows.append({
+                "model": model_name, "graph_id": gid, "carrier": q, "source": q,
+                "distance": int(r_ch), "scale": int(r_ch), "is_target": 0,
+                "factor": factor, "mode": mode, "effect_signed": v, "effect_abs": abs(v),
+            })
+
     for mode in CARRIAGE_MODES:
         for factor in SWAP_FACTORS:
             emit(factor, mode, _swap_carriage(model, b1, factor, mode, start=start,
@@ -791,6 +865,14 @@ def carriage_rows_for_graph(model: nn.Module, model_name: str, b1: Batch, gid: s
             if completeness_out is not None and math.isfinite(comp["target"]):
                 completeness_out.append({"model": model_name, "graph_id": gid, "factor": factor,
                                          "mode": mode, **comp, "abs_error": abs(comp["recon"] - comp["target"])})
+        # self node-RRWP, decomposed by walk-length r (IG + swap)
+        c_self_ig, comp_self = _self_node_rrwp_ig(model, b1, q, mode, steps=ig_steps)
+        emit_self(SELF_IG_FACTOR, mode, c_self_ig)
+        if completeness_out is not None and math.isfinite(comp_self["target"]):
+            completeness_out.append({"model": model_name, "graph_id": gid, "factor": SELF_IG_FACTOR,
+                                     "mode": mode, **comp_self, "abs_error": abs(comp_self["recon"] - comp_self["target"])})
+        emit_self(SELF_SWAP_FACTOR, mode,
+                  _self_node_rrwp_swap(model, b1, q, mode, replacement=replacement, donors=donors, rng=rng))
     return rows
 
 
