@@ -4939,6 +4939,46 @@ def _emit_carriage_rows(
             rows.append({**base, "effect_abs": abs(bval), "effect_signed": bval, "mode": "beneficial"})
 
 
+def _emit_scale_rows(rows: list[dict[str, Any]], model: ModelRun, gid: str, per_channel: torch.Tensor,
+                     *, factor: str, mode: str) -> None:
+    """By-walk-length (scale) marginal: one row per RRWP channel r (aggregated over sources), so the
+    ``scale`` column holds r. Which structural scales the graph collectively uses."""
+    v = per_channel.detach().cpu().reshape(-1)
+    for r in range(int(v.numel())):
+        val = float(v[r].item())
+        rows.append({"model": model.name, "role": model.role, "graph_id": gid, "source": "",
+                     "carrier": "", "distance": "", "scale": int(r), "factor": factor, "mode": mode,
+                     "effect_abs": abs(val), "effect_signed": val})
+
+
+def _emit_joint_rows(rows: list[dict[str, Any]], model: ModelRun, gid: str, carriage_joint: torch.Tensor,
+                     dist: torch.Tensor, *, factor: str, mode: str, min_distance: int) -> None:
+    """(distance x walk-length) joint: aggregate carriage_joint[carrier, source, r] by (hop distance,
+    channel r). One row per (distance, scale) -- the heatmap data."""
+    cj = carriage_joint.detach().cpu()
+    n = int(cj.size(0))
+    k = int(cj.size(-1))
+    d_np = dist.detach().cpu()
+    acc: dict[tuple[int, int], list[float]] = {}
+    for carrier in range(n):
+        for source in range(n):
+            if carrier == source:
+                continue
+            d = float(d_np[carrier, source].item())
+            if not math.isfinite(d) or d < float(min_distance):
+                continue
+            dd = int(round(d))
+            for r in range(k):
+                a = acc.setdefault((dd, r), [0.0, 0.0])
+                a[0] += float(cj[carrier, source, r].item())
+                a[1] += 1.0
+    for (dd, r), (s, cnt) in sorted(acc.items()):
+        val = s / max(cnt, 1.0)
+        rows.append({"model": model.name, "role": model.role, "graph_id": gid, "source": "",
+                     "carrier": "", "distance": int(dd), "scale": int(r), "factor": factor, "mode": mode,
+                     "effect_abs": abs(val), "effect_signed": val})
+
+
 def structural_carriage_ig(
     adapter: Any,
     graph: Any,
@@ -5047,6 +5087,12 @@ def structural_carriage_ig(
     y = None if loss_label is None else float(loss_label)
     yhat_clean = float(clean_cache.prediction.reshape(-1)[target_index].detach().cpu().item())
     carriage = h_clean.new_zeros((n, n))
+    # Channel-resolved accumulators for the by-walk-length (scale) and (distance x walk-length) joint
+    # decompositions of RRWP carriage. carriage_scale[carrier, r] = sum over sources; carriage_joint
+    # [carrier, source, r] keeps both axes (the existing carriage = carriage_joint.sum over r).
+    k_ig = int(rrwp_flat.size(-1))
+    carriage_scale = h_clean.new_zeros((n, k_ig))
+    carriage_joint = h_clean.new_zeros((n, n, k_ig))
     yhat_endpoint = None
     use_batched_vjp = bool(batched_vjp)
     batched_error: Optional[str] = None
@@ -5091,8 +5137,11 @@ def structural_carriage_ig(
                     carrier_scores, point, grad_outputs=eye, is_grads_batched=True,
                     retain_graph=False, create_graph=False,
                 )
-                per_slot = (bgrad.detach() * delta).sum(dim=-1)          # [n_carrier, S]
+                per_slot_ch = bgrad.detach() * delta                     # [n_carrier, S, K]
+                per_slot = per_slot_ch.sum(dim=-1)                        # [n_carrier, S]
                 carriage.index_add_(1, add_src, per_slot[:, active_idx])  # accumulate active slots by source
+                carriage_scale += per_slot_ch[:, active_idx].sum(dim=1)   # sum over sources -> [n_carrier, K]
+                carriage_joint.index_add_(1, add_src, per_slot_ch[:, active_idx])  # [n_carrier, source, K]
                 continue
             except Exception as exc:  # noqa: BLE001
                 batched_error = f"{type(exc).__name__}: {exc}"
@@ -5103,9 +5152,14 @@ def structural_carriage_ig(
                 point, _pv, carrier_scores = step_out
         for i in range(n):
             (grad,) = torch.autograd.grad(carrier_scores[i], point, retain_graph=(i < n - 1), create_graph=False)
-            per_row = (grad.detach() * delta).sum(dim=-1)
-            carriage[i].index_add_(0, add_src, per_row[active_idx].to(carriage.device))
+            per_row_ch = (grad.detach() * delta).to(carriage.device)     # [S, K]
+            active_ch = per_row_ch[active_idx]                           # [S_active, K]
+            carriage[i].index_add_(0, add_src, active_ch.sum(dim=-1))
+            carriage_scale[i] += active_ch.sum(dim=0)                    # [K]
+            carriage_joint[i].index_add_(0, add_src, active_ch)          # [source, K]
     carriage = carriage / float(steps)
+    carriage_scale = carriage_scale / float(steps)
+    carriage_joint = carriage_joint / float(steps)
     # completeness: sum carriage telescopes to y_hat(endpoint) - y_hat(base), where the endpoint is
     # the alpha=1 point (active slots at clean, others at baseline) -- exact with readout_ig.
     yhat_base = None
@@ -5121,6 +5175,8 @@ def structural_carriage_ig(
     target = None if (yhat_base is None or yhat_endpoint is None) else (yhat_endpoint - yhat_base)
     return {
         "carriage": carriage.detach().cpu(),
+        "carriage_scale": carriage_scale.detach().cpu(),   # [carrier, r] by-walk-length marginal
+        "carriage_joint": carriage_joint.detach().cpu(),   # [carrier, source, r] distance x scale
         "target_kind": target_kind,
         "yhat_clean": yhat_clean,
         "yhat_base": yhat_base,
@@ -5406,12 +5462,21 @@ def symbolic_structural_carriage_rows(
                 c_f = res["carriage"]
                 for j in sources:
                     _emit_carriage_rows(rows, model, gid, j, c_f[:, int(j)], dist, min_distance=min_distance, factor=fac, mode="functional")
+                # by-walk-length (scale) + (distance x scale) joint marginals -- same IG pass
+                scale_fac = f"{tkind}_rrwp_scale_ig"
+                joint_fac = f"{tkind}_rrwp_joint_ig"
+                if isinstance(res.get("carriage_scale"), torch.Tensor):
+                    _emit_scale_rows(rows, model, gid, res["carriage_scale"].sum(dim=0), factor=scale_fac, mode="functional")
+                    _emit_joint_rows(rows, model, gid, res["carriage_joint"], dist, factor=joint_fac, mode="functional", min_distance=min_distance)
                 if yv is not None:
                     resb = structural_carriage_ig(adapter, graph, target_kind=tkind, steps=ig_steps, readout_ig=struct_readout_ig, loss_label=yv, batched_vjp=struct_bvjp)
                     if resb is not None:
                         c_b = resb["carriage"]
                         for j in sources:
                             _emit_carriage_rows(rows, model, gid, j, c_b[:, int(j)], dist, min_distance=min_distance, factor=fac, mode="beneficial")
+                        if isinstance(resb.get("carriage_scale"), torch.Tensor):
+                            _emit_scale_rows(rows, model, gid, resb["carriage_scale"].sum(dim=0), factor=scale_fac, mode="beneficial")
+                            _emit_joint_rows(rows, model, gid, resb["carriage_joint"], dist, factor=joint_fac, mode="beneficial", min_distance=min_distance)
 
     # --- content carriage via the IG method (HEADLINE; same estimator/convention as structural IG) ---
     # Functional = carriage_ig; beneficial = carriage_ig(loss_label=yv) -> the proper integrated
@@ -5582,6 +5647,8 @@ def run_symbolic_structural_probe(models: Sequence[ModelRun], artifact_root: Pat
         ("funcbenef_carriage", lambda: render_carriage_functional_vs_beneficial(rows, artifact_root, dpi=dpi, completeness_note=completeness_note)),
         ("reach_summary", lambda: render_step7_reach_summary(rows, artifact_root, dpi=dpi, tau=reach_tau)),
         ("ig_vs_swap_agreement", lambda: render_step7_method_agreement(rows, artifact_root, dpi=dpi, completeness_note=completeness_note)),
+        ("rrwp_by_scale", lambda: render_symbolic_structural_by_scale(rows, artifact_root, dpi=dpi)),
+        ("rrwp_joint", lambda: render_symbolic_structural_joint(rows, artifact_root, dpi=dpi)),
     ]
     for name, fn in renders:
         try:
@@ -6269,6 +6336,89 @@ def render_symbolic_structural_by_distance(rows: Sequence[Mapping[str, Any]], ar
         fig_con.savefig(figures / "step7_symbolic_global_vs_local_rrwp_contrast.png", dpi=dpi)
         fig_con.savefig(figures / "step7_symbolic_global_vs_local_rrwp_contrast.pdf")
         plt.close(fig_con)
+
+
+def render_symbolic_structural_by_scale(rows: Sequence[Mapping[str, Any]], artifact_root: Path, *, dpi: int) -> None:
+    """RRWP carriage by WALK-LENGTH r (scale marginal): which structural scales the graph collectively
+    uses. High-r mass = the global structure local-RRWP truncation removes. Node + pair, IG + swap,
+    functional + beneficial. Mirrors the synthetic bottleneck-retrieval ``carriage_rrwp_by_scale``."""
+    def profile(factor: str, mode: str, model: str) -> tuple[list[int], list[float]]:
+        by_r: dict[int, list[float]] = {}
+        for r in rows:
+            if str(r.get("factor")) != factor or str(r.get("mode")) != mode or str(r.get("model")) != model:
+                continue
+            s = r.get("scale")
+            if s in (None, ""):
+                continue
+            val = safe_float(r.get("effect_abs") if mode == "functional" else r.get("effect_signed"))
+            if math.isfinite(val):
+                by_r.setdefault(int(float(s)), []).append(val)
+        rs = sorted(by_r)
+        return rs, [float(np.mean(by_r[x])) for x in rs]
+
+    models = ordered_model_names([str(r.get("model")) for r in rows if r.get("scale") not in (None, "")])
+    if not models:
+        return
+    figures = ensure_dir(artifact_root / "figures")
+    fig, axes = plt.subplots(2, 2, figsize=(12, 8.5), constrained_layout=True)
+    for col, (kind, ktitle) in enumerate([("node", "Node RRWP"), ("pair", "Pair RRWP")]):
+        for ri_, mode in enumerate(("functional", "beneficial")):
+            ax = axes[ri_][col]
+            for model in models:
+                rs, ys = profile(f"{kind}_rrwp_scale_ig", mode, model)
+                if rs:
+                    ax.plot(rs, ys, marker="o", linewidth=1.8, label=f"{model_label(model)} (IG)")
+                rs2, ys2 = profile(f"{kind}_rrwp_scale", mode, model)
+                if rs2:
+                    ax.plot(rs2, ys2, marker="x", ls="--", alpha=0.55, label=f"{model_label(model)} (swap)")
+            ax.axhline(0, color="gray", ls=":", lw=0.7)
+            ax.set_title(f"{ktitle} -- {mode}")
+            ax.set_xlabel("RRWP walk-length r (structural scale)")
+            ax.set_ylabel("|carriage|" if mode == "functional" else "beneficial (signed<0=good)")
+            ax.grid(alpha=0.3)
+            ax.legend(frameon=False, fontsize=7)
+    fig.suptitle("RRWP carriage by walk-length: which structural scales the focal node collectively uses")
+    fig.savefig(figures / "step7_rrwp_carriage_by_scale.png", dpi=dpi)
+    fig.savefig(figures / "step7_rrwp_carriage_by_scale.pdf")
+    plt.close(fig)
+
+
+def render_symbolic_structural_joint(rows: Sequence[Mapping[str, Any]], artifact_root: Path, *, dpi: int) -> None:
+    """Node-RRWP (distance x walk-length) JOINT heatmap, functional, per model."""
+    models = ordered_model_names([str(r.get("model")) for r in rows if str(r.get("factor")) == "node_rrwp_joint_ig"])
+    if not models:
+        return
+    figures = ensure_dir(artifact_root / "figures")
+    fig, axes = plt.subplots(1, len(models), figsize=(5.0 * len(models), 4.4), squeeze=False, constrained_layout=True)
+    for mi, model in enumerate(models):
+        ax = axes[0][mi]
+        cells: dict[tuple[int, int], list[float]] = {}
+        for r in rows:
+            if str(r.get("factor")) != "node_rrwp_joint_ig" or str(r.get("mode")) != "functional" or str(r.get("model")) != model:
+                continue
+            d, s = r.get("distance"), r.get("scale")
+            if d in (None, "") or s in (None, ""):
+                continue
+            cells.setdefault((int(float(d)), int(float(s))), []).append(safe_float(r.get("effect_abs")))
+        if cells:
+            ds = sorted({d for d, _ in cells})
+            rs = sorted({s for _, s in cells})
+            grid = np.zeros((len(ds), len(rs)))
+            di = {d: i for i, d in enumerate(ds)}
+            ri = {s: i for i, s in enumerate(rs)}
+            for (d, s), vals in cells.items():
+                grid[di[d], ri[s]] = float(np.mean(vals))
+            im = ax.imshow(grid, aspect="auto", origin="lower", cmap="viridis")
+            ax.set_xticks(range(len(rs))); ax.set_xticklabels(rs)
+            ax.set_yticks(range(len(ds))); ax.set_yticklabels(ds)
+            fig.colorbar(im, ax=ax, shrink=0.85, label="mean |carriage|")
+        ax.set_title(model_label(model))
+        ax.set_xlabel("walk-length r")
+        ax.set_ylabel("source distance d")
+    fig.suptitle("Node-RRWP carriage joint: distance x walk-length (functional)")
+    fig.savefig(figures / "step7_node_rrwp_carriage_joint.png", dpi=dpi)
+    fig.savefig(figures / "step7_node_rrwp_carriage_joint.pdf")
+    plt.close(fig)
 
 
 def rrwp_distance_ablation_types(raw: Any) -> list[str]:
