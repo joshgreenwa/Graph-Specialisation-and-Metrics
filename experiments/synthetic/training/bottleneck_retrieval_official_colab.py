@@ -141,6 +141,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     ap.add_argument("--skip-sweep", action="store_true")
     ap.add_argument("--force-retrain", action="store_true")
     ap.add_argument("--force-carriage", action="store_true", help="recompute carriage even if cached cells exist on Drive")
+    ap.add_argument("--phase", choices=["all", "train", "analyze"], default="all", help="train=GPU pass (cache all models to Drive); analyze=load models + compute carriage/figures; all=both")
     ap.add_argument("--carriage-graphs", nargs="+", default=["dumbbell", "expander", "wellconnected"])
     ap.add_argument("--carriage-target-distance", type=int, default=3)
     ap.add_argument("--carriage-graphs-count", type=int, default=12)
@@ -197,6 +198,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         inner.append("--force-retrain")
     if args.force_carriage:
         inner.append("--force-carriage")
+    inner += ["--phase", str(args.phase)]
     if args.fast_dev_run:
         inner.append("--fast-dev-run")
 

@@ -416,6 +416,7 @@ def train_one(
     seed: int,
     ckpt_dir: Path | None = None,
     force_retrain: bool = False,
+    load_only: bool = False,
 ) -> tuple[nn.Module, dict]:
     torch.manual_seed(seed)
     in_dim = 2 * cfg["key_vocab"] + cfg["value_vocab"] + 2
@@ -440,6 +441,11 @@ def train_one(
             meta = payload.get("meta", {})
             meta["loaded_from_cache"] = True
             return model, meta
+    if load_only:  # analyze phase: never train; the model must already be on Drive
+        raise RuntimeError(
+            f"[analyze] no pretrained checkpoint for {model_name}/{graph} (seed {seed}) at {ckpt_path}. "
+            "Run the train phase first (--phase train)."
+        )
 
     opt = torch.optim.Adam(model.parameters(), lr=cfg["lr"])
     sample = lambda s: make_batch(
@@ -855,9 +861,11 @@ def compute_carriage_rows(model: nn.Module, model_name: str, graph: str, cfg: di
 
 def collect_carriage(cfg: dict, device: torch.device, out_dir: Path, *, graphs: Sequence[str],
                      models: Sequence[str], td: int, train_fn, ckpt_dir: Path | None,
-                     force_retrain: bool, force_carriage: bool) -> tuple[list[dict], list[dict], list[dict]]:
+                     force_retrain: bool, force_carriage: bool,
+                     load_only: bool = False) -> tuple[list[dict], list[dict], list[dict]]:
     """Shared model-agnostic carriage driver: per cell, load-or-train the model (ckpt cache) then
-    load-or-compute its carriage rows (carriage cache). ``train_fn`` supplies the model backend."""
+    load-or-compute its carriage rows (carriage cache). ``train_fn`` supplies the model backend.
+    ``load_only`` (analyze phase) requires the model to already be cached on Drive."""
     cache_dir = Path(out_dir) / "carriage_cache"
     rows: list[dict] = []
     completeness: list[dict] = []
@@ -866,7 +874,8 @@ def collect_carriage(cfg: dict, device: torch.device, out_dir: Path, *, graphs: 
         run_cfg = {**cfg, "rank": 1, "addressing": "content", "target_distance": td}
         for model_name in models:
             model, res = train_fn(model_name=model_name, graph=graph, cfg=run_cfg, device=device,
-                                  seed=0, ckpt_dir=ckpt_dir, force_retrain=force_retrain)
+                                  seed=0, ckpt_dir=ckpt_dir, force_retrain=force_retrain,
+                                  load_only=load_only)
             model.eval()
             accs.append({"graph": graph, "model": model_name, "val_acc": res.get("val_acc"),
                          "train_acc": res.get("train_acc"),
@@ -882,13 +891,32 @@ def collect_carriage(cfg: dict, device: torch.device, out_dir: Path, *, graphs: 
     return rows, completeness, accs
 
 
+def train_carriage_models(cfg: dict, device: torch.device, ckpt_dir: Path, *, train_fn,
+                          force_retrain: bool = False) -> int:
+    """Train + cache (to Drive) every model the carriage suite will need (seed 0, rank 1, content,
+    at the planted target distance). Used by the ``--phase train`` GPU pass."""
+    td = int(cfg.get("carriage_target_distance") or cfg.get("target_distance") or 3)
+    graphs = list(cfg.get("carriage_graphs") or cfg.get("graphs") or ["dumbbell"])
+    n = 0
+    for graph in graphs:
+        run_cfg = {**cfg, "rank": 1, "addressing": "content", "target_distance": td}
+        for model_name in cfg["models"]:
+            _, res = train_fn(model_name=model_name, graph=graph, cfg=run_cfg, device=device,
+                              seed=0, ckpt_dir=ckpt_dir, force_retrain=force_retrain)
+            n += 1
+            print(f"  [train carriage {graph:13s} {model_name:11s}] val={res.get('val_acc'):.3f} "
+                  f"({'cache' if res.get('loaded_from_cache') else 'trained'})", flush=True)
+    return n
+
+
 def run_carriage_suite(cfg: dict, device: torch.device, out_dir: Path, *,
                        ckpt_dir: Path | None = None, force_retrain: bool = False,
-                       force_carriage: bool = False) -> dict:
+                       force_carriage: bool = False, load_only: bool = False) -> dict:
     """Train (cached) the models on each carriage graph at the planted target distance, then compute
     the full symbolic/structural x swap/IG x functional/beneficial carriage suite and render figures.
     Both the trained models and the per-cell carriage rows are cached under ``out_dir`` (Drive), so a
-    restarted runtime reloads everything and only regenerates the (cheap) figures."""
+    restarted runtime reloads everything and only regenerates the (cheap) figures. ``load_only``
+    (analyze phase) requires the models to already be trained on Drive."""
     td = int(cfg.get("carriage_target_distance") or cfg.get("target_distance") or 3)
     graphs = list(cfg.get("carriage_graphs") or cfg.get("graphs") or ["dumbbell"])
     models = list(cfg.get("models") or ["dense", "1hop"])
@@ -901,6 +929,7 @@ def run_carriage_suite(cfg: dict, device: torch.device, out_dir: Path, *,
     rows, completeness, accs = collect_carriage(
         cfg, device, out_dir, graphs=graphs, models=models, td=td, train_fn=train_one,
         ckpt_dir=ckpt_dir, force_retrain=force_retrain, force_carriage=force_carriage,
+        load_only=load_only,
     )
     out_dir.mkdir(parents=True, exist_ok=True)
     payload = {"config": {"target_distance": td, "graphs": graphs, "models": models,
@@ -1105,6 +1134,9 @@ def main(argv: Sequence[str] | None = None) -> dict:
     ap.add_argument("--donor-samples", type=int, default=None)
     ap.add_argument("--force-carriage", action="store_true", help="recompute carriage even if cached cells exist")
     ap.add_argument("--no-drive", action="store_true", help="do not auto-redirect the out-dir onto Google Drive in Colab")
+    ap.add_argument("--phase", choices=["all", "train", "analyze"], default="all",
+                    help="train = GPU pass, train+cache all models to Drive; analyze = load pretrained models "
+                         "from Drive and compute carriage+figures (never trains); all = both in one run")
     ap.add_argument("--fast-dev-run", action="store_true")
     ap.add_argument("--device", default="auto")
     args = ap.parse_args(argv)
@@ -1136,27 +1168,43 @@ def main(argv: Sequence[str] | None = None) -> dict:
     ckpt_dir = out_dir / "checkpoints"
     print(f"[persist] all models/carriage/figures under: {out_dir}", flush=True)
 
-    run_carriage = bool(getattr(args, "carriage", False) or getattr(args, "positive_control", False))
+    phase = getattr(args, "phase", "all")
+    cache_path = out_dir / "results.json"
+
+    # PHASE=train: the GPU-heavy pass. Train + cache EVERY model (sweep + carriage) to Drive; no
+    # analysis. Safe to interrupt/resume -- each finished model is checkpointed as it completes.
+    if phase == "train":
+        print(f"[train] device={device}: training all sweep + carriage models -> {ckpt_dir}", flush=True)
+        rows = run_sweep(cfg, device, ckpt_dir=ckpt_dir, force_retrain=args.force_retrain)
+        cache_path.write_text(json.dumps({"config": cfg, "rows": rows, "device": str(device)}, indent=2))
+        train_carriage_models(cfg, device, ckpt_dir, train_fn=train_one, force_retrain=args.force_retrain)
+        print(f"[train] done. Run --phase analyze later to compute carriage + figures from these.", flush=True)
+        return {"out_dir": str(out_dir), "phase": "train", "cache": str(cache_path)}
+
+    load_only = phase == "analyze"  # never train in analyze; models must already be on Drive
+    run_carriage = bool(getattr(args, "carriage", False) or getattr(args, "positive_control", False) or load_only)
     carriage_result: dict | None = None
     if run_carriage:
-        print(f"[carriage] device={device}", flush=True)
+        print(f"[carriage] device={device} (load_only={load_only})", flush=True)
         carriage_result = run_carriage_suite(cfg, device, out_dir / "carriage", ckpt_dir=ckpt_dir,
                                              force_retrain=args.force_retrain,
-                                             force_carriage=args.force_carriage)
+                                             force_carriage=args.force_carriage, load_only=load_only)
     if args.skip_sweep:
         return {"out_dir": str(out_dir), "carriage": carriage_result,
                 "figures": (carriage_result or {}).get("figures", [])}
 
-    cache_path = out_dir / "results.json"
     if cache_path.exists() and not args.force_retrain:
         print(f"[cache] loading existing results: {cache_path}", flush=True)
-        payload = json.loads(cache_path.read_text())
-        rows = payload["rows"]
+        rows = json.loads(cache_path.read_text())["rows"]
+    elif load_only:
+        print(f"[analyze] no results.json at {cache_path}; skipping breakaway figure "
+              "(run --phase train first for the sweep).", flush=True)
+        return {"out_dir": str(out_dir), "carriage": carriage_result,
+                "figures": (carriage_result or {}).get("figures", [])}
     else:
         print(f"[run] device={device}  cfg={ {k: cfg[k] for k in ('n','layers','steps','seeds','ranks','graphs')} }", flush=True)
         rows = run_sweep(cfg, device, ckpt_dir=ckpt_dir, force_retrain=args.force_retrain)
-        payload = {"config": cfg, "rows": rows, "device": str(device)}
-        cache_path.write_text(json.dumps(payload, indent=2))
+        cache_path.write_text(json.dumps({"config": cfg, "rows": rows, "device": str(device)}, indent=2))
         print(f"[cache] wrote {cache_path}", flush=True)
 
     fig_path = plot_breakaway(rows, out_dir / "breakaway.png")

@@ -48,6 +48,7 @@ from graph_specialisation_metrics.synthetic_bottleneck_retrieval import (
     make_batch,
     plot_breakaway,
     plot_carriage_suite,
+    train_carriage_models,
 )
 from graph_specialisation_metrics.counterfactual_interchange_mediation import (
     add_external_repo_path,
@@ -66,34 +67,38 @@ MODEL_SPECS = {"dense": dict(dense=True), "1hop": dict(dense=False)}
 # Official-GRIT retrieval model. Owns encode/propagate (so the carriage suite can integrate over the
 # content and RRWP substrates) and uses the official GritTransformerLayer for attention.
 # ======================================================================================
-def _edge_set(b1: Batch, dense: bool) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-    """Edge support for one graph: self-loops + (all pairs if dense else graph edges).
+def _batched_edge_set(adj: Tensor, dense: bool) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+    """Batched edge support for [B, n, n] adjacency: self-loops + (all pairs if dense else edges),
+    with node indices offset per graph so ONE GRIT pass covers the whole batch (no cross-graph edges).
 
-    Returns local source/dest indices, an edge-type id (0=self, 1=pair) and a matching count.
-    Attention runs over exactly these edges -- so ``dense`` vs ``1hop`` IS the support intervention.
-    """
-    n = int(b1.adj.size(1))
-    dev = b1.adj.device
+    Returns global src/dst (into B*n nodes), edge-type id (0=self, 1=pair), and the graph-id + LOCAL
+    (a,b) index of each edge (for gathering the [B,n,n,K] pair-RRWP). This batched pass is ~B× faster
+    than looping GRIT per graph."""
+    B, n = int(adj.size(0)), int(adj.size(1))
+    dev = adj.device
     idx = torch.arange(n, device=dev)
-    src = [idx]
-    dst = [idx]
-    etype = [torch.zeros(n, dtype=torch.long, device=dev)]
-    if dense:
-        a = idx.repeat_interleave(n)
-        c = idx.repeat(n)
-        keep = a != c
-        a, c = a[keep], c[keep]
-    else:
-        ei = (b1.adj[0] > 0).nonzero(as_tuple=False)
-        a, c = ei[:, 0], ei[:, 1]
-    src.append(a)
-    dst.append(c)
-    etype.append(torch.ones(a.numel(), dtype=torch.long, device=dev))
-    return torch.cat(src), torch.cat(dst), torch.cat(etype), torch.tensor([n], device=dev)
+    src_l, dst_l, et_l, g_l, la_l, lb_l = [], [], [], [], [], []
+    for i in range(B):
+        off = i * n
+        src_l.append(idx + off); dst_l.append(idx + off)
+        et_l.append(torch.zeros(n, dtype=torch.long, device=dev))
+        g_l.append(torch.full((n,), i, dtype=torch.long, device=dev)); la_l.append(idx); lb_l.append(idx)
+        if dense:
+            a = idx.repeat_interleave(n); c = idx.repeat(n)
+            keep = a != c
+            a, c = a[keep], c[keep]
+        else:
+            ei = (adj[i] > 0).nonzero(as_tuple=False)
+            a, c = ei[:, 0], ei[:, 1]
+        src_l.append(a + off); dst_l.append(c + off)
+        et_l.append(torch.ones(a.numel(), dtype=torch.long, device=dev))
+        g_l.append(torch.full((a.numel(),), i, dtype=torch.long, device=dev)); la_l.append(a); lb_l.append(c)
+    return (torch.cat(src_l), torch.cat(dst_l), torch.cat(et_l), torch.cat(g_l),
+            torch.stack([torch.cat(la_l), torch.cat(lb_l)], dim=0))
 
 
 class OfficialGRITRetriever(nn.Module):
-    """Single-graph (B=1) official-GRIT retriever exposing the carriage-suite hook interface."""
+    """Official-GRIT retriever (batched over B graphs) exposing the carriage-suite hook interface."""
 
     def __init__(self, *, in_dim: int, value_vocab: int, dim: int = 96, heads: int = 8,
                  layers: int = 4, rrwp_steps: int = 8, dropout: float = 0.0,
@@ -122,41 +127,39 @@ class OfficialGRITRetriever(nn.Module):
         )
         self.head = nn.Linear(dim, int(value_vocab))
 
-    def encode(self, b1: Batch, rrwp: Tensor | None = None) -> Tensor:
-        """h0 = content embedding + node-RRWP (diagonal). Shape [1, n, dim]. IG resample unit."""
-        r = b1.rrwp if rrwp is None else rrwp
-        n = int(b1.x.size(1))
-        node_rrwp = r[0, torch.arange(n), torch.arange(n)]           # [n, rrwp_steps]
-        return (self.encoder(b1.x[0]) + self.rrwp_abs_encoder(node_rrwp)).unsqueeze(0)
+    def encode(self, batch: Batch, rrwp: Tensor | None = None) -> Tensor:
+        """h0 = content embedding + node-RRWP (diagonal). Shape [B, n, dim]. IG resample unit."""
+        r = batch.rrwp if rrwp is None else rrwp
+        n = int(batch.x.size(1))
+        idx = torch.arange(n, device=r.device)
+        node_rrwp = r[:, idx, idx]                                   # [B, n, rrwp_steps]
+        return self.encoder(batch.x) + self.rrwp_abs_encoder(node_rrwp)
 
-    def propagate(self, b1: Batch, h0: Tensor, rrwp: Tensor | None = None) -> Tensor:
-        """Run the official GRIT attention stack from a given h0 over the (dense or 1-hop) edge set."""
-        r = b1.rrwp if rrwp is None else rrwp
-        n = int(b1.x.size(1))
-        src, dst, etype, _ = _edge_set(b1, self.dense)
-        edge_index = torch.stack([src, dst], dim=0)
-        edge_rrwp = r[0, src, dst]                                    # [E, rrwp_steps]
+    def propagate(self, batch: Batch, h0: Tensor, rrwp: Tensor | None = None) -> Tensor:
+        """One batched GRIT pass from h0 over the (dense or 1-hop) edge set. h0/return: [B, n, dim]."""
+        r = batch.rrwp if rrwp is None else rrwp
+        B, n = int(h0.size(0)), int(h0.size(1))
+        src, dst, etype, gidx, local = _batched_edge_set(batch.adj, self.dense)
+        edge_rrwp = r[gidx, local[0], local[1]]                      # [E, rrwp_steps]
         edge_attr = self.edge_type_encoder(etype) + self.rrwp_rel_encoder(edge_rrwp)
-        deg = torch.zeros(n, device=h0.device)
+        deg = torch.zeros(B * n, device=h0.device)
         deg.index_add_(0, dst, torch.ones(dst.numel(), device=h0.device))
-        data = self.data_mod.Data(num_nodes=n)
-        data.x = h0[0]
-        data.edge_index = edge_index
+        data = self.data_mod.Data(num_nodes=B * n)
+        data.x = h0.reshape(B * n, -1)
+        data.edge_index = torch.stack([src, dst], dim=0)
         data.edge_attr = edge_attr
         data.log_deg = torch.log(deg + 1.0)
         data.deg = deg
-        data.batch = torch.zeros(n, dtype=torch.long, device=h0.device)
+        data.batch = torch.arange(B, device=h0.device).repeat_interleave(n)
         for layer in self.layers:
             data = layer(data)
-        return data.x.unsqueeze(0)
+        return data.x.reshape(B, n, -1)
 
-    def node_states(self, b1: Batch, rrwp: Tensor | None = None) -> Tensor:
-        return self.propagate(b1, self.encode(b1, rrwp), rrwp)
+    def node_states(self, batch: Batch, rrwp: Tensor | None = None) -> Tensor:
+        return self.propagate(batch, self.encode(batch, rrwp), rrwp)
 
     def forward(self, batch: Batch) -> Tensor:
-        # Training path: iterate graphs in the batch (GRIT layers run per single graph here).
-        outs = [self.head(self.node_states(_slice_graph(batch, gi))[0]) for gi in range(batch.x.size(0))]
-        return torch.stack(outs, dim=0)
+        return self.head(self.node_states(batch))
 
 
 def build_model(model_name: str, cfg: dict, device: torch.device) -> OfficialGRITRetriever:
@@ -176,9 +179,9 @@ def build_model(model_name: str, cfg: dict, device: torch.device) -> OfficialGRI
 # official variant is a self-contained, revertible file).
 # ======================================================================================
 def train_one(*, model_name: str, graph: str, cfg: dict, device: torch.device, seed: int,
-              ckpt_dir: Path | None = None, force_retrain: bool = False) -> tuple[nn.Module, dict]:
+              ckpt_dir: Path | None = None, force_retrain: bool = False,
+              load_only: bool = False) -> tuple[nn.Module, dict]:
     torch.manual_seed(seed)
-    model = build_model(model_name, cfg, device)
     ckpt_path = None
     if ckpt_dir is not None:
         fp = _ckpt_fingerprint(f"official_{model_name}", graph, cfg, seed)
@@ -187,12 +190,19 @@ def train_one(*, model_name: str, graph: str, cfg: dict, device: torch.device, s
             f"__d{cfg.get('target_distance')}__s{seed}__{fp}.pt"
         )
         if ckpt_path.exists() and not force_retrain:
+            model = build_model(model_name, cfg, device)
             payload = torch.load(ckpt_path, map_location=device, weights_only=False)
             model.load_state_dict(payload["state_dict"])
             model.eval()
             meta = dict(payload.get("meta", {}))
             meta["loaded_from_cache"] = True
             return model, meta
+    if load_only:  # analyze phase: never train; the model must already be on Drive
+        raise RuntimeError(
+            f"[analyze] no pretrained checkpoint for official_{model_name}/{graph} (seed {seed}) at "
+            f"{ckpt_path}. Run the train phase first (--phase train)."
+        )
+    model = build_model(model_name, cfg, device)
 
     opt = torch.optim.Adam(model.parameters(), lr=cfg["lr"])
     sample = lambda s: make_batch(
@@ -274,13 +284,14 @@ def run_sweep(cfg: dict, device: torch.device, *, ckpt_dir: Path | None = None,
 
 def run_carriage_suite(cfg: dict, device: torch.device, out_dir: Path, *,
                        ckpt_dir: Path | None = None, force_retrain: bool = False,
-                       force_carriage: bool = False) -> dict:
+                       force_carriage: bool = False, load_only: bool = False) -> dict:
     td = int(cfg.get("carriage_target_distance") or cfg.get("target_distance") or 3)
     graphs = list(cfg.get("carriage_graphs") or cfg.get("graphs") or ["dumbbell"])
     models = list(cfg.get("models") or ["dense", "1hop"])
     rows, completeness, accs = collect_carriage(
         cfg, device, out_dir, graphs=graphs, models=models, td=td, train_fn=train_one,
         ckpt_dir=ckpt_dir, force_retrain=force_retrain, force_carriage=force_carriage,
+        load_only=load_only,
     )
     out_dir.mkdir(parents=True, exist_ok=True)
     payload = {"backend": "official_grit", "config": {"target_distance": td, "graphs": graphs, "models": models,
@@ -326,6 +337,9 @@ def main(argv: Sequence[str] | None = None) -> dict:
     ap.add_argument("--donor-samples", type=int, default=None)
     ap.add_argument("--force-carriage", action="store_true", help="recompute carriage even if cached cells exist")
     ap.add_argument("--no-drive", action="store_true", help="do not auto-redirect the out-dir onto Google Drive in Colab")
+    ap.add_argument("--phase", choices=["all", "train", "analyze"], default="all",
+                    help="train = GPU pass, train+cache all models to Drive; analyze = load pretrained models "
+                         "from Drive and compute carriage+figures (never trains); all = both in one run")
     ap.add_argument("--fast-dev-run", action="store_true")
     ap.add_argument("--device", default="auto")
     args = ap.parse_args(argv)
@@ -361,20 +375,36 @@ def main(argv: Sequence[str] | None = None) -> dict:
     ckpt_dir = out_dir / "checkpoints"
     print(f"[persist] all models/carriage/figures under: {out_dir}", flush=True)
 
+    phase = args.phase
+    cache_path = out_dir / "results.json"
+
+    # PHASE=train: GPU pass. Train + cache every sweep + carriage model to Drive; no analysis.
+    if phase == "train":
+        print(f"[train] device={device}: training all sweep + carriage models -> {ckpt_dir}", flush=True)
+        rows = run_sweep(cfg, device, ckpt_dir=ckpt_dir, force_retrain=args.force_retrain)
+        cache_path.write_text(json.dumps({"config": cfg, "rows": rows, "device": str(device)}, indent=2))
+        train_carriage_models(cfg, device, ckpt_dir, train_fn=train_one, force_retrain=args.force_retrain)
+        print("[train] done. Run --phase analyze later to compute carriage + figures from these.", flush=True)
+        return {"out_dir": str(out_dir), "phase": "train", "cache": str(cache_path)}
+
+    load_only = phase == "analyze"
     carriage_result = None
-    if args.carriage:
-        print(f"[official carriage] device={device}", flush=True)
+    if args.carriage or load_only:
+        print(f"[official carriage] device={device} (load_only={load_only})", flush=True)
         carriage_result = run_carriage_suite(cfg, device, out_dir / "carriage", ckpt_dir=ckpt_dir,
                                              force_retrain=args.force_retrain,
-                                             force_carriage=args.force_carriage)
+                                             force_carriage=args.force_carriage, load_only=load_only)
     if args.skip_sweep:
         return {"out_dir": str(out_dir), "carriage": carriage_result,
                 "figures": (carriage_result or {}).get("figures", [])}
 
-    cache_path = out_dir / "results.json"
     if cache_path.exists() and not args.force_retrain:
         print(f"[cache] loading existing results: {cache_path}", flush=True)
         rows = json.loads(cache_path.read_text())["rows"]
+    elif load_only:
+        print(f"[analyze] no results.json at {cache_path}; skipping breakaway (run --phase train first).", flush=True)
+        return {"out_dir": str(out_dir), "carriage": carriage_result,
+                "figures": (carriage_result or {}).get("figures", [])}
     else:
         print(f"[official run] device={device}", flush=True)
         rows = run_sweep(cfg, device, ckpt_dir=ckpt_dir, force_retrain=args.force_retrain)
