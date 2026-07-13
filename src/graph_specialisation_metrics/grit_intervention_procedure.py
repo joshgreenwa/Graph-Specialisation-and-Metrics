@@ -5074,17 +5074,19 @@ def structural_carriage_ig(
             try:
                 # One batched VJP computes d carrier_scores[i] / d point for ALL carriers i at once
                 # (is_grads_batched), replacing the O(n) autograd.grad loop -- the ~n x speedup that
-                # makes the structural IG affordable at high sample sizes. Falls back to the loop if
-                # the model has an op that does not support batched grads.
+                # makes the structural IG affordable at high sample sizes. retain_graph=True so the
+                # per-carrier loop below can still traverse the graph if the batched pass fails (some
+                # GRIT ops are not vmap-compatible); catch EVERYTHING so a batched failure can never
+                # crash the probe -- it just falls back to the (slower but proven) loop.
                 eye = torch.eye(n, device=carrier_scores.device, dtype=carrier_scores.dtype)
                 (bgrad,) = torch.autograd.grad(
                     carrier_scores, point, grad_outputs=eye, is_grads_batched=True,
-                    retain_graph=False, create_graph=False,
+                    retain_graph=True, create_graph=False,
                 )
                 per_slot = (bgrad.detach() * delta).sum(dim=-1)          # [n_carrier, S]
                 carriage.index_add_(1, add_src, per_slot[:, active_idx])  # accumulate active slots by source
                 continue
-            except (RuntimeError, TypeError):
+            except Exception:  # noqa: BLE001 -- any batched-grad failure -> proven per-carrier loop
                 use_batched_vjp = False
         for i in range(n):
             (grad,) = torch.autograd.grad(carrier_scores[i], point, retain_graph=(i < n - 1), create_graph=False)
@@ -5547,15 +5549,26 @@ def run_symbolic_structural_probe(models: Sequence[ModelRun], artifact_root: Pat
     write_csv(artifact_root / "metrics" / "step7_carriage_by_distance_summary.csv", step7_by_distance_summary_rows(rows))
     write_csv(artifact_root / "metrics" / "step7_carriage_reach_summary.csv", step7_reach_summary_rows(rows, tau=reach_tau))
     write_csv(artifact_root / "metrics" / "step7_method_agreement_summary.csv", step7_method_agreement_rows(rows))
-    render_symbolic_structural_by_distance(rows, artifact_root, dpi=dpi)
-    render_step7_funcbenef_grid(rows, artifact_root, dpi=dpi, method="ig")
-    render_step7_funcbenef_grid(rows, artifact_root, dpi=dpi, method="swap")
-    render_carriage_functional_vs_beneficial(rows, artifact_root, dpi=dpi, completeness_note=completeness_note)
-    render_step7_reach_summary(rows, artifact_root, dpi=dpi, tau=reach_tau)
-    render_step7_method_agreement(rows, artifact_root, dpi=dpi, completeness_note=completeness_note)
+    # Each figure is rendered independently so one failing render can NEVER wipe the others, and the
+    # figures actually written are logged so "zero figures" is impossible to mistake for a silent crash.
+    renders: list[tuple[str, Any]] = [
+        ("by_distance", lambda: render_symbolic_structural_by_distance(rows, artifact_root, dpi=dpi)),
+        ("funcbenef_ig", lambda: render_step7_funcbenef_grid(rows, artifact_root, dpi=dpi, method="ig")),
+        ("funcbenef_swap", lambda: render_step7_funcbenef_grid(rows, artifact_root, dpi=dpi, method="swap")),
+        ("funcbenef_carriage", lambda: render_carriage_functional_vs_beneficial(rows, artifact_root, dpi=dpi, completeness_note=completeness_note)),
+        ("reach_summary", lambda: render_step7_reach_summary(rows, artifact_root, dpi=dpi, tau=reach_tau)),
+        ("ig_vs_swap_agreement", lambda: render_step7_method_agreement(rows, artifact_root, dpi=dpi, completeness_note=completeness_note)),
+    ]
+    for name, fn in renders:
+        try:
+            fn()
+        except Exception as exc:  # noqa: BLE001
+            progress(f"Step 7 render '{name}' FAILED: {type(exc).__name__}: {exc}")
+    figs = sorted(p.name for p in (artifact_root / "figures").glob("step7_*.png")) if (artifact_root / "figures").exists() else []
+    progress(f"Step 7 wrote {len(figs)} figure(s): {figs}")
     n_struct = len([r for r in rows if str(r.get("factor")) in {"node_rrwp", "pair_rrwp", "both_rrwp", "structure"}])
     progress(f"Step 7 symbolic/structural: wrote {len(rows)} rows ({n_struct} structural)")
-    return {"status": "complete", "rows": len(rows), "structural_rows": n_struct}
+    return {"status": "complete", "rows": len(rows), "structural_rows": n_struct, "figures": len(figs)}
 
 
 def _bootstrap_mean_ci(
