@@ -5617,10 +5617,11 @@ def render_carriage_functional_vs_beneficial(
 
     Functional (top row) vs beneficial (bottom row) carriage by distance, for content and node/pair
     structural carriage (columns), overlaying the IG estimator (solid + shaded 95% bootstrap CI) and
-    the finite-swap estimator (dashed mean line) for every model (colour). IG is the anchor (its CI is
-    shaded); the swap line falling inside the IG band = the two estimators agree at that distance,
-    outside = a significant divergence. Shows at a glance that transport is functionally far-reaching
-    yet beneficial only short-range, for BOTH content and structure. Missing models annotated in red.
+    the finite-swap estimator (dashed line + 95% bootstrap CI error bars) for every model (colour). IG
+    is the anchor; where the swap error bars OVERLAP the IG band the two estimators agree at that
+    distance, where they are disjoint the divergence is significant (both carry uncertainty, so a gap
+    is only meaningful when the intervals do not overlap). Shows at a glance that transport is
+    functionally far-reaching yet beneficial only short-range. Missing models annotated in red.
     """
     from matplotlib.lines import Line2D
 
@@ -5647,13 +5648,18 @@ def render_carriage_functional_vs_beneficial(
             nmax = 0
             for m in models:
                 ds_i, ys_i, lo_i, hi_i, ns_i = _step7_series(rows, fi, m, mode, vk, rng=rng)
-                ds_s, ys_s, _, _, ns_s = _step7_series(rows, fs, m, mode, vk, rng=rng)
+                ds_s, ys_s, lo_s, hi_s, ns_s = _step7_series(rows, fs, m, mode, vk, rng=rng)
                 if ds_i:
+                    # IG = anchor: solid line + shaded 95% CI band
                     ax.fill_between(ds_i, lo_i, hi_i, color=color[m], alpha=0.15, lw=0)
                     ax.plot(ds_i, ys_i, "-o", ms=3.5, lw=1.8, color=color[m])
                     nmax = max([nmax, *ns_i])
                 if ds_s:
-                    ax.plot(ds_s, ys_s, "--s", ms=3.0, lw=1.3, alpha=0.8, color=color[m])
+                    # finite-swap: dashed line + 95% CI error bars (overlap with the IG band => agree)
+                    yerr = np.clip(np.array([[y - lo for y, lo in zip(ys_s, lo_s)],
+                                             [hi - y for y, hi in zip(ys_s, hi_s)]]), 0.0, None)
+                    ax.errorbar(ds_s, ys_s, yerr=yerr, fmt="--s", ms=3.0, lw=1.3, alpha=0.85,
+                                color=color[m], elinewidth=0.9, capsize=2.0)
                     nmax = max([nmax, *ns_s])
                 if not ds_i and not ds_s:
                     missing.append(model_label(m))
@@ -5669,7 +5675,7 @@ def render_carriage_functional_vs_beneficial(
     handles = [Line2D([0], [0], color=color[m], lw=2, label=model_label(m)) for m in models]
     handles += [
         Line2D([0], [0], color="0.25", ls="-", marker="o", ms=4, label="IG (shaded = 95% CI)"),
-        Line2D([0], [0], color="0.25", ls="--", marker="s", ms=4, label="finite-swap (mean)"),
+        Line2D([0], [0], color="0.25", ls="--", marker="s", ms=4, label="finite-swap (bars = 95% CI)"),
     ]
     fig.legend(handles=handles, loc="upper center", ncol=min(len(handles), 5), fontsize=8,
                frameon=False, bbox_to_anchor=(0.5, 1.0))
