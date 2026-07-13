@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -89,6 +90,30 @@ def _wellconnected_adj(n: int, degree: int, rng: np.random.Generator) -> np.ndar
     """One ~degree-regular block over all nodes: same local density as a dumbbell cluster, no bottleneck."""
     adj = np.zeros((n, n), dtype=np.float32)
     _add_cluster_edges(np.arange(n), degree, adj, rng)
+    return adj
+
+
+def _expander_adj(n: int, degree: int, rng: np.random.Generator) -> np.ndarray:
+    """Random ~degree-regular expander: same sparsity/degree as a dumbbell but no bottleneck.
+
+    The sparsification-story control. An expander is a SPARSE graph (edge count ~ n*degree/2, like
+    the dumbbell) whose spectral gap stays large, so k random rewired shortcuts relieve the
+    over-squashed bandwidth WITHOUT going dense. If 1-hop attention on an expander recovers the
+    dense-retrieval accuracy the dumbbell loses, the bottleneck -- not the density -- was the whole
+    story, and a good sparsifier only needs to add expander-like shortcuts (not all n^2 edges)."""
+    adj = np.zeros((n, n), dtype=np.float32)
+    perm = rng.permutation(n)                              # Hamiltonian cycle -> connected, 2-regular
+    for i in range(n):
+        u, v = int(perm[i]), int(perm[(i + 1) % n])
+        adj[u, v] = adj[v, u] = 1.0
+    extra = max(0, int(degree) - 2)                        # add random perfect matchings to reach degree
+    for _ in range(extra):
+        pm = rng.permutation(n)
+        for i in range(0, n - 1, 2):
+            u, v = int(pm[i]), int(pm[i + 1])
+            if u != v:
+                adj[u, v] = adj[v, u] = 1.0
+    np.fill_diagonal(adj, 0.0)
     return adj
 
 
@@ -168,6 +193,8 @@ def make_batch(
             adj = _dumbbell_adj(n, degree, bridge_edges, rng)
         elif graph == "wellconnected":
             adj = _wellconnected_adj(n, degree, rng)
+        elif graph == "expander":
+            adj = _expander_adj(n, degree, rng)
         else:
             raise ValueError(f"unknown graph type {graph!r}")
         keys = rng.permutation(key_vocab)[:n]          # distinct keys per node
@@ -298,16 +325,23 @@ class BottleneckRetriever(nn.Module):
         )
         self.head = nn.Linear(dim, value_vocab)
 
-    def encode(self, batch: Batch) -> Tensor:
-        """Post-encoder node state h0 = content embedding + node-RRWP (the IG resample unit)."""
+    def encode(self, batch: Batch, rrwp: Tensor | None = None) -> Tensor:
+        """Post-encoder node state h0 = content embedding + node-RRWP (the IG resample unit).
+
+        ``rrwp`` overrides ``batch.rrwp`` (used by the structural-carriage probes to perturb the raw
+        node-RRWP diagonal before it reaches the node encoder)."""
         b, n = batch.x.shape[:2]
-        node_rrwp = batch.rrwp[torch.arange(b)[:, None], torch.arange(n)[None], torch.arange(n)[None]]
+        r = batch.rrwp if rrwp is None else rrwp
+        node_rrwp = r[torch.arange(b)[:, None], torch.arange(n)[None], torch.arange(n)[None]]
         return self.encoder(batch.x) + self.rrwp_node(node_rrwp)
 
-    def propagate(self, batch: Batch, h0: Tensor) -> Tensor:
-        """Run the attention stack from a given h0 -- lets IG integrate over the encoded content."""
+    def propagate(self, batch: Batch, h0: Tensor, rrwp: Tensor | None = None) -> Tensor:
+        """Run the attention stack from a given h0 -- lets IG integrate over the encoded content.
+
+        ``rrwp`` overrides ``batch.rrwp`` for the pairwise attention bias (used by the pair-RRWP
+        structural-carriage probe)."""
         b, n = h0.shape[:2]
-        rrwp = batch.rrwp
+        rrwp = batch.rrwp if rrwp is None else rrwp
         if self.dense:
             mask = None
         else:
@@ -327,8 +361,8 @@ class BottleneckRetriever(nn.Module):
             h = layer(h, rrwp, mask)
         return h[:, :n] if self.use_vnode else h
 
-    def node_states(self, batch: Batch) -> Tensor:
-        return self.propagate(batch, self.encode(batch))
+    def node_states(self, batch: Batch, rrwp: Tensor | None = None) -> Tensor:
+        return self.propagate(batch, self.encode(batch, rrwp), rrwp)
 
     def forward(self, batch: Batch) -> Tensor:
         return self.head(self.node_states(batch))
@@ -355,6 +389,24 @@ MODEL_SPECS = {
 }
 
 
+CKPT_KEYS = ("n", "layers", "dim", "heads", "rrwp_steps", "dropout", "key_vocab",
+             "value_vocab", "bridge_edges", "degree", "steps", "lr", "batch_size")
+
+
+def _ckpt_fingerprint(model_name: str, graph: str, cfg: dict, seed: int) -> str:
+    """Stable id from architecture + data-generating config, so a stale checkpoint is never reused."""
+    import hashlib
+
+    payload = {
+        "model": model_name, "graph": graph, "seed": int(seed),
+        "addressing": cfg.get("addressing"), "rank": cfg.get("rank"),
+        "target_distance": cfg.get("target_distance"),
+        **{k: cfg[k] for k in CKPT_KEYS if k in cfg},
+    }
+    blob = json.dumps(payload, sort_keys=True, default=str)
+    return hashlib.sha1(blob.encode()).hexdigest()[:16]
+
+
 def train_one(
     *,
     model_name: str,
@@ -362,6 +414,8 @@ def train_one(
     cfg: dict,
     device: torch.device,
     seed: int,
+    ckpt_dir: Path | None = None,
+    force_retrain: bool = False,
 ) -> tuple[nn.Module, dict]:
     torch.manual_seed(seed)
     in_dim = 2 * cfg["key_vocab"] + cfg["value_vocab"] + 2
@@ -375,6 +429,18 @@ def train_one(
         dropout=cfg["dropout"],
         **MODEL_SPECS[model_name],
     ).to(device)
+    ckpt_path = None
+    if ckpt_dir is not None:
+        fp = _ckpt_fingerprint(model_name, graph, cfg, seed)
+        ckpt_path = Path(ckpt_dir) / f"{model_name}__{graph}__{cfg.get('addressing')}__r{cfg.get('rank')}__d{cfg.get('target_distance')}__s{seed}__{fp}.pt"
+        if ckpt_path.exists() and not force_retrain:
+            payload = torch.load(ckpt_path, map_location=device, weights_only=False)
+            model.load_state_dict(payload["state_dict"])
+            model.eval()
+            meta = payload.get("meta", {})
+            meta["loaded_from_cache"] = True
+            return model, meta
+
     opt = torch.optim.Adam(model.parameters(), lr=cfg["lr"])
     sample = lambda s: make_batch(
         cfg["batch_size"], graph=graph, n=cfg["n"], rank=cfg["rank"],
@@ -392,20 +458,36 @@ def train_one(
         opt.step()
         if step % max(1, cfg["steps"] // 10) == 0 or step == cfg["steps"] - 1:
             log.append({"step": step, "loss": float(loss.item()), "train_acc": acc})
-    # eval on fresh graphs
+    # eval on fresh graphs; also record final TRAIN accuracy (the routing-vs-memorisation guardrail)
     model.eval()
-    accs = []
+    accs, train_accs = [], []
     with torch.no_grad():
         for e in range(cfg["eval_batches"]):
             batch = sample(10_000_000 + seed * 991 + e)
             _, acc, nq = _loss_and_acc(model(batch), batch)
             if nq:
                 accs.append(acc)
-    return model, {"val_acc": float(np.mean(accs)) if accs else float("nan"), "train_log": log,
-                   "params": int(sum(p.numel() for p in model.parameters()))}
+            tb = sample(seed * 100003 + e)  # graphs the model trained on
+            _, tacc, tnq = _loss_and_acc(model(tb), tb)
+            if tnq:
+                train_accs.append(tacc)
+    meta = {
+        "val_acc": float(np.mean(accs)) if accs else float("nan"),
+        "train_acc": float(np.mean(train_accs)) if train_accs else float("nan"),
+        "train_log": log,
+        "params": int(sum(p.numel() for p in model.parameters())),
+        "loaded_from_cache": False,
+    }
+    if ckpt_path is not None:
+        ckpt_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save({"state_dict": model.state_dict(), "meta": meta,
+                    "cfg": {k: cfg[k] for k in CKPT_KEYS if k in cfg},
+                    "model_name": model_name, "graph": graph, "seed": seed}, ckpt_path)
+    return model, meta
 
 
-def run_sweep(cfg: dict, device: torch.device) -> list[dict]:
+def run_sweep(cfg: dict, device: torch.device, *, ckpt_dir: Path | None = None,
+              force_retrain: bool = False) -> list[dict]:
     rows = []
     distances = cfg.get("distances", [None])
     for addressing in cfg["addressings"]:
@@ -414,20 +496,27 @@ def run_sweep(cfg: dict, device: torch.device) -> list[dict]:
                 for rank in cfg["ranks"]:
                     for model_name in cfg["models"]:
                         run_cfg = {**cfg, "rank": rank, "addressing": addressing, "target_distance": dist}
-                        accs, params = [], None
+                        accs, tr_accs, params, n_cached = [], [], None, 0
                         for seed in range(cfg["seeds"]):
-                            _, res = train_one(model_name=model_name, graph=graph, cfg=run_cfg, device=device, seed=seed)
+                            _, res = train_one(model_name=model_name, graph=graph, cfg=run_cfg,
+                                               device=device, seed=seed, ckpt_dir=ckpt_dir,
+                                               force_retrain=force_retrain)
                             accs.append(res["val_acc"])
+                            tr_accs.append(res.get("train_acc", float("nan")))
                             params = res["params"]
+                            n_cached += int(bool(res.get("loaded_from_cache")))
                         rows.append({
                             "addressing": addressing, "graph": graph,
                             "distance": dist, "rank": rank, "model": model_name,
                             "val_acc_mean": float(np.nanmean(accs)), "val_acc_std": float(np.nanstd(accs)),
+                            "train_acc_mean": float(np.nanmean(tr_accs)),
                             "seeds": cfg["seeds"], "params": params,
                         })
                         dstr = f"d={dist}" if dist is not None else "d=far"
+                        cflag = f" [cache {n_cached}/{cfg['seeds']}]" if n_cached else ""
                         print(f"  [{addressing:10s} {graph:13s} {dstr:6s} rank={rank:2d} {model_name:11s}] "
-                              f"acc={rows[-1]['val_acc_mean']:.3f} +/- {rows[-1]['val_acc_std']:.3f}", flush=True)
+                              f"val={rows[-1]['val_acc_mean']:.3f}+/-{rows[-1]['val_acc_std']:.3f} "
+                              f"train={rows[-1]['train_acc_mean']:.3f}{cflag}", flush=True)
     return rows
 
 
@@ -489,90 +578,435 @@ def default_config() -> dict:
         "models": ["dense", "1hop", "1hop_vnode"],
         "distances": [None],  # set e.g. [1,2,3,4] to sweep query->target distance (the reach axis)
         "batch_size": 64, "steps": 400, "eval_batches": 8, "lr": 1e-3, "seeds": 2,
+        # --- Step-7 carriage suite ---
+        "carriage_graphs": ["dumbbell", "expander", "wellconnected"],
+        "carriage_target_distance": 3, "carriage_graphs_count": 12, "carriage_channel_start": 2,
+        "carriage_ig_steps": 24, "carriage_rrwp_replacement": "donor", "carriage_donor_samples": 4,
+        "carriage_min_distance": 1,
     }
 
 
-def ig_loss_carriage_decay(model: nn.Module, batch: Batch, *, steps: int = 32, max_d: int = 6) -> dict[int, float]:
-    """B_IG positive control: IG attribution of the query loss to each source's encoded content,
-    banded by query->source transport distance. Negative = loss-reducing (beneficial). On the
-    bottleneck task the planted target's content (far) should be strongly beneficial for a model
-    that can transport it (dense) and ~0 for one that cannot (1-hop)."""
-    device = batch.x.device
-    model.eval()
-    h0 = model.encode(batch).detach()
-    base = h0.mean(dim=1, keepdim=True).expand_as(h0)   # in-distribution-ish baseline: mean over nodes
-    b, n, _ = h0.shape
-    ig = torch.zeros(b, n, device=device)
+# ======================================================================================
+# Step-7 carriage suite (mirrors grit_intervention_procedure.symbolic_structural_carriage_rows):
+# symbolic (content) vs structural (node-RRWP / pair-RRWP) carriage, each via BOTH the finite-swap
+# AND the integrated-gradients estimator, in FUNCTIONAL and BENEFICIAL modes -- so the standalone
+# synthetic uses the same definitions as Step 7 of the core methodology. Methodology is beta: we
+# emit all six factors x two modes so the IG/swap agreement can be checked and the better estimator
+# picked per substrate.
+#
+#   Carriage C[query carrier, source j] = g . (h_clean - h_corrupt), the readout-projected node
+#   delta. g = dS/dh^L is the readout gradient of a scalar S at the query node(s):
+#     functional : S = sum_q logit[q, label_q]        (readout mass on the correct value)
+#     beneficial : S = sum_q CE(logit_q, label_q)     (query loss; signed<0 = loss-reducing = good)
+#   swap = discrete on-manifold perturbation of source j's substrate (multi-donor averaged, frozen g);
+#   IG   = integrate the substrate from its graph-mean baseline to clean and attribute per source.
+#   Structural channels < ``channel_start`` (self/one-hop identity) are preserved, so the RRWP probes
+#   perturb GLOBAL structural information only.
+# ======================================================================================
+IG_FACTORS = ("content_ig", "node_rrwp_ig", "pair_rrwp_ig")
+SWAP_FACTORS = ("content", "node_rrwp", "pair_rrwp")
+CARRIAGE_FACTORS = SWAP_FACTORS + IG_FACTORS
+CARRIAGE_MODES = ("functional", "beneficial")
+
+
+def _slice_graph(batch: Batch, gi: int) -> Batch:
+    return Batch(
+        x=batch.x[gi:gi + 1], adj=batch.adj[gi:gi + 1], rrwp=batch.rrwp[gi:gi + 1],
+        qmask=batch.qmask[gi:gi + 1], label=batch.label[gi:gi + 1], target_idx=batch.target_idx[gi:gi + 1],
+    )
+
+
+def _readout_scalar(logits: Tensor, b1: Batch, mode: str) -> Tensor:
+    qm = b1.qmask
+    if mode == "functional":
+        return logits[qm].gather(1, b1.label[qm].clamp_min(0)[:, None]).sum()
+    return F.cross_entropy(logits[qm], b1.label[qm], reduction="sum")  # beneficial: loss (<0 carriage = good)
+
+
+def _readout_gradient(model: nn.Module, b1: Batch, mode: str) -> tuple[Tensor, Tensor]:
+    """Clean final states h [1,n,dim] and frozen readout gradient g = dS/dh (nonzero at query carriers)."""
+    h = model.node_states(b1).detach().requires_grad_(True)
+    (g,) = torch.autograd.grad(_readout_scalar(model.head(h), b1, mode), h)
+    return h.detach(), g.detach()
+
+
+def _draw_donor(rng: np.random.Generator, n: int, j: int) -> int:
+    d = int(rng.integers(0, n - 1))
+    return d + (1 if d >= j else 0)
+
+
+def _content_replaced(b1: Batch, source: int, donor: int) -> Batch:
+    x = b1.x.clone()
+    x[0, source] = b1.x[0, donor]
+    return Batch(x=x, adj=b1.adj, rrwp=b1.rrwp, qmask=b1.qmask, label=b1.label, target_idx=b1.target_idx)
+
+
+def _rrwp_perturbed(rrwp: Tensor, source: int, *, kind: str, start: int, replacement: str, donor: int) -> Tensor:
+    """Replace long-range (channels>=start) RRWP at ``source``: node = its diagonal; pair = entries
+    incident to it (row+col), preserving the diagonal node-RRWP. donor/mean/zero replacements."""
+    r = rrwp.clone()
+    n = r.size(1)
+    idx = torch.arange(n)
+    off = idx != source
+    if kind == "node":
+        if replacement == "donor":
+            r[0, source, source, start:] = rrwp[0, donor, donor, start:]
+        elif replacement == "mean":
+            diag = rrwp[0, idx, idx]
+            r[0, source, source, start:] = diag[:, start:].mean(0)
+        else:
+            r[0, source, source, start:] = 0.0
+    else:  # pair: all off-diagonal entries incident to source
+        if replacement == "donor":
+            r[0, source, off, start:] = rrwp[0, donor, off, start:]
+            r[0, off, source, start:] = rrwp[0, off, donor, start:]
+        elif replacement == "mean":
+            eye = torch.eye(n, dtype=torch.bool)
+            m = rrwp[0][~eye][:, start:].mean(0)
+            r[0, source, off, start:] = m
+            r[0, off, source, start:] = m
+        else:
+            r[0, source, off, start:] = 0.0
+            r[0, off, source, start:] = 0.0
+    return r
+
+
+def _swap_carriage(model: nn.Module, b1: Batch, factor: str, mode: str, *, start: int,
+                   replacement: str, donors: int, rng: np.random.Generator) -> Tensor:
+    """Per-source carriage c[j] via the finite on-manifold swap (frozen readout gradient)."""
+    h_clean, g = _readout_gradient(model, b1, mode)
+    n = b1.x.size(1)
+    k = donors if replacement == "donor" else 1
+    c = torch.zeros(n)
+    for j in range(n):
+        acc, got = 0.0, 0
+        for _ in range(max(1, k)):
+            donor = _draw_donor(rng, n, j)
+            if factor == "content":
+                h = model.node_states(_content_replaced(b1, j, donor)).detach()
+            else:
+                kind = "node" if factor == "node_rrwp" else "pair"
+                r = _rrwp_perturbed(b1.rrwp, j, kind=kind, start=start, replacement=replacement, donor=donor)
+                h = model.node_states(b1, r).detach()
+            acc += float((g * (h_clean - h)).sum().item())
+            got += 1
+        c[j] = acc / max(got, 1)
+    return c
+
+
+def _ig_carriage(model: nn.Module, b1: Batch, factor: str, mode: str, *, start: int,
+                 steps: int) -> tuple[Tensor, dict[str, float]]:
+    """Per-source carriage c[j] via IG over the substrate; completeness = sum c vs S(1)-S(0)."""
+    n = b1.x.size(1)
+    if factor == "content_ig":
+        h0 = model.encode(b1).detach()
+        base = h0.mean(dim=1, keepdim=True).expand_as(h0).contiguous()
+        delta = h0 - base
+        c = torch.zeros(n)
+        for a in range(1, steps + 1):
+            pt = (base + (a / steps) * delta).detach().requires_grad_(True)
+            (grad,) = torch.autograd.grad(_readout_scalar(model.head(model.propagate(b1, pt)), b1, mode), pt)
+            c += (grad.detach() * delta).sum(dim=-1)[0] / steps
+        with torch.no_grad():
+            s0 = float(_readout_scalar(model.head(model.propagate(b1, base)), b1, mode).item())
+            s1 = float(_readout_scalar(model.head(model.propagate(b1, (base + delta))), b1, mode).item())
+        return c, {"recon": float(c.sum().item()), "target": s1 - s0}
+
+    K = b1.rrwp.size(-1)
+    flat_clean = b1.rrwp.detach().reshape(n * n, K)
+    a_idx = torch.arange(n).repeat_interleave(n)
+    b_idx = torch.arange(n).repeat(n)
+    diag = a_idx == b_idx
+    if factor == "node_rrwp_ig":
+        active, src = diag, a_idx
+    else:  # pair: attribute entry (a,b) to source b (the key node whose structure reaches carriers)
+        active, src = ~diag, b_idx
+    base_flat = flat_clean.clone()
+    if bool(active.any()) and K > start:
+        base_flat[active, start:] = flat_clean[active, start:].mean(0)
+    delta_flat = flat_clean - base_flat
+    c = torch.zeros(n)
     for a in range(1, steps + 1):
-        pt = (base + (a / steps) * (h0 - base)).detach().requires_grad_(True)
-        logits = model.head(model.propagate(batch, pt))
-        loss = F.cross_entropy(logits[batch.qmask], batch.label[batch.qmask], reduction="sum")
-        (g,) = torch.autograd.grad(loss, pt)
-        ig += (g.detach() * (h0 - base)).sum(dim=-1) / steps
-    adj = batch.adj.cpu().numpy()
-    qm = batch.qmask.cpu().numpy()
-    ig_np = ig.cpu().numpy()
-    bins: dict[int, list[float]] = {}
-    for gi in range(b):
-        qs = np.nonzero(qm[gi])[0]
-        if len(qs) != 1:  # rank-1 only, so query->source distance is unambiguous
-            continue
-        d_from_q = _bfs_distances(adj[gi], int(qs[0]))
-        for j in range(n):
-            dd = int(d_from_q[j])
-            if 0 <= dd <= max_d:
-                bins.setdefault(dd, []).append(float(ig_np[gi, j]))
-    return {d: float(np.mean(v)) for d, v in sorted(bins.items())}
+        pt = (base_flat + (a / steps) * delta_flat).detach().requires_grad_(True)
+        logits = model.head(model.node_states(b1, pt.reshape(1, n, n, K)))
+        (grad,) = torch.autograd.grad(_readout_scalar(logits, b1, mode), pt)
+        contrib = (grad.detach() * delta_flat).sum(dim=-1)
+        c.index_add_(0, src[active], contrib[active] / steps)
+    with torch.no_grad():
+        s0 = float(_readout_scalar(model.head(model.node_states(b1, base_flat.reshape(1, n, n, K))), b1, mode).item())
+        s1 = float(_readout_scalar(model.head(model.node_states(b1, flat_clean.reshape(1, n, n, K))), b1, mode).item())
+    return c, {"recon": float(c.sum().item()), "target": s1 - s0}
 
 
-def run_positive_control(cfg: dict, device: torch.device, out_dir: Path) -> dict:
-    """Train dense + 1-hop on content retrieval with the target planted at a fixed distance, then
-    check B_IG(d) spikes (negative) at that distance for dense and stays ~0 for 1-hop."""
+def carriage_rows_for_graph(model: nn.Module, model_name: str, b1: Batch, gid: str, *,
+                            start: int, ig_steps: int, replacement: str, donors: int,
+                            min_distance: int, rng: np.random.Generator,
+                            completeness_out: list[dict] | None = None) -> list[dict]:
+    """All six factors x two modes for one rank-1 graph (carrier = the single query node)."""
+    qm = b1.qmask[0].cpu().numpy()
+    qs = np.nonzero(qm)[0]
+    if len(qs) != 1:
+        return []
+    q = int(qs[0])
+    adj = b1.adj[0].cpu().numpy()
+    d_from_q = _bfs_distances(adj, q)
+    tgt = int(b1.target_idx[0, q].item())
+    rows: list[dict] = []
+
+    def emit(factor: str, mode: str, c: Tensor) -> None:
+        for j in range(int(c.numel())):
+            if j == q:
+                continue
+            d = int(d_from_q[j])
+            if d < min_distance or d < 0:
+                continue
+            v = float(c[j].item())
+            rows.append({
+                "model": model_name, "graph_id": gid, "carrier": q, "source": j,
+                "distance": d, "is_target": int(j == tgt), "factor": factor, "mode": mode,
+                "effect_signed": v, "effect_abs": abs(v),
+            })
+
+    for mode in CARRIAGE_MODES:
+        for factor in SWAP_FACTORS:
+            emit(factor, mode, _swap_carriage(model, b1, factor, mode, start=start,
+                                              replacement=replacement, donors=donors, rng=rng))
+        for factor in IG_FACTORS:
+            c, comp = _ig_carriage(model, b1, factor, mode, start=start, steps=ig_steps)
+            emit(factor, mode, c)
+            if completeness_out is not None and math.isfinite(comp["target"]):
+                completeness_out.append({"model": model_name, "graph_id": gid, "factor": factor,
+                                         "mode": mode, **comp, "abs_error": abs(comp["recon"] - comp["target"])})
+    return rows
+
+
+def run_carriage_suite(cfg: dict, device: torch.device, out_dir: Path, *,
+                       ckpt_dir: Path | None = None, force_retrain: bool = False) -> dict:
+    """Train (cached) the models on each carriage graph at the planted target distance, then compute
+    the full symbolic/structural x swap/IG x functional/beneficial carriage suite and render figures."""
+    td = int(cfg.get("carriage_target_distance") or cfg.get("target_distance") or 3)
+    graphs = list(cfg.get("carriage_graphs") or cfg.get("graphs") or ["dumbbell"])
+    models = list(cfg.get("models") or ["dense", "1hop"])
+    n_graphs = int(cfg.get("carriage_graphs_count", 12))
+    start = int(cfg.get("carriage_channel_start", 2))
+    ig_steps = int(cfg.get("carriage_ig_steps", 24))
+    replacement = str(cfg.get("carriage_rrwp_replacement", "donor"))
+    donors = int(cfg.get("carriage_donor_samples", 4))
+    min_distance = int(cfg.get("carriage_min_distance", 1))
+
+    rows: list[dict] = []
+    completeness: list[dict] = []
+    accs: list[dict] = []
+    for graph in graphs:
+        run_cfg = {**cfg, "rank": 1, "addressing": "content", "target_distance": td}
+        for model_name in models:
+            model, res = train_one(model_name=model_name, graph=graph, cfg=run_cfg, device=device,
+                                   seed=0, ckpt_dir=ckpt_dir, force_retrain=force_retrain)
+            model.eval()
+            accs_flag = "cache" if res.get("loaded_from_cache") else "trained"
+            accs_row = {"graph": graph, "model": model_name, "val_acc": res.get("val_acc"),
+                        "train_acc": res.get("train_acc"), "source": accs_flag}
+            accs.append(accs_row)
+            print(f"  [carriage {graph:13s} {model_name:11s}] val={res.get('val_acc'):.3f} "
+                  f"train={res.get('train_acc', float('nan')):.3f} ({accs_flag})", flush=True)
+            probe = make_batch(n_graphs, graph=graph, n=cfg["n"], rank=1, key_vocab=cfg["key_vocab"],
+                               value_vocab=cfg["value_vocab"], rrwp_steps=cfg["rrwp_steps"],
+                               bridge_edges=cfg["bridge_edges"], degree=cfg["degree"], seed=90210,
+                               device=device, addressing="content", target_distance=td)
+            rng = np.random.default_rng(1234)
+            for gi in range(n_graphs):
+                b1 = _slice_graph(probe, gi)
+                gid = f"{graph}:{gi}"
+                for r in carriage_rows_for_graph(model, model_name, b1, gid, start=start, ig_steps=ig_steps,
+                                                 replacement=replacement, donors=donors,
+                                                 min_distance=min_distance, rng=rng,
+                                                 completeness_out=completeness):
+                    r["graph"] = graph
+                    rows.append(r)
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    payload = {"config": {"target_distance": td, "graphs": graphs, "models": models,
+                          "channel_start": start, "ig_steps": ig_steps, "replacement": replacement,
+                          "donor_samples": donors, "n_graphs": n_graphs},
+               "rows": rows, "completeness": completeness, "accuracy": accs}
+    (out_dir / "carriage_rows.json").write_text(json.dumps(payload, indent=2))
+    figs = plot_carriage_suite(rows, accs, td, out_dir)
+    print(f"[carriage] wrote {out_dir/'carriage_rows.json'} ({len(rows)} rows); figures: {len(figs)}", flush=True)
+    return {"rows": rows, "completeness": completeness, "accuracy": accs, "figures": figs,
+            "out_dir": str(out_dir), "target_distance": td}
+
+
+def run_positive_control(cfg: dict, device: torch.device, out_dir: Path,
+                         ckpt_dir: Path | None = None, force_retrain: bool = False) -> dict:
+    """Back-compat entry: the beneficial-carriage-at-target headline is now part of the full suite."""
+    return run_carriage_suite(cfg, device, out_dir, ckpt_dir=ckpt_dir, force_retrain=force_retrain)
+
+
+_MODEL_STYLE = {
+    "dense": dict(marker="o", color="#1f77b4"),
+    "1hop": dict(marker="s", color="#d62728"),
+    "1hop_vnode": dict(marker="^", color="#2ca02c"),
+}
+
+
+def _profile(rows: Sequence[dict], *, factor: str, mode: str, model: str, graph: str,
+             value: str = "effect_abs", normalise: bool = False) -> tuple[list[int], list[float]]:
+    """Mean carriage by distance for one (factor, mode, model, graph); optionally per-graph-normalised."""
+    sub = [r for r in rows if r["factor"] == factor and r["mode"] == mode
+           and r["model"] == model and r["graph"] == graph]
+    if not sub:
+        return [], []
+    if normalise:
+        totals: dict[str, float] = {}
+        for r in sub:
+            totals[r["graph_id"]] = totals.get(r["graph_id"], 0.0) + abs(r["effect_abs"])
+        by_d: dict[int, list[float]] = {}
+        for r in sub:
+            denom = max(totals.get(r["graph_id"], 0.0), 1e-12)
+            by_d.setdefault(int(r["distance"]), []).append(abs(r["effect_abs"]) / denom)
+    else:
+        by_d = {}
+        for r in sub:
+            by_d.setdefault(int(r["distance"]), []).append(float(r[value]))
+    ds = sorted(by_d)
+    return ds, [float(np.mean(by_d[d])) for d in ds]
+
+
+def plot_carriage_suite(rows: Sequence[dict], accs: Sequence[dict], target_distance: int,
+                        out_dir: Path) -> list[str]:
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    td = int(cfg.get("target_distance") or 3)
-    max_d = max(int(cfg.get("max_distance", 6)), td + 1)
-    results: dict[str, dict[int, float]] = {}
-    for model_name in ("dense", "1hop"):
-        run_cfg = {**cfg, "rank": 1, "addressing": "content", "target_distance": td}
-        model, res = train_one(model_name=model_name, graph="dumbbell", cfg=run_cfg, device=device, seed=0)
-        batch = make_batch(cfg["batch_size"], graph="dumbbell", n=cfg["n"], rank=1,
-                           key_vocab=cfg["key_vocab"], value_vocab=cfg["value_vocab"], rrwp_steps=cfg["rrwp_steps"],
-                           bridge_edges=cfg["bridge_edges"], degree=cfg["degree"], seed=777, device=device,
-                           addressing="content", target_distance=td)
-        results[model_name] = ig_loss_carriage_decay(model, batch, steps=32, max_d=max_d)
-        print(f"  [positive-control {model_name}] val_acc={res['val_acc']:.3f}  B_IG(target d={td})="
-              f"{results[model_name].get(td, float('nan')):+.4f}", flush=True)
+    if not rows:
+        return []
+    graphs = sorted({r["graph"] for r in rows})
+    models = [m for m in ("dense", "1hop", "1hop_vnode") if any(r["model"] == m for r in rows)]
+    primary = "dumbbell" if "dumbbell" in graphs else graphs[0]
+    figs: list[str] = []
 
-    fig, ax = plt.subplots(figsize=(6.4, 4.4))
-    for model_name, style in (("dense", dict(marker="o", color="#1f77b4")), ("1hop", dict(marker="s", color="#d62728"))):
-        dec = results[model_name]
-        ds = sorted(dec)
-        ax.plot(ds, [dec[d] for d in ds], label=model_name, **style)
-    ax.axvline(td, color="k", ls=":", lw=0.8, label=f"planted target d={td}")
-    ax.axhline(0, color="gray", ls=":", lw=0.8)
-    ax.set_xlabel("query->source transport distance (hops)")
-    ax.set_ylabel("B_IG loss-carriage  (<0 = beneficial)")
-    ax.set_title("B_IG positive control: beneficial far carriage where the target lives (dense only)")
-    ax.grid(alpha=0.3)
-    ax.legend()
-    fig.tight_layout()
-    out_dir.mkdir(parents=True, exist_ok=True)
-    fig_path = out_dir / "positive_control_bIG.png"
-    fig.savefig(fig_path, dpi=140)
-    plt.close(fig)
-    (out_dir / "positive_control_bIG.json").write_text(json.dumps({"target_distance": td, "results": results}, indent=2))
-    print(f"[positive-control] wrote {fig_path}", flush=True)
-    return {"target_distance": td, "results": results, "figure": str(fig_path)}
+    def save(fig, name: str) -> None:
+        p = out_dir / name
+        fig.savefig(p, dpi=150, bbox_inches="tight")
+        fig.savefig(p.with_suffix(".pdf"), bbox_inches="tight")
+        plt.close(fig)
+        figs.append(str(p))
+
+    panels = [("content_ig", "Content (IG)"), ("node_rrwp_ig", "Node RRWP (IG)"),
+              ("pair_rrwp_ig", "Pair RRWP (IG)"), ("content", "Content (swap)"),
+              ("node_rrwp", "Node RRWP (swap)"), ("pair_rrwp", "Pair RRWP (swap)")]
+
+    # (1) Functional carriage by distance on the bottleneck graph -- the substrate decomposition.
+    fig, axes = plt.subplots(2, 3, figsize=(16, 8.5), constrained_layout=True)
+    for ax, (factor, title) in zip(axes.reshape(-1), panels):
+        for model in models:
+            ds, ys = _profile(rows, factor=factor, mode="functional", model=model, graph=primary)
+            if ds:
+                ax.plot(ds, ys, label=model, **_MODEL_STYLE.get(model, {}))
+        ax.axvline(target_distance, color="k", ls=":", lw=0.8)
+        ax.set_title(title)
+        ax.set_xlabel("query->source distance (hops)")
+        ax.set_ylabel("mean |carriage|")
+        ax.grid(alpha=0.3)
+        ax.legend(frameon=False, fontsize=8)
+    fig.suptitle(f"Functional carriage by distance ({primary}); dotted = planted target d={target_distance}")
+    save(fig, "carriage_functional_by_distance.png")
+
+    # (2) HEADLINE: beneficial carriage at the planted target -- dense transports, 1-hop cannot.
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4.6), constrained_layout=True)
+    for ax, (factor, title) in zip(axes, [("content_ig", "Content beneficial (IG)"),
+                                          ("pair_rrwp_ig", "Pair-RRWP beneficial (IG)")]):
+        for model in models:
+            ds, ys = _profile(rows, factor=factor, mode="beneficial", model=model, graph=primary,
+                              value="effect_signed")
+            if ds:
+                ax.plot(ds, ys, label=model, **_MODEL_STYLE.get(model, {}))
+        ax.axvline(target_distance, color="k", ls=":", lw=0.9, label=f"target d={target_distance}")
+        ax.axhline(0, color="gray", ls=":", lw=0.8)
+        ax.set_title(title)
+        ax.set_xlabel("query->source distance (hops)")
+        ax.set_ylabel("beneficial carriage (signed<0 = loss-reducing)")
+        ax.grid(alpha=0.3)
+        ax.legend(frameon=False, fontsize=8)
+    fig.suptitle(f"Beneficial far carriage where the target lives ({primary})")
+    save(fig, "carriage_beneficial_at_target.png")
+
+    # (3) IG vs swap estimator agreement (beta consistency check), per substrate, pooled over models.
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4.6), constrained_layout=True)
+    for ax, (ig_f, sw_f, title) in zip(axes, [("content_ig", "content", "Content"),
+                                              ("node_rrwp_ig", "node_rrwp", "Node RRWP"),
+                                              ("pair_rrwp_ig", "pair_rrwp", "Pair RRWP")]):
+        xs, ys, cs = [], [], []
+        for model in models:
+            ig_map = {(r["graph_id"], r["source"]): r["effect_signed"] for r in rows
+                      if r["factor"] == ig_f and r["mode"] == "functional" and r["model"] == model and r["graph"] == primary}
+            sw_map = {(r["graph_id"], r["source"]): r["effect_signed"] for r in rows
+                      if r["factor"] == sw_f and r["mode"] == "functional" and r["model"] == model and r["graph"] == primary}
+            for key in ig_map.keys() & sw_map.keys():
+                xs.append(sw_map[key]); ys.append(ig_map[key]); cs.append(_MODEL_STYLE.get(model, {}).get("color", "gray"))
+        if xs:
+            ax.scatter(xs, ys, s=10, c=cs, alpha=0.5)
+            lim = max(abs(min(xs + ys)), abs(max(xs + ys)), 1e-6)
+            ax.plot([-lim, lim], [-lim, lim], color="k", lw=0.7)
+            r = float(np.corrcoef(xs, ys)[0, 1]) if len(xs) > 2 else float("nan")
+            ax.set_title(f"{title}  (r={r:.2f}, n={len(xs)})")
+        ax.set_xlabel("swap carriage"); ax.set_ylabel("IG carriage")
+        ax.grid(alpha=0.3)
+    fig.suptitle(f"IG vs swap agreement ({primary}, functional) -- estimator consistency [beta]")
+    save(fig, "carriage_ig_vs_swap_agreement.png")
+
+    # (4) SPARSIFICATION: far beneficial carriage by substrate across graph types (bottleneck vs
+    #     expander vs wellconnected) + accuracy -- does an expander recover what the dumbbell loses?
+    far_by = {}  # (graph, model, substrate) -> mean beneficial carriage at d >= target
+    for r in rows:
+        if r["mode"] != "beneficial" or int(r["distance"]) < target_distance:
+            continue
+        sub = {"content_ig": "content", "pair_rrwp_ig": "pair_rrwp", "node_rrwp_ig": "node_rrwp"}.get(r["factor"])
+        if sub is None:
+            continue
+        far_by.setdefault((r["graph"], r["model"], sub), []).append(r["effect_signed"])
+    substrates = ["content", "node_rrwp", "pair_rrwp"]
+    fig, axes = plt.subplots(1, len(graphs), figsize=(4.6 * len(graphs), 4.6), squeeze=False, constrained_layout=True)
+    for gi, graph in enumerate(graphs):
+        ax = axes[0][gi]
+        xpos = np.arange(len(substrates))
+        w = 0.8 / max(len(models), 1)
+        for mi, model in enumerate(models):
+            vals = [float(np.mean(far_by.get((graph, model, s), [0.0]))) for s in substrates]
+            ax.bar(xpos + mi * w, vals, w, label=model, color=_MODEL_STYLE.get(model, {}).get("color"))
+        ax.axhline(0, color="gray", lw=0.7)
+        ax.set_xticks(xpos + w * (len(models) - 1) / 2)
+        ax.set_xticklabels(["content", "node RRWP", "pair RRWP"], fontsize=8)
+        acc_txt = "  ".join(f"{a['model'].split('_')[0]}:{a['val_acc']:.2f}" for a in accs if a["graph"] == graph)
+        ax.set_title(f"{graph}\nval acc {acc_txt}", fontsize=9)
+        ax.set_ylabel(f"beneficial carriage (d>={target_distance}, <0=good)")
+        ax.grid(alpha=0.3, axis="y")
+        ax.legend(frameon=False, fontsize=7)
+    fig.suptitle("Far beneficial carriage by substrate across graph types: bottleneck vs expander control")
+    save(fig, "carriage_sparsification_by_graph.png")
+
+    # (5) Accuracy guardrail: train vs val (a low val with high train = routing failure, not undertraining).
+    fig, ax = plt.subplots(figsize=(1.9 * max(len(accs), 3), 4.2), constrained_layout=True)
+    labels = [f"{a['graph'][:4]}/{a['model'].split('_')[0]}" for a in accs]
+    xpos = np.arange(len(accs))
+    ax.bar(xpos - 0.2, [a.get("train_acc", float("nan")) for a in accs], 0.4, label="train", color="#999999")
+    ax.bar(xpos + 0.2, [a.get("val_acc", float("nan")) for a in accs], 0.4, label="val", color="#1f77b4")
+    ax.set_xticks(xpos); ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=8)
+    ax.set_ylabel("retrieval accuracy"); ax.set_ylim(0, 1.02)
+    ax.legend(frameon=False)
+    ax.set_title("Train vs val accuracy (train>>val = routing failure, not undertraining)")
+    save(fig, "carriage_accuracy_guardrail.png")
+    return figs
 
 
 def main(argv: Sequence[str] | None = None) -> dict:
     ap = argparse.ArgumentParser(description="Dense vs 1-hop attention breakaway on bottleneck retrieval.")
     ap.add_argument("--out-dir", default="experiments/synthetic/results/bottleneck_retrieval")
     ap.add_argument("--run-name", default=None)
-    ap.add_argument("--positive-control", action="store_true", help="Run the B_IG loss-carriage positive control instead of the sweep.")
+    ap.add_argument("--positive-control", action="store_true", help="(alias for --carriage) run the carriage suite only.")
+    ap.add_argument("--carriage", action="store_true", help="Run the full Step-7 symbolic/structural carriage suite (swap+IG, functional+beneficial).")
+    ap.add_argument("--skip-sweep", action="store_true", help="Skip the accuracy breakaway sweep (carriage only).")
+    ap.add_argument("--force-retrain", action="store_true", help="Ignore cached checkpoints and retrain.")
     ap.add_argument("--n", type=int, default=None)
     ap.add_argument("--layers", type=int, default=None)
     ap.add_argument("--steps", type=int, default=None)
@@ -584,6 +1018,13 @@ def main(argv: Sequence[str] | None = None) -> dict:
     ap.add_argument("--distances", type=int, nargs="+", default=None,
                     help="query->target hop distances to sweep (the reach axis); omit for the default far placement")
     ap.add_argument("--degree", type=int, default=None, help="shared cluster degree (local density)")
+    ap.add_argument("--carriage-graphs", nargs="+", default=None, help="graph types for the carriage suite (e.g. dumbbell expander wellconnected)")
+    ap.add_argument("--carriage-target-distance", type=int, default=None)
+    ap.add_argument("--carriage-graphs-count", type=int, default=None)
+    ap.add_argument("--channel-start", type=int, default=None, help="first RRWP channel perturbed (preserve self/1-hop identity below it)")
+    ap.add_argument("--ig-steps", type=int, default=None)
+    ap.add_argument("--rrwp-replacement", default=None, choices=["donor", "mean", "zero"])
+    ap.add_argument("--donor-samples", type=int, default=None)
     ap.add_argument("--fast-dev-run", action="store_true")
     ap.add_argument("--device", default="auto")
     args = ap.parse_args(argv)
@@ -592,8 +1033,16 @@ def main(argv: Sequence[str] | None = None) -> dict:
     for key in ("n", "layers", "steps", "seeds", "ranks", "graphs", "addressings", "models", "distances", "degree"):
         if getattr(args, key) is not None:
             cfg[key] = getattr(args, key)
+    for arg_key, cfg_key in (("carriage_graphs", "carriage_graphs"), ("carriage_target_distance", "carriage_target_distance"),
+                             ("carriage_graphs_count", "carriage_graphs_count"), ("channel_start", "carriage_channel_start"),
+                             ("ig_steps", "carriage_ig_steps"), ("rrwp_replacement", "carriage_rrwp_replacement"),
+                             ("donor_samples", "carriage_donor_samples")):
+        if getattr(args, arg_key) is not None:
+            cfg[cfg_key] = getattr(args, arg_key)
     if args.fast_dev_run:
-        cfg.update({"steps": 30, "eval_batches": 2, "seeds": 1, "ranks": [1, 8], "batch_size": 16})
+        cfg.update({"steps": 30, "eval_batches": 2, "seeds": 1, "ranks": [1, 8], "batch_size": 16,
+                    "carriage_graphs": ["dumbbell", "expander"], "carriage_graphs_count": 3,
+                    "carriage_ig_steps": 6, "carriage_donor_samples": 2})
 
     device = torch.device(
         "cuda" if (args.device == "auto" and torch.cuda.is_available()) else
@@ -602,19 +1051,26 @@ def main(argv: Sequence[str] | None = None) -> dict:
     run_name = args.run_name or time.strftime("run_%Y%m%d_%H%M%S")
     out_dir = Path(args.out_dir) / run_name
     out_dir.mkdir(parents=True, exist_ok=True)
+    ckpt_dir = out_dir / "checkpoints"
 
-    if getattr(args, "positive_control", False):
-        print(f"[positive-control] device={device}", flush=True)
-        return run_positive_control(cfg, device, out_dir)
+    run_carriage = bool(getattr(args, "carriage", False) or getattr(args, "positive_control", False))
+    carriage_result: dict | None = None
+    if run_carriage:
+        print(f"[carriage] device={device}", flush=True)
+        carriage_result = run_carriage_suite(cfg, device, out_dir / "carriage", ckpt_dir=ckpt_dir,
+                                             force_retrain=args.force_retrain)
+    if args.skip_sweep:
+        return {"out_dir": str(out_dir), "carriage": carriage_result,
+                "figures": (carriage_result or {}).get("figures", [])}
 
     cache_path = out_dir / "results.json"
-    if cache_path.exists():
+    if cache_path.exists() and not args.force_retrain:
         print(f"[cache] loading existing results: {cache_path}", flush=True)
         payload = json.loads(cache_path.read_text())
         rows = payload["rows"]
     else:
         print(f"[run] device={device}  cfg={ {k: cfg[k] for k in ('n','layers','steps','seeds','ranks','graphs')} }", flush=True)
-        rows = run_sweep(cfg, device)
+        rows = run_sweep(cfg, device, ckpt_dir=ckpt_dir, force_retrain=args.force_retrain)
         payload = {"config": cfg, "rows": rows, "device": str(device)}
         cache_path.write_text(json.dumps(payload, indent=2))
         print(f"[cache] wrote {cache_path}", flush=True)
@@ -639,7 +1095,8 @@ def main(argv: Sequence[str] | None = None) -> dict:
                      for xval in xs]
             print(f"  {addressing:10s}/{graph:13s}  " + "   ".join(cells))
 
-    return {"out_dir": str(out_dir), "cache": str(cache_path), "figure": str(fig_path), "rows": rows}
+    return {"out_dir": str(out_dir), "cache": str(cache_path), "figure": str(fig_path),
+            "rows": rows, "carriage": carriage_result}
 
 
 if __name__ == "__main__":

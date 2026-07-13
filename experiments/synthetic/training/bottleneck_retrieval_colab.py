@@ -96,6 +96,17 @@ def main(argv: Sequence[str] | None = None) -> None:
     ap.add_argument("--addressings", nargs="+", default=["content"])
     ap.add_argument("--models", nargs="+", default=["dense", "1hop", "1hop_vnode"])
     ap.add_argument("--distances", type=int, nargs="+", default=[1, 2, 3, 4])
+    # Step-7 carriage suite + caching passthrough
+    ap.add_argument("--carriage", action="store_true", help="also run the symbolic/structural carriage suite (swap+IG, functional+beneficial)")
+    ap.add_argument("--skip-sweep", action="store_true", help="carriage only; skip the accuracy breakaway sweep")
+    ap.add_argument("--force-retrain", action="store_true", help="ignore cached Drive checkpoints and retrain")
+    ap.add_argument("--carriage-graphs", nargs="+", default=["dumbbell", "expander", "wellconnected"])
+    ap.add_argument("--carriage-target-distance", type=int, default=3)
+    ap.add_argument("--carriage-graphs-count", type=int, default=12)
+    ap.add_argument("--channel-start", type=int, default=2)
+    ap.add_argument("--ig-steps", type=int, default=24)
+    ap.add_argument("--rrwp-replacement", default="donor", choices=["donor", "mean", "zero"])
+    ap.add_argument("--donor-samples", type=int, default=4)
     ap.add_argument("--fast-dev-run", action="store_true")
     ap.add_argument("--skip-clone", action="store_true")
     args = ap.parse_args(argv)
@@ -130,26 +141,47 @@ def main(argv: Sequence[str] | None = None) -> None:
         "--graphs", *[str(g) for g in args.graphs],
         "--addressings", *[str(a) for a in args.addressings],
         "--models", *[str(m) for m in args.models],
+        "--carriage-graphs", *[str(g) for g in args.carriage_graphs],
+        "--carriage-target-distance", str(args.carriage_target_distance),
+        "--carriage-graphs-count", str(args.carriage_graphs_count),
+        "--channel-start", str(args.channel_start),
+        "--ig-steps", str(args.ig_steps),
+        "--rrwp-replacement", str(args.rrwp_replacement),
+        "--donor-samples", str(args.donor_samples),
     ]
     if args.distances:
         inner += ["--distances", *[str(d) for d in args.distances]]
+    if args.carriage:
+        inner.append("--carriage")
+    if args.skip_sweep:
+        inner.append("--skip-sweep")
+    if args.force_retrain:
+        inner.append("--force-retrain")
     if args.fast_dev_run:
         inner.append("--fast-dev-run")
 
     result = bnr.main(inner)
     print("\n[done]")
-    print(f"  figure : {result['figure']}")
-    print(f"  cache  : {result['cache']}")
     print(f"  out_dir: {result['out_dir']}")
+    if result.get("figure"):
+        print(f"  breakaway figure: {result['figure']}")
+    if result.get("cache"):
+        print(f"  sweep cache     : {result['cache']}")
+    carriage = result.get("carriage") or {}
+    if carriage.get("figures"):
+        print(f"  carriage figures: {len(carriage['figures'])} under {carriage.get('out_dir')}")
+    print("  checkpoints cached under <out_dir>/checkpoints (re-run reuses them; --force-retrain to rebuild)")
 
 
-# --- fires on paste. Default = the DISTANCE-trend figure: content retrieval, all 3 models,
-#     query->target distance 1..4 (the reach axis). Expect dense flat at ~1.0, 1-hop high at
-#     d=1 and falling as distance grows, and 1-hop+VNode somewhere in between (its failure point
-#     is what we're hunting). Pass --fast-dev-run first to check plumbing. ---
+# --- fires on paste. Default = the full first run: (a) the DISTANCE-trend breakaway (content
+#     retrieval, all 3 models, query->target distance 1..4 -- expect dense flat ~1.0, 1-hop falling
+#     with distance, 1-hop+VNode between), THEN (b) the Step-7 carriage suite (content/node-RRWP/
+#     pair-RRWP x swap/IG x functional/beneficial) on dumbbell vs expander vs wellconnected. Trained
+#     models are cached to Drive, so re-running the cell reuses them and only redoes analysis/figures.
+#     Pass --fast-dev-run first to check plumbing (~1 min). ---
 if __name__ == "__main__":
     main([
-        "--run-name", "distance_trend_v1",
+        "--run-name", "bottleneck_carriage_v1",
         "--steps", "1500",
         "--seeds", "3",
         "--ranks", "1",
@@ -157,4 +189,9 @@ if __name__ == "__main__":
         "--addressings", "content",
         "--graphs", "dumbbell", "wellconnected",
         "--models", "dense", "1hop", "1hop_vnode",
+        "--carriage",
+        "--carriage-graphs", "dumbbell", "expander", "wellconnected",
+        "--carriage-target-distance", "3",
+        "--carriage-graphs-count", "12",
+        "--ig-steps", "24",
     ])
