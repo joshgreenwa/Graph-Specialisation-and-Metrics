@@ -4948,6 +4948,7 @@ def structural_carriage_ig(
     target_index: int = 0,
     readout_ig: bool = False,
     loss_label: Optional[float] = None,
+    batched_vjp: bool = True,
 ) -> Optional[dict[str, Any]]:
     """IG structural carriage over the RRWP input -- the headline analog of ``carriage_ig``.
 
@@ -5047,6 +5048,7 @@ def structural_carriage_ig(
     yhat_clean = float(clean_cache.prediction.reshape(-1)[target_index].detach().cpu().item())
     carriage = h_clean.new_zeros((n, n))
     yhat_endpoint = None
+    use_batched_vjp = bool(batched_vjp)
     for alpha_idx in range(1, int(steps) + 1):
         alpha = float(alpha_idx) / float(steps)
         point = (base + alpha * delta).detach().requires_grad_(True)
@@ -5068,6 +5070,22 @@ def structural_carriage_ig(
         if y is not None:
             g_step = g_step * (1.0 if float(pred_a.detach().cpu().item()) >= y else -1.0)
         carrier_scores = (h * g_step).sum(dim=-1)
+        if use_batched_vjp:
+            try:
+                # One batched VJP computes d carrier_scores[i] / d point for ALL carriers i at once
+                # (is_grads_batched), replacing the O(n) autograd.grad loop -- the ~n x speedup that
+                # makes the structural IG affordable at high sample sizes. Falls back to the loop if
+                # the model has an op that does not support batched grads.
+                eye = torch.eye(n, device=carrier_scores.device, dtype=carrier_scores.dtype)
+                (bgrad,) = torch.autograd.grad(
+                    carrier_scores, point, grad_outputs=eye, is_grads_batched=True,
+                    retain_graph=False, create_graph=False,
+                )
+                per_slot = (bgrad.detach() * delta).sum(dim=-1)          # [n_carrier, S]
+                carriage.index_add_(1, add_src, per_slot[:, active_idx])  # accumulate active slots by source
+                continue
+            except (RuntimeError, TypeError):
+                use_batched_vjp = False
         for i in range(n):
             (grad,) = torch.autograd.grad(carrier_scores[i], point, retain_graph=(i < n - 1), create_graph=False)
             per_row = (grad.detach() * delta).sum(dim=-1)
@@ -5338,8 +5356,9 @@ def symbolic_structural_carriage_rows(
         if bool(cfg_sub.get("run_structural_carriage_ig", True)):
             ig_steps = int(config["perturbation"].get("ig_steps", 32))
             struct_readout_ig = carriage_ig_uses_readout_ig(config) if readout_ig is None else bool(readout_ig)
+            struct_bvjp = carriage_ig_uses_batched_vjp(config)
             for tkind, fac in (("node", "node_rrwp_ig"), ("pair", "pair_rrwp_ig")):
-                res = structural_carriage_ig(adapter, graph, target_kind=tkind, steps=ig_steps, readout_ig=struct_readout_ig)
+                res = structural_carriage_ig(adapter, graph, target_kind=tkind, steps=ig_steps, readout_ig=struct_readout_ig, batched_vjp=struct_bvjp)
                 if res is None:
                     def _shp(key: str) -> Any:
                         t = extras.get(key)
@@ -5362,7 +5381,7 @@ def symbolic_structural_carriage_rows(
                 for j in sources:
                     _emit_carriage_rows(rows, model, gid, j, c_f[:, int(j)], dist, min_distance=min_distance, factor=fac, mode="functional")
                 if yv is not None:
-                    resb = structural_carriage_ig(adapter, graph, target_kind=tkind, steps=ig_steps, readout_ig=struct_readout_ig, loss_label=yv)
+                    resb = structural_carriage_ig(adapter, graph, target_kind=tkind, steps=ig_steps, readout_ig=struct_readout_ig, loss_label=yv, batched_vjp=struct_bvjp)
                     if resb is not None:
                         c_b = resb["carriage"]
                         for j in sources:
