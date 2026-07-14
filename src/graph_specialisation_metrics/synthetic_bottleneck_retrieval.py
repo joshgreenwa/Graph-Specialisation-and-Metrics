@@ -975,13 +975,16 @@ def _carriage_cell_fingerprint(cfg: dict, graph: str, model_name: str, td: int) 
 def compute_carriage_rows(model: nn.Module, model_name: str, graph: str, cfg: dict, td: int,
                           device: torch.device, *, cache_dir: Path | None = None,
                           force: bool = False) -> tuple[list[dict], list[dict], bool]:
-    """Per-(graph, model) carriage rows, cached to ``cache_dir`` (Drive). Returns (rows, completeness,
-    loaded_from_cache) so a mid-run disconnect never loses a completed cell."""
-    path = None
+    """Per-(graph, model) carriage rows, cached to ``cache_dir`` (Drive). Resumable at PROBE-GRAPH
+    granularity: each probe graph's rows are written the moment it finishes (under a per-cell
+    ``parts/`` dir), so an interrupt/restart mid-cell reloads finished graphs and only computes the
+    remaining ones. Returns (rows, completeness, fully_from_cache)."""
+    path = parts_dir = None
     if cache_dir is not None:
         fp = _carriage_cell_fingerprint(cfg, graph, model_name, td)
         path = Path(cache_dir) / f"{graph}__{model_name}__{fp}.json"
-        if path.exists() and not force:
+        parts_dir = Path(cache_dir) / f"{graph}__{model_name}__{fp}__parts"
+        if path.exists() and not force:  # fast path: whole cell already finished
             d = json.loads(path.read_text())
             return d["rows"], d["completeness"], True
     start = int(cfg.get("carriage_channel_start", 2))
@@ -994,21 +997,53 @@ def compute_carriage_rows(model: nn.Module, model_name: str, graph: str, cfg: di
                        value_vocab=cfg["value_vocab"], rrwp_steps=cfg["rrwp_steps"],
                        bridge_edges=cfg["bridge_edges"], degree=cfg["degree"], seed=90210,
                        device=device, addressing="content", target_distance=td)
-    rng = np.random.default_rng(1234)
     rows: list[dict] = []
     completeness: list[dict] = []
+    computed_any = False
+    t0 = time.time()
+    print(f"    [compute {graph}/{model_name}] carriage over {n_graphs} probe graphs "
+          f"(content/node/pair x swap+IG + scale/joint, functional+beneficial, ig_steps={ig_steps}, "
+          f"donors={donors})...", flush=True)
     for gi in range(n_graphs):
-        b1 = _slice_graph(probe, gi)
-        for r in carriage_rows_for_graph(model, model_name, b1, f"{graph}:{gi}", start=start,
-                                         ig_steps=ig_steps, replacement=replacement, donors=donors,
-                                         min_distance=min_distance, rng=rng,
-                                         completeness_out=completeness):
-            r["graph"] = graph
-            rows.append(r)
+        gt = time.time()
+        gpart = (parts_dir / f"graph_{gi:04d}.json") if parts_dir is not None else None
+        if gpart is not None and gpart.exists() and not force:  # resume: this probe graph is done
+            d = json.loads(gpart.read_text())
+            cell, gcomp = d["rows"], d["completeness"]
+            src = "cache"
+        else:
+            gcomp: list[dict] = []
+            # per-graph RNG seed -> each probe graph is deterministic regardless of resume order
+            cell = carriage_rows_for_graph(model, model_name, _slice_graph(probe, gi), f"{graph}:{gi}",
+                                           start=start, ig_steps=ig_steps, replacement=replacement,
+                                           donors=donors, min_distance=min_distance,
+                                           rng=np.random.default_rng(1234 + gi), completeness_out=gcomp)
+            for r in cell:
+                r["graph"] = graph
+            if gpart is not None:
+                gpart.parent.mkdir(parents=True, exist_ok=True)
+                gpart.write_text(json.dumps({"rows": cell, "completeness": gcomp}))
+            computed_any = True
+            src = "computed"
+        rows.extend(cell)
+        completeness.extend(gcomp)
+        done = gi + 1
+        elapsed = time.time() - t0
+        eta = elapsed / max(done, 1) * (n_graphs - done)
+        print(f"      graph {done}/{n_graphs} ({src}, {time.time()-gt:.1f}s, {len(cell)} rows) | "
+              f"total {len(rows)} rows, {elapsed:.0f}s elapsed, ~{eta:.0f}s left", flush=True)
+    print(f"    [compute {graph}/{model_name}] done: {len(rows)} rows in {time.time()-t0:.0f}s", flush=True)
     if path is not None:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps({"rows": rows, "completeness": completeness}))
-    return rows, completeness, False
+        if parts_dir is not None and parts_dir.exists():  # cell finished -> parts are redundant
+            try:
+                for p in parts_dir.glob("graph_*.json"):
+                    p.unlink()
+                parts_dir.rmdir()
+            except OSError:
+                pass
+    return rows, completeness, not computed_any
 
 
 def collect_carriage(cfg: dict, device: torch.device, out_dir: Path, *, graphs: Sequence[str],
