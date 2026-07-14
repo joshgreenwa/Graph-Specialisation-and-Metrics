@@ -1238,26 +1238,33 @@ def plot_carriage_suite(rows: Sequence[dict], accs: Sequence[dict], target_dista
               ("node_rrwp", "Node RRWP (swap)"), ("pair_rrwp", "Pair RRWP (swap)")]
 
     # (0) HEADLINE per task (graph): functional vs beneficial carriage across distance, for the three
-    #     substrates (symbolic content / node-RRWP / pair-RRWP), lines per model. One figure per task.
-    substrates = [("content_ig", "Symbolic (content)"), ("node_rrwp_ig", "Node RRWP"),
-                  ("pair_rrwp_ig", "Pair RRWP")]
+    #     substrates, lines per model. SWAP estimator is primary (it works for structure, where the
+    #     structural-IG can break on real models); the SYMBOLIC panel also overlays content-IG (dashed)
+    #     as a swap/IG alignment check. One figure per task.
+    substrates = [("content", "content_ig", "Symbolic (content)"),
+                  ("node_rrwp", None, "Node RRWP"),
+                  ("pair_rrwp", None, "Pair RRWP")]
     modes = [("functional", "|carriage|  (functional)", "effect_abs"),
              ("beneficial", "beneficial carriage  (<0 = helps task)", "effect_signed")]
     for graph in graphs:
         fig, axes = plt.subplots(3, 2, figsize=(11.5, 12.0), constrained_layout=True)
         acc_txt = "  ".join(f"{a['model'].split('_')[0]}={a['val_acc']:.2f}" for a in accs if a["graph"] == graph)
-        for ri_, (factor, sub_title) in enumerate(substrates):
+        for ri_, (swap_f, ig_f, sub_title) in enumerate(substrates):
             for ci_, (mode, ylabel, value) in enumerate(modes):
                 ax = axes[ri_][ci_]
                 for model in models:
                     style = _MODEL_STYLE.get(model, {})
-                    ds, ys, es = _profile_spread(rows, factor=factor, mode=mode, model=model, graph=graph, value=value)
-                    if not ds:
-                        continue
-                    ax.plot(ds, ys, label=model, markersize=6, linewidth=1.9, **style)
-                    lo = [y - e for y, e in zip(ys, es)]
-                    hi = [y + e for y, e in zip(ys, es)]
-                    ax.fill_between(ds, lo, hi, color=style.get("color", "gray"), alpha=0.15, linewidth=0)
+                    color = style.get("color", "gray")
+                    ds, ys, es = _profile_spread(rows, factor=swap_f, mode=mode, model=model, graph=graph, value=value)
+                    if ds:
+                        ax.plot(ds, ys, label=f"{model} (swap)" if ig_f else model, markersize=6, linewidth=1.9, **style)
+                        ax.fill_between(ds, [y - e for y, e in zip(ys, es)], [y + e for y, e in zip(ys, es)],
+                                        color=color, alpha=0.15, linewidth=0)
+                    if ig_f is not None:  # symbolic: overlay IG (dashed) to check alignment with swap
+                        di, yi, _ = _profile_spread(rows, factor=ig_f, mode=mode, model=model, graph=graph, value=value)
+                        if di:
+                            ax.plot(di, yi, ls="--", marker=style.get("marker"), markersize=4, linewidth=1.3,
+                                    alpha=0.7, color=color, label=f"{model} (IG)")
                 ax.axvline(target_distance, color="k", ls=":", lw=0.9)
                 if mode == "beneficial":
                     ax.axhline(0, color="gray", ls=":", lw=0.9)
@@ -1265,10 +1272,10 @@ def plot_carriage_suite(rows: Sequence[dict], accs: Sequence[dict], target_dista
                 ax.set_xlabel("query→source distance (hops)")
                 ax.set_ylabel(ylabel)
                 ax.grid(alpha=0.3)
-                ax.legend(frameon=False, fontsize=9)
+                ax.legend(frameon=False, fontsize=8)
         fig.suptitle(f"Functional vs beneficial carriage by distance — task: {graph}\n"
-                     f"(content retrieval; dotted = planted target d={target_distance}; val acc  {acc_txt})",
-                     fontsize=13)
+                     f"(swap estimator; symbolic also shows content-IG dashed; dotted = target d={target_distance}; "
+                     f"val acc  {acc_txt})", fontsize=12)
         save(fig, f"carriage_func_vs_benef__{graph}.png")
 
     # (1) Functional carriage by distance on the bottleneck graph -- the substrate decomposition.
@@ -1288,14 +1295,19 @@ def plot_carriage_suite(rows: Sequence[dict], accs: Sequence[dict], target_dista
     save(fig, "carriage_functional_by_distance.png")
 
     # (2) HEADLINE: beneficial carriage at the planted target -- dense transports, 1-hop cannot.
+    #     Swap estimator (robust for structure); content also overlays IG (dashed) for the alignment check.
     fig, axes = plt.subplots(1, 2, figsize=(12, 4.6), constrained_layout=True)
-    for ax, (factor, title) in zip(axes, [("content_ig", "Content beneficial (IG)"),
-                                          ("pair_rrwp_ig", "Pair-RRWP beneficial (IG)")]):
+    for ax, (factor, ig_overlay, title) in zip(axes, [("content", "content_ig", "Content beneficial (swap)"),
+                                                      ("pair_rrwp", None, "Pair-RRWP beneficial (swap)")]):
         for model in models:
-            ds, ys = _profile(rows, factor=factor, mode="beneficial", model=model, graph=primary,
-                              value="effect_signed")
+            style = _MODEL_STYLE.get(model, {})
+            ds, ys = _profile(rows, factor=factor, mode="beneficial", model=model, graph=primary, value="effect_signed")
             if ds:
-                ax.plot(ds, ys, label=model, **_MODEL_STYLE.get(model, {}))
+                ax.plot(ds, ys, label=f"{model} (swap)" if ig_overlay else model, **style)
+            if ig_overlay:
+                di, yi = _profile(rows, factor=ig_overlay, mode="beneficial", model=model, graph=primary, value="effect_signed")
+                if di:
+                    ax.plot(di, yi, ls="--", alpha=0.7, color=style.get("color"), marker=style.get("marker"), label=f"{model} (IG)")
         ax.axvline(target_distance, color="k", ls=":", lw=0.9, label=f"target d={target_distance}")
         ax.axhline(0, color="gray", ls=":", lw=0.8)
         ax.set_title(title)
