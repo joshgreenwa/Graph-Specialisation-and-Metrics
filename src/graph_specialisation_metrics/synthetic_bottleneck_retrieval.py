@@ -1166,6 +1166,21 @@ def _profile(rows: Sequence[dict], *, factor: str, mode: str, model: str, graph:
     return ds, [float(np.mean(by_d[d])) for d in ds]
 
 
+def _profile_spread(rows: Sequence[dict], *, factor: str, mode: str, model: str, graph: str,
+                    value: str) -> tuple[list[int], list[float], list[float]]:
+    """Mean carriage by distance + standard error, over the distance-marginal rows only (excludes the
+    scale/joint rows which also carry a distance)."""
+    by_d: dict[int, list[float]] = {}
+    for r in rows:
+        if (r["factor"] == factor and r["mode"] == mode and r["model"] == model and r["graph"] == graph
+                and r.get("scale") is None and r.get("distance") is not None):
+            by_d.setdefault(int(r["distance"]), []).append(float(r[value]))
+    ds = sorted(by_d)
+    means = [float(np.mean(by_d[d])) for d in ds]
+    sems = [float(np.std(by_d[d]) / max(len(by_d[d]) ** 0.5, 1.0)) for d in ds]
+    return ds, means, sems
+
+
 def _scale_profile(rows: Sequence[dict], *, factor: str, mode: str, model: str, graph: str,
                    value: str = "effect_abs") -> tuple[list[int], list[float]]:
     """Mean carriage by walk-length r for one (factor, mode, model, graph)."""
@@ -1221,6 +1236,40 @@ def plot_carriage_suite(rows: Sequence[dict], accs: Sequence[dict], target_dista
     panels = [("content_ig", "Content (IG)"), ("node_rrwp_ig", "Node RRWP (IG)"),
               ("pair_rrwp_ig", "Pair RRWP (IG)"), ("content", "Content (swap)"),
               ("node_rrwp", "Node RRWP (swap)"), ("pair_rrwp", "Pair RRWP (swap)")]
+
+    # (0) HEADLINE per task (graph): functional vs beneficial carriage across distance, for the three
+    #     substrates (symbolic content / node-RRWP / pair-RRWP), lines per model. One figure per task.
+    substrates = [("content_ig", "Symbolic (content)"), ("node_rrwp_ig", "Node RRWP"),
+                  ("pair_rrwp_ig", "Pair RRWP")]
+    modes = [("functional", "|carriage|  (functional)", "effect_abs"),
+             ("beneficial", "beneficial carriage  (<0 = helps task)", "effect_signed")]
+    for graph in graphs:
+        fig, axes = plt.subplots(3, 2, figsize=(11.5, 12.0), constrained_layout=True)
+        acc_txt = "  ".join(f"{a['model'].split('_')[0]}={a['val_acc']:.2f}" for a in accs if a["graph"] == graph)
+        for ri_, (factor, sub_title) in enumerate(substrates):
+            for ci_, (mode, ylabel, value) in enumerate(modes):
+                ax = axes[ri_][ci_]
+                for model in models:
+                    style = _MODEL_STYLE.get(model, {})
+                    ds, ys, es = _profile_spread(rows, factor=factor, mode=mode, model=model, graph=graph, value=value)
+                    if not ds:
+                        continue
+                    ax.plot(ds, ys, label=model, markersize=6, linewidth=1.9, **style)
+                    lo = [y - e for y, e in zip(ys, es)]
+                    hi = [y + e for y, e in zip(ys, es)]
+                    ax.fill_between(ds, lo, hi, color=style.get("color", "gray"), alpha=0.15, linewidth=0)
+                ax.axvline(target_distance, color="k", ls=":", lw=0.9)
+                if mode == "beneficial":
+                    ax.axhline(0, color="gray", ls=":", lw=0.9)
+                ax.set_title(f"{sub_title} — {mode}", fontsize=11)
+                ax.set_xlabel("query→source distance (hops)")
+                ax.set_ylabel(ylabel)
+                ax.grid(alpha=0.3)
+                ax.legend(frameon=False, fontsize=9)
+        fig.suptitle(f"Functional vs beneficial carriage by distance — task: {graph}\n"
+                     f"(content retrieval; dotted = planted target d={target_distance}; val acc  {acc_txt})",
+                     fontsize=13)
+        save(fig, f"carriage_func_vs_benef__{graph}.png")
 
     # (1) Functional carriage by distance on the bottleneck graph -- the substrate decomposition.
     fig, axes = plt.subplots(2, 3, figsize=(16, 8.5), constrained_layout=True)
