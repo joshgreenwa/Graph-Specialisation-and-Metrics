@@ -5607,23 +5607,32 @@ def run_symbolic_structural_probe(models: Sequence[ModelRun], artifact_root: Pat
     if completeness_rows:
         write_csv(artifact_root / "metrics" / "step7_structural_carriage_ig_completeness.csv", completeness_rows)
 
-        def _rel(kinds: set[str]) -> Optional[float]:
+        def _rel_scale(kinds: set[str]) -> tuple[Optional[float], Optional[float]]:
+            """(rel-err, mean|dy_hat|). rel-err = mean|Sum C - dy_hat| / mean|dy_hat|; the SCALE matters
+            because on a task where a perturbation barely moves the prediction (e.g. CONTENT on the
+            structural peptides task) mean|dy_hat| is tiny and rel-err inflates even when IG is fine."""
             e = [safe_float(r["abs_error"]) for r in completeness_rows
                  if str(r.get("target_kind")) in kinds and math.isfinite(safe_float(r.get("abs_error")))]
             t = [abs(safe_float(r["completeness_target"])) for r in completeness_rows
-                 if str(r.get("target_kind")) in kinds]
-            return None if not e else float(np.mean(e)) / (float(np.mean(t)) + 1e-9)
+                 if str(r.get("target_kind")) in kinds and math.isfinite(safe_float(r.get("completeness_target")))]
+            if not e:
+                return None, None
+            return float(np.mean(e)) / (float(np.mean(t)) + 1e-12), (float(np.mean(t)) if t else None)
 
         def _fmt(x: Optional[float]) -> str:
             return "n/a" if x is None else f"{x:.1e}"
 
-        rel_c, rel_s = _rel({"content"}), _rel({"node", "pair"})
+        rel_c, scale_c = _rel_scale({"content"})
+        rel_s, scale_s = _rel_scale({"node", "pair"})
         completeness_note = (
-            f"IG completeness rel-err -- content: {_fmt(rel_c)}   structural: {_fmt(rel_s)}   "
-            "(Sum C == y_hat_clean - y_hat_base; ~0 certifies IG as the anchor)"
+            f"IG completeness rel-err -- content: {_fmt(rel_c)} (|dy_hat|~{_fmt(scale_c)})   "
+            f"structural: {_fmt(rel_s)} (|dy_hat|~{_fmt(scale_s)})   "
+            "(Sum C == y_hat_clean - y_hat_base; rel-err is inflated when |dy_hat| is tiny, "
+            "e.g. content carriage on a structural task)"
         )
-        progress(f"Step 7 IG completeness: content rel~{_fmt(rel_c)}, structural rel~{_fmt(rel_s)} "
-                 "(should be ~0 -- the IG self-test on real GRIT)")
+        progress(f"Step 7 IG completeness: content rel~{_fmt(rel_c)} |dy_hat|~{_fmt(scale_c)}, "
+                 f"structural rel~{_fmt(rel_s)} |dy_hat|~{_fmt(scale_s)} "
+                 "(rel-err inflates when |dy_hat| is tiny -- read the scale before trusting rel-err)")
     # --- coverage diagnostics: which (model, factor, mode) combos actually produced rows? ---
     # This is the antidote to silent single-model panels: the CSV + log say exactly which models
     # are present/missing per factor, so a dropout is a data-availability fact, not a mystery.
