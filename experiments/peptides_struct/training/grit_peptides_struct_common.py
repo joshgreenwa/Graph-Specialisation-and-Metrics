@@ -315,7 +315,10 @@ def install_peptides_dependencies(base: Any) -> None:
                 "try:\n"
                 "    from ogb.utils import smiles2graph\n"
                 "except ImportError:\n"
-                "    from ogb.utils.mol import smiles2graph\n"
+                "    try:\n"
+                "        from ogb.utils.mol import smiles2graph\n"
+                "    except ImportError:\n"
+                "        from ogb.utils.features import smiles2graph\n"
                 "assert Chem.MolFromSmiles('CCO') is not None; "
                 "assert smiles2graph('CCO')['num_nodes'] == 3; "
                 "print('Peptides deps OK: RDKit + OGB smiles2graph')"
@@ -346,7 +349,10 @@ def apply_peptides_dataset_compat_patch(base: Any, repo_dir: Path) -> None:
                 "try:\n"
                 "    from ogb.utils import smiles2graph\n"
                 "except ImportError:\n"
-                "    from ogb.utils.mol import smiles2graph\n"
+                "    try:\n"
+                "        from ogb.utils.mol import smiles2graph\n"
+                "    except ImportError:\n"
+                "        from ogb.utils.features import smiles2graph\n"
             ),
             1,
         )

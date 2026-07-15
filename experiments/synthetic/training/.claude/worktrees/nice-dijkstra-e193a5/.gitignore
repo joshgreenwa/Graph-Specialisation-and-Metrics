@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.venv/
+venv/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Local/editor state
+.DS_Store
+.idea/
+.vscode/
+
+# Large generated artifacts
+checkpoints/**/*.pt
+checkpoints/**/*.pth
+checkpoints/**/*.ckpt
+checkpoints/**/*.bin
+data/**/raw/
+data/**/processed/
+data/**/*.pt
+data/**/*.pth
+outputs/
+runs/
+wandb/
+
+# Keep documentation placeholders
+!checkpoints/**/README.md
+!data/**/README.md

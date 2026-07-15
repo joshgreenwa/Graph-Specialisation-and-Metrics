@@ -5663,6 +5663,7 @@ def run_symbolic_structural_probe(models: Sequence[ModelRun], artifact_root: Pat
     write_csv(artifact_root / "metrics" / "step7_carriage_by_distance_summary.csv", step7_by_distance_summary_rows(rows))
     write_csv(artifact_root / "metrics" / "step7_carriage_reach_summary.csv", step7_reach_summary_rows(rows, tau=reach_tau))
     write_csv(artifact_root / "metrics" / "step7_method_agreement_summary.csv", step7_method_agreement_rows(rows))
+    write_csv(artifact_root / "metrics" / "step7_cumulative_summary.csv", step7_cumulative_summary_rows(rows))
     # Each figure is rendered independently so one failing render can NEVER wipe the others, and the
     # figures actually written are logged so "zero figures" is impossible to mistake for a silent crash.
     renders: list[tuple[str, Any]] = [
@@ -5670,6 +5671,7 @@ def run_symbolic_structural_probe(models: Sequence[ModelRun], artifact_root: Pat
         ("funcbenef_ig", lambda: render_step7_funcbenef_grid(rows, artifact_root, dpi=dpi, method="ig")),
         ("funcbenef_swap", lambda: render_step7_funcbenef_grid(rows, artifact_root, dpi=dpi, method="swap")),
         ("funcbenef_carriage", lambda: render_carriage_functional_vs_beneficial(rows, artifact_root, dpi=dpi, completeness_note=completeness_note)),
+        ("cumulative_carriage", lambda: render_step7_cumulative_carriage(rows, artifact_root, dpi=dpi)),
         ("reach_summary", lambda: render_step7_reach_summary(rows, artifact_root, dpi=dpi, tau=reach_tau)),
         ("ig_vs_swap_agreement", lambda: render_step7_method_agreement(rows, artifact_root, dpi=dpi, completeness_note=completeness_note)),
         ("rrwp_by_scale", lambda: render_symbolic_structural_by_scale(rows, artifact_root, dpi=dpi)),
@@ -5703,6 +5705,31 @@ def _bootstrap_mean_ci(
     lo = float(np.percentile(boot, 100.0 * alpha / 2.0))
     hi = float(np.percentile(boot, 100.0 * (1.0 - alpha / 2.0)))
     return mean, lo, hi, n
+
+
+def _signflip_null_band(
+    values: Sequence[float], rng: np.random.Generator, *, n_boot: int = 1000, alpha: float = 0.05
+) -> tuple[float, float, int]:
+    """Sign-randomised null band (ci_lo, ci_hi, n) for a bucket of beneficial-carriage values.
+
+    Under the null "the transport direction is unrelated to the target", each pair contributes its
+    OBSERVED magnitude with a random +/- sign, so the null mean is centred on 0 with a spread set by
+    the magnitudes and the sample size. The returned interval is the central (1 - alpha) range of that
+    sign-flipped mean: a measured beneficial mean INSIDE this band is statistically indistinguishable
+    from directionless (dispensable) transport of the same magnitude; OUTSIDE it is genuinely
+    beneficial (<0) or adverse (>0). This is the "noise floor" the beneficial curves are read against.
+    """
+    x = np.asarray([abs(float(v)) for v in values if math.isfinite(float(v))], dtype=float)
+    n = int(x.size)
+    if n == 0:
+        return float("nan"), float("nan"), 0
+    if n == 1:
+        return -float(x[0]), float(x[0]), 1
+    signs = rng.integers(0, 2, size=(int(n_boot), n)) * 2 - 1
+    boot = (signs * x).mean(axis=1)
+    lo = float(np.percentile(boot, 100.0 * alpha / 2.0))
+    hi = float(np.percentile(boot, 100.0 * (1.0 - alpha / 2.0)))
+    return lo, hi, n
 
 
 def _step7_series(
@@ -5786,6 +5813,7 @@ def render_carriage_functional_vs_beneficial(
     functionally far-reaching yet beneficial only short-range. Missing models annotated in red.
     """
     from matplotlib.lines import Line2D
+    from matplotlib.patches import Patch
 
     triples = [
         ("content_ig", "content", "Content"),
@@ -5826,6 +5854,12 @@ def render_carriage_functional_vs_beneficial(
                 if not ds_i and not ds_s:
                     missing.append(model_label(m))
             if mode == "beneficial":
+                # Sign-flip null band (grey): where the beneficial line sits INSIDE it, the signed
+                # carriage at that distance is indistinguishable from directionless transport of the
+                # same magnitude -- i.e. dispensable, NOT "harmful". Computed on the IG factor.
+                dn, ln, hn = _step7_null_envelope(rows, fi, models, rng)
+                if dn:
+                    ax.fill_between(dn, ln, hn, color="0.5", alpha=0.15, lw=0, zorder=0)
                 ax.axhline(0, color="k", lw=0.7, ls=":")
             ax.set_title(f"{sub}: {title}")
             ax.set_xlabel("carrier<->source distance (hops)")
@@ -5838,6 +5872,7 @@ def render_carriage_functional_vs_beneficial(
     handles += [
         Line2D([0], [0], color="0.25", ls="-", marker="o", ms=4, label="IG (shaded = 95% CI)"),
         Line2D([0], [0], color="0.25", ls="--", marker="s", ms=4, label="finite-swap (bars = 95% CI)"),
+        Patch(facecolor="0.5", alpha=0.3, label="sign-flip null (95%): inside = dispensable"),
     ]
     fig.legend(handles=handles, loc="upper center", ncol=min(len(handles), 5), fontsize=8,
                frameon=False, bbox_to_anchor=(0.5, 1.0))
@@ -5890,6 +5925,12 @@ def render_step7_funcbenef_grid(rows: Sequence[Mapping[str, Any]], artifact_root
                 else:
                     missing.append(model_label(m))
             if mode == "beneficial":
+                dn, ln, hn = _step7_null_envelope(rows, factor, models, rng)
+                if dn:
+                    ax.fill_between(dn, ln, hn, color="0.5", alpha=0.15, lw=0, zorder=0)
+                    if c == 0:
+                        ax.text(0.98, 0.03, "grey = sign-flip null (95%)", transform=ax.transAxes,
+                                ha="right", va="bottom", fontsize=6.5, color="0.4")
                 ax.axhline(0, color="k", lw=0.7, ls=":")
             ax.set_title(f"{sub}: {title}")
             ax.set_xlabel("carrier<->source distance (hops)")
@@ -5908,6 +5949,163 @@ def render_step7_funcbenef_grid(rows: Sequence[Mapping[str, Any]], artifact_root
     figures = ensure_dir(artifact_root / "figures")
     fig.savefig(figures / f"step7_functional_vs_beneficial_{method}.png", dpi=dpi)
     fig.savefig(figures / f"step7_functional_vs_beneficial_{method}.pdf")
+    plt.close(fig)
+
+
+def _step7_null_envelope(
+    rows: Sequence[Mapping[str, Any]], factor: str, models: Sequence[str], rng: np.random.Generator,
+    *, mode: str = "beneficial", value_key: str = "effect_signed",
+) -> tuple[list[int], list[float], list[float]]:
+    """Per-distance sign-flip null band for `factor`, taken as the ENVELOPE (min lo / max hi) over the
+    given models so a SINGLE grey band can stand for the noise floor without per-model clutter. The
+    envelope is conservative (as wide as the noisiest model at each distance), which is exactly the
+    model that carries far -- so a far beneficial line inside it reads as 'within noise' correctly.
+    """
+    per_model: dict[str, dict[int, list[float]]] = {}
+    for m in models:
+        by: dict[int, list[float]] = {}
+        for d, v in _step7_pairs(rows, factor, m, mode, value_key):
+            by.setdefault(d, []).append(v)
+        per_model[str(m)] = by
+    ds_all = sorted({d for by in per_model.values() for d in by})
+    ds: list[int] = []
+    lo: list[float] = []
+    hi: list[float] = []
+    for d in ds_all:
+        los: list[float] = []
+        his: list[float] = []
+        for m in models:
+            vals = per_model[str(m)].get(d)
+            if vals:
+                l_, h_, _n = _signflip_null_band(vals, rng)
+                if math.isfinite(l_) and math.isfinite(h_):
+                    los.append(l_)
+                    his.append(h_)
+        if los:
+            ds.append(int(d))
+            lo.append(min(los))
+            hi.append(max(his))
+    return ds, lo, hi
+
+
+def _step7_cumulative(pairs: Sequence[tuple[int, float]]) -> tuple[list[int], list[float]]:
+    """Cumulative carriage mass vs distance, normalised to the model's own total (completeness).
+
+    Sums the value at each distance, then cumulatively, and divides by the grand total so the curve
+    ends at 1.0. For FUNCTIONAL (value = |carriage|) the total is the total transported magnitude and
+    the curve rises monotonically 0 -> 1 (how far the reach extends). For BENEFICIAL (value = signed
+    carriage) the total is the net loss reduction L_clean - L_base, so the curve shows what fraction of
+    the net benefit is delivered by distance d; it can OVERSHOOT 1.0 (short range already delivers the
+    full benefit) and settle back if the far tail is mildly adverse. Empty if the total is ~0.
+    """
+    if not pairs:
+        return [], []
+    by: dict[int, float] = {}
+    for d, v in pairs:
+        by[int(d)] = by.get(int(d), 0.0) + float(v)
+    ds = sorted(by)
+    total = sum(by[d] for d in ds)
+    if abs(total) < 1e-12:
+        return [], []
+    run = 0.0
+    frac: list[float] = []
+    for d in ds:
+        run += by[d]
+        frac.append(run / total)
+    return ds, frac
+
+
+def step7_cumulative_summary_rows(rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Flat (factor, method, model, mode, distance, cumulative_fraction) table -- the quantitative
+    backing for statements like 'X% of beneficial content carriage is captured within 1 hop'."""
+    combos = [
+        ("content_ig", "Content", "ig"), ("content", "Content", "swap"),
+        ("node_rrwp_ig", "Node RRWP", "ig"), ("node_rrwp", "Node RRWP", "swap"),
+        ("pair_rrwp_ig", "Pair RRWP", "ig"), ("pair_rrwp", "Pair RRWP", "swap"),
+    ]
+    models = ordered_model_names(sorted({str(r.get("model")) for r in rows}))
+    out: list[dict[str, Any]] = []
+    for factor, label, method in combos:
+        for m in models:
+            for mode, vk in (("functional", "effect_abs"), ("beneficial", "effect_signed")):
+                ds, fr = _step7_cumulative(_step7_pairs(rows, factor, m, mode, vk))
+                for d, f in zip(ds, fr):
+                    out.append({
+                        "factor": factor, "factor_label": label, "method": method, "model": m,
+                        "mode": mode, "distance": int(d), "cumulative_fraction": f,
+                    })
+    return out
+
+
+def render_step7_cumulative_carriage(rows: Sequence[Mapping[str, Any]], artifact_root: Path, *, dpi: int) -> None:
+    """Cumulative carriage vs distance -- the figure that stops the per-distance beneficial curve being
+    misread as '>1 hop harms the task'.
+
+    Each curve is the running fraction of the model's OWN total carriage (the completeness sum) captured
+    within distance d. Top row (functional, |carriage|) rises toward 1.0 slowly for a far-reaching model
+    -- reach is real. Bottom row (beneficial, signed carriage; total = net loss reduction) typically
+    reaches ~1.0 within 1-2 hops -- essentially ALL task-useful transport is short-range. A beneficial
+    curve that overshoots 1.0 and settles back means <=1 hop already delivers the full net benefit and
+    the far tail is at most mildly adverse (it gives a little back), NOT that far transport harms the
+    task. IG solid, finite-swap dashed; dotted line = 100% of the completeness total.
+    """
+    from matplotlib.lines import Line2D
+
+    triples = [("content_ig", "content", "Content"), ("node_rrwp_ig", "node_rrwp", "Node RRWP"),
+               ("pair_rrwp_ig", "pair_rrwp", "Pair RRWP")]
+    triples = [(fi, fs, t) for fi, fs, t in triples if any(str(r.get("factor")) in (fi, fs) for r in rows)]
+    if not triples:
+        return
+    involved = {f for fi, fs, _ in triples for f in (fi, fs)}
+    models = ordered_model_names(sorted({str(r["model"]) for r in rows if str(r.get("factor")) in involved}))
+    if not models:
+        return
+    palette = plt.cm.tab10.colors
+    color = {m: palette[i % len(palette)] for i, m in enumerate(models)}
+    layout = [
+        ("functional", "effect_abs", "cumulative |carriage| (frac of total)", "Functional reach"),
+        ("beneficial", "effect_signed", "cumulative carriage (frac of net benefit)", "Beneficial"),
+    ]
+    fig, axes = plt.subplots(2, len(triples), figsize=(4.9 * len(triples), 8.0), squeeze=False)
+    for c, (fi, fs, title) in enumerate(triples):
+        for ridx, (mode, vk, ylab, sub) in enumerate(layout):
+            ax = axes[ridx][c]
+            missing: list[str] = []
+            for m in models:
+                di, fri = _step7_cumulative(_step7_pairs(rows, fi, m, mode, vk))
+                dsw, frsw = _step7_cumulative(_step7_pairs(rows, fs, m, mode, vk))
+                got = False
+                if di:
+                    ax.plot(di, fri, "-o", ms=3.5, lw=1.8, color=color[m])
+                    got = True
+                if dsw:
+                    ax.plot(dsw, frsw, "--s", ms=3.0, lw=1.3, alpha=0.85, color=color[m])
+                    got = True
+                if not got:
+                    missing.append(model_label(m))
+            ax.axhline(1.0, color="k", lw=0.8, ls=":")
+            if mode == "beneficial":
+                ax.axhline(0.0, color="0.6", lw=0.6, ls=":")
+            ax.set_title(f"{sub}: {title}")
+            ax.set_xlabel("carrier<->source distance (hops)")
+            ax.set_ylabel(ylab)
+            ax.grid(alpha=0.3)
+            if missing:
+                ax.text(0.98, 0.03, "no data: " + ", ".join(missing), transform=ax.transAxes,
+                        ha="right", va="bottom", fontsize=6.5, color="crimson")
+    handles = [Line2D([0], [0], color=color[m], lw=2, label=model_label(m)) for m in models]
+    handles += [
+        Line2D([0], [0], color="0.25", ls="-", marker="o", ms=4, label="IG"),
+        Line2D([0], [0], color="0.25", ls="--", marker="s", ms=4, label="finite-swap"),
+        Line2D([0], [0], color="k", ls=":", label="100% of total (completeness)"),
+    ]
+    fig.legend(handles=handles, loc="upper center", ncol=min(len(handles), 6), fontsize=8,
+               frameon=False, bbox_to_anchor=(0.5, 1.0))
+    fig.suptitle("Cumulative carriage vs distance: beneficial saturates short-range, functional reaches far", y=0.965)
+    fig.tight_layout(rect=(0, 0.02, 1, 0.93))
+    figures = ensure_dir(artifact_root / "figures")
+    fig.savefig(figures / "step7_cumulative_carriage.png", dpi=dpi, bbox_inches="tight")
+    fig.savefig(figures / "step7_cumulative_carriage.pdf", bbox_inches="tight")
     plt.close(fig)
 
 

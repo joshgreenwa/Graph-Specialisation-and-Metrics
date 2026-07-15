@@ -1,0 +1,151 @@
+% ======================================================================
+%  Synthetic validation of (beneficial) carriage  --  drop-in fragments
+%  Figures live in experiments/synthetic/beneficial_carriage/figures/
+% ======================================================================
+
+% ----------------------------------------------------------------------
+%  Very brief findings summary
+% ----------------------------------------------------------------------
+\begin{itemize}\itemsep=2pt
+  \item The first-order \emph{benefit-sign} estimator (project default) is unreliable: on
+        a planted-ground-truth synthetic it ranks spuriously-used, task-irrelevant nodes
+        \emph{above} genuinely beneficial ones, and on a well-fit trained model it collapses
+        to chance (AUROC $0.54$) because the residual sign is noise.
+  \item Beneficial usage \emph{is} recoverable: a direct on-manifold intervention
+        (finite-swap loss difference) reaches AUROC $1.0$ on a dense graph transformer and
+        rises monotonically with model capability.
+  \item Functional carriage is the robust \emph{mechanistic} object but is \emph{not} a
+        benefit proxy (chance on weak models; over-flags distractors on partially-trained ones).
+  \item Over-squashing: functional-carriage \emph{reach} falls well short of the reachability
+        wall $kL$ (compression-limited), so $k$-hop masking probes compression survival, not
+        reachability; the dense-attention niche is the long-range band.
+  \item Estimator form: many-swap direct expectation $\equiv$ expected gradients ($\sim\!16$
+        swaps suffice, fewer if well-fit); a single deterministic mean-baseline (IG) is the
+        cheap default; additive perturbation $<$ full replacement.
+  \item \textbf{Off-manifold robustness is set by the intervention \emph{policy}, not the
+        estimator form}: matched-donor swaps are immune to a tunable off-manifold-risk dial
+        $\kappa$; donor-free methods degrade in proportion to input disruption
+        (small-perturbation $>$ IG $>$ marginal $\gg$ first-order); the required donor quality
+        rises with $\kappa$.
+\end{itemize}
+
+% ----------------------------------------------------------------------
+%  Experiments (intro + outline)
+% ----------------------------------------------------------------------
+\subsection{Synthetic validation of carriage estimators}
+We validate the carriage estimators on controlled synthetics where the ground-truth benefit
+of each node is known by construction, isolating (i) estimator bias, (ii) behaviour on trained
+models, (iii) the over-squashing prediction, and (iv) robustness once interventions leave the
+data manifold.
+
+\paragraph{Notation and synthetic tasks.}
+Common notation: readout $\hat y$, label $y$, loss $L=|\hat y-y|$; node $j$ has content $x_j$;
+an intervention replaces $x_j$ and yields $\hat y'$.
+
+\emph{Associative recall (E3--E6).} A path graph of $N$ nodes with node $0$ the readout. Each
+node $j\!\ge\!1$ holds a key $k_j\!\in\!\mathbb{R}^{d_k}$ and scalar value $v_j$; node $0$ holds
+a query equal to the key of a uniformly random \emph{matched} node $j^{\star}$. The label is
+$y=v_{j^{\star}}$ (retrieve the value whose key matches the query). The model is a masked graph
+transformer with $L$ layers and per-layer attention radius $k$ (global $=\!N\!-\!1$), so the
+information reach is $kL$. The matched node $j^{\star}$ is the unique beneficial node and all
+others are distractors, giving exact per-graph ground truth; the score is the AUROC with which a
+measure ranks $j^{\star}$ above distractors.
+
+\emph{Additive regression (E1).} $N$ nodes with content $x_j\!\sim\!\mathcal{N}(0,1)$; model
+$\hat y=\sum_j c_j x_j+b$, task $y=\sum_j a_j x_j+\varepsilon$. Node classes are planted by
+$(a_j,c_j)$: beneficial $(1,1)$, harmful $(1,-1)$, neutral $(0,1)$, unused $(1,0)$. Ground-truth
+benefit is the on-manifold leave-one-out loss change
+$B^{\star}_j=\mathbb{E}_{x_j'}\!\big[L(\hat y(x_{j\to x_j'}))\big]-L(\hat y)$.
+
+\emph{Off-manifold wrapper (E6).} Each node carries a checksum $s_j=v_j$; the data manifold is
+$\{s_j=v_j\}$. We wrap a trained model as $\hat y_\kappa(X)=\mathrm{GT}(X)+\kappa\sum_j(v_j-s_j)^2$.
+Swaps that preserve the checksum (matched donors) stay on-manifold ($\kappa$ inert); swaps that
+change $v_j$ alone are off-manifold. A quality-$q$ donor leaves residual mismatch $(1-q)$, i.e.\
+penalty $\kappa(1-q)^2(v_j'-v_j)^2$. The dial $\kappa$ is off-manifold risk and $q\!\in\![0,1]$ is
+donor quality.
+
+\emph{Follow-ups (folded into the figures).} (i) sample-size scaling of every estimator on the
+trained models (E5); (ii) the full estimator set (adding \texttt{direct\_crn},
+\texttt{perturb\_large}, \texttt{eg}) vs.\ $\kappa$, showing off-manifold behaviour tracks the
+intervention \emph{policy} not the estimator form; (iii) the matched-donor quality sweep
+$q\!\in\![0,1]$ (E6, Fig.~\ref{fig:offman}b).
+
+\paragraph{E1: Estimator bias under known ground truth.}
+An additive node-feature regression in which each node is planted as beneficial, harmful,
+neutral (used but task-irrelevant), or unused; the on-manifold leave-one-out loss change is the
+ground-truth benefit. We compare first-order sign estimators against the direct loss-difference
+across loss regimes (well-fit, biased, noisy, overshoot, non-linear). Fig.~\ref{fig:neutral}.
+
+\paragraph{E2: Robustness under an unknown manifold.}
+E1 assumes an oracle resampler. Here matched swaps must be built from data (nearest-neighbour /
+learned conditional) and the model is a trained MLP. We show estimator quality collapses smoothly
+with environment-signature identifiability and that the naive variance ``health gate'' does not
+detect the collapse.
+
+\paragraph{E3: Beneficial usage on trained models.}
+Masked graph transformers trained on path-graph associative recall (dense/global vs.\ radius-$k$),
+where the queried node is the unique beneficial node per graph. We report AUROC for each measure
+identifying that node. Fig.~\ref{fig:trained}.
+
+\paragraph{E4: $k$-hop over-squashing and carriage reach.}
+The same models across attention radius $k$: functional carriage by distance, carriage reach vs.\
+the reachability wall $kL$, and held-out skill by distance. Fig.~\ref{fig:khop}.
+
+\paragraph{E5: Practical estimators and sample size.}
+On the trained dense model (well-fit) and a radius-$5$ model (natural error), AUROC vs.\ sample
+size for six estimators, in the on-manifold regime. Fig.~\ref{fig:estim}.
+
+\paragraph{E6: Tunable off-manifold risk.}
+A checksum-penalty wrapper $\hat y_\kappa(X)=\mathrm{GT}(X)+\kappa\sum_j (v_j-s_j)^2$ makes
+off-manifold-ness a controllable dial $\kappa$ with intact ground truth: swaps that respect the
+checksum (matched donors) stay on-manifold, all others do not. We sweep every estimator against
+$\kappa$ and sweep matched-donor \emph{quality} $q$. Fig.~\ref{fig:offman}.
+
+% ----------------------------------------------------------------------
+%  Appendix: estimators of beneficial carriage
+% ----------------------------------------------------------------------
+\subsection{Estimators of (beneficial) carriage}
+\label{app:estimators}
+Let $\hat y$ be the readout on a graph with content $x$, $y$ the label, $L=|\hat y-y|$ the loss,
+$g=\partial\hat y/\partial h^{L}$ the readout gradient, and $h^{L}$ the final node states. An
+intervention replaces source node $j$'s content and yields $\hat y'$. The \emph{main} methodology
+retains only functional carriage, matched-donor direct beneficial carriage, and the
+small-perturbation fallback; the remaining variants are recorded here.
+
+\begin{description}
+\item[Functional carriage (main).] $C_{ij}=g_i\!\cdot\!\big(h^{L}_i(x)-h^{L}_i(x_{j\to\cdot})\big)$,
+  aggregated as $|C|$ by hop distance. Label-free: how much source $j$'s content moves the output
+  through carrier $i$. Robust across all our settings.
+
+\item[Beneficial carriage, general form.] $B_j=\mathbb{E}_{\text{swap}}\!\big[L(\hat y',y)\big]-L(\hat y,y)$.
+  Positive $\Rightarrow$ node $j$'s true content reduces task loss. Every estimator below is an
+  instance differing only in the \emph{intervention policy} used to obtain $\hat y'$.
+
+\item[First-order / benefit-sign (deprecated).]
+  $B^{\text{fo}}_j=\operatorname{sign}(\hat y-y)\,(\mathbb{E}\,\hat y'-\hat y)$: a first-order Taylor
+  expansion of the $L_1$ loss at the clean point. Fails when $\hat y\!\approx\!y$ (sign is noise) and
+  mis-attributes spuriously-used nodes; do not use.
+
+\item[Direct finite-swap, Monte-Carlo (main).]
+  $B^{\text{dir}}_j=\tfrac1K\sum_k |\hat y'_k-y|-|\hat y-y|$ over $K$ i.i.d.\ swaps. The swap
+  \emph{policy} determines on/off-manifold behaviour:
+  \emph{marginal} (resample from the feature marginal; off-manifold on constrained graphs);
+  \emph{matched-donor} (copy real content from a same-environment node; on-manifold; \textbf{robust});
+  \emph{common-random-numbers} (shared draws across nodes; variance-reduced ranking).
+
+\item[Perturbation (main, fallback).]
+  $B^{\text{prt}}_j=\tfrac1K\sum_k |\hat y(x+\delta_k)-y|-|\hat y-y|$ with small $\delta$. Least
+  input disruption, hence the most off-manifold-tolerant donor-free option, at the cost of signal.
+
+\item[Integrated / expected gradients.]
+  Single mean-baseline IG integrates $\partial L/\partial x_j$ along $x_j^{\text{base}}\!\to\!x_j$
+  (deterministic, cheap); expected gradients averages IG over data baselines and estimates the
+  \emph{same} quantity as direct MC, differing only in variance/compute. Off-manifold behaviour is
+  inherited from the baseline policy, exactly as for direct swaps.
+\end{description}
+
+\noindent\textbf{Take-away.} On-manifold, the direct expectation (equivalently EG) is the estimator
+of choice and the single deterministic mean-baseline is a cheap approximation; first-order is
+unusable on well-fit models. Off-manifold, robustness is governed by how far the intervention
+departs the manifold: matched-donor swaps are immune, small perturbations degrade slowly, and
+marginal / IG / first-order collapse.
