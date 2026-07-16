@@ -132,11 +132,18 @@ def run(variant,task):
         _,cs=capf(*struct_swap(j)); vd,ad=delta(cs); str_v+=vd; str_a+=ad
     sem_v/=(N-1); sem_a/=(N-1); str_v/=(N-1); str_a/=(N-1)
     # ---- Method 1: content-transposition equivariance (semantic) / invariance (structural) ----
-    # transpose content of a node pair (i,j); per query, per head, measure how much the attention to
-    # i,j SWAPPED (equivariant, t=1) vs STAYED (invariant, t=0); alpha-weight by attention on {i,j}.
-    S=6 if SMOKE else 40; ar=torch.arange(G); Hh=torch.arange(HEADS); Nn=torch.arange(N)
-    def col(A,c): return A[ar[:,None,None],Hh[None,:,None],Nn[None,None,:],c[:,None,None]]  # [G,heads,N]
-    sem1=np.zeros((L,HEADS)); wsum=np.zeros((L,HEADS))
+    # Transpose content of a node pair (i,j) at input; per query row look at the 2-vector of attention
+    # RECEIVED by (i,j): before p=(a,b), after p'=(ap,bp), swap-target p^swap=(b,a).  Two INDEPENDENT
+    # agreements (not a single fraction) -> genuine 2-D scatter, and a uniform head scores BOTH = 1:
+    #   equivariance (semantic)   = 1 - ||p'-p^swap|| / (||p^swap-p|| + f)   (1 = attention swapped)
+    #   invariance   (structural) = 1 - ||p'-p||      / (||p^swap-p|| + f)   (1 = attention unchanged)
+    # per query, clamp to [0,1], then average over queries/samples/graphs.  RAW = alpha-weighted (w=a+b);
+    # CENTRED = differential-weighted (w=|a-b|), which drops uniform-background queries (that trivially
+    # score both=1) so only selectively-routing queries survive.
+    S=6 if SMOKE else 40; ar=torch.arange(G); Hh=torch.arange(HEADS); Nn=torch.arange(N); F=0.02
+    def col(A,c): return A[ar[:,None,None],Hh[None,:,None],Nn[None,None,:],c[:,None,None]]  # [G,heads,N(query)]
+    eqv=np.zeros((L,HEADS)); inv=np.zeros((L,HEADS)); wr=np.zeros((L,HEADS))     # raw (alpha-weighted)
+    eqvc=np.zeros((L,HEADS)); invc=np.zeros((L,HEADS)); wc=np.zeros((L,HEADS))   # centred (differential-weighted)
     for _ in range(S):
         ii=np.random.randint(1,N,size=G); jj=np.array([np.random.choice([x for x in range(1,N) if x!=ii[g]]) for g in range(G)])
         it=torch.tensor(ii); jt=torch.tensor(jj); f2=me["feat"].clone()
@@ -144,9 +151,15 @@ def run(variant,task):
         _,capsT=capf(f2,me["nd"],me["pr"])
         for l in range(L):
             a=col(caps0[l][0],it); b=col(caps0[l][0],jt); ap=col(capsT[l][0],it); bp=col(capsT[l][0],jt)
-            t=(((ap-a)*(b-a)+(bp-b)*(a-b))/(2*(b-a)**2+1e-6)).clamp(0,1); w=a+b
-            sem1[l]+=(w*t).sum((0,2)).numpy(); wsum[l]+=w.sum((0,2)).numpy()
-    sem1=sem1/(wsum+1e-9); str1=1-sem1     # semantic=alpha-weighted equivariance, structural=invariance
+            e=torch.sqrt(2*(a-b)**2)                                # ||p^swap - p||  (swap displacement)
+            d_eq=torch.sqrt((ap-b)**2+(bp-a)**2)                    # ||p' - p^swap|| (distance to swapped)
+            d_in=torch.sqrt((ap-a)**2+(bp-b)**2)                    # ||p' - p||      (distance to original)
+            eq=(1-d_eq/(e+F)).clamp(0,1); iv=(1-d_in/(e+F)).clamp(0,1)   # INDEPENDENT, each in [0,1]
+            wa=a+b; wd=(a-b).abs()                                  # alpha weight  /  differential weight
+            eqv[l]+=(wa*eq).sum((0,2)).numpy(); inv[l]+=(wa*iv).sum((0,2)).numpy(); wr[l]+=wa.sum((0,2)).numpy()
+            eqvc[l]+=(wd*eq).sum((0,2)).numpy(); invc[l]+=(wd*iv).sum((0,2)).numpy(); wc[l]+=wd.sum((0,2)).numpy()
+    sem1=eqv/(wr+1e-9); str1=inv/(wr+1e-9)                   # RAW: independent equivariance / invariance
+    sem1c=eqvc/(wc+1e-9); str1c=invc/(wc+1e-9)               # CENTRED: differential-weighted (background removed)
 
     # per-head functional / beneficial carriage (full-head ablation)
     imp=np.zeros((L,HEADS)); ben=np.zeros((L,HEADS))
@@ -156,7 +169,8 @@ def run(variant,task):
                 yp=m(me["feat"],me["nd"],me["pr"],Mme,ablate=(l,h,0)).numpy()
                 imp[l,h]=np.abs(yp-yh).mean(); ben[l,h]=(np.abs(yp-yv)-absr).mean()
     skill=1-((yh-yv)**2).mean()/me["y"].var().item()
-    return dict(skill=skill,sem_v=sem_v,str_v=str_v,sem_a=sem_a,str_a=str_a,imp=imp,ben=ben,sem1=sem1,str1=str1)
+    return dict(skill=skill,sem_v=sem_v,str_v=str_v,sem_a=sem_a,str_a=str_a,imp=imp,ben=ben,
+                sem1=sem1,str1=str1,sem1c=sem1c,str1c=str1c)
 
 print(("SMOKE " if SMOKE else "")+"per-head alpha-weighted semantic/structural scores ...")
 R={}
@@ -225,21 +239,49 @@ fig.colorbar(im,ax=ax,fraction=0.04,label="structural (invariance) fraction  (0=
 fig.suptitle("Method 1: per-head structural fraction via content transposition (alpha-weighted attention invariance)")
 fig.savefig("fig_head_heatmap_equiv.png",dpi=140); print("saved fig_head_heatmap_equiv.png")
 
-# ---------------- (5) compare Method 1 (equivariance) vs Method 2 (separate intervention) ----------------
-fig,axc=plt.subplots(1,1,figsize=(6.2,5.6)); allx=[]; ally=[]
+# ---------------- (5) compare Method 1 (raw & centred) vs Method 2 ----------------
+fig,ax=plt.subplots(1,2,figsize=(11.5,5.4),sharey=True)
+for pi,(xk,xlab) in enumerate([("str1","Method 1 RAW: structural fraction (transposition invariance)"),
+                                ("str1c","Method 1 CENTRED: structural fraction (background removed)")]):
+    ax_=ax[pi]; ax2=[]; ay2=[]
+    for (v,t) in MODELS:
+        d=R[(v,t)]; x=d[xk].ravel(); y=SF(d).ravel()
+        mk="o" if v=="dense" else "^"; col="#d62728" if t=="structural" else "#1f77b4"
+        ax_.scatter(x,y,marker=mk,color=col,s=42,edgecolors="k",linewidths=0.4,alpha=0.85,label=f"{v}/{t}")
+        ax2+=list(x); ay2+=list(y)
+    rr=np.corrcoef(ax2,ay2)[0,1]; ax_.set_xlabel(xlab); ax_.set_title(f"vs Method 2   (r={rr:+.2f})"); ax_.grid(alpha=0.3); ax_.set_xlim(0,1)
+    if pi==0: ax_.set_ylabel("Method 2: structural fraction (RRWP-swap sensitivity)"); ax_.legend(fontsize=8)
+fig.suptitle("Per-head structural scores: content-transposition (raw vs centred) against separate-intervention value sensitivity")
+fig.tight_layout(rect=[0,0,1,0.95]); fig.savefig("fig_head_method_compare.png",dpi=140); print("saved fig_head_method_compare.png")
+
+# ---------------- (6) three-method scatter: structural (x) vs semantic (y) per head ----------------
+# separate intervention = independent axes; the two transposition methods give a single fraction,
+# so semantic = 1 - structural (points lie on the anti-diagonal by construction).
+def two_scores(d,method):
+    if method=="sep":   return TN(d).ravel(),   SN(d).ravel()     # structural, semantic (scale-norm. value sensitivity)
+    if method=="trans": return d["str1"].ravel(),  d["sem1"].ravel()    # invariance, equivariance (independent)
+    return d["str1c"].ravel(), d["sem1c"].ravel()                       # centred invariance, equivariance (independent)
+panels=[("sep","separate intervention"),("trans","node transposition"),("cent","centred node transposition")]
+fig,ax=plt.subplots(1,3,figsize=(15,5.2))
+for pi,(mkey,title) in enumerate(panels):
+    axi=ax[pi]; allx=[]; ally=[]
+    for (v,t) in MODELS:
+        d=R[(v,t)]; xs,ys=two_scores(d,mkey)
+        marker="o" if v=="dense" else "^"; c="#d62728" if t=="structural" else "#1f77b4"
+        axi.scatter(xs,ys,marker=marker,color=c,s=42,edgecolors="k",linewidths=0.4,alpha=0.85,label=f"{v}/{t}")
+        allx+=list(xs); ally+=list(ys)
+    axi.set_title(title); axi.set_xlabel("structural score"); axi.grid(alpha=0.3)
+    if mkey=="sep":
+        mx=max(max(allx),max(ally))*1.05+1e-6; axi.plot([0,mx],[0,mx],"k:",lw=0.7); axi.set_xlim(0,mx); axi.set_ylim(0,mx)
+    else:  # equivariance/invariance are independent -> genuine 2-D; y=x = equal semantic/structural, (1,1)=undifferentiated
+        axi.plot([0,1],[0,1],"k:",lw=0.7); axi.set_xlim(-0.02,1.02); axi.set_ylim(-0.02,1.02)
+ax[0].set_ylabel("semantic score"); ax[0].legend(fontsize=8)
+fig.suptitle("Per-head structural vs semantic score under three scoring methods (structural task=red, semantic task=blue; dense=circle, 1-hop=triangle)")
+fig.tight_layout(rect=[0,0,1,0.93]); fig.savefig("fig_head_three_methods.png",dpi=140); print("saved fig_head_three_methods.png")
+
+print("\nper-model structural-fraction means and correlations with Method 2:")
+print(f"  {'model':<18}{'M1 raw':>8}{'M1 centred':>12}{'M2':>7}{'r(raw,M2)':>11}{'r(cen,M2)':>11}")
 for (v,t) in MODELS:
-    d=R[(v,t)]; x=d["str1"].ravel(); y=SF(d).ravel()
-    mk="o" if v=="dense" else "^"; col="#d62728" if t=="structural" else "#1f77b4"
-    axc.scatter(x,y,marker=mk,color=col,s=45,edgecolors="k",linewidths=0.4,alpha=0.85,label=f"{v}/{t}")
-    allx+=list(x); ally+=list(y)
-r=np.corrcoef(allx,ally)[0,1]
-axc.set_xlabel("Method 1: structural fraction (content-transposition invariance)")
-axc.set_ylabel("Method 2: structural fraction (RRWP-swap sensitivity)")
-axc.set_title(f"Do the two per-head structural scores agree?   Spearman-ish r={r:.2f}")
-axc.legend(fontsize=8); axc.grid(alpha=0.3)
-fig.tight_layout(); fig.savefig("fig_head_method_compare.png",dpi=140); print("saved fig_head_method_compare.png")
-print("\nMethod1 vs Method2 structural-fraction correlation:")
-for (v,t) in MODELS:
-    d=R[(v,t)]; rr=np.corrcoef(d["str1"].ravel(),SF(d).ravel())[0,1]
-    print(f"  {v}/{t}: r={rr:+.2f}   (M1 mean {d['str1'].mean():.2f}, M2 mean {SF(d).mean():.2f})")
-print(f"  overall r={r:+.2f}")
+    d=R[(v,t)]; m2=SF(d).ravel()
+    print(f"  {v+'/'+t:<18}{d['str1'].mean():>8.2f}{d['str1c'].mean():>12.2f}{SF(d).mean():>7.2f}"
+          f"{np.corrcoef(d['str1'].ravel(),m2)[0,1]:>+11.2f}{np.corrcoef(d['str1c'].ravel(),m2)[0,1]:>+11.2f}")
