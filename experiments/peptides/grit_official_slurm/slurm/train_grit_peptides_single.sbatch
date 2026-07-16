@@ -16,7 +16,9 @@ REPO_ROOT="$(cd "${EXP_DIR}/../../.." && pwd)"
 
 cd "${REPO_ROOT}"
 
-if [[ -n "${CONDA_ENV:-}" ]]; then
+if [[ -n "${CONDA_ENV:-}" && "${CONDA_DEFAULT_ENV:-}" == "${CONDA_ENV}" ]]; then
+  echo "[env] Using exported active conda environment: ${CONDA_DEFAULT_ENV}"
+elif [[ -n "${CONDA_ENV:-}" ]]; then
   if [[ -f "/usr/local/Cluster-Apps/miniconda3/4.5.1/etc/profile.d/conda.sh" ]]; then
     # CSD3's legacy conda does not reliably support `conda shell.bash hook`
     # inside non-interactive Slurm shells.

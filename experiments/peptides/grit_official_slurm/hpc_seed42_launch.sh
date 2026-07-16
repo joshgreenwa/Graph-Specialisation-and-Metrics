@@ -33,6 +33,34 @@ export WANDB_MODE="${WANDB_MODE:-offline}"
 export WANDB_PROJECT="${WANDB_PROJECT:-grit-peptides}"
 export GRIT_PE_STREAM_CHUNK_SIZE="${GRIT_PE_STREAM_CHUNK_SIZE:-32}"
 
+python - <<'PY'
+import sys
+
+print(f"[preflight] python={sys.executable}")
+import torch
+import torch_geometric
+import pytorch_lightning
+import yaml
+from rdkit import Chem
+
+try:
+    from ogb.utils import smiles2graph
+except ImportError:
+    try:
+        from ogb.utils.mol import smiles2graph
+    except ImportError:
+        from ogb.utils.features import smiles2graph
+
+assert Chem.MolFromSmiles("CCO") is not None
+assert smiles2graph("CCO")["num_nodes"] == 3
+print(
+    "[preflight] deps OK:",
+    f"torch={torch.__version__}",
+    f"torch_geometric={torch_geometric.__version__}",
+    f"pytorch_lightning={pytorch_lightning.__version__}",
+)
+PY
+
 declare -A JOB_IDS=()
 
 submit_one() {
