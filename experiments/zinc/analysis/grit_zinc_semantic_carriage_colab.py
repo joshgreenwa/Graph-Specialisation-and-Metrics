@@ -762,6 +762,27 @@ def aggregate_carriage_curves(graph_id, distance, F, B, n_boot: int = 2000,
     }
 
 
+def _symlog_linthresh(values, override: float = 0.0, floor: float = 1e-9) -> float:
+    """Pick the symlog linear-region width for a signed distance curve.
+
+    The d=0 self-pair term (a node's own content acting on its own state) is ~100x the
+    cross-node transport terms, so a linear axis flattens every d>=1 point onto zero. A
+    symlog axis with a small linear region shows the d=0 spike AND the tail together while
+    preserving sign. We set the threshold to the median magnitude of the curve, which
+    puts the bulk of the tail into the (spread-out) log region and only the near-zero
+    crossings into the linear region. ``override`` (a CLI knob) wins when > 0.
+    """
+    import numpy as np
+
+    if override and override > 0:
+        return float(override)
+    a = np.abs(np.asarray(values, dtype=float))
+    a = a[np.isfinite(a) & (a > 0)]
+    if a.size == 0:
+        return floor
+    return float(max(floor, np.median(a)))
+
+
 # ==================================================================================
 # Stage 2: the analysis (runs in-process after prepare_inprocess(); cwd = GRIT repo)
 # ==================================================================================
@@ -1307,11 +1328,21 @@ def stage_analyze(args: argparse.Namespace) -> None:
            + f"\n{n_g} {args.eval_split} graphs, K={K} donor swaps/source, "
              f"donors from '{args.donor_split}'")
 
+    # d=0 is the self-pair (i=j): a node's own content acting on its own final state.
+    # It is the direct/local term, ~100x the cross-node transport, so we mark it and use
+    # log/symlog axes so the d>=1 transport structure stays legible next to it.
+    self_col = C_ADV
+    lin_B = _symlog_linthresh(B_mean[1:] if ds.size > 1 else B_mean, args.bd_linthresh)
+
     # ---- Fig 1: F(d) and B(d)
-    fig, axes = plt.subplots(1, 2, figsize=(11.5, 4.4))
+    fig, axes = plt.subplots(1, 2, figsize=(11.5, 4.6))
     ax = axes[0]
     ax.fill_between(ds, F_lo, F_hi, color=C_FUNC, alpha=0.18, lw=0)
-    ax.plot(ds, F_mean, "o-", color=C_FUNC, lw=1.8, ms=4.5)
+    ax.plot(ds, F_mean, "o-", color=C_FUNC, lw=1.8, ms=4.5, zorder=3)
+    if ds.size > 0:
+        ax.plot(ds[0], F_mean[0], "o", color=self_col, ms=8, zorder=4)
+        ax.annotate("self ($i{=}j$)", (ds[0], F_mean[0]), textcoords="offset points",
+                    xytext=(8, -2), fontsize=8, color=self_col, va="center")
     ax.set_xlabel("shortest-path distance $d(i,j)$ [hops]")
     ax.set_ylabel(r"$F(d)=\mathrm{mean}_{d(i,j)=d}\,|C[i,j]|$")
     ax.set_title("Functional carriage $F(d)$\n(label-free: does the model use $j$ at $i$?)")
@@ -1321,21 +1352,29 @@ def stage_analyze(args: argparse.Namespace) -> None:
 
     ax = axes[1]
     ax.axhline(0.0, color="0.35", lw=1.0)
-    ax.fill_between(ds, B_lo, B_hi, color="0.5", alpha=0.18, lw=0)
-    ax.plot(ds, B_mean, "o-", color="0.15", lw=1.8, ms=4.5, zorder=3)
     ax.fill_between(ds, np.minimum(B_mean, 0), 0, color=C_BEN, alpha=0.30, lw=0)
     ax.fill_between(ds, np.maximum(B_mean, 0), 0, color=C_ADV, alpha=0.30, lw=0)
+    # 95% CI as error bars (a filled band is illegible next to the d=0 spike under symlog);
+    # points whose bar straddles 0 are not robustly beneficial/adverse.
+    ax.errorbar(ds, B_mean, yerr=[B_mean - B_lo, B_hi - B_mean], fmt="none",
+                ecolor="0.45", elinewidth=0.9, capsize=2, zorder=2)
+    ax.plot(ds, B_mean, "o-", color="0.15", lw=1.8, ms=4.5, zorder=3)
+    if ds.size > 0:
+        ax.plot(ds[0], B_mean[0], "o", color=self_col, ms=8, zorder=4)
+        ax.annotate("self ($i{=}j$)", (ds[0], B_mean[0]), textcoords="offset points",
+                    xytext=(8, 0), fontsize=8, color=self_col, va="center")
+    ax.set_yscale("symlog", linthresh=lin_B)
     ax.set_xlabel("shortest-path distance $d(i,j)$ [hops]")
-    ax.set_ylabel(r"$B(d)=\mathrm{mean}_{d(i,j)=d}\,B[i,j]$   [MAE units]")
+    ax.set_ylabel(r"$B(d)=\mathrm{mean}_{d(i,j)=d}\,B[i,j]$   [MAE units, symlog]")
     ax.set_title("Beneficial carriage $B(d)$\n"
                  r"$B<0$ beneficial $\cdot$ $B>0$ adverse $\cdot$ $B\approx0$ dispensable")
     ax.set_xticks(ds)
-    ax.text(0.985, 0.05, "beneficial", transform=ax.transAxes, ha="right", va="bottom",
+    ax.text(0.985, 0.06, "beneficial", transform=ax.transAxes, ha="right", va="bottom",
             color=C_BEN, fontsize=8.5, fontweight="bold")
-    ax.text(0.985, 0.95, "adverse", transform=ax.transAxes, ha="right", va="top",
+    ax.text(0.985, 0.94, "adverse", transform=ax.transAxes, ha="right", va="top",
             color=C_ADV, fontsize=8.5, fontweight="bold")
 
-    fig.suptitle("Semantic donor-swap interventions on GRIT/ZINC   " + tag, fontsize=9.5, y=1.10)
+    fig.suptitle("Semantic donor-swap interventions on GRIT/ZINC   " + tag, fontsize=9.5, y=1.12)
     p1 = fig_dir / "fig_semantic_carriage_Fd_Bd.png"
     fig.savefig(p1); plt.close(fig)
     log(f"\n[fig] {p1}")
@@ -1372,10 +1411,16 @@ def stage_analyze(args: argparse.Namespace) -> None:
 
     ax = axes[0, 1]
     ax.axhline(0.0, color="0.35", lw=1.0)
-    ax.fill_between(ds, S_lo, S_hi, color="0.5", alpha=0.18, lw=0)
-    ax.plot(ds, S_mean, "o-", color="0.15", lw=1.8, ms=4.5)
+    ax.fill_between(ds, np.minimum(S_mean, 0), 0, color=C_BEN, alpha=0.25, lw=0)
+    ax.fill_between(ds, np.maximum(S_mean, 0), 0, color=C_ADV, alpha=0.25, lw=0)
+    ax.plot(ds, S_mean, "o-", color="0.15", lw=1.8, ms=4.5, zorder=3)
+    if ds.size > 0:
+        ax.plot(ds[0], S_mean[0], "o", color=self_col, ms=8, zorder=4)
+        ax.annotate("self ($i{=}j$)", (ds[0], S_mean[0]), textcoords="offset points",
+                    xytext=(8, 0), fontsize=8, color=self_col, va="center")
+    ax.set_yscale("symlog", linthresh=_symlog_linthresh(S_mean[1:] if ds.size > 1 else S_mean))
     ax.set_xlabel("$d(i,j)$ [hops]")
-    ax.set_ylabel(r"$\sum_{d(i,j)=d} B[i,j]$ per graph  [MAE units]")
+    ax.set_ylabel(r"$\sum_{d(i,j)=d} B[i,j]$ per graph  [MAE units, symlog]")
     ax.set_title("Error mass carried at each distance\n"
                  r"(tail sums give $B_{\mathrm{far}}(k)$; per source $\sum_i B[i,j]=dL_j$ exactly)")
     ax.set_xticks(ds)
@@ -1588,6 +1633,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
                    help="Seeds graph selection and donor sampling.")
     p.add_argument("--boot-seed", type=int, default=1234)
     p.add_argument("--n-boot", type=int, default=2000)
+    p.add_argument("--bd-linthresh", type=float, default=0.0,
+                   help="symlog linear-region width for the B(d) panel. 0 = auto (median "
+                        "|B(d)| over d>=1), which keeps the d=0 self term and the small "
+                        "transport tail both legible.")
 
     # verification
     p.add_argument("--verify", action="store_true", default=True)
