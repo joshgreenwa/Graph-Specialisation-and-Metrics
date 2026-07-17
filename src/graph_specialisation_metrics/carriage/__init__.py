@@ -8,11 +8,20 @@ secret) and call ``carriage.colab.run(task=...)``, so edits here propagate to ev
     from graph_specialisation_metrics.carriage import run, TASKS, GritTaskSpec
     run(task="zinc")
 
+Supports scalar regression (ZINC), multi-target regression, and multilabel classification
+(Peptides-func) uniformly: functional carriage = magnitude of the output movement over the
+T outputs; beneficial carriage = exact per-source change in the task loss, attributed to
+carriers by their loss-carriage share. For a scalar output this reduces exactly to the
+dissertation's F=|C|, B=sign(ŷ-y)·C form.
+
 Layout:
-    core.py        pure math (carriage, beneficial, aggregation) -- unit-testable, no GRIT
-    content.py     ContentAdapter: how to read/write swappable node content per encoder
-    tasks.py       GritTaskSpec + TASKS registry (add a GRIT model here)
+    core.py        pure math (carriage, functional magnitude, beneficial attribution,
+                   aggregation) -- unit-testable, no GRIT
+    content.py     ContentAdapter: whole-row node-content swap (TypeDictNode and OGB Atom)
+    metrics.py     per-graph task loss (l1/mse/BCE) and dataset metrics (MAE, multilabel AP)
+    tasks.py       GritTaskSpec + TASKS registry (zinc, peptides_func); add a model here
     env.py         compat patches, deps, GRIT clone, checkpoint discovery
+    peptides_env.py env hooks reusing the training code's RDKit + dataset/RRWP patches
     grit_runner.py the analysis loop + carriage-precondition checks
     figures.py     aggregate curves -> figures + .npz/.json
     colab.py       run(): one-call orchestration; figures collate under one Drive root

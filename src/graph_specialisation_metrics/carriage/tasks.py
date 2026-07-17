@@ -14,9 +14,10 @@ run time by ``grit_runner.check_carriage_preconditions``, so they hold for any t
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Callable, Optional
 
-from .content import ContentAdapter, TypeDictContentAdapter
+from .content import ContentAdapter, FullNodeContentAdapter
+from . import metrics
 
 # Official GRIT (Ma et al.), pinned to the commit the training runners used.
 OFFICIAL_GRIT_REPO = "https://github.com/LiamMa/GRIT.git"
@@ -38,8 +39,13 @@ class GritTaskSpec:
         drive_dir:       default Drive dir holding results/ and datasets/ for this task
                          (the same --drive-dir the training runner used).
         paper_metric:    ("mae", 0.059)-style (name, value) for the load sanity check; None skips.
-        metric_sanity_threshold: abort if the recomputed metric exceeds this (bad load guard).
-        content_adapter: how to read/write swappable node content (default TypeDictNode).
+        metric_fn:       (preds[N,T], trues[N,T]) -> float recomputed over the eval split.
+                         Default: MAE. Peptides-func uses multilabel mean-AP.
+        metric_higher_better: True for AP (abort if below threshold), False for MAE (abort if above).
+        metric_abort:    threshold for the bad-load guard, in the metric's own units.
+        content_adapter: how to read/write swappable node content (default: whole x row).
+        env_hooks:       callables (repo_dir) applied after GRIT clone, before loaders build
+                         (e.g. peptides RDKit + dataset/RRWP patches).
         grit_repo/commit: GRIT source to clone/pin. Default official.
         node_content_desc: label for logs ("atom type", ...).
     """
@@ -51,8 +57,11 @@ class GritTaskSpec:
     expected_params: Optional[int] = None
     drive_dir: str = ""
     paper_metric: Optional[tuple] = None
-    metric_sanity_threshold: float = 0.15
-    content_adapter: ContentAdapter = field(default_factory=TypeDictContentAdapter)
+    metric_fn: Callable = staticmethod(metrics.mae_metric)
+    metric_higher_better: bool = False
+    metric_abort: float = 0.15
+    content_adapter: ContentAdapter = field(default_factory=FullNodeContentAdapter)
+    env_hooks: tuple = ()
     grit_repo: str = OFFICIAL_GRIT_REPO
     grit_commit: str = OFFICIAL_GRIT_COMMIT
     node_content_desc: str = "node content"
@@ -82,7 +91,7 @@ def get_task(name: str) -> GritTaskSpec:
     return TASKS[name]
 
 
-# Official dense GRIT+RRWP on ZINC-subset -- the reproduced reference.
+# Official dense GRIT+RRWP on ZINC-subset -- the reproduced reference (scalar regression).
 register(GritTaskSpec(
     name="zinc",
     title="GRIT+RRWP ZINC-subset (dense)",
@@ -90,6 +99,36 @@ register(GritTaskSpec(
     expected_params=473_473,
     drive_dir="/content/drive/MyDrive/grit_zinc_official",
     paper_metric=("mae", 0.059),
-    metric_sanity_threshold=0.15,
+    metric_fn=staticmethod(metrics.mae_metric),
+    metric_higher_better=False,
+    metric_abort=0.15,
     node_content_desc="atom type",
+))
+
+
+def _peptides_hooks():
+    """Deferred so importing tasks stays torch/GRIT-free; called at run time."""
+    from . import peptides_env
+
+    def hook(repo_dir):
+        peptides_env.ensure_repo_root_on_path(repo_dir)
+        peptides_env.install_peptides_deps()
+        peptides_env.apply_peptides_patches(repo_dir)
+
+    return (hook,)
+
+
+# Official dense GRIT+RRWP on Peptides-func (10-way multilabel classification, metric AP).
+register(GritTaskSpec(
+    name="peptides_func",
+    title="GRIT+RRWP Peptides-func (dense)",
+    config_path="configs/GRIT/peptides-func-GRIT-RRWP.yaml",
+    expected_params=None,  # not asserted; the AP recompute is the load check
+    drive_dir="/content/drive/MyDrive/grit_peptides_func_official",
+    paper_metric=("AP", 0.6988),
+    metric_fn=staticmethod(metrics.multilabel_ap_metric),
+    metric_higher_better=True,
+    metric_abort=0.40,     # a correctly loaded model is ~0.65-0.70; below 0.40 => broken load
+    env_hooks=_peptides_hooks(),
+    node_content_desc="OGB atom features (9)",
 ))

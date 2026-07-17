@@ -20,7 +20,7 @@ from pathlib import Path
 
 import numpy as np
 
-from . import core
+from . import core, metrics
 from .env import log
 
 
@@ -116,23 +116,27 @@ def check_carriage_preconditions(cfg, tol: float, checks: dict) -> None:
     if bool(getattr(cfg.posenc_RRWP, "enable", False)) and bool(getattr(cfg.posenc_RRWP, "add_node_attr", False)):
         problems.append("posenc_RRWP.add_node_attr=True makes RRWP depend on node content, "
                         "so a semantic swap would also perturb S (violates Def 3.2.1).")
-    # (3) Pooling->MLP graph head.
+    # (3) Pooling->MLP graph head. GraphGym resolves gnn.head='default' -> dataset.task
+    #     ('graph' => GNNGraphHead); san_graph is the ZINC variant. Both pool then MLP.
     head = str(cfg.gnn.head)
     checks["gnn_head"] = head
-    if head != "san_graph":
-        log(f"[precond-warn] gnn.head={head!r} (expected san_graph pooling->MLP). h^L is still "
-            f"the pre-head node state; interpret g_i accordingly.")
-    # (4) Scalar regression target (B uses sign of a scalar residual).
+    if head not in ("san_graph", "graph"):
+        log(f"[precond-warn] gnn.head={head!r} (expected graph/san_graph pooling->MLP). h^L is "
+            f"still the pre-head node state; interpret g_i accordingly.")
+    # (4) Supported readout: scalar/multi-target regression, or multilabel classification.
+    #     Beneficial carriage decomposes L_clean - L_swap for the task loss; functional
+    #     carriage is ||dŷ from i|| over the T outputs. Both handle T>1.
     tt = str(cfg.dataset.task_type)
     checks["task_type"] = tt
-    if tt != "regression":
-        problems.append(f"dataset.task_type={tt!r}; carriage F(d)/B(d) as implemented assume "
-                        f"a scalar regression target (ŷ, y scalars).")
+    if tt not in ("regression", "classification_multilabel"):
+        problems.append(f"dataset.task_type={tt!r}; carriage supports regression and "
+                        f"classification_multilabel (a scalar/vector output with an additive "
+                        f"per-target loss). Others need a bespoke readout.")
     checks["loss_fun"] = str(cfg.model.loss_fun)
     if problems:
         raise RuntimeError("Carriage preconditions not met:\n  - " + "\n  - ".join(problems))
-    log("[precond] carriage preconditions OK: pooling={}, RRWP content-invariant, head={}, {} target."
-        .format(pooling, head, tt))
+    log("[precond] carriage preconditions OK: pooling={}, RRWP content-invariant, head={}, {} ({})."
+        .format(pooling, head, tt, cfg.model.loss_fun))
 
 
 def run_grit_carriage(task, cc: CarriageConfig) -> dict:
@@ -248,32 +252,36 @@ def run_grit_carriage(task, cc: CarriageConfig) -> dict:
 
     # ---- recompute the eval metric from the loaded checkpoint (strongest load check) ---
     @torch.no_grad()
-    def split_metric(loader) -> float:
-        tot, cnt = 0.0, 0
+    def collect_preds(loader):
+        ps, ts = [], []
         for batch in loader:
             batch = batch.to(device)
             pred, true = model(batch)
-            p, t = pred.view(-1), true.view(-1)
-            assert p.numel() == t.numel()
-            tot += (p - t).abs().sum().item()
-            cnt += t.numel()
-        return tot / max(cnt, 1)
+            ps.append(pred.detach().cpu().numpy().reshape(pred.shape[0], -1))
+            ts.append(true.detach().cpu().numpy().reshape(true.shape[0], -1))
+        return np.concatenate(ps), np.concatenate(ts)
 
+    metric_name = (task.paper_metric[0] if task.paper_metric else "metric")
     if cc.eval_metric:
         t0 = time.perf_counter()
-        test_metric = split_metric(loaders[2])
+        preds, trues = collect_preds(loaders[2])
+        test_metric = float(task.metric_fn(preds, trues))
         pm = f" (paper {task.paper_metric[0]} ~{task.paper_metric[1]})" if task.paper_metric else ""
-        log(f"[verify] test MAE recomputed from checkpoint: {test_metric:.5f}{pm} "
+        log(f"[verify] test {metric_name} recomputed from checkpoint: {test_metric:.5f}{pm} "
             f"[{time.perf_counter()-t0:.1f}s]")
-        checks["test_metric"] = float(test_metric)
-        if test_metric > task.metric_sanity_threshold:
+        checks["test_metric"] = test_metric
+        checks["test_metric_name"] = metric_name
+        bad = (test_metric < task.metric_abort) if task.metric_higher_better else (test_metric > task.metric_abort)
+        if bad:
+            arrow = "below" if task.metric_higher_better else "above"
             raise RuntimeError(
-                f"Recomputed test metric {test_metric:.5f} exceeds task sanity threshold "
-                f"{task.metric_sanity_threshold}. The checkpoint almost certainly did not load "
-                f"correctly (or training barely progressed). Refusing to report carriage."
+                f"Recomputed test {metric_name} {test_metric:.5f} is {arrow} the abort threshold "
+                f"{task.metric_abort}. The checkpoint almost certainly did not load correctly "
+                f"(or training barely progressed). Refusing to report carriage."
             )
     else:
         checks["test_metric"] = None
+        checks["test_metric_name"] = metric_name
 
     # ---- h^L capture: the tensor entering post_mp (out of the transformer layers) ------
     store: dict = {}
@@ -283,22 +291,27 @@ def run_grit_carriage(task, cc: CarriageConfig) -> dict:
 
     handle = model.model.layers.register_forward_hook(_hook)
     dim_h = int(cfg.gnn.dim_inner)
+    loss_fun = str(cfg.model.loss_fun)
     num_types = adapter.num_symbols(cfg)
 
-    # ---- donor pool (Def 3.2.2): real content from OTHER graphs of the same dataset ----
+    # ---- donor pool (Def 3.2.2): real content ROWS from OTHER graphs of the same dataset -
     log(f"\n[donors] Building donor pool from '{cc.donor_split}' ({task.node_content_desc}).")
-    sym_all, gid_all = [], []
+    row_all, gid_all = [], []
     for gi in range(len(donor_ds)):
-        s = adapter.symbols(donor_ds[gi])
-        sym_all.append(s)
-        gid_all.append(np.full(s.shape[0], gi, dtype=np.int64))
-    donor_syms = np.concatenate(sym_all).astype(np.int64)
+        r = adapter.rows(donor_ds[gi])                          # [n, F]
+        row_all.append(r)
+        gid_all.append(np.full(r.shape[0], gi, dtype=np.int64))
+    donor_rows = np.concatenate(row_all).astype(np.int64)       # [Npool, F]
     donor_gids = np.concatenate(gid_all)
-    assert donor_syms.min() >= 0 and donor_syms.max() < num_types, (
-        f"Donor symbols out of range for num_types={num_types}: [{donor_syms.min()}, {donor_syms.max()}]"
-    )
-    log(f"[donors] pool={donor_syms.size} nodes over {len(donor_ds)} graphs; "
-        f"{len(np.unique(donor_syms))} distinct symbols (max {donor_syms.max()} < {num_types}).")
+    F_feat = donor_rows.shape[1]
+    if num_types is not None and F_feat == 1:
+        assert donor_rows.min() >= 0 and donor_rows.max() < num_types, (
+            f"Donor symbols out of range for num_types={num_types}: "
+            f"[{donor_rows.min()}, {donor_rows.max()}]"
+        )
+    n_distinct = len(np.unique(donor_rows, axis=0))
+    log(f"[donors] pool={donor_rows.shape[0]} nodes over {len(donor_ds)} graphs; "
+        f"{n_distinct} distinct content rows (F={F_feat} feature col(s)).")
 
     # ---- graph selection --------------------------------------------------------------
     rng = np.random.default_rng(cc.analysis_seed)
@@ -311,7 +324,7 @@ def run_grit_carriage(task, cc: CarriageConfig) -> dict:
     log(f"[select] {n_graphs} {cc.eval_split} graphs ({cc.graph_select}, seed={cc.analysis_seed}), K={K}.")
 
     # ---- accumulators -----------------------------------------------------------------
-    all_gid, all_i, all_j, all_d, all_C, all_B = [], [], [], [], [], []
+    all_gid, all_i, all_j, all_d, all_C, all_B, all_F = [], [], [], [], [], [], []
     add_sumC, add_dyhat = [], []
     g_spread_max = noop_max_dh = batchinv_max = bexact_max = 0.0
     noop_total = donor_draws = unreachable_total = struct_checked = peak_mem = 0
@@ -323,42 +336,53 @@ def run_grit_carriage(task, cc: CarriageConfig) -> dict:
     for gi_pos, gi in enumerate(graph_ids):
         base = eval_ds[int(gi)]
         n = int(base.num_nodes)
-        y = float(base.y.view(-1)[0].item())
 
         # distances from the PRISTINE graph (GRIT's rel encoder overwrites edge_index later).
         D = _spd(base, n)
         unreachable_total += int(np.isinf(D).sum())
 
-        # clean pass: h^L and g_i = d yhat / d h^L_i (Eq 3.1).
+        # clean pass. Two readout gradients at h^L (Eq 3.1), both at the clean input:
+        #   g_out[t] = d yhat_t / d h^L_i  (T of them; functional carriage magnitude)
+        #   g_loss   = d L / d h^L_i        (loss carriage; beneficial-carriage basis)
         cb = Batch.from_data_list([base]).to(device)
         with torch.enable_grad():
-            pred_c, _ = model(cb)
+            pred_c, true_c = model(cb)
             h_clean_t = store["h"]
             assert h_clean_t.shape == (n, dim_h), f"h^L {tuple(h_clean_t.shape)} != {(n, dim_h)}"
-            g_t = torch.autograd.grad(pred_c.sum(), h_clean_t)[0]
-        yhat_clean = float(pred_c.view(-1)[0].item())
+            T = int(pred_c.view(pred_c.shape[0], -1).shape[1])
+            pred_row = pred_c.view(-1)                                   # [T]
+            g_out = torch.stack([
+                torch.autograd.grad(pred_row[t], h_clean_t, retain_graph=True)[0]
+                for t in range(T)
+            ])                                                          # [T, n, m]
+            L_c = metrics.per_graph_loss(pred_c, true_c, loss_fun).sum()  # scalar
+            g_loss_t = torch.autograd.grad(L_c, h_clean_t)[0]           # [n, m]
         h_clean = h_clean_t.detach()
-        g = g_t.detach()
-        g_spread_max = max(g_spread_max, float((g - g[0:1]).abs().max().item()))
+        g_loss = g_loss_t.detach()
+        g_out = g_out.detach()
+        true_vec = true_c.detach().view(1, -1).float()                 # [1, T]
+        L_clean = float(metrics.per_graph_loss(pred_c.detach(), true_c.detach(), loss_fun)[0].item())
+        # mean/add pooling => g_loss shared across nodes; verified, not assumed.
+        g_spread_max = max(g_spread_max, float((g_loss - g_loss[0:1]).abs().max().item()))
 
         # donors: K per source j, independent; from other graphs when donors==eval split.
         if cc.donor_split == cc.eval_split:
             pool = np.flatnonzero(donor_gids != int(gi))
         else:
-            pool = np.arange(donor_syms.size)
-        donor_ids = rng.choice(pool, size=(n, K), replace=True)
-        donor_sym = donor_syms[donor_ids]                       # [n, K]
-        own_sym = adapter.symbols(base)                         # [n]
-        noop_mask = donor_sym == own_sym[:, None]
+            pool = np.arange(donor_rows.shape[0])
+        donor_ids = rng.choice(pool, size=(n, K), replace=True)        # [n, K]
+        donor_content = donor_rows[donor_ids]                          # [n, K, F]
+        own_rows = adapter.rows(base)                                  # [n, F]
+        noop_mask = (donor_content == own_rows[:, None, :]).all(axis=-1)  # [n, K]
         noop_total += int(noop_mask.sum())
-        donor_draws += donor_sym.size
+        donor_draws += int(noop_mask.size)
 
         S, R = n, n * K
         rows_local = np.repeat(np.arange(S), K)
-        flat_donor = donor_sym.reshape(-1)
+        flat_donor = donor_content.reshape(R, F_feat)                  # [R, F]
 
         h_swap = torch.empty((R, n, dim_h), device=device, dtype=h_clean.dtype)
-        yhat_swap = torch.empty((R,), device=device, dtype=torch.float32)
+        pred_swap = torch.empty((R, T), device=device, dtype=torch.float32)
 
         chunk = _plan_chunk(n, cc)
         r0 = 0
@@ -378,7 +402,7 @@ def run_grit_carriage(task, cc: CarriageConfig) -> dict:
                         hs = store["h"]
                         assert hs.shape == (m * n, dim_h)
                         h_swap[r0:r0 + m] = hs.view(m, n, dim_h)
-                        yhat_swap[r0:r0 + m] = pred_s.view(-1).float()
+                        pred_swap[r0:r0 + m] = pred_s.view(m, -1).float()
                     break
                 except RuntimeError as exc:
                     if "out of memory" not in str(exc).lower():
@@ -407,12 +431,18 @@ def run_grit_carriage(task, cc: CarriageConfig) -> dict:
             nm = torch.as_tensor(noop_mask.reshape(-1), device=device)
             noop_max_dh = max(noop_max_dh, float((h_swap[nm] - h_clean.unsqueeze(0)).abs().max().item()))
 
-        # carriage (Eq 3.4/3.5) and beneficial carriage (exact per-source loss change).
-        C = core.carriage_from_states(h_clean, h_swap, g, S, K).cpu().numpy()
-        B, dL_j, sumC_j = core.beneficial_from_carriage(C, yhat_clean, yhat_swap, y, S, K)
+        # per-replica swap loss (donor-average the LOSS, not the prediction -- Jensen at the kink).
+        L_swap = metrics.per_graph_loss(pred_swap, true_vec.expand(R, -1), loss_fun).cpu().numpy()  # [R]
+        dL_j = L_clean - L_swap.reshape(S, K).mean(axis=1)             # [S]  <0 = beneficial
+
+        # functional carriage F[i,j] = ||dŷ from i|| over T outputs (label-free);
+        # loss carriage C_loss[i,j] = g_loss_i . dh_i(j) (beneficial-carriage basis).
+        F_ij = core.functional_magnitude(h_clean, h_swap, g_out, S, K)          # [n, n], >=0
+        C_loss = core.carriage_from_states(h_clean, h_swap, g_loss, S, K).cpu().numpy()  # [n, n]
+        B, sumC_j = core.beneficial_attribute(C_loss, dL_j)
 
         add_sumC.append(sumC_j)
-        add_dyhat.append(yhat_clean - yhat_swap.view(S, K).mean(dim=1).cpu().numpy())
+        add_dyhat.append(dL_j)
         moved = np.abs(sumC_j) > 1e-9
         if moved.any():
             bexact_max = max(bexact_max, float(np.abs(B.sum(axis=0)[moved] - dL_j[moved]).max()))
@@ -423,28 +453,29 @@ def run_grit_carriage(task, cc: CarriageConfig) -> dict:
         all_i.append(ii[finite].astype(np.int64))
         all_j.append(jj[finite].astype(np.int64))
         all_d.append(D[finite].astype(np.int64))
-        all_C.append(C[finite].astype(np.float64))
+        all_C.append(C_loss[finite].astype(np.float64))
         all_B.append(B[finite].astype(np.float64))
+        all_F.append(F_ij[finite].astype(np.float64))
 
-        del h_swap, yhat_swap
+        del h_swap, pred_swap
         if device.type == "cuda":
             torch.cuda.empty_cache()
         if (gi_pos + 1) % max(1, n_graphs // 10) == 0 or gi_pos == 0:
-            log(f"[run] graph {gi_pos+1}/{n_graphs} (id={int(gi)}, n={n}, {R} forwards) "
+            log(f"[run] graph {gi_pos+1}/{n_graphs} (id={int(gi)}, n={n}, T={T}, {R} forwards) "
                 f"| {time.perf_counter()-t_start:.1f}s")
 
     handle.remove()
 
     gid = np.concatenate(all_gid)
     pd_ = np.concatenate(all_d)
-    pC = np.concatenate(all_C)
+    pC = np.concatenate(all_C)      # signed loss-carriage C_loss (beneficial basis)
     pB = np.concatenate(all_B)
-    F = np.abs(pC)
+    F = np.concatenate(all_F)       # functional carriage magnitude ||dŷ||
 
     # ---- verification summary ---------------------------------------------------------
     tol = cc.tol
-    a_sumC = np.concatenate(add_sumC)
-    a_dyhat = np.concatenate(add_dyhat)
+    a_sumC = np.concatenate(add_sumC)     # sum_i C_loss[i,j]  (first-order loss change)
+    a_dyhat = np.concatenate(add_dyhat)   # dL_j               (exact loss change)
     if a_sumC.size > 2 and np.std(a_sumC) > 0 and np.std(a_dyhat) > 0:
         r = float(np.corrcoef(a_sumC, a_dyhat)[0, 1])
         slope = float(np.polyfit(a_sumC, a_dyhat, 1)[0])
@@ -470,14 +501,15 @@ def run_grit_carriage(task, cc: CarriageConfig) -> dict:
     log(f"  [param]  parameters              : {n_params}"
         + (f" (expected {task.expected_params})" if task.expected_params else ""))
     if checks["test_metric"] is not None:
-        log(f"  [4]  test MAE from checkpoint    : {checks['test_metric']:.5f}")
-    log(f"  [5]  max_i |g_i - g_1|           : {g_spread_max:.3e}  (pooling => must be ~0)")
+        log(f"  [4]  test {checks['test_metric_name']} from checkpoint : {checks['test_metric']:.5f}")
+    log(f"  [5]  max_i |g_i - g_1| (g_loss)  : {g_spread_max:.3e}  (pooling => must be ~0)")
     if cc.verify:
         log(f"  [6]  batch-invariance max|dh|    : {batchinv_max:.3e}")
         log(f"  [8]  structure invariance        : verified on {struct_checked} graph(s)")
     log(f"  [7]  no-op donors                : {noop_total}/{donor_draws} "
         f"({100*noop_frac:.1f}%) max|dh|={noop_max_dh:.3e} (must be 0)")
-    log(f"  [9]  additivity r/slope          : r={r:.4f}, slope={slope:.4f}")
+    log(f"  [9]  loss additivity r/slope     : r={r:.4f}, slope={slope:.4f}  "
+        f"(sum_i C_loss vs dL_j)")
     log(f"  [10] unreachable pairs (excluded): {unreachable_total}")
     log(f"  [11] beneficial exactness        : max_j|sum_i B - dL_j| = {bexact_max:.3e} (must be ~0)")
     if device.type == "cuda":
@@ -501,7 +533,8 @@ def run_grit_carriage(task, cc: CarriageConfig) -> dict:
         "eval_split": cc.eval_split, "donor_split": cc.donor_split,
         "num_graphs": int(np.unique(gid).size), "donors_K": K,
         "graph_select": cc.graph_select, "analysis_seed": cc.analysis_seed,
-        "test_metric": checks["test_metric"], "paper_metric": task.paper_metric,
+        "test_metric": checks["test_metric"], "test_metric_name": checks["test_metric_name"],
+        "paper_metric": task.paper_metric, "loss_units": metrics.loss_units(loss_fun),
     }
     return {
         "graph_id": gid,

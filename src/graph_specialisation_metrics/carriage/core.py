@@ -55,6 +55,50 @@ def carriage_from_states(h_clean, h_swap, g, num_sources: int, num_donors: int):
     return C_js.t().contiguous()                 # [i, j]
 
 
+def functional_magnitude(h_clean, h_swap, g_out, num_sources, num_donors):
+    """Functional carriage magnitude F[i,j] = || C_out[i,j] ||_2 over the T outputs.
+
+    Label-free (Def 3.3.2): how much does moving content from j change node i's effect on
+    the model's OUTPUT? For a scalar output (T=1) this is |C[i,j]| exactly; for a vector
+    output it is the L2 norm of the per-output carriage.
+
+    Args:
+        g_out: [T, n, m] Jacobian of the output w.r.t. h^L (one [n,m] slice per output t),
+               evaluated at the clean input.
+
+    Returns:
+        [n, n] numpy: F[i, j] (carrier x source), non-negative.
+    """
+    T = int(g_out.shape[0])
+    acc = None
+    for t in range(T):
+        Ct = carriage_from_states(h_clean, h_swap, g_out[t], num_sources, num_donors)  # [i,j]
+        acc = Ct.pow(2) if acc is None else acc + Ct.pow(2)
+    return acc.sqrt().cpu().numpy()  # [i, j], carrier x source
+
+
+def beneficial_attribute(C_basis, dL_j, eps=1e-9):
+    """Attribute the exact per-source loss change dL_j to carriers by their carriage share.
+
+        B[i,j] = dL_j . ( C_basis[i,j] / sum_i C_basis[i,j] )   =>  sum_i B[i,j] = dL_j exactly.
+
+    ``C_basis`` is the signed loss-carriage C_loss[i,j] = (dL/dh_i).dh_i(j): its column sum
+    is the first-order loss change from source j, so it is the natural basis for splitting
+    the (exact) dL_j across carriers. Sources that move nothing (sum_i C_basis ~ 0, hence
+    dL_j ~ 0) get a zeroed column via the eps guard.
+
+    Args:
+        C_basis: [n, n] numpy, the signed loss-carriage (carrier x source).
+        dL_j:    [n] numpy, exact per-source loss change L_clean - mean_k L_swap(j,k).
+    """
+    C_basis = np.asarray(C_basis)
+    sumC_j = C_basis.sum(axis=0)                                       # [n]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        share = np.where(np.abs(sumC_j) > eps, C_basis / sumC_j, 0.0)
+    B = np.asarray(dL_j)[None, :] * share                             # sum_i B[i,j] = dL_j
+    return B, sumC_j
+
+
 def beneficial_from_carriage(C, yhat_clean, yhat_swap, y, num_sources, num_donors, eps=1e-9):
     """Exact per-source loss change, attributed to carriers by their carriage share.
 

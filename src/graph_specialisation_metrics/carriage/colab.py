@@ -95,6 +95,10 @@ def run(
 
     repo_dir = Path(grit_repo_dir)
     env.clone_grit(repo_dir, spec.grit_repo, spec.grit_commit, force_fresh=force_fresh_grit)
+    # Task env hooks (e.g. peptides RDKit + dataset/RRWP patches) MUST run before GRIT is
+    # imported, since they patch GRIT source files that would otherwise be import-cached.
+    for hook in spec.env_hooks:
+        hook(repo_dir)
     env.prepare_inprocess_grit(repo_dir)
     config_file = env.resolve_config(spec, repo_dir, out_dir)
 

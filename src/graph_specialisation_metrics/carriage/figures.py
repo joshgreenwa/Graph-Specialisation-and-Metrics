@@ -21,9 +21,10 @@ C_FUNC, C_BEN, C_ADV = "#2b6cb0", "#2f855a", "#c53030"
 
 def _caption(meta: dict, n_g: int, K: int) -> str:
     tm = meta.get("test_metric")
+    mn = meta.get("test_metric_name", "metric")
     ep = meta.get("checkpoint_epoch")
     return (f"{meta.get('title', meta.get('task', 'GRIT'))} | epoch {ep}"
-            + (f" | test MAE {tm:.4f}" if tm is not None else "")
+            + (f" | test {mn} {tm:.4f}" if tm is not None else "")
             + f"\n{n_g} {meta.get('eval_split')} graphs, K={K} donor swaps/source, "
               f"donors from '{meta.get('donor_split')}'")
 
@@ -64,6 +65,7 @@ def make_figures_and_save(results: dict, out_dir: str, n_boot: int = 2000,
     })
     tag = _caption(meta, n_g, K)
     self_col = C_ADV
+    units = meta.get("loss_units", "MAE units")
     lin_B = core.symlog_linthresh(B_mean[1:] if ds.size > 1 else B_mean, bd_linthresh)
 
     # ---- Fig 1: F(d) and B(d) ---------------------------------------------------------
@@ -76,8 +78,9 @@ def make_figures_and_save(results: dict, out_dir: str, n_boot: int = 2000,
         ax.annotate("self ($i{=}j$)", (ds[0], F_mean[0]), textcoords="offset points",
                     xytext=(8, -2), fontsize=8, color=self_col, va="center")
     ax.set_xlabel("shortest-path distance $d(i,j)$ [hops]")
-    ax.set_ylabel(r"$F(d)=\mathrm{mean}_{d(i,j)=d}\,|C[i,j]|$")
-    ax.set_title("Functional carriage $F(d)$\n(label-free: does the model use $j$ at $i$?)")
+    ax.set_ylabel(r"$F(d)=\mathrm{mean}_{d(i,j)=d}\,\|C_{\mathrm{out}}[i,j]\|$")
+    ax.set_title("Functional carriage $F(d)$\n"
+                 r"(label-free: magnitude of the output movement from $j$ at $i$)")
     if np.nanmin(F_mean) > 0:
         ax.set_yscale("log")
     ax.set_xticks(ds)
@@ -95,7 +98,7 @@ def make_figures_and_save(results: dict, out_dir: str, n_boot: int = 2000,
                     xytext=(8, 0), fontsize=8, color=self_col, va="center")
     ax.set_yscale("symlog", linthresh=lin_B)
     ax.set_xlabel("shortest-path distance $d(i,j)$ [hops]")
-    ax.set_ylabel(r"$B(d)=\mathrm{mean}_{d(i,j)=d}\,B[i,j]$   [MAE units, symlog]")
+    ax.set_ylabel(rf"$B(d)=\mathrm{{mean}}_{{d(i,j)=d}}\,B[i,j]$   [{units}, symlog]")
     ax.set_title("Beneficial carriage $B(d)$\n"
                  r"$B<0$ beneficial $\cdot$ $B>0$ adverse $\cdot$ $B\approx0$ dispensable")
     ax.set_xticks(ds)
@@ -116,7 +119,7 @@ def make_figures_and_save(results: dict, out_dir: str, n_boot: int = 2000,
     ax.fill_between(ks, np.minimum(Bf_mean, 0), 0, color=C_BEN, alpha=0.30, lw=0)
     ax.fill_between(ks, np.maximum(Bf_mean, 0), 0, color=C_ADV, alpha=0.30, lw=0)
     ax.set_xlabel("hop threshold $k$")
-    ax.set_ylabel(r"$B_{\mathrm{far}}(k)=\sum_{\{(i,j):\,d(i,j)>k\}} B[i,j]$   [MAE units]")
+    ax.set_ylabel(rf"$B_{{\mathrm{{far}}}}(k)=\sum_{{\{{(i,j):\,d(i,j)>k\}}}} B[i,j]$   [{units}]")
     ax.set_title(r"Beneficial carriage beyond $k$ hops"
                  "\n" r"per graph, mean over graphs (95% CI, bootstrap over graphs)")
     ax.set_xticks(ks)
@@ -149,7 +152,7 @@ def make_figures_and_save(results: dict, out_dir: str, n_boot: int = 2000,
                     xytext=(8, 0), fontsize=8, color=self_col, va="center")
     ax.set_yscale("symlog", linthresh=core.symlog_linthresh(S_mean[1:] if ds.size > 1 else S_mean))
     ax.set_xlabel("$d(i,j)$ [hops]")
-    ax.set_ylabel(r"$\sum_{d(i,j)=d} B[i,j]$ per graph  [MAE units, symlog]")
+    ax.set_ylabel(rf"$\sum_{{d(i,j)=d}} B[i,j]$ per graph  [{units}, symlog]")
     ax.set_title("Error mass carried at each distance\n"
                  r"(tail sums give $B_{\mathrm{far}}(k)$; per source $\sum_i B[i,j]=dL_j$ exactly)")
     ax.set_xticks(ds)
@@ -159,9 +162,9 @@ def make_figures_and_save(results: dict, out_dir: str, n_boot: int = 2000,
     lim = max(float(np.nanmax(np.abs(np.concatenate([a_sumC, a_dyhat])))) * 1.05, 1e-12)
     ax.plot([-lim, lim], [-lim, lim], "--", color="0.4", lw=1.0, label="$y=x$")
     ax.set_xlim(-lim, lim); ax.set_ylim(-lim, lim)
-    ax.set_xlabel(r"$\sum_i C[i,j]$")
-    ax.set_ylabel(r"$\hat{y}_{\mathrm{clean}} - \mathrm{mean}_k\,\hat{y}_{\mathrm{swap}}(j,k)$")
-    ax.set_title(f"Additivity audit (first order)\n$r$={r:.3f}, slope={slope:.3f}")
+    ax.set_xlabel(r"$\sum_i C_{\mathrm{loss}}[i,j]$  (first-order $\Delta L$)")
+    ax.set_ylabel(r"$dL_j = L_{\mathrm{clean}} - \mathrm{mean}_k L_{\mathrm{swap}}(j,k)$")
+    ax.set_title(f"Loss additivity audit (first order)\n$r$={r:.3f}, slope={slope:.3f}")
     ax.legend(frameon=False, fontsize=8)
 
     ax = axes[1, 1]
@@ -211,7 +214,7 @@ def make_figures_and_save(results: dict, out_dir: str, n_boot: int = 2000,
 
     # ---- console table ----------------------------------------------------------------
     log("\n" + "=" * 84)
-    log("RESULTS  (C = clean - swapped, donor-averaged; B<0 = beneficial, MAE units)")
+    log(f"RESULTS  (F=||dy_hat||; B<0 = beneficial, {units})")
     log("=" * 84)
     log(f"{'d':>3} {'#pairs':>8} {'F(d)':>12} {'B(d)':>13} {'sum_d B/graph':>15}")
     for d in ds:
