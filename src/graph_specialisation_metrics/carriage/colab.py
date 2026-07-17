@@ -47,7 +47,7 @@ def run(
     drive_dir: Optional[str] = None,
     collate_dir: str = DEFAULT_COLLATE_DIR,
     ckpt: Optional[str] = None,
-    grit_repo_dir: str = "/content/GRIT",
+    grit_repo_dir: Optional[str] = None,
     # analysis knobs
     eval_split: str = "test",
     donor_split: str = "test",
@@ -93,7 +93,9 @@ def run(
     else:
         log("[deps] Skipping dependency installation (skip_install=True).")
 
-    repo_dir = Path(grit_repo_dir)
+    # A task that patches GRIT source (e.g. 1-hop) uses its own clone dir so it never
+    # collides with a dense clone in the same runtime; caller can still override.
+    repo_dir = Path(grit_repo_dir or spec.grit_repo_dir or "/content/GRIT")
     env.clone_grit(repo_dir, spec.grit_repo, spec.grit_commit, force_fresh=force_fresh_grit)
     # Task env hooks (e.g. peptides RDKit + dataset/RRWP patches) MUST run before GRIT is
     # imported, since they patch GRIT source files that would otherwise be import-cached.

@@ -229,6 +229,21 @@ def find_checkpoint(results_root: Path, explicit: Optional[str] = None) -> tuple
     return chosen, epoch
 
 
+def ensure_repo_root_on_path() -> None:
+    """Put the PROJECT repo root on sys.path so `import experiments...` resolves.
+
+    Task env hooks (peptides patches, the 1-hop patch) live under experiments/ in this
+    repo. The bootstrap cell adds <repo>/src (the carriage package); this adds <repo> so
+    the experiments package is importable too. Derived from this module's own location:
+    .../<repo>/src/graph_specialisation_metrics/carriage/env.py -> parents[3] == <repo>.
+    """
+    root = Path(__file__).resolve().parents[3]
+    if (root / "experiments").is_dir():
+        p = str(root)
+        if p not in sys.path:
+            sys.path.insert(0, p)
+
+
 def resolve_config(task, repo_dir: Path, out_dir: Path) -> str:
     """Return an absolute config path for the task (repo file, or inline text written out)."""
     if task.config_text:

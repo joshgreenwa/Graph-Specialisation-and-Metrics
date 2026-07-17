@@ -64,6 +64,7 @@ class GritTaskSpec:
     env_hooks: tuple = ()
     grit_repo: str = OFFICIAL_GRIT_REPO
     grit_commit: str = OFFICIAL_GRIT_COMMIT
+    grit_repo_dir: Optional[str] = None   # own clone dir when a task patches GRIT source
     node_content_desc: str = "node content"
 
     def __post_init__(self):
@@ -106,16 +107,45 @@ register(GritTaskSpec(
 ))
 
 
+def _onehop_hooks():
+    """Deferred so importing tasks stays torch/GRIT-free; called at run time."""
+    from . import onehop_env
+
+    def hook(repo_dir):
+        onehop_env.apply_onehop_patch(repo_dir)
+
+    return (hook,)
+
+
 def _peptides_hooks():
     """Deferred so importing tasks stays torch/GRIT-free; called at run time."""
     from . import peptides_env
 
     def hook(repo_dir):
-        peptides_env.ensure_repo_root_on_path(repo_dir)
+        peptides_env.ensure_repo_root_on_path()
         peptides_env.install_peptides_deps()
         peptides_env.apply_peptides_patches(repo_dir)
 
     return (hook,)
+
+
+# Parameter-matched 1-hop GRIT+RRWP on ZINC-subset (sparse control; same scalar regression).
+register(GritTaskSpec(
+    name="zinc_1hop",
+    title="GRIT+RRWP ZINC-subset (1-hop masked)",
+    # Written into the GRIT clone by the 1-hop patch hook, then resolved from there.
+    config_path="configs/GRIT/zinc-GRIT-RRWP-1hop.yaml",
+    expected_params=473_473,       # parameter-matched to dense ZINC
+    drive_dir="/content/drive/MyDrive/grit_zinc_1hop",
+    paper_metric=None,             # a locality-restricted control; MAE is model-dependent
+    metric_fn=staticmethod(metrics.mae_metric),
+    metric_higher_better=False,
+    metric_abort=0.6,              # catches an unloaded checkpoint (MAE ~ target std); a
+                                   # trained 1-hop ZINC control is well under this
+    env_hooks=_onehop_hooks(),
+    grit_repo_dir="/content/GRIT_zinc_1hop",  # own clone: the patch edits GRIT source
+    node_content_desc="atom type",
+))
 
 
 # Official dense GRIT+RRWP on Peptides-func (10-way multilabel classification, metric AP).

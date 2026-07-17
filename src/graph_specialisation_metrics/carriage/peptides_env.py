@@ -15,9 +15,9 @@ before building loaders.
 from __future__ import annotations
 
 import os
-import sys
 from pathlib import Path
 
+from . import env
 from .env import log, run_cmd
 
 
@@ -60,17 +60,6 @@ def apply_peptides_patches(repo_dir: Path) -> None:
     log(f"[peptides] GRIT_PE_STREAM_CHUNK_SIZE={os.environ['GRIT_PE_STREAM_CHUNK_SIZE']}")
 
 
-def ensure_repo_root_on_path(repo_dir: Path) -> None:
-    """The peptides helpers live under experiments/, imported from the PROJECT repo root.
-
-    The bootstrap cell adds <project_repo>/src; here we also add the project repo root so
-    `import experiments...` resolves. In Colab the project repo is /content/Graph-...; we
-    locate it by walking up from this module's file.
-    """
-    here = Path(__file__).resolve()
-    # .../<project_repo>/src/graph_specialisation_metrics/carriage/peptides_env.py
-    project_root = here.parents[3]
-    if (project_root / "experiments").is_dir():
-        p = str(project_root)
-        if p not in sys.path:
-            sys.path.insert(0, p)
+def ensure_repo_root_on_path(repo_dir: Path = None) -> None:
+    """Put the PROJECT repo root on sys.path so `import experiments...` resolves."""
+    env.ensure_repo_root_on_path()
