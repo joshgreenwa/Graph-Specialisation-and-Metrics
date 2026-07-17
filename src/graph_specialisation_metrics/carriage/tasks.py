@@ -132,3 +132,19 @@ register(GritTaskSpec(
     env_hooks=_peptides_hooks(),
     node_content_desc="OGB atom features (9)",
 ))
+
+
+# Official dense GRIT+RRWP on Peptides-struct (11-target regression, metric MAE).
+register(GritTaskSpec(
+    name="peptides_struct",
+    title="GRIT+RRWP Peptides-struct (dense)",
+    config_path="configs/GRIT/peptides-struct-GRIT-RRWP.yaml",
+    expected_params=None,  # the MAE recompute is the load check
+    drive_dir="/content/drive/MyDrive/grit_peptides_struct_official",
+    paper_metric=("MAE", 0.2460),
+    metric_fn=staticmethod(metrics.mae_metric),  # mean abs error over the 11 targets
+    metric_higher_better=False,
+    metric_abort=0.40,     # a correctly loaded model is ~0.246; above 0.40 => broken load
+    env_hooks=_peptides_hooks(),
+    node_content_desc="OGB atom features (9)",
+))
