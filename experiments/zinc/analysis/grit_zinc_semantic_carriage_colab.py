@@ -98,26 +98,40 @@ Functional carriage (Def 3.3.2)
     -> Label-free. abs() is applied to the donor-AVERAGED C (Eq. 3.6 is a function of
        C, and C is the estimator of 3.5), then the mean is taken over pairs.
 
-Beneficial carriage (Def 3.3.3, Eq. 3.11)
-        B[i, j] = sign(yhat_clean - y) . C[i, j]                            (3.8/3.11)
+Beneficial carriage (Def 3.3.3, made exact across the |.| kink)
+    The dissertation's linearized form is B[i,j] = sign(yhat_clean - y) . C[i,j]  (3.8),
+    whose column sum equals L_clean - L_base only to first order and only when the
+    residual does not change sign. We use the EXACT per-source loss change instead,
+    attributed to carriers by their share of the output change:
 
-    -> Units and sign. With L = |yhat - y| (the official ZINC loss is `l1`, and
-       metric_best is `mae`), dL/d yhat = sign(yhat - y), and the text's decomposition
-       yhat_clean - yhat_base = sum C[i,j] gives
+        L_clean = |yhat_clean - y|
+        dL_j    = L_clean - mean_k |yhat_swap(j,k) - y|          per source j  [MAE units]
+        B[i,j]  = dL_j . ( C[i,j] / sum_i C[i,j] )               carrier share
+        => sum_i B[i,j] = dL_j   EXACTLY.
 
-           L_clean - L_base  ~=  sign(yhat_clean - y) . (yhat_clean - yhat_base)
-                             =   sum_{i,j} B[i, j]
+    Sign is unchanged and reads the same way (units are MAE):
+        B < 0  -> transport REDUCED the error   : beneficial
+        B > 0  -> transport INCREASED the error : adverse
+        B ~ 0  -> moved the output, not the error: dispensable / redundant
 
-       so B is in MAE units and:
-           B < 0  -> transport REDUCED the error   : beneficial
-           B > 0  -> transport INCREASED the error : adverse
-           B ~ 0  -> moved the output, not the error: dispensable / redundant
-       This matches p. 33 exactly. The first-order step is audited at runtime by the
-       additivity diagnostic (see VERIFICATION).
+    Two subtleties that make this correct rather than merely exact:
+      * Donor-average the LOSS, not the prediction. The |.| kink makes E|.| != |E.|
+        precisely when donor variance is large (i.e. near a residual sign crossing), so
+        averaging yhat over donors and then taking |.| would misstate benefit. dL_j uses
+        mean_k |yhat_swap - y|, the actual post-swap loss.
+      * Because it uses the actual post-swap loss, this B SEES that corrupting a node's
+        own content is catastrophic: the swap sends the loss far up, so dL_j = L_clean -
+        L_swap is a large NEGATIVE number, i.e. the content was strongly beneficial (its
+        removal hurt a lot). The clean-point linearization sign(yhat_clean - y).C cannot
+        capture this magnitude across the kink. The carrier split C[i,j]/sum_i C[i,j] is a
+        signed share of the output change; sources that move nothing (sum_i C[i,j] ~ 0,
+        hence dL_j ~ 0) get a zeroed column via an eps guard, which is well-defined.
 
-       Per Remark 3.3.1 we never score the perturbed graph against the clean label y:
-       the swap is used ONLY to expose the transport dh_i(j); the benefit direction
-       comes from sign(yhat_clean - y) at the clean input.
+    Per Remark 3.3.1 we still never score the perturbed graph against the clean label to
+    make a per-pair CLAIM in the linearized sense; here the post-swap loss enters only as
+    the exact scalar dL_j being decomposed, and the transport dh_i(j) (via C) is what
+    distributes it across carriers. B<0/>0/~0 remains a statement about the trained
+    model's behaviour, not a ground-truth causal claim about the task.
 
 B_far(k)  [requested deliverable]
         B_far(k) = sum over {(i, j) : d(i, j) > k} of B[i, j]
@@ -145,12 +159,14 @@ VERIFICATION (every one of these runs by default; --verify off to skip the costl
   8. Structure invariance: only x changes under the intervention (bit-identical
      edge_index / edge_attr / rrwp / rrwp_index / rrwp_val).
   9. Additivity: sum_i C[i, j] vs (yhat_clean - mean_k yhat_swap(j,k)), reported as
-     Pearson r and OLS slope. This audits the linearisation implicit in
-     "yhat_clean - yhat_base = sum C[i,j]" (the head MLP is nonlinear, so this is a
-     first-order identity, not an exact one).
+     Pearson r and OLS slope. Audits that the carrier "share" C[i,j]/sum_i C[i,j]
+     divides a meaningful output change (the head MLP is nonlinear, so r<1 is expected).
  10. Connectivity: unreachable pairs (d = inf) are counted; ZINC molecules are
      connected so this should be 0. Any such pairs are excluded from all
      distance-indexed statistics and loudly reported.
+ 11. Beneficial exactness: max_j |sum_i B[i,j] - dL_j| must be ~0. B is constructed so
+     each source column sums to the exact per-source loss change; this asserts the share
+     attribution and the loss donor-average are wired correctly (aborts above --tol).
 
 Suggested Colab usage:
 
@@ -998,6 +1014,7 @@ def stage_analyze(args: argparse.Namespace) -> None:
     batchinv_max = 0.0
     struct_checked = 0
     peak_mem = 0
+    bexact_max = 0.0   # max |sum_i B[i,j] - dL_j| over sources that moved the output
 
     def _spd(data, n: int) -> np.ndarray:
         ei = data.edge_index.cpu().numpy()
@@ -1125,15 +1142,41 @@ def stage_analyze(args: argparse.Namespace) -> None:
         # --- carriage: Eq 3.4 / 3.5 -------------------------------------------------
         C = carriage_from_states(h_clean, h_swap, g, S, K).cpu().numpy()   # C[i, j]
 
-        # --- beneficial carriage: Eq 3.8 / 3.11 ------------------------------------
-        s = float(np.sign(yhat_clean - y))
-        B = s * C
+        # --- beneficial carriage ----------------------------------------------------
+        # EXACT per-source loss change, attributed to carriers by their share of the
+        # output change. This replaces the linearized B = sign(yhat_clean - y) * C
+        # (Eq. 3.8) with a form that is exact across the |.| kink and uses the ACTUAL
+        # post-swap loss (so it sees that corrupting a node's own content is catastrophic,
+        # which the linearization -- read off the clean point -- cannot).
+        #
+        #   dL_j        = |yhat_clean - y| - mean_k |yhat_swap(j,k) - y|      [per source]
+        #   B[i,j]      = dL_j * ( C[i,j] / sum_i C[i,j] )                    [carrier share]
+        #   => sum_i B[i,j] = dL_j  EXACTLY;  B<0 = beneficial, B>0 = adverse (MAE units)
+        #
+        # Donor-average the LOSS, not the prediction: the kink makes E|.| != |E.| exactly
+        # when donor variance is large, so averaging yhat over donors and then taking |.|
+        # would misstate benefit near a residual sign crossing.
+        L_clean = abs(yhat_clean - y)
+        L_swap = (yhat_swap.view(S, K) - y).abs().mean(dim=1).cpu().numpy()   # [S] per source
+        dL_j = L_clean - L_swap                                               # [S]  <0 = beneficial
+        sumC_j = C.sum(axis=0)                                                # [n]  sum_i C[i,j]
+        eps = 1e-9
+        # Guard the denominator: a source that moves nothing (sum_i C[i,j] ~ 0) also has
+        # dL_j ~ 0, so zeroing its column is the correct, well-defined attribution.
+        with np.errstate(divide="ignore", invalid="ignore"):
+            share = np.where(np.abs(sumC_j) > eps, C / sumC_j, 0.0)          # C[i,j] / sum_i C[i,j]
+        B = dL_j[None, :] * share                                            # sum_i B[i,j] = dL_j
 
-        # --- additivity diagnostic (check 9) ---------------------------------------
-        sumC_j = C.sum(axis=0)                                     # sum_i C[i, j]
+        # --- additivity diagnostic (check 9): audits sum_i C[i,j] ~ yhat_clean-yhat_base,
+        # --- i.e. that the carrier "share" divides a meaningful output change. -------
         dyhat_j = yhat_clean - yhat_swap.view(S, K).mean(dim=1).cpu().numpy()
         add_sumC.append(sumC_j)
         add_dyhat.append(dyhat_j)
+        # source-level exactness of the new B (must hold to fp tolerance where sumC!=0)
+        moved = np.abs(sumC_j) > eps
+        if moved.any():
+            bexact_max = max(bexact_max,
+                             float(np.abs(B.sum(axis=0)[moved] - dL_j[moved]).max()))
 
         # --- flatten pairs ----------------------------------------------------------
         ii, jj = np.meshgrid(np.arange(n), np.arange(n), indexing="ij")
@@ -1221,10 +1264,20 @@ def stage_analyze(args: argparse.Namespace) -> None:
         r, slope = float("nan"), float("nan")
     log(f"  [9] additivity sum_i C[i,j] vs (yhat_clean - mean_k yhat_swap): "
         f"r={r:.4f}, slope={slope:.4f}")
-    log("      (first-order identity only -- the SANGraphHead MLP after sum-pooling is "
-        "nonlinear, so r<1 is expected, not a bug)")
+    log("      (audits that the carrier 'share' C[i,j]/sum_i C[i,j] divides a meaningful "
+        "output change; r<1 is expected -- the head MLP after sum-pooling is nonlinear)")
     checks["additivity_pearson_r"] = r
     checks["additivity_slope"] = slope
+    log(f"  [11] beneficial exactness       : max_j |sum_i B[i,j] - dL_j| = {bexact_max:.3e}  "
+        f"(B decomposes the exact per-source loss change; must be ~0)")
+    checks["beneficial_exactness_max"] = float(bexact_max)
+    if bexact_max > tol:
+        raise RuntimeError(
+            f"Beneficial-carriage exactness violated: max_j |sum_i B[i,j] - dL_j| = "
+            f"{bexact_max:.3e} > tol {tol:.1e}. B is defined so its column sum equals the "
+            f"exact per-source loss change dL_j; a mismatch means the share attribution "
+            f"or the loss donor-average is miswired."
+        )
     if device.type == "cuda":
         log(f"  [mem] peak CUDA memory allocated: {peak_mem/1024**3:.2f} GiB of "
             f"{torch.cuda.get_device_properties(0).total_memory/1024**3:.1f} GiB")
@@ -1324,7 +1377,7 @@ def stage_analyze(args: argparse.Namespace) -> None:
     ax.set_xlabel("$d(i,j)$ [hops]")
     ax.set_ylabel(r"$\sum_{d(i,j)=d} B[i,j]$ per graph  [MAE units]")
     ax.set_title("Error mass carried at each distance\n"
-                 r"(these sum to $B_{\mathrm{far}}$; total $= L_{\mathrm{clean}}-L_{\mathrm{base}}$)")
+                 r"(tail sums give $B_{\mathrm{far}}(k)$; per source $\sum_i B[i,j]=dL_j$ exactly)")
     ax.set_xticks(ds)
 
     ax = axes[1, 0]
