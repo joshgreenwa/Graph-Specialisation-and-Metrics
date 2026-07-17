@@ -142,14 +142,22 @@ def run(variant,task):
     # score both=1) so only selectively-routing queries survive.
     S=6 if SMOKE else 40; ar=torch.arange(G); Hh=torch.arange(HEADS); Nn=torch.arange(N); F=0.02
     def col(A,c): return A[ar[:,None,None],Hh[None,:,None],Nn[None,None,:],c[:,None,None]]  # [G,heads,N(query)]
-    eqv=np.zeros((L,HEADS)); inv=np.zeros((L,HEADS)); wr=np.zeros((L,HEADS))     # raw (alpha-weighted)
-    eqvc=np.zeros((L,HEADS)); invc=np.zeros((L,HEADS)); wc=np.zeros((L,HEADS))   # centred (differential-weighted)
+    # SAME transposition, but the equivariance/invariance can be read off the ATTENTION matrix (a) OR the
+    # head VALUE output ho=attn.(V+pv) at the swapped nodes.  For ho the swap-target is (ho_j, ho_i): a head
+    # whose OUTPUT swaps with content is content-carrying (semantic); one whose output is unchanged is
+    # content-blind (structural).  NB V itself swaps under the content swap, so value-equivariance is the
+    # expected behaviour of any content-carrying head -> directly comparable to Method 2's ||d ho||.
+    eqv=np.zeros((L,HEADS)); inv=np.zeros((L,HEADS)); wr=np.zeros((L,HEADS))     # ATTENTION raw (alpha-weighted)
+    eqvc=np.zeros((L,HEADS)); invc=np.zeros((L,HEADS)); wc=np.zeros((L,HEADS))   # ATTENTION centred (diff-weighted)
+    veq=np.zeros((L,HEADS)); viv=np.zeros((L,HEADS)); vwr=np.zeros((L,HEADS))    # VALUE raw
+    veqc=np.zeros((L,HEADS)); vivc=np.zeros((L,HEADS)); vwc=np.zeros((L,HEADS))  # VALUE centred
     for _ in range(S):
         ii=np.random.randint(1,N,size=G); jj=np.array([np.random.choice([x for x in range(1,N) if x!=ii[g]]) for g in range(G)])
         it=torch.tensor(ii); jt=torch.tensor(jj); f2=me["feat"].clone()
         ci=f2[ar,it,2:2+CV].clone(); f2[ar,it,2:2+CV]=f2[ar,jt,2:2+CV]; f2[ar,jt,2:2+CV]=ci
         _,capsT=capf(f2,me["nd"],me["pr"])
         for l in range(L):
+            # -- attention channel (per query row) --
             a=col(caps0[l][0],it); b=col(caps0[l][0],jt); ap=col(capsT[l][0],it); bp=col(capsT[l][0],jt)
             e=torch.sqrt(2*(a-b)**2)                                # ||p^swap - p||  (swap displacement)
             d_eq=torch.sqrt((ap-b)**2+(bp-a)**2)                    # ||p' - p^swap|| (distance to swapped)
@@ -158,8 +166,21 @@ def run(variant,task):
             wa=a+b; wd=(a-b).abs()                                  # alpha weight  /  differential weight
             eqv[l]+=(wa*eq).sum((0,2)).numpy(); inv[l]+=(wa*iv).sum((0,2)).numpy(); wr[l]+=wa.sum((0,2)).numpy()
             eqvc[l]+=(wd*eq).sum((0,2)).numpy(); invc[l]+=(wd*iv).sum((0,2)).numpy(); wc[l]+=wd.sum((0,2)).numpy()
-    sem1=eqv/(wr+1e-9); str1=inv/(wr+1e-9)                   # RAW: independent equivariance / invariance
-    sem1c=eqvc/(wc+1e-9); str1c=invc/(wc+1e-9)               # CENTRED: differential-weighted (background removed)
+            # -- value channel (per node output ho, dh-dim vector at i,j) --
+            hi=caps0[l][1][ar,:,it]; hj=caps0[l][1][ar,:,jt]        # [G,heads,dh] clean output at i,j
+            hi2=capsT[l][1][ar,:,it]; hj2=capsT[l][1][ar,:,jt]      # after swap
+            ev=torch.sqrt(((hj-hi)**2).sum(-1)+((hi-hj)**2).sum(-1))    # ||p^swap - p||  [G,heads]
+            dqv=torch.sqrt(((hi2-hj)**2).sum(-1)+((hj2-hi)**2).sum(-1)) # to swapped target
+            div=torch.sqrt(((hi2-hi)**2).sum(-1)+((hj2-hj)**2).sum(-1)) # to original
+            Fv=0.1*ev.mean().clamp(min=1e-6)                        # scale-adaptive floor (value norms vary by head)
+            eqV=(1-dqv/(ev+Fv)).clamp(0,1); ivV=(1-div/(ev+Fv)).clamp(0,1)
+            wav=hi.norm(dim=-1)+hj.norm(dim=-1); wdv=(hi-hj).norm(dim=-1)   # value-magnitude / value-differential weight
+            veq[l]+=(wav*eqV).sum(0).numpy(); viv[l]+=(wav*ivV).sum(0).numpy(); vwr[l]+=wav.sum(0).numpy()
+            veqc[l]+=(wdv*eqV).sum(0).numpy(); vivc[l]+=(wdv*ivV).sum(0).numpy(); vwc[l]+=wdv.sum(0).numpy()
+    sem1=eqv/(wr+1e-9); str1=inv/(wr+1e-9)                   # ATTENTION raw: independent equivariance / invariance
+    sem1c=eqvc/(wc+1e-9); str1c=invc/(wc+1e-9)               # ATTENTION centred: differential-weighted
+    semV=veq/(vwr+1e-9); strV=viv/(vwr+1e-9)                 # VALUE raw
+    semVc=veqc/(vwc+1e-9); strVc=vivc/(vwc+1e-9)             # VALUE centred
 
     # per-head functional / beneficial carriage (full-head ablation)
     imp=np.zeros((L,HEADS)); ben=np.zeros((L,HEADS))
@@ -170,7 +191,8 @@ def run(variant,task):
                 imp[l,h]=np.abs(yp-yh).mean(); ben[l,h]=(np.abs(yp-yv)-absr).mean()
     skill=1-((yh-yv)**2).mean()/me["y"].var().item()
     return dict(skill=skill,sem_v=sem_v,str_v=str_v,sem_a=sem_a,str_a=str_a,imp=imp,ben=ben,
-                sem1=sem1,str1=str1,sem1c=sem1c,str1c=str1c)
+                sem1=sem1,str1=str1,sem1c=sem1c,str1c=str1c,
+                semV=semV,strV=strV,semVc=semVc,strVc=strVc)
 
 print(("SMOKE " if SMOKE else "")+"per-head alpha-weighted semantic/structural scores ...")
 R={}
@@ -182,9 +204,12 @@ for v,t in MODELS:
 # normalise each channel by its GLOBAL mean (content perturbations are inherently larger),
 # so the semantic/structural comparison is on a common scale.
 gsem=float(np.mean([R[m]["sem_v"] for m in R])); gstr=float(np.mean([R[m]["str_v"] for m in R]))
-def SN(d): return d["sem_v"]/(gsem+1e-9)
-def TN(d): return d["str_v"]/(gstr+1e-9)
+def SN(d): return d["sem_v"]/(gsem+1e-9)      # VALUE  · separate: semantic (content-swap ||d ho||, norm.)
+def TN(d): return d["str_v"]/(gstr+1e-9)      # VALUE  · separate: structural (RRWP-swap ||d ho||, norm.)
 def SF(d): return TN(d)/(SN(d)+TN(d)+1e-9)
+gsem_a=float(np.mean([R[m]["sem_a"] for m in R])); gstr_a=float(np.mean([R[m]["str_a"] for m in R]))
+def SNa(d): return d["sem_a"]/(gsem_a+1e-9)   # ATTN   · separate: semantic (content-swap ||d alpha||, norm.)
+def TNa(d): return d["str_a"]/(gstr_a+1e-9)   # ATTN   · separate: structural (RRWP-swap ||d alpha||, norm.)
 
 # ---------------- (1) heatmaps: structural fraction (value) per head ----------------
 fig,ax=plt.subplots(2,2,figsize=(9.6,7.8),constrained_layout=True)
@@ -285,3 +310,64 @@ for (v,t) in MODELS:
     d=R[(v,t)]; m2=SF(d).ravel()
     print(f"  {v+'/'+t:<18}{d['str1'].mean():>8.2f}{d['str1c'].mean():>12.2f}{SF(d).mean():>7.2f}"
           f"{np.corrcoef(d['str1'].ravel(),m2)[0,1]:>+11.2f}{np.corrcoef(d['str1c'].ravel(),m2)[0,1]:>+11.2f}")
+
+MODEL_STYLE=lambda v,t:("o" if v=="dense" else "^","#d62728" if t=="structural" else "#1f77b4")
+
+# ---------------- (7) NODE TRANSPOSITION: attention channel vs value channel ----------------
+# equivariance (semantic) / invariance (structural) of alpha  vs  of the head output ho, each in [0,1].
+fig,ax=plt.subplots(1,2,figsize=(11,5.2))
+for pi,(sk,ek,title) in enumerate([("str1","sem1","attention  ·  node transposition"),
+                                    ("strV","semV","value  ·  node transposition")]):
+    axi=ax[pi]
+    for (v,t) in MODELS:
+        d=R[(v,t)]; mkr,c=MODEL_STYLE(v,t)
+        axi.scatter(d[sk].ravel(),d[ek].ravel(),marker=mkr,color=c,s=42,edgecolors="k",linewidths=0.4,alpha=0.85,label=f"{v}/{t}")
+    axi.plot([0,1],[0,1],"k:",lw=0.7); axi.set_xlim(-0.02,1.02); axi.set_ylim(-0.02,1.02)
+    axi.set_title(title); axi.set_xlabel("structural score (invariance)"); axi.grid(alpha=0.3)
+    if pi==0: axi.set_ylabel("semantic score (equivariance)"); axi.legend(fontsize=8)
+fig.suptitle("Node transposition, scored on the attention vs the value vector (structural task=red, semantic task=blue; dense=circle, 1-hop=triangle)")
+fig.tight_layout(rect=[0,0,1,0.93]); fig.savefig("fig_head_transposition_value.png",dpi=140); print("saved fig_head_transposition_value.png")
+
+# ---------------- (8) SEPARATE INTERVENTION: attention channel vs value channel ----------------
+# scale-normalised sensitivity ||d alpha|| (attention) or ||d ho|| (value) to a single-node content
+# donor-swap (semantic) vs a degree-matched RRWP donor-swap (structural).
+fig,ax=plt.subplots(1,2,figsize=(11,5.2))
+sep_scores=[("attention  ·  separate intervention",TNa,SNa),("value  ·  separate intervention",TN,SN)]
+for pi,(title,Xf,Yf) in enumerate(sep_scores):
+    axi=ax[pi]; mx=0.0
+    for (v,t) in MODELS:
+        d=R[(v,t)]; mkr,c=MODEL_STYLE(v,t); xs=Xf(d).ravel(); ys=Yf(d).ravel(); mx=max(mx,xs.max(),ys.max())
+        axi.scatter(xs,ys,marker=mkr,color=c,s=42,edgecolors="k",linewidths=0.4,alpha=0.85,label=f"{v}/{t}")
+    mx*=1.06; axi.plot([0,mx],[0,mx],"k:",lw=0.7); axi.set_xlim(0,mx); axi.set_ylim(0,mx)
+    axi.set_title(title); axi.set_xlabel("structural score (RRWP-swap sensitivity, norm.)"); axi.grid(alpha=0.3)
+    if pi==0: axi.set_ylabel("semantic score (content-swap sensitivity, norm.)"); axi.legend(fontsize=8)
+fig.suptitle("Separate single-node donor intervention, scored on the attention vs the value vector (structural task=red, semantic task=blue; dense=circle, 1-hop=triangle)")
+fig.tight_layout(rect=[0,0,1,0.93]); fig.savefig("fig_head_separate_value.png",dpi=140); print("saved fig_head_separate_value.png")
+
+print("\nnode-transposition structural score, ATTENTION channel vs VALUE channel (and value-vs-Method 2):")
+print(f"  {'model':<18}{'attn str':>9}{'val str':>9}{'val cen':>9}{'r(attn,val)':>12}{'r(val,M2)':>11}")
+for (v,t) in MODELS:
+    d=R[(v,t)]; m2=SF(d).ravel()
+    print(f"  {v+'/'+t:<18}{d['str1'].mean():>9.2f}{d['strV'].mean():>9.2f}{d['strVc'].mean():>9.2f}"
+          f"{np.corrcoef(d['str1'].ravel(),d['strV'].ravel())[0,1]:>+12.2f}{np.corrcoef(d['strV'].ravel(),m2)[0,1]:>+11.2f}")
+
+# ---------------- (9) per-head FUNCTIONAL & BENEFICIAL carriage on each task ----------------
+# functional carriage = |dy_hat| when the head is ablated (how much the head's output is USED).
+# beneficial carriage = change in |prediction error| when ablated (>0 => ablation hurts => head HELPS).
+fig,ax=plt.subplots(2,4,figsize=(15,7.4),constrained_layout=True)
+vI=max(R[m]["imp"].max() for m in R); vB=max(np.abs(R[m]["ben"]).max() for m in R)
+for ci,(v,t) in enumerate(MODELS):
+    d=R[(v,t)]
+    im0=ax[0,ci].imshow(d["imp"],cmap="viridis",vmin=0,vmax=vI,aspect="auto")
+    im1=ax[1,ci].imshow(d["ben"],cmap="coolwarm",vmin=-vB,vmax=vB,aspect="auto")
+    ax[0,ci].set_title(f"{v} / {t}   (skill {d['skill']:.3f})")
+    for r,M in [(0,"imp"),(1,"ben")]:
+        ax[r,ci].set_xticks(range(HEADS)); ax[r,ci].set_yticks(range(L))
+        for l in range(L):
+            for h in range(HEADS): ax[r,ci].text(h,l,f"{d[M][l,h]:.2g}",ha="center",va="center",fontsize=6)
+    ax[1,ci].set_xlabel("head")
+ax[0,0].set_ylabel("FUNCTIONAL carriage\n|$\\Delta\\hat y$|   (layer)"); ax[1,0].set_ylabel("BENEFICIAL carriage\n$\\Delta$|error|   (layer)")
+fig.colorbar(im0,ax=ax[0,:],fraction=0.02,pad=0.01,label="functional  |$\\Delta\\hat y$|  (usage)")
+fig.colorbar(im1,ax=ax[1,:],fraction=0.02,pad=0.01,label="beneficial  $\\Delta$|error|  ( >0 = head helps )")
+fig.suptitle("Per-head functional and beneficial carriage on each synthetic task (full-head ablation)")
+fig.savefig("fig_head_carriage_maps.png",dpi=140); print("saved fig_head_carriage_maps.png")

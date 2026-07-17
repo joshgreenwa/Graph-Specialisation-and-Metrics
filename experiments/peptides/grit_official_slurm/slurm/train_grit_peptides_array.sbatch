@@ -11,7 +11,15 @@
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -n "${PROJECT_DIR:-}" ]]; then
+  REPO_ROOT="$(cd "${PROJECT_DIR}" && pwd)"
+elif [[ -n "${SLURM_SUBMIT_DIR:-}" && -d "${SLURM_SUBMIT_DIR}/experiments/peptides/grit_official_slurm" ]]; then
+  REPO_ROOT="$(cd "${SLURM_SUBMIT_DIR}" && pwd)"
+else
+  SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  REPO_ROOT="$(cd "${SCRIPT_DIR}/../../../.." && pwd)"
+fi
+SCRIPT_DIR="${REPO_ROOT}/experiments/peptides/grit_official_slurm/slurm"
 
 IFS=' ' read -r -a TASK_LIST <<< "${PEPTIDES_TASKS:-struct func}"
 IFS=' ' read -r -a VARIANT_LIST <<< "${GRIT_VARIANTS:-official 1hop}"

@@ -74,7 +74,7 @@ submit_one() {
   local job_id
   job_id="$(
     sbatch --parsable \
-      --export=ALL,WANDB_API_KEY,WANDB_MODE,WANDB_PROJECT,CONDA_ENV="${CONDA_ENV}",PEPTIDES_TASK="${task}",GRIT_VARIANT="${variant}",SEED="${SEED}",DATA_DIR="${data_dir}",RESULTS_DIR="${results_dir}",GRIT_PE_STREAM_CHUNK_SIZE="${GRIT_PE_STREAM_CHUNK_SIZE}" \
+      --export=ALL,WANDB_API_KEY,WANDB_MODE,WANDB_PROJECT,PROJECT_DIR="${PROJECT_DIR}",CONDA_ENV="${CONDA_ENV}",PEPTIDES_TASK="${task}",GRIT_VARIANT="${variant}",SEED="${SEED}",DATA_DIR="${data_dir}",RESULTS_DIR="${results_dir}",GRIT_PE_STREAM_CHUNK_SIZE="${GRIT_PE_STREAM_CHUNK_SIZE}" \
       -A "${ACCOUNT}" -p "${PARTITION}" --qos="${QOS}" \
       -N 1 --ntasks=1 --gres=gpu:1 --cpus-per-task="${CPUS_PER_TASK}" --mem="${MEM}" --time="${TIME_LIMIT}" \
       --job-name="grit-pep-${label}-s${SEED}" \

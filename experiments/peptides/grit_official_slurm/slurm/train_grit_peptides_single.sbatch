@@ -10,9 +10,17 @@
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-EXP_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
-REPO_ROOT="$(cd "${EXP_DIR}/../../.." && pwd)"
+if [[ -n "${PROJECT_DIR:-}" ]]; then
+  REPO_ROOT="$(cd "${PROJECT_DIR}" && pwd)"
+elif [[ -n "${SLURM_SUBMIT_DIR:-}" && -d "${SLURM_SUBMIT_DIR}/experiments/peptides/grit_official_slurm" ]]; then
+  REPO_ROOT="$(cd "${SLURM_SUBMIT_DIR}" && pwd)"
+else
+  SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  EXP_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+  REPO_ROOT="$(cd "${EXP_DIR}/../../.." && pwd)"
+fi
+EXP_DIR="${REPO_ROOT}/experiments/peptides/grit_official_slurm"
+SCRIPT_DIR="${EXP_DIR}/slurm"
 
 cd "${REPO_ROOT}"
 
