@@ -26,6 +26,7 @@ from typing import Optional
 from . import env, figures
 from .env import log
 from .grit_runner import CarriageConfig, run_grit_carriage
+from .structural_runner import run_grit_structural_carriage
 from .tasks import GritTaskSpec, get_task
 
 # All tasks' figures collate here (one subfolder per task) so they can be compared.
@@ -48,6 +49,16 @@ def run(
     collate_dir: str = DEFAULT_COLLATE_DIR,
     ckpt: Optional[str] = None,
     grit_repo_dir: Optional[str] = None,
+    # intervention selector:
+    #   "semantic"   (DEFAULT): donor-swap node content, hold structure (the validated path).
+    #   "structural" (BETA):    perturb topology-derived encodings, hold content. Two modes via
+    #       structural_mode: "transposition" (on-manifold node-role swap u<->v, partner v
+    #       marginalised over K matched draws -- primary) or "single_node" (off-manifold
+    #       footprint copy onto u only -- a cheap functional baseline). partner_match selects
+    #       the transposition partner pool ("degree" | "any").
+    intervention: str = "semantic",
+    structural_mode: str = "transposition",
+    partner_match: str = "degree",
     # analysis knobs
     eval_split: str = "test",
     donor_split: str = "test",
@@ -152,22 +163,35 @@ def run(
         donors=donors, graph_select=graph_select, analysis_seed=analysis_seed,
         verify=verify, verify_graphs=verify_graphs, eval_metric=eval_metric,
         allow_param_count_drift=allow_param_count_drift, beneficial_denom=beneficial_denom,
+        intervention=intervention, structural_mode=structural_mode, partner_match=partner_match,
         tol=tol, float_noise_tol=float_noise_tol,
         max_replicas=max_replicas, max_pair_edges=max_pair_edges,
     )
-    results = run_grit_carriage(spec, cc)
+    if intervention == "structural":
+        results = run_grit_structural_carriage(spec, cc)
+        collate_key = f"{spec.name}__structural_{structural_mode}"
+    elif intervention == "semantic":
+        results = run_grit_carriage(spec, cc)
+        collate_key = spec.name
+    else:
+        raise ValueError(f"intervention must be 'semantic' or 'structural', got {intervention!r}")
     outputs = figures.make_figures_and_save(
         results, str(out_dir), n_boot=n_boot, boot_seed=boot_seed, bd_linthresh=bd_linthresh,
         bin_strategy=bin_strategy, central=central, min_count=min_bin_count)
 
-    _update_collation_index(Path(collate_dir), spec, results, outputs)
+    _update_collation_index(Path(collate_dir), spec, results, outputs, key=collate_key)
     log(f"\n[done] Task {spec.name!r} figures + data: {out_dir}")
     log(f"[done] Collation root (all tasks): {collate_dir}")
     return {"task": spec.name, "out_dir": str(out_dir), **outputs, "checks": results["checks"]}
 
 
-def _update_collation_index(collate_root: Path, spec: GritTaskSpec, results: dict, outputs: dict) -> None:
-    """Maintain <collate_root>/index.json: one headline row per task for cross-task comparison."""
+def _update_collation_index(collate_root: Path, spec: GritTaskSpec, results: dict, outputs: dict,
+                            key: str = None) -> None:
+    """Maintain <collate_root>/index.json: one headline row per task for cross-task comparison.
+
+    ``key`` distinguishes interventions on the same task (semantic vs structural_*), so a
+    structural run does not clobber the semantic row for the same checkpoint."""
+    key = key or spec.name
     index_path = collate_root / "index.json"
     index = {}
     if index_path.exists():
@@ -177,8 +201,10 @@ def _update_collation_index(collate_root: Path, spec: GritTaskSpec, results: dic
             index = {}
     curves = outputs["curves"]
     checks, meta = results["checks"], results["meta"]
-    index[spec.name] = {
+    index[key] = {
         "title": spec.title,
+        "intervention": meta.get("intervention", "semantic"),
+        "structural_mode": meta.get("structural_mode"),
         "checkpoint": meta.get("checkpoint"),
         "checkpoint_epoch": meta.get("checkpoint_epoch"),
         "test_metric": checks.get("test_metric"),

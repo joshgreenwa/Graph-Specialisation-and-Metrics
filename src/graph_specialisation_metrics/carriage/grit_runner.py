@@ -45,6 +45,11 @@ class CarriageConfig:
     eval_metric: bool = True
     allow_param_count_drift: bool = False
     beneficial_denom: str = "magnitude"   # "magnitude" (default) | "signed" (legacy)
+    # Intervention selector (semantic path is the default; structural path is the beta twin
+    # in structural_runner.py and is dispatched by colab.run, not by this runner).
+    intervention: str = "semantic"        # "semantic" | "structural"
+    structural_mode: str = "transposition"  # "transposition" | "single_node"
+    partner_match: str = "degree"         # transposition partner v: "degree" | "any"
     tol: float = 1e-4
     # Looser ceiling for the float32-noise checks (no-op / batch-invariance). Real wiring
     # bugs (wrong row, no eval()) give O(1) dh, far above this; large full-attention graphs

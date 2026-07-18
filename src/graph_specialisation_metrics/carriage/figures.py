@@ -23,10 +23,11 @@ def _caption(meta: dict, n_g: int, K: int) -> str:
     tm = meta.get("test_metric")
     mn = meta.get("test_metric_name", "metric")
     ep = meta.get("checkpoint_epoch")
+    swap_word = meta.get("swap_word", "donor swaps")   # structural sets "partner-swaps"
     return (f"{meta.get('title', meta.get('task', 'GRIT'))} | epoch {ep}"
             + (f" | test {mn} {tm:.4f}" if tm is not None else "")
-            + f"\n{n_g} {meta.get('eval_split')} graphs, K={K} donor swaps/source, "
-              f"donors from '{meta.get('donor_split')}'")
+            + f"\n{n_g} {meta.get('eval_split')} graphs, K={K} {swap_word}/source, "
+              f"from '{meta.get('donor_split')}'")
 
 
 def make_figures_and_save(results: dict, out_dir: str, n_boot: int = 2000,
@@ -48,6 +49,10 @@ def make_figures_and_save(results: dict, out_dir: str, n_boot: int = 2000,
     a_sumC, a_dyhat = results["additivity_sumC"], results["additivity_dyhat"]
     checks, meta = results["checks"], results["meta"]
     K = int(meta["donors_K"])
+    # Output naming: semantic keeps its historical names; structural runs prefix theirs so the
+    # two coexist in one task folder without clobbering (default = semantic behaviour).
+    fig_tag = meta.get("fig_tag", "semantic")
+    data_prefix = "" if fig_tag == "semantic" else f"{fig_tag}_"
 
     agg = core.aggregate_carriage_curves(gid, pd_, F, pB, n_boot=n_boot, boot_seed=boot_seed,
                                          bin_strategy=bin_strategy, central=central,
@@ -119,8 +124,9 @@ def make_figures_and_save(results: dict, out_dir: str, n_boot: int = 2000,
             color=C_BEN, fontsize=8.5, fontweight="bold")
     ax.text(0.985, 0.94, "adverse", transform=ax.transAxes, ha="right", va="top",
             color=C_ADV, fontsize=8.5, fontweight="bold")
-    fig.suptitle("Semantic donor-swap interventions on GRIT   " + tag, fontsize=9.5, y=1.12)
-    p1 = fig_dir / "fig_semantic_carriage_Fd_Bd.png"
+    fig.suptitle(meta.get("fig_suptitle", "Semantic donor-swap interventions on GRIT")
+                 + "   " + tag, fontsize=9.5, y=1.12)
+    p1 = fig_dir / f"fig_{fig_tag}_carriage_Fd_Bd.png"
     fig.savefig(p1); plt.close(fig)
     log(f"\n[fig] {p1}")
 
@@ -142,7 +148,7 @@ def make_figures_and_save(results: dict, out_dir: str, n_boot: int = 2000,
     ax.text(0.985, 0.95, "net adverse", transform=ax.transAxes, ha="right", va="top",
             color=C_ADV, fontsize=9, fontweight="bold")
     fig.suptitle(tag, fontsize=8.5, y=1.02)
-    p2 = fig_dir / "fig_semantic_carriage_Bfar.png"
+    p2 = fig_dir / f"fig_{fig_tag}_carriage_Bfar.png"
     fig.savefig(p2); plt.close(fig)
     log(f"[fig] {p2}")
 
@@ -194,12 +200,12 @@ def make_figures_and_save(results: dict, out_dir: str, n_boot: int = 2000,
     _xaxis(ax)
     ax.legend(frameon=False, fontsize=8)
     fig.suptitle("Diagnostics   " + tag, fontsize=9.5, y=1.03)
-    p3 = fig_dir / "fig_semantic_carriage_diagnostics.png"
+    p3 = fig_dir / f"fig_{fig_tag}_carriage_diagnostics.png"
     fig.savefig(p3); plt.close(fig)
     log(f"[fig] {p3}")
 
     # ---- persist ----------------------------------------------------------------------
-    npz_path = out_dir / "carriage_pairs.npz"
+    npz_path = out_dir / f"{data_prefix}carriage_pairs.npz"
     np.savez_compressed(
         npz_path,
         graph_id=gid, carrier_i=results["carrier_i"], source_j=results["source_j"],
@@ -227,7 +233,7 @@ def make_figures_and_save(results: dict, out_dir: str, n_boot: int = 2000,
         },
         "figures": [str(p1), str(p2), str(p3)],
     }
-    json_path = out_dir / "carriage_summary.json"
+    json_path = out_dir / f"{data_prefix}carriage_summary.json"
     json_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
     log(f"[data] {json_path}")
 
