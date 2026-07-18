@@ -63,6 +63,7 @@ def run(
     eval_metric: bool = True,
     allow_param_count_drift: bool = False,
     tol: float = 1e-4,
+    float_noise_tol: float = 5e-3,
     max_replicas: int = 4096,
     max_pair_edges: int = 12_000_000,
     n_boot: int = 2000,
@@ -125,7 +126,7 @@ def run(
         eval_split=eval_split, donor_split=donor_split, num_graphs=num_graphs,
         donors=donors, graph_select=graph_select, analysis_seed=analysis_seed,
         verify=verify, verify_graphs=verify_graphs, eval_metric=eval_metric,
-        allow_param_count_drift=allow_param_count_drift, tol=tol,
+        allow_param_count_drift=allow_param_count_drift, tol=tol, float_noise_tol=float_noise_tol,
         max_replicas=max_replicas, max_pair_edges=max_pair_edges,
     )
     results = run_grit_carriage(spec, cc)

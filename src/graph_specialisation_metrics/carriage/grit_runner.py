@@ -45,6 +45,10 @@ class CarriageConfig:
     eval_metric: bool = True
     allow_param_count_drift: bool = False
     tol: float = 1e-4
+    # Looser ceiling for the float32-noise checks (no-op / batch-invariance). Real wiring
+    # bugs (wrong row, no eval()) give O(1) dh, far above this; large full-attention graphs
+    # can push GPU non-determinism to ~1e-3. Kept well below any real-bug scale.
+    float_noise_tol: float = 5e-3
     max_replicas: int = 4096
     max_pair_edges: int = 12_000_000
 
@@ -67,17 +71,19 @@ def _spd(data, n: int) -> np.ndarray:
     return shortest_path(A, method="D", unweighted=True, directed=False)
 
 
-def _verify_structure(base, b, m: int, n: int, rows, adapter) -> None:
+def _verify_structure(base, b, reps: int, n: int, rows, adapter) -> None:
     """Only node content changed; edge_index/edge_attr/rrwp* are bit-identical.
 
     Runs on the collated batch BEFORE the forward pass mutates it (GRIT's encoders rebind
     batch.x/edge_index/edge_attr in place). Content-agnostic: it checks the structural
-    tensors and that x differs only at the intended source rows.
+    tensors are the per-graph values replicated ``reps`` times, and that x differs only at
+    the intended source rows (``rows`` are the flat global row indices that were written;
+    with a within-batch clean baseline, replica 0 is unswapped and contributes no changes).
     """
     import torch
 
     def _rep(t, inc=0):
-        parts = [t + (r * n if inc else 0) for r in range(m)]
+        parts = [t + (r * n if inc else 0) for r in range(reps)]
         return torch.cat(parts, dim=(-1 if inc else 0))
 
     assert torch.equal(b.edge_index, _rep(base.edge_index.to(b.edge_index.device), inc=1)), \
@@ -94,7 +100,7 @@ def _verify_structure(base, b, m: int, n: int, rows, adapter) -> None:
 
     x_ref = _rep(base.x.to(b.x.device))
     diff = (b.x != x_ref).any(dim=1)
-    assert int(diff.sum().item()) <= m, "more than one node per replica was modified"
+    assert int(diff.sum().item()) <= len(rows), "more nodes changed than donors were written"
     changed = set(diff.nonzero().view(-1).tolist())
     assert changed.issubset(set(rows.tolist())), \
         "a node other than the intended source j was modified"
@@ -381,7 +387,12 @@ def run_grit_carriage(task, cc: CarriageConfig) -> dict:
         rows_local = np.repeat(np.arange(S), K)
         flat_donor = donor_content.reshape(R, F_feat)                  # [R, F]
 
-        h_swap = torch.empty((R, n, dim_h), device=device, dtype=h_clean.dtype)
+        # Transport delta dh_i(j,k) = h^L_i(clean) - h^L_i(swap), computed with a WITHIN-BATCH
+        # clean baseline: replica 0 of every chunk is the un-swapped graph, so delta is a
+        # same-forward difference. This cancels the batch-context float32 offset that a
+        # batch-of-1 clean would carry (~1e-4 in h) -- which on large peptides graphs is
+        # comparable to the long-range carriage signal -- and makes no-op donors give ~0.
+        delta = torch.empty((R, n, dim_h), device=device, dtype=h_clean.dtype)
         pred_swap = torch.empty((R, T), device=device, dtype=torch.float32)
 
         chunk = _plan_chunk(n, cc)
@@ -391,18 +402,21 @@ def run_grit_carriage(task, cc: CarriageConfig) -> dict:
             while True:
                 try:
                     with torch.no_grad():
-                        b = Batch.from_data_list([base] * m).to(device)
-                        rows = (torch.arange(m, device=device) * n
+                        # replica 0 = clean baseline; replicas 1..m = the m swaps.
+                        b = Batch.from_data_list([base] * (m + 1)).to(device)
+                        rows = (torch.arange(1, m + 1, device=device) * n
                                 + torch.as_tensor(rows_local[r0:r0 + m], device=device))
                         adapter.write_donors(b.x, rows, flat_donor[r0:r0 + m])
                         if cc.verify and struct_checked < cc.verify_graphs and r0 == 0:
-                            _verify_structure(base, b, m, n, rows, adapter)
+                            _verify_structure(base, b, m + 1, n, rows, adapter)
                             struct_checked += 1
                         pred_s, _ = model(b)
                         hs = store["h"]
-                        assert hs.shape == (m * n, dim_h)
-                        h_swap[r0:r0 + m] = hs.view(m, n, dim_h)
-                        pred_swap[r0:r0 + m] = pred_s.view(m, -1).float()
+                        assert hs.shape == ((m + 1) * n, dim_h)
+                        hs = hs.view(m + 1, n, dim_h)
+                        clean_chunk = hs[0]                            # [n, dim] clean, same forward
+                        delta[r0:r0 + m] = clean_chunk.unsqueeze(0) - hs[1:]
+                        pred_swap[r0:r0 + m] = pred_s.view(m + 1, -1)[1:].float()
                     break
                 except RuntimeError as exc:
                     if "out of memory" not in str(exc).lower():
@@ -419,6 +433,9 @@ def run_grit_carriage(task, cc: CarriageConfig) -> dict:
         if device.type == "cuda":
             peak_mem = max(peak_mem, torch.cuda.max_memory_allocated())
 
+        # batch invariance: clean-alone (grad forward, batch-1) vs clean inside a big batch.
+        # This is now only a model-sanity probe (eval mode); the carriage no longer depends
+        # on it since delta uses a within-batch clean baseline.
         if cc.verify and gi_pos < cc.verify_graphs:
             with torch.no_grad():
                 mm = min(_plan_chunk(n, cc), 64)
@@ -427,9 +444,11 @@ def run_grit_carriage(task, cc: CarriageConfig) -> dict:
                 hb = store["h"].view(mm, n, dim_h)
                 batchinv_max = max(batchinv_max, float((hb - h_clean.unsqueeze(0)).abs().max().item()))
 
+        # no-op donors: same content as the source => transport must be ~0. With the
+        # within-batch baseline this is now just residual GPU non-determinism (tiny).
         if noop_mask.any():
             nm = torch.as_tensor(noop_mask.reshape(-1), device=device)
-            noop_max_dh = max(noop_max_dh, float((h_swap[nm] - h_clean.unsqueeze(0)).abs().max().item()))
+            noop_max_dh = max(noop_max_dh, float(delta[nm].abs().max().item()))
 
         # per-replica swap loss (donor-average the LOSS, not the prediction -- Jensen at the kink).
         L_swap = metrics.per_graph_loss(pred_swap, true_vec.expand(R, -1), loss_fun).cpu().numpy()  # [R]
@@ -437,8 +456,8 @@ def run_grit_carriage(task, cc: CarriageConfig) -> dict:
 
         # functional carriage F[i,j] = ||dŷ from i|| over T outputs (label-free);
         # loss carriage C_loss[i,j] = g_loss_i . dh_i(j) (beneficial-carriage basis).
-        F_ij = core.functional_magnitude(h_clean, h_swap, g_out, S, K)          # [n, n], >=0
-        C_loss = core.carriage_from_states(h_clean, h_swap, g_loss, S, K).cpu().numpy()  # [n, n]
+        F_ij = core.functional_magnitude_from_delta(delta, g_out, S, K)          # [n, n], >=0
+        C_loss = core.carriage_from_delta(delta, g_loss, S, K).cpu().numpy()      # [n, n]
         B, sumC_j = core.beneficial_attribute(C_loss, dL_j)
 
         add_sumC.append(sumC_j)
@@ -457,7 +476,7 @@ def run_grit_carriage(task, cc: CarriageConfig) -> dict:
         all_B.append(B[finite].astype(np.float64))
         all_F.append(F_ij[finite].astype(np.float64))
 
-        del h_swap, pred_swap
+        del delta, pred_swap
         if device.type == "cuda":
             torch.cuda.empty_cache()
         if (gi_pos + 1) % max(1, n_graphs // 10) == 0 or gi_pos == 0:
@@ -507,7 +526,8 @@ def run_grit_carriage(task, cc: CarriageConfig) -> dict:
         log(f"  [6]  batch-invariance max|dh|    : {batchinv_max:.3e}")
         log(f"  [8]  structure invariance        : verified on {struct_checked} graph(s)")
     log(f"  [7]  no-op donors                : {noop_total}/{donor_draws} "
-        f"({100*noop_frac:.1f}%) max|dh|={noop_max_dh:.3e} (must be 0)")
+        f"({100*noop_frac:.1f}%) max|dh|={noop_max_dh:.3e} (within-batch => ~0; "
+        f"float32 floor < {cc.float_noise_tol:.0e})")
     log(f"  [9]  loss additivity r/slope     : r={r:.4f}, slope={slope:.4f}  "
         f"(sum_i C_loss vs dL_j)")
     log(f"  [10] unreachable pairs (excluded): {unreachable_total}")
@@ -515,13 +535,19 @@ def run_grit_carriage(task, cc: CarriageConfig) -> dict:
     if device.type == "cuda":
         log(f"  [mem] peak CUDA allocated        : {checks['peak_cuda_gib']:.2f} GiB")
 
+    # g_spread and beneficial exactness are true-zero quantities -> strict tol. no-op and
+    # batch-invariance are float32 GPU-noise probes -> looser float_noise_tol (a real bug
+    # gives O(1), far above it).
+    noise_tol = max(tol, cc.float_noise_tol)
     if g_spread_max > tol:
         log(f"  [!] g_i varies by {g_spread_max:.3e} > tol; readout not pooling->MLP as assumed.")
-    if noop_max_dh > tol:
-        raise RuntimeError(f"No-op donors gave |dh|={noop_max_dh:.3e} > tol {tol:.1e}: a same-symbol "
-                           f"swap must be a bit-exact identity (wrong row, or model not in eval()).")
-    if cc.verify and batchinv_max > tol:
-        raise RuntimeError(f"Batch invariance violated: max|dh|={batchinv_max:.3e} > tol {tol:.1e}.")
+    if noop_max_dh > noise_tol:
+        raise RuntimeError(f"No-op donors gave |dh|={noop_max_dh:.3e} > {noise_tol:.1e}: a same-content "
+                           f"swap shares the within-batch clean baseline, so this must be ~0. A value "
+                           f"this large means the wrong row is written or the model is not in eval().")
+    if cc.verify and batchinv_max > noise_tol:
+        raise RuntimeError(f"Batch invariance violated: max|dh|={batchinv_max:.3e} > {noise_tol:.1e} "
+                           f"(model likely not in eval(): BatchNorm using batch stats).")
     if bexact_max > tol:
         raise RuntimeError(f"Beneficial exactness violated: max_j|sum_i B - dL_j|={bexact_max:.3e} "
                            f"> tol {tol:.1e}; share attribution or loss donor-average miswired.")

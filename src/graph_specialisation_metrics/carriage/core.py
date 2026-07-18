@@ -39,8 +39,6 @@ def carriage_from_states(h_clean, h_swap, g, num_sources: int, num_donors: int):
     donor average is taken BEFORE any abs() (Eq. 3.6) or sign(), because both are
     defined as functions of the estimator C, not of the per-donor terms.
     """
-    import torch
-
     S, K = int(num_sources), int(num_donors)
     n, m = h_clean.shape
     if h_swap.shape != (S * K, n, m):
@@ -49,9 +47,28 @@ def carriage_from_states(h_clean, h_swap, g, num_sources: int, num_donors: int):
         raise ValueError(f"g {tuple(g.shape)} != {(n, m)}")
 
     delta = h_clean.unsqueeze(0) - h_swap        # [R, n, m]  dh_i(j,k), Eq. 3.4
-    c = torch.einsum("rnm,nm->rn", delta, g)     # [R, n]     g_i . dh_i(j,k)
-    c = c.view(S, K, n)                          # [source j, donor k, carrier i]
-    C_js = c.mean(dim=1)                         # [j, i]     Eq. 3.5: average over donors
+    return carriage_from_delta(delta, g, S, K)
+
+
+def carriage_from_delta(delta, g, num_sources: int, num_donors: int):
+    """Carriage from a precomputed transport delta dh_i(j,k) = h^L_i(clean) - h^L_i(swap).
+
+    Same as carriage_from_states but takes the delta directly, so the caller can compute it
+    with a WITHIN-BATCH clean baseline (clean and swap in the same forward pass), which
+    cancels the batch-context float32 offset that a separate batch-of-1 clean would carry.
+
+    Args:
+        delta: [S*K, n, m] transport delta, replica r = j*K + k.
+        g:     [n, m] readout gradient at the clean input.
+    Returns:
+        [n, n] tensor C[i, j] (carrier i x source j), donor-averaged (Eq. 3.5).
+    """
+    import torch
+
+    S, K = int(num_sources), int(num_donors)
+    c = torch.einsum("rnm,nm->rn", delta, g)     # [R, n]  g_i . dh_i(j,k)
+    c = c.view(S, K, delta.shape[1])             # [source j, donor k, carrier i]
+    C_js = c.mean(dim=1)                         # [j, i]  average over donors
     return C_js.t().contiguous()                 # [i, j]
 
 
@@ -69,10 +86,16 @@ def functional_magnitude(h_clean, h_swap, g_out, num_sources, num_donors):
     Returns:
         [n, n] numpy: F[i, j] (carrier x source), non-negative.
     """
+    delta = h_clean.unsqueeze(0) - h_swap
+    return functional_magnitude_from_delta(delta, g_out, num_sources, num_donors)
+
+
+def functional_magnitude_from_delta(delta, g_out, num_sources, num_donors):
+    """Functional carriage magnitude from a precomputed transport delta (see above)."""
     T = int(g_out.shape[0])
     acc = None
     for t in range(T):
-        Ct = carriage_from_states(h_clean, h_swap, g_out[t], num_sources, num_donors)  # [i,j]
+        Ct = carriage_from_delta(delta, g_out[t], num_sources, num_donors)  # [i,j]
         acc = Ct.pow(2) if acc is None else acc + Ct.pow(2)
     return acc.sqrt().cpu().numpy()  # [i, j], carrier x source
 
