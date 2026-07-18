@@ -63,14 +63,15 @@ Let `C_loss[i,j] = C^{g_loss}[i,j]` (signed loss-carriage). The **exact** per-so
 
     dL_j = ℓ(clean) − (1/K) Σ_k ℓ(swap_{j,k})
 
-attributed to carriers by their carriage share:
+mapped to carriers, keeping the per-carrier sign and bounding the magnitude:
 
-    B[i,j] = dL_j · w[i,j]            # DEFAULT (magnitude):  w[i,j] = |C_loss[i,j]| / Σ_{i'} |C_loss[i',j]|
-                                      # legacy   (signed):    w[i,j] =  C_loss[i,j]  / Σ_{i'}  C_loss[i',j]
+    B[i,j] = clip(dL_j / Σ_{i'} C_loss[i',j], −1, +1) · C_loss[i,j]   # DEFAULT (slope)
+             dL_j · |C_loss[i,j]| / Σ_{i'} |C_loss[i',j]|             # magnitude (collapses sign)
+             dL_j ·  C_loss[i,j]  / Σ_{i'}  C_loss[i',j]              # signed (legacy, blows up)
 
-If `Σ_{i'}|C_loss[i',j]| < 1e-8` the column is set to `0`. Both share definitions sum to 1 over
-`i`, so **`Σ_i B[i,j] = dL_j` exactly** (checked: `[11]`). The magnitude weights are convex, so
-`|B[i,j]| ≤ |dL_j|` (no blow-up) and `B = 0` wherever `F = 0`.
+`slope` keeps `C_loss`'s sign (adverse stays measurable) and is bounded — for a 1-Lipschitz loss
+(L1/BCE) `|B[i,j]| ≤ |C_loss[i,j]|`, so `B = 0` wherever `F = 0` (no delta ⇒ no carriage) and the
+far-tail blow-up is impossible; the clip only fires on estimation noise (`Σ C_loss ≈ 0`).
 
     B < 0  beneficial   (content reduced the error)
     B > 0  adverse      (content increased the error)
@@ -92,9 +93,10 @@ saved to `carriage_pairs.npz`, so any binning/estimator can be reproduced in ret
 
 ## Key decisions (why)
 
-- **Magnitude denominator (default).** The signed sum cancels on a balanced source, exploding the
-  share and fabricating `|B| ≫ |C|` spikes at far distances; magnitude shares are convex, bounded,
-  and vanish with `F`. `signed` reproduces the earlier scalar attribution and is kept for comparison.
+- **Slope attribution (default).** Keeps the per-carrier sign so adverse (`B>0`) is measurable, and
+  clips the per-source loss slope `dL_j / Σ C_loss` to `[−1,1]` so `|B| ≤ |C_loss|` — no far-tail
+  blow-up. `magnitude` (convex `|C|` shares, but collapses the sign) and `signed` (legacy, spikes)
+  are kept for comparison.
 - **Loss-gradient beneficial basis.** For `T = 1` regression `g^loss = sign(ŷ−y)·g^out`, so
   `C_loss = sign(ŷ−y)·C^out` recovers the dissertation's error-direction projection (Eq. 3.8) and
   `B` is its exact `dL_j`-attribution; for `T > 1` (multi-target regression, multilabel) it is the
@@ -118,7 +120,7 @@ saved to `carriage_pairs.npz`, so any binning/estimator can be reproduced in ret
   `tasks.py` (`zinc`, `zinc_1hop`, `peptides_func`, `peptides_struct`).
 - Entry point `carriage.colab.run(task=..., …)`; the notebook cells in `experiments/carriage/`
   clone this repo (via `dissertation_key`) and call it. Key args: `beneficial_denom`
-  (`magnitude`|`signed`), `bin_strategy` (`log`|`hop`|`equal_count`), `central`
+  (`slope`|`magnitude`|`signed`), `bin_strategy` (`log`|`hop`|`equal_count`), `central`
   (`trimmed`|`median`|`mean`), `num_graphs`, `donors` (K).
 - Outputs per task under `…/carriage_figures/<task>/`: three figures, `carriage_pairs.npz`
   (raw pairs + curves), `carriage_summary.json` (curves + settings + checks).

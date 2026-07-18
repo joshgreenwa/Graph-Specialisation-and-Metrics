@@ -58,7 +58,7 @@ run(
     donors=128,             # K>=128 donor swaps/source (32 is under-powered)
     max_pair_edges=4_000_000,   # smaller per-forward budget for large full-attention graphs
     verify_graphs=2,
-    # defaults already applied: beneficial_denom="magnitude", bin_strategy="log", central="trimmed"
+    # defaults already applied: beneficial_denom="slope", bin_strategy="log", central="trimmed"
     # to compare the legacy attribution: beneficial_denom="signed"
 )
 # ============================ paste to here ============================

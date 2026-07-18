@@ -14,9 +14,9 @@ multi-hour run on the A100 -- start smaller (num_graphs=16) to sanity-check the 
 then scale up. Watch the [mem] line; the OOM backoff shrinks chunks automatically.
 
 Two aggregation choices (both default to the improved behaviour; documented on run()):
-  * beneficial_denom="magnitude" (default) -- convex |C| shares, so |B| <= |dL_j| (no
-    blow-up) and B vanishes where functional carriage vanishes. Pass "signed" for the
-    legacy signed-sum share (can spike at far distances) only if you want to compare.
+  * beneficial_denom="slope" (default) -- clip(dL_j / sum_i C_loss, -1, 1) * C_loss[i,j]:
+    signed (adverse measurable) and bounded (|B| <= |C|, no blow-up), B=0 where functional
+    carriage vanishes. Pass "magnitude" (sign-collapsing) or "signed" (legacy, spikes) to compare.
   * bin_strategy="log" (default) + central="trimmed" -- F/B pooled into adaptive SPD bins
     with a robust central tendency + graph-clustered bootstrap CI, which is what makes the
     large-diameter x-axis legible. Pass bin_strategy="hop" for per-hop.
@@ -71,7 +71,7 @@ run(
     donors=128,             # K>=128 donor swaps/source (32 is under-powered)
     max_pair_edges=4_000_000,   # smaller per-forward budget for large full-attention graphs
     verify_graphs=2,
-    # defaults already applied: beneficial_denom="magnitude", bin_strategy="log", central="trimmed"
+    # defaults already applied: beneficial_denom="slope", bin_strategy="log", central="trimmed"
     # to compare the legacy attribution: beneficial_denom="signed"
 )
 # ============================ paste to here ============================

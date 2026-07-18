@@ -79,7 +79,7 @@ def run(
     #   "signed" (LEGACY):     B[i,j] = dL_j * C[i,j] / sum_i C[i,j]. Keeps the per-carrier
     #       sign but the signed sum can cancel to ~0 and make |B| >> |C| spikes at far
     #       distances. Kept only for comparison; prefer "magnitude".
-    beneficial_denom: str = "magnitude",
+    beneficial_denom: str = "slope",
     tol: float = 1e-4,
     float_noise_tol: float = 5e-3,
     max_replicas: int = 4096,
@@ -105,9 +105,12 @@ def run(
 
     Two aggregation choices worth knowing (both default to the improved behaviour):
 
-    * ``beneficial_denom`` -- how each source's exact loss change dL_j is split across its
-      carriers. "magnitude" (default) uses |C| shares: bounded, no blow-up, B=0 where
-      F=0. "signed" is the legacy signed-sum share, kept only for comparison.
+    * ``beneficial_denom`` -- how each source's exact loss change dL_j is mapped to its
+      carriers. "slope" (default) = clip(dL_j / sum_i C_loss, -1, 1) * C_loss[i,j]: keeps the
+      per-carrier sign so adverse (B>0) stays measurable, and is bounded (|B| <= |C|, no
+      blow-up) with B=0 where F=0 (no delta => no carriage). "magnitude" uses |C| shares
+      (bounded but collapses per-carrier sign); "signed" is the legacy signed share (blows up),
+      both kept only for comparison.
     * ``bin_strategy`` / ``central`` -- F and B are pooled into adaptive shortest-path
       bins and reported with a robust central tendency + graph-clustered bootstrap CI,
       which is what makes the large-graph (peptides) x-axis legible and the CIs tight.

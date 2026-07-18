@@ -198,6 +198,7 @@ def run_grit_structural_carriage(task, cc: CarriageConfig) -> dict:
     all_gid, all_i, all_j, all_d, all_C, all_B, all_F = [], [], [], [], [], [], []
     add_sumC, add_dyhat = [], []
     g_spread_max = noop_max_dh = bexact_max = relabel_inv_max = 0.0
+    clamp_moved = clamp_hit = 0            # slope-clip activation rate over moved sources
     noop_total = partner_draws = unreachable_total = struct_checked = peak_mem = 0
 
     if device.type == "cuda":
@@ -308,13 +309,16 @@ def run_grit_structural_carriage(task, cc: CarriageConfig) -> dict:
 
         F_ij = core.functional_magnitude_from_delta(delta, g_out, S, K)       # [n, n], >=0
         C_loss = core.carriage_from_delta(delta, g_loss, S, K).cpu().numpy()  # [n, n]
-        B, denom_used = core.beneficial_attribute(C_loss, dL_j, denom=cc.beneficial_denom)
+        B, denom_used, clamped = core.beneficial_attribute(C_loss, dL_j, denom=cc.beneficial_denom)
 
         add_sumC.append(C_loss.sum(axis=0))
         add_dyhat.append(dL_j)
         moved = np.abs(denom_used) > 1e-8
-        if moved.any():
-            bexact_max = max(bexact_max, float(np.abs(B.sum(axis=0)[moved] - dL_j[moved]).max()))
+        clamp_moved += int(moved.sum())
+        clamp_hit += int((moved & clamped).sum())
+        ok = moved & ~clamped                       # clamped sources break sum_i B==dL_j by construction
+        if ok.any():
+            bexact_max = max(bexact_max, float(np.abs(B.sum(axis=0)[ok] - dL_j[ok]).max()))
 
         # accumulate finite pairs: source j == anchor u, distance d(i, u) from the pristine SPD.
         ii, jj = np.meshgrid(np.arange(n), np.arange(n), indexing="ij")
@@ -384,7 +388,11 @@ def run_grit_structural_carriage(task, cc: CarriageConfig) -> dict:
         f"({100*noop_frac:.1f}%) max|dh|={noop_max_dh:.3e} (within-batch => ~0)")
     log(f"  [9]  loss additivity r/slope     : r={r:.4f}, slope={slope:.4f}  (sum_i C_loss vs dL_j)")
     log(f"  [10] unreachable pairs (excluded): {unreachable_total}")
-    log(f"  [11] beneficial exactness        : max_j|sum_i B - dL_j| = {bexact_max:.3e} (must be ~0)")
+    log(f"  [11] beneficial exactness        : max_j|sum_i B - dL_j| = {bexact_max:.3e} (must be ~0, "
+        f"unclamped sources)")
+    if cc.beneficial_denom == "slope":
+        log(f"  [11b] slope-clip activation      : {clamp_hit}/{clamp_moved} moved sources "
+            f"({(100.0*clamp_hit/max(1,clamp_moved)):.1f}%) hit |s_j|>1 (estimation noise near first-order~0)")
     if device.type == "cuda":
         log(f"  [mem] peak CUDA allocated        : {checks['peak_cuda_gib']:.2f} GiB")
 

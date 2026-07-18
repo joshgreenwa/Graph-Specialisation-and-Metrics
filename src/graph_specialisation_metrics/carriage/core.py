@@ -100,53 +100,67 @@ def functional_magnitude_from_delta(delta, g_out, num_sources, num_donors):
     return acc.sqrt().cpu().numpy()  # [i, j], carrier x source
 
 
-def beneficial_attribute(C_basis, dL_j, eps=1e-8, denom="magnitude"):
-    """Attribute the exact per-source loss change dL_j to carriers by their carriage share.
+def beneficial_attribute(C_basis, dL_j, eps=1e-8, denom="slope", slope_clip=1.0):
+    """Turn the signed loss-carriage into per-pair beneficial carriage B[i,j].
 
-    Two share definitions, both of which sum to 1 over carriers i (so sum_i B[i,j] = dL_j
-    EXACTLY in either case):
+    ``C_basis`` is the signed first-order loss-carriage C_loss[i,j] = (dL/dh_i).dh_i(j); summed
+    over carriers it is the FIRST-ORDER loss change  sum_i C_loss[i,j] = (dL/dyhat)|_clean . dyhat_j.
+    ``dL_j`` is the EXACT per-source loss change  L_clean - mean_k L_swap(j,k)  (<0 = beneficial).
 
-      denom="magnitude" (DEFAULT, recommended):
-          B[i,j] = dL_j * |C_basis[i,j]| / sum_i |C_basis[i,j]|
-        Convex weights in [0,1], so |B[i,j]| <= |dL_j| -- no blow-up -- and B vanishes
-        wherever functional carriage vanishes. The signed sum below can cancel to ~0 when a
-        source's carriage is balanced across carriers, making the signed share explode and
-        fabricating |B| >> |C| spikes (worst at far distances where carriage is tiny); the
-        magnitude denominator removes exactly that artifact.
+    Modes (default "slope"):
 
-      denom="signed" (legacy, kept for comparison):
-          B[i,j] = dL_j * C_basis[i,j] / sum_i C_basis[i,j]
-        Preserves the per-carrier SIGN of C, but the shares are not convex and can blow up.
+      denom="slope" (DEFAULT -- signed AND stable):
+          s_j    = dL_j / sum_i C_loss[i,j]                          exact / first-order loss change
+          B[i,j] = clip(s_j, -slope_clip, +slope_clip) . C_loss[i,j]
+        Keeps the per-carrier SIGN of C_loss, so adverse (B>0) stays measurable; and is bounded
+        -- for a 1-Lipschitz loss (L1/BCE) |s_j| <= 1 by the reverse triangle inequality, so
+        |B[i,j]| <= |C_loss[i,j]|: beneficial can never exceed functional and the signed-share
+        far-tail blow-up is impossible. The clip only activates on estimation noise (first-order
+        change ~ 0). "No delta => no carriage": C_loss[i,j]=0 -> B=0, and a source that moves
+        nothing (sum_i C_loss ~ 0, hence dL_j ~ 0) gets s_j=0 -> a zeroed column. slope_clip is
+        the loss's max |dL/dyhat| (1 for L1/BCE); it is NOT valid for MSE (unbounded slope).
 
-    ``C_basis`` is the signed loss-carriage C_loss[i,j] = (dL/dh_i).dh_i(j). A source that
-    moves nothing (denominator ~ 0, hence dL_j ~ 0 too) gets a zeroed column via the eps
-    guard.
+      denom="magnitude" (bounded but sign-collapsing):
+          B[i,j] = dL_j * |C_loss[i,j]| / sum_i |C_loss[i,j]|
+        Convex weights, |B| <= |dL_j|, sum_i B = dL_j exactly -- but every carrier inherits
+        sign(dL_j), so per-carrier adverse structure is erased.
 
-    Args:
-        C_basis: [n, n] numpy, the signed loss-carriage (carrier x source).
-        dL_j:    [n] numpy, exact per-source loss change L_clean - mean_k L_swap(j,k).
-        denom:   "magnitude" | "signed".
+      denom="signed" (legacy, unstable):
+          B[i,j] = dL_j * C_loss[i,j] / sum_i C_loss[i,j]
+        Signed and sums to dL_j, but the shares are not convex and blow up when the signed
+        denominator cancels to ~0 (the |B| >> |C| far-tail spikes).
 
     Returns:
-        (B, denom_used): denom_used is the [n] per-source denominator actually applied
-        (sum_i |C| for magnitude, sum_i C for signed); a source counts as "moved" when
-        |denom_used| > eps.
+        (B, denom_used, clamped): denom_used is the [n] per-source denominator (sum_i C_loss for
+        slope/signed, sum_i |C_loss| for magnitude); a source "moved" when |denom_used| > eps.
+        clamped is a [n] bool, True where the slope clip was active (slope mode only) -- for those
+        sources sum_i B != dL_j by construction (they are exactly the estimation-noise sources, so
+        exclude them from the sum_i B == dL_j exactness check).
     """
-    C_basis = np.asarray(C_basis)
-    if denom == "magnitude":
-        Z = np.abs(C_basis).sum(axis=0)                               # [n]  sum_i |C[i,j]|
+    C_basis = np.asarray(C_basis, dtype=np.float64)
+    dL_j = np.asarray(dL_j, dtype=np.float64)
+    clamped = np.zeros(C_basis.shape[1], dtype=bool)
+    if denom == "slope":
+        s = C_basis.sum(axis=0)                                       # [n] first-order loss change
         with np.errstate(divide="ignore", invalid="ignore"):
-            share = np.where(Z > eps, np.abs(C_basis) / Z, 0.0)       # convex, in [0,1]
-        denom_used = Z
-    elif denom == "signed":
-        s = C_basis.sum(axis=0)                                       # [n]  sum_i C[i,j]
+            slope = np.where(np.abs(s) > eps, dL_j / s, 0.0)          # exact/first-order, |.|<=1 (1-Lipschitz)
+        clamped = np.abs(slope) > slope_clip
+        slope = np.clip(slope, -slope_clip, slope_clip)              # guard estimation noise near s~0
+        B = slope[None, :] * C_basis                                 # B[i,j] = slope_j . C_loss[i,j]
+        return B, s, clamped
+    if denom == "magnitude":
+        Z = np.abs(C_basis).sum(axis=0)                              # [n] sum_i |C[i,j]|
+        with np.errstate(divide="ignore", invalid="ignore"):
+            share = np.where(Z > eps, np.abs(C_basis) / Z, 0.0)      # convex, in [0,1]
+        B = dL_j[None, :] * share                                    # sum_i B[i,j] = dL_j
+        return B, Z, clamped
+    if denom == "signed":
+        s = C_basis.sum(axis=0)                                      # [n] sum_i C[i,j]
         with np.errstate(divide="ignore", invalid="ignore"):
             share = np.where(np.abs(s) > eps, C_basis / s, 0.0)
-        denom_used = s
-    else:
-        raise ValueError(f"denom must be 'magnitude' or 'signed', got {denom!r}")
-    B = np.asarray(dL_j)[None, :] * share                            # sum_i B[i,j] = dL_j
-    return B, denom_used
+        B = dL_j[None, :] * share                                    # sum_i B[i,j] = dL_j
+        return B, s, clamped
+    raise ValueError(f"denom must be 'slope', 'magnitude' or 'signed', got {denom!r}")
 
 
 def beneficial_from_carriage(C, yhat_clean, yhat_swap, y, num_sources, num_donors, eps=1e-9):
