@@ -44,6 +44,7 @@ class CarriageConfig:
     verify_graphs: int = 2
     eval_metric: bool = True
     allow_param_count_drift: bool = False
+    beneficial_denom: str = "magnitude"   # "magnitude" (default) | "signed" (legacy)
     tol: float = 1e-4
     # Looser ceiling for the float32-noise checks (no-op / batch-invariance). Real wiring
     # bugs (wrong row, no eval()) give O(1) dh, far above this; large full-attention graphs
@@ -458,11 +459,13 @@ def run_grit_carriage(task, cc: CarriageConfig) -> dict:
         # loss carriage C_loss[i,j] = g_loss_i . dh_i(j) (beneficial-carriage basis).
         F_ij = core.functional_magnitude_from_delta(delta, g_out, S, K)          # [n, n], >=0
         C_loss = core.carriage_from_delta(delta, g_loss, S, K).cpu().numpy()      # [n, n]
-        B, sumC_j = core.beneficial_attribute(C_loss, dL_j)
+        B, denom_used = core.beneficial_attribute(C_loss, dL_j, denom=cc.beneficial_denom)
 
-        add_sumC.append(sumC_j)
+        # additivity diagnostic uses the SIGNED sum (first-order dL), independent of the
+        # denominator choice; exactness/"moved" use the denominator actually applied.
+        add_sumC.append(C_loss.sum(axis=0))
         add_dyhat.append(dL_j)
-        moved = np.abs(sumC_j) > 1e-9
+        moved = np.abs(denom_used) > 1e-8
         if moved.any():
             bexact_max = max(bexact_max, float(np.abs(B.sum(axis=0)[moved] - dL_j[moved]).max()))
 
@@ -561,6 +564,7 @@ def run_grit_carriage(task, cc: CarriageConfig) -> dict:
         "graph_select": cc.graph_select, "analysis_seed": cc.analysis_seed,
         "test_metric": checks["test_metric"], "test_metric_name": checks["test_metric_name"],
         "paper_metric": task.paper_metric, "loss_units": metrics.loss_units(loss_fun),
+        "beneficial_denom": cc.beneficial_denom,
     }
     return {
         "graph_id": gid,

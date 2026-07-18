@@ -100,26 +100,53 @@ def functional_magnitude_from_delta(delta, g_out, num_sources, num_donors):
     return acc.sqrt().cpu().numpy()  # [i, j], carrier x source
 
 
-def beneficial_attribute(C_basis, dL_j, eps=1e-9):
+def beneficial_attribute(C_basis, dL_j, eps=1e-8, denom="magnitude"):
     """Attribute the exact per-source loss change dL_j to carriers by their carriage share.
 
-        B[i,j] = dL_j . ( C_basis[i,j] / sum_i C_basis[i,j] )   =>  sum_i B[i,j] = dL_j exactly.
+    Two share definitions, both of which sum to 1 over carriers i (so sum_i B[i,j] = dL_j
+    EXACTLY in either case):
 
-    ``C_basis`` is the signed loss-carriage C_loss[i,j] = (dL/dh_i).dh_i(j): its column sum
-    is the first-order loss change from source j, so it is the natural basis for splitting
-    the (exact) dL_j across carriers. Sources that move nothing (sum_i C_basis ~ 0, hence
-    dL_j ~ 0) get a zeroed column via the eps guard.
+      denom="magnitude" (DEFAULT, recommended):
+          B[i,j] = dL_j * |C_basis[i,j]| / sum_i |C_basis[i,j]|
+        Convex weights in [0,1], so |B[i,j]| <= |dL_j| -- no blow-up -- and B vanishes
+        wherever functional carriage vanishes. The signed sum below can cancel to ~0 when a
+        source's carriage is balanced across carriers, making the signed share explode and
+        fabricating |B| >> |C| spikes (worst at far distances where carriage is tiny); the
+        magnitude denominator removes exactly that artifact.
+
+      denom="signed" (legacy, kept for comparison):
+          B[i,j] = dL_j * C_basis[i,j] / sum_i C_basis[i,j]
+        Preserves the per-carrier SIGN of C, but the shares are not convex and can blow up.
+
+    ``C_basis`` is the signed loss-carriage C_loss[i,j] = (dL/dh_i).dh_i(j). A source that
+    moves nothing (denominator ~ 0, hence dL_j ~ 0 too) gets a zeroed column via the eps
+    guard.
 
     Args:
         C_basis: [n, n] numpy, the signed loss-carriage (carrier x source).
         dL_j:    [n] numpy, exact per-source loss change L_clean - mean_k L_swap(j,k).
+        denom:   "magnitude" | "signed".
+
+    Returns:
+        (B, denom_used): denom_used is the [n] per-source denominator actually applied
+        (sum_i |C| for magnitude, sum_i C for signed); a source counts as "moved" when
+        |denom_used| > eps.
     """
     C_basis = np.asarray(C_basis)
-    sumC_j = C_basis.sum(axis=0)                                       # [n]
-    with np.errstate(divide="ignore", invalid="ignore"):
-        share = np.where(np.abs(sumC_j) > eps, C_basis / sumC_j, 0.0)
-    B = np.asarray(dL_j)[None, :] * share                             # sum_i B[i,j] = dL_j
-    return B, sumC_j
+    if denom == "magnitude":
+        Z = np.abs(C_basis).sum(axis=0)                               # [n]  sum_i |C[i,j]|
+        with np.errstate(divide="ignore", invalid="ignore"):
+            share = np.where(Z > eps, np.abs(C_basis) / Z, 0.0)       # convex, in [0,1]
+        denom_used = Z
+    elif denom == "signed":
+        s = C_basis.sum(axis=0)                                       # [n]  sum_i C[i,j]
+        with np.errstate(divide="ignore", invalid="ignore"):
+            share = np.where(np.abs(s) > eps, C_basis / s, 0.0)
+        denom_used = s
+    else:
+        raise ValueError(f"denom must be 'magnitude' or 'signed', got {denom!r}")
+    B = np.asarray(dL_j)[None, :] * share                            # sum_i B[i,j] = dL_j
+    return B, denom_used
 
 
 def beneficial_from_carriage(C, yhat_clean, yhat_swap, y, num_sources, num_donors, eps=1e-9):
@@ -160,98 +187,177 @@ def beneficial_from_carriage(C, yhat_clean, yhat_swap, y, num_sources, num_donor
     return B, dL_j, sumC_j
 
 
+def make_distance_bins(dmax: int, distance=None, strategy: str = "log", n_equal: int = 8):
+    """Adaptive shortest-path-distance bins as a list of inclusive (lo, hi) ranges.
+
+    Per-hop means are dominated by a few pairs at far distances (the graph-diameter tail is
+    heavy), so their CIs are huge and, on large-graph tasks, the x-axis is unreadable.
+    Pooling distances into bins tightens the CIs and keeps the axis legible while preserving
+    near/mid/far resolution.
+
+      "hop"          one bin per hop (fine for small-diameter tasks like ZINC).
+      "log"          singletons {0},{1},{2},{3} then dyadic {4-7},{8-15},{16-31},... to dmax.
+                     Keeps near-hop resolution; pools the far tail. Universal default.
+      "equal_count"  singletons {0..3} then quantile bins on d>=4 with ~equal pair counts.
+    """
+    dmax = int(dmax)
+    if dmax < 0:
+        return []
+    if strategy == "hop":
+        return [(d, d) for d in range(dmax + 1)]
+    if strategy == "log":
+        bins = [(d, d) for d in range(0, min(4, dmax + 1))]
+        lo = 4
+        while lo <= dmax:
+            hi = min(2 * lo - 1, dmax)
+            bins.append((lo, hi))
+            lo = hi + 1
+        return bins
+    if strategy == "equal_count":
+        if distance is None:
+            raise ValueError("equal_count binning needs the distance array")
+        d = np.asarray(distance)
+        bins = [(k, k) for k in range(0, min(4, dmax + 1))]
+        rest = d[d >= 4]
+        if rest.size:
+            edges = np.unique(np.quantile(rest, np.linspace(0, 1, n_equal + 1)).round().astype(int))
+            edges = np.clip(edges, 4, dmax)
+            edges = np.unique(np.concatenate([edges, [dmax + 1]]))
+            lo = 4
+            for e in edges:
+                hi = int(e) - 1 if int(e) > lo else lo
+                if hi >= lo:
+                    bins.append((lo, min(hi, dmax)))
+                    lo = min(hi, dmax) + 1
+                if lo > dmax:
+                    break
+        return bins
+    raise ValueError(f"unknown bin strategy {strategy!r}")
+
+
+def _bin_index(distance, bins):
+    """Map each distance to its bin index (-1 if in no bin; bins cover 0..dmax so rare)."""
+    idx = np.full(distance.shape, -1, dtype=np.int64)
+    for b, (lo, hi) in enumerate(bins):
+        idx[(distance >= lo) & (distance <= hi)] = b
+    return idx
+
+
+def _central(x, how: str):
+    x = np.asarray(x, dtype=float)
+    x = x[np.isfinite(x)]
+    if x.size == 0:
+        return float("nan")
+    if how == "median":
+        return float(np.median(x))
+    if how == "mean":
+        return float(np.mean(x))
+    if how == "trimmed":  # 20% trimmed mean
+        xs = np.sort(x)
+        k = int(np.floor(0.2 * xs.size))
+        return float(xs[k:xs.size - k].mean()) if 2 * k < xs.size else float(np.median(xs))
+    raise ValueError(f"unknown central tendency {how!r}")
+
+
 def aggregate_carriage_curves(graph_id, distance, F, B, n_boot: int = 2000,
-                              boot_seed: int = 1234) -> dict:
-    """Distance profiles F(d), B(d), the per-distance MAE mass S(d), and B_far(k).
+                              boot_seed: int = 1234, bin_strategy: str = "log",
+                              central: str = "trimmed", min_count: int = 50) -> dict:
+    """Binned, robust, graph-clustered distance profiles F, B, the loss mass S, and B_far.
 
-        F(d)     = mean over {(i,j) : d(i,j) = d} of |C[i,j]|            (Eq. 3.7)
-        B(d)     = mean over {(i,j) : d(i,j) = d} of B[i,j]              (analogue of 3.7)
-        S(d)     = per-graph SUM of B[i,j] at distance d, averaged over graphs [MAE units]
-        B_far(k) = per-graph SUM of B[i,j] over d(i,j) > k, averaged over graphs [MAE units]
+    For each SPD bin:
+      * F, B: two-stage estimator over graphs -- per-graph MEAN within the bin, then a robust
+        central tendency (``central``: median / 20%-trimmed mean / mean) ACROSS graphs, with a
+        graph-clustered bootstrap CI. This weights each graph equally (not by pair count) and
+        resists the few large-diameter graphs that dominate far bins. Bins with < ``min_count``
+        pairs are dropped (NaN).
+      * S: per-graph SUM within the bin, MEAN over graphs (loss units; additive, so the tail
+        bins telescope to B_far).
+      * B_far(edge): per-graph SUM over d > edge, MEAN over graphs, evaluated at each bin's
+        upper edge.
 
-    F(d) and B(d) are means over PAIRS, exactly as the definitions state. S(d) and
-    B_far(k) are SUMS taken per graph first, which keeps them in MAE units and makes them
-    telescope: sum over d>k of S(d) is B_far(k).
-
-    All CIs are 95% bootstrap intervals CLUSTERED ON GRAPHS: pairs inside one molecule are
-    strongly dependent, so resampling pairs would understate the interval. For the pooled
-    means the bootstrap resamples graphs and recomputes sum(sums)/sum(counts).
-
-    Args:
-        graph_id: [P] graph id per pair.
-        distance: [P] integer hop distance per pair (finite only; d=inf dropped by caller).
-        F:        [P] |C[i,j]|.
-        B:        [P] beneficial carriage per pair.
+    Returns bins as (bin_lo, bin_hi, bin_label) with an integer bin_center (the bin index) for
+    even, readable x-spacing.
     """
     graph_id = np.asarray(graph_id)
     distance = np.asarray(distance).astype(np.int64)
     F = np.asarray(F, dtype=np.float64)
     B = np.asarray(B, dtype=np.float64)
 
-    dmax = int(distance.max())
-    ds = np.arange(0, dmax + 1)
+    dmax = int(distance.max()) if distance.size else -1
+    bins = make_distance_bins(dmax, distance, bin_strategy)
+    nb = len(bins)
+    bin_lo = np.array([lo for lo, _ in bins], dtype=np.int64)
+    bin_hi = np.array([hi for _, hi in bins], dtype=np.int64)
+    bin_label = [str(lo) if lo == hi else f"{lo}-{hi}" for lo, hi in bins]
+    bin_center = np.arange(nb)
+
     uniq_g = np.unique(graph_id)
     n_g = int(uniq_g.size)
     gpos = {int(v): p for p, v in enumerate(uniq_g)}
     gidx = np.array([gpos[int(v)] for v in graph_id])
+    bidx = _bin_index(distance, bins)
 
-    def _by_graph(vals: np.ndarray, mask: np.ndarray):
-        s = np.zeros(n_g)
-        c = np.zeros(n_g)
+    def _per_graph_mean(vals, mask):
+        s = np.zeros(n_g); c = np.zeros(n_g)
         np.add.at(s, gidx[mask], vals[mask])
         np.add.at(c, gidx[mask], 1.0)
-        return s, c
+        present = c > 0
+        return np.where(present, s / np.maximum(c, 1), np.nan), present
 
-    def _boot_pooled(s, c):
-        if c.sum() == 0:
+    def _per_graph_sum(vals, mask):
+        s = np.zeros(n_g)
+        np.add.at(s, gidx[mask], vals[mask])
+        return s
+
+    def _robust_over_graphs(per_graph_vals):
+        vg = per_graph_vals[np.isfinite(per_graph_vals)]
+        if vg.size == 0:
             return float("nan"), float("nan"), float("nan")
-        point = s.sum() / c.sum()
+        point = _central(vg, central)
         br = np.random.default_rng(boot_seed)
-        draws = br.integers(0, n_g, size=(n_boot, n_g))
-        bs, bc = s[draws].sum(axis=1), c[draws].sum(axis=1)
-        good = bc > 0
-        if not np.any(good):
-            return float(point), float("nan"), float("nan")
-        vals = bs[good] / bc[good]
-        lo, hi = np.percentile(vals, [2.5, 97.5])
+        draws = br.integers(0, vg.size, size=(n_boot, vg.size))
+        boot = np.array([_central(vg[d], central) for d in draws])
+        lo, hi = np.percentile(boot, [2.5, 97.5])
         return float(point), float(lo), float(hi)
 
-    def _boot_graph(per_graph):
+    def _mean_over_graphs(per_graph):
         br = np.random.default_rng(boot_seed)
         draws = br.integers(0, per_graph.size, size=(n_boot, per_graph.size))
         vals = per_graph[draws].mean(axis=1)
         lo, hi = np.percentile(vals, [2.5, 97.5])
         return float(per_graph.mean()), float(lo), float(hi)
 
-    counts = np.zeros(ds.size, dtype=np.int64)
-    F_mean, F_lo, F_hi = (np.full(ds.size, np.nan) for _ in range(3))
-    B_mean, B_lo, B_hi = (np.full(ds.size, np.nan) for _ in range(3))
-    S_mean, S_lo, S_hi = (np.full(ds.size, np.nan) for _ in range(3))
-    F_per_graph = np.full((n_g, ds.size), np.nan)
+    counts = np.zeros(nb, dtype=np.int64)
+    F_mean, F_lo, F_hi = (np.full(nb, np.nan) for _ in range(3))
+    B_mean, B_lo, B_hi = (np.full(nb, np.nan) for _ in range(3))
+    S_mean, S_lo, S_hi = (np.full(nb, np.nan) for _ in range(3))
+    F_per_graph = np.full((n_g, nb), np.nan)
 
-    for d in ds:
-        m = distance == d
-        counts[d] = int(m.sum())
-        sF, cF = _by_graph(F, m)
-        F_mean[d], F_lo[d], F_hi[d] = _boot_pooled(sF, cF)
-        with np.errstate(invalid="ignore", divide="ignore"):
-            F_per_graph[:, d] = np.where(cF > 0, sF / np.maximum(cF, 1), np.nan)
-        sB, cB = _by_graph(B, m)
-        B_mean[d], B_lo[d], B_hi[d] = _boot_pooled(sB, cB)
-        S_mean[d], S_lo[d], S_hi[d] = _boot_graph(sB)
+    for b in range(nb):
+        m = bidx == b
+        counts[b] = int(m.sum())
+        Fg, present = _per_graph_mean(F, m)
+        F_per_graph[:, b] = Fg
+        if counts[b] >= min_count:
+            F_mean[b], F_lo[b], F_hi[b] = _robust_over_graphs(Fg)
+            Bg, _ = _per_graph_mean(B, m)
+            B_mean[b], B_lo[b], B_hi[b] = _robust_over_graphs(Bg)
+        S_mean[b], S_lo[b], S_hi[b] = _mean_over_graphs(_per_graph_sum(B, m))
 
-    ks = np.arange(0, dmax + 1)
-    Bf_mean, Bf_lo, Bf_hi = (np.full(ks.size, np.nan) for _ in range(3))
-    for k in ks:
-        sB, _ = _by_graph(B, distance > k)   # per-graph SUM over d(i,j) > k
-        Bf_mean[k], Bf_lo[k], Bf_hi[k] = _boot_graph(sB)
+    # B_far at each bin's upper edge: per-graph sum over d > edge, mean over graphs.
+    edges = bin_hi.copy()
+    Bf_mean, Bf_lo, Bf_hi = (np.full(nb, np.nan) for _ in range(3))
+    for b, k in enumerate(edges):
+        Bf_mean[b], Bf_lo[b], Bf_hi[b] = _mean_over_graphs(_per_graph_sum(B, distance > k))
 
     return {
-        "distances": ds, "pair_counts": counts, "n_graphs": n_g,
+        "bin_lo": bin_lo, "bin_hi": bin_hi, "bin_label": bin_label, "bin_center": bin_center,
+        "distances": bin_center, "n_bins": nb, "bin_strategy": bin_strategy, "central": central,
+        "min_count": int(min_count), "pair_counts": counts, "n_graphs": n_g,
         "F_mean": F_mean, "F_lo": F_lo, "F_hi": F_hi,
         "B_mean": B_mean, "B_lo": B_lo, "B_hi": B_hi,
         "S_mean": S_mean, "S_lo": S_lo, "S_hi": S_hi,
-        "k": ks, "B_far_mean": Bf_mean, "B_far_lo": Bf_lo, "B_far_hi": Bf_hi,
+        "k": edges, "B_far_mean": Bf_mean, "B_far_lo": Bf_lo, "B_far_hi": Bf_hi,
         "F_per_graph": F_per_graph,
     }
 

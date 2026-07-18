@@ -54,9 +54,11 @@ from graph_specialisation_metrics.carriage import run  # noqa: E402
 run(
     task="peptides_struct",
     mount=False,
-    num_graphs=32,          # ~150-node graphs; raise toward 64 if the A100 has headroom
-    donors=16,              # K donor swaps per source
+    num_graphs=128,         # >=128 for tight bootstrap CIs; drop to 16 for a quick check
+    donors=128,             # K>=128 donor swaps/source (32 is under-powered)
     max_pair_edges=4_000_000,   # smaller per-forward budget for large full-attention graphs
     verify_graphs=2,
+    # defaults already applied: beneficial_denom="magnitude", bin_strategy="log", central="trimmed"
+    # to compare the legacy attribution: beneficial_denom="signed"
 )
 # ============================ paste to here ============================

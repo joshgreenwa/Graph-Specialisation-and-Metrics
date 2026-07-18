@@ -20,6 +20,14 @@ Two ZINC models share this cell -- set TASK:
 
 To analyse a different GRIT model, register it once in src/.../carriage/tasks.py and call
 run(task="<name>"). Everything else is identical.
+
+Aggregation options (both default to the improved behaviour, method-wide):
+  * beneficial_denom="magnitude" (default): B[i,j] = dL_j * |C[i,j]| / sum_i |C[i,j]|.
+    Convex shares => |B| <= |dL_j| (no blow-up) and B=0 where functional carriage=0. Pass
+    run(..., beneficial_denom="signed") for the legacy signed-sum share (kept for comparison).
+  * bin_strategy="log" (default) + central="trimmed": F/B pooled into adaptive SPD bins
+    ({0},{1},{2},{3},{4-7},{8-15},...) with a robust central tendency + graph-clustered CI.
+    Pass bin_strategy="hop" to recover per-hop resolution (fine on ZINC's small diameter).
 """
 
 # ============================ paste from here ============================

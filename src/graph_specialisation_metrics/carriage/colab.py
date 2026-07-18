@@ -62,6 +62,13 @@ def run(
     verify_graphs: int = 2,
     eval_metric: bool = True,
     allow_param_count_drift: bool = False,
+    # beneficial-carriage denominator:
+    #   "magnitude" (DEFAULT): B[i,j] = dL_j * |C[i,j]| / sum_i |C[i,j]|. Convex shares, so
+    #       |B| <= |dL_j| (no blow-up) and B vanishes wherever functional carriage vanishes.
+    #   "signed" (LEGACY):     B[i,j] = dL_j * C[i,j] / sum_i C[i,j]. Keeps the per-carrier
+    #       sign but the signed sum can cancel to ~0 and make |B| >> |C| spikes at far
+    #       distances. Kept only for comparison; prefer "magnitude".
+    beneficial_denom: str = "magnitude",
     tol: float = 1e-4,
     float_noise_tol: float = 5e-3,
     max_replicas: int = 4096,
@@ -69,13 +76,31 @@ def run(
     n_boot: int = 2000,
     boot_seed: int = 1234,
     bd_linthresh: float = 0.0,
+    # SPD binning of F/B (fixes huge-diameter x-axes + heavy-tailed per-hop CIs):
+    #   bin_strategy: "log" (DEFAULT: {0},{1},{2},{3},{4-7},{8-15},{16-31},...), "hop"
+    #       (per-hop; fine for small ZINC), or "equal_count" (quantile bins on d>=4).
+    #   central: "trimmed" (DEFAULT 20%-trimmed mean over graphs), "median", or "mean".
+    #   min_bin_count: bins with fewer pairs are dropped from F/B (default 50).
+    bin_strategy: str = "log",
+    central: str = "trimmed",
+    min_bin_count: int = 50,
     # environment
     mount: bool = True,
     skip_install: bool = False,
     pyg_version: str = "2.2.0",
     force_fresh_grit: bool = False,
 ) -> dict:
-    """Run the semantic-intervention carriage analysis end to end for one GRIT task."""
+    """Run the semantic-intervention carriage analysis end to end for one GRIT task.
+
+    Two aggregation choices worth knowing (both default to the improved behaviour):
+
+    * ``beneficial_denom`` -- how each source's exact loss change dL_j is split across its
+      carriers. "magnitude" (default) uses |C| shares: bounded, no blow-up, B=0 where
+      F=0. "signed" is the legacy signed-sum share, kept only for comparison.
+    * ``bin_strategy`` / ``central`` -- F and B are pooled into adaptive shortest-path
+      bins and reported with a robust central tendency + graph-clustered bootstrap CI,
+      which is what makes the large-graph (peptides) x-axis legible and the CIs tight.
+    """
     spec = task if isinstance(task, GritTaskSpec) else get_task(task)
     drive_dir = drive_dir or spec.drive_dir
     if not drive_dir:
@@ -126,12 +151,14 @@ def run(
         eval_split=eval_split, donor_split=donor_split, num_graphs=num_graphs,
         donors=donors, graph_select=graph_select, analysis_seed=analysis_seed,
         verify=verify, verify_graphs=verify_graphs, eval_metric=eval_metric,
-        allow_param_count_drift=allow_param_count_drift, tol=tol, float_noise_tol=float_noise_tol,
+        allow_param_count_drift=allow_param_count_drift, beneficial_denom=beneficial_denom,
+        tol=tol, float_noise_tol=float_noise_tol,
         max_replicas=max_replicas, max_pair_edges=max_pair_edges,
     )
     results = run_grit_carriage(spec, cc)
     outputs = figures.make_figures_and_save(
-        results, str(out_dir), n_boot=n_boot, boot_seed=boot_seed, bd_linthresh=bd_linthresh)
+        results, str(out_dir), n_boot=n_boot, boot_seed=boot_seed, bd_linthresh=bd_linthresh,
+        bin_strategy=bin_strategy, central=central, min_count=min_bin_count)
 
     _update_collation_index(Path(collate_dir), spec, results, outputs)
     log(f"\n[done] Task {spec.name!r} figures + data: {out_dir}")

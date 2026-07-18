@@ -8,9 +8,18 @@ methodology automatically uses the multi-output readout (functional carriage = m
 of the output movement over the 10 logits; beneficial carriage = exact per-source change
 in the BCE loss, carrier-attributed). The load check recomputes test AP.
 
-Peptides molecules are large (~150 nodes) vs ZINC (~23), so each graph is far heavier:
-we default to fewer graphs / donors and a smaller per-forward budget. Raise them if the
-A100 has headroom (watch the [mem] line).
+Peptides molecules are large (~150 nodes) vs ZINC (~23), so each graph is far heavier. For
+statistical power we use >=128 graphs and K>=128 donors (32/32 is under-powered); this is a
+multi-hour run on the A100 -- start smaller (num_graphs=16) to sanity-check the green checks,
+then scale up. Watch the [mem] line; the OOM backoff shrinks chunks automatically.
+
+Two aggregation choices (both default to the improved behaviour; documented on run()):
+  * beneficial_denom="magnitude" (default) -- convex |C| shares, so |B| <= |dL_j| (no
+    blow-up) and B vanishes where functional carriage vanishes. Pass "signed" for the
+    legacy signed-sum share (can spike at far distances) only if you want to compare.
+  * bin_strategy="log" (default) + central="trimmed" -- F/B pooled into adaptive SPD bins
+    with a robust central tendency + graph-clustered bootstrap CI, which is what makes the
+    large-diameter x-axis legible. Pass bin_strategy="hop" for per-hop.
 
 Figures collate under /content/drive/MyDrive/graph_specialisation_metrics/carriage_figures/
 peptides_func/ alongside the ZINC ones.
@@ -58,9 +67,11 @@ from graph_specialisation_metrics.carriage import run  # noqa: E402
 run(
     task="peptides_func",
     mount=False,
-    num_graphs=32,          # ~150-node graphs; raise toward 64 if the A100 has headroom
-    donors=16,              # K donor swaps per source
+    num_graphs=128,         # >=128 for tight bootstrap CIs; drop to 16 for a quick check
+    donors=128,             # K>=128 donor swaps/source (32 is under-powered)
     max_pair_edges=4_000_000,   # smaller per-forward budget for large full-attention graphs
     verify_graphs=2,
+    # defaults already applied: beneficial_denom="magnitude", bin_strategy="log", central="trimmed"
+    # to compare the legacy attribution: beneficial_denom="signed"
 )
 # ============================ paste to here ============================
