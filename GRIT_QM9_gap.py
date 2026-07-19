@@ -1427,21 +1427,22 @@ def apply_qm9_patch(repo_dir: Path, drive_dir: Path, args: argparse.Namespace) -
         label="custom train guaranteed recovery checkpoint",
     )
 
-    patch_note = drive_dir / "patches" / "zinc_grit_rrwp_khop_patch.txt"
+    patch_note = drive_dir / "patches" / "qm9_gap_grit_rrwp_patch.txt"
     patch_note.parent.mkdir(parents=True, exist_ok=True)
     patch_note.write_text(
         "\n".join([
-            "Configurable k-hop GRIT ZINC control patch",
+            "Dense/configurable-k-hop GRIT QM9 gap patch",
             f"official_repo: {OFFICIAL_REPO}",
             f"official_commit: {OFFICIAL_COMMIT}",
-            f"dense_reference_config: {DENSE_OFFICIAL_CFG}",
-            f"k_hop_config: {OFFICIAL_CFG}",
+            f"config: {OFFICIAL_CFG}",
+            "target: HOMO-LUMO gap (PyG QM9 column 4, eV)",
+            "split: 110000 train / 10000 validation / remainder test; seed 42",
+            f"attention: {args.attention}",
             f"hops: {args.hops}",
             f"global_vnode: {args.global_vnode}",
             f"parameter_count_guard: {expected_param_count(args)}",
-            "scientific_change: gt.attn.full_attn=False and gt.attn.sparsity=k_hop",
-            "support: exact shortest-path distance <= k plus self after RRWP encoding",
-            "vnode: one learned graph token, bidirectional global attention, excluded from pooling",
+            "k-hop support: exact shortest-path distance <= k plus self after RRWP encoding",
+            "vnode: one learned graph token, bidirectional global attention, excluded from mean pooling",
         ]) + "\n",
         encoding="utf-8",
     )
@@ -1470,7 +1471,7 @@ def verify_recovery_checkpoint_patch(repo_dir: Path) -> None:
         raise RuntimeError(
             "Recovery checkpoint patch is not active in the official GRIT checkout. "
             f"Missing tokens in {custom_train}: {missing}. "
-            "Restart Colab with the latest standalone GRIT_khop_ZINC.py and pass --force-fresh-repo."
+            "Restart Colab with the latest standalone GRIT_QM9_gap.py and pass --force-fresh-repo."
         )
     lines = text.splitlines()
     hit = next(i for i, line in enumerate(lines) if "GRIT_FORCE_RECOVERY_CKPT" in line)
@@ -1481,8 +1482,8 @@ def verify_recovery_checkpoint_patch(repo_dir: Path) -> None:
         log(f"[checkpoint-guarantee:source] {line_no + 1:04d}: {lines[line_no]}")
 
 
-def verify_khop_attention_patch(repo_dir: Path) -> None:
-    """Fail before training if any required scientific patch segment is absent."""
+def verify_qm9_model_patch(repo_dir: Path) -> None:
+    """Fail before training if any required QM9/attention patch is absent."""
     required_by_file = {
         repo_dir / "grit" / "config" / "gt_config.py": [
             'cfg.gt.attn.sparsity = "full"',
@@ -1501,6 +1502,13 @@ def verify_khop_attention_patch(repo_dir: Path) -> None:
             'cfg.gt.attn.get("global_vnode", False)',
             "communication-only: preserve official real-node pooling",
         ],
+        repo_dir / "grit" / "loader" / "master_loader.py": [
+            "Planetoid, QM9, TUDataset",
+            "def preformat_QM9_gap(dataset_dir, name):",
+            "dataset.data.y[:, target_index:target_index + 1]",
+            "dataset.data.x = dataset.data.z.view(-1, 1).long()",
+            "QM9 single target: HOMO-LUMO gap",
+        ],
     }
     errors = []
     for path, tokens in required_by_file.items():
@@ -1514,10 +1522,10 @@ def verify_khop_attention_patch(repo_dir: Path) -> None:
             errors.append(f"{path}: missing {missing}")
     if errors:
         raise RuntimeError(
-            "The k-hop/VNode patch is incomplete; use --force-fresh-repo.\n  - "
+            "The QM9/attention/VNode patch is incomplete; use --force-fresh-repo.\n  - "
             + "\n  - ".join(errors)
         )
-    log("[patch-check] Verified k-hop support and optional global-VNode source patches.")
+    log("[patch-check] Verified QM9 gap loader, attention support, and optional VNode patches.")
 
 
 def get_nested(d: Mapping, path: Sequence[str]):
