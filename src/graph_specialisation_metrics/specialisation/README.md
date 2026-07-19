@@ -88,7 +88,15 @@ batch-context float32 offset cancels.
    (a) each target head's rank / z-score / ratio vs the **random-head null** (all `L·H` single-head
    impacts) plus a random-pair null for joint ablation; (b) per-graph impact distributions;
    (c) impact-vs-graph-feature Spearman heatmap; (d) does the structural head matter more on
-   ring-ier molecules? Plus a score→impact correlation (validity of the transport score).
+   ring-ier molecules?
+5. `fig_score_impact_<task>.png` — **does the specialisation score predict a head's causal (ablation)
+   importance?** Per-head scatter of each channel's score vs its mean ablation impact (coloured by
+   layer) with Spearman ρ, plus a bar panel of **partial correlations**: raw ρ, ρ controlling for the
+   OTHER channel, and ρ controlling for depth (layer). Because both the score and the impact scale
+   with a head's overall output-reach/throughput, the raw ρ is expected to be high and largely
+   reflects that shared factor; the partials isolate whether the semantic/structural distinction
+   carries causal signal *beyond* that amplitude. (`score_impact_corr` in the saved JSON holds the
+   full raw + partial correlations for functional and loss impact.)
 
 ## Verification (asserted every run)
 

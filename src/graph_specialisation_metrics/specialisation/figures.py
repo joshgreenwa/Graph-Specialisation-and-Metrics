@@ -47,6 +47,15 @@ def _rc():
                          "axes.axisbelow": True, "figure.dpi": 140})
 
 
+def _spearman_np(x, y) -> float:
+    x = np.asarray(x, float); y = np.asarray(y, float)
+    ok = np.isfinite(x) & np.isfinite(y)
+    if ok.sum() < 3 or np.std(x[ok]) == 0 or np.std(y[ok]) == 0:
+        return float("nan")
+    rx = np.argsort(np.argsort(x[ok])); ry = np.argsort(np.argsort(y[ok]))
+    return float(np.corrcoef(rx, ry)[0, 1])
+
+
 def _global_norms(results: dict):
     gsem = np.mean([r["S_sem"].mean() for r in results.values()]) + 1e-12
     gstr = np.mean([r["S_str"].mean() for r in results.values()]) + 1e-12
@@ -299,6 +308,122 @@ def fig_ablation(result, abl, out) -> str:
 
 
 # --------------------------------------------------------------------------------------- #
+# Score vs ablation impact: does the specialisation score predict causal importance?
+# --------------------------------------------------------------------------------------- #
+def fig_score_impact(result, abl, out) -> str:
+    """Per-head specialisation score vs ablation impact, with raw + partial correlations.
+
+    Both the score and the impact scale with a head's overall output-reach/throughput, so a raw
+    score->impact correlation is expected. The bar panel shows what survives controlling for the
+    OTHER channel and for DEPTH (layer) -- i.e. whether the semantic/structural distinction carries
+    causal signal beyond that shared amplitude factor.
+    """
+    _rc()
+    L, H = result["L"], result["H"]
+    layer = np.repeat(np.arange(L), H)
+    impact = abl["func_mean"].reshape(-1)
+    sic = abl["score_impact_corr"]
+    channels = [("semantic", result["S_sem"].reshape(-1), sic["func"]["sem"], "#1f77b4"),
+                ("structural", result["S_str"].reshape(-1), sic["func"]["str"], "#d62728")]
+    if result.get("S_attn_sem") is not None and "attn" in sic["func"]:
+        channels.append(("attention", result["S_attn_sem"].reshape(-1), sic["func"]["attn"], "#9467bd"))
+
+    ncol = len(channels) + 1
+    fig, axes = plt.subplots(1, ncol, figsize=(4.6 * ncol, 4.6), constrained_layout=True, squeeze=False)
+    axes = axes[0]
+    sc = None
+    for ax, (name, score, rho, _c) in zip(axes, channels):
+        sc = ax.scatter(score, impact, c=layer, cmap="viridis", s=55, edgecolors="k",
+                        linewidths=0.4, alpha=0.9, vmin=0, vmax=L - 1)
+        ax.set_xlabel(f"{name} score  (raw magnitude)")
+        ax.set_ylabel("mean ablation impact  |Δpred|")
+        ax.set_title(f"{name}: Spearman ρ = {rho:.2f}", fontsize=10, fontweight="bold")
+    if sc is not None:
+        fig.colorbar(sc, ax=axes[len(channels) - 1], label="layer", fraction=0.046, pad=0.04)
+
+    # bar panel: raw vs partial correlations (functional impact), + loss-impact raw.
+    axb = axes[-1]
+    cats = ["raw", "| other\nchannel", "| layer\n(depth)"]
+    sem_vals = [sic["func"]["sem"], sic["func"]["sem_ctrl_str"], sic["func"]["sem_ctrl_layer"]]
+    str_vals = [sic["func"]["str"], sic["func"]["str_ctrl_sem"], sic["func"]["str_ctrl_layer"]]
+    x = np.arange(len(cats)); w = 0.38
+    axb.bar(x - w / 2, sem_vals, w, color="#1f77b4", edgecolor="k", label="semantic")
+    axb.bar(x + w / 2, str_vals, w, color="#d62728", edgecolor="k", label="structural")
+    axb.axhline(0, color="k", lw=0.6)
+    axb.set_xticks(x); axb.set_xticklabels(cats, fontsize=8)
+    axb.set_ylabel("Spearman ρ  (score vs impact)")
+    axb.set_ylim(min(-0.1, min(sem_vals + str_vals) - 0.1), 1.02)
+    axb.set_title("(does it survive controls?)", fontsize=10, fontweight="bold")
+    axb.legend(frameon=False, fontsize=8)
+    axb.text(0.5, -0.28, f"loss-impact raw ρ: sem={sic['loss']['sem']:.2f}, str={sic['loss']['str']:.2f}",
+             transform=axb.transAxes, ha="center", fontsize=8, color="#444")
+    for xi, (sv, tv) in enumerate(zip(sem_vals, str_vals)):
+        axb.text(xi - w / 2, sv + 0.02, f"{sv:.2f}", ha="center", fontsize=7)
+        axb.text(xi + w / 2, tv + 0.02, f"{tv:.2f}", ha="center", fontsize=7)
+
+    fig.suptitle(f"{result['title']}  ·  specialisation score vs head-ablation impact  "
+                 f"(raw ρ shares the head-importance factor; partials isolate the rest)",
+                 fontsize=12, fontweight="bold")
+    fig.savefig(out, bbox_inches="tight")
+    plt.close(fig)
+    return str(out)
+
+
+# --------------------------------------------------------------------------------------- #
+# Skill-drop vs score, three depth-handling variants.
+# --------------------------------------------------------------------------------------- #
+def fig_skill_drop_vs_score(result, abl, out) -> str:
+    """Ablation skill-drop I(l,h) vs raw per-head score S(l,h), under three depth treatments.
+
+    I(l,h) = mean_graph [ loss(ablate) - loss(clean) ]  (Δ task loss; >0 = skill dropped).
+    L̄_S(l), L̄_I(l) = per-layer means over the H heads. Columns:
+      * raw          : S(l,h)                vs I(l,h)                 (layers mixed; amplitude in)
+      * layer-norm   : S(l,h) / L̄_S(l)       vs I(l,h)                (score rescaled to layer-mean 1)
+      * within-layer : S(l,h) - L̄_S(l)       vs I(l,h) - L̄_I(l)       (depth removed from BOTH -> the
+                       head-to-head signal inside each layer)
+    Rows = semantic / structural score. Points coloured by layer; Spearman ρ per panel.
+    """
+    _rc()
+    L, H = result["L"], result["H"]
+    layer_1d = np.repeat(np.arange(L), H)
+    I = np.asarray(abl["loss_mean"], float)                 # [L,H] skill drop (Δ loss)
+    Im = I.mean(axis=1, keepdims=True)                      # [L,1] per-layer mean impact
+    channels = [("semantic", np.asarray(result["S_sem"], float), "#1f77b4"),
+                ("structural", np.asarray(result["S_str"], float), "#d62728")]
+    variants = ["raw", "layer-norm", "within-layer"]
+
+    fig, axes = plt.subplots(len(channels), 3, figsize=(15.0, 4.7 * len(channels)),
+                             constrained_layout=True, squeeze=False)
+    sc = None
+    for ri, (name, S, _c) in enumerate(channels):
+        Sm = S.mean(axis=1, keepdims=True)                 # [L,1] per-layer mean score
+        panels = {
+            "raw": (S.reshape(-1), I.reshape(-1), f"{name} score  S(l,h)", "skill drop  I(l,h)"),
+            "layer-norm": ((S / (Sm + 1e-12)).reshape(-1), I.reshape(-1),
+                           f"{name} score / layer-mean", "skill drop  I(l,h)"),
+            "within-layer": ((S - Sm).reshape(-1), (I - Im).reshape(-1),
+                             f"{name} score - layer-mean", "skill drop  I - layer-mean"),
+        }
+        for ci, v in enumerate(variants):
+            ax = axes[ri][ci]
+            x, y, xl, yl = panels[v]
+            rho = _spearman_np(x, y)
+            sc = ax.scatter(x, y, c=layer_1d, cmap="viridis", s=52, edgecolors="k",
+                            linewidths=0.4, alpha=0.9, vmin=0, vmax=L - 1)
+            if v == "within-layer":
+                ax.axhline(0, color="k", lw=0.5); ax.axvline(0, color="k", lw=0.5)
+            ax.set_xlabel(xl); ax.set_ylabel(yl)
+            ax.set_title(f"{v}:  ρ = {rho:.2f}", fontsize=10, fontweight="bold")
+    if sc is not None:
+        fig.colorbar(sc, ax=axes[:, -1], label="layer index (0 = input)", fraction=0.046, pad=0.02)
+    fig.suptitle(f"{result['title']}  ·  skill-drop vs score  (raw | layer-normalised | within-layer)  "
+                 f"— each point = one head", fontsize=12, fontweight="bold")
+    fig.savefig(out, bbox_inches="tight")
+    plt.close(fig)
+    return str(out)
+
+
+# --------------------------------------------------------------------------------------- #
 # Orchestration.
 # --------------------------------------------------------------------------------------- #
 def make_all_figures(results: dict, ablations: dict, attn: dict, out_dir) -> dict:
@@ -312,6 +437,10 @@ def make_all_figures(results: dict, ablations: dict, attn: dict, out_dir) -> dic
         figs[f"heatmaps_{task}"] = fig_heatmaps(r, out_dir / f"fig_heatmaps_{task}.png")
         if task in ablations:
             figs[f"ablation_{task}"] = fig_ablation(r, ablations[task], out_dir / f"fig_ablation_{task}.png")
+            figs[f"score_impact_{task}"] = fig_score_impact(
+                r, ablations[task], out_dir / f"fig_score_impact_{task}.png")
+            figs[f"skill_drop_{task}"] = fig_skill_drop_vs_score(
+                r, ablations[task], out_dir / f"fig_skill_drop_{task}.png")
         if task in attn:
             ad = dict(attn[task]); ad["title"] = r["title"]
             hoi = ablations[task]["heads_of_interest"] if task in ablations \

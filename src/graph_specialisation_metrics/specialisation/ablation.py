@@ -61,6 +61,20 @@ def _spearman(x, y) -> float:
     return float(np.corrcoef(rx, ry)[0, 1])
 
 
+def _partial_spearman(x, y, z) -> float:
+    """First-order partial rank correlation of x,y controlling for z (correlation on ranks).
+
+    r_xy.z = (r_xy - r_xz r_yz) / sqrt((1 - r_xz^2)(1 - r_yz^2)). Answers "does x predict y beyond
+    what z explains?" -- here: does a channel's score predict ablation impact beyond depth / beyond
+    the other channel's score (i.e. beyond the shared head-importance factor)?
+    """
+    rxy, rxz, ryz = _spearman(x, y), _spearman(x, z), _spearman(y, z)
+    denom = np.sqrt(max(0.0, (1 - rxz ** 2) * (1 - ryz ** 2)))
+    if not np.isfinite(rxy) or denom < 1e-9:
+        return float("nan")
+    return float((rxy - rxz * ryz) / denom)
+
+
 # --------------------------------------------------------------------------------------- #
 # The ablation sweep.
 # --------------------------------------------------------------------------------------- #
@@ -182,10 +196,32 @@ def run_ablation(result, sc, *, seed: int = 0, n_random_pairs: int = 300) -> dic
                             "percentile": float((rand_pair_impacts < val).mean() * 100.0),
                             "p_ge": float((rand_pair_impacts >= val).mean())}
 
-    # ---- score-predicts-impact validity check ----
+    # ---- does the specialisation score predict causal (ablation) importance? ----
+    # Both the scores and the ablation impact scale with a head's overall output-reach/throughput,
+    # so a raw score->impact correlation is expected and largely reflects that shared factor. The
+    # partials test whether each channel adds predictive value BEYOND depth (layer) and BEYOND the
+    # other channel (i.e. beyond the shared importance factor); a partial that stays high means the
+    # semantic/structural distinction carries genuine causal signal, not just amplitude.
+    sflat, tflat = S_sem.reshape(-1), S_str.reshape(-1)
+    flat_loss = loss_mean.reshape(-1)
+    layer_idx = np.repeat(np.arange(L), H).astype(float)     # depth per head
+    S_attn = result.get("S_attn_sem")
+
+    def _corrset(y):
+        cs = {"sem": _spearman(sflat, y), "str": _spearman(tflat, y),
+              "sem_ctrl_str": _partial_spearman(sflat, y, tflat),
+              "str_ctrl_sem": _partial_spearman(tflat, y, sflat),
+              "sem_ctrl_layer": _partial_spearman(sflat, y, layer_idx),
+              "str_ctrl_layer": _partial_spearman(tflat, y, layer_idx)}
+        if S_attn is not None:
+            cs["attn"] = _spearman(S_attn.reshape(-1), y)
+        return cs
+
     score_impact_corr = {
-        "sem_score_vs_impact": _spearman(S_sem.reshape(-1), flat_func),
-        "str_score_vs_impact": _spearman(S_str.reshape(-1), flat_func),
+        "func": _corrset(flat_func), "loss": _corrset(flat_loss),
+        # kept for the ablation figure's suptitle (back-compat)
+        "sem_score_vs_impact": _spearman(sflat, flat_func),
+        "str_score_vs_impact": _spearman(tflat, flat_func),
     }
 
     # ---- per-graph impact vs graph features (the "structural head on structural inputs" test) ----
@@ -199,8 +235,10 @@ def run_ablation(result, sc, *, seed: int = 0, n_random_pairs: int = 300) -> dic
     for name, st in target_stats.items():
         log(f"   {name:14s} L{st['head'][0]}H{st['head'][1]}  impact={st['func_mean']:.3e}  "
             f"rank={st['rank']}/{st['n_heads']}  z={st['z']:+.2f}  x{st['ratio_vs_random']:.1f}")
-    log(f"[ablate] score->impact Spearman: sem={score_impact_corr['sem_score_vs_impact']:.2f} "
-        f"str={score_impact_corr['str_score_vs_impact']:.2f}")
+    sf = score_impact_corr["func"]
+    log(f"[ablate] score->impact Spearman (functional): sem={sf['sem']:.2f} str={sf['str']:.2f}  "
+        f"| partial: sem|str={sf['sem_ctrl_str']:.2f} str|sem={sf['str_ctrl_sem']:.2f} "
+        f"sem|layer={sf['sem_ctrl_layer']:.2f} str|layer={sf['str_ctrl_layer']:.2f}")
 
     return {
         "func_mean": func_mean, "loss_mean": loss_mean,
