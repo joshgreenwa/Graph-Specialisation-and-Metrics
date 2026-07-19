@@ -185,46 +185,60 @@ def fig_attention(attn_data, heads_named, out) -> str:
     return str(out)
 
 
-def fig_attention_graph(attn_data, heads_named, out, max_mols=3) -> str:
-    """Attention as an edge-weighted molecular graph for the interesting heads (a few molecules)."""
+def fig_attention_graph(attn_data, heads_named, out, max_mols=None, edge_frac=0.12) -> str:
+    """The SAME attention pattern as ``fig_attention`` (the [n,n] matrix), drawn ON the molecule.
+
+    Faithful to the matrix (so a diagonal-heavy head reads as a diagonal-heavy graph):
+      * node SIZE  ∝ self-attention A[i,i]  (the matrix diagonal) -- a self/local head shows big
+        nodes; node COLOUR = atom type (context, kept small so attention dominates);
+      * directed EDGE j→i (information flow, sender→receiver) with COLOUR + WIDTH ∝ a_{i←j}=A[i,j],
+        every off-diagonal edge >= ``edge_frac`` * (per-cell max), NOT just the top decile, so weak-
+        but-structured routing (e.g. a hub sender attended by many) is visible;
+      * per-cell normalisation by A.max() -- identical to each matrix panel's own colourbar -- and
+        the same molecules/heads as ``fig_attention``, so the two figures line up cell-for-cell.
+    """
+    from matplotlib.cm import ScalarMappable
+    from matplotlib.colors import Normalize
     _rc()
-    mols = attn_data["molecules"][:max_mols]
+    mols = attn_data["molecules"] if max_mols is None else attn_data["molecules"][:max_mols]
     named = list(heads_named.items())
     nrow, ncol = len(named), len(mols)
-    fig, axes = plt.subplots(nrow, ncol, figsize=(3.0 * ncol, 3.0 * nrow),
+    cmap = plt.get_cmap("plasma")
+    fig, axes = plt.subplots(nrow, ncol, figsize=(3.2 * ncol, 3.2 * nrow),
                              constrained_layout=True, squeeze=False)
     for ri, (name, hd) in enumerate(named):
         hd = tuple(int(x) for x in hd)
         for ci, mol in enumerate(mols):
             ax = axes[ri][ci]
-            pos, A = mol["pos"], mol["maps"][hd]
-            n = mol["n"]
-            # draw bonds faintly
-            for a, b in mol["bonds"]:
-                ax.plot([pos[a, 0], pos[b, 0]], [pos[a, 1], pos[b, 1]], "-", color="#cccccc",
+            pos, A, n = mol["pos"], mol["maps"][hd], mol["n"]
+            vmax = float(A.max()) + 1e-12                   # per-cell max == the matrix panel's colourbar top
+            for a, b in mol["bonds"]:                       # bonds, faint
+                ax.plot([pos[a, 0], pos[b, 0]], [pos[a, 1], pos[b, 1]], "-", color="#dddddd",
                         lw=1.0, zorder=1)
-            # draw the strongest attention edges (off-diagonal), width/alpha ~ weight
-            Ao = A.copy(); np.fill_diagonal(Ao, 0.0)
-            thr = np.quantile(Ao[Ao > 0], 0.9) if (Ao > 0).any() else 0.0
-            mxw = Ao.max() + 1e-9
-            for i in range(n):
-                for j in range(n):
-                    w = Ao[i, j]
-                    if w >= thr and w > 0:
-                        ax.annotate("", xy=pos[i], xytext=pos[j],
-                                    arrowprops=dict(arrowstyle="-|>", color="#d62728",
-                                                    alpha=float(min(1.0, w / mxw)),
-                                                    lw=0.5 + 2.5 * w / mxw), zorder=2)
-            sc = ax.scatter(pos[:, 0], pos[:, 1], c=mol["atom_types"], cmap="tab20", s=120,
-                            edgecolors="k", linewidths=0.6, zorder=3)
-            ax.set_xticks([]); ax.set_yticks([]); ax.grid(False)
-            ax.set_aspect("equal")
+            Ao = A.copy(); self_attn = np.diag(A).copy(); np.fill_diagonal(Ao, 0.0)
+            thr = edge_frac * vmax
+            ij = np.argwhere(Ao >= thr)
+            order = np.argsort(Ao[ij[:, 0], ij[:, 1]]) if len(ij) else []  # weak first, strong on top
+            for k in order:
+                i, j = ij[k]
+                w = Ao[i, j] / vmax                         # normalised [0,1] like the matrix
+                ax.annotate("", xy=pos[i], xytext=pos[j], zorder=2,
+                            arrowprops=dict(arrowstyle="-|>", color=cmap(w),
+                                            alpha=float(0.25 + 0.7 * w), lw=0.4 + 3.2 * w))
+            s_norm = self_attn / vmax                       # node size ∝ diagonal (self-attention)
+            ax.scatter(pos[:, 0], pos[:, 1], s=40 + 320 * s_norm, c=mol["atom_types"],
+                       cmap="tab20", edgecolors="k", linewidths=0.6, zorder=3)
+            ax.set_xticks([]); ax.set_yticks([]); ax.grid(False); ax.set_aspect("equal")
             if ri == 0:
-                ax.set_title(f"mol {mol['graph_id']}", fontsize=9)
+                ax.set_title(f"mol {mol['graph_id']} (n={n})", fontsize=9)
             if ci == 0:
                 ax.set_ylabel(f"{name}\nL{hd[0]}H{hd[1]}", fontsize=9)
-    fig.suptitle(f"{attn_data.get('title','')}  ·  top-decile attention edges on the molecule "
-                 f"(node colour = atom type)", fontsize=11, fontweight="bold")
+    sm = ScalarMappable(norm=Normalize(0, 1), cmap=cmap); sm.set_array([])
+    fig.colorbar(sm, ax=axes, fraction=0.02, pad=0.01,
+                 label="attention  a_{i←j}  (per-cell max = 1; matches the matrix panel)")
+    fig.suptitle(f"{attn_data.get('title','')}  ·  attention ON the molecule  —  node size = self-"
+                 f"attention A[i,i],  arrow j→i colour/width = a_{{i←j}}  (node colour = atom type)",
+                 fontsize=11, fontweight="bold")
     fig.savefig(out, bbox_inches="tight")
     plt.close(fig)
     return str(out)
