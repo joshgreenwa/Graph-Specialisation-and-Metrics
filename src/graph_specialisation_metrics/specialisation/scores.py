@@ -52,7 +52,7 @@ def _perturb_mask_frozen(base, u: int, v: int):
     the complete graph, so freezing is a no-op on the mask; the difference is only that the bond
     channel is held fixed, matching the spec (bonds are wiring, not RRWP payload).
     """
-    pert = structural.perturb(base, u, v, "transposition")   # conjugates rrwp/rrwp_index/val/deg/log_deg + edge_index
+    pert = structural.perturb(base, u, v, "transposition")   # includes RRWP, edge, and local-support indices
     pert.edge_index = base.edge_index                         # freeze the mask/wiring
     if getattr(base, "edge_attr", None) is not None:
         pert.edge_attr = base.edge_attr                      # bonds unchanged (perturb left values intact); realign

@@ -3,7 +3,7 @@
 This is the structural complement of the semantic donor swap (``content.py``). Where the
 semantic swap overwrites a node's *content* row and leaves structure S fixed, a structural
 intervention perturbs the *structure-derived* tensors (node-RRWP, pair-RRWP, and -- for the
-k-hop variants -- the attention-support mask, which those encoders derive at forward time)
+k-hop variants -- the attention-support mask, including the explicit local-RRWP support index)
 and leaves ``data.x`` fixed. It feeds the IDENTICAL core estimator: the runner still computes
 ``delta = h_clean - h_swap`` and hands it to ``core`` unchanged.
 
@@ -16,9 +16,9 @@ defined exactly as on the semantic side:
     isomorphic copy of the graph paired with the original (unmoved) content, so it is on the
     "physical structure, mismatched content" manifold, exactly like the semantic donor swap.
     Both ``u`` and ``v`` move, so the runner anchors at ``u`` and MARGINALISES the partner
-    ``v`` over K degree-matched draws (the donor-average recipe). Because the k-hop mask is
-    derived from the (conjugated) pairwise RRWP, it is conjugated too -- so dense and masked
-    models are both perturbed through the one operation.
+    ``v`` over K degree-matched draws (the donor-average recipe). Every attention-support
+    index is conjugated too, including ``rrwp_local_edge_index`` for the strictly-local model,
+    so dense and masked models are both perturbed through the one operation.
 
   * ``single_node`` (secondary, off-manifold): copy a donor ``v``'s structural footprint onto
     ``u`` only, leaving ``v`` untouched. Only ``u`` moves, so ``d(i,u)`` is perfectly clean,
@@ -41,9 +41,15 @@ import numpy as np
 # only if present on the Data object, so it is safe across GRIT configs.
 NODE_STRUCT_ATTRS = ("rrwp", "deg", "log_deg", "abs_pe", "pestat_RRWP")
 
-# Pairwise (edge-indexed) tensors: an index [2, E] plus an aligned value [E, ...]. Under a
-# transposition the index is relabelled and the value rides along unchanged.
-PAIR_TENSORS = (("rrwp_index", "rrwp_val"), ("edge_index", "edge_attr"))
+# Pairwise (edge-indexed) tensors: an index [2, E] and, where present, an aligned value
+# [E, ...]. Under a transposition the index is relabelled and the value rides along
+# unchanged. ``rrwp_local_edge_index`` is created only by the strictly-local RRWP patch and
+# is the model's attention-support mask; it has no separate aligned value tensor.
+PAIR_TENSORS = (
+    ("rrwp_index", "rrwp_val"),
+    ("edge_index", "edge_attr"),
+    ("rrwp_local_edge_index", None),
+)
 
 
 # --------------------------------------------------------------------------------------- #
@@ -137,10 +143,10 @@ def perturb(data, u: int, v: int, mode: str):
         for idx_name, val_name in PAIR_TENSORS:
             idx = getattr(data, idx_name, None)
             if idx is not None:
-                val = getattr(data, val_name, None)
+                val = getattr(data, val_name, None) if val_name is not None else None
                 new_idx, new_val = _copy_incidence(idx, u, v, val)
                 setattr(d, idx_name, new_idx)
-                if val is not None:
+                if val_name is not None and val is not None:
                     setattr(d, val_name, new_val)
     else:
         raise ValueError(f"structural mode must be 'transposition' or 'single_node', got {mode!r}")
@@ -220,7 +226,7 @@ def verify_perturbation(base, pert, u: int, v: int, mode: str) -> None:
         if idx is not None:
             assert torch.equal(getattr(pert, idx_name), _relabel_uv(idx, u, v)), \
                 f"pairwise index {idx_name!r} not relabelled under a transposition"
-            val = getattr(base, val_name, None)
-            if val is not None:
+            val = getattr(base, val_name, None) if val_name is not None else None
+            if val_name is not None and val is not None:
                 assert torch.equal(getattr(pert, val_name), val), \
                     f"pairwise value {val_name!r} changed under a transposition (must ride along)"

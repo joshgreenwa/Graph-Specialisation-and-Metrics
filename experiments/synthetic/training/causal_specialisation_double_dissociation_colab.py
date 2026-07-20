@@ -9,7 +9,9 @@ official LiamMa/GRIT ``GritTransformerLayer`` at the repository-pinned commit.  
 4. computes planted-source semantic and structural specialisation scores;
 5. sweeps every head's clean-input ablation impact; and
 6. performs clean-to-corrupt head-output interchange patching for necessity-plus-rescue
-   double dissociation.
+   double dissociation; and
+7. cumulatively ablates the score-selected semantic and structural head families to test
+   distributed necessity beyond single-head redundancy.
 
 Tasks
 -----
@@ -55,8 +57,10 @@ Primary outputs (PNG + vector PDF)
 ``fig2_score_ablation``
     Score versus same-channel single-head functional ablation impact.
 ``fig3_necessity_rescue_double_dissociation``
-    Selected semantic/structural head-family necessity and causal rescue matrices plus
+    Simultaneous semantic/structural head-family necessity and causal rescue matrices plus
     seed-level interaction contrasts.
+``fig4_iterative_family_ablation``
+    Cumulative fixed-order family ablation curves for loss and accuracy on both tasks.
 
 Paper claims must use the default (or larger) run, never ``--fast-dev-run``.  The fast run
 exists only to verify installation, official-layer execution, caching, and plotting.
@@ -85,6 +89,7 @@ import numpy as np
 
 
 EXPERIMENT_VERSION = "causal-specialisation-double-dissociation-v2-shared-source-marker"
+FAMILY_ABLATION_REVISION = "score-selected-prefix-family-ablation-v1"
 OFFICIAL_GRIT_URL = "https://github.com/LiamMa/GRIT.git"
 OFFICIAL_GRIT_COMMIT = "6c988ea600a606fbb49a2246c64a2d37396b3ab5"
 DEFAULT_GRIT_DIR = "/content/GRIT"
@@ -594,19 +599,35 @@ def build_model_class() -> type:
 
 @contextlib.contextmanager
 def ablate_head(model: Any, layer: int, head: int):
-    import torch
+    with ablate_heads(model, [(int(layer), int(head))]):
+        yield
 
-    def hook(_module: Any, _inputs: tuple[Any, ...], output: Any) -> Any:
-        h_out, e_out = output
-        changed = h_out.clone()
-        changed[:, int(head), :] = 0.0
-        return changed, e_out
 
-    handle = model.attention_layers[int(layer)].register_forward_hook(hook)
+@contextlib.contextmanager
+def ablate_heads(model: Any, heads: Sequence[tuple[int, int]]):
+    """Zero several routed heads in one pass, grouping hooks by layer."""
+
+    by_layer: dict[int, list[int]] = {}
+    for layer, head in heads:
+        by_layer.setdefault(int(layer), []).append(int(head))
+    handles = []
+
+    def make_hook(head_indices: Sequence[int]):
+        def hook(_module: Any, _inputs: tuple[Any, ...], output: Any) -> Any:
+            h_out, e_out = output
+            changed = h_out.clone()
+            changed[:, list(head_indices), :] = 0.0
+            return changed, e_out
+
+        return hook
+
     try:
+        for layer, head_indices in by_layer.items():
+            handles.append(model.attention_layers[layer].register_forward_hook(make_hook(head_indices)))
         yield
     finally:
-        handle.remove()
+        for handle in handles:
+            handle.remove()
 
 
 @contextlib.contextmanager
@@ -688,13 +709,18 @@ def predict_in_chunks(
     device: Any,
     chunk_size: int,
     ablation: tuple[int, int] | None = None,
+    ablations: Sequence[tuple[int, int]] | None = None,
 ) -> Any:
     import torch
 
+    if ablation is not None and ablations is not None:
+        raise ValueError("pass ablation or ablations, not both")
     outputs = []
     context = contextlib.nullcontext()
     if ablation is not None:
         context = ablate_head(model, ablation[0], ablation[1])
+    elif ablations is not None:
+        context = ablate_heads(model, ablations)
     with context, torch.no_grad():
         for start in range(0, len(batch), int(chunk_size)):
             outputs.append(model(batch.slice(start, min(start + chunk_size, len(batch))).to(device)).detach().cpu())
@@ -898,6 +924,66 @@ def ablation_sweep(model: Any, cfg: Config, *, mode: int, seed: int, device: Any
     }
 
 
+def family_ablation_sweep(
+    model: Any,
+    cfg: Config,
+    *,
+    groups: Mapping[str, Sequence[tuple[int, int]]],
+    seed: int,
+    device: Any,
+) -> dict[str, Any]:
+    """Cumulatively zero score-selected head families on independent clean graphs.
+
+    Orders are frozen by the intervention scores.  No ablation outcome is used to choose or
+    reorder heads, so every prefix remains an out-of-sample causal test of the score ranking.
+    """
+    import torch
+    import torch.nn.functional as F
+
+    output: dict[str, Any] = {"revision": FAMILY_ABLATION_REVISION, "tasks": {}}
+    for mode, task_name in MODE_NAMES.items():
+        batch = make_batch(cfg, cfg.ablation_graphs, seed + mode * 10_000, mode=mode)
+        clean = predict_in_chunks(model, batch, device=device, chunk_size=cfg.analysis_batch_size)
+        clean_loss = F.cross_entropy(clean, batch.y.long(), reduction="none")
+        clean_correct = clean.argmax(-1) == batch.y
+        task: dict[str, Any] = {
+            "clean_logits": clean,
+            "y": batch.y,
+            "clean_accuracy": float(clean_correct.float().mean()),
+            "families": {},
+        }
+        for family_name in ("semantic", "structural"):
+            order = [tuple(map(int, head)) for head in groups[family_name]]
+            functional = torch.zeros(len(order) + 1, len(batch))
+            loss = torch.zeros_like(functional)
+            accuracy_drop = torch.zeros_like(functional)
+            for prefix in range(1, len(order) + 1):
+                ablated = predict_in_chunks(
+                    model,
+                    batch,
+                    device=device,
+                    chunk_size=cfg.analysis_batch_size,
+                    ablations=order[:prefix],
+                )
+                functional[prefix] = torch.linalg.vector_norm(ablated - clean, dim=-1)
+                loss[prefix] = F.cross_entropy(ablated, batch.y.long(), reduction="none") - clean_loss
+                accuracy_drop[prefix] = clean_correct.float() - (ablated.argmax(-1) == batch.y).float()
+            task["families"][family_name] = {
+                "head_order": [list(head) for head in order],
+                "prefix_size": torch.arange(len(order) + 1),
+                "functional": functional,
+                "loss": loss,
+                "accuracy_drop": accuracy_drop,
+            }
+            print(
+                f"[family ablation {task_name}/{family_name}] "
+                f"0..{len(order)} score-ranked heads",
+                flush=True,
+            )
+        output["tasks"][task_name] = task
+    return output
+
+
 def rescue_sweep(model: Any, cfg: Config, *, mode: int, factor: str, seed: int, device: Any) -> dict[str, Any]:
     import torch
     import torch.nn.functional as F
@@ -1044,8 +1130,25 @@ def analyze_seed(
 
     path = analysis_path(run_dir, cfg, seed)
     if path.exists() and not force:
-        print(f"[analysis seed={seed}] loaded {path}", flush=True)
-        return torch.load(path, map_location="cpu", weights_only=False)
+        result = torch.load(path, map_location="cpu", weights_only=False)
+        family = result.get("family_ablation", {})
+        if family.get("revision") == FAMILY_ABLATION_REVISION:
+            print(f"[analysis seed={seed}] loaded {path}", flush=True)
+            return result
+        # Backward-compatible cache enrichment: do not repeat scoring, single-head ablation,
+        # or rescue when only the newly added family-ablation analysis is absent.
+        model.eval()
+        print(f"[analysis seed={seed}] augmenting cached result with family ablations", flush=True)
+        result["family_ablation"] = family_ablation_sweep(
+            model,
+            cfg,
+            groups=result["selected_groups"],
+            seed=1_000_000 + seed,
+            device=device,
+        )
+        torch.save(result, path)
+        print(f"[analysis seed={seed}] updated {path}", flush=True)
+        return result
 
     model.eval()
     checks = {
@@ -1084,6 +1187,9 @@ def analyze_seed(
     rescue_str = rescue_sweep(
         model, cfg, mode=MODE_STRUCTURAL, factor="structural", seed=900_000 + seed, device=device
     )
+    family_ablation = family_ablation_sweep(
+        model, cfg, groups=groups, seed=1_000_000 + seed, device=device
+    )
     result = {
         "version": EXPERIMENT_VERSION,
         "fingerprint": config_fingerprint(cfg),
@@ -1100,6 +1206,7 @@ def analyze_seed(
         "ablation_structural": ablation_str,
         "rescue_semantic": rescue_sem,
         "rescue_structural": rescue_str,
+        "family_ablation": family_ablation,
     }
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(result, path)
