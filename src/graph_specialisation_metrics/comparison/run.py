@@ -325,15 +325,17 @@ def run_all(tasks: Sequence[str] = _data.DEFAULT_TASKS, *,
             carriage_kwargs: Optional[dict] = None,
             # specialisation knobs
             run_specialisation: bool = True,
-            spec_num_graphs: int = 200,
-            spec_donors: int = 8,
+            spec_num_graphs: int = 128,
+            spec_donors: int = 64,
             with_attn_routing: bool = True,
             # channel-split causal ablation (I_sem/I_str functional + loss) -> the D/J validation
-            # figure. Off by default: it is the heavy swap x ablate sweep (L*H passes per model).
+            # figure. Off by default: it is the heavy swap x ablate sweep (L*H passes per model),
+            # so its donors stay lower than carriage/specialisation (each donor is multiplied by
+            # L*H ablated forwards); raise channel_ablation_donors to trade compute for tighter CIs.
             with_channel_ablation: bool = False,
-            channel_ablation_graphs: int = 48,
-            channel_ablation_sources: int = 6,
-            channel_ablation_donors: int = 3,
+            channel_ablation_graphs: int = 128,
+            channel_ablation_sources: int = 8,
+            channel_ablation_donors: int = 8,
             spec_kwargs: Optional[dict] = None,   # any other specialisation.colab.run option
             # cache / output
             carriage_collate: str = CARRIAGE_COLLATE,

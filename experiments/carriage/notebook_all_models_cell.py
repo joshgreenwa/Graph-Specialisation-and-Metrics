@@ -79,9 +79,9 @@ run_all(
     # HEAVY: L*H ablated forwards per model over intervention replicas. Set False to skip it
     # (the score-only quadrant/influence figures still build). Scale the knobs up for tighter CIs.
     with_channel_ablation=True,
-    channel_ablation_graphs=48,
-    channel_ablation_sources=6,
-    channel_ablation_donors=3,
+    channel_ablation_graphs=128,
+    channel_ablation_sources=8,
+    channel_ablation_donors=8,   # each donor => L*H extra ablated forwards; raise for tighter CIs
 )
 
 # --- Re-draw the deliverables from cache only (no re-compute), e.g. dropping the VNode runs: ---
