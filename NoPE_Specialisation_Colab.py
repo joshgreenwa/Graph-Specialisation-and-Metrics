@@ -171,6 +171,14 @@ def _setup_cache_dir():
 
 CACHE_DIR = _setup_cache_dir()
 
+# Every model/score/figure for a run lives in a geometry-named SUBFOLDER of CACHE_DIR, so a
+# different model size (T, d, heads) writes to its own dir and never overwrites another -- older
+# caches are preserved as-is. Set the NOPE_RUN env var to send a run to a custom subfolder name.
+RUN_NAME = os.environ.get("NOPE_RUN", "").strip() or f"T{SEQ_LEN}_d{D_MODEL}_h{N_HEADS}"
+RUN_DIR = os.path.join(CACHE_DIR, RUN_NAME)
+os.makedirs(RUN_DIR, exist_ok=True)
+print(f"[cache] run dir: {RUN_DIR}")
+
 def _config_dict(steps):
     """Hyperparameters that make a trained model comparable/cacheable (parametrised by steps)."""
     return dict(teacher=TEACHER_TYPE, sem=f"strict_earlier_sharp{SEM_SHARP}", T=SEQ_LEN, d=D_MODEL,
@@ -369,7 +377,7 @@ def eval_mse(model, task, n=4096):
 
 def model_cache_path(variant, task, n_layers, seed):
     return os.path.join(
-        CACHE_DIR, f"student_{variant}_{task}_L{n_layers}_seed{seed}_{model_tag(n_layers)}.pt")
+        RUN_DIR, f"student_{variant}_{task}_L{n_layers}_seed{seed}_{model_tag(n_layers)}.pt")
 
 
 def get_student(variant, task, n_layers, seed, force=False):
@@ -577,7 +585,7 @@ def scores_transport(model):
 # ============================== 8. Score orchestration + cache ==============================
 def scores_cache_path(variant, task, n_layers, seed):
     return os.path.join(
-        CACHE_DIR,
+        RUN_DIR,
         f"scores_{variant}_{task}_L{n_layers}_seed{seed}_{model_tag(n_layers)}_{EVAL_TAG}.pt")
 
 
@@ -1067,17 +1075,17 @@ def main(force_retrain_depths=None):
     print_training_table(train_rows)
     # Primary scatter / D-J / attention figures use the PRIMARY family; faithfulness overlays all.
     agg_primary = agg[PRIMARY]
-    scatter_path = os.path.join(CACHE_DIR, f"fig_specialisation_scatter_{CFG_TAG}_{EVAL_TAG}.png")
-    jd_path = os.path.join(CACHE_DIR, f"fig_specialisation_JDplane_{CFG_TAG}_{EVAL_TAG}.png")
+    scatter_path = os.path.join(RUN_DIR, f"fig_specialisation_scatter_{CFG_TAG}_{EVAL_TAG}.png")
+    jd_path = os.path.join(RUN_DIR, f"fig_specialisation_JDplane_{CFG_TAG}_{EVAL_TAG}.png")
     make_figure(agg_primary, scatter_path)
     make_jd_figure(agg_primary, jd_path)
-    faith_path = os.path.join(CACHE_DIR, f"fig_faithfulness_{CFG_TAG}_{EVAL_TAG}.png")
+    faith_path = os.path.join(RUN_DIR, f"fig_faithfulness_{CFG_TAG}_{EVAL_TAG}.png")
     make_faithfulness_figure(agg, faith_path)
-    tr_imp_path = os.path.join(CACHE_DIR, f"fig_transport_importance_{CFG_TAG}_{EVAL_TAG}.png")
+    tr_imp_path = os.path.join(RUN_DIR, f"fig_transport_importance_{CFG_TAG}_{EVAL_TAG}.png")
     make_transport_importance_figure(tr_imp_path)
     if ATTN_VIZ_DEPTH is not None:
         if ATTN_VIZ_DEPTH in DEPTHS:
-            attn_path = os.path.join(CACHE_DIR,
+            attn_path = os.path.join(RUN_DIR,
                                      f"fig_attention_L{ATTN_VIZ_DEPTH}_{CFG_TAG}_{EVAL_TAG}.png")
             make_attention_figure(depth=ATTN_VIZ_DEPTH, out_path=attn_path)
         else:
