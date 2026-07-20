@@ -28,6 +28,29 @@ If a run misses the reachable-cell gate, the notebook makes up to two recorded a
 initialisation attempts while holding its task/data seed fixed. Selection uses validation only;
 held-out accuracy remains a final gate, and successful checkpoints are reused unchanged.
 
+### Analysis note: sensitivity versus selectivity
+
+Keep the production scores `S_sem` and `S_str` unchanged: each remains a raw measure of how
+strongly that factor's intervention reaches the output through a head. Do not interpret their
+mean-normalised scatter as evidence that the two factors have equal total strength; normalising
+each axis separately deliberately removes that comparison.
+
+For cross-channel analysis, first calibrate each score against a matched null from the same
+intervention family, retaining intervention scale while removing factor--task alignment. Denote
+the resulting comparable effect sizes by `S_sem_tilde` and `S_str_tilde`, then report
+
+```text
+J = (S_sem_tilde + S_str_tilde) / 2   # shared/non-specific head response
+D = (S_sem_tilde - S_str_tilde) / 2   # semantic-versus-structural selectivity
+```
+
+`J` distinguishes generally influential heads from specialists; the sign and magnitude of `D`
+capture the off-diagonal preference. Report raw and calibrated scores alongside these derived
+quantities rather than folding selectivity into the core score. Validate `D` with the full
+cross-channel matrix (semantic/structural score against semantic/structural carriage loss), and
+keep task usefulness separate through beneficial carriage, ablation, and rescue. The exact
+matched-null construction must be fixed and verified before using `D` for headline claims.
+
 ## CausalSpecialisationDoubleDissociation
 
 `training/causal_specialisation_double_dissociation_colab.py` is a single-cell,
@@ -53,6 +76,29 @@ Cached phases can be rerun independently with `--phase train`, `--phase analyze`
 `--phase figures`; the figures-only phase does not reinstall GRIT. When a cached v2 analysis
 lacks the newer family-ablation block, `--phase analyze` augments it without recomputing scores,
 single-head ablations, rescue results, or training.
+
+The figure-only stage also derives a joint-strength/selectivity view from the cached per-head
+tensors. Within each seed, semantic and structural scores are divided by their respective head
+means before computing
+
+```text
+J     = (S_sem_norm + S_str_norm) / 2
+D_rel = (S_sem_norm - S_str_norm) / (S_sem_norm + S_str_norm)
+```
+
+`fig5_joint_influence_selectivity` tests whether `J` predicts mean cross-task functional
+ablation impact and whether `D_rel` predicts semantic-minus-structural ablation and rescue role.
+It additionally reports `|D_rel|` versus `J`, depth profiles, and semantic-specialist,
+generalist, structural-specialist, and low-`J` quadrant summaries. Heads with `J < 0.5` are faded
+and excluded from selectivity correlations because a ratio of two tiny scores is unstable. This
+is a within-seed head-allocation analysis, not yet a claim that raw semantic and structural score
+amplitudes are directly comparable across intervention families.
+
+`--phase analyze` enriches older caches once with four additional fixed score-selected family
+ablations: semantic specialists, structural specialists, high-`J` generalists, and low-`J`/inert
+heads. `fig6_joint_selectivity_family_ablation` compares their cumulative functional and accuracy
+effects on both tasks. It reuses the checkpoint and every existing score, single-head ablation,
+and rescue tensor; no model is retrained.
 
 ## MarkedTreePath
 

@@ -19,6 +19,7 @@ __all__ = [
     "run_all",
     "build_figures",
     "performance_table",
+    "inventory",
     "data",
     "plots",
     "DEFAULT_TASKS",
@@ -32,6 +33,12 @@ def run_all(*args, **kwargs):
     """Lazy proxy to comparison.run.run_all (keeps `import comparison` torch/GRIT-free)."""
     from .run import run_all as _run
     return _run(*args, **kwargs)
+
+
+def inventory(*args, **kwargs):
+    """Lazy proxy to comparison.run.inventory (per-model cache/checkpoint diagnostic)."""
+    from .run import inventory as _inv
+    return _inv(*args, **kwargs)
 
 
 def build_figures(*args, **kwargs):

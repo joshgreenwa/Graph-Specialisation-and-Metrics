@@ -8,6 +8,9 @@ Deliverables:
 * ``plot_spec_scatter_grid``      -- (ii)  side-by-side per-model scatter of the specialisation
                                      scores: structural (x) vs semantic (y), one panel per model,
                                      axes divided by the global per-channel mean, layer-coloured.
+* ``plot_spec_DJ_grid``           -- (ii-b) the same scores rotated to selectivity D (x) vs joint
+                                     strength J (y): D = (S~sem - S~str)/2, J = (S~sem + S~str)/2,
+                                     separating head strength (J) from channel preference (D).
 * ``plot_carriage_small_multiples`` -- (iii) side-by-side functional (top row) and beneficial
                                      (bottom row) carriage, one column per model, with a
                                      STANDARDISED (reference-fixed) y-axis per row so the scale
@@ -170,6 +173,90 @@ def plot_spec_scatter_grid(scores_by_task: dict, tasks: Sequence[str], out_path,
         if idx // ncols == nrows - 1:
             ax.set_xlabel("structural  S_str / mean")
     # blank any unused axes
+    for j in range(n, nrows * ncols):
+        axes[j // ncols][j % ncols].axis("off")
+    if sc is not None:
+        cb = fig.colorbar(sc, ax=axes.ravel().tolist(), shrink=0.8, pad=0.01)
+        cb.set_label("layer")
+    fig.suptitle(suptitle, fontsize=12)
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=150)
+    return fig, str(out_path)
+
+
+# --------------------------------------------------------------------------------------
+# (ii-b) selectivity D vs joint-strength J scatter grid (rotation of the S_str/S_sem plane)
+# --------------------------------------------------------------------------------------
+
+def plot_spec_DJ_grid(scores_by_task: dict, tasks: Sequence[str], out_path,
+                      *, gsem: Optional[float] = None, gstr: Optional[float] = None,
+                      ncols: Optional[int] = None, metrics_by_task: Optional[dict] = None,
+                      ref_tasks: Optional[Sequence[str]] = None,
+                      suptitle: str = ("Per-head specialisation: selectivity D (x) vs "
+                                       "joint strength J (y)")):
+    """(ii-b) Side-by-side per-model scatter of D (x) vs J (y), layer-coloured.
+
+    Using the amplitude-normalised scores S~ = raw / channel-mean (same ``gsem``/``gstr`` as the
+    S_str-vs-S_sem grid), each head maps to::
+
+        J = (S~_sem + S~_str) / 2     joint strength (how influential the head is overall)
+        D = (S~_sem - S~_str) / 2     selectivity  (>0 semantic-leaning, <0 structural-leaning)
+
+    This is a 45 degrees rotation of the (S~_str, S~_sem) plane that separates *strength* from
+    *preference*: high J = influential, sign of D = which channel it prefers, low J = inert.
+    The D-J plane limits are fixed from ``ref_tasks`` (default: all cached models) so dropping or
+    including methods does not rescale the plane. Returns (fig, path).
+    """
+    import matplotlib.pyplot as plt
+
+    tasks = [t for t in tasks if t in scores_by_task]
+    if not tasks:
+        raise ValueError("plot_spec_DJ_grid: no cached score matrices for the given tasks.")
+    if gsem is None or gstr is None:
+        gsem, gstr = global_norms(scores_by_task, tasks)
+
+    def _DJ(t):
+        ssem = scores_by_task[t]["S_sem"] / gsem
+        sstr = scores_by_task[t]["S_str"] / gstr
+        return 0.5 * (ssem - sstr), 0.5 * (ssem + sstr)   # (D, J)
+
+    # Fixed plane from the reference set so the axes are stable across drop/include selections.
+    lim_tasks = [t for t in (ref_tasks or list(scores_by_task.keys())) if t in scores_by_task]
+    dmax, jmax, Lmax = 1e-9, 1e-9, 1
+    for t in lim_tasks:
+        D, J = _DJ(t)
+        dmax = max(dmax, float(np.abs(D).max()))
+        jmax = max(jmax, float(J.max()))
+        Lmax = max(Lmax, scores_by_task[t]["S_sem"].shape[0])
+    dmax *= 1.08
+    jmax *= 1.08
+
+    n = len(tasks)
+    ncols = ncols or n
+    ncols = max(1, min(ncols, n))
+    nrows = int(np.ceil(n / ncols))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(3.6 * ncols, 3.7 * nrows),
+                             squeeze=False, constrained_layout=True)
+    sc = None
+    for idx, t in enumerate(tasks):
+        ax = axes[idx // ncols][idx % ncols]
+        D, J = _DJ(t)
+        L, H = scores_by_task[t]["S_sem"].shape
+        layer = np.repeat(np.arange(L), H)
+        ax.axvline(0.0, color="k", ls=":", lw=0.9, zorder=0)   # no-preference axis (D=0)
+        sc = ax.scatter(D.reshape(-1), J.reshape(-1), c=layer, cmap="viridis", s=48,
+                        edgecolors="k", linewidths=0.4, alpha=0.9, vmin=0, vmax=Lmax - 1)
+        ax.set_xlim(-dmax, dmax)
+        ax.set_ylim(0, jmax)
+        meta = _data.method_meta(t, idx)
+        ml = _metric_label(metrics_by_task, t)
+        ax.set_title(meta["label"] + (f"\n{ml}" if ml else ""), fontsize=9)
+        if idx % ncols == 0:
+            ax.set_ylabel(r"joint strength  $J=(\tilde S_{\rm sem}+\tilde S_{\rm str})/2$")
+        if idx // ncols == nrows - 1:
+            ax.set_xlabel(r"selectivity  $D=(\tilde S_{\rm sem}-\tilde S_{\rm str})/2$"
+                          "\n($<0$ structural  ·  $>0$ semantic)")
     for j in range(n, nrows * ncols):
         axes[j // ncols][j % ncols].axis("off")
     if sc is not None:

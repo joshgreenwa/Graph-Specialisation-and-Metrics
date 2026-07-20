@@ -61,6 +61,12 @@ Primary outputs (PNG + vector PDF)
     seed-level interaction contrasts.
 ``fig4_iterative_family_ablation``
     Cumulative fixed-order family ablation curves for loss and accuracy on both tasks.
+``fig5_joint_influence_selectivity``
+    The calibrated D--J head plane plus tests that J predicts overall ablation impact and
+    D predicts semantic-versus-structural ablation and rescue role.
+``fig6_joint_selectivity_family_ablation``
+    Fixed score-selected cumulative ablations of semantic specialists, structural specialists,
+    high-J generalists, and low-J/inert heads on both tasks.
 
 Paper claims must use the default (or larger) run, never ``--fast-dev-run``.  The fast run
 exists only to verify installation, official-layer execution, caching, and plotting.
@@ -90,6 +96,7 @@ import numpy as np
 
 EXPERIMENT_VERSION = "causal-specialisation-double-dissociation-v2-shared-source-marker"
 FAMILY_ABLATION_REVISION = "score-selected-prefix-family-ablation-v1"
+DJ_FAMILY_ABLATION_REVISION = "joint-selectivity-prefix-family-ablation-v1"
 OFFICIAL_GRIT_URL = "https://github.com/LiamMa/GRIT.git"
 OFFICIAL_GRIT_COMMIT = "6c988ea600a606fbb49a2246c64a2d37396b3ab5"
 DEFAULT_GRIT_DIR = "/content/GRIT"
@@ -98,6 +105,8 @@ MODE_SEMANTIC = 0
 MODE_STRUCTURAL = 1
 MODE_NAMES = {MODE_SEMANTIC: "semantic", MODE_STRUCTURAL: "structural"}
 EPS = 1.0e-12
+DJ_RELIABILITY_FLOOR = 0.50  # combined sensitivity relative to the within-seed head mean
+DJ_SELECTIVITY_THRESHOLD = 0.20  # equivalent to a 1.5:1 calibrated channel ratio
 
 
 # ======================================================================================
@@ -931,6 +940,7 @@ def family_ablation_sweep(
     groups: Mapping[str, Sequence[tuple[int, int]]],
     seed: int,
     device: Any,
+    revision: str = FAMILY_ABLATION_REVISION,
 ) -> dict[str, Any]:
     """Cumulatively zero score-selected head families on independent clean graphs.
 
@@ -940,7 +950,7 @@ def family_ablation_sweep(
     import torch
     import torch.nn.functional as F
 
-    output: dict[str, Any] = {"revision": FAMILY_ABLATION_REVISION, "tasks": {}}
+    output: dict[str, Any] = {"revision": str(revision), "tasks": {}}
     for mode, task_name in MODE_NAMES.items():
         batch = make_batch(cfg, cfg.ablation_graphs, seed + mode * 10_000, mode=mode)
         clean = predict_in_chunks(model, batch, device=device, chunk_size=cfg.analysis_batch_size)
@@ -952,8 +962,8 @@ def family_ablation_sweep(
             "clean_accuracy": float(clean_correct.float().mean()),
             "families": {},
         }
-        for family_name in ("semantic", "structural"):
-            order = [tuple(map(int, head)) for head in groups[family_name]]
+        for family_name, group in groups.items():
+            order = [tuple(map(int, head)) for head in group]
             functional = torch.zeros(len(order) + 1, len(batch))
             loss = torch.zeros_like(functional)
             accuracy_drop = torch.zeros_like(functional)
@@ -1113,6 +1123,44 @@ def select_head_groups(semantic: np.ndarray, structural: np.ndarray, size: int) 
     return {"semantic": sem_group, "structural": str_group}
 
 
+def select_dj_groups(
+    semantic: np.ndarray, structural: np.ndarray, size: int
+) -> dict[str, list[tuple[int, int]]]:
+    """Four disjoint, score-only families for specialist/generalist/inert causal tests."""
+    sem = np.asarray(semantic, dtype=float)
+    st = np.asarray(structural, dtype=float)
+    sem_n = sem / (np.mean(sem) + EPS)
+    str_n = st / (np.mean(st) + EPS)
+    joint, selectivity = joint_selectivity(sem_n, str_n)
+    heads = [(layer, head) for layer in range(sem.shape[0]) for head in range(sem.shape[1])]
+    reliable = {item for item in heads if joint[item] >= DJ_RELIABILITY_FLOOR}
+    used: set[tuple[int, int]] = set()
+
+    def take(primary: Sequence[tuple[int, int]], fallback: Sequence[tuple[int, int]]) -> list[tuple[int, int]]:
+        chosen = [item for item in primary if item not in used][: int(size)]
+        if len(chosen) < int(size):
+            chosen += [
+                item for item in fallback
+                if item not in used and item not in chosen
+            ][: int(size) - len(chosen)]
+        used.update(chosen)
+        return chosen
+
+    sem_order = sorted(reliable, key=lambda item: (-selectivity[item], item))
+    str_order = sorted(reliable, key=lambda item: (selectivity[item], item))
+    general_order = sorted(reliable, key=lambda item: (abs(selectivity[item]), item))
+    inert_order = sorted(heads, key=lambda item: (joint[item], item))
+    all_sem = sorted(heads, key=lambda item: (-selectivity[item], item))
+    all_str = sorted(heads, key=lambda item: (selectivity[item], item))
+    all_general = sorted(heads, key=lambda item: (abs(selectivity[item]), item))
+    return {
+        "semantic_specialist": take(sem_order, all_sem),
+        "structural_specialist": take(str_order, all_str),
+        "high_J_generalist": take(general_order, all_general),
+        "low_J_inert": take(inert_order, inert_order),
+    }
+
+
 def analysis_path(run_dir: Path, cfg: Config, seed: int) -> Path:
     return run_dir / "analysis" / f"seed_{seed}__{config_fingerprint(cfg)}.pt"
 
@@ -1132,20 +1180,41 @@ def analyze_seed(
     if path.exists() and not force:
         result = torch.load(path, map_location="cpu", weights_only=False)
         family = result.get("family_ablation", {})
-        if family.get("revision") == FAMILY_ABLATION_REVISION:
+        dj_family = result.get("dj_family_ablation", {})
+        if (
+            family.get("revision") == FAMILY_ABLATION_REVISION
+            and dj_family.get("revision") == DJ_FAMILY_ABLATION_REVISION
+        ):
             print(f"[analysis seed={seed}] loaded {path}", flush=True)
             return result
-        # Backward-compatible cache enrichment: do not repeat scoring, single-head ablation,
-        # or rescue when only the newly added family-ablation analysis is absent.
+        # Backward-compatible cache enrichment: never repeat scores, single-head ablations,
+        # or rescues when only a newly added score-selected family analysis is absent.
         model.eval()
-        print(f"[analysis seed={seed}] augmenting cached result with family ablations", flush=True)
-        result["family_ablation"] = family_ablation_sweep(
-            model,
-            cfg,
-            groups=result["selected_groups"],
-            seed=1_000_000 + seed,
-            device=device,
-        )
+        if family.get("revision") != FAMILY_ABLATION_REVISION:
+            print(f"[analysis seed={seed}] adding original family ablations", flush=True)
+            result["family_ablation"] = family_ablation_sweep(
+                model,
+                cfg,
+                groups=result["selected_groups"],
+                seed=1_000_000 + seed,
+                device=device,
+            )
+        if dj_family.get("revision") != DJ_FAMILY_ABLATION_REVISION:
+            print(f"[analysis seed={seed}] adding J/D quadrant family ablations", flush=True)
+            dj_groups = select_dj_groups(
+                np.asarray(result["semantic_score"]),
+                np.asarray(result["structural_score"]),
+                cfg.top_group_size,
+            )
+            result["dj_selected_groups"] = dj_groups
+            result["dj_family_ablation"] = family_ablation_sweep(
+                model,
+                cfg,
+                groups=dj_groups,
+                seed=1_100_000 + seed,
+                device=device,
+                revision=DJ_FAMILY_ABLATION_REVISION,
+            )
         torch.save(result, path)
         print(f"[analysis seed={seed}] updated {path}", flush=True)
         return result
@@ -1190,6 +1259,15 @@ def analyze_seed(
     family_ablation = family_ablation_sweep(
         model, cfg, groups=groups, seed=1_000_000 + seed, device=device
     )
+    dj_groups = select_dj_groups(semantic_score, structural_score, cfg.top_group_size)
+    dj_family_ablation = family_ablation_sweep(
+        model,
+        cfg,
+        groups=dj_groups,
+        seed=1_100_000 + seed,
+        device=device,
+        revision=DJ_FAMILY_ABLATION_REVISION,
+    )
     result = {
         "version": EXPERIMENT_VERSION,
         "fingerprint": config_fingerprint(cfg),
@@ -1202,11 +1280,13 @@ def analyze_seed(
         "semantic_score": semantic_score,
         "structural_score": structural_score,
         "selected_groups": groups,
+        "dj_selected_groups": dj_groups,
         "ablation_semantic": ablation_sem,
         "ablation_structural": ablation_str,
         "rescue_semantic": rescue_sem,
         "rescue_structural": rescue_str,
         "family_ablation": family_ablation,
+        "dj_family_ablation": dj_family_ablation,
     }
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(result, path)
@@ -1272,6 +1352,25 @@ def group_metric(matrix: Any, heads: Sequence[tuple[int, int]]) -> float:
     return finite_mean(np.concatenate(values))
 
 
+def joint_selectivity(semantic: Any, structural: Any) -> tuple[np.ndarray, np.ndarray]:
+    """Rotate two comparable non-negative channels into strength and bounded preference."""
+    semantic = np.asarray(semantic, dtype=float)
+    structural = np.asarray(structural, dtype=float)
+    joint = 0.5 * (semantic + structural)
+    selectivity = (semantic - structural) / (semantic + structural + EPS)
+    return joint, selectivity
+
+
+def dj_class(joint: float, selectivity: float) -> str:
+    if float(joint) < DJ_RELIABILITY_FLOOR:
+        return "low-J / inert"
+    if float(selectivity) >= DJ_SELECTIVITY_THRESHOLD:
+        return "semantic specialist"
+    if float(selectivity) <= -DJ_SELECTIVITY_THRESHOLD:
+        return "structural specialist"
+    return "high-J generalist"
+
+
 def build_head_rows(results: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
     rows = []
     for result in results:
@@ -1284,6 +1383,14 @@ def build_head_rows(results: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
         str_loss = np.asarray(result["ablation_structural"]["loss"]).mean(axis=-1)
         sem_rescue = np.nanmean(np.asarray(result["rescue_semantic"]["mediation"]), axis=-1)
         str_rescue = np.nanmean(np.asarray(result["rescue_structural"]["mediation"]), axis=-1)
+        sem_cross = np.asarray(result["semantic_on_structural_per_graph"], dtype=float).mean(axis=0)
+        str_cross = np.asarray(result["structural_on_semantic_per_graph"], dtype=float).mean(axis=0)
+        sem_norm = sem / (sem.mean() + EPS)
+        str_norm = st / (st.mean() + EPS)
+        joint, selectivity = joint_selectivity(sem_norm, str_norm)
+        sem_func_norm = sem_func / (sem_func.mean() + EPS)
+        str_func_norm = str_func / (str_func.mean() + EPS)
+        impact_joint, impact_selectivity = joint_selectivity(sem_func_norm, str_func_norm)
         sem_set = set(map(tuple, result["selected_groups"]["semantic"]))
         str_set = set(map(tuple, result["selected_groups"]["structural"]))
         for layer in range(sem.shape[0]):
@@ -1296,14 +1403,35 @@ def build_head_rows(results: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
                     "selected_group": group,
                     "semantic_score": float(sem[layer, head]),
                     "structural_score": float(st[layer, head]),
-                    "semantic_score_norm": float(sem[layer, head] / (sem.mean() + EPS)),
-                    "structural_score_norm": float(st[layer, head] / (st.mean() + EPS)),
+                    "semantic_score_norm": float(sem_norm[layer, head]),
+                    "structural_score_norm": float(str_norm[layer, head]),
+                    "joint_score_J": float(joint[layer, head]),
+                    "selectivity_D": float(selectivity[layer, head]),
+                    "absolute_selectivity": float(abs(selectivity[layer, head])),
+                    "selectivity_reliable": bool(joint[layer, head] >= DJ_RELIABILITY_FLOOR),
+                    "DJ_class": dj_class(joint[layer, head], selectivity[layer, head]),
+                    "semantic_cross_task_score": float(sem_cross[layer, head]),
+                    "structural_cross_task_score": float(str_cross[layer, head]),
+                    "semantic_matched_enrichment": float(
+                        (sem[layer, head] - sem_cross[layer, head])
+                        / (sem[layer, head] + sem_cross[layer, head] + EPS)
+                    ),
+                    "structural_matched_enrichment": float(
+                        (st[layer, head] - str_cross[layer, head])
+                        / (st[layer, head] + str_cross[layer, head] + EPS)
+                    ),
                     "semantic_ablation_functional": float(sem_func[layer, head]),
                     "structural_ablation_functional": float(str_func[layer, head]),
+                    "semantic_ablation_functional_norm": float(sem_func_norm[layer, head]),
+                    "structural_ablation_functional_norm": float(str_func_norm[layer, head]),
+                    "ablation_joint_impact": float(impact_joint[layer, head]),
+                    "ablation_role_selectivity": float(impact_selectivity[layer, head]),
                     "semantic_ablation_loss": float(sem_loss[layer, head]),
                     "structural_ablation_loss": float(str_loss[layer, head]),
                     "semantic_rescue_mem": float(sem_rescue[layer, head]),
                     "structural_rescue_mem": float(str_rescue[layer, head]),
+                    "rescue_joint_mem": float(0.5 * (sem_rescue[layer, head] + str_rescue[layer, head])),
+                    "rescue_role_contrast": float(sem_rescue[layer, head] - str_rescue[layer, head]),
                 })
     return rows
 
@@ -1525,6 +1653,284 @@ def figure_score_ablation(rows: Sequence[Mapping[str, Any]], cfg: Config, figure
     )
     fig.tight_layout(rect=(0, 0.10, 1, 0.84))
     return save_figure(fig, figures_dir / "fig2_score_ablation"), summary
+
+
+def correlation_by_seed(
+    rows: Sequence[Mapping[str, Any]],
+    x_key: str,
+    y_key: str,
+    *,
+    reliable_only: bool = False,
+) -> dict[str, Any]:
+    selected = [
+        row for row in rows
+        if not reliable_only or bool(row["selectivity_reliable"])
+    ]
+    per_seed: dict[str, float] = {}
+    for seed in sorted({int(row["seed"]) for row in selected}):
+        cell = [row for row in selected if int(row["seed"]) == seed]
+        per_seed[str(seed)] = correlation(
+            [float(row[x_key]) for row in cell],
+            [float(row[y_key]) for row in cell],
+        )
+    finite = np.asarray([value for value in per_seed.values() if np.isfinite(value)], dtype=float)
+    return {
+        "pooled_spearman": correlation(
+            [float(row[x_key]) for row in selected],
+            [float(row[y_key]) for row in selected],
+        ),
+        "seed_median_spearman": float(np.median(finite)) if len(finite) else float("nan"),
+        "seed_range_spearman": (
+            [float(finite.min()), float(finite.max())]
+            if len(finite) else [float("nan"), float("nan")]
+        ),
+        "per_seed": per_seed,
+        "heads": len(selected),
+        "reliable_only": bool(reliable_only),
+    }
+
+
+def dj_quadrant_rows(rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    output = []
+    fields = (
+        "joint_score_J",
+        "selectivity_D",
+        "ablation_joint_impact",
+        "ablation_role_selectivity",
+        "semantic_ablation_functional_norm",
+        "structural_ablation_functional_norm",
+        "semantic_rescue_mem",
+        "structural_rescue_mem",
+        "rescue_role_contrast",
+    )
+    order = ("semantic specialist", "high-J generalist", "structural specialist", "low-J / inert")
+    for seed in sorted({int(row["seed"]) for row in rows}):
+        for category in order:
+            selected = [
+                row for row in rows
+                if int(row["seed"]) == seed and row["DJ_class"] == category
+            ]
+            record: dict[str, Any] = {
+                "seed": seed,
+                "DJ_class": category,
+                "heads": len(selected),
+            }
+            for field in fields:
+                record[field] = (
+                    finite_mean([float(row[field]) for row in selected])
+                    if selected else float("nan")
+                )
+            output.append(record)
+    return output
+
+
+def _dj_scatter(
+    ax: Any,
+    rows: Sequence[Mapping[str, Any]],
+    cfg: Config,
+    x_key: str,
+    y_key: str,
+    *,
+    reliable_only: bool = False,
+) -> None:
+    colors = layer_palette(cfg.layers)
+    markers = ["o", "s", "^", "D", "P"]
+    seeds = sorted({int(row["seed"]) for row in rows})
+    for row in rows:
+        reliable = bool(row["selectivity_reliable"])
+        if reliable_only and not reliable:
+            continue
+        seed_index = seeds.index(int(row["seed"]))
+        ax.scatter(
+            float(row[x_key]),
+            float(row[y_key]),
+            s=48,
+            marker=markers[seed_index % len(markers)],
+            color=colors[int(row["layer"])],
+            alpha=0.82 if reliable else 0.16,
+            edgecolor="white" if reliable else "none",
+            linewidth=0.5,
+            zorder=3,
+        )
+
+
+def figure_joint_selectivity(
+    rows: Sequence[Mapping[str, Any]], cfg: Config, figures_dir: Path
+) -> tuple[list[str], dict[str, Any], list[dict[str, Any]]]:
+    plt = configure_matplotlib()
+    fig, axes = plt.subplots(2, 3, figsize=(15.4, 9.0))
+    summary: dict[str, Any] = {
+        "score_calibration": "each channel divided by its within-seed head mean",
+        "J_formula": "0.5 * (semantic_score_norm + structural_score_norm)",
+        "D_formula": "(semantic_score_norm - structural_score_norm) / (semantic_score_norm + structural_score_norm)",
+        "J_reliability_floor": DJ_RELIABILITY_FLOOR,
+        "D_specialist_threshold": DJ_SELECTIVITY_THRESHOLD,
+    }
+
+    # A: interpretable rotation of the original score plane.
+    ax = axes[0, 0]
+    _dj_scatter(ax, rows, cfg, "selectivity_D", "joint_score_J")
+    ax.axvspan(-DJ_SELECTIVITY_THRESHOLD, DJ_SELECTIVITY_THRESHOLD, color="#eeeeee", alpha=0.65, zorder=0)
+    ax.axvline(0.0, color="#777777", linewidth=0.8)
+    ax.axhline(DJ_RELIABILITY_FLOOR, color="#777777", linestyle="--", linewidth=0.9)
+    ax.set_yscale("log")
+    ax.set_xlim(-1.04, 1.04)
+    ax.set_xlabel(r"Selectivity $D_{rel}$  (structural $\leftarrow$ 0 $\rightarrow$ semantic)")
+    ax.set_ylabel(r"Joint sensitivity $J$")
+    ax.set_title("A  Strength and factor preference", loc="left", fontweight="bold")
+
+    # B: J should explain task-general causal influence.
+    ax = axes[0, 1]
+    _dj_scatter(ax, rows, cfg, "joint_score_J", "ablation_joint_impact")
+    joint_stats = correlation_by_seed(rows, "joint_score_J", "ablation_joint_impact")
+    summary["J_vs_joint_ablation"] = joint_stats
+    ax.set_xscale("log")
+    ax.set_yscale("log")
+    ax.set_xlabel(r"Joint sensitivity $J$")
+    ax.set_ylabel("Mean cross-task functional ablation impact")
+    ax.set_title("B  Does $J$ predict how much a head matters?", loc="left", fontweight="bold")
+    ax.text(
+        0.04, 0.96,
+        f"pooled $\\rho={joint_stats['pooled_spearman']:.2f}$\n"
+        f"seed median $\\rho={joint_stats['seed_median_spearman']:.2f}$",
+        transform=ax.transAxes, va="top",
+    )
+
+    # C: D is useful only if it predicts which task is affected, not merely score geometry.
+    ax = axes[0, 2]
+    _dj_scatter(ax, rows, cfg, "selectivity_D", "ablation_role_selectivity", reliable_only=True)
+    role_stats = correlation_by_seed(
+        rows, "selectivity_D", "ablation_role_selectivity", reliable_only=True
+    )
+    summary["D_vs_ablation_role"] = role_stats
+    ax.axhline(0.0, color="#777777", linewidth=0.8)
+    ax.axvline(0.0, color="#777777", linewidth=0.8)
+    ax.set_xlim(-1.04, 1.04)
+    ax.set_ylim(-1.04, 1.04)
+    ax.set_xlabel(r"Score selectivity $D_{rel}$")
+    ax.set_ylabel("Ablation role contrast")
+    ax.set_title("C  Does $D$ predict which task a head serves?", loc="left", fontweight="bold")
+    ax.text(
+        0.04, 0.96,
+        f"reliable heads only\npooled $\\rho={role_stats['pooled_spearman']:.2f}$\n"
+        f"seed median $\\rho={role_stats['seed_median_spearman']:.2f}$",
+        transform=ax.transAxes, va="top",
+    )
+
+    # D: show whether the strongest heads are specialists or generalists.
+    ax = axes[1, 0]
+    _dj_scatter(ax, rows, cfg, "joint_score_J", "absolute_selectivity")
+    strength_selectivity = correlation_by_seed(
+        rows, "joint_score_J", "absolute_selectivity", reliable_only=True
+    )
+    summary["J_vs_absolute_D"] = strength_selectivity
+    ax.axhline(DJ_SELECTIVITY_THRESHOLD, color="#777777", linestyle="--", linewidth=0.9)
+    ax.axvline(DJ_RELIABILITY_FLOOR, color="#777777", linestyle="--", linewidth=0.9)
+    ax.set_xscale("log")
+    ax.set_xlim(left=max(min(float(row["joint_score_J"]) for row in rows) * 0.8, 1.0e-3))
+    ax.set_ylim(-0.03, 1.03)
+    ax.set_xlabel(r"Joint sensitivity $J$")
+    ax.set_ylabel(r"Absolute preference $|D_{rel}|$")
+    ax.set_title("D  Are influential heads specialists?", loc="left", fontweight="bold")
+    ax.text(
+        0.04, 0.96,
+        f"reliable-head $\\rho={strength_selectivity['pooled_spearman']:.2f}$",
+        transform=ax.transAxes, va="top",
+    )
+
+    # E: depth profiles, using the training seed rather than heads as the uncertainty unit.
+    ax = axes[1, 1]
+    twin = ax.twinx()
+    layer_j, layer_d, layer_j_err, layer_d_err = [], [], [], []
+    seeds = sorted({int(row["seed"]) for row in rows})
+    for layer in range(cfg.layers):
+        j_seed = [
+            finite_mean([
+                float(row["joint_score_J"]) for row in rows
+                if int(row["seed"]) == seed and int(row["layer"]) == layer
+            ]) for seed in seeds
+        ]
+        d_seed = [
+            finite_mean([
+                float(row["selectivity_D"]) for row in rows
+                if int(row["seed"]) == seed and int(row["layer"]) == layer
+                and bool(row["selectivity_reliable"])
+            ]) for seed in seeds
+        ]
+        layer_j.append(finite_mean(j_seed))
+        layer_d.append(finite_mean(d_seed))
+        layer_j_err.append(float(np.nanstd(j_seed, ddof=1) / math.sqrt(len(seeds)) * 1.96) if len(seeds) > 1 else 0.0)
+        layer_d_err.append(float(np.nanstd(d_seed, ddof=1) / math.sqrt(len(seeds)) * 1.96) if len(seeds) > 1 else 0.0)
+    x_layer = np.arange(cfg.layers)
+    ax.errorbar(x_layer, layer_j, yerr=layer_j_err, color="#54278f", marker="o", linewidth=2.0, capsize=3, label="$J$")
+    twin.errorbar(x_layer, layer_d, yerr=layer_d_err, color="#238b45", marker="s", linewidth=2.0, capsize=3, label="$D$")
+    twin.axhline(0.0, color="#777777", linewidth=0.8)
+    ax.set_xticks(x_layer)
+    ax.set_xlabel("Layer")
+    ax.set_ylabel(r"Mean joint sensitivity $J$", color="#54278f")
+    twin.set_ylabel(r"Mean reliable-head selectivity $D_{rel}$", color="#238b45")
+    ax.set_title("E  Does preference emerge with depth?", loc="left", fontweight="bold")
+    handles_a, labels_a = ax.get_legend_handles_labels()
+    handles_b, labels_b = twin.get_legend_handles_labels()
+    ax.legend(handles_a + handles_b, labels_a + labels_b, frameon=False, loc="best")
+    summary["layer_profiles"] = {
+        "J_mean": layer_j, "J_ci95": layer_j_err,
+        "D_mean_reliable": layer_d, "D_ci95": layer_d_err,
+    }
+
+    # F: an independent intervention-patching check of the same signed role prediction.
+    ax = axes[1, 2]
+    _dj_scatter(ax, rows, cfg, "selectivity_D", "rescue_role_contrast", reliable_only=True)
+    rescue_stats = correlation_by_seed(
+        rows, "selectivity_D", "rescue_role_contrast", reliable_only=True
+    )
+    summary["D_vs_rescue_role"] = rescue_stats
+    ax.axhline(0.0, color="#777777", linewidth=0.8)
+    ax.axvline(0.0, color="#777777", linewidth=0.8)
+    ax.set_xlim(-1.04, 1.04)
+    ax.set_xlabel(r"Score selectivity $D_{rel}$")
+    ax.set_ylabel("Semantic − structural rescue mediation")
+    ax.set_title("F  Does $D$ predict causal rescue role?", loc="left", fontweight="bold")
+    ax.text(
+        0.04, 0.96,
+        f"reliable heads only\npooled $\\rho={rescue_stats['pooled_spearman']:.2f}$\n"
+        f"seed median $\\rho={rescue_stats['seed_median_spearman']:.2f}$",
+        transform=ax.transAxes, va="top",
+    )
+
+    for index, ax in enumerate(axes.ravel()):
+        ax.grid(True, which="both", linewidth=0.5, alpha=0.20)
+    from matplotlib.lines import Line2D
+
+    colors = layer_palette(cfg.layers)
+    markers = ["o", "s", "^", "D", "P"]
+    layer_handles = [
+        Line2D([0], [0], marker="o", color="none", markerfacecolor=colors[layer], markeredgecolor="none", label=f"Layer {layer}")
+        for layer in range(cfg.layers)
+    ]
+    seed_handles = [
+        Line2D([0], [0], marker=markers[index % len(markers)], color="#555555", linestyle="none", markerfacecolor="none", label=f"Seed {seed}")
+        for index, seed in enumerate(seeds)
+    ]
+    fig.legend(
+        layer_handles + seed_handles,
+        [handle.get_label() for handle in layer_handles + seed_handles],
+        frameon=False, loc="lower center", ncol=len(layer_handles) + len(seed_handles),
+        bbox_to_anchor=(0.5, 0.004),
+    )
+    fig.suptitle(
+        "Joint influence and semantic–structural role separate head strength from preference",
+        x=0.045, y=0.995, ha="left", fontsize=15, fontweight="bold",
+    )
+    fig.text(
+        0.045, 0.958,
+        "Scores and functional ablations are channel-mean calibrated within seed; faded heads have J < 0.5 and do not support selectivity claims.",
+        fontsize=9, color="#555555",
+    )
+    fig.tight_layout(rect=(0, 0.065, 1, 0.925), h_pad=2.2, w_pad=2.0)
+    quadrant_rows = dj_quadrant_rows(rows)
+    summary["quadrants_by_seed"] = quadrant_rows
+    return save_figure(fig, figures_dir / "fig5_joint_influence_selectivity"), summary, quadrant_rows
 
 
 def draw_heatmap(ax: Any, matrix: np.ndarray, row_labels: Sequence[str], col_labels: Sequence[str], title: str, cmap: str, center: float | None = None) -> None:
@@ -1776,6 +2182,99 @@ def figure_iterative_family_ablation(
     return save_figure(fig, figures_dir / "fig4_iterative_family_ablation"), summary
 
 
+def dj_family_ablation_values(results: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    family_names = (
+        "semantic_specialist",
+        "structural_specialist",
+        "high_J_generalist",
+        "low_J_inert",
+    )
+    values: dict[str, Any] = {}
+    for result in results:
+        if result.get("dj_family_ablation", {}).get("revision") != DJ_FAMILY_ABLATION_REVISION:
+            raise RuntimeError(
+                "J/D family-ablation cache is missing; run --phase analyze once before figures"
+            )
+    for task_name in ("semantic", "structural"):
+        values[task_name] = {}
+        for family_name in family_names:
+            functional, loss, accuracy, orders = [], [], [], []
+            for result in results:
+                family = result["dj_family_ablation"]["tasks"][task_name]["families"][family_name]
+                functional.append(np.asarray(family["functional"], dtype=float).mean(axis=-1))
+                loss.append(np.asarray(family["loss"], dtype=float).mean(axis=-1))
+                accuracy.append(np.asarray(family["accuracy_drop"], dtype=float).mean(axis=-1))
+                orders.append(family["head_order"])
+            values[task_name][family_name] = {
+                "functional_by_seed": np.stack(functional),
+                "loss_by_seed": np.stack(loss),
+                "accuracy_drop_by_seed": np.stack(accuracy),
+                "head_orders": orders,
+            }
+    return values
+
+
+def figure_dj_family_ablation(
+    results: Sequence[dict[str, Any]], cfg: Config, figures_dir: Path
+) -> tuple[list[str], dict[str, Any]]:
+    plt = configure_matplotlib()
+    values = dj_family_ablation_values(results)
+    fig, axes = plt.subplots(2, 2, figsize=(12.5, 8.8), sharex=True)
+    styles = {
+        "semantic_specialist": ("#cb181d", "Semantic specialists"),
+        "structural_specialist": ("#2171b5", "Structural specialists"),
+        "high_J_generalist": ("#6a51a3", "High-J generalists"),
+        "low_J_inert": ("#969696", "Low-J / inert"),
+    }
+    metrics = (
+        ("functional_by_seed", "Functional logit impact", 1.0),
+        ("accuracy_drop_by_seed", "Accuracy drop (percentage points)", 100.0),
+    )
+    max_prefix = 0
+    for col, task_name in enumerate(("semantic", "structural")):
+        for row_index, (metric, ylabel, scale) in enumerate(metrics):
+            ax = axes[row_index, col]
+            for family_name, (color, label) in styles.items():
+                curves = np.asarray(values[task_name][family_name][metric], dtype=float) * scale
+                x = np.arange(curves.shape[1])
+                max_prefix = max(max_prefix, int(x[-1]))
+                for curve in curves:
+                    ax.plot(x, curve, color=color, alpha=0.18, linewidth=1.0)
+                mean = np.nanmean(curves, axis=0)
+                error = (
+                    np.nanstd(curves, axis=0, ddof=1) / math.sqrt(curves.shape[0]) * 1.96
+                    if curves.shape[0] > 1 else np.zeros_like(mean)
+                )
+                ax.plot(x, mean, color=color, marker="o", linewidth=2.3, markersize=4.5, label=label)
+                ax.fill_between(x, mean - error, mean + error, color=color, alpha=0.10, linewidth=0)
+            ax.axhline(0.0, color="#777777", linewidth=0.8)
+            ax.grid(True, linewidth=0.5, alpha=0.20)
+            if col == 0:
+                ax.set_ylabel(ylabel)
+            if row_index == 0:
+                ax.set_title(
+                    f"{chr(65 + col)}  {task_name.capitalize()} task",
+                    loc="left", fontweight="bold",
+                )
+            if row_index == 1:
+                ax.set_xlabel("Number of fixed score-selected heads jointly ablated")
+    for ax in axes.ravel():
+        ax.set_xticks(np.arange(max_prefix + 1))
+    handles, labels = axes[0, 0].get_legend_handles_labels()
+    fig.legend(handles, labels, frameon=False, loc="lower center", ncol=4, bbox_to_anchor=(0.5, 0.005))
+    fig.suptitle(
+        "Joint ablation tests the causal roles of specialists, generalists, and inert heads",
+        x=0.055, y=0.99, ha="left", fontsize=15, fontweight="bold",
+    )
+    fig.text(
+        0.055, 0.945,
+        "Families are selected from J and D only; thin curves are training seeds and bands are seed-level 95% intervals.",
+        fontsize=9, color="#555555",
+    )
+    fig.tight_layout(rect=(0, 0.065, 1, 0.91), h_pad=2.0, w_pad=2.0)
+    return save_figure(fig, figures_dir / "fig6_joint_selectivity_family_ablation"), values
+
+
 def create_outputs(results: Sequence[dict[str, Any]], cfg: Config, run_dir: Path) -> dict[str, Any]:
     figures_dir = run_dir / "figures"
     tables_dir = run_dir / "tables"
@@ -1785,6 +2284,11 @@ def create_outputs(results: Sequence[dict[str, Any]], cfg: Config, run_dir: Path
     fig2, correlations = figure_score_ablation(head_rows, cfg, figures_dir)
     fig3, dissociation = figure_double_dissociation(results, cfg, figures_dir)
     fig4, iterative_ablation = figure_iterative_family_ablation(results, cfg, figures_dir)
+    fig5, joint_selectivity_summary, quadrant_rows = figure_joint_selectivity(
+        head_rows, cfg, figures_dir
+    )
+    write_csv(tables_dir / "joint_selectivity_quadrants.csv", quadrant_rows)
+    fig6, dj_family_ablation = figure_dj_family_ablation(results, cfg, figures_dir)
 
     seed_summaries = []
     for result in results:
@@ -1811,8 +2315,10 @@ def create_outputs(results: Sequence[dict[str, Any]], cfg: Config, run_dir: Path
         "rescue_interaction_by_seed": dissociation["rescue_interaction"],
         "selected_heads": dissociation["selected_heads"],
         "iterative_family_ablation": iterative_ablation,
+        "joint_influence_selectivity": joint_selectivity_summary,
+        "joint_selectivity_family_ablation": dj_family_ablation,
         "seeds": seed_summaries,
-        "figures": fig1 + fig2 + fig3 + fig4,
+        "figures": fig1 + fig2 + fig3 + fig4 + fig5 + fig6,
     }
     write_json(run_dir / "summary.json", summary)
     write_json(tables_dir / "selected_heads.json", {"selected_heads": dissociation["selected_heads"]})

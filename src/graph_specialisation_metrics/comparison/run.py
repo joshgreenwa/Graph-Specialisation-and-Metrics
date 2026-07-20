@@ -14,6 +14,7 @@ deliverables from that cache:
 * (i)   the cache itself -- per-model carriage summaries (F/B curves), carriage pair npz, and
         per-head specialisation score matrices -- plus a consolidated ``comparison`` manifest;
 * (ii)  ``fig_spec_scatter_grid.png``          -- side-by-side S_str-vs-S_sem scatter per model;
+* (ii-b)``fig_spec_DJ_grid.png``               -- selectivity D vs joint-strength J per model;
 * (iii) ``fig_carriage_smallmult_<intv>.png``  -- functional/beneficial carriage per model,
         standardised (reference-fixed) y-axis;
 * (iv)  ``fig_carriage_overlay_<intv>.png``    -- functional/beneficial carriage overlaid across
@@ -100,6 +101,64 @@ def performance_table(tasks: Sequence[str] = _data.DEFAULT_TASKS, *,
 
 
 # --------------------------------------------------------------------------------------
+# diagnostic: what is on Drive for each model (checkpoint found? which caches exist?)
+# --------------------------------------------------------------------------------------
+
+def inventory(tasks: Sequence[str] = _data.DEFAULT_TASKS, *,
+              carriage_collate: str = CARRIAGE_COLLATE,
+              spec_collate: str = SPEC_COLLATE,
+              structural_mode: str = "transposition",
+              check_ckpt: bool = True, mount: bool = False) -> dict:
+    """Per-model cache/checkpoint status, so a missing figure method is easy to diagnose.
+
+    For each task reports whether a checkpoint is discoverable (honouring a pinned path, else
+    auto-discovery under the task's ``drive_dir``) and whether the semantic-carriage,
+    structural-carriage, and specialisation-score caches exist (with val/test where present).
+    A method absent from a figure is missing its cache -- this shows if that is because the
+    checkpoint was not found (so compute failed) or because compute was never run.
+    """
+    if mount:
+        _mount_drive()
+
+    def _valtest(summary):
+        m = (summary or {}).get("meta", {})
+        return m.get("val_metric"), m.get("test_metric")
+
+    rows: dict = {}
+    log(f"{'model':<18} {'ckpt':<7} {'sem(F/B)':<9} {'struct':<7} {'scores':<7} {'val/test'}")
+    for t in tasks:
+        sem = _data.load_carriage_summary(_data.carriage_summary_path(carriage_collate, t, "semantic"))
+        strc = _data.load_carriage_summary(
+            _data.carriage_summary_path(carriage_collate, t, "structural", structural_mode))
+        scores = _data.scores_npz_path(spec_collate, t).exists()
+        sem_val, sem_test = _valtest(sem)
+
+        ckpt_status = "-"
+        if check_ckpt:
+            pinned = DEFAULT_CKPTS.get(t)
+            if pinned and Path(pinned).exists():
+                ckpt_status = "pinned"
+            else:
+                try:
+                    from ..carriage.tasks import get_task
+                    spec = get_task(t)
+                    p, _ = env.find_checkpoint(Path(spec.drive_dir) / "results", None)
+                    ckpt_status = "found" if p else "MISSING"
+                except Exception:  # noqa: BLE001
+                    ckpt_status = "MISSING"
+
+        vt = (f"{sem_val:.3f}/{sem_test:.3f}"
+              if (sem_val is not None and sem_test is not None) else
+              (f"-/{sem_test:.3f}" if sem_test is not None else "-"))
+        rows[t] = {"ckpt": ckpt_status, "carriage_semantic": bool(sem),
+                   "carriage_structural": bool(strc), "scores": bool(scores),
+                   "val_metric": sem_val, "test_metric": sem_test}
+        log(f"{t:<18} {ckpt_status:<7} {('yes' if sem else 'no'):<9} "
+            f"{('yes' if strc else 'no'):<7} {('yes' if scores else 'no'):<7} {vt}")
+    return rows
+
+
+# --------------------------------------------------------------------------------------
 # figure builder (pure cache -> figures; re-run this to restyle/subset without recompute)
 # --------------------------------------------------------------------------------------
 
@@ -141,6 +200,13 @@ def build_figures(tasks: Sequence[str] = _data.DEFAULT_TASKS, *,
                 scores_ref, shown_scores, out_dir / "fig_spec_scatter_grid.png",
                 gsem=gsem, gstr=gstr, metrics_by_task=metrics)
             figs["spec_scatter_grid"] = p
+            made.append(fig)
+            # (ii-b) selectivity D (x) vs joint strength J (y), same norms + reference-fixed plane
+            fig, p = _plots.plot_spec_DJ_grid(
+                scores_ref, shown_scores, out_dir / "fig_spec_DJ_grid.png",
+                gsem=gsem, gstr=gstr, metrics_by_task=metrics,
+                ref_tasks=list(scores_ref.keys()))
+            figs["spec_DJ_grid"] = p
             made.append(fig)
     else:
         log("[figures] no specialisation score caches found; skipping the scatter grid.")
@@ -282,9 +348,16 @@ def run_all(tasks: Sequence[str] = _data.DEFAULT_TASKS, *,
             summary = _data.carriage_summary_path(carriage_collate, task, intv, structural_mode)
             key = f"{task}:{intv}"
             if summary.exists() and not force:
-                log(f"[cache] carriage {key}: reuse {summary}")
-                status["carriage"][key] = "cached"
-                continue
+                # Reuse only if the cached summary already carries the val/test metrics. A summary
+                # written before val was added lacks val_metric; recompute it so the performance
+                # plot gets val (cheap relative to carriage, and self-healing without force=True).
+                cached = _data.load_carriage_summary(summary)
+                if (cached or {}).get("meta", {}).get("val_metric") is not None:
+                    log(f"[cache] carriage {key}: reuse {summary}")
+                    status["carriage"][key] = "cached"
+                    continue
+                log(f"[cache] carriage {key}: cached summary lacks val_metric; recomputing to "
+                    f"backfill val/test.")
             log(f"[run] carriage {key} ...")
             car_kw = dict(
                 task=task, intervention=intv, ckpt=_resolve_ckpt(task),
@@ -309,18 +382,20 @@ def run_all(tasks: Sequence[str] = _data.DEFAULT_TASKS, *,
                 status["errors"].append(f"carriage {key}: {exc}")
 
     # ---- specialisation scores (scores-only; ablation/attention not needed here) --------
+    # PER-MODEL, isolated: run spec_run one task at a time so a single bad/missing checkpoint
+    # (e.g. a VNode variant) cannot abort scoring for the other models and drop them all from
+    # the scatter grid. spec_run re-clones/re-imports its GRIT per task anyway, so this adds no
+    # extra setup relative to the batched call.
     if run_specialisation:
-        missing = [t for t in tasks
-                   if force or not _data.scores_npz_path(spec_collate, t).exists()]
         for t in tasks:
-            status["specialisation"][t] = ("cached"
-                                           if _data.scores_npz_path(spec_collate, t).exists()
-                                           and t not in missing else "pending")
-        if missing:
-            log(f"[run] specialisation scores for: {missing}")
-            spec_ckpts = {t: _resolve_ckpt(t) for t in missing if _resolve_ckpt(t)}
+            if not force and _data.scores_npz_path(spec_collate, t).exists():
+                log(f"[cache] specialisation {t}: reuse {_data.scores_npz_path(spec_collate, t)}")
+                status["specialisation"][t] = "cached"
+                continue
+            log(f"[run] specialisation scores for {t} ...")
+            ck = _resolve_ckpt(t)
             spec_kw = dict(
-                tasks=missing, ckpt=(spec_ckpts or None), collate_dir=spec_collate,
+                tasks=[t], ckpt=({t: ck} if ck else None), collate_dir=spec_collate,
                 num_graphs=spec_num_graphs, donors=spec_donors,
                 with_attn_routing=with_attn_routing,
                 with_ablation=False, with_attention=False,
@@ -330,15 +405,13 @@ def run_all(tasks: Sequence[str] = _data.DEFAULT_TASKS, *,
                 spec_kw.update(spec_kwargs)              # caller overrides any specialisation option
             try:
                 spec_run(**spec_kw)
-                for t in missing:
-                    status["specialisation"][t] = (
-                        "computed" if _data.scores_npz_path(spec_collate, t).exists()
-                        else "missing-after-run")
+                status["specialisation"][t] = (
+                    "computed" if _data.scores_npz_path(spec_collate, t).exists()
+                    else "missing-after-run")
             except Exception as exc:  # noqa: BLE001
-                log(f"[error] specialisation: {exc}")
-                status["errors"].append(f"specialisation: {exc}")
-        else:
-            log("[cache] all specialisation score caches present; skipping.")
+                log(f"[error] specialisation {t}: {exc}")
+                status["specialisation"][t] = f"error: {exc}"
+                status["errors"].append(f"specialisation {t}: {exc}")
 
     # ---- deliverables from cache -------------------------------------------------------
     figs = build_figures(

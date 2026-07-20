@@ -29,6 +29,7 @@ outputs/
 runs/
 wandb/
 experiments/**/results/
+nope_specialisation_cache/
 
 # Keep documentation placeholders
 !checkpoints/**/README.md

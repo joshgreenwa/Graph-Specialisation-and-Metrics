@@ -4,6 +4,7 @@ import importlib.util
 import sys
 from pathlib import Path
 
+import numpy as np
 import torch
 from torch import nn
 
@@ -117,6 +118,30 @@ def test_no_op_replicas_are_identical_and_head_groups_are_disjoint():
     assert len(groups["semantic"]) == 2
     assert len(groups["structural"]) == 2
     assert set(groups["semantic"]).isdisjoint(groups["structural"])
+    dj_groups = module.select_dj_groups(semantic, structural, size=2)
+    flattened = [head for group in dj_groups.values() for head in group]
+    assert set(dj_groups) == {
+        "semantic_specialist",
+        "structural_specialist",
+        "high_J_generalist",
+        "low_J_inert",
+    }
+    assert len(flattened) == len(set(flattened)) == 8
+
+
+def test_joint_strength_and_selectivity_separate_amplitude_from_role():
+    module = _load_module()
+    semantic = np.asarray([2.0, 0.0, 1.0, 0.02])
+    structural = np.asarray([0.0, 2.0, 1.0, 0.01])
+    joint, selectivity = module.joint_selectivity(semantic, structural)
+    assert np.allclose(joint[:3], [1.0, 1.0, 1.0])
+    assert np.allclose(selectivity[:3], [1.0, -1.0, 0.0])
+    # An apparently semantic tiny-score ratio is explicitly classified as unreliable/inert.
+    assert selectivity[3] > 0.0
+    assert module.dj_class(joint[3], selectivity[3]) == "low-J / inert"
+    assert module.dj_class(1.0, 0.3) == "semantic specialist"
+    assert module.dj_class(1.0, -0.3) == "structural specialist"
+    assert module.dj_class(1.0, 0.0) == "high-J generalist"
 
 
 def test_score_ablation_and_rescue_hooks_with_mock_head_model():
@@ -219,3 +244,21 @@ def test_score_ablation_and_rescue_hooks_with_mock_head_model():
     curves = module.iterative_family_ablation_values([{"family_ablation": family}])
     assert curves["semantic"]["semantic"]["loss_by_seed"].shape == (1, 3)
     assert curves["structural"]["structural"]["accuracy_drop_by_seed"].shape == (1, 3)
+
+    dj_groups = {
+        "semantic_specialist": [(0, 0)],
+        "structural_specialist": [(0, 1)],
+        "high_J_generalist": [(1, 0)],
+        "low_J_inert": [(1, 1)],
+    }
+    dj_family = module.family_ablation_sweep(
+        model,
+        cfg,
+        groups=dj_groups,
+        seed=106,
+        device=torch.device("cpu"),
+        revision=module.DJ_FAMILY_ABLATION_REVISION,
+    )
+    dj_values = module.dj_family_ablation_values([{"dj_family_ablation": dj_family}])
+    assert dj_values["semantic"]["high_J_generalist"]["functional_by_seed"].shape == (1, 2)
+    assert dj_values["structural"]["low_J_inert"]["accuracy_drop_by_seed"].shape == (1, 2)
