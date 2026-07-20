@@ -56,6 +56,10 @@ def _perturb_mask_frozen(base, u: int, v: int):
     pert.edge_index = base.edge_index                         # freeze the mask/wiring
     if getattr(base, "edge_attr", None) is not None:
         pert.edge_attr = base.edge_attr                      # bonds unchanged (perturb left values intact); realign
+    if getattr(base, "rrwp_local_edge_index", None) is not None:
+        # The strictly-local variant reads its mask from this preserved molecular support,
+        # rather than from edge_index. It is architecture/wiring, not RRWP payload.
+        pert.rrwp_local_edge_index = base.rrwp_local_edge_index
     return pert
 
 
@@ -115,7 +119,8 @@ def _build_donor_pool(model: GritHeadModel):
 
 
 def score_model(task, sc: SpecConfig, *, with_attn_routing: bool = True,
-                max_sources: int | None = None, seed: int = 0) -> dict:
+                max_sources: int | None = None, seed: int = 0,
+                response_observer=None) -> dict:
     """Return per-head {S_sem, S_str, S_attn_sem} [L,H] for one loaded GRIT checkpoint + diagnostics."""
     import torch
     from torch_geometric.data import Batch
@@ -266,6 +271,13 @@ def score_model(task, sc: SpecConfig, *, with_attn_routing: bool = True,
             if graph_attn:
                 da = (dAbar[l] / K).abs().sum(dim=1)             # [S, H]  sum_e |Dbar-a|
                 S_attn[l] += da.sum(0).cpu().numpy()
+        if response_observer is not None:
+            response_observer(
+                channel="semantic", graph_id=int(gi), base=base,
+                source_nodes=np.asarray(sources, dtype=np.int64),
+                phi_stack=phi_stack, donor_averaged_delta=[x / K for x in dObar],
+                clean_prediction=pred_c.detach(),
+            )
         tot_sem_sources += S
         if graph_attn:
             tot_attn_sources += S
@@ -286,6 +298,9 @@ def score_model(task, sc: SpecConfig, *, with_attn_routing: bool = True,
             raw = structural.perturb(base, 0, 1, "transposition")
             assert torch.equal(mf.edge_index, base.edge_index), \
                 "structural intervention changed the attention mask (edge_index must be frozen)"
+            if getattr(base, "rrwp_local_edge_index", None) is not None:
+                assert torch.equal(mf.rrwp_local_edge_index, base.rrwp_local_edge_index), \
+                    "structural intervention changed rrwp_local_edge_index (mask must be frozen)"
             if not torch.equal(raw.edge_index, base.edge_index):
                 mask_frozen_ok = True   # the freeze is doing real work on this graph
 
@@ -334,6 +349,13 @@ def score_model(task, sc: SpecConfig, *, with_attn_routing: bool = True,
 
         for l in range(L):
             S_str[l] += _funcmag_contrib(phi_stack[l], dObar[l] / K).cpu().numpy()
+        if response_observer is not None:
+            response_observer(
+                channel="structural", graph_id=int(gi), base=base,
+                source_nodes=np.asarray(sources, dtype=np.int64),
+                phi_stack=phi_stack, donor_averaged_delta=[x / K for x in dObar],
+                clean_prediction=pred_c.detach(),
+            )
         tot_str_anchors += S
 
         if device.type == "cuda":

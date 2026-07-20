@@ -1555,14 +1555,19 @@ def double_dissociation_values(results: Sequence[dict[str, Any]]) -> dict[str, A
         groups = result["selected_groups"]
         sem_heads = [tuple(item) for item in groups["semantic"]]
         str_heads = [tuple(item) for item in groups["structural"]]
+        if result.get("family_ablation", {}).get("revision") != FAMILY_ABLATION_REVISION:
+            raise RuntimeError(
+                "family-ablation cache is missing; run --phase analyze once before regenerating figures"
+            )
+        family_tasks = result["family_ablation"]["tasks"]
         necessity = np.asarray([
             [
-                group_metric(result["ablation_semantic"]["loss"], sem_heads),
-                group_metric(result["ablation_structural"]["loss"], sem_heads),
+                finite_mean(family_tasks["semantic"]["families"]["semantic"]["loss"][-1]),
+                finite_mean(family_tasks["structural"]["families"]["semantic"]["loss"][-1]),
             ],
             [
-                group_metric(result["ablation_semantic"]["loss"], str_heads),
-                group_metric(result["ablation_structural"]["loss"], str_heads),
+                finite_mean(family_tasks["semantic"]["families"]["structural"]["loss"][-1]),
+                finite_mean(family_tasks["structural"]["families"]["structural"]["loss"][-1]),
             ],
         ])
         rescue = np.asarray([
@@ -1643,7 +1648,7 @@ def figure_double_dissociation(results: Sequence[dict[str, Any]], cfg: Config, f
         values["necessity_mean"],
         rows,
         ["Semantic task", "Structural task"],
-        "A  Necessity: Δ cross-entropy under ablation",
+        "A  Necessity: ΔCE under simultaneous family ablation",
         "Purples",
         center=0.0,
     )
@@ -1667,12 +1672,108 @@ def figure_double_dissociation(results: Sequence[dict[str, Any]], cfg: Config, f
     fig.text(
         0.055,
         0.945,
-        "Head families are selected from intervention scores only; rescue patches the clean routed head value into the corrupted run.",
+        "Necessity jointly ablates each selected family; rescue patches one clean routed head at a time into the corrupted run.",
         fontsize=9,
         color="#555555",
     )
     fig.tight_layout(rect=(0, 0, 1, 0.92), h_pad=2.5, w_pad=2.0)
     return save_figure(fig, figures_dir / "fig3_necessity_rescue_double_dissociation"), values
+
+
+def iterative_family_ablation_values(results: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    values: dict[str, Any] = {}
+    for task_name in ("semantic", "structural"):
+        values[task_name] = {}
+        for family_name in ("semantic", "structural"):
+            loss_curves = []
+            accuracy_curves = []
+            functional_curves = []
+            head_orders = []
+            for result in results:
+                family = result["family_ablation"]["tasks"][task_name]["families"][family_name]
+                loss_curves.append(np.asarray(family["loss"], dtype=float).mean(axis=-1))
+                accuracy_curves.append(np.asarray(family["accuracy_drop"], dtype=float).mean(axis=-1))
+                functional_curves.append(np.asarray(family["functional"], dtype=float).mean(axis=-1))
+                head_orders.append(family["head_order"])
+            values[task_name][family_name] = {
+                "loss_by_seed": np.stack(loss_curves),
+                "accuracy_drop_by_seed": np.stack(accuracy_curves),
+                "functional_by_seed": np.stack(functional_curves),
+                "head_orders": head_orders,
+            }
+    return values
+
+
+def figure_iterative_family_ablation(
+    results: Sequence[dict[str, Any]], cfg: Config, figures_dir: Path
+) -> tuple[list[str], dict[str, Any]]:
+    plt = configure_matplotlib()
+    values = iterative_family_ablation_values(results)
+    fig, axes = plt.subplots(2, 2, figsize=(12.4, 8.8), sharex=True)
+    colors = {"semantic": "#cb181d", "structural": "#2171b5"}
+    labels = {"semantic": "Semantic-score family", "structural": "Structural-score family"}
+    metrics = (("loss_by_seed", "Δ cross-entropy"), ("accuracy_drop_by_seed", "Accuracy drop (percentage points)"))
+    seeds = [int(result["seed"]) for result in results]
+
+    for col, task_name in enumerate(("semantic", "structural")):
+        for row, (metric, ylabel) in enumerate(metrics):
+            ax = axes[row, col]
+            for family_name in ("semantic", "structural"):
+                curves = np.asarray(values[task_name][family_name][metric], dtype=float)
+                if metric == "accuracy_drop_by_seed":
+                    curves = curves * 100.0
+                x = np.arange(curves.shape[1])
+                for seed_idx, curve in enumerate(curves):
+                    ax.plot(x, curve, color=colors[family_name], alpha=0.20, linewidth=1.0)
+                    ax.scatter(x[-1], curve[-1], color=colors[family_name], alpha=0.35, s=18)
+                mean = np.nanmean(curves, axis=0)
+                if curves.shape[0] > 1:
+                    error = np.nanstd(curves, axis=0, ddof=1) / math.sqrt(curves.shape[0]) * 1.96
+                else:
+                    error = np.zeros_like(mean)
+                ax.plot(x, mean, color=colors[family_name], linewidth=2.6, marker="o", markersize=5, label=labels[family_name])
+                ax.fill_between(x, mean - error, mean + error, color=colors[family_name], alpha=0.12, linewidth=0)
+            ax.axhline(0.0, color="#777777", linewidth=0.8)
+            ax.set_xticks(np.arange(cfg.top_group_size + 1))
+            ax.grid(True, linewidth=0.5, alpha=0.22)
+            if col == 0:
+                ax.set_ylabel(ylabel)
+            if row == 0:
+                ax.set_title(f"{chr(65 + col)}  {task_name.capitalize()} task", loc="left", fontweight="bold")
+            if row == 1:
+                ax.set_xlabel("Number of score-ranked family heads jointly ablated")
+
+    fig.suptitle(
+        "Does necessity emerge when specialised heads are removed cumulatively?",
+        x=0.06,
+        y=0.99,
+        ha="left",
+        fontsize=15,
+        fontweight="bold",
+    )
+    fig.text(
+        0.06,
+        0.945,
+        "Thin lines are training seeds; thick lines are means and bands are 95% normal-approximation intervals.",
+        fontsize=9,
+        color="#555555",
+    )
+    handles, legend_labels = axes[0, 0].get_legend_handles_labels()
+    fig.legend(handles, legend_labels, frameon=False, loc="lower center", ncol=2, bbox_to_anchor=(0.5, 0.005))
+    fig.tight_layout(rect=(0, 0.06, 1, 0.91), h_pad=2.0, w_pad=2.0)
+    summary = {
+        task: {
+            family: {
+                "loss_by_seed": values[task][family]["loss_by_seed"],
+                "accuracy_drop_by_seed": values[task][family]["accuracy_drop_by_seed"],
+                "functional_by_seed": values[task][family]["functional_by_seed"],
+                "head_orders": values[task][family]["head_orders"],
+            }
+            for family in ("semantic", "structural")
+        }
+        for task in ("semantic", "structural")
+    }
+    return save_figure(fig, figures_dir / "fig4_iterative_family_ablation"), summary
 
 
 def create_outputs(results: Sequence[dict[str, Any]], cfg: Config, run_dir: Path) -> dict[str, Any]:
@@ -1683,6 +1784,7 @@ def create_outputs(results: Sequence[dict[str, Any]], cfg: Config, run_dir: Path
     fig1 = figure_specialisation_plane(results, cfg, figures_dir)
     fig2, correlations = figure_score_ablation(head_rows, cfg, figures_dir)
     fig3, dissociation = figure_double_dissociation(results, cfg, figures_dir)
+    fig4, iterative_ablation = figure_iterative_family_ablation(results, cfg, figures_dir)
 
     seed_summaries = []
     for result in results:
@@ -1708,8 +1810,9 @@ def create_outputs(results: Sequence[dict[str, Any]], cfg: Config, run_dir: Path
         "necessity_interaction_by_seed": dissociation["necessity_interaction"],
         "rescue_interaction_by_seed": dissociation["rescue_interaction"],
         "selected_heads": dissociation["selected_heads"],
+        "iterative_family_ablation": iterative_ablation,
         "seeds": seed_summaries,
-        "figures": fig1 + fig2 + fig3,
+        "figures": fig1 + fig2 + fig3 + fig4,
     }
     write_json(run_dir / "summary.json", summary)
     write_json(tables_dir / "selected_heads.json", {"selected_heads": dissociation["selected_heads"]})

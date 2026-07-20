@@ -11,18 +11,23 @@ head scores. A dense GRIT jointly learns marked-source value retrieval and struc
 source-distance classification on the same cycle graphs. The shared source marker controls
 addressing difficulty, leaving semantic payload versus RRWP relation as the task contrast. It then runs planted-source
 scoring, every-head pre-output ablation, and clean-to-corrupt head-output patching.
+It also jointly ablates score-selected head families and traces fixed score-ranked ablation
+prefixes, testing whether necessity appears only after redundant specialised heads are removed.
 
 Paste the complete file into Colab and run it. The default three-seed run mounts Drive,
 pins official GRIT, caches checkpoints and analysis tensors, and writes PNG/PDF versions
 of the specialisation plane, score-ablation correlations, and necessity-plus-rescue
-double-dissociation figure. For an installation/plumbing check, change the final call to:
+double-dissociation figure, plus cumulative family-ablation curves. For an
+installation/plumbing check, change the final call to:
 
 ```python
 main(["--fast-dev-run"])
 ```
 
 Cached phases can be rerun independently with `--phase train`, `--phase analyze`, or
-`--phase figures`; the figures-only phase does not reinstall GRIT.
+`--phase figures`; the figures-only phase does not reinstall GRIT. When a cached v2 analysis
+lacks the newer family-ablation block, `--phase analyze` augments it without recomputing scores,
+single-head ablations, rescue results, or training.
 
 ## MarkedTreePath
 

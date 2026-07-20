@@ -196,3 +196,26 @@ def test_score_ablation_and_rescue_hooks_with_mock_head_model():
     )
     assert rescue["mediation"].shape == (cfg.layers, cfg.heads, cfg.rescue_graphs)
     assert torch.isfinite(rescue["mediation"]).all()
+
+    groups = {
+        "semantic": [(0, 0), (1, 0)],
+        "structural": [(0, 1), (1, 1)],
+    }
+    family = module.family_ablation_sweep(
+        model,
+        cfg,
+        groups=groups,
+        seed=105,
+        device=torch.device("cpu"),
+    )
+    assert family["revision"] == module.FAMILY_ABLATION_REVISION
+    for task_name in ("semantic", "structural"):
+        for family_name in ("semantic", "structural"):
+            values = family["tasks"][task_name]["families"][family_name]
+            assert values["loss"].shape == (3, cfg.ablation_graphs)
+            assert values["accuracy_drop"].shape == (3, cfg.ablation_graphs)
+            assert torch.equal(values["loss"][0], torch.zeros(cfg.ablation_graphs))
+
+    curves = module.iterative_family_ablation_values([{"family_ablation": family}])
+    assert curves["semantic"]["semantic"]["loss_by_seed"].shape == (1, 3)
+    assert curves["structural"]["structural"]["accuracy_drop_by_seed"].shape == (1, 3)
