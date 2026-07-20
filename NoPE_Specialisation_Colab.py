@@ -104,7 +104,7 @@ SEQ_LEN      = 8  if SMOKE else 16
 D_MODEL      = 32 if SMOKE else 64
 D_FF         = 64 if SMOKE else 128
 N_HEADS      = 1                     # "each layer just a single head"
-DEPTHS       = [1, 2, 3]             # 1-, 2-, 3-layer students
+DEPTHS       = [1, 2, 3, 4, 5]       # student depths (depth-scaling of the local mislabel)
 SEEDS        = [0, 1] if SMOKE else [0, 1, 2]
 
 # ---- experiment families: (variant, task) ----
@@ -140,7 +140,7 @@ EVAL_SEED    = 20260720                # fixed so scores are comparable across m
 FORCE_RESCORE = False               # True to ignore the score cache and recompute
 
 # ---- optional per-layer mean/std attention figure (across inputs) ----
-ATTN_VIZ_DEPTH = 3                   # which depth to visualise (must be in DEPTHS); None to skip
+ATTN_VIZ_DEPTH = 5                   # which depth to visualise (must be in DEPTHS); None to skip
 ATTN_VIZ_SEED  = None                # None -> SEEDS[0]
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
