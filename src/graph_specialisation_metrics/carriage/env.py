@@ -225,10 +225,18 @@ def find_checkpoint(results_root: Path, explicit: Optional[str] = None) -> tuple
                 log(f"[ckpt] No GraphGym ckpt/ dir; using recovery checkpoint: {chosen} "
                     f"(prefer={stem})")
                 return chosen, -1
+        # Last resort: any *.ckpt anywhere under _recovery_checkpoints (e.g. period_*.ckpt),
+        # newest by mtime, so discovery tolerates whatever the runner actually wrote.
+        any_rec = sorted(results_root.glob("_recovery_checkpoints/**/*.ckpt"))
+        if any_rec:
+            chosen = max(any_rec, key=lambda p: p.stat().st_mtime)
+            epoch = int(chosen.stem) if chosen.stem.isdigit() else -1
+            log(f"[ckpt] No GraphGym ckpt/ dir; using newest recovery checkpoint: {chosen}")
+            return chosen, epoch
         raise FileNotFoundError(
-            f"No *.ckpt under {results_root}/**/ckpt/ and no "
-            f"{results_root}/_recovery_checkpoints/**/(best|latest).ckpt. "
-            f"Has training saved a checkpoint?"
+            f"No *.ckpt under {results_root}/**/ckpt/ and none under "
+            f"{results_root}/_recovery_checkpoints/. Has training saved a checkpoint for this "
+            f"model, and is drive_dir correct?"
         )
     log(f"[ckpt] Found {len(candidates)} checkpoint file(s) under {results_root}:")
     for c in candidates:

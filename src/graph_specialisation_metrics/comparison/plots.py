@@ -374,8 +374,11 @@ def plot_performance(metrics_by_task: dict, tasks: Sequence[str], out_path,
     if not tasks:
         raise ValueError("plot_performance: no metrics for the given tasks.")
     labels = [_data.method_meta(t, i)["label"] for i, t in enumerate(tasks)]
-    val = [metrics_by_task[t].get("val", np.nan) for t in tasks]
-    test = [metrics_by_task[t].get("test", np.nan) for t in tasks]
+
+    def _f(x):  # None (metric not computed / stale cache) -> NaN so matplotlib skips the bar
+        return float(x) if x is not None else np.nan
+    val = [_f(metrics_by_task[t].get("val")) for t in tasks]
+    test = [_f(metrics_by_task[t].get("test")) for t in tasks]
     xpos = np.arange(len(tasks))
     w = 0.38
     fig, ax = plt.subplots(figsize=(1.7 * len(tasks) + 2, 4.6), constrained_layout=True)

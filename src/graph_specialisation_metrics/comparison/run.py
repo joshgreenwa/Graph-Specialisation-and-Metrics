@@ -263,6 +263,17 @@ def run_all(tasks: Sequence[str] = _data.DEFAULT_TASKS, *,
     else:
         log("[deps] Skipping dependency installation (skip_install=True).")
 
+    def _resolve_ckpt(task):
+        # Honour a pinned checkpoint only if it actually exists; otherwise fall back to
+        # auto-discovery (env.find_checkpoint prefers a GraphGym ckpt/ dir, then the recovery
+        # best.ckpt, then latest.ckpt), which is robust to a stale/missing pinned path.
+        p = ckpts.get(task)
+        if p and not Path(p).exists():
+            log(f"[ckpt] pinned checkpoint for {task} not found ({p}); auto-discovering under "
+                f"the task's drive_dir instead.")
+            return None
+        return p
+
     status: dict = {"carriage": {}, "specialisation": {}, "errors": []}
 
     # ---- carriage: per task, per intervention, cache-skipping --------------------------
@@ -276,7 +287,7 @@ def run_all(tasks: Sequence[str] = _data.DEFAULT_TASKS, *,
                 continue
             log(f"[run] carriage {key} ...")
             car_kw = dict(
-                task=task, intervention=intv, ckpt=ckpts.get(task),
+                task=task, intervention=intv, ckpt=_resolve_ckpt(task),
                 collate_dir=carriage_collate, mount=False, skip_install=True,
                 num_graphs=carriage_num_graphs, donors=carriage_donors,
                 beneficial_denom=beneficial_denom,
@@ -307,7 +318,7 @@ def run_all(tasks: Sequence[str] = _data.DEFAULT_TASKS, *,
                                            and t not in missing else "pending")
         if missing:
             log(f"[run] specialisation scores for: {missing}")
-            spec_ckpts = {t: ckpts[t] for t in missing if ckpts.get(t)}
+            spec_ckpts = {t: _resolve_ckpt(t) for t in missing if _resolve_ckpt(t)}
             spec_kw = dict(
                 tasks=missing, ckpt=(spec_ckpts or None), collate_dir=spec_collate,
                 num_graphs=spec_num_graphs, donors=spec_donors,
