@@ -8,7 +8,7 @@ Implements the dissertation methodology (Ch. 3, Sections 3.2-3.3):
 
   semantic carriage      C_swap[i,j] = (1/K) sum_k g_i^T [h^L_i(clean) - h^L_i(swap_k)]   (3.4/3.5)
   functional carriage    F[i,j] = |C[i,j]|,  F(d) = mean_{d(i,j)=d} |C[i,j]|             (3.6/3.7)
-  beneficial carriage    exact per-source loss change, carrier-attributed (see grit_runner)
+  beneficial carriage    exact loss change via a signed final-state path integral
   B_far(k)               sum over {(i,j): d(i,j) > k} of B[i,j]                            [MAE units]
 """
 
@@ -100,6 +100,225 @@ def functional_magnitude_from_delta(delta, g_out, num_sources, num_donors):
     return acc.sqrt().cpu().numpy()  # [i, j], carrier x source
 
 
+def pool_final_states(h, pooling: str):
+    """Apply the linear graph pooling used by the supported GRIT readout heads.
+
+    ``h`` is ``[R, n, m]`` (or ``[n, m]``).  Carriage currently requires add/mean
+    pooling, so the final-state path can be integrated in the much smaller pooled
+    space without changing any carrier attribution.
+    """
+    if pooling == "add":
+        return h.sum(dim=-2)
+    if pooling == "mean":
+        return h.mean(dim=-2)
+    raise ValueError(f"integrated carriage requires add/mean pooling, got {pooling!r}")
+
+
+# Gauss--Kronrod (7, 15) nodes and weights on [-1, 1].  The embedded Gauss
+# estimate supplies a local carrier-level error estimate; intervals containing
+# an L1/ReLU kink are split rather than hidden by a global rescale or clipping.
+_GK15_NODES = (
+    -0.9914553711208126, -0.9491079123427585, -0.8648644233597691,
+    -0.7415311855993945, -0.5860872354676911, -0.4058451513773972,
+    -0.2077849550078985, 0.0, 0.2077849550078985, 0.4058451513773972,
+    0.5860872354676911, 0.7415311855993945, 0.8648644233597691,
+    0.9491079123427585, 0.9914553711208126,
+)
+_GK15_WEIGHTS = (
+    0.0229353220105292, 0.0630920926299786, 0.1047900103222502,
+    0.140653259715526, 0.169004726639268, 0.190350578064785,
+    0.204432940075299, 0.209482141084728, 0.204432940075299,
+    0.190350578064785, 0.169004726639268, 0.140653259715526,
+    0.1047900103222502, 0.0630920926299786, 0.0229353220105292,
+)
+_G7_WEIGHTS = (
+    0.0, 0.129484966168870, 0.0, 0.279705391489277, 0.0,
+    0.381830050505119, 0.0, 0.417959183673469, 0.0,
+    0.381830050505119, 0.0, 0.279705391489277, 0.0,
+    0.129484966168870, 0.0,
+)
+
+
+def integrated_loss_carriage(
+    h_clean,
+    h_swap,
+    loss_from_pooled,
+    *,
+    pooling: str,
+    atol: float = 1e-5,
+    rtol: float = 1e-4,
+    max_intervals: int = 64,
+):
+    """Signed finite-loss carriage along each swapped-to-clean final-state path.
+
+    For each replica ``r=(source j, donor k)`` this computes
+
+    ``b[r,i] = integral_0^1 <d loss(H(alpha))/d h_i, h_clean_i-h_swap_i> d alpha``
+
+    with ``H(alpha)=h_swap+alpha*(h_clean-h_swap)``.  The caller donor-averages
+    these *per-donor* paths afterwards.  Because add/mean pooling is linear, the
+    gradients are evaluated through the readout in pooled space and projected
+    back onto every carrier's ``delta h_i`` exactly.
+
+    Adaptive embedded Gauss--Kronrod quadrature localises L1 and ReLU kinks.  A
+    path is converged only when both (a) the L1 carrier refinement estimate and
+    (b) endpoint completeness are within tolerance.  Nothing is clipped,
+    rescaled, or completeness-corrected: the raw numerical residual is returned.
+
+    Args:
+        h_clean / h_swap: ``[R,n,m]`` tensors at the input to the graph head.
+        loss_from_pooled: differentiable callable mapping pooled states ``[Q,m]``
+            to one scalar task loss per row, ``[Q]``.
+        pooling: ``"add"`` or ``"mean"`` (the checked GRIT readout pooling).
+        atol / rtol: convergence tolerances in task-loss/carrier units.
+        max_intervals: maximum locally-adapted intervals per donor path.
+
+    Returns a dict of tensors, all in source-major replica order:
+        ``carriage [R,n]``, ``loss_delta [R]`` (clean minus swap),
+        ``completeness_residual [R]``, ``quadrature_error [R]``,
+        ``intervals [R]``, and ``converged [R]``.
+    """
+    import torch
+
+    if h_clean.ndim != 3 or h_swap.ndim != 3 or h_clean.shape != h_swap.shape:
+        raise ValueError(
+            f"h_clean and h_swap must have identical [R,n,m] shape; got "
+            f"{tuple(h_clean.shape)} and {tuple(h_swap.shape)}"
+        )
+    if int(h_clean.shape[0]) < 1:
+        raise ValueError("integrated carriage needs at least one donor path")
+    if atol < 0 or rtol < 0:
+        raise ValueError("integrated carriage tolerances must be non-negative")
+    if int(max_intervals) < 1:
+        raise ValueError("max_intervals must be >= 1")
+    if pooling not in ("add", "mean"):
+        raise ValueError(f"integrated carriage requires add/mean pooling, got {pooling!r}")
+
+    clean = h_clean.detach()
+    swap = h_swap.detach()
+    R, n, _m = clean.shape
+    delta_h = clean - swap
+    pool_scale = 1.0 if pooling == "add" else 1.0 / float(n)
+    p_clean = pool_final_states(clean, pooling)
+    p_swap = pool_final_states(swap, pooling)
+    delta_p = p_clean - p_swap
+
+    def _loss(p):
+        out = loss_from_pooled(p)
+        if out.ndim != 1 or int(out.shape[0]) != int(p.shape[0]):
+            raise ValueError(
+                "loss_from_pooled must return one scalar per row: "
+                f"input {tuple(p.shape)} -> output {tuple(out.shape)}"
+            )
+        return out
+
+    with torch.no_grad():
+        loss_delta = (_loss(p_clean) - _loss(p_swap)).detach()
+
+    nodes = torch.as_tensor(_GK15_NODES, device=clean.device, dtype=clean.dtype)
+    wk = torch.as_tensor(_GK15_WEIGHTS, device=clean.device, dtype=clean.dtype)
+    wg = torch.as_tensor(_G7_WEIGHTS, device=clean.device, dtype=clean.dtype)
+
+    def _eval_intervals(replica, left, right):
+        """Embedded estimates for a batch of (replica, [left,right]) intervals."""
+        replica = torch.as_tensor(replica, device=clean.device, dtype=torch.long)
+        left_t = torch.as_tensor(left, device=clean.device, dtype=clean.dtype)
+        right_t = torch.as_tensor(right, device=clean.device, dtype=clean.dtype)
+        centre = (left_t + right_t) * 0.5
+        half = (right_t - left_t) * 0.5
+        alpha = centre[:, None] + half[:, None] * nodes[None, :]
+        with torch.enable_grad():
+            path_p = (
+                p_swap[replica, None, :]
+                + alpha[:, :, None] * delta_p[replica, None, :]
+            ).reshape(-1, p_clean.shape[-1]).detach().requires_grad_(True)
+            losses = _loss(path_p)
+            grad = torch.autograd.grad(losses.sum(), path_p, create_graph=False)[0]
+        grad = grad.reshape(replica.numel(), nodes.numel(), p_clean.shape[-1])
+        a_k = half[:, None] * torch.einsum("q,rqm->rm", wk, grad)
+        a_g = half[:, None] * torch.einsum("q,rqm->rm", wg, grad)
+        b_k = pool_scale * torch.einsum("rnm,rm->rn", delta_h[replica], a_k)
+        b_g = pool_scale * torch.einsum("rnm,rm->rn", delta_h[replica], a_g)
+        error = (b_k - b_g).abs().sum(dim=-1)
+        return b_k.detach(), error.detach()
+
+    replica0 = torch.arange(R, device=clean.device)
+    initial_b, initial_error = _eval_intervals(replica0, [0.0] * R, [1.0] * R)
+    total_b = initial_b.clone()
+    error_sum = initial_error.detach().cpu().double().numpy()
+
+    # Per-path interval records: [left, right, Kronrod carrier vector, embedded L1 error].
+    # Chunks in the runners keep R moderate; Python records make the adaptive choice explicit
+    # and avoid padding every donor to the worst path's refinement depth.
+    records = [
+        [[0.0, 1.0, initial_b[r].clone(), float(error_sum[r])]]
+        for r in range(R)
+    ]
+
+    def _convergence_mask():
+        residual = (total_b.sum(dim=-1) - loss_delta).abs()
+        carrier_scale = total_b.abs().sum(dim=-1)
+        quad_tol = float(atol) + float(rtol) * carrier_scale
+        complete_tol = float(atol) + float(rtol) * loss_delta.abs()
+        qerr = torch.as_tensor(error_sum, device=clean.device, dtype=clean.dtype)
+        return (qerr <= quad_tol) & (residual <= complete_tol)
+
+    converged = _convergence_mask()
+    while True:
+        unresolved = [
+            r for r in range(R)
+            if not bool(converged[r].item()) and len(records[r]) < int(max_intervals)
+        ]
+        if not unresolved:
+            break
+
+        parents = []
+        child_replica, child_left, child_right = [], [], []
+        for r in unresolved:
+            # Split the locally least-certain interval.  Width breaks ties so a rare
+            # zero embedded-error / nonzero-completeness case still makes progress.
+            q = max(
+                range(len(records[r])),
+                key=lambda z: (records[r][z][3], records[r][z][1] - records[r][z][0]),
+            )
+            left, right, value, error = records[r].pop(q)
+            mid = (left + right) * 0.5
+            parents.append((r, left, right, value, error))
+            child_replica.extend((r, r))
+            child_left.extend((left, mid))
+            child_right.extend((mid, right))
+
+        child_b, child_error = _eval_intervals(
+            child_replica, child_left, child_right
+        )
+        child_error_cpu = child_error.detach().cpu().double().numpy()
+        for z, (r, left, right, old_value, old_error) in enumerate(parents):
+            mid = (left + right) * 0.5
+            b_left, b_right = child_b[2 * z], child_b[2 * z + 1]
+            e_left = float(child_error_cpu[2 * z])
+            e_right = float(child_error_cpu[2 * z + 1])
+            total_b[r] += b_left + b_right - old_value
+            error_sum[r] = max(0.0, error_sum[r] + e_left + e_right - old_error)
+            records[r].append([left, mid, b_left.clone(), e_left])
+            records[r].append([mid, right, b_right.clone(), e_right])
+        converged = _convergence_mask()
+
+    completeness = total_b.sum(dim=-1) - loss_delta
+    intervals = torch.as_tensor(
+        [len(x) for x in records], device=clean.device, dtype=torch.long
+    )
+    return {
+        "carriage": total_b,
+        "loss_delta": loss_delta,
+        "completeness_residual": completeness,
+        "quadrature_error": torch.as_tensor(
+            error_sum, device=clean.device, dtype=clean.dtype
+        ),
+        "intervals": intervals,
+        "converged": converged,
+    }
+
+
 def beneficial_attribute(C_basis, dL_j, eps=1e-8, denom="slope", slope_clip=1.0):
     """Turn the signed loss-carriage into per-pair beneficial carriage B[i,j].
 
@@ -109,16 +328,15 @@ def beneficial_attribute(C_basis, dL_j, eps=1e-8, denom="slope", slope_clip=1.0)
 
     Modes (default "slope"):
 
-      denom="slope" (DEFAULT -- signed AND stable):
+      denom="slope" (DEFAULT for backwards compatibility; finite-tangent approximation):
           s_j    = dL_j / sum_i C_loss[i,j]                          exact / first-order loss change
           B[i,j] = clip(s_j, -slope_clip, +slope_clip) . C_loss[i,j]
-        Keeps the per-carrier SIGN of C_loss, so adverse (B>0) stays measurable; and is bounded
-        -- for a 1-Lipschitz loss (L1/BCE) |s_j| <= 1 by the reverse triangle inequality, so
-        |B[i,j]| <= |C_loss[i,j]|: beneficial can never exceed functional and the signed-share
-        far-tail blow-up is impossible. The clip only activates on estimation noise (first-order
-        change ~ 0). "No delta => no carriage": C_loss[i,j]=0 -> B=0, and a source that moves
-        nothing (sum_i C_loss ~ 0, hence dL_j ~ 0) gets s_j=0 -> a zeroed column. slope_clip is
-        the loss's max |dL/dyhat| (1 for L1/BCE); it is NOT valid for MSE (unbounded slope).
+        Keeps the per-carrier SIGN of C_loss and bounds the first-order estimate.  However,
+        C_loss uses the gradient frozen at the clean endpoint, so a finite intervention can
+        cross readout/loss curvature or an L1/ReLU kink and legitimately give |s_j| > 1.
+        Clip activation therefore diagnoses tangent failure; it is not evidence that only
+        numerical noise was removed. Use the runner's ``integrated`` option for signed
+        finite-loss attribution without a ratio or clipping.
 
       denom="magnitude" (bounded but sign-collapsing):
           B[i,j] = dL_j * |C_loss[i,j]| / sum_i |C_loss[i,j]|
@@ -134,8 +352,8 @@ def beneficial_attribute(C_basis, dL_j, eps=1e-8, denom="slope", slope_clip=1.0)
         (B, denom_used, clamped): denom_used is the [n] per-source denominator (sum_i C_loss for
         slope/signed, sum_i |C_loss| for magnitude); a source "moved" when |denom_used| > eps.
         clamped is a [n] bool, True where the slope clip was active (slope mode only) -- for those
-        sources sum_i B != dL_j by construction (they are exactly the estimation-noise sources, so
-        exclude them from the sum_i B == dL_j exactness check).
+        sources sum_i B != dL_j by construction, so they are excluded from that estimator's
+        sum_i B == dL_j exactness check.
     """
     C_basis = np.asarray(C_basis, dtype=np.float64)
     dL_j = np.asarray(dL_j, dtype=np.float64)
@@ -143,9 +361,9 @@ def beneficial_attribute(C_basis, dL_j, eps=1e-8, denom="slope", slope_clip=1.0)
     if denom == "slope":
         s = C_basis.sum(axis=0)                                       # [n] first-order loss change
         with np.errstate(divide="ignore", invalid="ignore"):
-            slope = np.where(np.abs(s) > eps, dL_j / s, 0.0)          # exact/first-order, |.|<=1 (1-Lipschitz)
+            slope = np.where(np.abs(s) > eps, dL_j / s, 0.0)          # finite / clean-tangent change
         clamped = np.abs(slope) > slope_clip
-        slope = np.clip(slope, -slope_clip, slope_clip)              # guard estimation noise near s~0
+        slope = np.clip(slope, -slope_clip, slope_clip)              # bound tangent mismatch / s~0
         B = slope[None, :] * C_basis                                 # B[i,j] = slope_j . C_loss[i,j]
         return B, s, clamped
     if denom == "magnitude":

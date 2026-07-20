@@ -11,6 +11,7 @@ root so the different GRIT tasks can be compared side by side.
 
     from graph_specialisation_metrics.carriage.colab import run
     run(task="zinc")                         # auto-discovers the last checkpoint on Drive
+    run(task="zinc", beneficial_denom="integrated")  # signed finite-loss attribution
     run(task="zinc", num_graphs=128, donors=64)
     run(task="zinc", skip_install=True)      # same runtime as a finished training run
 """
@@ -73,13 +74,21 @@ def run(
     verify_graphs: int = 2,
     eval_metric: bool = True,
     allow_param_count_drift: bool = False,
-    # beneficial-carriage denominator:
-    #   "magnitude" (DEFAULT): B[i,j] = dL_j * |C[i,j]| / sum_i |C[i,j]|. Convex shares, so
-    #       |B| <= |dL_j| (no blow-up) and B vanishes wherever functional carriage vanishes.
+    # beneficial-carriage estimator (argument name retained for compatibility):
+    #   "integrated": final-state path integral of the exact task loss through the readout.
+    #       Signed, donor-wise, and complete (sum_i B=dL); no ratios and no clipping. Adaptive
+    #       quadrature localises L1/ReLU kinks and aborts if its checks do not converge.
+    #   "slope" (DEFAULT/back-compatible): clean-gradient tangent scaled by a clipped finite
+    #       slope. Fast, but clipping is diagnostic evidence that the tangent is inadequate.
+    #   "magnitude": B[i,j] = dL_j * |C[i,j]| / sum_i |C[i,j]|. Convex shares, so
+    #       |B| <= |dL_j|, but all carriers inherit the source-level sign.
     #   "signed" (LEGACY):     B[i,j] = dL_j * C[i,j] / sum_i C[i,j]. Keeps the per-carrier
     #       sign but the signed sum can cancel to ~0 and make |B| >> |C| spikes at far
-    #       distances. Kept only for comparison; prefer "magnitude".
+    #       distances. Kept only for comparison; prefer "integrated" for signed inference.
     beneficial_denom: str = "slope",
+    integrated_atol: float = 1e-5,
+    integrated_rtol: float = 1e-4,
+    integrated_max_intervals: int = 64,
     tol: float = 1e-4,
     float_noise_tol: float = 5e-3,
     max_replicas: int = 4096,
@@ -105,12 +114,11 @@ def run(
 
     Two aggregation choices worth knowing (both default to the improved behaviour):
 
-    * ``beneficial_denom`` -- how each source's exact loss change dL_j is mapped to its
-      carriers. "slope" (default) = clip(dL_j / sum_i C_loss, -1, 1) * C_loss[i,j]: keeps the
-      per-carrier sign so adverse (B>0) stays measurable, and is bounded (|B| <= |C|, no
-      blow-up) with B=0 where F=0 (no delta => no carriage). "magnitude" uses |C| shares
-      (bounded but collapses per-carrier sign); "signed" is the legacy signed share (blows up),
-      both kept only for comparison.
+    * ``beneficial_denom`` -- ``"integrated"`` is the signed finite-loss estimator: it
+      integrates the task-loss gradient along each donor's swapped-to-clean final-state path,
+      then averages donors. It has no ratio or clipping; completeness and adaptive-quadrature
+      diagnostics replace the slope clip. ``"slope"`` remains the back-compatible default,
+      while ``"magnitude"`` and ``"signed"`` retain the earlier share estimators.
     * ``bin_strategy`` / ``central`` -- F and B are pooled into adaptive shortest-path
       bins and reported with a robust central tendency + graph-clustered bootstrap CI,
       which is what makes the large-graph (peptides) x-axis legible and the CIs tight.
@@ -166,6 +174,8 @@ def run(
         donors=donors, graph_select=graph_select, analysis_seed=analysis_seed,
         verify=verify, verify_graphs=verify_graphs, eval_metric=eval_metric,
         allow_param_count_drift=allow_param_count_drift, beneficial_denom=beneficial_denom,
+        integrated_atol=integrated_atol, integrated_rtol=integrated_rtol,
+        integrated_max_intervals=integrated_max_intervals,
         intervention=intervention, structural_mode=structural_mode, partner_match=partner_match,
         tol=tol, float_noise_tol=float_noise_tol,
         max_replicas=max_replicas, max_pair_edges=max_pair_edges,

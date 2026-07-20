@@ -1021,6 +1021,51 @@ def apply_qm9_patch(repo_dir: Path, drive_dir: Path, args: argparse.Namespace) -
         label="QM9 gap target/features/split loader",
     )
 
+    grit_logger = repo_dir / "grit" / "logger.py"
+    _replace_exact(
+        grit_logger,
+        old=(
+            'def eval_spearmanr(y_true, y_pred):\n'
+            '    """Compute Spearman Rho averaged across tasks.\n'
+            '    """\n'
+            '    res_list = []\n'
+            '\n'
+            '    if y_true.ndim == 1:\n'
+            '        res_list.append(stats.spearmanr(y_true, y_pred)[0])\n'
+            '    else:\n'
+            '        for i in range(y_true.shape[1]):\n'
+            '            # ignore nan values\n'
+            '            is_labeled = ~np.isnan(y_true[:, i])\n'
+            '            res_list.append(stats.spearmanr(y_true[is_labeled, i],\n'
+            '                                            y_pred[is_labeled, i])[0])\n'
+            '\n'
+            '    return {\'spearmanr\': sum(res_list) / len(res_list)}\n'
+        ),
+        new=(
+            'def eval_spearmanr(y_true, y_pred):\n'
+            '    """Compute task-averaged Spearman Rho, including one-target regression."""\n'
+            '    y_true = np.asarray(y_true)\n'
+            '    y_pred = np.asarray(y_pred)\n'
+            '    if y_true.ndim == 1:\n'
+            '        y_true = y_true[:, None]\n'
+            '    if y_pred.ndim == 1:\n'
+            '        y_pred = y_pred[:, None]\n'
+            '    if y_true.shape != y_pred.shape:\n'
+            '        raise ValueError(\n'
+            '            f"Spearman target/prediction shape mismatch: {y_true.shape} vs {y_pred.shape}"\n'
+            '        )\n'
+            '    res_list = []\n'
+            '    for i in range(y_true.shape[1]):\n'
+            '        is_labeled = ~np.isnan(y_true[:, i])\n'
+            '        res_list.append(stats.spearmanr(\n'
+            '            y_true[is_labeled, i], y_pred[is_labeled, i]\n'
+            '        )[0])\n'
+            '    return {\'spearmanr\': sum(res_list) / len(res_list)}\n'
+        ),
+        marker="Spearman target/prediction shape mismatch",
+        label="single-target regression Spearman logger",
+    )
+
     gt_config = repo_dir / "grit" / "config" / "gt_config.py"
     _replace_exact(
         gt_config,
@@ -1508,6 +1553,10 @@ def verify_qm9_model_patch(repo_dir: Path) -> None:
             "dataset.data.y[:, target_index:target_index + 1]",
             "dataset.data.x = dataset.data.z.view(-1, 1).long()",
             "QM9 single target: HOMO-LUMO gap",
+        ],
+        repo_dir / "grit" / "logger.py": [
+            "y_pred = np.asarray(y_pred)",
+            "Spearman target/prediction shape mismatch",
         ],
     }
     errors = []

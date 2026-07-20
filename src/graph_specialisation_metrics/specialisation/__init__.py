@@ -17,26 +17,15 @@ Layout:
     model.py         GritHeadModel: load a checkpoint (mirrors carriage.grit_runner) + per-head
                      capture/ablation hooks (wV transport, attn selection)
     scores.py        per-head S_sem / S_str (transport) + S_attn_sem (selection), + select_heads
-    causal_mediation.py held-out channel-specific noising/denoising, controls and inference
-    effective_transport.py exact routing/value reconstruction and effective transport treatments
-    paper_figures.py two compact, failure-aware headline figures (PNG + PDF)
     ablation.py      causal head-ablation vs random-head null, per-graph, feature correlations
     attention_viz.py per-head attention maps across molecules
-    figures.py       legacy appendix deliverables + cross-model scatter
-    colab.py         default paper workflow plus explicit legacy reversion; collates on Drive
+    figures.py       the four deliverables + cross-model scatter
+    colab.py         run(): one-call orchestration for both models; figures collate on Drive
 """
 
 from __future__ import annotations
 
-__all__ = [
-    "run",
-    "score_model",
-    "run_ablation",
-    "select_heads",
-    "collect_attention",
-    "run_channel_causal_mediation",
-    "run_effective_transport",
-]
+__all__ = ["run", "score_model", "run_ablation", "select_heads", "collect_attention"]
 
 
 def run(*args, **kwargs):
@@ -62,14 +51,4 @@ def select_heads(*args, **kwargs):
 
 def collect_attention(*args, **kwargs):
     from .attention_viz import collect_attention as _f
-    return _f(*args, **kwargs)
-
-
-def run_channel_causal_mediation(*args, **kwargs):
-    from .causal_mediation import run_channel_causal_mediation as _f
-    return _f(*args, **kwargs)
-
-
-def run_effective_transport(*args, **kwargs):
-    from .effective_transport import run_effective_transport as _f
     return _f(*args, **kwargs)

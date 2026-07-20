@@ -10,9 +10,8 @@ secret) and call ``carriage.colab.run(task=...)``, so edits here propagate to ev
 
 Supports scalar regression (ZINC), multi-target regression, and multilabel classification
 (Peptides-func) uniformly: functional carriage = magnitude of the output movement over the
-T outputs; beneficial carriage = exact per-source change in the task loss, attributed to
-carriers by their loss-carriage share. For a scalar output this reduces exactly to the
-dissertation's F=|C|, B=sign(ŷ-y)·C form.
+T outputs; beneficial carriage = the task-loss change attributed to carriers either by a
+signed final-state path integral (finite intervention) or by retained comparison estimators.
 
 Layout:
     core.py        pure math (carriage, functional magnitude, beneficial attribution,
@@ -33,6 +32,7 @@ from .core import (
     aggregate_carriage_curves,
     beneficial_from_carriage,
     carriage_from_states,
+    integrated_loss_carriage,
     symlog_linthresh,
 )
 from .tasks import TASKS, GritTaskSpec, get_task, register
@@ -40,6 +40,7 @@ from .tasks import TASKS, GritTaskSpec, get_task, register
 __all__ = [
     "carriage_from_states",
     "beneficial_from_carriage",
+    "integrated_loss_carriage",
     "aggregate_carriage_curves",
     "symlog_linthresh",
     "GritTaskSpec",

@@ -26,7 +26,13 @@ import numpy as np
 
 from . import core, metrics, structural
 from .env import log
-from .grit_runner import CarriageConfig, _plan_chunk, _spd, check_carriage_preconditions
+from .grit_runner import (
+    CarriageConfig,
+    _plan_chunk,
+    _pooled_head_predictions,
+    _spd,
+    check_carriage_preconditions,
+)
 
 
 def run_grit_structural_carriage(task, cc: CarriageConfig) -> dict:
@@ -182,6 +188,14 @@ def run_grit_structural_carriage(task, cc: CarriageConfig) -> dict:
     handle = model.model.layers.register_forward_hook(_hook)
     dim_h = int(cfg.gnn.dim_inner)
     loss_fun = str(cfg.model.loss_fun)
+    valid_benefit = {"integrated", "slope", "magnitude", "signed"}
+    if cc.beneficial_denom not in valid_benefit:
+        raise ValueError(
+            f"beneficial_denom must be one of {sorted(valid_benefit)}, "
+            f"got {cc.beneficial_denom!r}"
+        )
+    integrated = cc.beneficial_denom == "integrated"
+    pooling = str(cfg.model.graph_pooling)
 
     # ---- graph selection (mirrors grit_runner) -----------------------------------------
     rng = np.random.default_rng(cc.analysis_seed)
@@ -198,8 +212,11 @@ def run_grit_structural_carriage(task, cc: CarriageConfig) -> dict:
     all_gid, all_i, all_j, all_d, all_C, all_B, all_F = [], [], [], [], [], [], []
     add_sumC, add_dyhat = [], []
     g_spread_max = noop_max_dh = bexact_max = relabel_inv_max = 0.0
+    integrated_replay_max = integrated_full_loss_delta_max = 0.0
     clamp_moved = clamp_hit = 0            # slope-clip activation rate over moved sources
     noop_total = partner_draws = unreachable_total = struct_checked = peak_mem = 0
+    integrated_residual, integrated_qerr = [], []
+    integrated_intervals, integrated_cancellation = [], []
 
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats()
@@ -257,12 +274,24 @@ def run_grit_structural_carriage(task, cc: CarriageConfig) -> dict:
         S, R = n, n * K                                      # replica r = u*K + k (source-major)
         delta = torch.empty((R, n, dim_h), device=device, dtype=h_clean.dtype)
         pred_swap = torch.empty((R, T), device=device, dtype=torch.float32)
+        if integrated:
+            path_B = torch.empty((R, n), device="cpu", dtype=torch.float32)
+            path_dL = torch.empty(R, device="cpu", dtype=torch.float32)
+
+            def loss_from_pooled(pooled):
+                pred = _pooled_head_predictions(model, pooled, true_vec)
+                return metrics.per_graph_loss(
+                    pred, true_vec.expand(int(pooled.shape[0]), -1), loss_fun
+                )
 
         chunk = _plan_chunk(n, cc)
         r0 = 0
         while r0 < R:
             m = min(chunk, R - r0)
             while True:
+                perts = b = pred_s = hs = full_rows = None
+                clean_paths = swap_paths = path = None
+                full_clean_pred = full_swap_pred = None
                 try:
                     with torch.no_grad():
                         # replica 0 = clean within-batch baseline; replicas 1..m = the m swaps.
@@ -281,11 +310,69 @@ def run_grit_structural_carriage(task, cc: CarriageConfig) -> dict:
                         assert hs.shape == ((m + 1) * n, dim_h)
                         hs = hs.view(m + 1, n, dim_h)
                         delta[r0:r0 + m] = hs[0:1] - hs[1:]          # within-batch clean baseline
-                        pred_swap[r0:r0 + m] = pred_s.view(m + 1, -1)[1:].float()
+                        full_rows = pred_s.view(m + 1, -1)
+                        pred_swap[r0:r0 + m] = full_rows[1:].float()
+                        if integrated:
+                            clean_paths = hs[0:1].detach().clone().expand(m, -1, -1)
+                            swap_paths = hs[1:].detach().clone()
+                            full_clean_pred = full_rows[0:1].detach().clone()
+                            full_swap_pred = full_rows[1:].detach().clone()
+                    if integrated:
+                        perts = b = pred_s = hs = full_rows = None
+                        store.pop("h", None)
+                        path = core.integrated_loss_carriage(
+                            clean_paths,
+                            swap_paths,
+                            loss_from_pooled,
+                            pooling=pooling,
+                            atol=cc.integrated_atol,
+                            rtol=cc.integrated_rtol,
+                            max_intervals=cc.integrated_max_intervals,
+                        )
+                        if not bool(path["converged"].all().item()):
+                            bad = (~path["converged"]).nonzero().view(-1)
+                            worst = float(
+                                path["completeness_residual"][bad].abs().max().item()
+                            )
+                            raise RuntimeError(
+                                f"Integrated beneficial carriage did not converge for "
+                                f"{int(bad.numel())}/{m} structural paths by "
+                                f"integrated_max_intervals={cc.integrated_max_intervals}; "
+                                f"worst completeness residual={worst:.3e}. Increase "
+                                f"integrated_max_intervals rather than clipping/rescaling."
+                            )
+                        path_B[r0:r0 + m] = path["carriage"].detach().float().cpu()
+                        path_dL[r0:r0 + m] = path["loss_delta"].detach().float().cpu()
+                        if cc.verify and gi_pos < cc.verify_graphs:
+                            with torch.no_grad():
+                                p_clean_chunk = core.pool_final_states(clean_paths, pooling)
+                                p_swap_chunk = core.pool_final_states(swap_paths, pooling)
+                                replay_clean = _pooled_head_predictions(
+                                    model, p_clean_chunk, true_vec
+                                )
+                                replay_swap = _pooled_head_predictions(
+                                    model, p_swap_chunk, true_vec
+                                )
+                                replay_error = max(
+                                    float((replay_clean - full_clean_pred).abs().max().item()),
+                                    float((replay_swap - full_swap_pred).abs().max().item()),
+                                )
+                                integrated_replay_max = max(
+                                    integrated_replay_max, replay_error
+                                )
+                        integrated_residual.append(
+                            path["completeness_residual"].detach().cpu().numpy()
+                        )
+                        integrated_qerr.append(path["quadrature_error"].detach().cpu().numpy())
+                        integrated_intervals.append(path["intervals"].detach().cpu().numpy())
                     break
                 except RuntimeError as exc:
                     if "out of memory" not in str(exc).lower():
                         raise
+                    perts = b = pred_s = hs = full_rows = None
+                    clean_paths = swap_paths = path = None
+                    full_clean_pred = full_swap_pred = None
+                    store.pop("h", None)
                     if device.type == "cuda":
                         torch.cuda.empty_cache()
                     if m == 1:
@@ -293,6 +380,9 @@ def run_grit_structural_carriage(task, cc: CarriageConfig) -> dict:
                     m = max(1, m // 2)
                     chunk = m
                     log(f"[mem] CUDA OOM -> reducing replicas/forward to {m}")
+            perts = b = pred_s = hs = full_rows = None
+            clean_paths = swap_paths = path = None
+            full_clean_pred = full_swap_pred = None
             r0 += m
 
         if device.type == "cuda":
@@ -305,20 +395,59 @@ def run_grit_structural_carriage(task, cc: CarriageConfig) -> dict:
 
         # per-source loss change (donor-average the LOSS over partners -- Jensen at the kink).
         L_swap = metrics.per_graph_loss(pred_swap, true_vec.expand(R, -1), loss_fun).cpu().numpy()
-        dL_j = L_clean - L_swap.reshape(S, K).mean(axis=1)          # [S]  <0 = beneficial
+        dL_full_j = L_clean - L_swap.reshape(S, K).mean(axis=1)     # [S]  <0 = beneficial
 
         F_ij = core.functional_magnitude_from_delta(delta, g_out, S, K)       # [n, n], >=0
         C_loss = core.carriage_from_delta(delta, g_loss, S, K).cpu().numpy()  # [n, n]
-        B, denom_used, clamped = core.beneficial_attribute(C_loss, dL_j, denom=cc.beneficial_denom)
+        if integrated:
+            B = path_B.view(S, K, n).mean(dim=1).t().double().numpy()
+            dL_j = path_dL.view(S, K).mean(dim=1).double().numpy()
+            target_mismatch = float(
+                np.max(np.abs(dL_j - dL_full_j.astype(np.float64)))
+            )
+            integrated_full_loss_delta_max = max(
+                integrated_full_loss_delta_max, target_mismatch,
+            )
+            if target_mismatch > cc.tol:
+                raise RuntimeError(
+                    f"Integrated donor-averaged path loss differs from the existing "
+                    f"clean-alone dL target "
+                    f"by {target_mismatch:.3e} > tol {cc.tol:.1e}. This is batch-context "
+                    f"numerical drift; refusing to compare estimators against different "
+                    f"loss changes."
+                )
+            denom_used = clamped = None
+            net = np.abs(dL_j)
+            cancel = np.abs(B).sum(axis=0) / np.maximum(net, 1e-12)
+            integrated_cancellation.append(cancel[net > 1e-8])
+        else:
+            dL_j = dL_full_j
+            B, denom_used, clamped = core.beneficial_attribute(
+                C_loss, dL_j, denom=cc.beneficial_denom
+            )
 
         add_sumC.append(C_loss.sum(axis=0))
         add_dyhat.append(dL_j)
-        moved = np.abs(denom_used) > 1e-8
-        clamp_moved += int(moved.sum())
-        clamp_hit += int((moved & clamped).sum())
-        ok = moved & ~clamped                       # clamped sources break sum_i B==dL_j by construction
-        if ok.any():
-            bexact_max = max(bexact_max, float(np.abs(B.sum(axis=0)[ok] - dL_j[ok]).max()))
+        if integrated:
+            source_residual = np.abs(B.sum(axis=0) - dL_j)
+            source_tol = cc.integrated_atol + cc.integrated_rtol * np.abs(dL_j)
+            if np.any(source_residual > source_tol):
+                worst = int(np.argmax(source_residual - source_tol))
+                raise RuntimeError(
+                    f"Donor-averaged integrated carriage failed completeness for source "
+                    f"{worst}: residual={source_residual[worst]:.3e}, allowed="
+                    f"{source_tol[worst]:.3e}."
+                )
+            bexact_max = max(bexact_max, float(source_residual.max()))
+        else:
+            moved = np.abs(denom_used) > 1e-8
+            clamp_moved += int(moved.sum())
+            clamp_hit += int((moved & clamped).sum())
+            ok = moved & ~clamped                   # slope clipping breaks exactness
+            if ok.any():
+                bexact_max = max(
+                    bexact_max, float(np.abs(B.sum(axis=0)[ok] - dL_j[ok]).max())
+                )
 
         # accumulate finite pairs: source j == anchor u, distance d(i, u) from the pristine SPD.
         ii, jj = np.meshgrid(np.arange(n), np.arange(n), indexing="ij")
@@ -332,6 +461,8 @@ def run_grit_structural_carriage(task, cc: CarriageConfig) -> dict:
         all_F.append(F_ij[finite].astype(np.float64))
 
         del delta, pred_swap
+        if integrated:
+            del path_B, path_dL
         if device.type == "cuda":
             torch.cuda.empty_cache()
         if (gi_pos + 1) % max(1, n_graphs // 10) == 0 or gi_pos == 0:
@@ -357,6 +488,41 @@ def run_grit_structural_carriage(task, cc: CarriageConfig) -> dict:
         r, slope = float("nan"), float("nan")
 
     noop_frac = noop_total / max(partner_draws, 1)
+    if integrated:
+        ig_res = np.abs(np.concatenate(integrated_residual).astype(np.float64))
+        ig_qerr = np.concatenate(integrated_qerr).astype(np.float64)
+        ig_nint = np.concatenate(integrated_intervals).astype(np.int64)
+        nonempty_cancel = [x for x in integrated_cancellation if x.size]
+        ig_cancel = (
+            np.concatenate(nonempty_cancel).astype(np.float64)
+            if nonempty_cancel else np.asarray([], dtype=np.float64)
+        )
+        checks.update({
+            "integrated_atol": float(cc.integrated_atol),
+            "integrated_rtol": float(cc.integrated_rtol),
+            "integrated_max_intervals": int(cc.integrated_max_intervals),
+            "integrated_completeness_residual_p95": float(np.quantile(ig_res, 0.95)),
+            "integrated_completeness_residual_max": float(ig_res.max()),
+            "integrated_quadrature_error_p95": float(np.quantile(ig_qerr, 0.95)),
+            "integrated_quadrature_error_max": float(ig_qerr.max()),
+            "integrated_intervals_p95": float(np.quantile(ig_nint, 0.95)),
+            "integrated_intervals_max": int(ig_nint.max()),
+            "integrated_at_max_intervals_fraction": float(
+                np.mean(ig_nint >= int(cc.integrated_max_intervals))
+            ),
+            "integrated_endpoint_replay_max_abs": (
+                float(integrated_replay_max) if cc.verify else None
+            ),
+            "integrated_vs_clean_alone_dL_j_max": float(
+                integrated_full_loss_delta_max
+            ),
+            "integrated_cancellation_ratio_p95": (
+                float(np.quantile(ig_cancel, 0.95)) if ig_cancel.size else None
+            ),
+            "integrated_cancellation_ratio_max": (
+                float(ig_cancel.max()) if ig_cancel.size else None
+            ),
+        })
     checks.update({
         "intervention": "structural",
         "structural_mode": mode,
@@ -388,11 +554,25 @@ def run_grit_structural_carriage(task, cc: CarriageConfig) -> dict:
         f"({100*noop_frac:.1f}%) max|dh|={noop_max_dh:.3e} (within-batch => ~0)")
     log(f"  [9]  loss additivity r/slope     : r={r:.4f}, slope={slope:.4f}  (sum_i C_loss vs dL_j)")
     log(f"  [10] unreachable pairs (excluded): {unreachable_total}")
-    log(f"  [11] beneficial exactness        : max_j|sum_i B - dL_j| = {bexact_max:.3e} (must be ~0, "
-        f"unclamped sources)")
+    if integrated:
+        log(f"  [11] beneficial completeness     : max_j|sum_i B - dL_j| = "
+            f"{bexact_max:.3e} (path integral; no clipping)")
+        log(f"  [11b] path quadrature residual   : p95={checks['integrated_completeness_residual_p95']:.3e}, "
+            f"max={checks['integrated_completeness_residual_max']:.3e}; carrier-error "
+            f"p95={checks['integrated_quadrature_error_p95']:.3e}; intervals "
+            f"p95/max={checks['integrated_intervals_p95']:.0f}/{checks['integrated_intervals_max']}; "
+            f"at-cap={100*checks['integrated_at_max_intervals_fraction']:.1f}%")
+        log(f"  [11c] clean-target alignment     : max|dL_path-dL_clean-alone|="
+            f"{integrated_full_loss_delta_max:.3e}")
+        if cc.verify:
+            log(f"  [11d] pooled-head endpoint replay: max|dpred|={integrated_replay_max:.3e}")
+    else:
+        log(f"  [11] beneficial exactness        : max_j|sum_i B - dL_j| = "
+            f"{bexact_max:.3e} (must be ~0, unclamped sources)")
     if cc.beneficial_denom == "slope":
         log(f"  [11b] slope-clip activation      : {clamp_hit}/{clamp_moved} moved sources "
-            f"({(100.0*clamp_hit/max(1,clamp_moved)):.1f}%) hit |s_j|>1 (estimation noise near first-order~0)")
+            f"({(100.0*clamp_hit/max(1,clamp_moved)):.1f}%) hit |s_j|>1 "
+            f"(finite intervention not represented by the clean tangent)")
     if device.type == "cuda":
         log(f"  [mem] peak CUDA allocated        : {checks['peak_cuda_gib']:.2f} GiB")
 
@@ -410,9 +590,15 @@ def run_grit_structural_carriage(task, cc: CarriageConfig) -> dict:
                            f"prediction must be invariant. The transposition is missing a "
                            f"structure-derived channel (extend structural.NODE_STRUCT_ATTRS / "
                            f"PAIR_TENSORS).")
-    if bexact_max > tol:
+    if integrated and cc.verify and integrated_replay_max > tol:
+        raise RuntimeError(
+            f"Pooled-head endpoint replay moved predictions by {integrated_replay_max:.3e} "
+            f"> tol {tol:.1e}; integrated carriage is not reaching the model's exact "
+            f"post-transformer readout."
+        )
+    if not integrated and bexact_max > tol:
         raise RuntimeError(f"Beneficial exactness violated: max_j|sum_i B - dL_j|={bexact_max:.3e} "
-                           f"> tol {tol:.1e}; share attribution or loss donor-average miswired.")
+                           f"> tol {tol:.1e}; carrier attribution or loss donor-average miswired.")
 
     label = f"Structural {mode.replace('_', '-')} (anchor u, partner {cc.partner_match}-matched)"
     meta = {
@@ -431,6 +617,12 @@ def run_grit_structural_carriage(task, cc: CarriageConfig) -> dict:
         "fig_tag": f"structural_{mode}",
         "swap_word": "partner-swaps",
     }
+    if integrated:
+        meta.update({
+            "integrated_atol": float(cc.integrated_atol),
+            "integrated_rtol": float(cc.integrated_rtol),
+            "integrated_max_intervals": int(cc.integrated_max_intervals),
+        })
     return {
         "graph_id": gid,
         "carrier_i": np.concatenate(all_i), "source_j": np.concatenate(all_j),

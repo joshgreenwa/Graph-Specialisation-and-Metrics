@@ -76,7 +76,8 @@ def make_figures_and_save(results: dict, out_dir: str, n_boot: int = 2000,
     })
     ctag = {"median": "median", "trimmed": "20%-trimmed mean", "mean": "mean"}.get(central, central)
     tag = (_caption(meta, n_g, K)
-           + f"\nSPD bins ({bin_strategy}), {ctag} over graphs; denom={meta.get('beneficial_denom','slope')}")
+           + f"\nSPD bins ({bin_strategy}), {ctag} over graphs; "
+             f"benefit={meta.get('beneficial_denom','slope')}")
     self_col = C_ADV
     units = meta.get("loss_units", "MAE units")
     xt = list(ds)

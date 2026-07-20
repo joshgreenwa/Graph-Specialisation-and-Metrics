@@ -58,20 +58,51 @@ Magnitude of the output movement that `j` induces at `i`, over the `T` outputs:
 
 ## Beneficial carriage `B` (does the transport help the task?)
 
-Let `C_loss[i,j] = C^{g_loss}[i,j]` (signed loss-carriage). The **exact** per-source loss change
-(donor-average the *loss*, not the prediction — Jensen matters at the L1/BCE kink) is
+Let `C_loss[i,j] = C^{g_loss}[i,j]` denote the clean-gradient (first-order) loss carriage. The
+**exact** per-source loss change (donor-average the *loss*, not the prediction — Jensen matters
+at the L1/BCE kink) is
 
     dL_j = ℓ(clean) − (1/K) Σ_k ℓ(swap_{j,k})
 
-mapped to carriers, keeping the per-carrier sign and bounding the magnitude:
+The signed finite-loss option maps this change to carriers by integrating the task-loss
+gradient along each donor's **swapped-to-clean final-state path**:
 
-    B[i,j] = clip(dL_j / Σ_{i'} C_loss[i',j], −1, +1) · C_loss[i,j]   # DEFAULT (slope)
-             dL_j · |C_loss[i,j]| / Σ_{i'} |C_loss[i',j]|             # magnitude (collapses sign)
-             dL_j ·  C_loss[i,j]  / Σ_{i'}  C_loss[i',j]              # signed (legacy, blows up)
+    H_{j,k}(α) = H_swap(j,k) + α(H_clean − H_swap(j,k))
 
-`slope` keeps `C_loss`'s sign (adverse stays measurable) and is bounded — for a 1-Lipschitz loss
-(L1/BCE) `|B[i,j]| ≤ |C_loss[i,j]|`, so `B = 0` wherever `F = 0` (no delta ⇒ no carriage) and the
-far-tail blow-up is impossible; the clip only fires on estimation noise (`Σ C_loss ≈ 0`).
+    b[i,j,k] = ∫₀¹ <∂ℓ(ρ(H_{j,k}(α)),y)/∂h_i, Δh_i(j,k)> dα
+
+    B[i,j] = (1/K) Σ_k b[i,j,k]                                      # integrated
+
+Each donor is integrated **before** donor-averaging; integrating from the mean swapped state
+would decompose a different nonlinear loss. By the fundamental theorem of calculus,
+
+    Σ_i B[i,j] = ℓ(clean) − (1/K) Σ_k ℓ(swap_{j,k}) = dL_j.
+
+Here `clean` is the same-forward clean endpoint used by `Δh`, which cancels batch-context
+floating-point drift. `[11c]` compares the donor-averaged source loss change with the existing
+clean-alone `dL_j` target and aborts if the difference exceeds `tol`, so estimator comparisons
+cannot silently use different loss changes.
+
+Because add/mean pooling is linear, the implementation integrates only through GRIT's small
+pooling-to-MLP readout and projects the resulting cotangent back onto each carrier's `Δh_i`.
+Adaptive local Gauss–Kronrod quadrature resolves L1/ReLU kinks. It reports carrier-refinement
+error, endpoint completeness, and exact-head replay; a non-converged path aborts the run.
+There is **no ratio and no clipping**: positive and negative carrier terms may legitimately
+exceed `|dL_j|` while cancelling in their sum.
+This is an Aumann–Shapley allocation along the declared straight final-state path: complete and
+signed for that path, but path-dependent rather than a unique Shapley decomposition.
+
+The earlier estimators remain available for controlled comparison and backwards compatibility:
+
+    B[i,j] = clip(dL_j / Σ_{i'} C_loss[i',j], −1, +1) · C_loss[i,j]   # slope (default API)
+             dL_j · |C_loss[i,j]| / Σ_{i'} |C_loss[i',j]|             # magnitude
+             dL_j ·  C_loss[i,j]  / Σ_{i'}  C_loss[i',j]              # signed (legacy)
+
+`slope` is a fast clean-tangent approximation. Its clip prevents numerical blow-up, but clip
+activation means that the frozen clean gradient does not represent the finite intervention; it
+must not be interpreted as successful exact attribution. `magnitude` is complete and bounded but
+forces every carrier to inherit the source-level sign. `signed` is complete but unstable when its
+signed denominator cancels.
 
     B < 0  beneficial   (content reduced the error)
     B > 0  adverse      (content increased the error)
@@ -89,14 +120,17 @@ Pairs are pooled into adaptive shortest-path bins (`log` default: `{0},{1},{2},{
     B_far(k)        = per-graph SUM of B over d(i,j) > k, mean over graphs (at bin upper edges).
 
 `S` telescopes to `B_far` at bin edges. Every raw per-pair `(graph, i, j, d, C_loss, B, F)` is
-saved to `carriage_pairs.npz`, so any binning/estimator can be reproduced in retrospect.
+saved to `carriage_pairs.npz`, so every reported binning and aggregation can be recomputed.
+Recomputing a different carrier estimator requires rerunning the checkpoint because donor-path
+final states are intentionally not persisted.
 
 ## Key decisions (why)
 
-- **Slope attribution (default).** Keeps the per-carrier sign so adverse (`B>0`) is measurable, and
-  clips the per-source loss slope `dL_j / Σ C_loss` to `[−1,1]` so `|B| ≤ |C_loss|` — no far-tail
-  blow-up. `magnitude` (convex `|C|` shares, but collapses the sign) and `signed` (legacy, spikes)
-  are kept for comparison.
+- **Path-integrated attribution (recommended signed finite-loss option).** Integrates the exact
+  task-loss gradient from each swapped final state back to the within-batch clean state. It keeps
+  genuine carrier-level beneficial/adverse cancellation and reconstructs `dL_j` without a share
+  denominator. Adaptive quadrature diagnostics replace clipping. `slope` remains the default only
+  for notebook backwards compatibility; `magnitude` and `signed` remain comparison estimators.
 - **Loss-gradient beneficial basis.** For `T = 1` regression `g^loss = sign(ŷ−y)·g^out`, so
   `C_loss = sign(ŷ−y)·C^out` recovers the dissertation's error-direction projection (Eq. 3.8) and
   `B` is its exact `dL_j`-attribution; for `T > 1` (multi-target regression, multilabel) it is the
@@ -111,7 +145,10 @@ saved to `carriage_pairs.npz`, so any binning/estimator can be reproduced in ret
 
 `[5]` shared `g_i` (pooling) · `[6]` batch invariance (eval mode) · `[7]` no-op donors → 0 ·
 `[8]` structure invariance under swap · `[9]` loss additivity `Σ_i C_loss` vs `dL_j` ·
-`[10]` unreachable pairs excluded · `[11]` `Σ_i B = dL_j`. Plus a checkpoint-load metric
+`[10]` unreachable pairs excluded · `[11]` `Σ_i B = dL_j`. In `integrated` mode, `[11b]` reports
+quadrature residual/refinement and interval counts, `[11c]` checks clean-target alignment, and
+`[11d]` verifies that replaying the pooled head at captured endpoints reproduces the full model.
+Plus a checkpoint-load metric
 (`[4]`: MAE / AP) recomputed on the eval split.
 
 ## Reproduction
@@ -119,8 +156,11 @@ saved to `carriage_pairs.npz`, so any binning/estimator can be reproduced in ret
 - GRIT pinned to `6c988ea600a606fbb49a2246c64a2d37396b3ab5`; each task's config/params/metric are in
   `tasks.py` (`zinc`, `zinc_1hop`, `peptides_func`, `peptides_struct`).
 - Entry point `carriage.colab.run(task=..., …)`; the notebook cells in `experiments/carriage/`
-  clone this repo (via `dissertation_key`) and call it. Key args: `beneficial_denom`
-  (`slope`|`magnitude`|`signed`), `bin_strategy` (`log`|`hop`|`equal_count`), `central`
+  clone this repo (via `dissertation_key`) and call it. For signed finite-loss attribution use
+  `beneficial_denom="integrated"` (the argument name is retained for compatibility); available
+  values are `integrated`|`slope`|`magnitude`|`signed`. Quadrature controls are
+  `integrated_atol`, `integrated_rtol`, and `integrated_max_intervals`. Other key args:
+  `bin_strategy` (`log`|`hop`|`equal_count`), `central`
   (`trimmed`|`median`|`mean`), `num_graphs`, `donors` (K).
 - Outputs per task under `…/carriage_figures/<task>/`: three figures, `carriage_pairs.npz`
   (raw pairs + curves), `carriage_summary.json` (curves + settings + checks).

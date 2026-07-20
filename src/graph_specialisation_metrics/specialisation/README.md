@@ -7,92 +7,8 @@ everything below runs from there.
 
 ```python
 from graph_specialisation_metrics.specialisation import run
-run(
-    tasks=["zinc", "zinc_1hop"],
-    num_graphs=200,
-    donors=8,
-    causal_extension=True,   # default
-)
+run(tasks=["zinc", "zinc_1hop"], num_graphs=200, donors=8, ablation_graphs=256)
 ```
-
-Set `causal_extension=False` to recover the original score → zero-ablation → attention-grid
-pipeline. `legacy_outputs=True` writes those appendix artefacts alongside the causal extension.
-The default paper path intentionally promotes only two figures per task.
-
-## Default paper extension: held-out causal evidence
-
-The raw score is a discovery statistic, not itself a causal treatment. The default command now
-uses the score graphs only for discovery and chooses confirmation molecules from their exact
-complement. It freezes the atom donors, RRWP-role partners, specialised head rankings, and matched
-controls before any confirmation measurement.
-
-### 1. Channel-specific causal mediation
-
-Positive channel scores are calibrated on discovery heads,
-
-```
-s_h = S_sem,h / mean_h(S_sem,h)        r_h = S_RRWP,h / mean_h(S_RRWP,h)
-I_h = s_h + r_h                        q_h = (s_h - r_h) / (I_h + eps)
-```
-
-where `I` is overall path importance and `q` is semantic-versus-RRWP-role preference. Preference
-ranking is restricted to an importance floor; the semantic and RRWP top-k sets are explicitly
-disjoint. On held-out ZINC molecules the runner evaluates every single head and cumulative
-`k = 1,2,4,8` groups with layer/importance-matched controls:
-
-- **noising** — insert counterfactual `wV` head states into the clean computation;
-- **denoising** — insert clean `wV` head states into the counterfactual computation.
-
-For `delta = pred_cf - pred_clean` and patched displacement `m`, the primary estimator is the
-stable, unclipped ratio of sums `beta = sum <m,delta> / sum ||delta||²`. Signed ZINC `delta MAE` is
-stored separately. Inference resamples whole molecules and recomputes the paired semantic/RRWP
-double dissociation. The output also contains group-minus-summed-single interactions, a continuous
-`q × channel` test controlling for importance and layer, and a within-layer permutation p-value.
-
-### 2. Static routing versus effective relational transport
-
-Attention maps are not treated as transport. For every clean GRIT layer the extension reconstructs
-the exact edge contribution, including the `VeRow` edge-enhancement term,
-
-```
-P_ijh = A_ijh * (V_jh + E_ijh VeRow_h)       wV_ih = sum_j P_ijh,
-```
-
-and blocks mechanistic estimates if the reconstruction does not equal the captured `wV`. A
-maximum-entropy static-routing null is found on the **same support** with the same receiver and
-source attention marginals. It is therefore valid for dense and 1-hop GRIT; on dense support it is
-exactly the receiver-repeated column mean.
-
-Effective head transport is read after GRIT's degree scaler and before `O_h`, then projected through
-the exact per-head block of `O_h`. Within each molecule it is decomposed as `U = B + R`, where `B`
-is receiver-broadcast and `R` is zero-mean receiver-specific transport. Causal confirmation runs
-measure:
-
-- support/marginal-matched routing staticisation;
-- broadcast-only transport (`R` removed);
-- deterministic within-molecule residual permutation (mean, norm and multiset preserved);
-- full selected-head zeroing;
-- separate content-residual and edge-residual removal.
-
-Hard checks cover pair → `wV`, degree-scaled `U`, per-head `O_h`, broadcast/residual and component
-energy identities, static-routing marginals, residual-permutation preservation, and parity with the
-existing whole-head ablation. A failed check blocks every downstream mechanism estimate but still
-writes the failure diagnostic and headline failure figure, so a real null and an invalid analysis
-cannot be confused.
-
-### Headline figures and reproducibility artefacts
-
-The default command writes PNG (300 dpi) and vector PDF versions under `paper/`:
-
-1. `fig_channel_causal_mediation_<task>` — discovery selection plus held-out noising and denoising
-   double dissociation. A CI crossing zero is labelled as unresolved rather than hidden.
-2. `fig_effective_relational_transport_<task>` — receiver-specific routing (distance from the
-   support- and source-marginal-matched static null) versus effective
-   projected relational transport, top-k necessity, and the component interventions. Invalid exact
-   reconstruction is shown as a failed analysis, never as a mechanism result.
-
-Per-head selection, the frozen intervention bank, every patched prediction, per-graph causal
-endpoints, head metrics, checks, and summaries are stored under `<task>/causal_extension/`.
 
 ## Task-general — one central methodology, many models
 
@@ -158,7 +74,7 @@ The transport delta uses a **within-batch clean baseline** (replica 0 of every f
 exactly like `carriage.grit_runner`, so a no-op donor / self-transposition gives ~0 and the
 batch-context float32 offset cancels.
 
-## Legacy / appendix deliverables (per model, written to Drive)
+## The four deliverables (per model, written to Drive)
 
 1. `fig_scatter_<task>.png` — structural (x) vs semantic (y) score per head, coloured by layer;
    axes divided by each channel's global mean so the diagonal is amplitude-normalised-equal
@@ -198,10 +114,7 @@ batch-context float32 offset cancels.
 | `scores.py` | per-head `S_sem` / `S_str` (transport) + `S_attn_sem` (selection); `select_heads` |
 | `ablation.py` | causal head ablation vs random-head null, per-graph, feature correlations |
 | `attention_viz.py` | per-head attention maps across molecules |
-| `figures.py` | the four legacy appendix deliverables + cross-model scatter |
-| `causal_mediation.py` | held-out bidirectional channel-specific head mediation |
-| `effective_transport.py` | exact static-routing and effective relational-transport decomposition |
-| `paper_figures.py` | the two failure-aware headline figures (PNG + PDF) |
-| `colab.py` | `run()`: default paper workflow plus explicit legacy reversion; collates on Drive |
+| `figures.py` | the four deliverables + cross-model scatter |
+| `colab.py` | `run()`: one-call orchestration for both models; figures collate on Drive |
 
 Deleting this package leaves the carriage path untouched (it only imports *from* carriage).
