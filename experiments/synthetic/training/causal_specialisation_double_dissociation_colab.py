@@ -14,13 +14,19 @@ official LiamMa/GRIT ``GritTransformerLayer`` at the repository-pinned commit.  
 Tasks
 -----
 ``semantic``
-    A marked query carries the key of one other node and must return that node's random
-    value class.  The target position is random and independent of graph structure.
+    A marked query and source identify one other node and the model must return that
+    node's random value class.  The source position is random and independent of graph
+    structure.  Its key is also placed at the query as a redundant associative cue.
 
 ``structural``
     A query and anchor are marked and the model must classify their shortest-path distance
     on an even cycle.  Node keys/values are independent distractors.  This task depends on
     the RRWP payload but not on semantic payload values.
+
+The source/anchor marker is deliberately shared across tasks.  It controls away the difficulty
+of discovering an address: the causal comparison is whether a head transports the marked node's
+semantic value or its structural relation to the query, not whether GRIT can first learn a large
+categorical equality circuit.
 
 Interventions
 -------------
@@ -78,7 +84,7 @@ from typing import Any, Iterable, Mapping, Sequence
 import numpy as np
 
 
-EXPERIMENT_VERSION = "causal-specialisation-double-dissociation-v1"
+EXPERIMENT_VERSION = "causal-specialisation-double-dissociation-v2-shared-source-marker"
 OFFICIAL_GRIT_URL = "https://github.com/LiamMa/GRIT.git"
 OFFICIAL_GRIT_COMMIT = "6c988ea600a606fbb49a2246c64a2d37396b3ab5"
 DEFAULT_GRIT_DIR = "/content/GRIT"
@@ -195,7 +201,7 @@ def write_csv(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
 
 @dataclass(frozen=True)
 class Config:
-    run_name: str = "cycle_dual_v1"
+    run_name: str = "cycle_dual_v2"
     drive_root: str = DEFAULT_DRIVE_ROOT
     n: int = 16
     key_vocab: int = 32
@@ -226,7 +232,7 @@ class Config:
 
     @property
     def feature_dim(self) -> int:
-        # key | value | semantic query-key | query | anchor | semantic-mode | structural-mode
+        # key | value | semantic query-key | query | shared source/anchor | semantic-mode | structural-mode
         return 2 * self.key_vocab + self.classes + 4
 
     @property
@@ -317,7 +323,7 @@ def make_batch(cfg: Config, size: int, seed: int, mode: int | None = None) -> Sy
     value_start = cfg.key_vocab
     query_key_start = cfg.key_vocab + cfg.classes
     query_flag = 2 * cfg.key_vocab + cfg.classes
-    anchor_flag = query_flag + 1
+    source_flag = query_flag + 1
     sem_mode_flag = query_flag + 2
     str_mode_flag = query_flag + 3
 
@@ -342,6 +348,9 @@ def make_batch(cfg: Config, size: int, seed: int, mode: int | None = None) -> Sy
             target = int(rng.choice(candidates))
             target_idx[b] = target
             xs[b, q, query_key_start + keys[target]] = 1.0
+            # Use the same role marker as the structural anchor.  This makes addressing
+            # difficulty identical across modes while the required payload remains orthogonal.
+            xs[b, target, source_flag] = 1.0
             xs[b, q, sem_mode_flag] = 1.0
             ys[b] = int(values[target])
         else:
@@ -351,7 +360,7 @@ def make_batch(cfg: Config, size: int, seed: int, mode: int | None = None) -> Sy
             target_idx[b] = anchor
             anchor_idx[b] = anchor
             xs[b, q, str_mode_flag] = 1.0
-            xs[b, anchor, anchor_flag] = 1.0
+            xs[b, anchor, source_flag] = 1.0
             ys[b] = d - 1
 
     return SynthBatch(
@@ -1056,7 +1065,7 @@ def analyze_seed(
         model, cfg, mode=MODE_STRUCTURAL, factor="structural", seed=300_000 + seed, device=device
     )
     # Negative-control channels: value swaps should not solve the structural task; RRWP
-    # transpositions should not matter to content-key retrieval.
+    # transpositions should not matter to marked-source value retrieval.
     semantic_on_structural_pg = score_channel(
         model, cfg, mode=MODE_STRUCTURAL, factor="semantic", seed=400_000 + seed, device=device
     )
@@ -1684,7 +1693,7 @@ def make_config(args: argparse.Namespace) -> Config:
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Causal semantic/structural GRIT head validation in one Colab cell")
-    parser.add_argument("--run-name", default="cycle_dual_v1")
+    parser.add_argument("--run-name", default="cycle_dual_v2")
     parser.add_argument("--drive-root", default=DEFAULT_DRIVE_ROOT)
     parser.add_argument("--grit-dir", default=DEFAULT_GRIT_DIR)
     parser.add_argument("--phase", choices=("all", "train", "analyze", "figures"), default="all")
@@ -1798,7 +1807,7 @@ def main(argv: Sequence[str] | None = None) -> dict[str, Any]:
 
 if __name__ == "__main__":
     main([
-        "--run-name", "cycle_dual_v1",
+        "--run-name", "cycle_dual_v2",
         "--phase", "all",
         "--seeds", "0", "1", "2",
         "--steps", "3000",

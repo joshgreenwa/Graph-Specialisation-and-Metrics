@@ -7,8 +7,9 @@ attention behaviour outside ZINC.
 
 `training/causal_specialisation_double_dissociation_colab.py` is a single-cell,
 official-GRIT experiment for causal validation of the production semantic and structural
-head scores. A dense GRIT jointly learns content-key retrieval and structural
-anchor-distance classification on the same cycle graphs. It then runs planted-source
+head scores. A dense GRIT jointly learns marked-source value retrieval and structural
+source-distance classification on the same cycle graphs. The shared source marker controls
+addressing difficulty, leaving semantic payload versus RRWP relation as the task contrast. It then runs planted-source
 scoring, every-head pre-output ablation, and clean-to-corrupt head-output patching.
 
 Paste the complete file into Colab and run it. The default three-seed run mounts Drive,

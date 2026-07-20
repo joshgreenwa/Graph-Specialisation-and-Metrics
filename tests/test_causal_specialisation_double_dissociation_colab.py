@@ -50,6 +50,9 @@ def test_dual_task_is_balanced_and_labels_are_valid():
     assert int((batch.mode == module.MODE_STRUCTURAL).sum()) == 10
     assert int(batch.y.min()) >= 0
     assert int(batch.y.max()) < cfg.classes
+    source_flag = 2 * cfg.key_vocab + cfg.classes + 1
+    rows = torch.arange(len(batch))
+    assert torch.equal(batch.x[rows, batch.target_idx, source_flag], torch.ones(len(batch)))
 
 
 def test_semantic_and_structural_interventions_change_only_declared_factor():
