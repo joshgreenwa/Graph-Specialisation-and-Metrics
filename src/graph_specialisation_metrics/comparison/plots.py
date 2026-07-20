@@ -193,23 +193,27 @@ def plot_spec_DJ_grid(scores_by_task: dict, tasks: Sequence[str], out_path,
                       *, gsem: Optional[float] = None, gstr: Optional[float] = None,
                       ncols: Optional[int] = None, metrics_by_task: Optional[dict] = None,
                       ref_tasks: Optional[Sequence[str]] = None,
-                      suptitle: str = ("Per-head specialisation: selectivity D (x) vs "
-                                       "joint strength J (y)")):
-    """(ii-b) Side-by-side per-model scatter of D (x) vs J (y), layer-coloured.
+                      selectivity: str = "relative", eps: float = 1e-9,
+                      suptitle: Optional[str] = None):
+    """(ii-b) Side-by-side per-model scatter of selectivity D (x) vs joint strength J (y).
 
     Using the amplitude-normalised scores S~ = raw / channel-mean (same ``gsem``/``gstr`` as the
     S_str-vs-S_sem grid), each head maps to::
 
-        J = (S~_sem + S~_str) / 2     joint strength (how influential the head is overall)
-        D = (S~_sem - S~_str) / 2     selectivity  (>0 semantic-leaning, <0 structural-leaning)
+        J = (S~_sem + S~_str) / 2                          joint strength (overall influence)
+        D_raw = (S~_sem - S~_str) / 2                       raw selectivity
+        D_rel = (S~_sem - S~_str) / (S~_sem + S~_str + eps) relative selectivity, bounded ~[-1,1]
 
-    This is a 45 degrees rotation of the (S~_str, S~_sem) plane that separates *strength* from
-    *preference*: high J = influential, sign of D = which channel it prefers, low J = inert.
-    The D-J plane limits are fixed from ``ref_tasks`` (default: all cached models) so dropping or
+    ``selectivity="relative"`` (default) plots D_rel, which -- unlike raw D -- does not mechanically
+    grow with J, so it is comparable across heads of different strength; ``"raw"`` plots D_raw.
+    Either way >0 = semantic-leaning, <0 = structural-leaning; high J = influential, low J = inert.
+    The plane limits are fixed from ``ref_tasks`` (default: all cached models) so dropping or
     including methods does not rescale the plane. Returns (fig, path).
     """
     import matplotlib.pyplot as plt
 
+    if selectivity not in ("relative", "raw"):
+        raise ValueError(f"selectivity must be 'relative' or 'raw', got {selectivity!r}")
     tasks = [t for t in tasks if t in scores_by_task]
     if not tasks:
         raise ValueError("plot_spec_DJ_grid: no cached score matrices for the given tasks.")
@@ -219,7 +223,10 @@ def plot_spec_DJ_grid(scores_by_task: dict, tasks: Sequence[str], out_path,
     def _DJ(t):
         ssem = scores_by_task[t]["S_sem"] / gsem
         sstr = scores_by_task[t]["S_str"] / gstr
-        return 0.5 * (ssem - sstr), 0.5 * (ssem + sstr)   # (D, J)
+        J = 0.5 * (ssem + sstr)
+        D = ((ssem - sstr) / (ssem + sstr + eps) if selectivity == "relative"
+             else 0.5 * (ssem - sstr))
+        return D, J
 
     # Fixed plane from the reference set so the axes are stable across drop/include selections.
     lim_tasks = [t for t in (ref_tasks or list(scores_by_task.keys())) if t in scores_by_task]
@@ -255,14 +262,19 @@ def plot_spec_DJ_grid(scores_by_task: dict, tasks: Sequence[str], out_path,
         if idx % ncols == 0:
             ax.set_ylabel(r"joint strength  $J=(\tilde S_{\rm sem}+\tilde S_{\rm str})/2$")
         if idx // ncols == nrows - 1:
-            ax.set_xlabel(r"selectivity  $D=(\tilde S_{\rm sem}-\tilde S_{\rm str})/2$"
-                          "\n($<0$ structural  ·  $>0$ semantic)")
+            xlab = (r"relative selectivity  $D_{\rm rel}=\frac{\tilde S_{\rm sem}-\tilde S_{\rm str}}"
+                    r"{\tilde S_{\rm sem}+\tilde S_{\rm str}}$" if selectivity == "relative"
+                    else r"selectivity  $D=(\tilde S_{\rm sem}-\tilde S_{\rm str})/2$")
+            ax.set_xlabel(xlab + "\n($<0$ structural  ·  $>0$ semantic)")
     for j in range(n, nrows * ncols):
         axes[j // ncols][j % ncols].axis("off")
     if sc is not None:
         cb = fig.colorbar(sc, ax=axes.ravel().tolist(), shrink=0.8, pad=0.01)
         cb.set_label("layer")
-    fig.suptitle(suptitle, fontsize=12)
+    sup = suptitle or (f"Per-head specialisation: "
+                       f"{'relative ' if selectivity == 'relative' else ''}selectivity "
+                       f"{'D_rel' if selectivity == 'relative' else 'D'} (x) vs joint strength J (y)")
+    fig.suptitle(sup, fontsize=12)
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path, dpi=150)
