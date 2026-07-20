@@ -77,6 +77,8 @@ def run(
     donors: int = 8,
     max_sources: Optional[int] = None,
     with_attn_routing: bool = True,
+    with_ablation: bool = True,
+    with_attention: bool = True,
     ablation_graphs: int = 256,
     n_random_pairs: int = 300,
     n_attention_molecules: int = 5,
@@ -150,40 +152,57 @@ def run(
             analysis_seed=analysis_seed, partner_match=partner_match,
         )
 
-        # --- (1) per-head scores ---
+        # --- (1) per-head scores (always) ---
         result = score_model(spec, sc, with_attn_routing=with_attn_routing,
                              max_sources=max_sources, seed=analysis_seed)
-        # --- (2) ablation ---
-        abl = ablation_mod.run_ablation(result, sc, seed=analysis_seed, n_random_pairs=n_random_pairs)
-        # --- (3) attention capture for the interesting heads across molecules ---
-        hoi = select_heads(result["S_sem"], result["S_str"])
-        mol_ids = _pick_attention_molecules(abl, n_attention_molecules)
-        attn = attention_viz.collect_attention(result["gm"], mol_ids, list(hoi.values()),
-                                               seed=analysis_seed)
+        # --- (2) ablation (optional; the score-only path for cross-model comparison skips it) ---
+        abl = None
+        if with_ablation:
+            abl = ablation_mod.run_ablation(result, sc, seed=analysis_seed,
+                                            n_random_pairs=n_random_pairs)
+        # --- (3) attention capture for the interesting heads (optional; needs ablation's
+        #         per-graph features to pick a molecule spread) ---
+        attn = None
+        mol_ids: list = []
+        if with_attention and abl is not None:
+            hoi = select_heads(result["S_sem"], result["S_str"])
+            mol_ids = _pick_attention_molecules(abl, n_attention_molecules)
+            attn = attention_viz.collect_attention(result["gm"], mol_ids, list(hoi.values()),
+                                                   seed=analysis_seed)
 
-        # --- persist per-task artefacts (Drive) ---
-        np.savez(task_out / f"scores_{spec.name}.npz",
-                 S_sem=result["S_sem"], S_str=result["S_str"],
-                 S_attn_sem=(result["S_attn_sem"] if result["S_attn_sem"] is not None
-                             else np.zeros_like(result["S_sem"])),
-                 func_mean=abl["func_mean"], loss_mean=abl["loss_mean"])
+        # --- persist per-task artefacts (Drive). The scores_<task>.npz S_sem/S_str [L,H]
+        #     matrices are the per-head cache the cross-model deliverables consume. ---
+        savez_kw = dict(
+            S_sem=result["S_sem"], S_str=result["S_str"],
+            S_attn_sem=(result["S_attn_sem"] if result["S_attn_sem"] is not None
+                        else np.zeros_like(result["S_sem"])),
+        )
+        if abl is not None:
+            savez_kw.update(func_mean=abl["func_mean"], loss_mean=abl["loss_mean"])
+        np.savez(task_out / f"scores_{spec.name}.npz", **savez_kw)
         stats = {
             "title": result["title"], "test_metric": result["test_metric"],
             "test_metric_name": result["test_metric_name"],
+            "val_metric": result.get("val_metric"), "val_metric_name": result.get("val_metric_name"),
             "num_graphs": result["num_graphs"], "donors_K": result["donors_K"],
-            "checks": result["checks"], "heads_of_interest": abl["heads_of_interest"],
-            "target_stats": abl["target_stats"], "pair_stats": abl["pair_stats"],
-            "score_impact_corr": abl["score_impact_corr"], "feature_corr": abl["feature_corr"],
-            "attention_molecules": mol_ids,
+            "checks": result["checks"], "attention_molecules": mol_ids,
         }
+        if abl is not None:
+            stats.update({
+                "heads_of_interest": abl["heads_of_interest"],
+                "target_stats": abl["target_stats"], "pair_stats": abl["pair_stats"],
+                "score_impact_corr": abl["score_impact_corr"], "feature_corr": abl["feature_corr"],
+            })
         (task_out / f"stats_{spec.name}.json").write_text(
             json.dumps(_to_jsonable(stats), indent=2), encoding="utf-8")
 
         # drop the model reference before switching GRIT clones (frees GPU + avoids stale import).
         result.pop("gm", None)
         results[task_name] = result
-        ablations[task_name] = abl
-        attns[task_name] = attn
+        if abl is not None:
+            ablations[task_name] = abl
+        if attn is not None:
+            attns[task_name] = attn
         per_task_meta[task_name] = stats
         try:
             import torch

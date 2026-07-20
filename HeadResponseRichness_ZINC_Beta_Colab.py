@@ -8,9 +8,11 @@ Run this file as a single Colab cell. It compares:
 
 The experiment reuses the established semantic donor swap, mask-frozen structural
 transposition, and per-head transport score. It then tests whether those scores predict
-pre-head ablation impact, whether score-selected semantic/structural families selectively
-rescue their matching corruption, and whether graphwise channel responses explain the paired
-accuracy gaps between checkpoints. The previous effective-response-rank beta is not run.
+pre-head ablation impact. Its focused global-vs-local test then measures high-order RRWP
+coordinate distinctions unavailable to the local-only substrate and asks whether, graph by
+graph, their loss is associated with causal-importance-weighted semantic compensation and the
+paired local-model error penalty. This pathway is associative, not causal mediation. The prior
+effective-rank, single-head rescue, and generic channel-response gap analyses are not run.
 
 Prerequisites: the ``dissertation_key`` Colab secret and all three checkpoints on Drive.
 Outputs are written under:
@@ -69,14 +71,10 @@ for _module in [
 from graph_specialisation_metrics.specialisation.richness_beta import run  # noqa: E402
 
 result = run(
-    num_graphs=128,
+    num_graphs=256,               # paired graphs; reduce to 128 only for a faster pilot
     donors=8,
     max_sources=None,             # all ZINC nodes
-    rescue_graphs=128,            # independent eval graphs held out from score estimation
-    rescue_batch_size=64,
-    family_size=3,                # selected from scores only
-    n_null=1000,                  # layer/throughput-matched family nulls
-    n_boot=1000,                  # graph-paired bootstrap intervals
+    n_boot=2000,                  # graph-paired bootstrap intervals
     skip_install=False,           # True only if dependencies already exist in this runtime
     mount=False,                  # Drive was mounted above
 )

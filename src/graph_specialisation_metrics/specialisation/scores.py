@@ -131,6 +131,16 @@ def score_model(task, sc: SpecConfig, *, with_attn_routing: bool = True,
     adapter = gm.adapter
     rng = np.random.default_rng(seed)
 
+    # A global-VNode model's attention support includes virtual-node edges, which are not
+    # slot-comparable across replicas (and inflate the edge set), so the edge-based attention-
+    # routing score is not defined for it. The per-head TRANSPORT scores S_sem/S_str are the
+    # primary readout and are unaffected (wV is restricted to real nodes in capture()).
+    has_vnode = getattr(getattr(model, "model", model), "global_vnode", None) is not None
+    attn_enabled = with_attn_routing and not has_vnode
+    if has_vnode and with_attn_routing:
+        log("[scale] global-VNode model: attention-routing (selection) score disabled; "
+            "transport scores S_sem/S_str unaffected.")
+
     donor_rows, donor_gids = _build_donor_pool(gm)
     F_feat = donor_rows.shape[1]
     log(f"[donors] pool={donor_rows.shape[0]} rows over {len(gm.donor_ds)} graphs (F={F_feat}).")
@@ -160,14 +170,20 @@ def score_model(task, sc: SpecConfig, *, with_attn_routing: bool = True,
         # F = sqrt(sum_t (phi_t . Dbar-o)^2), exactly carriage.core.functional_magnitude. For a
         # scalar target (T=1, ZINC) this reduces to |phi . Dbar-o|.
         cb = Batch.from_data_list([base]).to(device)
-        cap = gm.capture(cb, want_grad=True, want_attn=with_attn_routing)
+        cap = gm.capture(cb, want_grad=True, want_attn=attn_enabled)
         pred_c = cap["pred"].reshape(-1)                            # [T]
         T = int(pred_c.numel())
         phi_stack = []                                             # [L] of [T, n, H, dh]
+        # grad is taken over the FULL wV (incl. any virtual-node rows so autograd stays intact);
+        # restrict phi to real nodes so it aligns with the real-node transport deltas below.
+        rmask = cap.get("real_mask")
         grads_t = [torch.autograd.grad(pred_c[t], cap["wV"], retain_graph=(t < T - 1))
-                   for t in range(T)]                              # grads_t[t] = [L] of [n,H,dh]
+                   for t in range(T)]                              # grads_t[t] = [L] of [N,H,dh]
         for l in range(L):
-            phi_stack.append(torch.stack([grads_t[t][l].detach() for t in range(T)]))  # [T,n,H,dh]
+            stacked = torch.stack([grads_t[t][l].detach() for t in range(T)])  # [T,N,H,dh]
+            if rmask is not None:
+                stacked = stacked[:, rmask]                        # [T,n,H,dh] real nodes only
+            phi_stack.append(stacked)
         del grads_t
 
         # Effective per-graph source cap. The score is a POOLED mean over measured (graph, source)
@@ -192,9 +208,9 @@ def score_model(task, sc: SpecConfig, *, with_attn_routing: bool = True,
         # Per-graph attention-routing gate: dAbar = [S, E, H] with E = attention edges/replica
         # (n^2 for the dense full-attention support), which blows up on large graphs. The
         # transport score is unaffected; only the (secondary) selection-site score is skipped.
-        graph_attn = with_attn_routing
+        graph_attn = attn_enabled
         E = 0
-        if with_attn_routing:
+        if attn_enabled:
             E = int(cap["attn"][0].shape[0])
             if E * S * H * L * 4 * 3 > 2e9:
                 graph_attn = False
@@ -277,7 +293,8 @@ def score_model(task, sc: SpecConfig, *, with_attn_routing: bool = True,
                 source_nodes=np.asarray(sources, dtype=np.int64),
                 phi_stack=phi_stack, donor_averaged_delta=[x / K for x in dObar],
                 clean_prediction=pred_c.detach(),
-                clean_head_output=[x.detach() for x in cap["wV"]],
+                clean_head_output=[(x[rmask] if rmask is not None else x).detach()
+                                   for x in cap["wV"]],
             )
         tot_sem_sources += S
         if graph_attn:
@@ -356,7 +373,8 @@ def score_model(task, sc: SpecConfig, *, with_attn_routing: bool = True,
                 source_nodes=np.asarray(sources, dtype=np.int64),
                 phi_stack=phi_stack, donor_averaged_delta=[x / K for x in dObar],
                 clean_prediction=pred_c.detach(),
-                clean_head_output=[x.detach() for x in cap["wV"]],
+                clean_head_output=[(x[rmask] if rmask is not None else x).detach()
+                                   for x in cap["wV"]],
             )
         tot_str_anchors += S
 
@@ -397,6 +415,8 @@ def score_model(task, sc: SpecConfig, *, with_attn_routing: bool = True,
         "S_sem": S_sem, "S_str": S_str, "S_attn_sem": S_attn if attn_measured else None,
         "L": L, "H": H, "dh": dh, "n_heads": H, "n_layers": L, "T": T,
         "test_metric": gm.test_metric, "test_metric_name": gm.checks["test_metric_name"],
+        "val_metric": getattr(gm, "val_metric", None),
+        "val_metric_name": gm.checks.get("val_metric_name"),
         "num_graphs": int(len(graph_ids)), "donors_K": K,
         "checks": {"softmax_err": softmax_err, "noop_max": noop_max,
                    "relabel_inv_max": relabel_inv_max, **gm.checks},

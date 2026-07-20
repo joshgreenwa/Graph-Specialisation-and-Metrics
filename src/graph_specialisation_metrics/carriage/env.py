@@ -213,8 +213,22 @@ def find_checkpoint(results_root: Path, explicit: Optional[str] = None) -> tuple
         )
     candidates = sorted(results_root.glob("**/ckpt/*.ckpt"))
     if not candidates:
+        # Fallback: the k-hop/VNode ZINC runner (GRIT_khop_ZINC.py) writes stable, Colab-safe
+        # recovery copies under results/_recovery_checkpoints/seed<seed>_<name_tag>/ rather than
+        # GraphGym's <cfg>/<seed>/ckpt/<epoch>.ckpt. Prefer best.ckpt (best validation) over
+        # latest.ckpt. These are byte-identical GraphGym save_ckpt() outputs, so they load the
+        # same way; their stem is non-numeric, so the epoch is reported as -1.
+        for stem in ("best.ckpt", "latest.ckpt", "first_after_resume.ckpt"):
+            rec = sorted(results_root.glob(f"_recovery_checkpoints/**/{stem}"))
+            if rec:
+                chosen = max(rec, key=lambda p: p.stat().st_mtime)
+                log(f"[ckpt] No GraphGym ckpt/ dir; using recovery checkpoint: {chosen} "
+                    f"(prefer={stem})")
+                return chosen, -1
         raise FileNotFoundError(
-            f"No *.ckpt under {results_root}/**/ckpt/. Has training saved a checkpoint?"
+            f"No *.ckpt under {results_root}/**/ckpt/ and no "
+            f"{results_root}/_recovery_checkpoints/**/(best|latest).ckpt. "
+            f"Has training saved a checkpoint?"
         )
     log(f"[ckpt] Found {len(candidates)} checkpoint file(s) under {results_root}:")
     for c in candidates:

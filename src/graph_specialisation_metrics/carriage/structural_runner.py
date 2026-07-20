@@ -177,15 +177,32 @@ def run_grit_structural_carriage(task, cc: CarriageConfig) -> dict:
                 f"{task.metric_abort}. The checkpoint almost certainly did not load correctly. "
                 f"Refusing to report carriage."
             )
+        # Validation metric alongside test (loaders[1]=val), for reporting only -- no abort.
+        t0 = time.perf_counter()
+        vpreds, vtrues = collect_preds(loaders[1])
+        val_metric = float(task.metric_fn(vpreds, vtrues))
+        log(f"[verify] val {metric_name} recomputed from checkpoint: {val_metric:.5f} "
+            f"[{time.perf_counter()-t0:.1f}s]")
+        checks["val_metric"] = val_metric
+        checks["val_metric_name"] = metric_name
     else:
         checks["test_metric"] = None
         checks["test_metric_name"] = metric_name
+        checks["val_metric"] = None
+        checks["val_metric_name"] = metric_name
 
     # ---- h^L capture (the tensor entering post_mp) -------------------------------------
+    # A global-VNode model's layers output carries appended virtual-node row(s) (stripped just
+    # before post_mp). Under grad (the clean readout pass) keep the FULL tensor so autograd.grad
+    # reaches h; under no_grad (transport passes) strip the virtual rows so h aligns with real-node
+    # indexing. The readout gradients are restricted to real nodes below. No-op without a VNode.
     store: dict = {}
 
     def _hook(_m, _i, output):
-        store["h"] = output.x
+        mask = getattr(output, "real_node_mask", None)
+        store["real_mask"] = mask
+        store["h"] = (output.x[mask] if (mask is not None and not torch.is_grad_enabled())
+                      else output.x)
 
     handle = model.model.layers.register_forward_hook(_hook)
     dim_h = int(cfg.gnn.dim_inner)
@@ -241,8 +258,8 @@ def run_grit_structural_carriage(task, cc: CarriageConfig) -> dict:
         cb = Batch.from_data_list([base]).to(device)
         with torch.enable_grad():
             pred_c, true_c = model(cb)
-            h_clean_t = store["h"]
-            assert h_clean_t.shape == (n, dim_h), f"h^L {tuple(h_clean_t.shape)} != {(n, dim_h)}"
+            h_clean_t = store["h"]                                       # [N, m]; N=n(+vnode rows)
+            rmask = store.get("real_mask")
             T = int(pred_c.view(pred_c.shape[0], -1).shape[1])
             pred_row = pred_c.view(-1)
             g_out = torch.stack([
@@ -251,9 +268,17 @@ def run_grit_structural_carriage(task, cc: CarriageConfig) -> dict:
             ])
             L_c = metrics.per_graph_loss(pred_c, true_c, loss_fun).sum()
             g_loss_t = torch.autograd.grad(L_c, h_clean_t)[0]
-        h_clean = h_clean_t.detach()
-        g_loss = g_loss_t.detach()
-        g_out = g_out.detach()
+        # Restrict h^L + readout gradients to REAL nodes (a global-VNode row has zero readout
+        # gradient and would fail precondition [5] / mis-shape transport). No-op without a vnode.
+        if rmask is not None:
+            h_clean = h_clean_t.detach()[rmask]
+            g_loss = g_loss_t.detach()[rmask]
+            g_out = g_out.detach()[:, rmask]
+        else:
+            h_clean = h_clean_t.detach()
+            g_loss = g_loss_t.detach()
+            g_out = g_out.detach()
+        assert h_clean.shape == (n, dim_h), f"h^L {tuple(h_clean.shape)} != {(n, dim_h)}"
         true_vec = true_c.detach().view(1, -1).float()
         L_clean = float(metrics.per_graph_loss(pred_c.detach(), true_c.detach(), loss_fun)[0].item())
         pred_clean_row = pred_c.detach().view(-1)
@@ -639,6 +664,7 @@ def run_grit_structural_carriage(task, cc: CarriageConfig) -> dict:
         "num_graphs": int(np.unique(gid).size), "donors_K": K,
         "graph_select": cc.graph_select, "analysis_seed": cc.analysis_seed,
         "test_metric": checks["test_metric"], "test_metric_name": checks["test_metric_name"],
+        "val_metric": checks.get("val_metric"), "val_metric_name": checks.get("val_metric_name"),
         "paper_metric": task.paper_metric, "loss_units": metrics.loss_units(loss_fun),
         "beneficial_denom": cc.beneficial_denom,
         "intervention": "structural", "structural_mode": mode,

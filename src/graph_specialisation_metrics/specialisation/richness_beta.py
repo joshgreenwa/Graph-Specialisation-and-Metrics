@@ -1,15 +1,16 @@
-"""BETA: causal validation and graph-gap analysis of ZINC head specialisation.
+"""BETA: causal validation and compensation analysis of ZINC head specialisation.
 
 This standalone experiment retains the established semantic donor swap and mask-frozen
 structural transposition.  It deliberately removes the earlier effective-response-rank beta.
-The score is tested in three direct ways: prediction under pre-head ablation, clean-head rescue
-of matched semantic/structural corruptions, and paired per-graph associations with the accuracy
-gaps between dense, global-RRWP 1-hop, and local-RRWP 1-hop GRIT.
+The score is tested by pre-head ablation, then used to test a specific global-vs-local RRWP
+account: high-order coordinate novelty absent from the local model induces compensatory semantic
+specialisation, and that compensation accompanies the paired local-model error penalty.  This is
+a graphwise pathway analysis, not a claim of causal mediation; causal identification still
+requires matched training-time RRWP-horizon interventions.
 """
 
 from __future__ import annotations
 
-import contextlib
 import json
 import platform
 import sys
@@ -19,19 +20,81 @@ from typing import Optional, Sequence
 
 import numpy as np
 
-from ..carriage import env, metrics, structural
+from ..carriage import env, metrics
 from ..carriage.env import log
 from ..carriage.grit_runner import _spd
 from ..carriage.tasks import GritTaskSpec, get_task
 from .ablation import _build_groups
 from .model import SpecConfig
-from .scores import _perturb_mask_frozen, score_model
+from .scores import score_model
 
 
 BETA_TASKS = ("zinc", "zinc_1hop", "zinc_1hop_local")
 DEFAULT_OUT_DIR = "/content/drive/MyDrive/graph_specialisation_metrics/beta_zinc_causal_specialisation"
 BIN_LABELS = ("0", "1", "2", "3", "4-7", "8+")
 CHANNELS = ("semantic", "structural")
+
+
+def _stable_rank(x: np.ndarray) -> float:
+    """Participation-ratio rank of the role-by-coordinate matrix."""
+    x = np.asarray(x, float)
+    if x.ndim != 2 or min(x.shape) == 0:
+        return 0.0
+    singular = np.linalg.svd(x, compute_uv=False)
+    energy = np.square(singular)
+    denom = float(np.square(energy).sum())
+    return float(energy.sum() ** 2 / denom) if denom > 0 else 0.0
+
+
+def _conditional_coordinate_novelty(local: np.ndarray, high: np.ndarray) -> dict:
+    """High-order variation left within roles sharing the same local ``(I,P)`` code."""
+    local, high = np.asarray(local, float), np.asarray(high, float)
+    if local.ndim != 2 or high.ndim != 2 or len(local) != len(high) or high.shape[1] == 0:
+        return {"rms": 0.0, "stable_rank": 0.0, "roles": int(len(local))}
+    keys = np.round(local, decimals=7)
+    residual = np.zeros_like(high)
+    _, inverse = np.unique(keys, axis=0, return_inverse=True)
+    for group in np.unique(inverse):
+        selected = inverse == group
+        residual[selected] = high[selected] - high[selected].mean(axis=0, keepdims=True)
+    return {
+        "rms": float(np.sqrt(np.mean(np.square(residual)))) if residual.size else 0.0,
+        "stable_rank": _stable_rank(residual),
+        "roles": int(len(local)),
+    }
+
+
+def rrwp_coordinate_novelty(base) -> dict:
+    """Novel high-order RRWP coordinates beyond local ``(I,P)``, split node/pair.
+
+    Node roles use the diagonal RRWP code. Pair roles use the directed molecular edges consumed
+    by the 1-hop model.  Novelty is the residual high-order variation within roles with identical
+    local codes, so it measures structural distinctions unavailable to the local-only substrate.
+    """
+    n = int(base.num_nodes)
+    node = getattr(base, "rrwp", None)
+    pair_index = getattr(base, "rrwp_index", None)
+    pair_value = getattr(base, "rrwp_val", None)
+    if pair_index is None or pair_value is None:
+        raise RuntimeError("RRWP novelty audit requires rrwp_index and rrwp_val")
+    pair_value = pair_value.detach().cpu().numpy()
+    pair_index = pair_index.detach().cpu().numpy().astype(np.int64)
+    k = int(pair_value.shape[-1])
+    dense = np.zeros((n, n, k), dtype=np.float64)
+    dense[pair_index[0], pair_index[1]] = pair_value
+    if node is None:
+        idx = np.arange(n)
+        node_code = dense[idx, idx]
+    else:
+        node_code = node.detach().cpu().numpy().reshape(n, -1)
+    support = base.edge_index.detach().cpu().numpy().astype(np.int64)
+    pair_code = dense[support[0], support[1]]
+    keep = min(2, k)
+    node_stats = _conditional_coordinate_novelty(node_code[:, :keep], node_code[:, keep:])
+    pair_stats = _conditional_coordinate_novelty(pair_code[:, :keep], pair_code[:, keep:])
+    return {f"node_{key}": value for key, value in node_stats.items()} | {
+        f"pair_{key}": value for key, value in pair_stats.items()
+    }
 
 
 def _distance_bin_masks(distances: np.ndarray) -> list[np.ndarray]:
@@ -50,6 +113,7 @@ class ResponseCollector:
     )
     abs_error: dict[int, float] = field(default_factory=dict)
     throughput: dict[int, np.ndarray] = field(default_factory=dict)
+    rrwp_novelty: dict[int, dict] = field(default_factory=dict)
     _spd_cache: dict[int, np.ndarray] = field(default_factory=dict)
 
     def __call__(
@@ -60,6 +124,8 @@ class ResponseCollector:
 
         source_nodes = np.asarray(source_nodes, dtype=np.int64)
         n = int(base.num_nodes)
+        if int(graph_id) not in self.rrwp_novelty:
+            self.rrwp_novelty[int(graph_id)] = rrwp_coordinate_novelty(base)
         if graph_id not in self._spd_cache:
             self._spd_cache[graph_id] = _spd(base, n)
         distances = self._spd_cache[graph_id][:, source_nodes].T
@@ -241,210 +307,6 @@ def analyse_head_causality(score: dict, ablation: dict, throughput: np.ndarray,
     return result
 
 
-def select_score_families(score: dict, *, family_size: int = 3) -> dict[str, list[tuple[int, int]]]:
-    """Score-only semantic/structural families, matching the synthetic protocol."""
-    sem, st = np.asarray(score["S_sem"], float), np.asarray(score["S_str"], float)
-    sn, tn = sem / (sem.mean() + 1e-12), st / (st.mean() + 1e-12)
-    eligible = (sn + tn).reshape(-1) >= np.quantile((sn + tn).reshape(-1), .4)
-    selectivity = (np.log(sn + 1e-12) - np.log(tn + 1e-12)).reshape(-1)
-    sem_order = [int(i) for i in np.argsort(selectivity)[::-1] if eligible[i]]
-    str_order = [int(i) for i in np.argsort(selectivity) if eligible[i]]
-    sem_idx = sem_order[:family_size]
-    str_idx = [i for i in str_order if i not in sem_idx][:family_size]
-    if len(sem_idx) < family_size or len(str_idx) < family_size:
-        raise RuntimeError("not enough distinct eligible heads for the requested families")
-    return {
-        "semantic": [tuple(map(int, np.unravel_index(i, sem.shape))) for i in sem_idx],
-        "structural": [tuple(map(int, np.unravel_index(i, st.shape))) for i in str_idx],
-    }
-
-
-@contextlib.contextmanager
-def _patch_head_output(gm, layer: int, head: int, clean_wv):
-    def hook(_module, _inputs, output):
-        h_out, e_out = output
-        if tuple(h_out.shape) != tuple(clean_wv.shape):
-            raise RuntimeError("clean/corrupt routed-output alignment failed")
-        changed = h_out.clone()
-        changed[:, int(head), :] = clean_wv[:, int(head), :].to(changed)
-        return changed, e_out
-
-    handle = gm.attn_layers[int(layer)].register_forward_hook(hook)
-    try:
-        yield
-    finally:
-        handle.remove()
-
-
-def _donor_pool(gm) -> tuple[np.ndarray, np.ndarray]:
-    rows, gids = [], []
-    for gi in range(len(gm.donor_ds)):
-        r = gm.adapter.rows(gm.donor_ds[gi])
-        rows.append(r)
-        gids.append(np.full(len(r), gi, dtype=np.int64))
-    return np.concatenate(rows), np.concatenate(gids)
-
-
-def _make_corruptions(gm, graph_ids, channel: str, *, seed: int):
-    rng = np.random.default_rng(seed)
-    donor_rows = donor_gids = None
-    if channel == "semantic":
-        donor_rows, donor_gids = _donor_pool(gm)
-    clean, corrupt, meta = [], [], []
-    for gi in map(int, graph_ids):
-        base = gm.eval_ds[gi]
-        n = int(base.num_nodes)
-        source = int(rng.integers(n))
-        if channel == "semantic":
-            own = gm.adapter.rows(base)[source]
-            candidates = np.flatnonzero((donor_gids != gi) & (donor_rows != own).any(axis=1))
-            donor = int(rng.choice(candidates))
-            pert = base.clone()
-            gm.adapter.write_donors(pert.x, np.asarray([source]), donor_rows[[donor]])
-            meta.append((source, donor))
-        elif channel == "structural":
-            deg = structural.node_degrees(base.edge_index, n)
-            candidates = np.flatnonzero((deg == deg[source]) & (np.arange(n) != source))
-            if not len(candidates):
-                distance = np.abs(deg - deg[source]).astype(float)
-                distance[source] = np.inf
-                candidates = np.flatnonzero(distance == distance.min())
-            partner = int(rng.choice(candidates))
-            pert = _perturb_mask_frozen(base, source, partner)
-            meta.append((source, partner))
-        else:
-            raise ValueError(channel)
-        clean.append(base)
-        corrupt.append(pert)
-    return clean, corrupt, np.asarray(meta, dtype=np.int64)
-
-
-def run_rescue_sweep(gm, graph_ids, channel: str, *, seed: int,
-                     batch_size: int = 64, effect_floor: float = 1e-5) -> dict:
-    """Patch one clean routed head into a matched corrupt run; no head is selected here."""
-    import torch
-    from torch_geometric.data import Batch
-
-    graph_ids = np.asarray(graph_ids, dtype=np.int64)
-    clean, corrupt, meta = _make_corruptions(gm, graph_ids, channel, seed=seed)
-    G = len(clean)
-    mediation = np.full((gm.L, gm.H, G), np.nan, dtype=np.float32)
-    recovery = np.full_like(mediation, np.nan)
-    effect = np.zeros(G, dtype=np.float32)
-    clean_pred, corrupt_pred = [], []
-    for start in range(0, G, batch_size):
-        stop = min(G, start + batch_size)
-        cb = Batch.from_data_list(clean[start:stop]).to(gm.device)
-        cap = gm.capture(cb, want_grad=False, want_attn=False)
-        cp = cap["pred"].reshape(stop - start, -1).detach()
-        clean_wv = [x.detach() for x in cap["wV"]]
-        with torch.no_grad():
-            xb = Batch.from_data_list(corrupt[start:stop]).to(gm.device)
-            xp, _ = gm.model(xb)
-            xp = xp.reshape(stop - start, -1).detach()
-        total = cp - xp
-        denom = total.square().sum(dim=-1)
-        effect[start:stop] = denom.sqrt().cpu().numpy()
-        y = cb.y.reshape(cp.shape).to(cp.dtype)
-        clean_loss = metrics.per_graph_loss(cp, y, gm.loss_fun)
-        corrupt_loss = metrics.per_graph_loss(xp, y, gm.loss_fun)
-        loss_denom = corrupt_loss - clean_loss
-        clean_pred.append(cp.cpu().numpy()); corrupt_pred.append(xp.cpu().numpy())
-        for layer in range(gm.L):
-            for head in range(gm.H):
-                # GRIT's encoders mutate a Batch in-place, so every forward gets a fresh Batch.
-                xb = Batch.from_data_list(corrupt[start:stop]).to(gm.device)
-                with _patch_head_output(gm, layer, head, clean_wv[layer]), torch.no_grad():
-                    pp, _ = gm.model(xb)
-                    pp = pp.reshape(stop - start, -1).detach()
-                mem = ((pp - xp) * total).sum(dim=-1) / (denom + 1e-12)
-                mem = torch.where(denom.sqrt() >= effect_floor, mem,
-                                  torch.full_like(mem, float("nan")))
-                patched_loss = metrics.per_graph_loss(pp, y, gm.loss_fun)
-                lr = (corrupt_loss - patched_loss) / (loss_denom + 1e-12)
-                lr = torch.where(loss_denom > 1e-5, lr,
-                                 torch.full_like(lr, float("nan")))
-                mediation[layer, head, start:stop] = mem.cpu().numpy()
-                recovery[layer, head, start:stop] = lr.cpu().numpy()
-        log(f"[beta-rescue:{channel}] {stop}/{G}")
-    return {
-        "graph_ids": graph_ids, "mediation": mediation, "loss_recovery": recovery,
-        "effect_norm": effect, "clean_pred": np.concatenate(clean_pred),
-        "corrupt_pred": np.concatenate(corrupt_pred), "corruption_meta": meta,
-        "valid_effect_fraction": float(np.mean(effect >= effect_floor)),
-    }
-
-
-def _matched_families(selected, throughput, *, n: int, seed: int):
-    """Layer-exact, throughput-near random family controls."""
-    rng = np.random.default_rng(seed)
-    throughput = np.asarray(throughput, float)
-    L, H = throughput.shape
-    blocked = set(selected["semantic"]) | set(selected["structural"])
-    output = []
-    for _ in range(int(n)):
-        pair, used = {}, set()
-        for name in CHANNELS:
-            heads = []
-            for target in selected[name]:
-                candidates = [(target[0], h) for h in range(H)
-                              if (target[0], h) not in blocked | used]
-                if not candidates:
-                    candidates = [(target[0], h) for h in range(H)
-                                  if (target[0], h) not in used]
-                d = np.asarray([abs(np.log1p(throughput[c]) -
-                                       np.log1p(throughput[target])) for c in candidates])
-                scale = max(float(np.median(d[d > 0])) if np.any(d > 0) else 1.0, 1e-8)
-                p = np.exp(-d / scale); p /= p.sum()
-                choice = candidates[int(rng.choice(len(candidates), p=p))]
-                heads.append(choice); used.add(choice)
-            pair[name] = heads
-        output.append(pair)
-    return output
-
-
-def _family_graph_values(cube, heads):
-    return np.nanmean(np.stack([np.asarray(cube[h], float) for h in heads]), axis=0)
-
-
-def analyse_double_dissociation(score, rescue, throughput, *, family_size: int,
-                                n_null: int, n_boot: int, seed: int) -> dict:
-    selected = select_score_families(score, family_size=family_size)
-    graph_matrix = np.empty((2, 2, len(rescue["semantic"]["graph_ids"])), float)
-    for r, family in enumerate(CHANNELS):
-        for c, corruption in enumerate(CHANNELS):
-            graph_matrix[r, c] = _family_graph_values(
-                rescue[corruption]["mediation"], selected[family]
-            )
-    matrix = np.nanmean(graph_matrix, axis=2)
-    interaction_graph = ((graph_matrix[0, 0] - graph_matrix[0, 1]) +
-                         (graph_matrix[1, 1] - graph_matrix[1, 0]))
-    interaction = float(np.nanmean(interaction_graph))
-    ci = _bootstrap_stat(len(interaction_graph),
-                         lambda i: float(np.nanmean(interaction_graph[i])),
-                         n_boot=n_boot, seed=seed)
-    null_sets = _matched_families(selected, throughput, n=n_null, seed=seed + 1)
-    null = []
-    for controls in null_sets:
-        m = np.empty((2, 2), float)
-        for r, family in enumerate(CHANNELS):
-            for c, corruption in enumerate(CHANNELS):
-                m[r, c] = np.nanmean(_family_graph_values(
-                    rescue[corruption]["mediation"], controls[family]
-                ))
-        null.append((m[0, 0] - m[0, 1]) + (m[1, 1] - m[1, 0]))
-    null = np.asarray(null, float)
-    finite_null = null[np.isfinite(null)]
-    p = (float((1 + np.sum(finite_null >= interaction)) / (len(finite_null) + 1))
-         if np.isfinite(interaction) and finite_null.size else float("nan"))
-    return {
-        "selected_heads": {k: [list(h) for h in v] for k, v in selected.items()},
-        "mediation_matrix": matrix, "interaction": interaction,
-        "interaction_ci": ci, "matched_null": null, "p_ge": p,
-        "valid_effect_fraction": {c: rescue[c]["valid_effect_fraction"] for c in CHANNELS},
-    }
-
-
 def _common_graphs(task_results: dict) -> list[int]:
     sets = [set(map(int, task_results[t]["graph_ids"])) for t in BETA_TASKS]
     common = sorted(set.intersection(*sets))
@@ -453,96 +315,204 @@ def _common_graphs(task_results: dict) -> list[int]:
     return common
 
 
-def _graph_arrays(item: dict, graph_ids: Sequence[int]) -> dict:
+def _standardise(x: np.ndarray) -> np.ndarray:
+    x = np.asarray(x, float)
+    scale = np.std(x, axis=0)
+    scale = np.where(scale > 1e-12, scale, 1.0)
+    return (x - np.mean(x, axis=0)) / scale
+
+
+def _rank_standardise(x: np.ndarray) -> np.ndarray:
+    return _standardise(_rank_columns(np.asarray(x, float)))
+
+
+def _drop_constant_columns(x: np.ndarray) -> np.ndarray:
+    x = np.asarray(x, float)
+    if x.ndim == 1:
+        x = x[:, None]
+    keep = np.isfinite(x).all(axis=0) & (np.std(x, axis=0) > 1e-12)
+    return x[:, keep]
+
+
+def compensation_path_coefficients(x, mediator, outcome, controls) -> dict[str, float]:
+    """Rank-standardised graphwise X→M→Y pathway coefficients.
+
+    These are associative path coefficients. They are deliberately not labelled causal
+    mediation because the checkpoints were not generated by a randomised training intervention.
+    """
+    x = _rank_standardise(np.asarray(x, float)).reshape(-1)
+    m = _rank_standardise(np.asarray(mediator, float)).reshape(-1)
+    y = _rank_standardise(np.asarray(outcome, float)).reshape(-1)
+    z = _drop_constant_columns(_rank_standardise(np.asarray(controls, float)))
+    intercept = np.ones((len(x), 1))
+    a_design = np.column_stack([intercept, x, z])
+    a = float(np.linalg.lstsq(a_design, m, rcond=None)[0][1])
+    c = float(np.linalg.lstsq(a_design, y, rcond=None)[0][1])
+    b_design = np.column_stack([intercept, x, m, z])
+    b_fit = np.linalg.lstsq(b_design, y, rcond=None)[0]
+    return {"a": a, "b": float(b_fit[2]), "c": c,
+            "c_prime": float(b_fit[1]), "indirect": a * float(b_fit[2])}
+
+
+def _path_analysis(x, mediator, outcome, controls, *, n_boot: int, seed: int) -> dict:
+    x = np.asarray(x, float); mediator = np.asarray(mediator, float)
+    outcome = np.asarray(outcome, float); controls = np.asarray(controls, float)
+    point = compensation_path_coefficients(x, mediator, outcome, controls)
+    rng = np.random.default_rng(seed)
+    draws = {key: [] for key in point}
+    for _ in range(int(n_boot)):
+        idx = rng.integers(0, len(x), len(x))
+        fitted = compensation_path_coefficients(
+            x[idx], mediator[idx], outcome[idx], controls[idx])
+        for key, value in fitted.items():
+            if np.isfinite(value):
+                draws[key].append(value)
+    coefficients = {}
+    for key, estimate in point.items():
+        values = np.asarray(draws[key], float)
+        ci = ((float(np.quantile(values, .025)), float(np.quantile(values, .975)))
+              if values.size else (float("nan"), float("nan")))
+        coefficients[key] = {"estimate": estimate, "ci": ci}
+
+    rz = _drop_constant_columns(_rank_standardise(controls))
+    rx, rm, ry = (_rank_standardise(v).reshape(-1) for v in (x, mediator, outcome))
+    x_a = _residualise(rx, rz); m_a = _residualise(rm, rz)
+    xz = np.column_stack([rx, rz])
+    m_b = _residualise(rm, xz); y_b = _residualise(ry, xz)
+    y_c = _residualise(ry, rz)
+    return {
+        "coefficients": coefficients,
+        "residuals": {"a_x": x_a, "a_m": m_a, "b_m": m_b,
+                      "b_y": y_b, "c_x": x_a, "c_y": y_c},
+    }
+
+
+def _causal_weighted_graph_scores(item: dict, graph_ids: Sequence[int],
+                                  sem_scale: float, str_scale: float,
+                                  *, weighted: bool) -> dict:
     collector: ResponseCollector = item["collector"]
-    family = {k: [tuple(h) for h in v]
-              for k, v in item["double_dissociation"]["selected_heads"].items()}
-    shape = np.asarray(item["score"]["S_sem"]).shape
-    sem_idx = [np.ravel_multi_index(h, shape) for h in family["semantic"]]
-    str_idx = [np.ravel_multi_index(h, shape) for h in family["structural"]]
-    sem, st, far_sem, selected_mass, throughput, error = [], [], [], [], [], []
+    impact = np.asarray(item["ablation"]["functional"], float)
+    ablation_ids = list(map(int, item["ablation"]["graph_ids"]))
+    semantic, structural, throughput, error = [], [], [], []
     for gid in graph_ids:
-        sg = collector.graph_score("semantic", gid)
-        tg = collector.graph_score("structural", gid)
-        fg = collector.graph_score("semantic", gid, bins=(4, 5))
-        sem.append(sg.sum()); st.append(tg.sum())
-        far_sem.append(fg[sem_idx].sum())
-        selected_mass.append(sg[sem_idx].sum() + tg[str_idx].sum())
-        throughput.append(np.asarray(collector.throughput[gid], float).mean())
-        error.append(collector.abs_error[gid])
-    return {k: np.asarray(v, float) for k, v in {
-        "semantic_mass": sem, "structural_mass": st, "far_semantic_family": far_sem,
-        "selected_mass": selected_mass, "throughput": throughput, "error": error,
-    }.items()}
+        graph_impact = impact[:, :, ablation_ids.index(int(gid))].reshape(-1)
+        weights = (graph_impact / (graph_impact.mean() + 1e-12)
+                   if weighted else np.ones_like(graph_impact))
+        if not np.isfinite(weights).all() or weights.sum() <= 1e-12:
+            weights = np.ones_like(graph_impact)
+        sg = collector.graph_score("semantic", gid) / sem_scale
+        tg = collector.graph_score("structural", gid) / str_scale
+        semantic.append(float(np.average(sg, weights=weights)))
+        structural.append(float(np.average(tg, weights=weights)))
+        throughput.append(float(np.asarray(collector.throughput[gid], float).mean()))
+        error.append(float(collector.abs_error[gid]))
+    semantic, structural = np.asarray(semantic), np.asarray(structural)
+    return {
+        "semantic": semantic, "structural": structural,
+        "preference": np.log(semantic + 1e-12) - np.log(structural + 1e-12),
+        "total": semantic + structural,
+        "throughput": np.asarray(throughput), "error": np.asarray(error),
+    }
 
 
-def _controlled_association(x, y, controls, *, n_boot: int, seed: int) -> dict:
-    x, y, controls = np.asarray(x, float), np.asarray(y, float), np.asarray(controls, float)
-    rx, ry, rz = _rank_columns(x), _rank_columns(y), _rank_columns(controls)
-    xres, yres = _residualise(rx, rz), _residualise(ry, rz)
-    rho = (float(np.corrcoef(xres, yres)[0, 1])
-           if np.std(xres) >= 1e-12 and np.std(yres) >= 1e-12 else float("nan"))
-    ci = _bootstrap_stat(len(x),
-                         lambda i: partial_spearman(x[i], y[i], controls[i]),
-                         n_boot=n_boot, seed=seed)
-    return {"rho": rho, "ci": ci, "x_residual": xres, "y_residual": yres,
-            "x": x, "y": y}
-
-
-def analyse_graphwise_gaps(task_results: dict, *, n_boot: int, seed: int) -> dict:
-    """Paired graph residual gaps tested against channel-specific score contributions."""
+def analyse_semantic_compensation(task_results: dict, *, n_boot: int, seed: int) -> dict:
+    """Test RRWP coordinate novelty → semantic reweighting → local-model error penalty."""
     graph_ids = _common_graphs(task_results)
-    arr = {t: _graph_arrays(task_results[t], graph_ids) for t in BETA_TASKS}
-    ablation = task_results["zinc"]["ablation"]
-    all_features = np.asarray(ablation["features"], float)
+    global_item, local_item = task_results["zinc_1hop"], task_results["zinc_1hop_local"]
+    sem_scale = float(np.mean([
+        np.asarray(item["score"]["S_sem"], float).mean()
+        for item in (global_item, local_item)
+    ])) + 1e-12
+    str_scale = float(np.mean([
+        np.asarray(item["score"]["S_str"], float).mean()
+        for item in (global_item, local_item)
+    ])) + 1e-12
+
+    weighted = {
+        task: _causal_weighted_graph_scores(
+            task_results[task], graph_ids, sem_scale, str_scale, weighted=True)
+        for task in ("zinc_1hop", "zinc_1hop_local")
+    }
+    unweighted = {
+        task: _causal_weighted_graph_scores(
+            task_results[task], graph_ids, sem_scale, str_scale, weighted=False)
+        for task in ("zinc_1hop", "zinc_1hop_local")
+    }
+
+    novelty = global_item["collector"].rrwp_novelty
+    node = np.asarray([novelty[int(g)]["node_rms"] for g in graph_ids], float)
+    pair = np.asarray([novelty[int(g)]["pair_rms"] for g in graph_ids], float)
+    # Equal-weight, predeclared node/pair composite. Log compression prevents one large graph
+    # from defining the result; molecule controls below remove ordinary size/topology effects.
+    coordinate_novelty = np.mean(np.column_stack([
+        _standardise(np.log(node + 1e-12)),
+        _standardise(np.log(pair + 1e-12)),
+    ]), axis=1)
+    mediator = (weighted["zinc_1hop_local"]["preference"] -
+                weighted["zinc_1hop"]["preference"])
+    mediator_unweighted = (unweighted["zinc_1hop_local"]["preference"] -
+                           unweighted["zinc_1hop"]["preference"])
+    error_penalty = (weighted["zinc_1hop_local"]["error"] -
+                     weighted["zinc_1hop"]["error"])
+
+    ablation = global_item["ablation"]
+    feature_ids = list(map(int, ablation["graph_ids"]))
+    take = [feature_ids.index(int(g)) for g in graph_ids]
+    all_features = np.asarray(ablation["features"], float)[take]
     names = list(ablation.get("feature_names", []))
     wanted = ("n_nodes", "n_rings", "diameter", "atom_entropy")
-    columns = [names.index(k) for k in wanted if k in names]
-    features = all_features[:, columns] if columns else all_features
-    feature_ids = list(map(int, ablation["graph_ids"]))
-    take = [feature_ids.index(g) for g in graph_ids]
-    features = features[take]
+    selected_names = [name for name in wanted if name in names]
+    columns = [names.index(name) for name in selected_names]
+    molecule_controls = all_features[:, columns] if columns else all_features
+    molecule_control_names = (selected_names if columns else
+                              (names if names else [f"feature_{i}" for i in range(all_features.shape[1])]))
+    total_shift = (np.log(weighted["zinc_1hop_local"]["total"] + 1e-12) -
+                   np.log(weighted["zinc_1hop"]["total"] + 1e-12))
+    throughput_shift = (np.log1p(weighted["zinc_1hop_local"]["throughput"]) -
+                        np.log1p(weighted["zinc_1hop"]["throughput"]))
+    controls = np.column_stack([molecule_controls, total_shift, throughput_shift])
+    primary = _path_analysis(coordinate_novelty, mediator, error_penalty, controls,
+                             n_boot=n_boot, seed=seed)
+    robustness = _path_analysis(coordinate_novelty, mediator_unweighted, error_penalty,
+                                controls, n_boot=n_boot, seed=seed + 1)
+    primary_ci = primary["coefficients"]
+    directional_support = all(primary_ci[key]["ci"][0] > 0
+                              for key in ("a", "b", "indirect"))
+    robust_support = robustness["coefficients"]["indirect"]["ci"][0] > 0
+    contradicted = any(primary_ci[key]["ci"][1] < 0 for key in ("a", "b"))
+    verdict = ("SUPPORTED ASSOCIATION" if directional_support and robust_support else
+               "WEIGHT-SENSITIVE SIGNAL" if directional_support else
+               "DIRECTION CONTRADICTED" if contradicted else "NO CLEAR PATHWAY")
 
-    def compare(first, second, predictor, nuisance, label, offset):
-        # Positive y means the first model has lower absolute error than the second.
-        y = arr[second]["error"] - arr[first]["error"]
-        x = arr[first][predictor] - arr[second][predictor]
-        controls = np.column_stack([
-            arr[first][nuisance] - arr[second][nuisance],
-            arr[first]["throughput"] - arr[second]["throughput"],
-            features,
-        ])
-        out = _controlled_association(x, y, controls, n_boot=n_boot, seed=seed + offset)
-        out.update({"first": first, "second": second, "predictor": predictor,
-                    "label": label, "nuisance": nuisance})
-        return out
+    def novelty_matrix(task: str) -> np.ndarray:
+        values = task_results[task]["collector"].rrwp_novelty
+        return np.asarray([[values[int(g)]["node_rms"], values[int(g)]["pair_rms"]]
+                           for g in graph_ids], float)
 
-    comparisons = {
-        "global_vs_local": compare(
-            "zinc_1hop", "zinc_1hop_local", "structural_mass", "semantic_mass",
-            "Global-RRWP structural mass", 0,
-        ),
-        "dense_vs_global": compare(
-            "zinc", "zinc_1hop", "far_semantic_family", "structural_mass",
-            "Dense excess long-range semantic-head carriage", 1,
-        ),
-        "dense_vs_local": compare(
-            "zinc", "zinc_1hop_local", "far_semantic_family", "structural_mass",
-            "Dense excess long-range semantic-head carriage", 2,
-        ),
+    global_novelty = novelty_matrix("zinc_1hop")
+    dense_novelty = novelty_matrix("zinc")
+    local_novelty = novelty_matrix("zinc_1hop_local")
+    audit = {
+        "local_high_order_rms_max": float(np.max(np.abs(local_novelty))),
+        "dense_global_rms_max_abs_difference": float(np.max(
+            np.abs(dense_novelty - global_novelty))),
+        "node_rms_median": float(np.median(node)),
+        "pair_rms_median": float(np.median(pair)),
     }
-    # Closely related score-only alternative: total mass carried by selected channel families.
-    for key, item in comparisons.items():
-        first, second = item["first"], item["second"]
-        x = arr[first]["selected_mass"] - arr[second]["selected_mass"]
-        y = arr[second]["error"] - arr[first]["error"]
-        controls = np.column_stack([
-            arr[first]["throughput"] - arr[second]["throughput"], features
-        ])
-        item["selected_mass_association"] = _controlled_association(
-            x, y, controls, n_boot=n_boot, seed=seed + 10 + list(comparisons).index(key)
-        )
-    return {"graph_ids": graph_ids, "comparisons": comparisons}
+    return {
+        "graph_ids": np.asarray(graph_ids, dtype=np.int64),
+        "coordinate_novelty": coordinate_novelty,
+        "node_novelty": node, "pair_novelty": pair,
+        "semantic_compensation": mediator,
+        "semantic_compensation_unweighted": mediator_unweighted,
+        "local_error_penalty": error_penalty,
+        "controls": controls, "control_names": [
+            *molecule_control_names,
+            "total_specialisation_shift", "clean_throughput_shift",
+        ],
+        "primary": primary, "unweighted_robustness": robustness,
+        "substrate_audit": audit, "verdict": verdict,
+    }
 
 
 def _task_label(task: str) -> str:
@@ -623,72 +593,46 @@ def make_ablation_figure(task_results: dict, out: Path) -> str:
     return str(out)
 
 
-def make_rescue_figure(task_results: dict, out: Path) -> str:
+def make_compensation_figure(analysis: dict, out: Path) -> str:
     plt = _setup_matplotlib()
-    matrices = [np.asarray(task_results[t]["double_dissociation"]["mediation_matrix"], float)
-                for t in BETA_TASKS]
-    finite = np.concatenate([m[np.isfinite(m)] for m in matrices])
-    vmax = (float(np.max(np.abs(finite))) if finite.size else 1.0) + 1e-9
-    fig = plt.figure(figsize=(15.2, 4.8), constrained_layout=True)
-    gs = fig.add_gridspec(1, 4, width_ratios=[1, 1, 1, 1.25])
-    image = None
-    for i, (task, matrix) in enumerate(zip(BETA_TASKS, matrices)):
-        ax = fig.add_subplot(gs[0, i])
-        image = ax.imshow(matrix, cmap="RdBu_r", vmin=-vmax, vmax=vmax)
-        for r in range(2):
-            for c in range(2):
-                text = f"{matrix[r,c]:+.2f}" if np.isfinite(matrix[r, c]) else "NA"
-                ax.text(c, r, text, ha="center", va="center",
-                        fontweight="bold")
-        dd = task_results[task]["double_dissociation"]
-        ci = dd["interaction_ci"]
-        ax.set_xticks([0, 1], ["semantic", "structural"], rotation=15)
-        ax.set_yticks([0, 1], ["semantic heads", "structural heads"])
-        ax.set_xlabel("corruption rescued")
-        ax.set_title(f"{_task_label(task)}\nDD={dd['interaction']:+.2f} "
-                     f"[{ci[0]:+.2f},{ci[1]:+.2f}], pnull={dd['p_ge']:.3f}",
-                     fontsize=10, fontweight="bold")
-    ax = fig.add_subplot(gs[0, 3])
-    vals = np.asarray([task_results[t]["double_dissociation"]["interaction"] for t in BETA_TASKS])
-    lo = np.asarray([task_results[t]["double_dissociation"]["interaction_ci"][0] for t in BETA_TASKS])
-    hi = np.asarray([task_results[t]["double_dissociation"]["interaction_ci"][1] for t in BETA_TASKS])
-    ax.axhline(0, color="black", lw=1)
-    ax.errorbar(np.arange(3), vals, yerr=np.vstack([vals - lo, hi - vals]), fmt="o",
-                capsize=4, color="#333")
-    ax.set_xticks(np.arange(3), ["dense", "1-hop\nglobal", "1-hop\nlocal"])
-    ax.set_ylabel("semantic/structural interaction")
-    ax.set_title("Score-selected family\ndouble dissociation", fontweight="bold")
-    fig.colorbar(image, ax=fig.axes[:3], shrink=.7, label="fraction of corruption effect mediated")
-    fig.suptitle("Causal rescue at the established routed head output\n"
-                 "Clean one-head patches; families selected from scores only; nulls match layer and throughput",
-                 fontsize=13, fontweight="bold")
-    fig.savefig(out, bbox_inches="tight"); plt.close(fig)
-    return str(out)
-
-
-def make_graph_gap_figure(analysis: dict, out: Path) -> str:
-    plt = _setup_matplotlib()
-    keys = ("global_vs_local", "dense_vs_global", "dense_vs_local")
-    titles = ("1-hop global RRWP vs local RRWP", "Dense vs 1-hop global RRWP",
-              "Dense vs 1-hop local RRWP")
-    fig, axes = plt.subplots(1, 3, figsize=(15.2, 4.7), constrained_layout=True)
-    for ax, key, title in zip(axes, keys, titles):
-        item = analysis["comparisons"][key]
-        x, y = np.asarray(item["x_residual"]), np.asarray(item["y_residual"])
+    path = analysis["primary"]
+    residuals = path["residuals"]
+    panels = (
+        ("a", "a_x", "a_m", "High-order RRWP coordinate novelty",
+         "Local − global causal-weighted semantic preference",
+         "a · Does unavailable structure track compensation?"),
+        ("b", "b_m", "b_y", "Causal-weighted semantic compensation",
+         "Local − global absolute error",
+         "b · Does compensation track the error penalty?"),
+        ("c", "c_x", "c_y", "High-order RRWP coordinate novelty",
+         "Local − global absolute error",
+         "c · Does coordinate novelty track the error penalty?"),
+    )
+    fig, axes = plt.subplots(1, 3, figsize=(15.2, 4.8), constrained_layout=True)
+    colors = ("#1976b9", "#d55e00", "#4b7f52")
+    for ax, (coefficient, xkey, ykey, xlabel, ylabel, title), color in zip(
+            axes, panels, colors):
+        x, y = np.asarray(residuals[xkey]), np.asarray(residuals[ykey])
         ax.axhline(0, color="#888", lw=.8); ax.axvline(0, color="#888", lw=.8)
-        ax.scatter(x, y, s=28, alpha=.65, color="#3c6e9f", edgecolors="white", lw=.25)
+        ax.scatter(x, y, s=30, alpha=.68, color=color, edgecolors="white", lw=.25)
         if np.std(x) > 0:
             xx = np.linspace(x.min(), x.max(), 100)
-            ax.plot(xx, np.polyval(np.polyfit(x, y, 1), xx), color="#c33", lw=1.5)
-        ci = item["ci"]
-        alt = item["selected_mass_association"]
-        ax.set_title(f"{title}\npartial ρ={item['rho']:+.2f} [{ci[0]:+.2f},{ci[1]:+.2f}]\n"
-                     f"selected-mass partial ρ={alt['rho']:+.2f}", fontweight="bold", fontsize=10)
-        ax.set_xlabel(item["label"] + "\n(rank residual after controls)")
-        ax.set_ylabel("per-graph absolute-error advantage\n(rank residual after controls)")
-    fig.suptitle("Do channel-specific responses explain paired model performance gaps?\n"
-                 "Controls: nuisance channel, clean throughput, and molecule size/structure/content features",
-                 fontsize=13, fontweight="bold")
+            ax.plot(xx, np.polyval(np.polyfit(x, y, 1), xx), color="#222", lw=1.5)
+        stat = path["coefficients"][coefficient]
+        ci = stat["ci"]
+        ax.set_title(f"{title}\nβ={stat['estimate']:+.2f} "
+                     f"[{ci[0]:+.2f},{ci[1]:+.2f}]", fontweight="bold", fontsize=10)
+        ax.set_xlabel(xlabel + "\n(rank residual after controls)")
+        ax.set_ylabel(ylabel + "\n(rank residual after controls)")
+    indirect = path["coefficients"]["indirect"]
+    robust = analysis["unweighted_robustness"]["coefficients"]["indirect"]
+    fig.suptitle(
+        f"BETA VERDICT: {analysis['verdict']}\n"
+        "Structural-coordinate loss, semantic compensation, and the local-RRWP error penalty\n"
+        f"Paired graph pathway (associative, not causal mediation): indirect a×b="
+        f"{indirect['estimate']:+.2f} [{indirect['ci'][0]:+.2f},{indirect['ci'][1]:+.2f}]; "
+        f"unweighted robustness={robust['estimate']:+.2f}",
+        fontsize=12.5, fontweight="bold")
     fig.savefig(out, bbox_inches="tight"); plt.close(fig)
     return str(out)
 
@@ -708,7 +652,7 @@ def _jsonable(value):
     return value
 
 
-def _save_raw(task_results: dict, graphwise: dict, out_dir: Path) -> tuple[str, str]:
+def _save_raw(task_results: dict, compensation: dict, out_dir: Path) -> tuple[str, str]:
     payload = {}
     for task, item in task_results.items():
         score, collector = item["score"], item["collector"]
@@ -722,22 +666,32 @@ def _save_raw(task_results: dict, graphwise: dict, out_dir: Path) -> tuple[str, 
                 np.full(len(r["source_nodes"]), r["graph_id"], dtype=np.int64)
                 for r in records
             ])
-            payload[f"{task}__rescue_{channel}__mediation"] = item["rescue"][channel]["mediation"]
-            payload[f"{task}__rescue_{channel}__loss_recovery"] = item["rescue"][channel]["loss_recovery"]
         payload[f"{task}__ablation_functional"] = item["ablation"]["functional"]
         payload[f"{task}__ablation_loss"] = item["ablation"]["loss"]
         gids = np.asarray(sorted(collector.abs_error), dtype=np.int64)
         payload[f"{task}__graph_ids"] = gids
         payload[f"{task}__absolute_error"] = np.asarray([collector.abs_error[int(g)] for g in gids])
         payload[f"{task}__throughput"] = np.stack([collector.throughput[int(g)] for g in gids])
+        payload[f"{task}__rrwp_node_novelty"] = np.asarray([
+            collector.rrwp_novelty[int(g)]["node_rms"] for g in gids])
+        payload[f"{task}__rrwp_pair_novelty"] = np.asarray([
+            collector.rrwp_novelty[int(g)]["pair_rms"] for g in gids])
+    for key in ("graph_ids", "coordinate_novelty", "node_novelty", "pair_novelty",
+                "semantic_compensation", "semantic_compensation_unweighted",
+                "local_error_penalty", "controls"):
+        payload[f"compensation__{key}"] = np.asarray(compensation[key])
     npz_path = out_dir / "beta_zinc_causal_specialisation.npz"
     np.savez_compressed(npz_path, **payload)
     summary = {
         "status": "BETA",
-        "removed_analysis": ["effective head-response rank", "response-rank verdict"],
+        "removed_analysis": [
+            "effective head-response rank", "response-rank verdict",
+            "single-head rescue double dissociation", "channel-response model-gap regression",
+        ],
         "method": (
             "Existing separate semantic/structural interventions, validated by exact-graph "
-            "pre-head ablation, clean routed-head rescue, and paired graphwise model-gap tests."
+            "pre-head ablation, followed by a paired graphwise test of the predeclared "
+            "RRWP novelty -> semantic compensation -> local-model error pathway."
         ),
         "models": {
             task: {
@@ -745,10 +699,9 @@ def _save_raw(task_results: dict, graphwise: dict, out_dir: Path) -> tuple[str, 
                 "test_metric": item["score"]["test_metric"],
                 "score_reconstruction_max_abs": item["score_reconstruction_max_abs"],
                 "causality": _jsonable(item["causality"]),
-                "double_dissociation": _jsonable(item["double_dissociation"]),
             } for task, item in task_results.items()
         },
-        "graphwise_gaps": _jsonable(graphwise),
+        "semantic_compensation": _jsonable(compensation),
     }
     json_path = out_dir / "beta_zinc_causal_specialisation_summary.json"
     json_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
@@ -767,8 +720,7 @@ def _mount_drive(mount_point: str = "/content/drive") -> None:
 def run(
     *, tasks: Sequence[str] = BETA_TASKS, out_dir: str = DEFAULT_OUT_DIR,
     ckpt: Optional[dict] = None, num_graphs: int = 128, donors: int = 8,
-    max_sources: Optional[int] = None, rescue_graphs: Optional[int] = None,
-    rescue_batch_size: int = 64, family_size: int = 3, n_null: int = 1000,
+    max_sources: Optional[int] = None,
     n_boot: int = 1000, analysis_seed: int = 0, bootstrap_seed: int = 1729,
     partner_match: str = "degree", seed: int = 42, accelerator: str = "cuda:0",
     num_threads: int = 4, mount: bool = True, skip_install: bool = False,
@@ -778,8 +730,8 @@ def run(
     tasks = tuple(tasks)
     if tasks != BETA_TASKS:
         raise ValueError(f"tasks must be exactly {BETA_TASKS}")
-    if min(int(num_graphs), int(donors), int(n_boot), int(n_null), int(family_size)) < 1:
-        raise ValueError("graph, donor, bootstrap, null, and family counts must be positive")
+    if min(int(num_graphs), int(donors), int(n_boot)) < 1:
+        raise ValueError("graph, donor, and bootstrap counts must be positive")
     if mount:
         _mount_drive()
     output = Path(out_dir); output.mkdir(parents=True, exist_ok=True)
@@ -787,6 +739,14 @@ def run(
         env.install_dependencies(pyg_version=pyg_version)
     else:
         log("[deps] Skipping dependency installation (skip_install=True).")
+    # The retired null analyses should not survive from an earlier run in the same Drive folder.
+    for retired in ("fig_beta_zinc_response_rank_by_distance.png",
+                    "fig_beta_zinc_response_rank_verdict.png",
+                    "fig_beta_zinc_rescue_double_dissociation.png",
+                    "fig_beta_zinc_graphwise_residual_gaps.png"):
+        path = output / retired
+        if path.exists():
+            path.unlink()
 
     task_results = {}
     for task_index, task_name in enumerate(tasks):
@@ -828,7 +788,6 @@ def run(
         if not collector.throughput:
             raise RuntimeError("clean head throughput was not captured by the scorer")
         throughput_graph = np.stack([collector.throughput[int(g)] for g in graph_ids])
-        throughput = throughput_graph.mean(axis=0)
         per_graph_scores = {
             channel: np.stack([collector.graph_score(channel, int(g)).reshape(
                 score["L"], score["H"]) for g in graph_ids])
@@ -847,33 +806,14 @@ def run(
             graph_weights=source_counts, n_boot=n_boot,
             seed=bootstrap_seed + task_index * 100,
         )
-        available_rescue = np.setdiff1d(np.arange(len(gm.eval_ds), dtype=np.int64), graph_ids)
-        rg = min(int(rescue_graphs or num_graphs), len(available_rescue))
-        rescue_rng = np.random.default_rng(analysis_seed + 77_777)
-        rescue_ids = np.sort(rescue_rng.choice(available_rescue, size=rg, replace=False))
-        if rg < int(rescue_graphs or num_graphs):
-            log(f"[beta-rescue] only {rg} score-held-out eval graphs are available")
-        rescue = {
-            channel: run_rescue_sweep(
-                gm, rescue_ids, channel,
-                seed=analysis_seed + 10_000 + (0 if channel == "semantic" else 1),
-                batch_size=rescue_batch_size,
-            ) for channel in CHANNELS
-        }
-        dissociation = analyse_double_dissociation(
-            score, rescue, throughput, family_size=family_size, n_null=n_null,
-            n_boot=n_boot, seed=bootstrap_seed + task_index * 100 + 50,
-        )
         log(f"[beta-causal] functional partial rho: semantic="
             f"{causality['functional']['semantic']['partial_rho']:+.2f}, structural="
-            f"{causality['functional']['structural']['partial_rho']:+.2f}; "
-            f"rescue DD={dissociation['interaction']:+.2f}, pnull={dissociation['p_ge']:.3f}")
+            f"{causality['functional']['structural']['partial_rho']:+.2f}")
         score.pop("gm", None)
         task_results[task_name] = {
             "score": score, "collector": collector, "graph_ids": graph_ids,
             "score_reconstruction_max_abs": reconstruction_error,
-            "ablation": ablation, "causality": causality, "rescue": rescue,
-            "double_dissociation": dissociation,
+            "ablation": ablation, "causality": causality,
         }
         try:
             import torch
@@ -882,34 +822,34 @@ def run(
         except Exception:  # noqa: BLE001
             pass
 
-    rescue_reference = task_results[BETA_TASKS[0]]["rescue"]["semantic"]["graph_ids"]
-    for task in BETA_TASKS:
-        for channel in CHANNELS:
-            if not np.array_equal(task_results[task]["rescue"][channel]["graph_ids"],
-                                  rescue_reference):
-                raise RuntimeError("rescue graphs are not paired across model/channel runs")
-    graphwise = analyse_graphwise_gaps(task_results, n_boot=n_boot, seed=bootstrap_seed + 1000)
-    log("[beta-graphwise] paired model-gap associations (partial Spearman):")
-    for name, item in graphwise["comparisons"].items():
-        log(f"  {name}: rho={item['rho']:+.2f} "
-            f"[{item['ci'][0]:+.2f}, {item['ci'][1]:+.2f}]")
+    compensation = analyse_semantic_compensation(
+        task_results, n_boot=n_boot, seed=bootstrap_seed + 1000)
+    coefficients = compensation["primary"]["coefficients"]
+    log(f"[beta-compensation] verdict: {compensation['verdict']}")
+    log("[beta-compensation] RRWP novelty -> semantic compensation -> local error penalty:")
+    for name in ("a", "b", "indirect", "c", "c_prime"):
+        stat = coefficients[name]
+        log(f"  {name}: {stat['estimate']:+.3f} "
+            f"[{stat['ci'][0]:+.3f}, {stat['ci'][1]:+.3f}]")
+    audit = compensation["substrate_audit"]
+    log(f"[beta-compensation] substrate audit: local high-order max="
+        f"{audit['local_high_order_rms_max']:.3e}; dense/global max difference="
+        f"{audit['dense_global_rms_max_abs_difference']:.3e}")
     figures = {
         "score_scatter": make_score_scatter(
             task_results, output / "fig_beta_zinc_specialisation_scatter.png"),
         "score_ablation": make_ablation_figure(
             task_results, output / "fig_beta_zinc_score_ablation_causality.png"),
-        "rescue_double_dissociation": make_rescue_figure(
-            task_results, output / "fig_beta_zinc_rescue_double_dissociation.png"),
-        "graphwise_gaps": make_graph_gap_figure(
-            graphwise, output / "fig_beta_zinc_graphwise_residual_gaps.png"),
+        "rrwp_semantic_compensation": make_compensation_figure(
+            compensation, output / "fig_beta_zinc_rrwp_semantic_compensation.png"),
     }
-    raw_npz, summary_json = _save_raw(task_results, graphwise, output)
+    raw_npz, summary_json = _save_raw(task_results, compensation, output)
     log("\n" + "=" * 88)
-    log("BETA complete. Effective-rank outputs were not generated.")
+    log("BETA complete. Retired rank, rescue, and generic response-gap outputs were not generated.")
     for name, path in figures.items():
         log(f"  {name}: {path}")
     return {
         "status": "BETA", "figures": figures, "raw_npz": raw_npz,
-        "summary_json": summary_json, "graphwise_gaps": graphwise,
+        "summary_json": summary_json, "semantic_compensation": compensation,
         "task_results": task_results, "out_dir": str(output),
     }

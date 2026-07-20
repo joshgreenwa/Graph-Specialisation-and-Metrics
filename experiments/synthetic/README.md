@@ -3,6 +3,31 @@
 This folder contains controlled graph tasks for studying symbolic and structural
 attention behaviour outside ZINC.
 
+## ReachCarriageSpecialisation
+
+`training/reach_carriage_specialisation_colab.py` is a standalone, single-cell official-GRIT
+experiment connecting trained attention reach, semantic/structural carriage, and per-head
+specialisation. Parameter-matched 1-hop, 2-hop, 3-hop, and dense GRITs are trained on one
+colour-matched value-retrieval generator.
+
+The generator uses 24-node degree-4 two-block graphs. Degree-preserving edge switches create a
+thin two-edge cut or wide eight-edge cut without changing node count, degree, or edge count.
+Rank-1 retrieval sweeps query--source distance 1--6; the oversquashing experiment fixes distance
+three (reachable by all three-layer models) and sweeps 1, 2, 4, or 6 simultaneous cross-cut
+retrievals. This separates finite receptive-field failure from bottleneck load.
+
+The Colab caches every checkpoint and analysis tensor to Drive and writes five PNG/PDF figure
+families: reachability, oversquashing plus routing lesions, semantic/structural functional and
+beneficial carriage, score--carriage/ablation/rescue causality, and dense--masked carriage
+similarity. Use `--phase train`, `--phase analyze`, and `--phase figures` to split the GPU and
+plotting stages; use `--fast-dev-run` only to test installation and plumbing.
+Structural carriage conjugates RRWP and trained sparse support together; the per-head structural
+specialisation score separately freezes support, matching the distinction in the two production
+methodologies.
+If a run misses the reachable-cell gate, the notebook makes up to two recorded alternate
+initialisation attempts while holding its task/data seed fixed. Selection uses validation only;
+held-out accuracy remains a final gate, and successful checkpoints are reused unchanged.
+
 ## CausalSpecialisationDoubleDissociation
 
 `training/causal_specialisation_double_dissociation_colab.py` is a single-cell,

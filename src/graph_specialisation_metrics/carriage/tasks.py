@@ -127,6 +127,17 @@ def _onehop_localrrwp_hooks():
     return (hook,)
 
 
+def _khop_hooks(hops: int, global_vnode: bool):
+    """Deferred hook that replays the exact k-hop (+ optional VNode) training patch.
+
+    Reuses ``GRIT_khop_ZINC.apply_khop_patch`` (the function that trained these checkpoints)
+    so the analysis architecture matches training exactly. Torch/GRIT-free at import time.
+    """
+    from . import khop_env
+
+    return (khop_env.make_khop_hook(hops, global_vnode),)
+
+
 def _peptides_hooks():
     """Deferred so importing tasks stays torch/GRIT-free; called at run time."""
     from . import peptides_env
@@ -173,6 +184,68 @@ register(GritTaskSpec(
     env_hooks=_onehop_localrrwp_hooks(),
     # Separate clone: this source patch differs from both dense and standard 1-hop GRIT.
     grit_repo_dir="/content/GRIT_zinc_1hop_localrrwp",
+    node_content_desc="atom type",
+))
+
+
+# ---------------------------------------------------------------------------------------
+# k-hop / virtual-node ZINC controls, trained by the repo-root GRIT_khop_ZINC.py runner
+# (sparsity=k_hop with an exact <=k shortest-path attention mask derived from RRWP walk
+# channels, and an optional learned GlobalVNode excluded from pooling). Each replays the
+# EXACT training patch (khop_env -> GRIT_khop_ZINC.apply_khop_patch) so the checkpoint loads.
+# Each gets its own GRIT clone because the patch writes a hops/vnode-specific config into it.
+# The checkpoints live at <drive_dir>/results/_recovery_checkpoints/seed0_<name_tag>/{best,latest}.ckpt
+# (env.find_checkpoint has a recovery-checkpoint fallback for this layout).
+# ---------------------------------------------------------------------------------------
+
+# 2-hop masked control (no virtual node). name_tag "ColabDrive.2hop.GRITwRRWP".
+register(GritTaskSpec(
+    name="zinc_2hop",
+    title="GRIT+RRWP ZINC-subset (2-hop masked)",
+    # Written into the GRIT clone by the k-hop patch hook, then resolved from there.
+    config_path="configs/GRIT/zinc-GRIT-RRWP-khop.yaml",
+    expected_params=473_473,       # k-hop masking adds no parameters
+    drive_dir="/content/drive/MyDrive/grit_zinc_2hop",
+    paper_metric=None,             # a locality-restricted control; MAE is model-dependent
+    metric_fn=staticmethod(metrics.mae_metric),
+    metric_higher_better=False,
+    metric_abort=0.6,
+    env_hooks=_khop_hooks(hops=2, global_vnode=False),
+    grit_repo_dir="/content/GRIT_zinc_2hop",
+    node_content_desc="atom type",
+))
+
+
+# 1-hop masked control WITH a global virtual node. name_tag "ColabDrive.1hop.GRITwRRWP.VNode".
+register(GritTaskSpec(
+    name="zinc_1hop_vnode",
+    title="GRIT+RRWP ZINC-subset (1-hop masked + global VNode)",
+    config_path="configs/GRIT/zinc-GRIT-RRWP-khop.yaml",
+    expected_params=473_537,       # 473,473 + 64 for the learned VNode embedding
+    drive_dir="/content/drive/MyDrive/grit_zinc_1hop_vnode",
+    paper_metric=None,
+    metric_fn=staticmethod(metrics.mae_metric),
+    metric_higher_better=False,
+    metric_abort=0.6,
+    env_hooks=_khop_hooks(hops=1, global_vnode=True),
+    grit_repo_dir="/content/GRIT_zinc_1hop_vnode",
+    node_content_desc="atom type",
+))
+
+
+# 2-hop masked control WITH a global virtual node. name_tag "ColabDrive.2hop.GRITwRRWP.VNode".
+register(GritTaskSpec(
+    name="zinc_2hop_vnode",
+    title="GRIT+RRWP ZINC-subset (2-hop masked + global VNode)",
+    config_path="configs/GRIT/zinc-GRIT-RRWP-khop.yaml",
+    expected_params=473_537,       # 473,473 + 64 for the learned VNode embedding
+    drive_dir="/content/drive/MyDrive/grit_zinc_2hop_vnode",
+    paper_metric=None,
+    metric_fn=staticmethod(metrics.mae_metric),
+    metric_higher_better=False,
+    metric_abort=0.6,
+    env_hooks=_khop_hooks(hops=2, global_vnode=True),
+    grit_repo_dir="/content/GRIT_zinc_2hop_vnode",
     node_content_desc="atom type",
 ))
 

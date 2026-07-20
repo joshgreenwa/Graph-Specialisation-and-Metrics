@@ -257,10 +257,21 @@ class GritHeadModel:
                     f"not load correctly. Refusing to report specialisation scores.")
             self.test_metric = test_metric
             self.checks["test_metric"] = test_metric
+            # Validation metric alongside test (loaders[1]=val), for reporting only -- no abort.
+            t0 = time.perf_counter()
+            vpreds, vtrues = self._collect_preds(loaders[1])
+            val_metric = float(self.task.metric_fn(vpreds, vtrues))
+            log(f"[verify] val {metric_name} recomputed from checkpoint: {val_metric:.5f} "
+                f"[{time.perf_counter()-t0:.1f}s]")
+            self.val_metric = val_metric
+            self.checks["val_metric"] = val_metric
         else:
             self.test_metric = None
             self.checks["test_metric"] = None
+            self.val_metric = None
+            self.checks["val_metric"] = None
         self.checks["test_metric_name"] = metric_name
+        self.checks["val_metric_name"] = metric_name
         return self
 
     def _collect_preds(self, loader):
@@ -313,12 +324,20 @@ class GritHeadModel:
             for hd in handles:
                 hd.remove()
 
+        # global-VNode models append one virtual-node row per graph before the layers (stripped
+        # only just before pooling), so wV here carries those rows. Restrict the captured transport
+        # to REAL nodes so the per-node reshape/indexing in scores.py is exact. For the want_grad
+        # clean capture we must NOT re-index wV (that sibling tensor would fall off yhat's autograd
+        # path); we return real_mask and the caller strips the readout gradient phi instead.
+        real_mask = getattr(batch, "real_node_mask", None)
+        if real_mask is not None and not want_grad:
+            cap["wV"] = [w[real_mask] for w in cap["wV"]]
         for l in range(self.L):
             assert cap["wV"][l] is not None, f"layer {l} attention hook did not fire"
             assert cap["wV"][l].dim() == 3 and cap["wV"][l].shape[1:] == (self.H, self.dh), \
                 f"wV[{l}] shape {tuple(cap['wV'][l].shape)} != [N,{self.H},{self.dh}]"
         return {"pred": pred, "true": true, "wV": cap["wV"], "attn": cap["attn"],
-                "edge_index": cap["edge_index"]}
+                "edge_index": cap["edge_index"], "real_mask": real_mask}
 
     # ---- ablation forward ------------------------------------------------------------
     def collect_preds_ablated(self, data_groups, ablations=None):

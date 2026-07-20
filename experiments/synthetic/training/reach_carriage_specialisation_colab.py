@@ -16,13 +16,18 @@ colour-matched marked source.
 * Oversquashing: distance is fixed at d=3, reachable by every trained mask, while the number of
   simultaneous cross-cut query/source pairs is swept over 1,2,4,6 on thin versus wide cuts.
 
-The analysis computes semantic donor-swap and mask-frozen structural-transposition carriage.
-Functional carriage is the norm of the donor-averaged logit movement.  Beneficial carriage is the
-exact finite loss improvement, L(corrupt)-L(clean), so positive values mean that the clean factor
-helps the task.  Per-head intervention scores use official GRIT's routed ``wV`` transport site.
-Every head is then ablated to measure task impact and the resulting loss of matching carriage;
-top-score clean-head rescue, direct query-source edge lesions, and cross-cut lesions provide causal
-controls.
+The analysis computes semantic donor-swap carriage and full structural carriage, for which RRWP
+and sparse support are transposed together. Functional carriage is the norm of the donor-averaged
+logit movement. Beneficial carriage is the exact finite loss improvement,
+L(corrupt)-L(clean), so positive values mean that the clean factor helps the task. Per-head
+intervention scores use official GRIT's routed ``wV`` transport site; their structural intervention
+freezes support, as required by the specialisation methodology. Every head is then ablated to
+measure task impact and the resulting loss of full matching carriage; top-score clean-head rescue,
+direct query-source edge lesions, and cross-cut lesions provide causal controls.
+
+The node-retrieval head reads only the query state, so the query is the sole carrier: its linear
+readout makes the functional logit movement equal to aggregate functional carriage, and the exact
+finite cross-entropy change equals aggregate beneficial carriage without a multi-carrier allocation.
 
 Primary outputs
 ---------------
@@ -32,7 +37,9 @@ Primary outputs
 ``fig4_specialisation_carriage_causality``
 ``fig5_dense_masked_similarity``
 
-Use ``--fast-dev-run`` only for plumbing.  Paper claims require the default multi-seed run.
+Use ``--fast-dev-run`` only for plumbing. Paper claims require the default multi-seed run. A
+failed convergence gate receives at most two predetermined alternate initialisations, selected on
+validation accuracy only; the task/data seed is unchanged and the accepted attempt is recorded.
 """
 
 from __future__ import annotations
@@ -222,8 +229,12 @@ class Config:
             raise ValueError("dim must be divisible by heads")
         if any(model not in MODEL_RADII for model in self.models):
             raise ValueError(f"models must be drawn from {sorted(MODEL_RADII)}")
+        if "dense" not in self.models or len(self.models) < 2:
+            raise ValueError("the comparison and similarity figures require dense plus at least one masked model")
         if self.load_distance > self.layers:
             raise ValueError("load_distance must be reachable by the 1-hop model")
+        if any(distance not in self.distances for distance in self.focus_distances):
+            raise ValueError("focus_distances must be included in distances")
 
 
 def config_fingerprint(cfg: Config) -> str:
@@ -365,16 +376,47 @@ def sample_pairs(
             for source in range(cfg.n)
             if q != source and int(distances[q, source]) == int(distance)
         ]
+    # A greedy matching occasionally gets stuck at the largest load even when a
+    # valid matching exists.  Rank is deliberately tiny (<= 6), so an exact,
+    # randomised backtracking matcher is both cheap and deterministic by seed.
+    by_query: dict[int, list[int]] = {}
     rng.shuffle(candidates)
-    chosen: list[tuple[int, int]] = []
-    used: set[int] = set()
     for q, source in candidates:
-        if q in used or source in used:
-            continue
-        chosen.append((int(q), int(source)))
-        used.update((int(q), int(source)))
+        by_query.setdefault(int(q), []).append(int(source))
+    query_order = list(by_query)
+    rng.shuffle(query_order)
+    query_order.sort(key=lambda q: len(by_query[q]))
+
+    def find_matching(
+        position: int,
+        used: frozenset[int],
+        chosen: tuple[tuple[int, int], ...],
+    ) -> tuple[tuple[int, int], ...] | None:
         if len(chosen) == int(rank):
             return chosen
+        needed = int(rank) - len(chosen)
+        available_queries = sum(q not in used for q in query_order[position:])
+        if available_queries < needed:
+            return None
+        for index in range(position, len(query_order)):
+            q = query_order[index]
+            if q in used:
+                continue
+            for source in by_query[q]:
+                if source in used:
+                    continue
+                result = find_matching(
+                    index + 1,
+                    used | frozenset((q, source)),
+                    chosen + ((q, source),),
+                )
+                if result is not None:
+                    return result
+        return None
+
+    matching = find_matching(0, frozenset(), ())
+    if matching is not None:
+        return list(matching)
     raise RuntimeError(
         f"could not place rank={rank} disjoint pairs at distance={distance}, cross_cut={cross_cut}"
     )
@@ -581,6 +623,7 @@ def build_model_class() -> type:
             data = Data(num_nodes=bsz * n)
             data.x = self.input_encoder(batch.x.reshape(bsz * n, -1)) + self.node_rrwp_encoder(node_rrwp)
             data.edge_index = torch.stack([src, dst], dim=0)
+            self.last_edge_index = data.edge_index
             data.edge_attr = self.edge_type_encoder(edge_type) + self.pair_rrwp_encoder(edge_rrwp)
             data.batch = torch.arange(bsz, device=batch.x.device).repeat_interleave(n)
             degree = torch.zeros(bsz * n, device=batch.x.device)
@@ -825,6 +868,7 @@ def train_model(
     device: Any,
     force: bool,
     load_only: bool,
+    initialisation_attempt: int = 0,
 ) -> tuple[Any, dict[str, Any]]:
     import torch
 
@@ -832,13 +876,16 @@ def train_model(
     if OfficialMaskedGRIT.__name__ == "OfficialMaskedGRIT":
         OfficialMaskedGRIT = build_model_class()
     path = checkpoint_path(run_dir, cfg, model_name, seed)
-    set_seed(seed)
+    initialisation_seed = int(seed) + int(initialisation_attempt) * 100_003
+    set_seed(initialisation_seed)
     model = OfficialMaskedGRIT(cfg, model_name).to(device)
     if path.exists() and not force:
         payload = torch.load(path, map_location=device, weights_only=False)
         if payload.get("fingerprint") != config_fingerprint(cfg):
             raise RuntimeError(f"checkpoint fingerprint mismatch at {path}")
         model.load_state_dict(payload["state_dict"])
+        model.initialisation_attempt = int(payload.get("initialisation_attempt", 0))
+        model.initialisation_seed = int(payload.get("initialisation_seed", seed))
         model.eval()
         print(f"[train {model_name} seed={seed}] loaded {path}", flush=True)
         return model, payload
@@ -917,6 +964,8 @@ def train_model(
         "official_grit_commit": OFFICIAL_GRIT_COMMIT,
         "model_name": model_name,
         "seed": int(seed),
+        "initialisation_attempt": int(initialisation_attempt),
+        "initialisation_seed": int(initialisation_seed),
         "config": asdict(cfg),
         "state_dict": best_state,
         "best_validation": best_grid,
@@ -926,16 +975,1768 @@ def train_model(
     }
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(payload, path)
-    write_csv(run_dir / "tables" / f"training_{model_name}_seed_{seed}.csv", history)
+    write_csv(
+        run_dir / "tables" / f"training_{model_name}_seed_{seed}_attempt_{initialisation_attempt}.csv",
+        history,
+    )
+    model.initialisation_attempt = int(initialisation_attempt)
+    model.initialisation_seed = int(initialisation_seed)
     print(f"[train {model_name} seed={seed}] cached {path}", flush=True)
     return model, payload
 
 
-def checkpoint_gate(cfg: Config, model_name: str, payload: Mapping[str, Any]) -> float:
+def checkpoint_gate(
+    cfg: Config,
+    model_name: str,
+    payload: Mapping[str, Any],
+    *,
+    split: str = "heldout",
+) -> float:
+    if split not in {"best_validation", "heldout"}:
+        raise ValueError(split)
     reachable = [
-        row for row in payload.get("heldout", [])
+        row for row in payload.get(split, [])
         if (row["condition"] == "reach" and row["distance"] <= theoretical_reach(cfg, model_name))
         or (row["condition"] == "load" and row["rank"] == 1)
     ]
     return float(np.mean([row["accuracy"] for row in reachable])) if reachable else 0.0
 
+
+# ======================================================================================
+# Semantic/structural interventions and aggregate carriage
+# ======================================================================================
+
+
+def rank1_query_source(batch: RetrievalBatch, graph: int) -> tuple[int, int]:
+    queries = batch.qmask[int(graph)].nonzero(as_tuple=False).flatten()
+    if len(queries) != 1:
+        raise ValueError("this analysis requires rank-1 graphs")
+    query = int(queries[0])
+    return query, int(batch.source_for_query[int(graph), query])
+
+
+def replace_value(cfg: Config, row: Any, value: int) -> Any:
+    output = row.clone()
+    output[: cfg.classes] = 0.0
+    output[int(value)] = 1.0
+    return output
+
+
+def draw_other_class(rng: np.random.Generator, classes: int, current: int) -> int:
+    value = int(rng.integers(0, classes - 1))
+    return value + (1 if value >= int(current) else 0)
+
+
+def transpose_node_axes(tensor: Any, u: int, v: int) -> Any:
+    if int(u) == int(v):
+        return tensor.clone()
+    order = list(range(int(tensor.size(0))))
+    order[int(u)], order[int(v)] = order[int(v)], order[int(u)]
+    return tensor[order][:, order].clone()
+
+
+def structural_partners(adj: Any, source: int) -> list[int]:
+    adj_np = np.asarray(adj.detach().cpu(), dtype=np.float32)
+    degree = adj_np.sum(axis=1)
+    return [
+        node for node in range(adj_np.shape[0])
+        if node != int(source)
+        and degree[node] == degree[int(source)]
+    ]
+
+
+def _replica(
+    batch: RetrievalBatch,
+    graph: int,
+    *,
+    x: Any | None = None,
+    adj: Any | None = None,
+    rrwp: Any | None = None,
+    blocked: Any | None = None,
+) -> RetrievalBatch:
+    one = batch.slice(graph, graph + 1)
+    if x is not None:
+        one.x = x
+    if adj is not None:
+        one.adj = adj
+    if rrwp is not None:
+        one.rrwp = rrwp
+    if blocked is not None:
+        one.blocked = blocked
+    return one
+
+
+def make_all_source_replicas(
+    cfg: Config,
+    clean: RetrievalBatch,
+    *,
+    factor: str,
+    donors: int,
+    seed: int,
+    no_op: bool = False,
+    structural_support: str = "conjugated",
+) -> RetrievalBatch:
+    """All-source carriage replicas; structural carriage conjugates support by default."""
+    import torch
+
+    rng = np.random.default_rng(int(seed))
+    replicas: list[RetrievalBatch] = []
+    for graph in range(len(clean)):
+        one = clean.slice(graph, graph + 1)
+        replicas.append(one)
+        rank1_query_source(clean, graph)
+        for source in range(cfg.n):
+            for _ in range(int(donors)):
+                x = one.x.clone()
+                adj = one.adj.clone()
+                rrwp = one.rrwp.clone()
+                blocked = one.blocked.clone()
+                if factor == "semantic":
+                    current = int(torch.argmax(x[0, source, : cfg.classes]))
+                    value = current if no_op else draw_other_class(rng, cfg.classes, current)
+                    x[0, source] = replace_value(cfg, x[0, source], value)
+                elif factor == "structural":
+                    if no_op:
+                        partner = source
+                    else:
+                        candidates = structural_partners(one.adj[0], source)
+                        partner = int(rng.choice(candidates))
+                    rrwp[0] = transpose_node_axes(rrwp[0], source, partner)
+                    if structural_support == "conjugated":
+                        adj[0] = transpose_node_axes(adj[0], source, partner)
+                        blocked[0] = transpose_node_axes(blocked[0], source, partner)
+                    elif structural_support != "frozen":
+                        raise ValueError(structural_support)
+                else:
+                    raise ValueError(factor)
+                replicas.append(_replica(one, 0, x=x, adj=adj, rrwp=rrwp, blocked=blocked))
+    return concat_batches(replicas)
+
+
+def make_target_replicas(
+    cfg: Config,
+    clean: RetrievalBatch,
+    *,
+    factor: str,
+    donors: int,
+    seed: int,
+    structural_support: str = "frozen",
+) -> RetrievalBatch:
+    """Graph-major target corruptions; head scores default to mask-frozen structure."""
+    import torch
+
+    rng = np.random.default_rng(int(seed))
+    replicas: list[RetrievalBatch] = []
+    for graph in range(len(clean)):
+        one = clean.slice(graph, graph + 1)
+        replicas.append(one)
+        _, source = rank1_query_source(clean, graph)
+        for _ in range(int(donors)):
+            x = one.x.clone()
+            adj = one.adj.clone()
+            rrwp = one.rrwp.clone()
+            blocked = one.blocked.clone()
+            if factor == "semantic":
+                current = int(torch.argmax(x[0, source, : cfg.classes]))
+                x[0, source] = replace_value(
+                    cfg, x[0, source], draw_other_class(rng, cfg.classes, current)
+                )
+            elif factor == "structural":
+                partner = int(rng.choice(structural_partners(one.adj[0], source)))
+                rrwp[0] = transpose_node_axes(rrwp[0], source, partner)
+                if structural_support == "conjugated":
+                    adj[0] = transpose_node_axes(adj[0], source, partner)
+                    blocked[0] = transpose_node_axes(blocked[0], source, partner)
+                elif structural_support != "frozen":
+                    raise ValueError(structural_support)
+            else:
+                raise ValueError(factor)
+            replicas.append(_replica(one, 0, x=x, adj=adj, rrwp=rrwp, blocked=blocked))
+    return concat_batches(replicas)
+
+
+def rank1_logits(node_logits: Any, batch: RetrievalBatch) -> Any:
+    import torch
+
+    rows = torch.arange(len(batch), device=node_logits.device)
+    queries = batch.qmask.to(node_logits.device).float().argmax(dim=1).long()
+    return node_logits[rows, queries]
+
+
+def rank1_labels(batch: RetrievalBatch) -> Any:
+    queries = batch.qmask.float().argmax(dim=1).long()
+    rows = np.arange(len(batch))
+    return batch.y[rows, queries]
+
+
+def carriage_from_replica_logits(
+    query_logits: Any,
+    labels: Any,
+    *,
+    graphs: int,
+    sources: int,
+    donors: int,
+) -> dict[str, Any]:
+    import torch
+    import torch.nn.functional as F
+
+    reps = 1 + int(sources) * int(donors)
+    shaped = query_logits.reshape(graphs, reps, -1)
+    clean = shaped[:, 0]
+    corrupt = shaped[:, 1:].reshape(graphs, sources, donors, -1)
+    mean_corrupt = corrupt.mean(dim=2)
+    functional = torch.linalg.vector_norm(clean[:, None, :] - mean_corrupt, dim=-1)
+    clean_loss = F.cross_entropy(clean, labels.long(), reduction="none")
+    corrupt_labels = labels[:, None, None].expand(-1, sources, donors).reshape(-1)
+    corrupt_loss = F.cross_entropy(
+        corrupt.reshape(graphs * sources * donors, -1),
+        corrupt_labels,
+        reduction="none",
+    ).reshape(graphs, sources, donors)
+    # Production sign B = L(clean)-E L(corrupt): negative means the clean factor was beneficial.
+    beneficial_signed = clean_loss[:, None] - corrupt_loss.mean(dim=2)
+    return {
+        "functional": functional,
+        "beneficial_signed": beneficial_signed,
+        "benefit": -beneficial_signed,
+        "clean_logits": clean,
+        "mean_corrupt_logits": mean_corrupt,
+    }
+
+
+def predict_rank1_replicas(
+    model: Any,
+    replicas: RetrievalBatch,
+    *,
+    device: Any,
+    chunk_size: int,
+    ablations: Sequence[tuple[int, int]] | None = None,
+) -> Any:
+    node_logits = predict_in_chunks(
+        model,
+        replicas,
+        device=device,
+        chunk_size=chunk_size,
+        ablations=ablations,
+    )
+    return rank1_logits(node_logits, replicas)
+
+
+def carriage_profile(
+    model: Any,
+    cfg: Config,
+    *,
+    distance: int,
+    factor: str,
+    seed: int,
+    device: Any,
+) -> dict[str, Any]:
+    clean = make_batch(
+        cfg,
+        cfg.carriage_graphs,
+        seed,
+        condition="reach",
+        topology="thin",
+        distance=distance,
+        rank=1,
+    )
+    replicas = make_all_source_replicas(
+        cfg,
+        clean,
+        factor=factor,
+        donors=cfg.carriage_donors,
+        seed=seed + 1,
+    )
+    logits = predict_rank1_replicas(
+        model,
+        replicas,
+        device=device,
+        chunk_size=cfg.carriage_batch_size,
+    )
+    labels = rank1_labels(clean)
+    carriage = carriage_from_replica_logits(
+        logits,
+        labels,
+        graphs=len(clean),
+        sources=cfg.n,
+        donors=cfg.carriage_donors,
+    )
+    distances = np.zeros((len(clean), cfg.n), dtype=np.int64)
+    is_target = np.zeros((len(clean), cfg.n), dtype=bool)
+    for graph in range(len(clean)):
+        query, source = rank1_query_source(clean, graph)
+        distances[graph] = bfs_distances(np.asarray(clean.adj[graph]), query)
+        is_target[graph, source] = True
+    return {
+        "distance": int(distance),
+        "factor": factor,
+        "functional": carriage["functional"].cpu(),
+        "beneficial_signed": carriage["beneficial_signed"].cpu(),
+        "benefit": carriage["benefit"].cpu(),
+        "source_distance": distances,
+        "is_target": is_target,
+    }
+
+
+def no_op_carriage_check(model: Any, cfg: Config, *, factor: str, seed: int, device: Any) -> float:
+    clean = make_batch(cfg, 2, seed, condition="reach", topology="thin", distance=2, rank=1)
+    replicas = make_all_source_replicas(cfg, clean, factor=factor, donors=1, seed=seed + 1, no_op=True)
+    logits = predict_rank1_replicas(model, replicas, device=device, chunk_size=cfg.carriage_batch_size)
+    carriage = carriage_from_replica_logits(
+        logits,
+        rank1_labels(clean),
+        graphs=len(clean),
+        sources=cfg.n,
+        donors=1,
+    )
+    return float(carriage["functional"].abs().max())
+
+
+def relabel_invariance_check(model: Any, cfg: Config, *, seed: int, device: Any) -> float:
+    import torch
+
+    clean = make_batch(cfg, 3, seed, condition="reach", topology="thin", distance=2, rank=1)
+    rng = np.random.default_rng(seed + 1)
+    permuted = []
+    for graph in range(len(clean)):
+        one = clean.slice(graph, graph + 1)
+        order = rng.permutation(cfg.n)
+        inverse = np.empty(cfg.n, dtype=np.int64)
+        inverse[order] = np.arange(cfg.n)
+        source_map = one.source_for_query[:, order].clone()
+        active = source_map >= 0
+        if bool(active.any()):
+            source_map[active] = torch.as_tensor(inverse[source_map[active].numpy()], dtype=torch.long)
+        permuted.append(RetrievalBatch(
+            x=one.x[:, order],
+            adj=one.adj[:, order][:, :, order],
+            rrwp=one.rrwp[:, order][:, :, order],
+            qmask=one.qmask[:, order],
+            y=one.y[:, order],
+            source_for_query=source_map,
+            blocked=one.blocked[:, order][:, :, order],
+            condition=one.condition.clone(),
+            topology=one.topology.clone(),
+            target_distance=one.target_distance.clone(),
+            rank=one.rank.clone(),
+        ))
+    relabelled = concat_batches(permuted)
+    with torch.no_grad():
+        clean_logits = rank1_logits(model(clean.to(device)), clean.to(device))
+        relabelled_logits = rank1_logits(model(relabelled.to(device)), relabelled.to(device))
+    return float((clean_logits - relabelled_logits).abs().max().cpu())
+
+
+def softmax_check(model: Any, cfg: Config, *, seed: int, device: Any) -> float:
+    import torch
+
+    batch = make_batch(cfg, 2, seed, condition="load", topology="thin", distance=cfg.load_distance, rank=2).to(device)
+    result = capture_forward(model, batch, want_grad=False, want_attention=True)
+    edge_index = model.last_edge_index
+    errors = []
+    for attention in result["attention"]:
+        sums = torch.zeros(len(batch) * cfg.n, cfg.heads, device=device)
+        sums.index_add_(0, edge_index[1], attention)
+        errors.append(float((sums - 1.0).abs().max().cpu()))
+    return max(errors)
+
+
+# ======================================================================================
+# Head-resolved scores, carriage loss under ablation, task ablation, and rescue
+# ======================================================================================
+
+
+def score_factor_batch(
+    model: Any,
+    cfg: Config,
+    clean: RetrievalBatch,
+    *,
+    factor: str,
+    seed: int,
+    device: Any,
+) -> Any:
+    import torch
+
+    replicas = make_target_replicas(
+        cfg,
+        clean.cpu(),
+        factor=factor,
+        donors=cfg.score_donors,
+        seed=seed,
+    ).to(device)
+    result = capture_forward(model, replicas, want_grad=True)
+    query_logits = rank1_logits(result["logits"], replicas)
+    graphs = len(clean)
+    reps = cfg.score_donors + 1
+    clean_rows = torch.arange(graphs, device=device) * reps
+    accum = [torch.zeros(graphs, cfg.n, cfg.heads, device=device) for _ in range(cfg.layers)]
+    for output_index in range(cfg.classes):
+        gradients = torch.autograd.grad(
+            query_logits[clean_rows, output_index].sum(),
+            result["wV"],
+            retain_graph=output_index < cfg.classes - 1,
+            allow_unused=False,
+        )
+        for layer in range(cfg.layers):
+            states = result["wV"][layer].reshape(graphs, reps, cfg.n, cfg.heads, -1)
+            grads = gradients[layer].reshape(graphs, reps, cfg.n, cfg.heads, -1)[:, 0]
+            delta = states[:, 0] - states[:, 1:].mean(dim=1)
+            accum[layer] += (grads * delta).sum(dim=-1).square()
+    return torch.stack([value.sqrt().sum(dim=1) for value in accum], dim=1).detach().cpu()
+
+
+def score_factor(
+    model: Any,
+    cfg: Config,
+    clean: RetrievalBatch,
+    *,
+    factor: str,
+    seed: int,
+    device: Any,
+) -> Any:
+    import torch
+
+    pieces = []
+    for start in range(0, len(clean), cfg.score_batch_size):
+        stop = min(start + cfg.score_batch_size, len(clean))
+        pieces.append(score_factor_batch(
+            model,
+            cfg,
+            clean.slice(start, stop),
+            factor=factor,
+            seed=seed + start * 97,
+            device=device,
+        ))
+    return torch.cat(pieces, dim=0)
+
+
+def target_carriage_with_head_ablations(
+    model: Any,
+    cfg: Config,
+    clean: RetrievalBatch,
+    *,
+    factor: str,
+    seed: int,
+    device: Any,
+) -> dict[str, Any]:
+    import torch
+
+    replicas = make_target_replicas(
+        cfg,
+        clean,
+        factor=factor,
+        donors=cfg.score_donors,
+        seed=seed,
+        structural_support="conjugated",
+    )
+    labels = rank1_labels(clean)
+    baseline_logits = predict_rank1_replicas(
+        model, replicas, device=device, chunk_size=cfg.carriage_batch_size
+    )
+    baseline = carriage_from_replica_logits(
+        baseline_logits,
+        labels,
+        graphs=len(clean),
+        sources=1,
+        donors=cfg.score_donors,
+    )
+    base_functional = baseline["functional"][:, 0]
+    base_benefit = baseline["benefit"][:, 0]
+    functional_drop = torch.zeros(cfg.layers, cfg.heads, len(clean))
+    benefit_drop = torch.zeros_like(functional_drop)
+    for layer in range(cfg.layers):
+        for head in range(cfg.heads):
+            ablated_logits = predict_rank1_replicas(
+                model,
+                replicas,
+                device=device,
+                chunk_size=cfg.carriage_batch_size,
+                ablations=[(layer, head)],
+            )
+            ablated = carriage_from_replica_logits(
+                ablated_logits,
+                labels,
+                graphs=len(clean),
+                sources=1,
+                donors=cfg.score_donors,
+            )
+            functional_drop[layer, head] = base_functional - ablated["functional"][:, 0]
+            benefit_drop[layer, head] = base_benefit - ablated["benefit"][:, 0]
+    return {
+        "base_functional": base_functional,
+        "base_benefit": base_benefit,
+        "functional_drop": functional_drop,
+        "benefit_drop": benefit_drop,
+    }
+
+
+def task_ablation_sweep(
+    model: Any,
+    cfg: Config,
+    *,
+    distance: int,
+    seed: int,
+    device: Any,
+) -> dict[str, Any]:
+    import torch
+    import torch.nn.functional as F
+
+    clean = make_batch(
+        cfg,
+        cfg.ablation_graphs,
+        seed,
+        condition="reach",
+        topology="thin",
+        distance=distance,
+        rank=1,
+    )
+    node_logits = predict_in_chunks(model, clean, device=device, chunk_size=cfg.carriage_batch_size)
+    logits = rank1_logits(node_logits, clean)
+    labels = rank1_labels(clean)
+    clean_loss = F.cross_entropy(logits, labels.long(), reduction="none")
+    functional = torch.zeros(cfg.layers, cfg.heads, len(clean))
+    loss = torch.zeros_like(functional)
+    for layer in range(cfg.layers):
+        for head in range(cfg.heads):
+            ablated_nodes = predict_in_chunks(
+                model,
+                clean,
+                device=device,
+                chunk_size=cfg.carriage_batch_size,
+                ablations=[(layer, head)],
+            )
+            ablated = rank1_logits(ablated_nodes, clean)
+            functional[layer, head] = torch.linalg.vector_norm(ablated - logits, dim=-1)
+            loss[layer, head] = F.cross_entropy(ablated, labels.long(), reduction="none") - clean_loss
+    return {
+        "functional": functional,
+        "loss": loss,
+        "clean_accuracy": float((logits.argmax(-1) == labels).float().mean()),
+    }
+
+
+def _paired_clean_corrupt(replicas: RetrievalBatch, donors: int) -> tuple[RetrievalBatch, RetrievalBatch]:
+    clean_indices = np.arange(0, len(replicas), donors + 1, dtype=np.int64)
+    corrupt_indices = clean_indices + 1
+    return replicas.select(clean_indices), replicas.select(corrupt_indices)
+
+
+def rescue_controls(
+    model: Any,
+    cfg: Config,
+    clean: RetrievalBatch,
+    *,
+    factor: str,
+    score: np.ndarray,
+    joint_score: np.ndarray,
+    seed: int,
+    device: Any,
+) -> dict[str, Any]:
+    import torch
+
+    replicas = make_target_replicas(
+        cfg, clean, factor=factor, donors=cfg.score_donors, seed=seed
+    )
+    clean_batch, corrupt_batch = _paired_clean_corrupt(replicas, cfg.score_donors)
+    clean_device = clean_batch.to(device)
+    corrupt_device = corrupt_batch.to(device)
+    clean_result = capture_forward(model, clean_device, want_grad=False)
+    with torch.no_grad():
+        corrupt_nodes = model(corrupt_device).detach()
+    clean_logits = rank1_logits(clean_result["logits"], clean_device)
+    corrupt_logits = rank1_logits(corrupt_nodes, corrupt_device)
+    total = clean_logits - corrupt_logits
+    denominator = total.square().sum(dim=-1) + EPS
+    top_flat = int(np.nanargmax(score))
+    top = (top_flat // cfg.heads, top_flat % cfg.heads)
+    same_layer = [(top[0], head) for head in range(cfg.heads) if head != top[1]]
+    layer_median = float(np.median([score[item] for item in same_layer]))
+    low_factor = [item for item in same_layer if float(score[item]) <= layer_median]
+    candidates = low_factor or same_layer
+    # Match the selected head's aggregate semantic+structural throughput as closely as the small
+    # head set permits, while requiring below-median matching-factor score within the same layer.
+    control = min(
+        candidates,
+        key=lambda item: abs(math.log(float(joint_score[item]) + EPS) - math.log(float(joint_score[top]) + EPS)),
+    )
+    output: dict[str, Any] = {"top_head": list(top), "control_head": list(control)}
+    for name, (layer, head) in (("top", top), ("layer_matched_control", control)):
+        clean_wv = clean_result["wV"][layer].detach()
+        with patch_head_output(model, layer, head, clean_wv), torch.no_grad():
+            patched_nodes = model(corrupt_device).detach()
+        patched = rank1_logits(patched_nodes, corrupt_device)
+        mem = ((patched - corrupt_logits) * total).sum(dim=-1) / denominator
+        output[name] = mem.detach().cpu()
+    return output
+
+
+def head_analysis_condition(
+    model: Any,
+    cfg: Config,
+    *,
+    distance: int,
+    seed: int,
+    device: Any,
+) -> dict[str, Any]:
+    clean = make_batch(
+        cfg,
+        cfg.score_graphs,
+        seed,
+        condition="reach",
+        topology="thin",
+        distance=distance,
+        rank=1,
+    )
+    output: dict[str, Any] = {"distance": int(distance)}
+    factor_seeds: dict[str, int] = {}
+    for factor_index, factor in enumerate(("semantic", "structural")):
+        factor_seed = seed + 10_000 * (factor_index + 1)
+        factor_seeds[factor] = factor_seed
+        score_per_graph = score_factor(
+            model,
+            cfg,
+            clean,
+            factor=factor,
+            seed=factor_seed,
+            device=device,
+        )
+        carriage_delta = target_carriage_with_head_ablations(
+            model,
+            cfg,
+            clean,
+            factor=factor,
+            seed=factor_seed,
+            device=device,
+        )
+        score_mean = score_per_graph.mean(dim=0).numpy()
+        output[factor] = {
+            "score_per_graph": score_per_graph,
+            "score": score_mean,
+            "carriage": carriage_delta,
+        }
+    joint_score = np.asarray(output["semantic"]["score"]) + np.asarray(output["structural"]["score"])
+    for factor in ("semantic", "structural"):
+        output[factor]["rescue"] = rescue_controls(
+            model,
+            cfg,
+            clean,
+            factor=factor,
+            score=np.asarray(output[factor]["score"]),
+            joint_score=joint_score,
+            seed=factor_seeds[factor],
+            device=device,
+        )
+    output["task_ablation"] = task_ablation_sweep(
+        model,
+        cfg,
+        distance=distance,
+        seed=seed + 90_000,
+        device=device,
+    )
+    return output
+
+
+# ======================================================================================
+# Cached analysis orchestration
+# ======================================================================================
+
+
+def analysis_path(run_dir: Path, cfg: Config, model_name: str, seed: int) -> Path:
+    return run_dir / "analysis" / f"{model_name}__seed_{seed}__{config_fingerprint(cfg)}.pt"
+
+
+def analyze_model(
+    model: Any,
+    cfg: Config,
+    *,
+    model_name: str,
+    seed: int,
+    run_dir: Path,
+    device: Any,
+    force: bool,
+) -> dict[str, Any]:
+    import torch
+
+    path = analysis_path(run_dir, cfg, model_name, seed)
+    if path.exists() and not force:
+        print(f"[analysis {model_name} seed={seed}] loaded {path}", flush=True)
+        return torch.load(path, map_location="cpu", weights_only=False)
+    model.eval()
+    checks = {
+        "semantic_no_op_max": no_op_carriage_check(
+            model, cfg, factor="semantic", seed=1_100_000 + seed, device=device
+        ),
+        "structural_no_op_max": no_op_carriage_check(
+            model, cfg, factor="structural", seed=1_200_000 + seed, device=device
+        ),
+        "full_relabel_max": relabel_invariance_check(
+            model, cfg, seed=1_300_000 + seed, device=device
+        ),
+        "softmax_max_error": softmax_check(
+            model, cfg, seed=1_400_000 + seed, device=device
+        ),
+    }
+    if max(checks["semantic_no_op_max"], checks["structural_no_op_max"]) > 5.0e-5:
+        raise RuntimeError(f"no-op verification failed: {checks}")
+    if max(checks["full_relabel_max"], checks["softmax_max_error"]) > 5.0e-4:
+        raise RuntimeError(f"GRIT invariance/normalisation verification failed: {checks}")
+    profiles = []
+    for distance in cfg.distances:
+        for factor_index, factor in enumerate(("semantic", "structural")):
+            profiles.append(carriage_profile(
+                model,
+                cfg,
+                distance=distance,
+                factor=factor,
+                seed=2_000_000 + seed * 10_000 + distance * 101 + factor_index,
+                device=device,
+            ))
+        print(f"[carriage {model_name} seed={seed}] distance {distance}", flush=True)
+    head_conditions = []
+    for distance in cfg.focus_distances:
+        head_conditions.append(head_analysis_condition(
+            model,
+            cfg,
+            distance=distance,
+            seed=3_000_000 + seed * 10_000 + distance * 101,
+            device=device,
+        ))
+        print(f"[heads {model_name} seed={seed}] distance {distance}", flush=True)
+    lesions = []
+    for lesion_index, lesion in enumerate(("clean", "direct", "crosscut")):
+        lesions.append(evaluate_cell(
+            model,
+            cfg,
+            seed=4_000_000 + seed * 10_000 + lesion_index,
+            device=device,
+            condition="load",
+            topology="thin",
+            distance=cfg.load_distance,
+            rank=max(cfg.ranks),
+            graphs=cfg.heldout_graphs,
+            lesion=lesion,
+        ))
+    result = {
+        "version": EXPERIMENT_VERSION,
+        "fingerprint": config_fingerprint(cfg),
+        "model_name": model_name,
+        "seed": int(seed),
+        "initialisation_attempt": int(getattr(model, "initialisation_attempt", 0)),
+        "initialisation_seed": int(getattr(model, "initialisation_seed", seed)),
+        "parameters": int(sum(parameter.numel() for parameter in model.parameters())),
+        "checks": checks,
+        "evaluation": evaluate_grid(
+            model,
+            cfg,
+            seed=5_000_000 + seed,
+            device=device,
+            graphs=cfg.heldout_graphs,
+        ),
+        "lesions": lesions,
+        "carriage_profiles": profiles,
+        "head_conditions": head_conditions,
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(result, path)
+    print(f"[analysis {model_name} seed={seed}] cached {path}", flush=True)
+    return result
+
+
+def rank_values(values: np.ndarray) -> np.ndarray:
+    values = np.asarray(values, dtype=float)
+    order = np.argsort(values, kind="mergesort")
+    ranks = np.empty(len(values), dtype=float)
+    ranks[order] = np.arange(len(values), dtype=float)
+    unique, inverse, counts = np.unique(values, return_inverse=True, return_counts=True)
+    for index in np.where(counts > 1)[0]:
+        positions = np.where(inverse == index)[0]
+        ranks[positions] = ranks[positions].mean()
+    return ranks
+
+
+def spearman(x: Iterable[float], y: Iterable[float]) -> float:
+    x_arr = np.asarray(list(x), dtype=float)
+    y_arr = np.asarray(list(y), dtype=float)
+    valid = np.isfinite(x_arr) & np.isfinite(y_arr)
+    if valid.sum() < 3 or np.std(x_arr[valid]) <= 0 or np.std(y_arr[valid]) <= 0:
+        return float("nan")
+    return float(np.corrcoef(rank_values(x_arr[valid]), rank_values(y_arr[valid]))[0, 1])
+
+
+def mean_ci(values: Sequence[float]) -> tuple[float, float]:
+    array = np.asarray(values, dtype=float)
+    mean = float(np.nanmean(array))
+    error = float(np.nanstd(array, ddof=1) / math.sqrt(len(array)) * 1.96) if len(array) > 1 else 0.0
+    return mean, error
+
+
+def configure_matplotlib() -> Any:
+    import matplotlib as mpl
+    import matplotlib.pyplot as plt
+
+    mpl.rcParams.update({
+        "font.family": "DejaVu Sans",
+        "font.size": 10,
+        "axes.titlesize": 12,
+        "axes.labelsize": 10,
+        "axes.spines.top": False,
+        "axes.spines.right": False,
+        "figure.dpi": 130,
+        "savefig.dpi": 320,
+        "savefig.bbox": "tight",
+        "pdf.fonttype": 42,
+        "ps.fonttype": 42,
+    })
+    return plt
+
+
+def save_figure(fig: Any, base: Path) -> list[str]:
+    base.parent.mkdir(parents=True, exist_ok=True)
+    paths = [base.with_suffix(".png"), base.with_suffix(".pdf")]
+    for path in paths:
+        fig.savefig(path, facecolor="white")
+        print(f"[figure] {path}", flush=True)
+    return [str(path) for path in paths]
+
+
+MODEL_STYLE = {
+    "1hop": {"color": "#6a51a3", "marker": "o", "label": "1-hop"},
+    "2hop": {"color": "#2b8cbe", "marker": "s", "label": "2-hop"},
+    "3hop": {"color": "#41ab5d", "marker": "^", "label": "3-hop"},
+    "dense": {"color": "#d7301f", "marker": "D", "label": "Dense"},
+}
+
+
+def evaluation_rows(results: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    rows = []
+    for result in results:
+        for row in result["evaluation"]:
+            rows.append({"model": result["model_name"], "seed": result["seed"], **row})
+    return rows
+
+
+def _cell_values(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    model: str,
+    condition: str,
+    topology: str,
+    distance: int | None = None,
+    rank: int | None = None,
+    key: str = "accuracy",
+) -> list[float]:
+    return [
+        float(row[key]) for row in rows
+        if row["model"] == model
+        and row["condition"] == condition
+        and row["topology"] == topology
+        and (distance is None or int(row["distance"]) == int(distance))
+        and (rank is None or int(row["rank"]) == int(rank))
+    ]
+
+
+def figure_reachability(
+    results: Sequence[dict[str, Any]], cfg: Config, figures_dir: Path
+) -> tuple[list[str], dict[str, Any]]:
+    plt = configure_matplotlib()
+    rows = evaluation_rows(results)
+    fig, axes = plt.subplots(1, 2, figsize=(12.2, 4.9), gridspec_kw={"width_ratios": [1.35, 1.0]})
+    summary: dict[str, Any] = {}
+    for model_name in cfg.models:
+        means, errors = [], []
+        for distance in cfg.distances:
+            values = _cell_values(
+                rows,
+                model=model_name,
+                condition="reach",
+                topology="thin",
+                distance=distance,
+            )
+            mean, error = mean_ci(values)
+            means.append(mean)
+            errors.append(error)
+        style = MODEL_STYLE[model_name]
+        axes[0].errorbar(
+            cfg.distances,
+            means,
+            yerr=errors,
+            color=style["color"],
+            marker=style["marker"],
+            linewidth=2.0,
+            capsize=3,
+            label=style["label"],
+        )
+        summary[model_name] = {"accuracy_mean": means, "accuracy_ci95": errors}
+    axes[0].axhline(1.0 / cfg.classes, color="#777777", linestyle=":", linewidth=1.0, label="Chance")
+    axes[0].axvspan(0.5, cfg.layers + 0.5, color="#eeeeee", alpha=0.7, zorder=0)
+    axes[0].text(1.05, 0.82, "1-hop reachable", color="#555555", fontsize=9)
+    axes[0].set_xticks(cfg.distances)
+    axes[0].set_ylim(0.05, 1.04)
+    axes[0].set_xlabel("Query–source distance $d$")
+    axes[0].set_ylabel("Retrieval accuracy")
+    axes[0].set_title("A  Rank-1 reachability", loc="left", fontweight="bold")
+    axes[0].grid(True, linewidth=0.5, alpha=0.22)
+    axes[0].legend(frameon=False, ncol=2, loc="lower left")
+
+    # Difference is paired by seed and distance; construct explicitly to avoid pseudo-replication.
+    for model_name in [name for name in cfg.models if name != "dense"]:
+        gap_means, gap_errors = [], []
+        for distance in cfg.distances:
+            gaps = []
+            for seed in cfg.seeds:
+                dense = next(
+                    float(row["accuracy"]) for row in rows
+                    if row["model"] == "dense" and int(row["seed"]) == seed
+                    and row["condition"] == "reach" and int(row["distance"]) == distance
+                )
+                masked = next(
+                    float(row["accuracy"]) for row in rows
+                    if row["model"] == model_name and int(row["seed"]) == seed
+                    and row["condition"] == "reach" and int(row["distance"]) == distance
+                )
+                gaps.append(dense - masked)
+            mean, error = mean_ci(gaps)
+            gap_means.append(mean)
+            gap_errors.append(error)
+        style = MODEL_STYLE[model_name]
+        axes[1].errorbar(
+            cfg.distances,
+            gap_means,
+            yerr=gap_errors,
+            color=style["color"],
+            marker=style["marker"],
+            linewidth=2.0,
+            capsize=3,
+            label=f"Dense − {style['label']}",
+        )
+    axes[1].axhline(0.0, color="#777777", linewidth=0.9)
+    axes[1].set_xticks(cfg.distances)
+    axes[1].set_xlabel("Query–source distance $d$")
+    axes[1].set_ylabel("Paired accuracy gap")
+    axes[1].set_title("B  Dense advantage emerges beyond mask reach", loc="left", fontweight="bold")
+    axes[1].grid(True, linewidth=0.5, alpha=0.22)
+    axes[1].legend(frameon=False)
+    fig.suptitle(
+        "Trained attention radius determines non-redundant retrieval reach",
+        x=0.055,
+        y=1.01,
+        ha="left",
+        fontsize=15,
+        fontweight="bold",
+    )
+    fig.text(
+        0.055,
+        0.945,
+        "All models are parameter-matched official GRITs; only the attention support used during training differs.",
+        fontsize=9,
+        color="#555555",
+    )
+    fig.tight_layout(rect=(0, 0, 1, 0.90), w_pad=2.4)
+    return save_figure(fig, figures_dir / "fig1_reachability_accuracy"), summary
+
+
+def figure_oversquashing(
+    results: Sequence[dict[str, Any]], cfg: Config, figures_dir: Path
+) -> tuple[list[str], dict[str, Any]]:
+    plt = configure_matplotlib()
+    rows = evaluation_rows(results)
+    fig, axes = plt.subplots(1, 3, figsize=(15.3, 4.9), gridspec_kw={"width_ratios": [1, 1, 1.05]})
+    summary: dict[str, Any] = {"accuracy": {}, "lesions": {}}
+    for ax, topology, panel in zip(axes[:2], ("thin", "wide"), ("A", "B")):
+        for model_name in cfg.models:
+            means, errors = [], []
+            for rank in cfg.ranks:
+                mean, error = mean_ci(_cell_values(
+                    rows,
+                    model=model_name,
+                    condition="load",
+                    topology=topology,
+                    rank=rank,
+                ))
+                means.append(mean)
+                errors.append(error)
+            style = MODEL_STYLE[model_name]
+            ax.errorbar(
+                cfg.ranks,
+                means,
+                yerr=errors,
+                color=style["color"],
+                marker=style["marker"],
+                linewidth=2.0,
+                capsize=3,
+                label=style["label"],
+            )
+            summary["accuracy"][f"{topology}_{model_name}"] = means
+        ax.axhline(1.0 / cfg.classes, color="#777777", linestyle=":", linewidth=1.0)
+        ax.set_xticks(cfg.ranks)
+        ax.set_ylim(0.05, 1.04)
+        ax.set_xlabel("Simultaneous cross-cut retrievals $r$")
+        ax.set_title(
+            f"{panel}  {'Thin cut (2 edges)' if topology == 'thin' else 'Wide cut (8 edges)'}",
+            loc="left",
+            fontweight="bold",
+        )
+        ax.grid(True, linewidth=0.5, alpha=0.22)
+    axes[0].set_ylabel("Retrieval accuracy")
+    axes[1].legend(frameon=False, ncol=2, loc="lower left")
+
+    lesion_names = ("clean", "direct", "crosscut")
+    lesion_labels = ("Clean", "Direct pair\nblocked", "All cross-cut\nattention blocked")
+    x = np.arange(len(lesion_names))
+    width = 0.19
+    for model_index, model_name in enumerate(cfg.models):
+        values_by_lesion = []
+        for lesion in lesion_names:
+            values = [
+                float(row["accuracy"])
+                for result in results
+                if result["model_name"] == model_name
+                for row in result["lesions"]
+                if row["lesion"] == lesion
+            ]
+            values_by_lesion.append(values)
+        means = [mean_ci(values)[0] for values in values_by_lesion]
+        errors = [mean_ci(values)[1] for values in values_by_lesion]
+        style = MODEL_STYLE[model_name]
+        axes[2].bar(
+            x + (model_index - 1.5) * width,
+            means,
+            yerr=errors,
+            width=width,
+            color=style["color"],
+            alpha=0.85,
+            capsize=2,
+            label=style["label"],
+        )
+        summary["lesions"][model_name] = {name: mean for name, mean in zip(lesion_names, means)}
+    axes[2].set_xticks(x, lesion_labels)
+    axes[2].set_ylim(0.0, 1.04)
+    axes[2].set_ylabel("Accuracy at thin-cut $r=6$")
+    axes[2].set_title("C  Routing lesions", loc="left", fontweight="bold")
+    axes[2].grid(True, axis="y", linewidth=0.5, alpha=0.22)
+    fig.suptitle(
+        "Bottleneck load at fixed reachable distance",
+        x=0.045,
+        y=1.01,
+        ha="left",
+        fontsize=15,
+        fontweight="bold",
+    )
+    fig.text(
+        0.045,
+        0.945,
+        f"Every query/source pair is at d={cfg.load_distance}; thin and wide graphs are both 24-node, 4-regular, and edge-count matched.",
+        fontsize=9,
+        color="#555555",
+    )
+    fig.tight_layout(rect=(0, 0, 1, 0.90), w_pad=2.0)
+    return save_figure(fig, figures_dir / "fig2_oversquashing_and_lesions"), summary
+
+
+def profile_target_values(
+    result: Mapping[str, Any], *, factor: str, metric: str
+) -> dict[int, float]:
+    values: dict[int, float] = {}
+    for profile in result["carriage_profiles"]:
+        if profile["factor"] != factor:
+            continue
+        target = np.asarray(profile["is_target"], dtype=bool)
+        array = np.asarray(profile[metric], dtype=float)
+        values[int(profile["distance"])] = float(array[target].mean())
+    return values
+
+
+def figure_carriage(
+    results: Sequence[dict[str, Any]], cfg: Config, figures_dir: Path
+) -> tuple[list[str], dict[str, Any]]:
+    plt = configure_matplotlib()
+    fig, axes = plt.subplots(2, 2, figsize=(12.3, 8.5), sharex=True)
+    specs = [
+        ("semantic", "functional", "A  Semantic functional carriage", r"$F_{sem}$"),
+        ("structural", "functional", "B  Structural functional carriage", r"$F_{str}$"),
+        ("semantic", "benefit", "C  Semantic beneficial carriage", r"$-B_{sem}$ (loss improvement)"),
+        ("structural", "benefit", "D  Structural beneficial carriage", r"$-B_{str}$ (loss improvement)"),
+    ]
+    summary: dict[str, Any] = {}
+    for ax, (factor, metric, title, ylabel) in zip(axes.ravel(), specs):
+        for model_name in cfg.models:
+            curves = []
+            for result in results:
+                if result["model_name"] != model_name:
+                    continue
+                by_distance = profile_target_values(result, factor=factor, metric=metric)
+                curves.append([by_distance[distance] for distance in cfg.distances])
+            array = np.asarray(curves, dtype=float)
+            means = np.nanmean(array, axis=0)
+            errors = (
+                np.nanstd(array, axis=0, ddof=1) / math.sqrt(array.shape[0]) * 1.96
+                if array.shape[0] > 1 else np.zeros(len(cfg.distances))
+            )
+            style = MODEL_STYLE[model_name]
+            ax.plot(
+                cfg.distances,
+                means,
+                color=style["color"],
+                marker=style["marker"],
+                linewidth=2.0,
+                label=style["label"],
+            )
+            ax.fill_between(cfg.distances, means - errors, means + errors, color=style["color"], alpha=0.12)
+            summary[f"{factor}_{metric}_{model_name}"] = means
+        ax.axhline(0.0, color="#777777", linewidth=0.8)
+        ax.set_title(title, loc="left", fontweight="bold")
+        ax.set_ylabel(ylabel)
+        ax.grid(True, linewidth=0.5, alpha=0.22)
+    for ax in axes[1]:
+        ax.set_xlabel("Planted query–source distance $d$")
+        ax.set_xticks(cfg.distances)
+    axes[0, 0].legend(frameon=False, ncol=2)
+    fig.suptitle(
+        "Aggregate semantic and structural carriage tracks learned retrieval reach",
+        x=0.055,
+        y=0.99,
+        ha="left",
+        fontsize=15,
+        fontweight="bold",
+    )
+    fig.text(
+        0.055,
+        0.948,
+        "Target-source donor swaps and full RRWP-plus-support transpositions; bands are seed-level 95% intervals.",
+        fontsize=9,
+        color="#555555",
+    )
+    fig.tight_layout(rect=(0, 0, 1, 0.92), h_pad=2.0, w_pad=2.0)
+    return save_figure(fig, figures_dir / "fig3_semantic_structural_carriage"), summary
+
+
+def build_head_rows(results: Sequence[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    rows: list[dict[str, Any]] = []
+    rescues: list[dict[str, Any]] = []
+    for result in results:
+        model_name = str(result["model_name"])
+        seed = int(result["seed"])
+        for condition in result["head_conditions"]:
+            distance = int(condition["distance"])
+            clean_accuracy = float(condition["task_ablation"]["clean_accuracy"])
+            task_functional = np.asarray(condition["task_ablation"]["functional"], dtype=float).mean(axis=-1)
+            task_loss = np.asarray(condition["task_ablation"]["loss"], dtype=float).mean(axis=-1)
+            factor_arrays: dict[str, dict[str, np.ndarray]] = {}
+            for factor in ("semantic", "structural"):
+                payload = condition[factor]
+                factor_arrays[factor] = {
+                    "score": np.asarray(payload["score"], dtype=float),
+                    "functional_drop": np.asarray(payload["carriage"]["functional_drop"], dtype=float).mean(axis=-1),
+                    "benefit_drop": np.asarray(payload["carriage"]["benefit_drop"], dtype=float).mean(axis=-1),
+                }
+                rescues.append({
+                    "model": model_name,
+                    "seed": seed,
+                    "distance": distance,
+                    "factor": factor,
+                    "clean_accuracy": clean_accuracy,
+                    "top": float(np.asarray(payload["rescue"]["top"], dtype=float).mean()),
+                    "control": float(np.asarray(payload["rescue"]["layer_matched_control"], dtype=float).mean()),
+                })
+            for layer in range(task_functional.shape[0]):
+                for head in range(task_functional.shape[1]):
+                    rows.append({
+                        "model": model_name,
+                        "seed": seed,
+                        "distance": distance,
+                        "layer": layer,
+                        "head": head,
+                        "clean_accuracy": clean_accuracy,
+                        "semantic_score": factor_arrays["semantic"]["score"][layer, head],
+                        "structural_score": factor_arrays["structural"]["score"][layer, head],
+                        "semantic_carriage_drop": factor_arrays["semantic"]["functional_drop"][layer, head],
+                        "structural_carriage_drop": factor_arrays["structural"]["functional_drop"][layer, head],
+                        "semantic_benefit_drop": factor_arrays["semantic"]["benefit_drop"][layer, head],
+                        "structural_benefit_drop": factor_arrays["structural"]["benefit_drop"][layer, head],
+                        "task_ablation_functional": task_functional[layer, head],
+                        "task_ablation_loss": task_loss[layer, head],
+                    })
+    # Normalise only within a model/seed/distance cell; ranks and within-cell causal contrasts remain.
+    for key in sorted({(row["model"], row["seed"], row["distance"]) for row in rows}):
+        selected = [row for row in rows if (row["model"], row["seed"], row["distance"]) == key]
+        for field in ("semantic_score", "structural_score", "task_ablation_functional"):
+            scale = np.mean([abs(float(row[field])) for row in selected]) + EPS
+            for row in selected:
+                row[field + "_norm"] = float(row[field]) / scale
+        for field in ("semantic_carriage_drop", "structural_carriage_drop"):
+            scale = np.mean([abs(float(row[field])) for row in selected]) + EPS
+            for row in selected:
+                row[field + "_norm"] = float(row[field]) / scale
+    return rows, rescues
+
+
+def _scatter_by_model_distance(ax: Any, rows: Sequence[Mapping[str, Any]], x_key: str, y_key: str) -> None:
+    positive_y = y_key.endswith("_score_norm") or y_key == "task_ablation_functional_norm"
+    for model_name in MODEL_ORDER:
+        for distance in sorted({int(row["distance"]) for row in rows}):
+            selected = [row for row in rows if row["model"] == model_name and int(row["distance"]) == distance]
+            if not selected:
+                continue
+            style = MODEL_STYLE[model_name]
+            face = style["color"] if distance == min(int(row["distance"]) for row in rows) else "none"
+            ax.scatter(
+                [max(float(row[x_key]), 1.0e-10) for row in selected],
+                [max(float(row[y_key]), 1.0e-10) if positive_y else float(row[y_key]) for row in selected],
+                s=34,
+                marker=style["marker"],
+                facecolor=face,
+                edgecolor=style["color"],
+                linewidth=0.9,
+                alpha=0.72,
+            )
+
+
+def cell_correlation_summary(
+    rows: Sequence[Mapping[str, Any]], x_key: str, y_key: str
+) -> tuple[float, float, list[float]]:
+    pooled = spearman([row[x_key] for row in rows], [row[y_key] for row in rows])
+    correlations = []
+    cells = sorted({(row["model"], int(row["seed"]), int(row["distance"])) for row in rows})
+    for model_name, seed, distance in cells:
+        selected = [
+            row for row in rows
+            if row["model"] == model_name and int(row["seed"]) == seed and int(row["distance"]) == distance
+        ]
+        correlations.append(spearman([row[x_key] for row in selected], [row[y_key] for row in selected]))
+    finite = np.asarray([value for value in correlations if np.isfinite(value)], dtype=float)
+    median = float(np.median(finite)) if len(finite) else float("nan")
+    return pooled, median, correlations
+
+
+def figure_head_causality(
+    results: Sequence[dict[str, Any]], cfg: Config, figures_dir: Path
+) -> tuple[list[str], dict[str, Any], list[dict[str, Any]]]:
+    plt = configure_matplotlib()
+    rows, rescues = build_head_rows(results)
+    # Do not turn receptive-field failure into an apparent mechanistic null: causal correlations
+    # and rescue summaries are estimated only where the independently sampled clean task is solved.
+    plot_rows = [row for row in rows if float(row["clean_accuracy"]) >= cfg.accuracy_gate]
+    plot_rescues = [row for row in rescues if float(row["clean_accuracy"]) >= cfg.accuracy_gate]
+    if not plot_rows or not plot_rescues:
+        raise RuntimeError("no accuracy-qualified cells remain for the head-causality figure")
+    fig, axes = plt.subplots(2, 3, figsize=(15.2, 9.0))
+    all_cells = {(row["model"], row["seed"], row["distance"]) for row in rows}
+    qualified_cells = {(row["model"], row["seed"], row["distance"]) for row in plot_rows}
+    summary: dict[str, Any] = {
+        "accuracy_qualification": float(cfg.accuracy_gate),
+        "qualified_cells": len(qualified_cells),
+        "excluded_unsolved_cells": len(all_cells - qualified_cells),
+    }
+
+    x = np.asarray([float(row["structural_score_norm"]) for row in plot_rows])
+    y = np.asarray([float(row["semantic_score_norm"]) for row in plot_rows])
+    _scatter_by_model_distance(axes[0, 0], plot_rows, "structural_score_norm", "semantic_score_norm")
+    lo = max(min(np.min(x), np.min(y)) * 0.7, 1.0e-6)
+    hi = max(np.max(x), np.max(y)) * 1.35
+    axes[0, 0].plot([lo, hi], [lo, hi], color="#777777", linestyle="--", linewidth=1.0)
+    axes[0, 0].set_xscale("log")
+    axes[0, 0].set_yscale("log")
+    axes[0, 0].set_xlim(lo, hi)
+    axes[0, 0].set_ylim(lo, hi)
+    axes[0, 0].set_xlabel("Structural score (cell-normalised)")
+    axes[0, 0].set_ylabel("Semantic score (cell-normalised)")
+    axes[0, 0].set_title("A  Intervention-defined head plane", loc="left", fontweight="bold")
+
+    bridge_specs = [
+        ("semantic", axes[0, 1], "B  Semantic score predicts semantic-carriage loss"),
+        ("structural", axes[0, 2], "C  Structural score predicts structural-carriage loss"),
+    ]
+    for factor, ax, title in bridge_specs:
+        x_key = f"{factor}_score_norm"
+        y_key = f"{factor}_carriage_drop_norm"
+        _scatter_by_model_distance(ax, plot_rows, x_key, y_key)
+        rho, median_rho, cell_rhos = cell_correlation_summary(plot_rows, x_key, y_key)
+        summary[f"{factor}_score_carriage_drop_spearman"] = {
+            "pooled": rho, "cell_median": median_rho, "by_cell": cell_rhos,
+        }
+        ax.set_xscale("log")
+        ax.axhline(0.0, color="#777777", linewidth=0.8)
+        ax.set_xlabel(f"{factor.capitalize()} score (cell-normalised)")
+        ax.set_ylabel("Matching functional-carriage loss under ablation")
+        ax.set_title(title, loc="left", fontweight="bold")
+        ax.text(0.04, 0.95, f"pooled $\\rho={rho:.2f}$\ncell median $\\rho={median_rho:.2f}$", transform=ax.transAxes, va="top")
+
+    ablation_specs = [
+        ("semantic", axes[1, 0], "D  Semantic score–task ablation"),
+        ("structural", axes[1, 1], "E  Structural score–task ablation"),
+    ]
+    for factor, ax, title in ablation_specs:
+        x_key = f"{factor}_score_norm"
+        y_key = "task_ablation_functional_norm"
+        _scatter_by_model_distance(ax, plot_rows, x_key, y_key)
+        rho, median_rho, cell_rhos = cell_correlation_summary(plot_rows, x_key, y_key)
+        summary[f"{factor}_score_task_ablation_spearman"] = {
+            "pooled": rho, "cell_median": median_rho, "by_cell": cell_rhos,
+        }
+        ax.set_xscale("log")
+        ax.set_yscale("log")
+        ax.set_xlabel(f"{factor.capitalize()} score (cell-normalised)")
+        ax.set_ylabel("Clean-input logit impact (cell-normalised)")
+        ax.set_title(title, loc="left", fontweight="bold")
+        ax.text(0.04, 0.95, f"pooled $\\rho={rho:.2f}$\ncell median $\\rho={median_rho:.2f}$", transform=ax.transAxes, va="top")
+
+    rescue_ax = axes[1, 2]
+    categories = [("semantic", "top"), ("semantic", "control"), ("structural", "top"), ("structural", "control")]
+    values = []
+    errors = []
+    for factor, kind in categories:
+        cell = [float(row[kind]) for row in plot_rescues if row["factor"] == factor]
+        mean, error = mean_ci(cell)
+        values.append(mean)
+        errors.append(error)
+    rescue_ax.bar(
+        np.arange(4),
+        values,
+        yerr=errors,
+        color=["#cb181d", "#fcae91", "#2171b5", "#9ecae1"],
+        capsize=4,
+        width=0.72,
+    )
+    rescue_ax.axhline(0.0, color="#777777", linewidth=0.8)
+    rescue_ax.set_xticks(np.arange(4), ["Sem top", "Sem control", "Str top", "Str control"], rotation=16)
+    rescue_ax.set_ylabel("Clean→corrupt mediated-effect fraction")
+    rescue_ax.set_title("F  Score-selected rescue control", loc="left", fontweight="bold")
+    summary["rescue_means"] = {f"{factor}_{kind}": value for (factor, kind), value in zip(categories, values)}
+
+    for ax in axes.ravel():
+        ax.grid(True, which="both", linewidth=0.5, alpha=0.20)
+    from matplotlib.lines import Line2D
+
+    model_handles = [
+        Line2D([0], [0], marker=MODEL_STYLE[name]["marker"], color=MODEL_STYLE[name]["color"], linestyle="none", label=MODEL_STYLE[name]["label"])
+        for name in cfg.models
+    ]
+    distance_handles = [
+        Line2D([0], [0], marker="o", color="#555555", markerfacecolor=("#555555" if distance == min(cfg.focus_distances) else "none"), linestyle="none", label=f"d={distance}")
+        for distance in cfg.focus_distances
+    ]
+    fig.legend(model_handles + distance_handles, [handle.get_label() for handle in model_handles + distance_handles], frameon=False, ncol=6, loc="lower center", bbox_to_anchor=(0.5, 0.005))
+    fig.suptitle(
+        "Specialisation scores identify heads that causally sustain matching carriage",
+        x=0.045,
+        y=0.995,
+        ha="left",
+        fontsize=15,
+        fontweight="bold",
+    )
+    fig.text(
+        0.045,
+        0.958,
+        f"Filled: redundant d=2; open: non-redundant d=5. Scores freeze support; carriage transposes it. Solved cells only ($\\geq$ {cfg.accuracy_gate:.2f}).",
+        fontsize=9,
+        color="#555555",
+    )
+    fig.tight_layout(rect=(0, 0.07, 1, 0.92), h_pad=2.2, w_pad=2.0)
+    return save_figure(fig, figures_dir / "fig4_specialisation_carriage_causality"), summary, rows
+
+
+def carriage_signature(result: Mapping[str, Any], distance: int) -> np.ndarray:
+    channels = []
+    for factor in ("semantic", "structural"):
+        profile = next(
+            value for value in result["carriage_profiles"]
+            if value["factor"] == factor and int(value["distance"]) == int(distance)
+        )
+        source_distance = np.asarray(profile["source_distance"], dtype=int)
+        for metric in ("functional", "benefit"):
+            values = np.asarray(profile[metric], dtype=float)
+            curve = np.asarray([
+                float(values[source_distance == hop].mean()) if np.any(source_distance == hop) else 0.0
+                for hop in range(8)
+            ])
+            curve = curve / (np.linalg.norm(curve) + EPS)
+            channels.append(curve)
+    return np.concatenate(channels)
+
+
+def reach_accuracy(result: Mapping[str, Any], distance: int) -> float:
+    return next(
+        float(row["accuracy"]) for row in result["evaluation"]
+        if row["condition"] == "reach" and int(row["distance"]) == int(distance)
+    )
+
+
+def figure_similarity(
+    results: Sequence[dict[str, Any]], cfg: Config, figures_dir: Path
+) -> tuple[list[str], dict[str, Any]]:
+    plt = configure_matplotlib()
+    fig, axes = plt.subplots(1, 2, figsize=(11.8, 4.8))
+    cells = []
+    for seed in cfg.seeds:
+        dense = next(result for result in results if result["model_name"] == "dense" and int(result["seed"]) == seed)
+        for model_name in [name for name in cfg.models if name != "dense"]:
+            masked = next(result for result in results if result["model_name"] == model_name and int(result["seed"]) == seed)
+            for distance in cfg.distances:
+                dense_signature = carriage_signature(dense, distance)
+                masked_signature = carriage_signature(masked, distance)
+                similarity = float(
+                    np.dot(dense_signature, masked_signature)
+                    / ((np.linalg.norm(dense_signature) * np.linalg.norm(masked_signature)) + EPS)
+                )
+                cells.append({
+                    "seed": seed,
+                    "model": model_name,
+                    "distance": distance,
+                    "carriage_similarity": similarity,
+                    "accuracy_gap": abs(reach_accuracy(dense, distance) - reach_accuracy(masked, distance)),
+                })
+    for model_name in [name for name in cfg.models if name != "dense"]:
+        means, errors = [], []
+        for distance in cfg.distances:
+            values = [
+                row["carriage_similarity"] for row in cells
+                if row["model"] == model_name and row["distance"] == distance
+            ]
+            mean, error = mean_ci(values)
+            means.append(mean)
+            errors.append(error)
+        style = MODEL_STYLE[model_name]
+        axes[0].errorbar(
+            cfg.distances,
+            means,
+            yerr=errors,
+            color=style["color"],
+            marker=style["marker"],
+            linewidth=2.0,
+            capsize=3,
+            label=f"Dense vs {style['label']}",
+        )
+        selected = [row for row in cells if row["model"] == model_name]
+        axes[1].scatter(
+            [row["accuracy_gap"] for row in selected],
+            [row["carriage_similarity"] for row in selected],
+            color=style["color"],
+            marker=style["marker"],
+            s=46,
+            alpha=0.75,
+            label=style["label"],
+        )
+    axes[0].set_xticks(cfg.distances)
+    axes[0].set_ylim(-0.05, 1.05)
+    axes[0].set_xlabel("Query–source distance $d$")
+    axes[0].set_ylabel("Dense–masked carriage-signature cosine")
+    axes[0].set_title("A  Mechanistic similarity across reach", loc="left", fontweight="bold")
+    axes[0].legend(frameon=False)
+    rho = spearman([row["accuracy_gap"] for row in cells], [row["carriage_similarity"] for row in cells])
+    axes[1].set_xlabel("Absolute dense–masked accuracy gap")
+    axes[1].set_ylabel("Carriage-signature cosine")
+    axes[1].set_title("B  Functional parity predicts carriage similarity", loc="left", fontweight="bold")
+    axes[1].text(0.96, 0.95, f"Spearman $\\rho={rho:.2f}$", transform=axes[1].transAxes, ha="right", va="top")
+    axes[1].legend(frameon=False)
+    for ax in axes:
+        ax.grid(True, linewidth=0.5, alpha=0.22)
+    fig.suptitle(
+        "Aggregate carriage characterises when dense and masked GRIT learn similar solutions",
+        x=0.055,
+        y=1.01,
+        ha="left",
+        fontsize=15,
+        fontweight="bold",
+    )
+    fig.tight_layout(rect=(0, 0, 1, 0.92), w_pad=2.2)
+    return save_figure(fig, figures_dir / "fig5_dense_masked_similarity"), {"cells": cells, "gap_similarity_spearman": rho}
+
+
+def create_outputs(results: Sequence[dict[str, Any]], cfg: Config, run_dir: Path) -> dict[str, Any]:
+    figures_dir = run_dir / "figures"
+    tables_dir = run_dir / "tables"
+    parameter_counts = {
+        str(result["model_name"]): int(result["parameters"])
+        for result in results
+    }
+    if len(set(parameter_counts.values())) != 1:
+        raise RuntimeError(f"parameter-matching control failed: {parameter_counts}")
+    eval_rows = evaluation_rows(results)
+    write_csv(tables_dir / "evaluation_grid.csv", eval_rows)
+    fig1, reach_summary = figure_reachability(results, cfg, figures_dir)
+    fig2, load_summary = figure_oversquashing(results, cfg, figures_dir)
+    fig3, carriage_summary = figure_carriage(results, cfg, figures_dir)
+    fig4, causal_summary, head_rows = figure_head_causality(results, cfg, figures_dir)
+    fig5, similarity_summary = figure_similarity(results, cfg, figures_dir)
+    write_csv(tables_dir / "per_head_metrics.csv", head_rows)
+    summary = {
+        "version": EXPERIMENT_VERSION,
+        "fingerprint": config_fingerprint(cfg),
+        "official_grit_commit": OFFICIAL_GRIT_COMMIT,
+        "config": asdict(cfg),
+        "parameter_counts": parameter_counts,
+        "reachability": reach_summary,
+        "oversquashing_and_lesions": load_summary,
+        "carriage": carriage_summary,
+        "head_causality": causal_summary,
+        "dense_masked_similarity": similarity_summary,
+        "verification": [
+            {
+                "model": result["model_name"],
+                "seed": result["seed"],
+                "initialisation_attempt": result.get("initialisation_attempt", 0),
+                "initialisation_seed": result.get("initialisation_seed", result["seed"]),
+                **result["checks"],
+            }
+            for result in results
+        ],
+        "figures": fig1 + fig2 + fig3 + fig4 + fig5,
+    }
+    write_json(run_dir / "summary.json", summary)
+    return summary
+
+
+def environment_record(device: Any) -> dict[str, Any]:
+    import torch
+
+    return {
+        "experiment_version": EXPERIMENT_VERSION,
+        "official_grit_commit": OFFICIAL_GRIT_COMMIT,
+        "python": sys.version,
+        "torch": torch.__version__,
+        "cuda_runtime": getattr(torch.version, "cuda", None),
+        "cuda_available": torch.cuda.is_available(),
+        "device": str(device),
+        "gpu": torch.cuda.get_device_name(device) if torch.cuda.is_available() and str(device).startswith("cuda") else None,
+    }
+
+
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Official-GRIT trained-mask reach, carriage, and specialisation")
+    parser.add_argument("--run-name", default="reach_carriage_v1")
+    parser.add_argument("--drive-root", default=DEFAULT_DRIVE_ROOT)
+    parser.add_argument("--grit-dir", default=DEFAULT_GRIT_DIR)
+    parser.add_argument("--phase", choices=("all", "train", "analyze", "figures"), default="all")
+    parser.add_argument("--models", nargs="+", default=list(MODEL_ORDER))
+    parser.add_argument("--seeds", nargs="+", type=int, default=[0, 1, 2])
+    parser.add_argument("--distances", nargs="+", type=int, default=[1, 2, 3, 4, 5, 6])
+    parser.add_argument("--ranks", nargs="+", type=int, default=[1, 2, 4, 6])
+    parser.add_argument("--focus-distances", nargs="+", type=int, default=[2, 5])
+    parser.add_argument("--n", type=int, default=24)
+    parser.add_argument("--cluster-size", type=int, default=12)
+    parser.add_argument("--classes", type=int, default=8)
+    parser.add_argument("--pair-vocab", type=int, default=6)
+    parser.add_argument("--rrwp-steps", type=int, default=10)
+    parser.add_argument("--dim", type=int, default=64)
+    parser.add_argument("--heads", type=int, default=4)
+    parser.add_argument("--layers", type=int, default=3)
+    parser.add_argument("--dropout", type=float, default=0.0)
+    parser.add_argument("--attention-dropout", type=float, default=0.05)
+    parser.add_argument("--load-distance", type=int, default=3)
+    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--steps", type=int, default=1500)
+    parser.add_argument("--lr", type=float, default=1.0e-3)
+    parser.add_argument("--weight-decay", type=float, default=0.0)
+    parser.add_argument("--eval-every", type=int, default=100)
+    parser.add_argument("--validation-graphs", type=int, default=48)
+    parser.add_argument("--heldout-graphs", type=int, default=256)
+    parser.add_argument("--patience-checks", type=int, default=5)
+    parser.add_argument("--accuracy-gate", type=float, default=0.85)
+    parser.add_argument("--carriage-graphs", type=int, default=8)
+    parser.add_argument("--carriage-donors", type=int, default=3)
+    parser.add_argument("--carriage-batch-size", type=int, default=96)
+    parser.add_argument("--score-graphs", type=int, default=24)
+    parser.add_argument("--score-donors", type=int, default=4)
+    parser.add_argument("--score-batch-size", type=int, default=8)
+    parser.add_argument("--ablation-graphs", type=int, default=128)
+    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--force-retrain", action="store_true")
+    parser.add_argument("--force-analysis", action="store_true")
+    parser.add_argument("--allow-low-accuracy", action="store_true")
+    parser.add_argument(
+        "--failed-init-retries",
+        type=int,
+        default=2,
+        help="validation-gated alternate initialisations after a convergence failure",
+    )
+    parser.add_argument("--skip-drive-mount", action="store_true")
+    parser.add_argument("--skip-grit-install", action="store_true")
+    parser.add_argument("--fast-dev-run", action="store_true")
+    return parser.parse_args(argv)
+
+
+def make_config(args: argparse.Namespace) -> Config:
+    values = {
+        "run_name": args.run_name,
+        "drive_root": args.drive_root,
+        "n": args.n,
+        "cluster_size": args.cluster_size,
+        "classes": args.classes,
+        "pair_vocab": args.pair_vocab,
+        "rrwp_steps": args.rrwp_steps,
+        "dim": args.dim,
+        "heads": args.heads,
+        "layers": args.layers,
+        "dropout": args.dropout,
+        "attention_dropout": args.attention_dropout,
+        "models": tuple(args.models),
+        "distances": tuple(args.distances),
+        "ranks": tuple(args.ranks),
+        "load_distance": args.load_distance,
+        "batch_size": args.batch_size,
+        "steps": args.steps,
+        "lr": args.lr,
+        "weight_decay": args.weight_decay,
+        "eval_every": args.eval_every,
+        "validation_graphs": args.validation_graphs,
+        "heldout_graphs": args.heldout_graphs,
+        "patience_checks": args.patience_checks,
+        "accuracy_gate": args.accuracy_gate,
+        "carriage_graphs": args.carriage_graphs,
+        "carriage_donors": args.carriage_donors,
+        "carriage_batch_size": args.carriage_batch_size,
+        "score_graphs": args.score_graphs,
+        "score_donors": args.score_donors,
+        "score_batch_size": args.score_batch_size,
+        "ablation_graphs": args.ablation_graphs,
+        "focus_distances": tuple(args.focus_distances),
+        "seeds": tuple(args.seeds),
+        "device": args.device,
+    }
+    if args.fast_dev_run:
+        values.update({
+            "run_name": args.run_name + "_fast_dev",
+            "models": ("1hop", "dense"),
+            "seeds": (int(args.seeds[0]),),
+            "steps": 20,
+            "batch_size": 8,
+            "eval_every": 5,
+            "validation_graphs": 4,
+            "heldout_graphs": 8,
+            "patience_checks": 100,
+            "accuracy_gate": 0.0,
+            "carriage_graphs": 2,
+            "carriage_donors": 1,
+            "carriage_batch_size": 32,
+            "score_graphs": 2,
+            "score_donors": 1,
+            "score_batch_size": 1,
+            "ablation_graphs": 4,
+        })
+    cfg = Config(**values)
+    cfg.validate()
+    return cfg
+
+
+def main(argv: Sequence[str] | None = None) -> dict[str, Any]:
+    import torch
+
+    args = parse_args(argv)
+    if not args.skip_drive_mount:
+        mount_drive()
+    cfg = make_config(args)
+    if args.phase != "figures":
+        setup_official_grit(Path(args.grit_dir), install=not args.skip_grit_install)
+    device = torch.device(args.device if torch.cuda.is_available() or not str(args.device).startswith("cuda") else "cpu")
+    if device.type != "cuda":
+        print("[warn] CUDA unavailable; official GRIT execution will be slow", flush=True)
+    run_dir = Path(cfg.drive_root) / cfg.run_name
+    run_dir.mkdir(parents=True, exist_ok=True)
+    write_json(run_dir / "config.json", {
+        "config": asdict(cfg),
+        "fingerprint": config_fingerprint(cfg),
+        "failed_initialisation_retries": int(args.failed_init_retries),
+    })
+    write_json(run_dir / "environment.json", environment_record(device))
+
+    models: dict[tuple[str, int], Any] = {}
+    if args.phase in {"all", "train", "analyze"}:
+        for model_name in cfg.models:
+            for seed in cfg.seeds:
+                model, payload = train_model(
+                    cfg,
+                    model_name=model_name,
+                    seed=seed,
+                    run_dir=run_dir,
+                    device=device,
+                    force=args.force_retrain,
+                    load_only=args.phase == "analyze",
+                )
+                validation_gate = checkpoint_gate(
+                    cfg, model_name, payload, split="best_validation"
+                )
+                attempt = int(payload.get("initialisation_attempt", 0))
+                while (
+                    validation_gate < cfg.accuracy_gate
+                    and attempt < int(args.failed_init_retries)
+                    and args.phase != "analyze"
+                    and not args.allow_low_accuracy
+                ):
+                    attempt += 1
+                    print(
+                        f"[retry {model_name} seed={seed}] validation accuracy "
+                        f"{validation_gate:.3f} < {cfg.accuracy_gate:.3f}; "
+                        f"trying initialisation {attempt}/{args.failed_init_retries}",
+                        flush=True,
+                    )
+                    model, payload = train_model(
+                        cfg,
+                        model_name=model_name,
+                        seed=seed,
+                        run_dir=run_dir,
+                        device=device,
+                        force=True,
+                        load_only=False,
+                        initialisation_attempt=attempt,
+                    )
+                    validation_gate = checkpoint_gate(
+                        cfg, model_name, payload, split="best_validation"
+                    )
+                heldout_gate = checkpoint_gate(cfg, model_name, payload, split="heldout")
+                print(
+                    f"[gate {model_name} seed={seed}] validation={validation_gate:.3f} "
+                    f"heldout={heldout_gate:.3f} init_attempt={attempt}",
+                    flush=True,
+                )
+                gate = min(validation_gate, heldout_gate)
+                if gate < cfg.accuracy_gate and not args.allow_low_accuracy:
+                    raise RuntimeError(
+                        f"{model_name} seed {seed} failed reachable-task accuracy gate "
+                        f"(validation={validation_gate:.3f}, heldout={heldout_gate:.3f}, "
+                        f"required={cfg.accuracy_gate:.3f}); refusing causal analysis"
+                    )
+                models[(model_name, seed)] = model
+    if args.phase == "train":
+        return {"run_dir": str(run_dir), "phase": "train"}
+
+    results = []
+    if args.phase in {"all", "analyze"}:
+        for model_name in cfg.models:
+            for seed in cfg.seeds:
+                results.append(analyze_model(
+                    models[(model_name, seed)],
+                    cfg,
+                    model_name=model_name,
+                    seed=seed,
+                    run_dir=run_dir,
+                    device=device,
+                    force=args.force_analysis,
+                ))
+    else:
+        for model_name in cfg.models:
+            for seed in cfg.seeds:
+                path = analysis_path(run_dir, cfg, model_name, seed)
+                if not path.exists():
+                    raise FileNotFoundError(f"figures phase requires {path}")
+                results.append(torch.load(path, map_location="cpu", weights_only=False))
+
+    summary = create_outputs(results, cfg, run_dir)
+    print("\n[done]", flush=True)
+    print(f"  run_dir: {run_dir}", flush=True)
+    print(f"  checkpoints: {run_dir / 'checkpoints'}", flush=True)
+    print(f"  analyses: {run_dir / 'analysis'}", flush=True)
+    print(f"  figures: {run_dir / 'figures'}", flush=True)
+    return summary
+
+
+if __name__ == "__main__":
+    main([
+        "--run-name", "reach_carriage_v1",
+        "--phase", "all",
+        "--models", "1hop", "2hop", "3hop", "dense",
+        "--seeds", "0", "1", "2",
+        "--steps", "1500",
+        "--distances", "1", "2", "3", "4", "5", "6",
+        "--ranks", "1", "2", "4", "6",
+        "--focus-distances", "2", "5",
+    ])
