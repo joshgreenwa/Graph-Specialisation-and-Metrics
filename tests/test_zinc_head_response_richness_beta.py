@@ -1,5 +1,4 @@
 import copy
-import json
 from pathlib import Path
 
 import numpy as np
@@ -27,124 +26,139 @@ class _Data:
 def test_mask_frozen_intervention_freezes_local_rrwp_support():
     base = _Data()
     pert = _perturb_mask_frozen(base, 0, 2)
-
     assert torch.equal(pert.edge_index, base.edge_index)
     assert torch.equal(pert.rrwp_local_edge_index, base.rrwp_local_edge_index)
     assert torch.equal(pert.x, base.x)
     assert not torch.equal(pert.rrwp_index, base.rrwp_index)
 
 
-def test_participation_ratio_is_scale_invariant_and_counts_orthogonal_patterns():
-    rank_one = np.diag([4.0, 0.0, 0.0])
-    rank_two = np.diag([2.0, 2.0, 0.0])
-
-    assert beta.participation_ratio(rank_one) == 1.0
-    assert beta.participation_ratio(10.0 * rank_one) == 1.0
-    assert beta.participation_ratio(rank_two) == 2.0
-
-
-def test_response_collector_reconstructs_existing_score(monkeypatch):
+def test_response_collector_reconstructs_score_and_captures_throughput(monkeypatch):
     base = _Data()
-    D = np.asarray([[0, 1, 2], [1, 0, 1], [2, 1, 0]], dtype=float)
-    monkeypatch.setattr(beta, "_spd", lambda _base, _n: D)
+    monkeypatch.setattr(beta, "_spd", lambda _base, _n: np.asarray(
+        [[0, 1, 2], [1, 0, 1], [2, 1, 0]], dtype=float))
     collector = beta.ResponseCollector("zinc")
-
     phi = torch.ones(1, 3, 2, 1)
     delta = torch.tensor([
         [[[1.0], [2.0]], [[3.0], [4.0]], [[5.0], [6.0]]],
         [[[2.0], [1.0]], [[4.0], [3.0]], [[6.0], [5.0]]],
     ])
-    collector(
-        channel="semantic",
-        graph_id=7,
-        base=base,
-        source_nodes=np.asarray([0, 2]),
-        phi_stack=[phi],
-        donor_averaged_delta=[delta],
-        clean_prediction=torch.tensor([0.5]),
-    )
-
+    collector(channel="semantic", graph_id=7, base=base,
+              source_nodes=np.asarray([0, 2]), phi_stack=[phi],
+              donor_averaged_delta=[delta], clean_prediction=torch.tensor([0.5]),
+              clean_head_output=[torch.ones(3, 2, 1)])
     expected = delta.abs().sum(dim=(0, 1)).numpy() / 2.0
-    rebuilt = collector.score_reconstruction("semantic")
-    assert np.allclose(rebuilt, expected.reshape(-1))
+    assert np.allclose(collector.score_reconstruction("semantic"), expected.reshape(-1))
     assert collector.abs_error[7] == 0.25
+    assert collector.throughput[7].shape == (1, 2)
 
 
-def _record(graph_id, patterns):
-    response = np.zeros((len(patterns), len(beta.BIN_LABELS), 3), dtype=np.float32)
-    response[:, 0, :] = np.asarray(patterns, dtype=np.float32)
-    return {
-        "graph_id": graph_id,
-        "source_nodes": np.arange(len(patterns), dtype=np.int64),
-        "response": response,
+def test_partial_spearman_removes_shared_throughput_confound():
+    rng = np.random.default_rng(4)
+    throughput = rng.normal(0, 3, 200)
+    score = throughput + rng.normal(0, .5, 200)
+    impact = throughput + rng.normal(0, .5, 200)
+    raw = beta._spearman(score, impact)
+    partial = beta.partial_spearman(score, impact, throughput)
+    assert raw > .95
+    assert abs(partial) < .35
+
+
+def test_score_families_are_distinct_and_select_channel_extremes():
+    score = {
+        "S_sem": np.asarray([[9., 8., 7., 2.], [6., 5., 1., 1.]]),
+        "S_str": np.asarray([[1., 1., 2., 8.], [2., 3., 9., 7.]]),
     }
+    groups = beta.select_score_families(score, family_size=2)
+    assert len(groups["semantic"]) == len(groups["structural"]) == 2
+    assert set(groups["semantic"]).isdisjoint(groups["structural"])
+    assert np.mean([score["S_sem"][h] / score["S_str"][h] for h in groups["semantic"]]) > 1
+    assert np.mean([score["S_str"][h] / score["S_sem"][h] for h in groups["structural"]]) > 1
+
+
+def test_double_dissociation_detects_matching_rescue():
+    score = {
+        "S_sem": np.asarray([[9., 8., 2., 1.], [7., 6., 2., 1.]]),
+        "S_str": np.asarray([[1., 2., 8., 9.], [2., 1., 7., 6.]]),
+    }
+    groups = beta.select_score_families(score, family_size=2)
+    G = 40
+    sem = np.zeros((2, 4, G)); st = np.zeros_like(sem)
+    for h in groups["semantic"]:
+        sem[h] = .8; st[h] = .1
+    for h in groups["structural"]:
+        sem[h] = .1; st[h] = .8
+    rescue = {
+        "semantic": {"graph_ids": np.arange(G), "mediation": sem,
+                     "valid_effect_fraction": 1.0},
+        "structural": {"graph_ids": np.arange(G), "mediation": st,
+                       "valid_effect_fraction": 1.0},
+    }
+    out = beta.analyse_double_dissociation(
+        score, rescue, np.ones((2, 4)), family_size=2, n_null=30, n_boot=40, seed=5)
+    assert out["interaction"] > 1.0
+    assert out["interaction_ci"][0] > 1.0
+
+
+def _record(graph_id, scale, p=8):
+    response = np.zeros((2, len(beta.BIN_LABELS), p), dtype=np.float32)
+    response[:, :, :] = scale / (2 * len(beta.BIN_LABELS))
+    return {"graph_id": graph_id, "source_nodes": np.asarray([0, 1]), "response": response}
 
 
 def _synthetic_task_results():
-    gids = np.arange(6, dtype=np.int64)
-    same = [[1, 0, 0]] * 6
-    varied = [[1, 0, 0], [0, 1, 0], [0, 0, 1]] * 2
+    gids = np.arange(20, dtype=np.int64)
+    score = {"S_sem": np.asarray([[8., 7., 2., 1.], [6., 5., 2., 1.]]),
+             "S_str": np.asarray([[1., 2., 7., 8.], [2., 1., 6., 5.]]),
+             "L": 2, "H": 4, "test_metric": .1, "title": "x"}
+    groups = beta.select_score_families(score, family_size=2)
     out = {}
-    for task in beta.BETA_TASKS:
+    for task_i, task in enumerate(beta.BETA_TASKS):
         collector = beta.ResponseCollector(task)
-        collector.records["semantic"] = [_record(int(g), same) for g in gids]
-        structural = varied if task == "zinc_1hop" else same
-        collector.records["structural"] = [_record(int(g), structural) for g in gids]
-        collector.abs_error = {
-            int(g): float(0.05 + 0.01 * g + (0.06 if task == "zinc_1hop_local" else 0.0))
-            for g in gids
+        for g in gids:
+            sem_scale = 2.0 + .1 * g + (1.0 if task == "zinc" else 0)
+            str_scale = 2.0 + .1 * g + (1.0 if task == "zinc_1hop" else 0)
+            collector.records["semantic"].append(_record(int(g), sem_scale))
+            collector.records["structural"].append(_record(int(g), str_scale))
+            collector.throughput[int(g)] = np.ones((2, 4)) * (1 + .01 * g)
+            collector.abs_error[int(g)] = float(.3 - .004 * g + .03 * task_i)
+        functional = np.tile(np.arange(1, 9, dtype=float)[:, None], (1, len(gids))).reshape(2, 4, -1)
+        ablation = {
+            "graph_ids": gids, "functional": functional, "loss": functional * .1,
+            "features": np.column_stack([gids + 10, gids % 3, gids % 4]),
         }
-        out[task] = {
-            "collector": collector,
-            "graph_ids": gids,
-            "score": {
-                "S_sem": np.asarray([[1.0, 0.5, 0.2]]),
-                "S_str": np.asarray([[0.8, 0.4, 0.1]]),
-                "L": 1,
-                "H": 3,
-                "title": task,
-                "test_metric": collector.abs_error[0],
-                "test_metric_name": "mae",
-                "checks": {},
-            },
-            "score_reconstruction_max_abs": 0.0,
+        causality = {
+            outcome: {ch: {"rho": .5, "ci": (.2, .7), "partial_rho": .3,
+                            "partial_ci": (.1, .5)} for ch in beta.CHANNELS}
+            for outcome in ("functional", "loss")
         }
+        dd = {"selected_heads": {k: [list(h) for h in v] for k, v in groups.items()},
+              "mediation_matrix": np.asarray([[.5, .1], [.1, .5]]),
+              "interaction": .8, "interaction_ci": (.5, 1.0), "p_ge": .01}
+        out[task] = {"collector": collector, "graph_ids": gids, "score": dict(score),
+                     "ablation": ablation, "causality": causality,
+                     "double_dissociation": dd}
     return out
 
 
-def test_paired_beta_verdict_detects_structural_specific_rank_gain():
-    analysis = beta.analyse_response_rank(
-        _synthetic_task_results(), n_boot=100, bootstrap_seed=3
-    )
-
-    assert analysis["verdict"] == "SUPPORTED"
-    assert analysis["contrasts"]["overall"]["structural"]["ci_low"] > 0
-    assert analysis["contrasts"]["overall"]["semantic"]["difference"] == 0
-
-
-def test_beta_figures_and_outputs_smoke(tmp_path):
-    task_results = _synthetic_task_results()
-    analysis = beta.analyse_response_rank(task_results, n_boot=30, bootstrap_seed=5)
-
-    figure_paths = [
-        beta.make_score_scatter(task_results, tmp_path / "scatter.png"),
-        beta.make_distance_rank_figure(task_results, analysis, tmp_path / "distance.png"),
-        beta.make_verdict_figure(task_results, analysis, tmp_path / "verdict.png"),
+def test_new_figures_smoke_and_old_rank_figures_are_absent(tmp_path):
+    results = _synthetic_task_results()
+    graphwise = beta.analyse_graphwise_gaps(results, n_boot=20, seed=3)
+    paths = [
+        beta.make_score_scatter(results, tmp_path / "scatter.png"),
+        beta.make_ablation_figure(results, tmp_path / "ablation.png"),
+        beta.make_rescue_figure(results, tmp_path / "rescue.png"),
+        beta.make_graph_gap_figure(graphwise, tmp_path / "gaps.png"),
     ]
-    raw, summary = beta._save_raw(task_results, analysis, tmp_path)
-
-    assert all(Path(p).is_file() and Path(p).stat().st_size > 0 for p in figure_paths)
-    assert Path(raw).is_file()
-    payload = json.loads(Path(summary).read_text(encoding="utf-8"))
-    assert payload["status"] == "BETA"
-    assert payload["analysis"]["verdict"] == "SUPPORTED"
+    assert all(Path(p).is_file() and Path(p).stat().st_size > 0 for p in paths)
+    assert not hasattr(beta, "make_distance_rank_figure")
+    assert not hasattr(beta, "make_verdict_figure")
 
 
-def test_standalone_colab_script_is_valid_and_calls_beta_runner():
+def test_standalone_colab_calls_causal_beta_and_not_rank_analysis():
     path = Path(__file__).resolve().parents[1] / "HeadResponseRichness_ZINC_Beta_Colab.py"
     code = path.read_text(encoding="utf-8")
-
     compile(code, str(path), "exec")
     assert "specialisation.richness_beta import run" in code
-    assert 'num_graphs=128' in code
-    assert "NO CLEAR SEPARATION" in code
+    assert "rescue_graphs=128" in code
+    assert "activity_floor_fraction" not in code
+    assert "NO CLEAR SEPARATION" not in code

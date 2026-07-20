@@ -277,6 +277,7 @@ def score_model(task, sc: SpecConfig, *, with_attn_routing: bool = True,
                 source_nodes=np.asarray(sources, dtype=np.int64),
                 phi_stack=phi_stack, donor_averaged_delta=[x / K for x in dObar],
                 clean_prediction=pred_c.detach(),
+                clean_head_output=[x.detach() for x in cap["wV"]],
             )
         tot_sem_sources += S
         if graph_attn:
@@ -355,6 +356,7 @@ def score_model(task, sc: SpecConfig, *, with_attn_routing: bool = True,
                 source_nodes=np.asarray(sources, dtype=np.int64),
                 phi_stack=phi_stack, donor_averaged_delta=[x / K for x in dObar],
                 clean_prediction=pred_c.detach(),
+                clean_head_output=[x.detach() for x in cap["wV"]],
             )
         tot_str_anchors += S
 
