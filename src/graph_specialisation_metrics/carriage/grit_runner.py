@@ -49,7 +49,11 @@ class CarriageConfig:
     beneficial_denom: str = "slope"       # integrated | slope (default) | magnitude | signed
     integrated_atol: float = 1e-5
     integrated_rtol: float = 1e-4
-    integrated_max_intervals: int = 64
+    integrated_max_intervals: int = 256
+    # Rare paths that hit the interval cap retain their best estimate; these two
+    # predeclared gates prevent "ignore the outliers" from becoming silent cherry-picking.
+    integrated_max_unconverged_fraction: float = 1e-3  # 0.1% of donor paths
+    integrated_unconverged_error_cap: float = 5e-4     # completeness and carrier error
     # Intervention selector (semantic path is the default; structural path is the beta twin
     # in structural_runner.py and is dispatched by colab.run, not by this runner).
     intervention: str = "semantic"        # "semantic" | "structural"
@@ -176,6 +180,74 @@ def _pooled_head_predictions(model, pooled, target):
     out = model.model.post_mp(proxy)
     pred = out[0] if isinstance(out, (tuple, list)) else out
     return pred.reshape(rows, -1)
+
+
+def _retain_or_reject_unconverged_paths(path, cc, context: str):
+    """Keep rare capped quadrature estimates, but reject numerically large failures.
+
+    Returns the per-path convergence mask as a NumPy bool array.  No path is removed:
+    accepted failures retain their best max-interval estimate, preserving donor sampling.
+    The global failure-rate gate is applied after all graphs have run.
+    """
+    converged = path["converged"].detach().cpu().numpy().astype(bool)
+    bad = ~converged
+    if not bad.any():
+        return converged
+
+    residual = np.abs(
+        path["completeness_residual"].detach().cpu().numpy().astype(np.float64)
+    )[bad]
+    carrier_error = (
+        path["quadrature_error"].detach().cpu().numpy().astype(np.float64)
+    )[bad]
+    cap = float(cc.integrated_unconverged_error_cap)
+    worst_residual = float(residual.max())
+    worst_carrier = float(carrier_error.max())
+    if worst_residual > cap or worst_carrier > cap:
+        raise RuntimeError(
+            f"Integrated carriage hit its quadrature cap for {int(bad.sum())}/"
+            f"{int(bad.size)} {context} paths, and the best estimate exceeded "
+            f"integrated_unconverged_error_cap={cap:.1e}: completeness max="
+            f"{worst_residual:.3e}, carrier-error max={worst_carrier:.3e}."
+        )
+
+    log(
+        f"[warn] integrated quadrature cap: retaining best estimates for "
+        f"{int(bad.sum())}/{int(bad.size)} {context} paths; completeness residual "
+        f"median/p95/max={np.median(residual):.3e}/{np.quantile(residual, 0.95):.3e}/"
+        f"{worst_residual:.3e}; carrier-error median/p95/max="
+        f"{np.median(carrier_error):.3e}/{np.quantile(carrier_error, 0.95):.3e}/"
+        f"{worst_carrier:.3e}. Global failure-rate gate="
+        f"{100*float(cc.integrated_max_unconverged_fraction):.3f}%."
+    )
+    return converged
+
+
+def _integrated_failure_stats(converged, residual, carrier_error):
+    """Auditable global statistics for paths retained after hitting the cap."""
+    converged = np.asarray(converged, dtype=bool)
+    residual = np.abs(np.asarray(residual, dtype=np.float64))
+    carrier_error = np.asarray(carrier_error, dtype=np.float64)
+    failed = ~converged
+    out = {
+        "integrated_unconverged_count": int(failed.sum()),
+        "integrated_path_count": int(failed.size),
+        "integrated_unconverged_fraction": float(failed.mean()),
+    }
+    for name, values in (
+        ("completeness_residual", residual[failed]),
+        ("carrier_error", carrier_error[failed]),
+    ):
+        out[f"integrated_unconverged_{name}_median"] = (
+            float(np.median(values)) if values.size else None
+        )
+        out[f"integrated_unconverged_{name}_p95"] = (
+            float(np.quantile(values, 0.95)) if values.size else None
+        )
+        out[f"integrated_unconverged_{name}_max"] = (
+            float(values.max()) if values.size else None
+        )
+    return out
 
 
 def run_grit_carriage(task, cc: CarriageConfig) -> dict:
@@ -339,6 +411,10 @@ def run_grit_carriage(task, cc: CarriageConfig) -> dict:
             f"got {cc.beneficial_denom!r}"
         )
     integrated = cc.beneficial_denom == "integrated"
+    if integrated and not 0.0 <= float(cc.integrated_max_unconverged_fraction) <= 1.0:
+        raise ValueError("integrated_max_unconverged_fraction must lie in [0, 1]")
+    if integrated and float(cc.integrated_unconverged_error_cap) < 0.0:
+        raise ValueError("integrated_unconverged_error_cap must be non-negative")
     pooling = str(cfg.model.graph_pooling)
 
     # ---- donor pool (Def 3.2.2): real content ROWS from OTHER graphs of the same dataset -
@@ -377,7 +453,7 @@ def run_grit_carriage(task, cc: CarriageConfig) -> dict:
     integrated_replay_max = integrated_full_loss_delta_max = 0.0
     clamp_moved = clamp_hit = 0            # slope-clip activation rate over moved sources
     noop_total = donor_draws = unreachable_total = struct_checked = peak_mem = 0
-    integrated_residual, integrated_qerr = [], []
+    integrated_residual, integrated_qerr, integrated_converged = [], [], []
     integrated_intervals, integrated_cancellation = [], []
 
     if device.type == "cuda":
@@ -496,18 +572,6 @@ def run_grit_carriage(task, cc: CarriageConfig) -> dict:
                             rtol=cc.integrated_rtol,
                             max_intervals=cc.integrated_max_intervals,
                         )
-                        if not bool(path["converged"].all().item()):
-                            bad = (~path["converged"]).nonzero().view(-1)
-                            worst = float(
-                                path["completeness_residual"][bad].abs().max().item()
-                            )
-                            raise RuntimeError(
-                                f"Integrated beneficial carriage did not converge for "
-                                f"{int(bad.numel())}/{m} donor paths by "
-                                f"integrated_max_intervals={cc.integrated_max_intervals}; "
-                                f"worst completeness residual={worst:.3e}. Increase "
-                                f"integrated_max_intervals rather than clipping/rescaling."
-                        )
                         path_B[r0:r0 + m] = path["carriage"].detach().float().cpu()
                         path_dL[r0:r0 + m] = path["loss_delta"].detach().float().cpu()
 
@@ -530,6 +594,9 @@ def run_grit_carriage(task, cc: CarriageConfig) -> dict:
                                 integrated_replay_max = max(
                                     integrated_replay_max, replay_error
                                 )
+                        integrated_converged.append(
+                            _retain_or_reject_unconverged_paths(path, cc, "semantic donor")
+                        )
                         integrated_residual.append(
                             path["completeness_residual"].detach().cpu().numpy()
                         )
@@ -682,6 +749,8 @@ def run_grit_carriage(task, cc: CarriageConfig) -> dict:
         ig_res = np.abs(np.concatenate(integrated_residual).astype(np.float64))
         ig_qerr = np.concatenate(integrated_qerr).astype(np.float64)
         ig_nint = np.concatenate(integrated_intervals).astype(np.int64)
+        ig_converged = np.concatenate(integrated_converged).astype(bool)
+        failure_stats = _integrated_failure_stats(ig_converged, ig_res, ig_qerr)
         nonempty_cancel = [x for x in integrated_cancellation if x.size]
         ig_cancel = (
             np.concatenate(nonempty_cancel).astype(np.float64)
@@ -691,6 +760,12 @@ def run_grit_carriage(task, cc: CarriageConfig) -> dict:
             "integrated_atol": float(cc.integrated_atol),
             "integrated_rtol": float(cc.integrated_rtol),
             "integrated_max_intervals": int(cc.integrated_max_intervals),
+            "integrated_max_unconverged_fraction": float(
+                cc.integrated_max_unconverged_fraction
+            ),
+            "integrated_unconverged_error_cap": float(
+                cc.integrated_unconverged_error_cap
+            ),
             "integrated_completeness_residual_p95": float(np.quantile(ig_res, 0.95)),
             "integrated_completeness_residual_max": float(ig_res.max()),
             "integrated_quadrature_error_p95": float(np.quantile(ig_qerr, 0.95)),
@@ -712,6 +787,7 @@ def run_grit_carriage(task, cc: CarriageConfig) -> dict:
             "integrated_cancellation_ratio_max": (
                 float(ig_cancel.max()) if ig_cancel.size else None
             ),
+            **failure_stats,
         })
     checks.update({
         "g_spread_max": float(g_spread_max),
@@ -754,6 +830,21 @@ def run_grit_carriage(task, cc: CarriageConfig) -> dict:
             f"{integrated_full_loss_delta_max:.3e}")
         if cc.verify:
             log(f"  [11d] pooled-head endpoint replay: max|dpred|={integrated_replay_max:.3e}")
+        n_failed = checks["integrated_unconverged_count"]
+        n_paths = checks["integrated_path_count"]
+        fail_rate = checks["integrated_unconverged_fraction"]
+        if n_failed:
+            log(f"  [11e] capped paths retained      : {n_failed}/{n_paths} "
+                f"({100*fail_rate:.4f}%); completeness residual median/p95/max="
+                f"{checks['integrated_unconverged_completeness_residual_median']:.3e}/"
+                f"{checks['integrated_unconverged_completeness_residual_p95']:.3e}/"
+                f"{checks['integrated_unconverged_completeness_residual_max']:.3e}; "
+                f"carrier-error median/p95/max="
+                f"{checks['integrated_unconverged_carrier_error_median']:.3e}/"
+                f"{checks['integrated_unconverged_carrier_error_p95']:.3e}/"
+                f"{checks['integrated_unconverged_carrier_error_max']:.3e}")
+        else:
+            log(f"  [11e] capped paths retained      : 0/{n_paths} (0.0000%)")
     else:
         log(f"  [11] beneficial exactness        : max_j|sum_i B - dL_j| = "
             f"{bexact_max:.3e} (must be ~0, unclamped sources)")
@@ -783,6 +874,15 @@ def run_grit_carriage(task, cc: CarriageConfig) -> dict:
             f"> tol {tol:.1e}; integrated carriage is not reaching the model's exact "
             f"post-transformer readout."
         )
+    if (integrated and checks["integrated_unconverged_fraction"]
+            > float(cc.integrated_max_unconverged_fraction)):
+        raise RuntimeError(
+            f"Integrated quadrature retained {checks['integrated_unconverged_count']}/"
+            f"{checks['integrated_path_count']} capped paths "
+            f"({100*checks['integrated_unconverged_fraction']:.4f}%), exceeding "
+            f"integrated_max_unconverged_fraction="
+            f"{100*float(cc.integrated_max_unconverged_fraction):.4f}%."
+        )
     if not integrated and bexact_max > tol:
         raise RuntimeError(f"Beneficial exactness violated: max_j|sum_i B - dL_j|={bexact_max:.3e} "
                            f"> tol {tol:.1e}; carrier attribution or loss donor-average miswired.")
@@ -803,6 +903,12 @@ def run_grit_carriage(task, cc: CarriageConfig) -> dict:
             "integrated_atol": float(cc.integrated_atol),
             "integrated_rtol": float(cc.integrated_rtol),
             "integrated_max_intervals": int(cc.integrated_max_intervals),
+            "integrated_max_unconverged_fraction": float(
+                cc.integrated_max_unconverged_fraction
+            ),
+            "integrated_unconverged_error_cap": float(
+                cc.integrated_unconverged_error_cap
+            ),
         })
     return {
         "graph_id": gid,

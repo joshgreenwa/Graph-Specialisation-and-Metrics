@@ -77,7 +77,8 @@ def run(
     # beneficial-carriage estimator (argument name retained for compatibility):
     #   "integrated": final-state path integral of the exact task loss through the readout.
     #       Signed, donor-wise, and complete (sum_i B=dL); no ratios and no clipping. Adaptive
-    #       quadrature localises L1/ReLU kinks and aborts if its checks do not converge.
+    #       quadrature localises L1/ReLU kinks. Rare capped paths retain their best estimate
+    #       with warnings; predeclared rate/error gates still abort a materially bad run.
     #   "slope" (DEFAULT/back-compatible): clean-gradient tangent scaled by a clipped finite
     #       slope. Fast, but clipping is diagnostic evidence that the tangent is inadequate.
     #   "magnitude": B[i,j] = dL_j * |C[i,j]| / sum_i |C[i,j]|. Convex shares, so
@@ -88,7 +89,9 @@ def run(
     beneficial_denom: str = "slope",
     integrated_atol: float = 1e-5,
     integrated_rtol: float = 1e-4,
-    integrated_max_intervals: int = 64,
+    integrated_max_intervals: int = 256,
+    integrated_max_unconverged_fraction: float = 1e-3,
+    integrated_unconverged_error_cap: float = 5e-4,
     tol: float = 1e-4,
     float_noise_tol: float = 5e-3,
     max_replicas: int = 4096,
@@ -117,7 +120,9 @@ def run(
     * ``beneficial_denom`` -- ``"integrated"`` is the signed finite-loss estimator: it
       integrates the task-loss gradient along each donor's swapped-to-clean final-state path,
       then averages donors. It has no ratio or clipping; completeness and adaptive-quadrature
-      diagnostics replace the slope clip. ``"slope"`` remains the back-compatible default,
+      diagnostics replace the slope clip. Rare capped paths are retained (never deleted) and
+      reported, subject to ``integrated_max_unconverged_fraction`` and
+      ``integrated_unconverged_error_cap``. ``"slope"`` remains the back-compatible default,
       while ``"magnitude"`` and ``"signed"`` retain the earlier share estimators.
     * ``bin_strategy`` / ``central`` -- F and B are pooled into adaptive shortest-path
       bins and reported with a robust central tendency + graph-clustered bootstrap CI,
@@ -176,6 +181,8 @@ def run(
         allow_param_count_drift=allow_param_count_drift, beneficial_denom=beneficial_denom,
         integrated_atol=integrated_atol, integrated_rtol=integrated_rtol,
         integrated_max_intervals=integrated_max_intervals,
+        integrated_max_unconverged_fraction=integrated_max_unconverged_fraction,
+        integrated_unconverged_error_cap=integrated_unconverged_error_cap,
         intervention=intervention, structural_mode=structural_mode, partner_match=partner_match,
         tol=tol, float_noise_tol=float_noise_tol,
         max_replicas=max_replicas, max_pair_edges=max_pair_edges,

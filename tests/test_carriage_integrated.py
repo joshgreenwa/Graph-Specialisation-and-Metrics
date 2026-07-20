@@ -1,9 +1,14 @@
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from graph_specialisation_metrics.carriage.core import integrated_loss_carriage
-from graph_specialisation_metrics.carriage.grit_runner import _pooled_head_predictions
+from graph_specialisation_metrics.carriage.grit_runner import (
+    _integrated_failure_stats,
+    _pooled_head_predictions,
+    _retain_or_reject_unconverged_paths,
+)
 
 
 def _integrate(clean, swap, loss, *, pooling="add", **kwargs):
@@ -127,3 +132,42 @@ def test_pooled_head_adapter_preserves_replica_axis_for_scalar_output():
 
     assert pred.shape == (3, 1)
     torch.testing.assert_close(pred[:, 0], pooled[:, 0])
+
+
+def test_rare_capped_path_is_retained_warned_and_reported(capsys):
+    path = {
+        "converged": torch.tensor([True, False, True]),
+        "completeness_residual": torch.tensor([0.0, 2e-4, 0.0]),
+        "quadrature_error": torch.tensor([1e-7, 3e-4, 1e-7]),
+    }
+    cfg = SimpleNamespace(
+        integrated_unconverged_error_cap=5e-4,
+        integrated_max_unconverged_fraction=1e-3,
+    )
+    mask = _retain_or_reject_unconverged_paths(path, cfg, "test")
+    stats = _integrated_failure_stats(
+        mask,
+        path["completeness_residual"].numpy(),
+        path["quadrature_error"].numpy(),
+    )
+
+    assert mask.tolist() == [True, False, True]  # failed path was retained, not dropped
+    assert stats["integrated_unconverged_count"] == 1
+    assert stats["integrated_path_count"] == 3
+    assert stats["integrated_unconverged_completeness_residual_max"] == pytest.approx(2e-4)
+    assert stats["integrated_unconverged_carrier_error_max"] == pytest.approx(3e-4)
+    assert "retaining best estimates for 1/3 test paths" in capsys.readouterr().out
+
+
+def test_capped_path_aborts_when_its_error_exceeds_policy_cap():
+    path = {
+        "converged": torch.tensor([False]),
+        "completeness_residual": torch.tensor([6e-4]),
+        "quadrature_error": torch.tensor([2e-4]),
+    }
+    cfg = SimpleNamespace(
+        integrated_unconverged_error_cap=5e-4,
+        integrated_max_unconverged_fraction=1e-3,
+    )
+    with pytest.raises(RuntimeError, match="exceeded integrated_unconverged_error_cap"):
+        _retain_or_reject_unconverged_paths(path, cfg, "test")

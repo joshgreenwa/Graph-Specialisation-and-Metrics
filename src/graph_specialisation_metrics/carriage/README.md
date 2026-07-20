@@ -86,9 +86,12 @@ cannot silently use different loss changes.
 Because add/mean pooling is linear, the implementation integrates only through GRIT's small
 pooling-to-MLP readout and projects the resulting cotangent back onto each carrier's `Δh_i`.
 Adaptive local Gauss–Kronrod quadrature resolves L1/ReLU kinks. It reports carrier-refinement
-error, endpoint completeness, and exact-head replay; a non-converged path aborts the run.
-There is **no ratio and no clipping**: positive and negative carrier terms may legitimately
-exceed `|dL_j|` while cancelling in their sum.
+error, endpoint completeness, and exact-head replay. A rare path that reaches the interval cap
+retains its best estimate (it is not deleted from the donor average) and emits a warning. The run
+still aborts if the global capped-path fraction exceeds `0.1%`, if a capped path's completeness or
+carrier error exceeds `5e-4`, or if donor-averaged source completeness fails. These thresholds are
+configurable and recorded. There is **no ratio and no clipping**: positive and negative carrier
+terms may legitimately exceed `|dL_j|` while cancelling in their sum.
 This is an Aumann–Shapley allocation along the declared straight final-state path: complete and
 signed for that path, but path-dependent rather than a unique Shapley decomposition.
 
@@ -147,7 +150,8 @@ final states are intentionally not persisted.
 `[8]` structure invariance under swap · `[9]` loss additivity `Σ_i C_loss` vs `dL_j` ·
 `[10]` unreachable pairs excluded · `[11]` `Σ_i B = dL_j`. In `integrated` mode, `[11b]` reports
 quadrature residual/refinement and interval counts, `[11c]` checks clean-target alignment, and
-`[11d]` verifies that replaying the pooled head at captured endpoints reproduces the full model.
+`[11d]` verifies that replaying the pooled head at captured endpoints reproduces the full model;
+`[11e]` reports the capped-path count/rate and failure-only residual distributions.
 Plus a checkpoint-load metric
 (`[4]`: MAE / AP) recomputed on the eval split.
 
@@ -159,7 +163,8 @@ Plus a checkpoint-load metric
   clone this repo (via `dissertation_key`) and call it. For signed finite-loss attribution use
   `beneficial_denom="integrated"` (the argument name is retained for compatibility); available
   values are `integrated`|`slope`|`magnitude`|`signed`. Quadrature controls are
-  `integrated_atol`, `integrated_rtol`, and `integrated_max_intervals`. Other key args:
+  `integrated_atol`, `integrated_rtol`, `integrated_max_intervals`,
+  `integrated_max_unconverged_fraction`, and `integrated_unconverged_error_cap`. Other key args:
   `bin_strategy` (`log`|`hop`|`equal_count`), `central`
   (`trimmed`|`median`|`mean`), `num_graphs`, `donors` (K).
 - Outputs per task under `…/carriage_figures/<task>/`: three figures, `carriage_pairs.npz`
