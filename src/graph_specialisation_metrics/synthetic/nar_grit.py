@@ -212,6 +212,8 @@ class Config:
     max_dense_pairs: int = 300_000
     steps: int = 2000
     min_steps: int = 1500
+    warmup_steps: int = 400
+    train_n_sampling_exponent: float = -0.5
     lr: float = 1.5e-3
     weight_decay: float = 1.0e-5
     eval_every: int = 100
@@ -259,6 +261,8 @@ class Config:
             raise ValueError("the controlled motif generator currently defines two roles")
         if not 0 < self.family_size <= self.layers * self.heads // 3:
             raise ValueError("family_size must leave room for disjoint controls")
+        if not 0 <= self.warmup_steps < self.steps:
+            raise ValueError("warmup_steps must be non-negative and smaller than steps")
 
 
 def config_fingerprint(cfg: Config) -> str:
@@ -814,13 +818,19 @@ def train_model(
     history: list[dict[str, Any]] = []
     good_checks = 0
     rng = np.random.default_rng(seed * 1_000_003 + width)
-    schedule: list[int] = []
+    train_ns_array = np.asarray(cfg.train_ns, dtype=np.int64)
+    train_weights = train_ns_array.astype(np.float64) ** cfg.train_n_sampling_exponent
+    train_probabilities = train_weights / train_weights.sum()
     started = time.time()
     for step in range(1, cfg.steps + 1):
-        if not schedule:
-            schedule = list(map(int, cfg.train_ns))
-            rng.shuffle(schedule)
-        records = int(schedule.pop())
+        # First learn the small-map algorithm shared by every support.  Thereafter all models see
+        # the identical load distribution, with enough low-load examples to avoid impossible
+        # high-load gradients erasing the required matched-performance baseline.
+        records = (
+            int(min(cfg.train_ns))
+            if step <= cfg.warmup_steps
+            else int(rng.choice(train_ns_array, p=train_probabilities))
+        )
         graphs = batch_graphs(cfg, records)
         batch = make_batch(
             cfg,
@@ -846,7 +856,13 @@ def train_model(
                 seed=50_000 + seed,
                 device=device,
             )
-            objective = float(np.mean([row["loss"] for row in grid]))
+            loss_by_n = {int(row["N"]): float(row["loss"]) for row in grid}
+            objective = float(
+                sum(
+                    float(probability) * loss_by_n[int(records_value)]
+                    for probability, records_value in zip(train_probabilities, train_ns_array)
+                )
+            )
             low_n = next(row for row in grid if int(row["N"]) == min(cfg.train_ns))
             history.append(
                 {
@@ -855,6 +871,7 @@ def train_model(
                     "train_graphs": graphs,
                     "train_loss": float(loss.detach().cpu()),
                     "validation_loss": objective,
+                    "warmup": bool(step <= cfg.warmup_steps),
                     "low_N_min_accuracy": float(
                         min(low_n["semantic_accuracy"], low_n["structural_accuracy"])
                     ),
@@ -2200,6 +2217,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seeds", default="0,1,2")
     parser.add_argument("--steps", type=int, default=2000)
     parser.add_argument("--min-steps", type=int, default=1500)
+    parser.add_argument("--warmup-steps", type=int, default=400)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--score-graphs", type=int, default=8)
     parser.add_argument("--score-donors", type=int, default=3)
@@ -2231,6 +2249,7 @@ def config_from_args(args: argparse.Namespace) -> Config:
         "seeds": parse_int_tuple(args.seeds),
         "steps": args.steps,
         "min_steps": args.min_steps,
+        "warmup_steps": args.warmup_steps,
         "batch_size": args.batch_size,
         "score_graphs": args.score_graphs,
         "score_donors": args.score_donors,
@@ -2252,6 +2271,7 @@ def config_from_args(args: argparse.Namespace) -> Config:
                 "seeds": (0,),
                 "steps": 12,
                 "min_steps": 12,
+                "warmup_steps": 4,
                 "eval_every": 4,
                 "validation_graphs": 4,
                 "heldout_graphs": 8,

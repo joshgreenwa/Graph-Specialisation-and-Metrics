@@ -11,6 +11,10 @@ parameter-matched, two-layer official GRITs with genuinely trained 1-hop, 2-hop,
 attention support at widths 64 and 128. The capacity schedule is
 `N_train={4,8,16,32,64}`, with denser held-out evaluation at
 `N={4,8,12,16,24,32,48,64}` and three training seeds.
+Every support receives the same curriculum: a short `N=4` warm-up establishes the common
+small-map solution, followed by inverse-square-root sampling across the full training schedule.
+This prevents irreducible high-load gradients from destroying the low-load matched-accuracy
+control while still training and testing the capacity transition itself.
 
 Each graph contains an unmarked key--value record selected by a delayed query. The model must
 predict both the record's semantic value and an independent topology-defined role carried by the

@@ -99,11 +99,14 @@ except Exception:  # pragma: no cover
 SMOKE = os.environ.get("NOPE_SMOKE", "") == "1"
 
 # ---- task / model geometry ----
+# Small + fast on purpose: scoring cost is ~O(T^3) (T*(T-1)/2 swap-pairs x T queries), so T is the
+# biggest lever; a smaller head_dim (=D_MODEL/N_HEADS) also trains faster and canalises the learned
+# solution -> LESS seed noise. head_dim = 32 here; there is no vocab (inputs are continuous R^D).
 TEACHER_TYPE = "previous_token"     # previous_token | diagonal | first_token | uniform_causal
-SEQ_LEN      = 8  if SMOKE else 16
-D_MODEL      = 32 if SMOKE else 64
-D_FF         = 64 if SMOKE else 128
-N_HEADS      = 1                     # "each layer just a single head"
+SEQ_LEN      = 8  if SMOKE else 12
+D_MODEL      = 24 if SMOKE else 32
+D_FF         = 48 if SMOKE else 64
+N_HEADS      = 1                     # "each layer just a single head" -> head_dim = D_MODEL
 DEPTHS       = [1, 2, 3, 4, 5]       # student depths (depth-scaling of the local mislabel)
 SEEDS        = [0, 1] if SMOKE else [0, 1, 2]
 
