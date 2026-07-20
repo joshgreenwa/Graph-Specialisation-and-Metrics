@@ -3,44 +3,37 @@
 This folder contains controlled graph tasks for studying symbolic and structural
 attention behaviour outside ZINC.
 
-## Neighbor Associative Recall with trained GRIT support
+## Paper-aligned Neighbor Associative Recall with trained GRIT support
 
-`training/nar_grit_colab.py` is the standalone Colab launcher for the centrally maintained
-implementation in `src/graph_specialisation_metrics/synthetic/nar_grit.py`. It trains
-parameter-matched, two-layer official GRITs with genuinely trained 1-hop, 2-hop, or dense
-attention support at widths 64 and 128. The capacity schedule is
-`N_train={4,8,16,32,64}`, with denser held-out evaluation at
-`N={4,8,12,16,24,32,48,64}` and three training seeds.
-Every support receives the same curriculum: a short `N=4` warm-up establishes the common
-small-map solution, followed by inverse-square-root sampling across the full training schedule.
-This prevents irreducible high-load gradients from destroying the low-load matched-accuracy
-control while still training and testing the capacity transition itself.
+`training/nar_grit_colab.py` launches the centrally maintained implementation in
+`src/graph_specialisation_metrics/synthetic/nar_grit_fixed.py`. The task now follows the NAR
+classification construction directly. For each fixed neighborhood size `N`, a separate model is
+trained on graphs containing exactly `N+3` nodes: `N` key--value neighbors, a central node, an
+intermediate node, and a query node. Every key occurs exactly once; values are sampled with
+replacement from an `N`-value vocabulary; central and intermediate input features are zero; and
+the central node predicts the queried value after exactly two layers. There is no cross-`N`
+curriculum, motif gadget, structural auxiliary label, or task marker.
 
-Each graph contains an unmarked key--value record selected by a delayed query. The model must
-predict both the record's semantic value and an independent topology-defined role carried by the
-same source. The centre is one hop from every record but two hops from the query: a two-layer
-1-hop model has to compress the complete associative map before it knows which key is requested,
-whereas 2-hop and dense models can condition their second-layer record selection on the query.
-Triangle-tail and square source gadgets are degree/node/edge-count matched, making the structural
-output and structural interventions non-trivial without a task switch marker.
+The intended experimental substitution is the architecture. Parameter-matched official GRITs
+are trained with 1-hop, 2-hop, or dense attention support at widths 64 and 128 for
+`N={4,8,16,32,64}` and three seeds. Key and value embeddings and the `N`-way classifier are
+specific to each fixed-`N` checkpoint, as required by the task. Full mechanistic analysis is
+restricted to width 128 and `N={4,16,64}` to keep the run tractable. The resulting figures show
+the capacity curves, semantic score--ablation/carriage causality with equal-size random-family
+controls, and aggregate semantic carriage plus queried-record attention selection.
 
-The full run writes Drive-cached checkpoints and analysis tensors plus five PNG/PDF figure
-families: the accuracy/capacity phase diagram; the `J`--`D_rel` head plane across load; independent
-score--ablation and score-selected family causality; queried-record attention selection; and
-semantic/structural functional and beneficial carriage. CSV exports contain every plotted point.
-The exports also retain the complete intervention-factor by output response matrix and identical-
-replica transport null, so apparent selectivity can be checked against off-channel response.
-Use `--phase train`, `--phase analyze`, and `--phase figures` to separate expensive stages;
-`--fast-dev-run` checks installation and wiring only.
+Relative to the authors' released training protocol, this lightweight version samples fresh
+training graphs online, uses 192 validation and 512 held-out graphs, and omits their `N={80,96}`
+and width-256 settings. The graph distribution, token construction, learned null-padded key/value
+embeddings, fixed-`N` training unit, batch size 64, learning rate `1e-3`, and three repeats match
+the reference implementation.
 
-The specialisation estimator matches the central repository Method A: official GRIT routed
-`wV`, clean readout gradients, clean/corrupt replicas in one forward, nuisance averaging before
-magnitude, and frozen trained support for structural scoring. Structural carriage instead
-conjugates RRWP and support, matching the production score/carriage distinction. The intentional
-synthetic difference is recorded in every run summary: carriage is the exact target-source output
-or cross-entropy change at the sole central readout, rather than the production multi-carrier
-integrated allocation. This keeps the causal question exact while avoiding a claim that the
-synthetic readout implements the complete real-dataset carriage estimator.
+This benchmark is deliberately semantic-only, so it does not estimate structural scores or
+`J/D_rel`; those require a genuinely independent structural factor and belong in the preceding
+mixed-task validation experiment. The semantic score still uses the central Method-A routed-`wV`
+transport site with within-forward clean/corrupt replicas and donor averaging before magnitude.
+Use `--phase train`, `--phase analyze`, and `--phase figures` to separate cached stages;
+`--fast-dev-run` is an installation and wiring check only.
 
 ## ReachCarriageSpecialisation
 

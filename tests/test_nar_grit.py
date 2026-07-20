@@ -1,11 +1,11 @@
 import torch
 
-from graph_specialisation_metrics.synthetic.nar_grit import (
+from graph_specialisation_metrics.synthetic.nar_grit_fixed import (
     Config,
-    calibrated_jd,
     khop_support,
     make_batch,
-    verify_interventions,
+    semantic_replica,
+    verify_intervention,
 )
 
 
@@ -15,8 +15,7 @@ def tiny_config() -> Config:
         analysis_width=32,
         heads=4,
         models=("1hop", "dense"),
-        train_ns=(4, 8),
-        eval_ns=(4, 8),
+        ns=(4, 8),
         mechanistic_ns=(4, 8),
         seeds=(0,),
         family_size=1,
@@ -36,15 +35,17 @@ def shortest_distance(adj: torch.Tensor, source: int, target: int) -> int:
     raise AssertionError("graph is disconnected")
 
 
-def test_generator_realises_delayed_query_and_balanced_roles() -> None:
+def test_generator_matches_fixed_n_nar_graph() -> None:
     cfg = tiny_config()
     batch = make_batch(cfg, size=5, records=8, seed=123)
-    assert batch.x.shape == (5, cfg.nodes_for_n(8), cfg.feature_dim)
+    assert batch.x.shape == (5, 11, 2)
     for graph in range(len(batch)):
         records = torch.where(batch.record_mask[graph])[0]
         assert len(records) == 8
-        assert sorted(batch.record_role[graph, records].tolist()) == [0] * 4 + [1] * 4
-        assert torch.all(batch.adj[graph].sum(-1)[records] == 3)
+        assert batch.adj[graph].sum(-1)[batch.central_idx[graph]] == 9
+        assert batch.adj[graph].sum(-1)[batch.intermediate_idx[graph]] == 2
+        assert batch.adj[graph].sum(-1)[batch.query_idx[graph]] == 1
+        assert torch.all(batch.adj[graph].sum(-1)[records] == 1)
         assert shortest_distance(
             batch.adj[graph], int(batch.query_idx[graph]), int(batch.central_idx[graph])
         ) == 2
@@ -53,27 +54,36 @@ def test_generator_realises_delayed_query_and_balanced_roles() -> None:
         ) == 1
 
 
-def test_structural_role_has_controlled_rrwp_signature() -> None:
+def test_every_key_occurs_once_and_query_selects_target() -> None:
     cfg = tiny_config()
-    batch = make_batch(cfg, size=8, records=8, seed=456)
+    records = 8
+    batch = make_batch(cfg, size=7, records=records, seed=456)
     for graph in range(len(batch)):
-        records = torch.where(batch.record_mask[graph])[0]
-        returns = batch.rrwp[graph, records, records, 3]
-        roles = batch.record_role[graph, records]
-        assert torch.all(returns[roles == 0] > 0)
-        assert torch.all(returns[roles == 1] == 0)
+        memory = batch.x[graph, batch.record_mask[graph]]
+        assert sorted(memory[:, 0].tolist()) == list(range(records))
+        query_key = batch.x[graph, batch.query_idx[graph], 0]
+        target_key = batch.x[graph, batch.target_idx[graph], 0]
+        assert query_key == target_key
+        assert torch.all(batch.x[graph, batch.central_idx[graph]] == records)
+        assert torch.all(batch.x[graph, batch.intermediate_idx[graph]] == records)
+        assert batch.x[graph, batch.query_idx[graph], 1] == records
 
 
-def test_interventions_isolate_content_and_structure() -> None:
+def test_semantic_intervention_changes_only_target_value() -> None:
     cfg = tiny_config()
-    checks = verify_interventions(make_batch(cfg, 3, 8, 789), cfg)
-    assert checks["semantic_changed_values"] == 6
-    assert checks["semantic_adj_max"] == 0
-    assert checks["structural_x_max"] == 0
-    assert checks["structural_frozen_adj_max"] == 0
+    batch = make_batch(cfg, 3, 8, 789)
+    checks = verify_intervention(batch, 8)
+    assert checks["changed_value_entries"] == 3
+    assert checks["adj_max"] == 0
+    assert checks["rrwp_max"] == 0
+    assert checks["key_max"] == 0
+    changed = semantic_replica(batch, 8, 0)
+    for graph in range(len(batch)):
+        difference = (changed.x[graph] - batch.x[graph]).abs().sum(dim=-1)
+        assert torch.where(difference > 0)[0].tolist() == [int(batch.target_idx[graph])]
 
 
-def test_attention_support_is_trained_radius_not_parameter_change() -> None:
+def test_attention_support_changes_reach_not_parameters() -> None:
     cfg = tiny_config()
     batch = make_batch(cfg, 2, 8, 901)
     one = khop_support(batch.adj, 1)
@@ -88,10 +98,13 @@ def test_attention_support_is_trained_radius_not_parameter_change() -> None:
         assert two[graph, query, centre]
 
 
-def test_jd_separates_influence_from_preference() -> None:
-    semantic = torch.tensor([2.0, 1.0])
-    structural = torch.tensor([1.0, 2.0])
-    _, _, joint, selectivity = calibrated_jd(semantic, structural)
-    assert torch.allclose(joint, torch.ones_like(joint))
-    assert selectivity[0] > 0
-    assert selectivity[1] < 0
+def test_feature_and_label_spaces_are_specific_to_n() -> None:
+    cfg = tiny_config()
+    four = make_batch(cfg, 2, 4, 11)
+    eight = make_batch(cfg, 2, 8, 12)
+    assert four.x.shape[-1] == 2
+    assert eight.x.shape[-1] == 2
+    assert int(four.x.max()) <= 4
+    assert int(eight.x.max()) <= 8
+    assert int(four.y.max()) < 4
+    assert int(eight.y.max()) < 8

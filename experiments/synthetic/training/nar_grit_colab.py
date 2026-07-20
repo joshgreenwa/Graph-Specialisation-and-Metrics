@@ -1,9 +1,9 @@
-"""Standalone Colab launcher for the repository-controlled NAR–GRIT experiment.
+"""Standalone Colab launcher for the paper-aligned fixed-N NAR–GRIT experiment.
 
 Paste this complete file into one Colab cell and run it.  The scientific implementation lives in
-``src/graph_specialisation_metrics/synthetic/nar_grit.py`` so fixes made in the central repository
-are picked up on the next Colab run.  Checkpoints, analysis tensors, tables, and PNG/PDF figures
-are cached on Drive.
+``src/graph_specialisation_metrics/synthetic/nar_grit_fixed.py`` so fixes made in the central
+repository are picked up on the next Colab run. Checkpoints, analysis tensors, tables, and
+PNG/PDF figures are cached on Drive.
 """
 
 from __future__ import annotations
@@ -86,18 +86,18 @@ def bootstrap() -> None:
 
 bootstrap()
 
-from graph_specialisation_metrics.synthetic.nar_grit import main
+from graph_specialisation_metrics.synthetic.nar_grit_fixed import main
 
 
 # Normal run: trains only missing checkpoints, then caches mechanisms and makes every figure.
 # Cheap reruns after training:
-#   CELL_ARGS = ["--run-name", "nar_grit_v1", "--phase", "analyze"]
-#   CELL_ARGS = ["--run-name", "nar_grit_v1", "--phase", "figures"]
+#   CELL_ARGS = ["--run-name", "nar_grit_fixed_n_v2", "--phase", "analyze"]
+#   CELL_ARGS = ["--run-name", "nar_grit_fixed_n_v2", "--phase", "figures"]
 # Installation/plumbing only:
 #   CELL_ARGS = ["--run-name", "nar_grit_smoke", "--fast-dev-run", "--allow-low-accuracy"]
 CELL_ARGS = [
     "--run-name",
-    "nar_grit_v1",
+    "nar_grit_fixed_n_v2",
     "--phase",
     "all",
     "--models",
@@ -110,12 +110,10 @@ CELL_ARGS = [
     "8",
     "--layers",
     "2",
-    "--train-ns",
+    "--ns",
     "4,8,16,32,64",
-    "--eval-ns",
-    "4,8,12,16,24,32,48,64",
     "--mechanistic-ns",
-    "4,16,32,64",
+    "4,16,64",
     "--seeds",
     "0,1,2",
 ]
