@@ -86,13 +86,13 @@ J     = (S_sem_norm + S_str_norm) / 2
 D_rel = (S_sem_norm - S_str_norm) / (S_sem_norm + S_str_norm)
 ```
 
-`fig5_joint_influence_selectivity` tests whether `J` predicts mean cross-task functional
-ablation impact and whether `D_rel` predicts semantic-minus-structural ablation and rescue role.
-It additionally reports `|D_rel|` versus `J`, depth profiles, and semantic-specialist,
-generalist, structural-specialist, and low-`J` quadrant summaries. Heads with `J < 0.5` are faded
-and excluded from selectivity correlations because a ratio of two tiny scores is unstable. This
-is a within-seed head-allocation analysis, not yet a claim that raw semantic and structural score
-amplitudes are directly comparable across intervention families.
+`fig5_joint_influence_selectivity` shows the joint-sensitivity/selectivity plane, tests whether
+`J` predicts mean cross-task functional ablation impact, and tests whether `D_rel` predicts both
+semantic-minus-structural ablation role and causal rescue role. Heads with `J < 0.5` are faded and
+excluded from selectivity correlations because a ratio of two tiny scores is unstable. The
+semantic-specialist, generalist, structural-specialist, and low-`J` quadrant summaries remain in
+the cached analysis tables. This is a within-seed head-allocation analysis, not yet a claim that
+raw semantic and structural score amplitudes are directly comparable across intervention families.
 
 `--phase analyze` enriches older caches once with four additional fixed score-selected family
 ablations: semantic specialists, structural specialists, high-`J` generalists, and low-`J`/inert

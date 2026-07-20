@@ -1758,7 +1758,8 @@ def figure_joint_selectivity(
     rows: Sequence[Mapping[str, Any]], cfg: Config, figures_dir: Path
 ) -> tuple[list[str], dict[str, Any], list[dict[str, Any]]]:
     plt = configure_matplotlib()
-    fig, axes = plt.subplots(2, 3, figsize=(15.4, 9.0))
+    fig, axes = plt.subplots(2, 2, figsize=(12.6, 9.0))
+    seeds = sorted({int(row["seed"]) for row in rows})
     summary: dict[str, Any] = {
         "score_calibration": "each channel divided by its within-seed head mean",
         "J_formula": "0.5 * (semantic_score_norm + structural_score_norm)",
@@ -1797,7 +1798,7 @@ def figure_joint_selectivity(
     )
 
     # C: D is useful only if it predicts which task is affected, not merely score geometry.
-    ax = axes[0, 2]
+    ax = axes[1, 0]
     _dj_scatter(ax, rows, cfg, "selectivity_D", "ablation_role_selectivity", reliable_only=True)
     role_stats = correlation_by_seed(
         rows, "selectivity_D", "ablation_role_selectivity", reliable_only=True
@@ -1817,69 +1818,8 @@ def figure_joint_selectivity(
         transform=ax.transAxes, va="top",
     )
 
-    # D: show whether the strongest heads are specialists or generalists.
-    ax = axes[1, 0]
-    _dj_scatter(ax, rows, cfg, "joint_score_J", "absolute_selectivity")
-    strength_selectivity = correlation_by_seed(
-        rows, "joint_score_J", "absolute_selectivity", reliable_only=True
-    )
-    summary["J_vs_absolute_D"] = strength_selectivity
-    ax.axhline(DJ_SELECTIVITY_THRESHOLD, color="#777777", linestyle="--", linewidth=0.9)
-    ax.axvline(DJ_RELIABILITY_FLOOR, color="#777777", linestyle="--", linewidth=0.9)
-    ax.set_xscale("log")
-    ax.set_xlim(left=max(min(float(row["joint_score_J"]) for row in rows) * 0.8, 1.0e-3))
-    ax.set_ylim(-0.03, 1.03)
-    ax.set_xlabel(r"Joint sensitivity $J$")
-    ax.set_ylabel(r"Absolute preference $|D_{rel}|$")
-    ax.set_title("D  Are influential heads specialists?", loc="left", fontweight="bold")
-    ax.text(
-        0.04, 0.96,
-        f"reliable-head $\\rho={strength_selectivity['pooled_spearman']:.2f}$",
-        transform=ax.transAxes, va="top",
-    )
-
-    # E: depth profiles, using the training seed rather than heads as the uncertainty unit.
+    # D: an independent intervention-patching check of the same signed role prediction.
     ax = axes[1, 1]
-    twin = ax.twinx()
-    layer_j, layer_d, layer_j_err, layer_d_err = [], [], [], []
-    seeds = sorted({int(row["seed"]) for row in rows})
-    for layer in range(cfg.layers):
-        j_seed = [
-            finite_mean([
-                float(row["joint_score_J"]) for row in rows
-                if int(row["seed"]) == seed and int(row["layer"]) == layer
-            ]) for seed in seeds
-        ]
-        d_seed = [
-            finite_mean([
-                float(row["selectivity_D"]) for row in rows
-                if int(row["seed"]) == seed and int(row["layer"]) == layer
-                and bool(row["selectivity_reliable"])
-            ]) for seed in seeds
-        ]
-        layer_j.append(finite_mean(j_seed))
-        layer_d.append(finite_mean(d_seed))
-        layer_j_err.append(float(np.nanstd(j_seed, ddof=1) / math.sqrt(len(seeds)) * 1.96) if len(seeds) > 1 else 0.0)
-        layer_d_err.append(float(np.nanstd(d_seed, ddof=1) / math.sqrt(len(seeds)) * 1.96) if len(seeds) > 1 else 0.0)
-    x_layer = np.arange(cfg.layers)
-    ax.errorbar(x_layer, layer_j, yerr=layer_j_err, color="#54278f", marker="o", linewidth=2.0, capsize=3, label="$J$")
-    twin.errorbar(x_layer, layer_d, yerr=layer_d_err, color="#238b45", marker="s", linewidth=2.0, capsize=3, label="$D$")
-    twin.axhline(0.0, color="#777777", linewidth=0.8)
-    ax.set_xticks(x_layer)
-    ax.set_xlabel("Layer")
-    ax.set_ylabel(r"Mean joint sensitivity $J$", color="#54278f")
-    twin.set_ylabel(r"Mean reliable-head selectivity $D_{rel}$", color="#238b45")
-    ax.set_title("E  Does preference emerge with depth?", loc="left", fontweight="bold")
-    handles_a, labels_a = ax.get_legend_handles_labels()
-    handles_b, labels_b = twin.get_legend_handles_labels()
-    ax.legend(handles_a + handles_b, labels_a + labels_b, frameon=False, loc="best")
-    summary["layer_profiles"] = {
-        "J_mean": layer_j, "J_ci95": layer_j_err,
-        "D_mean_reliable": layer_d, "D_ci95": layer_d_err,
-    }
-
-    # F: an independent intervention-patching check of the same signed role prediction.
-    ax = axes[1, 2]
     _dj_scatter(ax, rows, cfg, "selectivity_D", "rescue_role_contrast", reliable_only=True)
     rescue_stats = correlation_by_seed(
         rows, "selectivity_D", "rescue_role_contrast", reliable_only=True
@@ -1890,7 +1830,7 @@ def figure_joint_selectivity(
     ax.set_xlim(-1.04, 1.04)
     ax.set_xlabel(r"Score selectivity $D_{rel}$")
     ax.set_ylabel("Semantic − structural rescue mediation")
-    ax.set_title("F  Does $D$ predict causal rescue role?", loc="left", fontweight="bold")
+    ax.set_title("D  Does $D$ predict causal rescue role?", loc="left", fontweight="bold")
     ax.text(
         0.04, 0.96,
         f"reliable heads only\npooled $\\rho={rescue_stats['pooled_spearman']:.2f}$\n"
@@ -2012,12 +1952,6 @@ def interaction_panel(ax: Any, necessity: np.ndarray, rescue: np.ndarray, seeds:
         errors = [0.0, 0.0]
     x = np.arange(2)
     ax.bar(x, means, yerr=np.asarray(errors) * 1.96, color=["#6a51a3", "#238b45"], alpha=0.84, capsize=5, width=0.64)
-    rng = np.random.default_rng(41)
-    for condition, values in enumerate((necessity, rescue)):
-        jitter = rng.normal(0, 0.035, size=len(values))
-        ax.scatter(np.full(len(values), condition) + jitter, values, color="#222222", s=32, zorder=3)
-        for idx, value in enumerate(values):
-            ax.text(condition + jitter[idx] + 0.03, value, f"s{seeds[idx]}", fontsize=7, va="center")
     ax.axhline(0.0, color="#777777", linewidth=0.9)
     ax.set_xticks(x, ["Necessity", "Rescue"])
     ax.set_ylabel("Double-dissociation interaction")

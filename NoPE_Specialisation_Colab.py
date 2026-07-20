@@ -117,6 +117,10 @@ N_PROBES     = 8   if SMOKE else 16    # R: Hutchinson probes for the functional
 EVAL_SEED    = 20260720                # fixed so scores are comparable across models/seeds
 FORCE_RESCORE = False               # True to ignore the score cache and recompute
 
+# ---- optional per-layer mean/std attention figure (across inputs) ----
+ATTN_VIZ_DEPTH = 3                   # which depth to visualise (must be in DEPTHS); None to skip
+ATTN_VIZ_SEED  = None                # None -> SEEDS[0]
+
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 DTYPE = torch.float32
 
@@ -705,6 +709,51 @@ def make_jd_figure(agg, out_path):
     return fig
 
 
+def make_attention_figure(depth=None, seed=None, out_path=None):
+    """Per-layer MEAN and STD of attention across random inputs, for one model.
+
+    A 2 x n_layers grid: row 1 = mean attention A[q,k] (positional if input-invariant),
+    row 2 = std across inputs (high = content-dependent). depth is configurable (e.g. L2/L4);
+    uses a single seed (attention solutions differ across seeds, so they are not averaged).
+    """
+    depth = depth if depth is not None else ATTN_VIZ_DEPTH
+    seed = seed if seed is not None else (ATTN_VIZ_SEED if ATTN_VIZ_SEED is not None else SEEDS[0])
+    model, *_ = get_student(depth, seed)
+    x = eval_inputs(N_EVAL_ATTN)
+    A = forward_capture(model, x, grad=False)["A"]         # list of (B,H,T,T), H=1
+    means = [a[:, 0].mean(0).cpu().numpy() for a in A]     # (T,T) per layer
+    stds = [a[:, 0].std(0).cpu().numpy() for a in A]
+
+    nL = depth
+    fig, axes = plt.subplots(2, nL, figsize=(4.3 * nL, 8.2))
+    axes = np.atleast_2d(axes)
+    for l in range(nL):
+        ax = axes[0, l]
+        im = ax.imshow(means[l], cmap="Blues", vmin=0, vmax=max(means[l].max(), 1e-8))
+        ax.set_title(f"Layer {l}: mean attention", fontsize=11)
+        ax.set_xlabel("key pos"); ax.set_ylabel("query pos" if l == 0 else "")
+        plt.colorbar(im, ax=ax, shrink=0.8)
+        ax = axes[1, l]
+        im = ax.imshow(stds[l], cmap="Oranges", vmin=0)
+        ax.set_title(f"Layer {l}: attention std\n(high = content-dependent)", fontsize=11)
+        ax.set_xlabel("key pos"); ax.set_ylabel("query pos" if l == 0 else "")
+        plt.colorbar(im, ax=ax, shrink=0.8)
+
+    fig.suptitle(f"NoPE {depth}-layer student (seed {seed}): attention mean & std across "
+                 f"{N_EVAL_ATTN} inputs\nlow std across inputs = positional (content-invariant) "
+                 "attention",
+                 fontsize=13, y=1.01)
+    fig.tight_layout(rect=[0, 0, 1, 0.99])
+    if out_path:
+        fig.savefig(out_path, dpi=140, bbox_inches="tight")
+        print(f"[fig  ] saved {out_path}")
+    try:
+        plt.show()
+    except Exception:
+        pass
+    return fig
+
+
 # %%
 # ============================== 11. Main ==============================
 def main():
@@ -716,6 +765,13 @@ def main():
     jd_path = os.path.join(CACHE_DIR, f"fig_specialisation_JDplane_{CFG_TAG}_{EVAL_TAG}.png")
     make_figure(agg, scatter_path)
     make_jd_figure(agg, jd_path)
+    if ATTN_VIZ_DEPTH is not None:
+        if ATTN_VIZ_DEPTH in DEPTHS:
+            attn_path = os.path.join(CACHE_DIR,
+                                     f"fig_attention_L{ATTN_VIZ_DEPTH}_{CFG_TAG}_{EVAL_TAG}.png")
+            make_attention_figure(depth=ATTN_VIZ_DEPTH, out_path=attn_path)
+        else:
+            print(f"[warn ] ATTN_VIZ_DEPTH={ATTN_VIZ_DEPTH} not in DEPTHS={DEPTHS}; skipping attn fig")
     return train_rows, agg
 
 
