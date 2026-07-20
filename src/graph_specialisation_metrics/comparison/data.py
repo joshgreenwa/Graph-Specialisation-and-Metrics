@@ -108,6 +108,10 @@ def scores_npz_path(spec_collate, task: str) -> Path:
     return Path(spec_collate) / task / f"scores_{task}.npz"
 
 
+def channel_ablation_npz_path(spec_collate, task: str) -> Path:
+    return Path(spec_collate) / task / f"channel_ablation_{task}.npz"
+
+
 def spec_stats_path(spec_collate, task: str) -> Path:
     return Path(spec_collate) / task / f"stats_{task}.json"
 
@@ -162,6 +166,30 @@ def load_scores_by_task(spec_collate, tasks: Sequence[str]) -> dict:
         s = load_scores(scores_npz_path(spec_collate, t))
         if s is not None:
             out[t] = s
+    return out
+
+
+# channel-split causal ablation (I_sem/I_str functional + loss, and single-channel overall_*).
+_CHANNEL_ABLATION_KEYS = ("I_sem_func", "I_str_func", "I_sem_loss", "I_str_loss",
+                          "overall_func", "overall_loss")
+
+
+def load_channel_ablation(path) -> Optional[dict]:
+    """Read a channel_ablation_<task>.npz -> {I_sem_func, I_str_func, ...} float [L,H] arrays, or None."""
+    path = Path(path)
+    if not path.exists():
+        return None
+    with np.load(path) as z:
+        return {k: np.asarray(z[k], float) for k in _CHANNEL_ABLATION_KEYS if k in z}
+
+
+def load_channel_ablation_by_task(spec_collate, tasks: Sequence[str]) -> dict:
+    """{task: channel_ablation_dict} for every task whose channel_ablation npz exists on disk."""
+    out = {}
+    for t in tasks:
+        c = load_channel_ablation(channel_ablation_npz_path(spec_collate, t))
+        if c is not None:
+            out[t] = c
     return out
 
 

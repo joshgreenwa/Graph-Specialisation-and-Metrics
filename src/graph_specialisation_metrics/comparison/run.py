@@ -19,6 +19,10 @@ deliverables from that cache:
         standardised (reference-fixed) y-axis;
 * (iv)  ``fig_carriage_overlay_<intv>.png``    -- functional/beneficial carriage overlaid across
         models for direct comparison;
+* (v)   ``fig_DJ_ablation_validation.png`` (+ ``fig_DJ_quadrants.png`` /
+        ``fig_DJ_influence_strength.png``) -- validates the score selectivity D_rel against the
+        channel-split (swap x ablate) ablation contrast, functional & loss; needs
+        ``with_channel_ablation=True`` (else the score-only quadrant/influence figures still build);
 plus ``fig_performance.png`` + ``performance.json`` for the val/test evaluation.
 
 Every figure accepts an ``include`` / ``exclude`` list and ``drop_vnode`` so a final figure can
@@ -125,12 +129,13 @@ def inventory(tasks: Sequence[str] = _data.DEFAULT_TASKS, *,
         return m.get("val_metric"), m.get("test_metric")
 
     rows: dict = {}
-    log(f"{'model':<18} {'ckpt':<7} {'sem(F/B)':<9} {'struct':<7} {'scores':<7} {'val/test'}")
+    log(f"{'model':<18} {'ckpt':<7} {'sem(F/B)':<9} {'struct':<7} {'scores':<7} {'chanAbl':<8} {'val/test'}")
     for t in tasks:
         sem = _data.load_carriage_summary(_data.carriage_summary_path(carriage_collate, t, "semantic"))
         strc = _data.load_carriage_summary(
             _data.carriage_summary_path(carriage_collate, t, "structural", structural_mode))
         scores = _data.scores_npz_path(spec_collate, t).exists()
+        chan = _data.channel_ablation_npz_path(spec_collate, t).exists()
         sem_val, sem_test = _valtest(sem)
 
         ckpt_status = "-"
@@ -152,9 +157,11 @@ def inventory(tasks: Sequence[str] = _data.DEFAULT_TASKS, *,
               (f"-/{sem_test:.3f}" if sem_test is not None else "-"))
         rows[t] = {"ckpt": ckpt_status, "carriage_semantic": bool(sem),
                    "carriage_structural": bool(strc), "scores": bool(scores),
+                   "channel_ablation": bool(chan),
                    "val_metric": sem_val, "test_metric": sem_test}
         log(f"{t:<18} {ckpt_status:<7} {('yes' if sem else 'no'):<9} "
-            f"{('yes' if strc else 'no'):<7} {('yes' if scores else 'no'):<7} {vt}")
+            f"{('yes' if strc else 'no'):<7} {('yes' if scores else 'no'):<7} "
+            f"{('yes' if chan else 'no'):<8} {vt}")
     return rows
 
 
@@ -208,6 +215,31 @@ def build_figures(tasks: Sequence[str] = _data.DEFAULT_TASKS, *,
                 ref_tasks=list(scores_ref.keys()))
             figs["spec_DJ_grid"] = p
             made.append(fig)
+
+            # (v) D/J causal validation against the channel-split (swap x ablate) ablation,
+            # when that heavier cache is present. Degrades to the score-only figures otherwise.
+            chan_ref = _data.load_channel_ablation_by_task(spec_collate, tasks)
+            # quadrant taxonomy (scores only; influence rho uses chan where present)
+            fig, p = _plots.plot_DJ_quadrants(
+                scores_ref, chan_ref, shown_scores, out_dir / "fig_DJ_quadrants.png",
+                gsem=gsem, gstr=gstr, ref_tasks=list(scores_ref.keys()), metrics_by_task=metrics)
+            figs["DJ_quadrants"] = p
+            made.append(fig)
+            fig, p = _plots.plot_DJ_influence_strength(
+                scores_ref, chan_ref, shown_scores, out_dir / "fig_DJ_influence_strength.png",
+                gsem=gsem, gstr=gstr)
+            figs["DJ_influence_strength"] = p
+            made.append(fig)
+            shown_chan = [t for t in shown_scores if t in chan_ref]
+            if shown_chan:
+                fig, p = _plots.plot_DJ_ablation_validation(
+                    scores_ref, chan_ref, shown_chan, out_dir / "fig_DJ_ablation_validation.png",
+                    gsem=gsem, gstr=gstr, metrics_by_task=metrics)
+                figs["DJ_ablation_validation"] = p
+                made.append(fig)
+            else:
+                log("[figures] no channel-ablation cache; skipping the D/J ablation-validation "
+                    "figure (run with with_channel_ablation=True to produce it).")
     else:
         log("[figures] no specialisation score caches found; skipping the scatter grid.")
 
@@ -296,6 +328,12 @@ def run_all(tasks: Sequence[str] = _data.DEFAULT_TASKS, *,
             spec_num_graphs: int = 200,
             spec_donors: int = 8,
             with_attn_routing: bool = True,
+            # channel-split causal ablation (I_sem/I_str functional + loss) -> the D/J validation
+            # figure. Off by default: it is the heavy swap x ablate sweep (L*H passes per model).
+            with_channel_ablation: bool = False,
+            channel_ablation_graphs: int = 48,
+            channel_ablation_sources: int = 6,
+            channel_ablation_donors: int = 3,
             spec_kwargs: Optional[dict] = None,   # any other specialisation.colab.run option
             # cache / output
             carriage_collate: str = CARRIAGE_COLLATE,
@@ -388,17 +426,28 @@ def run_all(tasks: Sequence[str] = _data.DEFAULT_TASKS, *,
     # extra setup relative to the batched call.
     if run_specialisation:
         for t in tasks:
-            if not force and _data.scores_npz_path(spec_collate, t).exists():
-                log(f"[cache] specialisation {t}: reuse {_data.scores_npz_path(spec_collate, t)}")
+            # A model is fully cached only if its scores exist AND, when channel ablation is
+            # requested, its channel_ablation npz exists too. Otherwise (re)run this model.
+            scores_cached = _data.scores_npz_path(spec_collate, t).exists()
+            chan_cached = _data.channel_ablation_npz_path(spec_collate, t).exists()
+            fully_cached = scores_cached and (not with_channel_ablation or chan_cached)
+            if not force and fully_cached:
+                log(f"[cache] specialisation {t}: reuse {_data.scores_npz_path(spec_collate, t)}"
+                    + (" (+ channel ablation)" if with_channel_ablation else ""))
                 status["specialisation"][t] = "cached"
                 continue
-            log(f"[run] specialisation scores for {t} ...")
+            log(f"[run] specialisation scores for {t} ..."
+                + (" (+ channel-split ablation)" if with_channel_ablation else ""))
             ck = _resolve_ckpt(t)
             spec_kw = dict(
                 tasks=[t], ckpt=({t: ck} if ck else None), collate_dir=spec_collate,
                 num_graphs=spec_num_graphs, donors=spec_donors,
                 with_attn_routing=with_attn_routing,
                 with_ablation=False, with_attention=False,
+                with_channel_ablation=with_channel_ablation,
+                channel_ablation_graphs=channel_ablation_graphs,
+                channel_ablation_sources=channel_ablation_sources,
+                channel_ablation_donors=channel_ablation_donors,
                 mount=False, skip_install=True,
             )
             if spec_kwargs:

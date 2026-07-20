@@ -91,6 +91,38 @@ def _log_ylim(values: np.ndarray, lo_pad: float = 0.6, hi_pad: float = 1.6):
     return (float(a.min()) * lo_pad, float(a.max()) * hi_pad)
 
 
+def _spearman(x, y) -> float:
+    """Spearman rank correlation over finite pairs (NaN if < 3 valid or a channel is constant)."""
+    x = np.asarray(x, float).reshape(-1)
+    y = np.asarray(y, float).reshape(-1)
+    ok = np.isfinite(x) & np.isfinite(y)
+    if ok.sum() < 3 or np.std(x[ok]) == 0 or np.std(y[ok]) == 0:
+        return float("nan")
+    rx = np.argsort(np.argsort(x[ok]))
+    ry = np.argsort(np.argsort(y[ok]))
+    return float(np.corrcoef(rx, ry)[0, 1])
+
+
+def _norm_scores(scores_by_task: dict, task: str, gsem: float, gstr: float):
+    """(S~_sem, S~_str) amplitude-normalised score matrices [L,H] for a task."""
+    return scores_by_task[task]["S_sem"] / gsem, scores_by_task[task]["S_str"] / gstr
+
+
+def d_rel(ssem, sstr, eps: float = 1e-9):
+    """Relative selectivity in ~[-1,1]: (S~_sem - S~_str)/(S~_sem + S~_str + eps)."""
+    return (ssem - sstr) / (ssem + sstr + eps)
+
+
+def joint_strength(ssem, sstr):
+    """Joint strength J = (S~_sem + S~_str)/2 (>=0)."""
+    return 0.5 * (ssem + sstr)
+
+
+def signed_contrast(a, b, eps: float = 1e-9):
+    """(a-b)/(|a|+|b|+eps) in [-1,1]; for a,b>=0 this is (a-b)/(a+b+eps)."""
+    return (a - b) / (np.abs(a) + np.abs(b) + eps)
+
+
 def _metric_label(metrics_by_task: Optional[dict], task: str) -> str:
     if not metrics_by_task or task not in metrics_by_task:
         return ""
@@ -496,6 +528,207 @@ def plot_performance(metrics_by_task: dict, tasks: Sequence[str], out_path,
     ax.legend()
     ax.grid(True, axis="y", alpha=0.3)
     fig.suptitle(suptitle, fontsize=12)
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=150)
+    return fig, str(out_path)
+
+
+# --------------------------------------------------------------------------------------
+# (v) D/J causal validation against the channel-split ablation (swap x ablate)
+# --------------------------------------------------------------------------------------
+
+def _Lmax(scores_by_task, tasks):
+    return max((scores_by_task[t]["S_sem"].shape[0] for t in tasks if t in scores_by_task),
+              default=1)
+
+
+def plot_DJ_ablation_validation(scores_by_task: dict, chan_by_task: dict, tasks: Sequence[str],
+                                out_path, *, gsem: Optional[float] = None,
+                                gstr: Optional[float] = None, eps: float = 1e-9,
+                                metrics_by_task: Optional[dict] = None,
+                                suptitle: Optional[str] = None):
+    """(v, central) Does score selectivity D_rel predict the causal ablation contrast?
+
+    Rows = {functional, loss} swap x ablate contrast; columns = models. Per head, x is the
+    score-derived relative selectivity D_rel, y is the ablation contrast
+    (I_sem - I_str)/(|I_sem| + |I_str|). A positive rank correlation means a head that the SCORES
+    call semantic-leaning is causally more necessary for the semantic channel (and vice versa) --
+    the independent causal validation of the D/J coordinates. Layer-coloured; Spearman rho per
+    panel. Returns (fig, path).
+    """
+    import matplotlib.pyplot as plt
+
+    tasks = [t for t in tasks if t in scores_by_task and t in chan_by_task]
+    if not tasks:
+        raise ValueError("plot_DJ_ablation_validation: need both scores and channel-ablation cache.")
+    if gsem is None or gstr is None:
+        gsem, gstr = global_norms(scores_by_task, tasks)
+    Lmax = _Lmax(scores_by_task, tasks)
+    rows = [("functional", "I_sem_func", "I_str_func"), ("loss", "I_sem_loss", "I_str_loss")]
+
+    n = len(tasks)
+    fig, axes = plt.subplots(2, n, figsize=(3.5 * n, 7.0), squeeze=False, constrained_layout=True)
+    sc = None
+    for r, (rname, ksem, kstr) in enumerate(rows):
+        for j, t in enumerate(tasks):
+            ax = axes[r][j]
+            ssem, sstr = _norm_scores(scores_by_task, t, gsem, gstr)
+            x = d_rel(ssem, sstr, eps).reshape(-1)
+            ch = chan_by_task[t]
+            if ksem not in ch or kstr not in ch:
+                ax.axis("off"); continue
+            y = signed_contrast(ch[ksem], ch[kstr], eps).reshape(-1)
+            L, H = ssem.shape
+            layer = np.repeat(np.arange(L), H)
+            ax.plot([-1, 1], [-1, 1], "k:", lw=0.8, zorder=0)
+            ax.axhline(0, color="k", lw=0.5, alpha=0.4); ax.axvline(0, color="k", lw=0.5, alpha=0.4)
+            sc = ax.scatter(x, y, c=layer, cmap="viridis", s=40, edgecolors="k",
+                            linewidths=0.35, alpha=0.9, vmin=0, vmax=Lmax - 1)
+            ax.set_xlim(-1.05, 1.05); ax.set_ylim(-1.05, 1.05)
+            rho = _spearman(x, y)
+            meta = _data.method_meta(t, j)
+            if r == 0:
+                ax.set_title(f"{meta['label']}\n{rname} contrast  ρ={rho:.2f}", fontsize=9)
+            else:
+                ax.set_title(f"{rname} contrast  ρ={rho:.2f}", fontsize=9)
+            if j == 0:
+                ax.set_ylabel(f"{rname} ablation contrast\n(I_sem−I_str)/(|I_sem|+|I_str|)")
+            if r == 1:
+                ax.set_xlabel(r"score selectivity  $D_{\rm rel}$")
+    if sc is not None:
+        cb = fig.colorbar(sc, ax=axes.ravel().tolist(), shrink=0.85, pad=0.01)
+        cb.set_label("layer")
+    fig.suptitle(suptitle or ("Central validation: score selectivity D_rel (x) vs causal "
+                              "ablation contrast (y) — functional (top) & loss (bottom)"),
+                 fontsize=12)
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=150)
+    return fig, str(out_path)
+
+
+def plot_DJ_quadrants(scores_by_task: dict, chan_by_task: dict, tasks: Sequence[str], out_path,
+                      *, gsem: Optional[float] = None, gstr: Optional[float] = None,
+                      eps: float = 1e-9, ref_tasks: Optional[Sequence[str]] = None,
+                      metrics_by_task: Optional[dict] = None, suptitle: Optional[str] = None):
+    """(v) Quadrant taxonomy on the D_rel-J plane, one panel per model, layer-coloured.
+
+    A vertical line at D_rel=0 splits semantic- vs structural-leaning; a horizontal line at the
+    reference median J splits influential vs inert. The four regions are influential semantic
+    specialists / structural specialists (top-left/right), and inert heads (bottom). Panel titles
+    carry the influence correlation rho(J, overall functional ablation impact). Returns (fig, path).
+    """
+    import matplotlib.pyplot as plt
+
+    tasks = [t for t in tasks if t in scores_by_task]
+    if not tasks:
+        raise ValueError("plot_DJ_quadrants: no cached score matrices for the given tasks.")
+    if gsem is None or gstr is None:
+        gsem, gstr = global_norms(scores_by_task, tasks)
+    lim_tasks = [t for t in (ref_tasks or list(scores_by_task.keys())) if t in scores_by_task]
+    Lmax = _Lmax(scores_by_task, lim_tasks)
+    # reference median J (inert threshold) + J axis top, fixed from the reference set
+    Jall, jmax = [], 1e-9
+    for t in lim_tasks:
+        ss, st = _norm_scores(scores_by_task, t, gsem, gstr)
+        J = joint_strength(ss, st)
+        Jall.append(J.reshape(-1)); jmax = max(jmax, float(J.max()))
+    j_thresh = float(np.median(np.concatenate(Jall))) if Jall else 0.0
+    jmax *= 1.08
+
+    n = len(tasks)
+    fig, axes = plt.subplots(1, n, figsize=(3.6 * n, 4.1), squeeze=False, constrained_layout=True)
+    sc = None
+    for j, t in enumerate(tasks):
+        ax = axes[0][j]
+        ss, st = _norm_scores(scores_by_task, t, gsem, gstr)
+        D = d_rel(ss, st, eps).reshape(-1)
+        J = joint_strength(ss, st).reshape(-1)
+        L, H = ss.shape
+        layer = np.repeat(np.arange(L), H)
+        ax.axvline(0.0, color="k", ls=":", lw=0.9)
+        ax.axhline(j_thresh, color="k", ls="--", lw=0.8, alpha=0.6)
+        sc = ax.scatter(D, J, c=layer, cmap="viridis", s=40, edgecolors="k", linewidths=0.35,
+                        alpha=0.9, vmin=0, vmax=Lmax - 1)
+        ax.set_xlim(-1.05, 1.05); ax.set_ylim(0, jmax)
+        # quadrant counts
+        infl = J >= j_thresh
+        n_sem = int(np.sum(infl & (D > 0))); n_str = int(np.sum(infl & (D < 0)))
+        n_inert = int(np.sum(~infl))
+        ax.text(0.97, 0.97, f"sem {n_sem}", transform=ax.transAxes, ha="right", va="top", fontsize=8,
+                color="#b30000")
+        ax.text(0.03, 0.97, f"str {n_str}", transform=ax.transAxes, ha="left", va="top", fontsize=8,
+                color="#00429d")
+        ax.text(0.5, 0.03, f"inert {n_inert}", transform=ax.transAxes, ha="center", va="bottom",
+                fontsize=8, color="#555555")
+        meta = _data.method_meta(t, j)
+        title = meta["label"]
+        ch = chan_by_task.get(t)
+        if ch is not None and "overall_func" in ch:
+            title += f"\ninfluence ρ(J,I)={_spearman(J, ch['overall_func'].reshape(-1)):.2f}"
+        ax.set_title(title, fontsize=9)
+        if j == 0:
+            ax.set_ylabel(r"joint strength  $J$")
+        ax.set_xlabel(r"selectivity  $D_{\rm rel}$")
+    if sc is not None:
+        cb = fig.colorbar(sc, ax=axes.ravel().tolist(), shrink=0.85, pad=0.01)
+        cb.set_label("layer")
+    fig.suptitle(suptitle or "Quadrant taxonomy: semantic/structural specialists, generalists, inert",
+                 fontsize=12)
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=150)
+    return fig, str(out_path)
+
+
+def plot_DJ_influence_strength(scores_by_task: dict, chan_by_task: dict, tasks: Sequence[str],
+                               out_path, *, gsem: Optional[float] = None,
+                               gstr: Optional[float] = None, eps: float = 1e-9,
+                               suptitle: Optional[str] = None):
+    """(v) Two pooled panels: influence (J vs overall functional ablation impact) and strength-vs-
+    specialisation (J vs |D_rel|). Heads pooled across the shown models, coloured by model, with
+    Spearman rho. Answers 'does J predict causal importance?' and 'are influential heads specialists
+    or generalists?'. Returns (fig, path)."""
+    import matplotlib.pyplot as plt
+
+    tasks = [t for t in tasks if t in scores_by_task]
+    have_chan = [t for t in tasks if t in chan_by_task and "overall_func" in chan_by_task[t]]
+    if gsem is None or gstr is None:
+        gsem, gstr = global_norms(scores_by_task, tasks)
+
+    fig, (axI, axS) = plt.subplots(1, 2, figsize=(11.5, 5.0), constrained_layout=True)
+    Jx_all, Iy_all, Jx2_all, Dy_all = [], [], [], []
+    for j, t in enumerate(tasks):
+        ss, st = _norm_scores(scores_by_task, t, gsem, gstr)
+        J = joint_strength(ss, st).reshape(-1)
+        absD = np.abs(d_rel(ss, st, eps)).reshape(-1)
+        meta = _data.method_meta(t, j)
+        col, mk, lab = meta["color"], meta["marker"], meta["label"]
+        axS.scatter(J, absD, s=28, color=col, marker=mk, alpha=0.7, edgecolors="none", label=lab)
+        Jx2_all.append(J); Dy_all.append(absD)
+        if t in have_chan:
+            I = chan_by_task[t]["overall_func"].reshape(-1)
+            axI.scatter(J, I, s=28, color=col, marker=mk, alpha=0.7, edgecolors="none", label=lab)
+            Jx_all.append(J); Iy_all.append(I)
+
+    if Jx_all:
+        rho = _spearman(np.concatenate(Jx_all), np.concatenate(Iy_all))
+        axI.set_title(f"Influence: J vs overall functional ablation impact  (pooled ρ={rho:.2f})",
+                      fontsize=10)
+    else:
+        axI.set_title("Influence: needs channel-ablation cache", fontsize=10)
+    axI.set_xlabel(r"joint strength  $J$"); axI.set_ylabel("overall functional ablation impact")
+    axI.grid(True, alpha=0.25)
+    if Jx_all:  # only when the influence panel actually has (labelled) points
+        axI.legend(fontsize=8, framealpha=0.9)
+
+    rhoS = _spearman(np.concatenate(Jx2_all), np.concatenate(Dy_all)) if Jx2_all else float("nan")
+    axS.set_title(f"Strength vs specialisation: J vs |D_rel|  (pooled ρ={rhoS:.2f})", fontsize=10)
+    axS.set_xlabel(r"joint strength  $J$"); axS.set_ylabel(r"|selectivity|  $|D_{\rm rel}|$")
+    axS.grid(True, alpha=0.25); axS.legend(fontsize=8, framealpha=0.9)
+
+    fig.suptitle(suptitle or "Head influence and strength-vs-specialisation", fontsize=12)
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path, dpi=150)

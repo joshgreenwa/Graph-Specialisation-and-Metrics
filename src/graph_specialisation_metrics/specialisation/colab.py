@@ -29,6 +29,7 @@ from ..carriage.env import log
 from ..carriage.tasks import GritTaskSpec, get_task
 from . import ablation as ablation_mod
 from . import attention_viz, figures
+from . import channel_ablation as channel_ablation_mod
 from .model import SpecConfig
 from .scores import score_model, select_heads
 
@@ -82,6 +83,12 @@ def run(
     ablation_graphs: int = 256,
     n_random_pairs: int = 300,
     n_attention_molecules: int = 5,
+    # channel-split causal ablation (I_sem/I_str, functional + loss); off by default because it
+    # is the heavy swap x ablate sweep. The cross-model D/J validation figure needs it.
+    with_channel_ablation: bool = False,
+    channel_ablation_graphs: int = 48,
+    channel_ablation_sources: int = 6,
+    channel_ablation_donors: int = 3,
     analysis_seed: int = 0,
     partner_match: str = "degree",
     # environment
@@ -180,6 +187,19 @@ def run(
         if abl is not None:
             savez_kw.update(func_mean=abl["func_mean"], loss_mean=abl["loss_mean"])
         np.savez(task_out / f"scores_{spec.name}.npz", **savez_kw)
+
+        # --- (2b) channel-split causal ablation (optional; the D/J validation figure needs it) ---
+        chan = None
+        if with_channel_ablation:
+            chan = channel_ablation_mod.run_channel_ablation(
+                result["gm"], sc, num_graphs=channel_ablation_graphs,
+                max_sources=channel_ablation_sources, donors=channel_ablation_donors,
+                seed=analysis_seed)
+            np.savez(
+                task_out / f"channel_ablation_{spec.name}.npz",
+                I_sem_func=chan["I_sem_func"], I_str_func=chan["I_str_func"],
+                I_sem_loss=chan["I_sem_loss"], I_str_loss=chan["I_str_loss"],
+                overall_func=chan["overall_func"], overall_loss=chan["overall_loss"])
         stats = {
             "title": result["title"], "test_metric": result["test_metric"],
             "test_metric_name": result["test_metric_name"],

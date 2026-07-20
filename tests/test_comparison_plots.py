@@ -67,3 +67,55 @@ def test_DJ_selectivity_sign_tracks_channel_preference():
     ssem = scores["zinc"]["S_sem"] / gsem
     sstr = scores["zinc"]["S_str"] / gstr
     assert float((0.5 * (ssem + sstr)).min()) >= 0.0
+
+
+# ---- channel-split ablation validation figures --------------------------------------
+
+def _channel_ablation(scores, gsem, gstr, seed=7):
+    rng = np.random.default_rng(seed)
+    ch = {}
+    for t in scores:
+        ss, st = scores[t]["S_sem"] / gsem, scores[t]["S_str"] / gstr
+        ch[t] = dict(
+            I_sem_func=np.abs(ss + rng.normal(0, 0.1, ss.shape)),
+            I_str_func=np.abs(st + rng.normal(0, 0.1, st.shape)),
+            I_sem_loss=(ss - st) * 0.3 + rng.normal(0, 0.1, ss.shape),
+            I_str_loss=(st - ss) * 0.3 + rng.normal(0, 0.1, st.shape),
+            overall_func=np.abs(0.5 * (ss + st) + rng.normal(0, 0.1, ss.shape)),
+            overall_loss=rng.normal(0, 0.1, ss.shape))
+    return ch
+
+
+def test_signed_contrast_and_drel_bounded():
+    rng = np.random.default_rng(0)
+    a, b = np.abs(rng.normal(size=200)), np.abs(rng.normal(size=200))
+    assert np.all(np.abs(P.signed_contrast(a, b)) <= 1.0)          # a,b>=0
+    ssem, sstr = np.abs(rng.normal(size=50)), np.abs(rng.normal(size=50))
+    assert np.all(np.abs(P.d_rel(ssem, sstr)) <= 1.0)
+
+
+def test_DJ_ablation_validation_and_summaries_render(tmp_path):
+    scores = _scores_by_task()
+    gsem, gstr = P.global_norms(scores, list(scores))
+    ch = _channel_ablation(scores, gsem, gstr)
+    _, p1 = P.plot_DJ_ablation_validation(scores, ch, list(scores), tmp_path / "val.png",
+                                          gsem=gsem, gstr=gstr)
+    _, p2 = P.plot_DJ_quadrants(scores, ch, list(scores), tmp_path / "quad.png",
+                                gsem=gsem, gstr=gstr, ref_tasks=list(scores))
+    _, p3 = P.plot_DJ_influence_strength(scores, ch, list(scores), tmp_path / "infl.png",
+                                         gsem=gsem, gstr=gstr)
+    for p in (p1, p2, p3):
+        from pathlib import Path
+        assert Path(p).stat().st_size > 0
+
+
+def test_DJ_summaries_work_without_channel_cache(tmp_path):
+    # quadrants + influence must still render (influence rho just unavailable) with no chan cache
+    scores = _scores_by_task()
+    gsem, gstr = P.global_norms(scores, list(scores))
+    _, pq = P.plot_DJ_quadrants(scores, {}, list(scores), tmp_path / "q.png",
+                                gsem=gsem, gstr=gstr, ref_tasks=list(scores))
+    _, pi = P.plot_DJ_influence_strength(scores, {}, list(scores), tmp_path / "i.png",
+                                         gsem=gsem, gstr=gstr)
+    from pathlib import Path
+    assert Path(pq).stat().st_size > 0 and Path(pi).stat().st_size > 0

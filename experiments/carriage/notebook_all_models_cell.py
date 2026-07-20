@@ -10,10 +10,14 @@ It runs, for each of the five ZINC GRIT models -- dense, 1-hop, 2-hop, 1-hop+VNo
   (1) val + test performance recomputed from the checkpoint;
   (2) functional/beneficial SEMANTIC and STRUCTURAL carriage (integrated beneficial estimator);
   (3) per-head SEMANTIC vs STRUCTURAL specialisation scores;
+  (4) OPTIONAL per-head channel-split causal ablation (swap x ablate), I_sem/I_str functional+loss;
 and CACHES all of it to Drive, then builds the deliverables:
-  (ii)  fig_spec_scatter_grid.png          -- side-by-side per-model score scatter;
+  (ii)  fig_spec_scatter_grid.png          -- side-by-side per-model score scatter (S_str vs S_sem);
+  (ii-b)fig_spec_DJ_grid.png               -- selectivity D_rel vs joint strength J per model;
   (iii) fig_carriage_smallmult_<intv>.png  -- functional/beneficial carriage, standardised y-axis;
   (iv)  fig_carriage_overlay_<intv>.png    -- functional/beneficial carriage overlaid per method;
+  (v)   fig_DJ_ablation_validation.png     -- D_rel vs the causal ablation contrast (functional &
+        loss), + fig_DJ_quadrants.png + fig_DJ_influence_strength.png (needs with_channel_ablation);
   (+)   fig_performance.png                -- val/test bars.
 
 The new 2-hop / VNode checkpoints are auto-registered from carriage.tasks; their Drive dirs are
@@ -71,9 +75,20 @@ run_all(
     skip_install=False,
     force=False,
     display=True,     # show the figures inline
+    # ---- channel-split causal ablation -> the D/J validation figure (deliverable v) ----
+    # HEAVY: L*H ablated forwards per model over intervention replicas. Set False to skip it
+    # (the score-only quadrant/influence figures still build). Scale the knobs up for tighter CIs.
+    with_channel_ablation=True,
+    channel_ablation_graphs=48,
+    channel_ablation_sources=6,
+    channel_ablation_donors=3,
 )
 
 # --- Re-draw the deliverables from cache only (no re-compute), e.g. dropping the VNode runs: ---
 # build_figures(drop_vnode=True, display=True)
 # build_figures(include=["zinc", "zinc_1hop", "zinc_2hop"], display=True)
+#
+# --- Diagnose why a model is missing from a figure (checkpoint found? which caches exist?): ---
+# from graph_specialisation_metrics.comparison import inventory
+# inventory()          # prints a per-model table: ckpt | carriage | scores | chanAbl | val/test
 # ============================ paste to here ============================
