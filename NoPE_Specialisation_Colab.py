@@ -123,10 +123,14 @@ PRIMARY  = ("nope", "positional")
 SEM_SHARP = 6.0
 
 # ---- training ----
-# 30k fits previous_token well for all depths; it is a ONE-TIME cost (every trained model is
-# cached to Drive, so later analysis runs never retrain). Raise for harder teachers; changing
-# it invalidates the model cache automatically (the config hash is in the filename).
+# Base step count (used for any depth NOT overridden below). One-time cost -- every trained model
+# is cached; changing steps for a depth invalidates ONLY that depth's cache (the per-depth step
+# count is folded into that model's config hash).
 N_STEPS      = int(os.environ.get("NOPE_STEPS", "0")) or (300 if SMOKE else 30000)
+# Per-depth OVERRIDE: deeper NoPE students need more steps to converge (fixed steps undertrains
+# them). Depths absent here use N_STEPS -- so keeping L1-L3 at N_STEPS preserves their cache while
+# only L4/L5 (new step counts -> new hash) retrain.
+STEPS_BY_DEPTH = {} if SMOKE else {4: 60000, 5: 90000}
 BATCH_SIZE   = 128 if SMOKE else 256
 LR           = 1e-3
 WEIGHT_DECAY = 0.0
@@ -164,13 +168,25 @@ def _setup_cache_dir():
 
 CACHE_DIR = _setup_cache_dir()
 
-def _config_tag():
-    """Hash of the hyperparameters that make a trained model comparable/cacheable."""
-    cfg = dict(teacher=TEACHER_TYPE, sem=f"strict_earlier_sharp{SEM_SHARP}", T=SEQ_LEN, d=D_MODEL,
-               dff=D_FF, heads=N_HEADS, steps=N_STEPS, bs=BATCH_SIZE, lr=LR, wd=WEIGHT_DECAY)
-    return hashlib.md5(json.dumps(cfg, sort_keys=True).encode()).hexdigest()[:8], cfg
+def _config_dict(steps):
+    """Hyperparameters that make a trained model comparable/cacheable (parametrised by steps)."""
+    return dict(teacher=TEACHER_TYPE, sem=f"strict_earlier_sharp{SEM_SHARP}", T=SEQ_LEN, d=D_MODEL,
+                dff=D_FF, heads=N_HEADS, steps=steps, bs=BATCH_SIZE, lr=LR, wd=WEIGHT_DECAY)
 
-CFG_TAG, CFG_DICT = _config_tag()
+def _hash_cfg(cfg):
+    return hashlib.md5(json.dumps(cfg, sort_keys=True).encode()).hexdigest()[:8]
+
+def steps_for_depth(n_layers):
+    return STEPS_BY_DEPTH.get(n_layers, N_STEPS)
+
+def model_tag(n_layers):
+    """Per-depth config hash: depths at N_STEPS share the base tag (their cache is preserved);
+    an overridden depth gets a new tag and retrains."""
+    return _hash_cfg(_config_dict(steps_for_depth(n_layers)))
+
+# Base tag (steps=N_STEPS) -- used for figure/eval filenames and by any depth not overridden.
+CFG_DICT = _config_dict(N_STEPS)
+CFG_TAG = _hash_cfg(CFG_DICT)
 
 def _eval_tag():
     cfg = dict(cfg=CFG_TAG, na=N_EVAL_ATTN, nt=N_EVAL_TRANS, R=N_PROBES, es=EVAL_SEED)
@@ -316,15 +332,16 @@ MASK = make_mask(SEQ_LEN)
 def train_student(variant, task, n_layers, seed):
     torch.manual_seed(seed)
     np.random.seed(seed)
+    steps = steps_for_depth(n_layers)
     use_rope = (variant == "rope")
     model = StudentTransformer(D_MODEL, N_HEADS, n_layers, D_FF, use_rope=use_rope).to(DEVICE, DTYPE)
     opt = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
-    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=N_STEPS)
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=steps)
     gen = torch.Generator(device=DEVICE).manual_seed(seed + 10_000)
 
     model.train()
     last = 0.0
-    for step in range(1, N_STEPS + 1):
+    for step in range(1, steps + 1):
         x = torch.randn(BATCH_SIZE, SEQ_LEN, D_MODEL, device=DEVICE, dtype=DTYPE, generator=gen)
         y_hat, _ = model(x, MASK)
         loss = F.mse_loss(y_hat, teacher_forward(x, task))
@@ -348,14 +365,16 @@ def eval_mse(model, task, n=4096):
 
 
 def model_cache_path(variant, task, n_layers, seed):
-    return os.path.join(CACHE_DIR, f"student_{variant}_{task}_L{n_layers}_seed{seed}_{CFG_TAG}.pt")
+    return os.path.join(
+        CACHE_DIR, f"student_{variant}_{task}_L{n_layers}_seed{seed}_{model_tag(n_layers)}.pt")
 
 
-def get_student(variant, task, n_layers, seed):
-    """Load from cache if present & config matches, else train and cache. Keyed by (variant,task)."""
+def get_student(variant, task, n_layers, seed, force=False):
+    """Load from cache if present & config matches, else train and cache. Keyed by (variant,task).
+    force=True (or the FORCE_RETRAIN global) ignores the cache and retrains this model."""
     path = model_cache_path(variant, task, n_layers, seed)
     tag = f"{variant}/{task} L{n_layers} seed{seed}"
-    if (not FORCE_RETRAIN) and os.path.exists(path):
+    if (not FORCE_RETRAIN) and (not force) and os.path.exists(path):
         blob = torch.load(path, map_location=DEVICE, weights_only=False)
         model = StudentTransformer(D_MODEL, N_HEADS, n_layers, D_FF,
                                    use_rope=(variant == "rope")).to(DEVICE, DTYPE)
@@ -367,10 +386,11 @@ def get_student(variant, task, n_layers, seed):
 
     model, train_mse = train_student(variant, task, n_layers, seed)
     e_mse = eval_mse(model, task)
-    torch.save({"state_dict": model.state_dict(), "config": CFG_DICT,
+    torch.save({"state_dict": model.state_dict(), "config": _config_dict(steps_for_depth(n_layers)),
                 "variant": variant, "task": task, "train_mse": train_mse, "eval_mse": e_mse,
-                "n_layers": n_layers, "seed": seed}, path)
-    print(f"[train] {tag}  train_mse={train_mse:.3e} eval_mse={e_mse:.3e}  -> cached")
+                "n_layers": n_layers, "seed": seed, "steps": steps_for_depth(n_layers)}, path)
+    print(f"[train] {tag}  steps={steps_for_depth(n_layers)} train_mse={train_mse:.3e} "
+          f"eval_mse={e_mse:.3e}  -> cached")
     model.eval()
     return model, train_mse, e_mse, False
 
@@ -554,15 +574,17 @@ def scores_transport(model):
 # ============================== 8. Score orchestration + cache ==============================
 def scores_cache_path(variant, task, n_layers, seed):
     return os.path.join(
-        CACHE_DIR, f"scores_{variant}_{task}_L{n_layers}_seed{seed}_{CFG_TAG}_{EVAL_TAG}.pt")
+        CACHE_DIR,
+        f"scores_{variant}_{task}_L{n_layers}_seed{seed}_{model_tag(n_layers)}_{EVAL_TAG}.pt")
 
 
-def compute_scores(model, variant, task, n_layers, seed):
+def compute_scores(model, variant, task, n_layers, seed, force=False):
     """All three methods for one model. Cached by (variant, task, config, eval-config). Returns:
        {method: {'x': {l:(T,)}, 'y': {l:(T,)}}} with method in {local,global,transport}.
+    force=True (or FORCE_RESCORE) ignores the score cache -- required when the model was retrained.
     """
     path = scores_cache_path(variant, task, n_layers, seed)
-    if (not FORCE_RESCORE) and os.path.exists(path):
+    if (not FORCE_RESCORE) and (not force) and os.path.exists(path):
         blob = torch.load(path, map_location="cpu", weights_only=False)
         return blob["scores"]
 
@@ -591,10 +613,15 @@ METHOD_TITLE = {
     "transport": "(3) TRANSPORT following/invariance  (readout-weighted)",
 }
 
-def run_all(families=None):
+def run_all(families=None, force_retrain_depths=None):
     """Train/score every (variant, task) family x depth x seed. Returns train_rows and
-    agg[(variant,task)][method][depth] = list over seeds of {l:(T,)} for 'x' and 'y'."""
+    agg[(variant,task)][method][depth] = list over seeds of {l:(T,)} for 'x' and 'y'.
+
+    force_retrain_depths: a collection of depths to retrain AND rescore from scratch, ignoring
+    their cache (other depths still load from cache). E.g. {4, 5} keeps L1-L3 but refreshes L4/L5.
+    """
     families = families if families is not None else FAMILIES
+    fdepths = set(force_retrain_depths or [])
     train_rows = []
     agg = {fam: {m: {L: {"x": [], "y": []} for L in DEPTHS} for m in METHOD_ORDER}
            for fam in families}
@@ -602,12 +629,14 @@ def run_all(families=None):
     for fam in families:
         variant, task = fam
         for L in DEPTHS:
+            force = L in fdepths
             for s in SEEDS:
-                model, tr_mse, ev_mse, cached = get_student(variant, task, L, s)
-                train_rows.append(dict(variant=variant, task=task, depth=L, seed=s, steps=N_STEPS,
+                model, tr_mse, ev_mse, cached = get_student(variant, task, L, s, force=force)
+                train_rows.append(dict(variant=variant, task=task, depth=L, seed=s,
+                                       steps=steps_for_depth(L),
                                        train_mse=tr_mse, eval_mse=ev_mse,
                                        source="cache" if cached else "trained"))
-                sc = compute_scores(model, variant, task, L, s)
+                sc = compute_scores(model, variant, task, L, s, force=force)
                 for m in METHOD_ORDER:
                     agg[fam][m][L]["x"].append(sc[m]["x"])
                     agg[fam][m][L]["y"].append(sc[m]["y"])
@@ -632,7 +661,7 @@ def print_training_table(train_rows):
         df = df[["variant", "task", "depth", "seed", "steps", "train_mse", "eval_mse", "source"]]
         with pd.option_context("display.float_format", lambda v: f"{v:.3e}"):
             print(df.to_string(index=False))
-        summ = (df.groupby(["variant", "task", "depth"])[["train_mse", "eval_mse"]]
+        summ = (df.groupby(["variant", "task", "depth", "steps"])[["train_mse", "eval_mse"]]
                   .mean().reset_index())
         print("\n-- mean over seeds --")
         with pd.option_context("display.float_format", lambda v: f"{v:.3e}"):
@@ -1026,10 +1055,12 @@ def make_transport_importance_figure(out_path):
 
 # %%
 # ============================== 11. Main ==============================
-def main():
-    print(f"[run  ] device={DEVICE}  depths={DEPTHS}  seeds={SEEDS}  "
-          f"cfg={CFG_TAG}  eval={EVAL_TAG}  smoke={SMOKE}")
-    train_rows, agg = run_all()
+def main(force_retrain_depths=None):
+    """force_retrain_depths: collection of depths to retrain+rescore from scratch (cache ignored),
+    keeping all other depths cached. E.g. main(force_retrain_depths={4, 5})."""
+    print(f"[run  ] device={DEVICE}  depths={DEPTHS}  seeds={SEEDS}  cfg={CFG_TAG}  eval={EVAL_TAG}"
+          f"  smoke={SMOKE}  force_retrain_depths={sorted(set(force_retrain_depths or []))}")
+    train_rows, agg = run_all(force_retrain_depths=force_retrain_depths)
     print_training_table(train_rows)
     # Primary scatter / D-J / attention figures use the PRIMARY family; faithfulness overlays all.
     agg_primary = agg[PRIMARY]

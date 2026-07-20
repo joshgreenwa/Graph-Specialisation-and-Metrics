@@ -3,6 +3,41 @@
 This folder contains controlled graph tasks for studying symbolic and structural
 attention behaviour outside ZINC.
 
+## Neighbor Associative Recall with trained GRIT support
+
+`training/nar_grit_colab.py` is the standalone Colab launcher for the centrally maintained
+implementation in `src/graph_specialisation_metrics/synthetic/nar_grit.py`. It trains
+parameter-matched, two-layer official GRITs with genuinely trained 1-hop, 2-hop, or dense
+attention support at widths 64 and 128. The capacity schedule is
+`N_train={4,8,16,32,64}`, with denser held-out evaluation at
+`N={4,8,12,16,24,32,48,64}` and three training seeds.
+
+Each graph contains an unmarked key--value record selected by a delayed query. The model must
+predict both the record's semantic value and an independent topology-defined role carried by the
+same source. The centre is one hop from every record but two hops from the query: a two-layer
+1-hop model has to compress the complete associative map before it knows which key is requested,
+whereas 2-hop and dense models can condition their second-layer record selection on the query.
+Triangle-tail and square source gadgets are degree/node/edge-count matched, making the structural
+output and structural interventions non-trivial without a task switch marker.
+
+The full run writes Drive-cached checkpoints and analysis tensors plus five PNG/PDF figure
+families: the accuracy/capacity phase diagram; the `J`--`D_rel` head plane across load; independent
+score--ablation and score-selected family causality; queried-record attention selection; and
+semantic/structural functional and beneficial carriage. CSV exports contain every plotted point.
+The exports also retain the complete intervention-factor by output response matrix and identical-
+replica transport null, so apparent selectivity can be checked against off-channel response.
+Use `--phase train`, `--phase analyze`, and `--phase figures` to separate expensive stages;
+`--fast-dev-run` checks installation and wiring only.
+
+The specialisation estimator matches the central repository Method A: official GRIT routed
+`wV`, clean readout gradients, clean/corrupt replicas in one forward, nuisance averaging before
+magnitude, and frozen trained support for structural scoring. Structural carriage instead
+conjugates RRWP and support, matching the production score/carriage distinction. The intentional
+synthetic difference is recorded in every run summary: carriage is the exact target-source output
+or cross-entropy change at the sole central readout, rather than the production multi-carrier
+integrated allocation. This keeps the causal question exact while avoiding a claim that the
+synthetic readout implements the complete real-dataset carriage estimator.
+
 ## ReachCarriageSpecialisation
 
 `training/reach_carriage_specialisation_colab.py` is a standalone, single-cell official-GRIT
