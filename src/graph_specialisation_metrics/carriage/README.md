@@ -158,7 +158,7 @@ Plus a checkpoint-load metric
 ## Reproduction
 
 - GRIT pinned to `6c988ea600a606fbb49a2246c64a2d37396b3ab5`; each task's config/params/metric are in
-  `tasks.py` (`zinc`, `zinc_1hop`, `peptides_func`, `peptides_struct`).
+  `tasks.py` (`zinc`, `zinc_1hop`, `zinc_1hop_local`, `peptides_func`, `peptides_struct`).
 - Entry point `carriage.colab.run(task=..., …)`; the notebook cells in `experiments/carriage/`
   clone this repo (via `dissertation_key`) and call it. For signed finite-loss attribution use
   `beneficial_denom="integrated"` (the argument name is retained for compatibility); available

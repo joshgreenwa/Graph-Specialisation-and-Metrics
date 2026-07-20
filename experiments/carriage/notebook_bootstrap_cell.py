@@ -10,13 +10,16 @@ notebook on its next run -- you do not edit this cell to change methodology.
 Reproduces the ZINC result with: local version installs, GRIT checkpoint loaded from Drive,
 figures written to Drive (collated under one root for all tasks).
 
-Two ZINC models share this cell -- set TASK:
-  * "zinc"       official dense GRIT+RRWP (full attention).
-  * "zinc_1hop"  parameter-matched 1-hop control. The methodology is identical (same ZINC
+Three ZINC models share this cell -- set TASK:
+  * "zinc"             official dense GRIT+RRWP (full attention).
+  * "zinc_1hop"        parameter-matched 1-hop control. The methodology is identical (same ZINC
                  scalar regression); the only difference is an env hook that applies the
                  repo's 1-hop patch to the GRIT clone (masked RRWP edge encoder,
                  sparsity=one_hop) so the checkpoint's masking is active. Its checkpoints
                  live in /content/drive/MyDrive/grit_zinc_1hop.
+  * "zinc_1hop_local"  the same 1-hop control with RRWP truncated to identity + one-step
+                 channels. It reuses the exact training patch and loads checkpoints from
+                 /content/drive/MyDrive/grit_zinc_1hop_localrrwp.
 
 To analyse a different GRIT model, register it once in src/.../carriage/tasks.py and call
 run(task="<name>"). Everything else is identical.
@@ -39,7 +42,7 @@ REPO_URL = "https://github.com/joshgreenwa/Graph-Specialisation-and-Metrics.git"
 BRANCH = "codex/cfim-grit-experiments"
 REPO_DIR = "/content/Graph-Specialisation-and-Metrics"
 SECRET_NAME = "dissertation_key"
-TASK = "zinc"          # <- set to "zinc_1hop" for the 1-hop masked control
+TASK = "zinc"          # also: "zinc_1hop", "zinc_1hop_local"
 
 from google.colab import drive, userdata  # noqa: E402
 

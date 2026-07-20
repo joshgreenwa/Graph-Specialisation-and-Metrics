@@ -18,7 +18,7 @@ Layout:
                    aggregation) -- unit-testable, no GRIT
     content.py     ContentAdapter: whole-row node-content swap (TypeDictNode and OGB Atom)
     metrics.py     per-graph task loss (l1/mse/BCE) and dataset metrics (MAE, multilabel AP)
-    tasks.py       GritTaskSpec + TASKS registry (zinc, peptides_func); add a model here
+    tasks.py       GritTaskSpec + TASKS registry (ZINC variants, Peptides); add a model here
     env.py         compat patches, deps, GRIT clone, checkpoint discovery
     peptides_env.py env hooks reusing the training code's RDKit + dataset/RRWP patches
     grit_runner.py the analysis loop + carriage-precondition checks

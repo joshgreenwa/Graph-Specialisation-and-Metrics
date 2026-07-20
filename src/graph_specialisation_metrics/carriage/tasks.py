@@ -117,6 +117,16 @@ def _onehop_hooks():
     return (hook,)
 
 
+def _onehop_localrrwp_hooks():
+    """Deferred exact reconstruction hook for the strictly local 1-hop control."""
+    from . import onehop_env
+
+    def hook(repo_dir):
+        onehop_env.apply_onehop_localrrwp_patch(repo_dir)
+
+    return (hook,)
+
+
 def _peptides_hooks():
     """Deferred so importing tasks stays torch/GRIT-free; called at run time."""
     from . import peptides_env
@@ -144,6 +154,25 @@ register(GritTaskSpec(
                                    # trained 1-hop ZINC control is well under this
     env_hooks=_onehop_hooks(),
     grit_repo_dir="/content/GRIT_zinc_1hop",  # own clone: the patch edits GRIT source
+    node_content_desc="atom type",
+))
+
+
+# Parameter-matched 1-hop ZINC control with RRWP itself truncated to local information.
+register(GritTaskSpec(
+    name="zinc_1hop_local",
+    title="GRIT+RRWP ZINC-subset (1-hop masked, local-only RRWP)",
+    # Written into the GRIT clone by the same patch function used during training.
+    config_path="configs/GRIT/zinc-GRIT-RRWP-1hop-localrrwp.yaml",
+    expected_params=473_473,       # parameter-matched to dense and standard 1-hop ZINC
+    drive_dir="/content/drive/MyDrive/grit_zinc_1hop_localrrwp",
+    paper_metric=None,             # locality-restricted control; MAE is model-dependent
+    metric_fn=staticmethod(metrics.mae_metric),
+    metric_higher_better=False,
+    metric_abort=0.6,
+    env_hooks=_onehop_localrrwp_hooks(),
+    # Separate clone: this source patch differs from both dense and standard 1-hop GRIT.
+    grit_repo_dir="/content/GRIT_zinc_1hop_localrrwp",
     node_content_desc="atom type",
 ))
 

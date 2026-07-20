@@ -3,6 +3,26 @@
 This folder contains controlled graph tasks for studying symbolic and structural
 attention behaviour outside ZINC.
 
+## CausalSpecialisationDoubleDissociation
+
+`training/causal_specialisation_double_dissociation_colab.py` is a single-cell,
+official-GRIT experiment for causal validation of the production semantic and structural
+head scores. A dense GRIT jointly learns content-key retrieval and structural
+anchor-distance classification on the same cycle graphs. It then runs planted-source
+scoring, every-head pre-output ablation, and clean-to-corrupt head-output patching.
+
+Paste the complete file into Colab and run it. The default three-seed run mounts Drive,
+pins official GRIT, caches checkpoints and analysis tensors, and writes PNG/PDF versions
+of the specialisation plane, score-ablation correlations, and necessity-plus-rescue
+double-dissociation figure. For an installation/plumbing check, change the final call to:
+
+```python
+main(["--fast-dev-run"])
+```
+
+Cached phases can be rerun independently with `--phase train`, `--phase analyze`, or
+`--phase figures`; the figures-only phase does not reinstall GRIT.
+
 ## MarkedTreePath
 
 `training/marked_tree_path_graphgps.py` trains small GraphGPS-style baselines on
