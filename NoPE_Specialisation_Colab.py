@@ -14,10 +14,16 @@ Task (from the `nope_index_retrieval` notebook + the /specialisation/ methodolog
   "positional/structural" = attention/message INVARIANT to a content swap (stays on slot);
   "semantic" = EQUIVARIANT (follows content).
 
-This script trains 3 seeds of each of the 1-, 2- and 3-layer students (caching every
-trained model to Drive so a later analysis run never retrains), prints a training-summary
-table, and draws a 3x3 grid of scatter plots -- semantic (y) vs structural/positional (x) --
-with one column per depth and one row per scoring method:
+This script trains 3 seeds of each 1-, 2- and 3-layer student across three FAMILIES (variant x
+task) -- (nope, positional), (rope, positional), (nope, semantic) -- caching every model so a
+later run never retrains, prints a training table, and draws FIVE figures: the 3x3 method x depth
+scatter and the D-J plane (both for the PRIMARY nope/positional family), the per-layer mean/std
+attention figure, a FAITHFULNESS figure vs a positional-ness oracle that overlays the families
+(the RoPE control removes the local-vs-global gap; the semantic control is a genuine content task
+where local should NOT mislabel), and a TRANSPORT-IMPORTANCE figure (lesion the final head inert
+while keeping its attention pattern: global-attention score unchanged, transport J -> 0).
+
+The 3x3 scatter has one column per depth and one row per scoring method:
 
   Row 1  METHOD (1) LOCAL  : content swap at each head's OWN residual-stream input, score the
                              attention response (cosine following/invariance), alpha-weighted.
@@ -70,6 +76,7 @@ the NET transport change is the POSITIONAL signal, not the semantic one.
 # %%
 # ============================== 0. Config ==============================
 import os
+import copy
 import math
 import json
 import hashlib
@@ -100,11 +107,26 @@ N_HEADS      = 1                     # "each layer just a single head"
 DEPTHS       = [1, 2, 3]             # 1-, 2-, 3-layer students
 SEEDS        = [0, 1] if SMOKE else [0, 1, 2]
 
+# ---- experiment families: (variant, task) ----
+#   variant "nope" = no positional encoding (position must be CONSTRUCTED in-stream over depth);
+#           "rope" = rotary PE (position injected explicitly every layer -> faithful at any depth,
+#                    the control that attributes the local-vs-global gap to in-stream construction).
+#   task    "positional" = Y = P X (fixed positional teacher);
+#           "semantic"   = content self-attention teacher (routing depends on content, not slot).
+# The scatter / D-J / attention figures use PRIMARY; the faithfulness figure overlays all families.
+FAMILIES = [("nope", "positional"), ("rope", "positional"), ("nope", "semantic")]
+PRIMARY  = ("nope", "positional")
+
+# Sharpness of the SEMANTIC teacher's content routing. Raw logits are ~unit-variance -> a nearly
+# uniform (positional-averaging) softmax; SEM_SHARP>1 concentrates routing on the best-matching
+# earlier token so the operation is genuinely CONTENT-selective (high attention variance).
+SEM_SHARP = 6.0
+
 # ---- training ----
 # 30k fits previous_token well for all depths; it is a ONE-TIME cost (every trained model is
 # cached to Drive, so later analysis runs never retrain). Raise for harder teachers; changing
 # it invalidates the model cache automatically (the config hash is in the filename).
-N_STEPS      = 300 if SMOKE else 30000
+N_STEPS      = int(os.environ.get("NOPE_STEPS", "0")) or (300 if SMOKE else 30000)
 BATCH_SIZE   = 128 if SMOKE else 256
 LR           = 1e-3
 WEIGHT_DECAY = 0.0
@@ -144,8 +166,8 @@ CACHE_DIR = _setup_cache_dir()
 
 def _config_tag():
     """Hash of the hyperparameters that make a trained model comparable/cacheable."""
-    cfg = dict(teacher=TEACHER_TYPE, T=SEQ_LEN, d=D_MODEL, dff=D_FF, heads=N_HEADS,
-               steps=N_STEPS, bs=BATCH_SIZE, lr=LR, wd=WEIGHT_DECAY)
+    cfg = dict(teacher=TEACHER_TYPE, sem=f"strict_earlier_sharp{SEM_SHARP}", T=SEQ_LEN, d=D_MODEL,
+               dff=D_FF, heads=N_HEADS, steps=N_STEPS, bs=BATCH_SIZE, lr=LR, wd=WEIGHT_DECAY)
     return hashlib.md5(json.dumps(cfg, sort_keys=True).encode()).hexdigest()[:8], cfg
 
 CFG_TAG, CFG_DICT = _config_tag()
@@ -179,19 +201,56 @@ def make_teacher_pattern(seq_len, pattern_type):
 
 TEACHER_P = make_teacher_pattern(SEQ_LEN, TEACHER_TYPE).to(DEVICE, DTYPE)
 
-def teacher_forward(x):
-    """x:(B,T,D) -> Y=P X:(B,T,D)."""
-    return torch.einsum("qk,bkd->bqd", TEACHER_P, x)
+# Fixed query-key map for the SEMANTIC teacher (content self-attention). Shared across all
+# models/seeds so the semantic task is identical everywhere; random so it is a non-trivial
+# content routing (not a copy-self identity).
+_sem_gen = torch.Generator().manual_seed(1234)
+TEACHER_W = (torch.randn(D_MODEL, D_MODEL, generator=_sem_gen) / (D_MODEL ** 0.5)).to(DEVICE, DTYPE)
+# Semantic teacher attends to STRICTLY EARLIER tokens (self excluded), so the target is a
+# content-selected *other* token and cannot be solved by identity/copy -> the student must learn
+# a genuine content-routing head. q=0 has no earlier token, so it attends to itself.
+_SEM_MASK = torch.triu(torch.ones(SEQ_LEN, SEQ_LEN, device=DEVICE), diagonal=0).bool()  # masks k>=q
+_SEM_MASK[0, 0] = False
+
+def teacher_forward(x, task="positional"):
+    """x:(B,T,D) -> teacher target Y:(B,T,D).
+
+    positional: Y = P X  (routing by SLOT; equivariant<->invariant flips are positional).
+    semantic  : Y[q] = sum_{k<q} softmax_k(SEM_SHARP*(x[q] W).x[k]) x[k]  (CONTENT routing, self excl).
+    """
+    if task == "positional":
+        return torch.einsum("qk,bkd->bqd", TEACHER_P, x)
+    if task == "semantic":
+        logits = SEM_SHARP * torch.einsum("bqd,bkd->bqk", x @ TEACHER_W, x) / (D_MODEL ** 0.5)
+        logits = logits.masked_fill(_SEM_MASK.unsqueeze(0), float("-inf"))
+        A = torch.softmax(logits, dim=-1)
+        return torch.einsum("bqk,bkd->bqd", A, x)
+    raise ValueError(f"Unknown task: {task}")
 
 
 # %%
 # ============================== 3. Student model ==============================
+def _apply_rope(x):
+    """Rotary positional encoding by ABSOLUTE slot index. x:(B,H,T,hd), hd even. Position enters
+    Q/K explicitly here (not via content), so a RoPE head can be positional at any layer."""
+    B, H, T, hd = x.shape
+    half = hd // 2
+    inv_freq = 1.0 / (10000 ** (torch.arange(0, hd, 2, device=x.device, dtype=x.dtype) / hd))
+    t = torch.arange(T, device=x.device, dtype=x.dtype)
+    freqs = torch.outer(t, inv_freq)                       # (T, half)
+    cos = torch.cat([freqs.cos(), freqs.cos()], dim=-1)[None, None]   # (1,1,T,hd)
+    sin = torch.cat([freqs.sin(), freqs.sin()], dim=-1)[None, None]
+    rot = torch.cat([-x[..., half:], x[..., :half]], dim=-1)
+    return x * cos + rot * sin
+
+
 class CausalAttention(nn.Module):
-    def __init__(self, d_model, n_heads):
+    def __init__(self, d_model, n_heads, use_rope=False):
         super().__init__()
         assert d_model % n_heads == 0
         self.n_heads = n_heads
         self.head_dim = d_model // n_heads
+        self.use_rope = use_rope
         self.qkv = nn.Linear(d_model, 3 * d_model, bias=False)
         self.out = nn.Linear(d_model, d_model, bias=False)
 
@@ -199,6 +258,8 @@ class CausalAttention(nn.Module):
         B, T, D = x.shape
         qkv = self.qkv(x).reshape(B, T, 3, self.n_heads, self.head_dim).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]                    # (B,H,T,hd)
+        if self.use_rope:
+            q, k = _apply_rope(q), _apply_rope(k)          # position injected explicitly (not V)
         scale = self.head_dim ** 0.5
         logits = (q @ k.transpose(-2, -1)) / scale         # (B,H,T,T)
         logits = logits.masked_fill(mask, float("-inf"))
@@ -211,10 +272,10 @@ class CausalAttention(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, d_model, n_heads, d_ff):
+    def __init__(self, d_model, n_heads, d_ff, use_rope=False):
         super().__init__()
         self.ln1 = nn.LayerNorm(d_model)
-        self.attn = CausalAttention(d_model, n_heads)
+        self.attn = CausalAttention(d_model, n_heads, use_rope=use_rope)
         self.ln2 = nn.LayerNorm(d_model)
         self.ff = nn.Sequential(nn.Linear(d_model, d_ff), nn.GELU(), nn.Linear(d_ff, d_model))
 
@@ -226,11 +287,12 @@ class TransformerBlock(nn.Module):
 
 
 class StudentTransformer(nn.Module):
-    """Minimal NoPE causal transformer. Prediction = ln_f(h) (matches the teacher's D-vector)."""
-    def __init__(self, d_model, n_heads, n_layers, d_ff):
+    """Minimal causal transformer (NoPE or RoPE). Prediction = ln_f(h) (teacher's D-vector)."""
+    def __init__(self, d_model, n_heads, n_layers, d_ff, use_rope=False):
         super().__init__()
         self.n_layers = n_layers
-        self.blocks = nn.ModuleList([TransformerBlock(d_model, n_heads, d_ff)
+        self.use_rope = use_rope
+        self.blocks = nn.ModuleList([TransformerBlock(d_model, n_heads, d_ff, use_rope=use_rope)
                                      for _ in range(n_layers)])
         self.ln_f = nn.LayerNorm(d_model)
 
@@ -251,10 +313,11 @@ MASK = make_mask(SEQ_LEN)
 
 # %%
 # ============================== 4. Train / load ==============================
-def train_student(n_layers, seed):
+def train_student(variant, task, n_layers, seed):
     torch.manual_seed(seed)
     np.random.seed(seed)
-    model = StudentTransformer(D_MODEL, N_HEADS, n_layers, D_FF).to(DEVICE, DTYPE)
+    use_rope = (variant == "rope")
+    model = StudentTransformer(D_MODEL, N_HEADS, n_layers, D_FF, use_rope=use_rope).to(DEVICE, DTYPE)
     opt = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=N_STEPS)
     gen = torch.Generator(device=DEVICE).manual_seed(seed + 10_000)
@@ -264,14 +327,14 @@ def train_student(n_layers, seed):
     for step in range(1, N_STEPS + 1):
         x = torch.randn(BATCH_SIZE, SEQ_LEN, D_MODEL, device=DEVICE, dtype=DTYPE, generator=gen)
         y_hat, _ = model(x, MASK)
-        loss = F.mse_loss(y_hat, teacher_forward(x))
+        loss = F.mse_loss(y_hat, teacher_forward(x, task))
         opt.zero_grad(); loss.backward(); opt.step(); sched.step()
         last = loss.item()
     return model, last
 
 
 @torch.no_grad()
-def eval_mse(model, n=4096):
+def eval_mse(model, task, n=4096):
     model.eval()
     gen = torch.Generator(device=DEVICE).manual_seed(EVAL_SEED)
     tot, cnt = 0.0, 0
@@ -279,34 +342,35 @@ def eval_mse(model, n=4096):
         bs = min(BATCH_SIZE, n - start)
         x = torch.randn(bs, SEQ_LEN, D_MODEL, device=DEVICE, dtype=DTYPE, generator=gen)
         y_hat, _ = model(x, MASK)
-        tot += F.mse_loss(y_hat, teacher_forward(x), reduction="sum").item()
+        tot += F.mse_loss(y_hat, teacher_forward(x, task), reduction="sum").item()
         cnt += bs * SEQ_LEN * D_MODEL
     return tot / cnt
 
 
-def model_cache_path(n_layers, seed):
-    return os.path.join(CACHE_DIR, f"student_L{n_layers}_seed{seed}_{CFG_TAG}.pt")
+def model_cache_path(variant, task, n_layers, seed):
+    return os.path.join(CACHE_DIR, f"student_{variant}_{task}_L{n_layers}_seed{seed}_{CFG_TAG}.pt")
 
 
-def get_student(n_layers, seed):
-    """Load from cache if present & config matches, else train and cache."""
-    path = model_cache_path(n_layers, seed)
+def get_student(variant, task, n_layers, seed):
+    """Load from cache if present & config matches, else train and cache. Keyed by (variant,task)."""
+    path = model_cache_path(variant, task, n_layers, seed)
+    tag = f"{variant}/{task} L{n_layers} seed{seed}"
     if (not FORCE_RETRAIN) and os.path.exists(path):
         blob = torch.load(path, map_location=DEVICE, weights_only=False)
-        model = StudentTransformer(D_MODEL, N_HEADS, n_layers, D_FF).to(DEVICE, DTYPE)
+        model = StudentTransformer(D_MODEL, N_HEADS, n_layers, D_FF,
+                                   use_rope=(variant == "rope")).to(DEVICE, DTYPE)
         model.load_state_dict(blob["state_dict"])
         model.eval()
-        print(f"[load ] L{n_layers} seed{seed}  train_mse={blob['train_mse']:.3e} "
+        print(f"[load ] {tag}  train_mse={blob['train_mse']:.3e} "
               f"eval_mse={blob['eval_mse']:.3e}  (cached)")
         return model, blob["train_mse"], blob["eval_mse"], True
 
-    model, train_mse = train_student(n_layers, seed)
-    e_mse = eval_mse(model)
+    model, train_mse = train_student(variant, task, n_layers, seed)
+    e_mse = eval_mse(model, task)
     torch.save({"state_dict": model.state_dict(), "config": CFG_DICT,
-                "train_mse": train_mse, "eval_mse": e_mse,
+                "variant": variant, "task": task, "train_mse": train_mse, "eval_mse": e_mse,
                 "n_layers": n_layers, "seed": seed}, path)
-    print(f"[train] L{n_layers} seed{seed}  train_mse={train_mse:.3e} "
-          f"eval_mse={e_mse:.3e}  -> cached")
+    print(f"[train] {tag}  train_mse={train_mse:.3e} eval_mse={e_mse:.3e}  -> cached")
     model.eval()
     return model, train_mse, e_mse, False
 
@@ -488,15 +552,16 @@ def scores_transport(model):
 
 # %%
 # ============================== 8. Score orchestration + cache ==============================
-def scores_cache_path(n_layers, seed):
-    return os.path.join(CACHE_DIR, f"scores_L{n_layers}_seed{seed}_{CFG_TAG}_{EVAL_TAG}.pt")
+def scores_cache_path(variant, task, n_layers, seed):
+    return os.path.join(
+        CACHE_DIR, f"scores_{variant}_{task}_L{n_layers}_seed{seed}_{CFG_TAG}_{EVAL_TAG}.pt")
 
 
-def compute_scores(model, n_layers, seed):
-    """All three methods for one model. Cached by (config, eval-config). Returns a dict:
-       {method: {'pos': {l:(T,)}, 'sym': {l:(T,)}}} with method in {local,global,transport}.
+def compute_scores(model, variant, task, n_layers, seed):
+    """All three methods for one model. Cached by (variant, task, config, eval-config). Returns:
+       {method: {'x': {l:(T,)}, 'y': {l:(T,)}}} with method in {local,global,transport}.
     """
-    path = scores_cache_path(n_layers, seed)
+    path = scores_cache_path(variant, task, n_layers, seed)
     if (not FORCE_RESCORE) and os.path.exists(path):
         blob = torch.load(path, map_location="cpu", weights_only=False)
         return blob["scores"]
@@ -526,21 +591,26 @@ METHOD_TITLE = {
     "transport": "(3) TRANSPORT following/invariance  (readout-weighted)",
 }
 
-def run_all():
+def run_all(families=None):
+    """Train/score every (variant, task) family x depth x seed. Returns train_rows and
+    agg[(variant,task)][method][depth] = list over seeds of {l:(T,)} for 'x' and 'y'."""
+    families = families if families is not None else FAMILIES
     train_rows = []
-    # scores_by[method][depth] -> list over seeds of dict{l:(T,)} for x and y
-    agg = {m: {L: {"x": [], "y": []} for L in DEPTHS} for m in METHOD_ORDER}
+    agg = {fam: {m: {L: {"x": [], "y": []} for L in DEPTHS} for m in METHOD_ORDER}
+           for fam in families}
 
-    for L in DEPTHS:
-        for s in SEEDS:
-            model, tr_mse, ev_mse, cached = get_student(L, s)
-            train_rows.append(dict(depth=L, seed=s, steps=N_STEPS,
-                                   train_mse=tr_mse, eval_mse=ev_mse,
-                                   source="cache" if cached else "trained"))
-            sc = compute_scores(model, L, s)
-            for m in METHOD_ORDER:
-                agg[m][L]["x"].append(sc[m]["x"])
-                agg[m][L]["y"].append(sc[m]["y"])
+    for fam in families:
+        variant, task = fam
+        for L in DEPTHS:
+            for s in SEEDS:
+                model, tr_mse, ev_mse, cached = get_student(variant, task, L, s)
+                train_rows.append(dict(variant=variant, task=task, depth=L, seed=s, steps=N_STEPS,
+                                       train_mse=tr_mse, eval_mse=ev_mse,
+                                       source="cache" if cached else "trained"))
+                sc = compute_scores(model, variant, task, L, s)
+                for m in METHOD_ORDER:
+                    agg[fam][m][L]["x"].append(sc[m]["x"])
+                    agg[fam][m][L]["y"].append(sc[m]["y"])
     return train_rows, agg
 
 
@@ -559,19 +629,19 @@ def print_training_table(train_rows):
     print("\n================= TRAINING SUMMARY =================")
     if _HAVE_PANDAS:
         df = pd.DataFrame(train_rows)
-        df = df[["depth", "seed", "steps", "train_mse", "eval_mse", "source"]]
+        df = df[["variant", "task", "depth", "seed", "steps", "train_mse", "eval_mse", "source"]]
         with pd.option_context("display.float_format", lambda v: f"{v:.3e}"):
             print(df.to_string(index=False))
-        summ = (df.groupby("depth")[["train_mse", "eval_mse"]]
+        summ = (df.groupby(["variant", "task", "depth"])[["train_mse", "eval_mse"]]
                   .mean().reset_index())
         print("\n-- mean over seeds --")
         with pd.option_context("display.float_format", lambda v: f"{v:.3e}"):
             print(summ.to_string(index=False))
     else:  # pragma: no cover
-        print(f"{'depth':>5} {'seed':>4} {'steps':>7} {'train_mse':>12} {'eval_mse':>12} {'src':>8}")
+        print(f"{'variant':>8} {'task':>11} {'depth':>5} {'seed':>4} {'train_mse':>12} {'eval_mse':>12}")
         for r in train_rows:
-            print(f"{r['depth']:>5} {r['seed']:>4} {r['steps']:>7} "
-                  f"{r['train_mse']:>12.3e} {r['eval_mse']:>12.3e} {r['source']:>8}")
+            print(f"{r['variant']:>8} {r['task']:>11} {r['depth']:>5} {r['seed']:>4} "
+                  f"{r['train_mse']:>12.3e} {r['eval_mse']:>12.3e}")
     print("===================================================\n")
 
 
@@ -709,7 +779,7 @@ def make_jd_figure(agg, out_path):
     return fig
 
 
-def make_attention_figure(depth=None, seed=None, out_path=None):
+def make_attention_figure(depth=None, seed=None, family=None, out_path=None):
     """Per-layer MEAN and STD of attention across random inputs, for one model.
 
     A 2 x n_layers grid: row 1 = mean attention A[q,k] (positional if input-invariant),
@@ -718,7 +788,8 @@ def make_attention_figure(depth=None, seed=None, out_path=None):
     """
     depth = depth if depth is not None else ATTN_VIZ_DEPTH
     seed = seed if seed is not None else (ATTN_VIZ_SEED if ATTN_VIZ_SEED is not None else SEEDS[0])
-    model, *_ = get_student(depth, seed)
+    variant, task = family if family is not None else PRIMARY
+    model, *_ = get_student(variant, task, depth, seed)
     x = eval_inputs(N_EVAL_ATTN)
     A = forward_capture(model, x, grad=False)["A"]         # list of (B,H,T,T), H=1
     means = [a[:, 0].mean(0).cpu().numpy() for a in A]     # (T,T) per layer
@@ -739,14 +810,213 @@ def make_attention_figure(depth=None, seed=None, out_path=None):
         ax.set_xlabel("key pos"); ax.set_ylabel("query pos" if l == 0 else "")
         plt.colorbar(im, ax=ax, shrink=0.8)
 
-    fig.suptitle(f"NoPE {depth}-layer student (seed {seed}): attention mean & std across "
-                 f"{N_EVAL_ATTN} inputs\nlow std across inputs = positional (content-invariant) "
-                 "attention",
+    fig.suptitle(f"{variant}/{task} {depth}-layer student (seed {seed}): attention mean & std "
+                 f"across {N_EVAL_ATTN} inputs\nlow std across inputs = positional "
+                 "(content-invariant) attention",
                  fontsize=13, y=1.01)
     fig.tight_layout(rect=[0, 0, 1, 0.99])
     if out_path:
         fig.savefig(out_path, dpi=140, bbox_inches="tight")
         print(f"[fig  ] saved {out_path}")
+    try:
+        plt.show()
+    except Exception:
+        pass
+    return fig
+
+
+def compute_oracle(variant, task, depth, seeds=None):
+    """Ground-truth positional-ness per (layer, query): high = attention is content-INVARIANT
+    across random inputs (low std) = positional. Independent of the swap-based scores. Seed-avg.
+    Returns {l: (T,)} in [0, 1]. Normalised by a GLOBAL std ceiling so it is comparable across
+    families (a semantic model has genuinely high std -> low positional fraction).
+    """
+    seeds = seeds if seeds is not None else SEEDS
+    per = []
+    for s in seeds:
+        model, *_ = get_student(variant, task, depth, s)
+        A = forward_capture(model, eval_inputs(N_EVAL_ATTN), grad=False)["A"]
+        stds = {}
+        for l, a in enumerate(A):
+            sqk = a[:, 0].std(0).cpu().numpy()                       # (T,T) std across inputs
+            stds[l] = np.array([sqk[q, :q + 1].mean() for q in range(SEQ_LEN)])  # avg over visible keys
+        per.append(stds)
+    std_avg = {l: np.mean([per[i][l] for i in range(len(seeds))], axis=0) for l in range(depth)}
+    # Ceiling = std of a maximally content-dependent (uniform-random) attention row, so the
+    # positional fraction is absolute (comparable across positional vs semantic families).
+    ceil = 1.0 / np.sqrt(12.0)
+    return {l: np.clip(1.0 - std_avg[l] / ceil, 0.0, 1.0) for l in range(depth)}
+
+
+def _pos_fraction_byq(x_by_l, y_by_l):
+    """Per (layer): positional fraction per query = structural / (structural + semantic) in [0,1]."""
+    out = {}
+    for l in x_by_l:
+        xc = np.clip(x_by_l[l], 0, None); yc = np.clip(y_by_l[l], 0, None)
+        out[l] = xc / (xc + yc + 1e-8)
+    return out
+
+
+def _final_pf_curve(agg, fam, method, depths):
+    """Final-layer positional fraction vs depth for one (family, method)."""
+    ys = []
+    for L in depths:
+        pf = _pos_fraction_byq(seed_mean_points(agg[fam][method][L]["x"]),
+                               seed_mean_points(agg[fam][method][L]["y"]))
+        ys.append(float(np.mean(pf[L - 1])))
+    return ys
+
+
+def _oracle_final_curve(fam, depths):
+    return [float(np.mean(compute_oracle(fam[0], fam[1], L)[L - 1])) for L in depths]
+
+
+def make_faithfulness_figure(agg, out_path):
+    """Is each method FAITHFUL to a ground-truth positional-ness oracle (attention std across
+    inputs)? Up to three panels, built from whichever families were trained:
+
+      A RoPE control   : final-layer positional fraction vs depth, LOCAL method, NoPE vs RoPE
+                         (+ oracles). The NoPE local curve falls with depth (position constructed
+                         in-stream, then mislabelled); RoPE tracks its oracle (position explicit).
+      B semantic ctrl  : final-layer positional fraction vs depth, LOCAL method, NoPE positional
+                         vs NoPE semantic (+ oracles). Local diverges from the oracle only on the
+                         positional task; on the semantic task it tracks it -> local is wrong
+                         SPECIFICALLY when position is constructed in-stream.
+      C localisation   : positional fraction per layer for the primary deepest model, all three
+                         methods vs oracle -> global & transport track the oracle, local dips at
+                         the late layers.
+    """
+    depths = sorted(DEPTHS)
+    fams = list(agg.keys())
+    panels = []
+    if ("nope", "positional") in fams and ("rope", "positional") in fams:
+        panels.append("rope")
+    if ("nope", "positional") in fams and ("nope", "semantic") in fams:
+        panels.append("semantic")
+    if PRIMARY in fams:
+        panels.append("localise")
+    if not panels:
+        panels = ["localise"]
+
+    fig, axes = plt.subplots(1, len(panels), figsize=(6.2 * len(panels), 5.2), squeeze=False)
+    axes = axes[0]
+    mcol = {"local": "#d62728", "global": "#1f77b4", "transport": "#2ca02c"}
+
+    for ax, panel in zip(axes, panels):
+        if panel == "rope":
+            fam_n, fam_r = ("nope", "positional"), ("rope", "positional")
+            ax.plot(depths, _final_pf_curve(agg, fam_n, "local", depths), "o-",
+                    color="#d62728", label="NoPE local")
+            ax.plot(depths, _oracle_final_curve(fam_n, depths), "^--", color="#d62728",
+                    alpha=0.6, label="NoPE oracle")
+            ax.plot(depths, _final_pf_curve(agg, fam_r, "local", depths), "o-",
+                    color="#1f77b4", label="RoPE local")
+            ax.plot(depths, _oracle_final_curve(fam_r, depths), "^--", color="#1f77b4",
+                    alpha=0.6, label="RoPE oracle")
+            ax.set_title("(A) RoPE control\nlocal mislabels only when position is in-stream")
+            ax.set_xlabel("student depth L"); ax.set_xticks(depths)
+        elif panel == "semantic":
+            fam_p, fam_s = ("nope", "positional"), ("nope", "semantic")
+            ax.plot(depths, _final_pf_curve(agg, fam_p, "local", depths), "o-",
+                    color="#d62728", label="positional local")
+            ax.plot(depths, _oracle_final_curve(fam_p, depths), "^--", color="#d62728",
+                    alpha=0.6, label="positional oracle")
+            ax.plot(depths, _final_pf_curve(agg, fam_s, "local", depths), "o-",
+                    color="#9467bd", label="semantic local")
+            ax.plot(depths, _oracle_final_curve(fam_s, depths), "^--", color="#9467bd",
+                    alpha=0.6, label="semantic oracle")
+            ax.set_title("(B) semantic control\nlocal is wrong only on the positional task")
+            ax.set_xlabel("student depth L"); ax.set_xticks(depths)
+        else:  # localise
+            Ld = depths[-1]
+            for m in METHOD_ORDER:
+                ys = [float(np.mean(_pos_fraction_byq(
+                    seed_mean_points(agg[PRIMARY][m][Ld]["x"]),
+                    seed_mean_points(agg[PRIMARY][m][Ld]["y"]))[l])) for l in range(Ld)]
+                ax.plot(range(Ld), ys, "o-", color=mcol[m], label=m)
+            orc = compute_oracle(PRIMARY[0], PRIMARY[1], Ld)
+            ax.plot(range(Ld), [float(np.mean(orc[l])) for l in range(Ld)], "k^--", label="oracle")
+            ax.set_title(f"(C) {PRIMARY[0]}/{PRIMARY[1]} L{Ld}: per-layer\nlocal dips at late layers")
+            ax.set_xlabel("layer"); ax.set_xticks(range(Ld))
+        ax.axhline(0.5, color="gray", lw=0.6, ls=":")
+        ax.set_ylabel("positional fraction  (1 = positional)")
+        ax.set_ylim(-0.02, 1.02); ax.legend(fontsize=8)
+
+    fig.suptitle("Faithfulness to a positional-ness oracle: local attention mislabels position "
+                 "constructed in-stream; global & transport stay faithful\n"
+                 f"T={SEQ_LEN}, d={D_MODEL}, {len(SEEDS)} seeds",
+                 fontsize=12, y=1.02)
+    fig.tight_layout(rect=[0, 0, 1, 0.98])
+    fig.savefig(out_path, dpi=140, bbox_inches="tight")
+    print(f"[fig  ] saved {out_path}")
+    try:
+        plt.show()
+    except Exception:
+        pass
+    return fig
+
+
+def _lesion_final_head(model, kind):
+    """Return a copy of `model` with its FINAL layer's single head made causally inert while its
+    attention PATTERN is preserved: 'outproj0' zeros the output projection; 'value0' zeros V."""
+    m = copy.deepcopy(model)
+    attn = m.blocks[m.n_layers - 1].attn
+    if kind == "outproj0":
+        attn.out.weight.data.zero_()                        # delivered message never reaches ŷ
+    elif kind == "value0":
+        attn.qkv.weight.data[2 * D_MODEL:3 * D_MODEL].zero_()   # V=0 -> message is 0
+    else:
+        raise ValueError(kind)
+    return m
+
+
+def _final_head_scores(model):
+    """(global-attention positional score, transport strength J) for the final-layer head."""
+    L = model.n_layers - 1
+    gpos, _ = scores_attention(model, "global")
+    S_sem, S_str = scores_transport(model)
+    attn_pos = float(np.mean(gpos[L]))
+    J = float(np.mean((S_str[L] + S_sem[L]) / 2.0))
+    return attn_pos, J
+
+
+def make_transport_importance_figure(out_path):
+    """Why transport, not (even global) attention: attention scores a head by what it SELECTS,
+    so it cannot tell a load-bearing positional head from a causally inert one. Lesion the final
+    head to be inert while keeping its attention pattern -> the global-attention positional score
+    is unchanged, but the transport strength J collapses to ~0.
+    """
+    variant, task = PRIMARY
+    Ld = DEPTHS[-1]
+    model, *_ = get_student(variant, task, Ld, SEEDS[0])
+    cases = [("intact", model),
+             ("out_proj → 0\n(inert)", _lesion_final_head(model, "outproj0")),
+             ("V → 0\n(inert)", _lesion_final_head(model, "value0"))]
+    attn_vals, J_vals = [], []
+    for _, mdl in cases:
+        ap, J = _final_head_scores(mdl)
+        attn_vals.append(ap); J_vals.append(J)
+    a0 = attn_vals[0] if abs(attn_vals[0]) > 1e-8 else 1.0
+    j0 = J_vals[0] if abs(J_vals[0]) > 1e-8 else 1.0
+    attn_r = [a / a0 for a in attn_vals]
+    J_r = [j / j0 for j in J_vals]
+
+    fig, ax = plt.subplots(figsize=(8.2, 5))
+    xs = np.arange(len(cases)); w = 0.38
+    b1 = ax.bar(xs - w / 2, attn_r, w, color="#1f77b4", label="global ATTENTION positional score")
+    b2 = ax.bar(xs + w / 2, J_r, w, color="#2ca02c", label="TRANSPORT strength  J")
+    for b in list(b1) + list(b2):
+        ax.text(b.get_x() + b.get_width() / 2, b.get_height() + 0.02, f"{b.get_height():.2f}",
+                ha="center", va="bottom", fontsize=8)
+    ax.axhline(1.0, color="gray", lw=0.6, ls=":")
+    ax.set_xticks(xs); ax.set_xticklabels([c[0] for c in cases])
+    ax.set_ylabel("score (relative to the intact head)")
+    ax.set_title(f"Why transport, not attention — final head of the {variant}/{task} L{Ld} model\n"
+                 "attention scores an inert head as unchanged; transport J collapses to ~0")
+    ax.legend(fontsize=9, loc="upper right")
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=140, bbox_inches="tight")
+    print(f"[fig  ] saved {out_path}")
     try:
         plt.show()
     except Exception:
@@ -761,10 +1031,16 @@ def main():
           f"cfg={CFG_TAG}  eval={EVAL_TAG}  smoke={SMOKE}")
     train_rows, agg = run_all()
     print_training_table(train_rows)
+    # Primary scatter / D-J / attention figures use the PRIMARY family; faithfulness overlays all.
+    agg_primary = agg[PRIMARY]
     scatter_path = os.path.join(CACHE_DIR, f"fig_specialisation_scatter_{CFG_TAG}_{EVAL_TAG}.png")
     jd_path = os.path.join(CACHE_DIR, f"fig_specialisation_JDplane_{CFG_TAG}_{EVAL_TAG}.png")
-    make_figure(agg, scatter_path)
-    make_jd_figure(agg, jd_path)
+    make_figure(agg_primary, scatter_path)
+    make_jd_figure(agg_primary, jd_path)
+    faith_path = os.path.join(CACHE_DIR, f"fig_faithfulness_{CFG_TAG}_{EVAL_TAG}.png")
+    make_faithfulness_figure(agg, faith_path)
+    tr_imp_path = os.path.join(CACHE_DIR, f"fig_transport_importance_{CFG_TAG}_{EVAL_TAG}.png")
+    make_transport_importance_figure(tr_imp_path)
     if ATTN_VIZ_DEPTH is not None:
         if ATTN_VIZ_DEPTH in DEPTHS:
             attn_path = os.path.join(CACHE_DIR,
