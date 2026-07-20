@@ -129,11 +129,11 @@ SEM_SHARP = 6.0
 # Base step count (used for any depth NOT overridden below). One-time cost -- every trained model
 # is cached; changing steps for a depth invalidates ONLY that depth's cache (the per-depth step
 # count is folded into that model's config hash).
-N_STEPS      = int(os.environ.get("NOPE_STEPS", "0")) or (300 if SMOKE else 30000)
+N_STEPS      = int(os.environ.get("NOPE_STEPS", "0")) or (300 if SMOKE else 20000)
 # Per-depth OVERRIDE: deeper NoPE students need more steps to converge (fixed steps undertrains
 # them). Depths absent here use N_STEPS -- so keeping L1-L3 at N_STEPS preserves their cache while
-# only L4/L5 (new step counts -> new hash) retrain.
-STEPS_BY_DEPTH = {} if SMOKE else {4: 60000, 5: 90000}
+# only L4/L5 (new step counts -> new hash) retrain. Bump these if the MSE table shows L4/L5 high.
+STEPS_BY_DEPTH = {} if SMOKE else {4: 30000, 5: 45000}
 BATCH_SIZE   = 128 if SMOKE else 256
 LR           = 1e-3
 WEIGHT_DECAY = 0.0

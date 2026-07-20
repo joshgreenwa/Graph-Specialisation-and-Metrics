@@ -2346,7 +2346,13 @@ def assert_parameter_matching(payloads: Sequence[Mapping[str, Any]], cfg: Config
 
 
 def main(argv: Sequence[str] | None = None) -> dict[str, Any] | None:
-    args = build_parser().parse_args(list(argv) if argv is not None else None)
+    # A source file pasted directly into Colab has ``__name__ == '__main__'`` and inherits
+    # ipykernel's private ``-f <connection.json>`` arguments.  Treat that case as the documented
+    # default run; normal command-line execution still consumes sys.argv.
+    parser_argv = list(argv) if argv is not None else None
+    if parser_argv is None and ("google.colab" in sys.modules or "ipykernel" in sys.modules):
+        parser_argv = []
+    args = build_parser().parse_args(parser_argv)
     cfg = config_from_args(args)
     run_dir = Path(cfg.drive_root) / cfg.run_name
     run_dir.mkdir(parents=True, exist_ok=True)
