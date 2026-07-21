@@ -31,6 +31,15 @@ and adopts the reference early-stopping rule exactly: stop when validation cross
 below `0.001`. Fixed topology and RRWP tensors are cached in memory, so the larger budget is spent
 on optimization rather than regenerating identical graph structure.
 
+The Colab launcher also enables an auditable one-shot outlier check. Within each
+`(support, width, N)` cell, a seed is retrained only when the other seeds agree within 0.05,
+the candidate differs from their median by at least 0.15 on held-out accuracy, and an independent
+validation set shows the same discrepancy. The active checkpoint and any matching analysis cache
+are moved to `outlier_archive/`, the cell receives exactly one independently randomized retry, and
+that retry is accepted unconditionally. Retry metadata is written into the replacement checkpoint
+and `tables/outlier_retraining_*.csv`; a persistent outlier is therefore reported rather than
+repeatedly optimized away. Disable this behavior by removing `--retrain-outliers` from `CELL_ARGS`.
+
 This benchmark is deliberately semantic-only, so it does not estimate structural scores or
 `J/D_rel`; those require a genuinely independent structural factor and belong in the preceding
 mixed-task validation experiment. The semantic score still uses the central Method-A routed-`wV`

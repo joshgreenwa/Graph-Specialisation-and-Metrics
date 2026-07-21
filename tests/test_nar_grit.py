@@ -2,6 +2,7 @@ import torch
 
 from graph_specialisation_metrics.synthetic.nar_grit_fixed import (
     Config,
+    detect_accuracy_outliers,
     khop_support,
     make_batch,
     semantic_replica,
@@ -108,3 +109,34 @@ def test_feature_and_label_spaces_are_specific_to_n() -> None:
     assert int(eight.x.max()) <= 8
     assert int(four.y.max()) < 4
     assert int(eight.y.max()) < 8
+
+
+def test_outlier_audit_requires_peer_and_validation_agreement_and_retries_once() -> None:
+    def payload(seed: int, heldout: float, validation: float, *, retried: bool = False):
+        result = {
+            "model_name": "dense",
+            "width": 128,
+            "N": 16,
+            "seed": seed,
+            "heldout": {"accuracy": heldout},
+            "best_validation": {"accuracy": validation},
+        }
+        if retried:
+            result["outlier_retraining"] = {"completed": True}
+        return result
+
+    clear = [
+        payload(0, 0.91, 0.90),
+        payload(1, 0.89, 0.88),
+        payload(2, 0.61, 0.60),
+    ]
+    found = detect_accuracy_outliers(clear, min_gap=0.15, peer_range=0.05)
+    assert [(item["seed"], item["direction"]) for item in found] == [(2, "low")]
+
+    # Held-out noise alone is insufficient when the independent validation result disagrees.
+    inconsistent = [clear[0], clear[1], payload(2, 0.61, 0.89)]
+    assert not detect_accuracy_outliers(inconsistent, min_gap=0.15, peer_range=0.05)
+
+    # A replacement is accepted as final even if it remains separated from its peers.
+    already_retried = [clear[0], clear[1], payload(2, 0.61, 0.60, retried=True)]
+    assert not detect_accuracy_outliers(already_retried, min_gap=0.15, peer_range=0.05)

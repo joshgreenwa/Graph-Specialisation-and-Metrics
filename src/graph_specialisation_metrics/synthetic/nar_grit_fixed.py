@@ -647,6 +647,7 @@ def train_model(
     device: Any,
     force: bool,
     load_only: bool,
+    optimization_attempt: int = 0,
 ) -> tuple[Any, dict[str, Any]]:
     import torch
     import torch.nn.functional as F
@@ -655,7 +656,15 @@ def train_model(
     if OfficialFixedNNARGRIT.__name__ == "OfficialFixedNNARGRIT":
         OfficialFixedNNARGRIT = build_model_class()
     path = checkpoint_path(run_dir, cfg, model_name, width, records, seed)
-    model_seed = seed + width * 1009 + records * 10_007 + MODEL_ORDER.index(model_name) * 100_003
+    # A targeted audit retry is an independently randomized optimization attempt for the same
+    # experimental cell. Evaluation sets remain fixed, and the attempt is stored in the payload.
+    optimization_seed = int(seed) + int(optimization_attempt) * 1_000_003
+    model_seed = (
+        optimization_seed
+        + width * 1009
+        + records * 10_007
+        + MODEL_ORDER.index(model_name) * 100_003
+    )
     set_seed(model_seed)
     model = OfficialFixedNNARGRIT(cfg, model_name, width, records).to(device)
     if path.exists() and not force:
@@ -672,7 +681,11 @@ def train_model(
     # The v2 run already produced several exact 100%-held-out solutions. Reuse only those
     # checkpoints after they independently pass the v3 validation and held-out sets; all
     # non-converged v2 runs are discarded and trained afresh under the longer common budget.
-    legacy_path = converged_legacy_checkpoint(cfg, model_name, width, records, seed)
+    legacy_path = (
+        converged_legacy_checkpoint(cfg, model_name, width, records, seed)
+        if optimization_attempt == 0
+        else None
+    )
     if legacy_path is not None and not force:
         fresh_state = {
             key: value.detach().cpu().clone() for key, value in model.state_dict().items()
@@ -720,6 +733,8 @@ def train_model(
                 "width": int(width),
                 "N": int(records),
                 "seed": int(seed),
+                "optimization_attempt": int(optimization_attempt),
+                "optimization_seed": int(optimization_seed),
                 "config": asdict(cfg),
                 "state_dict": promoted_state,
                 "best_validation": legacy_validation,
@@ -759,7 +774,7 @@ def train_model(
             cfg,
             graphs,
             records,
-            seed=seed * 10_000_019 + records * 100_003 + step * 101,
+            seed=optimization_seed * 10_000_019 + records * 100_003 + step * 101,
         ).to(device)
         model.train()
         logits = model(batch)
@@ -827,6 +842,8 @@ def train_model(
         "width": int(width),
         "N": int(records),
         "seed": int(seed),
+        "optimization_attempt": int(optimization_attempt),
+        "optimization_seed": int(optimization_seed),
         "config": asdict(cfg),
         "state_dict": best_state,
         "best_validation": best_validation,
@@ -1258,6 +1275,8 @@ def performance_rows(payloads: Sequence[Mapping[str, Any]]) -> list[dict[str, An
         "width": int(payload["width"]),
         "N": int(payload["N"]),
         "seed": int(payload["seed"]),
+        "optimization_attempt": int(payload.get("optimization_attempt", 0)),
+        "outlier_retrained": bool(payload.get("outlier_retraining")),
         "parameters": int(payload["parameters"]),
         **dict(payload["heldout"]),
     } for payload in payloads]
@@ -1391,7 +1410,8 @@ def plot_capacity(rows: Sequence[Mapping[str, Any]], cfg: Config, figure_dir: Pa
     _suptitle(
         fig,
         "Trained attention support determines Neighbor Associative Recall capacity",
-        "Each point is a separately trained fixed-N official GRIT; bands are seed-level 95% intervals.",
+        "Each point is a separately trained fixed-N official GRIT; bars are seed-level 95% intervals. "
+        "Audited retries are disclosed in the performance table.",
     )
     fig.subplots_adjust(top=0.84, bottom=0.20, wspace=0.14)
     save_figure(fig, figure_dir, "01_fixed_n_capacity")
@@ -1555,6 +1575,7 @@ def make_all_figures(
         "fingerprint": config_fingerprint(cfg),
         "paper_task_alignment": TASK_ALIGNMENT,
         "intentional_difference": INTENTIONAL_DIFFERENCE,
+        "outlier_retrained_cells": sum(bool(row["outlier_retrained"]) for row in performance),
         "headline_statistics": headline,
         "max_noop_transport": max((row["noop_transport_max"] for row in carriage), default=float("nan")),
         "artifacts": {
@@ -1605,6 +1626,23 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--skip-install", action="store_true")
     parser.add_argument("--force-training", action="store_true")
     parser.add_argument("--force-analysis", action="store_true")
+    parser.add_argument(
+        "--retrain-outliers",
+        action="store_true",
+        help="audit isolated seed outliers and replace each with one unconditional retry",
+    )
+    parser.add_argument(
+        "--outlier-min-gap",
+        type=float,
+        default=0.15,
+        help="minimum accuracy separation from the agreeing peer seeds",
+    )
+    parser.add_argument(
+        "--outlier-peer-range",
+        type=float,
+        default=0.05,
+        help="maximum held-out accuracy range among the peer seeds",
+    )
     parser.add_argument("--allow-low-accuracy", action="store_true")
     parser.add_argument("--fast-dev-run", action="store_true")
     return parser
@@ -1704,6 +1742,189 @@ def load_analyses(cfg: Config, run_dir: Path) -> list[dict[str, Any]]:
     return analyses
 
 
+def payload_cell(payload: Mapping[str, Any]) -> tuple[int, int, str, int]:
+    return (
+        int(payload["width"]),
+        int(payload["N"]),
+        str(payload["model_name"]),
+        int(payload["seed"]),
+    )
+
+
+def detect_accuracy_outliers(
+    payloads: Sequence[Mapping[str, Any]],
+    *,
+    min_gap: float,
+    peer_range: float,
+) -> list[dict[str, Any]]:
+    """Identify isolated optimization outcomes using held-out and validation agreement.
+
+    A run is eligible only when at least two *other* seeds agree within ``peer_range``, its
+    held-out accuracy differs from their median by ``min_gap``, and the independently measured
+    validation difference points the same way and is at least half as large. A checkpoint that
+    has already received its one audit retry is never selected again.
+    """
+    grouped: dict[tuple[int, int, str], list[Mapping[str, Any]]] = {}
+    for payload in payloads:
+        key = (int(payload["width"]), int(payload["N"]), str(payload["model_name"]))
+        grouped.setdefault(key, []).append(payload)
+
+    detected: list[dict[str, Any]] = []
+    for (width, records, model_name), group in grouped.items():
+        if len(group) < 3:
+            continue
+        for candidate in group:
+            if candidate.get("outlier_retraining"):
+                continue
+            peers = [item for item in group if int(item["seed"]) != int(candidate["seed"])]
+            if len(peers) < 2:
+                continue
+            peer_heldout = np.asarray(
+                [float(item["heldout"]["accuracy"]) for item in peers], dtype=float
+            )
+            if float(np.ptp(peer_heldout)) > float(peer_range):
+                continue
+            candidate_heldout = float(candidate["heldout"]["accuracy"])
+            peer_heldout_median = float(np.median(peer_heldout))
+            heldout_gap = candidate_heldout - peer_heldout_median
+            if abs(heldout_gap) < float(min_gap):
+                continue
+
+            candidate_validation = float(candidate["best_validation"]["accuracy"])
+            peer_validation_median = float(np.median([
+                float(item["best_validation"]["accuracy"]) for item in peers
+            ]))
+            validation_gap = candidate_validation - peer_validation_median
+            if heldout_gap * validation_gap <= 0 or abs(validation_gap) < 0.5 * float(min_gap):
+                continue
+            detected.append({
+                "width": width,
+                "N": records,
+                "model": model_name,
+                "seed": int(candidate["seed"]),
+                "direction": "high" if heldout_gap > 0 else "low",
+                "heldout_accuracy": candidate_heldout,
+                "peer_heldout_median": peer_heldout_median,
+                "heldout_gap": heldout_gap,
+                "validation_accuracy": candidate_validation,
+                "peer_validation_median": peer_validation_median,
+                "validation_gap": validation_gap,
+                "previous_optimization_attempt": int(candidate.get("optimization_attempt", 0)),
+            })
+    return detected
+
+
+def archive_active_cache(source: Path, run_dir: Path, archive_root: Path) -> str:
+    """Move an active cache artifact into the recoverable outlier-audit archive."""
+    if not source.exists():
+        return ""
+    relative = source.relative_to(run_dir)
+    destination = archive_root / relative
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(source), str(destination))
+    return str(destination)
+
+
+def retrain_accuracy_outliers(
+    payloads: Sequence[dict[str, Any]],
+    cfg: Config,
+    run_dir: Path,
+    *,
+    device: Any,
+    min_gap: float,
+    peer_range: float,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Archive and unconditionally replace each detected seed with one independent retry."""
+    import torch
+
+    flagged = detect_accuracy_outliers(
+        payloads,
+        min_gap=float(min_gap),
+        peer_range=float(peer_range),
+    )
+    if not flagged:
+        print("[outlier audit] no isolated seed outliers detected", flush=True)
+        return list(payloads), []
+
+    stamp = time.strftime("%Y%m%d_%H%M%S") + f"_{time.time_ns() % 1_000_000:06d}"
+    archive_root = run_dir / "outlier_archive" / stamp
+    current = {payload_cell(payload): payload for payload in payloads}
+    audit_rows: list[dict[str, Any]] = []
+    for finding in flagged:
+        key = (
+            int(finding["width"]),
+            int(finding["N"]),
+            str(finding["model"]),
+            int(finding["seed"]),
+        )
+        original = current[key]
+        width, records, model_name, seed = key
+        checkpoint = checkpoint_path(run_dir, cfg, model_name, width, records, seed)
+        training_table = (
+            run_dir / "tables" / f"training_{model_name}_d{width}_N{records}_seed_{seed}.csv"
+        )
+        archived_checkpoint = archive_active_cache(checkpoint, run_dir, archive_root)
+        archived_training = archive_active_cache(training_table, run_dir, archive_root)
+        archived_analysis = ""
+        if width == cfg.analysis_width and records in cfg.mechanistic_ns:
+            archived_analysis = archive_active_cache(
+                analysis_path(run_dir, cfg, model_name, records, seed),
+                run_dir,
+                archive_root,
+            )
+
+        next_attempt = int(original.get("optimization_attempt", 0)) + 1
+        print(
+            f"[outlier audit] retraining {model_name} d={width} N={records} seed={seed} "
+            f"({finding['direction']} gap={finding['heldout_gap']:+.3f}, attempt={next_attempt})",
+            flush=True,
+        )
+        model, replacement = train_model(
+            cfg,
+            model_name=model_name,
+            width=width,
+            records=records,
+            seed=seed,
+            run_dir=run_dir,
+            device=device,
+            force=True,
+            load_only=False,
+            optimization_attempt=next_attempt,
+        )
+        retry_metadata = {
+            "completed": True,
+            "detector": "agreeing-peers plus independent-validation v1",
+            "accepted_unconditionally": True,
+            "min_gap": float(min_gap),
+            "peer_range": float(peer_range),
+            "original_heldout_accuracy": float(original["heldout"]["accuracy"]),
+            "replacement_heldout_accuracy": float(replacement["heldout"]["accuracy"]),
+            "archive_root": str(archive_root),
+        }
+        replacement["outlier_retraining"] = retry_metadata
+        torch.save(replacement, checkpoint)
+        current[key] = replacement
+        audit_rows.append({
+            **finding,
+            "new_optimization_attempt": next_attempt,
+            "replacement_validation_accuracy": float(replacement["best_validation"]["accuracy"]),
+            "replacement_heldout_accuracy": float(replacement["heldout"]["accuracy"]),
+            "accepted_unconditionally": True,
+            "archived_checkpoint": archived_checkpoint,
+            "archived_training_table": archived_training,
+            "archived_analysis": archived_analysis,
+        })
+        del model
+        if str(device).startswith("cuda"):
+            torch.cuda.empty_cache()
+
+    audit_path = run_dir / "tables" / f"outlier_retraining_{stamp}.csv"
+    write_csv(audit_path, audit_rows)
+    print(f"[outlier audit] wrote {audit_path}", flush=True)
+    ordered = [current[payload_cell(payload)] for payload in payloads]
+    return ordered, audit_rows
+
+
 def assert_parameter_matching(
     payloads: Sequence[Mapping[str, Any]],
     cfg: Config,
@@ -1736,6 +1957,14 @@ def main(argv: Sequence[str] | None = None) -> dict[str, Any] | None:
     if parser_argv is None and ("google.colab" in sys.modules or "ipykernel" in sys.modules):
         parser_argv = []
     args = build_parser().parse_args(parser_argv)
+    if args.retrain_outliers and args.phase == "figures":
+        parser.error("--retrain-outliers requires --phase train, analyze, or all")
+    if args.retrain_outliers and args.force_training:
+        parser.error("use either --retrain-outliers or --force-training, not both")
+    if not 0 < args.outlier_min_gap <= 1:
+        parser.error("--outlier-min-gap must lie in (0, 1]")
+    if not 0 <= args.outlier_peer_range < args.outlier_min_gap:
+        parser.error("--outlier-peer-range must be non-negative and smaller than the gap")
     cfg = config_from_args(args)
     run_dir = Path(cfg.drive_root) / cfg.run_name
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -1745,6 +1974,13 @@ def main(argv: Sequence[str] | None = None) -> dict[str, Any] | None:
         "config": asdict(cfg),
         "paper_task_alignment": TASK_ALIGNMENT,
         "intentional_difference": INTENTIONAL_DIFFERENCE,
+        "outlier_audit": {
+            "enabled": bool(args.retrain_outliers),
+            "minimum_accuracy_gap": float(args.outlier_min_gap),
+            "maximum_peer_range": float(args.outlier_peer_range),
+            "maximum_retries_per_checkpoint": 1,
+            "replacement_policy": "accept the single retry unconditionally",
+        },
     })
 
     if args.phase == "figures":
@@ -1762,6 +1998,7 @@ def main(argv: Sequence[str] | None = None) -> dict[str, Any] | None:
         "time": time.strftime("%Y-%m-%d %H:%M:%S %Z"),
     })
 
+    payloads: list[dict[str, Any]] | None = None
     if args.phase in ("all", "train"):
         payloads = []
         for width in cfg.widths:
@@ -1793,6 +2030,24 @@ def main(argv: Sequence[str] | None = None) -> dict[str, Any] | None:
                             )
                         payloads.append(payload)
                         del model
+    elif args.retrain_outliers:
+        payloads = load_payloads(cfg, run_dir)
+
+    if args.retrain_outliers:
+        if payloads is None:
+            raise RuntimeError("outlier audit requires loaded training payloads")
+        payloads, _ = retrain_accuracy_outliers(
+            payloads,
+            cfg,
+            run_dir,
+            device=device,
+            min_gap=args.outlier_min_gap,
+            peer_range=args.outlier_peer_range,
+        )
+
+    if args.phase in ("all", "train"):
+        if payloads is None:
+            raise RuntimeError("training phase produced no payloads")
         assert_parameter_matching(payloads, cfg, run_dir)
         if args.phase == "train":
             print("[done] training caches are complete; run --phase analyze next", flush=True)

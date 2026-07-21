@@ -120,6 +120,8 @@ CELL_ARGS = [
     "10000",
     "--early-stopping-loss-threshold",
     "0.001",
+    # One auditable retry for isolated seed outcomes; original caches are archived on Drive.
+    "--retrain-outliers",
 ]
 
 main(CELL_ARGS)
