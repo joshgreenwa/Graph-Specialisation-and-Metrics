@@ -97,8 +97,10 @@ Families are selected from cached test-set scores and ablated on independent val
 The two primary outcomes are label-free output movement and signed task-loss change. The cache
 retains per-graph outcomes so all specialist-minus-generalist confidence intervals are paired
 graph bootstraps. High-|D|/low-`J` specialists below an activity floor are excluded because their
-relative selectivity is ratio-noise prone. A run that cannot form at least two matched triplets
-fails explicitly instead of silently relabelling weakly semantic heads as structural.
+relative selectivity is ratio-noise prone. A model that cannot form at least two matched triplets
+is recorded as **not estimable** and omitted from this optional figure instead of silently
+relabelling weakly semantic heads as structural. That score-geometry verdict does not abort or
+invalidate the complete carriage/specialisation comparison.
 
 ## VNode note
 

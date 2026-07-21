@@ -43,6 +43,10 @@ STRENGTHS = ("highJ", "lowJ")
 FAMILY_NAMES = tuple(f"{p}_{s}" for s in STRENGTHS for p in PREFERENCES)
 
 
+class FactorialNotEstimable(RuntimeError):
+    """The observed score geometry cannot instantiate the predeclared six-family design."""
+
+
 def score_fingerprint(scores: dict) -> str:
     """Stable identity for the two cached score matrices that selected the families."""
     h = hashlib.sha256()
@@ -106,7 +110,7 @@ def _candidate_cells(D: np.ndarray, J: np.ndarray, *, generalist_fraction: float
     medians = {}
     for pref, idx in pools.items():
         if len(idx) < 2:
-            raise RuntimeError(
+            raise FactorialNotEstimable(
                 f"factorial family selection has only {len(idx)} {pref} candidates; the model "
                 "does not support a signed semantic/structural/generalist factorial comparison.")
         med = float(np.median(j[idx])); medians[pref] = med
@@ -118,6 +122,27 @@ def _candidate_cells(D: np.ndarray, J: np.ndarray, *, generalist_fraction: float
         cells[f"{pref}_lowJ"] = np.asarray(lo, dtype=np.int64)
     return cells, {"generalist_count": int(n_gen), "J_activity_floor": floor,
                    "within_preference_J_medians": medians}
+
+
+def check_factorial_estimable(scores: dict, *, gsem: float, gstr: float,
+                              family_size: int = 6, generalist_fraction: float = 0.30,
+                              activity_floor_quantile: float = 0.10) -> dict:
+    """Cheap score-only preflight; raises before loading a model when the design is absent.
+
+    This deliberately does not relax signs, merge strength strata, or rename the nearest heads.
+    A non-estimable model is a property of its observed D/J plane and should be reported as such.
+    """
+    D, J = dj_coordinates(scores, gsem, gstr)
+    cells, thresholds = _candidate_cells(
+        D, J, generalist_fraction=generalist_fraction,
+        activity_floor_quantile=activity_floor_quantile)
+    sizes = {name: int(len(values)) for name, values in cells.items()}
+    available = min(sizes.values())
+    if min(int(family_size), available) < 2:
+        raise FactorialNotEstimable(
+            f"insufficient heads for six factorial families; cell sizes={sizes}")
+    return {"cell_sizes": sizes, "available_family_size": int(available),
+            "thresholds": thresholds}
 
 
 def _priority(idx: np.ndarray, pref: str, strength: str, D: np.ndarray, J: np.ndarray) -> np.ndarray:
@@ -198,8 +223,9 @@ def select_factorial_families(scores: dict, throughput: np.ndarray, *, gsem: flo
     available = min(len(v) for v in cells.values())
     k = min(int(family_size), int(available))
     if k < 2:
-        raise RuntimeError(f"insufficient heads for six factorial families; cell sizes="
-                           f"{ {name: len(v) for name, v in cells.items()} }")
+        raise FactorialNotEstimable(
+            f"insufficient heads for six factorial families; cell sizes="
+            f"{ {name: len(v) for name, v in cells.items()} }")
     if k < int(family_size):
         log(f"[family-selection:WARN] requested K={family_size}, but the smallest honest signed "
             f"D x J cell supports K={k}; using equal K={k} rather than relabelling heads. "

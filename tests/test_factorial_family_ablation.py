@@ -55,6 +55,8 @@ def test_factorial_selection_refuses_missing_signed_channel():
     scores = {"S_sem": J * (1 + Drel), "S_str": J * (1 - Drel)}
     with np.testing.assert_raises_regex(RuntimeError, "structural candidates"):
         F.select_factorial_families(scores, np.ones_like(J), gsem=1, gstr=1, family_size=2)
+    with np.testing.assert_raises_regex(F.FactorialNotEstimable, "structural candidates"):
+        F.check_factorial_estimable(scores, gsem=1, gstr=1, family_size=2)
 
 
 def _family_cache_fixture(G=40, K=4, B=4, R=5):

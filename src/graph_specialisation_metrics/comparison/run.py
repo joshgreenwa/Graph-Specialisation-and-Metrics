@@ -556,18 +556,46 @@ def run_all(tasks: Sequence[str] = _data.DEFAULT_TASKS, *,
                     cached_summary = json.loads(summary_path.read_text(encoding="utf-8"))
                 except Exception:  # noqa: BLE001
                     cached_summary = None
-            current = bool(
-                npz_path.exists() and cached_summary
+            summary_current = bool(
+                cached_summary
                 and int(cached_summary.get("cache_version", 0)) == family_mod.CACHE_VERSION
                 and cached_summary.get("score_fingerprint") == fingerprint
                 and cached_summary.get("config") == request)
+            current = bool(npz_path.exists() and summary_current
+                           and cached_summary.get("status", "complete") == "complete")
             if current and not force:
                 log(f"[cache] factorial family ablation {task}: reuse {npz_path}")
                 status["factorial_family_ablation"][task] = "cached"
                 family_current[task] = True
                 continue
+            if (summary_current and cached_summary.get("status") == "not-estimable"
+                    and not force):
+                reason = cached_summary.get("reason", "six-family D x J design unavailable")
+                log(f"[family-selection] {task}: not estimable from its score geometry; "
+                    f"reusing recorded verdict ({reason})")
+                status["factorial_family_ablation"][task] = f"not-estimable: {reason}"
+                family_current[task] = True
+                continue
+            try:
+                preflight = family_mod.check_factorial_estimable(
+                    scores_ref[task], gsem=gsem, gstr=gstr, family_size=family_size,
+                    generalist_fraction=family_generalist_fraction,
+                    activity_floor_quantile=family_activity_floor_quantile)
+            except family_mod.FactorialNotEstimable as exc:
+                reason = str(exc)
+                verdict = {
+                    "cache_version": family_mod.CACHE_VERSION, "status": "not-estimable",
+                    "task": task, "score_fingerprint": fingerprint, "config": request,
+                    "reason": reason,
+                }
+                summary_path.write_text(json.dumps(verdict, indent=2), encoding="utf-8")
+                log(f"[family-selection] {task}: NOT ESTIMABLE — {reason}. "
+                    "No heads were relabelled; the core all-model comparison will continue.")
+                status["factorial_family_ablation"][task] = f"not-estimable: {reason}"
+                family_current[task] = True
+                continue
             log(f"[run] factorial family ablation {task} from cached scores "
-                f"(no carriage/score recomputation) ...")
+                f"(no carriage/score recomputation; cells={preflight['cell_sizes']}) ...")
             try:
                 result = family_mod.prepare_and_run(
                     task, scores_ref[task], gsem=gsem, gstr=gstr,
@@ -611,12 +639,14 @@ def run_all(tasks: Sequence[str] = _data.DEFAULT_TASKS, *,
     Path(comparison_dir).mkdir(parents=True, exist_ok=True)
     status_path = Path(comparison_dir) / "run_status.json"
     status_path.write_text(json.dumps(status, indent=2), encoding="utf-8")
-    if not allow_partial and (missing_carriage or missing_scores or missing_family):
+    if missing_family:
+        log(f"[warn] unresolved optional factorial family stages: {missing_family}; core "
+            "carriage/specialisation figures will still be built.")
+    if not allow_partial and (missing_carriage or missing_scores):
         details = "; ".join(status["errors"][-5:]) or "see the per-stage status entries"
         raise RuntimeError(
             "Refusing to draw a partial all-model comparison. Missing carriage="
-            f"{missing_carriage}; missing scores={missing_scores}; "
-            f"missing factorial family ablation={missing_family}. {details}. "
+            f"{missing_carriage}; missing scores={missing_scores}. {details}. "
             f"Full status: {status_path}"
         )
 
