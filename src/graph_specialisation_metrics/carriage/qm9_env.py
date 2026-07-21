@@ -50,6 +50,8 @@ def make_qm9_hook(attention: str, hops: int = 1) -> Callable[[Path], None]:
             batch_size=128,
             epochs=300,
             warmup_epochs=10,
+            # The training runner's provenance note calls expected_param_count(args).
+            expected_params=None,
         )
         # ``drive_dir`` is used only for a patch provenance note. Keep analysis writes inside
         # the disposable task-specific clone rather than touching a training directory.

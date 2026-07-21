@@ -53,16 +53,23 @@ def test_qm9_hook_replays_exact_training_patch(name, expected_attention, monkeyp
     import GRIT_QM9_gap
 
     calls = []
-    monkeypatch.setattr(
-        GRIT_QM9_gap,
-        "apply_qm9_patch",
-        lambda repo_dir, note_dir, args: calls.append(
+
+    def fake_apply(repo_dir, note_dir, args):
+        # Exercise the helper reached by the real patch's provenance writer. This guards the
+        # complete Namespace contract, not merely the attributes read directly in its main body.
+        expected_count = GRIT_QM9_gap.expected_param_count(args)
+        calls.append(
             (
                 "apply", Path(repo_dir), Path(note_dir), args.attention, int(args.hops),
                 bool(args.global_vnode), int(args.batch_size), int(args.epochs),
-                int(args.warmup_epochs),
+                int(args.warmup_epochs), args.expected_params, expected_count,
             )
-        ),
+        )
+
+    monkeypatch.setattr(
+        GRIT_QM9_gap,
+        "apply_qm9_patch",
+        fake_apply,
     )
     monkeypatch.setattr(
         GRIT_QM9_gap,
@@ -73,7 +80,10 @@ def test_qm9_hook_replays_exact_training_patch(name, expected_attention, monkeyp
     get_task(name).env_hooks[0](tmp_path)
 
     assert calls == [
-        ("apply", tmp_path, tmp_path, expected_attention, 1, False, 128, 300, 10),
+        (
+            "apply", tmp_path, tmp_path, expected_attention, 1, False, 128, 300, 10,
+            None, 472_769,
+        ),
         ("verify", tmp_path),
     ]
 
