@@ -19,7 +19,9 @@ def _spring_layout(n, bonds, seed=0):
         g = nx.Graph()
         g.add_nodes_from(range(n))
         g.add_edges_from([(int(a), int(b)) for a, b in bonds])
-        pos = nx.spring_layout(g, seed=seed, k=1.2 / max(np.sqrt(n), 1))
+        # Molecules are small and connected; Kamada-Kawai gives a much more legible 2-D chemical
+        # topology than a circular layout while remaining deterministic without RDKit/SMILES.
+        pos = nx.kamada_kawai_layout(g)
         return np.array([pos[i] for i in range(n)])
     except Exception:  # noqa: BLE001
         ang = np.linspace(0, 2 * np.pi, n, endpoint=False)
@@ -55,8 +57,19 @@ def collect_attention(gm, graph_ids, heads, seed=0) -> dict:
             A = np.zeros((n, n), dtype=np.float64)
             A[dest, src] = a                                # A[i, j] = attention i<-j
             maps[(l, h)] = A
-        bonds = base.edge_index.cpu().numpy().T             # [2E, 2] directed bond pairs
-        bonds = np.unique(np.sort(bonds, axis=1), axis=0)   # undirected unique
+        raw_bonds = base.edge_index.cpu().numpy().T         # [2E, 2] directed bond pairs
+        raw_types = getattr(base, "edge_attr", None)
+        if raw_types is None:
+            raw_types = np.ones(len(raw_bonds), dtype=np.int64)
+        else:
+            raw_types = raw_types.detach().cpu().numpy()
+            raw_types = raw_types[:, 0] if raw_types.ndim > 1 else raw_types
+        bond_lookup = {}
+        for edge, bond_type in zip(raw_bonds, raw_types):
+            key = tuple(sorted((int(edge[0]), int(edge[1]))))
+            bond_lookup.setdefault(key, int(bond_type))
+        bonds = np.asarray(sorted(bond_lookup), dtype=np.int64)
+        bond_types = np.asarray([bond_lookup[tuple(edge)] for edge in bonds], dtype=np.int64)
         # node colour = first content column (ZINC atom type; OGB atomic number) -- task-general.
         xc = base.x
         atom_types = (xc[:, 0] if xc.dim() > 1 else xc).cpu().numpy().astype(int)
@@ -64,7 +77,8 @@ def collect_attention(gm, graph_ids, heads, seed=0) -> dict:
         mols.append({
             "graph_id": int(gi), "n": n,
             "atom_types": atom_types,
-            "bonds": bonds, "pos": _spring_layout(n, bonds, seed=seed),
+            "bonds": bonds, "bond_types": bond_types,
+            "pos": _spring_layout(n, bonds, seed=seed),
             "y": float(yv[0].item()), "y_dim": int(yv.numel()), "maps": maps,
         })
     return {"molecules": mols, "heads": heads}

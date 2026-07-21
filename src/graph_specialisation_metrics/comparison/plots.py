@@ -1099,3 +1099,99 @@ def plot_semantic_outlier_attention_matrices(attention: dict, outlier: dict, out
     out_path = Path(out_path); out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path, dpi=190)
     return fig, str(out_path)
+
+
+def _draw_molecule_bonds(ax, pos, bonds, bond_types, *, color="#444444", alpha=.85,
+                         linewidth=1.25):
+    """Draw categorical ZINC bonds, using parallel strokes for double/triple types."""
+    pos = np.asarray(pos, float)
+    span = max(float(np.ptp(pos[:, 0])), float(np.ptp(pos[:, 1])), 1e-6)
+    for (a, b), raw_type in zip(np.asarray(bonds, int), np.asarray(bond_types, int)):
+        p0, p1 = pos[int(a)], pos[int(b)]
+        vec = p1 - p0
+        norm = max(float(np.linalg.norm(vec)), 1e-12)
+        perp = np.asarray([-vec[1], vec[0]]) / norm * (.010 * span)
+        order = int(np.clip(int(raw_type), 1, 3))
+        offsets = ([0.] if order == 1 else ([-1., 1.] if order == 2 else [-1.5, 0., 1.5]))
+        for offset in offsets:
+            q0, q1 = p0 + offset * perp, p1 + offset * perp
+            ax.plot([q0[0], q1[0]], [q0[1], q1[1]], color=color, alpha=alpha,
+                    lw=linewidth, solid_capstyle="round", zorder=0)
+
+
+def plot_semantic_outlier_head_attention(attention: dict, outlier: dict,
+                                         head: tuple[int, int], out_path, *,
+                                         scores: Optional[dict] = None,
+                                         gsem: float = 1.0, gstr: float = 1.0,
+                                         suptitle: Optional[str] = None):
+    """One paper-style 4x3 attention figure for a dense semantic outlier head."""
+    import matplotlib.pyplot as plt
+    from matplotlib.ticker import MaxNLocator
+
+    head = tuple(map(int, head))
+    molecules = list(attention["molecules"])[:4]
+    top_heads = [tuple(map(int, h)) for h in np.asarray(outlier["top_heads"], int)]
+    if head not in top_heads or not molecules:
+        raise ValueError(f"head {head} is absent from the dense semantic-outlier cache")
+    rank = top_heads.index(head)
+    delta_loss = float(np.asarray(outlier["individual_loss"], float)[rank].mean())
+    score = float(np.asarray(outlier["top_scores"], float)[rank])
+    detail = f"raw S_sem={score:.4g}, Δloss={delta_loss:+.3f}"
+    if scores is not None:
+        ss = float(np.asarray(scores["S_sem"], float)[head]) / float(gsem)
+        st = float(np.asarray(scores["S_str"], float)[head]) / float(gstr)
+        detail = f"D_rel={float(d_rel(ss, st)):+.3f}, J={float(joint_strength(ss, st)):.3f}, " \
+                 f"Δloss={delta_loss:+.3f}"
+
+    matrices = [np.asarray(mol["maps"][head], float) for mol in molecules]
+    vmax = max(max(float(A.max()), 1e-12) for A in matrices)
+    fig, axes = plt.subplots(len(molecules), 3, figsize=(15.5, 3.7 * len(molecules)),
+                             squeeze=False, constrained_layout=True)
+    atom_cmap = plt.get_cmap("tab20")
+    for row, (mol, A) in enumerate(zip(molecules, matrices)):
+        pos = np.asarray(mol["pos"], float)
+        atom_types = np.asarray(mol["atom_types"], int)
+        bonds = np.asarray(mol["bonds"], int)
+        bond_types = np.asarray(mol.get("bond_types", np.ones(len(bonds))), int)
+
+        # 1) topology + atom indices. ZINC exposes atom categories, not canonical SMILES, so
+        # category is represented faithfully by index colour rather than fabricated symbols.
+        ax = axes[row, 0]
+        _draw_molecule_bonds(ax, pos, bonds, bond_types)
+        ax.scatter(pos[:, 0], pos[:, 1], s=24, facecolor="white", edgecolor="none", zorder=1)
+        for node, (xx, yy) in enumerate(pos):
+            ax.text(xx, yy, str(node), color=atom_cmap(int(atom_types[node]) % 20),
+                    fontsize=9, ha="center", va="center", fontweight="bold", zorder=2)
+        ax.set_title(f"Molecule {mol['graph_id']}: atom indices\n(colour = atom category)",
+                     fontsize=10)
+        ax.set_aspect("equal"); ax.axis("off")
+
+        # 2) key inflow = total attention mass received by sender/key j over all query rows.
+        ax = axes[row, 1]
+        _draw_molecule_bonds(ax, pos, bonds, bond_types, color="#555555", alpha=.6)
+        inflow = A.sum(axis=0)
+        inflow_scaled = inflow / max(float(inflow.max()), 1e-12)
+        ax.scatter(pos[:, 0], pos[:, 1], c=inflow_scaled, cmap="Reds", vmin=0, vmax=1,
+                   s=75 + 330 * inflow_scaled, edgecolor="#7f0000", linewidth=.45, zorder=2)
+        for node, (xx, yy) in enumerate(pos):
+            ax.text(xx, yy, str(node), color=("white" if inflow_scaled[node] > .62 else "black"),
+                    fontsize=7.5, ha="center", va="center", zorder=3)
+        ax.set_title("Attention key inflow (within-molecule scale)", fontsize=10)
+        ax.set_aspect("equal"); ax.axis("off")
+
+        # 3) the unaggregated attention operator, with one head-wide scale across all examples.
+        ax = axes[row, 2]
+        im = ax.imshow(A, cmap="magma", vmin=0, vmax=vmax, interpolation="nearest",
+                       aspect="equal")
+        ax.set_title("Node-conditioned attention", fontsize=10)
+        ax.set_xlabel("Key / sender atom")
+        ax.set_ylabel("Query / receiver atom")
+        ax.xaxis.set_major_locator(MaxNLocator(integer=True, nbins=7))
+        ax.yaxis.set_major_locator(MaxNLocator(integer=True, nbins=7))
+        fig.colorbar(im, ax=ax, fraction=.046, pad=.025)
+
+    fig.suptitle(suptitle or f"semantic-score outlier: L{head[0]}H{head[1]}  ({detail})",
+                 fontsize=14)
+    out_path = Path(out_path); out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=190)
+    return fig, str(out_path)

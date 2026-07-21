@@ -318,6 +318,9 @@ def load_semantic_outlier_attention(path) -> Optional[dict]:
                 "graph_id": int(np.asarray(z[f"graph_id_{g}"]).item()),
                 "atom_types": np.asarray(z[f"atom_types_{g}"], int),
                 "bonds": np.asarray(z[f"bonds_{g}"], int),
+                "bond_types": (np.asarray(z[f"bond_types_{g}"], int)
+                               if f"bond_types_{g}" in z else
+                               np.ones(len(np.asarray(z[f"bonds_{g}"])), dtype=int)),
                 "pos": np.asarray(z[f"pos_{g}"], float), "maps": maps,
             })
         cache_version = int(np.asarray(z["cache_version"]).item()) \

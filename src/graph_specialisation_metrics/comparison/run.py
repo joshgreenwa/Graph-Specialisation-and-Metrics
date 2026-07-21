@@ -29,7 +29,7 @@ deliverables from that cache:
         its own cache; it never recomputes carriage or scores;
 * (vii) ``fig_<channel>_outlier_ablation.png`` -- direct held-out ablation of the six largest raw
         semantic/structural-score heads against layer-nearest throughput controls, plus dense-only
-        fixed-molecule graph and raw-matrix attention panels for semantic heads. These stages are
+        per-head topology/inflow/raw-matrix attention figures for semantic heads. These stages are
         independently cached and reuse family validation forwards whenever samples match;
 plus ``fig_performance.png`` + ``performance.json`` for the val/test evaluation.
 
@@ -42,6 +42,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from typing import Optional, Sequence
+
+import numpy as np
 
 from ..carriage import env
 from ..carriage.env import log
@@ -298,6 +300,7 @@ def build_figures(tasks: Sequence[str] = _data.DEFAULT_TASKS, *,
 
             # (vii) Raw channel-score outliers: direct necessity, not a J-controlled estimand.
             from ..specialisation.semantic_outlier_ablation import (
+                ATTENTION_CACHE_VERSION,
                 CACHE_VERSION as OUTLIER_CACHE_VERSION,
                 score_fingerprint as outlier_score_fingerprint,
             )
@@ -329,17 +332,16 @@ def build_figures(tasks: Sequence[str] = _data.DEFAULT_TASKS, *,
             if dense_sem and "zinc" in shown_scores:
                 attn = _data.load_semantic_outlier_attention(
                     _data.semantic_outlier_attention_path(spec_collate, "zinc"))
-                if (attn and attn.get("cache_version") == OUTLIER_CACHE_VERSION
+                if (attn and attn.get("cache_version") == ATTENTION_CACHE_VERSION
                         and attn.get("score_fingerprint") == dense_sem.get("score_fingerprint")):
-                    fig, p = _plots.plot_semantic_outlier_attention(
-                        attn, dense_sem, out_dir / "fig_semantic_outlier_attention_dense.png")
-                    figs["semantic_outlier_attention_dense"] = p
-                    made.append(fig)
-                    fig, p = _plots.plot_semantic_outlier_attention_matrices(
-                        attn, dense_sem,
-                        out_dir / "fig_semantic_outlier_attention_matrices_dense.png")
-                    figs["semantic_outlier_attention_matrices_dense"] = p
-                    made.append(fig)
+                    for head in np.asarray(dense_sem["top_heads"], int)[:6]:
+                        layer, hidx = map(int, head)
+                        key = f"semantic_outlier_attention_dense_L{layer}H{hidx}"
+                        fig, p = _plots.plot_semantic_outlier_head_attention(
+                            attn, dense_sem, (layer, hidx), out_dir / f"fig_{key}.png",
+                            scores=scores_ref["zinc"], gsem=gsem, gstr=gstr)
+                        figs[key] = p
+                        made.append(fig)
     else:
         log("[figures] no specialisation score caches found; skipping the scatter grid.")
 
@@ -770,7 +772,8 @@ def run_all(tasks: Sequence[str] = _data.DEFAULT_TASKS, *,
                             cached_attn = _data.load_semantic_outlier_attention(attention_path)
                             attention_current = bool(
                                 cached_attn
-                                and cached_attn.get("cache_version") == outlier_mod.CACHE_VERSION
+                                and cached_attn.get("cache_version")
+                                == outlier_mod.ATTENTION_CACHE_VERSION
                                 and cached_attn.get("score_fingerprint") == fingerprint
                                 and len(cached_attn.get("molecules", []))
                                 >= int(semantic_outlier_attention_graphs)

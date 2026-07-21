@@ -29,6 +29,7 @@ from .model import GritHeadModel, SpecConfig
 
 
 CACHE_VERSION = 2
+ATTENTION_CACHE_VERSION = 3
 
 
 def score_fingerprint(scores: dict, score_key: str = "S_sem") -> str:
@@ -201,7 +202,7 @@ def _attention_graph_ids(gm, graph_ids, n_graphs: int) -> list[int]:
 def save_attention(attn: dict, path, *, score_hash: str = "") -> str:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {"cache_version": np.asarray(CACHE_VERSION, dtype=np.int64),
+    payload = {"cache_version": np.asarray(ATTENTION_CACHE_VERSION, dtype=np.int64),
                "score_fingerprint": np.asarray(str(score_hash)),
                "heads": np.asarray(attn["heads"], dtype=np.int64),
                "num_molecules": np.asarray(len(attn["molecules"]), dtype=np.int64)}
@@ -209,6 +210,8 @@ def save_attention(attn: dict, path, *, score_hash: str = "") -> str:
         payload[f"graph_id_{g}"] = np.asarray(mol["graph_id"], dtype=np.int64)
         for key in ("atom_types", "bonds", "pos"):
             payload[f"{key}_{g}"] = np.asarray(mol[key])
+        payload[f"bond_types_{g}"] = np.asarray(
+            mol.get("bond_types", np.ones(len(mol["bonds"]), dtype=np.int64)))
         for h, head in enumerate(attn["heads"]):
             payload[f"map_{g}_{h}"] = np.asarray(mol["maps"][tuple(head)], dtype=np.float32)
     np.savez_compressed(path, **payload)

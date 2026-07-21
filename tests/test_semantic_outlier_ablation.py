@@ -97,6 +97,11 @@ def test_attention_cache_and_plot(tmp_path):
     _, out = P.plot_semantic_outlier_attention_matrices(
         loaded, item, tmp_path / "matrices.png")
     assert (tmp_path / "matrices.png").stat().st_size > 0
+    scores = {"S_sem": np.ones((10, 8)), "S_str": np.ones((10, 8))}
+    _, out = P.plot_semantic_outlier_head_attention(
+        loaded, item, tuple(item["top_heads"][0]), tmp_path / "head.png",
+        scores=scores, gsem=1., gstr=1.)
+    assert (tmp_path / "head.png").stat().st_size > 0
 
 
 def test_structural_cache_path_and_plot(tmp_path):

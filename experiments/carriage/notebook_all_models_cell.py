@@ -23,9 +23,8 @@ and CACHES all of it to Drive, then builds the deliverables:
   (vii) fig_semantic_outlier_ablation.png  -- direct held-out test of each model's largest raw
         semantic-score heads against layer-nearest throughput controls;
         fig_structural_outlier_ablation.png -- the identical test for raw structural-score heads;
-        fig_semantic_outlier_attention_dense.png -- fixed-molecule descriptive attention for the
-        dense outliers and their matched controls;
-        fig_semantic_outlier_attention_matrices_dense.png -- raw receiver-by-sender matrices;
+        fig_semantic_outlier_attention_dense_LxHy.png -- one 4-molecule topology/inflow/raw-
+        matrix figure for each of the six dense semantic outliers;
   (+)   fig_performance.png                -- val/test bars.
 
 The new 2-hop / VNode checkpoints are auto-registered from carriage.tasks; their Drive dirs are
