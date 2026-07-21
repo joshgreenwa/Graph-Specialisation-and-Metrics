@@ -361,7 +361,7 @@ def run_all(tasks: Sequence[str] = _data.DEFAULT_TASKS, *,
             carriage_donors: int = 64,
             beneficial_denom: str = "integrated",
             integrated_max_intervals: int = 256,
-            integrated_atol: float = 5e-4,
+            integrated_atol: float = 1e-4,
             integrated_unconverged_error_cap: float = 1e-2,
             integrated_max_unconverged_fraction: float = 1e-2,
             structural_mode: str = "transposition",
@@ -375,13 +375,12 @@ def run_all(tasks: Sequence[str] = _data.DEFAULT_TASKS, *,
             spec_donors: int = 64,
             with_attn_routing: bool = True,
             # channel-split causal ablation (I_sem/I_str functional + loss) -> the D/J validation
-            # figure. Off by default: it is the heavy swap x ablate sweep (L*H passes per model),
-            # so its donors stay lower than carriage/specialisation (each donor is multiplied by
-            # L*H ablated forwards); raise channel_ablation_donors to trade compute for tighter CIs.
-            with_channel_ablation: bool = False,
+            # figure. This is the heavy swap x ablate sweep (L*H passes per model), but is part of
+            # the default paper-analysis run; set False explicitly for a score/carriage-only run.
+            with_channel_ablation: bool = True,
             channel_ablation_graphs: int = 128,
-            channel_ablation_sources: int = 8,
-            channel_ablation_donors: int = 8,
+            channel_ablation_sources: int = 32,
+            channel_ablation_donors: int = 16,
             # cached-score family ablation (enabled by default). This is a separate, incremental
             # stage: it loads S_sem/S_str from disk and computes only new held-out ablation passes.
             with_factorial_family_ablation: bool = True,

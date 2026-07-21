@@ -10,7 +10,7 @@ It runs, for each of the five ZINC GRIT models -- dense, 1-hop, 2-hop, 1-hop+VNo
   (1) val + test performance recomputed from the checkpoint;
   (2) functional/beneficial SEMANTIC and STRUCTURAL carriage (integrated beneficial estimator);
   (3) per-head SEMANTIC vs STRUCTURAL specialisation scores;
-  (4) OPTIONAL per-head channel-split causal ablation (swap x ablate), I_sem/I_str functional+loss;
+  (4) per-head channel-split causal ablation (swap x ablate), I_sem/I_str functional+loss;
 and CACHES all of it to Drive, then builds the deliverables:
   (ii)  fig_spec_scatter_grid.png          -- side-by-side per-model score scatter (S_str vs S_sem);
   (ii-b)fig_spec_DJ_grid.png               -- selectivity D_rel vs joint strength J per model;
@@ -83,14 +83,13 @@ run_all(
     allow_partial=False,  # fail clearly instead of silently drawing a subset of requested models
     display=True,     # show the figures inline
     # ---- channel-split causal ablation -> the D/J validation figure (deliverable v) ----
-    # HEAVY: L*H ablated forwards per model over intervention replicas. Set False to skip it
-    # (the score-only quadrant/influence figures still build). Scale the knobs up for tighter CIs.
-    # Keep False for this incremental run: existing channel-ablation caches are still plotted,
-    # while a missing one will not cause specialisation.colab to replay its score estimator.
-    with_channel_ablation=False,
+    # HEAVY: L*H ablated forwards per model over intervention replicas. This is on by default for
+    # the paper-analysis run; set False explicitly for a score/carriage-only diagnostic run.
+    with_channel_ablation=True,
     channel_ablation_graphs=128,
-    channel_ablation_sources=8,
-    channel_ablation_donors=8,   # each donor => L*H extra ablated forwards; raise for tighter CIs
+    channel_ablation_sources=32,
+    channel_ablation_donors=16,  # each donor => L*H extra ablated forwards
+    integrated_atol=1e-4,
     # ---- cached-score D x J family ablation (enabled by default) ----
     with_factorial_family_ablation=True,
     family_ablation_graphs=256,

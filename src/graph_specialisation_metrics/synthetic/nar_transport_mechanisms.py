@@ -1032,6 +1032,13 @@ def analyze_bundle(
         selection = clean_attention_selection(layer.attention[0], bundle.clean)
         for key, value in selection.items():
             clean_attention[key].append(value.detach().cpu())
+        routed_clean = layer.routed[: graphs * nodes].reshape(
+            graphs, nodes, model.H, model.dh
+        )
+        clean_throughput = torch.linalg.vector_norm(
+            routed_clean.float(), dim=-1
+        ).sum(dim=1)
+        clean_attention["clean_throughput"].append(clean_throughput.detach().cpu())
         for intervention in interventions:
             metrics, closure = intervention_layer_metrics(
                 layer, phi, bundle, bundle.clean, intervention

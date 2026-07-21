@@ -30,12 +30,15 @@ cached artefact already exists** (`force=True` overrides). It refuses to publish
    load check; surfaced in every cached summary's `meta`).
 2. **Carriage** — functional/beneficial **semantic** and **structural** carriage via
    `carriage.colab.run(intervention=...)`, integrated beneficial estimator by default
-   (`num_graphs=128, donors=64, beneficial_denom="integrated"`, matching the dissertation's
-   structural command).
+   (`num_graphs=128, donors=64, beneficial_denom="integrated", integrated_atol=1e-4`, matching
+   the dissertation's structural command).
 3. **Specialise** — per-head `S_sem` / `S_str` transport scores via `specialisation.colab.run`
    with `with_ablation=False, with_attention=False` (the deliverables need the scores, not the
    ablation/attention sweeps).
-4. **Factorial family ablation** — enabled by default and separately cached. It reads the existing
+4. **Channel-split causal ablation** — enabled by default at 128 graphs, 32 sources/graph and 16
+   donors/source; set `with_channel_ablation=False` explicitly for a lighter score/carriage-only
+   diagnostic run.
+5. **Factorial family ablation** — enabled by default and separately cached. It reads the existing
    score matrices, estimates clean pre-head throughput on validation graphs, then computes only
    the new simultaneous family-ablation forwards. Existing carriage and score stages are not
    repeated under `force=False`.
