@@ -6,6 +6,7 @@ from graph_specialisation_metrics.synthetic.nar_grit_fixed import (
     khop_support,
     make_batch,
     semantic_replica,
+    supplemental_seed_cells,
     verify_intervention,
 )
 
@@ -140,3 +141,28 @@ def test_outlier_audit_requires_peer_and_validation_agreement_and_retries_once()
     # A replacement is accepted as final even if it remains separated from its peers.
     already_retried = [clear[0], clear[1], payload(2, 0.61, 0.60, retried=True)]
     assert not detect_accuracy_outliers(already_retried, min_gap=0.15, peer_range=0.05)
+
+
+def test_supplemental_seeds_are_new_and_target_only_one_performance_cell() -> None:
+    cfg = Config()
+    cells = supplemental_seed_cells(
+        cfg,
+        model_name="dense",
+        width=64,
+        records=32,
+        seeds=(3, 4, 5, 6, 7),
+    )
+    assert cells == [("dense", 64, 32, seed) for seed in range(3, 8)]
+
+    try:
+        supplemental_seed_cells(
+            cfg,
+            model_name="dense",
+            width=64,
+            records=32,
+            seeds=(2, 3),
+        )
+    except ValueError as error:
+        assert "must be new" in str(error)
+    else:
+        raise AssertionError("base seed overlap should be rejected")

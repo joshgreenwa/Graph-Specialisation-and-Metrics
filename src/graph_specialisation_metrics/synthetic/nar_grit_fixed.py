@@ -1282,6 +1282,32 @@ def performance_rows(payloads: Sequence[Mapping[str, Any]]) -> list[dict[str, An
     } for payload in payloads]
 
 
+def performance_summary_rows(
+    rows: Sequence[Mapping[str, Any]],
+    cfg: Config,
+) -> list[dict[str, Any]]:
+    summary: list[dict[str, Any]] = []
+    for width in cfg.widths:
+        for records in cfg.ns:
+            for model in cfg.models:
+                values = [
+                    float(row["accuracy"]) for row in rows
+                    if int(row["width"]) == width
+                    and int(row["N"]) == records
+                    and str(row["model"]) == model
+                ]
+                mean, ci95 = mean_ci(values)
+                summary.append({
+                    "model": model,
+                    "width": width,
+                    "N": records,
+                    "repeats": len(values),
+                    "mean_accuracy": mean,
+                    "ci95_half_width": ci95,
+                })
+    return summary
+
+
 def head_rows(analyses: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for analysis in analyses:
@@ -1380,13 +1406,24 @@ def plot_capacity(rows: Sequence[Mapping[str, Any]], cfg: Config, figure_dir: Pa
         for model in cfg.models:
             means, errors = [], []
             for records in cfg.ns:
-                values = [
-                    row["accuracy"] for row in rows
+                selected = [
+                    row for row in rows
                     if row["width"] == width and row["model"] == model and row["N"] == records
                 ]
+                values = [row["accuracy"] for row in selected]
                 mean, error = mean_ci(values)
                 means.append(mean)
                 errors.append(error)
+                axis.scatter(
+                    [records] * len(values),
+                    values,
+                    color=MODEL_COLOURS[model],
+                    marker=MODEL_MARKERS[model],
+                    s=22,
+                    alpha=0.28,
+                    linewidths=0,
+                    zorder=2,
+                )
             axis.errorbar(
                 cfg.ns,
                 means,
@@ -1410,8 +1447,8 @@ def plot_capacity(rows: Sequence[Mapping[str, Any]], cfg: Config, figure_dir: Pa
     _suptitle(
         fig,
         "Trained attention support determines Neighbor Associative Recall capacity",
-        "Each point is a separately trained fixed-N official GRIT; bars are seed-level 95% intervals. "
-        "Audited retries are disclosed in the performance table.",
+        "Faint markers are individual runs; lines are means and bars are seed-level 95% intervals. "
+        "Replicate counts and audited retries are disclosed in the performance table.",
     )
     fig.subplots_adjust(top=0.84, bottom=0.20, wspace=0.14)
     save_figure(fig, figure_dir, "01_fixed_n_capacity")
@@ -1560,10 +1597,12 @@ def make_all_figures(
     configure_plots()
     figure_dir, table_dir = run_dir / "figures", run_dir / "tables"
     performance = performance_rows(payloads)
+    performance_summary = performance_summary_rows(performance, cfg)
     heads = head_rows(analyses)
     families = family_rows(analyses)
     carriage = carriage_rows(analyses)
     write_csv(table_dir / "heldout_performance.csv", performance)
+    write_csv(table_dir / "heldout_performance_summary.csv", performance_summary)
     write_csv(table_dir / "head_mechanisms.csv", heads)
     write_csv(table_dir / "family_ablations.csv", families)
     write_csv(table_dir / "aggregate_carriage.csv", carriage)
@@ -1599,6 +1638,32 @@ def parse_str_tuple(value: str | Sequence[str]) -> tuple[str, ...]:
     return tuple(map(str, value))
 
 
+def supplemental_seed_cells(
+    cfg: Config,
+    *,
+    model_name: str,
+    width: int,
+    records: int,
+    seeds: Sequence[int],
+) -> list[tuple[str, int, int, int]]:
+    """Validate performance-only supplemental repeats without altering the base fingerprint."""
+    seeds = tuple(map(int, seeds))
+    if not seeds:
+        return []
+    if model_name not in cfg.models:
+        raise ValueError("supplemental model must be present in --models")
+    if int(width) not in cfg.widths:
+        raise ValueError("supplemental width must be present in --widths")
+    if int(records) not in cfg.ns:
+        raise ValueError("supplemental N must be present in --ns")
+    if len(set(seeds)) != len(seeds):
+        raise ValueError("supplemental seeds must be unique")
+    overlap = sorted(set(seeds).intersection(cfg.seeds))
+    if overlap:
+        raise ValueError(f"supplemental seeds must be new; overlap with base seeds: {overlap}")
+    return [(str(model_name), int(width), int(records), seed) for seed in seeds]
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run-name", default="nar_grit_fixed_n_v3")
@@ -1612,6 +1677,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ns", default="4,8,16,32,64")
     parser.add_argument("--mechanistic-ns", default="4,16,64")
     parser.add_argument("--seeds", default="0,1,2")
+    parser.add_argument("--supplement-model", default="dense")
+    parser.add_argument("--supplement-width", type=int, default=64)
+    parser.add_argument("--supplement-n", type=int, default=32)
+    parser.add_argument(
+        "--supplement-seeds",
+        default="",
+        help="new performance-only seeds for one targeted model/width/N cell",
+    )
     parser.add_argument("--steps", type=int, default=10_000)
     parser.add_argument("--early-stopping-loss-threshold", type=float, default=0.001)
     parser.add_argument("--batch-size", type=int, default=64)
@@ -1710,10 +1783,15 @@ def resolve_device(requested: str) -> Any:
     return torch.device(requested)
 
 
-def load_payloads(cfg: Config, run_dir: Path) -> list[dict[str, Any]]:
+def load_payloads(
+    cfg: Config,
+    run_dir: Path,
+    supplemental: Sequence[tuple[str, int, int, int]] = (),
+) -> list[dict[str, Any]]:
     import torch
 
-    payloads = []
+    payloads: list[dict[str, Any]] = []
+    loaded: set[tuple[int, int, str, int]] = set()
     for width in cfg.widths:
         for records in cfg.ns:
             for model_name in cfg.models:
@@ -1721,7 +1799,19 @@ def load_payloads(cfg: Config, run_dir: Path) -> list[dict[str, Any]]:
                     path = checkpoint_path(run_dir, cfg, model_name, width, records, seed)
                     if not path.exists():
                         raise FileNotFoundError(f"missing checkpoint: {path}")
-                    payloads.append(torch.load(path, map_location="cpu", weights_only=False))
+                    payload = torch.load(path, map_location="cpu", weights_only=False)
+                    payloads.append(payload)
+                    loaded.add(payload_cell(payload))
+    for model_name, width, records, seed in supplemental:
+        key = (int(width), int(records), str(model_name), int(seed))
+        if key in loaded:
+            continue
+        path = checkpoint_path(run_dir, cfg, model_name, width, records, seed)
+        if not path.exists():
+            raise FileNotFoundError(f"missing supplemental checkpoint: {path}")
+        payload = torch.load(path, map_location="cpu", weights_only=False)
+        payloads.append(payload)
+        loaded.add(key)
     return payloads
 
 
@@ -1966,6 +2056,16 @@ def main(argv: Sequence[str] | None = None) -> dict[str, Any] | None:
     if not 0 <= args.outlier_peer_range < args.outlier_min_gap:
         parser.error("--outlier-peer-range must be non-negative and smaller than the gap")
     cfg = config_from_args(args)
+    try:
+        supplemental = supplemental_seed_cells(
+            cfg,
+            model_name=args.supplement_model,
+            width=args.supplement_width,
+            records=args.supplement_n,
+            seeds=parse_int_tuple(args.supplement_seeds),
+        )
+    except ValueError as error:
+        parser.error(str(error))
     run_dir = Path(cfg.drive_root) / cfg.run_name
     run_dir.mkdir(parents=True, exist_ok=True)
     write_json(run_dir / "experiment_config.json", {
@@ -1974,6 +2074,12 @@ def main(argv: Sequence[str] | None = None) -> dict[str, Any] | None:
         "config": asdict(cfg),
         "paper_task_alignment": TASK_ALIGNMENT,
         "intentional_difference": INTENTIONAL_DIFFERENCE,
+        "supplemental_performance_repeats": [{
+            "model": model_name,
+            "width": width,
+            "N": records,
+            "seed": seed,
+        } for model_name, width, records, seed in supplemental],
         "outlier_audit": {
             "enabled": bool(args.retrain_outliers),
             "minimum_accuracy_gap": float(args.outlier_min_gap),
@@ -1984,7 +2090,7 @@ def main(argv: Sequence[str] | None = None) -> dict[str, Any] | None:
     })
 
     if args.phase == "figures":
-        payloads = load_payloads(cfg, run_dir)
+        payloads = load_payloads(cfg, run_dir, supplemental)
         analyses = load_analyses(cfg, run_dir)
         assert_parameter_matching(payloads, cfg, run_dir)
         return make_all_figures(payloads, analyses, cfg, run_dir)
@@ -2030,8 +2136,27 @@ def main(argv: Sequence[str] | None = None) -> dict[str, Any] | None:
                             )
                         payloads.append(payload)
                         del model
+        for model_name, width, records, seed in supplemental:
+            model, payload = train_model(
+                cfg,
+                model_name=model_name,
+                width=width,
+                records=records,
+                seed=seed,
+                run_dir=run_dir,
+                device=device,
+                force=args.force_training,
+                load_only=False,
+            )
+            print(
+                f"[supplement {model_name} d={width} N={records} seed={seed}] "
+                f"accuracy={float(payload['heldout']['accuracy']):.3f}",
+                flush=True,
+            )
+            payloads.append(payload)
+            del model
     elif args.retrain_outliers:
-        payloads = load_payloads(cfg, run_dir)
+        payloads = load_payloads(cfg, run_dir, supplemental)
 
     if args.retrain_outliers:
         if payloads is None:
@@ -2088,7 +2213,7 @@ def main(argv: Sequence[str] | None = None) -> dict[str, Any] | None:
             print("[done] analysis caches are complete; run --phase figures next", flush=True)
             return None
 
-    payloads = load_payloads(cfg, run_dir)
+    payloads = load_payloads(cfg, run_dir, supplemental)
     analyses = load_analyses(cfg, run_dir)
     assert_parameter_matching(payloads, cfg, run_dir)
     summary = make_all_figures(payloads, analyses, cfg, run_dir)
