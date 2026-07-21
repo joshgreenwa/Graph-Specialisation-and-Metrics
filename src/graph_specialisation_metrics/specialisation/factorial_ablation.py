@@ -8,8 +8,8 @@ disjoint head families on the established coordinates
     J     = (S~_sem + S~_str) / 2                    (transport strength),
 
 namely relatively semantic / relatively structural / generalist crossed with high / low J.
-Generalists are closest to D=0; after removing them, the highest-D half is semantic and the
-lowest-D half structural. Thus labels are within-model ranks, not claims that D crosses zero.
+The highest-D tail is semantic, the lowest-D tail structural, and the middle-D band generalist.
+Thus labels are within-model ranks, not claims that D crosses zero.
 Families within each J stratum are matched for layer, J, and clean pre-head throughput ||wV||, then ablated
 cumulatively at the established routed-value site.  The active scientific null is the matched
 generalist family; low-J generalists are the inactive null.  Layer-matched random sets are retained
@@ -89,26 +89,25 @@ def _candidate_cells(D: np.ndarray, J: np.ndarray, *, generalist_fraction: float
                      activity_floor_quantile: float) -> tuple[dict[str, np.ndarray], dict]:
     """Partition heads into six disjoint candidate cells using score coordinates only.
 
-    The closest ``generalist_fraction`` of heads to D=0 are generalists. The remaining heads are
-    split by within-model D rank: the highest-D half is relatively semantic and the lowest-D half
-    relatively structural. This guarantees comparative specialist pools even when every head is
-    on the same side of D=0. Each preference pool is split at its own median J; low-J specialists
-    below a model-wide activity floor are dropped because relative D there is ratio-noise prone.
+    Heads are partitioned by within-model D rank: the highest-D tail is relatively semantic, the
+    lowest-D tail relatively structural, and the central ``generalist_fraction`` is the
+    preference-intermediate generalist pool. This guarantees disjoint comparative pools even when
+    every head is on the same side of D=0. Each pool is split at its own median J; low-J
+    specialists below a model-wide activity floor are dropped because relative D there is
+    ratio-noise prone.
     """
     d, j = np.asarray(D, float).reshape(-1), np.asarray(J, float).reshape(-1)
     n = len(d)
     if not (0.1 <= generalist_fraction <= 0.6):
         raise ValueError("generalist_fraction must be between 0.1 and 0.6")
     n_gen = max(2, min(n - 2, int(round(float(generalist_fraction) * n))))
-    gen = np.argsort(np.abs(d), kind="stable")[:n_gen]
-    is_gen = np.zeros(n, bool); is_gen[gen] = True
-    remaining = np.flatnonzero(~is_gen)
-    ranked = remaining[np.argsort(d[remaining], kind="stable")]
-    split = len(ranked) // 2
+    ranked = np.argsort(d, kind="stable")
+    n_tail = n - n_gen
+    split = n_tail // 2
     pools = {
-        "generalist": gen,
         "structural": ranked[:split],
-        "semantic": ranked[split:],
+        "generalist": ranked[split:split + n_gen],
+        "semantic": ranked[split + n_gen:],
     }
     floor = float(np.quantile(j, activity_floor_quantile))
     cells: dict[str, np.ndarray] = {}
@@ -150,7 +149,7 @@ def _priority(idx: np.ndarray, pref: str, strength: str, D: np.ndarray, J: np.nd
     """Predeclared score-only priority used to order matched triplets cumulatively."""
     d, j = D.reshape(-1)[idx], J.reshape(-1)[idx]
     if pref == "generalist":
-        pref_strength = -np.abs(d)
+        pref_strength = -np.abs(d - float(np.median(D)))
     elif pref == "semantic":
         pref_strength = d
     else:

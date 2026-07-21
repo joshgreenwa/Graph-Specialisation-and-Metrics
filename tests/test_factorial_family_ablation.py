@@ -28,7 +28,7 @@ def _score_fixture(L=10, H=8):
     return {"S_sem": sem, "S_str": stru}, throughput
 
 
-def test_factorial_selection_is_disjoint_signed_and_strength_split():
+def test_factorial_selection_is_disjoint_relative_and_strength_split():
     scores, throughput = _score_fixture()
     out = F.select_factorial_families(
         scores, throughput, gsem=1.0, gstr=1.0, family_size=5,
@@ -48,15 +48,21 @@ def test_factorial_selection_is_disjoint_signed_and_strength_split():
         assert diag[f"{pref}_highJ"]["mean_J"] > diag[f"{pref}_lowJ"]["mean_J"]
 
 
-def test_factorial_selection_refuses_missing_signed_channel():
-    # A genuinely all-semantic model must not have its least-semantic heads renamed structural.
-    J = np.ones((4, 8))
+def test_factorial_selection_uses_relative_specialists_when_all_d_is_positive():
+    # Absolute D need not cross zero: the lowest remaining D ranks form the relatively structural
+    # comparison family, while the high/low-J split remains real and independently estimable.
+    J = np.tile(np.linspace(.2, 2.0, 8), (4, 1))
     Drel = np.linspace(.1, .9, 32).reshape(4, 8)
     scores = {"S_sem": J * (1 + Drel), "S_str": J * (1 - Drel)}
-    with np.testing.assert_raises_regex(RuntimeError, "structural candidates"):
-        F.select_factorial_families(scores, np.ones_like(J), gsem=1, gstr=1, family_size=2)
-    with np.testing.assert_raises_regex(F.FactorialNotEstimable, "structural candidates"):
-        F.check_factorial_estimable(scores, gsem=1, gstr=1, family_size=2)
+    F.check_factorial_estimable(scores, gsem=1, gstr=1, family_size=2)
+    out = F.select_factorial_families(
+        scores, np.ones_like(J), gsem=1, gstr=1, family_size=2)
+    diag = out["diagnostics"]
+    for strength in F.STRENGTHS:
+        assert diag[f"structural_{strength}"]["mean_D"] > 0
+        assert (diag[f"structural_{strength}"]["mean_D"]
+                < diag[f"generalist_{strength}"]["mean_D"]
+                < diag[f"semantic_{strength}"]["mean_D"])
 
 
 def _family_cache_fixture(G=40, K=4, B=4, R=5):
@@ -78,7 +84,8 @@ def test_family_cache_loader_and_figures(tmp_path):
     path = D.family_ablation_npz_path(tmp_path, task)
     path.parent.mkdir(parents=True)
     item = _family_cache_fixture()
-    np.savez(path, cache_version=np.asarray(1), score_fingerprint=np.asarray("abc"), **item)
+    np.savez(path, cache_version=np.asarray(F.CACHE_VERSION),
+             score_fingerprint=np.asarray("abc"), **item)
     loaded = D.load_family_ablation(path)
     assert loaded["family_names"] == list(F.FAMILY_NAMES)
     assert loaded["loss"].shape == item["loss"].shape

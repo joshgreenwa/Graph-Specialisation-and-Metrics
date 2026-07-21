@@ -590,7 +590,7 @@ def run_all(tasks: Sequence[str] = _data.DEFAULT_TASKS, *,
                 }
                 summary_path.write_text(json.dumps(verdict, indent=2), encoding="utf-8")
                 log(f"[family-selection] {task}: NOT ESTIMABLE — {reason}. "
-                    "No heads were relabelled; the core all-model comparison will continue.")
+                    "No undersized groups were fabricated; the core comparison will continue.")
                 status["factorial_family_ablation"][task] = f"not-estimable: {reason}"
                 family_current[task] = True
                 continue

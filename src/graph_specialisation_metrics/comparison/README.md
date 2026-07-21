@@ -86,10 +86,10 @@ channel-split ablation figure to validate its causal interpretation.
 ### Factorial family-ablation programme
 
 The score plane is converted into six **disjoint** within-model families:
-`{semantic, structural, generalist} × {high J, low J}`. Generalists are the heads nearest
-`D_rel=0`; among the remaining heads, the highest-`D_rel` half is relatively semantic and the
-lowest-`D_rel` half relatively structural. These are within-model rankings, so the structural
-family need not have negative absolute `D_rel`. Within each `J` stratum, the three families are
+`{semantic, structural, generalist} × {high J, low J}`. The highest-`D_rel` tail is relatively
+semantic, the lowest-`D_rel` tail relatively structural, and the middle-`D_rel` band generalist.
+These are within-model rankings, so the structural family need not have negative absolute
+`D_rel`. Within each `J` stratum, the three families are
 selected as matched triplets for layer, `J`, and clean pre-head `||wV||` throughput. Thus the
 high-`J` generalist is the active null and the low-`J` generalist the inactive null; uniformly
 random heads appear only as a secondary, exactly layer-count-matched reference band.

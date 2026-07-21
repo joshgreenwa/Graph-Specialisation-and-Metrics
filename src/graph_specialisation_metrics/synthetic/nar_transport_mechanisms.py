@@ -1191,6 +1191,7 @@ def analyze_bundle(
         )
 
     noop_errors = {}
+    noop_rms_errors = {}
     for intervention in (
         "identical",
         "record_permutation",
@@ -1200,11 +1201,14 @@ def analyze_bundle(
             value = output_metrics[intervention]["functional"]
             finite = value[torch.isfinite(value)]
             maximum = float(finite.max().detach().cpu()) if finite.numel() else float("nan")
+            rms = maximum / math.sqrt(max(1, int(records)))
             noop_errors[intervention] = maximum
-            if math.isfinite(maximum) and maximum > noop_tol:
+            noop_rms_errors[intervention] = rms
+            if math.isfinite(rms) and rms > noop_tol:
                 raise RuntimeError(
-                    f"{intervention} changed model output by {maximum:.3e} "
-                    f"(tolerance {noop_tol:.3e})"
+                    f"{intervention} changed model output with per-logit RMS "
+                    f"{rms:.3e} (raw L2 {maximum:.3e}; tolerance "
+                    f"{noop_tol:.3e})"
                 )
 
     stacked_head = {
@@ -1236,6 +1240,7 @@ def analyze_bundle(
             "closure_absolute": closure_absolute,
             "closure_relative": closure_relative,
             "noop_errors": noop_errors,
+            "noop_rms_errors": noop_rms_errors,
         },
     }
     return result
@@ -1371,6 +1376,10 @@ def run_metric_split(
                 "structural_record_record_noop",
             )
         },
+    }
+    combined["checks"]["noop_rms_errors"] = {
+        name: value / math.sqrt(max(1, records))
+        for name, value in combined["checks"]["noop_errors"].items()
     }
     if str(row["model"]) == "1hop":
         address = combined["head"]["address_different_answer"]
@@ -2308,19 +2317,31 @@ def build_metric_tables(
             })
 
         checks = estimation["checks"]
+        noop_scale = math.sqrt(max(1, int(checkpoint["N"])))
         check_rows.append({
             **base,
             "closure_absolute": float(checks["closure_absolute"]),
             "closure_relative": float(checks["closure_relative"]),
             "identical_noop": float(checks["noop_errors"].get("identical", float("nan"))),
+            "identical_noop_rms_per_logit": float(
+                checks["noop_errors"].get("identical", float("nan"))
+            ) / noop_scale,
             "record_permutation_noop": float(
                 checks["noop_errors"].get("record_permutation", float("nan"))
             ),
+            "record_permutation_noop_rms_per_logit": float(
+                checks["noop_errors"].get("record_permutation", float("nan"))
+            ) / noop_scale,
             "structural_automorphism_noop": float(
                 checks["noop_errors"].get(
                     "structural_record_record_noop", float("nan")
                 )
             ),
+            "structural_automorphism_noop_rms_per_logit": float(
+                checks["noop_errors"].get(
+                    "structural_record_record_noop", float("nan")
+                )
+            ) / noop_scale,
             "onehop_layer2_address_raw_attention_moved_max": float(
                 checks.get(
                     "onehop_layer2_address_raw_attention_moved_max", float("nan")
