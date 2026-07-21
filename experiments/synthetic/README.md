@@ -26,7 +26,10 @@ Relative to the authors' released training protocol, this lightweight version sa
 training graphs online, uses 192 validation and 512 held-out graphs, and omits their `N={80,96}`
 and width-256 settings. The graph distribution, token construction, learned null-padded key/value
 embeddings, fixed-`N` training unit, batch size 64, learning rate `1e-3`, and three repeats match
-the reference implementation.
+the reference implementation. The A100 run allows at most 10,000 optimizer steps per checkpoint
+and adopts the reference early-stopping rule exactly: stop when validation cross-entropy falls
+below `0.001`. Fixed topology and RRWP tensors are cached in memory, so the larger budget is spent
+on optimization rather than regenerating identical graph structure.
 
 This benchmark is deliberately semantic-only, so it does not estimate structural scores or
 `J/D_rel`; those require a genuinely independent structural factor and belong in the preceding

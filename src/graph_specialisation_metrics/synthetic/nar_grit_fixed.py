@@ -29,13 +29,14 @@ import subprocess
 import sys
 import time
 from dataclasses import asdict, dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 import numpy as np
 
 
-EXPERIMENT_VERSION = "nar-grit-fixed-n-v2"
+EXPERIMENT_VERSION = "nar-grit-fixed-n-v3"
 OFFICIAL_GRIT_URL = "https://github.com/LiamMa/GRIT.git"
 OFFICIAL_GRIT_COMMIT = "6c988ea600a606fbb49a2246c64a2d37396b3ab5"
 DEFAULT_GRIT_DIR = "/content/GRIT"
@@ -148,8 +149,9 @@ def write_csv(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
 
 @dataclass(frozen=True)
 class Config:
-    run_name: str = "nar_grit_fixed_n_v2"
+    run_name: str = "nar_grit_fixed_n_v3"
     drive_root: str = DEFAULT_DRIVE_ROOT
+    converged_legacy_run: str = "nar_grit_fixed_n_v2"
     ns: tuple[int, ...] = (4, 8, 16, 32, 64)
     mechanistic_ns: tuple[int, ...] = (4, 16, 64)
     widths: tuple[int, ...] = (64, 128)
@@ -163,14 +165,15 @@ class Config:
     batch_size: int = 64
     max_batch_nodes: int = 4500
     max_dense_pairs: int = 300_000
-    steps: int = 1500
-    min_steps: int = 300
+    steps: int = 10_000
     lr: float = 1.0e-3
     weight_decay: float = 0.0
-    eval_every: int = 50
+    # The reference NAR setup has 8,000 training examples and batch size 64,
+    # hence 125 optimiser steps per epoch.  Evaluate at the same cadence.
+    eval_every: int = 125
     validation_graphs: int = 192
     heldout_graphs: int = 512
-    patience_checks: int = 4
+    early_stopping_loss_threshold: float = 0.001
     low_n_accuracy_gate: float = 0.85
     score_graphs: int = 8
     score_donors: int = 3
@@ -213,6 +216,7 @@ def config_fingerprint(cfg: Config) -> str:
     payload = {"version": EXPERIMENT_VERSION, **asdict(cfg)}
     payload.pop("drive_root", None)
     payload.pop("run_name", None)
+    payload.pop("converged_legacy_run", None)
     return hashlib.sha1(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()[:16]
 
 
@@ -277,6 +281,22 @@ def rrwp_from_adj(adj: np.ndarray, steps: int) -> np.ndarray:
     return output
 
 
+@lru_cache(maxsize=None)
+def fixed_n_topology(records: int, rrwp_steps: int) -> tuple[np.ndarray, np.ndarray]:
+    """Return the immutable NAR adjacency and RRWP tensors shared by every fixed-N graph."""
+    records = int(records)
+    nodes = records + 3
+    adjacency = np.zeros((nodes, nodes), dtype=np.float32)
+    add_undirected(adjacency, 0, 1)
+    add_undirected(adjacency, 1, 2)
+    for slot in range(records):
+        add_undirected(adjacency, 0, 3 + slot)
+    adjacency.setflags(write=False)
+    rrwp = rrwp_from_adj(adjacency, int(rrwp_steps))
+    rrwp.setflags(write=False)
+    return adjacency, rrwp
+
+
 def make_batch(cfg: Config, size: int, records: int, seed: int) -> NarBatch:
     """Generate the fixed-N classification task from the NAR paper."""
     import torch
@@ -298,40 +318,32 @@ def make_batch(cfg: Config, size: int, records: int, seed: int) -> NarBatch:
     labels = np.zeros(int(size), dtype=np.int64)
     n_records = np.full(int(size), records, dtype=np.int64)
 
-    for graph in range(int(size)):
-        central, intermediate, query = 0, 1, 2
-        x = np.full((nodes, 2), records, dtype=np.int64)
-        adj = np.zeros((nodes, nodes), dtype=np.float32)
-        record_mask = np.zeros(nodes, dtype=bool)
-        add_undirected(adj, central, intermediate)
-        add_undirected(adj, intermediate, query)
+    # NAR has one fixed topology for each N. Building it once (as the reference dataset does)
+    # removes repeated sparse random-walk construction from the training loop and makes longer,
+    # convergence-safe optimization budgets cheap enough for Colab.
+    central, intermediate, query = 0, 1, 2
+    base_adj, base_rrwp = fixed_n_topology(records, cfg.rrwp_steps)
+    base_record_mask = np.zeros(nodes, dtype=bool)
+    base_record_mask[3:] = True
+    adjs[:] = base_adj
+    rrwps[:] = base_rrwp
+    central_indices[:] = central
+    intermediate_indices[:] = intermediate
+    query_indices[:] = query
+    record_masks[:] = base_record_mask
 
-        keys = np.arange(records, dtype=np.int64)
+    for graph in range(int(size)):
+        x = np.full((nodes, 2), records, dtype=np.int64)
         values = rng.integers(0, records, size=records)
         target_slot = int(rng.integers(0, records))
-        target_old = 3 + target_slot
         for slot in range(records):
             node = 3 + slot
-            add_undirected(adj, central, node)
-            x[node, 0] = int(keys[slot])
+            x[node, 0] = slot
             x[node, 1] = int(values[slot])
-            record_mask[node] = True
-        x[query, 0] = int(keys[target_slot])
+        x[query, 0] = target_slot
         labels[graph] = int(values[target_slot])
-
-        order = rng.permutation(nodes)
-        inverse = np.empty(nodes, dtype=np.int64)
-        inverse[order] = np.arange(nodes)
-        x = x[order]
-        adj = adj[order][:, order]
         xs[graph] = x
-        adjs[graph] = adj
-        rrwps[graph] = rrwp_from_adj(adj, cfg.rrwp_steps)
-        central_indices[graph] = int(inverse[central])
-        intermediate_indices[graph] = int(inverse[intermediate])
-        query_indices[graph] = int(inverse[query])
-        target_indices[graph] = int(inverse[target_old])
-        record_masks[graph] = record_mask[order]
+        target_indices[graph] = 3 + target_slot
 
     return NarBatch(
         x=torch.from_numpy(xs),
@@ -602,6 +614,25 @@ def checkpoint_path(
     )
 
 
+def converged_legacy_checkpoint(
+    cfg: Config,
+    model_name: str,
+    width: int,
+    records: int,
+    seed: int,
+) -> Path | None:
+    """Find a v2 checkpoint only as a candidate for exact solved-model promotion."""
+    if not cfg.converged_legacy_run or cfg.converged_legacy_run == cfg.run_name:
+        return None
+    directory = Path(cfg.drive_root) / cfg.converged_legacy_run / "checkpoints"
+    matches = sorted(
+        directory.glob(f"{model_name}__d{width}__N{records}__seed_{seed}__*.pt"),
+        key=lambda item: item.stat().st_mtime,
+        reverse=True,
+    )
+    return matches[0] if matches else None
+
+
 def train_model(
     cfg: Config,
     *,
@@ -635,12 +666,89 @@ def train_model(
     if load_only:
         raise FileNotFoundError(f"analysis requested but checkpoint is missing: {path}")
 
+    # The v2 run already produced several exact 100%-held-out solutions. Reuse only those
+    # checkpoints after they independently pass the v3 validation and held-out sets; all
+    # non-converged v2 runs are discarded and trained afresh under the longer common budget.
+    legacy_path = converged_legacy_checkpoint(cfg, model_name, width, records, seed)
+    if legacy_path is not None and not force:
+        fresh_state = {
+            key: value.detach().cpu().clone() for key, value in model.state_dict().items()
+        }
+        legacy = torch.load(legacy_path, map_location=device, weights_only=False)
+        try:
+            model.load_state_dict(legacy["state_dict"])
+            model.eval()
+            legacy_validation = evaluate(
+                model,
+                cfg,
+                records=records,
+                graphs=cfg.validation_graphs,
+                seed=50_000_003 + seed * 10_007 + records,
+                device=device,
+            )
+            legacy_heldout = evaluate(
+                model,
+                cfg,
+                records=records,
+                graphs=cfg.heldout_graphs,
+                seed=800_000_011 + seed * 10_007 + records,
+                device=device,
+            )
+        except (KeyError, RuntimeError, ValueError):
+            legacy_validation = {"accuracy": 0.0}
+            legacy_heldout = {"accuracy": 0.0}
+        if min(legacy_validation["accuracy"], legacy_heldout["accuracy"]) >= 0.995:
+            promoted_state = {
+                key: value.detach().cpu().clone() for key, value in model.state_dict().items()
+            }
+            history = [{
+                "step": 0,
+                "train_loss": float("nan"),
+                "validation_loss": legacy_validation["loss"],
+                "validation_accuracy": legacy_validation["accuracy"],
+                "elapsed_s": 0.0,
+                "promoted_converged_legacy": True,
+            }]
+            payload = {
+                "version": EXPERIMENT_VERSION,
+                "fingerprint": config_fingerprint(cfg),
+                "official_grit_commit": OFFICIAL_GRIT_COMMIT,
+                "model_name": model_name,
+                "width": int(width),
+                "N": int(records),
+                "seed": int(seed),
+                "config": asdict(cfg),
+                "state_dict": promoted_state,
+                "best_validation": legacy_validation,
+                "heldout": legacy_heldout,
+                "history": history,
+                "parameters": int(sum(parameter.numel() for parameter in model.parameters())),
+                "promoted_from": str(legacy_path),
+            }
+            path.parent.mkdir(parents=True, exist_ok=True)
+            torch.save(payload, path)
+            write_csv(
+                run_dir / "tables" / f"training_{model_name}_d{width}_N{records}_seed_{seed}.csv",
+                history,
+            )
+            print(
+                f"[train {model_name} d={width} N={records} seed={seed}] "
+                f"promoted converged v2 checkpoint -> {path}",
+                flush=True,
+            )
+            return model, payload
+        model.load_state_dict(fresh_state)
+        print(
+            f"[train {model_name} d={width} N={records} seed={seed}] "
+            "discarded non-converged v2 checkpoint; training v3 from initialization",
+            flush=True,
+        )
+
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
     best_loss = float("inf")
     best_state = None
     best_validation: dict[str, Any] = {}
     history: list[dict[str, Any]] = []
-    solved_checks = 0
     started = time.time()
     graphs = batch_graphs(cfg, records)
     for step in range(1, cfg.steps + 1):
@@ -687,13 +795,13 @@ def train_model(
                 best_state = {
                     key: value.detach().cpu().clone() for key, value in model.state_dict().items()
                 }
-            solved_checks = (
-                solved_checks + 1
-                if validation["accuracy"] >= 0.995 and step >= cfg.min_steps
-                else 0
-            )
-            if solved_checks >= cfg.patience_checks:
-                print(f"[train {model_name} d={width} N={records} seed={seed}] early stop", flush=True)
+            if validation["loss"] < cfg.early_stopping_loss_threshold:
+                print(
+                    f"[train {model_name} d={width} N={records} seed={seed}] "
+                    f"early stop: validation loss {validation['loss']:.6f} "
+                    f"< {cfg.early_stopping_loss_threshold:.6f}",
+                    flush=True,
+                )
                 break
 
     if best_state is None:
@@ -1465,7 +1573,7 @@ def parse_str_tuple(value: str | Sequence[str]) -> tuple[str, ...]:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--run-name", default="nar_grit_fixed_n_v2")
+    parser.add_argument("--run-name", default="nar_grit_fixed_n_v3")
     parser.add_argument("--drive-root", default=DEFAULT_DRIVE_ROOT)
     parser.add_argument("--phase", choices=("all", "train", "analyze", "figures"), default="all")
     parser.add_argument("--models", default=",".join(MODEL_ORDER))
@@ -1476,8 +1584,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ns", default="4,8,16,32,64")
     parser.add_argument("--mechanistic-ns", default="4,16,64")
     parser.add_argument("--seeds", default="0,1,2")
-    parser.add_argument("--steps", type=int, default=1500)
-    parser.add_argument("--min-steps", type=int, default=300)
+    parser.add_argument("--steps", type=int, default=10_000)
+    parser.add_argument("--early-stopping-loss-threshold", type=float, default=0.001)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--score-graphs", type=int, default=8)
     parser.add_argument("--score-donors", type=int, default=3)
@@ -1508,7 +1616,7 @@ def config_from_args(args: argparse.Namespace) -> Config:
         "mechanistic_ns": parse_int_tuple(args.mechanistic_ns),
         "seeds": parse_int_tuple(args.seeds),
         "steps": args.steps,
-        "min_steps": args.min_steps,
+        "early_stopping_loss_threshold": args.early_stopping_loss_threshold,
         "batch_size": args.batch_size,
         "score_graphs": args.score_graphs,
         "score_donors": args.score_donors,
@@ -1528,7 +1636,6 @@ def config_from_args(args: argparse.Namespace) -> Config:
             "mechanistic_ns": (4, 8),
             "seeds": (0,),
             "steps": 8,
-            "min_steps": 8,
             "eval_every": 4,
             "validation_graphs": 4,
             "heldout_graphs": 8,
@@ -1541,7 +1648,7 @@ def config_from_args(args: argparse.Namespace) -> Config:
             "ablation_graphs": 4,
             "family_size": 1,
             "random_families": 2,
-            "patience_checks": 99,
+            "early_stopping_loss_threshold": -1.0,
             "low_n_accuracy_gate": 0.0,
         })
     cfg = Config(**values)

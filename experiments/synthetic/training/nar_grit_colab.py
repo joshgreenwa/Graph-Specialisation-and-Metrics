@@ -91,13 +91,13 @@ from graph_specialisation_metrics.synthetic.nar_grit_fixed import main
 
 # Normal run: trains only missing checkpoints, then caches mechanisms and makes every figure.
 # Cheap reruns after training:
-#   CELL_ARGS = ["--run-name", "nar_grit_fixed_n_v2", "--phase", "analyze"]
-#   CELL_ARGS = ["--run-name", "nar_grit_fixed_n_v2", "--phase", "figures"]
+#   CELL_ARGS = ["--run-name", "nar_grit_fixed_n_v3", "--phase", "analyze"]
+#   CELL_ARGS = ["--run-name", "nar_grit_fixed_n_v3", "--phase", "figures"]
 # Installation/plumbing only:
 #   CELL_ARGS = ["--run-name", "nar_grit_smoke", "--fast-dev-run", "--allow-low-accuracy"]
 CELL_ARGS = [
     "--run-name",
-    "nar_grit_fixed_n_v2",
+    "nar_grit_fixed_n_v3",
     "--phase",
     "all",
     "--models",
@@ -116,6 +116,10 @@ CELL_ARGS = [
     "4,16,64",
     "--seeds",
     "0,1,2",
+    "--steps",
+    "10000",
+    "--early-stopping-loss-threshold",
+    "0.001",
 ]
 
 main(CELL_ARGS)
