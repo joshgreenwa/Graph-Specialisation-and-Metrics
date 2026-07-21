@@ -112,6 +112,14 @@ def channel_ablation_npz_path(spec_collate, task: str) -> Path:
     return Path(spec_collate) / task / f"channel_ablation_{task}.npz"
 
 
+def family_ablation_npz_path(spec_collate, task: str) -> Path:
+    return Path(spec_collate) / task / f"factorial_family_ablation_{task}.npz"
+
+
+def family_ablation_summary_path(spec_collate, task: str) -> Path:
+    return Path(spec_collate) / task / f"factorial_family_ablation_{task}.json"
+
+
 def spec_stats_path(spec_collate, task: str) -> Path:
     return Path(spec_collate) / task / f"stats_{task}.json"
 
@@ -193,6 +201,39 @@ def load_channel_ablation_by_task(spec_collate, tasks: Sequence[str]) -> dict:
         c = load_channel_ablation(channel_ablation_npz_path(spec_collate, t))
         if c is not None:
             out[t] = c
+    return out
+
+
+# Cached-score D x J family ablation. Per-graph arrays are retained so every displayed contrast
+# can use a paired graph bootstrap rather than treating heads or random sets as observations.
+_FAMILY_ABLATION_KEYS = (
+    "family_names", "budgets", "functional", "loss", "random_functional", "random_loss",
+    "clean_pred", "clean_loss", "y", "graph_ids", "throughput_graph", "D", "J", "heads",
+)
+
+
+def load_family_ablation(path) -> Optional[dict]:
+    """Read a ``factorial_family_ablation_<task>.npz`` cache, or ``None`` when absent."""
+    path = Path(path)
+    if not path.exists():
+        return None
+    with np.load(path) as z:
+        out = {k: np.asarray(z[k]) for k in _FAMILY_ABLATION_KEYS if k in z}
+        if "family_names" in out:
+            out["family_names"] = [str(x) for x in out["family_names"].tolist()]
+        out["cache_version"] = int(np.asarray(z["cache_version"]).item()) \
+            if "cache_version" in z else 0
+        out["score_fingerprint"] = str(np.asarray(z["score_fingerprint"]).item()) \
+            if "score_fingerprint" in z else ""
+    return out
+
+
+def load_family_ablation_by_task(spec_collate, tasks: Sequence[str]) -> dict:
+    out = {}
+    for task in tasks:
+        item = load_family_ablation(family_ablation_npz_path(spec_collate, task))
+        if item is not None:
+            out[task] = item
     return out
 
 

@@ -735,3 +735,151 @@ def plot_DJ_influence_strength(scores_by_task: dict, chan_by_task: dict, tasks: 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path, dpi=150)
     return fig, str(out_path)
+
+
+# --------------------------------------------------------------------------------------
+# (vi) cached-score D x J factorial family ablation
+# --------------------------------------------------------------------------------------
+
+_FAMILY_COLOURS = {"semantic": "#0072B2", "structural": "#D55E00", "generalist": "#666666"}
+_FAMILY_MARKERS = {"semantic": "o", "structural": "s", "generalist": "^"}
+
+
+def _mean_ci_graph(values, *, n_boot: int = 2000, seed: int = 0):
+    """Mean and paired graph-bootstrap CI for one per-graph statistic."""
+    x = np.asarray(values, float).reshape(-1)
+    x = x[np.isfinite(x)]
+    if not len(x):
+        return float("nan"), float("nan"), float("nan")
+    rng = np.random.default_rng(seed)
+    # Chunking avoids allocating n_boot x G for the larger five-model figures.
+    draws = []
+    for start in range(0, int(n_boot), 256):
+        m = min(256, int(n_boot) - start)
+        idx = rng.integers(0, len(x), size=(m, len(x)))
+        draws.append(x[idx].mean(axis=1))
+    boot = np.concatenate(draws)
+    return float(x.mean()), float(np.quantile(boot, .025)), float(np.quantile(boot, .975))
+
+
+def plot_factorial_family_ablation_curves(family_by_task: dict, tasks: Sequence[str], out_path,
+                                          *, n_boot: int = 2000,
+                                          suptitle: Optional[str] = None):
+    """Cumulative held-out loss impact for the six D x J families, one column per model.
+
+    Rows are high/low J. Within each row semantic and structural specialists are compared to the
+    layer/J/clean-throughput-matched generalist family. The grey band is a secondary layer-matched
+    random-set reference. All panels share raw task-loss units because these are checkpoints on the
+    same ZINC target. Returns ``(fig, path)``.
+    """
+    import matplotlib.pyplot as plt
+
+    tasks = [t for t in tasks if t in family_by_task]
+    if not tasks:
+        raise ValueError("plot_factorial_family_ablation_curves: no family-ablation cache")
+    fig, axes = plt.subplots(2, len(tasks), figsize=(3.45 * len(tasks), 6.6), squeeze=False,
+                             constrained_layout=True, sharey=True)
+    strengths = (("highJ", "high J: active families"), ("lowJ", "low J: weak/inactive control"))
+    for row, (strength, row_label) in enumerate(strengths):
+        for col, task in enumerate(tasks):
+            ax = axes[row][col]
+            item = family_by_task[task]
+            names = list(item["family_names"])
+            budgets = np.asarray(item["budgets"], int)
+            loss = np.asarray(item["loss"], float)
+            for pidx, pref in enumerate(("semantic", "structural", "generalist")):
+                fi = names.index(f"{pref}_{strength}")
+                means, los, his = [], [], []
+                for b in range(len(budgets)):
+                    m, lo, hi = _mean_ci_graph(
+                        loss[fi, b], n_boot=n_boot,
+                        seed=7919 + row * 1000 + col * 100 + pidx * 10 + b)
+                    means.append(m); los.append(lo); his.append(hi)
+                colour = _FAMILY_COLOURS[pref]
+                ax.plot(budgets, means, color=colour, marker=_FAMILY_MARKERS[pref], lw=1.7,
+                        ms=4.5, label=pref)
+                ax.fill_between(budgets, los, his, color=colour, alpha=0.12, linewidth=0)
+
+            rnd = np.asarray(item.get("random_loss", []), float)
+            if rnd.ndim == 4 and rnd.shape[2] > 0:
+                # Distribution of graph-mean impacts over random head sets: not the scientific
+                # null, just a visual reference after exact layer-count matching.
+                set_means = rnd[row].mean(axis=-1)  # [budget, random set]
+                rlo, rhi = np.quantile(set_means, [.025, .975], axis=1)
+                ax.fill_between(budgets, rlo, rhi, color="#999999", alpha=0.12,
+                                label="layer-matched random")
+            ax.axhline(0, color="k", lw=0.7, alpha=0.45)
+            ax.grid(True, alpha=0.22)
+            ax.set_xticks(budgets)
+            if row == 1:
+                ax.set_xlabel("cumulatively ablated heads k")
+            if col == 0:
+                ax.set_ylabel(f"{row_label}\nΔ validation loss")
+            if row == 0:
+                meta = _data.method_meta(task, col)
+                K = int(np.asarray(item["heads"]).shape[1])
+                clean = float(np.asarray(item["clean_loss"], float).mean())
+                ax.set_title(f"{meta['label']}\nK={K}; clean={clean:.3f}", fontsize=9)
+            if row == 0 and col == len(tasks) - 1:
+                ax.legend(fontsize=7.5, framealpha=.9, loc="best")
+    fig.suptitle(suptitle or
+                 ("Matched specialisation-family ablation on held-out ZINC graphs\n"
+                  "specialists vs active generalists; ribbons are paired graph-bootstrap 95% CIs"),
+                 fontsize=12)
+    out_path = Path(out_path); out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=160)
+    return fig, str(out_path)
+
+
+def plot_factorial_family_ablation_contrasts(family_by_task: dict, tasks: Sequence[str], out_path,
+                                             *, n_boot: int = 4000,
+                                             suptitle: Optional[str] = None):
+    """Full-family specialist-minus-matched-generalist contrasts across models.
+
+    Positive functional contrast means the specialist family moves the output more; positive loss
+    contrast means it damages held-out performance more. CIs are paired over the same graphs.
+    """
+    import matplotlib.pyplot as plt
+
+    tasks = [t for t in tasks if t in family_by_task]
+    if not tasks:
+        raise ValueError("plot_factorial_family_ablation_contrasts: no family-ablation cache")
+    fig, axes = plt.subplots(1, 2, figsize=(12.5, 5.2), constrained_layout=True)
+    contrasts = [
+        ("semantic", "highJ", "#0072B2", "o", "semantic, high J"),
+        ("structural", "highJ", "#D55E00", "s", "structural, high J"),
+        ("semantic", "lowJ", "#56B4E9", "o", "semantic, low J"),
+        ("structural", "lowJ", "#E69F00", "s", "structural, low J"),
+    ]
+    x = np.arange(len(tasks), dtype=float)
+    offsets = np.linspace(-0.24, 0.24, len(contrasts))
+    for ax, (outcome, ylabel) in zip(
+            axes, (("functional", "specialist − generalist\nfunctional output movement"),
+                   ("loss", "specialist − generalist\nΔ validation loss"))):
+        for c, (pref, strength, colour, marker, label) in enumerate(contrasts):
+            means, los, his = [], [], []
+            for ti, task in enumerate(tasks):
+                item = family_by_task[task]
+                names = list(item["family_names"])
+                arr = np.asarray(item[outcome], float)
+                target = arr[names.index(f"{pref}_{strength}"), -1]
+                control = arr[names.index(f"generalist_{strength}"), -1]
+                m, lo, hi = _mean_ci_graph(target - control, n_boot=n_boot,
+                                            seed=1543 + c * 100 + ti)
+                means.append(m); los.append(lo); his.append(hi)
+            means, los, his = map(np.asarray, (means, los, his))
+            ax.errorbar(x + offsets[c], means, yerr=[means - los, his - means], fmt=marker,
+                        color=colour, ms=6, capsize=3, lw=1.4, label=label)
+        ax.axhline(0, color="k", lw=0.8)
+        ax.set_xticks(x)
+        ax.set_xticklabels([_data.method_meta(t, i)["label"] for i, t in enumerate(tasks)],
+                           rotation=18, ha="right")
+        ax.set_ylabel(ylabel)
+        ax.grid(True, axis="y", alpha=.25)
+    axes[0].legend(fontsize=8, framealpha=.9)
+    fig.suptitle(suptitle or
+                 ("Does score-targeted family ablation exceed a strength-matched active null?\n"
+                  "full matched families; paired graph-bootstrap 95% CIs"), fontsize=12)
+    out_path = Path(out_path); out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=160)
+    return fig, str(out_path)

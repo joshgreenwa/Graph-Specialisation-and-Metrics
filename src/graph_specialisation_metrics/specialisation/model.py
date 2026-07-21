@@ -78,6 +78,8 @@ class SpecConfig:
     analysis_seed: int = 0
     partner_match: str = "degree"
     content_adapter: object = field(default_factory=FullNodeContentAdapter)
+    resume: bool = True
+    checkpoint_every: int = 4
 
 
 class GritHeadModel:
@@ -324,6 +326,7 @@ class GritHeadModel:
                 # ``batch.batch`` just before pooling, after the wV rows have already been made.
                 order = _graph_major_order(cap["node_graph"])
                 cap["wV"] = [w[order] for w in cap["wV"]]
+                cap["node_graph"] = cap["node_graph"][order]
             else:
                 cap["wV"] = [w[real_mask] for w in cap["wV"]]
         for l in range(self.L):

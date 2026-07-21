@@ -172,19 +172,38 @@ def clone_grit(repo_dir: Path, repo_url: str, commit: Optional[str],
 def prepare_inprocess_grit(repo_dir: Path) -> None:
     """Make `import grit` work in THIS process and match main.py's cwd expectations."""
     import importlib
+    import importlib.util
 
     apply_compat_patches()
     run_cmd([sys.executable, "-m", "pip", "install", "-q", "-e", str(repo_dir), "--no-deps"], check=False)
     importlib.invalidate_caches()
+    repo_dir = repo_dir.resolve()
     p = str(repo_dir)
-    if p not in sys.path:
-        sys.path.insert(0, p)
+    # ``apply_compat_patches`` prepends site-packages.  Merely inserting the clone when absent
+    # therefore leaves an already-present task clone *behind* site-packages (or a previous clone),
+    # which made k-hop/VNode runs execute the stale one-hop GRIT implementation.  Re-prioritise on
+    # every task switch, even when this exact path was already present.
+    sys.path[:] = [entry for entry in sys.path if entry != p]
+    sys.path.insert(0, p)
     # GRIT reads a relative --cfg path and sets cfg.work_dir = os.getcwd().
     os.chdir(p)
     # Drop any stale grit modules from a previous run so the fresh checkout is imported.
     for name in [m for m in sys.modules if m == "grit" or m.startswith("grit.")]:
         del sys.modules[name]
-    log(f"[compat] In-process GRIT: sys.path[0]={sys.path[0]} | cwd={os.getcwd()}")
+    importlib.invalidate_caches()
+    spec = importlib.util.find_spec("grit")
+    origins = list(spec.submodule_search_locations or []) if spec is not None else []
+    if spec is not None and spec.origin and spec.origin not in {"namespace", "built-in"}:
+        origins.append(spec.origin)
+    resolved_origins = [Path(origin).resolve() for origin in origins]
+    if spec is None or not any(origin == repo_dir or repo_dir in origin.parents
+                               for origin in resolved_origins):
+        raise RuntimeError(
+            f"Task-isolated GRIT import did not resolve under {repo_dir}; resolved origins="
+            f"{[str(x) for x in resolved_origins]}. Refusing to import a stale task clone."
+        )
+    log(f"[compat] In-process GRIT: sys.path[0]={sys.path[0]} | "
+        f"origin={resolved_origins[0]} | cwd={os.getcwd()}")
 
 
 def enable_grit_reregistration() -> None:

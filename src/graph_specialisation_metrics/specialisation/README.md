@@ -106,6 +106,13 @@ batch-context float32 offset cancels.
    carries causal signal *beyond* that amplitude. (`score_impact_corr` in the saved JSON holds the
    full raw + partial correlations for functional and loss impact.)
 
+The cross-model comparison adds a separately cached **factorial family ablation** without
+re-estimating these scores. It crosses signed selectivity (`semantic`, `structural`, `generalist`)
+with joint strength (`high J`, `low J`), matches families for layer and clean pre-head throughput,
+and cumulatively zeros their routed `wV` values. High-`J` generalists are the active scientific
+null; low-`J` generalists are the inactive null. See `factorial_ablation.py` and
+`comparison/README.md`.
+
 ## Verification (asserted every run)
 
 - **softmax** — attention into each destination node sums to 1.
@@ -121,6 +128,7 @@ batch-context float32 offset cancels.
 | `model.py` | load a checkpoint (mirrors `carriage.grit_runner`) + per-head capture / ablation hooks |
 | `scores.py` | per-head `S_sem` / `S_str` (transport) + `S_attn_sem` (selection); `select_heads` |
 | `ablation.py` | causal head ablation vs random-head null, per-graph, feature correlations |
+| `factorial_ablation.py` | cached-score D × J family selection, matched cumulative ablation, cache writer |
 | `attention_viz.py` | per-head attention maps across molecules |
 | `figures.py` | the four deliverables + cross-model scatter |
 | `colab.py` | `run()`: one-call orchestration for both models; figures collate on Drive |

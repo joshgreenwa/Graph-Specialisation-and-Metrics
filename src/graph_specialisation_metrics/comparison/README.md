@@ -9,7 +9,7 @@ models.
 ```python
 from graph_specialisation_metrics.comparison import run_all, build_figures
 
-run_all()                       # 5 models x {semantic, structural} carriage + scores + figures
+run_all()                       # cached stages + new held-out family ablations + figures
 build_figures(drop_vnode=True)  # re-draw the deliverables from cache only (no GPU, no re-run)
 build_figures(include=["zinc", "zinc_1hop", "zinc_2hop"])
 ```
@@ -35,6 +35,16 @@ cached artefact already exists** (`force=True` overrides). It refuses to publish
 3. **Specialise** — per-head `S_sem` / `S_str` transport scores via `specialisation.colab.run`
    with `with_ablation=False, with_attention=False` (the deliverables need the scores, not the
    ablation/attention sweeps).
+4. **Factorial family ablation** — enabled by default and separately cached. It reads the existing
+   score matrices, estimates clean pre-head throughput on validation graphs, then computes only
+   the new simultaneous family-ablation forwards. Existing carriage and score stages are not
+   repeated under `force=False`.
+
+Within the expensive carriage and score stages, cumulative hidden snapshots are also written to
+each task directory every four completed graphs. Rerunning an identical request after a Colab
+disconnect or late verification failure restores the accumulators and RNG state from the last
+snapshot. A changed checkpoint, graph sample, or analysis setting invalidates it automatically;
+`resume=False` and `checkpoint_every=...` can be passed through `carriage_kwargs` / `spec_kwargs`.
 
 Then `build_figures` reads the cache and writes the deliverables to `comparison_dir`.
 
@@ -45,6 +55,8 @@ Then `build_figures` reads the cache and writes the deliverables to `comparison_
 | `fig_spec_scatter_grid.png`          | (ii) side-by-side per-model scatter: structural `S_str` (x) vs semantic `S_sem` (y), layer-coloured, axes divided by each channel's global-mean, shared diagonal. |
 | `fig_carriage_smallmult_<intv>.png`  | (iii) rows = {functional, beneficial}, columns = models; **standardised** (reference-fixed) y-axis per row so the scale never moves when methods are dropped. |
 | `fig_carriage_overlay_<intv>.png`    | (iv) two panels (functional \| beneficial) overlaying every method for direct comparison. |
+| `fig_DJ_family_ablation_curves.png` | (vi) cumulative validation-loss impact for semantic, structural and generalist families, split into high/low `J`; paired graph-bootstrap CIs and a secondary layer-matched random band. |
+| `fig_DJ_family_ablation_contrasts.png` | (vi-b) full-family specialist-minus-strength-matched-generalist contrasts for functional movement and loss. |
 | `fig_performance.png` + `performance.json` | (1) val/test bars + table. |
 | `figures_manifest.json`, `run_status.json` | which methods were shown, figure paths, per-stage cache status. |
 
@@ -67,6 +79,23 @@ within-head semantic-vs-structural balance; `J` deliberately retains total outpu
 transport strength. Raw `J` therefore supports cross-model comparison only as *influence
 amplitude*, not as an architecture-free selectivity statistic; use `D_rel` for the latter and the
 channel-split ablation figure to validate its causal interpretation.
+
+### Factorial family-ablation programme
+
+The score plane is converted into six **disjoint** within-model families:
+`{semantic, structural, generalist} × {high J, low J}`. Generalists are the heads nearest
+`D_rel=0`; specialist labels retain the actual sign of `D_rel` rather than forcing a balanced
+number of semantic/structural heads. Within each `J` stratum, semantic/structural/generalist heads
+are selected as matched triplets for layer, `J`, and clean pre-head `||wV||` throughput. Thus the
+high-`J` generalist is the active null and the low-`J` generalist the inactive null; uniformly
+random heads appear only as a secondary, exactly layer-count-matched reference band.
+
+Families are selected from cached test-set scores and ablated on independent validation graphs.
+The two primary outcomes are label-free output movement and signed task-loss change. The cache
+retains per-graph outcomes so all specialist-minus-generalist confidence intervals are paired
+graph bootstraps. High-|D|/low-`J` specialists below an activity floor are excluded because their
+relative selectivity is ratio-noise prone. A run that cannot form at least two matched triplets
+fails explicitly instead of silently relabelling weakly semantic heads as structural.
 
 ## VNode note
 

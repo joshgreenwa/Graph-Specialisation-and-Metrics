@@ -33,6 +33,7 @@ from pathlib import Path
 
 import numpy as np
 
+from .. import progress
 from ..carriage import structural
 from ..carriage.env import log
 from .model import GritHeadModel, SpecConfig
@@ -157,12 +158,68 @@ def score_model(task, sc: SpecConfig, *, with_attn_routing: bool = True,
     noop_max = relabel_inv_max = softmax_err = 0.0
     mask_frozen_ok = False        # did the mask-freeze actually neutralise an edge_index relabel?
     T = 1                         # #outputs (set from the first graph; 1 for ZINC scalar regression)
+    progress_enabled = bool(sc.resume and response_observer is None)
+    if sc.resume and response_observer is not None:
+        log("[resume] score progress disabled because a response_observer has external state.")
+    progress_path = Path(sc.out_dir) / ".specialisation_scores_progress.npz"
+    progress_fingerprint = {
+        "kind": "specialisation_scores",
+        "task": task.name,
+        "checkpoint": progress.checkpoint_identity(sc.ckpt),
+        "graph_ids": graph_ids.tolist(),
+        "config": {k: v for k, v in vars(sc).items()
+                   if k not in {"content_adapter", "resume", "checkpoint_every"}},
+        "with_attn_routing": bool(with_attn_routing),
+        "max_sources": max_sources,
+        "seed": int(seed),
+    }
+    start_index = 0
+    if progress_enabled:
+        saved = progress.load_progress(progress_path, fingerprint=progress_fingerprint)
+        if saved is not None and 0 <= saved["next_index"] <= n_graphs:
+            start_index = saved["next_index"]
+            rng.bit_generator.state = saved["rng_state"]
+            a, s = saved["arrays"], saved["scalars"]
+            S_sem = np.asarray(a["S_sem"], dtype=float)
+            S_str = np.asarray(a["S_str"], dtype=float)
+            S_attn = np.asarray(a["S_attn"], dtype=float)
+            tot_sem_sources = int(s["tot_sem_sources"])
+            tot_str_anchors = int(s["tot_str_anchors"])
+            tot_attn_sources = int(s["tot_attn_sources"])
+            noop_max = float(s["noop_max"])
+            relabel_inv_max = float(s["relabel_inv_max"])
+            softmax_err = float(s["softmax_err"])
+            mask_frozen_ok = bool(s["mask_frozen_ok"])
+            T = int(s["T"])
+            log(f"[resume] specialisation scores: {start_index}/{n_graphs} graphs restored "
+                f"from {progress_path}")
+        elif progress_path.exists():
+            log(f"[resume] ignoring stale/corrupt score progress: {progress_path}")
+
+    def _save_score_progress(next_index: int) -> None:
+        if not progress_enabled:
+            return
+        progress.save_progress(
+            progress_path, fingerprint=progress_fingerprint, next_index=next_index,
+            rng_state=rng.bit_generator.state,
+            arrays={"S_sem": S_sem, "S_str": S_str, "S_attn": S_attn},
+            scalars={
+                "tot_sem_sources": tot_sem_sources,
+                "tot_str_anchors": tot_str_anchors,
+                "tot_attn_sources": tot_attn_sources,
+                "noop_max": noop_max, "relabel_inv_max": relabel_inv_max,
+                "softmax_err": softmax_err, "mask_frozen_ok": mask_frozen_ok, "T": T,
+            },
+        )
     t0 = time.perf_counter()
 
-    for gi_pos, gi in enumerate(graph_ids):
+    for gi_pos, gi in enumerate(graph_ids[start_index:], start=start_index):
         base = gm.eval_ds[int(gi)]
         n = int(base.num_nodes)
         if n < 2:
+            if ((gi_pos + 1) % max(1, int(sc.checkpoint_every)) == 0
+                    or gi_pos + 1 == n_graphs):
+                _save_score_progress(gi_pos + 1)
             continue
 
         # ---- clean forward (batch-of-1, grad): phi_t^{lh}_i = d yhat_t / d wV_l ---------
@@ -389,6 +446,9 @@ def score_model(task, sc: SpecConfig, *, with_attn_routing: bool = True,
 
         if device.type == "cuda":
             torch.cuda.empty_cache()
+        if ((gi_pos + 1) % max(1, int(sc.checkpoint_every)) == 0
+                or gi_pos + 1 == n_graphs):
+            _save_score_progress(gi_pos + 1)
         if (gi_pos + 1) % max(1, n_graphs // 10) == 0 or gi_pos == 0:
             log(f"[run] graph {gi_pos+1}/{n_graphs} (id={int(gi)}, n={n}) | "
                 f"{time.perf_counter()-t0:.1f}s")

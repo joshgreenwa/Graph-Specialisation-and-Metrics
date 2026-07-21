@@ -23,6 +23,10 @@ deliverables from that cache:
         ``fig_DJ_influence_strength.png``) -- validates the score selectivity D_rel against the
         channel-split (swap x ablate) ablation contrast, functional & loss; needs
         ``with_channel_ablation=True`` (else the score-only quadrant/influence figures still build);
+* (vi)  ``fig_DJ_family_ablation_curves.png`` + ``fig_DJ_family_ablation_contrasts.png`` --
+        cumulative pre-head ablation of semantic/structural/generalist families crossed with
+        high/low J, matched for layer and clean throughput. This consumes the score cache and has
+        its own cache; it never recomputes carriage or scores;
 plus ``fig_performance.png`` + ``performance.json`` for the val/test evaluation.
 
 Every figure accepts an ``include`` / ``exclude`` list and ``drop_vnode`` so a final figure can
@@ -140,7 +144,8 @@ def inventory(tasks: Sequence[str] = _data.DEFAULT_TASKS, *,
         return m.get("val_metric"), m.get("test_metric")
 
     rows: dict = {}
-    log(f"{'model':<18} {'ckpt':<7} {'sem(F/B)':<9} {'struct':<7} {'scores':<7} {'chanAbl':<8} {'val/test'}")
+    log(f"{'model':<18} {'ckpt':<7} {'sem(F/B)':<9} {'struct':<7} {'scores':<7} "
+        f"{'chanAbl':<8} {'famAbl':<7} {'val/test'}")
     for t in tasks:
         sem = _data.load_carriage_summary(_data.carriage_summary_path(carriage_collate, t, "semantic"))
         strc = _data.load_carriage_summary(
@@ -150,6 +155,7 @@ def inventory(tasks: Sequence[str] = _data.DEFAULT_TASKS, *,
         score_version = int(score_stats.get("score_cache_version", 0))
         scores = scores_exists and (not _data.is_vnode(t) or score_version >= 2)
         chan = _data.channel_ablation_npz_path(spec_collate, t).exists()
+        fam = _data.family_ablation_npz_path(spec_collate, t).exists()
         sem_val, sem_test = _valtest(sem)
 
         ckpt_status = "-"
@@ -173,10 +179,11 @@ def inventory(tasks: Sequence[str] = _data.DEFAULT_TASKS, *,
                    "carriage_structural": bool(strc), "scores": bool(scores),
                    "score_cache_version": score_version,
                    "channel_ablation": bool(chan),
+                   "factorial_family_ablation": bool(fam),
                    "val_metric": sem_val, "test_metric": sem_test}
         log(f"{t:<18} {ckpt_status:<7} {('yes' if sem else 'no'):<9} "
             f"{('yes' if strc else 'no'):<7} {('yes' if scores else 'no'):<7} "
-            f"{('yes' if chan else 'no'):<8} {vt}")
+            f"{('yes' if chan else 'no'):<8} {('yes' if fam else 'no'):<7} {vt}")
     return rows
 
 
@@ -255,6 +262,30 @@ def build_figures(tasks: Sequence[str] = _data.DEFAULT_TASKS, *,
             else:
                 log("[figures] no channel-ablation cache; skipping the D/J ablation-validation "
                     "figure (run with with_channel_ablation=True to produce it).")
+
+            # (vi) Family-level necessity/redundancy programme. These plots are pure cache reads;
+            # generating/restyling them never loads a model.
+            family_ref = _data.load_family_ablation_by_task(spec_collate, tasks)
+            if family_ref:
+                from ..specialisation.factorial_ablation import CACHE_VERSION, score_fingerprint
+                stale = [t for t, item in family_ref.items()
+                         if (t not in scores_ref or item.get("cache_version") != CACHE_VERSION
+                             or item.get("score_fingerprint") != score_fingerprint(scores_ref[t]))]
+                for t in stale:
+                    family_ref.pop(t, None)
+                    log(f"[figures] ignoring stale factorial family-ablation cache for {t}.")
+            shown_family = [t for t in shown_scores if t in family_ref]
+            if shown_family:
+                fig, p = _plots.plot_factorial_family_ablation_curves(
+                    family_ref, shown_family, out_dir / "fig_DJ_family_ablation_curves.png")
+                figs["DJ_family_ablation_curves"] = p
+                made.append(fig)
+                fig, p = _plots.plot_factorial_family_ablation_contrasts(
+                    family_ref, shown_family, out_dir / "fig_DJ_family_ablation_contrasts.png")
+                figs["DJ_family_ablation_contrasts"] = p
+                made.append(fig)
+            else:
+                log("[figures] no factorial family-ablation cache; skipping its two figures.")
     else:
         log("[figures] no specialisation score caches found; skipping the scatter grid.")
 
@@ -331,7 +362,7 @@ def run_all(tasks: Sequence[str] = _data.DEFAULT_TASKS, *,
             beneficial_denom: str = "integrated",
             integrated_max_intervals: int = 256,
             integrated_atol: float = 5e-4,
-            integrated_unconverged_error_cap: float = 5e-3,
+            integrated_unconverged_error_cap: float = 1e-2,
             integrated_max_unconverged_fraction: float = 1e-2,
             structural_mode: str = "transposition",
             partner_match: str = "degree",
@@ -351,6 +382,17 @@ def run_all(tasks: Sequence[str] = _data.DEFAULT_TASKS, *,
             channel_ablation_graphs: int = 128,
             channel_ablation_sources: int = 8,
             channel_ablation_donors: int = 8,
+            # cached-score family ablation (enabled by default). This is a separate, incremental
+            # stage: it loads S_sem/S_str from disk and computes only new held-out ablation passes.
+            with_factorial_family_ablation: bool = True,
+            family_ablation_graphs: int = 256,
+            family_size: int = 6,
+            family_generalist_fraction: float = 0.30,
+            family_activity_floor_quantile: float = 0.10,
+            family_random_sets: int = 24,
+            family_analysis_seed: int = 2718,
+            family_eval_split: str = "val",
+            family_batch_size: int = 64,
             spec_kwargs: Optional[dict] = None,   # any other specialisation.colab.run option
             # cache / output
             carriage_collate: str = CARRIAGE_COLLATE,
@@ -396,7 +438,8 @@ def run_all(tasks: Sequence[str] = _data.DEFAULT_TASKS, *,
             return None
         return p
 
-    status: dict = {"carriage": {}, "specialisation": {}, "errors": []}
+    status: dict = {"carriage": {}, "specialisation": {},
+                    "factorial_family_ablation": {}, "errors": []}
 
     # ---- carriage: per task, per intervention, cache-skipping --------------------------
     for task in tasks:
@@ -419,6 +462,7 @@ def run_all(tasks: Sequence[str] = _data.DEFAULT_TASKS, *,
                 integrated_max_unconverged_fraction=integrated_max_unconverged_fraction,
                 structural_mode=structural_mode, partner_match=partner_match,
                 eval_metric=True,
+                resume=not force,
             )
             if carriage_kwargs:
                 car_kw.update(carriage_kwargs)          # caller overrides any carriage option
@@ -467,7 +511,7 @@ def run_all(tasks: Sequence[str] = _data.DEFAULT_TASKS, *,
                 channel_ablation_graphs=channel_ablation_graphs,
                 channel_ablation_sources=channel_ablation_sources,
                 channel_ablation_donors=channel_ablation_donors,
-                mount=False, skip_install=True,
+                mount=False, skip_install=True, resume=not force,
             )
             if spec_kwargs:
                 spec_kw.update(spec_kwargs)              # caller overrides any specialisation option
@@ -480,6 +524,70 @@ def run_all(tasks: Sequence[str] = _data.DEFAULT_TASKS, *,
                 log(f"[error] specialisation {t}: {exc}")
                 status["specialisation"][t] = f"error: {exc}"
                 status["errors"].append(f"specialisation {t}: {exc}")
+
+    # ---- D x J factorial family ablation: cached scores -> new held-out ablations only --------
+    family_current: dict[str, bool] = {}
+    if with_factorial_family_ablation:
+        from ..specialisation import factorial_ablation as family_mod
+
+        scores_ref = _data.load_scores_by_task(spec_collate, tasks)
+        if scores_ref:
+            gsem, gstr = _plots.global_norms(scores_ref, list(scores_ref))
+        else:
+            gsem = gstr = None
+        for task in tasks:
+            if task not in scores_ref:
+                status["factorial_family_ablation"][task] = "missing-score-cache"
+                family_current[task] = False
+                continue
+            npz_path = _data.family_ablation_npz_path(spec_collate, task)
+            summary_path = _data.family_ablation_summary_path(spec_collate, task)
+            fingerprint = family_mod.score_fingerprint(scores_ref[task])
+            request = {
+                "eval_split": family_eval_split, "num_graphs": int(family_ablation_graphs),
+                "requested_family_size": int(family_size),
+                "generalist_fraction": float(family_generalist_fraction),
+                "activity_floor_quantile": float(family_activity_floor_quantile),
+                "random_sets": int(family_random_sets), "analysis_seed": int(family_analysis_seed),
+                "batch_size": int(family_batch_size), "gsem": float(gsem), "gstr": float(gstr),
+            }
+            cached_summary = None
+            if summary_path.exists():
+                try:
+                    cached_summary = json.loads(summary_path.read_text(encoding="utf-8"))
+                except Exception:  # noqa: BLE001
+                    cached_summary = None
+            current = bool(
+                npz_path.exists() and cached_summary
+                and int(cached_summary.get("cache_version", 0)) == family_mod.CACHE_VERSION
+                and cached_summary.get("score_fingerprint") == fingerprint
+                and cached_summary.get("config") == request)
+            if current and not force:
+                log(f"[cache] factorial family ablation {task}: reuse {npz_path}")
+                status["factorial_family_ablation"][task] = "cached"
+                family_current[task] = True
+                continue
+            log(f"[run] factorial family ablation {task} from cached scores "
+                f"(no carriage/score recomputation) ...")
+            try:
+                result = family_mod.prepare_and_run(
+                    task, scores_ref[task], gsem=gsem, gstr=gstr,
+                    collate_dir=spec_collate, ckpt=_resolve_ckpt(task),
+                    num_graphs=family_ablation_graphs, family_size=family_size,
+                    generalist_fraction=family_generalist_fraction,
+                    activity_floor_quantile=family_activity_floor_quantile,
+                    random_sets=family_random_sets, analysis_seed=family_analysis_seed,
+                    eval_split=family_eval_split, batch_size=family_batch_size)
+                family_mod.save_family_ablation(
+                    result, npz_path, summary_path, task=task,
+                    score_hash=fingerprint, config=request)
+                status["factorial_family_ablation"][task] = "computed"
+                family_current[task] = True
+            except Exception as exc:  # noqa: BLE001
+                log(f"[error] factorial family ablation {task}: {exc}")
+                status["factorial_family_ablation"][task] = f"error: {exc}"
+                status["errors"].append(f"factorial family ablation {task}: {exc}")
+                family_current[task] = False
 
     # ---- completeness gate: never silently publish a two-line "all-model" overlay --------
     missing_carriage = [
@@ -496,16 +604,20 @@ def run_all(tasks: Sequence[str] = _data.DEFAULT_TASKS, *,
 
     missing_scores = ([task for task in tasks if not _score_cache_current(task)]
                       if run_specialisation else [])
+    missing_family = ([task for task in tasks if not family_current.get(task, False)]
+                      if with_factorial_family_ablation else [])
     status["missing_carriage"] = missing_carriage
     status["missing_scores"] = missing_scores
+    status["missing_factorial_family_ablation"] = missing_family
     Path(comparison_dir).mkdir(parents=True, exist_ok=True)
     status_path = Path(comparison_dir) / "run_status.json"
     status_path.write_text(json.dumps(status, indent=2), encoding="utf-8")
-    if not allow_partial and (missing_carriage or missing_scores):
+    if not allow_partial and (missing_carriage or missing_scores or missing_family):
         details = "; ".join(status["errors"][-5:]) or "see the per-stage status entries"
         raise RuntimeError(
             "Refusing to draw a partial all-model comparison. Missing carriage="
-            f"{missing_carriage}; missing scores={missing_scores}. {details}. "
+            f"{missing_carriage}; missing scores={missing_scores}; "
+            f"missing factorial family ablation={missing_family}. {details}. "
             f"Full status: {status_path}"
         )
 

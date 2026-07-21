@@ -96,6 +96,8 @@ def run(
     float_noise_tol: float = 5e-3,
     max_replicas: int = 4096,
     max_pair_edges: int = 12_000_000,
+    resume: bool = True,
+    checkpoint_every: int = 4,
     n_boot: int = 2000,
     boot_seed: int = 1234,
     bd_linthresh: float = 0.0,
@@ -186,6 +188,7 @@ def run(
         intervention=intervention, structural_mode=structural_mode, partner_match=partner_match,
         tol=tol, float_noise_tol=float_noise_tol,
         max_replicas=max_replicas, max_pair_edges=max_pair_edges,
+        resume=resume, checkpoint_every=checkpoint_every,
     )
     if intervention == "structural":
         results = run_grit_structural_carriage(spec, cc)

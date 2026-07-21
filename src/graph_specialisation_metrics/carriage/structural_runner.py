@@ -24,6 +24,7 @@ from pathlib import Path
 
 import numpy as np
 
+from .. import progress
 from . import core, metrics, structural
 from .env import enable_grit_reregistration, log
 from .grit_runner import (
@@ -242,14 +243,97 @@ def run_grit_structural_carriage(task, cc: CarriageConfig) -> dict:
     integrated_residual, integrated_qerr, integrated_converged = [], [], []
     integrated_intervals, integrated_cancellation = [], []
 
+    progress_path = out_dir / f".structural_{mode}_carriage_progress.npz"
+    progress_fingerprint = {
+        "kind": f"structural_{mode}_carriage",
+        "task": task.name,
+        "checkpoint": progress.checkpoint_identity(ckpt_path),
+        "graph_ids": graph_ids.tolist(),
+        "config": {k: v for k, v in vars(cc).items()
+                   if k not in {"resume", "checkpoint_every"}},
+    }
+    start_index = 0
+
+    def _restore_parts(arrays, name):
+        value = arrays.get(name, np.asarray([]))
+        return [value] if value.size else []
+
+    if cc.resume:
+        saved = progress.load_progress(progress_path, fingerprint=progress_fingerprint)
+        if saved is not None and 0 <= saved["next_index"] <= n_graphs:
+            start_index = saved["next_index"]
+            rng.bit_generator.state = saved["rng_state"]
+            a, s = saved["arrays"], saved["scalars"]
+            all_gid = _restore_parts(a, "gid"); all_i = _restore_parts(a, "i")
+            all_j = _restore_parts(a, "j"); all_d = _restore_parts(a, "d")
+            all_C = _restore_parts(a, "C"); all_B = _restore_parts(a, "B")
+            all_F = _restore_parts(a, "F")
+            add_sumC = _restore_parts(a, "sumC"); add_dyhat = _restore_parts(a, "dyhat")
+            integrated_residual = _restore_parts(a, "ig_residual")
+            integrated_qerr = _restore_parts(a, "ig_qerr")
+            integrated_converged = _restore_parts(a, "ig_converged")
+            integrated_intervals = _restore_parts(a, "ig_intervals")
+            integrated_cancellation = _restore_parts(a, "ig_cancellation")
+            g_spread_max = float(s["g_spread_max"])
+            noop_max_dh = float(s["noop_max_dh"])
+            bexact_max = float(s["bexact_max"])
+            relabel_inv_max = float(s["relabel_inv_max"])
+            integrated_replay_max = float(s["integrated_replay_max"])
+            integrated_full_loss_delta_max = float(s["integrated_full_loss_delta_max"])
+            clamp_moved = int(s["clamp_moved"]); clamp_hit = int(s["clamp_hit"])
+            noop_total = int(s["noop_total"]); partner_draws = int(s["partner_draws"])
+            unreachable_total = int(s["unreachable_total"])
+            struct_checked = int(s["struct_checked"]); peak_mem = int(s["peak_mem"])
+            log(f"[resume] structural {mode} carriage: {start_index}/{n_graphs} graphs "
+                f"restored from {progress_path}")
+        elif progress_path.exists():
+            log(f"[resume] ignoring stale/corrupt structural progress: {progress_path}")
+
+    def _save_progress(next_index: int) -> None:
+        if not cc.resume:
+            return
+        progress.save_progress(
+            progress_path, fingerprint=progress_fingerprint, next_index=next_index,
+            rng_state=rng.bit_generator.state,
+            arrays={
+                "gid": progress.concat(all_gid, dtype=np.int64),
+                "i": progress.concat(all_i, dtype=np.int64),
+                "j": progress.concat(all_j, dtype=np.int64),
+                "d": progress.concat(all_d, dtype=np.int64),
+                "C": progress.concat(all_C, dtype=np.float64),
+                "B": progress.concat(all_B, dtype=np.float64),
+                "F": progress.concat(all_F, dtype=np.float64),
+                "sumC": progress.concat(add_sumC, dtype=np.float64),
+                "dyhat": progress.concat(add_dyhat, dtype=np.float64),
+                "ig_residual": progress.concat(integrated_residual, dtype=np.float64),
+                "ig_qerr": progress.concat(integrated_qerr, dtype=np.float64),
+                "ig_converged": progress.concat(integrated_converged, dtype=bool),
+                "ig_intervals": progress.concat(integrated_intervals, dtype=np.int64),
+                "ig_cancellation": progress.concat(integrated_cancellation, dtype=np.float64),
+            },
+            scalars={
+                "g_spread_max": g_spread_max, "noop_max_dh": noop_max_dh,
+                "bexact_max": bexact_max, "relabel_inv_max": relabel_inv_max,
+                "integrated_replay_max": integrated_replay_max,
+                "integrated_full_loss_delta_max": integrated_full_loss_delta_max,
+                "clamp_moved": clamp_moved, "clamp_hit": clamp_hit,
+                "noop_total": noop_total, "partner_draws": partner_draws,
+                "unreachable_total": unreachable_total, "struct_checked": struct_checked,
+                "peak_mem": peak_mem,
+            },
+        )
+
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats()
     t_start = time.perf_counter()
 
-    for gi_pos, gi in enumerate(graph_ids):
+    for gi_pos, gi in enumerate(graph_ids[start_index:], start=start_index):
         base = eval_ds[int(gi)]
         n = int(base.num_nodes)
         if n < 2:  # a structural swap needs a partner; skip degenerate singletons
+            if ((gi_pos + 1) % max(1, int(cc.checkpoint_every)) == 0
+                    or gi_pos + 1 == n_graphs):
+                _save_progress(gi_pos + 1)
             continue
 
         D = _spd(base, n)                                   # pristine SPD for d(i, u)
@@ -488,6 +572,9 @@ def run_grit_structural_carriage(task, cc: CarriageConfig) -> dict:
             del path_B, path_dL
         if device.type == "cuda":
             torch.cuda.empty_cache()
+        if ((gi_pos + 1) % max(1, int(cc.checkpoint_every)) == 0
+                or gi_pos + 1 == n_graphs):
+            _save_progress(gi_pos + 1)
         if (gi_pos + 1) % max(1, n_graphs // 10) == 0 or gi_pos == 0:
             log(f"[run] graph {gi_pos+1}/{n_graphs} (id={int(gi)}, n={n}, T={T}, {R} forwards) "
                 f"| {time.perf_counter()-t_start:.1f}s")

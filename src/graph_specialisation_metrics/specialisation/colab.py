@@ -98,6 +98,8 @@ def run(
     seed: int = 42,
     accelerator: str = "cuda:0",
     num_threads: int = 4,
+    resume: bool = True,
+    checkpoint_every: int = 4,
     mount: bool = True,
     skip_install: bool = False,
     pyg_version: str = "2.2.0",
@@ -160,6 +162,7 @@ def run(
             config_file=config_file, accelerator=accelerator, seed=seed, num_threads=num_threads,
             num_graphs=num_graphs, donors=donors, ablation_graphs=ablation_graphs,
             analysis_seed=analysis_seed, partner_match=partner_match,
+            resume=resume, checkpoint_every=checkpoint_every,
         )
 
         # --- (1) per-head scores (always) ---

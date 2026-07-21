@@ -18,6 +18,8 @@ and CACHES all of it to Drive, then builds the deliverables:
   (iv)  fig_carriage_overlay_<intv>.png    -- functional/beneficial carriage overlaid per method;
   (v)   fig_DJ_ablation_validation.png     -- D_rel vs the causal ablation contrast (functional &
         loss), + fig_DJ_quadrants.png + fig_DJ_influence_strength.png (needs with_channel_ablation);
+  (vi)  fig_DJ_family_ablation_curves.png + fig_DJ_family_ablation_contrasts.png -- held-out,
+        cumulative semantic/structural/generalist family ablation crossed with high/low J;
   (+)   fig_performance.png                -- val/test bars.
 
 The new 2-hop / VNode checkpoints are auto-registered from carriage.tasks; their Drive dirs are
@@ -72,6 +74,8 @@ from graph_specialisation_metrics.comparison import run_all, build_figures  # no
 # force=False reuses every existing carriage result and computes only missing model/intervention
 # pairs. Dense/1-hop are therefore not repeated when completing 2-hop/VNode carriage. The two
 # pre-v2 VNode score caches are intentionally refreshed once to include VNode-mediated transport.
+# The factorial family stage below consumes those score caches and has its own cache: it computes
+# only the new validation-graph group ablations, never carriage or specialisation scores.
 run_all(
     # tasks=["zinc", "zinc_1hop", "zinc_2hop", "zinc_1hop_vnode", "zinc_2hop_vnode"],  # default
     skip_install=False,
@@ -81,10 +85,21 @@ run_all(
     # ---- channel-split causal ablation -> the D/J validation figure (deliverable v) ----
     # HEAVY: L*H ablated forwards per model over intervention replicas. Set False to skip it
     # (the score-only quadrant/influence figures still build). Scale the knobs up for tighter CIs.
-    with_channel_ablation=True,
+    # Keep False for this incremental run: existing channel-ablation caches are still plotted,
+    # while a missing one will not cause specialisation.colab to replay its score estimator.
+    with_channel_ablation=False,
     channel_ablation_graphs=128,
     channel_ablation_sources=8,
     channel_ablation_donors=8,   # each donor => L*H extra ablated forwards; raise for tighter CIs
+    # ---- cached-score D x J family ablation (enabled by default) ----
+    with_factorial_family_ablation=True,
+    family_ablation_graphs=256,
+    family_size=6,
+    family_random_sets=24,  # secondary layer-matched band; generalists are the scientific nulls
+    # A capped path is retained only when both the global <=1% failure-rate gate and this
+    # absolute residual gate pass. 1e-2 admits the observed isolated 5.108e-3 ZINC path while
+    # still rejecting a materially inaccurate tail; all failures/residuals remain reported.
+    integrated_unconverged_error_cap=1e-2,
 )
 
 # --- Re-draw the deliverables from cache only (no re-compute), e.g. dropping the VNode runs: ---

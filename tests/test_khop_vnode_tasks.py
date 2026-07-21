@@ -149,3 +149,4 @@ def test_capture_retains_and_groups_vnode_transport_before_pool_strip():
     gm.L = gm.H = gm.dh = 1
     captured = gm.capture(Batch(), want_grad=False, include_virtual_transport=True)
     assert captured["wV"][0].reshape(-1).tolist() == [0., 1., 100., 10., 11., 200.]
+    assert captured["node_graph"].tolist() == [0, 0, 0, 1, 1, 1]
