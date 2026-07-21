@@ -35,9 +35,9 @@ from graph_specialisation_metrics.synthetic import nar_grit_fixed as nar
 
 ANALYSIS_VERSION = "nar-transport-mechanisms-v2"
 MODEL_ORDER = ("1hop", "2hop", "dense")
-MODEL_COLOURS = {"1hop": "#6550a4", "2hop": "#2b8cbe", "dense": "#d7301f"}
+MODEL_COLOURS = {"1hop": "#6A3D9A", "2hop": "#1B9E77", "dense": "#D95F02"}
 MODEL_MARKERS = {"1hop": "o", "2hop": "s", "dense": "D"}
-LAYER_COLOURS = {0: "#238b45", 1: "#cb181d"}
+LAYER_COLOURS = {0: "#0072B2", 1: "#D55E00"}
 N_MARKERS = {4: "o", 8: "s", 16: "^", 32: "P", 64: "D"}
 EPS = 1.0e-12
 NOOP_HARD_TOLERANCE_FACTOR = 5.0
@@ -2488,13 +2488,19 @@ def configure_plots() -> None:
     mpl.rcParams.update({
         "figure.dpi": 130,
         "savefig.dpi": 300,
-        "font.size": 10.5,
-        "axes.titlesize": 12,
-        "axes.titleweight": "bold",
+        "font.size": 10.8,
+        "axes.titlesize": 11.5,
+        "axes.titleweight": "semibold",
+        "axes.labelsize": 10.8,
         "axes.spines.top": False,
         "axes.spines.right": False,
-        "axes.grid": True,
-        "grid.alpha": 0.18,
+        "axes.grid": False,
+        "grid.alpha": 0.16,
+        "grid.linewidth": 0.7,
+        "xtick.labelsize": 9.6,
+        "ytick.labelsize": 9.6,
+        "legend.fontsize": 9.4,
+        "legend.title_fontsize": 9.4,
         "legend.frameon": False,
     })
 
@@ -2507,7 +2513,63 @@ def save_figure(fig: Any, cfg: AnalysisConfig, stem: str) -> None:
 
 
 def _panel(axis: Any, letter: str, title: str) -> None:
-    axis.set_title(f"{letter}  {title}", loc="left")
+    axis.set_title(f"{letter}  {title}", loc="left", pad=10)
+
+
+def _model_label(model: str) -> str:
+    return {"1hop": "1-hop", "2hop": "2-hop", "dense": "Dense"}[model]
+
+
+def _seed_fillstyle(seed: int) -> str:
+    return ("none", "left", "full")[int(seed) % 3]
+
+
+def _encoding_handles(
+    cfg: AnalysisConfig,
+    *,
+    models: bool = False,
+    layers: bool = False,
+    records: bool = False,
+    seeds: bool = False,
+) -> list[Any]:
+    from matplotlib.lines import Line2D
+
+    handles: list[Any] = []
+    if models:
+        handles.extend([
+            Line2D(
+                [0], [0], color=MODEL_COLOURS[model], marker=MODEL_MARKERS[model],
+                lw=1.8, markersize=6, label=_model_label(model),
+            )
+            for model in cfg.models
+        ])
+    if layers:
+        handles.extend([
+            Line2D(
+                [0], [0], color=LAYER_COLOURS[layer], marker="o", lw=0,
+                markersize=6, label=f"Layer {layer + 1}",
+            )
+            for layer in (0, 1)
+        ])
+    if records:
+        handles.extend([
+            Line2D(
+                [0], [0], color="#555555", marker=N_MARKERS.get(value, "o"),
+                markerfacecolor="none", lw=0, markersize=6, label=str(value),
+            )
+            for value in cfg.ns
+        ])
+    if seeds:
+        handles.extend([
+            Line2D(
+                [0], [0], color="#555555", marker="o", lw=0, markersize=6,
+                markerfacecolor="#555555", markerfacecoloralt="white",
+                fillstyle=_seed_fillstyle(seed),
+                label=str(seed),
+            )
+            for seed in cfg.seeds
+        ])
+    return handles
 
 
 def plot_capacity(
@@ -2515,7 +2577,7 @@ def plot_capacity(
 ) -> None:
     import matplotlib.pyplot as plt
 
-    fig, axis = plt.subplots(figsize=(7.2, 5.0))
+    fig, axis = plt.subplots(figsize=(7.0, 4.9))
     for model in cfg.models:
         means, errors = [], []
         for records in cfg.ns:
@@ -2527,29 +2589,34 @@ def plot_capacity(
             mean, error = mean_ci(values)
             means.append(mean)
             errors.append(error)
-            axis.scatter(
-                [records] * len(values), values,
-                color=MODEL_COLOURS[model], alpha=0.25, s=28, zorder=2,
-            )
-            selected = next(row for row in rows if bool(row["selected_for_analysis"]))
-            axis.scatter(
-                [records], [selected["heldout_accuracy"]],
-                facecolors="none", edgecolors=MODEL_COLOURS[model], s=80, lw=1.4,
-                zorder=4,
-            )
         axis.errorbar(
             cfg.ns, means, yerr=errors,
             color=MODEL_COLOURS[model], marker=MODEL_MARKERS[model],
-            lw=2.1, capsize=3, label=model.replace("hop", "-hop"), zorder=3,
+            lw=2.0, markersize=6, capsize=3.5, capthick=1.1,
+            label=_model_label(model), zorder=3,
         )
-    axis.plot(cfg.ns, [1.0 / value for value in cfg.ns], ":", color="#666666", label="chance")
+    axis.plot(
+        cfg.ns, [1.0 / value for value in cfg.ns], ":",
+        color="#666666", lw=1.5, label="Chance",
+    )
     axis.set_xscale("log", base=2)
     axis.set_xticks(cfg.ns, [str(value) for value in cfg.ns])
-    axis.set_ylim(-0.03, 1.08)
-    axis.set_xlabel("Memory size N")
+    axis.set_ylim(-0.02, 1.04)
+    axis.set_xlabel("Number of records, $N$")
     axis.set_ylabel("Held-out recall accuracy")
-    _panel(axis, "A", f"NAR capacity (width {cfg.analysis_width})")
-    axis.legend(ncol=2)
+    axis.set_title("NAR recall accuracy", loc="left", pad=24)
+    axis.text(
+        0.0, 1.015,
+        f"Width $d={cfg.analysis_width}$; mean and 95% CI across {len(cfg.seeds)} seeds; "
+        "$N$ records correspond to $N+3$ graph nodes",
+        transform=axis.transAxes, ha="left", va="bottom", fontsize=9.5,
+        color="#555555",
+    )
+    axis.grid(axis="y")
+    axis.legend(
+        ncol=1, title="Attention support", loc="center left",
+        bbox_to_anchor=(1.015, 0.5),
+    )
     fig.tight_layout()
     save_figure(fig, cfg, "01_capacity")
     plt.close(fig)
@@ -2564,42 +2631,76 @@ def plot_specialisation_context(
 ) -> None:
     import matplotlib.pyplot as plt
 
-    selected = _primary(rows)
-    fig, axes = plt.subplots(2, len(cfg.models), figsize=(5.1 * len(cfg.models), 8.4))
+    selected = list(rows)
+    fig, axes = plt.subplots(
+        2, len(cfg.models), figsize=(5.15 * len(cfg.models), 8.7),
+        sharex="row", sharey="row",
+    )
     axes = np.asarray(axes).reshape(2, len(cfg.models))
     for column, model in enumerate(cfg.models):
         model_rows = [row for row in selected if row["model"] == model]
         for layer in (0, 1):
             layer_rows = [row for row in model_rows if int(row["layer"]) == layer]
             for records in cfg.ns:
-                points = [row for row in layer_rows if int(row["N"]) == records]
-                axes[0, column].scatter(
-                    [row["S_str"] for row in points],
-                    [row["S_sem"] for row in points],
-                    color=LAYER_COLOURS[layer], marker=N_MARKERS.get(records, "o"),
-                    s=36, alpha=0.72,
-                    label=f"L{layer + 1}" if records == cfg.ns[0] else None,
-                )
-                axes[1, column].scatter(
-                    [row["D"] for row in points],
-                    [row["J"] for row in points],
-                    color=LAYER_COLOURS[layer], marker=N_MARKERS.get(records, "o"),
-                    s=36, alpha=0.72,
-                )
+                for seed in cfg.seeds:
+                    points = [
+                        row for row in layer_rows
+                        if int(row["N"]) == records and int(row["seed"]) == seed
+                    ]
+                    if not points:
+                        continue
+                    style = {
+                        "linestyle": "none",
+                        "marker": N_MARKERS.get(records, "o"),
+                        "markersize": 6.2,
+                        "markerfacecolor": LAYER_COLOURS[layer],
+                        "markerfacecoloralt": "white",
+                        "markeredgecolor": LAYER_COLOURS[layer],
+                        "markeredgewidth": 0.9,
+                        "fillstyle": _seed_fillstyle(seed),
+                    }
+                    axes[0, column].plot(
+                        [row["S_str"] for row in points],
+                        [row["S_sem"] for row in points],
+                        **style,
+                    )
+                    axes[1, column].plot(
+                        [row["D"] for row in points],
+                        [row["J"] for row in points],
+                        **style,
+                    )
         axes[0, column].set_xlabel("Structural score $S_{str}$")
         axes[0, column].set_ylabel("Semantic score $S_{sem}$" if column == 0 else "")
         axes[1, column].set_xlabel("Selectivity $D$")
         axes[1, column].set_ylabel("Joint strength $J$" if column == 0 else "")
         axes[1, column].axvline(0, color="#777777", lw=1)
-        _panel(axes[0, column], chr(ord("A") + column), model.replace("hop", "-hop"))
-        _panel(axes[1, column], chr(ord("D") + column), "D-J context")
-    axes[0, 0].legend()
+        axes[0, column].grid(alpha=0.12)
+        axes[1, column].grid(alpha=0.12)
+        _panel(axes[0, column], chr(ord("A") + column), _model_label(model))
+        _panel(axes[1, column], chr(ord("D") + column), _model_label(model))
     fig.suptitle(
-        "Exploratory semantic-structural head allocation in NAR\n"
-        "Colour denotes layer; marker denotes N. NAR has no independent structural target.",
-        y=1.01,
+        "Semantic and structural transport scores",
+        x=0.055, y=0.995, ha="left", fontsize=14, fontweight="semibold",
     )
-    fig.tight_layout()
+    fig.text(
+        0.055, 0.958,
+        "$N$ records correspond to $N+3$ nodes; all seeds are shown at anchors and the "
+        "validation-selected seed otherwise. Structural scores are contextual in NAR.",
+        ha="left", va="top", fontsize=9.5, color="#555555",
+    )
+    fig.legend(
+        handles=_encoding_handles(cfg, layers=True), title="Colour",
+        loc="upper left", bbox_to_anchor=(0.05, 0.925), ncol=2,
+    )
+    fig.legend(
+        handles=_encoding_handles(cfg, records=True), title="Marker: records N",
+        loc="upper center", bbox_to_anchor=(0.52, 0.925), ncol=len(cfg.ns),
+    )
+    fig.legend(
+        handles=_encoding_handles(cfg, seeds=True), title="Fill: seed",
+        loc="upper right", bbox_to_anchor=(0.955, 0.925), ncol=len(cfg.seeds),
+    )
+    fig.subplots_adjust(top=0.78, bottom=0.09, left=0.07, right=0.985, hspace=0.38, wspace=0.20)
     save_figure(fig, cfg, "02_specialisation_context")
     plt.close(fig)
 
@@ -2619,7 +2720,10 @@ def _scatter_metric_grid(
 
     interventions = ("target_payload", "address_different_answer")
     selected = _primary(rows)
-    fig, axes = plt.subplots(2, len(cfg.models), figsize=(5.0 * len(cfg.models), 8.0))
+    fig, axes = plt.subplots(
+        2, len(cfg.models), figsize=(5.0 * len(cfg.models), 8.4),
+        sharex="row", sharey="row",
+    )
     axes = np.asarray(axes).reshape(2, len(cfg.models))
     for row_index, intervention in enumerate(interventions):
         for column, model in enumerate(cfg.models):
@@ -2635,20 +2739,45 @@ def _scatter_metric_grid(
                     axis.scatter(
                         [row[x_key] for row in cell], [row[y_key] for row in cell],
                         color=LAYER_COLOURS[layer], marker=N_MARKERS.get(records, "o"),
-                        s=34, alpha=0.68,
+                        s=38, alpha=0.74, edgecolors="white", linewidths=0.35,
                     )
             rho = spearman(
                 [float(row[x_key]) for row in points],
                 [float(row[y_key]) for row in points],
             )
-            axis.text(0.04, 0.95, rf"descriptive $\rho={rho:.2f}$", transform=axis.transAxes, va="top")
+            axis.text(
+                0.97, 0.05, rf"Spearman $\rho={rho:.2f}$",
+                transform=axis.transAxes, ha="right", va="bottom",
+                fontsize=9.2, color="#555555",
+            )
             axis.set_xlabel(xlabel)
             if column == 0:
                 axis.set_ylabel(ylabel)
             label = "payload" if row_index == 0 else "address"
-            _panel(axis, chr(ord("A") + row_index * len(cfg.models) + column), f"{model}: {label}")
-    fig.suptitle(title, y=1.01)
-    fig.tight_layout()
+            axis.grid(alpha=0.12)
+            _panel(
+                axis,
+                chr(ord("A") + row_index * len(cfg.models) + column),
+                f"{_model_label(model)} · {label}",
+            )
+    fig.suptitle(
+        title, x=0.055, y=0.995, ha="left", fontsize=14, fontweight="semibold",
+    )
+    fig.text(
+        0.055, 0.955,
+        "Each point is a head from the selected checkpoint; marker gives the number "
+        "of records $N$ (graph size $N+3$ nodes).",
+        ha="left", va="top", fontsize=9.5, color="#555555",
+    )
+    fig.legend(
+        handles=_encoding_handles(cfg, layers=True), title="Colour",
+        loc="upper center", bbox_to_anchor=(0.43, 0.925), ncol=2,
+    )
+    fig.legend(
+        handles=_encoding_handles(cfg, records=True), title="Marker: records N",
+        loc="upper center", bbox_to_anchor=(0.72, 0.925), ncol=len(cfg.ns),
+    )
+    fig.subplots_adjust(top=0.82, bottom=0.09, left=0.07, right=0.985, hspace=0.35, wspace=0.18)
     save_figure(fig, cfg, stem)
     plt.close(fig)
 
@@ -2660,21 +2789,21 @@ def plot_attention_and_decomposition(
         rows, cfg,
         x_key="attention_ratio", y_key="total",
         stem="03a_clean_attention_vs_transport",
-        title="Clean queried-record attention versus output-grounded transport",
+        title="Attention allocation and semantic transport",
         xlabel="Target/background attention ratio", ylabel="Transport score",
     )
     _scatter_metric_grid(
         rows, cfg,
         x_key="attention_moved_normalized", y_key="total",
         stem="03b_attention_response_vs_transport",
-        title="Intervention-induced attention movement versus transport",
+        title="Attention response and semantic transport",
         xlabel="Moved attention mass per valid edge", ylabel="Transport score",
     )
     _scatter_metric_grid(
         rows, cfg,
         x_key="message", y_key="route",
         stem="03c_routing_message_decomposition",
-        title="Output-grounded routing-message decomposition",
+        title="Routing and message contributions",
         xlabel="Message contribution", ylabel="Routing contribution",
     )
 
@@ -2717,9 +2846,11 @@ def plot_information_rendezvous(
     cfg: AnalysisConfig,
 ) -> None:
     import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
 
+    del manifest
     rows = _primary(head_rows)
-    fig, axes = plt.subplots(2, 2, figsize=(12.8, 9.2))
+    fig, axes = plt.subplots(2, 2, figsize=(11.8, 7.8))
     axes = np.asarray(axes).reshape(-1)
     for model in cfg.models:
         address_share = [
@@ -2731,7 +2862,8 @@ def plot_information_rendezvous(
         ]
         axes[0].plot(
             cfg.ns, address_share, color=MODEL_COLOURS[model],
-            marker=MODEL_MARKERS[model], lw=2, label=model,
+            marker=MODEL_MARKERS[model], markersize=5.5, lw=2,
+            label=_model_label(model),
         )
         for records in cfg.anchor_ns:
             seed_values = [
@@ -2758,8 +2890,7 @@ def plot_information_rendezvous(
             ]
             axes[1].plot(
                 cfg.ns, values, color=MODEL_COLOURS[model], linestyle=linestyle,
-                marker=MODEL_MARKERS[model], lw=1.8,
-                label=f"{model} L{layer + 1}",
+                marker=MODEL_MARKERS[model], markersize=5.2, lw=1.8,
             )
             for records in cfg.anchor_ns:
                 seed_values = [
@@ -2776,42 +2907,6 @@ def plot_information_rendezvous(
                     marker=MODEL_MARKERS[model], markerfacecolor="white",
                     capsize=2.5, lw=1.0, alpha=0.85,
                 )
-        for records in cfg.ns:
-            profile = _cell_head_mass(
-                rows, model=model, records=records,
-                intervention="address_different_answer", layer=1,
-            )["retrieval_attention_profile_moved"]
-            retrieval = _cell_head_mass(
-                rows, model=model, records=records,
-                intervention="address_different_answer", layer=1,
-            )["retrieval_route"]
-            selected_checkpoint = next(
-                row for row in manifest
-                if row["model"] == model
-                and int(row["N"]) == records
-                and bool(row["selected_for_analysis"])
-            )
-            axes[2].scatter(
-                records, profile,
-                color=MODEL_COLOURS[model], marker=N_MARKERS.get(records, "o"),
-                s=62,
-            )
-            axes[3].scatter(
-                retrieval, selected_checkpoint["heldout_accuracy"],
-                color=MODEL_COLOURS[model], marker=N_MARKERS.get(records, "o"),
-                s=62,
-            )
-        for cell in cell_rows:
-            if (
-                cell["model"] == model
-                and int(cell["N"]) in cfg.anchor_ns
-                and cell["intervention"] == "address_different_answer"
-                and int(cell["layer"]) == 1
-            ):
-                axes[3].scatter(
-                    cell["retrieval_route"], cell["heldout_accuracy"],
-                    color=MODEL_COLOURS[model], s=22, alpha=0.22,
-                )
         axes[2].plot(
             cfg.ns,
             [
@@ -2822,7 +2917,7 @@ def plot_information_rendezvous(
                 for records in cfg.ns
             ],
             color=MODEL_COLOURS[model], marker=MODEL_MARKERS[model],
-            lw=2, label=model,
+            markersize=5.5, lw=2,
         )
         for records in cfg.anchor_ns:
             seed_values = [
@@ -2839,25 +2934,84 @@ def plot_information_rendezvous(
                 marker=MODEL_MARKERS[model], markerfacecolor="white",
                 capsize=3, lw=1.2, zorder=5,
             )
+        trajectory_x, trajectory_y = [], []
+        for records in cfg.ns:
+            cells = [
+                cell for cell in cell_rows
+                if cell["model"] == model
+                and int(cell["N"]) == records
+                and cell["intervention"] == "address_different_answer"
+                and int(cell["layer"]) == 1
+            ]
+            retrieval_mean, retrieval_error = mean_ci([
+                float(cell["retrieval_route"]) for cell in cells
+            ])
+            accuracy_mean, accuracy_error = mean_ci([
+                float(cell["heldout_accuracy"]) for cell in cells
+            ])
+            trajectory_x.append(retrieval_mean)
+            trajectory_y.append(accuracy_mean)
+            axes[3].errorbar(
+                [retrieval_mean], [accuracy_mean],
+                xerr=[retrieval_error], yerr=[accuracy_error],
+                color=MODEL_COLOURS[model], marker=MODEL_MARKERS[model],
+                markerfacecolor="white", markersize=6.5,
+                capsize=2.5, lw=1.0, zorder=4,
+            )
+        axes[3].plot(
+            trajectory_x, trajectory_y, color=MODEL_COLOURS[model],
+            lw=1.35, alpha=0.6, zorder=2,
+        )
+        if len(trajectory_x) >= 2:
+            axes[3].annotate(
+                "",
+                xy=(trajectory_x[-1], trajectory_y[-1]),
+                xytext=(trajectory_x[-2], trajectory_y[-2]),
+                arrowprops={
+                    "arrowstyle": "-|>", "color": MODEL_COLOURS[model],
+                    "lw": 1.35, "alpha": 0.75,
+                },
+                zorder=3,
+            )
     for axis in axes[:3]:
         axis.set_xscale("log", base=2)
         axis.set_xticks(cfg.ns, [str(value) for value in cfg.ns])
-        axis.set_xlabel("Memory size N")
+        axis.set_xlabel("Number of records, $N$")
+        axis.grid(axis="y")
     for axis in axes[:2]:
         axis.set_ylim(-0.04, 1.04)
     axes[0].set_ylabel("Layer-2 routing share")
     axes[1].set_ylabel("Payload message share")
-    axes[2].set_ylabel("Within-record routing-profile movement")
-    axes[3].set_xlabel("Layer-2 centre-to-record address routing")
+    axes[2].set_ylabel("Within-record profile movement")
+    axes[3].set_xlabel("Centre-to-record routing contribution")
     axes[3].set_ylabel("Held-out accuracy")
-    _panel(axes[0], "A", "Address routing emerges at the rendezvous")
-    _panel(axes[1], "B", "Payload carriage across depth")
-    _panel(axes[2], "C", "Address-selective routing requires graph support")
-    _panel(axes[3], "D", "Realised retrieval mechanism and capacity")
-    axes[0].legend()
-    axes[1].legend(fontsize=8, ncol=2)
-    axes[2].legend()
-    fig.tight_layout()
+    axes[3].grid(alpha=0.14)
+    _panel(axes[0], "A", "Address routing share")
+    _panel(axes[1], "B", "Payload message share")
+    _panel(axes[2], "C", "Within-record routing change")
+    _panel(axes[3], "D", "Routing and recall accuracy")
+    fig.suptitle(
+        "Transport mechanism summary",
+        x=0.07, y=0.985, ha="left", fontsize=14, fontweight="semibold",
+    )
+    fig.text(
+        0.07, 0.945,
+        "$N$ records correspond to $N+3$ graph nodes. Validation-selected trajectories; "
+        "95% CI at anchor $N$. Panel D follows N=4 → 64.",
+        ha="left", va="top", fontsize=9.5, color="#555555",
+    )
+    axes[0].legend(title="Attention support", loc="lower right", ncol=1)
+    axes[1].legend(
+        handles=[
+            Line2D([0], [0], color="#555555", ls="--", lw=1.8, label="Layer 1"),
+            Line2D([0], [0], color="#555555", ls="-", lw=1.8, label="Layer 2"),
+        ],
+        title="Line style", loc="lower left", ncol=2,
+    )
+    fig.subplots_adjust(
+        top=0.85, bottom=0.09, left=0.10, right=0.975,
+        hspace=0.42, wspace=0.30,
+    )
     save_figure(fig, cfg, "04_information_rendezvous")
     plt.close(fig)
 
@@ -2873,6 +3027,21 @@ def _group_mean(
     return float(np.mean(values)) if values else float("nan")
 
 
+def _group_mean_ci(
+    rows: Sequence[Mapping[str, Any]], key: str, **filters: Any
+) -> tuple[float, float]:
+    clusters: dict[tuple[Any, ...], list[float]] = defaultdict(list)
+    for row in rows:
+        value = float(row[key])
+        if (
+            all(row.get(name) == expected for name, expected in filters.items())
+            and math.isfinite(value)
+        ):
+            cluster = (row.get("model"), row.get("N"), row.get("seed"))
+            clusters[cluster].append(value)
+    return mean_ci([float(np.mean(values)) for values in clusters.values()])
+
+
 def plot_causal_validation(
     tables: Mapping[str, Sequence[Mapping[str, Any]]],
     cfg: AnalysisConfig,
@@ -2883,59 +3052,91 @@ def plot_causal_validation(
     patching = tables["patching"]
     fig, axes = plt.subplots(2, 2, figsize=(12.4, 8.4))
     families = ("routing", "message", "routing_random", "message_random")
-    colours = ("#9e0142", "#2c7bb6", "#d9d9d9", "#969696")
-    ablation_means = [_group_mean(ablation, "loss_delta", family=family) for family in families]
-    axes[0, 0].bar(range(len(families)), ablation_means, color=colours)
-    axes[0, 0].set_xticks(range(len(families)), ["route", "message", "route null", "msg null"], rotation=15)
+    routing_colour, message_colour = MODEL_COLOURS["1hop"], MODEL_COLOURS["2hop"]
+    colours = (routing_colour, message_colour, "#D0D0D0", "#8C8C8C")
+    ablation_stats = [
+        _group_mean_ci(ablation, "loss_delta", family=family) for family in families
+    ]
+    axes[0, 0].bar(
+        range(len(families)), [item[0] for item in ablation_stats],
+        yerr=[item[1] for item in ablation_stats], color=colours,
+        capsize=3, error_kw={"lw": 1.0},
+    )
+    axes[0, 0].set_xticks(
+        range(len(families)),
+        ["Routing", "Message", "Routing\ncontrol", "Message\ncontrol"],
+    )
     axes[0, 0].set_ylabel("Cross-entropy increase")
     axes[0, 0].axhline(0, color="#777777", lw=1)
-    _panel(axes[0, 0], "A", "Selected-family necessity")
+    axes[0, 0].grid(axis="y")
+    _panel(axes[0, 0], "A", "Head-family ablation")
 
     interventions = ("address_different_answer", "target_payload")
     short = ("address", "payload")
-    for column, (metric, title) in enumerate((
-        ("routing_rescue", "Routing-only rescue"),
-        ("message_rescue", "Message-only rescue"),
-    )):
+    for column, metric in enumerate(("routing_rescue", "message_rescue")):
         axis = axes[0, 1] if column == 0 else axes[1, 0]
         width = 0.34
         for family_index, family in enumerate(("routing", "message")):
-            values = [
-                _group_mean(patching, metric, family=family, intervention=intervention)
+            stats = [
+                _group_mean_ci(
+                    patching, metric, family=family, intervention=intervention
+                )
                 for intervention in interventions
             ]
             positions = np.arange(2) + (family_index - 0.5) * width
             axis.bar(
-                positions, values, width=width,
-                color=MODEL_COLOURS["dense"] if family == "routing" else MODEL_COLOURS["2hop"],
-                alpha=0.82, label=f"{family} heads",
+                positions, [item[0] for item in stats], yerr=[item[1] for item in stats],
+                width=width, capsize=3, error_kw={"lw": 1.0},
+                color=routing_colour if family == "routing" else message_colour,
+                alpha=0.88,
             )
-        axis.set_xticks(range(2), short)
+        axis.set_xticks(range(2), [value.title() for value in short])
         axis.set_ylabel("Clean-target log-probability rescue")
         axis.axhline(0, color="#777777", lw=1)
-        _panel(axis, "B" if column == 0 else "C", title)
-        axis.legend()
+        axis.grid(axis="y")
+        panel_title = "Routing-component patch" if column == 0 else "Message-component patch"
+        _panel(axis, "B" if column == 0 else "C", panel_title)
 
-    interaction_values = [
-        _group_mean(patching, "interaction", intervention=intervention, family=family)
+    interaction_stats = [
+        _group_mean_ci(
+            patching, "interaction", intervention=intervention, family=family
+        )
         for intervention in interventions
         for family in ("routing", "message")
     ]
     axes[1, 1].bar(
-        range(4), interaction_values,
-        color=["#9e0142", "#2c7bb6", "#9e0142", "#2c7bb6"], alpha=0.82,
+        range(4), [item[0] for item in interaction_stats],
+        yerr=[item[1] for item in interaction_stats],
+        color=[routing_colour, message_colour, routing_colour, message_colour],
+        alpha=0.88, capsize=3, error_kw={"lw": 1.0},
     )
     axes[1, 1].set_xticks(
-        range(4), ["addr-route", "addr-msg", "pay-route", "pay-msg"], rotation=18
+        range(4), ["Address\nrouting", "Address\nmessage", "Payload\nrouting", "Payload\nmessage"]
     )
     axes[1, 1].axhline(0, color="#777777", lw=1)
     axes[1, 1].set_ylabel("Finite downstream interaction")
-    _panel(axes[1, 1], "D", "Routing-message interaction after wV")
+    axes[1, 1].grid(axis="y")
+    _panel(axes[1, 1], "D", "Routing–message interaction")
     fig.suptitle(
-        "Targeted causal validation of routing and message specialisation",
-        y=1.01,
+        "Causal validation of routing and message head families",
+        x=0.06, y=0.995, ha="left", fontsize=14, fontweight="semibold",
     )
-    fig.tight_layout()
+    fig.text(
+        0.06, 0.955,
+        f"Anchor record counts: N = {', '.join(map(str, cfg.anchor_ns))} "
+        f"(graph sizes {', '.join(str(value + 3) for value in cfg.anchor_ns)} nodes).\n"
+        "Bars show means and 95% CI across checkpoint cells.",
+        ha="left", va="top", fontsize=9.5, color="#555555",
+    )
+    from matplotlib.patches import Patch
+    fig.legend(
+        handles=[
+            Patch(facecolor=routing_colour, label="Routing-selected heads"),
+            Patch(facecolor=message_colour, label="Message-selected heads"),
+        ],
+        loc="upper right", bbox_to_anchor=(0.96, 0.94), ncol=2,
+    )
+    fig.subplots_adjust(top=0.81, bottom=0.09, left=0.09, right=0.975, hspace=0.38, wspace=0.28)
     save_figure(fig, cfg, "05_targeted_causal_validation")
     plt.close(fig)
 
