@@ -40,11 +40,12 @@ that retry is accepted unconditionally. Retry metadata is written into the repla
 and `tables/outlier_retraining_*.csv`; a persistent outlier is therefore reported rather than
 repeatedly optimized away.
 
-For the ambiguous dense-GRIT cell at width 64 and `N=32`, the default launcher instead performs
-the stronger check: five unconditional new runs (seeds 3--7), with no outlier filtering or
-replacement. These are merged with the three original runs in `heldout_performance.csv` and the
-capacity figure. Faint markers show every individual run, while the line and 95% interval use all
-eight outcomes for this cell. Other cells retain their original three repeats.
+The default launcher does not enable outlier replacement. Instead it trains two unconditional new
+runs (seeds 3 and 4) for every `(support, width, N)` cell and merges them with seeds 0--2. Thus every
+point in `heldout_performance.csv` and the capacity figure has exactly five repeats. Faint markers
+show every individual run, while the line and 95% interval use all five outcomes. The additional
+seeds are kept outside the base configuration fingerprint, so the three existing checkpoints per
+cell are reused rather than retrained.
 
 This benchmark is deliberately semantic-only, so it does not estimate structural scores or
 `J/D_rel`; those require a genuinely independent structural factor and belong in the preceding

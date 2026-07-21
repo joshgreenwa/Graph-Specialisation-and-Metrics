@@ -91,8 +91,8 @@ from graph_specialisation_metrics.synthetic.nar_grit_fixed import main
 
 # Normal run: trains only missing checkpoints, then caches mechanisms and makes every figure.
 # Cheap reruns after training:
-#   Retain the four --supplement-* arguments below when regenerating figures, so the five new
-#   dense d=64, N=32 runs are included.
+#   Retain --additional-seeds 3,4 when regenerating figures, so every performance cell contains
+#   the same five repeats.
 # Installation/plumbing only:
 #   CELL_ARGS = ["--run-name", "nar_grit_smoke", "--fast-dev-run", "--allow-low-accuracy"]
 CELL_ARGS = [
@@ -120,15 +120,9 @@ CELL_ARGS = [
     "10000",
     "--early-stopping-loss-threshold",
     "0.001",
-    # Five unconditional new runs for the ambiguous dense d=64, N=32 cell.
-    "--supplement-model",
-    "dense",
-    "--supplement-width",
-    "64",
-    "--supplement-n",
-    "32",
-    "--supplement-seeds",
-    "3,4,5,6,7",
+    # Two unconditional new runs for every model x width x N cell (five total repeats).
+    "--additional-seeds",
+    "3,4",
 ]
 
 main(CELL_ARGS)

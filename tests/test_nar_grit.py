@@ -143,23 +143,25 @@ def test_outlier_audit_requires_peer_and_validation_agreement_and_retries_once()
     assert not detect_accuracy_outliers(already_retried, min_gap=0.15, peer_range=0.05)
 
 
-def test_supplemental_seeds_are_new_and_target_only_one_performance_cell() -> None:
+def test_additional_seeds_are_new_and_cover_every_performance_cell() -> None:
     cfg = Config()
     cells = supplemental_seed_cells(
         cfg,
-        model_name="dense",
-        width=64,
-        records=32,
-        seeds=(3, 4, 5, 6, 7),
+        seeds=(3, 4),
     )
-    assert cells == [("dense", 64, 32, seed) for seed in range(3, 8)]
+    expected = {
+        (model, width, records, seed)
+        for width in cfg.widths
+        for records in cfg.ns
+        for model in cfg.models
+        for seed in (3, 4)
+    }
+    assert set(cells) == expected
+    assert len(cells) == len(cfg.widths) * len(cfg.ns) * len(cfg.models) * 2
 
     try:
         supplemental_seed_cells(
             cfg,
-            model_name="dense",
-            width=64,
-            records=32,
             seeds=(2, 3),
         )
     except ValueError as error:

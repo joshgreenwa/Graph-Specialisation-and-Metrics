@@ -1641,27 +1641,24 @@ def parse_str_tuple(value: str | Sequence[str]) -> tuple[str, ...]:
 def supplemental_seed_cells(
     cfg: Config,
     *,
-    model_name: str,
-    width: int,
-    records: int,
     seeds: Sequence[int],
 ) -> list[tuple[str, int, int, int]]:
-    """Validate performance-only supplemental repeats without altering the base fingerprint."""
+    """Add global performance repeats without altering the base checkpoint fingerprint."""
     seeds = tuple(map(int, seeds))
     if not seeds:
         return []
-    if model_name not in cfg.models:
-        raise ValueError("supplemental model must be present in --models")
-    if int(width) not in cfg.widths:
-        raise ValueError("supplemental width must be present in --widths")
-    if int(records) not in cfg.ns:
-        raise ValueError("supplemental N must be present in --ns")
     if len(set(seeds)) != len(seeds):
-        raise ValueError("supplemental seeds must be unique")
+        raise ValueError("additional seeds must be unique")
     overlap = sorted(set(seeds).intersection(cfg.seeds))
     if overlap:
-        raise ValueError(f"supplemental seeds must be new; overlap with base seeds: {overlap}")
-    return [(str(model_name), int(width), int(records), seed) for seed in seeds]
+        raise ValueError(f"additional seeds must be new; overlap with base seeds: {overlap}")
+    return [
+        (str(model_name), int(width), int(records), int(seed))
+        for width in cfg.widths
+        for records in cfg.ns
+        for model_name in cfg.models
+        for seed in seeds
+    ]
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1677,13 +1674,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ns", default="4,8,16,32,64")
     parser.add_argument("--mechanistic-ns", default="4,16,64")
     parser.add_argument("--seeds", default="0,1,2")
-    parser.add_argument("--supplement-model", default="dense")
-    parser.add_argument("--supplement-width", type=int, default=64)
-    parser.add_argument("--supplement-n", type=int, default=32)
     parser.add_argument(
-        "--supplement-seeds",
+        "--additional-seeds",
         default="",
-        help="new performance-only seeds for one targeted model/width/N cell",
+        help="new performance-only seeds trained for every model/width/N cell",
     )
     parser.add_argument("--steps", type=int, default=10_000)
     parser.add_argument("--early-stopping-loss-threshold", type=float, default=0.001)
@@ -2019,6 +2013,8 @@ def assert_parameter_matching(
     payloads: Sequence[Mapping[str, Any]],
     cfg: Config,
     run_dir: Path,
+    *,
+    expected_repeats: int | None = None,
 ) -> None:
     rows: list[dict[str, Any]] = []
     for width in cfg.widths:
@@ -2039,6 +2035,19 @@ def assert_parameter_matching(
                 "layers": cfg.layers,
                 "parameters": values.pop(),
             })
+            if expected_repeats is not None:
+                for model_name in cfg.models:
+                    repeats = sum(
+                        int(payload["width"]) == width
+                        and int(payload["N"]) == records
+                        and str(payload["model_name"]) == model_name
+                        for payload in payloads
+                    )
+                    if repeats != int(expected_repeats):
+                        raise RuntimeError(
+                            f"expected {expected_repeats} repeats for {model_name} "
+                            f"width={width}, N={records}; found {repeats}"
+                        )
     write_csv(run_dir / "tables" / "parameter_budget.csv", rows)
 
 
@@ -2056,13 +2065,11 @@ def main(argv: Sequence[str] | None = None) -> dict[str, Any] | None:
     if not 0 <= args.outlier_peer_range < args.outlier_min_gap:
         parser.error("--outlier-peer-range must be non-negative and smaller than the gap")
     cfg = config_from_args(args)
+    additional_seeds = parse_int_tuple(args.additional_seeds)
     try:
         supplemental = supplemental_seed_cells(
             cfg,
-            model_name=args.supplement_model,
-            width=args.supplement_width,
-            records=args.supplement_n,
-            seeds=parse_int_tuple(args.supplement_seeds),
+            seeds=additional_seeds,
         )
     except ValueError as error:
         parser.error(str(error))
@@ -2074,7 +2081,7 @@ def main(argv: Sequence[str] | None = None) -> dict[str, Any] | None:
         "config": asdict(cfg),
         "paper_task_alignment": TASK_ALIGNMENT,
         "intentional_difference": INTENTIONAL_DIFFERENCE,
-        "supplemental_performance_repeats": [{
+        "additional_performance_repeats": [{
             "model": model_name,
             "width": width,
             "N": records,
@@ -2092,7 +2099,12 @@ def main(argv: Sequence[str] | None = None) -> dict[str, Any] | None:
     if args.phase == "figures":
         payloads = load_payloads(cfg, run_dir, supplemental)
         analyses = load_analyses(cfg, run_dir)
-        assert_parameter_matching(payloads, cfg, run_dir)
+        assert_parameter_matching(
+            payloads,
+            cfg,
+            run_dir,
+            expected_repeats=len(cfg.seeds) + len(additional_seeds),
+        )
         return make_all_figures(payloads, analyses, cfg, run_dir)
 
     setup_official_grit(Path(args.grit_dir), install=not args.skip_install)
@@ -2149,7 +2161,7 @@ def main(argv: Sequence[str] | None = None) -> dict[str, Any] | None:
                 load_only=False,
             )
             print(
-                f"[supplement {model_name} d={width} N={records} seed={seed}] "
+                f"[additional seed {model_name} d={width} N={records} seed={seed}] "
                 f"accuracy={float(payload['heldout']['accuracy']):.3f}",
                 flush=True,
             )
@@ -2173,7 +2185,12 @@ def main(argv: Sequence[str] | None = None) -> dict[str, Any] | None:
     if args.phase in ("all", "train"):
         if payloads is None:
             raise RuntimeError("training phase produced no payloads")
-        assert_parameter_matching(payloads, cfg, run_dir)
+        assert_parameter_matching(
+            payloads,
+            cfg,
+            run_dir,
+            expected_repeats=len(cfg.seeds) + len(additional_seeds),
+        )
         if args.phase == "train":
             print("[done] training caches are complete; run --phase analyze next", flush=True)
             return None
@@ -2215,7 +2232,12 @@ def main(argv: Sequence[str] | None = None) -> dict[str, Any] | None:
 
     payloads = load_payloads(cfg, run_dir, supplemental)
     analyses = load_analyses(cfg, run_dir)
-    assert_parameter_matching(payloads, cfg, run_dir)
+    assert_parameter_matching(
+        payloads,
+        cfg,
+        run_dir,
+        expected_repeats=len(cfg.seeds) + len(additional_seeds),
+    )
     summary = make_all_figures(payloads, analyses, cfg, run_dir)
     print(f"[done] all artifacts saved under {run_dir}", flush=True)
     return summary
