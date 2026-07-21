@@ -120,6 +120,18 @@ def family_ablation_summary_path(spec_collate, task: str) -> Path:
     return Path(spec_collate) / task / f"factorial_family_ablation_{task}.json"
 
 
+def semantic_outlier_npz_path(spec_collate, task: str) -> Path:
+    return Path(spec_collate) / task / f"semantic_outlier_ablation_{task}.npz"
+
+
+def semantic_outlier_summary_path(spec_collate, task: str) -> Path:
+    return Path(spec_collate) / task / f"semantic_outlier_ablation_{task}.json"
+
+
+def semantic_outlier_attention_path(spec_collate, task: str) -> Path:
+    return Path(spec_collate) / task / f"semantic_outlier_attention_{task}.npz"
+
+
 def spec_stats_path(spec_collate, task: str) -> Path:
     return Path(spec_collate) / task / f"stats_{task}.json"
 
@@ -235,6 +247,60 @@ def load_family_ablation_by_task(spec_collate, tasks: Sequence[str]) -> dict:
         if item is not None:
             out[task] = item
     return out
+
+
+_SEMANTIC_OUTLIER_KEYS = (
+    "budgets", "top_heads", "matched_heads", "top_scores", "target_func", "target_loss",
+    "matched_func", "matched_loss", "reverse_func", "reverse_loss", "individual_func",
+    "individual_loss", "matched_individual_func", "matched_individual_loss", "random_func",
+    "random_loss", "clean_pred", "clean_loss", "y", "graph_ids", "throughput_graph",
+)
+
+
+def load_semantic_outlier(path) -> Optional[dict]:
+    path = Path(path)
+    if not path.exists():
+        return None
+    with np.load(path, allow_pickle=False) as z:
+        out = {k: np.asarray(z[k]) for k in _SEMANTIC_OUTLIER_KEYS if k in z}
+        out["cache_version"] = int(np.asarray(z["cache_version"]).item()) \
+            if "cache_version" in z else 0
+        out["score_fingerprint"] = str(np.asarray(z["score_fingerprint"]).item()) \
+            if "score_fingerprint" in z else ""
+    return out
+
+
+def load_semantic_outlier_by_task(spec_collate, tasks: Sequence[str]) -> dict:
+    out = {}
+    for task in tasks:
+        item = load_semantic_outlier(semantic_outlier_npz_path(spec_collate, task))
+        if item is not None:
+            out[task] = item
+    return out
+
+
+def load_semantic_outlier_attention(path) -> Optional[dict]:
+    path = Path(path)
+    if not path.exists():
+        return None
+    with np.load(path, allow_pickle=False) as z:
+        heads = np.asarray(z["heads"], dtype=np.int64)
+        molecules = []
+        for g in range(int(np.asarray(z["num_molecules"]).item())):
+            maps = {tuple(map(int, head)): np.asarray(z[f"map_{g}_{h}"], float)
+                    for h, head in enumerate(heads)}
+            molecules.append({
+                "graph_id": int(np.asarray(z[f"graph_id_{g}"]).item()),
+                "atom_types": np.asarray(z[f"atom_types_{g}"], int),
+                "bonds": np.asarray(z[f"bonds_{g}"], int),
+                "pos": np.asarray(z[f"pos_{g}"], float), "maps": maps,
+            })
+        cache_version = int(np.asarray(z["cache_version"]).item()) \
+            if "cache_version" in z else 0
+        fingerprint = str(np.asarray(z["score_fingerprint"]).item()) \
+            if "score_fingerprint" in z else ""
+    return {"heads": [tuple(map(int, h)) for h in heads], "molecules": molecules,
+            "cache_version": cache_version, "score_fingerprint": fingerprint}
 
 
 # --------------------------------------------------------------------------------------

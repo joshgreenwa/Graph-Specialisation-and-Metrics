@@ -20,6 +20,10 @@ and CACHES all of it to Drive, then builds the deliverables:
         loss), + fig_DJ_quadrants.png + fig_DJ_influence_strength.png (needs with_channel_ablation);
   (vi)  fig_DJ_family_ablation_curves.png + fig_DJ_family_ablation_contrasts.png -- held-out,
         cumulative semantic/structural/generalist family ablation crossed with high/low J;
+  (vii) fig_semantic_outlier_ablation.png  -- direct held-out test of each model's largest raw
+        semantic-score heads against exact-layer throughput controls;
+        fig_semantic_outlier_attention_dense.png -- fixed-molecule descriptive attention for the
+        dense outliers and their matched controls;
   (+)   fig_performance.png                -- val/test bars.
 
 The new 2-hop / VNode checkpoints are auto-registered from carriage.tasks; their Drive dirs are
@@ -76,6 +80,8 @@ from graph_specialisation_metrics.comparison import run_all, build_figures  # no
 # pre-v2 VNode score caches are intentionally refreshed once to include VNode-mediated transport.
 # The factorial family stage below consumes those score caches and has its own cache: it computes
 # only the new validation-graph group ablations, never carriage or specialisation scores.
+# The semantic-outlier stage is cached independently and, under the defaults below, reuses the
+# factorial stage's graph IDs, clean predictions, labels, and throughput (no repeated clean pass).
 run_all(
     # tasks=["zinc", "zinc_1hop", "zinc_2hop", "zinc_1hop_vnode", "zinc_2hop_vnode"],  # default
     skip_install=False,
@@ -95,6 +101,13 @@ run_all(
     family_ablation_graphs=256,
     family_size=6,
     family_random_sets=24,  # secondary layer-matched band; generalists are the scientific nulls
+    # ---- raw semantic-score outlier ablation (enabled by default; beta) ----
+    with_semantic_outlier_ablation=True,
+    semantic_outlier_graphs=256,
+    semantic_outlier_top_k=4,       # top raw S_sem heads; kept <= H/2 for exact-layer controls
+    semantic_outlier_random_sets=24,
+    semantic_outlier_attention_graphs=3,  # dense only; fixed size-quantile validation examples
+    semantic_outlier_attention_heads=2,
     # A capped path is retained only when both the global <=1% failure-rate gate and this
     # absolute residual gate pass. 1e-2 admits the observed isolated 5.108e-3 ZINC path while
     # still rejecting a materially inaccurate tail; all failures/residuals remain reported.

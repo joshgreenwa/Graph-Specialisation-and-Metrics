@@ -283,8 +283,9 @@ Save graph-level, layer-level and head-level sufficient statistics, not full den
 fields. Required checks:
 
 - softmax sums to one over valid sources;
-- identical replicas give zero response within a declared per-logit RMS tolerance (the raw
-  output-vector L2 response is retained for auditability);
+- identical replicas give zero response within a preferred per-logit RMS tolerance (the raw
+  output-vector L2 response is retained for auditability); small float32/CUDA exceedances are
+  warned and recorded, while a five-times-larger hard guard terminates the run;
 - `Delta_o = Delta_route + Delta_msg` at absolute and relative tolerances;
 - decomposed target-payload `S_total` reproduces the existing `S_sem`;
 - 1-hop address swaps give zero layer-2 within-record routing-profile change, while raw record

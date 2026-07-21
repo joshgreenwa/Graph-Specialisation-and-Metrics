@@ -883,3 +883,164 @@ def plot_factorial_family_ablation_contrasts(family_by_task: dict, tasks: Sequen
     out_path = Path(out_path); out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path, dpi=160)
     return fig, str(out_path)
+
+
+# --------------------------------------------------------------------------------------
+# (vii) raw semantic-score outliers: necessity + descriptive attention
+# --------------------------------------------------------------------------------------
+
+def _curve_with_graph_ci(values, *, n_boot: int, seed: int):
+    values = np.asarray(values, float)
+    means, lows, highs = [], [], []
+    for k in range(values.shape[0]):
+        m, lo, hi = _mean_ci_graph(values[k], n_boot=n_boot, seed=seed + k)
+        means.append(m); lows.append(lo); highs.append(hi)
+    return np.asarray(means), np.asarray(lows), np.asarray(highs)
+
+
+def plot_semantic_outlier_ablation(outlier_by_task: dict, tasks: Sequence[str], out_path, *,
+                                   n_boot: int = 3000,
+                                   suptitle: Optional[str] = None):
+    """Held-out loss test for the largest raw-S_sem heads in every model.
+
+    The cumulative panel compares score order with an exact-layer, nearest-throughput control.
+    Reverse score order is a diagnostic for the dense model's non-monotone family curve, not a
+    null. The second row exposes the individual-head effects so cancellation/redundancy is visible.
+    """
+    import matplotlib.pyplot as plt
+
+    tasks = [task for task in tasks if task in outlier_by_task]
+    if not tasks:
+        raise ValueError("plot_semantic_outlier_ablation: no semantic-outlier cache")
+    fig, axes = plt.subplots(2, len(tasks), figsize=(3.55 * len(tasks), 6.8), squeeze=False,
+                             sharey="row", constrained_layout=True)
+    target_c, matched_c, reverse_c = "#0072B2", "#666666", "#CC79A7"
+    for col, task in enumerate(tasks):
+        item = outlier_by_task[task]
+        budgets = np.asarray(item["budgets"], int)
+        top_heads = np.asarray(item["top_heads"], int)
+        matched_heads = np.asarray(item["matched_heads"], int)
+        top_scores = np.asarray(item["top_scores"], float)
+
+        ax = axes[0, col]
+        for key, colour, marker, label, ls in (
+                ("target_loss", target_c, "o", "top raw semantic score", "-"),
+                ("matched_loss", matched_c, "s", "layer + throughput control", "-"),
+                ("reverse_loss", reverse_c, "^", "same targets, reverse order", "--")):
+            mean, lo, hi = _curve_with_graph_ci(
+                item[key], n_boot=n_boot, seed=7100 + 100 * col + 10 * len(label))
+            x = np.r_[0, budgets]; mean = np.r_[0., mean]
+            lo = np.r_[0., lo]; hi = np.r_[0., hi]
+            ax.plot(x, mean, color=colour, marker=marker, ms=4, lw=1.7, ls=ls, label=label)
+            ax.fill_between(x, lo, hi, color=colour, alpha=.12, linewidth=0)
+        rnd = np.asarray(item.get("random_loss", []), float)
+        if rnd.ndim == 3 and rnd.shape[1] > 0:
+            set_means = rnd.mean(axis=-1)  # [budget, random set]
+            rlo, rhi = np.quantile(set_means, [.025, .975], axis=1)
+            ax.fill_between(np.r_[0, budgets], np.r_[0., rlo], np.r_[0., rhi],
+                            color="#AAAAAA", alpha=.14, label="exact-layer random")
+        ax.axhline(0, color="k", lw=.7, alpha=.5)
+        ax.set_xticks(np.r_[0, budgets])
+        ax.grid(True, alpha=.22)
+        if col == 0:
+            ax.set_ylabel("cumulative ablation\nΔ validation loss")
+        meta = _data.method_meta(task, col)
+        clean = float(np.asarray(item["clean_loss"], float).mean())
+        ax.set_title(f"{meta['label']}\nclean={clean:.3f}", fontsize=9.5)
+        if col == len(tasks) - 1:
+            ax.legend(fontsize=7.1, framealpha=.92, loc="best")
+
+        ax = axes[1, col]
+        x = np.arange(1, len(top_heads) + 1)
+        for key, colour, marker, label, offset in (
+                ("individual_loss", target_c, "o", "raw-semantic target", -.08),
+                ("matched_individual_loss", matched_c, "s", "matched control", .08)):
+            values = np.asarray(item[key], float)
+            means, los, his = [], [], []
+            for rank in range(len(values)):
+                m, lo, hi = _mean_ci_graph(
+                    values[rank], n_boot=n_boot, seed=9100 + 100 * col + 10 * rank
+                    + (1 if key.startswith("matched") else 0))
+                means.append(m); los.append(lo); his.append(hi)
+            means, los, his = map(np.asarray, (means, los, his))
+            ax.errorbar(x + offset, means, yerr=[means - los, his - means], fmt=marker,
+                        color=colour, ms=5, capsize=2.5, lw=1.25, label=label)
+        labels = [f"L{l}H{h}\n{score:.2g}" for (l, h), score in zip(top_heads, top_scores)]
+        ax.set_xticks(x); ax.set_xticklabels(labels, fontsize=7.5)
+        ax.set_xlabel("semantic-score rank\n(head; raw S_sem)")
+        ax.axhline(0, color="k", lw=.7, alpha=.5)
+        ax.grid(True, axis="y", alpha=.22)
+        if col == 0:
+            ax.set_ylabel("single-head ablation\nΔ validation loss")
+        if col == len(tasks) - 1:
+            ax.legend(fontsize=7.2, framealpha=.92, loc="best")
+
+    fig.suptitle(suptitle or
+                 ("Are the raw semantic-score outliers uniquely necessary?\n"
+                  "score-selected on test interventions; ablated on held-out validation graphs; "
+                  "J deliberately not matched"), fontsize=12)
+    out_path = Path(out_path); out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=170)
+    return fig, str(out_path)
+
+
+def plot_semantic_outlier_attention(attention: dict, outlier: dict, out_path, *,
+                                    suptitle: Optional[str] = None):
+    """Fixed-molecule attention examples for dense raw-semantic heads and their controls."""
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import FancyArrowPatch
+
+    heads = [tuple(map(int, h)) for h in attention["heads"]]
+    molecules = list(attention["molecules"])
+    if not heads or not molecules:
+        raise ValueError("plot_semantic_outlier_attention: empty attention cache")
+    target_set = {tuple(map(int, h)) for h in np.asarray(outlier["top_heads"], int)}
+    nrows, ncols = len(heads), len(molecules)
+    fig, axes = plt.subplots(nrows, ncols, figsize=(3.3 * ncols, 2.55 * nrows),
+                             squeeze=False, constrained_layout=True)
+    for row, head in enumerate(heads):
+        is_target = head in target_set
+        row_colour = "#0072B2" if is_target else "#666666"
+        for col, mol in enumerate(molecules):
+            ax = axes[row, col]
+            pos = np.asarray(mol["pos"], float)
+            bonds = np.asarray(mol["bonds"], int)
+            A = np.asarray(mol["maps"][head], float)
+            for a, b in bonds:
+                ax.plot(pos[[a, b], 0], pos[[a, b], 1], color="#B8B8B8", lw=2.0,
+                        alpha=.65, zorder=0)
+            nonself = A.copy(); np.fill_diagonal(nonself, 0.)
+            flat = np.argsort(nonself.reshape(-1), kind="stable")[::-1]
+            chosen = [int(i) for i in flat if nonself.reshape(-1)[i] > 0][:12]
+            vmax = max([nonself.reshape(-1)[i] for i in chosen], default=1.)
+            for idx in reversed(chosen):
+                dest, src = np.unravel_index(idx, nonself.shape)
+                w = float(nonself[dest, src]) / max(float(vmax), 1e-12)
+                arrow = FancyArrowPatch(
+                    pos[src], pos[dest], arrowstyle="-|>", mutation_scale=6 + 3 * w,
+                    linewidth=.45 + 2.1 * w, color=row_colour, alpha=.18 + .62 * w,
+                    connectionstyle="arc3,rad=0.08", shrinkA=7, shrinkB=7, zorder=1)
+                ax.add_patch(arrow)
+            atom = np.asarray(mol["atom_types"], int)
+            self_w = np.diag(A)
+            sizes = 70 + 170 * self_w / max(float(self_w.max()), 1e-12)
+            ax.scatter(pos[:, 0], pos[:, 1], c=atom, cmap="tab20", s=sizes,
+                       edgecolor="white", linewidth=.65, zorder=3)
+            for node, (xx, yy) in enumerate(pos):
+                ax.text(xx, yy, str(int(atom[node])), ha="center", va="center", fontsize=6,
+                        color="black", zorder=4)
+            ax.set_aspect("equal"); ax.axis("off")
+            if row == 0:
+                ax.set_title(f"fixed validation graph {mol['graph_id']}\nn={len(atom)}", fontsize=9)
+            if col == 0:
+                kind = "raw-semantic target" if is_target else "throughput control"
+                ax.text(-.08, .5, f"{kind}\nL{head[0]}H{head[1]}", transform=ax.transAxes,
+                        ha="right", va="center", rotation=90, color=row_colour,
+                        fontsize=9, fontweight="bold")
+    fig.suptitle(suptitle or
+                 ("Dense GRIT: static attention of raw semantic-score outliers\n"
+                  "arrows = 12 strongest non-self weights; node size = self weight; "
+                  "descriptive, not causal"), fontsize=12)
+    out_path = Path(out_path); out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=180)
+    return fig, str(out_path)

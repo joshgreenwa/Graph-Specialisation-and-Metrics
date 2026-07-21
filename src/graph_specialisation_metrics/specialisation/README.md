@@ -113,6 +113,12 @@ and cumulatively zeros their routed `wV` values. High-`J` generalists are the ac
 null; low-`J` generalists are the inactive null. See `factorial_ablation.py` and
 `comparison/README.md`.
 
+It also contains a clearly marked **beta raw-semantic-outlier test** in
+`semantic_outlier_ablation.py`. This does not alter the score methodology: it consumes cached
+`S_sem`, ablates the largest raw-score heads on independent validation graphs, and compares them
+with disjoint exact-layer nearest-throughput controls. Its dense static-attention examples are
+descriptive only. See `comparison/README.md` for the estimand and cache contract.
+
 ## Verification (asserted every run)
 
 - **softmax** — attention into each destination node sums to 1.
@@ -129,6 +135,7 @@ null; low-`J` generalists are the inactive null. See `factorial_ablation.py` and
 | `scores.py` | per-head `S_sem` / `S_str` (transport) + `S_attn_sem` (selection); `select_heads` |
 | `ablation.py` | causal head ablation vs random-head null, per-graph, feature correlations |
 | `factorial_ablation.py` | cached-score D × J family selection, matched cumulative ablation, cache writer |
+| `semantic_outlier_ablation.py` | beta cached-score raw-`S_sem` outlier ablation + fixed-example attention cache |
 | `attention_viz.py` | per-head attention maps across molecules |
 | `figures.py` | the four deliverables + cross-model scatter |
 | `colab.py` | `run()`: one-call orchestration for both models; figures collate on Drive |

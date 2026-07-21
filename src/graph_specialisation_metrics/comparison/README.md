@@ -42,6 +42,16 @@ cached artefact already exists** (`force=True` overrides). It refuses to publish
    score matrices, estimates clean pre-head throughput on validation graphs, then computes only
    the new simultaneous family-ablation forwards. Existing carriage and score stages are not
    repeated under `force=False`.
+6. **Raw semantic-outlier ablation (beta)** — enabled by default and separately cached. It takes
+   the top four heads by raw `S_sem` in each model and measures nested and individual held-out
+   validation-loss effects against disjoint exact-layer heads chosen for nearest clean `||wV||`
+   throughput. `J` is deliberately *not* matched: this asks whether the visually exceptional
+   dense heads are important in total, not whether semantic selectivity adds importance beyond
+   activity. Reverse score order diagnoses cancellation/redundancy; exact-layer random sets are a
+   secondary reference. When the family-stage graph contract matches, graph IDs, clean outputs,
+   labels, and throughput are reused, so no clean/throughput pass is repeated. A dense-only static
+   attention panel uses fixed validation molecules selected by size quantile and is explicitly
+   descriptive rather than causal.
 
 Within the expensive carriage and score stages, cumulative hidden snapshots are also written to
 each task directory every four completed graphs. Rerunning an identical request after a Colab
@@ -60,6 +70,8 @@ Then `build_figures` reads the cache and writes the deliverables to `comparison_
 | `fig_carriage_overlay_<intv>.png`    | (iv) two panels (functional \| beneficial) overlaying every method for direct comparison. |
 | `fig_DJ_family_ablation_curves.png` | (vi) cumulative validation-loss impact for semantic, structural and generalist families, split into high/low `J`; paired graph-bootstrap CIs and a secondary layer-matched random band. |
 | `fig_DJ_family_ablation_contrasts.png` | (vi-b) full-family specialist-minus-strength-matched-generalist contrasts for functional movement and loss. |
+| `fig_semantic_outlier_ablation.png` | (vii, beta) nested and single-head loss effects for top raw-`S_sem` heads versus exact-layer nearest-throughput controls, with reverse-order and random references. |
+| `fig_semantic_outlier_attention_dense.png` | (vii-b, beta) static attention for the top two dense raw-semantic heads and their matched controls on three fixed validation molecules. |
 | `fig_performance.png` + `performance.json` | (1) val/test bars + table. |
 | `figures_manifest.json`, `run_status.json` | which methods were shown, figure paths, per-stage cache status. |
 
