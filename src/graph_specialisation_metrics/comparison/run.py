@@ -27,10 +27,10 @@ deliverables from that cache:
         cumulative pre-head ablation of semantic/structural/generalist families crossed with
         high/low J, matched for layer and clean throughput. This consumes the score cache and has
         its own cache; it never recomputes carriage or scores;
-* (vii) ``fig_semantic_outlier_ablation.png`` -- direct held-out ablation of the largest raw
-        semantic-score heads against exact-layer throughput controls, plus a dense-only fixed-
-        molecule static-attention panel. This is independently cached and reuses the family
-        validation forwards whenever their graph sample matches;
+* (vii) ``fig_<channel>_outlier_ablation.png`` -- direct held-out ablation of the six largest raw
+        semantic/structural-score heads against layer-nearest throughput controls, plus dense-only
+        fixed-molecule graph and raw-matrix attention panels for semantic heads. These stages are
+        independently cached and reuse family validation forwards whenever samples match;
 plus ``fig_performance.png`` + ``performance.json`` for the val/test evaluation.
 
 Every figure accepts an ``include`` / ``exclude`` list and ``drop_vnode`` so a final figure can
@@ -149,7 +149,7 @@ def inventory(tasks: Sequence[str] = _data.DEFAULT_TASKS, *,
 
     rows: dict = {}
     log(f"{'model':<18} {'ckpt':<7} {'sem(F/B)':<9} {'struct':<7} {'scores':<7} "
-        f"{'chanAbl':<8} {'famAbl':<7} {'semOut':<7} {'val/test'}")
+        f"{'chanAbl':<8} {'famAbl':<7} {'semOut':<7} {'strOut':<7} {'val/test'}")
     for t in tasks:
         sem = _data.load_carriage_summary(_data.carriage_summary_path(carriage_collate, t, "semantic"))
         strc = _data.load_carriage_summary(
@@ -161,6 +161,7 @@ def inventory(tasks: Sequence[str] = _data.DEFAULT_TASKS, *,
         chan = _data.channel_ablation_npz_path(spec_collate, t).exists()
         fam = _data.family_ablation_npz_path(spec_collate, t).exists()
         outlier = _data.semantic_outlier_npz_path(spec_collate, t).exists()
+        str_outlier = _data.structural_outlier_npz_path(spec_collate, t).exists()
         sem_val, sem_test = _valtest(sem)
 
         ckpt_status = "-"
@@ -186,11 +187,12 @@ def inventory(tasks: Sequence[str] = _data.DEFAULT_TASKS, *,
                    "channel_ablation": bool(chan),
                    "factorial_family_ablation": bool(fam),
                    "semantic_outlier_ablation": bool(outlier),
+                   "structural_outlier_ablation": bool(str_outlier),
                    "val_metric": sem_val, "test_metric": sem_test}
         log(f"{t:<18} {ckpt_status:<7} {('yes' if sem else 'no'):<9} "
             f"{('yes' if strc else 'no'):<7} {('yes' if scores else 'no'):<7} "
             f"{('yes' if chan else 'no'):<8} {('yes' if fam else 'no'):<7} "
-            f"{('yes' if outlier else 'no'):<7} {vt}")
+            f"{('yes' if outlier else 'no'):<7} {('yes' if str_outlier else 'no'):<7} {vt}")
     return rows
 
 
@@ -294,46 +296,50 @@ def build_figures(tasks: Sequence[str] = _data.DEFAULT_TASKS, *,
             else:
                 log("[figures] no factorial family-ablation cache; skipping its two figures.")
 
-            # (vii) Raw semantic-score outliers. This asks a narrower question than the D x J
-            # factorial: are the visibly exceptional raw-S_sem heads causally necessary at all?
-            outlier_ref = _data.load_semantic_outlier_by_task(spec_collate, tasks)
-            if outlier_ref:
-                from ..specialisation.semantic_outlier_ablation import (
-                    CACHE_VERSION as OUTLIER_CACHE_VERSION,
-                    score_fingerprint as outlier_score_fingerprint,
-                )
+            # (vii) Raw channel-score outliers: direct necessity, not a J-controlled estimand.
+            from ..specialisation.semantic_outlier_ablation import (
+                CACHE_VERSION as OUTLIER_CACHE_VERSION,
+                score_fingerprint as outlier_score_fingerprint,
+            )
+            current_outlier_by_channel = {}
+            for channel, score_key in (("semantic", "S_sem"), ("structural", "S_str")):
+                outlier_ref = _data.load_score_outlier_by_task(spec_collate, tasks, channel)
                 stale = [t for t, item in outlier_ref.items()
                          if (t not in scores_ref
                              or item.get("cache_version") != OUTLIER_CACHE_VERSION
                              or item.get("score_fingerprint")
-                             != outlier_score_fingerprint(scores_ref[t]))]
+                             != outlier_score_fingerprint(scores_ref[t], score_key))]
                 for t in stale:
                     outlier_ref.pop(t, None)
-                    log(f"[figures] ignoring stale semantic-outlier cache for {t}.")
-            shown_outlier = [t for t in shown_scores if t in outlier_ref]
-            missing_shown_outlier = [t for t in shown_scores if t not in outlier_ref]
-            if shown_outlier and not missing_shown_outlier:
-                fig, p = _plots.plot_semantic_outlier_ablation(
-                    outlier_ref, shown_outlier, out_dir / "fig_semantic_outlier_ablation.png")
-                figs["semantic_outlier_ablation"] = p
-                made.append(fig)
-                dense_task = "zinc" if "zinc" in shown_outlier else None
-                if dense_task:
-                    attn = _data.load_semantic_outlier_attention(
-                        _data.semantic_outlier_attention_path(spec_collate, dense_task))
-                    if (attn and attn.get("cache_version") == OUTLIER_CACHE_VERSION
-                            and attn.get("score_fingerprint")
-                            == outlier_ref[dense_task].get("score_fingerprint")):
-                        fig, p = _plots.plot_semantic_outlier_attention(
-                            attn, outlier_ref[dense_task],
-                            out_dir / "fig_semantic_outlier_attention_dense.png")
-                        figs["semantic_outlier_attention_dense"] = p
-                        made.append(fig)
-            elif missing_shown_outlier:
-                log("[figures] refusing a partial semantic-outlier comparison; missing current "
-                    f"caches for {missing_shown_outlier}.")
-            else:
-                log("[figures] no semantic-outlier ablation cache; skipping its figures.")
+                    log(f"[figures] ignoring stale {channel}-outlier cache for {t}.")
+                current_outlier_by_channel[channel] = outlier_ref
+                shown_outlier = [t for t in shown_scores if t in outlier_ref]
+                missing_shown_outlier = [t for t in shown_scores if t not in outlier_ref]
+                if shown_outlier and not missing_shown_outlier:
+                    fig, p = _plots.plot_semantic_outlier_ablation(
+                        outlier_ref, shown_outlier,
+                        out_dir / f"fig_{channel}_outlier_ablation.png", channel=channel)
+                    figs[f"{channel}_outlier_ablation"] = p
+                    made.append(fig)
+                elif missing_shown_outlier:
+                    log(f"[figures] refusing a partial {channel}-outlier comparison; missing "
+                        f"current caches for {missing_shown_outlier}.")
+
+            dense_sem = current_outlier_by_channel["semantic"].get("zinc")
+            if dense_sem and "zinc" in shown_scores:
+                attn = _data.load_semantic_outlier_attention(
+                    _data.semantic_outlier_attention_path(spec_collate, "zinc"))
+                if (attn and attn.get("cache_version") == OUTLIER_CACHE_VERSION
+                        and attn.get("score_fingerprint") == dense_sem.get("score_fingerprint")):
+                    fig, p = _plots.plot_semantic_outlier_attention(
+                        attn, dense_sem, out_dir / "fig_semantic_outlier_attention_dense.png")
+                    figs["semantic_outlier_attention_dense"] = p
+                    made.append(fig)
+                    fig, p = _plots.plot_semantic_outlier_attention_matrices(
+                        attn, dense_sem,
+                        out_dir / "fig_semantic_outlier_attention_matrices_dense.png")
+                    figs["semantic_outlier_attention_matrices_dense"] = p
+                    made.append(fig)
     else:
         log("[figures] no specialisation score caches found; skipping the scatter grid.")
 
@@ -440,17 +446,18 @@ def run_all(tasks: Sequence[str] = _data.DEFAULT_TASKS, *,
             family_analysis_seed: int = 2718,
             family_eval_split: str = "val",
             family_batch_size: int = 64,
-            # Direct raw-S_sem outlier test (also separately cached). Where possible it reuses
+            # Direct raw-channel-score tests (separately cached). Where possible they reuse
             # the family stage's graph IDs, clean predictions, labels, and throughput tensor.
             with_semantic_outlier_ablation: bool = True,
+            with_structural_outlier_ablation: bool = True,
             semantic_outlier_graphs: int = 256,
-            semantic_outlier_top_k: int = 4,
+            semantic_outlier_top_k: int = 6,
             semantic_outlier_random_sets: int = 24,
             semantic_outlier_analysis_seed: int = 2718,
             semantic_outlier_eval_split: str = "val",
             semantic_outlier_batch_size: int = 64,
-            semantic_outlier_attention_graphs: int = 3,
-            semantic_outlier_attention_heads: int = 2,
+            semantic_outlier_attention_graphs: int = 4,
+            semantic_outlier_attention_heads: int = 6,
             spec_kwargs: Optional[dict] = None,   # any other specialisation.colab.run option
             # cache / output
             carriage_collate: str = CARRIAGE_COLLATE,
@@ -498,7 +505,8 @@ def run_all(tasks: Sequence[str] = _data.DEFAULT_TASKS, *,
 
     status: dict = {"carriage": {}, "specialisation": {},
                     "factorial_family_ablation": {},
-                    "semantic_outlier_ablation": {}, "errors": []}
+                    "semantic_outlier_ablation": {},
+                    "structural_outlier_ablation": {}, "errors": []}
 
     # ---- carriage: per task, per intervention, cache-skipping --------------------------
     for task in tasks:
@@ -676,82 +684,32 @@ def run_all(tasks: Sequence[str] = _data.DEFAULT_TASKS, *,
                 status["errors"].append(f"factorial family ablation {task}: {exc}")
                 family_current[task] = False
 
-    # ---- raw semantic-score outliers: a narrow causal test, independently cached ---------
+    # ---- raw channel-score outliers: narrow causal tests, independently cached -----------
     outlier_current: dict[str, bool] = {}
+    enabled_outlier_channels = []
     if with_semantic_outlier_ablation:
+        enabled_outlier_channels.append(("semantic", "S_sem"))
+    if with_structural_outlier_ablation:
+        enabled_outlier_channels.append(("structural", "S_str"))
+    if enabled_outlier_channels:
         from ..specialisation import semantic_outlier_ablation as outlier_mod
+        from ..specialisation import factorial_ablation as family_cache_mod
 
         scores_ref = _data.load_scores_by_task(spec_collate, tasks)
         for task in tasks:
             if task not in scores_ref:
-                status["semantic_outlier_ablation"][task] = "missing-score-cache"
-                outlier_current[task] = False
-                continue
-            npz_path = _data.semantic_outlier_npz_path(spec_collate, task)
-            summary_path = _data.semantic_outlier_summary_path(spec_collate, task)
-            attention_path = _data.semantic_outlier_attention_path(spec_collate, task)
-            fingerprint = outlier_mod.score_fingerprint(scores_ref[task])
-            request = {
-                "eval_split": semantic_outlier_eval_split,
-                "num_graphs": int(semantic_outlier_graphs),
-                "top_k": int(semantic_outlier_top_k),
-                "random_sets": int(semantic_outlier_random_sets),
-                "analysis_seed": int(semantic_outlier_analysis_seed),
-                "batch_size": int(semantic_outlier_batch_size),
-            }
-            cached_summary = None
-            if summary_path.exists():
-                try:
-                    cached_summary = json.loads(summary_path.read_text(encoding="utf-8"))
-                except Exception:  # noqa: BLE001
-                    cached_summary = None
-            result_current = bool(
-                npz_path.exists() and cached_summary
-                and int(cached_summary.get("cache_version", 0)) == outlier_mod.CACHE_VERSION
-                and cached_summary.get("score_fingerprint") == fingerprint
-                and cached_summary.get("config") == request)
-
-            if result_current and not force:
-                log(f"[cache] semantic-outlier ablation {task}: reuse {npz_path}")
-                status["semantic_outlier_ablation"][task] = "cached"
-                outlier_current[task] = True
-                # Attention is a cheap, descriptive add-on with its own file. If only this file
-                # is absent, load the dense checkpoint and collect it without repeating ablations.
-                attention_current = False
-                if attention_path.exists():
-                    try:
-                        cached_attn = _data.load_semantic_outlier_attention(attention_path)
-                        attention_current = bool(
-                            cached_attn
-                            and cached_attn.get("cache_version") == outlier_mod.CACHE_VERSION
-                            and cached_attn.get("score_fingerprint") == fingerprint)
-                    except Exception:  # noqa: BLE001
-                        attention_current = False
-                if (task == "zinc" and semantic_outlier_attention_graphs > 0
-                        and not attention_current):
-                    try:
-                        result = _data.load_semantic_outlier(npz_path)
-                        attn = outlier_mod.prepare_attention_only(
-                            task, result, collate_dir=spec_collate, ckpt=_resolve_ckpt(task),
-                            attention_graphs=semantic_outlier_attention_graphs,
-                            attention_heads=semantic_outlier_attention_heads,
-                            analysis_seed=semantic_outlier_analysis_seed,
-                            eval_split=semantic_outlier_eval_split)
-                        outlier_mod.save_attention(attn, attention_path, score_hash=fingerprint)
-                        status["semantic_outlier_ablation"][task] = "cached+attention-computed"
-                    except Exception as exc:  # noqa: BLE001
-                        log(f"[warn] dense semantic-outlier attention only: {exc}")
-                        status["errors"].append(f"semantic-outlier attention {task}: {exc}")
+                for channel, _ in enabled_outlier_channels:
+                    status[f"{channel}_outlier_ablation"][task] = "missing-score-cache"
+                    outlier_current[f"{task}:{channel}"] = False
                 continue
 
-            # Reuse the factorial cache's validation forwards only when its graph-selection
-            # contract matches this request. No carriage or score code is entered here.
+            # Reuse the family cache's validation forwards when its graph-selection contract
+            # matches. Both channel analyses consume the same clean/throughput arrays.
             reusable = None
             family_npz = _data.family_ablation_npz_path(spec_collate, task)
             family_summary = _data.family_ablation_summary_path(spec_collate, task)
             if family_npz.exists() and family_summary.exists():
                 try:
-                    from ..specialisation import factorial_ablation as family_cache_mod
                     fs = json.loads(family_summary.read_text(encoding="utf-8"))
                     fc = fs.get("config", {})
                     reusable_ok = (
@@ -768,31 +726,105 @@ def run_all(tasks: Sequence[str] = _data.DEFAULT_TASKS, *,
                         reusable = _data.load_family_ablation(family_npz)
                 except Exception:  # noqa: BLE001
                     reusable = None
-            reuse_note = " + reused clean/throughput cache" if reusable is not None else ""
-            log(f"[run] semantic-outlier ablation {task} from cached scores{reuse_note} "
-                "(no carriage/score recomputation) ...")
-            try:
-                result, attn = outlier_mod.prepare_and_run(
-                    task, scores_ref[task], collate_dir=spec_collate,
-                    ckpt=_resolve_ckpt(task), num_graphs=semantic_outlier_graphs,
-                    top_k=semantic_outlier_top_k, random_sets=semantic_outlier_random_sets,
-                    analysis_seed=semantic_outlier_analysis_seed,
-                    eval_split=semantic_outlier_eval_split,
-                    batch_size=semantic_outlier_batch_size,
-                    attention_graphs=(semantic_outlier_attention_graphs if task == "zinc" else 0),
-                    attention_heads=semantic_outlier_attention_heads, reusable=reusable)
-                outlier_mod.save_result(
-                    result, npz_path, summary_path, task=task,
-                    score_hash=fingerprint, config=request)
-                if attn is not None:
-                    outlier_mod.save_attention(attn, attention_path, score_hash=fingerprint)
-                status["semantic_outlier_ablation"][task] = "computed"
-                outlier_current[task] = True
-            except Exception as exc:  # noqa: BLE001
-                log(f"[error] semantic-outlier ablation {task}: {exc}")
-                status["semantic_outlier_ablation"][task] = f"error: {exc}"
-                status["errors"].append(f"semantic-outlier ablation {task}: {exc}")
-                outlier_current[task] = False
+
+            for channel, score_key in enabled_outlier_channels:
+                status_key = f"{channel}_outlier_ablation"
+                current_key = f"{task}:{channel}"
+                npz_path = _data.score_outlier_npz_path(spec_collate, task, channel)
+                summary_path = _data.score_outlier_summary_path(spec_collate, task, channel)
+                attention_path = _data.semantic_outlier_attention_path(spec_collate, task)
+                fingerprint = outlier_mod.score_fingerprint(scores_ref[task], score_key)
+                request = {
+                    "score_key": score_key, "eval_split": semantic_outlier_eval_split,
+                    "num_graphs": int(semantic_outlier_graphs),
+                    "top_k": int(semantic_outlier_top_k),
+                    "random_sets": int(semantic_outlier_random_sets),
+                    "analysis_seed": int(semantic_outlier_analysis_seed),
+                    "batch_size": int(semantic_outlier_batch_size),
+                }
+                cached_summary = None
+                if summary_path.exists():
+                    try:
+                        cached_summary = json.loads(summary_path.read_text(encoding="utf-8"))
+                    except Exception:  # noqa: BLE001
+                        cached_summary = None
+                result_current = bool(
+                    npz_path.exists() and cached_summary
+                    and int(cached_summary.get("cache_version", 0)) == outlier_mod.CACHE_VERSION
+                    and cached_summary.get("score_fingerprint") == fingerprint
+                    and cached_summary.get("config") == request)
+
+                if result_current and not force:
+                    log(f"[cache] {channel}-outlier ablation {task}: reuse {npz_path}")
+                    status[status_key][task] = "cached"
+                    outlier_current[current_key] = True
+                    cached_result = _data.load_semantic_outlier(npz_path)
+                    if channel == "semantic" and reusable is None:
+                        reusable = cached_result
+                    expected_attention_heads = 2 * min(
+                        int(semantic_outlier_attention_heads),
+                        len(np.asarray(cached_result["top_heads"])))
+                    attention_current = False
+                    if channel == "semantic" and attention_path.exists():
+                        try:
+                            cached_attn = _data.load_semantic_outlier_attention(attention_path)
+                            attention_current = bool(
+                                cached_attn
+                                and cached_attn.get("cache_version") == outlier_mod.CACHE_VERSION
+                                and cached_attn.get("score_fingerprint") == fingerprint
+                                and len(cached_attn.get("molecules", []))
+                                >= int(semantic_outlier_attention_graphs)
+                                and len(cached_attn.get("heads", []))
+                                >= expected_attention_heads)
+                        except Exception:  # noqa: BLE001
+                            attention_current = False
+                    if (channel == "semantic" and task == "zinc"
+                            and semantic_outlier_attention_graphs > 0 and not attention_current):
+                        try:
+                            attn = outlier_mod.prepare_attention_only(
+                                task, cached_result, collate_dir=spec_collate,
+                                ckpt=_resolve_ckpt(task),
+                                attention_graphs=semantic_outlier_attention_graphs,
+                                attention_heads=semantic_outlier_attention_heads,
+                                analysis_seed=semantic_outlier_analysis_seed,
+                                eval_split=semantic_outlier_eval_split)
+                            outlier_mod.save_attention(
+                                attn, attention_path, score_hash=fingerprint)
+                            status[status_key][task] = "cached+attention-computed"
+                        except Exception as exc:  # noqa: BLE001
+                            log(f"[warn] dense semantic-outlier attention only: {exc}")
+                            status["errors"].append(f"semantic-outlier attention {task}: {exc}")
+                    continue
+
+                reuse_note = " + reused clean/throughput cache" if reusable is not None else ""
+                log(f"[run] {channel}-outlier ablation {task} from cached scores{reuse_note} "
+                    "(no carriage/score recomputation) ...")
+                try:
+                    result, attn = outlier_mod.prepare_and_run(
+                        task, scores_ref[task], collate_dir=spec_collate,
+                        ckpt=_resolve_ckpt(task), score_key=score_key, channel_name=channel,
+                        num_graphs=semantic_outlier_graphs, top_k=semantic_outlier_top_k,
+                        random_sets=semantic_outlier_random_sets,
+                        analysis_seed=semantic_outlier_analysis_seed,
+                        eval_split=semantic_outlier_eval_split,
+                        batch_size=semantic_outlier_batch_size,
+                        attention_graphs=(semantic_outlier_attention_graphs
+                                          if channel == "semantic" and task == "zinc" else 0),
+                        attention_heads=semantic_outlier_attention_heads, reusable=reusable)
+                    outlier_mod.save_result(
+                        result, npz_path, summary_path, task=task,
+                        score_hash=fingerprint, config=request)
+                    if attn is not None:
+                        outlier_mod.save_attention(attn, attention_path, score_hash=fingerprint)
+                    status[status_key][task] = "computed"
+                    outlier_current[current_key] = True
+                    if channel == "semantic" and reusable is None:
+                        reusable = result
+                except Exception as exc:  # noqa: BLE001
+                    log(f"[error] {channel}-outlier ablation {task}: {exc}")
+                    status[status_key][task] = f"error: {exc}"
+                    status["errors"].append(f"{channel}-outlier ablation {task}: {exc}")
+                    outlier_current[current_key] = False
 
     # ---- completeness gate: never silently publish a two-line "all-model" overlay --------
     missing_carriage = [
@@ -811,12 +843,14 @@ def run_all(tasks: Sequence[str] = _data.DEFAULT_TASKS, *,
                       if run_specialisation else [])
     missing_family = ([task for task in tasks if not family_current.get(task, False)]
                       if with_factorial_family_ablation else [])
-    missing_outlier = ([task for task in tasks if not outlier_current.get(task, False)]
-                       if with_semantic_outlier_ablation else [])
+    missing_outlier = [
+        f"{task}:{channel}" for task in tasks for channel, _ in enabled_outlier_channels
+        if not outlier_current.get(f"{task}:{channel}", False)
+    ]
     status["missing_carriage"] = missing_carriage
     status["missing_scores"] = missing_scores
     status["missing_factorial_family_ablation"] = missing_family
-    status["missing_semantic_outlier_ablation"] = missing_outlier
+    status["missing_score_outlier_ablation"] = missing_outlier
     Path(comparison_dir).mkdir(parents=True, exist_ok=True)
     status_path = Path(comparison_dir) / "run_status.json"
     status_path.write_text(json.dumps(status, indent=2), encoding="utf-8")
@@ -824,7 +858,7 @@ def run_all(tasks: Sequence[str] = _data.DEFAULT_TASKS, *,
         log(f"[warn] unresolved optional factorial family stages: {missing_family}; core "
             "carriage/specialisation figures will still be built.")
     if missing_outlier:
-        log(f"[warn] unresolved optional semantic-outlier stages: {missing_outlier}; core "
+        log(f"[warn] unresolved optional score-outlier stages: {missing_outlier}; core "
             "carriage/specialisation figures will still be built.")
     if not allow_partial and (missing_carriage or missing_scores):
         details = "; ".join(status["errors"][-5:]) or "see the per-stage status entries"

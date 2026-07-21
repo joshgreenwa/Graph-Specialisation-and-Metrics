@@ -120,12 +120,28 @@ def family_ablation_summary_path(spec_collate, task: str) -> Path:
     return Path(spec_collate) / task / f"factorial_family_ablation_{task}.json"
 
 
+def score_outlier_npz_path(spec_collate, task: str, channel: str) -> Path:
+    return Path(spec_collate) / task / f"{channel}_outlier_ablation_{task}.npz"
+
+
 def semantic_outlier_npz_path(spec_collate, task: str) -> Path:
-    return Path(spec_collate) / task / f"semantic_outlier_ablation_{task}.npz"
+    return score_outlier_npz_path(spec_collate, task, "semantic")
+
+
+def structural_outlier_npz_path(spec_collate, task: str) -> Path:
+    return score_outlier_npz_path(spec_collate, task, "structural")
+
+
+def score_outlier_summary_path(spec_collate, task: str, channel: str) -> Path:
+    return Path(spec_collate) / task / f"{channel}_outlier_ablation_{task}.json"
 
 
 def semantic_outlier_summary_path(spec_collate, task: str) -> Path:
-    return Path(spec_collate) / task / f"semantic_outlier_ablation_{task}.json"
+    return score_outlier_summary_path(spec_collate, task, "semantic")
+
+
+def structural_outlier_summary_path(spec_collate, task: str) -> Path:
+    return score_outlier_summary_path(spec_collate, task, "structural")
 
 
 def semantic_outlier_attention_path(spec_collate, task: str) -> Path:
@@ -254,6 +270,7 @@ _SEMANTIC_OUTLIER_KEYS = (
     "matched_func", "matched_loss", "reverse_func", "reverse_loss", "individual_func",
     "individual_loss", "matched_individual_func", "matched_individual_loss", "random_func",
     "random_loss", "clean_pred", "clean_loss", "y", "graph_ids", "throughput_graph",
+    "matched_layer_delta", "score_key", "channel_name",
 )
 
 
@@ -271,9 +288,17 @@ def load_semantic_outlier(path) -> Optional[dict]:
 
 
 def load_semantic_outlier_by_task(spec_collate, tasks: Sequence[str]) -> dict:
+    return load_score_outlier_by_task(spec_collate, tasks, "semantic")
+
+
+def load_structural_outlier_by_task(spec_collate, tasks: Sequence[str]) -> dict:
+    return load_score_outlier_by_task(spec_collate, tasks, "structural")
+
+
+def load_score_outlier_by_task(spec_collate, tasks: Sequence[str], channel: str) -> dict:
     out = {}
     for task in tasks:
-        item = load_semantic_outlier(semantic_outlier_npz_path(spec_collate, task))
+        item = load_semantic_outlier(score_outlier_npz_path(spec_collate, task, channel))
         if item is not None:
             out[task] = item
     return out

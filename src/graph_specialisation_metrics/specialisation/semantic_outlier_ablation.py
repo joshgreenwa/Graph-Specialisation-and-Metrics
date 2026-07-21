@@ -1,10 +1,10 @@
-"""Targeted causal test for the unusually large raw semantic-score heads.
+"""Targeted causal test for unusually large raw semantic or structural score heads.
 
 This is deliberately separate from the D x J factorial programme. It asks whether the heads with
-the largest *raw* ``S_sem`` in each model are causally important, accepting that this estimand also
-contains their high J. Controls match layer and clean routed-value throughput, but never pretend to
-J-match an outlier outside common support. Scores are discovery-only (test graphs); impacts use
-held-out validation graphs.
+the largest *raw* ``S_sem`` or ``S_str`` are causally important, accepting that this estimand also
+contains their high J. Controls prioritise layer and then clean routed-value throughput; when six
+targets exhaust a layer, the control falls back to the nearest available layer and records the
+offset. Scores are discovery-only (test graphs); impacts use held-out validation graphs.
 """
 
 from __future__ import annotations
@@ -28,29 +28,33 @@ from .factorial_ablation import _clean_and_throughput, _graph_groups
 from .model import GritHeadModel, SpecConfig
 
 
-CACHE_VERSION = 1
+CACHE_VERSION = 2
 
 
-def score_fingerprint(scores: dict) -> str:
-    a = np.ascontiguousarray(np.asarray(scores["S_sem"], dtype=np.float64))
+def score_fingerprint(scores: dict, score_key: str = "S_sem") -> str:
+    a = np.ascontiguousarray(np.asarray(scores[score_key], dtype=np.float64))
     h = hashlib.sha256()
     h.update(str(a.shape).encode("ascii")); h.update(a.tobytes())
     return h.hexdigest()
 
 
-def select_top_semantic(scores: dict, k: int) -> list[tuple[int, int]]:
-    sem = np.asarray(scores["S_sem"], float)
-    L, H = sem.shape
+def select_top_scores(scores: dict, k: int, score_key: str = "S_sem") -> list[tuple[int, int]]:
+    values = np.asarray(scores[score_key], float)
+    L, H = values.shape
     k = int(k)
-    if not 1 <= k <= H // 2:
-        raise ValueError(
-            f"top_k must lie in [1, H/2] for exact within-layer nulls; got k={k}, H={H}")
-    order = np.argsort(sem.reshape(-1), kind="stable")[::-1][:k]
+    if not 1 <= k < L * H:
+        raise ValueError(f"top_k must lie in [1, L*H-1]; got k={k}, L={L}, H={H}")
+    order = np.argsort(values.reshape(-1), kind="stable")[::-1][:k]
     return [(int(i // H), int(i % H)) for i in order]
 
 
+def select_top_semantic(scores: dict, k: int) -> list[tuple[int, int]]:
+    """Backward-compatible name for the initial semantic-only beta."""
+    return select_top_scores(scores, k, "S_sem")
+
+
 def throughput_matched_null(top_heads, throughput: np.ndarray) -> list[tuple[int, int]]:
-    """Greedy exact-layer, nearest-clean-throughput control, excluding every target head."""
+    """Greedy layer-first, nearest-clean-throughput control, excluding every target head."""
     tp = np.asarray(throughput, float)
     L, H = tp.shape
     excluded = set(map(tuple, top_heads))
@@ -58,14 +62,14 @@ def throughput_matched_null(top_heads, throughput: np.ndarray) -> list[tuple[int
     controls = []
     for target in top_heads:
         l, h = map(int, target)
-        candidates = [x for x in available if x[0] == l]
+        candidates = list(available)
         if not candidates:
-            raise RuntimeError(
-                f"no exact-layer null remains for L{l}H{h}; reduce semantic_outlier_top_k")
+            raise RuntimeError("no disjoint head remains for the outlier control")
         scale = np.log1p(max(float(tp[l, h]), 0.0))
         chosen = min(
             candidates,
-            key=lambda x: (abs(np.log1p(max(float(tp[x]), 0.0)) - scale), x[1]),
+            key=lambda x: (abs(x[0] - l),
+                           abs(np.log1p(max(float(tp[x]), 0.0)) - scale), x[0], x[1]),
         )
         controls.append(chosen); available.remove(chosen)
     return controls
@@ -75,9 +79,11 @@ def _random_layer_null(rng, reference, *, L: int, H: int, excluded) -> list[tupl
     available = {(l, h) for l in range(L) for h in range(H)} - set(map(tuple, excluded))
     chosen = []
     for layer, _ in reference:
-        candidates = sorted(x for x in available if x[0] == int(layer))
+        candidates = sorted(available, key=lambda x: (abs(x[0] - int(layer)), x[0], x[1]))
         if not candidates:
-            raise RuntimeError("cannot construct exact-layer random semantic-outlier null")
+            raise RuntimeError("cannot construct a disjoint random outlier null")
+        nearest = abs(candidates[0][0] - int(layer))
+        candidates = [x for x in candidates if abs(x[0] - int(layer)) == nearest]
         head = candidates[int(rng.integers(len(candidates)))]
         chosen.append(head); available.remove(head)
     return chosen
@@ -93,10 +99,13 @@ def _impact(gm, groups, clean, clean_loss, y, heads):
             (per_graph_loss_np(pred, y, gm.loss_fun) - clean_loss).astype(np.float32))
 
 
-def run_outlier_ablation(gm, scores: dict, *, num_graphs: int = 256, top_k: int = 4,
+def run_outlier_ablation(gm, scores: dict, *, score_key: str = "S_sem",
+                         channel_name: Optional[str] = None,
+                         num_graphs: int = 256, top_k: int = 6,
                          random_sets: int = 24, seed: int = 2718,
                          batch_size: int = 64, reusable: Optional[dict] = None) -> dict:
-    """Run nested/individual raw-S_sem ablations and matched controls on validation graphs."""
+    """Run nested/individual raw-score ablations and matched controls on validation graphs."""
+    channel_name = channel_name or ("semantic" if score_key == "S_sem" else "structural")
     rng = np.random.default_rng(seed)
     if reusable is not None and all(k in reusable for k in
                                     ("graph_ids", "clean_pred", "clean_loss", "y",
@@ -109,7 +118,7 @@ def run_outlier_ablation(gm, scores: dict, *, num_graphs: int = 256, top_k: int 
         groups, y_check = _graph_groups(gm, graph_ids, batch_size)
         if y_check.shape != y.shape or not np.allclose(y_check, y):
             raise RuntimeError("reused family cache does not align with validation graph labels")
-        log(f"[semantic-outlier] reusing clean predictions/throughput for {len(graph_ids)} "
+        log(f"[{channel_name}-outlier] reusing clean predictions/throughput for {len(graph_ids)} "
             "validation graphs from the family-ablation cache.")
     else:
         n = min(int(num_graphs), len(gm.eval_ds))
@@ -119,8 +128,14 @@ def run_outlier_ablation(gm, scores: dict, *, num_graphs: int = 256, top_k: int 
         clean_loss = per_graph_loss_np(clean, y, gm.loss_fun)
 
     throughput = throughput_graph.mean(axis=0)
-    top_heads = select_top_semantic(scores, top_k)
+    top_heads = select_top_scores(scores, top_k, score_key)
     matched_heads = throughput_matched_null(top_heads, throughput)
+    matched_layer_delta = np.asarray(
+        [int(control[0]) - int(target[0]) for target, control in zip(top_heads, matched_heads)],
+        dtype=np.int64)
+    if np.any(matched_layer_delta):
+        log(f"[{channel_name}-outlier] exact-layer controls exhausted; nearest-layer offsets="
+            f"{matched_layer_delta.tolist()}")
     budgets = _budgets(len(top_heads))
     G, B, K = len(graph_ids), len(budgets), len(top_heads)
     target_func = np.zeros((B, G), np.float32); target_loss = np.zeros_like(target_func)
@@ -145,7 +160,7 @@ def run_outlier_ablation(gm, scores: dict, *, num_graphs: int = 256, top_k: int 
                 rng, top_heads[:int(budget)], L=gm.L, H=gm.H, excluded=top_heads)
             random_func[b, r], random_loss[b, r] = _impact(
                 gm, groups, clean, clean_loss, y, null)
-        log(f"[semantic-outlier] cumulative k={budget}/{K} done "
+        log(f"[{channel_name}-outlier] cumulative k={budget}/{K} done "
             f"[{time.perf_counter()-t0:.1f}s]")
 
     # k=1 for the first head is already available above; evaluate each remaining head alone.
@@ -160,7 +175,9 @@ def run_outlier_ablation(gm, scores: dict, *, num_graphs: int = 256, top_k: int 
     return {
         "budgets": budgets, "top_heads": np.asarray(top_heads, dtype=np.int64),
         "matched_heads": np.asarray(matched_heads, dtype=np.int64),
-        "top_scores": np.asarray([scores["S_sem"][h] for h in top_heads], dtype=np.float64),
+        "matched_layer_delta": matched_layer_delta,
+        "top_scores": np.asarray([scores[score_key][h] for h in top_heads], dtype=np.float64),
+        "score_key": np.asarray(score_key), "channel_name": np.asarray(channel_name),
         "target_func": target_func, "target_loss": target_loss,
         "matched_func": matched_func, "matched_loss": matched_loss,
         "reverse_func": reverse_func, "reverse_loss": reverse_loss,
@@ -207,9 +224,16 @@ def save_result(result: dict, npz_path, summary_path, *, task: str,
                         **{k: v for k, v in result.items() if isinstance(v, np.ndarray)})
     summary = {
         "cache_version": CACHE_VERSION, "task": task, "score_fingerprint": score_hash,
+        "score_key": str(np.asarray(result["score_key"]).item()),
+        "channel_name": str(np.asarray(result["channel_name"]).item()),
         "config": config, "top_heads": result["top_heads"].tolist(),
         "matched_heads": result["matched_heads"].tolist(),
+        "matched_layer_delta": result["matched_layer_delta"].tolist(),
         "top_scores": result["top_scores"].tolist(),
+        "individual_loss_delta_mean": np.asarray(
+            result["individual_loss"], float).mean(axis=1).tolist(),
+        "matched_individual_loss_delta_mean": np.asarray(
+            result["matched_individual_loss"], float).mean(axis=1).tolist(),
         "clean_loss_mean": float(np.mean(result["clean_loss"])),
         "top1_loss_delta": float(np.mean(result["individual_loss"][0])),
         "topK_loss_delta": float(np.mean(result["target_loss"][-1])),
@@ -242,7 +266,9 @@ def _load_model(task_name: str, *, collate_dir: str, ckpt: Optional[str], num_gr
 
 
 def prepare_and_run(task_name: str, scores: dict, *, collate_dir: str,
-                    ckpt: Optional[str] = None, num_graphs: int = 256, top_k: int = 4,
+                    ckpt: Optional[str] = None, score_key: str = "S_sem",
+                    channel_name: Optional[str] = None,
+                    num_graphs: int = 256, top_k: int = 6,
                     random_sets: int = 24, analysis_seed: int = 2718,
                     eval_split: str = "val", batch_size: int = 64,
                     attention_graphs: int = 0, attention_heads: int = 2,
@@ -255,7 +281,8 @@ def prepare_and_run(task_name: str, scores: dict, *, collate_dir: str,
         accelerator=accelerator, num_threads=num_threads)
     try:
         result = run_outlier_ablation(
-            gm, scores, num_graphs=num_graphs, top_k=top_k, random_sets=random_sets,
+            gm, scores, score_key=score_key, channel_name=channel_name,
+            num_graphs=num_graphs, top_k=top_k, random_sets=random_sets,
             seed=analysis_seed, batch_size=batch_size, reusable=reusable)
         attn = None
         if int(attention_graphs) > 0 and "vnode" not in task_name.lower():
