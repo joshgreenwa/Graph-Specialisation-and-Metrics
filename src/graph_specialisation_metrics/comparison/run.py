@@ -89,16 +89,27 @@ def performance_table(tasks: Sequence[str] = _data.DEFAULT_TASKS, *,
     """{task: {"val","test","name"}} read from the cached carriage meta (falls back to spec stats)."""
     out: dict = {}
     for t in tasks:
-        m = _metric_from_summary(_data.load_carriage_summary(
-            _data.carriage_summary_path(carriage_collate, t, "semantic")))
-        if m is None:
-            m = _metric_from_summary(_data.load_carriage_summary(
-                _data.carriage_summary_path(carriage_collate, t, "structural", structural_mode)))
-        if m is None:
-            stats = _data.load_spec_stats(_data.spec_stats_path(spec_collate, t))
-            if stats and (stats.get("val_metric") is not None or stats.get("test_metric") is not None):
-                m = {"val": stats.get("val_metric"), "test": stats.get("test_metric"),
-                     "name": stats.get("test_metric_name") or "MAE"}
+        candidates = [
+            _metric_from_summary(_data.load_carriage_summary(
+                _data.carriage_summary_path(carriage_collate, t, "semantic"))),
+            _metric_from_summary(_data.load_carriage_summary(
+                _data.carriage_summary_path(carriage_collate, t, "structural", structural_mode))),
+        ]
+        stats = _data.load_spec_stats(_data.spec_stats_path(spec_collate, t))
+        if stats and (stats.get("val_metric") is not None or stats.get("test_metric") is not None):
+            candidates.append({"val": stats.get("val_metric"), "test": stats.get("test_metric"),
+                               "name": stats.get("test_metric_name") or "MAE"})
+        candidates = [candidate for candidate in candidates if candidate is not None]
+        m = None
+        if candidates:
+            # Preserve an existing carriage result exactly; fill any old missing val/test field
+            # from structural/spec metadata rather than recomputing expensive carriage solely to
+            # backfill a plot label.
+            m = dict(candidates[0])
+            for candidate in candidates[1:]:
+                for key in ("val", "test", "name"):
+                    if m.get(key) is None and candidate.get(key) is not None:
+                        m[key] = candidate[key]
         if m is not None:
             out[t] = m
     return out
@@ -134,7 +145,10 @@ def inventory(tasks: Sequence[str] = _data.DEFAULT_TASKS, *,
         sem = _data.load_carriage_summary(_data.carriage_summary_path(carriage_collate, t, "semantic"))
         strc = _data.load_carriage_summary(
             _data.carriage_summary_path(carriage_collate, t, "structural", structural_mode))
-        scores = _data.scores_npz_path(spec_collate, t).exists()
+        scores_exists = _data.scores_npz_path(spec_collate, t).exists()
+        score_stats = _data.load_spec_stats(_data.spec_stats_path(spec_collate, t)) or {}
+        score_version = int(score_stats.get("score_cache_version", 0))
+        scores = scores_exists and (not _data.is_vnode(t) or score_version >= 2)
         chan = _data.channel_ablation_npz_path(spec_collate, t).exists()
         sem_val, sem_test = _valtest(sem)
 
@@ -157,6 +171,7 @@ def inventory(tasks: Sequence[str] = _data.DEFAULT_TASKS, *,
               (f"-/{sem_test:.3f}" if sem_test is not None else "-"))
         rows[t] = {"ckpt": ckpt_status, "carriage_semantic": bool(sem),
                    "carriage_structural": bool(strc), "scores": bool(scores),
+                   "score_cache_version": score_version,
                    "channel_ablation": bool(chan),
                    "val_metric": sem_val, "test_metric": sem_test}
         log(f"{t:<18} {ckpt_status:<7} {('yes' if sem else 'no'):<9} "
@@ -346,6 +361,7 @@ def run_all(tasks: Sequence[str] = _data.DEFAULT_TASKS, *,
             exclude: Optional[Sequence[str]] = None,
             drop_vnode: bool = False,
             display: bool = False,
+            allow_partial: bool = False,
             # environment
             mount: bool = True,
             skip_install: bool = False,
@@ -388,16 +404,9 @@ def run_all(tasks: Sequence[str] = _data.DEFAULT_TASKS, *,
             summary = _data.carriage_summary_path(carriage_collate, task, intv, structural_mode)
             key = f"{task}:{intv}"
             if summary.exists() and not force:
-                # Reuse only if the cached summary already carries the val/test metrics. A summary
-                # written before val was added lacks val_metric; recompute it so the performance
-                # plot gets val (cheap relative to carriage, and self-healing without force=True).
-                cached = _data.load_carriage_summary(summary)
-                if (cached or {}).get("meta", {}).get("val_metric") is not None:
-                    log(f"[cache] carriage {key}: reuse {summary}")
-                    status["carriage"][key] = "cached"
-                    continue
-                log(f"[cache] carriage {key}: cached summary lacks val_metric; recomputing to "
-                    f"backfill val/test.")
+                log(f"[cache] carriage {key}: reuse {summary}")
+                status["carriage"][key] = "cached"
+                continue
             log(f"[run] carriage {key} ...")
             car_kw = dict(
                 task=task, intervention=intv, ckpt=_resolve_ckpt(task),
@@ -430,7 +439,11 @@ def run_all(tasks: Sequence[str] = _data.DEFAULT_TASKS, *,
         for t in tasks:
             # A model is fully cached only if its scores exist AND, when channel ablation is
             # requested, its channel_ablation npz exists too. Otherwise (re)run this model.
-            scores_cached = _data.scores_npz_path(spec_collate, t).exists()
+            score_stats = _data.load_spec_stats(_data.spec_stats_path(spec_collate, t)) or {}
+            score_version = int(score_stats.get("score_cache_version", 0))
+            vnode_score_current = (not _data.is_vnode(t) or score_version >= 2)
+            scores_cached = (_data.scores_npz_path(spec_collate, t).exists()
+                             and vnode_score_current)
             chan_cached = _data.channel_ablation_npz_path(spec_collate, t).exists()
             fully_cached = scores_cached and (not with_channel_ablation or chan_cached)
             if not force and fully_cached:
@@ -438,15 +451,19 @@ def run_all(tasks: Sequence[str] = _data.DEFAULT_TASKS, *,
                     + (" (+ channel ablation)" if with_channel_ablation else ""))
                 status["specialisation"][t] = "cached"
                 continue
+            need_channel_ablation = with_channel_ablation and not chan_cached
+            if not vnode_score_current and _data.scores_npz_path(spec_collate, t).exists():
+                log(f"[cache] specialisation {t}: invalidating pre-v2 VNode score cache "
+                    "(virtual carrier was omitted); channel-ablation cache remains reusable.")
             log(f"[run] specialisation scores for {t} ..."
-                + (" (+ channel-split ablation)" if with_channel_ablation else ""))
+                + (" (+ channel-split ablation)" if need_channel_ablation else ""))
             ck = _resolve_ckpt(t)
             spec_kw = dict(
                 tasks=[t], ckpt=({t: ck} if ck else None), collate_dir=spec_collate,
                 num_graphs=spec_num_graphs, donors=spec_donors,
                 with_attn_routing=with_attn_routing,
                 with_ablation=False, with_attention=False,
-                with_channel_ablation=with_channel_ablation,
+                with_channel_ablation=need_channel_ablation,
                 channel_ablation_graphs=channel_ablation_graphs,
                 channel_ablation_sources=channel_ablation_sources,
                 channel_ablation_donors=channel_ablation_donors,
@@ -464,6 +481,34 @@ def run_all(tasks: Sequence[str] = _data.DEFAULT_TASKS, *,
                 status["specialisation"][t] = f"error: {exc}"
                 status["errors"].append(f"specialisation {t}: {exc}")
 
+    # ---- completeness gate: never silently publish a two-line "all-model" overlay --------
+    missing_carriage = [
+        f"{task}:{intv}" for task in tasks for intv in interventions
+        if not _data.carriage_summary_path(
+            carriage_collate, task, intv, structural_mode).exists()
+    ]
+    def _score_cache_current(task):
+        if not _data.scores_npz_path(spec_collate, task).exists():
+            return False
+        version = int((_data.load_spec_stats(
+            _data.spec_stats_path(spec_collate, task)) or {}).get("score_cache_version", 0))
+        return not _data.is_vnode(task) or version >= 2
+
+    missing_scores = ([task for task in tasks if not _score_cache_current(task)]
+                      if run_specialisation else [])
+    status["missing_carriage"] = missing_carriage
+    status["missing_scores"] = missing_scores
+    Path(comparison_dir).mkdir(parents=True, exist_ok=True)
+    status_path = Path(comparison_dir) / "run_status.json"
+    status_path.write_text(json.dumps(status, indent=2), encoding="utf-8")
+    if not allow_partial and (missing_carriage or missing_scores):
+        details = "; ".join(status["errors"][-5:]) or "see the per-stage status entries"
+        raise RuntimeError(
+            "Refusing to draw a partial all-model comparison. Missing carriage="
+            f"{missing_carriage}; missing scores={missing_scores}. {details}. "
+            f"Full status: {status_path}"
+        )
+
     # ---- deliverables from cache -------------------------------------------------------
     figs = build_figures(
         tasks, carriage_collate=carriage_collate, spec_collate=spec_collate,
@@ -471,8 +516,6 @@ def run_all(tasks: Sequence[str] = _data.DEFAULT_TASKS, *,
         structural_mode=structural_mode, include=include, exclude=exclude,
         drop_vnode=drop_vnode, display=display)
 
-    Path(comparison_dir).mkdir(parents=True, exist_ok=True)
-    (Path(comparison_dir) / "run_status.json").write_text(json.dumps(status, indent=2),
-                                                          encoding="utf-8")
+    status_path.write_text(json.dumps(status, indent=2), encoding="utf-8")
     log(f"\n[done] comparison artefacts + figures under: {comparison_dir}")
     return {"status": status, "figures": figs, "comparison_dir": comparison_dir}

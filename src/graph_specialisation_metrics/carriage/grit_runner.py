@@ -21,7 +21,7 @@ from pathlib import Path
 import numpy as np
 
 from . import core, metrics
-from .env import log
+from .env import enable_grit_reregistration, log
 
 
 @dataclass
@@ -264,6 +264,7 @@ def run_grit_carriage(task, cc: CarriageConfig) -> dict:
     from torch_geometric.graphgym.model_builder import create_model
     from torch_geometric.graphgym.utils.comp_budget import params_count
 
+    enable_grit_reregistration()
     import grit  # noqa: F401  registers loaders/encoders/layers/heads
 
     adapter = task.content_adapter

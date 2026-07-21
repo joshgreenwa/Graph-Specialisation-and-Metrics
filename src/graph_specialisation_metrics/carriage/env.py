@@ -187,6 +187,33 @@ def prepare_inprocess_grit(repo_dir: Path) -> None:
     log(f"[compat] In-process GRIT: sys.path[0]={sys.path[0]} | cwd={os.getcwd()}")
 
 
+def enable_grit_reregistration() -> None:
+    """Make GraphGym registrations overwrite-safe when switching patched GRIT clones.
+
+    GraphGym's registries survive deletion of ``grit.*`` from ``sys.modules``.  A comparison run
+    intentionally imports several differently patched GRIT clones in one Python process, so the
+    later clone must replace (not skip) the earlier clone's registered network/encoder/layer.
+    """
+    import torch_geometric.graphgym.register as reg
+
+    if getattr(reg, "_gsm_overwrite_registration", False):
+        return
+    # If specialisation installed its older equivalent wrapper first, it already has the exact
+    # overwrite semantics required here; mark it as shared rather than wrapping it twice.
+    if getattr(reg, "_spec_overwrite_registration", False):
+        reg._gsm_overwrite_registration = True
+        return
+    original = getattr(reg, "_gsm_original_register_base", reg.register_base)
+    reg._gsm_original_register_base = original
+
+    def register_base_overwrite(mapping, key, module):
+        mapping.pop(key, None)
+        return original(mapping, key, module)
+
+    reg.register_base = register_base_overwrite
+    reg._gsm_overwrite_registration = True
+
+
 # ======================================================================================
 # Checkpoint discovery on Drive
 # ======================================================================================

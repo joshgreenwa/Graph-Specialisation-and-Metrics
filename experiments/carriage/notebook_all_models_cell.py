@@ -69,11 +69,14 @@ from graph_specialisation_metrics.comparison import run_all, build_figures  # no
 
 # First run on a fresh runtime: omit skip_install so deps install (~a few minutes).
 # On a warm runtime (e.g. right after a training run), pass skip_install=True.
-# force=False reuses any cached carriage/score results, so re-runs are incremental.
+# force=False reuses every existing carriage result and computes only missing model/intervention
+# pairs. Dense/1-hop are therefore not repeated when completing 2-hop/VNode carriage. The two
+# pre-v2 VNode score caches are intentionally refreshed once to include VNode-mediated transport.
 run_all(
     # tasks=["zinc", "zinc_1hop", "zinc_2hop", "zinc_1hop_vnode", "zinc_2hop_vnode"],  # default
     skip_install=False,
     force=False,
+    allow_partial=False,  # fail clearly instead of silently drawing a subset of requested models
     display=True,     # show the figures inline
     # ---- channel-split causal ablation -> the D/J validation figure (deliverable v) ----
     # HEAVY: L*H ablated forwards per model over intervention replicas. Set False to skip it

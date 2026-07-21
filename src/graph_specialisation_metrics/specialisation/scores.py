@@ -133,8 +133,9 @@ def score_model(task, sc: SpecConfig, *, with_attn_routing: bool = True,
 
     # A global-VNode model's attention support includes virtual-node edges, which are not
     # slot-comparable across replicas (and inflate the edge set), so the edge-based attention-
-    # routing score is not defined for it. The per-head TRANSPORT scores S_sem/S_str are the
-    # primary readout and are unaffected (wV is restricted to real nodes in capture()).
+    # routing score is not defined for it. The primary TRANSPORT score includes the VNode row:
+    # it is an internal carrier whose earlier-layer wV has nonzero gradient through later real
+    # nodes, even though its final state is removed before graph pooling.
     has_vnode = getattr(getattr(model, "model", model), "global_vnode", None) is not None
     attn_enabled = with_attn_routing and not has_vnode
     if has_vnode and with_attn_routing:
@@ -170,19 +171,21 @@ def score_model(task, sc: SpecConfig, *, with_attn_routing: bool = True,
         # F = sqrt(sum_t (phi_t . Dbar-o)^2), exactly carriage.core.functional_magnitude. For a
         # scalar target (T=1, ZINC) this reduces to |phi . Dbar-o|.
         cb = Batch.from_data_list([base]).to(device)
-        cap = gm.capture(cb, want_grad=True, want_attn=attn_enabled)
+        cap = gm.capture(cb, want_grad=True, want_attn=attn_enabled,
+                         include_virtual_transport=has_vnode)
         pred_c = cap["pred"].reshape(-1)                            # [T]
         T = int(pred_c.numel())
-        phi_stack = []                                             # [L] of [T, n, H, dh]
-        # grad is taken over the FULL wV (incl. any virtual-node rows so autograd stays intact);
-        # restrict phi to real nodes so it aligns with the real-node transport deltas below.
+        n_carriers = int(cap["wV"][0].shape[0])                   # n (+1 for global VNode)
+        if has_vnode and n_carriers != n + 1:
+            raise RuntimeError(f"expected one VNode carrier: captured {n_carriers}, real n={n}")
+        phi_stack = []                                             # [L] of [T, n_carriers, H, dh]
+        # Gradients stay on the full captured wV. For VNode models this deliberately retains the
+        # virtual carrier; the no-grad replica captures below use the same graph-major ordering.
         rmask = cap.get("real_mask")
         grads_t = [torch.autograd.grad(pred_c[t], cap["wV"], retain_graph=(t < T - 1))
                    for t in range(T)]                              # grads_t[t] = [L] of [N,H,dh]
         for l in range(L):
             stacked = torch.stack([grads_t[t][l].detach() for t in range(T)])  # [T,N,H,dh]
-            if rmask is not None:
-                stacked = stacked[:, rmask]                        # [T,n,H,dh] real nodes only
             phi_stack.append(stacked)
         del grads_t
 
@@ -239,7 +242,7 @@ def score_model(task, sc: SpecConfig, *, with_attn_routing: bool = True,
         node_of_rep = np.array(sources, dtype=np.int64)[src_of_rep]   # replica r -> node j
         flat_donor = donor_content.reshape(R, F_feat)
 
-        dObar = [torch.zeros(S, n, H, dh, device=device) for _ in range(L)]     # per source-row
+        dObar = [torch.zeros(S, n_carriers, H, dh, device=device) for _ in range(L)]
         dAbar = ([torch.zeros(S, E, H, device=device) for _ in range(L)]
                  if graph_attn else None)
 
@@ -254,7 +257,9 @@ def score_model(task, sc: SpecConfig, *, with_attn_routing: bool = True,
                         rows = (torch.arange(1, m + 1, device=device) * n
                                 + torch.as_tensor(node_of_rep[r0:r0 + m], device=device))
                         adapter.write_donors(b.x, rows, flat_donor[r0:r0 + m])
-                        cc = gm.capture(b, want_grad=False, want_attn=graph_attn)
+                        cc = gm.capture(
+                            b, want_grad=False, want_attn=graph_attn,
+                            include_virtual_transport=has_vnode)
                     break
                 except RuntimeError as exc:
                     if "out of memory" not in str(exc).lower() or m == 1:
@@ -263,11 +268,12 @@ def score_model(task, sc: SpecConfig, *, with_attn_routing: bool = True,
                         torch.cuda.empty_cache()
                     m = max(1, m // 2); chunk = m
                     log(f"[mem] OOM -> reducing replicas/forward to {m}")
-            assert cc["wV"][0].shape[0] == (m + 1) * n, "semantic replica reshape mismatch"
+            assert cc["wV"][0].shape[0] == (m + 1) * n_carriers, \
+                "semantic replica reshape mismatch"
             reps_src = torch.as_tensor(src_of_rep[r0:r0 + m], device=device)
             for l in range(L):
-                wv = cc["wV"][l].view(m + 1, n, H, dh)
-                delta = wv[0:1] - wv[1:]                          # [m, n, H, dh]
+                wv = cc["wV"][l].view(m + 1, n_carriers, H, dh)
+                delta = wv[0:1] - wv[1:]                          # [m, carrier, H, dh]
                 dObar[l].index_add_(0, reps_src, delta)
                 if graph_attn:
                     assert cc["attn"][l].shape[0] == (m + 1) * E, "attention replica reshape mismatch"
@@ -278,7 +284,7 @@ def score_model(task, sc: SpecConfig, *, with_attn_routing: bool = True,
             if nm.any() and gi_pos < 3:
                 sel = torch.as_tensor(np.flatnonzero(nm), device=device)
                 for l in range(L):
-                    wv = cc["wV"][l].view(m + 1, n, H, dh)
+                    wv = cc["wV"][l].view(m + 1, n_carriers, H, dh)
                     noop_max = max(noop_max, float((wv[0:1] - wv[1 + sel]).abs().max().item()))
             r0 += m
 
@@ -329,7 +335,7 @@ def score_model(task, sc: SpecConfig, *, with_attn_routing: bool = True,
         anchor_of_rep = np.repeat(np.arange(S), K)               # replica -> anchor-row
         partners_flat = partners.reshape(-1)                     # replica -> partner node v
         anchor_nodes_flat = np.array(sources, dtype=np.int64)[anchor_of_rep]   # replica -> anchor node u
-        dObar = [torch.zeros(S, n, H, dh, device=device) for _ in range(L)]
+        dObar = [torch.zeros(S, n_carriers, H, dh, device=device) for _ in range(L)]
 
         chunk = _plan_chunk(n)
         r0 = 0
@@ -342,7 +348,9 @@ def score_model(task, sc: SpecConfig, *, with_attn_routing: bool = True,
                              for r in range(r0, r0 + m)]
                     with torch.no_grad():
                         b = Batch.from_data_list([base] + perts).to(device)
-                        cc = gm.capture(b, want_grad=False, want_attn=False)
+                        cc = gm.capture(
+                            b, want_grad=False, want_attn=False,
+                            include_virtual_transport=has_vnode)
                     break
                 except RuntimeError as exc:
                     if "out of memory" not in str(exc).lower() or m == 1:
@@ -351,17 +359,18 @@ def score_model(task, sc: SpecConfig, *, with_attn_routing: bool = True,
                         torch.cuda.empty_cache()
                     m = max(1, m // 2); chunk = m
                     log(f"[mem] OOM (structural) -> reducing replicas/forward to {m}")
-            assert cc["wV"][0].shape[0] == (m + 1) * n, "structural replica reshape mismatch"
+            assert cc["wV"][0].shape[0] == (m + 1) * n_carriers, \
+                "structural replica reshape mismatch"
             reps_anc = torch.as_tensor(anchor_of_rep[r0:r0 + m], device=device)
             for l in range(L):
-                wv = cc["wV"][l].view(m + 1, n, H, dh)
+                wv = cc["wV"][l].view(m + 1, n_carriers, H, dh)
                 dObar[l].index_add_(0, reps_anc, wv[0:1] - wv[1:])
             # no-op partner (v==u) check: a self-transposition must move ~0 transport.
             nm = partners_flat[r0:r0 + m] == anchor_nodes_flat[r0:r0 + m]
             if nm.any() and gi_pos < 3:
                 sel = torch.as_tensor(np.flatnonzero(nm), device=device)
                 for l in range(L):
-                    wv = cc["wV"][l].view(m + 1, n, H, dh)
+                    wv = cc["wV"][l].view(m + 1, n_carriers, H, dh)
                     noop_max = max(noop_max, float((wv[0:1] - wv[1 + sel]).abs().max().item()))
             r0 += m
 
@@ -419,7 +428,8 @@ def score_model(task, sc: SpecConfig, *, with_attn_routing: bool = True,
         "val_metric_name": gm.checks.get("val_metric_name"),
         "num_graphs": int(len(graph_ids)), "donors_K": K,
         "checks": {"softmax_err": softmax_err, "noop_max": noop_max,
-                   "relabel_inv_max": relabel_inv_max, **gm.checks},
+                   "relabel_inv_max": relabel_inv_max,
+                   "vnode_transport_included": bool(has_vnode), **gm.checks},
         "graph_ids": graph_ids,
         "gm": gm,     # the loaded model, reused by ablation / attention-viz (no reload)
     }

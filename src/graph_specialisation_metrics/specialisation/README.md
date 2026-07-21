@@ -59,6 +59,14 @@ estimator (donor/partner-average the transport delta **before** the abs — Jens
   the mask and confound a sparse head's *wiring* reliance with its structural *payload* reliance,
   inflating `S_str`. For the dense model the support is all-pairs, so freezing is a no-op there.
 
+This definition is unchanged for a trained **k-hop** model: the k-hop mask is fixed architecture,
+while the score measures semantic/structural signal transported through the head on that support.
+For a **global-VNode** model, the VNode is included as an internal carrier in `S_sem/S_str` (its
+earlier-layer head output can affect later real nodes even though its final state is excluded from
+pooling). Attention-routing scores remain disabled for VNode runs because virtual-edge slots are
+not a comparable graph-edge support. Score-cache version 2 records this complete VNode transport;
+older VNode score caches must be recomputed, but ordinary dense/k-hop caches remain valid.
+
 ```
 F^{lh}[i, s] = | φ^{lh}_i · Δ̄o^{lh}_i(s) |
 S_sem(l,h)   = mean_{graph, j}  Σ_i F   under the semantic donor swap

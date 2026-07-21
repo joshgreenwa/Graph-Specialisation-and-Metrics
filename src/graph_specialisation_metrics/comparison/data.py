@@ -160,9 +160,12 @@ def load_carriage_curves_by_task(carriage_collate, tasks: Sequence[str], interve
 
 
 def load_scores_by_task(spec_collate, tasks: Sequence[str]) -> dict:
-    """{task: scores_dict} for every task whose scores npz exists on disk."""
+    """Current {task: scores_dict}; pre-v2 VNode caches are intentionally excluded."""
     out = {}
     for t in tasks:
+        stats = load_spec_stats(spec_stats_path(spec_collate, t)) or {}
+        if is_vnode(t) and int(stats.get("score_cache_version", 0)) < 2:
+            continue
         s = load_scores(scores_npz_path(spec_collate, t))
         if s is not None:
             out[t] = s

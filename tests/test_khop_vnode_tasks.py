@@ -11,6 +11,7 @@ import pytest
 
 from graph_specialisation_metrics.carriage import env
 from graph_specialisation_metrics.carriage.tasks import get_task
+from graph_specialisation_metrics.specialisation.model import GritHeadModel, _graph_major_order
 
 
 @pytest.mark.parametrize(
@@ -96,3 +97,55 @@ def test_standard_graphgym_ckpt_still_preferred_over_recovery(tmp_path):
     chosen, epoch = env.find_checkpoint(results)
     assert chosen == std
     assert epoch == 1900
+
+
+def test_grit_reregistration_replaces_previous_clone_registration():
+    reg = pytest.importorskip("torch_geometric.graphgym.register")
+
+    env.enable_grit_reregistration()
+    old, new = object(), object()
+    mapping = {"same_key": old}
+    reg.register_base(mapping, "same_key", new)
+    assert mapping["same_key"] is new
+
+
+def test_vnode_rows_are_reordered_graph_major_for_replica_reshape():
+    import torch
+
+    # PyG real rows are graph-major, then GlobalVNode appends all virtual rows at the end.
+    graph_index = torch.tensor([0, 0, 1, 1, 0, 1])
+    order = _graph_major_order(graph_index)
+    assert order.tolist() == [0, 1, 4, 2, 3, 5]
+    assert graph_index[order].tolist() == [0, 0, 0, 1, 1, 1]
+
+
+def test_capture_retains_and_groups_vnode_transport_before_pool_strip():
+    import torch
+
+    class Attention(torch.nn.Module):
+        def forward(self, batch):
+            return batch.x.reshape(-1, 1, 1), None
+
+    attention = Attention()
+
+    class Model(torch.nn.Module):
+        def forward(self, batch):
+            n = len(batch.x)
+            batch.x = torch.cat([batch.x, torch.tensor([100., 200.])])
+            batch.batch = torch.cat([batch.batch, torch.tensor([0, 1])])
+            batch.real_node_mask = torch.arange(n + 2) < n
+            attention(batch)  # capture the full internal transport site
+            # Match GRIT: VNode entries are removed from batch.batch before capture() returns.
+            batch.x = batch.x[batch.real_node_mask]
+            batch.batch = batch.batch[batch.real_node_mask]
+            return torch.zeros(2, 1), torch.zeros(2, 1)
+
+    class Batch:
+        x = torch.tensor([0., 1., 10., 11.])
+        batch = torch.tensor([0, 0, 1, 1])
+
+    gm = object.__new__(GritHeadModel)
+    gm.model, gm.attn_layers = Model(), [attention]
+    gm.L = gm.H = gm.dh = 1
+    captured = gm.capture(Batch(), want_grad=False, include_virtual_transport=True)
+    assert captured["wV"][0].reshape(-1).tolist() == [0., 1., 100., 10., 11., 200.]

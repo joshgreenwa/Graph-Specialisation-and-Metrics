@@ -23,7 +23,8 @@ the checkpoints load. `run_all` pins the recovery checkpoints the runner wrote
 ## What it does
 
 `run_all` delegates to the existing orchestrators once per model, **skipping any stage whose
-cached artefact already exists** (`force=True` overrides):
+cached artefact already exists** (`force=True` overrides). It refuses to publish a partial
+"all-model" overlay by default (`allow_partial=True` is the explicit diagnostic escape hatch):
 
 1. **Evaluate** — val + test metric recomputed from each checkpoint (added to the carriage/spec
    load check; surfaced in every cached summary's `meta`).
@@ -59,13 +60,22 @@ The stable-scale requirement is a *reference-fixed* limit: F/B y-limits (and the
 (`d=0`) bin by default (`include_self_B=True` to keep it) because it is ~100x the transport terms
 and would dominate the shared symlog scale.
 
+The specialisation scatter and D/J grids use the same `gsem` and `gstr` reference constants and
+the same limits in every panel. Thus the larger dense semantic spread is not a panel-rescaling
+artefact: absolute score-amplitude differences are deliberately retained. `D_rel` is the bounded
+within-head semantic-vs-structural balance; `J` deliberately retains total output-relevant
+transport strength. Raw `J` therefore supports cross-model comparison only as *influence
+amplitude*, not as an architecture-free selectivity statistic; use `D_rel` for the latter and the
+channel-split ablation figure to validate its causal interpretation.
+
 ## VNode note
 
 A global-VNode model appends one virtual-node row per graph before the transformer layers and
-strips it before the add-pooling head. The carriage `h^L` capture and the specialisation `wV`
-capture restrict to real nodes (the VNode's discarded final state has zero readout gradient), and
-the VNode's edge-based attention-routing score is disabled — the transport carriage/scores are
-unaffected. See `carriage/khop_env.py`.
+strips it before the add-pooling head. Carriage remains defined over real graph-node carriers at
+`h^L`; earlier VNode communication is present in their final states. Per-head specialisation,
+however, includes the VNode's intermediate `wV` row because it can have nonzero downstream
+readout gradient. The VNode's edge-based attention-routing score is disabled. See
+`carriage/khop_env.py` and `specialisation/README.md`.
 
 ## Files
 

@@ -152,7 +152,9 @@ def global_norms(scores_by_task: dict, tasks: Sequence[str]):
 def plot_spec_scatter_grid(scores_by_task: dict, tasks: Sequence[str], out_path,
                            *, gsem: Optional[float] = None, gstr: Optional[float] = None,
                            ncols: Optional[int] = None, metrics_by_task: Optional[dict] = None,
-                           suptitle: str = "Per-head specialisation: structural (x) vs semantic (y)"):
+                           suptitle: str = ("Per-head specialisation: structural (x) vs semantic (y)\n"
+                                            "shared reference normalisation; absolute transport "
+                                            "amplitude retained")):
     """(ii) Side-by-side per-model scatter of S_str (x) vs S_sem (y), layer-coloured.
 
     ``gsem``/``gstr`` are the per-channel global means the axes are divided by; pass the reference
@@ -201,9 +203,9 @@ def plot_spec_scatter_grid(scores_by_task: dict, tasks: Sequence[str], out_path,
         ml = _metric_label(metrics_by_task, t)
         ax.set_title(meta["label"] + (f"\n{ml}" if ml else ""), fontsize=9)
         if idx % ncols == 0:
-            ax.set_ylabel("semantic  S_sem / mean")
+            ax.set_ylabel("semantic  S_sem / shared mean")
         if idx // ncols == nrows - 1:
-            ax.set_xlabel("structural  S_str / mean")
+            ax.set_xlabel("structural  S_str / shared mean")
     # blank any unused axes
     for j in range(n, nrows * ncols):
         axes[j // ncols][j % ncols].axis("off")
@@ -303,7 +305,7 @@ def plot_spec_DJ_grid(scores_by_task: dict, tasks: Sequence[str], out_path,
     if sc is not None:
         cb = fig.colorbar(sc, ax=axes.ravel().tolist(), shrink=0.8, pad=0.01)
         cb.set_label("layer")
-    sup = suptitle or (f"Per-head specialisation: "
+    sup = suptitle or (f"Per-head specialisation (shared reference normalisation): "
                        f"{'relative ' if selectivity == 'relative' else ''}selectivity "
                        f"{'D_rel' if selectivity == 'relative' else 'D'} (x) vs joint strength J (y)")
     fig.suptitle(sup, fontsize=12)

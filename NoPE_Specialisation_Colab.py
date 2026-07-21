@@ -94,6 +94,28 @@ try:
 except Exception:  # pragma: no cover
     _HAVE_PANDAS = False
 
+# ---- paper-style figure defaults (applied to every figure) ----
+plt.rcParams.update({
+    "savefig.dpi": 200, "figure.dpi": 110,
+    "figure.facecolor": "white", "savefig.facecolor": "white", "savefig.bbox": "tight",
+    "font.size": 11, "axes.titlesize": 11.5, "axes.labelsize": 11,
+    "xtick.labelsize": 10, "ytick.labelsize": 10, "legend.fontsize": 9,
+    "axes.linewidth": 0.8, "lines.linewidth": 1.9, "lines.markersize": 6,
+    "legend.frameon": True, "legend.framealpha": 0.9, "legend.edgecolor": "0.85",
+    "axes.titlepad": 8, "figure.autolayout": False,
+})
+
+# Consistent method palette used across figures (colour-blind friendly).
+METHOD_COLORS = {"local": "#e15759", "global": "#4e79a7", "transport": "#59a14f"}
+REF_COLOR = "#333333"
+
+def _despine(ax, grid=True):
+    for sp in ("top", "right"):
+        ax.spines[sp].set_visible(False)
+    if grid:
+        ax.grid(True, alpha=0.25, linewidth=0.6)
+        ax.set_axisbelow(True)
+
 # Smoke mode (local CPU sanity run): NOPE_SMOKE=1 shrinks everything so the whole
 # pipeline runs in a few seconds. Colab runs leave it unset for the full config.
 SMOKE = os.environ.get("NOPE_SMOKE", "") == "1"
@@ -149,6 +171,10 @@ FORCE_RESCORE = False               # True to ignore the score cache and recompu
 # ---- optional per-layer mean/std attention figure (across inputs) ----
 ATTN_VIZ_DEPTH = 5                   # which depth to visualise (must be in DEPTHS); None to skip
 ATTN_VIZ_SEED  = None                # None -> SEEDS[0]
+
+# The digestible 1xL_max per-depth figures (methods overlaid, queries collapsed) are the default.
+# Set DETAILED_FIGS=True to ALSO draw the detailed 3xL per-(layer,query) scatter and D-J grids.
+DETAILED_FIGS = False
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 DTYPE = torch.float32
@@ -734,7 +760,7 @@ def make_figure(agg, out_path):
                  f"{len(SEEDS)} seeds (points = per (layer, query), seed-averaged, coloured by layer)",
                  fontsize=13, y=1.005)
     fig.tight_layout(rect=[0.02, 0, 1, 0.99])
-    fig.savefig(out_path, dpi=140, bbox_inches="tight")
+    fig.savefig(out_path, dpi=200, bbox_inches="tight")
     print(f"[fig  ] saved {out_path}")
     try:
         plt.show()
@@ -810,7 +836,7 @@ def make_jd_figure(agg, out_path):
                  "D sign = semantic (right) / structural (left)",
                  fontsize=13, y=1.005)
     fig.tight_layout(rect=[0.02, 0, 1, 0.99])
-    fig.savefig(out_path, dpi=140, bbox_inches="tight")
+    fig.savefig(out_path, dpi=200, bbox_inches="tight")
     print(f"[fig  ] saved {out_path}")
     try:
         plt.show()
@@ -856,7 +882,7 @@ def make_attention_figure(depth=None, seed=None, family=None, out_path=None):
                  fontsize=13, y=1.01)
     fig.tight_layout(rect=[0, 0, 1, 0.99])
     if out_path:
-        fig.savefig(out_path, dpi=140, bbox_inches="tight")
+        fig.savefig(out_path, dpi=200, bbox_inches="tight")
         print(f"[fig  ] saved {out_path}")
     try:
         plt.show()
@@ -912,83 +938,193 @@ def _oracle_final_curve(fam, depths):
 
 
 def make_faithfulness_figure(agg, out_path):
-    """Is each method FAITHFUL to a ground-truth positional-ness oracle (attention std across
-    inputs)? Up to three panels, built from whichever families were trained:
+    """Positional fraction (1 = positional) per SCORING METHOD -- local vs global vs transport --
+    alongside an independent reference, one panel per trained setting. Panel titles are descriptive
+    (the setting), NOT claims about the outcome.
 
-      A RoPE control   : final-layer positional fraction vs depth, LOCAL method, NoPE vs RoPE
-                         (+ oracles). The NoPE local curve falls with depth (position constructed
-                         in-stream, then mislabelled); RoPE tracks its oracle (position explicit).
-      B semantic ctrl  : final-layer positional fraction vs depth, LOCAL method, NoPE positional
-                         vs NoPE semantic (+ oracles). Local diverges from the oracle only on the
-                         positional task; on the semantic task it tracks it -> local is wrong
-                         SPECIFICALLY when position is constructed in-stream.
-      C localisation   : positional fraction per layer for the primary deepest model, all three
-                         methods vs oracle -> global & transport track the oracle, local dips at
-                         the late layers.
+      reference (attn-var) = 1 - normalised std of attention across random inputs. A positional-ness
+      proxy computed WITHOUT the swap scores: low attention variance = content-invariant = positional.
+
+    Panels (built from whichever families were trained):
+      (1) NoPE, positional task -- final-layer fraction vs depth
+      (2) NoPE, positional task -- fraction per layer, deepest model
+      (3) RoPE, positional task -- final-layer fraction vs depth
+      (4) NoPE, semantic task   -- final-layer fraction vs depth
     """
     depths = sorted(DEPTHS)
     fams = list(agg.keys())
+
+    # (title, family, mode) for each available panel; titles name the SETTING only.
     panels = []
-    if ("nope", "positional") in fams and ("rope", "positional") in fams:
-        panels.append("rope")
-    if ("nope", "positional") in fams and ("nope", "semantic") in fams:
-        panels.append("semantic")
     if PRIMARY in fams:
-        panels.append("localise")
+        panels.append((f"(1) NoPE · positional — final layer vs depth", PRIMARY, "depth"))
+        panels.append((f"(2) NoPE · positional — per layer (L{depths[-1]})", PRIMARY, "layer"))
+    if ("rope", "positional") in fams:
+        panels.append(("(3) RoPE · positional — final layer vs depth", ("rope", "positional"), "depth"))
+    if ("nope", "semantic") in fams:
+        panels.append(("(4) NoPE · semantic — final layer vs depth", ("nope", "semantic"), "depth"))
     if not panels:
-        panels = ["localise"]
+        panels = [("per layer (deepest)", PRIMARY, "layer")]
 
-    fig, axes = plt.subplots(1, len(panels), figsize=(6.2 * len(panels), 5.2), squeeze=False)
-    axes = axes[0]
-    mcol = {"local": "#d62728", "global": "#1f77b4", "transport": "#2ca02c"}
+    n = len(panels)
+    ncols = 2 if n >= 3 else n
+    nrows = (n + ncols - 1) // ncols
+    fig, axes = plt.subplots(nrows, ncols, figsize=(6.6 * ncols, 5.0 * nrows), squeeze=False)
+    axes = axes.ravel()
 
-    for ax, panel in zip(axes, panels):
-        if panel == "rope":
-            fam_n, fam_r = ("nope", "positional"), ("rope", "positional")
-            ax.plot(depths, _final_pf_curve(agg, fam_n, "local", depths), "o-",
-                    color="#d62728", label="NoPE local")
-            ax.plot(depths, _oracle_final_curve(fam_n, depths), "^--", color="#d62728",
-                    alpha=0.6, label="NoPE oracle")
-            ax.plot(depths, _final_pf_curve(agg, fam_r, "local", depths), "o-",
-                    color="#1f77b4", label="RoPE local")
-            ax.plot(depths, _oracle_final_curve(fam_r, depths), "^--", color="#1f77b4",
-                    alpha=0.6, label="RoPE oracle")
-            ax.set_title("(A) RoPE control\nlocal mislabels only when position is in-stream")
-            ax.set_xlabel("student depth L"); ax.set_xticks(depths)
-        elif panel == "semantic":
-            fam_p, fam_s = ("nope", "positional"), ("nope", "semantic")
-            ax.plot(depths, _final_pf_curve(agg, fam_p, "local", depths), "o-",
-                    color="#d62728", label="positional local")
-            ax.plot(depths, _oracle_final_curve(fam_p, depths), "^--", color="#d62728",
-                    alpha=0.6, label="positional oracle")
-            ax.plot(depths, _final_pf_curve(agg, fam_s, "local", depths), "o-",
-                    color="#9467bd", label="semantic local")
-            ax.plot(depths, _oracle_final_curve(fam_s, depths), "^--", color="#9467bd",
-                    alpha=0.6, label="semantic oracle")
-            ax.set_title("(B) semantic control\nlocal is wrong only on the positional task")
-            ax.set_xlabel("student depth L"); ax.set_xticks(depths)
-        else:  # localise
+    def _draw(ax, title, fam, mode):
+        if mode == "depth":
+            for m in METHOD_ORDER:
+                ax.plot(depths, _final_pf_curve(agg, fam, m, depths), "o-",
+                        color=METHOD_COLORS[m], label=m)
+            ax.plot(depths, _oracle_final_curve(fam, depths), "^--", color=REF_COLOR,
+                    label="reference (attn-var)")
+            ax.set_xlabel(r"student depth $L$"); ax.set_xticks(depths)
+        else:  # per-layer, deepest model
             Ld = depths[-1]
             for m in METHOD_ORDER:
                 ys = [float(np.mean(_pos_fraction_byq(
-                    seed_mean_points(agg[PRIMARY][m][Ld]["x"]),
-                    seed_mean_points(agg[PRIMARY][m][Ld]["y"]))[l])) for l in range(Ld)]
-                ax.plot(range(Ld), ys, "o-", color=mcol[m], label=m)
-            orc = compute_oracle(PRIMARY[0], PRIMARY[1], Ld)
-            ax.plot(range(Ld), [float(np.mean(orc[l])) for l in range(Ld)], "k^--", label="oracle")
-            ax.set_title(f"(C) {PRIMARY[0]}/{PRIMARY[1]} L{Ld}: per-layer\nlocal dips at late layers")
+                    seed_mean_points(agg[fam][m][Ld]["x"]),
+                    seed_mean_points(agg[fam][m][Ld]["y"]))[l])) for l in range(Ld)]
+                ax.plot(range(Ld), ys, "o-", color=METHOD_COLORS[m], label=m)
+            orc = compute_oracle(fam[0], fam[1], Ld)
+            ax.plot(range(Ld), [float(np.mean(orc[l])) for l in range(Ld)], "^--",
+                    color=REF_COLOR, label="reference (attn-var)")
             ax.set_xlabel("layer"); ax.set_xticks(range(Ld))
-        ax.axhline(0.5, color="gray", lw=0.6, ls=":")
+        ax.axhline(0.5, color="0.6", lw=0.7, ls=":")
+        ax.set_title(title)
         ax.set_ylabel("positional fraction  (1 = positional)")
-        ax.set_ylim(-0.02, 1.02); ax.legend(fontsize=8)
+        ax.set_ylim(-0.02, 1.02)
+        ax.legend(loc="best")
+        _despine(ax)
 
-    fig.suptitle("Faithfulness to a positional-ness oracle: local attention mislabels position "
-                 "constructed in-stream; global & transport stay faithful\n"
-                 f"T={SEQ_LEN}, d={D_MODEL}, {len(SEEDS)} seeds",
-                 fontsize=12, y=1.02)
-    fig.tight_layout(rect=[0, 0, 1, 0.98])
-    fig.savefig(out_path, dpi=140, bbox_inches="tight")
+    for ax, (title, fam, mode) in zip(axes, panels):
+        _draw(ax, title, fam, mode)
+    for ax in axes[len(panels):]:
+        ax.axis("off")
+
+    fig.suptitle("Positional fraction by scoring method: local vs global vs transport\n"
+                 "reference (attn-var) = independent positional-ness from attention variance across "
+                 f"inputs   ·   T={SEQ_LEN}, d={D_MODEL}, {len(SEEDS)} seeds",
+                 fontsize=12, y=1.005)
+    fig.tight_layout(rect=[0, 0, 1, 0.97])
+    fig.savefig(out_path)
     print(f"[fig  ] saved {out_path}")
+    try:
+        plt.show()
+    except Exception:
+        pass
+    return fig
+
+
+def _layer_means(agg, fam, method, L):
+    """Per-layer mean score (over queries & seeds) for one (family, method, depth).
+    Returns (structural_by_layer, semantic_by_layer), each length L."""
+    x = seed_mean_points(agg[fam][method][L]["x"])   # {l:(T,)} structural
+    y = seed_mean_points(agg[fam][method][L]["y"])   # {l:(T,)} semantic
+    strv = np.array([float(x[l].mean()) for l in range(L)])
+    semv = np.array([float(y[l].mean()) for l in range(L)])
+    return strv, semv
+
+
+def _method_channel_means(agg, fam, method):
+    """Per-method structural/semantic scale = mean over ALL (depth, layer) points. Used to put the
+    three methods on a common axis and to de-bias the selectivity contrast, without the L=1
+    self-normalisation degeneracy of a per-depth mean."""
+    all_str, all_sem = [], []
+    for L in sorted(DEPTHS):
+        s, se = _layer_means(agg, fam, method, L)
+        all_str.extend(s.tolist()); all_sem.extend(se.tolist())
+    ms = float(np.mean(all_str)) if all_str else 1.0
+    me = float(np.mean(all_sem)) if all_sem else 1.0
+    return (ms if abs(ms) > 1e-9 else 1.0), (me if abs(me) > 1e-9 else 1.0)
+
+
+def make_scatter_bydepth_figure(agg, out_path, fam=None):
+    """Digestible 1 x |DEPTHS| view: per depth, normalised semantic (y) vs structural (x) with the
+    query dimension collapsed (mean over queries & seeds). local/global/transport overlay as
+    coloured paths over layers; marker grows with layer (largest = final / read-out layer). Scores
+    are normalised per method (raw / mean over all depths & layers) to share one axis scale."""
+    fam = fam if fam is not None else PRIMARY
+    depths = sorted(DEPTHS)
+    norms = {m: _method_channel_means(agg, fam, m) for m in METHOD_ORDER}
+    fig, axes = plt.subplots(1, len(depths), figsize=(3.7 * len(depths), 4.0), squeeze=False)
+    axes = axes[0]
+    for ax, L in zip(axes, depths):
+        lim = 1.0
+        for m in METHOD_ORDER:
+            strv, semv = _layer_means(agg, fam, m, L)
+            xs, ys = strv / norms[m][0], semv / norms[m][1]
+            ax.plot(xs, ys, "-", color=METHOD_COLORS[m], lw=1.3, alpha=0.75, zorder=2)
+            sizes = 22 + 60 * (np.arange(L) / max(L - 1, 1))
+            ax.scatter(xs, ys, s=sizes, color=METHOD_COLORS[m], edgecolors="white",
+                       linewidths=0.5, zorder=3, label=m)
+            lim = max(lim, xs.max(), ys.max())
+        lim = lim * 1.08 + 0.05
+        ax.plot([0, lim], [0, lim], color="0.75", ls="--", lw=0.8, zorder=1)   # equal line
+        ax.set_xlim(0, lim); ax.set_ylim(0, lim)
+        ax.set_title(f"$L={L}$")
+        ax.set_xlabel("structural (norm)")
+        if ax is axes[0]:
+            ax.set_ylabel("semantic (norm)")
+            ax.legend(loc="upper right")
+        _despine(ax)
+    fig.suptitle(f"Specialisation by layer — {fam[0]}/{fam[1]} — semantic vs structural, "
+                 "mean over queries (marker grows with layer)\n"
+                 "local vs global vs transport   ·   per-method normalisation "
+                 "(raw / mean over all depths & layers)",
+                 fontsize=11.5, y=1.03)
+    fig.tight_layout(rect=[0, 0, 1, 0.94])
+    fig.savefig(out_path); print(f"[fig  ] saved {out_path}")
+    try:
+        plt.show()
+    except Exception:
+        pass
+    return fig
+
+
+def make_selectivity_strength_figure(agg, out_path, fam=None):
+    """Digestible 1 x |DEPTHS| view: per depth, SELECTIVITY (x) vs JOINT STRENGTH (y), queries
+    collapsed. Selectivity uses the SCALE-INVARIANT contrast (S~sem - S~str)/(S~sem + S~str) in
+    [-1,1] (semantic right / structural left), NOT the raw difference D -- so a head with one
+    channel ~0 reads as fully one-sided regardless of magnitude. J = (S~sem + S~str)/2 is strength;
+    read selectivity only where J is non-negligible (low J = the ratio is noise)."""
+    fam = fam if fam is not None else PRIMARY
+    depths = sorted(DEPTHS)
+    norms = {m: _method_channel_means(agg, fam, m) for m in METHOD_ORDER}
+    fig, axes = plt.subplots(1, len(depths), figsize=(3.7 * len(depths), 4.0), squeeze=False)
+    axes = axes[0]
+    for ax, L in zip(axes, depths):
+        jmax = 1.0
+        for m in METHOD_ORDER:
+            strv, semv = _layer_means(agg, fam, m, L)
+            s_str, s_sem = strv / norms[m][0], semv / norms[m][1]
+            J = 0.5 * (s_sem + s_str)
+            sel = (s_sem - s_str) / (s_sem + s_str + 1e-9)
+            ax.plot(sel, J, "-", color=METHOD_COLORS[m], lw=1.3, alpha=0.75, zorder=2)
+            sizes = 22 + 60 * (np.arange(L) / max(L - 1, 1))
+            ax.scatter(sel, J, s=sizes, color=METHOD_COLORS[m], edgecolors="white",
+                       linewidths=0.5, zorder=3, label=m)
+            jmax = max(jmax, J.max())
+        ax.axvline(0, color="0.6", lw=0.8, ls="--", zorder=1)
+        ax.set_xlim(-1.05, 1.05); ax.set_ylim(0, jmax * 1.12 + 0.05)
+        ax.text(0.98, 0.02, "semantic →", transform=ax.transAxes, ha="right", va="bottom",
+                fontsize=7, color="0.4")
+        ax.text(0.02, 0.02, "← structural", transform=ax.transAxes, ha="left", va="bottom",
+                fontsize=7, color="0.4")
+        ax.set_title(f"$L={L}$")
+        ax.set_xlabel("selectivity (contrast)")
+        if ax is axes[0]:
+            ax.set_ylabel("joint strength  $J$")
+            ax.legend(loc="upper center")
+        _despine(ax)
+    fig.suptitle(f"Selectivity vs joint strength by layer — {fam[0]}/{fam[1]} — mean over queries "
+                 "(marker grows with layer)\n"
+                 r"selectivity $=(\tilde S_{sem}-\tilde S_{str})/(\tilde S_{sem}+\tilde S_{str})$ "
+                 "(scale-invariant)   ·   local vs global vs transport",
+                 fontsize=11.5, y=1.03)
+    fig.tight_layout(rect=[0, 0, 1, 0.94])
+    fig.savefig(out_path); print(f"[fig  ] saved {out_path}")
     try:
         plt.show()
     except Exception:
@@ -1043,19 +1179,21 @@ def make_transport_importance_figure(out_path):
 
     fig, ax = plt.subplots(figsize=(8.2, 5))
     xs = np.arange(len(cases)); w = 0.38
-    b1 = ax.bar(xs - w / 2, attn_r, w, color="#1f77b4", label="global ATTENTION positional score")
-    b2 = ax.bar(xs + w / 2, J_r, w, color="#2ca02c", label="TRANSPORT strength  J")
+    b1 = ax.bar(xs - w / 2, attn_r, w, color=METHOD_COLORS["global"],
+                label="global attention: positional score")
+    b2 = ax.bar(xs + w / 2, J_r, w, color=METHOD_COLORS["transport"],
+                label="transport: strength $J$")
     for b in list(b1) + list(b2):
         ax.text(b.get_x() + b.get_width() / 2, b.get_height() + 0.02, f"{b.get_height():.2f}",
                 ha="center", va="bottom", fontsize=8)
-    ax.axhline(1.0, color="gray", lw=0.6, ls=":")
+    ax.axhline(1.0, color="0.6", lw=0.7, ls=":")
     ax.set_xticks(xs); ax.set_xticklabels([c[0] for c in cases])
     ax.set_ylabel("score (relative to the intact head)")
-    ax.set_title(f"Why transport, not attention — final head of the {variant}/{task} L{Ld} model\n"
-                 "attention scores an inert head as unchanged; transport J collapses to ~0")
-    ax.legend(fontsize=9, loc="upper right")
+    ax.set_title(f"Final head lesioned inert, attention pattern preserved — {variant}/{task} L{Ld}")
+    ax.legend(loc="upper right")
+    _despine(ax)
     fig.tight_layout()
-    fig.savefig(out_path, dpi=140, bbox_inches="tight")
+    fig.savefig(out_path)
     print(f"[fig  ] saved {out_path}")
     try:
         plt.show()
@@ -1073,12 +1211,17 @@ def main(force_retrain_depths=None):
           f"  smoke={SMOKE}  force_retrain_depths={sorted(set(force_retrain_depths or []))}")
     train_rows, agg = run_all(force_retrain_depths=force_retrain_depths)
     print_training_table(train_rows)
-    # Primary scatter / D-J / attention figures use the PRIMARY family; faithfulness overlays all.
+    # Digestible 1 x |DEPTHS| summaries (methods overlaid, queries collapsed) -- the default output.
     agg_primary = agg[PRIMARY]
-    scatter_path = os.path.join(RUN_DIR, f"fig_specialisation_scatter_{CFG_TAG}_{EVAL_TAG}.png")
-    jd_path = os.path.join(RUN_DIR, f"fig_specialisation_JDplane_{CFG_TAG}_{EVAL_TAG}.png")
-    make_figure(agg_primary, scatter_path)
-    make_jd_figure(agg_primary, jd_path)
+    bydepth_path = os.path.join(RUN_DIR, f"fig_bydepth_specialisation_{CFG_TAG}_{EVAL_TAG}.png")
+    seljoint_path = os.path.join(RUN_DIR, f"fig_bydepth_selectivity_{CFG_TAG}_{EVAL_TAG}.png")
+    make_scatter_bydepth_figure(agg, bydepth_path)
+    make_selectivity_strength_figure(agg, seljoint_path)
+    if DETAILED_FIGS:   # detailed 3 x |DEPTHS| per-(layer,query) scatter + D-J grids
+        make_figure(agg_primary,
+                    os.path.join(RUN_DIR, f"fig_specialisation_scatter_{CFG_TAG}_{EVAL_TAG}.png"))
+        make_jd_figure(agg_primary,
+                       os.path.join(RUN_DIR, f"fig_specialisation_JDplane_{CFG_TAG}_{EVAL_TAG}.png"))
     faith_path = os.path.join(RUN_DIR, f"fig_faithfulness_{CFG_TAG}_{EVAL_TAG}.png")
     make_faithfulness_figure(agg, faith_path)
     tr_imp_path = os.path.join(RUN_DIR, f"fig_transport_importance_{CFG_TAG}_{EVAL_TAG}.png")

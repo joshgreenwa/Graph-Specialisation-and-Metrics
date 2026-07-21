@@ -40,35 +40,18 @@ from ..carriage.content import FullNodeContentAdapter
 from ..carriage.env import log
 
 
+def _graph_major_order(graph_index):
+    """Stable row order grouping real nodes and an appended VNode by graph id."""
+    import torch
+
+    return torch.argsort(graph_index, stable=True)
+
+
 def _enable_grit_reregistration() -> None:
-    """Make GraphGym's ``register_base`` OVERWRITE on a duplicate key instead of raising.
+    """Backward-compatible alias for the shared carriage/specialisation registry guard."""
+    from ..carriage.env import enable_grit_reregistration
 
-    Running BOTH ZINC models in one process re-imports GRIT for the second task (from the
-    1-hop *patched* clone). ``env.prepare_inprocess_grit`` drops ``grit.*`` from ``sys.modules``
-    but GraphGym's process-global registry (``torch_geometric.graphgym.register.*``) is never
-    cleared, so the re-import re-runs GRIT's ``@register_*`` decorators and PyG-2.2.0's
-    ``register_base`` raises ``KeyError: Module ... already defined``.
-
-    We OVERWRITE (not skip -- unlike the ``allow_graphgym_duplicate_registration`` helpers used
-    elsewhere in this repo, which re-import the SAME GRIT) because the 1-hop clone's *patched*
-    ``GritTransformer`` / masked encoder / ``gt.attn.sparsity`` config MUST replace the dense
-    ones; skipping would silently leave the 1-hop task running the dense, unmasked model.
-    Idempotent: guarded so wrapping happens once, and it delegates to the true original (popping
-    the key first) so any validation/side-effects of ``register_base`` are preserved.
-    """
-    import torch_geometric.graphgym.register as reg
-
-    if getattr(reg, "_spec_overwrite_registration", False):
-        return
-    original = getattr(reg, "_spec_original_register_base", reg.register_base)
-    reg._spec_original_register_base = original
-
-    def register_base_overwrite(mapping, key, module):
-        mapping.pop(key, None)                       # drop any prior entry so original won't raise
-        return original(mapping, key, module)
-
-    reg.register_base = register_base_overwrite
-    reg._spec_overwrite_registration = True
+    enable_grit_reregistration()
 
 
 @dataclass
@@ -286,14 +269,17 @@ class GritHeadModel:
         return np.concatenate(ps), np.concatenate(ts)
 
     # ---- per-head capture ------------------------------------------------------------
-    def capture(self, batch, *, want_grad: bool, want_attn: bool = False):
+    def capture(self, batch, *, want_grad: bool, want_attn: bool = False,
+                include_virtual_transport: bool = False):
         """Run one forward and capture per-layer wV (transport) and optionally attn.
 
         Args:
             batch:      a PyG ``Batch`` already on ``self.device``.
             want_grad:  keep wV in the autograd graph (for phi = d yhat / d wV). Uses
-                        ``torch.enable_grad``; caller takes the gradients.
+                         ``torch.enable_grad``; caller takes the gradients.
             want_attn:  also stash detached ``batch.attn`` + ``edge_index`` per layer.
+            include_virtual_transport: for a no-grad VNode replica batch, retain its virtual row
+                         and reorder rows graph-major so ``[replica, n+1, H, dh]`` is exact.
 
         Returns:
             dict(pred=[G,T] tensor, wV=[L] list of [N,H,dh] tensors, attn=[L] list of
@@ -302,13 +288,16 @@ class GritHeadModel:
         """
         import torch
 
-        cap = {"wV": [None] * self.L, "attn": [None] * self.L, "edge_index": None}
+        cap = {"wV": [None] * self.L, "attn": [None] * self.L,
+               "edge_index": None, "node_graph": None}
         idx_of = {id(a): l for l, a in enumerate(self.attn_layers)}
 
         def _hook(module, inputs, output):
             l = idx_of[id(module)]
             h_out = output[0] if isinstance(output, (tuple, list)) else output
             cap["wV"][l] = h_out                       # [N, H, dh], in-graph if want_grad
+            if cap["node_graph"] is None:
+                cap["node_graph"] = inputs[0].batch.detach().clone()
             if want_attn:
                 b = inputs[0]
                 cap["attn"][l] = b.attn.detach().squeeze(-1)   # [E, H]
@@ -324,20 +313,26 @@ class GritHeadModel:
             for hd in handles:
                 hd.remove()
 
-        # global-VNode models append one virtual-node row per graph before the layers (stripped
-        # only just before pooling), so wV here carries those rows. Restrict the captured transport
-        # to REAL nodes so the per-node reshape/indexing in scores.py is exact. For the want_grad
-        # clean capture we must NOT re-index wV (that sibling tensor would fall off yhat's autograd
-        # path); we return real_mask and the caller strips the readout gradient phi instead.
+        # Global-VNode models append all virtual rows after all real rows. For ordinary callers we
+        # retain the historical real-only capture. The specialisation score, however, must include
+        # the VNode as an internal carrier because its earlier-layer wV has nonzero readout gradient.
+        # Replica batches are reordered graph-major so a [replica,n+1,H,dh] view is valid.
         real_mask = getattr(batch, "real_node_mask", None)
         if real_mask is not None and not want_grad:
-            cap["wV"] = [w[real_mask] for w in cap["wV"]]
+            if include_virtual_transport:
+                # Save this inside the attention hook: GritTransformer strips VNode entries from
+                # ``batch.batch`` just before pooling, after the wV rows have already been made.
+                order = _graph_major_order(cap["node_graph"])
+                cap["wV"] = [w[order] for w in cap["wV"]]
+            else:
+                cap["wV"] = [w[real_mask] for w in cap["wV"]]
         for l in range(self.L):
             assert cap["wV"][l] is not None, f"layer {l} attention hook did not fire"
             assert cap["wV"][l].dim() == 3 and cap["wV"][l].shape[1:] == (self.H, self.dh), \
                 f"wV[{l}] shape {tuple(cap['wV'][l].shape)} != [N,{self.H},{self.dh}]"
         return {"pred": pred, "true": true, "wV": cap["wV"], "attn": cap["attn"],
-                "edge_index": cap["edge_index"], "real_mask": real_mask}
+                "edge_index": cap["edge_index"], "real_mask": real_mask,
+                "node_graph": cap["node_graph"]}
 
     # ---- ablation forward ------------------------------------------------------------
     def collect_preds_ablated(self, data_groups, ablations=None):

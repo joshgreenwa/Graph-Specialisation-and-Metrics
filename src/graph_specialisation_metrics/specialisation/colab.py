@@ -33,6 +33,9 @@ from . import channel_ablation as channel_ablation_mod
 from .model import SpecConfig
 from .scores import score_model, select_heads
 
+
+SCORE_CACHE_VERSION = 2  # v2 includes global-VNode rows in per-head transport scores
+
 DEFAULT_COLLATE_DIR = "/content/drive/MyDrive/graph_specialisation_metrics/specialisation_figures"
 
 
@@ -183,6 +186,7 @@ def run(
             S_sem=result["S_sem"], S_str=result["S_str"],
             S_attn_sem=(result["S_attn_sem"] if result["S_attn_sem"] is not None
                         else np.zeros_like(result["S_sem"])),
+            score_cache_version=np.asarray(SCORE_CACHE_VERSION, dtype=np.int64),
         )
         if abl is not None:
             savez_kw.update(func_mean=abl["func_mean"], loss_mean=abl["loss_mean"])
@@ -205,6 +209,7 @@ def run(
             "test_metric_name": result["test_metric_name"],
             "val_metric": result.get("val_metric"), "val_metric_name": result.get("val_metric_name"),
             "num_graphs": result["num_graphs"], "donors_K": result["donors_K"],
+            "score_cache_version": SCORE_CACHE_VERSION,
             "checks": result["checks"], "attention_molecules": mol_ids,
         }
         if abl is not None:

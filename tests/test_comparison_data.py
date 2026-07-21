@@ -5,6 +5,7 @@ import json
 import numpy as np
 
 from graph_specialisation_metrics.comparison import data as D
+from graph_specialisation_metrics.comparison.run import performance_table
 
 
 def test_carriage_summary_path_prefix():
@@ -54,3 +55,31 @@ def test_load_scores_and_summary_roundtrip(tmp_path):
     summ = D.load_carriage_summary(p)
     assert summ["meta"]["val_metric"] == 0.11
     assert D.load_carriage_summary(tmp_path / "missing.json") is None
+
+
+def test_performance_table_backfills_val_without_recomputing_carriage(tmp_path):
+    carriage, spec = tmp_path / "carriage", tmp_path / "spec"
+    cpath = D.carriage_summary_path(carriage, "zinc", "semantic")
+    cpath.parent.mkdir(parents=True)
+    cpath.write_text(json.dumps({"meta": {"test_metric": .058,
+                                           "test_metric_name": "mae"}}))
+    spath = D.spec_stats_path(spec, "zinc")
+    spath.parent.mkdir(parents=True)
+    spath.write_text(json.dumps({"val_metric": .070, "test_metric": .058,
+                                 "test_metric_name": "mae"}))
+    table = performance_table(["zinc"], carriage_collate=str(carriage),
+                              spec_collate=str(spec))
+    assert table["zinc"]["test"] == .058
+    assert table["zinc"]["val"] == .070
+
+
+def test_pre_v2_vnode_score_cache_is_not_loaded(tmp_path):
+    task = "zinc_1hop_vnode"
+    score_path = D.scores_npz_path(tmp_path, task)
+    score_path.parent.mkdir(parents=True)
+    np.savez(score_path, S_sem=np.ones((2, 2)), S_str=np.ones((2, 2)))
+    stats_path = D.spec_stats_path(tmp_path, task)
+    stats_path.write_text(json.dumps({"score_cache_version": 1}))
+    assert task not in D.load_scores_by_task(tmp_path, [task])
+    stats_path.write_text(json.dumps({"score_cache_version": 2}))
+    assert task in D.load_scores_by_task(tmp_path, [task])

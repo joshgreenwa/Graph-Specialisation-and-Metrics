@@ -25,7 +25,7 @@ from pathlib import Path
 import numpy as np
 
 from . import core, metrics, structural
-from .env import log
+from .env import enable_grit_reregistration, log
 from .grit_runner import (
     CarriageConfig,
     _integrated_failure_stats,
@@ -48,6 +48,7 @@ def run_grit_structural_carriage(task, cc: CarriageConfig) -> dict:
     from torch_geometric.graphgym.model_builder import create_model
     from torch_geometric.graphgym.utils.comp_budget import params_count
 
+    enable_grit_reregistration()
     import grit  # noqa: F401  registers loaders/encoders/layers/heads
 
     mode = cc.structural_mode
