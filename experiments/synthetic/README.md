@@ -38,6 +38,23 @@ transport site with within-forward clean/corrupt replicas and donor averaging be
 Use `--phase train`, `--phase analyze`, and `--phase figures` to separate cached stages;
 `--fast-dev-run` is an installation and wiring check only.
 
+### NAR attention faithfulness and transport mechanisms
+
+`analysis/nar_transport_mechanisms_colab.py` is the standalone Colab access point for the
+post-training mechanism experiment. It selects the best seed in each support-by-N cell using
+validation loss only, supports `--analysis-width 64` or `128`, and never changes the training
+fingerprint. The analysis adds target-payload, query-address, distractor-payload and same-answer
+address interventions; decomposes routed `wV` exactly into routing and message terms; computes the
+contextual semantic/structural and D/J planes; and runs score-selected family ablation plus finite
+2x2 routing/message patching.
+
+Expensive graph/head tensors are cached per checkpoint under
+`transport_mechanisms_v1/d<width>/metrics/` and causal results under `causal/`. The `figures` phase
+reads only those caches, so all tables and PNG/PDF figures can be regenerated without loading GRIT.
+Metric and causal graph chunks are also committed atomically as they finish, allowing interrupted
+large-N runs to resume at the next incomplete chunk.
+The full design and registered checks are in `NAR_TRANSPORT_MECHANISM_PLAN.md`.
+
 ## ReachCarriageSpecialisation
 
 `training/reach_carriage_specialisation_colab.py` is a standalone, single-cell official-GRIT
