@@ -41,6 +41,9 @@ OFFICIAL_GRIT_URL = "https://github.com/LiamMa/GRIT.git"
 OFFICIAL_GRIT_COMMIT = "6c988ea600a606fbb49a2246c64a2d37396b3ab5"
 DEFAULT_GRIT_DIR = "/content/GRIT"
 DEFAULT_DRIVE_ROOT = "/content/drive/MyDrive/graph_specialisation_metrics/nar_grit"
+# Batched sparse/scatter reductions on CUDA are not bitwise deterministic across two otherwise
+# identical graph replicas. Values below this scale are numerical round-off, not routed signal.
+NOOP_TRANSPORT_ATOL = 2.0e-5
 MODEL_RADII: dict[str, int | None] = {"1hop": 1, "2hop": 2, "dense": None}
 MODEL_ORDER = ("1hop", "2hop", "dense")
 MODEL_COLOURS = {"1hop": "#6550a4", "2hop": "#2b8cbe", "dense": "#d7301f"}
@@ -1162,8 +1165,11 @@ def analyze_model(
         score_batch.slice(0, min(2, len(score_batch))),
         device=device,
     )
-    if noop_max > 1.0e-5:
-        raise RuntimeError(f"identical replicas produced routed transport {noop_max:.3e}")
+    if noop_max > NOOP_TRANSPORT_ATOL:
+        raise RuntimeError(
+            "identical replicas produced routed transport "
+            f"{noop_max:.3e} (tolerance {NOOP_TRANSPORT_ATOL:.1e})"
+        )
     result = {
         "version": EXPERIMENT_VERSION,
         "fingerprint": config_fingerprint(cfg),
@@ -1180,6 +1186,7 @@ def analyze_model(
         "family_ablation": family,
         "intervention_checks": checks,
         "noop_transport_max": noop_max,
+        "noop_transport_tolerance": NOOP_TRANSPORT_ATOL,
     }
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(result, path)
