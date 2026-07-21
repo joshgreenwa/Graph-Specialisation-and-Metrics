@@ -8,9 +8,10 @@ runner, adds a reproducible QM9 loader plus attention patch, and launches GRIT.
 
 Use ``--attention dense`` for complete-graph attention, or ``--attention khop``
 with ``--hops K`` for every ordered node pair whose shortest-path distance is at
-most K (self included). K-hop support is recovered exactly from existing RRWP
-walk channels, so changing K does not regenerate cached QM9 data. With RRWP-21,
-valid K values are 1 through 20.
+most K (self included). One-hop support comes directly from molecular
+``edge_index`` plus self; larger K-hop support is recovered exactly from existing
+RRWP walk channels, so changing K does not regenerate cached QM9 data. With
+RRWP-21, valid K values are 1 through 20.
 
 Only QM9 target column 4 is retained: the HOMO-LUMO energy gap in eV. The loader
 uses atomic-number node embeddings, four bond-type embeddings, and a fixed
@@ -907,6 +908,34 @@ def _replace_if_present(path: Path, old: str, new: str, label: str) -> bool:
     return True
 
 
+def _upgrade_onehop_mask_to_explicit_support(rrwp_encoder: Path) -> bool:
+    """Migrate an older QM9 patch so a 1-hop mask comes from frozen ``edge_index``.
+
+    For a clean molecular graph, RRWP reachability at lengths zero and one is exactly
+    ``edge_index`` plus self loops, so this does not change the trained model's computation.
+    It does matter for analysis interventions: structural transposition deliberately moves the
+    RRWP payload while holding architectural support fixed.  Re-deriving the mask from that moved
+    payload would violate the intervention contract.
+    """
+    return _replace_if_present(
+        rrwp_encoder,
+        old=(
+            '        if self.max_hops is None:\n'
+            '            mask_index = batch.get(self.mask_index_name, None)\n'
+            '        else:\n'
+        ),
+        new=(
+            '        # At one hop, edge_index (+ self below) is exactly the trained support.\n'
+            '        # Keeping that architectural mask explicit lets RRWP-only interventions\n'
+            '        # transpose rrwp_index/rrwp_val without silently rewiring attention.\n'
+            '        if self.max_hops is None or self.max_hops == 1:\n'
+            '            mask_index = batch.get(self.mask_index_name, None)\n'
+            '        else:\n'
+        ),
+        label="freeze 1-hop attention support under RRWP interventions",
+    )
+
+
 def apply_qm9_patch(repo_dir: Path, drive_dir: Path, args: argparse.Namespace) -> None:
     """Apply the QM9-gap loader, attention support, and optional VNode patches."""
     variant = args.attention if args.attention == "dense" else f"{args.hops}hop"
@@ -1130,7 +1159,10 @@ def apply_qm9_patch(repo_dir: Path, drive_dir: Path, args: argparse.Namespace) -
             '        raw_rrwp_val = batch.rrwp_val\n'
             '        edge_index = batch.edge_index\n'
             '        edge_attr = batch.edge_attr\n'
-            '        if self.max_hops is None:\n'
+            '        # At one hop, edge_index (+ self below) is exactly the trained support.\n'
+            '        # Keeping that architectural mask explicit lets RRWP-only interventions\n'
+            '        # transpose rrwp_index/rrwp_val without silently rewiring attention.\n'
+            '        if self.max_hops is None or self.max_hops == 1:\n'
             '            mask_index = batch.get(self.mask_index_name, None)\n'
             '        else:\n'
             '            needed_channels = self.max_hops + 1  # identity + walks of length 1..k\n'
@@ -1147,6 +1179,12 @@ def apply_qm9_patch(repo_dir: Path, drive_dir: Path, args: argparse.Namespace) -
         marker="needed_channels = self.max_hops + 1",
         label="derive exact <=k-hop mask from RRWP",
     )
+    # Upgrade checkouts already patched by an earlier copy of this runner.  The broad marker
+    # above intentionally makes the main replacement idempotent, so without this migration an
+    # existing Colab clone would retain the old behaviour and derive even the 1-hop mask from
+    # rrwp_index/rrwp_val.  That makes a payload-only RRWP transposition rewire attention despite
+    # scores._perturb_mask_frozen restoring edge_index.
+    _upgrade_onehop_mask_to_explicit_support(rrwp_encoder)
 
     grit_model = repo_dir / "grit" / "network" / "grit_model.py"
     _replace_exact(
@@ -1537,6 +1575,7 @@ def verify_qm9_model_patch(repo_dir: Path) -> None:
         ],
         repo_dir / "grit" / "encoder" / "rrwp_encoder.py": [
             "max_hops=None",
+            "if self.max_hops is None or self.max_hops == 1:",
             "needed_channels = self.max_hops + 1",
             "mask_index = rrwp_idx[:, reachable]",
         ],

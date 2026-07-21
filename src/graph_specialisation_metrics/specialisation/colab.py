@@ -26,7 +26,7 @@ import numpy as np
 
 from ..carriage import env
 from ..carriage.env import log
-from ..carriage.tasks import GritTaskSpec, get_task
+from ..carriage.tasks import GritTaskSpec, get_task, resolve_dataset_dir
 from . import ablation as ablation_mod
 from . import attention_viz, figures
 from . import channel_ablation as channel_ablation_mod
@@ -133,7 +133,7 @@ def run(
             raise ValueError(f"task {spec.name!r} has no drive_dir; register one in carriage.tasks.")
         task_out = out_dir / spec.name
         task_out.mkdir(parents=True, exist_ok=True)
-        dataset_dir = str(Path(drive_dir) / "datasets")
+        dataset_dir = resolve_dataset_dir(spec, drive_dir)
 
         # --- env: clone GRIT (task-specific dir), apply hooks (1-hop patch), import in-process ---
         # A task with env_hooks PATCHES GRIT source; give it its own clone so two such tasks in one

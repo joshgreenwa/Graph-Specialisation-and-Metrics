@@ -14,6 +14,7 @@ run time by ``grit_runner.check_carriage_preconditions``, so they hold for any t
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Callable, Optional
 
 from .content import ContentAdapter, FullNodeContentAdapter
@@ -38,7 +39,10 @@ class GritTaskSpec:
         expected_params: exact param count to assert (None = skip; still logged).
         drive_dir:       default Drive dir holding results/ and datasets/ for this task
                          (the same --drive-dir the training runner used).
+        dataset_dir:     optional dataset directory override. Use this when several training
+                         runs share one dataset cache outside ``drive_dir/datasets``.
         paper_metric:    ("mae", 0.059)-style (name, value) for the load sanity check; None skips.
+        metric_name:     display name for a recomputed metric when there is no paper reference.
         metric_fn:       (preds[N,T], trues[N,T]) -> float recomputed over the eval split.
                          Default: MAE. Peptides-func uses multilabel mean-AP.
         metric_higher_better: True for AP (abort if below threshold), False for MAE (abort if above).
@@ -56,7 +60,9 @@ class GritTaskSpec:
     config_text: Optional[str] = None
     expected_params: Optional[int] = None
     drive_dir: str = ""
+    dataset_dir: Optional[str] = None
     paper_metric: Optional[tuple] = None
+    metric_name: Optional[str] = None
     metric_fn: Callable = staticmethod(metrics.mae_metric)
     metric_higher_better: bool = False
     metric_abort: float = 0.15
@@ -90,6 +96,16 @@ def get_task(name: str) -> GritTaskSpec:
     if name not in TASKS:
         raise KeyError(f"unknown task {name!r}; known: {sorted(TASKS)}")
     return TASKS[name]
+
+
+def resolve_dataset_dir(spec: GritTaskSpec, drive_dir: Optional[str] = None) -> str:
+    """Resolve the dataset cache without assuming it lives beside task results."""
+    if spec.dataset_dir:
+        return str(Path(spec.dataset_dir))
+    root = drive_dir or spec.drive_dir
+    if not root:
+        raise ValueError(f"task {spec.name!r} has no dataset_dir or drive_dir")
+    return str(Path(root) / "datasets")
 
 
 # Official dense GRIT+RRWP on ZINC-subset -- the reproduced reference (scalar regression).
@@ -150,6 +166,13 @@ def _peptides_hooks():
     return (hook,)
 
 
+def _qm9_hooks(attention: str, hops: int = 1):
+    """Deferred checkpoint-compatible reconstruction hook for a QM9 gap model."""
+    from . import qm9_env
+
+    return (qm9_env.make_qm9_hook(attention=attention, hops=hops),)
+
+
 # Parameter-matched 1-hop GRIT+RRWP on ZINC-subset (sparse control; same scalar regression).
 register(GritTaskSpec(
     name="zinc_1hop",
@@ -166,6 +189,49 @@ register(GritTaskSpec(
     env_hooks=_onehop_hooks(),
     grit_repo_dir="/content/GRIT_zinc_1hop",  # own clone: the patch edits GRIT source
     node_content_desc="atom type",
+))
+
+
+# ---------------------------------------------------------------------------------------
+# QM9 HOMO-LUMO gap controls, trained by the repo-root GRIT_QM9_gap.py runner. Both models
+# use the identical target/features/split contract and differ only in attention support.
+# The training runs deliberately share one PyG QM9 cache outside either results directory.
+# ---------------------------------------------------------------------------------------
+
+register(GritTaskSpec(
+    name="qm9_gap_dense",
+    title="GRIT+RRWP QM9 HOMO-LUMO gap (dense)",
+    config_path="configs/GRIT/qm9-gap-GRIT-RRWP.yaml",
+    expected_params=472_769,
+    drive_dir="/content/drive/MyDrive/grit_qm9_gap_dense",
+    dataset_dir="/content/drive/MyDrive/grit_qm9_gap_data",
+    paper_metric=None,
+    metric_name="MAE (eV)",
+    metric_fn=staticmethod(metrics.mae_metric),
+    metric_higher_better=False,
+    # A trained checkpoint is expected to be far below this; an uninitialised model is not.
+    metric_abort=0.5,
+    env_hooks=_qm9_hooks(attention="dense", hops=1),
+    grit_repo_dir="/content/GRIT_qm9_gap_dense",
+    node_content_desc="atomic number",
+))
+
+
+register(GritTaskSpec(
+    name="qm9_gap_1hop",
+    title="GRIT+RRWP QM9 HOMO-LUMO gap (1-hop masked)",
+    config_path="configs/GRIT/qm9-gap-GRIT-RRWP.yaml",
+    expected_params=472_769,
+    drive_dir="/content/drive/MyDrive/grit_qm9_gap_1hop_real",
+    dataset_dir="/content/drive/MyDrive/grit_qm9_gap_data",
+    paper_metric=None,
+    metric_name="MAE (eV)",
+    metric_fn=staticmethod(metrics.mae_metric),
+    metric_higher_better=False,
+    metric_abort=0.5,
+    env_hooks=_qm9_hooks(attention="khop", hops=1),
+    grit_repo_dir="/content/GRIT_qm9_gap_1hop",
+    node_content_desc="atomic number",
 ))
 
 

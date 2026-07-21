@@ -23,7 +23,7 @@ import numpy as np
 from ..carriage import env, metrics
 from ..carriage.env import log
 from ..carriage.grit_runner import _spd
-from ..carriage.tasks import GritTaskSpec, get_task
+from ..carriage.tasks import GritTaskSpec, get_task, resolve_dataset_dir
 from .ablation import _build_groups
 from .model import SpecConfig
 from .scores import score_model
@@ -766,7 +766,7 @@ def run(
         log(f"[env] {platform.platform()} | python {sys.version.split()[0]}")
         sc = SpecConfig(
             ckpt=str(chosen_ckpt), out_dir=str(task_out),
-            dataset_dir=str(Path(spec.drive_dir) / "datasets"), config_file=config_file,
+            dataset_dir=resolve_dataset_dir(spec), config_file=config_file,
             accelerator=accelerator, seed=seed, num_threads=num_threads,
             num_graphs=num_graphs, donors=donors, ablation_graphs=num_graphs,
             analysis_seed=analysis_seed, partner_match=partner_match,

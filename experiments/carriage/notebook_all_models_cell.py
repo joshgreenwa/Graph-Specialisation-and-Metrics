@@ -1,5 +1,8 @@
 """Colab cell: evaluate + carriage + specialise + compare ALL ZINC GRIT models.
 
+The dense-vs-1-hop QM9 HOMO-LUMO gap counterpart is
+``experiments/carriage/notebook_qm9_gap_models_cell.py``.
+
 Paste this whole cell into Colab and run it. Like the other bootstrap cells it clones this
 dissertation repo (via the ``dissertation_key`` Colab secret), puts <repo>/src (and <repo>) on
 the path, and calls the CENTRAL cross-model methodology in

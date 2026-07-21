@@ -22,7 +22,7 @@ import numpy as np
 
 from ..carriage import env
 from ..carriage.env import log
-from ..carriage.tasks import get_task
+from ..carriage.tasks import get_task, resolve_dataset_dir
 from . import attention_viz
 from .channel_ablation import per_graph_loss_np
 from .factorial_ablation import _clean_and_throughput, _graph_groups
@@ -395,6 +395,7 @@ def save_attention(attn: dict, path, *, score_hash: str = "",
                "heads": np.asarray(attn["heads"], dtype=np.int64),
                "num_molecules": np.asarray(len(attn["molecules"]), dtype=np.int64),
                "has_vnode": np.asarray(bool(attn.get("has_vnode", False))),
+               "atom_encoding": np.asarray(str(attn.get("atom_encoding", "category"))),
                "head_channels": np.asarray(attn.get(
                    "head_channels", ["semantic"] * len(attn["heads"]))),
                "selection_config": np.asarray(json.dumps(
@@ -464,7 +465,7 @@ def _load_model(task_name: str, *, collate_dir: str, ckpt: Optional[str], num_gr
     log(f"[semantic-outlier] runtime: {platform.platform()} | python {sys.version.split()[0]}")
     sc = SpecConfig(
         ckpt=str(chosen_ckpt), out_dir=str(task_out),
-        dataset_dir=str(Path(spec.drive_dir) / "datasets"), config_file=config_file,
+        dataset_dir=resolve_dataset_dir(spec), config_file=config_file,
         accelerator=accelerator, seed=seed, num_threads=num_threads,
         eval_split=eval_split, donor_split=eval_split, eval_metric=False,
         num_graphs=0, donors=0, ablation_graphs=num_graphs, analysis_seed=analysis_seed)

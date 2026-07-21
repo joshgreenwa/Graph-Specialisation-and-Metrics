@@ -24,8 +24,10 @@ from typing import Optional, Sequence
 
 import numpy as np
 
-# The five ZINC GRIT models this comparison targets, in a canonical display order.
+# Canonical suites. ``DEFAULT_TASKS`` remains the established ZINC comparison for backward
+# compatibility; the QM9 notebook passes ``QM9_GAP_TASKS`` explicitly.
 DEFAULT_TASKS = ["zinc", "zinc_1hop", "zinc_2hop", "zinc_1hop_vnode", "zinc_2hop_vnode"]
+QM9_GAP_TASKS = ["qm9_gap_dense", "qm9_gap_1hop"]
 
 # Drive collate roots (mirror carriage.colab.DEFAULT_COLLATE_DIR and
 # specialisation.colab.DEFAULT_COLLATE_DIR). Kept here in the torch-free layer so the figure
@@ -43,6 +45,8 @@ METHOD_META = {
     "zinc_1hop_local": dict(label="1-hop (local RRWP)", color="#17becf", marker="<", family="sparse"),
     "zinc_1hop_vnode": dict(label="1-hop + VNode", color="#ff7f0e", marker="v", family="vnode"),
     "zinc_2hop_vnode": dict(label="2-hop + VNode", color="#d62728", marker="D", family="vnode"),
+    "qm9_gap_dense":   dict(label="Dense",         color="#444444", marker="o", family="dense"),
+    "qm9_gap_1hop":    dict(label="1-hop",         color="#1f77b4", marker="^", family="sparse"),
 }
 _FALLBACK_PALETTE = ["#9467bd", "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22"]
 
@@ -58,6 +62,11 @@ def method_meta(task: str, i: int = 0) -> dict:
 def is_vnode(task: str) -> bool:
     """True for the virtual-node variants (used by ``drop_vnode``)."""
     return "vnode" in task.lower()
+
+
+def is_dense(task: str) -> bool:
+    """True for a registered comparison method designated as the dense reference."""
+    return method_meta(task).get("family") == "dense"
 
 
 def select_methods(tasks: Sequence[str], *, include: Optional[Sequence[str]] = None,
@@ -334,6 +343,8 @@ def load_semantic_outlier_attention(path) -> Optional[dict]:
         selection_config = (json.loads(str(np.asarray(z["selection_config"]).item()))
                             if "selection_config" in z else {})
         has_vnode = bool(np.asarray(z["has_vnode"]).item()) if "has_vnode" in z else False
+        atom_encoding = (str(np.asarray(z["atom_encoding"]).item())
+                         if "atom_encoding" in z else "category")
         head_channels = (np.asarray(z["head_channels"]).astype(str).tolist()
                          if "head_channels" in z else ["semantic"] * len(heads))
         selected = {}
@@ -351,7 +362,8 @@ def load_semantic_outlier_attention(path) -> Optional[dict]:
             }
     return {"heads": [tuple(map(int, h)) for h in heads], "molecules": molecules,
             "selected": selected, "selection_config": selection_config,
-            "has_vnode": has_vnode, "head_channels": head_channels,
+            "has_vnode": has_vnode, "atom_encoding": atom_encoding,
+            "head_channels": head_channels,
             "cache_version": cache_version, "score_fingerprint": fingerprint}
 
 

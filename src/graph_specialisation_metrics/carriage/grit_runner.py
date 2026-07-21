@@ -378,7 +378,8 @@ def run_grit_carriage(task, cc: CarriageConfig) -> dict:
             ts.append(true.detach().cpu().numpy().reshape(true.shape[0], -1))
         return np.concatenate(ps), np.concatenate(ts)
 
-    metric_name = (task.paper_metric[0] if task.paper_metric else "metric")
+    metric_name = (getattr(task, "metric_name", None)
+                   or (task.paper_metric[0] if task.paper_metric else "metric"))
     if cc.eval_metric:
         t0 = time.perf_counter()
         preds, trues = collect_preds(loaders[2])

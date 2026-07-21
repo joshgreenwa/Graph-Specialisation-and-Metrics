@@ -13,6 +13,12 @@ from __future__ import annotations
 import numpy as np
 
 
+def _visual_bond_types(raw_types, dataset_format: str) -> np.ndarray:
+    """Normalise task-specific categorical bonds to 1/2/3/aromatic=4 display codes."""
+    values = np.asarray(raw_types, dtype=np.int64)
+    return values + 1 if str(dataset_format) == "PyG-QM9" else values
+
+
 def _spring_layout(n, bonds, seed=0):
     try:
         import networkx as nx
@@ -69,6 +75,12 @@ def collect_attention(gm, graph_ids, heads, seed=0) -> dict:
         else:
             raw_types = raw_types.detach().cpu().numpy()
             raw_types = raw_types[:, 0] if raw_types.ndim > 1 else raw_types
+        # PyG QM9 stores one-hot bond columns in the order single/double/triple/aromatic;
+        # the training patch converts them to categorical indices 0..3. Normalise the cached
+        # visualisation codes to 1..4 so they do not get confused with ZINC's bond-order-like
+        # categories (1..3). Code 4 is rendered as aromatic/dashed by the comparison figures.
+        raw_types = _visual_bond_types(
+            raw_types, str(getattr(gm.cfg.dataset, "format", "")))
         bond_lookup = {}
         for edge, bond_type in zip(raw_bonds, raw_types):
             key = tuple(sorted((int(edge[0]), int(edge[1]))))
@@ -87,5 +99,13 @@ def collect_attention(gm, graph_ids, heads, seed=0) -> dict:
             "y": float(yv[0].item()), "y_dim": int(yv.numel()),
             "has_virtual": has_virtual, "maps": maps,
         })
-    return {"molecules": mols, "heads": heads,
-            "has_vnode": bool(any(m.get("has_virtual", False) for m in mols))}
+    return {
+        "molecules": mols,
+        "heads": heads,
+        "has_vnode": bool(any(m.get("has_virtual", False) for m in mols)),
+        "atom_encoding": (
+            "atomic_number"
+            if getattr(gm.task, "node_content_desc", "") == "atomic number"
+            else "category"
+        ),
+    }

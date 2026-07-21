@@ -34,7 +34,7 @@ import numpy as np
 
 from ..carriage import env
 from ..carriage.env import log
-from ..carriage.tasks import GritTaskSpec, get_task
+from ..carriage.tasks import GritTaskSpec, get_task, resolve_dataset_dir
 from .channel_ablation import per_graph_loss_np
 from .model import GritHeadModel, SpecConfig
 
@@ -450,7 +450,7 @@ def prepare_and_run(task_name: str, scores: dict, *, gsem: float, gstr: float,
     log(f"[family-ablation] runtime: {platform.platform()} | python {sys.version.split()[0]}")
     sc = SpecConfig(
         ckpt=str(chosen_ckpt), out_dir=str(task_out),
-        dataset_dir=str(Path(spec.drive_dir) / "datasets"), config_file=config_file,
+        dataset_dir=resolve_dataset_dir(spec), config_file=config_file,
         accelerator=accelerator, seed=seed, num_threads=num_threads,
         eval_split=eval_split, donor_split=eval_split, eval_metric=False,
         num_graphs=0, donors=0, ablation_graphs=num_graphs, analysis_seed=analysis_seed,

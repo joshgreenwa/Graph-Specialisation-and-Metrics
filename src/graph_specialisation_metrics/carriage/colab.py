@@ -28,7 +28,7 @@ from . import env, figures
 from .env import log
 from .grit_runner import CarriageConfig, run_grit_carriage
 from .structural_runner import run_grit_structural_carriage
-from .tasks import GritTaskSpec, get_task
+from .tasks import GritTaskSpec, get_task, resolve_dataset_dir
 
 # All tasks' figures collate here (one subfolder per task) so they can be compared.
 DEFAULT_COLLATE_DIR = "/content/drive/MyDrive/graph_specialisation_metrics/carriage_figures"
@@ -141,7 +141,7 @@ def run(
     # Figures + artifacts collate under <collate_dir>/<task>/ so tasks sit side by side.
     out_dir = Path(collate_dir) / spec.name
     out_dir.mkdir(parents=True, exist_ok=True)
-    dataset_dir = str(Path(drive_dir) / "datasets")
+    dataset_dir = resolve_dataset_dir(spec, drive_dir)
 
     if not skip_install:
         env.install_dependencies(pyg_version=pyg_version)

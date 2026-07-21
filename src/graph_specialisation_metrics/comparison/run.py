@@ -63,6 +63,12 @@ DEFAULT_COMPARISON_DIR = _data.COMPARISON_DIR
 # recovery-checkpoint fallback, so a task omitted here still resolves if its drive_dir is set;
 # these explicit entries pin the exact files the user specified.
 DEFAULT_CKPTS = {
+    # These are the user-identified best-validation files. Pin them rather than selecting the
+    # highest epoch: the QM9 training runner retains multiple recovery checkpoints.
+    "qm9_gap_dense": "/content/drive/MyDrive/grit_qm9_gap_dense/results/"
+                     "qm9-gap-GRIT-RRWP-QM9Gap.dense.GRITwRRWP/0/ckpt/294.ckpt",
+    "qm9_gap_1hop": "/content/drive/MyDrive/grit_qm9_gap_1hop_real/results/"
+                    "qm9-gap-GRIT-RRWP-QM9Gap.1hop.GRITwRRWP/0/ckpt/295.ckpt",
     "zinc_2hop": "/content/drive/MyDrive/grit_zinc_2hop/results/_recovery_checkpoints/"
                  "seed0_ColabDrive.2hop.GRITwRRWP/latest.ckpt",
     "zinc_1hop_vnode": "/content/drive/MyDrive/grit_zinc_1hop_vnode/results/_recovery_checkpoints/"
@@ -209,6 +215,7 @@ def build_figures(tasks: Sequence[str] = _data.DEFAULT_TASKS, *,
                   carriage_collate: str = CARRIAGE_COLLATE,
                   spec_collate: str = SPEC_COLLATE,
                   comparison_dir: str = DEFAULT_COMPARISON_DIR,
+                  dataset_label: str = "ZINC",
                   interventions: Sequence[str] = ("semantic", "structural"),
                   structural_mode: str = "transposition",
                   include: Optional[Sequence[str]] = None,
@@ -291,7 +298,11 @@ def build_figures(tasks: Sequence[str] = _data.DEFAULT_TASKS, *,
             shown_family = [t for t in shown_scores if t in family_ref]
             if shown_family:
                 fig, p = _plots.plot_factorial_family_ablation_curves(
-                    family_ref, shown_family, out_dir / "fig_DJ_family_ablation_curves.png")
+                    family_ref, shown_family, out_dir / "fig_DJ_family_ablation_curves.png",
+                    suptitle=(f"Matched specialisation-family ablation on held-out "
+                              f"{dataset_label} graphs\n"
+                              "specialists vs active generalists; ribbons are paired "
+                              "graph-bootstrap 95% CIs"))
                 figs["DJ_family_ablation_curves"] = p
                 made.append(fig)
                 fig, p = _plots.plot_factorial_family_ablation_contrasts(
@@ -336,15 +347,19 @@ def build_figures(tasks: Sequence[str] = _data.DEFAULT_TASKS, *,
             # Keep every molecule-level panel together and out of the main figure directory.
             gallery_dir = out_dir / "molecule_examples_all"
             gallery_dir.mkdir(parents=True, exist_ok=True)
-            dense_sem = current_outlier_by_channel["semantic"].get("zinc")
-            if dense_sem and "zinc" in shown_scores:
+            dense_tasks = [t for t in shown_scores if _data.is_dense(t)]
+            for dense_task in dense_tasks:
+                dense_sem = current_outlier_by_channel["semantic"].get(dense_task)
+                if dense_sem is None:
+                    continue
                 attn = _data.load_semantic_outlier_attention(
-                    _data.semantic_outlier_attention_path(spec_collate, "zinc"))
+                    _data.semantic_outlier_attention_path(spec_collate, dense_task))
                 if (attn and attn.get("cache_version") == ATTENTION_CACHE_VERSION
                         and attn.get("score_fingerprint") == dense_sem.get("score_fingerprint")):
                     for head in np.asarray(dense_sem["top_heads"], int)[:6]:
                         layer, hidx = map(int, head)
-                        key = f"semantic_outlier_attention_dense_L{layer}H{hidx}"
+                        dense_tag = "dense" if len(dense_tasks) == 1 else dense_task
+                        key = f"semantic_outlier_attention_{dense_tag}_L{layer}H{hidx}"
                         target = gallery_dir / f"fig_{key}.png"
                         legacy = out_dir / f"fig_{key}.png"
                         if legacy.exists():
@@ -353,7 +368,8 @@ def build_figures(tasks: Sequence[str] = _data.DEFAULT_TASKS, *,
                             legacy.replace(target)
                         fig, p = _plots.plot_semantic_outlier_head_attention(
                             attn, dense_sem, (layer, hidx), target,
-                            scores=scores_ref["zinc"], gsem=gsem, gstr=gstr)
+                            scores=scores_ref[dense_task], gsem=gsem, gstr=gstr,
+                            model_label=_data.method_meta(dense_task)["label"])
                         figs[f"molecule_examples_all/{key}"] = p
                         try:
                             import matplotlib.pyplot as plt
@@ -424,14 +440,16 @@ def build_figures(tasks: Sequence[str] = _data.DEFAULT_TASKS, *,
         if shown_metrics:
             name = next(iter(metrics.values())).get("name", "MAE")
             fig, p = _plots.plot_performance(metrics, shown_metrics,
-                                             out_dir / "fig_performance.png", metric_name=name)
+                                             out_dir / "fig_performance.png", metric_name=name,
+                                             suptitle=(f"{dataset_label} val / test performance "
+                                                       "(recomputed from checkpoint)"))
             figs["performance"] = p
             made.append(fig)
 
     (out_dir / "performance.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
     (out_dir / "figures_manifest.json").write_text(json.dumps({
         "reference_tasks": list(tasks), "shown_tasks": shown, "interventions": list(interventions),
-        "structural_mode": structural_mode, "figures": figs,
+        "structural_mode": structural_mode, "dataset_label": dataset_label, "figures": figs,
         "performance": str(out_dir / "performance.json"),
     }, indent=2), encoding="utf-8")
 
@@ -527,6 +545,7 @@ def run_all(tasks: Sequence[str] = _data.DEFAULT_TASKS, *,
             carriage_collate: str = CARRIAGE_COLLATE,
             spec_collate: str = SPEC_COLLATE,
             comparison_dir: str = DEFAULT_COMPARISON_DIR,
+            dataset_label: str = "ZINC",
             # figure selection
             include: Optional[Sequence[str]] = None,
             exclude: Optional[Sequence[str]] = None,
@@ -856,7 +875,7 @@ def run_all(tasks: Sequence[str] = _data.DEFAULT_TASKS, *,
                                 >= expected_attention_heads)
                         except Exception:  # noqa: BLE001
                             attention_current = False
-                    if (channel == "semantic" and task == "zinc"
+                    if (channel == "semantic" and _data.is_dense(task)
                             and semantic_outlier_attention_graphs > 0 and not attention_current):
                         try:
                             attn = outlier_mod.prepare_attention_only(
@@ -890,7 +909,8 @@ def run_all(tasks: Sequence[str] = _data.DEFAULT_TASKS, *,
                         eval_split=semantic_outlier_eval_split,
                         batch_size=semantic_outlier_batch_size,
                         attention_graphs=(semantic_outlier_attention_graphs
-                                          if channel == "semantic" and task == "zinc" else 0),
+                                          if channel == "semantic" and _data.is_dense(task)
+                                          else 0),
                         attention_heads=semantic_outlier_attention_heads,
                         attention_max_nodes=semantic_outlier_attention_max_nodes,
                         attention_candidates=semantic_outlier_attention_candidates,
@@ -1037,7 +1057,8 @@ def run_all(tasks: Sequence[str] = _data.DEFAULT_TASKS, *,
     # ---- deliverables from cache -------------------------------------------------------
     figs = build_figures(
         tasks, carriage_collate=carriage_collate, spec_collate=spec_collate,
-        comparison_dir=comparison_dir, interventions=interventions,
+        comparison_dir=comparison_dir, dataset_label=dataset_label,
+        interventions=interventions,
         structural_mode=structural_mode, include=include, exclude=exclude,
         drop_vnode=drop_vnode, display=display)
 

@@ -224,7 +224,8 @@ class GritHeadModel:
                 f"head geometry mismatch: layer has {a.num_heads}h x {a.out_dim}d, cfg says {self.H}x{self.dh}"
 
         # recompute the eval metric (strongest load check).
-        metric_name = (self.task.paper_metric[0] if self.task.paper_metric else "metric")
+        metric_name = (getattr(self.task, "metric_name", None)
+                       or (self.task.paper_metric[0] if self.task.paper_metric else "metric"))
         if sc.eval_metric:
             t0 = time.perf_counter()
             preds, trues = self._collect_preds(loaders[2])

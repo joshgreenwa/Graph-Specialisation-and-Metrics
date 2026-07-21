@@ -226,7 +226,9 @@ Plus a checkpoint-load metric
 
 - GRIT pinned to `6c988ea600a606fbb49a2246c64a2d37396b3ab5`; each task's config/params/metric are in
   `tasks.py` (`zinc`, `zinc_1hop`, `zinc_1hop_local`, `zinc_2hop`, `zinc_1hop_vnode`,
-  `zinc_2hop_vnode`, `peptides_func`, `peptides_struct`). The `zinc_2hop` / `*_vnode` variants
+  `zinc_2hop_vnode`, `qm9_gap_dense`, `qm9_gap_1hop`, `peptides_func`, `peptides_struct`).
+  The QM9 tasks share an explicit dataset cache and replay the exact target/split/model patch
+  from `GRIT_QM9_gap.py`. The `zinc_2hop` / `*_vnode` variants
   replay the exact k-hop + global-VNode training patch (`khop_env` -> `GRIT_khop_ZINC.apply_khop_patch`);
   their Colab-safe recovery checkpoints (`results/_recovery_checkpoints/seed0_<name_tag>/{best,latest}.ckpt`)
   are found by `env.find_checkpoint`'s recovery fallback. A global-VNode row is excluded from

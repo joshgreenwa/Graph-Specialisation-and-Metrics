@@ -1,4 +1,4 @@
-"""Cross-model comparison of ZINC GRIT variants (dense, k-hop, VNode).
+"""Cross-model comparison of registered GRIT variants (ZINC and QM9 suites).
 
 Evaluate (val/test), compute functional/beneficial semantic + structural carriage and per-head
 specialisation scores for every registered model, CACHE all of it to Drive, and build the
@@ -13,7 +13,7 @@ drop/include method selection. Figures rebuild from cache with no re-run.
 from __future__ import annotations
 
 from . import data, plots
-from .data import DEFAULT_TASKS, METHOD_META, is_vnode, select_methods
+from .data import DEFAULT_TASKS, METHOD_META, QM9_GAP_TASKS, is_dense, is_vnode, select_methods
 
 __all__ = [
     "run_all",
@@ -23,7 +23,9 @@ __all__ = [
     "data",
     "plots",
     "DEFAULT_TASKS",
+    "QM9_GAP_TASKS",
     "METHOD_META",
+    "is_dense",
     "is_vnode",
     "select_methods",
 ]

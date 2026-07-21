@@ -1103,7 +1103,7 @@ def plot_semantic_outlier_attention_matrices(attention: dict, outlier: dict, out
 
 def _draw_molecule_bonds(ax, pos, bonds, bond_types, *, color="#444444", alpha=.85,
                          linewidth=1.25):
-    """Draw categorical ZINC bonds, using parallel strokes for double/triple types."""
+    """Draw single/double/triple bonds and dashed aromatic bonds (code 4)."""
     pos = np.asarray(pos, float)
     span = max(float(np.ptp(pos[:, 0])), float(np.ptp(pos[:, 1])), 1e-6)
     for (a, b), raw_type in zip(np.asarray(bonds, int), np.asarray(bond_types, int)):
@@ -1111,12 +1111,23 @@ def _draw_molecule_bonds(ax, pos, bonds, bond_types, *, color="#444444", alpha=.
         vec = p1 - p0
         norm = max(float(np.linalg.norm(vec)), 1e-12)
         perp = np.asarray([-vec[1], vec[0]]) / norm * (.010 * span)
-        order = int(np.clip(int(raw_type), 1, 3))
+        aromatic = int(raw_type) == 4
+        order = 1 if aromatic else int(np.clip(int(raw_type), 1, 3))
         offsets = ([0.] if order == 1 else ([-1., 1.] if order == 2 else [-1.5, 0., 1.5]))
         for offset in offsets:
             q0, q1 = p0 + offset * perp, p1 + offset * perp
             ax.plot([q0[0], q1[0]], [q0[1], q1[1]], color=color, alpha=alpha,
-                    lw=linewidth, solid_capstyle="round", zorder=0)
+                    lw=linewidth, ls=("--" if aromatic else "-"),
+                    solid_capstyle="round", zorder=0)
+
+
+_QM9_ATOM_SYMBOLS = {1: "H", 6: "C", 7: "N", 8: "O", 9: "F"}
+
+
+def _atom_index_label(node: int, atom_type: int, *, atomic_numbers: bool = False) -> str:
+    """Add a real element label when node content is a QM9 atomic number."""
+    symbol = _QM9_ATOM_SYMBOLS.get(int(atom_type)) if atomic_numbers else None
+    return f"{int(node)}\n{symbol}" if symbol else str(int(node))
 
 
 def plot_semantic_outlier_head_attention(attention: dict, outlier: Optional[dict],
@@ -1168,6 +1179,7 @@ def plot_semantic_outlier_head_attention(attention: dict, outlier: Optional[dict
     fig, axes = plt.subplots(len(molecules), 3, figsize=(15.5, 3.7 * len(molecules)),
                              squeeze=False, constrained_layout=True)
     atom_cmap = plt.get_cmap("tab20")
+    atomic_numbers = attention.get("atom_encoding") == "atomic_number"
     for row, (mol, A, graph_score, candidate_rank) in enumerate(
             zip(molecules, matrices, selected_scores, selected_ranks)):
         pos = np.asarray(mol["pos"], float)
@@ -1175,19 +1187,21 @@ def plot_semantic_outlier_head_attention(attention: dict, outlier: Optional[dict
         bonds = np.asarray(mol["bonds"], int)
         bond_types = np.asarray(mol.get("bond_types", np.ones(len(bonds))), int)
 
-        # 1) topology + atom indices. ZINC exposes atom categories, not canonical SMILES, so
-        # category is represented faithfully by index colour rather than fabricated symbols.
+        # 1) topology + atom indices. Node content is represented faithfully by category/atomic-
+        # number colour rather than fabricating symbols for datasets that expose only categories.
         ax = axes[row, 0]
         _draw_molecule_bonds(ax, pos, bonds, bond_types)
         ax.scatter(pos[:, 0], pos[:, 1], s=24, facecolor="white", edgecolor="none", zorder=1)
         for node, (xx, yy) in enumerate(pos):
-            ax.text(xx, yy, str(node), color=atom_cmap(int(atom_types[node]) % 20),
-                    fontsize=9, ha="center", va="center", fontweight="bold", zorder=2)
+            label = _atom_index_label(
+                node, atom_types[node], atomic_numbers=atomic_numbers)
+            ax.text(xx, yy, label, color=atom_cmap(int(atom_types[node]) % 20),
+                    fontsize=8.5, ha="center", va="center", fontweight="bold", zorder=2)
         score_symbol = "S_sem" if channel == "semantic" else "S_str"
         score_text = (f"rank {candidate_rank}/{candidate_count}; "
                       f"per-molecule {score_symbol}={graph_score:.3g}"
                       if np.isfinite(graph_score) else "colour = atom category")
-        ax.set_title(f"Molecule {mol['graph_id']} (n={len(atom_types)}): atom indices\n"
+        ax.set_title(f"Molecule {mol['graph_id']} (n={len(atom_types)}): atom indices/elements\n"
                      f"{score_text}", fontsize=10)
         ax.set_aspect("equal"); ax.axis("off")
 

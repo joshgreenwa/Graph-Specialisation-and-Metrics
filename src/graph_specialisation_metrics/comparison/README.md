@@ -14,6 +14,21 @@ build_figures(drop_vnode=True)  # re-draw the deliverables from cache only (no G
 build_figures(include=["zinc", "zinc_1hop", "zinc_2hop"])
 ```
 
+## QM9 HOMO-LUMO gap suite
+
+`experiments/carriage/notebook_qm9_gap_models_cell.py` runs this same programme for the
+parameter-matched dense and 1-hop QM9 gap checkpoints. It passes
+`comparison.data.QM9_GAP_TASKS`, pins epochs 294/295, and writes to an isolated
+`graph_specialisation_metrics/qm9_gap/` Drive namespace.
+
+Both task registrations replay `GRIT_QM9_gap.apply_qm9_patch` before importing GRIT and use the
+training data contract: PyG QM9 target 4 (raw eV), `x=z`, categorical bonds, split
+110000/10000/remainder with seed 42, mean pooling and L1/MAE. Their shared dataset cache is
+`/content/drive/MyDrive/grit_qm9_gap_data`, represented by the task-level `dataset_dir` override
+instead of the usual `<drive_dir>/datasets` convention. Dense-only example generation is selected
+by method role rather than the literal ZINC task id, so the complete outlier/gallery deliverables
+are produced for QM9 as well.
+
 The five models (`comparison.data.DEFAULT_TASKS`): `zinc` (dense), `zinc_1hop`, `zinc_2hop`,
 `zinc_1hop_vnode`, `zinc_2hop_vnode`. The k-hop / VNode three are auto-registered in
 `carriage/tasks.py` and replay their exact training patch (`GRIT_khop_ZINC.apply_khop_patch`) so
