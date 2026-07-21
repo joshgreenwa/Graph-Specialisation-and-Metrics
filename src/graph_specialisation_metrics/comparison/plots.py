@@ -1119,36 +1119,57 @@ def _draw_molecule_bonds(ax, pos, bonds, bond_types, *, color="#444444", alpha=.
                     lw=linewidth, solid_capstyle="round", zorder=0)
 
 
-def plot_semantic_outlier_head_attention(attention: dict, outlier: dict,
+def plot_semantic_outlier_head_attention(attention: dict, outlier: Optional[dict],
                                          head: tuple[int, int], out_path, *,
                                          scores: Optional[dict] = None,
                                          gsem: float = 1.0, gstr: float = 1.0,
-                                         suptitle: Optional[str] = None):
-    """One paper-style 4x3 attention figure for a dense semantic outlier head."""
+                                         suptitle: Optional[str] = None,
+                                         channel: str = "semantic",
+                                         model_label: Optional[str] = None):
+    """One paper-style 4x3 attention figure for an outlier or D_rel specialist head."""
     import matplotlib.pyplot as plt
     from matplotlib.ticker import MaxNLocator
 
     head = tuple(map(int, head))
-    molecules = list(attention["molecules"])[:4]
-    top_heads = [tuple(map(int, h)) for h in np.asarray(outlier["top_heads"], int)]
+    all_molecules = {int(mol["graph_id"]): mol for mol in attention["molecules"]}
+    selection = attention.get("selected", {}).get(head)
+    if selection and selection.get("graph_ids"):
+        selected_ids = list(map(int, selection["graph_ids"]))[:4]
+        molecules = [all_molecules[gid] for gid in selected_ids]
+        selected_scores = list(map(float, selection["scores"]))[:len(molecules)]
+        selected_ranks = list(map(int, selection["candidate_ranks"]))[:len(molecules)]
+        candidate_count = int(selection["candidate_count"])
+    else:
+        molecules = list(attention["molecules"])[:4]
+        selected_scores = [float("nan")] * len(molecules)
+        selected_ranks = list(range(1, len(molecules) + 1))
+        candidate_count = len(molecules)
+    if channel not in ("semantic", "structural"):
+        raise ValueError(f"channel must be semantic or structural, got {channel!r}")
+    top_heads = ([tuple(map(int, h)) for h in np.asarray(outlier["top_heads"], int)]
+                 if outlier is not None else [tuple(map(int, h)) for h in attention["heads"]])
     if head not in top_heads or not molecules:
-        raise ValueError(f"head {head} is absent from the dense semantic-outlier cache")
-    rank = top_heads.index(head)
-    delta_loss = float(np.asarray(outlier["individual_loss"], float)[rank].mean())
-    score = float(np.asarray(outlier["top_scores"], float)[rank])
-    detail = f"raw S_sem={score:.4g}, Δloss={delta_loss:+.3f}"
+        raise ValueError(f"head {head} is absent from the specialist attention cache")
+    detail = ""
+    if outlier is not None:
+        rank = top_heads.index(head)
+        delta_loss = float(np.asarray(outlier["individual_loss"], float)[rank].mean())
+        score = float(np.asarray(outlier["top_scores"], float)[rank])
+        detail = f"raw S_sem={score:.4g}, Δloss={delta_loss:+.3f}"
     if scores is not None:
         ss = float(np.asarray(scores["S_sem"], float)[head]) / float(gsem)
         st = float(np.asarray(scores["S_str"], float)[head]) / float(gstr)
-        detail = f"D_rel={float(d_rel(ss, st)):+.3f}, J={float(joint_strength(ss, st)):.3f}, " \
-                 f"Δloss={delta_loss:+.3f}"
+        detail = f"D_rel={float(d_rel(ss, st)):+.3f}, J={float(joint_strength(ss, st)):.3f}"
+        if outlier is not None:
+            detail += f", Δloss={delta_loss:+.3f}"
 
     matrices = [np.asarray(mol["maps"][head], float) for mol in molecules]
     vmax = max(max(float(A.max()), 1e-12) for A in matrices)
     fig, axes = plt.subplots(len(molecules), 3, figsize=(15.5, 3.7 * len(molecules)),
                              squeeze=False, constrained_layout=True)
     atom_cmap = plt.get_cmap("tab20")
-    for row, (mol, A) in enumerate(zip(molecules, matrices)):
+    for row, (mol, A, graph_score, candidate_rank) in enumerate(
+            zip(molecules, matrices, selected_scores, selected_ranks)):
         pos = np.asarray(mol["pos"], float)
         atom_types = np.asarray(mol["atom_types"], int)
         bonds = np.asarray(mol["bonds"], int)
@@ -1162,8 +1183,12 @@ def plot_semantic_outlier_head_attention(attention: dict, outlier: dict,
         for node, (xx, yy) in enumerate(pos):
             ax.text(xx, yy, str(node), color=atom_cmap(int(atom_types[node]) % 20),
                     fontsize=9, ha="center", va="center", fontweight="bold", zorder=2)
-        ax.set_title(f"Molecule {mol['graph_id']}: atom indices\n(colour = atom category)",
-                     fontsize=10)
+        score_symbol = "S_sem" if channel == "semantic" else "S_str"
+        score_text = (f"rank {candidate_rank}/{candidate_count}; "
+                      f"per-molecule {score_symbol}={graph_score:.3g}"
+                      if np.isfinite(graph_score) else "colour = atom category")
+        ax.set_title(f"Molecule {mol['graph_id']} (n={len(atom_types)}): atom indices\n"
+                     f"{score_text}", fontsize=10)
         ax.set_aspect("equal"); ax.axis("off")
 
         # 2) key inflow = total attention mass received by sender/key j over all query rows.
@@ -1176,22 +1201,44 @@ def plot_semantic_outlier_head_attention(attention: dict, outlier: dict,
         for node, (xx, yy) in enumerate(pos):
             ax.text(xx, yy, str(node), color=("white" if inflow_scaled[node] > .62 else "black"),
                     fontsize=7.5, ha="center", va="center", zorder=3)
-        ax.set_title("Attention key inflow (within-molecule scale)", fontsize=10)
+        vnode_note = " (real keys; VNode omitted)" if attention.get("has_vnode") else ""
+        ax.set_title(f"Attention key inflow{vnode_note}\n(within-molecule scale)", fontsize=10)
         ax.set_aspect("equal"); ax.axis("off")
 
         # 3) the unaggregated attention operator, with one head-wide scale across all examples.
         ax = axes[row, 2]
         im = ax.imshow(A, cmap="magma", vmin=0, vmax=vmax, interpolation="nearest",
                        aspect="equal")
-        ax.set_title("Node-conditioned attention", fontsize=10)
+        matrix_note = "\n(real-atom submatrix; VNode omitted)" if attention.get("has_vnode") else ""
+        ax.set_title(f"Node-conditioned attention{matrix_note}", fontsize=10)
         ax.set_xlabel("Key / sender atom")
         ax.set_ylabel("Query / receiver atom")
         ax.xaxis.set_major_locator(MaxNLocator(integer=True, nbins=7))
         ax.yaxis.set_major_locator(MaxNLocator(integer=True, nbins=7))
         fig.colorbar(im, ax=ax, fraction=.046, pad=.025)
 
-    fig.suptitle(suptitle or f"semantic-score outlier: L{head[0]}H{head[1]}  ({detail})",
-                 fontsize=14)
+    if suptitle is None:
+        selection_note = ""
+        config = attention.get("selection_config", {})
+        if selection and config:
+            score_symbol = "S_sem" if channel == "semantic" else "S_str"
+            selection_note = (f"\nExamples: top {len(molecules)} per-molecule {score_symbol} "
+                              f"in a fixed "
+                              f"validation pool (N={candidate_count}, "
+                              f"n≤{int(config.get('max_nodes', 18))})")
+        role = "semantic-score outlier" if outlier is not None else f"{channel} specialist"
+        prefix = f"{model_label}: " if model_label else ""
+        suptitle = f"{prefix}{role} L{head[0]}H{head[1]}  ({detail}){selection_note}"
+    fig.suptitle(suptitle, fontsize=14)
     out_path = Path(out_path); out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path, dpi=190)
     return fig, str(out_path)
+
+
+def plot_specialist_head_attention(attention: dict, head: tuple[int, int], out_path, *,
+                                   channel: str, model_label: str, scores: dict,
+                                   gsem: float, gstr: float):
+    """D_rel-selected all-model wrapper around the common molecule-example layout."""
+    return plot_semantic_outlier_head_attention(
+        attention, None, head, out_path, scores=scores, gsem=gsem, gstr=gstr,
+        channel=channel, model_label=model_label)

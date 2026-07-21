@@ -14,6 +14,7 @@ model forward.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import csv
 import hashlib
 import json
@@ -34,11 +35,13 @@ from graph_specialisation_metrics.synthetic import nar_grit_fixed as nar
 
 
 ANALYSIS_VERSION = "nar-transport-mechanisms-v2"
+FOLLOWUP_VERSION = "nar-transport-followups-v1"
 MODEL_ORDER = ("1hop", "2hop", "dense")
 MODEL_COLOURS = {"1hop": "#6A3D9A", "2hop": "#1B9E77", "dense": "#D95F02"}
 MODEL_MARKERS = {"1hop": "o", "2hop": "s", "dense": "D"}
 LAYER_COLOURS = {0: "#0072B2", 1: "#D55E00"}
 N_MARKERS = {4: "o", 8: "s", 16: "^", 32: "P", 64: "D"}
+N_COLOURS = {4: "#3B4CC0", 8: "#2F7FBC", 16: "#57A773", 32: "#D9A441", 64: "#B24745"}
 EPS = 1.0e-12
 NOOP_HARD_TOLERANCE_FACTOR = 5.0
 
@@ -54,7 +57,7 @@ class AnalysisConfig:
     analysis_width: int = 64
     models: tuple[str, ...] = MODEL_ORDER
     ns: tuple[int, ...] = (4, 8, 16, 32, 64)
-    seeds: tuple[int, ...] = (0, 1, 2)
+    seeds: tuple[int, ...] = (0, 1, 2, 3, 4)
     anchor_ns: tuple[int, ...] = (4, 16, 64)
     donors: int = 4
     discovery_graphs: int = 32
@@ -62,6 +65,9 @@ class AnalysisConfig:
     robustness_graphs: int = 48
     causal_graphs: int = 256
     causal_donors: int = 4
+    followup_graphs: int = 128
+    followup_donors: int = 2
+    ablation_random_rankings: int = 8
     family_size: int = 2
     random_families: int = 8
     max_batch_nodes: int = 4500
@@ -83,10 +89,14 @@ class AnalysisConfig:
             raise ValueError(f"models must be drawn from {MODEL_ORDER}")
         if not self.ns or any(value <= 1 for value in self.ns):
             raise ValueError("N values must be greater than one")
+        if not self.seeds or len(set(self.seeds)) != len(self.seeds):
+            raise ValueError("seeds must be a non-empty set of unique requested seeds")
         if any(value not in self.ns for value in self.anchor_ns):
             raise ValueError("anchor_ns must be a subset of ns")
-        if self.donors <= 0 or self.causal_donors <= 0:
+        if self.donors <= 0 or self.causal_donors <= 0 or self.followup_donors <= 0:
             raise ValueError("donor counts must be positive")
+        if self.followup_graphs <= 0 or self.ablation_random_rankings <= 0:
+            raise ValueError("follow-up graph and random-ranking counts must be positive")
         if self.family_size <= 0:
             raise ValueError("family_size must be positive")
 
@@ -204,6 +214,10 @@ def atomic_torch_save(path: Path, payload: Mapping[str, Any]) -> None:
 
 def scientific_fingerprint(cfg: AnalysisConfig) -> str:
     payload = asdict(cfg)
+    # Requested seed coverage is orchestration, not a per-checkpoint estimand.
+    # Retain the original v2 sentinel so adding seeds 3/4 reuses completed
+    # seed-0/1/2 metric, causal and follow-up caches.
+    payload["seeds"] = (0, 1, 2)
     for key in (
         "drive_root",
         "run_name",
@@ -213,12 +227,26 @@ def scientific_fingerprint(cfg: AnalysisConfig) -> str:
         "max_batch_nodes",
         "max_dense_pairs",
         "max_replica_pairs",
+        "followup_graphs",
+        "followup_donors",
+        "ablation_random_rankings",
     ):
         payload.pop(key, None)
     encoded = json.dumps(
         {"version": ANALYSIS_VERSION, **payload}, sort_keys=True, default=str
     ).encode()
     return hashlib.sha1(encoded).hexdigest()[:16]
+
+
+def followup_fingerprint(cfg: AnalysisConfig) -> str:
+    payload = {
+        "version": FOLLOWUP_VERSION,
+        "base_fingerprint": scientific_fingerprint(cfg),
+        "followup_graphs": int(cfg.followup_graphs),
+        "followup_donors": int(cfg.followup_donors),
+        "ablation_random_rankings": int(cfg.ablation_random_rankings),
+    }
+    return hashlib.sha1(json.dumps(payload, sort_keys=True).encode()).hexdigest()[:16]
 
 
 def analysis_root(cfg: AnalysisConfig) -> Path:
@@ -292,19 +320,27 @@ def build_checkpoint_manifest(cfg: AnalysisConfig, *, force: bool = False) -> li
         "ns": list(cfg.ns),
         "seeds": list(cfg.seeds),
     }
+    candidates = sorted((run_root(cfg) / "checkpoints").glob("*.pt"))
+    if not candidates:
+        raise FileNotFoundError(f"no checkpoints found under {run_root(cfg) / 'checkpoints'}")
+    checkpoint_signature = [
+        {
+            "name": path.name,
+            "size": int(path.stat().st_size),
+            "mtime_ns": int(path.stat().st_mtime_ns),
+        }
+        for path in candidates
+    ]
     if json_path.exists() and not force:
         cached = json.loads(json_path.read_text(encoding="utf-8"))
         if (
             cached.get("analysis_version") == ANALYSIS_VERSION
             and cached.get("selection_scope") == selection_scope
+            and cached.get("checkpoint_signature") == checkpoint_signature
         ):
             rows = list(cached.get("rows", []))
             if rows and all(Path(row["path"]).exists() for row in rows):
                 return rows
-
-    candidates = sorted((run_root(cfg) / "checkpoints").glob("*.pt"))
-    if not candidates:
-        raise FileNotFoundError(f"no checkpoints found under {run_root(cfg) / 'checkpoints'}")
     rows = []
     for path in candidates:
         row = checkpoint_metadata(path)
@@ -319,19 +355,30 @@ def build_checkpoint_manifest(cfg: AnalysisConfig, *, force: bool = False) -> li
     grouped: dict[tuple[str, int, int], list[dict[str, Any]]] = defaultdict(list)
     for row in rows:
         grouped[(row["model"], row["N"], row["seed"])].append(row)
-    expected = {
+    requested = {
         (model, records, seed)
         for model in cfg.models
         for records in cfg.ns
         for seed in cfg.seeds
     }
-    missing = sorted(expected - set(grouped))
+    missing_requested = sorted(requested - set(grouped))
     duplicates = {key: value for key, value in grouped.items() if len(value) != 1}
-    if missing:
-        raise FileNotFoundError(f"missing width-{cfg.analysis_width} checkpoints: {missing}")
     if duplicates:
         detail = {key: [row["path"] for row in value] for key, value in duplicates.items()}
         raise RuntimeError(f"ambiguous checkpoint cells: {detail}")
+    present_cells = {(row["model"], int(row["N"])) for row in rows}
+    required_cells = {(model, records) for model in cfg.models for records in cfg.ns}
+    missing_cells = sorted(required_cells - present_cells)
+    if missing_cells:
+        raise FileNotFoundError(
+            f"no width-{cfg.analysis_width} checkpoint is available for cells: {missing_cells}"
+        )
+    if missing_requested:
+        print(
+            f"[manifest] using {len(rows)}/{len(requested)} requested checkpoints; "
+            f"skipping {len(missing_requested)} unavailable seed cells",
+            flush=True,
+        )
 
     by_cell: dict[tuple[str, int], list[dict[str, Any]]] = defaultdict(list)
     for row in rows:
@@ -363,6 +410,8 @@ def build_checkpoint_manifest(cfg: AnalysisConfig, *, force: bool = False) -> li
             "analysis_version": ANALYSIS_VERSION,
             "width": cfg.analysis_width,
             "selection_scope": selection_scope,
+            "checkpoint_signature": checkpoint_signature,
+            "missing_requested": [list(item) for item in missing_requested],
             "created": time.strftime("%Y-%m-%d %H:%M:%S %Z"),
             "rows": rows,
         },
@@ -732,6 +781,25 @@ def mean_ci(values: Sequence[float]) -> tuple[float, float]:
         return float(array[0]), 0.0
     t95 = {2: 12.706, 3: 4.303, 4: 3.182, 5: 2.776}.get(len(array), 1.96)
     return float(array.mean()), float(t95 * array.std(ddof=1) / math.sqrt(len(array)))
+
+
+def bootstrap_mean_interval(
+    values: Sequence[float],
+    *,
+    samples: int,
+    seed: int,
+) -> tuple[float, float, float]:
+    array = np.asarray(values, dtype=float)
+    array = array[np.isfinite(array)]
+    if not len(array):
+        return float("nan"), float("nan"), float("nan")
+    mean = float(array.mean())
+    if len(array) == 1:
+        return mean, mean, mean
+    rng = np.random.default_rng(int(seed))
+    draws = rng.choice(array, size=(int(samples), len(array)), replace=True).mean(axis=1)
+    lower, upper = np.quantile(draws, [0.025, 0.975])
+    return mean, float(lower), float(upper)
 
 
 def rankdata(values: Sequence[float]) -> np.ndarray:
@@ -1528,23 +1596,24 @@ def analyze_checkpoint(
     path = metric_cache_path(cfg, row, sample_type)
     if path.exists() and not force:
         cached = torch.load(path, map_location="cpu", weights_only=False)
-        if cached.get("fingerprint") == scientific_fingerprint(cfg):
+        if (
+            cached.get("fingerprint") == scientific_fingerprint(cfg)
+            and cached.get("discovery") is not None
+        ):
             print(f"[metrics cache] {path}", flush=True)
             return cached
     model, payload, nar_config = load_model_from_manifest(row, device)
-    discovery = None
-    if sample_type == "primary":
-        discovery = load_or_run_metric_split(
-            model,
-            nar_config,
-            row,
-            cfg,
-            sample_type=sample_type,
-            split="discovery",
-            graphs=cfg.discovery_graphs,
-            device=device,
-            force=force,
-        )
+    discovery = load_or_run_metric_split(
+        model,
+        nar_config,
+        row,
+        cfg,
+        sample_type=sample_type,
+        split="discovery",
+        graphs=cfg.discovery_graphs,
+        device=device,
+        force=force,
+    )
     estimation = load_or_run_metric_split(
         model,
         nar_config,
@@ -2069,11 +2138,21 @@ def run_causal_checkpoint(
         if cached.get("fingerprint") == scientific_fingerprint(cfg):
             print(f"[causal cache] {path}", flush=True)
             return cached
+    model, _payload, nar_config = load_model_from_manifest(row, device)
     discovery = metric_cache.get("discovery")
     if discovery is None:
-        raise RuntimeError("causal family selection requires the primary discovery cache")
+        discovery = load_or_run_metric_split(
+            model,
+            nar_config,
+            row,
+            cfg,
+            sample_type=str(metric_cache.get("sample_type", "robustness")),
+            split="discovery",
+            graphs=cfg.discovery_graphs,
+            device=device,
+            force=False,
+        )
     families = select_causal_families(discovery, cfg, row)
-    model, _payload, nar_config = load_model_from_manifest(row, device)
     records = int(row["N"])
     full_batch = nar.make_batch(
         nar_config,
@@ -2193,7 +2272,19 @@ def causal_schedule(
     return [
         dict(row)
         for row in manifest
-        if bool(row["selected_for_analysis"]) and int(row["N"]) in cfg.anchor_ns
+        if int(row["N"]) in cfg.anchor_ns
+    ]
+
+
+def followup_schedule(
+    manifest: Sequence[Mapping[str, Any]], cfg: AnalysisConfig
+) -> list[dict[str, Any]]:
+    """Selected checkpoints at every N plus all-seed anchor replications."""
+
+    return [
+        dict(row)
+        for row in manifest
+        if bool(row["selected_for_analysis"]) or int(row["N"]) in cfg.anchor_ns
     ]
 
 
@@ -2209,6 +2300,514 @@ def load_causal_caches(
         cached = torch.load(path, map_location="cpu", weights_only=False)
         if cached.get("fingerprint") != scientific_fingerprint(cfg):
             raise RuntimeError(f"causal cache fingerprint mismatch: {path}")
+        out.append(cached)
+    return out
+
+
+def cumulative_ablation_ks(total_heads: int) -> tuple[int, ...]:
+    values = {1, int(total_heads)}
+    value = 2
+    while value < int(total_heads):
+        values.add(value)
+        value *= 2
+    return tuple(sorted(item for item in values if 0 < item <= int(total_heads)))
+
+
+def _semantic_head_ranking(discovery: Mapping[str, Any]) -> list[tuple[int, int]]:
+    score = torch.nanmean(discovery["head"]["target_payload"]["total"], dim=0)
+    heads = int(score.size(1))
+    order = torch.argsort(score.flatten(), descending=True).tolist()
+    return [decode_head(index, heads) for index in order]
+
+
+def _sample_layer_matched_rankings(
+    target: Sequence[tuple[int, int]],
+    throughput: torch.Tensor,
+    *,
+    count: int,
+    seed: int,
+) -> list[list[tuple[int, int]]]:
+    """Nested random rankings matched to the target's layer sequence and throughput."""
+
+    rng = np.random.default_rng(int(seed))
+    layer_sequence = [int(layer) for layer, _head in target]
+    heads_per_layer = int(throughput.size(1))
+    target_values = np.asarray(
+        [float(throughput[layer, head]) for layer, head in target], dtype=float
+    )
+    target_cumulative = np.cumsum(target_values)
+    ks = cumulative_ablation_ks(len(target))
+    candidates: dict[tuple[tuple[int, int], ...], float] = {}
+    attempts = max(512, int(count) * 256)
+    for _ in range(attempts):
+        orders = {
+            layer: rng.permutation(heads_per_layer).tolist()
+            for layer in sorted(set(layer_sequence))
+        }
+        positions = defaultdict(int)
+        ranking: list[tuple[int, int]] = []
+        for layer in layer_sequence:
+            ranking.append((layer, int(orders[layer][positions[layer]])))
+            positions[layer] += 1
+        key = tuple(ranking)
+        if key == tuple(target):
+            continue
+        values = np.asarray(
+            [float(throughput[layer, head]) for layer, head in ranking], dtype=float
+        )
+        cumulative = np.cumsum(values)
+        mismatch = np.mean([
+            abs(math.log((cumulative[k - 1] + EPS) / (target_cumulative[k - 1] + EPS)))
+            for k in ks
+        ])
+        candidates[key] = float(mismatch)
+    if len(candidates) < int(count):
+        raise RuntimeError(f"could not construct {count} layer-matched random rankings")
+    return [
+        list(item)
+        for item in sorted(candidates, key=lambda key: (candidates[key], key))[: int(count)]
+    ]
+
+
+def _sample_layer_matched_control_families(
+    target: Sequence[tuple[int, int]],
+    throughput: torch.Tensor,
+    *,
+    count: int,
+    seed: int,
+) -> list[list[tuple[int, int]]]:
+    """Layer/throughput-matched controls that may partially overlap a union family."""
+
+    rng = np.random.default_rng(int(seed))
+    heads_per_layer = int(throughput.size(1))
+    layer_counts: dict[int, int] = defaultdict(int)
+    for layer, _head in target:
+        layer_counts[int(layer)] += 1
+    target_key = tuple(sorted((int(layer), int(head)) for layer, head in target))
+    target_throughput = sum(float(throughput[layer, head]) for layer, head in target_key)
+    candidates: dict[tuple[tuple[int, int], ...], float] = {}
+    for _ in range(max(512, int(count) * 256)):
+        family: list[tuple[int, int]] = []
+        for layer, needed in sorted(layer_counts.items()):
+            chosen = rng.choice(heads_per_layer, size=needed, replace=False).tolist()
+            family.extend((layer, int(head)) for head in chosen)
+        key = tuple(sorted(family))
+        if key == target_key:
+            continue
+        value = sum(float(throughput[layer, head]) for layer, head in key)
+        candidates[key] = abs(math.log((value + EPS) / (target_throughput + EPS)))
+    if len(candidates) < int(count):
+        raise RuntimeError(f"could not construct {count} controls for union family")
+    return [
+        list(item)
+        for item in sorted(candidates, key=lambda key: (candidates[key], key))[: int(count)]
+    ]
+
+
+def select_followup_families(
+    discovery: Mapping[str, Any],
+    cfg: AnalysisConfig,
+    row: Mapping[str, Any],
+) -> dict[str, Any]:
+    base = select_causal_families(discovery, cfg, row)
+    routing = sorted(set(map(tuple, base["routing"])))
+    message = sorted(set(map(tuple, base["message"])))
+    overlap = sorted(set(routing) & set(message))
+    union = sorted(set(routing) | set(message))
+    seed = (
+        cfg.analysis_seed
+        + int(row["seed"]) * 17_003
+        + int(row["N"]) * 170_011
+        + MODEL_ORDER.index(str(row["model"])) * 1_700_009
+    )
+    return {
+        **base,
+        "routing": routing,
+        "message": message,
+        "overlap": overlap,
+        "union": union,
+        "union_controls": _sample_layer_matched_control_families(
+            union,
+            base["clean_throughput"],
+            count=cfg.random_families,
+            seed=seed + 307,
+        ),
+    }
+
+
+@contextlib.contextmanager
+def ablate_head_sets_by_replica(
+    model: Any,
+    head_sets: Sequence[Sequence[tuple[int, int]]],
+    *,
+    graphs: int,
+    nodes: int,
+):
+    """Apply a different multi-layer head ablation to each replicated batch block."""
+
+    by_layer: dict[int, list[list[int]]] = {}
+    for layer in range(int(model.L)):
+        by_layer[layer] = [
+            [int(head) for item_layer, head in heads if int(item_layer) == layer]
+            for heads in head_sets
+        ]
+    handles = []
+
+    def make_hook(layer: int):
+        def hook(_module: Any, _inputs: tuple[Any, ...], output: Any) -> Any:
+            node_heads, edge_output = output
+            changed = node_heads.clone().reshape(
+                len(head_sets), int(graphs), int(nodes), node_heads.size(-2), node_heads.size(-1)
+            )
+            for replica, heads in enumerate(by_layer[layer]):
+                if heads:
+                    changed[replica, :, :, heads, :] = 0.0
+            return changed.reshape_as(node_heads), edge_output
+
+        return hook
+
+    try:
+        for layer, module in enumerate(model.attention_layers):
+            handles.append(module.register_forward_hook(make_hook(layer)))
+        yield
+    finally:
+        for handle in handles:
+            handle.remove()
+
+
+@torch.no_grad()
+def predict_ablated_head_sets(
+    model: Any,
+    batch: nar.NarBatch,
+    head_sets: Sequence[Sequence[tuple[int, int]]],
+    *,
+    device: torch.device,
+    max_replica_pairs: int,
+) -> torch.Tensor:
+    """Return ``[families, graphs, classes]`` logits with batched replica forwards."""
+
+    if not head_sets:
+        return torch.empty((0, len(batch), int(batch.y.max()) + 1))
+    graphs, nodes = len(batch), int(batch.x.size(1))
+    per_replica_pairs = max(1, graphs * nodes * nodes)
+    replica_chunk = max(1, int(max_replica_pairs) // per_replica_pairs)
+    outputs: list[torch.Tensor] = []
+    for start in range(0, len(head_sets), replica_chunk):
+        selected = list(head_sets[start : start + replica_chunk])
+        combined = nar.concat_batches([nar.clone_batch(batch) for _ in selected])
+        with ablate_head_sets_by_replica(
+            model, selected, graphs=graphs, nodes=nodes
+        ):
+            logits = model(combined.to(device)).detach().cpu()
+        outputs.append(logits.reshape(len(selected), graphs, -1))
+    return torch.cat(outputs, dim=0)
+
+
+def _ablation_descriptors(
+    discovery: Mapping[str, Any],
+    families: Mapping[str, Any],
+    cfg: AnalysisConfig,
+    row: Mapping[str, Any],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    ranking = _semantic_head_ranking(discovery)
+    ranking_controls = _sample_layer_matched_rankings(
+        ranking,
+        families["clean_throughput"],
+        count=cfg.ablation_random_rankings,
+        seed=(
+            cfg.analysis_seed
+            + int(row["seed"]) * 19_009
+            + int(row["N"]) * 190_027
+            + MODEL_ORDER.index(str(row["model"])) * 1_900_021
+        ),
+    )
+    descriptors: list[dict[str, Any]] = []
+    for k in cumulative_ablation_ks(len(ranking)):
+        descriptors.append({
+            "analysis": "semantic_curve",
+            "selection": "score",
+            "family": "semantic_transport",
+            "replicate": 0,
+            "k": int(k),
+            "heads": ranking[:k],
+        })
+        for replicate, control in enumerate(ranking_controls):
+            descriptors.append({
+                "analysis": "semantic_curve",
+                "selection": "random",
+                "family": "semantic_transport",
+                "replicate": int(replicate),
+                "k": int(k),
+                "heads": control[:k],
+            })
+    for family in ("routing", "message", "overlap", "union"):
+        descriptors.append({
+            "analysis": "family_overlap",
+            "selection": "score",
+            "family": family,
+            "replicate": 0,
+            "k": len(families[family]),
+            "heads": list(families[family]),
+        })
+    for replicate, heads in enumerate(families["union_controls"]):
+        descriptors.append({
+            "analysis": "family_overlap",
+            "selection": "random",
+            "family": "union_random",
+            "replicate": int(replicate),
+            "k": len(heads),
+            "heads": list(heads),
+        })
+    return descriptors, {
+        "semantic": ranking,
+        "semantic_controls": ranking_controls,
+    }
+
+
+def _append_batched_ablation_rows(
+    rows: list[dict[str, Any]],
+    *,
+    batch: nar.NarBatch,
+    baseline: torch.Tensor,
+    descriptors: Sequence[Mapping[str, Any]],
+    changed: torch.Tensor,
+    graph_offset: int,
+) -> None:
+    labels = batch.y.long()
+    baseline_cpu = baseline.detach().cpu()
+    base_loss = F.cross_entropy(baseline_cpu, labels, reduction="none")
+    for family_index, descriptor in enumerate(descriptors):
+        logits = changed[family_index]
+        changed_loss = F.cross_entropy(logits, labels, reduction="none")
+        for graph in range(len(batch)):
+            rows.append({
+                "graph": int(graph_offset + graph),
+                "analysis": descriptor["analysis"],
+                "selection": descriptor["selection"],
+                "family": descriptor["family"],
+                "replicate": int(descriptor["replicate"]),
+                "k": int(descriptor["k"]),
+                "heads": str(descriptor["heads"]),
+                "baseline_loss": float(base_loss[graph]),
+                "baseline_correct": float(
+                    baseline_cpu[graph].argmax() == labels[graph]
+                ),
+                "loss_delta": float(changed_loss[graph] - base_loss[graph]),
+                "accuracy_drop": float(
+                    (baseline_cpu[graph].argmax() == labels[graph]).float()
+                    - (logits[graph].argmax() == labels[graph]).float()
+                ),
+                "logit_displacement": float(
+                    torch.linalg.vector_norm(logits[graph] - baseline_cpu[graph])
+                ),
+            })
+
+
+def followup_cache_path(cfg: AnalysisConfig, row: Mapping[str, Any]) -> Path:
+    stem = (
+        f"{row['model']}__d{cfg.analysis_width}__N{row['N']}__seed_{row['seed']}"
+        f"__{followup_fingerprint(cfg)}.pt"
+    )
+    return analysis_root(cfg) / "followups" / stem
+
+
+def followup_chunk_cache_path(
+    cfg: AnalysisConfig,
+    row: Mapping[str, Any],
+    start: int,
+    stop: int,
+) -> Path:
+    stem = (
+        f"{row['model']}__d{cfg.analysis_width}__N{row['N']}__seed_{row['seed']}"
+        f"__graphs_{start}_{stop}__{followup_fingerprint(cfg)}.pt"
+    )
+    return analysis_root(cfg) / "followups" / "chunks" / stem
+
+
+def followup_seed(cfg: AnalysisConfig, row: Mapping[str, Any]) -> int:
+    return int(
+        cfg.analysis_seed
+        + 71
+        + int(row["seed"]) * 10_007
+        + int(row["N"]) * 100_003
+        + MODEL_ORDER.index(str(row["model"])) * 1_000_003
+    )
+
+
+def run_followup_checkpoint(
+    row: Mapping[str, Any],
+    metric_cache: Mapping[str, Any],
+    cfg: AnalysisConfig,
+    *,
+    device: torch.device,
+    force: bool,
+) -> dict[str, Any]:
+    path = followup_cache_path(cfg, row)
+    if path.exists() and not force:
+        cached = torch.load(path, map_location="cpu", weights_only=False)
+        if cached.get("followup_fingerprint") == followup_fingerprint(cfg):
+            print(f"[follow-up cache] {path}", flush=True)
+            return cached
+    model, _payload, nar_config = load_model_from_manifest(row, device)
+    discovery = metric_cache.get("discovery")
+    if discovery is None:
+        discovery = load_or_run_metric_split(
+            model,
+            nar_config,
+            row,
+            cfg,
+            sample_type=str(metric_cache.get("sample_type", "robustness")),
+            split="discovery",
+            graphs=cfg.discovery_graphs,
+            device=device,
+            force=False,
+        )
+    families = select_followup_families(discovery, cfg, row)
+    descriptors, rankings = _ablation_descriptors(discovery, families, cfg, row)
+    records = int(row["N"])
+    full_batch = nar.make_batch(
+        nar_config,
+        cfg.followup_graphs,
+        records,
+        seed=followup_seed(cfg, row),
+    )
+    nodes = int(full_batch.x.size(1))
+    chunk = max(1, min(
+        64,
+        cfg.max_batch_nodes // nodes,
+        cfg.max_dense_pairs // (nodes * nodes),
+    ))
+    ablation_rows: list[dict[str, Any]] = []
+    patch_rows: list[dict[str, Any]] = []
+    started = time.time()
+    patch_entries = [
+        {"family": "union", "replicate": 0, "heads": list(families["union"])},
+        {
+            "family": "union_random",
+            "replicate": 0,
+            "heads": list(families["union_controls"][0]),
+        },
+    ]
+    patch_union = records in cfg.anchor_ns
+    for start in range(0, len(full_batch), chunk):
+        stop = min(start + chunk, len(full_batch))
+        chunk_path = followup_chunk_cache_path(cfg, row, start, stop)
+        if chunk_path.exists() and not force:
+            cached = torch.load(chunk_path, map_location="cpu", weights_only=False)
+            if cached.get("followup_fingerprint") == followup_fingerprint(cfg):
+                print(f"[follow-up chunk cache] {chunk_path}", flush=True)
+                ablation_rows.extend(cached["ablation_rows"])
+                patch_rows.extend(cached["patch_rows"])
+                continue
+        print(
+            f"[follow-up {row['model']} d={cfg.analysis_width} N={records} "
+            f"seed={row['seed']}] {start}:{stop}/{len(full_batch)}",
+            flush=True,
+        )
+        clean = full_batch.slice(start, stop)
+        if patch_union:
+            baseline, clean_endpoints = capture_endpoint_forward(model, clean, device)
+        else:
+            with torch.no_grad():
+                baseline = model(clean.to(device)).detach()
+            clean_endpoints = {}
+        changed = predict_ablated_head_sets(
+            model,
+            clean,
+            [descriptor["heads"] for descriptor in descriptors],
+            device=device,
+            max_replica_pairs=cfg.max_replica_pairs,
+        )
+        chunk_ablation: list[dict[str, Any]] = []
+        chunk_patching: list[dict[str, Any]] = []
+        _append_batched_ablation_rows(
+            chunk_ablation,
+            batch=clean,
+            baseline=baseline,
+            descriptors=descriptors,
+            changed=changed,
+            graph_offset=start,
+        )
+        if patch_union:
+            for donor in range(cfg.followup_donors):
+                replicas = (
+                    target_payload_replica(clean, records, donor),
+                    address_replica(clean, records, donor, same_answer=False),
+                )
+                for replica in replicas:
+                    variant_logits, _variant_endpoints = capture_endpoint_forward(
+                        model, replica.batch, device
+                    )
+                    for family in patch_entries:
+                        _append_patch_rows(
+                            chunk_patching,
+                            intervention=replica.intervention,
+                            donor=donor,
+                            replica=replica,
+                            variant_logits=variant_logits,
+                            clean_endpoints=clean_endpoints,
+                            family=family,
+                            model=model,
+                            device=device,
+                            graph_offset=start,
+                        )
+        payload = {
+            "analysis_version": ANALYSIS_VERSION,
+            "followup_version": FOLLOWUP_VERSION,
+            "followup_fingerprint": followup_fingerprint(cfg),
+            "checkpoint": dict(row),
+            "start": start,
+            "stop": stop,
+            "families": families,
+            "rankings": rankings,
+            "ablation_rows": chunk_ablation,
+            "patch_rows": chunk_patching,
+        }
+        atomic_torch_save(chunk_path, payload)
+        print(f"[follow-up chunk saved] {chunk_path}", flush=True)
+        ablation_rows.extend(chunk_ablation)
+        patch_rows.extend(chunk_patching)
+        if str(device).startswith("cuda"):
+            torch.cuda.empty_cache()
+    result = {
+        "analysis_version": ANALYSIS_VERSION,
+        "followup_version": FOLLOWUP_VERSION,
+        "followup_fingerprint": followup_fingerprint(cfg),
+        "checkpoint": dict(row),
+        "families": families,
+        "rankings": rankings,
+        "ablation_rows": ablation_rows,
+        "patch_rows": patch_rows,
+        "meta": {
+            "graphs": cfg.followup_graphs,
+            "donors": cfg.followup_donors if patch_union else 0,
+            "seed": followup_seed(cfg, row),
+            "chunk_graphs": chunk,
+            "elapsed_s": time.time() - started,
+        },
+    }
+    atomic_torch_save(path, result)
+    print(f"[follow-up saved] {path}", flush=True)
+    del model
+    if str(device).startswith("cuda"):
+        torch.cuda.empty_cache()
+    return result
+
+
+def load_followup_caches(
+    cfg: AnalysisConfig,
+    rows: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    out = []
+    for row in rows:
+        path = followup_cache_path(cfg, row)
+        if not path.exists():
+            raise FileNotFoundError(
+                f"missing follow-up cache: {path}; run --phase followups"
+            )
+        cached = torch.load(path, map_location="cpu", weights_only=False)
+        if cached.get("followup_fingerprint") != followup_fingerprint(cfg):
+            raise RuntimeError(f"follow-up cache fingerprint mismatch: {path}")
         out.append(cached)
     return out
 
@@ -2239,6 +2838,7 @@ def build_metric_tables(
             "seed": int(checkpoint["seed"]),
             "sample_type": cached["sample_type"],
             "selected": bool(checkpoint["selected_for_analysis"]),
+            "heldout_loss": float(checkpoint["heldout_loss"]),
             "heldout_accuracy": float(checkpoint["heldout_accuracy"]),
         }
         clean_attention = estimation["clean_attention"]
@@ -2396,13 +2996,14 @@ def build_metric_tables(
         grouped_cells[(
             row["model"], row["width"], row["N"], row["seed"],
             row["sample_type"], row["selected"], row["heldout_accuracy"],
+            row["heldout_loss"],
             row["intervention"], row["layer"],
         )].append(row)
     cell_rows: list[dict[str, Any]] = []
     for key, values in grouped_cells.items():
         (
             model, width, records, seed, sample_type, selected,
-            heldout_accuracy, intervention, layer,
+            heldout_accuracy, heldout_loss, intervention, layer,
         ) = key
         route = sum(float(row["route"]) for row in values)
         message = sum(float(row["message"]) for row in values)
@@ -2413,6 +3014,7 @@ def build_metric_tables(
             "seed": seed,
             "sample_type": sample_type,
             "selected": selected,
+            "heldout_loss": heldout_loss,
             "heldout_accuracy": heldout_accuracy,
             "intervention": intervention,
             "layer": layer,
@@ -2482,6 +3084,588 @@ def build_causal_tables(
     return {"ablation": ablation_rows, "patching": patch_rows, "families": family_rows}
 
 
+def build_followup_tables(
+    caches: Sequence[Mapping[str, Any]],
+    cfg: AnalysisConfig,
+) -> dict[str, list[dict[str, Any]]]:
+    curve_rows: list[dict[str, Any]] = []
+    family_ablation_rows: list[dict[str, Any]] = []
+    union_patch_rows: list[dict[str, Any]] = []
+    family_rows: list[dict[str, Any]] = []
+    ranking_rows: list[dict[str, Any]] = []
+    for cached in caches:
+        checkpoint = cached["checkpoint"]
+        base = {
+            "model": checkpoint["model"],
+            "width": int(checkpoint["width"]),
+            "N": int(checkpoint["N"]),
+            "seed": int(checkpoint["seed"]),
+            "selected": bool(checkpoint["selected_for_analysis"]),
+            "heldout_loss": float(checkpoint["heldout_loss"]),
+            "heldout_accuracy": float(checkpoint["heldout_accuracy"]),
+        }
+        for row in cached["ablation_rows"]:
+            target = curve_rows if row["analysis"] == "semantic_curve" else family_ablation_rows
+            target.append({**base, **row})
+        union_patch_rows.extend({**base, **row} for row in cached["patch_rows"])
+        families = cached["families"]
+        routing = set(map(tuple, families["routing"]))
+        message = set(map(tuple, families["message"]))
+        overlap = routing & message
+        union = routing | message
+        family_rows.append({
+            **base,
+            "routing_heads": str(sorted(routing)),
+            "message_heads": str(sorted(message)),
+            "overlap_heads": str(sorted(overlap)),
+            "union_heads": str(sorted(union)),
+            "routing_size": len(routing),
+            "message_size": len(message),
+            "overlap_size": len(overlap),
+            "union_size": len(union),
+            "jaccard": len(overlap) / max(len(union), 1),
+        })
+        ranking = cached["rankings"]["semantic"]
+        for rank, (layer, head) in enumerate(ranking, start=1):
+            ranking_rows.append({
+                **base,
+                "selection": "score",
+                "replicate": 0,
+                "rank": rank,
+                "layer": int(layer),
+                "head": int(head),
+            })
+        for replicate, control in enumerate(cached["rankings"]["semantic_controls"]):
+            for rank, (layer, head) in enumerate(control, start=1):
+                ranking_rows.append({
+                    **base,
+                    "selection": "random",
+                    "replicate": replicate,
+                    "rank": rank,
+                    "layer": int(layer),
+                    "head": int(head),
+                })
+    table_dir = analysis_root(cfg) / "tables"
+    write_csv(table_dir / "followup_ablation_curve.csv", curve_rows)
+    write_csv(table_dir / "followup_family_ablation.csv", family_ablation_rows)
+    write_csv(table_dir / "followup_union_patching.csv", union_patch_rows)
+    write_csv(table_dir / "followup_family_overlap.csv", family_rows)
+    write_csv(table_dir / "followup_rankings.csv", ranking_rows)
+    return {
+        "curve": curve_rows,
+        "family_ablation": family_ablation_rows,
+        "union_patching": union_patch_rows,
+        "family_overlap": family_rows,
+        "rankings": ranking_rows,
+    }
+
+
+def _checkpoint_means(
+    rows: Sequence[Mapping[str, Any]],
+    key: str,
+    group_keys: Sequence[str],
+) -> list[dict[str, Any]]:
+    grouped: dict[tuple[Any, ...], list[float]] = defaultdict(list)
+    exemplars: dict[tuple[Any, ...], Mapping[str, Any]] = {}
+    for row in rows:
+        value = float(row[key])
+        if not math.isfinite(value):
+            continue
+        group = tuple(row.get(name) for name in group_keys)
+        grouped[group].append(value)
+        exemplars[group] = row
+    return [
+        {
+            **{name: exemplars[group].get(name) for name in group_keys},
+            key: float(np.mean(values)),
+        }
+        for group, values in grouped.items()
+    ]
+
+
+def build_ablation_curve_summary(
+    rows: Sequence[Mapping[str, Any]], cfg: AnalysisConfig
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    replicate_cells = _checkpoint_means(
+        rows,
+        "accuracy_drop",
+        ("model", "N", "seed", "selection", "replicate", "k"),
+    )
+    cells = _checkpoint_means(
+        replicate_cells,
+        "accuracy_drop",
+        ("model", "N", "seed", "selection", "k"),
+    )
+    summary: list[dict[str, Any]] = []
+    for model in cfg.models:
+        for records in cfg.ns:
+            for selection in ("score", "random"):
+                ks = sorted({
+                    int(row["k"])
+                    for row in cells
+                    if row["model"] == model
+                    and int(row["N"]) == records
+                    and row["selection"] == selection
+                })
+                for k in ks:
+                    values = [
+                        float(row["accuracy_drop"])
+                        for row in cells
+                        if row["model"] == model
+                        and int(row["N"]) == records
+                        and row["selection"] == selection
+                        and int(row["k"]) == k
+                    ]
+                    mean, lower, upper = bootstrap_mean_interval(
+                        values,
+                        samples=cfg.bootstrap_samples,
+                        seed=cfg.analysis_seed + records * 31 + k * 7,
+                    )
+                    summary.append({
+                        "model": model,
+                        "N": records,
+                        "selection": selection,
+                        "k": k,
+                        "checkpoint_cells": len(values),
+                        "accuracy_drop": mean,
+                        "ci_lower": lower,
+                        "ci_upper": upper,
+                    })
+    return cells, summary
+
+
+def build_attention_faithfulness_tables(
+    head_rows: Sequence[Mapping[str, Any]], cfg: AnalysisConfig
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    interventions = ("target_payload", "address_different_answer")
+    measures = {
+        "clean_attention": "attention_ratio",
+        "attention_response": "attention_moved_normalized",
+    }
+    layer_rows: list[dict[str, Any]] = []
+    grouped: dict[tuple[Any, ...], list[Mapping[str, Any]]] = defaultdict(list)
+    for row in head_rows:
+        if row["intervention"] in interventions:
+            grouped[(
+                row["model"], int(row["N"]), int(row["seed"]),
+                row["intervention"], int(row["layer"]),
+            )].append(row)
+    for (model, records, seed, intervention, layer), points in grouped.items():
+        for measure, x_key in measures.items():
+            layer_rows.append({
+                "model": model,
+                "N": records,
+                "seed": seed,
+                "intervention": intervention,
+                "measure": measure,
+                "layer": layer,
+                "solved": float(points[0]["heldout_accuracy"]) >= cfg.solved_accuracy,
+                "rho": spearman(
+                    [float(row[x_key]) for row in points],
+                    [float(row["total"]) for row in points],
+                ),
+            })
+    cell_rows = _checkpoint_means(
+        layer_rows,
+        "rho",
+        ("model", "N", "seed", "intervention", "measure", "solved"),
+    )
+    summary: list[dict[str, Any]] = []
+    for sample in ("solved", "all"):
+        for model in cfg.models:
+            for intervention in interventions:
+                for measure in measures:
+                    values = [
+                        float(row["rho"])
+                        for row in cell_rows
+                        if row["model"] == model
+                        and row["intervention"] == intervention
+                        and row["measure"] == measure
+                        and (sample == "all" or bool(row["solved"]))
+                    ]
+                    mean, lower, upper = bootstrap_mean_interval(
+                        values,
+                        samples=cfg.bootstrap_samples,
+                        seed=cfg.analysis_seed + MODEL_ORDER.index(model) * 101
+                        + interventions.index(intervention) * 17,
+                    )
+                    summary.append({
+                        "sample": sample,
+                        "model": model,
+                        "intervention": intervention,
+                        "measure": measure,
+                        "checkpoint_cells": len(values),
+                        "rho": mean,
+                        "ci_lower": lower,
+                        "ci_upper": upper,
+                    })
+    contrasts: list[dict[str, Any]] = []
+    indexed = {
+        (
+            row["model"], int(row["N"]), int(row["seed"]),
+            row["measure"], row["intervention"],
+        ): float(row["rho"])
+        for row in cell_rows
+    }
+    solved_index = {
+        (row["model"], int(row["N"]), int(row["seed"])): bool(row["solved"])
+        for row in cell_rows
+    }
+    for sample in ("solved", "all"):
+        for model in cfg.models:
+            for measure in measures:
+                differences = []
+                cells = sorted({
+                    (int(row["N"]), int(row["seed"]))
+                    for row in cell_rows
+                    if row["model"] == model and row["measure"] == measure
+                })
+                for records, seed in cells:
+                    address = indexed.get((
+                        model, records, seed, measure, "address_different_answer"
+                    ))
+                    payload = indexed.get((model, records, seed, measure, "target_payload"))
+                    solved = solved_index.get((model, records, seed), False)
+                    if (
+                        address is not None and payload is not None
+                        and (sample == "all" or solved)
+                    ):
+                        differences.append(address - payload)
+                mean, lower, upper = bootstrap_mean_interval(
+                    differences,
+                    samples=cfg.bootstrap_samples,
+                    seed=cfg.analysis_seed + MODEL_ORDER.index(model) * 211,
+                )
+                contrasts.append({
+                    "sample": sample,
+                    "model": model,
+                    "measure": measure,
+                    "contrast": "address_minus_payload",
+                    "checkpoint_cells": len(differences),
+                    "rho_difference": mean,
+                    "ci_lower": lower,
+                    "ci_upper": upper,
+                })
+    return cell_rows, summary, contrasts
+
+
+def build_support_causal_table(
+    patch_rows: Sequence[Mapping[str, Any]], cfg: AnalysisConfig
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    specifications = (
+        ("address_routing", "address_different_answer", "routing", "routing_rescue"),
+        ("payload_message", "target_payload", "message", "message_rescue"),
+        ("address_interaction", "address_different_answer", "routing", "interaction"),
+        ("payload_interaction", "target_payload", "message", "interaction"),
+    )
+    cells: list[dict[str, Any]] = []
+    for label, intervention, family, metric in specifications:
+        selected = _checkpoint_means(
+            [
+                row for row in patch_rows
+                if row["intervention"] == intervention and row["family"] == family
+            ],
+            metric,
+            ("model", "N", "seed"),
+        )
+        control = _checkpoint_means(
+            [
+                row for row in patch_rows
+                if row["intervention"] == intervention
+                and row["family"] == f"{family}_random"
+            ],
+            metric,
+            ("model", "N", "seed"),
+        )
+        selected_map = {
+            (row["model"], int(row["N"]), int(row["seed"])): float(row[metric])
+            for row in selected
+        }
+        control_map = {
+            (row["model"], int(row["N"]), int(row["seed"])): float(row[metric])
+            for row in control
+        }
+        for key in sorted(set(selected_map) & set(control_map)):
+            model, records, seed = key
+            cells.append({
+                "model": model,
+                "N": records,
+                "seed": seed,
+                "estimand": label,
+                "selected": selected_map[key],
+                "matched_random": control_map[key],
+                "contrast": selected_map[key] - control_map[key],
+            })
+    summary: list[dict[str, Any]] = []
+    for estimand, _intervention, _family, _metric in specifications:
+        for model in cfg.models:
+            for records in cfg.anchor_ns:
+                values = [
+                    float(row["contrast"])
+                    for row in cells
+                    if row["model"] == model
+                    and int(row["N"]) == records
+                    and row["estimand"] == estimand
+                ]
+                mean, lower, upper = bootstrap_mean_interval(
+                    values,
+                    samples=cfg.bootstrap_samples,
+                    seed=cfg.analysis_seed + records * 43 + MODEL_ORDER.index(model) * 13,
+                )
+                summary.append({
+                    "model": model,
+                    "N": records,
+                    "estimand": estimand,
+                    "seeds": len(values),
+                    "contrast": mean,
+                    "ci_lower": lower,
+                    "ci_upper": upper,
+                })
+    return cells, summary
+
+
+def build_family_interaction_tables(
+    followups: Mapping[str, Sequence[Mapping[str, Any]]],
+    cfg: AnalysisConfig,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    family_cells = _checkpoint_means(
+        [row for row in followups["family_ablation"] if row["selection"] == "score"],
+        "loss_delta",
+        ("model", "N", "seed", "family"),
+    )
+    indexed = {
+        (row["model"], int(row["N"]), int(row["seed"]), row["family"]):
+        float(row["loss_delta"])
+        for row in family_cells
+    }
+    interaction_cells: list[dict[str, Any]] = []
+    checkpoints = sorted({key[:3] for key in indexed})
+    for model, records, seed in checkpoints:
+        required = {
+            family: indexed.get((model, records, seed, family))
+            for family in ("routing", "message", "overlap", "union")
+        }
+        if all(value is not None for value in required.values()):
+            interaction_cells.append({
+                "model": model,
+                "N": records,
+                "seed": seed,
+                **{f"{family}_loss_delta": value for family, value in required.items()},
+                "joint_excess": (
+                    required["union"] - required["routing"]
+                    - required["message"] + required["overlap"]
+                ),
+            })
+    patch_cells = _checkpoint_means(
+        followups["union_patching"],
+        "interaction",
+        ("model", "N", "seed", "intervention", "family"),
+    )
+    patch_index = {
+        (
+            row["model"], int(row["N"]), int(row["seed"]),
+            row["intervention"], row["family"],
+        ): float(row["interaction"])
+        for row in patch_cells
+    }
+    for row in interaction_cells:
+        for intervention in ("address_different_answer", "target_payload"):
+            key = (row["model"], int(row["N"]), int(row["seed"]), intervention)
+            selected = patch_index.get((*key, "union"))
+            control = patch_index.get((*key, "union_random"))
+            row[f"{intervention}_component_interaction"] = (
+                selected - control
+                if selected is not None and control is not None else float("nan")
+            )
+    summary: list[dict[str, Any]] = []
+    metrics = (
+        "joint_excess",
+        "address_different_answer_component_interaction",
+        "target_payload_component_interaction",
+    )
+    for metric in metrics:
+        for model in cfg.models:
+            for records in cfg.ns:
+                values = [
+                    float(row.get(metric, float("nan")))
+                    for row in interaction_cells
+                    if row["model"] == model and int(row["N"]) == records
+                ]
+                mean, lower, upper = bootstrap_mean_interval(
+                    values,
+                    samples=cfg.bootstrap_samples,
+                    seed=cfg.analysis_seed + records * 47 + MODEL_ORDER.index(model) * 23,
+                )
+                summary.append({
+                    "model": model,
+                    "N": records,
+                    "metric": metric,
+                    "checkpoint_cells": int(np.isfinite(values).sum()),
+                    "value": mean,
+                    "ci_lower": lower,
+                    "ci_upper": upper,
+                })
+    return interaction_cells, summary
+
+
+def bootstrap_spearman_interval(
+    x: Sequence[float],
+    y: Sequence[float],
+    *,
+    samples: int,
+    seed: int,
+) -> tuple[float, float, float]:
+    left, right = np.asarray(x, dtype=float), np.asarray(y, dtype=float)
+    keep = np.isfinite(left) & np.isfinite(right)
+    left, right = left[keep], right[keep]
+    point = spearman(left, right)
+    if len(left) < 3:
+        return point, float("nan"), float("nan")
+    rng = np.random.default_rng(int(seed))
+    draws = []
+    for _ in range(int(samples)):
+        indices = rng.integers(0, len(left), size=len(left))
+        value = spearman(left[indices], right[indices])
+        if math.isfinite(value):
+            draws.append(value)
+    if not draws:
+        return point, float("nan"), float("nan")
+    lower, upper = np.quantile(draws, [0.025, 0.975])
+    return point, float(lower), float(upper)
+
+
+def build_capacity_linkage_tables(
+    cell_rows: Sequence[Mapping[str, Any]], cfg: AnalysisConfig
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    grouped: dict[tuple[str, int, int], list[Mapping[str, Any]]] = defaultdict(list)
+    for row in cell_rows:
+        grouped[(str(row["model"]), int(row["N"]), int(row["seed"]))].append(row)
+    cells: list[dict[str, Any]] = []
+    for (model, records, seed), rows in grouped.items():
+        address = next((
+            row for row in rows
+            if row["intervention"] == "address_different_answer"
+            and int(row["layer"]) == 1
+        ), None)
+        payload = [row for row in rows if row["intervention"] == "target_payload"]
+        if address is None or not payload:
+            continue
+        route = sum(float(row["route_mass"]) for row in payload)
+        message = sum(float(row["message_mass"]) for row in payload)
+        exemplar = rows[0]
+        cells.append({
+            "model": model,
+            "N": records,
+            "seed": seed,
+            "selected": bool(exemplar["selected"]),
+            "heldout_accuracy": float(exemplar["heldout_accuracy"]),
+            "heldout_loss": float(exemplar["heldout_loss"]),
+            "solved": float(exemplar["heldout_accuracy"]) >= cfg.solved_accuracy,
+            "address_profile_movement": float(address["retrieval_attention_profile_moved"]),
+            "address_retrieval_route": float(address["retrieval_route"]),
+            "address_routing_share": float(address["routing_share"]),
+            "payload_message_share": message / max(route + message, EPS),
+        })
+    metrics = (
+        "address_profile_movement",
+        "address_retrieval_route",
+        "address_routing_share",
+        "payload_message_share",
+    )
+    stats: list[dict[str, Any]] = []
+    for sample in ("all", "solved", "failed"):
+        for model in cfg.models:
+            model_rows = [
+                row for row in cells
+                if row["model"] == model
+                and (
+                    sample == "all"
+                    or (sample == "solved" and bool(row["solved"]))
+                    or (sample == "failed" and not bool(row["solved"]))
+                )
+            ]
+            performance = [-float(row["heldout_loss"]) for row in model_rows]
+            for metric in metrics:
+                rho, lower, upper = bootstrap_spearman_interval(
+                    [float(row[metric]) for row in model_rows],
+                    performance,
+                    samples=cfg.bootstrap_samples,
+                    seed=cfg.analysis_seed + MODEL_ORDER.index(model) * 59 + metrics.index(metric),
+                )
+                stats.append({
+                    "sample": sample,
+                    "model": model,
+                    "metric": metric,
+                    "checkpoint_cells": len(model_rows),
+                    "rho_with_negative_heldout_loss": rho,
+                    "ci_lower": lower,
+                    "ci_upper": upper,
+                })
+    transitions: list[dict[str, Any]] = []
+    for model in cfg.models:
+        trajectory = sorted(
+            [row for row in cells if row["model"] == model and bool(row["selected"])],
+            key=lambda row: int(row["N"]),
+        )
+        first_failed = next(
+            (index for index, row in enumerate(trajectory) if not bool(row["solved"])),
+            None,
+        )
+        if first_failed is None or first_failed == 0:
+            continue
+        before, after = trajectory[first_failed - 1], trajectory[first_failed]
+        transition = {
+            "model": model,
+            "last_solved_N": int(before["N"]),
+            "first_failed_N": int(after["N"]),
+        }
+        for metric in metrics:
+            transition[f"last_solved_{metric}"] = float(before[metric])
+            transition[f"first_failed_{metric}"] = float(after[metric])
+            transition[f"change_{metric}"] = float(after[metric]) - float(before[metric])
+        transitions.append(transition)
+    return cells, stats, transitions
+
+
+def build_followup_statistical_tables(
+    metric_tables: Mapping[str, Sequence[Mapping[str, Any]]],
+    causal_tables: Mapping[str, Sequence[Mapping[str, Any]]],
+    followup_tables: Mapping[str, Sequence[Mapping[str, Any]]],
+    cfg: AnalysisConfig,
+) -> dict[str, list[dict[str, Any]]]:
+    curve_cells, curve_summary = build_ablation_curve_summary(followup_tables["curve"], cfg)
+    faith_cells, faith_summary, faith_contrasts = build_attention_faithfulness_tables(
+        metric_tables["heads"], cfg
+    )
+    support_cells, support_summary = build_support_causal_table(
+        causal_tables["patching"], cfg
+    )
+    interaction_cells, interaction_summary = build_family_interaction_tables(
+        followup_tables, cfg
+    )
+    capacity_cells, capacity_stats, capacity_transitions = build_capacity_linkage_tables(
+        metric_tables["cells"], cfg
+    )
+    tables = {
+        "ablation_curve_cells": curve_cells,
+        "ablation_curve_summary": curve_summary,
+        "attention_faithfulness_cells": faith_cells,
+        "attention_faithfulness_summary": faith_summary,
+        "attention_faithfulness_contrasts": faith_contrasts,
+        "support_causal_cells": support_cells,
+        "support_causal_summary": support_summary,
+        "family_interaction_cells": interaction_cells,
+        "family_interaction_summary": interaction_summary,
+        "capacity_linkage_cells": capacity_cells,
+        "capacity_linkage_stats": capacity_stats,
+        "capacity_transitions": capacity_transitions,
+    }
+    table_dir = analysis_root(cfg) / "tables"
+    for name, rows in tables.items():
+        write_csv(table_dir / f"{name}.csv", rows)
+    return tables
+
+
 def configure_plots() -> None:
     import matplotlib as mpl
 
@@ -2521,7 +3705,7 @@ def _model_label(model: str) -> str:
 
 
 def _seed_fillstyle(seed: int) -> str:
-    return ("none", "left", "full")[int(seed) % 3]
+    return ("none", "left", "right", "bottom", "full")[int(seed) % 5]
 
 
 def _encoding_handles(
@@ -2531,6 +3715,7 @@ def _encoding_handles(
     layers: bool = False,
     records: bool = False,
     seeds: bool = False,
+    seed_values: Sequence[int] | None = None,
 ) -> list[Any]:
     from matplotlib.lines import Line2D
 
@@ -2560,6 +3745,9 @@ def _encoding_handles(
             for value in cfg.ns
         ])
     if seeds:
+        displayed_seeds = tuple(
+            sorted(set(map(int, seed_values if seed_values is not None else cfg.seeds)))
+        )
         handles.extend([
             Line2D(
                 [0], [0], color="#555555", marker="o", lw=0, markersize=6,
@@ -2567,7 +3755,7 @@ def _encoding_handles(
                 fillstyle=_seed_fillstyle(seed),
                 label=str(seed),
             )
-            for seed in cfg.seeds
+            for seed in displayed_seeds
         ])
     return handles
 
@@ -2578,6 +3766,7 @@ def plot_capacity(
     import matplotlib.pyplot as plt
 
     fig, axis = plt.subplots(figsize=(7.0, 4.9))
+    cell_seed_counts = []
     for model in cfg.models:
         means, errors = [], []
         for records in cfg.ns:
@@ -2586,6 +3775,7 @@ def plot_capacity(
                 if row["model"] == model and int(row["N"]) == records
             ]
             values = [float(row["heldout_accuracy"]) for row in rows]
+            cell_seed_counts.append(len(values))
             mean, error = mean_ci(values)
             means.append(mean)
             errors.append(error)
@@ -2605,9 +3795,15 @@ def plot_capacity(
     axis.set_xlabel("Number of records, $N$")
     axis.set_ylabel("Held-out recall accuracy")
     axis.set_title("NAR recall accuracy", loc="left", pad=24)
+    seed_count_text = (
+        str(cell_seed_counts[0])
+        if min(cell_seed_counts) == max(cell_seed_counts)
+        else f"{min(cell_seed_counts)}–{max(cell_seed_counts)}"
+    )
     axis.text(
         0.0, 1.015,
-        f"Width $d={cfg.analysis_width}$; mean and 95% CI across {len(cfg.seeds)} seeds; "
+        f"Width $d={cfg.analysis_width}$; mean and 95% CI across available seeds "
+        f"(n={seed_count_text} per cell); "
         "$N$ records correspond to $N+3$ graph nodes",
         transform=axis.transAxes, ha="left", va="bottom", fontsize=9.5,
         color="#555555",
@@ -2632,6 +3828,7 @@ def plot_specialisation_context(
     import matplotlib.pyplot as plt
 
     selected = list(rows)
+    available_seeds = sorted({int(row["seed"]) for row in selected})
     fig, axes = plt.subplots(
         2, len(cfg.models), figsize=(5.15 * len(cfg.models), 8.7),
         sharex="row", sharey="row",
@@ -2642,7 +3839,7 @@ def plot_specialisation_context(
         for layer in (0, 1):
             layer_rows = [row for row in model_rows if int(row["layer"]) == layer]
             for records in cfg.ns:
-                for seed in cfg.seeds:
+                for seed in available_seeds:
                     points = [
                         row for row in layer_rows
                         if int(row["N"]) == records and int(row["seed"]) == seed
@@ -2697,8 +3894,9 @@ def plot_specialisation_context(
         loc="upper center", bbox_to_anchor=(0.52, 0.925), ncol=len(cfg.ns),
     )
     fig.legend(
-        handles=_encoding_handles(cfg, seeds=True), title="Fill: seed",
-        loc="upper right", bbox_to_anchor=(0.955, 0.925), ncol=len(cfg.seeds),
+        handles=_encoding_handles(cfg, seeds=True, seed_values=available_seeds),
+        title="Fill: seed", loc="upper right", bbox_to_anchor=(0.955, 0.925),
+        ncol=max(1, len(available_seeds)),
     )
     fig.subplots_adjust(top=0.78, bottom=0.09, left=0.07, right=0.985, hspace=0.38, wspace=0.20)
     save_figure(fig, cfg, "02_specialisation_context")
@@ -3141,10 +4339,448 @@ def plot_causal_validation(
     plt.close(fig)
 
 
+def _error_from_interval(row: Mapping[str, Any], value_key: str) -> np.ndarray:
+    value = float(row[value_key])
+    lower = float(row["ci_lower"])
+    upper = float(row["ci_upper"])
+    return np.asarray([[max(0.0, value - lower)], [max(0.0, upper - value)]])
+
+
+def plot_cumulative_ablation(
+    tables: Mapping[str, Sequence[Mapping[str, Any]]],
+    cfg: AnalysisConfig,
+) -> None:
+    import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
+
+    rows = tables["ablation_curve_summary"]
+    fig, axes = plt.subplots(1, len(cfg.models), figsize=(5.0 * len(cfg.models), 4.7), sharey=True)
+    axes = np.atleast_1d(axes)
+    for column, model in enumerate(cfg.models):
+        axis = axes[column]
+        for records in cfg.ns:
+            for selection, linestyle, marker, alpha in (
+                ("score", "-", N_MARKERS.get(records, "o"), 1.0),
+                ("random", "--", None, 0.72),
+            ):
+                points = sorted(
+                    [
+                        row for row in rows
+                        if row["model"] == model
+                        and int(row["N"]) == records
+                        and row["selection"] == selection
+                    ],
+                    key=lambda row: int(row["k"]),
+                )
+                if not points:
+                    continue
+                axis.plot(
+                    [int(row["k"]) for row in points],
+                    [float(row["accuracy_drop"]) for row in points],
+                    color=N_COLOURS.get(records, "#555555"),
+                    ls=linestyle,
+                    marker=marker,
+                    markersize=5.2,
+                    lw=1.9 if selection == "score" else 1.35,
+                    alpha=alpha,
+                )
+                if selection == "score":
+                    anchor_points = [
+                        row for row in points
+                        if int(row["N"]) in cfg.anchor_ns and int(row["checkpoint_cells"]) > 1
+                    ]
+                    if anchor_points:
+                        axis.errorbar(
+                            [int(row["k"]) for row in anchor_points],
+                            [float(row["accuracy_drop"]) for row in anchor_points],
+                            yerr=np.hstack([
+                                _error_from_interval(row, "accuracy_drop")
+                                for row in anchor_points
+                            ]),
+                            color=N_COLOURS.get(records, "#555555"),
+                            fmt="none", capsize=2.5, lw=0.9,
+                        )
+        axis.set_xscale("log", base=2)
+        ks = sorted({int(row["k"]) for row in rows if row["model"] == model})
+        axis.set_xticks(ks, [str(value) for value in ks])
+        axis.set_xlabel("Number of ablated heads, $k$")
+        axis.axhline(0, color="#777777", lw=0.9)
+        axis.grid(axis="y", alpha=0.14)
+        _panel(axis, chr(ord("A") + column), _model_label(model))
+    axes[0].set_ylabel("Held-out accuracy drop")
+    fig.suptitle(
+        "Cumulative semantic-head ablation",
+        x=0.06, y=0.99, ha="left", fontsize=14, fontweight="semibold",
+    )
+    fig.text(
+        0.06, 0.94,
+        "Heads are ranked on disjoint discovery graphs; controls are nested random rankings "
+        "matched for layer order and clean throughput. Error bars are 95% checkpoint bootstrap intervals.",
+        ha="left", va="top", fontsize=9.3, color="#555555",
+    )
+    n_handles = [
+        Line2D([0], [0], color=N_COLOURS.get(records, "#555555"),
+               marker=N_MARKERS.get(records, "o"), lw=1.8, label=f"N={records}")
+        for records in cfg.ns
+    ]
+    style_handles = [
+        Line2D([0], [0], color="#555555", lw=1.9, label="Score-ranked"),
+        Line2D([0], [0], color="#555555", lw=1.35, ls="--", label="Matched random"),
+    ]
+    fig.legend(handles=n_handles, loc="upper center", bbox_to_anchor=(0.49, 0.895), ncol=len(cfg.ns))
+    fig.legend(handles=style_handles, loc="upper right", bbox_to_anchor=(0.96, 0.895), ncol=1)
+    fig.subplots_adjust(top=0.77, bottom=0.13, left=0.07, right=0.985, wspace=0.18)
+    save_figure(fig, cfg, "06_cumulative_ablation")
+    plt.close(fig)
+
+
+def plot_support_stratified_causality(
+    tables: Mapping[str, Sequence[Mapping[str, Any]]],
+    cfg: AnalysisConfig,
+) -> None:
+    import matplotlib.pyplot as plt
+
+    rows = tables["support_causal_summary"]
+    seed_counts = [int(row["seeds"]) for row in rows if int(row["seeds"]) > 0]
+    seed_count_text = (
+        str(seed_counts[0])
+        if seed_counts and min(seed_counts) == max(seed_counts)
+        else f"{min(seed_counts)}–{max(seed_counts)}" if seed_counts else "0"
+    )
+    panels = (
+        ("address_routing", "Address · routing-component rescue"),
+        ("payload_message", "Payload · message-component rescue"),
+        ("address_interaction", "Address · downstream interaction"),
+        ("payload_interaction", "Payload · downstream interaction"),
+    )
+    fig, axes = plt.subplots(2, 2, figsize=(11.5, 7.6), sharex=True)
+    axes = np.asarray(axes).reshape(-1)
+    for panel, (estimand, title) in enumerate(panels):
+        axis = axes[panel]
+        for model in cfg.models:
+            points = sorted(
+                [row for row in rows if row["estimand"] == estimand and row["model"] == model],
+                key=lambda row: int(row["N"]),
+            )
+            axis.plot(
+                [int(row["N"]) for row in points],
+                [float(row["contrast"]) for row in points],
+                color=MODEL_COLOURS[model], marker=MODEL_MARKERS[model],
+                lw=1.9, markersize=5.7, label=_model_label(model),
+            )
+            for row in points:
+                axis.errorbar(
+                    [int(row["N"])], [float(row["contrast"])],
+                    yerr=_error_from_interval(row, "contrast"),
+                    color=MODEL_COLOURS[model], fmt="none", capsize=2.5, lw=0.9,
+                )
+        axis.axhline(0, color="#777777", lw=0.9)
+        axis.set_xscale("log", base=2)
+        axis.set_xticks(cfg.anchor_ns, [str(value) for value in cfg.anchor_ns])
+        axis.grid(axis="y", alpha=0.14)
+        _panel(axis, chr(ord("A") + panel), title)
+    axes[2].set_xlabel("Number of records, $N$")
+    axes[3].set_xlabel("Number of records, $N$")
+    axes[0].set_ylabel("Selected − matched-random rescue")
+    axes[2].set_ylabel("Selected − matched-random interaction")
+    fig.suptitle(
+        "Causal mechanism effects by graph support",
+        x=0.07, y=0.99, ha="left", fontsize=14, fontweight="semibold",
+    )
+    fig.text(
+        0.07, 0.947,
+        f"Available seed checkpoints at anchor N (n={seed_count_text} per cell); "
+        "graph size is N+3 nodes. "
+        "Intervals bootstrap checkpoint seeds, not individual graphs.",
+        ha="left", va="top", fontsize=9.4, color="#555555",
+    )
+    axes[0].legend(title="Attention support", ncol=1, loc="best")
+    fig.subplots_adjust(top=0.86, bottom=0.09, left=0.09, right=0.98, hspace=0.34, wspace=0.25)
+    save_figure(fig, cfg, "07_support_stratified_causality")
+    plt.close(fig)
+
+
+def plot_attention_faithfulness_inference(
+    tables: Mapping[str, Sequence[Mapping[str, Any]]],
+    cfg: AnalysisConfig,
+) -> None:
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Patch
+
+    summary = tables["attention_faithfulness_summary"]
+    contrasts = tables["attention_faithfulness_contrasts"]
+    fig, axes = plt.subplots(1, 3, figsize=(13.0, 4.5), sharey=True)
+    intervention_specs = (
+        ("target_payload", "Payload", LAYER_COLOURS[0]),
+        ("address_different_answer", "Address", LAYER_COLOURS[1]),
+    )
+    positions = np.arange(len(cfg.models))
+    for panel, measure in enumerate(("clean_attention", "attention_response")):
+        axis = axes[panel]
+        for offset, (intervention, _label, colour) in zip(
+            (-0.14, 0.14), intervention_specs
+        ):
+            points = [
+                next(
+                    row for row in summary
+                    if row["model"] == model
+                    and row["sample"] == "solved"
+                    and row["measure"] == measure
+                    and row["intervention"] == intervention
+                )
+                for model in cfg.models
+            ]
+            axis.errorbar(
+                positions + offset,
+                [float(row["rho"]) for row in points],
+                yerr=np.hstack([_error_from_interval(row, "rho") for row in points]),
+                color=colour, marker="o", ls="none", markersize=6.5,
+                capsize=3, lw=1.1,
+            )
+        axis.set_xticks(positions, [_model_label(model) for model in cfg.models])
+        axis.axhline(0, color="#777777", lw=0.9)
+        axis.grid(axis="y", alpha=0.14)
+        _panel(
+            axis,
+            chr(ord("A") + panel),
+            "Clean attention allocation" if panel == 0 else "Intervention attention response",
+        )
+    contrast_points = [
+        next(
+            row for row in contrasts
+            if row["model"] == model
+            and row["sample"] == "solved"
+            and row["measure"] == "attention_response"
+        )
+        for model in cfg.models
+    ]
+    axes[2].errorbar(
+        positions,
+        [float(row["rho_difference"]) for row in contrast_points],
+        yerr=np.hstack([_error_from_interval(row, "rho_difference") for row in contrast_points]),
+        color="#555555", marker="o", ls="none", markersize=6.5,
+        capsize=3, lw=1.1,
+    )
+    axes[2].set_xticks(positions, [_model_label(model) for model in cfg.models])
+    axes[2].axhline(0, color="#777777", lw=0.9)
+    axes[2].grid(axis="y", alpha=0.14)
+    _panel(axes[2], "C", "Address–payload response contrast")
+    axes[0].set_ylabel(r"Layer-adjusted head-rank correlation, $\rho$")
+    fig.suptitle(
+        "Attention faithfulness across retrieval mechanisms",
+        x=0.065, y=0.99, ha="left", fontsize=14, fontweight="semibold",
+    )
+    fig.text(
+        0.065, 0.94,
+        "Solved checkpoints only. Spearman correlations are computed within checkpoint and layer, "
+        "then averaged; intervals bootstrap checkpoint cells across N and seeds.",
+        ha="left", va="top", fontsize=9.3, color="#555555",
+    )
+    fig.legend(
+        handles=[Patch(facecolor=colour, label=label) for _key, label, colour in intervention_specs],
+        loc="upper right", bbox_to_anchor=(0.96, 0.90), ncol=2,
+    )
+    fig.subplots_adjust(top=0.78, bottom=0.14, left=0.075, right=0.985, wspace=0.20)
+    save_figure(fig, cfg, "08_attention_faithfulness_inference")
+    plt.close(fig)
+
+
+def plot_family_overlap_and_interaction(
+    followups: Mapping[str, Sequence[Mapping[str, Any]]],
+    tables: Mapping[str, Sequence[Mapping[str, Any]]],
+    cfg: AnalysisConfig,
+) -> None:
+    import matplotlib.pyplot as plt
+
+    overlap = followups["family_overlap"]
+    summary = tables["family_interaction_summary"]
+    panels = (
+        ("jaccard", "Routing–message head overlap"),
+        ("joint_excess", "Joint family-ablation excess"),
+        ("address_different_answer_component_interaction", "Address component interaction"),
+        ("target_payload_component_interaction", "Payload component interaction"),
+    )
+    fig, axes = plt.subplots(2, 2, figsize=(11.5, 7.5), sharex=True)
+    axes = np.asarray(axes).reshape(-1)
+    for panel, (metric, title) in enumerate(panels):
+        axis = axes[panel]
+        for model in cfg.models:
+            if metric == "jaccard":
+                points = []
+                for records in cfg.ns:
+                    values = [
+                        float(row["jaccard"])
+                        for row in overlap
+                        if row["model"] == model and int(row["N"]) == records
+                    ]
+                    mean, lower, upper = bootstrap_mean_interval(
+                        values,
+                        samples=cfg.bootstrap_samples,
+                        seed=cfg.analysis_seed + records * 61 + MODEL_ORDER.index(model),
+                    )
+                    points.append({
+                        "N": records, "value": mean,
+                        "ci_lower": lower, "ci_upper": upper,
+                    })
+            else:
+                points = [
+                    {**row}
+                    for row in summary
+                    if row["model"] == model and row["metric"] == metric
+                    and math.isfinite(float(row["value"]))
+                ]
+            points = sorted(points, key=lambda row: int(row["N"]))
+            axis.plot(
+                [int(row["N"]) for row in points],
+                [float(row["value"]) for row in points],
+                color=MODEL_COLOURS[model], marker=MODEL_MARKERS[model],
+                lw=1.9, markersize=5.7, label=_model_label(model),
+            )
+            for row in points:
+                axis.errorbar(
+                    [int(row["N"])], [float(row["value"])],
+                    yerr=_error_from_interval(row, "value"),
+                    color=MODEL_COLOURS[model], fmt="none", capsize=2.5, lw=0.9,
+                )
+        axis.set_xscale("log", base=2)
+        axis.set_xticks(cfg.ns, [str(value) for value in cfg.ns])
+        axis.grid(axis="y", alpha=0.14)
+        if panel:
+            axis.axhline(0, color="#777777", lw=0.9)
+        _panel(axis, chr(ord("A") + panel), title)
+    axes[0].set_ylabel("Jaccard overlap")
+    axes[2].set_ylabel("Selected − matched-random effect")
+    axes[2].set_xlabel("Number of records, $N$")
+    axes[3].set_xlabel("Number of records, $N$")
+    fig.suptitle(
+        "Routing–message family overlap and interaction",
+        x=0.07, y=0.99, ha="left", fontsize=14, fontweight="semibold",
+    )
+    fig.text(
+        0.07, 0.947,
+        "Joint ablation uses overlap-corrected excess: union − routing − message + overlap. "
+        "Component interactions use finite routing/message hybrid patches.",
+        ha="left", va="top", fontsize=9.3, color="#555555",
+    )
+    axes[0].legend(title="Attention support", loc="best")
+    fig.subplots_adjust(top=0.85, bottom=0.09, left=0.09, right=0.98, hspace=0.34, wspace=0.25)
+    save_figure(fig, cfg, "09_family_overlap_interaction")
+    plt.close(fig)
+
+
+def plot_capacity_linkage(
+    tables: Mapping[str, Sequence[Mapping[str, Any]]],
+    cfg: AnalysisConfig,
+) -> None:
+    import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
+
+    cells = tables["capacity_linkage_cells"]
+    stats = tables["capacity_linkage_stats"]
+    available_seeds = sorted({int(row["seed"]) for row in cells})
+    metrics = (
+        ("address_profile_movement", "Within-record routing change"),
+        ("address_retrieval_route", "Address-routing contribution"),
+    )
+    fig, axes = plt.subplots(2, len(cfg.models), figsize=(5.0 * len(cfg.models), 8.0), sharey="row")
+    axes = np.asarray(axes).reshape(2, len(cfg.models))
+    for row_index, (metric, xlabel) in enumerate(metrics):
+        for column, model in enumerate(cfg.models):
+            axis = axes[row_index, column]
+            points = [row for row in cells if row["model"] == model]
+            for point in points:
+                seed = int(point["seed"])
+                records = int(point["N"])
+                axis.plot(
+                    [float(point[metric])],
+                    [max(float(point["heldout_loss"]), 1.0e-8)],
+                    marker=N_MARKERS.get(records, "o"), linestyle="none",
+                    markerfacecolor=N_COLOURS.get(records, "#555555"),
+                    markerfacecoloralt="white",
+                    markeredgecolor=N_COLOURS.get(records, "#555555"),
+                    fillstyle=_seed_fillstyle(seed), markersize=6.4,
+                )
+                if not bool(point["solved"]):
+                    axis.plot(
+                        [float(point[metric])],
+                        [max(float(point["heldout_loss"]), 1.0e-8)],
+                        marker="x", linestyle="none", color="#333333",
+                        markersize=5.4, markeredgewidth=1.0,
+                    )
+            trajectory = sorted(
+                [point for point in points if bool(point["selected"])],
+                key=lambda point: int(point["N"]),
+            )
+            axis.plot(
+                [float(point[metric]) for point in trajectory],
+                [max(float(point["heldout_loss"]), 1.0e-8) for point in trajectory],
+                color="#777777", lw=1.0, alpha=0.55, zorder=0,
+            )
+            stat = next(
+                row for row in stats
+                if row["model"] == model
+                and row["metric"] == metric
+                and row["sample"] == "all"
+            )
+            axis.text(
+                0.97, 0.95,
+                rf"$\rho_{{-\mathrm{{loss}}}}={float(stat['rho_with_negative_heldout_loss']):.2f}$",
+                transform=axis.transAxes, ha="right", va="top", fontsize=9.2,
+                color="#555555",
+            )
+            axis.set_yscale("log")
+            axis.set_xlabel(xlabel)
+            axis.grid(axis="y", alpha=0.14)
+            if column == 0:
+                axis.set_ylabel("Held-out cross-entropy")
+            _panel(
+                axis,
+                chr(ord("A") + row_index * len(cfg.models) + column),
+                _model_label(model),
+            )
+    fig.suptitle(
+        "Retrieval mechanism and NAR capacity",
+        x=0.055, y=0.995, ha="left", fontsize=14, fontweight="semibold",
+    )
+    fig.text(
+        0.055, 0.955,
+        "Each point is a checkpoint cell; colour/shape gives N and fill gives seed. "
+        "Grey trajectories connect validation-selected checkpoints from N=4 to 64.",
+        ha="left", va="top", fontsize=9.3, color="#555555",
+    )
+    fig.legend(
+        handles=[
+            Line2D(
+                [0], [0], color=N_COLOURS.get(records, "#555555"),
+                marker=N_MARKERS.get(records, "o"), lw=0, markersize=6,
+                label=f"N={records}",
+            )
+            for records in cfg.ns
+        ],
+        loc="upper center", bbox_to_anchor=(0.52, 0.925), ncol=len(cfg.ns),
+    )
+    fig.legend(
+        handles=_encoding_handles(cfg, seeds=True, seed_values=available_seeds),
+        title="Fill: seed", loc="upper right", bbox_to_anchor=(0.965, 0.925),
+        ncol=max(1, len(available_seeds)),
+    )
+    fig.legend(
+        handles=[
+            Line2D([0], [0], color="#333333", marker="x", lw=0,
+                   markersize=6, label=f"Unsolved (<{cfg.solved_accuracy:.2f} accuracy)"),
+        ],
+        loc="upper left", bbox_to_anchor=(0.055, 0.925),
+    )
+    fig.subplots_adjust(top=0.82, bottom=0.09, left=0.07, right=0.985, hspace=0.36, wspace=0.20)
+    save_figure(fig, cfg, "10_capacity_linkage")
+    plt.close(fig)
+
+
 def build_summary(
     manifest: Sequence[Mapping[str, Any]],
     metric_tables: Mapping[str, Sequence[Mapping[str, Any]]],
     causal_tables: Mapping[str, Sequence[Mapping[str, Any]]],
+    statistical_tables: Mapping[str, Sequence[Mapping[str, Any]]],
     cfg: AnalysisConfig,
 ) -> dict[str, Any]:
     heads = _primary(metric_tables["heads"])
@@ -3232,6 +4868,18 @@ def build_summary(
             "status": "supported" if routing_double > 0 and message_double > 0 else "unsupported",
         },
     }
+    attention_payload = {
+        str(row["model"]): float(row["rho"])
+        for row in statistical_tables["attention_faithfulness_summary"]
+        if row["intervention"] == "target_payload"
+        and row["sample"] == "solved"
+        and row["measure"] == "attention_response"
+    }
+    capacity_linkage = {
+        str(row["model"]): float(row["rho_with_negative_heldout_loss"])
+        for row in statistical_tables["capacity_linkage_stats"]
+        if row["metric"] == "address_profile_movement" and row["sample"] == "all"
+    }
     return {
         "analysis_version": ANALYSIS_VERSION,
         "fingerprint": scientific_fingerprint(cfg),
@@ -3239,6 +4887,10 @@ def build_summary(
         "config": asdict(cfg),
         "checkpoint_cells": len(manifest),
         "hypotheses": hypotheses,
+        "followup_estimands": {
+            "payload_attention_response_rho": attention_payload,
+            "address_profile_capacity_rho": capacity_linkage,
+        },
         "artifacts": {
             "tables": sorted(path.name for path in (analysis_root(cfg) / "tables").glob("*.csv")),
             "figures": sorted(path.name for path in (analysis_root(cfg) / "figures").glob("*.png")),
@@ -3250,11 +4902,16 @@ def make_figures_and_tables(
     manifest: Sequence[Mapping[str, Any]],
     metric_caches: Sequence[Mapping[str, Any]],
     causal_caches: Sequence[Mapping[str, Any]],
+    followup_caches: Sequence[Mapping[str, Any]],
     cfg: AnalysisConfig,
 ) -> dict[str, Any]:
     configure_plots()
     metric_tables = build_metric_tables(metric_caches, cfg)
     causal_tables = build_causal_tables(causal_caches, cfg)
+    followup_tables = build_followup_tables(followup_caches, cfg)
+    statistical_tables = build_followup_statistical_tables(
+        metric_tables, causal_tables, followup_tables, cfg
+    )
     plot_capacity(manifest, cfg)
     plot_specialisation_context(metric_tables["context"], cfg)
     plot_attention_and_decomposition(metric_tables["heads"], cfg)
@@ -3262,7 +4919,14 @@ def make_figures_and_tables(
         metric_tables["heads"], metric_tables["cells"], manifest, cfg
     )
     plot_causal_validation(causal_tables, cfg)
-    summary = build_summary(manifest, metric_tables, causal_tables, cfg)
+    plot_cumulative_ablation(statistical_tables, cfg)
+    plot_support_stratified_causality(statistical_tables, cfg)
+    plot_attention_faithfulness_inference(statistical_tables, cfg)
+    plot_family_overlap_and_interaction(followup_tables, statistical_tables, cfg)
+    plot_capacity_linkage(statistical_tables, cfg)
+    summary = build_summary(
+        manifest, metric_tables, causal_tables, statistical_tables, cfg
+    )
     atomic_write_json(analysis_root(cfg) / "summary.json", summary)
     return summary
 
@@ -3272,10 +4936,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--drive-root", default=nar.DEFAULT_DRIVE_ROOT)
     parser.add_argument("--run-name", default="nar_grit_fixed_n_v3")
     parser.add_argument("--analysis-width", type=int, choices=(64, 128), default=64)
-    parser.add_argument("--phase", choices=("all", "index", "analyze", "causal", "figures"), default="all")
+    parser.add_argument(
+        "--phase",
+        choices=("all", "index", "analyze", "causal", "followups", "figures"),
+        default="all",
+    )
     parser.add_argument("--models", default=",".join(MODEL_ORDER))
     parser.add_argument("--ns", default="4,8,16,32,64")
-    parser.add_argument("--seeds", default="0,1,2")
+    parser.add_argument(
+        "--seeds",
+        default="0,1,2,3,4",
+        help="Requested checkpoint seeds; unavailable seed cells are skipped",
+    )
     parser.add_argument("--anchor-ns", default="4,16,64")
     parser.add_argument("--donors", type=int, default=4)
     parser.add_argument("--discovery-graphs", type=int, default=32)
@@ -3283,6 +4955,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--robustness-graphs", type=int, default=48)
     parser.add_argument("--causal-graphs", type=int, default=256)
     parser.add_argument("--causal-donors", type=int, default=4)
+    parser.add_argument("--followup-graphs", type=int, default=128)
+    parser.add_argument("--followup-donors", type=int, default=2)
+    parser.add_argument("--ablation-random-rankings", type=int, default=8)
     parser.add_argument("--family-size", type=int, default=2)
     parser.add_argument("--random-families", type=int, default=8)
     parser.add_argument("--max-batch-nodes", type=int, default=4500)
@@ -3293,6 +4968,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--force-index", action="store_true")
     parser.add_argument("--force-analysis", action="store_true")
     parser.add_argument("--force-causal", action="store_true")
+    parser.add_argument("--force-followups", action="store_true")
     parser.add_argument("--fast-dev-run", action="store_true")
     return parser
 
@@ -3312,6 +4988,9 @@ def config_from_args(args: argparse.Namespace) -> AnalysisConfig:
         "robustness_graphs": args.robustness_graphs,
         "causal_graphs": args.causal_graphs,
         "causal_donors": args.causal_donors,
+        "followup_graphs": args.followup_graphs,
+        "followup_donors": args.followup_donors,
+        "ablation_random_rankings": args.ablation_random_rankings,
         "family_size": args.family_size,
         "random_families": args.random_families,
         "max_batch_nodes": args.max_batch_nodes,
@@ -3331,6 +5010,9 @@ def config_from_args(args: argparse.Namespace) -> AnalysisConfig:
             "robustness_graphs": 2,
             "causal_graphs": 2,
             "causal_donors": 1,
+            "followup_graphs": 2,
+            "followup_donors": 1,
+            "ablation_random_rankings": 2,
             "family_size": 1,
             "random_families": 2,
             "max_batch_nodes": 256,
@@ -3358,11 +5040,12 @@ def main(argv: Sequence[str] | None = None) -> dict[str, Any] | None:
     manifest = build_checkpoint_manifest(cfg, force=args.force_index)
     schedule = analysis_schedule(manifest, cfg)
     causal_rows = causal_schedule(manifest, cfg)
+    followup_rows = followup_schedule(manifest, cfg)
     if args.phase == "index":
         print(f"[done] checkpoint manifest: {root / 'checkpoint_manifest.csv'}", flush=True)
         return None
 
-    if args.phase in ("all", "analyze", "causal"):
+    if args.phase in ("all", "analyze", "causal", "followups"):
         nar.setup_official_grit(Path(cfg.grit_dir), install=not args.skip_install)
         device = resolve_device(cfg.device)
         atomic_write_json(
@@ -3412,14 +5095,30 @@ def main(argv: Sequence[str] | None = None) -> dict[str, Any] | None:
                 force=args.force_causal,
             )
         if args.phase == "causal":
-            print("[done] causal caches complete; run --phase figures", flush=True)
+            print("[done] causal caches complete; run --phase followups", flush=True)
+            return None
+
+    if args.phase in ("all", "followups"):
+        for row in followup_rows:
+            key = (str(row["model"]), int(row["N"]), int(row["seed"]))
+            run_followup_checkpoint(
+                row,
+                metric_by_cell[key],
+                cfg,
+                device=device,
+                force=args.force_followups,
+            )
+        if args.phase == "followups":
+            print("[done] follow-up caches complete; run --phase figures", flush=True)
             return None
 
     causal_caches = load_causal_caches(cfg, causal_rows)
+    followup_caches = load_followup_caches(cfg, followup_rows)
     summary = make_figures_and_tables(
         manifest,
         metric_caches,
         causal_caches,
+        followup_caches,
         cfg,
     )
     print(f"[done] NAR transport mechanisms saved under {root}", flush=True)

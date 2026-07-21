@@ -148,6 +148,10 @@ def semantic_outlier_attention_path(spec_collate, task: str) -> Path:
     return Path(spec_collate) / task / f"semantic_outlier_attention_{task}.npz"
 
 
+def specialist_molecule_examples_path(spec_collate, task: str) -> Path:
+    return Path(spec_collate) / task / f"specialist_molecule_examples_{task}.npz"
+
+
 def spec_stats_path(spec_collate, task: str) -> Path:
     return Path(spec_collate) / task / f"stats_{task}.json"
 
@@ -327,7 +331,27 @@ def load_semantic_outlier_attention(path) -> Optional[dict]:
             if "cache_version" in z else 0
         fingerprint = str(np.asarray(z["score_fingerprint"]).item()) \
             if "score_fingerprint" in z else ""
+        selection_config = (json.loads(str(np.asarray(z["selection_config"]).item()))
+                            if "selection_config" in z else {})
+        has_vnode = bool(np.asarray(z["has_vnode"]).item()) if "has_vnode" in z else False
+        head_channels = (np.asarray(z["head_channels"]).astype(str).tolist()
+                         if "head_channels" in z else ["semantic"] * len(heads))
+        selected = {}
+        for h, head in enumerate(heads):
+            ids_key = f"selected_graph_ids_{h}"
+            if ids_key not in z:
+                continue
+            selected[tuple(map(int, head))] = {
+                "graph_ids": np.asarray(z[ids_key], int).tolist(),
+                "scores": np.asarray(z[f"selected_scores_{h}"], float).tolist(),
+                "candidate_ranks": np.asarray(
+                    z[f"selected_candidate_ranks_{h}"], int).tolist(),
+                "candidate_count": int(np.asarray(
+                    z[f"selected_candidate_count_{h}"]).item()),
+            }
     return {"heads": [tuple(map(int, h)) for h in heads], "molecules": molecules,
+            "selected": selected, "selection_config": selection_config,
+            "has_vnode": has_vnode, "head_channels": head_channels,
             "cache_version": cache_version, "score_fingerprint": fingerprint}
 
 

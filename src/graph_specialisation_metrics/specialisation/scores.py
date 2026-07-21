@@ -121,12 +121,17 @@ def _build_donor_pool(model: GritHeadModel):
 
 def score_model(task, sc: SpecConfig, *, with_attn_routing: bool = True,
                 max_sources: int | None = None, seed: int = 0,
-                response_observer=None) -> dict:
+                response_observer=None, graph_ids_override=None,
+                channels=("semantic", "structural"), loaded_gm=None) -> dict:
     """Return per-head {S_sem, S_str, S_attn_sem} [L,H] for one loaded GRIT checkpoint + diagnostics."""
     import torch
     from torch_geometric.data import Batch
 
-    gm = GritHeadModel(task, sc).load()
+    channels = tuple(channels)
+    if channels not in (("semantic", "structural"), ("semantic",)):
+        raise ValueError("channels must be ('semantic', 'structural') or ('semantic',)")
+    structural_enabled = "structural" in channels
+    gm = loaded_gm if loaded_gm is not None else GritHeadModel(task, sc).load()
     model, device = gm.model, gm.device
     L, H, dh = gm.L, gm.H, gm.dh
     adapter = gm.adapter
@@ -147,8 +152,16 @@ def score_model(task, sc: SpecConfig, *, with_attn_routing: bool = True,
     F_feat = donor_rows.shape[1]
     log(f"[donors] pool={donor_rows.shape[0]} rows over {len(gm.donor_ds)} graphs (F={F_feat}).")
 
-    n_graphs = min(sc.num_graphs, len(gm.eval_ds))
-    graph_ids = np.sort(rng.choice(len(gm.eval_ds), size=n_graphs, replace=False))
+    if graph_ids_override is None:
+        n_graphs = min(sc.num_graphs, len(gm.eval_ds))
+        graph_ids = np.sort(rng.choice(len(gm.eval_ds), size=n_graphs, replace=False))
+    else:
+        graph_ids = np.asarray(graph_ids_override, dtype=np.int64).reshape(-1)
+        if len(np.unique(graph_ids)) != len(graph_ids):
+            raise ValueError("graph_ids_override must contain unique graph indices")
+        if np.any(graph_ids < 0) or np.any(graph_ids >= len(gm.eval_ds)):
+            raise IndexError("graph_ids_override contains an index outside the evaluation split")
+        n_graphs = int(len(graph_ids))
     K = int(sc.donors)
     log(f"[select] {n_graphs} {sc.eval_split} graphs, K={K} donors/partners, "
         f"max_sources={max_sources}.")
@@ -170,6 +183,7 @@ def score_model(task, sc: SpecConfig, *, with_attn_routing: bool = True,
         "config": {k: v for k, v in vars(sc).items()
                    if k not in {"content_adapter", "resume", "checkpoint_every"}},
         "with_attn_routing": bool(with_attn_routing),
+        "channels": list(channels),
         "max_sources": max_sources,
         "seed": int(seed),
     }
@@ -363,6 +377,20 @@ def score_model(task, sc: SpecConfig, *, with_attn_routing: bool = True,
         if graph_attn:
             tot_attn_sources += S
 
+        # A semantic-only pass is used by the descriptive attention-example selector. It applies
+        # the exact established donor-swap estimator above, but avoids the unrelated structural
+        # intervention and therefore does not repeat the full two-channel score experiment.
+        if not structural_enabled:
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+            if ((gi_pos + 1) % max(1, int(sc.checkpoint_every)) == 0
+                    or gi_pos + 1 == n_graphs):
+                _save_score_progress(gi_pos + 1)
+            if (gi_pos + 1) % max(1, n_graphs // 10) == 0 or gi_pos == 0:
+                log(f"[run] graph {gi_pos+1}/{n_graphs} (id={int(gi)}, n={n}; semantic only) | "
+                    f"{time.perf_counter()-t0:.1f}s")
+            continue
+
         # ============================ STRUCTURAL transposition ============================
         # completeness check: a FULL relabel (structure+content) is an isomorphism -> pred invariant
         # (validates that carriage.structural.perturb captures every structure-derived channel).
@@ -464,9 +492,12 @@ def score_model(task, sc: SpecConfig, *, with_attn_routing: bool = True,
     log(f"  [softmax] max|sum_j a_ij - 1|   : {softmax_err:.3e}  (must be ~0)")
     log(f"  [no-op]   max|dwV| same-content : {noop_max:.3e}  (within-batch => ~0; "
         f"floor < {sc.float_noise_tol:.0e})")
-    log(f"  [relabel] full-relabel |dpred|  : {relabel_inv_max:.3e}  (isomorphism => ~0)")
-    log(f"  [mask]    frozen under structural: edge_index unchanged; raw relabel neutralised="
-        f"{mask_frozen_ok} (spec: k-hop mask is architecture, held FIXED)")
+    if structural_enabled:
+        log(f"  [relabel] full-relabel |dpred|  : {relabel_inv_max:.3e}  (isomorphism => ~0)")
+        log(f"  [mask]    frozen under structural: edge_index unchanged; raw relabel neutralised="
+            f"{mask_frozen_ok} (spec: k-hop mask is architecture, held FIXED)")
+    else:
+        log("  [relabel/mask] structural intervention not requested (semantic-only pass)")
     log(f"  S_sem mean/max = {S_sem.mean():.3e}/{S_sem.max():.3e} | "
         f"S_str mean/max = {S_str.mean():.3e}/{S_str.max():.3e}")
     noise_tol = max(sc.tol, sc.float_noise_tol)
@@ -474,7 +505,7 @@ def score_model(task, sc: SpecConfig, *, with_attn_routing: bool = True,
         raise RuntimeError(f"No-op transport |dwV|={noop_max:.3e} > {noise_tol:.1e}: a same-content "
                            f"swap / self-transposition must be ~0 under the within-batch baseline. "
                            f"Wrong row written or model not in eval().")
-    if relabel_inv_max > noise_tol:
+    if structural_enabled and relabel_inv_max > noise_tol:
         raise RuntimeError(f"Full-relabel |dpred|={relabel_inv_max:.3e} > {noise_tol:.1e}: a "
                            f"structure+content relabel is an isomorphism, so pred must be invariant. "
                            f"The transposition is missing a structure-derived channel.")

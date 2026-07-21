@@ -5,6 +5,7 @@ from __future__ import annotations
 import matplotlib
 matplotlib.use("Agg")
 import numpy as np
+from types import SimpleNamespace
 
 from graph_specialisation_metrics.comparison import data as D
 from graph_specialisation_metrics.comparison import plots as P
@@ -21,6 +22,16 @@ def test_top_semantic_and_throughput_null_are_exact_layer_and_disjoint():
     assert len(set(null)) == 4
     assert not set(top) & set(null)
     assert [l for l, _ in null] == [l for l, _ in top]
+
+
+def test_drel_selects_signed_extremes():
+    scores = {
+        "S_sem": np.asarray([[9., 4., 1., .2, .1, .1]]),
+        "S_str": np.asarray([[1., 2., 3., 4., 6., 9.]]),
+    }
+    chosen = S.select_drel_heads(scores, gsem=1., gstr=1., k=2)
+    assert chosen["semantic"] == [(0, 0), (0, 1)]
+    assert chosen["structural"] == [(0, 5), (0, 4)]
 
 
 def test_six_head_control_falls_back_only_after_same_layer_is_exhausted():
@@ -85,12 +96,25 @@ def test_attention_cache_and_plot(tmp_path):
             maps[head] = a / a.sum(axis=1, keepdims=True)
         molecules.append({"graph_id": graph_id, "atom_types": np.arange(n) % 5,
                           "bonds": bonds, "pos": pos, "maps": maps})
-    attn = {"heads": heads, "molecules": molecules}
+    selected = {
+        heads[0]: {"graph_ids": [2, 0, 1], "scores": [.9, .8, .7],
+                   "candidate_ranks": [1, 2, 3], "candidate_count": 32},
+    }
+    selection_config = {"max_nodes": 18, "candidate_graphs": 32,
+                        "score_donors": 32, "examples_per_head": 3,
+                        "analysis_seed": 2718}
+    attn = {"heads": heads, "molecules": molecules, "selected": selected,
+            "selection_config": selection_config, "has_vnode": True,
+            "head_channels": ["semantic"] * 4 + ["structural"] * 4}
     path = D.semantic_outlier_attention_path(tmp_path, "zinc")
     S.save_attention(attn, path, score_hash="abc")
     loaded = D.load_semantic_outlier_attention(path)
     assert loaded["heads"] == heads and len(loaded["molecules"]) == 3
     assert loaded["score_fingerprint"] == "abc"
+    assert loaded["selection_config"] == selection_config
+    assert loaded["selected"][heads[0]]["graph_ids"] == [2, 0, 1]
+    assert loaded["has_vnode"] is True
+    assert loaded["head_channels"][-1] == "structural"
     _, out = P.plot_semantic_outlier_attention(
         loaded, item, tmp_path / "attention.png")
     assert (tmp_path / "attention.png").stat().st_size > 0
@@ -102,6 +126,56 @@ def test_attention_cache_and_plot(tmp_path):
         loaded, item, tuple(item["top_heads"][0]), tmp_path / "head.png",
         scores=scores, gsem=1., gstr=1.)
     assert (tmp_path / "head.png").stat().st_size > 0
+    _, out = P.plot_specialist_head_attention(
+        loaded, heads[0], tmp_path / "specialist.png", channel="semantic",
+        model_label="Dense", scores=scores, gsem=1., gstr=1.)
+    assert (tmp_path / "specialist.png").stat().st_size > 0
+
+
+def test_small_candidate_pool_applies_size_constraint_before_sampling():
+    gm = SimpleNamespace(eval_ds=[SimpleNamespace(num_nodes=n) for n in (9, 21, 12, 18, 30, 15)])
+    selected = S._small_attention_candidates(
+        gm, np.arange(6), max_nodes=18, candidate_graphs=4, seed=2)
+    assert len(selected) == 4
+    assert all(gm.eval_ds[i].num_nodes <= 18 for i in selected)
+
+
+def test_per_graph_semantic_collector_matches_method_a_sum():
+    import torch
+
+    collector = S._PerGraphSemanticCollector()
+    phi = torch.tensor([[[[1.], [2.]], [[3.], [4.]]]])  # [T=1,n=2,H=2,dh=1]
+    delta = torch.tensor([[[[2.], [1.]], [[1.], [-1.]]]])  # [S=1,n=2,H=2,dh=1]
+    collector(channel="semantic", graph_id=7, source_nodes=np.asarray([0]),
+              phi_stack=[phi], donor_averaged_delta=[delta])
+    np.testing.assert_allclose(collector.scores["semantic"][7], [[5., 6.]])
+
+
+def test_attention_capture_omits_virtual_edges_from_atom_matrix():
+    import torch
+    import pytest
+    pytest.importorskip("torch_geometric")
+    from torch_geometric.data import Data
+
+    base = Data(x=torch.arange(3).reshape(-1, 1),
+                edge_index=torch.tensor([[0, 1, 1, 2], [1, 0, 2, 1]]),
+                edge_attr=torch.ones(4, 1, dtype=torch.long), y=torch.tensor([0.]))
+    captured_edges = torch.tensor([[0, 1, 3, 0], [1, 0, 0, 3]])
+    captured_attention = torch.tensor([[.2], [.3], [.4], [.5]])
+
+    class FakeGM:
+        eval_ds = [base]
+        device = torch.device("cpu")
+
+        @staticmethod
+        def capture(_batch, **_):
+            return {"edge_index": captured_edges, "attn": [captured_attention]}
+
+    result = S.attention_viz.collect_attention(FakeGM(), [0], [(0, 0)])
+    A = result["molecules"][0]["maps"][(0, 0)]
+    assert result["has_vnode"] is True and A.shape == (3, 3)
+    assert np.isclose(A[1, 0], .2) and np.isclose(A[0, 1], .3)
+    assert np.count_nonzero(A) == 2
 
 
 def test_structural_cache_path_and_plot(tmp_path):

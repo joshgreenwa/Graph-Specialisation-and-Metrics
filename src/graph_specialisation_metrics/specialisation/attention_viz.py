@@ -51,11 +51,16 @@ def collect_attention(gm, graph_ids, heads, seed=0) -> dict:
         cap = gm.capture(cb, want_grad=False, want_attn=True)
         ei = cap["edge_index"].cpu().numpy()               # [2, E] model support (dense=all pairs)
         src, dest = ei[0], ei[1]
+        real_edges = (src < n) & (dest < n)
+        has_virtual = bool(np.any(~real_edges))
         maps = {}
         for (l, h) in heads:
             a = cap["attn"][l][:, h].cpu().numpy()          # [E]
             A = np.zeros((n, n), dtype=np.float64)
-            A[dest, src] = a                                # A[i, j] = attention i<-j
+            # VNode models append one virtual index. The molecule panel deliberately shows the
+            # real-atom submatrix; its omitted mass is stated in the figure rather than indexing
+            # the virtual row into an n-by-n atom matrix.
+            A[dest[real_edges], src[real_edges]] = a[real_edges]  # A[i,j] = attention i<-j
             maps[(l, h)] = A
         raw_bonds = base.edge_index.cpu().numpy().T         # [2E, 2] directed bond pairs
         raw_types = getattr(base, "edge_attr", None)
@@ -79,6 +84,8 @@ def collect_attention(gm, graph_ids, heads, seed=0) -> dict:
             "atom_types": atom_types,
             "bonds": bonds, "bond_types": bond_types,
             "pos": _spring_layout(n, bonds, seed=seed),
-            "y": float(yv[0].item()), "y_dim": int(yv.numel()), "maps": maps,
+            "y": float(yv[0].item()), "y_dim": int(yv.numel()),
+            "has_virtual": has_virtual, "maps": maps,
         })
-    return {"molecules": mols, "heads": heads}
+    return {"molecules": mols, "heads": heads,
+            "has_vnode": bool(any(m.get("has_virtual", False) for m in mols))}

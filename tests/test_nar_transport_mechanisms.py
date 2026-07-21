@@ -1,19 +1,29 @@
 from types import SimpleNamespace
 
 import torch
+from torch import nn
 
 from graph_specialisation_metrics.synthetic.nar_grit_fixed import Config, make_batch
 from graph_specialisation_metrics.synthetic.nar_transport_mechanisms import (
     AnalysisConfig,
+    _sample_layer_matched_rankings,
+    _seed_fillstyle,
+    ablate_head_sets_by_replica,
     _densify_sparse_record,
     address_replica,
     batched_output_jacobian,
     build_checkpoint_manifest,
+    build_family_interaction_tables,
     build_replica_bundle,
+    cumulative_ablation_ks,
+    causal_schedule,
+    followup_schedule,
     project_components,
+    predict_ablated_head_sets,
     record_permutation_replica,
     retrieval_attention_diagnostics,
     select_causal_families,
+    scientific_fingerprint,
     structural_query_record_replica,
     structural_record_record_noop,
     symmetric_output_decomposition,
@@ -220,6 +230,47 @@ def test_manifest_selection_uses_validation_not_heldout(tmp_path) -> None:
     assert selected[0]["seed"] == 1
 
 
+def test_manifest_skips_missing_requested_seed_cells(tmp_path) -> None:
+    checkpoint_dir = tmp_path / "run" / "checkpoints"
+    checkpoint_dir.mkdir(parents=True)
+    torch.save(
+        {
+            "version": "test",
+            "fingerprint": "seed-0",
+            "official_grit_commit": "test",
+            "model_name": "1hop",
+            "width": 64,
+            "N": 4,
+            "seed": 0,
+            "state_dict": {},
+            "best_validation": {"loss": 0.1, "accuracy": 1.0},
+            "heldout": {"loss": 0.1, "accuracy": 1.0},
+            "parameters": 123,
+        },
+        checkpoint_dir / "1hop_seed_0.pt",
+    )
+    cfg = AnalysisConfig(
+        drive_root=str(tmp_path),
+        run_name="run",
+        analysis_width=64,
+        models=("1hop",),
+        ns=(4,),
+        seeds=(0, 1, 2, 3, 4),
+        anchor_ns=(4,),
+    )
+    rows = build_checkpoint_manifest(cfg, force=True)
+    assert [(row["N"], row["seed"]) for row in rows] == [(4, 0)]
+    assert rows[0]["selected_for_analysis"]
+
+
+def test_seed_scope_does_not_invalidate_per_checkpoint_caches() -> None:
+    three = AnalysisConfig(seeds=(0, 1, 2))
+    five = AnalysisConfig(seeds=(0, 1, 2, 3, 4))
+    assert scientific_fingerprint(three) == "d444b9381bd91339"
+    assert scientific_fingerprint(five) == scientific_fingerprint(three)
+    assert len({_seed_fillstyle(seed) for seed in five.seeds}) == 5
+
+
 def test_causal_family_controls_match_layer_composition() -> None:
     discovery = {
         "head": {
@@ -262,3 +313,112 @@ def test_causal_family_controls_match_layer_composition() -> None:
                 control_counts[layer] = control_counts.get(layer, 0) + 1
             assert control_counts == target_counts
             assert not (set(control) & set(families[name]))
+
+
+def test_cumulative_controls_are_nested_and_layer_matched() -> None:
+    target = [
+        (0, 0), (1, 0), (0, 1), (1, 1),
+        (0, 2), (1, 2), (0, 3), (1, 3),
+    ]
+    throughput = torch.arange(1, 9, dtype=torch.float32).reshape(2, 4)
+    controls = _sample_layer_matched_rankings(
+        target, throughput, count=3, seed=701
+    )
+    assert cumulative_ablation_ks(len(target)) == (1, 2, 4, 8)
+    for control in controls:
+        assert len(control) == len(target)
+        assert [layer for layer, _head in control] == [layer for layer, _head in target]
+        assert len(set(control)) == len(control)
+
+
+def test_family_joint_excess_corrects_selected_overlap() -> None:
+    rows = []
+    values = {"routing": 3.0, "message": 4.0, "overlap": 1.0, "union": 8.0}
+    for family, value in values.items():
+        rows.append({
+            "model": "1hop", "N": 4, "seed": 0,
+            "selection": "score", "family": family,
+            "loss_delta": value,
+        })
+    cfg = AnalysisConfig(
+        models=("1hop",), ns=(4,), seeds=(0,), anchor_ns=(4,),
+        bootstrap_samples=20,
+    )
+    cells, _summary = build_family_interaction_tables(
+        {"family_ablation": rows, "union_patching": []}, cfg
+    )
+    assert len(cells) == 1
+    assert cells[0]["joint_excess"] == 2.0
+
+
+def test_replica_batched_ablation_applies_distinct_head_sets() -> None:
+    class Layer(nn.Module):
+        def forward(self, value):
+            return value.clone(), None
+
+    model = SimpleNamespace(L=2, attention_layers=nn.ModuleList([Layer(), Layer()]))
+    # Two replicas, one graph each, two nodes, three heads and one head channel.
+    value = torch.ones(4, 3, 1)
+    head_sets = [[(0, 0), (1, 1)], [(0, 2)]]
+    with ablate_head_sets_by_replica(
+        model, head_sets, graphs=1, nodes=2
+    ):
+        layer0, _ = model.attention_layers[0](value)
+        layer1, _ = model.attention_layers[1](value)
+    layer0 = layer0.reshape(2, 1, 2, 3, 1)
+    layer1 = layer1.reshape(2, 1, 2, 3, 1)
+    assert torch.all(layer0[0, :, :, 0] == 0)
+    assert torch.all(layer0[1, :, :, 2] == 0)
+    assert torch.all(layer1[0, :, :, 1] == 0)
+    assert torch.all(layer1[1] == 1)
+
+
+def test_followup_schedules_replicate_anchor_seeds() -> None:
+    manifest = []
+    for records in (4, 8):
+        for seed in (0, 1, 2):
+            manifest.append({
+                "model": "1hop", "N": records, "seed": seed,
+                "selected_for_analysis": seed == 0,
+            })
+    cfg = AnalysisConfig(
+        models=("1hop",), ns=(4, 8), seeds=(0, 1, 2), anchor_ns=(4,)
+    )
+    causal = causal_schedule(manifest, cfg)
+    followup = followup_schedule(manifest, cfg)
+    assert {(row["N"], row["seed"]) for row in causal} == {(4, 0), (4, 1), (4, 2)}
+    assert {(row["N"], row["seed"]) for row in followup} == {
+        (4, 0), (4, 1), (4, 2), (8, 0)
+    }
+
+
+def test_batched_ablation_forward_returns_one_block_per_family() -> None:
+    class Layer(nn.Module):
+        def forward(self, value):
+            return value, None
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.L = 2
+            self.H = 3
+            self.attention_layers = nn.ModuleList([Layer(), Layer()])
+
+        def forward(self, batch):
+            graphs, nodes = len(batch), int(batch.x.size(1))
+            value = torch.ones(graphs * nodes, self.H, 1, device=batch.x.device)
+            for layer in self.attention_layers:
+                value, _edge = layer(value)
+            score = value.reshape(graphs, nodes, self.H).sum(dim=(1, 2))
+            return torch.stack([score, -score], dim=-1)
+
+    batch = make_batch(tiny_nar_config(), 2, 4, seed=809)
+    logits = predict_ablated_head_sets(
+        Model(),
+        batch,
+        [[(1, 0)], [(1, 1), (1, 2)]],
+        device=torch.device("cpu"),
+        max_replica_pairs=10_000,
+    )
+    assert logits.shape == (2, 2, 2)
+    assert torch.all(logits[0, :, 0] > logits[1, :, 0])

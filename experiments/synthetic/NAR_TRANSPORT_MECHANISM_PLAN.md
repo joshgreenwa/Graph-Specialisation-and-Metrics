@@ -24,7 +24,9 @@ is produced.
 - **Checkpoint selection:** each saved seed checkpoint is already the lowest-validation-loss
   training step. For primary mechanism plots, select the seed with the lowest validation loss
   within each `(width, support, N)` cell. Never select using held-out performance.
-- **Performance uncertainty:** use all three seeds, not only the selected checkpoint.
+- **Performance uncertainty:** request seeds 0--4 and use every checkpoint present, not only the
+  selected checkpoint. Missing seed cells are recorded and skipped; every support-by-N cell must
+  retain at least one checkpoint.
 - **Mechanism robustness:** repeat the main mechanism estimates for all seeds at
   `N = {4,16,64}`. The validation-selected trajectory over all five `N` values is descriptive;
   the all-seed anchor analysis supplies model-level uncertainty.
@@ -248,9 +250,11 @@ path, experiment version, GRIT commit, width, support, N, seed,
 best validation loss/accuracy, held-out loss/accuracy, parameter count, selected_for_analysis
 ```
 
-Assertions:
+Assertions and flexibility:
 
-- exactly one compatible checkpoint per `(width, support, N, seed)`;
+- at most one compatible checkpoint per requested `(width, support, N, seed)`;
+- at least one compatible checkpoint per `(width, support, N)`; individual missing seeds are
+  recorded in the manifest and skipped;
 - supports are parameter matched within `(width, N)`;
 - selection depends only on validation loss;
 - every selected checkpoint reproduces its stored held-out metric within tolerance.
@@ -322,9 +326,9 @@ replicates.
 
 ### 1. Capacity figure
 
-Held-out accuracy versus `N` for all supports, using all seeds. Show individual seeds and the mean
-with seed-level uncertainty; include chance and mark the validation-selected checkpoint used for
-mechanistic analysis. Widths 64 and 128 are separate panels/files rather than pooled.
+Held-out accuracy versus `N` for all supports, using all seeds. Show the mean with seed-level 95%
+intervals and chance; do not overlay individual seed points. Widths 64 and 128 are separate
+panels/files rather than pooled.
 
 ### 2. Specialisation-context figure
 
@@ -366,15 +370,52 @@ Show:
 The headline test is the intervention-by-patched-component double dissociation, with uncertainty
 clustered over graphs and replicated over training seeds at anchor `N` values.
 
+### 6. Cumulative specialisation-ablation figure
+
+Rank all heads by semantic transport on discovery graphs and ablate nested prefixes
+`k = {1,2,4,8,all}`. Compare with nested random rankings matched for layer sequence and cumulative
+clean throughput. Plot support-specific curves at every `N`; use all seeds at anchor `N` values.
+This estimates causal concentration/redundancy rather than repeating the existing top-family
+necessity result.
+
+### 7. Support-stratified rescue figure
+
+Repeat causal routing/message rescue for every seed at anchor `N`. Report selected-family minus
+matched-random effects separately for support and `N`, with checkpoint-seed rather than graph-level
+uncertainty. Include the downstream factorial interaction.
+
+### 8. Attention-faithfulness inference figure
+
+Compute head-rank correlations within checkpoint and layer, then bootstrap checkpoint cells.
+Estimate clean-attention and intervention-response faithfulness separately for payload/address and
+each support, plus the paired address-minus-payload contrast. This is the formal test of whether
+attention faithfulness depends on graph support and intervention semantics.
+
+### 9. Routing-message overlap and interaction figure
+
+Report routing/message family Jaccard overlap, overlap-corrected joint ablation excess
+`union - routing - message + overlap`, and union-family routing/message hybrid-patch interaction.
+This distinguishes separate head roles, shared heads and nonlinear downstream cooperation.
+
+### 10. Capacity-linkage figure
+
+Replace the ceiling-saturated accuracy-only scatter with held-out cross-entropy against
+address-selective within-record routing and realised address-routing contribution. Preserve the
+validation-selected `N=4 -> 64` trajectories, add all-seed anchor cells, report within-support rank
+associations, and cache the last-solved/first-failed transition table.
+
 ## Sampling, uncertainty and interpretation
 
 - **Discovery:** 32 graphs per selected checkpoint, four alternatives per primary intervention.
 - **Mechanism estimation:** 96 independent graphs per selected checkpoint at every `N`.
 - **All-seed robustness:** 48 independent graphs per checkpoint at `N = {4,16,64}`.
-- **Causal evaluation:** 256 independent graphs per selected checkpoint at anchor `N` values.
+- **Causal evaluation:** 256 independent graphs for every available seed checkpoint at anchor `N`
+  values.
+- **Follow-up evaluation:** 128 independent graphs for the selected checkpoint at every `N` and
+  every available seed at anchor `N`; two intervention donors for union-family patching.
 - Use deterministic, non-overlapping generator seeds recorded in the cache metadata.
-- Use graph-clustered bootstrap intervals conditionally within a checkpoint. For anchor results,
-  use a hierarchical bootstrap over seeds then graphs and show individual seed estimates.
+- Average graphs and donors within checkpoint first. For anchor results, bootstrap checkpoint-seed
+  estimates so individual graphs are never treated as independent training replicates.
 - Heads are nested measurements, not independent experimental replicates. Compute head-level
   correlations within checkpoint, then summarise across checkpoints/seeds.
 - Interpret mechanisms primarily in solved/matched-performance cells. Failure cells describe the
@@ -393,6 +434,7 @@ nar_grit_fixed_n_v3/
       config.json
       metrics/*.pt
       causal/*.pt
+      followups/*.pt
       tables/*.csv
       figures/*.{png,pdf}
 ```
@@ -407,8 +449,10 @@ Efficiency requirements:
    captured `A/m` endpoints; do not run one forward per metric.
 4. Cache graph/head sufficient statistics immediately and release raw activations.
 5. Run finite patching only for frozen selected families and only at anchor `N` values.
-6. Keep `analyze`, `causal` and `figures` as resumable phases with per-cell atomic cache files.
-7. Store analysis and plotting fingerprints separately so changing fonts, bootstrap draws or figure
+6. Batch different cumulative head-ablation sets as replicated graph blocks in one model forward.
+7. Keep `analyze`, `causal`, `followups` and `figures` as resumable phases with per-cell atomic
+   cache files.
+8. Store analysis and follow-up fingerprints separately so changing fonts, bootstrap draws or figure
    layout never invalidates model forwards.
 
 ## Completion gates
@@ -421,6 +465,6 @@ The width-specific experiment is complete only when:
 - `target_payload` decomposed totals reproduce the production semantic score;
 - the exact 1-hop address-selective routing-profile negative control passes;
 - family selection and causal evaluation sets are disjoint;
-- all five figure families, their CSVs and a machine-readable summary are generated;
+- all ten figure families, their CSVs and a machine-readable summary are generated;
 - the summary reports every pre-registered hypothesis as supported, unsupported or inconclusive,
   without changing the hypothesis after held-out inspection.

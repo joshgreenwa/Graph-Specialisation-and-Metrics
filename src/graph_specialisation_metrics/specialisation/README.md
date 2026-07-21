@@ -117,8 +117,15 @@ It also contains a clearly marked **beta raw-channel-outlier test** in
 `semantic_outlier_ablation.py`. This does not alter the score methodology: it consumes cached
 `S_sem/S_str`, ablates each channel's six largest raw-score heads on independent validation
 graphs, and compares them with disjoint layer-nearest throughput controls. Dense semantic static-
-attention examples are descriptive only. See `comparison/README.md` for the estimand and cache
-contract.
+attention examples are descriptive only: for presentation they are chosen per head as the four
+highest donor-swap `S_sem` estimates from a fixed small-molecule validation pool, before any
+attention is inspected. See `comparison/README.md` for the estimand and cache contract.
+
+The cross-model comparison also maintains a separate beta molecule gallery. In every model it
+selects the three highest and three lowest signed `D_rel` heads, then ranks a fixed small-molecule
+validation pool by the matching per-graph intervention score (`S_sem` for semantic heads, `S_str`
+for structural heads). Thus neither the head examples nor their molecules are chosen from visual
+inspection of attention.
 
 ## Verification (asserted every run)
 

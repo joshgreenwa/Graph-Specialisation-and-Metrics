@@ -51,9 +51,11 @@ cached artefact already exists** (`force=True` overrides). It refuses to publish
    importance beyond activity. Reverse score order diagnoses cancellation/redundancy and a
    layer-nearest random band is secondary. When the family-stage graph contract matches, graph
    IDs, clean outputs, labels, and throughput are reused. Dense semantic heads also receive four
-   fixed-molecule attention examples. Each key head gets its own four-row figure containing the
-   indexed molecular topology, attention-key inflow, and raw receiver-by-sender matrix. These are
-   explicitly descriptive rather than causal.
+   head-specific examples: Method-A `S_sem` is estimated on a fixed pool of 32 validation
+   molecules with at most 18 nodes, and each head's top four are selected before attention is
+   inspected. Each key head gets its own four-row figure containing the indexed molecular
+   topology, attention-key inflow, and raw receiver-by-sender matrix. These are explicitly
+   descriptive rather than causal.
 
 Within the expensive carriage and score stages, cumulative hidden snapshots are also written to
 each task directory every four completed graphs. Rerunning an identical request after a Colab
@@ -74,7 +76,8 @@ Then `build_figures` reads the cache and writes the deliverables to `comparison_
 | `fig_DJ_family_ablation_contrasts.png` | (vi-b) full-family specialist-minus-strength-matched-generalist contrasts for functional movement and loss. |
 | `fig_semantic_outlier_ablation.png` | (vii, beta) nested and single-head loss effects for the top six raw-`S_sem` heads versus layer-nearest throughput controls. |
 | `fig_structural_outlier_ablation.png` | (vii-b, beta) identical test for the top six raw-`S_str` heads. |
-| `fig_semantic_outlier_attention_dense_LxHy.png` (six files) | (vii-c, beta) per-head four-molecule rows: indexed topology, attention-key inflow, and raw query-by-key matrix. |
+| `molecule_examples_all/fig_semantic_outlier_attention_dense_LxHy.png` (six files) | (vii-c, beta) retained dense raw-`S_sem` outlier examples: per-head rows for the four highest-`S_sem` molecules in a fixed `n<=18` validation pool. |
+| `molecule_examples_all/*.png` (six per model) | (viii, beta) separate gallery for the three highest-`D_rel` semantic and three lowest-`D_rel` structural heads in every model. Each head gets its own four highest matching-channel-score molecules from a fixed `n<=18` validation pool. |
 | `fig_performance.png` + `performance.json` | (1) val/test bars + table. |
 | `figures_manifest.json`, `run_status.json` | which methods were shown, figure paths, per-stage cache status. |
 

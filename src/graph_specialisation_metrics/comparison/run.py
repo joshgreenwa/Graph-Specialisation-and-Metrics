@@ -31,6 +31,9 @@ deliverables from that cache:
         semantic/structural-score heads against layer-nearest throughput controls, plus dense-only
         per-head topology/inflow/raw-matrix attention figures for semantic heads. These stages are
         independently cached and reuse family validation forwards whenever samples match;
+* (viii)``molecule_examples_all/`` -- separate all-model gallery for the three highest-D_rel
+        semantic and three lowest-D_rel structural heads, with each head shown only on its four
+        highest matching-channel-score molecules from a fixed small validation pool;
 plus ``fig_performance.png`` + ``performance.json`` for the val/test evaluation.
 
 Every figure accepts an ``include`` / ``exclude`` list and ``drop_vnode`` so a final figure can
@@ -302,7 +305,9 @@ def build_figures(tasks: Sequence[str] = _data.DEFAULT_TASKS, *,
             from ..specialisation.semantic_outlier_ablation import (
                 ATTENTION_CACHE_VERSION,
                 CACHE_VERSION as OUTLIER_CACHE_VERSION,
+                SPECIALIST_GALLERY_CACHE_VERSION,
                 score_fingerprint as outlier_score_fingerprint,
+                specialist_score_fingerprint,
             )
             current_outlier_by_channel = {}
             for channel, score_key in (("semantic", "S_sem"), ("structural", "S_str")):
@@ -328,6 +333,9 @@ def build_figures(tasks: Sequence[str] = _data.DEFAULT_TASKS, *,
                     log(f"[figures] refusing a partial {channel}-outlier comparison; missing "
                         f"current caches for {missing_shown_outlier}.")
 
+            # Keep every molecule-level panel together and out of the main figure directory.
+            gallery_dir = out_dir / "molecule_examples_all"
+            gallery_dir.mkdir(parents=True, exist_ok=True)
             dense_sem = current_outlier_by_channel["semantic"].get("zinc")
             if dense_sem and "zinc" in shown_scores:
                 attn = _data.load_semantic_outlier_attention(
@@ -337,11 +345,52 @@ def build_figures(tasks: Sequence[str] = _data.DEFAULT_TASKS, *,
                     for head in np.asarray(dense_sem["top_heads"], int)[:6]:
                         layer, hidx = map(int, head)
                         key = f"semantic_outlier_attention_dense_L{layer}H{hidx}"
+                        target = gallery_dir / f"fig_{key}.png"
+                        legacy = out_dir / f"fig_{key}.png"
+                        if legacy.exists():
+                            # A move preserves the previously rendered file while cleaning the
+                            # old root-level layout; the fresh render below then updates it.
+                            legacy.replace(target)
                         fig, p = _plots.plot_semantic_outlier_head_attention(
-                            attn, dense_sem, (layer, hidx), out_dir / f"fig_{key}.png",
+                            attn, dense_sem, (layer, hidx), target,
                             scores=scores_ref["zinc"], gsem=gsem, gstr=gstr)
-                        figs[key] = p
-                        made.append(fig)
+                        figs[f"molecule_examples_all/{key}"] = p
+                        try:
+                            import matplotlib.pyplot as plt
+                            plt.close(fig)
+                        except Exception:  # noqa: BLE001
+                            pass
+
+            # Separate all-model gallery: do not append these 30 large figures to ``made`` (and
+            # therefore do not flood display=True); paths remain in the manifest under their own
+            # directory. Head order in the cache is semantic D_rel descending, then structural
+            # D_rel ascending, three of each by default.
+            for task in shown_scores:
+                gallery = _data.load_semantic_outlier_attention(
+                    _data.specialist_molecule_examples_path(spec_collate, task))
+                expected = specialist_score_fingerprint(scores_ref[task], gsem, gstr)
+                if not (gallery
+                        and gallery.get("cache_version") == SPECIALIST_GALLERY_CACHE_VERSION
+                        and gallery.get("score_fingerprint") == expected):
+                    log(f"[figures] no current specialist molecule gallery for {task}; skipping.")
+                    continue
+                ranks = {"semantic": 0, "structural": 0}
+                for head, channel in zip(gallery["heads"], gallery["head_channels"]):
+                    channel = str(channel)
+                    ranks[channel] += 1
+                    layer, hidx = map(int, head)
+                    stem = (f"{task}_{channel}_Drel_rank{ranks[channel]}_"
+                            f"L{layer}H{hidx}")
+                    fig, p = _plots.plot_specialist_head_attention(
+                        gallery, (layer, hidx), gallery_dir / f"{stem}.png",
+                        channel=channel, model_label=_data.method_meta(task)["label"],
+                        scores=scores_ref[task], gsem=gsem, gstr=gstr)
+                    figs[f"molecule_examples_all/{stem}"] = p
+                    try:
+                        import matplotlib.pyplot as plt
+                        plt.close(fig)
+                    except Exception:  # noqa: BLE001
+                        pass
     else:
         log("[figures] no specialisation score caches found; skipping the scatter grid.")
 
@@ -460,6 +509,19 @@ def run_all(tasks: Sequence[str] = _data.DEFAULT_TASKS, *,
             semantic_outlier_batch_size: int = 64,
             semantic_outlier_attention_graphs: int = 4,
             semantic_outlier_attention_heads: int = 6,
+            semantic_outlier_attention_max_nodes: int = 18,
+            semantic_outlier_attention_candidates: int = 32,
+            semantic_outlier_attention_score_donors: int = 32,
+            # Separate all-model molecule gallery: top/bottom D_rel heads, with examples ranked
+            # by that molecule's matching channel score before attention is inspected.
+            with_specialist_molecule_examples: bool = True,
+            specialist_molecule_heads_per_channel: int = 3,
+            specialist_molecule_examples_per_head: int = 4,
+            specialist_molecule_max_nodes: int = 18,
+            specialist_molecule_candidates: int = 32,
+            specialist_molecule_score_donors: int = 32,
+            specialist_molecule_analysis_seed: int = 2718,
+            specialist_molecule_eval_split: str = "val",
             spec_kwargs: Optional[dict] = None,   # any other specialisation.colab.run option
             # cache / output
             carriage_collate: str = CARRIAGE_COLLATE,
@@ -508,7 +570,8 @@ def run_all(tasks: Sequence[str] = _data.DEFAULT_TASKS, *,
     status: dict = {"carriage": {}, "specialisation": {},
                     "factorial_family_ablation": {},
                     "semantic_outlier_ablation": {},
-                    "structural_outlier_ablation": {}, "errors": []}
+                    "structural_outlier_ablation": {},
+                    "specialist_molecule_examples": {}, "errors": []}
 
     # ---- carriage: per task, per intervention, cache-skipping --------------------------
     for task in tasks:
@@ -763,9 +826,16 @@ def run_all(tasks: Sequence[str] = _data.DEFAULT_TASKS, *,
                     cached_result = _data.load_semantic_outlier(npz_path)
                     if channel == "semantic" and reusable is None:
                         reusable = cached_result
-                    expected_attention_heads = 2 * min(
+                    expected_attention_heads = min(
                         int(semantic_outlier_attention_heads),
                         len(np.asarray(cached_result["top_heads"])))
+                    attention_selection_config = {
+                        "max_nodes": int(semantic_outlier_attention_max_nodes),
+                        "candidate_graphs": int(semantic_outlier_attention_candidates),
+                        "score_donors": int(semantic_outlier_attention_score_donors),
+                        "examples_per_head": int(semantic_outlier_attention_graphs),
+                        "analysis_seed": int(semantic_outlier_analysis_seed),
+                    }
                     attention_current = False
                     if channel == "semantic" and attention_path.exists():
                         try:
@@ -775,9 +845,14 @@ def run_all(tasks: Sequence[str] = _data.DEFAULT_TASKS, *,
                                 and cached_attn.get("cache_version")
                                 == outlier_mod.ATTENTION_CACHE_VERSION
                                 and cached_attn.get("score_fingerprint") == fingerprint
-                                and len(cached_attn.get("molecules", []))
-                                >= int(semantic_outlier_attention_graphs)
+                                and cached_attn.get("selection_config")
+                                == attention_selection_config
                                 and len(cached_attn.get("heads", []))
+                                >= expected_attention_heads
+                                and all(len(item.get("graph_ids", []))
+                                        >= int(semantic_outlier_attention_graphs)
+                                        for item in cached_attn.get("selected", {}).values())
+                                and len(cached_attn.get("selected", {}))
                                 >= expected_attention_heads)
                         except Exception:  # noqa: BLE001
                             attention_current = False
@@ -789,6 +864,9 @@ def run_all(tasks: Sequence[str] = _data.DEFAULT_TASKS, *,
                                 ckpt=_resolve_ckpt(task),
                                 attention_graphs=semantic_outlier_attention_graphs,
                                 attention_heads=semantic_outlier_attention_heads,
+                                attention_max_nodes=semantic_outlier_attention_max_nodes,
+                                attention_candidates=semantic_outlier_attention_candidates,
+                                attention_score_donors=semantic_outlier_attention_score_donors,
                                 analysis_seed=semantic_outlier_analysis_seed,
                                 eval_split=semantic_outlier_eval_split)
                             outlier_mod.save_attention(
@@ -813,7 +891,11 @@ def run_all(tasks: Sequence[str] = _data.DEFAULT_TASKS, *,
                         batch_size=semantic_outlier_batch_size,
                         attention_graphs=(semantic_outlier_attention_graphs
                                           if channel == "semantic" and task == "zinc" else 0),
-                        attention_heads=semantic_outlier_attention_heads, reusable=reusable)
+                        attention_heads=semantic_outlier_attention_heads,
+                        attention_max_nodes=semantic_outlier_attention_max_nodes,
+                        attention_candidates=semantic_outlier_attention_candidates,
+                        attention_score_donors=semantic_outlier_attention_score_donors,
+                        reusable=reusable)
                     outlier_mod.save_result(
                         result, npz_path, summary_path, task=task,
                         score_hash=fingerprint, config=request)
@@ -828,6 +910,81 @@ def run_all(tasks: Sequence[str] = _data.DEFAULT_TASKS, *,
                     status[status_key][task] = f"error: {exc}"
                     status["errors"].append(f"{channel}-outlier ablation {task}: {exc}")
                     outlier_current[current_key] = False
+
+    # ---- all-model D_rel specialist molecule gallery (separate cache + output dir) -----
+    gallery_current: dict[str, bool] = {}
+    if with_specialist_molecule_examples:
+        from ..specialisation import semantic_outlier_ablation as gallery_mod
+
+        gallery_scores = _data.load_scores_by_task(spec_collate, tasks)
+        gsem, gstr = _plots.global_norms(gallery_scores, tasks)
+        for task in tasks:
+            if task not in gallery_scores:
+                status["specialist_molecule_examples"][task] = "missing-score-cache"
+                gallery_current[task] = False
+                continue
+            path = _data.specialist_molecule_examples_path(spec_collate, task)
+            fingerprint = gallery_mod.specialist_score_fingerprint(
+                gallery_scores[task], gsem, gstr)
+            chosen = gallery_mod.select_drel_heads(
+                gallery_scores[task], gsem, gstr, specialist_molecule_heads_per_channel)
+            heads = chosen["semantic"] + chosen["structural"]
+            head_channels = (["semantic"] * len(chosen["semantic"])
+                             + ["structural"] * len(chosen["structural"]))
+            request = {
+                "max_nodes": int(specialist_molecule_max_nodes),
+                "candidate_graphs": int(specialist_molecule_candidates),
+                "score_donors": int(specialist_molecule_score_donors),
+                "examples_per_head": int(specialist_molecule_examples_per_head),
+                "heads_per_channel": int(specialist_molecule_heads_per_channel),
+                "analysis_seed": int(specialist_molecule_analysis_seed),
+                "eval_split": str(specialist_molecule_eval_split),
+                "heads": [list(h) for h in heads], "head_channels": head_channels,
+            }
+            current = False
+            if path.exists() and not force:
+                try:
+                    cached = _data.load_semantic_outlier_attention(path)
+                    current = bool(
+                        cached
+                        and cached.get("cache_version")
+                        == gallery_mod.SPECIALIST_GALLERY_CACHE_VERSION
+                        and cached.get("score_fingerprint") == fingerprint
+                        and cached.get("selection_config") == request
+                        and len(cached.get("selected", {})) == len(heads)
+                        and all(len(item.get("graph_ids", []))
+                                >= int(specialist_molecule_examples_per_head)
+                                for item in cached.get("selected", {}).values()))
+                except Exception:  # noqa: BLE001
+                    current = False
+            if current:
+                log(f"[cache] specialist molecule gallery {task}: reuse {path}")
+                status["specialist_molecule_examples"][task] = "cached"
+                gallery_current[task] = True
+                continue
+            log(f"[run] specialist molecule gallery {task}: per-molecule semantic/structural "
+                "scores on the small validation pool (no global score/carriage recomputation) ...")
+            try:
+                gallery = gallery_mod.prepare_specialist_gallery(
+                    task, gallery_scores[task], gsem=gsem, gstr=gstr,
+                    collate_dir=spec_collate, ckpt=_resolve_ckpt(task),
+                    heads_per_channel=specialist_molecule_heads_per_channel,
+                    examples_per_head=specialist_molecule_examples_per_head,
+                    max_nodes=specialist_molecule_max_nodes,
+                    candidate_graphs=specialist_molecule_candidates,
+                    score_donors=specialist_molecule_score_donors,
+                    analysis_seed=specialist_molecule_analysis_seed,
+                    eval_split=specialist_molecule_eval_split)
+                gallery_mod.save_attention(
+                    gallery, path, score_hash=fingerprint,
+                    cache_version=gallery_mod.SPECIALIST_GALLERY_CACHE_VERSION)
+                status["specialist_molecule_examples"][task] = "computed"
+                gallery_current[task] = True
+            except Exception as exc:  # noqa: BLE001
+                log(f"[error] specialist molecule gallery {task}: {exc}")
+                status["specialist_molecule_examples"][task] = f"error: {exc}"
+                status["errors"].append(f"specialist molecule gallery {task}: {exc}")
+                gallery_current[task] = False
 
     # ---- completeness gate: never silently publish a two-line "all-model" overlay --------
     missing_carriage = [
@@ -850,10 +1007,13 @@ def run_all(tasks: Sequence[str] = _data.DEFAULT_TASKS, *,
         f"{task}:{channel}" for task in tasks for channel, _ in enabled_outlier_channels
         if not outlier_current.get(f"{task}:{channel}", False)
     ]
+    missing_gallery = ([task for task in tasks if not gallery_current.get(task, False)]
+                       if with_specialist_molecule_examples else [])
     status["missing_carriage"] = missing_carriage
     status["missing_scores"] = missing_scores
     status["missing_factorial_family_ablation"] = missing_family
     status["missing_score_outlier_ablation"] = missing_outlier
+    status["missing_specialist_molecule_examples"] = missing_gallery
     Path(comparison_dir).mkdir(parents=True, exist_ok=True)
     status_path = Path(comparison_dir) / "run_status.json"
     status_path.write_text(json.dumps(status, indent=2), encoding="utf-8")
@@ -862,6 +1022,9 @@ def run_all(tasks: Sequence[str] = _data.DEFAULT_TASKS, *,
             "carriage/specialisation figures will still be built.")
     if missing_outlier:
         log(f"[warn] unresolved optional score-outlier stages: {missing_outlier}; core "
+            "carriage/specialisation figures will still be built.")
+    if missing_gallery:
+        log(f"[warn] unresolved specialist molecule galleries: {missing_gallery}; core "
             "carriage/specialisation figures will still be built.")
     if not allow_partial and (missing_carriage or missing_scores):
         details = "; ".join(status["errors"][-5:]) or "see the per-stage status entries"

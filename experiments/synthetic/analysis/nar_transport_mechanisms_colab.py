@@ -3,7 +3,7 @@
 Paste this complete file into one Google Colab cell and run it. It mounts Drive,
 checks out the repository, installs the package and pinned official GRIT stack,
 loads the validation-selected fixed-N checkpoints, and runs the resumable
-metric, causal and figure phases. Expensive results are cached per checkpoint
+metric, causal, follow-up and figure phases. Expensive results are cached per checkpoint
 under ``transport_mechanisms_v2/d<width>``; rerunning a figures phase never
 loads a model.
 
@@ -89,6 +89,7 @@ from graph_specialisation_metrics.synthetic.nar_transport_mechanisms import main
 # Resumable alternatives after the first run:
 #   CELL_ARGS = ["--analysis-width", "64", "--phase", "analyze"]
 #   CELL_ARGS = ["--analysis-width", "64", "--phase", "causal"]
+#   CELL_ARGS = ["--analysis-width", "64", "--phase", "followups"]
 #   CELL_ARGS = ["--analysis-width", "64", "--phase", "figures", "--skip-install"]
 # Installation/plumbing check (requires the corresponding N=4 seed-0 checkpoints):
 #   CELL_ARGS = ["--analysis-width", "64", "--phase", "all", "--fast-dev-run"]
@@ -108,7 +109,7 @@ CELL_ARGS = [
     "--anchor-ns",
     "4,16,64",
     "--seeds",
-    "0,1,2",
+    "0,1,2,3,4",
     "--donors",
     "4",
     "--discovery-graphs",
@@ -121,6 +122,12 @@ CELL_ARGS = [
     "256",
     "--causal-donors",
     "4",
+    "--followup-graphs",
+    "128",
+    "--followup-donors",
+    "2",
+    "--ablation-random-rankings",
+    "8",
 ]
 
 main(CELL_ARGS)

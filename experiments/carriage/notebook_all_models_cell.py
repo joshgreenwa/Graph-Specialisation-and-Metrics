@@ -23,8 +23,10 @@ and CACHES all of it to Drive, then builds the deliverables:
   (vii) fig_semantic_outlier_ablation.png  -- direct held-out test of each model's largest raw
         semantic-score heads against layer-nearest throughput controls;
         fig_structural_outlier_ablation.png -- the identical test for raw structural-score heads;
-        fig_semantic_outlier_attention_dense_LxHy.png -- one 4-molecule topology/inflow/raw-
-        matrix figure for each of the six dense semantic outliers;
+        molecule_examples_all/fig_semantic_outlier_attention_dense_LxHy.png -- retained dense
+        semantic-outlier examples, using that head's four highest-S_sem small molecules;
+  (viii)model_comparison/molecule_examples_all/ -- for every model, separate four-molecule
+        figures for the three highest-D_rel semantic and three lowest-D_rel structural heads;
   (+)   fig_performance.png                -- val/test bars.
 
 The new 2-hop / VNode checkpoints are auto-registered from carriage.tasks; their Drive dirs are
@@ -108,8 +110,18 @@ run_all(
     semantic_outlier_graphs=256,
     semantic_outlier_top_k=6,       # applied separately to raw S_sem and raw S_str
     semantic_outlier_random_sets=24,
-    semantic_outlier_attention_graphs=4,  # dense only; fixed size-quantile validation examples
-    semantic_outlier_attention_heads=6,   # captures all six targets + their six controls
+    semantic_outlier_attention_graphs=4,  # per head: top four from the small-molecule pool below
+    semantic_outlier_attention_heads=6,   # one topology/inflow/matrix figure per top-S_sem head
+    semantic_outlier_attention_max_nodes=18,  # readability constraint, applied before ranking
+    semantic_outlier_attention_candidates=32, # fixed validation pool satisfying n <= max_nodes
+    semantic_outlier_attention_score_donors=32, # Method-A S_sem estimate used to rank that pool
+    # ---- separate all-model specialised-head molecule gallery ----
+    with_specialist_molecule_examples=True,
+    specialist_molecule_heads_per_channel=3, # top 3 / bottom 3 signed D_rel in every model
+    specialist_molecule_examples_per_head=4,
+    specialist_molecule_max_nodes=18,         # readability filter applied before score ranking
+    specialist_molecule_candidates=32,
+    specialist_molecule_score_donors=32,      # matching S_sem/S_str ranks molecules per head
     # A capped path is retained only when both the global <=1% failure-rate gate and this
     # absolute residual gate pass. 1e-2 admits the observed isolated 5.108e-3 ZINC path while
     # still rejecting a materially inaccurate tail; all failures/residuals remain reported.
