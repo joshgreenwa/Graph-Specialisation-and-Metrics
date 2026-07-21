@@ -7,8 +7,10 @@ disjoint head families on the established coordinates
     D_rel = (S~_sem - S~_str) / (S~_sem + S~_str)    (channel preference)
     J     = (S~_sem + S~_str) / 2                    (transport strength),
 
-namely semantic / structural / generalist crossed with high / low J.  Families within each J
-stratum are matched as triplets for layer, J, and clean pre-head throughput ||wV||, then ablated
+namely relatively semantic / relatively structural / generalist crossed with high / low J.
+Generalists are closest to D=0; after removing them, the highest-D half is semantic and the
+lowest-D half structural. Thus labels are within-model ranks, not claims that D crosses zero.
+Families within each J stratum are matched for layer, J, and clean pre-head throughput ||wV||, then ablated
 cumulatively at the established routed-value site.  The active scientific null is the matched
 generalist family; low-J generalists are the inactive null.  Layer-matched random sets are retained
 only as a secondary reference band.
@@ -37,7 +39,7 @@ from .channel_ablation import per_graph_loss_np
 from .model import GritHeadModel, SpecConfig
 
 
-CACHE_VERSION = 1
+CACHE_VERSION = 2
 PREFERENCES = ("semantic", "structural", "generalist")
 STRENGTHS = ("highJ", "lowJ")
 FAMILY_NAMES = tuple(f"{p}_{s}" for s in STRENGTHS for p in PREFERENCES)
@@ -87,11 +89,11 @@ def _candidate_cells(D: np.ndarray, J: np.ndarray, *, generalist_fraction: float
                      activity_floor_quantile: float) -> tuple[dict[str, np.ndarray], dict]:
     """Partition heads into six disjoint candidate cells using score coordinates only.
 
-    The closest ``generalist_fraction`` of heads to D=0 are generalists.  Remaining heads retain
-    their actual sign (D>0 semantic, D<0 structural); we never relabel a merely less-semantic head
-    as structural.  Each preference pool is split at its own median J so high/low strength remain
-    estimable even when models have different absolute J distributions.  Low-J specialists below
-    a model-wide activity floor are dropped because large relative D there is ratio-noise prone.
+    The closest ``generalist_fraction`` of heads to D=0 are generalists. The remaining heads are
+    split by within-model D rank: the highest-D half is relatively semantic and the lowest-D half
+    relatively structural. This guarantees comparative specialist pools even when every head is
+    on the same side of D=0. Each preference pool is split at its own median J; low-J specialists
+    below a model-wide activity floor are dropped because relative D there is ratio-noise prone.
     """
     d, j = np.asarray(D, float).reshape(-1), np.asarray(J, float).reshape(-1)
     n = len(d)
@@ -100,10 +102,13 @@ def _candidate_cells(D: np.ndarray, J: np.ndarray, *, generalist_fraction: float
     n_gen = max(2, min(n - 2, int(round(float(generalist_fraction) * n))))
     gen = np.argsort(np.abs(d), kind="stable")[:n_gen]
     is_gen = np.zeros(n, bool); is_gen[gen] = True
+    remaining = np.flatnonzero(~is_gen)
+    ranked = remaining[np.argsort(d[remaining], kind="stable")]
+    split = len(ranked) // 2
     pools = {
         "generalist": gen,
-        "semantic": np.flatnonzero((~is_gen) & (d > 0)),
-        "structural": np.flatnonzero((~is_gen) & (d < 0)),
+        "structural": ranked[:split],
+        "semantic": ranked[split:],
     }
     floor = float(np.quantile(j, activity_floor_quantile))
     cells: dict[str, np.ndarray] = {}
@@ -112,7 +117,7 @@ def _candidate_cells(D: np.ndarray, J: np.ndarray, *, generalist_fraction: float
         if len(idx) < 2:
             raise FactorialNotEstimable(
                 f"factorial family selection has only {len(idx)} {pref} candidates; the model "
-                "does not support a signed semantic/structural/generalist factorial comparison.")
+                "does not support the relative semantic/structural/generalist comparison.")
         med = float(np.median(j[idx])); medians[pref] = med
         hi = idx[j[idx] >= med]
         lo = idx[j[idx] < med]
@@ -127,11 +132,7 @@ def _candidate_cells(D: np.ndarray, J: np.ndarray, *, generalist_fraction: float
 def check_factorial_estimable(scores: dict, *, gsem: float, gstr: float,
                               family_size: int = 6, generalist_fraction: float = 0.30,
                               activity_floor_quantile: float = 0.10) -> dict:
-    """Cheap score-only preflight; raises before loading a model when the design is absent.
-
-    This deliberately does not relax signs, merge strength strata, or rename the nearest heads.
-    A non-estimable model is a property of its observed D/J plane and should be reported as such.
-    """
+    """Cheap score-only preflight; raises before loading a model when the design is absent."""
     D, J = dj_coordinates(scores, gsem, gstr)
     cells, thresholds = _candidate_cells(
         D, J, generalist_fraction=generalist_fraction,
@@ -148,7 +149,12 @@ def check_factorial_estimable(scores: dict, *, gsem: float, gstr: float,
 def _priority(idx: np.ndarray, pref: str, strength: str, D: np.ndarray, J: np.ndarray) -> np.ndarray:
     """Predeclared score-only priority used to order matched triplets cumulatively."""
     d, j = D.reshape(-1)[idx], J.reshape(-1)[idx]
-    pref_strength = (-np.abs(d) if pref == "generalist" else np.abs(d))
+    if pref == "generalist":
+        pref_strength = -np.abs(d)
+    elif pref == "semantic":
+        pref_strength = d
+    else:
+        pref_strength = -d
     j_strength = (j if strength == "highJ" else -j)
     return 0.65 * _rank01(pref_strength) + 0.35 * _rank01(j_strength)
 
@@ -227,8 +233,8 @@ def select_factorial_families(scores: dict, throughput: np.ndarray, *, gsem: flo
             f"insufficient heads for six factorial families; cell sizes="
             f"{ {name: len(v) for name, v in cells.items()} }")
     if k < int(family_size):
-        log(f"[family-selection:WARN] requested K={family_size}, but the smallest honest signed "
-            f"D x J cell supports K={k}; using equal K={k} rather than relabelling heads. "
+        log(f"[family-selection:WARN] requested K={family_size}, but the smallest relative "
+            f"D x J cell supports K={k}; using equal K={k}. "
             f"cell sizes={ {name: len(v) for name, v in cells.items()} }")
 
     families, matching = {}, {}

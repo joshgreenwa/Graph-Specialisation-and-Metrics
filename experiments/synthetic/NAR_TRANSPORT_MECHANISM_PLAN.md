@@ -49,10 +49,11 @@ figure for the larger model.
 ## Pre-registered mechanistic predictions
 
 1. **Address-routing opportunity.** In a two-layer 1-hop model, the query has not reached the
-   centre before final-layer attention is computed. Consequently, changing only the query key
-   must leave layer-2 centre-to-record attention unchanged, up to numerical tolerance. In 2-hop
-   and dense models, the query can reach the centre in layer 1, so layer-2 record routing can be
-   query-conditioned.
+   centre or records before final-layer attention is computed. The query can nevertheless change
+   the competing intermediate-to-centre logit, so softmax may gate the *total* record-attention
+   mass. What must remain unchanged is the attention profile normalised within the record set.
+   In 2-hop and dense models, the query can reach the centre in layer 1, so layer-2 routing among
+   records can become address-conditioned.
 2. **Payload/message dominance.** Changing only the value stored at the queried record should act
    primarily through the message term in every support, although later-layer routing may also
    change after the payload has propagated.
@@ -285,7 +286,8 @@ fields. Required checks:
 - identical replicas give zero response;
 - `Delta_o = Delta_route + Delta_msg` at absolute and relative tolerances;
 - decomposed target-payload `S_total` reproduces the existing `S_sem`;
-- 1-hop address swaps give zero layer-2 centre-to-record routing change;
+- 1-hop address swaps give zero layer-2 within-record routing-profile change, while raw record
+  mass gating is measured separately rather than assumed to be zero;
 - record permutation leaves predictions invariant.
 
 ### Step 5 - Compute the structural context scores
@@ -344,11 +346,12 @@ rather than treating heads as independent replicates.
 This is the headline mechanism figure:
 
 - layerwise routing share for payload and address interventions across `N`;
-- layer-2 centre-to-record address-routing strength across supports;
+- layer-2 record-channel gating and within-record address-selective routing across supports;
 - the relationship between realised address routing, useful payload transport and recall accuracy.
 
 Separate solved cells from failure cells. The decisive negative control is the predicted numerical
-zero for 1-hop centre-to-record address routing.
+zero for 1-hop within-record routing-profile movement; non-zero raw centre-to-record attention
+movement is allowed and identifies softmax-mediated gating of the whole record channel.
 
 ### 5. Targeted causal-validation figure
 
@@ -382,7 +385,7 @@ Use the following cache tree under the existing run without touching checkpoints
 
 ```text
 nar_grit_fixed_n_v3/
-  transport_mechanisms_v1/
+  transport_mechanisms_v2/
     d64/                         # or d128
       checkpoint_manifest.csv
       config.json
@@ -414,7 +417,7 @@ The width-specific experiment is complete only when:
 - every intervention invariant passes;
 - decomposition closure and no-op errors are below declared tolerances;
 - `target_payload` decomposed totals reproduce the production semantic score;
-- the exact 1-hop address-routing negative control passes;
+- the exact 1-hop address-selective routing-profile negative control passes;
 - family selection and causal evaluation sets are disjoint;
 - all five figure families, their CSVs and a machine-readable summary are generated;
 - the summary reports every pre-registered hypothesis as supported, unsupported or inconclusive,

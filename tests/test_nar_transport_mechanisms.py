@@ -12,6 +12,7 @@ from graph_specialisation_metrics.synthetic.nar_transport_mechanisms import (
     build_replica_bundle,
     project_components,
     record_permutation_replica,
+    retrieval_attention_diagnostics,
     select_causal_families,
     structural_query_record_replica,
     structural_record_record_noop,
@@ -102,6 +103,32 @@ def test_symmetric_decomposition_closes_and_projection_is_consistent() -> None:
     ).sum(dim=1)
     assert torch.allclose(projected["total"], expected, atol=1.0e-5)
     assert torch.all(projected["alignment"] <= 1.0 + 1.0e-5)
+
+
+def test_record_gate_is_not_mistaken_for_address_selective_routing() -> None:
+    clean = torch.zeros(1, 1, 4, 4)
+    variant = torch.zeros_like(clean)
+    # Receiver 0 allocates a common-scaled mass to record sources 2 and 3.
+    # A changed competing source alters both raw record weights but not their
+    # relative within-record routing profile.
+    clean[0, 0, 0] = torch.tensor([0.5, 0.0, 0.2, 0.3])
+    variant[0, 0, 0] = torch.tensor([0.75, 0.0, 0.1, 0.15])
+    retrieval_mask = torch.zeros(1, 4, 4, dtype=torch.bool)
+    retrieval_mask[0, 0, 2:] = True
+
+    diagnostics = retrieval_attention_diagnostics(
+        clean, variant, retrieval_mask
+    )
+    assert float(diagnostics["raw_moved"]) > 0
+    assert float(diagnostics["gate_moved"]) > 0
+    assert torch.allclose(
+        diagnostics["profile_moved"], torch.zeros(1, 1), atol=1.0e-7
+    )
+
+    selective = variant.clone()
+    selective[0, 0, 0] = torch.tensor([0.7, 0.0, 0.2, 0.1])
+    changed = retrieval_attention_diagnostics(clean, selective, retrieval_mask)
+    assert float(changed["profile_moved"]) > 0
 
 
 def test_sparse_densification_reconstructs_head_output() -> None:

@@ -4,7 +4,7 @@ Paste this complete file into one Google Colab cell and run it. It mounts Drive,
 checks out the repository, installs the package and pinned official GRIT stack,
 loads the validation-selected fixed-N checkpoints, and runs the resumable
 metric, causal and figure phases. Expensive results are cached per checkpoint
-under ``transport_mechanisms_v1/d<width>``; rerunning a figures phase never
+under ``transport_mechanisms_v2/d<width>``; rerunning a figures phase never
 loads a model.
 
 The default analyses completed width-64 checkpoints. Change only

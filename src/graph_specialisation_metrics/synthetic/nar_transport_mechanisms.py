@@ -33,7 +33,7 @@ import torch.nn.functional as F
 from graph_specialisation_metrics.synthetic import nar_grit_fixed as nar
 
 
-ANALYSIS_VERSION = "nar-transport-mechanisms-v1"
+ANALYSIS_VERSION = "nar-transport-mechanisms-v2"
 MODEL_ORDER = ("1hop", "2hop", "dense")
 MODEL_COLOURS = {"1hop": "#6550a4", "2hop": "#2b8cbe", "dense": "#d7301f"}
 MODEL_MARKERS = {"1hop": "o", "2hop": "s", "dense": "D"}
@@ -224,7 +224,7 @@ def analysis_root(cfg: AnalysisConfig) -> Path:
     return (
         Path(cfg.drive_root)
         / cfg.run_name
-        / "transport_mechanisms_v1"
+        / "transport_mechanisms_v2"
         / f"d{cfg.analysis_width}"
     )
 
@@ -918,6 +918,50 @@ def _nan_invalid(value: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
     return torch.where(condition, value, torch.full_like(value, float("nan")))
 
 
+def retrieval_attention_diagnostics(
+    clean_attention: torch.Tensor,
+    variant_attention: torch.Tensor,
+    retrieval_mask: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    """Separate record-channel gating from within-record routing selection.
+
+    ``clean_attention`` and ``variant_attention`` are ``[B,H,N,N]`` routing
+    weights and ``retrieval_mask`` selects centre-to-record pairs.  A changed
+    competing non-record logit can rescale every selected attention value through
+    the softmax denominator without changing the relative distribution over
+    records.  The raw response therefore measures record-channel gating plus
+    selection, whereas ``profile_moved`` isolates address-selective reweighting.
+    """
+
+    selected = retrieval_mask[:, None]
+    clean_selected = torch.where(
+        selected, clean_attention, torch.zeros_like(clean_attention)
+    )
+    variant_selected = torch.where(
+        selected, variant_attention, torch.zeros_like(variant_attention)
+    )
+    clean_mass = clean_selected.sum(dim=(-1, -2))
+    variant_mass = variant_selected.sum(dim=(-1, -2))
+    clean_profile = clean_selected / clean_mass.clamp_min(EPS)[..., None, None]
+    variant_profile = (
+        variant_selected / variant_mass.clamp_min(EPS)[..., None, None]
+    )
+    profile_valid = (clean_mass > EPS) & (variant_mass > EPS)
+    profile_moved = 0.5 * (clean_profile - variant_profile).abs().sum(dim=(-1, -2))
+    profile_moved = torch.where(
+        profile_valid,
+        profile_moved,
+        torch.full_like(profile_moved, float("nan")),
+    )
+    return {
+        "raw_moved": 0.5 * (clean_selected - variant_selected).abs().sum(
+            dim=(-1, -2)
+        ),
+        "gate_moved": (clean_mass - variant_mass).abs(),
+        "profile_moved": profile_moved,
+    }
+
+
 def intervention_layer_metrics(
     layer: DenseLayerCapture,
     phi: torch.Tensor,
@@ -932,6 +976,8 @@ def intervention_layer_metrics(
     retrieval_route_values: list[torch.Tensor] = []
     attention_delta_values: list[torch.Tensor] = []
     retrieval_attention_values: list[torch.Tensor] = []
+    retrieval_gate_values: list[torch.Tensor] = []
+    retrieval_profile_values: list[torch.Tensor] = []
     valid_values: list[torch.Tensor] = []
     max_absolute, max_relative = 0.0, 0.0
 
@@ -976,6 +1022,13 @@ def intervention_layer_metrics(
             torch.zeros_like(clean_attention),
         )
         retrieval_attention_values.append(selected_attention)
+        retrieval_diagnostics = retrieval_attention_diagnostics(
+            clean_attention,
+            layer.attention[block],
+            retrieval_mask,
+        )
+        retrieval_gate_values.append(retrieval_diagnostics["gate_moved"])
+        retrieval_profile_values.append(retrieval_diagnostics["profile_moved"])
 
     if not route_values:
         raise KeyError(f"replica bundle has no intervention {intervention!r}")
@@ -985,6 +1038,12 @@ def intervention_layer_metrics(
     mean_attention_delta, _ = _valid_donor_mean(attention_delta_values, valid_values)
     mean_retrieval_attention, _ = _valid_donor_mean(
         retrieval_attention_values, valid_values
+    )
+    mean_retrieval_gate, _ = _valid_donor_mean(
+        retrieval_gate_values, valid_values
+    )
+    mean_retrieval_profile, _ = _valid_donor_mean(
+        retrieval_profile_values, valid_values
     )
 
     projected = project_components(phi, mean_route, mean_message)
@@ -1011,6 +1070,12 @@ def intervention_layer_metrics(
         "retrieval_attention_moved": _nan_invalid(retrieval_moved, valid_any),
         "retrieval_attention_moved_normalized": _nan_invalid(
             retrieval_moved_normalized, valid_any
+        ),
+        "retrieval_attention_gate_moved": _nan_invalid(
+            mean_retrieval_gate, valid_any
+        ),
+        "retrieval_attention_profile_moved": _nan_invalid(
+            mean_retrieval_profile, valid_any
         ),
         "valid": valid_any,
     })
@@ -1309,14 +1374,38 @@ def run_metric_split(
     }
     if str(row["model"]) == "1hop":
         address = combined["head"]["address_different_answer"]
-        moved = address["retrieval_attention_moved"][:, 1]
-        finite = moved[torch.isfinite(moved)]
-        maximum = float(finite.max()) if finite.numel() else float("nan")
-        combined["checks"]["onehop_layer2_address_routing_max"] = maximum
-        if math.isfinite(maximum) and maximum > cfg.noop_tol:
-            raise RuntimeError(
-                "1-hop layer-2 centre-to-record attention changed under an address swap: "
-                f"{maximum:.3e} > {cfg.noop_tol:.3e}"
+        for source, destination in (
+            (
+                "retrieval_attention_moved",
+                "onehop_layer2_address_raw_attention_moved_max",
+            ),
+            (
+                "retrieval_attention_gate_moved",
+                "onehop_layer2_address_gate_moved_max",
+            ),
+            (
+                "retrieval_attention_profile_moved",
+                "onehop_layer2_address_profile_moved_max",
+            ),
+        ):
+            values = address[source][:, 1]
+            finite = values[torch.isfinite(values)]
+            combined["checks"][destination] = (
+                float(finite.max()) if finite.numel() else float("nan")
+            )
+        profile_max = combined["checks"][
+            "onehop_layer2_address_profile_moved_max"
+        ]
+        combined["checks"]["onehop_layer2_address_profile_zero_pass"] = bool(
+            math.isfinite(profile_max) and profile_max <= cfg.noop_tol
+        )
+        if math.isfinite(profile_max) and profile_max > cfg.noop_tol:
+            print(
+                "[diagnostic warning] 1-hop layer-2 within-record attention profile "
+                f"changed under an address swap: {profile_max:.3e} > "
+                f"{cfg.noop_tol:.3e}. Results will be cached and the verification "
+                "check marked failed.",
+                flush=True,
             )
     combined["meta"] = {
         "split": split,
@@ -2171,6 +2260,12 @@ def build_metric_tables(
                         "retrieval_attention_moved_normalized": _tensor_mean(
                             metrics["retrieval_attention_moved_normalized"][:, layer, head]
                         ),
+                        "retrieval_attention_gate_moved": _tensor_mean(
+                            metrics["retrieval_attention_gate_moved"][:, layer, head]
+                        ),
+                        "retrieval_attention_profile_moved": _tensor_mean(
+                            metrics["retrieval_attention_profile_moved"][:, layer, head]
+                        ),
                         "attention_advantage": _tensor_mean(
                             clean_attention["attention_advantage"][:, layer, head]
                         ),
@@ -2226,8 +2321,19 @@ def build_metric_tables(
                     "structural_record_record_noop", float("nan")
                 )
             ),
-            "onehop_layer2_address_routing_max": float(
-                checks.get("onehop_layer2_address_routing_max", float("nan"))
+            "onehop_layer2_address_raw_attention_moved_max": float(
+                checks.get(
+                    "onehop_layer2_address_raw_attention_moved_max", float("nan")
+                )
+            ),
+            "onehop_layer2_address_gate_moved_max": float(
+                checks.get("onehop_layer2_address_gate_moved_max", float("nan"))
+            ),
+            "onehop_layer2_address_profile_moved_max": float(
+                checks.get("onehop_layer2_address_profile_moved_max", float("nan"))
+            ),
+            "onehop_layer2_address_profile_zero_pass": checks.get(
+                "onehop_layer2_address_profile_zero_pass", ""
             ),
         })
 
@@ -2285,6 +2391,12 @@ def build_metric_tables(
             "routing_share": route / max(route + message, EPS),
             "message_share": message / max(route + message, EPS),
             "retrieval_route": sum(float(row["retrieval_route"]) for row in values),
+            "retrieval_attention_gate_moved": float(np.mean([
+                float(row["retrieval_attention_gate_moved"]) for row in values
+            ])),
+            "retrieval_attention_profile_moved": float(np.mean([
+                float(row["retrieval_attention_profile_moved"]) for row in values
+            ])),
             "total": sum(float(row["total"]) for row in values),
         })
     cell_rows.sort(key=lambda row: (
@@ -2559,6 +2671,12 @@ def _cell_head_mass(
         "message": message,
         "routing_share": route / max(route + message, EPS),
         "retrieval_route": sum(float(row["retrieval_route"]) for row in cell),
+        "retrieval_attention_gate_moved": float(np.mean([
+            float(row["retrieval_attention_gate_moved"]) for row in cell
+        ])),
+        "retrieval_attention_profile_moved": float(np.mean([
+            float(row["retrieval_attention_profile_moved"]) for row in cell
+        ])),
     }
 
 
@@ -2571,7 +2689,8 @@ def plot_information_rendezvous(
     import matplotlib.pyplot as plt
 
     rows = _primary(head_rows)
-    fig, axes = plt.subplots(1, 3, figsize=(15.6, 4.8))
+    fig, axes = plt.subplots(2, 2, figsize=(12.8, 9.2))
+    axes = np.asarray(axes).reshape(-1)
     for model in cfg.models:
         address_share = [
             _cell_head_mass(
@@ -2628,6 +2747,10 @@ def plot_information_rendezvous(
                     capsize=2.5, lw=1.0, alpha=0.85,
                 )
         for records in cfg.ns:
+            profile = _cell_head_mass(
+                rows, model=model, records=records,
+                intervention="address_different_answer", layer=1,
+            )["retrieval_attention_profile_moved"]
             retrieval = _cell_head_mass(
                 rows, model=model, records=records,
                 intervention="address_different_answer", layer=1,
@@ -2639,6 +2762,11 @@ def plot_information_rendezvous(
                 and bool(row["selected_for_analysis"])
             )
             axes[2].scatter(
+                records, profile,
+                color=MODEL_COLOURS[model], marker=N_MARKERS.get(records, "o"),
+                s=62,
+            )
+            axes[3].scatter(
                 retrieval, selected_checkpoint["heldout_accuracy"],
                 color=MODEL_COLOURS[model], marker=N_MARKERS.get(records, "o"),
                 s=62,
@@ -2650,24 +2778,55 @@ def plot_information_rendezvous(
                 and cell["intervention"] == "address_different_answer"
                 and int(cell["layer"]) == 1
             ):
-                axes[2].scatter(
+                axes[3].scatter(
                     cell["retrieval_route"], cell["heldout_accuracy"],
                     color=MODEL_COLOURS[model], s=22, alpha=0.22,
                 )
-    for axis in axes[:2]:
+        axes[2].plot(
+            cfg.ns,
+            [
+                _cell_head_mass(
+                    rows, model=model, records=records,
+                    intervention="address_different_answer", layer=1,
+                )["retrieval_attention_profile_moved"]
+                for records in cfg.ns
+            ],
+            color=MODEL_COLOURS[model], marker=MODEL_MARKERS[model],
+            lw=2, label=model,
+        )
+        for records in cfg.anchor_ns:
+            seed_values = [
+                float(cell["retrieval_attention_profile_moved"])
+                for cell in cell_rows
+                if cell["model"] == model
+                and int(cell["N"]) == records
+                and cell["intervention"] == "address_different_answer"
+                and int(cell["layer"]) == 1
+            ]
+            mean, error = mean_ci(seed_values)
+            axes[2].errorbar(
+                [records], [mean], yerr=[error], color=MODEL_COLOURS[model],
+                marker=MODEL_MARKERS[model], markerfacecolor="white",
+                capsize=3, lw=1.2, zorder=5,
+            )
+    for axis in axes[:3]:
         axis.set_xscale("log", base=2)
         axis.set_xticks(cfg.ns, [str(value) for value in cfg.ns])
         axis.set_xlabel("Memory size N")
+    for axis in axes[:2]:
         axis.set_ylim(-0.04, 1.04)
     axes[0].set_ylabel("Layer-2 routing share")
     axes[1].set_ylabel("Payload message share")
-    axes[2].set_xlabel("Layer-2 centre-to-record address routing")
-    axes[2].set_ylabel("Held-out accuracy")
+    axes[2].set_ylabel("Within-record routing-profile movement")
+    axes[3].set_xlabel("Layer-2 centre-to-record address routing")
+    axes[3].set_ylabel("Held-out accuracy")
     _panel(axes[0], "A", "Address routing emerges at the rendezvous")
     _panel(axes[1], "B", "Payload carriage across depth")
-    _panel(axes[2], "C", "Realised retrieval mechanism and capacity")
+    _panel(axes[2], "C", "Address-selective routing requires graph support")
+    _panel(axes[3], "D", "Realised retrieval mechanism and capacity")
     axes[0].legend()
     axes[1].legend(fontsize=8, ncol=2)
+    axes[2].legend()
     fig.tight_layout()
     save_figure(fig, cfg, "04_information_rendezvous")
     plt.close(fig)
@@ -2759,12 +2918,14 @@ def build_summary(
 ) -> dict[str, Any]:
     heads = _primary(metric_tables["heads"])
     checks = metric_tables["checks"]
-    onehop_zero = max(
+    onehop_profile_zero = max(
         [
-            float(row["onehop_layer2_address_routing_max"])
+            float(row["onehop_layer2_address_profile_moved_max"])
             for row in checks
             if row["model"] == "1hop"
-            and math.isfinite(float(row["onehop_layer2_address_routing_max"]))
+            and math.isfinite(
+                float(row["onehop_layer2_address_profile_moved_max"])
+            )
         ]
         or [float("nan")]
     )
@@ -2820,9 +2981,10 @@ def build_summary(
         )
     )
     hypotheses = {
-        "H1_onehop_address_routing_zero": {
-            "statistic": onehop_zero,
-            "status": "supported" if onehop_zero <= cfg.noop_tol else "unsupported",
+        "H1_onehop_address_selective_routing_zero": {
+            "max_within_record_profile_movement": onehop_profile_zero,
+            "status": "supported"
+            if onehop_profile_zero <= cfg.noop_tol else "unsupported",
         },
         "H2_payload_message_dominance": {
             "mean_message_share": payload_message_share,

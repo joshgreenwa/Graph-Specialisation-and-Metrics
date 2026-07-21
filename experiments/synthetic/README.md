@@ -49,7 +49,7 @@ contextual semantic/structural and D/J planes; and runs score-selected family ab
 2x2 routing/message patching.
 
 Expensive graph/head tensors are cached per checkpoint under
-`transport_mechanisms_v1/d<width>/metrics/` and causal results under `causal/`. The `figures` phase
+`transport_mechanisms_v2/d<width>/metrics/` and causal results under `causal/`. The `figures` phase
 reads only those caches, so all tables and PNG/PDF figures can be regenerated without loading GRIT.
 Metric and causal graph chunks are also committed atomically as they finish, allowing interrupted
 large-N runs to resume at the next incomplete chunk.

@@ -87,9 +87,10 @@ channel-split ablation figure to validate its causal interpretation.
 
 The score plane is converted into six **disjoint** within-model families:
 `{semantic, structural, generalist} × {high J, low J}`. Generalists are the heads nearest
-`D_rel=0`; specialist labels retain the actual sign of `D_rel` rather than forcing a balanced
-number of semantic/structural heads. Within each `J` stratum, semantic/structural/generalist heads
-are selected as matched triplets for layer, `J`, and clean pre-head `||wV||` throughput. Thus the
+`D_rel=0`; among the remaining heads, the highest-`D_rel` half is relatively semantic and the
+lowest-`D_rel` half relatively structural. These are within-model rankings, so the structural
+family need not have negative absolute `D_rel`. Within each `J` stratum, the three families are
+selected as matched triplets for layer, `J`, and clean pre-head `||wV||` throughput. Thus the
 high-`J` generalist is the active null and the low-`J` generalist the inactive null; uniformly
 random heads appear only as a secondary, exactly layer-count-matched reference band.
 
@@ -97,10 +98,9 @@ Families are selected from cached test-set scores and ablated on independent val
 The two primary outcomes are label-free output movement and signed task-loss change. The cache
 retains per-graph outcomes so all specialist-minus-generalist confidence intervals are paired
 graph bootstraps. High-|D|/low-`J` specialists below an activity floor are excluded because their
-relative selectivity is ratio-noise prone. A model that cannot form at least two matched triplets
-is recorded as **not estimable** and omitted from this optional figure instead of silently
-relabelling weakly semantic heads as structural. That score-geometry verdict does not abort or
-invalidate the complete carriage/specialisation comparison.
+relative selectivity is ratio-noise prone. A model that still cannot form at least two matched
+triplets is recorded as **not estimable** and omitted from this optional figure; that verdict does
+not abort or invalidate the complete carriage/specialisation comparison.
 
 ## VNode note
 
