@@ -314,3 +314,214 @@ three existing `cycle_dual_v2` checkpoints read-only and writes only to
 This cycle task cannot approve non-isomorphic structural donors, multi-source hierarchy,
 production integrated beneficial carriage, or the sensitivity of general conditional-specialist
 discovery. Those remain explicit transfer-stage validations rather than synthetic claims.
+
+## Synthetic mixed-task beta findings
+
+These are validation findings from the three trained `cycle_dual_v2` seeds, not yet production
+methodology decisions. The figures currently retained in `Interesting Outputs From Synthetic`
+support the following conclusions.
+
+### Strong positive findings
+
+- **The independent analyses agree on a semantic/structural double dissociation.** The aggregate
+  task-mode × intervention-factor score matrix is strongly diagonal for every aggregation;
+  D-selected family × intervention-channel patching is diagonal under restore, inject and
+  necessity; and component patching finds semantic specialist families to be message-dominated
+  while structural specialist families are routing-dominated. This convergence across score,
+  causal and mechanism analyses is the central synthetic result.
+- **The task-factor controls are stable across seeds and aggregation choices.** Relative to the
+  off-diagonal task context, matched semantic-factor responses are approximately `2.8–3.8x`
+  stronger and matched structural-factor responses approximately `7.7–8.5x` stronger. Net carrier
+  aggregation modestly sharpens semantic specificity, but does not change the qualitative result.
+- **Selected families retain the task-factor diagonal.** In
+  `beta_fig1c_selected_family_specificity`, every raw-ranked and D-selected semantic, structural and
+  joint role has positive matched-factor enrichment in every seed, with narrow graph-bootstrap
+  intervals. D-selected enrichment is slightly weaker than raw-ranked enrichment: D preserves the
+  control result but does not improve it.
+- **Raw channel scores predict finite causal mediation.** Pooled across layers, median seed
+  correlations between raw score and bidirectional desired-direction patch effect are `0.93`
+  semantic and `0.94` structural. The corresponding within-layer association is weaker, roughly
+  `0.63–0.66`, so layer organisation is a real part of the global relationship but not its whole
+  explanation.
+- **Evoked and balanced strength are strongly causally aligned.** Pooled `J -> causal strength` and
+  `G -> balanced causal response` correlations are approximately `0.94` and `0.97`. Low-J families
+  are correspondingly inert under cumulative ablation.
+- **Causal family effects are bidirectional and necessary.** Semantic families show much stronger
+  effects on semantic than structural events; structural families show the reverse. The interaction
+  is present under clean-to-corrupt restoration, corrupt-to-clean injection and donor-wise
+  zero-ablation necessity, so the result is not rescue-only.
+- **Routing/message decomposition gives a clean mechanism result.** Algebraic reconstruction error
+  is approximately `7.6e-6`; finite component interaction is near zero for the selected families;
+  semantic rescue is almost entirely message-mediated and structural rescue almost entirely
+  routing-mediated across the three seeds.
+- **Sensitivity and coherence are empirically distinct.** Structural-ranked heads have highly
+  carrier-coherent and distance-localised responses, whereas semantic-ranked heads show more
+  cancellation across carriers and broader non-local carriage. This supports retaining both
+  `F_sens` and `F_coh` and the donor/carrier coherence diagnostics.
+
+### Negative findings and constraints
+
+- **Ungated `D_rel` is not a valid general causal-role score.** Its pooled correlation with signed
+  causal channel role is approximately `-0.07`, although the within-layer association is modestly
+  positive (`0.35–0.42`). Near-inert early-layer heads can receive extreme D values because both
+  channel scores are close to zero. The successful D-selected families already impose J/activity
+  and uncertainty gates. The supported claim is therefore **conditional/gated D**, not standalone D.
+- **No aggregation clearly replaces coherent-gross CG.** EG has the best observed top-k stability
+  and small advantages on some ablation and D correlations, but no candidate supplies a decisive
+  held-out causal improvement. Retain CG as the production baseline; keep EG/CN/EN as diagnostic
+  estimands until real-task validation.
+- **Pooled correlations partly reflect layer hierarchy.** Every real-task analysis must report both
+  global and within-layer validity, and should test incremental prediction after controlling for
+  layer and head activity/norm.
+- **The selected-family task-factor figure is not an independent confirmation.** Families are
+  selected using the matched diagonal and the same matched score sample enters the enrichment
+  statistic; its bootstrap conditions on the selected heads. Treat this as an off-diagonal
+  specificity control. Independent held-out patching provides the causal confirmation.
+- **Cross-graph mismatch patches are not a zero-effect control.** Some mismatched activation
+  transplants move the output in the desired direction. Matched effects must be compared directly
+  with mismatch, sham and same-layer strength-matched controls at family level.
+- **Ablation reveals redundancy and task asymmetry.** Family ablation produces large functional
+  logit displacement but much smaller behavioural degradation, especially on the semantic task;
+  structural loss is more fragile and more seed-variable. Functional, loss and task-performance
+  effects must remain separate endpoints.
+- **The synthetic task does not validate topology intervention, general conditional specialists or
+  molecular transfer.** It uses isomorphic cycles and the fixed-support PE/RRWP intervention. A
+  topology donor here would be isomorphic or training-OOD.
+
+## Priority ZINC transfer validation
+
+ZINC is the next decision stage. Its purpose is to test which synthetic findings survive a larger
+model, variable molecular topologies, a regression readout and less cleanly separated computation.
+The task-mode × intervention-factor 2x2 from the mixed synthetic task has no literal analogue on a
+single ZINC target. The transferable primary design is the **selected-family × intervention-channel
+2x2**, evaluated on held-out molecules.
+
+### Priority 1: decision-critical experiments
+
+1. **Intervention validity and comparability.** Run the semantic real-donor intervention and the
+   fixed-support PE/RRWP-payload intervention on identical held-out molecule samples. Add the
+   non-isomorphic matched-topology donor as a separate beta intervention, not as a silent replacement
+   for PE transposition. Match or balance size, atom/bond composition, degree statistics, target and
+   intervention dose; record donor common support and chemistry validity.
+2. **Raw score causal validity.** Compute CG/EG/CN/EN from identical events, then test each raw
+   channel score against bidirectional whole-transport patching and independent channel ablation.
+   Average donors within source, sources within molecule and molecules equally. Report both pooled
+   and within-layer correlations across at least three independently trained seeds.
+3. **Held-out family × channel causal 2x2.** Freeze semantic specialists, structural specialists,
+   high-J/high-G generalists and low-J controls on discovery molecules. On disjoint molecules, run
+   restore, inject and donor-wise necessity for both intervention channels. Compare matched effects
+   with sham, cross-graph mismatch, same-layer J-matched generalists and inactive heads. This is the
+   main transfer test of specialisation.
+4. **D/J/G validation.** Plot ungated and gated D against signed causal role, explicitly stratified
+   by layer and activity. Require D sign/role replication after a J/SNR floor and uncertainty gate.
+   Test J and G against their intended causal magnitudes and test whether G adds information beyond J
+   after controlling for layer and raw activity.
+
+### Priority 2: mechanism-defining experiments
+
+5. **Routing versus message component patching.** For the fixed-support PE intervention, reproduce
+   the exact decomposition and finite routing-only/message-only/full patches. Test whether the
+   synthetic semantic-message and structural-routing dissociation survives. For a support-changing
+   topology donor, add an explicit wiring/support component rather than forcing the two-way split.
+6. **Functional carriage and coherence.** Compare `F_sens` and `F_coh`, donor coherence, carrier
+   coherence and graph-balanced distance profiles. Use shortest distance to the changed node/edge set,
+   report support by distance and normalize comparisons for molecule size. Determine whether the
+   structural localisation and semantic carrier cancellation seen synthetically recur.
+7. **Functional versus task-level necessity.** Report finite prediction displacement, loss/MAE
+   change and any sign changes separately for individual heads and frozen families. A small MAE
+   effect with a large functional effect is evidence of redundancy, not failed mediation.
+
+### Priority 3: extension experiments
+
+8. **Conditional specialisation.** After the unconditional pipeline is locked, predeclare a small
+   number of molecular conditions such as oxygen presence, source atom class and source proximity to
+   a functional group. Use discovery/confirmation splits, condition-invariant definitions, dose
+   common support and channel-by-condition interactions. Do not infer a general conditional method
+   from the cycle task.
+9. **Integrated beneficial carriage.** Validate the finite loss-completeness identity and helpful
+   versus harmful donor decomposition on the regression loss. This remains complementary to, not a
+   replacement for, `F_sens/F_coh`.
+
+## ZINC transfer beta implementation
+
+The removable standalone Colab is
+`experiments/zinc/analysis/zinc_specialisation_redesign_beta_colab.py`. It analyses the existing
+dense GRIT and parameter-matched 1-hop GRIT checkpoints read-only and confines every write to
+`MyDrive/graph_specialisation_metrics/zinc_redesign_beta_v1`. The old ZINC richness beta is not
+modified. Expensive products are checkpoint-hash/config-fingerprint bound and restartable at graph,
+event or chunk level.
+
+The implemented protocol is:
+
+- use deterministic, mutually disjoint ZINC test subsets for score discovery, whole-transport
+  causal patching and ordinary/family ablation; use a further discovery/confirmation division for
+  conditional rules and heads;
+- force dense and 1-hop analyses to use identical graph IDs, semantic donor IDs, PE partners and
+  topology donor IDs, and fail if molecular RRWP-derived topology, content or target alignment
+  differs across architectures;
+- compute event-level `CG/EG/CN/EN`, averaging donors within source, sources within molecule and
+  molecules equally, with donor-prefix rank convergence, `F_sens/F_coh`, donor outcomes and
+  event-specific distance to `{source}` or `{source, partner}`;
+- compare each aggregation against independent semantic/PE restore effects, necessity and donor
+  convergence; make the cross-architecture winner explicit while retaining every aggregation and
+  CG as the legacy reference;
+- validate raw channel scores and gated `D`, `J` and `G` against held-out restore/inject/necessity,
+  sham and same-size cross-graph mismatch patches; evaluate D-selected, high-J/high-G,
+  topology-responsive and inactive families on the independent ablation split;
+- reconstruct the fixed-support semantic/PE transport delta exactly as routing plus complete-message
+  terms, then patch routing-only, message-only and full transport and report their finite
+  interaction;
+- run a finite, general conditional screen over graph size, cycle rank, atom diversity, common atom
+  presence and source atom class. The rule/head/direction are selected on discovery molecules and
+  graph-bootstrap-confirmed on held-out molecules; this is deliberately a screen, not an exhaustive
+  condition learner.
+
+### Matched-real topology donor in the ZINC beta
+
+Molecular bonds are recovered from the one-step RRWP transition channel, never from dense attention
+support. Real train-set donors must have the same node count and be non-isomorphic as unlabelled
+graphs. They are ranked in explicit tiers:
+
+1. exact atom multiset, degree multiset, edge count and bond-label multiset;
+2. exact atom multiset and edge count;
+3. relaxed same-size nearest match, retained only for coverage diagnostics.
+
+A Hungarian alignment prioritises atom identity, then degree and neighbour-atom context. The donor's
+edge/bond tensors and already recomputed RRWP tensors are conjugated into base-node coordinates while
+base `x` and `y` remain fixed. Unknown topology-derived fields, isomorphic donors or failed support
+transplants stop the run. Primary topology figures and head scores use only tiers 1–2; relaxed donors
+cannot silently enter the claim.
+
+Topology remains a separate third structural axis. Its whole-graph dose and intervention unit differ
+from local semantic/PE events, so it is not inserted into PE-based `D`. Adoption requires adequate
+tier-1/2 coverage and held-out score-to-topology-patch validity; PE/topology head agreement is measured
+but is not required, because a useful topology probe may expose wiring reliance that PE transposition
+cannot. Routing/message is not forced onto topology events with changed support: wiring is an explicit
+third contribution.
+
+The notebook emits eleven paper figure families (PNG and PDF), machine-readable head/causal/topology
+tables and a predeclared decision report. It also records a current limitation: Drive contains one
+checkpoint per architecture for this comparison. Graph bootstraps quantify evaluation-sample
+uncertainty, not training-seed uncertainty, so decisions are concrete for this beta but remain subject
+to revision if independently trained ZINC seeds disagree.
+
+## Decisions to make after ZINC
+
+- **Aggregation:** retain CG unless another aggregation improves held-out patch and ablation validity,
+  rank stability and seed replication without worse noise-floor behaviour.
+- **Selectivity:** retain D only as a gated relative-role coordinate if its sign and causal-role
+  association replicate within layers; otherwise use the two raw scores plus J/G and report D only
+  descriptively.
+- **Strength:** retain J as evoked strength if its causal relation transfers. Retain G as a distinct
+  balanced-strength statistic only if it adds information beyond J.
+- **Structural scope:** keep PE/RRWP-payload specialisation and topology specialisation as separate
+  claims. Approve the topology score only if matched donors have adequate common support and its
+  results survive nuisance/dose controls.
+- **Causal confirmation:** make held-out family × channel bidirectional patching the required
+  confirmation for specialist labels; ablation alone remains insufficient.
+- **Mechanism:** retain routing/message labels only when both exact reconstruction and finite component
+  patching agree. Treat wiring as a third component for topology-changing interventions.
+- **Carriage:** retain `F_sens`, `F_coh` and coherence/distance diagnostics if their synthetic
+  distinctions reproduce; keep beneficial carriage as the complete signed loss attribution.
+- **Conditional labels:** approve only conditions that replicate under frozen rules, adequate support
+  and multiplicity control. Otherwise retain conditional analysis as exploratory.
