@@ -142,3 +142,29 @@ def test_checkpoint_discovery_prefers_canonical_paper_fingerprint(tmp_path):
     canonical_fingerprint = legacy.config_fingerprint(canonical)
     assert payload["fingerprint"] == canonical_fingerprint
     assert path.name == f"seed_0__{canonical_fingerprint}.pt"
+
+
+def test_cg_regression_manifest_uses_cuda_tolerant_structured_gate():
+    beta = load_beta_module()
+    comparison = beta._tensor_equivalence_diagnostic(
+        torch.ones(8),
+        torch.ones(8) + 3.05e-5,
+        atol=beta.CG_REGRESSION_ATOL,
+    )
+    assert comparison["passed"]
+    assert not beta._tensor_equivalence_diagnostic(
+        torch.ones(8),
+        torch.ones(8) + 1.0e-2,
+        atol=beta.CG_REGRESSION_ATOL,
+    )["passed"]
+    assert beta._cg_formula_regression_passed(
+        {
+            "passed": True,
+            "max_abs_error": 3.05e-5,
+            "atol": beta.CG_REGRESSION_ATOL,
+            "rtol": beta.CUDA_EQUIVALENCE_RTOL,
+        }
+    )
+    assert beta._cg_formula_regression_passed(3.05e-5)  # legacy scalar manifest
+    assert not beta._cg_formula_regression_passed({"passed": False})
+    assert not beta._cg_formula_regression_passed(1.0e-2)

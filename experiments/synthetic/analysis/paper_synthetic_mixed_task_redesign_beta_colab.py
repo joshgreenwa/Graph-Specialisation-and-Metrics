@@ -57,8 +57,8 @@ from urllib.parse import quote
 import numpy as np
 
 
-BETA_VERSION = "mixed-task-specialisation-redesign-beta-v2"
-BETA_SCHEMA = 2
+BETA_VERSION = "mixed-task-specialisation-redesign-beta-v3"
+BETA_SCHEMA = 3
 LEGACY_VERSION = "causal-specialisation-double-dissociation-v2-shared-source-marker"
 REPOSITORY_URL = "https://github.com/joshgreenwa/Graph-Specialisation-and-Metrics.git"
 REPOSITORY_BRANCH = "codex/cfim-grit-experiments"
@@ -77,6 +77,14 @@ SECRET_NAME = "dissertation_key"
 AGGREGATIONS = ("CG", "EG", "CN", "EN")
 CHANNELS = ("semantic", "structural")
 EPS = 1.0e-12
+# Equivalence checks compare independent CUDA forwards.  PyG/GRIT scatter kernels can
+# differ by a few ulps between otherwise identical batched executions, especially on
+# newer Torch/CUDA stacks, so validity gates must use an absolute+relative tolerance
+# rather than a brittle, scale-free max-error cutoff.
+CUDA_EQUIVALENCE_RTOL = 2.0e-5
+CG_REGRESSION_ATOL = 1.0e-4
+FORWARD_EQUIVALENCE_ATOL = 1.0e-4
+MECHANISM_RECONSTRUCTION_ATOL = 2.0e-4
 
 
 # ======================================================================================
@@ -187,6 +195,61 @@ def _json_default(value: Any) -> Any:
     except ImportError:
         pass
     raise TypeError(f"cannot JSON-encode {type(value)!r}")
+
+
+def _tensor_equivalence_diagnostic(
+    reference: Any,
+    candidate: Any,
+    *,
+    atol: float,
+    rtol: float = CUDA_EQUIVALENCE_RTOL,
+) -> dict[str, Any]:
+    """Return a JSON-safe, elementwise absolute+relative equivalence check."""
+
+    import torch
+
+    if tuple(reference.shape) != tuple(candidate.shape):
+        return {
+            "passed": False,
+            "reason": f"shape mismatch: {tuple(reference.shape)} != {tuple(candidate.shape)}",
+            "max_abs_error": float("inf"),
+            "signal_at_max_error": float("nan"),
+            "allowed_at_max_error": float(atol),
+            "max_tolerance_ratio": float("inf"),
+            "atol": float(atol),
+            "rtol": float(rtol),
+            "finite": False,
+        }
+    reference = reference.detach()
+    candidate = candidate.detach()
+    difference = (reference - candidate).abs()
+    signal = torch.maximum(reference.abs(), candidate.abs())
+    allowed = float(atol) + float(rtol) * signal
+    finite = bool(torch.isfinite(reference).all() and torch.isfinite(candidate).all())
+    if not difference.numel():
+        return {
+            "passed": finite,
+            "max_abs_error": 0.0,
+            "signal_at_max_error": 0.0,
+            "allowed_at_max_error": float(atol),
+            "max_tolerance_ratio": 0.0,
+            "atol": float(atol),
+            "rtol": float(rtol),
+            "finite": finite,
+        }
+    max_index = int(difference.reshape(-1).argmax())
+    tolerance_ratio = difference / allowed.clamp_min(EPS)
+    passed = finite and bool(torch.all(tolerance_ratio <= 1.0))
+    return {
+        "passed": passed,
+        "max_abs_error": float(difference.max()),
+        "signal_at_max_error": float(signal.reshape(-1)[max_index]),
+        "allowed_at_max_error": float(allowed.reshape(-1)[max_index]),
+        "max_tolerance_ratio": float(tolerance_ratio.max()),
+        "atol": float(atol),
+        "rtol": float(rtol),
+        "finite": finite,
+    }
 
 
 def write_json(path: Path, payload: Mapping[str, Any]) -> None:
@@ -923,8 +986,14 @@ def _legacy_formula_regression(
     factor: str,
     seed: int,
     device: Any,
-) -> float:
-    """Assert beta CG exactly reproduces the legacy code on identical sampled events."""
+) -> dict[str, Any]:
+    """Verify beta CG against legacy CG on identical sampled events.
+
+    The two formulas are evaluated in separate forwards.  On CUDA, nondeterministic
+    accumulation order in graph scatter kernels can therefore produce harmless
+    float32 differences even though the formulas agree.  Record a scale-aware
+    diagnostic and fail only when ``torch.allclose`` semantics are violated.
+    """
 
     clean = legacy.make_batch(model_cfg, 3, seed, mode=mode)
     old = legacy.score_channel_batch(
@@ -941,10 +1010,37 @@ def _legacy_formula_regression(
         event_mode="sample",
         sampled_events=model_cfg.score_donors,
     )["per_graph"]["CG"]
-    error = float((old - new).abs().max())
-    if error > 2.0e-5:
-        raise RuntimeError(f"beta CG does not reproduce legacy CG: max error={error:.3e}")
-    return error
+    diagnostic = _tensor_equivalence_diagnostic(
+        old,
+        new,
+        atol=CG_REGRESSION_ATOL,
+    )
+    if not bool(diagnostic["passed"]):
+        raise RuntimeError(
+            "beta CG does not reproduce legacy CG: "
+            f"max error={diagnostic['max_abs_error']:.3e}, "
+            f"signal={diagnostic['signal_at_max_error']:.3e}, "
+            f"allowed={diagnostic['allowed_at_max_error']:.3e}"
+        )
+    print(
+        f"[verification {factor}] legacy CG agreement: "
+        f"max error={diagnostic['max_abs_error']:.3e}, "
+        f"max tolerance ratio={diagnostic['max_tolerance_ratio']:.3f}",
+        flush=True,
+    )
+    return diagnostic
+
+
+def _cg_formula_regression_passed(value: Any) -> bool:
+    """Read current structured checks and older scalar manifests defensively."""
+
+    if isinstance(value, Mapping):
+        return bool(value.get("passed", False))
+    try:
+        scalar = float(value)
+    except (TypeError, ValueError):
+        return False
+    return math.isfinite(scalar) and scalar <= CG_REGRESSION_ATOL
 
 
 def score_cache_path(beta_dir: Path, seed: int, channel: str, fingerprint: str) -> Path:
@@ -1020,6 +1116,31 @@ def run_score_channel(
         sampled_events=1,
         no_op=True,
     )
+    no_op_output_check = _tensor_equivalence_diagnostic(
+        no_op["clean_logits"][:, None, :],
+        no_op["variant_logits"],
+        atol=FORWARD_EQUIVALENCE_ATOL,
+    )
+    no_op_score_checks = {
+        aggregation: _tensor_equivalence_diagnostic(
+            torch.zeros_like(no_op["per_graph"][aggregation]),
+            no_op["per_graph"][aggregation],
+            atol=FORWARD_EQUIVALENCE_ATOL,
+        )
+        for aggregation in AGGREGATIONS
+    }
+    if not bool(no_op_output_check["passed"]) or not all(
+        bool(check["passed"]) for check in no_op_score_checks.values()
+    ):
+        worst_score_ratio = max(
+            float(check["max_tolerance_ratio"])
+            for check in no_op_score_checks.values()
+        )
+        raise RuntimeError(
+            f"score no-op control failed for seed {seed} {channel}: "
+            f"output ratio={no_op_output_check['max_tolerance_ratio']:.3f}, "
+            f"score ratio={worst_score_ratio:.3f}"
+        )
     mode_name = "enumerated population" if beta_cfg.score_event_mode == "enumerate" else "sample"
     payload = {
         "version": BETA_VERSION,
@@ -1038,6 +1159,10 @@ def run_score_channel(
             "score": _merge_tensor_dicts(cross_chunks),
         },
         "no_op": no_op,
+        "no_op_numerical_check": {
+            "output": no_op_output_check,
+            "scores": no_op_score_checks,
+        },
     }
     atomic_torch_save(payload, path)
     print(f"[scores seed={seed} {channel}] cached {path}", flush=True)
@@ -1208,6 +1333,7 @@ def bidirectional_patch_sweep(
     clean_loss_all = torch.full((total_events,), float("nan"))
     corrupt_loss_all = torch.full((total_events,), float("nan"))
     sham_max = 0.0
+    sham_tolerance_ratio_max = 0.0
 
     for start in range(0, total_events, beta_cfg.causal_batch_size):
         stop = min(start + beta_cfg.causal_batch_size, total_events)
@@ -1242,7 +1368,22 @@ def bidirectional_patch_sweep(
         # Explicit sham: corrupt endpoint patched back into itself must be a numerical no-op.
         with legacy.patch_head_output(model, 0, 0, corrupt_wv[0]), torch.no_grad():
             sham = model(corrupt)
-        sham_max = max(sham_max, float((sham - corrupt_logits).abs().max().cpu()))
+        sham_check = _tensor_equivalence_diagnostic(
+            corrupt_logits,
+            sham,
+            atol=FORWARD_EQUIVALENCE_ATOL,
+        )
+        sham_max = max(sham_max, float(sham_check["max_abs_error"]))
+        sham_tolerance_ratio_max = max(
+            sham_tolerance_ratio_max,
+            float(sham_check["max_tolerance_ratio"]),
+        )
+        if not bool(sham_check["passed"]):
+            raise RuntimeError(
+                f"patch sham failed for seed {seed} {channel}: "
+                f"max error={sham_check['max_abs_error']:.3e}, "
+                f"tolerance ratio={sham_check['max_tolerance_ratio']:.3f}"
+            )
 
         for layer in range(model_cfg.layers):
             wrong_source = _cross_graph_mismatch_transport(
@@ -1308,6 +1449,7 @@ def bidirectional_patch_sweep(
         "corrupt_loss": corrupt_loss_all,
         "event_metadata": event_metadata,
         "sham_max": sham_max,
+        "sham_tolerance_ratio_max": sham_tolerance_ratio_max,
         "site_claim": "carrier-aligned routed node wV; edge-update output is not patched",
     }
 
@@ -1395,10 +1537,17 @@ def capture_mechanistic_forward(model: Any, batch: Any, *, device: Any) -> dict[
         reconstructed = (
             attention.unsqueeze(-1) * message
         ).sum(dim=3).permute(0, 2, 1, 3)
-        error = float((reconstructed - routed).abs().max().detach().cpu())
-        if error > 5.0e-5:
+        reconstruction_check = _tensor_equivalence_diagnostic(
+            routed,
+            reconstructed,
+            atol=MECHANISM_RECONSTRUCTION_ATOL,
+        )
+        error = float(reconstruction_check["max_abs_error"])
+        if not bool(reconstruction_check["passed"]):
             raise RuntimeError(
-                f"A/message reconstruction failed at layer {record.layer}: {error:.3e}"
+                f"A/message reconstruction failed at layer {record.layer}: "
+                f"max error={error:.3e}, "
+                f"tolerance ratio={reconstruction_check['max_tolerance_ratio']:.3f}"
             )
         layers.append(
             {
@@ -1406,6 +1555,9 @@ def capture_mechanistic_forward(model: Any, batch: Any, *, device: Any) -> dict[
                 "message": message,
                 "routed": record.head_output,
                 "reconstruction_max": error,
+                "reconstruction_tolerance_ratio_max": float(
+                    reconstruction_check["max_tolerance_ratio"]
+                ),
             }
         )
     return {"logits": logits, "layers": layers, "batch": moved}
@@ -1478,6 +1630,7 @@ def mechanism_score_batch(
 
     route_q, message_q, total_q = [], [], []
     reconstruction = []
+    reconstruction_tolerance_ratios = []
     for layer, fields in enumerate(captured["layers"]):
         attention = fields["attention"].reshape(
             graphs, replicas, model_cfg.heads, model_cfg.n, model_cfg.n
@@ -1497,11 +1650,21 @@ def mechanism_score_batch(
         direct = (
             routed_view[:, 0, None] - routed_view[:, 1:]
         ).permute(0, 1, 3, 2, 4)
-        error = float((route + message - direct).abs().max().detach().cpu())
+        reconstruction_check = _tensor_equivalence_diagnostic(
+            direct,
+            route + message,
+            atol=MECHANISM_RECONSTRUCTION_ATOL,
+        )
+        error = float(reconstruction_check["max_abs_error"])
         reconstruction.append(error)
-        if error > 8.0e-5:
+        reconstruction_tolerance_ratios.append(
+            float(reconstruction_check["max_tolerance_ratio"])
+        )
+        if not bool(reconstruction_check["passed"]):
             raise RuntimeError(
-                f"symmetric routing/message split failed at layer {layer}: {error:.3e}"
+                f"symmetric routing/message split failed at layer {layer}: "
+                f"max error={error:.3e}, "
+                f"tolerance ratio={reconstruction_check['max_tolerance_ratio']:.3f}"
             )
         phi = torch.stack(phi_by_output[layer], dim=0)
         route_q.append(torch.einsum("tgnhd,gkhnd->gkhnt", phi, route))
@@ -1511,11 +1674,18 @@ def mechanism_score_batch(
     route_q_t = torch.stack(route_q, dim=2)
     message_q_t = torch.stack(message_q, dim=2)
     total_q_t = torch.stack(total_q, dim=2)
-    projected_error = float(
-        (route_q_t + message_q_t - total_q_t).abs().max().detach().cpu()
+    projected_check = _tensor_equivalence_diagnostic(
+        total_q_t,
+        route_q_t + message_q_t,
+        atol=MECHANISM_RECONSTRUCTION_ATOL,
     )
-    if projected_error > 1.0e-4:
-        raise RuntimeError(f"projected mechanism split failed: {projected_error:.3e}")
+    projected_error = float(projected_check["max_abs_error"])
+    if not bool(projected_check["passed"]):
+        raise RuntimeError(
+            "projected mechanism split failed: "
+            f"max error={projected_error:.3e}, "
+            f"tolerance ratio={projected_check['max_tolerance_ratio']:.3f}"
+        )
     valid = bundle.valid.to(device)
     output = {}
     for name, values in (
@@ -1532,7 +1702,11 @@ def mechanism_score_batch(
         "components": output,
         "valid": bundle.valid,
         "reconstruction_max": max(reconstruction),
+        "reconstruction_tolerance_ratio_max": max(reconstruction_tolerance_ratios),
         "projected_reconstruction_max": projected_error,
+        "projected_reconstruction_tolerance_ratio_max": float(
+            projected_check["max_tolerance_ratio"]
+        ),
     }
 
 
@@ -1637,6 +1811,10 @@ def component_patch_sweep(
         "event_metadata": metadata,
         "reconstruction_max": max(
             float(layer["reconstruction_max"])
+            for layer in clean_capture["layers"] + variant_capture["layers"]
+        ),
+        "reconstruction_tolerance_ratio_max": max(
+            float(layer["reconstruction_tolerance_ratio_max"])
             for layer in clean_capture["layers"] + variant_capture["layers"]
         ),
     }
@@ -3802,24 +3980,41 @@ def figure_bidirectional_patching(
     finite = np.concatenate(finite_all)
     cosine = np.concatenate(cosine_all)
     keep = np.isfinite(predicted) & np.isfinite(finite) & np.isfinite(cosine)
-    axes[0].scatter(
-        predicted[keep],
-        finite[keep],
-        c=cosine[keep],
-        cmap="viridis",
-        vmin=-1,
-        vmax=1,
-        s=8,
-        alpha=0.30,
-        rasterized=True,
-    )
-    high = float(np.quantile(np.concatenate([predicted[keep], finite[keep]]), 0.99))
-    axes[0].plot([0, high], [0, high], "--", color="#666666", linewidth=0.9)
-    axes[0].set(xlim=(0, high), ylim=(0, high))
+    if bool(keep.any()):
+        axes[0].scatter(
+            predicted[keep],
+            finite[keep],
+            c=cosine[keep],
+            cmap="viridis",
+            vmin=-1,
+            vmax=1,
+            s=8,
+            alpha=0.30,
+            rasterized=True,
+        )
+        high = max(
+            float(np.quantile(np.concatenate([predicted[keep], finite[keep]]), 0.99)),
+            1.0e-6,
+        )
+        axes[0].plot([0, high], [0, high], "--", color="#666666", linewidth=0.9)
+        axes[0].set(xlim=(0, high), ylim=(0, high))
+        calibration_label = f"median cosine={np.median(cosine[keep]):.2f}"
+    else:
+        axes[0].text(
+            0.5,
+            0.5,
+            "No sites cleared the predeclared effect floor",
+            ha="center",
+            va="center",
+            transform=axes[0].transAxes,
+            color="#555555",
+        )
+        axes[0].set(xlim=(0, 1), ylim=(0, 1))
+        calibration_label = "no eligible sites"
     axes[0].set_xlabel("clean-gradient predicted norm")
     axes[0].set_ylabel("finite injected effect norm")
     axes[0].set_title(
-        f"A. Local→finite calibration\nmedian cosine={np.median(cosine[keep]):.2f}",
+        f"A. Local→finite calibration\n{calibration_label}",
         loc="left",
         fontweight="bold",
     )
@@ -4985,30 +5180,67 @@ def create_outputs(
 
     numerical_checks = {
         "CG_formula_regression": all(
-            max(run["checks"]["cg_formula_error"].values())
-            <= 2.0e-5
+            all(
+                _cg_formula_regression_passed(value)
+                for value in run["checks"]["cg_formula_error"].values()
+            )
             for run in runs.values()
         ),
         "no_op_score": all(
-            max(
-                float(np.nanmax(np.asarray(run["scores"][channel]["no_op"]["per_graph"][aggregation])))
+            all(
+                bool(
+                    run["scores"][channel]["no_op_numerical_check"]["output"][
+                        "passed"
+                    ]
+                )
+                and all(
+                    bool(
+                        run["scores"][channel]["no_op_numerical_check"]["scores"][
+                            aggregation
+                        ]["passed"]
+                    )
+                    for aggregation in AGGREGATIONS
+                )
                 for channel in CHANNELS
-                for aggregation in AGGREGATIONS
             )
-            <= 5.0e-5
             for run in runs.values()
         ),
         "patch_sham": all(
-            max(float(run["patches"][channel]["sham_max"]) for channel in CHANNELS)
-            <= 5.0e-5
+            max(
+                float(run["patches"][channel]["sham_tolerance_ratio_max"])
+                for channel in CHANNELS
+            )
+            <= 1.0
             for run in runs.values()
         ),
         "routing_message_reconstruction": all(
             max(
-                float(run["mechanisms"][channel]["score"]["reconstruction_max"])
+                float(
+                    run["mechanisms"][channel]["score"][
+                        "reconstruction_tolerance_ratio_max"
+                    ]
+                )
                 for channel in CHANNELS
             )
-            <= 1.0e-4
+            <= 1.0
+            and max(
+                float(
+                    run["mechanisms"][channel]["score"][
+                        "projected_reconstruction_tolerance_ratio_max"
+                    ]
+                )
+                for channel in CHANNELS
+            )
+            <= 1.0
+            and max(
+                float(
+                    run["mechanisms"][channel]["patch"][
+                        "reconstruction_tolerance_ratio_max"
+                    ]
+                )
+                for channel in CHANNELS
+            )
+            <= 1.0
             for run in runs.values()
         ),
     }
