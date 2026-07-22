@@ -286,7 +286,7 @@ class BetaConfig:
     family_graphs: int = 192
     family_size: int = 3
     bootstrap_samples: int = 1000
-    conditional_permutations: int = 1000
+    conditional_bootstrap_samples: int = 1000
     min_condition_fraction: float = 0.25
     min_condition_graphs: int = 16
     activity_floor_relative: float = 0.10
@@ -303,7 +303,7 @@ class BetaConfig:
         for name in (
             "score_graphs", "score_batch_size", "causal_graphs", "causal_events",
             "causal_batch_size", "mechanism_graphs", "mechanism_events", "family_graphs",
-            "family_size", "bootstrap_samples", "conditional_permutations",
+            "family_size", "bootstrap_samples", "conditional_bootstrap_samples",
         ):
             if int(getattr(self, name)) < 1:
                 raise ValueError(f"{name} must be positive")
@@ -1882,18 +1882,6 @@ def load_ablation_inputs(
 ) -> dict[str, Any]:
     import torch
 
-    legacy_path = discover_legacy_analysis(legacy, beta_cfg.legacy_run_dir, model_cfg, seed)
-    if legacy_path is not None:
-        result = torch.load(legacy_path, map_location="cpu", weights_only=False)
-        if int(result.get("seed", -1)) != int(seed):
-            raise RuntimeError(f"legacy analysis seed mismatch at {legacy_path}")
-        print(f"[ablation seed={seed}] read-only legacy cache {legacy_path}", flush=True)
-        return {
-            "source": str(legacy_path),
-            "semantic": result["ablation_semantic"],
-            "structural": result["ablation_structural"],
-        }
-
     path = beta_cfg.beta_dir / "causal" / (
         f"seed_{seed}__ablation_fallback__{beta_cfg.fingerprint}__{checkpoint_sha256[:12]}.pt"
     )
@@ -1905,7 +1893,7 @@ def load_ablation_inputs(
         "schema": BETA_SCHEMA,
         "fingerprint": beta_cfg.fingerprint,
         "checkpoint_sha256": checkpoint_sha256,
-        "source": "beta fallback; legacy cache unavailable",
+        "source": "checkpoint-bound beta ablation; legacy cache deliberately not reused",
         "semantic": legacy.ablation_sweep(
             model,
             analysis_cfg,
@@ -2209,6 +2197,7 @@ def method_metrics_for_seed(
                 np.mean(np.asarray(patch_payloads["structural"]["effect_norm"], dtype=float) <= structural_floor)
             ),
             "causal_anti_aligned_head_fraction": float(np.nanmean(causal["anti_aligned"])),
+            "ranking_bootstrap_samples": int(min(beta_cfg.bootstrap_samples, 500)),
         }
     return output
 
@@ -2747,7 +2736,10 @@ def conditional_discovery_confirmation(
                 if confirmation_support_valid
                 else [float("nan")] * 4
             )
-            confirmation_reference = float(np.nanmean(confirmation_stratum_means))
+            confirmation_reference = (
+                float(np.mean(confirmation_stratum_means))
+                if confirmation_support_valid else float("nan")
+            )
             confirmation_activity_valid = bool(
                 confirmation_support_valid
                 and np.isfinite(confirmation_stratum_means).all()
@@ -2835,14 +2827,21 @@ def conditional_discovery_confirmation(
             continue
         observed = abs(float(row["confirmation_interaction"]))
         null = []
-        for _ in range(beta_cfg.conditional_permutations):
+        for _ in range(beta_cfg.conditional_bootstrap_samples):
             sem_indices = rng.integers(0, len(row["_sem_values"]), len(row["_sem_values"]))
             str_indices = rng.integers(0, len(row["_str_values"]), len(row["_str_values"]))
+            sem_condition = row["_sem_condition"][sem_indices]
+            str_condition = row["_str_condition"][str_indices]
+            if min(
+                int(sem_condition.sum()), int((~sem_condition).sum()),
+                int(str_condition.sum()), int((~str_condition).sum()),
+            ) == 0:
+                continue
             value = _log_interaction(
                 row["_sem_values"][sem_indices, None, None],
                 row["_str_values"][str_indices, None, None],
-                row["_sem_condition"][sem_indices],
-                row["_str_condition"][str_indices],
+                sem_condition,
+                str_condition,
             )[0, 0]
             if np.isfinite(value):
                 null.append(float(value) - float(row["confirmation_interaction"]))
@@ -2854,6 +2853,7 @@ def conditional_discovery_confirmation(
         row["fdr_q"] = float("nan")
         row["confirmed_fdr_0.05"] = False
         row["inference"] = "sample-split, dose-overlap-trimmed, centred graph bootstrap"
+        row["conditional_bootstrap_samples"] = int(beta_cfg.conditional_bootstrap_samples)
         row.pop("_sem_condition", None)
         row.pop("_str_condition", None)
         row.pop("_sem_values", None)
@@ -3119,6 +3119,61 @@ def beneficial_outcome_rows(
     return rows
 
 
+def coordinate_uncertainty_rows(
+    runs: Mapping[int, Mapping[str, Any]], beta_cfg: BetaConfig
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    samples = min(int(beta_cfg.bootstrap_samples), 500)
+    for seed in beta_cfg.seeds:
+        for aggregation in AGGREGATIONS:
+            sem_pg = np.asarray(
+                runs[int(seed)]["scores"]["semantic"]["score"]["per_graph"][aggregation],
+                dtype=float,
+            )
+            str_pg = np.asarray(
+                runs[int(seed)]["scores"]["structural"]["score"]["per_graph"][aggregation],
+                dtype=float,
+            )
+            rng = np.random.default_rng(
+                7_100_000 + int(seed) * 101 + AGGREGATIONS.index(aggregation)
+            )
+            draws = {name: [] for name in ("semantic", "structural", "D", "J", "G")}
+            for _ in range(samples):
+                sem = sem_pg[rng.integers(0, len(sem_pg), len(sem_pg))].mean(axis=0)
+                st = str_pg[rng.integers(0, len(str_pg), len(str_pg))].mean(axis=0)
+                coordinates = score_coordinates(sem, st)
+                draws["semantic"].append(sem)
+                draws["structural"].append(st)
+                for name in ("D", "J", "G"):
+                    draws[name].append(coordinates[name])
+            arrays = {name: np.stack(value, axis=0) for name, value in draws.items()}
+            point_sem, point_str = sem_pg.mean(axis=0), str_pg.mean(axis=0)
+            point_coordinates = score_coordinates(point_sem, point_str)
+            for layer in range(point_sem.shape[0]):
+                for head in range(point_sem.shape[1]):
+                    row = {
+                        "seed": int(seed), "aggregation": aggregation,
+                        "layer": layer, "head": head, "bootstrap_samples": samples,
+                        "semantic": float(point_sem[layer, head]),
+                        "structural": float(point_str[layer, head]),
+                        "D": float(point_coordinates["D"][layer, head]),
+                        "J": float(point_coordinates["J"][layer, head]),
+                        "G": float(point_coordinates["G"][layer, head]),
+                    }
+                    for name, array in arrays.items():
+                        row[f"{name}_ci_low"] = float(
+                            np.quantile(array[:, layer, head], 0.025)
+                        )
+                        row[f"{name}_ci_high"] = float(
+                            np.quantile(array[:, layer, head], 0.975)
+                        )
+                    row["probability_D_positive"] = float(
+                        np.mean(arrays["D"][:, layer, head] > 0)
+                    )
+                    rows.append(row)
+    return rows
+
+
 def task_factor_control_rows(
     runs: Mapping[int, Mapping[str, Any]], beta_cfg: BetaConfig
 ) -> list[dict[str, Any]]:
@@ -3152,6 +3207,119 @@ def task_factor_control_rows(
                                     "score": float(mean[layer, head]),
                                 }
                             )
+    return rows
+
+
+def task_factor_family_specificity_rows(
+    runs: Mapping[int, Mapping[str, Any]],
+    beta_cfg: BetaConfig,
+    aggregation: str,
+) -> list[dict[str, Any]]:
+    """Do selected heads respond to their factor beyond the task-context off diagonal?"""
+
+    rows: list[dict[str, Any]] = []
+    samples = min(int(beta_cfg.bootstrap_samples), 500)
+    for seed in beta_cfg.seeds:
+        run = runs[int(seed)]
+        groups = run["families"]["selection"][aggregation]["groups"]
+        family_pairs = {
+            "raw_ranked": (
+                [tuple(value) for value in groups["raw_semantic"]],
+                [tuple(value) for value in groups["raw_structural"]],
+            ),
+            "D_specialist": (
+                [tuple(value) for value in groups["semantic_specialist"]],
+                [tuple(value) for value in groups["structural_specialist"]],
+            ),
+        }
+        cells = {
+            "sem_sem": np.asarray(
+                run["scores"]["semantic"]["score"]["per_graph"][aggregation], dtype=float
+            ),
+            "sem_str": np.asarray(
+                run["scores"]["semantic"]["cross_factor_control"]["score"]["per_graph"][aggregation],
+                dtype=float,
+            ),
+            "str_str": np.asarray(
+                run["scores"]["structural"]["score"]["per_graph"][aggregation], dtype=float
+            ),
+            "str_sem": np.asarray(
+                run["scores"]["structural"]["cross_factor_control"]["score"]["per_graph"][aggregation],
+                dtype=float,
+            ),
+        }
+
+        def enrichments(cell_mean: Mapping[str, np.ndarray]) -> dict[str, np.ndarray]:
+            semantic_scale = 0.5 * (
+                float(np.mean(cell_mean["sem_sem"])) + float(np.mean(cell_mean["str_sem"]))
+            ) + EPS
+            structural_scale = 0.5 * (
+                float(np.mean(cell_mean["str_str"])) + float(np.mean(cell_mean["sem_str"]))
+            ) + EPS
+            return {
+                "semantic": (cell_mean["sem_sem"] - cell_mean["str_sem"]) / semantic_scale,
+                "structural": (cell_mean["str_str"] - cell_mean["sem_str"]) / structural_scale,
+            }
+
+        point_enrichment = enrichments(
+            {name: value.mean(axis=0) for name, value in cells.items()}
+        )
+        for family_type, (sem_heads, str_heads) in family_pairs.items():
+            available = bool(sem_heads and str_heads)
+            if not available:
+                for role_name in (*CHANNELS, "joint"):
+                    rows.append(
+                        {
+                            "seed": int(seed), "aggregation": aggregation,
+                            "family_type": family_type, "role": role_name,
+                            "available": False, "matched_factor_enrichment": float("nan"),
+                            "ci_low": float("nan"), "ci_high": float("nan"),
+                            "bootstrap_samples": 0,
+                        }
+                    )
+                continue
+            point = {
+                "semantic": float(np.mean([point_enrichment["semantic"][item] for item in sem_heads])),
+                "structural": float(np.mean([point_enrichment["structural"][item] for item in str_heads])),
+            }
+            point["joint"] = float(np.mean([point[channel] for channel in CHANNELS]))
+            rng = np.random.default_rng(
+                7_150_000 + int(seed) * 101
+                + (10_000 if family_type == "D_specialist" else 0)
+            )
+            draws = {name: [] for name in (*CHANNELS, "joint")}
+            for _ in range(samples):
+                sem_indices = rng.integers(0, len(cells["sem_sem"]), len(cells["sem_sem"]))
+                str_indices = rng.integers(0, len(cells["str_str"]), len(cells["str_str"]))
+                sampled = enrichments(
+                    {
+                        "sem_sem": cells["sem_sem"][sem_indices].mean(axis=0),
+                        "sem_str": cells["sem_str"][sem_indices].mean(axis=0),
+                        "str_str": cells["str_str"][str_indices].mean(axis=0),
+                        "str_sem": cells["str_sem"][str_indices].mean(axis=0),
+                    }
+                )
+                values = {
+                    "semantic": float(np.mean([sampled["semantic"][item] for item in sem_heads])),
+                    "structural": float(np.mean([sampled["structural"][item] for item in str_heads])),
+                }
+                values["joint"] = float(np.mean([values[channel] for channel in CHANNELS]))
+                for role_name, value in values.items():
+                    draws[role_name].append(value)
+            for role_name in (*CHANNELS, "joint"):
+                values = np.asarray(draws[role_name], dtype=float)
+                rows.append(
+                    {
+                        "seed": int(seed), "aggregation": aggregation,
+                        "family_type": family_type, "role": role_name,
+                        "available": True,
+                        "matched_factor_enrichment": point[role_name],
+                        "ci_low": float(np.quantile(values, 0.025)),
+                        "ci_high": float(np.quantile(values, 0.975)),
+                        "positive_probability": float(np.mean(values > 0)),
+                        "bootstrap_samples": samples,
+                    }
+                )
     return rows
 
 
@@ -3194,8 +3362,8 @@ def figure_aggregation_planes(
         ax.plot([low, high], [low, high], color="#666666", linestyle="--", linewidth=0.9)
         ax.set(xscale="log", yscale="log", xlim=(low, high), ylim=(low, high))
         ax.set_title(f"{aggregation}: {descriptors[aggregation]}", loc="left", fontweight="bold")
-        ax.set_xlabel(r"Structural score / head mean")
-        ax.set_ylabel(r"Semantic score / head mean")
+        ax.set_xlabel(r"Matched structural task/factor score / head mean")
+        ax.set_ylabel(r"Matched semantic task/factor score / head mean")
         ax.grid(True, which="both", alpha=0.18, linewidth=0.5)
     fig.suptitle(
         "The aggregation choice changes what counts as a specialist",
@@ -3265,6 +3433,61 @@ def figure_task_factor_controls(
     )
     fig.subplots_adjust(left=0.06, right=0.89, bottom=0.20, top=0.80, wspace=0.36)
     return save_figure(fig, figures / "beta_fig1b_task_factor_controls")
+
+
+def figure_task_factor_family_specificity(
+    rows: Sequence[Mapping[str, Any]], figures: Path
+) -> list[str]:
+    plt = configure_matplotlib()
+    fig, axes = plt.subplots(1, 2, figsize=(9.6, 3.9), sharey=True)
+    roles = (*CHANNELS, "joint")
+    for ax, family_type, title in zip(
+        axes,
+        ("raw_ranked", "D_specialist"),
+        ("A. Raw-ranked families", "B. D-selected specialists"),
+    ):
+        available_points = 0
+        for seed_index, seed in enumerate(sorted({int(row["seed"]) for row in rows})):
+            selected = {
+                str(row["role"]): row for row in rows
+                if row["family_type"] == family_type and int(row["seed"]) == seed
+            }
+            for role_index, role in enumerate(roles):
+                row = selected.get(role)
+                if row is None or not bool(row["available"]):
+                    continue
+                available_points += 1
+                point = float(row["matched_factor_enrichment"])
+                x_value = role_index + (seed_index - 1) * 0.08
+                colour = "#D55E00" if role == "semantic" else (
+                    "#0072B2" if role == "structural" else "#555555"
+                )
+                ax.vlines(
+                    x_value, float(row["ci_low"]), float(row["ci_high"]),
+                    color=colour, linewidth=1,
+                )
+                ax.scatter(
+                    x_value, point,
+                    marker=SEED_MARKERS[seed_index % len(SEED_MARKERS)],
+                    color=colour, s=28, zorder=3,
+                )
+        ax.axhline(0, color="#999999", linewidth=0.8)
+        ax.set_xticks(range(3), ("semantic role", "structural role", "joint"))
+        if ax is axes[0]:
+            ax.set_ylabel("matched-factor enrichment over off-diagonal task")
+        ax.set_title(title, loc="left", fontweight="bold")
+        ax.grid(True, axis="y", alpha=0.16, linewidth=0.5)
+        if available_points == 0:
+            ax.text(
+                0.5, 0.5, "no family cleared\nactivity/uncertainty criteria",
+                transform=ax.transAxes, ha="center", va="center", color="#666666",
+            )
+    fig.suptitle(
+        "Selected-family specificity must survive the task-context controls",
+        x=0.06, ha="left", fontsize=14, fontweight="bold",
+    )
+    fig.tight_layout(rect=(0, 0, 1, 0.87))
+    return save_figure(fig, figures / "beta_fig1c_selected_family_specificity")
 
 
 def figure_method_comparison(
@@ -3594,6 +3817,19 @@ def figure_bidirectional_patching(
         fontsize=14,
         fontweight="bold",
     )
+    sem_special_seeds = sum(
+        bool(runs[int(seed)]["families"]["selection"][aggregation]["groups"]["semantic_specialist"])
+        for seed in beta_cfg.seeds
+    )
+    str_special_seeds = sum(
+        bool(runs[int(seed)]["families"]["selection"][aggregation]["groups"]["structural_specialist"])
+        for seed in beta_cfg.seeds
+    )
+    fig.text(
+        0.04, 0.88,
+        f"D-specialist family used in {sem_special_seeds}/{len(beta_cfg.seeds)} semantic and {str_special_seeds}/{len(beta_cfg.seeds)} structural seeds; raw-ranked fallback otherwise",
+        color="#555555",
+    )
     return save_figure(fig, figures / "beta_fig4_bidirectional_patching")
 
 
@@ -3611,6 +3847,15 @@ def patch_metric_rows(
             valid = np.asarray(patch["effect_norm"], dtype=float) > floor
             for direction, metrics in patch["metrics"].items():
                 arrays = {name: np.asarray(value, dtype=float) for name, value in metrics.items()}
+                loss_name = {
+                    "restore": "restore_reduction",
+                    "inject": "inject_increase",
+                    "necessity": "necessity_reduction",
+                }.get(direction)
+                loss_array = (
+                    np.asarray(patch["loss_metrics"][loss_name], dtype=float)
+                    if loss_name is not None else None
+                )
                 for layer in range(next(iter(arrays.values())).shape[0]):
                     for head in range(next(iter(arrays.values())).shape[1]):
                         rows.append(
@@ -3624,6 +3869,11 @@ def patch_metric_rows(
                                 "excluded_event_fraction": float(1.0 - valid.mean()),
                                 "effect_floor": float(floor),
                                 "sham_max": float(patch["sham_max"]),
+                                "nonlinear_loss_effect_mean": float(
+                                    np.nanmean(loss_array[layer, head, valid])
+                                )
+                                if loss_array is not None and valid.any()
+                                else float("nan"),
                                 **{
                                     f"{name}_mean": float(np.nanmean(array[layer, head, valid]))
                                     if valid.any() else float("nan")
@@ -3832,7 +4082,8 @@ def matched_control_patch_rows(
         for control_name, control_groups in controls.items():
             for direction in ("restore", "inject", "necessity"):
                 available = all(
-                    specialists[channel] and control_groups[channel]
+                    len(specialists[channel]) > 0
+                    and len(control_groups[channel]) == len(specialists[channel])
                     for channel in CHANNELS
                 )
                 if not available:
@@ -4017,7 +4268,22 @@ def figure_family_ablation(
         "D-selected specialist families are allowed to be empty; functional/loss effects are primary and accuracy remains tabulated",
         color="#555555",
     )
-    fig.tight_layout(rect=(0, 0.08, 1, 0.90))
+    empties = {
+        family: sum(
+            not runs[int(seed)]["families"]["selection"][aggregation]["groups"][family]
+            for seed in beta_cfg.seeds
+        )
+        for family in ("semantic_specialist", "structural_specialist", "low_J_inert")
+    }
+    fig.text(
+        0.06, 0.895,
+        "Empty seeds: " + ", ".join(
+            f"{name.replace('_', ' ')} {count}/{len(beta_cfg.seeds)}"
+            for name, count in empties.items()
+        ),
+        color="#555555", fontsize=8.5,
+    )
+    fig.tight_layout(rect=(0, 0.08, 1, 0.86))
     return save_figure(fig, figures / "beta_fig5_family_ablation")
 
 
@@ -4418,6 +4684,21 @@ def carriage_rows(
     runs: Mapping[int, Mapping[str, Any]], beta_cfg: BetaConfig
 ) -> list[dict[str, Any]]:
     rows = []
+    samples = min(int(beta_cfg.bootstrap_samples), 500)
+
+    def interval(values: np.ndarray, rng: np.random.Generator) -> tuple[float, float]:
+        finite = np.asarray(values, dtype=float)
+        finite = finite[np.isfinite(finite)]
+        if not len(finite):
+            return float("nan"), float("nan")
+        indices = rng.integers(0, len(finite), size=(samples, len(finite)))
+        draws = finite[indices].mean(axis=1)
+        return float(np.quantile(draws, 0.025)), float(np.quantile(draws, 0.975))
+
+    def effective_support(weights: np.ndarray) -> float:
+        values = np.asarray(weights, dtype=float)
+        return float(values.sum() ** 2 / (np.square(values).sum() + EPS))
+
     for seed in beta_cfg.seeds:
         for channel in CHANNELS:
             profile = runs[int(seed)]["scores"][channel]["score"]["distance_profiles"]
@@ -4429,6 +4710,12 @@ def carriage_rows(
             for layer in range(sens.shape[1]):
                 for head in range(sens.shape[2]):
                     for index, value in enumerate(distance):
+                        rng = np.random.default_rng(
+                            7_400_000 + int(seed) * 10_000 + CHANNELS.index(channel) * 1_000
+                            + layer * 100 + head * 10 + index
+                        )
+                        sens_low, sens_high = interval(sens[:, layer, head, index], rng)
+                        coh_low, coh_high = interval(coh[:, layer, head, index], rng)
                         rows.append(
                             {
                                 "seed": int(seed),
@@ -4437,9 +4724,21 @@ def carriage_rows(
                                 "head": head,
                                 "distance": int(value),
                                 "F_sens_mean": float(np.nanmean(sens[:, layer, head, index])),
+                                "F_sens_ci_low": sens_low,
+                                "F_sens_ci_high": sens_high,
                                 "F_coh_mean": float(np.nanmean(coh[:, layer, head, index])),
+                                "F_coh_ci_low": coh_low,
+                                "F_coh_ci_high": coh_high,
                                 "event_carrier_support": int(event_support[:, index].sum()),
                                 "carrier_support": int(carrier_support[:, index].sum()),
+                                "supported_graphs": int((carrier_support[:, index] > 0).sum()),
+                                "effective_graph_event_support": effective_support(
+                                    event_support[:, index]
+                                ),
+                                "effective_graph_carrier_support": effective_support(
+                                    carrier_support[:, index]
+                                ),
+                                "bootstrap_samples": samples,
                             }
                         )
     return rows
@@ -4451,6 +4750,8 @@ def component_decision_records(
     beta_cfg: BetaConfig,
     aggregation: str,
     family_patch_rows: Sequence[Mapping[str, Any]],
+    matched_control_rows: Sequence[Mapping[str, Any]],
+    task_factor_family_rows: Sequence[Mapping[str, Any]],
     numerical_checks: Mapping[str, bool],
 ) -> dict[str, Any]:
     def coordinate_decision(metric: str, label: str) -> dict[str, Any]:
@@ -4458,7 +4759,11 @@ def component_decision_records(
             [per_seed_metrics[int(seed)][aggregation][metric] for seed in beta_cfg.seeds],
             dtype=float,
         )
-        passed = bool(np.nanmedian(values) >= 0.70 and np.nanmin(values) >= 0.50)
+        passed = bool(
+            np.isfinite(values).all()
+            and np.median(values) >= 0.70
+            and np.min(values) >= 0.50
+        )
         return {
             "status": "approve_for_real-task_beta" if passed else "retain_as_diagnostic",
             "criterion": "median seed within-layer rho >= 0.70 and every seed >= 0.50",
@@ -4471,10 +4776,32 @@ def component_decision_records(
         if row["family_type"] == "D_specialist" and row["direction"] in {"restore", "inject"}
     ]
     available = [row for row in specialist if bool(row["available"])]
+    matched = [
+        row for row in matched_control_rows
+        if row["control"] == "J_matched_generalist"
+        and row["role"] == "joint"
+        and row["direction"] in {"restore", "inject"}
+        and bool(row["available"])
+    ]
     patch_passed = bool(
         len(available) == 2 * len(beta_cfg.seeds)
         and all(float(row["interaction"]) > 0 for row in available)
         and sum(float(row["ci_low"]) > 0 for row in available) >= len(available) - 1
+        and len(matched) == 2 * len(beta_cfg.seeds)
+        and all(float(row["specialist_minus_control"]) > 0 for row in matched)
+        and sum(float(row["ci_low"]) > 0 for row in matched) >= len(matched) - 1
+    )
+    selected_specificity = [
+        row for row in task_factor_family_rows
+        if row["family_type"] == "D_specialist"
+        and row["role"] == "joint"
+        and bool(row["available"])
+    ]
+    selected_specificity_passed = bool(
+        len(selected_specificity) == len(beta_cfg.seeds)
+        and all(float(row["matched_factor_enrichment"]) > 0 for row in selected_specificity)
+        and sum(float(row["ci_low"]) > 0 for row in selected_specificity)
+        >= len(selected_specificity) - 1
     )
     finite_supported = True
     task_factor_interactions = []
@@ -4514,9 +4841,11 @@ def component_decision_records(
         },
         "task_factor_specificity_control": {
             "status": "passes_negative_control"
-            if min(task_factor_interactions) > 0 else "matched_scores_are_context_confounded",
+            if min(task_factor_interactions) > 0 and selected_specificity_passed
+            else "withhold_intrinsic_semantic_structural_labels",
             "per_seed_log_diagonal_interaction": task_factor_interactions,
-            "claim": "matched task-factor scores are primary only when both off-diagonal controls are weaker in aggregate",
+            "selected_D_family_rows": len(selected_specificity),
+            "claim": "labels require both an aggregate diagonal interaction and positive D-family matched-factor enrichment across seeds",
         },
         "D_relative_selectivity": coordinate_decision(
             "D_causal_role_rho", "signed finite causal channel role"
@@ -4529,8 +4858,9 @@ def component_decision_records(
         ),
         "whole_transport_patching": {
             "status": "approve_for_real-task_beta" if patch_passed else "retain_as_diagnostic",
-            "criterion": "D-specialist restore/inject interaction positive in every seed and all but at most one 95% graph-bootstrap CI exclude zero",
+            "criterion": "D-specialist restore/inject channel interaction and excess over same-layer J-matched generalists are positive in every seed; all but at most one CI in each family exclude zero",
             "available_rows": len(available),
+            "J_matched_control_rows": len(matched),
         },
         "routing_message_decomposition": {
             "status": "approve_for_real-task_beta"
@@ -4690,11 +5020,16 @@ def create_outputs(
             )
 
     head_rows = build_head_rows(runs, beta_cfg)
+    uncertainty_rows = coordinate_uncertainty_rows(runs, beta_cfg)
     benefit_rows = beneficial_outcome_rows(runs, beta_cfg)
     task_factor_rows = task_factor_control_rows(runs, beta_cfg)
     patch_rows = patch_metric_rows(runs, beta_cfg)
     calibration_rows = finite_gradient_calibration_rows(runs, beta_cfg)
     family_patch_rows = family_patch_interaction_rows(
+        runs, beta_cfg, chosen
+    )
+    matched_patch_rows = matched_control_patch_rows(runs, beta_cfg, chosen)
+    task_factor_family_rows = task_factor_family_specificity_rows(
         runs, beta_cfg, chosen
     )
     family_rows = family_ablation_rows(runs, beta_cfg)
@@ -4706,16 +5041,21 @@ def create_outputs(
         beta_cfg,
         chosen,
         family_patch_rows,
+        matched_patch_rows,
+        task_factor_family_rows,
         numerical_checks,
     )
     write_csv(tables / "method_validation_by_seed.csv", method_rows)
     write_csv(tables / "per_head_beta_metrics.csv", head_rows)
+    write_csv(tables / "per_head_score_coordinate_uncertainty.csv", uncertainty_rows)
     write_csv(tables / "conditional_rules_discovery_confirmation.csv", conditional_rows)
     write_csv(tables / "source_level_beneficial_outcomes.csv", benefit_rows)
     write_csv(tables / "task_mode_by_intervention_factor_controls.csv", task_factor_rows)
     write_csv(tables / "whole_transport_patch_metrics.csv", patch_rows)
     write_csv(tables / "finite_gradient_calibration_by_seed.csv", calibration_rows)
     write_csv(tables / "family_by_channel_patch_interactions.csv", family_patch_rows)
+    write_csv(tables / "specialist_vs_matched_control_patching.csv", matched_patch_rows)
+    write_csv(tables / "selected_family_task_factor_specificity.csv", task_factor_family_rows)
     write_csv(tables / "family_ablation_curves.csv", family_rows)
     write_csv(tables / "routing_message_component_patching.csv", mechanism_table)
     write_csv(tables / "head_site_carriage_distance.csv", carriage_table)
@@ -4732,6 +5072,9 @@ def create_outputs(
     figure_paths = []
     figure_paths += figure_aggregation_planes(runs, beta_cfg, figures)
     figure_paths += figure_task_factor_controls(task_factor_rows, figures)
+    figure_paths += figure_task_factor_family_specificity(
+        task_factor_family_rows, figures
+    )
     figure_paths += figure_method_comparison(method_rows, decision, figures)
     figure_paths += figure_winner_causal_scatter(head_rows, chosen, figures)
     figure_paths += figure_selectivity_strength(head_rows, chosen, figures)
@@ -4859,29 +5202,18 @@ def load_cached_runs(
             beta_cfg,
             checkpoint_sha256,
         )
-        legacy_analysis = discover_legacy_analysis(
-            legacy, beta_cfg.legacy_run_dir, model_cfg, int(seed)
+        fallbacks = sorted(
+            (beta_cfg.beta_dir / "causal").glob(
+                f"seed_{seed}__ablation_fallback__{beta_cfg.fingerprint}__{checkpoint_sha256[:12]}.pt"
+            )
         )
-        if legacy_analysis is not None:
-            stored = torch.load(legacy_analysis, map_location="cpu", weights_only=False)
-            ablations = {
-                "source": str(legacy_analysis),
-                "semantic": stored["ablation_semantic"],
-                "structural": stored["ablation_structural"],
-            }
-        else:
-            fallbacks = sorted(
-                (beta_cfg.beta_dir / "causal").glob(
-                    f"seed_{seed}__ablation_fallback__{beta_cfg.fingerprint}__{checkpoint_sha256[:12]}.pt"
-                )
+        if len(fallbacks) != 1:
+            raise FileNotFoundError(
+                f"no checkpoint-bound beta ablation cache for seed {seed}; run --phase families"
             )
-            if len(fallbacks) != 1:
-                raise FileNotFoundError(
-                    f"no legacy or beta ablation cache for seed {seed}; run --phase families"
-                )
-            ablations = _load_validated_beta_cache(
-                fallbacks[0], beta_cfg, checkpoint_sha256
-            )
+        ablations = _load_validated_beta_cache(
+            fallbacks[0], beta_cfg, checkpoint_sha256
+        )
         check_path = beta_cfg.beta_dir / "verification" / f"seed_{seed}.json"
         if not check_path.exists():
             raise FileNotFoundError(
@@ -4929,7 +5261,7 @@ def make_beta_config(args: argparse.Namespace) -> BetaConfig:
         "family_graphs": args.family_graphs,
         "family_size": args.family_size,
         "bootstrap_samples": args.bootstrap_samples,
-        "conditional_permutations": args.conditional_permutations,
+        "conditional_bootstrap_samples": args.conditional_bootstrap_samples,
         "device": args.device,
     }
     if args.fast_dev_run:
@@ -4948,7 +5280,7 @@ def make_beta_config(args: argparse.Namespace) -> BetaConfig:
                 "family_graphs": 12,
                 "family_size": 1,
                 "bootstrap_samples": 50,
-                "conditional_permutations": 50,
+                "conditional_bootstrap_samples": 50,
             }
         )
     config = BetaConfig(**values)
@@ -4981,7 +5313,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--family-graphs", type=int, default=192)
     parser.add_argument("--family-size", type=int, default=3)
     parser.add_argument("--bootstrap-samples", type=int, default=1000)
-    parser.add_argument("--conditional-permutations", type=int, default=1000)
+    parser.add_argument("--conditional-bootstrap-samples", type=int, default=1000)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--repository-branch", default=REPOSITORY_BRANCH)
     parser.add_argument("--grit-dir", default=str(DEFAULT_GRIT_DIR))
@@ -5167,9 +5499,13 @@ CELL_ARGS = [
 
 
 if __name__ == "__main__":
+    try:
+        colab_installed = importlib.util.find_spec("google.colab") is not None
+    except (ImportError, ModuleNotFoundError, ValueError):
+        colab_installed = False
     in_colab = (
         bool(os.environ.get("COLAB_RELEASE_TAG"))
         or "google.colab" in sys.modules
-        or importlib.util.find_spec("google.colab") is not None
+        or colab_installed
     )
     main(CELL_ARGS if in_colab else None)

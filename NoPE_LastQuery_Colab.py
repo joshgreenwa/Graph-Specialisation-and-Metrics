@@ -447,7 +447,7 @@ def _despine(ax):
 def make_positional_fraction_figure(agg, out_path):
     layers = np.arange(N_LAYERS)
     dodge = {"local_att": -0.10, "global_att": 0.0, "global_tr": 0.10}
-    fig, axes = plt.subplots(1, len(FIG_TASKS), figsize=(3.9 * len(FIG_TASKS), 4.3), squeeze=False)
+    fig, axes = plt.subplots(1, len(FIG_TASKS), figsize=(5.4 * len(FIG_TASKS), 4.3), squeeze=False)
     axes = axes[0]
     for ax, task in zip(axes, FIG_TASKS):
         for m in ("global_att", "global_tr", "local_att"):
@@ -471,7 +471,7 @@ def make_positional_fraction_figure(agg, out_path):
 
 def make_residual_posrep_figure(agg, out_path):
     layers = np.arange(N_LAYERS)
-    fig, axes = plt.subplots(1, len(FIG_TASKS), figsize=(3.9 * len(FIG_TASKS), 4.3), squeeze=False)
+    fig, axes = plt.subplots(1, len(FIG_TASKS), figsize=(5.4 * len(FIG_TASKS), 4.3), squeeze=False)
     axes = axes[0]
     ymax = max(0.5, max((_stack(agg[t]["posrep"]).mean(0) + _stack(agg[t]["posrep"]).std(0)).max()
                         for t in FIG_TASKS) * 1.1)

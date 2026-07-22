@@ -106,6 +106,7 @@ def test_specialist_families_can_be_empty_and_cache_identity_is_fail_closed():
     )
     assert groups["semantic_specialist"] == []
     assert groups["structural_specialist"] == []
+    assert groups["low_J_inert"] == []
     assert "semantic_specialist" in diagnostics["empty_families"]
     payload = {
         "version": beta.BETA_VERSION,
@@ -115,4 +116,3 @@ def test_specialist_families_can_be_empty_and_cache_identity_is_fail_closed():
     }
     assert beta._beta_cache_is_current(payload, config, "abc")
     assert not beta._beta_cache_is_current(payload, config, "different")
-
