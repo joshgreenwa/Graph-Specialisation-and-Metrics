@@ -45,9 +45,11 @@ def test_load_scores_and_summary_roundtrip(tmp_path):
     z = tmp_path / "zinc" / "scores_zinc.npz"
     z.parent.mkdir(parents=True)
     np.savez(z, S_sem=np.ones((10, 8)), S_str=np.full((10, 8), 2.0),
-             S_attn_sem=np.zeros((10, 8)))
+             S_sem_CG=np.full((10, 8), 0.9), S_str_CG=np.full((10, 8), 1.8),
+             S_attn_sem=np.zeros((10, 8)), score_aggregation=np.asarray("EG"))
     s = D.load_scores(z)
     assert s["S_sem"].shape == (10, 8) and s["S_str"].mean() == 2.0
+    assert s["score_aggregation"] == "EG" and np.isclose(s["S_sem_CG"].mean(), 0.9)
 
     p = tmp_path / "zinc" / "carriage_summary.json"
     p.write_text(json.dumps({"meta": {"val_metric": 0.11, "test_metric": 0.10,
@@ -73,13 +75,13 @@ def test_performance_table_backfills_val_without_recomputing_carriage(tmp_path):
     assert table["zinc"]["val"] == .070
 
 
-def test_pre_v2_vnode_score_cache_is_not_loaded(tmp_path):
-    task = "zinc_1hop_vnode"
-    score_path = D.scores_npz_path(tmp_path, task)
-    score_path.parent.mkdir(parents=True)
-    np.savez(score_path, S_sem=np.ones((2, 2)), S_str=np.ones((2, 2)))
-    stats_path = D.spec_stats_path(tmp_path, task)
-    stats_path.write_text(json.dumps({"score_cache_version": 1}))
-    assert task not in D.load_scores_by_task(tmp_path, [task])
-    stats_path.write_text(json.dumps({"score_cache_version": 2}))
-    assert task in D.load_scores_by_task(tmp_path, [task])
+def test_pre_v3_cg_score_cache_is_not_loaded(tmp_path):
+    for task in ("zinc", "zinc_1hop_vnode"):
+        score_path = D.scores_npz_path(tmp_path, task)
+        score_path.parent.mkdir(parents=True)
+        np.savez(score_path, S_sem=np.ones((2, 2)), S_str=np.ones((2, 2)))
+        stats_path = D.spec_stats_path(tmp_path, task)
+        stats_path.write_text(json.dumps({"score_cache_version": 2}))
+        assert task not in D.load_scores_by_task(tmp_path, [task])
+        stats_path.write_text(json.dumps({"score_cache_version": 3}))
+        assert task in D.load_scores_by_task(tmp_path, [task])

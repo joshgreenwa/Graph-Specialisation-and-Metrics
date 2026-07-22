@@ -8,9 +8,9 @@ specialisation orchestrators already write to Drive:
   where ``<prefix>`` is ``""`` for semantic and ``"structural_<mode>_"`` for structural. Each
   holds a ``curves`` block (F/B/S/B_far arrays keyed by SPD ``bin_label``) plus a ``meta`` block
   (checkpoint, val/test metric, num_graphs, donors_K, ...).
-* specialisation (per task): ``<spec_collate>/<task>/scores_<task>.npz`` with the per-head
-  ``S_sem`` / ``S_str`` / ``S_attn_sem`` ``[L, H]`` matrices, and ``stats_<task>.json`` with the
-  val/test metrics + checks.
+* specialisation (per task): ``<spec_collate>/<task>/scores_<task>.npz`` with production EG
+  ``S_sem`` / ``S_str``, diagnostic CG companions and ``S_attn_sem`` ``[L,H]`` matrices, and
+  ``stats_<task>.json`` with the aggregation label, val/test metrics and checks.
 
 ``select_methods`` / ``is_vnode`` implement the drop/include filtering the deliverables need
 (e.g. drop the VNode runs for a final figure).
@@ -28,6 +28,7 @@ import numpy as np
 # compatibility; the QM9 notebook passes ``QM9_GAP_TASKS`` explicitly.
 DEFAULT_TASKS = ["zinc", "zinc_1hop", "zinc_2hop", "zinc_1hop_vnode", "zinc_2hop_vnode"]
 QM9_GAP_TASKS = ["qm9_gap_dense", "qm9_gap_1hop"]
+CURRENT_SCORE_CACHE_VERSION = 3  # graph-balanced EG production scores
 
 # Drive collate roots (mirror carriage.colab.DEFAULT_COLLATE_DIR and
 # specialisation.colab.DEFAULT_COLLATE_DIR). Kept here in the torch-free layer so the figure
@@ -178,14 +179,17 @@ def load_carriage_summary(path) -> Optional[dict]:
 
 
 def load_scores(path) -> Optional[dict]:
-    """Read a scores_<task>.npz -> {S_sem, S_str, S_attn_sem} as float arrays, or None."""
+    """Read a current score payload; ``S_sem/S_str`` are production EG matrices."""
     path = Path(path)
     if not path.exists():
         return None
     with np.load(path) as z:
         out = {"S_sem": np.asarray(z["S_sem"], float), "S_str": np.asarray(z["S_str"], float)}
-        if "S_attn_sem" in z:
-            out["S_attn_sem"] = np.asarray(z["S_attn_sem"], float)
+        for key in ("S_attn_sem", "S_sem_CG", "S_str_CG"):
+            if key in z:
+                out[key] = np.asarray(z[key], float)
+        if "score_aggregation" in z:
+            out["score_aggregation"] = str(np.asarray(z["score_aggregation"]).item())
     return out
 
 
@@ -209,11 +213,11 @@ def load_carriage_curves_by_task(carriage_collate, tasks: Sequence[str], interve
 
 
 def load_scores_by_task(spec_collate, tasks: Sequence[str]) -> dict:
-    """Current {task: scores_dict}; pre-v2 VNode caches are intentionally excluded."""
+    """Current {task: scores_dict}; pre-v3 CG-default caches are excluded."""
     out = {}
     for t in tasks:
         stats = load_spec_stats(spec_stats_path(spec_collate, t)) or {}
-        if is_vnode(t) and int(stats.get("score_cache_version", 0)) < 2:
+        if int(stats.get("score_cache_version", 0)) < CURRENT_SCORE_CACHE_VERSION:
             continue
         s = load_scores(scores_npz_path(spec_collate, t))
         if s is not None:

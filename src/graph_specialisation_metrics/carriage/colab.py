@@ -61,6 +61,8 @@ def run(
     structural_mode: str = "transposition",
     partner_match: str = "degree",
     # analysis knobs
+    # Functional carriage is fixed to F_sens = mean_event ||q_event||. F_coh is emitted only
+    # as a coherence/cancellation diagnostic; it is intentionally not a configuration choice.
     eval_split: str = "test",
     donor_split: str = "test",
     num_graphs: int = 64,
@@ -233,6 +235,8 @@ def _update_collation_index(collate_root: Path, spec: GritTaskSpec, results: dic
         "test_metric": checks.get("test_metric"),
         "num_graphs": meta.get("num_graphs"),
         "donors_K": meta.get("donors_K"),
+        "functional_estimand": meta.get("functional_estimand", "F_sens"),
+        "functional_carriage_version": meta.get("functional_carriage_version"),
         "B_far_at_0": (curves["B_far_mean"][0] if curves["B_far_mean"] else None),
         "B_far_at_1": (curves["B_far_mean"][1] if len(curves["B_far_mean"]) > 1 else None),
         "figures": outputs["figures"],

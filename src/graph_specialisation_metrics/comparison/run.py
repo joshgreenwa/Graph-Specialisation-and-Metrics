@@ -168,7 +168,7 @@ def inventory(tasks: Sequence[str] = _data.DEFAULT_TASKS, *,
         scores_exists = _data.scores_npz_path(spec_collate, t).exists()
         score_stats = _data.load_spec_stats(_data.spec_stats_path(spec_collate, t)) or {}
         score_version = int(score_stats.get("score_cache_version", 0))
-        scores = scores_exists and (not _data.is_vnode(t) or score_version >= 2)
+        scores = scores_exists and score_version >= _data.CURRENT_SCORE_CACHE_VERSION
         chan = _data.channel_ablation_npz_path(spec_collate, t).exists()
         fam = _data.family_ablation_npz_path(spec_collate, t).exists()
         outlier = _data.semantic_outlier_npz_path(spec_collate, t).exists()
@@ -636,9 +636,9 @@ def run_all(tasks: Sequence[str] = _data.DEFAULT_TASKS, *,
             # requested, its channel_ablation npz exists too. Otherwise (re)run this model.
             score_stats = _data.load_spec_stats(_data.spec_stats_path(spec_collate, t)) or {}
             score_version = int(score_stats.get("score_cache_version", 0))
-            vnode_score_current = (not _data.is_vnode(t) or score_version >= 2)
+            score_current = score_version >= _data.CURRENT_SCORE_CACHE_VERSION
             scores_cached = (_data.scores_npz_path(spec_collate, t).exists()
-                             and vnode_score_current)
+                             and score_current)
             chan_cached = _data.channel_ablation_npz_path(spec_collate, t).exists()
             fully_cached = scores_cached and (not with_channel_ablation or chan_cached)
             if not force and fully_cached:
@@ -647,9 +647,10 @@ def run_all(tasks: Sequence[str] = _data.DEFAULT_TASKS, *,
                 status["specialisation"][t] = "cached"
                 continue
             need_channel_ablation = with_channel_ablation and not chan_cached
-            if not vnode_score_current and _data.scores_npz_path(spec_collate, t).exists():
-                log(f"[cache] specialisation {t}: invalidating pre-v2 VNode score cache "
-                    "(virtual carrier was omitted); channel-ablation cache remains reusable.")
+            if not score_current and _data.scores_npz_path(spec_collate, t).exists():
+                log(f"[cache] specialisation {t}: invalidating pre-v3 score cache "
+                    "(production aggregation is now graph-balanced EG); "
+                    "channel-ablation cache remains reusable.")
             log(f"[run] specialisation scores for {t} ..."
                 + (" (+ channel-split ablation)" if need_channel_ablation else ""))
             ck = _resolve_ckpt(t)
@@ -1017,7 +1018,7 @@ def run_all(tasks: Sequence[str] = _data.DEFAULT_TASKS, *,
             return False
         version = int((_data.load_spec_stats(
             _data.spec_stats_path(spec_collate, task)) or {}).get("score_cache_version", 0))
-        return not _data.is_vnode(task) or version >= 2
+        return version >= _data.CURRENT_SCORE_CACHE_VERSION
 
     missing_scores = ([task for task in tasks if not _score_cache_current(task)]
                       if run_specialisation else [])

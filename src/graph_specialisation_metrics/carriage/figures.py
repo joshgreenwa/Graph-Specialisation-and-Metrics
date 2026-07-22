@@ -3,7 +3,7 @@
 Task-agnostic: given the per-pair arrays and provenance ``meta`` from grit_runner, it
 aggregates the distance curves, writes the three figures, the per-pair .npz, and the
 summary .json into ``out_dir``. The d=0 self-pair term is ~100x the transport terms, so
-B(d)/S(d) use symlog and the self term is marked; F(d) uses log.
+B(d)/S(d) use symlog and the self term is marked; production F_sens(d) uses log.
 """
 
 from __future__ import annotations
@@ -46,6 +46,7 @@ def make_figures_and_save(results: dict, out_dir: str, n_boot: int = 2000,
     gid = results["graph_id"]
     pd_ = results["distance"]
     pC, pB, F = results["C"], results["B"], results["F"]
+    F_coh = results.get("F_coh")
     a_sumC, a_dyhat = results["additivity_sumC"], results["additivity_dyhat"]
     checks, meta = results["checks"], results["meta"]
     K = int(meta["donors_K"])
@@ -56,10 +57,13 @@ def make_figures_and_save(results: dict, out_dir: str, n_boot: int = 2000,
 
     agg = core.aggregate_carriage_curves(gid, pd_, F, pB, n_boot=n_boot, boot_seed=boot_seed,
                                          bin_strategy=bin_strategy, central=central,
-                                         min_count=min_count)
+                                         min_count=min_count, F_coh=F_coh)
     ds, counts, n_g = agg["bin_center"], agg["pair_counts"], agg["n_graphs"]
     labels = agg["bin_label"]
     F_mean, F_lo, F_hi = agg["F_mean"], agg["F_lo"], agg["F_hi"]
+    F_coh_mean, F_coh_lo, F_coh_hi = (
+        agg["F_coh_mean"], agg["F_coh_lo"], agg["F_coh_hi"]
+    )
     B_mean, B_lo, B_hi = agg["B_mean"], agg["B_lo"], agg["B_hi"]
     S_mean, S_lo, S_hi = agg["S_mean"], agg["S_lo"], agg["S_hi"]
     Bf_mean, Bf_lo, Bf_hi = agg["B_far_mean"], agg["B_far_lo"], agg["B_far_hi"]
@@ -97,9 +101,9 @@ def make_figures_and_save(results: dict, out_dir: str, n_boot: int = 2000,
         ax.annotate("self ($i{=}j$)", (ds[0], F_mean[0]), textcoords="offset points",
                     xytext=(8, -2), fontsize=8, color=self_col, va="center")
     ax.set_xlabel("shortest-path distance bin [hops]")
-    ax.set_ylabel(r"$F$(bin) $=$ central $\|C_{\mathrm{out}}[i,j]\|$")
-    ax.set_title("Functional carriage $F$\n"
-                 r"(label-free: magnitude of the output movement from $j$ at $i$)")
+    ax.set_ylabel(r"$F_{\mathrm{sens}}$(bin) $=$ central $\,\mathbb{E}_k\|q_k[i,j]\|$")
+    ax.set_title(r"Functional carriage $F_{\mathrm{sens}}$" "\n"
+                 r"(label-free: typical eventwise output movement from $j$ at $i$)")
     if np.nanmin(F_mean[np.isfinite(F_mean)]) > 0 if np.any(np.isfinite(F_mean)) else False:
         ax.set_yscale("log")
     _xaxis(ax)
@@ -193,11 +197,15 @@ def make_figures_and_save(results: dict, out_dir: str, n_boot: int = 2000,
     ax = axes[1, 1]
     for gi_ in range(n_g):
         ax.plot(ds, F_per_graph[gi_], "-", color=C_FUNC, alpha=0.13, lw=0.9)
-    ax.plot(ds, F_mean, "o-", color="0.1", lw=2.0, ms=4.5, label=f"{ctag} over graphs")
+    ax.plot(ds, F_mean, "o-", color="0.1", lw=2.0, ms=4.5,
+            label=rf"$F_{{\rm sens}}$: {ctag}")
+    if F_coh is not None:
+        ax.plot(ds, F_coh_mean, "s--", color=C_ADV, lw=1.4, ms=3.8,
+                label=r"$F_{\rm coh}=\|\mathbb{E}_k q_k\|$")
     if np.any(np.isfinite(F_mean)) and np.nanmin(F_mean[np.isfinite(F_mean)]) > 0:
         ax.set_yscale("log")
-    ax.set_xlabel("SPD bin [hops]"); ax.set_ylabel("$F$(bin)")
-    ax.set_title("Per-graph $F$ (spaghetti) vs central")
+    ax.set_xlabel("SPD bin [hops]"); ax.set_ylabel("functional carriage")
+    ax.set_title(r"Per-graph $F_{\rm sens}$ and coherence diagnostic")
     _xaxis(ax)
     ax.legend(frameon=False, fontsize=8)
     fig.suptitle("Diagnostics   " + tag, fontsize=9.5, y=1.03)
@@ -210,9 +218,16 @@ def make_figures_and_save(results: dict, out_dir: str, n_boot: int = 2000,
     np.savez_compressed(
         npz_path,
         graph_id=gid, carrier_i=results["carrier_i"], source_j=results["source_j"],
-        distance=pd_, C=pC, B=pB, F=F,
+        distance=pd_, C=pC, B=pB, F=F, F_sens=F,
+        F_coh=(np.asarray(F_coh) if F_coh is not None else np.full_like(F, np.nan)),
+        functional_estimand=np.asarray(meta.get("functional_estimand", "F_sens")),
+        functional_carriage_version=np.asarray(
+            meta.get("functional_carriage_version", core.FUNCTIONAL_CARRIAGE_VERSION)
+        ),
         bin_lo=agg["bin_lo"], bin_hi=agg["bin_hi"], bin_center=ds,
         F_mean=F_mean, F_lo=F_lo, F_hi=F_hi,
+        F_sens_mean=F_mean, F_sens_lo=F_lo, F_sens_hi=F_hi,
+        F_coh_mean=F_coh_mean, F_coh_lo=F_coh_lo, F_coh_hi=F_coh_hi,
         B_mean=B_mean, B_lo=B_lo, B_hi=B_hi,
         B_sum_per_graph_mean=S_mean, B_sum_per_graph_lo=S_lo, B_sum_per_graph_hi=S_hi,
         pair_counts=counts, k=edges, B_far_mean=Bf_mean, B_far_lo=Bf_lo, B_far_hi=Bf_hi,
@@ -227,6 +242,10 @@ def make_figures_and_save(results: dict, out_dir: str, n_boot: int = 2000,
             "bin_label": labels, "bin_strategy": bin_strategy, "central": central,
             "min_count": int(min_count), "pair_counts": counts.tolist(),
             "F_mean": F_mean.tolist(), "F_lo": F_lo.tolist(), "F_hi": F_hi.tolist(),
+            "F_sens_mean": F_mean.tolist(), "F_sens_lo": F_lo.tolist(),
+            "F_sens_hi": F_hi.tolist(),
+            "F_coh_mean": F_coh_mean.tolist(), "F_coh_lo": F_coh_lo.tolist(),
+            "F_coh_hi": F_coh_hi.tolist(),
             "B_mean": B_mean.tolist(), "B_lo": B_lo.tolist(), "B_hi": B_hi.tolist(),
             "B_sum_per_graph_mean": S_mean.tolist(),
             "k": edges.tolist(), "B_far_mean": Bf_mean.tolist(),
@@ -240,7 +259,8 @@ def make_figures_and_save(results: dict, out_dir: str, n_boot: int = 2000,
 
     # ---- console table ----------------------------------------------------------------
     log("\n" + "=" * 88)
-    log(f"RESULTS  (bins={bin_strategy}, {ctag} over graphs; F=||dy_hat||; B<0 = beneficial, {units})")
+    log(f"RESULTS  (bins={bin_strategy}, {ctag} over graphs; "
+        f"F=F_sens=mean_k||q_k||; B<0 = beneficial, {units})")
     log("=" * 88)
     log(f"{'bin':>7} {'#pairs':>9} {'F':>12} {'B':>13} {'sumB/graph':>13} {'B_far(>hi)':>13}")
     for b in range(len(labels)):

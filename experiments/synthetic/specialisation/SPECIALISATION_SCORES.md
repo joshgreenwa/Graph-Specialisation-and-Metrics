@@ -10,6 +10,11 @@ bias**, content-only value, readout on a designated query node (node 0) — trai
 `spec_tasks_train.py`. The method is architecture-general within that family; the same estimator
 skeleton mirrors `/carriage/`, so the two are kept consistent.
 
+> **Historical estimator:** this spec-lite experiment retains coherent-gross (CG), averaging donor
+> deltas before magnitude. The central production GRIT methodology in
+> `src/graph_specialisation_metrics/specialisation/README.md` now uses graph-balanced
+> eventwise-gross (EG). Do not treat the CG equations below as the current production default.
+
 ## Setup
 
 A graph carries content `X` (role-flags + content columns) and structure `S` (node-RRWP `nd`,

@@ -7,8 +7,8 @@ Reference for the two **carriage** methodologies implemented in this package:
   structural transposition.
 
 They differ only in the intervention. Both capture the same final node state, form the same
-within-batch transport delta, and use the same functional `F`, beneficial `B`, distance-binning,
-aggregation, and verification machinery. The primary structural intervention is implemented in
+within-batch transport delta, and use the same default functional `F_sens`, beneficial `B`,
+distance-binning, aggregation, and verification machinery. The primary structural intervention is implemented in
 `structural.py` and `structural_runner.py` and is part of the methodology documented here (the API
 may still label that execution path `BETA`).
 
@@ -71,8 +71,10 @@ different questions and must not be described as using an identical structural i
 
 Both `u` and `v` move under a transposition, but carriage is indexed by the declared anchor `u`
 and pristine distance `d(i,u)`. The partner is a nuisance variable: `K` partners are sampled with
-replacement and averaged before the magnitude is taken, exactly as semantic donor identity is
-marginalised. `partner_match="degree"` is the primary setting, drawing `v` from nodes with the
+replacement and marginalised exactly as semantic donor identity is marginalised. For functional
+carriage, each partner's response magnitude is computed before this average; signed loss carriage
+and beneficial carriage retain their signed/pathwise averaging rules. `partner_match="degree"` is
+the primary setting, drawing `v` from nodes with the
 same degree when possible, then from the nearest-degree bucket when no exact match exists;
 `partner_match="any"` is an unmatched sensitivity control. A full structure-plus-content
 transposition is a graph isomorphism and must leave the pooled prediction invariant; this is the
@@ -92,23 +94,38 @@ batch-context float offset cancels):
     semantic:  Δh_i(j,k) = h^L_i(X, S) − h^L_i(X_{j→x̃_k}, S)
     structural: Δh_i(u,k) = h^L_i(X, S) − h^L_i(X, S_{u↔v_k})
 
-Projecting onto a readout gradient and donor-averaging gives the carriage under that gradient:
+Projecting onto a readout gradient and donor-averaging gives the signed carriage under that gradient:
 
     C^g[i,s] = (1/K) Σ_k  g_i · Δh_i(s,k)
 
-Here `k` indexes semantic donors or structural partners. The nuisance average is taken in signed
-transport space before `F` applies its magnitude.
+Here `k` indexes semantic donors or structural partners. This signed average defines `C_loss` and
+the coherent-response diagnostic below. Production functional carriage instead takes the output
+magnitude per valid event before marginalising donor/partner identity.
 
-## Functional carriage `F` (label-free)
+## Functional carriage `F_sens` (label-free; production default)
 
-Magnitude of the output movement that source/anchor `s` induces at `i`, over the `T` outputs:
+For each intervention event, form the output-projected transport vector
 
-    F[i,s] = ‖ ( C^{out_t}[i,s] )_{t=1..T} ‖_2          # = |C^out[i,s]| when T = 1
+    q[k,i,s] = (g^out_{t,i} · Δh_i(s,k))_{t=1..T}.
 
-`F(bin) = mean_{d(i,s)∈bin} F[i,s]` (aggregated as below). It answers *does the model use the
-intervened semantic/structural signal at `i`, and how far does that use reach* — no labels
-involved. It measures the reach and magnitude of response, not the information richness of the
-signal that arrived.
+The fixed default is eventwise sensitivity:
+
+    F_sens[i,s] = (1/K) Σ_k ‖q[k,i,s]‖_2.
+
+Magnitude is taken before the nuisance average, so two real donors/partners that evoke equally
+large but opposite output movements do not erase one another. This matches the eventwise-gross
+(`EG`) specialisation estimand. `F_sens(bin)` is aggregated over pairs as below. It answers *does
+the model typically use the intervened semantic/structural signal at `i`, and how far does that use
+reach* — no labels involved. It measures the reach and magnitude of response, not the information
+richness of the signal that arrived.
+
+The previous estimator is retained, explicitly renamed as a diagnostic:
+
+    F_coh[i,s] = ‖(1/K) Σ_k q[k,i,s]‖_2.
+
+`F_coh` asks whether the population-average intervention moves the carrier consistently; wherever
+`F_sens > 0`, `F_coh/F_sens ∈ [0,1]` describes directional coherence (up to numerical error). It is
+useful for diagnosing donor cancellation but is no longer the functional-carriage default.
 
 ## Beneficial carriage `B` (does the transport help the task?)
 
@@ -171,14 +188,15 @@ signed denominator cancels.
 Pairs are pooled into adaptive shortest-path bins (`log` default: `{0},{1},{2},{3},{4–7},
 {8–15},{16–31},…`) and reported over **graphs**:
 
-    F(bin), B(bin)  = robust central tendency (20%-trimmed mean; median/mean optional) of the
+    F_sens(bin), B(bin) = robust central tendency (20%-trimmed mean; median/mean optional) of the
                       per-graph mean, with a graph-clustered bootstrap 95% CI; bins with < 50
                       pairs are dropped.
     S(bin)          = per-graph SUM of B in bin, mean over graphs (loss units; additive).
     B_far(k)        = per-graph SUM of B over d(i,s) > k, mean over graphs (at bin upper edges).
 
-`S` telescopes to `B_far` at bin edges. Every raw per-pair `(graph, i, j, d, C_loss, B, F)` is
-saved to `carriage_pairs.npz` (`j` stores the semantic source or structural anchor), so every
+`S` telescopes to `B_far` at bin edges. Every raw per-pair
+`(graph, i, j, d, C_loss, B, F_sens, F_coh)` is saved to `carriage_pairs.npz` (`F` remains a
+compatibility alias for `F_sens`; `j` stores the semantic source or structural anchor), so every
 reported binning and aggregation can be recomputed. Recomputing a different carrier estimator
 requires rerunning the checkpoint because intervention-path final states are intentionally not
 persisted.
@@ -194,6 +212,11 @@ persisted.
   `C_loss = sign(ŷ−y)·C^out` recovers the dissertation's error-direction projection (Eq. 3.8) and
   `B` is its exact `dL_s`-attribution; for `T > 1` (multi-target regression, multilabel) it is the
   principled generalisation, and it keeps `F` label-free while `B` uses the loss.
+- **Eventwise functional sensitivity.** `F_sens = E_k||q_k||` is the production functional
+  carriage estimand because donor/partner direction is a nuisance, not evidence that a response
+  did not occur. It is aligned with EG specialisation and was empirically indistinguishable in
+  broad conclusions from the earlier coherent curve. `F_coh = ||E_k q_k||` remains a named
+  cancellation/coherence diagnostic rather than a competing headline score.
 - **Structural transposition with a marginalised partner.** Conjugates every structure-derived
   channel while holding content fixed. Degree matching reduces arbitrary partner variation; the
   average over `K` partners prevents a single second moved node from defining the result.
@@ -254,6 +277,9 @@ Plus a checkpoint-load metric
   `bin_strategy` (`log`|`hop`|`equal_count`), `central`
   (`trimmed`|`median`|`mean`), `num_graphs`, `donors` (K).
 - Outputs per task/intervention under `…/carriage_figures/<task>/`: three figures,
-  `carriage_pairs.npz` (raw pairs + curves), and `carriage_summary.json` (curves + intervention
-  settings + checks). The collation index uses distinct keys for semantic and structural modes,
+  `carriage_pairs.npz` (raw pairs + curves; `F`/`F_sens` are the default and `F_coh` is retained),
+  and `carriage_summary.json` (both functional curves + intervention settings + checks). Artifacts
+  record `functional_estimand="F_sens"` and functional-carriage version `2`; progress from the
+  former coherent default is fingerprint-incompatible and therefore recomputed. The collation
+  index uses distinct keys for semantic and structural modes,
   so running both does not overwrite their headline rows.

@@ -151,6 +151,21 @@ def test_per_graph_semantic_collector_matches_method_a_sum():
     np.testing.assert_allclose(collector.scores["semantic"][7], [[5., 6.]])
 
 
+def test_per_graph_semantic_collector_prefers_eventwise_eg_payload():
+    import torch
+
+    collector = S._PerGraphSemanticCollector()
+    phi = torch.ones(1, 2, 1, 1)
+    coherent_delta = torch.zeros(1, 2, 1, 1)
+    eventwise = torch.tensor([[[2.0], [3.0]]])
+    collector(
+        channel="semantic", graph_id=8, source_nodes=np.asarray([0]),
+        phi_stack=[phi], donor_averaged_delta=[coherent_delta],
+        eventwise_functional=[eventwise],
+    )
+    np.testing.assert_allclose(collector.scores["semantic"][8], [[5.0]])
+
+
 def test_attention_capture_omits_virtual_edges_from_atom_matrix():
     import torch
     import pytest

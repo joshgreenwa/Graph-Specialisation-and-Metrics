@@ -31,7 +31,7 @@ from .scores import score_model
 
 BETA_TASKS = ("zinc", "zinc_1hop", "zinc_1hop_local")
 DEFAULT_OUT_DIR = "/content/drive/MyDrive/graph_specialisation_metrics/beta_zinc_causal_specialisation"
-BIN_LABELS = ("0", "1", "2", "3", "4-7", "8+")
+BIN_LABELS = ("0", "1", "2", "3", "4-7", "8+", "unreachable", "hub")
 CHANNELS = ("semantic", "structural")
 
 
@@ -100,7 +100,7 @@ def rrwp_coordinate_novelty(base) -> dict:
 def _distance_bin_masks(distances: np.ndarray) -> list[np.ndarray]:
     d = np.asarray(distances, dtype=float)
     return [d == 0, d == 1, d == 2, d == 3, (d >= 4) & (d <= 7),
-            (d >= 8) & np.isfinite(d)]
+            (d >= 8) & np.isfinite(d), ~np.isfinite(d)]
 
 
 @dataclass
@@ -119,6 +119,7 @@ class ResponseCollector:
     def __call__(
         self, *, channel, graph_id, base, source_nodes, phi_stack,
         donor_averaged_delta, clean_prediction, clean_head_output=None,
+        eventwise_functional=None,
     ) -> None:
         import torch
 
@@ -136,10 +137,21 @@ class ResponseCollector:
         response = torch.zeros(S, len(BIN_LABELS), L, H,
                                device=phi_stack[0].device, dtype=phi_stack[0].dtype)
         for layer, (phi, delta) in enumerate(zip(phi_stack, donor_averaged_delta)):
-            projected = torch.einsum("tnhd,snhd->tsnh", phi, delta)
-            functional = projected.square().sum(dim=0).sqrt()
+            if eventwise_functional is None:
+                projected = torch.einsum("tnhd,snhd->tsnh", phi, delta)
+                functional = projected.square().sum(dim=0).sqrt()
+            else:
+                functional = eventwise_functional[layer]
+            real_functional = functional[:, :n]
             for b, mask in enumerate(masks):
-                response[:, b, layer, :] = torch.einsum("snh,sn->sh", functional, mask)
+                response[:, b, layer, :] = torch.einsum(
+                    "snh,sn->sh", real_functional, mask
+                )
+            # Virtual-node transport has no molecular hop distance.  Retain it in an
+            # explicit hub bucket so summing the distance decomposition exactly
+            # reconstructs the production score instead of silently dropping it.
+            if int(functional.shape[1]) > n:
+                response[:, -1, layer, :] = functional[:, n:].sum(dim=1)
         self.records[channel].append({
             "graph_id": int(graph_id),
             "source_nodes": source_nodes.copy(),
@@ -159,9 +171,11 @@ class ResponseCollector:
 
     def score_reconstruction(self, channel: str) -> np.ndarray:
         records = self.records[channel]
-        total = sum(r["response"].sum(axis=(0, 1)) for r in records)
-        count = sum(int(r["response"].shape[0]) for r in records)
-        return total / max(count, 1)
+        per_graph = [
+            r["response"].sum(axis=(0, 1)) / max(int(r["response"].shape[0]), 1)
+            for r in records
+        ]
+        return np.mean(per_graph, axis=0) if per_graph else np.asarray([])
 
     def graph_score(self, channel: str, graph_id: int, bins=None) -> np.ndarray:
         record = next(r for r in self.records[channel] if int(r["graph_id"]) == int(graph_id))

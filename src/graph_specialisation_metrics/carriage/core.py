@@ -7,7 +7,7 @@ or a trained model. Everything model- or task-specific lives in ``grit_runner`` 
 Implements the dissertation methodology (Ch. 3, Sections 3.2-3.3):
 
   semantic carriage      C_swap[i,j] = (1/K) sum_k g_i^T [h^L_i(clean) - h^L_i(swap_k)]   (3.4/3.5)
-  functional carriage    F[i,j] = |C[i,j]|,  F(d) = mean_{d(i,j)=d} |C[i,j]|             (3.6/3.7)
+  functional carriage    F_sens[i,j] = (1/K) sum_k ||q[k,i,j]||_2                         (3.6/3.7)
   beneficial carriage    exact loss change via a signed final-state path integral
   B_far(k)               sum over {(i,j): d(i,j) > k} of B[i,j]                            [MAE units]
 """
@@ -15,6 +15,13 @@ Implements the dissertation methodology (Ch. 3, Sections 3.2-3.3):
 from __future__ import annotations
 
 import numpy as np
+
+
+# Included in graph-wise progress fingerprints and persisted output metadata.  Version 2 makes
+# eventwise sensitivity (F_sens) the production functional-carriage estimand; version 1 used the
+# norm of the donor-mean response (now retained as the F_coh diagnostic).
+FUNCTIONAL_CARRIAGE_VERSION = 2
+FUNCTIONAL_CARRIAGE_ESTIMAND = "F_sens"
 
 
 def carriage_from_states(h_clean, h_swap, g, num_sources: int, num_donors: int):
@@ -35,9 +42,9 @@ def carriage_from_states(h_clean, h_swap, g, num_sources: int, num_donors: int):
     Returns:
         [n, n] tensor C[i, j]: carrier i (rows) x source j (columns).
 
-    Sign convention: dh is CLEAN minus SWAPPED, exactly as written in Eq. 3.4. The
-    donor average is taken BEFORE any abs() (Eq. 3.6) or sign(), because both are
-    defined as functions of the estimator C, not of the per-donor terms.
+    Sign convention: dh is CLEAN minus SWAPPED, exactly as written in Eq. 3.4. This
+    function returns the signed donor-mean estimator ``C`` used by loss carriage.
+    Production functional carriage ``F_sens`` is computed separately from eventwise terms.
     """
     S, K = int(num_sources), int(num_donors)
     n, m = h_clean.shape
@@ -73,31 +80,76 @@ def carriage_from_delta(delta, g, num_sources: int, num_donors: int):
 
 
 def functional_magnitude(h_clean, h_swap, g_out, num_sources, num_donors):
-    """Functional carriage magnitude F[i,j] = || C_out[i,j] ||_2 over the T outputs.
+    """Default functional carriage F_sens: mean eventwise output-response magnitude.
 
     Label-free (Def 3.3.2): how much does moving content from j change node i's effect on
-    the model's OUTPUT? For a scalar output (T=1) this is |C[i,j]| exactly; for a vector
-    output it is the L2 norm of the per-output carriage.
+    the model's OUTPUT? Magnitude is taken for each donor/partner event before nuisance
+    averaging, so valid responses in opposite directions cannot cancel.
 
     Args:
         g_out: [T, n, m] Jacobian of the output w.r.t. h^L (one [n,m] slice per output t),
                evaluated at the clean input.
 
     Returns:
-        [n, n] numpy: F[i, j] (carrier x source), non-negative.
+        [n, n] numpy: F_sens[i, j] (carrier x source), non-negative.
     """
     delta = h_clean.unsqueeze(0) - h_swap
     return functional_magnitude_from_delta(delta, g_out, num_sources, num_donors)
 
 
 def functional_magnitude_from_delta(delta, g_out, num_sources, num_donors):
-    """Functional carriage magnitude from a precomputed transport delta (see above)."""
-    T = int(g_out.shape[0])
-    acc = None
-    for t in range(T):
-        Ct = carriage_from_delta(delta, g_out[t], num_sources, num_donors)  # [i,j]
-        acc = Ct.pow(2) if acc is None else acc + Ct.pow(2)
-    return acc.sqrt().cpu().numpy()  # [i, j], carrier x source
+    """Return production ``F_sens`` from a precomputed transport delta.
+
+    This public name is retained for API compatibility, but now resolves to the declared
+    default estimand.  Use :func:`functional_magnitudes_from_delta` when the companion
+    coherent-response diagnostic is also required.
+    """
+    F_sens, _F_coh = functional_magnitudes_from_delta(
+        delta, g_out, num_sources, num_donors
+    )
+    return F_sens
+
+
+def functional_magnitudes_from_delta(delta, g_out, num_sources, num_donors):
+    """Compute eventwise sensitivity and coherent-response functional carriage together.
+
+    For ``q[k,i,s] = (g_out[t,i] . delta[k,i,s])_t``:
+
+    ``F_sens[i,s] = mean_k ||q[k,i,s]||_2`` (production default), while
+    ``F_coh[i,s] = ||mean_k q[k,i,s]||_2`` is a cancellation/coherence diagnostic.
+
+    Returns two ``[carrier i, source s]`` NumPy arrays ``(F_sens, F_coh)``.  Computing both
+    in one pass avoids retaining the full ``[event, output, carrier]`` projection tensor.
+    """
+    import torch
+
+    S, K = int(num_sources), int(num_donors)
+    if delta.ndim != 3:
+        raise ValueError(f"delta must be [S*K,n,m], got {tuple(delta.shape)}")
+    if int(delta.shape[0]) != S * K:
+        raise ValueError(f"delta has {delta.shape[0]} events, expected S*K={S*K}")
+    if g_out.ndim != 3 or tuple(g_out.shape[1:]) != tuple(delta.shape[1:]):
+        raise ValueError(
+            f"g_out must be [T,n,m] aligned with delta; got {tuple(g_out.shape)} "
+            f"for delta {tuple(delta.shape)}"
+        )
+    if int(g_out.shape[0]) < 1:
+        raise ValueError("g_out must contain at least one output direction")
+
+    event_sq = torch.zeros(
+        (S, K, int(delta.shape[1])), device=delta.device, dtype=delta.dtype
+    )
+    coherent_sq = torch.zeros(
+        (S, int(delta.shape[1])), device=delta.device, dtype=delta.dtype
+    )
+    for t in range(int(g_out.shape[0])):
+        q_t = torch.einsum("rnm,nm->rn", delta, g_out[t]).view(S, K, -1)
+        event_sq.add_(q_t.square())
+        coherent_sq.add_(q_t.mean(dim=1).square())
+
+    F_sens = event_sq.sqrt().mean(dim=1).t().contiguous()
+    F_coh = coherent_sq.sqrt().t().contiguous()
+    return F_sens.cpu().numpy(), F_coh.cpu().numpy()
 
 
 def pool_final_states(h, pooling: str):
@@ -493,15 +545,16 @@ def _central(x, how: str):
 
 def aggregate_carriage_curves(graph_id, distance, F, B, n_boot: int = 2000,
                               boot_seed: int = 1234, bin_strategy: str = "log",
-                              central: str = "trimmed", min_count: int = 50) -> dict:
-    """Binned, robust, graph-clustered distance profiles F, B, the loss mass S, and B_far.
+                              central: str = "trimmed", min_count: int = 50,
+                              F_coh=None) -> dict:
+    """Binned, robust, graph-clustered profiles F_sens, B, loss mass S, and B_far.
 
     For each SPD bin:
-      * F, B: two-stage estimator over graphs -- per-graph MEAN within the bin, then a robust
+      * F_sens, B: two-stage estimator over graphs -- per-graph MEAN within the bin, then a robust
         central tendency (``central``: median / 20%-trimmed mean / mean) ACROSS graphs, with a
         graph-clustered bootstrap CI. This weights each graph equally (not by pair count) and
         resists the few large-diameter graphs that dominate far bins. Bins with < ``min_count``
-        pairs are dropped (NaN).
+        pairs are dropped (NaN). If supplied, F_coh is aggregated identically as a diagnostic.
       * S: per-graph SUM within the bin, MEAN over graphs (loss units; additive, so the tail
         bins telescope to B_far).
       * B_far(edge): per-graph SUM over d > edge, MEAN over graphs, evaluated at each bin's
@@ -514,6 +567,9 @@ def aggregate_carriage_curves(graph_id, distance, F, B, n_boot: int = 2000,
     distance = np.asarray(distance).astype(np.int64)
     F = np.asarray(F, dtype=np.float64)
     B = np.asarray(B, dtype=np.float64)
+    F_coh = None if F_coh is None else np.asarray(F_coh, dtype=np.float64)
+    if F_coh is not None and F_coh.shape != F.shape:
+        raise ValueError(f"F_coh shape {F_coh.shape} != F shape {F.shape}")
 
     dmax = int(distance.max()) if distance.size else -1
     bins = make_distance_bins(dmax, distance, bin_strategy)
@@ -561,17 +617,25 @@ def aggregate_carriage_curves(graph_id, distance, F, B, n_boot: int = 2000,
 
     counts = np.zeros(nb, dtype=np.int64)
     F_mean, F_lo, F_hi = (np.full(nb, np.nan) for _ in range(3))
+    F_coh_mean, F_coh_lo, F_coh_hi = (np.full(nb, np.nan) for _ in range(3))
     B_mean, B_lo, B_hi = (np.full(nb, np.nan) for _ in range(3))
     S_mean, S_lo, S_hi = (np.full(nb, np.nan) for _ in range(3))
     F_per_graph = np.full((n_g, nb), np.nan)
+    F_coh_per_graph = np.full((n_g, nb), np.nan)
 
     for b in range(nb):
         m = bidx == b
         counts[b] = int(m.sum())
         Fg, present = _per_graph_mean(F, m)
         F_per_graph[:, b] = Fg
+        Fcg = None
+        if F_coh is not None:
+            Fcg, _ = _per_graph_mean(F_coh, m)
+            F_coh_per_graph[:, b] = Fcg
         if counts[b] >= min_count:
             F_mean[b], F_lo[b], F_hi[b] = _robust_over_graphs(Fg)
+            if Fcg is not None:
+                F_coh_mean[b], F_coh_lo[b], F_coh_hi[b] = _robust_over_graphs(Fcg)
             Bg, _ = _per_graph_mean(B, m)
             B_mean[b], B_lo[b], B_hi[b] = _robust_over_graphs(Bg)
         S_mean[b], S_lo[b], S_hi[b] = _mean_over_graphs(_per_graph_sum(B, m))
@@ -587,10 +651,12 @@ def aggregate_carriage_curves(graph_id, distance, F, B, n_boot: int = 2000,
         "distances": bin_center, "n_bins": nb, "bin_strategy": bin_strategy, "central": central,
         "min_count": int(min_count), "pair_counts": counts, "n_graphs": n_g,
         "F_mean": F_mean, "F_lo": F_lo, "F_hi": F_hi,
+        "F_coh_mean": F_coh_mean, "F_coh_lo": F_coh_lo, "F_coh_hi": F_coh_hi,
         "B_mean": B_mean, "B_lo": B_lo, "B_hi": B_hi,
         "S_mean": S_mean, "S_lo": S_lo, "S_hi": S_hi,
         "k": edges, "B_far_mean": Bf_mean, "B_far_lo": Bf_lo, "B_far_hi": Bf_hi,
         "F_per_graph": F_per_graph,
+        "F_coh_per_graph": F_coh_per_graph,
     }
 
 

@@ -1,33 +1,37 @@
-"""Standalone Colab beta for the ZINC specialisation-method redesign.
+"""Standalone Colab rerun for the headline ZINC specialisation methodology.
 
 Paste this file into one Colab cell, or run it from the repository.  It loads the
 trained dense-GRIT and 1-hop-GRIT ZINC checkpoints read-only, evaluates the successor
 specialisation protocol on deterministic disjoint graph splits, and writes resumable
-artifacts beneath ``MyDrive/graph_specialisation_metrics/zinc_redesign_beta_v1``.
+artifacts beneath ``MyDrive/graph_specialisation_metrics/zinc_redesign_headline_v2``.
 
-This is deliberately isolated from the production ``specialisation`` and ``carriage``
-packages.  Nothing here changes the current methodology.  The beta tests:
+This remains deliberately isolated from the production analysis packages, but its two headline
+estimands are fixed rather than reselected from the data: graph-balanced eventwise-gross ``EG``
+specialisation and eventwise functional sensitivity ``F_sens`` carriage.  It tests:
 
-* coherent/eventwise x gross/net score aggregation (CG, EG, CN, EN);
-* graph-balanced donor -> source -> graph estimation and donor-count convergence;
+* graph-balanced donor -> source -> graph EG estimation and donor-count convergence;
 * D selectivity, evoked strength J, and joint-channel strength G;
 * whole-transport restore/inject patching, zero-ablation necessity, sham and
   same-node-count cross-graph mismatch controls on an independent graph split;
 * individual and family ablation on a third split;
-* fixed-support routing/message decomposition for semantic and PE interventions;
-* sensitivity/coherence carriage with intervention-specific distance;
-* sample-split conditional-specialisation screening;
+* support-aware routing/message/wiring decomposition for all three interventions;
+* final-state ``F_sens`` and path-integrated beneficial carriage for semantic, PE and topology;
+* an exact distance decomposition of each head's EG score, with a separate hub bucket,
+  and frozen-family reach profiles aligned to functional and beneficial carriage;
+* an expanded sample-split conditional screen over raw scores and all pairwise D/J/G coordinates;
 * a matched-real, non-isomorphic molecular-topology donor intervention with donor
   topology/RRWP copied in aligned base-node coordinates while atom content and target
   stay fixed.
 
-The topology intervention is an exploratory third structural probe.  It is not silently
-substituted for PE transposition in D: a whole-graph topology donor has a different
-intervention unit and dose.  Its coverage, matching tier, graph-edit dose, agreement with
-PE scores, and causal mediation are reported explicitly before any adoption decision.
+The topology intervention remains a separate third channel.  The rerun explicitly adds semantic
+versus topology score planes, activity-gated PE versus topology contrasts, pooled/within-layer
+correlations, top-k graph-bootstrap stability, frozen PE-specific/topology-specific/shared families,
+held-out simultaneous three-channel family patching, and tier/dose-stratified results.
 
 The expensive phases are resumable: ``scores``, ``causal``, ``mechanism``, ``ablations``,
-and ``figures``.  ``all`` runs them in that order.  ``--fast-dev-run`` is plumbing only.
+and ``figures``. Score estimation checkpoints every completed source group, channel and graph;
+rare quadrature cap hits are retained only under explicit per-path error and global-rate gates.
+``all`` runs the phases in order. ``--fast-dev-run`` is plumbing only.
 """
 
 from __future__ import annotations
@@ -51,13 +55,13 @@ from urllib.parse import quote
 import numpy as np
 
 
-BETA_VERSION = "zinc-specialisation-redesign-beta-v1"
-BETA_SCHEMA = 1
+BETA_VERSION = "zinc-specialisation-headline-v2"
+BETA_SCHEMA = 2
 REPOSITORY_URL = "https://github.com/joshgreenwa/Graph-Specialisation-and-Metrics.git"
 REPOSITORY_BRANCH = "codex/cfim-grit-experiments"
 COLAB_REPOSITORY = Path("/content/Graph-Specialisation-and-Metrics")
 DEFAULT_OUTPUT = Path(
-    "/content/drive/MyDrive/graph_specialisation_metrics/zinc_redesign_beta_v1"
+    "/content/drive/MyDrive/graph_specialisation_metrics/zinc_redesign_headline_v2"
 )
 SECRET_NAME = "dissertation_key"
 ARCHITECTURES = ("zinc", "zinc_1hop")
@@ -65,10 +69,37 @@ DISPLAY = {"zinc": "Dense GRIT", "zinc_1hop": "1-hop GRIT"}
 PRIMARY_CHANNELS = ("semantic", "pe")
 CHANNELS = ("semantic", "pe", "topology")
 AGGREGATIONS = ("CG", "EG", "CN", "EN")
+HEADLINE_AGGREGATION = "EG"
+PATCH_FAMILY_NAMES = (
+    "semantic_specialist",
+    "pe_specialist",
+    "structural_pe_specific",
+    "structural_topology_specific",
+    "structural_shared",
+    "high_J",
+    "high_G_balanced",
+    "low_J_inert",
+)
+DISTANCE_FAMILIES = {
+    "semantic": ("semantic_specialist", "high_G_balanced"),
+    "pe": ("structural_pe_specific", "structural_shared"),
+    "topology": ("structural_topology_specific", "structural_shared"),
+}
+CONDITIONAL_SCORE_FEATURES = (
+    "S_semantic", "S_pe", "S_topology",
+    "D_semantic_pe", "J_semantic_pe", "G_semantic_pe",
+    "D_semantic_topology", "J_semantic_topology", "G_semantic_topology",
+    "D_pe_topology", "J_pe_topology", "G_pe_topology",
+    "J_three_channel", "G_three_channel",
+)
 EPS = 1.0e-12
 CUDA_EQUIVALENCE_ATOL = 1.0e-4
 CUDA_EQUIVALENCE_RTOL = 2.0e-5
 MECHANISM_ATOL = 3.0e-4
+DISTANCE_UNREACHABLE = -1
+DISTANCE_HUB = -2
+DISTANCE_IDENTITY_ATOL = 2.0e-5
+DISTANCE_IDENTITY_RTOL = 2.0e-5
 
 
 # =====================================================================================
@@ -207,7 +238,7 @@ class BetaConfig:
     score_sources: int = 8
     semantic_donors: int = 8
     pe_partners: int = 8
-    topology_donors: int = 2
+    topology_donors: int = 6
     topology_pool: int = 10_000
     causal_graphs: int = 48
     causal_sources: int = 2
@@ -227,6 +258,17 @@ class BetaConfig:
     selectivity_threshold: float = 0.20
     min_condition_graphs: int = 12
     min_condition_fraction: float = 0.20
+    conditional_per_feature: int = 2
+    conditional_max_tests: int = 48
+    topk_values: tuple[int, ...] = (3, 5, 10)
+    # ZINC's L1/readout paths can contain isolated kinks.  This established carriage
+    # policy converges quickly for almost all paths and retains only rare, numerically
+    # bounded cap hits rather than aborting an otherwise valid multi-hour run.
+    integrated_atol: float = 5.0e-4
+    integrated_rtol: float = 1.0e-4
+    integrated_max_intervals: int = 256
+    integrated_unconverged_error_cap: float = 5.0e-3
+    integrated_max_unconverged_fraction: float = 1.0e-2
 
     def validate(self) -> None:
         for name in (
@@ -234,6 +276,7 @@ class BetaConfig:
             "topology_donors", "topology_pool", "causal_graphs",
             "causal_sources", "causal_batch_graphs", "mechanism_graphs", "ablation_graphs",
             "family_size", "bootstrap_samples", "conditional_bootstrap_samples",
+            "conditional_per_feature", "conditional_max_tests", "integrated_max_intervals",
         ):
             if int(getattr(self, name)) < 1:
                 raise ValueError(f"{name} must be positive")
@@ -243,6 +286,20 @@ class BetaConfig:
             raise ValueError("activity_floor_relative must be in (0,1)")
         if not 0.0 <= self.causal_effect_floor_relative < 1.0:
             raise ValueError("causal_effect_floor_relative must be in [0,1)")
+        if not self.topk_values or any(int(value) < 1 for value in self.topk_values):
+            raise ValueError("topk_values must contain positive integers")
+        if self.conditional_max_tests < self.conditional_per_feature * len(
+            CONDITIONAL_SCORE_FEATURES
+        ):
+            raise ValueError(
+                "conditional_max_tests must cover conditional_per_feature for every score feature"
+            )
+        if self.integrated_atol < 0 or self.integrated_rtol < 0:
+            raise ValueError("integrated carriage tolerances must be non-negative")
+        if self.integrated_unconverged_error_cap < 0:
+            raise ValueError("integrated_unconverged_error_cap must be non-negative")
+        if not 0.0 <= self.integrated_max_unconverged_fraction <= 1.0:
+            raise ValueError("integrated_max_unconverged_fraction must lie in [0,1]")
 
     @property
     def root(self) -> Path:
@@ -255,10 +312,45 @@ class BetaConfig:
             values.pop(key, None)
         return stable_hash({"version": BETA_VERSION, **values})
 
+    @property
+    def legacy_strict_score_fingerprint(self) -> str:
+        """Fingerprint of the immediately preceding fail-on-any-cap score policy.
+
+        A completed graph under that policy necessarily converged every path at tighter
+        tolerances, so it is safe to migrate into the new bounded policy. Partial/failed
+        graphs had no complete graph cache and therefore cannot be migrated silently.
+        """
+
+        values = asdict(self)
+        for key in ("output_dir", "device", "dense_checkpoint", "onehop_checkpoint"):
+            values.pop(key, None)
+        values.pop("integrated_unconverged_error_cap", None)
+        values.pop("integrated_max_unconverged_fraction", None)
+        values["integrated_atol"] = 1.0e-5
+        values["integrated_rtol"] = 1.0e-4
+        values["integrated_max_intervals"] = 128
+        return stable_hash({"version": BETA_VERSION, **values})
+
 
 def cache_path(cfg: BetaConfig, task: str, phase: str, checkpoint_sha: str) -> Path:
     return cfg.root / "cache" / task / (
         f"{phase}__{cfg.fingerprint}__{checkpoint_sha[:12]}.pt"
+    )
+
+
+def score_component_cache_path(
+    cfg: BetaConfig,
+    task: str,
+    graph_id: int,
+    component: str,
+    checkpoint_sha: str,
+) -> Path:
+    """Fine-grained score cache: source groups -> channels -> complete graph."""
+
+    safe_component = component.replace("/", "_")
+    return cfg.root / "cache" / task / "score_components" / (
+        f"graph_{int(graph_id)}__{safe_component}__{cfg.fingerprint}__"
+        f"{checkpoint_sha[:12]}.pt"
     )
 
 
@@ -276,6 +368,30 @@ def valid_cache(path: Path, cfg: BetaConfig, checkpoint_sha: str) -> dict[str, A
         or payload.get("fingerprint") != cfg.fingerprint
         or payload.get("checkpoint_sha256") != checkpoint_sha
     ):
+        return None
+    return dict(payload)
+
+
+def valid_legacy_strict_graph_cache(
+    path: Path, cfg: BetaConfig, checkpoint_sha: str
+) -> dict[str, Any] | None:
+    """Accept only complete, fully converged graph caches from the prior strict policy."""
+
+    import torch
+
+    if not path.exists():
+        return None
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    if not isinstance(payload, Mapping) or (
+        payload.get("version") != BETA_VERSION
+        or int(payload.get("schema", -1)) != BETA_SCHEMA
+        or payload.get("fingerprint") != cfg.legacy_strict_score_fingerprint
+        or payload.get("checkpoint_sha256") != checkpoint_sha
+        or "record" not in payload
+    ):
+        return None
+    audit = integrated_carriage_audit([payload["record"]])
+    if int(audit["unconverged"]) != 0:
         return None
     return dict(payload)
 
@@ -944,8 +1060,27 @@ def select_topology_donors(
             continue
         candidates.append((int(tier), topology_match_cost(base, donor), int(donor["graph_id"]), donor))
     candidates.sort(key=lambda item: item[:3])
+    by_tier: dict[int, list[tuple[int, float, int, Mapping[str, Any]]]] = {}
+    for candidate in candidates:
+        by_tier.setdefault(int(candidate[0]), []).append(candidate)
+    # Interleave tiers so the sensitivity analysis actually contains strict, near and
+    # relaxed donors when available. Headline scores still discard tier 2 downstream.
+    stratified_candidates = []
+    tier_offsets = {tier: 0 for tier in sorted(by_tier)}
+    while len(stratified_candidates) < int(count):
+        added = False
+        for tier in sorted(by_tier):
+            offset = tier_offsets[tier]
+            if offset < len(by_tier[tier]):
+                stratified_candidates.append(by_tier[tier][offset])
+                tier_offsets[tier] += 1
+                added = True
+                if len(stratified_candidates) == int(count):
+                    break
+        if not added:
+            break
     selected = []
-    for tier, cost, graph_id, donor in candidates[:count]:
+    for tier, cost, graph_id, donor in stratified_candidates:
         alignment = align_donor_nodes(base, donor)
         content_alignment_exact = bool(np.array_equal(
             np.asarray(base["labels"]), np.asarray(donor["labels"])[alignment]
@@ -1081,21 +1216,36 @@ def graph_event_variants(gm: Any, plan: Mapping[str, Any], channel: str) -> list
 # =====================================================================================
 
 
-def clean_gradients(gm: Any, base: Any) -> tuple[Any, list[Any], Any]:
+def clean_gradients(gm: Any, base: Any) -> tuple[Any, list[Any], Any, Any]:
     import torch
     from torch_geometric.data import Batch
 
     batch = Batch.from_data_list([base.clone()]).to(gm.device)
-    capture = gm.capture(batch, want_grad=True, want_attn=False)
+    final: dict[str, Any] = {}
+
+    def final_hook(_module: Any, _inputs: Any, output: Any) -> None:
+        final["h"] = output.x
+
+    handle = gm.model.model.layers.register_forward_hook(final_hook)
+    try:
+        capture = gm.capture(batch, want_grad=True, want_attn=False)
+    finally:
+        handle.remove()
     pred = capture["pred"]
     outputs = pred.reshape(pred.shape[0], -1)
-    gradients = []
+    gradients, final_gradients = [], []
     for target in range(outputs.shape[1]):
-        gradients.append(torch.autograd.grad(
-            outputs[0, target], capture["wV"], retain_graph=target + 1 < outputs.shape[1]
-        ))
+        values = torch.autograd.grad(
+            outputs[0, target], [*capture["wV"], final["h"]],
+            retain_graph=target + 1 < outputs.shape[1],
+        )
+        gradients.append(values[:-1])
+        final_gradients.append(values[-1])
     phi = [torch.stack([gradient[layer] for gradient in gradients], dim=0) for layer in range(gm.L)]
-    return pred.detach(), phi, capture
+    final_phi = torch.stack(final_gradients, dim=0).detach()  # [T,N,D]
+    if tuple(final_phi.shape[1:]) != (int(base.num_nodes), int(gm.dim_h)):
+        raise RuntimeError(f"unexpected final-state gradient shape {tuple(final_phi.shape)}")
+    return pred.detach(), phi, capture, final_phi
 
 
 def projected_event_group(
@@ -1103,17 +1253,29 @@ def projected_event_group(
     base: Any,
     variants: Sequence[Any],
     phi: Sequence[Any],
-) -> tuple[Any, np.ndarray, np.ndarray]:
+) -> tuple[Any, np.ndarray, np.ndarray, Any]:
     """q=[K,L,H,N,T] using within-batch clean baselines to cancel scatter jitter."""
 
     import torch
     from torch_geometric.data import Batch
 
     if not variants:
-        return torch.empty(0, gm.L, gm.H, int(base.num_nodes), len(phi[0])), np.empty(0), np.empty(0)
+        return (
+            torch.empty(0, gm.L, gm.H, int(base.num_nodes), len(phi[0])),
+            np.empty(0), np.empty(0), torch.empty(0, device=gm.device),
+        )
     replicas = [base.clone(), *[variant.clone() for variant in variants]]
     batch = Batch.from_data_list(replicas).to(gm.device)
-    capture = gm.capture(batch, want_grad=False, want_attn=False, include_virtual_transport=True)
+    final: dict[str, Any] = {}
+
+    def final_hook(_module: Any, _inputs: Any, output: Any) -> None:
+        final["h"] = output.x.detach()
+
+    handle = gm.model.model.layers.register_forward_hook(final_hook)
+    try:
+        capture = gm.capture(batch, want_grad=False, want_attn=False, include_virtual_transport=True)
+    finally:
+        handle.remove()
     per_replica = int(capture["wV"][0].shape[0] // len(replicas))
     if per_replica != int(base.num_nodes):
         raise RuntimeError("unexpected virtual-node transport in ZINC beta")
@@ -1129,10 +1291,142 @@ def projected_event_group(
     within_clean = predictions[0]
     prediction_deltas = within_clean[None] - predictions[1:]
     no_op = np.max(np.abs(prediction_deltas), axis=1) == 0.0
-    return q.detach().cpu(), predictions, no_op
+    final_states = final["h"].reshape(len(replicas), per_replica, gm.dim_h)
+    return q.detach().cpu(), predictions, no_op, final_states
 
 
-def distance_profile_one_graph(q: Any, distances: np.ndarray) -> list[dict[str, Any]]:
+def final_state_carriage_group(
+    gm: Any,
+    final_states: Any,
+    final_output_gradient: Any,
+    target: Any,
+    cfg: BetaConfig,
+    *,
+    full_predictions: np.ndarray | None = None,
+) -> tuple[Any, Any, dict[str, Any]]:
+    """Return eventwise output projections and complete signed loss carriage.
+
+    ``q_final`` is ``[K,N,T]`` and supplies production F_sens. ``B`` is ``[K,N]``:
+    every donor/partner path is integrated before later source/graph aggregation.
+    """
+
+    import torch
+
+    from graph_specialisation_metrics.carriage import core, metrics
+    from graph_specialisation_metrics.carriage.grit_runner import (
+        _pooled_head_predictions,
+        _retain_or_reject_unconverged_paths,
+    )
+
+    if final_states.ndim != 3 or int(final_states.shape[0]) < 2:
+        raise ValueError(f"final_states must be [clean+K,N,D], got {tuple(final_states.shape)}")
+    clean = final_states[0:1].expand(int(final_states.shape[0]) - 1, -1, -1)
+    swap = final_states[1:]
+    delta = clean - swap
+    q_final = torch.einsum("tnd,knd->knt", final_output_gradient, delta)
+    target_row = target.detach().reshape(1, -1).float().to(gm.device)
+    pooling = str(gm.cfg.model.graph_pooling)
+
+    def loss_from_pooled(pooled: Any) -> Any:
+        pred = _pooled_head_predictions(gm.model, pooled, target_row)
+        return metrics.per_graph_loss(
+            pred, target_row.expand(int(pooled.shape[0]), -1), gm.loss_fun
+        )
+
+    path = core.integrated_loss_carriage(
+        clean,
+        swap,
+        loss_from_pooled,
+        pooling=pooling,
+        atol=cfg.integrated_atol,
+        rtol=cfg.integrated_rtol,
+        max_intervals=cfg.integrated_max_intervals,
+    )
+    residual = path["completeness_residual"].abs()
+    converged = _retain_or_reject_unconverged_paths(
+        path, cfg, "ZINC beta donor"
+    )
+    failed = ~np.asarray(converged, dtype=bool)
+    residual_numpy = residual.detach().cpu().numpy().astype(float)
+    error_numpy = path["quadrature_error"].detach().cpu().numpy().astype(float)
+    endpoint_replay = None
+    if full_predictions is not None:
+        with torch.no_grad():
+            pooled = core.pool_final_states(final_states, pooling)
+            replay = _pooled_head_predictions(
+                gm.model, pooled, target_row
+            ).detach().cpu()
+        endpoint_replay = tensor_equivalent(
+            torch.as_tensor(np.asarray(full_predictions)), replay
+        )
+        if not endpoint_replay["passed"]:
+            raise RuntimeError(f"final-state readout endpoint replay failed: {endpoint_replay}")
+    diagnostics = {
+        "completeness_max": float(residual.max()),
+        "quadrature_error_max": float(path["quadrature_error"].max()),
+        "unconverged": int(failed.sum()),
+        "paths": int(path["converged"].numel()),
+        "unconverged_fraction": float(failed.mean()),
+        "unconverged_indices": np.flatnonzero(failed).astype(np.int64),
+        "unconverged_completeness_max": (
+            float(residual_numpy[failed].max()) if failed.any() else 0.0
+        ),
+        "unconverged_quadrature_error_max": (
+            float(error_numpy[failed].max()) if failed.any() else 0.0
+        ),
+        "intervals_max": int(path["intervals"].max()),
+        "integrated_atol": float(cfg.integrated_atol),
+        "integrated_rtol": float(cfg.integrated_rtol),
+        "integrated_max_intervals": int(cfg.integrated_max_intervals),
+        "integrated_unconverged_error_cap": float(
+            cfg.integrated_unconverged_error_cap
+        ),
+        "endpoint_replay": endpoint_replay,
+    }
+    return q_final.detach().cpu(), path["carriage"].detach().cpu(), diagnostics
+
+
+def integrated_carriage_audit(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """Aggregate the predeclared rare-cap policy over every cached score path."""
+
+    diagnostics = [
+        diagnostic
+        for record in records
+        for channel in CHANNELS
+        for diagnostic in record["channels"][channel].get("beneficial_diagnostics", [])
+    ]
+    paths = int(sum(int(item.get("paths", 0)) for item in diagnostics))
+    unconverged = int(sum(int(item.get("unconverged", 0)) for item in diagnostics))
+    return {
+        "groups": len(diagnostics),
+        "paths": paths,
+        "unconverged": unconverged,
+        "unconverged_fraction": float(unconverged / paths) if paths else 0.0,
+        "completeness_max": float(max(
+            (float(item.get("completeness_max", 0.0)) for item in diagnostics),
+            default=0.0,
+        )),
+        "quadrature_error_max": float(max(
+            (float(item.get("quadrature_error_max", 0.0)) for item in diagnostics),
+            default=0.0,
+        )),
+        "unconverged_completeness_max": float(max(
+            (float(item.get("unconverged_completeness_max", 0.0)) for item in diagnostics),
+            default=0.0,
+        )),
+        "unconverged_quadrature_error_max": float(max(
+            (float(item.get("unconverged_quadrature_error_max", 0.0)) for item in diagnostics),
+            default=0.0,
+        )),
+        "intervals_max": int(max(
+            (int(item.get("intervals_max", 0)) for item in diagnostics), default=0
+        )),
+    }
+
+
+def distance_profile_one_graph(
+    q: Any, distances: np.ndarray, beneficial: Any | None = None
+) -> list[dict[str, Any]]:
     """F_sens/F_coh with event-specific changed sets and equal carrier weighting."""
 
     import torch
@@ -1140,6 +1434,10 @@ def distance_profile_one_graph(q: Any, distances: np.ndarray) -> list[dict[str, 
     distance = torch.as_tensor(distances, dtype=torch.long)
     if tuple(distance.shape) != (int(q.shape[0]), int(q.shape[-2])):
         raise ValueError(f"distance {distance.shape} is not [events,carriers] for q {q.shape}")
+    if beneficial is not None and tuple(beneficial.shape) != tuple(distance.shape):
+        raise ValueError(
+            f"beneficial {tuple(beneficial.shape)} is not [events,carriers] for {tuple(distance.shape)}"
+        )
     event_norm = torch.linalg.vector_norm(q, dim=-1)  # [K,L,H,N]
     rows = []
     finite = distance[distance >= 0]
@@ -1156,14 +1454,342 @@ def distance_profile_one_graph(q: Any, distances: np.ndarray) -> list[dict[str, 
         expanded = pair_mask[:, None, None, :, None].to(q.dtype)
         per_carrier_q = (q * expanded).sum(dim=0) / carrier_count[None, None, :, None].clamp_min(1)
         per_carrier_coh = torch.linalg.vector_norm(per_carrier_q, dim=-1)
-        rows.append({
+        row = {
             "distance": hop,
             "F_sens": per_carrier_sens[..., carrier_valid].mean(dim=-1).numpy(),
             "F_coh": per_carrier_coh[..., carrier_valid].mean(dim=-1).numpy(),
             "carriers": int(carrier_valid.sum()),
             "event_carrier_pairs": int(pair_mask.sum()),
-        })
+        }
+        if beneficial is not None:
+            benefit = torch.as_tensor(beneficial, dtype=q.dtype)
+            per_carrier_b = (benefit * pair_mask.to(q.dtype)).sum(dim=0) / carrier_count.clamp_min(1)
+            row["B"] = float(per_carrier_b[carrier_valid].mean())
+            row["B_sum"] = float(
+                (benefit * pair_mask.to(q.dtype)).sum(dim=-1).mean()
+            )
+        rows.append(row)
     return rows
+
+
+def event_distance_matrix(
+    record: Mapping[str, Any],
+    channel: str,
+    source_index: int,
+    *,
+    event_count: int,
+    carrier_count: int,
+) -> np.ndarray:
+    """Distance from every event's changed set to every transport carrier.
+
+    Real nodes receive molecular shortest-path distance. Disconnected real nodes and
+    virtual-node carriers receive distinct codes so neither can silently disappear from
+    the exact score decomposition.
+    """
+
+    n = int(record["n"])
+    if carrier_count < n:
+        raise ValueError(f"transport has {carrier_count} carriers for a {n}-node graph")
+    plan = record["plan"]
+    edges = np.asarray(plan["descriptor"]["edges"], dtype=np.int64)
+    distance = shortest_paths(n, edges)
+    if channel == "semantic":
+        source = int(plan["semantic"][source_index]["source"])
+        real = np.repeat(distance[:, source][None, :], event_count, axis=0)
+    elif channel == "pe":
+        item = plan["pe"][source_index]
+        partners = np.asarray(item["partners"], dtype=np.int64)
+        if len(partners) != event_count:
+            raise ValueError(
+                f"PE plan has {len(partners)} events but q has {event_count}"
+            )
+        source = int(item["source"])
+        real = np.stack([
+            np.minimum(distance[:, source], distance[:, int(partner)])
+            for partner in partners
+        ])
+    elif channel == "topology":
+        if source_index != 0:
+            raise ValueError("topology is a single whole-graph source")
+        items = plan["topology"]
+        if len(items) != event_count:
+            raise ValueError(
+                f"topology plan has {len(items)} events but q has {event_count}"
+            )
+        real_rows = []
+        for item in items:
+            changed = np.asarray(item["dose"]["changed_nodes"], dtype=np.int64)
+            real_rows.append(
+                np.min(distance[:, changed], axis=1)
+                if len(changed) else np.full(n, np.inf)
+            )
+        real = np.stack(real_rows)
+    else:
+        raise ValueError(f"unknown intervention channel {channel!r}")
+
+    encoded = np.full(
+        (event_count, carrier_count), DISTANCE_UNREACHABLE, dtype=np.int64
+    )
+    encoded[:, :n] = np.where(np.isfinite(real), real, DISTANCE_UNREACHABLE).astype(
+        np.int64
+    )
+    if carrier_count > n:
+        encoded[:, n:] = DISTANCE_HUB
+    return encoded
+
+
+def _distance_label(code: int) -> str:
+    if int(code) == DISTANCE_HUB:
+        return "hub"
+    if int(code) == DISTANCE_UNREACHABLE:
+        return "unreachable"
+    return str(int(code))
+
+
+def _distance_sort_key(code: int) -> tuple[int, int]:
+    if int(code) >= 0:
+        return 0, int(code)
+    if int(code) == DISTANCE_UNREACHABLE:
+        return 1, 0
+    if int(code) == DISTANCE_HUB:
+        return 2, 0
+    return 3, int(code)
+
+
+def distance_resolved_eg_one_graph(
+    q_groups: Sequence[Any], distance_groups: Sequence[np.ndarray]
+) -> dict[str, Any]:
+    """Exact source-balanced distance decomposition of graph-level EG.
+
+    For each source, carrier magnitudes are summed inside each event-specific distance
+    bucket, donors/events are averaged, then sources are averaged. Consequently the sum
+    over returned buckets is exactly the established graph EG score.
+    """
+
+    import torch
+
+    if not q_groups or len(q_groups) != len(distance_groups):
+        raise ValueError("q_groups and distance_groups must be non-empty and aligned")
+    source_rows: list[dict[int, Any]] = []
+    source_support: list[set[int]] = []
+    for q, distances in zip(q_groups, distance_groups):
+        if q.dim() != 5:
+            raise ValueError(f"expected q=[K,L,H,N,T], got {tuple(q.shape)}")
+        encoded = torch.as_tensor(distances, dtype=torch.long, device=q.device)
+        if tuple(encoded.shape) != (int(q.shape[0]), int(q.shape[-2])):
+            raise ValueError(
+                f"distance {tuple(encoded.shape)} is not [events,carriers] for q {tuple(q.shape)}"
+            )
+        magnitude = torch.linalg.vector_norm(q, dim=-1)  # [K,L,H,N]
+        row: dict[int, Any] = {}
+        codes = sorted(set(map(int, encoded.unique().tolist())), key=_distance_sort_key)
+        for code in codes:
+            mask = (encoded == code)[:, None, None, :].to(magnitude.dtype)
+            row[code] = (magnitude * mask).sum(dim=-1).mean(dim=0)
+        source_rows.append(row)
+        source_support.append(set(codes))
+
+    all_codes = sorted(
+        set().union(*(set(row) for row in source_rows)), key=_distance_sort_key
+    )
+    template = torch.zeros_like(next(iter(source_rows[0].values())))
+    contribution = {
+        code: torch.stack([row.get(code, template) for row in source_rows]).mean(dim=0)
+        for code in all_codes
+    }
+    total = sum(contribution.values(), torch.zeros_like(template))
+    direct = torch.stack([
+        torch.linalg.vector_norm(q, dim=-1).sum(dim=-1).mean(dim=0)
+        for q in q_groups
+    ]).mean(dim=0)
+    error = (total - direct).abs()
+    return {
+        "codes": all_codes,
+        "contribution": {code: value.detach().cpu().numpy() for code, value in contribution.items()},
+        "support": {code: any(code in support for support in source_support) for code in all_codes},
+        "total": total.detach().cpu().numpy(),
+        "direct": direct.detach().cpu().numpy(),
+        "identity_max_abs_error": float(error.max()) if error.numel() else 0.0,
+        "sources": len(q_groups),
+        "events": int(sum(int(q.shape[0]) for q in q_groups)),
+    }
+
+
+def record_distance_resolved_eg(
+    record: Mapping[str, Any], channel: str, *, donor_scope: str = "headline"
+) -> dict[str, Any] | None:
+    """Recover the exact distance-resolved EG tensor from one cached score graph."""
+
+    import torch
+
+    result = record["channels"][channel]
+    if not result["available"]:
+        return None
+    q_groups = list(result["q_groups"])
+    distance_groups = [
+        event_distance_matrix(
+            record,
+            channel,
+            source_index,
+            event_count=int(q.shape[0]),
+            carrier_count=int(q.shape[-2]),
+        )
+        for source_index, q in enumerate(q_groups)
+    ]
+    if channel == "topology":
+        tiers = np.asarray(
+            [item["tier"] for item in record["plan"]["topology"]], dtype=np.int64
+        )
+        if donor_scope == "headline":
+            keep = np.flatnonzero(tiers <= 1)
+        elif donor_scope.startswith("tier_"):
+            tier = int(donor_scope.rsplit("_", 1)[1])
+            keep = np.flatnonzero(tiers == tier)
+        elif donor_scope == "all":
+            keep = np.arange(len(tiers), dtype=np.int64)
+        else:
+            raise ValueError(f"unknown topology donor scope {donor_scope!r}")
+        if not len(keep):
+            return None
+        index = torch.as_tensor(keep, dtype=torch.long)
+        q_groups = [q_groups[0][index]]
+        distance_groups = [distance_groups[0][keep]]
+    elif donor_scope != "headline":
+        raise ValueError(f"{channel} only defines the headline donor scope")
+
+    decomposed = distance_resolved_eg_one_graph(q_groups, distance_groups)
+    if channel == "topology" and donor_scope == "headline":
+        reference = record_channel_score(
+            record, channel, HEADLINE_AGGREGATION, topology_max_tier=1
+        )
+        if reference is None:
+            return None
+    elif channel == "topology" and donor_scope.startswith("tier_"):
+        # Tier-specific scores have no pre-existing scalar cache field. Their direct EG
+        # definition is retained as the reference for the per-distance accounting audit.
+        reference = decomposed["direct"]
+    else:
+        reference = np.asarray(result["per_graph"][HEADLINE_AGGREGATION], dtype=float)
+    difference = np.abs(np.asarray(decomposed["total"], float) - reference)
+    allowed = DISTANCE_IDENTITY_ATOL + DISTANCE_IDENTITY_RTOL * np.abs(reference)
+    decomposed.update({
+        "graph_id": int(record["graph_id"]),
+        "channel": channel,
+        "donor_scope": donor_scope,
+        "reference": reference,
+        "reference_identity_max_abs_error": float(np.max(difference)),
+        "reference_identity_passed": bool(np.all(difference <= allowed)),
+    })
+    return decomposed
+
+
+def distance_specialisation_profile(
+    score: Mapping[str, Any],
+    channel: str,
+    *,
+    donor_scope: str = "headline",
+    bootstrap_samples: int = 1000,
+    seed: int = 0,
+) -> dict[str, Any]:
+    """Graph-balanced EG-by-distance tensors, uncertainty and reach summaries."""
+
+    decomposed = [
+        item for item in (
+            record_distance_resolved_eg(record, channel, donor_scope=donor_scope)
+            for record in score["records"]
+        ) if item is not None
+    ]
+    if not decomposed:
+        raise RuntimeError(f"no distance-resolved score support for {channel}/{donor_scope}")
+    failed = [item for item in decomposed if not item["reference_identity_passed"]]
+    if failed:
+        worst = max(failed, key=lambda item: item["reference_identity_max_abs_error"])
+        raise RuntimeError(
+            "distance-resolved EG does not reconstruct the cached graph score: "
+            f"channel={channel} graph={worst['graph_id']} "
+            f"error={worst['reference_identity_max_abs_error']:.3e}"
+        )
+    codes = sorted(
+        set().union(*(set(item["codes"]) for item in decomposed)), key=_distance_sort_key
+    )
+    L, H = int(score["L"]), int(score["H"])
+    graph_cube = np.zeros((len(decomposed), len(codes), L, H), dtype=np.float64)
+    support = np.zeros((len(decomposed), len(codes)), dtype=bool)
+    references = np.zeros((len(decomposed), L, H), dtype=np.float64)
+    for graph_index, item in enumerate(decomposed):
+        references[graph_index] = np.asarray(item["reference"], dtype=float)
+        for bucket_index, code in enumerate(codes):
+            if code in item["contribution"]:
+                graph_cube[graph_index, bucket_index] = item["contribution"][code]
+                support[graph_index, bucket_index] = bool(item["support"].get(code, False))
+    contribution = graph_cube.mean(axis=0)
+    total = contribution.sum(axis=0)
+    fraction = np.divide(
+        contribution,
+        total[None],
+        out=np.zeros_like(contribution),
+        where=total[None] > EPS,
+    )
+    rng = np.random.default_rng(seed)
+    draw_indices = rng.integers(
+        0, len(decomposed), size=(int(bootstrap_samples), len(decomposed))
+    )
+    draw_means = graph_cube[draw_indices].mean(axis=1)
+    draw_totals = draw_means.sum(axis=1)
+    draw_fractions = np.divide(
+        draw_means,
+        draw_totals[:, None],
+        out=np.zeros_like(draw_means),
+        where=draw_totals[:, None] > EPS,
+    )
+    numeric = np.asarray([code >= 0 for code in codes], dtype=bool)
+    hops = np.asarray([max(code, 0) for code in codes], dtype=float)
+    numeric_mass = contribution[numeric].sum(axis=0)
+    expected_distance = np.divide(
+        (contribution * hops[:, None, None] * numeric[:, None, None]).sum(axis=0),
+        numeric_mass,
+        out=np.full_like(total, np.nan),
+        where=numeric_mass > EPS,
+    )
+    near_mass = contribution[
+        np.asarray([(code >= 0 and code <= 1) for code in codes], dtype=bool)
+    ].sum(axis=0)
+    far_mass = contribution[
+        np.asarray([code >= 2 for code in codes], dtype=bool)
+    ].sum(axis=0)
+    code_to_index = {code: index for index, code in enumerate(codes)}
+
+    def share_for(code: int) -> np.ndarray:
+        value = (
+            contribution[code_to_index[code]]
+            if code in code_to_index else np.zeros_like(total)
+        )
+        return np.divide(value, total, out=np.zeros_like(total), where=total > EPS)
+
+    return {
+        "channel": channel,
+        "donor_scope": donor_scope,
+        "codes": np.asarray(codes, dtype=np.int64),
+        "labels": [_distance_label(code) for code in codes],
+        "graph_ids": np.asarray([item["graph_id"] for item in decomposed], dtype=np.int64),
+        "graph_contribution": graph_cube,
+        "graph_support": support,
+        "contribution": contribution,
+        "fraction": fraction,
+        "fraction_ci_low": np.quantile(draw_fractions, 0.025, axis=0),
+        "fraction_ci_high": np.quantile(draw_fractions, 0.975, axis=0),
+        "total": total,
+        "reference_mean": references.mean(axis=0),
+        "expected_distance": expected_distance,
+        "near_share": np.divide(near_mass, total, out=np.zeros_like(total), where=total > EPS),
+        "far_share": np.divide(far_mass, total, out=np.zeros_like(total), where=total > EPS),
+        "unreachable_share": share_for(DISTANCE_UNREACHABLE),
+        "hub_share": share_for(DISTANCE_HUB),
+        "identity_max_abs_error": float(max(
+            item["reference_identity_max_abs_error"] for item in decomposed
+        )),
+        "identity_passed": True,
+    }
 
 
 def score_graph_channel(
@@ -1171,6 +1797,12 @@ def score_graph_channel(
     plan: Mapping[str, Any],
     channel: str,
     phi: Sequence[Any],
+    final_output_gradient: Any,
+    cfg: BetaConfig,
+    *,
+    task_name: str | None = None,
+    checkpoint_sha: str | None = None,
+    force: bool = False,
 ) -> dict[str, Any]:
     import torch
 
@@ -1180,16 +1812,84 @@ def score_graph_channel(
         return {"available": False, "channel": channel, "graph_id": int(plan["graph_id"])}
     q_groups = []
     prediction_groups = []
-    for variants in groups:
-        q, predictions, _no_op = projected_event_group(gm, base, variants, phi)
-        if q.numel():
-            q_groups.append(q)
-            prediction_groups.append(predictions)
+    final_q_groups = []
+    benefit_groups = []
+    benefit_diagnostics = []
+    source_indices = []
+    for source_index, variants in enumerate(groups):
+        if not variants:
+            continue
+        group_path = None
+        group_chunk = None
+        if task_name is not None and checkpoint_sha is not None:
+            group_path = score_component_cache_path(
+                cfg,
+                task_name,
+                int(plan["graph_id"]),
+                f"{channel}_source_{source_index}",
+                checkpoint_sha,
+            )
+            group_chunk = None if force else valid_cache(
+                group_path, cfg, checkpoint_sha
+            )
+        if group_chunk is not None:
+            group = group_chunk["group"]
+            q = group["q"]
+            predictions = group["predictions"]
+            q_final = group["q_final"]
+            benefit = group["benefit"]
+            diagnostic = group["diagnostic"]
+            print(
+                f"[scores:{task_name}] graph {int(plan['graph_id'])} {channel} "
+                f"source {source_index + 1}/{len(groups)} cache hit",
+                flush=True,
+            )
+        else:
+            q, predictions, _no_op, final_states = projected_event_group(
+                gm, base, variants, phi
+            )
+            if not q.numel():
+                continue
+            q_final, benefit, diagnostic = final_state_carriage_group(
+                gm,
+                final_states,
+                final_output_gradient,
+                base.y,
+                cfg,
+                full_predictions=predictions,
+            )
+            if group_path is not None and checkpoint_sha is not None:
+                atomic_torch_save({
+                    "version": BETA_VERSION,
+                    "schema": BETA_SCHEMA,
+                    "fingerprint": cfg.fingerprint,
+                    "checkpoint_sha256": checkpoint_sha,
+                    "task": task_name,
+                    "graph_id": int(plan["graph_id"]),
+                    "channel": channel,
+                    "source_index": source_index,
+                    "group": {
+                        "q": q,
+                        "predictions": predictions,
+                        "q_final": q_final,
+                        "benefit": benefit,
+                        "diagnostic": diagnostic,
+                    },
+                }, group_path)
+        source_indices.append(source_index)
+        q_groups.append(q)
+        prediction_groups.append(predictions)
+        final_q_groups.append(q_final)
+        benefit_groups.append(benefit)
+        benefit_diagnostics.append(diagnostic)
     if not q_groups:
         return {"available": False, "channel": channel, "graph_id": int(plan["graph_id"])}
     max_events = max(int(q.shape[0]) for q in q_groups)
     n = int(base.num_nodes)
-    q_all = torch.zeros(len(q_groups), max_events, gm.L, gm.H, n, len(phi[0]))
+    n_carriers = int(q_groups[0].shape[-2])
+    q_all = torch.zeros(
+        len(q_groups), max_events, gm.L, gm.H, n_carriers, len(phi[0])
+    )
     valid = torch.zeros(len(q_groups), max_events, dtype=torch.bool)
     for source, q in enumerate(q_groups):
         q_all[source, :len(q)] = q
@@ -1206,7 +1906,8 @@ def score_graph_channel(
     edges = np.asarray(plan["descriptor"]["edges"], dtype=np.int64)
     distance = shortest_paths(n, edges)
     carriage_rows = []
-    for source_index, q in enumerate(q_groups):
+    model_carriage_rows = []
+    for group_index, (source_index, q) in enumerate(zip(source_indices, q_groups)):
         if channel == "semantic":
             source = int(plan["semantic"][source_index]["source"])
             event_distances = np.repeat(distance[:, source][None, :], len(q), axis=0)
@@ -1227,8 +1928,39 @@ def score_graph_channel(
             event_distances = np.stack(event_distances)
         # Encode disconnected/undefined carriers as -1 so they are omitted, not a fake far bin.
         event_distances = np.where(np.isfinite(event_distances), event_distances, -1).astype(int)
-        for row in distance_profile_one_graph(q, event_distances):
-            carriage_rows.append({"source_index": int(source_index), **row})
+        subsets: list[tuple[str, np.ndarray]] = [
+            ("headline", np.arange(len(q), dtype=np.int64))
+        ]
+        if channel == "topology":
+            tiers = np.asarray([item["tier"] for item in plan["topology"]], dtype=np.int64)
+            subsets = [("headline", np.flatnonzero(tiers <= 1))]
+            subsets.extend(
+                (f"tier_{int(tier)}", np.flatnonzero(tiers == int(tier)))
+                for tier in sorted(set(tiers.tolist()))
+            )
+        for donor_scope, event_indices in subsets:
+            if not len(event_indices):
+                continue
+            q_subset = q[event_indices]
+            distance_subset = event_distances[event_indices]
+            for row in distance_profile_one_graph(q_subset, distance_subset):
+                carriage_rows.append({
+                    "source_index": int(source_index),
+                    "donor_scope": donor_scope,
+                    **row,
+                })
+            q_final = final_q_groups[group_index][event_indices, None, None, :, :]
+            benefit_subset = benefit_groups[group_index][event_indices]
+            for row in distance_profile_one_graph(
+                q_final, distance_subset, beneficial=benefit_subset
+            ):
+                model_carriage_rows.append({
+                    "source_index": int(source_index),
+                    "donor_scope": donor_scope,
+                    **row,
+                    "F_sens": float(np.asarray(row["F_sens"]).reshape(-1)[0]),
+                    "F_coh": float(np.asarray(row["F_coh"]).reshape(-1)[0]),
+                })
 
     y = base.y.detach().cpu().numpy().reshape(1, -1)
     event_outcomes = []
@@ -1244,6 +1976,8 @@ def score_graph_channel(
         "per_source": per_source,
         "q_groups": q_groups,
         "carriage": carriage_rows,
+        "model_carriage": model_carriage_rows,
+        "beneficial_diagnostics": benefit_diagnostics,
         "event_outcomes": np.asarray(event_outcomes, dtype=np.float32),
     }
 
@@ -1282,10 +2016,10 @@ def verify_interventions(
     current_row = node_labels(base)[source]
     semantic_noop = semantic_variant(base, source, current_row)
     pe_noop = pe_variant(base, source, source)
-    semantic_q, semantic_predictions, _ = projected_event_group(
+    semantic_q, semantic_predictions, _, _ = projected_event_group(
         gm, base, [semantic_noop], phi
     )
-    pe_q, pe_predictions, _ = projected_event_group(gm, base, [pe_noop], phi)
+    pe_q, pe_predictions, _, _ = projected_event_group(gm, base, [pe_noop], phi)
     checks = {
         "semantic_noop_prediction": tensor_equivalent(
             torch.as_tensor(semantic_predictions[0]), torch.as_tensor(semantic_predictions[1])
@@ -1341,10 +2075,42 @@ def verify_interventions(
         observed_edges = molecular_edges(variant)
         if not np.array_equal(np.unique(expected_edges, axis=0), observed_edges):
             raise RuntimeError("topology donor molecular support was not transplanted exactly")
+        donor_descriptor = graph_descriptor(
+            donor, graph_id=int(item["donor_graph_id"])
+        )
+        if not nonisomorphic(plan["descriptor"], donor_descriptor):
+            raise RuntimeError("topology intervention donor is isomorphic to the base graph")
+        permutation = torch.as_tensor(item["alignment"], dtype=torch.long)
+        for field in STRUCTURAL_NODE_FIELDS:
+            donor_value, observed = getattr(donor, field, None), getattr(variant, field, None)
+            if donor_value is None:
+                continue
+            expected = (
+                donor_value[permutation.to(donor_value.device)]
+                if donor_value.dim() >= 1 and int(donor_value.shape[0]) == int(base.num_nodes)
+                else donor_value
+            )
+            if observed is None or not torch.equal(observed, expected):
+                raise RuntimeError(f"topology donor field {field} was not transplanted exactly")
+        for index_name, value_name in STRUCTURAL_PAIR_FIELDS:
+            donor_index = getattr(donor, index_name, None)
+            if donor_index is None:
+                continue
+            expected_index = relabel_pair_index(
+                donor_index, np.asarray(item["alignment"], dtype=np.int64)
+            )
+            if not torch.equal(getattr(variant, index_name), expected_index):
+                raise RuntimeError(f"topology donor index {index_name} was not relabelled exactly")
+            if value_name is not None and getattr(donor, value_name, None) is not None:
+                if not torch.equal(getattr(variant, value_name), getattr(donor, value_name)):
+                    raise RuntimeError(f"topology donor values {value_name} were not copied exactly")
+        if float(item["dose"]["edge_jaccard_distance"]) <= 0.0:
+            raise RuntimeError("non-isomorphic topology donor has zero molecular edit dose")
         checks["topology_content_target_fixed"] = True
         checks["topology_content_alignment_exact"] = bool(item["content_alignment_exact"])
         checks["topology_support_exact"] = True
         checks["topology_nonisomorphic"] = True
+        checks["topology_structural_payload_exact"] = True
     required = (
         checks["semantic_noop_prediction"]["passed"],
         checks["pe_noop_prediction"]["passed"],
@@ -1387,6 +2153,26 @@ def run_scores_task(
             f"graph_{graph_id}__{cfg.fingerprint}__{checkpoint_sha[:12]}.pt"
         )
         chunk = None if force else valid_cache(chunk_path, cfg, checkpoint_sha)
+        if chunk is None and not force:
+            legacy_path = cfg.root / "cache" / task_name / "score_graphs" / (
+                f"graph_{graph_id}__{cfg.legacy_strict_score_fingerprint}__"
+                f"{checkpoint_sha[:12]}.pt"
+            )
+            legacy = valid_legacy_strict_graph_cache(
+                legacy_path, cfg, checkpoint_sha
+            )
+            if legacy is not None:
+                chunk = {
+                    **legacy,
+                    "fingerprint": cfg.fingerprint,
+                    "migrated_from_fingerprint": cfg.legacy_strict_score_fingerprint,
+                }
+                atomic_torch_save(chunk, chunk_path)
+                print(
+                    f"[scores:{task_name}] graph {position + 1}/{len(splits['score'])} "
+                    f"id={graph_id} migrated tighter legacy cache",
+                    flush=True,
+                )
         if chunk is not None:
             records.append(chunk["record"])
             if verification is None and chunk.get("intervention_verification") is not None:
@@ -1401,7 +2187,7 @@ def run_scores_task(
             flush=True,
         )
         base = gm.eval_ds[graph_id]
-        clean_prediction, phi, clean_capture = clean_gradients(gm, base)
+        clean_prediction, phi, clean_capture, final_output_gradient = clean_gradients(gm, base)
         plan = plan_graph_events(
             gm,
             graph_id,
@@ -1415,9 +2201,42 @@ def run_scores_task(
         if verification is None:
             verification = verify_interventions(gm, plan, phi)
             verified_this_graph = True
-        channel_records = {
-            channel: score_graph_channel(gm, plan, channel, phi) for channel in CHANNELS
-        }
+        channel_records = {}
+        for channel in CHANNELS:
+            channel_path = score_component_cache_path(
+                cfg, task_name, graph_id, f"{channel}_complete", checkpoint_sha
+            )
+            channel_chunk = None if force else valid_cache(
+                channel_path, cfg, checkpoint_sha
+            )
+            if channel_chunk is not None:
+                channel_records[channel] = channel_chunk["result"]
+                print(
+                    f"[scores:{task_name}] graph {graph_id} {channel} channel cache hit",
+                    flush=True,
+                )
+                continue
+            channel_records[channel] = score_graph_channel(
+                gm,
+                plan,
+                channel,
+                phi,
+                final_output_gradient,
+                cfg,
+                task_name=task_name,
+                checkpoint_sha=checkpoint_sha,
+                force=force,
+            )
+            atomic_torch_save({
+                "version": BETA_VERSION,
+                "schema": BETA_SCHEMA,
+                "fingerprint": cfg.fingerprint,
+                "checkpoint_sha256": checkpoint_sha,
+                "task": task_name,
+                "graph_id": graph_id,
+                "channel": channel,
+                "result": channel_records[channel],
+            }, channel_path)
         prefixes = {}
         for channel in PRIMARY_CHANNELS:
             if channel_records[channel]["available"]:
@@ -1448,9 +2267,45 @@ def run_scores_task(
             "record": record,
             "intervention_verification": verification if verified_this_graph else None,
         }, chunk_path)
-        del phi, clean_capture
+        progress_audit = integrated_carriage_audit(records)
+        write_json(
+            cfg.root / "cache" / task_name / "scores_progress.json",
+            {
+                "version": BETA_VERSION,
+                "schema": BETA_SCHEMA,
+                "fingerprint": cfg.fingerprint,
+                "checkpoint_sha256": checkpoint_sha,
+                "completed_graphs": len(records),
+                "total_graphs": len(splits["score"]),
+                "last_graph_id": graph_id,
+                "integrated_carriage": progress_audit,
+            },
+        )
+        del phi, clean_capture, final_output_gradient
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+    integrated_audit = integrated_carriage_audit(records)
+    write_json(
+        cfg.root / "cache" / task_name / "scores_progress.json",
+        {
+            "version": BETA_VERSION,
+            "schema": BETA_SCHEMA,
+            "fingerprint": cfg.fingerprint,
+            "checkpoint_sha256": checkpoint_sha,
+            "completed_graphs": len(records),
+            "total_graphs": len(splits["score"]),
+            "integrated_carriage": integrated_audit,
+        },
+    )
+    if integrated_audit["unconverged_fraction"] > cfg.integrated_max_unconverged_fraction:
+        raise RuntimeError(
+            "Integrated beneficial carriage retained "
+            f"{integrated_audit['unconverged']}/{integrated_audit['paths']} capped paths "
+            f"({100 * integrated_audit['unconverged_fraction']:.4f}%), exceeding "
+            "integrated_max_unconverged_fraction="
+            f"{100 * cfg.integrated_max_unconverged_fraction:.4f}%. All completed graph, "
+            "channel and source caches were preserved for inspection."
+        )
     payload = {
         "version": BETA_VERSION,
         "schema": BETA_SCHEMA,
@@ -1463,6 +2318,7 @@ def run_scores_task(
         "records": sorted(records, key=lambda item: int(item["graph_id"])),
         "field_audit": field_audit,
         "intervention_verification": verification,
+        "integrated_carriage_audit": integrated_audit,
     }
     atomic_torch_save(payload, path)
     return payload
@@ -1498,6 +2354,56 @@ def stack_graph_scores(
     return np.stack(values)
 
 
+def record_channel_score(
+    record: Mapping[str, Any], channel: str, aggregation: str, *, topology_max_tier: int | None = 1
+) -> np.ndarray | None:
+    result = record["channels"][channel]
+    if not result["available"]:
+        return None
+    if channel != "topology" or topology_max_tier is None:
+        return np.asarray(result["per_graph"][aggregation], dtype=float)
+    import torch
+
+    tiers = np.asarray([item["tier"] for item in record["plan"]["topology"]])
+    keep = np.flatnonzero(tiers <= int(topology_max_tier))
+    if not keep.size:
+        return None
+    q = result["q_groups"][0][torch.as_tensor(keep, dtype=torch.long)]
+    valid = torch.ones(1, len(q), dtype=torch.bool)
+    subset = aggregate_topology_events(q[None], valid)
+    return subset["per_graph"][aggregation][0].numpy()
+
+
+def paired_graph_scores(
+    score_payload: Mapping[str, Any],
+    left: str,
+    right: str,
+    aggregation: str,
+    *,
+    topology_max_tier: int | None = 1,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Graph-aligned channel scores; required for paired graph bootstraps."""
+
+    left_values, right_values, graph_ids = [], [], []
+    for record in score_payload["records"]:
+        lval = record_channel_score(
+            record, left, aggregation, topology_max_tier=topology_max_tier
+        )
+        rval = record_channel_score(
+            record, right, aggregation, topology_max_tier=topology_max_tier
+        )
+        if lval is None or rval is None:
+            continue
+        left_values.append(lval); right_values.append(rval)
+        graph_ids.append(int(record["graph_id"]))
+    shape = (0, int(score_payload["L"]), int(score_payload["H"]))
+    return (
+        np.stack(left_values) if left_values else np.empty(shape),
+        np.stack(right_values) if right_values else np.empty(shape),
+        np.asarray(graph_ids, dtype=np.int64),
+    )
+
+
 # =====================================================================================
 # Independent whole-transport patching and causal controls
 # =====================================================================================
@@ -1525,6 +2431,49 @@ def patched_head(gm: Any, layer: int, head: int, source: Any | None):
         yield
     finally:
         handle.remove()
+
+
+@contextlib.contextmanager
+def patched_family(
+    gm: Any,
+    heads: Sequence[tuple[int, int]],
+    sources: Mapping[int, Any] | None,
+):
+    """Patch or zero a frozen multi-layer head family simultaneously."""
+
+    by_layer: dict[int, list[int]] = {}
+    for layer, head in heads:
+        by_layer.setdefault(int(layer), []).append(int(head))
+    handles = []
+    for layer, layer_heads in by_layer.items():
+        source = None if sources is None else sources[layer]
+
+        def hook(
+            _module: Any,
+            _inputs: Any,
+            output: Any,
+            *,
+            selected: tuple[int, ...] = tuple(layer_heads),
+            replacement: Any | None = source,
+        ) -> Any:
+            h_out, e_out = output
+            changed = h_out.clone()
+            if replacement is None:
+                changed[:, selected, :] = 0.0
+            else:
+                if tuple(replacement.shape) != tuple(h_out.shape):
+                    raise RuntimeError(
+                        f"family patch tensor {tuple(replacement.shape)} != {tuple(h_out.shape)}"
+                    )
+                changed[:, selected, :] = replacement[:, selected, :]
+            return changed, e_out
+
+        handles.append(gm.attn_layers[layer].register_forward_hook(hook))
+    try:
+        yield
+    finally:
+        for handle in handles:
+            handle.remove()
 
 
 def annotate_graph_num_nodes(batch: Any, data_list: Sequence[Any]) -> Any:
@@ -1573,6 +2522,20 @@ def forward_data_list(
     if patch is not None:
         manager = patched_head(gm, patch[0], patch[1], patch[2])
     with manager, torch.no_grad():
+        prediction, _target = gm.model(batch)
+    return prediction.detach().cpu().numpy().reshape(len(data_list), -1)
+
+
+def forward_data_list_family(
+    gm: Any,
+    data_list: Sequence[Any],
+    heads: Sequence[tuple[int, int]],
+    sources: Mapping[int, Any] | None,
+) -> np.ndarray:
+    import torch
+
+    batch = make_grit_batch(data_list, gm.device)
+    with patched_family(gm, heads, sources), torch.no_grad():
         prediction, _target = gm.model(batch)
     return prediction.detach().cpu().numpy().reshape(len(data_list), -1)
 
@@ -1641,13 +2604,23 @@ def causal_event_catalog(
                 "descriptor": plan["descriptor"],
                 "partner": int(item["partners"][0]),
             })
-        if plan["topology"]:
-            item = plan["topology"][0]
+        # Causal validation uses the best available donor from each tier. Score estimation
+        # retains all planned donors; this keeps tier/dose coverage without duplicating the
+        # very expensive all-head patch sweep within a molecule/tier.
+        causal_topology_items = []
+        seen_topology_tiers: set[int] = set()
+        for topology_index, item in enumerate(plan["topology"]):
+            tier = int(item["tier"])
+            if tier in seen_topology_tiers:
+                continue
+            seen_topology_tiers.add(tier)
+            causal_topology_items.append((topology_index, item))
+        for topology_index, item in causal_topology_items:
             events.append({
                 "graph_id": int(graph_id),
                 "channel": "topology",
                 "source": -1,
-                "event_index": 0,
+                "event_index": int(topology_index),
                 "clean": base,
                 "corrupt": topology_donor_variant(
                     base,
@@ -1723,7 +2696,11 @@ def concatenate_mismatch_transport(
 
 
 def run_causal_task(
-    loaded: Mapping[str, Any], cfg: BetaConfig, *, force: bool = False
+    loaded: Mapping[str, Any],
+    cfg: BetaConfig,
+    score_payload: Mapping[str, Any],
+    *,
+    force: bool = False,
 ) -> dict[str, Any]:
     import torch
 
@@ -1750,6 +2727,12 @@ def run_causal_task(
     )
     if not events:
         raise RuntimeError("causal catalog is empty")
+    frozen_families, _family_diagnostics = select_families(
+        score_payload, cfg, HEADLINE_AGGREGATION
+    )
+    family_names = [
+        name for name in PATCH_FAMILY_NAMES if frozen_families.get(name)
+    ]
     batch_size = max(1, int(cfg.causal_batch_graphs))
     for start in range(0, len(events), batch_size):
         chunk = events[start:start + batch_size]
@@ -1773,6 +2756,13 @@ def run_causal_task(
             "restore_loss", "inject_loss", "necessity_loss",
         )
     }
+    family_metrics = {
+        name: np.full((event_count, len(family_names)), np.nan, dtype=np.float32)
+        for name in (
+            "restore", "inject", "necessity", "mismatch", "sham",
+            "restore_loss", "inject_loss", "necessity_loss",
+        )
+    }
     progress_path = cache_path(cfg, task_name, "causal_progress", checkpoint_sha)
     progress = None if force else valid_cache(progress_path, cfg, checkpoint_sha)
     completed_chunks: set[int] = set()
@@ -1780,6 +2770,9 @@ def run_causal_task(
         if int(progress.get("event_count", -1)) != event_count:
             raise RuntimeError("causal progress event catalog size changed")
         metrics = {key: np.asarray(value) for key, value in progress["metrics"].items()}
+        family_metrics = {
+            key: np.asarray(value) for key, value in progress["family_metrics"].items()
+        }
         completed_chunks = {int(value) for value in progress.get("completed_chunks", [])}
     baseline_check = tensor_equivalent(
         torch.as_tensor(events[0]["clean_prediction"]),
@@ -1870,6 +2863,78 @@ def run_causal_task(
                 f"[causal:{task_name}] events {indices[0] + 1}-{indices[-1] + 1}/{event_count} "
                 f"layer {layer + 1}/{gm.L}", flush=True,
             )
+
+        # Frozen families are patched as units, simultaneously across all selected layers.
+        clean_sources = {
+            layer: concatenate_layer_transport(
+                events, indices, layer=layer, kind="clean_wv", device=gm.device
+            )
+            for layer in range(gm.L)
+        }
+        corrupt_sources = {
+            layer: concatenate_layer_transport(
+                events, indices, layer=layer, kind="corrupt_wv", device=gm.device
+            )
+            for layer in range(gm.L)
+        }
+        mismatch_sources, mismatch_valid_by_layer = {}, []
+        for layer in range(gm.L):
+            source, valid = concatenate_mismatch_transport(
+                events, indices, layer=layer, device=gm.device
+            )
+            mismatch_sources[layer] = source
+            mismatch_valid_by_layer.append(valid)
+        mismatch_valid = np.logical_and.reduce(mismatch_valid_by_layer)
+        for family_index, family in enumerate(family_names):
+            heads = frozen_families[family]
+            restore_sources = {
+                layer: torch.cat([clean_sources[layer], corrupt_sources[layer]], dim=0)
+                for layer in range(gm.L)
+            }
+            restore_inject = forward_data_list_family(
+                gm, [*corrupt_data, *clean_data], heads, restore_sources
+            )
+            restored = restore_inject[:len(indices)]
+            injected = restore_inject[len(indices):]
+            ablated = forward_data_list_family(
+                gm, [*clean_data, *corrupt_data], heads, None
+            )
+            ablated_clean = ablated[:len(indices)]
+            ablated_corrupt = ablated[len(indices):]
+            mismatch_sources_both = {
+                layer: torch.cat([mismatch_sources[layer], corrupt_sources[layer]], dim=0)
+                for layer in range(gm.L)
+            }
+            mismatch_sham = forward_data_list_family(
+                gm, [*corrupt_data, *corrupt_data], heads, mismatch_sources_both
+            )
+            movements = {
+                "restore": restored - corrupt,
+                "inject": clean - injected,
+                "necessity": delta - (ablated_clean - ablated_corrupt),
+                "mismatch": mismatch_sham[:len(indices)] - corrupt,
+                "sham": mismatch_sham[len(indices):] - corrupt,
+            }
+            for name, movement in movements.items():
+                desired = np.mean(movement * direction, axis=1)
+                if name == "mismatch":
+                    desired = np.where(mismatch_valid, desired, np.nan)
+                family_metrics[name][indices, family_index] = desired
+            clean_loss = np.abs(clean - target).mean(axis=1)
+            corrupt_loss = np.abs(corrupt - target).mean(axis=1)
+            family_metrics["restore_loss"][indices, family_index] = (
+                corrupt_loss - np.abs(restored - target).mean(axis=1)
+            )
+            family_metrics["inject_loss"][indices, family_index] = (
+                np.abs(injected - target).mean(axis=1) - clean_loss
+            )
+            family_metrics["necessity_loss"][indices, family_index] = (
+                (corrupt_loss - clean_loss)
+                - (
+                    np.abs(ablated_corrupt - target).mean(axis=1)
+                    - np.abs(ablated_clean - target).mean(axis=1)
+                )
+            )
         completed_chunks.add(start)
         atomic_torch_save({
             "version": BETA_VERSION,
@@ -1879,6 +2944,9 @@ def run_causal_task(
             "task": task_name,
             "event_count": event_count,
             "metrics": metrics,
+            "family_metrics": family_metrics,
+            "family_names": family_names,
+            "family_definitions": frozen_families,
             "completed_chunks": sorted(completed_chunks),
         }, progress_path)
 
@@ -1898,6 +2966,9 @@ def run_causal_task(
         "H": gm.H,
         "events": metadata,
         "metrics": metrics,
+        "family_metrics": family_metrics,
+        "family_names": family_names,
+        "family_definitions": frozen_families,
         "batch_invariance": baseline_check,
         "causal_effect_floor_relative": cfg.causal_effect_floor_relative,
     }
@@ -1973,19 +3044,32 @@ def partial_spearman(left: np.ndarray, right: np.ndarray, controls: np.ndarray) 
     return float(np.corrcoef(left_residual, right_residual)[0, 1])
 
 
-def causal_coordinates(causal_payload: Mapping[str, Any], metric: str = "restore") -> dict[str, np.ndarray]:
-    semantic = channel_mean_metric(causal_payload, "semantic", metric)
-    structural = channel_mean_metric(causal_payload, "pe", metric)
-    total_magnitude = np.abs(semantic) + np.abs(structural)
+def causal_pair_coordinates(
+    causal_payload: Mapping[str, Any],
+    left_channel: str,
+    right_channel: str,
+    metric: str = "restore",
+) -> dict[str, np.ndarray]:
+    left = channel_mean_metric(causal_payload, left_channel, metric)
+    right = channel_mean_metric(causal_payload, right_channel, metric)
+    total_magnitude = np.abs(left) + np.abs(right)
     return {
-        "semantic": semantic,
-        "structural": structural,
-        "D": (semantic - structural) / (total_magnitude + EPS),
+        "semantic": left,
+        "structural": right,
+        "left": left,
+        "right": right,
+        "D": (left - right) / (total_magnitude + EPS),
         "J": 0.5 * total_magnitude,
-        "G": np.sqrt(np.maximum(semantic, 0.0) * np.maximum(structural, 0.0)),
-        "semantic_anti_aligned": semantic < 0.0,
-        "structural_anti_aligned": structural < 0.0,
+        "G": np.sqrt(np.maximum(left, 0.0) * np.maximum(right, 0.0)),
+        "semantic_anti_aligned": left < 0.0,
+        "structural_anti_aligned": right < 0.0,
+        "left_anti_aligned": left < 0.0,
+        "right_anti_aligned": right < 0.0,
     }
+
+
+def causal_coordinates(causal_payload: Mapping[str, Any], metric: str = "restore") -> dict[str, np.ndarray]:
+    return causal_pair_coordinates(causal_payload, "semantic", "pe", metric)
 
 
 def aggregation_diagnostics(
@@ -2068,40 +3152,6 @@ def prefix_reliability(score_payload: Mapping[str, Any], aggregation: str) -> di
         "rank_rho": float(np.nanmean(correlations)) if correlations else float("nan"),
         "top3_jaccard": float(np.nanmean(topk)) if topk else float("nan"),
     }
-
-
-def choose_aggregation(
-    score_payload: Mapping[str, Any], causal_payload: Mapping[str, Any]
-) -> tuple[str, list[dict[str, Any]]]:
-    rows = aggregation_diagnostics(score_payload, causal_payload)
-    scored = []
-    for aggregation in AGGREGATIONS:
-        relevant = [row for row in rows if row["aggregation"] == aggregation]
-        validity = np.nanmean([
-            row[key]
-            for row in relevant
-            for key in (
-                "rho_sem_restore", "rho_pe_restore", "rho_J_restore", "rho_G_restore",
-                "rho_D_restore_gated", "rho_D_necessity_gated",
-            )
-        ])
-        reliability = prefix_reliability(score_payload, aggregation)
-        reliability_mean = finite_mean([reliability["rank_rho"], reliability["top3_jaccard"]])
-        objective = float(np.nanmean([validity, reliability_mean]))
-        scored.append((objective, aggregation, validity, reliability))
-    scored.sort(key=lambda item: (-np.nan_to_num(item[0], nan=-np.inf), AGGREGATIONS.index(item[1])))
-    winner = scored[0][1]
-    for objective, aggregation, validity, reliability in scored:
-        rows.append({
-            "aggregation": aggregation,
-            "scope": "decision",
-            "validity_mean": validity,
-            "prefix_reliability": reliability["rank_rho"],
-            "prefix_top3_jaccard": reliability["top3_jaccard"],
-            "objective": objective,
-            "selected": aggregation == winner,
-        })
-    return winner, rows
 
 
 def bootstrap_d_intervals(
@@ -2194,7 +3244,61 @@ def select_families(
             chosen.append(candidates[0])
         return chosen
 
+    pe_graphs_paired, topology_graphs_paired, _ = paired_graph_scores(
+        score_payload, "pe", "topology", aggregation
+    )
+    if len(pe_graphs_paired):
+        pe_topology_pe = pe_graphs_paired.mean(axis=0)
+        pe_topology_topology = topology_graphs_paired.mean(axis=0)
+        pe_topology_coordinates = score_coordinates(
+            pe_topology_pe, pe_topology_topology
+        )
+        pe_topology_lower, pe_topology_upper = bootstrap_d_intervals(
+            pe_graphs_paired,
+            topology_graphs_paired,
+            samples=cfg.bootstrap_samples,
+            seed=cfg.analysis_seed + 8_911,
+        )
+    else:
+        pe_topology_pe = np.full_like(structural, np.nan)
+        pe_topology_topology = np.full_like(structural, np.nan)
+        pe_topology_coordinates = score_coordinates(
+            pe_topology_pe, pe_topology_topology
+        )
+        pe_topology_lower = np.full_like(structural, np.nan)
+        pe_topology_upper = np.full_like(structural, np.nan)
     topology = mean_score(score_payload, "topology", aggregation)
+    semantic_topology_semantic_graphs, semantic_topology_graphs, _ = paired_graph_scores(
+        score_payload, "semantic", "topology", aggregation
+    )
+    if len(semantic_topology_semantic_graphs):
+        semantic_topology_semantic = semantic_topology_semantic_graphs.mean(axis=0)
+        semantic_topology_topology = semantic_topology_graphs.mean(axis=0)
+    else:
+        semantic_topology_semantic = np.full_like(semantic, np.nan)
+        semantic_topology_topology = np.full_like(semantic, np.nan)
+    if np.isfinite(pe_topology_coordinates["J"]).any():
+        pe_topology_floor = max(
+            cfg.activity_floor_relative * float(np.nanmax(pe_topology_coordinates["J"])),
+            EPS,
+        )
+        pe_topology_active = pe_topology_coordinates["J"] >= pe_topology_floor
+    else:
+        pe_topology_floor = float("nan")
+        pe_topology_active = np.zeros_like(pe_topology_coordinates["J"], dtype=bool)
+    pe_specific_mask = (
+        pe_topology_active
+        & (pe_topology_coordinates["D"] >= cfg.selectivity_threshold)
+        & (pe_topology_lower > 0.0)
+    )
+    topology_specific_mask = (
+        pe_topology_active
+        & (pe_topology_coordinates["D"] <= -cfg.selectivity_threshold)
+        & (pe_topology_upper < 0.0)
+    )
+    pe_topology_shared_mask = (
+        pe_topology_active & (pe_topology_lower <= 0.0) & (pe_topology_upper >= 0.0)
+    )
     families = {
         "raw_semantic": take(head_order(semantic)),
         "raw_pe": take(head_order(structural)),
@@ -2216,6 +3320,15 @@ def select_families(
         "high_G_balanced": take(head_order(coordinates["G"]), balanced),
         "low_J_inert": take(head_order(coordinates["J"], reverse=False)),
         "topology_responsive": take(head_order(topology)) if np.isfinite(topology).any() else [],
+        "structural_pe_specific": take(
+            head_order(pe_topology_coordinates["D"]), pe_specific_mask
+        ),
+        "structural_topology_specific": take(
+            head_order(-pe_topology_coordinates["D"]), topology_specific_mask
+        ),
+        "structural_shared": take(
+            head_order(pe_topology_coordinates["G"]), pe_topology_shared_mask
+        ),
     }
     return families, {
         "semantic": semantic,
@@ -2226,6 +3339,15 @@ def select_families(
         "D_ci_upper": upper,
         "activity_floor": activity_floor,
         "active": active,
+        "pe_topology_coordinates": pe_topology_coordinates,
+        "pe_topology_pe": pe_topology_pe,
+        "pe_topology_topology": pe_topology_topology,
+        "semantic_topology_semantic": semantic_topology_semantic,
+        "semantic_topology_topology": semantic_topology_topology,
+        "pe_topology_D_ci_lower": pe_topology_lower,
+        "pe_topology_D_ci_upper": pe_topology_upper,
+        "pe_topology_activity_floor": pe_topology_floor,
+        "pe_topology_active": pe_topology_active,
         "families": families,
     }
 
@@ -2265,21 +3387,72 @@ def run_ablation_task(
     groups = batch_groups(data, size=64)
     clean = gm.collect_preds_ablated(groups)
     target = np.stack([item.y.detach().cpu().numpy().reshape(-1) for item in data])
+    progress_path = cache_path(cfg, task_name, "ablations_progress", checkpoint_sha)
+    progress = None if force else valid_cache(progress_path, cfg, checkpoint_sha)
     per_head = {
         "functional": np.zeros((gm.L, gm.H), dtype=np.float32),
         "loss_increase": np.zeros((gm.L, gm.H), dtype=np.float32),
         "mae": np.zeros((gm.L, gm.H), dtype=np.float32),
     }
+    completed_heads: set[tuple[int, int]] = set()
+    family_curves: dict[str, dict[str, list[dict[str, Any]]]] = {}
+    if progress is not None:
+        if tuple(progress.get("head_shape", ())) != (gm.L, gm.H):
+            raise RuntimeError("ablation progress head shape changed")
+        cached_per_head = progress.get("per_head", {})
+        if set(cached_per_head) != set(per_head):
+            raise RuntimeError("ablation progress metric schema changed")
+        per_head = {key: np.asarray(value) for key, value in cached_per_head.items()}
+        completed_heads = {
+            (int(value[0]), int(value[1]))
+            for value in progress.get("completed_heads", [])
+        }
+        family_curves = {
+            str(aggregation): {
+                str(family): list(rows) for family, rows in curves.items()
+            }
+            for aggregation, curves in progress.get("family_curves", {}).items()
+        }
+
+    def save_ablation_progress() -> None:
+        atomic_torch_save({
+            "version": BETA_VERSION,
+            "schema": BETA_SCHEMA,
+            "fingerprint": cfg.fingerprint,
+            "checkpoint_sha256": checkpoint_sha,
+            "task": task_name,
+            "head_shape": (gm.L, gm.H),
+            "per_head": per_head,
+            "completed_heads": sorted(completed_heads),
+            "family_curves": family_curves,
+        }, progress_path)
+
     for layer in range(gm.L):
         for head in range(gm.H):
+            if (layer, head) in completed_heads:
+                continue
             prediction = gm.collect_preds_ablated(groups, [(layer, head)])
             summary = ablation_summary(prediction, clean, target)
             for key in per_head:
                 per_head[key][layer, head] = summary[key]
+            completed_heads.add((layer, head))
+        # One layer is the natural resumable unit and avoids excessive Drive writes.
+        save_ablation_progress()
         print(f"[ablations:{task_name}] layer {layer + 1}/{gm.L}", flush=True)
 
-    winner, method_rows = choose_aggregation(score_payload, causal_payload)
+    # EG is predeclared from the synthetic/ZINC redesign decision; diagnostics for the other
+    # aggregations remain cheap audit rows but cannot change the headline analysis.
+    winner = HEADLINE_AGGREGATION
+    method_rows = aggregation_diagnostics(score_payload, causal_payload)
     for aggregation in AGGREGATIONS:
+        reliability = prefix_reliability(score_payload, aggregation)
+        method_rows.append({
+            "aggregation": aggregation,
+            "scope": "donor_convergence_audit",
+            "prefix_rank_rho": reliability["rank_rho"],
+            "prefix_top3_jaccard": reliability["top3_jaccard"],
+            "selected": aggregation == HEADLINE_AGGREGATION,
+        })
         semantic = mean_score(score_payload, "semantic", aggregation)
         structural = mean_score(score_payload, "pe", aggregation)
         coordinates = score_coordinates(semantic, structural)
@@ -2296,17 +3469,27 @@ def run_ablation_task(
                 "rho_J_loss_ablation": spearman(transform(coordinates["J"]).reshape(-1), loss),
             })
     selections = {}
-    family_curves = {}
-    for aggregation in AGGREGATIONS:
+    for aggregation in (HEADLINE_AGGREGATION,):
         families, diagnostics = select_families(score_payload, cfg, aggregation)
         selections[aggregation] = diagnostics
-        family_curves[aggregation] = {}
+        family_curves.setdefault(aggregation, {})
         for family, heads in families.items():
-            rows = []
+            rows = list(family_curves[aggregation].get(family, []))
+            rows_by_count = {int(row["count"]): row for row in rows}
             for count in range(1, len(heads) + 1):
+                if count in rows_by_count:
+                    continue
                 prediction = gm.collect_preds_ablated(groups, heads[:count])
-                rows.append({"count": count, **ablation_summary(prediction, clean, target)})
-            family_curves[aggregation][family] = rows
+                row = {"count": count, **ablation_summary(prediction, clean, target)}
+                rows_by_count[count] = row
+                family_curves[aggregation][family] = [
+                    rows_by_count[index] for index in sorted(rows_by_count)
+                ]
+            family_curves[aggregation][family] = [
+                rows_by_count[index] for index in sorted(rows_by_count)
+            ]
+            # Preserve a completed ranked family without writing after every prefix.
+            save_ablation_progress()
     payload = {
         "version": BETA_VERSION,
         "schema": BETA_SCHEMA,
@@ -2412,46 +3595,82 @@ def aggregate_pairs_to_nodes(pair_value: Any, destination: Any, n: int) -> Any:
     return out
 
 
-def decompose_fixed_support_layer(clean: Mapping[str, Any], corrupt: Mapping[str, Any]) -> dict[str, Any]:
+def decompose_support_aware_layer(clean: Mapping[str, Any], corrupt: Mapping[str, Any]) -> dict[str, Any]:
+    """Exact routing/message/wiring split on the common and exclusive supports.
+
+    Routing and message use the symmetric product decomposition on common directed pairs.
+    Clean-only minus corrupt-only transported messages form an explicit wiring component.
+    This reduces exactly to the two-way decomposition when support is fixed.
+    """
+
     import torch
 
-    if not torch.equal(clean["src"], corrupt["src"]) or not torch.equal(clean["dst"], corrupt["dst"]):
-        raise RuntimeError("routing/message decomposition requires identical ordered support")
     n = int(clean["head_output"].shape[0])
-    clean_attention = clean["attention"].unsqueeze(-1)
-    corrupt_attention = corrupt["attention"].unsqueeze(-1)
-    clean_message = clean["message"]
-    corrupt_message = corrupt["message"]
-    route_pairs = (clean_attention - corrupt_attention) * 0.5 * (
-        clean_message + corrupt_message
-    )
-    message_pairs = 0.5 * (clean_attention + corrupt_attention) * (
-        clean_message - corrupt_message
-    )
-    route_nodes = aggregate_pairs_to_nodes(route_pairs, clean["dst"], n)
-    message_nodes = aggregate_pairs_to_nodes(message_pairs, clean["dst"], n)
+    clean_keys = list(zip(clean["src"].cpu().tolist(), clean["dst"].cpu().tolist()))
+    corrupt_keys = list(zip(corrupt["src"].cpu().tolist(), corrupt["dst"].cpu().tolist()))
+    if len(set(clean_keys)) != len(clean_keys) or len(set(corrupt_keys)) != len(corrupt_keys):
+        raise RuntimeError("mechanism support contains duplicate directed pairs")
+    clean_pos = {key: index for index, key in enumerate(clean_keys)}
+    corrupt_pos = {key: index for index, key in enumerate(corrupt_keys)}
+    common = sorted(set(clean_pos) & set(corrupt_pos))
+    clean_only = sorted(set(clean_pos) - set(corrupt_pos))
+    corrupt_only = sorted(set(corrupt_pos) - set(clean_pos))
+
+    def indices(mapping: Mapping[tuple[int, int], int], keys: Sequence[tuple[int, int]]) -> Any:
+        return torch.as_tensor(
+            [mapping[key] for key in keys], device=clean["attention"].device, dtype=torch.long
+        )
+
+    ci, xi = indices(clean_pos, common), indices(corrupt_pos, common)
+    clean_attention = clean["attention"][ci].unsqueeze(-1)
+    corrupt_attention = corrupt["attention"][xi].unsqueeze(-1)
+    clean_message = clean["message"][ci]
+    corrupt_message = corrupt["message"][xi]
+    route_pairs = (clean_attention - corrupt_attention) * 0.5 * (clean_message + corrupt_message)
+    message_pairs = 0.5 * (clean_attention + corrupt_attention) * (clean_message - corrupt_message)
+    common_dst = clean["dst"][ci]
+    route_nodes = aggregate_pairs_to_nodes(route_pairs, common_dst, n)
+    message_nodes = aggregate_pairs_to_nodes(message_pairs, common_dst, n)
+
+    wiring_nodes = torch.zeros_like(route_nodes)
+    if clean_only:
+        oi = indices(clean_pos, clean_only)
+        wiring_nodes += aggregate_pairs_to_nodes(
+            clean["attention"][oi].unsqueeze(-1) * clean["message"][oi], clean["dst"][oi], n
+        )
+    if corrupt_only:
+        oi = indices(corrupt_pos, corrupt_only)
+        wiring_nodes -= aggregate_pairs_to_nodes(
+            corrupt["attention"][oi].unsqueeze(-1) * corrupt["message"][oi],
+            corrupt["dst"][oi], n,
+        )
     direct_nodes = clean["head_output"] - corrupt["head_output"]
-    reconstruction = direct_nodes - route_nodes - message_nodes
+    reconstruction = direct_nodes - route_nodes - message_nodes - wiring_nodes
     gradient = clean["gradient"]
     direct_q = torch.einsum("nhd,nhd->h", gradient, direct_nodes)
     route_q = torch.einsum("nhd,nhd->h", gradient, route_nodes)
     message_q = torch.einsum("nhd,nhd->h", gradient, message_nodes)
-
-    routing_hybrid = aggregate_pairs_to_nodes(
-        clean_attention * corrupt_message, clean["dst"], n
-    )
-    message_hybrid = aggregate_pairs_to_nodes(
-        corrupt_attention * clean_message, clean["dst"], n
-    )
+    wiring_q = torch.einsum("nhd,nhd->h", gradient, wiring_nodes)
     return {
         "direct_q": direct_q,
         "routing_q": route_q,
         "message_q": message_q,
+        "wiring_q": wiring_q,
         "reconstruction_max": float(reconstruction.abs().max()),
-        "routing_hybrid": routing_hybrid,
-        "message_hybrid": message_hybrid,
+        "routing_hybrid": corrupt["head_output"] + route_nodes,
+        "message_hybrid": corrupt["head_output"] + message_nodes,
+        "wiring_hybrid": corrupt["head_output"] + wiring_nodes,
         "full_clean": clean["head_output"],
+        "common_pairs": len(common),
+        "clean_only_pairs": len(clean_only),
+        "corrupt_only_pairs": len(corrupt_only),
     }
+
+
+def decompose_fixed_support_layer(clean: Mapping[str, Any], corrupt: Mapping[str, Any]) -> dict[str, Any]:
+    """Compatibility alias; now returns the support-aware decomposition."""
+
+    return decompose_support_aware_layer(clean, corrupt)
 
 
 def run_mechanism_task(
@@ -2480,16 +3699,13 @@ def run_mechanism_task(
         topology_descriptors=descriptors,
         topology_by_n=by_n,
     )
-    events = [
-        event for event in catalog
-        if event["channel"] in PRIMARY_CHANNELS and int(event["event_index"]) == 0
-    ]
+    events = [event for event in catalog if int(event["event_index"]) == 0]
     shape = (len(events), gm.L, gm.H)
     arrays = {
         key: np.full(shape, np.nan, dtype=np.float32)
         for key in (
-            "direct_q", "routing_q", "message_q", "routing_rescue", "message_rescue",
-            "full_rescue", "finite_interaction",
+            "direct_q", "routing_q", "message_q", "wiring_q", "routing_rescue",
+            "message_rescue", "wiring_rescue", "full_rescue", "finite_interaction",
         )
     }
     reconstruction = np.zeros((len(events), gm.L), dtype=np.float32)
@@ -2502,52 +3718,8 @@ def run_mechanism_task(
         arrays = {key: np.asarray(value) for key, value in progress["metrics"].items()}
         reconstruction = np.asarray(progress["reconstruction_max"])
         completed_events = {int(value) for value in progress.get("completed_events", [])}
-    for event_index, event in enumerate(events):
-        if event_index in completed_events:
-            print(f"[mechanism:{task_name}] event {event_index + 1} cache hit", flush=True)
-            continue
-        clean = capture_mechanism(gm, event["clean"])
-        corrupt = capture_mechanism(gm, event["corrupt"])
-        delta = clean["prediction"] - corrupt["prediction"]
-        direction = np.sign(delta)
-        for layer in range(gm.L):
-            decomposition = decompose_fixed_support_layer(
-                clean["layers"][layer], corrupt["layers"][layer]
-            )
-            reconstruction[event_index, layer] = decomposition["reconstruction_max"]
-            if decomposition["reconstruction_max"] > MECHANISM_ATOL:
-                raise RuntimeError(
-                    f"routing/message reconstruction failed: {decomposition['reconstruction_max']:.3e}"
-                )
-            for key in ("direct_q", "routing_q", "message_q"):
-                arrays[key][event_index, layer] = decomposition[key].detach().cpu().numpy()
-            for head in range(gm.H):
-                names = ("routing_rescue", "message_rescue", "full_rescue")
-                sources = (
-                    decomposition["routing_hybrid"],
-                    decomposition["message_hybrid"],
-                    decomposition["full_clean"],
-                )
-                patched = forward_data_list(
-                    gm,
-                    [event["corrupt"], event["corrupt"], event["corrupt"]],
-                    patch=(layer, head, torch.cat([source.to(gm.device) for source in sources], dim=0)),
-                )
-                predictions = {}
-                for name, prediction in zip(names, patched):
-                    desired = float(np.mean((prediction - corrupt["prediction"]) * direction))
-                    arrays[name][event_index, layer, head] = desired
-                    predictions[name] = desired
-                arrays["finite_interaction"][event_index, layer, head] = (
-                    predictions["full_rescue"]
-                    - predictions["routing_rescue"]
-                    - predictions["message_rescue"]
-                )
-        print(
-            f"[mechanism:{task_name}] event {event_index + 1}/{len(events)} "
-            f"channel={event['channel']}", flush=True,
-        )
-        completed_events.add(event_index)
+
+    def save_mechanism_progress() -> None:
         atomic_torch_save({
             "version": BETA_VERSION,
             "schema": BETA_SCHEMA,
@@ -2559,6 +3731,56 @@ def run_mechanism_task(
             "reconstruction_max": reconstruction,
             "completed_events": sorted(completed_events),
         }, progress_path)
+
+    for event_index, event in enumerate(events):
+        if event_index in completed_events:
+            print(f"[mechanism:{task_name}] event {event_index + 1} cache hit", flush=True)
+            continue
+        clean = capture_mechanism(gm, event["clean"])
+        corrupt = capture_mechanism(gm, event["corrupt"])
+        delta = clean["prediction"] - corrupt["prediction"]
+        direction = np.sign(delta)
+        for layer in range(gm.L):
+            decomposition = decompose_support_aware_layer(
+                clean["layers"][layer], corrupt["layers"][layer]
+            )
+            reconstruction[event_index, layer] = decomposition["reconstruction_max"]
+            if decomposition["reconstruction_max"] > MECHANISM_ATOL:
+                raise RuntimeError(
+                    f"routing/message reconstruction failed: {decomposition['reconstruction_max']:.3e}"
+                )
+            for key in ("direct_q", "routing_q", "message_q", "wiring_q"):
+                arrays[key][event_index, layer] = decomposition[key].detach().cpu().numpy()
+            for head in range(gm.H):
+                names = ("routing_rescue", "message_rescue", "wiring_rescue", "full_rescue")
+                sources = (
+                    decomposition["routing_hybrid"],
+                    decomposition["message_hybrid"],
+                    decomposition["wiring_hybrid"],
+                    decomposition["full_clean"],
+                )
+                patched = forward_data_list(
+                    gm,
+                    [event["corrupt"] for _ in names],
+                    patch=(layer, head, torch.cat([source.to(gm.device) for source in sources], dim=0)),
+                )
+                predictions = {}
+                for name, prediction in zip(names, patched):
+                    desired = float(np.mean((prediction - corrupt["prediction"]) * direction))
+                    arrays[name][event_index, layer, head] = desired
+                    predictions[name] = desired
+                arrays["finite_interaction"][event_index, layer, head] = (
+                    predictions["full_rescue"]
+                    - predictions["routing_rescue"]
+                    - predictions["message_rescue"]
+                    - predictions["wiring_rescue"]
+                )
+        print(
+            f"[mechanism:{task_name}] event {event_index + 1}/{len(events)} "
+            f"channel={event['channel']}", flush=True,
+        )
+        completed_events.add(event_index)
+        save_mechanism_progress()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
     payload = {
@@ -2586,6 +3808,8 @@ def run_mechanism_task(
 def _condition_observations(
     score_payload: Mapping[str, Any], aggregation: str
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    import networkx as nx
+
     records = score_payload["records"]
     graph_features = []
     discovery_graphs = {
@@ -2595,6 +3819,12 @@ def _condition_observations(
     for record in records:
         descriptor = record["plan"]["descriptor"]
         labels = [tuple(row) for row in np.asarray(descriptor["labels"], dtype=int)]
+        degree = np.asarray(descriptor["degree"], dtype=float)
+        graph = nx.Graph()
+        graph.add_nodes_from(range(int(record["n"])))
+        graph.add_edges_from(np.asarray(descriptor["edges"], dtype=int).tolist())
+        cycle_nodes = {node for cycle in nx.cycle_basis(graph) for node in cycle}
+        articulation = set(nx.articulation_points(graph))
         if int(record["graph_id"]) in discovery_graphs:
             for label in set(labels):
                 atom_counts[label] = atom_counts.get(label, 0) + 1
@@ -2603,15 +3833,29 @@ def _condition_observations(
             "n": int(record["n"]),
             "cycle_rank": int(descriptor["cycle_rank"]),
             "atom_diversity": len(set(labels)),
+            "mean_degree": float(np.mean(degree)),
+            "edge_density": float(
+                len(descriptor["edges"]) / max(int(record["n"]) * (int(record["n"]) - 1) / 2, 1)
+            ),
+            "degree": degree,
+            "cycle_nodes": cycle_nodes,
+            "articulation": articulation,
+            "edges": np.asarray(descriptor["edges"], dtype=int),
             "labels": labels,
+            "distances": shortest_paths(
+                int(record["n"]), np.asarray(descriptor["edges"], dtype=int)
+            ),
         })
     discovery_features = [row for row in graph_features if row["graph_id"] in discovery_graphs]
     thresholds = {
         name: float(np.median([row[name] for row in discovery_features]))
-        for name in ("n", "cycle_rank", "atom_diversity")
+        for name in ("n", "cycle_rank", "atom_diversity", "mean_degree", "edge_density")
     }
+    thresholds["source_degree"] = float(np.median(np.concatenate([
+        row["degree"] for row in discovery_features
+    ])))
     common_atoms = [
-        label for label, _count in sorted(atom_counts.items(), key=lambda item: (-item[1], item[0]))[:4]
+        label for label, _count in sorted(atom_counts.items(), key=lambda item: (-item[1], item[0]))[:6]
     ]
     by_id = {row["graph_id"]: row for row in graph_features}
     observations = []
@@ -2622,18 +3866,44 @@ def _condition_observations(
         entropy = -(probability * np.log(np.maximum(probability, EPS))).sum(axis=-1)
         return 1.0 - entropy / max(math.log(event_magnitude.shape[-1]), EPS)
 
+    def pair_features(left: np.ndarray, right: np.ndarray, prefix: str) -> dict[str, np.ndarray]:
+        total = left + right
+        return {
+            f"D_{prefix}": (left - right) / (total + EPS),
+            f"J_{prefix}": 0.5 * total,
+            f"G_{prefix}": np.sqrt(np.maximum(left * right, 0.0)),
+        }
+
     for record in records:
+        if not all(record["channels"][channel]["available"] for channel in CHANNELS):
+            continue
         semantic = np.asarray(record["channels"]["semantic"]["per_source"][aggregation], float)
-        structural = np.asarray(record["channels"]["pe"]["per_source"][aggregation], float)
-        total = semantic + structural
-        d_value = (semantic - structural) / (total + EPS)
-        j_value = 0.5 * total
+        pe = np.asarray(record["channels"]["pe"]["per_source"][aggregation], float)
+        topology_graph = record_channel_score(
+            record, "topology", aggregation, topology_max_tier=1
+        )
+        if topology_graph is None:
+            continue
+        topology_graph = np.asarray(topology_graph, float)
+        topology = np.broadcast_to(topology_graph, semantic.shape)
+        score_features = {
+            "S_semantic": semantic,
+            "S_pe": pe,
+            "S_topology": topology,
+            **pair_features(semantic, pe, "semantic_pe"),
+            **pair_features(semantic, topology, "semantic_topology"),
+            **pair_features(pe, topology, "pe_topology"),
+            "J_three_channel": (semantic + pe + topology) / 3.0,
+            "G_three_channel": np.cbrt(np.maximum(semantic * pe * topology, 0.0)),
+        }
         sources = np.asarray(record["plan"]["sources"], dtype=np.int64)
         feature = by_id[int(record["graph_id"])]
         graph_rules = {
             "graph_size_high": feature["n"] > thresholds["n"],
             "cycle_rank_high": feature["cycle_rank"] > thresholds["cycle_rank"],
             "atom_diversity_high": feature["atom_diversity"] > thresholds["atom_diversity"],
+            "mean_degree_high": feature["mean_degree"] > thresholds["mean_degree"],
+            "edge_density_high": feature["edge_density"] > thresholds["edge_density"],
         }
         for atom in common_atoms:
             graph_rules[f"graph_contains_atom_{'_'.join(map(str, atom))}"] = atom in feature["labels"]
@@ -2642,20 +3912,52 @@ def _condition_observations(
             rules = dict(graph_rules)
             for atom in common_atoms:
                 rules[f"source_atom_{'_'.join(map(str, atom))}"] = source_label == atom
+                atom_nodes = [index for index, label in enumerate(feature["labels"]) if label == atom]
+                rules[f"source_near_atom_{'_'.join(map(str, atom))}"] = (
+                    bool(
+                        np.min(feature["distances"][int(source), atom_nodes]) <= 1
+                    )
+                    if atom_nodes else False
+                )
+            neighbors = [
+                int(v) if int(u) == int(source) else int(u)
+                for u, v in feature["edges"] if int(source) in (int(u), int(v))
+            ]
+            rules["source_degree_high"] = feature["degree"][int(source)] > thresholds["source_degree"]
+            rules["source_in_cycle"] = int(source) in feature["cycle_nodes"]
+            rules["source_is_articulation"] = int(source) in feature["articulation"]
+            rules["source_neighbor_atom_diverse"] = len({feature["labels"][node] for node in neighbors}) >= 2
+            topology_items = [
+                item for item in record["plan"]["topology"] if int(item["tier"]) <= 1
+            ]
+            topology_dose = float(np.mean([
+                item["dose"]["edge_jaccard_distance"] for item in topology_items
+            ])) if topology_items else float("nan")
+            topology_tier = float(np.mean([item["tier"] for item in topology_items])) if topology_items else float("nan")
+            topology_indices = [
+                index for index, item in enumerate(record["plan"]["topology"])
+                if int(item["tier"]) <= 1
+            ]
+            topology_q = record["channels"]["topology"]["q_groups"][0][topology_indices]
+            topology_concentration = concentration(topology_q)
             observations.append({
                 "graph_id": int(record["graph_id"]),
                 "split": "discovery" if int(record["graph_id"]) in discovery_graphs else "confirmation",
                 "source": int(source),
-                "D": d_value[source_index],
-                "J": j_value[source_index],
+                **{key: value[source_index] for key, value in score_features.items()},
+                "D": score_features["D_semantic_pe"][source_index],
+                "J": score_features["J_semantic_pe"][source_index],
                 "semantic_dose": float(np.mean(record["plan"]["semantic"][source_index]["dose"])),
                 "pe_dose": float(np.mean(record["plan"]["pe"][source_index]["dose"])),
+                "topology_dose": topology_dose,
+                "topology_tier": topology_tier,
                 "semantic_concentration": concentration(
                     record["channels"]["semantic"]["q_groups"][source_index]
                 ),
                 "pe_concentration": concentration(
                     record["channels"]["pe"]["q_groups"][source_index]
                 ),
+                "topology_concentration": topology_concentration,
                 "rules": rules,
             })
     return observations, {
@@ -2691,14 +3993,17 @@ def _conditional_feature_effect(
 
 
 def _conditional_p_value(
-    observations: Sequence[Mapping[str, Any]], rule: str, head: tuple[int, int]
+    observations: Sequence[Mapping[str, Any]],
+    rule: str,
+    head: tuple[int, int],
+    feature: str = "D",
 ) -> float:
     from scipy.stats import ttest_1samp, ttest_ind
 
     by_state: dict[bool, dict[int, list[float]]] = {False: {}, True: {}}
     for row in observations:
         state = bool(row["rules"][rule])
-        by_state[state].setdefault(int(row["graph_id"]), []).append(float(row["D"][head]))
+        by_state[state].setdefault(int(row["graph_id"]), []).append(float(row[feature][head]))
     means = {
         state: {graph_id: float(np.mean(values)) for graph_id, values in groups.items()}
         for state, groups in by_state.items()
@@ -2731,11 +4036,17 @@ def conditional_dose_diagnostics(
     observations: Sequence[Mapping[str, Any]], rule: str
 ) -> dict[str, float]:
     output = {}
-    for key in ("semantic_dose", "pe_dose"):
-        values = {
-            state: np.asarray([float(row[key]) for row in observations if bool(row["rules"][rule]) == state])
-            for state in (False, True)
-        }
+    for key in ("semantic_dose", "pe_dose", "topology_dose"):
+        values = {}
+        for state in (False, True):
+            grouped: dict[int, list[float]] = {}
+            for row in observations:
+                if bool(row["rules"][rule]) == state:
+                    grouped.setdefault(int(row["graph_id"]), []).append(float(row[key]))
+            values[state] = np.asarray(
+                [np.nanmean(grouped[graph_id]) for graph_id in sorted(grouped)], dtype=float
+            )
+            values[state] = values[state][np.isfinite(values[state])]
         left, right = values[False], values[True]
         if not len(left) or not len(right):
             output[f"{key}_standardized_difference"] = float("nan")
@@ -2761,6 +4072,7 @@ def _bootstrap_conditional_effect(
     observations: Sequence[Mapping[str, Any]],
     rule: str,
     head: tuple[int, int],
+    feature: str = "D",
     *,
     samples: int,
     seed: int,
@@ -2777,7 +4089,7 @@ def _bootstrap_conditional_effect(
                 copied = dict(row)
                 copied["graph_id"] = new_id
                 boot.append(copied)
-        effect, _, _ = _conditional_effect(boot, rule, head)
+        effect, _, _ = _conditional_feature_effect(boot, rule, head, feature)
         if np.isfinite(effect):
             values.append(effect)
     if not values:
@@ -2794,58 +4106,99 @@ def conditional_analysis(
     rules = sorted(observations[0]["rules"]) if observations else []
     L, H = int(score_payload["L"]), int(score_payload["H"])
     candidates = []
-    for rule in rules:
-        true_fraction = np.mean([bool(row["rules"][rule]) for row in discovery])
-        if not cfg.min_condition_fraction <= true_fraction <= 1.0 - cfg.min_condition_fraction:
-            continue
-        for layer in range(L):
-            for head in range(H):
-                effect, true_graphs, false_graphs = _conditional_effect(discovery, rule, (layer, head))
-                if min(true_graphs, false_graphs) < cfg.min_condition_graphs:
-                    continue
-                activity = np.mean([float(row["J"][layer, head]) for row in discovery])
-                candidates.append({
-                    "rule": rule,
-                    "layer": layer,
-                    "head": head,
-                    "discovery_effect": effect,
-                    "discovery_activity": activity,
-                    "true_graphs": true_graphs,
-                    "false_graphs": false_graphs,
-                })
+    for feature_name in CONDITIONAL_SCORE_FEATURES:
+        for rule in rules:
+            true_fraction = np.mean([bool(row["rules"][rule]) for row in discovery])
+            if not cfg.min_condition_fraction <= true_fraction <= 1.0 - cfg.min_condition_fraction:
+                continue
+            for layer in range(L):
+                for head in range(H):
+                    effect, true_graphs, false_graphs = _conditional_feature_effect(
+                        discovery, rule, (layer, head), feature_name
+                    )
+                    if min(true_graphs, false_graphs) < cfg.min_condition_graphs:
+                        continue
+                    activity = np.mean([
+                        float(row["J_three_channel"][layer, head]) for row in discovery
+                    ])
+                    scale = float(np.std([
+                        float(item[feature_name][layer, head]) for item in discovery
+                    ]))
+                    candidates.append({
+                        "feature": feature_name,
+                        "rule": rule,
+                        "layer": layer,
+                        "head": head,
+                        "discovery_effect": effect,
+                        "discovery_scale": scale,
+                        "discovery_effect_standardized": effect / max(scale, EPS),
+                        "discovery_activity": activity,
+                        "true_graphs": true_graphs,
+                        "false_graphs": false_graphs,
+                    })
     if not candidates:
         return {"metadata": metadata, "candidates": [], "confirmed": []}
     activity_floor = cfg.activity_floor_relative * max(row["discovery_activity"] for row in candidates)
     eligible = [row for row in candidates if row["discovery_activity"] >= activity_floor]
-    eligible.sort(key=lambda row: (-abs(row["discovery_effect"]), row["rule"], row["layer"], row["head"]))
-    tested = eligible[: min(12, len(eligible))]
+    eligible.sort(key=lambda row: (
+        -abs(row["discovery_effect_standardized"]), row["feature"], row["rule"],
+        row["layer"], row["head"],
+    ))
+    tested = []
+    selected_keys: set[tuple[Any, ...]] = set()
+
+    def candidate_key(row: Mapping[str, Any]) -> tuple[Any, ...]:
+        return (row["feature"], row["rule"], int(row["layer"]), int(row["head"]))
+
+    # Guarantee coverage of every score coordinate before filling remaining slots globally.
+    for feature_name in CONDITIONAL_SCORE_FEATURES:
+        feature_rows = [row for row in eligible if row["feature"] == feature_name]
+        for row in feature_rows[: cfg.conditional_per_feature]:
+            key = candidate_key(row)
+            if key not in selected_keys and len(tested) < cfg.conditional_max_tests:
+                tested.append(row); selected_keys.add(key)
+    for row in eligible:
+        key = candidate_key(row)
+        if key not in selected_keys and len(tested) < cfg.conditional_max_tests:
+            tested.append(row); selected_keys.add(key)
     confirmed = []
     for index, row in enumerate(tested):
         head = (int(row["layer"]), int(row["head"]))
-        effect, true_graphs, false_graphs = _conditional_effect(confirmation, row["rule"], head)
+        effect, true_graphs, false_graphs = _conditional_feature_effect(
+            confirmation, row["rule"], head, row["feature"]
+        )
         lower, upper = _bootstrap_conditional_effect(
             confirmation,
             row["rule"],
             head,
+            feature=row["feature"],
             samples=cfg.conditional_bootstrap_samples,
             seed=cfg.analysis_seed + 70_001 + index,
         )
         confirmed.append({
             **row,
             "confirmation_effect": effect,
+            "confirmation_effect_standardized": effect / max(row["discovery_scale"], EPS),
             "confirmation_ci_low": lower,
             "confirmation_ci_high": upper,
+            "confirmation_ci_low_standardized": lower / max(row["discovery_scale"], EPS),
+            "confirmation_ci_high_standardized": upper / max(row["discovery_scale"], EPS),
             "confirmation_true_graphs": true_graphs,
             "confirmation_false_graphs": false_graphs,
             "same_sign": bool(np.sign(effect) == np.sign(row["discovery_effect"])),
             "ci_excludes_zero": bool(lower > 0.0 or upper < 0.0),
-            "confirmation_p": _conditional_p_value(confirmation, row["rule"], head),
+            "confirmation_p": _conditional_p_value(
+                confirmation, row["rule"], head, row["feature"]
+            ),
             **conditional_dose_diagnostics(confirmation, row["rule"]),
             "semantic_concentration_interaction": _conditional_feature_effect(
                 confirmation, row["rule"], head, "semantic_concentration"
             )[0],
             "pe_concentration_interaction": _conditional_feature_effect(
                 confirmation, row["rule"], head, "pe_concentration"
+            )[0],
+            "topology_concentration_interaction": _conditional_feature_effect(
+                confirmation, row["rule"], head, "topology_concentration"
             )[0],
         })
     q_values = bh_q_values([row["confirmation_p"] for row in confirmed])
@@ -2858,6 +4211,20 @@ def conditional_analysis(
         "metadata": metadata,
         "activity_floor": activity_floor,
         "candidates": tested,
+        "discovery_summary": {
+            feature_name: {
+                "eligible": sum(row["feature"] == feature_name for row in eligible),
+                "tested": sum(row["feature"] == feature_name for row in tested),
+                "largest_abs_standardized_effect": max(
+                    (
+                        abs(row["discovery_effect_standardized"])
+                        for row in eligible if row["feature"] == feature_name
+                    ),
+                    default=float("nan"),
+                ),
+            }
+            for feature_name in CONDITIONAL_SCORE_FEATURES
+        },
         "confirmed": confirmed,
         "interpretation": (
             "Finite predeclared condition basis with sample-split rule/head selection and "
@@ -3036,28 +4403,64 @@ def figure_causal_coordinates(
     runs: Mapping[str, Mapping[str, Any]], aggregation: str, path: Path
 ) -> list[str]:
     plt = configure_matplotlib()
-    fig, axes = plt.subplots(2, 2, figsize=(8.0, 7.0), constrained_layout=True)
+    fig, axes = plt.subplots(2, 6, figsize=(16.0, 6.7), constrained_layout=True)
     for row, task in enumerate(("zinc", "zinc_1hop")):
         selection = runs[task]["ablations"]["selections"][aggregation]
-        score = selection["coordinates"]
-        causal = causal_coordinates(runs[task]["causal"], "restore")
-        active = np.asarray(selection["active"], bool)
-        for column, key in enumerate(("D", "J")):
-            axis = axes[row, column]
-            axis.scatter(
-                score[key][~active], causal[key][~active], color="0.78", s=18,
+        score_pairs = (
+            (
+                "semantic–PE",
+                selection["coordinates"],
+                np.asarray(selection["active"], bool),
+                ("semantic", "pe"),
+            ),
+            (
+                "semantic–topology",
+                score_coordinates(
+                    selection["semantic_topology_semantic"],
+                    selection["semantic_topology_topology"],
+                ),
+                None,
+                ("semantic", "topology"),
+            ),
+            (
+                "PE–topology",
+                selection["pe_topology_coordinates"],
+                np.asarray(selection["pe_topology_active"], bool),
+                ("pe", "topology"),
+            ),
+        )
+        for pair_index, (pair_label, score, active, channels) in enumerate(score_pairs):
+            if active is None:
+                floor = max(0.10 * float(np.nanmax(score["J"])), EPS)
+                active = np.asarray(score["J"] >= floor, bool)
+            causal = causal_pair_coordinates(
+                runs[task]["causal"], channels[0], channels[1], "restore"
             )
-            axis.scatter(
-                score[key][active], causal[key][active], color="#3b7ddd", s=27,
-                edgecolor="black", linewidth=0.25,
-            )
-            rho = spearman(score[key][active].reshape(-1), causal[key][active].reshape(-1))
-            axis.set_title(f"{DISPLAY[task]} · {key} · gated ρ={rho:.2f}")
-            axis.set_xlabel(f"score {key}")
-            axis.set_ylabel(f"restore causal {key}")
-            axis.axhline(0, color="0.6", linewidth=0.6)
-            axis.axvline(0, color="0.6", linewidth=0.6)
-    fig.suptitle("Score coordinates predict independent whole-transport mediation", fontsize=11)
+            for key_index, key in enumerate(("D", "J")):
+                column = 2 * pair_index + key_index
+                axis = axes[row, column]
+                axis.scatter(
+                    score[key][~active], causal[key][~active], color="0.78", s=16,
+                )
+                axis.scatter(
+                    score[key][active], causal[key][active], color="#3b7ddd", s=25,
+                    edgecolor="black", linewidth=0.25,
+                )
+                rho = spearman(
+                    score[key][active].reshape(-1), causal[key][active].reshape(-1)
+                )
+                axis.set_title(f"{pair_label} · {key} · ρ={rho:.2f}")
+                axis.set_xlabel(f"score {key}")
+                axis.set_ylabel(
+                    f"{DISPLAY[task]}\nrestore causal {key}"
+                    if column == 0 else f"restore causal {key}"
+                )
+                axis.axhline(0, color="0.6", linewidth=0.6)
+                axis.axvline(0, color="0.6", linewidth=0.6)
+    fig.suptitle(
+        "Activity-gated score coordinates versus held-out whole-transport mediation",
+        fontsize=11,
+    )
     outputs = save_figure(fig, path)
     plt.close(fig)
     return outputs
@@ -3070,12 +4473,24 @@ def family_channel_matrix(
     metric: str,
 ) -> np.ndarray:
     matrix = np.full((len(family_names), len(CHANNELS)), np.nan)
+    frozen_names = list(causal.get("family_names", []))
     for row, family in enumerate(family_names):
         heads = families.get(family, [])
         for column, channel in enumerate(CHANNELS):
-            value = channel_mean_metric(causal, channel, metric)
-            if heads and np.isfinite(value).any():
-                matrix[row, column] = np.nanmean([value[head] for head in heads])
+            event_mask = np.asarray([event["channel"] == channel for event in causal["events"]])
+            if channel == "topology":
+                event_mask &= np.asarray([
+                    int(event.get("topology_tier", 99)) <= 1 for event in causal["events"]
+                ])
+            if family in frozen_names and event_mask.any():
+                family_index = frozen_names.index(family)
+                matrix[row, column] = np.nanmean(
+                    np.asarray(causal["family_metrics"][metric])[event_mask, family_index]
+                )
+            else:
+                value = channel_mean_metric(causal, channel, metric)
+                if heads and np.isfinite(value).any():
+                    matrix[row, column] = np.nanmean([value[head] for head in heads])
     return matrix
 
 
@@ -3084,9 +4499,9 @@ def figure_family_patching(
 ) -> list[str]:
     plt = configure_matplotlib()
     family_names = (
-        "semantic_specialist", "semantic_same_layer_J_matched", "semantic_same_layer_inert",
-        "pe_specialist", "pe_same_layer_J_matched", "pe_same_layer_inert",
-        "high_J", "high_G_balanced", "topology_responsive", "low_J_inert",
+        "semantic_specialist", "pe_specialist", "structural_pe_specific",
+        "structural_topology_specific", "structural_shared", "high_J",
+        "high_G_balanced", "low_J_inert",
     )
     metrics = ("restore", "inject", "necessity")
     fig, axes = plt.subplots(2, 3, figsize=(10.0, 7.0), constrained_layout=True)
@@ -3134,11 +4549,20 @@ def topology_summary(
         any(int(item["tier"]) <= 1 for item in record["plan"]["topology"])
         for record in score["records"]
     )
-    pe = mean_score(score, "pe", aggregation)
-    topology = mean_score(score, "topology", aggregation)
+    pe_graphs, topology_graphs, paired_graph_ids = paired_graph_scores(
+        score, "pe", "topology", aggregation
+    )
+    if len(pe_graphs):
+        pe = pe_graphs.mean(axis=0)
+        topology = topology_graphs.mean(axis=0)
+    else:
+        shape = (int(score["L"]), int(score["H"]))
+        pe = np.full(shape, np.nan)
+        topology = np.full(shape, np.nan)
     topology_restore = channel_mean_metric(causal, "topology", "restore")
     return {
         "graphs": total,
+        "paired_graphs": int(len(paired_graph_ids)),
         "graphs_with_tier_le_1": graphs_near,
         "coverage_tier_le_1": graphs_near / max(total, 1),
         "tier_counts": {str(tier): tiers.count(tier) for tier in sorted(set(tiers))},
@@ -3151,6 +4575,247 @@ def topology_summary(
         "topology": topology,
         "topology_restore": topology_restore,
     }
+
+
+def _top_indices(values: np.ndarray, active: np.ndarray, count: int) -> set[int]:
+    flat = np.asarray(values, float).reshape(-1)
+    eligible = np.flatnonzero(np.asarray(active, bool).reshape(-1) & np.isfinite(flat))
+    if not len(eligible):
+        return set()
+    count = min(int(count), len(eligible))
+    order = eligible[np.argsort(flat[eligible], kind="stable")[-count:]]
+    return set(map(int, order))
+
+
+def topology_agreement_analysis(
+    score: Mapping[str, Any], cfg: BetaConfig, aggregation: str = HEADLINE_AGGREGATION
+) -> dict[str, Any]:
+    pe_graphs, topology_graphs, graph_ids = paired_graph_scores(
+        score, "pe", "topology", aggregation
+    )
+    if not len(pe_graphs):
+        return {"graph_ids": graph_ids, "available": False}
+    pe, topology = pe_graphs.mean(axis=0), topology_graphs.mean(axis=0)
+    coordinates = score_coordinates(pe, topology)
+    activity_floor = max(
+        cfg.activity_floor_relative * float(np.nanmax(coordinates["J"])), EPS
+    )
+    active = coordinates["J"] >= activity_floor
+    flat_active = active.reshape(-1)
+    pooled = spearman(pe.reshape(-1)[flat_active], topology.reshape(-1)[flat_active])
+    within = spearman(
+        layer_centered(pe).reshape(-1)[flat_active],
+        layer_centered(topology).reshape(-1)[flat_active],
+    )
+    full_sets = {
+        (channel, int(k)): _top_indices(values, active, int(k))
+        for channel, values in (("pe", pe), ("topology", topology))
+        for k in cfg.topk_values
+    }
+    rng = np.random.default_rng(cfg.analysis_seed + 92_101)
+    draws: dict[str, list[float]] = {
+        "rho_pooled": [], "rho_within_layer": [],
+        **{f"rho_layer_{layer}": [] for layer in range(pe.shape[0])},
+        **{
+            f"top{k}_{name}": []
+            for k in cfg.topk_values
+            for name in ("overlap", "pe_stability", "topology_stability")
+        },
+    }
+    for _ in range(cfg.bootstrap_samples):
+        chosen = rng.integers(0, len(pe_graphs), len(pe_graphs))
+        pe_boot = pe_graphs[chosen].mean(axis=0)
+        topology_boot = topology_graphs[chosen].mean(axis=0)
+        draws["rho_pooled"].append(
+            spearman(pe_boot.reshape(-1)[flat_active], topology_boot.reshape(-1)[flat_active])
+        )
+        draws["rho_within_layer"].append(spearman(
+            layer_centered(pe_boot).reshape(-1)[flat_active],
+            layer_centered(topology_boot).reshape(-1)[flat_active],
+        ))
+        for layer in range(pe.shape[0]):
+            layer_active = active[layer]
+            draws[f"rho_layer_{layer}"].append(spearman(
+                pe_boot[layer][layer_active], topology_boot[layer][layer_active]
+            ))
+        for k in cfg.topk_values:
+            pe_set = _top_indices(pe_boot, active, int(k))
+            topology_set = _top_indices(topology_boot, active, int(k))
+            draws[f"top{k}_overlap"].append(jaccard(pe_set, topology_set))
+            draws[f"top{k}_pe_stability"].append(jaccard(pe_set, full_sets[("pe", int(k))]))
+            draws[f"top{k}_topology_stability"].append(
+                jaccard(topology_set, full_sets[("topology", int(k))])
+            )
+
+    def interval(values: Sequence[float]) -> dict[str, float]:
+        array = np.asarray(values, float)
+        array = array[np.isfinite(array)]
+        return {
+            "mean": float(np.mean(array)) if len(array) else float("nan"),
+            "ci_low": float(np.quantile(array, 0.025)) if len(array) else float("nan"),
+            "ci_high": float(np.quantile(array, 0.975)) if len(array) else float("nan"),
+        }
+
+    topk = {}
+    for k in cfg.topk_values:
+        pe_set, topology_set = full_sets[("pe", int(k))], full_sets[("topology", int(k))]
+        topk[str(k)] = {
+            "point_overlap": jaccard(pe_set, topology_set),
+            "overlap": interval(draws[f"top{k}_overlap"]),
+            "pe_stability": interval(draws[f"top{k}_pe_stability"]),
+            "topology_stability": interval(draws[f"top{k}_topology_stability"]),
+        }
+    return {
+        "available": True,
+        "graph_ids": graph_ids,
+        "pe": pe,
+        "topology": topology,
+        "coordinates": coordinates,
+        "active": active,
+        "activity_floor": activity_floor,
+        "rho_pooled": {"point": pooled, **interval(draws["rho_pooled"])},
+        "rho_within_layer": {"point": within, **interval(draws["rho_within_layer"])},
+        "rho_by_layer": {
+            str(layer): {
+                "point": spearman(pe[layer][active[layer]], topology[layer][active[layer]]),
+                **interval(draws[f"rho_layer_{layer}"]),
+            }
+            for layer in range(pe.shape[0])
+        },
+        "topk": topk,
+    }
+
+
+def topology_stratified_analysis(
+    score: Mapping[str, Any], causal: Mapping[str, Any], aggregation: str = HEADLINE_AGGREGATION
+) -> list[dict[str, Any]]:
+    """Tier- and dose-stratified topology/PE agreement and causal validity."""
+
+    event_rows = []
+    for record in score["records"]:
+        result = record["channels"]["topology"]
+        if not result["available"]:
+            continue
+        for index, item in enumerate(record["plan"]["topology"]):
+            q = result["q_groups"][0][index]
+            event_score = np.linalg.norm(q.numpy(), axis=-1).sum(axis=-1)  # [L,H]
+            event_rows.append({
+                "graph_id": int(record["graph_id"]),
+                "tier": int(item["tier"]),
+                "dose": float(item["dose"]["edge_jaccard_distance"]),
+                "score": event_score,
+            })
+    if not event_rows:
+        return []
+    doses = np.asarray([row["dose"] for row in event_rows])
+    q1, q2 = np.quantile(doses, [1 / 3, 2 / 3])
+    strata: list[tuple[str, Any]] = [
+        (f"tier_{tier}", lambda row, tier=tier: row["tier"] == tier)
+        for tier in sorted({row["tier"] for row in event_rows})
+    ] + [
+        ("dose_low", lambda row: row["dose"] <= q1),
+        ("dose_mid", lambda row: q1 < row["dose"] <= q2),
+        ("dose_high", lambda row: row["dose"] > q2),
+    ]
+    pe_by_graph = {
+        int(record["graph_id"]): record_channel_score(
+            record, "pe", aggregation, topology_max_tier=None
+        )
+        for record in score["records"]
+    }
+    causal_events = causal["events"]
+    topology_causal = np.asarray(causal["metrics"]["restore"], float)
+    frozen_names = list(causal.get("family_names", []))
+    frozen_restore = np.asarray(
+        causal.get("family_metrics", {}).get(
+            "restore", np.empty((len(causal_events), 0))
+        ),
+        float,
+    )
+
+    def graph_balanced_mean(values: Sequence[Any], graph_ids: Sequence[int]) -> np.ndarray:
+        grouped: dict[int, list[np.ndarray]] = {}
+        for value, graph_id in zip(values, graph_ids):
+            grouped.setdefault(int(graph_id), []).append(np.asarray(value, float))
+        if not grouped:
+            return np.asarray(float("nan"))
+        graph_means = [np.nanmean(np.stack(grouped[key]), axis=0) for key in sorted(grouped)]
+        return np.nanmean(np.stack(graph_means), axis=0)
+
+    output = []
+    for name, predicate in strata:
+        selected = [row for row in event_rows if predicate(row)]
+        if not selected:
+            continue
+        selected_graph_ids = sorted({int(row["graph_id"]) for row in selected})
+        topology_score = graph_balanced_mean(
+            [row["score"] for row in selected], [row["graph_id"] for row in selected]
+        )
+        pe = np.nanmean(np.stack([pe_by_graph[graph_id] for graph_id in selected_graph_ids]), axis=0)
+        if name.startswith("tier_"):
+            tier = int(name.rsplit("_", 1)[1])
+            causal_mask = np.asarray([
+                event["channel"] == "topology" and int(event.get("topology_tier", -1)) == tier
+                for event in causal_events
+            ])
+        else:
+            causal_doses = np.asarray([
+                float(event.get("topology_dose", {}).get("edge_jaccard_distance", np.nan))
+                for event in causal_events
+            ])
+            if name == "dose_low":
+                dose_mask = causal_doses <= q1
+            elif name == "dose_mid":
+                dose_mask = (causal_doses > q1) & (causal_doses <= q2)
+            else:
+                dose_mask = causal_doses > q2
+            causal_mask = np.asarray([event["channel"] == "topology" for event in causal_events]) & dose_mask
+        causal_graph_ids = np.asarray(
+            [int(event["graph_id"]) for event in causal_events], dtype=np.int64
+        )
+        restore = (
+            graph_balanced_mean(topology_causal[causal_mask], causal_graph_ids[causal_mask])
+            if causal_mask.any() else np.full_like(pe, np.nan)
+        )
+        coordinates = score_coordinates(pe, topology_score)
+        activity_floor = max(0.10 * float(np.nanmax(coordinates["J"])), EPS)
+        active = coordinates["J"] >= activity_floor
+        family_restore = {}
+        for family in (
+            "structural_pe_specific", "structural_topology_specific", "structural_shared"
+        ):
+            if family in frozen_names and causal_mask.any():
+                family_restore[family] = float(graph_balanced_mean(
+                    frozen_restore[causal_mask, frozen_names.index(family)],
+                    causal_graph_ids[causal_mask],
+                ))
+            else:
+                family_restore[family] = float("nan")
+        output.append({
+            "stratum": name,
+            "events": len(selected),
+            "graphs": len({row["graph_id"] for row in selected}),
+            "causal_graphs": len(set(causal_graph_ids[causal_mask].tolist())),
+            "dose_mean": float(graph_balanced_mean(
+                [row["dose"] for row in selected], [row["graph_id"] for row in selected]
+            )),
+            "active_heads": int(active.sum()),
+            "rho_pe_topology_pooled": spearman(
+                pe[active].reshape(-1), topology_score[active].reshape(-1)
+            ),
+            "rho_pe_topology_within_layer": spearman(
+                layer_centered(pe)[active].reshape(-1),
+                layer_centered(topology_score)[active].reshape(-1),
+            ),
+            "rho_topology_restore": spearman(
+                topology_score[active].reshape(-1), restore[active].reshape(-1)
+            ),
+            **{
+                f"family_restore_{family}": value
+                for family, value in family_restore.items()
+            },
+        })
+    return output
 
 
 def figure_topology_validation(
@@ -3185,34 +4850,231 @@ def figure_topology_validation(
     return outputs
 
 
+def figure_three_channel_planes(
+    runs: Mapping[str, Mapping[str, Any]], path: Path
+) -> list[str]:
+    """Headline EG score planes, including the previously missing topology coordinates."""
+
+    plt = configure_matplotlib()
+    fig, axes = plt.subplots(2, 4, figsize=(12.5, 6.2), constrained_layout=True)
+    scatter = None
+    for row, task in enumerate(ARCHITECTURES):
+        score = runs[task]["scores"]
+        selection = runs[task]["ablations"]["selections"][HEADLINE_AGGREGATION]
+        semantic, pe, topology = (
+            np.asarray(selection[key], float) for key in ("semantic", "pe", "topology")
+        )
+        semantic_topology_semantic = np.asarray(
+            selection["semantic_topology_semantic"], float
+        )
+        semantic_topology_topology = np.asarray(
+            selection["semantic_topology_topology"], float
+        )
+        cmap, norm = layer_colors(int(score["L"]))
+        layers = _head_layers(int(score["L"]), int(score["H"]))
+        comparisons = [
+            (pe, semantic, "PE score", "semantic score", None),
+            (
+                semantic_topology_topology,
+                semantic_topology_semantic,
+                "topology score",
+                "semantic score",
+                None,
+            ),
+        ]
+        sem_top = score_coordinates(
+            semantic_topology_semantic, semantic_topology_topology
+        )
+        pe_top = selection["pe_topology_coordinates"]
+        comparisons.extend([
+            (sem_top["D"], sem_top["J"], "D (− topology, + semantic)", "J", sem_top),
+            (pe_top["D"], pe_top["J"], "D (− topology, + PE)", "J", pe_top),
+        ])
+        for column, (xval, yval, xlabel, ylabel, coordinates) in enumerate(comparisons):
+            axis = axes[row, column]
+            if coordinates is None:
+                activity = score_coordinates(yval, xval)["J"]
+                active = activity >= 0.10 * np.nanmax(activity)
+            elif column == 3:
+                active = np.asarray(selection["pe_topology_active"], bool)
+            else:
+                active = coordinates["J"] >= 0.10 * np.nanmax(coordinates["J"])
+            axis.scatter(
+                np.asarray(xval).reshape(-1)[~active.reshape(-1)],
+                np.asarray(yval).reshape(-1)[~active.reshape(-1)],
+                color="0.82", s=18, label="below gate",
+            )
+            scatter = axis.scatter(
+                np.asarray(xval).reshape(-1)[active.reshape(-1)],
+                np.asarray(yval).reshape(-1)[active.reshape(-1)],
+                c=layers[active.reshape(-1)], cmap=cmap, norm=norm, s=27,
+                edgecolor="black", linewidth=0.25,
+            )
+            if column < 2:
+                low, high = _identity_limits(xval, yval)
+                axis.plot([low, high], [low, high], ":", color="black", linewidth=0.8)
+            else:
+                axis.axvline(0.0, color="black", linewidth=0.7)
+            axis.set_xlabel(xlabel); axis.set_ylabel(ylabel)
+            axis.set_title(("semantic–PE", "semantic–topology", "semantic–topology D/J", "PE–topology D/J")[column])
+            if column == 0:
+                axis.text(0.02, 0.98, DISPLAY[task], transform=axis.transAxes, va="top")
+    if scatter is not None:
+        fig.colorbar(scatter, ax=axes, fraction=0.016, pad=0.01, label="layer")
+    fig.suptitle("Headline EG: three-channel score and activity-gated selectivity planes", fontsize=11)
+    outputs = save_figure(fig, path)
+    plt.close(fig)
+    return outputs
+
+
+def figure_topology_agreement(
+    runs: Mapping[str, Mapping[str, Any]], cfg: BetaConfig, path: Path
+) -> list[str]:
+    plt = configure_matplotlib()
+    fig, axes = plt.subplots(2, 3, figsize=(10.8, 6.6), constrained_layout=True)
+    for row, task in enumerate(ARCHITECTURES):
+        analysis = topology_agreement_analysis(runs[task]["scores"], cfg)
+        pe, topology = analysis["pe"], analysis["topology"]
+        active = np.asarray(analysis["active"], bool).reshape(-1)
+        axis = axes[row, 0]
+        axis.scatter(pe.reshape(-1)[~active], topology.reshape(-1)[~active], color="0.82", s=17)
+        axis.scatter(pe.reshape(-1)[active], topology.reshape(-1)[active], color="#6f63a8", s=27,
+                     edgecolor="black", linewidth=0.25)
+        low, high = _identity_limits(pe, topology)
+        axis.plot([low, high], [low, high], ":", color="black", linewidth=0.8)
+        axis.set_xlabel("PE EG score"); axis.set_ylabel("topology EG score")
+        axis.set_title(f"{DISPLAY[task]} · activity gated")
+
+        axis = axes[row, 1]
+        labels = ("pooled", "within layer")
+        entries = (analysis["rho_pooled"], analysis["rho_within_layer"])
+        points = [entry["point"] for entry in entries]
+        correlation_x = np.arange(len(labels))
+        axis.bar(correlation_x, points, color=("#6f63a8", "#4f8a78"))
+        axis.set_xticks(correlation_x, labels)
+        axis.errorbar(
+            correlation_x, points,
+            yerr=[
+                [max(point - entry["ci_low"], 0.0) for point, entry in zip(points, entries)],
+                [max(entry["ci_high"] - point, 0.0) for point, entry in zip(points, entries)],
+            ],
+            fmt="none", color="black", capsize=3,
+        )
+        layer_points = np.asarray([
+            entry["point"] for entry in analysis["rho_by_layer"].values()
+        ], float)
+        finite_layers = layer_points[np.isfinite(layer_points)]
+        if len(finite_layers):
+            jitter = np.linspace(-0.10, 0.10, len(finite_layers))
+            axis.scatter(1.0 + jitter, finite_layers, marker="_", color="black", s=18,
+                         label="individual layers" if row == 0 else None)
+        axis.axhline(0, color="black", linewidth=0.7)
+        axis.set_ylabel("Spearman ρ (graph bootstrap 95% CI)")
+        axis.set_title("PE–topology agreement")
+
+        axis = axes[row, 2]
+        ks = [int(value) for value in cfg.topk_values]
+        for key, label, color in (
+            ("overlap", "PE ∩ topology", "#6f63a8"),
+            ("pe_stability", "PE stability", "#4c78a8"),
+            ("topology_stability", "topology stability", "#c06b53"),
+        ):
+            values = [analysis["topk"][str(k)][key]["mean"] for k in ks]
+            low = [analysis["topk"][str(k)][key]["ci_low"] for k in ks]
+            high = [analysis["topk"][str(k)][key]["ci_high"] for k in ks]
+            axis.plot(ks, values, marker="o", color=color, label=label)
+            axis.fill_between(ks, low, high, color=color, alpha=0.15)
+        axis.set_ylim(-0.03, 1.03); axis.set_xticks(ks)
+        axis.set_xlabel("top k"); axis.set_ylabel("Jaccard")
+        axis.set_title("Top-k overlap and bootstrap stability")
+    axes[0, 2].legend(frameon=False, fontsize=7)
+    fig.suptitle("PE versus matched-topology agreement under the fixed EG/activity protocol", fontsize=11)
+    outputs = save_figure(fig, path)
+    plt.close(fig)
+    return outputs
+
+
+def figure_topology_strata(
+    runs: Mapping[str, Mapping[str, Any]], path: Path
+) -> list[str]:
+    plt = configure_matplotlib()
+    fig, axes = plt.subplots(2, 3, figsize=(12.5, 6.5), constrained_layout=True)
+    for row, task in enumerate(ARCHITECTURES):
+        rows = topology_stratified_analysis(runs[task]["scores"], runs[task]["causal"])
+        labels = [item["stratum"].replace("_", " ") for item in rows]
+        x = np.arange(len(rows))
+        axes[row, 0].bar(x, [item["rho_pe_topology_within_layer"] for item in rows], color="#6f63a8")
+        axes[row, 0].axhline(0, color="black", linewidth=0.7)
+        axes[row, 0].set_ylabel("within-layer PE–topology ρ")
+        axes[row, 1].bar(x, [item["rho_topology_restore"] for item in rows], color="#c06b53")
+        axes[row, 1].axhline(0, color="black", linewidth=0.7)
+        axes[row, 1].set_ylabel("topology score–restore ρ")
+        width = 0.24
+        for offset, (family, label, color) in enumerate((
+            ("structural_pe_specific", "PE-specific", "#4c78a8"),
+            ("structural_topology_specific", "topology-specific", "#6f63a8"),
+            ("structural_shared", "shared", "#55a868"),
+        )):
+            axes[row, 2].bar(
+                x + (offset - 1) * width,
+                [item[f"family_restore_{family}"] for item in rows],
+                width,
+                color=color,
+                label=label,
+            )
+        axes[row, 2].axhline(0, color="black", linewidth=0.7)
+        axes[row, 2].set_ylabel("topology-family restore")
+        for axis in axes[row]:
+            axis.set_xticks(x, labels, rotation=30, ha="right")
+            axis.set_title(DISPLAY[task])
+    axes[0, 2].legend(frameon=False, fontsize=7)
+    fig.suptitle("Topology conclusions separated by donor tier and graph-edit dose", fontsize=11)
+    outputs = save_figure(fig, path)
+    plt.close(fig)
+    return outputs
+
+
 def figure_ablation(
     runs: Mapping[str, Mapping[str, Any]], aggregation: str, path: Path
 ) -> list[str]:
     plt = configure_matplotlib()
-    fig, axes = plt.subplots(2, 2, figsize=(9.0, 7.0), constrained_layout=True)
-    colors = {"semantic_specialist": "#c75b5b", "pe_specialist": "#4c78a8", "high_J": "#55a868", "low_J_inert": "0.5"}
+    fig, axes = plt.subplots(2, 4, figsize=(13.0, 6.8), constrained_layout=True)
+    colors = {
+        "semantic_specialist": "#c75b5b", "pe_specialist": "#4c78a8",
+        "structural_pe_specific": "#3c78a8", "structural_topology_specific": "#6f63a8",
+        "structural_shared": "#55a868", "low_J_inert": "0.5",
+    }
     for row, task in enumerate(("zinc", "zinc_1hop")):
         score = runs[task]["scores"]
         ablation = runs[task]["ablations"]
-        coordinates = ablation["selections"][aggregation]["coordinates"]
+        selection = ablation["selections"][aggregation]
         impact = np.asarray(ablation["per_head"]["functional"])
-        axes[row, 0].scatter(coordinates["J"].reshape(-1), impact.reshape(-1), s=24, color="#5a8f6b")
-        axes[row, 0].set_title(f"{DISPLAY[task]} · ρ={spearman(coordinates['J'].reshape(-1), impact.reshape(-1)):.2f}")
-        axes[row, 0].set_xlabel("evoked strength J")
-        axes[row, 0].set_ylabel("single-head functional ablation")
+        for column, (channel, label, color) in enumerate((
+            ("semantic", "semantic EG", "#c75b5b"),
+            ("pe", "PE EG", "#4c78a8"),
+            ("topology", "topology EG", "#6f63a8"),
+        )):
+            values = np.asarray(selection[channel], float)
+            axes[row, column].scatter(values.reshape(-1), impact.reshape(-1), s=22, color=color)
+            axes[row, column].set_title(
+                f"{DISPLAY[task]} · ρ={spearman(values.reshape(-1), impact.reshape(-1)):.2f}"
+            )
+            axes[row, column].set_xlabel(label)
+            if column == 0:
+                axes[row, column].set_ylabel("single-head functional ablation")
         curves = ablation["family_curves"][aggregation]
         for family, color in colors.items():
             rows = curves.get(family, [])
             if rows:
-                axes[row, 1].plot(
+                axes[row, 3].plot(
                     [item["count"] for item in rows], [item["functional"] for item in rows],
                     marker="o", color=color, label=family.replace("_", " "),
                 )
-        axes[row, 1].set_title(f"{DISPLAY[task]} · cumulative family ablation")
-        axes[row, 1].set_xlabel("heads ablated")
-        axes[row, 1].set_ylabel("mean |Δ prediction|")
-    axes[0, 1].legend(frameon=False, fontsize=7)
-    fig.suptitle("Independent ordinary and score-ranked family ablations", fontsize=11)
+        axes[row, 3].set_title(f"{DISPLAY[task]} · frozen-family ablation")
+        axes[row, 3].set_xlabel("heads ablated")
+        axes[row, 3].set_ylabel("mean |Δ prediction|")
+    axes[0, 3].legend(frameon=False, fontsize=6)
+    fig.suptitle("Held-out ablation validation for all three headline EG channels", fontsize=11)
     outputs = save_figure(fig, path)
     plt.close(fig)
     return outputs
@@ -3246,30 +5108,81 @@ def figure_routing_message(
     runs: Mapping[str, Mapping[str, Any]], aggregation: str, path: Path
 ) -> list[str]:
     plt = configure_matplotlib()
-    fig, axes = plt.subplots(2, 2, figsize=(8.5, 6.8), constrained_layout=True)
-    for row, task in enumerate(("zinc", "zinc_1hop")):
+    fig, axes = plt.subplots(4, 3, figsize=(11.5, 11.0), constrained_layout=True)
+    family_styles = (
+        ("semantic_specialist", "#c75b5b"),
+        ("structural_pe_specific", "#4c78a8"),
+        ("structural_topology_specific", "#6f63a8"),
+        ("structural_shared", "#55a868"),
+    )
+    for architecture_index, task in enumerate(("zinc", "zinc_1hop")):
         mechanism = runs[task]["mechanism"]
         events = mechanism["events"]
         families = runs[task]["ablations"]["selections"][aggregation]["families"]
-        for column, channel in enumerate(PRIMARY_CHANNELS):
-            axis = axes[row, column]
+        for column, channel in enumerate(CHANNELS):
             mask = np.asarray([event["channel"] == channel for event in events])
-            routing = np.nanmean(np.abs(mechanism["metrics"]["routing_q"][mask]), axis=0)
-            message = np.nanmean(np.abs(mechanism["metrics"]["message_q"][mask]), axis=0)
-            for family, color in (("semantic_specialist", "#c75b5b"), ("pe_specialist", "#4c78a8"), ("high_J", "#55a868")):
-                heads = families.get(family, [])
-                if heads:
-                    axis.scatter(
-                        [routing[head] for head in heads], [message[head] for head in heads],
-                        s=45, color=color, label=family.replace("_", " "), edgecolor="black", linewidth=0.3,
+            for mode_index, (prefix, absolute, label) in enumerate((
+                ("", True, "projected transport |q|"),
+                ("_rescue", False, "finite component patch"),
+            )):
+                row = 2 * architecture_index + mode_index
+                axis = axes[row, column]
+                if prefix:
+                    routing = np.nanmean(
+                        np.asarray(mechanism["metrics"]["routing_rescue"])[mask], axis=0
                     )
-            low, high = _identity_limits(routing, message)
-            axis.plot([low, high], [low, high], ":", color="black", linewidth=0.8)
-            axis.set_xlabel("routing contribution |q|")
-            axis.set_ylabel("message contribution |q|")
-            axis.set_title(f"{DISPLAY[task]} · {channel}")
+                    message = np.nanmean(
+                        np.asarray(mechanism["metrics"]["message_rescue"])[mask], axis=0
+                    )
+                    wiring = np.nanmean(
+                        np.asarray(mechanism["metrics"]["wiring_rescue"])[mask], axis=0
+                    )
+                else:
+                    routing = np.nanmean(
+                        np.abs(np.asarray(mechanism["metrics"]["routing_q"])[mask]), axis=0
+                    )
+                    message = np.nanmean(
+                        np.abs(np.asarray(mechanism["metrics"]["message_q"])[mask]), axis=0
+                    )
+                    wiring = np.nanmean(
+                        np.abs(np.asarray(mechanism["metrics"]["wiring_q"])[mask]), axis=0
+                    )
+                wiring_scale = float(np.nanmax(np.abs(wiring))) if np.isfinite(wiring).any() else 0.0
+                wiring_scale = max(wiring_scale, EPS)
+                for family, color in family_styles:
+                    heads = families.get(family, [])
+                    if heads:
+                        axis.scatter(
+                            [routing[head] for head in heads],
+                            [message[head] for head in heads],
+                            s=[
+                                35 + 90 * abs(float(wiring[head])) / wiring_scale
+                                for head in heads
+                            ],
+                            color=color,
+                            label=family.replace("_", " "),
+                            edgecolor="black",
+                            linewidth=0.3,
+                        )
+                low, high = _identity_limits(routing, message)
+                axis.plot([low, high], [low, high], ":", color="black", linewidth=0.8)
+                axis.axhline(0, color="0.7", linewidth=0.5)
+                axis.axvline(0, color="0.7", linewidth=0.5)
+                axis.set_xlabel("routing" + (" |q|" if absolute else " restore"))
+                message_label = "message" + (" |q|" if absolute else " restore")
+                axis.set_ylabel(
+                    f"{DISPLAY[task]}\n{label}\n{message_label}"
+                    if column == 0 else message_label
+                )
+                axis.set_title(
+                    ("semantic", "PE", "topology")[column] if row == 0 else ""
+                )
     axes[0, 0].legend(frameon=False, fontsize=7)
-    fig.suptitle("Why specialisation appears: fixed-support routing vs message", fontsize=11)
+    fig.suptitle(
+        "Why specialisation appears: exact transport split and finite component patches "
+        "(point area = |wiring|)",
+        fontsize=11,
+    )
     outputs = save_figure(fig, path)
     plt.close(fig)
     return outputs
@@ -3321,6 +5234,456 @@ def carriage_profile(
     return result
 
 
+def model_carriage_profile(
+    score: Mapping[str, Any],
+    channel: str,
+    *,
+    donor_scope: str = "headline",
+    bootstrap_samples: int = 1000,
+    seed: int = 0,
+) -> dict[str, np.ndarray]:
+    """Graph-balanced final-state F_sens/F_coh/B distance profile."""
+
+    keys = ("F_sens", "F_coh", "B", "B_sum")
+    by_distance: dict[int, dict[int, dict[str, list[float]]]] = {}
+    for record in score["records"]:
+        result = record["channels"][channel]
+        if not result["available"]:
+            continue
+        for item in result.get("model_carriage", []):
+            if str(item.get("donor_scope", "headline")) != donor_scope:
+                continue
+            distance, graph_id = int(item["distance"]), int(record["graph_id"])
+            bucket = by_distance.setdefault(distance, {}).setdefault(
+                graph_id, {key: [] for key in keys}
+            )
+            for key in keys:
+                bucket[key].append(float(item[key]))
+    distances = sorted(by_distance)
+    graph_ids = sorted({gid for distance in distances for gid in by_distance[distance]})
+    result: dict[str, Any] = {"distance": np.asarray(distances, dtype=int)}
+    if not graph_ids:
+        for key in keys:
+            result[key] = np.asarray([], dtype=float)
+            result[f"{key}_ci_low"] = np.asarray([], dtype=float)
+            result[f"{key}_ci_high"] = np.asarray([], dtype=float)
+        result["graph_support"] = np.asarray([], dtype=int)
+        return result
+    rng = np.random.default_rng(seed)
+    for key in keys:
+        matrix = np.full((len(graph_ids), len(distances)), np.nan)
+        for i, graph_id in enumerate(graph_ids):
+            for j, distance in enumerate(distances):
+                values = by_distance[distance].get(graph_id, {}).get(key, [])
+                if values:
+                    matrix[i, j] = np.mean(values)
+        result[key] = np.nanmean(matrix, axis=0)
+        draws = []
+        for _ in range(bootstrap_samples):
+            chosen = rng.integers(0, len(graph_ids), len(graph_ids))
+            draws.append(np.nanmean(matrix[chosen], axis=0))
+        stacked = np.stack(draws)
+        result[f"{key}_ci_low"] = np.nanquantile(stacked, 0.025, axis=0)
+        result[f"{key}_ci_high"] = np.nanquantile(stacked, 0.975, axis=0)
+    result["graph_support"] = np.asarray([
+        len(by_distance[distance]) for distance in distances
+    ], dtype=int)
+    return result
+
+
+def distance_specialisation_rows(
+    architecture: str, profile: Mapping[str, Any]
+) -> list[dict[str, Any]]:
+    """Long-form exact EG-by-distance contributions for every layer and head."""
+
+    rows = []
+    contribution = np.asarray(profile["contribution"], dtype=float)
+    fraction = np.asarray(profile["fraction"], dtype=float)
+    low = np.asarray(profile["fraction_ci_low"], dtype=float)
+    high = np.asarray(profile["fraction_ci_high"], dtype=float)
+    support = np.asarray(profile["graph_support"], dtype=bool)
+    for bucket, (code, label) in enumerate(zip(profile["codes"], profile["labels"])):
+        for layer in range(contribution.shape[1]):
+            for head in range(contribution.shape[2]):
+                rows.append({
+                    "architecture": architecture,
+                    "channel": profile["channel"],
+                    "donor_scope": profile["donor_scope"],
+                    "distance_code": int(code),
+                    "distance_bucket": label,
+                    "layer": layer,
+                    "head": head,
+                    "EG_contribution": float(contribution[bucket, layer, head]),
+                    "fraction_of_head_EG": float(fraction[bucket, layer, head]),
+                    "fraction_ci_low": float(low[bucket, layer, head]),
+                    "fraction_ci_high": float(high[bucket, layer, head]),
+                    "graph_support": int(support[:, bucket].sum()),
+                    "graphs": int(support.shape[0]),
+                })
+    return rows
+
+
+def head_reach_summary_rows(
+    architecture: str, profile: Mapping[str, Any]
+) -> list[dict[str, Any]]:
+    total = np.asarray(profile["total"], dtype=float)
+    rows = []
+    for layer in range(total.shape[0]):
+        for head in range(total.shape[1]):
+            rows.append({
+                "architecture": architecture,
+                "channel": profile["channel"],
+                "donor_scope": profile["donor_scope"],
+                "layer": layer,
+                "head": head,
+                "S_EG_reconstructed": float(total[layer, head]),
+                "expected_numeric_distance": float(profile["expected_distance"][layer, head]),
+                "near_share_d_le_1": float(profile["near_share"][layer, head]),
+                "far_share_d_ge_2": float(profile["far_share"][layer, head]),
+                "unreachable_share": float(profile["unreachable_share"][layer, head]),
+                "hub_share": float(profile["hub_share"][layer, head]),
+            })
+    return rows
+
+
+def _cosine_similarity(left: np.ndarray, right: np.ndarray) -> float:
+    left, right = np.asarray(left, float), np.asarray(right, float)
+    keep = np.isfinite(left) & np.isfinite(right)
+    if not keep.any():
+        return float("nan")
+    denominator = float(np.linalg.norm(left[keep]) * np.linalg.norm(right[keep]))
+    return float(np.dot(left[keep], right[keep]) / denominator) if denominator > EPS else float("nan")
+
+
+def family_distance_reach_rows(
+    architecture: str,
+    profile: Mapping[str, Any],
+    families: Mapping[str, Sequence[tuple[int, int]]],
+    carriage: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    """Frozen-family score reach, aligned descriptively with final-state F and B."""
+
+    codes = np.asarray(profile["codes"], dtype=int)
+    numeric = codes >= 0
+    numeric_codes = codes[numeric]
+    contribution = np.asarray(profile["contribution"], dtype=float)[numeric]
+    all_head = contribution.sum(axis=(1, 2))
+    carriage_distance = np.asarray(carriage["distance"], dtype=int)
+    carriage_lookup = {int(value): index for index, value in enumerate(carriage_distance)}
+    common = np.asarray([code in carriage_lookup for code in numeric_codes], dtype=bool)
+    family_map: dict[str, Sequence[tuple[int, int]]] = {"all_heads": [
+        (layer, head)
+        for layer in range(contribution.shape[1])
+        for head in range(contribution.shape[2])
+    ]}
+    family_map.update({
+        name: families.get(name, []) for name in DISTANCE_FAMILIES[profile["channel"]]
+    })
+    rows = []
+    for family, heads in family_map.items():
+        valid_heads = [
+            (int(layer), int(head)) for layer, head in heads
+            if 0 <= int(layer) < contribution.shape[1]
+            and 0 <= int(head) < contribution.shape[2]
+        ]
+        if not valid_heads:
+            continue
+        family_contribution = np.asarray([
+            sum(float(contribution[index, layer, head]) for layer, head in valid_heads)
+            for index in range(len(numeric_codes))
+        ])
+        family_total = float(family_contribution.sum())
+        distribution = family_contribution / max(family_total, EPS)
+        bin_share = np.divide(
+            family_contribution,
+            all_head,
+            out=np.zeros_like(family_contribution),
+            where=all_head > EPS,
+        )
+        common_family = distribution[common]
+        common_f = np.asarray([
+            carriage["F_sens"][carriage_lookup[int(code)]]
+            for code in numeric_codes[common]
+        ], dtype=float)
+        common_b = np.asarray([
+            carriage["B"][carriage_lookup[int(code)]]
+            for code in numeric_codes[common]
+        ], dtype=float)
+        f_cosine = _cosine_similarity(common_family, common_f)
+        b_cosine = _cosine_similarity(common_family, common_b)
+        expected = float(np.dot(numeric_codes, distribution)) if family_total > EPS else float("nan")
+        for index, code in enumerate(numeric_codes):
+            rows.append({
+                "architecture": architecture,
+                "channel": profile["channel"],
+                "donor_scope": profile["donor_scope"],
+                "family": family,
+                "heads": str(valid_heads),
+                "distance": int(code),
+                "EG_contribution": float(family_contribution[index]),
+                "distance_fraction_within_family": float(distribution[index]),
+                "family_share_of_all_head_EG_at_distance": float(bin_share[index]),
+                "expected_numeric_distance": expected,
+                "cosine_to_F_sens_profile": f_cosine,
+                "signed_cosine_to_B_profile": b_cosine,
+            })
+    return rows
+
+
+def figure_distance_specialisation_atlas(
+    profiles: Mapping[tuple[str, str], Mapping[str, Any]], path: Path
+) -> list[str]:
+    """Head-by-distance atlas of the fraction of each head's exact EG score."""
+
+    plt = configure_matplotlib()
+    fig, axes = plt.subplots(2, 3, figsize=(12.0, 8.0), constrained_layout=True)
+    vmax = max(
+        float(np.nanmax(np.asarray(profile["fraction"], float)))
+        for profile in profiles.values()
+    )
+    image = None
+    for row, task in enumerate(ARCHITECTURES):
+        for column, channel in enumerate(CHANNELS):
+            profile = profiles[(task, channel)]
+            fraction = np.asarray(profile["fraction"], float)
+            matrix = fraction.transpose(1, 2, 0).reshape(-1, fraction.shape[0])
+            axis = axes[row, column]
+            image = axis.imshow(
+                matrix,
+                aspect="auto",
+                interpolation="nearest",
+                cmap="magma",
+                vmin=0.0,
+                vmax=max(vmax, EPS),
+            )
+            H = fraction.shape[2]
+            L = fraction.shape[1]
+            for layer in range(1, L):
+                axis.axhline(layer * H - 0.5, color="white", linewidth=0.35, alpha=0.7)
+            axis.set_yticks(
+                [layer * H + (H - 1) / 2 for layer in range(L)],
+                [f"L{layer}" for layer in range(L)],
+            )
+            axis.set_xticks(np.arange(len(profile["labels"])), profile["labels"])
+            axis.set_xlabel("carrier distance from changed set [hops]")
+            if column == 0:
+                axis.set_ylabel(f"{DISPLAY[task]}\nhead rows (layer blocks)")
+            axis.set_title(("semantic donor", "PE transposition", "topology donor")[column])
+    if image is not None:
+        colorbar = fig.colorbar(image, ax=axes, fraction=0.018, pad=0.01)
+        colorbar.set_label("fraction of that head's EG score")
+    fig.suptitle(
+        "Who implements intervention reach: exact distance decomposition of head EG", fontsize=11
+    )
+    outputs = save_figure(fig, path)
+    plt.close(fig)
+    return outputs
+
+
+def figure_distance_usage_coupling(
+    runs: Mapping[str, Mapping[str, Any]],
+    profiles: Mapping[tuple[str, str], Mapping[str, Any]],
+    cfg: BetaConfig,
+    path: Path,
+) -> list[str]:
+    """Align frozen-family head reach with final-state F_sens and signed B."""
+
+    plt = configure_matplotlib()
+    fig, axes = plt.subplots(4, 3, figsize=(12.0, 11.0), constrained_layout=True)
+    carriage_profiles = {
+        (task, channel): model_carriage_profile(
+            runs[task]["scores"],
+            channel,
+            bootstrap_samples=cfg.bootstrap_samples,
+            seed=cfg.analysis_seed + 12_701 + 101 * row + column,
+        )
+        for row, task in enumerate(ARCHITECTURES)
+        for column, channel in enumerate(CHANNELS)
+    }
+    b_values = np.concatenate([
+        np.asarray(profile[key], float).reshape(-1)
+        for profile in carriage_profiles.values()
+        for key in ("B_ci_low", "B_ci_high")
+    ])
+    finite_b = np.abs(b_values[np.isfinite(b_values)])
+    nonzero_b = finite_b[finite_b > 0]
+    b_bound = max(float(np.max(finite_b)) * 1.25 if len(finite_b) else 1.0, 1e-12)
+    b_linthresh = max(
+        float(np.quantile(nonzero_b, 0.15)) if len(nonzero_b) else b_bound * 1e-3,
+        1e-12,
+    )
+    family_styles = {
+        "semantic_specialist": ("#c75b5b", "-"),
+        "high_G_balanced": ("#55a868", ":"),
+        "structural_pe_specific": ("#4c78a8", "-"),
+        "structural_topology_specific": ("#6f63a8", "-"),
+        "structural_shared": ("#55a868", ":"),
+    }
+    for architecture_index, task in enumerate(ARCHITECTURES):
+        families = runs[task]["ablations"]["selections"][HEADLINE_AGGREGATION]["families"]
+        for column, channel in enumerate(CHANNELS):
+            profile = profiles[(task, channel)]
+            numeric = np.asarray(profile["codes"], int) >= 0
+            x = np.asarray(profile["codes"], int)[numeric]
+            contribution = np.asarray(profile["contribution"], float)[numeric]
+            top = axes[2 * architecture_index, column]
+            all_head = contribution.sum(axis=(1, 2))
+            top.plot(
+                x,
+                all_head / max(float(all_head.sum()), EPS),
+                color="0.45",
+                marker="o",
+                linewidth=1.4,
+                label="all-head EG",
+            )
+            for family in DISTANCE_FAMILIES[channel]:
+                heads = [tuple(map(int, head)) for head in families.get(family, [])]
+                if not heads:
+                    continue
+                values = np.asarray([
+                    sum(float(contribution[index, head[0], head[1]]) for head in heads)
+                    for index in range(len(x))
+                ])
+                color, style = family_styles[family]
+                top.plot(
+                    x,
+                    values / max(float(values.sum()), EPS),
+                    linestyle=style,
+                    marker="s",
+                    color=color,
+                    linewidth=1.2,
+                    label=family.replace("structural_", "").replace("_", " "),
+                )
+            carriage = carriage_profiles[(task, channel)]
+            f = np.asarray(carriage["F_sens"], float)
+            top.plot(
+                carriage["distance"],
+                f / max(float(np.nansum(f)), EPS),
+                "--^",
+                color="black",
+                linewidth=1.4,
+                label="final-state F_sens",
+            )
+            top.set_ylim(bottom=0.0)
+            top.set_ylabel(
+                f"{DISPLAY[task]}\nnormalised distance mass" if column == 0
+                else "normalised distance mass"
+            )
+            top.set_title(("semantic donor", "PE transposition", "topology donor")[column])
+            top.legend(frameon=False, fontsize=6.5)
+
+            bottom = axes[2 * architecture_index + 1, column]
+            bottom.axhline(0, color="black", linewidth=0.7)
+            bottom.fill_between(
+                carriage["distance"], carriage["B_ci_low"], carriage["B_ci_high"],
+                color="0.45", alpha=0.18,
+            )
+            bottom.plot(carriage["distance"], carriage["B"], "o-", color="0.25")
+            bottom.set_yscale("symlog", linthresh=b_linthresh)
+            bottom.set_ylim(-b_bound, b_bound)
+            bottom.set_xlabel("distance to changed set [hops]")
+            bottom.set_ylabel(
+                "signed beneficial B\n(B<0 beneficial)" if column == 0
+                else "signed beneficial B"
+            )
+    fig.suptitle(
+        "Head-score reach above; functional reach and task-level usage on the same distance axis",
+        fontsize=11,
+    )
+    outputs = save_figure(fig, path)
+    plt.close(fig)
+    return outputs
+
+
+def figure_model_functional_carriage(
+    runs: Mapping[str, Mapping[str, Any]], cfg: BetaConfig, path: Path
+) -> list[str]:
+    plt = configure_matplotlib()
+    fig, axes = plt.subplots(2, 3, figsize=(12.0, 7.0), constrained_layout=True, sharey=True)
+    profiles = {}
+    positive = []
+    for row, task in enumerate(ARCHITECTURES):
+        for column, channel in enumerate(CHANNELS):
+            profile = model_carriage_profile(
+                runs[task]["scores"], channel,
+                bootstrap_samples=cfg.bootstrap_samples,
+                seed=cfg.analysis_seed + 101 * row + column,
+            )
+            profiles[(task, channel)] = profile
+            for key in ("F_sens", "F_sens_ci_low", "F_sens_ci_high", "F_coh"):
+                values = np.asarray(profile[key], float)
+                positive.extend(values[np.isfinite(values) & (values > 0)])
+    low = max(float(np.min(positive)) * 0.7, 1e-12) if positive else 1e-12
+    high = float(np.max(positive)) * 1.4 if positive else 1.0
+    colors = {"semantic": "#c75b5b", "pe": "#4c78a8", "topology": "#6f63a8"}
+    for row, task in enumerate(ARCHITECTURES):
+        for column, channel in enumerate(CHANNELS):
+            axis = axes[row, column]
+            profile = profiles[(task, channel)]
+            x = profile["distance"]
+            axis.fill_between(x, profile["F_sens_ci_low"], profile["F_sens_ci_high"],
+                              color=colors[channel], alpha=0.18)
+            axis.plot(x, profile["F_sens"], marker="o", color=colors[channel], label="F_sens")
+            axis.plot(x, profile["F_coh"], linestyle="--", color="0.35", label="F_coh diagnostic")
+            axis.set_yscale("log"); axis.set_ylim(low, high)
+            axis.set_xlabel("distance to changed set [hops]")
+            if column == 0:
+                axis.set_ylabel(f"{DISPLAY[task]}\nfunctional carriage")
+            axis.set_title(("semantic donor", "PE transposition", "topology donor")[column])
+    axes[0, 0].legend(frameon=False, fontsize=7)
+    fig.suptitle("Final-state functional carriage: production F_sens on a shared log scale", fontsize=11)
+    outputs = save_figure(fig, path)
+    plt.close(fig)
+    return outputs
+
+
+def figure_model_beneficial_carriage(
+    runs: Mapping[str, Mapping[str, Any]], cfg: BetaConfig, path: Path
+) -> list[str]:
+    plt = configure_matplotlib()
+    fig, axes = plt.subplots(2, 3, figsize=(12.0, 7.0), constrained_layout=True, sharey=True)
+    profiles = {
+        (task, channel): model_carriage_profile(
+            runs[task]["scores"], channel,
+            bootstrap_samples=cfg.bootstrap_samples,
+            seed=cfg.analysis_seed + 401 + 101 * row + column,
+        )
+        for row, task in enumerate(ARCHITECTURES)
+        for column, channel in enumerate(CHANNELS)
+    }
+    values = np.concatenate([
+        np.asarray(profile[key], float).reshape(-1)
+        for profile in profiles.values()
+        for key in ("B_ci_low", "B_ci_high")
+    ])
+    finite = np.abs(values[np.isfinite(values)])
+    nonzero = finite[finite > 0]
+    bound = max(float(np.max(finite)) * 1.25 if len(finite) else 1.0, 1e-12)
+    linthresh = max(float(np.quantile(nonzero, 0.15)) if len(nonzero) else bound * 1e-3, 1e-12)
+    colors = {"semantic": "#c75b5b", "pe": "#4c78a8", "topology": "#6f63a8"}
+    for row, task in enumerate(ARCHITECTURES):
+        for column, channel in enumerate(CHANNELS):
+            axis = axes[row, column]
+            profile = profiles[(task, channel)]
+            x = profile["distance"]
+            axis.axhline(0, color="black", linewidth=0.7)
+            axis.fill_between(x, profile["B_ci_low"], profile["B_ci_high"],
+                              color=colors[channel], alpha=0.18)
+            axis.plot(x, profile["B"], marker="o", color=colors[channel])
+            axis.set_yscale("symlog", linthresh=linthresh)
+            axis.set_ylim(-bound, bound)
+            axis.set_xlabel("distance to changed set [hops]")
+            if column == 0:
+                axis.set_ylabel(f"{DISPLAY[task]}\nbeneficial carriage B")
+            axis.set_title(("semantic donor", "PE transposition", "topology donor")[column])
+    fig.suptitle(
+        "Path-integrated beneficial carriage on shared signed-log limits (B<0 beneficial)", fontsize=11
+    )
+    outputs = save_figure(fig, path)
+    plt.close(fig)
+    return outputs
+
+
 def figure_carriage(
     runs: Mapping[str, Mapping[str, Any]], aggregation: str, path: Path
 ) -> list[str]:
@@ -3362,26 +5725,48 @@ def figure_conditional(
     plt = configure_matplotlib()
     fig, axes = plt.subplots(1, 2, figsize=(9.0, 4.0), constrained_layout=True)
     for axis, task in zip(axes, ("zinc", "zinc_1hop")):
-        rows = conditional[task].get("confirmed", [])[:8]
+        rows = sorted(
+            conditional[task].get("confirmed", []),
+            key=lambda row: (
+                not bool(row.get("confirmed_at_fdr_0.05", False)),
+                float(row.get("confirmation_q_global", float("inf"))),
+                -abs(float(row.get("confirmation_effect_standardized", 0.0))),
+            ),
+        )[:8]
         if not rows:
             axis.text(0.5, 0.5, "No eligible condition", ha="center", va="center")
             axis.set_axis_off()
             continue
-        labels = [f"{row['rule']}\nL{row['layer']}H{row['head']}" for row in rows]
+        labels = [
+            f"{row['feature']} · {row['rule']}\nL{row['layer']}H{row['head']}" for row in rows
+        ]
         y = np.arange(len(rows))
-        discovery = np.asarray([row["discovery_effect"] for row in rows])
-        confirmation = np.asarray([row["confirmation_effect"] for row in rows])
+        discovery = np.asarray([row["discovery_effect_standardized"] for row in rows])
+        confirmation = np.asarray([row["confirmation_effect_standardized"] for row in rows])
         low = np.maximum(
-            confirmation - np.asarray([row["confirmation_ci_low"] for row in rows]), 0.0
+            confirmation - np.asarray([row["confirmation_ci_low_standardized"] for row in rows]), 0.0
         )
         high = np.maximum(
-            np.asarray([row["confirmation_ci_high"] for row in rows]) - confirmation, 0.0
+            np.asarray([row["confirmation_ci_high_standardized"] for row in rows]) - confirmation, 0.0
         )
         axis.scatter(discovery, y - 0.12, marker="x", color="0.3", label="discovery")
-        axis.errorbar(confirmation, y + 0.12, xerr=[low, high], fmt="o", color="#3b7ddd", label="confirmation")
+        seen_confirmation_labels: set[str] = set()
+        for index, row in enumerate(rows):
+            confirmed = bool(row.get("confirmed_at_fdr_0.05", False))
+            state_label = "FDR-confirmed" if confirmed else "not confirmed"
+            axis.errorbar(
+                confirmation[index],
+                y[index] + 0.12,
+                xerr=[[low[index]], [high[index]]],
+                fmt="o",
+                color="#3b7ddd" if confirmed else "0.55",
+                markerfacecolor="#3b7ddd" if confirmed else "white",
+                label=state_label if state_label not in seen_confirmation_labels else None,
+            )
+            seen_confirmation_labels.add(state_label)
         axis.axvline(0, color="black", linewidth=0.7)
         axis.set_yticks(y, labels)
-        axis.set_xlabel("conditional ΔD")
+        axis.set_xlabel("standardised conditional score delta")
         axis.set_title(DISPLAY[task])
         axis.invert_yaxis()
     axes[0].legend(frameon=False)
@@ -3392,7 +5777,7 @@ def figure_conditional(
 
 
 def jaccard(left: Sequence[Any], right: Sequence[Any]) -> float:
-    a, b = set(map(tuple, left)), set(map(tuple, right))
+    a, b = set(left), set(right)
     return len(a & b) / max(len(a | b), 1)
 
 
@@ -3498,11 +5883,12 @@ def create_decisions(
     for task in ARCHITECTURES:
         rows = [
             row for row in runs[task]["ablations"]["method_rows"]
-            if row.get("scope") == "decision" and row["aggregation"] == aggregation
-        ][0]
+            if row.get("scope") in {"pooled", "within_layer"}
+            and row["aggregation"] == aggregation
+        ]
         selections = runs[task]["ablations"]["selections"][aggregation]["families"]
         method[task] = {
-            "aggregation": rows,
+            "aggregation_diagnostics": rows,
             "D_gate_required": True,
             "topology_pe_family_jaccard": jaccard(
                 selections.get("topology_responsive", []), selections.get("pe_specialist", [])
@@ -3560,25 +5946,24 @@ def create_decisions(
     for task in ARCHITECTURES:
         causal = runs[task]["causal"]
         families = runs[task]["ablations"]["selections"][aggregation]["families"]
-        for family, matched_channel, other_channel in (
-            ("semantic_specialist", "semantic", "pe"),
-            ("pe_specialist", "pe", "semantic"),
+        for family, matched_channel, other_channels in (
+            ("semantic_specialist", "semantic", ("pe", "topology")),
+            ("structural_pe_specific", "pe", ("semantic", "topology")),
+            ("structural_topology_specific", "topology", ("semantic", "pe")),
         ):
             heads = families.get(family, [])
             if not heads:
                 patch_advantages.append(float("nan"))
                 continue
             for metric in ("restore", "inject", "necessity"):
-                matched = np.nanmean([
-                    channel_mean_metric(causal, matched_channel, metric)[head] for head in heads
-                ])
-                off_channel = np.nanmean([
-                    channel_mean_metric(causal, other_channel, metric)[head] for head in heads
+                matrix = family_channel_matrix(causal, families, [family], metric)
+                matched = float(matrix[0, CHANNELS.index(matched_channel)])
+                off_channel = np.nanmax([
+                    matrix[0, CHANNELS.index(channel)] for channel in other_channels
                 ])
                 mismatch = (
-                    np.nanmean([
-                        channel_mean_metric(causal, matched_channel, "mismatch")[head]
-                        for head in heads
+                    float(family_channel_matrix(causal, families, [family], "mismatch")[
+                        0, CHANNELS.index(matched_channel)
                     ])
                     if metric == "restore" else 0.0
                 )
@@ -3586,10 +5971,7 @@ def create_decisions(
     patch_valid = all(np.isfinite(value) and value > 0.0 for value in patch_advantages)
     return {
         "overall_aggregation": aggregation,
-        "aggregation_rule": (
-            "replace CG only if one candidate is not worse in either architecture and improves "
-            "the cross-architecture mean of causal-validity plus donor-prefix reliability by >=0.03"
-        ),
+        "aggregation_rule": "EG is predeclared; this rerun performs no aggregation reselection",
         "D": {
             "verdict": "retain_gated" if d_valid else "descriptive_only",
             "rule": (
@@ -3611,23 +5993,20 @@ def create_decisions(
             "matched_minus_max_offchannel_mismatch": patch_advantages,
             "protocol": "restore + inject + zero-ablation necessity, with sham and cross-graph calibration",
         },
-        "routing_message": {
-            "verdict": "retain_fixed_support_decomposition" if mechanism_valid else "descriptive_only",
+        "routing_message_wiring": {
+            "verdict": "retain_support_aware_decomposition" if mechanism_valid else "descriptive_only",
             "maximum_exact_reconstruction_error": mechanism_max,
             "mean_full_rescue_by_architecture": mechanism_full,
             "finite_interaction_to_full_ratio": mechanism_interaction_ratio,
-            "topology_limitation": (
-                "not decomposed into only routing/message because changed support is a third wiring term"
-            ),
+            "topology_convention": "common-support routing/message plus explicit exclusive-support wiring",
         },
         "carriage": (
-            "retain F_sens beside F_coh; use the changed-node set for PE distance and suppress a "
-            "local topology profile when the topology edit is effectively global"
+            "F_sens is the fixed headline; F_coh is diagnostic; all channels use event-specific "
+            "changed-set distance and shared log-scale figures"
         ),
         "beneficial_carriage": (
-            "retain the existing signed path-integrated loss-complete estimator unchanged; this "
-            "beta adds exact donor-level helpful/harmful probabilities and conditional magnitudes, "
-            "but does not replace carrier-wise beneficial carriage with an absolute score"
+            "signed path-integrated carrier attribution is computed for semantic, PE and topology "
+            "events and shown on shared symlog limits; no absolute-value replacement"
         ),
         "topology_donor": {
             "verdict": topology_verdict,
@@ -3657,35 +6036,11 @@ def create_outputs(runs: Mapping[str, Mapping[str, Any]], cfg: BetaConfig) -> di
     figures = cfg.root / "figures"
     tables.mkdir(parents=True, exist_ok=True)
     figures.mkdir(parents=True, exist_ok=True)
-    aggregation_objectives: dict[str, list[float]] = {name: [] for name in AGGREGATIONS}
     method_rows = []
     for task in ARCHITECTURES:
         for row in runs[task]["ablations"]["method_rows"]:
             method_rows.append({"architecture": task, **row})
-            if row.get("scope") == "decision":
-                aggregation_objectives[row["aggregation"]].append(float(row["objective"]))
-    overall = sorted(
-        AGGREGATIONS,
-        key=lambda name: (-np.nanmean(aggregation_objectives[name]), AGGREGATIONS.index(name)),
-    )[0]
-    objective_mean = {
-        name: finite_mean(aggregation_objectives[name]) for name in AGGREGATIONS
-    }
-    candidate = overall
-    if candidate != "CG":
-        per_architecture_not_worse = all(
-            next(
-                row["objective"] for row in runs[task]["ablations"]["method_rows"]
-                if row.get("scope") == "decision" and row["aggregation"] == candidate
-            )
-            >= next(
-                row["objective"] for row in runs[task]["ablations"]["method_rows"]
-                if row.get("scope") == "decision" and row["aggregation"] == "CG"
-            )
-            for task in ARCHITECTURES
-        )
-        if not per_architecture_not_worse or objective_mean[candidate] - objective_mean["CG"] < 0.03:
-            overall = "CG"
+    overall = HEADLINE_AGGREGATION
     write_csv(tables / "aggregation_validation.csv", method_rows)
 
     topology_rows = []
@@ -3695,18 +6050,130 @@ def create_outputs(runs: Mapping[str, Mapping[str, Any]], cfg: BetaConfig) -> di
     family_patch_rows = []
     family_ablation_rows = []
     carriage_rows = []
+    beneficial_diagnostic_rows = []
     conditional = {}
     event_rows = []
+    topology_strata_rows = []
+    topology_agreement = {}
+    distance_profiles: dict[tuple[str, str], dict[str, Any]] = {}
+    distance_score_rows = []
+    head_reach_rows = []
+    family_reach_rows = []
+    distance_identity_rows = []
+    integrated_audit_rows = []
     for task in ARCHITECTURES:
         event_rows.extend(intervention_event_rows(task, runs[task]["scores"]))
+        task_integrated_audit = runs[task]["scores"].get(
+            "integrated_carriage_audit",
+            integrated_carriage_audit(runs[task]["scores"]["records"]),
+        )
+        integrated_audit_rows.append({"architecture": task, **task_integrated_audit})
+        for record in runs[task]["scores"]["records"]:
+            for channel in CHANNELS:
+                result = record["channels"][channel]
+                for source_index, diagnostic in enumerate(
+                    result.get("beneficial_diagnostics", [])
+                ):
+                    replay = diagnostic.get("endpoint_replay") or {}
+                    beneficial_diagnostic_rows.append({
+                        "architecture": task,
+                        "graph_id": int(record["graph_id"]),
+                        "channel": channel,
+                        "source_index": int(source_index),
+                        "paths": int(diagnostic["paths"]),
+                        "unconverged": int(diagnostic["unconverged"]),
+                        "unconverged_fraction": float(
+                            diagnostic.get("unconverged_fraction", 0.0)
+                        ),
+                        "completeness_max": float(diagnostic["completeness_max"]),
+                        "quadrature_error_max": float(diagnostic["quadrature_error_max"]),
+                        "unconverged_completeness_max": float(
+                            diagnostic.get("unconverged_completeness_max", 0.0)
+                        ),
+                        "unconverged_quadrature_error_max": float(
+                            diagnostic.get("unconverged_quadrature_error_max", 0.0)
+                        ),
+                        "intervals_max": int(diagnostic.get("intervals_max", 0)),
+                        "endpoint_replay_passed": bool(replay.get("passed", False)),
+                        "endpoint_replay_max_abs_error": float(
+                            replay.get("max_abs_error", float("nan"))
+                        ),
+                    })
         summary = topology_summary(runs[task]["scores"], runs[task]["causal"], overall)
         topology_rows.append({
             "architecture": task,
             **{key: value for key, value in summary.items() if np.isscalar(value) or isinstance(value, dict)},
         })
+        topology_agreement[task] = topology_agreement_analysis(
+            runs[task]["scores"], cfg, overall
+        )
+        write_json(tables / f"topology_agreement_{task}.json", topology_agreement[task])
+        topology_strata_rows.extend({"architecture": task, **row} for row in
+                                    topology_stratified_analysis(
+                                        runs[task]["scores"], runs[task]["causal"], overall
+                                    ))
         selection = runs[task]["ablations"]["selections"][overall]
         families = selection["families"]
+        for channel_index, channel in enumerate(CHANNELS):
+            donor_scopes = ["headline"]
+            if channel == "topology":
+                donor_scopes.extend(sorted({
+                    f"tier_{int(item['tier'])}"
+                    for record in runs[task]["scores"]["records"]
+                    for item in record["plan"]["topology"]
+                }))
+            for scope_index, donor_scope in enumerate(donor_scopes):
+                profile = distance_specialisation_profile(
+                    runs[task]["scores"],
+                    channel,
+                    donor_scope=donor_scope,
+                    bootstrap_samples=cfg.bootstrap_samples,
+                    seed=(
+                        cfg.analysis_seed + 10_901 + 997 * ARCHITECTURES.index(task)
+                        + 31 * channel_index + scope_index
+                    ),
+                )
+                distance_score_rows.extend(distance_specialisation_rows(task, profile))
+                head_reach_rows.extend(head_reach_summary_rows(task, profile))
+                distance_identity_rows.append({
+                    "architecture": task,
+                    "channel": channel,
+                    "donor_scope": donor_scope,
+                    "graphs": len(profile["graph_ids"]),
+                    "identity_passed": bool(profile["identity_passed"]),
+                    "maximum_absolute_reconstruction_error": float(
+                        profile["identity_max_abs_error"]
+                    ),
+                })
+                if donor_scope == "headline":
+                    distance_profiles[(task, channel)] = profile
+                    final_carriage = model_carriage_profile(
+                        runs[task]["scores"],
+                        channel,
+                        bootstrap_samples=cfg.bootstrap_samples,
+                        seed=cfg.analysis_seed + 11_701 + 101 * channel_index,
+                    )
+                    family_reach_rows.extend(family_distance_reach_rows(
+                        task, profile, families, final_carriage
+                    ))
+        causal = runs[task]["causal"]
+        for family in causal.get("family_names", []):
+            score_heads = [tuple(map(int, head)) for head in families.get(family, [])]
+            causal_heads = [
+                tuple(map(int, head))
+                for head in causal.get("family_definitions", {}).get(family, [])
+            ]
+            if score_heads != causal_heads:
+                raise RuntimeError(
+                    f"frozen family drift for {task}/{family}: "
+                    f"score={score_heads}, causal={causal_heads}"
+                )
         coordinates = selection["coordinates"]
+        semantic_topology_coordinates = score_coordinates(
+            selection["semantic_topology_semantic"],
+            selection["semantic_topology_topology"],
+        )
+        pe_topology_coordinates = selection["pe_topology_coordinates"]
         impact = runs[task]["ablations"]["per_head"]
         for layer in range(int(runs[task]["scores"]["L"])):
             for head in range(int(runs[task]["scores"]["H"])):
@@ -3715,14 +6182,36 @@ def create_outputs(runs: Mapping[str, Mapping[str, Any]], cfg: BetaConfig) -> di
                     "S_sem": selection["semantic"][layer, head],
                     "S_pe": selection["pe"][layer, head],
                     "S_topology": selection["topology"][layer, head],
+                    "S_semantic_on_topology_paired_graphs": selection[
+                        "semantic_topology_semantic"
+                    ][layer, head],
+                    "S_pe_on_topology_paired_graphs": selection["pe_topology_pe"][layer, head],
+                    "S_topology_on_semantic_paired_graphs": selection[
+                        "semantic_topology_topology"
+                    ][layer, head],
+                    "S_topology_on_pe_paired_graphs": selection[
+                        "pe_topology_topology"
+                    ][layer, head],
                     "D": coordinates["D"][layer, head],
                     "J": coordinates["J"][layer, head],
                     "G": coordinates["G"][layer, head],
+                    "D_semantic_topology": semantic_topology_coordinates["D"][layer, head],
+                    "J_semantic_topology": semantic_topology_coordinates["J"][layer, head],
+                    "G_semantic_topology": semantic_topology_coordinates["G"][layer, head],
+                    "D_pe_topology": pe_topology_coordinates["D"][layer, head],
+                    "J_pe_topology": pe_topology_coordinates["J"][layer, head],
+                    "G_pe_topology": pe_topology_coordinates["G"][layer, head],
+                    "D_pe_topology_ci_low": selection["pe_topology_D_ci_lower"][layer, head],
+                    "D_pe_topology_ci_high": selection["pe_topology_D_ci_upper"][layer, head],
                     "active": bool(selection["active"][layer, head]),
+                    "active_pe_topology": bool(selection["pe_topology_active"][layer, head]),
+                    "families": ";".join(
+                        family for family, heads in families.items()
+                        if (layer, head) in [tuple(map(int, item)) for item in heads]
+                    ),
                     "functional_ablation": impact["functional"][layer, head],
                     "loss_ablation": impact["loss_increase"][layer, head],
                 })
-        causal = runs[task]["causal"]
         for channel in CHANNELS:
             for metric in ("restore", "inject", "necessity", "mismatch", "sham"):
                 matrix = channel_mean_metric(causal, channel, metric)
@@ -3735,19 +6224,22 @@ def create_outputs(runs: Mapping[str, Mapping[str, Any]], cfg: BetaConfig) -> di
         for family, heads in families.items():
             for channel in CHANNELS:
                 for metric in ("restore", "inject", "necessity", "mismatch", "sham"):
-                    matrix = channel_mean_metric(causal, channel, metric)
+                    matrix = family_channel_matrix(
+                        causal, families, [family], metric
+                    )
                     family_patch_rows.append({
                         "architecture": task,
                         "family": family,
                         "heads": str(list(heads)),
                         "channel": channel,
                         "metric": metric,
-                        "mean": float(np.nanmean([matrix[head] for head in heads])) if heads else float("nan"),
+                        "mean": float(matrix[0, CHANNELS.index(channel)]) if heads else float("nan"),
+                        "simultaneous_family_patch": family in causal.get("family_names", []),
                     })
             for row in runs[task]["ablations"]["family_curves"][overall].get(family, []):
                 family_ablation_rows.append({"architecture": task, "family": family, **row})
         mechanism = runs[task]["mechanism"]
-        for channel in PRIMARY_CHANNELS:
+        for channel in CHANNELS:
             mask = np.asarray([event["channel"] == channel for event in mechanism["events"]])
             for layer in range(int(runs[task]["scores"]["L"])):
                 for head in range(int(runs[task]["scores"]["H"])):
@@ -3761,51 +6253,91 @@ def create_outputs(runs: Mapping[str, Mapping[str, Any]], cfg: BetaConfig) -> di
                             for key, value in mechanism["metrics"].items()
                         },
                     })
-        for channel, family in (("semantic", "semantic_specialist"), ("pe", "pe_specialist")):
-            profile = carriage_profile(runs[task]["scores"], channel, families.get(family, []))
-            for index, distance in enumerate(profile["distance"]):
-                carriage_rows.append({
-                    "architecture": task,
-                    "channel": channel,
-                    "family": family,
-                    "distance": int(distance),
-                    "F_sens": float(profile["F_sens"][index]),
-                    "F_coh": float(profile["F_coh"][index]),
-                    "F_sens_ci_low": float(profile["F_sens_ci_low"][index]),
-                    "F_sens_ci_high": float(profile["F_sens_ci_high"][index]),
-                    "F_coh_ci_low": float(profile["F_coh_ci_low"][index]),
-                    "F_coh_ci_high": float(profile["F_coh_ci_high"][index]),
-                    "graph_support": int(profile["graph_support"][index]),
-                })
+        for channel in CHANNELS:
+            donor_scopes = ["headline"]
+            if channel == "topology":
+                donor_scopes.extend(sorted({
+                    str(item.get("donor_scope"))
+                    for record in runs[task]["scores"]["records"]
+                    for item in record["channels"][channel].get("model_carriage", [])
+                    if str(item.get("donor_scope", "")).startswith("tier_")
+                }))
+            for scope_index, donor_scope in enumerate(donor_scopes):
+                profile = model_carriage_profile(
+                    runs[task]["scores"],
+                    channel,
+                    donor_scope=donor_scope,
+                    bootstrap_samples=cfg.bootstrap_samples,
+                    seed=(
+                        cfg.analysis_seed + 717 + 31 * scope_index
+                        + CHANNELS.index(channel)
+                    ),
+                )
+                for index, distance in enumerate(profile["distance"]):
+                    carriage_rows.append({
+                        "architecture": task,
+                        "channel": channel,
+                        "donor_scope": donor_scope,
+                        "level": "final_state_model",
+                        "distance": int(distance),
+                        "F_sens": float(profile["F_sens"][index]),
+                        "F_coh": float(profile["F_coh"][index]),
+                        "F_sens_ci_low": float(profile["F_sens_ci_low"][index]),
+                        "F_sens_ci_high": float(profile["F_sens_ci_high"][index]),
+                        "F_coh_ci_low": float(profile["F_coh_ci_low"][index]),
+                        "F_coh_ci_high": float(profile["F_coh_ci_high"][index]),
+                        "B": float(profile["B"][index]),
+                        "B_ci_low": float(profile["B_ci_low"][index]),
+                        "B_ci_high": float(profile["B_ci_high"][index]),
+                        "B_sum": float(profile["B_sum"][index]),
+                        "graph_support": int(profile["graph_support"][index]),
+                    })
         conditional[task] = conditional_analysis(runs[task]["scores"], overall, cfg)
         write_json(tables / f"conditional_{task}.json", conditional[task])
     write_csv(tables / "topology_validation.csv", topology_rows)
+    write_csv(tables / "topology_tier_dose_validation.csv", topology_strata_rows)
     write_csv(tables / "head_scores_and_ablation.csv", ablation_rows)
     write_csv(tables / "causal_head_metrics.csv", causal_rows)
     write_csv(tables / "family_patch_metrics.csv", family_patch_rows)
     write_csv(tables / "family_ablation_curves.csv", family_ablation_rows)
     write_csv(tables / "routing_message_metrics.csv", mechanism_rows)
     write_csv(tables / "carriage_profiles.csv", carriage_rows)
+    write_csv(tables / "beneficial_carriage_diagnostics.csv", beneficial_diagnostic_rows)
+    write_csv(tables / "integrated_carriage_audit.csv", integrated_audit_rows)
     write_csv(tables / "intervention_events_and_dose.csv", event_rows)
     write_csv(tables / "donor_outcome_summary.csv", donor_outcome_summary_rows(event_rows))
+    write_csv(tables / "distance_resolved_specialisation.csv", distance_score_rows)
+    write_csv(tables / "head_reach_summary.csv", head_reach_rows)
+    write_csv(tables / "family_reach_alignment.csv", family_reach_rows)
+    write_csv(tables / "distance_score_identity.csv", distance_identity_rows)
 
     figure_paths = []
-    figure_paths += figure_aggregation_planes(runs, figures / "zinc_beta_fig01_aggregation_planes")
-    figure_paths += figure_method_validation(runs, figures / "zinc_beta_fig02_method_validation")
-    figure_paths += figure_selectivity_strength(runs, overall, figures / "zinc_beta_fig03_selectivity_strength")
-    figure_paths += figure_causal_coordinates(runs, overall, figures / "zinc_beta_fig04_causal_coordinates")
-    figure_paths += figure_family_patching(runs, overall, figures / "zinc_beta_fig05_family_patching")
-    figure_paths += figure_patch_controls(runs, figures / "zinc_beta_fig06_patch_controls")
-    figure_paths += figure_topology_validation(runs, overall, figures / "zinc_beta_fig07_topology_validation")
-    figure_paths += figure_ablation(runs, overall, figures / "zinc_beta_fig08_ablation")
-    figure_paths += figure_routing_message(runs, overall, figures / "zinc_beta_fig09_routing_message")
-    figure_paths += figure_carriage(runs, overall, figures / "zinc_beta_fig10_carriage")
-    figure_paths += figure_conditional(conditional, figures / "zinc_beta_fig11_conditional")
+    figure_paths += figure_three_channel_planes(runs, figures / "zinc_headline_fig01_three_channel_planes")
+    figure_paths += figure_topology_agreement(runs, cfg, figures / "zinc_headline_fig02_topology_agreement")
+    figure_paths += figure_topology_strata(runs, figures / "zinc_headline_fig03_topology_tier_dose")
+    figure_paths += figure_family_patching(runs, overall, figures / "zinc_headline_fig04_family_patching")
+    figure_paths += figure_patch_controls(runs, figures / "zinc_headline_fig05_patch_controls")
+    figure_paths += figure_ablation(runs, overall, figures / "zinc_headline_fig06_ablation")
+    figure_paths += figure_routing_message(runs, overall, figures / "zinc_headline_fig07_mechanism")
+    figure_paths += figure_model_functional_carriage(
+        runs, cfg, figures / "zinc_headline_fig08_functional_carriage"
+    )
+    figure_paths += figure_model_beneficial_carriage(
+        runs, cfg, figures / "zinc_headline_fig09_beneficial_carriage"
+    )
+    figure_paths += figure_conditional(conditional, figures / "zinc_headline_fig10_conditional")
+    figure_paths += figure_causal_coordinates(runs, overall, figures / "zinc_headline_fig11_causal_coordinates")
+    figure_paths += figure_distance_specialisation_atlas(
+        distance_profiles, figures / "zinc_headline_fig12_distance_specialisation"
+    )
+    figure_paths += figure_distance_usage_coupling(
+        runs, distance_profiles, cfg, figures / "zinc_headline_fig13_reach_usage_coupling"
+    )
 
     decisions = create_decisions(runs, overall)
     confirmed_rules = {
         task: {
-            row["rule"] for row in conditional[task].get("confirmed", [])
+            f"{row['feature']}::{row['rule']}" for row in conditional[task].get("confirmed", [])
             if row.get("confirmed_at_fdr_0.05", False)
         }
         for task in ARCHITECTURES
@@ -3818,9 +6350,25 @@ def create_outputs(runs: Mapping[str, Mapping[str, Any]], cfg: BetaConfig) -> di
         "label_verdict": "approve_shared_conditions" if shared_confirmed else "exploratory_only",
         "constraint": "finite predeclared basis with held-out global-FDR, dose and localisation diagnostics",
     }
+    decisions["distance_resolved_specialisation"] = {
+        "verdict": "retain_exact_decomposition",
+        "estimand": (
+            "S_EG(layer,head,distance): event magnitude is summed over carriers in the "
+            "event-specific distance bucket, then events, sources and graphs are averaged"
+        ),
+        "methodological_status": "exact decomposition of EG, not a new score",
+        "identity_max_abs_error": float(max(
+            row["maximum_absolute_reconstruction_error"] for row in distance_identity_rows
+        )),
+        "hub_rule": "virtual-node transport is assigned to a separate hub bucket",
+        "interpretation": (
+            "identifies which heads and frozen families implement intervention reach; final-state "
+            "F_sens and signed B remain the functional and task-usage endpoints"
+        ),
+    }
     write_json(tables / "methodology_decisions.json", decisions)
     scope = {
-        "primary_comparison": "semantic donor swaps versus mask-frozen PE transpositions",
+        "primary_comparison": "fixed EG analysis of semantic, mask-frozen PE and matched topology channels",
         "topology_probe": (
             "matched-real non-isomorphic molecular donors, same n, preferentially exact atom/degree/"
             "bond multisets, Hungarian node alignment, donor-recomputed RRWP, base x/y fixed"
@@ -3838,9 +6386,11 @@ def create_outputs(runs: Mapping[str, Mapping[str, Any]], cfg: BetaConfig) -> di
         "schema": BETA_SCHEMA,
         "fingerprint": cfg.fingerprint,
         "selected_aggregation": overall,
-        "aggregation_candidate": candidate,
-        "aggregation_objective_mean": objective_mean,
-        "successor_minimum_margin_over_CG": 0.03,
+        "aggregation_choice": "predeclared headline EG; no data-dependent reselection",
+        "functional_carriage_choice": "predeclared F_sens; F_coh retained diagnostically",
+        "distance_specialisation_choice": (
+            "exact EG-by-distance decomposition with unreachable and hub buckets"
+        ),
         "decisions": decisions,
         "figures": figure_paths,
         "tables": [str(item) for item in sorted(tables.iterdir())],
@@ -3985,12 +6535,22 @@ def make_config(args: argparse.Namespace) -> BetaConfig:
         "family_size": args.family_size,
         "bootstrap_samples": args.bootstrap_samples,
         "conditional_bootstrap_samples": args.conditional_bootstrap_samples,
+        "conditional_per_feature": args.conditional_per_feature,
+        "conditional_max_tests": args.conditional_max_tests,
         "analysis_seed": args.analysis_seed,
         "device": args.device,
         "dense_checkpoint": args.dense_checkpoint,
         "onehop_checkpoint": args.onehop_checkpoint,
         "allow_relaxed_topology": not args.strict_topology_only,
         "causal_effect_floor_relative": args.causal_effect_floor_relative,
+        "topk_values": tuple(
+            int(value.strip()) for value in args.top_k_values.split(",") if value.strip()
+        ),
+        "integrated_atol": args.integrated_atol,
+        "integrated_rtol": args.integrated_rtol,
+        "integrated_max_intervals": args.integrated_max_intervals,
+        "integrated_unconverged_error_cap": args.integrated_unconverged_error_cap,
+        "integrated_max_unconverged_fraction": args.integrated_max_unconverged_fraction,
     }
     if args.fast_dev_run:
         values.update({
@@ -4009,6 +6569,8 @@ def make_config(args: argparse.Namespace) -> BetaConfig:
             "family_size": 1,
             "bootstrap_samples": 40,
             "conditional_bootstrap_samples": 40,
+            "conditional_per_feature": 1,
+            "conditional_max_tests": 16,
         })
     cfg = BetaConfig(**values)
     cfg.validate()
@@ -4029,7 +6591,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--score-sources", type=int, default=8)
     parser.add_argument("--semantic-donors", type=int, default=8)
     parser.add_argument("--pe-partners", type=int, default=8)
-    parser.add_argument("--topology-donors", type=int, default=2)
+    parser.add_argument("--topology-donors", type=int, default=6)
     parser.add_argument("--topology-pool", type=int, default=10_000)
     parser.add_argument("--causal-graphs", type=int, default=48)
     parser.add_argument("--causal-sources", type=int, default=2)
@@ -4039,12 +6601,20 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--family-size", type=int, default=3)
     parser.add_argument("--bootstrap-samples", type=int, default=1000)
     parser.add_argument("--conditional-bootstrap-samples", type=int, default=1000)
+    parser.add_argument("--conditional-per-feature", type=int, default=2)
+    parser.add_argument("--conditional-max-tests", type=int, default=48)
     parser.add_argument("--analysis-seed", type=int, default=1771)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--dense-checkpoint", default=None)
     parser.add_argument("--onehop-checkpoint", default=None)
     parser.add_argument("--strict-topology-only", action="store_true")
     parser.add_argument("--causal-effect-floor-relative", type=float, default=0.05)
+    parser.add_argument("--top-k-values", default="3,5,10")
+    parser.add_argument("--integrated-atol", type=float, default=5.0e-4)
+    parser.add_argument("--integrated-rtol", type=float, default=1.0e-4)
+    parser.add_argument("--integrated-max-intervals", type=int, default=256)
+    parser.add_argument("--integrated-unconverged-error-cap", type=float, default=5.0e-3)
+    parser.add_argument("--integrated-max-unconverged-fraction", type=float, default=1.0e-2)
     parser.add_argument("--repository-branch", default=REPOSITORY_BRANCH)
     parser.add_argument("--skip-bootstrap", action="store_true")
     parser.add_argument("--skip-install", action="store_true")
@@ -4088,7 +6658,11 @@ def main(argv: Sequence[str] | None = None) -> dict[str, Any]:
                 if args.phase in {"all", "scores"}:
                     score_payload = run_scores_task(loaded, cfg, force=args.force)
                 if args.phase in {"all", "causal"}:
-                    causal_payload = run_causal_task(loaded, cfg, force=args.force)
+                    if score_payload is None:
+                        score_payload = find_cached_phase(cfg, task, "scores")
+                    causal_payload = run_causal_task(
+                        loaded, cfg, score_payload, force=args.force
+                    )
                 if args.phase in {"all", "mechanism"}:
                     run_mechanism_task(loaded, cfg, force=args.force)
                 if args.phase in {"all", "ablations"}:

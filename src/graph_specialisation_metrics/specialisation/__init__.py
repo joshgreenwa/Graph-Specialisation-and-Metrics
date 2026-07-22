@@ -1,8 +1,9 @@
 """Per-head semantic / structural specialisation scores for pretrained GRIT models.
 
-The productionised, central version of the specialisation-score methodology documented in
-``experiments/synthetic/specialisation/SPECIALISATION_SCORES.md`` -- lifted from the spec-lite
-``Net`` onto the REAL GRIT transformer (dense ZINC + its 1-hop control). It reuses the carriage
+The production, central version of the graph-balanced eventwise-gross (EG) specialisation-score
+methodology documented in this package's ``README.md``. It was lifted from the historical
+spec-lite ``Net`` method onto the REAL GRIT transformer (dense ZINC + its 1-hop control). It reuses
+the carriage
 package for model loading, the semantic donor swap (``carriage.content``) and the structural
 transposition (``carriage.structural``); the new part is reading those interventions at the
 per-head TRANSPORT site  o^{lh}_i = ``batch.wV``  (and, secondarily, the SELECTION site

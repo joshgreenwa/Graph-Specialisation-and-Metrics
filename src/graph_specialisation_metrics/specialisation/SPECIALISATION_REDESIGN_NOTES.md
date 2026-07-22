@@ -44,20 +44,21 @@ Two separate global input interventions are currently run through the complete m
 - **Structural:** transpose RRWP/PE payload between anchor `s` and a degree-matched within-graph
   partner, while holding node content, edge/bond attributes and the attention mask fixed.
 
-For `K` donors or partners, transport deltas are averaged before taking a magnitude:
+For intervention event `k`, define the output-projected transport vector
 
-    Delta_bar o_i(s) = (1/K) sum_k [o_i(clean) - o_i(intervention_(s,k))].
+    q[k,i,s] = (phi_(t,i) . [o_i(clean) - o_i(intervention_(s,k))])_(t=1..T).
 
-The per-carrier functional contribution and raw head scores are
+The production per-carrier sensitivity and raw head score are now
 
-    F[i,s] = sqrt(sum_t (phi_(t,i) . Delta_bar o_i(s))^2)
+    F_sens[i,s] = (1/K) sum_k ||q[k,i,s]||
 
-    S_sem(l,h) = mean_(graph,source) sum_i F_sem[i,source]
-    S_str(l,h) = mean_(graph,anchor) sum_i F_str[i,anchor].
+    S_sem(l,h) = mean_graph mean_source sum_i F_sens_sem[i,source]
+    S_str(l,h) = mean_graph mean_anchor sum_i F_sens_str[i,anchor].
 
-Thus the current scores measure **output-relevant gross transport response** under the declared
-intervention distributions. They use global counterfactuals and full routed transport, but average
-signed donor effects before magnitude and sum carrier magnitudes without carrier cancellation.
+These are graph-balanced **eventwise-gross (EG)** scores: magnitude is taken per event before
+averaging, so neither opposite donor/partner directions nor opposite carrier contributions cancel.
+The graph-balanced coherent-gross matrices remain stored as `S_sem_CG/S_str_CG` diagnostics.
+Production score-cache version 3 makes this choice explicit and invalidates older CG-default caches.
 
 For comparison plots, each channel is divided by a shared reference mean, producing
 `S_tilde_sem` and `S_tilde_str`, followed by
@@ -71,10 +72,11 @@ that both channels are jointly strong.
 
 ## Successor plan: validation before integration
 
-This section specifies candidate experiments, not approved production changes. Existing outputs
-must be retained while the candidates are compared on identical interventions and graph samples.
+This section records the validation design. The specialisation aggregation and functional-carriage
+comparisons are now resolved in favour of EG and `F_sens`; unresolved components remain candidates
+until separately approved.
 
-### 1. Four specialisation aggregations
+### 1. Four specialisation aggregations — resolved
 
 For one head and channel, let
 
@@ -83,16 +85,19 @@ For one head and channel, let
 be the output-projected transport vector for intervention event `k` and carrier `i`. Compute the
 complete two-by-two aggregation family:
 
-    S_CG = mean_(graph,source) sum_i ||mean_k q[k,i]||       # coherent-gross; current score
+    S_CG = mean_(graph,source) sum_i ||mean_k q[k,i]||       # coherent-gross; legacy score
     S_EG = mean_(graph,source,k) sum_i ||q[k,i]||            # eventwise-gross
     S_CN = mean_(graph,source) ||mean_k sum_i q[k,i]||       # coherent-net
     S_EN = mean_(graph,source,k) ||sum_i q[k,i]||            # eventwise-net
 
-`S_EN` is the candidate primary functional-specialisation score. Taking magnitude per event avoids
-donor/partner-direction cancellation; summing signed carriers first estimates the head's net
-first-order graph-output effect. Its cost is that heterogeneous/noisy events contribute positively
-and strong internal transport that cancels at the readout becomes small. Therefore retain `S_CG`
-as legacy coherent gross transport and `S_EG` as the principal internal-transport companion.
+**Firm decision: `S_EG` is the production functional-specialisation score.** Taking magnitude per
+event avoids donor/partner-direction cancellation, while gross carrier aggregation preserves the
+full internal transport signal that the methodology is designed to identify. CN/EN instead estimate
+net first-order graph-output influence and can hide strong internal transport that cancels across
+carriers; causal patching and ablation already test downstream use independently. CG remains the
+coherent legacy diagnostic. Across the synthetic and ZINC validations all four methods were
+qualitatively stable, with CG/EG and CN/EN especially close, so the choice is made by the cleaner EG
+sensitivity estimand rather than a small empirical advantage on one dataset.
 
 Report donor and carrier coherence diagnostics, conceptually
 
@@ -210,21 +215,24 @@ defined without an alignment convention. Treat support/wiring as a third compone
 the two-way decomposition to the fixed-support PE intervention. Do not present an arbitrary
 reindexing convention as an identified mechanism.
 
-### 6. Functional and beneficial carriage
+### 6. Functional and beneficial carriage — functional choice resolved
 
-Carriage must retain individual carriers because their distance distribution is the estimand. Add
-eventwise functional sensitivity
+Carriage must retain individual carriers because their distance distribution is the estimand.
+**Firm decision: eventwise functional sensitivity is the production functional-carriage field:**
 
     F_sens[i,s] = mean_k ||q[k,i,s]||
 
-beside current coherent functional carriage
+The former coherent functional carriage is retained as a diagnostic:
 
     F_coh[i,s] = ||mean_k q[k,i,s]||.
 
-`F_sens` asks whether a typical valid intervention reaches a carrier; `F_coh` asks whether the
-population-average intervention moves it consistently. Add donor coherence, and optionally compare
-gross versus signed-net contributions within each distance band. Do not globally sum carriers before
-constructing the distance profile.
+`F_sens` asks whether a typical valid intervention reaches a carrier and is aligned with production
+EG specialisation; `F_coh` asks whether the population-average intervention moves it consistently.
+This is implemented centrally for both semantic and structural carriage: existing `F`/`F_mean`
+fields now mean `F_sens`, while raw and aggregated `F_coh` remain available. Functional-carriage
+version 2 invalidates old progress snapshots rather than silently mixing the estimands. Retain donor
+coherence as a diagnostic, and optionally compare gross versus signed-net contributions within each
+distance band. Do not globally sum carriers before constructing the distance profile.
 
 No replacement for integrated beneficial carriage is required. Its donor-wise signed path
 attribution and subsequent averaging are precisely what preserve loss completeness:
@@ -366,10 +374,11 @@ support the following conclusions.
   positive (`0.35–0.42`). Near-inert early-layer heads can receive extreme D values because both
   channel scores are close to zero. The successful D-selected families already impose J/activity
   and uncertainty gates. The supported claim is therefore **conditional/gated D**, not standalone D.
-- **No aggregation clearly replaces coherent-gross CG.** EG has the best observed top-k stability
-  and small advantages on some ablation and D correlations, but no candidate supplies a decisive
-  held-out causal improvement. Retain CG as the production baseline; keep EG/CN/EN as diagnostic
-  estimands until real-task validation.
+- **The synthetic experiment alone did not justify replacing CG.** EG had the best observed top-k
+  stability and small advantages on some ablation and D correlations, but no candidate supplied a
+  decisive held-out causal improvement. This was the correct interim conclusion before molecular
+  transfer; the later cross-validation decision adopts EG for its cleaner sensitivity estimand after
+  ZINC showed that the qualitative results are insensitive to the aggregation choice.
 - **Pooled correlations partly reflect layer hierarchy.** Every real-task analysis must report both
   global and within-layer validity, and should test incremental prediction after controlling for
   layer and head activity/norm.
@@ -423,10 +432,11 @@ single ZINC target. The transferable primary design is the **selected-family × 
    the exact decomposition and finite routing-only/message-only/full patches. Test whether the
    synthetic semantic-message and structural-routing dissociation survives. For a support-changing
    topology donor, add an explicit wiring/support component rather than forcing the two-way split.
-6. **Functional carriage and coherence.** Compare `F_sens` and `F_coh`, donor coherence, carrier
-   coherence and graph-balanced distance profiles. Use shortest distance to the changed node/edge set,
-   report support by distance and normalize comparisons for molecule size. Determine whether the
-   structural localisation and semantic carrier cancellation seen synthetically recur.
+6. **Functional carriage and coherence.** Report production `F_sens` alongside diagnostic `F_coh`,
+   donor coherence, carrier coherence and graph-balanced distance profiles. Use shortest distance to
+   the changed node/edge set, report support by distance and normalize comparisons for molecule size.
+   Quantify whether the structural localisation and semantic carrier cancellation seen synthetically
+   recur; this no longer reopens the default-estimator choice.
 7. **Functional versus task-level necessity.** Report finite prediction displacement, loss/MAE
    change and any sign changes separately for individual heads and frozen families. A small MAE
    effect with a large functional effect is evidence of redundancy, not failed mediation.
@@ -447,11 +457,12 @@ single ZINC target. The transferable primary design is the **selected-family × 
 The removable standalone Colab is
 `experiments/zinc/analysis/zinc_specialisation_redesign_beta_colab.py`. It analyses the existing
 dense GRIT and parameter-matched 1-hop GRIT checkpoints read-only and confines every write to
-`MyDrive/graph_specialisation_metrics/zinc_redesign_beta_v1`. The old ZINC richness beta is not
+`MyDrive/graph_specialisation_metrics/zinc_redesign_headline_v2`. The old ZINC richness beta and
+the previous redesign output are not
 modified. Expensive products are checkpoint-hash/config-fingerprint bound and restartable at graph,
 event or chunk level.
 
-The implemented protocol is:
+The headline rerun protocol fixes `EG` and `F_sens` before looking at the new results:
 
 - use deterministic, mutually disjoint ZINC test subsets for score discovery, whole-transport
   causal patching and ordinary/family ablation; use a further discovery/confirmation division for
@@ -459,22 +470,54 @@ The implemented protocol is:
 - force dense and 1-hop analyses to use identical graph IDs, semantic donor IDs, PE partners and
   topology donor IDs, and fail if molecular RRWP-derived topology, content or target alignment
   differs across architectures;
-- compute event-level `CG/EG/CN/EN`, averaging donors within source, sources within molecule and
-  molecules equally, with donor-prefix rank convergence, `F_sens/F_coh`, donor outcomes and
-  event-specific distance to `{source}` or `{source, partner}`;
-- compare each aggregation against independent semantic/PE restore effects, necessity and donor
-  convergence; make the cross-architecture winner explicit while retaining every aggregation and
-  CG as the legacy reference;
-- validate raw channel scores and gated `D`, `J` and `G` against held-out restore/inject/necessity,
-  sham and same-size cross-graph mismatch patches; evaluate D-selected, high-J/high-G,
-  topology-responsive and inactive families on the independent ablation split;
-- reconstruct the fixed-support semantic/PE transport delta exactly as routing plus complete-message
-  terms, then patch routing-only, message-only and full transport and report their finite
-  interaction;
-- run a finite, general conditional screen over graph size, cycle rank, atom diversity, common atom
-  presence and source atom class. The rule/head/direction are selected on discovery molecules and
-  graph-bootstrap-confirmed on held-out molecules; this is deliberately a screen, not an exhaustive
-  condition learner.
+- compute all four aggregations as audit fields but use graph-balanced `EG` for every score, family
+  and causal comparison; donors are averaged within source, sources within molecule, then molecules
+  equally;
+- retain semantic real-donor and fixed-mask PE transposition as distinct local channels and add
+  matched-real non-isomorphic topology donors as a third channel. Headline topology comparisons use
+  only strict/near donor tiers and pair the semantic or PE means to the exact same eligible graphs;
+- add semantic-versus-topology score and D/J planes, activity-gated PE-versus-topology comparisons,
+  pooled, layer-controlled and per-layer correlations, top-k overlap and paired graph-bootstrap
+  rank stability;
+- separate topology conclusions by donor tier and edit-dose tertile. Donors are first averaged
+  within molecule before molecules are averaged; the same graph-balancing is used for held-out
+  topology patch effects. Up to six donors are selected by interleaving the best available matches
+  from each tier so the sensitivity analysis does not collapse to the easiest tier; relaxed donors
+  remain excluded from headline scores. The expensive all-head causal sweep uses the best donor in
+  each available tier per molecule, retaining tier coverage without pseudoreplicating near-identical
+  donors;
+- freeze semantic, PE-specific, topology-specific and PE/topology-shared families on score graphs,
+  then patch all heads in each family simultaneously on held-out semantic, PE and topology events.
+  Restore, inject and zero-ablation necessity are accompanied by sham and same-size cross-graph
+  mismatch controls;
+- run individual-head and frozen-family ablations on a third split, and relate all three raw EG
+  scores to functional and loss impact without reopening aggregation selection;
+- decompose transport under every intervention into exact common-support routing and message terms
+  plus an exclusive-support wiring term. Patch each component and the full transport; abort on a
+  failed reconstruction identity;
+- compute final-state production `F_sens` and path-integrated signed beneficial carriage for
+  semantic, PE and topology events using event-specific changed-set distance. Functional curves use
+  shared log limits; signed beneficial curves use shared symmetric-log limits. Endpoint head replay,
+  quadrature convergence and loss completeness are saved diagnostics. The ZINC beta uses the
+  established bounded integrated-carriage policy (`atol=5e-4`, at most 256 intervals): a capped path
+  is retained only when both completeness and carrier errors are at most `5e-3`, and the complete
+  run aborts if capped paths exceed 1%. This prevents one harmless L1/ReLU kink from discarding a
+  long run while keeping numerical failures auditable and fail-closed.
+  Headline topology curves exclude relaxed donors, while tier-specific carriage profiles remain in
+  the machine-readable table;
+- retain carrier distance before the production EG carrier sum. For every channel, compute
+  `S_EG(l,h,b) = E_graph E_source E_event sum_{i in b} ||q_event(l,h,i)||`, and assert that summing
+  distance buckets reconstructs the cached head EG score graph by graph. This is an exact
+  decomposition, not a new score. Semantic bins use source distance, PE bins use distance to the
+  source/partner changed set, topology bins use distance to the edited-node set, disconnected nodes
+  use `unreachable`, and virtual-node transport uses a separate `hub` bucket. Report head-by-distance
+  atlases, reach summaries and frozen-family distance curves aligned with final-state `F_sens` and
+  signed beneficial carriage; interpret these as who implements reach, not direct performance
+  prediction;
+- expand the sample-split conditional screen to raw semantic/PE/topology EG scores, every pairwise
+  D/J/G coordinate and three-channel J/G. Conditions cover clean graph composition/topology and
+  source atom, neighbourhood, degree, cycle and articulation context; confirmation uses a global
+  FDR and reports intervention-dose overlap and spatial concentration changes.
 
 ### Matched-real topology donor in the ZINC beta
 
@@ -496,19 +539,45 @@ Topology remains a separate third structural axis. Its whole-graph dose and inte
 from local semantic/PE events, so it is not inserted into PE-based `D`. Adoption requires adequate
 tier-1/2 coverage and held-out score-to-topology-patch validity; PE/topology head agreement is measured
 but is not required, because a useful topology probe may expose wiring reliance that PE transposition
-cannot. Routing/message is not forced onto topology events with changed support: wiring is an explicit
-third contribution.
+cannot. Topology events are never forced into a two-way fixed-support account: routing and message
+are defined only on common directed pairs, with exclusive clean/corrupt support reported as an
+explicit wiring contribution.
 
-The notebook emits eleven paper figure families (PNG and PDF), machine-readable head/causal/topology
+The notebook emits thirteen paper figure families (PNG and PDF), machine-readable head/causal/topology
 tables and a predeclared decision report. It also records a current limitation: Drive contains one
 checkpoint per architecture for this comparison. Graph bootstraps quantify evaluation-sample
 uncertainty, not training-seed uncertainty, so decisions are concrete for this beta but remain subject
 to revision if independently trained ZINC seeds disagree.
 
-## Decisions to make after ZINC
+Score estimation is restartable at three levels: every completed source/event group is saved, then
+every completed intervention channel, then the assembled graph. A cumulative integrated-carriage
+audit is also written after each graph. Thus an interruption or later-channel error does not repeat
+completed semantic/PE/topology integrations.
 
-- **Aggregation:** retain CG unless another aggregation improves held-out patch and ablation validity,
-  rank stability and seed replication without worse noise-floor behaviour.
+### Headline rerun decision priorities
+
+1. Treat PE and topology as complementary only if strict/near donors have useful coverage, topology
+   EG predicts held-out topology patching, and PE-specific/topology-specific/shared families are
+   stable under graph bootstrap and show the expected three-channel patch interactions.
+2. If PE and topology agree globally but stable off-diagonal families exist, retain two structural
+   axes; high pooled correlation is not evidence that the interventions are interchangeable. If the
+   purported specific families are unstable or fail held-out patching, retain topology only as an
+   intervention-validity diagnostic.
+3. Read tier/dose reversals as intervention-distribution dependence. Do not merge topology into the
+   production PE score or D denominator unless conclusions survive common-tier/common-dose support.
+4. Require exact support-aware reconstruction before interpreting routing/message/wiring fractions.
+   Functional displacement, loss change and rescue remain separate endpoints because redundancy can
+   preserve MAE after a mechanistically important family is removed.
+5. Conditional effects are promoted only when the frozen feature/rule/head direction replicates on
+   confirmation graphs with global-FDR control and acceptable dose overlap. Otherwise the expanded
+   screen remains hypothesis generation for a later multi-seed experiment.
+
+## Firm and remaining decisions after ZINC
+
+- **Aggregation — firm:** use graph-balanced EG for production `S_sem/S_str`, and therefore for
+  derived `D`, `J` and `G`. Save graph-balanced CG as a coherence/legacy diagnostic; CN and EN remain
+  validation estimands rather than production alternatives. This decision is now implemented in the
+  central scorer and methodology README.
 - **Selectivity:** retain D only as a gated relative-role coordinate if its sign and causal-role
   association replicate within layers; otherwise use the two raw scores plus J/G and report D only
   descriptively.
@@ -521,7 +590,14 @@ to revision if independently trained ZINC seeds disagree.
   confirmation for specialist labels; ablation alone remains insufficient.
 - **Mechanism:** retain routing/message labels only when both exact reconstruction and finite component
   patching agree. Treat wiring as a third component for topology-changing interventions.
-- **Carriage:** retain `F_sens`, `F_coh` and coherence/distance diagnostics if their synthetic
-  distinctions reproduce; keep beneficial carriage as the complete signed loss attribution.
+- **Carriage — firm and implemented:** use `F_sens` as the functional-carriage field aligned with EG;
+  retain `F_coh` and their ratio as coherence/cancellation diagnostics. Existing `F`/`F_mean`
+  artifact keys are compatibility aliases for `F_sens`, and functional-carriage version 2 prevents
+  reuse of coherent-default progress. Keep beneficial carriage as the complete signed loss attribution.
+- **Distance-resolved specialisation — exact and implemented in beta:** decompose EG by the
+  event-specific carrier distance before summing over carriers, with graphwise reconstruction as a
+  fatal identity check. Use the resulting head/family reach profiles to explain which mechanisms
+  implement `F_sens`/beneficial reach; do not treat them as an additional specialist score or as a
+  direct performance predictor. Keep `unreachable` and virtual-node `hub` buckets explicit.
 - **Conditional labels:** approve only conditions that replicate under frozen rules, adequate support
   and multiplicity control. Otherwise retain conditional analysis as exploratory.

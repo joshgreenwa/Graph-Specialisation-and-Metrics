@@ -228,15 +228,18 @@ class _PerGraphChannelCollector:
         self.scores: dict[str, dict[int, np.ndarray]] = {"semantic": {}, "structural": {}}
 
     def __call__(self, *, channel, graph_id, source_nodes, phi_stack,
-                 donor_averaged_delta, **_):
+                 donor_averaged_delta, eventwise_functional=None, **_):
         if channel not in self.scores:
             return
         import torch
 
         layers = []
-        for phi, delta in zip(phi_stack, donor_averaged_delta):
-            projected = torch.einsum("tnhd,snhd->tsnh", phi, delta)
-            functional = projected.square().sum(dim=0).sqrt()  # [source, carrier, head]
+        for layer, (phi, delta) in enumerate(zip(phi_stack, donor_averaged_delta)):
+            if eventwise_functional is None:
+                projected = torch.einsum("tnhd,snhd->tsnh", phi, delta)
+                functional = projected.square().sum(dim=0).sqrt()
+            else:
+                functional = eventwise_functional[layer]
             layers.append(functional.sum(dim=(0, 1)).detach().cpu().numpy())
         self.scores[channel][int(graph_id)] = np.stack(layers) / max(len(source_nodes), 1)
 

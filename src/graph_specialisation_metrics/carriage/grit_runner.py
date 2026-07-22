@@ -474,7 +474,9 @@ def run_grit_carriage(task, cc: CarriageConfig) -> dict:
     log(f"[select] {n_graphs} {cc.eval_split} graphs ({cc.graph_select}, seed={cc.analysis_seed}), K={K}.")
 
     # ---- accumulators -----------------------------------------------------------------
-    all_gid, all_i, all_j, all_d, all_C, all_B, all_F = [], [], [], [], [], [], []
+    all_gid, all_i, all_j, all_d, all_C, all_B, all_F, all_F_coh = (
+        [], [], [], [], [], [], [], []
+    )
     add_sumC, add_dyhat = [], []
     g_spread_max = noop_max_dh = batchinv_max = bexact_max = 0.0
     integrated_replay_max = integrated_full_loss_delta_max = 0.0
@@ -486,6 +488,7 @@ def run_grit_carriage(task, cc: CarriageConfig) -> dict:
     progress_path = out_dir / ".semantic_carriage_progress.npz"
     progress_fingerprint = {
         "kind": "semantic_carriage",
+        "functional_carriage_version": core.FUNCTIONAL_CARRIAGE_VERSION,
         "task": task.name,
         "checkpoint": progress.checkpoint_identity(ckpt_path),
         "graph_ids": graph_ids.tolist(),
@@ -508,6 +511,7 @@ def run_grit_carriage(task, cc: CarriageConfig) -> dict:
             all_j = _restore_parts(a, "j"); all_d = _restore_parts(a, "d")
             all_C = _restore_parts(a, "C"); all_B = _restore_parts(a, "B")
             all_F = _restore_parts(a, "F")
+            all_F_coh = _restore_parts(a, "F_coh")
             add_sumC = _restore_parts(a, "sumC"); add_dyhat = _restore_parts(a, "dyhat")
             integrated_residual = _restore_parts(a, "ig_residual")
             integrated_qerr = _restore_parts(a, "ig_qerr")
@@ -543,6 +547,7 @@ def run_grit_carriage(task, cc: CarriageConfig) -> dict:
                 "C": progress.concat(all_C, dtype=np.float64),
                 "B": progress.concat(all_B, dtype=np.float64),
                 "F": progress.concat(all_F, dtype=np.float64),
+                "F_coh": progress.concat(all_F_coh, dtype=np.float64),
                 "sumC": progress.concat(add_sumC, dtype=np.float64),
                 "dyhat": progress.concat(add_dyhat, dtype=np.float64),
                 "ig_residual": progress.concat(integrated_residual, dtype=np.float64),
@@ -763,9 +768,10 @@ def run_grit_carriage(task, cc: CarriageConfig) -> dict:
         L_swap = metrics.per_graph_loss(pred_swap, true_vec.expand(R, -1), loss_fun).cpu().numpy()  # [R]
         dL_full_j = L_clean - L_swap.reshape(S, K).mean(axis=1)        # [S]  <0 = beneficial
 
-        # functional carriage F[i,j] = ||dŷ from i|| over T outputs (label-free);
+        # Functional carriage is eventwise sensitivity: average ||dŷ|| after taking each
+        # donor's output norm. F_coh retains the norm-after-donor-average diagnostic.
         # loss carriage C_loss[i,j] = g_loss_i . dh_i(j) (beneficial-carriage basis).
-        F_ij = core.functional_magnitude_from_delta(delta, g_out, S, K)          # [n, n], >=0
+        F_ij, F_coh_ij = core.functional_magnitudes_from_delta(delta, g_out, S, K)
         C_loss = core.carriage_from_delta(delta, g_loss, S, K).cpu().numpy()      # [n, n]
         if integrated:
             # Integrate each donor path first; only then marginalise donor identity.
@@ -833,6 +839,7 @@ def run_grit_carriage(task, cc: CarriageConfig) -> dict:
         all_C.append(C_loss[finite].astype(np.float64))
         all_B.append(B[finite].astype(np.float64))
         all_F.append(F_ij[finite].astype(np.float64))
+        all_F_coh.append(F_coh_ij[finite].astype(np.float64))
 
         del delta, pred_swap
         if integrated:
@@ -852,7 +859,8 @@ def run_grit_carriage(task, cc: CarriageConfig) -> dict:
     pd_ = np.concatenate(all_d)
     pC = np.concatenate(all_C)      # signed loss-carriage C_loss (beneficial basis)
     pB = np.concatenate(all_B)
-    F = np.concatenate(all_F)       # functional carriage magnitude ||dŷ||
+    F = np.concatenate(all_F)       # F_sens: mean_k ||q_k||
+    F_coh = np.concatenate(all_F_coh)  # ||mean_k q_k||, cancellation diagnostic
 
     # ---- verification summary ---------------------------------------------------------
     tol = cc.tol
@@ -1018,6 +1026,8 @@ def run_grit_carriage(task, cc: CarriageConfig) -> dict:
         "val_metric": checks.get("val_metric"), "val_metric_name": checks.get("val_metric_name"),
         "paper_metric": task.paper_metric, "loss_units": metrics.loss_units(loss_fun),
         "beneficial_denom": cc.beneficial_denom,
+        "functional_estimand": core.FUNCTIONAL_CARRIAGE_ESTIMAND,
+        "functional_carriage_version": core.FUNCTIONAL_CARRIAGE_VERSION,
     }
     if integrated:
         meta.update({
@@ -1034,7 +1044,7 @@ def run_grit_carriage(task, cc: CarriageConfig) -> dict:
     return {
         "graph_id": gid,
         "carrier_i": np.concatenate(all_i), "source_j": np.concatenate(all_j),
-        "distance": pd_, "C": pC, "B": pB, "F": F,
+        "distance": pd_, "C": pC, "B": pB, "F": F, "F_coh": F_coh,
         "additivity_sumC": a_sumC, "additivity_dyhat": a_dyhat,
         "checks": checks, "meta": meta,
     }

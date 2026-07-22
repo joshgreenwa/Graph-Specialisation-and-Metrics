@@ -1065,9 +1065,9 @@ def transport_head_scores(
 ) -> Any:
     """Repository Method A on the sole intervened source, returning ``[L,H]`` scores.
 
-    The clean replica and all nuisance donors share a forward.  Readout gradients are taken at
-    the clean routed ``wV``.  Donor transport is averaged before its magnitude, exactly as in
-    ``specialisation.scores._funcmag_contrib``.
+    The clean replica and all nuisance donors share a forward. Readout gradients are taken at
+    the clean routed ``wV``. This isolated synthetic control retains the historical coherent-gross
+    aggregation; central production specialisation now uses eventwise-gross.
     """
     import torch
 

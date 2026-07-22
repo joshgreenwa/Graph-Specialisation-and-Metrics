@@ -31,10 +31,10 @@ from . import ablation as ablation_mod
 from . import attention_viz, figures
 from . import channel_ablation as channel_ablation_mod
 from .model import SpecConfig
-from .scores import score_model, select_heads
+from .scores import SCORE_AGGREGATION, score_model, select_heads
 
 
-SCORE_CACHE_VERSION = 2  # v2 includes global-VNode rows in per-head transport scores
+SCORE_CACHE_VERSION = 3  # v3 makes graph-balanced eventwise-gross (EG) the production score
 
 DEFAULT_COLLATE_DIR = "/content/drive/MyDrive/graph_specialisation_metrics/specialisation_figures"
 
@@ -183,12 +183,14 @@ def run(
             attn = attention_viz.collect_attention(result["gm"], mol_ids, list(hoi.values()),
                                                    seed=analysis_seed)
 
-        # --- persist per-task artefacts (Drive). The scores_<task>.npz S_sem/S_str [L,H]
-        #     matrices are the per-head cache the cross-model deliverables consume. ---
+        # --- persist per-task artefacts (Drive). S_sem/S_str are production EG [L,H];
+        #     graph-balanced CG companions are retained for coherence/legacy diagnostics. ---
         savez_kw = dict(
             S_sem=result["S_sem"], S_str=result["S_str"],
+            S_sem_CG=result["S_sem_CG"], S_str_CG=result["S_str_CG"],
             S_attn_sem=(result["S_attn_sem"] if result["S_attn_sem"] is not None
                         else np.zeros_like(result["S_sem"])),
+            score_aggregation=np.asarray(SCORE_AGGREGATION),
             score_cache_version=np.asarray(SCORE_CACHE_VERSION, dtype=np.int64),
         )
         if abl is not None:
@@ -212,6 +214,7 @@ def run(
             "test_metric_name": result["test_metric_name"],
             "val_metric": result.get("val_metric"), "val_metric_name": result.get("val_metric_name"),
             "num_graphs": result["num_graphs"], "donors_K": result["donors_K"],
+            "score_aggregation": SCORE_AGGREGATION,
             "score_cache_version": SCORE_CACHE_VERSION,
             "checks": result["checks"], "attention_molecules": mol_ids,
         }

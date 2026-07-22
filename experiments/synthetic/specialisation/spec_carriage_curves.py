@@ -2,7 +2,8 @@
 
 Uses the precise repo methodology UNCHANGED -- imports the estimators straight from
 `graph_specialisation_metrics.carriage.core` (pure numpy/torch, no GraphGym dependency):
-  * functional carriage  F[i,j] = ||C_out[i,j]||   (core.functional_magnitude_from_delta, g=∂ŷ/∂h^L)
+  * functional carriage  F_sens[i,j] = mean_k ||q[k,i,j]||
+                          (core.functional_magnitude_from_delta, g=∂ŷ/∂h^L)
   * loss carriage        C_loss = core.carriage_from_delta(delta, g_loss),  g_loss = ∂|ŷ−y|/∂h^L
   * beneficial carriage  B      = core.beneficial_attribute(C_loss, dL_j, denom='slope')
                                   dL_j = L_clean − mean_k L_swap(j,k)   (exact, L1 loss)
@@ -178,8 +179,8 @@ def main(out_path=None):
     # ---- figure: 4 rows (F-sem, F-str, B-sem, B-str) x 2 cols (tasks) ----
     plt.rcParams.update({"font.size": 10, "axes.grid": True, "grid.alpha": 0.25, "axes.axisbelow": True, "figure.dpi": 140})
     STY = {"dense": dict(color="#1f77b4", marker="o"), "1-hop": dict(color="#d62728", marker="^")}
-    ROWS = [("F", "semantic", "Functional $F(d)$ · semantic channel (donor swap)"),
-            ("F", "structural", "Functional $F(d)$ · structural channel (transposition)"),
+    ROWS = [("F", "semantic", "Functional $F_{sens}(d)$ · semantic channel (donor swap)"),
+            ("F", "structural", "Functional $F_{sens}(d)$ · structural channel (transposition)"),
             ("B", "semantic", "Beneficial $B(d)$ · semantic channel (donor swap)"),
             ("B", "structural", "Beneficial $B(d)$ · structural channel (transposition)")]
     fig, axes = plt.subplots(4, 2, figsize=(11.5, 15.0), constrained_layout=True)
@@ -197,7 +198,7 @@ def main(out_path=None):
                 ax.axhline(0, color="k", lw=0.7, ls="--")
             ax.set_xticks(xr["bin_center"]); ax.set_xticklabels(xr["bin_label"])
             ax.set_xlabel("shortest-path distance  d(readout, source)")
-            ax.set_ylabel("functional $F$" if metric == "F" else "beneficial $B$  ($<0$ helps)")
+            ax.set_ylabel("functional $F_{sens}$" if metric == "F" else "beneficial $B$  ($<0$ helps)")
             if ri == 0:
                 ax.set_title(f"{TASK_LABELS.get(t, t)} task", fontsize=12, fontweight="bold")
             ax.annotate(rlab, xy=(0.97, 0.97), xycoords="axes fraction", ha="right", va="top", fontsize=9,
@@ -205,7 +206,7 @@ def main(out_path=None):
 
     handles = [Line2D([0], [0], **STY[v], lw=1.8, ms=6, label=v) for v in VARIANTS]
     fig.legend(handles=handles, loc="upper center", ncol=2, frameon=False, bbox_to_anchor=(0.5, 1.015), fontsize=11)
-    fig.suptitle("Official carriage distance curves — functional $F(d)$ and beneficial $B(d)$  "
+    fig.suptitle("Official carriage distance curves — functional $F_{sens}(d)$ and beneficial $B(d)$  "
                  "(semantic & structural channels, dense vs 1-hop)", fontsize=12.5, y=1.035)
     fig.text(0.5, -0.04, "Repo /carriage/ estimators (core.py) applied verbatim: donor swap (semantic channel) and full node "
              "transposition incl. mask (structural channel);  g=∂ŷ/∂h$^L$ functional, g=∂|ŷ−y|/∂h$^L$ + exact dL beneficial;  "

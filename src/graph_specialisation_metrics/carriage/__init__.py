@@ -9,8 +9,9 @@ secret) and call ``carriage.colab.run(task=...)``, so edits here propagate to ev
     run(task="zinc")
 
 Supports scalar regression (ZINC), multi-target regression, and multilabel classification
-(Peptides-func) uniformly: functional carriage = magnitude of the output movement over the
-T outputs; beneficial carriage = the task-loss change attributed to carriers either by a
+(Peptides-func) uniformly: functional carriage = the mean eventwise magnitude of the output
+movement over the T outputs (``F_sens``; ``F_coh`` is retained diagnostically); beneficial
+carriage = the task-loss change attributed to carriers either by a
 signed final-state path integral (finite intervention) or by retained comparison estimators.
 
 Layout:

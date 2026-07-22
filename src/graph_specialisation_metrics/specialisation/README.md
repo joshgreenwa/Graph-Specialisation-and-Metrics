@@ -1,9 +1,9 @@
 # Per-head specialisation scores on GRIT (central methodology)
 
-The productionised version of the specialisation-score methodology
-(`experiments/synthetic/specialisation/SPECIALISATION_SCORES.md`), lifted from the spec-lite
-`Net` onto the **real GRIT transformer**. A notebook clones the repo and calls `run(...)`;
-everything below runs from there.
+The production specialisation-score methodology on the **real GRIT transformer**. It originated
+from the spec-lite method in `experiments/synthetic/specialisation/SPECIALISATION_SCORES.md`, but
+the production estimator is now the graph-balanced **eventwise-gross (EG)** score defined below.
+A notebook clones the repo and calls `run(...)`; everything below runs from there.
 
 ```python
 from graph_specialisation_metrics.specialisation import run
@@ -19,7 +19,8 @@ registered in `carriage/tasks.py`. Nothing here is ZINC-specific:
   cfg, so it adapts to each checkpoint.
 - **Output shape** is general: for `T > 1` (multi-target regression like peptides-struct, or
   multilabel classification like peptides-func) the per-head score uses the functional MAGNITUDE
-  `sqrt(sum_t (phi_t . Dbar-o)^2)` over the T readout gradients (for `T = 1` this is `|phi . Dbar-o|`),
+  `sqrt(sum_t (phi_t . Delta-o_k)^2)` per event over the T readout gradients (for `T = 1` this is
+  `|phi . Delta-o_k|`),
   and the ablation impact uses the task loss (`l1` / `mse` / BCE) via `carriage.metrics`.
 - **Content shape** is general: the semantic swap uses the task's `content_adapter` (whole `x` row
   — ZINC atom type or OGB's 9 atom features); figures/features use the first content column.
@@ -45,9 +46,9 @@ per-head **transport site**
     o^{lh}_i = batch.wV[i, h, :]              # the message head (l,h) delivers to node i
 
 (`grit/layer/grit_layer.py`; `wV = Σ_j a^{lh}_{i<-j} · V x_j` plus the edge-enhance term). The
-per-head readout gradient `φ^{lh}_i = ∂ŷ/∂o^{lh}_i` is a single `autograd.grad` at the clean
-input. Both interventions come straight from the carriage vocabulary and feed the identical
-estimator (donor/partner-average the transport delta **before** the abs — Jensen at the kink):
+per-head readout gradients `φ^{lh}_{t,i} = ∂ŷ_t/∂o^{lh}_i` are computed at the clean
+input. Both interventions come straight from the carriage vocabulary and feed the identical EG
+estimator: take magnitude for each donor/partner event, then average events.
 
 - **Semantic** — donor swap (`carriage.content`): overwrite node `j`'s atom type with a real
   donor row from another molecule, structure (RRWP, mask) held fixed.
@@ -64,19 +65,59 @@ while the score measures semantic/structural signal transported through the head
 For a **global-VNode** model, the VNode is included as an internal carrier in `S_sem/S_str` (its
 earlier-layer head output can affect later real nodes even though its final state is excluded from
 pooling). Attention-routing scores remain disabled for VNode runs because virtual-edge slots are
-not a comparable graph-edge support. Score-cache version 2 records this complete VNode transport;
-older VNode score caches must be recomputed, but ordinary dense/k-hop caches remain valid.
+not a comparable graph-edge support. Score-cache version 3 records graph-balanced EG production
+scores; every older CG-default score cache must be recomputed.
 
 ```
-F^{lh}[i, s] = | φ^{lh}_i · Δ̄o^{lh}_i(s) |
-S_sem(l,h)   = mean_{graph, j}  Σ_i F   under the semantic donor swap
-S_str(l,h)   = mean_{graph, u}  Σ_i F   under the structural transposition
+q_k^{lh}[i,s] = (φ_{t,i}^{lh} · Δo_{k,i}^{lh}(s))_{t=1..T}
+
+S_EG^{lh} = mean_graph mean_source mean_k Σ_i ||q_k^{lh}[i,s]||
+S_CG^{lh} = mean_graph mean_source Σ_i ||mean_k q_k^{lh}[i,s]||
 ```
+
+`S_sem` and `S_str` mean `S_EG` for their respective intervention channels. **EG is the firm
+production choice.** It estimates the expected output-relevant transport response to a typical
+valid event. Taking magnitude before event averaging prevents legitimate donor/partner responses
+in opposite directions from cancelling; summing carrier magnitudes preserves internal signal even
+when different carriers cancel at the final output. This matches the purpose of the score—identify
+heads that carry channel-specific signal—while held-out patching and ablation test whether that
+signal is causally used.
+
+Aggregation is hierarchical and graph-balanced: average events within source, sources within
+graph, and graphs equally. `S_sem_CG` and `S_str_CG` remain saved as coherence/legacy diagnostics;
+CG/CN/EN are not alternative production defaults. Close EG and CG results mean the event
+population is coherent, not that signed events should be averaged first.
+
+The matching primary functional-carriage field is
+`F_sens[i,s] = mean_k ||q_k[i,s]||`; coherent carriage
+`F_coh[i,s] = ||mean_k q_k[i,s]||` remains a cancellation diagnostic.
+
+### Exact distance decomposition of the production score
+
+For reach analysis, retain carrier distance before EG sums over carriers:
+
+```
+S_EG^{lh}(b) = mean_graph mean_source mean_k
+               sum_{i: d(i, changed_set_k) in b} ||q_k^{lh}[i,s]||
+
+S_EG^{lh} = sum_b S_EG^{lh}(b)
+```
+
+This is an accounting decomposition of the established score, not a new score or an estimator
+choice. The event magnitude must remain *inside* the donor average: replacing it with
+`||mean_k q_k||` would instead decompose CG, not the production EG score. Semantic distance is to
+the swapped source; PE-transposition distance is to the source/partner changed set; topology-donor
+distance is to the edited-node set. Disconnected real carriers use an `unreachable` bucket and
+VNode transport uses its own `hub` bucket, so summing all buckets reconstructs the full score.
+Distance-resolved results explain which heads implement an intervention's reach profile; final-state
+`F_sens` and signed beneficial carriage remain the functional-reach and task-usage endpoints.
 
 A complementary **attention-routing** (selection-site) score is reported for the **semantic**
 intervention only — a content swap keeps the edge set fixed so the per-edge attention slots stay
 aligned across replicas; a structural transposition relabels edges, so the selection score is not
-slot-comparable and is omitted (transport is the primary readout on both sides).
+slot-comparable and is omitted (transport is the primary readout on both sides). This secondary
+attention score remains coherent/donor-averaged and must not be confused with production EG
+transport scores.
 
 The transport delta uses a **within-batch clean baseline** (replica 0 of every forward chunk),
 exactly like `carriage.grit_runner`, so a no-op donor / self-transposition gives ~0 and the

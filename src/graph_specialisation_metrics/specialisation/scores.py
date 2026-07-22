@@ -3,11 +3,12 @@
 Lifts ``spec_head_scores.score_model`` (the spec-lite ``Net``) onto GRIT, reading at the
 per-head TRANSPORT site  o^{lh}_i = ``batch.wV``  [n, H, dh]  (``model.GritHeadModel``):
 
-  METHOD A -- SEPARATE INTERVENTION, read as per-head carriage (SPECIALISATION_SCORES.md):
+  METHOD A -- SEPARATE INTERVENTION, read as per-head carriage:
     phi^{lh}_i = d yhat / d o^{lh}_i                          (per-head readout grad, clean input)
-    F^{lh}[i,s] = | phi^{lh}_i . Dbar-o^{lh}_i(s) |           (donor/partner-averaged transport delta)
-    S_sem(l,h)  = mean_{graph, j}  sum_i F   under the SEMANTIC donor swap (carriage.content)
-    S_str(l,h)  = mean_{graph, u}  sum_i F   under the STRUCTURAL transposition (RRWP-feature channel,
+    q_k^{lh}[i,s] = phi^{lh}_i . Delta-o_k^{lh}_i(s)
+    F_sens^{lh}[i,s] = mean_k ||q_k^{lh}[i,s]||
+    S_sem(l,h)  = mean_graph mean_j sum_i F_sens under the SEMANTIC donor swap
+    S_str(l,h)  = mean_graph mean_u sum_i F_sens under the STRUCTURAL transposition (RRWP-feature channel,
                   ``_perturb_mask_frozen``): conjugate the RRWP payload (rrwp/rrwp_index/val/deg/
                   log_deg) but FREEZE the attention mask (edge_index/edge_attr). SPECIALISATION_SCORES.md
                   requires the k-hop mask be held fixed; conjugating it (as a full relabel would) would
@@ -21,9 +22,13 @@ per-head TRANSPORT site  o^{lh}_i = ``batch.wV``  [n, H, dh]  (``model.GritHeadM
     S_attn_sem(l,h) = mean_{graph, j}  sum_e | Dbar-a^{lh}_e(j) |    (donor-avg the attention delta,
                       then abs -- Jensen at the softmax, mirroring the transport recipe).
 
-Both interventions feed the IDENTICAL estimator; the transport delta uses a WITHIN-BATCH clean
-baseline (replica 0 of every chunk) exactly as ``carriage.grit_runner``, so a no-op donor / self
-transposition gives ~0 and the batch-context float32 offset cancels.
+The production aggregation is eventwise-gross (EG): take output-vector magnitude per intervention
+event, sum carrier magnitudes, then average events within source, sources within graph and graphs
+equally. This avoids both donor-direction and carrier cancellation. Graph-balanced coherent-gross
+(CG) matrices are retained as diagnostics. Both interventions feed the IDENTICAL estimator; the
+transport delta uses a WITHIN-BATCH clean baseline (replica 0 of every chunk) exactly as
+``carriage.grit_runner``, so a no-op donor / self-transposition gives ~0 and the batch-context
+float32 offset cancels.
 """
 
 from __future__ import annotations
@@ -37,6 +42,9 @@ from .. import progress
 from ..carriage import structural
 from ..carriage.env import log
 from .model import GritHeadModel, SpecConfig
+
+
+SCORE_AGGREGATION = "EG"
 
 
 def _perturb_mask_frozen(base, u: int, v: int):
@@ -77,6 +85,20 @@ def _funcmag_contrib(phi_stack_l, dob):
     c = torch.einsum("tnhd,snhd->tsnh", phi_stack_l, dob)   # [T, S, n, H]
     F = (c * c).sum(0).sqrt()                               # [S, n, H] magnitude over outputs
     return F.sum(dim=(0, 1))                                # [H]
+
+
+def _eventwise_functional(phi_stack_l, delta):
+    """Return output-magnitude projection for each event and carrier.
+
+    ``phi_stack_l`` is ``[T,N,H,D]`` and ``delta`` is ``[K,N,H,D]``.  The result
+    is ``[K,N,H]`` with magnitude over outputs only; callers retain events and
+    carriers until the EG hierarchy has been applied.
+    """
+
+    import torch
+
+    projected = torch.einsum("tnhd,knhd->ktnh", phi_stack_l, delta)
+    return torch.linalg.vector_norm(projected, dim=1)
 
 
 def select_heads(S_sem, S_str) -> dict:
@@ -123,7 +145,7 @@ def score_model(task, sc: SpecConfig, *, with_attn_routing: bool = True,
                 max_sources: int | None = None, seed: int = 0,
                 response_observer=None, graph_ids_override=None,
                 channels=("semantic", "structural"), loaded_gm=None) -> dict:
-    """Return per-head {S_sem, S_str, S_attn_sem} [L,H] for one loaded GRIT checkpoint + diagnostics."""
+    """Return graph-balanced EG ``S_sem/S_str`` [L,H] plus CG diagnostics."""
     import torch
     from torch_geometric.data import Batch
 
@@ -167,7 +189,9 @@ def score_model(task, sc: SpecConfig, *, with_attn_routing: bool = True,
         f"max_sources={max_sources}.")
 
     S_sem = np.zeros((L, H)); S_str = np.zeros((L, H)); S_attn = np.zeros((L, H))
+    S_sem_CG = np.zeros((L, H)); S_str_CG = np.zeros((L, H))
     tot_sem_sources = tot_str_anchors = tot_attn_sources = 0
+    tot_sem_graphs = tot_str_graphs = tot_attn_graphs = 0
     noop_max = relabel_inv_max = softmax_err = 0.0
     mask_frozen_ok = False        # did the mask-freeze actually neutralise an edge_index relabel?
     T = 1                         # #outputs (set from the first graph; 1 for ZINC scalar regression)
@@ -183,6 +207,8 @@ def score_model(task, sc: SpecConfig, *, with_attn_routing: bool = True,
         "config": {k: v for k, v in vars(sc).items()
                    if k not in {"content_adapter", "resume", "checkpoint_every"}},
         "with_attn_routing": bool(with_attn_routing),
+        "score_aggregation": SCORE_AGGREGATION,
+        "graph_balanced": True,
         "channels": list(channels),
         "max_sources": max_sources,
         "seed": int(seed),
@@ -196,10 +222,15 @@ def score_model(task, sc: SpecConfig, *, with_attn_routing: bool = True,
             a, s = saved["arrays"], saved["scalars"]
             S_sem = np.asarray(a["S_sem"], dtype=float)
             S_str = np.asarray(a["S_str"], dtype=float)
+            S_sem_CG = np.asarray(a["S_sem_CG"], dtype=float)
+            S_str_CG = np.asarray(a["S_str_CG"], dtype=float)
             S_attn = np.asarray(a["S_attn"], dtype=float)
             tot_sem_sources = int(s["tot_sem_sources"])
             tot_str_anchors = int(s["tot_str_anchors"])
             tot_attn_sources = int(s["tot_attn_sources"])
+            tot_sem_graphs = int(s["tot_sem_graphs"])
+            tot_str_graphs = int(s["tot_str_graphs"])
+            tot_attn_graphs = int(s["tot_attn_graphs"])
             noop_max = float(s["noop_max"])
             relabel_inv_max = float(s["relabel_inv_max"])
             softmax_err = float(s["softmax_err"])
@@ -216,11 +247,16 @@ def score_model(task, sc: SpecConfig, *, with_attn_routing: bool = True,
         progress.save_progress(
             progress_path, fingerprint=progress_fingerprint, next_index=next_index,
             rng_state=rng.bit_generator.state,
-            arrays={"S_sem": S_sem, "S_str": S_str, "S_attn": S_attn},
+            arrays={"S_sem": S_sem, "S_str": S_str,
+                    "S_sem_CG": S_sem_CG, "S_str_CG": S_str_CG,
+                    "S_attn": S_attn},
             scalars={
                 "tot_sem_sources": tot_sem_sources,
                 "tot_str_anchors": tot_str_anchors,
                 "tot_attn_sources": tot_attn_sources,
+                "tot_sem_graphs": tot_sem_graphs,
+                "tot_str_graphs": tot_str_graphs,
+                "tot_attn_graphs": tot_attn_graphs,
                 "noop_max": noop_max, "relabel_inv_max": relabel_inv_max,
                 "softmax_err": softmax_err, "mask_frozen_ok": mask_frozen_ok, "T": T,
             },
@@ -238,9 +274,9 @@ def score_model(task, sc: SpecConfig, *, with_attn_routing: bool = True,
 
         # ---- clean forward (batch-of-1, grad): phi_t^{lh}_i = d yhat_t / d wV_l ---------
         # Task-general: for T>1 outputs (multi-target regression / multilabel classification)
-        # we keep one readout gradient per output and combine as the functional MAGNITUDE
-        # F = sqrt(sum_t (phi_t . Dbar-o)^2), exactly carriage.core.functional_magnitude. For a
-        # scalar target (T=1, ZINC) this reduces to |phi . Dbar-o|.
+        # we keep one readout gradient per output and combine each event as the functional
+        # magnitude sqrt(sum_t (phi_t . Delta-o_k)^2). For a scalar target this reduces to
+        # |phi . Delta-o_k|.
         cb = Batch.from_data_list([base]).to(device)
         cap = gm.capture(cb, want_grad=True, want_attn=attn_enabled,
                          include_virtual_transport=has_vnode)
@@ -260,12 +296,10 @@ def score_model(task, sc: SpecConfig, *, with_attn_routing: bool = True,
             phi_stack.append(stacked)
         del grads_t
 
-        # Effective per-graph source cap. The score is a POOLED mean over measured (graph, source)
-        # pairs (denominator = total sources), so subsampling sources on large-graph tasks (e.g.
-        # peptides, n up to ~450) is an unbiased estimate of that pooled mean. NB: when capping is
-        # active, large graphs contribute cap_S (not n) sources, so their per-source weight is the
-        # same as a small graph's -- a mild reweighting vs the uncapped pooled mean, never a bias
-        # in the estimator. Bounds the transport accumulator dObar[L] = [S,n,H,dh]*4B to ~2 GiB;
+        # Effective per-graph source cap. Sources are averaged within each graph before graphs are
+        # averaged equally, so source subsampling estimates that graph's source mean without making
+        # large molecules dominate the dataset-level score. Bounds the transport accumulator
+        # dObar[L] = [S,n,H,dh]*4B to ~2 GiB;
         # an explicit max_sources always wins. Logged, never silent.
         if max_sources is not None:
             cap_S = min(int(max_sources), n)
@@ -314,6 +348,7 @@ def score_model(task, sc: SpecConfig, *, with_attn_routing: bool = True,
         flat_donor = donor_content.reshape(R, F_feat)
 
         dObar = [torch.zeros(S, n_carriers, H, dh, device=device) for _ in range(L)]
+        eventwise_F = [torch.zeros(S, n_carriers, H, device=device) for _ in range(L)]
         dAbar = ([torch.zeros(S, E, H, device=device) for _ in range(L)]
                  if graph_attn else None)
 
@@ -346,6 +381,9 @@ def score_model(task, sc: SpecConfig, *, with_attn_routing: bool = True,
                 wv = cc["wV"][l].view(m + 1, n_carriers, H, dh)
                 delta = wv[0:1] - wv[1:]                          # [m, carrier, H, dh]
                 dObar[l].index_add_(0, reps_src, delta)
+                eventwise_F[l].index_add_(
+                    0, reps_src, _eventwise_functional(phi_stack[l], delta)
+                )
                 if graph_attn:
                     assert cc["attn"][l].shape[0] == (m + 1) * E, "attention replica reshape mismatch"
                     at = cc["attn"][l].view(m + 1, E, H)
@@ -360,22 +398,30 @@ def score_model(task, sc: SpecConfig, *, with_attn_routing: bool = True,
             r0 += m
 
         for l in range(L):
-            S_sem[l] += _funcmag_contrib(phi_stack[l], dObar[l] / K).cpu().numpy()
+            # EG: average events within source, then sources within this graph.
+            S_sem[l] += (eventwise_F[l] / K).sum(dim=1).mean(dim=0).cpu().numpy()
+            # Graph-balanced CG is retained only as a coherence/legacy diagnostic.
+            S_sem_CG[l] += (
+                _funcmag_contrib(phi_stack[l], dObar[l] / K) / max(S, 1)
+            ).cpu().numpy()
             if graph_attn:
                 da = (dAbar[l] / K).abs().sum(dim=1)             # [S, H]  sum_e |Dbar-a|
-                S_attn[l] += da.sum(0).cpu().numpy()
+                S_attn[l] += da.mean(0).cpu().numpy()
         if response_observer is not None:
             response_observer(
                 channel="semantic", graph_id=int(gi), base=base,
                 source_nodes=np.asarray(sources, dtype=np.int64),
                 phi_stack=phi_stack, donor_averaged_delta=[x / K for x in dObar],
+                eventwise_functional=[x / K for x in eventwise_F],
                 clean_prediction=pred_c.detach(),
                 clean_head_output=[(x[rmask] if rmask is not None else x).detach()
                                    for x in cap["wV"]],
             )
         tot_sem_sources += S
+        tot_sem_graphs += 1
         if graph_attn:
             tot_attn_sources += S
+            tot_attn_graphs += 1
 
         # A semantic-only pass is used by the descriptive attention-example selector. It applies
         # the exact established donor-swap estimator above, but avoids the unrelated structural
@@ -421,6 +467,7 @@ def score_model(task, sc: SpecConfig, *, with_attn_routing: bool = True,
         partners_flat = partners.reshape(-1)                     # replica -> partner node v
         anchor_nodes_flat = np.array(sources, dtype=np.int64)[anchor_of_rep]   # replica -> anchor node u
         dObar = [torch.zeros(S, n_carriers, H, dh, device=device) for _ in range(L)]
+        eventwise_F = [torch.zeros(S, n_carriers, H, device=device) for _ in range(L)]
 
         chunk = _plan_chunk(n)
         r0 = 0
@@ -449,7 +496,11 @@ def score_model(task, sc: SpecConfig, *, with_attn_routing: bool = True,
             reps_anc = torch.as_tensor(anchor_of_rep[r0:r0 + m], device=device)
             for l in range(L):
                 wv = cc["wV"][l].view(m + 1, n_carriers, H, dh)
-                dObar[l].index_add_(0, reps_anc, wv[0:1] - wv[1:])
+                delta = wv[0:1] - wv[1:]
+                dObar[l].index_add_(0, reps_anc, delta)
+                eventwise_F[l].index_add_(
+                    0, reps_anc, _eventwise_functional(phi_stack[l], delta)
+                )
             # no-op partner (v==u) check: a self-transposition must move ~0 transport.
             nm = partners_flat[r0:r0 + m] == anchor_nodes_flat[r0:r0 + m]
             if nm.any() and gi_pos < 3:
@@ -460,17 +511,22 @@ def score_model(task, sc: SpecConfig, *, with_attn_routing: bool = True,
             r0 += m
 
         for l in range(L):
-            S_str[l] += _funcmag_contrib(phi_stack[l], dObar[l] / K).cpu().numpy()
+            S_str[l] += (eventwise_F[l] / K).sum(dim=1).mean(dim=0).cpu().numpy()
+            S_str_CG[l] += (
+                _funcmag_contrib(phi_stack[l], dObar[l] / K) / max(S, 1)
+            ).cpu().numpy()
         if response_observer is not None:
             response_observer(
                 channel="structural", graph_id=int(gi), base=base,
                 source_nodes=np.asarray(sources, dtype=np.int64),
                 phi_stack=phi_stack, donor_averaged_delta=[x / K for x in dObar],
+                eventwise_functional=[x / K for x in eventwise_F],
                 clean_prediction=pred_c.detach(),
                 clean_head_output=[(x[rmask] if rmask is not None else x).detach()
                                    for x in cap["wV"]],
             )
         tot_str_anchors += S
+        tot_str_graphs += 1
 
         if device.type == "cuda":
             torch.cuda.empty_cache()
@@ -481,11 +537,13 @@ def score_model(task, sc: SpecConfig, *, with_attn_routing: bool = True,
             log(f"[run] graph {gi_pos+1}/{n_graphs} (id={int(gi)}, n={n}) | "
                 f"{time.perf_counter()-t0:.1f}s")
 
-    S_sem /= max(tot_sem_sources, 1)
-    S_str /= max(tot_str_anchors, 1)
-    attn_measured = with_attn_routing and tot_attn_sources > 0
+    S_sem /= max(tot_sem_graphs, 1)
+    S_str /= max(tot_str_graphs, 1)
+    S_sem_CG /= max(tot_sem_graphs, 1)
+    S_str_CG /= max(tot_str_graphs, 1)
+    attn_measured = with_attn_routing and tot_attn_graphs > 0
     if attn_measured:
-        S_attn /= tot_attn_sources
+        S_attn /= tot_attn_graphs
 
     log("\n" + "=" * 72 + "\nSPECIALISATION-SCORE VERIFICATION\n" + "=" * 72)
     log(f"  test {gm.checks['test_metric_name']:>4} from ckpt : {gm.test_metric}")
@@ -498,6 +556,7 @@ def score_model(task, sc: SpecConfig, *, with_attn_routing: bool = True,
             f"{mask_frozen_ok} (spec: k-hop mask is architecture, held FIXED)")
     else:
         log("  [relabel/mask] structural intervention not requested (semantic-only pass)")
+    log(f"  aggregation={SCORE_AGGREGATION} (eventwise-gross; graph balanced)")
     log(f"  S_sem mean/max = {S_sem.mean():.3e}/{S_sem.max():.3e} | "
         f"S_str mean/max = {S_str.mean():.3e}/{S_str.max():.3e}")
     noise_tol = max(sc.tol, sc.float_noise_tol)
@@ -513,6 +572,8 @@ def score_model(task, sc: SpecConfig, *, with_attn_routing: bool = True,
     return {
         "task": task.name, "title": task.title,
         "S_sem": S_sem, "S_str": S_str, "S_attn_sem": S_attn if attn_measured else None,
+        "S_sem_CG": S_sem_CG, "S_str_CG": S_str_CG,
+        "score_aggregation": SCORE_AGGREGATION,
         "L": L, "H": H, "dh": dh, "n_heads": H, "n_layers": L, "T": T,
         "test_metric": gm.test_metric, "test_metric_name": gm.checks["test_metric_name"],
         "val_metric": getattr(gm, "val_metric", None),

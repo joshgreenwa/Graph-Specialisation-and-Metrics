@@ -52,6 +52,27 @@ def test_response_collector_reconstructs_score_and_captures_throughput(monkeypat
     assert collector.throughput[7].shape == (1, 2)
 
 
+def test_response_collector_assigns_virtual_transport_to_hub_bucket(monkeypatch):
+    base = _Data()
+    monkeypatch.setattr(beta, "_spd", lambda _base, _n: np.asarray(
+        [[0, 1, 2], [1, 0, 1], [2, 1, 0]], dtype=float))
+    collector = beta.ResponseCollector("zinc")
+    phi = torch.ones(1, 4, 1, 1)
+    delta = torch.tensor([[[[1.0]], [[2.0]], [[3.0]], [[4.0]]]])
+    collector(
+        channel="structural",
+        graph_id=2,
+        base=base,
+        source_nodes=np.asarray([0]),
+        phi_stack=[phi],
+        donor_averaged_delta=[delta],
+        clean_prediction=torch.tensor([0.0]),
+    )
+    response = collector.records["structural"][0]["response"]
+    assert response[0, beta.BIN_LABELS.index("hub"), 0] == 4.0
+    assert collector.score_reconstruction("structural")[0] == 10.0
+
+
 def test_partial_spearman_removes_shared_throughput_confound():
     rng = np.random.default_rng(4)
     throughput = rng.normal(0, 3, 200)

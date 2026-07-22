@@ -55,6 +55,49 @@ def test_distance_profiles_use_each_events_own_changed_set() -> None:
     assert rows[0]["F_coh"][0, 0] == pytest.approx(3.0)
 
 
+def test_distance_profiles_keep_signed_beneficial_carriage() -> None:
+    torch = pytest.importorskip("torch")
+    q = torch.ones(2, 1, 1, 2, 1)
+    benefit = torch.tensor([[-2.0, 1.0], [-4.0, 3.0]])
+    rows = BETA.distance_profile_one_graph(
+        q, np.array([[0, 1], [0, 1]]), beneficial=benefit
+    )
+    assert rows[0]["B"] == pytest.approx(-3.0)
+    assert rows[1]["B"] == pytest.approx(2.0)
+    assert sum(row["B_sum"] for row in rows) == pytest.approx(-1.0)
+
+
+def test_distance_resolved_eg_exactly_reconstructs_score_with_event_specific_bins() -> None:
+    torch = pytest.importorskip("torch")
+    q_source_0 = torch.zeros(2, 1, 1, 3, 1)
+    q_source_1 = torch.zeros(1, 1, 1, 3, 1)
+    q_source_0[0, 0, 0, :, 0] = torch.tensor([1.0, 2.0, 3.0])
+    q_source_0[1, 0, 0, :, 0] = torch.tensor([4.0, 5.0, 6.0])
+    q_source_1[0, 0, 0, :, 0] = torch.tensor([7.0, 8.0, 9.0])
+    result = BETA.distance_resolved_eg_one_graph(
+        [q_source_0, q_source_1],
+        [np.array([[0, 1, 2], [1, 0, 2]]), np.array([[0, 1, 2]])],
+    )
+    # Donors average within source, then the two source scores average equally.
+    expected = ((1 + 2 + 3 + 4 + 5 + 6) / 2 + (7 + 8 + 9)) / 2
+    assert float(result["total"][0, 0]) == pytest.approx(expected)
+    assert sum(float(value[0, 0]) for value in result["contribution"].values()) == pytest.approx(
+        expected
+    )
+    assert result["identity_max_abs_error"] < 1.0e-6
+
+
+def test_distance_resolved_eg_keeps_unreachable_and_virtual_hub_buckets() -> None:
+    torch = pytest.importorskip("torch")
+    q = torch.tensor([[[[[1.0], [2.0], [3.0], [4.0]]]]])  # [K,L,H,N,T]
+    result = BETA.distance_resolved_eg_one_graph(
+        [q], [np.array([[0, 1, BETA.DISTANCE_UNREACHABLE, BETA.DISTANCE_HUB]])]
+    )
+    assert result["contribution"][BETA.DISTANCE_UNREACHABLE][0, 0] == pytest.approx(3.0)
+    assert result["contribution"][BETA.DISTANCE_HUB][0, 0] == pytest.approx(4.0)
+    assert result["total"][0, 0] == pytest.approx(10.0)
+
+
 def test_score_coordinates_separate_selectivity_activity_and_joint_strength() -> None:
     result = BETA.score_coordinates(np.array([[4.0, 2.0]]), np.array([[0.0, 2.0]]))
     assert np.allclose(result["D"], np.array([[1.0, 0.0]]))
@@ -88,6 +131,97 @@ def test_deterministic_splits_are_disjoint_and_repeatable() -> None:
     assert not set(first["score"]) & set(first["ablation"])
     assert not set(first["causal"]) & set(first["ablation"])
     assert set(first["mechanism"]).issubset(set(first["causal"]))
+
+
+def test_integrated_carriage_defaults_use_bounded_rare_cap_policy() -> None:
+    cfg = BETA.BetaConfig()
+    assert cfg.integrated_atol == pytest.approx(5.0e-4)
+    assert cfg.integrated_max_intervals == 256
+    assert cfg.integrated_unconverged_error_cap == pytest.approx(5.0e-3)
+    assert cfg.integrated_max_unconverged_fraction == pytest.approx(1.0e-2)
+    cfg.validate()
+    with pytest.raises(ValueError, match="must lie in"):
+        BETA.BetaConfig(integrated_max_unconverged_fraction=1.1).validate()
+
+
+def test_integrated_carriage_audit_aggregates_cached_source_groups() -> None:
+    diagnostics = [
+        {
+            "paths": 8,
+            "unconverged": 1,
+            "completeness_max": 2.0e-3,
+            "quadrature_error_max": 3.0e-3,
+            "unconverged_completeness_max": 2.0e-3,
+            "unconverged_quadrature_error_max": 3.0e-3,
+            "intervals_max": 256,
+        },
+        {
+            "paths": 8,
+            "unconverged": 0,
+            "completeness_max": 1.0e-4,
+            "quadrature_error_max": 2.0e-4,
+            "intervals_max": 3,
+        },
+    ]
+    records = [{
+        "channels": {
+            channel: {"beneficial_diagnostics": diagnostics if channel == "semantic" else []}
+            for channel in BETA.CHANNELS
+        }
+    }]
+    audit = BETA.integrated_carriage_audit(records)
+    assert audit["paths"] == 16
+    assert audit["unconverged"] == 1
+    assert audit["unconverged_fraction"] == pytest.approx(1 / 16)
+    assert audit["unconverged_quadrature_error_max"] == pytest.approx(3.0e-3)
+    assert audit["intervals_max"] == 256
+
+
+def test_score_component_cache_separates_source_channel_and_graph(tmp_path) -> None:
+    cfg = BETA.BetaConfig(output_dir=str(tmp_path))
+    semantic_source = BETA.score_component_cache_path(
+        cfg, "zinc", 10, "semantic_source_0", "a" * 64
+    )
+    semantic_channel = BETA.score_component_cache_path(
+        cfg, "zinc", 10, "semantic_complete", "a" * 64
+    )
+    pe_source = BETA.score_component_cache_path(
+        cfg, "zinc", 10, "pe_source_0", "a" * 64
+    )
+    assert len({semantic_source, semantic_channel, pe_source}) == 3
+    assert all("score_components" in str(path) for path in (
+        semantic_source, semantic_channel, pe_source
+    ))
+
+
+def test_completed_tighter_legacy_graph_cache_is_migratable(tmp_path) -> None:
+    torch = pytest.importorskip("torch")
+    cfg = BETA.BetaConfig(output_dir=str(tmp_path))
+    checkpoint_sha = "b" * 64
+    record = {
+        "channels": {
+            channel: {
+                "beneficial_diagnostics": [{
+                    "paths": 8,
+                    "unconverged": 0,
+                    "completeness_max": 1.0e-5,
+                    "quadrature_error_max": 1.0e-5,
+                }]
+            }
+            for channel in BETA.CHANNELS
+        }
+    }
+    path = tmp_path / "legacy.pt"
+    torch.save({
+        "version": BETA.BETA_VERSION,
+        "schema": BETA.BETA_SCHEMA,
+        "fingerprint": cfg.legacy_strict_score_fingerprint,
+        "checkpoint_sha256": checkpoint_sha,
+        "record": record,
+    }, path)
+    loaded = BETA.valid_legacy_strict_graph_cache(path, cfg, checkpoint_sha)
+    assert loaded is not None
+    assert cfg.legacy_strict_score_fingerprint != cfg.fingerprint
 
 
 def test_graph_num_nodes_adapter_supplies_collector_metadata() -> None:
@@ -171,6 +305,20 @@ def test_topology_matching_excludes_isomorphic_graphs_and_ranks_tiers() -> None:
     assert BETA.topology_match_tier(path, star) == 1
 
 
+def test_topology_donor_selection_interleaves_available_tiers() -> None:
+    base = _descriptor([[0, 1], [1, 2], [2, 3]], [0, 0, 0, 0])
+    tier0 = _descriptor([[0, 1], [0, 2], [0, 3]], [0, 0, 0, 0], 10)
+    # The test descriptor deliberately controls the matching summary independently of
+    # topology so this candidate exercises the strict-tier branch while remaining non-isomorphic.
+    tier0["degree_multiset"] = base["degree_multiset"]
+    tier1 = _descriptor([[0, 1], [0, 2], [0, 3]], [0, 0, 0, 0], 11)
+    tier2 = _descriptor([[0, 1], [1, 2], [2, 3], [3, 0]], [0, 0, 0, 0], 12)
+    selected = BETA.select_topology_donors(
+        base, [tier0, tier1, tier2], {4: [0, 1, 2]}, count=3, allow_relaxed=True
+    )
+    assert [item["tier"] for item in selected] == [0, 1, 2]
+
+
 def test_hungarian_alignment_and_topology_transplant_hold_x_and_y_fixed() -> None:
     torch = pytest.importorskip("torch")
     base_desc = _descriptor([[0, 1], [1, 2]], [0, 1, 2])
@@ -227,6 +375,37 @@ def test_topology_edit_dose_uses_undirected_symmetric_difference() -> None:
     assert result["changed_nodes"] == [0, 1, 2]
 
 
+def test_support_aware_decomposition_reconstructs_changed_support() -> None:
+    torch = pytest.importorskip("torch")
+
+    def capture(src, dst, attention, message, n=4):
+        return {
+            "src": torch.tensor(src),
+            "dst": torch.tensor(dst),
+            "attention": torch.tensor(attention, dtype=torch.float32).reshape(-1, 1),
+            "message": torch.tensor(message, dtype=torch.float32).reshape(-1, 1, 1),
+            "gradient": torch.ones(n, 1, 1),
+            "head_output": BETA.aggregate_pairs_to_nodes(
+                torch.tensor(attention, dtype=torch.float32).reshape(-1, 1, 1)
+                * torch.tensor(message, dtype=torch.float32).reshape(-1, 1, 1),
+                torch.tensor(dst),
+                n,
+            ),
+        }
+
+    clean = capture([0, 1, 2], [1, 2, 3], [0.2, 0.3, 0.5], [2.0, 3.0, 4.0])
+    corrupt = capture([0, 3], [1, 2], [0.4, 0.6], [1.0, 5.0])
+    result = BETA.decompose_support_aware_layer(clean, corrupt)
+    assert result["reconstruction_max"] < 1.0e-6
+    assert result["clean_only_pairs"] == 2
+    assert result["corrupt_only_pairs"] == 1
+    assert torch.allclose(
+        result["direct_q"],
+        result["routing_q"] + result["message_q"] + result["wiring_q"],
+        atol=1.0e-6,
+    )
+
+
 def _fake_score_payload(offset: float = 0.0):
     torch = pytest.importorskip("torch")
     L, H, n, sources, events = 2, 2, 4, 2, 2
@@ -238,7 +417,13 @@ def _fake_score_payload(offset: float = 0.0):
         channels = {}
         for channel, matrix in (("semantic", semantic), ("pe", pe), ("topology", topology)):
             per_source = np.stack([matrix, matrix * 1.05])
-            q_groups = [torch.ones(events, L, H, n, 1) * float(matrix.mean()) for _ in range(sources)]
+            # Match the cached EG field exactly: every event has carrier magnitudes
+            # summing to the graph-level EG matrix.
+            eg_matrix = matrix * (1 + 0.03 * BETA.AGGREGATIONS.index("EG"))
+            q_template = torch.as_tensor(eg_matrix / n, dtype=torch.float32)[
+                None, :, :, None, None
+            ].repeat(events, 1, 1, n, 1)
+            q_groups = [q_template.clone() for _ in range(sources)]
             if channel == "topology":
                 q_groups = q_groups[:1]
             channels[channel] = {
@@ -254,11 +439,21 @@ def _fake_score_payload(offset: float = 0.0):
                     "source_index": 0,
                     "carriers": 2,
                 } for distance in (0, 1)],
+                "model_carriage": [{
+                    "distance": distance,
+                    "F_sens": float(matrix.mean() / (distance + 1)),
+                    "F_coh": float(0.8 * matrix.mean() / (distance + 1)),
+                    "B": float((-1 if distance == 0 else 1) * 0.01 * matrix.mean()),
+                    "B_sum": float((-1 if distance == 0 else 1) * 0.02 * matrix.mean()),
+                    "source_index": 0,
+                    "carriers": 2,
+                } for distance in (0, 1)],
             }
         descriptor = {
             "n": n,
             "labels": np.arange(n).reshape(-1, 1),
             "edges": np.array([[0, 1], [1, 2], [2, 3]]),
+            "degree": np.array([1, 2, 2, 1]),
             "cycle_rank": 0,
         }
         records.append({
@@ -320,9 +515,14 @@ def _fake_causal_payload(offset: float = 0.0):
                 "clean_prediction": np.array([1.0]),
                 "corrupt_prediction": np.array([0.7 - 0.03 * channel_index]),
                 "topology_tier": 0,
+                "topology_dose": {"edge_jaccard_distance": 0.3 + 0.1 * graph_id},
             })
     shape = (len(events), L, H)
     base = np.linspace(0.01, 0.3, np.prod(shape)).reshape(shape) + offset
+    family_names = list(BETA.PATCH_FAMILY_NAMES)
+    family_base = np.linspace(0.02, 0.2, len(events) * len(family_names)).reshape(
+        len(events), len(family_names)
+    )
     return {
         "events": events,
         "causal_effect_floor_relative": 0.05,
@@ -332,6 +532,27 @@ def _fake_causal_payload(offset: float = 0.0):
             "necessity": base * 0.7,
             "mismatch": base * 0.1,
             "sham": base * 0.001,
+        },
+        "family_names": family_names,
+        "family_definitions": {
+            "semantic_specialist": [(0, 0)],
+            "pe_specialist": [(1, 0)],
+            "structural_pe_specific": [(1, 0)],
+            "structural_topology_specific": [(0, 1)],
+            "structural_shared": [(1, 1)],
+            "high_J": [(0, 1)],
+            "high_G_balanced": [(1, 1)],
+            "low_J_inert": [(1, 1)],
+        },
+        "family_metrics": {
+            "restore": family_base,
+            "inject": family_base * 0.9,
+            "necessity": family_base * 0.7,
+            "mismatch": family_base * 0.1,
+            "sham": family_base * 0.001,
+            "restore_loss": family_base * 0.5,
+            "inject_loss": family_base * 0.4,
+            "necessity_loss": family_base * 0.3,
         },
     }
 
@@ -352,8 +573,12 @@ def _fake_ablations(score, causal):
             "high_J": [(0, 1)],
             "high_G_balanced": [(1, 1)],
             "topology_responsive": [(0, 1)],
+            "structural_pe_specific": [(1, 0)],
+            "structural_topology_specific": [(0, 1)],
+            "structural_shared": [(1, 1)],
             "low_J_inert": [(1, 1)],
         }
+        pe_topology_coordinates = BETA.score_coordinates(pe, topology)
         selections[aggregation] = {
             "semantic": semantic,
             "pe": pe,
@@ -361,6 +586,15 @@ def _fake_ablations(score, causal):
             "coordinates": coordinates,
             "active": np.ones((L, H), dtype=bool),
             "activity_floor": 0.01,
+            "pe_topology_coordinates": pe_topology_coordinates,
+            "pe_topology_pe": pe,
+            "pe_topology_topology": topology,
+            "semantic_topology_semantic": semantic,
+            "semantic_topology_topology": topology,
+            "pe_topology_active": np.ones((L, H), dtype=bool),
+            "pe_topology_activity_floor": 0.01,
+            "pe_topology_D_ci_lower": pe_topology_coordinates["D"] - 0.05,
+            "pe_topology_D_ci_upper": pe_topology_coordinates["D"] + 0.05,
             "families": families,
         }
         method_rows.append({
@@ -369,7 +603,7 @@ def _fake_ablations(score, causal):
             "validity_mean": 0.5 + index * 0.01,
             "prefix_reliability": 0.8,
             "objective": 0.65 + index * 0.01,
-            "selected": aggregation == "EN",
+            "selected": aggregation == BETA.HEADLINE_AGGREGATION,
         })
         family_curves[aggregation] = {
             family: [{"count": 1, "functional": 0.1 + 0.01 * j, "loss_increase": 0.0, "mae": 0.1}]
@@ -387,16 +621,18 @@ def _fake_ablations(score, causal):
 
 
 def _fake_mechanism():
-    events = [{"channel": channel} for channel in BETA.PRIMARY_CHANNELS for _ in range(2)]
+    events = [{"channel": channel} for channel in BETA.CHANNELS for _ in range(2)]
     shape = (len(events), 2, 2)
     return {
         "events": events,
         "metrics": {
             "routing_q": np.ones(shape) * 0.2,
             "message_q": np.ones(shape) * 0.3,
+            "wiring_q": np.ones(shape) * 0.05,
             "routing_rescue": np.ones(shape) * 0.1,
             "message_rescue": np.ones(shape) * 0.15,
-            "full_rescue": np.ones(shape) * 0.25,
+            "wiring_rescue": np.ones(shape) * 0.03,
+            "full_rescue": np.ones(shape) * 0.28,
             "finite_interaction": np.zeros(shape),
         },
         "reconstruction_max": np.zeros((len(events), 2)),
@@ -425,7 +661,11 @@ def test_all_paper_outputs_render_from_schema_complete_smoke_payload(tmp_path) -
         min_condition_graphs=2,
     )
     summary = BETA.create_outputs(runs, cfg)
-    assert summary["selected_aggregation"] == "EN"
-    assert len(summary["figures"]) == 22
+    assert summary["selected_aggregation"] == "EG"
+    assert len(summary["figures"]) == 26
     assert all(Path(path).exists() for path in summary["figures"])
     assert (tmp_path / "tables/methodology_decisions.json").exists()
+    assert (tmp_path / "tables/distance_resolved_specialisation.csv").exists()
+    assert summary["decisions"]["distance_resolved_specialisation"]["verdict"] == (
+        "retain_exact_decomposition"
+    )
