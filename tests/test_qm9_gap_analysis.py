@@ -142,3 +142,5 @@ def test_qm9_notebook_cell_is_syntax_valid_and_uses_isolated_cache():
     assert "graph_specialisation_metrics/qm9_gap" in source
     assert 'dataset_label="QM9 HOMO-LUMO gap"' in source
     assert "ckpt/294.ckpt" in source and "ckpt/295.ckpt" in source
+    assert "integrated_unconverged_error_cap=1e-3" in source
+    assert "integrated_max_unconverged_fraction=1e-2" in source

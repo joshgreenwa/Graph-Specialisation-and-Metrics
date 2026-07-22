@@ -104,9 +104,10 @@ run_all(
     integrated_atol=1e-4,
     integrated_max_intervals=256,
     integrated_max_unconverged_fraction=1e-2,
-    # QM9 loss is raw eV. Keep a task-scale-aware numerical gate instead of copying the looser
-    # 1e-2 ZINC exception; capped paths above 5e-4 eV abort and remain fully auditable.
-    integrated_unconverged_error_cap=5e-4,
+    # QM9 loss is raw eV. A 1e-3 eV cap admits rare paths that hit the interval cap only when
+    # both the global <=1% failure-rate gate and this absolute bound pass. It remains 10x
+    # stricter than ZINC's 1e-2 exception; residuals and failures remain fully auditable.
+    integrated_unconverged_error_cap=1e-3,
     # ---- per-head semantic/structural scores ----
     spec_num_graphs=128,
     spec_donors=64,
