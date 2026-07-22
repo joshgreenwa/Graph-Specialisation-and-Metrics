@@ -714,11 +714,40 @@ def discover_checkpoint(legacy: Any, run_dir: Path, seed: int) -> tuple[Path, di
         if payload.get("fingerprint") != legacy.config_fingerprint(model_cfg):
             continue
         accepted.append((path, payload))
+    if len(accepted) > 1:
+        # ``cycle_dual_v2`` has occasionally accumulated checkpoints from exploratory
+        # configurations under the same run directory.  The paper task is the exact
+        # configuration declared by the canonical source file, whose fingerprint is
+        # stable (currently 364da99053dbe173).  Prefer that match without relying on
+        # file ordering or modification time.
+        canonical_cfg = legacy.Config()
+        canonical_fingerprint = legacy.config_fingerprint(canonical_cfg)
+        canonical = [
+            item for item in accepted
+            if item[1].get("fingerprint") == canonical_fingerprint
+        ]
+        if len(canonical) == 1:
+            rejected = ", ".join(
+                str(item[1].get("fingerprint"))
+                for item in accepted
+                if item[0] != canonical[0][0]
+            )
+            print(
+                f"[checkpoint seed={seed}] {len(accepted)} valid configurations found; "
+                f"selected canonical paper fingerprint {canonical_fingerprint} "
+                f"(ignored: {rejected})",
+                flush=True,
+            )
+            return canonical[0]
     if len(accepted) != 1:
-        listing = "\n".join(f"  - {path}" for path in candidates) or "  (none)"
+        listing = "\n".join(
+            f"  - {path} | fingerprint={payload.get('fingerprint')}"
+            for path, payload in accepted
+        ) or "  (none accepted)"
         raise RuntimeError(
             f"expected exactly one valid legacy checkpoint for seed {seed}, found "
-            f"{len(accepted)} under {run_dir}:\n{listing}"
+            f"{len(accepted)} under {run_dir}. No unique canonical-paper match was "
+            f"available:\n{listing}"
         )
     return accepted[0]
 

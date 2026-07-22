@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import sys
+from dataclasses import asdict, replace
 from pathlib import Path
 
 import numpy as np
@@ -116,3 +117,28 @@ def test_specialist_families_can_be_empty_and_cache_identity_is_fail_closed():
     }
     assert beta._beta_cache_is_current(payload, config, "abc")
     assert not beta._beta_cache_is_current(payload, config, "different")
+
+
+def test_checkpoint_discovery_prefers_canonical_paper_fingerprint(tmp_path):
+    beta = load_beta_module()
+    repository = SOURCE.parents[3]
+    legacy = beta.load_legacy_module(repository)
+    checkpoint_dir = tmp_path / "cycle_dual_v2" / "checkpoints"
+    checkpoint_dir.mkdir(parents=True)
+    canonical = legacy.Config()
+    exploratory = replace(canonical, steps=canonical.steps + 1)
+    for config in (canonical, exploratory):
+        fingerprint = legacy.config_fingerprint(config)
+        torch.save(
+            {
+                "version": beta.LEGACY_VERSION,
+                "seed": 0,
+                "config": asdict(config),
+                "fingerprint": fingerprint,
+            },
+            checkpoint_dir / f"seed_0__{fingerprint}.pt",
+        )
+    path, payload = beta.discover_checkpoint(legacy, checkpoint_dir.parent, 0)
+    canonical_fingerprint = legacy.config_fingerprint(canonical)
+    assert payload["fingerprint"] == canonical_fingerprint
+    assert path.name == f"seed_0__{canonical_fingerprint}.pt"
