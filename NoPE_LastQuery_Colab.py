@@ -27,10 +27,15 @@ Five synthetic last-query tasks (continuous Gaussian tokens; the last query does
   posret : output the POSITION of the earlier token whose content equals the query
            (content-addressed position readout)
 
-Six seeds per task, four layers per model. Every trained model AND its scores are cached to Drive,
-so figures regenerate without retraining. Two figures are produced:
+Six seeds per task, four layers per model. TASKS lists the models trained + cached; FIG_TASKS is the
+(sub)set shown in figures (default: prev, ihalf, posret). Every trained model AND its scores are
+cached to Drive, so all figures regenerate without retraining or re-scoring. Figures produced:
   fig_positional_fraction : per task, the three methods per layer (with error bars over seeds).
   fig_residual_posrep     : per task, the residual positional-representation fraction per layer.
+  fig_attn_mean_<task>    : 1 x n_layers heatmaps of the mean attention across inputs (best-fit seed).
+  fig_attn_std_<task>     : 1 x n_layers heatmaps of the std of attention across inputs (best-fit seed).
+The attention figures load the cached model and do a single forward pass (no retraining/re-scoring),
+and cache their result so subsequent regeneration is free.
 """
 
 # %%
@@ -55,7 +60,8 @@ except Exception:  # pragma: no cover
 SMOKE = os.environ.get("NOPE_SMOKE", "") == "1"
 
 # ---- tasks / model ----
-TASKS = ["first", "prev", "ihalf", "match", "posret"]
+TASKS = ["prev", "ihalf", "posret"]          # models trained + cached (add "first"/"match" to include)
+FIG_TASKS = ["prev", "ihalf", "posret"]      # subset shown in figures (must be a subset of TASKS)
 TASK_NAME = {                         # human-readable, identifies the operation (no claim of result)
     "first":  "Copy first token",
     "prev":   "Copy previous token",
@@ -115,6 +121,9 @@ CACHE_DIR = _setup_cache_dir()
 
 def _hash(d):
     return hashlib.md5(json.dumps(d, sort_keys=True).encode()).hexdigest()[:8]
+
+def _task_salt(t):                    # stable per-task seed offset (independent of the TASKS list order)
+    return int(hashlib.md5(t.encode()).hexdigest()[:6], 16)
 
 CFG = dict(T=SEQ_LEN, d=D_MODEL, dff=D_FF, heads=N_HEADS, layers=N_LAYERS, lr=LR, bs=BATCH_SIZE,
            max_steps=MAX_STEPS, min_steps=MIN_STEPS, eval_every=EVAL_EVERY, patience=PATIENCE,
@@ -295,7 +304,7 @@ def score_model(net, task, seed):
     x2 = x.detach()
     out2, _, _, Mc2 = forward(net, x2, capture=True)
     qy = out2[:, -1]                                      # (B, out_dim)
-    sgen = torch.Generator(device=DEVICE).manual_seed(EVAL_SEED + 7919 * seed + 104729 * TASKS.index(task))
+    sgen = torch.Generator(device=DEVICE).manual_seed(EVAL_SEED + 7919 * seed + _task_salt(task))
     U = torch.randn(N_PROBES, qy.shape[-1], device=DEVICE, generator=sgen)   # reproducible probes
     phis = []
     for l in range(L):
@@ -353,7 +362,7 @@ def residual_probe(net, task):
     x = eval_inputs(task, PROBE_N)
     _, res_out = residual_inputs(net, x)
     content = x.reshape(-1, D_MODEL); M = x.shape[0] * T
-    rgen = torch.Generator(device=DEVICE).manual_seed(EVAL_SEED + 104729 * TASKS.index(task))
+    rgen = torch.Generator(device=DEVICE).manual_seed(EVAL_SEED + _task_salt(task))
     idx = torch.randperm(M, device=DEVICE, generator=rgen)
     cut = int(PROBE_SPLIT * M); tr, te = idx[:cut], idx[cut:]
     pos = torch.arange(T, device=DEVICE).view(1, T).expand(x.shape[0], T).reshape(-1)
@@ -368,6 +377,29 @@ def residual_probe(net, task):
         pn = max(0.0, (acc - chance) / (1 - chance))
         out.append(pn / (pn + max(r2, 0.0) + 1e-9))
     return out
+
+
+# %%
+# ============================== 6b. Attention mean/std (cached; no retrain/rescore) ==============================
+@torch.no_grad()
+def attention_stats(task, seed):
+    """Per-layer mean and std of attention across the eval inputs, for one cached model. Loads the
+    cached model (no retraining) + one forward pass, and caches the result so re-generation is free."""
+    path = os.path.join(RUN_DIR, f"attn_{task}_seed{seed}_{CFG_TAG}_{EVAL_TAG}.pt")
+    if os.path.exists(path):
+        b = torch.load(path, map_location="cpu", weights_only=False)
+        return b["mean"], b["std"]
+    net, _ = get_model(task, seed)
+    _, A, _, _ = forward(net, eval_inputs(task, N_EVAL), capture=True)   # A[l]: (B,T,T)
+    mean = [A[l].mean(0).cpu().numpy() for l in range(N_LAYERS)]
+    std = [A[l].std(0).cpu().numpy() for l in range(N_LAYERS)]
+    torch.save({"mean": mean, "std": std}, path)
+    return mean, std
+
+def best_seed_for(task, rows):
+    rs = [r for r in rows if r["task"] == task]
+    pick = max if TASK_KIND[task] == "cls" else min      # cls: highest acc; reg: lowest mse
+    return pick(rs, key=lambda r: r["fit"])["seed"]
 
 
 # %%
@@ -396,36 +428,42 @@ plt.rcParams.update({
     "xtick.labelsize": 10, "ytick.labelsize": 10, "legend.fontsize": 9.5,
     "axes.linewidth": 0.8, "lines.linewidth": 2.0, "lines.markersize": 6,
 })
-METHOD_COLOR = {"local_att": "#e15759", "global_att": "#4e79a7", "global_tr": "#59a14f"}
+# Validated categorical hues (data-viz reference palette, fixed order): the two faithful GLOBAL
+# methods take the cool pair (blue, green); LOCAL — the method that diverges — takes the distinct
+# magenta accent. The probe (separate figure) uses a calm violet; heatmaps use cool sequential ramps.
+METHOD_COLOR = {"local_att": "#e87ba4", "global_att": "#2a78d6", "global_tr": "#008300"}
 METHOD_LABEL = {"local_att": "local attention", "global_att": "global attention",
                 "global_tr": "global transport"}
-PROBE_COLOR = "#b8860b"
+PROBE_COLOR = "#4a3aa7"
+ATTN_CMAP = {"mean": "Blues", "std": "Purples"}
+_MARK = dict(marker="o", markersize=7, markeredgecolor="white", markeredgewidth=0.7,
+             capsize=3, elinewidth=1.2, capthick=1.2)
 
 def _despine(ax):
     for sp in ("top", "right"):
         ax.spines[sp].set_visible(False)
-    ax.grid(True, axis="y", alpha=0.25, linewidth=0.6); ax.set_axisbelow(True)
+    ax.grid(True, axis="y", alpha=0.22, linewidth=0.6); ax.set_axisbelow(True)
 
 def make_positional_fraction_figure(agg, out_path):
     layers = np.arange(N_LAYERS)
     dodge = {"local_att": -0.10, "global_att": 0.0, "global_tr": 0.10}
-    fig, axes = plt.subplots(1, len(TASKS), figsize=(3.7 * len(TASKS), 4.2), squeeze=False)
+    fig, axes = plt.subplots(1, len(FIG_TASKS), figsize=(3.9 * len(FIG_TASKS), 4.3), squeeze=False)
     axes = axes[0]
-    for ax, task in zip(axes, TASKS):
-        for m in ("local_att", "global_att", "global_tr"):
+    for ax, task in zip(axes, FIG_TASKS):
+        for m in ("global_att", "global_tr", "local_att"):
             a = _stack(agg[task][m]); mu = a.mean(0); err = a.std(0)
             ax.errorbar(layers + dodge[m], mu, yerr=err, color=METHOD_COLOR[m], label=METHOD_LABEL[m],
-                        marker="o", capsize=3, elinewidth=1.3, capthick=1.3)
-        ax.axhline(0.5, color="0.6", lw=0.7, ls=":")
+                        **_MARK)
+        ax.axhline(0.5, color="0.7", lw=0.8, ls=(0, (2, 3)))
         ax.set_title(TASK_NAME[task]); ax.set_xlabel("layer")
         ax.set_xticks(layers); ax.set_ylim(-0.03, 1.03)
         if ax is axes[0]:
-            ax.set_ylabel("positional fraction\n(1 = positional, 0 = semantic)")
-            ax.legend(loc="lower left", framealpha=0.9)
+            ax.set_ylabel("positional specialisation fraction\n(1 = positional, 0 = semantic)")
+            ax.legend(loc="lower left", framealpha=0.92, edgecolor="0.85")
         _despine(ax)
-    fig.suptitle(f"Per-layer positional fraction at the final query, by scoring method"
-                 f"   ({N_LAYERS}-layer NoPE students, {len(SEEDS)} seeds; error bars = std)",
-                 fontsize=12.5, y=1.02)
+    fig.suptitle(f"Per-layer positional specialisation fraction, by scoring method"
+                 f"   ({N_LAYERS}-layer NoPE students, {len(SEEDS)} seeds)",
+                 fontsize=13, y=1.02)
     fig.tight_layout(rect=[0, 0, 1, 0.95])
     fig.savefig(out_path); print(f"[fig  ] saved {out_path}")
     try: plt.show()
@@ -433,22 +471,45 @@ def make_positional_fraction_figure(agg, out_path):
 
 def make_residual_posrep_figure(agg, out_path):
     layers = np.arange(N_LAYERS)
-    fig, axes = plt.subplots(1, len(TASKS), figsize=(3.7 * len(TASKS), 4.2), squeeze=False)
+    fig, axes = plt.subplots(1, len(FIG_TASKS), figsize=(3.9 * len(FIG_TASKS), 4.3), squeeze=False)
     axes = axes[0]
     ymax = max(0.5, max((_stack(agg[t]["posrep"]).mean(0) + _stack(agg[t]["posrep"]).std(0)).max()
-                        for t in TASKS) * 1.1)
-    for ax, task in zip(axes, TASKS):
+                        for t in FIG_TASKS) * 1.1)
+    for ax, task in zip(axes, FIG_TASKS):
         a = _stack(agg[task]["posrep"]); mu = a.mean(0); err = a.std(0)
-        ax.errorbar(layers, mu, yerr=err, color=PROBE_COLOR, marker="s", capsize=3,
-                    elinewidth=1.3, capthick=1.3)
+        ax.errorbar(layers, mu, yerr=err, color=PROBE_COLOR, **{**_MARK, "marker": "s"})
         ax.set_title(TASK_NAME[task]); ax.set_xlabel("layer")
         ax.set_xticks(layers); ax.set_ylim(0, ymax)
         if ax is axes[0]:
-            ax.set_ylabel("residual positional-representation\nfraction (position vs content)")
+            ax.set_ylabel("residual positional representation\n(probe: position vs content)")
         _despine(ax)
-    fig.suptitle(f"Per-layer residual positional-representation fraction (linear probe)"
-                 f"   ({N_LAYERS}-layer NoPE students, {len(SEEDS)} seeds; error bars = std)",
-                 fontsize=12.5, y=1.02)
+    fig.suptitle(f"Per-layer residual positional representation, by linear probe"
+                 f"   ({N_LAYERS}-layer NoPE students, {len(SEEDS)} seeds)",
+                 fontsize=13, y=1.02)
+    fig.tight_layout(rect=[0, 0, 1, 0.95])
+    fig.savefig(out_path); print(f"[fig  ] saved {out_path}")
+    try: plt.show()
+    except Exception: pass
+
+def make_attention_figure(task, seed, kind, out_path):
+    """One figure, size 1 x n_layers: the per-layer attention 'kind' (mean or std) across inputs,
+    for the best-fit model of `task`. mean and std are drawn as SEPARATE figures."""
+    mean, std = attention_stats(task, seed)
+    mats = mean if kind == "mean" else std
+    fig, axes = plt.subplots(1, N_LAYERS, figsize=(2.9 * N_LAYERS, 3.4), squeeze=False)
+    axes = axes[0]
+    for l, ax in enumerate(axes):
+        im = ax.imshow(mats[l], cmap=ATTN_CMAP[kind], vmin=0, vmax=max(float(mats[l].max()), 1e-8))
+        ax.set_title(f"Layer {l}")
+        ax.set_xlabel("key position")
+        ax.set_ylabel("query position" if l == 0 else "")
+        ax.set_xticks(range(SEQ_LEN)); ax.set_yticks(range(SEQ_LEN))
+        ax.tick_params(length=0)
+        for sp in ax.spines.values():
+            sp.set_visible(False)
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    label = "mean attention" if kind == "mean" else "attention variability (std)"
+    fig.suptitle(f"{TASK_NAME[task]} — {label} per layer", fontsize=13, y=1.02)
     fig.tight_layout(rect=[0, 0, 1, 0.95])
     fig.savefig(out_path); print(f"[fig  ] saved {out_path}")
     try: plt.show()
@@ -472,13 +533,20 @@ def print_fit_table(rows):
     print("============================================================\n")
 
 def main():
-    print(f"[run  ] device={DEVICE} tasks={TASKS} seeds={SEEDS} cfg={CFG_TAG} eval={EVAL_TAG} smoke={SMOKE}")
+    print(f"[run  ] device={DEVICE} tasks={TASKS} fig_tasks={FIG_TASKS} seeds={SEEDS} "
+          f"cfg={CFG_TAG} eval={EVAL_TAG} smoke={SMOKE}")
     rows, agg = run_all()
     print_fit_table(rows)
-    make_positional_fraction_figure(
-        agg, os.path.join(RUN_DIR, f"fig_positional_fraction_{CFG_TAG}_{EVAL_TAG}.png"))
-    make_residual_posrep_figure(
-        agg, os.path.join(RUN_DIR, f"fig_residual_posrep_{CFG_TAG}_{EVAL_TAG}.png"))
+    tag = f"{CFG_TAG}_{EVAL_TAG}"
+    make_positional_fraction_figure(agg, os.path.join(RUN_DIR, f"fig_positional_fraction_{tag}.png"))
+    make_residual_posrep_figure(agg, os.path.join(RUN_DIR, f"fig_residual_posrep_{tag}.png"))
+    # per-task attention mean & std (separate figures), best-fit seed, from cached models
+    for task in FIG_TASKS:
+        bs = best_seed_for(task, rows)
+        make_attention_figure(task, bs, "mean",
+                              os.path.join(RUN_DIR, f"fig_attn_mean_{task}_seed{bs}_{tag}.png"))
+        make_attention_figure(task, bs, "std",
+                              os.path.join(RUN_DIR, f"fig_attn_std_{task}_seed{bs}_{tag}.png"))
     return rows, agg
 
 
