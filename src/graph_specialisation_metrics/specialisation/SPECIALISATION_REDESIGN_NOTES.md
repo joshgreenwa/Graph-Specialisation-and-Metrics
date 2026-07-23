@@ -222,17 +222,13 @@ Carriage must retain individual carriers because their distance distribution is 
 
     F_sens[i,s] = mean_k ||q[k,i,s]||
 
-The former coherent functional carriage is retained as a diagnostic:
-
-    F_coh[i,s] = ||mean_k q[k,i,s]||.
-
 `F_sens` asks whether a typical valid intervention reaches a carrier and is aligned with production
-EG specialisation; `F_coh` asks whether the population-average intervention moves it consistently.
-This is implemented centrally for both semantic and structural carriage: existing `F`/`F_mean`
-fields now mean `F_sens`, while raw and aggregated `F_coh` remain available. Functional-carriage
-version 2 invalidates old progress snapshots rather than silently mixing the estimands. Retain donor
-coherence as a diagnostic, and optionally compare gross versus signed-net contributions within each
-distance band. Do not globally sum carriers before constructing the distance profile.
+EG specialisation. The coherent-response alternative was empirically indistinguishable in both the
+synthetic and ZINC validations and is therefore retired from the beta pipeline rather than computed
+as a duplicate curve. Existing `F`/`F_mean` fields mean `F_sens`. Functional-carriage version 2
+invalidates old progress snapshots rather than silently mixing estimands. Optional donor-direction
+coherence analyses must be separately motivated; they are not part of functional carriage. Do not
+globally sum carriers before constructing the distance profile.
 
 No replacement for integrated beneficial carriage is required. Its donor-wise signed path
 attribution and subsequent averaging are precisely what preserve loss completeness:
@@ -265,7 +261,7 @@ and costs additional backward work, so it does not block the cheap `F_sens` expe
 ### 7. Experimental validation sequence
 
 1. **Cache-compatible discovery.** Version the score cache; retain legacy matrices and accumulate
-   all four specialisation scores, `F_sens/F_coh`, coherence, per-graph summaries, clean condition
+   all four specialisation scores, `F_sens`, per-graph summaries, clean condition
    metadata, intervention type/dose and localisation statistics without new intervention forwards.
 2. **Reliability.** Use nested graph/source/event bootstrap, explicit deterministic no-op/sham noise
    floors, repeated donor seeds and `K`-convergence checks. Report score/selectivity CIs, ranking and
@@ -315,7 +311,7 @@ three existing `cycle_dual_v2` checkpoints read-only and writes only to
   cross-graph mismatch and sham controls, plus family-by-channel interactions;
 - decompose fixed-support transport into exact routing/message terms and causally patch routing,
   message, full transport and their finite interaction;
-- report graph-balanced donor outcomes, support-aware `F_sens/F_coh`, event-specific structural
+- report graph-balanced donor outcomes, support-aware `F_sens`, event-specific structural
   distance, raw/J/G/D family ablations, and sample-split conditional rules with dose-overlap,
   sign-replication, spatial-phenotype and global-FDR checks.
 
@@ -362,10 +358,9 @@ support the following conclusions.
   is approximately `7.6e-6`; finite component interaction is near zero for the selected families;
   semantic rescue is almost entirely message-mediated and structural rescue almost entirely
   routing-mediated across the three seeds.
-- **Sensitivity and coherence are empirically distinct.** Structural-ranked heads have highly
-  carrier-coherent and distance-localised responses, whereas semantic-ranked heads show more
-  cancellation across carriers and broader non-local carriage. This supports retaining both
-  `F_sens` and `F_coh` and the donor/carrier coherence diagnostics.
+- **Functional-carriage choice is resolved.** The eventwise-sensitivity and coherent-response
+  curves were effectively overlapping in both synthetic and ZINC validation. Retain only `F_sens`,
+  which has the cleaner eventwise-sensitivity interpretation and aligns directly with EG.
 
 ### Negative findings and constraints
 
@@ -432,11 +427,9 @@ single ZINC target. The transferable primary design is the **selected-family × 
    the exact decomposition and finite routing-only/message-only/full patches. Test whether the
    synthetic semantic-message and structural-routing dissociation survives. For a support-changing
    topology donor, add an explicit wiring/support component rather than forcing the two-way split.
-6. **Functional carriage and coherence.** Report production `F_sens` alongside diagnostic `F_coh`,
-   donor coherence, carrier coherence and graph-balanced distance profiles. Use shortest distance to
-   the changed node/edge set, report support by distance and normalize comparisons for molecule size.
-   Quantify whether the structural localisation and semantic carrier cancellation seen synthetically
-   recur; this no longer reopens the default-estimator choice.
+6. **Functional carriage.** Report production `F_sens` with graph-balanced distance profiles. Use
+   shortest distance to the changed node/edge set, report support by distance and normalize
+   comparisons for molecule size. The redundant coherent-response curve is no longer computed.
 7. **Functional versus task-level necessity.** Report finite prediction displacement, loss/MAE
    change and any sign changes separately for individual heads and frozen families. A small MAE
    effect with a large functional effect is evidence of redundancy, not failed mediation.
@@ -450,7 +443,7 @@ single ZINC target. The transferable primary design is the **selected-family × 
    from the cycle task.
 9. **Integrated beneficial carriage.** Validate the finite loss-completeness identity and helpful
    versus harmful donor decomposition on the regression loss. This remains complementary to, not a
-   replacement for, `F_sens/F_coh`.
+   replacement for, `F_sens`.
 
 ## ZINC transfer beta implementation
 
@@ -599,10 +592,11 @@ completed semantic/PE/topology integrations.
   confirmation for specialist labels; ablation alone remains insufficient.
 - **Mechanism:** retain routing/message labels only when both exact reconstruction and finite component
   patching agree. Treat wiring as a third component for topology-changing interventions.
-- **Carriage — firm and implemented:** use `F_sens` as the functional-carriage field aligned with EG;
-  retain `F_coh` and their ratio as coherence/cancellation diagnostics. Existing `F`/`F_mean`
-  artifact keys are compatibility aliases for `F_sens`, and functional-carriage version 2 prevents
-  reuse of coherent-default progress. Keep beneficial carriage as the complete signed loss attribution.
+- **Carriage — firm and implemented:** use `F_sens` as the sole functional-carriage field aligned
+  with EG. The empirically redundant coherent-response curve is not computed in the headline beta
+  pipeline. Existing `F`/`F_mean` artifact keys are compatibility aliases for `F_sens`, and
+  functional-carriage version 2 prevents reuse of coherent-default progress. Keep beneficial
+  carriage as the complete signed loss attribution.
 - **Distance-resolved specialisation — exact and implemented in beta:** decompose EG by the
   event-specific carrier distance before summing over carriers, with graphwise reconstruction as a
   fatal identity check. Use the resulting head/family reach profiles to explain which mechanisms

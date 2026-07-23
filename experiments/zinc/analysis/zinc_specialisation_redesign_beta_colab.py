@@ -441,7 +441,6 @@ def aggregate_projected_events(q: Any, valid: Any) -> dict[str, Any]:
             name: masked_mean(value, source_valid, dim=1)
             for name, value in {"CG": cg, "EG": eg, "CN": cn, "EN": en}.items()
         },
-        "F_coh_source": carrier_coherent,
         "F_sens_source": masked_mean(carrier_event, valid, dim=2),
         "source_valid": source_valid,
     }
@@ -1429,7 +1428,7 @@ def integrated_carriage_audit(records: Sequence[Mapping[str, Any]]) -> dict[str,
 def distance_profile_one_graph(
     q: Any, distances: np.ndarray, beneficial: Any | None = None
 ) -> list[dict[str, Any]]:
-    """F_sens/F_coh with event-specific changed sets and equal carrier weighting."""
+    """F_sens with event-specific changed sets and equal carrier weighting."""
 
     import torch
 
@@ -1453,13 +1452,9 @@ def distance_profile_one_graph(
             continue
         weight = pair_mask[:, None, None, :].to(q.dtype)
         per_carrier_sens = (event_norm * weight).sum(dim=0) / carrier_count[None, None, :].clamp_min(1)
-        expanded = pair_mask[:, None, None, :, None].to(q.dtype)
-        per_carrier_q = (q * expanded).sum(dim=0) / carrier_count[None, None, :, None].clamp_min(1)
-        per_carrier_coh = torch.linalg.vector_norm(per_carrier_q, dim=-1)
         row = {
             "distance": hop,
             "F_sens": per_carrier_sens[..., carrier_valid].mean(dim=-1).numpy(),
-            "F_coh": per_carrier_coh[..., carrier_valid].mean(dim=-1).numpy(),
             "carriers": int(carrier_valid.sum()),
             "event_carrier_pairs": int(pair_mask.sum()),
         }
@@ -2206,7 +2201,6 @@ def score_graph_channel(
                     "donor_scope": donor_scope,
                     **row,
                     "F_sens": float(np.asarray(row["F_sens"]).reshape(-1)[0]),
-                    "F_coh": float(np.asarray(row["F_coh"]).reshape(-1)[0]),
                 })
 
     y = base.y.detach().cpu().numpy().reshape(1, -1)
@@ -5614,16 +5608,15 @@ def carriage_profile(
         for item in result["carriage"]:
             distance = int(item["distance"])
             rows.setdefault(distance, {}).setdefault(
-                int(record["graph_id"]), {"F_sens": [], "F_coh": []}
+                int(record["graph_id"]), {"F_sens": []}
             )
-            for key in ("F_sens", "F_coh"):
-                matrix = np.asarray(item[key], dtype=float)
-                value = np.nanmean([matrix[head] for head in heads]) if heads else np.nanmean(matrix)
-                rows[distance][int(record["graph_id"])][key].append(float(value))
+            matrix = np.asarray(item["F_sens"], dtype=float)
+            value = np.nanmean([matrix[head] for head in heads]) if heads else np.nanmean(matrix)
+            rows[distance][int(record["graph_id"])]["F_sens"].append(float(value))
     distances = sorted(rows)
     graph_ids = sorted({graph for distance in distances for graph in rows[distance]})
     matrices = {}
-    for key in ("F_sens", "F_coh"):
+    for key in ("F_sens",):
         matrix = np.full((len(graph_ids), len(distances)), np.nan)
         for i, graph_id in enumerate(graph_ids):
             for j, distance in enumerate(distances):
@@ -5652,9 +5645,9 @@ def model_carriage_profile(
     bootstrap_samples: int = 1000,
     seed: int = 0,
 ) -> dict[str, np.ndarray]:
-    """Graph-balanced final-state F_sens/F_coh/B distance profile."""
+    """Graph-balanced final-state F_sens/B distance profile."""
 
-    keys = ("F_sens", "F_coh", "B", "B_sum")
+    keys = ("F_sens", "B", "B_sum")
     by_distance: dict[int, dict[int, dict[str, list[float]]]] = {}
     for record in score["records"]:
         result = record["channels"][channel]
@@ -6361,7 +6354,7 @@ def figure_model_functional_carriage(
                 seed=cfg.analysis_seed + 101 * row + column,
             )
             profiles[(task, channel)] = profile
-            for key in ("F_sens", "F_sens_ci_low", "F_sens_ci_high", "F_coh"):
+            for key in ("F_sens", "F_sens_ci_low", "F_sens_ci_high"):
                 values = np.asarray(profile[key], float)
                 positive.extend(values[np.isfinite(values) & (values > 0)])
     low = max(float(np.min(positive)) * 0.7, 1e-12) if positive else 1e-12
@@ -6375,7 +6368,6 @@ def figure_model_functional_carriage(
             axis.fill_between(x, profile["F_sens_ci_low"], profile["F_sens_ci_high"],
                               color=colors[channel], alpha=0.18)
             axis.plot(x, profile["F_sens"], marker="o", color=colors[channel], label="F_sens")
-            axis.plot(x, profile["F_coh"], linestyle="--", color="0.35", label="F_coh diagnostic")
             axis.set_yscale("log"); axis.set_ylim(low, high)
             axis.set_xlabel("distance to changed set [hops]")
             if column == 0:
@@ -6449,22 +6441,21 @@ def figure_carriage(
                 runs[task]["scores"], channel, families.get(family_for[channel], []),
                 seed=31_001 + row * 101 + column,
             )
-            for key, style in (("F_sens", "-"), ("F_coh", "--")):
-                value = profile[key]
-                denominator = max(float(np.nansum(value)), EPS)
-                normalised = value / denominator
-                axis.plot(profile["distance"], normalised, style, marker="o", label=key)
-                axis.fill_between(
-                    profile["distance"],
-                    profile[f"{key}_ci_low"] / denominator,
-                    profile[f"{key}_ci_high"] / denominator,
-                    alpha=0.12,
-                )
+            value = profile["F_sens"]
+            denominator = max(float(np.nansum(value)), EPS)
+            normalised = value / denominator
+            axis.plot(profile["distance"], normalised, "-", marker="o", label="F_sens")
+            axis.fill_between(
+                profile["distance"],
+                profile["F_sens_ci_low"] / denominator,
+                profile["F_sens_ci_high"] / denominator,
+                alpha=0.12,
+            )
             axis.set_xlabel("molecular hop distance from changed set")
             axis.set_ylabel("normalised functional carriage")
             axis.set_title(f"{DISPLAY[task]} · {channel}")
     axes[0, 0].legend(frameon=False)
-    fig.suptitle("Sensitivity versus coherent functional carriage", fontsize=11)
+    fig.suptitle("Specialist-family functional carriage (F_sens)", fontsize=11)
     outputs = save_figure(fig, path)
     plt.close(fig)
     return outputs
@@ -6763,7 +6754,7 @@ def create_decisions(
             "topology_convention": "common-support routing/message plus explicit exclusive-support wiring",
         },
         "carriage": (
-            "F_sens is the fixed headline; F_coh is diagnostic; all channels use event-specific "
+            "F_sens is the sole functional-carriage estimand; all channels use event-specific "
             "changed-set distance and shared log-scale figures"
         ),
         "beneficial_carriage": (
@@ -7070,11 +7061,8 @@ def create_outputs(runs: Mapping[str, Mapping[str, Any]], cfg: BetaConfig) -> di
                         "level": "final_state_model",
                         "distance": int(distance),
                         "F_sens": float(profile["F_sens"][index]),
-                        "F_coh": float(profile["F_coh"][index]),
                         "F_sens_ci_low": float(profile["F_sens_ci_low"][index]),
                         "F_sens_ci_high": float(profile["F_sens_ci_high"][index]),
-                        "F_coh_ci_low": float(profile["F_coh_ci_low"][index]),
-                        "F_coh_ci_high": float(profile["F_coh_ci_high"][index]),
                         "B": float(profile["B"][index]),
                         "B_ci_low": float(profile["B_ci_low"][index]),
                         "B_ci_high": float(profile["B_ci_high"][index]),
@@ -7203,7 +7191,9 @@ def create_outputs(runs: Mapping[str, Mapping[str, Any]], cfg: BetaConfig) -> di
         "fingerprint": cfg.fingerprint,
         "selected_aggregation": overall,
         "aggregation_choice": "predeclared headline EG; no data-dependent reselection",
-        "functional_carriage_choice": "predeclared F_sens; F_coh retained diagnostically",
+        "functional_carriage_choice": (
+            "predeclared F_sens only; redundant coherent-response curve omitted"
+        ),
         "distance_specialisation_choice": (
             "exact EG-by-distance decomposition retained; support-normalised EG and raw "
             "attention locality are explicitly diagnostic companion views"

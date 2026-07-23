@@ -28,7 +28,6 @@ def test_four_aggregations_preserve_donor_order_and_carrier_cancellation() -> No
     result = BETA.aggregate_projected_events(q, torch.ones(1, 1, 2, dtype=torch.bool))
     observed = {key: float(value[0, 0, 0]) for key, value in result["per_graph"].items()}
     assert observed == pytest.approx({"CG": 2.0, "EG": 3.0, "CN": 2.0, "EN": 2.0})
-    assert result["F_coh_source"][0, 0, 0, 0].tolist() == pytest.approx([2.0, 0.0])
     assert result["F_sens_source"][0, 0, 0, 0].tolist() == pytest.approx([2.0, 1.0])
 
 
@@ -52,7 +51,6 @@ def test_distance_profiles_use_each_events_own_changed_set() -> None:
     assert [row["distance"] for row in rows] == [0, 1]
     # At d=0, each event contributes at its own changed carrier: mean(|2|,|4|)=3.
     assert rows[0]["F_sens"][0, 0] == pytest.approx(3.0)
-    assert rows[0]["F_coh"][0, 0] == pytest.approx(3.0)
 
 
 def test_distance_profiles_keep_signed_beneficial_carriage() -> None:
@@ -470,14 +468,12 @@ def _fake_score_payload(offset: float = 0.0):
                 "carriage": [{
                     "distance": distance,
                     "F_sens": matrix / (distance + 1),
-                    "F_coh": 0.8 * matrix / (distance + 1),
                     "source_index": 0,
                     "carriers": 2,
                 } for distance in (0, 1)],
                 "model_carriage": [{
                     "distance": distance,
                     "F_sens": float(matrix.mean() / (distance + 1)),
-                    "F_coh": float(0.8 * matrix.mean() / (distance + 1)),
                     "B": float((-1 if distance == 0 else 1) * 0.01 * matrix.mean()),
                     "B_sum": float((-1 if distance == 0 else 1) * 0.02 * matrix.mean()),
                     "source_index": 0,
