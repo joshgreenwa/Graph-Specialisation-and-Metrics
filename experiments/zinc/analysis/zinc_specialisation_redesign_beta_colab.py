@@ -1343,6 +1343,51 @@ def final_state_carriage_group(
         rtol=cfg.integrated_rtol,
         max_intervals=cfg.integrated_max_intervals,
     )
+    # Rare L1/ReLU kink paths can exhaust the ordinary cap even when the carrier
+    # quadrature estimate is already stable. Retry only numerically unacceptable
+    # capped paths at higher resolution; ordinary paths pay no extra cost.
+    retry_indices = np.flatnonzero(
+        (
+            ~path["converged"].detach().cpu().numpy().astype(bool)
+        )
+        & (
+            (
+                path["completeness_residual"].abs().detach().cpu().numpy()
+                > float(cfg.integrated_unconverged_error_cap)
+            )
+            | (
+                path["quadrature_error"].detach().cpu().numpy()
+                > float(cfg.integrated_unconverged_error_cap)
+            )
+        )
+    )
+    retry_max_intervals = max(int(cfg.integrated_max_intervals) * 4, 1024)
+    if retry_indices.size:
+        print(
+            "[carriage] retrying "
+            f"{retry_indices.size}/{int(path['converged'].numel())} capped donor paths "
+            f"at max_intervals={retry_max_intervals}",
+            flush=True,
+        )
+        retry_index = torch.as_tensor(
+            retry_indices, dtype=torch.long, device=clean.device
+        )
+        retry = core.integrated_loss_carriage(
+            clean.index_select(0, retry_index),
+            swap.index_select(0, retry_index),
+            loss_from_pooled,
+            pooling=pooling,
+            atol=cfg.integrated_atol,
+            rtol=cfg.integrated_rtol,
+            max_intervals=retry_max_intervals,
+        )
+        for key in (
+            "carriage", "loss_delta", "completeness_residual",
+            "quadrature_error", "intervals", "converged",
+        ):
+            merged = path[key].clone()
+            merged.index_copy_(0, retry_index.to(merged.device), retry[key])
+            path[key] = merged
     residual = path["completeness_residual"].abs()
     converged = _retain_or_reject_unconverged_paths(
         path, cfg, "ZINC beta donor"
@@ -1379,6 +1424,8 @@ def final_state_carriage_group(
         "integrated_atol": float(cfg.integrated_atol),
         "integrated_rtol": float(cfg.integrated_rtol),
         "integrated_max_intervals": int(cfg.integrated_max_intervals),
+        "integrated_retry_paths": int(retry_indices.size),
+        "integrated_retry_max_intervals": int(retry_max_intervals),
         "integrated_unconverged_error_cap": float(
             cfg.integrated_unconverged_error_cap
         ),
@@ -1398,9 +1445,14 @@ def integrated_carriage_audit(records: Sequence[Mapping[str, Any]]) -> dict[str,
     ]
     paths = int(sum(int(item.get("paths", 0)) for item in diagnostics))
     unconverged = int(sum(int(item.get("unconverged", 0)) for item in diagnostics))
+    retry_paths = int(sum(
+        int(item.get("integrated_retry_paths", 0)) for item in diagnostics
+    ))
     return {
         "groups": len(diagnostics),
         "paths": paths,
+        "retry_paths": retry_paths,
+        "retry_fraction": float(retry_paths / paths) if paths else 0.0,
         "unconverged": unconverged,
         "unconverged_fraction": float(unconverged / paths) if paths else 0.0,
         "completeness_max": float(max(
@@ -6859,6 +6911,12 @@ def create_outputs(runs: Mapping[str, Mapping[str, Any]], cfg: BetaConfig) -> di
                         "unconverged": int(diagnostic["unconverged"]),
                         "unconverged_fraction": float(
                             diagnostic.get("unconverged_fraction", 0.0)
+                        ),
+                        "retry_paths": int(
+                            diagnostic.get("integrated_retry_paths", 0)
+                        ),
+                        "retry_max_intervals": int(
+                            diagnostic.get("integrated_retry_max_intervals", 0)
                         ),
                         "completeness_max": float(diagnostic["completeness_max"]),
                         "quadrature_error_max": float(diagnostic["quadrature_error_max"]),
