@@ -13,13 +13,20 @@ specialisation and eventwise functional sensitivity ``F_sens`` carriage.  It tes
 * D selectivity, evoked strength J, and joint-channel strength G;
 * whole-transport restore/inject patching, zero-ablation necessity, sham and
   same-node-count cross-graph mismatch controls on an independent graph split;
+* the correct causal target for D: held-out differential semantic-versus-PE mediation,
+  with two swaps per source, hierarchical averaging, graph bootstrap, within-layer
+  permutation tests and frozen D-extreme versus same-layer/J-matched family controls;
+  a separately labelled semantic-versus-topology analogue, raw causal-strength controls,
+  and a role/importance/necessity/rescue map;
 * individual and family ablation on a third split;
 * support-aware routing/message/wiring decomposition for all three interventions;
-* final-state ``F_sens`` and path-integrated beneficial carriage for semantic, PE and topology;
+* final-state ``F_sens`` and path-integrated beneficial carriage for semantic, PE and a
+  genuinely local, degree-preserving topology reach probe;
 * an exact distance decomposition of each head's EG score, with a separate hub bucket,
   a support-normalised per-opportunity companion, clean attention-distance locality,
   and frozen-family reach profiles aligned to functional and beneficial carriage;
-* an expanded sample-split conditional screen over raw scores and all pairwise D/J/G coordinates;
+* an expanded sample-split conditional screen over raw scores and all pairwise D/J/G coordinates,
+  with intervention-unit compatibility and independent causal-split confirmation;
 * a matched-real, non-isomorphic molecular-topology donor intervention with donor
   topology/RRWP copied in aligned base-node coordinates while atom content and target
   stay fixed.
@@ -29,8 +36,14 @@ versus topology score planes, activity-gated PE versus topology contrasts, poole
 correlations, top-k graph-bootstrap stability, frozen PE-specific/topology-specific/shared families,
 held-out simultaneous three-channel family patching, and tier/dose-stratified results.
 
+Whole-molecule matched donors are intentionally *not* used to estimate topology reach: their
+changed-node set generally covers most of a small molecule, making distance-to-edit collapse to a
+few hops.  A separate local topology phase uses a degree- and bond-label-preserving two-edge switch,
+recomputes RRWP from the edited graph, and measures distance from its four edited endpoints.  Thus
+the global donor tests topology sensitivity/specialisation, while the local edit tests propagation.
+
 The expensive phases are resumable: ``scores``, ``attention``, ``causal``, ``mechanism``,
-``ablations``, and ``figures``. Score estimation checkpoints every completed source group,
+``ablations``, ``topology-reach``, and ``figures``. Score estimation checkpoints every completed source group,
 channel and graph; clean attention locality checkpoints every graph;
 rare quadrature cap hits are retained only under explicit per-path error and global-rate gates.
 ``all`` runs the phases in order. ``--fast-dev-run`` is plumbing only.
@@ -59,6 +72,12 @@ import numpy as np
 
 BETA_VERSION = "zinc-specialisation-headline-v2"
 BETA_SCHEMA = 2
+CAUSAL_PROTOCOL_VERSION = 2
+CAUSAL_EVENTS_PER_SOURCE = 2
+TOPOLOGY_REACH_PROTOCOL_VERSION = 1
+LOCAL_TOPOLOGY_CHANNEL = "topology_local"
+LOCAL_TOPOLOGY_SOURCES = 4
+LOCAL_TOPOLOGY_EVENTS_PER_SOURCE = 4
 REPOSITORY_URL = "https://github.com/joshgreenwa/Graph-Specialisation-and-Metrics.git"
 REPOSITORY_BRANCH = "codex/cfim-grit-experiments"
 COLAB_REPOSITORY = Path("/content/Graph-Specialisation-and-Metrics")
@@ -75,6 +94,10 @@ HEADLINE_AGGREGATION = "EG"
 PATCH_FAMILY_NAMES = (
     "semantic_specialist",
     "pe_specialist",
+    "semantic_D_extreme",
+    "pe_D_extreme",
+    "semantic_D_J_matched",
+    "pe_D_J_matched",
     "structural_pe_specific",
     "structural_topology_specific",
     "structural_shared",
@@ -86,6 +109,7 @@ DISTANCE_FAMILIES = {
     "semantic": ("semantic_specialist", "high_G_balanced"),
     "pe": ("structural_pe_specific", "structural_shared"),
     "topology": ("structural_topology_specific", "structural_shared"),
+    LOCAL_TOPOLOGY_CHANNEL: ("structural_topology_specific", "structural_shared"),
 }
 CONDITIONAL_SCORE_FEATURES = (
     "S_semantic", "S_pe", "S_topology",
@@ -94,6 +118,17 @@ CONDITIONAL_SCORE_FEATURES = (
     "D_pe_topology", "J_pe_topology", "G_pe_topology",
     "J_three_channel", "G_three_channel",
 )
+TOPOLOGY_CONDITIONAL_FEATURES = frozenset({
+    "S_topology",
+    "D_semantic_topology", "J_semantic_topology", "G_semantic_topology",
+    "D_pe_topology", "J_pe_topology", "G_pe_topology",
+    "J_three_channel", "G_three_channel",
+})
+CHANNEL_DISPLAY = {
+    "semantic": "semantic",
+    "pe": "PE",
+    "topology": "topology",
+}
 EPS = 1.0e-12
 CUDA_EQUIVALENCE_ATOL = 1.0e-4
 CUDA_EQUIVALENCE_RTOL = 2.0e-5
@@ -819,6 +854,311 @@ def topology_edit_dose(
     }
 
 
+def _canonical_edge(left: int, right: int) -> tuple[int, int]:
+    return (min(int(left), int(right)), max(int(left), int(right)))
+
+
+def undirected_bond_attribute_rows(data: Any) -> dict[tuple[int, int], Any]:
+    """Return one checked edge-attribute tensor per undirected molecular bond."""
+
+    import torch
+
+    edge_index = data.edge_index.detach().cpu().numpy().astype(np.int64)
+    edge_attr = getattr(data, "edge_attr", None)
+    if edge_attr is None or int(edge_attr.shape[0]) != int(edge_index.shape[1]):
+        raise RuntimeError("local topology edits require edge-aligned molecular bond attributes")
+    output: dict[tuple[int, int], Any] = {}
+    for position, (left, right) in enumerate(edge_index.T):
+        if int(left) == int(right):
+            continue
+        key = _canonical_edge(int(left), int(right))
+        value = edge_attr[position].detach().clone()
+        if key in output and not torch.equal(output[key], value):
+            raise RuntimeError(f"directed rows disagree on bond attribute for edge {key}")
+        output[key] = value
+    expected = {tuple(map(int, edge)) for edge in molecular_edges(data)}
+    if set(output) != expected:
+        missing = sorted(expected - set(output))
+        extra = sorted(set(output) - expected)
+        raise RuntimeError(
+            f"molecular edge/attribute support mismatch; missing={missing}, extra={extra}"
+        )
+    return output
+
+
+def _bond_attribute_key(value: Any) -> tuple[Any, ...]:
+    array = value.detach().cpu().numpy().reshape(-1)
+    return tuple(array.tolist())
+
+
+def _connected_undirected_graph(n: int, edges: np.ndarray) -> bool:
+    if int(n) <= 1:
+        return True
+    distance = shortest_paths(int(n), np.asarray(edges, dtype=np.int64))
+    return bool(np.isfinite(distance).all())
+
+
+def plan_local_topology_events(
+    base: Any,
+    *,
+    graph_id: int,
+    seed: int,
+    maximum_sources: int = LOCAL_TOPOLOGY_SOURCES,
+    events_per_source: int = LOCAL_TOPOLOGY_EVENTS_PER_SOURCE,
+) -> list[dict[str, Any]]:
+    """Plan local degree-preserving two-edge switches.
+
+    Each event removes two disjoint, identically labelled bonds and reconnects their
+    four endpoints in one of the two alternative pairings.  Degree, edge count and the
+    bond-label multiset are therefore fixed; disconnected, duplicate and no-op edits
+    are rejected.  Candidate source groups are ranked for *locality* (large pristine
+    distance from the four edited endpoints to at least one carrier), preventing a
+    global changed set from silently masquerading as a reach experiment.
+    """
+
+    n = int(base.num_nodes)
+    edges = [tuple(map(int, edge)) for edge in molecular_edges(base, n)]
+    edge_set = set(edges)
+    attributes = undirected_bond_attribute_rows(base)
+    pristine_distance = shortest_paths(n, np.asarray(edges, dtype=np.int64))
+    candidates_by_anchor: dict[tuple[int, int], list[dict[str, Any]]] = {}
+    for first_index, first in enumerate(edges):
+        a, b = first
+        for second in edges[first_index + 1:]:
+            c, d = second
+            if len({a, b, c, d}) != 4:
+                continue
+            if _bond_attribute_key(attributes[first]) != _bond_attribute_key(attributes[second]):
+                continue
+            alternatives = (
+                (_canonical_edge(a, c), _canonical_edge(b, d)),
+                (_canonical_edge(a, d), _canonical_edge(b, c)),
+            )
+            for added in alternatives:
+                if added[0] == added[1] or any(edge in edge_set for edge in added):
+                    continue
+                edited_set = (edge_set - {first, second}) | set(added)
+                if len(edited_set) != len(edge_set):
+                    continue
+                edited_edges = np.asarray(sorted(edited_set), dtype=np.int64)
+                if not _connected_undirected_graph(n, edited_edges):
+                    continue
+                if not np.array_equal(
+                    degrees_from_edges(n, edited_edges),
+                    degrees_from_edges(n, np.asarray(edges, dtype=np.int64)),
+                ):
+                    continue
+                changed = np.asarray(sorted({a, b, c, d}), dtype=np.int64)
+                nearest = np.min(pristine_distance[:, changed], axis=1)
+                finite = nearest[np.isfinite(nearest)]
+                changed_pair_distance = pristine_distance[np.ix_(changed, changed)]
+                event = {
+                    "removed_edges": np.asarray([first, second], dtype=np.int64),
+                    "added_edges": np.asarray(sorted(added), dtype=np.int64),
+                    "changed_nodes": changed,
+                    "bond_attribute": attributes[first].detach().cpu().numpy(),
+                    "dose": {
+                        "edge_symmetric_difference": 4,
+                        "edge_jaccard_distance": float(4 / max(2 * len(edges), 1)),
+                        "changed_nodes": changed.tolist(),
+                        "changed_node_fraction": float(len(changed) / max(n, 1)),
+                        "maximum_pristine_distance": int(np.max(finite)) if len(finite) else -1,
+                        "mean_pristine_distance": float(np.mean(finite)) if len(finite) else float("nan"),
+                        "changed_set_diameter": float(np.max(changed_pair_distance)),
+                    },
+                }
+                candidates_by_anchor.setdefault(first, []).append(event)
+
+    # Seeded tie-breaking avoids graph-order artefacts while leaving the primary ranking
+    # (maximum observable reach, then compactness of the edited set) explicit.
+    rng = np.random.default_rng(int(seed) + 7919 * int(graph_id))
+    ranked_groups = []
+    for anchor, candidates in candidates_by_anchor.items():
+        random_rank = rng.permutation(len(candidates))
+        candidates = [
+            item for _, item in sorted(
+                zip(random_rank, candidates),
+                key=lambda pair: (
+                    -int(pair[1]["dose"]["maximum_pristine_distance"]),
+                    float(pair[1]["dose"]["changed_set_diameter"]),
+                    int(pair[0]),
+                ),
+            )
+        ]
+        selected = candidates[: int(events_per_source)]
+        if selected:
+            ranked_groups.append({
+                "source_edge": np.asarray(anchor, dtype=np.int64),
+                "events": selected,
+                "maximum_pristine_distance": max(
+                    int(item["dose"]["maximum_pristine_distance"]) for item in selected
+                ),
+                "changed_set_diameter": min(
+                    float(item["dose"]["changed_set_diameter"]) for item in selected
+                ),
+            })
+    rng.shuffle(ranked_groups)
+    ranked_groups.sort(
+        key=lambda item: (
+            -int(item["maximum_pristine_distance"]),
+            float(item["changed_set_diameter"]),
+        )
+    )
+    return ranked_groups[: int(maximum_sources)]
+
+
+def recompute_rrwp_fields(edge_index: Any, *, num_nodes: int, width: int) -> dict[str, Any]:
+    """Pure-Torch reproduction of official GRIT ``add_full_rrwp``.
+
+    Official GRIT stores ``[I, P, ..., P^(k-1)]`` and reverses the sparse pair index
+    from row/column into message-passing source/destination coordinates.
+    """
+
+    import torch
+
+    device = edge_index.device
+    adjacency = torch.zeros(
+        int(num_nodes), int(num_nodes), dtype=torch.float32, device=device
+    )
+    if edge_index.numel():
+        adjacency[edge_index[0].long(), edge_index[1].long()] = 1.0
+    degree = adjacency.sum(dim=1)
+    inverse = torch.where(degree > 0, degree.reciprocal(), torch.zeros_like(degree))
+    transition = adjacency * inverse[:, None]
+    powers = []
+    if int(width) >= 1:
+        powers.append(torch.eye(int(num_nodes), dtype=torch.float32, device=device))
+    current = transition
+    while len(powers) < int(width):
+        powers.append(current)
+        current = current @ transition
+    pe = (
+        torch.stack(powers, dim=-1)
+        if powers else torch.zeros(int(num_nodes), int(num_nodes), 0, device=device)
+    )
+    support = pe.abs().sum(dim=-1) > 0
+    row, column = torch.nonzero(support, as_tuple=True)
+    return {
+        "rrwp": pe.diagonal(dim1=0, dim2=1).transpose(0, 1).contiguous(),
+        "rrwp_index": torch.stack([column, row], dim=0).long(),
+        "rrwp_val": pe[row, column].contiguous(),
+        "deg": degree.long(),
+        "log_deg": torch.log(degree + 1.0),
+    }
+
+
+def _dense_rrwp_pair_payload(data: Any) -> Any:
+    import torch
+
+    n = int(data.num_nodes)
+    value = data.rrwp_val.reshape(data.rrwp_val.shape[0], -1)
+    output = torch.zeros(
+        n, n, int(value.shape[1]), dtype=value.dtype, device=value.device
+    )
+    index = data.rrwp_index.long()
+    output[index[1], index[0]] = value
+    return output
+
+
+def rrwp_reconstruction_audit(base: Any) -> dict[str, Any]:
+    """Verify the local recomputation exactly matches the loader's pristine RRWP."""
+
+    import torch
+
+    width = int(base.rrwp.reshape(int(base.num_nodes), -1).shape[1])
+    rebuilt = recompute_rrwp_fields(
+        base.edge_index, num_nodes=int(base.num_nodes), width=width
+    )
+    observed_pair = _dense_rrwp_pair_payload(base).float()
+    rebuilt_pair = torch.zeros_like(observed_pair)
+    index = rebuilt["rrwp_index"]
+    rebuilt_pair[index[1], index[0]] = rebuilt["rrwp_val"].to(rebuilt_pair)
+    checks = {
+        "pair": tensor_equivalent(observed_pair, rebuilt_pair),
+        "node": tensor_equivalent(base.rrwp.float(), rebuilt["rrwp"].to(base.rrwp).float()),
+        "degree": bool(torch.equal(base.deg.long(), rebuilt["deg"].to(base.deg.device))),
+        "log_degree": tensor_equivalent(
+            base.log_deg.float(), rebuilt["log_deg"].to(base.log_deg).float()
+        ),
+    }
+    checks["passed"] = bool(
+        checks["pair"]["passed"]
+        and checks["node"]["passed"]
+        and checks["degree"]
+        and checks["log_degree"]["passed"]
+    )
+    if not checks["passed"]:
+        raise RuntimeError(f"local topology RRWP reconstruction does not match loader: {checks}")
+    return checks
+
+
+def local_topology_variant(base: Any, event: Mapping[str, Any]) -> Any:
+    """Apply one local two-edge switch and recompute all ZINC topology/RRWP fields."""
+
+    import torch
+
+    unsupported = [
+        field for field in ("abs_pe", "pestat_RRWP", "EigVals", "EigVecs")
+        if getattr(base, field, None) is not None
+    ]
+    if unsupported:
+        raise RuntimeError(
+            "local topology recomputation does not implement extra structural fields: "
+            + ", ".join(unsupported)
+        )
+    out = base.clone()
+    removed = {
+        tuple(map(int, edge)) for edge in np.asarray(event["removed_edges"], dtype=np.int64)
+    }
+    added = [
+        tuple(map(int, edge)) for edge in np.asarray(event["added_edges"], dtype=np.int64)
+    ]
+    edge_index = base.edge_index
+    canonical = torch.stack(
+        [
+            torch.minimum(edge_index[0], edge_index[1]),
+            torch.maximum(edge_index[0], edge_index[1]),
+        ],
+        dim=1,
+    ).detach().cpu().numpy()
+    keep_numpy = np.asarray(
+        [tuple(map(int, edge)) not in removed for edge in canonical], dtype=bool
+    )
+    keep = torch.as_tensor(keep_numpy, dtype=torch.bool, device=edge_index.device)
+    kept_index = edge_index[:, keep]
+    kept_attr = base.edge_attr[keep]
+    added_directed = []
+    for left, right in added:
+        added_directed.extend(((left, right), (right, left)))
+    added_index = torch.as_tensor(
+        added_directed, dtype=edge_index.dtype, device=edge_index.device
+    ).T.contiguous()
+    attribute = torch.as_tensor(
+        event["bond_attribute"], dtype=base.edge_attr.dtype, device=base.edge_attr.device
+    )
+    added_attr = torch.stack(
+        [attribute.clone() for _ in added_directed], dim=0
+    )
+    out.edge_index = torch.cat([kept_index, added_index], dim=1)
+    out.edge_attr = torch.cat([kept_attr, added_attr], dim=0)
+    width = int(base.rrwp.reshape(int(base.num_nodes), -1).shape[1])
+    rebuilt = recompute_rrwp_fields(
+        out.edge_index, num_nodes=int(base.num_nodes), width=width
+    )
+    for field, value in rebuilt.items():
+        reference = getattr(base, field)
+        setattr(out, field, value.to(device=reference.device, dtype=reference.dtype))
+    if getattr(base, "rrwp_local_edge_index", None) is not None:
+        out.rrwp_local_edge_index = out.edge_index.clone()
+    if not torch.equal(out.x, base.x):
+        raise RuntimeError("local topology edit altered semantic x")
+    if getattr(base, "y", None) is not None and not torch.equal(out.y, base.y):
+        raise RuntimeError("local topology edit altered target y")
+    if not torch.equal(out.deg, base.deg):
+        raise RuntimeError("degree-preserving topology edit changed node degree")
+    return out
+
+
 # =====================================================================================
 # Task loading, deterministic splits, and intervention manifests
 # =====================================================================================
@@ -1187,7 +1527,7 @@ def plan_graph_events(
 
 
 def graph_event_variants(gm: Any, plan: Mapping[str, Any], channel: str) -> list[list[Any]]:
-    """Return source groups of Data variants; topology has one graph-level group."""
+    """Return source groups of Data variants; global topology has one graph-level group."""
 
     base = gm.eval_ds[int(plan["graph_id"])]
     if channel == "semantic":
@@ -1209,6 +1549,11 @@ def graph_event_variants(gm: Any, plan: Mapping[str, Any], channel: str) -> list
             )
             for item in plan["topology"]
         ]]
+    if channel == LOCAL_TOPOLOGY_CHANNEL:
+        return [
+            [local_topology_variant(base, event) for event in item["events"]]
+            for item in plan[LOCAL_TOPOLOGY_CHANNEL]
+        ]
     raise ValueError(channel)
 
 
@@ -1434,13 +1779,18 @@ def final_state_carriage_group(
     return q_final.detach().cpu(), path["carriage"].detach().cpu(), diagnostics
 
 
-def integrated_carriage_audit(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+def integrated_carriage_audit(
+    records: Sequence[Mapping[str, Any]],
+    channels: Sequence[str] | None = None,
+) -> dict[str, Any]:
     """Aggregate the predeclared rare-cap policy over every cached score path."""
 
+    selected = tuple(channels) if channels is not None else CHANNELS
     diagnostics = [
         diagnostic
         for record in records
-        for channel in CHANNELS
+        for channel in selected
+        if channel in record["channels"]
         for diagnostic in record["channels"][channel].get("beneficial_diagnostics", [])
     ]
     paths = int(sum(int(item.get("paths", 0)) for item in diagnostics))
@@ -1573,6 +1923,24 @@ def event_distance_matrix(
                 if len(changed) else np.full(n, np.inf)
             )
         real = np.stack(real_rows)
+    elif channel == LOCAL_TOPOLOGY_CHANNEL:
+        items = plan[LOCAL_TOPOLOGY_CHANNEL]
+        if source_index >= len(items):
+            raise ValueError(
+                f"local topology source {source_index} is outside {len(items)} groups"
+            )
+        events = items[source_index]["events"]
+        if len(events) != event_count:
+            raise ValueError(
+                f"local topology plan has {len(events)} events but q has {event_count}"
+            )
+        real = np.stack([
+            np.min(
+                distance[:, np.asarray(event["changed_nodes"], dtype=np.int64)],
+                axis=1,
+            )
+            for event in events
+        ])
     else:
         raise ValueError(f"unknown intervention channel {channel!r}")
 
@@ -2116,11 +2484,15 @@ def score_graph_channel(
         group_path = None
         group_chunk = None
         if task_name is not None and checkpoint_sha is not None:
+            cache_channel = (
+                f"{channel}_v{TOPOLOGY_REACH_PROTOCOL_VERSION}"
+                if channel == LOCAL_TOPOLOGY_CHANNEL else channel
+            )
             group_path = score_component_cache_path(
                 cfg,
                 task_name,
                 int(plan["graph_id"]),
-                f"{channel}_source_{source_index}",
+                f"{cache_channel}_source_{source_index}",
                 checkpoint_sha,
             )
             group_chunk = None if force else valid_cache(
@@ -2197,31 +2569,16 @@ def score_graph_channel(
         per_graph = {key: value[0].numpy() for key, value in aggregation["per_graph"].items()}
         per_source = {key: value[0].numpy() for key, value in aggregation["per_source"].items()}
 
-    edges = np.asarray(plan["descriptor"]["edges"], dtype=np.int64)
-    distance = shortest_paths(n, edges)
     carriage_rows = []
     model_carriage_rows = []
     for group_index, (source_index, q) in enumerate(zip(source_indices, q_groups)):
-        if channel == "semantic":
-            source = int(plan["semantic"][source_index]["source"])
-            event_distances = np.repeat(distance[:, source][None, :], len(q), axis=0)
-        elif channel == "pe":
-            item = plan["pe"][source_index]
-            source = int(item["source"])
-            event_distances = np.stack([
-                np.minimum(distance[:, source], distance[:, int(partner)])
-                for partner in item["partners"]
-            ])
-        else:
-            event_distances = []
-            for item in plan["topology"]:
-                changed = list(map(int, item["dose"]["changed_nodes"]))
-                event_distances.append(
-                    np.min(distance[:, changed], axis=1) if changed else np.full(n, np.inf)
-                )
-            event_distances = np.stack(event_distances)
-        # Encode disconnected/undefined carriers as -1 so they are omitted, not a fake far bin.
-        event_distances = np.where(np.isfinite(event_distances), event_distances, -1).astype(int)
+        event_distances = event_distance_matrix(
+            {"n": n, "plan": plan},
+            channel,
+            int(source_index),
+            event_count=int(len(q)),
+            carrier_count=int(q.shape[-2]),
+        )
         subsets: list[tuple[str, np.ndarray]] = [
             ("headline", np.arange(len(q), dtype=np.int64))
         ]
@@ -2617,6 +2974,274 @@ def run_scores_task(
     return payload
 
 
+def verify_local_topology_intervention(
+    base: Any, local_plan: Sequence[Mapping[str, Any]]
+) -> dict[str, Any]:
+    """Fail closed on the local edit, RRWP reconstruction and distance contract."""
+
+    import torch
+
+    if not local_plan or not local_plan[0]["events"]:
+        raise RuntimeError("cannot verify an empty local topology plan")
+    rrwp_audit = rrwp_reconstruction_audit(base)
+    event = local_plan[0]["events"][0]
+    variant = local_topology_variant(base, event)
+    base_set = {tuple(map(int, edge)) for edge in molecular_edges(base)}
+    removed = {
+        tuple(map(int, edge))
+        for edge in np.asarray(event["removed_edges"], dtype=np.int64)
+    }
+    added = {
+        tuple(map(int, edge))
+        for edge in np.asarray(event["added_edges"], dtype=np.int64)
+    }
+    expected = (base_set - removed) | added
+    observed = {tuple(map(int, edge)) for edge in molecular_edges(variant)}
+    if observed != expected:
+        raise RuntimeError(
+            f"local topology molecular support mismatch: expected={expected}, observed={observed}"
+        )
+    if len(base_set.symmetric_difference(observed)) != 4:
+        raise RuntimeError("local topology switch must have an undirected edge dose of four")
+    if not torch.equal(base.x, variant.x) or (
+        getattr(base, "y", None) is not None and not torch.equal(base.y, variant.y)
+    ):
+        raise RuntimeError("local topology switch changed semantic content or target")
+    if not torch.equal(base.deg, variant.deg):
+        raise RuntimeError("local topology switch failed degree preservation")
+    changed = set(map(int, event["changed_nodes"]))
+    expected_changed = {node for edge in removed | added for node in edge}
+    if changed != expected_changed or len(changed) != 4:
+        raise RuntimeError(
+            f"local topology changed set must be exactly four endpoints, got {sorted(changed)}"
+        )
+    return {
+        "passed": True,
+        "rrwp_pristine_reconstruction": rrwp_audit,
+        "content_target_fixed": True,
+        "degree_preserved": True,
+        "edge_count_preserved": len(base_set) == len(observed),
+        "bond_label_multiset_preserved": True,
+        "changed_nodes": sorted(changed),
+        "edge_symmetric_difference": 4,
+    }
+
+
+def local_topology_reach_audit(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """Summarise whether the planned local sources actually expose long distances."""
+
+    distances = []
+    changed_fractions = []
+    graph_maxima = {}
+    unavailable = []
+    for record in records:
+        groups = record["plan"].get(LOCAL_TOPOLOGY_CHANNEL, [])
+        if not groups:
+            unavailable.append(int(record["graph_id"]))
+            continue
+        graph_values = []
+        for group in groups:
+            for event in group["events"]:
+                dose = event["dose"]
+                value = int(dose["maximum_pristine_distance"])
+                distances.append(value)
+                graph_values.append(value)
+                changed_fractions.append(float(dose["changed_node_fraction"]))
+        if graph_values:
+            graph_maxima[int(record["graph_id"])] = max(graph_values)
+    values = np.asarray(distances, dtype=int)
+    return {
+        "protocol_version": TOPOLOGY_REACH_PROTOCOL_VERSION,
+        "intervention": "local degree- and bond-label-preserving two-edge switch",
+        "distance_reference": "pristine molecular distance to the four edited endpoints",
+        "graphs": len(records),
+        "eligible_graphs": len(graph_maxima),
+        "unavailable_graph_ids": unavailable,
+        "events": int(len(values)),
+        "maximum_planned_distance": int(values.max()) if len(values) else -1,
+        "median_planned_distance": float(np.median(values)) if len(values) else float("nan"),
+        "events_reaching_beyond_3": int(np.sum(values > 3)) if len(values) else 0,
+        "fraction_events_reaching_beyond_3": float(np.mean(values > 3)) if len(values) else 0.0,
+        "mean_changed_node_fraction": (
+            float(np.mean(changed_fractions)) if changed_fractions else float("nan")
+        ),
+        "graph_maximum_distance": graph_maxima,
+    }
+
+
+def run_topology_reach_task(
+    loaded: Mapping[str, Any],
+    cfg: BetaConfig,
+    score_payload: Mapping[str, Any],
+    *,
+    force: bool = False,
+) -> dict[str, Any]:
+    """Run only the local topology reach probe, reusing all global score caches."""
+
+    import torch
+
+    gm, checkpoint_sha = loaded["gm"], loaded["sha"]
+    task_name = loaded["spec"].name
+    path = cache_path(cfg, task_name, "topology_reach", checkpoint_sha)
+    cached = None if force else valid_cache(path, cfg, checkpoint_sha)
+    if cached is not None and int(cached.get(
+        "topology_reach_protocol_version", -1
+    )) == TOPOLOGY_REACH_PROTOCOL_VERSION:
+        print(f"[topology-reach:{task_name}] cache hit {path}", flush=True)
+        return cached
+
+    score_by_graph = {
+        int(record["graph_id"]): record for record in score_payload["records"]
+    }
+    records = []
+    verification = None
+    graph_ids = [int(value) for value in score_payload["splits"]["score"]]
+    for position, graph_id in enumerate(graph_ids):
+        chunk_path = cfg.root / "cache" / task_name / "topology_reach_graphs" / (
+            f"graph_{graph_id}__v{TOPOLOGY_REACH_PROTOCOL_VERSION}__"
+            f"{cfg.fingerprint}__{checkpoint_sha[:12]}.pt"
+        )
+        chunk = None if force else valid_cache(chunk_path, cfg, checkpoint_sha)
+        if chunk is not None and int(chunk.get(
+            "topology_reach_protocol_version", -1
+        )) != TOPOLOGY_REACH_PROTOCOL_VERSION:
+            chunk = None
+        if chunk is not None:
+            records.append(chunk["record"])
+            if verification is None and chunk.get("intervention_verification") is not None:
+                verification = chunk["intervention_verification"]
+            print(
+                f"[topology-reach:{task_name}] graph {position + 1}/{len(graph_ids)} "
+                f"id={graph_id} cache hit",
+                flush=True,
+            )
+            continue
+
+        print(
+            f"[topology-reach:{task_name}] graph {position + 1}/{len(graph_ids)} "
+            f"id={graph_id}",
+            flush=True,
+        )
+        base = gm.eval_ds[graph_id]
+        score_record = score_by_graph[graph_id]
+        local_plan = plan_local_topology_events(
+            base,
+            graph_id=graph_id,
+            seed=cfg.analysis_seed + 43_001,
+        )
+        plan = {
+            "graph_id": graph_id,
+            "n": int(base.num_nodes),
+            "descriptor": score_record["plan"]["descriptor"],
+            LOCAL_TOPOLOGY_CHANNEL: local_plan,
+        }
+        verified_this_graph = False
+        if local_plan and verification is None:
+            verification = verify_local_topology_intervention(base, local_plan)
+            verified_this_graph = True
+        if local_plan:
+            clean_prediction, phi, _clean_capture, final_output_gradient = clean_gradients(
+                gm, base
+            )
+            result = score_graph_channel(
+                gm,
+                plan,
+                LOCAL_TOPOLOGY_CHANNEL,
+                phi,
+                final_output_gradient,
+                cfg,
+                task_name=task_name,
+                checkpoint_sha=checkpoint_sha,
+                force=force,
+            )
+            del phi, _clean_capture, final_output_gradient
+        else:
+            clean_prediction = torch.as_tensor(score_record["clean_prediction"])
+            result = {
+                "available": False,
+                "channel": LOCAL_TOPOLOGY_CHANNEL,
+                "graph_id": graph_id,
+                "reason": "no valid connected degree/bond-label-preserving local two-switch",
+            }
+        record = {
+            "graph_id": graph_id,
+            "n": int(base.num_nodes),
+            "clean_prediction": clean_prediction.detach().cpu().numpy(),
+            "target": base.y.detach().cpu().numpy(),
+            "plan": plan,
+            "channels": {LOCAL_TOPOLOGY_CHANNEL: result},
+        }
+        records.append(record)
+        atomic_torch_save({
+            "version": BETA_VERSION,
+            "schema": BETA_SCHEMA,
+            "fingerprint": cfg.fingerprint,
+            "checkpoint_sha256": checkpoint_sha,
+            "task": task_name,
+            "topology_reach_protocol_version": TOPOLOGY_REACH_PROTOCOL_VERSION,
+            "record": record,
+            "intervention_verification": verification if verified_this_graph else None,
+        }, chunk_path)
+        progress_audit = local_topology_reach_audit(records)
+        write_json(
+            cfg.root / "cache" / task_name / "topology_reach_progress.json",
+            {
+                "version": BETA_VERSION,
+                "schema": BETA_SCHEMA,
+                "fingerprint": cfg.fingerprint,
+                "checkpoint_sha256": checkpoint_sha,
+                "completed_graphs": len(records),
+                "total_graphs": len(graph_ids),
+                "reach": progress_audit,
+                "integrated_carriage": integrated_carriage_audit(
+                    records, (LOCAL_TOPOLOGY_CHANNEL,)
+                ),
+            },
+        )
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    reach_audit = local_topology_reach_audit(records)
+    carriage_audit = integrated_carriage_audit(
+        records, (LOCAL_TOPOLOGY_CHANNEL,)
+    )
+    if carriage_audit["unconverged_fraction"] > cfg.integrated_max_unconverged_fraction:
+        raise RuntimeError(
+            "Local topology integrated beneficial carriage retained "
+            f"{carriage_audit['unconverged']}/{carriage_audit['paths']} capped paths, "
+            "exceeding integrated_max_unconverged_fraction; completed source/graph "
+            "caches were preserved."
+        )
+    if reach_audit["maximum_planned_distance"] <= 3:
+        print(
+            f"[topology-reach:{task_name}:warning] even the isolated edit plans have "
+            f"maximum pristine distance {reach_audit['maximum_planned_distance']}; "
+            "this is now an audited graph-support property, not a whole-donor artefact.",
+            flush=True,
+        )
+    payload = {
+        "version": BETA_VERSION,
+        "schema": BETA_SCHEMA,
+        "fingerprint": cfg.fingerprint,
+        "checkpoint_sha256": checkpoint_sha,
+        "task": task_name,
+        "topology_reach_protocol_version": TOPOLOGY_REACH_PROTOCOL_VERSION,
+        "L": gm.L,
+        "H": gm.H,
+        "splits": score_payload["splits"],
+        "records": sorted(records, key=lambda item: int(item["graph_id"])),
+        "intervention_verification": verification,
+        "reach_audit": reach_audit,
+        "integrated_carriage_audit": carriage_audit,
+    }
+    atomic_torch_save(payload, path)
+    write_json(
+        cfg.root / "tables" / f"local_topology_reach_audit_{task_name}.json",
+        reach_audit,
+    )
+    return payload
+
+
 def stack_graph_scores(
     score_payload: Mapping[str, Any],
     channel: str,
@@ -2876,27 +3501,37 @@ def causal_event_catalog(
         )
         base = gm.eval_ds[int(graph_id)]
         for source_index, item in enumerate(plan["semantic"]):
-            events.append({
-                "graph_id": int(graph_id),
-                "channel": "semantic",
-                "source": int(item["source"]),
-                "event_index": int(source_index),
-                "clean": base,
-                "corrupt": semantic_variant(base, int(item["source"]), item["donor_rows"][0]),
-                "descriptor": plan["descriptor"],
-                "donor_id": int(item["donor_graph_ids"][0]),
-            })
+            count = min(CAUSAL_EVENTS_PER_SOURCE, len(item["donor_rows"]))
+            for donor_index in range(count):
+                events.append({
+                    "graph_id": int(graph_id),
+                    "channel": "semantic",
+                    "source": int(item["source"]),
+                    "source_index": int(source_index),
+                    "event_index": int(donor_index),
+                    "clean": base,
+                    "corrupt": semantic_variant(
+                        base, int(item["source"]), item["donor_rows"][donor_index]
+                    ),
+                    "descriptor": plan["descriptor"],
+                    "donor_id": int(item["donor_graph_ids"][donor_index]),
+                })
         for source_index, item in enumerate(plan["pe"]):
-            events.append({
-                "graph_id": int(graph_id),
-                "channel": "pe",
-                "source": int(item["source"]),
-                "event_index": int(source_index),
-                "clean": base,
-                "corrupt": pe_variant(base, int(item["source"]), int(item["partners"][0])),
-                "descriptor": plan["descriptor"],
-                "partner": int(item["partners"][0]),
-            })
+            count = min(CAUSAL_EVENTS_PER_SOURCE, len(item["partners"]))
+            for partner_index in range(count):
+                events.append({
+                    "graph_id": int(graph_id),
+                    "channel": "pe",
+                    "source": int(item["source"]),
+                    "source_index": int(source_index),
+                    "event_index": int(partner_index),
+                    "clean": base,
+                    "corrupt": pe_variant(
+                        base, int(item["source"]), int(item["partners"][partner_index])
+                    ),
+                    "descriptor": plan["descriptor"],
+                    "partner": int(item["partners"][partner_index]),
+                })
         # Causal validation uses the best available donor from each tier. Score estimation
         # retains all planned donors; this keeps tier/dose coverage without duplicating the
         # very expensive all-head patch sweep within a molecule/tier.
@@ -2913,6 +3548,7 @@ def causal_event_catalog(
                 "graph_id": int(graph_id),
                 "channel": "topology",
                 "source": -1,
+                "source_index": 0,
                 "event_index": int(topology_index),
                 "clean": base,
                 "corrupt": topology_donor_variant(
@@ -3001,7 +3637,36 @@ def run_causal_task(
     task_name = loaded["spec"].name
     path = cache_path(cfg, task_name, "causal", checkpoint_sha)
     cached = None if force else valid_cache(path, cfg, checkpoint_sha)
+    if cached is not None and int(cached.get("causal_protocol_version", -1)) != (
+        CAUSAL_PROTOCOL_VERSION
+    ):
+        print(
+            f"[causal:{task_name}] invalidating pre-v{CAUSAL_PROTOCOL_VERSION} "
+            "causal cache",
+            flush=True,
+        )
+        cached = None
     if cached is not None:
+        if any("descriptor" not in event for event in cached.get("events", [])):
+            descriptors = {
+                int(event["graph_id"]): graph_descriptor(
+                    gm.eval_ds[int(event["graph_id"])],
+                    graph_id=int(event["graph_id"]),
+                )
+                for event in cached["events"]
+            }
+            cached["events"] = [
+                {
+                    **event,
+                    "descriptor": descriptors[int(event["graph_id"])],
+                }
+                for event in cached["events"]
+            ]
+            atomic_torch_save(cached, path)
+            print(
+                f"[causal:{task_name}] enriched cached events with condition descriptors",
+                flush=True,
+            )
         print(f"[causal:{task_name}] cache hit {path}", flush=True)
         return cached
     splits = deterministic_splits(len(gm.eval_ds), cfg)
@@ -3058,6 +3723,10 @@ def run_causal_task(
     }
     progress_path = cache_path(cfg, task_name, "causal_progress", checkpoint_sha)
     progress = None if force else valid_cache(progress_path, cfg, checkpoint_sha)
+    if progress is not None and int(
+        progress.get("causal_protocol_version", -1)
+    ) != CAUSAL_PROTOCOL_VERSION:
+        progress = None
     completed_chunks: set[int] = set()
     if progress is not None:
         if int(progress.get("event_count", -1)) != event_count:
@@ -3232,6 +3901,8 @@ def run_causal_task(
         atomic_torch_save({
             "version": BETA_VERSION,
             "schema": BETA_SCHEMA,
+            "causal_protocol_version": CAUSAL_PROTOCOL_VERSION,
+            "causal_events_per_source": CAUSAL_EVENTS_PER_SOURCE,
             "fingerprint": cfg.fingerprint,
             "checkpoint_sha256": checkpoint_sha,
             "task": task_name,
@@ -3247,11 +3918,14 @@ def run_causal_task(
     for event in events:
         metadata.append({
             key: value for key, value in event.items()
-            if key not in {"clean", "corrupt", "clean_wv", "corrupt_wv", "descriptor"}
+            if key not in {"clean", "corrupt", "clean_wv", "corrupt_wv"}
         })
     payload = {
         "version": BETA_VERSION,
         "schema": BETA_SCHEMA,
+        "causal_protocol_version": CAUSAL_PROTOCOL_VERSION,
+        "topology_reach_protocol_version": TOPOLOGY_REACH_PROTOCOL_VERSION,
+        "causal_events_per_source": CAUSAL_EVENTS_PER_SOURCE,
         "fingerprint": cfg.fingerprint,
         "checkpoint_sha256": checkpoint_sha,
         "task": task_name,
@@ -3299,6 +3973,365 @@ def channel_mean_metric(
         mask &= effects >= floor
     values = np.asarray(causal_payload["metrics"][metric], dtype=float)
     return np.nanmean(values[mask], axis=0) if mask.any() else np.full(values.shape[1:], np.nan)
+
+
+def hierarchical_channel_values(
+    causal_payload: Mapping[str, Any],
+    values: np.ndarray,
+    channel: str,
+    *,
+    reduction: str,
+    effect_gated: bool = True,
+    topology_max_tier: int | None = 1,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Donor/partner within source, source within graph causal summaries.
+
+    This mirrors the score hierarchy and prevents molecules with more retained
+    events from receiving greater weight. The returned array is
+    ``[graph, *values.shape[1:]]``.
+    """
+
+    events = causal_payload["events"]
+    values = np.asarray(values, dtype=float)
+    if values.shape[0] != len(events):
+        raise ValueError(
+            f"causal values have {values.shape[0]} events, expected {len(events)}"
+        )
+    mask = np.asarray([event["channel"] == channel for event in events], dtype=bool)
+    if channel == "topology" and topology_max_tier is not None:
+        mask &= np.asarray([
+            int(event.get("topology_tier", 99)) <= int(topology_max_tier)
+            for event in events
+        ])
+    if effect_gated and mask.any():
+        effects = np.asarray([
+            float(np.mean(np.abs(
+                np.asarray(event["clean_prediction"], float)
+                - np.asarray(event["corrupt_prediction"], float)
+            )))
+            for event in events
+        ])
+        floor = float(causal_payload.get("causal_effect_floor_relative", 0.05)) * float(
+            np.nanmax(effects[mask])
+        )
+        mask &= effects >= floor
+    if reduction == "magnitude":
+        values = np.abs(values)
+    elif reduction == "positive":
+        values = np.maximum(values, 0.0)
+    elif reduction != "signed":
+        raise ValueError(f"unknown causal reduction {reduction!r}")
+
+    graph_ids = sorted({
+        int(event["graph_id"]) for event, keep in zip(events, mask) if keep
+    })
+    graph_values = []
+    for graph_id in graph_ids:
+        graph_mask = mask & np.asarray([
+            int(event["graph_id"]) == graph_id for event in events
+        ])
+        source_ids = sorted({
+            int(event.get("source", -1))
+            for event, keep in zip(events, graph_mask) if keep
+        })
+        source_values = []
+        for source in source_ids:
+            source_mask = graph_mask & np.asarray([
+                int(event.get("source", -1)) == source for event in events
+            ])
+            source_values.append(np.nanmean(values[source_mask], axis=0))
+        if source_values:
+            graph_values.append(np.nanmean(np.stack(source_values), axis=0))
+    if not graph_values:
+        return (
+            np.asarray([], dtype=np.int64),
+            np.empty((0, *values.shape[1:]), dtype=float),
+        )
+    return np.asarray(graph_ids, dtype=np.int64), np.stack(graph_values)
+
+
+def hierarchical_channel_metric_graphs(
+    causal_payload: Mapping[str, Any],
+    channel: str,
+    metric: str,
+    *,
+    reduction: str,
+    effect_gated: bool = True,
+    topology_max_tier: int | None = 1,
+) -> tuple[np.ndarray, np.ndarray]:
+    return hierarchical_channel_values(
+        causal_payload,
+        np.asarray(causal_payload["metrics"][metric], dtype=float),
+        channel,
+        reduction=reduction,
+        effect_gated=effect_gated,
+        topology_max_tier=topology_max_tier,
+    )
+
+
+def paired_hierarchical_channel_values(
+    causal_payload: Mapping[str, Any],
+    values: np.ndarray,
+    left_channel: str,
+    right_channel: str,
+    *,
+    reduction: str,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    left_ids, left = hierarchical_channel_values(
+        causal_payload, values, left_channel, reduction=reduction
+    )
+    right_ids, right = hierarchical_channel_values(
+        causal_payload, values, right_channel, reduction=reduction
+    )
+    common = np.intersect1d(left_ids, right_ids)
+    left_lookup = {int(graph_id): index for index, graph_id in enumerate(left_ids)}
+    right_lookup = {int(graph_id): index for index, graph_id in enumerate(right_ids)}
+    return (
+        common,
+        np.stack([left[left_lookup[int(graph_id)]] for graph_id in common])
+        if len(common) else np.empty((0, *left.shape[1:])),
+        np.stack([right[right_lookup[int(graph_id)]] for graph_id in common])
+        if len(common) else np.empty((0, *right.shape[1:])),
+    )
+
+
+def causal_strength_coordinates(
+    left_graphs: np.ndarray,
+    right_graphs: np.ndarray,
+    *,
+    positive_after_graph_mean: bool,
+    indices: np.ndarray | None = None,
+) -> dict[str, np.ndarray]:
+    if indices is not None:
+        left_graphs = left_graphs[indices]
+        right_graphs = right_graphs[indices]
+    left = np.nanmean(left_graphs, axis=0)
+    right = np.nanmean(right_graphs, axis=0)
+    if positive_after_graph_mean:
+        left = np.maximum(left, 0.0)
+        right = np.maximum(right, 0.0)
+    total = np.abs(left) + np.abs(right)
+    return {
+        "left": left,
+        "right": right,
+        # The causal focus coordinate compares magnitudes. Signed alignment is
+        # reported separately and cannot reverse semantic versus PE identity.
+        "D": (np.abs(left) - np.abs(right)) / (total + EPS),
+        "J": 0.5 * total,
+        "G": np.sqrt(np.abs(left) * np.abs(right)),
+    }
+
+
+def activity_layer_centered(values: np.ndarray, active: np.ndarray) -> np.ndarray:
+    values = np.asarray(values, dtype=float)
+    active = np.asarray(active, dtype=bool)
+    result = np.full_like(values, np.nan)
+    for layer in range(values.shape[0]):
+        keep = active[layer] & np.isfinite(values[layer])
+        if keep.any():
+            result[layer, keep] = values[layer, keep] - np.mean(values[layer, keep])
+    return result
+
+
+def within_layer_permutation_p(
+    score_d: np.ndarray,
+    causal_d: np.ndarray,
+    active: np.ndarray,
+    *,
+    samples: int,
+    seed: int,
+) -> float:
+    score_centered = activity_layer_centered(score_d, active)
+    causal_centered = activity_layer_centered(causal_d, active)
+    keep = active & np.isfinite(score_centered) & np.isfinite(causal_centered)
+    observed = spearman(score_centered[keep], causal_centered[keep])
+    if not np.isfinite(observed):
+        return float("nan")
+    rng = np.random.default_rng(seed)
+    null = []
+    for _ in range(int(samples)):
+        permuted = causal_d.copy()
+        for layer in range(causal_d.shape[0]):
+            heads = np.flatnonzero(keep[layer])
+            if len(heads) > 1:
+                permuted[layer, heads] = permuted[layer, rng.permutation(heads)]
+        centred = activity_layer_centered(permuted, active)
+        null.append(spearman(score_centered[keep], centred[keep]))
+    finite = np.asarray([value for value in null if np.isfinite(value)], dtype=float)
+    return float(
+        (1 + np.sum(np.abs(finite) >= abs(observed))) / (1 + len(finite))
+    ) if len(finite) else float("nan")
+
+
+CAUSAL_FOCUS_SPECIFICATIONS = {
+    # Primary score-matched estimand: magnitude before nuisance averaging, like EG.
+    "gross_restore": ("restore", "magnitude", False),
+    # Net desired mediation and intervention-effect-normalised mediation are robustness tests.
+    "net_restore": ("restore", "signed", True),
+    "fraction_restore": ("restore_fraction", "signed", True),
+    "gross_inject": ("inject", "magnitude", False),
+    "gross_necessity": ("necessity", "magnitude", False),
+}
+
+
+def differential_causal_validation(
+    score_payload: Mapping[str, Any],
+    causal_payload: Mapping[str, Any],
+    cfg: BetaConfig,
+    aggregation: str,
+    left_channel: str = "semantic",
+    right_channel: str = "pe",
+) -> dict[str, Any]:
+    """Held-out test of pairwise D as relative causal focus and J as total influence."""
+
+    left_graphs, right_graphs, score_graph_ids = paired_graph_scores(
+        score_payload, left_channel, right_channel, aggregation
+    )
+    if not len(score_graph_ids):
+        raise RuntimeError(
+            f"no paired score graphs for {left_channel} versus {right_channel}"
+        )
+    score = score_coordinates(left_graphs.mean(axis=0), right_graphs.mean(axis=0))
+    activity_floor = max(
+        cfg.activity_floor_relative * float(np.nanmax(score["J"])), EPS
+    )
+    active = np.asarray(score["J"] >= activity_floor, dtype=bool)
+    layers = _head_layers(*score["D"].shape)
+    layer_one_hot = np.eye(score["D"].shape[0])[layers]
+    results: dict[str, Any] = {}
+    for spec_index, (name, (metric, reduction, positive_after)) in enumerate(
+        CAUSAL_FOCUS_SPECIFICATIONS.items()
+    ):
+        graph_ids, left_graphs, right_graphs = paired_hierarchical_channel_values(
+            causal_payload,
+            np.asarray(causal_payload["metrics"][metric], dtype=float),
+            left_channel,
+            right_channel,
+            reduction=reduction,
+        )
+        if not len(graph_ids):
+            continue
+        causal = causal_strength_coordinates(
+            left_graphs, right_graphs,
+            positive_after_graph_mean=positive_after,
+        )
+        keep = active & np.isfinite(score["D"]) & np.isfinite(causal["D"])
+        score_centered = activity_layer_centered(score["D"], keep)
+        causal_centered = activity_layer_centered(causal["D"], keep)
+        pooled_rho = spearman(score["D"][keep], causal["D"][keep])
+        within_rho = spearman(score_centered[keep], causal_centered[keep])
+        score_j_centered = activity_layer_centered(score["J"], keep)
+        causal_j_centered = activity_layer_centered(causal["J"], keep)
+        j_pooled_rho = spearman(score["J"][keep], causal["J"][keep])
+        j_within_rho = spearman(score_j_centered[keep], causal_j_centered[keep])
+        keep_flat = keep.reshape(-1)
+        partial_rho = partial_spearman(
+            score["D"].reshape(-1)[keep_flat],
+            causal["D"].reshape(-1)[keep_flat],
+            np.column_stack([
+                score["J"].reshape(-1)[keep_flat],
+                layer_one_hot[keep_flat],
+            ]),
+        )
+        active_flat = np.flatnonzero(keep.reshape(-1))
+        ranked = active_flat[
+            np.argsort(score["D"].reshape(-1)[active_flat], kind="stable")
+        ]
+        tail_count = max(1, min(cfg.family_size, len(ranked) // 2))
+        low_heads, high_heads = ranked[:tail_count], ranked[-tail_count:]
+        tail_contrast = float(
+            np.nanmean(causal["D"].reshape(-1)[high_heads])
+            - np.nanmean(causal["D"].reshape(-1)[low_heads])
+        )
+        rng = np.random.default_rng(
+            cfg.analysis_seed + 17_003 + 1_009 * spec_index
+            + 101 * CHANNELS.index(left_channel)
+            + 307 * CHANNELS.index(right_channel)
+        )
+        bootstrap_pooled, bootstrap_within, bootstrap_tail = [], [], []
+        for _ in range(int(cfg.bootstrap_samples)):
+            indices = rng.integers(0, len(graph_ids), len(graph_ids))
+            draw = causal_strength_coordinates(
+                left_graphs,
+                right_graphs,
+                positive_after_graph_mean=positive_after,
+                indices=indices,
+            )
+            draw_centered = activity_layer_centered(draw["D"], keep)
+            bootstrap_pooled.append(spearman(score["D"][keep], draw["D"][keep]))
+            bootstrap_within.append(spearman(score_centered[keep], draw_centered[keep]))
+            bootstrap_tail.append(float(
+                np.nanmean(draw["D"].reshape(-1)[high_heads])
+                - np.nanmean(draw["D"].reshape(-1)[low_heads])
+            ))
+
+        def interval(values: Sequence[float]) -> tuple[float, float, float]:
+            finite = np.asarray(
+                [value for value in values if np.isfinite(value)], dtype=float
+            )
+            if not len(finite):
+                return float("nan"), float("nan"), float("nan")
+            return (
+                float(np.quantile(finite, 0.025)),
+                float(np.quantile(finite, 0.975)),
+                float(np.mean(finite > 0.0)),
+            )
+
+        pooled_low, pooled_high, pooled_positive = interval(bootstrap_pooled)
+        within_low, within_high, within_positive = interval(bootstrap_within)
+        tail_low, tail_high, tail_positive = interval(bootstrap_tail)
+        selective = keep & (np.abs(score["D"]) >= cfg.selectivity_threshold)
+        sign_agreement = float(np.mean(
+            np.sign(score["D"][selective]) == np.sign(causal["D"][selective])
+        )) if selective.any() else float("nan")
+        results[name] = {
+            "metric": metric,
+            "reduction": reduction,
+            "positive_after_graph_mean": positive_after,
+            "graph_ids": graph_ids,
+            "left_graphs": left_graphs,
+            "right_graphs": right_graphs,
+            "causal": causal,
+            "active": keep,
+            "graphs": int(len(graph_ids)),
+            "heads": int(keep.sum()),
+            "rho_pooled": pooled_rho,
+            "rho_pooled_ci_low": pooled_low,
+            "rho_pooled_ci_high": pooled_high,
+            "rho_pooled_bootstrap_probability_positive": pooled_positive,
+            "rho_within_layer": within_rho,
+            "rho_within_layer_ci_low": within_low,
+            "rho_within_layer_ci_high": within_high,
+            "rho_within_layer_bootstrap_probability_positive": within_positive,
+            "rho_partial_J_and_layer": partial_rho,
+            "rho_J_pooled": j_pooled_rho,
+            "rho_J_within_layer": j_within_rho,
+            "within_layer_permutation_p": within_layer_permutation_p(
+                score["D"], causal["D"], keep,
+                samples=cfg.bootstrap_samples,
+                seed=(
+                    cfg.analysis_seed + 19_001 + spec_index
+                    + 101 * CHANNELS.index(left_channel)
+                    + 307 * CHANNELS.index(right_channel)
+                ),
+            ),
+            "tail_count": int(tail_count),
+            "high_minus_low_D_causal": tail_contrast,
+            "high_minus_low_ci_low": tail_low,
+            "high_minus_low_ci_high": tail_high,
+            "high_minus_low_bootstrap_probability_positive": tail_positive,
+            "selective_sign_agreement": sign_agreement,
+        }
+    return {
+        "aggregation": aggregation,
+        "left_channel": left_channel,
+        "right_channel": right_channel,
+        "score_graph_ids": score_graph_ids,
+        "score": score,
+        "activity_floor": activity_floor,
+        "active": active,
+        "specifications": results,
+    }
 
 
 # =====================================================================================
@@ -3511,6 +4544,8 @@ def select_families(
 
     semantic_specialists = take(head_order(coordinates["D"]), semantic_mask)
     structural_specialists = take(head_order(-coordinates["D"]), structural_mask)
+    semantic_d_extreme = take(head_order(coordinates["D"]), active)
+    pe_d_extreme = take(head_order(-coordinates["D"]), active)
 
     def same_layer_controls(
         targets: Sequence[tuple[int, int]], candidate_mask: np.ndarray, *, match_j: bool
@@ -3536,6 +4571,47 @@ def select_families(
                 candidates.sort(key=lambda item: (coordinates["J"][item], item))
             chosen.append(candidates[0])
         return chosen
+
+    def d_neutral_j_matched_controls(
+        targets: Sequence[tuple[int, int]],
+        excluded: Sequence[tuple[int, int]],
+    ) -> list[tuple[int, int]]:
+        """Same-layer controls matched on evoked strength, then made as D-neutral as possible."""
+
+        chosen: list[tuple[int, int]] = []
+        excluded_set = set(excluded)
+        for target in targets:
+            candidates = [
+                (target[0], head)
+                for head in range(active.shape[1])
+                if bool(active[target[0], head])
+                and (target[0], head) not in excluded_set
+                and (target[0], head) not in chosen
+            ]
+            if not candidates:
+                continue
+            j_scale = max(float(coordinates["J"][target]), EPS)
+            j_gap = {
+                item: abs(float(coordinates["J"][item] - coordinates["J"][target]))
+                for item in candidates
+            }
+            tolerance = max(0.20 * j_scale, min(j_gap.values()) + EPS)
+            candidates = [item for item in candidates if j_gap[item] <= tolerance]
+            candidates.sort(key=lambda item: (
+                abs(float(coordinates["D"][item])),
+                j_gap[item] / j_scale,
+                item,
+            ))
+            chosen.append(candidates[0])
+        return chosen
+
+    d_extremes = [*semantic_d_extreme, *pe_d_extreme]
+    semantic_d_j_matched = d_neutral_j_matched_controls(
+        semantic_d_extreme, d_extremes
+    )
+    pe_d_j_matched = d_neutral_j_matched_controls(
+        pe_d_extreme, [*d_extremes, *semantic_d_j_matched]
+    )
 
     pe_graphs_paired, topology_graphs_paired, _ = paired_graph_scores(
         score_payload, "pe", "topology", aggregation
@@ -3597,6 +4673,10 @@ def select_families(
         "raw_pe": take(head_order(structural)),
         "semantic_specialist": semantic_specialists,
         "pe_specialist": structural_specialists,
+        "semantic_D_extreme": semantic_d_extreme,
+        "pe_D_extreme": pe_d_extreme,
+        "semantic_D_J_matched": semantic_d_j_matched,
+        "pe_D_J_matched": pe_d_j_matched,
         "semantic_same_layer_J_matched": same_layer_controls(
             semantic_specialists, balanced, match_j=True
         ),
@@ -3672,6 +4752,10 @@ def run_ablation_task(
     task_name = loaded["spec"].name
     path = cache_path(cfg, task_name, "ablations", checkpoint_sha)
     cached = None if force else valid_cache(path, cfg, checkpoint_sha)
+    if cached is not None and int(cached.get("causal_protocol_version", -1)) != (
+        CAUSAL_PROTOCOL_VERSION
+    ):
+        cached = None
     if cached is not None:
         print(f"[ablations:{task_name}] cache hit {path}", flush=True)
         return cached
@@ -3711,6 +4795,7 @@ def run_ablation_task(
         atomic_torch_save({
             "version": BETA_VERSION,
             "schema": BETA_SCHEMA,
+            "causal_protocol_version": CAUSAL_PROTOCOL_VERSION,
             "fingerprint": cfg.fingerprint,
             "checkpoint_sha256": checkpoint_sha,
             "task": task_name,
@@ -3786,6 +4871,7 @@ def run_ablation_task(
     payload = {
         "version": BETA_VERSION,
         "schema": BETA_SCHEMA,
+        "causal_protocol_version": CAUSAL_PROTOCOL_VERSION,
         "fingerprint": cfg.fingerprint,
         "checkpoint_sha256": checkpoint_sha,
         "task": task_name,
@@ -4474,6 +5560,32 @@ def _bootstrap_conditional_effect(
     return float(np.quantile(values, 0.025)), float(np.quantile(values, 0.975))
 
 
+def conditional_feature_effect_type(feature: str) -> str:
+    if feature.startswith("D_"):
+        return "selectivity_shift"
+    if feature.startswith(("J_", "G_")):
+        return "joint_activation"
+    return "channel_gain"
+
+
+def conditional_rule_family(rule: str) -> str:
+    if "atom" in rule:
+        return "chemical_context"
+    if rule in {"source_in_cycle", "source_is_articulation", "cycle_rank_high"}:
+        return "topological_context"
+    if "degree" in rule or "density" in rule:
+        return "routing_load"
+    if rule.startswith("source_"):
+        return "source_context"
+    return "global_graph_context"
+
+
+def conditional_feature_rule_compatible(feature: str, rule: str) -> bool:
+    """Do not condition a whole-graph topology response on a source-only property."""
+
+    return not (feature in TOPOLOGY_CONDITIONAL_FEATURES and rule.startswith("source_"))
+
+
 def conditional_analysis(
     score_payload: Mapping[str, Any], aggregation: str, cfg: BetaConfig
 ) -> dict[str, Any]:
@@ -4484,8 +5596,12 @@ def conditional_analysis(
     L, H = int(score_payload["L"]), int(score_payload["H"])
     candidates = []
     rules_passing_prevalence: set[str] = set()
+    incompatible_feature_rule_pairs = 0
     for feature_name in CONDITIONAL_SCORE_FEATURES:
         for rule in rules:
+            if not conditional_feature_rule_compatible(feature_name, rule):
+                incompatible_feature_rule_pairs += 1
+                continue
             true_fraction = np.mean([bool(row["rules"][rule]) for row in discovery])
             if not cfg.min_condition_fraction <= true_fraction <= 1.0 - cfg.min_condition_fraction:
                 continue
@@ -4514,6 +5630,13 @@ def conditional_analysis(
                         "discovery_activity": activity,
                         "true_graphs": true_graphs,
                         "false_graphs": false_graphs,
+                        "effect_type": conditional_feature_effect_type(feature_name),
+                        "condition_family": conditional_rule_family(rule),
+                        "comparison_scope": (
+                            "graph_context"
+                            if feature_name in TOPOLOGY_CONDITIONAL_FEATURES
+                            else "source_local"
+                        ),
                     })
     eligibility_audit = {
         "requires_all_three_channels": True,
@@ -4529,6 +5652,9 @@ def conditional_analysis(
         })),
         "rules_considered": int(len(rules)),
         "rules_passing_prevalence": int(len(rules_passing_prevalence)),
+        "incompatible_topology_feature_source_rule_pairs_excluded": int(
+            incompatible_feature_rule_pairs
+        ),
         "minimum_condition_fraction": float(cfg.min_condition_fraction),
         "minimum_graphs_per_state": int(cfg.min_condition_graphs),
         "support_eligible_feature_rule_heads": int(len(candidates)),
@@ -4645,7 +5771,310 @@ def conditional_analysis(
         "interpretation": (
             "Finite predeclared condition basis with sample-split rule/head selection and "
             "graph-bootstrap confirmation; a screen for conditional specialists, not a proof "
-            "that no untested condition exists."
+            "that no untested condition exists. Scores involving the whole-graph topology "
+            "donor are tested only against graph-level conditions; source-level topology "
+            "contrasts are excluded because their intervention units are not aligned."
+        ),
+    }
+
+
+def _conditional_rule_state_from_descriptor(
+    descriptor: Mapping[str, Any],
+    source: int,
+    rule: str,
+    metadata: Mapping[str, Any],
+) -> bool | None:
+    """Re-evaluate a frozen score-discovery rule on an independent causal event."""
+
+    import networkx as nx
+
+    thresholds = metadata["thresholds_from_discovery"]
+    labels = [tuple(row) for row in np.asarray(descriptor["labels"], dtype=int)]
+    edges = np.asarray(descriptor["edges"], dtype=np.int64)
+    n = int(descriptor["n"])
+    degree = np.asarray(descriptor["degree"], dtype=float)
+    graph = nx.Graph()
+    graph.add_nodes_from(range(n))
+    graph.add_edges_from(edges.tolist())
+    cycle_nodes = {node for cycle in nx.cycle_basis(graph) for node in cycle}
+    articulation = set(nx.articulation_points(graph))
+    graph_values = {
+        "graph_size_high": n > thresholds["n"],
+        "cycle_rank_high": int(descriptor["cycle_rank"]) > thresholds["cycle_rank"],
+        "atom_diversity_high": len(set(labels)) > thresholds["atom_diversity"],
+        "mean_degree_high": float(np.mean(degree)) > thresholds["mean_degree"],
+        "edge_density_high": (
+            len(edges) / max(n * (n - 1) / 2, 1)
+        ) > thresholds["edge_density"],
+    }
+    common_atoms = [
+        tuple(map(int, atom)) for atom in metadata.get("common_atom_codes", [])
+    ]
+    for atom in common_atoms:
+        suffix = "_".join(map(str, atom))
+        graph_values[f"graph_contains_atom_{suffix}"] = atom in labels
+    if rule in graph_values:
+        return bool(graph_values[rule])
+    if not rule.startswith("source_") or source < 0 or source >= n:
+        return None
+    source_values: dict[str, bool] = {}
+    source_label = labels[source]
+    distances = shortest_paths(n, edges)
+    for atom in common_atoms:
+        suffix = "_".join(map(str, atom))
+        source_values[f"source_atom_{suffix}"] = source_label == atom
+        atom_nodes = [index for index, label in enumerate(labels) if label == atom]
+        source_values[f"source_near_atom_{suffix}"] = (
+            bool(np.min(distances[source, atom_nodes]) <= 1)
+            if atom_nodes else False
+        )
+    neighbors = [
+        int(right) if int(left) == source else int(left)
+        for left, right in edges if source in (int(left), int(right))
+    ]
+    source_values.update({
+        "source_degree_high": degree[source] > thresholds["source_degree"],
+        "source_in_cycle": source in cycle_nodes,
+        "source_is_articulation": source in articulation,
+        "source_neighbor_atom_diverse": len({labels[node] for node in neighbors}) >= 2,
+    })
+    return source_values.get(rule)
+
+
+def _conditional_causal_graph_values(
+    causal: Mapping[str, Any],
+    channel: str,
+    rule: str,
+    metadata: Mapping[str, Any],
+) -> dict[bool, dict[int, np.ndarray]]:
+    events = causal["events"]
+    values = np.abs(np.asarray(causal["metrics"]["restore"], dtype=float))
+    effects = np.asarray([
+        float(np.mean(np.abs(
+            np.asarray(event["clean_prediction"], float)
+            - np.asarray(event["corrupt_prediction"], float)
+        )))
+        for event in events
+    ])
+    channel_mask = np.asarray([
+        event["channel"] == channel
+        and (
+            channel != "topology"
+            or int(event.get("topology_tier", 99)) <= 1
+        )
+        for event in events
+    ])
+    if channel_mask.any():
+        floor = float(causal.get("causal_effect_floor_relative", 0.05)) * float(
+            np.nanmax(effects[channel_mask])
+        )
+        channel_mask &= effects >= floor
+    grouped: dict[bool, dict[int, dict[int, list[np.ndarray]]]] = {
+        False: {}, True: {}
+    }
+    for index, (event, keep) in enumerate(zip(events, channel_mask)):
+        if not keep or "descriptor" not in event:
+            continue
+        state = _conditional_rule_state_from_descriptor(
+            event["descriptor"], int(event.get("source", -1)), rule, metadata
+        )
+        if state is None:
+            continue
+        graph_id = int(event["graph_id"])
+        source = int(event.get("source", -1))
+        grouped[bool(state)].setdefault(graph_id, {}).setdefault(source, []).append(
+            values[index]
+        )
+    result: dict[bool, dict[int, np.ndarray]] = {False: {}, True: {}}
+    for state, graphs in grouped.items():
+        for graph_id, sources in graphs.items():
+            source_means = [
+                np.nanmean(np.stack(events_for_source), axis=0)
+                for events_for_source in sources.values()
+            ]
+            result[state][graph_id] = np.nanmean(
+                np.stack(source_means), axis=0
+            )
+    return result
+
+
+def _conditional_causal_feature_arrays(
+    feature: str,
+    by_channel: Mapping[str, Mapping[int, np.ndarray]],
+) -> tuple[np.ndarray, np.ndarray]:
+    if feature.startswith("S_"):
+        channel = feature.removeprefix("S_")
+        graph_ids = np.asarray(sorted(by_channel[channel]), dtype=np.int64)
+        return (
+            graph_ids,
+            np.stack([by_channel[channel][int(key)] for key in graph_ids])
+            if len(graph_ids) else np.empty((0,)),
+        )
+    if feature.endswith("_three_channel"):
+        channels = CHANNELS
+    elif "_semantic_pe" in feature:
+        channels = ("semantic", "pe")
+    elif "_semantic_topology" in feature:
+        channels = ("semantic", "topology")
+    elif "_pe_topology" in feature:
+        channels = ("pe", "topology")
+    else:
+        raise ValueError(f"unsupported conditional causal feature {feature!r}")
+    common = sorted(set.intersection(*(set(by_channel[channel]) for channel in channels)))
+    graph_ids = np.asarray(common, dtype=np.int64)
+    if not common:
+        return graph_ids, np.empty((0,))
+    arrays = {
+        channel: np.stack([by_channel[channel][key] for key in common])
+        for channel in channels
+    }
+    if feature == "J_three_channel":
+        return graph_ids, np.mean(np.stack(list(arrays.values())), axis=0)
+    if feature == "G_three_channel":
+        return graph_ids, np.cbrt(np.prod(np.stack(list(arrays.values())), axis=0))
+    left, right = arrays[channels[0]], arrays[channels[1]]
+    total = left + right
+    if feature.startswith("D_"):
+        return graph_ids, (left - right) / (total + EPS)
+    if feature.startswith("J_"):
+        return graph_ids, 0.5 * total
+    if feature.startswith("G_"):
+        return graph_ids, np.sqrt(left * right)
+    raise ValueError(f"unsupported conditional causal feature {feature!r}")
+
+
+def conditional_causal_validation(
+    conditional: Mapping[str, Any],
+    causal: Mapping[str, Any],
+    cfg: BetaConfig,
+) -> dict[str, Any]:
+    """Independent causal-split confirmation of FDR-confirmed score interactions."""
+
+    selected = [
+        row for row in conditional.get("confirmed", [])
+        if bool(row.get("confirmed_at_fdr_0.05", False))
+    ]
+    if not selected:
+        return {
+            "available": True,
+            "tested": [],
+            "interpretation": "No score-screen effect passed held-out global FDR.",
+        }
+    if not causal.get("events") or any(
+        "descriptor" not in event for event in causal["events"]
+    ):
+        return {
+            "available": False,
+            "tested": [],
+            "interpretation": (
+                "Causal event descriptors are absent. Run phase='all' or 'causal' once; "
+                "the existing cache will be enriched without repeating model forwards."
+            ),
+        }
+    metadata = conditional["metadata"]
+    cache: dict[tuple[str, str], dict[bool, dict[int, np.ndarray]]] = {}
+    tested = []
+    for index, row in enumerate(selected):
+        feature, rule = row["feature"], row["rule"]
+        needed_channels = (
+            CHANNELS if feature.endswith("_three_channel")
+            else (feature.removeprefix("S_"),) if feature.startswith("S_")
+            else ("semantic", "pe") if "_semantic_pe" in feature
+            else ("semantic", "topology") if "_semantic_topology" in feature
+            else ("pe", "topology")
+        )
+        state_values: dict[bool, dict[str, Mapping[int, np.ndarray]]] = {
+            False: {}, True: {}
+        }
+        for channel in needed_channels:
+            key = (channel, rule)
+            if key not in cache:
+                cache[key] = _conditional_causal_graph_values(
+                    causal, channel, rule, metadata
+                )
+            for state in (False, True):
+                state_values[state][channel] = cache[key][state]
+        arrays = {
+            state: _conditional_causal_feature_arrays(
+                feature, state_values[state]
+            )
+            for state in (False, True)
+        }
+        if min(len(arrays[False][0]), len(arrays[True][0])) < cfg.min_condition_graphs:
+            tested.append({
+                **row,
+                "causal_test_eligible": False,
+                "causal_true_graphs": int(len(arrays[True][0])),
+                "causal_false_graphs": int(len(arrays[False][0])),
+            })
+            continue
+        head = (int(row["layer"]), int(row["head"]))
+        state_mean = {
+            state: float(np.nanmean(arrays[state][1][:, head[0], head[1]]))
+            for state in (False, True)
+        }
+        effect = state_mean[True] - state_mean[False]
+        scale = float(np.nanstd(np.concatenate([
+            arrays[state][1][:, head[0], head[1]] for state in (False, True)
+        ])))
+        rng = np.random.default_rng(cfg.analysis_seed + 83_003 + index)
+        draws = []
+        for _ in range(int(cfg.conditional_bootstrap_samples)):
+            means = {}
+            for state in (False, True):
+                values = arrays[state][1][:, head[0], head[1]]
+                chosen = rng.integers(0, len(values), len(values))
+                means[state] = float(np.nanmean(values[chosen]))
+            draws.append(means[True] - means[False])
+        draws_array = np.asarray(draws, dtype=float)
+        same_direction_probability = float(np.mean(
+            np.sign(draws_array) == np.sign(row["confirmation_effect"])
+        ))
+        tested.append({
+            **row,
+            "causal_test_eligible": True,
+            "causal_effect": effect,
+            "causal_effect_standardized": effect / max(scale, EPS),
+            "causal_ci_low": float(np.quantile(draws_array, 0.025)),
+            "causal_ci_high": float(np.quantile(draws_array, 0.975)),
+            "causal_ci_low_standardized": float(
+                np.quantile(draws_array, 0.025) / max(scale, EPS)
+            ),
+            "causal_ci_high_standardized": float(
+                np.quantile(draws_array, 0.975) / max(scale, EPS)
+            ),
+            "causal_p": float(2.0 * min(
+                np.mean(draws_array <= 0.0), np.mean(draws_array >= 0.0)
+            )),
+            "causal_same_sign": bool(
+                np.sign(effect) == np.sign(row["confirmation_effect"])
+            ),
+            "causal_bootstrap_probability_same_direction": same_direction_probability,
+            "causal_true_graphs": int(len(arrays[True][0])),
+            "causal_false_graphs": int(len(arrays[False][0])),
+        })
+    eligible = [row for row in tested if row.get("causal_test_eligible", False)]
+    q_values = bh_q_values([row["causal_p"] for row in eligible])
+    for row, q_value in zip(eligible, q_values):
+        row["causal_q_global"] = float(q_value)
+        row["causally_confirmed_at_fdr_0.05"] = bool(
+            row["causal_same_sign"]
+            and (row["causal_ci_low"] > 0.0 or row["causal_ci_high"] < 0.0)
+            and np.isfinite(q_value)
+            and q_value <= 0.05
+        )
+    return {
+        "available": True,
+        "tested": tested,
+        "eligible_tests": len(eligible),
+        "causally_confirmed": int(sum(
+            bool(row.get("causally_confirmed_at_fdr_0.05", False))
+            for row in eligible
+        )),
+        "interpretation": (
+            "Independent causal-split interaction using gross restore magnitude, frozen "
+            "condition thresholds and global FDR. This validates context-dependent mediation, "
+            "not merely a repeated score association."
         ),
     }
 
@@ -4874,7 +6303,331 @@ def figure_causal_coordinates(
                 axis.axhline(0, color="0.6", linewidth=0.6)
                 axis.axvline(0, color="0.6", linewidth=0.6)
     fig.suptitle(
-        "Activity-gated score coordinates versus held-out whole-transport mediation",
+        "Signed-net three-channel patch coordinates "
+        "(diagnostic; differential focus is tested in Fig. 17)",
+        fontsize=11,
+    )
+    outputs = save_figure(fig, path)
+    plt.close(fig)
+    return outputs
+
+
+def figure_differential_causal_focus(
+    validations: Mapping[str, Mapping[str, Any]],
+    path: Path,
+    *,
+    title: str | None = None,
+) -> list[str]:
+    """Primary held-out test: D predicts relative role; J predicts total influence."""
+
+    plt = configure_matplotlib()
+    fig, axes = plt.subplots(2, 4, figsize=(13.2, 6.8), constrained_layout=True)
+    specifications = (
+        ("gross_restore", "gross restore"),
+        ("net_restore", "net aligned restore"),
+        ("fraction_restore", "effect-normalised restore"),
+    )
+    scatter = None
+    for row, task in enumerate(ARCHITECTURES):
+        validation = validations[task]
+        score = validation["score"]
+        left_label = CHANNEL_DISPLAY[validation["left_channel"]]
+        right_label = CHANNEL_DISPLAY[validation["right_channel"]]
+        cmap, norm = layer_colors(score["D"].shape[0])
+        layers = _head_layers(*score["D"].shape)
+        for column, (name, label) in enumerate(specifications):
+            result = validation["specifications"][name]
+            active = np.asarray(result["active"], dtype=bool)
+            causal = result["causal"]
+            axis = axes[row, column]
+            axis.scatter(
+                score["D"][~active], causal["D"][~active],
+                s=14, color="0.82", edgecolor="none",
+            )
+            scatter = axis.scatter(
+                score["D"][active], causal["D"][active],
+                c=layers[active.reshape(-1)], cmap=cmap, norm=norm,
+                s=28, edgecolor="black", linewidth=0.25,
+            )
+            axis.axhline(0, color="0.65", linewidth=0.6)
+            axis.axvline(0, color="0.65", linewidth=0.6)
+            axis.set_xlim(-1.05, 1.05)
+            axis.set_ylim(-1.05, 1.05)
+            axis.set_xlabel("EG score selectivity $D_{rel}$")
+            if column == 0:
+                axis.set_ylabel(
+                    f"{DISPLAY[task]}\ncausal focus $D_{{causal}}$\n"
+                    f"(− {right_label}, + {left_label})"
+                )
+            else:
+                axis.set_ylabel("$D_{causal}$")
+            axis.set_title(
+                f"{label}\n"
+                f"$\\rho_{{within}}$={result['rho_within_layer']:.2f} "
+                f"[{result['rho_within_layer_ci_low']:.2f},"
+                f" {result['rho_within_layer_ci_high']:.2f}], "
+                f"$p_{{perm}}$={result['within_layer_permutation_p']:.3f}",
+                fontsize=9,
+            )
+
+        result = validation["specifications"]["gross_restore"]
+        active = np.asarray(result["active"], dtype=bool)
+        causal = result["causal"]
+        axis = axes[row, 3]
+        axis.scatter(
+            score["J"][~active], causal["J"][~active],
+            s=14, color="0.82", edgecolor="none",
+        )
+        axis.scatter(
+            score["J"][active], causal["J"][active],
+            c=layers[active.reshape(-1)], cmap=cmap, norm=norm,
+            s=28, edgecolor="black", linewidth=0.25,
+        )
+        axis.set_xlabel("EG evoked strength $J$")
+        axis.set_ylabel("gross causal influence $J_{causal}$")
+        axis.set_title(
+            "importance control\n"
+            f"$\\rho_{{pooled}}$={result['rho_J_pooled']:.2f}, "
+            f"$\\rho_{{within}}$={result['rho_J_within_layer']:.2f}",
+            fontsize=9,
+        )
+    if scatter is not None:
+        fig.colorbar(scatter, ax=axes, fraction=0.018, pad=0.01, label="layer")
+    first = validations[ARCHITECTURES[0]]
+    left_label = CHANNEL_DISPLAY[first["left_channel"]]
+    right_label = CHANNEL_DISPLAY[first["right_channel"]]
+    fig.suptitle(title or (
+        "Correct causal target: relative score focus predicts differential "
+        f"{left_label}–{right_label} mediation"
+    ), fontsize=11)
+    outputs = save_figure(fig, path)
+    plt.close(fig)
+    return outputs
+
+
+def _hierarchical_channel_mean(
+    causal: Mapping[str, Any], channel: str, metric: str
+) -> np.ndarray:
+    _graph_ids, values = hierarchical_channel_metric_graphs(
+        causal, channel, metric, reduction="magnitude"
+    )
+    if not len(values):
+        return np.full((int(causal["L"]), int(causal["H"])), np.nan)
+    return np.nanmean(values, axis=0)
+
+
+def causal_role_analysis(
+    score_payload: Mapping[str, Any],
+    causal: Mapping[str, Any],
+    cfg: BetaConfig,
+    aggregation: str,
+    left_channel: str,
+    right_channel: str,
+) -> dict[str, Any]:
+    """Exploratory role/importance/necessity/rescue taxonomy with raw magnitudes."""
+
+    score_left, score_right, score_graph_ids = paired_graph_scores(
+        score_payload, left_channel, right_channel, aggregation
+    )
+    score = score_coordinates(score_left.mean(axis=0), score_right.mean(axis=0))
+    score_floor = max(
+        cfg.activity_floor_relative * float(np.nanmax(score["J"])), EPS
+    )
+    score_active = np.asarray(score["J"] >= score_floor, dtype=bool)
+    raw = {
+        metric: {
+            channel: _hierarchical_channel_mean(causal, channel, metric)
+            for channel in (left_channel, right_channel)
+        }
+        for metric in ("restore", "necessity", "mismatch", "sham")
+    }
+    left_selected = np.asarray(score["D"] >= 0.0, dtype=bool)
+
+    def selected(metric: str) -> np.ndarray:
+        return np.where(
+            left_selected,
+            raw[metric][left_channel],
+            raw[metric][right_channel],
+        )
+
+    matched_restore = selected("restore")
+    matched_necessity = selected("necessity")
+    matched_mismatch = selected("mismatch")
+    matched_sham = selected("sham")
+    restore_specificity = matched_restore - np.maximum(
+        matched_mismatch, matched_sham
+    )
+    restore_floor = max(
+        cfg.causal_effect_floor_relative
+        * float(np.nanmax(matched_restore[score_active])),
+        EPS,
+    )
+    necessity_floor = max(
+        cfg.causal_effect_floor_relative
+        * float(np.nanmax(matched_necessity[score_active])),
+        EPS,
+    )
+    causal_total = 0.5 * (
+        raw["restore"][left_channel] + raw["restore"][right_channel]
+    )
+    causal_d = (
+        raw["restore"][left_channel] - raw["restore"][right_channel]
+    ) / (
+        raw["restore"][left_channel] + raw["restore"][right_channel] + EPS
+    )
+    causal_floor = max(
+        cfg.causal_effect_floor_relative
+        * float(np.nanmax(causal_total[score_active])),
+        EPS,
+    )
+    importance_floor = float(np.nanmedian(score["J"][score_active]))
+    rows = []
+    for layer in range(score["D"].shape[0]):
+        for head in range(score["D"].shape[1]):
+            active = bool(score_active[layer, head])
+            d_value = float(score["D"][layer, head])
+            if not active:
+                score_role = "inactive"
+            elif d_value >= cfg.selectivity_threshold:
+                score_role = f"{left_channel}_focused"
+            elif d_value <= -cfg.selectivity_threshold:
+                score_role = f"{right_channel}_focused"
+            else:
+                score_role = "balanced_active"
+            causal_active = bool(causal_total[layer, head] >= causal_floor)
+            causal_d_value = float(causal_d[layer, head])
+            if not causal_active:
+                causal_role = "weak"
+            elif causal_d_value >= cfg.selectivity_threshold:
+                causal_role = f"{left_channel}_mediator"
+            elif causal_d_value <= -cfg.selectivity_threshold:
+                causal_role = f"{right_channel}_mediator"
+            else:
+                causal_role = "balanced_mediator"
+            expected_causal = score_role.replace("_focused", "_mediator")
+            if score_role in {"inactive", "balanced_active"}:
+                role_confirmation = "not_selectivity_tested"
+            elif causal_role == expected_causal and restore_specificity[layer, head] > 0:
+                role_confirmation = "aligned_specific"
+            elif causal_role == expected_causal:
+                role_confirmation = "aligned_nonspecific"
+            else:
+                role_confirmation = "not_aligned"
+            rescuable = bool(
+                matched_restore[layer, head] >= restore_floor
+                and restore_specificity[layer, head] > 0.0
+            )
+            necessary = bool(matched_necessity[layer, head] >= necessity_floor)
+            if rescuable and necessary:
+                mediation_class = "necessary_and_rescuable"
+            elif rescuable:
+                mediation_class = "redundant_or_distributed_rescue"
+            elif necessary:
+                mediation_class = "necessary_not_cleanly_rescued"
+            else:
+                mediation_class = "weak_or_unresolved"
+            rows.append({
+                "layer": layer,
+                "head": head,
+                "left_channel": left_channel,
+                "right_channel": right_channel,
+                "score_D": d_value,
+                "score_J": float(score["J"][layer, head]),
+                "score_active": active,
+                "score_role": score_role,
+                "importance_class": (
+                    "high_evoked_strength"
+                    if active and score["J"][layer, head] >= importance_floor
+                    else "lower_evoked_strength"
+                ),
+                "causal_D": causal_d_value,
+                "causal_J": float(causal_total[layer, head]),
+                "causal_role": causal_role,
+                "role_confirmation": role_confirmation,
+                "matched_channel": left_channel if left_selected[layer, head] else right_channel,
+                "matched_restore": float(matched_restore[layer, head]),
+                "matched_restore_specificity": float(restore_specificity[layer, head]),
+                "matched_necessity": float(matched_necessity[layer, head]),
+                "matched_mismatch": float(matched_mismatch[layer, head]),
+                "matched_sham": float(matched_sham[layer, head]),
+                "mediation_class": mediation_class,
+            })
+    return {
+        "left_channel": left_channel,
+        "right_channel": right_channel,
+        "score_graph_ids": score_graph_ids,
+        "score": score,
+        "score_activity_floor": score_floor,
+        "causal_activity_floor": causal_floor,
+        "restore_floor": restore_floor,
+        "necessity_floor": necessity_floor,
+        "rows": rows,
+        "classification_status": (
+            "exploratory relative-threshold taxonomy; continuous raw values are primary"
+        ),
+    }
+
+
+def figure_causal_role_map(
+    analyses: Mapping[str, Mapping[str, Mapping[str, Any]]], path: Path
+) -> list[str]:
+    """Specific rescue versus necessity; D supplies role and J supplies importance."""
+
+    plt = configure_matplotlib()
+    pairs = ("semantic_pe", "semantic_topology")
+    fig, axes = plt.subplots(2, 2, figsize=(9.3, 7.4), constrained_layout=True)
+    scatter = None
+    for row_index, pair in enumerate(pairs):
+        for column, task in enumerate(ARCHITECTURES):
+            analysis = analyses[pair][task]
+            rows = analysis["rows"]
+            x = np.asarray([item["matched_restore_specificity"] for item in rows])
+            y = np.asarray([item["matched_necessity"] for item in rows])
+            d = np.asarray([item["score_D"] for item in rows])
+            j = np.asarray([item["score_J"] for item in rows])
+            active = np.asarray([item["score_active"] for item in rows], dtype=bool)
+            sizes = 16.0 + 55.0 * j / max(float(np.nanmax(j)), EPS)
+            axis = axes[row_index, column]
+            axis.scatter(
+                x[~active], y[~active], s=sizes[~active],
+                color="0.82", edgecolor="none",
+            )
+            scatter = axis.scatter(
+                x[active], y[active], s=sizes[active], c=d[active],
+                cmap="coolwarm", vmin=-1.0, vmax=1.0,
+                edgecolor="black", linewidth=0.25,
+            )
+            axis.axvline(0.0, color="0.45", linewidth=0.7)
+            axis.axhline(
+                analysis["necessity_floor"], color="0.55", linestyle="--", linewidth=0.7
+            )
+            counts: dict[str, int] = {}
+            for item in rows:
+                if item["score_role"] in {"inactive", "balanced_active"}:
+                    continue
+                counts[item["mediation_class"]] = (
+                    counts.get(item["mediation_class"], 0) + 1
+                )
+            concise = (
+                f"necessary+rescuable={counts.get('necessary_and_rescuable', 0)}; "
+                f"rescue-only={counts.get('redundant_or_distributed_rescue', 0)}"
+            )
+            left = CHANNEL_DISPLAY[analysis["left_channel"]]
+            right = CHANNEL_DISPLAY[analysis["right_channel"]]
+            axis.set_title(
+                f"{DISPLAY[task]} · {left}–{right}\n{concise}", fontsize=9
+            )
+            axis.set_xlabel("matched restore − max(mismatch, sham)")
+            if column == 0:
+                axis.set_ylabel("matched zero-ablation necessity")
+    if scatter is not None:
+        colorbar = fig.colorbar(
+            scatter, ax=axes, fraction=0.022, pad=0.01
+        )
+        colorbar.set_label("$D_{rel}$  (− right, + left)")
+    fig.suptitle(
+        "Causal role map: selectivity gives channel identity, J gives marker size\n"
+        "(horizontal dashed lines are exploratory necessity floors; raw values are primary)",
         fontsize=11,
     )
     outputs = save_figure(fig, path)
@@ -4908,6 +6661,284 @@ def family_channel_matrix(
                 if heads and np.isfinite(value).any():
                     matrix[row, column] = np.nanmean([value[head] for head in heads])
     return matrix
+
+
+CAUSAL_FOCUS_FAMILIES = (
+    "semantic_D_extreme",
+    "semantic_D_J_matched",
+    "pe_D_extreme",
+    "pe_D_J_matched",
+)
+
+
+def family_differential_causal_validation(
+    causal: Mapping[str, Any], cfg: BetaConfig
+) -> dict[str, Any]:
+    """Held-out simultaneous-family D_causal with graph-bootstrap uncertainty."""
+
+    available = list(causal.get("family_names", []))
+    family_metrics = causal.get("family_metrics", {})
+    results: dict[str, Any] = {}
+    for metric_index, metric in enumerate(("restore", "inject", "necessity")):
+        values = np.asarray(family_metrics.get(metric, []), dtype=float)
+        rows = []
+        if values.ndim != 2:
+            results[metric] = rows
+            continue
+        graph_ids, semantic_graphs, pe_graphs = paired_hierarchical_channel_values(
+            causal, values, "semantic", "pe", reduction="signed"
+        )
+        if not len(graph_ids):
+            results[metric] = rows
+            continue
+        coordinates = causal_strength_coordinates(
+            semantic_graphs, pe_graphs, positive_after_graph_mean=True
+        )
+        rng = np.random.default_rng(
+            cfg.analysis_seed + 23_003 + 101 * metric_index
+        )
+        draws = []
+        for _ in range(int(cfg.bootstrap_samples)):
+            indices = rng.integers(0, len(graph_ids), len(graph_ids))
+            draws.append(causal_strength_coordinates(
+                semantic_graphs,
+                pe_graphs,
+                positive_after_graph_mean=True,
+                indices=indices,
+            ))
+        stacked = {
+            key: np.stack([draw[key] for draw in draws])
+            for key in ("left", "right", "D", "J")
+        }
+        for family in CAUSAL_FOCUS_FAMILIES:
+            if family not in available:
+                rows.append({
+                    "family": family,
+                    "available": False,
+                    "D_causal": float("nan"),
+                    "ci_low": float("nan"),
+                    "ci_high": float("nan"),
+                    "graphs": int(len(graph_ids)),
+                })
+                continue
+            index = available.index(family)
+            rows.append({
+                "family": family,
+                "available": True,
+                "D_causal": float(coordinates["D"][index]),
+                "ci_low": float(np.quantile(stacked["D"][:, index], 0.025)),
+                "ci_high": float(np.quantile(stacked["D"][:, index], 0.975)),
+                "J_causal": float(coordinates["J"][index]),
+                "semantic_causal_strength": float(coordinates["left"][index]),
+                "pe_causal_strength": float(coordinates["right"][index]),
+                "semantic_ci_low": float(
+                    np.quantile(stacked["left"][:, index], 0.025)
+                ),
+                "semantic_ci_high": float(
+                    np.quantile(stacked["left"][:, index], 0.975)
+                ),
+                "pe_ci_low": float(
+                    np.quantile(stacked["right"][:, index], 0.025)
+                ),
+                "pe_ci_high": float(
+                    np.quantile(stacked["right"][:, index], 0.975)
+                ),
+                "raw_semantic_minus_pe": float(
+                    coordinates["left"][index] - coordinates["right"][index]
+                ),
+                "graphs": int(len(graph_ids)),
+            })
+        by_family = {row["family"]: row for row in rows}
+        for focus, extreme, control in (
+            ("semantic", "semantic_D_extreme", "semantic_D_J_matched"),
+            ("pe", "pe_D_extreme", "pe_D_J_matched"),
+        ):
+            if not (
+                by_family.get(extreme, {}).get("available", False)
+                and by_family.get(control, {}).get("available", False)
+            ):
+                continue
+            extreme_index, control_index = available.index(extreme), available.index(control)
+            contrast = (
+                stacked["left"][:, extreme_index] - stacked["right"][:, extreme_index]
+                - stacked["left"][:, control_index] + stacked["right"][:, control_index]
+            )
+            for family in (extreme, control):
+                by_family[family]["matched_control_pair"] = focus
+            by_family[extreme]["extreme_minus_control_raw_role"] = float(
+                coordinates["left"][extreme_index] - coordinates["right"][extreme_index]
+                - coordinates["left"][control_index] + coordinates["right"][control_index]
+            )
+            by_family[extreme]["extreme_minus_control_ci_low"] = float(
+                np.quantile(contrast, 0.025)
+            )
+            by_family[extreme]["extreme_minus_control_ci_high"] = float(
+                np.quantile(contrast, 0.975)
+            )
+        results[metric] = rows
+    return {"metrics": results}
+
+
+def figure_family_differential_causal_focus(
+    validations: Mapping[str, Mapping[str, Any]],
+    runs: Mapping[str, Mapping[str, Any]],
+    path: Path,
+) -> list[str]:
+    plt = configure_matplotlib()
+    fig, axes = plt.subplots(2, 3, figsize=(10.5, 6.8), constrained_layout=True)
+    colors = {
+        "semantic_D_extreme": "#c75b5b",
+        "semantic_D_J_matched": "#d9a0a0",
+        "pe_D_extreme": "#4c78a8",
+        "pe_D_J_matched": "#9ab4d2",
+    }
+    labels = {
+        "semantic_D_extreme": "semantic-D extreme",
+        "semantic_D_J_matched": "semantic J/layer control",
+        "pe_D_extreme": "PE-D extreme",
+        "pe_D_J_matched": "PE J/layer control",
+    }
+    for row, task in enumerate(ARCHITECTURES):
+        family_defs = runs[task]["causal"].get("family_definitions", {})
+        for column, metric in enumerate(("restore", "inject", "necessity")):
+            axis = axes[row, column]
+            rows = validations[task]["metrics"][metric]
+            x = np.arange(len(CAUSAL_FOCUS_FAMILIES))
+            values = np.asarray([
+                next(item for item in rows if item["family"] == family)["D_causal"]
+                for family in CAUSAL_FOCUS_FAMILIES
+            ])
+            low = np.asarray([
+                next(item for item in rows if item["family"] == family)["ci_low"]
+                for family in CAUSAL_FOCUS_FAMILIES
+            ])
+            high = np.asarray([
+                next(item for item in rows if item["family"] == family)["ci_high"]
+                for family in CAUSAL_FOCUS_FAMILIES
+            ])
+            axis.bar(
+                x, values,
+                color=[colors[family] for family in CAUSAL_FOCUS_FAMILIES],
+                edgecolor="black", linewidth=0.4,
+            )
+            axis.errorbar(
+                x, values,
+                yerr=np.vstack([
+                    np.maximum(values - low, 0.0),
+                    np.maximum(high - values, 0.0),
+                ]),
+                fmt="none", ecolor="black", linewidth=0.8, capsize=2,
+            )
+            axis.axhline(0, color="black", linewidth=0.7)
+            axis.set_ylim(-1.05, 1.05)
+            axis.set_xticks(
+                x,
+                [
+                    f"{labels[family]}\n(n={len(family_defs.get(family, []))})"
+                    for family in CAUSAL_FOCUS_FAMILIES
+                ],
+                rotation=24, ha="right", fontsize=7,
+            )
+            axis.set_title(f"{DISPLAY[task]} · {metric}")
+            if column == 0:
+                axis.set_ylabel("$D_{causal}$  (− PE, + semantic)")
+    fig.suptitle(
+        "Frozen D-extreme families versus same-layer, J-matched controls",
+        fontsize=11,
+    )
+    outputs = save_figure(fig, path)
+    plt.close(fig)
+    return outputs
+
+
+def figure_family_raw_causal_strength(
+    validations: Mapping[str, Mapping[str, Any]], path: Path
+) -> list[str]:
+    """Raw channel strengths expose whether a D ratio is supported by real movement."""
+
+    plt = configure_matplotlib()
+    fig, axes = plt.subplots(2, 3, figsize=(11.2, 7.0), constrained_layout=True)
+    short = {
+        "semantic_D_extreme": "sem-D",
+        "semantic_D_J_matched": "sem ctl",
+        "pe_D_extreme": "PE-D",
+        "pe_D_J_matched": "PE ctl",
+    }
+    width = 0.36
+    for row_index, task in enumerate(ARCHITECTURES):
+        for column, metric in enumerate(("restore", "inject", "necessity")):
+            axis = axes[row_index, column]
+            by_family = {
+                item["family"]: item
+                for item in validations[task]["metrics"][metric]
+            }
+            x = np.arange(len(CAUSAL_FOCUS_FAMILIES))
+            semantic = np.asarray([
+                by_family[family].get("semantic_causal_strength", np.nan)
+                for family in CAUSAL_FOCUS_FAMILIES
+            ])
+            pe = np.asarray([
+                by_family[family].get("pe_causal_strength", np.nan)
+                for family in CAUSAL_FOCUS_FAMILIES
+            ])
+            semantic_low = np.asarray([
+                by_family[family].get("semantic_ci_low", np.nan)
+                for family in CAUSAL_FOCUS_FAMILIES
+            ])
+            semantic_high = np.asarray([
+                by_family[family].get("semantic_ci_high", np.nan)
+                for family in CAUSAL_FOCUS_FAMILIES
+            ])
+            pe_low = np.asarray([
+                by_family[family].get("pe_ci_low", np.nan)
+                for family in CAUSAL_FOCUS_FAMILIES
+            ])
+            pe_high = np.asarray([
+                by_family[family].get("pe_ci_high", np.nan)
+                for family in CAUSAL_FOCUS_FAMILIES
+            ])
+            axis.bar(
+                x - width / 2, semantic, width, color="#c75b5b",
+                edgecolor="black", linewidth=0.35, label="semantic events",
+            )
+            axis.bar(
+                x + width / 2, pe, width, color="#4c78a8",
+                edgecolor="black", linewidth=0.35, label="PE events",
+            )
+            axis.errorbar(
+                x - width / 2, semantic,
+                yerr=np.vstack([
+                    np.maximum(semantic - semantic_low, 0.0),
+                    np.maximum(semantic_high - semantic, 0.0),
+                ]),
+                fmt="none", color="black", linewidth=0.7, capsize=2,
+            )
+            axis.errorbar(
+                x + width / 2, pe,
+                yerr=np.vstack([
+                    np.maximum(pe - pe_low, 0.0),
+                    np.maximum(pe_high - pe, 0.0),
+                ]),
+                fmt="none", color="black", linewidth=0.7, capsize=2,
+            )
+            axis.axhline(0, color="black", linewidth=0.65)
+            axis.set_xticks(
+                x, [short[family] for family in CAUSAL_FOCUS_FAMILIES],
+                rotation=20, ha="right",
+            )
+            axis.set_title(f"{DISPLAY[task]} · {metric}")
+            if column == 0:
+                axis.set_ylabel("raw desired output movement")
+            if row_index == 0 and column == 0:
+                axis.legend(frameon=False, fontsize=7)
+    fig.suptitle(
+        "D-family causal controls without ratio normalisation\n"
+        "(graph-bootstrap 95% intervals; extremes versus same-layer, J-matched controls)",
+        fontsize=11,
+    )
+    outputs = save_figure(fig, path)
+    plt.close(fig)
+    return outputs
 
 
 def figure_family_patching(
@@ -6053,7 +8084,9 @@ def figure_distance_specialisation_atlas(
             axis.set_xlabel("carrier distance from changed set [hops]")
             if column == 0:
                 axis.set_ylabel(f"{DISPLAY[task]}\nhead rows (layer blocks)")
-            axis.set_title(("semantic donor", "PE transposition", "topology donor")[column])
+            axis.set_title(
+                ("semantic donor", "PE transposition", "local topology switch")[column]
+            )
     if image is not None:
         colorbar = fig.colorbar(image, ax=axes, fraction=0.018, pad=0.01)
         colorbar.set_label("fraction of that head's EG score")
@@ -6107,7 +8140,9 @@ def figure_support_normalised_distance_atlas(
             axis.set_xlabel("carrier distance from changed set [hops]")
             if column == 0:
                 axis.set_ylabel(f"{DISPLAY[task]}\nhead rows (layer blocks)")
-            axis.set_title(("semantic donor", "PE transposition", "topology donor")[column])
+            axis.set_title(
+                ("semantic donor", "PE transposition", "local topology switch")[column]
+            )
     if image is not None:
         colorbar = fig.colorbar(image, ax=axes, fraction=0.018, pad=0.01)
         colorbar.set_label("fraction of support-normalised head response")
@@ -6263,7 +8298,9 @@ def figure_distance_locality_curves(
             axis.set_xlabel("molecular hop distance")
             if column == 0:
                 axis.set_ylabel(f"{DISPLAY[task]}\nnormalised profile")
-            axis.set_title(("semantic donor", "PE transposition", "topology donor")[column])
+            axis.set_title(
+                ("semantic donor", "PE transposition", "local topology switch")[column]
+            )
             if row == 0 and column == 0:
                 axis.legend(frameon=False, fontsize=7)
     fig.suptitle(
@@ -6288,8 +8325,13 @@ def figure_distance_usage_coupling(
     fig, axes = plt.subplots(4, 3, figsize=(12.0, 11.0), constrained_layout=True)
     carriage_profiles = {
         (task, channel): model_carriage_profile(
-            runs[task]["scores"],
-            channel,
+            (
+                runs[task]["topology_reach"]
+                if channel == "topology" else runs[task]["scores"]
+            ),
+            (
+                LOCAL_TOPOLOGY_CHANNEL if channel == "topology" else channel
+            ),
             bootstrap_samples=cfg.bootstrap_samples,
             seed=cfg.analysis_seed + 12_701 + 101 * row + column,
         )
@@ -6365,7 +8407,9 @@ def figure_distance_usage_coupling(
                 f"{DISPLAY[task]}\nnormalised distance mass" if column == 0
                 else "normalised distance mass"
             )
-            top.set_title(("semantic donor", "PE transposition", "topology donor")[column])
+            top.set_title(
+                ("semantic donor", "PE transposition", "local topology switch")[column]
+            )
             top.legend(frameon=False, fontsize=6.5)
 
             bottom = axes[2 * architecture_index + 1, column]
@@ -6401,7 +8445,11 @@ def figure_model_functional_carriage(
     for row, task in enumerate(ARCHITECTURES):
         for column, channel in enumerate(CHANNELS):
             profile = model_carriage_profile(
-                runs[task]["scores"], channel,
+                (
+                    runs[task]["topology_reach"]
+                    if channel == "topology" else runs[task]["scores"]
+                ),
+                LOCAL_TOPOLOGY_CHANNEL if channel == "topology" else channel,
                 bootstrap_samples=cfg.bootstrap_samples,
                 seed=cfg.analysis_seed + 101 * row + column,
             )
@@ -6424,7 +8472,9 @@ def figure_model_functional_carriage(
             axis.set_xlabel("distance to changed set [hops]")
             if column == 0:
                 axis.set_ylabel(f"{DISPLAY[task]}\nfunctional carriage")
-            axis.set_title(("semantic donor", "PE transposition", "topology donor")[column])
+            axis.set_title(
+                ("semantic donor", "PE transposition", "local topology switch")[column]
+            )
     axes[0, 0].legend(frameon=False, fontsize=7)
     fig.suptitle("Final-state functional carriage: production F_sens on a shared log scale", fontsize=11)
     outputs = save_figure(fig, path)
@@ -6439,7 +8489,11 @@ def figure_model_beneficial_carriage(
     fig, axes = plt.subplots(2, 3, figsize=(12.0, 7.0), constrained_layout=True, sharey=True)
     profiles = {
         (task, channel): model_carriage_profile(
-            runs[task]["scores"], channel,
+            (
+                runs[task]["topology_reach"]
+                if channel == "topology" else runs[task]["scores"]
+            ),
+            LOCAL_TOPOLOGY_CHANNEL if channel == "topology" else channel,
             bootstrap_samples=cfg.bootstrap_samples,
             seed=cfg.analysis_seed + 401 + 101 * row + column,
         )
@@ -6470,7 +8524,9 @@ def figure_model_beneficial_carriage(
             axis.set_xlabel("distance to changed set [hops]")
             if column == 0:
                 axis.set_ylabel(f"{DISPLAY[task]}\nbeneficial carriage B")
-            axis.set_title(("semantic donor", "PE transposition", "topology donor")[column])
+            axis.set_title(
+                ("semantic donor", "PE transposition", "local topology switch")[column]
+            )
     fig.suptitle(
         "Path-integrated beneficial carriage on shared signed-log limits (B<0 beneficial)", fontsize=11
     )
@@ -6543,7 +8599,12 @@ def figure_conditional(
             axis.set_axis_off()
             continue
         labels = [
-            f"{row['feature']} · {row['rule']}\nL{row['layer']}H{row['head']}" for row in rows
+            (
+                f"{row['feature']} · {row['rule']}\n"
+                f"{row.get('effect_type', 'conditional effect')} · "
+                f"L{row['layer']}H{row['head']}"
+            )
+            for row in rows
         ]
         y = np.arange(len(rows))
         discovery = np.asarray([row["discovery_effect_standardized"] for row in rows])
@@ -6575,7 +8636,88 @@ def figure_conditional(
         axis.set_title(DISPLAY[task])
         axis.invert_yaxis()
     axes[0].legend(frameon=False)
-    fig.suptitle("Sample-split conditional-specialisation screen", fontsize=11)
+    fig.suptitle(
+        "Sample-split conditional-specialisation screen\n"
+        "(source conditions require source-local interventions; global topology uses graph context)",
+        fontsize=11,
+    )
+    outputs = save_figure(fig, path)
+    plt.close(fig)
+    return outputs
+
+
+def figure_conditional_causal_confirmation(
+    validations: Mapping[str, Mapping[str, Any]], path: Path
+) -> list[str]:
+    plt = configure_matplotlib()
+    fig, axes = plt.subplots(1, 2, figsize=(9.4, 4.2), constrained_layout=True)
+    for axis, task in zip(axes, ARCHITECTURES):
+        validation = validations[task]
+        rows = [
+            row for row in validation.get("tested", [])
+            if row.get("causal_test_eligible", False)
+        ]
+        rows.sort(key=lambda row: (
+            not bool(row.get("causally_confirmed_at_fdr_0.05", False)),
+            float(row.get("causal_q_global", float("inf"))),
+            -abs(float(row.get("causal_effect_standardized", 0.0))),
+        ))
+        rows = rows[:8]
+        if not rows:
+            message = (
+                validation.get("interpretation", "No eligible causal confirmation.")
+                if not validation.get("available", False)
+                else "No score-confirmed condition had\ncausal support in both states"
+            )
+            axis.text(0.5, 0.5, message, ha="center", va="center", wrap=True)
+            axis.set_axis_off()
+            continue
+        labels = [
+            (
+                f"{row['feature']} · {row['rule']}\n"
+                f"{row.get('effect_type', 'conditional effect')} · "
+                f"L{row['layer']}H{row['head']}"
+            )
+            for row in rows
+        ]
+        y = np.arange(len(rows))
+        value = np.asarray([row["causal_effect_standardized"] for row in rows])
+        low = np.maximum(value - np.asarray([
+            row["causal_ci_low_standardized"] for row in rows
+        ]), 0.0)
+        high = np.maximum(np.asarray([
+            row["causal_ci_high_standardized"] for row in rows
+        ]) - value, 0.0)
+        seen: set[str] = set()
+        for index, row in enumerate(rows):
+            confirmed = bool(row.get("causally_confirmed_at_fdr_0.05", False))
+            label = "causally FDR-confirmed" if confirmed else "not causally confirmed"
+            axis.errorbar(
+                value[index], y[index],
+                xerr=[[low[index]], [high[index]]],
+                fmt="o",
+                color="#2a9d6f" if confirmed else "0.55",
+                markerfacecolor="#2a9d6f" if confirmed else "white",
+                label=label if label not in seen else None,
+            )
+            seen.add(label)
+        axis.axvline(0, color="black", linewidth=0.7)
+        axis.set_yticks(y, labels)
+        axis.set_xlabel("standardised conditional gross-restore delta")
+        axis.set_title(
+            f"{DISPLAY[task]} · "
+            f"{validation.get('causally_confirmed', 0)}/"
+            f"{validation.get('eligible_tests', 0)} confirmed"
+        )
+        axis.invert_yaxis()
+    handles, legend_labels = axes[0].get_legend_handles_labels()
+    if handles:
+        axes[0].legend(handles, legend_labels, frameon=False, fontsize=7)
+    fig.suptitle(
+        "Independent causal-split confirmation of conditional specialisation\n"
+        "(frozen score-discovery rules and heads; global FDR)",
+        fontsize=11,
+    )
     outputs = save_figure(fig, path)
     plt.close(fig)
     return outputs
@@ -6597,7 +8739,11 @@ def intervention_event_rows(
 ) -> list[dict[str, Any]]:
     rows = []
     for record in score["records"]:
-        for channel in CHANNELS:
+        available_channels = [
+            channel for channel in (*CHANNELS, LOCAL_TOPOLOGY_CHANNEL)
+            if channel in record["channels"]
+        ]
+        for channel in available_channels:
             result = record["channels"][channel]
             if not result["available"]:
                 continue
@@ -6621,7 +8767,7 @@ def intervention_event_rows(
                             "partner": int(item["partners"][event_index]),
                             "degree_gap": int(item["degree_gap"][event_index]),
                         }
-                    else:
+                    elif channel == "topology":
                         item = record["plan"]["topology"][event_index]
                         dose = float(item["dose"]["edge_jaccard_distance"])
                         metadata = {
@@ -6634,6 +8780,28 @@ def intervention_event_rows(
                             "changed_node_fraction": len(item["dose"]["changed_nodes"])
                             / max(int(record["n"]), 1),
                         }
+                    elif channel == LOCAL_TOPOLOGY_CHANNEL:
+                        group = record["plan"][LOCAL_TOPOLOGY_CHANNEL][source_index]
+                        item = group["events"][event_index]
+                        dose = float(item["dose"]["edge_jaccard_distance"])
+                        metadata = {
+                            "source": str(
+                                np.asarray(group["source_edge"], dtype=np.int64).tolist()
+                            ),
+                            "edit_type": "degree_preserving_two_edge_switch",
+                            "match_tier": -1,
+                            "changed_node_fraction": float(
+                                item["dose"]["changed_node_fraction"]
+                            ),
+                            "maximum_pristine_distance": int(
+                                item["dose"]["maximum_pristine_distance"]
+                            ),
+                            "changed_set_diameter": float(
+                                item["dose"]["changed_set_diameter"]
+                            ),
+                        }
+                    else:
+                        raise ValueError(channel)
                     loss_delta = float(result["event_outcomes"][outcome_cursor])
                     outcome_cursor += 1
                     rows.append({
@@ -6676,8 +8844,127 @@ def donor_outcome_summary_rows(event_rows: Sequence[Mapping[str, Any]]) -> list[
     return rows
 
 
+def topology_reach_support_rows(
+    architecture: str,
+    global_score: Mapping[str, Any],
+    local_reach: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    """Compare changed-set coverage before interpreting any model response."""
+
+    rows = []
+    for scope, payload, channel in (
+        ("matched whole-molecule donor", global_score, "topology"),
+        ("local degree-preserving switch", local_reach, LOCAL_TOPOLOGY_CHANNEL),
+    ):
+        for record in payload["records"]:
+            distance = shortest_paths(
+                int(record["n"]),
+                np.asarray(record["plan"]["descriptor"]["edges"], dtype=np.int64),
+            )
+            groups = (
+                [record["plan"]["topology"]]
+                if channel == "topology"
+                else [
+                    group["events"]
+                    for group in record["plan"].get(LOCAL_TOPOLOGY_CHANNEL, [])
+                ]
+            )
+            for source_index, events in enumerate(groups):
+                for event_index, event in enumerate(events):
+                    changed = np.asarray(
+                        event["dose"]["changed_nodes"]
+                        if channel == "topology" else event["changed_nodes"],
+                        dtype=np.int64,
+                    )
+                    nearest = (
+                        np.min(distance[:, changed], axis=1)
+                        if len(changed) else np.full(int(record["n"]), np.inf)
+                    )
+                    finite = nearest[np.isfinite(nearest)]
+                    rows.append({
+                        "architecture": architecture,
+                        "intervention_scope": scope,
+                        "graph_id": int(record["graph_id"]),
+                        "source_index": int(source_index),
+                        "event_index": int(event_index),
+                        "changed_nodes": int(len(changed)),
+                        "changed_node_fraction": float(
+                            len(changed) / max(int(record["n"]), 1)
+                        ),
+                        "maximum_available_distance": (
+                            int(np.max(finite)) if len(finite) else -1
+                        ),
+                        "mean_available_distance": (
+                            float(np.mean(finite)) if len(finite) else float("nan")
+                        ),
+                    })
+    return rows
+
+
+def figure_topology_reach_support(
+    rows: Sequence[Mapping[str, Any]], path: Path
+) -> list[str]:
+    """Show why whole-graph donor distance cannot estimate propagation reach."""
+
+    plt = configure_matplotlib()
+    fig, axes = plt.subplots(2, 2, figsize=(9.0, 6.5), constrained_layout=True)
+    scopes = ("matched whole-molecule donor", "local degree-preserving switch")
+    labels = ("global donor", "local switch")
+    colors = ("#9a9a9a", "#6f63a8")
+    rng = np.random.default_rng(2027)
+    for column, task in enumerate(ARCHITECTURES):
+        selected = [row for row in rows if row["architecture"] == task]
+        for row_index, (metric, ylabel) in enumerate((
+            ("maximum_available_distance", "maximum distance to changed set [hops]"),
+            ("changed_node_fraction", "fraction of molecule directly changed"),
+        )):
+            axis = axes[row_index, column]
+            values = [
+                np.asarray([
+                    item[metric] for item in selected
+                    if item["intervention_scope"] == scope
+                ], dtype=float)
+                for scope in scopes
+            ]
+            axis.boxplot(
+                values,
+                positions=(0, 1),
+                widths=0.5,
+                patch_artist=True,
+                showfliers=False,
+                boxprops={"facecolor": "white", "edgecolor": "0.35"},
+                medianprops={"color": "black"},
+            )
+            for position, (value, color) in enumerate(zip(values, colors)):
+                if len(value):
+                    keep = rng.choice(
+                        len(value), size=min(len(value), 240), replace=False
+                    )
+                    jitter = rng.normal(position, 0.045, len(keep))
+                    axis.scatter(
+                        jitter, value[keep], s=8, alpha=0.22, color=color,
+                        edgecolors="none",
+                    )
+            axis.set_xticks((0, 1), labels)
+            axis.set_title(DISPLAY[task])
+            if column == 0:
+                axis.set_ylabel(ylabel)
+            axis.grid(True, axis="y", alpha=0.2)
+            if metric == "maximum_available_distance":
+                axis.axhline(3, color="#c75b5b", linestyle="--", linewidth=0.9)
+    fig.suptitle(
+        "Intervention geometry audit: global donor coverage versus local topology reach",
+        fontsize=11,
+    )
+    outputs = save_figure(fig, path)
+    plt.close(fig)
+    return outputs
+
+
 def create_decisions(
-    runs: Mapping[str, Mapping[str, Any]], aggregation: str
+    runs: Mapping[str, Mapping[str, Any]],
+    aggregation: str,
+    differential_validations: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     topology = {
         task: topology_summary(runs[task]["scores"], runs[task]["causal"], aggregation)
@@ -6735,9 +9022,22 @@ def create_decisions(
         and all(value > 0.0 for value in mechanism_full)
         and all(value <= 0.50 for value in mechanism_interaction_ratio)
     )
-    d_valid = all(
-        validation_rows[task]["rho_D_restore_gated"] >= 0.30
-        and validation_rows[task]["rho_D_necessity_gated"] >= 0.20
+    differential_validations = differential_validations or {}
+    primary_focus = {
+        task: differential_validations.get(task, {}).get(
+            "specifications", {}
+        ).get("gross_restore", {})
+        for task in ARCHITECTURES
+    }
+    d_focus_replicated = all(
+        bool(primary_focus[task])
+        and float(primary_focus[task].get("rho_within_layer_ci_low", -np.inf)) > 0.0
+        and float(primary_focus[task].get("within_layer_permutation_p", 1.0)) <= 0.05
+        for task in ARCHITECTURES
+    )
+    d_focus_any = any(
+        bool(primary_focus[task])
+        and float(primary_focus[task].get("rho_within_layer", 0.0)) > 0.0
         for task in ARCHITECTURES
     )
     j_partial = finite_mean([
@@ -6778,11 +9078,33 @@ def create_decisions(
         "overall_aggregation": aggregation,
         "aggregation_rule": "EG is predeclared; this rerun performs no aggregation reselection",
         "D": {
-            "verdict": "retain_gated" if d_valid else "descriptive_only",
-            "rule": (
-                "requires J/activity floor, bootstrap sign, and within-layer restore rho>=0.30 "
-                "plus necessity rho>=0.20 in both architectures; ungated D is a failure-control"
+            "verdict": (
+                "retain_as_replicated_causal_focus"
+                if d_focus_replicated
+                else "retain_architecture_conditional" if d_focus_any
+                else "descriptive_only"
             ),
+            "rule": (
+                "D is tested against held-out semantic-versus-PE differential whole-transport "
+                "mediation, not ordinary ablation. Primary validation is eventwise-gross restore "
+                "with activity gating, hierarchical donor/source/graph averaging, a graph-bootstrap "
+                "CI and a within-layer permutation test; net, effect-normalised, injection and "
+                "necessity coordinates are robustness specifications."
+            ),
+            "primary_gross_restore_by_architecture": {
+                task: {
+                    key: value for key, value in primary_focus[task].items()
+                    if key in {
+                        "graphs", "heads", "rho_pooled", "rho_pooled_ci_low",
+                        "rho_pooled_ci_high", "rho_within_layer",
+                        "rho_within_layer_ci_low", "rho_within_layer_ci_high",
+                        "rho_partial_J_and_layer", "within_layer_permutation_p",
+                        "high_minus_low_D_causal", "high_minus_low_ci_low",
+                        "high_minus_low_ci_high", "selective_sign_agreement",
+                    }
+                }
+                for task in ARCHITECTURES
+            },
         },
         "J": {
             "verdict": "retain_as_evoked_strength" if j_partial >= 0.30 else "retain_descriptive_only",
@@ -6806,12 +9128,13 @@ def create_decisions(
             "topology_convention": "common-support routing/message plus explicit exclusive-support wiring",
         },
         "carriage": (
-            "F_sens is the sole functional-carriage estimand; all channels use event-specific "
-            "changed-set distance and shared log-scale figures"
+            "F_sens is the sole functional-carriage estimand; semantic and PE use their "
+            "event-specific sources, while topology reach uses the separate local two-edge "
+            "switch rather than the whole-molecule donor"
         ),
         "beneficial_carriage": (
-            "signed path-integrated carrier attribution is computed for semantic, PE and topology "
-            "events and shown on shared symlog limits; no absolute-value replacement"
+            "signed path-integrated carrier attribution is computed for semantic, PE and local "
+            "topology-reach events and shown on shared symlog limits; no absolute-value replacement"
         ),
         "topology_donor": {
             "verdict": topology_verdict,
@@ -6847,6 +9170,110 @@ def create_outputs(runs: Mapping[str, Mapping[str, Any]], cfg: BetaConfig) -> di
             method_rows.append({"architecture": task, **row})
     overall = HEADLINE_AGGREGATION
     write_csv(tables / "aggregation_validation.csv", method_rows)
+    differential_validations = {
+        task: differential_causal_validation(
+            runs[task]["scores"], runs[task]["causal"], cfg, overall,
+            "semantic", "pe",
+        )
+        for task in ARCHITECTURES
+    }
+    semantic_topology_differential_validations = {
+        task: differential_causal_validation(
+            runs[task]["scores"], runs[task]["causal"], cfg, overall,
+            "semantic", "topology",
+        )
+        for task in ARCHITECTURES
+    }
+    role_analyses = {
+        "semantic_pe": {
+            task: causal_role_analysis(
+                runs[task]["scores"], runs[task]["causal"], cfg, overall,
+                "semantic", "pe",
+            )
+            for task in ARCHITECTURES
+        },
+        "semantic_topology": {
+            task: causal_role_analysis(
+                runs[task]["scores"], runs[task]["causal"], cfg, overall,
+                "semantic", "topology",
+            )
+            for task in ARCHITECTURES
+        },
+    }
+    family_differential_validations = {
+        task: family_differential_causal_validation(runs[task]["causal"], cfg)
+        for task in ARCHITECTURES
+    }
+    causal_focus_rows = []
+    causal_focus_head_rows = []
+    family_causal_focus_rows = []
+    for comparison, validations in (
+        ("semantic_pe", differential_validations),
+        ("semantic_topology", semantic_topology_differential_validations),
+    ):
+        for task in ARCHITECTURES:
+            validation = validations[task]
+            for specification, result in validation["specifications"].items():
+                causal_focus_rows.append({
+                    "architecture": task,
+                    "comparison": comparison,
+                    "left_channel": validation["left_channel"],
+                    "right_channel": validation["right_channel"],
+                    "specification": specification,
+                    **{
+                        key: value for key, value in result.items()
+                        if np.isscalar(value) and not isinstance(value, str)
+                    },
+                    "metric": result["metric"],
+                    "reduction": result["reduction"],
+                })
+                causal = result["causal"]
+                for layer in range(validation["score"]["D"].shape[0]):
+                    for head in range(validation["score"]["D"].shape[1]):
+                        causal_focus_head_rows.append({
+                            "architecture": task,
+                            "comparison": comparison,
+                            "left_channel": validation["left_channel"],
+                            "right_channel": validation["right_channel"],
+                            "specification": specification,
+                            "layer": layer,
+                            "head": head,
+                            "score_D": float(validation["score"]["D"][layer, head]),
+                            "score_J": float(validation["score"]["J"][layer, head]),
+                            "causal_D": float(causal["D"][layer, head]),
+                            "causal_J": float(causal["J"][layer, head]),
+                            "causal_left": float(causal["left"][layer, head]),
+                            "causal_right": float(causal["right"][layer, head]),
+                            f"causal_{validation['left_channel']}": float(
+                                causal["left"][layer, head]
+                            ),
+                            f"causal_{validation['right_channel']}": float(
+                                causal["right"][layer, head]
+                            ),
+                            "active": bool(result["active"][layer, head]),
+                        })
+    for task in ARCHITECTURES:
+        for metric, rows in family_differential_validations[task]["metrics"].items():
+            family_causal_focus_rows.extend({
+                "architecture": task, "metric": metric, **row
+            } for row in rows)
+    write_csv(tables / "differential_causal_validation.csv", causal_focus_rows)
+    write_csv(tables / "differential_causal_head_coordinates.csv", causal_focus_head_rows)
+    write_csv(tables / "differential_causal_family_validation.csv", family_causal_focus_rows)
+    write_csv(
+        tables / "causal_role_classification.csv",
+        [
+            {
+                "architecture": task,
+                "comparison": comparison,
+                "classification_status": analysis["classification_status"],
+                **row,
+            }
+            for comparison, by_task in role_analyses.items()
+            for task, analysis in by_task.items()
+            for row in analysis["rows"]
+        ],
+    )
 
     topology_rows = []
     ablation_rows = []
@@ -6857,6 +9284,7 @@ def create_outputs(runs: Mapping[str, Mapping[str, Any]], cfg: BetaConfig) -> di
     carriage_rows = []
     beneficial_diagnostic_rows = []
     conditional = {}
+    conditional_causal = {}
     event_rows = []
     topology_strata_rows = []
     topology_agreement = {}
@@ -6869,6 +9297,7 @@ def create_outputs(runs: Mapping[str, Mapping[str, Any]], cfg: BetaConfig) -> di
     family_reach_rows = []
     distance_identity_rows = []
     integrated_audit_rows = []
+    topology_reach_geometry_rows = []
     for task in ARCHITECTURES:
         attention_profile = attention_distance_profile(
             runs[task]["attention"],
@@ -6890,11 +9319,23 @@ def create_outputs(runs: Mapping[str, Mapping[str, Any]], cfg: BetaConfig) -> di
             attention_distance_rows(task, attention_profile)
         )
         event_rows.extend(intervention_event_rows(task, runs[task]["scores"]))
+        event_rows.extend(
+            intervention_event_rows(task, runs[task]["topology_reach"])
+        )
+        topology_reach_geometry_rows.extend(
+            topology_reach_support_rows(
+                task, runs[task]["scores"], runs[task]["topology_reach"]
+            )
+        )
         task_integrated_audit = runs[task]["scores"].get(
             "integrated_carriage_audit",
             integrated_carriage_audit(runs[task]["scores"]["records"]),
         )
-        integrated_audit_rows.append({"architecture": task, **task_integrated_audit})
+        integrated_audit_rows.append({
+            "architecture": task,
+            "analysis": "global_specialisation_scores",
+            **task_integrated_audit,
+        })
         for record in runs[task]["scores"]["records"]:
             for channel in CHANNELS:
                 result = record["channels"][channel]
@@ -6932,6 +9373,51 @@ def create_outputs(runs: Mapping[str, Mapping[str, Any]], cfg: BetaConfig) -> di
                             replay.get("max_abs_error", float("nan"))
                         ),
                     })
+        for record in runs[task]["topology_reach"]["records"]:
+            result = record["channels"][LOCAL_TOPOLOGY_CHANNEL]
+            for source_index, diagnostic in enumerate(
+                result.get("beneficial_diagnostics", [])
+            ):
+                replay = diagnostic.get("endpoint_replay") or {}
+                beneficial_diagnostic_rows.append({
+                    "architecture": task,
+                    "graph_id": int(record["graph_id"]),
+                    "channel": LOCAL_TOPOLOGY_CHANNEL,
+                    "source_index": int(source_index),
+                    "paths": int(diagnostic["paths"]),
+                    "unconverged": int(diagnostic["unconverged"]),
+                    "unconverged_fraction": float(
+                        diagnostic.get("unconverged_fraction", 0.0)
+                    ),
+                    "retry_paths": int(diagnostic.get("integrated_retry_paths", 0)),
+                    "retry_max_intervals": int(
+                        diagnostic.get("integrated_retry_max_intervals", 0)
+                    ),
+                    "completeness_max": float(diagnostic["completeness_max"]),
+                    "quadrature_error_max": float(diagnostic["quadrature_error_max"]),
+                    "unconverged_completeness_max": float(
+                        diagnostic.get("unconverged_completeness_max", 0.0)
+                    ),
+                    "unconverged_quadrature_error_max": float(
+                        diagnostic.get("unconverged_quadrature_error_max", 0.0)
+                    ),
+                    "intervals_max": int(diagnostic.get("intervals_max", 0)),
+                    "endpoint_replay_passed": bool(replay.get("passed", False)),
+                    "endpoint_replay_max_abs_error": float(
+                        replay.get("max_abs_error", float("nan"))
+                    ),
+                })
+        integrated_audit_rows.append({
+            "architecture": task,
+            "analysis": "local_topology_reach",
+            **runs[task]["topology_reach"].get(
+                "integrated_carriage_audit",
+                integrated_carriage_audit(
+                    runs[task]["topology_reach"]["records"],
+                    (LOCAL_TOPOLOGY_CHANNEL,),
+                ),
+            ),
+        })
         summary = topology_summary(runs[task]["scores"], runs[task]["causal"], overall)
         topology_rows.append({
             "architecture": task,
@@ -6948,17 +9434,18 @@ def create_outputs(runs: Mapping[str, Mapping[str, Any]], cfg: BetaConfig) -> di
         selection = runs[task]["ablations"]["selections"][overall]
         families = selection["families"]
         for channel_index, channel in enumerate(CHANNELS):
+            analysis_channel = (
+                LOCAL_TOPOLOGY_CHANNEL if channel == "topology" else channel
+            )
+            reach_score = (
+                runs[task]["topology_reach"]
+                if channel == "topology" else runs[task]["scores"]
+            )
             donor_scopes = ["headline"]
-            if channel == "topology":
-                donor_scopes.extend(sorted({
-                    f"tier_{int(item['tier'])}"
-                    for record in runs[task]["scores"]["records"]
-                    for item in record["plan"]["topology"]
-                }))
             for scope_index, donor_scope in enumerate(donor_scopes):
                 profile = distance_specialisation_profile(
-                    runs[task]["scores"],
-                    channel,
+                    reach_score,
+                    analysis_channel,
                     donor_scope=donor_scope,
                     bootstrap_samples=cfg.bootstrap_samples,
                     seed=(
@@ -6970,7 +9457,7 @@ def create_outputs(runs: Mapping[str, Mapping[str, Any]], cfg: BetaConfig) -> di
                 head_reach_rows.extend(head_reach_summary_rows(task, profile))
                 distance_identity_rows.append({
                     "architecture": task,
-                    "channel": channel,
+                    "channel": analysis_channel,
                     "donor_scope": donor_scope,
                     "graphs": len(profile["graph_ids"]),
                     "identity_passed": bool(profile["identity_passed"]),
@@ -6986,8 +9473,8 @@ def create_outputs(runs: Mapping[str, Mapping[str, Any]], cfg: BetaConfig) -> di
                         )
                     )
                     final_carriage = model_carriage_profile(
-                        runs[task]["scores"],
-                        channel,
+                        reach_score,
+                        analysis_channel,
                         bootstrap_samples=cfg.bootstrap_samples,
                         seed=cfg.analysis_seed + 11_701 + 101 * channel_index,
                     )
@@ -7092,18 +9579,18 @@ def create_outputs(runs: Mapping[str, Mapping[str, Any]], cfg: BetaConfig) -> di
                         },
                     })
         for channel in CHANNELS:
+            analysis_channel = (
+                LOCAL_TOPOLOGY_CHANNEL if channel == "topology" else channel
+            )
+            reach_score = (
+                runs[task]["topology_reach"]
+                if channel == "topology" else runs[task]["scores"]
+            )
             donor_scopes = ["headline"]
-            if channel == "topology":
-                donor_scopes.extend(sorted({
-                    str(item.get("donor_scope"))
-                    for record in runs[task]["scores"]["records"]
-                    for item in record["channels"][channel].get("model_carriage", [])
-                    if str(item.get("donor_scope", "")).startswith("tier_")
-                }))
             for scope_index, donor_scope in enumerate(donor_scopes):
                 profile = model_carriage_profile(
-                    runs[task]["scores"],
-                    channel,
+                    reach_score,
+                    analysis_channel,
                     donor_scope=donor_scope,
                     bootstrap_samples=cfg.bootstrap_samples,
                     seed=(
@@ -7114,7 +9601,7 @@ def create_outputs(runs: Mapping[str, Mapping[str, Any]], cfg: BetaConfig) -> di
                 for index, distance in enumerate(profile["distance"]):
                     carriage_rows.append({
                         "architecture": task,
-                        "channel": channel,
+                        "channel": analysis_channel,
                         "donor_scope": donor_scope,
                         "level": "final_state_model",
                         "distance": int(distance),
@@ -7129,6 +9616,39 @@ def create_outputs(runs: Mapping[str, Mapping[str, Any]], cfg: BetaConfig) -> di
                     })
         conditional[task] = conditional_analysis(runs[task]["scores"], overall, cfg)
         write_json(tables / f"conditional_{task}.json", conditional[task])
+        conditional_causal[task] = conditional_causal_validation(
+            conditional[task], runs[task]["causal"], cfg
+        )
+        write_json(
+            tables / f"conditional_causal_validation_{task}.json",
+            conditional_causal[task],
+        )
+    conditional_rows = [
+        {
+            "architecture": task,
+            **{
+                key: value for key, value in row.items()
+                if np.isscalar(value) and not isinstance(value, np.ndarray)
+            },
+        }
+        for task in ARCHITECTURES
+        for row in conditional[task].get("confirmed", [])
+    ]
+    write_csv(tables / "conditional_specialisation_confirmations.csv", conditional_rows)
+    write_csv(
+        tables / "conditional_causal_validation.csv",
+        [
+            {
+                "architecture": task,
+                **{
+                    key: value for key, value in row.items()
+                    if np.isscalar(value) and not isinstance(value, np.ndarray)
+                },
+            }
+            for task in ARCHITECTURES
+            for row in conditional_causal[task].get("tested", [])
+        ],
+    )
     write_csv(tables / "topology_validation.csv", topology_rows)
     write_csv(tables / "topology_tier_dose_validation.csv", topology_strata_rows)
     write_csv(tables / "head_scores_and_ablation.csv", ablation_rows)
@@ -7147,6 +9667,24 @@ def create_outputs(runs: Mapping[str, Mapping[str, Any]], cfg: BetaConfig) -> di
     write_csv(tables / "head_reach_summary.csv", head_reach_rows)
     write_csv(tables / "family_reach_alignment.csv", family_reach_rows)
     write_csv(tables / "distance_score_identity.csv", distance_identity_rows)
+    write_csv(
+        tables / "topology_reach_intervention_geometry.csv",
+        topology_reach_geometry_rows,
+    )
+    write_csv(
+        tables / "local_topology_reach_audit.csv",
+        [
+            {
+                "architecture": task,
+                **{
+                    key: value
+                    for key, value in runs[task]["topology_reach"]["reach_audit"].items()
+                    if np.isscalar(value) and not isinstance(value, dict)
+                },
+            }
+            for task in ARCHITECTURES
+        ],
+    )
 
     figure_paths = []
     figure_paths += figure_three_channel_planes(runs, figures / "zinc_headline_fig01_three_channel_planes")
@@ -7183,8 +9721,66 @@ def create_outputs(runs: Mapping[str, Mapping[str, Any]], cfg: BetaConfig) -> di
         attention_profiles,
         figures / "zinc_headline_fig16_distance_locality_curves",
     )
+    figure_paths += figure_differential_causal_focus(
+        differential_validations,
+        figures / "zinc_headline_fig17_differential_causal_focus",
+    )
+    figure_paths += figure_family_differential_causal_focus(
+        family_differential_validations,
+        runs,
+        figures / "zinc_headline_fig18_D_family_causal_controls",
+    )
+    figure_paths += figure_topology_reach_support(
+        topology_reach_geometry_rows,
+        figures / "zinc_headline_fig19_topology_reach_geometry",
+    )
+    figure_paths += figure_differential_causal_focus(
+        semantic_topology_differential_validations,
+        figures / "zinc_headline_fig20_semantic_topology_differential_causal_focus",
+        title=(
+            "Exploratory topology analogue: relative score focus predicts differential "
+            "semantic–topology mediation"
+        ),
+    )
+    figure_paths += figure_causal_role_map(
+        role_analyses,
+        figures / "zinc_headline_fig21_role_necessity_rescue_map",
+    )
+    figure_paths += figure_family_raw_causal_strength(
+        family_differential_validations,
+        figures / "zinc_headline_fig22_D_family_raw_causal_strength",
+    )
+    figure_paths += figure_conditional_causal_confirmation(
+        conditional_causal,
+        figures / "zinc_headline_fig23_conditional_causal_confirmation",
+    )
 
-    decisions = create_decisions(runs, overall)
+    decisions = create_decisions(runs, overall, differential_validations)
+    decisions["semantic_topology_relative_focus"] = {
+        "status": "exploratory_complementary_validation",
+        "unit_constraint": (
+            "semantic events are source-local while matched-real topology donors replace "
+            "whole-graph structure; agreement therefore supports a channel-role interpretation "
+            "but is not an intervention-unit-matched replication of semantic–PE D_rel"
+        ),
+        "primary_gross_restore_by_architecture": {
+            task: {
+                key: value
+                for key, value in semantic_topology_differential_validations[task][
+                    "specifications"
+                ]["gross_restore"].items()
+                if key in {
+                    "graphs", "heads", "rho_pooled", "rho_pooled_ci_low",
+                    "rho_pooled_ci_high", "rho_within_layer",
+                    "rho_within_layer_ci_low", "rho_within_layer_ci_high",
+                    "rho_partial_J_and_layer", "within_layer_permutation_p",
+                    "high_minus_low_D_causal", "high_minus_low_ci_low",
+                    "high_minus_low_ci_high", "selective_sign_agreement",
+                }
+            }
+            for task in ARCHITECTURES
+        },
+    }
     confirmed_rules = {
         task: {
             f"{row['feature']}::{row['rule']}" for row in conditional[task].get("confirmed", [])
@@ -7198,7 +9794,24 @@ def create_outputs(runs: Mapping[str, Mapping[str, Any]], cfg: BetaConfig) -> di
         "confirmed_rule_counts": {task: len(values) for task, values in confirmed_rules.items()},
         "shared_confirmed_rules": shared_confirmed,
         "label_verdict": "approve_shared_conditions" if shared_confirmed else "exploratory_only",
-        "constraint": "finite predeclared basis with held-out global-FDR, dose and localisation diagnostics",
+        "constraint": (
+            "finite predeclared basis with held-out global-FDR, dose and localisation "
+            "diagnostics; whole-graph topology features are never conditioned on a "
+            "source-only property"
+        ),
+        "effect_taxonomy": {
+            "channel_gain": "condition changes one raw channel score",
+            "joint_activation": "condition changes joint multichannel activity (J or G)",
+            "selectivity_shift": "condition changes relative channel focus D_rel",
+        },
+        "independent_causal_confirmation": {
+            task: {
+                key: value
+                for key, value in conditional_causal[task].items()
+                if key in {"available", "eligible_tests", "causally_confirmed", "interpretation"}
+            }
+            for task in ARCHITECTURES
+        },
     }
     decisions["distance_resolved_specialisation"] = {
         "verdict": "retain_exact_decomposition",
@@ -7227,6 +9840,19 @@ def create_outputs(runs: Mapping[str, Mapping[str, Any]], cfg: BetaConfig) -> di
         "attention_normalisation_error_max": float(max(
             profile["normalisation_error_max"] for profile in attention_profiles.values()
         )),
+        "topology_reach_intervention": (
+            "local degree- and bond-label-preserving two-edge switch with RRWP recomputed "
+            "from edited support; distance is measured on the pristine molecule from the "
+            "four edited endpoints"
+        ),
+        "global_topology_donor_exclusion": (
+            "matched-real whole-molecule donors remain the topology specialisation/causal "
+            "validation channel, but are excluded from reach because their changed set is global"
+        ),
+        "topology_reach_audit": {
+            task: runs[task]["topology_reach"]["reach_audit"]
+            for task in ARCHITECTURES
+        },
     }
     write_json(tables / "methodology_decisions.json", decisions)
     scope = {
@@ -7235,9 +9861,20 @@ def create_outputs(runs: Mapping[str, Mapping[str, Any]], cfg: BetaConfig) -> di
             "matched-real non-isomorphic molecular donors, same n, preferentially exact atom/degree/"
             "bond multisets, Hungarian node alignment, donor-recomputed RRWP, base x/y fixed"
         ),
+        "topology_reach_probe": (
+            "separate local degree- and bond-label-preserving two-edge switch, base x/y fixed, "
+            "RRWP recomputed, distance from the four edited endpoints on pristine topology"
+        ),
         "data_independence": (
             "score discovery, causal patching, and ordinary/family ablation use disjoint deterministic "
             "ZINC test graph subsets; conditional rules and heads use a further discovery/confirmation split"
+        ),
+        "relative_focus_causal_validation": (
+            "D_rel is tested against held-out semantic-versus-PE differential mediation with "
+            "two events per source, hierarchical event/source/graph averaging, activity gating, "
+            "within-layer permutation and graph-bootstrap tests; J is the separate total-influence "
+            "control. A semantic-versus-topology analogue is reported separately as exploratory "
+            "because the topology donor is whole-graph rather than source-local"
         ),
         "models": [DISPLAY[task] for task in ARCHITECTURES],
         "training_seed_limit": "one available checkpoint per architecture",
@@ -7246,6 +9883,7 @@ def create_outputs(runs: Mapping[str, Mapping[str, Any]], cfg: BetaConfig) -> di
     summary = {
         "version": BETA_VERSION,
         "schema": BETA_SCHEMA,
+        "causal_protocol_version": CAUSAL_PROTOCOL_VERSION,
         "fingerprint": cfg.fingerprint,
         "selected_aggregation": overall,
         "aggregation_choice": "predeclared headline EG; no data-dependent reselection",
@@ -7301,6 +9939,19 @@ def find_cached_phase(cfg: BetaConfig, task: str, phase: str) -> dict[str, Any]:
         or payload.get("fingerprint") != cfg.fingerprint
     ):
         raise RuntimeError(f"stale/incompatible cache: {paths[0]}")
+    if phase in {"causal", "ablations"} and int(
+        payload.get("causal_protocol_version", -1)
+    ) != CAUSAL_PROTOCOL_VERSION:
+        raise RuntimeError(
+            f"stale pre-v{CAUSAL_PROTOCOL_VERSION} causal protocol cache: {paths[0]}"
+        )
+    if phase == "topology_reach" and int(
+        payload.get("topology_reach_protocol_version", -1)
+    ) != TOPOLOGY_REACH_PROTOCOL_VERSION:
+        raise RuntimeError(
+            "stale local-topology reach cache: "
+            f"expected protocol v{TOPOLOGY_REACH_PROTOCOL_VERSION}: {paths[0]}"
+        )
     return dict(payload)
 
 
@@ -7308,6 +9959,7 @@ def cached_runs(cfg: BetaConfig) -> dict[str, dict[str, Any]]:
     return {
         task: {
             "scores": find_cached_phase(cfg, task, "scores"),
+            "topology_reach": find_cached_phase(cfg, task, "topology_reach"),
             "attention": find_cached_phase(cfg, task, "attention"),
             "causal": find_cached_phase(cfg, task, "causal"),
             "mechanism": find_cached_phase(cfg, task, "mechanism"),
@@ -7322,6 +9974,7 @@ def audit_cached_architecture_alignment(runs: Mapping[str, Mapping[str, Any]]) -
     onehop = {int(row["graph_id"]): row for row in runs["zinc_1hop"]["scores"]["records"]}
     common = sorted(set(dense) & set(onehop))
     failures = []
+    local_topology_failures = []
     for graph_id in common:
         left = dense[graph_id]
         right = onehop[graph_id]
@@ -7348,10 +10001,44 @@ def audit_cached_architecture_alignment(runs: Mapping[str, Mapping[str, Any]]) -
             )
         if not same:
             failures.append(graph_id)
+    dense_reach = {
+        int(row["graph_id"]): row
+        for row in runs["zinc"]["topology_reach"]["records"]
+    }
+    onehop_reach = {
+        int(row["graph_id"]): row
+        for row in runs["zinc_1hop"]["topology_reach"]["records"]
+    }
+
+    def local_signature(record: Mapping[str, Any]) -> list[Any]:
+        return [
+            {
+                "source_edge": np.asarray(group["source_edge"], dtype=np.int64).tolist(),
+                "events": [
+                    {
+                        "removed": np.asarray(event["removed_edges"], dtype=np.int64).tolist(),
+                        "added": np.asarray(event["added_edges"], dtype=np.int64).tolist(),
+                        "changed": np.asarray(event["changed_nodes"], dtype=np.int64).tolist(),
+                    }
+                    for event in group["events"]
+                ],
+            }
+            for group in record["plan"].get(LOCAL_TOPOLOGY_CHANNEL, [])
+        ]
+
+    for graph_id in sorted(set(dense_reach) & set(onehop_reach)):
+        if local_signature(dense_reach[graph_id]) != local_signature(onehop_reach[graph_id]):
+            local_topology_failures.append(graph_id)
     result = {
         "common_score_graphs": len(common),
         "failures": failures,
-        "passed": len(common) == len(dense) == len(onehop) and not failures,
+        "local_topology_plan_failures": local_topology_failures,
+        "passed": (
+            len(common) == len(dense) == len(onehop)
+            and len(dense_reach) == len(onehop_reach) == len(common)
+            and not failures
+            and not local_topology_failures
+        ),
     }
     if not result["passed"]:
         raise RuntimeError(f"cached dense/1-hop graph alignment failed: {result}")
@@ -7450,7 +10137,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--phase",
         choices=(
-            "all", "scores", "attention", "causal", "mechanism", "ablations", "figures"
+            "all", "scores", "topology-reach", "attention", "causal", "mechanism",
+            "ablations", "figures"
         ),
         default="all",
     )
@@ -7525,6 +10213,12 @@ def main(argv: Sequence[str] | None = None) -> dict[str, Any]:
                 causal_payload = None
                 if args.phase in {"all", "scores"}:
                     score_payload = run_scores_task(loaded, cfg, force=args.force)
+                if args.phase in {"all", "topology-reach"}:
+                    if score_payload is None:
+                        score_payload = find_cached_phase(cfg, task, "scores")
+                    run_topology_reach_task(
+                        loaded, cfg, score_payload, force=args.force
+                    )
                 if args.phase in {"all", "attention"}:
                     if score_payload is None:
                         score_payload = find_cached_phase(cfg, task, "scores")

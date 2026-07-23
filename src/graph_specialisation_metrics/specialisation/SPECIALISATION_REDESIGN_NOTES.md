@@ -489,20 +489,23 @@ The headline rerun protocol fixes `EG` and `F_sens` before looking at the new re
   plus an exclusive-support wiring term. Patch each component and the full transport; abort on a
   failed reconstruction identity;
 - compute final-state production `F_sens` and path-integrated signed beneficial carriage for
-  semantic, PE and topology events using event-specific changed-set distance. Functional curves use
+  semantic, PE and a separate local topology-reach intervention using event-specific changed-set
+  distance. The whole-molecule matched topology donor remains the global score/causal probe and is
+  excluded from reach plots because its changed-node set is not local. Functional curves use
   shared log limits; signed beneficial curves use shared symmetric-log limits. Endpoint head replay,
   quadrature convergence and loss completeness are saved diagnostics. The ZINC beta uses the
   established bounded integrated-carriage policy (`atol=5e-4`, at most 256 intervals): a capped path
   is retained only when both completeness and carrier errors are at most `5e-3`, and the complete
   run aborts if capped paths exceed 1%. This prevents one harmless L1/ReLU kink from discarding a
   long run while keeping numerical failures auditable and fail-closed.
-  Headline topology curves exclude relaxed donors, while tier-specific carriage profiles remain in
-  the machine-readable table;
+  The local topology reach probe is a connected, degree-, edge-count- and bond-label-preserving
+  two-edge switch with RRWP recomputed from the edited support;
 - retain carrier distance before the production EG carrier sum. For every channel, compute
   `S_EG(l,h,b) = E_graph E_source E_event sum_{i in b} ||q_event(l,h,i)||`, and assert that summing
   distance buckets reconstructs the cached head EG score graph by graph. This is an exact
   decomposition, not a new score. Semantic bins use source distance, PE bins use distance to the
-  source/partner changed set, topology bins use distance to the edited-node set, disconnected nodes
+  source/partner changed set, and topology-reach bins use pristine molecular distance to the exact
+  four endpoints of the local two-edge switch. Disconnected nodes
   use `unreachable`, and virtual-node transport uses a separate `hub` bucket. Report head-by-distance
   atlases, reach summaries and frozen-family distance curves aligned with final-state `F_sens` and
   signed beneficial carriage; interpret these as who implements reach, not direct performance
@@ -519,7 +522,28 @@ The headline rerun protocol fixes `EG` and `F_sens` before looking at the new re
 - expand the sample-split conditional screen to raw semantic/PE/topology EG scores, every pairwise
   D/J/G coordinate and three-channel J/G. Conditions cover clean graph composition/topology and
   source atom, neighbourhood, degree, cycle and articulation context; confirmation uses a global
-  FDR and reports intervention-dose overlap and spatial concentration changes.
+  FDR and reports intervention-dose overlap and spatial concentration changes. A strict
+  intervention-unit rule now excludes any source-only condition from a score containing the
+  whole-graph topology donor. Such topology-containing scores can be conditioned only on graph
+  context; source-conditioned topology claims require a future source-local topology intervention.
+  Confirmed effects are classified as raw channel gain, joint-channel activation or relative
+  selectivity shift, and as chemical, topological, routing-load, source or global graph context;
+  score-confirmed effects are then tested once more on the disjoint causal split using gross
+  restore magnitude, the frozen condition thresholds/head identity and a second global-FDR
+  correction. Existing causal caches are enriched with molecular descriptors only, so this
+  independent condition-by-mediation test does not repeat any model forward pass;
+- repeat the continuous held-out differential-mediation analysis for semantic versus topology.
+  This is reported separately from the primary semantic-versus-PE validation because the
+  matched-real topology donor changes a whole graph rather than one source. Preserve raw semantic
+  and topology causal strengths beside every ratio, and require activity gating;
+- add a causal role map that keeps four questions separate: `D` supplies channel identity, `J`
+  supplies evoked importance, matched restore minus mismatch/sham supplies specific rescue, and
+  zero-ablation supplies necessity. The resulting necessary-and-rescuable,
+  redundant/distributed-rescue, necessary-not-cleanly-rescued and weak/unresolved labels are
+  explicitly exploratory relative-threshold summaries; the continuous raw effects remain primary.
+  Also plot raw semantic/PE family effects and bootstrap intervals beside the normalised
+  `D_causal` family controls so near-zero denominators cannot manufacture apparently decisive
+  selectivity.
 
 ### Matched-real topology donor in the ZINC beta
 
@@ -545,14 +569,33 @@ cannot. Topology events are never forced into a two-way fixed-support account: r
 are defined only on common directed pairs, with exclusive clean/corrupt support reported as an
 explicit wiring contribution.
 
-The notebook emits sixteen paper figure families (PNG and PDF), machine-readable head/causal/topology
+### Global topology score versus local topology reach
+
+The matched-real donor changes topology throughout a molecule. Distance to the union of all edited
+endpoints therefore often has support only through two or three hops; that is changed-set coverage,
+not evidence that topology effects are local. It remains the preferred beta intervention for global
+topology specialisation, patching and PE-versus-topology comparisons because it stays on the support
+of real molecules.
+
+Topology reach is now a separate estimand. For two disjoint bonds with identical bond labels, remove
+both and reconnect the same four endpoints using a valid alternative pairing. Reject duplicates,
+disconnection and no-ops. This preserves every node degree, edge count and bond-label multiset while
+changing support locally; atom features and target remain fixed and all RRWP fields are recomputed.
+Candidate groups prioritise compact edited sets with large observable pristine eccentricity. The run
+records the planned maximum distance and fraction of events reaching beyond three hops, so limited
+support cannot pass silently. This local probe supplies topology `F_sens`, beneficial-carriage and
+distance-resolved EG panels only; it does not replace the matched-real topology score used for
+`S_topology`, families or held-out causal validation.
+
+The notebook emits twenty-three paper figure families (PNG and PDF), machine-readable head/causal/topology
 tables and a predeclared decision report. It also records a current limitation: Drive contains one
 checkpoint per architecture for this comparison. Graph bootstraps quantify evaluation-sample
 uncertainty, not training-seed uncertainty, so decisions are concrete for this beta but remain subject
 to revision if independently trained ZINC seeds disagree.
 
 Score estimation is restartable at three levels: every completed source/event group is saved, then
-every completed intervention channel, then the assembled graph. A cumulative integrated-carriage
+every completed intervention channel, then the assembled graph. Local topology reach has its own
+versioned graph/source cache and reuses completed global score caches. A cumulative integrated-carriage
 audit is also written after each graph. Thus an interruption or later-channel error does not repeat
 completed semantic/PE/topology integrations.
 
@@ -588,8 +631,26 @@ completed semantic/PE/topology integrations.
 - **Structural scope:** keep PE/RRWP-payload specialisation and topology specialisation as separate
   claims. Approve the topology score only if matched donors have adequate common support and its
   results survive nuisance/dose controls.
+- **Topology reach:** do not interpret whole-molecule donor distance as propagation distance. Use the
+  separate local degree-preserving two-edge switch for topology distance, functional carriage and
+  beneficial carriage; keep matched-real donors for global topology scores and causal validation.
 - **Causal confirmation:** make held-out family × channel bidirectional patching the required
   confirmation for specialist labels; ablation alone remains insufficient.
+- **Relative-focus causal target — implemented in the ZINC beta:** validate `D_rel` against
+  differential semantic-versus-PE whole-transport mediation, not ordinary head-ablation magnitude.
+  The primary causal coordinate uses eventwise-gross restore magnitude to match EG, with donors
+  averaged within source, sources within molecule and molecules equally. Report activity-gated
+  pooled and within-layer rank association, graph-bootstrap uncertainty, a within-layer
+  permutation test, and high-minus-low-D causal contrast. Net-aligned restore,
+  intervention-effect-normalised restore, injection and necessity are robustness specifications.
+  Semantic and PE causal validation use two independently planned donors/partners per source rather
+  than a single swap. Because strong specialists may be absent, also patch frozen active
+  high-`+D` and high-`-D` families continuously and compare them with same-layer, `J`-matched
+  controls; call these D-extreme families, not confirmed specialists.
+  A parallel semantic-versus-topology figure is complementary evidence only until the intervention
+  units are matched. Raw channel strengths and mismatch/sham-calibrated rescue must accompany all
+  ratio coordinates. Role, evoked importance, necessity and rescue are reported as distinct
+  endpoints rather than collapsed into a single specialist-importance label.
 - **Mechanism:** retain routing/message labels only when both exact reconstruction and finite component
   patching agree. Treat wiring as a third component for topology-changing interventions.
 - **Carriage — firm and implemented:** use `F_sens` as the sole functional-carriage field aligned
@@ -606,4 +667,5 @@ completed semantic/PE/topology integrations.
   survives distance-shell opportunity, and clean attention-distance mass to test whether functional
   locality differs from raw routing locality. Neither diagnostic changes `S`, `D`, `J` or `G`.
 - **Conditional labels:** approve only conditions that replicate under frozen rules, adequate support
-  and multiplicity control. Otherwise retain conditional analysis as exploratory.
+  and multiplicity control. Whole-graph topology scores are never conditioned on source-only
+  properties. Otherwise retain conditional analysis as exploratory.

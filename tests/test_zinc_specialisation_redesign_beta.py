@@ -65,6 +65,38 @@ def test_distance_profiles_keep_signed_beneficial_carriage() -> None:
     assert sum(row["B_sum"] for row in rows) == pytest.approx(-1.0)
 
 
+def test_causal_hierarchy_averages_events_then_sources_within_graph() -> None:
+    events = [
+        {"channel": "semantic", "graph_id": 0, "source": 0,
+         "clean_prediction": [1.0], "corrupt_prediction": [0.0]},
+        {"channel": "semantic", "graph_id": 0, "source": 0,
+         "clean_prediction": [1.0], "corrupt_prediction": [0.0]},
+        {"channel": "semantic", "graph_id": 0, "source": 1,
+         "clean_prediction": [1.0], "corrupt_prediction": [0.0]},
+        {"channel": "semantic", "graph_id": 1, "source": 0,
+         "clean_prediction": [1.0], "corrupt_prediction": [0.0]},
+    ]
+    graph_ids, values = BETA.hierarchical_channel_values(
+        {"events": events, "causal_effect_floor_relative": 0.0},
+        np.asarray([[1.0], [3.0], [10.0], [4.0]]),
+        "semantic",
+        reduction="signed",
+    )
+    np.testing.assert_array_equal(graph_ids, [0, 1])
+    # graph 0: mean donors for source 0 = 2, then mean sources (2,10) = 6.
+    np.testing.assert_allclose(values[:, 0], [6.0, 4.0])
+
+
+def test_causal_focus_compares_channel_magnitudes_not_effect_signs() -> None:
+    coordinates = BETA.causal_strength_coordinates(
+        np.asarray([[[-2.0]]]),
+        np.asarray([[[1.0]]]),
+        positive_after_graph_mean=False,
+    )
+    assert coordinates["D"][0, 0] == pytest.approx(1.0 / 3.0)
+    assert coordinates["J"][0, 0] == pytest.approx(1.5)
+
+
 def test_distance_resolved_eg_exactly_reconstructs_score_with_event_specific_bins() -> None:
     torch = pytest.importorskip("torch")
     q_source_0 = torch.zeros(2, 1, 1, 3, 1)
@@ -408,6 +440,77 @@ def test_topology_edit_dose_uses_undirected_symmetric_difference() -> None:
     assert result["changed_nodes"] == [0, 1, 2]
 
 
+def _path_data_for_local_topology(n: int = 14):
+    torch = pytest.importorskip("torch")
+    directed = []
+    for node in range(n - 1):
+        directed.extend(((node, node + 1), (node + 1, node)))
+    edge_index = torch.tensor(directed, dtype=torch.long).T.contiguous()
+    fields = BETA.recompute_rrwp_fields(edge_index, num_nodes=n, width=7)
+    return FakeData(
+        x=torch.zeros(n, 1, dtype=torch.long),
+        y=torch.tensor([0.0]),
+        edge_index=edge_index,
+        edge_attr=torch.zeros(len(directed), 1, dtype=torch.long),
+        **fields,
+    )
+
+
+def test_local_topology_switch_is_degree_preserving_and_exposes_long_reach() -> None:
+    torch = pytest.importorskip("torch")
+    base = _path_data_for_local_topology()
+    plan = BETA.plan_local_topology_events(base, graph_id=3, seed=17)
+    assert plan
+    assert max(group["maximum_pristine_distance"] for group in plan) > 3
+    event = plan[0]["events"][0]
+    variant = BETA.local_topology_variant(base, event)
+    assert torch.equal(base.x, variant.x)
+    assert torch.equal(base.y, variant.y)
+    assert torch.equal(base.deg, variant.deg)
+    assert len(
+        {tuple(edge) for edge in BETA.molecular_edges(base)}
+        ^ {tuple(edge) for edge in BETA.molecular_edges(variant)}
+    ) == 4
+    assert not torch.equal(base.rrwp_val, variant.rrwp_val)
+
+
+def test_local_topology_rrwp_recomputation_matches_pristine_loader_contract() -> None:
+    base = _path_data_for_local_topology()
+    audit = BETA.rrwp_reconstruction_audit(base)
+    assert audit["passed"]
+    assert audit["pair"]["max_abs_error"] == pytest.approx(0.0)
+    assert audit["node"]["max_abs_error"] == pytest.approx(0.0)
+
+
+def test_local_topology_event_distance_uses_exact_four_endpoint_changed_set() -> None:
+    base = _path_data_for_local_topology()
+    local_plan = BETA.plan_local_topology_events(
+        base, graph_id=0, seed=1, maximum_sources=1, events_per_source=1
+    )
+    record = {
+        "n": base.num_nodes,
+        "plan": {
+            "descriptor": {
+                "edges": BETA.molecular_edges(base),
+            },
+            BETA.LOCAL_TOPOLOGY_CHANNEL: local_plan,
+        },
+    }
+    observed = BETA.event_distance_matrix(
+        record,
+        BETA.LOCAL_TOPOLOGY_CHANNEL,
+        0,
+        event_count=1,
+        carrier_count=base.num_nodes + 1,
+    )
+    changed = np.asarray(local_plan[0]["events"][0]["changed_nodes"], dtype=int)
+    pristine = BETA.shortest_paths(base.num_nodes, BETA.molecular_edges(base))
+    expected = np.min(pristine[:, changed], axis=1).astype(int)
+    np.testing.assert_array_equal(observed[0, :base.num_nodes], expected)
+    assert observed[0, -1] == BETA.DISTANCE_HUB
+    assert observed[0, :base.num_nodes].max() > 3
+
+
 def test_support_aware_decomposition_reconstructs_changed_support() -> None:
     torch = pytest.importorskip("torch")
 
@@ -535,6 +638,54 @@ def _fake_score_payload(offset: float = 0.0):
     return {"L": L, "H": H, "records": records}
 
 
+def _fake_topology_reach_payload(score):
+    records = []
+    for source in score["records"]:
+        result = copy.deepcopy(source["channels"]["topology"])
+        result["channel"] = BETA.LOCAL_TOPOLOGY_CHANNEL
+        events = []
+        for event_index in range(len(result["q_groups"][0])):
+            events.append({
+                "removed_edges": np.asarray([[0, 1], [2, 3]], dtype=np.int64),
+                "added_edges": np.asarray([[0, 2], [1, 3]], dtype=np.int64),
+                "changed_nodes": np.asarray([0, 1, 2, 3], dtype=np.int64),
+                "dose": {
+                    "edge_jaccard_distance": 0.5,
+                    "changed_node_fraction": 1.0,
+                    "maximum_pristine_distance": 0,
+                    "changed_set_diameter": 3.0,
+                },
+            })
+        records.append({
+            "graph_id": source["graph_id"],
+            "n": source["n"],
+            "target": source["target"],
+            "plan": {
+                "descriptor": source["plan"]["descriptor"],
+                BETA.LOCAL_TOPOLOGY_CHANNEL: [{
+                    "source_edge": np.asarray([0, 1], dtype=np.int64),
+                    "events": events,
+                }],
+            },
+            "channels": {BETA.LOCAL_TOPOLOGY_CHANNEL: result},
+        })
+    return {
+        "L": score["L"],
+        "H": score["H"],
+        "records": records,
+        "reach_audit": {
+            "protocol_version": BETA.TOPOLOGY_REACH_PROTOCOL_VERSION,
+            "eligible_graphs": len(records),
+            "events": 2 * len(records),
+            "maximum_planned_distance": 0,
+            "fraction_events_reaching_beyond_3": 0.0,
+        },
+        "integrated_carriage_audit": BETA.integrated_carriage_audit(
+            records, (BETA.LOCAL_TOPOLOGY_CHANNEL,)
+        ),
+    }
+
+
 def _fake_causal_payload(offset: float = 0.0):
     L, H = 2, 2
     events = []
@@ -543,6 +694,7 @@ def _fake_causal_payload(offset: float = 0.0):
             events.append({
                 "channel": channel,
                 "graph_id": graph_id,
+                "source": 0,
                 "clean_prediction": np.array([1.0]),
                 "corrupt_prediction": np.array([0.7 - 0.03 * channel_index]),
                 "topology_tier": 0,
@@ -561,6 +713,9 @@ def _fake_causal_payload(offset: float = 0.0):
             "restore": base,
             "inject": base * 0.9,
             "necessity": base * 0.7,
+            "restore_fraction": base * 2.0,
+            "inject_fraction": base * 1.8,
+            "necessity_fraction": base * 1.4,
             "mismatch": base * 0.1,
             "sham": base * 0.001,
         },
@@ -688,6 +843,86 @@ def _fake_attention():
     return {"records": records}
 
 
+def test_conditional_screen_aligns_condition_and_intervention_units() -> None:
+    assert BETA.conditional_feature_rule_compatible(
+        "D_semantic_pe", "source_degree_high"
+    )
+    assert BETA.conditional_feature_rule_compatible(
+        "D_semantic_topology", "cycle_rank_high"
+    )
+    assert not BETA.conditional_feature_rule_compatible(
+        "D_semantic_topology", "source_degree_high"
+    )
+    assert not BETA.conditional_feature_rule_compatible(
+        "G_three_channel", "source_in_cycle"
+    )
+    assert BETA.conditional_feature_effect_type("D_semantic_pe") == "selectivity_shift"
+    assert BETA.conditional_rule_family("source_degree_high") == "routing_load"
+
+
+def test_differential_causal_validation_generalises_to_semantic_topology() -> None:
+    score = _fake_score_payload()
+    causal = _fake_causal_payload()
+    cfg = BETA.BetaConfig(
+        bootstrap_samples=10,
+        causal_graphs=4,
+    )
+    result = BETA.differential_causal_validation(
+        score, causal, cfg, "EG", "semantic", "topology"
+    )
+    assert result["left_channel"] == "semantic"
+    assert result["right_channel"] == "topology"
+    assert result["score"]["D"].shape == (2, 2)
+    assert "gross_restore" in result["specifications"]
+    assert result["specifications"]["gross_restore"]["graphs"] == 4
+
+
+def test_conditional_causal_validation_uses_independent_event_context() -> None:
+    score = _fake_score_payload()
+    causal = _fake_causal_payload()
+    descriptors = {
+        int(record["graph_id"]): record["plan"]["descriptor"]
+        for record in score["records"]
+    }
+    for event in causal["events"]:
+        event["source"] = int(event["graph_id"]) % 2
+        event["descriptor"] = descriptors[int(event["graph_id"])]
+    conditional = {
+        "metadata": {
+            "thresholds_from_discovery": {
+                "n": 3.0,
+                "cycle_rank": 0.0,
+                "atom_diversity": 3.0,
+                "mean_degree": 1.0,
+                "edge_density": 0.2,
+                "source_degree": 1.5,
+            },
+            "common_atom_codes": [],
+        },
+        "confirmed": [{
+            "feature": "D_semantic_pe",
+            "rule": "source_degree_high",
+            "layer": 0,
+            "head": 0,
+            "confirmation_effect": 0.2,
+            "confirmed_at_fdr_0.05": True,
+            "effect_type": "selectivity_shift",
+            "condition_family": "routing_load",
+            "comparison_scope": "source_local",
+        }],
+    }
+    cfg = BETA.BetaConfig(
+        min_condition_graphs=2,
+        conditional_bootstrap_samples=20,
+    )
+    result = BETA.conditional_causal_validation(conditional, causal, cfg)
+    assert result["available"]
+    assert result["eligible_tests"] == 1
+    assert result["tested"][0]["causal_test_eligible"]
+    assert result["tested"][0]["causal_true_graphs"] == 2
+    assert result["tested"][0]["causal_false_graphs"] == 2
+
+
 def test_all_paper_outputs_render_from_schema_complete_smoke_payload(tmp_path) -> None:
     pytest.importorskip("matplotlib")
     runs = {}
@@ -696,6 +931,7 @@ def test_all_paper_outputs_render_from_schema_complete_smoke_payload(tmp_path) -
         causal = _fake_causal_payload(index * 0.01)
         runs[task] = {
             "scores": score,
+            "topology_reach": _fake_topology_reach_payload(score),
             "attention": _fake_attention(),
             "causal": causal,
             "ablations": _fake_ablations(score, causal),
@@ -712,7 +948,7 @@ def test_all_paper_outputs_render_from_schema_complete_smoke_payload(tmp_path) -
     )
     summary = BETA.create_outputs(runs, cfg)
     assert summary["selected_aggregation"] == "EG"
-    assert len(summary["figures"]) == 32
+    assert len(summary["figures"]) == 46
     assert all(Path(path).exists() for path in summary["figures"])
     assert (tmp_path / "tables/methodology_decisions.json").exists()
     assert (tmp_path / "tables/distance_resolved_specialisation.csv").exists()
