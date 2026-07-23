@@ -98,6 +98,41 @@ def test_distance_resolved_eg_keeps_unreachable_and_virtual_hub_buckets() -> Non
     assert result["total"][0, 0] == pytest.approx(10.0)
 
 
+def test_distance_resolved_eg_retains_support_normalised_response() -> None:
+    torch = pytest.importorskip("torch")
+    q = torch.tensor([[[[[1.0], [2.0], [4.0]]]]])  # [K,L,H,N,T]
+    result = BETA.distance_resolved_eg_one_graph(
+        [q], [np.array([[0, 1, 1]])]
+    )
+    assert result["opportunity"] == pytest.approx({0: 1.0, 1: 2.0})
+    assert result["contribution"][1][0, 0] == pytest.approx(6.0)
+    assert result["density"][1][0, 0] == pytest.approx(3.0)
+    # Support normalisation is diagnostic and does not alter exact EG reconstruction.
+    assert result["total"][0, 0] == pytest.approx(7.0)
+
+
+def test_attention_distance_profile_is_graph_balanced_and_head_normalised() -> None:
+    records = []
+    for graph_id, values in enumerate(((0.8, 0.2), (0.2, 0.8))):
+        records.append({
+            "graph_id": graph_id,
+            "codes": [0, 1],
+            "mass": {
+                0: np.full((2, 2), values[0]),
+                1: np.full((2, 2), values[1]),
+            },
+            "pair_count": {0: 2, 1: 6},
+            "normalisation_error": np.zeros(2),
+            "minimum_weight": np.zeros(2),
+        })
+    profile = BETA.attention_distance_profile(
+        {"records": records}, bootstrap_samples=20, seed=4
+    )
+    assert np.allclose(profile["fraction"].sum(axis=0), 1.0)
+    assert profile["aggregate_fraction"] == pytest.approx([0.5, 0.5])
+    assert profile["graph_support"].tolist() == [2, 2]
+
+
 def test_score_coordinates_separate_selectivity_activity_and_joint_strength() -> None:
     result = BETA.score_coordinates(np.array([[4.0, 2.0]]), np.array([[0.0, 2.0]]))
     assert np.allclose(result["D"], np.array([[1.0, 0.0]]))
@@ -639,6 +674,24 @@ def _fake_mechanism():
     }
 
 
+def _fake_attention():
+    records = []
+    for graph_id in range(8):
+        scale = 1.0 + 0.01 * graph_id
+        records.append({
+            "graph_id": graph_id,
+            "codes": [0, 1, 2, 3],
+            "mass": {
+                distance: np.full((2, 2), value * scale)
+                for distance, value in enumerate((0.5, 0.3, 0.15, 0.05))
+            },
+            "pair_count": {0: 4, 1: 8, 2: 6, 3: 2},
+            "normalisation_error": np.zeros(2),
+            "minimum_weight": np.zeros(2),
+        })
+    return {"records": records}
+
+
 def test_all_paper_outputs_render_from_schema_complete_smoke_payload(tmp_path) -> None:
     pytest.importorskip("matplotlib")
     runs = {}
@@ -647,6 +700,7 @@ def test_all_paper_outputs_render_from_schema_complete_smoke_payload(tmp_path) -
         causal = _fake_causal_payload(index * 0.01)
         runs[task] = {
             "scores": score,
+            "attention": _fake_attention(),
             "causal": causal,
             "ablations": _fake_ablations(score, causal),
             "mechanism": _fake_mechanism(),
@@ -662,10 +716,12 @@ def test_all_paper_outputs_render_from_schema_complete_smoke_payload(tmp_path) -
     )
     summary = BETA.create_outputs(runs, cfg)
     assert summary["selected_aggregation"] == "EG"
-    assert len(summary["figures"]) == 26
+    assert len(summary["figures"]) == 32
     assert all(Path(path).exists() for path in summary["figures"])
     assert (tmp_path / "tables/methodology_decisions.json").exists()
     assert (tmp_path / "tables/distance_resolved_specialisation.csv").exists()
+    assert (tmp_path / "tables/clean_attention_distance_profiles.csv").exists()
+    assert (tmp_path / "tables/distance_locality_summary_curves.csv").exists()
     assert summary["decisions"]["distance_resolved_specialisation"]["verdict"] == (
         "retain_exact_decomposition"
     )

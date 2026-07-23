@@ -17,6 +17,7 @@ specialisation and eventwise functional sensitivity ``F_sens`` carriage.  It tes
 * support-aware routing/message/wiring decomposition for all three interventions;
 * final-state ``F_sens`` and path-integrated beneficial carriage for semantic, PE and topology;
 * an exact distance decomposition of each head's EG score, with a separate hub bucket,
+  a support-normalised per-opportunity companion, clean attention-distance locality,
   and frozen-family reach profiles aligned to functional and beneficial carriage;
 * an expanded sample-split conditional screen over raw scores and all pairwise D/J/G coordinates;
 * a matched-real, non-isomorphic molecular-topology donor intervention with donor
@@ -28,8 +29,9 @@ versus topology score planes, activity-gated PE versus topology contrasts, poole
 correlations, top-k graph-bootstrap stability, frozen PE-specific/topology-specific/shared families,
 held-out simultaneous three-channel family patching, and tier/dose-stratified results.
 
-The expensive phases are resumable: ``scores``, ``causal``, ``mechanism``, ``ablations``,
-and ``figures``. Score estimation checkpoints every completed source group, channel and graph;
+The expensive phases are resumable: ``scores``, ``attention``, ``causal``, ``mechanism``,
+``ablations``, and ``figures``. Score estimation checkpoints every completed source group,
+channel and graph; clean attention locality checkpoints every graph;
 rare quadrature cap hits are retained only under explicit per-path error and global-rate gates.
 ``all`` runs the phases in order. ``--fast-dev-run`` is plumbing only.
 """
@@ -1563,7 +1565,9 @@ def distance_resolved_eg_one_graph(
 
     For each source, carrier magnitudes are summed inside each event-specific distance
     bucket, donors/events are averaged, then sources are averaged. Consequently the sum
-    over returned buckets is exactly the established graph EG score.
+    over returned buckets is exactly the established graph EG score.  The matching
+    event-carrier opportunity is retained for every bucket so a second, explicitly
+    support-normalised response-density view can be formed without changing EG.
     """
 
     import torch
@@ -1571,6 +1575,7 @@ def distance_resolved_eg_one_graph(
     if not q_groups or len(q_groups) != len(distance_groups):
         raise ValueError("q_groups and distance_groups must be non-empty and aligned")
     source_rows: list[dict[int, Any]] = []
+    source_opportunities: list[dict[int, float]] = []
     source_support: list[set[int]] = []
     for q, distances in zip(q_groups, distance_groups):
         if q.dim() != 5:
@@ -1582,11 +1587,17 @@ def distance_resolved_eg_one_graph(
             )
         magnitude = torch.linalg.vector_norm(q, dim=-1)  # [K,L,H,N]
         row: dict[int, Any] = {}
+        opportunity_row: dict[int, float] = {}
         codes = sorted(set(map(int, encoded.unique().tolist())), key=_distance_sort_key)
         for code in codes:
             mask = (encoded == code)[:, None, None, :].to(magnitude.dtype)
             row[code] = (magnitude * mask).sum(dim=-1).mean(dim=0)
+            # Mean number of available carriers per intervention event.  Dividing the
+            # exact bucket contribution by this scalar removes shell cardinality while
+            # preserving the established donor/source weighting of the EG numerator.
+            opportunity_row[code] = float((encoded == code).sum(dim=-1).float().mean())
         source_rows.append(row)
+        source_opportunities.append(opportunity_row)
         source_support.append(set(codes))
 
     all_codes = sorted(
@@ -1595,6 +1606,17 @@ def distance_resolved_eg_one_graph(
     template = torch.zeros_like(next(iter(source_rows[0].values())))
     contribution = {
         code: torch.stack([row.get(code, template) for row in source_rows]).mean(dim=0)
+        for code in all_codes
+    }
+    opportunity = {
+        code: float(np.mean([row.get(code, 0.0) for row in source_opportunities]))
+        for code in all_codes
+    }
+    density = {
+        code: (
+            contribution[code] / opportunity[code]
+            if opportunity[code] > 0.0 else torch.zeros_like(template)
+        )
         for code in all_codes
     }
     total = sum(contribution.values(), torch.zeros_like(template))
@@ -1606,6 +1628,8 @@ def distance_resolved_eg_one_graph(
     return {
         "codes": all_codes,
         "contribution": {code: value.detach().cpu().numpy() for code, value in contribution.items()},
+        "opportunity": opportunity,
+        "density": {code: value.detach().cpu().numpy() for code, value in density.items()},
         "support": {code: any(code in support for support in source_support) for code in all_codes},
         "total": total.detach().cpu().numpy(),
         "direct": direct.detach().cpu().numpy(),
@@ -1714,6 +1738,7 @@ def distance_specialisation_profile(
     )
     L, H = int(score["L"]), int(score["H"])
     graph_cube = np.zeros((len(decomposed), len(codes), L, H), dtype=np.float64)
+    graph_opportunity = np.zeros((len(decomposed), len(codes)), dtype=np.float64)
     support = np.zeros((len(decomposed), len(codes)), dtype=bool)
     references = np.zeros((len(decomposed), L, H), dtype=np.float64)
     for graph_index, item in enumerate(decomposed):
@@ -1721,6 +1746,9 @@ def distance_specialisation_profile(
         for bucket_index, code in enumerate(codes):
             if code in item["contribution"]:
                 graph_cube[graph_index, bucket_index] = item["contribution"][code]
+                graph_opportunity[graph_index, bucket_index] = float(
+                    item["opportunity"].get(code, 0.0)
+                )
                 support[graph_index, bucket_index] = bool(item["support"].get(code, False))
     contribution = graph_cube.mean(axis=0)
     total = contribution.sum(axis=0)
@@ -1741,6 +1769,67 @@ def distance_specialisation_profile(
         draw_totals[:, None],
         out=np.zeros_like(draw_means),
         where=draw_totals[:, None] > EPS,
+    )
+    graph_density = np.divide(
+        graph_cube,
+        graph_opportunity[:, :, None, None],
+        out=np.full_like(graph_cube, np.nan),
+        where=graph_opportunity[:, :, None, None] > 0,
+    )
+
+    def finite_mean(value: np.ndarray, axis: int | tuple[int, ...]) -> np.ndarray:
+        count = np.isfinite(value).sum(axis=axis)
+        total_value = np.nansum(value, axis=axis)
+        return np.divide(
+            total_value,
+            count,
+            out=np.full_like(total_value, np.nan, dtype=float),
+            where=count > 0,
+        )
+
+    density = finite_mean(graph_density, axis=0)
+    density_total = np.nansum(density, axis=0)
+    density_fraction = np.divide(
+        density,
+        density_total[None],
+        out=np.zeros_like(density),
+        where=density_total[None] > EPS,
+    )
+    draw_density = finite_mean(graph_density[draw_indices], axis=1)
+    draw_density_total = np.nansum(draw_density, axis=1)
+    draw_density_fraction = np.divide(
+        draw_density,
+        draw_density_total[:, None],
+        out=np.zeros_like(draw_density),
+        where=draw_density_total[:, None] > EPS,
+    )
+
+    aggregate_graph_mass = graph_cube.sum(axis=(2, 3))
+    aggregate_mass_mean = aggregate_graph_mass.mean(axis=0)
+    aggregate_mass_fraction = aggregate_mass_mean / max(
+        float(aggregate_mass_mean.sum()), EPS
+    )
+    aggregate_mass_draw = aggregate_graph_mass[draw_indices].mean(axis=1)
+    aggregate_mass_draw_fraction = np.divide(
+        aggregate_mass_draw,
+        aggregate_mass_draw.sum(axis=1, keepdims=True),
+        out=np.zeros_like(aggregate_mass_draw),
+        where=aggregate_mass_draw.sum(axis=1, keepdims=True) > EPS,
+    )
+    aggregate_graph_density = np.nansum(graph_density, axis=(2, 3))
+    aggregate_graph_density[graph_opportunity <= 0] = np.nan
+    aggregate_density_mean = finite_mean(aggregate_graph_density, axis=0)
+    aggregate_density_fraction = aggregate_density_mean / max(
+        float(np.nansum(aggregate_density_mean)), EPS
+    )
+    aggregate_density_draw = finite_mean(
+        aggregate_graph_density[draw_indices], axis=1
+    )
+    aggregate_density_draw_fraction = np.divide(
+        aggregate_density_draw,
+        np.nansum(aggregate_density_draw, axis=1, keepdims=True),
+        out=np.zeros_like(aggregate_density_draw),
+        where=np.nansum(aggregate_density_draw, axis=1, keepdims=True) > EPS,
     )
     numeric = np.asarray([code >= 0 for code in codes], dtype=bool)
     hops = np.asarray([max(code, 0) for code in codes], dtype=float)
@@ -1773,11 +1862,36 @@ def distance_specialisation_profile(
         "labels": [_distance_label(code) for code in codes],
         "graph_ids": np.asarray([item["graph_id"] for item in decomposed], dtype=np.int64),
         "graph_contribution": graph_cube,
+        "graph_opportunity": graph_opportunity,
+        "mean_opportunity": graph_opportunity.mean(axis=0),
+        "graph_density": graph_density,
         "graph_support": support,
         "contribution": contribution,
         "fraction": fraction,
         "fraction_ci_low": np.quantile(draw_fractions, 0.025, axis=0),
         "fraction_ci_high": np.quantile(draw_fractions, 0.975, axis=0),
+        "support_normalised_response": density,
+        "support_normalised_fraction": density_fraction,
+        "support_normalised_fraction_ci_low": np.nanquantile(
+            draw_density_fraction, 0.025, axis=0
+        ),
+        "support_normalised_fraction_ci_high": np.nanquantile(
+            draw_density_fraction, 0.975, axis=0
+        ),
+        "aggregate_mass_fraction": aggregate_mass_fraction,
+        "aggregate_mass_fraction_ci_low": np.quantile(
+            aggregate_mass_draw_fraction, 0.025, axis=0
+        ),
+        "aggregate_mass_fraction_ci_high": np.quantile(
+            aggregate_mass_draw_fraction, 0.975, axis=0
+        ),
+        "aggregate_support_normalised_fraction": aggregate_density_fraction,
+        "aggregate_support_normalised_fraction_ci_low": np.nanquantile(
+            aggregate_density_draw_fraction, 0.025, axis=0
+        ),
+        "aggregate_support_normalised_fraction_ci_high": np.nanquantile(
+            aggregate_density_draw_fraction, 0.975, axis=0
+        ),
         "total": total,
         "reference_mean": references.mean(axis=0),
         "expected_distance": expected_distance,
@@ -1789,6 +1903,139 @@ def distance_specialisation_profile(
             item["reference_identity_max_abs_error"] for item in decomposed
         )),
         "identity_passed": True,
+    }
+
+
+def clean_attention_distance_record(
+    gm: Any, data: Any, graph_id: int
+) -> dict[str, Any]:
+    """Clean post-softmax attention mass by pristine molecular query-key distance."""
+
+    import torch
+    from torch_geometric.data import Batch
+
+    batch = Batch.from_data_list([data.clone()]).to(gm.device)
+    capture = gm.capture(batch, want_grad=False, want_attn=True)
+    edge_index = capture["edge_index"].detach().cpu().numpy().astype(np.int64)
+    n = int(data.num_nodes)
+    molecular_distance = shortest_paths(n, molecular_edges(data))
+    source, destination = edge_index
+    code = np.full(len(source), DISTANCE_HUB, dtype=np.int64)
+    real = (source >= 0) & (source < n) & (destination >= 0) & (destination < n)
+    real_distance = molecular_distance[destination[real], source[real]]
+    code[real] = np.where(
+        np.isfinite(real_distance), real_distance, DISTANCE_UNREACHABLE
+    ).astype(np.int64)
+    codes = sorted(set(map(int, code.tolist())), key=_distance_sort_key)
+    mass = {value: np.zeros((gm.L, gm.H), dtype=np.float64) for value in codes}
+    pair_count = {value: int(np.sum(code == value)) for value in codes}
+    normalisation_error = np.zeros((gm.L,), dtype=np.float64)
+    minimum_weight = np.zeros((gm.L,), dtype=np.float64)
+    for layer, tensor in enumerate(capture["attn"]):
+        attention = tensor.detach().cpu().numpy().astype(np.float64)
+        if tuple(attention.shape) != (len(source), int(gm.H)):
+            raise RuntimeError(
+                f"attention shape {attention.shape} != {(len(source), int(gm.H))}"
+            )
+        minimum_weight[layer] = float(np.min(attention)) if attention.size else 0.0
+        if minimum_weight[layer] < -1.0e-7:
+            raise RuntimeError(
+                f"post-softmax attention has negative weight {minimum_weight[layer]:.3e}"
+            )
+        attention = np.maximum(attention, 0.0)
+        for value in codes:
+            mass[value][layer] = attention[code == value].sum(axis=0)
+
+        # GRIT normalises incoming sender weights for each receiver and head.
+        incoming = np.zeros((n, gm.H), dtype=np.float64)
+        np.add.at(incoming, destination[real], attention[real])
+        receiver_support = np.bincount(destination[real], minlength=n) > 0
+        normalisation_error[layer] = (
+            float(np.max(np.abs(incoming[receiver_support] - 1.0)))
+            if receiver_support.any() else 0.0
+        )
+    if float(np.max(normalisation_error)) > 2.0e-4:
+        raise RuntimeError(
+            "clean attention is not receiver-normalised: "
+            f"max error={float(np.max(normalisation_error)):.3e}"
+        )
+    return {
+        "graph_id": int(graph_id),
+        "n": n,
+        "codes": codes,
+        "mass": mass,
+        "pair_count": pair_count,
+        "normalisation_error": normalisation_error,
+        "minimum_weight": minimum_weight,
+    }
+
+
+def attention_distance_profile(
+    payload: Mapping[str, Any],
+    *,
+    bootstrap_samples: int = 1000,
+    seed: int = 0,
+) -> dict[str, Any]:
+    """Graph-balanced clean-attention locality with per-head bootstrap uncertainty."""
+
+    records = list(payload["records"])
+    if not records:
+        raise RuntimeError("attention-distance cache contains no records")
+    codes = sorted(
+        set().union(*(set(map(int, row["codes"])) for row in records)),
+        key=_distance_sort_key,
+    )
+    first_mass = next(iter(records[0]["mass"].values()))
+    L, H = map(int, np.asarray(first_mass).shape)
+    graph_mass = np.zeros((len(records), len(codes), L, H), dtype=np.float64)
+    graph_pairs = np.zeros((len(records), len(codes)), dtype=np.int64)
+    for graph_index, record in enumerate(records):
+        for bucket_index, code in enumerate(codes):
+            if code in record["mass"]:
+                graph_mass[graph_index, bucket_index] = np.asarray(
+                    record["mass"][code], dtype=float
+                )
+                graph_pairs[graph_index, bucket_index] = int(
+                    record["pair_count"].get(code, 0)
+                )
+    graph_total = graph_mass.sum(axis=1)
+    graph_fraction = np.divide(
+        graph_mass,
+        graph_total[:, None],
+        out=np.zeros_like(graph_mass),
+        where=graph_total[:, None] > EPS,
+    )
+    fraction = graph_fraction.mean(axis=0)
+    aggregate_graph_fraction = graph_fraction.mean(axis=(2, 3))
+    aggregate_fraction = aggregate_graph_fraction.mean(axis=0)
+    rng = np.random.default_rng(seed)
+    draw_indices = rng.integers(
+        0, len(records), size=(int(bootstrap_samples), len(records))
+    )
+    draw_fraction = graph_fraction[draw_indices].mean(axis=1)
+    aggregate_draw = aggregate_graph_fraction[draw_indices].mean(axis=1)
+    return {
+        "codes": np.asarray(codes, dtype=np.int64),
+        "labels": [_distance_label(code) for code in codes],
+        "graph_ids": np.asarray([row["graph_id"] for row in records], dtype=np.int64),
+        "graph_mass": graph_mass,
+        "graph_pair_count": graph_pairs,
+        "fraction": fraction,
+        "fraction_ci_low": np.quantile(draw_fraction, 0.025, axis=0),
+        "fraction_ci_high": np.quantile(draw_fraction, 0.975, axis=0),
+        "aggregate_fraction": aggregate_fraction,
+        "aggregate_fraction_ci_low": np.quantile(aggregate_draw, 0.025, axis=0),
+        "aggregate_fraction_ci_high": np.quantile(aggregate_draw, 0.975, axis=0),
+        "mean_pair_count": graph_pairs.mean(axis=0),
+        "graph_support": (graph_pairs > 0).sum(axis=0),
+        "normalisation_error_max": float(max(
+            np.max(np.asarray(row["normalisation_error"], dtype=float))
+            for row in records
+        )),
+        "minimum_weight": float(min(
+            np.min(np.asarray(row["minimum_weight"], dtype=float))
+            for row in records
+        )),
     }
 
 
@@ -3584,6 +3831,90 @@ def capture_mechanism(gm: Any, data: Any) -> dict[str, Any]:
     }
 
 
+def run_attention_task(
+    loaded: Mapping[str, Any],
+    cfg: BetaConfig,
+    score_payload: Mapping[str, Any],
+    *,
+    force: bool = False,
+) -> dict[str, Any]:
+    """Cache clean attention-distance mass on exactly the score graphs."""
+
+    import torch
+
+    gm, checkpoint_sha = loaded["gm"], loaded["sha"]
+    task_name = loaded["spec"].name
+    path = cache_path(cfg, task_name, "attention", checkpoint_sha)
+    cached = None if force else valid_cache(path, cfg, checkpoint_sha)
+    if cached is not None:
+        print(f"[attention:{task_name}] cache hit {path}", flush=True)
+        return cached
+    records = []
+    chunk_root = cfg.root / "cache" / task_name / "attention_graphs"
+    chunk_root.mkdir(parents=True, exist_ok=True)
+    score_records = list(score_payload["records"])
+    for position, score_record in enumerate(score_records):
+        graph_id = int(score_record["graph_id"])
+        chunk_path = (
+            chunk_root
+            / f"graph_{graph_id}__{cfg.fingerprint}__{checkpoint_sha[:12]}.pt"
+        )
+        chunk = None if force else valid_cache(chunk_path, cfg, checkpoint_sha)
+        if chunk is None:
+            data = gm.eval_ds[graph_id]
+            descriptor = score_record["plan"]["descriptor"]
+            if int(data.num_nodes) != int(score_record["n"]) or not np.array_equal(
+                molecular_edges(data), np.asarray(descriptor["edges"], dtype=np.int64)
+            ):
+                raise RuntimeError(
+                    f"attention graph {graph_id} no longer matches score graph topology"
+                )
+            record = clean_attention_distance_record(gm, data, graph_id)
+            chunk = {
+                "version": BETA_VERSION,
+                "schema": BETA_SCHEMA,
+                "fingerprint": cfg.fingerprint,
+                "checkpoint_sha256": checkpoint_sha,
+                "task": task_name,
+                "graph_id": graph_id,
+                "record": record,
+            }
+            atomic_torch_save(chunk, chunk_path)
+            print(
+                f"[attention:{task_name}] graph {position + 1}/{len(score_records)} "
+                f"id={graph_id}",
+                flush=True,
+            )
+        else:
+            print(
+                f"[attention:{task_name}] graph {position + 1}/{len(score_records)} "
+                f"id={graph_id} cache hit",
+                flush=True,
+            )
+        records.append(chunk["record"])
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    payload = {
+        "version": BETA_VERSION,
+        "schema": BETA_SCHEMA,
+        "fingerprint": cfg.fingerprint,
+        "checkpoint_sha256": checkpoint_sha,
+        "task": task_name,
+        "graph_ids": np.asarray([row["graph_id"] for row in records], dtype=np.int64),
+        "records": records,
+        "normalisation_error_max": float(max(
+            np.max(np.asarray(row["normalisation_error"], dtype=float))
+            for row in records
+        )),
+        "minimum_weight": float(min(
+            np.min(np.asarray(row["minimum_weight"], dtype=float))
+            for row in records
+        )),
+    }
+    atomic_torch_save(payload, path)
+    return payload
+
+
 def aggregate_pairs_to_nodes(pair_value: Any, destination: Any, n: int) -> Any:
     import torch
 
@@ -4106,11 +4437,13 @@ def conditional_analysis(
     rules = sorted(observations[0]["rules"]) if observations else []
     L, H = int(score_payload["L"]), int(score_payload["H"])
     candidates = []
+    rules_passing_prevalence: set[str] = set()
     for feature_name in CONDITIONAL_SCORE_FEATURES:
         for rule in rules:
             true_fraction = np.mean([bool(row["rules"][rule]) for row in discovery])
             if not cfg.min_condition_fraction <= true_fraction <= 1.0 - cfg.min_condition_fraction:
                 continue
+            rules_passing_prevalence.add(rule)
             for layer in range(L):
                 for head in range(H):
                     effect, true_graphs, false_graphs = _conditional_feature_effect(
@@ -4136,10 +4469,42 @@ def conditional_analysis(
                         "true_graphs": true_graphs,
                         "false_graphs": false_graphs,
                     })
+    eligibility_audit = {
+        "requires_all_three_channels": True,
+        "observations": int(len(observations)),
+        "observation_graphs": int(len({
+            int(row["graph_id"]) for row in observations
+        })),
+        "discovery_graphs": int(len({
+            int(row["graph_id"]) for row in discovery
+        })),
+        "confirmation_graphs": int(len({
+            int(row["graph_id"]) for row in confirmation
+        })),
+        "rules_considered": int(len(rules)),
+        "rules_passing_prevalence": int(len(rules_passing_prevalence)),
+        "minimum_condition_fraction": float(cfg.min_condition_fraction),
+        "minimum_graphs_per_state": int(cfg.min_condition_graphs),
+        "support_eligible_feature_rule_heads": int(len(candidates)),
+        "activity_eligible_feature_rule_heads": 0,
+        "tested_feature_rule_heads": 0,
+        "fdr_confirmed_feature_rule_heads": 0,
+    }
     if not candidates:
-        return {"metadata": metadata, "candidates": [], "confirmed": []}
+        return {
+            "metadata": metadata,
+            "eligibility_audit": eligibility_audit,
+            "candidates": [],
+            "confirmed": [],
+            "interpretation": (
+                "No feature/rule/head combination met the predeclared prevalence and "
+                "per-state graph-support gates. This is an ineligible screen, not evidence "
+                "that conditional specialisation is absent."
+            ),
+        }
     activity_floor = cfg.activity_floor_relative * max(row["discovery_activity"] for row in candidates)
     eligible = [row for row in candidates if row["discovery_activity"] >= activity_floor]
+    eligibility_audit["activity_eligible_feature_rule_heads"] = int(len(eligible))
     eligible.sort(key=lambda row: (
         -abs(row["discovery_effect_standardized"]), row["feature"], row["rule"],
         row["layer"], row["head"],
@@ -4161,6 +4526,7 @@ def conditional_analysis(
         key = candidate_key(row)
         if key not in selected_keys and len(tested) < cfg.conditional_max_tests:
             tested.append(row); selected_keys.add(key)
+    eligibility_audit["tested_feature_rule_heads"] = int(len(tested))
     confirmed = []
     for index, row in enumerate(tested):
         head = (int(row["layer"]), int(row["head"]))
@@ -4207,8 +4573,12 @@ def conditional_analysis(
         row["confirmed_at_fdr_0.05"] = bool(
             row["same_sign"] and row["ci_excludes_zero"] and np.isfinite(q_value) and q_value <= 0.05
         )
+    eligibility_audit["fdr_confirmed_feature_rule_heads"] = int(sum(
+        bool(row["confirmed_at_fdr_0.05"]) for row in confirmed
+    ))
     return {
         "metadata": metadata,
+        "eligibility_audit": eligibility_audit,
         "activity_floor": activity_floor,
         "candidates": tested,
         "discovery_summary": {
@@ -4853,12 +5223,12 @@ def figure_topology_validation(
 def figure_three_channel_planes(
     runs: Mapping[str, Mapping[str, Any]], path: Path
 ) -> list[str]:
-    """Headline EG score planes, including the previously missing topology coordinates."""
+    """Complete raw-score and D/J planes for all three pairwise channel contrasts."""
 
     plt = configure_matplotlib()
-    fig, axes = plt.subplots(2, 4, figsize=(12.5, 6.2), constrained_layout=True)
+    fig, axes = plt.subplots(4, 3, figsize=(12.5, 11.0), constrained_layout=True)
     scatter = None
-    for row, task in enumerate(ARCHITECTURES):
+    for architecture_index, task in enumerate(ARCHITECTURES):
         score = runs[task]["scores"]
         selection = runs[task]["ablations"]["selections"][HEADLINE_AGGREGATION]
         semantic, pe, topology = (
@@ -4870,55 +5240,95 @@ def figure_three_channel_planes(
         semantic_topology_topology = np.asarray(
             selection["semantic_topology_topology"], float
         )
+        pe_topology_pe = np.asarray(selection["pe_topology_pe"], float)
+        pe_topology_topology = np.asarray(
+            selection["pe_topology_topology"], float
+        )
         cmap, norm = layer_colors(int(score["L"]))
         layers = _head_layers(int(score["L"]), int(score["H"]))
-        comparisons = [
-            (pe, semantic, "PE score", "semantic score", None),
-            (
-                semantic_topology_topology,
-                semantic_topology_semantic,
-                "topology score",
-                "semantic score",
-                None,
-            ),
-        ]
+        sem_pe = selection["coordinates"]
         sem_top = score_coordinates(
             semantic_topology_semantic, semantic_topology_topology
         )
         pe_top = selection["pe_topology_coordinates"]
-        comparisons.extend([
-            (sem_top["D"], sem_top["J"], "D (− topology, + semantic)", "J", sem_top),
-            (pe_top["D"], pe_top["J"], "D (− topology, + PE)", "J", pe_top),
-        ])
-        for column, (xval, yval, xlabel, ylabel, coordinates) in enumerate(comparisons):
-            axis = axes[row, column]
-            if coordinates is None:
-                activity = score_coordinates(yval, xval)["J"]
-                active = activity >= 0.10 * np.nanmax(activity)
-            elif column == 3:
-                active = np.asarray(selection["pe_topology_active"], bool)
-            else:
-                active = coordinates["J"] >= 0.10 * np.nanmax(coordinates["J"])
-            axis.scatter(
-                np.asarray(xval).reshape(-1)[~active.reshape(-1)],
-                np.asarray(yval).reshape(-1)[~active.reshape(-1)],
-                color="0.82", s=18, label="below gate",
-            )
-            scatter = axis.scatter(
-                np.asarray(xval).reshape(-1)[active.reshape(-1)],
-                np.asarray(yval).reshape(-1)[active.reshape(-1)],
-                c=layers[active.reshape(-1)], cmap=cmap, norm=norm, s=27,
-                edgecolor="black", linewidth=0.25,
-            )
-            if column < 2:
-                low, high = _identity_limits(xval, yval)
-                axis.plot([low, high], [low, high], ":", color="black", linewidth=0.8)
-            else:
-                axis.axvline(0.0, color="black", linewidth=0.7)
-            axis.set_xlabel(xlabel); axis.set_ylabel(ylabel)
-            axis.set_title(("semantic–PE", "semantic–topology", "semantic–topology D/J", "PE–topology D/J")[column])
-            if column == 0:
-                axis.text(0.02, 0.98, DISPLAY[task], transform=axis.transAxes, va="top")
+        sem_pe_active = np.asarray(selection["active"], bool)
+        sem_top_active = sem_top["J"] >= max(
+            0.10 * float(np.nanmax(sem_top["J"])), EPS
+        )
+        pe_top_active = np.asarray(selection["pe_topology_active"], bool)
+        comparisons = (
+            (
+                (pe, semantic, "PE EG score", "semantic EG score"),
+                (sem_pe["D"], sem_pe["J"], "D (− PE, + semantic)", "J"),
+                sem_pe_active,
+                "semantic–PE",
+            ),
+            (
+                (
+                    semantic_topology_topology,
+                    semantic_topology_semantic,
+                    "topology EG score",
+                    "semantic EG score",
+                ),
+                (
+                    sem_top["D"],
+                    sem_top["J"],
+                    "D (− topology, + semantic)",
+                    "J",
+                ),
+                sem_top_active,
+                "semantic–topology",
+            ),
+            (
+                (
+                    pe_topology_topology,
+                    pe_topology_pe,
+                    "topology EG score",
+                    "PE EG score",
+                ),
+                (pe_top["D"], pe_top["J"], "D (− topology, + PE)", "J"),
+                pe_top_active,
+                "PE–topology",
+            ),
+        )
+        raw_row = 2 * architecture_index
+        coordinate_row = raw_row + 1
+        for column, (raw, coordinate, active, pair_label) in enumerate(comparisons):
+            for axis, values, title, raw_plane in (
+                (axes[raw_row, column], raw, f"{pair_label} scores", True),
+                (
+                    axes[coordinate_row, column],
+                    coordinate,
+                    f"{pair_label} D/J",
+                    False,
+                ),
+            ):
+                xval, yval, xlabel, ylabel = values
+                axis.scatter(
+                    np.asarray(xval).reshape(-1)[~active.reshape(-1)],
+                    np.asarray(yval).reshape(-1)[~active.reshape(-1)],
+                    color="0.82", s=18, label="below gate",
+                )
+                scatter = axis.scatter(
+                    np.asarray(xval).reshape(-1)[active.reshape(-1)],
+                    np.asarray(yval).reshape(-1)[active.reshape(-1)],
+                    c=layers[active.reshape(-1)], cmap=cmap, norm=norm, s=27,
+                    edgecolor="black", linewidth=0.25,
+                )
+                if raw_plane:
+                    low, high = _identity_limits(xval, yval)
+                    axis.plot(
+                        [low, high], [low, high], ":", color="black", linewidth=0.8
+                    )
+                else:
+                    axis.axvline(0.0, color="black", linewidth=0.7)
+                axis.set_xlabel(xlabel)
+                axis.set_ylabel(ylabel)
+                axis.set_title(title)
+        axes[raw_row, 0].text(
+            0.02, 0.98, DISPLAY[task],
+            transform=axes[raw_row, 0].transAxes, va="top",
+        )
     if scatter is not None:
         fig.colorbar(scatter, ax=axes, fraction=0.016, pad=0.01, label="layer")
     fig.suptitle("Headline EG: three-channel score and activity-gated selectivity planes", fontsize=11)
@@ -5301,6 +5711,17 @@ def distance_specialisation_rows(
     fraction = np.asarray(profile["fraction"], dtype=float)
     low = np.asarray(profile["fraction_ci_low"], dtype=float)
     high = np.asarray(profile["fraction_ci_high"], dtype=float)
+    density = np.asarray(profile["support_normalised_response"], dtype=float)
+    density_fraction = np.asarray(
+        profile["support_normalised_fraction"], dtype=float
+    )
+    density_low = np.asarray(
+        profile["support_normalised_fraction_ci_low"], dtype=float
+    )
+    density_high = np.asarray(
+        profile["support_normalised_fraction_ci_high"], dtype=float
+    )
+    opportunity = np.asarray(profile["mean_opportunity"], dtype=float)
     support = np.asarray(profile["graph_support"], dtype=bool)
     for bucket, (code, label) in enumerate(zip(profile["codes"], profile["labels"])):
         for layer in range(contribution.shape[1]):
@@ -5317,6 +5738,17 @@ def distance_specialisation_rows(
                     "fraction_of_head_EG": float(fraction[bucket, layer, head]),
                     "fraction_ci_low": float(low[bucket, layer, head]),
                     "fraction_ci_high": float(high[bucket, layer, head]),
+                    "mean_event_carrier_opportunity": float(opportunity[bucket]),
+                    "support_normalised_EG": float(density[bucket, layer, head]),
+                    "fraction_of_support_normalised_head_EG": float(
+                        density_fraction[bucket, layer, head]
+                    ),
+                    "support_normalised_fraction_ci_low": float(
+                        density_low[bucket, layer, head]
+                    ),
+                    "support_normalised_fraction_ci_high": float(
+                        density_high[bucket, layer, head]
+                    ),
                     "graph_support": int(support[:, bucket].sum()),
                     "graphs": int(support.shape[0]),
                 })
@@ -5327,6 +5759,21 @@ def head_reach_summary_rows(
     architecture: str, profile: Mapping[str, Any]
 ) -> list[dict[str, Any]]:
     total = np.asarray(profile["total"], dtype=float)
+    codes = np.asarray(profile["codes"], dtype=int)
+    support_fraction = np.asarray(
+        profile["support_normalised_fraction"], dtype=float
+    )
+    numeric = codes >= 0
+    numeric_hops = np.maximum(codes, 0).astype(float)
+    support_expected = (
+        support_fraction * numeric_hops[:, None, None] * numeric[:, None, None]
+    ).sum(axis=0)
+    support_near = support_fraction[
+        np.asarray([(code >= 0 and code <= 1) for code in codes], dtype=bool)
+    ].sum(axis=0)
+    support_far = support_fraction[
+        np.asarray([code >= 2 for code in codes], dtype=bool)
+    ].sum(axis=0)
     rows = []
     for layer in range(total.shape[0]):
         for head in range(total.shape[1]):
@@ -5340,9 +5787,102 @@ def head_reach_summary_rows(
                 "expected_numeric_distance": float(profile["expected_distance"][layer, head]),
                 "near_share_d_le_1": float(profile["near_share"][layer, head]),
                 "far_share_d_ge_2": float(profile["far_share"][layer, head]),
+                "support_normalised_expected_distance": float(
+                    support_expected[layer, head]
+                ),
+                "support_normalised_near_share_d_le_1": float(
+                    support_near[layer, head]
+                ),
+                "support_normalised_far_share_d_ge_2": float(
+                    support_far[layer, head]
+                ),
                 "unreachable_share": float(profile["unreachable_share"][layer, head]),
                 "hub_share": float(profile["hub_share"][layer, head]),
             })
+    return rows
+
+
+def attention_distance_rows(
+    architecture: str, profile: Mapping[str, Any]
+) -> list[dict[str, Any]]:
+    """Long-form clean post-softmax attention locality for every head."""
+
+    fraction = np.asarray(profile["fraction"], dtype=float)
+    low = np.asarray(profile["fraction_ci_low"], dtype=float)
+    high = np.asarray(profile["fraction_ci_high"], dtype=float)
+    rows = []
+    for bucket, (code, label) in enumerate(zip(profile["codes"], profile["labels"])):
+        for layer in range(fraction.shape[1]):
+            for head in range(fraction.shape[2]):
+                rows.append({
+                    "architecture": architecture,
+                    "distance_code": int(code),
+                    "distance_bucket": label,
+                    "layer": layer,
+                    "head": head,
+                    "fraction_of_clean_attention_mass": float(
+                        fraction[bucket, layer, head]
+                    ),
+                    "fraction_ci_low": float(low[bucket, layer, head]),
+                    "fraction_ci_high": float(high[bucket, layer, head]),
+                    "mean_supported_attention_pairs": float(
+                        profile["mean_pair_count"][bucket]
+                    ),
+                    "graph_support": int(profile["graph_support"][bucket]),
+                    "graphs": int(len(profile["graph_ids"])),
+                })
+    return rows
+
+
+def locality_curve_rows(
+    architecture: str,
+    channel: str,
+    profile: Mapping[str, Any],
+    attention: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    """Aggregate curve values and graph-bootstrap intervals used by the locality figure."""
+
+    rows = []
+    numeric = np.asarray(profile["codes"], dtype=int) >= 0
+    for name, value_key, low_key, high_key in (
+        (
+            "exact_EG_mass",
+            "aggregate_mass_fraction",
+            "aggregate_mass_fraction_ci_low",
+            "aggregate_mass_fraction_ci_high",
+        ),
+        (
+            "support_normalised_EG",
+            "aggregate_support_normalised_fraction",
+            "aggregate_support_normalised_fraction_ci_low",
+            "aggregate_support_normalised_fraction_ci_high",
+        ),
+    ):
+        for index in np.flatnonzero(numeric):
+            rows.append({
+                "architecture": architecture,
+                "channel": channel,
+                "profile": name,
+                "distance": int(profile["codes"][index]),
+                "value": float(profile[value_key][index]),
+                "ci_low": float(profile[low_key][index]),
+                "ci_high": float(profile[high_key][index]),
+                "graph_support": int(
+                    np.asarray(profile["graph_support"], dtype=bool)[:, index].sum()
+                ),
+            })
+    attention_numeric = np.asarray(attention["codes"], dtype=int) >= 0
+    for index in np.flatnonzero(attention_numeric):
+        rows.append({
+            "architecture": architecture,
+            "channel": channel,
+            "profile": "clean_attention_mass",
+            "distance": int(attention["codes"][index]),
+            "value": float(attention["aggregate_fraction"][index]),
+            "ci_low": float(attention["aggregate_fraction_ci_low"][index]),
+            "ci_high": float(attention["aggregate_fraction_ci_high"][index]),
+            "graph_support": int(attention["graph_support"][index]),
+        })
     return rows
 
 
@@ -5474,6 +6014,217 @@ def figure_distance_specialisation_atlas(
         colorbar.set_label("fraction of that head's EG score")
     fig.suptitle(
         "Who implements intervention reach: exact distance decomposition of head EG", fontsize=11
+    )
+    outputs = save_figure(fig, path)
+    plt.close(fig)
+    return outputs
+
+
+def figure_support_normalised_distance_atlas(
+    profiles: Mapping[tuple[str, str], Mapping[str, Any]], path: Path
+) -> list[str]:
+    """Per-head response-density atlas after removing distance-shell opportunity."""
+
+    plt = configure_matplotlib()
+    fig, axes = plt.subplots(2, 3, figsize=(12.0, 8.0), constrained_layout=True)
+    vmax = max(
+        float(np.nanmax(np.asarray(
+            profile["support_normalised_fraction"], float
+        )))
+        for profile in profiles.values()
+    )
+    image = None
+    for row, task in enumerate(ARCHITECTURES):
+        for column, channel in enumerate(CHANNELS):
+            profile = profiles[(task, channel)]
+            fraction = np.asarray(
+                profile["support_normalised_fraction"], float
+            )
+            matrix = fraction.transpose(1, 2, 0).reshape(-1, fraction.shape[0])
+            axis = axes[row, column]
+            image = axis.imshow(
+                matrix,
+                aspect="auto",
+                interpolation="nearest",
+                cmap="magma",
+                vmin=0.0,
+                vmax=max(vmax, EPS),
+            )
+            H = fraction.shape[2]
+            L = fraction.shape[1]
+            for layer in range(1, L):
+                axis.axhline(layer * H - 0.5, color="white", linewidth=0.35, alpha=0.7)
+            axis.set_yticks(
+                [layer * H + (H - 1) / 2 for layer in range(L)],
+                [f"L{layer}" for layer in range(L)],
+            )
+            axis.set_xticks(np.arange(len(profile["labels"])), profile["labels"])
+            axis.set_xlabel("carrier distance from changed set [hops]")
+            if column == 0:
+                axis.set_ylabel(f"{DISPLAY[task]}\nhead rows (layer blocks)")
+            axis.set_title(("semantic donor", "PE transposition", "topology donor")[column])
+    if image is not None:
+        colorbar = fig.colorbar(image, ax=axes, fraction=0.018, pad=0.01)
+        colorbar.set_label("fraction of support-normalised head response")
+    fig.suptitle(
+        "Per-opportunity functional locality: EG divided by event-carrier support",
+        fontsize=11,
+    )
+    outputs = save_figure(fig, path)
+    plt.close(fig)
+    return outputs
+
+
+def figure_attention_distance_atlas(
+    profiles: Mapping[str, Mapping[str, Any]], path: Path
+) -> list[str]:
+    """Clean attention-mass locality for every layer and head."""
+
+    plt = configure_matplotlib()
+    fig, axes = plt.subplots(1, 2, figsize=(12.0, 4.5), constrained_layout=True)
+    vmax = max(
+        float(np.nanmax(np.asarray(profile["fraction"], float)))
+        for profile in profiles.values()
+    )
+    image = None
+    for column, task in enumerate(ARCHITECTURES):
+        profile = profiles[task]
+        fraction = np.asarray(profile["fraction"], float)
+        matrix = fraction.transpose(1, 2, 0).reshape(-1, fraction.shape[0])
+        axis = axes[column]
+        image = axis.imshow(
+            matrix,
+            aspect="auto",
+            interpolation="nearest",
+            cmap="viridis",
+            vmin=0.0,
+            vmax=max(vmax, EPS),
+        )
+        H = fraction.shape[2]
+        L = fraction.shape[1]
+        for layer in range(1, L):
+            axis.axhline(layer * H - 0.5, color="white", linewidth=0.35, alpha=0.7)
+        axis.set_yticks(
+            [layer * H + (H - 1) / 2 for layer in range(L)],
+            [f"L{layer}" for layer in range(L)],
+        )
+        axis.set_xticks(np.arange(len(profile["labels"])), profile["labels"])
+        axis.set_xlabel("clean attention query-key distance [molecular hops]")
+        axis.set_ylabel(f"{DISPLAY[task]}\nhead rows (layer blocks)")
+        axis.set_title(DISPLAY[task])
+    if image is not None:
+        colorbar = fig.colorbar(image, ax=axes, fraction=0.022, pad=0.01)
+        colorbar.set_label("fraction of clean post-softmax attention mass")
+    fig.suptitle(
+        "How local are the raw attention matrices?", fontsize=11
+    )
+    outputs = save_figure(fig, path)
+    plt.close(fig)
+    return outputs
+
+
+def figure_distance_locality_curves(
+    profiles: Mapping[tuple[str, str], Mapping[str, Any]],
+    attention_profiles: Mapping[str, Mapping[str, Any]],
+    path: Path,
+) -> list[str]:
+    """Exact score mass, per-opportunity response and raw attention with uncertainty."""
+
+    plt = configure_matplotlib()
+    fig, axes = plt.subplots(2, 3, figsize=(12.0, 7.2), constrained_layout=True)
+    colors = {
+        "exact": "#6f6f6f",
+        "normalised": "#c75b5b",
+        "attention": "#4c78a8",
+    }
+    positive = []
+    for profile in profiles.values():
+        for key in (
+            "aggregate_mass_fraction",
+            "aggregate_support_normalised_fraction",
+        ):
+            values = np.asarray(profile[key], float)
+            positive.extend(values[np.isfinite(values) & (values > 0)].tolist())
+    for profile in attention_profiles.values():
+        values = np.asarray(profile["aggregate_fraction"], float)
+        positive.extend(values[np.isfinite(values) & (values > 0)].tolist())
+    lower = max(min(positive) * 0.5 if positive else 1.0e-6, 1.0e-8)
+    for row, task in enumerate(ARCHITECTURES):
+        attention = attention_profiles[task]
+        attention_numeric = np.asarray(attention["codes"], int) >= 0
+        attention_x = np.asarray(attention["codes"], int)[attention_numeric]
+        for column, channel in enumerate(CHANNELS):
+            axis = axes[row, column]
+            profile = profiles[(task, channel)]
+            numeric = np.asarray(profile["codes"], int) >= 0
+            x = np.asarray(profile["codes"], int)[numeric]
+            series = (
+                (
+                    "exact EG score mass",
+                    "aggregate_mass_fraction",
+                    "aggregate_mass_fraction_ci_low",
+                    "aggregate_mass_fraction_ci_high",
+                    colors["exact"],
+                    "o-",
+                ),
+                (
+                    "support-normalised EG",
+                    "aggregate_support_normalised_fraction",
+                    "aggregate_support_normalised_fraction_ci_low",
+                    "aggregate_support_normalised_fraction_ci_high",
+                    colors["normalised"],
+                    "s-",
+                ),
+            )
+            for label, key, low_key, high_key, color, style in series:
+                value = np.asarray(profile[key], float)[numeric]
+                low = np.asarray(profile[low_key], float)[numeric]
+                high = np.asarray(profile[high_key], float)[numeric]
+                axis.fill_between(
+                    x, np.maximum(low, lower), np.maximum(high, lower),
+                    color=color, alpha=0.13, linewidth=0,
+                )
+                axis.plot(x, np.maximum(value, lower), style, color=color,
+                          linewidth=1.3, markersize=3.5, label=label)
+            attention_value = np.asarray(
+                attention["aggregate_fraction"], float
+            )[attention_numeric]
+            attention_low = np.asarray(
+                attention["aggregate_fraction_ci_low"], float
+            )[attention_numeric]
+            attention_high = np.asarray(
+                attention["aggregate_fraction_ci_high"], float
+            )[attention_numeric]
+            axis.fill_between(
+                attention_x,
+                np.maximum(attention_low, lower),
+                np.maximum(attention_high, lower),
+                color=colors["attention"],
+                alpha=0.10,
+                linewidth=0,
+            )
+            axis.plot(
+                attention_x,
+                np.maximum(attention_value, lower),
+                "^--",
+                color=colors["attention"],
+                linewidth=1.2,
+                markersize=3.5,
+                label="clean attention mass",
+            )
+            axis.set_yscale("log")
+            axis.set_ylim(lower, 1.2)
+            axis.grid(True, which="major", alpha=0.22)
+            axis.set_xlabel("molecular hop distance")
+            if column == 0:
+                axis.set_ylabel(f"{DISPLAY[task]}\nnormalised profile")
+            axis.set_title(("semantic donor", "PE transposition", "topology donor")[column])
+            if row == 0 and column == 0:
+                axis.legend(frameon=False, fontsize=7)
+    fig.suptitle(
+        "Score mass versus per-opportunity sensitivity and clean attention locality\n"
+        "(bands: graph-bootstrap 95% intervals)",
+        fontsize=11,
     )
     outputs = save_figure(fig, path)
     plt.close(fig)
@@ -5734,7 +6485,18 @@ def figure_conditional(
             ),
         )[:8]
         if not rows:
-            axis.text(0.5, 0.5, "No eligible condition", ha="center", va="center")
+            audit = conditional[task].get("eligibility_audit", {})
+            if int(audit.get("observations", 0)) == 0:
+                message = "Screen unavailable:\nno aligned three-channel observations"
+            elif int(audit.get("rules_passing_prevalence", 0)) == 0:
+                message = "No condition met\nthe prevalence gate"
+            elif int(audit.get("support_eligible_feature_rule_heads", 0)) == 0:
+                message = "No condition met\nthe per-state graph-support gate"
+            elif int(audit.get("activity_eligible_feature_rule_heads", 0)) == 0:
+                message = "No condition/head met\nthe activity gate"
+            else:
+                message = "No condition entered\nheld-out confirmation"
+            axis.text(0.5, 0.5, message, ha="center", va="center")
             axis.set_axis_off()
             continue
         labels = [
@@ -6056,12 +6818,34 @@ def create_outputs(runs: Mapping[str, Mapping[str, Any]], cfg: BetaConfig) -> di
     topology_strata_rows = []
     topology_agreement = {}
     distance_profiles: dict[tuple[str, str], dict[str, Any]] = {}
+    attention_profiles: dict[str, dict[str, Any]] = {}
     distance_score_rows = []
+    attention_distance_table_rows = []
+    locality_summary_rows = []
     head_reach_rows = []
     family_reach_rows = []
     distance_identity_rows = []
     integrated_audit_rows = []
     for task in ARCHITECTURES:
+        attention_profile = attention_distance_profile(
+            runs[task]["attention"],
+            bootstrap_samples=cfg.bootstrap_samples,
+            seed=cfg.analysis_seed + 10_301 + 997 * ARCHITECTURES.index(task),
+        )
+        score_graph_ids = np.asarray(
+            [row["graph_id"] for row in runs[task]["scores"]["records"]],
+            dtype=np.int64,
+        )
+        if not np.array_equal(
+            np.sort(score_graph_ids), np.sort(attention_profile["graph_ids"])
+        ):
+            raise RuntimeError(
+                f"clean-attention graphs do not match score graphs for {task}"
+            )
+        attention_profiles[task] = attention_profile
+        attention_distance_table_rows.extend(
+            attention_distance_rows(task, attention_profile)
+        )
         event_rows.extend(intervention_event_rows(task, runs[task]["scores"]))
         task_integrated_audit = runs[task]["scores"].get(
             "integrated_carriage_audit",
@@ -6147,6 +6931,11 @@ def create_outputs(runs: Mapping[str, Mapping[str, Any]], cfg: BetaConfig) -> di
                 })
                 if donor_scope == "headline":
                     distance_profiles[(task, channel)] = profile
+                    locality_summary_rows.extend(
+                        locality_curve_rows(
+                            task, channel, profile, attention_profile
+                        )
+                    )
                     final_carriage = model_carriage_profile(
                         runs[task]["scores"],
                         channel,
@@ -6307,6 +7096,8 @@ def create_outputs(runs: Mapping[str, Mapping[str, Any]], cfg: BetaConfig) -> di
     write_csv(tables / "intervention_events_and_dose.csv", event_rows)
     write_csv(tables / "donor_outcome_summary.csv", donor_outcome_summary_rows(event_rows))
     write_csv(tables / "distance_resolved_specialisation.csv", distance_score_rows)
+    write_csv(tables / "clean_attention_distance_profiles.csv", attention_distance_table_rows)
+    write_csv(tables / "distance_locality_summary_curves.csv", locality_summary_rows)
     write_csv(tables / "head_reach_summary.csv", head_reach_rows)
     write_csv(tables / "family_reach_alignment.csv", family_reach_rows)
     write_csv(tables / "distance_score_identity.csv", distance_identity_rows)
@@ -6332,6 +7123,19 @@ def create_outputs(runs: Mapping[str, Mapping[str, Any]], cfg: BetaConfig) -> di
     )
     figure_paths += figure_distance_usage_coupling(
         runs, distance_profiles, cfg, figures / "zinc_headline_fig13_reach_usage_coupling"
+    )
+    figure_paths += figure_support_normalised_distance_atlas(
+        distance_profiles,
+        figures / "zinc_headline_fig14_support_normalised_distance_specialisation",
+    )
+    figure_paths += figure_attention_distance_atlas(
+        attention_profiles,
+        figures / "zinc_headline_fig15_attention_distance_locality",
+    )
+    figure_paths += figure_distance_locality_curves(
+        distance_profiles,
+        attention_profiles,
+        figures / "zinc_headline_fig16_distance_locality_curves",
     )
 
     decisions = create_decisions(runs, overall)
@@ -6365,6 +7169,18 @@ def create_outputs(runs: Mapping[str, Mapping[str, Any]], cfg: BetaConfig) -> di
             "identifies which heads and frozen families implement intervention reach; final-state "
             "F_sens and signed B remain the functional and task-usage endpoints"
         ),
+        "support_normalised_diagnostic": (
+            "divide each graph's exact distance-bucket EG contribution by its matched mean "
+            "event-carrier opportunity, then graph-average; this diagnoses per-opportunity "
+            "functional locality without replacing or renormalising the headline EG score"
+        ),
+        "attention_locality_control": (
+            "clean post-softmax attention mass is binned by pristine molecular query-key "
+            "distance, normalised within graph/layer/head and graph-bootstrap aggregated"
+        ),
+        "attention_normalisation_error_max": float(max(
+            profile["normalisation_error_max"] for profile in attention_profiles.values()
+        )),
     }
     write_json(tables / "methodology_decisions.json", decisions)
     scope = {
@@ -6389,7 +7205,8 @@ def create_outputs(runs: Mapping[str, Mapping[str, Any]], cfg: BetaConfig) -> di
         "aggregation_choice": "predeclared headline EG; no data-dependent reselection",
         "functional_carriage_choice": "predeclared F_sens; F_coh retained diagnostically",
         "distance_specialisation_choice": (
-            "exact EG-by-distance decomposition with unreachable and hub buckets"
+            "exact EG-by-distance decomposition retained; support-normalised EG and raw "
+            "attention locality are explicitly diagnostic companion views"
         ),
         "decisions": decisions,
         "figures": figure_paths,
@@ -6443,6 +7260,7 @@ def cached_runs(cfg: BetaConfig) -> dict[str, dict[str, Any]]:
     return {
         task: {
             "scores": find_cached_phase(cfg, task, "scores"),
+            "attention": find_cached_phase(cfg, task, "attention"),
             "causal": find_cached_phase(cfg, task, "causal"),
             "mechanism": find_cached_phase(cfg, task, "mechanism"),
             "ablations": find_cached_phase(cfg, task, "ablations"),
@@ -6583,7 +7401,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--phase",
-        choices=("all", "scores", "causal", "mechanism", "ablations", "figures"),
+        choices=(
+            "all", "scores", "attention", "causal", "mechanism", "ablations", "figures"
+        ),
         default="all",
     )
     parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT))
@@ -6657,6 +7477,12 @@ def main(argv: Sequence[str] | None = None) -> dict[str, Any]:
                 causal_payload = None
                 if args.phase in {"all", "scores"}:
                     score_payload = run_scores_task(loaded, cfg, force=args.force)
+                if args.phase in {"all", "attention"}:
+                    if score_payload is None:
+                        score_payload = find_cached_phase(cfg, task, "scores")
+                    run_attention_task(
+                        loaded, cfg, score_payload, force=args.force
+                    )
                 if args.phase in {"all", "causal"}:
                     if score_payload is None:
                         score_payload = find_cached_phase(cfg, task, "scores")

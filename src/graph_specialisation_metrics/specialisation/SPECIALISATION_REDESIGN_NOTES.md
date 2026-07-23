@@ -514,6 +514,15 @@ The headline rerun protocol fixes `EG` and `F_sens` before looking at the new re
   atlases, reach summaries and frozen-family distance curves aligned with final-state `F_sens` and
   signed beneficial carriage; interpret these as who implements reach, not direct performance
   prediction;
+- retain that exact score-mass atlas unchanged, and add two explicit locality diagnostics. First,
+  divide each graph's distance-bucket EG contribution by its matched mean event-carrier opportunity
+  before graph averaging; this removes shell cardinality and estimates output-relevant response per
+  available carrier without replacing the headline score. Second, bin each clean head's post-softmax
+  attention mass by pristine molecular query-key distance. Report head atlases plus aggregate curves
+  for exact EG mass, support-normalised EG and clean attention, with graph-bootstrap intervals and
+  machine-readable per-head intervals. This comparison distinguishes global attention support from
+  functionally effective transport; it does not equate query-key distance with a multi-layer causal
+  path;
 - expand the sample-split conditional screen to raw semantic/PE/topology EG scores, every pairwise
   D/J/G coordinate and three-channel J/G. Conditions cover clean graph composition/topology and
   source atom, neighbourhood, degree, cycle and articulation context; confirmation uses a global
@@ -543,7 +552,7 @@ cannot. Topology events are never forced into a two-way fixed-support account: r
 are defined only on common directed pairs, with exclusive clean/corrupt support reported as an
 explicit wiring contribution.
 
-The notebook emits thirteen paper figure families (PNG and PDF), machine-readable head/causal/topology
+The notebook emits sixteen paper figure families (PNG and PDF), machine-readable head/causal/topology
 tables and a predeclared decision report. It also records a current limitation: Drive contains one
 checkpoint per architecture for this comparison. Graph bootstraps quantify evaluation-sample
 uncertainty, not training-seed uncertainty, so decisions are concrete for this beta but remain subject
@@ -598,6 +607,9 @@ completed semantic/PE/topology integrations.
   event-specific carrier distance before summing over carriers, with graphwise reconstruction as a
   fatal identity check. Use the resulting head/family reach profiles to explain which mechanisms
   implement `F_sens`/beneficial reach; do not treat them as an additional specialist score or as a
-  direct performance predictor. Keep `unreachable` and virtual-node `hub` buckets explicit.
+  direct performance predictor. Keep `unreachable` and virtual-node `hub` buckets explicit. Preserve
+  the exact score-mass view as primary; use support-normalised EG to test whether apparent locality
+  survives distance-shell opportunity, and clean attention-distance mass to test whether functional
+  locality differs from raw routing locality. Neither diagnostic changes `S`, `D`, `J` or `G`.
 - **Conditional labels:** approve only conditions that replicate under frozen rules, adequate support
   and multiplicity control. Otherwise retain conditional analysis as exploratory.
