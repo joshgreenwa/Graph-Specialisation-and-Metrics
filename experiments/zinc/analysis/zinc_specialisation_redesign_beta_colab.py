@@ -1598,8 +1598,13 @@ def clean_gradients(gm: Any, base: Any) -> tuple[Any, list[Any], Any, Any]:
     final: dict[str, Any] = {}
 
     def final_hook(_module: Any, _inputs: Any, output: Any) -> None:
+        # Keep the exact tensor consumed downstream by GritTransformer. A VNode model
+        # subsequently applies ``output.x[real_node_mask]`` before its readout; creating
+        # that slice again inside this hook would be a separate, unused autograd branch.
+        # Differentiate the full layer output, then remove the zero-gradient hub row below.
         real_mask = getattr(output, "real_node_mask", None)
-        final["h"] = output.x if real_mask is None else output.x[real_mask]
+        final["h"] = output.x
+        final["real_mask"] = real_mask
 
     handle = gm.model.model.layers.register_forward_hook(final_hook)
     try:
@@ -1617,7 +1622,10 @@ def clean_gradients(gm: Any, base: Any) -> tuple[Any, list[Any], Any, Any]:
         gradients.append(values[:-1])
         final_gradients.append(values[-1])
     phi = [torch.stack([gradient[layer] for gradient in gradients], dim=0) for layer in range(gm.L)]
-    final_phi = torch.stack(final_gradients, dim=0).detach()  # [T,N,D]
+    final_phi = torch.stack(final_gradients, dim=0).detach()  # [T,N(+hub),D]
+    real_mask = final.get("real_mask")
+    if real_mask is not None:
+        final_phi = final_phi[:, real_mask]
     if tuple(final_phi.shape[1:]) != (int(base.num_nodes), int(gm.dim_h)):
         raise RuntimeError(f"unexpected final-state gradient shape {tuple(final_phi.shape)}")
     return pred.detach(), phi, capture, final_phi

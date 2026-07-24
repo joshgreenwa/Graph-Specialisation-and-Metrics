@@ -165,3 +165,21 @@ def test_cross_graph_mismatch_alignment_preserves_vnode_carrier():
     )
     assert valid.tolist() == [True]
     assert value[:, 0, 0].tolist() == [30.0, 10.0, 20.0, 99.0]
+
+
+def test_vnode_final_gradient_uses_consumed_full_tensor_before_real_slice():
+    """The hook must not differentiate a duplicate slice unused by the readout."""
+
+    torch = pytest.importorskip("torch")
+    full = torch.arange(12.0, requires_grad=True).reshape(4, 3)
+    real_mask = torch.tensor([True, True, True, False])
+    prediction = full[real_mask].mean()
+
+    full_gradient = torch.autograd.grad(prediction, full)[0]
+    assert tuple(full_gradient.shape) == (4, 3)
+    assert torch.equal(full_gradient[~real_mask], torch.zeros(1, 3))
+    assert tuple(full_gradient[real_mask].shape) == (3, 3)
+
+    duplicate_slice = full[real_mask]
+    with pytest.raises(RuntimeError, match="not have been used"):
+        torch.autograd.grad(prediction, duplicate_slice)
