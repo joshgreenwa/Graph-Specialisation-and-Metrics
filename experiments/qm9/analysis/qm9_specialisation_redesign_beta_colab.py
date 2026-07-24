@@ -183,6 +183,48 @@ def _repository_branch(argv: Sequence[str]) -> str:
     return REPOSITORY_BRANCH
 
 
+def _strip_colab_kernel_args(argv: Sequence[str]) -> list[str]:
+    """Discard only IPython's injected ``-f kernel-....json`` argument pair.
+
+    Pasting this file into a Colab cell leaves ``sys.argv`` owned by
+    ``colab_kernel_launcher.py``. Genuine analysis options remain strict so misspelled
+    user arguments still fail loudly.
+    """
+
+    cleaned: list[str] = []
+    index = 0
+    values = list(argv)
+    while index < len(values):
+        value = values[index]
+        if (
+            value == "-f"
+            and index + 1 < len(values)
+            and "kernel-" in values[index + 1]
+            and values[index + 1].endswith(".json")
+        ):
+            print(
+                "[args] Ignoring Colab/Jupyter kernel argument: "
+                f"{value} {values[index + 1]}",
+                flush=True,
+            )
+            index += 2
+            continue
+        if (
+            value.startswith("-f=")
+            and "kernel-" in value
+            and value.endswith(".json")
+        ):
+            print(
+                f"[args] Ignoring Colab/Jupyter kernel argument: {value}",
+                flush=True,
+            )
+            index += 1
+            continue
+        cleaned.append(value)
+        index += 1
+    return cleaned
+
+
 def configure_qm9_profile(shared: Any, *, onehop_vnode: bool) -> None:
     """Set the dataset profile consumed dynamically by the shared implementation."""
 
@@ -212,7 +254,9 @@ def configure_qm9_profile(shared: Any, *, onehop_vnode: bool) -> None:
 
 
 def main(argv: Sequence[str] | None = None) -> dict[str, Any]:
-    supplied = list(sys.argv[1:] if argv is None else argv)
+    supplied = _strip_colab_kernel_args(
+        sys.argv[1:] if argv is None else argv
+    )
     repository = bootstrap_repository(branch=_repository_branch(supplied))
     for path in (repository / "src", repository):
         if str(path) not in sys.path:

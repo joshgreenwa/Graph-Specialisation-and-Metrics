@@ -62,6 +62,28 @@ def test_qm9_entrypoint_can_select_non_vnode_onehop_checkpoint():
     assert SHARED.DISPLAY["qm9_gap_1hop"] == "1-hop GRIT"
 
 
+@pytest.mark.parametrize(
+    "raw",
+    [
+        ["-f", "/root/.local/share/jupyter/runtime/kernel-deadbeef.json"],
+        ["-f=/root/.local/share/jupyter/runtime/kernel-deadbeef.json"],
+    ],
+)
+def test_qm9_entrypoint_strips_only_injected_colab_kernel_args(raw):
+    supplied = [
+        "--phase", "scores",
+        *raw,
+        "--onehop-checkpoint", "/content/model.ckpt",
+    ]
+    assert ENTRYPOINT._strip_colab_kernel_args(supplied) == [
+        "--phase", "scores",
+        "--onehop-checkpoint", "/content/model.ckpt",
+    ]
+    assert ENTRYPOINT._strip_colab_kernel_args(["-f", "ordinary.txt"]) == [
+        "-f", "ordinary.txt",
+    ]
+
+
 def test_qm9_vnode_task_replays_attached_training_contract(monkeypatch, tmp_path):
     import GRIT_QM9_gap
 
