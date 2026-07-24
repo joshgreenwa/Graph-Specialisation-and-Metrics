@@ -31,6 +31,8 @@ QM9-specific feature indices.
 - `validation.py`: individual-head ablation, restore/inject patching, correlations,
   bootstrap intervals, permutation tests, and method rankings.
 - `figures.py`: the raw, derived, agreement, significance, role, and topology atlases.
+- `synthetic_validation.py`: task-independent M1/M4/M5/M7 score mapping and the four
+  consolidated mixed-task causal-validation figures.
 - `cache.py`: atomic, checkpoint- and protocol-fingerprinted caches.
 - `runner.py`: phase orchestration only.
 
@@ -178,6 +180,16 @@ Run:
 ```python
 %run experiments/methodology/colab_scoring_metric_refinement_dense.py
 ```
+
+For the final controlled comparison on the cached mixed synthetic task:
+
+```python
+%run experiments/methodology/colab_scoring_metric_refinement_synthetic.py
+```
+
+The synthetic comparison adds `M7`, whose semantic axis is M4 semantic-attention
+following and whose structural axis is M5 PE-attention following. It does not
+change the dense ZINC/QM9 M1–M6 protocol or invalidate those caches.
 
 The frontend mounts Drive, refreshes this repository, installs it, runs ZINC and QM9 dense models
 sequentially, and releases GPU memory between tasks. Use `--fast-dev-run` for an end-to-end smoke

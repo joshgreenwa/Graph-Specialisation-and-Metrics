@@ -10,6 +10,28 @@ Its standalone ZINC/QM9 frontend is
 the reusable implementation and estimands are documented in
 [`scoring_refinement/README.md`](../../src/graph_specialisation_metrics/scoring_refinement/README.md).
 
+The final controlled comparison on the already-trained mixed synthetic task uses
+[colab_scoring_metric_refinement_synthetic.py](colab_scoring_metric_refinement_synthetic.py).
+Upload it to Colab and run:
+
+```python
+%run colab_scoring_metric_refinement_synthetic.py
+```
+
+It loads the existing `cycle_dual_v2` seeds from Drive, evaluates
+`M1_DD`, `M1_DT`, `M1_TD`, `M1_TT`, `M4`, `M5`, and `M7`, and writes
+new caches beneath:
+
+```text
+/content/drive/MyDrive/graph_specialisation_metrics/
+  causal_specialisation_double_dissociation/
+  cycle_dual_v2/scoring_refinement_m1_m4_m5_m7_v1
+```
+
+The original checkpoints and causal-analysis caches remain unchanged. The four
+figure families consolidate score planes, head necessity/task role, causal rescue
+role, and score-selected family necessity plus rescue across every method.
+
 ## Local smoke runs
 
 ```bash

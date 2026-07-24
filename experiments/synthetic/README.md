@@ -3,6 +3,40 @@
 This folder contains controlled graph tasks for studying symbolic and structural
 attention behaviour outside ZINC.
 
+## Final scoring-method comparison on the mixed task
+
+`analysis/scoring_metric_refinement_synthetic.py` is the model/data adapter for
+the seven-method comparison on the three trained `cycle_dual_v2` seeds. The
+recommended access point is the self-bootstrapping Colab file
+`experiments/methodology/colab_scoring_metric_refinement_synthetic.py`.
+
+The compared semantic/structural score axes are:
+
+- `M1_DD`, `M1_DT`, `M1_TD`, and `M1_TT`: output-projected transport EG
+  under every semantic donor/transposition × PE donor/transposition pairing;
+- `M4`: semantic-transposition attention following versus invariance;
+- `M5`: PE-transposition attention invariance versus following; and
+- `M7`: M4 semantic following versus M5 PE/structural following.
+
+All four M1 arms share the within-seed `M1_DT` semantic-donor and
+PE-transposition references, so intervention-amplitude differences remain
+visible in `J` and `D_rel`. M4, M5, and M7 use their own fixed within-seed axis
+means.
+
+The adapter reuses the original held-out individual-head ablation and causal
+rescue tensors. It computes only missing score components and the
+method-specific simultaneous family ablations. Outputs are deliberately limited
+to four consolidated PNG/PDF figure families:
+
+1. semantic versus structural score planes;
+2. `J` versus necessity and `D_rel` versus ablation task role;
+3. `D_rel` versus causal rescue role; and
+4. score-selected family necessity plus rescue matrices.
+
+Per-head raw/calibrated scores, correlations, and seed-level family matrices are
+also exported as CSV. Figure-only reruns use `--phase figures`; interrupted
+analysis resumes from each seed/method cache.
+
 ## Paper-aligned Neighbor Associative Recall with trained GRIT support
 
 `training/nar_grit_colab.py` launches the centrally maintained implementation in

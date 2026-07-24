@@ -589,3 +589,40 @@ The task is complete when:
 8. Colab execution is resumable and writes only to the dedicated Drive output root.
 9. The package README and protocol metadata fully define the estimands.
 10. Unit tests and a fast-development smoke run pass before a full Colab run.
+
+## Final controlled synthetic comparison
+
+The frozen-method comparison on the already-trained `cycle_dual_v2` checkpoints
+uses:
+
+```text
+M1_DD, M1_DT, M1_TD, M1_TT, M4, M5, M7
+```
+
+`M4` maps semantic-transposition attention following to the semantic axis and
+attention invariance to the structural axis. `M5` maps PE-transposition
+attention invariance to the semantic axis and PE following to the structural
+axis. `M7` combines M4 semantic following with M5 PE following. All M1 arms
+share M1_DT references; the three cosine methods use their own fixed
+within-seed axis means.
+
+The standalone access point is
+`experiments/methodology/colab_scoring_metric_refinement_synthetic.py`. It reads
+the existing checkpoint and causal caches but writes its own resumable analysis
+under:
+
+```text
+cycle_dual_v2/scoring_refinement_m1_m4_m5_m7_v1/
+```
+
+Its output contract is exactly four consolidated PNG/PDF figure families:
+
+1. semantic-score versus structural-score planes for all methods;
+2. `J` versus head necessity and `D_rel` versus ablation task role;
+3. `D_rel` versus causal rescue role; and
+4. method-selected family necessity plus rescue matrices.
+
+All methods reuse identical individual-head ablation/rescue tensors and
+identical held-out graph draws for simultaneous family ablation. Raw per-head
+scores, validation correlations, selected families, and seed-level family
+matrices remain available as CSV/cache artifacts.
