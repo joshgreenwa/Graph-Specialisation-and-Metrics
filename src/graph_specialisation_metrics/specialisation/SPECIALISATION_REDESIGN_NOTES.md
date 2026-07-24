@@ -597,7 +597,10 @@ Score estimation is restartable at three levels: every completed source/event gr
 every completed intervention channel, then the assembled graph. Local topology reach has its own
 versioned graph/source cache and reuses completed global score caches. A cumulative integrated-carriage
 audit is also written after each graph. Thus an interruption or later-channel error does not repeat
-completed semantic/PE/topology integrations.
+completed semantic/PE/topology integrations. The default Colab entry point reloads the exact
+fingerprinted configuration from the existing output directory's `beta_config.json`; this prevents
+the higher-sample rerun from silently reverting to parser defaults and entering a new cache
+namespace. It never restores `--force`.
 
 ### Headline rerun decision priorities
 

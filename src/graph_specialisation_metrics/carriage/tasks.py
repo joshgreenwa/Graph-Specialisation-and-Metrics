@@ -166,11 +166,22 @@ def _peptides_hooks():
     return (hook,)
 
 
-def _qm9_hooks(attention: str, hops: int = 1):
+def _qm9_hooks(
+    attention: str,
+    hops: int = 1,
+    *,
+    global_vnode: bool = False,
+):
     """Deferred checkpoint-compatible reconstruction hook for a QM9 gap model."""
     from . import qm9_env
 
-    return (qm9_env.make_qm9_hook(attention=attention, hops=hops),)
+    return (
+        qm9_env.make_qm9_hook(
+            attention=attention,
+            hops=hops,
+            global_vnode=global_vnode,
+        ),
+    )
 
 
 # Parameter-matched 1-hop GRIT+RRWP on ZINC-subset (sparse control; same scalar regression).
@@ -231,6 +242,28 @@ register(GritTaskSpec(
     metric_abort=0.5,
     env_hooks=_qm9_hooks(attention="khop", hops=1),
     grit_repo_dir="/content/GRIT_qm9_gap_1hop",
+    node_content_desc="atomic number",
+))
+
+
+register(GritTaskSpec(
+    name="qm9_gap_1hop_vnode",
+    title="GRIT+RRWP QM9 HOMO-LUMO gap (1-hop masked + global VNode)",
+    config_path="configs/GRIT/qm9-gap-GRIT-RRWP.yaml",
+    expected_params=472_833,
+    drive_dir="/content/drive/MyDrive/grit_qm9_gap_1hop_vnode",
+    dataset_dir="/content/drive/MyDrive/grit_qm9_gap_data",
+    paper_metric=None,
+    metric_name="MAE (eV)",
+    metric_fn=staticmethod(metrics.mae_metric),
+    metric_higher_better=False,
+    metric_abort=0.5,
+    env_hooks=_qm9_hooks(
+        attention="khop",
+        hops=1,
+        global_vnode=True,
+    ),
+    grit_repo_dir="/content/GRIT_qm9_gap_1hop_vnode",
     node_content_desc="atomic number",
 ))
 

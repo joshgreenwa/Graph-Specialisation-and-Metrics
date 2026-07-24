@@ -209,6 +209,37 @@ def test_integrated_carriage_defaults_use_bounded_rare_cap_policy() -> None:
         BETA.BetaConfig(integrated_max_unconverged_fraction=1.1).validate()
 
 
+def test_colab_resume_config_preserves_prior_cache_fingerprint(tmp_path) -> None:
+    saved = BETA.BetaConfig(
+        output_dir=str(tmp_path),
+        score_graphs=128,
+        score_sources=10,
+        causal_graphs=64,
+        ablation_graphs=160,
+        bootstrap_samples=2000,
+        conditional_bootstrap_samples=2000,
+    )
+    BETA.write_json(
+        tmp_path / "beta_config.json",
+        {
+            "version": BETA.BETA_VERSION,
+            "schema": BETA.BETA_SCHEMA,
+            "fingerprint": saved.fingerprint,
+            "config": BETA.asdict(saved),
+        },
+    )
+    args = BETA.parse_args([
+        "--phase", "all",
+        "--output-dir", str(tmp_path),
+        "--resume-config",
+    ])
+    resumed = BETA.resume_saved_config(args)
+    assert not resumed.force
+    assert resumed.score_graphs == 128
+    assert resumed.bootstrap_samples == 2000
+    assert BETA.make_config(resumed).fingerprint == saved.fingerprint
+
+
 def test_integrated_carriage_audit_aggregates_cached_source_groups() -> None:
     diagnostics = [
         {
@@ -723,6 +754,10 @@ def _fake_causal_payload(offset: float = 0.0):
         "family_definitions": {
             "semantic_specialist": [(0, 0)],
             "pe_specialist": [(1, 0)],
+            "semantic_D_extreme": [(0, 0), (0, 1)],
+            "pe_D_extreme": [(1, 0), (1, 1)],
+            "semantic_D_J_matched": [(1, 1)],
+            "pe_D_J_matched": [(0, 1)],
             "structural_pe_specific": [(1, 0)],
             "structural_topology_specific": [(0, 1)],
             "structural_shared": [(1, 1)],
@@ -756,6 +791,10 @@ def _fake_ablations(score, causal):
         families = {
             "semantic_specialist": [(0, 0)],
             "pe_specialist": [(1, 0)],
+            "semantic_D_extreme": [(0, 0), (0, 1)],
+            "pe_D_extreme": [(1, 0), (1, 1)],
+            "semantic_D_J_matched": [(1, 1)],
+            "pe_D_J_matched": [(0, 1)],
             "high_J": [(0, 1)],
             "high_G_balanced": [(1, 1)],
             "topology_responsive": [(0, 1)],
@@ -841,6 +880,58 @@ def _fake_attention():
             "minimum_weight": np.zeros(2),
         })
     return {"records": records}
+
+
+def _fake_head_gallery(score, causal):
+    selected = BETA.select_causal_head_gallery_heads(
+        score, causal, heads_per_family=1
+    )
+    heads = []
+    graph_ids = set()
+    for family_rows in selected.values():
+        for row in family_rows:
+            head = (int(row["layer"]), int(row["head"]))
+            row["examples"] = BETA.rank_small_head_gallery_examples(
+                score, head, row["channel"], max_nodes=8, examples=2
+            )
+            heads.append(head)
+            graph_ids.update(example["graph_id"] for example in row["examples"])
+    molecules = []
+    for graph_id in sorted(graph_ids):
+        record = next(
+            item for item in score["records"]
+            if int(item["graph_id"]) == int(graph_id)
+        )
+        n = int(record["n"])
+        positions = np.column_stack([
+            np.arange(n, dtype=float),
+            np.zeros(n, dtype=float),
+        ])
+        maps = {}
+        for layer, head in heads:
+            matrix = np.eye(n, dtype=float) * 0.4
+            for node in range(n - 1):
+                matrix[node + 1, node] = 0.6
+            maps[(layer, head)] = matrix
+        molecules.append({
+            "graph_id": int(graph_id),
+            "n": n,
+            "atom_types": np.arange(n, dtype=int),
+            "bonds": np.asarray(record["plan"]["descriptor"]["edges"], dtype=int),
+            "bond_types": np.ones(n - 1, dtype=int),
+            "pos": positions,
+            "maps": maps,
+        })
+    return {
+        "head_gallery_protocol_version": BETA.HEAD_GALLERY_PROTOCOL_VERSION,
+        "selections": selected,
+        "attention": {
+            "molecules": molecules,
+            "heads": heads,
+            "has_vnode": False,
+            "atom_encoding": "category",
+        },
+    }
 
 
 def test_conditional_screen_aligns_condition_and_intervention_units() -> None:
@@ -936,6 +1027,7 @@ def test_all_paper_outputs_render_from_schema_complete_smoke_payload(tmp_path) -
             "causal": causal,
             "ablations": _fake_ablations(score, causal),
             "mechanism": _fake_mechanism(),
+            "head_gallery": _fake_head_gallery(score, causal),
         }
     cfg = BETA.BetaConfig(
         output_dir=str(tmp_path),
@@ -948,8 +1040,9 @@ def test_all_paper_outputs_render_from_schema_complete_smoke_payload(tmp_path) -
     )
     summary = BETA.create_outputs(runs, cfg)
     assert summary["selected_aggregation"] == "EG"
-    assert len(summary["figures"]) == 46
+    assert len(summary["figures"]) == 54
     assert all(Path(path).exists() for path in summary["figures"])
+    assert (tmp_path / "tables/causal_head_gallery_selection.csv").exists()
     assert (tmp_path / "tables/methodology_decisions.json").exists()
     assert (tmp_path / "tables/distance_resolved_specialisation.csv").exists()
     assert (tmp_path / "tables/clean_attention_distance_profiles.csv").exists()

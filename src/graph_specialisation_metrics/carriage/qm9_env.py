@@ -34,7 +34,12 @@ def _import_qm9_patch():
     return apply_qm9_patch, verify_qm9_model_patch
 
 
-def make_qm9_hook(attention: str, hops: int = 1) -> Callable[[Path], None]:
+def make_qm9_hook(
+    attention: str,
+    hops: int = 1,
+    *,
+    global_vnode: bool = False,
+) -> Callable[[Path], None]:
     """Return a hook reconstructing either dense or exact ``<=k``-hop QM9 GRIT."""
     if attention not in {"dense", "khop"}:
         raise ValueError(f"attention must be 'dense' or 'khop', got {attention!r}")
@@ -46,7 +51,7 @@ def make_qm9_hook(attention: str, hops: int = 1) -> Callable[[Path], None]:
         args = argparse.Namespace(
             attention=str(attention),
             hops=int(hops),
-            global_vnode=False,
+            global_vnode=bool(global_vnode),
             batch_size=128,
             epochs=300,
             warmup_epochs=10,
@@ -58,6 +63,8 @@ def make_qm9_hook(attention: str, hops: int = 1) -> Callable[[Path], None]:
         apply_qm9_patch(Path(repo_dir), Path(repo_dir), args)
         verify_qm9_model_patch(Path(repo_dir))
         variant = "dense" if attention == "dense" else f"{int(hops)}-hop"
+        if global_vnode:
+            variant += "+VNode"
         log(
             f"[qm9] applied checkpoint-compatible QM9-gap {variant} patch "
             "(target=column 4 eV; split=110000/10000/remainder, seed=42)."
