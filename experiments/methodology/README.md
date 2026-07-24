@@ -3,6 +3,13 @@
 This directory contains config and Slurm entry points for the dissertation core
 procedure and the method-validation suite.
 
+The implementation specification for the final dense-model scoring comparison is
+[SCORING_METRIC_REFINEMENT_TASK.md](SCORING_METRIC_REFINEMENT_TASK.md).
+Its standalone ZINC/QM9 frontend is
+[colab_scoring_metric_refinement_dense.py](colab_scoring_metric_refinement_dense.py);
+the reusable implementation and estimands are documented in
+[`scoring_refinement/README.md`](../../src/graph_specialisation_metrics/scoring_refinement/README.md).
+
 ## Local smoke runs
 
 ```bash

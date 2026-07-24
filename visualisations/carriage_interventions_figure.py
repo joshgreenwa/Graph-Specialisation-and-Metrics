@@ -1,16 +1,13 @@
-"""Draw a paper-style schematic of the carriage interventions.
+"""Draw a compact paper schematic of the two carriage interventions.
 
-The figure separates the two intervention families implemented in
-``graph_specialisation_metrics.carriage``:
+Both branches begin from the same clean graph:
 
-* semantic carriage: replace one node content row with a donor row from another
-  graph, while structure-derived tensors stay fixed;
-* structural carriage: hold content fixed and transpose topology-derived
-  structure between an anchor ``u`` and a degree-matched partner ``v``.
+* donor replacement inserts an external donor at a chosen target ``j``;
+* node transposition exchanges two selected nodes ``u`` and ``v``.
 
-The right side is deliberately left at the intervention stage. A later version
-can extend the same rows into ``Delta h_i = h_i(clean) - h_i(intervention)``,
-``F_sens``, and ``B`` panels.
+The drawing is intentionally concerned with the intervention mechanics only.
+Downstream transport deltas and carriage summaries can be appended to the two
+output lanes in a later figure revision.
 """
 
 from __future__ import annotations
@@ -29,23 +26,28 @@ import matplotlib
 matplotlib.use("Agg")
 
 import matplotlib.pyplot as plt
-from matplotlib.patches import Circle, FancyArrowPatch, FancyBboxPatch, Rectangle
+from matplotlib.patches import Circle, FancyArrowPatch, FancyBboxPatch
 
+
+INK = "#17212b"
+MUTED = "#617181"
+EDGE = "#34414d"
+PANEL_EDGE = "#d3dde5"
+PANEL_FILL = "#f8fafc"
+DONOR = "#df5b52"
+DONOR_DARK = "#ad3f38"
+SWAP = "#357b6c"
+SWAP_DARK = "#286254"
 
 CONTENT_COLORS = {
-    0: "#87b7e5",
-    1: "#f2a35e",
-    2: "#7bc9a5",
-    3: "#e98b96",
-    4: "#caa3e8",
-    5: "#f0d76f",
-    6: "#9cc7cf",
-    "donor": "#e45b4f",
-}
-STRUCT_COLORS = {
-    "u": "#59b18b",
-    "v": "#7c61c6",
-    "j": "#476a9e",
+    0: "#78aee0",
+    1: "#f0a05a",
+    2: "#73c59d",
+    3: "#e68191",
+    4: "#bc8ddd",
+    5: "#f1d365",
+    6: "#8fc4ca",
+    "donor": DONOR,
 }
 
 NODES = tuple(range(7))
@@ -70,62 +72,33 @@ POS = {
     6: (2.88, 1.08),
 }
 
-SOURCE_J = 2
-ANCHOR_U = 1
-PARTNER_V = 4
+# The three intervention sites are deliberately well separated in the graph.
+TARGET_J = 6
+ANCHOR_U = 0
+PARTNER_V = 5
 
 
-def add_panel(
+def rounded_panel(
     ax: plt.Axes,
     x: float,
     y: float,
     w: float,
     h: float,
     *,
-    title: str,
-    subtitle: str | None = None,
-    face: str = "#f7f9fb",
-    edge: str = "#c6d2dc",
+    edge: str = PANEL_EDGE,
+    face: str = PANEL_FILL,
+    linewidth: float = 1.0,
 ) -> None:
     ax.add_patch(
         FancyBboxPatch(
             (x, y),
             w,
             h,
-            boxstyle="round,pad=0.045,rounding_size=0.16",
+            boxstyle="round,pad=0.035,rounding_size=0.16",
             facecolor=face,
             edgecolor=edge,
-            linewidth=1.0,
+            linewidth=linewidth,
             zorder=0,
-        )
-    )
-    ax.text(x + 0.18, y + h - 0.20, title, ha="left", va="top", fontsize=9.8, weight=500)
-    if subtitle:
-        ax.text(x + 0.18, y + h - 0.44, subtitle, ha="left", va="top", fontsize=7.8, color="#3f4e5a")
-
-
-def draw_arrow(
-    ax: plt.Axes,
-    start: tuple[float, float],
-    end: tuple[float, float],
-    *,
-    color: str = "#263744",
-    rad: float = 0.0,
-    lw: float = 1.25,
-    mutation: float = 13,
-) -> None:
-    ax.add_patch(
-        FancyArrowPatch(
-            start,
-            end,
-            arrowstyle="-|>",
-            mutation_scale=mutation,
-            linewidth=lw,
-            color=color,
-            connectionstyle=f"arc3,rad={rad}",
-            shrinkA=0,
-            shrinkB=4,
-            zorder=8,
         )
     )
 
@@ -139,277 +112,297 @@ def draw_graph(
     ax: plt.Axes,
     origin: tuple[float, float],
     *,
-    scale: float = 0.64,
-    content_override: dict[int, str] | None = None,
-    halos: dict[int, str] | None = None,
+    scale: float,
+    overrides: dict[int, str] | None = None,
     labels: dict[int, str] | None = None,
-    changed_nodes: set[int] | None = None,
-    structural_edges: tuple[tuple[int, int], ...] = EDGES,
-    dim_unhighlighted: bool = False,
+    emphasis: dict[int, str] | None = None,
 ) -> dict[int, tuple[float, float]]:
+    """Draw the shared graph grammar and return node centres."""
     positions = graph_positions(origin, scale)
-    halos = halos or {}
+    overrides = overrides or {}
     labels = labels or {}
-    content_override = content_override or {}
-    changed_nodes = changed_nodes or set()
+    emphasis = emphasis or {}
 
-    for a, b in structural_edges:
+    for a, b in EDGES:
         x0, y0 = positions[a]
         x1, y1 = positions[b]
-        ax.plot([x0, x1], [y0, y1], color="#20262d", lw=1.05, zorder=1, solid_capstyle="round")
+        ax.plot(
+            [x0, x1],
+            [y0, y1],
+            color=EDGE,
+            linewidth=1.15,
+            solid_capstyle="round",
+            zorder=1,
+        )
 
-    r = 0.145 * scale / 0.76
+    radius = 0.145 * scale / 0.72
     for node in NODES:
         x, y = positions[node]
-        if node in halos:
+        if node in emphasis:
             ax.add_patch(
                 Circle(
                     (x, y),
-                    r * 1.60,
-                    facecolor=halos[node],
-                    edgecolor="none",
-                    alpha=0.22,
-                    zorder=2,
-                )
-            )
-            ax.add_patch(
-                Circle(
-                    (x, y),
-                    r * 1.43,
+                    radius * 1.42,
                     facecolor="none",
-                    edgecolor=halos[node],
-                    linewidth=1.25,
-                    zorder=4,
+                    edgecolor=emphasis[node],
+                    linewidth=1.55,
+                    zorder=3,
                 )
             )
-        fill = content_override.get(node, CONTENT_COLORS[node])
-        alpha = 0.42 if dim_unhighlighted and node not in changed_nodes and node not in halos else 1.0
         ax.add_patch(
             Circle(
                 (x, y),
-                r,
-                facecolor=fill,
-                edgecolor="#111111",
-                linewidth=0.95,
-                alpha=alpha,
-                zorder=5,
+                radius,
+                facecolor=overrides.get(node, CONTENT_COLORS[node]),
+                edgecolor=INK,
+                linewidth=1.0,
+                zorder=4,
             )
         )
-        if node in changed_nodes:
-            ax.add_patch(
-                Circle((x, y), r * 1.25, facecolor="none", edgecolor="#111111", linewidth=1.15, zorder=6)
-            )
         if node in labels:
-            ax.text(x, y, labels[node], ha="center", va="center", fontsize=8.5, color="#101418", zorder=7)
+            ax.text(
+                x,
+                y - 0.003,
+                labels[node],
+                ha="center",
+                va="center",
+                fontsize=9.2,
+                fontstyle="italic",
+                color=INK,
+                zorder=5,
+            )
     return positions
 
 
-def draw_tag(
+def arrow(
+    ax: plt.Axes,
+    start: tuple[float, float],
+    end: tuple[float, float],
+    *,
+    color: str,
+    linewidth: float = 1.35,
+    mutation: float = 13,
+    rad: float = 0.0,
+    style: str = "-|>",
+    zorder: int = 6,
+) -> None:
+    ax.add_patch(
+        FancyArrowPatch(
+            start,
+            end,
+            arrowstyle=style,
+            mutation_scale=mutation,
+            linewidth=linewidth,
+            color=color,
+            connectionstyle=f"arc3,rad={rad}",
+            shrinkA=1,
+            shrinkB=3,
+            zorder=zorder,
+        )
+    )
+
+
+def lane_label(
     ax: plt.Axes,
     x: float,
     y: float,
-    text: str,
-    *,
-    face: str,
-    edge: str,
-    text_color: str = "#1a242c",
-    width: float | None = None,
+    letter: str,
+    title: str,
+    subtitle: str,
+    color: str,
 ) -> None:
-    w = width if width is not None else 0.13 * len(text) + 0.42
-    h = 0.34
-    ax.add_patch(
-        FancyBboxPatch(
-            (x, y),
-            w,
-            h,
-            boxstyle="round,pad=0.03,rounding_size=0.09",
-            facecolor=face,
-            edgecolor=edge,
-            linewidth=0.85,
-            zorder=9,
-        )
-    )
-    ax.text(x + w / 2, y + h / 2, text, ha="center", va="center", fontsize=8.3, color=text_color, zorder=10)
+    ax.text(x, y, letter, ha="left", va="top", fontsize=11.5, weight=600, color=INK)
+    ax.text(x + 0.34, y, title, ha="left", va="top", fontsize=11.5, weight=500, color=INK)
+    ax.text(x + 0.34, y - 0.33, subtitle, ha="left", va="top", fontsize=8.5, color=MUTED)
+    ax.plot([x + 0.34, x + 0.90], [y - 0.57, y - 0.57], color=color, linewidth=2.2, solid_capstyle="round")
 
 
-def draw_semantic_operation(ax: plt.Axes, x: float, y: float) -> None:
-    add_panel(
+def draw_swap_glyph(ax: plt.Axes, centre: tuple[float, float]) -> None:
+    """A compact, unmistakable two-way exchange mark."""
+    cx, cy = centre
+    left = (cx - 0.34, cy)
+    right = (cx + 0.34, cy)
+    ax.add_patch(Circle(left, 0.15, facecolor=CONTENT_COLORS[ANCHOR_U], edgecolor=INK, linewidth=0.9, zorder=7))
+    ax.add_patch(Circle(right, 0.15, facecolor=CONTENT_COLORS[PARTNER_V], edgecolor=INK, linewidth=0.9, zorder=7))
+    ax.text(left[0], left[1], r"$u$", ha="center", va="center", fontsize=8.2, fontstyle="italic", zorder=8)
+    ax.text(right[0], right[1], r"$v$", ha="center", va="center", fontsize=8.2, fontstyle="italic", zorder=8)
+    arrow(
         ax,
-        x,
-        y,
-        2.25,
-        2.18,
-        title="Donor content swap",
-        subtitle=r"$x_j \leftarrow \tilde{x}$,  with $S$ fixed",
-        face="#fff7f5",
-        edge="#efc7bd",
+        (left[0] + 0.16, cy + 0.11),
+        (right[0] - 0.16, cy + 0.11),
+        color=SWAP_DARK,
+        linewidth=1.25,
+        mutation=10,
+        rad=-0.26,
+        zorder=8,
     )
-    donor_x = x + 0.62
-    donor_y = y + 0.88
-    ax.add_patch(Circle((donor_x, donor_y), 0.22, facecolor=CONTENT_COLORS["donor"], edgecolor="#111111", lw=1.0, zorder=4))
-    ax.text(donor_x, donor_y - 0.01, r"$\tilde{x}$", ha="center", va="center", fontsize=10.5, zorder=5)
-    ax.text(donor_x, donor_y + 0.38, "donor row", ha="center", va="bottom", fontsize=7.8, color="#4a2c27")
-    draw_arrow(ax, (donor_x + 0.32, donor_y), (x + 1.72, donor_y), color="#b54136", lw=1.2)
-    ax.text(x + 1.72, donor_y, r"$j$", ha="center", va="center", fontsize=10.5)
-    ax.add_patch(Rectangle((x + 1.54, donor_y - 0.18), 0.36, 0.36, facecolor="none", edgecolor="#b54136", lw=1.2))
-    ax.text(x + 1.13, y + 0.30, r"average over $K$ donors", ha="center", va="center", fontsize=7.8, color="#6c3932")
-
-
-def draw_structural_operation(ax: plt.Axes, x: float, y: float) -> None:
-    add_panel(
+    arrow(
         ax,
-        x,
-        y,
-        2.25,
-        2.18,
-        title="Structural transposition",
-        subtitle=r"$S' = P_{(uv)} S P_{(uv)}^\top$,  with $X$ fixed",
-        face="#f4fbf7",
-        edge="#b8dec9",
+        (right[0] - 0.16, cy - 0.11),
+        (left[0] + 0.16, cy - 0.11),
+        color=SWAP_DARK,
+        linewidth=1.25,
+        mutation=10,
+        rad=-0.26,
+        zorder=8,
     )
-    ux, uy = x + 0.66, y + 0.92
-    vx, vy = x + 1.62, y + 0.92
-    ax.add_patch(Circle((ux, uy), 0.26, facecolor=STRUCT_COLORS["u"], edgecolor="#111111", lw=1.1, alpha=0.38, zorder=3))
-    ax.add_patch(Circle((vx, vy), 0.26, facecolor=STRUCT_COLORS["v"], edgecolor="#111111", lw=1.1, alpha=0.38, zorder=3))
-    ax.text(ux, uy, r"$s_u$", ha="center", va="center", fontsize=10.5, zorder=4)
-    ax.text(vx, vy, r"$s_v$", ha="center", va="center", fontsize=10.5, zorder=4)
-    ax.add_patch(
-        FancyArrowPatch(
-            (ux + 0.30, uy + 0.10),
-            (vx - 0.30, vy + 0.10),
-            arrowstyle="<->",
-            mutation_scale=12,
-            linewidth=1.2,
-            color="#2e6b4d",
-            connectionstyle="arc3,rad=0.30",
-            zorder=5,
-        )
-    )
-    ax.text(x + 1.13, y + 0.30, r"average over $K$ degree-matched partners", ha="center", va="center", fontsize=7.3, color="#315d43")
 
 
 def make_figure() -> plt.Figure:
-    fig, ax = plt.subplots(figsize=(13.2, 6.1))
-    ax.set_xlim(0, 12.8)
-    ax.set_ylim(0, 6.0)
+    fig, ax = plt.subplots(figsize=(11.8, 5.5))
+    ax.set_xlim(0, 11.7)
+    ax.set_ylim(0, 5.5)
     ax.axis("off")
 
-    ax.text(0.30, 5.78, "A", fontsize=12.5, weight=600, ha="left", va="top")
-    ax.text(0.62, 5.78, "Semantic intervention", fontsize=12.5, weight=500, ha="left", va="top", color="#8f2e27")
-    ax.text(0.62, 5.48, "Change X only; keep S fixed.", fontsize=8.6, ha="left", va="top", color="#52606d")
-
-    ax.text(0.30, 2.78, "B", fontsize=12.5, weight=600, ha="left", va="top")
-    ax.text(0.62, 2.78, "Structural intervention", fontsize=12.5, weight=500, ha="left", va="top", color="#2f6849")
-    ax.text(0.62, 2.48, "Change S only; keep X fixed.", fontsize=8.6, ha="left", va="top", color="#52606d")
-
-    # Row A: semantic.
-    add_panel(
-        ax,
-        0.42,
-        3.22,
-        3.20,
-        2.00,
-        title="Clean graph",
-        face="#f8fafc",
-        edge="#c7d1db",
-    )
+    # Shared input graph.
+    rounded_panel(ax, 0.42, 1.23, 3.12, 3.12)
+    ax.text(0.68, 4.08, "Shared clean graph", ha="left", va="top", fontsize=10.5, weight=500, color=INK)
     draw_graph(
         ax,
-        (0.88, 3.47),
-        halos={SOURCE_J: STRUCT_COLORS["j"]},
-        labels={SOURCE_J: r"$j$"},
-        changed_nodes={SOURCE_J},
+        (0.77, 1.64),
+        scale=0.76,
+        labels={TARGET_J: r"$j$", ANCHOR_U: r"$u$", PARTNER_V: r"$v$"},
+        emphasis={TARGET_J: DONOR, ANCHOR_U: SWAP, PARTNER_V: SWAP},
     )
-    draw_tag(ax, 2.55, 3.36, "source j", face="#e8eef8", edge="#b7c6dc", width=0.78)
 
-    draw_semantic_operation(ax, 4.03, 3.22)
-
-    add_panel(
+    # Lane headings.
+    lane_label(
         ax,
-        6.75,
-        3.22,
-        3.30,
-        2.00,
-        title="Intervened graph",
-        face="#f8fafc",
-        edge="#c7d1db",
+        4.05,
+        5.26,
+        "A",
+        "Donor replacement",
+        r"replace target $j$ with a node from another graph",
+        DONOR,
     )
-    draw_graph(
+    lane_label(
         ax,
-        (7.22, 3.47),
-        content_override={SOURCE_J: CONTENT_COLORS["donor"]},
-        halos={SOURCE_J: STRUCT_COLORS["j"]},
-        labels={SOURCE_J: r"$j$"},
-        changed_nodes={SOURCE_J},
+        4.05,
+        2.54,
+        "B",
+        "Node transposition",
+        r"exchange the selected nodes $u$ and $v$",
+        SWAP,
     )
-    draw_tag(ax, 9.08, 3.36, "S fixed", face="#edf5fb", edge="#bcd0df", width=0.76)
 
-    draw_arrow(ax, (3.68, 4.20), (4.00, 4.20), color="#6e7f8c")
-    draw_arrow(ax, (6.32, 4.20), (6.72, 4.20), color="#6e7f8c")
+    # Output panels share the same geometry and alignment.
+    panel_x, panel_w, panel_h = 8.03, 3.22, 2.05
+    top_y, bottom_y = 3.10, 0.30
+    rounded_panel(ax, panel_x, top_y, panel_w, panel_h, edge="#e4c5c0", face="#fffafa")
+    rounded_panel(ax, panel_x, bottom_y, panel_w, panel_h, edge="#c7ddd6", face="#f8fcfa")
+    ax.text(panel_x + 0.23, top_y + panel_h - 0.20, "After replacement", ha="left", va="top", fontsize=9.6, weight=500, color=INK)
+    ax.text(panel_x + 0.23, bottom_y + panel_h - 0.20, "After transposition", ha="left", va="top", fontsize=9.6, weight=500, color=INK)
 
-    # Row B: structural.
-    add_panel(
+    out_scale = 0.63
+    top_pos = draw_graph(
         ax,
-        0.42,
-        0.35,
-        3.20,
-        2.00,
-        title="Clean graph",
-        face="#f8fafc",
-        edge="#c7d1db",
+        (panel_x + 0.39, top_y + 0.35),
+        scale=out_scale,
+        overrides={TARGET_J: CONTENT_COLORS["donor"]},
+        labels={TARGET_J: r"$j$"},
+        emphasis={TARGET_J: DONOR},
     )
-    draw_graph(
+    bottom_pos = draw_graph(
         ax,
-        (0.88, 0.60),
-        halos={ANCHOR_U: STRUCT_COLORS["u"], PARTNER_V: STRUCT_COLORS["v"]},
+        (panel_x + 0.39, bottom_y + 0.35),
+        scale=out_scale,
+        overrides={
+            ANCHOR_U: CONTENT_COLORS[PARTNER_V],
+            PARTNER_V: CONTENT_COLORS[ANCHOR_U],
+        },
         labels={ANCHOR_U: r"$u$", PARTNER_V: r"$v$"},
-        changed_nodes={ANCHOR_U, PARTNER_V},
+        emphasis={ANCHOR_U: SWAP, PARTNER_V: SWAP},
     )
-    draw_tag(ax, 2.42, 0.47, "roles u, v", face="#edf7f1", edge="#bdd8c8", width=0.90)
 
-    draw_structural_operation(ax, 4.03, 0.35)
+    # The common input splits orthogonally so process lines never cross labels.
+    split_x = 3.88
+    clean_y = 2.78
+    top_lane_y = 3.64
+    bottom_lane_y = 1.08
+    ax.plot(
+        [3.56, split_x, split_x],
+        [clean_y, clean_y, top_lane_y],
+        color="#8a98a5",
+        linewidth=1.15,
+        solid_capstyle="round",
+        zorder=2,
+    )
+    ax.plot(
+        [split_x, split_x],
+        [clean_y, bottom_lane_y],
+        color="#8a98a5",
+        linewidth=1.15,
+        solid_capstyle="round",
+        zorder=2,
+    )
+    arrow(ax, (split_x, top_lane_y), (5.13, top_lane_y), color="#8a98a5", linewidth=1.15, mutation=12)
+    arrow(ax, (split_x, bottom_lane_y), (5.02, bottom_lane_y), color="#8a98a5", linewidth=1.15, mutation=12)
 
-    add_panel(
+    # Each operation is encoded directly on its branch.
+    target_icon = (5.75, top_lane_y)
+    ax.add_patch(
+        Circle(
+            target_icon,
+            0.18,
+            facecolor=CONTENT_COLORS[TARGET_J],
+            edgecolor=INK,
+            linewidth=1.0,
+            zorder=7,
+        )
+    )
+    ax.text(*target_icon, r"$j$", ha="center", va="center", fontsize=8.8, fontstyle="italic", color=INK, zorder=8)
+    donor_icon = (5.56, 4.18)
+    ax.add_patch(
+        Circle(
+            donor_icon,
+            0.19,
+            facecolor=CONTENT_COLORS["donor"],
+            edgecolor=INK,
+            linewidth=1.0,
+            zorder=8,
+        )
+    )
+    ax.text(*donor_icon, r"$\tilde{x}$", ha="center", va="center", fontsize=9.2, color=INK, zorder=9)
+    ax.text(donor_icon[0], donor_icon[1] + 0.27, "external donor", ha="center", va="bottom", fontsize=7.9, color=MUTED)
+    arrow(
         ax,
-        6.75,
-        0.35,
-        3.30,
-        2.00,
-        title="Intervened graph",
-        face="#f8fafc",
-        edge="#c7d1db",
+        (donor_icon[0] + 0.05, donor_icon[1] - 0.20),
+        (target_icon[0] - 0.04, target_icon[1] + 0.20),
+        color=DONOR_DARK,
+        linewidth=1.55,
+        mutation=12,
+        rad=0.02,
+        zorder=9,
     )
-    draw_graph(
+    arrow(
         ax,
-        (7.22, 0.60),
-        halos={ANCHOR_U: STRUCT_COLORS["v"], PARTNER_V: STRUCT_COLORS["u"]},
-        labels={ANCHOR_U: r"$u$", PARTNER_V: r"$v$"},
-        changed_nodes={ANCHOR_U, PARTNER_V},
+        (target_icon[0] + 0.23, top_lane_y),
+        (panel_x - 0.08, top_lane_y),
+        color=DONOR_DARK,
+        linewidth=1.45,
+        mutation=13,
     )
-    draw_tag(ax, 9.08, 0.47, "X fixed", face="#f7f1ff", edge="#cabbe0", width=0.76)
 
-    draw_arrow(ax, (3.68, 1.33), (4.00, 1.33), color="#6e7f8c")
-    draw_arrow(ax, (6.32, 1.33), (6.72, 1.33), color="#6e7f8c")
+    draw_swap_glyph(ax, centre=(5.75, bottom_lane_y))
+    arrow(
+        ax,
+        (6.25, bottom_lane_y),
+        (panel_x - 0.08, bottom_lane_y),
+        color=SWAP_DARK,
+        linewidth=1.45,
+        mutation=13,
+    )
 
-    # Legend.
-    lx, ly = 10.58, 4.80
-    ax.text(lx, ly, "Visual key", ha="left", va="center", fontsize=10.8, weight=500)
-    ax.add_patch(Circle((lx + 0.16, ly - 0.48), 0.10, facecolor=CONTENT_COLORS[1], edgecolor="#111111", lw=1.0))
-    ax.text(lx + 0.38, ly - 0.48, r"inner fill: content row $x_i$", ha="left", va="center", fontsize=8.6, color="#35424d")
-    ax.add_patch(Circle((lx + 0.16, ly - 0.92), 0.16, facecolor=STRUCT_COLORS["u"], edgecolor="none", alpha=0.22))
-    ax.add_patch(Circle((lx + 0.16, ly - 0.92), 0.14, facecolor="none", edgecolor=STRUCT_COLORS["u"], lw=1.3))
-    ax.text(lx + 0.38, ly - 0.92, r"halo: structural role / support $s_i$", ha="left", va="center", fontsize=8.6, color="#35424d")
-
+    # Small endpoint cues reinforce that only the selected site(s) change.
+    swap_mid_x = (bottom_pos[ANCHOR_U][0] + bottom_pos[PARTNER_V][0]) / 2
     ax.text(
-        10.55,
-        2.12,
-        "Both rows then feed the\nsame carriage estimator:\n"
-        r"$\Delta h_i = h_i^L(\mathrm{clean}) - h_i^L(\mathrm{intervention})$",
-        ha="left",
-        va="top",
-        fontsize=9.0,
-        color="#3f4e5a",
-        linespacing=1.35,
+        swap_mid_x,
+        bottom_y + 0.17,
+        r"$u \leftrightarrow v$",
+        ha="center",
+        va="bottom",
+        fontsize=8.0,
+        color=SWAP_DARK,
     )
 
     return fig
