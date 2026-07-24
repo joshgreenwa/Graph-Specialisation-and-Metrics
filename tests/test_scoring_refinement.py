@@ -448,3 +448,141 @@ def test_required_figure_atlas_renders_from_cache_only_tables(tmp_path):
     for paths in figures.values():
         assert {Path(path).suffix for path in paths} == {".png", ".pdf"}
         assert all(Path(path).exists() for path in paths)
+
+
+def test_cached_numpy_payload_continues_through_validation_and_csv(tmp_path):
+    from graph_specialisation_metrics.scoring_refinement.cache import read_csv, write_csv
+    from graph_specialisation_metrics.scoring_refinement.scores import (
+        build_score_tables,
+        graph_balanced_mean,
+    )
+    from graph_specialisation_metrics.scoring_refinement.validation import (
+        build_m1_arm_agreement,
+        build_variant_agreement,
+        compare_methods,
+    )
+
+    graph_count, layers, heads = 5, 2, 3
+    graph_offset = np.arange(graph_count, dtype=float)[:, None, None] * 0.01
+    head_pattern = np.arange(layers * heads, dtype=float).reshape(1, layers, heads)
+
+    def cached(base, scale):
+        return base + scale * head_pattern + graph_offset
+
+    per_graph = {
+        "eg_semantic_single": cached(1.0, 0.08),
+        "eg_semantic_transposition": cached(1.15, 0.10),
+        "eg_pe_single": cached(0.9, 0.07),
+        "eg_pe_transposition": cached(1.1, 0.09),
+        "semantic_transport_follow": cached(0.55, 0.015),
+        "semantic_transport_invariant": cached(0.35, 0.010),
+        "pe_transport_follow": cached(0.50, 0.012),
+        "pe_transport_invariant": cached(0.40, 0.008),
+        "semantic_attention_follow": cached(0.60, 0.010),
+        "semantic_attention_invariant": cached(0.30, 0.012),
+        "pe_attention_follow": cached(0.58, 0.009),
+        "pe_attention_invariant": cached(0.32, 0.011),
+        "topology_eg": cached(0.75, 0.06),
+        "clean_throughput": cached(1.4, 0.05),
+    }
+    assert all(value.shape == (graph_count, layers, heads) for value in per_graph.values())
+
+    score = {key: graph_balanced_mean(value) for key, value in per_graph.items()}
+    raw, derived, _ = build_score_tables(
+        "cached-task",
+        "checkpoint-sha",
+        score,
+        graph_count=graph_count,
+        event_count=4,
+    )
+    agreement = build_variant_agreement(
+        score,
+        per_graph,
+        top_k=(2,),
+        bootstrap_samples=10,
+        seed=17,
+    )
+    agreement.extend(build_m1_arm_agreement(derived, top_k=(2,)))
+
+    ablation = [
+        {
+            "layer": layer,
+            "head": head,
+            "prediction_movement": float(1 + 2 * layer + head),
+        }
+        for layer in range(layers)
+        for head in range(heads)
+    ]
+    differential = np.asarray([[0.5, 0.2, -0.1], [0.4, -0.2, -0.6]])
+    total = np.asarray([[0.2, 0.3, 0.5], [0.4, 0.6, 0.8]])
+    throughput = score["clean_throughput"].copy()
+    throughput[0, 0] = np.nan
+    ablation_validation, causal_validation, ranking = compare_methods(
+        derived,
+        ablation,
+        {"differential": differential, "total": total},
+        throughput,
+        top_k=(2,),
+        seed=23,
+    )
+
+    assert len(raw) == len(derived) == 9 * layers * heads
+    assert len(agreement) == 8
+    assert len(ablation_validation) == len(causal_validation) == len(ranking) == 9
+    assert {row["significance_rank"] for row in ranking} == set(range(1, 10))
+
+    for name, rows in (
+        ("raw", raw),
+        ("derived", derived),
+        ("agreement", agreement),
+        ("ablation_validation", ablation_validation),
+        ("causal_validation", causal_validation),
+        ("ranking", ranking),
+    ):
+        path = tmp_path / f"{name}.csv"
+        write_csv(path, rows)
+        assert len(read_csv(path)) == len(rows)
+
+
+def test_subset_method_figures_and_m1_agreement_are_graceful(tmp_path):
+    pytest.importorskip("matplotlib")
+    from graph_specialisation_metrics.scoring_refinement.figures import make_all_figures
+    from graph_specialisation_metrics.scoring_refinement.scores import build_score_tables
+    from graph_specialisation_metrics.scoring_refinement.validation import (
+        build_m1_arm_agreement,
+    )
+
+    shape = (2, 2)
+    score = {
+        "eg_semantic_single": np.full(shape, 1.0),
+        "eg_semantic_transposition": np.full(shape, 1.2),
+        "eg_pe_single": np.full(shape, 0.9),
+        "eg_pe_transposition": np.full(shape, 1.1),
+        "semantic_transport_follow": np.asarray([[0.5, 0.6], [0.7, 0.8]]),
+        "semantic_transport_invariant": np.asarray([[0.4, 0.3], [0.2, 0.1]]),
+        "pe_transport_follow": np.full(shape, 0.6),
+        "pe_transport_invariant": np.full(shape, 0.4),
+        "semantic_attention_follow": np.full(shape, 0.6),
+        "semantic_attention_invariant": np.full(shape, 0.4),
+        "pe_attention_follow": np.full(shape, 0.6),
+        "pe_attention_invariant": np.full(shape, 0.4),
+        "topology_eg": np.full(shape, 0.7),
+    }
+    raw, derived, _ = build_score_tables(
+        "task",
+        "sha",
+        score,
+        graph_count=4,
+        event_count=2,
+        methods=("M2",),
+    )
+    assert build_m1_arm_agreement(derived, top_k=(2,)) == []
+    figures = make_all_figures(raw, derived, out_dir=tmp_path)
+    assert set(figures) == {
+        "raw_score_atlas",
+        "m1_intervention_factorial",
+        "donor_vs_transposition",
+        "derived_DJ_atlas",
+        "topology_companions",
+    }
+    assert all(Path(path).exists() for paths in figures.values() for path in paths)

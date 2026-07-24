@@ -49,8 +49,17 @@ def _within_layer_spearman(left: np.ndarray, right: np.ndarray) -> float:
 
 
 def _topk_overlap(left: np.ndarray, right: np.ndarray, k: int) -> float:
-    left_flat = np.asarray(left).reshape(-1)
-    right_flat = np.asarray(right).reshape(-1)
+    left_flat = np.asarray(left, dtype=float).reshape(-1)
+    right_flat = np.asarray(right, dtype=float).reshape(-1)
+    if left_flat.shape != right_flat.shape:
+        raise ValueError(
+            f"top-k arrays must align, got {left_flat.shape} and {right_flat.shape}"
+        )
+    valid = np.isfinite(left_flat) & np.isfinite(right_flat)
+    left_flat = left_flat[valid]
+    right_flat = right_flat[valid]
+    if not len(left_flat):
+        return float("nan")
     count = min(int(k), len(left_flat))
     a = set(np.argsort(left_flat)[-count:].tolist())
     b = set(np.argsort(right_flat)[-count:].tolist())
@@ -106,6 +115,10 @@ def _bootstrap_topk_overlap(
                 int(k),
             )
         )
+    values = np.asarray(values, dtype=float)
+    values = values[np.isfinite(values)]
+    if not len(values):
+        return float("nan"), float("nan"), float("nan")
     low, high = np.quantile(values, [0.025, 0.975])
     return float(np.mean(values)), float(low), float(high)
 
@@ -181,7 +194,9 @@ def build_m1_arm_agreement(
 ) -> list[dict[str, Any]]:
     """Pairwise D/J rank agreement across the four M1 intervention arms."""
 
-    arms = ("M1_DD", "M1_DT", "M1_TD", "M1_TT")
+    arm_order = ("M1_DD", "M1_DT", "M1_TD", "M1_TT")
+    present = {str(row["method"]) for row in derived_rows}
+    arms = tuple(arm for arm in arm_order if arm in present)
     values: dict[str, dict[str, np.ndarray]] = {}
     for arm in arms:
         rows = [row for row in derived_rows if str(row["method"]) == arm]
@@ -533,14 +548,30 @@ def _partial_spearman_layer(
 ) -> float:
     from scipy.stats import rankdata
 
-    y = rankdata(np.asarray(right).reshape(-1))
-    x = rankdata(np.asarray(left).reshape(-1))
-    layer = np.repeat(np.arange(left.shape[0]), left.shape[1])
-    activity = rankdata(np.asarray(throughput).reshape(-1))
+    left = np.asarray(left, dtype=float)
+    right = np.asarray(right, dtype=float)
+    throughput = np.asarray(throughput, dtype=float)
+    if left.shape != right.shape or left.shape != throughput.shape:
+        raise ValueError(
+            "partial-correlation arrays must share a [layer, head] shape; "
+            f"got {left.shape}, {right.shape}, and {throughput.shape}"
+        )
+    layer_count = int(left.shape[0])
+    layer = np.repeat(np.arange(layer_count), left.shape[1])
+    left = left.reshape(-1)
+    right = right.reshape(-1)
+    throughput = throughput.reshape(-1)
+    valid = np.isfinite(left) & np.isfinite(right) & np.isfinite(throughput)
+    if int(valid.sum()) < 3:
+        return float("nan")
+    layer = layer[valid]
+    x = rankdata(left[valid])
+    y = rankdata(right[valid])
+    activity = rankdata(throughput[valid])
     design = np.column_stack(
         [
             np.ones(len(layer)),
-            *[(layer == value).astype(float) for value in range(1, left.shape[0])],
+            *[(layer == value).astype(float) for value in range(1, layer_count)],
             activity,
         ]
     )

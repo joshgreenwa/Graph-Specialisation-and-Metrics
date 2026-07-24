@@ -682,6 +682,13 @@ def _release_model(gm: Any) -> None:
 
 
 def _cross_task_ranking(cfg: RefinementConfig) -> list[dict[str, Any]]:
+    def finite_summary(values: np.ndarray) -> tuple[float, float]:
+        finite = np.asarray(values, dtype=float)
+        finite = finite[np.isfinite(finite)]
+        if not len(finite):
+            return float("nan"), float("nan")
+        return float(np.mean(finite)), float(np.max(finite) - np.min(finite))
+
     by_method: dict[str, list[dict[str, Any]]] = {}
     for task in cfg.tasks:
         for row in read_csv(cfg.root / task / "tables" / "method_ranking.csv"):
@@ -698,20 +705,20 @@ def _cross_task_ranking(cfg: RefinementConfig) -> list[dict[str, Any]]:
     for method, rows in sorted(by_method.items()):
         significance = np.asarray([row["significance_score"] for row in rows], dtype=float)
         role = np.asarray([row["role_score"] for row in rows], dtype=float)
+        mean_significance, significance_range = finite_summary(significance)
+        mean_role, role_range = finite_summary(role)
         output.append(
             {
                 "method": method,
                 "tasks": len(rows),
-                "mean_significance_score": float(np.nanmean(significance)),
-                "mean_role_score": float(np.nanmean(role)),
+                "mean_significance_score": mean_significance,
+                "mean_role_score": mean_role,
                 "mean_significance_rank": float(
                     np.mean([row["significance_rank"] for row in rows])
                 ),
                 "mean_role_rank": float(np.mean([row["role_rank"] for row in rows])),
-                "significance_score_range": float(
-                    np.nanmax(significance) - np.nanmin(significance)
-                ),
-                "role_score_range": float(np.nanmax(role) - np.nanmin(role)),
+                "significance_score_range": significance_range,
+                "role_score_range": role_range,
             }
         )
     return output

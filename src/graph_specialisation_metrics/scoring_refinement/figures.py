@@ -87,7 +87,14 @@ def _method_arrays(
 def _spearman(left: np.ndarray, right: np.ndarray) -> float:
     from scipy.stats import spearmanr
 
-    if len(left) < 3 or np.std(left) == 0 or np.std(right) == 0:
+    left = np.asarray(left, dtype=float).reshape(-1)
+    right = np.asarray(right, dtype=float).reshape(-1)
+    valid = np.isfinite(left) & np.isfinite(right)
+    if int(valid.sum()) < 3:
+        return float("nan")
+    left = left[valid]
+    right = right[valid]
+    if np.std(left) == 0 or np.std(right) == 0:
         return float("nan")
     return float(spearmanr(left, right).statistic)
 
@@ -115,7 +122,32 @@ def _scatter(
     xlabel: str,
     ylabel: str,
     diagonal: bool,
-) -> None:
+) -> Any | None:
+    left = np.asarray(left, dtype=float).reshape(-1)
+    right = np.asarray(right, dtype=float).reshape(-1)
+    layers = np.asarray(layers).reshape(-1)
+    if not (len(left) == len(right) == len(layers)):
+        raise ValueError(
+            f"scatter inputs must align, got {len(left)}, {len(right)}, {len(layers)}"
+        )
+    valid = np.isfinite(left) & np.isfinite(right) & np.isfinite(layers)
+    left = left[valid]
+    right = right[valid]
+    layers = layers[valid]
+    if not len(left):
+        ax.set_title(title)
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel(ylabel)
+        ax.text(
+            0.5,
+            0.5,
+            "No paired finite scores",
+            ha="center",
+            va="center",
+            transform=ax.transAxes,
+            color="0.45",
+        )
+        return None
     scatter = ax.scatter(
         left, right, c=layers, cmap="viridis", s=28, alpha=0.85, edgecolor="none"
     )
@@ -132,15 +164,49 @@ def _scatter(
     return scatter
 
 
+def _available_methods(rows: Sequence[Mapping[str, Any]]) -> list[str]:
+    present = {str(row["method"]) for row in rows}
+    return [method for method in METHOD_ORDER if method in present]
+
+
+def _disable_unused(axes: Sequence[Any], used: int) -> None:
+    for ax in list(axes)[used:]:
+        ax.axis("off")
+
+
+def _paired_method_values(
+    rows: Sequence[Mapping[str, Any]],
+    left_method: str,
+    right_method: str,
+    field: str,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def indexed(method: str) -> dict[tuple[int, int], float]:
+        return {
+            (int(row["layer"]), int(row["head"])): float(row[field])
+            for row in rows
+            if str(row["method"]) == method
+        }
+
+    left = indexed(left_method)
+    right = indexed(right_method)
+    keys = sorted(set(left) & set(right))
+    return (
+        np.asarray([left[key] for key in keys], dtype=float),
+        np.asarray([right[key] for key in keys], dtype=float),
+        np.asarray([key[0] for key in keys], dtype=int),
+    )
+
+
 def raw_score_atlas(rows: Sequence[Mapping[str, Any]], out: Path) -> list[str]:
     plt = _pyplot()
     fig, axes = plt.subplots(3, 3, figsize=(13.5, 12.0), constrained_layout=True)
     scatter = None
-    for ax, method in zip(axes.flat, METHOD_ORDER):
+    methods = _available_methods(rows)
+    for ax, method in zip(axes.flat, methods):
         semantic, pe, layer = _method_arrays(
             rows, method, "semantic_score", "pe_score"
         )
-        scatter = _scatter(
+        current = _scatter(
             ax,
             semantic,
             pe,
@@ -150,6 +216,9 @@ def raw_score_atlas(rows: Sequence[Mapping[str, Any]], out: Path) -> list[str]:
             ylabel=RAW_AXIS_LABELS[method][1],
             diagonal=method in {"M2", "M3", "M4", "M5"},
         )
+        if current is not None:
+            scatter = current
+    _disable_unused(axes.flat, len(methods))
     if scatter is not None:
         fig.colorbar(scatter, ax=axes, label="Layer", shrink=0.65)
     paths = _save(fig, out / "raw_score_atlas")
@@ -161,22 +230,27 @@ def m1_factorial(rows: Sequence[Mapping[str, Any]], out: Path) -> list[str]:
     plt = _pyplot()
     fig, axes = plt.subplots(2, 2, figsize=(9.5, 8.5), constrained_layout=True)
     scatter = None
-    for ax, method in zip(axes.flat, METHOD_ORDER[:4]):
+    methods = [
+        method for method in METHOD_ORDER[:4] if method in _available_methods(rows)
+    ]
+    for ax, method in zip(axes.flat, methods):
+        method_rows = [row for row in rows if str(row["method"]) == method]
         semantic, pe, layer = _method_arrays(
             rows, method, "semantic_score", "pe_score"
         )
-        scatter = _scatter(
+        current = _scatter(
             ax,
             semantic,
             pe,
             layer,
             title=method,
-            xlabel=str(next(row["semantic_intervention"] for row in rows
-                             if row["method"] == method)),
-            ylabel=str(next(row["pe_intervention"] for row in rows
-                             if row["method"] == method)),
+            xlabel=str(method_rows[0]["semantic_intervention"]),
+            ylabel=str(method_rows[0]["pe_intervention"]),
             diagonal=False,
         )
+        if current is not None:
+            scatter = current
+    _disable_unused(axes.flat, len(methods))
     if scatter is not None:
         fig.colorbar(scatter, ax=axes, label="Layer", shrink=0.75)
     paths = _save(fig, out / "m1_intervention_factorial")
@@ -187,10 +261,12 @@ def m1_factorial(rows: Sequence[Mapping[str, Any]], out: Path) -> list[str]:
 def donor_vs_transposition(rows: Sequence[Mapping[str, Any]], out: Path) -> list[str]:
     plt = _pyplot()
     fig, axes = plt.subplots(2, 2, figsize=(10.5, 8.5), constrained_layout=True)
-    sem_donor, _, layer = _method_arrays(rows, "M1_DD", "semantic_score", "pe_score")
-    sem_trans, _, _ = _method_arrays(rows, "M1_TD", "semantic_score", "pe_score")
-    _, pe_donor, pe_layer = _method_arrays(rows, "M1_DD", "semantic_score", "pe_score")
-    _, pe_trans, _ = _method_arrays(rows, "M1_DT", "semantic_score", "pe_score")
+    sem_donor, sem_trans, layer = _paired_method_values(
+        rows, "M1_DD", "M1_TD", "semantic_score"
+    )
+    pe_donor, pe_trans, pe_layer = _paired_method_values(
+        rows, "M1_DD", "M1_DT", "pe_score"
+    )
     left_scatter = _scatter(
         axes[0, 0],
         sem_donor,
@@ -201,7 +277,7 @@ def donor_vs_transposition(rows: Sequence[Mapping[str, Any]], out: Path) -> list
         ylabel="Node-transposition EG",
         diagonal=True,
     )
-    _scatter(
+    right_scatter = _scatter(
         axes[0, 1],
         pe_donor,
         pe_trans,
@@ -232,7 +308,19 @@ def donor_vs_transposition(rows: Sequence[Mapping[str, Any]], out: Path) -> list
         ax.set_title(f"{channel}: log-scale difference")
         ax.set_xlabel("Mean log1p score")
         ax.set_ylabel("log1p(transposition) − log1p(donor)")
-    fig.colorbar(left_scatter, ax=axes, label="Layer", shrink=0.75)
+        if not len(donor):
+            ax.text(
+                0.5,
+                0.5,
+                "Required M1 arms not selected",
+                ha="center",
+                va="center",
+                transform=ax.transAxes,
+                color="0.45",
+            )
+    color_source = left_scatter if left_scatter is not None else right_scatter
+    if color_source is not None:
+        fig.colorbar(color_source, ax=axes, label="Layer", shrink=0.75)
     paths = _save(fig, out / "donor_vs_transposition")
     plt.close(fig)
     return paths
@@ -242,9 +330,10 @@ def derived_dj_atlas(rows: Sequence[Mapping[str, Any]], out: Path) -> list[str]:
     plt = _pyplot()
     fig, axes = plt.subplots(3, 3, figsize=(13.5, 12.0), constrained_layout=True)
     scatter = None
-    for ax, method in zip(axes.flat, METHOD_ORDER):
+    methods = _available_methods(rows)
+    for ax, method in zip(axes.flat, methods):
         d_rel, joint, layer = _method_arrays(rows, method, "D_rel", "J")
-        scatter = _scatter(
+        current = _scatter(
             ax,
             d_rel,
             joint,
@@ -254,7 +343,10 @@ def derived_dj_atlas(rows: Sequence[Mapping[str, Any]], out: Path) -> list[str]:
             ylabel="J",
             diagonal=False,
         )
+        if current is not None:
+            scatter = current
         ax.axvline(0.0, color="0.65", linewidth=0.8)
+    _disable_unused(axes.flat, len(methods))
     if scatter is not None:
         fig.colorbar(scatter, ax=axes, label="Layer", shrink=0.65)
     paths = _save(fig, out / "derived_DJ_atlas")
@@ -281,15 +373,19 @@ def significance_validation(
     target = _head_target(ablation_rows, "prediction_movement")
     fig, axes = plt.subplots(3, 3, figsize=(13.5, 12.0), constrained_layout=True)
     scatter = None
-    for ax, method in zip(axes.flat, METHOD_ORDER):
+    methods = _available_methods(derived_rows)
+    for ax, method in zip(axes.flat, methods):
         rows = [row for row in derived_rows if row["method"] == method]
         rows.sort(key=lambda row: (int(row["layer"]), int(row["head"])))
         joint = np.asarray([float(row["J"]) for row in rows])
         effect = np.asarray(
-            [target[(int(row["layer"]), int(row["head"]))] for row in rows]
+            [
+                target.get((int(row["layer"]), int(row["head"])), np.nan)
+                for row in rows
+            ]
         )
         layer = np.asarray([int(row["layer"]) for row in rows])
-        scatter = _scatter(
+        current = _scatter(
             ax,
             joint,
             effect,
@@ -299,6 +395,9 @@ def significance_validation(
             ylabel="Held-out ablation movement",
             diagonal=False,
         )
+        if current is not None:
+            scatter = current
+    _disable_unused(axes.flat, len(methods))
     if scatter is not None:
         fig.colorbar(scatter, ax=axes, label="Layer", shrink=0.65)
     paths = _save(fig, out / "significance_validation")
@@ -320,7 +419,8 @@ def role_validation(
     }
     fig, axes = plt.subplots(3, 3, figsize=(13.5, 12.0), constrained_layout=True)
     scatter = None
-    for ax, method in zip(axes.flat, METHOD_ORDER):
+    methods = _available_methods(derived_rows)
+    for ax, method in zip(axes.flat, methods):
         rows = [row for row in derived_rows if row["method"] == method]
         rows.sort(key=lambda row: (int(row["layer"]), int(row["head"])))
         d_rel = np.asarray([float(row["D_rel"]) for row in rows])
@@ -336,7 +436,7 @@ def role_validation(
             ]
         )
         layer = np.asarray([int(row["layer"]) for row in rows])
-        scatter = _scatter(
+        current = _scatter(
             ax,
             d_rel,
             differential,
@@ -346,8 +446,11 @@ def role_validation(
             ylabel="Held-out semantic − PE mediation",
             diagonal=False,
         )
+        if current is not None:
+            scatter = current
         ax.axvline(0.0, color="0.65", linewidth=0.8)
         ax.axhline(0.0, color="0.65", linewidth=0.8)
+    _disable_unused(axes.flat, len(methods))
     if scatter is not None:
         fig.colorbar(scatter, ax=axes, label="Layer", shrink=0.65)
     paths = _save(fig, out / "role_validation")
@@ -360,11 +463,12 @@ def topology_companions(rows: Sequence[Mapping[str, Any]], out: Path) -> list[st
     fig, axes = plt.subplots(5, 4, figsize=(17.0, 19.0), constrained_layout=True)
     scatter = None
     flat_axes = list(axes.flat)
-    for method_index, method in enumerate(METHOD_ORDER):
+    methods = _available_methods(rows)
+    for method_index, method in enumerate(methods):
         semantic, topology, layer = _method_arrays(
             rows, method, "semantic_score", "topology_score"
         )
-        scatter = _scatter(
+        current = _scatter(
             flat_axes[2 * method_index],
             semantic,
             topology,
@@ -374,10 +478,12 @@ def topology_companions(rows: Sequence[Mapping[str, Any]], out: Path) -> list[st
             ylabel="Fixed topology EG",
             diagonal=False,
         )
+        if current is not None:
+            scatter = current
         pe, topology, layer = _method_arrays(
             rows, method, "pe_score", "topology_score"
         )
-        scatter = _scatter(
+        current = _scatter(
             flat_axes[2 * method_index + 1],
             pe,
             topology,
@@ -387,7 +493,9 @@ def topology_companions(rows: Sequence[Mapping[str, Any]], out: Path) -> list[st
             ylabel="Fixed topology EG",
             diagonal=False,
         )
-    for ax in flat_axes[2 * len(METHOD_ORDER):]:
+        if current is not None:
+            scatter = current
+    for ax in flat_axes[2 * len(methods):]:
         ax.axis("off")
     if scatter is not None:
         fig.colorbar(scatter, ax=axes, label="Layer", shrink=0.65)
