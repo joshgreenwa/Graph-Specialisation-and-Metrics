@@ -12,6 +12,7 @@ checkpoints, and executes M1--M6 with resumable caches. A Colab secret named
 from __future__ import annotations
 
 import argparse
+import importlib
 import importlib.util
 import os
 import shutil
@@ -154,6 +155,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--zinc-checkpoint")
     parser.add_argument("--qm9-checkpoint")
     parser.add_argument("--analysis-seed", type=int, default=1771)
+    parser.add_argument(
+        "--cosine-temperature",
+        type=float,
+        help="Appendix swap-softmax temperature; default 0.1 or saved resume value",
+    )
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--repository-branch", default=REPOSITORY_BRANCH)
     parser.add_argument("--pyg-version", default="2.2.0")
@@ -175,6 +181,16 @@ def main(argv: Sequence[str] | None = None):
     for path in (repository / "src", repository):
         if str(path) not in sys.path:
             sys.path.insert(0, str(path))
+    # Colab keeps imported modules alive across ``%run`` calls. After refreshing
+    # the checkout, discard the old package so this run cannot silently execute
+    # code from the previous branch revision.
+    importlib.invalidate_caches()
+    for module_name in list(sys.modules):
+        if (
+            module_name == "graph_specialisation_metrics"
+            or module_name.startswith("graph_specialisation_metrics.")
+        ):
+            del sys.modules[module_name]
 
     from graph_specialisation_metrics.scoring_refinement import run
 
@@ -201,6 +217,7 @@ def main(argv: Sequence[str] | None = None):
         pyg_version=args.pyg_version,
         force_fresh_grit=args.force_fresh_grit,
         analysis_seed=args.analysis_seed,
+        cosine_temperature=args.cosine_temperature,
     )
 
 

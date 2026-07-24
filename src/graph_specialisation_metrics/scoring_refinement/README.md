@@ -77,21 +77,24 @@ EG[event,l,h]    = sum_i ||q[event,l,h,i,:]||_2
 
 Events are averaged within source, sources within graph, and graphs equally.
 
-### Probability-mass-weighted following/invariance
+### Appendix A.3 cosine following/invariance
 
-For a transposition `pi`, the invariant reference keeps clean key coordinates and the following
-reference gathers the clean key axis by `pi`.
+For a node transposition `pi=(u,v)`, nodes are singleton blocks. At each graph query, the event
+pair at sender locations `(u,v)` is compared by cosine similarity with either the clean pair in
+its original ordering (invariant) or its reversed ordering (equivariant/following). This is the
+graph adaptation of Appendix A.3 in
+[arXiv:2511.11579](https://arxiv.org/abs/2511.11579).
 
-Attention uses distributional overlap:
+Attention compares the two attention masses directly. Transport compares the flattened pair of
+realised complete-message contributions `A*m`. Sampled swaps are weighted per query using:
 
 ```text
-1 - 0.5 * L1(A_event, A_reference)
+softmax(|A_clean[i,u] - A_clean[i,v]| / temperature)
 ```
 
-Transport uses a weighted message-field cosine. Per-key weights are the mean of event and
-reference attention probability, and are applied inside the dot products and norms. The
-headline uncentered cosine is clipped to `[0,1]`; raw and centered companions remain available
-in graph caches. This is not the older softmax-over-sampled-permutations weighting.
+The default temperature is `0.1` and is protocol-fingerprinted. Query rows are subsequently
+weighted by clean attention mass on the swapped pair. Attention scores lie in `[0,1]`; transport
+scores retain the appendix cosine range `[-1,1]`.
 
 ## M1–M6
 
@@ -121,6 +124,13 @@ M2–M5 coordinates are explicitly diagnostic because invariance is not positive
 other channel. Topology EG is always reported separately and never folded into semantic/PE
 `D_rel`.
 
+Every M1 arm is additionally compared against the role-aligned raw axes of M2–M6. For example,
+an M1 structural/PE score is correlated with M2 semantic-transposition invariance, M3
+PE-transposition following, M4 semantic-attention invariance, M5 PE-attention following, and the
+raw M6 PE-following component. Semantic comparisons use the complementary raw axes.
+`m1_cross_method_correlations.csv` contains pooled, within-layer, and layer-centred statistics;
+four `m1_cross_method_correlations_m1_*.{png,pdf}` atlases show the underlying head scatters.
+
 ## Validation estimands
 
 Significance is evaluated on a disjoint clean split. Each head's full `wV` is zeroed and the
@@ -144,6 +154,10 @@ separately for significance (`J`) and role (`D_rel`).
 `phase` is one of `scores`, `validation`, `figures`, or `all`. Score work checkpoints after every
 graph. Caches include the protocol fingerprint, task, checkpoint SHA-256, and event-manifest hash.
 `figures` reads CSV tables only and never imports or loads GRIT.
+
+Protocol `scoring-refinement-v2-appendix-cosine` invalidates v1 score caches. The collector keeps
+the exact hooked `wV` tensor on the clean gradient path; missing, non-finite, or layerwise-zero
+readout gradients abort rather than being converted into silent zero M1/topology scores.
 
 All donor/partner events belonging to one source are evaluated in a single batched GRIT forward.
 The clean fields and each intervention field are collected once and shared by every method that

@@ -6,7 +6,7 @@ from typing import Any, Mapping, Sequence
 
 import numpy as np
 
-from .config import METHODS
+from .config import METHODS, PROTOCOL_VERSION
 from .fields import GraphCapture, HeadFields
 
 
@@ -44,70 +44,213 @@ def projected_event_score(
     return np.stack(output, axis=0)
 
 
-def _masked_attention_overlap(
+def _pair_cosine(
     event: Any,
     reference: Any,
-    event_mask: Any,
-    reference_mask: Any,
-) -> tuple[Any, Any]:
-    import torch
-
-    support = event_mask | reference_mask
-    left = torch.where(event_mask, event.float(), torch.zeros_like(event.float()))
-    right = torch.where(reference_mask, reference.float(), torch.zeros_like(reference.float()))
-    overlap = 1.0 - 0.5 * torch.abs(left - right).sum(dim=-1)
-    valid = support.any(dim=-1)
-    return torch.clamp(overlap, 0.0, 1.0), valid
-
-
-def _weighted_message_cosine(
-    event_message: Any,
-    reference_message: Any,
-    event_attention: Any,
-    reference_attention: Any,
-    event_mask: Any,
-    reference_mask: Any,
+    valid: Any,
     *,
-    centered: bool,
-) -> tuple[Any, Any, Any]:
-    """Attention-probability-mass-weighted cosine by head/query."""
+    reduce_dims: tuple[int, ...],
+) -> tuple[Any, Any]:
+    """Cosine similarity with an explicit valid-query mask."""
 
     import torch
 
-    support = event_mask & reference_mask
-    weight = 0.5 * (event_attention.float() + reference_attention.float())
-    weight = torch.where(support, weight, torch.zeros_like(weight))
-    mass = weight.sum(dim=-1)
-    valid = mass > EPS
-    left = torch.where(
-        support.unsqueeze(-1), event_message.float(), torch.zeros_like(event_message.float())
-    )
-    right = torch.where(
-        support.unsqueeze(-1),
-        reference_message.float(),
-        torch.zeros_like(reference_message.float()),
-    )
-    if centered:
-        denom = mass.unsqueeze(-1).clamp_min(EPS)
-        left_mean = (weight.unsqueeze(-1) * left).sum(dim=-2) / denom
-        right_mean = (weight.unsqueeze(-1) * right).sum(dim=-2) / denom
-        left = left - left_mean.unsqueeze(-2)
-        right = right - right_mean.unsqueeze(-2)
-    weighted = weight.unsqueeze(-1)
-    numerator = (weighted * left * right).sum(dim=(-2, -1))
-    left_norm = (weighted * left.square()).sum(dim=(-2, -1))
-    right_norm = (weighted * right.square()).sum(dim=(-2, -1))
-    cosine = numerator / torch.sqrt(left_norm * right_norm).clamp_min(EPS)
+    event = event.float()
+    reference = reference.float()
+    numerator = (event * reference).sum(dim=reduce_dims)
+    event_norm = event.square().sum(dim=reduce_dims)
+    reference_norm = reference.square().sum(dim=reduce_dims)
+    norm_valid = (event_norm > EPS) & (reference_norm > EPS)
+    valid = valid & norm_valid
+    cosine = numerator / torch.sqrt(event_norm * reference_norm).clamp_min(EPS)
     cosine = torch.where(valid, cosine, torch.zeros_like(cosine))
-    return torch.clamp(cosine, -1.0, 1.0), valid, mass
+    return torch.clamp(cosine, -1.0, 1.0), valid
 
 
-def _query_mean(value: Any, valid: Any) -> np.ndarray:
+def _transposition_pair(permutation: Any) -> tuple[int, int]:
     import torch
 
-    count = valid.sum(dim=-1).clamp_min(1).to(value.dtype)
-    result = torch.where(valid, value, torch.zeros_like(value)).sum(dim=-1) / count
-    return result.detach().cpu().numpy()
+    permutation = permutation.reshape(-1)
+    identity = torch.arange(
+        int(permutation.numel()), device=permutation.device, dtype=permutation.dtype
+    )
+    changed = torch.nonzero(permutation != identity, as_tuple=False).reshape(-1)
+    if int(changed.numel()) != 2:
+        raise ValueError(
+            "appendix cosine scoring requires one non-trivial two-node transposition"
+        )
+    return int(changed[0].item()), int(changed[1].item())
+
+
+def _appendix_event_components(
+    clean: GraphCapture,
+    event: GraphCapture,
+    permutation: Any,
+) -> dict[str, Any]:
+    """Per-query Appendix A.3 cosine terms for one node transposition.
+
+    Graph nodes are singleton blocks. For every receiver/query, the two swapped
+    sender locations form ``v_ij``. Attention uses the two scalar masses;
+    transport uses the flattened pair of realised contributions ``alpha * m``.
+    """
+
+    import torch
+
+    source, partner = _transposition_pair(permutation)
+    output: dict[str, list[Any]] = {
+        "attention_follow": [],
+        "attention_invariant": [],
+        "transport_follow": [],
+        "transport_invariant": [],
+        "attention_valid": [],
+        "transport_valid": [],
+        "alpha_logit": [],
+        "query_mass": [],
+    }
+    for clean_layer, event_layer in zip(clean.layers, event.layers):
+        indices = torch.as_tensor(
+            [source, partner],
+            dtype=torch.long,
+            device=clean_layer.attention.device,
+        )
+        clean_attention = clean_layer.attention.index_select(-1, indices).float()
+        event_attention = event_layer.attention.index_select(-1, indices).float()
+        clean_mask = clean_layer.mask.index_select(-1, indices)
+        event_mask = event_layer.mask.index_select(-1, indices)
+        valid_pair = (clean_mask & event_mask).all(dim=-1)
+
+        attention_invariant, attention_valid = _pair_cosine(
+            event_attention,
+            clean_attention,
+            valid_pair,
+            reduce_dims=(-1,),
+        )
+        attention_follow, attention_follow_valid = _pair_cosine(
+            event_attention,
+            clean_attention.flip(dims=(-1,)),
+            valid_pair,
+            reduce_dims=(-1,),
+        )
+        attention_valid = attention_valid & attention_follow_valid
+
+        clean_message = clean_layer.message.index_select(-2, indices).float()
+        event_message = event_layer.message.index_select(-2, indices).float()
+        clean_transport = clean_attention.unsqueeze(-1) * clean_message
+        event_transport = event_attention.unsqueeze(-1) * event_message
+        transport_invariant, transport_valid = _pair_cosine(
+            event_transport,
+            clean_transport,
+            valid_pair,
+            reduce_dims=(-2, -1),
+        )
+        transport_follow, transport_follow_valid = _pair_cosine(
+            event_transport,
+            clean_transport.flip(dims=(-2,)),
+            valid_pair,
+            reduce_dims=(-2, -1),
+        )
+        transport_valid = transport_valid & transport_follow_valid
+
+        output["attention_follow"].append(attention_follow)
+        output["attention_invariant"].append(attention_invariant)
+        output["transport_follow"].append(transport_follow)
+        output["transport_invariant"].append(transport_invariant)
+        output["attention_valid"].append(attention_valid)
+        output["transport_valid"].append(transport_valid)
+        output["alpha_logit"].append(
+            torch.abs(clean_attention[..., 0] - clean_attention[..., 1])
+        )
+        output["query_mass"].append(clean_attention.sum(dim=-1))
+    return {key: torch.stack(values, dim=0) for key, values in output.items()}
+
+
+def appendix_cosine_group_scores(
+    clean: GraphCapture,
+    events: Sequence[GraphCapture],
+    permutations: Sequence[Any],
+    *,
+    temperature: float,
+) -> dict[str, np.ndarray]:
+    """Appendix A.3 cosine scores aggregated over sampled transpositions.
+
+    The paper's swap weight is applied as
+    ``softmax(|d_i-d_j| / temperature)`` over events for each layer, head, and
+    graph query. Graph queries are then averaged using their clean attention
+    mass on the swapped node pair.
+    """
+
+    import torch
+
+    if len(events) != len(permutations) or not len(events):
+        raise ValueError("events and permutations must be aligned and non-empty")
+    if float(temperature) <= 0.0:
+        raise ValueError("cosine temperature must be positive")
+    components = [
+        _appendix_event_components(clean, event, permutation)
+        for event, permutation in zip(events, permutations)
+    ]
+    logits = torch.stack([item["alpha_logit"] for item in components], dim=0)
+    query_mass = torch.stack([item["query_mass"] for item in components], dim=0)
+    output: dict[str, np.ndarray] = {}
+    valid_by_family = {
+        "attention": torch.stack(
+            [item["attention_valid"] for item in components], dim=0
+        ),
+        "transport": torch.stack(
+            [item["transport_valid"] for item in components], dim=0
+        ),
+    }
+    for family in ("attention", "transport"):
+        valid = valid_by_family[family]
+        any_event = valid.any(dim=0, keepdim=True)
+        masked_logits = torch.where(
+            valid,
+            logits / float(temperature),
+            torch.full_like(logits, -torch.inf),
+        )
+        masked_logits = torch.where(
+            any_event, masked_logits, torch.zeros_like(masked_logits)
+        )
+        alpha = torch.softmax(masked_logits, dim=0)
+        alpha = torch.where(valid, alpha, torch.zeros_like(alpha))
+        pair_mass = (alpha * query_mass).sum(dim=0)
+        valid_query = valid.any(dim=0)
+        query_weight = torch.where(
+            valid_query, pair_mass, torch.zeros_like(pair_mass)
+        )
+        mass_total = query_weight.sum(dim=-1, keepdim=True)
+        fallback = valid_query.to(query_weight.dtype)
+        query_weight = torch.where(
+            mass_total > EPS,
+            query_weight,
+            fallback,
+        )
+        weight_total = query_weight.sum(dim=-1).clamp_min(EPS)
+        for behavior in ("follow", "invariant"):
+            key = f"{family}_{behavior}"
+            value = torch.stack([item[key] for item in components], dim=0)
+            event_average = (
+                alpha * torch.where(valid, value, torch.zeros_like(value))
+            ).sum(dim=0)
+            score = (query_weight * event_average).sum(dim=-1) / weight_total
+            output[key] = score.detach().cpu().numpy()
+        output[f"{family}_effective_support"] = (
+            valid_query.sum(dim=-1).detach().cpu().numpy()
+        )
+        output[f"{family}_pair_mass"] = (
+            torch.where(valid_query, pair_mass, torch.zeros_like(pair_mass))
+            .sum(dim=-1)
+            .div(valid_query.sum(dim=-1).clamp_min(1))
+            .detach()
+            .cpu()
+            .numpy()
+        )
+    output["effective_support"] = np.minimum(
+        output["attention_effective_support"],
+        output["transport_effective_support"],
+    )
+    output["attention_mass"] = output["attention_pair_mass"]
+    return output
 
 
 def follow_invariant_scores(
@@ -115,109 +258,14 @@ def follow_invariant_scores(
     event: GraphCapture,
     permutation: Any,
 ) -> dict[str, np.ndarray]:
-    """Return probability-mass-weighted attention and transport agreements.
+    """Convenience wrapper for one Appendix A.3 transposition event."""
 
-    Results are ``[L,H]`` arrays.  Query rows are averaged only after the
-    per-key attention-mass weighting has been applied.
-    """
-
-    attention_follow = []
-    attention_invariant = []
-    transport_follow = []
-    transport_invariant = []
-    transport_follow_raw = []
-    transport_invariant_raw = []
-    transport_follow_centered = []
-    transport_invariant_centered = []
-    effective_support = []
-    attention_mass = []
-    for clean_layer, event_layer in zip(clean.layers, event.layers):
-        follow_attention_reference = clean_layer.attention.index_select(-1, permutation)
-        follow_message_reference = clean_layer.message.index_select(-2, permutation)
-        follow_mask_reference = clean_layer.mask.index_select(-1, permutation)
-
-        attn_inv, valid_attn_inv = _masked_attention_overlap(
-            event_layer.attention,
-            clean_layer.attention,
-            event_layer.mask,
-            clean_layer.mask,
-        )
-        attn_follow, valid_attn_follow = _masked_attention_overlap(
-            event_layer.attention,
-            follow_attention_reference,
-            event_layer.mask,
-            follow_mask_reference,
-        )
-        inv_raw, valid_inv, inv_mass = _weighted_message_cosine(
-            event_layer.message,
-            clean_layer.message,
-            event_layer.attention,
-            clean_layer.attention,
-            event_layer.mask,
-            clean_layer.mask,
-            centered=False,
-        )
-        follow_raw, valid_follow, follow_mass = _weighted_message_cosine(
-            event_layer.message,
-            follow_message_reference,
-            event_layer.attention,
-            follow_attention_reference,
-            event_layer.mask,
-            follow_mask_reference,
-            centered=False,
-        )
-        inv_centered, valid_inv_centered, _ = _weighted_message_cosine(
-            event_layer.message,
-            clean_layer.message,
-            event_layer.attention,
-            clean_layer.attention,
-            event_layer.mask,
-            clean_layer.mask,
-            centered=True,
-        )
-        follow_centered, valid_follow_centered, _ = _weighted_message_cosine(
-            event_layer.message,
-            follow_message_reference,
-            event_layer.attention,
-            follow_attention_reference,
-            event_layer.mask,
-            follow_mask_reference,
-            centered=True,
-        )
-        attention_invariant.append(_query_mean(attn_inv, valid_attn_inv))
-        attention_follow.append(_query_mean(attn_follow, valid_attn_follow))
-        transport_invariant.append(_query_mean(inv_raw.clamp(0.0, 1.0), valid_inv))
-        transport_follow.append(_query_mean(follow_raw.clamp(0.0, 1.0), valid_follow))
-        transport_invariant_raw.append(_query_mean(inv_raw, valid_inv))
-        transport_follow_raw.append(_query_mean(follow_raw, valid_follow))
-        transport_invariant_centered.append(
-            _query_mean(inv_centered, valid_inv_centered)
-        )
-        transport_follow_centered.append(
-            _query_mean(follow_centered, valid_follow_centered)
-        )
-        joint_valid = valid_inv | valid_follow
-        effective_support.append(
-            _query_mean(
-                (event_layer.mask | clean_layer.mask).sum(dim=-1).float(),
-                joint_valid,
-            )
-        )
-        attention_mass.append(
-            _query_mean(0.5 * (inv_mass + follow_mass), joint_valid)
-        )
-    return {
-        "attention_follow": np.stack(attention_follow),
-        "attention_invariant": np.stack(attention_invariant),
-        "transport_follow": np.stack(transport_follow),
-        "transport_invariant": np.stack(transport_invariant),
-        "transport_follow_raw": np.stack(transport_follow_raw),
-        "transport_invariant_raw": np.stack(transport_invariant_raw),
-        "transport_follow_centered": np.stack(transport_follow_centered),
-        "transport_invariant_centered": np.stack(transport_invariant_centered),
-        "effective_support": np.stack(effective_support),
-        "attention_mass": np.stack(attention_mass),
-    }
+    return appendix_cosine_group_scores(
+        clean,
+        [event],
+        [permutation],
+        temperature=1.0,
+    )
 
 
 def hierarchical_event_mean(groups: Sequence[Sequence[np.ndarray]]) -> np.ndarray:
@@ -340,11 +388,11 @@ def build_score_tables(
         "M1_DT": "output_projected_transport",
         "M1_TD": "output_projected_transport",
         "M1_TT": "output_projected_transport",
-        "M2": "message_transport",
-        "M3": "message_transport",
-        "M4": "attention",
-        "M5": "attention",
-        "M6": "message_transport",
+        "M2": "realised_transport_pair_cosine",
+        "M3": "realised_transport_pair_cosine",
+        "M4": "attention_pair_cosine",
+        "M5": "attention_pair_cosine",
+        "M6": "realised_transport_pair_cosine",
     }
     for method in methods:
         semantic, pe = axes[method]
@@ -362,6 +410,7 @@ def build_score_tables(
         for layer in range(int(semantic.shape[0])):
             for head in range(int(semantic.shape[1])):
                 common = {
+                    "protocol_version": PROTOCOL_VERSION,
                     "task": task,
                     "checkpoint_sha": checkpoint_sha,
                     "graph_split": "score",
@@ -382,7 +431,7 @@ def build_score_tables(
                         "topology_score": float(topology[layer, head]),
                         "centered": False,
                         "probability_weighting": (
-                            "attention_probability_mass"
+                            "appendix_swap_softmax_and_query_pair_mass"
                             if method in {"M2", "M3", "M4", "M5", "M6"}
                             else "none"
                         ),

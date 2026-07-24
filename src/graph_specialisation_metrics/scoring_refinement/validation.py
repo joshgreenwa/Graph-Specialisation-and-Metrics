@@ -230,6 +230,70 @@ def build_m1_arm_agreement(
     return output
 
 
+def build_m1_cross_method_correlations(
+    raw_rows: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Correlate every M1 arm with the role-aligned raw axes of M2--M6."""
+
+    grouped: dict[str, dict[tuple[int, int], Mapping[str, Any]]] = defaultdict(dict)
+    for row in raw_rows:
+        grouped[str(row["method"])][
+            (int(row["layer"]), int(row["head"]))
+        ] = row
+    m1_arms = [
+        arm for arm in ("M1_DD", "M1_DT", "M1_TD", "M1_TT") if arm in grouped
+    ]
+    comparisons = [
+        method for method in ("M2", "M3", "M4", "M5", "M6") if method in grouped
+    ]
+    output = []
+    for arm in m1_arms:
+        for axis, field in (
+            ("semantic", "semantic_score"),
+            ("structural", "pe_score"),
+        ):
+            for method in comparisons:
+                keys = sorted(set(grouped[arm]) & set(grouped[method]))
+                left = np.asarray(
+                    [float(grouped[arm][key][field]) for key in keys], dtype=float
+                )
+                right = np.asarray(
+                    [float(grouped[method][key][field]) for key in keys], dtype=float
+                )
+                layers = np.asarray([key[0] for key in keys], dtype=int)
+                within = [
+                    _spearman(left[layers == layer], right[layers == layer])
+                    for layer in sorted(set(layers.tolist()))
+                ]
+                within = [value for value in within if np.isfinite(value)]
+                left_centered = left.copy()
+                right_centered = right.copy()
+                for layer in sorted(set(layers.tolist())):
+                    mask = layers == layer
+                    left_centered[mask] -= np.nanmean(left[mask])
+                    right_centered[mask] -= np.nanmean(right[mask])
+                output.append(
+                    {
+                        "comparison_type": "m1_cross_method",
+                        "m1_arm": arm,
+                        "axis": axis,
+                        "m1_field": field,
+                        "comparison_method": method,
+                        "comparison_field": field,
+                        "heads": len(keys),
+                        "pearson": _pearson(left, right),
+                        "spearman": _spearman(left, right),
+                        "within_layer_spearman": (
+                            float(np.mean(within)) if within else float("nan")
+                        ),
+                        "layer_centered_spearman": _spearman(
+                            left_centered, right_centered
+                        ),
+                    }
+                )
+    return output
+
+
 def _batch_groups(items: Sequence[Any], size: int = 32) -> list[list[Any]]:
     return [list(items[start:start + size]) for start in range(0, len(items), size)]
 

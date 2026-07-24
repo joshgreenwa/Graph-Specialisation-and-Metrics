@@ -33,11 +33,20 @@ RAW_AXIS_LABELS = {
         "Semantic transposition output-projected EG",
         "PE transposition output-projected EG",
     ),
-    "M2": ("Semantic transport-follow", "Semantic transport-invariant"),
-    "M3": ("PE transport-invariant", "PE transport-follow"),
-    "M4": ("Semantic attention-follow", "Semantic attention-invariant"),
-    "M5": ("PE attention-invariant", "PE attention-follow"),
-    "M6": ("Semantic transport-follow", "PE transport-follow"),
+    "M2": (
+        "Semantic transport-equivariant/follow",
+        "Semantic transport-invariant",
+    ),
+    "M3": ("PE transport-invariant", "PE transport-equivariant/follow"),
+    "M4": (
+        "Semantic attention-equivariant/follow",
+        "Semantic attention-invariant",
+    ),
+    "M5": ("PE attention-invariant", "PE attention-equivariant/follow"),
+    "M6": (
+        "Semantic transport-equivariant/follow",
+        "PE transport-equivariant/follow",
+    ),
 }
 
 
@@ -326,6 +335,60 @@ def donor_vs_transposition(rows: Sequence[Mapping[str, Any]], out: Path) -> list
     return paths
 
 
+def m1_cross_method_correlations(
+    rows: Sequence[Mapping[str, Any]],
+    out: Path,
+) -> list[str]:
+    """Scatter every M1 arm against role-aligned M2--M6 raw axes."""
+
+    plt = _pyplot()
+    present = set(_available_methods(rows))
+    arms = [
+        arm for arm in ("M1_DD", "M1_DT", "M1_TD", "M1_TT") if arm in present
+    ]
+    comparisons = [
+        method for method in ("M2", "M3", "M4", "M5", "M6") if method in present
+    ]
+    if not arms or not comparisons:
+        return []
+    paths: list[str] = []
+    for arm in arms:
+        fig, axes = plt.subplots(
+            2,
+            len(comparisons),
+            figsize=(4.1 * len(comparisons), 7.8),
+            constrained_layout=True,
+            squeeze=False,
+        )
+        scatter = None
+        for column, method in enumerate(comparisons):
+            for row_index, (axis_name, field) in enumerate(
+                (("semantic", "semantic_score"), ("structural", "pe_score"))
+            ):
+                left, right, layer = _paired_method_values(
+                    rows, arm, method, field
+                )
+                current = _scatter(
+                    axes[row_index, column],
+                    left,
+                    right,
+                    layer,
+                    title=f"{arm} {axis_name} vs {method}",
+                    xlabel=RAW_AXIS_LABELS[arm][row_index],
+                    ylabel=RAW_AXIS_LABELS[method][row_index],
+                    diagonal=False,
+                )
+                if current is not None:
+                    scatter = current
+        if scatter is not None:
+            fig.colorbar(scatter, ax=axes, label="Layer", shrink=0.72)
+        paths.extend(
+            _save(fig, out / f"m1_cross_method_correlations_{arm.lower()}")
+        )
+        plt.close(fig)
+    return paths
+
+
 def derived_dj_atlas(rows: Sequence[Mapping[str, Any]], out: Path) -> list[str]:
     plt = _pyplot()
     fig, axes = plt.subplots(3, 3, figsize=(13.5, 12.0), constrained_layout=True)
@@ -521,6 +584,9 @@ def make_all_figures(
         "derived_DJ_atlas": derived_dj_atlas(derived_rows, out_dir),
         "topology_companions": topology_companions(raw_rows, out_dir),
     }
+    cross_method = m1_cross_method_correlations(raw_rows, out_dir)
+    if cross_method:
+        output["m1_cross_method_correlations"] = cross_method
     if ablation_rows:
         output["significance_validation"] = significance_validation(
             derived_rows, ablation_rows, out_dir

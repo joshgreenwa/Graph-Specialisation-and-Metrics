@@ -133,67 +133,64 @@ All event-based estimators must be hierarchical and graph-balanced:
 Use the same deterministic graph, source, pair and donor manifests wherever two methods are
 compared.
 
-## Probability-mass-weighted follow/invariance protocol
+## Appendix-cosine follow/invariance protocol
 
-The transposition methods compare the perturbed field with two clean references in fixed-query
-coordinates. If `pi=(u,v)`:
+The transposition methods use the singleton-node graph adaptation of Appendix A.3 of
+*Decoupling Positional and Symbolic Attention Behavior in Transformers*
+([arXiv:2511.11579](https://arxiv.org/abs/2511.11579)). For `pi=(u,v)`, compare the
+intervened pair in fixed query coordinates with the clean pair in either its original or swapped
+ordering:
 
 ```text
-invariant reference: F_clean[i,:]
-following reference: F_clean[i, pi(:)]
+clean pair:           v_uv  = (F_clean[i,u], F_clean[i,v])
+event pair:           v'_uv = (F_event[i,u], F_event[i,v])
+invariant reference:  v_uv
+following reference:  v_vu  = (F_clean[i,v], F_clean[i,u])
 ```
 
 “Following” means that the key/sender field follows the transposed semantic or PE identity.
 “Invariant” means that it remains in the original key coordinates.
 
-### Attention agreement
-
-For raw attention, use probability-distribution overlap:
+For each layer, head and query, weight the sampled swaps exactly in the appendix form:
 
 ```text
-AttnInvariant = 1 - 0.5 * ||A_event[i,:] - A_clean[i,:]||_1
-AttnFollow    = 1 - 0.5 * ||A_event[i,:] - A_clean[i,pi(:)]||_1
+alpha(pi) = softmax_pi( |A_clean[i,u] - A_clean[i,v]| / tau )
+
+Invariant = sum_pi alpha(pi) cosine(v'_uv, v_uv)
+Follow    = sum_pi alpha(pi) cosine(v'_uv, v_vu)
 ```
 
-Evaluate only aligned valid support. Clamp numerical noise to `[0,1]`. For dense attention the
-support is naturally aligned. Any later sparse-model extension must use the union/intersection
-support policy explicitly and must not equate a support change with attention-mass movement.
+The default `tau` is `0.1`, is configurable, and is part of the protocol fingerprint.
 
-### Transport/message agreement
+### Attention cosine
 
-For transport, compare the complete per-key message field `m`, because it preserves the sender
-axis needed by the following reference. Weight the comparison by the attention probability mass
-that actually routes those messages.
-
-For reference `R` (clean-invariant or clean-following), use:
+For raw attention, each node is a singleton block:
 
 ```text
-w_invariant[i,j] = 0.5 * (A_event[i,j] + A_clean[i,j])
-w_follow[i,j]    = 0.5 * (A_event[i,j] + A_clean[i,pi(j)])
-
-WeightedCos(U,V;w) =
-    sum_j w[j] <U[j],V[j]>
-    / sqrt(sum_j w[j] ||U[j]||^2 * sum_j w[j] ||V[j]||^2)
+v_uv  = (A_clean[i,u], A_clean[i,v])
+v'_uv = (A_event[i,u], A_event[i,v])
 ```
 
-The primary agreement is the uncentered weighted cosine clipped to `[0,1]`:
+Evaluate queries only when both swapped sender locations exist in clean and event support.
+Attention cosine lies in `[0,1]`.
+
+### Realised-transport cosine
+
+For value output, use the realised sender contribution `c=A*m`, preserving the sender axis and
+the complete edge-enhanced GRIT message:
 
 ```text
-TransportInvariant = WeightedCos(m_event, m_clean, w_invariant)
-TransportFollow    = WeightedCos(m_event, m_clean[:,pi(:)], w_follow)
+v_uv  = concat(c_clean[i,u,:], c_clean[i,v,:])
+v'_uv = concat(c_event[i,u,:], c_event[i,v,:])
 ```
 
-Also store the raw cosine and a centered-key companion, but do not create extra headline methods
-from them. Record attention mass, valid key count and effective support for every query so a high
-agreement on negligible mass is detectable.
+The same invariant/follow cosine comparisons apply. After Appendix weighting over sampled swaps,
+average graph-query rows using their clean attention mass on the swapped pair. Record pair mass
+and valid-query count. Realised-transport cosine lies in `[-1,1]` and is not clipped to discard
+anti-alignment.
 
-This probability-mass weighting is distinct from the older softmax weighting over sampled
-permutations. If the existing general metric engine retains that older weighting, expose it as an
-optional diagnostic named `permutation_moved_mass_weighting`; do not call it attention-probability
-weighting.
-
-Aggregate query scores within graph, then graphs equally. Do not select transpositions by inspecting
-their perturbed scores.
+Continue to average events within source, sources within graph, and graphs equally. Do not select
+swaps by inspecting perturbed scores.
 
 ## Six headline scoring methods
 
@@ -351,7 +348,19 @@ Report:
 The semantic and PE score for a given intervention variant must be computed only once. Do not let
 the other channel's selected variant alter its graph/source/event manifest.
 
-### 3. Fast ablation and causal patching
+### 3. M1 versus single-intervention methods
+
+For every M1 arm, produce raw head-score scatters and a correlation table against M2–M6:
+
+- compare the M1 semantic axis with each method's role-aligned semantic raw axis;
+- compare the M1 structural/PE axis with each method's role-aligned structural raw axis;
+- include M2 semantic-follow/invariant, M3 PE-invariant/follow, M4 attention
+  semantic-follow/invariant, M5 attention PE-invariant/follow, and both raw M6 components; and
+- report pooled, within-layer, and layer-centred Spearman plus Pearson correlation.
+
+These comparisons use raw scores before `D_rel/J` construction.
+
+### 4. Fast ablation and causal patching
 
 Use disjoint deterministic splits:
 
@@ -517,6 +526,7 @@ tables/
     raw_head_scores.csv
     derived_head_coordinates.csv
     intervention_variant_agreement.csv
+    m1_cross_method_correlations.csv
     causal_validation.csv
     ablation_validation.csv
     method_ranking.csv
@@ -528,6 +538,7 @@ figures/
     significance_validation.{png,pdf}
     role_validation.{png,pdf}
     topology_companions.{png,pdf}
+    m1_cross_method_correlations_m1_*.{png,pdf}
 protocol.json
 summary.json
 ```
@@ -535,7 +546,7 @@ summary.json
 `raw_head_scores.csv` must contain at least:
 
 ```text
-task, checkpoint_sha, graph_split, layer, head, method,
+protocol_version, task, checkpoint_sha, graph_split, layer, head, method,
 semantic_intervention, pe_intervention, field,
 semantic_score, pe_score, topology_score,
 centered, probability_weighting, graphs, events

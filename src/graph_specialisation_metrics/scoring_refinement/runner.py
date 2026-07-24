@@ -36,14 +36,15 @@ from .interventions import (
     intervention_dose,
 )
 from .scores import (
+    appendix_cosine_group_scores,
     build_score_tables,
-    follow_invariant_scores,
     graph_balanced_mean,
     hierarchical_event_mean,
     projected_event_score,
     transposition_permutation,
 )
 from .validation import (
+    build_m1_cross_method_correlations,
     build_m1_arm_agreement,
     build_variant_agreement,
     compare_methods,
@@ -155,6 +156,7 @@ def _event_group_scores(
     events: Sequence[Mapping[str, Any]],
     *,
     compute_follow: bool,
+    cosine_temperature: float | None,
 ) -> tuple[list[np.ndarray], dict[str, list[np.ndarray]], list[dict[str, Any]]]:
     projected: list[np.ndarray] = []
     agreements: dict[str, list[np.ndarray]] = {}
@@ -163,6 +165,7 @@ def _event_group_scores(
     for event, variant_data in zip(events, variants):
         audit_preservation(base, variant_data, event)
     captures = collector.collect_many(variants, require_grad=False)
+    permutations = []
     for event, variant_data, variant in zip(events, variants, captures):
         event_projected = projected_event_score(clean, variant, gradients)
         projected.append(event_projected)
@@ -192,15 +195,22 @@ def _event_group_scores(
         }
         diagnostics.append(record)
         if compute_follow:
-            permutation = transposition_permutation(
+            permutations.append(
+                transposition_permutation(
                 int(base.num_nodes),
                 int(event["source"]),
                 int(event["partner"]),
                 device=clean.layers[0].attention.device,
             )
-            score = follow_invariant_scores(clean, variant, permutation)
-            for key, value in score.items():
-                agreements.setdefault(key, []).append(value)
+            )
+    if compute_follow:
+        score = appendix_cosine_group_scores(
+            clean,
+            captures,
+            permutations,
+            temperature=cosine_temperature,
+        )
+        agreements = {key: [value] for key, value in score.items()}
     return projected, agreements, diagnostics
 
 
@@ -208,6 +218,8 @@ def _score_one_graph(
     gm: Any,
     graph_id: int,
     manifest: Mapping[str, Any],
+    *,
+    cosine_temperature: float,
 ) -> dict[str, Any]:
     collector = GritFieldCollector(gm)
     base = gm.eval_ds[int(graph_id)]
@@ -264,20 +276,12 @@ def _score_one_graph(
     agreement_scores: dict[str, list[list[np.ndarray]]] = {
         "semantic_transport_follow": [],
         "semantic_transport_invariant": [],
-        "semantic_transport_follow_raw": [],
-        "semantic_transport_invariant_raw": [],
-        "semantic_transport_follow_centered": [],
-        "semantic_transport_invariant_centered": [],
         "semantic_attention_follow": [],
         "semantic_attention_invariant": [],
         "semantic_effective_support": [],
         "semantic_attention_mass": [],
         "pe_transport_follow": [],
         "pe_transport_invariant": [],
-        "pe_transport_follow_raw": [],
-        "pe_transport_invariant_raw": [],
-        "pe_transport_follow_centered": [],
-        "pe_transport_invariant_centered": [],
         "pe_attention_follow": [],
         "pe_attention_invariant": [],
         "pe_effective_support": [],
@@ -296,6 +300,7 @@ def _score_one_graph(
                 gradients,
                 events,
                 compute_follow=compute_follow,
+                cosine_temperature=cosine_temperature,
             )
             event_scores[variant_name].append(projected)
             event_diagnostics.extend(diagnostics)
@@ -304,10 +309,6 @@ def _score_one_graph(
                 for suffix in (
                     "transport_follow",
                     "transport_invariant",
-                    "transport_follow_raw",
-                    "transport_invariant_raw",
-                    "transport_follow_centered",
-                    "transport_invariant_centered",
                     "attention_follow",
                     "attention_invariant",
                     "effective_support",
@@ -323,6 +324,7 @@ def _score_one_graph(
         gradients,
         manifest["topology"],
         compute_follow=False,
+        cosine_temperature=cosine_temperature,
     )
     event_diagnostics.extend(topology_diagnostics)
     zero = np.zeros((gm.L, gm.H), dtype=float)
@@ -352,6 +354,14 @@ def _score_one_graph(
             "reconstruction_error": reconstruction,
             "attention_mass_error": softmax,
             "full_relabel_prediction_error": relabel_error,
+            "readout_gradient_norm_min": min(
+                float(np.linalg.norm(value.detach().cpu().numpy()))
+                for value in gradients
+            ),
+            "readout_gradient_norm_max": max(
+                float(np.linalg.norm(value.detach().cpu().numpy()))
+                for value in gradients
+            ),
             "topology_available": bool(topology_projected),
             "events": event_diagnostics,
         },
@@ -417,7 +427,12 @@ def _run_scores(
         )
         if cached is None:
             log(f"[scores:{task}] graph {position}/{len(splits['score'])} id={graph_id}")
-            cached = _score_one_graph(gm, int(graph_id), manifest)
+            cached = _score_one_graph(
+                gm,
+                int(graph_id),
+                manifest,
+                cosine_temperature=cfg.cosine_temperature,
+            )
             cache.save_torch(
                 "scores", f"graph_{graph_id}", cached, event_manifest=manifest
             )
@@ -434,6 +449,30 @@ def _run_scores(
         for key in available_score_keys
     }
     score = {key: graph_balanced_mean(value) for key, value in per_graph.items()}
+    for key in (
+        "eg_semantic_single",
+        "eg_semantic_transposition",
+        "eg_pe_single",
+        "eg_pe_transposition",
+        "topology_eg",
+    ):
+        values = np.asarray(score[key], dtype=float)
+        finite = values[np.isfinite(values)]
+        if not finite.size:
+            raise RuntimeError(
+                f"{key} has no finite values after aggregation; "
+                "refusing to write invalid M1/topology tables"
+            )
+        nonzero = int(np.count_nonzero(np.abs(finite) > 1.0e-12))
+        log(
+            f"[score-check:{task}] {key}: max={np.max(np.abs(finite)):.6g}, "
+            f"nonzero_heads={nonzero}/{finite.size}"
+        )
+        if nonzero == 0:
+            raise RuntimeError(
+                f"{key} is identically zero/non-finite after aggregation; "
+                "refusing to write invalid M1/topology tables"
+            )
     raw_rows, derived_rows, references = build_score_tables(
         task,
         checkpoint_sha,
@@ -450,6 +489,7 @@ def _run_scores(
         seed=cfg.analysis_seed,
     )
     agreement_rows.extend(build_m1_arm_agreement(derived_rows, top_k=cfg.top_k))
+    cross_method_rows = build_m1_cross_method_correlations(raw_rows)
     diagnostic_rows = []
     for item in graph_results:
         graph_id = int(item["graph_id"])
@@ -487,6 +527,7 @@ def _run_scores(
     write_csv(table_dir / "raw_head_scores.csv", raw_rows)
     write_csv(table_dir / "derived_head_coordinates.csv", derived_rows)
     write_csv(table_dir / "intervention_variant_agreement.csv", agreement_rows)
+    write_csv(table_dir / "m1_cross_method_correlations.csv", cross_method_rows)
     write_csv(table_dir / "intervention_diagnostics.csv", diagnostic_rows)
     cache.save_torch(
         "scores",
@@ -505,6 +546,7 @@ def _run_scores(
         "raw_rows": raw_rows,
         "derived_rows": derived_rows,
         "agreement_rows": agreement_rows,
+        "cross_method_rows": cross_method_rows,
         "donor_index": donor_index,
     }
 
@@ -643,12 +685,33 @@ def _run_validation(
 
 
 def _read_score_payload(task_out: Path) -> dict[str, Any]:
+    protocol_path = task_out / "protocol.json"
+    if protocol_path.exists():
+        protocol = read_json(protocol_path)
+        cached_version = str(protocol.get("protocol_version", "unknown"))
+        if cached_version != PROTOCOL_VERSION:
+            raise RuntimeError(
+                f"score tables under {task_out} use protocol {cached_version!r}, "
+                f"but this code requires {PROTOCOL_VERSION!r}; rerun --phase scores "
+                "before validation or figure-only rendering"
+            )
     raw_rows = read_csv(task_out / "tables" / "raw_head_scores.csv")
     derived_rows = read_csv(task_out / "tables" / "derived_head_coordinates.csv")
     if not raw_rows or not derived_rows:
         raise FileNotFoundError(
             f"score tables are missing under {task_out}; run --phase scores first"
         )
+    for name, rows in (
+        ("raw_head_scores.csv", raw_rows),
+        ("derived_head_coordinates.csv", derived_rows),
+    ):
+        versions = {str(row.get("protocol_version", "unknown")) for row in rows}
+        if versions != {PROTOCOL_VERSION}:
+            raise RuntimeError(
+                f"{name} under {task_out} contains protocol version(s) "
+                f"{sorted(versions)}, expected {PROTOCOL_VERSION!r}; rerun "
+                "--phase scores before validation or figure-only rendering"
+            )
     return {"raw_rows": raw_rows, "derived_rows": derived_rows}
 
 
@@ -739,6 +802,7 @@ def _build_config(
     pyg_version: str,
     force_fresh_grit: bool,
     analysis_seed: int,
+    cosine_temperature: float,
 ) -> RefinementConfig:
     protocol_path = Path(output_dir) / "protocol.json"
     if resume_config and protocol_path.exists():
@@ -753,15 +817,16 @@ def _build_config(
             force_fresh_grit=force_fresh_grit,
         )
         # Runtime selection may narrow tasks/methods without changing cached estimands.
-        cfg = RefinementConfig(
-            **{
-                **cfg.__dict__,
-                "tasks": tuple(tasks),
-                "methods": parse_methods(methods),
-                "device": device,
-                "pyg_version": pyg_version,
-            }
-        )
+        overrides = {
+            **cfg.__dict__,
+            "tasks": tuple(tasks),
+            "methods": parse_methods(methods),
+            "device": device,
+            "pyg_version": pyg_version,
+        }
+        if cosine_temperature is not None:
+            overrides["cosine_temperature"] = float(cosine_temperature)
+        cfg = RefinementConfig(**overrides)
     else:
         cfg = RefinementConfig(
             output_dir=output_dir,
@@ -770,6 +835,9 @@ def _build_config(
             methods=parse_methods(methods),
             sizes=RunSizes.fast() if fast_dev_run else RunSizes(),
             analysis_seed=analysis_seed,
+            cosine_temperature=(
+                0.1 if cosine_temperature is None else float(cosine_temperature)
+            ),
             device=device,
             force=force,
             checkpoints=dict(checkpoints or {}),
@@ -796,6 +864,7 @@ def run(
     pyg_version: str = "2.2.0",
     force_fresh_grit: bool = False,
     analysis_seed: int = 1771,
+    cosine_temperature: float | None = None,
 ) -> dict[str, Any]:
     """Run M1--M6 on any registered dense ``GritTaskSpec`` task."""
 
@@ -813,6 +882,7 @@ def run(
         pyg_version=pyg_version,
         force_fresh_grit=force_fresh_grit,
         analysis_seed=analysis_seed,
+        cosine_temperature=cosine_temperature,
     )
     cfg.root.mkdir(parents=True, exist_ok=True)
     write_json(cfg.root / "protocol.json", cfg.protocol_record())

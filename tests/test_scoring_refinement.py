@@ -151,10 +151,69 @@ def test_probability_mass_follow_and_invariant_scores_have_expected_extremes():
     result = follow_invariant_scores(clean, follow, permutation)
 
     assert result["attention_follow"][0, 0] == pytest.approx(1.0)
+    expected_invariant = 0.5 * (
+        (0.8 * 0.2 + 0.2 * 0.8) / (0.8**2 + 0.2**2)
+        + (0.1 * 0.9 + 0.9 * 0.1) / (0.1**2 + 0.9**2)
+    )
+    assert result["attention_invariant"][0, 0] == pytest.approx(
+        expected_invariant
+    )
     assert result["transport_follow"][0, 0] == pytest.approx(1.0)
     assert 0.0 <= result["attention_invariant"][0, 0] < 1.0
     assert 0.0 <= result["transport_invariant"][0, 0] < 1.0
     assert result["attention_mass"][0, 0] == pytest.approx(1.0)
+
+
+def test_appendix_cosine_uses_softmax_mass_movement_weights():
+    torch = pytest.importorskip("torch")
+    from graph_specialisation_metrics.scoring_refinement.scores import (
+        appendix_cosine_group_scores,
+        transposition_permutation,
+    )
+
+    clean_attention = torch.tensor(
+        [[[0.80, 0.15, 0.05]] * 3], dtype=torch.float32
+    )
+    message = torch.ones(1, 3, 3, 1)
+    clean = _capture(torch, attention=clean_attention, message=message)
+    event_01 = _capture(
+        torch,
+        attention=clean_attention[..., [1, 0, 2]],
+        message=message[..., [1, 0, 2], :],
+    )
+    event_02 = _capture(
+        torch,
+        attention=clean_attention,
+        message=message,
+    )
+    result = appendix_cosine_group_scores(
+        clean,
+        [event_01, event_02],
+        [
+            transposition_permutation(3, 0, 1),
+            transposition_permutation(3, 0, 2),
+        ],
+        temperature=0.1,
+    )
+
+    weights = np.exp(np.asarray([0.65, 0.75]) / 0.1)
+    weights /= weights.sum()
+
+    def swapped_cosine(left, right):
+        return 2.0 * left * right / (left**2 + right**2)
+
+    expected_follow = (
+        weights[0] + weights[1] * swapped_cosine(0.80, 0.05)
+    )
+    expected_invariant = (
+        weights[0] * swapped_cosine(0.80, 0.15) + weights[1]
+    )
+    assert result["attention_follow"][0, 0] == pytest.approx(
+        expected_follow, rel=1.0e-6
+    )
+    assert result["attention_invariant"][0, 0] == pytest.approx(
+        expected_invariant, rel=1.0e-6
+    )
 
 
 def test_official_grit_field_collector_batches_event_replicas(monkeypatch):
@@ -169,7 +228,11 @@ def test_official_grit_field_collector_batches_event_replicas(monkeypatch):
 
     class Graph:
         def __init__(self, values):
-            self.x = torch.tensor(values, dtype=torch.float32).reshape(-1, 1)
+            self.x = torch.tensor(
+                [[value] for value in values],
+                dtype=torch.float32,
+                requires_grad=True,
+            )
             self.y = torch.tensor([0.0])
             self.num_nodes = len(values)
 
@@ -250,6 +313,12 @@ def test_official_grit_field_collector_batches_event_replicas(monkeypatch):
     assert reconstruction_error(captures[1].layers[0]) == pytest.approx(0.0)
     assert attention_mass_error(captures[0].layers[0]) == pytest.approx(0.0)
     assert attention_mass_error(captures[1].layers[0]) == pytest.approx(0.0)
+    clean, gradients = GritFieldCollector(gm).clean_with_gradients(
+        Graph([1.0, 3.0])
+    )
+    assert gradients[0].shape == (1, 2, 1, 1)
+    assert float(torch.linalg.vector_norm(gradients[0])) > 0.0
+    assert clean.layers[0].routed_output is not None
 
 
 def test_output_projected_eg_and_hierarchical_aggregation():
@@ -296,6 +365,7 @@ def test_all_method_rows_share_m1_references_and_keep_topology_separate():
     from graph_specialisation_metrics.scoring_refinement.scores import build_score_tables
     from graph_specialisation_metrics.scoring_refinement.validation import (
         build_m1_arm_agreement,
+        build_m1_cross_method_correlations,
     )
 
     shape = (2, 2)
@@ -325,6 +395,9 @@ def test_all_method_rows_share_m1_references_and_keep_topology_separate():
     arm_agreement = build_m1_arm_agreement(derived, top_k=(3,))
     assert len(arm_agreement) == 6
     assert all(row["comparison_type"] == "m1_arm" for row in arm_agreement)
+    cross_method = build_m1_cross_method_correlations(raw)
+    assert len(cross_method) == 4 * 2 * 5
+    assert {row["axis"] for row in cross_method} == {"semantic", "structural"}
 
 
 def test_deterministic_splits_are_disjoint_and_fast_sizes_are_small():
@@ -380,9 +453,19 @@ def test_colab_frontend_strips_only_injected_kernel_arguments():
         "-f",
         "ordinary.json",
     ]
-    parsed = module.build_parser().parse_args(["--task", "zinc", "--phase", "figures"])
+    parsed = module.build_parser().parse_args(
+        [
+            "--task",
+            "zinc",
+            "--phase",
+            "figures",
+            "--cosine-temperature",
+            "0.2",
+        ]
+    )
     assert parsed.task == ["zinc"]
     assert parsed.phase == "figures"
+    assert parsed.cosine_temperature == pytest.approx(0.2)
 
 
 def test_required_figure_atlas_renders_from_cache_only_tables(tmp_path):
@@ -440,6 +523,7 @@ def test_required_figure_atlas_renders_from_cache_only_tables(tmp_path):
         "raw_score_atlas",
         "m1_intervention_factorial",
         "donor_vs_transposition",
+        "m1_cross_method_correlations",
         "derived_DJ_atlas",
         "topology_companions",
         "significance_validation",
@@ -458,6 +542,7 @@ def test_cached_numpy_payload_continues_through_validation_and_csv(tmp_path):
     )
     from graph_specialisation_metrics.scoring_refinement.validation import (
         build_m1_arm_agreement,
+        build_m1_cross_method_correlations,
         build_variant_agreement,
         compare_methods,
     )
@@ -503,6 +588,7 @@ def test_cached_numpy_payload_continues_through_validation_and_csv(tmp_path):
         seed=17,
     )
     agreement.extend(build_m1_arm_agreement(derived, top_k=(2,)))
+    cross_method = build_m1_cross_method_correlations(raw)
 
     ablation = [
         {
@@ -528,6 +614,7 @@ def test_cached_numpy_payload_continues_through_validation_and_csv(tmp_path):
 
     assert len(raw) == len(derived) == 9 * layers * heads
     assert len(agreement) == 8
+    assert len(cross_method) == 40
     assert len(ablation_validation) == len(causal_validation) == len(ranking) == 9
     assert {row["significance_rank"] for row in ranking} == set(range(1, 10))
 
@@ -535,6 +622,7 @@ def test_cached_numpy_payload_continues_through_validation_and_csv(tmp_path):
         ("raw", raw),
         ("derived", derived),
         ("agreement", agreement),
+        ("cross_method", cross_method),
         ("ablation_validation", ablation_validation),
         ("causal_validation", causal_validation),
         ("ranking", ranking),

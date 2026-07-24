@@ -113,7 +113,15 @@ class GritFieldCollector:
                         1, 0, 2
                     )
                     mask[:, local_query, local_key] = True
-                output = routed[start:stop]
+                # For the clean gradient pass, preserve the exact tensor returned by
+                # the attention module. A slice created here is a downstream view of
+                # ``routed`` and was never consumed by the rest of the model, so
+                # autograd correctly reports it as unused by the prediction.
+                output = (
+                    routed
+                    if require_grad and len(data_list) == 1
+                    else routed[start:stop]
+                )
                 records[layer][graph_index] = HeadFields(
                     layer=layer,
                     attention=attention.detach(),
@@ -167,16 +175,23 @@ class GritFieldCollector:
                 prediction[target_index],
                 layer_outputs,
                 retain_graph=target_index + 1 < int(prediction.numel()),
-                allow_unused=True,
             )
             gradients_by_target.append(values)
         gradients: list[Any] = []
         for layer, output in enumerate(layer_outputs):
-            per_target = []
-            for values in gradients_by_target:
-                value = values[layer]
-                per_target.append(torch.zeros_like(output) if value is None else value.detach())
-            gradients.append(torch.stack(per_target, dim=0))
+            gradient = torch.stack(
+                [values[layer].detach() for values in gradients_by_target], dim=0
+            )
+            if not bool(torch.isfinite(gradient).all()):
+                raise RuntimeError(
+                    f"non-finite clean readout gradient captured at GRIT layer {layer}"
+                )
+            if float(torch.linalg.vector_norm(gradient).item()) <= 0.0:
+                raise RuntimeError(
+                    f"zero clean readout gradient captured at GRIT layer {layer}; "
+                    "refusing to emit silent zero M1/topology scores"
+                )
+            gradients.append(gradient)
         return capture, gradients
 
 

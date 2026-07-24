@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 
-PROTOCOL_VERSION = "scoring-refinement-v1"
+PROTOCOL_VERSION = "scoring-refinement-v2-appendix-cosine"
 METHODS = (
     "M1_DD",
     "M1_DT",
@@ -91,6 +91,7 @@ class RefinementConfig:
     top_k: tuple[int, ...] = (3, 5, 10)
     reference_method: str = "mean"
     pe_partner_match: str = "degree"
+    cosine_temperature: float = 0.1
     topology_allow_relaxed: bool = True
     skip_install: bool = False
     pyg_version: str = "2.2.0"
@@ -109,6 +110,8 @@ class RefinementConfig:
             raise ValueError("at least one task is required")
         if self.pe_partner_match not in {"degree", "any"}:
             raise ValueError("pe_partner_match must be 'degree' or 'any'")
+        if float(self.cosine_temperature) <= 0.0:
+            raise ValueError("cosine_temperature must be positive")
         if self.reference_method != "mean":
             raise ValueError("only the predeclared mean reference is supported")
         if any(int(value) < 1 for value in self.top_k):
@@ -131,6 +134,7 @@ class RefinementConfig:
             "top_k": list(self.top_k),
             "reference_method": self.reference_method,
             "pe_partner_match": self.pe_partner_match,
+            "cosine_temperature": self.cosine_temperature,
             "topology_allow_relaxed": self.topology_allow_relaxed,
         }
 
@@ -175,6 +179,7 @@ class RefinementConfig:
             top_k=tuple(int(value) for value in record.get("top_k", (3, 5, 10))),
             reference_method=str(record.get("reference_method", "mean")),
             pe_partner_match=str(record.get("pe_partner_match", "degree")),
+            cosine_temperature=float(record.get("cosine_temperature", 0.1)),
             topology_allow_relaxed=bool(record.get("topology_allow_relaxed", True)),
             checkpoints=dict(checkpoints or record.get("checkpoints", {})),
             force=force,
