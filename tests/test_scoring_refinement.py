@@ -255,6 +255,7 @@ def test_official_grit_field_collector_batches_event_replicas(monkeypatch):
 def test_output_projected_eg_and_hierarchical_aggregation():
     torch = pytest.importorskip("torch")
     from graph_specialisation_metrics.scoring_refinement.scores import (
+        graph_balanced_mean,
         hierarchical_event_mean,
         projected_event_score,
     )
@@ -283,6 +284,11 @@ def test_output_projected_eg_and_hierarchical_aggregation():
     )
     # Event mean for source 1 is 2; source 2 is 10; sources are then equal.
     assert aggregated[0, 0] == pytest.approx(6.0)
+
+    graph_values = np.asarray([[[1.0]], [[3.0]], [[8.0]]])
+    assert graph_balanced_mean(graph_values)[0, 0] == pytest.approx(4.0)
+    with pytest.raises(ValueError, match="zero graphs"):
+        graph_balanced_mean(np.empty((0, 1, 1)))
 
 
 def test_all_method_rows_share_m1_references_and_keep_topology_separate():

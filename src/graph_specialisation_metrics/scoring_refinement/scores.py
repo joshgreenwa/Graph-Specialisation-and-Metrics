@@ -234,7 +234,7 @@ def hierarchical_event_mean(groups: Sequence[Sequence[np.ndarray]]) -> np.ndarra
 
 
 def graph_balanced_mean(values: Sequence[np.ndarray]) -> np.ndarray:
-    if not values:
+    if len(values) == 0:
         raise ValueError("cannot aggregate zero graphs")
     return np.mean(np.stack(list(values), axis=0), axis=0)
 
