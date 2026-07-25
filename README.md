@@ -2,6 +2,20 @@
 
 This repository explores how graph transformer models process symbolic and structural information, with an emphasis on architecture-specific head specialisation.
 
+## Canonical methodology
+
+The final, task-general scientific specification is
+[`src/graph_specialisation_metrics/README.md`](src/graph_specialisation_metrics/README.md).
+It fixes donor-swaps for both semantic and structural channels, graph-balanced output-projected
+head scores, `F_sens` Functional carriage, and positive-is-beneficial donor-wise path-integrated
+Beneficial carriage.
+The public implementation is
+[`src/graph_specialisation_metrics/methodology/`](src/graph_specialisation_metrics/methodology/README.md),
+exposed through `graph_specialisation_metrics.main()`. The Drive-backed production launcher is
+[`experiments/methodology/canonical_methodology_colab.py`](experiments/methodology/canonical_methodology_colab.py).
+Module-level READMEs document implementations and historical refinement experiments; where their
+older alternatives differ, the canonical methodology takes precedence.
+
 The long-term project scope covers:
 
 - training and evaluation files for Graphormer, GraphGPS, GRIT, CSA, and Exphormer;
