@@ -25,6 +25,9 @@ graphbench = [
   "graphbench-lib",
 ]
 
+[project.scripts]
+graph-specialisation-metrics = "graph_specialisation_metrics.main:cli"
+
 [tool.ruff]
 line-length = 100
 
