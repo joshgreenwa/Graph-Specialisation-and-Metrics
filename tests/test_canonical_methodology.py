@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 import torch
 
+from graph_specialisation_metrics import main as public_main
 from graph_specialisation_metrics.methodology.bootstrap import (
     Observation,
     nested_percentile_interval,
@@ -33,6 +34,10 @@ from graph_specialisation_metrics.methodology.distance import (
 )
 from graph_specialisation_metrics.methodology.figures import (
     HeadPlotData,
+    attention_distance_profiles,
+    causal_family_panels,
+    causal_scatter_grid,
+    cumulative_prefix_curves,
     joint_selectivity_plane,
     score_plane,
 )
@@ -63,7 +68,7 @@ from graph_specialisation_metrics.methodology.scores import (
     head_coordinates,
     project_transport,
 )
-from graph_specialisation_metrics.methodology.tasks import get_task
+from graph_specialisation_metrics.methodology.tasks import TASKS, OutputGeometry, get_task
 
 
 class FakeData:
@@ -105,6 +110,7 @@ def structural_graph():
 
 
 def test_protocol_constants_and_disjoint_splits():
+    assert callable(public_main)
     config = MethodologyConfig()
     config.validate()
     assert config.bootstrap.replicates == BOOTSTRAP_REPLICATES == 2_000
@@ -124,6 +130,38 @@ def test_protocol_constants_and_disjoint_splits():
         set(split.semantic_donor_pool),
     ]
     assert all(not groups[i] & groups[j] for i in range(4) for j in range(i))
+
+
+def test_registered_grit_geometry_covers_dense_local_khop_and_vnode():
+    expected = {
+        "zinc",
+        "zinc_1hop",
+        "zinc_2hop",
+        "zinc_1hop_vnode",
+        "zinc_2hop_vnode",
+    }
+    assert expected <= set(TASKS)
+    assert not TASKS["zinc"].virtual_node
+    assert not TASKS["zinc_2hop"].virtual_node
+    assert TASKS["zinc_1hop_vnode"].virtual_node
+    assert TASKS["zinc_2hop_vnode"].carrier_policy == (
+        "real_nodes_plus_internal_vnode"
+    )
+
+
+def test_output_geometry_uses_fixed_z_space_and_training_only_std():
+    regression = OutputGeometry(
+        "evaluation_regression", None, "training_target_std"
+    )
+    targets = np.asarray([[1.0, 10.0], [3.0, 14.0]])
+    sigma = regression.resolve(2, training_targets=targets)
+    assert np.allclose(sigma, [1.0, 2.0])
+    assert np.allclose(
+        regression.transform(np.asarray([[2.0, 8.0]]), sigma),
+        [[2.0, 4.0]],
+    )
+    logits = OutputGeometry("logits", None, "unit")
+    assert np.array_equal(logits.resolve(3), np.ones(3))
 
 
 def test_semantic_donor_law_minimum_gap_and_graph_balancing():
@@ -390,4 +428,60 @@ def test_figure_axis_strings_are_repository_fixed():
     fig, ax = joint_selectivity_plane(HeadPlotData(coordinates, seed=42))
     assert ax.get_xlabel() == SELECTIVITY_AXIS_LABEL
     assert ax.get_ylabel() == JOINT_AXIS_LABEL
+    fig.clf()
+
+
+def test_modular_causal_and_distance_figure_components_render():
+    interval = (np.asarray([0.0, 0.5]), np.asarray([1.0, 1.5]))
+    fig, _ = causal_scatter_grid(
+        [
+            {
+                "x": np.asarray([0.2, 0.8]),
+                "y": np.asarray([0.3, 1.0]),
+                "x_interval": interval,
+                "y_interval": interval,
+                "layer": np.asarray([0, 1]),
+                "xlabel": "x",
+                "ylabel": "y",
+            }
+        ]
+    )
+    fig.clf()
+    keys = (
+        "restoration_gross",
+        "injection_gross",
+        "rescue",
+        "induction",
+        "necessity",
+    )
+    values = {key: np.ones((2, 2)) for key in keys}
+    intervals = {
+        key: (np.full((2, 2), 0.5), np.full((2, 2), 1.5)) for key in keys
+    }
+    fig, _ = causal_family_panels(
+        ("semantic_leaning", "structural_leaning"),
+        values,
+        intervals=intervals,
+    )
+    fig.clf()
+    curve = {
+        "semantic_leaning": {
+            "prefix": [1, 2],
+            "gross": {"semantic": [0.1, 0.2], "structural": [0.0, 0.1]},
+            "gross_interval": {
+                "semantic": ([0.0, 0.1], [0.2, 0.3]),
+                "structural": ([-0.1, 0.0], [0.1, 0.2]),
+            },
+            "necessity": {"semantic": [0.1, 0.2], "structural": [0.0, 0.1]},
+            "necessity_interval": {
+                "semantic": ([0.0, 0.1], [0.2, 0.3]),
+                "structural": ([-0.1, 0.0], [0.1, 0.2]),
+            },
+        }
+    }
+    fig, _ = cumulative_prefix_curves(curve)
+    fig.clf()
+    fig, _ = attention_distance_profiles(
+        (0, 1), {"semantic_leaning": [0.7, 0.3]}
+    )
     fig.clf()

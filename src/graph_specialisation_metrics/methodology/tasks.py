@@ -24,15 +24,26 @@ FIXED_SUPPORT_FIELDS = (
 def _mae_per_graph(prediction, target):
     import torch
 
-    return torch.abs(prediction - target).reshape(prediction.shape[0], -1).mean(dim=1)
+    error = torch.abs(prediction - target).reshape(prediction.shape[0], -1)
+    valid = torch.isfinite(error)
+    return torch.where(valid, error, torch.zeros_like(error)).sum(dim=1) / valid.sum(
+        dim=1
+    ).clamp_min(1)
 
 
 def _bce_per_graph(prediction, target):
     import torch
 
-    return torch.nn.functional.binary_cross_entropy_with_logits(
-        prediction, target.to(prediction.dtype), reduction="none"
-    ).reshape(prediction.shape[0], -1).mean(dim=1)
+    target = target.to(prediction.dtype)
+    valid = torch.isfinite(target)
+    safe_target = torch.where(valid, target, torch.zeros_like(target))
+    error = torch.nn.functional.binary_cross_entropy_with_logits(
+        prediction, safe_target, reduction="none"
+    ).reshape(prediction.shape[0], -1)
+    valid = valid.reshape(prediction.shape[0], -1)
+    return torch.where(valid, error, torch.zeros_like(error)).sum(dim=1) / valid.sum(
+        dim=1
+    ).clamp_min(1)
 
 
 @dataclass(frozen=True)
@@ -52,7 +63,7 @@ class OutputGeometry:
             if training_targets is None:
                 raise ValueError("training_target_std requires training targets")
             values = np.asarray(training_targets, dtype=np.float64).reshape(-1, int(outputs))
-            scale = np.std(values, axis=0, ddof=0)
+            scale = np.nanstd(values, axis=0, ddof=0)
         else:
             raise ValueError(f"unknown sigma policy {self.sigma_policy!r}")
         if scale.shape != (int(outputs),):
@@ -134,6 +145,9 @@ def _known_task(name: str) -> CanonicalTask:
         grit=grit,
         output=output,
         loss_per_graph=loss,
+        fixed_support_fields=(
+            FIXED_SUPPORT_FIELDS + (("pos",) if name.startswith("qm9_") else ())
+        ),
         virtual_node=virtual,
         carrier_policy=("real_nodes_plus_internal_vnode" if virtual else "real_nodes"),
     )

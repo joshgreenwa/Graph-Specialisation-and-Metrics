@@ -89,6 +89,7 @@ in Section 12 of the normative README.
         *.png
         *.metadata.json
       figures.json
+    population.json              # seed estimates; population CI only with >=3 seeds
 ```
 
 Training checkpoints and dataset caches are read-only. Analysis caches bind the protocol
@@ -96,3 +97,8 @@ fingerprint, checkpoint SHA-256, task adapter, output representation and sigma, 
 split IDs, event manifest, donor/source dose, bootstrap seed, `F_sens`, and the positive-beneficial
 sign convention.
 
+The score cache also retains clean attention distance mass and frozen-family exact/support-
+normalized score profiles as descriptive diagnostics. These never replace the transport score.
+When at least three training seeds are run, `population.json` bootstraps seed-level summary and
+association estimates without aligning head indices; with fewer seeds it records the individual
+seed estimates and explicitly suppresses a seed-population interval.

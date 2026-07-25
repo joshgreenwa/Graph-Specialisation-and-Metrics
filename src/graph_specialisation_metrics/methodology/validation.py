@@ -37,7 +37,46 @@ def _targets(prepared: Any, scores: Mapping[str, Any]) -> dict[str, tuple[tuple[
     for name, family in scores.get("matched_controls", {}).items():
         if family:
             result[f"control_{name}"] = tuple(tuple(value) for value in family)
+            for prefix in range(1, len(family) + 1):
+                result[f"control_prefix_{name}_{prefix}"] = tuple(
+                    tuple(value) for value in family[:prefix]
+                )
     return result
+
+
+def _reference_target_names(
+    target: str,
+    target_order: Sequence[str],
+) -> list[str]:
+    """Matched reference population for a head, family, or cumulative prefix."""
+
+    if target.startswith("head_"):
+        return [name for name in target_order if name.startswith("head_")]
+    for leaning in ("semantic_leaning", "structural_leaning"):
+        if target == f"family_{leaning}":
+            return [
+                name
+                for name in target_order
+                if name.startswith(f"control_{leaning}_")
+                and not name.startswith("control_prefix_")
+            ]
+        prefix = f"prefix_{leaning}_"
+        if target.startswith(prefix):
+            size = target.removeprefix(prefix)
+            return [
+                name
+                for name in target_order
+                if name.startswith(f"control_prefix_{leaning}_")
+                and name.endswith(f"_{size}")
+            ]
+    return [name for name in target_order if name.startswith("head_")]
+
+
+def _requires_matched_reference(target: str) -> bool:
+    return target in {
+        "family_semantic_leaning",
+        "family_structural_leaning",
+    } or target.startswith(("prefix_semantic_leaning_", "prefix_structural_leaning_"))
 
 
 def _aggregate(records: Sequence[Mapping[str, Any]], key: str) -> float:
@@ -64,6 +103,7 @@ def _mismatch_indices(records: Sequence[Any]) -> list[int]:
             for other, candidate in enumerate(records)
             if candidate.source == record.source
             and candidate.payload_fingerprint != record.payload_fingerprint
+            and candidate.degree_gap == record.degree_gap
             and other != position
         ]
         if not candidates:
@@ -71,6 +111,7 @@ def _mismatch_indices(records: Sequence[Any]) -> list[int]:
                 other
                 for other, candidate in enumerate(records)
                 if candidate.payload_fingerprint != record.payload_fingerprint
+                and candidate.degree_gap == record.degree_gap
                 and other != position
             ]
         if not candidates:
@@ -94,6 +135,7 @@ def _clean_ablation_stage(
     prepared: Any,
     config: Any,
     targets: Mapping[str, Sequence[tuple[int, int]]],
+    scores: Mapping[str, Any],
 ) -> dict[str, Any]:
     from .runner import _stage_ids
 
@@ -182,10 +224,37 @@ def _clean_ablation_stage(
                 ),
             )
         )
+    endpoint_interval = nested_percentile_interval(
+        vector_observations, config.bootstrap
+    )
+    head_positions = [
+        position for position, name in enumerate(names) if name.startswith("head_")
+    ]
+    J = scores["coordinates"].joint_sensitivity.reshape(-1)
+
+    def association_transform(value):
+        head_values = value[head_positions]
+        return np.asarray(
+            (
+                _spearman(J, head_values[:, 0])["rho"],
+                _spearman(J, head_values[:, 1])["rho"],
+            )
+        )
+
+    association_interval = nested_percentile_interval(
+        vector_observations,
+        config.bootstrap,
+        transform=association_transform,
+    )
     output["_intervals"] = {
         "target_order": names,
         "endpoint_order": ("prediction_movement", "loss_change"),
-        "interval": nested_percentile_interval(vector_observations, config.bootstrap),
+        "interval": endpoint_interval,
+        "association_order": (
+            "J_vs_clean_prediction_movement",
+            "J_vs_clean_loss_change",
+        ),
+        "association_interval": association_interval,
     }
     return output
 
@@ -287,11 +356,19 @@ def _causal_events(
                 aligned_adjusted = mismatch_adjusted_aligned(matched, mismatched)
                 rows = records_by_target[target_name][channel]
                 for position, record in enumerate(records):
+                    mismatch_record = records[mismatch[position]]
                     rows.append(
                         {
                             "graph": int(graph_id),
                             "source": int(record.source),
                             "donor": int(record.draw),
+                            "mismatch_source": int(mismatch_record.source),
+                            "mismatch_donor": int(mismatch_record.draw),
+                            "mismatch_payload_fingerprint": (
+                                mismatch_record.payload_fingerprint
+                            ),
+                            "mismatch_dose": float(mismatch_record.dose),
+                            "matched_dose": float(record.dose),
                             "G_c": float(gross_adjusted[position]),
                             "P_gross_matched": float(
                                 matched.bidirectional_gross[position]
@@ -327,6 +404,7 @@ def _summarize_causal(
     event_output: Mapping[str, Any],
     targets: Mapping[str, Sequence[tuple[int, int]]],
     config: Any,
+    scores: Mapping[str, Any],
 ) -> dict[str, Any]:
     records = event_output["records"]
     summary: dict[str, dict[str, Any]] = {}
@@ -365,7 +443,36 @@ def _summarize_causal(
             [summary[name][channel]["gross_necessity"] for name in head_targets],
             floor=config.numerical.effect_floor,
         )
+    family_reference_scales = {}
+    target_order = list(targets)
     for target in targets:
+        reference_names = _reference_target_names(target, target_order)
+        if _requires_matched_reference(target) and not reference_names:
+            raise RuntimeError(
+                f"{target!r} has no frozen same-composition matched reference family"
+            )
+        if not reference_names:
+            reference_names = head_targets
+        target_gross_scales = {
+            channel: reference_scale(
+                [
+                    summary[name][channel]["P_gross_matched"]
+                    for name in reference_names
+                ],
+                floor=config.numerical.effect_floor,
+            )
+            for channel in CHANNELS
+        }
+        target_necessity_scales = {
+            channel: reference_scale(
+                [
+                    summary[name][channel]["gross_necessity"]
+                    for name in reference_names
+                ],
+                floor=config.numerical.effect_floor,
+            )
+            for channel in CHANNELS
+        }
         summary[target]["calibrated"] = {
             key: float(value)
             for key, value in calibrated_targets(
@@ -373,10 +480,19 @@ def _summarize_causal(
                 summary[target]["structural"]["G_c"],
                 summary[target]["semantic"]["necessity"],
                 summary[target]["structural"]["necessity"],
-                gross_scales=gross_scales,
-                necessity_scales=necessity_scales,
+                gross_scales=target_gross_scales,
+                necessity_scales=target_necessity_scales,
             ).items()
         }
+        summary[target]["calibration_reference"] = {
+            "targets": reference_names,
+            "gross_scales": target_gross_scales,
+            "necessity_scales": target_necessity_scales,
+        }
+        if not target.startswith("head_"):
+            family_reference_scales[target] = summary[target][
+                "calibration_reference"
+            ]
     endpoint_order = (
         "G_c",
         "P_gross_matched",
@@ -388,7 +504,6 @@ def _summarize_causal(
         "necessity",
         "gross_necessity",
     )
-    target_order = list(targets)
     head_positions = [
         position for position, name in enumerate(target_order) if name.startswith("head_")
     ]
@@ -420,30 +535,83 @@ def _summarize_causal(
 
         def transform(value):
             # Recompute positive unadjusted reference scales in every bootstrap draw.
-            a_g = np.asarray(
-                [
-                    np.mean(value[channel, head_positions, endpoint_order.index("P_gross_matched")])
-                    for channel in range(len(CHANNELS))
-                ]
-            )
-            a_n = np.asarray(
-                [
-                    np.mean(value[channel, head_positions, endpoint_order.index("gross_necessity")])
-                    for channel in range(len(CHANNELS))
-                ]
-            )
             G = value[:, :, endpoint_order.index("G_c")]
             N = value[:, :, endpoint_order.index("necessity")]
-            calibrated = np.stack(
+            calibrated_rows = []
+            for target_index, target in enumerate(target_order):
+                reference_names = _reference_target_names(target, target_order)
+                if _requires_matched_reference(target) and not reference_names:
+                    raise RuntimeError(
+                        f"{target!r} has no matched reference in a causal bootstrap draw"
+                    )
+                reference_positions = [
+                    target_order.index(name) for name in reference_names
+                ] or head_positions
+                a_g = np.asarray(
+                    [
+                        np.mean(
+                            value[
+                                channel,
+                                reference_positions,
+                                endpoint_order.index("P_gross_matched"),
+                            ]
+                        )
+                        for channel in range(len(CHANNELS))
+                    ]
+                )
+                a_n = np.asarray(
+                    [
+                        np.mean(
+                            value[
+                                channel,
+                                reference_positions,
+                                endpoint_order.index("gross_necessity"),
+                            ]
+                        )
+                        for channel in range(len(CHANNELS))
+                    ]
+                )
+                if np.any(a_g <= config.numerical.effect_floor) or np.any(
+                    a_n <= config.numerical.effect_floor
+                ):
+                    raise RuntimeError(
+                        "a causal bootstrap reference scale fell below the registered floor"
+                    )
+                calibrated_rows.append(
+                    (
+                        0.5
+                        * (
+                            G[0, target_index] / a_g[0]
+                            + G[1, target_index] / a_g[1]
+                        ),
+                        G[0, target_index] / a_g[0]
+                        - G[1, target_index] / a_g[1],
+                        0.5
+                        * (
+                            N[0, target_index] / a_n[0]
+                            + N[1, target_index] / a_n[1]
+                        ),
+                        N[0, target_index] / a_n[0]
+                        - N[1, target_index] / a_n[1],
+                    )
+                )
+            calibrated = np.asarray(calibrated_rows)
+            coordinates = scores["coordinates"]
+            J = coordinates.joint_sensitivity.reshape(-1)
+            D = coordinates.selectivity.reshape(-1)
+            active = coordinates.active.reshape(-1)
+            head_calibrated = calibrated[head_positions]
+            associations = np.asarray(
                 (
-                    0.5 * (G[0] / a_g[0] + G[1] / a_g[1]),
-                    G[0] / a_g[0] - G[1] / a_g[1],
-                    0.5 * (N[0] / a_n[0] + N[1] / a_n[1]),
-                    N[0] / a_n[0] - N[1] / a_n[1],
-                ),
-                axis=-1,
+                    _spearman(J, head_calibrated[:, 0])["rho"],
+                    _spearman(D[active], head_calibrated[active, 1])["rho"],
+                    _spearman(J, head_calibrated[:, 2])["rho"],
+                    _spearman(D[active], head_calibrated[active, 3])["rho"],
+                )
             )
-            return np.concatenate((value.reshape(-1), calibrated.reshape(-1)))
+            return np.concatenate(
+                (value.reshape(-1), calibrated.reshape(-1), associations)
+            )
 
         causal_interval = nested_percentile_interval(
             causal_observations, config.bootstrap, transform=transform
@@ -454,6 +622,7 @@ def _summarize_causal(
         "targets": summary,
         "gross_reference_scales": gross_scales,
         "necessity_reference_scales": necessity_scales,
+        "family_reference_scales": family_reference_scales,
         "intervals": {
             "target_order": target_order,
             "channel_order": CHANNELS,
@@ -463,6 +632,12 @@ def _summarize_causal(
                 "gross_contrast_for_D_rel",
                 "necessity_total_for_J",
                 "necessity_contrast_for_D_rel",
+            ),
+            "association_order": (
+                "J_vs_gross_total",
+                "D_rel_vs_gross_contrast_active",
+                "J_vs_necessity_total",
+                "D_rel_vs_necessity_contrast_active",
             ),
             "interval": causal_interval,
         },
@@ -629,19 +804,11 @@ def _association_report(
     return report
 
 
-def run_causal_validation(
-    prepared: Any,
-    config: Any,
-    scores: Mapping[str, Any],
-) -> dict[str, Any]:
-    """Run all-head validation and frozen-family causal confirmation on disjoint graphs."""
-
+def _causal_cache(prepared: Any, config: Any, scores: Mapping[str, Any]):
     from .cache import CanonicalCache
     from .protocol import stable_hash
     from .runner import _cache, _stage_plan
 
-    if scores is None:
-        raise ValueError("causal validation requires discovery scores")
     plan = _stage_plan(prepared, config, "causal")
     base_cache = _cache(prepared, config, plan)
     causal_manifest = stable_hash(
@@ -651,21 +818,56 @@ def run_causal_validation(
             "matched_controls": scores.get("matched_controls", {}),
         }
     )
-    cache = CanonicalCache(
+    return plan, CanonicalCache(
         config.root,
         dataclasses.replace(
             base_cache.contract, event_manifest_hash=causal_manifest
         ),
     )
+
+
+def load_cached_causal_validation(
+    prepared: Any,
+    config: Any,
+    scores: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    if scores is None:
+        return None
+    _, cache = _causal_cache(prepared, config, scores)
+    return cache.load("causal", "validation")
+
+
+def run_causal_validation(
+    prepared: Any,
+    config: Any,
+    scores: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Run all-head validation and frozen-family causal confirmation on disjoint graphs."""
+
+    if scores is None:
+        raise ValueError("causal validation requires discovery scores")
+    plan, cache = _causal_cache(prepared, config, scores)
     if config.resume and not config.force:
         cached = cache.load("causal", "validation")
         if cached is not None:
             return cached
     targets = _targets(prepared, scores)
-    clean = _clean_ablation_stage(prepared, config, targets)
+    clean = _clean_ablation_stage(prepared, config, targets, scores)
     events = _causal_events(prepared, config, scores, targets, plan)
-    summary = _summarize_causal(events, targets, config)
+    summary = _summarize_causal(events, targets, config, scores)
     associations = _association_report(prepared, scores, summary, clean, config)
+    causal_interval = summary["intervals"]["interval"]
+    if causal_interval is not None:
+        association_count = len(summary["intervals"]["association_order"])
+        associations["nested_interval_order"] = summary["intervals"][
+            "association_order"
+        ]
+        associations["nested_interval_low"] = causal_interval.low[
+            -association_count:
+        ]
+        associations["nested_interval_high"] = causal_interval.high[
+            -association_count:
+        ]
     target_summary = summary["targets"]
     sem_name = "family_semantic_leaning"
     str_name = "family_structural_leaning"
@@ -682,14 +884,23 @@ def run_causal_validation(
         family_interactions["gross_score_validation"] = float(
             semantic_focus - structural_focus
         )
-        a_g = summary["gross_reference_scales"]
+        sem_a_g = target_summary[sem_name]["calibration_reference"][
+            "gross_scales"
+        ]
+        str_a_g = target_summary[str_name]["calibration_reference"][
+            "gross_scales"
+        ]
         sem_aligned = (
-            target_summary[sem_name]["semantic"]["M_align"] / a_g["semantic"]
-            - target_summary[sem_name]["structural"]["M_align"] / a_g["structural"]
+            target_summary[sem_name]["semantic"]["M_align"]
+            / sem_a_g["semantic"]
+            - target_summary[sem_name]["structural"]["M_align"]
+            / sem_a_g["structural"]
         )
         str_aligned = (
-            target_summary[str_name]["semantic"]["M_align"] / a_g["semantic"]
-            - target_summary[str_name]["structural"]["M_align"] / a_g["structural"]
+            target_summary[str_name]["semantic"]["M_align"]
+            / str_a_g["semantic"]
+            - target_summary[str_name]["structural"]["M_align"]
+            / str_a_g["structural"]
         )
         family_interactions["aligned_rescue_induction"] = float(
             sem_aligned - str_aligned

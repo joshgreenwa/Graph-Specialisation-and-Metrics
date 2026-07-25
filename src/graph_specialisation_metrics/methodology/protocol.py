@@ -203,6 +203,10 @@ class MethodologyConfig:
             "raw_score_aggregation": "event -> source -> graph",
             "functional_estimand": "F_sens",
             "beneficial_sign": "positive-is-beneficial",
+            "causal_mismatch_control": (
+                "same graph/channel/degree tier; distinct donor; prefer same source; "
+                "minimum absolute intervention-dose gap"
+            ),
         }
 
     @property

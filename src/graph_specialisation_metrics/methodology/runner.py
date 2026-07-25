@@ -5,6 +5,7 @@ from __future__ import annotations
 import dataclasses
 import gc
 import platform
+import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -39,8 +40,10 @@ from .figures import (
     FigureTheme,
     HeadPlotData,
     TASK_FIGURE_MODIFIERS,
+    attention_distance_profiles,
     causal_family_panels,
     causal_scatter_grid,
+    cumulative_prefix_curves,
     carriage_profiles,
     distance_heatmaps,
     joint_selectivity_plane,
@@ -78,6 +81,19 @@ class PreparedTask:
     sigma: np.ndarray
     splits: SplitManifest
     donor_pool: SemanticDonorPool
+
+
+def _repository_commit() -> str:
+    root = Path(__file__).resolve().parents[3]
+    try:
+        return subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    except (OSError, subprocess.CalledProcessError):
+        return "unknown"
 
 
 def _model_audits(
@@ -341,6 +357,7 @@ def prepare_task(
     )
     model_record = {
         "protocol_version": PROTOCOL_VERSION,
+        "repository_commit": _repository_commit(),
         "task": task_name,
         "title": task.title,
         "train_seed": int(train_seed),
@@ -483,6 +500,7 @@ def _cache(
             donors_per_source=int(config.sizes.donors_per_source),
             source_cap=int(config.sizes.sources_per_graph),
             bootstrap_seed=int(config.bootstrap.rng_seed),
+            repository_commit=_repository_commit(),
             bootstrap_replicates=int(config.bootstrap.replicates),
         ),
     )
@@ -540,6 +558,51 @@ def _distance_axis(prepared: PreparedTask, graph_ids: Sequence[int]) -> Distance
     return DistanceAxis(tuple(labels))
 
 
+def _clean_attention_distance(
+    prepared: PreparedTask,
+    base: Any,
+    pristine: np.ndarray,
+    axis: DistanceAxis,
+) -> np.ndarray:
+    """Normalize clean attention by graph and head before any family averaging."""
+
+    from torch_geometric.data import Batch
+
+    batch = Batch.from_data_list([base.clone()]).to(prepared.grit.device)
+    captured = prepared.grit.capture(
+        batch,
+        want_grad=False,
+        want_attn=True,
+        include_virtual_transport=True,
+    )
+    edge_index = captured["edge_index"].detach().cpu().numpy()
+    buckets = []
+    for sender, receiver in edge_index.T:
+        if int(sender) >= int(base.num_nodes) or int(receiver) >= int(base.num_nodes):
+            buckets.append(axis.index("virtual"))
+        else:
+            buckets.append(axis.index(pristine[int(receiver), int(sender)]))
+    buckets = np.asarray(buckets, dtype=np.int64)
+    profile = np.zeros(
+        (int(prepared.grit.L), int(prepared.grit.H), len(axis.labels)),
+        dtype=np.float64,
+    )
+    for layer, attention in enumerate(captured["attn"]):
+        values = attention.detach().cpu().numpy()
+        for distance_index in range(len(axis.labels)):
+            mask = buckets == distance_index
+            if mask.any():
+                profile[layer, :, distance_index] = values[mask].sum(axis=0)
+        denominator = profile[layer].sum(axis=-1, keepdims=True)
+        np.divide(
+            profile[layer],
+            denominator,
+            out=profile[layer],
+            where=denominator > 0,
+        )
+    return profile
+
+
 def run_scores(
     prepared: PreparedTask,
     config: MethodologyConfig,
@@ -570,6 +633,7 @@ def run_scores(
         channel: [] for channel in CHANNELS
     }
     throughput_graph: dict[int, np.ndarray] = {}
+    attention_graph: dict[int, np.ndarray] = {}
     for channel in CHANNELS:
         graph_scores: dict[int, np.ndarray] = {}
         graph_contribution: dict[int, np.ndarray] = {}
@@ -579,12 +643,21 @@ def run_scores(
             base = prepared.grit.eval_ds[int(graph_id)]
             clean = prepared.backend.clean_jacobians(base)
             if channel == "semantic":
-                throughput_graph[graph_id] = torch.stack(
-                    [
-                        torch.linalg.vector_norm(layer.detach(), dim=-1).sum(dim=0)
-                        for layer in clean.capture.transport
-                    ]
-                ).cpu().numpy()
+                clean_transport = torch.stack(clean.capture.transport, dim=0)
+                projected_clean = torch.einsum(
+                    "lnhd,tlnhd->lhnt",
+                    clean_transport,
+                    clean.transport,
+                )
+                throughput_graph[graph_id] = (
+                    projected_clean.square()
+                    .sum(dim=-1)
+                    .sqrt()
+                    .sum(dim=-1)
+                    .detach()
+                    .cpu()
+                    .numpy()
+                )
             sources = plan[graph_id][channel]["sources"]
             variants, records = _rebuild_graph_events(
                 prepared, config, "scores", graph_id, channel, sources
@@ -607,6 +680,10 @@ def run_scores(
             event_c = []
             event_o = []
             pristine = shortest_path_distances(base.edge_index, int(base.num_nodes))
+            if channel == "semantic":
+                attention_graph[graph_id] = _clean_attention_distance(
+                    prepared, base, pristine, axis
+                )
             for position, record in enumerate(records):
                 distances: list[Any] = list(pristine[int(record.source), :])
                 if q.shape[3] == int(base.num_nodes) + 1:
@@ -712,6 +789,10 @@ def run_scores(
     output["clean_throughput"] = np.stack(
         [throughput_graph[key] for key in sorted(throughput_graph)]
     ).mean(axis=0)
+    output["clean_attention_distance_graph"] = attention_graph
+    output["clean_attention_distance"] = np.stack(
+        [attention_graph[key] for key in sorted(attention_graph)]
+    ).mean(axis=0)
     output["families"] = freeze_families(
         coordinates,
         tail_fraction=config.families.tail_fraction,
@@ -759,6 +840,27 @@ def run_scores(
                 ),
             }
         channel_output["family_distance_profiles"] = family_profiles
+    output["family_attention_distance"] = {
+        family_name: np.mean(
+            np.stack(
+                [
+                    np.mean(
+                        np.stack(
+                            [
+                                attention_graph[graph_id][layer, head]
+                                for layer, head in family
+                            ]
+                        ),
+                        axis=0,
+                    )
+                    for graph_id in sorted(attention_graph)
+                ]
+            ),
+            axis=0,
+        )
+        for family_name, family in output["families"].items()
+        if family
+    }
 
     # Paired channel draws transform the complete hierarchy through normalization and J/D_rel.
     semantic_by_key = {
@@ -965,14 +1067,67 @@ def run_carriage(
         bins = adaptive_distance_bins(maximum_distance)
         far_thresholds = tuple(range(maximum_distance + 1))
         additive = {
-            graph_id: additive_beneficial_mass(
-                field["B"],
-                field["distance"],
-                bins=bins,
-                far_thresholds=far_thresholds,
-            )
+            graph_id: {
+                key: value
+                * (
+                    int(prepared.grit.eval_ds[int(graph_id)].num_nodes)
+                    / len(field["sources"])
+                )
+                for key, value in additive_beneficial_mass(
+                    field["B"],
+                    field["distance"],
+                    bins=bins,
+                    far_thresholds=far_thresholds,
+                ).items()
+            }
             for graph_id, field in graph_fields.items()
         }
+        additive_observations = []
+        for graph_id, field in graph_fields.items():
+            n = int(prepared.grit.eval_ds[int(graph_id)].num_nodes)
+            event_b = np.asarray(field["event_B"])
+            distance = np.asarray(field["distance"])
+            for source_position, source in enumerate(field["sources"]):
+                for donor in range(event_b.shape[1]):
+                    source_values = event_b[source_position, donor]
+                    bin_values = [
+                        np.sum(
+                            source_values[
+                                np.isfinite(distance[:, source_position])
+                                & (distance[:, source_position] >= lower)
+                                & (distance[:, source_position] <= upper)
+                            ]
+                        )
+                        for lower, upper in bins
+                    ]
+                    far_values = [
+                        np.sum(
+                            source_values[
+                                np.isfinite(distance[:, source_position])
+                                & (distance[:, source_position] > threshold)
+                            ]
+                        )
+                        for threshold in far_thresholds
+                    ]
+                    # Source sampling is uniform without replacement. Multiplying each
+                    # source contribution by n makes the later source mean a total-mass
+                    # estimator for the graph rather than a per-source mean.
+                    additive_observations.append(
+                        Observation(
+                            seed=int(prepared.grit.sc.seed),
+                            graph=int(graph_id),
+                            source=int(source),
+                            donor=int(donor),
+                            value=n
+                            * np.asarray(
+                                [*bin_values, *far_values], dtype=np.float64
+                            ),
+                        )
+                    )
+        additive_interval = nested_percentile_interval(
+            additive_observations, config.bootstrap
+        )
+        bin_count = len(bins)
         output["channels"][channel] = {
             "graph_fields": graph_fields,
             "pairs": pair_rows,
@@ -981,12 +1136,15 @@ def run_carriage(
             "capped_fraction": capped_fraction,
             "distance_bins": bins,
             "far_thresholds": far_thresholds,
-            "S_B": np.stack(
-                [additive[key]["S_B"] for key in sorted(additive)]
-            ).mean(axis=0),
-            "B_far": np.stack(
-                [additive[key]["B_far"] for key in sorted(additive)]
-            ).mean(axis=0),
+            "S_B": additive_interval.estimate[:bin_count],
+            "B_far": additive_interval.estimate[bin_count:],
+            "additive_intervals": {
+                "order": (
+                    tuple(f"{lower}-{upper}" for lower, upper in bins)
+                    + tuple(f"far>{value}" for value in far_thresholds)
+                ),
+                "interval": additive_interval,
+            },
             "additive_graph": additive,
         }
     cache.save("carriage", "fields", output)
@@ -1093,6 +1251,7 @@ def make_figures(
         modifier=TASK_FIGURE_MODIFIERS.get(prepared.task.name),
         common_metadata={
             "protocol_version": PROTOCOL_VERSION,
+            "repository_commit": _repository_commit(),
             "protocol_fingerprint": config.fingerprint,
             "checkpoint_sha256": prepared.checkpoint_sha,
             "output_representation": prepared.task.output.representation,
@@ -1195,6 +1354,23 @@ def make_figures(
                 },
             )
             saved[f"{channel}_carriage"] = [str(path) for path in paths]
+    if scores.get("family_attention_distance"):
+        fig, axes = attention_distance_profiles(
+            scores["axis"],
+            scores["family_attention_distance"],
+            theme=theme,
+        )
+        paths = builder.save(
+            "clean_attention_distance_profiles",
+            fig,
+            axes,
+            metadata={
+                "task": prepared.task.name,
+                "seed": int(prepared.grit.sc.seed),
+                "status": "descriptive routing diagnostic",
+            },
+        )
+        saved["attention_distance"] = [str(path) for path in paths]
     if causal is not None:
         coordinates = scores["coordinates"]
         layers = np.repeat(
@@ -1248,8 +1424,13 @@ def make_figures(
         )
         raw_low = interval_object.low[:raw_size].reshape(point_raw.shape)
         raw_high = interval_object.high[:raw_size].reshape(point_raw.shape)
-        calibrated_low = interval_object.low[raw_size:].reshape(point_calibrated.shape)
-        calibrated_high = interval_object.high[raw_size:].reshape(point_calibrated.shape)
+        calibrated_size = point_calibrated.size
+        calibrated_low = interval_object.low[
+            raw_size : raw_size + calibrated_size
+        ].reshape(point_calibrated.shape)
+        calibrated_high = interval_object.high[
+            raw_size : raw_size + calibrated_size
+        ].reshape(point_calibrated.shape)
         head_positions = [target_position[name] for name in head_names]
         clean_interval_meta = causal["clean_ablation"]["_intervals"]
         clean_order = {
@@ -1414,7 +1595,6 @@ def make_figures(
             if name in target_position
         ]
         if family_names:
-            family_positions = [target_position[name] for name in family_names]
             metric_map = {
                 "restoration_gross": "R_gross",
                 "injection_gross": "I_gross",
@@ -1422,34 +1602,107 @@ def make_figures(
                 "induction": "I_align",
                 "necessity": "necessity",
             }
-            family_values = {
-                key: point_raw[:, family_positions, endpoint_order.index(endpoint)]
-                for key, endpoint in metric_map.items()
-            }
-            family_intervals = {
-                key: (
-                    raw_low[:, family_positions, endpoint_order.index(endpoint)],
-                    raw_high[:, family_positions, endpoint_order.index(endpoint)],
+
+            def save_family_figure(names, file_name, output_key):
+                positions = [target_position[name] for name in names]
+                values = {
+                    key: point_raw[:, positions, endpoint_order.index(endpoint)]
+                    for key, endpoint in metric_map.items()
+                }
+                intervals = {
+                    key: (
+                        raw_low[:, positions, endpoint_order.index(endpoint)],
+                        raw_high[:, positions, endpoint_order.index(endpoint)],
+                    )
+                    for key, endpoint in metric_map.items()
+                }
+                family_figure, family_axes = causal_family_panels(
+                    names,
+                    values,
+                    intervals=intervals,
+                    theme=theme,
                 )
-                for key, endpoint in metric_map.items()
-            }
-            fig, axes = causal_family_panels(
-                family_names,
-                family_values,
-                intervals=family_intervals,
-                theme=theme,
+                family_paths = builder.save(
+                    file_name,
+                    family_figure,
+                    family_axes,
+                    metadata={
+                        "task": prepared.task.name,
+                        "seed": int(prepared.grit.sc.seed),
+                    },
+                )
+                saved[output_key] = [str(path) for path in family_paths]
+
+            save_family_figure(
+                family_names, "causal_family_endpoints", "causal_families"
             )
-            paths = builder.save(
-                "causal_family_endpoints",
-                fig,
-                axes,
-                metadata={
-                    "task": prepared.task.name,
-                    "seed": int(prepared.grit.sc.seed),
-                    "controls": list(scores.get("matched_controls", {})),
-                },
-            )
-            saved["causal_families"] = [str(path) for path in paths]
+            control_names = [
+                name for name in target_order if name.startswith("control_")
+            ]
+            if control_names:
+                save_family_figure(
+                    control_names,
+                    "causal_matched_control_endpoints",
+                    "causal_controls",
+                )
+            prefix_curves = {}
+            for family in ("semantic_leaning", "structural_leaning"):
+                names = sorted(
+                    (
+                        name
+                        for name in target_order
+                        if name.startswith(f"prefix_{family}_")
+                    ),
+                    key=lambda name: int(name.rsplit("_", 1)[1]),
+                )
+                if not names:
+                    continue
+                positions = [target_position[name] for name in names]
+                gross_index = endpoint_order.index("G_c")
+                necessity_index = endpoint_order.index("necessity")
+                prefix_curves[family] = {
+                    "prefix": [int(name.rsplit("_", 1)[1]) for name in names],
+                    "gross": {
+                        "semantic": point_raw[0, positions, gross_index],
+                        "structural": point_raw[1, positions, gross_index],
+                    },
+                    "gross_interval": {
+                        "semantic": (
+                            raw_low[0, positions, gross_index],
+                            raw_high[0, positions, gross_index],
+                        ),
+                        "structural": (
+                            raw_low[1, positions, gross_index],
+                            raw_high[1, positions, gross_index],
+                        ),
+                    },
+                    "necessity": {
+                        "semantic": point_raw[0, positions, necessity_index],
+                        "structural": point_raw[1, positions, necessity_index],
+                    },
+                    "necessity_interval": {
+                        "semantic": (
+                            raw_low[0, positions, necessity_index],
+                            raw_high[0, positions, necessity_index],
+                        ),
+                        "structural": (
+                            raw_low[1, positions, necessity_index],
+                            raw_high[1, positions, necessity_index],
+                        ),
+                    },
+                }
+            if prefix_curves:
+                fig, axes = cumulative_prefix_curves(prefix_curves, theme=theme)
+                paths = builder.save(
+                    "causal_cumulative_prefix_curves",
+                    fig,
+                    axes,
+                    metadata={
+                        "task": prepared.task.name,
+                        "seed": int(prepared.grit.sc.seed),
+                    },
+                )
+                saved["causal_prefixes"] = [str(path) for path in paths]
     atomic_json(prepared.output_dir / "figures.json", saved)
     return saved
 
@@ -1469,6 +1722,10 @@ def run_prepared(prepared: PreparedTask, config: MethodologyConfig) -> dict[str,
         from .validation import run_causal_validation
 
         causal = run_causal_validation(prepared, config, scores)
+    elif "figures" in config.phases:
+        from .validation import load_cached_causal_validation
+
+        causal = load_cached_causal_validation(prepared, config, scores)
     figures = (
         make_figures(prepared, config, scores, carriage, causal)
         if "figures" in config.phases
@@ -1493,7 +1750,9 @@ def run_methodology(
     """Public non-Colab entry point."""
 
     config.validate()
-    atomic_json(config.root / "protocol.json", config.record())
+    protocol_record = config.record()
+    protocol_record["repository_commit"] = _repository_commit()
+    atomic_json(config.root / "protocol.json", protocol_record)
     results: dict[str, Any] = {}
     for task_name in config.tasks:
         for train_seed in config.train_seeds:
@@ -1512,16 +1771,113 @@ def run_methodology(
                     torch.cuda.empty_cache()
             except ImportError:
                 pass
+    population: dict[str, Any] = {}
+    for task_name in config.tasks:
+        task_results = [
+            value for value in results.values() if value["task"] == task_name
+        ]
+        seed_rows = []
+        for value in task_results:
+            scores = value.get("scores")
+            if scores is None:
+                continue
+            coordinates = scores["coordinates"]
+            row = {
+                "seed": int(value["seed"]),
+                "mean_raw_semantic_score": float(
+                    np.mean(scores["channels"]["semantic"]["raw"])
+                ),
+                "mean_raw_structural_score": float(
+                    np.mean(scores["channels"]["structural"]["raw"])
+                ),
+                "median_active_selectivity": float(
+                    np.median(
+                        coordinates.selectivity[coordinates.active]
+                    )
+                    if coordinates.active.any()
+                    else np.nan
+                ),
+                "active_head_fraction": float(np.mean(coordinates.active)),
+            }
+            causal_value = value.get("causal")
+            if causal_value is not None:
+                association = causal_value["associations"]
+                for name in (
+                    "J_vs_clean_prediction_movement",
+                    "J_vs_gross_total",
+                    "J_vs_necessity_total",
+                ):
+                    if name in association:
+                        row[f"rho_{name}"] = float(
+                            association[name]["pooled"]["rho"]
+                        )
+                for name in (
+                    "D_rel_vs_gross_contrast",
+                    "D_rel_vs_necessity_contrast",
+                ):
+                    if name in association:
+                        row[f"rho_{name}"] = float(
+                            association[name]["pooled_active"]["rho"]
+                        )
+            seed_rows.append(row)
+        if not seed_rows:
+            continue
+        numeric_keys = [
+            key
+            for key in seed_rows[0]
+            if key != "seed" and all(key in row for row in seed_rows)
+        ]
+        task_population: dict[str, Any] = {
+            "seed_estimates": seed_rows,
+            "head_alignment": "not assumed; summaries are computed within seed",
+        }
+        if len(seed_rows) >= 3:
+            matrix = np.asarray(
+                [[row[key] for key in numeric_keys] for row in seed_rows],
+                dtype=np.float64,
+            )
+            rng = np.random.default_rng(config.bootstrap.rng_seed)
+            draws = np.stack(
+                [
+                    matrix[
+                        rng.integers(0, len(matrix), size=len(matrix))
+                    ].mean(axis=0)
+                    for _ in range(config.bootstrap.replicates)
+                ]
+            )
+            task_population["population_interval"] = {
+                "quantity_order": numeric_keys,
+                "estimate": np.mean(matrix, axis=0),
+                "low": np.quantile(draws, 0.025, axis=0),
+                "high": np.quantile(draws, 0.975, axis=0),
+                "replicates": int(config.bootstrap.replicates),
+                "rng_seed": int(config.bootstrap.rng_seed),
+                "level": "training seed",
+            }
+        else:
+            task_population["population_interval"] = None
+            task_population["note"] = (
+                "Fewer than three trained seeds: report seed estimates and within-seed "
+                "graph intervals, not a seed-population confidence interval."
+            )
+        path = config.root / task_name / "population.json"
+        atomic_json(path, task_population)
+        population[task_name] = {"path": str(path), **task_population}
     atomic_json(
         config.root / "index.json",
         {
-            key: {
-                "task": value["task"],
-                "seed": value["seed"],
-                "output_dir": value["output_dir"],
-                "figures": value["figures"],
-            }
-            for key, value in results.items()
+            "runs": {
+                key: {
+                    "task": value["task"],
+                    "seed": value["seed"],
+                    "output_dir": value["output_dir"],
+                    "figures": value["figures"],
+                }
+                for key, value in results.items()
+            },
+            "population": {
+                key: {"path": value["path"]} for key, value in population.items()
+            },
         },
     )
     return results

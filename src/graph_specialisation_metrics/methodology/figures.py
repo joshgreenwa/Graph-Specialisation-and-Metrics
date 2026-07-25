@@ -315,6 +315,34 @@ def score_distance_profiles(
     return fig, axes
 
 
+def attention_distance_profiles(
+    labels: Sequence[int | str],
+    profiles: Mapping[str, Sequence[float]],
+    *,
+    theme: FigureTheme = FigureTheme(),
+):
+    import matplotlib.pyplot as plt
+
+    positions = np.arange(len(labels))
+    with publication_style(theme):
+        fig, ax = plt.subplots(figsize=(theme.width * 1.25, theme.height))
+        for family, values in profiles.items():
+            ax.plot(
+                positions,
+                values,
+                marker="o",
+                linewidth=theme.line_width,
+                label=family.replace("_", " "),
+            )
+        ax.set_xlabel("Pristine sender–receiver distance")
+        ax.set_ylabel("Fraction of clean attention mass")
+        ax.set_xticks(positions, [str(value) for value in labels])
+        ax.set_title("Clean attention distance profile")
+        ax.grid(alpha=theme.grid_alpha, linewidth=0.5)
+        ax.legend(frameon=False, fontsize=theme.tick_size)
+    return fig, ax
+
+
 def carriage_profiles(
     x: Sequence[Any],
     functional: Sequence[float],
@@ -484,6 +512,59 @@ def causal_family_panels(
             )
             ax.grid(axis="y", alpha=theme.grid_alpha, linewidth=0.5)
         axes[0].legend(frameon=False, fontsize=theme.tick_size)
+    return fig, axes
+
+
+def cumulative_prefix_curves(
+    curves: Mapping[str, Mapping[str, Any]],
+    *,
+    theme: FigureTheme = FigureTheme(),
+):
+    """Cumulative frozen-family prefix curves with channel-specific intervals."""
+
+    import matplotlib.pyplot as plt
+
+    with publication_style(theme):
+        fig, axes = plt.subplots(
+            1, 2, figsize=(theme.width * 1.8, theme.height), constrained_layout=True
+        )
+        for ax, endpoint, title in (
+            (axes[0], "gross", r"Gross patch response $G_c$"),
+            (axes[1], "necessity", "Donor-wise necessity"),
+        ):
+            for family, record in curves.items():
+                x = np.asarray(record["prefix"])
+                for channel, color, marker in (
+                    ("semantic", theme.semantic_color, "o"),
+                    ("structural", theme.structural_color, "s"),
+                ):
+                    values = np.asarray(record[endpoint][channel])
+                    low, high = record[f"{endpoint}_interval"][channel]
+                    label = (
+                        f"{family.replace('_', ' ')} — {channel} donor-swap"
+                    )
+                    ax.plot(
+                        x,
+                        values,
+                        color=color,
+                        marker=marker,
+                        linestyle=("-" if family.startswith("semantic") else "--"),
+                        linewidth=theme.line_width,
+                        label=label,
+                    )
+                    ax.fill_between(
+                        x,
+                        np.asarray(low),
+                        np.asarray(high),
+                        color=color,
+                        alpha=0.12,
+                        linewidth=0,
+                    )
+            ax.axhline(0, color="#777777", linewidth=0.8)
+            ax.set_xlabel("Cumulative frozen-family prefix size")
+            ax.set_title(title)
+            ax.grid(alpha=theme.grid_alpha, linewidth=0.5)
+        axes[0].legend(frameon=False, fontsize=theme.tick_size - 1)
     return fig, axes
 
 

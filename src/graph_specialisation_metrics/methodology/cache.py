@@ -35,6 +35,7 @@ class CacheContract:
     donors_per_source: int
     source_cap: int
     bootstrap_seed: int
+    repository_commit: str = "unknown"
     bootstrap_replicates: int = 2_000
     raw_score_aggregation: str = "donor->source->graph"
     semantic_donor_law: str = "graph-uniform/node-uniform/min-gap/iid-replacement"
@@ -159,4 +160,3 @@ class CanonicalCache:
             },
         )
         return path
-
