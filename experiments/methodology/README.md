@@ -13,3 +13,6 @@ The implementation boundary and output layout are documented in
 
 Edit only the task list, training seeds, requested phases, checkpoint overrides, and run sizes in
 the launcher. Methodological definitions belong in the canonical package, not in the Colab cell.
+
+The initial production run is configured for the dense `zinc`, `qm9_gap_dense`,
+`peptides_func`, and `peptides_struct` registrations.

@@ -15,8 +15,8 @@ BRANCH = "main"
 REPO_DIR = "/content/Graph-Specialisation-and-Metrics"
 SECRET_NAME = "dissertation_key"
 
-# Registered dense / local / k-hop / k-hop+VNode examples:
-TASKS = ("zinc",)
+# First production run: all registered dense task families.
+TASKS = ("zinc", "qm9_gap_dense", "peptides_func", "peptides_struct")
 TRAIN_SEEDS = (42,)
 PHASES = ("scores", "causal", "carriage", "figures")
 CHECKPOINTS = {}  # e.g. {"zinc:42": "/content/drive/MyDrive/.../best.ckpt"}
@@ -75,4 +75,3 @@ run(
 )
 # On a runtime where GRIT/PyG dependencies are already installed, add skip_install=True.
 # ============================ paste to here ============================
-

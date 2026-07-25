@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Sequence
 
+from .audit import audit_check
+
 
 @dataclass
 class BackendCapture:
@@ -148,14 +150,22 @@ class CanonicalGritBackend:
         if capture.real_mask is not None:
             final_gradient = final_gradient[:, capture.real_mask]
             final_state = final_state[capture.real_mask]
-        if not bool(torch.isfinite(transport).all() and torch.isfinite(final_gradient).all()):
-            raise RuntimeError("non-finite clean z-space Jacobian")
+        audit_check(
+            bool(torch.isfinite(transport).all() and torch.isfinite(final_gradient).all()),
+            "backend.finite_clean_jacobian",
+            "non-finite clean z-space Jacobian; downstream scores inherit the non-finite entries",
+        )
         layer_norms = torch.linalg.vector_norm(
             transport.reshape(transport.shape[0], transport.shape[1], -1), dim=(0, 2)
         )
         if bool((layer_norms <= 0).any()):
             missing = torch.nonzero(layer_norms <= 0).reshape(-1).tolist()
-            raise RuntimeError(f"zero clean transport Jacobian in layers {missing}")
+            audit_check(
+                False,
+                "backend.nonzero_clean_transport",
+                f"zero clean transport Jacobian in layers {missing}; those layers score zero",
+                context={"layers": missing},
+            )
         capture.final_state = final_state
         return CleanJacobians(capture, transport, final_gradient)
 

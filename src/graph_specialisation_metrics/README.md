@@ -593,9 +593,9 @@ projected exactly back to carriers. Adaptive Gauss-Kronrod quadrature is the pro
 method because it resolves L1/ReLU kinks and exposes both carrier-refinement and completeness error.
 No clipping, ratio rescaling, or forced completeness correction is permitted.
 
-A capped path retains its best estimate only under predeclared per-path error limits. The full run
-fails if the capped/unconverged fraction or donor-averaged completeness residual exceeds the
-recorded tolerance.
+A capped path retains its best estimate only under predeclared per-path error limits. A
+capped/unconverged fraction or donor-averaged completeness residual above the recorded tolerance is
+a recorded audit failure for the whole run under the Section 10 policy.
 
 ## 7. Distance profiles and population aggregation
 
@@ -1095,7 +1095,18 @@ effect remains exploratory, and any resulting specialist label is explicitly con
 
 ## 10. Required verification and failure policy
 
-Every production run is fail-closed.
+Every production run is fail-reported. Each check below is mandatory and its measured value is
+recorded, but a numerical, invariance, or estimability breach does not terminate the run: it is
+logged once, accumulated per task/seed, written to `audits.json` (and, for the model checks, to
+`canonical_audits.failures` in `model.json`), and reported again in the run summary. Results
+carrying a recorded breach are not eligible for headline claims until the breach is resolved or
+explicitly argued to be immaterial. A verification run may re-enable fail-closed behaviour with
+`strict_audits=True`, which raises `AuditError` on the first failed check.
+
+Three conditions remain fatal because no quantity can be computed or the computed quantity would
+not be the declared one: an unregistered or channel-crossing task field, a task/model disagreement
+about registration (for example the virtual-node contract or a patch geometry mismatch), and a
+stage in which no graph retains a source estimable under both channels.
 
 ### Model and gradient checks
 
@@ -1119,7 +1130,9 @@ Every production run is fail-closed.
 - structural fields remain exactly fixed semantically;
 - same-content semantic donors and structural self-donors produce numerical zero;
 - every production event is nontrivial;
-- source/donor matching tiers and degree gaps are recorded; and
+- source/donor matching tiers and degree gaps are recorded;
+- a mismatch control drawn outside the frozen degree tier, or an event forced to serve as its own
+  mismatch control, is recorded as an audit failure for that stratum; and
 - unknown task fields that could cross the channel boundary abort the run.
 
 ### Estimator checks
