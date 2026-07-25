@@ -42,8 +42,13 @@ def run(
     skip_install: bool = False,
     force_fresh_grit: bool = False,
     force: bool = False,
+    strict_audits: bool = False,
 ) -> dict[str, Any]:
-    """Mount Drive, reuse training caches/checkpoints, and run selected task phases."""
+    """Mount Drive, reuse training caches/checkpoints, and run selected task phases.
+
+    Numerical and estimability audits report into ``audits.json`` and continue by default; pass
+    ``strict_audits=True`` for a fail-closed verification run.
+    """
 
     if mount:
         mount_drive()
@@ -74,6 +79,7 @@ def run(
         figure_overrides=dict(figure_overrides or {}),
         skip_install=True,
         force=bool(force),
+        strict_audits=bool(strict_audits),
     )
     return run_methodology(config, force_fresh_grit=force_fresh_grit)
 

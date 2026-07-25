@@ -53,6 +53,7 @@ The paste-ready clone/mount/dispatch cell is
 | `causal.py` / `validation.py` | Clean necessity, donor-wise necessity, gross patch responses, rescue/induction, controls. |
 | `bootstrap.py` | Fixed 2,000-draw nested percentile intervals and 20% graph-trimmed summaries. |
 | `cache.py` | Atomic, contract-bound Drive caches that reject stale methodology/results. |
+| `audit.py` | Soft numerical/estimability audits: record, log, and continue; strict mode raises. |
 | `figures.py` | Shared publication theme, exact labels, intervals, PDF+PNG+metadata export. |
 | `runner.py` | Stage orchestration for dense, 1-hop, k-hop, and k-hop+VNode registrations. |
 
@@ -80,9 +81,11 @@ in Section 12 of the normative README.
 <output>/
   protocol.json
   index.json
+  audits.json                    # every soft audit failure, by task/seed
   <task>/
     seed_<training-seed>/
       model.json
+      audits.json                # this run's soft audit failures
       audit/
       cache/{scores,carriage,causal}/
       figures/
@@ -92,6 +95,12 @@ in Section 12 of the normative README.
       figures.json
     population.json              # seed estimates; population CI only with >=3 seeds
 ```
+
+Numerical, invariance, and estimability audits report and continue by default: a breach is logged
+once, merged by audit name with its worst observed value and repeat count, and written to the two
+`audits.json` files (model checks also land in `canonical_audits.failures` of `model.json`).
+`run(..., strict_audits=True)` restores fail-closed runs, raising `AuditError` on the first breach.
+Cache fingerprints are unaffected by this switch, so strict and reporting runs share caches.
 
 Training checkpoints and dataset caches are read-only. Analysis caches bind the protocol
 fingerprint, checkpoint SHA-256, task adapter, output representation and sigma, model geometry,

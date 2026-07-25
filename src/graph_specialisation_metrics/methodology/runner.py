@@ -17,6 +17,7 @@ from ..carriage import env
 from ..carriage.env import log
 from ..carriage.tasks import resolve_dataset_dir
 from ..specialisation.model import GritHeadModel, SpecConfig
+from .audit import audit_check, audit_scope, log_summary, set_strict, within_tolerance
 from .backend import CanonicalGritBackend
 from .bootstrap import Observation, nested_percentile_interval, trimmed_mean
 from .cache import CacheContract, CanonicalCache, atomic_json, checkpoint_sha256
@@ -102,7 +103,11 @@ def _model_audits(
     task: CanonicalTask,
     config: MethodologyConfig,
 ) -> dict[str, Any]:
-    """Mandatory model, gradient, attention, and intervention no-op checks."""
+    """Model, gradient, attention, and intervention no-op checks.
+
+    Every check reports through the soft-audit ledger: a breach is measured, logged, and recorded
+    in ``model.json`` rather than aborting the run (see ``strict_audits`` for fail-closed runs).
+    """
 
     import torch
     from torch_geometric.data import Batch
@@ -120,11 +125,13 @@ def _model_audits(
             )
         ).item()
     )
-    if batch_error > config.numerical.batch_invariance_tolerance:
-        raise RuntimeError(
-            f"batch invariance error {batch_error:.3e} exceeds "
-            f"{config.numerical.batch_invariance_tolerance:.3e}"
-        )
+    within_tolerance(
+        batch_error,
+        config.numerical.batch_invariance_tolerance,
+        "model.batch_invariance",
+        "batch invariance error",
+        context={"task": task.name, "train_seed": int(grit.sc.seed)},
+    )
 
     # Attention rows are receiver-normalized on every supported layer.
     batch = Batch.from_data_list([base.clone()]).to(grit.device)
@@ -150,11 +157,13 @@ def _model_audits(
             attention_error,
             float(torch.max(torch.abs(mass[valid] - 1.0)).item()),
         )
-    if attention_error > config.numerical.attention_tolerance:
-        raise RuntimeError(
-            f"attention normalization error {attention_error:.3e} exceeds "
-            f"{config.numerical.attention_tolerance:.3e}"
-        )
+    within_tolerance(
+        attention_error,
+        config.numerical.attention_tolerance,
+        "model.attention_normalization",
+        "attention normalization error",
+        context={"task": task.name, "train_seed": int(grit.sc.seed)},
+    )
 
     rows = task.grit.content_adapter.rows(base)
     semantic_noop = semantic_donor_swap(
@@ -180,11 +189,13 @@ def _model_audits(
             no_op_error,
             float(torch.max(torch.abs(layer[1:] - layer[0:1])).item()),
         )
-    if no_op_error > config.numerical.no_op_tolerance:
-        raise RuntimeError(
-            f"declared no-op donor response {no_op_error:.3e} exceeds "
-            f"{config.numerical.no_op_tolerance:.3e}"
-        )
+    within_tolerance(
+        no_op_error,
+        config.numerical.no_op_tolerance,
+        "model.declared_no_op",
+        "declared no-op donor response",
+        context={"task": task.name, "train_seed": int(grit.sc.seed)},
+    )
 
     # This also verifies every layer has a finite, nonzero z-space Jacobian.
     clean = backend.clean_jacobians(base)
@@ -225,6 +236,7 @@ def prepare_task(
     import torch
     from torch_geometric.data import Batch
 
+    set_strict(bool(config.strict_audits))
     task_overrides = config.task_overrides.get(task_name, {})
     runtime_override_names = {
         "grit_repo_dir",
@@ -339,7 +351,11 @@ def prepare_task(
     )
     sigma = task.output.resolve(outputs, training_targets=training_targets)
     backend = CanonicalGritBackend(grit, task, sigma)
-    audit_checks = _model_audits(grit, backend, task, config)
+    with audit_scope(f"{task_name}:seed{int(train_seed)}:model") as model_scope:
+        audit_checks = _model_audits(grit, backend, task, config)
+    audit_checks["failures"] = log_summary(
+        model_scope, header=f"{task_name}:seed{int(train_seed)} model audits"
+    )
     same_space = (
         grit.eval_ds is grit.donor_ds
         or model_config.eval_split == model_config.donor_split
@@ -455,9 +471,15 @@ def _stage_plan(
             and source in set(entry["structural"]["sources"])
         )
         if not common_sources:
-            raise RuntimeError(
-                f"graph {graph_id} has no source estimable under both donor-swap channels"
+            # Drop the graph from the stage rather than abort; the loss of support is recorded.
+            audit_check(
+                False,
+                "plan.no_estimable_source",
+                f"graph {graph_id} has no source estimable under both donor-swap channels; "
+                f"the graph is dropped from stage {stage!r}",
+                context={"stage": stage, "graph": int(graph_id)},
             )
+            continue
         for channel in CHANNELS:
             entry[channel] = {
                 "sources": common_sources,
@@ -468,6 +490,11 @@ def _stage_plan(
                 ),
             }
         plan[int(graph_id)] = entry
+    if not plan:
+        # Nothing is estimable anywhere, so no stage quantity exists to report on.
+        raise RuntimeError(
+            f"stage {stage!r} retained no graph with a source estimable under both channels"
+        )
     return plan
 
 
@@ -662,10 +689,14 @@ def run_scores(
             variants, records = _rebuild_graph_events(
                 prepared, config, "scores", graph_id, channel, sources
             )
-            if [record.record() for record in records] != list(
-                plan[graph_id][channel]["records"]
-            ):
-                raise RuntimeError("deterministic event replay changed its manifest")
+            audit_check(
+                [record.record() for record in records]
+                == list(plan[graph_id][channel]["records"]),
+                "events.deterministic_replay",
+                "deterministic event replay changed its manifest; cached scores are keyed by the "
+                "planned manifest hash",
+                context={"stage": "scores", "graph": int(graph_id), "channel": channel},
+            )
             event_capture = prepared.backend.capture(
                 [base, *variants], require_grad=False, include_virtual_transport=True
             )
@@ -952,10 +983,14 @@ def run_carriage(
             variants, records = _rebuild_graph_events(
                 prepared, config, "carriage", graph_id, channel, sources
             )
-            if [record.record() for record in records] != list(
-                plan[graph_id][channel]["records"]
-            ):
-                raise RuntimeError("deterministic carriage event replay changed its manifest")
+            audit_check(
+                [record.record() for record in records]
+                == list(plan[graph_id][channel]["records"]),
+                "carriage.deterministic_replay",
+                "deterministic carriage event replay changed its manifest; cached fields are "
+                "keyed by the planned manifest hash",
+                context={"stage": "carriage", "graph": int(graph_id), "channel": channel},
+            )
             captured = prepared.backend.capture(
                 [base, *variants], require_grad=False, include_virtual_transport=True
             )
@@ -1006,11 +1041,13 @@ def run_carriage(
                     )
                 ).item()
             )
-            if endpoint_replay_error > config.numerical.reconstruction_tolerance:
-                raise RuntimeError(
-                    f"pooling-to-readout replay error {endpoint_replay_error:.3e} exceeds "
-                    f"{config.numerical.reconstruction_tolerance:.3e}"
-                )
+            within_tolerance(
+                endpoint_replay_error,
+                config.numerical.reconstruction_tolerance,
+                "carriage.endpoint_replay",
+                "pooling-to-readout replay error",
+                context={"graph": int(graph_id), "channel": channel},
+            )
             paths += int(integrated.converged.numel())
             capped += int((~integrated.converged).sum().item())
             F = event_f.mean(dim=1).t().detach().cpu().numpy()
@@ -1051,11 +1088,13 @@ def run_carriage(
                             }
                         )
         capped_fraction = float(capped / paths) if paths else 0.0
-        if capped_fraction > config.numerical.integrated_unconverged_fraction:
-            raise RuntimeError(
-                f"{channel} Beneficial carriage capped-path fraction {capped_fraction:.3%} "
-                f"exceeds {config.numerical.integrated_unconverged_fraction:.3%}"
-            )
+        within_tolerance(
+            capped_fraction,
+            config.numerical.integrated_unconverged_fraction,
+            "carriage.capped_paths",
+            f"{channel} Beneficial carriage capped-path fraction",
+            context={"channel": channel, "paths": int(paths), "capped": int(capped)},
+        )
         maximum_distance = max(
             (
                 int(np.max(field["distance"][np.isfinite(field["distance"])]))
@@ -1708,28 +1747,43 @@ def make_figures(
 
 
 def run_prepared(prepared: PreparedTask, config: MethodologyConfig) -> dict[str, Any]:
-    score_plan = _stage_plan(prepared, config, "scores")
-    scores = run_scores(prepared, config, plan=score_plan) if (
-        {"scores", "causal", "figures"} & set(config.phases)
-    ) else None
-    carriage = (
-        run_carriage(prepared, config)
-        if "carriage" in config.phases or "figures" in config.phases
-        else None
-    )
-    causal = None
-    if "causal" in config.phases:
-        from .validation import run_causal_validation
+    set_strict(bool(config.strict_audits))
+    key = f"{prepared.task.name}:seed{int(prepared.grit.sc.seed)}"
+    with audit_scope(key) as scope:
+        score_plan = _stage_plan(prepared, config, "scores")
+        scores = run_scores(prepared, config, plan=score_plan) if (
+            {"scores", "causal", "figures"} & set(config.phases)
+        ) else None
+        carriage = (
+            run_carriage(prepared, config)
+            if "carriage" in config.phases or "figures" in config.phases
+            else None
+        )
+        causal = None
+        if "causal" in config.phases:
+            from .validation import run_causal_validation
 
-        causal = run_causal_validation(prepared, config, scores)
-    elif "figures" in config.phases:
-        from .validation import load_cached_causal_validation
+            causal = run_causal_validation(prepared, config, scores)
+        elif "figures" in config.phases:
+            from .validation import load_cached_causal_validation
 
-        causal = load_cached_causal_validation(prepared, config, scores)
-    figures = (
-        make_figures(prepared, config, scores, carriage, causal)
-        if "figures" in config.phases
-        else None
+            causal = load_cached_causal_validation(prepared, config, scores)
+        figures = (
+            make_figures(prepared, config, scores, carriage, causal)
+            if "figures" in config.phases
+            else None
+        )
+    findings = log_summary(scope, header=f"{key} analysis audits")
+    atomic_json(
+        prepared.output_dir / "audits.json",
+        {
+            "protocol_version": PROTOCOL_VERSION,
+            "task": prepared.task.name,
+            "train_seed": int(prepared.grit.sc.seed),
+            "strict_audits": bool(config.strict_audits),
+            "phases": list(config.phases),
+            "findings": findings,
+        },
     )
     return {
         "task": prepared.task.name,
@@ -1739,6 +1793,7 @@ def run_prepared(prepared: PreparedTask, config: MethodologyConfig) -> dict[str,
         "carriage": carriage,
         "causal": causal,
         "figures": figures,
+        "audit_findings": findings,
     }
 
 
@@ -1750,18 +1805,22 @@ def run_methodology(
     """Public non-Colab entry point."""
 
     config.validate()
+    set_strict(bool(config.strict_audits))
     protocol_record = config.record()
     protocol_record["repository_commit"] = _repository_commit()
     atomic_json(config.root / "protocol.json", protocol_record)
     results: dict[str, Any] = {}
+    run_findings: dict[str, list[dict[str, Any]]] = {}
     for task_name in config.tasks:
         for train_seed in config.train_seeds:
             key = f"{task_name}:seed{int(train_seed)}"
             log(f"\n[canonical] {key}")
-            prepared = prepare_task(
-                config, task_name, int(train_seed), force_fresh_grit=force_fresh_grit
-            )
-            results[key] = run_prepared(prepared, config)
+            with audit_scope(key) as scope:
+                prepared = prepare_task(
+                    config, task_name, int(train_seed), force_fresh_grit=force_fresh_grit
+                )
+                results[key] = run_prepared(prepared, config)
+            run_findings[key] = scope.records()
             del prepared
             gc.collect()
             try:
@@ -1864,6 +1923,14 @@ def run_methodology(
         atomic_json(path, task_population)
         population[task_name] = {"path": str(path), **task_population}
     atomic_json(
+        config.root / "audits.json",
+        {
+            "protocol_version": PROTOCOL_VERSION,
+            "strict_audits": bool(config.strict_audits),
+            "runs": run_findings,
+        },
+    )
+    atomic_json(
         config.root / "index.json",
         {
             "runs": {
@@ -1872,12 +1939,20 @@ def run_methodology(
                     "seed": value["seed"],
                     "output_dir": value["output_dir"],
                     "figures": value["figures"],
+                    "audit_failures": len(run_findings.get(key, ())),
                 }
                 for key, value in results.items()
             },
             "population": {
                 key: {"path": value["path"]} for key, value in population.items()
             },
+            "audits": str(config.root / "audits.json"),
         },
     )
+    failed = sorted(key for key, value in run_findings.items() if value)
+    if failed:
+        log(
+            "[audit] soft audit failures were recorded for "
+            f"{', '.join(failed)}; see {config.root / 'audits.json'}"
+        )
     return results

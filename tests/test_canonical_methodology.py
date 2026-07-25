@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 from copy import deepcopy
 
 import numpy as np
@@ -7,6 +8,8 @@ import pytest
 import torch
 
 from graph_specialisation_metrics import main as public_main
+from graph_specialisation_metrics.methodology import audit
+from graph_specialisation_metrics.methodology.audit import audit_scope
 from graph_specialisation_metrics.methodology.bootstrap import (
     Observation,
     nested_percentile_interval,
@@ -25,6 +28,7 @@ from graph_specialisation_metrics.methodology.causal import (
     donor_necessity,
     mismatch_adjusted_gross,
     patch_response,
+    reference_scale,
 )
 from graph_specialisation_metrics.methodology.distance import (
     DistanceAxis,
@@ -130,6 +134,52 @@ def test_protocol_constants_and_disjoint_splits():
         set(split.semantic_donor_pool),
     ]
     assert all(not groups[i] & groups[j] for i in range(4) for j in range(i))
+
+
+def test_numerical_audits_are_soft_by_default_and_strict_on_request():
+    config = MethodologyConfig()
+    assert config.strict_audits is False
+    # Execution policy must not enter the cache/protocol fingerprint.
+    assert config.fingerprint == dataclasses.replace(config, strict_audits=True).fingerprint
+
+    with audit_scope("test") as scope:
+        assert audit.audit_check(True, "test.pass", "never recorded")
+        assert not audit.within_tolerance(1.0e-5, 1.0e-6, "test.tolerance", "observed")
+        assert not audit.within_tolerance(2.0e-5, 1.0e-6, "test.tolerance", "observed")
+    findings = scope.records()
+    assert [row["name"] for row in findings] == ["test.tolerance"]
+    assert findings[0]["count"] == 2
+    assert findings[0]["observed"] == pytest.approx(2.0e-5)
+
+    previous = audit.set_strict(True)
+    try:
+        with pytest.raises(audit.AuditError, match="test.tolerance"):
+            audit.within_tolerance(1.0e-5, 1.0e-6, "test.tolerance", "observed")
+    finally:
+        audit.set_strict(previous)
+
+
+def test_soft_audit_keeps_a_broken_reconstruction_running():
+    q = torch.tensor([[[[[3.0], [4.0]]]]])  # [E,L,H,N,T]
+    axis = DistanceAxis((0, 1))
+    contribution, support = distance_event_contributions(q, [0, 1], axis)
+    graph_c, graph_o = aggregate_distance_events(contribution, support, [9], [2])
+    with audit_scope("reconstruction") as scope:
+        result = score_heatmaps(
+            graph_c,
+            graph_o,
+            reconstruction_tolerance=1e-8,
+            graph_scores={9: np.array([[99.0]])},
+        )
+    assert np.allclose(result.exact, [[3.0, 4.0]])
+    assert [row["name"] for row in scope.records()] == ["distance.bucket_reconstruction"]
+
+
+def test_non_estimable_reference_scale_is_reported_not_raised():
+    with audit_scope("reference") as scope:
+        assert np.isnan(reference_scale([0.0, 0.0], floor=1e-8))
+        assert reference_scale([2.0, 4.0], floor=1e-8) == pytest.approx(3.0)
+    assert [row["name"] for row in scope.records()] == ["causal.reference_scale"]
 
 
 def test_registered_grit_geometry_covers_dense_local_khop_and_vnode():

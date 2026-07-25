@@ -153,6 +153,8 @@ class MethodologyConfig:
     skip_install: bool = False
     resume: bool = True
     force: bool = False
+    # Numerical/estimability audits report and continue by default; True restores fail-closed runs.
+    strict_audits: bool = False
 
     def validate(self) -> None:
         self.sizes.validate()
@@ -221,6 +223,8 @@ class MethodologyConfig:
             "output_dir": self.output_dir,
             "accelerator": self.accelerator,
             "num_threads": self.num_threads,
+            # Execution policy, not a scientific boundary: excluded from the cache fingerprint.
+            "strict_audits": bool(self.strict_audits),
             "checkpoints": dict(self.checkpoints),
             "figure_overrides": dict(self.figure_overrides),
         }

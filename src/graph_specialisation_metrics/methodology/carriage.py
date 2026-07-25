@@ -8,6 +8,7 @@ from typing import Any
 import numpy as np
 
 from ..carriage.core import integrated_loss_carriage
+from .audit import within_tolerance
 
 
 FUNCTIONAL_NAME = "Functional carriage"
@@ -95,11 +96,13 @@ def beneficial_carriage(
     event_b = -path["carriage"].reshape(sources, donors, carriers)
     event_loss_increase = -path["loss_delta"].reshape(sources, donors)
     residual = event_b.sum(dim=-1) - event_loss_increase
-    if not torch.allclose(
-        event_b.sum(dim=-1), event_loss_increase, atol=float(tolerance), rtol=0.0
-    ):
-        worst = float(residual.abs().max())
-        raise RuntimeError(f"Beneficial carriage completeness failed (max residual {worst:.3e})")
+    within_tolerance(
+        float(residual.abs().max()),
+        float(tolerance),
+        "carriage.completeness",
+        "Beneficial carriage completeness residual",
+        context={"sources": int(sources), "donors": int(donors)},
+    )
     field = event_b.mean(dim=1).t().contiguous()
     return BeneficialResult(
         field=field,

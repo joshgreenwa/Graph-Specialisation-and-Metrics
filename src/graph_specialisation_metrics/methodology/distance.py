@@ -7,6 +7,8 @@ from typing import Any, Iterable, Mapping, Sequence
 
 import numpy as np
 
+from .audit import audit_check
+
 
 def shortest_path_distances(edge_index: Any, num_nodes: int) -> np.ndarray:
     """All-pairs pristine-graph distance; unreachable entries are ``inf``."""
@@ -139,13 +141,19 @@ def score_heatmaps(
     if graph_scores is not None:
         for key in keys:
             reconstructed = exact_graph[key].sum(axis=-1)
-            if not np.allclose(
-                reconstructed,
-                np.asarray(graph_scores[key]),
-                atol=float(reconstruction_tolerance),
-                rtol=0.0,
-            ):
-                raise RuntimeError(f"distance buckets do not reconstruct graph score {key}")
+            residual = float(
+                np.max(np.abs(reconstructed - np.asarray(graph_scores[key])))
+            )
+            audit_check(
+                residual <= float(reconstruction_tolerance),
+                "distance.bucket_reconstruction",
+                f"distance buckets do not reconstruct graph score {key} "
+                f"(max residual {residual:.3e} exceeds "
+                f"{float(reconstruction_tolerance):.3e})",
+                observed=residual,
+                tolerance=float(reconstruction_tolerance),
+                context={"graph": int(key)},
+            )
     # C is [L,H,D]; sum heads only after equal-graph averaging.
     exact = np.stack([exact_graph[key] for key in keys]).mean(axis=0).sum(axis=1)
     ratios: list[np.ndarray] = []

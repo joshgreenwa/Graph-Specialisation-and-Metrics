@@ -7,6 +7,7 @@ from typing import Any, Mapping, Sequence
 
 import numpy as np
 
+from .audit import audit_check, within_tolerance
 from .bootstrap import Observation, nested_percentile_interval
 from .causal import (
     calibrated_targets,
@@ -115,9 +116,27 @@ def _mismatch_indices(records: Sequence[Any]) -> list[int]:
                 and other != position
             ]
         if not candidates:
-            raise RuntimeError(
-                "causal mismatch controls require at least two distinct donor payloads/footprints"
+            # Relax the degree tier before giving up on the same-geometry control.
+            relaxed = [
+                other
+                for other, candidate in enumerate(records)
+                if candidate.payload_fingerprint != record.payload_fingerprint
+                and other != position
+            ]
+            audit_check(
+                False,
+                "causal.mismatch_control_relaxed"
+                if relaxed
+                else "causal.mismatch_control_unavailable",
+                "no distinct-payload donor shares this event's degree tier; "
+                + (
+                    "the mismatch control was drawn from another degree tier"
+                    if relaxed
+                    else "the event is its own mismatch control, which nulls its adjustment"
+                ),
+                context={"source": int(record.source), "relaxed_degree_tier": bool(relaxed)},
             )
+            candidates = relaxed or [position]
         result.append(
             min(
                 candidates,
@@ -390,10 +409,12 @@ def _causal_events(
                             "event_effect": float(necessity["event_effect"][position]),
                         }
                     )
-    if self_patch_max > config.numerical.reconstruction_tolerance:
-        raise RuntimeError(
-            f"same-condition activation patch was not zero (max {self_patch_max:.3e})"
-        )
+    within_tolerance(
+        self_patch_max,
+        config.numerical.reconstruction_tolerance,
+        "causal.same_condition_patch",
+        "same-condition activation patch response",
+    )
     return {
         "records": records_by_target,
         "same_condition_patch_max": self_patch_max,
@@ -448,8 +469,12 @@ def _summarize_causal(
     for target in targets:
         reference_names = _reference_target_names(target, target_order)
         if _requires_matched_reference(target) and not reference_names:
-            raise RuntimeError(
-                f"{target!r} has no frozen same-composition matched reference family"
+            audit_check(
+                False,
+                "causal.matched_reference",
+                f"{target!r} has no frozen same-composition matched reference family; "
+                "its calibration falls back to the all-head reference",
+                context={"target": target},
             )
         if not reference_names:
             reference_names = head_targets
@@ -541,8 +566,12 @@ def _summarize_causal(
             for target_index, target in enumerate(target_order):
                 reference_names = _reference_target_names(target, target_order)
                 if _requires_matched_reference(target) and not reference_names:
-                    raise RuntimeError(
-                        f"{target!r} has no matched reference in a causal bootstrap draw"
+                    audit_check(
+                        False,
+                        "causal.bootstrap_matched_reference",
+                        f"{target!r} has no matched reference in a causal bootstrap draw; "
+                        "the draw falls back to the all-head reference",
+                        context={"target": target},
                     )
                 reference_positions = [
                     target_order.index(name) for name in reference_names
@@ -574,9 +603,18 @@ def _summarize_causal(
                 if np.any(a_g <= config.numerical.effect_floor) or np.any(
                     a_n <= config.numerical.effect_floor
                 ):
-                    raise RuntimeError(
-                        "a causal bootstrap reference scale fell below the registered floor"
+                    audit_check(
+                        False,
+                        "causal.bootstrap_reference_scale",
+                        "a causal bootstrap reference scale fell below the registered floor; "
+                        "the affected draw is reported as non-estimable",
+                        observed=float(min(np.min(a_g), np.min(a_n))),
+                        tolerance=float(config.numerical.effect_floor),
+                        context={"target": target},
                     )
+                    # Non-estimable scales become nan rather than exploding the ratio.
+                    a_g = np.where(a_g > config.numerical.effect_floor, a_g, np.nan)
+                    a_n = np.where(a_n > config.numerical.effect_floor, a_n, np.nan)
                 calibrated_rows.append(
                     (
                         0.5

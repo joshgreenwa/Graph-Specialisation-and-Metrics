@@ -7,6 +7,8 @@ from typing import Any, Mapping
 
 import numpy as np
 
+from .audit import audit_check
+
 
 def _rows(value: Any) -> np.ndarray:
     value = np.asarray(value, dtype=np.float64)
@@ -118,11 +120,18 @@ def mismatch_adjusted_aligned(
 
 
 def reference_scale(values: Any, *, floor: float) -> float:
-    """Positive unadjusted matched/gross reference mean."""
+    """Positive unadjusted matched/gross reference mean, or ``nan`` when non-estimable."""
 
     value = float(np.mean(np.asarray(values, dtype=np.float64)))
-    if not np.isfinite(value) or value <= float(floor):
-        raise ValueError("causal reference scale is non-estimable")
+    if not audit_check(
+        bool(np.isfinite(value) and value > float(floor)),
+        "causal.reference_scale",
+        f"causal reference scale {value:.3e} is at or below the registered floor "
+        f"{float(floor):.3e}; calibrated targets built on it are reported as non-estimable",
+        observed=value,
+        tolerance=float(floor),
+    ):
+        return float("nan")
     return value
 
 
