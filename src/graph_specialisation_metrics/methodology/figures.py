@@ -46,8 +46,11 @@ class FigureTheme:
     error_alpha: float = 0.22
     grid_alpha: float = 0.18
     layer_cmap: str = "viridis"
+    # Presentation-only cap on distance columns per figure; long-diameter tasks are grouped to fit.
+    max_distance_points: int = 14
     semantic_color: str = "#C44E52"
     structural_color: str = "#4C72B0"
+    central_color: str = "#6E6E6E"
     functional_color: str = "#4C72B0"
     beneficial_color: str = "#55A868"
     inactive_color: str = "#B8B8B8"
@@ -95,6 +98,33 @@ class HeadPlotData:
 
 def _flatten_heads(array: Any) -> np.ndarray:
     return np.asarray(array).reshape(-1)
+
+
+def _exact_panel_title(grouped: bool) -> str:
+    """Name the exact panel for what it plots; grouped columns show mass per unit distance."""
+
+    return (
+        "Exact score contribution per unit distance"
+        if grouped
+        else "Exact score contribution"
+    )
+
+
+def distance_ticks(ax, labels: Sequence[int | str], theme: FigureTheme) -> None:
+    """Label every distance column, rotating once grouped ranges make the labels wide.
+
+    Callers pass an already-grouped axis (see `distance.display_bins`), so this only has to keep
+    the labels legible, never to thin them: a distance figure with hidden columns invites the
+    reader to interpolate across a gap that may not be there.
+    """
+
+    text = [str(value) for value in labels]
+    ax.set_xticks(np.arange(len(text)), text)
+    if any(len(value) > 3 for value in text) or len(text) > 10:
+        for label in ax.get_xticklabels():
+            label.set_rotation(45)
+            label.set_horizontalalignment("right")
+            label.set_rotation_mode("anchor")
 
 
 def _head_colours(shape: tuple[int, int], cmap: str):
@@ -230,31 +260,63 @@ def distance_heatmaps(
     *,
     channel: str,
     title: str | None = None,
+    normalised: bool = False,
+    grouped: bool = False,
     theme: FigureTheme = FigureTheme(),
 ):
+    """Head-resolved distance atlas: one row per head, layer 0 at the top.
+
+    Both panels take ``[layer, head, distance]``.  Heads stay separate because a layer's heads
+    routinely peak at different distances, and summing them reports every layer as broader than any
+    head inside it.  ``normalised`` only relabels a figure whose panels the caller already divided
+    by each head's own total; the geometry and panel titles are otherwise identical.
+    """
+
     import matplotlib.pyplot as plt
 
     exact = np.asarray(exact)
     per_opportunity = np.asarray(per_opportunity)
     if exact.shape != per_opportunity.shape:
         raise ValueError("exact/support-normalized heatmaps must have the same geometry")
+    if exact.ndim != 3:
+        raise ValueError(
+            f"distance heatmaps need [layer,head,distance]; got {tuple(exact.shape)}"
+        )
+    layers, heads, distances = exact.shape
+    if distances != len(labels):
+        raise ValueError("heatmap distance axis does not match the registered labels")
     with publication_style(theme):
         fig, axes = plt.subplots(
-            1, 2, figsize=(theme.width * 1.75, theme.height), constrained_layout=True
+            1, 2, figsize=(theme.width * 1.75, theme.height * 1.6), constrained_layout=True
         )
         for ax, matrix, panel in zip(
             axes,
             (exact, per_opportunity),
-            ("Exact score contribution", "Contribution / event-carrier support"),
+            (_exact_panel_title(grouped), "Contribution / event-carrier support"),
         ):
-            image = ax.imshow(matrix, origin="lower", aspect="auto", cmap="magma")
+            # Row-major [L,H] with the default upper origin puts layer 0 in the top block.
+            image = ax.imshow(
+                matrix.reshape(layers * heads, distances),
+                origin="upper",
+                aspect="auto",
+                interpolation="nearest",
+                cmap="magma",
+            )
+            for layer in range(1, layers):
+                ax.axhline(
+                    layer * heads - 0.5, color="white", linewidth=0.35, alpha=0.7
+                )
             ax.set_xlabel("Carrier distance from changed node")
-            ax.set_ylabel("Layer")
-            ax.set_xticks(np.arange(len(labels)), [str(value) for value in labels])
-            ax.set_yticks(np.arange(matrix.shape[0]))
+            ax.set_ylabel("Head rows (layer blocks)")
+            distance_ticks(ax, labels, theme)
+            ax.set_yticks(
+                [layer * heads + (heads - 1) / 2 for layer in range(layers)],
+                [f"L{layer}" for layer in range(layers)],
+            )
             ax.set_title(panel)
             fig.colorbar(image, ax=ax, pad=0.02)
-        fig.suptitle(title or f"{channel.capitalize()} donor-swap")
+        heading = title or f"{channel.capitalize()} donor-swap"
+        fig.suptitle(f"{heading} (row-normalised)" if normalised else heading)
     return fig, axes
 
 
@@ -266,6 +328,7 @@ def score_distance_profiles(
     exact_interval: tuple[Any, Any] | None = None,
     per_opportunity_interval: tuple[Any, Any] | None = None,
     channel: str,
+    grouped: bool = False,
     theme: FigureTheme = FigureTheme(),
 ):
     import matplotlib.pyplot as plt
@@ -276,7 +339,7 @@ def score_distance_profiles(
             1, 2, figsize=(theme.width * 1.75, theme.height), constrained_layout=True
         )
         for ax, values, interval, title in (
-            (axes[0], exact, exact_interval, "Exact score contribution"),
+            (axes[0], exact, exact_interval, _exact_panel_title(grouped)),
             (
                 axes[1],
                 per_opportunity,
@@ -309,9 +372,83 @@ def score_distance_profiles(
                 )
             ax.set_title(title)
             ax.set_xlabel("Carrier distance from changed node")
-            ax.set_xticks(positions, [str(value) for value in labels])
+            distance_ticks(ax, labels, theme)
             ax.grid(alpha=theme.grid_alpha, linewidth=0.5)
         fig.suptitle(f"{channel.capitalize()} donor-swap score distance profile")
+    return fig, axes
+
+
+def distance_support_profile(
+    labels: Sequence[int | str],
+    graphs: Sequence[int],
+    pairs: Sequence[int],
+    *,
+    empty_replicate_fraction: Sequence[float] | None = None,
+    minimum_graphs: int,
+    minimum_pairs: int,
+    channel: str,
+    theme: FigureTheme = FigureTheme(),
+):
+    """Show how much evidence each distance column carries, against the reporting floor."""
+
+    import matplotlib.pyplot as plt
+
+    positions = np.arange(len(labels))
+    graphs = np.asarray(graphs, dtype=np.float64)
+    pairs = np.asarray(pairs, dtype=np.float64)
+    colour = theme.semantic_color if channel == "semantic" else theme.structural_color
+    with publication_style(theme):
+        fig, axes = plt.subplots(
+            1, 2, figsize=(theme.width * 1.75, theme.height), constrained_layout=True
+        )
+        for ax, values, floor, title in (
+            (axes[0], graphs, int(minimum_graphs), "Supporting graphs"),
+            (axes[1], pairs, int(minimum_pairs), "Eligible carrier-source pairs"),
+        ):
+            below = values < float(floor)
+            ax.bar(
+                positions,
+                values,
+                color=[theme.inactive_color if flag else colour for flag in below],
+                width=0.8,
+            )
+            ax.axhline(
+                float(floor),
+                color="black",
+                linewidth=theme.line_width,
+                linestyle="--",
+            )
+            ax.annotate(
+                f"reporting floor = {int(floor)}",
+                xy=(0.02, float(floor)),
+                xycoords=("axes fraction", "data"),
+                va="bottom",
+                fontsize=theme.tick_size,
+            )
+            ax.set_title(title)
+            ax.set_xlabel("Carrier distance from changed node")
+            distance_ticks(ax, labels, theme)
+            ax.grid(alpha=theme.grid_alpha, linewidth=0.5, axis="y")
+            if values.size and float(np.max(values)) > 0:
+                ax.set_ylim(0, float(np.max(values)) * 1.18)
+        if empty_replicate_fraction is not None:
+            fraction = np.asarray(empty_replicate_fraction, dtype=np.float64)
+            twin = axes[0].twinx()
+            twin.plot(
+                positions,
+                fraction,
+                color="black",
+                linewidth=theme.line_width,
+                marker="o",
+                markersize=3.0,
+                linestyle=":",
+            )
+            twin.set_ylim(0.0, 1.0)
+            twin.set_ylabel("Bootstrap replicates with no support")
+        fig.suptitle(
+            f"{channel.capitalize()} distance-column support "
+            "(grey columns are suppressed in reported figures)"
+        )
     return fig, axes
 
 
@@ -319,6 +456,7 @@ def attention_distance_profiles(
     labels: Sequence[int | str],
     profiles: Mapping[str, Sequence[float]],
     *,
+    grouped: bool = False,
     theme: FigureTheme = FigureTheme(),
 ):
     import matplotlib.pyplot as plt
@@ -330,13 +468,20 @@ def attention_distance_profiles(
             ax.plot(
                 positions,
                 values,
-                marker="o",
                 linewidth=theme.line_width,
-                label=family.replace("_", " "),
+                markersize=4.0,
+                markeredgecolor="white",
+                markeredgewidth=0.5,
+                label=target_label(family),
+                **family_style(family, theme),
             )
-        ax.set_xlabel("Pristine sender–receiver distance")
-        ax.set_ylabel("Fraction of clean attention mass")
-        ax.set_xticks(positions, [str(value) for value in labels])
+        ax.set_xlabel("Sender–receiver shortest path-distance")
+        ax.set_ylabel(
+            "Clean attention mass per unit distance"
+            if grouped
+            else "Fraction of clean attention mass"
+        )
+        distance_ticks(ax, labels, theme)
         ax.set_title("Clean attention distance profile")
         ax.grid(alpha=theme.grid_alpha, linewidth=0.5)
         ax.legend(frameon=False, fontsize=theme.tick_size)
@@ -397,17 +542,54 @@ def carriage_profiles(
     return fig, axes
 
 
+def statistic_caption(statistic: Mapping[str, Any] | None) -> str:
+    """One-line rank-correlation caption: rho with its interval, permutation p, and n.
+
+    The interval is the registered nested bootstrap and the p is the within-layer permutation test,
+    so the caption reports the layer-confound-controlled evidence rather than a naive pooled p.
+    """
+
+    if not statistic:
+        return ""
+    rho = statistic.get("rho")
+    if rho is None or not np.isfinite(rho):
+        return "ρ not estimable"
+    parts = [f"ρ = {float(rho):.2f}"]
+    low, high = statistic.get("low"), statistic.get("high")
+    if low is not None and high is not None and np.isfinite(low) and np.isfinite(high):
+        parts[0] += f" [{float(low):.2f}, {float(high):.2f}]"
+    p = statistic.get("p")
+    if p is not None and np.isfinite(p):
+        parts.append("p < 0.001" if float(p) < 0.001 else f"p = {float(p):.3f}")
+    n = statistic.get("n")
+    if n:
+        parts.append(f"n = {int(n)}")
+    return ", ".join(parts)
+
+
 def causal_scatter_grid(
     panels: Sequence[Mapping[str, Any]],
     *,
     theme: FigureTheme = FigureTheme(),
 ):
-    """Publication scatter grid with optional two-axis percentile intervals."""
+    """Publication scatter grid with two-axis percentile intervals and rank correlations.
+
+    Each panel carries its own rank correlation above the axes, and the grid carries one shared
+    key: the layer colourbar that the point colours have always encoded, and a marker for heads
+    below the activity floor. Neither was documented anywhere in the figure before.
+    """
 
     import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
 
     columns = 3
     rows = int(np.ceil(len(panels) / columns))
+    layer_max = max(
+        (int(np.asarray(panel.get("layer", [0])).max(initial=0)) for panel in panels),
+        default=0,
+    )
+    normalizer = plt.Normalize(0, max(1, layer_max))
+    any_inactive = False
     with publication_style(theme):
         fig, axes = plt.subplots(
             rows,
@@ -421,11 +603,11 @@ def causal_scatter_grid(
             y = np.asarray(panel["y"])
             active = np.asarray(panel.get("active", np.ones(len(x), dtype=bool)))
             layer = np.asarray(panel.get("layer", np.zeros(len(x), dtype=int)))
-            normalizer = plt.Normalize(0, max(1, int(layer.max(initial=0))))
             colours = plt.get_cmap(theme.layer_cmap)(normalizer(layer))
             colours[~active] = __import__("matplotlib").colors.to_rgba(
                 theme.inactive_color
             )
+            any_inactive = any_inactive or not bool(active.all())
             x_interval = panel.get("x_interval")
             y_interval = panel.get("y_interval")
             _errorbars(ax, x, y, x_interval, y_interval, theme)
@@ -439,15 +621,87 @@ def causal_scatter_grid(
             )
             ax.set_xlabel(panel["xlabel"])
             ax.set_ylabel(panel["ylabel"])
-            ax.set_title(panel.get("title", ""))
+            caption = statistic_caption(panel.get("statistic"))
+            title = panel.get("title", "")
+            ax.set_title(
+                f"{title}\n{caption}" if caption else title,
+                fontsize=theme.title_size * 0.92,
+            )
             if panel.get("zero_x"):
                 ax.axvline(0, color="#777777", linestyle="--", linewidth=0.8)
             if panel.get("zero_y"):
                 ax.axhline(0, color="#777777", linestyle="--", linewidth=0.8)
             ax.grid(alpha=theme.grid_alpha, linewidth=0.5)
+        used = list(axes.reshape(-1)[: len(panels)])
         for ax in axes.reshape(-1)[len(panels) :]:
             ax.set_visible(False)
+        scalar = plt.cm.ScalarMappable(norm=normalizer, cmap=theme.layer_cmap)
+        bar = fig.colorbar(scalar, ax=used, pad=0.015, fraction=0.03)
+        bar.set_label("Layer")
+        bar.set_ticks(np.arange(layer_max + 1))
+        key = [
+            Line2D(
+                [],
+                [],
+                linestyle="none",
+                marker="o",
+                markersize=5,
+                markerfacecolor=theme.inactive_color,
+                markeredgecolor="white",
+                label=f"below the activity floor",
+            )
+        ] if any_inactive else []
+        key.append(
+            Line2D(
+                [],
+                [],
+                color="#555555",
+                alpha=theme.error_alpha + 0.3,
+                linewidth=1.1,
+                label="95% nested percentile interval",
+            )
+        )
+        fig.legend(
+            handles=key,
+            frameon=False,
+            fontsize=theme.tick_size,
+            loc="upper center",
+            bbox_to_anchor=(0.5, 0.0),
+            ncol=len(key),
+        )
     return fig, axes
+
+
+def family_style(name: str, theme: FigureTheme) -> dict[str, Any]:
+    """Colour, marker, and dash for a frozen family, consistent across every figure.
+
+    The leaning families take their channel's colour — a semantic-leaning family drawn in the
+    structural channel's blue reads as a contradiction against the rest of the figure set — and the
+    reference families take neutral greys. Marker and dash carry the same distinction so the figure
+    survives greyscale printing.
+    """
+
+    key = str(name).removeprefix("family_")
+    styles = {
+        "semantic_leaning": (theme.semantic_color, "o", "-"),
+        "structural_leaning": (theme.structural_color, "s", "--"),
+        "central_responsive": (theme.central_color, "^", ":"),
+        "inactive": (theme.inactive_color, "v", "-."),
+    }
+    colour, marker, dash = styles.get(key, (theme.central_color, "o", "-"))
+    return {"color": colour, "marker": marker, "linestyle": dash}
+
+
+def target_label(name: str) -> str:
+    """Readable axis label for a frozen family or matched-control target."""
+
+    text = str(name)
+    for prefix in ("family_", "control_"):
+        text = text.removeprefix(prefix)
+    text = text.removesuffix("_control")
+    for kind in ("central", "inactive", "random"):
+        text = text.replace(f"_{kind}", f" / {kind}")
+    return text.replace("_", " ")
 
 
 def causal_family_panels(
@@ -457,31 +711,38 @@ def causal_family_panels(
     intervals: Mapping[str, tuple[np.ndarray, np.ndarray]] | None = None,
     theme: FigureTheme = FigureTheme(),
 ):
-    """Channel-by-family restoration/injection, alignment, and necessity endpoints."""
+    """Channel-by-family restoration/injection, alignment, and necessity endpoints.
+
+    Targets run down a shared vertical axis rather than across five rotated category axes: the
+    names are long, and one legible copy of them beats five illegible ones. Panel height follows
+    the target count, so the bars keep a constant thickness however many targets are passed.
+    """
 
     import matplotlib.pyplot as plt
 
     positions = np.arange(len(family_names))
-    width = 0.34
+    height = 0.36
+    panels = (
+        ("restoration_gross", "Gross restoration"),
+        ("injection_gross", "Gross injection"),
+        ("rescue", "Causal rescue"),
+        ("induction", "Causal induction"),
+        ("necessity", "Donor-wise necessity"),
+    )
+    figure_height = max(theme.height, 0.42 * len(family_names) + 1.5)
     with publication_style(theme):
         fig, axes = plt.subplots(
-            1, 5, figsize=(theme.width * 3.5, theme.height), constrained_layout=True
+            1,
+            len(panels),
+            figsize=(theme.width * 2.6, figure_height),
+            constrained_layout=True,
+            sharey=True,
         )
-        for ax, key, title in zip(
-            axes,
-            ("restoration_gross", "injection_gross", "rescue", "induction", "necessity"),
-            (
-                "Gross restoration",
-                "Gross injection",
-                "Causal rescue",
-                "Causal induction",
-                "Donor-wise necessity",
-            ),
-        ):
+        for ax, (key, title) in zip(axes, panels):
             matrix = np.asarray(values[key])  # [channel,family]
             for channel, offset, color in (
-                (0, -width / 2, theme.semantic_color),
-                (1, width / 2, theme.structural_color),
+                (0, height / 2, theme.semantic_color),
+                (1, -height / 2, theme.structural_color),
             ):
                 error = None
                 if intervals and key in intervals:
@@ -492,26 +753,33 @@ def causal_family_panels(
                             np.asarray(high)[channel] - matrix[channel],
                         )
                     )
-                ax.bar(
+                ax.barh(
                     positions + offset,
                     matrix[channel],
-                    width,
-                    yerr=error,
+                    height,
+                    xerr=error,
                     color=color,
                     alpha=0.88,
                     capsize=2,
                     label=("Semantic donor-swap" if channel == 0 else "Structural donor-swap"),
                 )
-            ax.axhline(0, color="#777777", linewidth=0.8)
+            ax.axvline(0, color="#777777", linewidth=0.8)
             ax.set_title(title)
-            ax.set_xticks(
-                positions,
-                [name.replace("family_", "").replace("_", " ") for name in family_names],
-                rotation=25,
-                ha="right",
-            )
-            ax.grid(axis="y", alpha=theme.grid_alpha, linewidth=0.5)
-        axes[0].legend(frameon=False, fontsize=theme.tick_size)
+            ax.grid(axis="x", alpha=theme.grid_alpha, linewidth=0.5)
+        # Top-to-bottom in the order given, which keeps a family next to its own controls.
+        axes[0].set_yticks(positions, [target_label(name) for name in family_names])
+        axes[0].invert_yaxis()
+        handles, entries = axes[0].get_legend_handles_labels()
+        # Below the panels: an in-axes key would sit on top of whichever bar happens to be short.
+        fig.legend(
+            handles,
+            entries,
+            frameon=False,
+            fontsize=theme.tick_size,
+            loc="upper center",
+            bbox_to_anchor=(0.5, 0.0),
+            ncol=2,
+        )
     return fig, axes
 
 
@@ -520,7 +788,13 @@ def cumulative_prefix_curves(
     *,
     theme: FigureTheme = FigureTheme(),
 ):
-    """Cumulative frozen-family prefix curves with channel-specific intervals."""
+    """Cumulative frozen-family prefix curves with channel-specific intervals.
+
+    A `control` entry, when present, is the size-matched control ladder at the same prefix sizes.
+    It is drawn as a faint reference line rather than as its own categorical figure: the question a
+    prefix ladder answers is whether the family separates from its matched control as heads
+    accumulate, which is only legible when the two run on one pair of axes.
+    """
 
     import matplotlib.pyplot as plt
 
@@ -560,11 +834,36 @@ def cumulative_prefix_curves(
                         alpha=0.12,
                         linewidth=0,
                     )
+                    control = (record.get("control") or {}).get(endpoint, {}).get(channel)
+                    if control is not None:
+                        ax.plot(
+                            x,
+                            np.asarray(control),
+                            color=color,
+                            marker=marker,
+                            markersize=3.0,
+                            markerfacecolor="white",
+                            linestyle=":",
+                            linewidth=theme.line_width * 0.8,
+                            alpha=0.75,
+                            label=f"{label} (matched control)",
+                        )
             ax.axhline(0, color="#777777", linewidth=0.8)
             ax.set_xlabel("Cumulative frozen-family prefix size")
             ax.set_title(title)
             ax.grid(alpha=theme.grid_alpha, linewidth=0.5)
-        axes[0].legend(frameon=False, fontsize=theme.tick_size - 1)
+        # Adding control ladders doubles the series, so the key goes below the panels rather than
+        # over the curves it describes.
+        handles, entries = axes[0].get_legend_handles_labels()
+        fig.legend(
+            handles,
+            entries,
+            frameon=False,
+            fontsize=theme.tick_size - 1,
+            loc="upper center",
+            bbox_to_anchor=(0.5, 0.0),
+            ncol=2,
+        )
     return fig, axes
 
 
@@ -589,7 +888,15 @@ class FigureBuilder:
         paths: list[Path] = []
         for suffix in self.theme.formats:
             path = self.output_dir / f"{name}.{suffix}"
-            fig.savefig(path, dpi=self.theme.dpi)
+            # `publication_style` sets savefig.bbox, but its rc context closed when the figure
+            # function returned, so the bound has to be given here or anything drawn outside the
+            # axes -- a legend below the panels, a rotated tick label -- is cropped away silently.
+            fig.savefig(
+                path,
+                dpi=self.theme.dpi,
+                bbox_inches="tight",
+                pad_inches=0.04,
+            )
             paths.append(path)
         atomic_json(
             self.output_dir / f"{name}.metadata.json",

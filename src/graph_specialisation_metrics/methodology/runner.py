@@ -19,7 +19,12 @@ from ..carriage.tasks import resolve_dataset_dir
 from ..specialisation.model import GritHeadModel, SpecConfig
 from .audit import audit_check, audit_scope, log_summary, set_strict, within_tolerance
 from .backend import CanonicalGritBackend
-from .bootstrap import Observation, nested_percentile_interval, trimmed_mean
+from .bootstrap import (
+    Observation,
+    nested_percentile_interval,
+    reportable_bin,
+    trimmed_mean,
+)
 from .cache import CacheContract, CanonicalCache, atomic_json, checkpoint_sha256
 from .carriage import (
     additive_beneficial_mass,
@@ -27,12 +32,18 @@ from .carriage import (
     functional_carriage_events,
 )
 from .distance import (
+    DisplayAxis,
     DistanceAxis,
     adaptive_distance_bins,
     aggregate_distance_events,
+    column_support,
+    display_bins,
     distance_event_contributions,
+    distance_profile_reduce,
+    row_normalised,
     score_heatmaps,
     shortest_path_distances,
+    supported_mean,
 )
 from .events import build_channel_events
 from .interventions import semantic_donor_swap, structural_donor_swap
@@ -47,6 +58,7 @@ from .figures import (
     cumulative_prefix_curves,
     carriage_profiles,
     distance_heatmaps,
+    distance_support_profile,
     joint_selectivity_plane,
     score_distance_profiles,
     score_plane,
@@ -779,30 +791,71 @@ def run_scores(
             "graph_distance_support": graph_support,
             "heatmap_exact": heatmaps.exact,
             "heatmap_per_opportunity": heatmaps.per_opportunity,
+            "heatmap_exact_head": heatmaps.exact_head,
+            "heatmap_per_opportunity_head": heatmaps.per_opportunity_head,
             "events": event_rows,
         }
+        empty_columns = np.zeros(len(axis.labels), dtype=np.int64)
+        replicates_seen = 0
+
         def graph_distance_reduce(rows):
-            # rows [G,2,L,H,D]. Divide support within graph, then average graphs.
-            C = rows[:, 0]
-            O = rows[:, 1]
-            ratio = np.full_like(C, np.nan)
-            np.divide(C, O, out=ratio, where=O > 0)
-            cells_c = C.mean(axis=0).sum(axis=1)
-            cells_r = np.nansum(np.nanmean(ratio, axis=0), axis=1)
-            profile_c = cells_c.sum(axis=0, keepdims=True)
-            profile_r = cells_r.sum(axis=0, keepdims=True)
-            return np.stack(
-                (
-                    np.concatenate((cells_c, profile_c), axis=0),
-                    np.concatenate((cells_r, profile_r), axis=0),
-                )
-            )
+            nonlocal replicates_seen
+            result = distance_profile_reduce(rows)
+            replicates_seen += 1
+            # cells_r is nan exactly where no resampled graph supported the column.
+            empty_columns[~np.isfinite(result[1, :-1]).any(axis=0)] += 1
+            return result
 
         output["channels"][channel]["distance_intervals"] = nested_percentile_interval(
             distance_observations[channel],
             config.bootstrap,
             graph_reduce=graph_distance_reduce,
         )
+        support_graphs, support_pairs = column_support(
+            graph_support,
+            {
+                graph_id: len(plan[graph_id][channel]["sources"])
+                for graph_id in graph_ids
+            },
+        )
+        reportable = np.asarray(
+            [
+                reportable_bin(
+                    [key for key in graph_ids if graph_support[key][column] > 0],
+                    int(support_pairs[column]),
+                    policy=config.bootstrap,
+                )
+                for column in range(len(axis.labels))
+            ]
+        )
+        output["channels"][channel]["distance_support"] = {
+            "axis": axis.labels,
+            "graphs": support_graphs,
+            "pairs": support_pairs,
+            "reportable": reportable,
+            "minimum_graphs": int(config.bootstrap.minimum_graphs),
+            "minimum_pairs": int(config.bootstrap.minimum_pairs),
+            "empty_replicate_fraction": (
+                empty_columns / float(replicates_seen) if replicates_seen else empty_columns
+            ),
+            # Denominator is the point estimate plus every bootstrap replicate.
+            "reduce_calls": int(replicates_seen),
+        }
+        suppressed = [
+            str(axis.labels[column])
+            for column in range(len(axis.labels))
+            if not reportable[column]
+        ]
+        if suppressed:
+            audit_check(
+                False,
+                "distance.column_below_reporting_floor",
+                f"{channel} distance columns {suppressed} fall below the registered "
+                f"{int(config.bootstrap.minimum_graphs)}-graph/"
+                f"{int(config.bootstrap.minimum_pairs)}-pair reporting floor and are suppressed "
+                "in every distance figure",
+                context={"channel": channel, "columns": suppressed},
+            )
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -863,7 +916,7 @@ def run_scores(
                 "exact": np.stack(
                     [exact_graph[key] for key in sorted(exact_graph)]
                 ).mean(axis=0),
-                "per_opportunity": np.nanmean(
+                "per_opportunity": supported_mean(
                     np.stack(
                         [normalized_graph[key] for key in sorted(normalized_graph)]
                     ),
@@ -1191,6 +1244,169 @@ def run_carriage(
     return output
 
 
+def _association_statistic(
+    associations: Mapping[str, Any],
+    name: str,
+    *,
+    active: bool = False,
+    interval: Mapping[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """Rank correlation, nested interval, and permutation p for one validation panel.
+
+    All three are already estimated by the causal stage; this only selects the active-head variant
+    where the coordinate is only defined for active heads, and pairs the value with its interval.
+    """
+
+    record = associations.get(name)
+    if not record:
+        return None
+    pooled = record.get("pooled_active" if active else "pooled") or {}
+    permutation = (
+        record.get("within_layer_permutation_active" if active else "within_layer_permutation")
+        or {}
+    )
+    statistic: dict[str, Any] = {
+        "rho": pooled.get("rho"),
+        "n": pooled.get("n"),
+        "p": permutation.get("p"),
+    }
+    order = list((interval or associations).get("nested_interval_order", ()) or ())
+    low = (interval or associations).get("nested_interval_low")
+    high = (interval or associations).get("nested_interval_high")
+    # The interval order labels the active variants explicitly; the report keys do not.
+    key = f"{name}_active" if active else name
+    if low is not None and high is not None and key in order:
+        position = order.index(key)
+        statistic["low"] = float(np.asarray(low)[position])
+        statistic["high"] = float(np.asarray(high)[position])
+    return statistic
+
+
+def _sources_per_graph(channel_scores: Mapping[str, Any]) -> dict[int, int]:
+    """Estimable source count per graph, read back from the cached event table."""
+
+    sources: dict[int, set[int]] = {}
+    for row in channel_scores.get("events", ()):
+        sources.setdefault(int(row["graph_id"]), set()).add(int(row["source"]))
+    return {key: len(value) for key, value in sources.items()}
+
+
+def _display_distance(
+    channel_scores: Mapping[str, Any],
+    config: MethodologyConfig,
+    display: DisplayAxis,
+    *,
+    seed: int,
+) -> dict[str, Any] | None:
+    """Every distance quantity a figure needs, on the grouped display axis.
+
+    Grouping is applied to the cached per-graph and per-event sufficient statistics, then the
+    registered estimators are rerun on top: mass is summed, support-normalized quantities are
+    recomputed as summed contribution over summed support inside each graph, and the interval is a
+    fresh nested bootstrap over grouped observations. Nothing here re-derives a grouped value from
+    an already-aggregated one, so no figure shows a statistic the estimator would not produce for
+    that grouping.
+    """
+
+    graph_contribution = channel_scores.get("graph_distance_contribution")
+    graph_support = channel_scores.get("graph_distance_support")
+    if not graph_contribution or not graph_support:
+        return None
+    contribution = {
+        key: display.group_sum(value) for key, value in graph_contribution.items()
+    }
+    support = {key: display.group_sum(value) for key, value in graph_support.items()}
+    heatmaps = score_heatmaps(
+        contribution,
+        support,
+        reconstruction_tolerance=config.numerical.reconstruction_tolerance,
+        graph_scores=channel_scores.get("graph_scores"),
+    )
+    counts = _sources_per_graph(channel_scores)
+    graphs, pairs = column_support(
+        support, {key: counts.get(int(key), 0) for key in support}
+    )
+    keys = sorted(support)
+    reportable = np.asarray(
+        [
+            reportable_bin(
+                [key for key in keys if support[key][column] > 0],
+                int(pairs[column]),
+                policy=config.bootstrap,
+            )
+            for column in range(len(pairs))
+        ]
+    )
+    if display.identity and channel_scores.get("distance_intervals") is not None:
+        interval = channel_scores["distance_intervals"]
+    else:
+        log(
+            f"[figures] rebuilding distance intervals on {len(display.labels)} display columns "
+            f"from {len(channel_scores.get('events', ()))} cached events"
+        )
+        interval = nested_percentile_interval(
+            [
+                Observation(
+                    seed=int(seed),
+                    graph=int(row["graph_id"]),
+                    source=int(row["source"]),
+                    donor=int(row["draw"]),
+                    value=_display_observation(row, display),
+                )
+                for row in channel_scores["events"]
+            ],
+            config.bootstrap,
+            graph_reduce=distance_profile_reduce,
+        )
+    estimable = getattr(interval, "estimable_draws", None)
+    # Exact mass is additive, so a widened group would draw as a resurgence; report it per unit
+    # distance instead. Support-normalized panels are already width-invariant. Both are identities
+    # at unit resolution, and dividing by a width is linear, so the band transforms with the point.
+    widths = display.widths
+    exact_interval = tuple(
+        np.asarray(value)[0] / widths
+        for value in (interval.estimate, interval.low, interval.high)
+    )
+    return {
+        "exact_head": heatmaps.exact_head / widths,
+        "per_opportunity_head": heatmaps.per_opportunity_head,
+        "interval": interval,
+        "exact_estimate": exact_interval[0],
+        "exact_low": exact_interval[1],
+        "exact_high": exact_interval[2],
+        "graphs": graphs,
+        "pairs": pairs,
+        "reportable": reportable,
+        "minimum_graphs": int(config.bootstrap.minimum_graphs),
+        "minimum_pairs": int(config.bootstrap.minimum_pairs),
+        "empty_replicate_fraction": (
+            None
+            if estimable is None
+            else 1.0 - np.asarray(estimable[1, -1], dtype=np.float64)
+            / float(interval.replicates)
+        ),
+    }
+
+
+def _display_observation(row: Mapping[str, Any], display: DisplayAxis) -> np.ndarray:
+    contribution = display.group_sum(np.asarray(row["distance_contribution"]))
+    support = display.group_sum(np.asarray(row["distance_support"]))
+    return np.stack(
+        (contribution, np.broadcast_to(support, contribution.shape))
+    )
+
+
+def _mask_columns(values: Any, reportable: Any) -> np.ndarray:
+    """Blank the trailing distance axis of `values` wherever the reporting floor is not met."""
+
+    values = np.asarray(values, dtype=np.float64).copy()
+    reportable = np.asarray(reportable, dtype=bool)
+    if values.shape[-1] != reportable.shape[-1]:
+        raise ValueError("reportable mask does not align with the distance axis")
+    values[..., ~reportable] = np.nan
+    return values
+
+
 def _coordinate_plot_data(scores: Mapping[str, Any], seed: int) -> HeadPlotData:
     interval = scores.get("intervals")
     if interval is None:
@@ -1315,42 +1531,95 @@ def make_figures(
         metadata={"task": prepared.task.name, "seed": int(prepared.grit.sc.seed)},
     )
     saved["coordinate_plane"] = [str(path) for path in paths]
+    display = display_bins(scores["axis"], max_points=int(theme.max_distance_points))
     for channel in CHANNELS:
         channel_scores = scores["channels"][channel]
-        fig, axes = distance_heatmaps(
-            channel_scores["heatmap_exact"],
-            channel_scores["heatmap_per_opportunity"],
-            scores["axis"],
-            channel=channel,
-            title=prepared.task.title,
-            theme=theme,
+        support = _display_distance(
+            channel_scores, config, display, seed=int(prepared.grit.sc.seed)
         )
-        paths = builder.save(
-            f"{channel}_score_distance_heatmaps",
-            fig,
-            axes,
-            metadata={
-                "task": prepared.task.name,
-                "seed": int(prepared.grit.sc.seed),
-                "channel": channel,
+        labels = display.labels
+        # The registered reporting floor is applied at presentation time only: cached measurements
+        # keep every column, figures show only groups with adequate graph and pair support.
+        reportable = (
+            np.asarray(support["reportable"], dtype=bool)
+            if support is not None
+            else np.ones(len(labels), dtype=bool)
+        )
+        suppressed_columns = [
+            str(label) for label, keep in zip(labels, reportable) if not keep
+        ]
+        reporting_metadata = {
+            "distance_display": {
+                "registered_columns": len(scores["axis"]),
+                "display_columns": list(labels),
+                "grouping": (
+                    "unit resolution near the changed node, dyadic widening in the tail"
+                    if not display.identity
+                    else "none; the registered axis already fits"
+                ),
             },
-        )
-        saved[f"{channel}_distance"] = [str(path) for path in paths]
-        interval = channel_scores["distance_intervals"]
+            "reporting_floor": {
+                "minimum_graphs": int(config.bootstrap.minimum_graphs),
+                "minimum_pairs": int(config.bootstrap.minimum_pairs),
+                "suppressed_columns": suppressed_columns,
+            },
+        }
+        if support is None:
+            continue
+        exact_head = support["exact_head"]
+        per_opportunity_head = support["per_opportunity_head"]
+        # Both variants share one estimate; row normalisation divides by each head's own total
+        # before the reporting floor blanks columns, so suppression never inflates what remains.
+        for normalised, suffix in ((False, ""), (True, "_row_normalised")):
+            panels = (
+                (row_normalised(exact_head), row_normalised(per_opportunity_head))
+                if normalised
+                else (exact_head, per_opportunity_head)
+            )
+            fig, axes = distance_heatmaps(
+                _mask_columns(panels[0], reportable),
+                _mask_columns(panels[1], reportable),
+                labels,
+                channel=channel,
+                title=prepared.task.title,
+                normalised=normalised,
+                grouped=not display.identity,
+                theme=theme,
+            )
+            paths = builder.save(
+                f"{channel}_score_distance_heatmaps{suffix}",
+                fig,
+                axes,
+                metadata={
+                    "task": prepared.task.name,
+                    "seed": int(prepared.grit.sc.seed),
+                    "channel": channel,
+                    "head_aggregation": "per-head rows, layer blocks, layer 0 at the top",
+                    "normalisation": (
+                        "each head divided by its own total over the full distance axis"
+                        if normalised
+                        else "none"
+                    ),
+                    **reporting_metadata,
+                },
+            )
+            saved[f"{channel}_distance{suffix}"] = [str(path) for path in paths]
+        interval = support["interval"]
         profile_row = int(prepared.grit.L)
         fig, axes = score_distance_profiles(
-            scores["axis"],
-            interval.estimate[0, profile_row],
-            interval.estimate[1, profile_row],
+            labels,
+            _mask_columns(support["exact_estimate"][profile_row], reportable),
+            _mask_columns(interval.estimate[1, profile_row], reportable),
             exact_interval=(
-                interval.low[0, profile_row],
-                interval.high[0, profile_row],
+                _mask_columns(support["exact_low"][profile_row], reportable),
+                _mask_columns(support["exact_high"][profile_row], reportable),
             ),
             per_opportunity_interval=(
-                interval.low[1, profile_row],
-                interval.high[1, profile_row],
+                _mask_columns(interval.low[1, profile_row], reportable),
+                _mask_columns(interval.high[1, profile_row], reportable),
             ),
             channel=channel,
+            grouped=not display.identity,
             theme=theme,
         )
         paths = builder.save(
@@ -1362,9 +1631,40 @@ def make_figures(
                 "seed": int(prepared.grit.sc.seed),
                 "channel": channel,
                 "intervals": "nested percentile bootstrap",
+                **reporting_metadata,
             },
         )
         saved[f"{channel}_distance_profile"] = [str(path) for path in paths]
+        if support is not None:
+            fig, axes = distance_support_profile(
+                labels,
+                support["graphs"],
+                support["pairs"],
+                empty_replicate_fraction=support["empty_replicate_fraction"],
+                minimum_graphs=int(support["minimum_graphs"]),
+                minimum_pairs=int(support["minimum_pairs"]),
+                channel=channel,
+                theme=theme,
+            )
+            paths = builder.save(
+                f"{channel}_distance_column_support",
+                fig,
+                axes,
+                metadata={
+                    "task": prepared.task.name,
+                    "seed": int(prepared.grit.sc.seed),
+                    "channel": channel,
+                    "graphs": np.asarray(support["graphs"]).tolist(),
+                    "pairs": np.asarray(support["pairs"]).tolist(),
+                    "empty_replicate_fraction": (
+                        None
+                        if support["empty_replicate_fraction"] is None
+                        else np.asarray(support["empty_replicate_fraction"]).tolist()
+                    ),
+                    **reporting_metadata,
+                },
+            )
+            saved[f"{channel}_distance_support"] = [str(path) for path in paths]
         if carriage is not None:
             rows = carriage["channels"][channel]["pairs"]
             labels, functional, functional_interval = _carriage_profile(
@@ -1394,9 +1694,14 @@ def make_figures(
             )
             saved[f"{channel}_carriage"] = [str(path) for path in paths]
     if scores.get("family_attention_distance"):
+        # Attention mass is a fraction of a fixed total, so grouping is an exact sum.
         fig, axes = attention_distance_profiles(
-            scores["axis"],
-            scores["family_attention_distance"],
+            display.labels,
+            {
+                family: display.group_density(np.asarray(profile))
+                for family, profile in scores["family_attention_distance"].items()
+            },
+            grouped=not display.identity,
             theme=theme,
         )
         paths = builder.save(
@@ -1407,6 +1712,10 @@ def make_figures(
                 "task": prepared.task.name,
                 "seed": int(prepared.grit.sc.seed),
                 "status": "descriptive routing diagnostic",
+                "distance_display": {
+                    "registered_columns": len(scores["axis"]),
+                    "display_columns": list(display.labels),
+                },
             },
         )
         saved["attention_distance"] = [str(path) for path in paths]
@@ -1486,6 +1795,22 @@ def make_figures(
         J = coordinates.joint_sensitivity.reshape(-1)
         D = coordinates.selectivity.reshape(-1)
         active = coordinates.active.reshape(-1)
+        associations = causal["associations"]
+        # The clean-ablation association carries its own interval, estimated in that stage.
+        clean_association = clean_interval_meta.get("association_interval")
+        clean_statistic = _association_statistic(
+            associations,
+            "J_vs_clean_prediction_movement",
+            interval={
+                "nested_interval_order": clean_interval_meta.get("association_order", ()),
+                "nested_interval_low": (
+                    None if clean_association is None else clean_association.low
+                ),
+                "nested_interval_high": (
+                    None if clean_association is None else clean_association.high
+                ),
+            },
+        )
         calibrated_names = list(causal_intervals["calibrated_order"])
 
         def calibrated_column(name):
@@ -1521,6 +1846,7 @@ def make_figures(
                 "xlabel": r"Joint sensitivity $J$",
                 "ylabel": "Clean ablation prediction movement",
                 "title": "Clean necessity",
+                "statistic": clean_statistic,
             },
             {
                 "x": J,
@@ -1531,6 +1857,7 @@ def make_figures(
                 "xlabel": r"Joint sensitivity $J$",
                 "ylabel": "Calibrated total gross patch response",
                 "title": "Gross causal response",
+                "statistic": _association_statistic(associations, "J_vs_gross_total"),
             },
             {
                 "x": J,
@@ -1541,6 +1868,9 @@ def make_figures(
                 "xlabel": r"Joint sensitivity $J$",
                 "ylabel": "Calibrated total donor-wise necessity",
                 "title": "Donor-wise necessity",
+                "statistic": _association_statistic(
+                    associations, "J_vs_necessity_total"
+                ),
             },
             {
                 "x": D[active],
@@ -1557,6 +1887,9 @@ def make_figures(
                 "xlabel": r"Selectivity $D_{rel}$",
                 "ylabel": "Calibrated gross channel contrast",
                 "title": "Selectivity validation",
+                "statistic": _association_statistic(
+                    associations, "D_rel_vs_gross_contrast", active=True
+                ),
                 "zero_x": True,
                 "zero_y": True,
             },
@@ -1575,6 +1908,9 @@ def make_figures(
                 "xlabel": r"Selectivity $D_{rel}$",
                 "ylabel": "Calibrated necessity channel contrast",
                 "title": "Selectivity and necessity",
+                "statistic": _association_statistic(
+                    associations, "D_rel_vs_necessity_contrast", active=True
+                ),
                 "zero_x": True,
                 "zero_y": True,
             },
@@ -1675,8 +2011,13 @@ def make_figures(
             save_family_figure(
                 family_names, "causal_family_endpoints", "causal_families"
             )
+            # Full-size matched controls only. The `control_prefix_*` ladder is the reference for
+            # the cumulative prefix curves, and enumerating it here put one bar category per
+            # (control, prefix size) pair — a hundred or so on a ten-layer model.
             control_names = [
-                name for name in target_order if name.startswith("control_")
+                name
+                for name in target_order
+                if name.startswith("control_") and not name.startswith("control_prefix_")
             ]
             if control_names:
                 save_family_figure(
@@ -1699,7 +2040,39 @@ def make_figures(
                 positions = [target_position[name] for name in names]
                 gross_index = endpoint_order.index("G_c")
                 necessity_index = endpoint_order.index("necessity")
+                # Average the frozen control kinds at each prefix size: the ladder is a reference
+                # level for the family curve, not three separate claims.
+                control_positions = [
+                    [
+                        target_position[control]
+                        for control in target_order
+                        if control.startswith("control_prefix_")
+                        and control.endswith(f"_{size}")
+                        and f"_{family}_" in control
+                    ]
+                    for size in (int(name.rsplit("_", 1)[1]) for name in names)
+                ]
+                control_curve = (
+                    {
+                        endpoint: {
+                            channel: [
+                                float(np.mean(point_raw[index, group, metric]))
+                                if group
+                                else np.nan
+                                for group in control_positions
+                            ]
+                            for channel, index in (("semantic", 0), ("structural", 1))
+                        }
+                        for endpoint, metric in (
+                            ("gross", gross_index),
+                            ("necessity", necessity_index),
+                        )
+                    }
+                    if any(control_positions)
+                    else None
+                )
                 prefix_curves[family] = {
+                    "control": control_curve,
                     "prefix": [int(name.rsplit("_", 1)[1]) for name in names],
                     "gross": {
                         "semantic": point_raw[0, positions, gross_index],

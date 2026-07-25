@@ -38,6 +38,9 @@ class Interval:
     replicates: int
     rng_seed: int
     resampled_levels: tuple[str, ...]
+    # Draws in which each cell was estimable; below `replicates` means some replicate had no
+    # support there. None for intervals recorded before this was tracked.
+    estimable_draws: np.ndarray | None = None
 
 
 def _choice(keys: Sequence[Any], rng: np.random.Generator, resample: bool) -> list[Any]:
@@ -131,6 +134,7 @@ def nested_percentile_interval(
         ]
     )
     alpha = (1.0 - float(policy.confidence)) / 2.0
+    low, high, estimable = _percentiles(draws, alpha)
     levels = [
         name
         for name, enabled in (
@@ -143,11 +147,35 @@ def nested_percentile_interval(
     ]
     return Interval(
         estimate=estimate,
-        low=np.quantile(draws, alpha, axis=0),
-        high=np.quantile(draws, 1.0 - alpha, axis=0),
+        low=low,
+        high=high,
         replicates=int(policy.replicates),
         rng_seed=int(policy.rng_seed),
         resampled_levels=tuple(levels),
+        estimable_draws=estimable,
+    )
+
+
+def _percentiles(
+    draws: np.ndarray, alpha: float
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Percentiles over the estimable draws of each cell.
+
+    A replicate in which a cell has no support is missing, not zero: including it would drag the
+    band toward zero and contradict the point estimator, which reports that cell as non-estimable.
+    """
+
+    draws = np.asarray(draws, dtype=np.float64)
+    estimable = np.isfinite(draws).sum(axis=0)
+    empty = estimable == 0
+    # Fill fully unsupported cells so np.nanquantile never sees an all-nan slice, then restore nan.
+    filled = np.where(np.broadcast_to(empty, draws.shape), 0.0, draws)
+    low = np.nanquantile(filled, alpha, axis=0)
+    high = np.nanquantile(filled, 1.0 - alpha, axis=0)
+    return (
+        np.where(empty, np.nan, low),
+        np.where(empty, np.nan, high),
+        estimable,
     )
 
 

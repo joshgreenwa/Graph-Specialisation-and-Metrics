@@ -387,17 +387,33 @@ S_c(l,h)     = sum_d mean_g C_{g,c}(l,h,d)
 
 Distance is measured on the pristine graph. Because both core interventions change one declared
 source, the distance anchor is `s` for both channels. For each channel, model, and task, the
-mandatory exact-contribution heatmap is:
+mandatory exact-contribution matrix is head-resolved:
 
 ```text
-H_c(l,d) = sum_h mean_g C_{g,c}(l,h,d)
+H_c(l,h,d) = mean_g C_{g,c}(l,h,d)
+H_c(l,d)   = sum_h H_c(l,h,d)
 ```
 
-It has shape `num_layers x (max finite carrier distance + 1)`. Rows are layers and columns are the
-integer distances `0, 1, ..., d_max`. Summing across distance reconstructs the graph-averaged total
-head mass in that layer. Save `H_c` before any display normalization. If a fraction heatmap is
-shown, normalize by the single panel total `sum_{l,d} H_c(l,d)`; do not row-normalize and thereby
-erase between-layer differences.
+`H_c(l,h,d)` is what the heatmap displays: one row per head, blocked by layer, layer `0` in the top
+block, columns the integer distances `0, 1, ..., d_max`. Heads are not summed for display, because a
+layer's heads routinely peak at different distances and the head sum then reports every layer as
+broader than any head inside it. The head-summed `H_c(l,d)` is retained as the aggregate
+measurement and is what the accompanying distance-profile figure and its intervals are built from.
+Save both before any display normalization.
+
+Two normalizations are registered, and both figures are mandatory for a channel:
+
+```text
+H_c(l,h,d)                        (primary, absolute)
+H_c(l,h,d) / sum_d H_c(l,h,d)     (companion, row-normalized)
+```
+
+The primary figure carries the between-layer and between-head magnitude differences. The companion
+divides each head by its own total over the **whole** registered distance axis, so it reports profile
+shape at fixed head magnitude, and blanking a column under the reporting floor can never inflate the
+columns that remain — a displayed row sums to at most one. A head with no mass anywhere stays
+non-estimable rather than becoming a uniform profile. Publishing the companion alone is incomplete:
+it is the primary figure that shows which heads carry the mass being profiled.
 
 The event-carrier support at distance `d` is the mean opportunity count within graph:
 
@@ -409,22 +425,36 @@ O_{g,c}(d)
 The corresponding per-opportunity response is computed **within graph before graph averaging**:
 
 ```text
-R_c(l,d)
-    = sum_h mean_{g: O_{g,c}(d)>0}
-      [ C_{g,c}(l,h,d) / O_{g,c}(d) ]
+R_c(l,h,d) = mean_{g: O_{g,c}(d)>0} [ C_{g,c}(l,h,d) / O_{g,c}(d) ]
+R_c(l,d)   = sum_h R_c(l,h,d)
 ```
 
-The second mandatory heatmap displays `R_c(l,d)` and has the same layer-by-distance shape. It is
-the exact score contribution divided by event-carrier support, not a replacement score. This
-within-graph division prevents large or long-diameter graphs from supplying both the numerator and
-the weighting.
+`R_c` occupies the second panel of both heatmap figures, at the same head-resolved geometry and
+under the same two normalizations as `H_c`. It is the exact score contribution divided by
+event-carrier support, not a replacement score. This within-graph division prevents large or
+long-diameter graphs from supplying both the numerator and the weighting. Note that the two panels
+are not conditioned on the same graphs: `H_c` averages every graph, counting a graph with no carrier
+at `d` as a real zero, while `R_c` averages only the graphs that have support there. At the far
+columns that subset is small and `O_{g,c}(d)` approaches one carrier, so `R_c` is both amplified and
+conditioned on the longest-diameter graphs; the reporting floor of Section 7 is what keeps those
+cells from being read as population estimates.
 
 `unreachable` carriers and internal virtual/hub nodes use explicit columns after the numeric
 distance columns and are never folded into `d_max`. Summing all numeric and explicit special
 buckets must reconstruct the raw score graph by graph within tolerance.
 
+Measurement is always at unit distance resolution. Presentation is not: on a long-diameter task a
+figure would carry more distance columns than it can label, so every distance figure is drawn on a
+grouped display axis of a bounded number of columns — unit resolution near the changed node, dyadic
+widening in the tail, explicit columns never merged into a numeric range. Grouping is applied to the
+per-graph and per-event statistics and the registered estimators are rerun on the grouped axis, so a
+displayed value is always one the estimator would produce for that grouping, with its own interval
+and its own reporting-floor decision. Because groups have unequal widths, additive quantities are
+displayed per unit distance; support-normalized quantities need no such correction. Both reduce to
+the ungrouped figure when every group is a single column.
+
 Heatmap cells cannot display useful error bars. Therefore every heatmap is accompanied by a
-distance-profile figure obtained by summing its matrix over layers, with a 95% confidence band
+distance-profile figure obtained by summing `H_c(l,d)` and `R_c(l,d)` over layers, with a 95% band
 under the Section 7 hierarchy, plus a machine-readable cell table with corresponding intervals.
 With multiple seeds, show seed-level curves and, with at least three seeds, use the registered
 hierarchical population interval. Both semantic and structural panels use identical distance
@@ -623,6 +653,19 @@ if that count is zero, the estimator reduces to the ordinary mean. Median and or
 sensitivity analyses, not silent replacements. A bin is reported only when it contains at least
 10 contributing graphs and 50 eligible `(carrier, source)` pairs in total; otherwise it is marked
 not estimable.
+
+This floor governs score distance columns exactly as it governs carriage distance bins. The
+distance axis is frozen from the all-pairs distances of the whole discovery split, so its far
+columns can be populated by very few graphs; every distance figure therefore suppresses columns
+below the floor, and each run records the per-column supporting-graph and eligible-pair counts
+alongside a support figure. Cached measurements retain every column: the floor is a reporting rule,
+not a measurement change.
+
+Within a resample, a distance column with no carrier opportunity is *missing*, not zero. Support-
+normalized quantities average only over the graphs that supply opportunity, and a bootstrap
+replicate in which no resampled graph supplies any is excluded from that cell's percentiles rather
+than entered as zero, which would bias the band toward zero and contradict the point estimate. Each
+interval records how many replicates were estimable per cell.
 
 Every plotted Functional carriage or Beneficial carriage summary includes uncertainty. Unless a
 section explicitly fixes a level, the same hierarchy also governs raw scores, conditional
@@ -1131,8 +1174,9 @@ stage in which no graph retains a source estimable under both channels.
 - same-content semantic donors and structural self-donors produce numerical zero;
 - every production event is nontrivial;
 - source/donor matching tiers and degree gaps are recorded;
-- a mismatch control drawn outside the frozen degree tier, or an event forced to serve as its own
-  mismatch control, is recorded as an audit failure for that stratum; and
+- a mismatch control drawn outside the frozen degree tier is recorded as an audit failure for that
+  stratum, and an event with no admissible control at all is excluded from the causal record
+  rather than reported against a self-control that would null its adjustment; and
 - unknown task fields that could cross the channel boundary abort the run.
 
 ### Estimator checks
@@ -1141,6 +1185,8 @@ stage in which no graph retains a source estimable under both channels.
 - reconstruct raw head scores from source/event accumulators;
 - reconstruct distance-resolved head scores from all distance buckets;
 - verify every support-normalized cell was divided within graph before graph averaging;
+- record per-column supporting-graph and eligible-pair counts, the fraction of bootstrap replicates
+  in which each column had no support, and every column suppressed by the reporting floor;
 - verify each integrated donor path against its finite endpoint loss change;
 - verify donor-averaged `sum_i B = mean_k(loss_event_k - loss_clean)`;
 - verify same-condition activation patches are numerical zero and replay the exact intervened

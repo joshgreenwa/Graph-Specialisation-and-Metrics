@@ -94,10 +94,16 @@ def _aggregate(records: Sequence[Mapping[str, Any]], key: str) -> float:
     return float(np.mean(graph_values))
 
 
-def _mismatch_indices(records: Sequence[Any]) -> list[int]:
-    """Prefer another donor event for the same source."""
+def _mismatch_indices(records: Sequence[Any]) -> tuple[list[int], set[int]]:
+    """Prefer another donor event for the same source.
+
+    Returns the control index chosen for each event and the positions that have no admissible
+    control at all. A self-control would silently null that event's mismatch adjustment, so those
+    events are excluded from the causal record instead of being reported with a zeroed control.
+    """
 
     result: list[int] = []
+    excluded: set[int] = set()
     for position, record in enumerate(records):
         candidates = [
             other
@@ -132,10 +138,13 @@ def _mismatch_indices(records: Sequence[Any]) -> list[int]:
                 + (
                     "the mismatch control was drawn from another degree tier"
                     if relaxed
-                    else "the event is its own mismatch control, which nulls its adjustment"
+                    else "the event has no admissible control and is excluded from the "
+                    "causal record"
                 ),
                 context={"source": int(record.source), "relaxed_degree_tier": bool(relaxed)},
             )
+            if not relaxed:
+                excluded.add(position)
             candidates = relaxed or [position]
         result.append(
             min(
@@ -147,7 +156,7 @@ def _mismatch_indices(records: Sequence[Any]) -> list[int]:
                 ),
             )
         )
-    return result
+    return result, excluded
 
 
 def _clean_ablation_stage(
@@ -291,6 +300,7 @@ def _causal_events(
         target: {channel: [] for channel in CHANNELS} for target in targets
     }
     self_patch_max = 0.0
+    excluded_events = 0
     for graph_id in sorted(plan):
         base = prepared.grit.eval_ds[int(graph_id)]
         for channel in CHANNELS:
@@ -305,7 +315,8 @@ def _causal_events(
             )
             z_clean = captured.z[0:1].detach().cpu().numpy()
             z_event = captured.z[1:].detach().cpu().numpy()
-            mismatch = _mismatch_indices(records)
+            mismatch, uncontrolled = _mismatch_indices(records)
+            excluded_events += len(uncontrolled)
             event_indices = list(range(1, len(records) + 1))
             mismatch_capture_indices = [value + 1 for value in mismatch]
             clean_replacements = prepared.backend.replacement_batch(
@@ -375,6 +386,9 @@ def _causal_events(
                 aligned_adjusted = mismatch_adjusted_aligned(matched, mismatched)
                 rows = records_by_target[target_name][channel]
                 for position, record in enumerate(records):
+                    if position in uncontrolled:
+                        # No admissible mismatch control: excluded rather than self-controlled.
+                        continue
                     mismatch_record = records[mismatch[position]]
                     rows.append(
                         {
@@ -417,6 +431,7 @@ def _causal_events(
     )
     return {
         "records": records_by_target,
+        "uncontrolled_events_excluded": int(excluded_events),
         "same_condition_patch_max": self_patch_max,
     }
 
@@ -948,6 +963,7 @@ def run_causal_validation(
         "clean_ablation": clean,
         "event_records": events["records"],
         "same_condition_patch_max": events["same_condition_patch_max"],
+        "uncontrolled_events_excluded": events["uncontrolled_events_excluded"],
         "summary": summary,
         "associations": associations,
         "families": scores["families"],
