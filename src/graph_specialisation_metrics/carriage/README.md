@@ -1,5 +1,12 @@
 # Semantic and structural carriage
 
+> **Normative status:** the final cross-task methodology is now
+> [`../README.md`](../README.md). This file remains an implementation and historical reference.
+> Its structural-transposition passages describe the previous production path and do not override
+> the final structural donor-swap specification. The canonical methodology uses only `F_sens` for
+> Functional carriage and defines Beneficial carriage with the positive-is-beneficial sign; older
+> diagnostic names and opposite-sign equations below must not be reused in new analyses.
+
 Reference for the two **carriage** methodologies implemented in this package:
 
 - **semantic carriage** measures reliance on node content using an inter-graph donor swap; and

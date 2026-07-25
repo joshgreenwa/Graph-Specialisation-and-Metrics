@@ -1,7 +1,19 @@
 # Methodology Experiments
 
+> The final normative methodology is
+> [`../../src/graph_specialisation_metrics/README.md`](../../src/graph_specialisation_metrics/README.md).
+> The multi-method comparisons documented here are selection experiments, not alternative
+> production methods.
+
 This directory contains config and Slurm entry points for the dissertation core
 procedure and the method-validation suite.
+
+The production Colab entry point is now
+[`canonical_methodology_colab.py`](canonical_methodology_colab.py). It checks out one pinned
+repository branch, reuses the registered training checkpoint/data caches in Drive, and dispatches
+the canonical package for any combination of dense, 1-hop, k-hop, and k-hop+VNode GRIT tasks.
+Its outputs are versioned by task and training seed beneath the configured Drive root. The older
+front ends below remain as selection/draft artifacts and are not called by the public `main()`.
 
 The implementation specification for the final dense-model scoring comparison is
 [SCORING_METRIC_REFINEMENT_TASK.md](SCORING_METRIC_REFINEMENT_TASK.md).

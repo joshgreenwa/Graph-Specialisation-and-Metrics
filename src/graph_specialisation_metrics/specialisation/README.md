@@ -1,5 +1,10 @@
 # Per-head specialisation scores on GRIT (central methodology)
 
+> **Normative status:** the final cross-task methodology is now
+> [`../README.md`](../README.md). This file remains an implementation and historical reference.
+> Its structural-transposition passages describe the previous production path and do not override
+> the final structural donor-swap specification.
+
 The production specialisation-score methodology on the **real GRIT transformer**. It originated
 from the spec-lite method in `experiments/synthetic/specialisation/SPECIALISATION_SCORES.md`, but
 the production estimator is now the graph-balanced **eventwise-gross (EG)** score defined below.

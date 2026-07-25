@@ -155,7 +155,7 @@ def make_variant_replicas(
             elif variant in {"pe_single_donor", "pe_transposition"}:
                 partner = int(
                     rng.choice(
-                        legacy.structural_partners(cfg, query, source)
+                        legacy.structural_donors(cfg, query, source)
                     )
                 )
                 partners[graph, event] = partner

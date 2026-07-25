@@ -84,19 +84,32 @@ def test_semantic_and_structural_interventions_change_only_declared_factor():
         else:
             assert torch.equal(corrupt.x, clean.x)
             assert bool((corrupt.rrwp != clean.rrwp).any())
-            # The RRWP permutation always moves the marked anchor to a different query-distance
-            # orbit; because cycle nodes all have degree two, this is an exact degree match.
+            # The source receives exactly one donor's RRWP footprint without a reciprocal
+            # replacement. Every cycle node has degree two, so donor matching is exact.
             for graph in range(len(clean)):
                 q = int(clean.q_idx[graph])
                 source = int(clean.target_idx[graph])
-                partners = module.structural_partners(cfg, q, source)
+                donors = module.structural_donors(cfg, q, source)
                 matched = [
-                    partner
-                    for partner in partners
-                    if torch.equal(corrupt.rrwp[graph], module.transpose_rrwp(clean.rrwp[graph], source, partner))
+                    donor
+                    for donor in donors
+                    if torch.equal(
+                        corrupt.rrwp[graph],
+                        module.copy_rrwp_footprint(clean.rrwp[graph], source, donor),
+                    )
                 ]
                 assert len(matched) == 1
                 assert module.cycle_distance(cfg.n, q, matched[0]) != int(clean.y[graph]) + 1
+                donor = matched[0]
+                other = [node for node in range(cfg.n) if node != source]
+                assert torch.equal(
+                    corrupt.rrwp[graph][other][:, other],
+                    clean.rrwp[graph][other][:, other],
+                )
+                assert torch.equal(
+                    corrupt.rrwp[graph, donor, donor],
+                    clean.rrwp[graph, donor, donor],
+                )
 
 
 def test_no_op_replicas_are_identical_and_head_groups_are_disjoint():
@@ -262,3 +275,41 @@ def test_score_ablation_and_rescue_hooks_with_mock_head_model():
     dj_values = module.dj_family_ablation_values([{"dj_family_ablation": dj_family}])
     assert dj_values["semantic"]["high_J_generalist"]["functional_by_seed"].shape == (1, 2)
     assert dj_values["structural"]["low_J_inert"]["accuracy_drop_by_seed"].shape == (1, 2)
+
+
+def test_validation_performance_summary_reports_seed_mean_and_std():
+    module = _load_module()
+
+    def heldout(base):
+        return {
+            "accuracy": base,
+            "semantic_accuracy": base - 0.02,
+            "structural_accuracy": base + 0.02,
+            "loss": 1.0 - base,
+            "semantic_loss": 1.1 - base,
+            "structural_loss": 0.9 - base,
+        }
+
+    checkpoints = {
+        1: {"heldout_validation": heldout(0.90), "best_validation": {"accuracy": 0.91}},
+        0: {"heldout_validation": heldout(0.94), "best_validation": {}},
+    }
+    summary = module.validation_performance_summary(checkpoints)
+    assert summary["metric_source"] == "heldout_validation"
+    assert summary["n_seeds"] == 2
+    assert [row["seed"] for row in summary["per_seed"]] == [0, 1]
+    accuracy = summary["aggregate"]["accuracy"]
+    assert np.isclose(accuracy["mean"], 0.92)
+    assert np.isclose(accuracy["std"], np.std([0.90, 0.94], ddof=1))
+    assert np.isclose(accuracy["sem"], accuracy["std"] / np.sqrt(2))
+    assert accuracy["n_seeds"] == 2
+    # Missing selection metrics degrade to NaN placeholders instead of failing.
+    assert np.isnan(summary["per_seed"][0]["selection_loss"])
+    assert np.isclose(summary["per_seed"][1]["selection_accuracy"], 0.91)
+
+    single = module.validation_performance_summary({5: {"heldout_validation": heldout(0.88)}})
+    assert np.isclose(single["aggregate"]["accuracy"]["mean"], 0.88)
+    assert single["aggregate"]["accuracy"]["std"] == 0.0
+    assert single["aggregate"]["accuracy"]["sem"] == 0.0
+
+    module.print_validation_performance(summary, module.Config())

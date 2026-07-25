@@ -1,5 +1,10 @@
 # Synthetic Experiments
 
+> The final normative methodology is
+> [`../../src/graph_specialisation_metrics/README.md`](../../src/graph_specialisation_metrics/README.md).
+> Multi-arm donor/transposition sections below document method-selection experiments rather than
+> current production variants.
+
 This folder contains controlled graph tasks for studying symbolic and structural
 attention behaviour outside ZINC.
 

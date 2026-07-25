@@ -1,5 +1,10 @@
 # Scoring-metric refinement
 
+> **Normative status:** this package records the comparison that selected the final method. The
+> production specification is [`../README.md`](../README.md): semantic and structural donor-swaps
+> are the only core interventions. Factorial method labels and transposition arms below are
+> historical comparison vocabulary, not names or variants of the final method.
+
 This package implements the task-general experiment specified in
 `experiments/methodology/SCORING_METRIC_REFINEMENT_TASK.md`. Its public API is:
 

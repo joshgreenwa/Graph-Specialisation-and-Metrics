@@ -39,9 +39,11 @@ Semantic score/corruption
     fixed.  Donor deltas are averaged before the functional magnitude.
 
 Structural score/corruption
-    Transpose the anchor's RRWP row and column with a degree-matched partner while content
-    and the dense all-pairs mask remain fixed.  Every cycle node has degree two, so partner
-    matching is exact.  Partner deltas are averaged before the functional magnitude.
+    Replace the anchor's complete RRWP footprint with that of a degree-matched structural
+    donor while content and the dense all-pairs mask remain fixed.  There is no reciprocal
+    replacement: every RRWP entry not incident to the anchor is unchanged.  Every cycle
+    node has degree two, so donor matching is exact.  Donor deltas are averaged before the
+    functional magnitude.
 
 The score at head (l,h) is the production transport-site estimator
 
@@ -67,6 +69,9 @@ Primary outputs (PNG + vector PDF)
 ``fig6_joint_selectivity_family_ablation``
     Fixed score-selected cumulative ablations of semantic specialists, structural specialists,
     high-J generalists, and low-J/inert heads on both tasks.
+``tables/validation_performance.csv`` and the printed ``[validation]`` block
+    Per-seed best-checkpoint held-out validation accuracy and loss (overall and per task)
+    with the across-seed mean ± sample standard deviation.
 
 Paper claims must use the default (or larger) run, never ``--fast-dev-run``.  The fast run
 exists only to verify installation, official-layer execution, caching, and plotting.
@@ -95,6 +100,7 @@ import numpy as np
 
 
 EXPERIMENT_VERSION = "causal-specialisation-double-dissociation-v2-shared-source-marker"
+ANALYSIS_VERSION = "causal-specialisation-matched-donor-swaps-v1"
 FAMILY_ABLATION_REVISION = "score-selected-prefix-family-ablation-v1"
 DJ_FAMILY_ABLATION_REVISION = "joint-selectivity-prefix-family-ablation-v1"
 OFFICIAL_GRIT_URL = "https://github.com/LiamMa/GRIT.git"
@@ -273,6 +279,16 @@ def config_fingerprint(cfg: Config) -> str:
     return hashlib.sha1(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()[:16]
 
 
+def analysis_fingerprint(cfg: Config) -> str:
+    """Fingerprint intervention-dependent work without invalidating training caches."""
+
+    payload = {
+        "analysis_version": ANALYSIS_VERSION,
+        "training_fingerprint": config_fingerprint(cfg),
+    }
+    return hashlib.sha1(json.dumps(payload, sort_keys=True).encode()).hexdigest()[:16]
+
+
 @dataclass
 class SynthBatch:
     x: Any
@@ -398,11 +414,33 @@ def concat_batches(batches: Sequence[SynthBatch]) -> SynthBatch:
 
 
 def transpose_rrwp(rrwp: Any, u: int, v: int) -> Any:
+    """Relabel RRWP for the independent full-isomorphism verification check."""
+
     if int(u) == int(v):
         return rrwp.clone()
     order = list(range(int(rrwp.size(0))))
     order[int(u)], order[int(v)] = order[int(v)], order[int(u)]
     return rrwp[order][:, order].clone()
+
+
+def copy_rrwp_footprint(rrwp: Any, source: int, donor: int) -> Any:
+    """Replace one source node's dense RRWP row/column with a donor footprint.
+
+    There is no reciprocal replacement: every entry not incident to ``source`` remains
+    unchanged.  This is the mask-frozen, single-node structural donor-swap used by the
+    final methodology.
+    """
+
+    source, donor = int(source), int(donor)
+    if source == donor:
+        return rrwp.clone()
+    output = rrwp.clone()
+    donor_row = rrwp[donor].clone()
+    donor_column = rrwp[:, donor].clone()
+    output[source] = donor_row
+    output[:, source] = donor_column
+    output[source, source] = rrwp[donor, donor]
+    return output
 
 
 def replace_value(cfg: Config, row: Any, value: int) -> Any:
@@ -418,14 +456,14 @@ def draw_other_class(rng: np.random.Generator, classes: int, current: int) -> in
     return value + (1 if value >= int(current) else 0)
 
 
-def structural_partners(cfg: Config, q: int, anchor: int) -> list[int]:
+def structural_donors(cfg: Config, q: int, anchor: int) -> list[int]:
     clean_distance = cycle_distance(cfg.n, q, anchor)
     candidates = [
         node for node in range(cfg.n)
         if node not in {q, anchor} and cycle_distance(cfg.n, q, node) != clean_distance
     ]
     if not candidates:
-        raise RuntimeError("no degree-matched structural partner changes the planted distance")
+        raise RuntimeError("no degree-matched structural donor changes the planted distance")
     return candidates
 
 
@@ -457,11 +495,11 @@ def make_replicas(
                 x[0, source] = replace_value(cfg, x[0, source], donor_value)
             elif factor == "structural":
                 if no_op:
-                    partner = source
+                    donor = source
                 else:
-                    candidates = structural_partners(cfg, q, source)
-                    partner = int(rng.choice(candidates))
-                rrwp[0] = transpose_rrwp(rrwp[0], source, partner)
+                    candidates = structural_donors(cfg, q, source)
+                    donor = int(rng.choice(candidates))
+                rrwp[0] = copy_rrwp_footprint(rrwp[0], source, donor)
             else:
                 raise ValueError(f"unknown factor {factor!r}")
             replicas.append(SynthBatch(
@@ -856,7 +894,7 @@ def train_seed(
 
 
 def score_channel_batch(model: Any, cfg: Config, clean: SynthBatch, *, factor: str, seed: int, device: Any) -> Any:
-    """Per-graph [G,L,H] functional score; donor/partner average occurs before magnitude."""
+    """Per-graph [G,L,H] functional score; donor average occurs before magnitude."""
     import torch
 
     replicas = make_replicas(cfg, clean.cpu(), factor=factor, donors=cfg.score_donors, seed=seed).to(device)
@@ -1162,7 +1200,7 @@ def select_dj_groups(
 
 
 def analysis_path(run_dir: Path, cfg: Config, seed: int) -> Path:
-    return run_dir / "analysis" / f"seed_{seed}__{config_fingerprint(cfg)}.pt"
+    return run_dir / "analysis" / f"seed_{seed}__{analysis_fingerprint(cfg)}.pt"
 
 
 def analyze_seed(
@@ -1236,8 +1274,8 @@ def analyze_seed(
     structural_pg = score_channel(
         model, cfg, mode=MODE_STRUCTURAL, factor="structural", seed=300_000 + seed, device=device
     )
-    # Negative-control channels: value swaps should not solve the structural task; RRWP
-    # transpositions should not matter to marked-source value retrieval.
+    # Negative-control channels: value donor-swaps should not solve the structural task;
+    # structural donor-swaps should not matter to marked-source value retrieval.
     semantic_on_structural_pg = score_channel(
         model, cfg, mode=MODE_STRUCTURAL, factor="semantic", seed=400_000 + seed, device=device
     )
@@ -1270,7 +1308,9 @@ def analyze_seed(
     )
     result = {
         "version": EXPERIMENT_VERSION,
+        "analysis_version": ANALYSIS_VERSION,
         "fingerprint": config_fingerprint(cfg),
+        "analysis_fingerprint": analysis_fingerprint(cfg),
         "seed": int(seed),
         "checks": checks,
         "semantic_score_per_graph": semantic_pg,
@@ -1546,7 +1586,7 @@ def figure_score_ablation(rows: Sequence[Mapping[str, Any]], cfg: Config, figure
     markers = ["o", "s", "^", "D", "P"]
     specs = [
         ("semantic", "semantic_score_norm", "semantic_ablation_functional", "Semantic donor-swap score", "Semantic-task ablation impact"),
-        ("structural", "structural_score_norm", "structural_ablation_functional", "Structural transposition score", "Structural-task ablation impact"),
+        ("structural", "structural_score_norm", "structural_ablation_functional", "Structural donor-swap score", "Structural-task ablation impact"),
     ]
     summary: dict[str, Any] = {}
     for ax, (name, x_key, y_key, x_label, y_label) in zip(axes, specs):
@@ -2209,7 +2249,79 @@ def figure_dj_family_ablation(
     return save_figure(fig, figures_dir / "fig6_joint_selectivity_family_ablation"), values
 
 
-def create_outputs(results: Sequence[dict[str, Any]], cfg: Config, run_dir: Path) -> dict[str, Any]:
+VALIDATION_METRIC_LABELS = (
+    ("accuracy", "overall accuracy"),
+    ("semantic_accuracy", "semantic accuracy"),
+    ("structural_accuracy", "structural accuracy"),
+    ("loss", "overall loss"),
+    ("semantic_loss", "semantic loss"),
+    ("structural_loss", "structural loss"),
+)
+
+
+def validation_performance_summary(checkpoints: Mapping[int, Mapping[str, Any]]) -> dict[str, Any]:
+    """Per-seed checkpoint validation metrics plus the across-seed mean ± sample std.
+
+    Aggregates use ``heldout_validation``: it is evaluated once on fresh graphs after the
+    best checkpoint is restored, so unlike the selection-set metrics it is untouched by
+    checkpoint selection.  Selection-set metrics are kept per seed for reference only.
+    """
+
+    rows: list[dict[str, Any]] = []
+    for seed in sorted(checkpoints):
+        payload = checkpoints[seed]
+        heldout = payload.get("heldout_validation") or {}
+        selection = payload.get("best_validation") or {}
+        row: dict[str, Any] = {"seed": int(seed)}
+        for key, _ in VALIDATION_METRIC_LABELS:
+            row[f"heldout_{key}"] = float(heldout.get(key, float("nan")))
+            row[f"selection_{key}"] = float(selection.get(key, float("nan")))
+        rows.append(row)
+    aggregate: dict[str, dict[str, float]] = {}
+    for key, _ in VALIDATION_METRIC_LABELS:
+        values = np.asarray([row[f"heldout_{key}"] for row in rows], dtype=float)
+        finite = values[np.isfinite(values)]
+        n = int(finite.size)
+        std = float(finite.std(ddof=1)) if n > 1 else 0.0
+        aggregate[key] = {
+            "mean": float(finite.mean()) if n else float("nan"),
+            "std": std,
+            "sem": std / math.sqrt(n) if n > 1 else 0.0,
+            "n_seeds": n,
+        }
+    return {
+        "metric_source": "heldout_validation",
+        "n_seeds": len(rows),
+        "per_seed": rows,
+        "aggregate": aggregate,
+    }
+
+
+def print_validation_performance(summary: Mapping[str, Any], cfg: Config) -> None:
+    print(
+        f"\n[validation] best-checkpoint held-out validation over {summary['n_seeds']} seeds "
+        f"({cfg.validation_graphs} fresh graphs per seed; ± is the across-seed sample std)",
+        flush=True,
+    )
+    for row in summary["per_seed"]:
+        print(
+            f"  seed {int(row['seed'])}: overall={row['heldout_accuracy']:.4f} "
+            f"sem={row['heldout_semantic_accuracy']:.4f} "
+            f"str={row['heldout_structural_accuracy']:.4f} "
+            f"loss={row['heldout_loss']:.4f}",
+            flush=True,
+        )
+    for key, label in VALIDATION_METRIC_LABELS:
+        stats = summary["aggregate"][key]
+        print(f"  {label:<19} = {stats['mean']:.4f} ± {stats['std']:.4f}", flush=True)
+
+
+def create_outputs(
+    results: Sequence[dict[str, Any]],
+    cfg: Config,
+    run_dir: Path,
+    validation: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
     figures_dir = run_dir / "figures"
     tables_dir = run_dir / "tables"
     head_rows = build_head_rows(results)
@@ -2239,7 +2351,9 @@ def create_outputs(results: Sequence[dict[str, Any]], cfg: Config, run_dir: Path
         })
     summary = {
         "version": EXPERIMENT_VERSION,
+        "analysis_version": ANALYSIS_VERSION,
         "fingerprint": config_fingerprint(cfg),
+        "analysis_fingerprint": analysis_fingerprint(cfg),
         "official_grit_commit": OFFICIAL_GRIT_COMMIT,
         "config": asdict(cfg),
         "score_ablation_correlations": correlations,
@@ -2251,6 +2365,7 @@ def create_outputs(results: Sequence[dict[str, Any]], cfg: Config, run_dir: Path
         "iterative_family_ablation": iterative_ablation,
         "joint_influence_selectivity": joint_selectivity_summary,
         "joint_selectivity_family_ablation": dj_family_ablation,
+        "validation_performance": validation,
         "seeds": seed_summaries,
         "figures": fig1 + fig2 + fig3 + fig4 + fig5 + fig6,
     }
@@ -2269,6 +2384,7 @@ def environment_record(device: Any) -> dict[str, Any]:
 
     return {
         "experiment_version": EXPERIMENT_VERSION,
+        "analysis_version": ANALYSIS_VERSION,
         "official_grit_commit": OFFICIAL_GRIT_COMMIT,
         "python": sys.version,
         "torch": torch.__version__,
@@ -2397,7 +2513,15 @@ def main(argv: Sequence[str] | None = None) -> dict[str, Any]:
         print("[warn] CUDA unavailable; official GRIT analysis will be slow", flush=True)
     run_dir = Path(cfg.drive_root) / cfg.run_name
     run_dir.mkdir(parents=True, exist_ok=True)
-    write_json(run_dir / "config.json", {"config": asdict(cfg), "fingerprint": config_fingerprint(cfg)})
+    write_json(
+        run_dir / "config.json",
+        {
+            "config": asdict(cfg),
+            "fingerprint": config_fingerprint(cfg),
+            "analysis_version": ANALYSIS_VERSION,
+            "analysis_fingerprint": analysis_fingerprint(cfg),
+        },
+    )
     write_json(run_dir / "environment.json", environment_record(device))
 
     models: dict[int, Any] = {}
@@ -2425,7 +2549,15 @@ def main(argv: Sequence[str] | None = None) -> dict[str, Any]:
             models[int(seed)] = model
             checkpoints[int(seed)] = payload
     if args.phase == "train":
-        return {"run_dir": str(run_dir), "checkpoints": [str(checkpoint_path(run_dir, cfg, seed)) for seed in cfg.seeds]}
+        validation_performance = validation_performance_summary(checkpoints) if checkpoints else None
+        if validation_performance is not None:
+            write_csv(run_dir / "tables" / "validation_performance.csv", validation_performance["per_seed"])
+            print_validation_performance(validation_performance, cfg)
+        return {
+            "run_dir": str(run_dir),
+            "checkpoints": [str(checkpoint_path(run_dir, cfg, seed)) for seed in cfg.seeds],
+            "validation_performance": validation_performance,
+        }
 
     results = []
     if args.phase in {"all", "analyze"}:
@@ -2440,25 +2572,43 @@ def main(argv: Sequence[str] | None = None) -> dict[str, Any]:
             ))
     else:
         for seed in cfg.seeds:
+            # Figures reruns skip training, so recover the cached validation metrics directly.
+            ckpt = checkpoint_path(run_dir, cfg, seed)
+            if not ckpt.exists():
+                print(f"[validation] checkpoint missing for seed {seed}; it will be absent from the report", flush=True)
+            else:
+                payload = torch.load(ckpt, map_location="cpu", weights_only=False)
+                if payload.get("fingerprint") == config_fingerprint(cfg):
+                    checkpoints[int(seed)] = payload
+                else:
+                    print(f"[validation] fingerprint mismatch; skipping {ckpt}", flush=True)
             path = analysis_path(run_dir, cfg, seed)
             if not path.exists():
                 raise FileNotFoundError(f"figures phase requires cached analysis: {path}")
             results.append(torch.load(path, map_location="cpu", weights_only=False))
 
-    summary = create_outputs(results, cfg, run_dir)
+    validation_performance = validation_performance_summary(checkpoints) if checkpoints else None
+    if validation_performance is not None:
+        write_csv(run_dir / "tables" / "validation_performance.csv", validation_performance["per_seed"])
+    summary = create_outputs(results, cfg, run_dir, validation=validation_performance)
     print("\n[done]", flush=True)
     print(f"  run_dir: {run_dir}", flush=True)
     print(f"  checkpoints: {run_dir / 'checkpoints'}", flush=True)
     print(f"  analysis cache: {run_dir / 'analysis'}", flush=True)
     print(f"  figures: {run_dir / 'figures'}", flush=True)
     print(f"  per-head table: {run_dir / 'tables' / 'per_head_metrics.csv'}", flush=True)
+    if validation_performance is None:
+        print("[validation] no matching checkpoints found; validation performance unavailable", flush=True)
+    else:
+        print(f"  validation table: {run_dir / 'tables' / 'validation_performance.csv'}", flush=True)
+        print_validation_performance(validation_performance, cfg)
     return summary
 
 
 if __name__ == "__main__":
     main([
         "--run-name", "cycle_dual_v2",
-        "--phase", "all",
+        "--phase", "analyze",
         "--seeds", "0", "1", "2",
         "--steps", "3000",
         "--score-graphs", "96",
