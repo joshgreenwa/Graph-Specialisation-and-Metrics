@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import warnings
 from copy import deepcopy
 
 import numpy as np
@@ -13,6 +14,7 @@ from graph_specialisation_metrics.methodology.audit import audit_scope
 from graph_specialisation_metrics.methodology.bootstrap import (
     Observation,
     nested_percentile_interval,
+    reportable_bin,
     trimmed_mean,
 )
 from graph_specialisation_metrics.methodology.cache import (
@@ -33,12 +35,20 @@ from graph_specialisation_metrics.methodology.causal import (
 from graph_specialisation_metrics.methodology.distance import (
     DistanceAxis,
     aggregate_distance_events,
+    column_support,
+    display_bins,
     distance_event_contributions,
+    distance_profile_reduce,
+    per_opportunity_from_ratio,
+    row_normalised,
     score_heatmaps,
+    supported_mean,
 )
 from graph_specialisation_metrics.methodology.figures import (
     HeadPlotData,
     attention_distance_profiles,
+    distance_heatmaps,
+    distance_support_profile,
     causal_family_panels,
     causal_scatter_grid,
     cumulative_prefix_curves,
@@ -73,6 +83,7 @@ from graph_specialisation_metrics.methodology.scores import (
     project_transport,
 )
 from graph_specialisation_metrics.methodology.tasks import TASKS, OutputGeometry, get_task
+from graph_specialisation_metrics.methodology.validation import _mismatch_indices
 
 
 class FakeData:
@@ -157,6 +168,206 @@ def test_numerical_audits_are_soft_by_default_and_strict_on_request():
             audit.within_tolerance(1.0e-5, 1.0e-6, "test.tolerance", "observed")
     finally:
         audit.set_strict(previous)
+
+
+def test_unsupported_distance_columns_never_warn_and_stay_non_estimable():
+    # A column no graph populates is a normal consequence of the frozen distance axis.
+    ratio = np.array([[[[1.0, np.nan]]], [[[3.0, np.nan]]]])  # [G=2,L=1,H=1,D=2]
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)
+        mean_ratio = supported_mean(ratio, axis=0)
+        per_opportunity = per_opportunity_from_ratio(mean_ratio)
+        empty = supported_mean(np.full((3, 2), np.nan), axis=0)
+    assert mean_ratio[0, 0, 0] == pytest.approx(2.0)
+    assert np.isnan(mean_ratio[0, 0, 1])
+    assert per_opportunity[0, 0] == pytest.approx(2.0)
+    assert np.isnan(per_opportunity[0, 1])
+    assert np.isnan(empty).all()
+    # Matches np.nanmean exactly wherever np.nanmean is defined.
+    supported = np.array([[1.0, 2.0], [3.0, np.nan]])
+    assert supported_mean(supported, axis=0) == pytest.approx(
+        np.nanmean(supported, axis=0), nan_ok=True
+    )
+
+
+def test_empty_replicates_are_missing_not_zero_in_the_interval():
+    policy = BootstrapPolicy(rng_seed=5)
+    observations = [
+        Observation(0, graph_id, 0, donor, np.array([1.0, np.nan]))
+        for graph_id in range(12)
+        for donor in range(2)
+    ]
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)
+        interval = nested_percentile_interval(observations, policy)
+    # A column that is non-estimable in every draw stays non-estimable, never 0.
+    assert interval.low[0] == pytest.approx(1.0)
+    assert np.isnan(interval.low[1]) and np.isnan(interval.high[1])
+    assert interval.estimable_draws[0] == policy.replicates
+    assert interval.estimable_draws[1] == 0
+
+
+def test_statistic_caption_reports_rho_with_its_interval_and_permutation_p():
+    from graph_specialisation_metrics.methodology.figures import statistic_caption
+
+    caption = statistic_caption(
+        {"rho": 0.8271, "low": 0.74, "high": 0.89, "p": 0.0004, "n": 80}
+    )
+    assert caption == "ρ = 0.83 [0.74, 0.89], p < 0.001, n = 80"
+    # The permutation floor is 1/(replicates + 1), so an exact p is never claimed below it.
+    assert "p < 0.001" in statistic_caption({"rho": 0.5, "p": 0.0})
+    assert statistic_caption({"rho": 0.5, "p": 0.0125}).endswith("p = 0.013")
+    # A non-estimable coordinate says so rather than printing a misleading number.
+    assert statistic_caption({"rho": np.nan}) == "ρ not estimable"
+    assert statistic_caption(None) == ""
+
+
+def test_family_styles_follow_the_channel_colours_used_everywhere_else():
+    from graph_specialisation_metrics.methodology.figures import FigureTheme, family_style
+
+    theme = FigureTheme()
+    # A semantic-leaning family drawn in the structural channel's blue would contradict every
+    # other figure in the set, so the mapping is pinned.
+    assert family_style("family_semantic_leaning", theme)["color"] == theme.semantic_color
+    assert family_style("structural_leaning", theme)["color"] == theme.structural_color
+    assert family_style("central_responsive", theme)["color"] == theme.central_color
+    assert family_style("inactive", theme)["color"] == theme.inactive_color
+    # Marker and dash also separate the families, so the figure survives greyscale printing.
+    styles = [
+        family_style(name, theme)
+        for name in ("semantic_leaning", "structural_leaning", "central_responsive", "inactive")
+    ]
+    assert len({style["marker"] for style in styles}) == 4
+    assert len({style["linestyle"] for style in styles}) == 4
+
+
+def test_saved_figures_keep_content_drawn_outside_the_axes(tmp_path):
+    import matplotlib.image as mpimg
+
+    from graph_specialisation_metrics.methodology.figures import FigureBuilder, FigureTheme
+
+    names = [
+        f"control_{leaning}_leaning_{kind}_control"
+        for leaning in ("semantic", "structural")
+        for kind in ("central", "inactive", "random")
+    ]
+    keys = ("restoration_gross", "injection_gross", "rescue", "induction", "necessity")
+    values = {key: np.full((2, len(names)), 0.5) for key in keys}
+    theme = FigureTheme(dpi=100)
+    figure, axes = causal_family_panels(names, values, theme=theme)
+    paths = FigureBuilder(tmp_path, theme, common_metadata={}).save(
+        "controls", figure, axes, metadata={}
+    )
+    png = next(path for path in paths if path.suffix == ".png")
+    # The legend is drawn below the panels. Saving without a tight bound crops it away silently,
+    # leaving an image no taller than the nominal canvas.
+    nominal = max(theme.height, 0.42 * len(names) + 1.5) * theme.dpi
+    assert mpimg.imread(png).shape[0] > nominal
+
+
+def test_display_bins_fit_the_budget_and_keep_the_near_field_at_unit_resolution():
+    # A peptides-sized axis: 0..116 plus an explicit non-numeric column.
+    labels = tuple(range(117)) + ("unreachable",)
+    display = display_bins(labels, max_points=14)
+    assert len(display.labels) <= 14
+    # The explicit column reserves a slot, leaving 13 for the numeric axis.
+    assert display.labels[:9] == tuple(str(value) for value in range(9))
+    assert display.labels[9:-1] == ("9-17", "18-35", "36-71", "72-116")
+    assert display.labels[-1] == "unreachable"
+    # Contiguous, exhaustive, and in registered order.
+    assert [index for group in display.groups for index in group] == list(range(118))
+    assert not display.identity
+
+    # A ZINC-sized axis already fits, so binning is a no-op and figures are unchanged.
+    small = display_bins(tuple(range(11)), max_points=14)
+    assert small.identity
+    assert small.labels == tuple(str(value) for value in range(11))
+
+
+def test_display_grouping_sums_mass_and_recomputes_ratios_from_support():
+    labels = tuple(range(6))
+    display = display_bins(labels, max_points=4)
+    contribution = np.array([[[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]]])  # [L=1,H=1,D=6]
+    support = np.array([2.0, 2.0, 1.0, 0.0, 0.0, 0.0])  # nothing supports the widened tail
+    grouped = display.group_sum(contribution)
+    assert grouped.sum() == pytest.approx(contribution.sum())  # mass is conserved
+    ratio = display.group_ratio(contribution, np.broadcast_to(support, contribution.shape))
+    # A ratio is summed contribution over summed support, never a mean of per-column ratios.
+    expected = [
+        contribution[0, 0, list(group)].sum() / support[list(group)].sum()
+        if support[list(group)].sum() > 0
+        else np.nan
+        for group in display.groups
+    ]
+    assert ratio[0, 0] == pytest.approx(np.asarray(expected), nan_ok=True)
+    assert np.isnan(ratio[0, 0, -1])  # a group with no opportunity stays non-estimable
+
+
+def test_grouped_mass_is_reported_per_unit_distance():
+    # A flat profile must stay flat once grouped: a wide group holds more mass only because it is
+    # wide, and drawing that sum would invent a resurgence in the tail.
+    flat = np.ones(24)
+    display = display_bins(tuple(range(24)), max_points=8)
+    assert not display.identity
+    assert display.group_density(flat) == pytest.approx(np.ones(len(display.labels)))
+    assert display.group_sum(flat).sum() == pytest.approx(flat.sum())  # the sum still reconstructs
+    # At unit resolution the density is the identity, so short-diameter tasks are untouched.
+    identity = display_bins(tuple(range(6)), max_points=14)
+    values = np.array([3.0, 1.0, 4.0, 1.0, 5.0, 9.0])
+    assert identity.group_density(values) == pytest.approx(values)
+
+
+def test_column_support_counts_graphs_and_pairs_for_the_reporting_floor():
+    support = {
+        1: np.array([2.0, 1.0, 0.0]),
+        2: np.array([2.0, 0.0, 0.0]),
+    }
+    graphs, pairs = column_support(support, {1: 3, 2: 6})
+    assert graphs.tolist() == [2, 1, 0]
+    assert pairs.tolist() == [18, 3, 0]
+    policy = BootstrapPolicy()
+    assert not reportable_bin([1, 2], 18, policy=policy)
+    assert reportable_bin(list(range(10)), 50, policy=policy)
+
+
+def test_events_without_an_admissible_mismatch_control_are_excluded():
+    def event(source, draw, fingerprint, degree_gap):
+        return FakeData(
+            source=source,
+            draw=draw,
+            payload_fingerprint=fingerprint,
+            degree_gap=degree_gap,
+            dose=float(draw),
+        )
+
+    # Distinct payloads inside one degree tier: the registered control is available.
+    records = [
+        event(0, 0, b"a", 1),
+        event(0, 1, b"b", 1),
+        event(1, 0, b"c", 1),
+    ]
+    with audit_scope("mismatch") as scope:
+        indices, excluded = _mismatch_indices(records)
+    assert indices[0] == 1 and indices[1] == 0
+    assert excluded == set()
+    assert not scope.records()
+
+    # Distinct payloads but no shared tier: the tier is relaxed, the event is still controlled.
+    with audit_scope("mismatch-relaxed") as scope:
+        indices, excluded = _mismatch_indices(
+            [event(0, 0, b"a", 1), event(1, 0, b"c", 2)]
+        )
+    assert indices == [1, 0]
+    assert excluded == set()
+    assert [row["name"] for row in scope.records()] == ["causal.mismatch_control_relaxed"]
+
+    # One payload only: no admissible control exists, so both events leave the causal record.
+    with audit_scope("mismatch-none") as scope:
+        _, excluded = _mismatch_indices([records[0], event(0, 1, b"a", 1)])
+    assert excluded == {0, 1}
+    assert [row["name"] for row in scope.records()] == [
+        "causal.mismatch_control_unavailable"
+    ]
 
 
 def test_soft_audit_keeps_a_broken_reconstruction_running():
@@ -356,6 +567,68 @@ def test_distance_accounting_reconstructs_and_divides_inside_graph():
     )
     assert np.allclose(result.exact, [[3.0, 4.0]])
     assert np.allclose(result.per_opportunity, [[3.0, 4.0]])
+    # The head-resolved arrays the figures display are what the aggregate views sum over heads.
+    assert result.exact_head.shape == (1, 1, 2)
+    assert np.allclose(result.exact_head.sum(axis=1), result.exact)
+    assert np.allclose(result.per_opportunity_head.sum(axis=1), result.per_opportunity)
+
+
+def test_head_rows_survive_aggregation_with_diverse_peaks():
+    # Two heads peaking at opposite ends: the head sum reports a flat layer neither head has.
+    graph_c = {0: np.array([[[9.0, 1.0], [1.0, 9.0]]])}  # [L=1,H=2,D=2]
+    graph_o = {0: np.array([1.0, 1.0])}
+    result = score_heatmaps(graph_c, graph_o, reconstruction_tolerance=1e-8)
+    assert np.allclose(result.exact, [[10.0, 10.0]])
+    assert np.allclose(result.exact_head, graph_c[0])
+    fractions = row_normalised(result.exact_head)
+    assert np.allclose(fractions, [[[0.9, 0.1], [0.1, 0.9]]])
+
+
+def test_row_normalisation_uses_the_full_axis_and_keeps_empty_rows_missing():
+    values = np.array([[[3.0, 1.0, np.nan], [0.0, 0.0, 0.0]]])  # [L=1,H=2,D=3]
+    result = row_normalised(values)
+    # nan columns stay nan and are excluded from the denominator, not treated as zero mass.
+    assert result[0, 0, 0] == pytest.approx(0.75)
+    assert result[0, 0, 1] == pytest.approx(0.25)
+    assert np.isnan(result[0, 0, 2])
+    # A row with no mass has no profile to report.
+    assert np.isnan(result[0, 1]).all()
+    # Blanking a column afterwards leaves the remaining columns untouched.
+    assert np.nansum(result[0, 0]) == pytest.approx(1.0)
+
+
+def test_distance_heatmaps_put_layer_zero_at_the_top_of_head_blocks():
+    values = np.arange(2 * 3 * 4, dtype=np.float64).reshape(2, 3, 4)
+    fig, axes = distance_heatmaps(
+        values, values, [0, 1, 2, 3], channel="semantic", title="task"
+    )
+    try:
+        # One row per head, blocked by layer.
+        assert axes[0].get_images()[0].get_array().shape == (6, 4)
+        assert [text.get_text() for text in axes[0].get_yticklabels()] == ["L0", "L1"]
+        # L0's block centre sits above L1's in display coordinates.
+        assert axes[0].get_yticks()[0] < axes[0].get_yticks()[1]
+        assert axes[0].yaxis_inverted()
+        assert fig._suptitle.get_text() == "task"
+    finally:
+        import matplotlib.pyplot as plt
+
+        plt.close(fig)
+
+    fig, _ = distance_heatmaps(
+        values, values, [0, 1, 2, 3], channel="semantic", title="task", normalised=True
+    )
+    try:
+        assert fig._suptitle.get_text() == "task (row-normalised)"
+    finally:
+        import matplotlib.pyplot as plt
+
+        plt.close(fig)
+
+    with pytest.raises(ValueError, match=r"\[layer,head,distance\]"):
+        distance_heatmaps(
+            values.sum(axis=1), values.sum(axis=1), [0, 1, 2, 3], channel="semantic"
+        )
 
 
 def test_functional_carriage_takes_event_norm_before_donor_mean():
@@ -533,5 +806,15 @@ def test_modular_causal_and_distance_figure_components_render():
     fig.clf()
     fig, _ = attention_distance_profiles(
         (0, 1), {"semantic_leaning": [0.7, 0.3]}
+    )
+    fig.clf()
+    fig, _ = distance_support_profile(
+        (0, 1, 2, "unreachable"),
+        (48, 48, 12, 1),
+        (2_880, 1_450, 60, 3),
+        empty_replicate_fraction=(0.0, 0.0, 0.01, 0.37),
+        minimum_graphs=10,
+        minimum_pairs=50,
+        channel="semantic",
     )
     fig.clf()

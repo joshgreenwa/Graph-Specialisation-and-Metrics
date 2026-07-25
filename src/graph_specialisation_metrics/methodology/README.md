@@ -102,6 +102,56 @@ once, merged by audit name with its worst observed value and repeat count, and w
 `run(..., strict_audits=True)` restores fail-closed runs, raising `AuditError` on the first breach.
 Cache fingerprints are unaffected by this switch, so strict and reporting runs share caches.
 
+Every distance figure is drawn on a grouped **display axis** of at most
+`FigureTheme.max_distance_points` columns (default 14, overridable per task through
+`figure_overrides`). Near distances keep unit resolution and the tail widens dyadically, so a
+121-column peptides axis becomes `0…9, 10-19, 20-39, 40-79, 80-121` instead of 122 illegible ticks;
+a short-diameter task such as ZINC already fits and is left exactly as it was. Grouping is applied
+to the cached per-graph and per-event sufficient statistics and the registered estimators are then
+rerun on top — mass is summed, support-normalized panels are recomputed as summed contribution over
+summed support inside each graph, and the interval is a fresh nested bootstrap over grouped
+observations (a few seconds, from the cached event table). No figure ever re-derives a grouped
+value from an already-aggregated one.
+
+Additive quantities are displayed **per unit distance** once grouped, because a ten-wide tail group
+accumulates ten columns of mass and would otherwise draw as a resurgence that is not in the data.
+This affects the exact score panels and the attention profile, whose labels say so; support-
+normalized panels are already width-invariant, and both are identities at unit resolution.
+
+The registered 10-graph/50-pair reporting floor is then applied to the display columns. Each channel
+gains a `{channel}_distance_column_support` figure showing supporting graphs, eligible pairs, and
+the fraction of bootstrap replicates in which the column had no support at all; columns below the
+floor are drawn in grey there and blanked in the heatmap and profile figures, with the suppressed
+labels recorded in each figure's metadata. Grouping usually lifts the far tail over the floor, since
+a group aggregates the support of every column in it. Cached arrays keep unit resolution throughout,
+and a score cache written before any of this existed still gets all of it — everything needed is
+recomputed from the cached graph support and event table, so only the figures phase needs rerunning.
+
+`causal_validation_coordinates` prints each panel's rank correlation above it — `rho` with its
+nested-bootstrap interval, the within-layer permutation `p`, and `n` — all of them already
+estimated by the causal stage, so the figure reports the same numbers as `associations` rather than
+recomputing anything. The `D_rel` panels use the active-head variants, since selectivity is only
+defined there. No trend line is drawn: the statistic is a rank correlation, and an ordinary
+least-squares line would show a different model from the one being reported. The grid also carries
+the key it never had — the layer colourbar its point colours have always encoded, a marker for
+heads below the activity floor, and a note that the whiskers are 95% nested percentile intervals.
+
+`causal_family_endpoints` and `causal_matched_control_endpoints` run their targets down a shared
+vertical axis, one legible copy of the names rather than five rotated illegible ones, with panel
+height following the target count. The matched-control figure shows the full-size frozen controls
+only; the `control_prefix_*` ladder it used to enumerate — one bar category per (control, prefix
+size) pair, around a hundred of them on a ten-layer model — is now drawn where a ladder belongs, as
+a dotted reference line beneath its family's curve in `causal_cumulative_prefix_curves`. That is
+also the comparison the design is for: whether a family separates from its size-matched control as
+heads accumulate.
+
+Score distance heatmaps are head-resolved. `{channel}_score_distance_heatmaps` draws one row per
+head, blocked by layer with layer 0 in the top block; the companion figure named with the extra
+suffix `_row_normalised` repeats it with each head divided by its own total over the full distance
+axis. Both come from one estimate; only the display differs, and each figure's metadata says which.
+A score cache written before the head-resolved arrays existed still renders both — they are rebuilt
+exactly from the cached per-graph contribution and support, so only the figures phase needs rerunning.
+
 Training checkpoints and dataset caches are read-only. Analysis caches bind the protocol
 fingerprint, checkpoint SHA-256, task adapter, output representation and sigma, model geometry,
 split IDs, event manifest, donor/source dose, bootstrap seed, `F_sens`, and the positive-beneficial
