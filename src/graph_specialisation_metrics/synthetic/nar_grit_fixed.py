@@ -36,7 +36,7 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 
 
-EXPERIMENT_VERSION = "nar-grit-fixed-n-v3"
+EXPERIMENT_VERSION = "nar-grit-fixed-n-paper-v1"
 OFFICIAL_GRIT_URL = "https://github.com/LiamMa/GRIT.git"
 OFFICIAL_GRIT_COMMIT = "6c988ea600a606fbb49a2246c64a2d37396b3ab5"
 DEFAULT_GRIT_DIR = "/content/GRIT"
@@ -66,9 +66,8 @@ INTENTIONAL_DIFFERENCE = {
     "positional_encoding": "official GRIT RRWP node/pair encodings are retained",
     "analysis": "semantic intervention, ablation, attention, and carriage diagnostics are added",
     "lightweight_protocol": (
-        "fresh online training graphs, 192 validation graphs, 512 held-out graphs, "
-        "N up to 64, and widths up to 128; the authors use fixed 8000/1000/1000 splits, "
-        "also sweep N=80,96 and width 256"
+        "fresh online training graphs rather than a reused fixed training split, "
+        "N up to 80, and widths up to 128; the authors also sweep N=96 and width 256"
     ),
 }
 
@@ -155,7 +154,7 @@ class Config:
     run_name: str = "nar_grit_fixed_n_v3"
     drive_root: str = DEFAULT_DRIVE_ROOT
     converged_legacy_run: str = "nar_grit_fixed_n_v2"
-    ns: tuple[int, ...] = (4, 8, 16, 32, 64)
+    ns: tuple[int, ...] = (4, 8, 16, 32, 64, 80)
     mechanistic_ns: tuple[int, ...] = (4, 16, 64)
     widths: tuple[int, ...] = (64, 128)
     analysis_width: int = 128
@@ -166,17 +165,24 @@ class Config:
     dropout: float = 0.0
     attention_dropout: float = 0.0
     batch_size: int = 64
-    max_batch_nodes: int = 4500
-    max_dense_pairs: int = 300_000
-    steps: int = 10_000
+    # These caps retain the paper's batch size of 64 through N=80, including
+    # for dense attention (64 * 83 nodes and 64 * 83^2 ordered pairs).
+    max_batch_nodes: int = 6000
+    max_dense_pairs: int = 500_000
+    train_graphs_per_epoch: int = 8000
+    epochs: int = 200
+    steps: int = 25_000
     lr: float = 1.0e-3
     weight_decay: float = 0.0
+    lr_scheduler: str = "cosine"
+    gradient_clip_norm: float = 1.0
     # The reference NAR setup has 8,000 training examples and batch size 64,
     # hence 125 optimiser steps per epoch.  Evaluate at the same cadence.
     eval_every: int = 125
-    validation_graphs: int = 192
-    heldout_graphs: int = 512
+    validation_graphs: int = 1000
+    heldout_graphs: int = 1000
     early_stopping_loss_threshold: float = 0.001
+    early_stopping_patience_epochs: int = 50
     low_n_accuracy_gate: float = 0.85
     score_graphs: int = 8
     score_donors: int = 3
@@ -213,6 +219,27 @@ class Config:
             raise ValueError("the core comparison requires 1hop and dense")
         if not 0 < 2 * self.family_size <= self.layers * self.heads:
             raise ValueError("family_size must leave an equal-size non-top control pool")
+        if self.epochs <= 0 or self.train_graphs_per_epoch <= 0:
+            raise ValueError("epochs and train_graphs_per_epoch must be positive")
+        if self.steps <= 0 or self.eval_every <= 0:
+            raise ValueError("steps and eval_every must be positive")
+        if self.steps != self.epochs * self.eval_every:
+            raise ValueError("steps must equal epochs * eval_every")
+        expected_eval_every = math.ceil(self.train_graphs_per_epoch / self.batch_size)
+        if self.eval_every != expected_eval_every:
+            raise ValueError(
+                "eval_every must equal ceil(train_graphs_per_epoch / batch_size)"
+            )
+        if self.lr_scheduler not in {"constant", "cosine"}:
+            raise ValueError("lr_scheduler must be 'constant' or 'cosine'")
+        if self.gradient_clip_norm <= 0:
+            raise ValueError("gradient_clip_norm must be positive")
+        if self.early_stopping_patience_epochs < 0:
+            raise ValueError("early_stopping_patience_epochs must be non-negative")
+        if batch_graphs(self, max(self.ns)) != self.batch_size:
+            raise ValueError(
+                "memory caps reduce the requested paper-aligned batch size at max N"
+            )
 
 
 def config_fingerprint(cfg: Config) -> str:
@@ -763,9 +790,20 @@ def train_model(
         )
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+    scheduler = (
+        torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=cfg.epochs,
+            eta_min=0.0,
+        )
+        if cfg.lr_scheduler == "cosine"
+        else None
+    )
     best_loss = float("inf")
     best_state = None
     best_validation: dict[str, Any] = {}
+    best_accuracy = -float("inf")
+    best_accuracy_epoch = 0
     history: list[dict[str, Any]] = []
     started = time.time()
     graphs = batch_graphs(cfg, records)
@@ -781,10 +819,11 @@ def train_model(
         loss = F.cross_entropy(logits, batch.y.long())
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.gradient_clip_norm)
         optimizer.step()
 
-        if step == 1 or step % cfg.eval_every == 0 or step == cfg.steps:
+        if step % cfg.eval_every == 0 or step == cfg.steps:
+            epoch = int(math.ceil(step / cfg.eval_every))
             model.eval()
             validation = evaluate(
                 model,
@@ -795,16 +834,19 @@ def train_model(
                 device=device,
             )
             history.append({
+                "epoch": epoch,
                 "step": step,
                 "train_loss": float(loss.detach().cpu()),
                 "validation_loss": validation["loss"],
                 "validation_accuracy": validation["accuracy"],
+                "learning_rate": float(optimizer.param_groups[0]["lr"]),
                 "elapsed_s": time.time() - started,
             })
             print(
                 f"[train {model_name} d={width} N={records} seed={seed}] "
-                f"{step:4d}/{cfg.steps} loss={float(loss.detach().cpu()):.4f} "
-                f"val={validation['accuracy']:.3f}",
+                f"epoch {epoch:3d}/{cfg.epochs} step {step:5d}/{cfg.steps} "
+                f"lr={float(optimizer.param_groups[0]['lr']):.3e} "
+                f"loss={float(loss.detach().cpu()):.4f} val={validation['accuracy']:.3f}",
                 flush=True,
             )
             if validation["loss"] < best_loss:
@@ -813,11 +855,31 @@ def train_model(
                 best_state = {
                     key: value.detach().cpu().clone() for key, value in model.state_dict().items()
                 }
+            if validation["accuracy"] > best_accuracy:
+                best_accuracy = float(validation["accuracy"])
+                best_accuracy_epoch = epoch
+
+            if scheduler is not None:
+                scheduler.step()
+
+            stop_reason = ""
             if validation["loss"] < cfg.early_stopping_loss_threshold:
+                stop_reason = (
+                    f"validation loss {validation['loss']:.6f} "
+                    f"< {cfg.early_stopping_loss_threshold:.6f}"
+                )
+            elif (
+                cfg.early_stopping_patience_epochs > 0
+                and epoch - best_accuracy_epoch > cfg.early_stopping_patience_epochs
+            ):
+                stop_reason = (
+                    f"validation accuracy did not improve for more than "
+                    f"{cfg.early_stopping_patience_epochs} epochs"
+                )
+            if stop_reason:
                 print(
                     f"[train {model_name} d={width} N={records} seed={seed}] "
-                    f"early stop: validation loss {validation['loss']:.6f} "
-                    f"< {cfg.early_stopping_loss_threshold:.6f}",
+                    f"early stop: {stop_reason}",
                     flush=True,
                 )
                 break
@@ -1671,7 +1733,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--analysis-width", type=int, default=128)
     parser.add_argument("--heads", type=int, default=8)
     parser.add_argument("--layers", type=int, default=2)
-    parser.add_argument("--ns", default="4,8,16,32,64")
+    parser.add_argument("--ns", default="4,8,16,32,64,80")
     parser.add_argument("--mechanistic-ns", default="4,16,64")
     parser.add_argument("--seeds", default="0,1,2")
     parser.add_argument(
@@ -1679,9 +1741,23 @@ def build_parser() -> argparse.ArgumentParser:
         default="",
         help="new performance-only seeds trained for every model/width/N cell",
     )
-    parser.add_argument("--steps", type=int, default=10_000)
+    parser.add_argument("--epochs", type=int, default=200)
+    parser.add_argument("--train-graphs-per-epoch", type=int, default=8000)
+    parser.add_argument("--lr", type=float, default=1.0e-3)
+    parser.add_argument("--weight-decay", type=float, default=0.0)
+    parser.add_argument(
+        "--lr-scheduler",
+        choices=("constant", "cosine"),
+        default="cosine",
+    )
+    parser.add_argument("--gradient-clip-norm", type=float, default=1.0)
     parser.add_argument("--early-stopping-loss-threshold", type=float, default=0.001)
+    parser.add_argument("--early-stopping-patience-epochs", type=int, default=50)
     parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--max-batch-nodes", type=int, default=6000)
+    parser.add_argument("--max-dense-pairs", type=int, default=500_000)
+    parser.add_argument("--validation-graphs", type=int, default=1000)
+    parser.add_argument("--heldout-graphs", type=int, default=1000)
     parser.add_argument("--score-graphs", type=int, default=8)
     parser.add_argument("--score-donors", type=int, default=3)
     parser.add_argument("--analysis-graphs", type=int, default=12)
@@ -1716,6 +1792,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def config_from_args(args: argparse.Namespace) -> Config:
+    if args.batch_size <= 0:
+        raise ValueError("batch_size must be positive")
+    if args.train_graphs_per_epoch <= 0:
+        raise ValueError("train_graphs_per_epoch must be positive")
+    eval_every = int(math.ceil(args.train_graphs_per_epoch / args.batch_size))
     values: dict[str, Any] = {
         "run_name": args.run_name,
         "drive_root": args.drive_root,
@@ -1727,9 +1808,21 @@ def config_from_args(args: argparse.Namespace) -> Config:
         "ns": parse_int_tuple(args.ns),
         "mechanistic_ns": parse_int_tuple(args.mechanistic_ns),
         "seeds": parse_int_tuple(args.seeds),
-        "steps": args.steps,
+        "train_graphs_per_epoch": args.train_graphs_per_epoch,
+        "epochs": args.epochs,
+        "steps": args.epochs * eval_every,
+        "eval_every": eval_every,
+        "lr": args.lr,
+        "weight_decay": args.weight_decay,
+        "lr_scheduler": args.lr_scheduler,
+        "gradient_clip_norm": args.gradient_clip_norm,
         "early_stopping_loss_threshold": args.early_stopping_loss_threshold,
+        "early_stopping_patience_epochs": args.early_stopping_patience_epochs,
         "batch_size": args.batch_size,
+        "max_batch_nodes": args.max_batch_nodes,
+        "max_dense_pairs": args.max_dense_pairs,
+        "validation_graphs": args.validation_graphs,
+        "heldout_graphs": args.heldout_graphs,
         "score_graphs": args.score_graphs,
         "score_donors": args.score_donors,
         "analysis_graphs": args.analysis_graphs,
@@ -1747,6 +1840,8 @@ def config_from_args(args: argparse.Namespace) -> Config:
             "ns": (4, 8),
             "mechanistic_ns": (4, 8),
             "seeds": (0,),
+            "train_graphs_per_epoch": 8,
+            "epochs": 2,
             "steps": 8,
             "eval_every": 4,
             "validation_graphs": 4,

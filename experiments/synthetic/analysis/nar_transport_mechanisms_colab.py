@@ -86,6 +86,8 @@ bootstrap()
 from graph_specialisation_metrics.synthetic.nar_transport_mechanisms import main
 
 
+# The first run below intentionally rebuilds the checkpoint index and all downstream caches for
+# the replacement checkpoints. Remove the four --force-* flags before using these resumable forms.
 # Resumable alternatives after the first run:
 #   CELL_ARGS = ["--analysis-width", "64", "--phase", "analyze"]
 #   CELL_ARGS = ["--analysis-width", "64", "--phase", "causal"]
@@ -105,11 +107,11 @@ CELL_ARGS = [
     "--models",
     "1hop,2hop,dense",
     "--ns",
-    "4,8,16,32,64",
+    "4,8,16,32,64,80",
     "--anchor-ns",
     "4,16,64",
     "--seeds",
-    "0,1,2,3,4",
+    "0,1,2",
     "--donors",
     "4",
     "--discovery-graphs",
@@ -128,6 +130,10 @@ CELL_ARGS = [
     "2",
     "--ablation-random-rankings",
     "8",
+    "--force-index",
+    "--force-analysis",
+    "--force-causal",
+    "--force-followups",
 ]
 
 main(CELL_ARGS)

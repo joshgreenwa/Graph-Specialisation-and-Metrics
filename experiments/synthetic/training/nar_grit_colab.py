@@ -89,10 +89,9 @@ bootstrap()
 from graph_specialisation_metrics.synthetic.nar_grit_fixed import main
 
 
-# Normal run: trains only missing checkpoints, then caches mechanisms and makes every figure.
-# Cheap reruns after training:
-#   Retain --additional-seeds 3,4 when regenerating figures, so every performance cell contains
-#   the same five repeats.
+# This launch intentionally replaces every active checkpoint and analysis cache with a fresh,
+# paper-budget run. After it completes once, remove --force-training and --force-analysis before
+# any interrupted/resumed or figure-only rerun.
 # Installation/plumbing only:
 #   CELL_ARGS = ["--run-name", "nar_grit_smoke", "--fast-dev-run", "--allow-low-accuracy"]
 CELL_ARGS = [
@@ -111,18 +110,39 @@ CELL_ARGS = [
     "--layers",
     "2",
     "--ns",
-    "4,8,16,32,64",
+    "4,8,16,32,64,80",
     "--mechanistic-ns",
     "4,16,64",
     "--seeds",
     "0,1,2",
-    "--steps",
-    "10000",
+    "--epochs",
+    "200",
+    "--train-graphs-per-epoch",
+    "8000",
+    "--batch-size",
+    "64",
+    "--lr",
+    "0.001",
+    "--weight-decay",
+    "0.0",
+    "--lr-scheduler",
+    "cosine",
+    "--gradient-clip-norm",
+    "1.0",
     "--early-stopping-loss-threshold",
     "0.001",
-    # Two unconditional new runs for every model x width x N cell (five total repeats).
-    "--additional-seeds",
-    "3,4",
+    "--early-stopping-patience-epochs",
+    "50",
+    "--validation-graphs",
+    "1000",
+    "--heldout-graphs",
+    "1000",
+    "--max-batch-nodes",
+    "6000",
+    "--max-dense-pairs",
+    "500000",
+    "--force-training",
+    "--force-analysis",
 ]
 
 main(CELL_ARGS)

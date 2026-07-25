@@ -56,8 +56,8 @@ class AnalysisConfig:
     run_name: str = "nar_grit_fixed_n_v3"
     analysis_width: int = 64
     models: tuple[str, ...] = MODEL_ORDER
-    ns: tuple[int, ...] = (4, 8, 16, 32, 64)
-    seeds: tuple[int, ...] = (0, 1, 2, 3, 4)
+    ns: tuple[int, ...] = (4, 8, 16, 32, 64, 80)
+    seeds: tuple[int, ...] = (0, 1, 2)
     anchor_ns: tuple[int, ...] = (4, 16, 64)
     donors: int = 4
     discovery_graphs: int = 32
@@ -70,8 +70,8 @@ class AnalysisConfig:
     ablation_random_rankings: int = 8
     family_size: int = 2
     random_families: int = 8
-    max_batch_nodes: int = 4500
-    max_dense_pairs: int = 300_000
+    max_batch_nodes: int = 6000
+    max_dense_pairs: int = 500_000
     max_replica_pairs: int = 1_200_000
     bootstrap_samples: int = 2000
     device: str = "cuda"
@@ -215,8 +215,7 @@ def atomic_torch_save(path: Path, payload: Mapping[str, Any]) -> None:
 def scientific_fingerprint(cfg: AnalysisConfig) -> str:
     payload = asdict(cfg)
     # Requested seed coverage is orchestration, not a per-checkpoint estimand.
-    # Retain the original v2 sentinel so adding seeds 3/4 reuses completed
-    # seed-0/1/2 metric, causal and follow-up caches.
+    # Use the registered three-repeat sentinel for cache identity.
     payload["seeds"] = (0, 1, 2)
     for key in (
         "drive_root",
@@ -314,11 +313,20 @@ def build_checkpoint_manifest(cfg: AnalysisConfig, *, force: bool = False) -> li
     root = analysis_root(cfg)
     manifest_path = root / "checkpoint_manifest.csv"
     json_path = root / "checkpoint_manifest.json"
+    active_fingerprint = ""
+    experiment_config_path = run_root(cfg) / "experiment_config.json"
+    if experiment_config_path.exists():
+        active_fingerprint = str(
+            json.loads(experiment_config_path.read_text(encoding="utf-8")).get(
+                "fingerprint", ""
+            )
+        )
     selection_scope = {
         "width": cfg.analysis_width,
         "models": list(cfg.models),
         "ns": list(cfg.ns),
         "seeds": list(cfg.seeds),
+        "training_fingerprint": active_fingerprint,
     }
     candidates = sorted((run_root(cfg) / "checkpoints").glob("*.pt"))
     if not candidates:
@@ -349,6 +357,7 @@ def build_checkpoint_manifest(cfg: AnalysisConfig, *, force: bool = False) -> li
             and row["model"] in cfg.models
             and row["N"] in cfg.ns
             and row["seed"] in cfg.seeds
+            and (not active_fingerprint or row["fingerprint"] == active_fingerprint)
         ):
             rows.append(row)
 
@@ -4942,10 +4951,10 @@ def build_parser() -> argparse.ArgumentParser:
         default="all",
     )
     parser.add_argument("--models", default=",".join(MODEL_ORDER))
-    parser.add_argument("--ns", default="4,8,16,32,64")
+    parser.add_argument("--ns", default="4,8,16,32,64,80")
     parser.add_argument(
         "--seeds",
-        default="0,1,2,3,4",
+        default="0,1,2",
         help="Requested checkpoint seeds; unavailable seed cells are skipped",
     )
     parser.add_argument("--anchor-ns", default="4,16,64")
@@ -4960,7 +4969,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ablation-random-rankings", type=int, default=8)
     parser.add_argument("--family-size", type=int, default=2)
     parser.add_argument("--random-families", type=int, default=8)
-    parser.add_argument("--max-batch-nodes", type=int, default=4500)
+    parser.add_argument("--max-batch-nodes", type=int, default=6000)
+    parser.add_argument("--max-dense-pairs", type=int, default=500_000)
     parser.add_argument("--max-replica-pairs", type=int, default=1_200_000)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--grit-dir", default=nar.DEFAULT_GRIT_DIR)
@@ -4994,6 +5004,7 @@ def config_from_args(args: argparse.Namespace) -> AnalysisConfig:
         "family_size": args.family_size,
         "random_families": args.random_families,
         "max_batch_nodes": args.max_batch_nodes,
+        "max_dense_pairs": args.max_dense_pairs,
         "max_replica_pairs": args.max_replica_pairs,
         "device": args.device,
         "grit_dir": args.grit_dir,

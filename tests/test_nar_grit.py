@@ -2,6 +2,8 @@ import torch
 
 from graph_specialisation_metrics.synthetic.nar_grit_fixed import (
     Config,
+    build_parser,
+    config_from_args,
     detect_accuracy_outliers,
     khop_support,
     make_batch,
@@ -22,6 +24,25 @@ def tiny_config() -> Config:
         seeds=(0,),
         family_size=1,
     )
+
+
+def test_default_cli_matches_released_nar_training_budget() -> None:
+    cfg = config_from_args(build_parser().parse_args([]))
+    assert cfg.ns == (4, 8, 16, 32, 64, 80)
+    assert cfg.seeds == (0, 1, 2)
+    assert cfg.train_graphs_per_epoch == 8000
+    assert cfg.batch_size == 64
+    assert cfg.eval_every == 125
+    assert cfg.epochs == 200
+    assert cfg.steps == 25_000
+    assert cfg.lr == 1.0e-3
+    assert cfg.weight_decay == 0.0
+    assert cfg.lr_scheduler == "cosine"
+    assert cfg.gradient_clip_norm == 1.0
+    assert cfg.validation_graphs == 1000
+    assert cfg.heldout_graphs == 1000
+    assert cfg.early_stopping_loss_threshold == 0.001
+    assert cfg.early_stopping_patience_epochs == 50
 
 
 def shortest_distance(adj: torch.Tensor, source: int, target: int) -> int:

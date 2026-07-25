@@ -266,9 +266,48 @@ def test_manifest_skips_missing_requested_seed_cells(tmp_path) -> None:
 def test_seed_scope_does_not_invalidate_per_checkpoint_caches() -> None:
     three = AnalysisConfig(seeds=(0, 1, 2))
     five = AnalysisConfig(seeds=(0, 1, 2, 3, 4))
-    assert scientific_fingerprint(three) == "d444b9381bd91339"
+    assert len(scientific_fingerprint(three)) == 16
     assert scientific_fingerprint(five) == scientific_fingerprint(three)
     assert len({_seed_fillstyle(seed) for seed in five.seeds}) == 5
+
+
+def test_manifest_ignores_superseded_training_fingerprints(tmp_path) -> None:
+    run_dir = tmp_path / "run"
+    checkpoint_dir = run_dir / "checkpoints"
+    checkpoint_dir.mkdir(parents=True)
+    (run_dir / "experiment_config.json").write_text(
+        '{"fingerprint": "active"}\n',
+        encoding="utf-8",
+    )
+    for fingerprint, validation_loss in (("superseded", 0.01), ("active", 0.2)):
+        torch.save(
+            {
+                "version": "test",
+                "fingerprint": fingerprint,
+                "official_grit_commit": "test",
+                "model_name": "1hop",
+                "width": 64,
+                "N": 4,
+                "seed": 0,
+                "state_dict": {},
+                "best_validation": {"loss": validation_loss, "accuracy": 0.5},
+                "heldout": {"loss": 1.0, "accuracy": 0.5},
+                "parameters": 123,
+            },
+            checkpoint_dir / f"1hop_seed_0_{fingerprint}.pt",
+        )
+    cfg = AnalysisConfig(
+        drive_root=str(tmp_path),
+        run_name="run",
+        analysis_width=64,
+        models=("1hop",),
+        ns=(4,),
+        seeds=(0,),
+        anchor_ns=(4,),
+    )
+    rows = build_checkpoint_manifest(cfg, force=True)
+    assert len(rows) == 1
+    assert rows[0]["fingerprint"] == "active"
 
 
 def test_causal_family_controls_match_layer_composition() -> None:

@@ -18,17 +18,17 @@ is produced.
 
 - **Task:** fixed-N NAR with exactly two GRIT layers.
 - **Supports:** 1-hop, 2-hop and dense.
-- **Memory sizes:** `N = {4, 8, 16, 32, 64}`.
+- **Memory sizes:** `N = {4, 8, 16, 32, 64, 80}`.
 - **Widths:** selectable with `--analysis-width {64,128}`. Run width 64 first; replay the identical
   pipeline at width 128 when training finishes.
 - **Checkpoint selection:** each saved seed checkpoint is already the lowest-validation-loss
   training step. For primary mechanism plots, select the seed with the lowest validation loss
   within each `(width, support, N)` cell. Never select using held-out performance.
-- **Performance uncertainty:** request seeds 0--4 and use every checkpoint present, not only the
+- **Performance uncertainty:** request the paper-matched seeds 0--2 and use every checkpoint present, not only the
   selected checkpoint. Missing seed cells are recorded and skipped; every support-by-N cell must
   retain at least one checkpoint.
 - **Mechanism robustness:** repeat the main mechanism estimates for all seeds at
-  `N = {4,16,64}`. The validation-selected trajectory over all five `N` values is descriptive;
+  `N = {4,16,64}`. The validation-selected trajectory over all six `N` values is descriptive;
   the all-seed anchor analysis supplies model-level uncertainty.
 - **Evaluation mode:** dropout off and fixed running normalisation statistics.
 - **GRIT version:** retain the pinned official GRIT commit already recorded in each checkpoint.
@@ -401,7 +401,7 @@ This distinguishes separate head roles, shared heads and nonlinear downstream co
 
 Replace the ceiling-saturated accuracy-only scatter with held-out cross-entropy against
 address-selective within-record routing and realised address-routing contribution. Preserve the
-validation-selected `N=4 -> 64` trajectories, add all-seed anchor cells, report within-support rank
+validation-selected `N=4 -> 80` trajectories, add all-seed anchor cells, report within-support rank
 associations, and cache the last-solved/first-failed transition table.
 
 ## Sampling, uncertainty and interpretation

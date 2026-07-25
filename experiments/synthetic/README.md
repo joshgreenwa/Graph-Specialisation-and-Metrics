@@ -55,20 +55,22 @@ curriculum, motif gadget, structural auxiliary label, or task marker.
 
 The intended experimental substitution is the architecture. Parameter-matched official GRITs
 are trained with 1-hop, 2-hop, or dense attention support at widths 64 and 128 for
-`N={4,8,16,32,64}` and three seeds. Key and value embeddings and the `N`-way classifier are
+`N={4,8,16,32,64,80}` and three seeds. Key and value embeddings and the `N`-way classifier are
 specific to each fixed-`N` checkpoint, as required by the task. Full mechanistic analysis is
 restricted to width 128 and `N={4,16,64}` to keep the run tractable. The resulting figures show
 the capacity curves, semantic score--ablation/carriage causality with equal-size random-family
 controls, and aggregate semantic carriage plus queried-record attention selection.
 
-Relative to the authors' released training protocol, this lightweight version samples fresh
-training graphs online, uses 192 validation and 512 held-out graphs, and omits their `N={80,96}`
-and width-256 settings. The graph distribution, token construction, learned null-padded key/value
-embeddings, fixed-`N` training unit, batch size 64, learning rate `1e-3`, and three repeats match
-the reference implementation. The A100 run allows at most 10,000 optimizer steps per checkpoint
-and adopts the reference early-stopping rule exactly: stop when validation cross-entropy falls
-below `0.001`. Fixed topology and RRWP tensors are cached in memory, so the larger budget is spent
-on optimization rather than regenerating identical graph structure.
+Relative to the authors' released training protocol, this version samples fresh training graphs
+online rather than reusing a fixed 8,000-graph training split, and omits only their `N=96` and
+width-256 settings. The graph distribution, token construction, learned null-padded key/value
+embeddings, fixed-`N` training unit, 8,000 graph presentations per epoch, 1,000 validation and
+1,000 held-out graphs, batch size 64, 200-epoch maximum, AdamW at learning rate `1e-3` with zero
+weight decay, epoch-wise cosine decay, gradient clipping at 1.0, and three repeats match the
+reference implementation. Training evaluates every 125 updates and stops when validation
+cross-entropy falls below `0.001` or validation accuracy has not improved for 50 epochs. The
+minimum-validation-loss state is retained for mechanistic analysis, avoiding the released code's
+first-tie behavior once validation accuracy saturates.
 
 An optional auditable one-shot outlier check is available via `--retrain-outliers`. Within each
 `(support, width, N)` cell, a seed is retrained only when the other seeds agree within 0.05,
@@ -79,12 +81,10 @@ that retry is accepted unconditionally. Retry metadata is written into the repla
 and `tables/outlier_retraining_*.csv`; a persistent outlier is therefore reported rather than
 repeatedly optimized away.
 
-The default launcher does not enable outlier replacement. Instead it trains two unconditional new
-runs (seeds 3 and 4) for every `(support, width, N)` cell and merges them with seeds 0--2. Thus every
-point in `heldout_performance.csv` and the capacity figure has exactly five repeats. Faint markers
-show every individual run, while the line and 95% interval use all five outcomes. The additional
-seeds are kept outside the base configuration fingerprint, so the three existing checkpoints per
-cell are reused rather than retrained.
+The default launcher uses exactly the paper's three repeats (seeds 0--2). It includes
+`--force-training` and `--force-analysis` so the first launch replaces active results with fresh
+paper-budget runs. Remove both force flags after that first complete launch before resuming an
+interrupted run or regenerating figures.
 
 This benchmark is deliberately semantic-only, so it does not estimate structural scores or
 `J/D_rel`; those require a genuinely independent structural factor and belong in the preceding
