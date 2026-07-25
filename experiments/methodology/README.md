@@ -2,8 +2,8 @@
 
 [`canonical_methodology_colab.py`](canonical_methodology_colab.py) is the lightweight,
 Drive-backed Colab entry point for the public methodology. It clones a selected repository
-revision, reuses registered training checkpoints and datasets, and dispatches dense, 1-hop,
-k-hop, and k-hop plus VNode GRIT tasks through
+revision, reuses registered training checkpoints and datasets, and dispatches GRIT and official
+Graphormer tasks through
 `graph_specialisation_metrics.methodology.colab.run`.
 
 The normative scientific specification is
@@ -16,3 +16,10 @@ the launcher. Methodological definitions belong in the canonical package, not in
 
 The initial production run is configured for the dense `zinc`, `qm9_gap_dense`,
 `peptides_func`, and `peptides_struct` registrations.
+
+For the public PCQM model, set `TASKS = ("graphormer_pcqm4mv2",)` and leave `CHECKPOINTS`
+empty. The registered `clefourrier/graphormer-base-pcqm4mv2@refs/pr/4` checkpoint is loaded
+with its scalar head. Use `TASK_TRAIN_SEEDS = {"graphormer_pcqm4mv2": (0,)}` so its cache label
+does not inherit GRIT training seeds. `TASK_OVERRIDES` can relocate the PCQM and Hugging Face
+caches or enforce offline loading. The same front end accepts local Graphormer checkpoints once a
+matching task/dataset registration (for example ZINC) is added.

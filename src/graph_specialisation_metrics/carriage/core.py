@@ -1,8 +1,8 @@
 """Task-agnostic carriage estimators and distance aggregation.
 
-Pure NumPy/PyTorch, no GRIT/GraphGym dependency, so it is unit-testable without a GPU
-or a trained model. Everything model- or task-specific lives in ``grit_runner`` and
-``tasks``; this module only knows about captured states, gradients, and per-pair arrays.
+Pure NumPy/PyTorch, with no model-backend dependency, so it is unit-testable without a
+GPU or a trained model. Model-specific code registers captured states, gradients, loss
+replay, and a linear carrier-to-readout projection.
 
 Implements the dissertation methodology (Ch. 3, Sections 3.2-3.3):
 
@@ -153,17 +153,36 @@ def functional_magnitudes_from_delta(delta, g_out, num_sources, num_donors):
 
 
 def pool_final_states(h, pooling: str):
-    """Apply the linear graph pooling used by the supported GRIT readout heads.
+    """Apply legacy add/mean graph pooling.
 
-    ``h`` is ``[R, n, m]`` (or ``[n, m]``).  Carriage currently requires add/mean
-    pooling, so the final-state path can be integrated in the much smaller pooled
-    space without changing any carrier attribution.
+    New backends should register explicit carrier weights with
+    :func:`project_final_states`.
     """
     if pooling == "add":
         return h.sum(dim=-2)
     if pooling == "mean":
         return h.mean(dim=-2)
     raise ValueError(f"integrated carriage requires add/mean pooling, got {pooling!r}")
+
+
+def project_final_states(h, carrier_weights):
+    """Apply a registered linear carrier-to-readout projection.
+
+    ``carrier_weights`` is one scalar per carrier. Add/mean pooling and Graphormer's
+    graph-token readout are all instances of this operation.
+    """
+
+    import torch
+
+    weights = torch.as_tensor(carrier_weights, device=h.device, dtype=h.dtype).reshape(-1)
+    if h.ndim not in (2, 3) or int(h.shape[-2]) != int(weights.numel()):
+        raise ValueError(
+            f"final states {tuple(h.shape)} do not align with "
+            f"{int(weights.numel())} carrier weights"
+        )
+    if not torch.isfinite(weights).all():
+        raise ValueError("carrier weights must be finite")
+    return torch.einsum("...nm,n->...m", h, weights)
 
 
 # Gauss--Kronrod (7, 15) nodes and weights on [-1, 1].  The embedded Gauss
@@ -196,7 +215,8 @@ def integrated_loss_carriage(
     h_swap,
     loss_from_pooled,
     *,
-    pooling: str,
+    pooling: str | None = None,
+    carrier_weights=None,
     atol: float = 1e-5,
     rtol: float = 1e-4,
     max_intervals: int = 64,
@@ -208,9 +228,10 @@ def integrated_loss_carriage(
     ``b[r,i] = integral_0^1 <d loss(H(alpha))/d h_i, h_clean_i-h_swap_i> d alpha``
 
     with ``H(alpha)=h_swap+alpha*(h_clean-h_swap)``.  The caller donor-averages
-    these *per-donor* paths afterwards.  Because add/mean pooling is linear, the
-    gradients are evaluated through the readout in pooled space and projected
-    back onto every carrier's ``delta h_i`` exactly.
+    these *per-donor* paths afterwards.  Because the registered carrier projection
+    is linear (including add, mean, or graph-token selection), gradients are
+    evaluated through the smaller readout space and projected back onto every
+    carrier's ``delta h_i`` exactly.
 
     Adaptive embedded Gauss--Kronrod quadrature localises L1 and ReLU kinks.  A
     path is converged only when both (a) the L1 carrier refinement estimate and
@@ -221,7 +242,9 @@ def integrated_loss_carriage(
         h_clean / h_swap: ``[R,n,m]`` tensors at the input to the graph head.
         loss_from_pooled: differentiable callable mapping pooled states ``[Q,m]``
             to one scalar task loss per row, ``[Q]``.
-        pooling: ``"add"`` or ``"mean"`` (the checked GRIT readout pooling).
+        pooling: legacy ``"add"`` or ``"mean"`` shortcut.
+        carrier_weights: optional registered linear readout projection. For
+            Graphormer this is one at the graph token and zero at molecular nodes.
         atol / rtol: convergence tolerances in task-loss/carrier units.
         max_intervals: maximum locally-adapted intervals per donor path.
 
@@ -243,16 +266,30 @@ def integrated_loss_carriage(
         raise ValueError("integrated carriage tolerances must be non-negative")
     if int(max_intervals) < 1:
         raise ValueError("max_intervals must be >= 1")
-    if pooling not in ("add", "mean"):
-        raise ValueError(f"integrated carriage requires add/mean pooling, got {pooling!r}")
-
     clean = h_clean.detach()
     swap = h_swap.detach()
     R, n, _m = clean.shape
     delta_h = clean - swap
-    pool_scale = 1.0 if pooling == "add" else 1.0 / float(n)
-    p_clean = pool_final_states(clean, pooling)
-    p_swap = pool_final_states(swap, pooling)
+    if carrier_weights is None:
+        if pooling not in ("add", "mean"):
+            raise ValueError(
+                "integrated carriage requires add/mean pooling or explicit carrier_weights"
+            )
+        weights = clean.new_ones(n)
+        if pooling == "mean":
+            weights /= float(n)
+    else:
+        weights = torch.as_tensor(
+            carrier_weights, device=clean.device, dtype=clean.dtype
+        ).reshape(-1)
+        if tuple(weights.shape) != (int(n),):
+            raise ValueError(
+                f"carrier_weights has shape {tuple(weights.shape)}; expected {(int(n),)}"
+            )
+        if not torch.isfinite(weights).all():
+            raise ValueError("carrier_weights must be finite")
+    p_clean = project_final_states(clean, weights)
+    p_swap = project_final_states(swap, weights)
     delta_p = p_clean - p_swap
 
     def _loss(p):
@@ -289,8 +326,8 @@ def integrated_loss_carriage(
         grad = grad.reshape(replica.numel(), nodes.numel(), p_clean.shape[-1])
         a_k = half[:, None] * torch.einsum("q,rqm->rm", wk, grad)
         a_g = half[:, None] * torch.einsum("q,rqm->rm", wg, grad)
-        b_k = pool_scale * torch.einsum("rnm,rm->rn", delta_h[replica], a_k)
-        b_g = pool_scale * torch.einsum("rnm,rm->rn", delta_h[replica], a_g)
+        b_k = weights[None, :] * torch.einsum("rnm,rm->rn", delta_h[replica], a_k)
+        b_g = weights[None, :] * torch.einsum("rnm,rm->rn", delta_h[replica], a_g)
         error = (b_k - b_g).abs().sum(dim=-1)
         return b_k.detach(), error.detach()
 

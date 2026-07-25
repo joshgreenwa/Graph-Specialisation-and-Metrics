@@ -61,11 +61,12 @@ def audit_structural_fields(data: Any, task: Any) -> None:
 
     node = set(task.node_structural_fields)
     pair = {name for pair in task.pair_structural_fields for name in pair}
+    dense_pair = set(getattr(task, "dense_pair_structural_fields", ()))
     fixed = set(task.fixed_support_fields)
     semantic = set(task.semantic_fields)
     controls = set(task.immutable_control_fields)
     extras = set(task.extra_known_fields)
-    declared = node | pair | fixed | semantic | controls | extras
+    declared = node | pair | dense_pair | fixed | semantic | controls | extras
     structural_tokens = (
         "rrwp",
         "rwse",
@@ -76,6 +77,9 @@ def audit_structural_fields(data: Any, task: Any) -> None:
         "eigen",
         "eig",
         "abs_pe",
+        "spatial",
+        "input_edges",
+        "attn_edge",
     )
     for name in _keys(data):
         lowered = str(name).lower()
@@ -94,6 +98,17 @@ def audit_structural_fields(data: Any, task: Any) -> None:
         if (index is None) != (value is None):
             raise StructuralAuditError(
                 f"pair field {index_name!r}/{value_name!r} must be present or absent together"
+            )
+    for name in getattr(task, "dense_pair_structural_fields", ()):
+        value = getattr(data, name, None)
+        if value is not None and (
+            value.ndim < 2
+            or int(value.shape[0]) != int(data.num_nodes)
+            or int(value.shape[1]) != int(data.num_nodes)
+        ):
+            raise StructuralAuditError(
+                f"dense pair field {name!r} must begin [num_nodes,num_nodes], "
+                f"got {tuple(value.shape)}"
             )
     if "edge_index" not in fixed:
         raise StructuralAuditError("edge_index must be registered as fixed architectural support")
@@ -291,6 +306,11 @@ def structural_donor_swap(
             setattr(out, index_name, new_index)
             setattr(out, value_name, new_value)
 
+    for name in getattr(task, "dense_pair_structural_fields", ()):
+        value = getattr(data, name, None)
+        if value is not None:
+            setattr(out, name, dense_pair_donor_swap(value, source, donor))
+
     verify_structural_swap(
         data,
         out,
@@ -373,6 +393,16 @@ def verify_structural_swap(
         ):
             raise StructuralAuditError(f"payload for {value_name!r} violates dense copy")
 
+    for name in getattr(task, "dense_pair_structural_fields", ()):
+        clean = getattr(base, name, None)
+        if clean is None:
+            continue
+        expected = dense_pair_donor_swap(clean, source, donor)
+        if not _tensor_equal(expected, getattr(event, name), duplicate_tolerance):
+            raise StructuralAuditError(
+                f"dense pair structural field {name!r} violates row/column/self copy"
+            )
+
 
 def verify_semantic_swap(
     base: Any,
@@ -395,9 +425,13 @@ def verify_semantic_swap(
         expected[source] = value.reshape_as(expected[source])
     if not torch.equal(event.x, expected):
         raise RuntimeError("semantic donor swap did not replace exactly the source x row")
-    for name in task.node_structural_fields + tuple(
-        field for pair in task.pair_structural_fields for field in pair
-    ) + task.fixed_support_fields + task.immutable_control_fields:
+    for name in (
+        task.node_structural_fields
+        + tuple(field for pair in task.pair_structural_fields for field in pair)
+        + tuple(getattr(task, "dense_pair_structural_fields", ()))
+        + task.fixed_support_fields
+        + task.immutable_control_fields
+    ):
         if hasattr(base, name) and not _tensor_equal(getattr(base, name), getattr(event, name)):
             raise RuntimeError(f"semantic donor swap changed fixed field {name!r}")
 
@@ -435,6 +469,18 @@ def structural_footprints(data: Any, task: Any, *, tolerance: float) -> tuple[by
                     np.ascontiguousarray(dense_np[:, node]).tobytes(),
                     np.ascontiguousarray(present_np[node, :]).tobytes(),
                     np.ascontiguousarray(present_np[:, node]).tobytes(),
+                )
+            )
+    for name in getattr(task, "dense_pair_structural_fields", ()):
+        value = getattr(data, name, None)
+        if value is None:
+            continue
+        array = value.detach().cpu().numpy()
+        for node in range(n):
+            pieces[node].extend(
+                (
+                    np.ascontiguousarray(array[node, :]).tobytes(),
+                    np.ascontiguousarray(array[:, node]).tobytes(),
                 )
             )
     return tuple(b"\x1f".join(part) for part in pieces)
@@ -491,6 +537,16 @@ def structural_intervention_dose(
             .numpy()
             .reshape(-1)
         )
+    for name in getattr(task, "dense_pair_structural_fields", ()):
+        left = getattr(base, name, None)
+        right = getattr(event, name, None)
+        if left is not None:
+            components.append(
+                (left.detach().float() - right.detach().float())
+                .cpu()
+                .numpy()
+                .reshape(-1)
+            )
     if not components:
         return 0.0
     joined = np.concatenate(components).astype(np.float64)

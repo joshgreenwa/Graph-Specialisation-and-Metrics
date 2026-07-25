@@ -77,7 +77,9 @@ def distance_event_contributions(
     """Return exact score mass ``[event,L,H,D]`` and support ``[event,D]``."""
 
     magnitude = q.square().sum(dim=-1).sqrt().detach().cpu().numpy()  # [E,L,H,N]
-    distance = np.asarray(distances)
+    # Preserve mixed numeric/special labels (e.g. ``virtual`` or ``graph_token``).
+    # NumPy's default coercion would turn every numeric distance into a string.
+    distance = np.asarray(distances, dtype=object)
     if magnitude.shape[-1] != len(distance):
         raise ValueError("carrier distances do not align with q")
     contribution = np.zeros(magnitude.shape[:-1] + (len(axis.labels),), dtype=np.float64)

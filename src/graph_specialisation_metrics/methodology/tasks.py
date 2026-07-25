@@ -1,18 +1,20 @@
-"""Canonical task registrations layered over the checkpoint-compatible GRIT registry."""
+"""Canonical task registrations for every supported model backend."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Mapping
 
 import numpy as np
 
-from ..carriage.tasks import GritTaskSpec, get_task as get_grit_task
-
+from ..carriage.content import ContentAdapter, FullNodeContentAdapter
+from ..carriage.metrics import mae_metric
+from ..carriage.tasks import get_task as get_grit_task
 
 SEMANTIC_FIELDS = ("x",)
 NODE_STRUCTURAL_FIELDS = ("rrwp", "deg", "log_deg", "abs_pe", "pestat_RRWP")
 PAIR_STRUCTURAL_FIELDS = (("rrwp_index", "rrwp_val"),)
+DENSE_PAIR_STRUCTURAL_FIELDS: tuple[str, ...] = ()
 FIXED_SUPPORT_FIELDS = (
     "edge_index",
     "edge_attr",
@@ -89,13 +91,15 @@ class CanonicalTask:
     """Everything a new task must declare rather than forking the estimators."""
 
     name: str
-    grit: GritTaskSpec
+    backend_kind: str
+    spec: Any
     output: OutputGeometry
     loss_per_graph: Callable
     semantic_fields: tuple[str, ...] = SEMANTIC_FIELDS
     immutable_control_fields: tuple[str, ...] = ()
     node_structural_fields: tuple[str, ...] = NODE_STRUCTURAL_FIELDS
     pair_structural_fields: tuple[tuple[str, str], ...] = PAIR_STRUCTURAL_FIELDS
+    dense_pair_structural_fields: tuple[str, ...] = DENSE_PAIR_STRUCTURAL_FIELDS
     fixed_support_fields: tuple[str, ...] = FIXED_SUPPORT_FIELDS
     virtual_node: bool = False
     carrier_policy: str = "real_nodes"
@@ -113,7 +117,38 @@ class CanonicalTask:
 
     @property
     def title(self) -> str:
-        return self.grit.title
+        return self.spec.title
+
+    @property
+    def content_adapter(self) -> ContentAdapter:
+        return self.spec.content_adapter
+
+    @property
+    def metric_fn(self) -> Callable:
+        return self.spec.metric_fn
+
+    @property
+    def grit(self) -> Any:
+        """Compatibility alias for older callers; new code should use ``spec``."""
+
+        return self.spec
+
+
+@dataclass(frozen=True)
+class GraphormerTaskSpec:
+    """Runtime-only details for an official Hugging Face-compatible Graphormer."""
+
+    name: str
+    title: str
+    model_id: str
+    revision: str | None
+    dataset_name: str
+    dataset_root: str
+    eval_split: str
+    donor_split: str
+    metric_fn: Callable = staticmethod(mae_metric)
+    content_adapter: ContentAdapter = field(default_factory=FullNodeContentAdapter)
+    checkpoint_format: str = "auto"
 
 
 TASKS: dict[str, CanonicalTask] = {}
@@ -126,7 +161,7 @@ def register(task: CanonicalTask) -> CanonicalTask:
     return task
 
 
-def _known_task(name: str) -> CanonicalTask:
+def _known_grit_task(name: str) -> CanonicalTask:
     grit = get_grit_task(name)
     if name == "peptides_func":
         output = OutputGeometry("logits", None, "unit")
@@ -142,7 +177,8 @@ def _known_task(name: str) -> CanonicalTask:
     virtual = name.endswith("_vnode")
     return CanonicalTask(
         name=name,
-        grit=grit,
+        backend_kind="grit",
+        spec=grit,
         output=output,
         loss_per_graph=loss,
         fixed_support_fields=(
@@ -166,7 +202,36 @@ for _name in (
     "peptides_func",
     "peptides_struct",
 ):
-    register(_known_task(_name))
+    register(_known_grit_task(_name))
+
+
+register(
+    CanonicalTask(
+        name="graphormer_pcqm4mv2",
+        backend_kind="graphormer",
+        spec=GraphormerTaskSpec(
+            name="graphormer_pcqm4mv2",
+            title="Official Graphormer PCQM4Mv2",
+            model_id="clefourrier/graphormer-base-pcqm4mv2",
+            revision="refs/pr/4",
+            dataset_name="pcqm4mv2",
+            dataset_root="/content/pcqm4mv2",
+            eval_split="valid",
+            donor_split="train",
+        ),
+        output=OutputGeometry("evaluation_regression", (1.0,), "fixed"),
+        loss_per_graph=_mae_per_graph,
+        semantic_fields=("x",),
+        node_structural_fields=("in_degree", "out_degree"),
+        pair_structural_fields=(),
+        dense_pair_structural_fields=("spatial_pos", "attn_edge_type", "input_edges"),
+        fixed_support_fields=("edge_index", "edge_attr", "attn_bias", "y", "smiles"),
+        virtual_node=False,
+        carrier_policy="real_nodes_plus_graph_token",
+        adapter_version="canonical-graphormer-hf-v1",
+        extra_known_fields=("num_nodes",),
+    )
+)
 
 
 def get_task(name: str, overrides: Mapping[str, Any] | None = None) -> CanonicalTask:
@@ -175,7 +240,9 @@ def get_task(name: str, overrides: Mapping[str, Any] | None = None) -> Canonical
     task = TASKS[name]
     if not overrides:
         return task
-    allowed = {field.name for field in task.__dataclass_fields__.values()} - {"name", "grit"}
+    allowed = {
+        field.name for field in task.__dataclass_fields__.values()
+    } - {"name", "backend_kind", "spec"}
     unknown = sorted(set(overrides) - allowed)
     if unknown:
         raise ValueError(f"unknown task override fields for {name!r}: {unknown}")

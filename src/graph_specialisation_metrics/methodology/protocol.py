@@ -132,13 +132,14 @@ class FamilyPolicy:
 
 @dataclass(frozen=True)
 class MethodologyConfig:
-    """Complete public configuration for canonical GRIT analyses."""
+    """Complete public configuration for canonical multi-backend analyses."""
 
     output_dir: str = (
         "/content/drive/MyDrive/graph_specialisation_metrics/canonical_methodology"
     )
     tasks: tuple[str, ...] = ("zinc",)
     train_seeds: tuple[int, ...] = (42,)
+    task_train_seeds: Mapping[str, tuple[int, ...]] = field(default_factory=dict)
     phases: tuple[str, ...] = PHASES
     sizes: RunSizes = field(default_factory=RunSizes)
     numerical: NumericalPolicy = field(default_factory=NumericalPolicy)
@@ -165,6 +166,17 @@ class MethodologyConfig:
             raise ValueError("at least one task is required")
         if not self.train_seeds:
             raise ValueError("at least one training seed is required")
+        unknown_seed_tasks = sorted(set(self.task_train_seeds) - set(self.tasks))
+        if unknown_seed_tasks:
+            raise ValueError(
+                f"task_train_seeds contains tasks not selected for this run: "
+                f"{unknown_seed_tasks}"
+            )
+        empty_seed_tasks = sorted(
+            task for task, seeds in self.task_train_seeds.items() if not tuple(seeds)
+        )
+        if empty_seed_tasks:
+            raise ValueError(f"task_train_seeds entries cannot be empty: {empty_seed_tasks}")
         unknown = sorted(set(self.phases) - set(PHASES))
         if unknown:
             raise ValueError(f"unknown phases {unknown}; expected a subset of {PHASES}")
@@ -177,6 +189,11 @@ class MethodologyConfig:
     def root(self) -> Path:
         return Path(self.output_dir)
 
+    def seeds_for(self, task: str) -> tuple[int, ...]:
+        return tuple(
+            int(value) for value in self.task_train_seeds.get(task, self.train_seeds)
+        )
+
     @property
     def scientific_record(self) -> dict[str, Any]:
         return {
@@ -184,6 +201,10 @@ class MethodologyConfig:
             "channels": list(CHANNELS),
             "tasks": list(self.tasks),
             "train_seeds": list(self.train_seeds),
+            "task_train_seeds": {
+                str(task): [int(seed) for seed in seeds]
+                for task, seeds in self.task_train_seeds.items()
+            },
             "sizes": dataclasses.asdict(self.sizes),
             "numerical": dataclasses.asdict(self.numerical),
             "bootstrap": dataclasses.asdict(self.bootstrap),

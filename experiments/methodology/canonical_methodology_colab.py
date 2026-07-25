@@ -1,8 +1,9 @@
 """Paste/run this lightweight cell in Colab to execute the final methodology.
 
-Edit only TASKS, TRAIN_SEEDS, PHASES, CHECKPOINTS, and SIZES.  Scientific definitions live in
-``src/graph_specialisation_metrics/README.md`` and the canonical package; this front end merely
-checks out the chosen repository revision, mounts Drive, and dispatches registered tasks.
+Edit only TASKS, TRAIN_SEEDS/TASK_TRAIN_SEEDS, PHASES, CHECKPOINTS, TASK_OVERRIDES,
+and SIZES. Scientific definitions live in ``src/graph_specialisation_metrics/README.md``
+and the canonical package; this front end merely checks out the chosen repository revision,
+mounts Drive, and dispatches registered tasks.
 """
 
 # ============================ paste from here ============================
@@ -18,8 +19,19 @@ SECRET_NAME = "dissertation_key"
 # First production run: all registered dense task families.
 TASKS = ("zinc", "qm9_gap_dense", "peptides_func", "peptides_struct")
 TRAIN_SEEDS = (42,)
+# A public checkpoint has no training-seed ensemble; use a stable seed label for its cache.
+# Example: TASKS = ("graphormer_pcqm4mv2",)
+TASK_TRAIN_SEEDS = {"graphormer_pcqm4mv2": (0,)}
 PHASES = ("scores", "causal", "carriage", "figures")
-CHECKPOINTS = {}  # e.g. {"zinc:42": "/content/drive/MyDrive/.../best.ckpt"}
+CHECKPOINTS = {}  # e.g. {"graphormer_zinc:42": "/content/drive/MyDrive/.../checkpoint.pt"}
+TASK_OVERRIDES = {
+    # Optional PCQM cache location or Hugging Face cache/offline controls:
+    # "graphormer_pcqm4mv2": {
+    #     "dataset_root": "/content/drive/MyDrive/datasets/pcqm4mv2",
+    #     "cache_dir": "/content/drive/MyDrive/huggingface",
+    #     "local_files_only": False,
+    # },
+}
 SIZES = {
     "discovery_graphs": 48,
     "causal_graphs": 24,
@@ -68,8 +80,12 @@ from graph_specialisation_metrics.methodology.colab import run  # noqa: E402
 run(
     tasks=TASKS,
     train_seeds=TRAIN_SEEDS,
+    task_train_seeds={
+        task: seeds for task, seeds in TASK_TRAIN_SEEDS.items() if task in TASKS
+    },
     phases=PHASES,
     checkpoints=CHECKPOINTS,
+    task_overrides=TASK_OVERRIDES,
     sizes=SIZES,
     mount=False,
 )
