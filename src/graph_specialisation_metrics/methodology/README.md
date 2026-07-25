@@ -24,6 +24,28 @@ main(MethodologyConfig(
 ))
 ```
 
+Official PCQM4Mv2 Graphormer use:
+
+```python
+main(MethodologyConfig(
+    tasks=("graphormer_pcqm4mv2",),
+    train_seeds=(0,),
+    checkpoints={},  # downloads the registered public checkpoint
+    task_overrides={
+        "graphormer_pcqm4mv2": {
+            "dataset_root": "/path/to/pcqm4mv2",
+            "cache_dir": "/path/to/huggingface-cache",
+        },
+    },
+))
+```
+
+`0` is a stable cache label for the one public model, not a claim about its training seed. A local
+Hugging Face model directory can be supplied in `checkpoints`; a raw `.pt`, `.bin`, or
+`.safetensors` state can also be overlaid when `model_id` resolves to the matching base
+configuration. The checkpoint-compatible `transformers==4.40.2` stack supports Python 3.10-3.12;
+the Colab installer rejects Python 3.13 with a direct compatibility message.
+
 Colab use:
 
 ```python
@@ -44,10 +66,11 @@ The paste-ready clone/mount/dispatch cell is
 | Module | Responsibility |
 |---|---|
 | `protocol.py` | Version, fixed constants, split discipline, fingerprints. |
-| `tasks.py` | Output geometry, loss, content/PE/support declarations, GRIT task registration. |
+| `tasks.py` | Backend-neutral task contract and GRIT/Graphormer task registrations. |
 | `sampling.py` | Exact graph-uniform/node-uniform semantic law and node-uniform structural law. |
 | `interventions.py` | One-row semantic replacement and dense-equivalent sparse structural footprint copy. |
-| `backend.py` | Native GRIT `wV`/final-state capture, z-space Jacobians, ablation and patching. |
+| `backend.py` | Native GRIT `wV`/final-state adapter. |
+| `graphormer.py` | Official checkpoint/dataset loading, native Graphormer transport hooks, graph-token readout adapter. |
 | `scores.py` / `distance.py` | Raw event score, hierarchy, coordinates, and exact SPD accounting. |
 | `carriage.py` | `F_sens` and positive-is-beneficial donor-wise integrated `B`. |
 | `causal.py` / `validation.py` | Clean necessity, donor-wise necessity, gross patch responses, rescue/induction, controls. |
@@ -55,7 +78,7 @@ The paste-ready clone/mount/dispatch cell is
 | `cache.py` | Atomic, contract-bound Drive caches that reject stale methodology/results. |
 | `audit.py` | Soft numerical/estimability audits: record, log, and continue; strict mode raises. |
 | `figures.py` | Shared publication theme, exact labels, intervals, PDF+PNG+metadata export. |
-| `runner.py` | Stage orchestration for dense, 1-hop, k-hop, and k-hop+VNode registrations. |
+| `runner.py` | Backend-neutral score, causal, carriage, cache, and figure orchestration. |
 
 Task-specific presentation can be added without changing cached measurements:
 
@@ -74,6 +97,11 @@ register_task_figure_modifier("zinc", adjust_zinc)
 Scientific task differences are registrations, not runner forks. A task must declare all semantic,
 structural, fixed-support, output-scaling, carrier, loss, split, and tolerance boundaries listed
 in Section 12 of the normative README.
+
+To add a future Graphormer dataset such as ZINC, register a `CanonicalTask` with
+`backend_kind="graphormer"` and a `GraphormerTaskSpec`, then register its dataset builder with
+`register_graphormer_dataset`. The builder returns evaluation and donor split views containing
+`GraphormerGraph` records. No score, causal, carriage, or plotting estimator is duplicated.
 
 ## Output layout
 

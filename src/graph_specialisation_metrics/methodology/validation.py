@@ -202,12 +202,12 @@ def _clean_ablation_stage(
                 }
             )
         metric_clean = float(
-            prepared.task.grit.metric_fn(
+            prepared.task.metric_fn(
                 np.concatenate(clean_predictions), np.concatenate(truths)
             )
         )
         metric_ablated = float(
-            prepared.task.grit.metric_fn(
+            prepared.task.metric_fn(
                 np.concatenate(ablated_predictions), np.concatenate(truths)
             )
         )

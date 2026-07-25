@@ -41,7 +41,7 @@ def build_channel_events(
     variants: list[Any] = []
     records: list[DonorEvent] = []
     if channel == "semantic":
-        rows = payload_array(base, task.grit.content_adapter)
+        rows = payload_array(base, task.content_adapter)
         selected = semantic_pool.draw(
             rows[source],
             int(degrees[source]),
@@ -55,7 +55,7 @@ def build_channel_events(
                 base,
                 source,
                 donor.payload,
-                adapter=task.grit.content_adapter,
+                adapter=task.content_adapter,
             )
             verify_semantic_swap(base, event, source, donor.payload, task=task)
             variants.append(event)

@@ -618,10 +618,13 @@ causal effects or necessity estimates. Beneficial carriage localizes the signed 
 allocation under that path; necessity requires the separate ablation and patching programme in
 Section 9.
 
-For add or mean pooling, the path can be integrated through the smaller pooling-to-readout head and
-projected exactly back to carriers. Adaptive Gauss-Kronrod quadrature is the production numerical
-method because it resolves L1/ReLU kinks and exposes both carrier-refinement and completeness error.
-No clipping, ratio rescaling, or forced completeness correction is permitted.
+For a registered linear carrier projection, the path can be integrated through the smaller
+projection-to-readout head and projected exactly back to carriers. Add pooling, mean pooling, and
+selection of a dedicated graph token are instances of this rule. The task registration must record
+the carrier weights: a Graphormer graph-token readout uses weight one on the graph token and zero on
+molecular nodes. Adaptive Gauss-Kronrod quadrature is the production numerical method because it
+resolves L1/ReLU kinks and exposes both carrier-refinement and completeness error. No clipping,
+ratio rescaling, or forced completeness correction is permitted.
 
 A capped path retains its best estimate only under predeclared per-path error limits. A
 capped/unconverged fraction or donor-averaged completeness residual above the recorded tolerance is
@@ -634,6 +637,9 @@ Distances are shortest-path distances on the pristine graph:
 ```text
 d = d_g(i,s)
 ```
+
+A dedicated graph token or internal virtual/hub carrier has no artificial molecular shortest-path
+distance. Retain it under its own explicit carrier label in event tables and profiles.
 
 The default adaptive bins are:
 

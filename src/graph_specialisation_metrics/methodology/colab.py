@@ -8,6 +8,7 @@ from ..carriage import env
 from ..carriage.env import log
 from .protocol import BootstrapPolicy, MethodologyConfig, RunSizes
 from .runner import run_methodology
+from .tasks import get_task
 
 
 DEFAULT_DRIVE_OUTPUT = (
@@ -29,6 +30,7 @@ def run(
     tasks: str | Sequence[str] = ("zinc",),
     *,
     train_seeds: Sequence[int] = (42,),
+    task_train_seeds: Mapping[str, Sequence[int]] | None = None,
     phases: Sequence[str] = ("scores", "causal", "carriage", "figures"),
     output_dir: str = DEFAULT_DRIVE_OUTPUT,
     checkpoints: Mapping[str, str] | None = None,
@@ -37,6 +39,7 @@ def run(
     figure_overrides: Mapping[str, Any] | None = None,
     analysis_seed: int = 31_415,
     bootstrap_seed: int = 17_071,
+    resample_source: bool = True,
     accelerator: str = "cuda:0",
     mount: bool = True,
     skip_install: bool = False,
@@ -52,23 +55,36 @@ def run(
 
     if mount:
         mount_drive()
-    if not skip_install:
-        env.install_dependencies(pyg_version="2.2.0")
-    else:
-        log("[deps] using the current runtime (skip_install=True)")
     if isinstance(tasks, str):
         task_names = tuple(part.strip() for part in tasks.split(",") if part.strip())
     else:
         task_names = tuple(str(value) for value in tasks)
+    backend_kinds = {get_task(name).backend_kind for name in task_names}
+    if not skip_install:
+        if "grit" in backend_kinds:
+            env.install_dependencies(pyg_version="2.2.0")
+        if "graphormer" in backend_kinds:
+            from .graphormer import install_graphormer_dependencies
+
+            install_graphormer_dependencies()
+    else:
+        log("[deps] using the current runtime (skip_install=True)")
     run_sizes = sizes if isinstance(sizes, RunSizes) else RunSizes(**dict(sizes or {}))
     bootstrap = BootstrapPolicy(
         rng_seed=int(bootstrap_seed),
         replicates=run_sizes.bootstrap_replicates,
+        # Exhaustive sources are a census, not a sample: resampling them would report
+        # sampling variance the design does not have.
+        resample_source=bool(resample_source),
     )
     config = MethodologyConfig(
         output_dir=output_dir,
         tasks=task_names,
         train_seeds=tuple(int(value) for value in train_seeds),
+        task_train_seeds={
+            str(task): tuple(int(value) for value in seeds)
+            for task, seeds in dict(task_train_seeds or {}).items()
+        },
         phases=tuple(str(value) for value in phases),
         sizes=run_sizes,
         bootstrap=bootstrap,
@@ -82,4 +98,3 @@ def run(
         strict_audits=bool(strict_audits),
     )
     return run_methodology(config, force_fresh_grit=force_fresh_grit)
-

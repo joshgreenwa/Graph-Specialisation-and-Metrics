@@ -1,4 +1,4 @@
-"""End-to-end canonical runner for all registered GRIT variants."""
+"""End-to-end canonical runner shared by every registered model backend."""
 
 from __future__ import annotations
 
@@ -86,14 +86,20 @@ from .tasks import CanonicalTask, get_task, training_target_matrix
 @dataclass
 class PreparedTask:
     task: CanonicalTask
-    grit: GritHeadModel
-    backend: CanonicalGritBackend
+    runtime: Any
+    backend: Any
     output_dir: Path
     checkpoint: Path
     checkpoint_sha: str
     sigma: np.ndarray
     splits: SplitManifest
     donor_pool: SemanticDonorPool
+
+    @property
+    def grit(self) -> Any:
+        """Compatibility alias while historical GRIT callers migrate to ``runtime``."""
+
+        return self.runtime
 
 
 def _repository_commit() -> str:
@@ -110,8 +116,8 @@ def _repository_commit() -> str:
 
 
 def _model_audits(
-    grit: GritHeadModel,
-    backend: CanonicalGritBackend,
+    runtime: Any,
+    backend: Any,
     task: CanonicalTask,
     config: MethodologyConfig,
 ) -> dict[str, Any]:
@@ -122,9 +128,8 @@ def _model_audits(
     """
 
     import torch
-    from torch_geometric.data import Batch
 
-    base = grit.eval_ds[0]
+    base = runtime.eval_ds[0]
     single = backend.capture([base], require_grad=False, include_virtual_transport=True)
     repeated = backend.capture(
         [base, base], require_grad=False, include_virtual_transport=True
@@ -142,44 +147,22 @@ def _model_audits(
         config.numerical.batch_invariance_tolerance,
         "model.batch_invariance",
         "batch invariance error",
-        context={"task": task.name, "train_seed": int(grit.sc.seed)},
+        context={"task": task.name, "train_seed": int(runtime.sc.seed)},
     )
 
     # Attention rows are receiver-normalized on every supported layer.
-    batch = Batch.from_data_list([base.clone()]).to(grit.device)
-    attention_capture = grit.capture(
-        batch,
-        want_grad=False,
-        want_attn=True,
-        include_virtual_transport=True,
-    )
-    attention_error = 0.0
-    edge_index = attention_capture["edge_index"].long()
-    receiver = edge_index[1]
-    for attention in attention_capture["attn"]:
-        mass = torch.zeros(
-            int(attention_capture["wV"][0].shape[0]),
-            int(grit.H),
-            dtype=attention.dtype,
-            device=attention.device,
-        )
-        mass.index_add_(0, receiver, attention)
-        valid = torch.unique(receiver)
-        attention_error = max(
-            attention_error,
-            float(torch.max(torch.abs(mass[valid] - 1.0)).item()),
-        )
+    attention_error = float(backend.attention_normalization_error(base))
     within_tolerance(
         attention_error,
         config.numerical.attention_tolerance,
         "model.attention_normalization",
         "attention normalization error",
-        context={"task": task.name, "train_seed": int(grit.sc.seed)},
+        context={"task": task.name, "train_seed": int(runtime.sc.seed)},
     )
 
-    rows = task.grit.content_adapter.rows(base)
+    rows = task.content_adapter.rows(base)
     semantic_noop = semantic_donor_swap(
-        base, 0, rows[0], adapter=task.grit.content_adapter
+        base, 0, rows[0], adapter=task.content_adapter
     )
     structural_noop = structural_donor_swap(
         base,
@@ -206,7 +189,7 @@ def _model_audits(
         config.numerical.no_op_tolerance,
         "model.declared_no_op",
         "declared no-op donor response",
-        context={"task": task.name, "train_seed": int(grit.sc.seed)},
+        context={"task": task.name, "train_seed": int(runtime.sc.seed)},
     )
 
     # This also verifies every layer has a finite, nonzero z-space Jacobian.
@@ -236,6 +219,86 @@ def _checkpoint_override(config: MethodologyConfig, task: str, seed: int) -> str
     return None
 
 
+def _prepare_graphormer_task(
+    config: MethodologyConfig,
+    task: CanonicalTask,
+    train_seed: int,
+    task_overrides: Mapping[str, Any],
+) -> PreparedTask:
+    from .graphormer import GraphormerBackend, build_graphormer_runtime
+
+    output_dir = config.root / task.name / f"seed_{int(train_seed)}"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    runtime, checkpoint_descriptor, digest = build_graphormer_runtime(
+        task,
+        checkpoint=_checkpoint_override(config, task.name, int(train_seed)),
+        train_seed=int(train_seed),
+        accelerator=config.accelerator,
+        overrides=task_overrides,
+    )
+    outputs = int(runtime.model.config.num_classes)
+    sigma = task.output.resolve(outputs)
+    backend = GraphormerBackend(runtime, task, sigma)
+    with audit_scope(f"{task.name}:seed{int(train_seed)}:model") as model_scope:
+        audit_checks = _model_audits(runtime, backend, task, config)
+    audit_checks["failures"] = log_summary(
+        model_scope, header=f"{task.name}:seed{int(train_seed)} model audits"
+    )
+    splits = deterministic_splits(
+        len(runtime.eval_ds),
+        len(runtime.donor_ds),
+        config.sizes,
+        int(config.analysis_seed),
+        same_index_space=False,
+    )
+    donor_pool = SemanticDonorPool(
+        [
+            (graph_id, runtime.donor_ds[graph_id])
+            for graph_id in splits.semantic_donor_pool
+        ],
+        adapter=task.content_adapter,
+    )
+    model_record = {
+        "protocol_version": PROTOCOL_VERSION,
+        "repository_commit": _repository_commit(),
+        "task": task.name,
+        "backend": task.backend_kind,
+        "title": task.title,
+        "train_seed": int(train_seed),
+        "checkpoint": checkpoint_descriptor,
+        "checkpoint_epoch": None,
+        "checkpoint_sha256": digest,
+        "output_representation": task.output.representation,
+        "sigma": sigma.tolist(),
+        "task_adapter_version": task.adapter_version,
+        "carrier_policy": task.carrier_policy,
+        "splits": dataclasses.asdict(splits),
+        "test_metric": runtime.test_metric,
+        "validation_metric": runtime.val_metric,
+        "parameter_count": runtime.checks.get("num_parameters"),
+        "canonical_audits": audit_checks,
+        "runtime": {
+            "platform": platform.platform(),
+            "python": sys.version.split()[0],
+        },
+    }
+    atomic_json(output_dir / "model.json", model_record)
+    checkpoint_label = Path(
+        checkpoint_descriptor.replace("/", "__").replace("@", "__at__")
+    )
+    return PreparedTask(
+        task,
+        runtime,
+        backend,
+        output_dir,
+        checkpoint_label,
+        digest,
+        sigma,
+        splits,
+        donor_pool,
+    )
+
+
 def prepare_task(
     config: MethodologyConfig,
     task_name: str,
@@ -244,9 +307,6 @@ def prepare_task(
     force_fresh_grit: bool = False,
 ) -> PreparedTask:
     """Rebuild the registered environment and load a cached training checkpoint read-only."""
-
-    import torch
-    from torch_geometric.data import Batch
 
     set_strict(bool(config.strict_audits))
     task_overrides = config.task_overrides.get(task_name, {})
@@ -260,8 +320,17 @@ def prepare_task(
         "sigma",
         "output_representation",
         "sigma_policy",
+        "dataset_root",
+        "model_id",
+        "revision",
+        "cache_dir",
+        "local_files_only",
     }
-    canonical_override_names = set(CanonicalTask.__dataclass_fields__) - {"name", "grit"}
+    canonical_override_names = set(CanonicalTask.__dataclass_fields__) - {
+        "name",
+        "backend_kind",
+        "spec",
+    }
     unknown_overrides = sorted(
         set(task_overrides) - runtime_override_names - canonical_override_names
     )
@@ -302,7 +371,20 @@ def prepare_task(
                 ),
             ),
         )
-    spec = task.grit
+    if task.backend_kind == "graphormer":
+        return _prepare_graphormer_task(
+            config,
+            task,
+            int(train_seed),
+            task_overrides,
+        )
+    if task.backend_kind != "grit":
+        raise ValueError(f"unsupported canonical backend {task.backend_kind!r}")
+
+    import torch
+    from torch_geometric.data import Batch
+
+    spec = task.spec
     output_dir = config.root / task_name / f"seed_{int(train_seed)}"
     output_dir.mkdir(parents=True, exist_ok=True)
     repo_dir = Path(
@@ -387,6 +469,7 @@ def prepare_task(
         "protocol_version": PROTOCOL_VERSION,
         "repository_commit": _repository_commit(),
         "task": task_name,
+        "backend": task.backend_kind,
         "title": task.title,
         "train_seed": int(train_seed),
         "checkpoint": str(checkpoint),
@@ -395,6 +478,7 @@ def prepare_task(
         "output_representation": task.output.representation,
         "sigma": sigma.tolist(),
         "task_adapter_version": task.adapter_version,
+        "carrier_policy": task.carrier_policy,
         "splits": dataclasses.asdict(splits),
         "test_metric": grit.test_metric,
         "validation_metric": grit.val_metric,
@@ -592,8 +676,9 @@ def _distance_axis(prepared: PreparedTask, graph_ids: Sequence[int]) -> Distance
     ]
     axis = DistanceAxis.from_matrices(matrices)
     labels = list(axis.labels)
-    if prepared.task.virtual_node and "virtual" not in labels:
-        labels.append("virtual")
+    for label in prepared.backend.special_carrier_labels:
+        if label not in labels:
+            labels.append(label)
     return DistanceAxis(tuple(labels))
 
 
@@ -603,43 +688,9 @@ def _clean_attention_distance(
     pristine: np.ndarray,
     axis: DistanceAxis,
 ) -> np.ndarray:
-    """Normalize clean attention by graph and head before any family averaging."""
+    """Normalize clean attention by graph and head before family averaging."""
 
-    from torch_geometric.data import Batch
-
-    batch = Batch.from_data_list([base.clone()]).to(prepared.grit.device)
-    captured = prepared.grit.capture(
-        batch,
-        want_grad=False,
-        want_attn=True,
-        include_virtual_transport=True,
-    )
-    edge_index = captured["edge_index"].detach().cpu().numpy()
-    buckets = []
-    for sender, receiver in edge_index.T:
-        if int(sender) >= int(base.num_nodes) or int(receiver) >= int(base.num_nodes):
-            buckets.append(axis.index("virtual"))
-        else:
-            buckets.append(axis.index(pristine[int(receiver), int(sender)]))
-    buckets = np.asarray(buckets, dtype=np.int64)
-    profile = np.zeros(
-        (int(prepared.grit.L), int(prepared.grit.H), len(axis.labels)),
-        dtype=np.float64,
-    )
-    for layer, attention in enumerate(captured["attn"]):
-        values = attention.detach().cpu().numpy()
-        for distance_index in range(len(axis.labels)):
-            mask = buckets == distance_index
-            if mask.any():
-                profile[layer, :, distance_index] = values[mask].sum(axis=0)
-        denominator = profile[layer].sum(axis=-1, keepdims=True)
-        np.divide(
-            profile[layer],
-            denominator,
-            out=profile[layer],
-            where=denominator > 0,
-        )
-    return profile
+    return prepared.backend.clean_attention_distance(base, pristine, axis)
 
 
 def run_scores(
@@ -728,9 +779,9 @@ def run_scores(
                     prepared, base, pristine, axis
                 )
             for position, record in enumerate(records):
-                distances: list[Any] = list(pristine[int(record.source), :])
-                if q.shape[3] == int(base.num_nodes) + 1:
-                    distances.append("virtual")
+                distances = prepared.backend.transport_distances(
+                    base, int(record.source), pristine
+                )
                 contribution, support = distance_event_contributions(
                     q[position : position + 1], distances, axis
                 )
@@ -1008,7 +1059,7 @@ def run_carriage(
 
     import torch
 
-    from ..carriage.core import pool_final_states
+    from ..carriage.core import project_final_states
 
     plan = dict(plan or _stage_plan(prepared, config, "carriage"))
     cache = _cache(prepared, config, plan)
@@ -1050,16 +1101,16 @@ def run_carriage(
             K = int(config.sizes.donors_per_source)
             S = len(sources)
             h_clean = captured.final_state[0]
-            h_event = captured.final_state[1:].reshape(
-                S, K, int(base.num_nodes), prepared.grit.dim_h
-            )
+            carriers, width = int(h_clean.shape[-2]), int(h_clean.shape[-1])
+            h_event = captured.final_state[1:].reshape(S, K, carriers, width)
             delta = h_clean[None, None, :, :] - h_event
             event_f = functional_carriage_events(delta, clean.final_state)
+            carrier_weights = prepared.backend.carriage_weights(base, h_clean)
             integrated = beneficial_carriage(
                 h_clean,
                 h_event,
                 prepared.backend.loss_from_pooled(clean.capture.target.reshape(1, -1)),
-                pooling=str(prepared.grit.cfg.model.graph_pooling),
+                carrier_weights=carrier_weights,
                 atol=config.numerical.integrated_atol,
                 rtol=config.numerical.integrated_rtol,
                 max_intervals=config.numerical.integrated_max_intervals,
@@ -1070,12 +1121,12 @@ def run_carriage(
             )
             target = clean.capture.target.reshape(1, -1)
             replay_loss = prepared.backend.loss_from_pooled(target)
-            pooled_clean = pool_final_states(h_clean.unsqueeze(0), str(
-                prepared.grit.cfg.model.graph_pooling
-            ))
-            pooled_event = pool_final_states(
-                h_event.reshape(S * K, int(base.num_nodes), prepared.grit.dim_h),
-                str(prepared.grit.cfg.model.graph_pooling),
+            pooled_clean = project_final_states(
+                h_clean.unsqueeze(0), carrier_weights
+            )
+            pooled_event = project_final_states(
+                h_event.reshape(S * K, carriers, width),
+                carrier_weights,
             )
             with torch.no_grad():
                 replay_clean_loss = replay_loss(pooled_clean)
@@ -1106,12 +1157,18 @@ def run_carriage(
             F = event_f.mean(dim=1).t().detach().cpu().numpy()
             B = integrated.field.detach().cpu().numpy()
             pristine = shortest_path_distances(base.edge_index, int(base.num_nodes))
-            distance = pristine[np.asarray(sources), :].T
+            distance = prepared.backend.carriage_distance_matrix(
+                base, sources, pristine
+            )
             graph_fields[graph_id] = {
                 "sources": tuple(sources),
                 "F_sens": F,
                 "B": B,
                 "distance": distance,
+                "carrier_kinds": tuple(
+                    prepared.backend.carriage_carrier_kind(base, carrier)
+                    for carrier in range(carriers)
+                ),
                 "event_F_sens": event_f.detach().cpu().numpy(),
                 "event_B": integrated.event_field.detach().cpu().numpy(),
                 "event_loss_increase": integrated.event_loss_increase.detach().cpu().numpy(),
@@ -1126,7 +1183,10 @@ def run_carriage(
             event_f_np = event_f.detach().cpu().numpy()
             for source_position, source in enumerate(sources):
                 for donor in range(K):
-                    for carrier in range(int(base.num_nodes)):
+                    for carrier in range(carriers):
+                        carrier_kind = prepared.backend.carriage_carrier_kind(
+                            base, carrier
+                        )
                         pair_rows.append(
                             {
                                 "seed": int(prepared.grit.sc.seed),
@@ -1135,6 +1195,7 @@ def run_carriage(
                                 "donor": donor,
                                 "carrier": carrier,
                                 "distance": float(distance[carrier, source_position]),
+                                "carrier_kind": carrier_kind,
                                 "F_sens": float(event_f_np[source_position, donor, carrier]),
                                 "B": float(event_b[source_position, donor, carrier]),
                                 "channel": channel,
@@ -1430,13 +1491,28 @@ def _carriage_profile(
     maximum = max(finite_distances, default=0)
     bins = adaptive_distance_bins(maximum)
     labels = [str(lo) if lo == hi else f"{lo}-{hi}" for lo, hi in bins]
-    estimates, lows, highs = [], [], []
-    for lo, hi in bins:
-        selected = [
-            row
+    special_kinds = sorted(
+        {
+            str(row.get("carrier_kind", "molecular_node"))
             for row in rows
-            if np.isfinite(row["distance"]) and lo <= int(row["distance"]) <= hi
-        ]
+            if str(row.get("carrier_kind", "molecular_node")) != "molecular_node"
+        }
+    )
+    labels.extend(kind.replace("_", " ") for kind in special_kinds)
+    estimates, lows, highs = [], [], []
+    selectors = [
+        lambda row, lower=lo, upper=hi: (
+            np.isfinite(row["distance"])
+            and lower <= int(row["distance"]) <= upper
+        )
+        for lo, hi in bins
+    ]
+    selectors.extend(
+        lambda row, kind=kind: str(row.get("carrier_kind")) == kind
+        for kind in special_kinds
+    )
+    for select in selectors:
+        selected = [row for row in rows if select(row)]
         graph_ids = {int(row["graph_id"]) for row in selected}
         pairs = {
             (int(row["graph_id"]), int(row["carrier"]), int(row["source"]))
@@ -2185,7 +2261,7 @@ def run_methodology(
     results: dict[str, Any] = {}
     run_findings: dict[str, list[dict[str, Any]]] = {}
     for task_name in config.tasks:
-        for train_seed in config.train_seeds:
+        for train_seed in config.seeds_for(task_name):
             key = f"{task_name}:seed{int(train_seed)}"
             log(f"\n[canonical] {key}")
             with audit_scope(key) as scope:

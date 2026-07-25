@@ -147,6 +147,20 @@ def test_protocol_constants_and_disjoint_splits():
     assert all(not groups[i] & groups[j] for i in range(4) for j in range(i))
 
 
+def test_task_specific_seed_labels_support_mixed_backends():
+    config = MethodologyConfig(
+        tasks=("zinc", "graphormer_pcqm4mv2"),
+        train_seeds=(42, 43),
+        task_train_seeds={"graphormer_pcqm4mv2": (0,)},
+    )
+    config.validate()
+    assert config.seeds_for("zinc") == (42, 43)
+    assert config.seeds_for("graphormer_pcqm4mv2") == (0,)
+    assert config.scientific_record["task_train_seeds"] == {
+        "graphormer_pcqm4mv2": [0]
+    }
+
+
 def test_numerical_audits_are_soft_by_default_and_strict_on_request():
     config = MethodologyConfig()
     assert config.strict_audits is False
