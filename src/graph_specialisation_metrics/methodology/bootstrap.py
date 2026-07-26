@@ -8,6 +8,7 @@ from typing import Any, Callable, Sequence
 import numpy as np
 
 from .protocol import BOOTSTRAP_REPLICATES, BootstrapPolicy
+from .progress import ProgressTracker
 
 
 def trimmed_mean(values: Any, proportion: float = 0.20, axis: int = 0) -> np.ndarray:
@@ -115,6 +116,9 @@ def nested_percentile_interval(
     *,
     graph_reduce: Callable[[np.ndarray], np.ndarray] | None = None,
     transform: Callable[[np.ndarray], np.ndarray] | None = None,
+    progress_label: str | None = None,
+    progress_enabled: bool = True,
+    progress_updates: int = 20,
 ) -> Interval:
     """Run the complete seed->graph->source->donor bootstrap hierarchy."""
 
@@ -127,12 +131,27 @@ def nested_percentile_interval(
     apply = transform or (lambda value: value)
     estimate = apply(_nested_estimate(observations, None, policy, reduce))
     rng = np.random.default_rng(int(policy.rng_seed))
-    draws = np.stack(
-        [
-            apply(_nested_estimate(observations, rng, policy, reduce))
-            for _ in range(policy.replicates)
-        ]
+    tracker = ProgressTracker(
+        progress_label or "bootstrap",
+        int(policy.replicates),
+        unit="replicates",
+        enabled=bool(progress_label) and bool(progress_enabled),
+        updates=int(progress_updates),
     )
+    draw_values = []
+    try:
+        for _ in range(policy.replicates):
+            draw_values.append(
+                apply(_nested_estimate(observations, rng, policy, reduce))
+            )
+            if progress_label:
+                tracker.advance()
+    except BaseException as error:
+        tracker.fail(detail=f"{type(error).__name__}: {error}")
+        raise
+    else:
+        tracker.finish()
+    draws = np.stack(draw_values)
     alpha = (1.0 - float(policy.confidence)) / 2.0
     low, high, estimable = _percentiles(draws, alpha)
     levels = [

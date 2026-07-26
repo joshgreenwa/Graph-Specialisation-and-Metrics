@@ -7,6 +7,7 @@ from typing import Any, Mapping, Sequence
 
 import numpy as np
 
+from ..carriage.env import log
 from .audit import audit_check, within_tolerance
 from .bootstrap import Observation, nested_percentile_interval
 from .causal import (
@@ -20,6 +21,7 @@ from .causal import (
 )
 from .execution import execute_graph_batches
 from .protocol import CHANNELS, PROTOCOL_VERSION
+from .progress import ProgressTracker, progress_kwargs, timed_stage
 from .scores import HeadCoordinates
 
 
@@ -172,6 +174,8 @@ def _clean_ablation_stage(
 
     output: dict[str, Any] = {}
     graph_ids = list(_stage_ids(prepared, "clean_ablation"))
+    task_name = getattr(prepared.task, "name", "task")
+    run_label = f"{task_name}:seed{int(prepared.grit.sc.seed)}"
     clean_by_graph: dict[int, Any] = {}
 
     def execute_clean(chunk):
@@ -200,8 +204,18 @@ def _clean_ablation_stage(
         execute=execute_clean,
         consume=lambda rows: clean_by_graph.update(rows),
         oom_backoff=config.execution.oom_backoff,
+        **progress_kwargs(
+            config, f"{run_label} | causal | clean-ablation baselines"
+        ),
     )
     target_reports: dict[str, Any] = {}
+    target_progress = ProgressTracker(
+        f"{run_label} | causal | clean-ablation targets",
+        len(targets),
+        unit="targets",
+        enabled=bool(config.execution.verbose_progress),
+        updates=int(config.execution.progress_updates),
+    )
     for name, family in targets.items():
         rows = []
         clean_predictions = []
@@ -302,6 +316,8 @@ def _clean_ablation_stage(
             "registered_metric_change": metric_ablated - metric_clean,
             "graphs": rows,
         }
+        target_progress.advance(1, detail=name)
+    target_progress.finish()
     names = list(targets)
     vector_observations = []
     graph_ids = sorted(
@@ -334,7 +350,11 @@ def _clean_ablation_stage(
             )
         )
     endpoint_interval = nested_percentile_interval(
-        vector_observations, config.bootstrap
+        vector_observations,
+        config.bootstrap,
+        **progress_kwargs(
+            config, f"{run_label} | causal | clean-ablation endpoint bootstrap"
+        ),
     )
     head_positions = [
         position for position, name in enumerate(names) if name.startswith("head_")
@@ -354,6 +374,9 @@ def _clean_ablation_stage(
         vector_observations,
         config.bootstrap,
         transform=association_transform,
+        **progress_kwargs(
+            config, f"{run_label} | causal | clean-ablation association bootstrap"
+        ),
     )
     output["_intervals"] = {
         "target_order": names,
@@ -387,6 +410,19 @@ def _causal_events(
     }
     self_patch_max = 0.0
     excluded_events = 0
+    active_graph_channels = sum(
+        bool(plan[graph_id][channel].get("records"))
+        for graph_id in plan
+        for channel in CHANNELS
+    )
+    run_label = f"{prepared.task.name}:seed{int(prepared.grit.sc.seed)}"
+    target_progress = ProgressTracker(
+        f"{run_label} | causal | donor patch/necessity targets",
+        active_graph_channels * len(targets),
+        unit="graph-channel-targets",
+        enabled=bool(config.execution.verbose_progress),
+        updates=int(config.execution.progress_updates),
+    )
     for graph_id in sorted(plan):
         base = prepared.grit.eval_ds[int(graph_id)]
         for channel in CHANNELS:
@@ -509,6 +545,11 @@ def _causal_events(
                             "event_effect": float(necessity["event_effect"][position]),
                         }
                     )
+                target_progress.advance(
+                    1,
+                    detail=f"graph={int(graph_id)}, channel={channel}, target={target_name}",
+                )
+    target_progress.finish()
     within_tolerance(
         self_patch_max,
         config.numerical.reconstruction_tolerance,
@@ -527,6 +568,8 @@ def _summarize_causal(
     targets: Mapping[str, Sequence[tuple[int, int]]],
     config: Any,
     scores: Mapping[str, Any],
+    *,
+    progress_label: str | None = None,
 ) -> dict[str, Any]:
     records = event_output["records"]
     summary: dict[str, dict[str, Any]] = {}
@@ -753,7 +796,14 @@ def _summarize_causal(
             )
 
         causal_interval = nested_percentile_interval(
-            causal_observations, config.bootstrap, transform=transform
+            causal_observations,
+            config.bootstrap,
+            transform=transform,
+            **(
+                progress_kwargs(config, progress_label)
+                if progress_label is not None
+                else {}
+            ),
         )
     else:
         causal_interval = None
@@ -989,12 +1039,34 @@ def run_causal_validation(
     if config.resume and not config.force:
         cached = cache.load("causal", "validation")
         if cached is not None:
+            log(f"[cache] loaded canonical causal validation for {prepared.task.name}")
             return cached
     targets = _targets(prepared, scores)
-    clean = _clean_ablation_stage(prepared, config, targets, scores)
-    events = _causal_events(prepared, config, scores, targets, plan)
-    summary = _summarize_causal(events, targets, config, scores)
-    associations = _association_report(prepared, scores, summary, clean, config)
+    run_label = f"{prepared.task.name}:seed{int(prepared.grit.sc.seed)}"
+    log(
+        f"[causal] computing {len(targets)} head/family targets over "
+        f"{len(plan)} causal graphs and {len(prepared.splits.clean_ablation)} "
+        "clean-ablation graphs"
+    )
+    stage_options = {
+        "enabled": bool(config.execution.verbose_progress),
+        "heartbeat_seconds": float(config.execution.heartbeat_seconds),
+    }
+    with timed_stage(f"{run_label} | causal | clean ablation", **stage_options):
+        clean = _clean_ablation_stage(prepared, config, targets, scores)
+    with timed_stage(
+        f"{run_label} | causal | donor patching and necessity", **stage_options
+    ):
+        events = _causal_events(prepared, config, scores, targets, plan)
+    with timed_stage(f"{run_label} | causal | summarization", **stage_options):
+        summary = _summarize_causal(
+            events,
+            targets,
+            config,
+            scores,
+            progress_label=f"{run_label} | causal | endpoint bootstrap",
+        )
+        associations = _association_report(prepared, scores, summary, clean, config)
     causal_interval = summary["intervals"]["interval"]
     if causal_interval is not None:
         association_count = len(summary["intervals"]["association_order"])
@@ -1058,4 +1130,5 @@ def run_causal_validation(
     }
     cache.save("causal", "validation", output)
     cache.save_audit("causal_manifest", plan)
+    log(f"[cache] saved canonical causal validation for {run_label}")
     return output

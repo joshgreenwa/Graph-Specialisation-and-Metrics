@@ -78,6 +78,7 @@ The paste-ready clone/mount/dispatch cell is
 | `cache.py` | Atomic, contract-bound Drive caches that reject stale methodology/results. |
 | `audit.py` | Soft numerical/estimability audits: record, log, and continue; strict mode raises. |
 | `execution.py` | Runtime-only multi-graph batching and CUDA-OOM backoff. |
+| `progress.py` | Flush-safe stage, item, ETA, throughput, CUDA-memory, and heartbeat reporting. |
 | `figures.py` | Shared publication theme, exact labels, intervals, PDF+PNG+metadata export. |
 | `runner.py` | Backend-neutral score, causal, carriage, cache, and figure orchestration. |
 
@@ -105,6 +106,26 @@ aggregation. The setting and any OOM retries are recorded, but execution policy 
 excluded from the scientific cache fingerprint. Clean Jacobians are computed once and reused
 across the semantic and structural channels; clean-ablation baselines are likewise reused across
 all head and family targets.
+
+Long Colab runs report task/phase boundaries, bounded item progress, elapsed time, ETA, throughput,
+CUDA allocated/reserved/peak memory, cache decisions, and saved figure paths. A heartbeat is also
+printed while an indivisible operation is still running, so a slow bootstrap or target evaluation
+never leaves the notebook silent. These controls are runtime-only and do not change scientific
+results or cache identity:
+
+```python
+EXECUTION = {
+    "graphs_per_batch": 8,
+    "oom_backoff": True,
+    "verbose_progress": True,
+    "progress_updates": 20,     # approximately this many item updates per operation
+    "heartbeat_seconds": 60,    # set to 0 to disable only the heartbeat
+}
+```
+
+Set `verbose_progress=False` (or pass `--quiet-progress` to the CLI) to suppress the detailed
+trackers and heartbeats; task, cache, and saved-output milestones remain visible. Each log call is
+flushed immediately for reliable display in Colab.
 
 To add a future Graphormer dataset such as ZINC, register a `CanonicalTask` with
 `backend_kind="graphormer"` and a `GraphormerTaskSpec`, then register its dataset builder with

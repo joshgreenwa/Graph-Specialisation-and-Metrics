@@ -136,10 +136,17 @@ class ExecutionPolicy:
 
     graphs_per_batch: int = 4
     oom_backoff: bool = True
+    verbose_progress: bool = True
+    progress_updates: int = 20
+    heartbeat_seconds: float = 60.0
 
     def validate(self) -> None:
         if int(self.graphs_per_batch) < 1:
             raise ValueError("graphs_per_batch must be positive")
+        if int(self.progress_updates) < 1:
+            raise ValueError("progress_updates must be positive")
+        if float(self.heartbeat_seconds) < 0:
+            raise ValueError("heartbeat_seconds must be non-negative")
 
 
 @dataclass(frozen=True)
