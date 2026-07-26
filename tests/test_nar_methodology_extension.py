@@ -121,10 +121,15 @@ def test_role_family_matching_trims_weakest_tail_when_layer_is_infeasible():
         rng_seed=7,
     )
 
-    assert families["address"] == ((0, 0),)
-    assert families["content"] == ((0, 4),)
-    assert families["address_control"] == ((0, 2),)
-    assert families["content_control"] == ((0, 2),)
+    assert (0, 0) in families["address"]
+    assert (0, 4) in families["content"]
+    assert len(families["address"]) + len(families["content"]) == 3
+    assert len(families["address_control"]) == len(families["address"])
+    assert len(families["content_control"]) == len(families["content"])
+    retained = set(families["address"]) | set(families["content"])
+    assert retained.isdisjoint(families["address_control"])
+    assert retained.isdisjoint(families["content_control"])
+    assert all(layer == 0 for family in families.values() for layer, _ in family)
 
 
 def test_extension_store_refuses_an_existing_different_contract(tmp_path):

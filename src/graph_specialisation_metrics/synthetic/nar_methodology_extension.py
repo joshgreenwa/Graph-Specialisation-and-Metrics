@@ -406,44 +406,73 @@ def freeze_role_families(
         (address and len(address_control) != len(address))
         or (content and len(content_control) != len(content))
     ):
-        # A small-head model can put several tail heads in a layer containing too few *active*
-        # neutral heads for a one-for-one control.  This is a property of the discovery result,
-        # not a reason to discard the cell.  Preserve same-layer/activity matching by removing
-        # only the weakest tail members in the infeasible layer, then match the retained targets
-        # deterministically on J and clean throughput.  No causal outcome is inspected.
-        original_leaning = set(address) | set(content)
+        # A small-head model can put several tail heads in one layer and leave no *active*
+        # central head there. This is a discovery result, not a reason to discard the cell.
+        # Reserve enough non-family heads in every layer for one-for-one controls, retaining the
+        # strongest tail members. Then match continuously on J and clean throughput; an arbitrary
+        # active/inactive threshold is not imposed on the control pool. No causal outcome enters.
         J = role.joint_sensitivity
         D = role.selectivity
         throughput_array = np.asarray(throughput, dtype=np.float64)
         active = role.active
         median_d = float(np.nanmedian(D[active]))
 
+        address_by_layer = {
+            layer: sorted(
+                [item for item in address if int(item[0]) == layer],
+                key=lambda item: (-float(D[item]), item),
+            )
+            for layer in range(J.shape[0])
+        }
+        content_by_layer = {
+            layer: sorted(
+                [item for item in content if int(item[0]) == layer],
+                key=lambda item: (float(D[item]), item),
+            )
+            for layer in range(J.shape[0])
+        }
+        for layer in range(J.shape[0]):
+            address_layer = address_by_layer[layer]
+            content_layer = content_by_layer[layer]
+            # Control families may share a matched head with one another (as in the canonical
+            # matcher), but heads are unique within each control. Thus the available neutral
+            # count must cover the larger retained family in this layer.
+            while (
+                int(J.shape[1]) - len(address_layer) - len(content_layer)
+                < max(len(address_layer), len(content_layer))
+            ):
+                candidates: list[tuple[float, str]] = []
+                if address_layer:
+                    # Last is the weakest address-tail member after descending-D sorting.
+                    candidates.append((abs(float(D[address_layer[-1]])), "address"))
+                if content_layer:
+                    # Last is the weakest content-tail member after ascending-D sorting.
+                    candidates.append((abs(float(D[content_layer[-1]])), "content"))
+                if not candidates:
+                    break
+                _, remove = min(candidates, key=lambda item: (item[0], item[1]))
+                if remove == "address":
+                    address_layer.pop()
+                else:
+                    content_layer.pop()
+        address = tuple(
+            item
+            for layer in range(J.shape[0])
+            for item in address_by_layer[layer]
+        )
+        content = tuple(
+            item
+            for layer in range(J.shape[0])
+            for item in content_by_layer[layer]
+        )
+        retained_leaning = set(address) | set(content)
+
         def neutral_pool(layer: int) -> list[tuple[int, int]]:
             return [
                 (int(layer), int(head))
                 for head in range(J.shape[1])
-                if bool(active[layer, head])
-                and (int(layer), int(head)) not in original_leaning
+                if (int(layer), int(head)) not in retained_leaning
             ]
-
-        def feasible_tail(
-            target: Sequence[tuple[int, int]],
-            *,
-            address_role: bool,
-        ) -> tuple[tuple[int, int], ...]:
-            retained: list[tuple[int, int]] = []
-            for layer in sorted({int(item[0]) for item in target}):
-                layer_targets = [item for item in target if int(item[0]) == layer]
-                capacity = len(neutral_pool(layer))
-                ordered = sorted(
-                    layer_targets,
-                    key=lambda item: (
-                        -float(D[item]) if address_role else float(D[item]),
-                        item,
-                    ),
-                )
-                retained.extend(ordered[:capacity])
-            return tuple(retained)
 
         def matched_control(
             target: Sequence[tuple[int, int]],
@@ -456,7 +485,7 @@ def freeze_role_families(
                 ]
                 if not candidates:
                     raise RuntimeError(
-                        "discovery family remains infeasible after same-layer trimming"
+                        "model has no non-family head available for a same-layer control"
                     )
                 scale_j = max(float(np.nanstd(J[int(layer)])), 1e-12)
                 scale_t = max(
@@ -479,13 +508,11 @@ def freeze_role_families(
                 used.add(choice)
             return tuple(selected)
 
-        address = feasible_tail(address, address_role=True)
-        content = feasible_tail(content, address_role=False)
         if not address or not content:
-            raise RuntimeError(
-                "no non-empty address/content tail can be paired with an active "
-                "same-layer neutral control"
-            )
+            # This can occur only for a single-head model. Such a model cannot define distinct
+            # specialised and control head families, so fail with an explicit estimability
+            # boundary rather than an implementation-dependent matching error.
+            raise RuntimeError("head-family controls require at least two heads per layer")
         address_control = matched_control(address)
         content_control = matched_control(content)
     return {
@@ -589,9 +616,9 @@ def derive_role_result(
                 or len(frozen["content"]) < requested_tail
             ),
             "fallback": (
-                "if a layer has too few active neutral controls, retain its strongest "
-                "tail members up to same-layer neutral capacity; match controls on "
-                "role-neutrality, J, and clean throughput"
+                "if a layer has too few active central controls, retain its strongest "
+                "tail members while reserving same-layer non-family heads; match controls "
+                "continuously on role-neutrality, J, and clean throughput"
             ),
         },
         "clean_throughput": np.asarray(value["clean_throughput"]),
