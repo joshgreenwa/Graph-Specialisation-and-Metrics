@@ -72,6 +72,7 @@ from .protocol import (
     deterministic_splits,
     stable_hash,
 )
+from .progress import ProgressTracker, progress_kwargs, timed_stage
 from .sampling import SemanticDonorPool, manifest_fingerprint, sample_sources
 from .scores import (
     aggregate_event_scores,
@@ -230,6 +231,10 @@ def _prepare_graphormer_task(
 
     output_dir = config.root / task.name / f"seed_{int(train_seed)}"
     output_dir.mkdir(parents=True, exist_ok=True)
+    log(
+        f"[prepare] {task.name}:seed{int(train_seed)} | loading Graphormer runtime "
+        f"on {config.accelerator}"
+    )
     runtime, checkpoint_descriptor, digest = build_graphormer_runtime(
         task,
         checkpoint=_checkpoint_override(config, task.name, int(train_seed)),
@@ -238,6 +243,10 @@ def _prepare_graphormer_task(
         overrides=task_overrides,
     )
     outputs = int(runtime.model.config.num_classes)
+    log(
+        f"[prepare] Graphormer loaded | eval_graphs={len(runtime.eval_ds)} | "
+        f"donor_graphs={len(runtime.donor_ds)} | outputs={outputs}"
+    )
     sigma = task.output.resolve(outputs)
     backend = GraphormerBackend(runtime, task, sigma)
     with audit_scope(f"{task.name}:seed{int(train_seed)}:model") as model_scope:
@@ -258,6 +267,10 @@ def _prepare_graphormer_task(
             for graph_id in splits.semantic_donor_pool
         ],
         adapter=task.content_adapter,
+    )
+    log(
+        f"[prepare] semantic donor pool ready | "
+        f"graphs={len(splits.semantic_donor_pool)}"
     )
     model_record = {
         "protocol_version": PROTOCOL_VERSION,
@@ -397,6 +410,10 @@ def prepare_task(
             )
         )
     )
+    log(
+        f"[prepare] {task_name}:seed{int(train_seed)} | backend=GRIT | "
+        f"accelerator={config.accelerator} | repo={repo_dir}"
+    )
     env.clone_grit(
         repo_dir,
         spec.grit_repo,
@@ -417,6 +434,7 @@ def prepare_task(
         Path(drive_dir) / "results",
         _checkpoint_override(config, task_name, int(train_seed)),
     )
+    log(f"[prepare] checkpoint selected | epoch={int(epoch)} | path={checkpoint}")
     digest = checkpoint_sha256(checkpoint)
     model_config = SpecConfig(
         ckpt=str(checkpoint),
@@ -435,6 +453,10 @@ def prepare_task(
         resume=bool(config.resume),
     )
     grit = GritHeadModel(spec, model_config).load()
+    log(
+        f"[prepare] model and datasets loaded | eval_graphs={len(grit.eval_ds)} | "
+        f"donor_graphs={len(grit.donor_ds)} | device={grit.device}"
+    )
     with torch.no_grad():
         first = Batch.from_data_list([grit.eval_ds[0].clone()]).to(grit.device)
         first_prediction, _ = grit.model(first)
@@ -445,6 +467,10 @@ def prepare_task(
         else None
     )
     sigma = task.output.resolve(outputs, training_targets=training_targets)
+    log(
+        f"[prepare] output geometry resolved | representation={task.output.representation} | "
+        f"outputs={outputs} | sigma={np.asarray(sigma).tolist()}"
+    )
     backend = CanonicalGritBackend(grit, task, sigma)
     with audit_scope(f"{task_name}:seed{int(train_seed)}:model") as model_scope:
         audit_checks = _model_audits(grit, backend, task, config)
@@ -465,6 +491,10 @@ def prepare_task(
     donor_pool = SemanticDonorPool(
         [(graph_id, grit.donor_ds[graph_id]) for graph_id in splits.semantic_donor_pool],
         adapter=spec.content_adapter,
+    )
+    log(
+        f"[prepare] semantic donor pool ready | "
+        f"graphs={len(splits.semantic_donor_pool)}"
     )
     model_record = {
         "protocol_version": PROTOCOL_VERSION,
@@ -522,7 +552,15 @@ def _stage_plan(
     """Freeze source IDs and both independently drawn donor manifests before inference."""
 
     plan: dict[int, dict[str, Any]] = {}
-    for graph_id in _stage_ids(prepared, stage):
+    graph_ids = _stage_ids(prepared, stage)
+    tracker = ProgressTracker(
+        f"{prepared.task.name}:seed{int(prepared.grit.sc.seed)} | {stage} | event planning",
+        len(graph_ids),
+        unit="graphs",
+        enabled=bool(config.execution.verbose_progress),
+        updates=int(config.execution.progress_updates),
+    )
+    for graph_id in graph_ids:
         base = prepared.grit.eval_ds[int(graph_id)]
         sources = sample_sources(
             int(base.num_nodes),
@@ -576,6 +614,7 @@ def _stage_plan(
                 f"the graph is dropped from stage {stage!r}",
                 context={"stage": stage, "graph": int(graph_id)},
             )
+            tracker.advance(1, detail=f"graph={int(graph_id)} dropped")
             continue
         for channel in CHANNELS:
             entry[channel] = {
@@ -587,6 +626,15 @@ def _stage_plan(
                 ),
             }
         plan[int(graph_id)] = entry
+        tracker.advance(
+            1,
+            detail=(
+                f"graph={int(graph_id)}, semantic_events="
+                f"{len(entry['semantic']['records'])}, structural_events="
+                f"{len(entry['structural']['records'])}"
+            ),
+        )
+    tracker.finish()
     if not plan:
         # Nothing is estimable anywhere, so no stage quantity exists to report on.
         raise RuntimeError(
@@ -710,6 +758,8 @@ def _prepare_clean_jacobians(
     prepared: PreparedTask,
     config: MethodologyConfig,
     graph_ids: Sequence[int],
+    *,
+    phase: str,
 ) -> tuple[dict[int, Any], dict[str, Any]]:
     """Batch clean linearisations and return graph-keyed results plus execution provenance."""
 
@@ -736,6 +786,11 @@ def _prepare_clean_jacobians(
         execute=execute,
         consume=consume,
         oom_backoff=config.execution.oom_backoff,
+        **progress_kwargs(
+            config,
+            f"{prepared.task.name}:seed{int(prepared.grit.sc.seed)} | "
+            f"{phase} | clean Jacobians",
+        ),
     )
     return clean_by_graph, dataclasses.asdict(report)
 
@@ -897,6 +952,12 @@ def run_scores(
             log(f"[cache] loaded canonical scores for {prepared.task.name}")
             return cached
     graph_ids = sorted(plan)
+    run_label = f"{prepared.task.name}:seed{int(prepared.grit.sc.seed)}"
+    log(
+        f"[scores] computing {len(graph_ids)} discovery graphs × "
+        f"{int(config.sizes.sources_per_graph)} sources × "
+        f"{int(config.sizes.donors_per_source)} donors for semantic and structural channels"
+    )
     axis = _distance_axis(prepared, graph_ids)
     output: dict[str, Any] = {
         "protocol_version": PROTOCOL_VERSION,
@@ -913,7 +974,7 @@ def run_scores(
     # The clean linearisation is channel-independent. Compute it once per graph and reuse it for
     # both semantic and structural events.
     clean_by_graph, clean_execution = _prepare_clean_jacobians(
-        prepared, config, graph_ids
+        prepared, config, graph_ids, phase="scores"
     )
     execution_reports: dict[str, Any] = {}
     for channel in CHANNELS:
@@ -952,6 +1013,11 @@ def run_scores(
             ),
             consume=consume_score_batch,
             oom_backoff=config.execution.oom_backoff,
+            **progress_kwargs(
+                config,
+                f"{prepared.task.name}:seed{int(prepared.grit.sc.seed)} | "
+                f"scores | {channel} donor-swap forwards",
+            ),
         )
         execution_reports[channel] = dataclasses.asdict(report)
         raw = np.stack([graph_scores[key] for key in graph_ids]).mean(axis=0)
@@ -987,6 +1053,9 @@ def run_scores(
             distance_observations[channel],
             config.bootstrap,
             graph_reduce=graph_distance_reduce,
+            **progress_kwargs(
+                config, f"{run_label} | scores | {channel} distance bootstrap"
+            ),
         )
         support_graphs, support_pairs = column_support(
             graph_support,
@@ -1174,10 +1243,16 @@ def run_scores(
 
     if paired:
         output["intervals"] = nested_percentile_interval(
-            paired, config.bootstrap, transform=transform
+            paired,
+            config.bootstrap,
+            transform=transform,
+            **progress_kwargs(
+                config, f"{run_label} | scores | head-coordinate bootstrap"
+            ),
         )
     cache.save("scores", "raw", output)
     cache.save_audit("scores_manifest", plan)
+    log(f"[cache] saved canonical scores for {run_label}")
     return output
 
 
@@ -1368,9 +1443,15 @@ def run_carriage(
         "channels": {},
     }
     graph_ids = sorted(plan)
+    run_label = f"{prepared.task.name}:seed{int(prepared.grit.sc.seed)}"
+    log(
+        f"[carriage] computing {len(graph_ids)} discovery graphs × "
+        f"{int(config.sizes.sources_per_graph)} sources × "
+        f"{int(config.sizes.donors_per_source)} donors for semantic and structural channels"
+    )
     # Reuse the same clean z-space linearisation for both intervention channels.
     clean_by_graph, clean_execution = _prepare_clean_jacobians(
-        prepared, config, graph_ids
+        prepared, config, graph_ids, phase="carriage"
     )
     execution_reports: dict[str, Any] = {}
     for channel in CHANNELS:
@@ -1401,6 +1482,11 @@ def run_carriage(
             ),
             consume=consume_carriage_batch,
             oom_backoff=config.execution.oom_backoff,
+            **progress_kwargs(
+                config,
+                f"{prepared.task.name}:seed{int(prepared.grit.sc.seed)} | "
+                f"carriage | {channel} donor-swap forwards",
+            ),
         )
         execution_reports[channel] = dataclasses.asdict(report)
         capped_fraction = float(capped / paths) if paths else 0.0
@@ -1480,7 +1566,11 @@ def run_carriage(
                         )
                     )
         additive_interval = nested_percentile_interval(
-            additive_observations, config.bootstrap
+            additive_observations,
+            config.bootstrap,
+            **progress_kwargs(
+                config, f"{run_label} | carriage | {channel} additive bootstrap"
+            ),
         )
         bin_count = len(bins)
         output["channels"][channel] = {
@@ -1510,6 +1600,7 @@ def run_carriage(
     }
     cache.save("carriage", "fields", output)
     cache.save_audit("carriage_manifest", plan)
+    log(f"[cache] saved canonical carriage for {run_label}")
     return output
 
 
@@ -1566,6 +1657,7 @@ def _display_distance(
     display: DisplayAxis,
     *,
     seed: int,
+    progress_label: str | None = None,
 ) -> dict[str, Any] | None:
     """Every distance quantity a figure needs, on the grouped display axis.
 
@@ -1626,6 +1718,11 @@ def _display_distance(
             ],
             config.bootstrap,
             graph_reduce=distance_profile_reduce,
+            **(
+                progress_kwargs(config, progress_label)
+                if progress_label is not None
+                else {}
+            ),
         )
     estimable = getattr(interval, "estimable_draws", None)
     # Exact mass is additive, so a widened group would draw as a resurgence; report it per unit
@@ -1694,6 +1791,8 @@ def _carriage_profile(
     rows: Sequence[Mapping[str, Any]],
     field: str,
     config: MethodologyConfig,
+    *,
+    progress_label: str | None = None,
 ) -> tuple[list[str], np.ndarray, tuple[np.ndarray, np.ndarray]]:
     finite_distances = [int(row["distance"]) for row in rows if np.isfinite(row["distance"])]
     maximum = max(finite_distances, default=0)
@@ -1719,7 +1818,14 @@ def _carriage_profile(
         lambda row, kind=kind: str(row.get("carrier_kind")) == kind
         for kind in special_kinds
     )
-    for select in selectors:
+    tracker = ProgressTracker(
+        progress_label or "carriage profile",
+        len(selectors),
+        unit="distance bins",
+        enabled=bool(progress_label) and bool(config.execution.verbose_progress),
+        updates=int(config.execution.progress_updates),
+    )
+    for position, select in enumerate(selectors):
         selected = [row for row in rows if select(row)]
         graph_ids = {int(row["graph_id"]) for row in selected}
         pairs = {
@@ -1733,6 +1839,7 @@ def _carriage_profile(
             estimates.append(np.nan)
             lows.append(np.nan)
             highs.append(np.nan)
+            tracker.advance(1, detail=f"bin={labels[position]} suppressed")
             continue
         grouped: dict[tuple[int, int, int, int], list[float]] = {}
         for row in selected:
@@ -1768,6 +1875,8 @@ def _carriage_profile(
         estimates.append(float(interval.estimate))
         lows.append(float(interval.low))
         highs.append(float(interval.high))
+        tracker.advance(1, detail=f"bin={labels[position]}")
+    tracker.finish()
     return labels, np.asarray(estimates), (np.asarray(lows), np.asarray(highs))
 
 
@@ -1798,6 +1907,7 @@ def make_figures(
         },
     )
     saved: dict[str, list[str]] = {}
+    run_label = f"{prepared.task.name}:seed{int(prepared.grit.sc.seed)}"
     plot_data = _coordinate_plot_data(scores, int(prepared.grit.sc.seed))
     fig, axes = score_plane(plot_data, title=prepared.task.title, theme=theme)
     paths = builder.save(
@@ -1819,7 +1929,11 @@ def make_figures(
     for channel in CHANNELS:
         channel_scores = scores["channels"][channel]
         support = _display_distance(
-            channel_scores, config, display, seed=int(prepared.grit.sc.seed)
+            channel_scores,
+            config,
+            display,
+            seed=int(prepared.grit.sc.seed),
+            progress_label=f"{run_label} | figures | {channel} distance bootstrap",
         )
         labels = display.labels
         # The registered reporting floor is applied at presentation time only: cached measurements
@@ -1952,9 +2066,21 @@ def make_figures(
         if carriage is not None:
             rows = carriage["channels"][channel]["pairs"]
             labels, functional, functional_interval = _carriage_profile(
-                rows, "F_sens", config
+                rows,
+                "F_sens",
+                config,
+                progress_label=(
+                    f"{run_label} | figures | {channel} Functional carriage bins"
+                ),
             )
-            _, beneficial, beneficial_interval = _carriage_profile(rows, "B", config)
+            _, beneficial, beneficial_interval = _carriage_profile(
+                rows,
+                "B",
+                config,
+                progress_label=(
+                    f"{run_label} | figures | {channel} Beneficial carriage bins"
+                ),
+            )
             fig, axes = carriage_profiles(
                 labels,
                 functional,
@@ -2406,30 +2532,38 @@ def make_figures(
 def run_prepared(prepared: PreparedTask, config: MethodologyConfig) -> dict[str, Any]:
     set_strict(bool(config.strict_audits))
     key = f"{prepared.task.name}:seed{int(prepared.grit.sc.seed)}"
+    stage_options = {
+        "enabled": bool(config.execution.verbose_progress),
+        "heartbeat_seconds": float(config.execution.heartbeat_seconds),
+    }
     with audit_scope(key) as scope:
-        score_plan = _stage_plan(prepared, config, "scores")
-        scores = run_scores(prepared, config, plan=score_plan) if (
-            {"scores", "causal", "figures"} & set(config.phases)
-        ) else None
-        carriage = (
-            run_carriage(prepared, config)
-            if "carriage" in config.phases or "figures" in config.phases
-            else None
-        )
+        scores = None
+        if {"scores", "causal", "figures"} & set(config.phases):
+            with timed_stage(f"{key} | scores", **stage_options):
+                score_plan = _stage_plan(prepared, config, "scores")
+                scores = run_scores(prepared, config, plan=score_plan)
+        carriage = None
+        if "carriage" in config.phases or "figures" in config.phases:
+            with timed_stage(f"{key} | carriage", **stage_options):
+                carriage = run_carriage(prepared, config)
         causal = None
         if "causal" in config.phases:
             from .validation import run_causal_validation
 
-            causal = run_causal_validation(prepared, config, scores)
+            with timed_stage(f"{key} | causal validation", **stage_options):
+                causal = run_causal_validation(prepared, config, scores)
         elif "figures" in config.phases:
             from .validation import load_cached_causal_validation
 
             causal = load_cached_causal_validation(prepared, config, scores)
-        figures = (
-            make_figures(prepared, config, scores, carriage, causal)
-            if "figures" in config.phases
-            else None
-        )
+            log(
+                f"[cache] causal validation for figures is "
+                f"{'available' if causal is not None else 'not available'}"
+            )
+        figures = None
+        if "figures" in config.phases:
+            with timed_stage(f"{key} | figures", **stage_options):
+                figures = make_figures(prepared, config, scores, carriage, causal)
     findings = log_summary(scope, header=f"{key} analysis audits")
     atomic_json(
         prepared.output_dir / "audits.json",
@@ -2466,18 +2600,48 @@ def run_methodology(
     protocol_record = config.record()
     protocol_record["repository_commit"] = _repository_commit()
     atomic_json(config.root / "protocol.json", protocol_record)
+    run_keys = [
+        f"{task}:seed{int(seed)}"
+        for task in config.tasks
+        for seed in config.seeds_for(task)
+    ]
+    log(
+        "[canonical] starting methodology\n"
+        f"[canonical] runs={len(run_keys)} | {', '.join(run_keys)}\n"
+        f"[canonical] phases={','.join(config.phases)} | output={config.root}\n"
+        f"[canonical] resume={bool(config.resume)} | force={bool(config.force)} | "
+        f"graphs_per_batch={int(config.execution.graphs_per_batch)} | "
+        f"progress_updates={int(config.execution.progress_updates)} | "
+        f"heartbeat={float(config.execution.heartbeat_seconds):g}s"
+    )
     results: dict[str, Any] = {}
     run_findings: dict[str, list[dict[str, Any]]] = {}
+    run_progress = ProgressTracker(
+        "canonical methodology",
+        len(run_keys),
+        unit="task-seed runs",
+        enabled=bool(config.execution.verbose_progress),
+        updates=int(config.execution.progress_updates),
+    )
+    stage_options = {
+        "enabled": bool(config.execution.verbose_progress),
+        "heartbeat_seconds": float(config.execution.heartbeat_seconds),
+    }
     for task_name in config.tasks:
         for train_seed in config.seeds_for(task_name):
             key = f"{task_name}:seed{int(train_seed)}"
             log(f"\n[canonical] {key}")
             with audit_scope(key) as scope:
-                prepared = prepare_task(
-                    config, task_name, int(train_seed), force_fresh_grit=force_fresh_grit
-                )
+                with timed_stage(f"{key} | prepare model and data", **stage_options):
+                    prepared = prepare_task(
+                        config,
+                        task_name,
+                        int(train_seed),
+                        force_fresh_grit=force_fresh_grit,
+                    )
                 results[key] = run_prepared(prepared, config)
             run_findings[key] = scope.records()
+            run_progress.advance(1, detail=key)
             del prepared
             gc.collect()
             try:
@@ -2487,6 +2651,7 @@ def run_methodology(
                     torch.cuda.empty_cache()
             except ImportError:
                 pass
+    run_progress.finish()
     population: dict[str, Any] = {}
     for task_name in config.tasks:
         task_results = [
@@ -2612,4 +2777,8 @@ def run_methodology(
             "[audit] soft audit failures were recorded for "
             f"{', '.join(failed)}; see {config.root / 'audits.json'}"
         )
+    log(
+        f"[canonical] complete | runs={len(results)} | "
+        f"index={config.root / 'index.json'}"
+    )
     return results

@@ -45,6 +45,10 @@ EXECUTION = {
     # Runtime-only: increase on large GPUs; CUDA OOM automatically retries smaller groups.
     "graphs_per_batch": 4,
     "oom_backoff": True,
+    # Flush-safe progress, ETA, throughput, CUDA memory, and long-operation heartbeats.
+    "verbose_progress": True,
+    "progress_updates": 20,
+    "heartbeat_seconds": 60,
 }
 
 from google.colab import drive, userdata  # noqa: E402

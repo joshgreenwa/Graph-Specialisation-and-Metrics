@@ -10,6 +10,7 @@ from typing import Any, Callable, Mapping, Sequence
 
 import numpy as np
 
+from ..carriage.env import log
 from .cache import atomic_json
 from .scores import (
     JOINT_AXIS_LABEL,
@@ -883,6 +884,10 @@ class FigureBuilder:
         metadata: Mapping[str, Any],
     ) -> tuple[Path, ...]:
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        log(
+            f"[figures] rendering {name} | formats={','.join(self.theme.formats)} | "
+            f"output={self.output_dir}"
+        )
         if self.modifier is not None:
             self.modifier(name, fig, axes)
         paths: list[Path] = []
@@ -910,4 +915,8 @@ class FigureBuilder:
         import matplotlib.pyplot as plt
 
         plt.close(fig)
+        log(
+            f"[figures] saved {name} | "
+            + ", ".join(str(path) for path in paths)
+        )
         return tuple(paths)

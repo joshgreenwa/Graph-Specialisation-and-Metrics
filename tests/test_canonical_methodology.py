@@ -72,6 +72,10 @@ from graph_specialisation_metrics.methodology.protocol import (
     RunSizes,
     deterministic_splits,
 )
+from graph_specialisation_metrics.methodology.progress import (
+    ProgressTracker,
+    format_duration,
+)
 from graph_specialisation_metrics.methodology.sampling import (
     SemanticDonorPool,
     draw_structural_donors,
@@ -180,7 +184,21 @@ def test_numerical_audits_are_soft_by_default_and_strict_on_request():
     assert config.record()["execution"] == {
         "graphs_per_batch": 4,
         "oom_backoff": True,
+        "verbose_progress": True,
+        "progress_updates": 20,
+        "heartbeat_seconds": 60.0,
     }
+    quiet = dataclasses.replace(
+        config,
+        execution=ExecutionPolicy(
+            graphs_per_batch=32,
+            oom_backoff=False,
+            verbose_progress=False,
+            progress_updates=7,
+            heartbeat_seconds=0,
+        ),
+    )
+    assert config.fingerprint == quiet.fingerprint
 
     with audit_scope("test") as scope:
         assert audit.audit_check(True, "test.pass", "never recorded")
@@ -245,6 +263,27 @@ def test_graph_batch_executor_does_not_hide_non_oom_errors():
             consume=lambda _result: None,
             oom_backoff=True,
         )
+
+
+def test_progress_tracker_reports_bounded_progress_and_eta(monkeypatch):
+    messages = []
+    monkeypatch.setattr(
+        "graph_specialisation_metrics.methodology.progress.log",
+        messages.append,
+    )
+    tracker = ProgressTracker("unit operation", 4, unit="graphs", updates=2)
+    for index in range(4):
+        tracker.advance(detail=f"graph={index}")
+    tracker.finish()
+
+    assert format_duration(65) == "01:05"
+    assert format_duration(3661) == "1:01:01"
+    assert messages[0].startswith("[progress] START unit operation | 4 graphs")
+    updates = [message for message in messages if "elapsed" in message]
+    assert len(updates) == 2
+    assert "2/4 graphs (50.0%)" in updates[0]
+    assert "ETA " in updates[0]
+    assert "4/4 graphs (100.0%)" in updates[-1]
 
 
 def test_grit_grouped_capture_matches_individual_variable_size_groups():

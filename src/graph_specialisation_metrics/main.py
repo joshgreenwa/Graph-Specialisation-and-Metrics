@@ -34,6 +34,9 @@ def cli() -> None:
     parser.add_argument("--accelerator", default="cuda:0")
     parser.add_argument("--graphs-per-batch", type=int, default=4)
     parser.add_argument("--no-oom-backoff", action="store_true")
+    parser.add_argument("--quiet-progress", action="store_true")
+    parser.add_argument("--progress-updates", type=int, default=20)
+    parser.add_argument("--heartbeat-seconds", type=float, default=60.0)
     parser.add_argument("--checkpoint", action="append", default=[])
     parser.add_argument("--skip-install", action="store_true")
     parser.add_argument("--force", action="store_true")
@@ -53,6 +56,9 @@ def cli() -> None:
         execution=ExecutionPolicy(
             graphs_per_batch=args.graphs_per_batch,
             oom_backoff=not args.no_oom_backoff,
+            verbose_progress=not args.quiet_progress,
+            progress_updates=args.progress_updates,
+            heartbeat_seconds=args.heartbeat_seconds,
         ),
         checkpoints=checkpoints,
         skip_install=args.skip_install,
