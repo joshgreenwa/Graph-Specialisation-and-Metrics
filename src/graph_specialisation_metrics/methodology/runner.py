@@ -32,6 +32,7 @@ from .cache import (
     CanonicalCache,
     atomic_json,
     checkpoint_sha256,
+    load_cache_artifact_file,
     load_cache_value_file,
 )
 from .carriage import (
@@ -3233,53 +3234,89 @@ def run_prepared(prepared: PreparedTask, config: MethodologyConfig) -> dict[str,
     }
 
 
-def run_methodology(
+def _release_runtime_memory() -> None:
+    gc.collect()
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except ImportError:
+        pass
+
+
+def run_worker(
     config: MethodologyConfig,
+    task_name: str,
+    train_seed: int,
     *,
     force_fresh_grit: bool = False,
 ) -> dict[str, Any]:
-    """Public non-Colab entry point."""
+    """Run one isolated task/seed without writing shared task/root summaries."""
 
     config.validate()
+    if task_name not in config.tasks:
+        raise ValueError(f"worker task {task_name!r} is not registered in this run")
+    if int(train_seed) not in config.seeds_for(task_name):
+        raise ValueError(
+            f"worker seed {int(train_seed)} is not registered for {task_name!r}"
+        )
+    if "figures" in config.phases:
+        raise ValueError(
+            "worker phases must omit figures; use the dependency-gated figures-only "
+            "finalizer after every seed worker completes"
+        )
     set_strict(bool(config.strict_audits))
+    key = f"{task_name}:seed{int(train_seed)}"
+    output_dir = config.root / task_name / f"seed_{int(train_seed)}"
     protocol_record = config.record()
-    protocol_record["repository_commit"] = _repository_commit()
-    atomic_json(config.root / "protocol.json", protocol_record)
-    results: dict[str, Any] = {}
-    run_findings: dict[str, list[dict[str, Any]]] = {}
-    for task_name in config.tasks:
-        for train_seed in config.seeds_for(task_name):
-            key = f"{task_name}:seed{int(train_seed)}"
-            log(f"\n[canonical] {key}")
-            with audit_scope(key) as scope:
-                prepared = prepare_task(
-                    config, task_name, int(train_seed), force_fresh_grit=force_fresh_grit
-                )
-                results[key] = run_prepared(prepared, config)
-            run_findings[key] = scope.records()
-            results[key]["audit_findings"] = run_findings[key]
-            results[key]["headline_eligible"] = not bool(run_findings[key])
-            atomic_json(
-                Path(results[key]["output_dir"]) / "audits.json",
-                {
-                    "protocol_version": PROTOCOL_VERSION,
-                    "task": task_name,
-                    "train_seed": int(train_seed),
-                    "strict_audits": bool(config.strict_audits),
-                    "phases": list(config.phases),
-                    "findings": run_findings[key],
-                    "headline_eligible": not bool(run_findings[key]),
-                },
-            )
-            del prepared
-            gc.collect()
-            try:
-                import torch
+    protocol_record.update(
+        {
+            "repository_commit": _repository_commit(),
+            "execution_mode": "isolated-seed-worker",
+            "worker_task": task_name,
+            "worker_seed": int(train_seed),
+        }
+    )
+    atomic_json(output_dir / "protocol.json", protocol_record)
+    log(f"\n[canonical-worker] {key}")
+    with audit_scope(key) as scope:
+        prepared = prepare_task(
+            config,
+            task_name,
+            int(train_seed),
+            force_fresh_grit=force_fresh_grit,
+        )
+        result = run_prepared(prepared, config)
+    findings = scope.records()
+    result["audit_findings"] = findings
+    result["headline_eligible"] = not bool(findings)
+    atomic_json(
+        output_dir / "audits.json",
+        {
+            "protocol_version": PROTOCOL_VERSION,
+            "task": task_name,
+            "train_seed": int(train_seed),
+            "strict_audits": bool(config.strict_audits),
+            "phases": list(config.phases),
+            "findings": findings,
+            "headline_eligible": not bool(findings),
+        },
+    )
+    del prepared
+    _release_runtime_memory()
+    return result
 
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-            except ImportError:
-                pass
+
+def _write_run_summaries(
+    config: MethodologyConfig,
+    results: Mapping[str, Mapping[str, Any]],
+    run_findings: Mapping[str, Sequence[Mapping[str, Any]]],
+    *,
+    require_complete: bool = False,
+) -> dict[str, Any]:
+    """Write the task-population and root summaries from a complete result set."""
+
     population: dict[str, Any] = {}
     for task_name in config.tasks:
         task_results = [
@@ -3300,9 +3337,7 @@ def run_methodology(
                     np.mean(scores["channels"]["structural"]["raw"])
                 ),
                 "median_active_selectivity": float(
-                    np.median(
-                        coordinates.selectivity[coordinates.active]
-                    )
+                    np.median(coordinates.selectivity[coordinates.active])
                     if coordinates.active.any()
                     else np.nan
                 ),
@@ -3330,7 +3365,18 @@ def run_methodology(
                         )
             seed_rows.append(row)
         if not seed_rows:
+            if require_complete:
+                raise RuntimeError(
+                    f"cannot finalize {task_name}: no seed score summaries were loaded"
+                )
             continue
+        expected_seeds = sorted(config.seeds_for(task_name))
+        observed_seeds = sorted(int(row["seed"]) for row in seed_rows)
+        if require_complete and observed_seeds != expected_seeds:
+            raise RuntimeError(
+                f"cannot finalize {task_name}: expected seed summaries "
+                f"{expected_seeds}, observed {observed_seeds}"
+            )
         numeric_keys = [
             key
             for key in seed_rows[0]
@@ -3406,6 +3452,50 @@ def run_methodology(
             "[audit] soft audit failures were recorded for "
             f"{', '.join(failed)}; see {config.root / 'audits.json'}"
         )
+    return population
+
+
+def run_methodology(
+    config: MethodologyConfig,
+    *,
+    force_fresh_grit: bool = False,
+) -> dict[str, Any]:
+    """Public non-Colab entry point."""
+
+    config.validate()
+    set_strict(bool(config.strict_audits))
+    protocol_record = config.record()
+    protocol_record["repository_commit"] = _repository_commit()
+    atomic_json(config.root / "protocol.json", protocol_record)
+    results: dict[str, Any] = {}
+    run_findings: dict[str, list[dict[str, Any]]] = {}
+    for task_name in config.tasks:
+        for train_seed in config.seeds_for(task_name):
+            key = f"{task_name}:seed{int(train_seed)}"
+            log(f"\n[canonical] {key}")
+            with audit_scope(key) as scope:
+                prepared = prepare_task(
+                    config, task_name, int(train_seed), force_fresh_grit=force_fresh_grit
+                )
+                results[key] = run_prepared(prepared, config)
+            run_findings[key] = scope.records()
+            results[key]["audit_findings"] = run_findings[key]
+            results[key]["headline_eligible"] = not bool(run_findings[key])
+            atomic_json(
+                Path(results[key]["output_dir"]) / "audits.json",
+                {
+                    "protocol_version": PROTOCOL_VERSION,
+                    "task": task_name,
+                    "train_seed": int(train_seed),
+                    "strict_audits": bool(config.strict_audits),
+                    "phases": list(config.phases),
+                    "findings": run_findings[key],
+                    "headline_eligible": not bool(run_findings[key]),
+                },
+            )
+            del prepared
+            _release_runtime_memory()
+    _write_run_summaries(config, results, run_findings)
     return results
 
 
@@ -3458,3 +3548,91 @@ def render_cached_figures(
         progress=None,
     )
     return make_figures(prepared, config, scores, carriage, causal)
+
+
+def finalize_cached_run(config: MethodologyConfig) -> dict[str, Any]:
+    """Render every seed and write shared summaries exactly once from immutable caches."""
+
+    import json
+
+    config.validate()
+    if tuple(config.phases) != ("figures",):
+        raise ValueError("cached finalization requires phases=('figures',)")
+    results: dict[str, Any] = {}
+    run_findings: dict[str, list[dict[str, Any]]] = {}
+    artifact_commits: set[str] = set()
+    artifact_fingerprints: dict[str, dict[str, str]] = {}
+    for task_name in config.tasks:
+        for train_seed in config.seeds_for(task_name):
+            key = f"{task_name}:seed{int(train_seed)}"
+            output_dir = config.root / task_name / f"seed_{int(train_seed)}"
+            required = {
+                "scores": output_dir / "cache" / "scores" / "raw.pt",
+                "carriage": output_dir / "cache" / "carriage" / "fields.pt",
+                "causal": output_dir / "cache" / "causal" / "validation.pt",
+            }
+            artifacts = {
+                name: load_cache_artifact_file(path)
+                for name, path in required.items()
+            }
+            artifact_fingerprints[key] = {}
+            for name, artifact in artifacts.items():
+                contract = artifact.metadata["contract"]
+                if contract.get("task") != task_name or int(
+                    contract.get("train_seed", -1)
+                ) != int(train_seed):
+                    raise RuntimeError(
+                        f"{artifact.path} is not the registered {key} {name} cache"
+                    )
+                if contract.get("protocol_fingerprint") != config.fingerprint:
+                    raise RuntimeError(
+                        f"{artifact.path} was produced under another scientific "
+                        "configuration; use the matching worker/finalizer arguments"
+                    )
+                artifact_commits.add(str(contract.get("repository_commit", "unknown")))
+                artifact_fingerprints[key][name] = str(
+                    artifact.metadata["contract_fingerprint"]
+                )
+            audit_path = output_dir / "audits.json"
+            if not audit_path.exists():
+                raise FileNotFoundError(
+                    f"cached finalization requires worker audit {audit_path}"
+                )
+            audit_record = json.loads(audit_path.read_text(encoding="utf-8"))
+            findings = list(audit_record.get("findings", ()))
+            log(f"[finalize] rendering {key}")
+            figures = render_cached_figures(config, task_name, int(train_seed))
+            results[key] = {
+                "task": task_name,
+                "seed": int(train_seed),
+                "output_dir": str(output_dir),
+                "scores": artifacts["scores"].value,
+                "carriage": artifacts["carriage"].value,
+                "causal": artifacts["causal"].value,
+                "figures": figures,
+                "audit_findings": findings,
+                "headline_eligible": not bool(findings),
+            }
+            run_findings[key] = findings
+    if len(artifact_commits) != 1:
+        raise RuntimeError(
+            "cannot finalize caches produced by different repository commits: "
+            f"{sorted(artifact_commits)}"
+        )
+    protocol_record = config.record()
+    protocol_record.update(
+        {
+            "repository_commit": _repository_commit(),
+            "execution_mode": "model-free-cache-finalizer",
+            "source_repository_commit": next(iter(artifact_commits)),
+            "source_cache_contract_fingerprints": artifact_fingerprints,
+        }
+    )
+    atomic_json(config.root / "protocol.json", protocol_record)
+    _write_run_summaries(
+        config,
+        results,
+        run_findings,
+        require_complete=True,
+    )
+    return results

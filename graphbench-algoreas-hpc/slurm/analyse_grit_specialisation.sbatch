@@ -1,12 +1,12 @@
 #!/bin/bash
-#SBATCH --job-name=gb-grit-spec
+#SBATCH --job-name=gb-grit-worker
 #SBATCH --gres=gpu:a100:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=128G
 #SBATCH --time=36:00:00
-#SBATCH --array=0-1%1
-#SBATCH --output=logs/gb-grit-spec-%A-%a.out
-#SBATCH --error=logs/gb-grit-spec-%A-%a.err
+#SBATCH --array=0-3%1
+#SBATCH --output=logs/%x-%A-%a.out
+#SBATCH --error=logs/%x-%A-%a.err
 
 set -euo pipefail
 
@@ -24,15 +24,26 @@ if [[ -n "${ENV_ACTIVATE:-}" ]]; then
   source "${ENV_ACTIVATE}"
 fi
 
-TASKS=(bipartite_matching_hard flow_hard)
-TASK="${TASKS[${SLURM_ARRAY_TASK_ID}]}"
+ANALYSIS_TASK="${ANALYSIS_TASK:?Set ANALYSIS_TASK to bipartite_matching_hard or flow_hard}"
+case "${ANALYSIS_TASK}" in
+  bipartite_matching_hard|flow_hard) ;;
+  *) echo "Unsupported ANALYSIS_TASK=${ANALYSIS_TASK}" >&2; exit 2 ;;
+esac
+IFS=',' read -r -a SEED_VALUES <<< "${SEEDS:-0,1,2,3}"
+if (( SLURM_ARRAY_TASK_ID >= ${#SEED_VALUES[@]} )); then
+  echo "Array index ${SLURM_ARRAY_TASK_ID} exceeds SEEDS=${SEEDS:-0,1,2,3}" >&2
+  exit 2
+fi
+SEED="${SEED_VALUES[${SLURM_ARRAY_TASK_ID}]}"
 
 python graphbench-algoreas-hpc/bin/check_official_backends.py --models grit
 
 python graphbench-algoreas-hpc/bin/grit_specialisation.py \
-  --tasks "${TASK}" \
+  --tasks bipartite_matching_hard,flow_hard \
   --seeds "${SEEDS:-0,1,2,3}" \
-  --phases "${PHASES:-scores,causal,carriage,figures}" \
+  --worker-task "${ANALYSIS_TASK}" \
+  --worker-seed "${SEED}" \
+  --phases "${PHASES:-scores,causal,carriage}" \
   --profile "${PROFILE:-production}" \
   --training-output-root "${GRAPHBENCH_TRAINING_OUTPUT_ROOT}" \
   --analysis-output-root "${GRAPHBENCH_ANALYSIS_OUTPUT_ROOT}" \

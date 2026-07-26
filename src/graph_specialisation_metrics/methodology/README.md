@@ -121,6 +121,13 @@ all head and family targets.
 `jacobian_output_chunk` batched VJPs. These controls, OOM backoff, and heartbeat frequency are
 execution-only and never enter the scientific fingerprint.
 
+Independent HPC processes should call `run_worker` with the same complete multi-task/multi-seed
+configuration and one selected task/seed. A worker writes only its `seed_<training-seed>` subtree;
+it never writes shared task or root summaries. After every worker succeeds,
+`finalize_cached_run` performs a model-free completeness and cache-contract check, renders every
+seed, and becomes the sole writer of `population.json`, `protocol.json`, `audits.json`, and
+`index.json`. This worker/finalizer boundary is required when seeds share an output root.
+
 To add a future Graphormer dataset such as ZINC, register a `CanonicalTask` with
 `backend_kind="graphormer"` and a `GraphormerTaskSpec`, then register its dataset builder with
 `register_graphormer_dataset`. The builder returns evaluation and donor split views containing

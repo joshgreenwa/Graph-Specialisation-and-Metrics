@@ -1,16 +1,18 @@
 #!/bin/bash
-#SBATCH --job-name=gb-grit-fig
+#SBATCH --job-name=gb-grit-finalize
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=32G
 #SBATCH --time=02:00:00
-#SBATCH --array=0-1%1
-#SBATCH --output=logs/gb-grit-fig-%A-%a.out
-#SBATCH --error=logs/gb-grit-fig-%A-%a.err
+#SBATCH --output=logs/%x-%j.out
+#SBATCH --error=logs/%x-%j.err
 
 set -euo pipefail
 
 PROJECT_ROOT="${PROJECT_ROOT:-/rds/user/jgg45/hpc-work/Graph-Specialisation-and-Metrics}"
 GRAPHBENCH_ANALYSIS_OUTPUT_ROOT="${GRAPHBENCH_ANALYSIS_OUTPUT_ROOT:-/rds/user/jgg45/hpc-work/graphbench-algoreas/outputs/grit_specialisation_graphbench_edge_v1}"
+GRAPHBENCH_DATASET_ROOT="${GRAPHBENCH_DATASET_ROOT:-/rds/user/jgg45/hpc-work/graphbench-algoreas/datasets}"
+GRAPHBENCH_PE_CACHE_ROOT="${GRAPHBENCH_PE_CACHE_ROOT:-/rds/user/jgg45/hpc-work/graphbench-algoreas/pe_cache}"
+GRAPHBENCH_TRAINING_OUTPUT_ROOT="${GRAPHBENCH_TRAINING_OUTPUT_ROOT:-/rds/user/jgg45/hpc-work/graphbench-algoreas/outputs/graphbench_algoreas_hpc_base_v1}"
 
 cd "${PROJECT_ROOT}"
 mkdir -p graphbench-algoreas-hpc/logs
@@ -20,14 +22,15 @@ if [[ -n "${ENV_ACTIVATE:-}" ]]; then
   source "${ENV_ACTIVATE}"
 fi
 
-TASKS=(bipartite_matching_hard flow_hard)
-TASK="${TASKS[${SLURM_ARRAY_TASK_ID}]}"
-
 python graphbench-algoreas-hpc/bin/grit_specialisation.py \
-  --tasks "${TASK}" \
+  --tasks bipartite_matching_hard,flow_hard \
   --seeds "${SEEDS:-0,1,2,3}" \
   --phases figures \
   --profile "${PROFILE:-production}" \
   --analysis-output-root "${GRAPHBENCH_ANALYSIS_OUTPUT_ROOT}" \
+  --training-output-root "${GRAPHBENCH_TRAINING_OUTPUT_ROOT}" \
+  --dataset-root "${GRAPHBENCH_DATASET_ROOT}" \
+  --pe-cache-root "${GRAPHBENCH_PE_CACHE_ROOT}" \
+  --pe-cache-namespace base_40k4k4k_n64 \
   --accelerator cpu \
   "$@"

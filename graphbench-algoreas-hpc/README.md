@@ -194,7 +194,7 @@ channel, 8 donors per source, and 2,000 bootstrap draws. All 16 structural node 
 enumerated on the primary `n=16` validation split, so structural-source resampling is disabled;
 semantic edge sources are sampled when more than 16 are eligible.
 
-Run locally on an HPC node:
+Run all models sequentially in one process:
 
 ```bash
 python graphbench-algoreas-hpc/bin/grit_specialisation.py \
@@ -203,13 +203,24 @@ python graphbench-algoreas-hpc/bin/grit_specialisation.py \
   --profile production
 ```
 
-Or submit one task at a time:
+For HPC production, use isolated task/seed GPU workers and one CPU finalizer:
 
 ```bash
-sbatch -A mlmi-jgg45-sl2-gpu -p ampere --qos=gpu1 \
-  --export=ALL,ENV_ACTIVATE=/path/to/activate_graphbench_algoreas \
-  graphbench-algoreas-hpc/slurm/analyse_grit_specialisation.sbatch
+cd /rds/user/jgg45/hpc-work/Graph-Specialisation-and-Metrics
+
+ENV_ACTIVATE=$PWD/graphbench-algoreas-hpc/activate_graphbench_algoreas \
+PROFILE=production \
+MAX_PARALLEL=1 \
+bash graphbench-algoreas-hpc/bin/submit_grit_specialisation.sh
 ```
+
+This submits separate four-seed arrays for matching and flow. Set `MAX_PARALLEL=4` only when the
+GPU allocation permits four simultaneous seeds per task; the recorded `gpu1` workflow uses
+`MAX_PARALLEL=1`. Each worker writes only
+`<analysis-root>/<task>/seed_<seed>/`, so workers never race on task or root summaries. One
+`afterok` CPU job verifies that all eight cache contracts came from the same scientific
+configuration and repository commit, renders every seed's figures, then writes both
+`population.json` files and the root `protocol.json`, `audits.json`, and `index.json`.
 
 Every long component writes atomic graph/target shards and a consolidated cache. Re-running the
 same command resumes missing work. `progress.jsonl` and stdout include the active
@@ -218,8 +229,8 @@ Numerical/no-op/attention/replay/completeness gates are soft by default and make
 `headline_eligible=false`; checkpoint geometry, event-manifest alignment, patch geometry, and
 cache corruption remain hard failures. Add `--strict-audits` for release verification.
 
-Figures can be regenerated on CPU without importing GRIT, loading a checkpoint, or reopening the
-dataset:
+The finalizer can be rerun manually on CPU without importing GRIT, loading a checkpoint, or
+reopening the dataset:
 
 ```bash
 python graphbench-algoreas-hpc/bin/grit_specialisation.py \
@@ -229,8 +240,9 @@ python graphbench-algoreas-hpc/bin/grit_specialisation.py \
   --accelerator cpu
 ```
 
-This consumes the consolidated score, carriage, and causal caches and overwrites only figure
-artifacts. The canonical figure suite contains the same six paper-facing views used by the mixed
-synthetic plan (specialisation plane, score/causal association, double-dissociation endpoints,
-cumulative family ablation, joint/selectivity validation, and family controls), plus the required
-distance, attention, support, and carriage diagnostics.
+This requires all eight consolidated score, carriage, and causal caches. It regenerates figure
+artifacts and atomically rebuilds the complete four-seed population and root indexes. The canonical
+figure suite contains the same six paper-facing views used by the mixed synthetic plan
+(specialisation plane, score/causal association, double-dissociation endpoints, cumulative family
+ablation, joint/selectivity validation, and family controls), plus the required distance,
+attention, support, and carriage diagnostics.

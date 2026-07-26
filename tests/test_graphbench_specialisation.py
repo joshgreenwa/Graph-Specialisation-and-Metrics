@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -31,8 +33,10 @@ from graph_specialisation_metrics.methodology.protocol import (
 from graph_specialisation_metrics.methodology.runner import (
     PreparedTask,
     _stage_plan,
+    finalize_cached_run,
     run_carriage,
     run_scores,
+    run_worker,
 )
 from graph_specialisation_metrics.methodology.tasks import get_task
 
@@ -536,3 +540,123 @@ def test_graphbench_score_and_carriage_components_resume_from_graph_shards(tmp_p
     resumed_carriage = run_carriage(prepared, config, plan=carriage_plan)
     assert resumed_scores["manifest_hash"] == scores["manifest_hash"]
     assert resumed_carriage["manifest_hash"] == carriage["manifest_hash"]
+
+
+def test_model_free_finalizer_owns_shared_four_seed_summaries(
+    tmp_path,
+    monkeypatch,
+):
+    tasks = (
+        "graphbench_bipartite_matching_hard",
+        "graphbench_flow_hard",
+    )
+    config = MethodologyConfig(
+        output_dir=str(tmp_path),
+        tasks=tasks,
+        train_seeds=(0, 1, 2, 3),
+        phases=("figures",),
+        accelerator="cpu",
+    )
+    for task in tasks:
+        for seed in config.train_seeds:
+            output = tmp_path / task / f"seed_{seed}"
+            output.mkdir(parents=True)
+            (output / "audits.json").write_text(
+                json.dumps({"findings": []}),
+                encoding="utf-8",
+            )
+
+    def artifact(path):
+        path = Path(path)
+        seed = int(path.parents[2].name.removeprefix("seed_"))
+        task = path.parents[3].name
+        stage = path.parent.name
+        if stage == "scores":
+            value = {
+                "channels": {
+                    "semantic": {"raw": np.full((1, 2), seed + 1.0)},
+                    "structural": {"raw": np.full((1, 2), seed + 2.0)},
+                },
+                "coordinates": SimpleNamespace(
+                    selectivity=np.asarray([[0.1, -0.1]]),
+                    active=np.asarray([[True, True]]),
+                ),
+            }
+        elif stage == "causal":
+            value = {"associations": {}}
+        else:
+            value = {}
+        return SimpleNamespace(
+            path=path,
+            metadata={
+                "contract": {
+                    "task": task,
+                    "train_seed": seed,
+                    "protocol_fingerprint": config.fingerprint,
+                    "repository_commit": "worker-commit",
+                },
+                "contract_fingerprint": f"{task}:{seed}:{stage}",
+            },
+            value=value,
+        )
+
+    rendered = []
+    monkeypatch.setattr(
+        "graph_specialisation_metrics.methodology.runner.load_cache_artifact_file",
+        artifact,
+    )
+    monkeypatch.setattr(
+        "graph_specialisation_metrics.methodology.runner.render_cached_figures",
+        lambda _config, task, seed: rendered.append((task, seed)) or {"ok": []},
+    )
+
+    results = finalize_cached_run(config)
+
+    assert len(results) == 8
+    assert len(rendered) == 8
+    assert len(json.loads((tmp_path / "index.json").read_text())["runs"]) == 8
+    for task in tasks:
+        population = json.loads(
+            (tmp_path / task / "population.json").read_text(encoding="utf-8")
+        )
+        assert [row["seed"] for row in population["seed_estimates"]] == [0, 1, 2, 3]
+        assert population["population_interval"]["level"] == "training seed"
+
+
+def test_seed_worker_writes_no_shared_root_or_task_summaries(tmp_path, monkeypatch):
+    task = "graphbench_bipartite_matching_hard"
+    config = MethodologyConfig(
+        output_dir=str(tmp_path),
+        tasks=(task, "graphbench_flow_hard"),
+        train_seeds=(0, 1, 2, 3),
+        phases=("scores",),
+        accelerator="cpu",
+    )
+    output = tmp_path / task / "seed_2"
+    prepared = SimpleNamespace()
+    monkeypatch.setattr(
+        "graph_specialisation_metrics.methodology.runner.prepare_task",
+        lambda *_args, **_kwargs: prepared,
+    )
+    monkeypatch.setattr(
+        "graph_specialisation_metrics.methodology.runner.run_prepared",
+        lambda *_args, **_kwargs: {
+            "task": task,
+            "seed": 2,
+            "output_dir": str(output),
+            "scores": {},
+            "carriage": None,
+            "causal": None,
+            "figures": None,
+            "audit_findings": [],
+            "headline_eligible": True,
+        },
+    )
+
+    run_worker(config, task, 2)
+
+    assert (output / "protocol.json").exists()
+    assert (output / "audits.json").exists()
+    assert not (tmp_path / "protocol.json").exists()
+    assert not (tmp_path / "index.json").exists()
+    assert not (tmp_path / task / "population.json").exists()

@@ -21,8 +21,9 @@ from graph_specialisation_metrics.methodology.protocol import (  # noqa: E402
     parse_csv,
 )
 from graph_specialisation_metrics.methodology.runner import (  # noqa: E402
-    render_cached_figures,
+    finalize_cached_run,
     run_methodology,
+    run_worker,
 )
 
 
@@ -67,7 +68,19 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument(
         "--phases",
         default="scores,causal,carriage,figures",
-        help="scores,causal,carriage,figures; figures alone is model-free/cache-only.",
+        help=(
+            "scores,causal,carriage,figures; figures alone is the model-free "
+            "all-seed finalizer."
+        ),
+    )
+    value.add_argument(
+        "--worker-task",
+        help="Run only this task without writing shared summaries (requires --worker-seed).",
+    )
+    value.add_argument(
+        "--worker-seed",
+        type=int,
+        help="Run only this seed without writing shared summaries (requires --worker-task).",
     )
     value.add_argument(
         "--profile",
@@ -181,11 +194,14 @@ def main(argv: Sequence[str] | None = None) -> None:
     args = parser().parse_args(argv)
     config = build_config(args)
     config.validate()
+    if (args.worker_task is None) != (args.worker_seed is None):
+        raise ValueError("--worker-task and --worker-seed must be supplied together")
+    if args.worker_task is not None:
+        worker_task = TASK_ALIASES.get(args.worker_task, args.worker_task)
+        run_worker(config, worker_task, int(args.worker_seed))
+        return
     if tuple(config.phases) == ("figures",):
-        for task in config.tasks:
-            for seed in config.seeds_for(task):
-                print(f"[figures-only] {task}:seed{seed}", flush=True)
-                render_cached_figures(config, task, seed)
+        finalize_cached_run(config)
         return
     run_methodology(config)
 
