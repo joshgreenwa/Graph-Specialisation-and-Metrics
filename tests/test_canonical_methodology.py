@@ -3,6 +3,7 @@ from __future__ import annotations
 import dataclasses
 import warnings
 from copy import deepcopy
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -17,11 +18,13 @@ from graph_specialisation_metrics.methodology.bootstrap import (
     reportable_bin,
     trimmed_mean,
 )
+from graph_specialisation_metrics.methodology.backend import CanonicalGritBackend
 from graph_specialisation_metrics.methodology.cache import (
     CacheContract,
     CanonicalCache,
     StaleCacheError,
 )
+from graph_specialisation_metrics.methodology.execution import execute_graph_batches
 from graph_specialisation_metrics.methodology.carriage import (
     beneficial_carriage,
     functional_carriage,
@@ -64,6 +67,7 @@ from graph_specialisation_metrics.methodology.interventions import (
 from graph_specialisation_metrics.methodology.protocol import (
     BOOTSTRAP_REPLICATES,
     BootstrapPolicy,
+    ExecutionPolicy,
     MethodologyConfig,
     RunSizes,
     deterministic_splits,
@@ -83,7 +87,10 @@ from graph_specialisation_metrics.methodology.scores import (
     project_transport,
 )
 from graph_specialisation_metrics.methodology.tasks import TASKS, OutputGeometry, get_task
-from graph_specialisation_metrics.methodology.validation import _mismatch_indices
+from graph_specialisation_metrics.methodology.validation import (
+    _clean_ablation_stage,
+    _mismatch_indices,
+)
 
 
 class FakeData:
@@ -166,6 +173,14 @@ def test_numerical_audits_are_soft_by_default_and_strict_on_request():
     assert config.strict_audits is False
     # Execution policy must not enter the cache/protocol fingerprint.
     assert config.fingerprint == dataclasses.replace(config, strict_audits=True).fingerprint
+    faster = dataclasses.replace(
+        config, execution=ExecutionPolicy(graphs_per_batch=16)
+    )
+    assert config.fingerprint == faster.fingerprint
+    assert config.record()["execution"] == {
+        "graphs_per_batch": 4,
+        "oom_backoff": True,
+    }
 
     with audit_scope("test") as scope:
         assert audit.audit_check(True, "test.pass", "never recorded")
@@ -182,6 +197,204 @@ def test_numerical_audits_are_soft_by_default_and_strict_on_request():
             audit.within_tolerance(1.0e-5, 1.0e-6, "test.tolerance", "observed")
     finally:
         audit.set_strict(previous)
+
+
+def test_graph_batch_executor_preserves_order_and_retries_without_double_consumption():
+    consumed = []
+    attempts = []
+
+    def execute(chunk):
+        attempts.append(tuple(chunk))
+        if len(chunk) > 2:
+            raise RuntimeError("CUDA out of memory")
+        return [value * 10 for value in chunk]
+
+    report = execute_graph_batches(
+        list(range(7)),
+        graphs_per_batch=4,
+        execute=execute,
+        consume=consumed.extend,
+        oom_backoff=True,
+    )
+
+    assert consumed == [value * 10 for value in range(7)]
+    assert attempts == [
+        (0, 1, 2, 3),
+        (0, 1),
+        (2, 3, 4, 5),
+        (2, 3),
+        (4, 5, 6),
+        (4,),
+        (5, 6),
+    ]
+    assert report.requested_graphs_per_batch == 4
+    assert report.minimum_graphs_per_batch == 1
+    assert report.maximum_graphs_per_batch == 2
+    assert report.successful_batches == 4
+    assert report.oom_retries == 3
+
+
+def test_graph_batch_executor_does_not_hide_non_oom_errors():
+    with pytest.raises(RuntimeError, match="scientific failure"):
+        execute_graph_batches(
+            [1, 2],
+            graphs_per_batch=2,
+            execute=lambda _chunk: (_ for _ in ()).throw(
+                RuntimeError("scientific failure")
+            ),
+            consume=lambda _result: None,
+            oom_backoff=True,
+        )
+
+
+def test_grit_grouped_capture_matches_individual_variable_size_groups():
+    pyg_data = pytest.importorskip("torch_geometric.data")
+    Data = pyg_data.Data
+
+    class Layers(torch.nn.Module):
+        def forward(self, batch):
+            batch.x = batch.x.float().clone().requires_grad_(True)
+            return batch
+
+    class Runtime:
+        device = torch.device("cpu")
+        L = H = dh = dim_h = 1
+
+        def __init__(self):
+            self.model = SimpleNamespace(
+                model=SimpleNamespace(layers=Layers())
+            )
+
+        def capture(
+            self,
+            batch,
+            *,
+            want_grad,
+            want_attn,
+            include_virtual_transport,
+        ):
+            del want_grad, want_attn, include_virtual_transport
+            output = self.model.model.layers(batch)
+            routed = output.x.float().reshape(-1, 1, 1)
+            graphs = int(output.batch.max().item()) + 1
+            prediction = torch.zeros(graphs, 1)
+            prediction.index_add_(0, output.batch, routed.reshape(-1, 1))
+            return {
+                "pred": prediction,
+                "true": output.y.reshape(graphs, -1),
+                "wV": [routed],
+                "node_graph": output.batch.clone(),
+            }
+
+    task = SimpleNamespace(
+        virtual_node=False,
+        output=OutputGeometry("evaluation_regression", (1.0,), "fixed"),
+    )
+    backend = CanonicalGritBackend(Runtime(), task, (1.0,))
+
+    def data(values, target):
+        values = torch.tensor(values, dtype=torch.float32).reshape(-1, 1)
+        return Data(
+            x=values,
+            y=torch.tensor([target], dtype=torch.float32),
+            edge_index=torch.empty((2, 0), dtype=torch.long),
+            num_nodes=len(values),
+        )
+
+    groups = [
+        [data([1, 2], 1), data([3, 4], 1)],
+        [data([5, 6, 7], 2), data([8, 9, 10], 2)],
+    ]
+    individual = [
+        backend.capture(group, require_grad=False) for group in groups
+    ]
+    grouped = backend.capture_groups(groups)
+
+    assert len(grouped) == len(individual) == 2
+    for observed, expected in zip(grouped, individual):
+        assert torch.equal(observed.prediction, expected.prediction)
+        assert torch.equal(observed.target, expected.target)
+        assert torch.equal(observed.final_state, expected.final_state)
+        assert torch.equal(observed.transport[0], expected.transport[0])
+
+    clean_individual = [
+        backend.clean_jacobians(groups[0][0]),
+        backend.clean_jacobians(groups[1][0]),
+    ]
+    clean_grouped = backend.clean_jacobians_many(
+        [groups[0][0], groups[1][0]]
+    )
+    for observed, expected in zip(clean_grouped, clean_individual):
+        assert torch.equal(observed.capture.prediction, expected.capture.prediction)
+        assert torch.equal(observed.capture.final_state, expected.capture.final_state)
+        assert torch.equal(observed.transport, expected.transport)
+        assert torch.equal(observed.final_state, expected.final_state)
+
+
+def test_clean_ablation_reuses_clean_captures_and_batches_each_target(monkeypatch):
+    monkeypatch.setattr(
+        "graph_specialisation_metrics.methodology.validation._spearman",
+        lambda x, y: {"rho": 0.0, "p": 1.0, "n": min(len(x), len(y))},
+    )
+
+    class Backend:
+        def __init__(self):
+            self.clean_batch_sizes = []
+            self.ablation_batch_sizes = []
+
+        def ablate(self, data_list, family):
+            if not family:
+                self.clean_batch_sizes.append(len(data_list))
+                prediction = torch.tensor(
+                    [[float(data.value)] for data in data_list]
+                )
+                return prediction, prediction, torch.zeros_like(prediction)
+            self.ablation_batch_sizes.append(len(data_list))
+            prediction = torch.tensor(
+                [[float(data.value) + 1.0] for data in data_list]
+            )
+            return prediction, prediction, torch.zeros_like(prediction)
+
+        @staticmethod
+        def loss_per_graph(prediction, target):
+            return (prediction - target).square().sum(dim=-1)
+
+    backend = Backend()
+    prepared = SimpleNamespace(
+        backend=backend,
+        grit=SimpleNamespace(
+            eval_ds=[SimpleNamespace(value=value) for value in (1.0, 2.0, 3.0)],
+            L=1,
+            H=1,
+            sc=SimpleNamespace(seed=0),
+        ),
+        splits=SimpleNamespace(clean_ablation=(0, 1, 2)),
+        task=SimpleNamespace(
+            metric_fn=lambda prediction, truth: float(
+                np.mean(np.abs(prediction - truth))
+            )
+        ),
+    )
+    config = SimpleNamespace(
+        execution=ExecutionPolicy(graphs_per_batch=2, oom_backoff=True),
+        bootstrap=BootstrapPolicy(),
+    )
+    result = _clean_ablation_stage(
+        prepared,
+        config,
+        {
+            "head_L0_H0": ((0, 0),),
+            "family_test": ((0, 0),),
+        },
+        scores=SimpleNamespace(
+            coordinates=SimpleNamespace(joint_sensitivity=np.asarray([[1.0]]))
+        ).__dict__,
+    )
+
+    assert backend.clean_batch_sizes == [2, 1]
+    assert backend.ablation_batch_sizes == [2, 1, 2, 1]
+    assert result["_execution"]["clean_reused_across_targets"] is True
+    assert result["head_L0_H0"]["prediction_movement"] == pytest.approx(1.0)
 
 
 def test_unsupported_distance_columns_never_warn_and_stay_non_estimable():

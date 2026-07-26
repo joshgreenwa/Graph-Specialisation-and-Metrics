@@ -6,7 +6,7 @@ from typing import Any, Mapping, Sequence
 
 from ..carriage import env
 from ..carriage.env import log
-from .protocol import BootstrapPolicy, MethodologyConfig, RunSizes
+from .protocol import BootstrapPolicy, ExecutionPolicy, MethodologyConfig, RunSizes
 from .runner import run_methodology
 from .tasks import get_task
 
@@ -35,6 +35,7 @@ def run(
     output_dir: str = DEFAULT_DRIVE_OUTPUT,
     checkpoints: Mapping[str, str] | None = None,
     sizes: RunSizes | Mapping[str, Any] | None = None,
+    execution: ExecutionPolicy | Mapping[str, Any] | None = None,
     task_overrides: Mapping[str, Mapping[str, Any]] | None = None,
     figure_overrides: Mapping[str, Any] | None = None,
     analysis_seed: int = 31_415,
@@ -70,6 +71,11 @@ def run(
     else:
         log("[deps] using the current runtime (skip_install=True)")
     run_sizes = sizes if isinstance(sizes, RunSizes) else RunSizes(**dict(sizes or {}))
+    execution_policy = (
+        execution
+        if isinstance(execution, ExecutionPolicy)
+        else ExecutionPolicy(**dict(execution or {}))
+    )
     bootstrap = BootstrapPolicy(
         rng_seed=int(bootstrap_seed),
         replicates=run_sizes.bootstrap_replicates,
@@ -87,6 +93,7 @@ def run(
         },
         phases=tuple(str(value) for value in phases),
         sizes=run_sizes,
+        execution=execution_policy,
         bootstrap=bootstrap,
         analysis_seed=int(analysis_seed),
         accelerator=accelerator,

@@ -18,6 +18,7 @@ from .causal import (
     patch_response,
     reference_scale,
 )
+from .execution import execute_graph_batches
 from .protocol import CHANNELS, PROTOCOL_VERSION
 from .scores import HeadCoordinates
 
@@ -165,42 +166,122 @@ def _clean_ablation_stage(
     targets: Mapping[str, Sequence[tuple[int, int]]],
     scores: Mapping[str, Any],
 ) -> dict[str, Any]:
+    import torch
+
     from .runner import _stage_ids
 
     output: dict[str, Any] = {}
+    graph_ids = list(_stage_ids(prepared, "clean_ablation"))
+    clean_by_graph: dict[int, Any] = {}
+
+    def execute_clean(chunk):
+        bases = [
+            prepared.grit.eval_ds[int(graph_id)]
+            for graph_id in chunk
+        ]
+        prediction, z, target = prepared.backend.ablate(bases, ())
+        if int(prediction.shape[0]) != len(chunk):
+            raise RuntimeError("grouped clean-ablation capture changed the graph count")
+        return [
+            (
+                int(graph_id),
+                {
+                    "prediction": prediction[position : position + 1].detach(),
+                    "z": z[position : position + 1].detach(),
+                    "target": target[position : position + 1].detach(),
+                },
+            )
+            for position, graph_id in enumerate(chunk)
+        ]
+
+    clean_report = execute_graph_batches(
+        graph_ids,
+        graphs_per_batch=config.execution.graphs_per_batch,
+        execute=execute_clean,
+        consume=lambda rows: clean_by_graph.update(rows),
+        oom_backoff=config.execution.oom_backoff,
+    )
+    target_reports: dict[str, Any] = {}
     for name, family in targets.items():
         rows = []
         clean_predictions = []
         ablated_predictions = []
         truths = []
-        for graph_id in _stage_ids(prepared, "clean_ablation"):
-            base = prepared.grit.eval_ds[int(graph_id)]
-            clean = prepared.backend.capture([base], require_grad=False)
-            prediction_a, z_a, target_a = prepared.backend.ablate([base], family)
+
+        def execute_target(chunk):
+            bases = [
+                prepared.grit.eval_ds[int(graph_id)]
+                for graph_id in chunk
+            ]
+            prediction_a, z_a, target_a = prepared.backend.ablate(bases, family)
+            if int(prediction_a.shape[0]) != len(chunk):
+                raise RuntimeError("grouped clean ablation changed the graph count")
             loss_clean = prepared.backend.loss_per_graph(
-                clean.prediction, clean.target
+                torch.cat(
+                    [clean_by_graph[int(graph_id)]["prediction"] for graph_id in chunk],
+                    dim=0,
+                ),
+                torch.cat(
+                    [clean_by_graph[int(graph_id)]["target"] for graph_id in chunk],
+                    dim=0,
+                ),
             ).detach().cpu().numpy()
             loss_ablated = prepared.backend.loss_per_graph(
                 prediction_a, target_a
             ).detach().cpu().numpy()
-            endpoint = clean_ablation(
-                clean.z.detach().cpu().numpy(),
-                z_a.detach().cpu().numpy(),
-                loss_clean,
-                loss_ablated,
-            )
-            clean_predictions.append(clean.prediction.detach().cpu().numpy().reshape(1, -1))
-            ablated_predictions.append(
-                prediction_a.detach().cpu().numpy().reshape(1, -1)
-            )
-            truths.append(clean.target.detach().cpu().numpy().reshape(1, -1))
-            rows.append(
-                {
-                    "graph": int(graph_id),
-                    "prediction_movement": float(endpoint["prediction_movement"][0]),
-                    "loss_change": float(endpoint["loss_change"][0]),
-                }
-            )
+            result = []
+            for position, graph_id in enumerate(chunk):
+                graph_id = int(graph_id)
+                clean = clean_by_graph[graph_id]
+                endpoint = clean_ablation(
+                    clean["z"].detach().cpu().numpy(),
+                    z_a[position : position + 1].detach().cpu().numpy(),
+                    loss_clean[position : position + 1],
+                    loss_ablated[position : position + 1],
+                )
+                result.append(
+                    {
+                        "graph": graph_id,
+                        "clean_prediction": clean["prediction"]
+                        .detach()
+                        .cpu()
+                        .numpy()
+                        .reshape(1, -1),
+                        "ablated_prediction": prediction_a[
+                            position : position + 1
+                        ]
+                        .detach()
+                        .cpu()
+                        .numpy()
+                        .reshape(1, -1),
+                        "truth": clean["target"]
+                        .detach()
+                        .cpu()
+                        .numpy()
+                        .reshape(1, -1),
+                        "prediction_movement": float(
+                            endpoint["prediction_movement"][0]
+                        ),
+                        "loss_change": float(endpoint["loss_change"][0]),
+                    }
+                )
+            return result
+
+        def consume_target(values):
+            for value in values:
+                clean_predictions.append(value.pop("clean_prediction"))
+                ablated_predictions.append(value.pop("ablated_prediction"))
+                truths.append(value.pop("truth"))
+                rows.append(value)
+
+        target_report = execute_graph_batches(
+            graph_ids,
+            graphs_per_batch=config.execution.graphs_per_batch,
+            execute=execute_target,
+            consume=consume_target,
+            oom_backoff=config.execution.oom_backoff,
+        )
+        target_reports[name] = dataclasses.asdict(target_report)
         metric_clean = float(
             prepared.task.metric_fn(
                 np.concatenate(clean_predictions), np.concatenate(truths)
@@ -283,6 +364,11 @@ def _clean_ablation_stage(
             "J_vs_clean_loss_change",
         ),
         "association_interval": association_interval,
+    }
+    output["_execution"] = {
+        "clean_reused_across_targets": True,
+        "clean_graph_batches": dataclasses.asdict(clean_report),
+        "target_graph_batches": target_reports,
     }
     return output
 
