@@ -13,9 +13,11 @@ from graph_specialisation_metrics.methodology.cache import (
     load_cache_artifact_file,
 )
 from graph_specialisation_metrics.methodology.protocol import (
+    BootstrapPolicy,
     PROTOCOL_VERSION,
     stable_hash,
 )
+from graph_specialisation_metrics.synthetic import nar_methodology_paper_v3 as v3
 from graph_specialisation_metrics.synthetic.nar_causal_transition import (
     _expected_provenance,
     _provenance_path,
@@ -26,8 +28,12 @@ from graph_specialisation_metrics.synthetic.nar_methodology_paper_v3 import (
     causal_engagement_rows,
     causal_engagement_transition_rows,
     discriminant_rows,
+    family_causal_phenotype_rows,
     interaction_outlier_rows,
     localisation_rows,
+    mechanism_transition_order_rows,
+    mechanism_transition_rows,
+    plot_carriage_survival_by_distance,
     plot_compact_causal_validation,
     plot_complete_grounding,
     plot_causal_engagement_and_capacity,
@@ -35,8 +41,10 @@ from graph_specialisation_metrics.synthetic.nar_methodology_paper_v3 import (
     plot_discriminant_validity,
     plot_family_overlap,
     plot_localisation_and_counterfactual,
+    plot_mechanism_survival,
     plot_organisation,
     plot_specificity_vs_engagement,
+    selectivity_reliability_rows,
 )
 from graph_specialisation_metrics.synthetic.nar_methodology_paper import PaperInputs
 
@@ -125,6 +133,218 @@ def test_v3_defaults_require_complete_score_and_causal_capacity_grid():
     assert args.canonical_causal_ns == "4,16,64"
     assert args.transition_causal_ns == "8,32"
     assert args.performance_ns.endswith(",80")
+    assert args.render_target == "all"
+    assert args.mechanism_cache_mode == "auto"
+
+
+def test_selectivity_reliability_requires_activity_and_interval_sign():
+    coordinates = SimpleNamespace(
+        normalized_structural=np.ones((2, 2)),
+        normalized_semantic=np.ones((2, 2)),
+        selectivity=np.asarray([[-0.5, 0.1], [0.6, 0.0]]),
+        joint_sensitivity=np.ones((2, 2)),
+        active=np.asarray([[True, True], [True, False]]),
+    )
+    low = np.zeros((6, 2, 2), dtype=np.float64)
+    high = np.zeros((6, 2, 2), dtype=np.float64)
+    low[5] = np.asarray([[-0.7, -0.2], [0.2, -0.2]])
+    high[5] = np.asarray([[-0.2, 0.3], [0.8, 0.2]])
+    score = {
+        "coordinates": coordinates,
+        "intervals": SimpleNamespace(low=low, high=high),
+        "families": {
+            "semantic_leaning": ((1, 0),),
+            "structural_leaning": ((0, 0),),
+            "central_responsive": ((0, 1),),
+            "inactive": ((1, 1),),
+        },
+    }
+    inputs = PaperInputs(
+        score_bindings={
+            ("dense", 4, 0): SimpleNamespace(
+                score_artifact=SimpleNamespace(value=score)
+            )
+        },
+        causal={},
+        role_results={},
+        counterfactual={},
+        carriage={},
+        best_seeds={},
+        performance=[
+            {"model": "dense", "N": 4, "seed": 0, "accuracy": 1.0}
+        ],
+    )
+
+    row = selectivity_reliability_rows(
+        inputs,
+        models=("dense",),
+        seeds=(0,),
+        ns=(4,),
+    )[0]
+
+    assert row["active_fraction"] == pytest.approx(0.75)
+    assert row["sign_reliable_given_active"] == pytest.approx(2 / 3)
+    assert row["active_and_sign_reliable_fraction"] == pytest.approx(0.5)
+    assert row["semantic_family_final_layer_share"] == pytest.approx(1.0)
+    assert row["structural_family_final_layer_share"] == pytest.approx(0.0)
+
+
+def test_family_causal_phenotype_is_absolute_matched_control_double_contrast():
+    def target(semantic_gross, structural_gross):
+        return {
+            "semantic": {
+                "P_gross_matched": semantic_gross,
+                "gross_necessity": semantic_gross / 2,
+            },
+            "structural": {
+                "P_gross_matched": structural_gross,
+                "gross_necessity": structural_gross / 2,
+            },
+        }
+
+    causal = {
+        "summary": {
+            "targets": {
+                "family_semantic_leaning": target(5.0, 1.0),
+                "control_semantic_leaning_central_control": target(2.0, 1.0),
+                "family_structural_leaning": target(2.0, 6.0),
+                "control_structural_leaning_central_control": target(1.0, 2.0),
+            }
+        }
+    }
+    inputs = PaperInputs(
+        score_bindings={},
+        causal={("dense", 16, 0): causal},
+        role_results={},
+        counterfactual={},
+        carriage={},
+        best_seeds={},
+        performance=[],
+    )
+
+    rows = family_causal_phenotype_rows(
+        inputs,
+        models=("dense",),
+        seeds=(0,),
+        ns=(16,),
+    )
+    by_family = {row["family"]: row for row in rows}
+
+    assert by_family["semantic_leaning"][
+        "gross_absolute_specificity"
+    ] == pytest.approx(3.0)
+    assert by_family["structural_leaning"][
+        "gross_absolute_specificity"
+    ] == pytest.approx(3.0)
+
+
+def test_transition_order_detects_mechanism_decline_before_performance_drop():
+    reliability = []
+    family = []
+    for records, accuracy, active in (
+        (4, 1.0, 1.0),
+        (8, 1.0, 0.4),
+        (16, 0.2, 0.3),
+    ):
+        reliability.append(
+            {
+                "model": "dense",
+                "N": records,
+                "seed": 0,
+                "chance_adjusted_accuracy": accuracy,
+                "active_fraction": active,
+                "sign_reliable_given_active": active,
+                "active_and_sign_reliable_fraction": active,
+                "median_active_abs_D_rel": 0.5,
+                "semantic_family_final_layer_share": 0.5,
+                "structural_family_final_layer_share": 0.5,
+            }
+        )
+        for family_name in ("semantic_leaning", "structural_leaning"):
+            family.append(
+                {
+                    "model": "dense",
+                    "N": records,
+                    "seed": 0,
+                    "family": family_name,
+                    "gross_absolute_specificity": active,
+                    "necessity_absolute_specificity": active,
+                }
+            )
+    transitions = mechanism_transition_rows(
+        reliability,
+        family,
+        models=("dense",),
+        seeds=(0,),
+        ns=(4, 8, 16),
+    )
+    order = mechanism_transition_order_rows(transitions)
+    activity = next(row for row in order if row["metric"] == "activity")
+
+    assert activity["largest_mechanism_change_transition"] == "4->8"
+    assert activity["largest_performance_drop_transition"] == "8->16"
+    assert activity["lead_steps"] == 1
+
+
+def test_mechanism_derived_cache_can_be_required_without_recomputation(
+    tmp_path,
+    monkeypatch,
+):
+    inputs = PaperInputs(
+        score_bindings={},
+        causal={},
+        role_results={},
+        counterfactual={},
+        carriage={},
+        best_seeds={},
+        performance=[],
+    )
+    monkeypatch.setattr(
+        v3,
+        "_mechanism_source_fingerprint",
+        lambda *args, **kwargs: "source-fingerprint",
+    )
+    monkeypatch.setattr(v3, "selectivity_reliability_rows", lambda *a, **k: [])
+    monkeypatch.setattr(v3, "family_causal_phenotype_rows", lambda *a, **k: [])
+    monkeypatch.setattr(v3, "mechanism_transition_rows", lambda *a, **k: [])
+    monkeypatch.setattr(
+        v3, "mechanism_transition_statistics", lambda *a, **k: []
+    )
+    monkeypatch.setattr(
+        v3, "mechanism_transition_order_rows", lambda *a, **k: []
+    )
+    monkeypatch.setattr(
+        v3, "carriage_survival_rows", lambda *a, **k: ([], [])
+    )
+    first = v3.mechanism_survival_analysis(
+        inputs,
+        output_dir=tmp_path,
+        models=(),
+        seeds=(),
+        ns=(),
+        carriage_ns=(),
+        bootstrap=BootstrapPolicy(),
+        cache_mode="auto",
+    )
+
+    monkeypatch.setattr(
+        v3,
+        "selectivity_reliability_rows",
+        lambda *a, **k: pytest.fail("derived analysis was recomputed"),
+    )
+    second = v3.mechanism_survival_analysis(
+        inputs,
+        output_dir=tmp_path,
+        models=(),
+        seeds=(),
+        ns=(),
+        carriage_ns=(),
+        bootstrap=BootstrapPolicy(),
+        cache_mode="require",
+    )
+
+    assert first["metadata"]["source_fingerprint"] == "source-fingerprint"
+    assert second == first
 
 
 def test_absolute_causal_engagement_retention_does_not_use_normalised_J():
@@ -485,6 +705,65 @@ def test_v3_publication_figures_render_without_overlapping_legacy_panels(tmp_pat
             "ci95_high": 0.95,
         }
     ]
+    reliability = [
+        {
+            "model": model,
+            "N": records,
+            "seed": seed,
+            "chance_adjusted_accuracy": 0.9 - 0.1 * ns.index(records),
+            "active_fraction": 0.8 - 0.1 * ns.index(records),
+            "sign_reliable_given_active": 0.7 - 0.1 * ns.index(records),
+            "semantic_family_final_layer_share": 0.6,
+            "structural_family_final_layer_share": 0.4,
+        }
+        for model in models
+        for records in ns
+        for seed in seeds
+    ]
+    family_causal = [
+        {
+            "model": model,
+            "N": records,
+            "seed": seed,
+            "family": family,
+            "gross_absolute_specificity": (
+                0.4 - 0.1 * ns.index(records)
+            ),
+        }
+        for model in models
+        for records in ns
+        for seed in seeds
+        for family in ("semantic_leaning", "structural_leaning")
+    ]
+    carriage = [
+        {
+            "model": model,
+            "N": records,
+            "channel": channel,
+            "carriage_per_carrier": 0.5 - 0.1 * ns.index(records),
+            "carriage_per_carrier_low": 0.4 - 0.05 * ns.index(records),
+            "carriage_per_carrier_high": 0.6 - 0.05 * ns.index(records),
+        }
+        for model in models
+        for records in ns
+        for channel in ("semantic", "structural")
+    ]
+    carriage_profiles = [
+        {
+            "model": model,
+            "N": records,
+            "channel": channel,
+            "distance_index": distance_index,
+            "distance_group": str(distance_index),
+            "carriage_per_carrier": 0.5 / (distance_index + 1),
+            "carriage_per_carrier_low": 0.4 / (distance_index + 1),
+            "carriage_per_carrier_high": 0.6 / (distance_index + 1),
+        }
+        for model in models
+        for records in ns
+        for channel in ("semantic", "structural")
+        for distance_index in (0, 1)
+    ]
 
     plot_compact_causal_validation(
         inputs,
@@ -556,5 +835,21 @@ def test_v3_publication_figures_render_without_overlapping_legacy_panels(tmp_pat
         seeds=seeds,
         ns=ns,
     )
+    plot_mechanism_survival(
+        reliability,
+        family_causal,
+        carriage,
+        output_dir=tmp_path,
+        models=models,
+        seeds=seeds,
+        ns=ns,
+        carriage_ns=ns,
+    )
+    plot_carriage_survival_by_distance(
+        carriage_profiles,
+        output_dir=tmp_path,
+        models=models,
+        carriage_ns=ns,
+    )
 
-    assert len(list(tmp_path.rglob("*.png"))) == 9
+    assert len(list(tmp_path.rglob("*.png"))) == 11

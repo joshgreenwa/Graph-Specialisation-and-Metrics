@@ -118,10 +118,17 @@ all head and family targets.
 
 `ExecutionPolicy.replica_pair_budget` can additionally cap an approximate
 `replicas * nodes^2` batch cost, and matching-output Jacobians use
-`jacobian_output_chunk` batched VJPs. These controls, OOM backoff, and heartbeat frequency are
-execution-only and never enter the scientific fingerprint. After an OOM, subsequent batches retain
-the successful smaller graph count instead of repeatedly retrying an oversized batch. GraphBench
-heartbeats additionally sample device-wide utilization, VRAM use, and power through `nvidia-smi`.
+`jacobian_output_chunk` batched VJPs. If the pinned PyTorch/PyG stack reports that an official
+operator has no compatible vmap rule, the GraphBench backend rebuilds that clean forward and
+retains exact sequential VJPs for the rest of the worker; unrelated autograd errors are not
+suppressed. Each detached clean Jacobian is atomically persisted as soon as its graph completes,
+then retained within the isolated worker and reused when scores and carriage address the same
+discovery graph. A restarted worker loads these protected graph shards before computing any misses.
+The selected engine is recorded in the model audits. These controls, OOM backoff, and heartbeat
+frequency are execution-only and never enter the scientific fingerprint. After an OOM, subsequent
+batches retain the successful smaller graph count instead of repeatedly retrying an oversized
+batch. GraphBench heartbeats additionally sample device-wide utilization, VRAM use, and power
+through `nvidia-smi`.
 
 Independent HPC processes should call `run_worker` with the same complete multi-task/multi-seed
 configuration and one selected task/seed. A worker writes only its `seed_<training-seed>` subtree;

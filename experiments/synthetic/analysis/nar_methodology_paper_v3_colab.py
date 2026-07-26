@@ -6,6 +6,9 @@ publication tree at ``extensions/nar_methodology_paper_v3``.  Its headline capac
 tests whether absolute semantic/structural score and held-out causal-response retention
 co-transition with fixed-N retrieval competence; it never uses normalised ``J`` as a cross-N
 magnitude and does not describe independently trained fixed-N checkpoints as an OOD sweep.
+The first full run caches source-fingerprinted mechanism-survival estimands. For later
+presentation-only iterations, set ``--render-target mechanism`` and
+``--mechanism-cache-mode require`` in ``CELL_ARGS``.
 """
 
 from __future__ import annotations
@@ -93,6 +96,10 @@ from graph_specialisation_metrics.synthetic.nar_methodology_paper_v3 import main
 CELL_ARGS = [
     "--phase",
     "figures",
+    "--render-target",
+    "all",
+    "--mechanism-cache-mode",
+    "auto",
     "--drive-root",
     "/content/drive/MyDrive/graph_specialisation_metrics/nar_grit",
     "--training-run-name",

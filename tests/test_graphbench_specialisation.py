@@ -471,6 +471,87 @@ def test_graphbench_flow_backend_replays_exact_mean_max_readout():
     assert torch.allclose(replay_loss, actual_loss, atol=1.0e-6)
 
 
+@pytest.mark.parametrize(
+    ("graph_factory", "task_name", "sigma"),
+    (
+        (matching_graph, "graphbench_bipartite_matching_hard", [1.0]),
+        (flow_graph, "graphbench_flow_hard", [2.0]),
+    ),
+)
+def test_graphbench_clean_jacobians_fall_back_exactly_when_vmap_is_unsupported(
+    monkeypatch,
+    capsys,
+    graph_factory,
+    task_name,
+    sigma,
+):
+    graph = graph_factory()
+    task = get_task(task_name)
+    runtime = fake_runtime(graph)
+    expected_backend = GraphBenchGritBackend(
+        runtime,
+        task,
+        sigma=sigma,
+        jacobian_output_chunk=2,
+    )
+    expected = expected_backend.clean_jacobians(graph)
+
+    backend = GraphBenchGritBackend(
+        runtime,
+        task,
+        sigma=sigma,
+        jacobian_output_chunk=2,
+    )
+    original_grad = torch.autograd.grad
+    calls = {"batched": 0, "sequential": 0}
+
+    def vmap_incompatible_grad(*args, **kwargs):
+        if kwargs.get("is_grads_batched", False):
+            calls["batched"] += 1
+            raise RuntimeError(
+                "vmap: aten::scatter_(self, *extra_args) is not possible because "
+                "an official operator has no compatible batching rule"
+            )
+        calls["sequential"] += 1
+        return original_grad(*args, **kwargs)
+
+    monkeypatch.setattr(torch.autograd, "grad", vmap_incompatible_grad)
+    actual = backend.clean_jacobians(graph)
+    repeated = backend.clean_jacobians(graph)
+
+    assert backend.jacobian_engine == "sequential_vjp"
+    assert calls["batched"] == 1
+    assert calls["sequential"] == int(expected.capture.z.numel())
+    output = capsys.readouterr().out
+    assert "using exact sequential VJPs" in output
+    assert "reusing detached clean Jacobians" in output
+    assert torch.allclose(actual.transport, expected.transport, atol=1.0e-6)
+    assert torch.allclose(actual.final_state, expected.final_state, atol=1.0e-6)
+    assert repeated is actual
+    assert torch.allclose(repeated.transport, expected.transport, atol=1.0e-6)
+    assert torch.allclose(repeated.final_state, expected.final_state, atol=1.0e-6)
+
+
+def test_graphbench_clean_jacobians_do_not_hide_unrelated_autograd_failures(
+    monkeypatch,
+):
+    graph = matching_graph()
+    backend = GraphBenchGritBackend(
+        fake_runtime(graph),
+        get_task("graphbench_bipartite_matching_hard"),
+        sigma=[1.0],
+        jacobian_output_chunk=2,
+    )
+
+    def unrelated_failure(*_args, **_kwargs):
+        raise RuntimeError("CUDA launch failure unrelated to vmap")
+
+    monkeypatch.setattr(torch.autograd, "grad", unrelated_failure)
+    with pytest.raises(RuntimeError, match="CUDA launch failure"):
+        backend.clean_jacobians(graph)
+    assert backend.jacobian_engine == "auto"
+
+
 def test_graphbench_score_and_carriage_components_resume_from_graph_shards(tmp_path):
     evaluation = [matching_graph() for _ in range(7)]
     donors = [
@@ -522,6 +603,16 @@ def test_graphbench_score_and_carriage_components_resume_from_graph_shards(tmp_p
     )
     score_plan = _stage_plan(prepared, config, "scores")
     scores = run_scores(prepared, config, plan=score_plan)
+    clean_shards = list(
+        (prepared.output_dir / "cache" / "clean_jacobians").glob("graph_*.pt")
+    )
+    assert len(clean_shards) == 3
+    backend._clean_jacobian_cache.clear()
+
+    def unexpected_recomputation(_data):
+        raise AssertionError("carriage should resume clean Jacobians from graph shards")
+
+    backend.clean_jacobians = unexpected_recomputation
     carriage_plan = _stage_plan(prepared, config, "carriage")
     carriage = run_carriage(prepared, config, plan=carriage_plan)
 

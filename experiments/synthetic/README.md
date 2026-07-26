@@ -146,6 +146,11 @@ writes only to `extensions/nar_methodology_paper_v3/`. Its targeted outputs are:
   structural raw-score magnitudes, and independently held-out gross-patching/necessity response,
   co-transitions with collapse of chance-adjusted retrieval accuracy. The figure uses within-seed
   retention relative to N=4 and an adjacent-N trajectory-cluster bootstrap;
+- a focused mechanism-survival figure combining chance-adjusted competence, active-head
+  population, interval-reliable `D_rel`, semantic/structural family layer organisation, absolute
+  matched-control family causal specificity, and raw Functional-carriage magnitude. A companion
+  figure shows semantic and structural Functional carriage jointly across cached N and
+  shortest-path distance;
 - supplementary sensitivity-concentration, frozen-family overlap, and same-minus-cross-channel
   discriminant-validity analyses, including a diagnostic that separates relative `D_rel`
   selectivity from absolute causal-response magnitude; and
@@ -159,6 +164,29 @@ fixed-N capacity co-transition across independently trained checkpoints, not str
 generalisation. Since the registered output-projected response has an N-way output geometry, the
 raw-score, gross-patching, and necessity endpoints are retained separately and should be interpreted
 as convergent evidence rather than interchangeable measurements.
+
+For mechanism survival, a `D_rel` sign is reliable only when the head is point-active under the
+registered activity floor and its registered nested-bootstrap 95% interval excludes zero. Family
+stability is population-level: layer occupancy and held-out causal phenotype are compared across
+independently trained cells, never head identity. The family causal endpoint is the absolute raw
+matched-control double contrast
+`(family same - family cross) - (control same - control cross)`, avoiding the unstable calibrated
+ratio retained only in the diagnostic table. Carriage remains raw `F_sens`; beneficial and
+event-normalised carriage are not computed.
+
+The first full run writes a source-fingerprinted derived cache below
+`extensions/nar_methodology_paper_v3/cache/mechanism_survival/`. Once it exists, figure-only
+iteration is:
+
+```bash
+python -m graph_specialisation_metrics.synthetic.nar_methodology_paper_v3 \
+  --render-target mechanism \
+  --mechanism-cache-mode require
+```
+
+`require` never recomputes the mechanism estimands: it fails if the exact protected score, causal,
+carriage, performance, and bootstrap fingerprint is unavailable. Use the default `auto` for the
+first run or when intentionally analysing a new source fingerprint.
 
 Command-line equivalents:
 

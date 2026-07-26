@@ -9,14 +9,20 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import json
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 import numpy as np
 
-from ..methodology.bootstrap import Observation, nested_percentile_interval
+from ..methodology.bootstrap import (
+    Observation,
+    nested_percentile_interval,
+    trimmed_mean,
+)
 from ..methodology.cache import atomic_json
-from ..methodology.protocol import BootstrapPolicy
+from ..methodology.distance import display_bins
+from ..methodology.protocol import BootstrapPolicy, stable_hash
 from . import nar_methodology_paper as v2
 from .nar_canonical_analysis import (
     MODEL_COLOURS,
@@ -56,6 +62,11 @@ ENGAGEMENT_FIGURE_STEM = "05_causal_engagement_and_capacity"
 ENGAGEMENT_SPECIFICITY_FIGURE_STEM = (
     "S07_relative_specificity_vs_causal_engagement"
 )
+MECHANISM_FIGURE_STEM = "06_mechanism_survival_across_capacity"
+CARRIAGE_SURVIVAL_FIGURE_STEM = (
+    "S08_functional_carriage_survival_by_distance"
+)
+MECHANISM_CACHE_VERSION = "nar-mechanism-survival-v1"
 FINGERPRINT_FIGURE_STEM = "S03_conditional_source_fingerprint_N{N}"
 
 
@@ -2001,6 +2012,1592 @@ def plot_specificity_vs_engagement(
         plt.close(fig)
 
 
+def selectivity_reliability_rows(
+    inputs: v2.PaperInputs,
+    *,
+    models: Sequence[str],
+    seeds: Sequence[int],
+    ns: Sequence[int],
+) -> list[dict[str, Any]]:
+    """Activity, interval reliability, and population-level family organisation.
+
+    A reliable selectivity sign is defined only for a discovery-active head and requires its
+    registered nested-bootstrap 95% interval for ``D_rel`` to exclude zero. Cross-checkpoint
+    head identity is deliberately absent.
+    """
+
+    accuracy = {
+        (str(row["model"]), int(row["N"]), int(row["seed"])): v2._as_float(
+            row.get("accuracy")
+        )
+        for row in inputs.performance
+    }
+    output: list[dict[str, Any]] = []
+    for records in ns:
+        heads = v2._head_interval_rows(
+            inputs,
+            models=models,
+            seeds=seeds,
+            records=int(records),
+        )
+        for model in models:
+            for seed in seeds:
+                cell = [
+                    row
+                    for row in heads
+                    if str(row["model"]) == str(model)
+                    and int(row["seed"]) == int(seed)
+                ]
+                if not cell:
+                    continue
+                active = [row for row in cell if bool(row["active"])]
+                reliable = [
+                    row
+                    for row in active
+                    if np.isfinite(v2._as_float(row.get("D_rel_low")))
+                    and np.isfinite(v2._as_float(row.get("D_rel_high")))
+                    and (
+                        v2._as_float(row["D_rel_low"]) > 0
+                        or v2._as_float(row["D_rel_high"]) < 0
+                    )
+                ]
+                widths = np.asarray(
+                    [
+                        v2._as_float(row["D_rel_high"])
+                        - v2._as_float(row["D_rel_low"])
+                        for row in active
+                    ],
+                    dtype=np.float64,
+                )
+                widths = widths[np.isfinite(widths)]
+                maximum_layer = max(int(row["layer"]) for row in cell)
+                family_values: dict[str, dict[str, Any]] = {}
+                for family in ("semantic_leaning", "structural_leaning"):
+                    selected = [
+                        row for row in cell if str(row["family"]) == family
+                    ]
+                    selected_reliable = [
+                        row
+                        for row in selected
+                        if np.isfinite(v2._as_float(row.get("D_rel_low")))
+                        and np.isfinite(v2._as_float(row.get("D_rel_high")))
+                        and (
+                            v2._as_float(row["D_rel_low"]) > 0
+                            or v2._as_float(row["D_rel_high"]) < 0
+                        )
+                    ]
+                    family_values[family] = {
+                        "count": len(selected),
+                        "final_layer_share": (
+                            sum(
+                                int(row["layer"]) == maximum_layer
+                                for row in selected
+                            )
+                            / len(selected)
+                            if selected
+                            else np.nan
+                        ),
+                        "sign_reliable_fraction": (
+                            len(selected_reliable) / len(selected)
+                            if selected
+                            else np.nan
+                        ),
+                    }
+                cell_accuracy = accuracy.get(
+                    (str(model), int(records), int(seed)), np.nan
+                )
+                output.append(
+                    {
+                        "model": model,
+                        "N": int(records),
+                        "seed": int(seed),
+                        "accuracy": cell_accuracy,
+                        "chance_adjusted_accuracy": (
+                            _excess_accuracy(cell_accuracy, int(records))
+                            if np.isfinite(cell_accuracy)
+                            else np.nan
+                        ),
+                        "heads": len(cell),
+                        "active_heads": len(active),
+                        "active_fraction": len(active) / len(cell),
+                        "active_sign_reliable_heads": len(reliable),
+                        "sign_reliable_given_active": (
+                            len(reliable) / len(active) if active else np.nan
+                        ),
+                        "active_and_sign_reliable_fraction": (
+                            len(reliable) / len(cell)
+                        ),
+                        "median_active_D_rel_interval_width": (
+                            float(np.median(widths)) if len(widths) else np.nan
+                        ),
+                        "median_active_abs_D_rel": (
+                            float(
+                                np.median(
+                                    [
+                                        abs(v2._as_float(row["D_rel"]))
+                                        for row in active
+                                    ]
+                                )
+                            )
+                            if active
+                            else np.nan
+                        ),
+                        "semantic_family_heads": family_values[
+                            "semantic_leaning"
+                        ]["count"],
+                        "structural_family_heads": family_values[
+                            "structural_leaning"
+                        ]["count"],
+                        "semantic_family_final_layer_share": family_values[
+                            "semantic_leaning"
+                        ]["final_layer_share"],
+                        "structural_family_final_layer_share": family_values[
+                            "structural_leaning"
+                        ]["final_layer_share"],
+                        "semantic_family_sign_reliable_fraction": family_values[
+                            "semantic_leaning"
+                        ]["sign_reliable_fraction"],
+                        "structural_family_sign_reliable_fraction": family_values[
+                            "structural_leaning"
+                        ]["sign_reliable_fraction"],
+                        "final_layer_index": int(maximum_layer),
+                        "cross_N_head_alignment": False,
+                        "reliability_rule": (
+                            "point-active and nested-bootstrap 95% D_rel interval "
+                            "excludes zero"
+                        ),
+                    }
+                )
+    return output
+
+
+def family_causal_phenotype_rows(
+    inputs: v2.PaperInputs,
+    *,
+    models: Sequence[str],
+    seeds: Sequence[int],
+    ns: Sequence[int],
+) -> list[dict[str, Any]]:
+    """Absolute matched-control family specificity without calibrated ratios."""
+
+    output: list[dict[str, Any]] = []
+    for records in ns:
+        for model in models:
+            for seed in seeds:
+                causal = inputs.causal[(str(model), int(records), int(seed))]
+                targets = causal.get("summary", {}).get("targets", {})
+                for family, same_channel, cross_channel in (
+                    ("semantic_leaning", "semantic", "structural"),
+                    ("structural_leaning", "structural", "semantic"),
+                ):
+                    family_name = f"family_{family}"
+                    control_name = f"control_{family}_central_control"
+                    family_target = targets.get(family_name, {})
+                    control_target = targets.get(control_name, {})
+                    row: dict[str, Any] = {
+                        "model": model,
+                        "N": int(records),
+                        "seed": int(seed),
+                        "family": family,
+                        "predicted_channel": same_channel,
+                        "cross_channel": cross_channel,
+                        "family_target": family_name,
+                        "matched_control_target": control_name,
+                        "response_geometry": (
+                            "absolute registered output-projected z-space response"
+                        ),
+                    }
+                    for label, endpoint in (
+                        ("gross", "P_gross_matched"),
+                        ("necessity", "gross_necessity"),
+                    ):
+                        family_same = v2._as_float(
+                            family_target.get(same_channel, {}).get(endpoint)
+                        )
+                        family_cross = v2._as_float(
+                            family_target.get(cross_channel, {}).get(endpoint)
+                        )
+                        control_same = v2._as_float(
+                            control_target.get(same_channel, {}).get(endpoint)
+                        )
+                        control_cross = v2._as_float(
+                            control_target.get(cross_channel, {}).get(endpoint)
+                        )
+                        row.update(
+                            {
+                                f"{label}_family_same": family_same,
+                                f"{label}_family_cross": family_cross,
+                                f"{label}_control_same": control_same,
+                                f"{label}_control_cross": control_cross,
+                                f"{label}_aligned_advantage": (
+                                    family_same - control_same
+                                ),
+                                f"{label}_cross_advantage": (
+                                    family_cross - control_cross
+                                ),
+                                f"{label}_absolute_specificity": (
+                                    (family_same - family_cross)
+                                    - (control_same - control_cross)
+                                ),
+                            }
+                        )
+                    output.append(row)
+    return output
+
+
+def mechanism_transition_rows(
+    reliability: Sequence[Mapping[str, Any]],
+    family_causal: Sequence[Mapping[str, Any]],
+    *,
+    models: Sequence[str],
+    seeds: Sequence[int],
+    ns: Sequence[int],
+) -> list[dict[str, Any]]:
+    """Adjacent-N changes, with the largest performance transition identified per trajectory."""
+
+    reliability_lookup = {
+        (str(row["model"]), int(row["N"]), int(row["seed"])): row
+        for row in reliability
+    }
+    family_lookup: dict[tuple[str, int, int], list[Mapping[str, Any]]] = {}
+    for row in family_causal:
+        family_lookup.setdefault(
+            (str(row["model"]), int(row["N"]), int(row["seed"])), []
+        ).append(row)
+
+    def family_mean(key: tuple[str, int, int], field: str) -> float:
+        values = np.asarray(
+            [v2._as_float(row.get(field)) for row in family_lookup.get(key, ())],
+            dtype=np.float64,
+        )
+        values = values[np.isfinite(values)]
+        return float(np.mean(values)) if len(values) else np.nan
+
+    output: list[dict[str, Any]] = []
+    for model in models:
+        for seed in seeds:
+            trajectory: list[dict[str, Any]] = []
+            for transition_index, (left_n, right_n) in enumerate(
+                zip(ns[:-1], ns[1:])
+            ):
+                left_key = (str(model), int(left_n), int(seed))
+                right_key = (str(model), int(right_n), int(seed))
+                left = reliability_lookup[left_key]
+                right = reliability_lookup[right_key]
+                delta_semantic_layer = (
+                    v2._as_float(
+                        right["semantic_family_final_layer_share"]
+                    )
+                    - v2._as_float(
+                        left["semantic_family_final_layer_share"]
+                    )
+                )
+                delta_structural_layer = (
+                    v2._as_float(
+                        right["structural_family_final_layer_share"]
+                    )
+                    - v2._as_float(
+                        left["structural_family_final_layer_share"]
+                    )
+                )
+                row = {
+                    "model": model,
+                    "seed": int(seed),
+                    "transition": f"{left_n}->{right_n}",
+                    "transition_index": int(transition_index),
+                    "N_left": int(left_n),
+                    "N_right": int(right_n),
+                    "delta_chance_adjusted_accuracy": (
+                        v2._as_float(right["chance_adjusted_accuracy"])
+                        - v2._as_float(left["chance_adjusted_accuracy"])
+                    ),
+                    "delta_active_fraction": (
+                        v2._as_float(right["active_fraction"])
+                        - v2._as_float(left["active_fraction"])
+                    ),
+                    "delta_sign_reliable_given_active": (
+                        v2._as_float(right["sign_reliable_given_active"])
+                        - v2._as_float(left["sign_reliable_given_active"])
+                    ),
+                    "delta_active_and_sign_reliable_fraction": (
+                        v2._as_float(
+                            right["active_and_sign_reliable_fraction"]
+                        )
+                        - v2._as_float(
+                            left["active_and_sign_reliable_fraction"]
+                        )
+                    ),
+                    "delta_median_active_abs_D_rel": (
+                        v2._as_float(right["median_active_abs_D_rel"])
+                        - v2._as_float(left["median_active_abs_D_rel"])
+                    ),
+                    "delta_semantic_final_layer_share": delta_semantic_layer,
+                    "delta_structural_final_layer_share": (
+                        delta_structural_layer
+                    ),
+                    "family_layer_reorganisation": (
+                        0.5
+                        * (
+                            abs(delta_semantic_layer)
+                            + abs(delta_structural_layer)
+                        )
+                    ),
+                    "delta_gross_family_absolute_specificity": (
+                        family_mean(
+                            right_key, "gross_absolute_specificity"
+                        )
+                        - family_mean(
+                            left_key, "gross_absolute_specificity"
+                        )
+                    ),
+                    "delta_necessity_family_absolute_specificity": (
+                        family_mean(
+                            right_key, "necessity_absolute_specificity"
+                        )
+                        - family_mean(
+                            left_key, "necessity_absolute_specificity"
+                        )
+                    ),
+                }
+                trajectory.append(row)
+            finite_accuracy = [
+                (index, v2._as_float(row["delta_chance_adjusted_accuracy"]))
+                for index, row in enumerate(trajectory)
+                if np.isfinite(
+                    v2._as_float(row["delta_chance_adjusted_accuracy"])
+                )
+            ]
+            largest_index = (
+                min(finite_accuracy, key=lambda item: item[1])[0]
+                if finite_accuracy
+                else -1
+            )
+            for index, row in enumerate(trajectory):
+                row["is_largest_performance_drop"] = index == largest_index
+                row["is_immediately_pre_transition"] = (
+                    index == largest_index - 1
+                )
+                row["transition_timing"] = (
+                    "largest_performance_drop"
+                    if index == largest_index
+                    else (
+                        "immediately_pre_transition"
+                        if index == largest_index - 1
+                        else "other"
+                    )
+                )
+                output.append(row)
+    return output
+
+
+def mechanism_transition_statistics(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    bootstrap: BootstrapPolicy,
+) -> list[dict[str, Any]]:
+    metrics = (
+        ("activity", "delta_active_fraction"),
+        (
+            "selectivity_reliability",
+            "delta_active_and_sign_reliable_fraction",
+        ),
+        ("selectivity_magnitude", "delta_median_active_abs_D_rel"),
+        ("family_layer_reorganisation", "family_layer_reorganisation"),
+        (
+            "gross_family_causal_specificity",
+            "delta_gross_family_absolute_specificity",
+        ),
+        (
+            "necessity_family_causal_specificity",
+            "delta_necessity_family_absolute_specificity",
+        ),
+    )
+    output: list[dict[str, Any]] = []
+    for offset, (name, field) in enumerate(metrics):
+        trajectories: dict[tuple[str, int], list[tuple[float, float]]] = {}
+        for row in rows:
+            x = v2._as_float(row.get(field))
+            y = v2._as_float(row.get("delta_chance_adjusted_accuracy"))
+            if np.isfinite(x) and np.isfinite(y):
+                trajectories.setdefault(
+                    (str(row["model"]), int(row["seed"])), []
+                ).append((x, y))
+        if not trajectories:
+            continue
+        rho, low, high = _cluster_spearman_interval(
+            trajectories,
+            seed=int(bootstrap.rng_seed) + 160_000 + offset,
+            replicates=int(bootstrap.replicates),
+        )
+        output.append(
+            {
+                "metric": name,
+                "field": field,
+                "spearman_rho": rho,
+                "ci95_low": low,
+                "ci95_high": high,
+                "trajectory_clusters": len(trajectories),
+                "resampling_unit": "model × training-seed trajectory",
+                "y": "adjacent delta chance-adjusted accuracy",
+                "claim_scope": (
+                    "descriptive co-transition across independently trained "
+                    "fixed-N checkpoints"
+                ),
+            }
+        )
+    return output
+
+
+def mechanism_transition_order_rows(
+    rows: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Discrete ordering of the largest decline in each mechanism coordinate."""
+
+    metrics = (
+        ("activity", "delta_active_fraction", "largest_decline"),
+        (
+            "selectivity_reliability",
+            "delta_active_and_sign_reliable_fraction",
+            "largest_decline",
+        ),
+        (
+            "selectivity_magnitude",
+            "delta_median_active_abs_D_rel",
+            "largest_absolute_change",
+        ),
+        (
+            "family_layer_reorganisation",
+            "family_layer_reorganisation",
+            "largest_increase",
+        ),
+        (
+            "gross_family_causal_specificity",
+            "delta_gross_family_absolute_specificity",
+            "largest_decline",
+        ),
+    )
+    grouped: dict[tuple[str, int], list[Mapping[str, Any]]] = {}
+    for row in rows:
+        grouped.setdefault(
+            (str(row["model"]), int(row["seed"])), []
+        ).append(row)
+    output: list[dict[str, Any]] = []
+    for (model, seed), selected in sorted(grouped.items()):
+        ordered = sorted(selected, key=lambda row: int(row["transition_index"]))
+        performance = [
+            (
+                int(row["transition_index"]),
+                str(row["transition"]),
+                v2._as_float(row["delta_chance_adjusted_accuracy"]),
+            )
+            for row in ordered
+            if np.isfinite(
+                v2._as_float(row["delta_chance_adjusted_accuracy"])
+            )
+        ]
+        if not performance:
+            continue
+        performance_index, performance_transition, performance_delta = min(
+            performance, key=lambda item: item[2]
+        )
+        for metric, field, selection_rule in metrics:
+            candidates = [
+                (
+                    int(row["transition_index"]),
+                    str(row["transition"]),
+                    v2._as_float(row.get(field)),
+                )
+                for row in ordered
+                if np.isfinite(v2._as_float(row.get(field)))
+            ]
+            if not candidates:
+                continue
+            if selection_rule == "largest_absolute_change":
+                mechanism_index, mechanism_transition, mechanism_delta = max(
+                    candidates, key=lambda item: abs(item[2])
+                )
+            elif selection_rule == "largest_increase":
+                mechanism_index, mechanism_transition, mechanism_delta = max(
+                    candidates, key=lambda item: item[2]
+                )
+            else:
+                mechanism_index, mechanism_transition, mechanism_delta = min(
+                    candidates, key=lambda item: item[2]
+                )
+            output.append(
+                {
+                    "model": model,
+                    "seed": int(seed),
+                    "metric": metric,
+                    "field": field,
+                    "largest_mechanism_change_transition": mechanism_transition,
+                    "mechanism_change": mechanism_delta,
+                    "selection_rule": selection_rule,
+                    "largest_performance_drop_transition": performance_transition,
+                    "largest_performance_drop": performance_delta,
+                    "lead_steps": performance_index - mechanism_index,
+                    "timing_interpretation": (
+                        "positive means the selected mechanism change occurs "
+                        "at an earlier registered N transition"
+                    ),
+                }
+            )
+    return output
+
+
+def _carriage_interval(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    bootstrap: BootstrapPolicy,
+    seed: int,
+    rng_offset: int,
+) -> dict[str, Any]:
+    finite = [
+        row
+        for row in rows
+        if np.isfinite(v2._as_float(row.get("F_sens")))
+    ]
+    graphs = {int(row["graph_id"]) for row in finite}
+    pairs = {
+        (int(row["graph_id"]), int(row["carrier"]), int(row["source"]))
+        for row in finite
+    }
+    grouped: dict[tuple[int, int, int], list[float]] = {}
+    for row in finite:
+        key = (
+            int(row["graph_id"]),
+            int(row["source"]),
+            int(row["donor"]),
+        )
+        grouped.setdefault(key, []).append(v2._as_float(row["F_sens"]))
+    reportable = (
+        len(graphs) >= int(bootstrap.minimum_graphs)
+        and len(pairs) >= int(bootstrap.minimum_pairs)
+        and bool(grouped)
+    )
+    result: dict[str, Any] = {
+        "graphs": len(graphs),
+        "eligible_pairs": len(pairs),
+        "events": len(grouped),
+        "reportable": bool(reportable),
+        "carriage_per_carrier": np.nan,
+        "carriage_per_carrier_low": np.nan,
+        "carriage_per_carrier_high": np.nan,
+        "carriage_total_event_mass": np.nan,
+        "carriage_total_event_mass_low": np.nan,
+        "carriage_total_event_mass_high": np.nan,
+    }
+    if not reportable:
+        return result
+    observations = [
+        Observation(
+            seed=int(seed),
+            graph=int(graph),
+            source=int(source),
+            donor=int(donor),
+            value=np.asarray([np.sum(values), len(values)], dtype=np.float64),
+        )
+        for (graph, source, donor), values in sorted(grouped.items())
+    ]
+
+    def graph_reduce(values: np.ndarray) -> np.ndarray:
+        return np.asarray(
+            [
+                trimmed_mean(
+                    values[:, 0] / values[:, 1],
+                    bootstrap.trim_fraction,
+                    axis=0,
+                ),
+                trimmed_mean(
+                    values[:, 0],
+                    bootstrap.trim_fraction,
+                    axis=0,
+                ),
+            ],
+            dtype=np.float64,
+        )
+
+    interval = nested_percentile_interval(
+        observations,
+        dataclasses.replace(
+            bootstrap,
+            rng_seed=int(bootstrap.rng_seed) + int(rng_offset),
+            resample_source=False,
+        ),
+        graph_reduce=graph_reduce,
+    )
+    result.update(
+        {
+            "carriage_per_carrier": float(interval.estimate[0]),
+            "carriage_per_carrier_low": float(interval.low[0]),
+            "carriage_per_carrier_high": float(interval.high[0]),
+            "carriage_total_event_mass": float(interval.estimate[1]),
+            "carriage_total_event_mass_low": float(interval.low[1]),
+            "carriage_total_event_mass_high": float(interval.high[1]),
+            "bootstrap_replicates": int(interval.replicates),
+            "resampled_levels": ",".join(interval.resampled_levels),
+        }
+    )
+    return result
+
+
+def carriage_survival_rows(
+    inputs: v2.PaperInputs,
+    *,
+    models: Sequence[str],
+    carriage_ns: Sequence[int],
+    bootstrap: BootstrapPolicy,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Absolute carriage magnitude and distance profile from best-seed protected caches."""
+
+    all_distances = [
+        int(float(row["distance"]))
+        for model in models
+        for records in carriage_ns
+        for channel in ("semantic", "structural")
+        for row in inputs.carriage.get((str(model), int(records)), {})
+        .get("channels", {})
+        .get(channel, {})
+        .get("pairs", ())
+        if np.isfinite(v2._as_float(row.get("distance")))
+    ]
+    if not all_distances:
+        return [], []
+    axis = display_bins(
+        tuple(range(max(all_distances) + 1)),
+        max_points=14,
+    )
+    accuracy = {
+        (str(row["model"]), int(row["N"]), int(row["seed"])): v2._as_float(
+            row.get("accuracy")
+        )
+        for row in inputs.performance
+    }
+    summary_rows: list[dict[str, Any]] = []
+    profile_rows: list[dict[str, Any]] = []
+    offset = 0
+    for model in models:
+        for records in carriage_ns:
+            key = (str(model), int(records))
+            if key not in inputs.carriage or key not in inputs.best_seeds:
+                continue
+            seed = int(inputs.best_seeds[key])
+            for channel in ("semantic", "structural"):
+                rows = list(
+                    inputs.carriage[key]
+                    .get("channels", {})
+                    .get(channel, {})
+                    .get("pairs", ())
+                )
+                offset += 1
+                result = _carriage_interval(
+                    rows,
+                    bootstrap=bootstrap,
+                    seed=seed,
+                    rng_offset=180_000 + offset,
+                )
+                summary_rows.append(
+                    {
+                        "model": model,
+                        "N": int(records),
+                        "best_validation_seed": seed,
+                        "accuracy": accuracy.get(
+                            (str(model), int(records), int(seed)), np.nan
+                        ),
+                        "channel": channel,
+                        "source_role": "all registered NAR sources",
+                        "estimand": (
+                            "raw Functional carriage per eligible carrier; "
+                            "all registered distances"
+                        ),
+                        **result,
+                    }
+                )
+                for distance_index, (label, group) in enumerate(
+                    zip(axis.labels, axis.groups)
+                ):
+                    distances = {int(value) for value in group}
+                    selected = [
+                        row
+                        for row in rows
+                        if np.isfinite(v2._as_float(row.get("distance")))
+                        and int(float(row["distance"])) in distances
+                    ]
+                    offset += 1
+                    profile = _carriage_interval(
+                        selected,
+                        bootstrap=bootstrap,
+                        seed=seed,
+                        rng_offset=180_000 + offset,
+                    )
+                    profile_rows.append(
+                        {
+                            "model": model,
+                            "N": int(records),
+                            "best_validation_seed": seed,
+                            "channel": channel,
+                            "distance_index": int(distance_index),
+                            "distance_group": str(label),
+                            "distance_members": ",".join(map(str, group)),
+                            "estimand": (
+                                "raw Functional carriage per eligible carrier "
+                                "within distance group"
+                            ),
+                            **profile,
+                        }
+                    )
+    for model in models:
+        for channel in ("semantic", "structural"):
+            selected = [
+                row
+                for row in summary_rows
+                if str(row["model"]) == str(model)
+                and str(row["channel"]) == channel
+            ]
+            if not selected:
+                continue
+            baseline = min(selected, key=lambda row: int(row["N"]))
+            for row in selected:
+                for field in (
+                    "carriage_per_carrier",
+                    "carriage_total_event_mass",
+                ):
+                    numerator = v2._as_float(row[field])
+                    denominator = v2._as_float(baseline[field])
+                    retention = (
+                        numerator / denominator
+                        if np.isfinite(numerator)
+                        and np.isfinite(denominator)
+                        and numerator > 0
+                        and denominator > 0
+                        else np.nan
+                    )
+                    row[f"{field}_retention"] = retention
+                    row[f"{field}_log2_retention"] = (
+                        float(np.log2(retention))
+                        if np.isfinite(retention) and retention > 0
+                        else np.nan
+                    )
+                row["retention_reference_N"] = int(baseline["N"])
+    return summary_rows, profile_rows
+
+
+def _mechanism_source_fingerprint(
+    inputs: v2.PaperInputs,
+    *,
+    models: Sequence[str],
+    seeds: Sequence[int],
+    ns: Sequence[int],
+    carriage_ns: Sequence[int],
+    bootstrap: BootstrapPolicy,
+) -> str:
+    score_sources = []
+    causal_sources = []
+    for model in models:
+        for records in ns:
+            for seed in seeds:
+                key = (str(model), int(records), int(seed))
+                binding = inputs.score_bindings[key]
+                score_sources.append(
+                    {
+                        "key": key,
+                        "checkpoint_sha256": str(binding.checkpoint_sha256),
+                        "score_sha256": str(
+                            binding.score_artifact.file_sha256
+                        ),
+                    }
+                )
+                targets = (
+                    inputs.causal[key].get("summary", {}).get("targets", {})
+                )
+                causal_sources.append(
+                    {
+                        "key": key,
+                        "gross_reference_scales": inputs.causal[key]
+                        .get("summary", {})
+                        .get("gross_reference_scales", {}),
+                        "necessity_reference_scales": inputs.causal[key]
+                        .get("summary", {})
+                        .get("necessity_reference_scales", {}),
+                        "family_targets": {
+                            name: targets.get(name, {})
+                            for name in (
+                                "family_semantic_leaning",
+                                "family_structural_leaning",
+                                "control_semantic_leaning_central_control",
+                                "control_structural_leaning_central_control",
+                            )
+                        },
+                    }
+                )
+    carriage_sources = []
+    for model in models:
+        for records in carriage_ns:
+            key = (str(model), int(records))
+            for channel in ("semantic", "structural"):
+                rows = list(
+                    inputs.carriage.get(key, {})
+                    .get("channels", {})
+                    .get(channel, {})
+                    .get("pairs", ())
+                )
+                values = np.asarray(
+                    [v2._as_float(row.get("F_sens")) for row in rows],
+                    dtype=np.float64,
+                )
+                distances = np.asarray(
+                    [v2._as_float(row.get("distance")) for row in rows],
+                    dtype=np.float64,
+                )
+                carriage_sources.append(
+                    {
+                        "key": key,
+                        "channel": channel,
+                        "best_seed": inputs.best_seeds.get(key),
+                        "rows": len(rows),
+                        "sum_F_sens": float(np.nansum(values)),
+                        "sum_square_F_sens": float(
+                            np.nansum(np.square(values))
+                        ),
+                        "sum_distance": float(np.nansum(distances)),
+                    }
+                )
+    return stable_hash(
+        {
+            "cache_version": MECHANISM_CACHE_VERSION,
+            "models": list(models),
+            "seeds": list(map(int, seeds)),
+            "N_values": list(map(int, ns)),
+            "carriage_N_values": list(map(int, carriage_ns)),
+            "bootstrap": dataclasses.asdict(bootstrap),
+            "scores": score_sources,
+            "causal": causal_sources,
+            "carriage": carriage_sources,
+            "performance": list(inputs.performance),
+        },
+        length=32,
+    )
+
+
+def mechanism_survival_analysis(
+    inputs: v2.PaperInputs,
+    *,
+    output_dir: Path,
+    models: Sequence[str],
+    seeds: Sequence[int],
+    ns: Sequence[int],
+    carriage_ns: Sequence[int],
+    bootstrap: BootstrapPolicy,
+    cache_mode: str,
+) -> dict[str, Any]:
+    """Load or derive the mechanism-survival estimands before any rendering."""
+
+    if cache_mode not in {"auto", "refresh", "require"}:
+        raise ValueError("mechanism cache mode must be auto, refresh, or require")
+    fingerprint = _mechanism_source_fingerprint(
+        inputs,
+        models=models,
+        seeds=seeds,
+        ns=ns,
+        carriage_ns=carriage_ns,
+        bootstrap=bootstrap,
+    )
+    cache_path = (
+        output_dir
+        / "cache"
+        / "mechanism_survival"
+        / f"derived_v1_{fingerprint}.json"
+    )
+    if cache_path.exists() and cache_mode != "refresh":
+        with cache_path.open("r", encoding="utf-8") as stream:
+            cached = json.load(stream)
+        metadata = cached.get("metadata", {})
+        if (
+            metadata.get("cache_version") == MECHANISM_CACHE_VERSION
+            and metadata.get("source_fingerprint") == fingerprint
+        ):
+            print(
+                f"[mechanism-cache] reused {cache_path}",
+                flush=True,
+            )
+            return cached
+        if cache_mode == "require":
+            raise RuntimeError(
+                "mechanism-survival derived cache failed its internal "
+                "fingerprint check"
+            )
+    elif cache_mode == "require":
+        raise FileNotFoundError(
+            "mechanism-survival derived cache is missing; run once with "
+            "--mechanism-cache-mode auto"
+        )
+
+    reliability = selectivity_reliability_rows(
+        inputs,
+        models=models,
+        seeds=seeds,
+        ns=ns,
+    )
+    family_causal = family_causal_phenotype_rows(
+        inputs,
+        models=models,
+        seeds=seeds,
+        ns=ns,
+    )
+    transitions = mechanism_transition_rows(
+        reliability,
+        family_causal,
+        models=models,
+        seeds=seeds,
+        ns=ns,
+    )
+    statistics = mechanism_transition_statistics(
+        transitions,
+        bootstrap=bootstrap,
+    )
+    transition_order = mechanism_transition_order_rows(transitions)
+    carriage, carriage_profiles = carriage_survival_rows(
+        inputs,
+        models=models,
+        carriage_ns=carriage_ns,
+        bootstrap=bootstrap,
+    )
+    payload = {
+        "metadata": {
+            "cache_version": MECHANISM_CACHE_VERSION,
+            "source_fingerprint": fingerprint,
+            "models": list(models),
+            "seeds": list(map(int, seeds)),
+            "N_values": list(map(int, ns)),
+            "carriage_N_values": list(map(int, carriage_ns)),
+            "bootstrap": dataclasses.asdict(bootstrap),
+            "checkpoint_inference": False,
+            "score_recomputation": False,
+            "causal_recomputation": False,
+            "carriage_recomputation": False,
+        },
+        "selectivity_reliability": reliability,
+        "family_causal_phenotype": family_causal,
+        "transitions": transitions,
+        "transition_statistics": statistics,
+        "transition_order": transition_order,
+        "carriage_survival": carriage,
+        "carriage_profiles": carriage_profiles,
+    }
+    atomic_json(cache_path, payload)
+    print(f"[mechanism-cache] wrote {cache_path}", flush=True)
+    return payload
+
+
+def _seed_metric_matrix(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    model: str,
+    seeds: Sequence[int],
+    ns: Sequence[int],
+    field: str,
+) -> np.ndarray:
+    lookup = {
+        (str(row["model"]), int(row["N"]), int(row["seed"])): v2._as_float(
+            row.get(field)
+        )
+        for row in rows
+    }
+    return np.asarray(
+        [
+            [
+                lookup.get((str(model), int(records), int(seed)), np.nan)
+                for records in ns
+            ]
+            for seed in seeds
+        ],
+        dtype=np.float64,
+    )
+
+
+def plot_mechanism_survival(
+    reliability: Sequence[Mapping[str, Any]],
+    family_causal: Sequence[Mapping[str, Any]],
+    carriage: Sequence[Mapping[str, Any]],
+    *,
+    output_dir: Path,
+    models: Sequence[str],
+    seeds: Sequence[int],
+    ns: Sequence[int],
+    carriage_ns: Sequence[int],
+) -> None:
+    """Headline integration of competence, reliability, family phenotype, and carriage."""
+
+    import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
+
+    with _style():
+        fig, axes = plt.subplots(
+            2,
+            3,
+            figsize=(11.5, 6.05),
+            squeeze=False,
+        )
+        simple_panels = (
+            (
+                axes[0, 0],
+                "chance_adjusted_accuracy",
+                "A  Retrieval competence",
+                "Chance-adjusted accuracy",
+            ),
+            (
+                axes[0, 1],
+                "active_fraction",
+                "B  Active head population",
+                "Active-head fraction",
+            ),
+            (
+                axes[0, 2],
+                "sign_reliable_given_active",
+                r"C  Reliable $D_{\rm rel}$ among active heads",
+                "Sign-reliable fraction",
+            ),
+        )
+        for axis, field, title, ylabel in simple_panels:
+            for model in models:
+                matrix = _seed_metric_matrix(
+                    reliability,
+                    model=str(model),
+                    seeds=seeds,
+                    ns=ns,
+                    field=field,
+                )
+                mean = np.nanmean(matrix, axis=0)
+                sd = np.nanstd(matrix, axis=0, ddof=1)
+                for seed_values in matrix:
+                    axis.plot(
+                        ns,
+                        seed_values,
+                        color=MODEL_COLOURS[str(model)],
+                        linewidth=0.55,
+                        alpha=0.16,
+                    )
+                axis.plot(
+                    ns,
+                    mean,
+                    color=MODEL_COLOURS[str(model)],
+                    marker=MODEL_MARKERS[str(model)],
+                    linewidth=1.45,
+                    markersize=4.0,
+                    label=MODEL_LABELS[str(model)],
+                )
+                axis.fill_between(
+                    ns,
+                    mean - sd,
+                    mean + sd,
+                    color=MODEL_COLOURS[str(model)],
+                    alpha=0.09,
+                    linewidth=0,
+                )
+            axis.set_xticks(ns)
+            axis.set_xlabel("Memory size, $N$")
+            axis.set_ylabel(ylabel)
+            axis.set_title(title, fontsize=9.4)
+            axis.set_ylim(-0.05, 1.05)
+
+        family_styles = (
+            ("semantic", "-", "Semantic"),
+            ("structural", (0, (3.0, 1.8)), "Structural"),
+        )
+        for model in models:
+            for family, linestyle, _ in family_styles:
+                field = f"{family}_family_final_layer_share"
+                matrix = _seed_metric_matrix(
+                    reliability,
+                    model=str(model),
+                    seeds=seeds,
+                    ns=ns,
+                    field=field,
+                )
+                mean = np.nanmean(matrix, axis=0)
+                sd = np.nanstd(matrix, axis=0, ddof=1)
+                axes[1, 0].plot(
+                    ns,
+                    mean,
+                    color=MODEL_COLOURS[str(model)],
+                    linestyle=linestyle,
+                    marker=MODEL_MARKERS[str(model)],
+                    linewidth=1.35,
+                    markersize=3.7,
+                )
+                axes[1, 0].fill_between(
+                    ns,
+                    mean - sd,
+                    mean + sd,
+                    color=MODEL_COLOURS[str(model)],
+                    alpha=0.065,
+                    linewidth=0,
+                )
+        axes[1, 0].set_ylim(-0.05, 1.05)
+        axes[1, 0].set_ylabel("Final-layer family share")
+        axes[1, 0].set_title(
+            "D  Population-level family organisation",
+            fontsize=9.4,
+        )
+
+        family_lookup = {
+            (
+                str(row["model"]),
+                int(row["N"]),
+                int(row["seed"]),
+                str(row["family"]),
+            ): v2._as_float(row.get("gross_absolute_specificity"))
+            for row in family_causal
+        }
+        for model in models:
+            for family, linestyle, _ in family_styles:
+                family_name = f"{family}_leaning"
+                matrix = np.asarray(
+                    [
+                        [
+                            family_lookup.get(
+                                (
+                                    str(model),
+                                    int(records),
+                                    int(seed),
+                                    family_name,
+                                ),
+                                np.nan,
+                            )
+                            for records in ns
+                        ]
+                        for seed in seeds
+                    ],
+                    dtype=np.float64,
+                )
+                mean = np.nanmean(matrix, axis=0)
+                sd = np.nanstd(matrix, axis=0, ddof=1)
+                axes[1, 1].plot(
+                    ns,
+                    mean,
+                    color=MODEL_COLOURS[str(model)],
+                    linestyle=linestyle,
+                    marker=MODEL_MARKERS[str(model)],
+                    linewidth=1.35,
+                    markersize=3.7,
+                )
+                axes[1, 1].fill_between(
+                    ns,
+                    mean - sd,
+                    mean + sd,
+                    color=MODEL_COLOURS[str(model)],
+                    alpha=0.065,
+                    linewidth=0,
+                )
+        axes[1, 1].axhline(
+            0, color="#888888", linestyle="--", linewidth=0.7
+        )
+        axes[1, 1].set_ylabel(
+            "Absolute causal specificity\n(raw z-response)"
+        )
+        axes[1, 1].set_title(
+            "E  Matched-control family phenotype",
+            fontsize=9.4,
+        )
+
+        carriage_lookup = {
+            (
+                str(row["model"]),
+                int(row["N"]),
+                str(row["channel"]),
+            ): row
+            for row in carriage
+        }
+        for model in models:
+            for channel, linestyle, _ in family_styles:
+                selected = [
+                    carriage_lookup.get(
+                        (str(model), int(records), channel), {}
+                    )
+                    for records in carriage_ns
+                ]
+                estimate = np.asarray(
+                    [
+                        v2._as_float(row.get("carriage_per_carrier"))
+                        for row in selected
+                    ],
+                    dtype=np.float64,
+                )
+                low = np.asarray(
+                    [
+                        v2._as_float(row.get("carriage_per_carrier_low"))
+                        for row in selected
+                    ],
+                    dtype=np.float64,
+                )
+                high = np.asarray(
+                    [
+                        v2._as_float(row.get("carriage_per_carrier_high"))
+                        for row in selected
+                    ],
+                    dtype=np.float64,
+                )
+                valid = estimate > 0
+                plot_estimate = np.where(valid, np.log10(estimate), np.nan)
+                plot_low = np.where(low > 0, np.log10(low), np.nan)
+                plot_high = np.where(high > 0, np.log10(high), np.nan)
+                axes[1, 2].plot(
+                    carriage_ns,
+                    plot_estimate,
+                    color=MODEL_COLOURS[str(model)],
+                    linestyle=linestyle,
+                    marker=MODEL_MARKERS[str(model)],
+                    linewidth=1.35,
+                    markersize=3.7,
+                )
+                axes[1, 2].fill_between(
+                    carriage_ns,
+                    plot_low,
+                    plot_high,
+                    color=MODEL_COLOURS[str(model)],
+                    alpha=0.075,
+                    linewidth=0,
+                )
+        axes[1, 2].set_ylabel(
+            r"$\log_{10}\,F_{\rm sens}$ per carrier"
+        )
+        axes[1, 2].set_title(
+            "F  Functional-carriage survival",
+            fontsize=9.4,
+        )
+        axes[1, 2].text(
+            0.03,
+            0.04,
+            "Best validation seed per cell",
+            transform=axes[1, 2].transAxes,
+            fontsize=6.5,
+            color="#555555",
+            ha="left",
+            va="bottom",
+        )
+        for axis in axes[1]:
+            axis.set_xticks(ns)
+            axis.set_xlabel("Memory size, $N$")
+        model_handles = [
+            Line2D(
+                [],
+                [],
+                color=MODEL_COLOURS[str(model)],
+                marker=MODEL_MARKERS[str(model)],
+                linewidth=1.4,
+                label=MODEL_LABELS[str(model)],
+            )
+            for model in models
+        ]
+        family_handles = [
+            Line2D(
+                [],
+                [],
+                color="#555555",
+                linestyle=linestyle,
+                linewidth=1.4,
+                label=label,
+            )
+            for _, linestyle, label in family_styles
+        ]
+        fig.legend(
+            handles=[*model_handles, *family_handles],
+            loc="lower center",
+            bbox_to_anchor=(0.5, 0.006),
+            ncol=len(model_handles) + len(family_handles),
+            fontsize=7.1,
+        )
+        fig.suptitle(
+            "Mechanism survival across retrieval capacity",
+            fontsize=13.0,
+            y=0.987,
+        )
+        fig.subplots_adjust(
+            left=0.075,
+            right=0.995,
+            bottom=0.14,
+            top=0.87,
+            hspace=0.54,
+            wspace=0.34,
+        )
+        _save_figure(
+            fig,
+            output_dir / "figures",
+            MECHANISM_FIGURE_STEM,
+            {
+                "paper_version": PAPER_VERSION,
+                "selectivity_reliability": (
+                    "point-active head whose registered nested-bootstrap 95% "
+                    "D_rel interval excludes zero"
+                ),
+                "family_stability": (
+                    "population/layer organisation and absolute held-out "
+                    "matched-control causal phenotype; no cross-N head matching"
+                ),
+                "family_causal_specificity": (
+                    "(family same - family cross) - "
+                    "(matched-control same - matched-control cross), using raw "
+                    "P_gross_matched z-space responses"
+                ),
+                "carriage": (
+                    "raw F_sens per eligible carrier with within-selected-seed "
+                    "registered nested-bootstrap interval"
+                ),
+                "carriage_seed_scope": (
+                    "best validation seed independently per model and N; descriptive "
+                    "across N, not training-seed uncertainty"
+                ),
+                "claim_scope": (
+                    "fixed-N capacity co-transition across independently trained "
+                    "checkpoints, not strict OOD generalisation"
+                ),
+            },
+        )
+        plt.close(fig)
+
+
+def plot_carriage_survival_by_distance(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    output_dir: Path,
+    models: Sequence[str],
+    carriage_ns: Sequence[int],
+) -> None:
+    """Distance-resolved raw carriage across the cached capacity cells."""
+
+    import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
+
+    if not rows:
+        return
+    labels = [
+        str(row["distance_group"])
+        for row in sorted(
+            {
+                int(row["distance_index"]): row
+                for row in rows
+            }.values(),
+            key=lambda row: int(row["distance_index"]),
+        )
+    ]
+    n_colours = ("#2F6B9A", "#7A7A7A", "#B33A3A", "#7A4E9A")
+    colour_by_n = {
+        int(records): n_colours[index % len(n_colours)]
+        for index, records in enumerate(carriage_ns)
+    }
+    lookup = {
+        (
+            str(row["model"]),
+            int(row["N"]),
+            str(row["channel"]),
+            int(row["distance_index"]),
+        ): row
+        for row in rows
+    }
+    with _style():
+        fig, axes = plt.subplots(
+            2,
+            len(models),
+            figsize=(3.4 * len(models), 5.2),
+            sharex=True,
+            squeeze=False,
+        )
+        for row_index, channel in enumerate(("semantic", "structural")):
+            for column, model in enumerate(models):
+                axis = axes[row_index, column]
+                for records in carriage_ns:
+                    selected = [
+                        lookup.get(
+                            (
+                                str(model),
+                                int(records),
+                                channel,
+                                distance_index,
+                            ),
+                            {},
+                        )
+                        for distance_index in range(len(labels))
+                    ]
+                    estimate = np.asarray(
+                        [
+                            v2._as_float(row.get("carriage_per_carrier"))
+                            for row in selected
+                        ],
+                        dtype=np.float64,
+                    )
+                    low = np.asarray(
+                        [
+                            v2._as_float(
+                                row.get("carriage_per_carrier_low")
+                            )
+                            for row in selected
+                        ],
+                        dtype=np.float64,
+                    )
+                    high = np.asarray(
+                        [
+                            v2._as_float(
+                                row.get("carriage_per_carrier_high")
+                            )
+                            for row in selected
+                        ],
+                        dtype=np.float64,
+                    )
+                    x = np.arange(len(labels))
+                    axis.plot(
+                        x,
+                        estimate,
+                        color=colour_by_n[int(records)],
+                        marker=("o", "s", "D", "^")[
+                            list(carriage_ns).index(records) % 4
+                        ],
+                        linewidth=1.35,
+                        markersize=3.7,
+                    )
+                    axis.fill_between(
+                        x,
+                        low,
+                        high,
+                        color=colour_by_n[int(records)],
+                        alpha=0.105,
+                        linewidth=0,
+                    )
+                if row_index == 0:
+                    axis.set_title(
+                        MODEL_LABELS[str(model)],
+                        fontsize=10,
+                    )
+                if column == 0:
+                    axis.set_ylabel(
+                        rf"{channel.capitalize()} $F_{{\rm sens}}$ per carrier",
+                        labelpad=8,
+                    )
+                axis.set_xticks(np.arange(len(labels)))
+                axis.set_xticklabels(
+                    labels,
+                    rotation=35,
+                    ha="right",
+                    rotation_mode="anchor",
+                    fontsize=7,
+                )
+        handles = [
+            Line2D(
+                [],
+                [],
+                color=colour_by_n[int(records)],
+                marker=("o", "s", "D", "^")[index % 4],
+                linewidth=1.35,
+                label=f"$N={records}$",
+            )
+            for index, records in enumerate(carriage_ns)
+        ]
+        fig.legend(
+            handles=handles,
+            loc="lower center",
+            bbox_to_anchor=(0.5, 0.006),
+            ncol=len(handles),
+            fontsize=7.2,
+        )
+        fig.supxlabel(
+            "Shortest-path distance from changed source",
+            fontsize=9.5,
+            y=0.075,
+        )
+        fig.suptitle(
+            "Functional carriage across distance and retrieval capacity",
+            fontsize=12.5,
+            y=0.985,
+        )
+        fig.subplots_adjust(
+            left=0.09,
+            right=0.995,
+            bottom=0.18,
+            top=0.86,
+            hspace=0.32,
+            wspace=0.26,
+        )
+        _save_figure(
+            fig,
+            output_dir / "supplementary" / "carriage",
+            CARRIAGE_SURVIVAL_FIGURE_STEM,
+            {
+                "paper_version": PAPER_VERSION,
+                "estimand": (
+                    "raw Functional carriage F_sens per eligible carrier within "
+                    "each grouped shortest-path distance"
+                ),
+                "seed_policy": (
+                    "best validation seed independently per model and N"
+                ),
+                "uncertainty": (
+                    "95% registered nested graph/donor interval within selected seed"
+                ),
+                "source_roles": (
+                    "all registered NAR sources; role-conditioned figures remain separate"
+                ),
+                "beneficial_carriage": "not computed",
+            },
+        )
+        plt.close(fig)
+
+
+def write_and_plot_mechanism_survival(
+    inputs: v2.PaperInputs,
+    *,
+    output_dir: Path,
+    models: Sequence[str],
+    seeds: Sequence[int],
+    ns: Sequence[int],
+    carriage_ns: Sequence[int],
+    bootstrap: BootstrapPolicy,
+    cache_mode: str,
+) -> dict[str, Any]:
+    payload = mechanism_survival_analysis(
+        inputs,
+        output_dir=output_dir,
+        models=models,
+        seeds=seeds,
+        ns=ns,
+        carriage_ns=carriage_ns,
+        bootstrap=bootstrap,
+        cache_mode=cache_mode,
+    )
+    tables = (
+        ("selectivity_reliability.csv", "selectivity_reliability"),
+        ("family_causal_phenotype.csv", "family_causal_phenotype"),
+        ("mechanism_survival_transitions.csv", "transitions"),
+        (
+            "mechanism_survival_transition_statistics.csv",
+            "transition_statistics",
+        ),
+        ("mechanism_survival_transition_order.csv", "transition_order"),
+        ("functional_carriage_survival.csv", "carriage_survival"),
+        (
+            "functional_carriage_survival_by_distance.csv",
+            "carriage_profiles",
+        ),
+    )
+    for filename, key in tables:
+        _write_csv(output_dir / "tables" / filename, payload.get(key, ()))
+    plot_mechanism_survival(
+        payload["selectivity_reliability"],
+        payload["family_causal_phenotype"],
+        payload["carriage_survival"],
+        output_dir=output_dir,
+        models=models,
+        seeds=seeds,
+        ns=ns,
+        carriage_ns=carriage_ns,
+    )
+    plot_carriage_survival_by_distance(
+        payload["carriage_profiles"],
+        output_dir=output_dir,
+        models=models,
+        carriage_ns=carriage_ns,
+    )
+    return payload
+
+
 def make_v3_figures(
     inputs: v2.PaperInputs,
     *,
@@ -2014,6 +3611,7 @@ def make_v3_figures(
     performance_ns: Sequence[int],
     headline_n: int,
     bootstrap: BootstrapPolicy,
+    mechanism_cache_mode: str,
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -2155,6 +3753,16 @@ def make_v3_figures(
         seeds=seeds,
         ns=causal_ns,
     )
+    write_and_plot_mechanism_survival(
+        inputs,
+        output_dir=output_dir,
+        models=models,
+        seeds=seeds,
+        ns=causal_ns,
+        carriage_ns=carriage_ns,
+        bootstrap=bootstrap,
+        cache_mode=mechanism_cache_mode,
+    )
 
     organisation = organisation_rows(
         inputs, models=models, seeds=seeds, ns=score_ns
@@ -2219,6 +3827,12 @@ def make_v3_figures(
                 "retention or collapse of absolute semantic/structural causal engagement "
                 "co-transitions with retention or collapse of fixed-N held-out performance"
             ),
+            "mechanism_survival_questions": [
+                "does the active head population collapse with competence",
+                "is D_rel sign-identifiable among the heads that remain active",
+                "does family layer organisation or causal phenotype change before failure",
+                "does raw Functional carriage magnitude or distance reach disappear",
+            ],
             "terminology": (
                 "capacity retention across independently trained fixed-N checkpoints, not "
                 "cross-N OOD generalisation"
@@ -2234,6 +3848,7 @@ def make_v3_figures(
                 INTERPRETATION_FIGURE_STEM,
                 TRANSITION_FIGURE_STEM,
                 ENGAGEMENT_FIGURE_STEM,
+                MECHANISM_FIGURE_STEM,
             ],
             "complete_core_landscapes": [
                 v2.CORE_FIGURE_STEM.format(N=int(records))
@@ -2245,10 +3860,15 @@ def make_v3_figures(
                 OVERLAP_FIGURE_STEM,
                 DISCRIMINANT_FIGURE_STEM,
                 ENGAGEMENT_SPECIFICITY_FIGURE_STEM,
+                CARRIAGE_SURVIVAL_FIGURE_STEM,
                 "raw role-conditioned Functional carriage",
             ],
             "demoted_or_removed": {
                 "family_interaction": "table only pending outlier audit",
+                "cross_N_head_identity": (
+                    "not used; independent checkpoints are summarised by "
+                    "population/layer phenotype"
+                ),
                 "R_role": "not used",
                 "event_normalised_carriage": "not used",
                 "head_intervals": "supplementary companions",
@@ -2271,6 +3891,24 @@ def build_parser() -> argparse.ArgumentParser:
         description="Cache-only v3 publication synthesis for the fixed-N NAR experiment"
     )
     parser.add_argument("--phase", choices=("figures",), default="figures")
+    parser.add_argument(
+        "--render-target",
+        choices=("all", "mechanism"),
+        default="all",
+        help=(
+            "all renders the complete v3 publication tree; mechanism renders only "
+            "the mechanism-survival figures and tables"
+        ),
+    )
+    parser.add_argument(
+        "--mechanism-cache-mode",
+        choices=("auto", "refresh", "require"),
+        default="auto",
+        help=(
+            "auto reuses a compatible derived cache, refresh recomputes it from "
+            "protected artifacts, and require fails rather than recomputing"
+        ),
+    )
     parser.add_argument(
         "--drive-root",
         default="/content/drive/MyDrive/graph_specialisation_metrics/nar_grit",
@@ -2300,6 +3938,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
     del args.phase
+    render_target = str(args.render_target)
+    mechanism_cache_mode = str(args.mechanism_cache_mode)
     models = _parse_csv_strings(args.models)
     seeds = _parse_csv_ints(args.seeds)
     cached_ns = _parse_csv_ints(args.cached_ns)
@@ -2372,21 +4012,39 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         accuracy_gate=float(args.accuracy_gate),
     )
     _, _, bootstrap, _, _ = policies
-    make_v3_figures(
-        inputs,
-        output_dir=output_dir,
-        models=models,
-        seeds=seeds,
-        score_ns=score_ns,
-        causal_ns=causal_ns,
-        counterfactual_ns=counterfactual_ns,
-        carriage_ns=carriage_ns,
-        performance_ns=performance_ns,
-        headline_n=int(args.headline_n),
-        bootstrap=bootstrap,
+    if render_target == "mechanism":
+        write_and_plot_mechanism_survival(
+            inputs,
+            output_dir=output_dir,
+            models=models,
+            seeds=seeds,
+            ns=causal_ns,
+            carriage_ns=carriage_ns,
+            bootstrap=bootstrap,
+            cache_mode=mechanism_cache_mode,
+        )
+    else:
+        make_v3_figures(
+            inputs,
+            output_dir=output_dir,
+            models=models,
+            seeds=seeds,
+            score_ns=score_ns,
+            causal_ns=causal_ns,
+            counterfactual_ns=counterfactual_ns,
+            carriage_ns=carriage_ns,
+            performance_ns=performance_ns,
+            headline_n=int(args.headline_n),
+            bootstrap=bootstrap,
+            mechanism_cache_mode=mechanism_cache_mode,
+        )
+    summary_name = (
+        "run_summary.json"
+        if render_target == "all"
+        else "mechanism_render_summary.json"
     )
     atomic_json(
-        output_dir / "run_summary.json",
+        output_dir / summary_name,
         {
             "paper_version": PAPER_VERSION,
             "output_dir": str(output_dir),
@@ -2395,9 +4053,16 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "causal_extension_root": str(causal_extension_root),
             "checkpoint_inference": False,
             "score_recomputation": False,
+            "render_target": render_target,
+            "mechanism_cache_mode": mechanism_cache_mode,
             "capacity_hypothesis": (
                 "absolute semantic/structural causal-engagement retention "
                 "co-transitions with fixed-N held-out performance retention"
+            ),
+            "mechanism_survival": (
+                "activity, interval-reliable selectivity, population-level family "
+                "organisation, absolute matched-control causal phenotype, and raw "
+                "Functional carriage are analysed jointly"
             ),
             "cross_N_J_policy": (
                 "J is used for within-checkpoint ranking only; mean_h(J)=1 by construction, "
@@ -2418,7 +4083,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "performance_N_values": list(performance_ns),
         },
     )
-    print(f"[done] v3 paper figures and tables saved under {output_dir}", flush=True)
+    print(
+        f"[done] v3 {render_target} figures and tables saved under {output_dir}",
+        flush=True,
+    )
     return {"output_dir": str(output_dir)}
 
 
@@ -2433,15 +4101,25 @@ __all__ = [
     "causal_engagement_rows",
     "causal_engagement_transition_rows",
     "causal_engagement_transition_statistics",
+    "carriage_survival_rows",
     "discriminant_rows",
+    "family_causal_phenotype_rows",
     "family_overlap_rows",
     "localisation_rows",
     "main",
+    "mechanism_survival_analysis",
+    "mechanism_transition_order_rows",
+    "mechanism_transition_rows",
+    "mechanism_transition_statistics",
     "organisation_rows",
+    "plot_carriage_survival_by_distance",
     "pooled_counterfactual_rows",
     "plot_causal_engagement_and_capacity",
+    "plot_mechanism_survival",
     "plot_specificity_vs_engagement",
     "run",
+    "selectivity_reliability_rows",
+    "write_and_plot_mechanism_survival",
 ]
 
 

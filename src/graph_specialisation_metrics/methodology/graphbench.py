@@ -648,6 +648,17 @@ class GraphBenchGritBackend:
         )
         self.device = runtime.device
         self._torch = torch
+        # Official GRIT currently reaches PyTorch/PyG scatter kernels whose backwards are not
+        # always compatible with ``is_grads_batched=True`` under the pinned PyTorch 2.2 HPC
+        # environment.  Probe the faster engine once, then retain an exact sequential-VJP
+        # fallback for every later graph if vmap reports an unsupported operator.
+        self._batched_vjp_supported: bool | None = None
+        self._jacobian_fallback_reason: str | None = None
+        # Scores and carriage share the discovery graphs within one worker. Retaining detached
+        # clean Jacobians avoids paying the sequential fallback twice while keeping every
+        # checkpoint/task/seed boundary isolated in its own backend instance.
+        self._clean_jacobian_cache: dict[int, CleanJacobians] = {}
+        self._clean_jacobian_cache_hits = 0
 
     @property
     def geometry(self) -> dict[str, int]:
@@ -887,7 +898,50 @@ class GraphBenchGritBackend:
             offset += len(group)
         return outputs
 
-    def clean_jacobians(self, data: Any) -> CleanJacobians:
+    @property
+    def jacobian_engine(self) -> str:
+        if self._batched_vjp_supported is False:
+            return "sequential_vjp"
+        if self._batched_vjp_supported is True:
+            return "batched_vjp"
+        return "auto"
+
+    @property
+    def clean_jacobian_batch_size(self) -> int:
+        # clean_jacobians_many intentionally loops over graph-local output geometries, so a
+        # larger outer batch delays per-graph persistence without increasing device concurrency.
+        return 1
+
+    def remember_clean_jacobians(self, data: Any, clean: CleanJacobians) -> None:
+        """Populate worker-local reuse from a validated persistent shard."""
+
+        self._clean_jacobian_cache[id(data)] = clean
+
+    @staticmethod
+    def _is_vmap_compatibility_error(error: RuntimeError) -> bool:
+        """Recognise engine limitations without swallowing unrelated autograd failures."""
+
+        message = str(error).lower()
+        if "vmap" not in message:
+            return False
+        return any(
+            marker in message
+            for marker in (
+                "not possible",
+                "batching rule",
+                "in-place",
+                "inplace",
+                "does not support",
+                "not implemented",
+            )
+        )
+
+    def _clean_jacobians_impl(
+        self,
+        data: Any,
+        *,
+        use_batched_vjp: bool,
+    ) -> CleanJacobians:
         torch = self._torch
         raw = self._forward_capture([data], require_grad=True)
         capture = self._split_capture(raw)[0]
@@ -900,35 +954,54 @@ class GraphBenchGritBackend:
         )
         transport_rows: list[list[Any]] = []
         final_rows: list[Any] = []
-        for start in range(0, output_count, self.jacobian_output_chunk):
-            stop = min(output_count, start + self.jacobian_output_chunk)
-            basis = torch.zeros(
-                stop - start,
-                output_count,
-                device=z.device,
-                dtype=z.dtype,
-            )
-            basis[
-                torch.arange(stop - start, device=z.device),
-                torch.arange(start, stop, device=z.device),
-            ] = 1
-            gradients = torch.autograd.grad(
-                z,
-                targets,
-                grad_outputs=basis,
-                is_grads_batched=True,
-                retain_graph=stop < output_count,
-                allow_unused=False,
-            )
-            transport_rows.append(list(gradients[:-1]))
-            if self.task_type == "edge_binary":
-                diagonal = gradients[-1][
+        if use_batched_vjp:
+            for start in range(0, output_count, self.jacobian_output_chunk):
+                stop = min(output_count, start + self.jacobian_output_chunk)
+                basis = torch.zeros(
+                    stop - start,
+                    output_count,
+                    device=z.device,
+                    dtype=z.dtype,
+                )
+                basis[
                     torch.arange(stop - start, device=z.device),
                     torch.arange(start, stop, device=z.device),
-                ]
-                final_rows.append(diagonal)
-            else:
-                final_rows.append(gradients[-1])
+                ] = 1
+                gradients = torch.autograd.grad(
+                    z,
+                    targets,
+                    grad_outputs=basis,
+                    is_grads_batched=True,
+                    retain_graph=stop < output_count,
+                    allow_unused=False,
+                )
+                transport_rows.append(list(gradients[:-1]))
+                if self.task_type == "edge_binary":
+                    diagonal = gradients[-1][
+                        torch.arange(stop - start, device=z.device),
+                        torch.arange(start, stop, device=z.device),
+                    ]
+                    final_rows.append(diagonal)
+                else:
+                    final_rows.append(gradients[-1])
+        else:
+            # This computes the same output-by-intermediate Jacobian as the batched path.  It is
+            # slower, but it does not invoke vmap and therefore supports official operators with
+            # in-place or missing batching rules.
+            for output in range(output_count):
+                gradients = torch.autograd.grad(
+                    z[output],
+                    targets,
+                    retain_graph=output + 1 < output_count,
+                    allow_unused=False,
+                )
+                transport_rows.append(
+                    [gradient.unsqueeze(0) for gradient in gradients[:-1]]
+                )
+                if self.task_type == "edge_binary":
+                    final_rows.append(gradients[-1][output : output + 1])
+                else:
+                    final_rows.append(gradients[-1].unsqueeze(0))
         transport = torch.stack(
             [
                 torch.cat([chunk[layer] for chunk in transport_rows], dim=0)
@@ -949,8 +1022,45 @@ class GraphBenchGritBackend:
         capture.final_state = capture.final_state.detach()
         return CleanJacobians(capture, transport.detach(), final_gradient.detach())
 
+    def clean_jacobians(self, data: Any) -> CleanJacobians:
+        cache_key = id(data)
+        cached = self._clean_jacobian_cache.get(cache_key)
+        if cached is not None:
+            self._clean_jacobian_cache_hits += 1
+            if self._clean_jacobian_cache_hits == 1:
+                print(
+                    "[graphbench] reusing detached clean Jacobians across worker "
+                    "components",
+                    flush=True,
+                )
+            return cached
+        use_batched_vjp = self._batched_vjp_supported is not False
+        try:
+            clean = self._clean_jacobians_impl(
+                data,
+                use_batched_vjp=use_batched_vjp,
+            )
+        except RuntimeError as error:
+            if not use_batched_vjp or not self._is_vmap_compatibility_error(error):
+                raise
+            self._batched_vjp_supported = False
+            self._jacobian_fallback_reason = str(error).splitlines()[0]
+            print(
+                "[graphbench] batched VJP is incompatible with an official model "
+                "operator; rebuilding the clean forward and using exact sequential "
+                "VJPs for this worker",
+                flush=True,
+            )
+            clean = self._clean_jacobians_impl(data, use_batched_vjp=False)
+        else:
+            if use_batched_vjp:
+                self._batched_vjp_supported = True
+        self._clean_jacobian_cache[cache_key] = clean
+        return clean
+
     def clean_jacobians_many(self, data_list: Sequence[Any]) -> list[CleanJacobians]:
-        # Output counts differ across matching graphs. Chunked batched VJPs are used inside each
+        # Output counts differ across matching graphs. Batched VJPs (or the exact sequential
+        # fallback selected by the first incompatible official operator) are used inside each
         # graph, while event forwards remain multi-graph. This avoids padding a dense E-by-E
         # Jacobian across unrelated graph geometries.
         return [self.clean_jacobians(data) for data in data_list]

@@ -214,6 +214,7 @@ def _model_audits(
         "batch_invariance_max_error": batch_error,
         "attention_normalization_max_error": attention_error,
         "no_op_max_error": no_op_error,
+        "jacobian_engine": getattr(backend, "jacobian_engine", "sequential_vjp"),
         "clean_transport_gradient_norm": float(
             torch.linalg.vector_norm(clean.transport).item()
         ),
@@ -894,6 +895,8 @@ def _cache(
     prepared: PreparedTask,
     config: MethodologyConfig,
     plan: Mapping[int, Mapping[str, Any]],
+    *,
+    manifest_hash: str | None = None,
 ) -> CanonicalCache:
     return CanonicalCache(
         config.root,
@@ -907,7 +910,9 @@ def _cache(
             output_representation=prepared.task.output.representation,
             sigma=tuple(float(value) for value in prepared.sigma),
             split_fingerprint=prepared.splits.fingerprint,
-            event_manifest_hash=_manifest_hash(plan),
+            event_manifest_hash=(
+                _manifest_hash(plan) if manifest_hash is None else str(manifest_hash)
+            ),
             donors_per_source=int(config.sizes.donors_per_source),
             source_cap=int(config.sizes.sources_per_graph),
             bootstrap_seed=int(config.bootstrap.rng_seed),
@@ -1004,9 +1009,71 @@ def _prepare_clean_jacobians(
     config: MethodologyConfig,
     graph_ids: Sequence[int],
 ) -> tuple[dict[int, Any], dict[str, Any]]:
-    """Batch clean linearisations and return graph-keyed results plus execution provenance."""
+    """Resume/persist clean linearisations and return graph-keyed execution provenance."""
 
+    requested_ids = tuple(int(value) for value in graph_ids)
     clean_by_graph: dict[int, Any] = {}
+    # Scores and carriage use the same discovery population but different event manifests. Bind
+    # clean shards to the complete discovery IDs so either component (and a restarted worker) sees
+    # the same protected cache contract even when only a subset of event shards is missing.
+    clean_population = tuple(int(graph_id) for graph_id in prepared.splits.discovery)
+    cache = _cache(
+        prepared,
+        config,
+        {},
+        manifest_hash=stable_hash(
+            {
+                "stage": "clean_jacobians",
+                "graphs": clean_population,
+            }
+        ),
+    )
+    cache_hits = 0
+    missing: list[int] = []
+
+    def to_device(clean):
+        device = getattr(prepared.backend, "device", None)
+        if device is None:
+            device = getattr(getattr(prepared.backend, "gm", None), "device", None)
+        if device is None:
+            return clean
+        clean.capture.prediction = clean.capture.prediction.to(device)
+        clean.capture.z = clean.capture.z.to(device)
+        clean.capture.target = clean.capture.target.to(device)
+        clean.capture.transport = tuple(
+            value.to(device) for value in clean.capture.transport
+        )
+        clean.capture.final_state = clean.capture.final_state.to(device)
+        if clean.capture.real_mask is not None:
+            clean.capture.real_mask = clean.capture.real_mask.to(device)
+        clean.transport = clean.transport.to(device)
+        clean.final_state = clean.final_state.to(device)
+        return clean
+
+    for graph_id in requested_ids:
+        cached = (
+            cache.load(
+                "clean_jacobians",
+                f"graph_{graph_id:06d}",
+                strict=True,
+            )
+            if config.resume and not config.force
+            else None
+        )
+        if cached is None:
+            missing.append(graph_id)
+            continue
+        clean = to_device(cached)
+        clean_by_graph[graph_id] = clean
+        remember = getattr(prepared.backend, "remember_clean_jacobians", None)
+        if callable(remember):
+            remember(prepared.grit.eval_ds[graph_id], clean)
+        cache_hits += 1
+    if cache_hits:
+        log(
+            f"[cache] loaded {cache_hits}/{len(requested_ids)} clean Jacobian "
+            f"graph shards for {prepared.task.name}"
+        )
 
     def execute(chunk):
         bases = [prepared.grit.eval_ds[int(graph_id)] for graph_id in chunk]
@@ -1021,16 +1088,50 @@ def _prepare_clean_jacobians(
         return list(zip((int(value) for value in chunk), values))
 
     def consume(rows):
-        clean_by_graph.update(rows)
+        for graph_id, clean in rows:
+            clean_by_graph[int(graph_id)] = clean
+            cache.save(
+                "clean_jacobians",
+                f"graph_{int(graph_id):06d}",
+                clean,
+            )
+
+    requested_batch = int(config.execution.graphs_per_batch)
+    backend_limit = getattr(prepared.backend, "clean_jacobian_batch_size", None)
+    clean_batch = (
+        requested_batch
+        if backend_limit is None
+        else min(requested_batch, max(1, int(backend_limit)))
+    )
+
+    def on_batch(completed, total, batch_size):
+        if prepared.progress is not None:
+            prepared.progress.emit(
+                "clean_jacobian_progress",
+                completed=int(completed),
+                total=int(total),
+                batch_size=int(batch_size),
+                cache_hits=int(cache_hits),
+            )
 
     report = execute_graph_batches(
-        graph_ids,
-        graphs_per_batch=config.execution.graphs_per_batch,
+        missing,
+        graphs_per_batch=clean_batch,
         execute=execute,
         consume=consume,
         oom_backoff=config.execution.oom_backoff,
+        on_batch=on_batch,
     )
-    return clean_by_graph, dataclasses.asdict(report)
+    execution = dataclasses.asdict(report)
+    execution.update(
+        {
+            "cache_hits": int(cache_hits),
+            "cache_misses": len(missing),
+            "requested_graphs": len(requested_ids),
+            "configured_graphs_per_batch": requested_batch,
+        }
+    )
+    return clean_by_graph, execution
 
 
 def _event_item_cost(
