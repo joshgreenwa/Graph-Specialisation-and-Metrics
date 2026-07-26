@@ -20,7 +20,7 @@ from ..methodology.bootstrap import (
     nested_percentile_interval,
     trimmed_mean,
 )
-from ..methodology.cache import atomic_json
+from ..methodology.cache import StaleCacheError, atomic_json
 from ..methodology.distance import display_bins
 from ..methodology.protocol import BootstrapPolicy, stable_hash
 from . import nar_methodology_paper as v2
@@ -108,18 +108,66 @@ def load_v3_inputs(
         accuracy_gate=float(accuracy_gate),
     )
     causal = dict(inputs.causal)
+    missing: list[tuple[str, int, int, Path]] = []
+    incompatible: list[str] = []
     for records in transition_causal_ns:
         for model in models:
             for seed in seeds:
                 binding = inputs.score_bindings[
                     (str(model), int(records), int(seed))
                 ]
-                causal[(str(model), int(records), int(seed))] = (
-                    load_transition_causal_artifact(
-                        extension_root=causal_extension_root,
-                        binding=binding,
+                path = (
+                    causal_extension_root
+                    / "canonical"
+                    / str(binding.task)
+                    / f"seed_{int(seed)}"
+                    / "cache"
+                    / "causal"
+                    / "validation.pt"
+                )
+                try:
+                    causal[(str(model), int(records), int(seed))] = (
+                        load_transition_causal_artifact(
+                            extension_root=causal_extension_root,
+                            binding=binding,
+                        )
+                    )
+                except FileNotFoundError:
+                    missing.append((str(model), int(records), int(seed), path))
+                except StaleCacheError as error:
+                    incompatible.append(
+                        f"{model}:N{records}:seed{seed}: {error}"
+                    )
+    if missing or incompatible:
+        lines = [
+            "v3 source preflight found incomplete transition causal caches.",
+            "Protected score caches are unaffected and must not be recomputed.",
+        ]
+        if missing:
+            lines.append("Missing causal-only cells:")
+            lines.extend(
+                f"- {model}:N{records}:seed{seed}: {path}"
+                for model, records, seed, path in missing
+            )
+            if len(missing) == 1:
+                model, records, seed, _ = missing[0]
+                lines.extend(
+                    (
+                        "Recover only this cell with nar_causal_transition_colab.py:",
+                        f'  "--models", "{model}",',
+                        f'  "--seeds", "{seed}",',
+                        f'  "--causal-ns", "{records}",',
                     )
                 )
+            else:
+                lines.append(
+                    "Rerun nar_causal_transition_colab.py unchanged: its preflight "
+                    "validates existing cells and computes only missing causal cells."
+                )
+        if incompatible:
+            lines.append("Existing but incompatible causal cells (left untouched):")
+            lines.extend(f"- {item}" for item in incompatible)
+        raise FileNotFoundError("\n".join(lines))
     return dataclasses.replace(inputs, causal=causal), policies
 
 

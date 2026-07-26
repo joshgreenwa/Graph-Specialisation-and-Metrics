@@ -2,7 +2,9 @@
 
 Paste this file into one Colab cell.  It reads the protected N=8,32 score caches from
 ``nar_role_counterfactual_v1`` and writes only held-out causal-validation artifacts to
-``nar_causal_transition_v1``.  It never runs the score stage.
+``nar_causal_transition_v1``.  It never runs the score stage. It is safe to rerun after an
+interruption: preflight validates every existing cell and computes only missing causal cells.
+A per-cell completion manifest is streamed to Drive.
 """
 
 from __future__ import annotations

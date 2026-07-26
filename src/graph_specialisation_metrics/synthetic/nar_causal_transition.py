@@ -81,6 +81,51 @@ def _expected_provenance(binding: Any) -> dict[str, Any]:
     }
 
 
+def _cell_record(
+    *,
+    binding: Any,
+    path: Path,
+    status: str,
+    artifact_sha256: str | None = None,
+) -> dict[str, Any]:
+    record = {
+        "task": str(binding.task),
+        "seed": int(binding.seed),
+        "path": str(path),
+        "status": str(status),
+        "checkpoint_sha256": str(binding.checkpoint_sha256),
+        "source_score_sha256": str(binding.score_artifact.file_sha256),
+    }
+    if artifact_sha256 is not None:
+        record["causal_artifact_sha256"] = str(artifact_sha256)
+    return record
+
+
+def _write_completion_manifest(
+    extension_root: Path,
+    *,
+    expected: Sequence[Mapping[str, Any]],
+    existing: Sequence[Mapping[str, Any]],
+    completed: Sequence[Mapping[str, Any]],
+    status: str,
+) -> None:
+    atomic_json(
+        extension_root / "completion_manifest.json",
+        {
+            "causal_transition_version": CAUSAL_TRANSITION_VERSION,
+            "status": str(status),
+            "score_recomputation": False,
+            "expected_cell_count": len(expected),
+            "validated_existing_cell_count": len(existing),
+            "completed_in_this_invocation_count": len(completed),
+            "remaining_cell_count": len(expected) - len(existing) - len(completed),
+            "expected_cells": list(expected),
+            "validated_existing_cells": list(existing),
+            "completed_in_this_invocation": list(completed),
+        },
+    )
+
+
 def load_transition_causal_artifact(
     *,
     extension_root: Path,
@@ -189,7 +234,7 @@ def run_causal_completion(
     accelerator: str,
     graphs_per_batch: int,
     num_threads: int,
-) -> None:
+) -> dict[str, Any]:
     """Compute only missing causal cells from already-protected score artifacts."""
 
     from ..methodology.runner import prepare_task
@@ -201,6 +246,9 @@ def run_causal_completion(
         width=int(width),
         training_run_dir=training_run_dir,
     )
+    cells: list[tuple[Any, Path]] = []
+    existing: list[dict[str, Any]] = []
+    missing: list[tuple[Any, Path]] = []
     for records in ns:
         for model in models:
             for seed in seeds:
@@ -215,62 +263,119 @@ def run_causal_completion(
                 path = _causal_path(
                     causal_extension_root, binding.task, binding.seed
                 )
+                cells.append((binding, path))
                 if path.exists():
                     load_transition_causal_artifact(
                         extension_root=causal_extension_root,
                         binding=binding,
+                    )
+                    artifact = load_cache_artifact_file(path)
+                    existing.append(
+                        _cell_record(
+                            binding=binding,
+                            path=path,
+                            status="validated_existing",
+                            artifact_sha256=artifact.file_sha256,
+                        )
                     )
                     print(
                         f"[causal-transition] protected cache exists: "
                         f"{binding.task}:seed{seed}",
                         flush=True,
                     )
-                    continue
-                config = _causal_config(
-                    base_canonical_root=base_canonical_root,
-                    output_dir=_causal_root(causal_extension_root),
-                    task=binding.task,
-                    seed=int(seed),
-                    accelerator=str(accelerator),
-                    graphs_per_batch=int(graphs_per_batch),
-                    num_threads=int(num_threads),
-                )
-                prepared = prepare_task(config, binding.task, int(seed))
-                if str(prepared.checkpoint_sha) != str(binding.checkpoint_sha256):
-                    raise StaleCacheError(
-                        f"loaded checkpoint changed for {binding.task}:seed{seed}; "
-                        "protected score and causal artifacts were left untouched"
-                    )
-                print(
-                    f"[causal-transition] {binding.task}:seed{seed} "
-                    "(official causal validation; score cache read-only)",
-                    flush=True,
-                )
-                result = run_causal_validation(
-                    prepared,
-                    config,
-                    binding.score_artifact.value,
-                )
-                if result.get("families", {}) != binding.score_artifact.value.get(
-                    "families", {}
-                ):
-                    raise RuntimeError("official causal result changed frozen score families")
-                artifact = load_cache_artifact_file(path)
-                provenance = {
-                    **_expected_provenance(binding),
-                    "causal_artifact_path": str(path),
-                    "causal_artifact_sha256": artifact.file_sha256,
-                }
-                atomic_json(
-                    _provenance_path(
-                        causal_extension_root, binding.task, binding.seed
-                    ),
-                    provenance,
-                )
-                load_transition_causal_artifact(
-                    extension_root=causal_extension_root,
-                    binding=binding,
-                )
+                else:
+                    missing.append((binding, path))
+    expected = [
+        _cell_record(binding=binding, path=path, status="expected")
+        for binding, path in cells
+    ]
+    completed: list[dict[str, Any]] = []
+    _write_completion_manifest(
+        causal_extension_root,
+        expected=expected,
+        existing=existing,
+        completed=completed,
+        status="running",
+    )
+    print(
+        "[causal-transition] preflight: "
+        f"{len(existing)}/{len(cells)} cells validated; "
+        f"{len(missing)} causal-only cell(s) remain; scores will not be recomputed",
+        flush=True,
+    )
+    for binding, path in missing:
+        config = _causal_config(
+            base_canonical_root=base_canonical_root,
+            output_dir=_causal_root(causal_extension_root),
+            task=binding.task,
+            seed=int(binding.seed),
+            accelerator=str(accelerator),
+            graphs_per_batch=int(graphs_per_batch),
+            num_threads=int(num_threads),
+        )
+        prepared = prepare_task(config, binding.task, int(binding.seed))
+        if str(prepared.checkpoint_sha) != str(binding.checkpoint_sha256):
+            raise StaleCacheError(
+                f"loaded checkpoint changed for {binding.task}:seed{binding.seed}; "
+                "protected score and causal artifacts were left untouched"
+            )
+        print(
+            f"[causal-transition] {binding.task}:seed{binding.seed} "
+            "(official causal validation; score cache read-only)",
+            flush=True,
+        )
+        result = run_causal_validation(
+            prepared,
+            config,
+            binding.score_artifact.value,
+        )
+        if result.get("families", {}) != binding.score_artifact.value.get(
+            "families", {}
+        ):
+            raise RuntimeError("official causal result changed frozen score families")
+        artifact = load_cache_artifact_file(path)
+        provenance = {
+            **_expected_provenance(binding),
+            "causal_artifact_path": str(path),
+            "causal_artifact_sha256": artifact.file_sha256,
+        }
+        atomic_json(
+            _provenance_path(
+                causal_extension_root, binding.task, binding.seed
+            ),
+            provenance,
+        )
+        load_transition_causal_artifact(
+            extension_root=causal_extension_root,
+            binding=binding,
+        )
+        completed.append(
+            _cell_record(
+                binding=binding,
+                path=path,
+                status="completed_in_this_invocation",
+                artifact_sha256=artifact.file_sha256,
+            )
+        )
+        _write_completion_manifest(
+            causal_extension_root,
+            expected=expected,
+            existing=existing,
+            completed=completed,
+            status="running",
+        )
+    _write_completion_manifest(
+        causal_extension_root,
+        expected=expected,
+        existing=existing,
+        completed=completed,
+        status="complete",
+    )
+    return {
+        "expected_cells": expected,
+        "validated_existing_cells": existing,
+        "completed_in_this_invocation": completed,
+    }
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -326,7 +431,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     training.setup_official_grit(
         Path(args.grit_dir), install=not bool(args.skip_install)
     )
-    run_causal_completion(
+    completion = run_causal_completion(
         base_canonical_root=base_canonical_root,
         source_extension_root=source_extension_root,
         causal_extension_root=causal_extension_root,
@@ -351,6 +456,16 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "seeds": list(seeds),
             "causal_N_values": list(causal_ns),
             "score_recomputation": False,
+            "expected_cell_count": len(completion["expected_cells"]),
+            "validated_existing_cell_count": len(
+                completion["validated_existing_cells"]
+            ),
+            "completed_in_this_invocation_count": len(
+                completion["completed_in_this_invocation"]
+            ),
+            "completion_manifest": str(
+                causal_extension_root / "completion_manifest.json"
+            ),
             "cache_policy": (
                 "source scores read-only; completed causal cells immutable and validated "
                 "against source score hashes"

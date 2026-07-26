@@ -21,6 +21,7 @@ from graph_specialisation_metrics.synthetic import nar_methodology_paper_v3 as v
 from graph_specialisation_metrics.synthetic.nar_causal_transition import (
     _expected_provenance,
     _provenance_path,
+    _write_completion_manifest,
     load_transition_causal_artifact,
 )
 from graph_specialisation_metrics.synthetic.nar_methodology_paper_v3 import (
@@ -508,6 +509,93 @@ def test_transition_causal_loader_is_bound_to_source_score_hash(tmp_path):
             extension_root=tmp_path,
             binding=changed_binding,
         )
+
+
+def test_read_only_artifact_loader_preserves_missing_file_diagnostic(tmp_path):
+    path = tmp_path / "missing.pt"
+
+    with pytest.raises(FileNotFoundError, match="cache file does not exist"):
+        load_cache_artifact_file(path)
+
+
+def test_transition_completion_manifest_is_cell_level_and_fail_visible(tmp_path):
+    expected = [{"task": "nar_dense_N32", "seed": 2}]
+    completed = [
+        {
+            "task": "nar_dense_N32",
+            "seed": 2,
+            "causal_artifact_sha256": "causal-sha",
+        }
+    ]
+
+    _write_completion_manifest(
+        tmp_path,
+        expected=expected,
+        existing=(),
+        completed=completed,
+        status="complete",
+    )
+    manifest = json.loads(
+        (tmp_path / "completion_manifest.json").read_text(encoding="utf-8")
+    )
+
+    assert manifest["status"] == "complete"
+    assert manifest["score_recomputation"] is False
+    assert manifest["remaining_cell_count"] == 0
+    assert manifest["completed_in_this_invocation"] == completed
+
+
+def test_v3_preflight_reports_exact_causal_only_recovery_cell(
+    tmp_path,
+    monkeypatch,
+):
+    binding = SimpleNamespace(task="nar_dense_N32")
+    inputs = PaperInputs(
+        score_bindings={("dense", 32, 2): binding},
+        causal={},
+        role_results={},
+        counterfactual={},
+        carriage={},
+        best_seeds={},
+        performance=[],
+    )
+    monkeypatch.setattr(
+        v3.v2,
+        "load_paper_inputs",
+        lambda **kwargs: (inputs, ()),
+    )
+    monkeypatch.setattr(
+        v3,
+        "load_transition_causal_artifact",
+        lambda **kwargs: (_ for _ in ()).throw(FileNotFoundError("missing")),
+    )
+
+    with pytest.raises(FileNotFoundError) as raised:
+        v3.load_v3_inputs(
+            base_analysis_root=tmp_path / "analysis",
+            base_canonical_root=tmp_path / "canonical",
+            source_extension_root=tmp_path / "scores",
+            causal_extension_root=tmp_path / "causal",
+            training_run_dir=tmp_path / "training",
+            models=("dense",),
+            score_ns=(32,),
+            canonical_causal_ns=(),
+            transition_causal_ns=(32,),
+            counterfactual_ns=(),
+            carriage_ns=(),
+            cached_ns=(4, 16, 64),
+            performance_ns=(32,),
+            seeds=(2,),
+            width=128,
+            donors_per_role=8,
+            accuracy_gate=0.85,
+        )
+
+    message = str(raised.value)
+    assert "Protected score caches are unaffected" in message
+    assert '"--models", "dense"' in message
+    assert '"--seeds", "2"' in message
+    assert '"--causal-ns", "32"' in message
 
 
 def test_v3_publication_figures_render_without_overlapping_legacy_panels(tmp_path):

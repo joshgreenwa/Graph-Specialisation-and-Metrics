@@ -129,7 +129,10 @@ rerunning scoring. Run `analysis/nar_causal_transition_colab.py` once. It invoke
 causal-validation implementation directly against the protected score payloads and writes
 checkpoint- and score-hash-bound artifacts only below
 `extensions/nar_causal_transition_v1/`. Existing canonical, score-extension, and paper-v2 files
-are never overwritten.
+are never overwritten. The frontend is safely resumable: it preflights the requested matrix,
+validates every existing causal cell, and computes only missing causal cells. It updates
+`completion_manifest.json` in Drive after each completed cell, then marks the manifest complete
+only after the full requested matrix has been validated.
 
 Then run `analysis/nar_methodology_paper_v3_colab.py`. This second frontend is model-free and
 writes only to `extensions/nar_methodology_paper_v3/`. Its targeted outputs are:

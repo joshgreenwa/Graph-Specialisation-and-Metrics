@@ -214,6 +214,8 @@ def load_cache_artifact_file(path: str | Path) -> ReadOnlyCacheArtifact:
     import torch
 
     resolved = Path(path)
+    if not resolved.exists():
+        raise FileNotFoundError(f"cache file does not exist: {resolved}")
     try:
         payload = torch.load(resolved, map_location="cpu", weights_only=False)
     except (OSError, RuntimeError, EOFError) as error:
