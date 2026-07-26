@@ -34,6 +34,8 @@ from .nar_causal_transition import (
 )
 from .nar_methodology_extension import (
     DEFAULT_EXTENSION_NAME as SOURCE_EXTENSION_NAME,
+    _cluster_spearman_interval,
+    _excess_accuracy,
     _methodology_policies,
     _parse_csv_ints,
     _parse_csv_strings,
@@ -50,6 +52,10 @@ TRANSITION_FIGURE_STEM = "04_competence_and_causal_grounding"
 ORGANISATION_FIGURE_STEM = "S04_head_organisation_across_capacity"
 OVERLAP_FIGURE_STEM = "S05_core_role_family_overlap"
 DISCRIMINANT_FIGURE_STEM = "S06_channel_discriminant_validity"
+ENGAGEMENT_FIGURE_STEM = "05_causal_engagement_and_capacity"
+ENGAGEMENT_SPECIFICITY_FIGURE_STEM = (
+    "S07_relative_specificity_vs_causal_engagement"
+)
 FINGERPRINT_FIGURE_STEM = "S03_conditional_source_fingerprint_N{N}"
 
 
@@ -1290,6 +1296,711 @@ def plot_complete_grounding(
         plt.close(fig)
 
 
+def causal_engagement_rows(
+    inputs: v2.PaperInputs,
+    *,
+    models: Sequence[str],
+    seeds: Sequence[int],
+    ns: Sequence[int],
+) -> list[dict[str, Any]]:
+    """Checkpoint-level absolute engagement, retention, and relative specificity.
+
+    ``J`` is intentionally absent as an absolute level: its within-checkpoint mean is one by
+    construction. The discovery endpoints are the unnormalised ``S_sem``/``S_str`` means; the
+    held-out endpoints are the positive, unadjusted all-head reference scales already retained
+    by the canonical causal analysis.
+    """
+
+    accuracy = {
+        (str(row["model"]), int(row["N"]), int(row["seed"])): v2._as_float(
+            row.get("accuracy")
+        )
+        for row in inputs.performance
+    }
+    output: list[dict[str, Any]] = []
+    for model in models:
+        for seed in seeds:
+            provisional: list[dict[str, Any]] = []
+            for records in ns:
+                key = (str(model), int(records), int(seed))
+                causal = inputs.causal[key]
+                scores = inputs.score_bindings[key].score_artifact.value
+                coordinates = scores["coordinates"]
+                summary = causal["summary"]
+                gross = summary.get("gross_reference_scales", {})
+                necessity = summary.get("necessity_reference_scales", {})
+                gross_semantic = v2._as_float(gross.get("semantic"))
+                gross_structural = v2._as_float(gross.get("structural"))
+                necessity_semantic = v2._as_float(necessity.get("semantic"))
+                necessity_structural = v2._as_float(necessity.get("structural"))
+
+                def geometric_mean(left: float, right: float) -> float:
+                    if (
+                        not np.isfinite(left)
+                        or not np.isfinite(right)
+                        or left <= 0
+                        or right <= 0
+                    ):
+                        return float("nan")
+                    return float(np.sqrt(left * right))
+
+                head_clean = [
+                    value
+                    for name, value in causal.get("clean_ablation", {}).items()
+                    if str(name).startswith("head_")
+                ]
+                prediction_movement = np.asarray(
+                    [
+                        v2._as_float(value.get("prediction_movement"))
+                        for value in head_clean
+                    ],
+                    dtype=np.float64,
+                )
+                prediction_movement = prediction_movement[
+                    np.isfinite(prediction_movement)
+                ]
+                metric_loss = np.asarray(
+                    [
+                        v2._as_float(value.get("registered_metric_clean"))
+                        - v2._as_float(value.get("registered_metric_ablated"))
+                        for value in head_clean
+                    ],
+                    dtype=np.float64,
+                )
+                metric_loss = metric_loss[np.isfinite(metric_loss)]
+                active = np.asarray(coordinates.active, dtype=bool)
+                selectivity = np.asarray(
+                    coordinates.selectivity, dtype=np.float64
+                )
+                cell_accuracy = accuracy.get(key, np.nan)
+                provisional.append(
+                    {
+                        "model": model,
+                        "N": int(records),
+                        "seed": int(seed),
+                        "accuracy": cell_accuracy,
+                        "chance": 1.0 / float(records),
+                        "chance_adjusted_accuracy": (
+                            _excess_accuracy(cell_accuracy, int(records))
+                            if np.isfinite(cell_accuracy)
+                            else np.nan
+                        ),
+                        "gross_semantic": gross_semantic,
+                        "gross_structural": gross_structural,
+                        "gross_joint_geomean": geometric_mean(
+                            gross_semantic, gross_structural
+                        ),
+                        "necessity_semantic": necessity_semantic,
+                        "necessity_structural": necessity_structural,
+                        "necessity_joint_geomean": geometric_mean(
+                            necessity_semantic, necessity_structural
+                        ),
+                        "raw_semantic_mean": v2._as_float(
+                            coordinates.semantic_mean
+                        ),
+                        "raw_structural_mean": v2._as_float(
+                            coordinates.structural_mean
+                        ),
+                        "raw_joint_geomean": geometric_mean(
+                            v2._as_float(coordinates.semantic_mean),
+                            v2._as_float(coordinates.structural_mean),
+                        ),
+                        "mean_head_clean_prediction_movement": (
+                            float(np.mean(prediction_movement))
+                            if len(prediction_movement)
+                            else np.nan
+                        ),
+                        "mean_head_accuracy_loss": (
+                            float(np.mean(metric_loss)) if len(metric_loss) else np.nan
+                        ),
+                        "median_active_abs_D_rel": (
+                            float(np.nanmedian(np.abs(selectivity[active])))
+                            if np.any(active)
+                            else np.nan
+                        ),
+                        "active_head_fraction": float(np.mean(active)),
+                        "J_cross_N_status": (
+                            "not an absolute engagement endpoint; mean_h(J)=1 "
+                            "within every estimable checkpoint"
+                        ),
+                        "output_dimension": int(records),
+                        "response_geometry": (
+                            "registered output-projected z-space response; the N-way "
+                            "output dimension changes with memory size"
+                        ),
+                        "checkpoint_regime": (
+                            "independently trained and evaluated at this fixed N"
+                        ),
+                    }
+                )
+            if not provisional:
+                continue
+            baseline = min(provisional, key=lambda row: int(row["N"]))
+            retention_fields = (
+                "gross_semantic",
+                "gross_structural",
+                "gross_joint_geomean",
+                "necessity_semantic",
+                "necessity_structural",
+                "necessity_joint_geomean",
+                "raw_semantic_mean",
+                "raw_structural_mean",
+                "raw_joint_geomean",
+                "mean_head_clean_prediction_movement",
+            )
+            for row in provisional:
+                for field in retention_fields:
+                    numerator = v2._as_float(row[field])
+                    denominator = v2._as_float(baseline[field])
+                    retention = (
+                        float(numerator / denominator)
+                        if np.isfinite(numerator)
+                        and np.isfinite(denominator)
+                        and numerator > 0
+                        and denominator > 0
+                        else np.nan
+                    )
+                    row[f"{field}_retention"] = retention
+                    row[f"{field}_log2_retention"] = (
+                        float(np.log2(retention))
+                        if np.isfinite(retention) and retention > 0
+                        else np.nan
+                    )
+                row["retention_reference_N"] = int(baseline["N"])
+                output.append(row)
+    return output
+
+
+def causal_engagement_transition_rows(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    models: Sequence[str],
+    seeds: Sequence[int],
+    ns: Sequence[int],
+) -> tuple[list[dict[str, Any]], dict[str, list[tuple[float, float]]]]:
+    """Adjacent-N co-transitions for raw-score and held-out causal engagement."""
+
+    lookup = {
+        (str(row["model"]), int(row["N"]), int(row["seed"])): row
+        for row in rows
+    }
+    output: list[dict[str, Any]] = []
+    raw_trajectories: dict[str, list[tuple[float, float]]] = {}
+    gross_trajectories: dict[str, list[tuple[float, float]]] = {}
+    necessity_trajectories: dict[str, list[tuple[float, float]]] = {}
+    for model in models:
+        for seed in seeds:
+            raw_points: list[tuple[float, float]] = []
+            gross_points: list[tuple[float, float]] = []
+            necessity_points: list[tuple[float, float]] = []
+            for left_n, right_n in zip(ns[:-1], ns[1:]):
+                left = lookup[(str(model), int(left_n), int(seed))]
+                right = lookup[(str(model), int(right_n), int(seed))]
+                delta_accuracy = (
+                    float(right["chance_adjusted_accuracy"])
+                    - float(left["chance_adjusted_accuracy"])
+                )
+                delta_gross = (
+                    float(right["gross_joint_geomean_log2_retention"])
+                    - float(left["gross_joint_geomean_log2_retention"])
+                )
+                delta_raw = (
+                    float(right["raw_joint_geomean_log2_retention"])
+                    - float(left["raw_joint_geomean_log2_retention"])
+                )
+                delta_necessity = (
+                    float(right["necessity_joint_geomean_log2_retention"])
+                    - float(left["necessity_joint_geomean_log2_retention"])
+                )
+                delta_specificity = (
+                    float(right["median_active_abs_D_rel"])
+                    - float(left["median_active_abs_D_rel"])
+                )
+                output.append(
+                    {
+                        "model": model,
+                        "seed": int(seed),
+                        "transition": f"{left_n}->{right_n}",
+                        "N_left": int(left_n),
+                        "N_right": int(right_n),
+                        "delta_chance_adjusted_accuracy": delta_accuracy,
+                        "delta_log2_raw_score_engagement": delta_raw,
+                        "delta_log2_gross_engagement": delta_gross,
+                        "delta_log2_necessity_engagement": delta_necessity,
+                        "delta_median_active_abs_D_rel": delta_specificity,
+                    }
+                )
+                if np.isfinite(delta_raw) and np.isfinite(delta_accuracy):
+                    raw_points.append((delta_raw, delta_accuracy))
+                if np.isfinite(delta_gross) and np.isfinite(delta_accuracy):
+                    gross_points.append((delta_gross, delta_accuracy))
+                if np.isfinite(delta_necessity) and np.isfinite(delta_accuracy):
+                    necessity_points.append((delta_necessity, delta_accuracy))
+            cluster = f"{model}:seed{int(seed)}"
+            raw_trajectories[cluster] = raw_points
+            gross_trajectories[cluster] = gross_points
+            necessity_trajectories[cluster] = necessity_points
+    return output, {
+        "raw_score": raw_trajectories,
+        "gross": gross_trajectories,
+        "necessity": necessity_trajectories,
+    }
+
+
+def causal_engagement_transition_statistics(
+    trajectories: Mapping[str, Mapping[str, Sequence[tuple[float, float]]]],
+    *,
+    bootstrap: BootstrapPolicy,
+) -> list[dict[str, Any]]:
+    output: list[dict[str, Any]] = []
+    for index, endpoint in enumerate(("raw_score", "gross", "necessity")):
+        keyed = {
+            (str(key), 0): tuple(points)
+            for key, points in trajectories[endpoint].items()
+            if points
+        }
+        if not keyed:
+            continue
+        rho, low, high = _cluster_spearman_interval(
+            keyed,
+            seed=int(bootstrap.rng_seed) + 140_000 + index,
+            replicates=int(bootstrap.replicates),
+        )
+        output.append(
+            {
+                "endpoint": endpoint,
+                "spearman_rho": rho,
+                "ci95_low": low,
+                "ci95_high": high,
+                "trajectory_clusters": len(keyed),
+                "bootstrap_replicates": int(bootstrap.replicates),
+                "resampling_unit": "model × training-seed trajectory",
+                "x": f"adjacent delta log2 {endpoint} engagement",
+                "y": "adjacent delta chance-adjusted accuracy",
+                "claim_scope": "co-transition, not causal prediction beyond N",
+            }
+        )
+    return output
+
+
+def _seed_curve(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    model: str,
+    seeds: Sequence[int],
+    ns: Sequence[int],
+    field: str,
+) -> np.ndarray:
+    lookup = {
+        (str(row["model"]), int(row["N"]), int(row["seed"])): v2._as_float(
+            row.get(field)
+        )
+        for row in rows
+    }
+    return np.asarray(
+        [
+            [
+                lookup.get((str(model), int(records), int(seed)), np.nan)
+                for records in ns
+            ]
+            for seed in seeds
+        ],
+        dtype=np.float64,
+    )
+
+
+def plot_causal_engagement_and_capacity(
+    rows: Sequence[Mapping[str, Any]],
+    transitions: Sequence[Mapping[str, Any]],
+    statistics: Sequence[Mapping[str, Any]],
+    *,
+    output_dir: Path,
+    models: Sequence[str],
+    seeds: Sequence[int],
+    ns: Sequence[int],
+) -> None:
+    """Headline test of causal-engagement retention versus capacity retention."""
+
+    import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
+
+    stats = {str(row["endpoint"]): row for row in statistics}
+    transition_names = [
+        f"{left}->{right}" for left, right in zip(ns[:-1], ns[1:])
+    ]
+    transition_markers = {
+        name: ("o", "s", "D", "^", "P", "X")[index % 6]
+        for index, name in enumerate(transition_names)
+    }
+    with _style():
+        fig, axes = plt.subplots(
+            1,
+            4,
+            figsize=(12.1, 3.35),
+            gridspec_kw={"width_ratios": (1.05, 1.05, 1.05, 1.25)},
+        )
+        fields = (
+            (
+                "chance_adjusted_accuracy",
+                None,
+                "A  Retrieval capacity",
+            ),
+            (
+                "raw_semantic_mean_log2_retention",
+                "raw_structural_mean_log2_retention",
+                "B  Raw score engagement",
+            ),
+            (
+                "gross_semantic_log2_retention",
+                "gross_structural_log2_retention",
+                "C  Held-out causal engagement",
+            ),
+        )
+        channel_styles = (
+            ("semantic", "-", "Semantic"),
+            ("structural", (0, (3.0, 1.8)), "Structural"),
+        )
+        for axis, (semantic_field, structural_field, title) in zip(
+            axes[:3], fields
+        ):
+            for model in models:
+                selected_fields = (
+                    ((semantic_field, "-", 1.0),)
+                    if structural_field is None
+                    else (
+                        (semantic_field, channel_styles[0][1], 1.0),
+                        (structural_field, channel_styles[1][1], 0.78),
+                    )
+                )
+                for field, linestyle, alpha_scale in selected_fields:
+                    matrix = _seed_curve(
+                        rows,
+                        model=str(model),
+                        seeds=seeds,
+                        ns=ns,
+                        field=str(field),
+                    )
+                    mean = np.nanmean(matrix, axis=0)
+                    sd = (
+                        np.nanstd(matrix, axis=0, ddof=1)
+                        if matrix.shape[0] > 1
+                        else np.zeros(matrix.shape[1])
+                    )
+                    for seed_row in matrix:
+                        axis.plot(
+                            ns,
+                            seed_row,
+                            color=MODEL_COLOURS[str(model)],
+                            linestyle=linestyle,
+                            linewidth=0.50,
+                            alpha=0.13 * alpha_scale,
+                        )
+                    axis.plot(
+                        ns,
+                        mean,
+                        color=MODEL_COLOURS[str(model)],
+                        marker=MODEL_MARKERS[str(model)],
+                        linestyle=linestyle,
+                        linewidth=1.45,
+                        markersize=4.0,
+                        alpha=alpha_scale,
+                        label=(
+                            MODEL_LABELS[str(model)]
+                            if structural_field is None
+                            or field == semantic_field
+                            else None
+                        ),
+                    )
+                    axis.fill_between(
+                        ns,
+                        mean - sd,
+                        mean + sd,
+                        color=MODEL_COLOURS[str(model)],
+                        alpha=0.075 * alpha_scale,
+                        linewidth=0,
+                    )
+            axis.set_xticks(ns)
+            axis.set_xlabel("Memory size, $N$")
+            axis.set_title(title, fontsize=9.5)
+        axes[0].set_ylim(-0.05, 1.05)
+        axes[0].set_ylabel("Chance-adjusted accuracy")
+        for axis in axes[1:3]:
+            axis.axhline(0, color="#888888", linestyle="--", linewidth=0.7)
+            axis.set_ylabel(r"$\log_2$ retention versus $N=4$")
+
+        for row in transitions:
+            x = v2._as_float(row["delta_log2_gross_engagement"])
+            y = v2._as_float(row["delta_chance_adjusted_accuracy"])
+            if not np.isfinite(x) or not np.isfinite(y):
+                continue
+            axes[3].scatter(
+                x,
+                y,
+                color=MODEL_COLOURS[str(row["model"])],
+                marker=transition_markers[str(row["transition"])],
+                s=24,
+                alpha=0.82,
+                edgecolor="white",
+                linewidth=0.35,
+            )
+        axes[3].axhline(0, color="#888888", linestyle="--", linewidth=0.7)
+        axes[3].axvline(0, color="#888888", linestyle="--", linewidth=0.7)
+        axes[3].set_xlabel(r"$\Delta\log_2$ gross engagement")
+        axes[3].set_ylabel(r"$\Delta$ chance-adjusted accuracy")
+        axes[3].set_title("D  Adjacent-$N$ co-transition", fontsize=9.5)
+        axes[3].margins(x=0.12, y=0.14)
+        gross_stats = stats.get("gross", {})
+        if gross_stats:
+            axes[3].text(
+                0.04,
+                0.96,
+                (
+                    rf"$\rho_s={float(gross_stats['spearman_rho']):.2f}$ "
+                    rf"[{float(gross_stats['ci95_low']):.2f}, "
+                    rf"{float(gross_stats['ci95_high']):.2f}]"
+                ),
+                transform=axes[3].transAxes,
+                ha="left",
+                va="top",
+                fontsize=7.6,
+            )
+        model_handles, model_labels = axes[0].get_legend_handles_labels()
+        channel_handles = [
+            Line2D(
+                [],
+                [],
+                color="#555555",
+                linestyle=linestyle,
+                linewidth=1.4,
+                label=label,
+            )
+            for _, linestyle, label in channel_styles
+        ]
+        transition_handles = [
+            Line2D(
+                [], [], color="#555555",
+                marker=transition_markers[name],
+                linestyle="none",
+                label=name,
+                markersize=4.5,
+            )
+            for name in transition_names
+        ]
+        axes[3].legend(
+            handles=transition_handles,
+            title="$N$ transition",
+            loc="upper right",
+            fontsize=6.3,
+            title_fontsize=6.5,
+            frameon=False,
+        )
+        fig.legend(
+            [*model_handles, *channel_handles],
+            [*model_labels, *(handle.get_label() for handle in channel_handles)],
+            loc="lower center",
+            bbox_to_anchor=(0.5, 0.005),
+            ncol=len(model_handles) + len(channel_handles),
+            fontsize=7.1,
+        )
+        fig.suptitle(
+            "Causal engagement across retrieval-capacity transitions",
+            fontsize=12.5,
+            y=0.985,
+        )
+        fig.subplots_adjust(
+            left=0.065,
+            right=0.995,
+            bottom=0.24,
+            top=0.80,
+            wspace=0.40,
+        )
+        _save_figure(
+            fig,
+            output_dir / "figures",
+            ENGAGEMENT_FIGURE_STEM,
+            {
+                "paper_version": PAPER_VERSION,
+                "performance": "(accuracy-1/N)/(1-1/N)",
+                "raw_score_engagement": (
+                    "within-seed log2 retention of the unnormalised mean S_sem and "
+                    "S_str scientific measurements relative to N=4"
+                ),
+                "gross_engagement": (
+                    "within-seed log2 retention of semantic/structural positive "
+                    "unadjusted all-head matched gross reference scales relative to N=4"
+                ),
+                "necessity_engagement": (
+                    "confirmatory table/statistic: geometric mean over "
+                    "semantic/structural positive all-head gross donor-wise necessity "
+                    "reference scales"
+                ),
+                "transition_panel": (
+                    "geometric mean over semantic/structural gross causal scales"
+                ),
+                "uncertainty": (
+                    "faint seed trajectories; mean ± one sample-SD band across three seeds"
+                ),
+                "transition_statistic": (
+                    "Spearman with model × seed trajectory-cluster bootstrap"
+                ),
+                "claim_scope": (
+                    "fixed-N held-out capacity co-transition; checkpoints are independently "
+                    "trained at each N, so this is not cross-N OOD evaluation"
+                ),
+                "J_exclusion": (
+                    "mean_h(J)=1 by within-checkpoint normalization; J is not used as an "
+                    "absolute cross-N engagement magnitude"
+                ),
+                "cross_N_geometry_caveat": (
+                    "registered output-projected z-space response geometry is retained, "
+                    "but output dimension is N and therefore changes across checkpoints; "
+                    "raw-score and held-out gross/necessity convergence is required"
+                ),
+            },
+        )
+        plt.close(fig)
+
+
+def plot_specificity_vs_engagement(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    output_dir: Path,
+    models: Sequence[str],
+    seeds: Sequence[int],
+    ns: Sequence[int],
+) -> None:
+    """Diagnostic separating relative selectivity from absolute causal engagement."""
+
+    import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
+
+    with _style():
+        fig, axes = plt.subplots(
+            1,
+            len(models),
+            figsize=(3.2 * len(models), 3.0),
+            squeeze=False,
+        )
+        for column, model in enumerate(models):
+            axis = axes[0, column]
+            for records in ns:
+                selected = [
+                    row
+                    for row in rows
+                    if row["model"] == model and int(row["N"]) == int(records)
+                ]
+                x = np.asarray(
+                    [
+                        v2._as_float(
+                            row["gross_joint_geomean_log2_retention"]
+                        )
+                        for row in selected
+                    ],
+                    dtype=np.float64,
+                )
+                y = np.asarray(
+                    [
+                        v2._as_float(row["median_active_abs_D_rel"])
+                        for row in selected
+                    ],
+                    dtype=np.float64,
+                )
+                for seed_index, seed in enumerate(seeds):
+                    seed_rows = [
+                        row
+                        for row in selected
+                        if int(row["seed"]) == int(seed)
+                    ]
+                    if not seed_rows:
+                        continue
+                    axis.scatter(
+                        v2._as_float(
+                            seed_rows[0][
+                                "gross_joint_geomean_log2_retention"
+                            ]
+                        ),
+                        v2._as_float(seed_rows[0]["median_active_abs_D_rel"]),
+                        marker=SEED_MARKERS[seed_index],
+                        s=25,
+                        color=MODEL_COLOURS[str(model)],
+                        alpha=0.55,
+                        edgecolor="white",
+                        linewidth=0.35,
+                    )
+                finite = np.isfinite(x) & np.isfinite(y)
+                if np.any(finite):
+                    mean_x = float(np.mean(x[finite]))
+                    mean_y = float(np.mean(y[finite]))
+                    axis.scatter(
+                        mean_x,
+                        mean_y,
+                        marker="D",
+                        s=31,
+                        facecolor="white",
+                        edgecolor=MODEL_COLOURS[str(model)],
+                        linewidth=1.0,
+                        zorder=4,
+                    )
+                    axis.annotate(
+                        f"$N={records}$",
+                        (mean_x, mean_y),
+                        xytext=(4, 3),
+                        textcoords="offset points",
+                        fontsize=6.6,
+                        color="#333333",
+                    )
+            axis.axvline(0, color="#888888", linestyle="--", linewidth=0.7)
+            axis.set_xlabel(r"$\log_2$ gross engagement retention")
+            axis.set_title(MODEL_LABELS[str(model)], fontsize=9.7)
+            if column == 0:
+                axis.set_ylabel(r"Median active $|D_{\rm rel}|$")
+        seed_handles = [
+            Line2D(
+                [], [], marker=SEED_MARKERS[index], linestyle="none",
+                color="#666666", label=f"Seed {seed}", markersize=5,
+            )
+            for index, seed in enumerate(seeds)
+        ]
+        fig.legend(
+            handles=seed_handles,
+            loc="lower center",
+            bbox_to_anchor=(0.5, 0.008),
+            ncol=len(seed_handles),
+            fontsize=7,
+        )
+        fig.suptitle(
+            "Relative selectivity versus absolute causal engagement",
+            fontsize=12,
+            y=0.985,
+        )
+        fig.subplots_adjust(
+            left=0.085,
+            right=0.995,
+            bottom=0.23,
+            top=0.78,
+            wspace=0.30,
+        )
+        _save_figure(
+            fig,
+            output_dir / "supplementary" / "capacity",
+            ENGAGEMENT_SPECIFICITY_FIGURE_STEM,
+            {
+                "paper_version": PAPER_VERSION,
+                "selectivity": (
+                    "median |D_rel| over discovery-active heads; relative within checkpoint"
+                ),
+                "engagement": (
+                    "absolute gross causal-response scale retained relative to N=4"
+                ),
+                "interpretation": (
+                    "tests whether selectivity persists or increases while absolute engagement "
+                    "and performance collapse"
+                ),
+            },
+        )
+        plt.close(fig)
+
+
 def make_v3_figures(
     inputs: v2.PaperInputs,
     *,
@@ -1398,6 +2109,53 @@ def make_v3_figures(
         causal_rows=causal_rows,
     )
 
+    engagement = causal_engagement_rows(
+        inputs,
+        models=models,
+        seeds=seeds,
+        ns=causal_ns,
+    )
+    engagement_transitions, engagement_trajectories = (
+        causal_engagement_transition_rows(
+            engagement,
+            models=models,
+            seeds=seeds,
+            ns=causal_ns,
+        )
+    )
+    engagement_statistics = causal_engagement_transition_statistics(
+        engagement_trajectories,
+        bootstrap=bootstrap,
+    )
+    _write_csv(
+        output_dir / "tables" / "causal_engagement_by_capacity.csv",
+        engagement,
+    )
+    _write_csv(
+        output_dir / "tables" / "causal_engagement_transitions.csv",
+        engagement_transitions,
+    )
+    _write_csv(
+        output_dir / "tables" / "causal_engagement_transition_statistics.csv",
+        engagement_statistics,
+    )
+    plot_causal_engagement_and_capacity(
+        engagement,
+        engagement_transitions,
+        engagement_statistics,
+        output_dir=output_dir,
+        models=models,
+        seeds=seeds,
+        ns=causal_ns,
+    )
+    plot_specificity_vs_engagement(
+        engagement,
+        output_dir=output_dir,
+        models=models,
+        seeds=seeds,
+        ns=causal_ns,
+    )
+
     organisation = organisation_rows(
         inputs, models=models, seeds=seeds, ns=score_ns
     )
@@ -1457,11 +2215,25 @@ def make_v3_figures(
         output_dir / "paper_figure_index.json",
         {
             "paper_version": PAPER_VERSION,
+            "capacity_hypothesis": (
+                "retention or collapse of absolute semantic/structural causal engagement "
+                "co-transitions with retention or collapse of fixed-N held-out performance"
+            ),
+            "terminology": (
+                "capacity retention across independently trained fixed-N checkpoints, not "
+                "cross-N OOD generalisation"
+            ),
+            "cross_N_response_geometry": (
+                "registered output-projected response geometry has N output dimensions; "
+                "raw score, gross patch, and necessity endpoints are reported separately "
+                "and require convergent interpretation"
+            ),
             "headline_figures": [
                 v2.CORE_FIGURE_STEM.format(N=int(headline_n)),
                 CAUSAL_FIGURE_STEM.format(N=int(headline_n)),
                 INTERPRETATION_FIGURE_STEM,
                 TRANSITION_FIGURE_STEM,
+                ENGAGEMENT_FIGURE_STEM,
             ],
             "complete_core_landscapes": [
                 v2.CORE_FIGURE_STEM.format(N=int(records))
@@ -1472,6 +2244,7 @@ def make_v3_figures(
                 ORGANISATION_FIGURE_STEM,
                 OVERLAP_FIGURE_STEM,
                 DISCRIMINANT_FIGURE_STEM,
+                ENGAGEMENT_SPECIFICITY_FIGURE_STEM,
                 "raw role-conditioned Functional carriage",
             ],
             "demoted_or_removed": {
@@ -1622,6 +2395,20 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "causal_extension_root": str(causal_extension_root),
             "checkpoint_inference": False,
             "score_recomputation": False,
+            "capacity_hypothesis": (
+                "absolute semantic/structural causal-engagement retention "
+                "co-transitions with fixed-N held-out performance retention"
+            ),
+            "cross_N_J_policy": (
+                "J is used for within-checkpoint ranking only; mean_h(J)=1 by construction, "
+                "so cross-N engagement uses raw S_sem/S_str means and uncalibrated held-out "
+                "causal reference scales"
+            ),
+            "cross_N_response_geometry": (
+                "registered output-projected response geometry has N output dimensions; "
+                "raw score, gross patch, and necessity endpoints remain separate "
+                "convergent measurements"
+            ),
             "models": list(models),
             "seeds": list(seeds),
             "score_N_values": list(score_ns),
@@ -1643,12 +2430,17 @@ __all__ = [
     "DEFAULT_PAPER_ANALYSIS_NAME",
     "PAPER_VERSION",
     "build_parser",
+    "causal_engagement_rows",
+    "causal_engagement_transition_rows",
+    "causal_engagement_transition_statistics",
     "discriminant_rows",
     "family_overlap_rows",
     "localisation_rows",
     "main",
     "organisation_rows",
     "pooled_counterfactual_rows",
+    "plot_causal_engagement_and_capacity",
+    "plot_specificity_vs_engagement",
     "run",
 ]
 

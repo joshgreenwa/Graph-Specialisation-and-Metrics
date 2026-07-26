@@ -23,16 +23,20 @@ from graph_specialisation_metrics.synthetic.nar_causal_transition import (
 )
 from graph_specialisation_metrics.synthetic.nar_methodology_paper_v3 import (
     build_parser,
+    causal_engagement_rows,
+    causal_engagement_transition_rows,
     discriminant_rows,
     interaction_outlier_rows,
     localisation_rows,
     plot_compact_causal_validation,
     plot_complete_grounding,
+    plot_causal_engagement_and_capacity,
     plot_conditional_fingerprint_supplement,
     plot_discriminant_validity,
     plot_family_overlap,
     plot_localisation_and_counterfactual,
     plot_organisation,
+    plot_specificity_vs_engagement,
 )
 from graph_specialisation_metrics.synthetic.nar_methodology_paper import PaperInputs
 
@@ -121,6 +125,89 @@ def test_v3_defaults_require_complete_score_and_causal_capacity_grid():
     assert args.canonical_causal_ns == "4,16,64"
     assert args.transition_causal_ns == "8,32"
     assert args.performance_ns.endswith(",80")
+
+
+def test_absolute_causal_engagement_retention_does_not_use_normalised_J():
+    models = ("dense",)
+    seeds = (0,)
+    ns = (4, 8)
+    score_bindings = {}
+    causal = {}
+    performance = []
+    for records, scale, accuracy in ((4, 2.0, 1.0), (8, 1.0, 0.5)):
+        coordinates = SimpleNamespace(
+            semantic_mean=4.0 * scale,
+            structural_mean=2.0 * scale,
+            joint_sensitivity=np.asarray([[0.5, 1.5]]),
+            selectivity=np.asarray([[-0.4, 0.6]]),
+            active=np.asarray([[True, True]]),
+        )
+        score_bindings[("dense", records, 0)] = SimpleNamespace(
+            score_artifact=SimpleNamespace(value={"coordinates": coordinates})
+        )
+        causal[("dense", records, 0)] = {
+            "summary": {
+                "gross_reference_scales": {
+                    "semantic": scale,
+                    "structural": scale,
+                },
+                "necessity_reference_scales": {
+                    "semantic": 2.0 * scale,
+                    "structural": 0.5 * scale,
+                },
+            },
+            "clean_ablation": {
+                "head_L0_H0": {
+                    "prediction_movement": scale,
+                    "registered_metric_clean": accuracy,
+                    "registered_metric_ablated": accuracy - 0.1,
+                },
+                "head_L0_H1": {
+                    "prediction_movement": 2.0 * scale,
+                    "registered_metric_clean": accuracy,
+                    "registered_metric_ablated": accuracy - 0.2,
+                },
+            },
+        }
+        performance.append(
+            {"model": "dense", "N": records, "seed": 0, "accuracy": accuracy}
+        )
+    inputs = PaperInputs(
+        score_bindings=score_bindings,
+        causal=causal,
+        role_results={},
+        counterfactual={},
+        carriage={},
+        best_seeds={},
+        performance=performance,
+    )
+
+    rows = causal_engagement_rows(
+        inputs,
+        models=models,
+        seeds=seeds,
+        ns=ns,
+    )
+    by_n = {int(row["N"]): row for row in rows}
+
+    assert by_n[4]["gross_joint_geomean_retention"] == pytest.approx(1.0)
+    assert by_n[8]["gross_joint_geomean_retention"] == pytest.approx(0.5)
+    assert by_n[8]["gross_joint_geomean_log2_retention"] == pytest.approx(-1.0)
+    assert by_n[8]["raw_joint_geomean_log2_retention"] == pytest.approx(-1.0)
+    assert "J_retention" not in by_n[8]
+    assert "mean_h(J)=1" in by_n[8]["J_cross_N_status"]
+
+    transitions, trajectories = causal_engagement_transition_rows(
+        rows,
+        models=models,
+        seeds=seeds,
+        ns=ns,
+    )
+    assert transitions[0]["delta_log2_raw_score_engagement"] == pytest.approx(-1.0)
+    assert transitions[0]["delta_log2_gross_engagement"] == pytest.approx(-1.0)
+    assert transitions[0]["delta_chance_adjusted_accuracy"] < 0
+    assert len(trajectories["raw_score"]["dense:seed0"]) == 1
+    assert len(trajectories["gross"]["dense:seed0"]) == 1
 
 
 def test_transition_causal_loader_is_bound_to_source_score_hash(tmp_path):
@@ -361,6 +448,43 @@ def test_v3_publication_figures_render_without_overlapping_legacy_panels(tmp_pat
         for seed in seeds
         for channel in ("semantic", "structural")
     ]
+    engagement = [
+        {
+            "model": model,
+            "N": records,
+            "seed": seed,
+            "chance_adjusted_accuracy": 0.9 - 0.1 * ns.index(records),
+            "raw_semantic_mean_log2_retention": -0.45 * ns.index(records),
+            "raw_structural_mean_log2_retention": -0.55 * ns.index(records),
+            "gross_joint_geomean_log2_retention": -0.5 * ns.index(records),
+            "gross_semantic_log2_retention": -0.4 * ns.index(records),
+            "gross_structural_log2_retention": -0.6 * ns.index(records),
+            "necessity_joint_geomean_log2_retention": -0.4 * ns.index(records),
+            "median_active_abs_D_rel": 0.2 + 0.1 * ns.index(records),
+        }
+        for model in models
+        for records in ns
+        for seed in seeds
+    ]
+    engagement_transitions = [
+        {
+            "model": model,
+            "seed": seed,
+            "transition": "4->8",
+            "delta_log2_gross_engagement": -0.5,
+            "delta_chance_adjusted_accuracy": -0.1,
+        }
+        for model in models
+        for seed in seeds
+    ]
+    engagement_statistics = [
+        {
+            "endpoint": "gross",
+            "spearman_rho": 0.8,
+            "ci95_low": 0.5,
+            "ci95_high": 0.95,
+        }
+    ]
 
     plot_compact_causal_validation(
         inputs,
@@ -416,5 +540,21 @@ def test_v3_publication_figures_render_without_overlapping_legacy_panels(tmp_pat
         seeds=seeds,
         ns=ns,
     )
+    plot_causal_engagement_and_capacity(
+        engagement,
+        engagement_transitions,
+        engagement_statistics,
+        output_dir=tmp_path,
+        models=models,
+        seeds=seeds,
+        ns=ns,
+    )
+    plot_specificity_vs_engagement(
+        engagement,
+        output_dir=tmp_path,
+        models=models,
+        seeds=seeds,
+        ns=ns,
+    )
 
-    assert len(list(tmp_path.rglob("*.png"))) == 7
+    assert len(list(tmp_path.rglob("*.png"))) == 9

@@ -2,7 +2,10 @@
 
 Run ``nar_causal_transition_colab.py`` once first.  This frontend then reads every protected
 score and causal cell for N=4,8,16,32,64, performs no checkpoint inference, and writes a new
-publication tree at ``extensions/nar_methodology_paper_v3``.
+publication tree at ``extensions/nar_methodology_paper_v3``.  Its headline capacity analysis
+tests whether absolute semantic/structural score and held-out causal-response retention
+co-transition with fixed-N retrieval competence; it never uses normalised ``J`` as a cross-N
+magnitude and does not describe independently trained fixed-N checkpoints as an OOD sweep.
 """
 
 from __future__ import annotations

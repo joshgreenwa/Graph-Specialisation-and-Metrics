@@ -142,10 +142,23 @@ writes only to `extensions/nar_methodology_paper_v3/`. Its targeted outputs are:
   hierarchically pooled exact-counterfactual double dissociation;
 - accuracy plus complete all-N heatmaps for `J` versus clean ablation and `D_rel` versus channel
   contrast;
+- a cache-only capacity-retention test asking whether collapse of the absolute semantic and
+  structural raw-score magnitudes, and independently held-out gross-patching/necessity response,
+  co-transitions with collapse of chance-adjusted retrieval accuracy. The figure uses within-seed
+  retention relative to N=4 and an adjacent-N trajectory-cluster bootstrap;
 - supplementary sensitivity-concentration, frozen-family overlap, and same-minus-cross-channel
-  discriminant-validity analyses; and
+  discriminant-validity analyses, including a diagnostic that separates relative `D_rel`
+  selectivity from absolute causal-response magnitude; and
 - official raw `F_sens` role-conditioned Functional carriage supplements. Event-normalised
   carriage and the task-specific `R_role` score are not used.
+
+`J` is deliberately not treated as an absolute cross-N response level: its mean over heads is one
+by construction in every estimable checkpoint. The cross-N analysis therefore retains the
+unnormalised `S_sem` and `S_str` means and the uncalibrated causal reference scales. It reports
+fixed-N capacity co-transition across independently trained checkpoints, not strict cross-N OOD
+generalisation. Since the registered output-projected response has an N-way output geometry, the
+raw-score, gross-patching, and necessity endpoints are retained separately and should be interpreted
+as convergent evidence rather than interchangeable measurements.
 
 Command-line equivalents:
 
