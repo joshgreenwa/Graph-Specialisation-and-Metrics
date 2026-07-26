@@ -110,6 +110,8 @@ CELL_ARGS = [
     "nar_role_counterfactual_v1",
     "--causal-extension-name",
     "nar_causal_transition_v1",
+    "--causal-overlay-extension-names",
+    "nar_causal_transition_repair_v1",
     "--paper-analysis-name",
     "nar_methodology_paper_v3",
     "--models",

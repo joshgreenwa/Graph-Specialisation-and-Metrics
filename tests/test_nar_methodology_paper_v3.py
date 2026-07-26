@@ -136,6 +136,7 @@ def test_v3_defaults_require_complete_score_and_causal_capacity_grid():
     assert args.performance_ns.endswith(",80")
     assert args.render_target == "all"
     assert args.mechanism_cache_mode == "auto"
+    assert args.causal_overlay_extension_names == ""
 
 
 def test_selectivity_reliability_requires_activity_and_interval_sign():
@@ -596,6 +597,71 @@ def test_v3_preflight_reports_exact_causal_only_recovery_cell(
     assert '"--models", "dense"' in message
     assert '"--seeds", "2"' in message
     assert '"--causal-ns", "32"' in message
+    assert '"nar_causal_transition_repair_v1"' in message
+
+
+def test_v3_loads_missing_primary_cell_from_protected_repair_overlay(
+    tmp_path,
+    monkeypatch,
+):
+    binding = SimpleNamespace(task="nar_dense_N32")
+    inputs = PaperInputs(
+        score_bindings={("dense", 32, 2): binding},
+        causal={},
+        role_results={},
+        counterfactual={},
+        carriage={},
+        best_seeds={},
+        performance=[],
+    )
+    primary = tmp_path / "primary"
+    overlay = tmp_path / "repair"
+    overlay_path = (
+        overlay
+        / "canonical"
+        / binding.task
+        / "seed_2"
+        / "cache"
+        / "causal"
+        / "validation.pt"
+    )
+    overlay_path.parent.mkdir(parents=True)
+    overlay_path.touch()
+    monkeypatch.setattr(
+        v3.v2,
+        "load_paper_inputs",
+        lambda **kwargs: (inputs, ()),
+    )
+    monkeypatch.setattr(
+        v3,
+        "load_transition_causal_artifact",
+        lambda *, extension_root, binding: {
+            "loaded_from": str(extension_root),
+        },
+    )
+
+    loaded, _ = v3.load_v3_inputs(
+        base_analysis_root=tmp_path / "analysis",
+        base_canonical_root=tmp_path / "canonical",
+        source_extension_root=tmp_path / "scores",
+        causal_extension_root=primary,
+        training_run_dir=tmp_path / "training",
+        models=("dense",),
+        score_ns=(32,),
+        canonical_causal_ns=(),
+        transition_causal_ns=(32,),
+        counterfactual_ns=(),
+        carriage_ns=(),
+        cached_ns=(4, 16, 64),
+        performance_ns=(32,),
+        seeds=(2,),
+        width=128,
+        donors_per_role=8,
+        accuracy_gate=0.85,
+        causal_overlay_roots=(overlay,),
+    )
+
+    assert loaded.causal[("dense", 32, 2)]["loaded_from"] == str(overlay)
 
 
 def test_v3_publication_figures_render_without_overlapping_legacy_panels(tmp_path):

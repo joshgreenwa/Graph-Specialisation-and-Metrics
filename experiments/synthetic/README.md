@@ -134,6 +134,12 @@ validates every existing causal cell, and computes only missing causal cells. It
 `completion_manifest.json` in Drive after each completed cell, then marks the manifest complete
 only after the full requested matrix has been validated.
 
+If a missing consolidated `validation.pt` is accompanied by protected partial causal shards from
+an earlier contract, do not delete or overwrite them. Run only the affected cell with a fresh
+`--causal-extension-name` such as `nar_causal_transition_repair_v1`, then pass that name to v3 via
+`--causal-overlay-extension-names nar_causal_transition_repair_v1`. V3 searches the primary
+namespace first and uses an overlay only where the primary consolidated artifact is absent.
+
 Then run `analysis/nar_methodology_paper_v3_colab.py`. This second frontend is model-free and
 writes only to `extensions/nar_methodology_paper_v3/`. Its targeted outputs are:
 

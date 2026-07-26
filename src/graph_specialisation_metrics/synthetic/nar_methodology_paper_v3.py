@@ -89,6 +89,7 @@ def load_v3_inputs(
     width: int,
     donors_per_role: int,
     accuracy_gate: float,
+    causal_overlay_roots: Sequence[Path] = (),
 ) -> tuple[v2.PaperInputs, tuple[Any, ...]]:
     inputs, policies = v2.load_paper_inputs(
         base_analysis_root=base_analysis_root,
@@ -108,7 +109,8 @@ def load_v3_inputs(
         accuracy_gate=float(accuracy_gate),
     )
     causal = dict(inputs.causal)
-    missing: list[tuple[str, int, int, Path]] = []
+    causal_roots = (causal_extension_root, *tuple(causal_overlay_roots))
+    missing: list[tuple[str, int, int, tuple[Path, ...]]] = []
     incompatible: list[str] = []
     for records in transition_causal_ns:
         for model in models:
@@ -116,27 +118,51 @@ def load_v3_inputs(
                 binding = inputs.score_bindings[
                     (str(model), int(records), int(seed))
                 ]
-                path = (
-                    causal_extension_root
+                candidate_paths = tuple(
+                    root
                     / "canonical"
                     / str(binding.task)
                     / f"seed_{int(seed)}"
                     / "cache"
                     / "causal"
                     / "validation.pt"
+                    for root in causal_roots
                 )
+                available = [
+                    (root, path)
+                    for root, path in zip(causal_roots, candidate_paths)
+                    if path.exists()
+                ]
+                if not available:
+                    missing.append(
+                        (
+                            str(model),
+                            int(records),
+                            int(seed),
+                            candidate_paths,
+                        )
+                    )
+                    continue
+                selected_root, selected_path = available[0]
                 try:
                     causal[(str(model), int(records), int(seed))] = (
                         load_transition_causal_artifact(
-                            extension_root=causal_extension_root,
+                            extension_root=selected_root,
                             binding=binding,
                         )
                     )
                 except FileNotFoundError:
-                    missing.append((str(model), int(records), int(seed), path))
+                    missing.append(
+                        (
+                            str(model),
+                            int(records),
+                            int(seed),
+                            candidate_paths,
+                        )
+                    )
                 except StaleCacheError as error:
                     incompatible.append(
-                        f"{model}:N{records}:seed{seed}: {error}"
+                        f"{model}:N{records}:seed{seed} at {selected_path}: {error}"
                     )
     if missing or incompatible:
         lines = [
@@ -145,18 +171,22 @@ def load_v3_inputs(
         ]
         if missing:
             lines.append("Missing causal-only cells:")
-            lines.extend(
-                f"- {model}:N{records}:seed{seed}: {path}"
-                for model, records, seed, path in missing
-            )
+            for model, records, seed, paths in missing:
+                lines.append(f"- {model}:N{records}:seed{seed}")
+                lines.extend(f"  searched: {path}" for path in paths)
             if len(missing) == 1:
                 model, records, seed, _ = missing[0]
                 lines.extend(
                     (
-                        "Recover only this cell with nar_causal_transition_colab.py:",
+                        "Recover only this cell into a fresh repair namespace with "
+                        "nar_causal_transition_colab.py:",
                         f'  "--models", "{model}",',
                         f'  "--seeds", "{seed}",',
                         f'  "--causal-ns", "{records}",',
+                        '  "--causal-extension-name", '
+                        '"nar_causal_transition_repair_v1",',
+                        "Then register that namespace with "
+                        "--causal-overlay-extension-names.",
                     )
                 )
             else:
@@ -3967,6 +3997,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--causal-extension-name", default=DEFAULT_CAUSAL_EXTENSION_NAME
     )
+    parser.add_argument(
+        "--causal-overlay-extension-names",
+        default="",
+        help=(
+            "comma-separated additive repair namespaces; the primary causal "
+            "namespace remains first-precedence and no source file is overwritten"
+        ),
+    )
     parser.add_argument("--paper-analysis-name", default=DEFAULT_PAPER_ANALYSIS_NAME)
     parser.add_argument("--models", default="1hop,2hop,dense")
     parser.add_argument("--seeds", default="0,1,2")
@@ -3989,6 +4027,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     render_target = str(args.render_target)
     mechanism_cache_mode = str(args.mechanism_cache_mode)
     models = _parse_csv_strings(args.models)
+    causal_overlay_names = _parse_csv_strings(
+        args.causal_overlay_extension_names
+    )
     seeds = _parse_csv_ints(args.seeds)
     cached_ns = _parse_csv_ints(args.cached_ns)
     score_ns = _parse_csv_ints(args.score_ns)
@@ -4028,6 +4069,18 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     causal_extension_root = (
         base_analysis_root / "extensions" / str(args.causal_extension_name)
     )
+    causal_overlay_roots = tuple(
+        base_analysis_root / "extensions" / str(name)
+        for name in causal_overlay_names
+    )
+    if causal_extension_root in causal_overlay_roots:
+        raise ValueError(
+            "causal overlay namespaces must differ from the primary causal namespace"
+        )
+    if len({root.resolve() for root in causal_overlay_roots}) != len(
+        causal_overlay_roots
+    ):
+        raise ValueError("causal overlay namespace names must be unique")
     output_dir = (
         base_analysis_root / "extensions" / str(args.paper_analysis_name)
     )
@@ -4036,6 +4089,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         source_extension_root.resolve(),
         causal_extension_root.resolve(),
         base_canonical_root.resolve(),
+        *(root.resolve() for root in causal_overlay_roots),
     }
     if output_dir.resolve() in protected_sources:
         raise ValueError("paper-analysis-name must select a new derived-output namespace")
@@ -4058,6 +4112,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         width=int(args.analysis_width),
         donors_per_role=int(args.counterfactual_donors_per_role),
         accuracy_gate=float(args.accuracy_gate),
+        causal_overlay_roots=causal_overlay_roots,
     )
     _, _, bootstrap, _, _ = policies
     if render_target == "mechanism":
@@ -4099,6 +4154,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "base_canonical_root": str(base_canonical_root),
             "source_extension_root": str(source_extension_root),
             "causal_extension_root": str(causal_extension_root),
+            "causal_overlay_extension_roots": [
+                str(root) for root in causal_overlay_roots
+            ],
             "checkpoint_inference": False,
             "score_recomputation": False,
             "render_target": render_target,

@@ -324,11 +324,20 @@ def run_causal_completion(
             "(official causal validation; score cache read-only)",
             flush=True,
         )
-        result = run_causal_validation(
-            prepared,
-            config,
-            binding.score_artifact.value,
-        )
+        try:
+            result = run_causal_validation(
+                prepared,
+                config,
+                binding.score_artifact.value,
+            )
+        except StaleCacheError as error:
+            raise StaleCacheError(
+                f"{binding.task}:seed{binding.seed} has protected partial causal "
+                "shards from another scientific contract in "
+                f"{causal_extension_root}. They were left untouched. Rerun this "
+                "single cell with a new --causal-extension-name, then add that "
+                "namespace to v3 with --causal-overlay-extension-names."
+            ) from error
         if result.get("families", {}) != binding.score_artifact.value.get(
             "families", {}
         ):
