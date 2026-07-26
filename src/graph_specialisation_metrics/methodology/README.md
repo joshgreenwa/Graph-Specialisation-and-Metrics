@@ -77,6 +77,7 @@ The paste-ready clone/mount/dispatch cell is
 | `bootstrap.py` | Fixed 2,000-draw nested percentile intervals and 20% graph-trimmed summaries. |
 | `cache.py` | Atomic, contract-bound Drive caches that reject stale methodology/results. |
 | `audit.py` | Soft numerical/estimability audits: record, log, and continue; strict mode raises. |
+| `execution.py` | Runtime-only multi-graph batching and CUDA-OOM backoff. |
 | `figures.py` | Shared publication theme, exact labels, intervals, PDF+PNG+metadata export. |
 | `runner.py` | Backend-neutral score, causal, carriage, cache, and figure orchestration. |
 
@@ -97,6 +98,13 @@ register_task_figure_modifier("zinc", adjust_zinc)
 Scientific task differences are registrations, not runner forks. A task must declare all semantic,
 structural, fixed-support, output-scaling, carrier, loss, split, and tolerance boundaries listed
 in Section 12 of the normative README.
+
+`ExecutionPolicy.graphs_per_batch` controls how many base graphs share an event forward. Batched
+results are split back into graph-local sufficient statistics before donor/source/graph
+aggregation. The setting and any OOM retries are recorded, but execution policy is deliberately
+excluded from the scientific cache fingerprint. Clean Jacobians are computed once and reused
+across the semantic and structural channels; clean-ablation baselines are likewise reused across
+all head and family targets.
 
 To add a future Graphormer dataset such as ZINC, register a `CanonicalTask` with
 `backend_kind="graphormer"` and a `GraphormerTaskSpec`, then register its dataset builder with

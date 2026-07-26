@@ -124,6 +124,110 @@ class CanonicalGritBackend:
             real_mask=real_mask,
         )
 
+    def capture_groups(
+        self,
+        groups: Sequence[Sequence[Any]],
+        *,
+        include_virtual_transport: bool = True,
+    ) -> list[BackendCapture]:
+        """Capture replicas from several base graphs in one native PyG forward.
+
+        Graphs may have different node counts; replicas inside each group must share the base
+        geometry. Results are split back into the original graph groups before any estimator sees
+        them.
+        """
+
+        import torch
+        from torch_geometric.data import Batch
+
+        normalised = [list(group) for group in groups]
+        if not normalised or any(not group for group in normalised):
+            raise ValueError("capture_groups requires non-empty graph groups")
+        for group in normalised:
+            counts = {int(data.num_nodes) for data in group}
+            if len(counts) != 1:
+                raise ValueError("replicas within one event group must share node geometry")
+        flat = [data for group in normalised for data in group]
+        batch = Batch.from_data_list([data.clone() for data in flat]).to(self.gm.device)
+        final: dict[str, Any] = {}
+
+        def final_hook(_module, _inputs, output):
+            full = output.x
+            mask = getattr(output, "real_node_mask", None)
+            final["full"] = full
+            final["real_mask"] = mask.detach().clone() if mask is not None else None
+            final["real"] = full[mask] if mask is not None else full
+
+        handle = self.gm.model.model.layers.register_forward_hook(final_hook)
+        try:
+            captured = self.gm.capture(
+                batch,
+                want_grad=False,
+                want_attn=False,
+                include_virtual_transport=include_virtual_transport,
+            )
+        finally:
+            handle.remove()
+        if "full" not in final or captured.get("node_graph") is None:
+            raise RuntimeError("grouped final-state/transport hooks did not fire")
+
+        prediction = captured["pred"]
+        z = self._z(prediction)
+        target = captured["true"]
+        node_graph = captured["node_graph"].long()
+        real_counts = [int(data.num_nodes) for data in flat]
+        has_virtual = final["real_mask"] is not None
+        self.has_virtual_node = self.has_virtual_node or has_virtual
+        if bool(has_virtual) != bool(self.task.virtual_node):
+            raise RuntimeError(
+                f"task registration virtual_node={self.task.virtual_node} disagrees with "
+                f"the loaded GRIT model (real_node_mask present={has_virtual})"
+            )
+
+        transport_by_replica: list[tuple[Any, ...]] = []
+        for replica, real_nodes in enumerate(real_counts):
+            mask = node_graph == int(replica)
+            expected = real_nodes + (1 if has_virtual and include_virtual_transport else 0)
+            if int(mask.sum()) != expected:
+                raise RuntimeError(
+                    f"grouped transport replica {replica} has {int(mask.sum())} carriers; "
+                    f"expected {expected}"
+                )
+            transport_by_replica.append(
+                tuple(layer[mask] for layer in captured["wV"])
+            )
+
+        real_states: list[Any] = []
+        offset = 0
+        for count in real_counts:
+            real_states.append(final["real"][offset : offset + count])
+            offset += count
+        if offset != int(final["real"].shape[0]):
+            raise RuntimeError("grouped final-state rows do not reconstruct the real-node batch")
+
+        outputs: list[BackendCapture] = []
+        replica_offset = 0
+        for group in normalised:
+            replicas = len(group)
+            selected = range(replica_offset, replica_offset + replicas)
+            layers = tuple(
+                torch.stack([transport_by_replica[index][layer] for index in selected], dim=0)
+                for layer in range(int(self.gm.L))
+            )
+            states = torch.stack([real_states[index] for index in selected], dim=0)
+            outputs.append(
+                BackendCapture(
+                    prediction=prediction[replica_offset : replica_offset + replicas],
+                    z=z[replica_offset : replica_offset + replicas],
+                    target=target[replica_offset : replica_offset + replicas],
+                    transport=layers,
+                    final_state=states,
+                    real_mask=None,
+                )
+            )
+            replica_offset += replicas
+        return outputs
+
     def clean_jacobians(self, data: Any) -> CleanJacobians:
         import torch
 
@@ -169,8 +273,135 @@ class CanonicalGritBackend:
                 f"zero clean transport Jacobian in layers {missing}; those layers score zero",
                 context={"layers": missing},
             )
-        capture.final_state = final_state
+        capture.prediction = capture.prediction.detach()
+        capture.z = capture.z.detach()
+        capture.target = capture.target.detach()
+        capture.transport = tuple(value.detach() for value in capture.transport)
+        capture.final_state = final_state.detach()
         return CleanJacobians(capture, transport, final_gradient)
+
+    def clean_jacobians_many(self, data_list: Sequence[Any]) -> list[CleanJacobians]:
+        """Compute independent clean Jacobians for several graphs in one autograd forward."""
+
+        import torch
+        from torch_geometric.data import Batch
+
+        values = list(data_list)
+        if not values:
+            return []
+        if len(values) == 1:
+            return [self.clean_jacobians(values[0])]
+        batch = Batch.from_data_list([data.clone() for data in values]).to(self.gm.device)
+        final: dict[str, Any] = {}
+
+        def final_hook(_module, _inputs, output):
+            final["full"] = output.x
+            mask = getattr(output, "real_node_mask", None)
+            final["real_mask"] = mask.detach().clone() if mask is not None else None
+
+        handle = self.gm.model.model.layers.register_forward_hook(final_hook)
+        try:
+            captured = self.gm.capture(
+                batch,
+                want_grad=True,
+                want_attn=False,
+                include_virtual_transport=True,
+            )
+        finally:
+            handle.remove()
+        if "full" not in final or captured.get("node_graph") is None:
+            raise RuntimeError("grouped clean-Jacobian hooks did not fire")
+        z = self._z(captured["pred"])
+        targets = tuple(captured["wV"]) + (final["full"],)
+        by_output: list[tuple[Any, ...]] = []
+        for output in range(int(z.shape[1])):
+            by_output.append(
+                torch.autograd.grad(
+                    z[:, output].sum(),
+                    targets,
+                    retain_graph=output + 1 < int(z.shape[1]),
+                    allow_unused=False,
+                )
+            )
+
+        node_graph = captured["node_graph"].long()
+        global_real_mask = final["real_mask"]
+        has_virtual = global_real_mask is not None
+        self.has_virtual_node = self.has_virtual_node or has_virtual
+        if bool(has_virtual) != bool(self.task.virtual_node):
+            raise RuntimeError(
+                f"task registration virtual_node={self.task.virtual_node} disagrees with "
+                f"the loaded GRIT model (real_node_mask present={has_virtual})"
+            )
+        outputs: list[CleanJacobians] = []
+        for graph_index, data in enumerate(values):
+            graph_mask = node_graph == int(graph_index)
+            local_real = (
+                global_real_mask[graph_mask]
+                if global_real_mask is not None
+                else torch.ones(
+                    int(graph_mask.sum()), dtype=torch.bool, device=graph_mask.device
+                )
+            )
+            capture_transport = tuple(
+                layer[graph_mask].detach() for layer in captured["wV"]
+            )
+            capture_final = final["full"][graph_mask][local_real].detach()
+            transport = torch.stack(
+                [
+                    torch.stack(
+                        [row[layer][graph_mask].detach() for row in by_output],
+                        dim=0,
+                    )
+                    for layer in range(int(self.gm.L))
+                ],
+                dim=1,
+            )
+            final_gradient = torch.stack(
+                [row[-1][graph_mask][local_real].detach() for row in by_output],
+                dim=0,
+            )
+            expected_real = int(data.num_nodes)
+            if int(capture_final.shape[0]) != expected_real:
+                raise RuntimeError(
+                    f"grouped clean graph {graph_index} has {int(capture_final.shape[0])} "
+                    f"real final-state rows; expected {expected_real}"
+                )
+            audit_check(
+                bool(
+                    torch.isfinite(transport).all()
+                    and torch.isfinite(final_gradient).all()
+                ),
+                "backend.finite_clean_jacobian",
+                "non-finite grouped clean z-space Jacobian",
+                context={"graph_batch_index": int(graph_index)},
+            )
+            layer_norms = torch.linalg.vector_norm(
+                transport.reshape(transport.shape[0], transport.shape[1], -1),
+                dim=(0, 2),
+            )
+            if bool((layer_norms <= 0).any()):
+                missing = torch.nonzero(layer_norms <= 0).reshape(-1).tolist()
+                audit_check(
+                    False,
+                    "backend.nonzero_clean_transport",
+                    f"zero grouped clean transport Jacobian in layers {missing}; "
+                    "those layers score zero",
+                    context={
+                        "graph_batch_index": int(graph_index),
+                        "layers": missing,
+                    },
+                )
+            capture = BackendCapture(
+                prediction=captured["pred"][graph_index : graph_index + 1].detach(),
+                z=z[graph_index : graph_index + 1].detach(),
+                target=captured["true"][graph_index : graph_index + 1].detach(),
+                transport=capture_transport,
+                final_state=capture_final,
+                real_mask=local_real.detach() if has_virtual else None,
+            )
+            outputs.append(CleanJacobians(capture, transport, final_gradient))
+        return outputs
 
     def loss_per_graph(self, prediction, target):
         return self.task.loss_per_graph(

@@ -23,17 +23,6 @@ from .audit import audit_check
 from .backend import BackendCapture, CleanJacobians
 from .protocol import stable_hash
 
-MODEL_INPUT_FIELDS = (
-    "input_nodes",
-    "input_edges",
-    "attn_bias",
-    "in_degree",
-    "out_degree",
-    "spatial_pos",
-    "attn_edge_type",
-)
-
-
 def install_graphormer_dependencies() -> None:
     """Install the checkpoint-compatible Graphormer analysis stack in Colab."""
 
@@ -562,15 +551,62 @@ class GraphormerBackend:
 
         if not data_list:
             raise ValueError("capture requires at least one graph")
-        node_counts = {int(data.num_nodes) for data in data_list}
-        if len(node_counts) != 1:
-            raise ValueError("one Graphormer capture must contain replicas of one base graph")
-        result = {}
-        for name in MODEL_INPUT_FIELDS:
-            source_name = "x" if name == "input_nodes" else name
-            result[name] = torch.stack([getattr(data, source_name) for data in data_list]).to(
-                self.runtime.device
-            )
+        maximum = max(int(data.num_nodes) for data in data_list)
+        batch_size = len(data_list)
+        exemplar = data_list[0]
+        result = {
+            "input_nodes": torch.zeros(
+                batch_size,
+                maximum,
+                *exemplar.x.shape[1:],
+                dtype=exemplar.x.dtype,
+            ),
+            "input_edges": torch.zeros(
+                batch_size,
+                maximum,
+                maximum,
+                *exemplar.input_edges.shape[2:],
+                dtype=exemplar.input_edges.dtype,
+            ),
+            "attn_bias": torch.zeros(
+                batch_size,
+                maximum + 1,
+                maximum + 1,
+                dtype=exemplar.attn_bias.dtype,
+            ),
+            "in_degree": torch.zeros(
+                batch_size, maximum, dtype=exemplar.in_degree.dtype
+            ),
+            "out_degree": torch.zeros(
+                batch_size, maximum, dtype=exemplar.out_degree.dtype
+            ),
+            "spatial_pos": torch.zeros(
+                batch_size,
+                maximum,
+                maximum,
+                dtype=exemplar.spatial_pos.dtype,
+            ),
+            "attn_edge_type": torch.zeros(
+                batch_size,
+                maximum,
+                maximum,
+                *exemplar.attn_edge_type.shape[2:],
+                dtype=exemplar.attn_edge_type.dtype,
+            ),
+        }
+        for index, data in enumerate(data_list):
+            nodes = int(data.num_nodes)
+            result["input_nodes"][index, :nodes] = data.x
+            result["input_edges"][index, :nodes, :nodes] = data.input_edges
+            result["attn_bias"][index, : nodes + 1, : nodes + 1] = data.attn_bias
+            result["in_degree"][index, :nodes] = data.in_degree
+            result["out_degree"][index, :nodes] = data.out_degree
+            result["spatial_pos"][index, :nodes, :nodes] = data.spatial_pos
+            result["attn_edge_type"][index, :nodes, :nodes] = data.attn_edge_type
+        result = {
+            name: value.to(self.runtime.device)
+            for name, value in result.items()
+        }
         target = torch.stack([data.y.reshape(-1) for data in data_list]).to(
             self.runtime.device
         )
@@ -586,8 +622,6 @@ class GraphormerBackend:
         replacements: Sequence[Any] | None = None,
     ) -> BackendCapture:
         del include_virtual_transport
-        if require_grad and len(data_list) != 1:
-            raise ValueError("clean Jacobians are captured one graph at a time")
         inputs, target = self._batch(data_list)
         by_layer: dict[int, list[int]] = {}
         for layer, head in family:
@@ -622,6 +656,49 @@ class GraphormerBackend:
             final_state=final_state,
             real_mask=None,
         )
+
+    def capture_groups(
+        self,
+        groups: Sequence[Sequence[GraphormerGraph]],
+        *,
+        include_virtual_transport: bool = True,
+    ) -> list[BackendCapture]:
+        """Pad and batch variable-size event groups, then restore graph-local geometry."""
+
+        del include_virtual_transport
+        normalised = [list(group) for group in groups]
+        if not normalised or any(not group for group in normalised):
+            raise ValueError("capture_groups requires non-empty graph groups")
+        for group in normalised:
+            counts = {int(data.num_nodes) for data in group}
+            if len(counts) != 1:
+                raise ValueError("replicas within one Graphormer group must share geometry")
+        flat = [data for group in normalised for data in group]
+        captured = self.capture(flat, require_grad=False)
+        outputs: list[BackendCapture] = []
+        offset = 0
+        for group in normalised:
+            replicas = len(group)
+            tokens = int(group[0].num_nodes) + 1
+            outputs.append(
+                BackendCapture(
+                    prediction=captured.prediction[offset : offset + replicas],
+                    z=captured.z[offset : offset + replicas],
+                    target=captured.target[offset : offset + replicas],
+                    transport=tuple(
+                        layer[offset : offset + replicas, :tokens]
+                        for layer in captured.transport
+                    ),
+                    final_state=captured.final_state[
+                        offset : offset + replicas, :tokens
+                    ],
+                    real_mask=None,
+                )
+            )
+            offset += replicas
+        if offset != len(flat):
+            raise RuntimeError("grouped Graphormer capture did not reconstruct every graph")
+        return outputs
 
     def clean_jacobians(self, data: GraphormerGraph) -> CleanJacobians:
         import torch
@@ -672,9 +749,100 @@ class GraphormerBackend:
                 "those layers score zero",
                 context={"layers": missing},
             )
-        capture.transport = tuple(value[:, 0] for value in capture.transport)
-        capture.final_state = capture.final_state[0]
+        capture.prediction = capture.prediction.detach()
+        capture.z = capture.z.detach()
+        capture.target = capture.target.detach()
+        capture.transport = tuple(value[:, 0].detach() for value in capture.transport)
+        capture.final_state = capture.final_state[0].detach()
         return CleanJacobians(capture, transport, final_gradient)
+
+    def clean_jacobians_many(
+        self, data_list: Sequence[GraphormerGraph]
+    ) -> list[CleanJacobians]:
+        """Batch independent variable-size clean Jacobians with native padding."""
+
+        import torch
+
+        values = list(data_list)
+        if not values:
+            return []
+        if len(values) == 1:
+            return [self.clean_jacobians(values[0])]
+        self.model.zero_grad(set_to_none=True)
+        capture = self.capture(values, require_grad=True)
+        targets = tuple(capture.transport) + (capture.final_state,)
+        by_output = []
+        for output in range(int(capture.z.shape[1])):
+            by_output.append(
+                torch.autograd.grad(
+                    capture.z[:, output].sum(),
+                    targets,
+                    retain_graph=output + 1 < int(capture.z.shape[1]),
+                    allow_unused=False,
+                )
+            )
+        outputs: list[CleanJacobians] = []
+        for graph_index, data in enumerate(values):
+            tokens = int(data.num_nodes) + 1
+            transport = torch.stack(
+                [
+                    torch.stack(
+                        [
+                            row[layer][:tokens, graph_index].detach()
+                            for row in by_output
+                        ],
+                        dim=0,
+                    )
+                    for layer in range(self.runtime.L)
+                ],
+                dim=1,
+            )
+            final_gradient = torch.stack(
+                [row[-1][graph_index, :tokens].detach() for row in by_output],
+                dim=0,
+            )
+            audit_check(
+                bool(
+                    torch.isfinite(transport).all()
+                    and torch.isfinite(final_gradient).all()
+                ),
+                "backend.finite_clean_jacobian",
+                "non-finite grouped Graphormer clean z-space Jacobian",
+                context={"graph_batch_index": int(graph_index)},
+            )
+            layer_norms = torch.linalg.vector_norm(
+                transport.reshape(transport.shape[0], transport.shape[1], -1),
+                dim=(0, 2),
+            )
+            if bool((layer_norms <= 0).any()):
+                missing = torch.nonzero(layer_norms <= 0).reshape(-1).tolist()
+                audit_check(
+                    False,
+                    "backend.nonzero_clean_transport",
+                    f"zero grouped Graphormer transport Jacobian in layers {missing}; "
+                    "those layers score zero",
+                    context={
+                        "graph_batch_index": int(graph_index),
+                        "layers": missing,
+                    },
+                )
+            graph_capture = BackendCapture(
+                prediction=capture.prediction[
+                    graph_index : graph_index + 1
+                ].detach(),
+                z=capture.z[graph_index : graph_index + 1].detach(),
+                target=capture.target[graph_index : graph_index + 1].detach(),
+                transport=tuple(
+                    value[:tokens, graph_index].detach()
+                    for value in capture.transport
+                ),
+                final_state=capture.final_state[graph_index, :tokens].detach(),
+                real_mask=None,
+            )
+            outputs.append(
+                CleanJacobians(graph_capture, transport, final_gradient)
+            )
+        return outputs
 
     def loss_per_graph(self, prediction, target):
         return self.task.loss_per_graph(

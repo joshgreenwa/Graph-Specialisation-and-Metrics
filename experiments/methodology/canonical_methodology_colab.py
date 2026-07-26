@@ -1,7 +1,7 @@
 """Paste/run this lightweight cell in Colab to execute the final methodology.
 
 Edit only TASKS, TRAIN_SEEDS/TASK_TRAIN_SEEDS, PHASES, CHECKPOINTS, TASK_OVERRIDES,
-and SIZES. Scientific definitions live in ``src/graph_specialisation_metrics/README.md``
+SIZES, and EXECUTION. Scientific definitions live in ``src/graph_specialisation_metrics/README.md``
 and the canonical package; this front end merely checks out the chosen repository revision,
 mounts Drive, and dispatches registered tasks.
 """
@@ -40,6 +40,11 @@ SIZES = {
     "sources_per_graph": 6,
     "donors_per_source": 8,
     "bootstrap_replicates": 2_000,  # fixed by the normative protocol
+}
+EXECUTION = {
+    # Runtime-only: increase on large GPUs; CUDA OOM automatically retries smaller groups.
+    "graphs_per_batch": 4,
+    "oom_backoff": True,
 }
 
 from google.colab import drive, userdata  # noqa: E402
@@ -87,6 +92,7 @@ run(
     checkpoints=CHECKPOINTS,
     task_overrides=TASK_OVERRIDES,
     sizes=SIZES,
+    execution=EXECUTION,
     mount=False,
 )
 # On a runtime where GRIT/PyG dependencies are already installed, add skip_install=True.

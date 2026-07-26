@@ -55,6 +55,21 @@ def tiny_graph(config):
     )
 
 
+def tiny_two_node_graph(config):
+    graph = {
+        "num_nodes": 2,
+        "node_feat": np.asarray([[5, 0, 4], [6, 1, 3]], dtype=np.int64),
+        "edge_index": np.asarray([[0, 1], [1, 0]], dtype=np.int64),
+        "edge_feat": np.asarray([[0, 1, 0], [0, 1, 0]], dtype=np.int64),
+    }
+    return graphormer_graph_from_ogb(
+        graph,
+        [0.5],
+        config=config,
+        smiles="CC",
+    )
+
+
 def tiny_config():
     transformers = pytest.importorskip("transformers")
     return transformers.GraphormerConfig(
@@ -186,6 +201,7 @@ def test_graphormer_backend_hooks_patch_and_graph_token_replay():
     config = tiny_config()
     model = transformers.GraphormerForGraphClassification(config).eval()
     data = tiny_graph(config)
+    small = tiny_two_node_graph(config)
     task = get_task("graphormer_pcqm4mv2")
     runtime = GraphormerRuntime(
         model,
@@ -219,6 +235,47 @@ def test_graphormer_backend_hooks_patch_and_graph_token_replay():
     )
     assert clean.final_state.shape == (1, data.num_nodes + 1, config.embedding_dim)
     assert torch.count_nonzero(clean.final_state[:, 1:]) == 0
+
+    grouped = backend.capture_groups([[data, data], [small]])
+    assert len(grouped) == 2
+    assert torch.allclose(grouped[0].z, captured.z, atol=1e-7, rtol=0.0)
+    for layer, expected in zip(grouped[0].transport, captured.transport):
+        assert torch.allclose(layer, expected, atol=1e-7, rtol=0.0)
+    assert torch.allclose(
+        grouped[0].final_state, captured.final_state, atol=1e-7, rtol=0.0
+    )
+    small_captured = backend.capture([small], require_grad=False)
+    assert torch.allclose(
+        grouped[1].z, small_captured.z, atol=1e-6, rtol=0.0
+    )
+    for layer, expected in zip(grouped[1].transport, small_captured.transport):
+        assert torch.allclose(layer, expected, atol=1e-6, rtol=0.0)
+    assert torch.allclose(
+        grouped[1].final_state, small_captured.final_state, atol=1e-6, rtol=0.0
+    )
+
+    small_clean = backend.clean_jacobians(small)
+    clean_many = backend.clean_jacobians_many([data, small])
+    assert len(clean_many) == 2
+    for batched_clean, individual_clean in zip(clean_many, (clean, small_clean)):
+        assert torch.allclose(
+            batched_clean.capture.z,
+            individual_clean.capture.z,
+            atol=1e-6,
+            rtol=0.0,
+        )
+        assert torch.allclose(
+            batched_clean.transport,
+            individual_clean.transport,
+            atol=1e-6,
+            rtol=0.0,
+        )
+        assert torch.allclose(
+            batched_clean.final_state,
+            individual_clean.final_state,
+            atol=1e-6,
+            rtol=0.0,
+        )
 
     replacements = backend.replacement_batch(captured, [0])
     prediction, z, _ = backend.patch(data, replacements, ((0, 0),))

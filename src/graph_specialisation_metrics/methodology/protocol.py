@@ -131,6 +131,18 @@ class FamilyPolicy:
 
 
 @dataclass(frozen=True)
+class ExecutionPolicy:
+    """Performance controls that must leave cached scientific quantities unchanged."""
+
+    graphs_per_batch: int = 4
+    oom_backoff: bool = True
+
+    def validate(self) -> None:
+        if int(self.graphs_per_batch) < 1:
+            raise ValueError("graphs_per_batch must be positive")
+
+
+@dataclass(frozen=True)
 class MethodologyConfig:
     """Complete public configuration for canonical multi-backend analyses."""
 
@@ -145,6 +157,7 @@ class MethodologyConfig:
     numerical: NumericalPolicy = field(default_factory=NumericalPolicy)
     bootstrap: BootstrapPolicy = field(default_factory=BootstrapPolicy)
     families: FamilyPolicy = field(default_factory=FamilyPolicy)
+    execution: ExecutionPolicy = field(default_factory=ExecutionPolicy)
     analysis_seed: int = 31_415
     accelerator: str = "cuda:0"
     num_threads: int = 4
@@ -162,6 +175,7 @@ class MethodologyConfig:
         self.numerical.validate()
         self.bootstrap.validate()
         self.families.validate()
+        self.execution.validate()
         if not self.tasks:
             raise ValueError("at least one task is required")
         if not self.train_seeds:
@@ -245,6 +259,7 @@ class MethodologyConfig:
             "accelerator": self.accelerator,
             "num_threads": self.num_threads,
             # Execution policy, not a scientific boundary: excluded from the cache fingerprint.
+            "execution": dataclasses.asdict(self.execution),
             "strict_audits": bool(self.strict_audits),
             "checkpoints": dict(self.checkpoints),
             "figure_overrides": dict(self.figure_overrides),

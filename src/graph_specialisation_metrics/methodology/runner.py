@@ -46,6 +46,7 @@ from .distance import (
     supported_mean,
 )
 from .events import build_channel_events
+from .execution import execute_graph_batches
 from .interventions import semantic_donor_swap, structural_donor_swap
 from .figures import (
     FigureBuilder,
@@ -693,6 +694,191 @@ def _clean_attention_distance(
     return prepared.backend.clean_attention_distance(base, pristine, axis)
 
 
+def _capture_event_groups(prepared: PreparedTask, groups: Sequence[Sequence[Any]]):
+    capture_groups = getattr(prepared.backend, "capture_groups", None)
+    if callable(capture_groups):
+        return capture_groups(groups, include_virtual_transport=True)
+    return [
+        prepared.backend.capture(
+            group, require_grad=False, include_virtual_transport=True
+        )
+        for group in groups
+    ]
+
+
+def _prepare_clean_jacobians(
+    prepared: PreparedTask,
+    config: MethodologyConfig,
+    graph_ids: Sequence[int],
+) -> tuple[dict[int, Any], dict[str, Any]]:
+    """Batch clean linearisations and return graph-keyed results plus execution provenance."""
+
+    clean_by_graph: dict[int, Any] = {}
+
+    def execute(chunk):
+        bases = [prepared.grit.eval_ds[int(graph_id)] for graph_id in chunk]
+        clean_many = getattr(prepared.backend, "clean_jacobians_many", None)
+        values = (
+            clean_many(bases)
+            if callable(clean_many)
+            else [prepared.backend.clean_jacobians(base) for base in bases]
+        )
+        if len(values) != len(chunk):
+            raise RuntimeError("grouped clean Jacobians changed the graph count")
+        return list(zip((int(value) for value in chunk), values))
+
+    def consume(rows):
+        clean_by_graph.update(rows)
+
+    report = execute_graph_batches(
+        graph_ids,
+        graphs_per_batch=config.execution.graphs_per_batch,
+        execute=execute,
+        consume=consume,
+        oom_backoff=config.execution.oom_backoff,
+    )
+    return clean_by_graph, dataclasses.asdict(report)
+
+
+def _score_graph_batch(
+    prepared: PreparedTask,
+    config: MethodologyConfig,
+    plan: Mapping[int, Mapping[str, Any]],
+    clean_by_graph: Mapping[int, Any],
+    axis: DistanceAxis,
+    channel: str,
+    graph_ids: Sequence[int],
+) -> list[dict[str, Any]]:
+    """Run one multi-graph event forward and return graph-local score sufficient statistics."""
+
+    import torch
+
+    contexts: list[dict[str, Any]] = []
+    groups: list[list[Any]] = []
+    for graph_id in graph_ids:
+        graph_id = int(graph_id)
+        base = prepared.grit.eval_ds[graph_id]
+        sources = plan[graph_id][channel]["sources"]
+        variants, records = _rebuild_graph_events(
+            prepared, config, "scores", graph_id, channel, sources
+        )
+        audit_check(
+            [record.record() for record in records]
+            == list(plan[graph_id][channel]["records"]),
+            "events.deterministic_replay",
+            "deterministic event replay changed its manifest; cached scores are keyed by the "
+            "planned manifest hash",
+            context={"stage": "scores", "graph": graph_id, "channel": channel},
+        )
+        pristine = shortest_path_distances(base.edge_index, int(base.num_nodes))
+        contexts.append(
+            {
+                "graph_id": graph_id,
+                "base": base,
+                "clean": clean_by_graph[graph_id],
+                "records": records,
+                "pristine": pristine,
+            }
+        )
+        groups.append([base, *variants])
+
+    captures = _capture_event_groups(prepared, groups)
+    if len(captures) != len(contexts):
+        raise RuntimeError("grouped event capture changed the number of base-graph groups")
+    results: list[dict[str, Any]] = []
+    for context, event_capture in zip(contexts, captures):
+        graph_id = context["graph_id"]
+        clean = context["clean"]
+        records = context["records"]
+        base = context["base"]
+        pristine = context["pristine"]
+        transport = torch.stack(event_capture.transport, dim=1)
+        delta = transport[0:1] - transport[1:]
+        q = project_transport(delta, clean.transport)
+        scores = event_head_scores(q).detach().cpu().numpy()
+        source_ids = [record.source for record in records]
+        gids = [graph_id] * len(records)
+        _, one_graph, _ = aggregate_event_scores(scores, gids, source_ids)
+        event_c, event_o, rows = [], [], []
+        score_observations, distance_rows = [], []
+        for position, record in enumerate(records):
+            distances = prepared.backend.transport_distances(
+                base, int(record.source), pristine
+            )
+            contribution, support = distance_event_contributions(
+                q[position : position + 1], distances, axis
+            )
+            event_c.append(contribution[0])
+            event_o.append(support[0])
+            rows.append(
+                {
+                    **record.record(),
+                    "score": scores[position],
+                    "distance_contribution": contribution[0],
+                    "distance_support": support[0],
+                }
+            )
+            score_observations.append(
+                Observation(
+                    seed=int(prepared.grit.sc.seed),
+                    graph=graph_id,
+                    source=int(record.source),
+                    donor=int(record.draw),
+                    value=scores[position],
+                )
+            )
+            distance_rows.append(
+                Observation(
+                    seed=int(prepared.grit.sc.seed),
+                    graph=graph_id,
+                    source=int(record.source),
+                    donor=int(record.draw),
+                    value=np.stack(
+                        (
+                            contribution[0],
+                            np.broadcast_to(
+                                support[0][None, None, :], contribution[0].shape
+                            ),
+                        )
+                    ),
+                )
+            )
+        contribution_graph, support_graph = aggregate_distance_events(
+            np.stack(event_c), np.stack(event_o), gids, source_ids
+        )
+        throughput = None
+        attention = None
+        if channel == "semantic":
+            clean_transport = torch.stack(clean.capture.transport, dim=0)
+            projected_clean = torch.einsum(
+                "lnhd,tlnhd->lhnt", clean_transport, clean.transport
+            )
+            throughput = (
+                projected_clean.square()
+                .sum(dim=-1)
+                .sqrt()
+                .sum(dim=-1)
+                .detach()
+                .cpu()
+                .numpy()
+            )
+            attention = _clean_attention_distance(prepared, base, pristine, axis)
+        results.append(
+            {
+                "graph_id": graph_id,
+                "score": one_graph[graph_id],
+                "contribution": contribution_graph[graph_id],
+                "support": support_graph[graph_id],
+                "event_rows": rows,
+                "observations": score_observations,
+                "distance_observations": distance_rows,
+                "throughput": throughput,
+                "attention": attention,
+            }
+        )
+    return results
+
+
 def run_scores(
     prepared: PreparedTask,
     config: MethodologyConfig,
@@ -724,110 +910,50 @@ def run_scores(
     }
     throughput_graph: dict[int, np.ndarray] = {}
     attention_graph: dict[int, np.ndarray] = {}
+    # The clean linearisation is channel-independent. Compute it once per graph and reuse it for
+    # both semantic and structural events.
+    clean_by_graph, clean_execution = _prepare_clean_jacobians(
+        prepared, config, graph_ids
+    )
+    execution_reports: dict[str, Any] = {}
     for channel in CHANNELS:
         graph_scores: dict[int, np.ndarray] = {}
         graph_contribution: dict[int, np.ndarray] = {}
         graph_support: dict[int, np.ndarray] = {}
         event_rows: list[dict[str, Any]] = []
-        for graph_id in graph_ids:
-            base = prepared.grit.eval_ds[int(graph_id)]
-            clean = prepared.backend.clean_jacobians(base)
-            if channel == "semantic":
-                clean_transport = torch.stack(clean.capture.transport, dim=0)
-                projected_clean = torch.einsum(
-                    "lnhd,tlnhd->lhnt",
-                    clean_transport,
-                    clean.transport,
+
+        def consume_score_batch(results):
+            for result in results:
+                graph_id = int(result["graph_id"])
+                graph_scores[graph_id] = result["score"]
+                graph_contribution[graph_id] = result["contribution"]
+                graph_support[graph_id] = result["support"]
+                event_rows.extend(result["event_rows"])
+                observations[channel].extend(result["observations"])
+                distance_observations[channel].extend(
+                    result["distance_observations"]
                 )
-                throughput_graph[graph_id] = (
-                    projected_clean.square()
-                    .sum(dim=-1)
-                    .sqrt()
-                    .sum(dim=-1)
-                    .detach()
-                    .cpu()
-                    .numpy()
-                )
-            sources = plan[graph_id][channel]["sources"]
-            variants, records = _rebuild_graph_events(
-                prepared, config, "scores", graph_id, channel, sources
-            )
-            audit_check(
-                [record.record() for record in records]
-                == list(plan[graph_id][channel]["records"]),
-                "events.deterministic_replay",
-                "deterministic event replay changed its manifest; cached scores are keyed by the "
-                "planned manifest hash",
-                context={"stage": "scores", "graph": int(graph_id), "channel": channel},
-            )
-            event_capture = prepared.backend.capture(
-                [base, *variants], require_grad=False, include_virtual_transport=True
-            )
-            transport = torch.stack(event_capture.transport, dim=1)
-            delta = transport[0:1] - transport[1:]
-            q = project_transport(delta, clean.transport)
-            scores = event_head_scores(q).detach().cpu().numpy()
-            source_ids = [record.source for record in records]
-            gids = [graph_id] * len(records)
-            _, one_graph, _ = aggregate_event_scores(scores, gids, source_ids)
-            graph_scores[graph_id] = one_graph[graph_id]
-            event_c = []
-            event_o = []
-            pristine = shortest_path_distances(base.edge_index, int(base.num_nodes))
-            if channel == "semantic":
-                attention_graph[graph_id] = _clean_attention_distance(
-                    prepared, base, pristine, axis
-                )
-            for position, record in enumerate(records):
-                distances = prepared.backend.transport_distances(
-                    base, int(record.source), pristine
-                )
-                contribution, support = distance_event_contributions(
-                    q[position : position + 1], distances, axis
-                )
-                event_c.append(contribution[0])
-                event_o.append(support[0])
-                event_rows.append(
-                    {
-                        **record.record(),
-                        "score": scores[position],
-                        "distance_contribution": contribution[0],
-                        "distance_support": support[0],
-                    }
-                )
-                observations[channel].append(
-                    Observation(
-                        seed=int(prepared.grit.sc.seed),
-                        graph=graph_id,
-                        source=int(record.source),
-                        donor=int(record.draw),
-                        value=scores[position],
-                    )
-                )
-                distance_observations[channel].append(
-                    Observation(
-                        seed=int(prepared.grit.sc.seed),
-                        graph=graph_id,
-                        source=int(record.source),
-                        donor=int(record.draw),
-                        value=np.stack(
-                            (
-                                contribution[0],
-                                np.broadcast_to(
-                                    support[0][None, None, :], contribution[0].shape
-                                ),
-                            )
-                        ),
-                    )
-                )
-            contribution_graph, support_graph = aggregate_distance_events(
-                np.stack(event_c),
-                np.stack(event_o),
-                gids,
-                source_ids,
-            )
-            graph_contribution[graph_id] = contribution_graph[graph_id]
-            graph_support[graph_id] = support_graph[graph_id]
+                if result["throughput"] is not None:
+                    throughput_graph[graph_id] = result["throughput"]
+                if result["attention"] is not None:
+                    attention_graph[graph_id] = result["attention"]
+
+        report = execute_graph_batches(
+            graph_ids,
+            graphs_per_batch=config.execution.graphs_per_batch,
+            execute=lambda chunk: _score_graph_batch(
+                prepared,
+                config,
+                plan,
+                clean_by_graph,
+                axis,
+                channel,
+                chunk,
+            ),
+            consume=consume_score_batch,
+            oom_backoff=config.execution.oom_backoff,
+        )
+        execution_reports[channel] = dataclasses.asdict(report)
         raw = np.stack([graph_scores[key] for key in graph_ids]).mean(axis=0)
         heatmaps = score_heatmaps(
             graph_contribution,
@@ -911,6 +1037,12 @@ def run_scores(
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
+    output["execution"] = {
+        "clean_jacobian_graphs": len(clean_by_graph),
+        "clean_graph_batches": clean_execution,
+        "clean_reused_across_channels": True,
+        "event_graph_batches": execution_reports,
+    }
     semantic = output["channels"]["semantic"]["raw"]
     structural = output["channels"]["structural"]["raw"]
     coordinates = head_coordinates(
@@ -1049,6 +1181,170 @@ def run_scores(
     return output
 
 
+def _carriage_graph_batch(
+    prepared: PreparedTask,
+    config: MethodologyConfig,
+    plan: Mapping[int, Mapping[str, Any]],
+    clean_by_graph: Mapping[int, Any],
+    channel: str,
+    graph_ids: Sequence[int],
+) -> list[dict[str, Any]]:
+    """Run grouped endpoint forwards, then compute graph-local carriage fields."""
+
+    import torch
+
+    from ..carriage.core import project_final_states
+
+    contexts: list[dict[str, Any]] = []
+    groups: list[list[Any]] = []
+    for graph_id in graph_ids:
+        graph_id = int(graph_id)
+        base = prepared.grit.eval_ds[graph_id]
+        sources = plan[graph_id][channel]["sources"]
+        if not sources:
+            continue
+        variants, records = _rebuild_graph_events(
+            prepared, config, "carriage", graph_id, channel, sources
+        )
+        audit_check(
+            [record.record() for record in records]
+            == list(plan[graph_id][channel]["records"]),
+            "carriage.deterministic_replay",
+            "deterministic carriage event replay changed its manifest; cached fields are "
+            "keyed by the planned manifest hash",
+            context={"stage": "carriage", "graph": graph_id, "channel": channel},
+        )
+        contexts.append(
+            {
+                "graph_id": graph_id,
+                "base": base,
+                "sources": sources,
+                "clean": clean_by_graph[graph_id],
+            }
+        )
+        groups.append([base, *variants])
+    if not groups:
+        return []
+    captures = _capture_event_groups(prepared, groups)
+    if len(captures) != len(contexts):
+        raise RuntimeError("grouped carriage capture changed the base-graph group count")
+
+    results: list[dict[str, Any]] = []
+    for context, captured in zip(contexts, captures):
+        graph_id = context["graph_id"]
+        base = context["base"]
+        sources = context["sources"]
+        clean = context["clean"]
+        K = int(config.sizes.donors_per_source)
+        S = len(sources)
+        h_clean = captured.final_state[0]
+        carriers, width = int(h_clean.shape[-2]), int(h_clean.shape[-1])
+        h_event = captured.final_state[1:].reshape(S, K, carriers, width)
+        delta = h_clean[None, None, :, :] - h_event
+        event_f = functional_carriage_events(delta, clean.final_state)
+        carrier_weights = prepared.backend.carriage_weights(base, h_clean)
+        integrated = beneficial_carriage(
+            h_clean,
+            h_event,
+            prepared.backend.loss_from_pooled(clean.capture.target.reshape(1, -1)),
+            carrier_weights=carrier_weights,
+            atol=config.numerical.integrated_atol,
+            rtol=config.numerical.integrated_rtol,
+            max_intervals=config.numerical.integrated_max_intervals,
+            tolerance=max(
+                config.numerical.integrated_atol * 5,
+                config.numerical.reconstruction_tolerance,
+            ),
+        )
+        target = clean.capture.target.reshape(1, -1)
+        replay_loss = prepared.backend.loss_from_pooled(target)
+        pooled_clean = project_final_states(h_clean.unsqueeze(0), carrier_weights)
+        pooled_event = project_final_states(
+            h_event.reshape(S * K, carriers, width), carrier_weights
+        )
+        with torch.no_grad():
+            replay_clean_loss = replay_loss(pooled_clean)
+            replay_event_loss = replay_loss(pooled_event)
+            actual_clean_loss = prepared.backend.loss_per_graph(
+                captured.prediction[0:1], captured.target[0:1]
+            )
+            actual_event_loss = prepared.backend.loss_per_graph(
+                captured.prediction[1:], captured.target[1:]
+            )
+        endpoint_replay_error = float(
+            torch.max(
+                torch.abs(
+                    torch.cat((replay_clean_loss, replay_event_loss))
+                    - torch.cat((actual_clean_loss, actual_event_loss))
+                )
+            ).item()
+        )
+        within_tolerance(
+            endpoint_replay_error,
+            config.numerical.reconstruction_tolerance,
+            "carriage.endpoint_replay",
+            "pooling-to-readout replay error",
+            context={"graph": graph_id, "channel": channel},
+        )
+        F = event_f.mean(dim=1).t().detach().cpu().numpy()
+        B = integrated.field.detach().cpu().numpy()
+        pristine = shortest_path_distances(base.edge_index, int(base.num_nodes))
+        distance = prepared.backend.carriage_distance_matrix(base, sources, pristine)
+        graph_field = {
+            "sources": tuple(sources),
+            "F_sens": F,
+            "B": B,
+            "distance": distance,
+            "carrier_kinds": tuple(
+                prepared.backend.carriage_carrier_kind(base, carrier)
+                for carrier in range(carriers)
+            ),
+            "event_F_sens": event_f.detach().cpu().numpy(),
+            "event_B": integrated.event_field.detach().cpu().numpy(),
+            "event_loss_increase": integrated.event_loss_increase.detach().cpu().numpy(),
+            "quadrature_error": integrated.quadrature_error.detach().cpu().numpy(),
+            "completeness_residual": (
+                integrated.completeness_residual.detach().cpu().numpy()
+            ),
+            "endpoint_replay_error": endpoint_replay_error,
+            "converged": integrated.converged.detach().cpu().numpy(),
+        }
+        event_b = integrated.event_field.detach().cpu().numpy()
+        event_f_np = event_f.detach().cpu().numpy()
+        pair_rows: list[dict[str, Any]] = []
+        for source_position, source in enumerate(sources):
+            for donor in range(K):
+                for carrier in range(carriers):
+                    pair_rows.append(
+                        {
+                            "seed": int(prepared.grit.sc.seed),
+                            "graph_id": graph_id,
+                            "source": int(source),
+                            "donor": donor,
+                            "carrier": carrier,
+                            "distance": float(distance[carrier, source_position]),
+                            "carrier_kind": prepared.backend.carriage_carrier_kind(
+                                base, carrier
+                            ),
+                            "F_sens": float(
+                                event_f_np[source_position, donor, carrier]
+                            ),
+                            "B": float(event_b[source_position, donor, carrier]),
+                            "channel": channel,
+                        }
+                    )
+        results.append(
+            {
+                "graph_id": graph_id,
+                "graph_field": graph_field,
+                "pair_rows": pair_rows,
+                "paths": int(integrated.converged.numel()),
+                "capped": int((~integrated.converged).sum().item()),
+            }
+        )
+    return results
+
+
 def run_carriage(
     prepared: PreparedTask,
     config: MethodologyConfig,
@@ -1058,8 +1354,6 @@ def run_carriage(
     """Compute F_sens and donor-wise signed path-integrated B for both channels."""
 
     import torch
-
-    from ..carriage.core import project_final_states
 
     plan = dict(plan or _stage_plan(prepared, config, "carriage"))
     cache = _cache(prepared, config, plan)
@@ -1073,134 +1367,42 @@ def run_carriage(
         "manifest_hash": _manifest_hash(plan),
         "channels": {},
     }
+    graph_ids = sorted(plan)
+    # Reuse the same clean z-space linearisation for both intervention channels.
+    clean_by_graph, clean_execution = _prepare_clean_jacobians(
+        prepared, config, graph_ids
+    )
+    execution_reports: dict[str, Any] = {}
     for channel in CHANNELS:
         pair_rows: list[dict[str, Any]] = []
         graph_fields: dict[int, dict[str, Any]] = {}
         capped = 0
         paths = 0
-        for graph_id in sorted(plan):
-            base = prepared.grit.eval_ds[int(graph_id)]
-            sources = plan[graph_id][channel]["sources"]
-            if not sources:
-                continue
-            clean = prepared.backend.clean_jacobians(base)
-            variants, records = _rebuild_graph_events(
-                prepared, config, "carriage", graph_id, channel, sources
-            )
-            audit_check(
-                [record.record() for record in records]
-                == list(plan[graph_id][channel]["records"]),
-                "carriage.deterministic_replay",
-                "deterministic carriage event replay changed its manifest; cached fields are "
-                "keyed by the planned manifest hash",
-                context={"stage": "carriage", "graph": int(graph_id), "channel": channel},
-            )
-            captured = prepared.backend.capture(
-                [base, *variants], require_grad=False, include_virtual_transport=True
-            )
-            K = int(config.sizes.donors_per_source)
-            S = len(sources)
-            h_clean = captured.final_state[0]
-            carriers, width = int(h_clean.shape[-2]), int(h_clean.shape[-1])
-            h_event = captured.final_state[1:].reshape(S, K, carriers, width)
-            delta = h_clean[None, None, :, :] - h_event
-            event_f = functional_carriage_events(delta, clean.final_state)
-            carrier_weights = prepared.backend.carriage_weights(base, h_clean)
-            integrated = beneficial_carriage(
-                h_clean,
-                h_event,
-                prepared.backend.loss_from_pooled(clean.capture.target.reshape(1, -1)),
-                carrier_weights=carrier_weights,
-                atol=config.numerical.integrated_atol,
-                rtol=config.numerical.integrated_rtol,
-                max_intervals=config.numerical.integrated_max_intervals,
-                tolerance=max(
-                    config.numerical.integrated_atol * 5,
-                    config.numerical.reconstruction_tolerance,
-                ),
-            )
-            target = clean.capture.target.reshape(1, -1)
-            replay_loss = prepared.backend.loss_from_pooled(target)
-            pooled_clean = project_final_states(
-                h_clean.unsqueeze(0), carrier_weights
-            )
-            pooled_event = project_final_states(
-                h_event.reshape(S * K, carriers, width),
-                carrier_weights,
-            )
-            with torch.no_grad():
-                replay_clean_loss = replay_loss(pooled_clean)
-                replay_event_loss = replay_loss(pooled_event)
-                actual_clean_loss = prepared.backend.loss_per_graph(
-                    captured.prediction[0:1], captured.target[0:1]
-                )
-                actual_event_loss = prepared.backend.loss_per_graph(
-                    captured.prediction[1:], captured.target[1:]
-                )
-            endpoint_replay_error = float(
-                torch.max(
-                    torch.abs(
-                        torch.cat((replay_clean_loss, replay_event_loss))
-                        - torch.cat((actual_clean_loss, actual_event_loss))
-                    )
-                ).item()
-            )
-            within_tolerance(
-                endpoint_replay_error,
-                config.numerical.reconstruction_tolerance,
-                "carriage.endpoint_replay",
-                "pooling-to-readout replay error",
-                context={"graph": int(graph_id), "channel": channel},
-            )
-            paths += int(integrated.converged.numel())
-            capped += int((~integrated.converged).sum().item())
-            F = event_f.mean(dim=1).t().detach().cpu().numpy()
-            B = integrated.field.detach().cpu().numpy()
-            pristine = shortest_path_distances(base.edge_index, int(base.num_nodes))
-            distance = prepared.backend.carriage_distance_matrix(
-                base, sources, pristine
-            )
-            graph_fields[graph_id] = {
-                "sources": tuple(sources),
-                "F_sens": F,
-                "B": B,
-                "distance": distance,
-                "carrier_kinds": tuple(
-                    prepared.backend.carriage_carrier_kind(base, carrier)
-                    for carrier in range(carriers)
-                ),
-                "event_F_sens": event_f.detach().cpu().numpy(),
-                "event_B": integrated.event_field.detach().cpu().numpy(),
-                "event_loss_increase": integrated.event_loss_increase.detach().cpu().numpy(),
-                "quadrature_error": integrated.quadrature_error.detach().cpu().numpy(),
-                "completeness_residual": (
-                    integrated.completeness_residual.detach().cpu().numpy()
-                ),
-                "endpoint_replay_error": endpoint_replay_error,
-                "converged": integrated.converged.detach().cpu().numpy(),
-            }
-            event_b = integrated.event_field.detach().cpu().numpy()
-            event_f_np = event_f.detach().cpu().numpy()
-            for source_position, source in enumerate(sources):
-                for donor in range(K):
-                    for carrier in range(carriers):
-                        carrier_kind = prepared.backend.carriage_carrier_kind(
-                            base, carrier
-                        )
-                        pair_rows.append(
-                            {
-                                "seed": int(prepared.grit.sc.seed),
-                                "graph_id": int(graph_id),
-                                "source": int(source),
-                                "donor": donor,
-                                "carrier": carrier,
-                                "distance": float(distance[carrier, source_position]),
-                                "carrier_kind": carrier_kind,
-                                "F_sens": float(event_f_np[source_position, donor, carrier]),
-                                "B": float(event_b[source_position, donor, carrier]),
-                                "channel": channel,
-                            }
-                        )
+
+        def consume_carriage_batch(results):
+            nonlocal capped, paths
+            for result in results:
+                graph_id = int(result["graph_id"])
+                graph_fields[graph_id] = result["graph_field"]
+                pair_rows.extend(result["pair_rows"])
+                paths += int(result["paths"])
+                capped += int(result["capped"])
+
+        report = execute_graph_batches(
+            graph_ids,
+            graphs_per_batch=config.execution.graphs_per_batch,
+            execute=lambda chunk: _carriage_graph_batch(
+                prepared,
+                config,
+                plan,
+                clean_by_graph,
+                channel,
+                chunk,
+            ),
+            consume=consume_carriage_batch,
+            oom_backoff=config.execution.oom_backoff,
+        )
+        execution_reports[channel] = dataclasses.asdict(report)
         capped_fraction = float(capped / paths) if paths else 0.0
         within_tolerance(
             capped_fraction,
@@ -1300,6 +1502,12 @@ def run_carriage(
             },
             "additive_graph": additive,
         }
+    output["execution"] = {
+        "clean_jacobian_graphs": len(clean_by_graph),
+        "clean_graph_batches": clean_execution,
+        "clean_reused_across_channels": True,
+        "event_graph_batches": execution_reports,
+    }
     cache.save("carriage", "fields", output)
     cache.save_audit("carriage_manifest", plan)
     return output
