@@ -229,6 +229,8 @@ configuration and repository commit, renders every seed's figures, then writes b
 `population.json` files and the root `protocol.json`, `audits.json`, and `index.json`.
 Each GPU array element requests four hours; interrupted runs resume from their completed atomic
 graph and target shards.
+The launcher validates `GRIT_ROOT` as the pinned official Git checkout and transports the four
+seeds through Slurm as a colon-separated list, avoiding the comma semantics of `--export`.
 
 Every long component writes atomic graph/target shards and a consolidated cache. Re-running the
 same command resumes missing work. `progress.jsonl` and stdout include the active

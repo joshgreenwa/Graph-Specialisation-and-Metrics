@@ -26,7 +26,11 @@ from typing import Any, Mapping, Sequence
 
 import numpy as np
 
-from ..methodology.bootstrap import Observation, nested_percentile_interval
+from ..methodology.bootstrap import (
+    Observation,
+    nested_percentile_interval,
+    trimmed_mean,
+)
 from ..methodology.cache import StaleCacheError, atomic_json, load_cache_artifact_file
 from ..methodology.distance import display_bins
 from ..methodology.protocol import BootstrapPolicy
@@ -1139,7 +1143,7 @@ def plot_core_causal_validation(
         fig, axes = plt.subplots(
             3,
             len(models),
-            figsize=(2.75 * len(models), 7.0),
+            figsize=(3.05 * len(models), 7.0),
             constrained_layout=False,
             squeeze=False,
             gridspec_kw={"height_ratios": (1.0, 1.15, 0.92)},
@@ -1188,6 +1192,10 @@ def plot_core_causal_validation(
             )
             axes[1, column].set_xlim(-1.05, 1.05)
             axes[1, column].set_xlabel(r"Spearman $\rho$")
+            if column > 0:
+                for row_index in (0, 1):
+                    axes[row_index, column].set_yticklabels([])
+                    axes[row_index, column].tick_params(axis="y", length=0)
             interaction = [
                 row for row in selected if row["section"] == "family_interaction"
             ]
@@ -1277,12 +1285,12 @@ def plot_core_causal_validation(
             y=0.988,
         )
         fig.subplots_adjust(
-            left=0.14,
+            left=0.13,
             right=0.99,
             bottom=0.10,
             top=0.89,
             hspace=0.54,
-            wspace=0.42,
+            wspace=0.24,
         )
         _save_figure(
             fig,
@@ -1852,7 +1860,7 @@ def plot_competence_and_causal_grounding(
         fig, axes = plt.subplots(
             1,
             4,
-            figsize=(10.8, 3.25),
+            figsize=(10.8, 3.45),
             constrained_layout=False,
             gridspec_kw={"width_ratios": (1.6, 1, 1, 1)},
         )
@@ -1888,7 +1896,7 @@ def plot_competence_and_causal_grounding(
         axes[0].set_xlabel("Memory size, $N$")
         axes[0].set_ylabel("Held-out accuracy")
         axes[0].set_title("A  Retrieval competence", fontsize=9.8)
-        axes[0].legend(fontsize=7.2, loc="lower left")
+        handles, labels = axes[0].get_legend_handles_labels()
         _annotated_matrix(
             fig,
             axes[1],
@@ -1914,7 +1922,18 @@ def plot_competence_and_causal_grounding(
             vmax=1,
         )
         finite_family = np.abs(family_mean[np.isfinite(family_mean)])
-        limit = max(float(np.max(finite_family)) if finite_family.size else 1.0, 0.25)
+        sorted_family = np.sort(finite_family)
+        largest = float(sorted_family[-1]) if sorted_family.size else 1.0
+        second_largest = (
+            float(sorted_family[-2]) if sorted_family.size > 1 else largest
+        )
+        interaction_display_clipped = bool(
+            largest > 5.0 * max(second_largest, 0.25)
+        )
+        limit = max(
+            second_largest if interaction_display_clipped else largest,
+            0.25,
+        )
         _annotated_matrix(
             fig,
             axes[3],
@@ -1922,10 +1941,32 @@ def plot_competence_and_causal_grounding(
             family_sd,
             models=models,
             ns=causal_ns,
-            title="D  Family × channel interaction",
+            title=(
+                "D  Family × channel interaction$^{\\dagger}$"
+                if interaction_display_clipped
+                else "D  Family × channel interaction"
+            ),
             cmap="PuOr_r",
             vmin=-limit,
             vmax=limit,
+        )
+        if interaction_display_clipped:
+            fig.text(
+                0.992,
+                0.145,
+                r"$^{\dagger}$Colour scale clipped; annotated estimates are exact.",
+                ha="right",
+                va="bottom",
+                fontsize=6.2,
+                color="#555555",
+            )
+        fig.legend(
+            handles,
+            labels,
+            loc="lower center",
+            bbox_to_anchor=(0.5, 0.008),
+            ncol=len(handles),
+            fontsize=7.2,
         )
         fig.suptitle(
             "Retrieval competence and causal grounding across capacity regimes",
@@ -1935,7 +1976,7 @@ def plot_competence_and_causal_grounding(
         fig.subplots_adjust(
             left=0.065,
             right=0.995,
-            bottom=0.18,
+            bottom=0.24,
             top=0.82,
             wspace=0.52,
         )
@@ -1956,6 +1997,12 @@ def plot_competence_and_causal_grounding(
                     "R_role is intentionally absent: it is amplitude-free and is not a core "
                     "methodology coordinate"
                 ),
+                "family_interaction_colour_scale": (
+                    "clipped at the second-largest absolute cell to keep non-outlier cells "
+                    "visible; annotations always show the unclipped mean and SD"
+                    if interaction_display_clipped
+                    else "full observed range"
+                ),
             },
         )
         plt.close(fig)
@@ -1969,7 +2016,7 @@ def role_conditioned_carriage_profiles(
     max_points: int = 14,
     distance_axis: Any | None = None,
 ) -> dict[tuple[str, str], dict[str, Any]]:
-    """Event-normalised Functional carriage by source role and canonical channel."""
+    """Primary raw Functional carriage by source role and canonical channel."""
 
     output: dict[tuple[str, str], dict[str, Any]] = {}
     offset = 0
@@ -1993,57 +2040,95 @@ def role_conditioned_carriage_profiles(
             ("query", lambda source: int(source) == 2),
             ("record", lambda source: int(source) >= 3),
         ):
-            event_values: dict[tuple[int, int, int], np.ndarray] = {}
-            for row in rows:
-                source = int(row["source"])
-                distance = _as_float(row.get("distance"))
-                if not predicate(source) or not np.isfinite(distance):
-                    continue
-                key = (int(row["graph_id"]), source, int(row["donor"]))
-                event_values.setdefault(key, np.zeros(len(axis.groups), dtype=np.float64))
-                numeric_distance = int(distance)
-                position = next(
+            role_rows = [row for row in rows if predicate(row["source"])]
+            estimates: list[float] = []
+            lows: list[float] = []
+            highs: list[float] = []
+            graph_support: list[int] = []
+            pair_support: list[int] = []
+            event_support: list[int] = []
+            for group in axis.groups:
+                distances = {int(value) for value in group}
+                selected = [
+                    row
+                    for row in role_rows
+                    if np.isfinite(_as_float(row.get("distance")))
+                    and int(float(row["distance"])) in distances
+                    and np.isfinite(_as_float(row.get("F_sens")))
+                ]
+                graphs = {int(row["graph_id"]) for row in selected}
+                pairs = {
                     (
-                        index
-                        for index, group in enumerate(axis.groups)
-                        if numeric_distance in group
-                    ),
-                    None,
-                )
-                if position is not None:
-                    event_values[key][position] += _as_float(row.get("F_sens"), 0.0)
-            observations = []
-            for (graph, source, donor), values in sorted(event_values.items()):
-                total = float(np.sum(values))
-                if total <= 0:
+                        int(row["graph_id"]),
+                        int(row["carrier"]),
+                        int(row["source"]),
+                    )
+                    for row in selected
+                }
+                grouped: dict[tuple[int, int, int], list[float]] = {}
+                for row in selected:
+                    key = (
+                        int(row["graph_id"]),
+                        int(row["source"]),
+                        int(row["donor"]),
+                    )
+                    grouped.setdefault(key, []).append(float(row["F_sens"]))
+                graph_support.append(len(graphs))
+                pair_support.append(len(pairs))
+                event_support.append(len(grouped))
+                if (
+                    len(graphs) < int(bootstrap.minimum_graphs)
+                    or len(pairs) < int(bootstrap.minimum_pairs)
+                    or not grouped
+                ):
+                    estimates.append(float("nan"))
+                    lows.append(float("nan"))
+                    highs.append(float("nan"))
                     continue
-                observations.append(
+                observations = [
                     Observation(
                         seed=int(seed),
                         graph=int(graph),
                         source=int(source),
                         donor=int(donor),
-                        value=values / total,
+                        value=np.asarray(
+                            [np.sum(values), len(values)],
+                            dtype=np.float64,
+                        ),
                     )
+                    for (graph, source, donor), values in sorted(grouped.items())
+                ]
+
+                def graph_reduce(values: np.ndarray) -> np.ndarray:
+                    return trimmed_mean(
+                        values[:, 0] / values[:, 1],
+                        bootstrap.trim_fraction,
+                        axis=0,
+                    )
+
+                offset += 1
+                interval = nested_percentile_interval(
+                    observations,
+                    dataclasses.replace(
+                        bootstrap,
+                        rng_seed=int(bootstrap.rng_seed) + 90_000 + offset,
+                        resample_source=False,
+                    ),
+                    graph_reduce=graph_reduce,
                 )
-            if not observations:
+                estimates.append(float(interval.estimate))
+                lows.append(float(interval.low))
+                highs.append(float(interval.high))
+            if not any(np.isfinite(estimates)):
                 continue
-            offset += 1
-            interval = nested_percentile_interval(
-                observations,
-                dataclasses.replace(
-                    bootstrap,
-                    rng_seed=int(bootstrap.rng_seed) + 90_000 + offset,
-                    resample_source=False,
-                ),
-            )
             output[(channel, role)] = {
                 "labels": axis.labels,
-                "estimate": np.asarray(interval.estimate),
-                "low": np.asarray(interval.low),
-                "high": np.asarray(interval.high),
-                "events": len(observations),
-                "graphs": len({row.graph for row in observations}),
+                "estimate": np.asarray(estimates, dtype=np.float64),
+                "low": np.asarray(lows, dtype=np.float64),
+                "high": np.asarray(highs, dtype=np.float64),
+                "graphs": np.asarray(graph_support, dtype=np.int64),
+                "pairs": np.asarray(pair_support, dtype=np.int64),
+                "events": np.asarray(event_support, dtype=np.int64),
             }
     return output
 
@@ -2101,13 +2186,14 @@ def plot_role_conditioned_carriage(
                         "channel": channel,
                         "source_role": role,
                         "distance_group": label,
-                        "event_normalised_functional_carriage": float(
+                        "functional_carriage": float(
                             result["estimate"][position]
                         ),
                         "ci95_low": float(result["low"][position]),
                         "ci95_high": float(result["high"][position]),
-                        "events": int(result["events"]),
-                        "graphs": int(result["graphs"]),
+                        "events": int(result["events"][position]),
+                        "graphs": int(result["graphs"][position]),
+                        "eligible_pairs": int(result["pairs"][position]),
                     }
                 )
     if not profiles:
@@ -2126,7 +2212,7 @@ def plot_role_conditioned_carriage(
         fig, axes = plt.subplots(
             2,
             2,
-            figsize=(7.5, 4.85),
+            figsize=(7.5, 5.25),
             constrained_layout=False,
             sharey=True,
             sharex=True,
@@ -2166,24 +2252,20 @@ def plot_role_conditioned_carriage(
                     rotation_mode="anchor",
                     fontsize=6.6,
                 )
-                if row_index == 0:
-                    axis.set_title(
+                axis.set_title(
+                    f"{channel.capitalize()} donor swap\n"
+                    + (
                         "Query source"
                         if role == "query"
-                        else "Requested-record source",
-                        fontsize=9.5,
-                    )
-                axis.text(
-                    0.02,
-                    0.92,
-                    f"{channel.capitalize()} donor swap",
-                    transform=axis.transAxes,
-                    ha="left",
-                    va="top",
-                    fontsize=7.3,
-                    color=SEMANTIC_COLOUR
-                    if channel == "semantic"
-                    else STRUCTURAL_COLOUR,
+                        else "Requested-record source"
+                    ),
+                    fontsize=8.2,
+                    color=(
+                        SEMANTIC_COLOUR
+                        if channel == "semantic"
+                        else STRUCTURAL_COLOUR
+                    ),
+                    pad=6,
                 )
         handles, _ = axes[0, 0].get_legend_handles_labels()
         labels = []
@@ -2216,7 +2298,7 @@ def plot_role_conditioned_carriage(
             y=0.98,
         )
         fig.supylabel(
-            "Fraction of event Functional carriage",
+            r"Functional carriage  $F_{\rm sens}$",
             fontsize=9.3,
             x=0.02,
         )
@@ -2228,9 +2310,9 @@ def plot_role_conditioned_carriage(
         fig.subplots_adjust(
             left=0.10,
             right=0.99,
-            bottom=0.23,
-            top=0.86,
-            hspace=0.24,
+            bottom=0.22,
+            top=0.82,
+            hspace=0.50,
             wspace=0.25,
         )
         directory = (
@@ -2246,10 +2328,14 @@ def plot_role_conditioned_carriage(
                 "paper_version": PAPER_VERSION,
                 "N": int(records),
                 "seed_policy": "lowest-validation-loss seed independently per model",
-                "estimand": "event-normalised Functional carriage; beneficial carriage absent",
+                "estimand": "raw Functional carriage F_sens; beneficial carriage absent",
                 "uncertainty": "95% nested graph/donor percentile interval within selected seed",
                 "distance_groups": (
                     "one shared axis across models/channels; at most 14 contiguous groups"
+                ),
+                "reporting_floor": (
+                    f"{bootstrap.minimum_graphs} graphs and "
+                    f"{bootstrap.minimum_pairs} eligible carrier/source pairs"
                 ),
             },
         )

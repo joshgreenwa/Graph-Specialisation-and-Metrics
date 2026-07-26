@@ -23,10 +23,12 @@ if [[ -n "${ENV_ACTIVATE:-}" ]]; then
   # shellcheck disable=SC1090
   source "${ENV_ACTIVATE}"
 fi
+IFS=':' read -r -a SEED_VALUES <<< "${SEED_LIST:-0:1:2:3}"
+SEEDS_CSV="$(IFS=,; echo "${SEED_VALUES[*]}")"
 
 python graphbench-algoreas-hpc/bin/grit_specialisation.py \
   --tasks bipartite_matching_hard,flow_hard \
-  --seeds "${SEEDS:-0,1,2,3}" \
+  --seeds "${SEEDS_CSV}" \
   --phases figures \
   --profile "${PROFILE:-production}" \
   --analysis-output-root "${GRAPHBENCH_ANALYSIS_OUTPUT_ROOT}" \

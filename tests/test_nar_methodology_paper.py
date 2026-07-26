@@ -13,6 +13,7 @@ from graph_specialisation_metrics.synthetic.nar_methodology_paper import (
     causal_summary_rows,
     conditional_source_scores,
     counterfactual_graph_observations,
+    role_conditioned_carriage_profiles,
 )
 
 
@@ -250,3 +251,29 @@ def test_paper_frontend_defaults_are_cache_only_and_keep_N80_performance_only():
     assert args.causal_ns == "4,16,64"
     assert args.performance_ns == "4,8,16,32,64,80"
     assert args.paper_analysis_name != args.source_extension_name
+
+
+def test_role_conditioned_carriage_keeps_raw_F_sens_scale():
+    rows = []
+    for graph in range(10):
+        for source, value in ((2, 2.0), (3, 4.0)):
+            for carrier in range(5):
+                rows.append(
+                    {
+                        "graph_id": graph,
+                        "source": source,
+                        "donor": 0,
+                        "carrier": carrier,
+                        "distance": 0,
+                        "F_sens": value,
+                    }
+                )
+    profiles = role_conditioned_carriage_profiles(
+        {"channels": {"semantic": {"pairs": rows}}},
+        seed=0,
+        bootstrap=BootstrapPolicy(),
+    )
+
+    assert profiles[("semantic", "query")]["estimate"][0] == pytest.approx(2.0)
+    assert profiles[("semantic", "record")]["estimate"][0] == pytest.approx(4.0)
+    assert profiles[("semantic", "query")]["pairs"][0] == 50

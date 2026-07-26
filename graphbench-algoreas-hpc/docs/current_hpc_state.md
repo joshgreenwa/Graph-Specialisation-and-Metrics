@@ -52,7 +52,9 @@ cd /rds/user/jgg45/hpc-work/Graph-Specialisation-and-Metrics/graphbench-algoreas
 cat > activate_graphbench_algoreas <<'EOF'
 source /usr/local/Cluster-Apps/miniconda3/4.5.1/etc/profile.d/conda.sh
 conda activate graphbench-algoreas
-export PYTHONPATH="$PWD:$PWD/external/GRIT:$PWD/external/GNNPlus:${PYTHONPATH:-}"
+export PROJECT_ROOT=/rds/user/jgg45/hpc-work/Graph-Specialisation-and-Metrics
+export GRIT_ROOT=$PROJECT_ROOT/external/GRIT
+export PYTHONPATH="$PROJECT_ROOT/src:$GRIT_ROOT:$PROJECT_ROOT/external/GNNPlus:${PYTHONPATH:-}"
 export GRAPHBENCH_DATASET_ROOT=/rds/user/jgg45/hpc-work/graphbench-algoreas/datasets
 export GRAPHBENCH_PE_CACHE_ROOT=/rds/user/jgg45/hpc-work/graphbench-algoreas/pe_cache
 export GRAPHBENCH_OUTPUT_ROOT=/rds/user/jgg45/hpc-work/graphbench-algoreas/outputs
@@ -315,6 +317,9 @@ can be resubmitted against the same contract-bound output root to resume complet
 Production workers use 32 base graphs per batch, a 2,000,000 dense-replica budget, and
 64-output matching VJPs. CUDA OOM automatically halves graph batches and keeps the stable smaller
 size. `progress.jsonl` and heartbeat log lines expose utilization, VRAM, and power for live tuning.
+The launcher exports the four seeds internally as colon-separated `SEED_LIST=0:1:2:3`; commas
+cannot be embedded directly in Slurm's `--export` list because Slurm treats them as variable
+separators. It also refuses submission unless `GRIT_ROOT` is a Git checkout at the pinned commit.
 
 Monitor the three job IDs printed by the launcher:
 

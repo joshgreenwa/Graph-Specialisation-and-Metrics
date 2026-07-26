@@ -100,8 +100,8 @@ checkpoint/GRIT inference, and writes a separate
   control-adjusted counterfactual double dissociation;
 - `04_competence_and_causal_grounding`: the full accuracy curve next to causal-grounding summaries
   at the completed canonical `N=4,16,64` cells; and
-- role-conditioned, event-normalised Functional carriage supplements for the
-  lowest-validation-loss seed of each model.
+- role-conditioned raw Functional carriage (`F_sens`) supplements for the
+  lowest-validation-loss seed of each model, with the registered reporting floors and estimator.
 
 The pointwise nested score intervals required by the normative README are moved out of the crowded
 head scatters into model-specific interval companions below `supplementary/intervals/`. Full
@@ -121,6 +121,45 @@ python -m graph_specialisation_metrics.synthetic.nar_methodology_paper \
 
 `N=80` is intentionally performance-only: no score cache was computed for it. Missing or
 provenance-incompatible protected source artifacts fail closed.
+
+### Publication v3: complete capacity and validity analysis
+
+The v3 workflow adds causal validation to the already-computed N=8 and N=32 scores without
+rerunning scoring. Run `analysis/nar_causal_transition_colab.py` once. It invokes the official
+causal-validation implementation directly against the protected score payloads and writes
+checkpoint- and score-hash-bound artifacts only below
+`extensions/nar_causal_transition_v1/`. Existing canonical, score-extension, and paper-v2 files
+are never overwritten.
+
+Then run `analysis/nar_methodology_paper_v3_colab.py`. This second frontend is model-free and
+writes only to `extensions/nar_methodology_paper_v3/`. Its targeted outputs are:
+
+- complete structural-versus-semantic and `D_rel`-versus-`J` landscapes at every score-cached
+  `N=4,8,16,32,64`;
+- a compact two-row causal validation figure at N=16, with the unstable family-interaction
+  endpoint retained as a diagnostic table rather than a headline result;
+- query-versus-record localisation of the canonical families across N, paired with per-cell and
+  hierarchically pooled exact-counterfactual double dissociation;
+- accuracy plus complete all-N heatmaps for `J` versus clean ablation and `D_rel` versus channel
+  contrast;
+- supplementary sensitivity-concentration, frozen-family overlap, and same-minus-cross-channel
+  discriminant-validity analyses; and
+- official raw `F_sens` role-conditioned Functional carriage supplements. Event-normalised
+  carriage and the task-specific `R_role` score are not used.
+
+Command-line equivalents:
+
+```bash
+python -m graph_specialisation_metrics.synthetic.nar_causal_transition \
+  --causal-ns 8,32 \
+  --graphs-per-batch 48
+
+python -m graph_specialisation_metrics.synthetic.nar_methodology_paper_v3 \
+  --phase figures \
+  --score-ns 4,8,16,32,64 \
+  --canonical-causal-ns 4,16,64 \
+  --transition-causal-ns 8,32
+```
 
 ## MarkedTreePath
 

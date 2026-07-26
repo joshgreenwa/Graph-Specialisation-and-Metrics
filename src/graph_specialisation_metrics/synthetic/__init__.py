@@ -25,9 +25,23 @@ def run_nar_methodology_paper(*args, **kwargs):
     return main(*args, **kwargs)
 
 
+def run_nar_causal_transition(*args, **kwargs):
+    from .nar_causal_transition import main
+
+    return main(*args, **kwargs)
+
+
+def run_nar_methodology_paper_v3(*args, **kwargs):
+    from .nar_methodology_paper_v3 import main
+
+    return main(*args, **kwargs)
+
+
 __all__ = [
+    "run_nar_causal_transition",
     "run_nar_canonical_analysis",
     "run_nar_grit",
     "run_nar_methodology_extension",
     "run_nar_methodology_paper",
+    "run_nar_methodology_paper_v3",
 ]
