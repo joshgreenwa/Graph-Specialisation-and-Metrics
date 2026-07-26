@@ -12,6 +12,7 @@ each model-by-N cell; Beneficial carriage is deliberately not computed.
 
 from __future__ import annotations
 
+import importlib
 import os
 import shutil
 import subprocess
@@ -98,6 +99,15 @@ def bootstrap() -> None:
     source = str(COLAB_REPOSITORY / "src")
     if source not in sys.path:
         sys.path.insert(0, source)
+    # A failed Colab cell leaves imported modules alive.  Drop only this repository's modules so
+    # rerunning after a branch update executes the newly checked-out analysis rather than stale
+    # in-memory code.
+    for module_name in tuple(sys.modules):
+        if module_name == "graph_specialisation_metrics" or module_name.startswith(
+            "graph_specialisation_metrics."
+        ):
+            del sys.modules[module_name]
+    importlib.invalidate_caches()
 
 
 bootstrap()

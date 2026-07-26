@@ -157,6 +157,14 @@ TASKS: dict[str, CanonicalTask] = {}
 def register(task: CanonicalTask) -> CanonicalTask:
     if task.name in TASKS:
         raise ValueError(f"canonical task {task.name!r} is already registered")
+    if not callable(task.metric_fn):
+        raise ValueError(
+            f"canonical task {task.name!r} must register a callable dataset metric"
+        )
+    if not callable(task.loss_per_graph):
+        raise ValueError(
+            f"canonical task {task.name!r} must register a callable per-graph loss"
+        )
     TASKS[task.name] = task
     return task
 

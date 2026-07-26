@@ -10,6 +10,7 @@ from graph_specialisation_metrics.methodology.protocol import MethodologyConfig
 from graph_specialisation_metrics.methodology.tasks import TASKS
 from graph_specialisation_metrics.synthetic.nar_canonical_analysis import (
     best_seed_by_validation,
+    categorical_accuracy_metric,
     NarSemanticDonorPool,
     register_nar_tasks,
     task_name,
@@ -28,12 +29,24 @@ def test_nar_registration_declares_canonical_channel_boundaries(tmp_path: Path) 
         assert names == (name,)
         task = TASKS[name]
         assert task.backend_kind == "nar_grit"
+        assert callable(task.metric_fn)
         assert task.semantic_fields == ("x",)
         assert task.dense_pair_structural_fields == ("rrwp",)
         assert "adj" in task.fixed_support_fields
         assert task.adapter_version.endswith("role-aligned-donors")
+        logits = np.asarray([[0.1, 1.2, -0.5], [2.0, 0.3, -1.0]])
+        labels = np.asarray([[1], [2]])
+        assert task.metric_fn(logits, labels) == 0.5
     finally:
         TASKS.pop(name, None)
+
+
+def test_nar_categorical_accuracy_validates_graph_alignment() -> None:
+    with np.testing.assert_raises_regex(ValueError, "graph counts differ"):
+        categorical_accuracy_metric(
+            np.asarray([[1.0, 0.0], [0.0, 1.0]]),
+            np.asarray([0]),
+        )
 
 
 def test_best_seed_selection_uses_validation_not_heldout() -> None:

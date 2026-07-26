@@ -56,6 +56,31 @@ def _cross_entropy_per_graph(prediction, target):
     )
 
 
+def categorical_accuracy_metric(predictions: np.ndarray, targets: np.ndarray) -> float:
+    """Return graph-level categorical accuracy for N-way recall logits.
+
+    Canonical validation passes predictions as ``[graphs, classes]`` and may pass labels as
+    either ``[graphs]`` or ``[graphs, 1]``.  Normalising both here keeps the registered dataset
+    metric identical to the accuracy used by the NAR training frontend.
+    """
+
+    logits = np.asarray(predictions)
+    labels = np.asarray(targets).reshape(-1)
+    if logits.ndim < 2:
+        raise ValueError(
+            "NAR categorical accuracy requires predictions with a class dimension"
+        )
+    logits = logits.reshape(-1, int(logits.shape[-1]))
+    if int(logits.shape[0]) != int(labels.size):
+        raise ValueError(
+            "NAR prediction/target graph counts differ: "
+            f"{int(logits.shape[0])} != {int(labels.size)}"
+        )
+    if not labels.size:
+        raise ValueError("NAR categorical accuracy requires at least one graph")
+    return float(np.mean(np.argmax(logits, axis=-1) == labels))
+
+
 @dataclass(frozen=True)
 class NarTaskSpec:
     name: str
@@ -65,7 +90,7 @@ class NarTaskSpec:
     width: int
     training_run_dir: str
     content_adapter: Any = dataclasses.field(default_factory=FullNodeContentAdapter)
-    metric_fn: Any = None
+    metric_fn: Any = staticmethod(categorical_accuracy_metric)
 
 
 def task_name(model_name: str, records: int) -> str:
@@ -1764,6 +1789,7 @@ __all__ = [
     "NarSemanticDonorPool",
     "NarTaskSpec",
     "best_seed_by_validation",
+    "categorical_accuracy_metric",
     "checkpoint_payloads",
     "find_checkpoint",
     "build_parser",
