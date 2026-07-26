@@ -19,8 +19,15 @@ def run_nar_methodology_extension(*args, **kwargs):
     return main(*args, **kwargs)
 
 
+def run_nar_methodology_paper(*args, **kwargs):
+    from .nar_methodology_paper import main
+
+    return main(*args, **kwargs)
+
+
 __all__ = [
     "run_nar_canonical_analysis",
     "run_nar_grit",
     "run_nar_methodology_extension",
+    "run_nar_methodology_paper",
 ]

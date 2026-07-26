@@ -82,6 +82,46 @@ controls are independently configurable with `--score-graphs-per-batch` and
 Low host-RAM use is expected because NAR graphs are generated lazily and model activations live on
 the accelerator.
 
+## Fixed-N associative recall: publication synthesis
+
+`analysis/nar_methodology_paper_colab.py` is the final, cache-only publication frontend. It keeps
+the original canonical analysis and `nar_role_counterfactual_v1` extension immutable, performs no
+checkpoint/GRIT inference, and writes a separate
+`extensions/nar_methodology_paper_v2/` tree containing:
+
+- `01_core_specialisation_N16`: the mandatory structural-versus-semantic and
+  `D_rel`-versus-`J` head landscapes, with discrete layer colours, seed shapes, core-family
+  outlines, model accuracy subtitles, and no whiskers over the main scatter;
+- `02_core_causal_validation_N16`: same-/cross-channel raw-score calibration, `J` against clean
+  ablation/total causal response, `D_rel` against signed channel contrasts, and the frozen
+  semantic-family versus structural-family causal interaction against matched controls;
+- `03_task_role_and_counterfactual_validation`: canonical-family query/record fingerprints using
+  the unconditional core-channel normalisers, plus a correctness-gated, graph-paired,
+  control-adjusted counterfactual double dissociation;
+- `04_competence_and_causal_grounding`: the full accuracy curve next to causal-grounding summaries
+  at the completed canonical `N=4,16,64` cells; and
+- role-conditioned, event-normalised Functional carriage supplements for the
+  lowest-validation-loss seed of each model.
+
+The pointwise nested score intervals required by the normative README are moved out of the crowded
+head scatters into model-specific interval companions below `supplementary/intervals/`. Full
+machine-readable head intervals, causal estimates, conditional fingerprints, counterfactual
+contrasts, and carriage profiles are saved under `tables/`.
+
+Run locally (with the completed Drive tree mounted at the configured path):
+
+```bash
+python -m graph_specialisation_metrics.synthetic.nar_methodology_paper \
+  --phase figures \
+  --score-ns 4,8,16,32,64 \
+  --causal-ns 4,16,64 \
+  --counterfactual-ns 4,8,16 \
+  --performance-ns 4,8,16,32,64,80
+```
+
+`N=80` is intentionally performance-only: no score cache was computed for it. Missing or
+provenance-incompatible protected source artifacts fail closed.
+
 ## MarkedTreePath
 
 `training/marked_tree_path_graphgps.py` trains small GraphGPS-style baselines on

@@ -794,6 +794,32 @@ def prepare_results_namespace(args: argparse.Namespace) -> None:
     log(f"[recovery] Archived previous non-resumed results to: {archive}")
 
 
+def prepare_legacy_results_link(repo_dir: Path, drive_dir: Path) -> Path:
+    """Route the upstream trainer's hard-coded ./results write to Drive."""
+    target = drive_dir / "results"
+    target.mkdir(parents=True, exist_ok=True)
+    legacy = repo_dir / "results"
+    if legacy.is_symlink():
+        if legacy.resolve() == target.resolve():
+            log(f"[storage] Legacy results path already routes to Drive: {legacy}")
+            return legacy
+        legacy.unlink()
+    elif legacy.exists():
+        archive_root = drive_dir / "attempt_archives"
+        archive_root.mkdir(parents=True, exist_ok=True)
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        archive = archive_root / f"repo_relative_results_{timestamp}"
+        suffix = 1
+        while archive.exists():
+            archive = archive_root / f"repo_relative_results_{timestamp}_{suffix}"
+            suffix += 1
+        shutil.move(str(legacy), str(archive))
+        log(f"[storage] Archived pre-existing repository-relative results: {archive}")
+    os.symlink(target, legacy, target_is_directory=True)
+    log(f"[storage] Routed upstream hard-coded {legacy} -> {target}")
+    return legacy
+
+
 def parse_training_summary_from_logs(log_paths: Sequence[Path]) -> dict:
     by_epoch: dict[int, dict[str, dict]] = {}
     param_count = None
@@ -835,6 +861,7 @@ def parse_training_summary_from_logs(log_paths: Sequence[Path]) -> dict:
     best_splits = by_epoch.get(best_epoch, {}) if best_epoch is not None else {}
     return {
         "history_epochs": len(by_epoch),
+        "max_logged_epoch": max(by_epoch) if by_epoch else None,
         "best_epoch": best_epoch,
         "best_train": best_splits.get("train", {}),
         "best_val": best_splits.get("val", {}),
@@ -888,6 +915,121 @@ def write_run_manifest(args: argparse.Namespace, drive_dir: Path, repo_commit: s
     latest.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
     log(f"[manifest] wrote: {manifest_path}")
     return manifest_path
+
+
+def finalize_existing_completed_run(args: argparse.Namespace) -> Path:
+    """Recover bookkeeping after the upstream final relative-path write fails."""
+    wrapper_dir = args.drive_dir / "wrapper_logs"
+    logs = sorted(
+        (path for path in wrapper_dir.glob("ginplus_nope_zinc_seed*.log") if path.is_file()),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    if not logs:
+        raise RuntimeError(f"No no-PE wrapper logs found under {wrapper_dir}")
+
+    completed_log: Path | None = None
+    completed_summary: dict | None = None
+    for candidate in logs:
+        summary = parse_training_summary_from_logs([candidate])
+        if (
+            summary.get("max_logged_epoch") == args.max_epoch - 1
+            and summary.get("history_epochs") == args.max_epoch
+            and summary.get("param_count") == EXPECTED_NOPE_PARAMS
+        ):
+            completed_log = candidate
+            completed_summary = summary
+            break
+    if completed_log is None or completed_summary is None:
+        raise RuntimeError(
+            "Could not find a log proving completion of all configured epochs "
+            f"with {EXPECTED_NOPE_PARAMS:,} no-PE parameters."
+        )
+
+    checkpoints = checkpoint_candidates(args.drive_dir / "results")
+    if not checkpoints:
+        raise RuntimeError(
+            "The log reached the final epoch, but no retained checkpoint was found "
+            f"under {args.drive_dir / 'results'}."
+        )
+    best_epoch = completed_summary.get("best_epoch")
+    best_val = completed_summary.get("best_val", {})
+    best_test = completed_summary.get("best_test", {})
+    if best_epoch is None or "mae" not in best_val or "mae" not in best_test:
+        raise RuntimeError(
+            f"Could not recover best validation/test MAE from {completed_log}"
+        )
+
+    result_file = args.drive_dir / "results" / "subset_result.txt"
+    result_file.parent.mkdir(parents=True, exist_ok=True)
+    existing = result_file.read_text(encoding="utf-8") if result_file.exists() else ""
+    seed_marker = f"seed_{args.seed}:"
+    if seed_marker not in existing:
+        with result_file.open("a", encoding="utf-8") as handle:
+            handle.write(
+                "gine residual_True ffn_True 12 80 0.0 "
+                f"seed_{args.seed}: test_mae: {float(best_test['mae']):.4f}\n"
+            )
+        log(f"[finalize] Reconstructed upstream result line: {result_file}")
+    else:
+        log(f"[finalize] Result line for seed {args.seed} already exists: {result_file}")
+
+    manifest_path = write_run_manifest(
+        args,
+        args.drive_dir,
+        OFFICIAL_COMMIT,
+        completed_log,
+    )
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest.update({
+        "status": "training_complete_bookkeeping_recovered",
+        "recovered_from_log": str(completed_log),
+        "recovery_reason": (
+            "Upstream custom_train.py completed the final epoch, then failed while "
+            "writing hard-coded relative results/subset_result.txt."
+        ),
+        "max_logged_epoch": completed_summary.get("max_logged_epoch"),
+        "best_epoch_from_completed_log": best_epoch,
+        "best_val_from_completed_log": best_val,
+        "best_test_from_completed_log": best_test,
+        "verified_checkpoint_count": len(checkpoints),
+    })
+    manifest_path.write_text(
+        json.dumps(manifest, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    (args.drive_dir / "latest_ginplus_zinc_manifest.json").write_text(
+        json.dumps(manifest, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    recovery_path = args.drive_dir / f"ginplus_nope_finalize_seed{args.seed}.json"
+    recovery_path.write_text(
+        json.dumps(
+            {
+                "seed": args.seed,
+                "parameter_count": EXPECTED_NOPE_PARAMS,
+                "max_logged_epoch": completed_summary.get("max_logged_epoch"),
+                "best_epoch": best_epoch,
+                "best_val_mae": float(best_val["mae"]),
+                "best_test_mae": float(best_test["mae"]),
+                "completed_log": str(completed_log),
+                "checkpoints": [str(path) for path in checkpoints],
+                "result_file": str(result_file),
+                "manifest": str(manifest_path),
+                "finalized_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            },
+            indent=2,
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    log("[finalize] Verified completed no-PE training without rerunning any epoch.")
+    log(
+        f"[finalize] best@{best_epoch} val_mae={float(best_val['mae']):.5f} "
+        f"test_mae={float(best_test['mae']):.5f}"
+    )
+    log(f"[finalize] Recovery record: {recovery_path}")
+    return recovery_path
 
 
 def print_environment_summary(drive_dir: Path, repo_dir: Path, commit: str) -> None:
@@ -957,6 +1099,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--pyg-version", default="2.3.1")
     parser.add_argument("--skip-install", action="store_true")
     parser.add_argument("--force-fresh-repo", action="store_true")
+    parser.add_argument(
+        "--finalize-existing",
+        action="store_true",
+        help=(
+            "Do not train. Recover result/manifest bookkeeping when a complete "
+            "epoch-1999 run hit the upstream relative results-path error."
+        ),
+    )
     parser.add_argument("--wandb", action="store_true")
     parser.add_argument("--console-verbosity", choices=["compact", "standard", "full"], default="compact")
     parser.add_argument("--console-epoch-period", type=int, default=1)
@@ -990,6 +1140,9 @@ def main(argv: Sequence[str] | None = None) -> None:
             "/content/drive/MyDrive/ginplus_zinc_nope_official."
         )
     args.drive_dir.mkdir(parents=True, exist_ok=True)
+    if args.finalize_existing:
+        finalize_existing_completed_run(args)
+        return
 
     compat_shim_dir = None
     if sys.version_info >= (3, 12):
@@ -1008,6 +1161,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     print_environment_summary(args.drive_dir, args.repo_dir, commit)
     validate_resume_checkpoint_namespace(args)
     prepare_results_namespace(args)
+    prepare_legacy_results_link(args.repo_dir, args.drive_dir)
 
     cmd = build_training_command(args, args.drive_dir, nope_cfg_path)
     wrapper_log = args.drive_dir / "wrapper_logs" / f"ginplus_nope_zinc_seed{args.seed}_{time.strftime('%Y%m%d_%H%M%S')}.log"
@@ -1031,7 +1185,10 @@ def main(argv: Sequence[str] | None = None) -> None:
 
 if __name__ == "__main__":
     main([
-        # "--skip-install",  # Safe when rerunning in the same prepared Colab runtime.
+        # Recovery mode for the completed seed-41 run. Remove this option only
+        # when intentionally launching a new training run.
+        "--finalize-existing",
+        # "--skip-install",  # Safe when rerunning training in the same runtime.
         "--seed", "41",
         "--name-tag", "ColabDrive.GINPlus_NoPE.ZINC.s41",
         "--drive-dir", "/content/drive/MyDrive/ginplus_zinc_nope_official",
