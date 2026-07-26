@@ -63,7 +63,7 @@ def parser() -> argparse.ArgumentParser:
         default="bipartite_matching_hard,flow_hard",
         help="GraphBench task names (the graphbench_ canonical prefix is optional).",
     )
-    value.add_argument("--seeds", default="0,1,2")
+    value.add_argument("--seeds", default="0,1,2,3")
     value.add_argument(
         "--phases",
         default="scores,causal,carriage,figures",

@@ -25,7 +25,7 @@ TASK="${TASKS[${SLURM_ARRAY_TASK_ID}]}"
 
 python graphbench-algoreas-hpc/bin/grit_specialisation.py \
   --tasks "${TASK}" \
-  --seeds "${SEEDS:-0,1,2}" \
+  --seeds "${SEEDS:-0,1,2,3}" \
   --phases figures \
   --profile "${PROFILE:-production}" \
   --analysis-output-root "${GRAPHBENCH_ANALYSIS_OUTPUT_ROOT}" \

@@ -199,7 +199,7 @@ Run locally on an HPC node:
 ```bash
 python graphbench-algoreas-hpc/bin/grit_specialisation.py \
   --tasks bipartite_matching_hard,flow_hard \
-  --seeds 0,1,2 \
+  --seeds 0,1,2,3 \
   --profile production
 ```
 
@@ -224,7 +224,7 @@ dataset:
 ```bash
 python graphbench-algoreas-hpc/bin/grit_specialisation.py \
   --tasks bipartite_matching_hard,flow_hard \
-  --seeds 0,1,2 \
+  --seeds 0,1,2,3 \
   --phases figures \
   --accelerator cpu
 ```

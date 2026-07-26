@@ -4,7 +4,7 @@ tasks:
   - graphbench_bipartite_matching_hard
   - graphbench_flow_hard
 model: grit
-seeds: [0, 1, 2]
+seeds: [0, 1, 2, 3]
 split:
   primary_analysis: val
   donor: train

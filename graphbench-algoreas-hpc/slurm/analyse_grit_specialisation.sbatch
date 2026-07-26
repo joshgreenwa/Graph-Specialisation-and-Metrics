@@ -31,7 +31,7 @@ python graphbench-algoreas-hpc/bin/check_official_backends.py --models grit
 
 python graphbench-algoreas-hpc/bin/grit_specialisation.py \
   --tasks "${TASK}" \
-  --seeds "${SEEDS:-0,1,2}" \
+  --seeds "${SEEDS:-0,1,2,3}" \
   --phases "${PHASES:-scores,causal,carriage,figures}" \
   --profile "${PROFILE:-production}" \
   --training-output-root "${GRAPHBENCH_TRAINING_OUTPUT_ROOT}" \
