@@ -7,6 +7,7 @@ import numpy as np
 import pytest
 import torch
 
+from graph_specialisation_metrics.methodology import validation as validation_module
 from graph_specialisation_metrics.methodology.bootstrap import (
     Observation,
     paired_channel_percentile_interval,
@@ -186,6 +187,78 @@ def test_channel_independent_sources_are_paired_only_at_graph_level():
         "graph",
         "source(channel-independent)",
         "donor(channel-independent)",
+    )
+
+
+def test_causal_summary_uses_graph_paired_independent_channel_sources(monkeypatch):
+    endpoints = (
+        "G_c",
+        "P_gross_matched",
+        "P_gross_mismatch",
+        "R_gross",
+        "I_gross",
+        "R_align",
+        "I_align",
+        "necessity",
+        "gross_necessity",
+        "M_align",
+    )
+
+    def row(source):
+        return {
+            "graph": 4,
+            "source": source,
+            "donor": 2,
+            **{endpoint: 1.0 for endpoint in endpoints},
+        }
+
+    captured = {}
+
+    def fake_interval(left, right, policy, *, transform, resample_source):
+        captured["left_sources"] = [item.source for item in left]
+        captured["right_sources"] = [item.source for item in right]
+        captured["resample_source"] = resample_source
+        assert callable(transform)
+        return "independent-interval"
+
+    monkeypatch.setattr(
+        validation_module,
+        "paired_channel_percentile_interval",
+        fake_interval,
+    )
+    result = validation_module._summarize_causal(
+        {
+            "records": {
+                "head_L0_H0": {
+                    "semantic": [row(7)],
+                    "structural": [row(11)],
+                }
+            }
+        },
+        {"head_L0_H0": ((0, 0),)},
+        SimpleNamespace(
+            numerical=SimpleNamespace(effect_floor=1.0e-12),
+            bootstrap=BootstrapPolicy(),
+        ),
+        {
+            "coordinates": SimpleNamespace(
+                joint_sensitivity=np.ones((1, 1)),
+                selectivity=np.zeros((1, 1)),
+                active=np.ones((1, 1), dtype=bool),
+            )
+        },
+        paired_channel_sources=False,
+        source_resampling=(True, False),
+    )
+
+    assert captured == {
+        "left_sources": [7],
+        "right_sources": [11],
+        "resample_source": (True, False),
+    }
+    assert result["intervals"]["interval"] == "independent-interval"
+    assert result["intervals"]["pairing"] == (
+        "graph-paired/channel-source-independent"
     )
 
 

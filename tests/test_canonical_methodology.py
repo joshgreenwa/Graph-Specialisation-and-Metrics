@@ -1020,12 +1020,33 @@ def contract(**updates):
 
 def test_cache_rejects_any_contract_change(tmp_path):
     cache = CanonicalCache(tmp_path, contract())
-    cache.save("scores", "raw", {"ok": True})
+    path = cache.save("scores", "raw", {"ok": True})
+    original = path.read_bytes()
     assert cache.load("scores", "raw") == {"ok": True}
     stale = CanonicalCache(tmp_path, contract(event_manifest_hash="other"))
-    assert stale.load("scores", "raw") is None
     with pytest.raises(StaleCacheError):
-        stale.load("scores", "raw", strict=True)
+        stale.load("scores", "raw")
+    with pytest.raises(StaleCacheError, match="refusing to overwrite protected cache"):
+        stale.save("scores", "raw", {"replacement": True})
+    assert path.read_bytes() == original
+    assert cache.load("scores", "raw") == {"ok": True}
+
+
+def test_cache_protection_includes_unrelated_repository_commit_changes(tmp_path):
+    original = CanonicalCache(tmp_path, contract(repository_commit="commit-a"))
+    path = original.save("causal", "validation", {"complete": True})
+    original_bytes = path.read_bytes()
+
+    updated_checkout = CanonicalCache(
+        tmp_path, contract(repository_commit="commit-b")
+    )
+    with pytest.raises(StaleCacheError, match="different output_dir/analysis name"):
+        updated_checkout.load("causal", "validation")
+    with pytest.raises(StaleCacheError, match="left untouched"):
+        updated_checkout.save("causal", "validation", {"complete": False})
+
+    assert path.read_bytes() == original_bytes
+    assert original.load("causal", "validation") == {"complete": True}
 
 
 def test_figure_axis_strings_are_repository_fixed():

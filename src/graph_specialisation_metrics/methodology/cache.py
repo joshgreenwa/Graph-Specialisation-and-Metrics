@@ -21,6 +21,16 @@ class StaleCacheError(RuntimeError):
 
 
 @dataclass(frozen=True)
+class ReadOnlyCacheArtifact:
+    """A validated immutable cache payload with its original provenance."""
+
+    path: Path
+    file_sha256: str
+    metadata: Mapping[str, Any]
+    value: Any
+
+
+@dataclass(frozen=True)
 class CacheContract:
     protocol_fingerprint: str
     task: str
@@ -89,7 +99,12 @@ def atomic_json(path: Path, payload: Any) -> None:
 
 
 class CanonicalCache:
-    """Cache namespace keyed by the complete scientific contract."""
+    """Cache namespace keyed by the complete scientific contract.
+
+    Existing cache files are immutable across contracts. A stale file is a protected scientific
+    artifact, not a cache miss: callers must select a new output directory or analysis name rather
+    than replacing it in place.
+    """
 
     def __init__(self, root: str | Path, contract: CacheContract):
         self.root = Path(root)
@@ -110,6 +125,17 @@ class CanonicalCache:
 
         path = self.path(stage, name)
         path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists():
+            try:
+                # A forced recomputation may replace a cache only when its complete scientific
+                # contract is unchanged. Incompatible or unreadable files remain untouched.
+                self.load(stage, name, strict=True)
+            except StaleCacheError as error:
+                raise StaleCacheError(
+                    f"refusing to overwrite protected cache {path}; its stored contract does "
+                    "not match the current run (or the file is unreadable). Choose a different "
+                    "output_dir/analysis name. The existing file was left untouched."
+                ) from error
         payload = {
             "metadata": {
                 "protocol_version": PROTOCOL_VERSION,
@@ -126,25 +152,36 @@ class CanonicalCache:
     def load(self, stage: str, name: str, *, strict: bool = False) -> Any | None:
         import torch
 
+        del strict  # Existing incompatible files are always protected, independent of audit mode.
         path = self.path(stage, name)
         if not path.exists():
             return None
         try:
             payload = torch.load(path, map_location="cpu", weights_only=False)
         except (OSError, RuntimeError, EOFError) as error:
-            if strict:
-                raise StaleCacheError(f"unreadable cache {path}") from error
-            return None
+            raise StaleCacheError(
+                f"protected cache {path} is unreadable and will not be replaced"
+            ) from error
+        if not isinstance(payload, Mapping):
+            raise StaleCacheError(
+                f"protected cache {path} is malformed and will not be replaced"
+            )
         metadata = payload.get("metadata", {})
+        if not isinstance(metadata, Mapping):
+            raise StaleCacheError(
+                f"protected cache {path} has malformed metadata and will not be replaced"
+            )
         expected = self.contract.fingerprint
         if metadata.get("protocol_version") != PROTOCOL_VERSION:
-            if strict:
-                raise StaleCacheError(f"{path} uses another methodology version")
-            return None
+            raise StaleCacheError(
+                f"protected cache {path} uses another methodology version and will not "
+                "be replaced; choose a different output_dir/analysis name"
+            )
         if metadata.get("contract_fingerprint") != expected:
-            if strict:
-                raise StaleCacheError(f"{path} does not match this scientific contract")
-            return None
+            raise StaleCacheError(
+                f"protected cache {path} does not match this scientific contract and will not "
+                "be replaced; choose a different output_dir/analysis name"
+            )
         return payload.get("value")
 
     def save_audit(self, name: str, payload: Any) -> Path:
@@ -166,8 +203,13 @@ class CanonicalCache:
         return path
 
 
-def load_cache_value_file(path: str | Path) -> Any:
-    """Load a consolidated cache for a model-free figures-only pass."""
+def load_cache_artifact_file(path: str | Path) -> ReadOnlyCacheArtifact:
+    """Load and validate an existing cache without comparing it to the current checkout.
+
+    This is intentionally read-only. It verifies the cache's own protocol and stored contract
+    fingerprint, then exposes that original contract so an additive analysis can bind itself to
+    the exact artifact even when the repository has since advanced.
+    """
 
     import torch
 
@@ -188,4 +230,24 @@ def load_cache_value_file(path: str | Path) -> Any:
             f"{resolved} uses protocol {metadata.get('protocol_version')!r}; "
             f"expected {PROTOCOL_VERSION!r}"
         )
-    return payload["value"]
+    contract = metadata.get("contract")
+    if not isinstance(contract, Mapping):
+        raise StaleCacheError(f"cache contract is malformed: {resolved}")
+    claimed = metadata.get("contract_fingerprint")
+    actual = stable_hash(dict(contract))
+    if claimed != actual:
+        raise StaleCacheError(
+            f"cache contract fingerprint is internally inconsistent: {resolved}"
+        )
+    return ReadOnlyCacheArtifact(
+        path=resolved,
+        file_sha256=checkpoint_sha256(resolved),
+        metadata=metadata,
+        value=payload["value"],
+    )
+
+
+def load_cache_value_file(path: str | Path) -> Any:
+    """Load a consolidated cache for a model-free figures-only pass."""
+
+    return load_cache_artifact_file(path).value

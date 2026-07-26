@@ -171,6 +171,7 @@ python bin/check_official_backends.py --models graphgps,static_grit,grit,gatedgc
 
 All rows must pass. Environment notes and likely import failures are listed in
 `docs/hpc_environment.md`.
+
 # GRIT specialisation and carriage
 
 The trained GRIT checkpoints for `bipartite_matching_hard` and `flow_hard` are supported by the

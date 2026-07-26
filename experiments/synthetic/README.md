@@ -30,6 +30,51 @@ python -m graph_specialisation_metrics.synthetic.nar_canonical_analysis \
   --seeds 0,1,2
 ```
 
+## Fixed-N associative recall: methodology-paper extension
+
+`analysis/nar_methodology_extension_colab.py` is a separate, cache-safe frontend for three
+NAR-specific paper analyses:
+
+- query-address versus requested-value head specialisation;
+- exact in-distribution query/value counterfactual mediation by frozen head families; and
+- changes in role separation at retrieval-capacity transitions.
+
+The frontend never writes below the existing
+`canonical_nar_analysis_d128/canonical/` directory. It reads the completed N=4,16,64 score
+artifacts with an internally validated read-only loader, writes new score-only N=8,32 runs below
+`extensions/nar_role_counterfactual_v1/transition_scores/`, and places all derived caches,
+tables, and PNG/PDF figures below the same versioned extension directory. Existing extension
+caches are also immutable: a contract mismatch fails with instructions to choose a new
+`--extension-name`.
+
+The three registered headline figures are:
+
+- `06_head_role_specialisation_N16`: normalized content sensitivity versus normalized address
+  sensitivity for every head, layer, and seed (the other transition Ns are saved as `S01_*`
+  supplementary figures);
+- `07_counterfactual_head_role_validation`: symmetric injection/restoration mediation of exact
+  query and target-value counterfactual answers; and
+- `08_specialisation_performance_transition`: chance-adjusted accuracy, total-variation role
+  separation, and their adjacent-N changes.
+
+Figure regeneration is model-free:
+
+```bash
+python -m graph_specialisation_metrics.synthetic.nar_methodology_extension \
+  --phase figures
+```
+
+The full extension run is:
+
+```bash
+python -m graph_specialisation_metrics.synthetic.nar_methodology_extension \
+  --phase all \
+  --cached-ns 4,16,64 \
+  --additional-score-ns 8,32 \
+  --transition-ns 4,8,16,32,64 \
+  --counterfactual-ns 4,8,16
+```
+
 ## MarkedTreePath
 
 `training/marked_tree_path_graphgps.py` trains small GraphGPS-style baselines on

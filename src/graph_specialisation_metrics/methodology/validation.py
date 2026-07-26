@@ -8,7 +8,11 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 
 from .audit import audit_check, within_tolerance
-from .bootstrap import Observation, nested_percentile_interval
+from .bootstrap import (
+    Observation,
+    nested_percentile_interval,
+    paired_channel_percentile_interval,
+)
 from .causal import (
     calibrated_targets,
     clean_ablation,
@@ -615,6 +619,7 @@ def _summarize_causal(
     scores: Mapping[str, Any],
     *,
     paired_channel_sources: bool = True,
+    source_resampling: tuple[bool, bool] = (True, True),
 ) -> dict[str, Any]:
     records = event_output["records"]
     summary: dict[str, dict[str, Any]] = {}
@@ -741,6 +746,100 @@ def _summarize_causal(
         if paired_channel_sources
         else []
     )
+
+    def transform(value):
+        # Recompute positive unadjusted reference scales in every bootstrap draw.
+        G = value[:, :, endpoint_order.index("G_c")]
+        N = value[:, :, endpoint_order.index("necessity")]
+        calibrated_rows = []
+        for target_index, target in enumerate(target_order):
+            reference_names = _reference_target_names(target, target_order)
+            if _requires_matched_reference(target) and not reference_names:
+                audit_check(
+                    False,
+                    "causal.bootstrap_matched_reference",
+                    f"{target!r} has no matched reference in a causal bootstrap draw; "
+                    "the draw falls back to the all-head reference",
+                    context={"target": target},
+                )
+            reference_positions = [
+                target_order.index(name) for name in reference_names
+            ] or head_positions
+            a_g = np.asarray(
+                [
+                    np.mean(
+                        value[
+                            channel,
+                            reference_positions,
+                            endpoint_order.index("P_gross_matched"),
+                        ]
+                    )
+                    for channel in range(len(CHANNELS))
+                ]
+            )
+            a_n = np.asarray(
+                [
+                    np.mean(
+                        value[
+                            channel,
+                            reference_positions,
+                            endpoint_order.index("gross_necessity"),
+                        ]
+                    )
+                    for channel in range(len(CHANNELS))
+                ]
+            )
+            if np.any(a_g <= config.numerical.effect_floor) or np.any(
+                a_n <= config.numerical.effect_floor
+            ):
+                audit_check(
+                    False,
+                    "causal.bootstrap_reference_scale",
+                    "a causal bootstrap reference scale fell below the registered floor; "
+                    "the affected draw is reported as non-estimable",
+                    observed=float(min(np.min(a_g), np.min(a_n))),
+                    tolerance=float(config.numerical.effect_floor),
+                    context={"target": target},
+                )
+                # Non-estimable scales become nan rather than exploding the ratio.
+                a_g = np.where(a_g > config.numerical.effect_floor, a_g, np.nan)
+                a_n = np.where(a_n > config.numerical.effect_floor, a_n, np.nan)
+            calibrated_rows.append(
+                (
+                    0.5
+                    * (
+                        G[0, target_index] / a_g[0]
+                        + G[1, target_index] / a_g[1]
+                    ),
+                    G[0, target_index] / a_g[0]
+                    - G[1, target_index] / a_g[1],
+                    0.5
+                    * (
+                        N[0, target_index] / a_n[0]
+                        + N[1, target_index] / a_n[1]
+                    ),
+                    N[0, target_index] / a_n[0]
+                    - N[1, target_index] / a_n[1],
+                )
+            )
+        calibrated = np.asarray(calibrated_rows)
+        coordinates = scores["coordinates"]
+        J = coordinates.joint_sensitivity.reshape(-1)
+        D = coordinates.selectivity.reshape(-1)
+        active = coordinates.active.reshape(-1)
+        head_calibrated = calibrated[head_positions]
+        associations = np.asarray(
+            (
+                _spearman(J, head_calibrated[:, 0])["rho"],
+                _spearman(D[active], head_calibrated[active, 1])["rho"],
+                _spearman(J, head_calibrated[:, 2])["rho"],
+                _spearman(D[active], head_calibrated[active, 3])["rho"],
+            )
+        )
+        return np.concatenate(
+            (value.reshape(-1), calibrated.reshape(-1), associations)
+        )
+
     if complete:
         causal_observations = [
             Observation(
@@ -752,105 +851,47 @@ def _summarize_causal(
             )
             for key, value in complete
         ]
-
-        def transform(value):
-            # Recompute positive unadjusted reference scales in every bootstrap draw.
-            G = value[:, :, endpoint_order.index("G_c")]
-            N = value[:, :, endpoint_order.index("necessity")]
-            calibrated_rows = []
-            for target_index, target in enumerate(target_order):
-                reference_names = _reference_target_names(target, target_order)
-                if _requires_matched_reference(target) and not reference_names:
-                    audit_check(
-                        False,
-                        "causal.bootstrap_matched_reference",
-                        f"{target!r} has no matched reference in a causal bootstrap draw; "
-                        "the draw falls back to the all-head reference",
-                        context={"target": target},
-                    )
-                reference_positions = [
-                    target_order.index(name) for name in reference_names
-                ] or head_positions
-                a_g = np.asarray(
-                    [
-                        np.mean(
-                            value[
-                                channel,
-                                reference_positions,
-                                endpoint_order.index("P_gross_matched"),
-                            ]
-                        )
-                        for channel in range(len(CHANNELS))
-                    ]
-                )
-                a_n = np.asarray(
-                    [
-                        np.mean(
-                            value[
-                                channel,
-                                reference_positions,
-                                endpoint_order.index("gross_necessity"),
-                            ]
-                        )
-                        for channel in range(len(CHANNELS))
-                    ]
-                )
-                if np.any(a_g <= config.numerical.effect_floor) or np.any(
-                    a_n <= config.numerical.effect_floor
-                ):
-                    audit_check(
-                        False,
-                        "causal.bootstrap_reference_scale",
-                        "a causal bootstrap reference scale fell below the registered floor; "
-                        "the affected draw is reported as non-estimable",
-                        observed=float(min(np.min(a_g), np.min(a_n))),
-                        tolerance=float(config.numerical.effect_floor),
-                        context={"target": target},
-                    )
-                    # Non-estimable scales become nan rather than exploding the ratio.
-                    a_g = np.where(a_g > config.numerical.effect_floor, a_g, np.nan)
-                    a_n = np.where(a_n > config.numerical.effect_floor, a_n, np.nan)
-                calibrated_rows.append(
-                    (
-                        0.5
-                        * (
-                            G[0, target_index] / a_g[0]
-                            + G[1, target_index] / a_g[1]
-                        ),
-                        G[0, target_index] / a_g[0]
-                        - G[1, target_index] / a_g[1],
-                        0.5
-                        * (
-                            N[0, target_index] / a_n[0]
-                            + N[1, target_index] / a_n[1]
-                        ),
-                        N[0, target_index] / a_n[0]
-                        - N[1, target_index] / a_n[1],
-                    )
-                )
-            calibrated = np.asarray(calibrated_rows)
-            coordinates = scores["coordinates"]
-            J = coordinates.joint_sensitivity.reshape(-1)
-            D = coordinates.selectivity.reshape(-1)
-            active = coordinates.active.reshape(-1)
-            head_calibrated = calibrated[head_positions]
-            associations = np.asarray(
-                (
-                    _spearman(J, head_calibrated[:, 0])["rho"],
-                    _spearman(D[active], head_calibrated[active, 1])["rho"],
-                    _spearman(J, head_calibrated[:, 2])["rho"],
-                    _spearman(D[active], head_calibrated[active, 3])["rho"],
-                )
-            )
-            return np.concatenate(
-                (value.reshape(-1), calibrated.reshape(-1), associations)
-            )
-
         causal_interval = nested_percentile_interval(
             causal_observations, config.bootstrap, transform=transform
         )
+        interval_pairing = "source-and-graph-paired"
+    elif not paired_channel_sources:
+        channel_observations: dict[str, list[Observation]] = {}
+        for channel in CHANNELS:
+            by_key: dict[tuple[int, int, int], np.ndarray] = {}
+            for target_index, target in enumerate(target_order):
+                for row in records[target][channel]:
+                    key = (
+                        int(row["graph"]),
+                        int(row["source"]),
+                        int(row["donor"]),
+                    )
+                    by_key.setdefault(
+                        key,
+                        np.full(
+                            (len(target_order), len(endpoint_order)),
+                            np.nan,
+                        ),
+                    )
+                    by_key[key][target_index] = [
+                        float(row[name]) for name in endpoint_order
+                    ]
+            channel_observations[channel] = [
+                Observation(0, key[0], key[1], key[2], value)
+                for key, value in sorted(by_key.items())
+                if np.isfinite(value).all()
+            ]
+        causal_interval = paired_channel_percentile_interval(
+            channel_observations["semantic"],
+            channel_observations["structural"],
+            config.bootstrap,
+            transform=transform,
+            resample_source=source_resampling,
+        )
+        interval_pairing = "graph-paired/channel-source-independent"
     else:
         causal_interval = None
+        interval_pairing = None
     return {
         "targets": summary,
         "gross_reference_scales": gross_scales,
@@ -873,6 +914,7 @@ def _summarize_causal(
                 "D_rel_vs_necessity_contrast_active",
             ),
             "interval": causal_interval,
+            "pairing": interval_pairing,
         },
     }
 
@@ -1079,6 +1121,8 @@ def run_causal_validation(
 
     if scores is None:
         raise ValueError("causal validation requires discovery scores")
+    from .runner import _channel_bootstrap_policy
+
     plan, cache = _causal_cache(prepared, config, scores)
     if config.resume and not config.force:
         cached = cache.load("causal", "validation", strict=True)
@@ -1097,6 +1141,10 @@ def run_causal_validation(
         config,
         scores,
         paired_channel_sources=prepared.task.paired_channel_sources,
+        source_resampling=tuple(
+            _channel_bootstrap_policy(prepared, config, plan, channel).resample_source
+            for channel in CHANNELS
+        ),
     )
     associations = _association_report(prepared, scores, summary, clean, config)
     causal_interval = summary["intervals"]["interval"]

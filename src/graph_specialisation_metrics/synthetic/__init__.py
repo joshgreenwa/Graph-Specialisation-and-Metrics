@@ -13,4 +13,14 @@ def run_nar_canonical_analysis(*args, **kwargs):
     return main(*args, **kwargs)
 
 
-__all__ = ["run_nar_canonical_analysis", "run_nar_grit"]
+def run_nar_methodology_extension(*args, **kwargs):
+    from .nar_methodology_extension import main
+
+    return main(*args, **kwargs)
+
+
+__all__ = [
+    "run_nar_canonical_analysis",
+    "run_nar_grit",
+    "run_nar_methodology_extension",
+]

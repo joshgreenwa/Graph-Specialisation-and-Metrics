@@ -318,7 +318,6 @@ def _prepare_graphormer_task(
         "test_metric": runtime.test_metric,
         "validation_metric": runtime.val_metric,
         "parameter_count": runtime.checks.get("num_parameters"),
-        "fidelity": runtime.checks,
         "canonical_audits": audit_checks,
         "runtime": {
             "platform": platform.platform(),

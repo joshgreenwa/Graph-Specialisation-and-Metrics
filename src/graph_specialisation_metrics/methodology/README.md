@@ -216,7 +216,10 @@ the cached donor-event rows; raw carriage remains the primary scale-sensitive ou
 Training checkpoints and dataset caches are read-only. Analysis caches bind the protocol
 fingerprint, checkpoint SHA-256, task adapter, output representation and sigma, model geometry,
 split IDs, event manifest, donor/source dose, bootstrap seed, `F_sens`, and the positive-beneficial
-sign convention.
+sign convention. An existing analysis cache is immutable across contracts: a changed repository
+commit or any other contract mismatch raises before inference instead of being treated as a cache
+miss, and the save path independently refuses replacement. Use a new output directory or analysis
+name for the new contract; the original cache remains untouched.
 
 The score cache also retains clean attention distance mass and frozen-family exact/support-
 normalized score profiles as descriptive diagnostics. These never replace the transport score.
