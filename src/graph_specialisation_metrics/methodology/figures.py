@@ -496,6 +496,7 @@ def carriage_profiles(
     functional_interval: tuple[Any, Any] | None = None,
     beneficial_interval: tuple[Any, Any] | None = None,
     channel: str,
+    event_normalised: bool = False,
     theme: FigureTheme = FigureTheme(),
 ):
     import matplotlib.pyplot as plt
@@ -530,6 +531,7 @@ def carriage_profiles(
                 )
             )
         for ax, values, interval, name, color in panels:
+            title = f"{name} (event-normalised)" if event_normalised else name
             values = np.asarray(values)
             ax.plot(positions, values, marker="o", color=color, linewidth=theme.line_width)
             if interval is not None:
@@ -543,8 +545,14 @@ def carriage_profiles(
                 )
             if name == "Beneficial carriage":
                 ax.axhline(0, color="#777777", linewidth=0.8)
-            ax.set_title(name)
+            ax.set_title(title)
             ax.set_xlabel("Carrier distance from changed node")
+            if event_normalised:
+                ax.set_ylabel(
+                    "Signed fraction of event carriage magnitude"
+                    if name == "Beneficial carriage"
+                    else "Fraction of event carriage"
+                )
             ax.set_xticks(positions, [str(value) for value in x])
             ax.grid(alpha=theme.grid_alpha, linewidth=0.5)
         fig.suptitle(f"{channel.capitalize()} donor-swap")

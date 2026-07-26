@@ -76,6 +76,10 @@ from graph_specialisation_metrics.methodology.sampling import (
     SemanticDonorPool,
     draw_structural_donors,
 )
+from graph_specialisation_metrics.methodology.runner import (
+    _carriage_profile,
+    _event_normalised_carriage_rows,
+)
 from graph_specialisation_metrics.methodology.scores import (
     JOINT_AXIS_LABEL,
     SELECTIVITY_AXIS_LABEL,
@@ -395,6 +399,48 @@ def test_clean_ablation_reuses_clean_captures_and_batches_each_target(monkeypatc
     assert backend.ablation_batch_sizes == [2, 1, 2, 1]
     assert result["_execution"]["clean_reused_across_targets"] is True
     assert result["head_L0_H0"]["prediction_movement"] == pytest.approx(1.0)
+
+
+def test_event_normalised_carriage_is_donorwise_and_bin_additive():
+    rows = []
+    for graph_id in range(10):
+        for carrier, beneficial in enumerate((-1.0, 3.0, 0.0, 0.0, 0.0)):
+            rows.append(
+                {
+                    "seed": 0,
+                    "graph_id": graph_id,
+                    "source": 0,
+                    "donor": 0,
+                    "carrier": carrier,
+                    "distance": 0.0,
+                    "carrier_kind": "molecular_node",
+                    "F_sens": 1.0,
+                    "B": beneficial,
+                }
+            )
+    config = MethodologyConfig()
+    normalised, metadata = _event_normalised_carriage_rows(rows, config)
+
+    first_event = normalised[:5]
+    assert [row["F_sens_event_normalised"] for row in first_event] == pytest.approx(
+        [0.2] * 5
+    )
+    assert [row["B_event_normalised"] for row in first_event] == pytest.approx(
+        [-0.25, 0.75, 0.0, 0.0, 0.0]
+    )
+    assert metadata["functional"]["eligible_events"] == 10
+    assert metadata["beneficial"]["eligible_events"] == 10
+
+    labels, estimate, interval = _carriage_profile(
+        normalised,
+        "F_sens_event_normalised",
+        config,
+        sum_within_event=True,
+    )
+    assert labels[:4] == ["0", "1", "2", "3"]
+    assert estimate[0] == pytest.approx(1.0)
+    assert interval[0][0] == pytest.approx(1.0)
+    assert interval[1][0] == pytest.approx(1.0)
 
 
 def test_unsupported_distance_columns_never_warn_and_stay_non_estimable():

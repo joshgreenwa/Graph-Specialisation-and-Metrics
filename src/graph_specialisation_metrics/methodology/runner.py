@@ -1759,6 +1759,8 @@ def _carriage_profile(
     rows: Sequence[Mapping[str, Any]],
     field: str,
     config: MethodologyConfig,
+    *,
+    sum_within_event: bool = False,
 ) -> tuple[list[str], np.ndarray, tuple[np.ndarray, np.ndarray]]:
     finite_distances = [int(row["distance"]) for row in rows if np.isfinite(row["distance"])]
     maximum = max(finite_distances, default=0)
@@ -1785,7 +1787,11 @@ def _carriage_profile(
         for kind in special_kinds
     )
     for select in selectors:
-        selected = [row for row in rows if select(row)]
+        selected = [
+            row
+            for row in rows
+            if select(row) and np.isfinite(float(row[field]))
+        ]
         graph_ids = {int(row["graph_id"]) for row in selected}
         pairs = {
             (int(row["graph_id"]), int(row["carrier"]), int(row["source"]))
@@ -1808,32 +1814,131 @@ def _carriage_profile(
                 int(row["donor"]),
             )
             grouped.setdefault(key, []).append(float(row[field]))
-        observations = [
-            Observation(
-                seed,
-                graph,
-                source,
-                donor,
-                np.asarray([np.sum(values), len(values)], dtype=np.float64),
-            )
-            for (seed, graph, source, donor), values in grouped.items()
-        ]
+        if sum_within_event:
+            observations = [
+                Observation(
+                    seed,
+                    graph,
+                    source,
+                    donor,
+                    float(np.sum(values)),
+                )
+                for (seed, graph, source, donor), values in grouped.items()
+            ]
 
-        def pair_graph_reduce(values):
-            graph_pair_means = values[:, 0] / values[:, 1]
-            return trimmed_mean(
-                graph_pair_means, config.bootstrap.trim_fraction, axis=0
-            )
+            def graph_reduce(values):
+                return trimmed_mean(
+                    values, config.bootstrap.trim_fraction, axis=0
+                )
+
+        else:
+            observations = [
+                Observation(
+                    seed,
+                    graph,
+                    source,
+                    donor,
+                    np.asarray([np.sum(values), len(values)], dtype=np.float64),
+                )
+                for (seed, graph, source, donor), values in grouped.items()
+            ]
+
+            def graph_reduce(values):
+                graph_pair_means = values[:, 0] / values[:, 1]
+                return trimmed_mean(
+                    graph_pair_means, config.bootstrap.trim_fraction, axis=0
+                )
 
         interval = nested_percentile_interval(
             observations,
             config.bootstrap,
-            graph_reduce=pair_graph_reduce,
+            graph_reduce=graph_reduce,
         )
         estimates.append(float(interval.estimate))
         lows.append(float(interval.low))
         highs.append(float(interval.high))
     return labels, np.asarray(estimates), (np.asarray(lows), np.asarray(highs))
+
+
+def _event_normalised_carriage_rows(
+    rows: Sequence[Mapping[str, Any]],
+    config: MethodologyConfig,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Normalize each donor event across all registered carriers before binning."""
+
+    result = [dict(row) for row in rows]
+    grouped: dict[tuple[int, int, int, int], list[int]] = {}
+    for position, row in enumerate(result):
+        key = (
+            int(row["seed"]),
+            int(row["graph_id"]),
+            int(row["source"]),
+            int(row["donor"]),
+        )
+        grouped.setdefault(key, []).append(position)
+
+    functional_floor = float(config.numerical.effect_floor)
+    beneficial_floor = float(config.numerical.integrated_atol)
+    eligible_functional = 0
+    eligible_beneficial = 0
+    beneficial_present = bool(result and "B" in result[0])
+    for positions in grouped.values():
+        functional = np.asarray(
+            [float(result[position]["F_sens"]) for position in positions],
+            dtype=np.float64,
+        )
+        functional_denominator = float(np.sum(functional))
+        functional_ok = bool(
+            np.isfinite(functional).all()
+            and np.isfinite(functional_denominator)
+            and functional_denominator > functional_floor
+        )
+        eligible_functional += int(functional_ok)
+        for position, value in zip(positions, functional):
+            result[position]["F_sens_event_normalised"] = (
+                float(value / functional_denominator) if functional_ok else np.nan
+            )
+
+        if not beneficial_present:
+            continue
+        beneficial = np.asarray(
+            [float(result[position]["B"]) for position in positions],
+            dtype=np.float64,
+        )
+        beneficial_denominator = float(np.sum(np.abs(beneficial)))
+        beneficial_ok = bool(
+            np.isfinite(beneficial).all()
+            and np.isfinite(beneficial_denominator)
+            and beneficial_denominator > beneficial_floor
+        )
+        eligible_beneficial += int(beneficial_ok)
+        for position, value in zip(positions, beneficial):
+            result[position]["B_event_normalised"] = (
+                float(value / beneficial_denominator) if beneficial_ok else np.nan
+            )
+
+    total = len(grouped)
+    metadata = {
+        "level": "donor_event",
+        "functional": {
+            "formula": "F_sens[i] / sum_j F_sens[j]",
+            "denominator_floor": functional_floor,
+            "eligible_events": eligible_functional,
+            "excluded_events": total - eligible_functional,
+        },
+        "beneficial": (
+            {
+                "formula": "B[i] / sum_j abs(B[j])",
+                "denominator_floor": beneficial_floor,
+                "eligible_events": eligible_beneficial,
+                "excluded_events": total - eligible_beneficial,
+            }
+            if beneficial_present
+            else {"computed": False}
+        ),
+        "total_events": total,
+    }
+    return result, metadata
 
 
 def make_figures(
@@ -2051,6 +2156,63 @@ def make_figures(
                 },
             )
             saved[f"{channel}_carriage"] = [str(path) for path in paths]
+
+            normalised_rows, normalisation = _event_normalised_carriage_rows(
+                rows, config
+            )
+            (
+                normalised_labels,
+                normalised_functional,
+                normalised_functional_interval,
+            ) = _carriage_profile(
+                normalised_rows,
+                "F_sens_event_normalised",
+                config,
+                sum_within_event=True,
+            )
+            normalised_beneficial = None
+            normalised_beneficial_interval = None
+            if config.compute_beneficial_carriage:
+                (
+                    _,
+                    normalised_beneficial,
+                    normalised_beneficial_interval,
+                ) = _carriage_profile(
+                    normalised_rows,
+                    "B_event_normalised",
+                    config,
+                    sum_within_event=True,
+                )
+            fig, axes = carriage_profiles(
+                normalised_labels,
+                normalised_functional,
+                normalised_beneficial,
+                functional_interval=normalised_functional_interval,
+                beneficial_interval=normalised_beneficial_interval,
+                channel=channel,
+                event_normalised=True,
+                theme=theme,
+            )
+            paths = builder.save(
+                f"{channel}_carriage_profiles_event_normalised",
+                fig,
+                axes,
+                metadata={
+                    "task": prepared.task.name,
+                    "seed": int(prepared.grit.sc.seed),
+                    "channel": channel,
+                    "functional_estimand": "F_sens",
+                    "beneficial_sign": (
+                        "positive-is-beneficial"
+                        if config.compute_beneficial_carriage
+                        else "not_computed"
+                    ),
+                    "normalisation": normalisation,
+                },
+            )
+            saved[f"{channel}_carriage_event_normalised"] = [
+                str(path) for path in paths
+            ]
     if scores.get("family_attention_distance"):
         # Attention mass is a fraction of a fixed total, so grouping is an exact sum.
         fig, axes = attention_distance_profiles(

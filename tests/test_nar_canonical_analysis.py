@@ -133,6 +133,23 @@ def test_functional_only_carriage_figure_has_one_panel() -> None:
         plt.close(fig)
 
 
+def test_event_normalised_carriage_figure_titles_are_explicit() -> None:
+    fig, axes = carriage_profiles(
+        ("0", "1"),
+        (0.7, 0.3),
+        (0.2, -0.2),
+        channel="structural",
+        event_normalised=True,
+    )
+    try:
+        assert axes[0].get_title() == "Functional carriage (event-normalised)"
+        assert axes[1].get_title() == "Beneficial carriage (event-normalised)"
+        assert axes[0].get_ylabel() == "Fraction of event carriage"
+        assert axes[1].get_ylabel() == "Signed fraction of event carriage magnitude"
+    finally:
+        plt.close(fig)
+
+
 def test_beneficial_carriage_choice_is_cache_fingerprinted() -> None:
     included = MethodologyConfig(compute_beneficial_carriage=True)
     omitted = MethodologyConfig(compute_beneficial_carriage=False)

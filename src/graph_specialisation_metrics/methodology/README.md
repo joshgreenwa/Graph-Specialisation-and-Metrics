@@ -188,6 +188,11 @@ axis. Both come from one estimate; only the display differs, and each figure's m
 A score cache written before the head-resolved arrays existed still renders both — they are rebuilt
 exactly from the cached per-graph contribution and support, so only the figures phase needs rerunning.
 
+Each channel also emits `{channel}_carriage_profiles_event_normalised`. Its panels are titled
+`Functional carriage (event-normalised)` and, where registered,
+`Beneficial carriage (event-normalised)`. These are figure-only shape diagnostics derived from
+the cached donor-event rows; raw carriage remains the primary scale-sensitive output.
+
 Training checkpoints and dataset caches are read-only. Analysis caches bind the protocol
 fingerprint, checkpoint SHA-256, task adapter, output representation and sigma, model geometry,
 split IDs, event manifest, donor/source dose, bootstrap seed, `F_sens`, and the positive-beneficial

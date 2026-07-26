@@ -703,6 +703,30 @@ B_far(r)  = mean_g sum_{d_g(i,s) > r} B[g,i,s]
 Mean `B` answers the typical pair question; `S_B` and `B_far` answer how much signed task-loss mass
 is carried in a region. They must not be conflated.
 
+Each channel also has a secondary event-normalised distance figure. For donor event
+`e=(g,s,k)`, normalize across every registered carrier, including any explicit graph-token or
+virtual-node carrier:
+
+```text
+F_tilde[e,i] = F_event[e,i] / sum_j F_event[e,j]
+
+B_tilde[e,i] = B_event[e,i] / sum_j |B_event[e,j]|
+```
+
+`F_tilde` is a non-negative allocation whose carrier sum is one. `B_tilde` preserves the
+positive-beneficial sign while removing the event's overall Beneficial-carriage magnitude. Sum
+the normalized carrier values within each distance bin for each donor event, then apply the same
+donor -> source -> graph aggregation, 20% graph-trimmed estimator, 2,000-draw nested bootstrap,
+and reporting floors as the raw profiles. Exclude a Functional-carriage event when its denominator
+does not exceed the registered `effect_floor`; exclude a Beneficial-carriage event when its
+denominator does not exceed the task-loss-scale `integrated_atol`. Record eligible and excluded
+event counts.
+
+The panel titles are **Functional carriage (event-normalised)** and
+**Beneficial carriage (event-normalised)**. These are shape-only companion diagnostics. Raw
+Functional carriage and Beneficial carriage remain the primary measurements because
+event-normalisation deliberately removes architecture and intervention sensitivity scale.
+
 At minimum, saved artifacts must retain:
 
 ```text
