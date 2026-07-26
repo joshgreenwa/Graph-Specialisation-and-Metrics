@@ -169,6 +169,9 @@ class MethodologyConfig:
     force: bool = False
     # Numerical/estimability audits report and continue by default; True restores fail-closed runs.
     strict_audits: bool = False
+    # Functional carriage is always computed in the carriage phase. Some task-facing analyses
+    # deliberately omit Beneficial carriage when it is outside the requested scientific scope.
+    compute_beneficial_carriage: bool = True
 
     def validate(self) -> None:
         self.sizes.validate()
@@ -239,7 +242,12 @@ class MethodologyConfig:
             },
             "raw_score_aggregation": "event -> source -> graph",
             "functional_estimand": "F_sens",
-            "beneficial_sign": "positive-is-beneficial",
+            "beneficial_carriage": bool(self.compute_beneficial_carriage),
+            "beneficial_sign": (
+                "positive-is-beneficial"
+                if self.compute_beneficial_carriage
+                else "not_computed"
+            ),
             "causal_mismatch_control": (
                 "same graph/channel/degree tier; distinct donor; prefer same source; "
                 "minimum absolute intervention-dose gap"

@@ -3,6 +3,33 @@
 This folder contains controlled graph tasks for studying symbolic and structural
 attention behaviour outside ZINC.
 
+## Fixed-N associative recall: canonical analysis
+
+`training/nar_grit_colab.py` trains the three-seed 1-hop, 2-hop, and dense fixed-N GRIT
+checkpoints. `analysis/nar_canonical_methodology_colab.py` is the standalone Colab frontend for
+the repository's normative donor-swap specialisation, causal-validation, and Functional carriage
+methodology.
+
+The analysis frontend separates:
+
+- `--all-ns`, always used for the three-seed accuracy-versus-N figure; and
+- `--analysis-ns`, the subset receiving the expensive score, causal, and carriage analysis.
+
+It caches checkpoint-bound raw results under the training run on Drive, regenerates PNG/PDF
+figures from those caches, uses at most 14 grouped shortest-path columns, and computes carriage
+only for the lowest-validation-loss seed in each support-by-N cell. Beneficial carriage is
+intentionally disabled for this experiment.
+
+Local CLI form, after the NAR checkpoints and official GRIT environment are available:
+
+```bash
+python -m graph_specialisation_metrics.synthetic.nar_canonical_analysis \
+  --phase all \
+  --all-ns 4,8,16,32,64,80 \
+  --analysis-ns 4,16,64 \
+  --seeds 0,1,2
+```
+
 ## MarkedTreePath
 
 `training/marked_tree_path_graphgps.py` trains small GraphGPS-style baselines on

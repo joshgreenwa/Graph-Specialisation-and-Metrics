@@ -491,7 +491,7 @@ def attention_distance_profiles(
 def carriage_profiles(
     x: Sequence[Any],
     functional: Sequence[float],
-    beneficial: Sequence[float],
+    beneficial: Sequence[float] | None,
     *,
     functional_interval: tuple[Any, Any] | None = None,
     beneficial_interval: tuple[Any, Any] | None = None,
@@ -502,25 +502,34 @@ def carriage_profiles(
 
     positions = np.arange(len(x))
     with publication_style(theme):
+        columns = 1 if beneficial is None else 2
         fig, axes = plt.subplots(
-            1, 2, figsize=(theme.width * 1.75, theme.height), constrained_layout=True
+            1,
+            columns,
+            figsize=(theme.width * (1.0 if columns == 1 else 1.75), theme.height),
+            constrained_layout=True,
+            squeeze=False,
         )
-        for ax, values, interval, name, color in (
+        panels = [
             (
-                axes[0],
+                axes[0, 0],
                 functional,
                 functional_interval,
                 "Functional carriage",
                 theme.functional_color,
             ),
-            (
-                axes[1],
-                beneficial,
-                beneficial_interval,
-                "Beneficial carriage",
-                theme.beneficial_color,
-            ),
-        ):
+        ]
+        if beneficial is not None:
+            panels.append(
+                (
+                    axes[0, 1],
+                    beneficial,
+                    beneficial_interval,
+                    "Beneficial carriage",
+                    theme.beneficial_color,
+                )
+            )
+        for ax, values, interval, name, color in panels:
             values = np.asarray(values)
             ax.plot(positions, values, marker="o", color=color, linewidth=theme.line_width)
             if interval is not None:
@@ -539,7 +548,7 @@ def carriage_profiles(
             ax.set_xticks(positions, [str(value) for value in x])
             ax.grid(alpha=theme.grid_alpha, linewidth=0.5)
         fig.suptitle(f"{channel.capitalize()} donor-swap")
-    return fig, axes
+    return fig, axes[0]
 
 
 def statistic_caption(statistic: Mapping[str, Any] | None) -> str:

@@ -379,6 +379,17 @@ def prepare_task(
             int(train_seed),
             task_overrides,
         )
+    if task.backend_kind == "nar_grit":
+        from ..synthetic.nar_canonical_analysis import prepare_nar_task
+
+        return prepare_nar_task(
+            config,
+            task,
+            int(train_seed),
+            task_overrides,
+            prepared_task_class=PreparedTask,
+            repository_commit=_repository_commit(),
+        )
     if task.backend_kind != "grit":
         raise ValueError(f"unsupported canonical backend {task.backend_kind!r}")
 
@@ -524,11 +535,31 @@ def _stage_plan(
     plan: dict[int, dict[str, Any]] = {}
     for graph_id in _stage_ids(prepared, stage):
         base = prepared.grit.eval_ds[int(graph_id)]
-        sources = sample_sources(
-            int(base.num_nodes),
-            int(config.sizes.sources_per_graph),
-            _rng(config, prepared.task.name, prepared.grit.sc.seed, stage, graph_id, "sources"),
+        source_rng = _rng(
+            config,
+            prepared.task.name,
+            prepared.grit.sc.seed,
+            stage,
+            graph_id,
+            "sources",
         )
+        eligible_source_fn = getattr(prepared.backend, "eligible_sources", None)
+        if callable(eligible_source_fn):
+            eligible = np.asarray(eligible_source_fn(base), dtype=np.int64)
+            if eligible.ndim != 1 or not eligible.size:
+                raise RuntimeError(
+                    f"{prepared.task.name} supplied no eligible analysis sources"
+                )
+            count = min(int(config.sizes.sources_per_graph), int(eligible.size))
+            sources = np.sort(
+                source_rng.choice(eligible, size=count, replace=False)
+            ).astype(np.int64)
+        else:
+            sources = sample_sources(
+                int(base.num_nodes),
+                int(config.sizes.sources_per_graph),
+                source_rng,
+            )
         entry: dict[str, Any] = {"sources": tuple(int(v) for v in sources)}
         for channel in CHANNELS:
             records = []
@@ -1242,74 +1273,87 @@ def _carriage_graph_batch(
         h_event = captured.final_state[1:].reshape(S, K, carriers, width)
         delta = h_clean[None, None, :, :] - h_event
         event_f = functional_carriage_events(delta, clean.final_state)
-        carrier_weights = prepared.backend.carriage_weights(base, h_clean)
-        integrated = beneficial_carriage(
-            h_clean,
-            h_event,
-            prepared.backend.loss_from_pooled(clean.capture.target.reshape(1, -1)),
-            carrier_weights=carrier_weights,
-            atol=config.numerical.integrated_atol,
-            rtol=config.numerical.integrated_rtol,
-            max_intervals=config.numerical.integrated_max_intervals,
-            tolerance=max(
-                config.numerical.integrated_atol * 5,
-                config.numerical.reconstruction_tolerance,
-            ),
-        )
-        target = clean.capture.target.reshape(1, -1)
-        replay_loss = prepared.backend.loss_from_pooled(target)
-        pooled_clean = project_final_states(h_clean.unsqueeze(0), carrier_weights)
-        pooled_event = project_final_states(
-            h_event.reshape(S * K, carriers, width), carrier_weights
-        )
-        with torch.no_grad():
-            replay_clean_loss = replay_loss(pooled_clean)
-            replay_event_loss = replay_loss(pooled_event)
-            actual_clean_loss = prepared.backend.loss_per_graph(
-                captured.prediction[0:1], captured.target[0:1]
-            )
-            actual_event_loss = prepared.backend.loss_per_graph(
-                captured.prediction[1:], captured.target[1:]
-            )
-        endpoint_replay_error = float(
-            torch.max(
-                torch.abs(
-                    torch.cat((replay_clean_loss, replay_event_loss))
-                    - torch.cat((actual_clean_loss, actual_event_loss))
-                )
-            ).item()
-        )
-        within_tolerance(
-            endpoint_replay_error,
-            config.numerical.reconstruction_tolerance,
-            "carriage.endpoint_replay",
-            "pooling-to-readout replay error",
-            context={"graph": graph_id, "channel": channel},
-        )
         F = event_f.mean(dim=1).t().detach().cpu().numpy()
-        B = integrated.field.detach().cpu().numpy()
+        integrated = None
+        endpoint_replay_error = 0.0
+        B = None
+        if config.compute_beneficial_carriage:
+            carrier_weights = prepared.backend.carriage_weights(base, h_clean)
+            integrated = beneficial_carriage(
+                h_clean,
+                h_event,
+                prepared.backend.loss_from_pooled(clean.capture.target.reshape(1, -1)),
+                carrier_weights=carrier_weights,
+                atol=config.numerical.integrated_atol,
+                rtol=config.numerical.integrated_rtol,
+                max_intervals=config.numerical.integrated_max_intervals,
+                tolerance=max(
+                    config.numerical.integrated_atol * 5,
+                    config.numerical.reconstruction_tolerance,
+                ),
+            )
+            target = clean.capture.target.reshape(1, -1)
+            replay_loss = prepared.backend.loss_from_pooled(target)
+            pooled_clean = project_final_states(h_clean.unsqueeze(0), carrier_weights)
+            pooled_event = project_final_states(
+                h_event.reshape(S * K, carriers, width), carrier_weights
+            )
+            with torch.no_grad():
+                replay_clean_loss = replay_loss(pooled_clean)
+                replay_event_loss = replay_loss(pooled_event)
+                actual_clean_loss = prepared.backend.loss_per_graph(
+                    captured.prediction[0:1], captured.target[0:1]
+                )
+                actual_event_loss = prepared.backend.loss_per_graph(
+                    captured.prediction[1:], captured.target[1:]
+                )
+            endpoint_replay_error = float(
+                torch.max(
+                    torch.abs(
+                        torch.cat((replay_clean_loss, replay_event_loss))
+                        - torch.cat((actual_clean_loss, actual_event_loss))
+                    )
+                ).item()
+            )
+            within_tolerance(
+                endpoint_replay_error,
+                config.numerical.reconstruction_tolerance,
+                "carriage.endpoint_replay",
+                "pooling-to-readout replay error",
+                context={"graph": graph_id, "channel": channel},
+            )
+            B = integrated.field.detach().cpu().numpy()
         pristine = shortest_path_distances(base.edge_index, int(base.num_nodes))
         distance = prepared.backend.carriage_distance_matrix(base, sources, pristine)
         graph_field = {
             "sources": tuple(sources),
             "F_sens": F,
-            "B": B,
             "distance": distance,
             "carrier_kinds": tuple(
                 prepared.backend.carriage_carrier_kind(base, carrier)
                 for carrier in range(carriers)
             ),
             "event_F_sens": event_f.detach().cpu().numpy(),
-            "event_B": integrated.event_field.detach().cpu().numpy(),
-            "event_loss_increase": integrated.event_loss_increase.detach().cpu().numpy(),
-            "quadrature_error": integrated.quadrature_error.detach().cpu().numpy(),
-            "completeness_residual": (
-                integrated.completeness_residual.detach().cpu().numpy()
-            ),
             "endpoint_replay_error": endpoint_replay_error,
-            "converged": integrated.converged.detach().cpu().numpy(),
         }
-        event_b = integrated.event_field.detach().cpu().numpy()
+        if integrated is not None:
+            graph_field.update(
+                {
+                    "B": B,
+                    "event_B": integrated.event_field.detach().cpu().numpy(),
+                    "event_loss_increase": (
+                        integrated.event_loss_increase.detach().cpu().numpy()
+                    ),
+                    "quadrature_error": integrated.quadrature_error.detach().cpu().numpy(),
+                    "completeness_residual": (
+                        integrated.completeness_residual.detach().cpu().numpy()
+                    ),
+                    "converged": integrated.converged.detach().cpu().numpy(),
+                }
+            )
+            event_b = integrated.event_field.detach().cpu().numpy()
+        else:
+            event_b = None
         event_f_np = event_f.detach().cpu().numpy()
         pair_rows: list[dict[str, Any]] = []
         for source_position, source in enumerate(sources):
@@ -1329,17 +1373,26 @@ def _carriage_graph_batch(
                             "F_sens": float(
                                 event_f_np[source_position, donor, carrier]
                             ),
-                            "B": float(event_b[source_position, donor, carrier]),
                             "channel": channel,
                         }
                     )
+                    if event_b is not None:
+                        pair_rows[-1]["B"] = float(
+                            event_b[source_position, donor, carrier]
+                        )
         results.append(
             {
                 "graph_id": graph_id,
                 "graph_field": graph_field,
                 "pair_rows": pair_rows,
-                "paths": int(integrated.converged.numel()),
-                "capped": int((~integrated.converged).sum().item()),
+                "paths": (
+                    int(integrated.converged.numel()) if integrated is not None else 0
+                ),
+                "capped": (
+                    int((~integrated.converged).sum().item())
+                    if integrated is not None
+                    else 0
+                ),
             }
         )
     return results
@@ -1404,13 +1457,14 @@ def run_carriage(
         )
         execution_reports[channel] = dataclasses.asdict(report)
         capped_fraction = float(capped / paths) if paths else 0.0
-        within_tolerance(
-            capped_fraction,
-            config.numerical.integrated_unconverged_fraction,
-            "carriage.capped_paths",
-            f"{channel} Beneficial carriage capped-path fraction",
-            context={"channel": channel, "paths": int(paths), "capped": int(capped)},
-        )
+        if config.compute_beneficial_carriage:
+            within_tolerance(
+                capped_fraction,
+                config.numerical.integrated_unconverged_fraction,
+                "carriage.capped_paths",
+                f"{channel} Beneficial carriage capped-path fraction",
+                context={"channel": channel, "paths": int(paths), "capped": int(capped)},
+            )
         maximum_distance = max(
             (
                 int(np.max(field["distance"][np.isfinite(field["distance"])]))
@@ -1436,9 +1490,12 @@ def run_carriage(
                 ).items()
             }
             for graph_id, field in graph_fields.items()
+            if config.compute_beneficial_carriage
         }
         additive_observations = []
         for graph_id, field in graph_fields.items():
+            if not config.compute_beneficial_carriage:
+                continue
             n = int(prepared.grit.eval_ds[int(graph_id)].num_nodes)
             event_b = np.asarray(field["event_B"])
             distance = np.asarray(field["distance"])
@@ -1479,11 +1536,13 @@ def run_carriage(
                             ),
                         )
                     )
-        additive_interval = nested_percentile_interval(
-            additive_observations, config.bootstrap
+        additive_interval = (
+            nested_percentile_interval(additive_observations, config.bootstrap)
+            if additive_observations
+            else None
         )
         bin_count = len(bins)
-        output["channels"][channel] = {
+        channel_output = {
             "graph_fields": graph_fields,
             "pairs": pair_rows,
             "capped_paths": capped,
@@ -1491,17 +1550,23 @@ def run_carriage(
             "capped_fraction": capped_fraction,
             "distance_bins": bins,
             "far_thresholds": far_thresholds,
-            "S_B": additive_interval.estimate[:bin_count],
-            "B_far": additive_interval.estimate[bin_count:],
-            "additive_intervals": {
-                "order": (
-                    tuple(f"{lower}-{upper}" for lower, upper in bins)
-                    + tuple(f"far>{value}" for value in far_thresholds)
-                ),
-                "interval": additive_interval,
-            },
-            "additive_graph": additive,
         }
+        if additive_interval is not None:
+            channel_output.update(
+                {
+                    "S_B": additive_interval.estimate[:bin_count],
+                    "B_far": additive_interval.estimate[bin_count:],
+                    "additive_intervals": {
+                        "order": (
+                            tuple(f"{lower}-{upper}" for lower, upper in bins)
+                            + tuple(f"far>{value}" for value in far_thresholds)
+                        ),
+                        "interval": additive_interval,
+                    },
+                    "additive_graph": additive,
+                }
+            )
+        output["channels"][channel] = channel_output
     output["execution"] = {
         "clean_jacobian_graphs": len(clean_by_graph),
         "clean_graph_batches": clean_execution,
@@ -1954,7 +2019,12 @@ def make_figures(
             labels, functional, functional_interval = _carriage_profile(
                 rows, "F_sens", config
             )
-            _, beneficial, beneficial_interval = _carriage_profile(rows, "B", config)
+            beneficial = None
+            beneficial_interval = None
+            if config.compute_beneficial_carriage:
+                _, beneficial, beneficial_interval = _carriage_profile(
+                    rows, "B", config
+                )
             fig, axes = carriage_profiles(
                 labels,
                 functional,
@@ -1973,7 +2043,11 @@ def make_figures(
                     "seed": int(prepared.grit.sc.seed),
                     "channel": channel,
                     "functional_estimand": "F_sens",
-                    "beneficial_sign": "positive-is-beneficial",
+                    "beneficial_sign": (
+                        "positive-is-beneficial"
+                        if config.compute_beneficial_carriage
+                        else "not_computed"
+                    ),
                 },
             )
             saved[f"{channel}_carriage"] = [str(path) for path in paths]
@@ -2411,11 +2485,15 @@ def run_prepared(prepared: PreparedTask, config: MethodologyConfig) -> dict[str,
         scores = run_scores(prepared, config, plan=score_plan) if (
             {"scores", "causal", "figures"} & set(config.phases)
         ) else None
-        carriage = (
-            run_carriage(prepared, config)
-            if "carriage" in config.phases or "figures" in config.phases
-            else None
-        )
+        carriage = run_carriage(prepared, config) if "carriage" in config.phases else None
+        if carriage is None and "figures" in config.phases:
+            # Figure regeneration is cache-only for carriage. This keeps a causal/score figure
+            # pass from silently launching an expensive carriage analysis, and lets task
+            # frontends compute carriage only for preregistered seeds.
+            carriage_plan = _stage_plan(prepared, config, "carriage")
+            carriage = _cache(prepared, config, carriage_plan).load(
+                "carriage", "fields"
+            )
         causal = None
         if "causal" in config.phases:
             from .validation import run_causal_validation
