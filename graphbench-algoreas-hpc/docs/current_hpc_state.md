@@ -308,7 +308,9 @@ bash graphbench-algoreas-hpc/bin/submit_grit_specialisation.sh
 The launcher submits separate `0-3` arrays for matching and flow, then one CPU finalizer with an
 `afterok` dependency on both complete arrays. `MAX_PARALLEL=1` follows the confirmed `gpu1`
 workflow. If the allocation permits concurrent jobs, set `MAX_PARALLEL=2` or `4`; this cap applies
-to each task array, and the scheduler still enforces account-wide limits.
+to each task array, and the scheduler still enforces account-wide limits. Every submission
+explicitly requests `--nodes=1 --ntasks=1 --gres=gpu:1`, as required by the Cambridge site
+wrapper; the `ampere` partition selects the GPU class.
 
 Monitor the three job IDs printed by the launcher:
 

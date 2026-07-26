@@ -38,6 +38,7 @@ ARRAY_SPEC="0-3%${MAX_PARALLEL}"
 MATCH_JOB="$(
   sbatch --parsable \
     -A mlmi-jgg45-sl2-gpu -p ampere --qos=gpu1 \
+    --nodes=1 --ntasks=1 --gres=gpu:1 \
     --array="${ARRAY_SPEC}" \
     --job-name=gb-grit-match \
     --export="${COMMON_EXPORT},ANALYSIS_TASK=bipartite_matching_hard" \
@@ -48,6 +49,7 @@ MATCH_JOB="${MATCH_JOB%%;*}"
 FLOW_JOB="$(
   sbatch --parsable \
     -A mlmi-jgg45-sl2-gpu -p ampere --qos=gpu1 \
+    --nodes=1 --ntasks=1 --gres=gpu:1 \
     --array="${ARRAY_SPEC}" \
     --job-name=gb-grit-flow \
     --export="${COMMON_EXPORT},ANALYSIS_TASK=flow_hard" \
@@ -58,6 +60,7 @@ FLOW_JOB="${FLOW_JOB%%;*}"
 FINAL_JOB="$(
   sbatch --parsable \
     -A mlmi-jgg45-sl2-cpu -p sapphire --qos=cpu1 \
+    --nodes=1 --ntasks=1 \
     --dependency="afterok:${MATCH_JOB}:${FLOW_JOB}" \
     --job-name=gb-grit-finalize \
     --export="${COMMON_EXPORT}" \

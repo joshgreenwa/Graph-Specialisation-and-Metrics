@@ -99,6 +99,34 @@ def test_role_families_are_frozen_from_selectivity_with_matched_controls():
     assert all(role.selectivity[head] < 0 for head in families["content"])
 
 
+def test_role_family_matching_trims_weakest_tail_when_layer_is_infeasible():
+    query = np.asarray([[5.0, 4.0, 2.0, 1.0, 0.5]])
+    value = np.asarray([[0.5, 1.0, 2.0, 4.0, 5.0]])
+    role = role_coordinates(
+        query,
+        value,
+        score_floor=1e-12,
+        epsilon=1e-12,
+        activity_floor=0.2,
+    )
+
+    families = freeze_role_families(
+        role,
+        np.ones_like(query),
+        policy=FamilyPolicy(
+            activity_floor=0.2,
+            tail_fraction=0.4,
+            central_fraction=0.2,
+        ),
+        rng_seed=7,
+    )
+
+    assert families["address"] == ((0, 0),)
+    assert families["content"] == ((0, 4),)
+    assert families["address_control"] == ((0, 2),)
+    assert families["content_control"] == ((0, 2),)
+
+
 def test_extension_store_refuses_an_existing_different_contract(tmp_path):
     store = ExtensionStore(tmp_path / "extension")
     base = ExtensionContract(

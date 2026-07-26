@@ -1,6 +1,8 @@
 #!/bin/bash
 #SBATCH --job-name=gb-grit-worker
-#SBATCH --gres=gpu:a100:1
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=128G
 #SBATCH --time=36:00:00

@@ -402,10 +402,92 @@ def freeze_role_families(
     content_control = tuple(
         controls.get("structural_leaning_central_control", ())
     )
-    if address and len(address_control) != len(address):
-        raise RuntimeError("could not freeze a complete address-family matched control")
-    if content and len(content_control) != len(content):
-        raise RuntimeError("could not freeze a complete content-family matched control")
+    if (
+        (address and len(address_control) != len(address))
+        or (content and len(content_control) != len(content))
+    ):
+        # A small-head model can put several tail heads in a layer containing too few *active*
+        # neutral heads for a one-for-one control.  This is a property of the discovery result,
+        # not a reason to discard the cell.  Preserve same-layer/activity matching by removing
+        # only the weakest tail members in the infeasible layer, then match the retained targets
+        # deterministically on J and clean throughput.  No causal outcome is inspected.
+        original_leaning = set(address) | set(content)
+        J = role.joint_sensitivity
+        D = role.selectivity
+        throughput_array = np.asarray(throughput, dtype=np.float64)
+        active = role.active
+        median_d = float(np.nanmedian(D[active]))
+
+        def neutral_pool(layer: int) -> list[tuple[int, int]]:
+            return [
+                (int(layer), int(head))
+                for head in range(J.shape[1])
+                if bool(active[layer, head])
+                and (int(layer), int(head)) not in original_leaning
+            ]
+
+        def feasible_tail(
+            target: Sequence[tuple[int, int]],
+            *,
+            address_role: bool,
+        ) -> tuple[tuple[int, int], ...]:
+            retained: list[tuple[int, int]] = []
+            for layer in sorted({int(item[0]) for item in target}):
+                layer_targets = [item for item in target if int(item[0]) == layer]
+                capacity = len(neutral_pool(layer))
+                ordered = sorted(
+                    layer_targets,
+                    key=lambda item: (
+                        -float(D[item]) if address_role else float(D[item]),
+                        item,
+                    ),
+                )
+                retained.extend(ordered[:capacity])
+            return tuple(retained)
+
+        def matched_control(
+            target: Sequence[tuple[int, int]],
+        ) -> tuple[tuple[int, int], ...]:
+            selected: list[tuple[int, int]] = []
+            used: set[tuple[int, int]] = set()
+            for layer, head in target:
+                candidates = [
+                    item for item in neutral_pool(int(layer)) if item not in used
+                ]
+                if not candidates:
+                    raise RuntimeError(
+                        "discovery family remains infeasible after same-layer trimming"
+                    )
+                scale_j = max(float(np.nanstd(J[int(layer)])), 1e-12)
+                scale_t = max(
+                    float(np.nanstd(throughput_array[int(layer)])), 1e-12
+                )
+                choice = min(
+                    candidates,
+                    key=lambda item: (
+                        abs(float(D[item]) - median_d)
+                        + abs(float(J[item]) - float(J[layer, head])) / scale_j
+                        + abs(
+                            float(throughput_array[item])
+                            - float(throughput_array[layer, head])
+                        )
+                        / scale_t,
+                        item,
+                    ),
+                )
+                selected.append(choice)
+                used.add(choice)
+            return tuple(selected)
+
+        address = feasible_tail(address, address_role=True)
+        content = feasible_tail(content, address_role=False)
+        if not address or not content:
+            raise RuntimeError(
+                "no non-empty address/content tail can be paired with an active "
+                "same-layer neutral control"
+            )
+        address_control = matched_control(address)
+        content_control = matched_control(content)
     return {
         "address": address,
         "content": content,
@@ -472,6 +554,12 @@ def derive_role_result(
         policy=families,
         rng_seed=int(analysis_seed) + int(binding.seed),
     )
+    active_heads = int(np.sum(coordinates.active))
+    requested_tail = (
+        max(1, int(np.floor(float(families.tail_fraction) * active_heads)))
+        if active_heads
+        else 0
+    )
     return {
         "extension_version": EXTENSION_VERSION,
         "task": binding.task,
@@ -492,6 +580,20 @@ def derive_role_result(
             "role_separation_broadcast",
         ),
         "families": frozen,
+        "family_matching": {
+            "requested_tail_heads_per_role": requested_tail,
+            "retained_address_heads": len(frozen["address"]),
+            "retained_content_heads": len(frozen["content"]),
+            "feasibility_trimmed": bool(
+                len(frozen["address"]) < requested_tail
+                or len(frozen["content"]) < requested_tail
+            ),
+            "fallback": (
+                "if a layer has too few active neutral controls, retain its strongest "
+                "tail members up to same-layer neutral capacity; match controls on "
+                "role-neutrality, J, and clean throughput"
+            ),
+        },
         "clean_throughput": np.asarray(value["clean_throughput"]),
         "canonical_semantic_reconstruction_error": reconstruction_error,
         "graphs": len(query_graphs),
@@ -679,6 +781,29 @@ def run_role_derivation(
                     store.save(contract, "role_scores", result)
                 results[(str(model_name), int(records), int(seed))] = result
                 role: RoleCoordinates = result["role_coordinates"]
+                requested_tail = (
+                    max(
+                        1,
+                        int(
+                            np.floor(
+                                float(families.tail_fraction)
+                                * int(np.sum(role.active))
+                            )
+                        ),
+                    )
+                    if np.any(role.active)
+                    else 0
+                )
+                matching = result.get(
+                    "family_matching",
+                    {
+                        "requested_tail_heads_per_role": requested_tail,
+                        "feasibility_trimmed": bool(
+                            len(result["families"]["address"]) < requested_tail
+                            or len(result["families"]["content"]) < requested_tail
+                        ),
+                    },
+                )
                 table.append(
                     {
                         "model": model_name,
@@ -688,6 +813,12 @@ def run_role_derivation(
                         "active_heads": int(np.sum(role.active)),
                         "address_heads": len(result["families"]["address"]),
                         "content_heads": len(result["families"]["content"]),
+                        "requested_tail_heads_per_role": int(
+                            matching["requested_tail_heads_per_role"]
+                        ),
+                        "family_feasibility_trimmed": bool(
+                            matching["feasibility_trimmed"]
+                        ),
                         "reconstruction_error": float(
                             result["canonical_semantic_reconstruction_error"]
                         ),
@@ -696,7 +827,12 @@ def run_role_derivation(
                 )
                 print(
                     f"[roles] {binding.task}:seed{seed} "
-                    f"R_role={role.role_separation:.3f}",
+                    f"R_role={role.role_separation:.3f}"
+                    + (
+                        " [same-layer control feasibility trim]"
+                        if bool(matching["feasibility_trimmed"])
+                        else ""
+                    ),
                     flush=True,
                 )
     summary_path = extension_root / "tables" / "role_summary.csv"
