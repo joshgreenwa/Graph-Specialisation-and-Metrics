@@ -598,16 +598,27 @@ class CanonicalNarBackend:
         weights[int(data.central_idx)] = 1.0
         return weights
 
-    def transport_distances(self, data: Any, source: int, pristine) -> list[Any]:
-        del data
+    def transport_distances(
+        self, data: Any, source: int, pristine, *, channel: str | None = None
+    ) -> list[Any]:
+        del data, channel
         return list(pristine[int(source), :])
 
-    def carriage_distance_matrix(self, data: Any, sources: Sequence[int], pristine):
-        del data
+    def carriage_distance_matrix(
+        self,
+        data: Any,
+        sources: Sequence[int],
+        pristine,
+        *,
+        channel: str | None = None,
+    ):
+        del data, channel
         return pristine[np.asarray(sources, dtype=np.int64), :].T
 
-    def carriage_carrier_kind(self, data: Any, carrier: int) -> str:
-        del data, carrier
+    def carriage_carrier_kind(
+        self, data: Any, carrier: int, *, channel: str | None = None
+    ) -> str:
+        del data, carrier, channel
         return "molecular_node"
 
     def attention_normalization_error(self, data: Any) -> float:

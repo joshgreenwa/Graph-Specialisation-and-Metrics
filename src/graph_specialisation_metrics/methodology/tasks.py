@@ -104,6 +104,11 @@ class CanonicalTask:
     virtual_node: bool = False
     carrier_policy: str = "real_nodes"
     adapter_version: str = "canonical-grit-v1"
+    # Existing node-content tasks draw one shared source set for paired channel inference.
+    # GraphBench's edge-semantic extension declares independent edge/node source domains.
+    paired_channel_sources: bool = True
+    semantic_source_kind: str = "node"
+    protocol_extension: str | None = None
     bootstrap_seed: int = 17_071
     extra_known_fields: tuple[str, ...] = (
         "num_nodes",
@@ -149,6 +154,20 @@ class GraphormerTaskSpec:
     metric_fn: Callable = staticmethod(mae_metric)
     content_adapter: ContentAdapter = field(default_factory=FullNodeContentAdapter)
     checkpoint_format: str = "auto"
+
+
+@dataclass(frozen=True)
+class GraphBenchTaskSpec:
+    """Runtime details for the official-GRIT GraphBench AlgoReas adapter."""
+
+    name: str
+    title: str
+    graphbench_task: str
+    task_type: str
+    eval_split: str = "val"
+    donor_split: str = "train"
+    metric_fn: Callable = staticmethod(mae_metric)
+    content_adapter: ContentAdapter = field(default_factory=FullNodeContentAdapter)
 
 
 TASKS: dict[str, CanonicalTask] = {}
@@ -240,6 +259,71 @@ register(
         extra_known_fields=("num_nodes",),
     )
 )
+
+
+def _matching_f1(logits, target) -> float:
+    logits = np.asarray(logits, dtype=np.float64).reshape(-1)
+    target = np.asarray(target, dtype=np.float64).reshape(-1)
+    valid = np.isfinite(target)
+    prediction = logits[valid] >= 0.0
+    truth = target[valid] >= 0.5
+    true_positive = float(np.sum(prediction & truth))
+    false_positive = float(np.sum(prediction & ~truth))
+    false_negative = float(np.sum(~prediction & truth))
+    precision = true_positive / max(1.0, true_positive + false_positive)
+    recall = true_positive / max(1.0, true_positive + false_negative)
+    return 2.0 * precision * recall / max(1.0e-12, precision + recall)
+
+
+for _name, _title, _task_type, _metric in (
+    (
+        "graphbench_bipartite_matching_hard",
+        "GraphBench Bipartite Matching (hard, n=16)",
+        "edge_binary",
+        _matching_f1,
+    ),
+    (
+        "graphbench_flow_hard",
+        "GraphBench Maximum Flow (hard, n=16)",
+        "graph_regression",
+        mae_metric,
+    ),
+):
+    _graphbench_name = _name.removeprefix("graphbench_")
+    register(
+        CanonicalTask(
+            name=_name,
+            backend_kind="graphbench_grit",
+            spec=GraphBenchTaskSpec(
+                name=_name,
+                title=_title,
+                graphbench_task=_graphbench_name,
+                task_type=_task_type,
+                metric_fn=_metric,
+            ),
+            output=OutputGeometry(
+                "logits" if _task_type == "edge_binary" else "evaluation_regression",
+                None,
+                "unit" if _task_type == "edge_binary" else "training_target_std",
+            ),
+            # The GraphBench backend supplies graph-aware padded BCE / normalized MSE.
+            loss_per_graph=_bce_per_graph if _task_type == "edge_binary" else _mae_per_graph,
+            semantic_fields=("edge_value",),
+            immutable_control_fields=("node_type",),
+            node_structural_fields=(),
+            pair_structural_fields=(),
+            dense_pair_structural_fields=("rrwp",),
+            fixed_support_fields=("edge_index", "target", "spd", "rwse"),
+            carrier_policy=(
+                "readout_edges" if _task_type == "edge_binary" else "real_nodes"
+            ),
+            adapter_version="graphbench-official-grit-edge-semantic-v1",
+            paired_channel_sources=False,
+            semantic_source_kind="edge",
+            protocol_extension="graphbench-edge-semantic-v1",
+            extra_known_fields=("num_nodes", "task_type"),
+        )
+    )
 
 
 def get_task(name: str, overrides: Mapping[str, Any] | None = None) -> CanonicalTask:

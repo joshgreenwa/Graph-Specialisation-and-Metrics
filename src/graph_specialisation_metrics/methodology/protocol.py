@@ -136,10 +136,21 @@ class ExecutionPolicy:
 
     graphs_per_batch: int = 4
     oom_backoff: bool = True
+    # Optional guard for dense-pair models.  One item's cost is supplied by its backend and is
+    # approximately replicas * nodes^2.  ``None`` leaves batching controlled only by graph count.
+    replica_pair_budget: int | None = None
+    jacobian_output_chunk: int = 8
+    progress_heartbeat_seconds: float = 30.0
 
     def validate(self) -> None:
         if int(self.graphs_per_batch) < 1:
             raise ValueError("graphs_per_batch must be positive")
+        if self.replica_pair_budget is not None and int(self.replica_pair_budget) < 1:
+            raise ValueError("replica_pair_budget must be positive when set")
+        if int(self.jacobian_output_chunk) < 1:
+            raise ValueError("jacobian_output_chunk must be positive")
+        if float(self.progress_heartbeat_seconds) < 5:
+            raise ValueError("progress_heartbeat_seconds must be at least five seconds")
 
 
 @dataclass(frozen=True)
@@ -239,6 +250,25 @@ class MethodologyConfig:
                     "different footprint; minimum absolute degree gap; "
                     "uniform eligible node within base graph; iid replacement"
                 ),
+            },
+            "task_protocol_extensions": {
+                task: {
+                    "version": "graphbench-edge-semantic-v1",
+                    "semantic_source": (
+                        "one ordered edge for flow; one reciprocal edge unit for matching"
+                    ),
+                    "semantic_donor_law": (
+                        "different normalized edge value; minimum endpoint-degree-signature "
+                        "L1 gap; uniform eligible graph then uniform eligible edge; "
+                        "iid replacement"
+                    ),
+                    "structural_source": "node RRWP row/column/self footprint",
+                    "channel_source_pairing": (
+                        "graph-paired; edge/node sources independently sampled"
+                    ),
+                }
+                for task in self.tasks
+                if str(task).startswith("graphbench_")
             },
             "raw_score_aggregation": "event -> source -> graph",
             "functional_estimand": "F_sens",

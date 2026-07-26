@@ -14,6 +14,7 @@ from graph_specialisation_metrics.methodology.distance import (
 from graph_specialisation_metrics.methodology.graphormer import (
     GraphormerBackend,
     GraphormerRuntime,
+    _load_official_pcqm_split,
     _official_to_hf_state,
     graphormer_graph_from_ogb,
 )
@@ -173,6 +174,24 @@ def test_official_fairseq_readout_keys_map_to_hugging_face_head():
     assert "classifier.classifier.weight" in converted
     assert "classifier.lm_output_learned_bias" in converted
     assert not any("masked_lm_pooler" in key for key in converted)
+
+
+def test_official_pcqm_legacy_split_loads_under_pytorch_weights_only_default(
+    tmp_path,
+):
+    folder = tmp_path / "pcqm4m-v2"
+    folder.mkdir()
+    torch.save(
+        {
+            "train": np.asarray([0, 1], dtype=np.int64),
+            "valid": np.asarray([2], dtype=np.int64),
+        },
+        folder / "split_dict.pt",
+    )
+
+    split = _load_official_pcqm_split(SimpleNamespace(folder=str(folder)))
+    assert split["train"].tolist() == [0, 1]
+    assert split["valid"].tolist() == [2]
 
 
 def test_graph_token_beneficial_carriage_is_the_registered_readout_carrier():

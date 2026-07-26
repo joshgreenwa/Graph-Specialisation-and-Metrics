@@ -40,6 +40,15 @@ main(MethodologyConfig(
 ))
 ```
 
+Official-GRIT GraphBench AlgoReas use is provided by the repository frontend
+`graphbench-algoreas-hpc/bin/grit_specialisation.py`. It reuses the training runner's exact
+GraphBench conversion, PE cache, upstream GRIT layers, prediction heads, and checkpoint geometry.
+Because matching and flow expose weighted edges rather than swappable node-content rows, this is
+recorded as protocol extension `graphbench-edge-semantic-v1`: semantic sources are edges and
+structural sources remain nodes. Their bootstrap is paired at the graph level while independently
+resampling the two source domains. Existing registered tasks keep the unmodified node-content v3
+intervention and source-paired hierarchy.
+
 `0` is a stable cache label for the one public model, not a claim about its training seed. A local
 Hugging Face model directory can be supplied in `checkpoints`; a raw `.pt`, `.bin`, or
 `.safetensors` state can also be overlaid when `model_id` resolves to the matching base
@@ -71,6 +80,7 @@ The paste-ready clone/mount/dispatch cell is
 | `interventions.py` | One-row semantic replacement and dense-equivalent sparse structural footprint copy. |
 | `backend.py` | Native GRIT `wV`/final-state adapter. |
 | `graphormer.py` | Official checkpoint/dataset loading, native Graphormer transport hooks, graph-token readout adapter. |
+| `graphbench.py` | Exact GraphBench runner/checkpoint adapter, edge-semantic donor law, official-GRIT hooks, and nonlinear readout replay. |
 | `scores.py` / `distance.py` | Raw event score, hierarchy, coordinates, and exact SPD accounting. |
 | `carriage.py` | `F_sens` and positive-is-beneficial donor-wise integrated `B`. |
 | `causal.py` / `validation.py` | Clean necessity, donor-wise necessity, gross patch responses, rescue/induction, controls. |
@@ -106,6 +116,11 @@ excluded from the scientific cache fingerprint. Clean Jacobians are computed onc
 across the semantic and structural channels; clean-ablation baselines are likewise reused across
 all head and family targets.
 
+`ExecutionPolicy.replica_pair_budget` can additionally cap an approximate
+`replicas * nodes^2` batch cost, and matching-output Jacobians use
+`jacobian_output_chunk` batched VJPs. These controls, OOM backoff, and heartbeat frequency are
+execution-only and never enter the scientific fingerprint.
+
 To add a future Graphormer dataset such as ZINC, register a `CanonicalTask` with
 `backend_kind="graphormer"` and a `GraphormerTaskSpec`, then register its dataset builder with
 `register_graphormer_dataset`. The builder returns evaluation and donor split views containing
@@ -124,6 +139,11 @@ To add a future Graphormer dataset such as ZINC, register a `CanonicalTask` with
       audits.json                # this run's soft audit failures
       audit/
       cache/{scores,carriage,causal}/
+        scores/{semantic,structural}/graph_*.pt
+        carriage/{semantic,structural}/graph_*.pt
+        causal/clean_ablation/*.pt
+        causal/events/<channel>/graph_*/*.pt
+      progress.jsonl
       figures/
         *.pdf
         *.png

@@ -36,6 +36,19 @@ def build_channel_events(
     semantic_pool: SemanticDonorPool,
     duplicate_tolerance: float,
 ) -> tuple[list[Any], list[DonorEvent]]:
+    if getattr(task, "backend_kind", None) == "graphbench_grit":
+        from .graphbench import build_graphbench_channel_events
+
+        return build_graphbench_channel_events(
+            base,
+            graph_id=int(graph_id),
+            source=int(source),
+            channel=channel,
+            stage=stage,
+            donors=int(donors),
+            rng=rng,
+            semantic_pool=semantic_pool,
+        )
     source = int(source)
     degrees = node_degrees(base)
     variants: list[Any] = []

@@ -10,8 +10,15 @@ from .protocol import (
     NumericalPolicy,
     RunSizes,
 )
-from .runner import run_methodology
-from .tasks import CanonicalTask, GraphormerTaskSpec, OutputGeometry, get_task, register
+from .runner import render_cached_figures, run_methodology
+from .tasks import (
+    CanonicalTask,
+    GraphBenchTaskSpec,
+    GraphormerTaskSpec,
+    OutputGeometry,
+    get_task,
+    register,
+)
 
 __all__ = [
     "BOOTSTRAP_REPLICATES",
@@ -19,6 +26,7 @@ __all__ = [
     "BootstrapPolicy",
     "CanonicalTask",
     "ExecutionPolicy",
+    "GraphBenchTaskSpec",
     "GraphormerTaskSpec",
     "MethodologyConfig",
     "NumericalPolicy",
@@ -27,5 +35,6 @@ __all__ = [
     "get_task",
     "register",
     "register_graphormer_dataset",
+    "render_cached_figures",
     "run_methodology",
 ]

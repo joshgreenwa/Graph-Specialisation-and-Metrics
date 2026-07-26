@@ -41,6 +41,9 @@ def execute_graph_batches(
     execute: Callable[[Sequence[Any]], Any],
     consume: Callable[[Any], None],
     oom_backoff: bool,
+    item_cost: Callable[[Any], int] | None = None,
+    max_cost: int | None = None,
+    on_batch: Callable[[int, int, int], None] | None = None,
 ) -> BatchExecutionReport:
     """Execute ordered graph groups, halving only the failing batch on CUDA OOM.
 
@@ -57,6 +60,12 @@ def execute_graph_batches(
     retries = 0
     while cursor < len(values):
         size = min(requested, len(values) - cursor)
+        if item_cost is not None and max_cost is not None:
+            while size > 1 and sum(
+                max(1, int(item_cost(value)))
+                for value in values[cursor : cursor + size]
+            ) > int(max_cost):
+                size -= 1
         while True:
             chunk = values[cursor : cursor + size]
             try:
@@ -72,6 +81,8 @@ def execute_graph_batches(
             consume(result)
             successful_sizes.append(size)
             cursor += size
+            if on_batch is not None:
+                on_batch(cursor, len(values), size)
             break
     return BatchExecutionReport(
         requested_graphs_per_batch=requested,

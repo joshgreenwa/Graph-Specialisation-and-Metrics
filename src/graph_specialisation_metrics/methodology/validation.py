@@ -165,6 +165,8 @@ def _clean_ablation_stage(
     config: Any,
     targets: Mapping[str, Sequence[tuple[int, int]]],
     scores: Mapping[str, Any],
+    *,
+    cache: Any | None = None,
 ) -> dict[str, Any]:
     import torch
 
@@ -172,6 +174,17 @@ def _clean_ablation_stage(
 
     output: dict[str, Any] = {}
     graph_ids = list(_stage_ids(prepared, "clean_ablation"))
+    cached_targets = {
+        name: (
+            cache.load("causal/clean_ablation", name, strict=True)
+            if cache is not None and config.resume and not config.force
+            else None
+        )
+        for name in targets
+    }
+    missing_targets = [
+        name for name, value in cached_targets.items() if value is None
+    ]
     clean_by_graph: dict[int, Any] = {}
 
     def execute_clean(chunk):
@@ -195,7 +208,7 @@ def _clean_ablation_stage(
         ]
 
     clean_report = execute_graph_batches(
-        graph_ids,
+        graph_ids if missing_targets else [],
         graphs_per_batch=config.execution.graphs_per_batch,
         execute=execute_clean,
         consume=lambda rows: clean_by_graph.update(rows),
@@ -203,6 +216,19 @@ def _clean_ablation_stage(
     )
     target_reports: dict[str, Any] = {}
     for name, family in targets.items():
+        if cached_targets[name] is not None:
+            output[name] = cached_targets[name]
+            target_reports[name] = {
+                "cache_hit": True,
+                "cache_miss": False,
+            }
+            if getattr(prepared, "progress", None) is not None:
+                prepared.progress.emit(
+                    "causal_target_cache_hit",
+                    causal_component="clean_ablation",
+                    target=name,
+                )
+            continue
         rows = []
         clean_predictions = []
         ablated_predictions = []
@@ -302,6 +328,14 @@ def _clean_ablation_stage(
             "registered_metric_change": metric_ablated - metric_clean,
             "graphs": rows,
         }
+        if cache is not None:
+            cache.save("causal/clean_ablation", name, output[name])
+        if getattr(prepared, "progress", None) is not None:
+            prepared.progress.emit(
+                "causal_target_complete",
+                causal_component="clean_ablation",
+                target=name,
+            )
     names = list(targets)
     vector_observations = []
     graph_ids = sorted(
@@ -369,6 +403,8 @@ def _clean_ablation_stage(
         "clean_reused_across_targets": True,
         "clean_graph_batches": dataclasses.asdict(clean_report),
         "target_graph_batches": target_reports,
+        "target_cache_hits": int(len(targets) - len(missing_targets)),
+        "target_cache_misses": int(len(missing_targets)),
     }
     return output
 
@@ -379,6 +415,8 @@ def _causal_events(
     scores: Mapping[str, Any],
     targets: Mapping[str, Sequence[tuple[int, int]]],
     plan: Mapping[int, Mapping[str, Any]],
+    *,
+    cache: Any | None = None,
 ) -> dict[str, Any]:
     from .runner import _rebuild_graph_events
 
@@ -390,6 +428,24 @@ def _causal_events(
     for graph_id in sorted(plan):
         base = prepared.grit.eval_ds[int(graph_id)]
         for channel in CHANNELS:
+            shard_stage = f"causal/events/{channel}/graph_{int(graph_id):06d}"
+            cached_targets = {
+                target_name: (
+                    cache.load(shard_stage, target_name, strict=True)
+                    if cache is not None and config.resume and not config.force
+                    else None
+                )
+                for target_name in targets
+            }
+            if all(value is not None for value in cached_targets.values()):
+                first = next(iter(cached_targets.values()))
+                excluded_events += int(first.get("uncontrolled_events_excluded", 0))
+                for target_name, cached in cached_targets.items():
+                    records_by_target[target_name][channel].extend(cached["rows"])
+                    self_patch_max = max(
+                        self_patch_max, float(cached["same_condition_patch_max"])
+                    )
+                continue
             sources = plan[graph_id][channel]["sources"]
             variants, records = _rebuild_graph_events(
                 prepared, config, "causal", graph_id, channel, sources
@@ -415,17 +471,28 @@ def _causal_events(
                 captured, mismatch_capture_indices
             )
             for target_name, family in targets.items():
+                cached = cached_targets[target_name]
+                if cached is not None:
+                    records_by_target[target_name][channel].extend(cached["rows"])
+                    self_patch_max = max(
+                        self_patch_max, float(cached["same_condition_patch_max"])
+                    )
+                    if getattr(prepared, "progress", None) is not None:
+                        prepared.progress.emit(
+                            "causal_target_cache_hit",
+                            causal_component="events",
+                            graph_id=int(graph_id),
+                            channel=channel,
+                            target=target_name,
+                        )
+                    continue
                 # Same-condition patch is a numerical audit, not a control endpoint.
                 self_replacement = prepared.backend.replacement_batch(captured, [0])
                 _, self_z, _ = prepared.backend.patch(base, self_replacement, family)
-                self_patch_max = max(
-                    self_patch_max,
-                    float(
-                        np.max(
-                            np.abs(self_z.detach().cpu().numpy() - z_clean)
-                        )
-                    ),
+                target_self_patch = float(
+                    np.max(np.abs(self_z.detach().cpu().numpy() - z_clean))
                 )
+                self_patch_max = max(self_patch_max, target_self_patch)
 
                 # Donor-wise necessity is evaluated in one aligned [clean,*events] batch.
                 _, z_ablated, _ = prepared.backend.ablate([base, *variants], family)
@@ -470,13 +537,13 @@ def _causal_events(
                 )
                 gross_adjusted = mismatch_adjusted_gross(matched, mismatched)
                 aligned_adjusted = mismatch_adjusted_aligned(matched, mismatched)
-                rows = records_by_target[target_name][channel]
+                target_rows: list[dict[str, Any]] = []
                 for position, record in enumerate(records):
                     if position in uncontrolled:
                         # No admissible mismatch control: excluded rather than self-controlled.
                         continue
                     mismatch_record = records[mismatch[position]]
-                    rows.append(
+                    target_rows.append(
                         {
                             "graph": int(graph_id),
                             "source": int(record.source),
@@ -509,6 +576,25 @@ def _causal_events(
                             "event_effect": float(necessity["event_effect"][position]),
                         }
                     )
+                records_by_target[target_name][channel].extend(target_rows)
+                if cache is not None:
+                    cache.save(
+                        shard_stage,
+                        target_name,
+                        {
+                            "rows": target_rows,
+                            "same_condition_patch_max": target_self_patch,
+                            "uncontrolled_events_excluded": len(uncontrolled),
+                        },
+                    )
+                if getattr(prepared, "progress", None) is not None:
+                    prepared.progress.emit(
+                        "causal_target_complete",
+                        causal_component="events",
+                        graph_id=int(graph_id),
+                        channel=channel,
+                        target=target_name,
+                    )
     within_tolerance(
         self_patch_max,
         config.numerical.reconstruction_tolerance,
@@ -527,6 +613,8 @@ def _summarize_causal(
     targets: Mapping[str, Sequence[tuple[int, int]]],
     config: Any,
     scores: Mapping[str, Any],
+    *,
+    paired_channel_sources: bool = True,
 ) -> dict[str, Any]:
     records = event_output["records"]
     summary: dict[str, dict[str, Any]] = {}
@@ -644,9 +732,15 @@ def _summarize_causal(
                 by_channel_key[key][channel_index, target_index] = [
                     float(row[name]) for name in endpoint_order
                 ]
-    complete = [
-        (key, value) for key, value in sorted(by_channel_key.items()) if np.isfinite(value).all()
-    ]
+    complete = (
+        [
+            (key, value)
+            for key, value in sorted(by_channel_key.items())
+            if np.isfinite(value).all()
+        ]
+        if paired_channel_sources
+        else []
+    )
     if complete:
         causal_observations = [
             Observation(
@@ -973,7 +1067,7 @@ def load_cached_causal_validation(
     if scores is None:
         return None
     _, cache = _causal_cache(prepared, config, scores)
-    return cache.load("causal", "validation")
+    return cache.load("causal", "validation", strict=True)
 
 
 def run_causal_validation(
@@ -987,13 +1081,23 @@ def run_causal_validation(
         raise ValueError("causal validation requires discovery scores")
     plan, cache = _causal_cache(prepared, config, scores)
     if config.resume and not config.force:
-        cached = cache.load("causal", "validation")
+        cached = cache.load("causal", "validation", strict=True)
         if cached is not None:
             return cached
     targets = _targets(prepared, scores)
-    clean = _clean_ablation_stage(prepared, config, targets, scores)
-    events = _causal_events(prepared, config, scores, targets, plan)
-    summary = _summarize_causal(events, targets, config, scores)
+    clean = _clean_ablation_stage(
+        prepared, config, targets, scores, cache=cache
+    )
+    events = _causal_events(
+        prepared, config, scores, targets, plan, cache=cache
+    )
+    summary = _summarize_causal(
+        events,
+        targets,
+        config,
+        scores,
+        paired_channel_sources=prepared.task.paired_channel_sources,
+    )
     associations = _association_report(prepared, scores, summary, clean, config)
     causal_interval = summary["intervals"]["interval"]
     if causal_interval is not None:

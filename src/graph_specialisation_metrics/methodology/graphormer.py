@@ -867,15 +867,37 @@ class GraphormerBackend:
         weights[0] = 1.0
         return weights
 
-    def transport_distances(self, data: GraphormerGraph, source: int, pristine):
+    def transport_distances(
+        self,
+        data: GraphormerGraph,
+        source: int,
+        pristine,
+        *,
+        channel: str | None = None,
+    ):
+        del channel
         return ["graph_token", *list(pristine[int(source), :])]
 
-    def carriage_distance_matrix(self, data: GraphormerGraph, sources, pristine):
+    def carriage_distance_matrix(
+        self,
+        data: GraphormerGraph,
+        sources,
+        pristine,
+        *,
+        channel: str | None = None,
+    ):
+        del channel
         node = pristine[np.asarray(sources, dtype=np.int64), :].T
         return np.concatenate((np.full((1, len(sources)), np.nan), node), axis=0)
 
-    def carriage_carrier_kind(self, data: GraphormerGraph, carrier: int) -> str:
-        del data
+    def carriage_carrier_kind(
+        self,
+        data: GraphormerGraph,
+        carrier: int,
+        *,
+        channel: str | None = None,
+    ) -> str:
+        del data, channel
         return "graph_token" if int(carrier) == 0 else "molecular_node"
 
     def _native_forward(self, data_list, family=(), replacements=None):
@@ -982,6 +1004,25 @@ class GraphormerBackend:
         return profile
 
 
+def _load_official_pcqm_split(dataset: Any):
+    """Load OGB's trusted legacy split metadata under PyTorch 2.6+.
+
+    OGB 1.3.6 calls ``torch.load`` without an explicit ``weights_only`` argument.
+    PyTorch 2.6 changed that default to ``True``, but the official PCQM split file
+    contains NumPy arrays and is therefore not a weights-only artifact. Limit the
+    compatibility opt-out to this one file from the registered official OGB archive.
+    """
+
+    import torch
+
+    path = Path(dataset.folder) / "split_dict.pt"
+    try:
+        return torch.load(path, map_location="cpu", weights_only=False)
+    except TypeError:
+        # Compatibility with older PyTorch releases that predate ``weights_only``.
+        return torch.load(path, map_location="cpu")
+
+
 def _pcqm_datasets(spec: Any, model: Any, overrides: Mapping[str, Any]):
     from ogb.lsc import PCQM4Mv2Dataset
 
@@ -990,7 +1031,7 @@ def _pcqm_datasets(spec: Any, model: Any, overrides: Mapping[str, Any]):
         dataset = PCQM4Mv2Dataset(root=dataset_root, only_smiles=True)
     except TypeError:
         dataset = PCQM4Mv2Dataset(root=dataset_root)
-    split = dataset.get_idx_split()
+    split = _load_official_pcqm_split(dataset)
     eval_split = str(overrides.get("eval_split", spec.eval_split))
     donor_split = str(overrides.get("donor_split", spec.donor_split))
     if eval_split not in split or donor_split not in split:

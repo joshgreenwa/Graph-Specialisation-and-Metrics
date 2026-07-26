@@ -171,3 +171,65 @@ python bin/check_official_backends.py --models graphgps,static_grit,grit,gatedgc
 
 All rows must pass. Environment notes and likely import failures are listed in
 `docs/hpc_environment.md`.
+# GRIT specialisation and carriage
+
+The trained GRIT checkpoints for `bipartite_matching_hard` and `flow_hard` are supported by the
+canonical `donor-swap-specialisation-carriage-v3` implementation through the explicitly labelled
+`graphbench-edge-semantic-v1` extension. GCN+ checkpoints are intentionally rejected: there is no
+GCN+ transport-site adapter in the canonical methodology.
+
+GraphBench has no swappable node-content row for these tasks. The semantic source is therefore one
+normalized weighted edge from the model input. Flow uses one ordered directed edge; matching treats
+a reciprocal pair as one semantic unit when both orientations are present. The external training
+donor law is graph-balanced and matches the source's endpoint-degree signature before drawing an
+edge value. The structural intervention remains the canonical fixed-support node intervention and
+copies one RRWP row/column/self footprint without changing topology, weights, labels, or flow
+source/sink markers.
+
+Production defaults are recorded in
+[`configs/grit_specialisation_graphbench_edge_v1.yaml`](configs/grit_specialisation_graphbench_edge_v1.yaml):
+64 discovery graphs, 32 causal graphs, 96 held-out clean-ablation graphs, up to 16 sources per
+channel, 8 donors per source, and 2,000 bootstrap draws. All 16 structural node sources are
+enumerated on the primary `n=16` validation split, so structural-source resampling is disabled;
+semantic edge sources are sampled when more than 16 are eligible.
+
+Run locally on an HPC node:
+
+```bash
+python graphbench-algoreas-hpc/bin/grit_specialisation.py \
+  --tasks bipartite_matching_hard,flow_hard \
+  --seeds 0,1,2 \
+  --profile production
+```
+
+Or submit one task at a time:
+
+```bash
+sbatch -A mlmi-jgg45-sl2-gpu -p ampere --qos=gpu1 \
+  --export=ALL,ENV_ACTIVATE=/path/to/activate_graphbench_algoreas \
+  graphbench-algoreas-hpc/slurm/analyse_grit_specialisation.sbatch
+```
+
+Every long component writes atomic graph/target shards and a consolidated cache. Re-running the
+same command resumes missing work. `progress.jsonl` and stdout include the active
+task/seed/component/channel, cache use, graph counts, elapsed time, heartbeat, and CUDA memory.
+Numerical/no-op/attention/replay/completeness gates are soft by default and make the run
+`headline_eligible=false`; checkpoint geometry, event-manifest alignment, patch geometry, and
+cache corruption remain hard failures. Add `--strict-audits` for release verification.
+
+Figures can be regenerated on CPU without importing GRIT, loading a checkpoint, or reopening the
+dataset:
+
+```bash
+python graphbench-algoreas-hpc/bin/grit_specialisation.py \
+  --tasks bipartite_matching_hard,flow_hard \
+  --seeds 0,1,2 \
+  --phases figures \
+  --accelerator cpu
+```
+
+This consumes the consolidated score, carriage, and causal caches and overwrites only figure
+artifacts. The canonical figure suite contains the same six paper-facing views used by the mixed
+synthetic plan (specialisation plane, score/causal association, double-dissociation endpoints,
+cumulative family ablation, joint/selectivity validation, and family controls), plus the required
+distance, attention, support, and carriage diagnostics.

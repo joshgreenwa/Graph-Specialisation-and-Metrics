@@ -7,6 +7,7 @@ import gc
 import platform
 import subprocess
 import sys
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -22,10 +23,17 @@ from .backend import CanonicalGritBackend
 from .bootstrap import (
     Observation,
     nested_percentile_interval,
+    paired_channel_percentile_interval,
     reportable_bin,
     trimmed_mean,
 )
-from .cache import CacheContract, CanonicalCache, atomic_json, checkpoint_sha256
+from .cache import (
+    CacheContract,
+    CanonicalCache,
+    atomic_json,
+    checkpoint_sha256,
+    load_cache_value_file,
+)
 from .carriage import (
     additive_beneficial_mass,
     beneficial_carriage,
@@ -72,6 +80,7 @@ from .protocol import (
     deterministic_splits,
     stable_hash,
 )
+from .progress import ProgressJournal
 from .sampling import SemanticDonorPool, manifest_fingerprint, sample_sources
 from .scores import (
     aggregate_event_scores,
@@ -95,6 +104,7 @@ class PreparedTask:
     sigma: np.ndarray
     splits: SplitManifest
     donor_pool: SemanticDonorPool
+    progress: ProgressJournal | None = None
 
     @property
     def grit(self) -> Any:
@@ -161,17 +171,21 @@ def _model_audits(
         context={"task": task.name, "train_seed": int(runtime.sc.seed)},
     )
 
-    rows = task.content_adapter.rows(base)
-    semantic_noop = semantic_donor_swap(
-        base, 0, rows[0], adapter=task.content_adapter
-    )
-    structural_noop = structural_donor_swap(
-        base,
-        0,
-        0,
-        task=task,
-        duplicate_tolerance=config.numerical.duplicate_tolerance,
-    )
+    declared_noops = getattr(backend, "declared_noop_variants", None)
+    if callable(declared_noops):
+        semantic_noop, structural_noop = declared_noops(base)
+    else:
+        rows = task.content_adapter.rows(base)
+        semantic_noop = semantic_donor_swap(
+            base, 0, rows[0], adapter=task.content_adapter
+        )
+        structural_noop = structural_donor_swap(
+            base,
+            0,
+            0,
+            task=task,
+            duplicate_tolerance=config.numerical.duplicate_tolerance,
+        )
     noops = backend.capture(
         [base, semantic_noop, structural_noop],
         require_grad=False,
@@ -211,6 +225,33 @@ def _model_audits(
 def _rng(config: MethodologyConfig, *parts: Any) -> np.random.Generator:
     digest = stable_hash({"seed": int(config.analysis_seed), "parts": parts}, length=16)
     return np.random.default_rng(int(digest, 16))
+
+
+def _channel_bootstrap_policy(
+    prepared: PreparedTask,
+    config: MethodologyConfig,
+    plan: Mapping[int, Mapping[str, Any]],
+    channel: str,
+):
+    """Disable source resampling only when every eligible source was enumerated."""
+
+    eligible_source_fn = getattr(prepared.backend, "eligible_sources", None)
+    if not callable(eligible_source_fn) or prepared.task.paired_channel_sources:
+        return config.bootstrap
+    exhaustive = all(
+        len(plan[int(graph_id)][channel]["sources"])
+        == len(
+            eligible_source_fn(
+                prepared.grit.eval_ds[int(graph_id)], channel=channel
+            )
+        )
+        for graph_id in plan
+    )
+    return (
+        dataclasses.replace(config.bootstrap, resample_source=False)
+        if exhaustive
+        else config.bootstrap
+    )
 
 
 def _checkpoint_override(config: MethodologyConfig, task: str, seed: int) -> str | None:
@@ -277,6 +318,7 @@ def _prepare_graphormer_task(
         "test_metric": runtime.test_metric,
         "validation_metric": runtime.val_metric,
         "parameter_count": runtime.checks.get("num_parameters"),
+        "fidelity": runtime.checks,
         "canonical_audits": audit_checks,
         "runtime": {
             "platform": platform.platform(),
@@ -297,6 +339,133 @@ def _prepare_graphormer_task(
         sigma,
         splits,
         donor_pool,
+        ProgressJournal(
+            output_dir / "progress.jsonl",
+            heartbeat_seconds=config.execution.progress_heartbeat_seconds,
+        ),
+    )
+
+
+def _prepare_graphbench_task(
+    config: MethodologyConfig,
+    task: CanonicalTask,
+    train_seed: int,
+    task_overrides: Mapping[str, Any],
+) -> PreparedTask:
+    from .graphbench import (
+        GraphBenchEdgeDonorPool,
+        GraphBenchGritBackend,
+        build_graphbench_runtime,
+    )
+
+    output_dir = config.root / task.name / f"seed_{int(train_seed)}"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_value = _checkpoint_override(config, task.name, int(train_seed))
+    if checkpoint_value is None:
+        training_root = Path(
+            str(
+                task_overrides.get(
+                    "training_output_root",
+                    "/rds/user/jgg45/hpc-work/graphbench-algoreas/outputs/"
+                    "graphbench_algoreas_hpc_base_v1",
+                )
+            )
+        )
+        checkpoint_value = str(
+            training_root
+            / task.spec.graphbench_task
+            / "grit"
+            / f"seed{int(train_seed)}"
+            / "best.pt"
+        )
+    runtime, checkpoint_descriptor = build_graphbench_runtime(
+        task,
+        checkpoint_path=checkpoint_value,
+        train_seed=int(train_seed),
+        accelerator=config.accelerator,
+        overrides=task_overrides,
+        jacobian_output_chunk=int(config.execution.jacobian_output_chunk),
+    )
+    checkpoint = Path(checkpoint_descriptor)
+    digest = checkpoint_sha256(checkpoint)
+    if task.spec.task_type == "graph_regression":
+        if runtime.target_stats is None:
+            raise RuntimeError("GraphBench flow checkpoint has no training target scale")
+        sigma = np.asarray(
+            [max(float(runtime.target_stats["std"]), 1.0e-6)], dtype=np.float64
+        )
+    else:
+        sigma = np.asarray([1.0], dtype=np.float64)
+    backend = GraphBenchGritBackend(
+        runtime,
+        task,
+        sigma,
+        jacobian_output_chunk=int(config.execution.jacobian_output_chunk),
+    )
+    with audit_scope(f"{task.name}:seed{int(train_seed)}:model") as model_scope:
+        audit_checks = _model_audits(runtime, backend, task, config)
+    audit_checks["failures"] = log_summary(
+        model_scope, header=f"{task.name}:seed{int(train_seed)} model audits"
+    )
+    splits = deterministic_splits(
+        len(runtime.eval_ds),
+        len(runtime.donor_ds),
+        config.sizes,
+        int(config.analysis_seed),
+        same_index_space=False,
+    )
+    donor_pool = GraphBenchEdgeDonorPool(
+        [
+            (graph_id, runtime.donor_ds[graph_id])
+            for graph_id in splits.semantic_donor_pool
+        ]
+    )
+    model_record = {
+        "protocol_version": PROTOCOL_VERSION,
+        "protocol_extension": task.protocol_extension,
+        "repository_commit": _repository_commit(),
+        "task": task.name,
+        "graphbench_task": task.spec.graphbench_task,
+        "backend": task.backend_kind,
+        "title": task.title,
+        "train_seed": int(train_seed),
+        "checkpoint": checkpoint_descriptor,
+        "checkpoint_epoch": runtime.checkpoint.get("epoch"),
+        "checkpoint_step": runtime.checkpoint.get("step"),
+        "checkpoint_sha256": digest,
+        "output_representation": task.output.representation,
+        "sigma": sigma.tolist(),
+        "task_adapter_version": task.adapter_version,
+        "semantic_source_kind": task.semantic_source_kind,
+        "paired_channel_sources": task.paired_channel_sources,
+        "carrier_policy": task.carrier_policy,
+        "model_geometry": backend.geometry,
+        "splits": dataclasses.asdict(splits),
+        "validation_metric": runtime.val_metric,
+        "test_metric": runtime.test_metric,
+        "parameter_count": runtime.checks.get("num_parameters"),
+        "fidelity": runtime.checks,
+        "canonical_audits": audit_checks,
+        "runtime": {
+            "platform": platform.platform(),
+            "python": sys.version.split()[0],
+        },
+    }
+    atomic_json(output_dir / "model.json", model_record)
+    return PreparedTask(
+        task,
+        runtime,
+        backend,
+        output_dir,
+        checkpoint,
+        digest,
+        sigma,
+        splits,
+        donor_pool,
+        ProgressJournal(
+            output_dir / "progress.jsonl",
+            heartbeat_seconds=config.execution.progress_heartbeat_seconds,
+        ),
     )
 
 
@@ -326,6 +495,26 @@ def prepare_task(
         "revision",
         "cache_dir",
         "local_files_only",
+        "runner_path",
+        "training_output_root",
+        "pe_cache_root",
+        "pe_cache_namespace",
+        "pe_cache_dtype",
+        "pe_workers",
+        "pe_save_every",
+        "require_subset_cache",
+        "require_pe_cache",
+        "build_missing_pe_cache",
+        "force_reload_data",
+        "metric_reproduction_tolerance",
+        "expected_grit_commit",
+        "split_seed",
+        "train_size",
+        "val_size",
+        "test_size",
+        "train_node_size",
+        "val_node_size",
+        "test_node_size",
     }
     canonical_override_names = set(CanonicalTask.__dataclass_fields__) - {
         "name",
@@ -374,6 +563,13 @@ def prepare_task(
         )
     if task.backend_kind == "graphormer":
         return _prepare_graphormer_task(
+            config,
+            task,
+            int(train_seed),
+            task_overrides,
+        )
+    if task.backend_kind == "graphbench_grit":
+        return _prepare_graphbench_task(
             config,
             task,
             int(train_seed),
@@ -512,6 +708,10 @@ def prepare_task(
         sigma,
         splits,
         donor_pool,
+        ProgressJournal(
+            output_dir / "progress.jsonl",
+            heartbeat_seconds=config.execution.progress_heartbeat_seconds,
+        ),
     )
 
 
@@ -535,33 +735,80 @@ def _stage_plan(
     plan: dict[int, dict[str, Any]] = {}
     for graph_id in _stage_ids(prepared, stage):
         base = prepared.grit.eval_ds[int(graph_id)]
-        source_rng = _rng(
-            config,
-            prepared.task.name,
-            prepared.grit.sc.seed,
-            stage,
-            graph_id,
-            "sources",
-        )
         eligible_source_fn = getattr(prepared.backend, "eligible_sources", None)
-        if callable(eligible_source_fn):
-            eligible = np.asarray(eligible_source_fn(base), dtype=np.int64)
-            if eligible.ndim != 1 or not eligible.size:
-                raise RuntimeError(
-                    f"{prepared.task.name} supplied no eligible analysis sources"
-                )
-            count = min(int(config.sizes.sources_per_graph), int(eligible.size))
-            sources = np.sort(
-                source_rng.choice(eligible, size=count, replace=False)
-            ).astype(np.int64)
-        else:
-            sources = sample_sources(
-                int(base.num_nodes),
-                int(config.sizes.sources_per_graph),
-                source_rng,
+        entry: dict[str, Any] = {}
+        shared_sources: np.ndarray | None = None
+        if prepared.task.paired_channel_sources:
+            source_rng = _rng(
+                config,
+                prepared.task.name,
+                prepared.grit.sc.seed,
+                stage,
+                graph_id,
+                "sources",
             )
-        entry: dict[str, Any] = {"sources": tuple(int(v) for v in sources)}
+            if callable(eligible_source_fn):
+                eligible = np.asarray(eligible_source_fn(base), dtype=np.int64)
+                if eligible.ndim != 1 or not eligible.size:
+                    raise RuntimeError(
+                        f"{prepared.task.name} supplied no eligible analysis sources"
+                    )
+                count = min(
+                    int(config.sizes.sources_per_graph), int(eligible.size)
+                )
+                shared_sources = np.sort(
+                    source_rng.choice(eligible, size=count, replace=False)
+                ).astype(np.int64)
+            else:
+                shared_sources = sample_sources(
+                    int(base.num_nodes),
+                    int(config.sizes.sources_per_graph),
+                    source_rng,
+                )
+            entry["sources"] = tuple(int(v) for v in shared_sources)
         for channel in CHANNELS:
+            if shared_sources is not None:
+                sources = shared_sources
+            else:
+                if not callable(eligible_source_fn):
+                    raise RuntimeError(
+                        f"{prepared.task.name} uses channel-specific sources but its "
+                        "backend does not declare eligible_sources(data, channel)"
+                    )
+                eligible = np.asarray(
+                    eligible_source_fn(base, channel=channel), dtype=np.int64
+                )
+                if eligible.ndim != 1 or not eligible.size:
+                    audit_check(
+                        False,
+                        "plan.no_eligible_channel_source",
+                        f"graph {graph_id} has no eligible {channel} source",
+                        context={
+                            "stage": stage,
+                            "graph": int(graph_id),
+                            "channel": channel,
+                        },
+                    )
+                    sources = np.empty(0, dtype=np.int64)
+                else:
+                    count = min(
+                        int(config.sizes.sources_per_graph), int(eligible.size)
+                    )
+                    if count == int(eligible.size):
+                        # Exhaustive source use has no source-sampling uncertainty.
+                        sources = np.sort(eligible)
+                    else:
+                        sources = np.sort(
+                            _rng(
+                                config,
+                                prepared.task.name,
+                                prepared.grit.sc.seed,
+                                stage,
+                                graph_id,
+                                channel,
+                                "sources",
+                            ).choice(eligible, size=count, replace=False)
+                        ).astype(np.int64)
             records = []
             estimable_sources = []
             for source in sources:
@@ -592,31 +839,40 @@ def _stage_plan(
                 "sources": tuple(estimable_sources),
                 "records": tuple(record.record() for record in records),
             }
-        common_sources = tuple(
-            source
-            for source in entry["sources"]
-            if source in set(entry["semantic"]["sources"])
-            and source in set(entry["structural"]["sources"])
-        )
-        if not common_sources:
-            # Drop the graph from the stage rather than abort; the loss of support is recorded.
+        if prepared.task.paired_channel_sources:
+            common_sources = tuple(
+                source
+                for source in entry["sources"]
+                if source in set(entry["semantic"]["sources"])
+                and source in set(entry["structural"]["sources"])
+            )
+            if not common_sources:
+                audit_check(
+                    False,
+                    "plan.no_estimable_source",
+                    f"graph {graph_id} has no source estimable under both donor-swap "
+                    f"channels; the graph is dropped from stage {stage!r}",
+                    context={"stage": stage, "graph": int(graph_id)},
+                )
+                continue
+            for channel in CHANNELS:
+                entry[channel] = {
+                    "sources": common_sources,
+                    "records": tuple(
+                        record
+                        for record in entry[channel]["records"]
+                        if int(record["source"]) in set(common_sources)
+                    ),
+                }
+        elif any(not entry[channel]["sources"] for channel in CHANNELS):
             audit_check(
                 False,
-                "plan.no_estimable_source",
-                f"graph {graph_id} has no source estimable under both donor-swap channels; "
+                "plan.no_estimable_channel_source",
+                f"graph {graph_id} is not estimable in both independent source domains; "
                 f"the graph is dropped from stage {stage!r}",
                 context={"stage": stage, "graph": int(graph_id)},
             )
             continue
-        for channel in CHANNELS:
-            entry[channel] = {
-                "sources": common_sources,
-                "records": tuple(
-                    record
-                    for record in entry[channel]["records"]
-                    if int(record["source"]) in set(common_sources)
-                ),
-            }
         plan[int(graph_id)] = entry
     if not plan:
         # Nothing is estimable anywhere, so no stage quantity exists to report on.
@@ -657,6 +913,12 @@ def _cache(
             bootstrap_seed=int(config.bootstrap.rng_seed),
             repository_commit=_repository_commit(),
             bootstrap_replicates=int(config.bootstrap.replicates),
+            semantic_donor_law=(
+                "graph-uniform/edge-uniform/min-endpoint-degree-signature-gap/"
+                "iid-replacement"
+                if prepared.task.semantic_source_kind == "edge"
+                else "graph-uniform/node-uniform/min-gap/iid-replacement"
+            ),
         ),
     )
 
@@ -771,6 +1033,54 @@ def _prepare_clean_jacobians(
     return clean_by_graph, dataclasses.asdict(report)
 
 
+def _event_item_cost(
+    prepared: PreparedTask,
+    config: MethodologyConfig,
+    plan: Mapping[int, Mapping[str, Any]],
+    graph_id: int,
+    channel: str,
+) -> int:
+    estimator = getattr(prepared.backend, "event_pair_cost", None)
+    if not callable(estimator):
+        return 1
+    data = prepared.grit.eval_ds[int(graph_id)]
+    return int(
+        estimator(
+            data,
+            len(plan[int(graph_id)][channel]["sources"]),
+            int(config.sizes.donors_per_source),
+        )
+    )
+
+
+def _progress_batch_callback(
+    prepared: PreparedTask,
+    *,
+    phase: str,
+    channel: str,
+    cached: int = 0,
+):
+    def report(done: int, total: int, size: int) -> None:
+        if prepared.progress is not None:
+            prepared.progress.emit(
+                "batch_complete",
+                phase=phase,
+                channel=channel,
+                completed_graphs=int(cached + done),
+                total_graphs=int(cached + total),
+                batch_graphs=int(size),
+            )
+
+    return report
+
+
+def _source_population_size(prepared: PreparedTask, data: Any, channel: str) -> int:
+    eligible = getattr(prepared.backend, "eligible_sources", None)
+    if callable(eligible) and not prepared.task.paired_channel_sources:
+        return int(len(eligible(data, channel=channel)))
+    return int(data.num_nodes)
+
+
 def _score_graph_batch(
     prepared: PreparedTask,
     config: MethodologyConfig,
@@ -793,14 +1103,13 @@ def _score_graph_batch(
         variants, records = _rebuild_graph_events(
             prepared, config, "scores", graph_id, channel, sources
         )
-        audit_check(
-            [record.record() for record in records]
-            == list(plan[graph_id][channel]["records"]),
-            "events.deterministic_replay",
-            "deterministic event replay changed its manifest; cached scores are keyed by the "
-            "planned manifest hash",
-            context={"stage": "scores", "graph": graph_id, "channel": channel},
-        )
+        if [record.record() for record in records] != list(
+            plan[graph_id][channel]["records"]
+        ):
+            raise RuntimeError(
+                "deterministic score-event replay changed its manifest for "
+                f"graph={graph_id} channel={channel}; refusing misaligned results"
+            )
         pristine = shortest_path_distances(base.edge_index, int(base.num_nodes))
         contexts.append(
             {
@@ -834,7 +1143,7 @@ def _score_graph_batch(
         score_observations, distance_rows = [], []
         for position, record in enumerate(records):
             distances = prepared.backend.transport_distances(
-                base, int(record.source), pristine
+                base, int(record.source), pristine, channel=channel
             )
             contribution, support = distance_event_contributions(
                 q[position : position + 1], distances, axis
@@ -923,9 +1232,13 @@ def run_scores(
     plan = dict(plan or _stage_plan(prepared, config, "scores"))
     cache = _cache(prepared, config, plan)
     if config.resume and not config.force:
-        cached = cache.load("scores", "raw")
+        cached = cache.load("scores", "raw", strict=True)
         if cached is not None:
             log(f"[cache] loaded canonical scores for {prepared.task.name}")
+            if prepared.progress is not None:
+                prepared.progress.emit(
+                    "cache_hit", phase="scores", cache="consolidated"
+                )
             return cached
     graph_ids = sorted(plan)
     axis = _distance_axis(prepared, graph_ids)
@@ -941,10 +1254,32 @@ def run_scores(
     }
     throughput_graph: dict[int, np.ndarray] = {}
     attention_graph: dict[int, np.ndarray] = {}
-    # The clean linearisation is channel-independent. Compute it once per graph and reuse it for
-    # both semantic and structural events.
+    cached_graphs: dict[str, dict[int, Any]] = {
+        channel: {} for channel in CHANNELS
+    }
+    missing_graphs: dict[str, list[int]] = {
+        channel: [] for channel in CHANNELS
+    }
+    for channel in CHANNELS:
+        for graph_id in graph_ids:
+            shard = (
+                cache.load(
+                    f"scores/{channel}",
+                    f"graph_{int(graph_id):06d}",
+                    strict=True,
+                )
+                if config.resume and not config.force
+                else None
+            )
+            if shard is None:
+                missing_graphs[channel].append(int(graph_id))
+            else:
+                cached_graphs[channel][int(graph_id)] = shard
+    clean_needed = sorted(
+        set(missing_graphs["semantic"]) | set(missing_graphs["structural"])
+    )
     clean_by_graph, clean_execution = _prepare_clean_jacobians(
-        prepared, config, graph_ids
+        prepared, config, clean_needed
     )
     execution_reports: dict[str, Any] = {}
     for channel in CHANNELS:
@@ -953,7 +1288,7 @@ def run_scores(
         graph_support: dict[int, np.ndarray] = {}
         event_rows: list[dict[str, Any]] = []
 
-        def consume_score_batch(results):
+        def consume_score_batch(results, *, persist: bool = True):
             for result in results:
                 graph_id = int(result["graph_id"])
                 graph_scores[graph_id] = result["score"]
@@ -968,9 +1303,19 @@ def run_scores(
                     throughput_graph[graph_id] = result["throughput"]
                 if result["attention"] is not None:
                     attention_graph[graph_id] = result["attention"]
+                if persist:
+                    cache.save(
+                        f"scores/{channel}",
+                        f"graph_{graph_id:06d}",
+                        result,
+                    )
 
+        consume_score_batch(
+            [cached_graphs[channel][key] for key in sorted(cached_graphs[channel])],
+            persist=False,
+        )
         report = execute_graph_batches(
-            graph_ids,
+            missing_graphs[channel],
             graphs_per_batch=config.execution.graphs_per_batch,
             execute=lambda chunk: _score_graph_batch(
                 prepared,
@@ -983,8 +1328,22 @@ def run_scores(
             ),
             consume=consume_score_batch,
             oom_backoff=config.execution.oom_backoff,
+            item_cost=lambda graph_id: _event_item_cost(
+                prepared, config, plan, int(graph_id), channel
+            ),
+            max_cost=config.execution.replica_pair_budget,
+            on_batch=_progress_batch_callback(
+                prepared,
+                phase="scores",
+                channel=channel,
+                cached=len(cached_graphs[channel]),
+            ),
         )
-        execution_reports[channel] = dataclasses.asdict(report)
+        execution_reports[channel] = {
+            **dataclasses.asdict(report),
+            "cache_hits": len(cached_graphs[channel]),
+            "cache_misses": len(missing_graphs[channel]),
+        }
         raw = np.stack([graph_scores[key] for key in graph_ids]).mean(axis=0)
         heatmaps = score_heatmaps(
             graph_contribution,
@@ -1002,6 +1361,11 @@ def run_scores(
             "heatmap_exact_head": heatmaps.exact_head,
             "heatmap_per_opportunity_head": heatmaps.per_opportunity_head,
             "events": event_rows,
+            "resample_source": bool(
+                _channel_bootstrap_policy(
+                    prepared, config, plan, channel
+                ).resample_source
+            ),
         }
         empty_columns = np.zeros(len(axis.labels), dtype=np.int64)
         replicates_seen = 0
@@ -1016,7 +1380,9 @@ def run_scores(
 
         output["channels"][channel]["distance_intervals"] = nested_percentile_interval(
             distance_observations[channel],
-            config.bootstrap,
+            _channel_bootstrap_policy(
+                prepared, config, plan, channel
+            ),
             graph_reduce=graph_distance_reduce,
         )
         support_graphs, support_pairs = column_support(
@@ -1167,23 +1533,6 @@ def run_scores(
     structural_by_key = {
         (row.graph, row.source, row.donor): row.value for row in observations["structural"]
     }
-    common = sorted(set(semantic_by_key) & set(structural_by_key))
-    paired = [
-        Observation(
-            int(prepared.grit.sc.seed),
-            graph,
-            source,
-            donor,
-            np.stack(
-                (
-                    semantic_by_key[(graph, source, donor)],
-                    structural_by_key[(graph, source, donor)],
-                )
-            ),
-        )
-        for graph, source, donor in common
-    ]
-
     def transform(value):
         transformed = head_coordinates(
             value[0],
@@ -1203,10 +1552,41 @@ def run_scores(
             )
         )
 
-    if paired:
-        output["intervals"] = nested_percentile_interval(
-            paired, config.bootstrap, transform=transform
+    if prepared.task.paired_channel_sources:
+        common = sorted(set(semantic_by_key) & set(structural_by_key))
+        paired = [
+            Observation(
+                int(prepared.grit.sc.seed),
+                graph,
+                source,
+                donor,
+                np.stack(
+                    (
+                        semantic_by_key[(graph, source, donor)],
+                        structural_by_key[(graph, source, donor)],
+                    )
+                ),
+            )
+            for graph, source, donor in common
+        ]
+        if paired:
+            output["intervals"] = nested_percentile_interval(
+                paired, config.bootstrap, transform=transform
+            )
+            output["interval_pairing"] = "source-and-graph-paired"
+    else:
+        source_resampling = tuple(
+            _channel_bootstrap_policy(prepared, config, plan, channel).resample_source
+            for channel in CHANNELS
         )
+        output["intervals"] = paired_channel_percentile_interval(
+            observations["semantic"],
+            observations["structural"],
+            config.bootstrap,
+            transform=transform,
+            resample_source=source_resampling,
+        )
+        output["interval_pairing"] = "graph-paired/channel-source-independent"
     cache.save("scores", "raw", output)
     cache.save_audit("scores_manifest", plan)
     return output
@@ -1237,14 +1617,13 @@ def _carriage_graph_batch(
         variants, records = _rebuild_graph_events(
             prepared, config, "carriage", graph_id, channel, sources
         )
-        audit_check(
-            [record.record() for record in records]
-            == list(plan[graph_id][channel]["records"]),
-            "carriage.deterministic_replay",
-            "deterministic carriage event replay changed its manifest; cached fields are "
-            "keyed by the planned manifest hash",
-            context={"stage": "carriage", "graph": graph_id, "channel": channel},
-        )
+        if [record.record() for record in records] != list(
+            plan[graph_id][channel]["records"]
+        ):
+            raise RuntimeError(
+                "deterministic carriage-event replay changed its manifest for "
+                f"graph={graph_id} channel={channel}; refusing misaligned results"
+            )
         contexts.append(
             {
                 "graph_id": graph_id,
@@ -1272,35 +1651,66 @@ def _carriage_graph_batch(
         carriers, width = int(h_clean.shape[-2]), int(h_clean.shape[-1])
         h_event = captured.final_state[1:].reshape(S, K, carriers, width)
         delta = h_clean[None, None, :, :] - h_event
-        event_f = functional_carriage_events(delta, clean.final_state)
+        functional_events = getattr(
+            prepared.backend, "functional_carriage_events", functional_carriage_events
+        )
+        event_f = functional_events(delta, clean.final_state)
         F = event_f.mean(dim=1).t().detach().cpu().numpy()
         integrated = None
         endpoint_replay_error = 0.0
         B = None
         if config.compute_beneficial_carriage:
-            carrier_weights = prepared.backend.carriage_weights(base, h_clean)
-            integrated = beneficial_carriage(
-                h_clean,
-                h_event,
-                prepared.backend.loss_from_pooled(clean.capture.target.reshape(1, -1)),
-                carrier_weights=carrier_weights,
-                atol=config.numerical.integrated_atol,
-                rtol=config.numerical.integrated_rtol,
-                max_intervals=config.numerical.integrated_max_intervals,
-                tolerance=max(
-                    config.numerical.integrated_atol * 5,
-                    config.numerical.reconstruction_tolerance,
-                ),
-            )
             target = clean.capture.target.reshape(1, -1)
-            replay_loss = prepared.backend.loss_from_pooled(target)
-            pooled_clean = project_final_states(h_clean.unsqueeze(0), carrier_weights)
-            pooled_event = project_final_states(
-                h_event.reshape(S * K, carriers, width), carrier_weights
+            state_loss_factory = getattr(
+                prepared.backend, "loss_from_states", None
             )
+            if callable(state_loss_factory):
+                replay_loss = state_loss_factory(base, target)
+                integrated = beneficial_carriage(
+                    h_clean,
+                    h_event,
+                    loss_from_states=replay_loss,
+                    atol=config.numerical.integrated_atol,
+                    rtol=config.numerical.integrated_rtol,
+                    max_intervals=config.numerical.integrated_max_intervals,
+                    tolerance=max(
+                        config.numerical.integrated_atol * 5,
+                        config.numerical.reconstruction_tolerance,
+                    ),
+                )
+                replay_clean_states = h_clean.unsqueeze(0)
+                replay_event_states = h_event.reshape(
+                    S * K, carriers, width
+                )
+                with torch.no_grad():
+                    replay_clean_loss = replay_loss(replay_clean_states)
+                    replay_event_loss = replay_loss(replay_event_states)
+            else:
+                carrier_weights = prepared.backend.carriage_weights(base, h_clean)
+                replay_loss = prepared.backend.loss_from_pooled(target)
+                integrated = beneficial_carriage(
+                    h_clean,
+                    h_event,
+                    replay_loss,
+                    carrier_weights=carrier_weights,
+                    atol=config.numerical.integrated_atol,
+                    rtol=config.numerical.integrated_rtol,
+                    max_intervals=config.numerical.integrated_max_intervals,
+                    tolerance=max(
+                        config.numerical.integrated_atol * 5,
+                        config.numerical.reconstruction_tolerance,
+                    ),
+                )
+                pooled_clean = project_final_states(
+                    h_clean.unsqueeze(0), carrier_weights
+                )
+                pooled_event = project_final_states(
+                    h_event.reshape(S * K, carriers, width), carrier_weights
+                )
+                with torch.no_grad():
+                    replay_clean_loss = replay_loss(pooled_clean)
+                    replay_event_loss = replay_loss(pooled_event)
             with torch.no_grad():
-                replay_clean_loss = replay_loss(pooled_clean)
-                replay_event_loss = replay_loss(pooled_event)
                 actual_clean_loss = prepared.backend.loss_per_graph(
                     captured.prediction[0:1], captured.target[0:1]
                 )
@@ -1324,13 +1734,17 @@ def _carriage_graph_batch(
             )
             B = integrated.field.detach().cpu().numpy()
         pristine = shortest_path_distances(base.edge_index, int(base.num_nodes))
-        distance = prepared.backend.carriage_distance_matrix(base, sources, pristine)
+        distance = prepared.backend.carriage_distance_matrix(
+            base, sources, pristine, channel=channel
+        )
         graph_field = {
             "sources": tuple(sources),
             "F_sens": F,
             "distance": distance,
             "carrier_kinds": tuple(
-                prepared.backend.carriage_carrier_kind(base, carrier)
+                prepared.backend.carriage_carrier_kind(
+                    base, carrier, channel=channel
+                )
                 for carrier in range(carriers)
             ),
             "event_F_sens": event_f.detach().cpu().numpy(),
@@ -1368,7 +1782,7 @@ def _carriage_graph_batch(
                             "carrier": carrier,
                             "distance": float(distance[carrier, source_position]),
                             "carrier_kind": prepared.backend.carriage_carrier_kind(
-                                base, carrier
+                                base, carrier, channel=channel
                             ),
                             "F_sens": float(
                                 event_f_np[source_position, donor, carrier]
@@ -1411,9 +1825,13 @@ def run_carriage(
     plan = dict(plan or _stage_plan(prepared, config, "carriage"))
     cache = _cache(prepared, config, plan)
     if config.resume and not config.force:
-        cached = cache.load("carriage", "fields")
+        cached = cache.load("carriage", "fields", strict=True)
         if cached is not None:
             log(f"[cache] loaded canonical carriage for {prepared.task.name}")
+            if prepared.progress is not None:
+                prepared.progress.emit(
+                    "cache_hit", phase="carriage", cache="consolidated"
+                )
             return cached
     output: dict[str, Any] = {
         "protocol_version": PROTOCOL_VERSION,
@@ -1421,9 +1839,32 @@ def run_carriage(
         "channels": {},
     }
     graph_ids = sorted(plan)
-    # Reuse the same clean z-space linearisation for both intervention channels.
+    cached_graphs: dict[str, dict[int, Any]] = {
+        channel: {} for channel in CHANNELS
+    }
+    missing_graphs: dict[str, list[int]] = {
+        channel: [] for channel in CHANNELS
+    }
+    for channel in CHANNELS:
+        for graph_id in graph_ids:
+            shard = (
+                cache.load(
+                    f"carriage/{channel}",
+                    f"graph_{int(graph_id):06d}",
+                    strict=True,
+                )
+                if config.resume and not config.force
+                else None
+            )
+            if shard is None:
+                missing_graphs[channel].append(int(graph_id))
+            else:
+                cached_graphs[channel][int(graph_id)] = shard
+    clean_needed = sorted(
+        set(missing_graphs["semantic"]) | set(missing_graphs["structural"])
+    )
     clean_by_graph, clean_execution = _prepare_clean_jacobians(
-        prepared, config, graph_ids
+        prepared, config, clean_needed
     )
     execution_reports: dict[str, Any] = {}
     for channel in CHANNELS:
@@ -1432,7 +1873,7 @@ def run_carriage(
         capped = 0
         paths = 0
 
-        def consume_carriage_batch(results):
+        def consume_carriage_batch(results, *, persist: bool = True):
             nonlocal capped, paths
             for result in results:
                 graph_id = int(result["graph_id"])
@@ -1440,9 +1881,19 @@ def run_carriage(
                 pair_rows.extend(result["pair_rows"])
                 paths += int(result["paths"])
                 capped += int(result["capped"])
+                if persist:
+                    cache.save(
+                        f"carriage/{channel}",
+                        f"graph_{graph_id:06d}",
+                        result,
+                    )
 
+        consume_carriage_batch(
+            [cached_graphs[channel][key] for key in sorted(cached_graphs[channel])],
+            persist=False,
+        )
         report = execute_graph_batches(
-            graph_ids,
+            missing_graphs[channel],
             graphs_per_batch=config.execution.graphs_per_batch,
             execute=lambda chunk: _carriage_graph_batch(
                 prepared,
@@ -1454,8 +1905,22 @@ def run_carriage(
             ),
             consume=consume_carriage_batch,
             oom_backoff=config.execution.oom_backoff,
+            item_cost=lambda graph_id: _event_item_cost(
+                prepared, config, plan, int(graph_id), channel
+            ),
+            max_cost=config.execution.replica_pair_budget,
+            on_batch=_progress_batch_callback(
+                prepared,
+                phase="carriage",
+                channel=channel,
+                cached=len(cached_graphs[channel]),
+            ),
         )
-        execution_reports[channel] = dataclasses.asdict(report)
+        execution_reports[channel] = {
+            **dataclasses.asdict(report),
+            "cache_hits": len(cached_graphs[channel]),
+            "cache_misses": len(missing_graphs[channel]),
+        }
         capped_fraction = float(capped / paths) if paths else 0.0
         if config.compute_beneficial_carriage:
             within_tolerance(
@@ -1479,7 +1944,11 @@ def run_carriage(
             graph_id: {
                 key: value
                 * (
-                    int(prepared.grit.eval_ds[int(graph_id)].num_nodes)
+                    _source_population_size(
+                        prepared,
+                        prepared.grit.eval_ds[int(graph_id)],
+                        channel,
+                    )
                     / len(field["sources"])
                 )
                 for key, value in additive_beneficial_mass(
@@ -1496,7 +1965,11 @@ def run_carriage(
         for graph_id, field in graph_fields.items():
             if not config.compute_beneficial_carriage:
                 continue
-            n = int(prepared.grit.eval_ds[int(graph_id)].num_nodes)
+            n = _source_population_size(
+                prepared,
+                prepared.grit.eval_ds[int(graph_id)],
+                channel,
+            )
             event_b = np.asarray(field["event_B"])
             distance = np.asarray(field["distance"])
             for source_position, source in enumerate(field["sources"]):
@@ -1537,7 +2010,10 @@ def run_carriage(
                         )
                     )
         additive_interval = (
-            nested_percentile_interval(additive_observations, config.bootstrap)
+            nested_percentile_interval(
+                additive_observations,
+                _channel_bootstrap_policy(prepared, config, plan, channel),
+            )
             if additive_observations
             else None
         )
@@ -1550,6 +2026,11 @@ def run_carriage(
             "capped_fraction": capped_fraction,
             "distance_bins": bins,
             "far_thresholds": far_thresholds,
+            "resample_source": bool(
+                _channel_bootstrap_policy(
+                    prepared, config, plan, channel
+                ).resample_source
+            ),
         }
         if additive_interval is not None:
             channel_output.update(
@@ -1689,7 +2170,12 @@ def _display_distance(
                 )
                 for row in channel_scores["events"]
             ],
-            config.bootstrap,
+            dataclasses.replace(
+                config.bootstrap,
+                resample_source=bool(
+                    channel_scores.get("resample_source", True)
+                ),
+            ),
             graph_reduce=distance_profile_reduce,
         )
     estimable = getattr(interval, "estimable_draws", None)
@@ -1761,6 +2247,7 @@ def _carriage_profile(
     config: MethodologyConfig,
     *,
     sum_within_event: bool = False,
+    bootstrap_policy: Any | None = None,
 ) -> tuple[list[str], np.ndarray, tuple[np.ndarray, np.ndarray]]:
     finite_distances = [int(row["distance"]) for row in rows if np.isfinite(row["distance"])]
     maximum = max(finite_distances, default=0)
@@ -1771,6 +2258,7 @@ def _carriage_profile(
             str(row.get("carrier_kind", "molecular_node"))
             for row in rows
             if str(row.get("carrier_kind", "molecular_node")) != "molecular_node"
+            and not np.isfinite(float(row["distance"]))
         }
     )
     labels.extend(kind.replace("_", " ") for kind in special_kinds)
@@ -1851,7 +2339,7 @@ def _carriage_profile(
 
         interval = nested_percentile_interval(
             observations,
-            config.bootstrap,
+            bootstrap_policy or config.bootstrap,
             graph_reduce=graph_reduce,
         )
         estimates.append(float(interval.estimate))
@@ -2120,15 +2608,28 @@ def make_figures(
             )
             saved[f"{channel}_distance_support"] = [str(path) for path in paths]
         if carriage is not None:
-            rows = carriage["channels"][channel]["pairs"]
+            carriage_channel = carriage["channels"][channel]
+            rows = carriage_channel["pairs"]
+            carriage_bootstrap = dataclasses.replace(
+                config.bootstrap,
+                resample_source=bool(
+                    carriage_channel.get("resample_source", True)
+                ),
+            )
             labels, functional, functional_interval = _carriage_profile(
-                rows, "F_sens", config
+                rows,
+                "F_sens",
+                config,
+                bootstrap_policy=carriage_bootstrap,
             )
             beneficial = None
             beneficial_interval = None
             if config.compute_beneficial_carriage:
                 _, beneficial, beneficial_interval = _carriage_profile(
-                    rows, "B", config
+                    rows,
+                    "B",
+                    config,
+                    bootstrap_policy=carriage_bootstrap,
                 )
             fig, axes = carriage_profiles(
                 labels,
@@ -2169,6 +2670,7 @@ def make_figures(
                 "F_sens_event_normalised",
                 config,
                 sum_within_event=True,
+                bootstrap_policy=carriage_bootstrap,
             )
             normalised_beneficial = None
             normalised_beneficial_interval = None
@@ -2182,6 +2684,7 @@ def make_figures(
                     "B_event_normalised",
                     config,
                     sum_within_event=True,
+                    bootstrap_policy=carriage_bootstrap,
                 )
             fig, axes = carriage_profiles(
                 normalised_labels,
@@ -2642,34 +3145,69 @@ def make_figures(
 def run_prepared(prepared: PreparedTask, config: MethodologyConfig) -> dict[str, Any]:
     set_strict(bool(config.strict_audits))
     key = f"{prepared.task.name}:seed{int(prepared.grit.sc.seed)}"
-    with audit_scope(key) as scope:
-        score_plan = _stage_plan(prepared, config, "scores")
-        scores = run_scores(prepared, config, plan=score_plan) if (
-            {"scores", "causal", "figures"} & set(config.phases)
-        ) else None
-        carriage = run_carriage(prepared, config) if "carriage" in config.phases else None
-        if carriage is None and "figures" in config.phases:
-            # Figure regeneration is cache-only for carriage. This keeps a causal/score figure
-            # pass from silently launching an expensive carriage analysis, and lets task
-            # frontends compute carriage only for preregistered seeds.
-            carriage_plan = _stage_plan(prepared, config, "carriage")
-            carriage = _cache(prepared, config, carriage_plan).load(
-                "carriage", "fields"
-            )
-        causal = None
-        if "causal" in config.phases:
-            from .validation import run_causal_validation
-
-            causal = run_causal_validation(prepared, config, scores)
-        elif "figures" in config.phases:
-            from .validation import load_cached_causal_validation
-
-            causal = load_cached_causal_validation(prepared, config, scores)
-        figures = (
-            make_figures(prepared, config, scores, carriage, causal)
-            if "figures" in config.phases
-            else None
+    if prepared.progress is not None:
+        prepared.progress.update(
+            task=prepared.task.name,
+            train_seed=int(prepared.grit.sc.seed),
         )
+        prepared.progress.start()
+        prepared.progress.emit("run_start", phases=list(config.phases))
+    try:
+        with audit_scope(key) as scope:
+            scores = None
+            if {"scores", "causal", "figures"} & set(config.phases):
+                context = (
+                    prepared.progress.component("scores")
+                    if prepared.progress is not None
+                    else nullcontext()
+                )
+                with context:
+                    score_plan = _stage_plan(prepared, config, "scores")
+                    scores = run_scores(prepared, config, plan=score_plan)
+            carriage = None
+            if "carriage" in config.phases:
+                context = (
+                    prepared.progress.component("carriage")
+                    if prepared.progress is not None
+                    else nullcontext()
+                )
+                with context:
+                    carriage = run_carriage(prepared, config)
+            if carriage is None and "figures" in config.phases:
+                carriage_plan = _stage_plan(prepared, config, "carriage")
+                carriage = _cache(prepared, config, carriage_plan).load(
+                    "carriage", "fields", strict=True
+                )
+            causal = None
+            if "causal" in config.phases:
+                from .validation import run_causal_validation
+
+                context = (
+                    prepared.progress.component("causal")
+                    if prepared.progress is not None
+                    else nullcontext()
+                )
+                with context:
+                    causal = run_causal_validation(prepared, config, scores)
+            elif "figures" in config.phases:
+                from .validation import load_cached_causal_validation
+
+                causal = load_cached_causal_validation(prepared, config, scores)
+            figures = None
+            if "figures" in config.phases:
+                context = (
+                    prepared.progress.component("figures")
+                    if prepared.progress is not None
+                    else nullcontext()
+                )
+                with context:
+                    figures = make_figures(
+                        prepared, config, scores, carriage, causal
+                    )
+    finally:
+        if prepared.progress is not None:
+            prepared.progress.emit("run_stop")
+            prepared.progress.close()
     findings = log_summary(scope, header=f"{key} analysis audits")
     atomic_json(
         prepared.output_dir / "audits.json",
@@ -2680,6 +3218,7 @@ def run_prepared(prepared: PreparedTask, config: MethodologyConfig) -> dict[str,
             "strict_audits": bool(config.strict_audits),
             "phases": list(config.phases),
             "findings": findings,
+            "headline_eligible": not bool(findings),
         },
     )
     return {
@@ -2691,6 +3230,7 @@ def run_prepared(prepared: PreparedTask, config: MethodologyConfig) -> dict[str,
         "causal": causal,
         "figures": figures,
         "audit_findings": findings,
+        "headline_eligible": not bool(findings),
     }
 
 
@@ -2718,6 +3258,20 @@ def run_methodology(
                 )
                 results[key] = run_prepared(prepared, config)
             run_findings[key] = scope.records()
+            results[key]["audit_findings"] = run_findings[key]
+            results[key]["headline_eligible"] = not bool(run_findings[key])
+            atomic_json(
+                Path(results[key]["output_dir"]) / "audits.json",
+                {
+                    "protocol_version": PROTOCOL_VERSION,
+                    "task": task_name,
+                    "train_seed": int(train_seed),
+                    "strict_audits": bool(config.strict_audits),
+                    "phases": list(config.phases),
+                    "findings": run_findings[key],
+                    "headline_eligible": not bool(run_findings[key]),
+                },
+            )
             del prepared
             gc.collect()
             try:
@@ -2837,6 +3391,7 @@ def run_methodology(
                     "output_dir": value["output_dir"],
                     "figures": value["figures"],
                     "audit_failures": len(run_findings.get(key, ())),
+                    "headline_eligible": bool(value["headline_eligible"]),
                 }
                 for key, value in results.items()
             },
@@ -2853,3 +3408,54 @@ def run_methodology(
             f"{', '.join(failed)}; see {config.root / 'audits.json'}"
         )
     return results
+
+
+def render_cached_figures(
+    config: MethodologyConfig,
+    task_name: str,
+    train_seed: int,
+) -> dict[str, list[str]]:
+    """Regenerate figures from CPU caches without loading a checkpoint or dataset."""
+
+    import json
+    from types import SimpleNamespace
+
+    output_dir = config.root / task_name / f"seed_{int(train_seed)}"
+    model_path = output_dir / "model.json"
+    if not model_path.exists():
+        raise FileNotFoundError(f"figures-only pass requires {model_path}")
+    model_record = json.loads(model_path.read_text(encoding="utf-8"))
+    geometry = model_record.get("model_geometry") or {}
+    if not geometry:
+        raise ValueError(
+            f"{model_path} has no model_geometry; rerun model preparation once"
+        )
+
+    def consolidated(stage: str, name: str, *, required: bool):
+        path = output_dir / "cache" / stage / f"{name}.pt"
+        if not path.exists():
+            if required:
+                raise FileNotFoundError(f"figures-only pass requires {path}")
+            return None
+        return load_cache_value_file(path)
+
+    scores = consolidated("scores", "raw", required=True)
+    carriage = consolidated("carriage", "fields", required=False)
+    causal = consolidated("causal", "validation", required=False)
+    prepared = PreparedTask(
+        task=get_task(task_name),
+        runtime=SimpleNamespace(
+            sc=SimpleNamespace(seed=int(train_seed)),
+            L=int(geometry["layers"]),
+            H=int(geometry["heads"]),
+        ),
+        backend=None,
+        output_dir=output_dir,
+        checkpoint=Path(str(model_record.get("checkpoint", "checkpoint"))),
+        checkpoint_sha=str(model_record["checkpoint_sha256"]),
+        sigma=np.asarray(model_record["sigma"], dtype=np.float64),
+        splits=None,
+        donor_pool=None,
+        progress=None,
+    )
+    return make_figures(prepared, config, scores, carriage, causal)

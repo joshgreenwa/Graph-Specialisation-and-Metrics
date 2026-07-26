@@ -434,19 +434,32 @@ class CanonicalGritBackend:
             raise ValueError(f"canonical carriage requires add/mean pooling, got {pooling!r}")
         return weights
 
-    def transport_distances(self, data: Any, source: int, pristine) -> list[Any]:
+    def transport_distances(
+        self, data: Any, source: int, pristine, *, channel: str | None = None
+    ) -> list[Any]:
+        del channel
         distances: list[Any] = list(pristine[int(source), :])
         if self.task.virtual_node:
             distances.append("virtual")
         return distances
 
-    def carriage_distance_matrix(self, data: Any, sources: Sequence[int], pristine):
+    def carriage_distance_matrix(
+        self,
+        data: Any,
+        sources: Sequence[int],
+        pristine,
+        *,
+        channel: str | None = None,
+    ):
+        del channel
         import numpy as np
 
         return pristine[np.asarray(sources, dtype=np.int64), :].T
 
-    def carriage_carrier_kind(self, data: Any, carrier: int) -> str:
-        del data, carrier
+    def carriage_carrier_kind(
+        self, data: Any, carrier: int, *, channel: str | None = None
+    ) -> str:
+        del data, carrier, channel
         return "molecular_node"
 
     def attention_normalization_error(self, data: Any) -> float:

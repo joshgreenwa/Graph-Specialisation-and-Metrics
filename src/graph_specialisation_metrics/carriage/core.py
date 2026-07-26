@@ -213,8 +213,9 @@ _G7_WEIGHTS = (
 def integrated_loss_carriage(
     h_clean,
     h_swap,
-    loss_from_pooled,
+    loss_from_pooled=None,
     *,
+    loss_from_states=None,
     pooling: str | None = None,
     carrier_weights=None,
     atol: float = 1e-5,
@@ -228,10 +229,9 @@ def integrated_loss_carriage(
     ``b[r,i] = integral_0^1 <d loss(H(alpha))/d h_i, h_clean_i-h_swap_i> d alpha``
 
     with ``H(alpha)=h_swap+alpha*(h_clean-h_swap)``.  The caller donor-averages
-    these *per-donor* paths afterwards.  Because the registered carrier projection
-    is linear (including add, mean, or graph-token selection), gradients are
-    evaluated through the smaller readout space and projected back onto every
-    carrier's ``delta h_i`` exactly.
+    these *per-donor* paths afterwards. A backend may register either a linear
+    carrier projection followed by ``loss_from_pooled`` or an exact nonlinear
+    ``loss_from_states`` readout.
 
     Adaptive embedded Gauss--Kronrod quadrature localises L1 and ReLU kinks.  A
     path is converged only when both (a) the L1 carrier refinement estimate and
@@ -242,6 +242,8 @@ def integrated_loss_carriage(
         h_clean / h_swap: ``[R,n,m]`` tensors at the input to the graph head.
         loss_from_pooled: differentiable callable mapping pooled states ``[Q,m]``
             to one scalar task loss per row, ``[Q]``.
+        loss_from_states: optional differentiable callable mapping complete states
+            ``[Q,n,m]`` to one scalar task loss per row. Pass exactly one loss callable.
         pooling: legacy ``"add"`` or ``"mean"`` shortcut.
         carrier_weights: optional registered linear readout projection. For
             Graphormer this is one at the graph token and zero at molecular nodes.
@@ -270,39 +272,50 @@ def integrated_loss_carriage(
     swap = h_swap.detach()
     R, n, _m = clean.shape
     delta_h = clean - swap
-    if carrier_weights is None:
-        if pooling not in ("add", "mean"):
-            raise ValueError(
-                "integrated carriage requires add/mean pooling or explicit carrier_weights"
-            )
-        weights = clean.new_ones(n)
-        if pooling == "mean":
-            weights /= float(n)
+    direct = loss_from_states is not None
+    if direct and loss_from_pooled is not None:
+        raise ValueError("pass loss_from_states or loss_from_pooled, not both")
+    if not direct and loss_from_pooled is None:
+        raise ValueError("one differentiable readout loss callable is required")
+    if direct:
+        weights = None
+        endpoint_clean = clean
+        endpoint_swap = swap
+        endpoint_delta = delta_h
     else:
-        weights = torch.as_tensor(
-            carrier_weights, device=clean.device, dtype=clean.dtype
-        ).reshape(-1)
-        if tuple(weights.shape) != (int(n),):
-            raise ValueError(
-                f"carrier_weights has shape {tuple(weights.shape)}; expected {(int(n),)}"
-            )
-        if not torch.isfinite(weights).all():
-            raise ValueError("carrier_weights must be finite")
-    p_clean = project_final_states(clean, weights)
-    p_swap = project_final_states(swap, weights)
-    delta_p = p_clean - p_swap
+        if carrier_weights is None:
+            if pooling not in ("add", "mean"):
+                raise ValueError(
+                    "integrated carriage requires add/mean pooling or explicit carrier_weights"
+                )
+            weights = clean.new_ones(n)
+            if pooling == "mean":
+                weights /= float(n)
+        else:
+            weights = torch.as_tensor(
+                carrier_weights, device=clean.device, dtype=clean.dtype
+            ).reshape(-1)
+            if tuple(weights.shape) != (int(n),):
+                raise ValueError(
+                    f"carrier_weights has shape {tuple(weights.shape)}; expected {(int(n),)}"
+                )
+            if not torch.isfinite(weights).all():
+                raise ValueError("carrier_weights must be finite")
+        endpoint_clean = project_final_states(clean, weights)
+        endpoint_swap = project_final_states(swap, weights)
+        endpoint_delta = endpoint_clean - endpoint_swap
 
-    def _loss(p):
-        out = loss_from_pooled(p)
-        if out.ndim != 1 or int(out.shape[0]) != int(p.shape[0]):
+    def _loss(value):
+        out = loss_from_states(value) if direct else loss_from_pooled(value)
+        if out.ndim != 1 or int(out.shape[0]) != int(value.shape[0]):
             raise ValueError(
-                "loss_from_pooled must return one scalar per row: "
-                f"input {tuple(p.shape)} -> output {tuple(out.shape)}"
+                "readout loss must return one scalar per row: "
+                f"input {tuple(value.shape)} -> output {tuple(out.shape)}"
             )
         return out
 
     with torch.no_grad():
-        loss_delta = (_loss(p_clean) - _loss(p_swap)).detach()
+        loss_delta = (_loss(endpoint_clean) - _loss(endpoint_swap)).detach()
 
     nodes = torch.as_tensor(_GK15_NODES, device=clean.device, dtype=clean.dtype)
     wk = torch.as_tensor(_GK15_WEIGHTS, device=clean.device, dtype=clean.dtype)
@@ -317,17 +330,41 @@ def integrated_loss_carriage(
         half = (right_t - left_t) * 0.5
         alpha = centre[:, None] + half[:, None] * nodes[None, :]
         with torch.enable_grad():
-            path_p = (
-                p_swap[replica, None, :]
-                + alpha[:, :, None] * delta_p[replica, None, :]
-            ).reshape(-1, p_clean.shape[-1]).detach().requires_grad_(True)
-            losses = _loss(path_p)
-            grad = torch.autograd.grad(losses.sum(), path_p, create_graph=False)[0]
-        grad = grad.reshape(replica.numel(), nodes.numel(), p_clean.shape[-1])
-        a_k = half[:, None] * torch.einsum("q,rqm->rm", wk, grad)
-        a_g = half[:, None] * torch.einsum("q,rqm->rm", wg, grad)
-        b_k = weights[None, :] * torch.einsum("rnm,rm->rn", delta_h[replica], a_k)
-        b_g = weights[None, :] * torch.einsum("rnm,rm->rn", delta_h[replica], a_g)
+            if direct:
+                path_value = (
+                    endpoint_swap[replica, None, :, :]
+                    + alpha[:, :, None, None]
+                    * endpoint_delta[replica, None, :, :]
+                ).reshape(-1, n, clean.shape[-1]).detach().requires_grad_(True)
+            else:
+                path_value = (
+                    endpoint_swap[replica, None, :]
+                    + alpha[:, :, None] * endpoint_delta[replica, None, :]
+                ).reshape(-1, endpoint_clean.shape[-1]).detach().requires_grad_(True)
+            losses = _loss(path_value)
+            grad = torch.autograd.grad(
+                losses.sum(), path_value, create_graph=False
+            )[0]
+        if direct:
+            grad = grad.reshape(
+                replica.numel(), nodes.numel(), n, clean.shape[-1]
+            )
+            a_k = half[:, None, None] * torch.einsum("q,rqnm->rnm", wk, grad)
+            a_g = half[:, None, None] * torch.einsum("q,rqnm->rnm", wg, grad)
+            b_k = torch.einsum("rnm,rnm->rn", delta_h[replica], a_k)
+            b_g = torch.einsum("rnm,rnm->rn", delta_h[replica], a_g)
+        else:
+            grad = grad.reshape(
+                replica.numel(), nodes.numel(), endpoint_clean.shape[-1]
+            )
+            a_k = half[:, None] * torch.einsum("q,rqm->rm", wk, grad)
+            a_g = half[:, None] * torch.einsum("q,rqm->rm", wg, grad)
+            b_k = weights[None, :] * torch.einsum(
+                "rnm,rm->rn", delta_h[replica], a_k
+            )
+            b_g = weights[None, :] * torch.einsum(
+                "rnm,rm->rn", delta_h[replica], a_g
+            )
         error = (b_k - b_g).abs().sum(dim=-1)
         return b_k.detach(), error.detach()
 

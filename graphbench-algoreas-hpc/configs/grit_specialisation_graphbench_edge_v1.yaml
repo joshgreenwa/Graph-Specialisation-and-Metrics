@@ -1,0 +1,43 @@
+protocol: donor-swap-specialisation-carriage-v3
+extension: graphbench-edge-semantic-v1
+tasks:
+  - graphbench_bipartite_matching_hard
+  - graphbench_flow_hard
+model: grit
+seeds: [0, 1, 2]
+split:
+  primary_analysis: val
+  donor: train
+sizes:
+  discovery_graphs: 64
+  causal_graphs: 32
+  clean_ablation_graphs: 96
+  semantic_donor_graphs: 2000
+  sources_per_graph: 16
+  donors_per_source: 8
+  bootstrap_replicates: 2000
+sources:
+  semantic:
+    unit: edge
+    flow: ordered_directed_edge
+    bipartite_matching: reciprocal_edge_unit_when_present
+    donor_matching: minimum_endpoint_degree_signature_l1_gap
+  structural:
+    unit: node
+    intervention: fixed_topology_rrwp_row_column_self_copy
+  uncertainty: graph_paired_channel_source_independent
+execution:
+  graphs_per_batch: 4
+  replica_pair_budget: 200000
+  jacobian_output_chunk: 8
+  oom_backoff: true
+  progress_heartbeat_seconds: 30
+audits:
+  strict: false
+  scientific_numerical_failures: record_warn_continue
+  alignment_or_corruption_failures: raise
+cache:
+  consolidated: true
+  per_graph_score_and_carriage_shards: true
+  per_target_causal_shards: true
+  atomic_writes: true

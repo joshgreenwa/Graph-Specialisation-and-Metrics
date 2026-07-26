@@ -63,8 +63,9 @@ class BeneficialResult:
 def beneficial_carriage(
     h_clean,
     h_event,
-    loss_from_pooled,
+    loss_from_pooled=None,
     *,
+    loss_from_states=None,
     pooling: str | None = None,
     carrier_weights=None,
     atol: float,
@@ -87,6 +88,7 @@ def beneficial_carriage(
         clean,
         event,
         loss_from_pooled,
+        loss_from_states=loss_from_states,
         pooling=pooling,
         carrier_weights=carrier_weights,
         atol=float(atol),

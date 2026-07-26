@@ -164,3 +164,28 @@ class CanonicalCache:
             },
         )
         return path
+
+
+def load_cache_value_file(path: str | Path) -> Any:
+    """Load a consolidated cache for a model-free figures-only pass."""
+
+    import torch
+
+    resolved = Path(path)
+    try:
+        payload = torch.load(resolved, map_location="cpu", weights_only=False)
+    except (OSError, RuntimeError, EOFError) as error:
+        raise StaleCacheError(f"unreadable cache {resolved}") from error
+    if (
+        not isinstance(payload, Mapping)
+        or "metadata" not in payload
+        or "value" not in payload
+    ):
+        raise StaleCacheError(f"cache payload is malformed: {resolved}")
+    metadata = payload["metadata"]
+    if metadata.get("protocol_version") != PROTOCOL_VERSION:
+        raise StaleCacheError(
+            f"{resolved} uses protocol {metadata.get('protocol_version')!r}; "
+            f"expected {PROTOCOL_VERSION!r}"
+        )
+    return payload["value"]

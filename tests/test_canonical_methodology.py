@@ -184,6 +184,9 @@ def test_numerical_audits_are_soft_by_default_and_strict_on_request():
     assert config.record()["execution"] == {
         "graphs_per_batch": 4,
         "oom_backoff": True,
+        "replica_pair_budget": None,
+        "jacobian_output_chunk": 8,
+        "progress_heartbeat_seconds": 30.0,
     }
 
     with audit_scope("test") as scope:
@@ -236,6 +239,22 @@ def test_graph_batch_executor_preserves_order_and_retries_without_double_consump
     assert report.maximum_graphs_per_batch == 2
     assert report.successful_batches == 4
     assert report.oom_retries == 3
+
+
+def test_graph_batch_executor_respects_backend_cost_budget():
+    batches = []
+    report = execute_graph_batches(
+        [3, 4, 5, 6],
+        graphs_per_batch=4,
+        execute=lambda chunk: list(chunk),
+        consume=lambda rows: batches.append(tuple(rows)),
+        oom_backoff=True,
+        item_cost=lambda value: value,
+        max_cost=9,
+    )
+
+    assert batches == [(3, 4), (5,), (6,)]
+    assert report.maximum_graphs_per_batch == 2
 
 
 def test_graph_batch_executor_does_not_hide_non_oom_errors():

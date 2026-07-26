@@ -156,6 +156,113 @@ def nested_percentile_interval(
     )
 
 
+def paired_channel_percentile_interval(
+    left: Sequence[Observation],
+    right: Sequence[Observation],
+    policy: BootstrapPolicy,
+    *,
+    transform: Callable[[np.ndarray], np.ndarray],
+    resample_source: tuple[bool, bool] = (True, True),
+) -> Interval:
+    """Graph-paired bootstrap for channels with different source domains.
+
+    The same graph draw is used for both channels, but each channel independently resamples its
+    own sources and donors inside that graph. This is the correct extension for an edge-semantic
+    channel paired with a node-structural channel; integer source IDs are never falsely matched.
+    """
+
+    policy.validate()
+    if not left or not right:
+        raise ValueError("both channels require observations")
+    by_channel = []
+    for observations in (left, right):
+        by_graph: dict[int, list[Observation]] = {}
+        for row in observations:
+            by_graph.setdefault(int(row.graph), []).append(row)
+        by_channel.append(by_graph)
+    graphs = sorted(set(by_channel[0]) & set(by_channel[1]))
+    if not graphs:
+        raise ValueError("channels share no graph IDs")
+
+    def channel_graph_estimate(
+        rows: Sequence[Observation],
+        rng: np.random.Generator | None,
+        *,
+        resample_sources: bool,
+    ) -> np.ndarray:
+        by_source: dict[int, list[Observation]] = {}
+        for row in rows:
+            by_source.setdefault(int(row.source), []).append(row)
+        source_keys = sorted(by_source)
+        selected_sources = (
+            _choice(source_keys, rng, resample_sources)
+            if rng is not None
+            else source_keys
+        )
+        values = []
+        for source in selected_sources:
+            source_rows = by_source[source]
+            donor_indices = list(range(len(source_rows)))
+            selected_donors = (
+                _choice(donor_indices, rng, policy.resample_donor)
+                if rng is not None
+                else donor_indices
+            )
+            values.append(
+                np.mean(
+                    np.stack(
+                        [
+                            np.asarray(source_rows[index].value, dtype=np.float64)
+                            for index in selected_donors
+                        ]
+                    ),
+                    axis=0,
+                )
+            )
+        return np.mean(np.stack(values), axis=0)
+
+    def estimate(rng: np.random.Generator | None) -> np.ndarray:
+        selected_graphs = (
+            _choice(graphs, rng, policy.resample_graph)
+            if rng is not None
+            else graphs
+        )
+        channel_values = []
+        for channel in range(2):
+            graph_values = [
+                channel_graph_estimate(
+                    by_channel[channel][graph],
+                    rng,
+                    resample_sources=(
+                        bool(resample_source[channel]) and policy.resample_source
+                    ),
+                )
+                for graph in selected_graphs
+            ]
+            channel_values.append(np.mean(np.stack(graph_values), axis=0))
+        return transform(np.stack(channel_values))
+
+    point = estimate(None)
+    rng = np.random.default_rng(int(policy.rng_seed))
+    draws = np.stack([estimate(rng) for _ in range(int(policy.replicates))])
+    alpha = (1.0 - float(policy.confidence)) / 2.0
+    low, high, estimable = _percentiles(draws, alpha)
+    levels = ["graph"]
+    if any(resample_source) and policy.resample_source:
+        levels.append("source(channel-independent)")
+    if policy.resample_donor:
+        levels.append("donor(channel-independent)")
+    return Interval(
+        estimate=point,
+        low=low,
+        high=high,
+        replicates=int(policy.replicates),
+        rng_seed=int(policy.rng_seed),
+        resampled_levels=tuple(levels),
+        estimable_draws=estimable,
+    )
+
+
 def _percentiles(
     draws: np.ndarray, alpha: float
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
