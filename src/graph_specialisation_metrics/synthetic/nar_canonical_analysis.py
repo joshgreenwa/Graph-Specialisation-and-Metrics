@@ -1526,7 +1526,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--semantic-donor-graphs", type=int, default=256)
     parser.add_argument("--source-nodes-per-graph", type=int, default=2)
     parser.add_argument("--donors-per-source", type=int, default=8)
-    parser.add_argument("--graphs-per-batch", type=int, default=8)
+    parser.add_argument(
+        "--graphs-per-batch",
+        type=int,
+        default=48,
+        help="initial batch size; CUDA OOM automatically halves only the failing batch",
+    )
     parser.add_argument("--analysis-seed", type=int, default=31_415)
     parser.add_argument("--bootstrap-seed", type=int, default=17_071)
     parser.add_argument("--activity-floor", type=float, default=0.20)

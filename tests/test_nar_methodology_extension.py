@@ -18,6 +18,7 @@ from graph_specialisation_metrics.synthetic.nar_methodology_extension import (
     ExtensionContract,
     ExtensionStore,
     _safe_extension_layout,
+    build_parser,
     counterfactual_estimand,
     freeze_role_families,
     role_coordinates,
@@ -198,3 +199,11 @@ def test_read_only_artifact_loader_accepts_old_repository_provenance_but_checks_
     torch.save(payload, path)
     with pytest.raises(StaleCacheError, match="internally inconsistent"):
         load_cache_artifact_file(path)
+
+
+def test_extension_defaults_use_large_stage_specific_batches():
+    args = build_parser().parse_args([])
+
+    assert args.score_graphs_per_batch == 48
+    assert args.counterfactual_graphs_per_batch == 48
+    assert args.graphs_per_batch is None

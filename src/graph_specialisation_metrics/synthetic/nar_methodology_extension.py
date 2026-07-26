@@ -1343,17 +1343,16 @@ def run_counterfactual_cell(
     )
     rows: list[dict[str, Any]] = []
     graph_ids = sorted(plan)
-    for start in range(0, len(graph_ids), int(graphs_per_batch)):
-        chunk = graph_ids[start : start + int(graphs_per_batch)]
-        missing: list[int] = []
-        for graph_id in chunk:
-            shard = store.load(contract, f"graph_{int(graph_id):06d}")
-            if shard is None:
-                missing.append(int(graph_id))
-            else:
-                rows.extend(shard["rows"])
-        if not missing:
-            continue
+    missing_graph_ids: list[int] = []
+    for graph_id in graph_ids:
+        shard = store.load(contract, f"graph_{int(graph_id):06d}")
+        if shard is None:
+            missing_graph_ids.append(int(graph_id))
+        else:
+            rows.extend(shard["rows"])
+
+    def execute_chunk(chunk: Sequence[int]) -> dict[int, dict[str, Any]]:
+        missing = [int(graph_id) for graph_id in chunk]
         groups = [
             [runtime.eval_ds[graph_id], *variants[graph_id]]
             for graph_id in missing
@@ -1494,25 +1493,68 @@ def run_counterfactual_cell(
                         ),
                     }
                 )
+        result: dict[int, dict[str, Any]] = {}
         for graph_id in missing:
             selected = [
                 row for row in all_rows if int(row["graph_id"]) == int(graph_id)
             ]
+            result[int(graph_id)] = {
+                "manifest": plan[graph_id],
+                "rows": selected,
+            }
+        return result
+
+    def consume_chunk(result: Mapping[int, Mapping[str, Any]]) -> None:
+        for graph_id in sorted(result):
+            shard = result[graph_id]
             store.save(
                 contract,
                 f"graph_{int(graph_id):06d}",
-                {
-                    "manifest": plan[graph_id],
-                    "rows": selected,
-                },
+                dict(shard),
             )
-            rows.extend(selected)
+            rows.extend(shard["rows"])
+
+    def report_batch(cursor: int, total: int, batch_size: int) -> None:
+        memory = ""
+        try:
+            if torch.cuda.is_available():
+                memory = (
+                    f" | CUDA peak={torch.cuda.max_memory_allocated() / 2**30:.2f} GiB"
+                    f", reserved={torch.cuda.memory_reserved() / 2**30:.2f} GiB"
+                )
+        except (NameError, RuntimeError):
+            pass
         print(
             f"[counterfactual] {binding.task}:seed{binding.seed} "
-            f"graphs {start + 1}-{min(start + len(chunk), len(graph_ids))}/"
-            f"{len(graph_ids)}",
+            f"completed {cursor}/{total} missing graphs (batch={batch_size}){memory}",
             flush=True,
         )
+    if missing_graph_ids:
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                torch.cuda.reset_peak_memory_stats()
+        except (ImportError, RuntimeError):
+            pass
+    from ..methodology.execution import execute_graph_batches
+
+    execution_report = execute_graph_batches(
+        missing_graph_ids,
+        graphs_per_batch=int(graphs_per_batch),
+        execute=execute_chunk,
+        consume=consume_chunk,
+        oom_backoff=True,
+        on_batch=report_batch,
+    )
+    rows.sort(
+        key=lambda row: (
+            int(row["graph_id"]),
+            str(row["role"]),
+            int(row["draw"]),
+            str(row["family"]),
+        )
+    )
     output = {
         "extension_version": EXTENSION_VERSION,
         "task": binding.task,
@@ -1531,6 +1573,8 @@ def run_counterfactual_cell(
         "rows": rows,
         "graphs": len(graph_ids),
         "donors_per_role": int(donors_per_role),
+        "execution": dataclasses.asdict(execution_report),
+        "cache_hits": len(graph_ids) - len(missing_graph_ids),
     }
     store.save(contract, "results", output)
     return output
@@ -2788,7 +2832,24 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--analysis-width", type=int, default=128)
     parser.add_argument("--counterfactual-donors-per-role", type=int, default=8)
     parser.add_argument("--accuracy-gate", type=float, default=0.85)
-    parser.add_argument("--graphs-per-batch", type=int, default=8)
+    parser.add_argument(
+        "--score-graphs-per-batch",
+        type=int,
+        default=48,
+        help="initial score batch; CUDA OOM automatically halves only the failing batch",
+    )
+    parser.add_argument(
+        "--counterfactual-graphs-per-batch",
+        type=int,
+        default=48,
+        help="initial counterfactual batch; CUDA OOM automatically halves and resumes",
+    )
+    parser.add_argument(
+        "--graphs-per-batch",
+        type=int,
+        default=None,
+        help="deprecated compatibility alias overriding both stage-specific batch sizes",
+    )
     parser.add_argument("--accelerator", default="cuda:0")
     parser.add_argument("--num-threads", type=int, default=4)
     parser.add_argument("--grit-dir", default="/content/GRIT")
@@ -2828,6 +2889,18 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     transition_ns = _parse_csv_ints(args.transition_ns)
     counterfactual_ns = _parse_csv_ints(args.counterfactual_ns)
     performance_ns = _parse_csv_ints(args.all_performance_ns)
+    score_graphs_per_batch = int(
+        args.graphs_per_batch
+        if args.graphs_per_batch is not None
+        else args.score_graphs_per_batch
+    )
+    counterfactual_graphs_per_batch = int(
+        args.graphs_per_batch
+        if args.graphs_per_batch is not None
+        else args.counterfactual_graphs_per_batch
+    )
+    if score_graphs_per_batch < 1 or counterfactual_graphs_per_batch < 1:
+        raise ValueError("stage batch sizes must be positive")
     if any(model not in MODEL_ORDER for model in models):
         raise ValueError(f"models must be drawn from {MODEL_ORDER}")
     if len(seeds) != 3 and not args.fast_dev_run:
@@ -2883,7 +2956,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 seeds=seeds,
                 width=int(args.analysis_width),
                 accelerator=str(args.accelerator),
-                graphs_per_batch=int(args.graphs_per_batch),
+                graphs_per_batch=score_graphs_per_batch,
                 num_threads=int(args.num_threads),
             )
         if args.phase == "transition_scores":
@@ -2926,7 +2999,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             analysis_seed=analysis_seed,
             accelerator=str(args.accelerator),
             donors_per_role=int(args.counterfactual_donors_per_role),
-            graphs_per_batch=int(args.graphs_per_batch),
+            graphs_per_batch=counterfactual_graphs_per_batch,
             accuracy_gate=float(args.accuracy_gate),
             role_results=(
                 None
@@ -2988,6 +3061,13 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "counterfactual_donors_per_role": int(
                 args.counterfactual_donors_per_role
             ),
+            "execution": {
+                "score_graphs_per_batch_initial": score_graphs_per_batch,
+                "counterfactual_graphs_per_batch_initial": (
+                    counterfactual_graphs_per_batch
+                ),
+                "cuda_oom_backoff": True,
+            },
             "figures": [
                 ROLE_FIGURE_STEM,
                 COUNTERFACTUAL_FIGURE_STEM,

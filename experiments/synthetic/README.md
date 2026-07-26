@@ -75,6 +75,13 @@ python -m graph_specialisation_metrics.synthetic.nar_methodology_extension \
   --counterfactual-ns 4,8,16
 ```
 
+Both score and counterfactual inference start at 48 base graphs per batch. CUDA OOM handling
+automatically halves only a failing batch and continues from immutable graph shards. The runtime
+controls are independently configurable with `--score-graphs-per-batch` and
+`--counterfactual-graphs-per-batch`; changing them does not change the scientific cache contract.
+Low host-RAM use is expected because NAR graphs are generated lazily and model activations live on
+the accelerator.
+
 ## MarkedTreePath
 
 `training/marked_tree_path_graphgps.py` trains small GraphGPS-style baselines on

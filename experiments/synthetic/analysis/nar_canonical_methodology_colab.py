@@ -154,7 +154,7 @@ CELL_ARGS = [
     "--donors-per-source",
     "8",
     "--graphs-per-batch",
-    "8",
+    "48",
     "--analysis-seed",
     "31415",
     "--bootstrap-seed",
