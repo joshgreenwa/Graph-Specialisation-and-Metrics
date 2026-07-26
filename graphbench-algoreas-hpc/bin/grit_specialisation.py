@@ -121,9 +121,9 @@ def parser() -> argparse.ArgumentParser:
         default=REPOSITORY_ROOT / "graphbench-algoreas-hpc" / "bin" / "algoreas_hpc.py",
     )
     value.add_argument("--accelerator", default="cuda:0")
-    value.add_argument("--graphs-per-batch", type=int, default=4)
-    value.add_argument("--replica-pair-budget", type=int, default=200_000)
-    value.add_argument("--jacobian-output-chunk", type=int, default=8)
+    value.add_argument("--graphs-per-batch", type=int, default=32)
+    value.add_argument("--replica-pair-budget", type=int, default=2_000_000)
+    value.add_argument("--jacobian-output-chunk", type=int, default=64)
     value.add_argument("--progress-heartbeat-seconds", type=float, default=30.0)
     value.add_argument("--analysis-seed", type=int, default=31_415)
     value.add_argument("--strict-audits", action="store_true")

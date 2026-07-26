@@ -56,10 +56,11 @@ def execute_graph_batches(
         raise ValueError("graphs_per_batch must be positive")
     values = list(items)
     cursor = 0
+    adaptive_limit = requested
     successful_sizes: list[int] = []
     retries = 0
     while cursor < len(values):
-        size = min(requested, len(values) - cursor)
+        size = min(adaptive_limit, len(values) - cursor)
         if item_cost is not None and max_cost is not None:
             while size > 1 and sum(
                 max(1, int(item_cost(value)))
@@ -75,6 +76,7 @@ def execute_graph_batches(
                     raise
                 retries += 1
                 size = max(1, size // 2)
+                adaptive_limit = min(adaptive_limit, size)
                 del error
                 _clear_cuda_cache()
                 continue

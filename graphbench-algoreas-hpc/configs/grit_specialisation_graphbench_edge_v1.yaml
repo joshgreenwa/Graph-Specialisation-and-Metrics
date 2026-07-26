@@ -27,9 +27,9 @@ sources:
     intervention: fixed_topology_rrwp_row_column_self_copy
   uncertainty: graph_paired_channel_source_independent
 execution:
-  graphs_per_batch: 4
-  replica_pair_budget: 200000
-  jacobian_output_chunk: 8
+  graphs_per_batch: 32
+  replica_pair_budget: 2000000
+  jacobian_output_chunk: 64
   oom_backoff: true
   progress_heartbeat_seconds: 30
 audits:

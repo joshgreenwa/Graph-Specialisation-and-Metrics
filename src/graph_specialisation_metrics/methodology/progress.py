@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
 import threading
 import time
 from contextlib import contextmanager
@@ -43,7 +45,47 @@ class ProgressJournal:
             pass
         return {}
 
+    def _gpu_device_telemetry(self) -> dict[str, float]:
+        """Sample device-wide utilization without adding overhead to every event."""
+
+        visible = os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",")[0].strip()
+        command = [
+            "nvidia-smi",
+            "--query-gpu=utilization.gpu,memory.used,memory.total,power.draw",
+            "--format=csv,noheader,nounits",
+        ]
+        if visible:
+            command.extend(("--id", visible))
+        try:
+            output = subprocess.check_output(
+                command,
+                text=True,
+                stderr=subprocess.DEVNULL,
+                timeout=5,
+            )
+            values = [
+                float(value.strip())
+                for value in output.strip().splitlines()[0].split(",")
+            ]
+            return {
+                "gpu_utilization_percent": values[0],
+                "gpu_memory_used_gb": values[1] / 1_000.0,
+                "gpu_memory_total_gb": values[2] / 1_000.0,
+                "gpu_power_watts": values[3],
+            }
+        except (
+            FileNotFoundError,
+            IndexError,
+            OSError,
+            subprocess.SubprocessError,
+            ValueError,
+        ):
+            return {}
+
     def emit(self, event: str, *, message: str | None = None, **values: Any) -> None:
+        device_telemetry = (
+            self._gpu_device_telemetry() if event == "heartbeat" else {}
+        )
         record = {
             "time_unix": time.time(),
             "elapsed_seconds": time.monotonic() - self.started,
@@ -51,6 +93,7 @@ class ProgressJournal:
             **self._state,
             **values,
             **self._cuda_memory(),
+            **device_telemetry,
         }
         rendered = message or " ".join(
             f"{key}={value}"
@@ -63,11 +106,24 @@ class ProgressJournal:
                 "cuda_allocated_gb",
                 "cuda_reserved_gb",
                 "cuda_peak_gb",
+                "gpu_utilization_percent",
+                "gpu_memory_used_gb",
+                "gpu_memory_total_gb",
+                "gpu_power_watts",
             }
         )
+        gpu_suffix = ""
+        if "gpu_utilization_percent" in record:
+            gpu_suffix = (
+                f" gpu={record['gpu_utilization_percent']:.0f}%"
+                f" vram={record['gpu_memory_used_gb']:.1f}/"
+                f"{record['gpu_memory_total_gb']:.1f}GB"
+                f" power={record['gpu_power_watts']:.0f}W"
+            )
         log(
             f"[progress] {event}"
             + (f" {rendered}" if rendered else "")
+            + gpu_suffix
             + f" elapsed={record['elapsed_seconds']:.1f}s"
         )
         with self._lock:
@@ -125,4 +181,3 @@ class ProgressJournal:
         finally:
             with self._lock:
                 self._state = previous
-

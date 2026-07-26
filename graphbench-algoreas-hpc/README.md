@@ -194,6 +194,12 @@ channel, 8 donors per source, and 2,000 bootstrap draws. All 16 structural node 
 enumerated on the primary `n=16` validation split, so structural-source resampling is disabled;
 semantic edge sources are sampled when more than 16 are eligible.
 
+The production GPU envelope requests 32 base graphs per forward, allows up to 2,000,000
+`replicas * nodes^2` units in an event batch, and computes matching-output VJPs in chunks of 64.
+Graph batches halve and retain the smaller size after a CUDA OOM. Heartbeats record process
+allocated/reserved/peak CUDA memory plus device utilization, total VRAM use, and power from
+`nvidia-smi`; these execution settings do not alter the scientific fingerprint.
+
 Run all models sequentially in one process:
 
 ```bash
@@ -221,6 +227,8 @@ GPU allocation permits four simultaneous seeds per task; the recorded `gpu1` wor
 `afterok` CPU job verifies that all eight cache contracts came from the same scientific
 configuration and repository commit, renders every seed's figures, then writes both
 `population.json` files and the root `protocol.json`, `audits.json`, and `index.json`.
+Each GPU array element requests four hours; interrupted runs resume from their completed atomic
+graph and target shards.
 
 Every long component writes atomic graph/target shards and a consolidated cache. Re-running the
 same command resumes missing work. `progress.jsonl` and stdout include the active

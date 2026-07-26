@@ -119,7 +119,9 @@ all head and family targets.
 `ExecutionPolicy.replica_pair_budget` can additionally cap an approximate
 `replicas * nodes^2` batch cost, and matching-output Jacobians use
 `jacobian_output_chunk` batched VJPs. These controls, OOM backoff, and heartbeat frequency are
-execution-only and never enter the scientific fingerprint.
+execution-only and never enter the scientific fingerprint. After an OOM, subsequent batches retain
+the successful smaller graph count instead of repeatedly retrying an oversized batch. GraphBench
+heartbeats additionally sample device-wide utilization, VRAM use, and power through `nvidia-smi`.
 
 Independent HPC processes should call `run_worker` with the same complete multi-task/multi-seed
 configuration and one selected task/seed. A worker writes only its `seed_<training-seed>` subtree;

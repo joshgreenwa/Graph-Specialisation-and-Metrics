@@ -5,7 +5,7 @@
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=128G
-#SBATCH --time=36:00:00
+#SBATCH --time=04:00:00
 #SBATCH --array=0-3%1
 #SBATCH --output=logs/%x-%A-%a.out
 #SBATCH --error=logs/%x-%A-%a.err
@@ -25,6 +25,8 @@ if [[ -n "${ENV_ACTIVATE:-}" ]]; then
   # shellcheck disable=SC1090
   source "${ENV_ACTIVATE}"
 fi
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-8}"
+export MKL_NUM_THREADS="${MKL_NUM_THREADS:-8}"
 
 ANALYSIS_TASK="${ANALYSIS_TASK:?Set ANALYSIS_TASK to bipartite_matching_hard or flow_hard}"
 case "${ANALYSIS_TASK}" in
@@ -53,4 +55,7 @@ python graphbench-algoreas-hpc/bin/grit_specialisation.py \
   --pe-cache-root "${GRAPHBENCH_PE_CACHE_ROOT}" \
   --pe-cache-namespace base_40k4k4k_n64 \
   --accelerator cuda:0 \
+  --graphs-per-batch "${GRAPHS_PER_BATCH:-32}" \
+  --replica-pair-budget "${REPLICA_PAIR_BUDGET:-2000000}" \
+  --jacobian-output-chunk "${JACOBIAN_OUTPUT_CHUNK:-64}" \
   "$@"

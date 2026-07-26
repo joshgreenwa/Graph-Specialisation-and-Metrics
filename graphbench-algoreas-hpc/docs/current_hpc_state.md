@@ -310,7 +310,11 @@ The launcher submits separate `0-3` arrays for matching and flow, then one CPU f
 workflow. If the allocation permits concurrent jobs, set `MAX_PARALLEL=2` or `4`; this cap applies
 to each task array, and the scheduler still enforces account-wide limits. Every submission
 explicitly requests `--nodes=1 --ntasks=1 --gres=gpu:1`, as required by the Cambridge site
-wrapper; the `ampere` partition selects the GPU class.
+wrapper; the `ampere` partition selects the GPU class. Each seed worker requests four hours and
+can be resubmitted against the same contract-bound output root to resume completed shards.
+Production workers use 32 base graphs per batch, a 2,000,000 dense-replica budget, and
+64-output matching VJPs. CUDA OOM automatically halves graph batches and keeps the stable smaller
+size. `progress.jsonl` and heartbeat log lines expose utilization, VRAM, and power for live tuning.
 
 Monitor the three job IDs printed by the launcher:
 

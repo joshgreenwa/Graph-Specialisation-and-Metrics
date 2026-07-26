@@ -228,17 +228,15 @@ def test_graph_batch_executor_preserves_order_and_retries_without_double_consump
     assert attempts == [
         (0, 1, 2, 3),
         (0, 1),
-        (2, 3, 4, 5),
         (2, 3),
-        (4, 5, 6),
-        (4,),
-        (5, 6),
+        (4, 5),
+        (6,),
     ]
     assert report.requested_graphs_per_batch == 4
     assert report.minimum_graphs_per_batch == 1
     assert report.maximum_graphs_per_batch == 2
     assert report.successful_batches == 4
-    assert report.oom_retries == 3
+    assert report.oom_retries == 1
 
 
 def test_graph_batch_executor_respects_backend_cost_budget():
