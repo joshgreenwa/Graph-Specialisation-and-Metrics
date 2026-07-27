@@ -168,6 +168,11 @@ To add a future Graphormer dataset such as ZINC, register a `CanonicalTask` with
     population.json              # seed estimates; population CI only with >=3 seeds
 ```
 
+The figures-only finalizer is seed-resumable. `figures.json` is written atomically only after one
+seed finishes; a later finalizer reuses it only when every declared figure and metadata sidecar is
+present and non-empty. A seed interrupted while plotting is rendered again, while earlier complete
+seeds are skipped. Pass `--force` when intentionally regenerating every figure.
+
 Numerical, invariance, and estimability audits report and continue by default: a breach is logged
 once, merged by audit name with its worst observed value and repeat count, and written to the two
 `audits.json` files (model checks also land in `canonical_audits.failures` of `model.json`).

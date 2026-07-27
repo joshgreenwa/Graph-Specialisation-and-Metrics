@@ -3651,6 +3651,39 @@ def render_cached_figures(
     return make_figures(prepared, config, scores, carriage, causal)
 
 
+def _load_complete_figure_manifest(output_dir: Path) -> dict[str, list[str]] | None:
+    """Return an atomic per-seed manifest only when every declared artifact is intact."""
+
+    import json
+
+    manifest_path = output_dir / "figures.json"
+    if not manifest_path.exists():
+        return None
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, Mapping) or not payload:
+        return None
+    figure_root = (output_dir / "figures").resolve()
+    for paths in payload.values():
+        if not isinstance(paths, list) or not paths:
+            return None
+        for value in paths:
+            path = Path(str(value)).resolve()
+            if not path.is_relative_to(figure_root):
+                return None
+            metadata = path.with_suffix(".metadata.json")
+            if (
+                not path.is_file()
+                or path.stat().st_size <= 0
+                or not metadata.is_file()
+                or metadata.stat().st_size <= 0
+            ):
+                return None
+    return {str(key): [str(value) for value in paths] for key, paths in payload.items()}
+
+
 def finalize_cached_run(config: MethodologyConfig) -> dict[str, Any]:
     """Render every seed and write shared summaries exactly once from immutable caches."""
 
@@ -3701,8 +3734,16 @@ def finalize_cached_run(config: MethodologyConfig) -> dict[str, Any]:
                 )
             audit_record = json.loads(audit_path.read_text(encoding="utf-8"))
             findings = list(audit_record.get("findings", ()))
-            log(f"[finalize] rendering {key}")
-            figures = render_cached_figures(config, task_name, int(train_seed))
+            figures = (
+                _load_complete_figure_manifest(output_dir)
+                if config.resume and not config.force
+                else None
+            )
+            if figures is None:
+                log(f"[finalize] rendering {key}")
+                figures = render_cached_figures(config, task_name, int(train_seed))
+            else:
+                log(f"[finalize] reusing complete figures for {key}")
             results[key] = {
                 "task": task_name,
                 "seed": int(train_seed),

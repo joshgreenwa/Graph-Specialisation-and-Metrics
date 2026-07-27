@@ -656,6 +656,17 @@ def test_model_free_finalizer_owns_shared_four_seed_summaries(
                 json.dumps({"findings": []}),
                 encoding="utf-8",
             )
+            if task == tasks[0] and seed == 0:
+                figure_dir = output / "figures"
+                figure_dir.mkdir()
+                figure = figure_dir / "complete.png"
+                metadata = figure_dir / "complete.metadata.json"
+                figure.write_bytes(b"complete")
+                metadata.write_text("{}", encoding="utf-8")
+                (output / "figures.json").write_text(
+                    json.dumps({"complete": [str(figure)]}),
+                    encoding="utf-8",
+                )
 
     def artifact(path):
         path = Path(path)
@@ -704,7 +715,9 @@ def test_model_free_finalizer_owns_shared_four_seed_summaries(
     results = finalize_cached_run(config)
 
     assert len(results) == 8
-    assert len(rendered) == 8
+    assert len(rendered) == 7
+    assert (tasks[0], 0) not in rendered
+    assert results[f"{tasks[0]}:seed0"]["figures"]["complete"]
     assert len(json.loads((tmp_path / "index.json").read_text())["runs"]) == 8
     for task in tasks:
         population = json.loads(
