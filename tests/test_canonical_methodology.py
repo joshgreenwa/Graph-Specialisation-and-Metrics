@@ -27,7 +27,9 @@ from graph_specialisation_metrics.methodology.cache import (
 from graph_specialisation_metrics.methodology.execution import execute_graph_batches
 from graph_specialisation_metrics.methodology.carriage import (
     beneficial_carriage,
+    beneficial_carriage_ragged,
     functional_carriage,
+    functional_carriage_ragged,
 )
 from graph_specialisation_metrics.methodology.causal import (
     donor_necessity,
@@ -77,9 +79,11 @@ from graph_specialisation_metrics.methodology.progress import (
     format_duration,
 )
 from graph_specialisation_metrics.methodology.sampling import (
+    DonorEvent,
     SemanticDonorPool,
     draw_structural_donors,
 )
+from graph_specialisation_metrics.methodology.runner import _carriage_graph_batch
 from graph_specialisation_metrics.methodology.scores import (
     JOINT_AXIS_LABEL,
     SELECTIVITY_AXIS_LABEL,
@@ -597,8 +601,9 @@ def test_column_support_counts_graphs_and_pairs_for_the_reporting_floor():
 
 
 def test_events_without_an_admissible_mismatch_control_are_excluded():
-    def event(source, draw, fingerprint, degree_gap):
+    def event(source, draw, fingerprint, degree_gap, channel="semantic"):
         return FakeData(
+            channel=channel,
             source=source,
             draw=draw,
             payload_fingerprint=fingerprint,
@@ -634,6 +639,18 @@ def test_events_without_an_admissible_mismatch_control_are_excluded():
     assert [row["name"] for row in scope.records()] == [
         "causal.mismatch_control_unavailable"
     ]
+
+    # Structural controls use the full non-identical donor tier: degree gap is recorded but is
+    # not a matching restriction.
+    structural = [
+        event(0, 0, b"a", 1, "structural"),
+        event(0, 1, b"b", 4, "structural"),
+    ]
+    with audit_scope("structural-mismatch") as scope:
+        indices, excluded = _mismatch_indices(structural)
+    assert indices == [1, 0]
+    assert excluded == set()
+    assert not scope.records()
 
 
 def test_soft_audit_keeps_a_broken_reconstruction_running():
@@ -717,19 +734,197 @@ def test_semantic_donor_excludes_identical_payload():
     assert all(item.payload != (7,) for item in draws)
 
 
-def test_structural_donor_law_minimum_gap_with_replacement():
+def test_structural_donor_law_is_uniform_without_replacement_and_exhaustive():
     footprints = [b"a", b"b", b"c", b"d"]
-    degrees = [2, 4, 3, 3]
     result = draw_structural_donors(
         footprints,
-        degrees,
         source=0,
         count=30,
         rng=np.random.default_rng(2),
         equal=lambda left, right: left == right,
     )
-    assert set(result) <= {2, 3}
-    assert len(result) == 30
+    # Fewer than K eligible donors means every donor is used exactly once.
+    assert result.tolist() == [1, 2, 3]
+
+    rng = np.random.default_rng(9)
+    draws = np.concatenate(
+        [
+            draw_structural_donors(
+                footprints,
+                source=0,
+                count=1,
+                rng=rng,
+                equal=lambda left, right: left == right,
+            )
+            for _ in range(6_000)
+        ]
+    )
+    frequencies = np.bincount(draws, minlength=4)[1:] / len(draws)
+    assert np.all(np.abs(frequencies - 1.0 / 3.0) < 0.03)
+
+    unique = draw_structural_donors(
+        footprints,
+        source=0,
+        count=2,
+        rng=np.random.default_rng(4),
+        equal=lambda left, right: left == right,
+    )
+    assert len(unique) == len(set(unique.tolist())) == 2
+
+
+def test_structural_donor_law_excludes_source_identical_footprints():
+    result = draw_structural_donors(
+        [b"a", b"a", b"b"],
+        source=0,
+        count=8,
+        rng=np.random.default_rng(2),
+        equal=lambda left, right: left == right,
+    )
+    assert result.tolist() == [2]
+
+
+def test_ragged_carriage_averages_each_sources_actual_donors():
+    gradient = torch.ones((1, 2, 1), dtype=torch.float64)
+    delta = torch.tensor(
+        [[[1.0], [0.0]], [[0.0], [2.0]], [[0.0], [4.0]]],
+        dtype=torch.float64,
+    )
+    functional, functional_events = functional_carriage_ragged(
+        delta, gradient, (1, 2)
+    )
+    torch.testing.assert_close(
+        functional,
+        torch.tensor([[1.0, 0.0], [0.0, 3.0]], dtype=torch.float64),
+    )
+    assert [int(value.shape[0]) for value in functional_events] == [1, 2]
+
+    h_clean = torch.zeros((2, 1), dtype=torch.float64)
+    h_event = torch.tensor(
+        [[[-1.0], [0.0]], [[0.0], [-2.0]], [[0.0], [2.0]]],
+        dtype=torch.float64,
+    )
+    beneficial = beneficial_carriage_ragged(
+        h_clean,
+        h_event,
+        (1, 2),
+        lambda pooled: pooled[:, 0].square(),
+        carrier_weights=torch.ones(2, dtype=torch.float64),
+        atol=1e-10,
+        rtol=1e-8,
+        max_intervals=64,
+    )
+    torch.testing.assert_close(
+        beneficial.field,
+        torch.tensor([[1.0, 0.0], [0.0, 4.0]], dtype=torch.float64),
+    )
+    assert [int(value.shape[0]) for value in beneficial.event_field] == [1, 2]
+
+
+def test_carriage_runner_preserves_ragged_structural_donor_counts(monkeypatch):
+    records = [
+        DonorEvent(
+            channel="structural",
+            stage="carriage",
+            graph_id=0,
+            source=source,
+            donor_graph_id=0,
+            donor_node=donor_node,
+            source_degree=1,
+            donor_degree=donor_node + 1,
+            degree_gap=donor_node,
+            dose=float(draw + 1),
+            payload_fingerprint=f"footprint-{donor_node}",
+            draw=draw,
+        )
+        for source, donor_node, draw in ((0, 1, 0), (1, 0, 0), (1, 2, 1))
+    ]
+    variants = [FakeData() for _ in records]
+    monkeypatch.setattr(
+        "graph_specialisation_metrics.methodology.runner._rebuild_graph_events",
+        lambda *_args, **_kwargs: (variants, records),
+    )
+    final_state = torch.tensor(
+        [
+            [[0.0], [0.0]],
+            [[-1.0], [0.0]],
+            [[0.0], [-2.0]],
+            [[0.0], [2.0]],
+        ],
+        dtype=torch.float64,
+    )
+    prediction = final_state.sum(dim=1)
+    captured = FakeData(
+        final_state=final_state,
+        prediction=prediction,
+        target=torch.zeros_like(prediction),
+    )
+    monkeypatch.setattr(
+        "graph_specialisation_metrics.methodology.runner._capture_event_groups",
+        lambda _prepared, _groups: [captured],
+    )
+
+    class Backend:
+        @staticmethod
+        def carriage_weights(_base, _clean):
+            return torch.ones(2, dtype=torch.float64)
+
+        @staticmethod
+        def loss_from_pooled(_target):
+            return lambda pooled: pooled[:, 0].square()
+
+        @staticmethod
+        def loss_per_graph(prediction, _target):
+            return prediction[:, 0].square()
+
+        @staticmethod
+        def carriage_distance_matrix(_base, _sources, _pristine):
+            return np.zeros((2, 2), dtype=np.float64)
+
+        @staticmethod
+        def carriage_carrier_kind(_base, _carrier):
+            return "node"
+
+    base = graph([[1], [2], [3]], [[0, 1], [1, 0]])
+    prepared = SimpleNamespace(
+        grit=SimpleNamespace(eval_ds=[base], sc=SimpleNamespace(seed=0)),
+        backend=Backend(),
+    )
+    config = SimpleNamespace(
+        sizes=SimpleNamespace(donors_per_source=8),
+        numerical=SimpleNamespace(
+            integrated_atol=1e-10,
+            integrated_rtol=1e-8,
+            integrated_max_intervals=64,
+            reconstruction_tolerance=1e-8,
+        ),
+    )
+    plan = {
+        0: {
+            "structural": {
+                "sources": (0, 1),
+                "records": tuple(record.record() for record in records),
+            }
+        }
+    }
+    clean = {
+        0: SimpleNamespace(
+            final_state=torch.ones((1, 2, 1), dtype=torch.float64),
+            capture=SimpleNamespace(target=torch.zeros((1, 1), dtype=torch.float64)),
+        )
+    }
+    result = _carriage_graph_batch(
+        prepared,
+        config,
+        plan,
+        clean,
+        "structural",
+        [0],
+    )[0]
+
+    assert result["graph_field"]["donor_counts"] == (1, 2)
+    assert [len(value) for value in result["graph_field"]["event_B"]] == [1, 2]
+    assert len(result["pair_rows"]) == 6
+    assert result["paths"] == 3
 
 
 def test_structural_swap_matches_dense_row_column_self_and_fixed_support():

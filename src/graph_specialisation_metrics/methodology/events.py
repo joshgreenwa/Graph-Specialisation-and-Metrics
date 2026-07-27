@@ -86,7 +86,6 @@ def build_channel_events(
         )
         selected = draw_structural_donors(
             footprints,
-            degrees,
             source,
             donors,
             rng,

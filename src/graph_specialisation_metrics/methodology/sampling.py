@@ -131,18 +131,17 @@ class SemanticDonorPool:
 
 def structural_eligible_nodes(
     footprints: Sequence[Any],
-    degrees: Sequence[int],
     source: int,
     *,
     equal: Any | None = None,
 ) -> np.ndarray:
-    """Return every non-identical node attaining the minimum absolute degree gap."""
+    """Return every other node whose structural footprint differs from the source."""
 
     source = int(source)
     compare = equal or (
         lambda left, right: np.array_equal(np.asarray(left), np.asarray(right))
     )
-    candidates = np.asarray(
+    return np.asarray(
         [
             node
             for node in range(len(footprints))
@@ -150,26 +149,25 @@ def structural_eligible_nodes(
         ],
         dtype=np.int64,
     )
-    if not candidates.size:
-        return candidates
-    degree = np.asarray(degrees, dtype=np.int64)
-    gap = np.abs(degree[candidates] - degree[source])
-    return candidates[gap == gap.min()]
 
 
 def draw_structural_donors(
     footprints: Sequence[Any],
-    degrees: Sequence[int],
     source: int,
     count: int,
     rng: np.random.Generator,
     *,
     equal: Any | None = None,
 ) -> np.ndarray:
-    eligible = structural_eligible_nodes(footprints, degrees, source, equal=equal)
+    """Draw unique structural donors uniformly, using all when fewer than ``count`` exist."""
+
+    eligible = structural_eligible_nodes(footprints, source, equal=equal)
     if not eligible.size:
         return np.empty(0, dtype=np.int64)
-    return rng.choice(eligible, size=int(count), replace=True).astype(np.int64)
+    selected = min(max(0, int(count)), int(eligible.size))
+    if selected == int(eligible.size):
+        return eligible.copy()
+    return rng.choice(eligible, size=selected, replace=False).astype(np.int64)
 
 
 def sample_sources(num_nodes: int, cap: int, rng: np.random.Generator) -> np.ndarray:

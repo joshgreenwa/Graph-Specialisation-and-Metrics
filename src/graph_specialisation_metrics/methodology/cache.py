@@ -39,7 +39,9 @@ class CacheContract:
     bootstrap_replicates: int = 2_000
     raw_score_aggregation: str = "donor->source->graph"
     semantic_donor_law: str = "graph-uniform/node-uniform/min-gap/iid-replacement"
-    structural_donor_law: str = "node-uniform/min-gap/iid-replacement"
+    structural_donor_law: str = (
+        "node-uniform/all-nonidentical/without-replacement/exhaust-if-short"
+    )
     functional_estimand: str = "F_sens"
     beneficial_sign: str = "positive-is-beneficial"
 
