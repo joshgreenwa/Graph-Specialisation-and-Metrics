@@ -218,7 +218,7 @@ Production is a three-stage Slurm DAG:
 2. one 16-element arm array: four arms by four seeds, after all common elements succeed;
 3. one model-free CPU refinement finalizer.
 
-Every GPU element requests one untyped Ampere GPU and at most four hours. The production default
+Every GPU element requests one untyped Ampere GPU and at most six hours. The production default
 starts at 16 graph event groups per score forward and 24 independently patched heads per causal
 forward (two saturated passes over 48 heads), with automatic OOM backoff. Heartbeats report
 progress and GPU/VRAM telemetry. These execution-only batch sizes do not alter the scientific
@@ -261,7 +261,7 @@ Soft audits are cached and flagged but do not terminate production.
 - [x] Four-seed nested inference and range-restriction reporting.
 - [x] Refinement/confirmation lockbox.
 - [x] Atomic common/arm caches and component progress.
-- [x] Slurm common/arm/finalizer DAG with four-hour GPU limits.
+- [x] Slurm common/arm/finalizer DAG with six-hour GPU and CPU safety limits.
 - [x] Complete local unit/static/contract verification (`198 passed, 1 skipped`).
 - [ ] Refresh HPC checkout and run new preflight.
 - [ ] Queue production DAG.
