@@ -38,7 +38,7 @@ SIZES = {
     "clean_ablation_graphs": 64,
     "semantic_donor_graphs": 2_000,
     "sources_per_graph": 6,
-    "donors_per_source": 8,
+    "donors_per_source": 8,  # exact semantic K; maximum unique structural donors
     "bootstrap_replicates": 2_000,  # fixed by the normative protocol
 }
 EXECUTION = {

@@ -2,7 +2,7 @@
 
 The normative scientific specification is
 [`../README.md`](../README.md), protocol
-`donor-swap-specialisation-carriage-v3`. This package is its public implementation. Historical
+`donor-swap-specialisation-carriage-v4`. This package is its public implementation. Historical
 implementations remain provenance rather than public alternatives. The selected internal
 `carriage/` and `specialisation/` modules supply only checkpoint-compatible low-level GRIT
 machinery where explicitly imported.
@@ -67,7 +67,7 @@ The paste-ready clone/mount/dispatch cell is
 |---|---|
 | `protocol.py` | Version, fixed constants, split discipline, fingerprints. |
 | `tasks.py` | Backend-neutral task contract and GRIT/Graphormer task registrations. |
-| `sampling.py` | Exact graph-uniform/node-uniform semantic law and node-uniform structural law. |
+| `sampling.py` | Minimum-degree-gap graph-uniform/node-uniform semantic law and uniform without-replacement structural law. |
 | `interventions.py` | One-row semantic replacement and dense-equivalent sparse structural footprint copy. |
 | `backend.py` | Native GRIT `wV`/final-state adapter. |
 | `graphormer.py` | Official checkpoint/dataset loading, native Graphormer transport hooks, graph-token readout adapter. |

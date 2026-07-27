@@ -28,8 +28,8 @@ from .bootstrap import (
 from .cache import CacheContract, CanonicalCache, atomic_json, checkpoint_sha256
 from .carriage import (
     additive_beneficial_mass,
-    beneficial_carriage,
-    functional_carriage_events,
+    beneficial_carriage_ragged,
+    functional_carriage_ragged,
 )
 from .distance import (
     DisplayAxis,
@@ -956,7 +956,8 @@ def run_scores(
     log(
         f"[scores] computing {len(graph_ids)} discovery graphs × "
         f"{int(config.sizes.sources_per_graph)} sources × "
-        f"{int(config.sizes.donors_per_source)} donors for semantic and structural channels"
+        f"{int(config.sizes.donors_per_source)} semantic donors / up to "
+        f"{int(config.sizes.donors_per_source)} unique structural donors"
     )
     axis = _distance_axis(prepared, graph_ids)
     output: dict[str, Any] = {
@@ -1289,11 +1290,20 @@ def _carriage_graph_batch(
             "keyed by the planned manifest hash",
             context={"stage": "carriage", "graph": graph_id, "channel": channel},
         )
+        donor_counts = tuple(
+            sum(int(record.source) == int(source) for record in records)
+            for source in sources
+        )
+        if any(count < 1 for count in donor_counts):
+            raise RuntimeError(
+                "an estimable carriage source was replayed without a donor event"
+            )
         contexts.append(
             {
                 "graph_id": graph_id,
                 "base": base,
                 "sources": sources,
+                "donor_counts": donor_counts,
                 "clean": clean_by_graph[graph_id],
             }
         )
@@ -1309,18 +1319,24 @@ def _carriage_graph_batch(
         graph_id = context["graph_id"]
         base = context["base"]
         sources = context["sources"]
+        donor_counts = context["donor_counts"]
         clean = context["clean"]
-        K = int(config.sizes.donors_per_source)
-        S = len(sources)
         h_clean = captured.final_state[0]
         carriers, width = int(h_clean.shape[-2]), int(h_clean.shape[-1])
-        h_event = captured.final_state[1:].reshape(S, K, carriers, width)
-        delta = h_clean[None, None, :, :] - h_event
-        event_f = functional_carriage_events(delta, clean.final_state)
+        h_event = captured.final_state[1:]
+        if int(h_event.shape[0]) != sum(donor_counts):
+            raise RuntimeError("captured carriage events do not match the donor manifest")
+        delta = h_clean.unsqueeze(0) - h_event
+        F_tensor, event_f = functional_carriage_ragged(
+            delta,
+            clean.final_state,
+            donor_counts,
+        )
         carrier_weights = prepared.backend.carriage_weights(base, h_clean)
-        integrated = beneficial_carriage(
+        integrated = beneficial_carriage_ragged(
             h_clean,
             h_event,
+            donor_counts,
             prepared.backend.loss_from_pooled(clean.capture.target.reshape(1, -1)),
             carrier_weights=carrier_weights,
             atol=config.numerical.integrated_atol,
@@ -1334,9 +1350,7 @@ def _carriage_graph_batch(
         target = clean.capture.target.reshape(1, -1)
         replay_loss = prepared.backend.loss_from_pooled(target)
         pooled_clean = project_final_states(h_clean.unsqueeze(0), carrier_weights)
-        pooled_event = project_final_states(
-            h_event.reshape(S * K, carriers, width), carrier_weights
-        )
+        pooled_event = project_final_states(h_event, carrier_weights)
         with torch.no_grad():
             replay_clean_loss = replay_loss(pooled_clean)
             replay_event_loss = replay_loss(pooled_event)
@@ -1361,7 +1375,7 @@ def _carriage_graph_batch(
             "pooling-to-readout replay error",
             context={"graph": graph_id, "channel": channel},
         )
-        F = event_f.mean(dim=1).t().detach().cpu().numpy()
+        F = F_tensor.detach().cpu().numpy()
         B = integrated.field.detach().cpu().numpy()
         pristine = shortest_path_distances(base.edge_index, int(base.num_nodes))
         distance = prepared.backend.carriage_distance_matrix(base, sources, pristine)
@@ -1374,21 +1388,35 @@ def _carriage_graph_batch(
                 prepared.backend.carriage_carrier_kind(base, carrier)
                 for carrier in range(carriers)
             ),
-            "event_F_sens": event_f.detach().cpu().numpy(),
-            "event_B": integrated.event_field.detach().cpu().numpy(),
-            "event_loss_increase": integrated.event_loss_increase.detach().cpu().numpy(),
-            "quadrature_error": integrated.quadrature_error.detach().cpu().numpy(),
-            "completeness_residual": (
-                integrated.completeness_residual.detach().cpu().numpy()
+            "donor_counts": donor_counts,
+            "event_F_sens": tuple(
+                value.detach().cpu().numpy() for value in event_f
+            ),
+            "event_B": tuple(
+                value.detach().cpu().numpy() for value in integrated.event_field
+            ),
+            "event_loss_increase": tuple(
+                value.detach().cpu().numpy()
+                for value in integrated.event_loss_increase
+            ),
+            "quadrature_error": tuple(
+                value.detach().cpu().numpy()
+                for value in integrated.quadrature_error
+            ),
+            "completeness_residual": tuple(
+                value.detach().cpu().numpy()
+                for value in integrated.completeness_residual
             ),
             "endpoint_replay_error": endpoint_replay_error,
-            "converged": integrated.converged.detach().cpu().numpy(),
+            "converged": tuple(
+                value.detach().cpu().numpy() for value in integrated.converged
+            ),
         }
-        event_b = integrated.event_field.detach().cpu().numpy()
-        event_f_np = event_f.detach().cpu().numpy()
+        event_b = graph_field["event_B"]
+        event_f_np = graph_field["event_F_sens"]
         pair_rows: list[dict[str, Any]] = []
         for source_position, source in enumerate(sources):
-            for donor in range(K):
+            for donor in range(donor_counts[source_position]):
                 for carrier in range(carriers):
                     pair_rows.append(
                         {
@@ -1402,9 +1430,9 @@ def _carriage_graph_batch(
                                 base, carrier
                             ),
                             "F_sens": float(
-                                event_f_np[source_position, donor, carrier]
+                                event_f_np[source_position][donor, carrier]
                             ),
-                            "B": float(event_b[source_position, donor, carrier]),
+                            "B": float(event_b[source_position][donor, carrier]),
                             "channel": channel,
                         }
                     )
@@ -1413,8 +1441,10 @@ def _carriage_graph_batch(
                 "graph_id": graph_id,
                 "graph_field": graph_field,
                 "pair_rows": pair_rows,
-                "paths": int(integrated.converged.numel()),
-                "capped": int((~integrated.converged).sum().item()),
+                "paths": sum(int(value.numel()) for value in integrated.converged),
+                "capped": sum(
+                    int((~value).sum().item()) for value in integrated.converged
+                ),
             }
         )
     return results
@@ -1447,7 +1477,8 @@ def run_carriage(
     log(
         f"[carriage] computing {len(graph_ids)} discovery graphs × "
         f"{int(config.sizes.sources_per_graph)} sources × "
-        f"{int(config.sizes.donors_per_source)} donors for semantic and structural channels"
+        f"{int(config.sizes.donors_per_source)} semantic donors / up to "
+        f"{int(config.sizes.donors_per_source)} unique structural donors"
     )
     # Reuse the same clean z-space linearisation for both intervention channels.
     clean_by_graph, clean_execution = _prepare_clean_jacobians(
@@ -1526,11 +1557,11 @@ def run_carriage(
         additive_observations = []
         for graph_id, field in graph_fields.items():
             n = int(prepared.grit.eval_ds[int(graph_id)].num_nodes)
-            event_b = np.asarray(field["event_B"])
+            event_b = field["event_B"]
             distance = np.asarray(field["distance"])
             for source_position, source in enumerate(field["sources"]):
-                for donor in range(event_b.shape[1]):
-                    source_values = event_b[source_position, donor]
+                for donor in range(len(event_b[source_position])):
+                    source_values = event_b[source_position][donor]
                     bin_values = [
                         np.sum(
                             source_values[

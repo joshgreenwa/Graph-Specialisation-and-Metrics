@@ -8,7 +8,7 @@ scientific definitions of:
 3. semantic and structural functional carriage using `F_sens`; and
 4. semantic and structural beneficial carriage using signed, donor-wise finite-loss paths.
 
-**Protocol version:** `donor-swap-specialisation-carriage-v3`.
+**Protocol version:** `donor-swap-specialisation-carriage-v4`.
 
 The same two intervention distributions are used throughout. Semantic scoring, semantic
 functional carriage, and semantic beneficial carriage use the same semantic donor-swap.
@@ -105,9 +105,9 @@ graph, node, degree gap, and payload fingerprint for every draw.
 
 ### 2.2 Structural donor-swap
 
-For source `s` and a different, degree-matched donor node `v` in the same graph, copy the donor's
-complete topology-derived positional footprint onto the source. For a node PE `p` and a possibly
-directed pair PE `r`, the operation is defined entrywise by:
+For source `s` and a different donor node `v` in the same graph, copy the donor's complete
+topology-derived positional footprint onto the source. For a node PE `p` and a possibly directed
+pair PE `r`, the operation is defined entrywise by:
 
 ```text
 node PE:
@@ -164,14 +164,15 @@ fields are a fatal audit error rather than something to ignore silently.
 Core donor eligibility is:
 
 1. `v != s`;
-2. the copied footprint differs from the source footprint;
-3. compute the smallest available absolute source--donor degree gap over the remaining nodes; and
-4. retain every donor node attaining that smallest gap, including all ties.
+2. the copied footprint differs from the source footprint; and
+3. every node satisfying 1--2 is eligible, irrespective of its degree.
 
 If no nontrivial eligible donor exists, the source is marked non-estimable; a self-donor is used
-only as a deterministic no-op check. Structural donors are sampled uniformly over the eligible
-minimum-gap nodes in the base graph. Draw the `K` donors independently with replacement so donor
-identity is marginalised in the same manner as on the semantic side.
+only as a deterministic no-op check. If there are `M` eligible structural donor nodes, draw
+`min(K,M)` uniformly without replacement. When `M <= K`, use every eligible donor exactly once.
+Thus a source never repeats a structural donor merely to fill `K`, and degree does not constrain
+the core structural intervention distribution. Source--donor degree gaps are still recorded for
+audit and possible secondary analyses.
 
 This is a fixed-support PE/RRWP intervention. Copying one real footprint into another node's
 coordinate slot can duplicate a structural role and need not produce the RRWP of any realizable
@@ -184,8 +185,10 @@ For both channels:
 
 - sources are sampled uniformly without replacement within each graph, subject to a declared
   memory cap;
-- `K` eligible donors are drawn independently with replacement for every source under the
-  channel-specific probability law above;
+- semantic events use exactly `K` independent donor draws with replacement under the
+  minimum-degree-gap, graph-balanced semantic law;
+- structural events use `K^str_{g,s} = min(K,M_{g,s})` unique donor nodes under the uniform
+  without-replacement structural law, exhausting the eligible set when `M_{g,s} < K`;
 - the clean graph and all events for one source are evaluated in the same forward batch whenever
   possible;
 - the clean member of that batch is the numerical baseline for every event;
@@ -193,8 +196,10 @@ For both channels:
 - aggregation is hierarchical: events within source, sources within graph, graphs equally.
 
 The semantic and structural analyses should use the same base graph IDs and source IDs when task
-geometry permits. Their event manifests, donor matching tiers, degree gaps, and nontrivial-event
-rates must be saved.
+geometry permits. Their event manifests, actual per-source donor counts, semantic matching tiers,
+degree gaps, and nontrivial-event rates must be saved. In all formulas below, `K^c_{g,s}` denotes
+the actual number of donors for that graph, source, and channel; an unqualified `mean_k` means the
+mean over those actual events.
 
 Both interventions are controlled counterfactual corruptions. A semantic row sampled from a real
 node need not be chemically or contextually valid after insertion into a different graph, and a
@@ -267,7 +272,7 @@ E^{lh,c}_{g,s,k}
     = sum_i ||q^{lh,c}_{g,s,k,i,:}||_2
 
 S_{c,g}(l,h)
-    = mean_{s in sources(g)} mean_{k=1..K} E^{lh,c}_{g,s,k}
+    = mean_{s in sources(g)} mean_{k=1..K^c_{g,s}} E^{lh,c}_{g,s,k}
 
 S_c(l,h)
     = mean_g S_{c,g}(l,h)
@@ -523,7 +528,7 @@ The sole production functional-carriage field is:
 
 ```text
 F_sens^c[g,i,s]
-    = mean_{k=1..K} ||q^c_{g,s,k,i,:}||_2
+    = mean_{k=1..K^c_{g,s}} ||q^c_{g,s,k,i,:}||_2
 ```
 
 Use the scientific name **Functional carriage** and the implementation symbol `F_sens`. `F` may
@@ -576,7 +581,7 @@ The production **Beneficial carriage** field takes the negative of that allocati
 
 ```text
 B^c[g,i,s]
-    = - mean_{k=1..K} a_loss^c[g,i,s,k]
+    = - mean_{k=1..K^c_{g,s}} a_loss^c[g,i,s,k]
 ```
 
 This uses the same eventwise principle as `F_sens`: perform the nonlinear donor-specific operation
@@ -982,10 +987,13 @@ P_gross[c,e,A] = 0.5 (R_gross[c,e,A] + I_gross[c,e,A])
 ```
 
 Run the same patch with a mismatched activation under the same architecture, tensor shape, layer,
-family size, donor tier, and intervention-dose constraints. Prefer a different donor event for the
-same base graph, source, and channel; use a wrong-graph activation only when carrier alignment and
-all matching constraints are explicitly defined. This is the nonspecific patch control. The
-matched-control-adjusted gross patch response is:
+family size, channel-specific donor tier, and intervention-dose constraints. The semantic control
+retains the event's minimum-degree-gap tier whenever an admissible distinct donor exists. The
+structural control is selected from the full non-identical structural donor tier and is not
+degree-matched, because degree belongs to the intervened structural payload. Prefer a different
+donor event for the same base graph, source, and channel; use a wrong-graph activation only when
+carrier alignment and all matching constraints are explicitly defined. This is the nonspecific
+patch control. The matched-control-adjusted gross patch response is:
 
 ```text
 G_c(A)
@@ -1179,10 +1187,15 @@ stage in which no graph retains a source estimable under both channels.
 - structural fields remain exactly fixed semantically;
 - same-content semantic donors and structural self-donors produce numerical zero;
 - every production event is nontrivial;
-- source/donor matching tiers and degree gaps are recorded;
-- a mismatch control drawn outside the frozen degree tier is recorded as an audit failure for that
-  stratum, and an event with no admissible control at all is excluded from the causal record
-  rather than reported against a self-control that would null its adjustment; and
+- semantic matching tiers, all source--donor degree gaps, and actual structural donor counts are
+  recorded;
+- structural donor identities are unique within source, every selected donor is drawn from the
+  full non-identical footprint set, and every eligible donor is selected when fewer than `K`
+  exist;
+- a semantic mismatch control drawn outside its frozen degree tier is recorded as an audit failure
+  for that stratum, while structural mismatch controls impose no degree restriction; an event with
+  no admissible distinct control at all is excluded from the causal record rather than reported
+  against a self-control that would null its adjustment; and
 - unknown task fields that could cross the channel boundary abort the run.
 
 ### Estimator checks
@@ -1197,8 +1210,8 @@ stage in which no graph retains a source estimable under both channels.
 - verify donor-averaged `sum_i B = mean_k(loss_event_k - loss_clean)`;
 - verify same-condition activation patches are numerical zero and replay the exact intervened
   tensor at the registered native site;
-- verify mismatch patches satisfy the frozen donor-tier, dose, shape, layer, and family-size
-  rules; and
+- verify mismatch patches satisfy the channel-specific donor-tier, dose, shape, layer, and
+  family-size rules; and
 - record quadrature residuals, interval counts, capped-path rates, and endpoint replay error.
 
 ### Cache checks
@@ -1214,10 +1227,10 @@ model geometry
 score/causal output representation and sigma vector
 graph/source/donor split IDs
 event-manifest hash
-K and source cap
+K cap, actual per-source donor counts, and source cap
 semantic graph-uniform/node-uniform donor law
-structural node-uniform donor law
-matching rule, minimum-gap ties, and fallback
+semantic minimum-degree-gap matching and tie rule
+structural node-uniform without-replacement law and eligible-set exhaustion
 raw-score aggregation
 score normalization constants and activity floor
 distance buckets, support counts, and heatmap aggregation
@@ -1245,6 +1258,7 @@ sensitivity analyses. None is part of the main methodology.
 | Signed or norm-after-averaging head aggregation | Net output-influence diagnostic; not a raw specialisation score. |
 | Semantic node transposition | Historical intervention comparison; not core. |
 | Structural/PE transposition | Historical intervention comparison; not core. |
+| Degree-matched or degree-stratified structural sensitivity | Optional robustness/diagnostic analysis; not the core structural donor law and not required for headline reporting. |
 | Full structure-plus-content relabelling | Model invariance check only. |
 | Non-isomorphic whole-graph topology donor | Separate topology comparator; never folded into `S_str`. |
 | Local edge switch with recomputed RRWP | Separate topology-reach probe; not core carriage. |
@@ -1268,8 +1282,8 @@ A new task joins this methodology by registering, not forking:
    task loss;
 7. pooling rule and carrier set;
 8. eligible source rule and memory cap;
-9. semantic graph-uniform/node-uniform and structural node-uniform donor laws, minimum-gap tie
-   handling, `K`, and intervention dose;
+9. semantic graph-uniform/node-uniform minimum-degree-gap donor law, structural node-uniform
+   without-replacement donor law with eligible-set exhaustion, `K`, and intervention dose;
 10. score/carriage graph counts, distance bins, and the 10-graph/50-pair reporting floor;
 11. bootstrap RNG seed and which levels are resampled or fixed under the 2,000-replicate percentile
     rule;
@@ -1294,7 +1308,8 @@ Every paper table or figure must be traceable to:
 - base/donor/validation split IDs;
 - graph IDs and source IDs;
 - donor event manifest and RNG seed;
-- `K`, source cap, donor probability law, degree gaps, tie counts, and fallback rates;
+- `K`, actual per-source donor counts, source cap, channel-specific donor probability law,
+  degree gaps, semantic tie counts, and non-estimable-source rates;
 - raw `S_sem` and `S_str` before normalization;
 - normalization means, `s_sem`, `s_str`, `J`, and `D_rel`;
 - exact and support-normalized distance matrices;

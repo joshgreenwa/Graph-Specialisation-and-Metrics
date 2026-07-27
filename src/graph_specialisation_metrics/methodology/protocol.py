@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 
-PROTOCOL_VERSION = "donor-swap-specialisation-carriage-v3"
+PROTOCOL_VERSION = "donor-swap-specialisation-carriage-v4"
 CHANNELS = ("semantic", "structural")
 PHASES = ("scores", "causal", "carriage", "figures")
 BOOTSTRAP_REPLICATES = 2_000
@@ -36,6 +36,7 @@ class RunSizes:
     clean_ablation_graphs: int = 64
     semantic_donor_graphs: int = 2_000
     sources_per_graph: int = 6
+    # Exact semantic draw count; upper bound on unique structural donors.
     donors_per_source: int = 8
     bootstrap_replicates: int = BOOTSTRAP_REPLICATES
 
@@ -240,16 +241,16 @@ class MethodologyConfig:
                     "uniform eligible graph then uniform eligible node; iid replacement"
                 ),
                 "structural": (
-                    "different footprint; minimum absolute degree gap; "
-                    "uniform eligible node within base graph; iid replacement"
+                    "different footprint; uniform eligible node within base graph; "
+                    "without replacement up to K; exhaustive when fewer than K"
                 ),
             },
             "raw_score_aggregation": "event -> source -> graph",
             "functional_estimand": "F_sens",
             "beneficial_sign": "positive-is-beneficial",
             "causal_mismatch_control": (
-                "same graph/channel/degree tier; distinct donor; prefer same source; "
-                "minimum absolute intervention-dose gap"
+                "same graph/channel and distinct donor; prefer same source; semantic controls "
+                "retain the degree tier; minimum absolute intervention-dose gap"
             ),
         }
 

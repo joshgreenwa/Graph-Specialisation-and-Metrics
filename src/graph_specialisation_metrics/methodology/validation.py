@@ -108,12 +108,19 @@ def _mismatch_indices(records: Sequence[Any]) -> tuple[list[int], set[int]]:
     result: list[int] = []
     excluded: set[int] = set()
     for position, record in enumerate(records):
+        # Degree is a matching constraint only for semantic events. Structural degree is part of
+        # the intervened footprint, so conditioning structural controls on degree gap would
+        # silently reintroduce the retired degree-matched structural donor law.
+        require_degree_tier = getattr(record, "channel", "semantic") == "semantic"
         candidates = [
             other
             for other, candidate in enumerate(records)
             if candidate.source == record.source
             and candidate.payload_fingerprint != record.payload_fingerprint
-            and candidate.degree_gap == record.degree_gap
+            and (
+                not require_degree_tier
+                or candidate.degree_gap == record.degree_gap
+            )
             and other != position
         ]
         if not candidates:
@@ -121,10 +128,13 @@ def _mismatch_indices(records: Sequence[Any]) -> tuple[list[int], set[int]]:
                 other
                 for other, candidate in enumerate(records)
                 if candidate.payload_fingerprint != record.payload_fingerprint
-                and candidate.degree_gap == record.degree_gap
+                and (
+                    not require_degree_tier
+                    or candidate.degree_gap == record.degree_gap
+                )
                 and other != position
             ]
-        if not candidates:
+        if not candidates and require_degree_tier:
             # Relax the degree tier before giving up on the same-geometry control.
             relaxed = [
                 other
@@ -149,12 +159,29 @@ def _mismatch_indices(records: Sequence[Any]) -> tuple[list[int], set[int]]:
             if not relaxed:
                 excluded.add(position)
             candidates = relaxed or [position]
+        elif not candidates:
+            audit_check(
+                False,
+                "causal.mismatch_control_unavailable",
+                "no distinct structural donor event is available; the event is excluded from "
+                "the causal record",
+                context={"source": int(record.source), "channel": "structural"},
+            )
+            excluded.add(position)
+            candidates = [position]
         result.append(
             min(
                 candidates,
                 key=lambda other: (
                     abs(float(records[other].dose) - float(record.dose)),
-                    abs(int(records[other].degree_gap) - int(record.degree_gap)),
+                    (
+                        abs(
+                            int(records[other].degree_gap)
+                            - int(record.degree_gap)
+                        )
+                        if require_degree_tier
+                        else 0
+                    ),
                     other,
                 ),
             )
