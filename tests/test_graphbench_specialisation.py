@@ -22,7 +22,22 @@ from graph_specialisation_metrics.methodology.graphbench import (
     build_graphbench_channel_events,
     edge_units,
     semantic_edge_swap,
+    structural_pe_intervention,
     structural_rrwp_swap,
+    verify_structural_pe_intervention,
+)
+from graph_specialisation_metrics.methodology.scores import event_head_score_systems
+from graph_specialisation_metrics.methodology.graphbench_pe_refinement import (
+    PERefinementConfig,
+    PERefinementSizes,
+    PreparedPERefinement,
+    _candidate_public_summary,
+    _causal_graph,
+    _permuted_spearman_values,
+    _run_causal_component,
+    render_refinement_figures,
+    run_common_ablation,
+    structural_pair_manifest,
 )
 from graph_specialisation_metrics.methodology.protocol import BootstrapPolicy
 from graph_specialisation_metrics.methodology.protocol import (
@@ -78,6 +93,29 @@ def flow_graph() -> Graph:
     return graph
 
 
+def six_node_matching_graph() -> Graph:
+    undirected = ((0, 3), (0, 4), (1, 4), (1, 5), (2, 5), (2, 3))
+    directed = [edge for pair in undirected for edge in (pair, pair[::-1])]
+    return Graph(
+        node_type=torch.zeros(6, dtype=torch.long),
+        edge_index=torch.tensor(directed, dtype=torch.long).t().contiguous(),
+        edge_value=torch.tensor(
+            [float(1 + index // 2) for index in range(len(directed))],
+            dtype=torch.float32,
+        ),
+        target=torch.tensor(
+            [float(index % 4 == 0) for index in range(len(directed))]
+        ),
+        task_type="edge_binary",
+        num_nodes=6,
+        spd=torch.zeros(6, 6, dtype=torch.long),
+        rwse=torch.zeros(6, 16),
+        rrwp=torch.arange(
+            6 * 6 * 17, dtype=torch.float32
+        ).reshape(6, 6, 17) / 100.0,
+    )
+
+
 def test_graphbench_tasks_are_explicit_protocol_extensions():
     for name in (
         "graphbench_bipartite_matching_hard",
@@ -113,6 +151,94 @@ def test_graphbench_structural_swap_is_rrwp_row_column_self_on_fixed_support():
     assert torch.equal(changed.edge_index, graph.edge_index)
     assert torch.equal(changed.edge_value, graph.edge_value)
     assert torch.equal(changed.node_type, graph.node_type)
+
+
+@pytest.mark.parametrize(
+    ("complete_pe", "transpose"),
+    ((False, False), (False, True), (True, False), (True, True)),
+)
+def test_graphbench_pe_refinement_interventions_cover_registered_factorial(
+    complete_pe,
+    transpose,
+):
+    graph = matching_graph()
+    changed = structural_pe_intervention(
+        graph,
+        0,
+        1,
+        complete_pe=complete_pe,
+        transpose=transpose,
+    )
+    verify_structural_pe_intervention(
+        graph,
+        changed,
+        0,
+        1,
+        complete_pe=complete_pe,
+        transpose=transpose,
+    )
+
+    if transpose:
+        permutation = torch.tensor([1, 0, 2])
+        expected_rrwp = graph.rrwp[permutation][:, permutation]
+    else:
+        expected_rrwp = structural_rrwp_swap(graph, 0, 1).rrwp
+    assert torch.equal(changed.rrwp, expected_rrwp)
+    assert torch.equal(changed.edge_index, graph.edge_index)
+    assert torch.equal(changed.edge_value, graph.edge_value)
+    assert torch.equal(changed.target, graph.target)
+    if complete_pe:
+        assert changed.degree_override.tolist() == (
+            [2.0, 1.0, 1.0] if transpose else [2.0, 2.0, 1.0]
+        )
+    else:
+        assert getattr(changed, "degree_override", None) is None
+
+
+def test_complete_pe_degree_override_is_presented_to_official_grit_adapter():
+    graph = matching_graph()
+    changed = structural_pe_intervention(
+        graph, 0, 1, complete_pe=True, transpose=False
+    )
+    batch = FakeRunner.collate_graphs([changed])
+
+    assert batch.degree[0, :3].tolist() == [2.0, 2.0, 1.0]
+
+
+def test_pe_refinement_changes_only_rrwp_channels_consumed_by_official_grit():
+    graph = matching_graph()
+    changed = structural_pe_intervention(
+        graph,
+        0,
+        1,
+        complete_pe=True,
+        transpose=True,
+        rrwp_steps=16,
+    )
+
+    assert torch.equal(changed.rrwp[..., 16], graph.rrwp[..., 16])
+    assert not torch.equal(changed.rrwp[..., :16], graph.rrwp[..., :16])
+
+
+def test_mass_coherent_and_cancellation_score_identities():
+    q = torch.tensor(
+        [
+            [
+                [
+                    [[1.0, 0.0], [-1.0, 0.0]],
+                    [[1.0, 0.0], [1.0, 0.0]],
+                ]
+            ]
+        ]
+    )
+    systems = event_head_score_systems(q, mass_floor=1.0e-12)
+
+    assert systems["mass"].shape == (1, 1, 2)
+    assert systems["mass"][0, 0].tolist() == pytest.approx([2.0, 2.0])
+    assert systems["coherent"][0, 0].tolist() == pytest.approx([0.0, 2.0])
+    assert systems["carrier_coherence"][0, 0].tolist() == pytest.approx(
+        [0.0, 1.0]
+    )
 
 
 def test_edge_donor_events_are_external_graph_and_auditable():
@@ -389,6 +515,8 @@ class FakeOfficialModel(torch.nn.Module):
 
 
 class FakeRunner:
+    RRWP_STEPS = 16
+
     @staticmethod
     def collate_graphs(graphs):
         from graph_specialisation_metrics.methodology.graphbench import _load_module, default_runner_path
@@ -447,6 +575,390 @@ def test_graphbench_backend_captures_chunked_vjps_and_native_patch_site():
     replacements = backend.replacement_batch(capture, [0])
     patched, _, _ = backend.patch(graph, replacements, ((0, 0),))
     assert torch.allclose(patched, capture.prediction[0:1], atol=1.0e-6)
+
+
+def test_graphbench_replica_specific_head_batching_matches_serial_patch_and_ablation():
+    graph = matching_graph()
+    backend = GraphBenchGritBackend(
+        fake_runtime(graph),
+        get_task("graphbench_bipartite_matching_hard"),
+        sigma=[1.0],
+        jacobian_output_chunk=2,
+    )
+    capture = backend.capture([graph, graph], require_grad=False)
+    assignments = ((0, 0), (1, 1))
+    replacements = backend.replacement_batch(capture, [0, 1])
+
+    _, z_batched_patch, _ = backend.patch_individual_heads(
+        [graph, graph], replacements, assignments
+    )
+    serial_patch = torch.cat(
+        [
+            backend.patch(
+                graph,
+                tuple(
+                    layer[index]
+                    for layer in capture.transport
+                ),
+                (assignment,),
+            )[1]
+            for index, assignment in enumerate(assignments)
+        ],
+        dim=0,
+    )
+    _, z_batched_ablation, _ = backend.ablate_individual_heads(
+        [graph, graph], assignments
+    )
+    serial_ablation = torch.cat(
+        [
+            backend.ablate([graph], (assignment,))[1]
+            for assignment in assignments
+        ],
+        dim=0,
+    )
+
+    assert torch.allclose(z_batched_patch, serial_patch, atol=1.0e-6)
+    assert torch.allclose(z_batched_ablation, serial_ablation, atol=1.0e-6)
+
+
+def test_pe_refinement_causal_geometry_and_taylor_audit_are_complete(tmp_path):
+    graph = six_node_matching_graph()
+    runtime = fake_runtime(graph)
+    task = get_task("graphbench_bipartite_matching_hard")
+    backend = GraphBenchGritBackend(
+        runtime, task, sigma=[1.0], jacobian_output_chunk=4
+    )
+    config = PERefinementConfig(
+        output_dir=str(tmp_path / "analysis"),
+        training_output_root=str(tmp_path / "training"),
+        dataset_root=str(tmp_path / "dataset"),
+        pe_cache_root=str(tmp_path / "pe"),
+        runner_path=str(tmp_path / "runner.py"),
+        sizes=PERefinementSizes(
+            discovery_graphs=1,
+            refinement_graphs=1,
+            confirmation_graphs=1,
+            clean_ablation_graphs=1,
+            semantic_donor_graphs=1,
+            semantic_sources_per_graph=1,
+            donors_per_source=2,
+            taylor_graphs=1,
+        ),
+        accelerator="cpu",
+        head_batch_size=2,
+    )
+    prepared = SimpleNamespace(
+        config=config,
+        runtime=runtime,
+        backend=backend,
+        progress=SimpleNamespace(emit=lambda *_args, **_kwargs: None),
+    )
+    manifest = structural_pair_manifest(prepared, "refinement", (0,))
+    rows = manifest[0]
+
+    assert len(rows) == 12
+    assert all(row["realised_donor_count"] == 2 for row in rows)
+    assert all(
+        len(
+            {
+                row["donor_node"]
+                for row in rows
+                if row["source"] == source
+            }
+        )
+        == 2
+        for source in range(6)
+    )
+
+    result = _causal_graph(
+        prepared,
+        graph_id=0,
+        channel="structural",
+        arm="complete_pe_transpose",
+        stage="refinement",
+        manifest_rows=rows,
+        clean_taylor=backend.clean_jacobians(graph),
+    )
+
+    assert result["controlled"].all()
+    assert result["endpoints"]["G_c"].shape == (4, 12)
+    assert np.isfinite(result["endpoints"]["G_c"]).all()
+    assert result["taylor"]["predicted"].shape == (4, 12, 12)
+    assert result["taylor"]["exact"].shape == (4, 12, 12)
+    assert np.isfinite(result["taylor"]["relative_error"]).all()
+
+
+def test_pe_refinement_vectorized_permutation_respects_layer_strata():
+    x = np.asarray([1.0, 3.0, 2.0, 4.0])
+    y = np.asarray([4.0, 2.0, 3.0, 1.0])
+    # A singleton stratum cannot be permuted, so every null replicate must equal
+    # the observed rank correlation exactly.
+    null = _permuted_spearman_values(
+        x,
+        y,
+        np.arange(4),
+        replicates=32,
+        rng=np.random.default_rng(123),
+    )
+
+    from scipy.stats import spearmanr
+
+    assert np.allclose(null, float(spearmanr(x, y).statistic))
+
+
+def test_pe_refinement_candidate_aggregation_keeps_public_association_names(
+    tmp_path,
+    monkeypatch,
+):
+    config = PERefinementConfig(
+        output_dir=str(tmp_path / "analysis"),
+        training_output_root=str(tmp_path / "training"),
+        dataset_root=str(tmp_path / "dataset"),
+        pe_cache_root=str(tmp_path / "pe"),
+        runner_path=str(tmp_path / "runner.py"),
+        sizes=PERefinementSizes(
+            discovery_graphs=1,
+            refinement_graphs=1,
+            confirmation_graphs=1,
+            clean_ablation_graphs=1,
+            semantic_donor_graphs=1,
+            semantic_sources_per_graph=1,
+            donors_per_source=1,
+            taylor_graphs=1,
+            permutation_replicates=8,
+        ),
+        accelerator="cpu",
+    )
+
+    def fake_seed_analysis(_config, *, seed, arm, score_system, split):
+        del _config, arm, score_system, split
+        rho = 0.1 + 0.1 * int(seed)
+        result = {
+            "seed": int(seed),
+            "associations": {
+                "registered_name": {
+                    "spearman": {"rho": rho},
+                }
+            },
+        }
+        vectors = {
+            "registered_name": {
+                "x": np.asarray([1.0, 2.0, 3.0, 4.0]),
+                "y": np.asarray([1.0, 3.0, 2.0, 4.0]),
+                "layer": np.asarray([0, 0, 1, 1]),
+            }
+        }
+        return result, vectors
+
+    monkeypatch.setattr(
+        "graph_specialisation_metrics.methodology.graphbench_pe_refinement."
+        "_seed_candidate_analysis",
+        fake_seed_analysis,
+    )
+    candidate, _ = _candidate_public_summary(
+        config,
+        arm="rrwp_copy",
+        score_system="mass",
+        split="refinement",
+    )
+
+    assert set(candidate["population_associations"]) == {"registered_name"}
+    assert candidate["population_associations"]["registered_name"]["n_seeds"] == 4
+
+
+def test_confirmation_figure_renderer_accepts_only_the_locked_candidate(tmp_path):
+    per_seed = []
+    for seed in range(4):
+        per_seed.append(
+            {
+                "seed": seed,
+                "scores": {
+                    "structural_normalized": np.asarray([[0.8, 1.2], [0.9, 1.1]]),
+                    "semantic_normalized": np.asarray([[1.1, 0.9], [1.2, 0.8]]),
+                    "joint_sensitivity": np.ones((2, 2)),
+                    "selectivity": np.asarray([[0.2, -0.2], [0.1, -0.1]]),
+                    "active": np.ones((2, 2), dtype=bool),
+                    },
+                    "causal": {
+                        "semantic": {
+                            "G_c": np.asarray([0.5, 0.4, 0.3, 0.2]),
+                        },
+                        "structural": {
+                        "P_gross_matched": np.asarray([0.4, 0.5, 0.6, 0.7]),
+                        "P_gross_mismatch": np.asarray([0.1, 0.2, 0.2, 0.3]),
+                        "G_c": np.asarray([0.3, 0.3, 0.4, 0.4]),
+                    },
+                    "gross_total_for_J": np.asarray([0.3, 0.4, 0.5, 0.6]),
+                    "gross_contrast_for_D_rel": np.asarray([0.2, -0.2, 0.1, -0.1]),
+                },
+            }
+        )
+    population = {
+        name: {"fisher_mean_rho": 0.5}
+        for name in (
+            "S_structural_vs_P_matched",
+            "S_structural_vs_P_mismatch",
+            "S_structural_vs_G_structural",
+            "S_semantic_vs_G_semantic",
+            "S_semantic_vs_G_structural_control",
+            "S_structural_vs_G_semantic_control",
+            "J_vs_gross_total",
+            "D_rel_vs_gross_contrast",
+        )
+    }
+    candidate = {
+        "candidate_id": "complete_pe_transpose__coherent",
+        "arm": "complete_pe_transpose",
+        "score_system": "coherent",
+        "per_seed": per_seed,
+        "population_associations": population,
+    }
+    selection = {
+        "candidate_id": candidate["candidate_id"],
+        "registered_rank": 1,
+        "structural_score_adjusted_rho": 0.5,
+        "D_rel_causal_contrast_rho": 0.5,
+        "median_structural_taylor_cosine_across_seeds": 0.8,
+        "median_structural_carrier_coherence_across_seeds": 0.7,
+    }
+
+    saved = render_refinement_figures(
+        {
+            "split": "confirmation",
+            "seeds": [0, 1, 2, 3],
+            "candidates": [candidate],
+            "selection_table": [selection],
+        },
+        tmp_path,
+    )
+
+    assert saved
+    assert all(Path(path).exists() for paths in saved.values() for path in paths)
+
+
+def test_pe_refinement_clean_ablation_resumes_its_atomic_graph_shard(
+    tmp_path,
+    monkeypatch,
+):
+    graph = matching_graph()
+    runtime = fake_runtime(graph)
+    task = get_task("graphbench_bipartite_matching_hard")
+    backend = GraphBenchGritBackend(
+        runtime, task, sigma=[1.0], jacobian_output_chunk=2
+    )
+    config = PERefinementConfig(
+        output_dir=str(tmp_path / "analysis"),
+        training_output_root=str(tmp_path / "training"),
+        dataset_root=str(tmp_path / "dataset"),
+        pe_cache_root=str(tmp_path / "pe"),
+        runner_path=str(tmp_path / "runner.py"),
+        sizes=PERefinementSizes(
+            discovery_graphs=1,
+            refinement_graphs=1,
+            confirmation_graphs=1,
+            clean_ablation_graphs=1,
+            semantic_donor_graphs=1,
+            semantic_sources_per_graph=1,
+            donors_per_source=2,
+            taylor_graphs=1,
+        ),
+        accelerator="cpu",
+        head_batch_size=2,
+    )
+    prepared = PreparedPERefinement(
+        config=config,
+        runtime=runtime,
+        backend=backend,
+        task=task,
+        donor_pool=GraphBenchEdgeDonorPool([(0, graph)]),
+        splits=SimpleNamespace(
+            clean_ablation=(0,),
+            fingerprint="fake-split",
+        ),
+        checkpoint=tmp_path / "best.pt",
+        checkpoint_sha="fake-checkpoint",
+        seed=0,
+        progress=SimpleNamespace(emit=lambda *_args, **_kwargs: None),
+    )
+    first = run_common_ablation(prepared)
+
+    monkeypatch.setattr(
+        backend,
+        "capture",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("resume should not rerun clean capture")
+        ),
+    )
+    resumed = run_common_ablation(prepared)
+
+    assert np.array_equal(
+        resumed["prediction_movement"], first["prediction_movement"]
+    )
+
+
+def test_pe_refinement_causal_component_resumes_with_manifest_validation(tmp_path):
+    graph = six_node_matching_graph()
+    runtime = fake_runtime(graph)
+    task = get_task("graphbench_bipartite_matching_hard")
+    backend = GraphBenchGritBackend(
+        runtime, task, sigma=[1.0], jacobian_output_chunk=4
+    )
+    config = PERefinementConfig(
+        output_dir=str(tmp_path / "analysis"),
+        training_output_root=str(tmp_path / "training"),
+        dataset_root=str(tmp_path / "dataset"),
+        pe_cache_root=str(tmp_path / "pe"),
+        runner_path=str(tmp_path / "runner.py"),
+        sizes=PERefinementSizes(
+            discovery_graphs=1,
+            refinement_graphs=1,
+            confirmation_graphs=1,
+            clean_ablation_graphs=1,
+            semantic_donor_graphs=1,
+            semantic_sources_per_graph=1,
+            donors_per_source=2,
+            taylor_graphs=1,
+        ),
+        accelerator="cpu",
+        head_batch_size=2,
+    )
+    prepared = PreparedPERefinement(
+        config=config,
+        runtime=runtime,
+        backend=backend,
+        task=task,
+        donor_pool=GraphBenchEdgeDonorPool([(0, graph)]),
+        splits=SimpleNamespace(
+            causal=(0, 0),
+            fingerprint="fake-split",
+        ),
+        checkpoint=tmp_path / "best.pt",
+        checkpoint_sha="fake-checkpoint",
+        seed=0,
+        progress=SimpleNamespace(emit=lambda *_args, **_kwargs: None),
+    )
+    manifest = structural_pair_manifest(prepared, "refinement", (0,))
+    clean = backend.clean_jacobians(graph)
+
+    first = _run_causal_component(
+        prepared,
+        channel="structural",
+        arm="complete_pe_copy",
+        split="refinement",
+        manifest=manifest,
+        clean_taylor={0: clean},
+    )
+    resumed = _run_causal_component(
+        prepared,
+        channel="structural",
+        arm="complete_pe_copy",
+        split="refinement",
+        manifest=manifest,
+        clean_taylor={0: clean},
+    )
+
+    assert first["manifest_hash"] == resumed["manifest_hash"]
+    assert first["support"] == resumed["support"]
 
 
 def test_graphbench_flow_backend_replays_exact_mean_max_readout():

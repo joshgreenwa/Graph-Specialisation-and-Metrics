@@ -47,6 +47,40 @@ def event_head_scores(q):
     return q.square().sum(dim=-1).sqrt().sum(dim=-1)
 
 
+def event_head_score_systems(q, *, mass_floor: float = 0.0) -> dict[str, Any]:
+    """Return transport mass, coherent movement, and event-level carrier coherence.
+
+    Args:
+        q: ``[event, layer, head, carrier, output]`` projected transport.
+        mass_floor: events at or below this mass are non-estimable for the ratio.
+    """
+
+    import torch
+
+    if q.ndim != 5:
+        raise ValueError("projected transport must be [event,layer,head,carrier,output]")
+    if not torch.isfinite(q).all():
+        raise ValueError("projected transport must be finite")
+    mass = q.square().sum(dim=-1).sqrt().sum(dim=-1)
+    coherent_vector = q.sum(dim=-2)
+    coherent = coherent_vector.square().sum(dim=-1).sqrt()
+    tolerance = 32.0 * torch.finfo(q.dtype).eps * torch.maximum(
+        mass, torch.ones_like(mass)
+    )
+    if bool((coherent > mass + tolerance).any()):
+        raise RuntimeError("coherent movement exceeds transport mass beyond numerical tolerance")
+    coherence = torch.full_like(mass, float("nan"))
+    estimable = mass > float(mass_floor)
+    coherence[estimable] = coherent[estimable] / mass[estimable]
+    return {
+        "mass": mass,
+        "coherent": coherent,
+        "coherent_vector": coherent_vector,
+        "carrier_coherence": coherence,
+        "estimable": estimable,
+    }
+
+
 def aggregate_event_scores(
     scores: np.ndarray,
     graph_ids: Sequence[int],

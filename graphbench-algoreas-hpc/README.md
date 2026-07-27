@@ -256,3 +256,54 @@ figure suite contains the same six paper-facing views used by the mixed syntheti
 (specialisation plane, score/causal association, double-dissociation endpoints, cumulative family
 ablation, joint/selectivity validation, and family controls), plus the required distance,
 attention, support, and carriage diagnostics.
+
+## Bipartite structural-PE refinement
+
+The focused `graphbench-bipartite-pe-refinement-v1` experiment is separate from the preceding
+score/carriage run. It compares RRWP donor copy, RRWP node transposition, complete-PE donor copy,
+and complete-PE node transposition on bipartite matching only. Each arm is evaluated with
+transport-mass and coherent output-movement scores, matched/mismatch causal patching, `J`/`D_rel`
+validation, cancellation, and Taylor-fidelity audits across seeds `0,1,2,3`.
+
+The complete protocol and lockbox are recorded in
+[`docs/bipartite_matching_specialisation_rerun_plan.md`](docs/bipartite_matching_specialisation_rerun_plan.md).
+Validate local/HPC paths before submission:
+
+```bash
+python graphbench-algoreas-hpc/bin/check_official_backends.py --models grit
+
+python graphbench-algoreas-hpc/bin/grit_pe_refinement.py preflight \
+  --profile production
+```
+
+Submit the common, arm, and model-free refinement-finalizer DAG:
+
+```bash
+ENV_ACTIVATE=$PWD/graphbench-algoreas-hpc/activate_graphbench_algoreas \
+PROFILE=production \
+MAX_PARALLEL=4 \
+bash graphbench-algoreas-hpc/bin/submit_grit_pe_refinement.sh
+```
+
+The submitter repeats both official-backend and path/cache preflights before calling `sbatch`.
+Every GPU array element has a four-hour limit. The common array has 12 elements (three reusable
+components by four seeds); the dependent arm array has 16 elements (four interventions by four
+seeds). Production starts at 16 score-event graph groups and 24 independently patched heads per
+causal forward, with automatic OOM backoff and graph-level resume. Confirmation event caches are
+computed blindly, but the confirmation finalizer refuses to read them until one refinement
+candidate is explicitly locked:
+
+```bash
+python graphbench-algoreas-hpc/bin/grit_pe_refinement.py lock \
+  --arm complete_pe_transpose \
+  --score-system coherent
+
+sbatch -A mlmi-jgg45-sl2-cpu -p sapphire --qos=cpu1 \
+  --nodes=1 --ntasks=1 \
+  --job-name=gb-pe-confirm \
+  --chdir="$PWD" \
+  --output="$PWD/graphbench-algoreas-hpc/logs/%x-%j.out" \
+  --error="$PWD/graphbench-algoreas-hpc/logs/%x-%j.err" \
+  --export=ALL,ENV_ACTIVATE="$PWD/graphbench-algoreas-hpc/activate_graphbench_algoreas",FINALIZE_SPLIT=confirmation \
+  graphbench-algoreas-hpc/slurm/grit_pe_refinement_finalize.sbatch
+```

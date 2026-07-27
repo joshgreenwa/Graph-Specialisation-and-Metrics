@@ -81,6 +81,7 @@ def _replace_graph(graph: Any, **changes: Any) -> Any:
             "spd",
             "rwse",
             "rrwp",
+            "degree_override",
         )
         if hasattr(graph, name)
     }
@@ -92,7 +93,16 @@ def _clone_graph(graph: Any) -> Any:
     import torch
 
     changes = {}
-    for name in ("node_type", "edge_index", "edge_value", "target", "spd", "rwse", "rrwp"):
+    for name in (
+        "node_type",
+        "edge_index",
+        "edge_value",
+        "target",
+        "spd",
+        "rwse",
+        "rrwp",
+        "degree_override",
+    ):
         value = getattr(graph, name, None)
         if isinstance(value, torch.Tensor):
             changes[name] = value.clone()
@@ -167,6 +177,144 @@ def structural_rrwp_swap(graph: Any, source: int, donor: int) -> Any:
         raise RuntimeError("GraphBench structural intervention requires cached RRWP")
     out.rrwp = dense_pair_donor_swap(graph.rrwp, int(source), int(donor))
     return out
+
+
+def _model_degree(graph: Any):
+    """Return the degree vector presented to official GRIT for this graph."""
+
+    import torch
+
+    override = getattr(graph, "degree_override", None)
+    if override is not None:
+        return override.clone()
+    return torch.as_tensor(
+        _graph_degrees(graph),
+        dtype=torch.float32,
+        device=graph.edge_index.device,
+    )
+
+
+def _set_degree_override(graph: Any, degree: Any) -> Any:
+    """Set the analysis-only degree field without requiring it on lightweight test graphs."""
+
+    out = _clone_graph(graph)
+    if dataclasses.is_dataclass(out) and "degree_override" in {
+        field.name for field in dataclasses.fields(out)
+    }:
+        return dataclasses.replace(out, degree_override=degree.clone())
+    setattr(out, "degree_override", degree.clone())
+    return out
+
+
+def structural_pe_intervention(
+    graph: Any,
+    source: int,
+    donor: int,
+    *,
+    complete_pe: bool,
+    transpose: bool,
+    rrwp_steps: int | None = None,
+) -> Any:
+    """Apply one of the four registered RRWP/complete-PE structural interventions.
+
+    ``transpose=False`` copies the donor's incident RRWP role onto the source.  ``transpose=True``
+    applies the same source/donor permutation to both RRWP axes.  Complete-PE variants apply the
+    corresponding copy/permutation to the explicit degree channel; ``log_deg`` remains exactly
+    derived by the official adapter from that degree vector.
+    """
+
+    import torch
+
+    source, donor = int(source), int(donor)
+    n = int(graph.num_nodes)
+    if not 0 <= source < n or not 0 <= donor < n:
+        raise IndexError("source/donor is outside the graph")
+    if graph.rrwp is None:
+        raise RuntimeError("GraphBench structural intervention requires cached RRWP")
+    out = _clone_graph(graph)
+    clean_rrwp = graph.rrwp
+    steps = (
+        int(clean_rrwp.shape[-1])
+        if rrwp_steps is None
+        else int(rrwp_steps)
+    )
+    if steps < 1 or steps > int(clean_rrwp.shape[-1]):
+        raise ValueError(
+            f"rrwp_steps={steps} is outside cached width {int(clean_rrwp.shape[-1])}"
+        )
+    visible_rrwp = clean_rrwp[..., :steps]
+    if transpose:
+        permutation = torch.arange(n, device=visible_rrwp.device)
+        permutation[source], permutation[donor] = (
+            permutation[donor].clone(),
+            permutation[source].clone(),
+        )
+        changed_visible = visible_rrwp.index_select(0, permutation).index_select(
+            1, permutation
+        )
+    else:
+        from .interventions import dense_pair_donor_swap
+
+        changed_visible = dense_pair_donor_swap(visible_rrwp, source, donor)
+    out.rrwp = clean_rrwp.clone()
+    out.rrwp[..., :steps] = changed_visible
+    if complete_pe:
+        degree = _model_degree(graph)
+        if transpose:
+            changed_degree = degree.clone()
+            changed_degree[source], changed_degree[donor] = (
+                degree[donor].clone(),
+                degree[source].clone(),
+            )
+        else:
+            changed_degree = degree.clone()
+            changed_degree[source] = degree[donor]
+        out = _set_degree_override(out, changed_degree)
+        out.rrwp = clean_rrwp.clone()
+        out.rrwp[..., :steps] = changed_visible
+    return out
+
+
+def verify_structural_pe_intervention(
+    base: Any,
+    event: Any,
+    source: int,
+    donor: int,
+    *,
+    complete_pe: bool,
+    transpose: bool,
+    rrwp_steps: int | None = None,
+) -> None:
+    """Hard integrity audit for the complete declared GraphBench input boundary."""
+
+    import torch
+
+    expected = structural_pe_intervention(
+        base,
+        source,
+        donor,
+        complete_pe=complete_pe,
+        transpose=transpose,
+        rrwp_steps=rrwp_steps,
+    )
+    for name in (
+        "edge_value",
+        "node_type",
+        "edge_index",
+        "target",
+        "spd",
+        "rwse",
+        "rrwp",
+        "degree_override",
+    ):
+        left, right = getattr(expected, name, None), getattr(event, name, None)
+        if isinstance(left, torch.Tensor):
+            if not isinstance(right, torch.Tensor) or not torch.equal(left, right):
+                raise RuntimeError(
+                    f"GraphBench PE intervention has invalid field {name!r}"
+                )
+        elif left != right:
+            raise RuntimeError(f"GraphBench PE intervention has invalid field {name!r}")
 
 
 def verify_semantic_edge_swap(
@@ -1276,6 +1424,117 @@ class GraphBenchGritBackend:
                 handle.remove()
         return raw["prediction"], raw["z"], raw["target"]
 
+    def _native_forward_individual_heads(
+        self,
+        data_list: Sequence[Any],
+        heads: Sequence[tuple[int, int]],
+        *,
+        replacements: Sequence[Any] | None = None,
+        ablate: bool = False,
+    ):
+        """Patch a different single head in each replica within one saturated forward.
+
+        The canonical public patch API applies one family to every replica.  The PE-refinement
+        experiment requires the same all-head endpoints but can evaluate independent heads much
+        more efficiently by assigning one ``(layer, head)`` pair to each replica.
+        """
+
+        torch = self._torch
+        if len(data_list) != len(heads) or not data_list:
+            raise ValueError("individual-head targets and assignments must align and be non-empty")
+        node_counts = {int(data.num_nodes) for data in data_list}
+        edge_counts = {int(data.edge_index.shape[1]) for data in data_list}
+        if len(node_counts) != 1 or len(edge_counts) != 1:
+            raise ValueError("individual-head replicas must share one base geometry")
+        if not ablate:
+            if replacements is None or len(replacements) != int(self.runtime.L):
+                raise ValueError("individual-head patching requires one replacement per layer")
+            expected = (
+                len(data_list),
+                next(iter(node_counts)),
+                int(self.runtime.H),
+                int(self.runtime.dh),
+            )
+            normalised_replacements = []
+            for layer, replacement in enumerate(replacements):
+                if tuple(replacement.shape) == (
+                    expected[0] * expected[1],
+                    expected[2],
+                    expected[3],
+                ):
+                    replacement = replacement.reshape(expected)
+                if tuple(replacement.shape) != expected:
+                    raise RuntimeError(
+                        f"replacement geometry differs at layer {layer}: "
+                        f"{tuple(replacement.shape)} vs {expected}"
+                    )
+                normalised_replacements.append(replacement)
+            replacements = tuple(normalised_replacements)
+        assignments = torch.as_tensor(
+            heads, dtype=torch.long, device=self.device
+        )
+        if bool((assignments[:, 0] < 0).any()) or bool(
+            (assignments[:, 0] >= int(self.runtime.L)).any()
+        ):
+            raise IndexError("individual-head layer assignment is outside the model")
+        if bool((assignments[:, 1] < 0).any()) or bool(
+            (assignments[:, 1] >= int(self.runtime.H)).any()
+        ):
+            raise IndexError("individual-head index is outside the model")
+        replicas = len(data_list)
+        nodes = next(iter(node_counts))
+        node_index = torch.arange(nodes, device=self.device).reshape(1, -1)
+        handles = []
+        for layer in range(int(self.runtime.L)):
+            selected = torch.nonzero(
+                assignments[:, 0] == layer, as_tuple=False
+            ).reshape(-1)
+            if not int(selected.numel()):
+                continue
+
+            def make_hook(layer_index: int, selected_replicas: Any):
+                selected_heads = assignments[selected_replicas, 1]
+
+                def hook(_module, _inputs, output):
+                    routed = output[0] if isinstance(output, tuple) else output
+                    view = routed.reshape(
+                        replicas,
+                        nodes,
+                        int(self.runtime.H),
+                        int(self.runtime.dh),
+                    )
+                    changed = view.clone()
+                    replica_grid = selected_replicas.reshape(-1, 1)
+                    head_grid = selected_heads.reshape(-1, 1)
+                    nodes_grid = node_index.expand(int(selected_replicas.numel()), -1)
+                    if ablate:
+                        changed[replica_grid, nodes_grid, head_grid, :] = 0.0
+                    else:
+                        donor = replacements[layer_index].to(
+                            device=changed.device, dtype=changed.dtype
+                        )
+                        changed[replica_grid, nodes_grid, head_grid, :] = donor[
+                            replica_grid, nodes_grid, head_grid, :
+                        ]
+                    routed_changed = changed.reshape_as(routed)
+                    if isinstance(output, tuple):
+                        return (routed_changed, *output[1:])
+                    return routed_changed
+
+                return hook
+
+            handles.append(
+                self.model.layers[layer].attention.register_forward_hook(
+                    make_hook(layer, selected)
+                )
+            )
+        try:
+            raw = self._forward_capture(data_list, require_grad=False)
+        finally:
+            for handle in handles:
+                handle.remove()
+        return raw["prediction"], raw["z"], raw["target"]
+
     def ablate(self, data_list: Sequence[Any], family):
         return self._native_forward(data_list, family=family, ablate=True)
 
@@ -1287,6 +1546,25 @@ class GraphBenchGritBackend:
     def patch_many(self, targets: Sequence[Any], donor_transport: Sequence[Any], family):
         return self._native_forward(
             targets, family=family, replacements=donor_transport
+        )
+
+    def ablate_individual_heads(
+        self,
+        data_list: Sequence[Any],
+        heads: Sequence[tuple[int, int]],
+    ):
+        return self._native_forward_individual_heads(
+            data_list, heads, ablate=True
+        )
+
+    def patch_individual_heads(
+        self,
+        targets: Sequence[Any],
+        donor_transport: Sequence[Any],
+        heads: Sequence[tuple[int, int]],
+    ):
+        return self._native_forward_individual_heads(
+            targets, heads, replacements=donor_transport, ablate=False
         )
 
     def replacement_batch(

@@ -195,6 +195,9 @@ class OfficialGraph:
     spd: Optional[torch.Tensor] = None
     rwse: Optional[torch.Tensor] = None
     rrwp: Optional[torch.Tensor] = None
+    # Analysis-only override for fixed-topology complete-PE counterfactuals. Training graphs and
+    # persisted dataset caches leave this as ``None``, so their degree remains adjacency-derived.
+    degree_override: Optional[torch.Tensor] = None
 
 
 @dataclass
@@ -273,6 +276,7 @@ def graph_to_payload(graph: OfficialGraph) -> dict[str, object]:
         "spd": graph.spd,
         "rwse": graph.rwse,
         "rrwp": graph.rrwp,
+        "degree_override": getattr(graph, "degree_override", None),
     }
 
 
@@ -287,6 +291,7 @@ def graph_from_payload(payload: Mapping[str, object]) -> OfficialGraph:
         spd=payload.get("spd"),
         rwse=payload.get("rwse"),
         rrwp=payload.get("rrwp"),
+        degree_override=payload.get("degree_override"),
     )
 
 
@@ -1112,7 +1117,20 @@ def collate_graphs(graphs: Sequence[OfficialGraph]) -> OfficialBatch:
             graph_target[graph_idx] = graph.target.float().reshape(-1)[0]
         else:
             raise ValueError(task_type)
-        degree[graph_idx, :n] = adj[graph_idx, :n, :n].sum(dim=-1)
+        topology_degree = adj[graph_idx, :n, :n].sum(dim=-1)
+        degree_override = getattr(graph, "degree_override", None)
+        if degree_override is None:
+            degree[graph_idx, :n] = topology_degree
+        else:
+            override = degree_override.float().reshape(-1)
+            if int(override.numel()) != int(n):
+                raise ValueError(
+                    "degree_override must contain exactly one value per graph node: "
+                    f"got {int(override.numel())}, expected {int(n)}"
+                )
+            if not torch.isfinite(override).all() or bool((override < 0).any()):
+                raise ValueError("degree_override must be finite and non-negative")
+            degree[graph_idx, :n] = override
         if graph.spd is not None and graph.rwse is not None and graph.rrwp is not None:
             spd_i = graph.spd.long()
             rwse_i = graph.rwse.float()

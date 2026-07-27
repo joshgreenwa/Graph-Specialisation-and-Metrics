@@ -1,0 +1,64 @@
+protocol: graphbench-bipartite-pe-refinement-v1
+task: graphbench_bipartite_matching_hard
+model: official_grit
+seeds: [0, 1, 2, 3]
+split:
+  analysis: val
+  node_size: 16
+  refinement_confirmation_lockbox: true
+sizes:
+  discovery_graphs: 64
+  refinement_graphs: 24
+  confirmation_graphs: 24
+  clean_ablation_graphs: 64
+  semantic_donor_graphs: 2000
+  semantic_sources_per_graph: 12
+  structural_sources_per_graph: all_eligible_nodes
+  donors_per_source: 8_unique_max
+  taylor_graphs: 12_refinement_only
+  permutation_replicates: 2000
+structural_pair_law:
+  node_type: same
+  bipartition_side: same_inferred_side
+  footprint: non_identical_rrwp_role
+  degree_matching: false
+  distance_strata: [near, middle, far]
+  replacement: false
+arms:
+  - rrwp_copy
+  - rrwp_transpose
+  - complete_pe_copy
+  - complete_pe_transpose
+complete_pe:
+  fields: [rrwp_node_diagonal, rrwp_full_pair, degree, log_degree]
+  fixed: [edge_support, edge_values, node_types, labels, output_coordinates]
+scores:
+  systems: [transport_mass, coherent_output_movement]
+  audit: [carrier_coherence, cancellation_ratio, taylor_fidelity]
+causal:
+  endpoints:
+    - matched_gross_response
+    - mismatch_gross_response
+    - mismatch_adjusted_response
+    - donor_wise_necessity
+    - clean_head_ablation
+  coordinates:
+    - joint_sensitivity
+    - selectivity
+  selectivity_reliability_floor: "J >= 0.20"
+statistics:
+  primary_replication_unit: trained_seed
+  heads_nested_within: [seed, layer]
+  flat_192_head_pooling: forbidden
+execution:
+  graphs_per_batch: 16
+  head_batch_size: 24
+  replica_pair_budget: 2000000
+  jacobian_output_chunk: 64
+  oom_backoff: true
+  progress_heartbeat_seconds: 30
+  gpu_job_time: "04:00:00"
+cache:
+  atomic_graph_shards: true
+  shared_clean_jacobians: true
+  confirmation_blind_until_lock: true
