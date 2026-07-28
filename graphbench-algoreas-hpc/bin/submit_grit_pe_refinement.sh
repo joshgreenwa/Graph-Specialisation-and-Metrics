@@ -105,6 +105,7 @@ COMMON_JOB="$(
     graphbench-algoreas-hpc/slurm/grit_pe_refinement_worker.sbatch
 )"
 COMMON_JOB="${COMMON_JOB%%;*}"
+echo "common_array=${COMMON_JOB}"
 
 ARM_JOB="$(
   sbatch --parsable \
@@ -120,6 +121,7 @@ ARM_JOB="$(
     graphbench-algoreas-hpc/slurm/grit_pe_refinement_worker.sbatch
 )"
 ARM_JOB="${ARM_JOB%%;*}"
+echo "arm_array=${ARM_JOB}"
 
 FINAL_JOB="$(
   sbatch --parsable \
@@ -135,8 +137,6 @@ FINAL_JOB="$(
 )"
 FINAL_JOB="${FINAL_JOB%%;*}"
 
-echo "common_array=${COMMON_JOB}"
-echo "arm_array=${ARM_JOB}"
 echo "refinement_finalizer=${FINAL_JOB}"
 echo "analysis_root=${GRAPHBENCH_ANALYSIS_OUTPUT_ROOT}"
 echo "monitor: squeue -j ${COMMON_JOB},${ARM_JOB},${FINAL_JOB}"

@@ -186,14 +186,44 @@ def freeze_families(
     *,
     tail_fraction: float,
     central_fraction: float,
+    central_pool_fraction: float = 0.50,
 ) -> dict[str, tuple[tuple[int, int], ...]]:
     """Freeze rank-based discovery families without inspecting causal outcomes."""
 
-    J = coordinates.joint_sensitivity
-    D = coordinates.selectivity
+    return _freeze_family_arrays(
+        coordinates.joint_sensitivity,
+        coordinates.selectivity,
+        coordinates.active,
+        tail_fraction=tail_fraction,
+        central_fraction=central_fraction,
+        central_pool_fraction=central_pool_fraction,
+    )
+
+
+def _freeze_family_arrays(
+    joint_sensitivity: Any,
+    selectivity: Any,
+    active_mask: Any,
+    *,
+    tail_fraction: float,
+    central_fraction: float,
+    central_pool_fraction: float = 0.50,
+) -> dict[str, tuple[tuple[int, int], ...]]:
+    """Shared deterministic family rule for the point estimate and every bootstrap draw."""
+
+    J = np.asarray(joint_sensitivity, dtype=np.float64)
+    D = np.asarray(selectivity, dtype=np.float64)
+    active_mask = np.asarray(active_mask, dtype=bool)
+    if J.shape != D.shape or J.shape != active_mask.shape or J.ndim != 2:
+        raise ValueError("J, D_rel, and the activity mask must share [layer,head] shape")
     heads = [(l, h) for l in range(J.shape[0]) for h in range(J.shape[1])]
-    active = [(l, h) for l, h in heads if coordinates.active[l, h]]
-    inactive = [(l, h) for l, h in heads if not coordinates.active[l, h]]
+    active = [
+        (l, h)
+        for l, h in heads
+        if active_mask[l, h] and np.isfinite(J[l, h]) and np.isfinite(D[l, h])
+    ]
+    active_set = set(active)
+    inactive = [(l, h) for l, h in heads if (l, h) not in active_set]
     count = max(1, int(np.floor(float(tail_fraction) * len(active)))) if active else 0
     ordered_d = sorted(active, key=lambda item: (D[item], item))
     structural = ordered_d[:count]
@@ -202,14 +232,245 @@ def freeze_families(
         max(1, int(np.floor(float(central_fraction) * len(active)))) if active else 0
     )
     median = float(np.median([D[item] for item in active])) if active else np.nan
+    pool_count = (
+        max(
+            central_count,
+            int(np.ceil(float(central_pool_fraction) * len(active))),
+        )
+        if active
+        else 0
+    )
+    central_pool = sorted(
+        active, key=lambda item: (abs(D[item] - median), item)
+    )[:pool_count]
     central = sorted(
-        active, key=lambda item: (abs(D[item] - median), -J[item], item)
+        central_pool, key=lambda item: (-J[item], abs(D[item] - median), item)
     )[:central_count]
     return {
         "semantic_leaning": tuple(semantic),
         "structural_leaning": tuple(structural),
         "central_responsive": tuple(central),
         "inactive": tuple(sorted(inactive, key=lambda item: (J[item], item))[:central_count]),
+    }
+
+
+def specialisation_diagnostics(
+    coordinates: HeadCoordinates,
+    families: Mapping[str, Sequence[tuple[int, int]]],
+    bootstrap_draws: Any,
+    *,
+    selectivity_interval: tuple[Any, Any],
+    activity_floor: float,
+    tail_fraction: float,
+    central_fraction: float,
+    central_pool_fraction: float = 0.50,
+    equivalence_half_width: float,
+    membership_stability_floor: float,
+    generalist_fraction_floor: float,
+) -> dict[str, Any]:
+    """Describe whether discovery resolves channel-selective families or a generalist regime.
+
+    ``bootstrap_draws`` is the transient output of the same paired nested bootstrap used for the
+    coordinate intervals.  Family assignment is rerun in every draw.  Nothing in this diagnostic
+    inspects a causal endpoint, so it cannot tune the later confirmation test.
+    """
+
+    draws = np.asarray(bootstrap_draws, dtype=np.float64)
+    shape = coordinates.joint_sensitivity.shape
+    if draws.ndim != 4 or draws.shape[1] < 6 or tuple(draws.shape[2:]) != tuple(shape):
+        raise ValueError(
+            "coordinate bootstrap draws must be [replicate,coordinate,layer,head]"
+        )
+    point_active = np.asarray(coordinates.active, dtype=bool)
+    D = np.asarray(coordinates.selectivity, dtype=np.float64)
+    low, high = (np.asarray(value, dtype=np.float64) for value in selectivity_interval)
+    if low.shape != shape or high.shape != shape:
+        raise ValueError("selectivity intervals must match the head geometry")
+    margin = float(equivalence_half_width)
+
+    def finite_quantile(values: Any, quantile: float) -> float:
+        finite = np.asarray(values, dtype=np.float64)
+        finite = finite[np.isfinite(finite)]
+        return float(np.quantile(finite, quantile)) if finite.size else np.nan
+
+    def finite_mean(values: Any) -> float:
+        finite = np.asarray(values, dtype=np.float64)
+        finite = finite[np.isfinite(finite)]
+        return float(np.mean(finite)) if finite.size else np.nan
+
+    equivalent = point_active & (low >= -margin) & (high <= margin)
+    semantic_selective = point_active & (low > margin)
+    structural_selective = point_active & (high < -margin)
+    unresolved = point_active & ~(
+        equivalent | semantic_selective | structural_selective
+    )
+    denominator = max(1, int(point_active.sum()))
+    classification = {
+        "equivalent": equivalent,
+        "semantic_selective": semantic_selective,
+        "structural_selective": structural_selective,
+        "unresolved": unresolved,
+    }
+    classification_fraction = {
+        name: float(mask.sum() / denominator) for name, mask in classification.items()
+    }
+
+    tracked = ("semantic_leaning", "structural_leaning", "central_responsive")
+    frozen_sets = {
+        name: {tuple(value) for value in families.get(name, ())} for name in tracked
+    }
+    inclusion = {name: np.zeros(shape, dtype=np.float64) for name in tracked}
+    jaccard = {name: [] for name in tracked}
+    p90_spans: list[float] = []
+    fixed_tail_separation: list[float] = []
+    rank_stability: list[float] = []
+    point_rank_mask = point_active & np.isfinite(D)
+
+    def ordinal_rank(value: np.ndarray) -> np.ndarray:
+        order = np.argsort(value, kind="mergesort")
+        result = np.empty(len(value), dtype=np.float64)
+        result[order] = np.arange(len(value), dtype=np.float64)
+        return result
+
+    def fixed_family_mean(value: np.ndarray, name: str) -> float:
+        members = frozen_sets[name]
+        if not members:
+            return np.nan
+        selected = np.asarray([value[item] for item in members], dtype=np.float64)
+        return float(np.mean(selected)) if np.isfinite(selected).all() else np.nan
+
+    for draw in draws:
+        draw_j = draw[4]
+        draw_d = draw[5]
+        draw_active = np.isfinite(draw_j) & np.isfinite(draw_d) & (
+            draw_j >= float(activity_floor)
+        )
+        draw_families = _freeze_family_arrays(
+            draw_j,
+            draw_d,
+            draw_active,
+            tail_fraction=tail_fraction,
+            central_fraction=central_fraction,
+            central_pool_fraction=central_pool_fraction,
+        )
+        for name in tracked:
+            selected = {tuple(value) for value in draw_families.get(name, ())}
+            for item in selected:
+                inclusion[name][item] += 1.0
+            union = frozen_sets[name] | selected
+            jaccard[name].append(
+                float(len(frozen_sets[name] & selected) / len(union))
+                if union
+                else np.nan
+            )
+        active_values = draw_d[draw_active]
+        p90_spans.append(
+            float(np.quantile(active_values, 0.95) - np.quantile(active_values, 0.05))
+            if active_values.size
+            else np.nan
+        )
+        fixed_tail_separation.append(
+            fixed_family_mean(draw_d, "semantic_leaning")
+            - fixed_family_mean(draw_d, "structural_leaning")
+        )
+        candidate = draw_d[point_rank_mask]
+        reference = D[point_rank_mask]
+        if len(candidate) >= 3 and np.isfinite(candidate).all():
+            rank_stability.append(
+                float(np.corrcoef(ordinal_rank(reference), ordinal_rank(candidate))[0, 1])
+            )
+        else:
+            rank_stability.append(np.nan)
+
+    replicates = max(1, draws.shape[0])
+    membership: dict[str, Any] = {}
+    for name in tracked:
+        values = np.asarray(jaccard[name], dtype=np.float64)
+        membership[name] = {
+            "frozen_members": tuple(sorted(frozen_sets[name])),
+            "inclusion_probability": inclusion[name] / float(replicates),
+            "mean_jaccard": finite_mean(values),
+            "jaccard_low": finite_quantile(values, 0.025),
+            "jaccard_high": finite_quantile(values, 0.975),
+        }
+
+    active_values = D[point_active & np.isfinite(D)]
+    point_span = (
+        float(np.quantile(active_values, 0.95) - np.quantile(active_values, 0.05))
+        if active_values.size
+        else np.nan
+    )
+    span_draws = np.asarray(p90_spans, dtype=np.float64)
+    separation_draws = np.asarray(fixed_tail_separation, dtype=np.float64)
+    rank_draws = np.asarray(rank_stability, dtype=np.float64)
+    tail_separation = (
+        fixed_family_mean(D, "semantic_leaning")
+        - fixed_family_mean(D, "structural_leaning")
+    )
+    unstable = any(
+        membership[name]["mean_jaccard"] < float(membership_stability_floor)
+        for name in ("semantic_leaning", "structural_leaning")
+    )
+    narrow = bool(
+        np.isfinite(span_draws).any()
+        and finite_quantile(span_draws, 0.975) <= 2.0 * margin
+    )
+    equivalent_fraction = classification_fraction["equivalent"]
+    entanglement_compatible = bool(
+        narrow
+        or unstable
+        or equivalent_fraction >= float(generalist_fraction_floor)
+    )
+    resolved_relative_tails = bool(
+        np.isfinite(separation_draws).any()
+        and finite_quantile(separation_draws, 0.025) > 2.0 * margin
+        and not unstable
+    )
+    if not coordinates.estimable or not point_active.any():
+        status = "not_estimable"
+    elif resolved_relative_tails:
+        status = "resolved_relative_tails"
+    elif entanglement_compatible:
+        status = "entanglement_compatible"
+    else:
+        status = "mixed_or_unresolved"
+    return {
+        "equivalence_half_width": margin,
+        "active_heads": int(point_active.sum()),
+        "classification_masks": classification,
+        "classification_fraction": classification_fraction,
+        "active_selectivity": {
+            "median": float(np.median(active_values)) if active_values.size else np.nan,
+            "p05": float(np.quantile(active_values, 0.05)) if active_values.size else np.nan,
+            "p95": float(np.quantile(active_values, 0.95)) if active_values.size else np.nan,
+            "p90_span": point_span,
+            "p90_span_low": finite_quantile(span_draws, 0.025),
+            "p90_span_high": finite_quantile(span_draws, 0.975),
+        },
+        "frozen_tail_separation": {
+            "estimate": float(tail_separation),
+            "low": finite_quantile(separation_draws, 0.025),
+            "high": finite_quantile(separation_draws, 0.975),
+        },
+        "membership": membership,
+        "rank_stability": {
+            "median": finite_quantile(rank_draws, 0.50),
+            "low": finite_quantile(rank_draws, 0.025),
+            "high": finite_quantile(rank_draws, 0.975),
+        },
+        "interpretation": {
+            "status": status,
+            "narrow_selectivity_distribution": narrow,
+            "tail_membership_unstable": unstable,
+            "equivalent_head_fraction_reaches_floor": bool(
+                equivalent_fraction >= float(generalist_fraction_floor)
+            ),
+            "entanglement_compatible": entanglement_compatible,
+            "resolved_relative_tails": resolved_relative_tails,
+            "membership_stability_floor": float(membership_stability_floor),
+            "generalist_fraction_floor": float(generalist_fraction_floor),
+        },
+        "bootstrap_replicates": int(draws.shape[0]),
     }
 
 

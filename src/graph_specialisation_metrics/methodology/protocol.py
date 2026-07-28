@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 
-PROTOCOL_VERSION = "donor-swap-specialisation-carriage-v3"
+PROTOCOL_VERSION = "donor-swap-specialisation-carriage-v4"
 CHANNELS = ("semantic", "structural")
 PHASES = ("scores", "causal", "carriage", "figures")
 BOOTSTRAP_REPLICATES = 2_000
@@ -119,7 +119,24 @@ class FamilyPolicy:
     activity_floor: float = 0.20
     tail_fraction: float = 0.20
     central_fraction: float = 0.20
+    # Select the high-J central family from this nearest-to-median D_rel pool.  This keeps
+    # "central" about channel balance while making "responsive" an actual selection criterion.
+    central_pool_fraction: float = 0.50
+    # Practical-equivalence region for discovery selectivity.  A confidence interval has to be
+    # wholly contained in [-width, +width]; merely crossing zero is never evidence of balance.
     equivalence_half_width: float = 0.10
+    # Family-by-channel interactions are reference-scaled, so this is a fraction of the frozen
+    # matched-reference response rather than a task-specific raw-output unit.
+    causal_equivalence_half_width: float = 0.20
+    # Discovery diagnostics used by the regime synthesis.  They never tune a family or endpoint.
+    membership_stability_floor: float = 0.60
+    generalist_fraction_floor: float = 0.50
+    # Minimum lower confidence bound for the J-to-importance rank correlations included in the
+    # headline activity check.
+    importance_correlation_floor: float = 0.10
+    # Minimum reference-scaled lower confidence bound for calling the high-J central family
+    # responsive in both channels.
+    causal_response_floor: float = 0.10
 
     def validate(self) -> None:
         if self.activity_floor < 0:
@@ -128,6 +145,22 @@ class FamilyPolicy:
             value = float(getattr(self, name))
             if not 0 < value <= 0.5:
                 raise ValueError(f"{name} must lie in (0, .5]")
+        if not 0 < float(self.central_pool_fraction) <= 1:
+            raise ValueError("central_pool_fraction must lie in (0, 1]")
+        for name in (
+            "equivalence_half_width",
+            "causal_equivalence_half_width",
+            "importance_correlation_floor",
+            "causal_response_floor",
+        ):
+            if float(getattr(self, name)) < 0:
+                raise ValueError(f"{name} must be non-negative")
+        if self.equivalence_half_width == 0 or self.causal_equivalence_half_width == 0:
+            raise ValueError("equivalence half-widths must be positive")
+        for name in ("membership_stability_floor", "generalist_fraction_floor"):
+            value = float(getattr(self, name))
+            if not 0 < value <= 1:
+                raise ValueError(f"{name} must lie in (0, 1]")
 
 
 @dataclass(frozen=True)

@@ -1,0 +1,2469 @@
+A Semantic and Structural Divide:
+  A Mechanistic Account of the
+Vanishing GNN-Graph Transformer
+        Benchmarking Gap
+
+
+
+
+                          Josh Green
+                   Department of Engineering
+                    University of Cambridge
+
+
+
+         This dissertation is submitted for the degree of
+       MPhil in Machine Learning & Machine Intelligence
+
+
+
+
+ Corpus Christi College                                July 2026
+I would like to dedicate this thesis to . . .
+                 Declaration
+
+
+Declaration...
+
+                               Josh Green
+                                July 2026
+                          Acknowledgements
+
+
+And I would like to acknowledge ...
+                                    Abstract
+
+
+This is where you write your abstract ...
+Table of contents
+
+List of figures                                                                        xv
+
+List of tables                                                                        xvii
+
+1 Introduction                                                                          1
+  1.1 Open Research Questions . . . . . . . . . . . . . . . . . . . . . . . . .         2
+  1.2 Contributions . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .     2
+  1.3 Organisation of the Dissertation . . . . . . . . . . . . . . . . . . . . . .      3
+
+2 Graph Machine Learning                                                                7
+  2.1 Foundations . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .     7
+  2.2 Classical Graph Neural Networks . . . . . . . . . . . . . . . . . . . . .         7
+      2.2.1 Graph Convolutional Neural Network . . . . . . . . . . . . . . .            8
+      2.2.2 Limitations of GNNs . . . . . . . . . . . . . . . . . . . . . . . .         8
+  2.3 Graph Transformers . . . . . . . . . . . . . . . . . . . . . . . . . . . .        8
+      2.3.1 GTs are Complete-Support GNNs . . . . . . . . . . . . . . . . .             9
+      2.3.2 Addressing the limitations of message passing. . . . . . . . . . .         10
+      2.3.3 Expressive Power . . . . . . . . . . . . . . . . . . . . . . . . . .       10
+      2.3.4 Positional and Structural Encodings . . . . . . . . . . . . . . .          11
+      2.3.5 Graphormer . . . . . . . . . . . . . . . . . . . . . . . . . . . . .       11
+      2.3.6 GraphGPS . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .       11
+      2.3.7 GRIT . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .       11
+      2.3.8 Expansion of GNNs and Sparsification of GTs . . . . . . . . . .            12
+  2.4 The Vanishing GNN-GT Benchmarking Gap . . . . . . . . . . . . . . .              12
+      2.4.1 GNN+ Models . . . . . . . . . . . . . . . . . . . . . . . . . . .          12
+      2.4.2 Where Did the Gap Go? . . . . . . . . . . . . . . . . . . . . . .          12
+  2.5 Gaps in the Mechanistic Understanding of Graph Transformers . . . . .            12
+  2.6 Attention Head Specialisation in Transformers . . . . . . . . . . . . . .        13
+xii                                                                     Table of contents
+
+
+            2.6.1Quantifying semantic–positional specialisation in LLMs . . . . . 13
+            2.6.2Why positional–symbolic symmetry does not directly generalise
+                 to graphs . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 13
+      2.7   Summary . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 15
+
+3 Measuring Semantic and Structural Behaviour in Graph Transformers 19
+  3.1 Motivation and design principles . . . . . . . . . . . . . . . . . . . . . . 19
+  3.2 Semantic and structural interventions . . . . . . . . . . . . . . . . . . . 21
+      3.2.1 Graph interventions . . . . . . . . . . . . . . . . . . . . . . . . . 22
+      3.2.2 Semantic donor-swap . . . . . . . . . . . . . . . . . . . . . . . . 24
+      3.2.3 Structural donor-swap . . . . . . . . . . . . . . . . . . . . . . . 25
+  3.3 Measuring attention-head specialisation . . . . . . . . . . . . . . . . . . 26
+      3.3.1 Output geometry and per-head transport . . . . . . . . . . . . . 26
+      3.3.2 Raw semantic and structural scores . . . . . . . . . . . . . . . . 28
+      3.3.3 Raw semantic and structural scores . . . . . . . . . . . . . . . . 28
+      3.3.4 Joint sensitivity and selectivity . . . . . . . . . . . . . . . . . . 29
+      3.3.5 Distance decomposition of head scores . . . . . . . . . . . . . . 30
+  3.4 Distance-resolved carriage . . . . . . . . . . . . . . . . . . . . . . . . . 31
+      3.4.1 Final-state transport response . . . . . . . . . . . . . . . . . . . 32
+      3.4.2 Functional carriage . . . . . . . . . . . . . . . . . . . . . . . . . 32
+      3.4.3 Beneficial carriage . . . . . . . . . . . . . . . . . . . . . . . . . 33
+      3.4.4 Distance profiles and tail summaries . . . . . . . . . . . . . . . 33
+      3.4.5 Carriage . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 33
+
+4 Synthetic Experiments                                                                35
+  4.1 Specialisation Scoring Design Principles . . . . . . . . . . . . . . . . . .     35
+      4.1.1 Global versus local interventions . . . . . . . . . . . . . . . . . .      36
+      4.1.2 Attention versus transport-based metrics . . . . . . . . . . . . .         37
+  4.2 Causal validation of head roles . . . . . . . . . . . . . . . . . . . . . . .    38
+      4.2.1 . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .    39
+      4.2.2 Semantic–structural mixture experiment . . . . . . . . . . . . .           39
+      4.2.3 Recovering semantic and structural head roles . . . . . . . . . .          40
+      4.2.4 Functional engagement and channel preference . . . . . . . . . .           41
+      4.2.5 Ablation and patching double dissociation . . . . . . . . . . . .          41
+  4.3 Head Specialisation under Communication Constraints . . . . . . . . .            43
+      4.3.1 Neighbour Associative Recall (NAR) . . . . . . . . . . . . . . .           43
+      4.3.2 Proving the role of attention support . . . . . . . . . . . . . . .        43
+Table of contents                                                                    xiii
+
+
+   4.4   Neighbour Associative Recall Experiment . . . . . . . . . . . . . . . . . 43
+
+5 Head Specialisation and Reach in Real-World Graph Transformers                      45
+  5.1 Research questions and experiments . . . . . . . . . . . . . . . . . . . .      45
+  5.2 Case Study: Graphormer on PCQM4Mv2 . . . . . . . . . . . . . . . .              45
+  5.3 Head specialisation and causal importance . . . . . . . . . . . . . . . .       45
+  5.4 Effects of sparse and dense connectivity . . . . . . . . . . . . . . . . . .    46
+  5.5 Measuring Semantic and Structural Reach . . . . . . . . . . . . . . . .         46
+
+References                                                                            47
+
+Appendix A Details: Mixed Synthetic Task                                          51
+  A.1 Alternative Scoring Methods . . . . . . . . . . . . . . . . . . . . . . . . 51
+  A.2 Exact Experimental Config . . . . . . . . . . . . . . . . . . . . . . . . . 52
+List of figures
+
+
+ 2.1   Caption . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 15
+
+ 2.2   Caption . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 16
+
+ 2.3   Caption . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 16
+
+ 2.4   Caption . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 16
+
+ 2.5   Caption . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 17
+
+
+ 3.1   Example graph interventions: donor-swaps replace channel-specific
+       features of a source node with those of another node, whereas node
+       transpositions swap the channel-specific features of two nodes in a graph. 24
+
+ 3.2   Semantic and structural scores. a. A semantic or structural donor-
+       swap intervention is applied to a clean graph. b. The change in output
+       at head (ℓ, h) is measured. c. Aggregating across interventions and
+       graphs gives separate per-head scores. d. Head role is derived from the
+       relationship of scores. . . . . . . . . . . . . . . . . . . . . . . . . . . . . 30
+
+ 3.3   Measuring distance-dependent usage via carriage. a. Final layer
+       states are obtained through a forward pass of the intervened graph. b.
+       The output change at each node state is projected onto the readout
+       direction. c. Aggregation across source nodes and graphs. d. The
+       output is a distance-decay curve for most real-world datasets. . . . . . 33
+xvi                                                                    List of figures
+
+
+  4.1 Teacher–student operator distillation in LLMs: (a) The per-layer
+      positional specialisation fraction rspec for each of three tasks, and (b) the
+      per-layer residual stream positional representation fraction, computed
+      via a linear probe. Across all three tasks, global intervention scoring
+      methods are shown to be more faithful to underlying residual stream
+      dynamics than the local intervention approach. In particular, the local
+      intervention approach is agnostic to residual stream dynamics: while the
+      positional information is increasing embedded in the residual stream,
+      the local attention intervention reports an increasingly semantic focus of
+      the head. In contrast, global intervention approaches better capture full
+      network dynamics, and correctly identify the increasingly positionally-
+      specialised role of each head. . . . . . . . . . . . . . . . . . . . . . . . 38
+  4.2 Mixed synthetic task. The semantic mode retrieves the value of the
+      source whose key matches the query; the structural mode retrieves the
+      shortest-path distance between the marked source and query nodes. The
+      task is split into 50% semantic and 50% structural examples, and C16
+      graphs are used for all examples (as visualised here). . . . . . . . . . . 40
+  4.3 Semantic and structural specialisation scores for the mixed synthetic task. 41
+  4.4 Joint sensitivity and specialisation preference. . . . . . . . . . 42
+  4.5 Overall figure caption. . . . . . . . . . . . . . . . . . . . . . . . . . . . 43
+
+  A.1 Comparing a variety of scoring approaches on the mixed synthetic task. 52
+List of tables
+
+ 4.1 Training summary for the teacher-student operator distillation synthetic
+     tasks: mean ± std over 6 seeds of 4-layer single-head NoPE students.
+     Regression targets use MSE (lower is better); the classification target uses
+     accuracy (higher is better). Steps is the mean number of optimisation
+     steps at early stopping. . . . . . . . . . . . . . . . . . . . . . . . . . . . 37
+
+ A.1 Summary of alternative scoring methods. . . . . . . . . . . . . . . . . . 51
+ A.2 Training configuration for the controlled semantic–structural experiment. 53
+Chapter 1
+
+Introduction
+
+Graph-structured data is ... With the advent of deep learning, Graph Neural Networks
+(GNNs) have emerged as a cornerstone in Graph Machine Learning (GML).
+    In this dissertation, we are primarily concerned with two classes of Graph Machine
+Learning algorithms: (i) classical GNNs, in which nodes iterately exchange and
+aggregate information with immediate neighbours; and (ii) Graph Transformers (GTs),
+which leverage global self-attention, enabling all nodes in the graph to exchange
+information in just a single layer. Although GTs can be considered a special case
+of GNNs that utilise self-attention and a global graph support, we will reserve the
+nomenclature of ‘GNN’ for classical GNNs, for clarity and alignment to the standard
+nomenclature used in the literature.
+    While significant progress has been made in the mechanistic interpretability for
+Transformer-based Large Language Models (LLMs), similar progress has been far more
+incremental for GTs. This is partly because, despite both classes of models using
+the same underlying Transformer architecture, the architectural design space of GT
+architectures is far more diverse. For instance, dense causal attention is widely adopted
+by LLMs, causal masking enables linear-time memory requirements for auto-regressive
+generation, partly mitigating costs associated with quadratic attention. Similar causal
+masking is absent in typical GT models, meaning that dense attention poses both a
+critical time and memory constraint, and, resultingly, diverse sparsification methods
+are especially prominent among GTs. Moreover, while RoPE-like PEs have been widely
+adopted by LLMs, PEs and SEs are inherently more diverse among GTs, and lack
+the same theoretical guarantees of expressivity inherent to sequence-based models
+equipped with RoPE. The result of these factors is an architectural design space for
+GTs that is largely incongruent, with frontier models widely varying in approach to
+sparsification, choice of PE/SE, and method of PE/SE injection into the model. This
+2                                                                          Introduction
+
+
+poses an inherent risk that mechanistic insights weakly generalise across models or
+that mechanistic tools can even be applied across architectures, and therefore the
+development of model-agnostic mechanistic tools is of central importance to improving
+mechanistic interpretability for GTs.
+    In this dissertation, we develop a novel methodology for measuring the semantic and
+structural division of labour in GTs based on measuring functional response to controlled
+graph input interventions. These interventions are closely related to sensitivity and
+counterfactual analysis: each intervention represents a small perturbation to the graph,
+isolating either a single node or a pair of nodes, while keeping the rest of the graph
+fixed. Crucially, interventions are separated by semantic and structural focus: a
+semantic intervention represents a perturbation to the content of a node, whereas a
+structural perturbation represents a perturbation to the pairwise relation between
+two nodes. By keeping the rest of the graph fixed, and using in-distribution semantic
+and structural swaps, this methodology allows specific node-to-node semantic and
+structural dependencies to be probed, while minimising out-of-distribution risks.
+   A unified causal methodology reveals that graph transformers range from genuine
+semantic–structural specialisation to entangled processing, and that supposedly long-
+range benchmarks often induce surprisingly little useful long-range computation.
+
+
+
+1.1        Open Research Questions
+(i) Do attention heads learn specialised roles in GTs? – and if so, what is the form of
+specialisation, and can it be shown to play a causally important role in GT computation?
+    (ii)
+   (i) can we construct tools that generalise well across different models and architec-
+tures?
+
+
+
+1.2        Contributions
+    1. new methodology – model-agnostic specialisation design
+
+
+    2. establish causal importance
+
+
+    3. identify specialisation in molecular tasks + identify that GTs
+1.3 Organisation of the Dissertation                                                  3
+
+
+1.3     Organisation of the Dissertation
+  1. Introduction and Organisation
+
+  2. Graph Machine Learning (Classical GNNs, Issues with classical GNNs, Graph
+     Transformers, Open Questions in GML, Mechanistic Interpretability of Graph
+     Transformers)
+
+   Open question in GML narrative:
+
+  1. GTs are hypothesised to resolve core limitations in GNNs, especially by alleviating
+     overfitting.
+
+  2. Early benchmarks showed substantial improvement of GTs over GNNs, especially
+     in long-range and molecular tasks.
+
+  3. However, recent work showed that extensive fine-tuning of GNNs bridge much of
+     the gap.
+
+  4. Even more notably, GNN+ transformer-ises classical GNNs by adding transformer-
+     like edge features, normalisation, ... into classical GNNs, finding that most
+     apparent benchmark gaps in ... are eliminated.
+
+  5. Hence, overall there is a very poor understanding of when dense attention is
+     useful. Further, key questions include (i) when can GTs be sparsified while
+     retaining performance, and (ii) for what problems does dense attention provide
+     an inherent advantage over 1-hop local models?
+
+   Mechanistic Interpretability of GTs narrative:
+
+  1. Some progress has been made in advancing mechanistic understanding of classical
+     GNNs, especially in ...
+
+  2. Overall, such advancements lag behind those in the Large Language Model (LLM)
+     domain of sequence transformers.
+
+  3. Mechanistic interpretability work in GTs, however, is especially limited. Recent
+     work proposed an advancement through the construction of attention graphs,
+     computed by contracting raw attention matrices across layers. However, such a
+     construction ignores model non-linearities, ignores hidden state and value vector
+     manipulation, and this work does not establish a causal connection between the
+     proposed attention graphs and the model’s functional usage.
+4                                                                            Introduction
+
+
+    4. Major questions include (i) can we motivate an understanding of the role of
+       dense attention through mechanistic insights, especially to explain the absence
+       or presence of performance gaps between GNNs and GTs across various core
+       benchmarks.
+
+    5. This is the perspective of this thesis.
+
+    Chapter 3: Carriage-Based Mechanistic Analysis of Graph Models
+
+    1. Definitions (incl. three tiers of usage: model has learned to use component; usage
+       serves a functional purpose; usage causally benefits performance.
+
+    2. Symbolic Carriage
+
+    3. Structural Carriage
+
+    4. Synthetic Task Validation
+
+    5. Carriage is More Faithful than Attention (incl. attention is a better predictor of
+       meaningful attention-level ablations; but carriage is a better predictor of true
+       functional usage and sensitivity).
+
+    6. Relation to Prior Work
+
+    Chapter 4: Long-Range Carriage and its Necessity in Graph Transformers
+
+    1. Benchmarking results between GTs and 1-hop GT controls (also include GNN+
+       and classical GNN results if computed) for datasets used within this chapter
+       and from hereon. Three likely key cases: (i) ZINC; (ii) a case with no apparent
+       GT advantage; (iii) one with a superior advantage (if it can be found) – maybe
+       all molecular tasks. Core models: GRIT and 1-hop sparse GRIT (with local vs
+       global RRWP).
+
+    2. Local-vs-global carriage decay
+
+    3. Probing the structure of long-range signals (incl. structural analysis tools applied
+       to carriage matrix; ie is long-range transport low or high rank etc – crucial to
+       characterise across tasks – possibly even VNode sufficiency here.)
+
+    Chapter 5: Composability and the origin of dense attention advantages.
+
+    1. Local Pathway Mediator-Patching
+1.3 Organisation of the Dissertation                                                  5
+
+
+   2. Do GTs Implement Locally Composable Logic? (answer: not really at all; incl.
+      validation applied to 1-hop models).
+
+   3. Depthwise effects (ie direct vs total carriage magnitude by clamp depth across
+      models and different decay curves – this should build into something bigger).
+
+   Chapter 6: Structural Carriage and Sparse Graph Transformer Design
+
+   1. Purpose: explain cases where sparse models work surprisingly well.
+
+   2. If 1-hop models can approach dense GT performance, what substitutes for dense
+      content transport?
+
+   3. global RRWP vs local RRWP; node RRWP vs pair RRWP carriage; global-to-local
+      RRWP ablation; implications for sparsified GT design.
+
+    Additional core questions: - how to best sparsify a GT; and can we justify sparsifi-
+cation from clear mechanistic insights? Lots of part-way answers here, need something
+strong to hit home.
+    Optional additional experiments: - Internal implementation, specialisation, and
+sparsification design (RQ4). Head-mediated carriage → specialisation map → is far
+carriage concentrated in a few heads/edges? → sparsified-GT design. Even a null
+(diffuse/redundant) is a quantified finding and explains your failed head ablations.
+    What have we gotten out of experiments so far?
+
+   • Preface: we introduce the method and validate it as a measure of functional
+     usage.
+
+   • We start with benchmark performance (what is already known by prior work).
+
+   • We then contrast distance dependent carriage (symbolic and structural) between
+     models.
+
+   • To do better: establish that (varying-distance) long-range usage present in dense
+     GT meaningfully contributes to performance (or doesn’t).
+
+   • We then show that dense GTs implement non-composable representations (ie
+     fundamentally a different computational pathway to 1-hop models).
+
+   • To do better: establish that these non-composable pathways meaningfully con-
+     tribute to performance (or doesn’t – might be trickier). This might be a dead
+     end, but the non-composability part can still be kept for differentiating model
+     functionality.
+6                                                                        Introduction
+
+
+    • We then also probe the structure of carriage – is it low-rank or high-rank, can
+      this motivate sparsification?
+
+   The big tie together: synthetic controlled experiments showing role of node RRWP,
+pair RRWP, VNode, k-hop, extension to expander + random connectivity.
+   Goals: (1) Present a contrary suggestion to "PE helps with low graph count",
+emphasising that it helps on tasks where global structural reasoning helps. (2) One of
+the main advantages of dense attention is global content retrieval. This cannot be well
+supplemented. (3) Show the bridge where GNN+ fails but GNN+ with VNode helps,
+then fails before dense GT is needed. Repeat the results but with expander graph
+sparsification.
+Chapter 2
+
+Graph Machine Learning
+
+
+2.1     Foundations
+
+
+2.2     Classical Graph Neural Networks
+
+Classical Graph Neural Networks (GNNs) are a class of neural architectures designed
+to operate on graph-structured data, where a graph G = (V, E) comprises a set of
+nodes V and edges E encoding pairwise relations between them.
+
+    The dominant paradigm underlying classical GNNs is message passing (Gilmer et
+al, 2017). Each node v maintains a hidden representation hv initialised from input
+features xv . At each layer k, every node aggregated messages from its neighbours N (v)
+and updates its own state:
+                                                                       
+                                                                   
+                     v = ϕ
+                    h(k)                                                          (2.1)
+                          (k)  (k−1
+                                                 ψ (k) h(k−1) , h(k−1)
+                                        M
+                               hv                       v        u
+                                                                       
+                                       u∈N (u)
+
+
+where ψ (k) constructs messages,    is a permutation-invariant aggregator (e.g. sum,
+                                   L
+
+mean, or max), and ϕ updates the node state. A defining characteristic of classical
+                      (k)
+
+GNNs is that N (v) represents the 1-hop neighbourhood of node v, i.e. all nodes
+u ∈ N (v) share an edge with node v. After K layers, each node representation encodes
+information from its K-hop neighbourhood. A graph-level prediction is obtained by a
+final permutation-invariant readout over all node states.
+8                                                            Graph Machine Learning
+
+
+2.2.1    Graph Convolutional Neural Network
+Classical instances of this message-passing framework differ chiefly in how messages
+are formed and aggregated. The Graph Convolutional Network (GCN; Kipf & Welling,
+2017) uses a symmetric degree-normalised sum, motivated as a first-order approxima-
+tion to spectral graph convolution. The Graph Attention Network (GAT) replaces
+fixed normalisation with learned attention coefficients over neighbours. GraphSAGE
+emphasises inductive learning through neighbour sampling and generalised aggregators,
+while the Graph Isomorphism Network (GIN) employs an injective sum aggregator,
+shown to match the discriminative power of the Weisfeiler-Lehmann graph isomorphism
+test.
+
+
+2.2.2    Limitations of GNNs
+Despite their success, message-passing GNNs are subject to well-documented limita-
+tions. Their expressive power is bounded by the 1-Weisfeiler-Lehman test (Xu et al,
+2019; Morris et al 2019), so certain non-isomorphic graphs cannot be distinguished.
+Stacking many layers induces over-smoothing, whereby node representations converge
+to indistinguishable values (Li et al, 2018), and over-squashing, whereby information
+from exponentially growing receptive fields is compressed into fixed-width vectors,
+impeding long-range signal propagation. (Alon & Yahav, 2021).
+    over-squashing Akansha (2025); Alon and Yahav (2021).
+
+
+
+2.3     Graph Transformers
+Graph Transformers (GTs) adapt the self-attention mechanism of the transformer (Vaswani
+et al., 2017) to graph-structured data. A transformer is a stack of alternating blocks of
+multi-head attention and fully-connected feed-forward layers. Let G be a graph with
+semantic node feature matrix X ∈ RN ×d . In each layer t > 0, a single attention head
+computes
+                                                  QKT
+                                                        !
+                             O(X ) := softmax √
+                                  (t)
+                                                          V                         (2.2)
+                                                    dk
+where the softmax is applied row-wise, dk denotes the feature dimension of the matrices
+Q and K, with X(0) := X. Here, the matrices Q, K, and V are the result of projecting
+X(t) linearly,
+
+                Q := X(t) WQ ,      K := X(t) WK ,      V := X(t) WV
+2.3 Graph Transformers                                                              9
+
+
+using three matrices WQ , WK ∈ Rd×dk , and WV ∈ Rd×d . Multi-head attention
+MultiHead(X(t) ) concatenated multiple individual attention heads, followed by an
+output projection to the feature space of X(t) . The transformer layer incorporates
+residual connections and normalisation, and updates features X(t) as,
+                                                           
+                      X(t+1) := FFN MultiHead X(t) + X(t)                        (2.3)
+
+
+
+
+2.3.1    GTs are Complete-Support GNNs
+
+LLMs are GNNs Joshi (2025).
+   Survey bridging LLMs and GNNs Arroyo et al. (2026)
+   A token sequence can be represented as a directed path graph whose nodes are
+tokens and whose edges connect consecutive positions in sequence order.
+   A sequence has the geometry of a uniformly edge-labelled directed path Pn : each
+token has a canonical one-dimensional coordinate, at most two local neighbours, and
+pairwise structure reduces to signed displacement i − j, unlike the branching, cycles,
+typed bonds, variable degrees, and non-canonical positions of molecular graphs.
+   It can be shown that GTs can be considered to be message-passing GNNs with
+complete graph support, meaning that each node aggregates a message sent by all
+other nodes, rather than strictly receiving a message from its neighbours.
+    The defining underlying design difference between GNNs and GTs is whether local
+or global message-passing is employed. This is not to say this is the only practical
+difference: specific choices of update function, aggregator, normalisation, choice of
+positional and structural encodings, among many other engineering design choices each
+play a major role in determining comparative model performance.
+    A primary architectural difference between classical message-passing GNNs and GTs
+is that the former restricts each node to aggregate only over its immediate neighbours
+N (v), whereas the latter attends over the complete node set, which is equivalent to
+message passing on a fully connected graph whose edge weights are learned rather than
+fixed by the input adjacency. In this view, a GT is a GNN operating on a dynamically
+weighted complete graph. Unlike classical GNNs, where the original graph structure
+is implicitly injected through the aggregation support, said support must be injected
+through auxiliary signals, namely positional encodings (PEs) and structural encodings
+(SEs).
+10                                                            Graph Machine Learning
+
+
+2.3.2     Addressing the limitations of message passing.
+The development of GTs has been motivated primarily by the structural pathologies
+of classical GNNs. Because information can flow directly between distant nodes in a
+single layer, GTs bypass the exponential compression of long-range signals that produce
+over-squashing (Alon Yahav) and they avoid the repeated local averaging over many
+layers that drives over-smoothing (Li et al 2018). Attention biases derived from SEs
+can also lift the expressive ceiling imposed by the 1-Weisfeiler-Lehman test, allowing
+GTs to distinguish graph that message passing cannot (Ying et al). Notably, however,
+the expressive power of classical GNNs can be similarly enhanced by the addition
+of SEs, so the primary architectural difference of interest resides entirely around the
+condar
+
+
+2.3.3     Expressive Power
+It is imperative to understand that the general GT architecture is less expressive in
+distinguishing non-isomorphic graphs than standard GNNs. GTs are weaker since, with-
+out sufficiently expressive structural and positional encodings, they cannot capture any
+graph structure beyond the number of nodes. This makes them structure-agnostic, and
+they treat input graphs as unordered sets of semantic features. They are therefore equiv-
+alent in expressive power to DeepSet architectures, i.e. they learn permutation-invariant
+set function. GTs are therefore crucially dependent on structural and positional en-
+codings. In contrast, standard GNNs aggregate information from exclusively local
+neighbourhoods, and therefore topology-aware by construction.
+    GTs can become maximally expressive, i.e. universal function approximators, if
+they have access to maximally expressive structural encodings (Müller et al., 2024).
+However, this is equivalent to solving the graph isomorphism problem, which is NP-
+Intermediate (?), and standard GNNs equipped with the same encodings would likewise
+possess the same expressive power. Hence, regarding expressive power, GTs do not
+have an inherent advantage over GNNs.
+    GNNs with a virtual node connected to all other nodes are sufficient to simulate a
+graph transformer. Conversely, Kim et al. (2022) propose a hierarchy of (higher-order)
+transformers and respective positional encodings that is aligned with k-IGNs (Maron
+et al., 2019), i.e., for each k>1, there exists a corresponding higher-order transformer
+that can simulate a k-IGN. The relationship between k-IGNs and k-WL (Maron et al.,
+2019) then implies the connection between transformers and the k-WL hierarchy as
+well.
+2.3 Graph Transformers                                                               11
+
+
+2.3.4     Positional and Structural Encodings
+Without Positional Encodings (PEs) and Structural Encodings (SEs), GTs are topology-
+ignorant. That is, they are equivalent to permutation-invariant set operators.
+   Comparing GTs by PE (Black et al., 2024).
+   Simple paths (Airale et al., 2025) and homomorphism (Bao et al., 2025) PEs.
+
+
+2.3.5     Graphormer
+
+2.3.6     GraphGPS
+
+2.3.7     GRIT
+GRIT injects graph structure into a Transformer with no message-passing branch, via
+three mechanisms.
+
+
+RRWP positional encoding. Let M := D−1 A be the random-walk transition
+matrix. Each ordered pair (i, j) receives
+                                  h                         i
+                          Pij = I, M, M2 , . . . , MK−1           ∈ RK ,           (2.4)
+                                                             ij
+
+
+so (Mk )ij is the k-step landing probability. The diagonal Pii recovers RWSE, while
+the off-diagonal supplies the relative term.
+
+
+Initialisation.
+                           xi = [ xi′ ∥ Pii ],   eij = [ e′ij ∥ Pij ],             (2.5)
+
+with eij defined on all N 2 pairs (i.e. raw semantic node features are concatenated with
+RWSE terms, while the pair states are initialised by the RRWP vector for each ordered
+pair.
+
+
+Attention. Pair states are updated in-layer and fed forward:
+                                                                        
+                  êij = σ ρ (WQ xi + WK xj ) ⊙ WEw eij + WEb eij ,                (2.6)
+                                            
+                  αij = Softmaxj WA êij ,                                         (2.7)
+                                                     
+                  x̂i =         αij · WV xj + WEv êij ,                           (2.8)
+                          X
+                            j
+12                                                                 Graph Machine Learning
+
+
+where ρ(x) := (ReLU(x))1/2 − (ReLU(−x))1/2 . Query and key combine additively and
+are gated multiplicatively by the pair state; êij becomes the next layer’s edge input
+(residual + BN).
+
+Degree scaler. Softmax is degree-invariant, so di is re-injected per layer:
+
+                         xi′ := xi ⊙ θ 1 + log(1 + di ) · xi ⊙ θ 2 .                 (2.9)
+
+LayerNorm destroys this signal so GRIT uses BatchNorm.
+
+Expressivity. MLP(P) approximates shortest-path distance up to K−1 hops and
+any k θk (D−1 A)k . GD-WL with RRWP is strictly stronger than GD-WL with SPD
+    P
+
+(separates Dodecahedron/Desargues). Cost is O(N 2 ) per layer.
+
+
+2.3.8    Expansion of GNNs and Sparsification of GTs
+Overglobalising issue Xing et al. (2024)
+
+
+2.4     The Vanishing GNN-GT Benchmarking Gap
+2.4.1    GNN+ Models
+GNN+ Luo et al. (2025)
+  Enhancing GNNs (with attention) Liao and Poczos (2025)
+
+
+2.4.2    Where Did the Gap Go?
+Tönshoff et al. (2024)
+
+
+2.5     Gaps in the Mechanistic Understanding of Graph
+        Transformers
+Key points: some prior work studying what GNNs have learnt, very limited prior
+work into understanding GTs, essentially no work at understanding the GNN-GT
+vanishing benchmark gap findings (mostly benchmark-driven sentiment). One clear
+goal of mechanistic work here should be model-agnostic design: a methodology that
+generalises across the myriad of GT architectures, allowing cross-model insights.
+2.6 Attention Head Specialisation in Transformers                                      13
+
+
+   Bamberger et al. (2025)
+
+
+2.6      Attention Head Specialisation in Transformers
+Urrutia et al. (2026) Urrutia’s shared intervention is clean for classifying attention
+transformation behaviour; separate interventions would be complementary and cleaner
+for measuring independent causal content/position sensitivity, but substantially harder
+to define validly in LLMs.
+    After swapping two tokens while positions remain fixed, non-uniform attention can
+either stay with the slots—positional invariance—or move with the tokens—semantic
+equivariance. It generally cannot do both. Only uniform/degenerate attention approxi-
+mately satisfies both transformation laws, which is the basis of Urrutia et al.’s exclusion
+result. Thus the anticorrelation is not necessarily evidence that the model allocates
+a fixed resource between semantics and position; it partly reflects two competing
+explanations of the same response. Urrutia et al.
+    (Gu et al., 2026) – found a RoPE specialised head that carried significant ablation
+weight.
+
+
+2.6.1     Quantifying semantic–positional specialisation in LLMs
+Urrutia et al. (2026)
+
+
+2.6.2     Why positional–symbolic symmetry does not directly
+          generalise to graphs
+? distinguish symbolic and positional attention using a single content-transposition
+intervention. Let A(X, P) denote an attention profile produced from token content X
+at fixed sequence positions P, and let Π transpose two tokens. Attention is positionally
+invariant when
+                                A(ΠX, P ) ≈ A(X, P ),
+
+and symbolically equivariant when
+
+                                A(ΠX, P ) ≈ ΠA(X, P ).
+
+For a non-uniform attention profile, these are competing transformation laws: attention
+mass cannot generally remain at the original positions while also following the trans-
+posed tokens. Their observed inverse relationship is therefore partly induced by the
+14                                                             Graph Machine Learning
+
+
+shared intervention and its symmetry structure, rather than necessarily representing a
+zero-sum allocation of model capacity. Uniform attention is a degenerate case that can
+approximately satisfy both conditions.
+    This construction is natural for language because sequence positions are canonical
+ordered indices. Graphs lack a comparable canonical positional frame of reference: node
+indices are in fact arbitrary, and structure is distributed across adjacency, topology,
+and edges. Under a semantic transposition, invariance may indicate genuine structural
+dependence, but it may equally indicate an inert or uniform head, a permutation-
+invariant semantic aggregation, or a head simply unaffected by the selected nodes.
+The strong inverse semantic–positional relationship under the semantic transposition
+intervention is lost. It is therefore imperative that structural dependence is probed by
+its own intervention, while holding semantic content fixed, meaning that the elevation
+of (Urrutia et al., 2026) naturally necessitates the separation of semantic and structural
+interventions.
+2.7 Summary                                                                          15
+
+
+2.7      Summary
+This leaves us with the following motivation and research questions.
+    In the absence of a significant performance gap between GNN+ and GT models,
+the reach of a dense GT must not be inherently advantageous to the problem. In
+such cases, are GNN+ and GT models learning to approximate the same functional
+solution? There are plausible explanations for why this must not strictly be the case.
+For example, a GT has advantages in reducing over-squashing and extending reach
+beyond what is achievable by a classical GNN. However, this reach can also serve as
+a burden, increasing the likelihood of overfitting to long-range nodes and worsening
+the signal-to-noise ratio among node candidates. We aim to answer this question,
+addressing both semantic and structural components of the solution. Moreover, do
+GNN+ and GT models differ in how a matched functional solution is formed internally?
+What is the role of PEs in this process?
+   When a performance gap is present, the core question is where it emerges from.
+Does it come from a mitigation of over-squashing? (as opposed to pure reach). If so, can
+we characterise the severity of over-squashing in the classical GNN, and prescribe a fix?
+Can we provide a mechanistic motivation for the best approach to graph sparsification?
+
+
+
+
+                                   Fig. 2.1 Caption
+
+
+    y-axis = how much the prediction moves when you delete edges; higher = those
+edges mattered more to the output. Attention isn’t noise. Both attention- and carriage-
+ranked lines sit well above random in both panels. attention is spread more widely
+than the causally-useful subset. The gap between carriage and attention shows that
+attention does not align with causal importance. Near neighbourhoods are dense and
+redundant (many parallel short paths), meaning a high-attention near edge can have a
+large mixing weight. Far edges are sparse and non-redundant, forcing attention and
+carriage onto the same irreplaceable few connections, leading to a closer gap. Natural
+reflection of the model making use of redundant computational pathways.
+   Significant difference in causal carriage implemented. Dense GRIT sustains a
+long-range carriage plateau, while 1-hop local models decay quickly with distance (over-
+16                                                                                                                                    Graph Machine Learning
+
+                                                 Over-squashing: carriage magnitude vs distance by model (half-distance annotated)
+                                                                                                  dense_grit
+                                                                                                  gin
+                                                                                                  grit_1hop
+                                                                                                  grit_1hop_localrrwp
+                                           0.8
+
+
+
+
+                     |C| / per-graph max
+                                           0.6
+                                                                                                                             dense_grit hd>18
+
+
+
+
+                                                          grit_1hop
+                                                          grit_1hop_localrrwp
+                                                         gin hd=4   hd=4      hd=4
+                                           0.4
+
+
+                                           0.2
+
+
+                                           0.0
+                                                 2                       4           6   8             10          12   14   16            18
+                                                                                             Molecular hop distance
+
+
+                                                                                     Fig. 2.2 Caption
+
+squashing?) – essentially zero long-range content transport. Motivates questioning
+whether dense GRIT’s long-range carriage causally benefits performance.
+
+
+
+
+                                                                                     Fig. 2.3 Caption
+
+
+
+
+                                                                                     Fig. 2.4 Caption
+
+   Clamp validation check – mediator patching completely works. So dense routes long-
+range influence without local composable steps, which fully characterise representations
+developed layer-wise in 1-hop local models.
+   Depth of composition: dense GRIT clamp carriage stays flat and matched to
+unclamped carriage at every clamp depth, evidencing static layer-equalised composition.
+2.7 Summary                                                                     17
+
+
+
+
+                                 Fig. 2.5 Caption
+
+
+in GIN, short-range carriage falls to zero by clamp layer 3, showing a very shallow
+composition. In 1-hop GRIT models, carriage falls to zero only when clamped through
+full 9 layers, evidencing deep composition.
+Chapter 3
+
+Measuring Semantic and Structural
+Behaviour in Graph Transformers
+
+3.1      Motivation and design principles
+Overview. We introduce a novel methodology for separately probing the semantic and
+structural components of computation in Graph Transformers (GTs). Our approach
+applies controlled, localised perturbations at the graph input and measures their
+downstream effects on attention-head transport and model behaviour. Specifically, we
+define two donor-swap interventions: a semantic intervention that replaces a node’s
+content while preserving its structural context, and a structural intervention that
+replaces its topology-derived positional encoding while leaving node content fixed.
+These same interventions underpin our head-specialisation scores, causal validation
+experiments, and distance-resolved measures of Functional and Beneficial carriage,
+providing a common methodological foundation for the analyses that follow.
+
+
+Motivation. As pointed out in Section 2.5, work towards the mechanistic understand-
+ing of GTs has been limited relative to advancements in understanding Large Language
+Model (LLM) behaviour. Moreover, many prior works have identified attention-head
+specialisation in LLMs...
+
+
+Key prior work. Urrutia et al. (2026) establish intervention-based metrics for
+quantifying attention-head specialisation in LLMs equipped with Rotary Positional
+Encodings (RoPE). See Section 2.6.1 for details. In this work, a single semantic node
+transposition is used to jointly compute semantic and positional scores – applied locally
+20             Measuring Semantic and Structural Behaviour in Graph Transformers
+
+
+to key vectors at head input – and the specialisation scores are computed based on the
+response of attention matrices to the intervention.
+   do we want a different DP (I) – e.g. Intervention-defined behaviour, then move
+global interventions to a separate II and so forth? if so we need to align any other
+mentions to the DPs.
+
+
+Design Principle (I): global interventions. Our work introduces several key
+methodological improvements to this prior work. Firstly, we use global interventions
+in place of local ones, meaning that the intervention is applied to the input of the
+model, rather than just at the input to the attention head of interest. Using global
+interventions allows the specialisation scores to better capture network and residual
+stream dynamics, and enables the methodology to be applied to a wider range of
+transformer models. For example, using global interventions in place of local ones in
+the semantic–positional methodology of (Urrutia et al., 2026) allows specialisation
+scores to be computed on No Positional Encodings (NoPE; Haviv et al. (2022)) models.
+We substantiate these claims in Section 4.1.
+
+
+Design Principle (II): transport-based scores. A second improvement we intro-
+duce is swapping attention-based scores for transport scores, i.e. we measure changes to
+head output rather than changes to raw attention under interventions. Most relevant
+positional encodings for LLMs, including RoPE Su et al. (2024), AliBi Press et al.
+(2022), directly inject positional information into the raw attention scores of LLMs.
+Using attention-based specialisation may suffice in these cases because attention is the
+primary point of discrimination between semantic and positional computation in the
+model. This applies likewise to the Graphormer GT model (Ying et al., 2021), which
+predominantly injects structural information via an additive bias to raw attention
+logits. However, GT models such as GRIT (Ma et al., 2023) and CSA (Menegaux
+et al., 2023) directly inject structural information into the value component of head
+output. In such cases,
+    Moreover, measuring the response of head output to interventions may also naturally
+improve the faithfulness of specialisation scores computed when absolute positional
+encodings are used because such encodings more directly inject positional information
+into the residual stream, which is likely better captured by value vector representations
+of tokens in the residual stream. However, we leave validation of this idea to future work,
+and we consider the primary motivation for transport-based scores to be improving
+the applicability of our methodology to a wider range of GT models.
+3.2 Semantic and structural interventions                                                 21
+
+
+Design Principle (III): separate semantic–structural interventions. In Sec-
+tion 2.6.2, we argue that using a single shared intervention for attention-head speciali-
+sation scores, as in Urrutia et al. (2026), is well-suited to probing LLMs equipped with
+RoPE, but it is not naturally well-suited to GT models. The primary reason is the
+structural diversity problem: across GTs, structural encodings lack a canonical mode of
+injection, and often use a multitude of positional encodings in combination. In GRIT,
+for example, has three major sites of structural injection: (i) via concatenation of struc-
+tural features with node semantic features; (ii) additively into raw attention; and (iii)
+via direct structural modulation of head output (Ma et al., 2023). This is even further
+complicated by the evolution of the pairwise representation tensor, which updates its
+representation of node pairs by mixing both semantic and structural information after
+each layer. The end result is this: semantic and structural computation do not strictly
+fight for expression via the same degrees of freedom in a GT, and semantic–structural
+entanglement is highly probabe. Hence, while RoPE naturally induces a direct trade-off
+between positional (high frequency) and semantic (low frequency) attention represen-
+tation, the design of GTs lacks a clear inverse structural–semantic relationship. It
+is therefore natural to probe semantic and structural computation separately, rather
+than designing metrics that expect an inverse relationship in the absence of a strong
+rationale for the existence of such a relationship. Findings in Section 5 strongly support
+this idea.
+
+
+Design Principle (IV): in-distribution interventions. ...
+
+
+Design Principle (V): shared methodology across models. One of the critical
+gaps identified in Section 2.5 is a lack of mechanistic tools that apply across architectures.
+The methodology introduced in our work is therefore aimed to apply to any attention-
+based GT. This includes predominant architectures, like Graphormer, GraphGPS, and
+GRIT. Moreover, it applies equally to their sparsified variants.
+
+
+
+3.2      Semantic and structural interventions
+In this section, we clarify the terminology used throughout this chapter, introduce the
+concept of global graph-input interventions, and then specify the precise semantic and
+structural interventions adopted in our work.
+22              Measuring Semantic and Structural Behaviour in Graph Transformers
+
+
+3.2.1     Graph interventions
+Our methodology is centred around novel Graph-input Interventions (GIs). GIs are
+controlled perturbations applied to the graphs at GT input, allowing model behaviour
+to be probed by measuring downstream effects. Two specific interventions form the
+foundation of our work: semantic and structural donor-swap interventions, which
+perturb the semantic or structural information of just one single node in isolation.
+
+
+Complete graph input. Let
+
+                                    G = (C, R, P, W )
+
+denote the complete tensorised input presented to the model for graph G, where C
+contains semantic content, R contains immutable task controls, P contains topology-
+derived positional or structural encodings, and W contains fixed graph and architectural
+support, including edges, bond attributes, and optional attention masks.
+
+
+Channel-specific features. The channel-specific features associated with a node
+are the complete collection of model-input features assigned to that node within a
+declared channel. There are two channels of interest: semantic and structural. For the
+semantic channel, these are its task-declared node-content features. For the structural
+channel, they comprise its node-level PE features together with the corresponding
+outgoing row, incoming column, and self-entry of every pairwise PE field. We denote
+the channel as c ∈ {sem, str}.
+
+
+Source and carrier nodes. For a particular intervention event, the source s is the
+node whose channel-specific features are replaced. A carrier i is a node at which the
+resulting change in head transport is measured. Source and carrier are roles rather
+than distinct node types: any graph node may act as a source or carrier. Where a
+model contains a graph token or virtual node, it may additionally act as a carrier even
+though it is not an ordinary graph node.
+
+Definition 3.2.1 (Graph-input intervention) A graph-input intervention is a trans-
+formation
+                               Iη : G 7−→ G η
+
+applied to graph G before the model forward pass, where η identifies the intervention
+event. It changes a declared subset of the graph-input features while leaving its declared
+3.2 Semantic and structural interventions                                           23
+
+
+complement, the model parameters, and the original target fixed. A channel-specific
+intervention changes only the features assigned to that channel.
+
+
+Definition 3.2.2 (Donor-swap) Let s be a source node and v an eligible donor for
+channel c. A donor-swap
+                                     c
+                                   Ds←v
+
+replaces the complete channel-specific features associated with s by the corresponding
+features of v, while leaving the donor, every non-source coordinate, and every field
+outside channel c unchanged. A donor-swap is a one-way replacement: the source
+receives the donor features, but the donor is not modified.
+
+
+Definition 3.2.3 (Node transposition) Let u ̸= v be two nodes in the same graph.
+A channel-c node transposition reciprocally exchanges the complete channel-specific
+features associated with u and v. For a node-indexed field A and pair-indexed field B
+belonging to channel c,
+
+                           A′ = Puv A,      B ′ = Puv BPuv
+                                                        ⊤
+                                                           ,
+
+where Puv is the permutation matrix exchanging u and v. All fields outside channel c
+remain fixed.
+
+
+On donor-swaps and node transpositions. Both donor-swaps and node transpo-
+sitions are equally valid intervention approaches. In particular, they similarly perturb
+channel-specific features by replacing them with those of a different, but otherwise
+perfectly ordinary node (aligned with Design Principle IV). Assuming donor-swaps
+are derived from nodes belonging to graphs in the dataset, these two intervention
+types prevent replacing graph information with semantic or positional features that
+are completely unfamiliar to the model, thereby minimising out-of-distribution risk.
+Node transpositions were applied to the local key vectors at head input in (Urrutia
+et al., 2026). In Appendix A.1, we experiment with using both types of intervention,
+and find that both intervention methods work equally well and produce consistent
+specialisation scores. We ultimately adopt donor-swaps as the primary intervention
+method because they cleanly allow a single node to be perturbed, rather than a pair of
+nodes, which helps for distance-dependent analysis. A visualisation showing examples
+of donor-swaps and node transpositions is provided in Figure 3.1.
+24                     Measuring Semantic and Structural Behaviour in Graph Transformers
+
+
+           a     Donor swap                                                    b   Node transposition
+
+
+
+
+                w                 v                                                v
+
+
+               donor
+
+
+
+                                                                                                                  u
+
+
+                                            xv ← xw                                              (xu , xv ) ← (xv , xu )
+
+                              replace semantic or structural features                      swap semantic or structural features
+
+
+
+
+Fig. 3.1 Example graph interventions: donor-swaps replace channel-specific features
+of a source node with those of another node, whereas node transpositions swap the
+channel-specific features of two nodes in a graph.
+
+
+3.2.2     Semantic donor-swap
+
+Definition 3.2.4 (Semantic intervention) A semantic intervention at source j re-
+places that node’s content with alternative content x̃ ∈ Rd , holding the structure S and
+all other nodes’ content fixed:
+                                                                                      
+                 Xj→x̃ =                  x1 , . . . , xj−1 , x̃, xj+1 , . . . , xn ,                 S unchanged.                (3.1)
+
+The intervened prediction is f (Xj→x̃ , S) and the intervened states are hLi (Xj→x̃ , S).
+
+
+
+    Because S is held fixed, the graph keeps exactly the same node set, edge set and
+positional encoding; only the identity of one node changes. Any resulting change in the
+model’s behaviour is therefore attributable to content alone. This is what makes the
+intervention semantic, and it is the counterpart of the structural interventions, which
+instead perturb S while holding X fixed.
+
+
+
+Definition 3.2.5 (Semantic donor-swap) Let s be a source node in a base graph G,
+and let v be a donor node from a different graph Ge in the declared donor pool. Writing
+xi for the task-declared semantic features of node i, the semantic donor-swap
+
+                                                                         sem
+                                                                        Ds←v
+3.2 Semantic and structural interventions                                           25
+
+
+produces the intervened features
+                                           
+                                           x
+                                            ev ,   i = s,
+                                   x′i =
+                                           xi ,
+                                           
+                                                    i ̸= s.
+
+All structural encodings, immutable task controls, topology, edge and bond features,
+attention support, and the original target remain fixed.
+
+
+On semantic donor node selection. Eligible donor nodes must differ semantically
+from the source to prevent a no-op intervention, and we preference donors with a
+similar degree (i.e. a matched number of edges). Sampling is graph-balanced: an
+eligible donor graph is sampled uniformly, followed by uniform sampling over its
+eligible minimum-degree difference nodes. The pool of donor graphs is disjoint from all
+evaluated base-graph splits.
+
+
+3.2.3     Structural donor-swap
+Definition 3.2.6 (Structural donor-swap) Let s be a source node and v ̸= s an
+eligible donor node in the same graph. Writing pi for a node-indexed PE and rij for a
+possibly directed pairwise PE, the structural donor-swap
+
+                                             str
+                                            Ds←v
+
+is defined by                              
+                                           pv ,
+                                           
+                                                    i = s,
+                                   p′i =
+                                           pi ,
+                                           
+                                                    i ̸= s,
+and                                   
+                                      
+                                      
+                                      
+                                      rvj ,    i = s, j ̸= s,
+                                      
+                                      
+                                                j = s, i ̸= s,
+                                      
+                                      riv ,
+                                      
+                               ′
+                              rij =
+                                      
+                                      
+                                      
+                                      rvv ,    i = j = s,
+                                      
+                                      
+                                      
+                                      rij ,
+                                      
+                                                otherwise.
+The same operation is applied to every task-declared node- and pair-indexed structural
+field. Semantic content, immutable task controls, topology, edge and bond features,
+attention support, and the original target remain fixed. The donor coordinate itself is
+unchanged.
+26             Measuring Semantic and Structural Behaviour in Graph Transformers
+
+
+On stuctural donor node selection. Eligible donor nodes must have have structural
+features distinct from the source, and we preference donors of the same degree as the
+source node. We use within-graph structural donors because their pairwise encodings
+refer to the same set of nodes and can therefore be copied directly onto the source.
+Donor nodes are uniformly sampled over nodes on the graph.
+    Possibly delete: Degree injection is often encoded by GTs separately to standard
+structural encodings. For example, in GRIT (Ma et al., 2023), a learned degree-
+dependent scalar is applied to each layer’s node representation. Degree-matching
+reduces a major confound here: by controlling for degree-matched donors, we can
+cleanly isolate the intervention effect from the change in structural encoding, rather
+than conflating this change with the effect of separate degree injection.
+
+
+3.3      Measuring attention-head specialisation
+We measure attention-head specialisation by quantifying how strongly each head’s
+transported messages respond to semantic and structural donor-swaps. The interven-
+tions are applied at graph input and propagated through the complete nonlinear model.
+Head responses are then projected onto the model’s output space, ensuring that the
+resulting scores capture transport that is relevant to the model’s prediction rather than
+arbitrary changes in its hidden representation.
+
+
+3.3.1     Output geometry and per-head transport
+                                                                                    (ℓ,h)
+Consider layer ℓ, attention head h, receiving node i, and sending node j. Let Aij
+denote the post-softmax attention weight and mℓhij the complete message sent from j to
+i, including any value and edge-dependent components. The routed output delivered
+by the head to node i is
+                                 (ℓ,h)   X (ℓ,h) (ℓ,h)
+                                oi     =  Aij mij .
+                                         j
+
+             (ℓ,h)
+We refer to oi    as the per-head transport site. In implementation, this is the actual
+head-output tensor consumed by the remainder of the model, rather than a detached
+reconstruction from the attention matrix.
+   Let
+                                   yb = ρ(H (L) ) ∈ RT
+
+denote the model output for a T output dimensions, where H (L) contains the final
+node states and ρ comprises the permutation-invariant graph-pooling operation and
+3.3 Measuring attention-head specialisation                                            27
+
+
+prediction head. To place different output dimensions on a common scale, each task
+registers a fixed positive scale σt , giving
+
+                                     ybt
+                              zt =       ,         t ∈ {1, . . . , T }.
+                                     σt
+
+For multi-target regression, σt is the training-set standard deviation of target t; for
+classification, z is normally the logit vector with σt = 1. These scales are estimated
+from training data only and remain fixed throughout analysis.
+   At the clean graph input, we compute the output gradient
+
+                                           (ℓ,h)       ∂zg,t
+                                          ϕg,t,i =         (ℓ,h)
+                                                                   ,
+                                                       ∂og,i
+
+which measures the local sensitivity of output t to the message delivered by head (ℓ, h)
+at carrier i.
+
+
+
+Definition 3.3.1 (Output-projected transport response) For channel c ∈ {sem, str},
+source s, donor event k, and graph g, the intervention-induced change in head transport
+is
+                                (ℓ,h),c   (ℓ,h)        (ℓ,h)
+                             ∆og,s,k,i = og,clean,i − og,c(s,k),i ,               (3.2)
+
+   which follows a clean output subtract intervened output convention. Its first-order
+projection onto output dimension t is
+                                               D                         E
+                                (ℓ,h),c            (ℓ,h)       (ℓ,h),c
+                               qg,s,k,i,t = ϕg,t,i , ∆og,s,k,i .
+
+The vector
+                                             (ℓ,h),c
+                                           qg,s,k,i,: ∈ RT
+
+is the output-projected transport response of head (ℓ, h) at carrier i to the intervention
+event.
+
+
+
+Interpreting output-projected transport response. The graph-input interven-
+tion is finite and propagates through the complete nonlinear GT. Only the projection
+from the per-head transport site into output space is linearised around the clean
+computation. Accordingly, q is a first-order measure of output-relevant head transport,
+rather than an exact decomposition of the finite prediction change.
+28              Measuring Semantic and Structural Behaviour in Graph Transformers
+
+
+3.3.2      Raw semantic and structural scores
+Using the output-projected transport response of Definition 3.3.1, we define two raw
+measurements for every attention head: its response to the semantic donor-swap of
+Definition 3.2.5, and its response to the structural donor-swap of Definition 3.2.6.
+
+
+3.3.3      Raw semantic and structural scores
+. The full specialisation scoring methodology is depicted in Figure 3.2.
+
+Definition 3.3.2 (Raw channel score) Let g ∈ {1, . . . , G} index the G graphs used
+for analysis, and let Vg be the node set of graph g, with ng = |Vg |. For each source
+node s ∈ Vg , let k ∈ {1, . . . , K} index one of its K sampled donor events. Finally, let
+ (ℓ,h),c
+qg,s,k,i,t be the output-projected transport response from Definition 3.3.1, measured at
+carrier i and output dimension t.
+    The event-level response of head (ℓ, h) is
+                                               " T             #1/2
+                              (ℓ,h),c           X  (ℓ,h),c 2
+                             Eg,s,k =                                                             (3.3)
+                                       X
+                                                            qg,s,k,i,t    .
+                                      i∈Vg            t=1
+
+
+Thus, the response magnitude is computed across the T output dimensions at each
+carrier and then summed over carrier nodes.
+   The graph-level channel score averages over donor events and source nodes:
+
+                                             1 X 1 X    K
+                                                            (ℓ,h),c
+                             Sc,g (ℓ, h) =                E         .                             (3.4)
+                                             ng s∈Vg K k=1 g,s,k
+
+     The raw score then averages across G graphs:
+
+                                                  1 XG
+                                 Sc (ℓ, h) =            Sc,g (ℓ, h).                              (3.5)
+                                                  G g=1
+
+     The two primary head measurements are
+
+                Ssem (ℓ, h) = Sc (ℓ, h)           ,         Sstr (ℓ, h) = Sc (ℓ, h)           ,
+                                          c=sem                                       c=str
+
+
+which we call the semantic score and structural score, respectively.
+
+Aggregation order and graph-weighting. The order of aggregation is important.
+For each donor event and carrier, the L2 magnitude is first taken across output
+3.3 Measuring attention-head specialisation                                          29
+
+
+dimensions. These carrier magnitudes are summed before averaging donor events within
+sources, sources within graphs, and finally graphs equally. Computing magnitude before
+donor averaging prevents equally strong but directionally opposite donor responses
+from cancelling, while equal graph weighting prevents graphs with more nodes or
+sampled sources from dominating the estimate.
+
+Interpreting scores. A large semantic score indicates that the messages transported
+by a head respond strongly and output-relevantly to changes in node content; a large
+structural score has the analogous interpretation for changes in structural encoding.
+Both scores are non-negative. Raw amplitudes are comparable across heads within a
+registered task and model, but the semantic and structural intervention distributions
+need not have intrinsically equivalent scales. Normalised measures of overall sensitivity
+and relative channel preference are therefore introduced separately in Section 3.3.4.
+
+
+3.3.4     Joint sensitivity and selectivity
+To describe the relative position of each head within a model, we first define
+
+                                                             Sc (ℓ, h)
+                      S c = mean Sc (ℓ, h),    sc (ℓ, h) =             ,
+                             ℓ,h                                Sc
+
+for c ∈ {sem, str}, where the mean is taken over all registered attention heads. This
+normalisation is performed separately for each channel, primarily to account for
+potential scale differences in the raw scores.
+
+Definition 3.3.3 (Joint sensitivity and selectivity) The Joint sensitivity of head
+(ℓ, h) is
+                                   1
+                       J(ℓ, h) = (ssem (ℓ, h) + sstr (ℓ, h)) .
+                                   2
+Its Selectivity is
+                                      ssem (ℓ, h) − sstr (ℓ, h)
+                      Drel (ℓ, h) =                               ,
+                                    ssem (ℓ, h) + sstr (ℓ, h) + ε
+where ε > 0 is a numerical stabilier that protects against instabilities from heads that
+are jointly unresponsive to semantic and structural interventions.
+
+Interpreting joint sensitivity. Joint sensitivity J is a measure of the overall
+normalised responsiveness of a head to the two intervention channels. The term joint
+refers to this combined summary: a large value may arise from strong responsiveness
+to either one or both channels and does not imply balanced processing.
+30                          Measuring Semantic and Structural Behaviour in Graph Transformers
+
+
+ a   One clean run, two donor-swap channels                                              b                    Score one head from its transport site
+
+                                                                                             (ℓ, h)                                (ℓ, h)       (ℓ, h)
+                                                                                         E                            = Σi |φi              · Δoi        |
+                                                                          semantic                                                  heads h                                     one semantic event
+                                                                          intervention
+                                                                                                                                                                         magnitude at each carrier, then Σi
+                                                         s
+
+                                                                                              layers ℓ
+                                             w
+
+                                            donor from another graph
+                                                                                                                                                                 |qi |
+
+
+                                                                                                                              one head (ℓ, h)
+                                                                                                                                                                                       carriers i
+     clean graph
+                                                 v                        structural
+                                                                          intervention
+                                                         s                               averaged over donors, then sources, then graphs → Ssem (ℓ, h), Sstr (ℓ, h)
+
+                                            donor from the same graph
+
+
+ c   One score per head, per channel                                                     d                    The head specialisation plane
+
+
+                                                                                                                                            layer 1                               ed
+                                                                                                                                                                             nc
+                      Ssem /Ssem                             Sstr /Sstr                                                                     layer 2                      ba
+                                                                                                                                                                             la
+
+
+
+
+                                                                                              Semantic score Ssem /Ssem
+                                                                                                                          2                 layer 3
+
+
+
+
+      layers ℓ
+                                                                                                                                              (ℓ, h)
+                                                                                                                          1
+
+
+                       heads h
+
+
+
+                                                                                                                          0
+                 0                    1.7            0                       2.3
+                                                                                                                               0                             1           2
+                            outlined: the head scored in b
+                                                                                                                                               Structural score Sstr /Sstr
+
+
+
+Fig. 3.2 Semantic and structural scores. a. A semantic or structural donor-swap
+intervention is applied to a clean graph. b. The change in output at head (ℓ, h) is
+measured. c. Aggregating across interventions and graphs gives separate per-head
+scores. d. Head role is derived from the relationship of scores.
+
+
+Interpreting selectivity. Selectivity Drel describes the relative balance between
+semantic and structural focus. Positive (negative) values indicate a greater preference
+for semantic (structural) reasoning. Values near zero indicate a balanced normalised
+response under the intervention channels.
+
+
+
+3.3.5                Distance decomposition of head scores
+
+Shortest-path distance provides a common coordinate for localising the response to
+an intervention. Let dg (i, s) denote the shortest-path distance between source s and
+carrier i in the clean graph g.
+3.4 Distance-resolved carriage                                                                  31
+
+
+Definition 3.3.4 (Distance-resolved raw score) For channel c, the contribution
+to the graph-level score from carriers at distance d is
+
+                                                                          (ℓ,h),c
+                     Cg,c (ℓ, h, d) = mean mean                                                (3.6)
+                                                             X
+                                                                         qg,s,k,i,:       .
+                                           s         k                                2
+                                                         i: dg (i,s)=d
+
+
+
+    where a mean is taken over both the sampled sources in g and the K sampled donor
+events for each source, and the sum is over all carriers i at clean shortest-path distance
+d from s. A distance with no such carrier contributes zero.
+   Aggregating over graphs gives
+
+                               Hc (ℓ, h, d) = mean
+                                               g
+                                                   Cg,c (ℓ, h, d).                             (3.7)
+
+
+    Equation 3.6 and Equation 3.7 are an exact decomposition of the per-graph score
+Sc,g and graph-aggregated score Sc (ℓ, h), respectively:
+
+               Sc,g (ℓ, h) =       Cg,c (ℓ, h, d),       Sc (ℓ, h) =           Hc (ℓ, h, d).
+                               X                                          X
+
+                               d                                           d
+
+
+Thus, we can exactly decompose semantic and structural scores by distance, i.e. we can
+measure whether head responsiveness to semantic and structural interventions vary
+by distance. It also ultimately means that we can probe whether an attention-head
+preferences semantic or structural behaviour by the distance between nodes. Note
+that, since graph tokens and virtual nodes lack an ordinary graph distance, we retain
+these nodes in a separate category for this analysis rather than assigning an artificial
+numerical distance.
+
+
+
+
+3.4      Distance-resolved carriage
+
+Similar to the per-head distance decomposition in Section 3.3.5, we can construct an
+aggregate measure of where a model’s response to an intervention is represented across
+the graph. We call this construction carriage, referring to the output-relevant effect of
+the intervention being carried by node representations at different distances. Carriage
+uses the same semantic and structural interventions introduced in Section 3.2, thereby
+providing separate views of the model’s semantic and structural distance dependence.
+32               Measuring Semantic and Structural Behaviour in Graph Transformers
+
+
+3.4.1      Final-state transport response
+Whereas the head scores read transported output at individual attention heads, carriage
+reads the intervention response at the final node states immediately before graph pooling
+                     (L)
+and readout. Let hg,i denote the final representation of carrier i. At the clean input,
+define
+                                             ∂zg,t
+                                   ψg,t,i =    (L)
+                                                         ,
+                                             ∂hg,i clean
+where zg,t is the scaled model output defined in Section 3.3.1.
+
+Definition 3.4.1 (Final-state transport response) For channel c, source s, donor
+event k, and carrier i, the intervention-induced change in the final node state is
+
+                                  (L),c       (L)               (L)
+                              ∆hg,s,k,i = hg,clean,i − hg,c(s,k),i .                (3.8)
+
+     Its output-projected transport response is
+                                          D                     E
+                                                        (L),c
+                              c
+                             qg,s,k,i,t = ψg,t,i , ∆hg,s,k,i ∈ RT ,                 (3.9)
+
+     where T is the output dimension.
+
+
+3.4.2      Functional carriage
+Functional carriage is the magnitude of the carriage, and its distance profile is the
+mean over pairs at a given hop distance. See Figure 3.3 for an overview of the core
+methodology.
+
+Definition 3.4.2 (Functional carriage) The channel-c functional carriage from
+source s to carrier i is
+
+                              c
+                             Fsens (g, i, s) = mean qg,s,k,i,:
+                                                     c
+                                                                          ,
+                                                    k                 2
+
+
+where the mean is taken over the K valid donor events sampled for source s.
+
+What does functional carriage measure? Functional carriage measures whether
+a typical channel-specific intervention at source s produces an output-relevant response
+at carrier i. The response magnitude is computed separately for each donor event
+before averaging, preventing responses in different output directions from cancelling.
+Intuitively, it answers does the intervention at source node s change the final state of
+3.4 Distance-resolved carriage                                                                                                                                              33
+
+
+ a    One donor swap, one pass                           b   Project onto the readout                           d        Carriage falls with distance
+                               input graph                                               (L)
+                                                                          |qi | = |g · Δhi |
+
+
+
+
+                s
+                                                                                                                        0.2                           shaded: 95% bootstrap
+                                                               s                                                                                         interval over graphs
+      w
+
+     donor
+                                                             Fsens how much of that reaches the output
+
+
+                            model, L layers                           0                        0.08
+
+
+                                                                                                                Fsens   0.1
+
+                                                 (L)     c   Aggregate over sources and graphs
+                          final-layer states h
+                                                              sample source nodes, average over graphs
+
+
+
+
+                                                                                                          ...
+
+                                                                                                                        0.0
+          s                                                                                                                   0         1         2             3          4-7
+                                                                            mean across graphs
+                                                                                                                                  d(i, s) hops from the swapped node
+                    (L)
+              ‖Δhi ‖ how far each state moved
+                                                                one dot = one graph, d = 1 bin (n = 24)
+
+                      0                           1.92
+
+
+
+
+Fig. 3.3 Measuring distance-dependent usage via carriage. a. Final layer states
+are obtained through a forward pass of the intervened graph. b. The output change
+at each node state is projected onto the readout direction. c. Aggregation across
+source nodes and graphs. d. The output is a distance-decay curve for most real-world
+datasets.
+
+
+carrier of carrier node i (at a distance of dg (i, s)), and to first-order, does the change
+in final state move the model output? Importantly, it does not measure whether the
+response at carrier i improves task performance or is necessary for the prediction. It is
+simply a measure of whether a transported signal does anything at all, i.e. a minimum
+requirement for useful distance-dependent signal.
+
+
+
+3.4.3                     Beneficial carriage
+
+3.4.4                     Distance profiles and tail summaries
+
+3.4.5                     Carriage
+A semantic intervention at j changes the final states of other nodes only if the model
+transports j’s information to them. We measure that transport causally.
+34                   Measuring Semantic and Structural Behaviour in Graph Transformers
+
+
+Definition 3.4.3 (Semantic carriage) For a readout gradient g, the carriage from
+source j to carrier i is the donor-averaged, readout-projected change in i’s final state
+under a donor swap at j:
+
+                    1 XK                                                            
+     C g [i, j] =        g ⊤ ∆hi (j, k),    ∆hi (j, k) = hLi (X, S) − hLi Xj→x̃(k) , S .   (3.10)
+                    K k=1 i
+
+The clean hLi (X, S) and intervened hLi (Xj→x̃(k) , S) states are obtained from a single
+batched forward pass of the model. A donor swap that leaves the graph unchanged,
+x̃(k) = xj gives ∆hi (j, k) = 0 and hence C g [i, j] = 0. The donor average K1 k is part
+                                                                                  P
+
+of the estimator in Eq. (3.10), so the magnitude in Eq. (??) and the loss projection in
+Eq. (??) act on this averaged carriage, not on the individual donor terms.
+     The two factors in Equation 3.10 follow intuition: ∆hi (j) asks did node j’s infor-
+mation change node i’s final-layer state?, while the projection onto gi asks, did this
+change in i move the prediction? Information that arrives at i but lies in the null space
+of the readout has C[i, j] = 0 because it is present but inert. C[i, j] is a signed quantity,
+representing the direction that the scalar prediction moves under the transport.
+
+(i) Donor-swap estimator. Averaging Equation (3.10) over the K donors of Defi-
+nition ?? gives the finite, on-manifold estimator
+
+                                     1 XK                                 
+                      Cswap [i, j] =       gi⊤ hLi (X, S) − hLi Xj→x̃(k) , S .             (3.11)
+                                     K k=1
+Chapter 4
+
+Synthetic Experiments
+
+4.1      Specialisation Scoring Design Principles
+We first implement a simple synthetic experiment to motivate the core design principle
+of global interventions, i.e. applying interventions at graph-input, rather than local ....
+   We highlight both a failure mode of previous work and a strength of our new
+methodology.
+    Using the method of Urrutia et al. (2026), in LLMs with No Positional Encoding,
+called NoPE models, every query in every attention head receives an exact, maximum
+semantic score of 1.0 for every input sequence. This is in spite of the fact that tasks and
+heads vary widely in semantic focus, and all heads receive a maximum semantic score
+even for purely positional tasks. This is not a problem for LLMs equipped with Rotary
+Positional Encodings (RoPE) due to the direct positional-modulation of attention
+scores in every head. However, even here, the scores of Urrutia et al. (2026) only
+measure whether the head acts semantically or positionally on the immediate latent
+residual stream representations; it does not consider whether this latent representation
+itself encodes strong semantic or positional representations.
+    In contrast, global interventions capture network dynamics, non-linearities, and
+residual representational focus.
+   Structure:
+
+   • Teacher–student operator distillation
+
+   • Global versus local interventions
+
+   • Transport versus attention-based scores
+36                                                                 Synthetic Experiments
+
+
+   Beyond generalising previous specialisation approaches (Urrutia et al., 2026) from
+sequence to the complex domain of graph models, we also introduce two complementary
+methodological improvements: (i) the adoption of global interventions in place of local
+head-level interventions, and (ii) transport-based metrics in place of attention-based
+ones. In this section, we demonstrate that these methodological improvements better
+capture residual-stream dynamics, and improve the faithfulness of specialisation metrics,
+even when applied to their original Large Language Model (LLM) (sequence-based)
+context.
+
+
+4.1.1     Global versus local interventions
+Relation to prior work. Urrutia et al. (2026) introduce specialisation metrics for
+LLMs based on local key-permutation interventions. In contrast, we adopt a global
+approach: interventions are applied to graph inputs, measuring downstream attention
+and transport delta by forward passing through the model. Here we demonstrate that
+the global intervention principle directly improves upon the local interventions used
+in (Urrutia et al., 2026), even when applied to LLMs rather than Graph Transformers
+(GTs). We demonstrate this by showing that replacing the local interventions in Urrutia
+et al. (2026) with global ones, while keeping the scoring methodology fixed, generate
+scoring metrics that are more faithful to underlying model dynamics.
+
+
+Teacher–student operator distillation task. We introduce a simple synthetic
+task to accentuate the failure mode of local intervention methods. In this task, given
+an ordered input sequence X = [x1 , . . . , xn ]⊤ ∈ Rn×d , the teacher “model” represents a
+simple lookup operation read out at the final (query) position n,
+
+                                        y = T (X).
+
+where T (·) represents the teacher operation. We consider three lookups,
+
+      Tprev (X) = xn−1 ,      Thalf (X) = x⌊n/2⌋ ,     Tloc (X) = arg max ⟨xn , xk ⟩,
+                                                                     k<n
+
+
+where for Tloc the query duplicates an earlier token, xn := xr with r ∼ U{1, . . . , n − 1},
+so the lookup returns its position r. Thus prev and half return a token selected
+by relative and absolute position, whereas loc returns a position selected by content.
+The student model is an L-layer, single-head NoPE transformer (i.e. an LLM absent
+of an explicit positional encoding). Each student fθ is distilled to match the teacher at
+4.1 Specialisation Scoring Design Principles                                         37
+
+
+position n, ŷ = fθ (X)n , by minimising
+                                           h             i
+                               L(θ) = EX ℓ ŷ, T (X) ,
+
+with ℓ the squared error for the token lookups (prev,half) and the cross-entropy over
+                                                                           iid
+positions {1, . . . , n − 1} for loc. Input sequences rows are drawn as xi ∼ N (0, Id ),
+simplifying the data distribution and reducing overfitting risk.
+
+
+Scoring methods. We consider three scoring methods:
+
+  • local attention: an exact replication of the method in (Urrutia et al., 2026).
+
+  • global attention: local interventions are replaced with global ones.
+
+  • global transport: scores are computed using transport, not raw attention.
+
+
+Global interventions are faithful to residual stream dynamics. Global input
+interventions measures signal surviving the network, whereas local interventions measure
+whether a head behaves semantically or positionally when acting upon the residual
+stream (which itself contains a mixture). Measuring deltas in transport is stronger than
+raw attention because it includes routing, values, and captures structural-modulation
+of messages, which can directly mediate value output in key GTs and is therefore
+missed by raw attention measurements.
+
+Table 4.1 Training summary for the teacher-student operator distillation synthetic
+tasks: mean ± std over 6 seeds of 4-layer single-head NoPE students. Regression
+targets use MSE (lower is better); the classification target uses accuracy (higher is
+better). Steps is the mean number of optimisation steps at early stopping.
+
+         Task                                    Metric        Value    Steps
+         Copy previous token                     MSE ↓ 0.238 ± 0.022 37 500
+         Copy token at ⌊q/2⌋                     MSE ↓ 0.261 ± 0.059 40 000
+         Report position of content match        Acc ↑ 0.999 ± 0.002 35 833
+
+
+
+
+4.1.2     Attention versus transport-based metrics
+Why are transport-based metrics better suited to graph models?
+38                                                                 Synthetic Experiments
+
+
+
+
+       (a) The per-layer positional specialisation fraction for each scoring method.
+
+
+
+
+  (b) Per-layer residual positional representation for each of the trained student models.
+
+Fig. 4.1 Teacher–student operator distillation in LLMs: (a) The per-layer
+positional specialisation fraction rspec for each of three tasks, and (b) the per-layer
+residual stream positional representation fraction, computed via a linear probe. Across
+all three tasks, global intervention scoring methods are shown to be more faithful
+to underlying residual stream dynamics than the local intervention approach. In
+particular, the local intervention approach is agnostic to residual stream dynamics:
+while the positional information is increasing embedded in the residual stream, the
+local attention intervention reports an increasingly semantic focus of the head. In
+contrast, global intervention approaches better capture full network dynamics, and
+correctly identify the increasingly positionally-specialised role of each head.
+
+
+
+
+4.2      Causal validation of head roles
+
+
+
+In this section, we causally validate the semantic and structural scores introduced in
+Chapter 3. In particular, we find that head selectivity is causally related to ..., joint
+sensitivity predicts ablation impact, and ...
+4.2 Causal validation of head roles                                               39
+
+
+4.2.1
+
+4.2.2    Semantic–structural mixture experiment
+
+Mixed synthetic task. We construct a paired synthetic task to separate semantic
+payload processing from structural-relation processing. Each example is an even cycle
+graph C16 with a marked query node q and a marked source node s. The location of s
+is uniformly randomly assigned. Each node receives a unique categorical key and an
+independently and uniformly sampled value
+
+                               vi ∼ Uniform{0, . . . , 7}
+
+Examples are divided equally between two modes, marked by a binary task-mode
+indicator. In the semantic mode, the target is to retrieve the value of the marked
+source node,
+                                    ysem = vs
+
+Because s is sampled independently of graph position, RRWP carries no predictive
+information about its value. In the structural mode, the target is the zero-indexed
+shortest-path distance,
+                                    ystr = d − 1
+
+Node keys and values are independent distractors in this mode. Both tasks therefore
+use the same graph family, source marker, query readout, and eight-class output head;
+they differ only in whether the required signal is the source’s semantic value or its
+structural relation to the query. Each task mode is visualised in Figure 4.2, and the
+full task config is available in Appendix A.1.
+
+
+
+Graph Transformer. We use a 3-layer dense GRIT model (Ma et al., 2023). Graph
+structure is represented by ten random-walk positional encoding channels,
+                                         h                     i
+                            RRWPij = I, P, P 2 , . . . , P 9
+
+where P is the transition matrix of C16 . Pair features comprise RRWP and a pair
+edge-type embedding, while diagonal RRWP features are additionally supplied to
+the node encoder. Predictions are read from the final representation of the marked
+query node. The dense GT was trained to minimise cross-entropy loss across 3 seeds,
+achieving perfect 1.000 ± 0.000 validation accuracy.
+40                                                                                                  Synthetic Experiments
+
+
+     Semantic: retrieve the marked source value                            Structural: retrieve the query-source distance
+
+
+                                   source                                                                source
+                                   s
+                                                ysem = vs                                               s           ystr = d − 1
+                                                    2 {0, …, 7}                                                       2 {0, …, 7}
+          retrieve source value
+
+                                                                                              d hops
+
+
+                     q                                                                    q
+               graph distance does not predict vs                                  node keys and values do not predict d
+
+
+
+Fig. 4.2 Mixed synthetic task. The semantic mode retrieves the value of the source
+whose key matches the query; the structural mode retrieves the shortest-path distance
+between the marked source and query nodes. The task is split into 50% semantic and
+50% structural examples, and C16 graphs are used for all examples (as visualised here).
+
+
+4.2.3        Recovering semantic and structural head roles
+
+Intervention-defined head scores. Semantic and structural scores are computed
+as per Section ??. For the semantic intervention, only the planted source’s value
+one-hot is replaced by a different on-manifold value. The structural intervention follows
+from Section ?? exactly. All cycle nodes have degree two, making degree matching
+exact.
+   For channel f ∈ {sem, str}, six counterfactual donors are sampled and averaged
+before taking the functional magnitude:
+
+                                                    ℓh                    1X 6
+                                            ∆og,i (f ) = oℓh
+                                                          g,i −                oℓh    (f ).
+                                                                          6 k=1 g,i,k
+
+Let zg,t denote output logit t, and define
+
+                                                                         ∂zg,t
+                                                               g,t,i =
+                                                              ϕℓh              .
+                                                                         ∂oℓh
+                                                                           g,i
+
+
+The label-free specialisation score is
+                                                                  v
+                                         1 XG X uX  8 D          u         E2
+                                                                    ℓh
+                                  Sfℓh =         t
+                                                          g,t,i , ∆og,i (f )
+                                                         ϕℓh                    ,
+                                         G g=1 i   t=1
+
+
+estimated using G = 96 independently generated graphs per factor and seed. The cor-
+responding semantic and structural scores across three seeds are provided in Figure 4.4.
+4.2 Causal validation of head roles                                                                                                        41
+
+
+                                     Intervention-defined GRIT head specialisation
+                                     Planted-source functional transport; red/blue rims mark preregistered head families
+
+
+
+
+                                               Depth
+                                                Layer 0
+                                                Layer 1
+                                                Layer 2
+                                     100
+
+
+
+
+         Semantic score Ssem/Ssem
+                                    10−1
+
+
+
+
+                                    10−2
+
+                                                                                                                           Training seed
+                                                                                                                                  Seed 0
+                                                                                                                                  Seed 1
+                                                                                                                                  Seed 2
+                                    10−3
+                                       10−3                     10−2                     10−1                      100
+                                                                             Structural score Sstr/Sstr
+
+
+ Fig. 4.3 Semantic and structural specialisation scores for the mixed synthetic task.
+
+
+4.2.4     Functional engagement and channel preference
+joint sensitivity and score selectivity.
+
+
+4.2.5     Ablation and patching double dissociation
+Necessity and rescue. Single-head necessity of the head indexed by (ℓ, h) is mea-
+                                            (ℓ,h)
+sured on 256 independent graphs by setting oi     = 0 before the GRIT output projection
+and recording both logit displacement and the change in cross-entropy. Semantic and
+structural head families are selected using specialisation scores alone: scores are nor-
+malised within seed, heads below the 40th percentile of total semantic-plus-structural
+score are excluded, and the three most selective disjoint heads are assigned to each
+family. Family necessity is then tested by jointly ablating fixed prefixes of one, two,
+and three score-ranked heads.
+
+
+Causal rescue. Causal rescue is evaluated on a separate set of 128 graphs. A clean
+intervention is first applied to the source node to produce a corrupted execution. The
+42                                                                                                                                                                                                                                 Synthetic Experiments
+
+                                 Joint influence and semantic–structural role separate head strength from preference
+                                 Scores and functional ablations are channel-mean calibrated within seed; faded heads have J < 0.5 and do not support selectivity claims.
+
+
+
+
+                                       A Strength and factor preference                                                                                                                               B Does J predict how much a head matters?
+
+
+
+
+                                                                                                                                                  Mean cross-task functional ablation impact
+                                                                                                                                                                                                        pooled ρ = 0.77
+                                                                                                                                                                                                        seed median ρ = 0.79
+                                                                                                                                                                                                100
+                                 100
+
+
+
+
+          Joint sensitivity J   10−1
+                                                                                                                                                                                               10−1
+
+
+
+
+                                10−2
+
+                                   −1.00     −0.75     −0.50 −0.25          0.00    0.25    0.50          0.75      1.00                                                                                10−2                      10−1                    100
+                                                      Selectivity Drel (structural ← 0 → semantic)                                                                                                                                 Joint sensitivity J
+
+
+                                       C Does D predict which task a head serves?                                                                                                                     D Does D predict causal rescue role?
+
+
+
+
+                                                                                                                             Semantic − structural rescue mediation
+                                1.00
+                                         reliable heads only                                                                                                                                            reliable heads only
+                                                                                                                                                                                               0.15
+                                0.75     pooled ρ = 0.93                                                                                                                                                pooled ρ = 0.89
+                                         seed median ρ = 0.90                                                                                                                                           seed median ρ = 0.91
+                                                                                                                                                                                               0.10
+
+
+
+
+Ablation role contrast
+                                0.50
+                                                                                                                                                                                               0.05
+                                0.25
+                                                                                                                                                                                               0.00
+                                0.00
+                                                                                                                                                                                 −0.05
+                          −0.25
+                                                                                                                                                                                 −0.10
+                          −0.50
+                                                                                                                                                                                 −0.15
+                          −0.75
+                                                                                                                                                                                 −0.20
+                          −1.00
+                               −1.00         −0.75     −0.50     −0.25    0.00      0.25        0.50      0.75      1.00                                                                          −1.00     −0.75   −0.50      −0.25    0.00      0.25   0.50   0.75   1.00
+                                                                  Score selectivity Drel                                                                                                                                        Score selectivity Drel
+
+
+
+                                                                            Layer 0            Layer 1            Layer 2                                                                        Seed 0         Seed 1            Seed 2
+
+
+
+
+                                                  Fig. 4.4 Joint sensitivity and specialisation preference.
+
+
+
+
+clean output of head (ℓ, h) is then patched directly into the corrupted run. Rescue is
+quantified by the mediated-effect fraction
+
+                                                                                                         ⟨zpatch − zcorr , zclean − zcorr ⟩
+                                                                               MEMℓh =                                                      .
+                                                                                                             ∥zclean − zcorr ∥22 + ϵ
+
+This design distinguishes causal efficacy from causal necessity: a head may restore
+factor-specific information when patched into a corrupted computation even when
+redundant pathways make that head dispensable under clean-input ablation.
+4.3 Head Specialisation under Communication Constraints                                                                                                                                                                                                                                                                                                                                                                                                           43
+
+                                                                                                                                                                                                                                                   Necessity plus rescue: a causal semantic/structural double dissociation
+                                                                                                                                                                                                                                                   Necessity jointly ablates each selected family; rescue patches one clean routed head at a time into the corrupted run.
+
+
+
+                                                               Joint ablation tests the causal roles of specialists, generalists, and inert heads
+                                                               Families are selected from J and D only; thin curves are training seeds and bands are seed-level 95% intervals.
+                                                                                                                                                                                                                                                                                                   A Necessity: ΔCE under simultaneous family ablation                                                      B Rescue: clean→corrupt mediated-effect fraction
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                 0.15
+
+                                                                                                                                                                                                                                                                                                                                           0.04
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                 0.10
+                                                                   A Semantic task                                                                                 B Structural task
+                                                                                                                                                                                                                                            Semantic-score heads                                         +0.003             +0.052                 Semantic-score heads                                            +0.154                    +0.066
+                                                              12                                                                                                                                                                                                                                                                           0.02
+                                                                                                                                                             12                                                                                                                                                                                                                                                                                                  0.05
+
+                                                              10
+                                                                                                                                                             10
+
+
+
+
+                                    Functional logit impact
+                                                                                                                                                                                                                                                                                                                                           0.00                                                                                                                  0.00
+                                                              8                                                                                                8
+
+                                                              6                                                                                                                                                                                                                                                                                                                                                                                                  −0.05
+                                                                                                                                                               6                                                                                                                                                                           −0.02
+                                                                                                                                                                                                                                            Structural-score heads                                       +0.000             +0.010                 Structural-score heads                                          +0.006                    +0.128
+                                                              4                                                                                                4
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                 −0.10
+                                                                                                                                                                                                                                                                                                                                           −0.04
+                                                              2                                                                                                2
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                 −0.15
+                                                                                                                                                               0                                                                                                                                      Semantic task      Structural task                                                                     Semantic corruption       Structural corruption
+                                                              0
+
+
+                                                                                                                                                                                                                                                                                                   Channel-specific causal interaction                                                                      Intervention negative controls
+                                                                                                                                                                                                                                                                                            0.25
+                                                                                                                                                                                                                                                                                                                                                                                                      1.0
+
+
+
+
+Accuracy drop (percentage points)
+                                               0.04                                                                                                          20
+                                                                                                                                                                                                                                                                                            0.20
+
+
+
+
+                                                                                                                                                                                                                                                                                                                                                                  Mean score / matched-channel mean
+                                                                                                                                                             15
+
+
+
+
+                                                                                                                                                                                                                                                         Double-dissociation interaction
+                                               0.02                                                                                                                                                                                                                                                                                                                                                   0.8
+                                                                                                                                                                                                                                                                                            0.15
+
+                                                                                                                                                             10
+                                               0.00                                                                                                                                                                                                                                         0.10
+                                                                                                                                                                                                                                                                                                                                                                                                      0.6
+                                                                                                                                                               5
+                                                                                                                                                                                                                                                                                            0.05
+                                    −0.02
+                                                                                                                                                               0                                                                                                                            0.00                                                                                                      0.4
+
+                                    −0.04                                                                                                                    −5                                                                                                                            −0.05
+                                                                                                                                                                                                                                                                                                                                                                                                      0.2
+                                                                     0                       1                      2                               3                0                        1                      2                  3                                                  −0.10
+                                                                                Number of fixed score-selected heads jointly ablated                                             Number of fixed score-selected heads jointly ablated
+                                                                                                                                                                                                                                                                                           −0.15
+                                                                                                                                                                                                                                                                                                                                                                                                      0.0
+                                                                                                                                                                                                                                                                                                        Necessity                 Rescue                                                                                           r          str
+                                                                                                                                                                                                                                                                                                                                                                                                                 →se
+                                                                                                                                                                                                                                                                                                                                                                                                                       m       →st        Str→             sem
+                                                                                                   Semantic specialists             Structural specialists            High-J generalists           Low-J / inert                                                                                                                                                                                             Sem            Sem                        Str→
+
+
+
+
+                                                                                                                    (a) First figure.                                                                                                                                                                                   (b) Second figure.
+
+                                                                                                                                                                                        Fig. 4.5 Overall figure caption.
+
+
+4.3                                                                                           Head Specialisation under Communication Con-
+                                                                                              straints
+4.3.1                                                                                              Neighbour Associative Recall (NAR)
+
+4.3.2                                                                                              Proving the role of attention support
+
+4.4                                                                                           Neighbour Associative Recall Experiment
+Chapter 5
+
+Head Specialisation and Reach in
+Real-World Graph Transformers
+
+5.1      Research questions and experiments
+
+5.2      Case Study: Graphormer on PCQM4Mv2
+– include Graphormer as a headline: clear semantic specialisation identified.
+   Hu et al. (2021); Shi et al. (2022); Ying et al. (2021).
+
+
+
+5.3      Head specialisation and causal importance
+– include ZINC, QM9, maybe peptides-struct/func in appendix.
+   – role of sensitivity J is clear: predicts ablation impact.
+   – relative semantic/structural preference is weak: hypothesise that most heads use
+an entangled representation of
+   – hypothesis: it may be architecture-dependent, add graphormer on PCQM.
+   Aim: Turn weak specialisation into a positive entanglement result
+   Aim to show:
+   J still predicts importance, so the method detects active heads.
+   Drel is weak (unlikely unstable across graphs/seeds).
+   Selective-family causal interactions fall inside a preregistered equivalence region,
+not merely fail a significance test.
+   High-J, central families causally respond to and rescue both channels.
+46                Head Specialisation and Reach in Real-World Graph Transformers
+
+
+   Bootstrap family membership is unstable or the selectivity distribution is genuinely
+narrow.
+
+
+5.4     Effects of sparse and dense connectivity
+
+5.5     Measuring Semantic and Structural Reach
+References
+
+Louis Airale, Antonio Longa, Mattia Rigon, Andrea Passerini, and Roberto Passerone.
+  Simple path structural encoding for graph transformers. In Aarti Singh, Maryam
+  Fazel, Daniel Hsu, Simon Lacoste-Julien, Felix Berkenkamp, Tegan Maharaj, Kiri
+  Wagstaff, and Jerry Zhu, editors, Proceedings of the 42nd International Conference
+  on Machine Learning, volume 267 of Proceedings of Machine Learning Research,
+  pages 857–873. PMLR, 13–19 Jul 2025. URL https://proceedings.mlr.press/v267/
+  airale25a.html.
+
+S. Akansha. Over-squashing in graph neural networks: A comprehensive survey.
+  Neurocomputing, 642:130389, 2025. ISSN 0925-2312. doi: 10.1016/j.neucom.2025.
+  130389. URL https://doi.org/10.1016/j.neucom.2025.130389.
+
+Uri Alon and Eran Yahav. On the bottleneck of graph neural networks and its practical
+  implications. In International Conference on Learning Representations, 2021. URL
+  https://openreview.net/forum?id=i80OPhOCVH2.
+
+Alvaro Arroyo, Federico Barbero, Hugh Blayney, Michael M. Bronstein, Xiaowen Dong,
+  Pietro Lio, Razvan Pascanu, and Pierre Vandergheynst. A survey on over-smoothing
+  and over-squashing: Unified propagation perspectives on graph neural networks and
+  transformers. Transactions on Machine Learning Research, 2026. ISSN 2835-8856.
+  URL https://openreview.net/forum?id=H9zhC5pVnH.
+
+Jacob Bamberger, Benjamin Gutteridge, Scott Le Roux, Michael M. Bronstein,
+  and Xiaowen Dong. On measuring long-range interactions in graph neural net-
+  works. In Aarti Singh, Maryam Fazel, Daniel Hsu, Simon Lacoste-Julien, Felix
+  Berkenkamp, Tegan Maharaj, Kiri Wagstaff, and Jerry Zhu, editors, Proceedings of
+  the 42nd International Conference on Machine Learning, volume 267 of Proceedings
+  of Machine Learning Research, pages 2770–2789. PMLR, 13–19 Jul 2025. URL
+  https://proceedings.mlr.press/v267/bamberger25a.html.
+
+Linus Bao, Emily Jin, Michael M. Bronstein, Ismail Ilkan Ceylan, and Matthias
+  Lanzinger. Homomorphism counts as structural encodings for graph learning. In
+  The Thirteenth International Conference on Learning Representations, 2025. URL
+  https://openreview.net/forum?id=qFw2RFJS5g.
+
+Mitchell Black, Zhengchao Wan, Gal Mishne, Amir Nayyeri, and Yusu Wang. Com-
+ paring graph transformers via positional encodings. In Ruslan Salakhutdinov, Zico
+ Kolter, Katherine Heller, Adrian Weller, Nuria Oliver, Jonathan Scarlett, and Felix
+ Berkenkamp, editors, Proceedings of the 41st International Conference on Machine
+48                                                                          References
+
+
+  Learning, volume 235 of Proceedings of Machine Learning Research, pages 4103–4139.
+  PMLR, 21–27 Jul 2024. URL https://proceedings.mlr.press/v235/black24b.html.
+Zihan Gu, Ruoyu Chen, Han Zhang, Hua Zhang, and Yue Hu. Deconstructing positional
+  information: From attention logits to training biases. In The Fourteenth International
+  Conference on Learning Representations, 2026. URL https://openreview.net/forum?
+  id=D0u0glT060.
+Adi Haviv, Ori Ram, Ofir Press, Peter Izsak, and Omer Levy. Transformer language
+ models without positional encodings still learn positional information. In Yoav
+ Goldberg, Zornitsa Kozareva, and Yue Zhang, editors, Findings of the Association for
+ Computational Linguistics: EMNLP 2022, pages 1382–1390, Abu Dhabi, United Arab
+ Emirates, December 2022. Association for Computational Linguistics. doi: 10.18653/
+ v1/2022.findings-emnlp.99. URL https://aclanthology.org/2022.findings-emnlp.99/.
+Weihua Hu, Matthias Fey, Hongyu Ren, Maho Nakata, Yuxiao Dong, and Jure Leskovec.
+ OGB-LSC: A large-scale challenge for machine learning on graphs. In Thirty-fifth
+ Conference on Neural Information Processing Systems Datasets and Benchmarks
+ Track (Round 2), 2021. URL https://openreview.net/forum?id=qkcLxoC52kL.
+Chaitanya K. Joshi. Transformers are graph neural networks, 2025. URL https:
+ //arxiv.org/abs/2506.22084.
+Tongzhou Liao and Barnabas Poczos. Greener grass: Enhancing gnns with encoding,
+  rewiring, and attention. In The Thirteenth International Conference on Learning
+  Representations, 2025. URL https://openreview.net/forum?id=rEQqBZIz49.
+Yuankai Luo, Lei Shi, and Xiao-Ming Wu. Can classic GNNs be strong baselines for
+  graph-level tasks? Simple architectures meet excellence. In Aarti Singh, Maryam
+  Fazel, Daniel Hsu, Simon Lacoste-Julien, Felix Berkenkamp, Tegan Maharaj, Kiri
+ Wagstaff, and Jerry Zhu, editors, Proceedings of the 42nd International Conference
+ on Machine Learning, volume 267 of Proceedings of Machine Learning Research,
+  pages 41290–41310. PMLR, 13–19 Jul 2025. URL https://proceedings.mlr.press/
+  v267/luo25h.html.
+Liheng Ma, Chen Lin, Derek Lim, Adriana Romero-Soriano, Puneet K. Dokania, Mark
+  Coates, Philip Torr, and Ser-Nam Lim. Graph inductive biases in transformers
+  without message passing. In Andreas Krause, Emma Brunskill, Kyunghyun Cho,
+  Barbara Engelhardt, Sivan Sabato, and Jonathan Scarlett, editors, Proceedings of
+  the 40th International Conference on Machine Learning, volume 202 of Proceedings
+  of Machine Learning Research, pages 23321–23337. PMLR, 23–29 Jul 2023. URL
+  https://proceedings.mlr.press/v202/ma23c.html.
+Romain Menegaux, Emmanuel Jehanno, Margot Selosse, and Julien Mairal. Self-
+ attention in colors: Another take on encoding graph structure in transformers.
+ Transactions on Machine Learning Research, 2023. ISSN 2835-8856. URL https:
+ //openreview.net/forum?id=3dQCNqqv2d.
+Luis Müller, Mikhail Galkin, Christopher Morris, and Ladislav Rampášek. Attending
+  to graph transformers. Transactions on Machine Learning Research, 2024. ISSN
+  2835-8856. URL https://openreview.net/forum?id=HhbqHBBrfZ.
+References                                                                           49
+
+
+Ofir Press, Noah A. Smith, and Mike Lewis. Train short, test long: Attention with linear
+  biases enables input length extrapolation. In International Conference on Learning
+  Representations, 2022. URL https://openreview.net/forum?id=R8sQPpGCv0.
+Yu Shi, Shuxin Zheng, Guolin Ke, Yifei Shen, Jiacheng You, Jiyan He, Shengjie
+  Luo, Chang Liu, Di He, and Tie-Yan Liu. Benchmarking graphormer on large-
+  scale molecular modeling datasets. arXiv preprint arXiv:2203.04810, 2022. URL
+  https://arxiv.org/abs/2203.04810.
+Jianlin Su, Murtadha H. M. Ahmed, Yu Lu, Shengfeng Pan, Wen Bo, and Yunfeng Liu.
+  RoFormer: Enhanced transformer with rotary position embedding. Neurocomputing,
+  568:127063, 2024. ISSN 0925-2312. doi: 10.1016/j.neucom.2023.127063. URL
+  https://doi.org/10.1016/j.neucom.2023.127063.
+Jan Tönshoff, Martin Ritzert, Eran Rosenbluth, and Martin Grohe. Where did the
+  gap go? reassessing the long-range graph benchmark. Transactions on Machine
+  Learning Research, 2024. ISSN 2835-8856. URL https://openreview.net/forum?id=
+  Nm0WX86sKv.
+Felipe Urrutia, Jorge Salas, Alexander Kozachinskiy, Cristian Buc Calderon, Hector
+  Pasten, and Cristobal Rojas. Decoupling positional and symbolic attention in trans-
+  formers. In The Fourteenth International Conference on Learning Representations,
+  2026. URL https://openreview.net/forum?id=V38yAoqddQ.
+Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones, Aidan N.
+  Gomez, Łukasz Kaiser, and Illia Polosukhin. Attention is all you need. In Advances
+ in Neural Information Processing Systems, volume 30, pages 5998–6008. Curran
+  Associates, Inc., 2017.
+Yujie Xing, Xiao Wang, Yibo Li, Hai Huang, and Chuan Shi. Less is more: on the
+  over-globalizing problem in graph transformers. In Ruslan Salakhutdinov, Zico
+  Kolter, Katherine Heller, Adrian Weller, Nuria Oliver, Jonathan Scarlett, and Felix
+  Berkenkamp, editors, Proceedings of the 41st International Conference on Machine
+ Learning, volume 235 of Proceedings of Machine Learning Research, pages 54656–
+  54672. PMLR, 21–27 Jul 2024. URL https://proceedings.mlr.press/v235/xing24b.
+  html.
+Chengxuan Ying, Tianle Cai, Shengjie Luo, Shuxin Zheng, Guolin Ke, Di He, Yanming
+  Shen, and Tie-Yan Liu. Do transformers really perform badly for graph represen-
+  tation? In M. Ranzato, A. Beygelzimer, Y. Dauphin, P.S. Liang, and J. Wortman
+ Vaughan, editors, Advances in Neural Information Processing Systems, volume 34,
+  pages 28877–28888. Curran Associates, Inc., 2021. URL https://proceedings.neurips.
+  cc/paper_files/paper/2021/file/f1c1592588411002af340cbaedd6fc33-Paper.pdf.
+Appendix A
+
+Details: Mixed Synthetic Task
+A.1       Alternative Scoring Methods
+Testing alternative scoring methods. Alongside the core specialisation metrics
+introduced in this dissertation, we considered alternative methods, more closely inspired
+by the prior work of Urrutia et al. (2026). See Table A.1 for a summary of methods.
+The M1 methods are variants of the methodology introduced in this dissertation, based
+on separate semantic and structural interventions. Here we consider combinations of
+donor-swaps (D), swapping individual node content or PE features across graphs, and
+node transpositions (T), swapping content or PE features between two nodes in the
+same graph. Additionally, M4 and M5 are direct generalisations of Urrutia et al. (2026)
+to graphs, with M7 representing a combination of these approaches. In Figure A.1(b),
+we find that the M1 variants are substantially better at distinguishing the importance
+of each attention head, and its specific semantically/structurally-specialised role.
+
+ Method      Description
+ M1_DD       Output-projected transport using semantic donor-swap and PE donor-swap.
+ M1_DT       Output-projected transport using semantic donor-swap and PE node trans-
+             position.
+ M1_TD       Output-projected transport using semantic node transposition and PE donor-
+             swap.
+ M1_TT       Output-projected transport using semantic and PE node transpositions.
+ M4          Semantic node transposition: attention equivariance is semantic; invariance
+             is structural.
+ M5          PE node transposition: attention invariance is semantic; equivariance is
+             structural.
+ M7          M4 semantic-following combined with M5 structural-following, treated as
+             separate interventions.
+                 Table A.1 Summary of alternative scoring methods.
+52                                                                                                                                                                                                                                                                                                                                                                   Details: Mixed Synthetic Task
+
+         Semantic and structural head-score planes across candidate methods
+
+
+                                                                                     M1_DD                                                                                                                   M1_DT                                                                                                                            M1_TD                                                                                                  M1_TT
+                                                                            semantic donor · PE donor                                                                                             semantic donor · PE transpose                                                                                                    semantic transpose · PE donor                                                                        semantic transpose · PE transpose
+                                                                    6                                                                                                                         6
+                                                                                                                                                                                                                                                                                                                               4                                                                                                        4
+
+
+
+
+                                       Semantic score / seed mean                                                                                                Semantic score / seed mean                                                                                                       Semantic score / seed mean                                                                               Semantic score / seed mean
+                                                                    5                                                                                                                         5
+
+                                                                                                                                                                                                                                                                                                                               3                                                                                                        3
+                                                                    4                                                                                                                         4
+
+                                                                    3                                                                                                                         3                                                                                                                                                                                                                                         2
+                                                                                                                                                                                                                                                                                                                               2
+
+                                                                    2                                                                                                                         2
+                                                                                                                                                                                                                                                                                                                               1                                                                                                        1
+                                                                    1                                                                                                                         1
+
+
+                                                                                    2           4        6                                                                                                  2           4        6                                                                                                        1       2       3     4                                                                                1       2        3     4
+                                                                            Structural score / seed mean                                                                                            Structural score / seed mean                                                                                                     Structural score / seed mean                                                                           Structural score / seed mean
+
+                                                                                    M4                                                                                                                          M5                                                                                                                             M7
+                                                                    semantic attention follow · invariant                                                                                         PE attention invariant · follow                                                                                                   semantic follow · PE follow
+                                                    1.6
+                                                                                                                                                                              1.6                                                                                                                              1.6
+
+
+
+
+                  Semantic score / seed mean                                                                                                Semantic score / seed mean                                                                                                       Semantic score / seed mean
+                                                    1.4
+                                                                                                                                                                              1.4                                                                                                                              1.4
+                                                    1.2
+                                                                                                                                                                              1.2                                                                                                                              1.2
+                                                    1.0                                                                                                                       1.0                                                                                                                              1.0
+                                                    0.8                                                                                                                       0.8
+                                                                                                                                                                                                                                                                                                               0.8
+                                                    0.6                                                                                                                       0.6
+                                                                                                                                                                                                                                                                                                               0.6
+                                                    0.4                                                                                                                       0.4
+                                                                                                                                                                                                                                                                                                               0.4
+                                                    0.2                                                                                                                       0.2
+                                                                               0.5          1.0        1.5                                                                                             0.5         1.0       1.5                                                                                                       0.5         1.0        1.5
+                                                                            Structural score / seed mean                                                                                            Structural score / seed mean                                                                                                     Structural score / seed mean
+
+
+                                                                                                                                                                                                  Layer 0               Layer 1                    Layer 2                   Seed 0                                                          Seed 1                   Seed 2
+
+
+
+
+                                                                            (a) Raw semantic–structural scores using a variety of scoring approaches.
+                                        Does each method predict head necessity and which task the head serves?
+                                        Top: J versus held-out clean-input ablation movement. Bottom: D_rel versus the semantic–structural ablation-role contrast.
+
+
+
+
+                                                                                  M1_DD                                    M1_DT                                                                                   M1_TD                                             M1_TT                                                                                      M4                                       M5                                                               M7
+
+
+
+
+                        Joint necessity
+                                                                            ρ=0.77; within=0.78                      ρ=0.77; within=0.77                                                                     ρ=0.61; within=0.57                               ρ=0.61; within=0.57                                                                     ρ=-0.49; within=-0.23                    ρ=-0.40; within=-0.19                                            ρ=-0.24; within=-0.02
+                                                        2.5                                                2.5                                                                                     2.5                                             2.5                                                                                      2.5                                       2.5                                                              2.5
+
+                                                        2.0                                                2.0                                                                                     2.0                                             2.0                                                                                      2.0                                       2.0                                                              2.0
+
+                                                        1.5                                                1.5                                                                                     1.5                                             1.5                                                                                      1.5                                       1.5                                                              1.5
+
+
+
+
+             (mean calibrated ablation movement)
+                                                        1.0                                                1.0                                                                                     1.0                                             1.0                                                                                      1.0                                       1.0                                                              1.0
+
+                                                        0.5                                                0.5                                                                                     0.5                                             0.5                                                                                      0.5                                       0.5                                                              0.5
+
+                                                        0.0                                                0.0                                                                                     0.0                                             0.0                                                                                      0.0                                       0.0                                                              0.0
+                                                                        0      1       2      3     4            0     1      2       3                                           4                      0       1        2         3                    0          1        2                                                 3                      0.8      1.0      1.2    1.4              0.8      1.0      1.2                          1.4           0.50     0.75   1.00    1.25
+                                                                               Score strength J                        Score strength J                                                                         Score strength J                                   Score strength J                                                                         Score strength J                          Score strength J                                                Score strength J
+
+
+                                                                            ρ=0.87; within=0.62                      ρ=0.85; within=0.55                                                                     ρ=0.63; within=0.41                               ρ=0.60; within=0.32                                                                     ρ=-0.06; within=0.16                      ρ=0.00; within=0.10                                             ρ=-0.04; within=0.11
+                                                        1.0                                                1.0                                                                                     1.0                                             1.0                                                                                      1.0                                       1.0                                                              1.0
+
+
+
+
+         Necessity role
+                                                        0.5                                                0.5                                                                                     0.5                                             0.5                                                                                      0.5                                       0.5                                                              0.5
+
+
+                                                        0.0                                                0.0                                                                                     0.0                                             0.0                                                                                      0.0                                       0.0                                                              0.0
+
+
+
+     (semantic − structural)
+                                           −0.5                                                           −0.5                                                                                    −0.5                                            −0.5                                                                                     −0.5                                      −0.5                                                             −0.5
+
+
+                                           −1.0                                                           −1.0                                                                                    −1.0                                            −1.0                                                                                     −1.0                                      −1.0                                                             −1.0
+                                               −1.0                          −0.5    0.0      0.5   1.0       −1.0   −0.5    0.0      0.5                                  1.0                        −1.0   −0.5    0.0      0.5        1.0          −1.0      −0.5    0.0      0.5                                               1.0         −1.0     −0.5    0.0      0.5   1.0       −1.0     −0.5    0.0      0.5                          1.0       −1.0      −0.5    0.0      0.5    1.0
+                                                                                Score role Drel                         Score role Drel                                                                         Score role Drel                                    Score role Drel                                                                         Score role Drel                           Score role Drel                                                   Score role Drel
+
+
+
+                                                                                                                                                                                                                    Layer 0             Layer 1              Layer 2         Seed 0                                                      Seed 1             Seed 2
+
+
+
+
+                                                                                    (b) Comparing methodologies in explaining head role and necessity.
+
+ Fig. A.1 Comparing a variety of scoring approaches on the mixed synthetic task.
+
+
+A.2                                                                            Exact Experimental Config
+A.2 Exact Experimental Config                                                    53
+
+
+
+
+Table A.2 Training configuration for the controlled semantic–structural experiment.
+
+ Category       Parameter                     Value
+ Data           Graph family                  Even cycle C16
+                Task mixture                  50% semantic, 50% structural
+                Node key vocabulary           32; unique within each graph
+                Semantic value classes        8
+                Structural distance classes   8
+                Node feature dimension        76
+                RRWP channels                 10 (I through P 9 )
+                Attention support             Dense, 162 ordered pairs
+ Model          Graph Transformer             GRIT (Ma et al., 2023)
+                Hidden dimension              96
+                Transformer layers            3
+                Attention heads               8
+                Per-head dimension            12
+                Residual dropout              0.0
+                Attention dropout             0.05
+                Normalisation                 Batch norm; no layer norm
+ Optimisation   Optimiser                     AdamW
+                Initial learning rate         2 × 10−3
+                Weight decay                  10−5
+                Schedule                      Cosine decay to 10−4
+                Batch size                    64 graphs
+                Maximum steps                 3000
+                Maximum graphs per seed       192,000
+                Gradient clipping             Global norm 5.0
+ Selection      Fixed validation set          512 graphs
+                Checkpoint criterion          Minimum validation cross-entropy
+                Early stopping                10 consecutive checks with both accuracies ≥ 99.5%
+                Held-out accuracy gate        Both task accuracies ≥ 90%
+                Training seeds                0, 1, 2
+

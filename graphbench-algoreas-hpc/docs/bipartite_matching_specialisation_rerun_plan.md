@@ -223,6 +223,8 @@ starts at 16 graph event groups per score forward and 24 independently patched h
 forward (two saturated passes over 48 heads), with automatic OOM backoff. Heartbeats report
 progress and GPU/VRAM telemetry. These execution-only batch sizes do not alter the scientific
 fingerprint or invalidate completed graph shards.
+The vectorized finalizer requests one CPU for six hours (six CPU-hours maximum), keeping it within
+the remaining CPU allocation without changing any estimator.
 
 ## 10. Acceptance policy
 

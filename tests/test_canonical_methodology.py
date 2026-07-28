@@ -13,6 +13,7 @@ from graph_specialisation_metrics import main as public_main
 from graph_specialisation_metrics.methodology import audit
 from graph_specialisation_metrics.methodology.audit import audit_scope
 from graph_specialisation_metrics.methodology.bootstrap import (
+    Interval,
     Observation,
     nested_percentile_interval,
     reportable_bin,
@@ -53,10 +54,12 @@ from graph_specialisation_metrics.methodology.figures import (
     distance_heatmaps,
     distance_support_profile,
     causal_family_panels,
+    causal_regime_summary,
     causal_scatter_grid,
     cumulative_prefix_curves,
     joint_selectivity_plane,
     score_plane,
+    selectivity_regime_diagnostics,
 )
 from graph_specialisation_metrics.methodology.interventions import (
     StructuralAuditError,
@@ -88,12 +91,16 @@ from graph_specialisation_metrics.methodology.scores import (
     aggregate_event_scores,
     event_head_scores,
     head_coordinates,
+    freeze_families,
     project_transport,
+    specialisation_diagnostics,
 )
 from graph_specialisation_metrics.methodology.tasks import TASKS, OutputGeometry, get_task
 from graph_specialisation_metrics.methodology.validation import (
     _clean_ablation_stage,
     _mismatch_indices,
+    _summarize_causal,
+    equivalence_decision,
 )
 
 
@@ -844,6 +851,165 @@ def test_head_coordinates_use_within_model_means_and_gate_only_selectivity():
     assert result.joint_sensitivity.shape == result.active.shape
 
 
+def test_discovery_diagnostics_can_confirm_a_narrow_generalist_regime():
+    selectivity = np.asarray([[-0.04, -0.02, -0.01, 0.01, 0.02, 0.04]])
+    coordinates = head_coordinates(
+        1.0 + selectivity,
+        1.0 - selectivity,
+        score_floor=1e-12,
+        epsilon=1e-12,
+        activity_floor=0.2,
+    )
+    families = freeze_families(
+        coordinates,
+        tail_fraction=0.2,
+        central_fraction=0.2,
+    )
+    rng = np.random.default_rng(7)
+    draws = np.zeros((200, 6, 1, 6), dtype=np.float64)
+    draws[:, 4] = 1.0
+    draws[:, 5] = selectivity + rng.normal(0.0, 0.006, size=(200, 1, 6))
+    diagnostics = specialisation_diagnostics(
+        coordinates,
+        families,
+        draws,
+        selectivity_interval=(selectivity - 0.02, selectivity + 0.02),
+        activity_floor=0.2,
+        tail_fraction=0.2,
+        central_fraction=0.2,
+        equivalence_half_width=0.1,
+        membership_stability_floor=0.6,
+        generalist_fraction_floor=0.5,
+    )
+    assert diagnostics["classification_fraction"]["equivalent"] == pytest.approx(1.0)
+    assert diagnostics["interpretation"]["narrow_selectivity_distribution"]
+    assert diagnostics["interpretation"]["entanglement_compatible"]
+
+
+def test_equivalence_requires_interval_containment_not_failure_to_reject_zero():
+    assert (
+        equivalence_decision(0.01, -0.08, 0.09, half_width=0.1)
+        == "equivalent"
+    )
+    assert (
+        equivalence_decision(0.01, -0.08, 0.18, half_width=0.1)
+        == "unresolved"
+    )
+    assert (
+        equivalence_decision(0.35, 0.22, 0.48, half_width=0.1)
+        == "specialised"
+    )
+
+
+def test_causal_bootstrap_jointly_estimates_family_interactions(monkeypatch):
+    endpoint_names = (
+        "G_c",
+        "P_gross_matched",
+        "P_gross_mismatch",
+        "R_gross",
+        "I_gross",
+        "R_align",
+        "I_align",
+        "R_align_adjusted",
+        "I_align_adjusted",
+        "necessity",
+        "gross_necessity",
+        "M_align",
+    )
+    targets = {
+        "head_L0_H0": ((0, 0),),
+        "head_L0_H1": ((0, 1),),
+        "head_L0_H2": ((0, 2),),
+        "family_semantic_leaning": ((0, 2),),
+        "family_structural_leaning": ((0, 0),),
+        "family_central_responsive": ((0, 1),),
+        "control_semantic_leaning_random_control": ((0, 1),),
+        "control_structural_leaning_random_control": ((0, 1),),
+    }
+
+    def endpoint_row(target, channel):
+        semantic_family = target == "family_semantic_leaning"
+        structural_family = target == "family_structural_leaning"
+        if (semantic_family and channel == "semantic") or (
+            structural_family and channel == "structural"
+        ):
+            channel_focus = 0.6
+        elif semantic_family or structural_family:
+            channel_focus = 0.4
+        elif target.startswith("head_"):
+            head = int(target.rsplit("H", 1)[1])
+            channel_focus = 0.3 + 0.2 * head
+            channel_focus += (head - 1) * (0.02 if channel == "semantic" else -0.02)
+        else:
+            channel_focus = 0.5
+        values = {name: 1.0 for name in endpoint_names}
+        values.update(
+            {
+                "G_c": channel_focus,
+                "P_gross_matched": 1.0,
+                "P_gross_mismatch": 0.0,
+                "R_align": channel_focus,
+                "I_align": channel_focus,
+                "R_align_adjusted": channel_focus,
+                "I_align_adjusted": channel_focus,
+                "necessity": channel_focus,
+                "gross_necessity": 1.0,
+            }
+        )
+        return {"graph": 0, "source": 0, "donor": 0, **values}
+
+    records = {
+        target: {
+            channel: [endpoint_row(target, channel)]
+            for channel in ("semantic", "structural")
+        }
+        for target in targets
+    }
+
+    def one_draw_interval(observations, policy, *, transform):
+        estimate = transform(np.asarray(observations[0].value))
+        return Interval(
+            estimate=estimate,
+            low=estimate,
+            high=estimate,
+            replicates=2000,
+            rng_seed=17_071,
+            resampled_levels=(),
+        )
+
+    monkeypatch.setattr(
+        "graph_specialisation_metrics.methodology.validation.nested_percentile_interval",
+        one_draw_interval,
+    )
+    coordinates = SimpleNamespace(
+        joint_sensitivity=np.asarray([[1.0, 2.0, 3.0]]),
+        selectivity=np.asarray([[-0.1, 0.0, 0.1]]),
+        active=np.ones((1, 3), dtype=bool),
+    )
+    summary = _summarize_causal(
+        {"records": records},
+        targets,
+        SimpleNamespace(
+            numerical=SimpleNamespace(effect_floor=1e-12),
+            bootstrap=BootstrapPolicy(),
+        ),
+        {"coordinates": coordinates},
+    )
+    metadata = summary["intervals"]
+    assert metadata["interaction_order"] == (
+        "gross_family_by_channel",
+        "necessity_family_by_channel",
+        "rescue_family_by_channel",
+        "induction_family_by_channel",
+    )
+    raw_size = 2 * len(targets) * len(metadata["endpoint_order"])
+    calibrated_size = len(targets) * len(metadata["calibrated_order"])
+    interaction = metadata["interval"].estimate[
+        raw_size + calibrated_size : raw_size + calibrated_size + 4
+    ]
+    assert np.allclose(interaction, 0.4)
+
+
 def test_distance_accounting_reconstructs_and_divides_inside_graph():
     q = torch.tensor([[[[[3.0], [4.0]]]]])  # [E,L,H,N,T]
     axis = DistanceAxis((0, 1))
@@ -1098,6 +1264,99 @@ def test_modular_causal_and_distance_figure_components_render():
         intervals=intervals,
     )
     fig.clf()
+    selectivity = np.asarray([[-0.04, -0.02, 0.02, 0.04]])
+    coordinates = head_coordinates(
+        1.0 + selectivity,
+        1.0 - selectivity,
+        score_floor=1e-12,
+        epsilon=1e-12,
+        activity_floor=0.2,
+    )
+    families = freeze_families(
+        coordinates,
+        tail_fraction=0.25,
+        central_fraction=0.25,
+    )
+    draws = np.zeros((20, 6, 1, 4), dtype=np.float64)
+    draws[:, 4] = 1.0
+    draws[:, 5] = selectivity
+    diagnostics = specialisation_diagnostics(
+        coordinates,
+        families,
+        draws,
+        selectivity_interval=(selectivity - 0.01, selectivity + 0.01),
+        activity_floor=0.2,
+        tail_fraction=0.25,
+        central_fraction=0.25,
+        equivalence_half_width=0.1,
+        membership_stability_floor=0.6,
+        generalist_fraction_floor=0.5,
+    )
+    fig, _ = selectivity_regime_diagnostics(
+        HeadPlotData(
+            coordinates,
+            seed=42,
+            selectivity_interval=(selectivity - 0.01, selectivity + 0.01),
+        ),
+        diagnostics,
+        families,
+    )
+    fig.canvas.draw()
+    fig.clf()
+    interaction = {
+        name: {
+            "estimate": 0.01,
+            "low": -0.05,
+            "high": 0.06,
+            "equivalence_half_width": 0.2,
+            "decision": "equivalent",
+        }
+        for name in (
+            "gross_family_by_channel",
+            "necessity_family_by_channel",
+            "rescue_family_by_channel",
+            "induction_family_by_channel",
+        )
+    }
+    core = {
+        name: {
+            "channels": {
+                channel: {"estimate": 0.4, "low": 0.2, "high": 0.6}
+                for channel in ("semantic", "structural")
+            },
+            "response_floor": 0.1,
+            "dual_channel": True,
+        }
+        for name in (
+            "gross_response",
+            "donor_wise_necessity",
+            "causal_rescue",
+            "causal_induction",
+        )
+    }
+    fig, _ = causal_regime_summary(
+        {
+            "regime": "confirmed_entangled_generalist",
+            "activity_validation": {
+                name: {
+                    "estimate": 0.6,
+                    "low": 0.4,
+                    "high": 0.8,
+                    "importance_correlation_floor": 0.1,
+                    "decision": "positive",
+                }
+                for name in (
+                    "J_vs_clean_prediction_movement",
+                    "J_vs_gross_total",
+                    "J_vs_necessity_total",
+                )
+            },
+            "family_interactions": interaction,
+            "central_generalist_core": core,
+        }
+    )
+    fig.canvas.draw()
+    fig.clf()
     curve = {
         "semantic_leaning": {
             "prefix": [1, 2],
@@ -1114,6 +1373,30 @@ def test_modular_causal_and_distance_figure_components_render():
         }
     }
     fig, _ = cumulative_prefix_curves(curve)
+    fig.clf()
+    calibrated_curve = {
+        family: {
+            "prefix": [1, 2],
+            "equivalence_half_width": 0.2,
+            **{
+                endpoint: {
+                    "estimate": [0.1, 0.2],
+                    "interval": ([0.0, 0.1], [0.2, 0.3]),
+                    "control": [0.08, 0.16],
+                }
+                for endpoint in (
+                    "gross_total",
+                    "gross_contrast",
+                    "necessity_total",
+                    "necessity_contrast",
+                )
+            },
+        }
+        for family in ("semantic_leaning", "structural_leaning")
+    }
+    fig, axes = cumulative_prefix_curves(calibrated_curve)
+    assert np.asarray(axes).shape == (2, 2)
+    fig.canvas.draw()
     fig.clf()
     fig, _ = attention_distance_profiles(
         (0, 1), {"semantic_leaning": [0.7, 0.3]}

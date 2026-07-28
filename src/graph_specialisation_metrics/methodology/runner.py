@@ -64,6 +64,7 @@ from .figures import (
     TASK_FIGURE_MODIFIERS,
     attention_distance_profiles,
     causal_family_panels,
+    causal_regime_summary,
     causal_scatter_grid,
     cumulative_prefix_curves,
     carriage_profiles,
@@ -72,6 +73,7 @@ from .figures import (
     joint_selectivity_plane,
     score_distance_profiles,
     score_plane,
+    selectivity_regime_diagnostics,
 )
 from .protocol import (
     CHANNELS,
@@ -90,6 +92,7 @@ from .scores import (
     freeze_matched_controls,
     head_coordinates,
     project_transport,
+    specialisation_diagnostics,
 )
 from .tasks import CanonicalTask, get_task, training_target_matrix
 
@@ -1562,6 +1565,7 @@ def run_scores(
         coordinates,
         tail_fraction=config.families.tail_fraction,
         central_fraction=config.families.central_fraction,
+        central_pool_fraction=config.families.central_pool_fraction,
     )
     output["matched_controls"] = freeze_matched_controls(
         coordinates,
@@ -1672,7 +1676,10 @@ def run_scores(
         ]
         if paired:
             output["intervals"] = nested_percentile_interval(
-                paired, config.bootstrap, transform=transform
+                paired,
+                config.bootstrap,
+                transform=transform,
+                retain_draws=True,
             )
             output["interval_pairing"] = "source-and-graph-paired"
     else:
@@ -1686,8 +1693,30 @@ def run_scores(
             config.bootstrap,
             transform=transform,
             resample_source=source_resampling,
+            retain_draws=True,
         )
         output["interval_pairing"] = "graph-paired/channel-source-independent"
+    coordinate_interval = output.get("intervals")
+    if coordinate_interval is not None and coordinate_interval.draws is not None:
+        output["specialisation_diagnostics"] = specialisation_diagnostics(
+            coordinates,
+            output["families"],
+            coordinate_interval.draws,
+            selectivity_interval=(
+                coordinate_interval.low[5],
+                coordinate_interval.high[5],
+            ),
+            activity_floor=config.families.activity_floor,
+            tail_fraction=config.families.tail_fraction,
+            central_fraction=config.families.central_fraction,
+            central_pool_fraction=config.families.central_pool_fraction,
+            equivalence_half_width=config.families.equivalence_half_width,
+            membership_stability_floor=config.families.membership_stability_floor,
+            generalist_fraction_floor=config.families.generalist_fraction_floor,
+        )
+        # The stability summaries above are sufficient; the full 2,000-draw tensor is deliberately
+        # transient so the score cache stays compact.
+        output["intervals"] = dataclasses.replace(coordinate_interval, draws=None)
     cache.save("scores", "raw", output)
     cache.save_audit("scores_manifest", plan)
     return output
@@ -2566,7 +2595,12 @@ def make_figures(
         metadata={"task": prepared.task.name, "seed": int(prepared.grit.sc.seed)},
     )
     saved["score_plane"] = [str(path) for path in paths]
-    fig, axes = joint_selectivity_plane(plot_data, title=prepared.task.title, theme=theme)
+    fig, axes = joint_selectivity_plane(
+        plot_data,
+        title=prepared.task.title,
+        equivalence_half_width=config.families.equivalence_half_width,
+        theme=theme,
+    )
     paths = builder.save(
         "selectivity_vs_joint_sensitivity",
         fig,
@@ -2574,6 +2608,24 @@ def make_figures(
         metadata={"task": prepared.task.name, "seed": int(prepared.grit.sc.seed)},
     )
     saved["coordinate_plane"] = [str(path) for path in paths]
+    if scores.get("specialisation_diagnostics"):
+        fig, axes = selectivity_regime_diagnostics(
+            plot_data,
+            scores["specialisation_diagnostics"],
+            scores["families"],
+            theme=theme,
+        )
+        paths = builder.save(
+            "selectivity_regime_diagnostics",
+            fig,
+            axes,
+            metadata={
+                "task": prepared.task.name,
+                "seed": int(prepared.grit.sc.seed),
+                "diagnostics": scores["specialisation_diagnostics"],
+            },
+        )
+        saved["selectivity_regime"] = [str(path) for path in paths]
     display = display_bins(scores["axis"], max_points=int(theme.max_distance_points))
     for channel in CHANNELS:
         channel_scores = scores["channels"][channel]
@@ -2844,6 +2896,22 @@ def make_figures(
         )
         saved["attention_distance"] = [str(path) for path in paths]
     if causal is not None:
+        if causal.get("regime_evidence"):
+            fig, axes = causal_regime_summary(
+                causal["regime_evidence"],
+                theme=theme,
+            )
+            paths = builder.save(
+                "causal_regime_summary",
+                fig,
+                axes,
+                metadata={
+                    "task": prepared.task.name,
+                    "seed": int(prepared.grit.sc.seed),
+                    "regime_evidence": causal["regime_evidence"],
+                },
+            )
+            saved["causal_regime"] = [str(path) for path in paths]
         coordinates = scores["coordinates"]
         layers = np.repeat(
             np.arange(coordinates.joint_sensitivity.shape[0]),
@@ -3162,8 +3230,6 @@ def make_figures(
                 if not names:
                     continue
                 positions = [target_position[name] for name in names]
-                gross_index = endpoint_order.index("G_c")
-                necessity_index = endpoint_order.index("necessity")
                 # Average the frozen control kinds at each prefix size: the ladder is a reference
                 # level for the family curve, not three separate claims.
                 control_positions = [
@@ -3176,57 +3242,38 @@ def make_figures(
                     ]
                     for size in (int(name.rsplit("_", 1)[1]) for name in names)
                 ]
-                control_curve = (
-                    {
-                        endpoint: {
-                            channel: [
-                                float(np.mean(point_raw[index, group, metric]))
+                endpoint_columns = {
+                    "gross_total": "gross_total_for_J",
+                    "gross_contrast": "gross_contrast_for_D_rel",
+                    "necessity_total": "necessity_total_for_J",
+                    "necessity_contrast": "necessity_contrast_for_D_rel",
+                }
+                record = {
+                    "prefix": [int(name.rsplit("_", 1)[1]) for name in names],
+                    "equivalence_half_width": float(
+                        config.families.causal_equivalence_half_width
+                    ),
+                }
+                for endpoint, calibrated_name in endpoint_columns.items():
+                    column = calibrated_names.index(calibrated_name)
+                    record[endpoint] = {
+                        "estimate": point_calibrated[positions, column],
+                        "interval": (
+                            calibrated_low[positions, column],
+                            calibrated_high[positions, column],
+                        ),
+                        "control": (
+                            [
+                                float(np.mean(point_calibrated[group, column]))
                                 if group
                                 else np.nan
                                 for group in control_positions
                             ]
-                            for channel, index in (("semantic", 0), ("structural", 1))
-                        }
-                        for endpoint, metric in (
-                            ("gross", gross_index),
-                            ("necessity", necessity_index),
-                        )
+                            if any(control_positions)
+                            else None
+                        ),
                     }
-                    if any(control_positions)
-                    else None
-                )
-                prefix_curves[family] = {
-                    "control": control_curve,
-                    "prefix": [int(name.rsplit("_", 1)[1]) for name in names],
-                    "gross": {
-                        "semantic": point_raw[0, positions, gross_index],
-                        "structural": point_raw[1, positions, gross_index],
-                    },
-                    "gross_interval": {
-                        "semantic": (
-                            raw_low[0, positions, gross_index],
-                            raw_high[0, positions, gross_index],
-                        ),
-                        "structural": (
-                            raw_low[1, positions, gross_index],
-                            raw_high[1, positions, gross_index],
-                        ),
-                    },
-                    "necessity": {
-                        "semantic": point_raw[0, positions, necessity_index],
-                        "structural": point_raw[1, positions, necessity_index],
-                    },
-                    "necessity_interval": {
-                        "semantic": (
-                            raw_low[0, positions, necessity_index],
-                            raw_high[0, positions, necessity_index],
-                        ),
-                        "structural": (
-                            raw_low[1, positions, necessity_index],
-                            raw_high[1, positions, necessity_index],
-                        ),
-                    },
-                }
+                prefix_curves[family] = record
             if prefix_curves:
                 fig, axes = cumulative_prefix_curves(prefix_curves, theme=theme)
                 paths = builder.save(
@@ -3444,6 +3491,28 @@ def _write_run_summaries(
                 ),
                 "active_head_fraction": float(np.mean(coordinates.active)),
             }
+            diagnostics = scores.get("specialisation_diagnostics")
+            if diagnostics:
+                row.update(
+                    {
+                        "active_selectivity_p90_span": float(
+                            diagnostics["active_selectivity"]["p90_span"]
+                        ),
+                        "equivalent_active_head_fraction": float(
+                            diagnostics["classification_fraction"]["equivalent"]
+                        ),
+                        "semantic_tail_membership_jaccard": float(
+                            diagnostics["membership"]["semantic_leaning"][
+                                "mean_jaccard"
+                            ]
+                        ),
+                        "structural_tail_membership_jaccard": float(
+                            diagnostics["membership"]["structural_leaning"][
+                                "mean_jaccard"
+                            ]
+                        ),
+                    }
+                )
             causal_value = value.get("causal")
             if causal_value is not None:
                 association = causal_value["associations"]
@@ -3464,6 +3533,11 @@ def _write_run_summaries(
                         row[f"rho_{name}"] = float(
                             association[name]["pooled_active"]["rho"]
                         )
+                for name, record in causal_value.get(
+                    "family_interactions", {}
+                ).items():
+                    if isinstance(record, Mapping) and "estimate" in record:
+                        row[f"interaction_{name}"] = float(record["estimate"])
             seed_rows.append(row)
         if not seed_rows:
             if require_complete:
@@ -3486,6 +3560,16 @@ def _write_run_summaries(
         task_population: dict[str, Any] = {
             "seed_estimates": seed_rows,
             "head_alignment": "not assumed; summaries are computed within seed",
+            "regime_calls": [
+                {
+                    "seed": int(value["seed"]),
+                    "regime": value.get("causal", {})
+                    .get("regime_evidence", {})
+                    .get("regime", "not_available"),
+                }
+                for value in task_results
+                if value.get("scores") is not None
+            ],
         }
         if len(seed_rows) >= 3:
             matrix = np.asarray(

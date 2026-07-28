@@ -329,6 +329,8 @@ def test_causal_summary_uses_graph_paired_independent_channel_sources(monkeypatc
         "I_gross",
         "R_align",
         "I_align",
+        "R_align_adjusted",
+        "I_align_adjusted",
         "necessity",
         "gross_necessity",
         "M_align",

@@ -1,0 +1,1343 @@
+         On Measuring Long-Range Interactions in Graph Neural Networks
+
+
+      Jacob Bamberger * 1 Benjamin Gutteridge * 1 Scott le Roux * 1 Michael Bronstein 1 2 Xiaowen Dong 1
+
+
+                         Abstract                                     However, MPNNs struggle to capture long-range depen-
+                                                                      dencies, where interactions between distant nodes are criti-
+     Long-range graph tasks — those dependent on
+                                                                      cal. These difficulties stem from various well-documented
+     interactions between ‘distant’ nodes — are an
+                                                                      pathologies, such as the difficulty building deep GNNs often
+     open problem in graph neural network research.
+                                                                      attributed to over-smoothing and vanishing gradients (Nt &
+     Real-world benchmark tasks, especially the Long
+                                                                      Maehara, 2019; Oono & Suzuki, 2019; Li et al., 2019), or
+     Range Graph Benchmark, have become popular
+                                                                      the inability to propagate information through graph bottle-
+     for validating the long-range capability of pro-
+                                                                      necks attributed to over-squashing (Alon & Yahav, 2020).
+     posed architectures. However, this is an empirical
+                                                                      These limitations hinder the ability of MPNNs to model
+     approach that lacks both robustness and theoret-
+                                                                      tasks that depend on global or long-range interactions.
+     ical underpinning; a more principled characteri-
+     zation of the long-range problem is required. To                 Various strategies have been proposed to address these is-
+     bridge this gap, we formalize long-range interac-                sues, but a common theme is the effective reduction of dis-
+     tions in graph tasks, introduce a range measure                  tance on a graph — either via explicit static rewiring (Top-
+     for operators on graphs, and validate it with syn-               ping et al., 2021; Gasteiger et al., 2019; Barbero et al., 2023),
+     thetic experiments. We then leverage our measure                 or rewiring of the computational graph via architectural com-
+     to examine commonly used tasks and architec-                     ponents such as virtual/latent nodes (Gilmer et al., 2017;
+     tures, and discuss to what extent they are, in fact,             Southern et al., 2024), fully connected or multi-hop message
+     long-range. We believe our work advances efforts                 passing layers (Alon & Yahav, 2020; Abu-El-Haija et al.,
+     to define and address the long-range problem on                  2019; Gutteridge et al., 2023), and global attention (Vaswani
+     graphs, and that our range measure will aid evalu-               et al., 2017; Wu et al., 2021; Rampášek et al., 2022). For
+     ation of new datasets and architectures.                         many of these methods, the argument that they improve per-
+                                                                      formance on long-range tasks is based solely on empirical
+                                                                      performance on synthetic and real-world benchmarks.
+
+1. Introduction                                                       However, most synthetic long-range tasks (Bodnar et al.,
+                                                                      2021; Rampášek & Wolf, 2021) are simplistic and depend
+Graphs have emerged as a rich data modality, capable of               on long-range interactions only, such that a simple rewiring
+modeling pairwise relationships between entities in diverse           converts them into short-range tasks. Few synthetic tasks
+applications. Graph neural networks (GNNs) have become                acknowledge that graph-structured data and graph tasks are,
+the dominant paradigm for learning from such data, with               by design, locally biased: solutions should capture long-
+message passing neural networks (MPNNs) (Gilmer et al.,               range interactions, but should usually prioritize local ones.
+2020) standing out as the most widely used framework.
+MPNNs operate by iteratively updating a node’s representa-            Real-world benchmarks face similar problems. While some
+tion based on information aggregated from its local neigh-            recent works have introduced and motivated long-range
+borhood. This local message-passing mechanism has been                tasks more systematically (Liang et al., 2025), the Long
+highly effective in a wide range of tasks, such as social net-        Range Graph Benchmark (LRGB) (Dwivedi et al., 2022)
+works (Monti et al., 2019), computational chemistry (Gilmer           remains ubiquitous. LRGB establishes task long-rangedness
+et al., 2017) and recommendation systems (Fan et al., 2019).          via graph size/diameter and domain-specific intuition. These
+                                                                      are necessary, but not sufficient conditions for qualifying
+  *
+    Equal contribution 1 University of Oxford 2 AITHYRA. Corre-       a task as long-range. Furthermore, LRGB’s sensitivity to
+spondence to: Jacob Bamberger <jacob.bamberger@cs.ox.ac.uk>,          hyperparameter tuning has recently come under scrutiny
+Benjamin Gutteridge <beng@robots.ox.ac.uk>, Scott le Roux             (Tönshoff et al., 2023), raising doubts about the extent to
+<sleroux@robots.ox.ac.uk>.
+                                                                      which its tasks are truly long-range. These issues stem from
+Proceedings of the 42 nd International Conference on Machine          a lack of theoretical characterization of the long-range issue,
+Learning, Vancouver, Canada. PMLR 267, 2025. Copyright 2025           which hampers efforts in measuring and addressing it.
+by the author(s).
+
+                                                                  1
+                                On Measuring Long-Range Interactions in Graph Neural Networks
+
+
+
+
+Figure 1. Illustration of the range measure on an example grid graph. The distance (left) and influence (center) relative to nodes v (top)
+and u (bottom) are indicated by node opacity. Taking the node-wise product of distance and influence and then aggregating over the entire
+graph yields the node-level range (right; also represented by opacity), e.g. ρu , ρv . All node ranges can then be aggregated to obtain a
+graph range ρG . See Table 1 for details on the range measure at different granularities. We use different influence distributions for u and
+v to show that influence is task-dependent.
+
+In this work, we address these gaps by formalizing, for the              influence-based measure is a specific instantiation. In addi-
+first time, the notion of the ‘long-range problem’ on graphs.            tion, their work introduces a benchmark, while ours aims at
+Our main contributions are three-fold.                                   a deeper theoretical investigation of the long-range issue.
+
+   • We introduce a formal definition of long-range interac-             Alon & Yahav (2020) introduced a prototypical range mea-
+     tions in graph tasks, grounded in first principles rather           sure, the problem radius, which, for a task, is defined as
+     than empirical heuristics. This provides a systematic               the minimal number of hops necessary to solve it. The
+     foundation for analyzing both tasks and architectures.              problem radius is generally unknown and is approximated
+                                                                         by tuning the number of layers; larger radii require deeper
+   • We derive a family of principled, quantitative measures             MPNNs. They also introduce the over-squashing problem, a
+     of a GNN’s range — the extent to which it captures                  phenomena that is closely linked to long-range interactions.
+     long-range dependencies. These measures apply to
+     node- and graph-level tasks, support evaluation at mul-             Sensitivity analysis by Topping et al. (2021); Di Giovanni
+     tiple granularities — node, graph, and dataset — and                et al. (2023a) formalized over-squashing, showing that
+     function in both inductive and transductive settings.               poorly-connected nodes result in small influence scores.
+                                                                         Di Giovanni et al. (2023b) studied pair-wise node inter-
+   • We validate our approach through synthetic experi-                  actions by casting model expressivity as a measure of a
+     ments designed to capture long-range interactions, and              model’s capacity to mix node features. Their measure is
+     then apply it to critically assess the LRGB benchmark.1             based on the Hessian of pair-wise node features, focuses
+                                                                         specifically on mixing rather than range, and is computed
+2. Background                                                            for known tasks; in Section 6.1 we demonstrate how our
+                                                                         measure can be applied to models trained on arbitrary tasks.
+Existing range measures. A handful of existing works
+consider the notion of node-to-node interaction more for-
+mally. Xu et al. (2018b) introduced the influence score as a             Graphs and features. A graph G is a tuple (V, E) of a set
+measure of an output node’s sensitivity to an input node as              of nodes V and edges E. We denote the number of nodes
+the sum of absolute values of their Jacobian. This approach              by n = |V|, and edges are represented as tuples (u, v) ∈ E.
+adapts influence functions to graphs, building on the work               The graphs considered in this work are undirected, and are
+of Koh & Liang (2017), who originally applied them to                    often represented by an adjacency matrix A ∈ {0, 1}n×n
+interpret neural network predictions. Recent work by Liang               with corresponding degree matrix D := diag(A1). We
+et al. (2025) motivates a novel long-range benchmark us-                 denote the features at node u by xu ∈ Rd and stack all node
+ing a proposed influence-based measure. Our work derives                 features into a matrix X ∈ Rn×d . We denote by Nk (u)
+a family of measures from first principles, of which their               the k-hop neighbors of node u, i.e. the nodes at exactly k
+  1
+                                                                         hops as per shortest-path distance (SPD), and by N≤k (u)
+    All code for reproducing experiments is available at https:          the k-hop neighborhood of u: all nodes at k or fewer hops.
+//github.com/BenGutteridge/range-measure
+
+                                                                     2
+                             On Measuring Long-Range Interactions in Graph Neural Networks
+
+GNNs. In many applications, the goal is to perform a predic-         is better suited to studying how information propagates in
+tion task starting from data modeled as a graph G and node           MPNNs (Di Giovanni et al., 2023a; Black et al., 2023). For
+features X ∈ Rn×d . For node-level tasks, predictions are            full generality of the measure, we simply assume that we
+made based on a representation for every node u denoted              are given a metric dG : V × V → R+ on the graph, with
+yu ∈ Rc which can be stacked into a matrix Y ∈ Rn×c .                respect to which we measure the range denoted ρu .
+GNNs are used to achieve such predictions. Most GNNs,
+                                                                     For our experiments we focus on SPD and resistance dis-
+including widely used MPNNs (Kipf & Welling, 2017; Xu
+                                                                     tance, denoted by ρspd    res
+                                                                                        u and ρu respectively.
+et al., 2018a; Bresson & Laurent, 2017) and graph Trans-
+formers (GTs) update the nodes features sequentially by
+computing hidden node features H(ℓ) ∈ Rn×dℓ at each                  3.1. Derivation of node-level range
+of L layers, with input H(0) = X and final layer output              We first state the desirable properties of the range measure,
+Y = H(L) . For graph-level tasks, a further pooling opera-           ρu , which quantifies the range of interactions received by a
+tion is applied to obtain a single graph-level output y ∈ Rc .       node u under a linear task L.
+
+3. Formalizing the range of a node-level task                          Property 1 (Locality) The range at node u should
+                                                                       only depend on interactions received by node u. i.e.
+To address the challenge of quantifying long-range inter-              ρu (1wv ) = 0 if w ̸= u.
+actions in GNNs, we propose a measure of the range of a                Motivation: Ensures that the range measure does not
+task, a GNN, or, more generally, an operator on a graph.               depend on irrelevant parts of the graph.
+This measure captures how strongly distant nodes interact.
+We derive the measure from first principles as the unique              Property 2 (Unit interaction) If the output of node
+measure that satisfies a set of desired properties.                    u depends solely on the input of another node v at
+                                                                       distance dG (u, v) = r, then the range should equal r.
+We first propose a definition of the range of a node-level             i.e. ρu (1uv ) = dG (u, v)
+task. By a node-level task on a graph, we mean a map                   Motivation: Provides a baseline for what constitutes the
+F transforming an input signal X ∈ Rn×d into an output                 range of a single interaction.
+Y = F(X) ∈ Rn×c . The range should be applicable to any
+map F, including linear ones i.e. such that F(aX + bX′ ) =             Property 3 (Additivity) The range of disjoint interac-
+aF(X) + bF(X′ ) for all a, b ∈ R and X, X′ ∈ Rn×d .                    tionsa should be the sum of their individual ranges. If
+We restrict our attention to linear maps, denoted L, and               L1 and L2 are disjoint, then ρu (L1 + L2 ) = ρu (L1 ) +
+for simplicity we consider the case d = c = 1, where a                 ρu (L2 ).
+linear map corresponds to a matrix L ∈ Rn×n , and Luv is               Motivation: Ensures that the range appropriately aggre-
+the interaction from v to u. An example of a linear map                gates independent contributions to the output.
+is the transformation denoted by 1uv . This transformation             Property 4 (Homogeneity) Scaling the interaction
+copies the value at position v from the input and places it at         strength should proportionally scale the range, i.e.,
+position u, setting all other values to zero. Specifically, it         ∀α ∈ R, ρu (αL) = |α|ρu (L).
+transforms the matrix X into a new matrix Y, where Y is                Motivation: Guarantees that the measure meaningfully
+zero everywhere except at index u, where yu = xv .                     reflects the strength of interaction.
+As a task can be long-range around one node and short-range               a
+                                                                            We say that two linear maps L1 , L2 consist of disjoint
+around another, the range measure should be defined for                interactions, or are disjoint, if |L1uv | > 0 =⇒ L2uv = 0
+every node. Our goal is thus to find a suitable definition of          and |L2uw | > 0 =⇒ L1uw = 0, in other words, they do not
+the range of a task F at a node u, denoted by ρu (F) ∈ R+ .            capture interactions between the same pairs of nodes.
+
+Distance metric. A critical aspect of defining this measure
+is establishing a notion of distance between nodes, with             Remarkably, from these we can uniquely derive ρu :
+respect to which the range can be defined. While metrics like
+Euclidean distance are commonly used for sequences and                 Theorem 3.1. Given a graph G, metric dG , and node u,
+grids, graphs are more complex as there are many choices               there is a unique range ρu defined on one-dimensional
+of metric. Common options include SPD (the length of the               linear tasks that satisfies Properties 1–4, and, given a
+shortest path between two nodes in hops), commute-time                 linear task Y = L (X), it corresponds to the following:
+distance (based on the expected time for a random walk to                                       X
+travel between nodes), and diffusion distances (capturing                            ρu (L) =       |Luv |dG (u, v).
+connectivity in terms of information flow). While SPD is                                       v∈V
+intuitive, recent work suggest that commute-time distance
+
+
+                                                                 3
+                                  On Measuring Long-Range Interactions in Graph Neural Networks
+
+
+Table 1. Normalized range measures based on the Jacobian and Hessian, for node-level and graph-level tasks, and at node, graph, and
+dataset granularities. For node-level tasks, ρ denotes ranges derived from the Jacobian (the first-order Taylor series term), which we use as
+it provides a set of pairwise interactions. For graph-level tasks, the Jacobian does not provide pairwise interaction terms, so we instead use
+range measures derived from the Hessian (the second-order Taylor term), and denote them by η.
+                                           Jacobian-based (ρ)                                               Hessian-based (η)
+
+ Granularity               Node              Graph                 Dataset               Node                Graph                 Dataset
+                                             1
+                                               P                    1
+                                                                      PN
+ Node-level tasks      ρ̂u (Eq. 2)     ρ̂G := n   u∈V ρ̂u    ρ̂G := N     i=1 ρ̂Gi        N/A                 N/A                   N/A
+                                                                                                                                     PN
+                              As above; using pre-pooling node features2                               η̂G := n1             η̂G := N1
+                                                                                                               P
+ Graph-level tasks                                                                     η̂u (Eq. 4)                 u∈V η̂u               i=1 η̂Gi
+
+
+
+
+Proof. The linear tasks form a vector space which is
+spanned by the maps 1uv . Any linear     P map L can there-
+                                                                                                 X ∂ (F(X))
+                                                                                                                    u
+                                                                                     ρu (F) :=                          dG (u, v), and       (1)
+fore be decomposed into a sum L = ij Lij 1ij . By Prop-                                                     ∂xv
+P 3, since each 1ij are disjoint, we must have ρu (L) =
+                                                                                                 v∈V
+erty
+                                                                                                         ρu (F)
+   ij ρu (Lij 1ij ). By Property 1 the range
+                                           Pat u depends only                        ρ̂u (F) := P                        .                   (2)
+on the terms with i = u, i.e. ρu (L) = Pv∈V ρu (Luv 1uv ).                                           v∈V
+                                                                                                         ∂(F(X))u
+                                                                                                           ∂xv
+By Property 4, we deduce that ρuP    (L) = v |Luv |ρu (1uv ).
+By Property 2, we get ρu (L) = v |Luv |dG (u, v).                         In particular, when restricted to linear maps, the measures
+                                                                          defined in Equations 1 & 2 are the unique measures from
+Normalized range. One consequence of the above proper-                    Theorems 3.1 & 3.2.
+ties of ρu is that many short-range interactions can increase
+                                                                          Since a GNN with weights Θ parameterizes a differentiable
+the range. For example, m disjoint interactions at distance 1
+                                                                          map FΘ (X) = Y, we can straightforwardly use this defi-
+results in a range of m, when we might prefer the range to
+                                                                          nition to compute the range of any GNN. Furthermore, we
+reflect the average (or in this case, unanimous) range, which
+                                                                          can generalize the measure to the case of multiple input and
+in this case would be 1. As a remedy, we consider a normal-
+                                                                          output channels in an equivalent form as an expectation with
+ized range, ρ̂u , by replacing Properties 3 & 4 by:
+                                                                          respect to the influence distribution Iu :
+  Property 5 If L1 and L2 are disjoint, then ∀α ̸= 0, β,
+                      |α|                |β|
+  ρu (αL1 + βL2 ) = |α|+|β| ρu (L1 ) + |α|+|β| ρu (L2 ).                                    ρ̂u (F) := Ev∼Iu [dG (u, v)] ,                   (3)
+
+                                                                                                          ∂Fα
+                                                                          where Iu (v) = N1u α,β ∂xβu , normalizing constant
+                                                                                                  P
+From which we also derive a uniqueness result:                                                              v
+                                                                                  P          ∂Fα
+  Theorem 3.2. Given a graph G, metric dG , and node u,                   Nu = w,α,β ∂xβu , and α and β index the output and
+                                                                                               w
+  there is a unique range ρ̂u , defined on one-dimensional                input channels respectively. This formulation extends natu-
+  linear tasks, that satisfies Properties 1, 2 & 5, and                   rally to higher dimensions, since the influence distribution
+  given a linear task Y = L (X) it corresponds to the                     is not restricted to dimension 1. Using this viewpoint, we
+  following:                                                              can interpret ρ̂u as measuring the average distance over all
+                                                                          interactions, or as the average displacement after following
+                             1      X
+          ρ̂u (L) = P                 |Luv |dG (u, v) .                   a random walk defined by the influence distribution. Addi-
+                           v |Luv |  v∈V                                  tionally, the probabilistic viewpoint permits fast stochastic
+Proof. As in the above proof, we decompose L =                            approximations of the normalized range. For these reasons,
+   ij Lij 1ijP
+                                                                          we favor the normalized range in our experiments.
+P
+             . By Properties 3 & 1 & 5 we get ρ̂u (L) =
+               v∈V |Luv |ρ̂u (1uv ), and by Property 2 we con-
+P 1
+  v∈V |Luv |
+                                                                          Range granularities. We define a hierarchy of range granu-
+clude ρ̂u (L) = P 1|Luv | v∈V |Luv |dG (u, v).                            larities to capture task-specific statistics at different levels.
+                              P
+                     v∈V
+                                                                          The node-level node range ρ̂u is defined for every node u.
+Range of a GNN. In order to apply the above range to                      Averaging over all nodes in a graph G yields the node-level
+GNNs it suffices to extend this measure to any differentiable             graph range ρ̂G . Similarly, averaging over all graphs in
+map F(X) = Y. This is done by applying the above to the                   a dataset G gives the node-level dataset range ρ̂G . This
+Jacobian, namely the best linear approximation of F.                      hierarchy allows the range measures to be computed on
+   2
+     For graph-level tasks, the Jacobian-based method is introduced       both transductive and inductive tasks. We use the graph
+as a computationally more efficient alternative. See Section 6.2.1        and dataset granularity for our figures and experiments in
+for details.                                                              Sections 5 and 6. See Table 1 for details and a summary.
+
+                                                                      4
+                                      On Measuring Long-Range Interactions in Graph Neural Networks
+
+4. Range of a graph-level task                                                              Range granularities. As in the node-level case, we define
+                                                                                            a hierarchy of range granularities for graph-level tasks. The
+For node-level functions, the Jacobian — corresponding to                                   graph-level node range η̂u is defined per node u. Averaging
+the first-order term in the Taylor expansion — provides a set                               over nodes in a graph G yields the graph-level graph range
+of interactions between all nodes, making it suitable to cap-                               η̂G , and averaging over graphs in a dataset G gives the graph-
+ture pairwise node sensitivity. However, for a graph-level                                  level dataset range η̂G . See Table 1 for details.
+function y (X) ∈ Rc , the Jacobian is a vector, only captur-
+ing the sensitivity of the output with respect to individual
+nodes. This makes it unsuitable for assessing pairwise inter-                               5. Task Range Examples
+actions. To capture such interactions, we use the Hessian,                                  In this section we illustrate the proposed range measures,
+which appears in the second-order term of the Taylor expan-                                 computing them for different tasks and topologies for node-
+sion. This is in line with the mixing measure from Giovanni                                 and graph-level tasks, both empirically and analytically.
+et al. (2024), in which the Hessian is used to study infor-
+mation propagation in GNNs. For completeness, we write
+                                                                                            5.1. Design of synthetic tasks
+down the Taylor expansion of a task in the 1-dimensional
+case, where ∆ ∈ Rn is a small perturbation applied to X:                                    We design synthetic examples under a general framework
+                                                                                            of pairwise tasks on graphs. The framework consists of the
+                                      ∂y(X)                                                 combination of a distance function D : V × V → R and an
+     y(X + ∆) = y(X) +                      ∆
+                                      | ∂X
+                                         {z }                                               interaction function I :LRd ×Rd → Rc . A node-level task is
+                                        first order                                         obtained  as F (X)u = v∈V D(u, v)−1 · I(xu , xv ), where
+         X ∂ 2 y(X)                        X ∂ 2 y(X) 1                       2
+                                                                                            L
+                                                                                                denotes an aggregation. The interaction function is a
+     +                       ∆u ∆v +                                  (∆u )
+                  ∂xu ∂xv                             ∂x2u        2                         general pairwise function and the distance function scales
+         u̸=v                                u
+         |                              {z                                    }             the magnitude of the pairwise interactions.
+                                                                                                                                     LGraph level tasks
+                                                                                                                                                   −1
+                                                                                                                              N
+                                                                                                                           =            v∈V D(u, v)   ·
+                                    second order                                            can then be obtained  as y(X)        u∈V
+                       2
+                         
+     + O ∥∆∥
+                                                                                                               N
+                                                                                            I(xu , xv ), where    is another aggregation. This provides
+                                                                                            a general framework to design tasks on graphs, which we
+       | {z }
+             higher order
+                                                                                            use to design tasks of varying range.
+We can then define the graph-level range in the one-
+dimensional case as the analogous quantity:                                                 5.2. Empirical examples
+                                                                                            In order to investigate the impact of graph topology and
+                              X       ∂2y
+                  ηu (y) :=                  dG (u, v),                                     task definition on the range measure, we consider several
+                                     ∂xu ∂xv                                                distributions of graph topologies and three linear tasks.
+                              v∈V
+
+and its normalized version:                                                                 Impact of topology. To study the impact of the topology
+                                                                                            of a graph on the range, we consider node-level regres-
+                                         ηu (y)                                             sion tasks that predict Ãk X for some k where Ãk is k-th
+                     η̂u (y) := P                            .                    (4)
+                                            ∂2y                                             power of the symmetric normalized adjacency with self
+                                      v∈V ∂xu ∂xv
+                                                                                            loops, and graph-level regression tasks which consists of
+As in the node-level case, we extend this to higher dimen-                                  the squared difference interaction and the same distance.
+sions for both input and output channels and represent the
+measure as an expectation:
+                                                                                              100                                                     Grid
+                      η̂u (y) := Ev∼Ju [dG (u, v)],                                                                       10−2                        BA
+                                                                                                                                                      Sparse ER
+                                                                                            ρ̂res
+                                                                                              G                          η̂Gres                       Sparse SBM
+                                                                           ∂ 2 yγ
+where Ju is the distribution Ju (v) = N1u
+                                                         P
+                                                                                  β          10−1                                                     ER
+                                                                 α,β,γ    ∂xα
+                                                                            u ∂xv                                         10−3                        SBM
+                                                                      2   γ
+with normalizing constant Nu = v,α,β,γ ∂x∂αy∂xβ , and
+                                                 P
+                                                                                                    2    4       6   8            2   4       6   8
+                                                 u   v
+                                                                                                             k                            k
+α, β, γ are the dimensions of the inputs and the output. The
+       ∂ 2 yγ
+term ∂x   α xβ
+               corresponds to the mixing between channel α
+         u    v                                                                             Figure 2. Topology of graph impacts range. Ranges of node-level
+of xu and channel β of xv to compute channel γ of y(X),                                     tasks predicting Ãk X (left) and graph-level tasks using a squared
+so this quantity measures the total mixing between the two                                  difference interaction function and the same distance function,
+nodes. Similarly to the node-level measure, the normal-                                     where D(u, v)−1 = (Ãk )uv , averaged over nodes (right) for
+ized range generalizes to higher dimensions, enabling fast                                  varying k on graph distributions. While task choice affects range,
+stochastic approximations of η̂u .                                                          high range requires topologies with sufficiently large diameter.
+
+                                                                                        5
+                                     On Measuring Long-Range Interactions in Graph Neural Networks
+
+Figure 2 shows the task range for varying values of k on                    5.3. Analytic node-level examples
+different distributions of graphs, namely on 1-dimensional
+                                                                            We now consider example tasks whose range can be com-
+grid graphs (i.e. line graphs), on dense (p = 0.3) and
+                                                                            puted analytically.
+sparse (p = 0.1) Erdős-Renyi graphs (ER) with 100 nodes,
+and on dense (pintra = 0.75, pinter = 0.25) and sparse                      Example 1. Consider a task that is computable by a node-
+(pintra = 0.3, pinter = 0.1) stochastic block models (SBM)                  level function. That is, there exists a f : Rd → Rc such
+with 100 nodes. We notice that, overall, the ranges of the                  that F is simply applying f node-wise F(X)u := f (Xu ).
+tasks increase with k, but the topology affects the rate at                 In this case, no matter the distance metric chosen, ρ̂u (F ) =
+which the range grows. Indeed, sparse topologies (e.g. grids)               ρu (F ) = 0, independently of u and X. This shows that in
+that permit large diameters result in larger ranges than those              the extreme case of a purely local task, the range is 0.
+induced by their denser counterparts (ER, SBM).
+                                                                            Example 2. Consider the node-level task which averages
+Impact of task. We now fix the topology to be a grid-graph                  the squared difference of node features within the k-hop
+and compute the range of the three following tasks:                         neighborhood, where the node features are sampled i.i.d.
+                                                                            from a standard Gaussian distribution:
+k-Power: Predicting the function F (X) = Ãk X where                                               1         X
+                                                                                  Fk (X)u :=                       (xu − xv )2 .
+    Ãk is the k-th power of the symmetric normalized                                          |N≤k (u)|
+                                                                                                                    v∈N≤k (u)
+    adjacency matrix without self-loops.
+                                                                            This is a 1-dimensional task whose Jacobian is given by:
+k-Rectangle: P
+             Predicting          the     function F (X)u =
+           1
+                                X v,     the mean of inputs                                       2
+                                                                                            (
+      |N≤k (u)|       v∈N≤k (u)                                               ∂Fk (X)u                  (xv − xu ) if v ∈ N≤k (u)
+      over all nodes within k hops.                                                       = |N≤k (u)|
+                                                                                  ∂xv         0                     otherwise,
+k-Dirac: Predicting        the function F (X)u          =
+         1
+           P                                                                and whose normalized range with respect to SPD is:
+      |Nk (u)|   v∈Nk (u) X  v , the mean   of inputs over
+      all nodes that are exactly k hops away.                                                         1 X
+                                                                                                         k      X           2
+                                                                                           k
+                                                                               ρ̂spd
+                                                                                               
+                                                                                 u     F           =                               |xv − xu | r,
+                                                                                                     Nu r=1              |N≤k (u)|
+We plot the ranges for different k for all three tasks in                                                     v∈Nr (u)
+Figure 3. As expected, all tasks become more long-range                                             P              2
+with increasing k, with a clear order in the ranges for each                where Nu :=               v∈N≤k (u) |N≤k (u)| |xv − xu | is the nor-
+fixed k: k-Dirac > k-Rectangle > k-Power. This can be                       malizing constant. Since the features are i.i.d. Gaussian,
+understood by visualizing the shape of the influence distribu-              |xu − xv | is half-Gaussian with expectation √2π , so the ex-
+tion of the three tasks (see Figure 3): the mass concentrated               pected Nu is √4π and the expected normalized range is:
+furthest away for the Dirac task, spread uniformly for the
+rectangle task, and concentrated locally for the power task.                                                        1
+                                                                                                                            k
+                                                                                                                            X
+                                                                                       EX [ρ̂spd Fk ] =
+                                                                                                   
+                                                                                             u                                  |Nr (u)| r.
+                                                                                                               |N≤k (u)| r=1
+       8           k–Dirac
+                                                    k–Dirac
+                                                                            In particular, we have EX [ρ̂spd Fk+1 ] ≥ EX [ρ̂spd
+                   k–Rectangle                                                                                                   
+       6                                                                                                                        Fk ],
+ ρ̂spd             k–Power                          k–Rectangle                                          u                  u
+   G                                                k–Power                 with strict inequality if Nk+1 (u) is non-empty, showing
+       4
+                                                                            that the range increases with k.
+       2
+
+               2      4          6   8                                      5.4. Analytic graph-level examples
+                          k                                                 Example 1. Consider a task that is computable without
+                                                                            mixing between nodes, namely, there exists a node-wise
+        (a) Per-task ranges              (b) Influence distributions
+                                                                            f : Rd → Rd function such
+                                                                                                    P that the task y is simply a sum
+                                                                            over all nodes: y(X) = u f (xu ). In this case, no matter
+Figure 3. Task impacts range. (a) illustrates, for each of the 3
+synthetic tasks, SPD range on a grid graph for varying k. Owing             the metric chosen, ηG (y) = η̂G (y) = 0.
+to the shape of each influence distribution, we observe a linear            Example 2. Consider the graph-level task which sums the
+increase for k-Dirac and k-Rectangle, and a sublinear increase for          squared difference of features on nodes within the k-hop
+k-Power. (b) illustrates, on a line graph, the influence distribution
+                                                                            neighborhood followed by averaging over the graph:
+for the central node for each task when k = 2. For k-Power the
+influence decays with distance, while for k-Dirac influence is zero                                      1 X        X                   2
+everywhere except at the k-hop.                                                        yk (X) :=                             (xu − xv ) .
+                                                                                                        |V|
+                                                                                                             u∈V v∈N≤k (u)
+
+
+                                                                        6
+                              On Measuring Long-Range Interactions in Graph Neural Networks
+
+                           ∂2y     4|N≤k (u)|                                                            True res
+The second derivatives are ∂x 2 =     |V|     and:                         1.25                          Depth 8 1.0
+                              u                                                                                                       res
+                                                                           1.00                          Depth 7
+                                                                         res                             Depth 6 0.5
+                       (
+                            4
+            ∂2y          − |V|  if v ∈ N≤k (u)
+                    =                                                      0.75                          Depth 5
+          ∂xu ∂xv        0      otherwise.                                                               Depth 4
+                                                                           0.50                          Depth 3 0.1
+                                                                                                         Depth 2                      MSE
+Hence the normalizing constant is Nu =
+                                             8|N≤k (u)|
+                                                        , result-          0.25                          Depth 1 0.0
+                                                |V|                               5    10    15                        2     5       8
+ing in the following normalized range:                                                Epoch                                Depth
+                                     k
+                             1       X
+                                                                        Figure 4. Node-level range can be approximated with a good
+          η̂uspd yk =
+                   
+                                          |Nr (u)| r,
+                        2 |N≤k (u)| r=1                                 model. (Left) Average node-level dataset range evolutions for
+                                                                        different GCN depths on a line graph for the 5-power task. Shaded
+showing that the range increases with k as the task incorpo-            area corresponds to min/max over 4 seeds. (Right) Range and
+rates interaction between more distant nodes.                           MSE at epoch 20 against number of GCN layers.
+
+
+6. Experiments
+                                                                          0.8                     0.8                            True res
+In many real-world scenarios, the underlying task is un-                                                                         Depth 8
+known, making it essential to characterize task properties                0.6                     0.6                            Depth 7
+empirically. In this section, we present empirical results in             res                     res                            Depth 6
+                                                                          0.4                     0.4                            Depth 5
+this direction on both synthetic and real-world experiments.                                                                     Depth 4
+First, we demonstrate that the range of a trained model that              0.2                     0.2                            Depth 3
+solves a task approximates the range of the underlying task.                                                                     Depth 2
+                                                                          0.0 10 20 30 40         0.0 10 20 30 40                Depth 1
+We then leverage this observation to analyze the LRGB
+benchmark by the range of models trained on its tasks.                            Epoch                   Epoch
+
+While this approximation holds in synthetic settings where              Figure 5. Average dataset range evolutions for different GCN
+the task is solved nearly perfectly, real-world models do               depths on a line graph, using the 5-Power distance function and
+not achieve zero error, and thus do not provide a unique or             squared difference interaction function from Section 5.4. Shaded
+exact estimate of task range. Nevertheless, we find that the            area corresponds to min and max over 4 seeds. (Left) Graph-level
+correlation between model range and performance across                  range can be approximated with a good model. (Right) Pre-
+architectures offers a useful heuristic: tasks where better-            pooling node-level range correlates with graph-level range.
+performing models tend to exhibit longer range are plausibly
+long-range in nature, while those where performance satu-
+rates at low range are likely dominated by local interactions.
+                                                                        and plot final MSE vs. depth. Deeper models approach
+                                                                        the true task range and achieve lower MSE, while shal-
+6.1. Do GNNs approximate the true range of a task?
+                                                                        low models under-perform due to limited receptive fields
+This section investigates whether the range of a well-trained           and under-reaching. These results demonstrate that, under
+GNN can approximate the range of the underlying task.                   ideal conditions, model range converges toward the true task
+When using a GNN, we implicitly assume that the target                  range as training progresses and depth increases.
+function is parameterizable and thus admits a true range.
+                                                                        We repeat this on a graph-level task as shown in Figure 5.
+This raises a central question: under what conditions does
+                                                                        We use the same distance function as for the node-level but
+the range of a GNN align with that of the task? We argue that
+                                                                        replace the interaction function with the squared difference
+when the validation error approaches zero — i.e., when the
+                                                                        followed by averaging over the nodes, as in Section 5.4.
+model generalizes well — the range of the GNN converges
+                                                                        This makes the task non-linear and guarantees a non-trivial
+to the task range. We demonstrate this empirically in a
+                                                                        Hessian. We also use GeLU activation to make the models
+controlled synthetic setting, across both node- and graph-
+                                                                        non-linear. Similarly to the node-level case, the graph-level
+level tasks. These results support using the range of a trained
+                                                                        range η̂Gres of deeper models tends towards the true task range.
+GNN as a practical proxy for the range of a real-world task.
+                                                                        Figure 5 also shows the mean node-level range of the pre-
+Figure 4 illustrates linear GCNs with residual connections              pooling node embeddings, ρ̂res                       res
+                                                                                                       G ; we can see that ρ̂G follows
+of varying depths predicting Ã5 X on a 1D grid graph —                                       res
+                                                                        a similar trend to η̂G , suggesting a correlation between the
+a 5-hop task with ρ̂res
+                     G = 1.33. Models are trained on 500                two measures. This justifies using ρ̂res       res
+                                                                                                              G over η̂G in our LRGB
+samples with i.i.d. standard Gaussian node features. We                 experiments in Section 6.2, and allows a greater focus more
+track the evolution of the range of a model during training             on pairwise interactions induced by message-passing.
+
+                                                                    7
+                             On Measuring Long-Range Interactions in Graph Neural Networks
+
+6.2. Validating real-world benchmarks                               not compromise accuracy. Sub-sampling is performed over
+                                                                    output nodes as well as input and output feature channels,
+The goal of this section is to evaluate (i) whether GNNs
+                                                                    according to by pre-defined probability hyperparameters
+trained on existing long-range benchmarks do indeed learn
+                                                                    (details in Appendix D.4).
+long-range functions, and (ii) whether the underlying bench-
+mark tasks themselves are long-range.                               Distance metric. We focus on ρ̂spd   G as (i) SPD is more in-
+                                                                    terpretable than resistance distance, and (ii) results were
+As previously mentioned, we acknowledge that the unsolved
+                                                                    generally similar to those for ρ̂res
+                                                                                                     G . In particular, PEPTIDES
+nature of real-world tasks means that range of a model
+                                                                    graphs have similar topologies to line graphs, for which
+alone cannot definitively give us the range of the underlying
+                                                                    SPD and resistance are equivalent. Figures for resistance
+task; furthermore, models might exhibit bias towards par-
+                                                                    range can nevertheless be found in Appendix C.2. VOCSU -
+ticular ranges depending on their design. To address this,
+                                                                    PERPIXELS , PEPTIDES - FUNC and PEPTIDES - STRUCT are
+we analyze the correlation of performance and range for
+                                                                    evaluated on F1 score, average precision (AP) and mean
+a spectrum of architectures, to determine if a model is a
+                                                                    absolute error (MAE) respectively.
+good approximator, and whether long-range interactions are
+beneficial to the downstream task.                                  Graph-level tasks. For the graph-level PEPTIDES tasks, we
+                                                                    compute the node-level, Jacobian-based range (see Table 1)
+Furthermore, we include additional experiments on CORA, a
+                                                                    using node representations obtained after the final message-
+known short-range task, and on heterophilic tasks (Platonov
+                                                                    passing layer, but before global pooling and final MLP. This
+et al., 2023) in Appendix C. These experiments support
+                                                                    is partly due to the high computational cost of estimating the
+the intuition that the correlation between performance and
+                                                                    Hessian for large graphs with high feature dimensionality.
+model range is a suitable heuristic to assess the range of a
+                                                                    More importantly, since the post-message-passing compo-
+task, and show that GTs are able to learn to be short-range.
+                                                                    nents are standard architectural elements applied uniformly
+                                                                    across models, we focus on the long-range interactions in-
+6.2.1. E XPERIMENTAL SETUP
+                                                                    duced specifically by the GNN layers.
+Models. We consider four models, GCN (Kipf & Welling,
+2017), GINE (Xu et al., 2018a; Hu et al., 2020), GatedGCN           6.2.2. R ESULTS
+(Bresson & Laurent, 2017) and GPS (Rampášek et al., 2022),
+from Tönshoff et al. (2023), which reports more accurate               101                                       Model: F1
+                                                                                                                GPS       .451±.01
+baseline LRGB performance than Dwivedi et al. (2022),
+a hyperparameter search and correct normalization having               spd                                      GT        .392±.00
+                                                                                                                GatedGCN .378±.00
+been performed for each task. We also use a pure graph                                                          GINE      .275±.00
+transformer without message-passing (GT; Vaswani et al.                                                         GCN+VN    .245±.00
+                                                                                                                GCN       .185±.00
+(2017)) and a GCN with a virtual node (GCN+VN) to ensure                100                                        (4 seeds)
+a set of models with broad range tendencies.                                  1 2 3 4    5 20 40 60 80 100
+                                                                                Epoch          Epoch
+Tasks. From LRGB, we consider VOCSUPERPIXELS, a
+node-level classification task, and PEPTIDES - FUNC and
+PEPTIDES - STRUCT , graph-level classification and regres-          Figure 6. ρ̂spd
+                                                                                G for MPNN and GT models during training, evalu-
+
+sion tasks respectively. The models are trained using the           ated on a 500-graph subset of the validation split for VOCSUPER -
+                                                                    PIXELS . We cut off after 100 epochs as ranges have converged.
+hyperparameters from Tönshoff et al. (2023). We track ρ̂res
+                                                         G          The fact that ρ̂spd
+                                                                                    G settles at 2-3 for MPNNs and at 10 for GPS,
+                                                                                                ∼                        ∼
+and ρ̂spd
+      G throughout training using the Jacobian of node out-         and that range positively correlates with performance, suggests
+put features with respect to input features. Figures 6 & 7          that VOCSUPERPIXELS is, to some degree, long-range. Standard
+show evolution of model range over training for a subset            deviation is over 4 model/sampling seeds. Log scale on y-axis.
+of the validation split; 500 graphs for VOCSUPERPIXELS,
+200 each for PEPTIDES. We use subsets as we found that              VOCSUPERPIXELS .       Figure 6 shows that all models in-
+this approximates the full dataset ranges well, while being         crease in range during training, primarily within the first
+significantly less compute-intensive. We report only vali-          few epochs. MPNNs reach a final range of ∼2–3 hops,
+dation results as range estimates were found to be highly           while GPS and GT reach around ∼10. This is consistent
+consistent across splits.                                           with the notion that MPNNs learn local information first and
+                                                                    incorporate more distant information as training progresses.
+Jacobian sampling. To reduce the computational cost of
+                                                                    Additionally, range correlates positively with performance
+range computation, we use an estimate of the range (see
+                                                                    across models, and relative ranges are in line with our un-
+Equation 3) obtained from a sub-sampling of the Jacobian.
+                                                                    derstanding of each model.
+This is essential due to the large size and feature dimen-
+sionality of the LRGB tasks, and we observe that it does            GINE and GatedGCN, being more expressive than the
+
+                                                                8
+                               On Measuring Long-Range Interactions in Graph Neural Networks
+
+                                              Model: AP                  training; for PEPTIDES - STRUCT the range of GINE even
+                                             GCN+VN    .695±.01          decreases. This suggests that the PEPTIDES tasks are in-
+     101
+   spd                                       GINE
+                                             GCN
+                                                       .693±.00
+                                                       .692±.00
+                                                                         herently local. Although GPS and GT exhibit larger ranges
+                                             GatedGCN .681±.01
+                                                                         — and to a lesser extent, GatedGCN on PEPTIDES - FUNC —
+                                             GPS       .654±.01          these do not translate into improved performance. Similarly,
+    100                                      GT        .593±.06          GCN+VN has higher range than the MPNNs but yields
+                                                (4 seeds)
+                                                                         minimal or no performance gains. These findings indicate
+           1 2 3 4   5 20 40 60 80 100                                   that while some models are capable of modeling long-range
+             Epoch         Epoch
+                                                                         interactions, such capacity is unnecessary for solving the
+                      (a) PEPTIDES - FUNC                                PEPTIDES tasks effectively.
+
+                                                                         For PEPTIDES - STRUCT this finding is less surprising;
+                                             Model: MAE                  Tönshoff et al. (2023) report that GCN remains state-of-
+                                             GatedGCN .244±.00
+     101                                                                 the-art, even when compared against an array of more ex-
+   spd                                       GCN
+                                             GINE
+                                                       .245±.00
+                                                       .245±.00
+                                                                         pressive models. For PEPTIDES - FUNC, however, several
+                                             GCN+VN    .246±.00          later works report improved performance compared to the
+                                             GPS       .256±.00          models considered here. Notably, these approaches often
+    100                                      GT        .293±.02
+                                                                         incorporate some form of long-range information flow, such
+                                                (4 seeds)
+           1 2 3 4   5 20 40 60 80 100                                   as dynamically rewired multi-hop (Gutteridge et al., 2023)
+             Epoch         Epoch                                         or global attention with added inductive bias (Ma et al.,
+                                                                         2023). However, both of these examples emphasize the im-
+                     (b) PEPTIDES - STRUCT
+                                                                         portance of short-range interactions in their architectures by
+                                                                         integrating strong local inductive bias. Indeed, this seems
+Figure 7. ρ̂spd
+            G for MPNN and GT models during training, evalu-             to be a requirement for long-range models to perform well
+ated on a 200-graph subset of the validation splits for PEPTIDES -
+                                                                         on PEPTIDES - FUNC. Given that our findings suggest that
+FUNC and PEPTIDES - STRUCT . We cut off after 100 epochs as
+                                                                         PEPTIDES - FUNC may not be especially long-range, these
+ranges have converged. The negative correlation between perfor-
+mance and range may suggest that the PEPTIDES tasks are not as           models’ performance is, perhaps, more attributable to how
+long-range as previously assumed. Standard deviation is over 4           information is propagated than to their range capabilities.
+model/sampling seeds. Log scale on y-axis.
+                                                                         7. Discussion
+purely convolutional GCN, improve resistance to the over-                This work formalizes long-range interactions for graph tasks,
+smoothing and over-squashing phenomena that hamper long-                 introduces a family of principled and quantitative range mea-
+range interactions, and therefore attain higher ranges — but             sures, and applies them to synthetic and real-world tasks.
+they are ultimately still MPNNs, so the difference is slight.            We believe that these measures will serve as tools that af-
+GCN+VN improves significantly on the performance of a                    ford both a greater understanding of the long-range prob-
+pure GCN and induces a larger range, as the VN mitigates                 lem in graph machine learning, and as an additional vali-
+under-reaching by creating a 2-hop connection between                    dation method for future proposed architectures and bench-
+all nodes. GPS, the best-performing model, uses global                   mark tasks. More broadly, our findings highlight the need
+attention — which permits a large range and mitigates over-              for GNN evaluation to move beyond performance metrics,
+squashing — alongside a local GatedGCN component.                        incorporating interpretable measures—such as range—for
+The observed positive correlation between model range and                more transparent and principled assessment. Finally, our
+performance suggests that VOCSUPERPIXELS is inherently                   proposed range measures are not limited to GNNs or graph
+a long-range task, in that successfully solving it requires              learning tasks and can be applied to any geometric domain
+incorporating information from distant nodes. The poor                   equipped with a notion of distance.
+performance of MPNNs on this task can therefore be at-                   Future work will further investigate our Hessian-based range
+tributed to their limited ability to capture long-range depen-           measures η̂ for evaluating real-world benchmarks alongside,
+dencies, likely due to under-reaching, over-smoothing, and               and in comparison with, the node-level range. Future work
+over-squashing.                                                          will also focus on investigating specific architectural compo-
+PEPTIDES . In contrast to VOCSUPERPIXELS , PEPTIDES -
+                                                                         nents such as fully connected layers, graph rewiring, resid-
+FUNC and PEPTIDES - STRUCT exhibit the opposite trend:
+                                                                         ual connections, and positional or structural encoding, and
+GT and GPS perform the worst while the three MPNNs all                   their impact on the range of a model. This will include both
+perform similarly well. Notably, the MPNNs maintain a                    empirical and theoretical analysis to assess how common
+range ρ̂spd                                                              GNN building blocks influence range in a principled way.
+        G of 1 hop after epoch 1, with no increase during
+            ∼
+
+
+                                                                     9
+                            On Measuring Long-Range Interactions in Graph Neural Networks
+
+Impact Statement                                                   Barbero, F., Velingker, A., Saberi, A., Bronstein, M. M., and
+                                                                     Di Giovanni, F. Locality-aware graph rewiring in gnns.
+This paper presents work whose goal is to advance the field          In The Twelfth International Conference on Learning
+of machine learning. There are many potential societal               Representations, 2023.
+consequences of our work, none which we feel must be
+specifically highlighted here.                                     Black, M., Wan, Z., Nayyeri, A., and Wang, Y. Under-
+                                                                     standing oversquashing in gnns through the lens of effec-
+                                                                     tive resistance. In International Conference on Machine
+Acknowledgments
+                                                                     Learning, pp. 2528–2547. PMLR, 2023.
+We thank Federico Barbero, İsmail İlkan Ceylan and
+                                                                   Bodnar, C., Frasca, F., Otter, N., Wang, Y., Lio, P., Montu-
+Francesco Di Giovanni, discussions with whom helped
+                                                                     far, G. F., and Bronstein, M. Weisfeiler and lehman go
+shape the presentation of this work. BG and SLR acknowl-
+                                                                     cellular: Cw networks. Advances in neural information
+edge funding support from EPSRC Centre for Doctoral
+                                                                     processing systems, 34:2625–2640, 2021.
+Training in Autonomous Intelligent Machines and Systems
+No. EP/S024050/1. MB and JB are partially supported by             Bresson, X. and Laurent, T. Residual gated graph convnets.
+the EPSRC Turing AI World-Leading Research Fellowship                arXiv preprint arXiv:1711.07553, 2017.
+No. EP/X040062/1 and EPSRC AI Hub No. EP/Y028872/1.
+                                                                   Choi, J., Kim, H., An, M., and Whang, J. J. Spot-
+XD acknowledges support from the Oxford-Man Institute
+                                                                     mamba: Learning long-range dependency on spatio-
+of Quantitative Finance and the EPSRC No. EP/T023333/1.
+                                                                     temporal graphs with selective state spaces. arXiv
+                                                                     preprint arXiv:2406.11244, 2024.
+References
+                                                                   Deac, A., Lackenby, M., and Veličković, P. Expander graph
+Abboud, R., Dimitrov, R., and Ceylan, I. I. Shortest path            propagation. In Learning on Graphs Conference, pp.
+  networks for graph property prediction. In Learning on             38–1. PMLR, 2022.
+ Graphs Conference, pp. 5–1. PMLR, 2022.
+                                                                   Di Giovanni, F., Giusti, L., Barbero, F., Luise, G., Lio, P.,
+Abu-El-Haija, S., Perozzi, B., Kapoor, A., Alipourfard, N.,          and Bronstein, M. M. On over-squashing in message
+  Lerman, K., Harutyunyan, H., Ver Steeg, G., and Gal-               passing neural networks: The impact of width, depth,
+  styan, A. Mixhop: Higher-order graph convolutional                 and topology. In International conference on machine
+  architectures via sparsified neighborhood mixing. In in-           learning, pp. 7865–7885. PMLR, 2023a.
+  ternational conference on machine learning, pp. 21–29.
+                                                                   Di Giovanni, F., Rusch, T. K., Bronstein, M., Deac, A.,
+  PMLR, 2019.
+                                                                     Lackenby, M., Mishra, S., and Veličković, P. How does
+Alon, U. and Yahav, E. On the bottleneck of graph neural             over-squashing affect the power of gnns? Transactions
+  networks and its practical implications. arXiv preprint            on Machine Learning Research, 2023b.
+  arXiv:2006.05205, 2020.
+                                                                   Dwivedi, V. P., Rampášek, L., Galkin, M., Parviz, A., Wolf,
+Arnaiz-Rodrı́guez, A. and Errica, F. Oversmoothing,” over-          G., Luu, A. T., and Beaini, D. Long range graph bench-
+  squashing”, heterophily, long-range, and more: Demysti-           mark. Advances in Neural Information Processing Sys-
+  fying common beliefs in graph machine learning. arXiv             tems, 35:22326–22340, 2022.
+  preprint arXiv:2505.15547, 2025.                                 Fan, W., Ma, Y., Li, Q., He, Y., Zhao, E., Tang, J., and Yin,
+Arnaiz-Rodrı́guez, A., Begga, A., Escolano, F., and Oliver,          D. Graph neural networks for social recommendation. In
+  N. M. Diffwire: Inductive graph rewiring via the lovász           The world wide web conference, pp. 417–426, 2019.
+  bound. In Learning on Graphs Conference, pp. 15–1.               Finkelshtein, B., Huang, X., Bronstein, M. M., and Cey-
+  PMLR, 2022.                                                        lan, I. I. Cooperative graph neural networks. In Inter-
+                                                                     national Conference on Machine Learning, pp. 13633–
+Arroyo, Á., Gravina, A., Gutteridge, B., Barbero, F., Gal-
+                                                                     13659. PMLR, 2024.
+  licchio, C., Dong, X., Bronstein, M., and Vandergheynst,
+  P. On vanishing gradients, over-smoothing, and over-             Gasteiger, J., Weißenberger, S., and Günnemann, S. Diffu-
+  squashing in gnns: Bridging recurrent and graph learning.          sion improves graph learning. Advances in neural infor-
+  arXiv preprint arXiv:2502.10818, 2025.                             mation processing systems, 32, 2019.
+Bamberger, J., Barbero, F., Dong, X., and Bronstein, M. M.         Gilmer, J., Schoenholz, S. S., Riley, P. F., Vinyals, O., and
+  Bundle neural network for message diffusion on graphs.             Dahl, G. E. Neural message passing for quantum chem-
+  In The Thirteenth International Conference on Learning             istry. In International conference on machine learning,
+  Representations, 2025.                                             pp. 1263–1272. PMLR, 2017.
+
+                                                              10
+                             On Measuring Long-Range Interactions in Graph Neural Networks
+
+Gilmer, J., Schoenholz, S. S., Riley, P. F., Vinyals, O., and        Lukovnikov, D., Lehmann, J., and Fischer, A. Improving the
+  Dahl, G. E. Message passing neural networks. In Machine              long-range performance of gated graph neural networks.
+  learning meets quantum physics, pp. 199–214. Springer                arXiv preprint arXiv:2007.09668, 2020.
+  International Publishing Cham, 2020.
+                                                                     Ma, L., Lin, C., Lim, D., Romero-Soriano, A., Dokania,
+Giovanni, F. D., Rusch, T. K., Bronstein, M., Deac, A.,               P. K., Coates, M., Torr, P., and Lim, S.-N. Graph in-
+  Lackenby, M., Mishra, S., and Veličković, P. How does             ductive biases in transformers without message passing.
+  over-squashing affect the power of GNNs? Transactions               In International Conference on Machine Learning, pp.
+  on Machine Learning Research, 2024. ISSN 2835-8856.                 23321–23337. PMLR, 2023.
+
+Gutteridge, B., Dong, X., Bronstein, M. M., and Di Gio-              Monti, F., Frasca, F., Eynard, D., Mannion, D., and
+ vanni, F. Drew: Dynamically rewired message pass-                    Bronstein, M. M. Fake news detection on social me-
+  ing with delay. In International Conference on Machine              dia using geometric deep learning. arXiv preprint
+ Learning, pp. 12252–12267. PMLR, 2023.                               arXiv:1902.06673, 2019.
+
+                                                                     Nt, H. and Maehara, T. Revisiting graph neural net-
+Hariri, A. and Vandergheynst, P. Graph learning for cap-
+                                                                       works: All we have is low-pass filters. arXiv preprint
+  turing long-range dependencies in protein structures. In
+                                                                       arXiv:1905.09550, 2019.
+ Machine Learning for Computational Biology, 2024.
+                                                                     Oono, K. and Suzuki, T. Graph neural networks exponen-
+He, X., Hooi, B., Laurent, T., Perold, A., LeCun, Y., and              tially lose expressive power for node classification. In
+  Bresson, X. A generalization of vit/mlp-mixer to graphs.            International Conference on Learning Representations,
+  In International conference on machine learning, pp.                 2019.
+ 12724–12745. PMLR, 2023.
+                                                                     Platonov, O., Kuznedelev, D., Diskin, M., Babenko, A., and
+Hu, W., Liu, B., Gomes, J., Zitnik, M., Liang, P., Pande, V.,          Prokhorenkova, L. A critical look at the evaluation of
+  and Leskovec, J. Strategies for pre-training graph neu-              GNNs under heterophily: Are we really making progress?
+  ral networks. In International Conference on Learning                In The Eleventh International Conference on Learning
+  Representations (ICLR), 2020.                                        Representations, 2023.
+
+Karhadkar, K., Banerjee, P. K., and Montufar, G. Fosr:               Rampášek, L. and Wolf, G. Hierarchical graph neural nets
+  First-order spectral rewiring for addressing oversquashing           can capture long-range interactions. In 2021 IEEE 31st
+  in gnns. In The Eleventh International Conference on                 International Workshop on Machine Learning for Signal
+  Learning Representations, 2022.                                      Processing (MLSP), pp. 1–6. IEEE, 2021.
+
+Kipf, T. N. and Welling, M. Semi-supervised classifica-              Rampášek, L., Galkin, M., Dwivedi, V. P., Luu, A. T., Wolf,
+  tion with graph convolutional networks. In International             G., and Beaini, D. Recipe for a general, powerful, scal-
+  Conference on Learning Representations, 2017.                        able graph transformer. Advances in Neural Information
+                                                                       Processing Systems, 35:14501–14515, 2022.
+Koh, P. W. and Liang, P. Understanding black-box predic-
+                                                                     Southern, J., Di Giovanni, F., Bronstein, M., and Lutzeyer,
+  tions via influence functions. In International conference
+                                                                       J. F. Understanding virtual nodes: Oversmoothing,
+  on machine learning, pp. 1885–1894. PMLR, 2017.
+                                                                       oversquashing, and node heterogeneity. arXiv preprint
+Li, G., Muller, M., Thabet, A., and Ghanem, B. Deepgcns:               arXiv:2405.13526, 2024.
+  Can gcns go as deep as cnns? In Proceedings of the                 Tay, Y., Dehghani, M., Abnar, S., Shen, Y., Bahri, D., Pham,
+  IEEE/CVF international conference on computer vision,                P., Rao, J., Yang, L., Ruder, S., and Metzler, D. Long
+  pp. 9267–9276, 2019.                                                 range arena : A benchmark for efficient transformers. In
+                                                                       International Conference on Learning Representations,
+Liang, H., de Ocáriz Borde, H. S., Sripathmanathan, B.,
+                                                                       2021.
+  Bronstein, M., and Dong, X. Towards quantifying long-
+  range interactions in graph machine learning: a large              Tönshoff, J., Ritzert, M., Rosenbluth, E., and Grohe, M.
+  graph dataset and a measurement, 2025.                               Where did the gap go? reassessing the long-range graph
+                                                                       benchmark. In The Second Learning on Graphs Confer-
+Lukovnikov, D. and Fischer, A. Improving breadth-wise                  ence, 2023.
+  backpropagation in graph neural networks helps learning
+  long-range dependencies. In International Conference on            Topping, J., Di Giovanni, F., Chamberlain, B. P., Dong, X.,
+  Machine Learning, pp. 7180–7191. PMLR, 2021.                         and Bronstein, M. M. Understanding over-squashing and
+
+                                                                11
+                             On Measuring Long-Range Interactions in Graph Neural Networks
+
+  bottlenecks on graphs via curvature. In International
+  Conference on Learning Representations, 2021.
+Vaswani, A., Shazeer, N., Parmar, N., Uszkoreit, J., Jones,
+  L., Gomez, A. N., Kaiser, Ł., and Polosukhin, I. At-
+  tention is all you need. Advances in neural information
+  processing systems, 30, 2017.
+
+Wang, C., Tsepa, O., Ma, J., and Wang, B. Graph-mamba:
+ Towards long-range graph sequence modeling with se-
+ lective state spaces. arXiv preprint arXiv:2402.00789,
+ 2024.
+Wu, Z., Jain, P., Wright, M., Mirhoseini, A., Gonzalez, J. E.,
+ and Stoica, I. Representing long-range context for graph
+ neural networks with global attention. Advances in neural
+ information processing systems, 34:13266–13279, 2021.
+Xu, K., Hu, W., Leskovec, J., and Jegelka, S. How powerful
+  are graph neural networks? In International Conference
+  on Learning Representations, 2018a.
+
+Xu, K., Li, C., Tian, Y., Sonobe, T., Kawarabayashi, K.-
+  i., and Jegelka, S. Representation learning on graphs
+ with jumping knowledge networks. In International con-
+  ference on machine learning, pp. 5453–5462. PMLR,
+  2018b.
+
+Zhou, D., Kharlamov, E., and Kostylev, E. V. GLora: A
+  benchmark to evaluate the ability to learn long-range
+  dependencies in graphs. In The Thirteenth International
+  Conference on Learning Representations, 2025.
+
+
+
+
+                                                                 12
+                             On Measuring Long-Range Interactions in Graph Neural Networks
+
+A. Detailed discussion of related work
+In this section we review existing attempts at long-range benchmarks, both synthetic and real-world, as well as methods that
+attempt to solve the long-range problem, and how they validate their claims.
+
+A.1. Long-range benchmarks
+Dwivedi et al. (2022) argue that the standard suite of GNN benchmarks are inappropriate for evaluating long-range
+interactions as they are overwhelmingly local, consisting of graphs with a small number of nodes and narrow diameter.
+They then introduce the Long Range Graph Benchmark (LRGB), a suite of tasks whose long-rangedness is established,
+variably, by (i) large graph size/diameter, (ii) the necessity of graph-level mixing, and (iii) arguments based on an intuitive
+understanding of the underlying task — e.g. classifying long peptide chains with globally-dependent properties. They also
+show a performance gap between ‘short-range’ standard MPNNs and GTs utilizing global attention, though Tönshoff et al.
+(2023) have since shown that this gap is significantly narrowed by simple hyperparameter tuning, calling into question the
+extent to which the LRGB tasks are truly long-range. Despite this, LRGB remains the de-facto validator of long-range
+performance.
+Synthetic tasks are also frequently used. Examples include RingTransfer (Bodnar et al., 2021), where a source node must
+infer a distant target node’s label on a ring graph, a color connectivity task where a graph with binary-labelled nodes must
+be classified as having one ‘island’ of clustered labels or two (Rampášek & Wolf, 2021), and tasks approximating searches
+on trees (Lukovnikov et al., 2020; Lukovnikov & Fischer, 2021) such as NeighborsMatch (Alon & Yahav, 2020), and
+GLoRa (Zhou et al., 2025), which introduces synthetic tasks that require identifying specific long paths in graphs. Several of
+these tasks bear similarities to tasks from the popular Long Range Arena (Tay et al., 2021) benchmark from the sequence
+literature; they frequently use very simple topologies (lines, rings, trees), are simple tasks with limited or no node features,
+and usually depend only on long-range interactions, such that a simple rewiring converts them into short-range tasks.
+Few synthetic tasks acknowledge that graph-structured data and tasks are, by design, locally biased: a task may involve
+long-range interactions, but will likely be primarily based on local ones. In this paper, we design synthetic experiments that
+better reflect this fact, requiring long-range interactions without neglecting short ones.
+
+A.2. Empirical solutions to the long-range problem
+Many methods have been proposed for addressing the long-range problem, often with the correlated goal of reducing
+over-squashing. Simple methods such as adding virtual or latent nodes (Gilmer et al., 2017; Southern et al., 2024; Hariri
+& Vandergheynst, 2024) or fully adjacent layers (Alon & Yahav, 2020) remove any meaningful distance between nodes
+by making them all connected within one or two hops, and are often quite effective. Graph rewiring approaches work in a
+similar fashion, improving the connectedness of nodes with additional edges, typically reducing the graph diameter, either
+as a pre-processing step (Topping et al., 2021; Gasteiger et al., 2019; Deac et al., 2022; Arnaiz-Rodrı́guez et al., 2022;
+Black et al., 2023; Karhadkar et al., 2022; Barbero et al., 2023) or acting on the computational graph within the model
+architecture (Abu-El-Haija et al., 2019; Abboud et al., 2022; Gutteridge et al., 2023; Bamberger et al., 2025; Finkelshtein
+et al., 2024). Rewiring has been shown to mitigate over-squashing, at the risk of diluting the benefit of the inductive bias
+afforded by graph topology. Global attention, such as that used by GTs (Vaswani et al., 2017; Wu et al., 2021; Rampášek
+et al., 2022), also throws away topology in favor of allowing nodes to interact directly, regardless of distance. Reflecting the
+inherently local nature of most graph tasks, the best-performing GT architectures tend to be those that combine local with
+global/long-range components (Ma et al., 2023; He et al., 2023). Increasingly, the relationship between vanishing gradients
+and the long-range problem is being studied, with inspiration taken from sequence literature: residual connections (Xu et al.,
+2018b; Gutteridge et al., 2023), gating (Lukovnikov et al., 2020) and state-space models (Choi et al., 2024; Wang et al.,
+2024; Arroyo et al., 2025), treating the spatial dimension of graphs as analogous to the temporal dimension of sequences.
+All of these methods have been argued to improve performance for long-range interactions based on empirical performance
+on benchmarks. Our work provides an additional and more principled validator by a means of formally measuring the range
+of a model trained on a given task.
+
+
+
+
+                                                              13
+                              On Measuring Long-Range Interactions in Graph Neural Networks
+
+B. LRGB dataset statistics
+In this section we discuss some dataset statistics of interest for VOCSUPERPIXELS and PEPTIDES, which can be found in
+Table 2. These statistics are taken from Dwivedi et al. (2022), but it should be noted that there exist disconnected graphs in
+the PEPTIDES datasets, which may affect their accuracy.
+
+Table 2. Comparison of VOCSUPERPIXELS and PEPTIDES datasets across various metrics. We report the average validation range over 4
+seeds at the final epoch. The graph statistics are reported according to Dwivedi et al. (2022).
+
+                                  Metric            VOCSUPERPIXELS          PEPTIDES - FUNC
+
+                                  GCN ρ̂spd
+                                         G             2.32 ± 0.098          1.04 ± 0.030
+                                  GPS ρ̂spd
+                                        G              9.15 ± 0.525          19.08 ± 8.879
+                                  Avg. SPD             10.74 ± 0.51           20.89 ± 9.79
+                                  Avg. diameter        27.62 ± 2.13          56.99 ± 28.72
+                                  Avg. degree              5.65                   2.04
+
+We note that the range of a GPS induces an SPD range approximately close to the average SPD over the graphs in the
+corresponding datasets. One can conjecture that this is the result of the attention scores being relatively uniform and
+struggle to capture more complex and local structures within the graph. In the case of VOCSUPERPIXELS, GPS is the
+best-performing model, hence uniform attention may be desired for the downstream task. PEPTIDES - FUNC is the opposite;
+the poor performance of GPS and the similarity between SPD and ρ̂spd    G suggests that the attention mechanism is learning a
+global averaging rather than complex pairwise interactions. This suggests that the model is simply not well-aligned to the
+task, and that local structures, which attention is unable to capture, are more important for the downstream task. Further
+investigation of the influence distributions of these models is required to shed light into the types of structures captured by a
+model when trained on a specific task.
+
+C. Additional experimental results
+In this Section we include additional experiments and ablations excluded from the main text, on synthetic datasets, on
+LRGB, CORA and the heterophilic datasets AMAZON - RATINGS and ROMAN - EMPIRE.
+
+C.1. Additional synthetic experiments
+Node-level range. In Section 6.1 we look at how well a linear GNN with varying depths can approximate the range of a
+synthetic task with known true range. We extend this analysis to include a non-linear GNN activation (GeLU) and a GNN
+with a virtual node. The architecture used for the results in Figure 4 is a GCN (Kipf & Welling, 2017) with no activation
+plus skip connections. The hidden dimension of the GCN layers is 64. We use L2 loss and a learning rate of 0.001.
+Graph-level range. We repeat these ablations for the graph-level range in Figure 5 by adding a mean pooling laye in
+addition to the virtual node. We only include the virtual node ablation here since the original experiment in Figure 5 already
+has a GeLU activation at every layer to guarantee its ability to capture non-linear interactions. We report the results in
+Figure 9.
+
+C.2. Additional LRGB experiments
+In this section we include additional figures for resistance distance range experiments for LRGB, which were excluded
+from the main text due to the similarity of the figures between ρ̂spd     res
+                                                                  G and ρ̂G . This similarity is especially pronounced for
+PEPTIDES , as the graphs are very similar to line graphs, for which SPD and resistance distance are equivalent.
+
+
+C.3. CORA: a known short-range task
+We primarily evaluate range for models trained on LRGB, as it is the de-facto long-range benchmark, but it is desirable to
+also analyze our range measure on a reference short-range task. We use CORA, and train a graph Transformer and a GCN to
+compare the range extremities for GNNs. Results are shown in Figure 12. We also show in Figure 13 that, for this task, the
+GT is capable of learning a similar range to a GCN. This refutes a possible interpretation of our experiments in Section 6.2:
+
+                                                               14
+                                On Measuring Long-Range Interactions in Graph Neural Networks
+
+                                 True res   1.25                                4                           True res
+    1.25                                                                                                    Depth 8    2.5
+                                 Depth 8    1.00                 res         res 3                          Depth 7    2.0               res
+    1.00                         Depth 7
+ res                             Depth 6    0.75                                                            Depth 6    1.5
+    0.75                         Depth 5                                                                    Depth 5
+                                 Depth 4                                        2                           Depth 4
+                                             0.1                                                                       0.1
+    0.50                         Depth 3
+                                                                 MSE                                        Depth 3
+                                                                                                                                         MSE
+                                 Depth 2                                        1                           Depth 2
+    0.25                         Depth 1     0.0                                                            Depth 1    0.0
+           5   10    15                             2     5      8                   5    25        50                       2     5     8
+               Epoch                                    Depth                            Epoch                                   Depth
+(a) (Left) Average range of GCN with GeLU activation for                    (b) (Left) Average range of a GCN+VN for different depths
+different depths on a line graph for the k-Power task for k = 5.            on a line graph for the k-Power task for k = 5. Shaded area
+Shaded area corresponds to min/max over 4 seeds. (Right) Range              corresponds to min/max over 4 seeds. (Right) Range and MSE at
+and MSE at epoch 20 against number of GCN layers.                           epoch 50 against number of GCN layers.
+
+Figure 8. Node-level range ablations on synthetic k-Power task, further validating the range measure on synthetic tasks. Figure 8a shows
+that including a non-linearity has little effect on range, and Figure 4, whereas adding a virtual node Figure 8b induces more longer ranges
+at initialization, but this decreases during training as the model successfully learns the task.
+
+                                     3.0                                                         True res
+                                                                                                 Depth 8
+                                     2.0                                                         Depth 7
+                                     res                                                         Depth 6
+                                                                                                 Depth 5
+                                     1.0                                                         Depth 4
+                                                                                                 Depth 3
+                                                                                                 Depth 2
+                                     0.0                                                         Depth 1
+                                               10          20        30       40
+                                                                Epoch
+
+Figure 9. Average graph-level range of a GCN+VN for different depths on a line graph for the k-Power task for k = 5. Shaded area
+corresponds to min/max over 4 seeds. Adding a virtual node produces a similar result to the node-level case; the range is initially higher
+but trends lower, towards the true range.
+
+
+that GTs are always long-range and are therefore unsuitable for providing information about the underlying range of the
+task. For these experiments both models use a hidden dimension of 64 and 2 layers, following the hyperparameterizations
+from Kipf & Welling (2017).
+
+C.4. AMAZON - RATINGS and ROMAN - EMPIRE: heterophilic tasks
+We now investigate if there is a relationship between the long-range interaction problem and heterophilic tasks (Arnaiz-
+Rodrı́guez & Errica, 2025). We use our range measure to evaluate models trained on the heterophilic datasets AMAZON -
+RATINGS and ROMAN - EMPIRE (Platonov et al., 2023). Due to the size of these graphs, 24492 and 22662 nodes for
+AMAZON - RATINGS and ROMAN - EMPIRE respectively, dense GTs are computationally infeasible. Hence, we test using a
+local MPNN (GCN), local attention (GT; the same architecture referred to as a GT by Platonov et al. (2023)), and an MPNN
+with a virtual node (GCN+VN).
+Figures 14 & 15 show that only the MPNN+VN is long-range (due to the drastic increase in receptive field) but yields zero
+performance benefit over a standard GCN; far more important is how information is propagated. The local GT, i.e. an
+MPNN using Transformer-style attention, performs better for both tasks, while range is near-identical to that of a GCN. This
+suggests that heterophily is not necessarily related to range, at least for these tasks.
+
+
+
+
+                                                                       15
+                               On Measuring Long-Range Interactions in Graph Neural Networks
+
+
+                                      1.0                                          Model: F1
+                                                                                  GPS       .451±.01
+
+                                    res0.8                                        GT        .392±.00
+                                                                                  GatedGCN .378±.00
+                                      0.6                                         GINE      .275±.00
+                                                                                  GCN+VN    .245±.00
+                                      0.4                                         GCN       .185±.00
+                                                                                     (4 seeds)
+                                             1 2 3 4       5 20 40 60 80 100
+                                               Epoch             Epoch
+
+Figure 10. ρ̂res
+             G for MPNN and GT models during training, evaluated on a 500-graph subset of the validation split for VOCSUPERPIXELS .
+We cut off after 100 epochs as ranges have converged. The relative range evolutions between models and correlation with performance
+are very similar to the SPD case, reinforcing our earlier argument about the validity of VOCSUPERPIXELS as a long-range benchmark.
+However, we note that all ranges are contracted to below 1, even for the GPS and GT. This is due to the topology of VOCSUPERPIXELS
+graphs (see Table 2), which have a high average degree (see Table 2), meaning that resistance distance grows sub-linearly against
+SPD. Additionally, the range of GT matches that of GINE and GCN+VN at epoch 1, which contrasts with the SPD range where GT is
+considerably higher. This confirms the importance of the choice of distance metric. Standard deviation is over 4 model/sampling seeds.
+
+
+                                               Model: AP                                                               Model: MAE
+                                              GCN+VN    .695±.01                                                       GatedGCN .244±.00
+    101                                       GINE      .693±.00
+                                                                           101                                         GCN       .245±.00
+   res                                        GCN       .692±.00
+                                                                          res                                          GINE      .245±.00
+                                              GatedGCN .681±.01                                                        GCN+VN    .246±.00
+                                              GPS       .654±.01                                                       GPS       .256±.00
+    100                                       GT        .593±.06           100                                         GT        .293±.02
+                                                 (4 seeds)                                                                (4 seeds)
+          1 2 3 4    5 20 40 60 80 100                                           1 2 3 4       5 20 40 60 80 100
+            Epoch          Epoch                                                   Epoch             Epoch
+                      (a) PEPTIDES - FUNC                                                      (b) PEPTIDES - STRUCT
+
+Figure 11. ρ̂res
+             G for MPNN and GT models during training, evaluated on a 200-graph subset of the validation splits for PEPTIDES - FUNC
+and PEPTIDES - STRUCT. We cut off after 100 epochs as ranges have converged. The negative correlation between performance and range
+may suggest that the PEPTIDES tasks are not as long-range as previously assumed. Standard deviation is over 4 model/sampling seeds. We
+use log scaling on the y-axis.
+
+
+D. Additional experimental details
+In this section we discuss some additional experimental details excluded from the main text.
+
+D.1. Differentiability of models for PEPTIDES experiments
+Node features for PEPTIDES are integer-valued as they represent atomic features. The AtomEncoder module (from
+GraphGym) used to encode these discrete values uses a torch.nn.Embedding module directly. This process prohibits
+differentiating the model output with respect to the input features, which is necessary for the Jacobian calculation required
+to compute the range. Hence, we replace the AtomEncoder with a DifferentiableAtomEncoder which pre-
+processes the PEPTIDES node features into one-hot floating point vectors. This produces a differentiable input and encoder
+equivalent to the existing AtomEncoder and allows us to compute the Jacobian for our range measures.
+
+D.2. Inefficiency of one-hot encoding for PEPTIDES
+The standard AtomEncoder from GraphGym used for PEPTIDES that one-hot encodes integer node features is extremely
+inefficient: it converts 9 integer-valued node features into a 174-dimensional one-hot vector, but over 80% of these are zero
+for all graphs in the PEPTIDES dataset. Only 31 one-hot features are required in practice.
+As our range measure involves computing the Jacobian between input and output features, and the complex-
+ity of this computation scales with the input feature dimension, we reduce the one-hot encoding to 31 for our
+DifferentiableAtomEncoder. This means our model architectures are slightly different than those reported by
+
+                                                                    16
+                                         On Measuring Long-Range Interactions in Graph Neural Networks
+
+        1.0
+                                                                                                            3.0
+        0.8                                                                                                 2.5
+  res                                                                   Model: Acc                      spd 2.0                                                  Model: Acc
+        0.6
+                                                                          GCN   0.857                       1.5                                                    GCN   0.857
+        0.4                                                               GT    0.681                                                                              GT    0.681
+                                                                                                            1.0
+        0.2                                                                                                 0.5
+              0   25   50   75    100 125 150 175 200                                                                  0   25   50   75    100 125 150 175 200
+                                 Epoch                                                                                                    Epoch
+
+                                  (a) ρ̂res
+                                        G for CORA .                                                                                      (b) ρ̂spd
+                                                                                                                                                G for CORA .
+
+
+Figure 12. Range experiments on CORA for a GCN and GT. ρ̂spd G of the GCN stays at 1 hop and outperforms the GT, as we would expect
+                                                                                   ∼
+from a known short-range task. We can see that in the initial epochs, the GT is able to learn to be more short-range after a high-range
+initialization; see Figure 13.
+
+                                                        2
+                                                 3.0
+                                                 2.5        13
+                                             spd 2.0                                                                            Model: Acc
+                                                        0 4                                                                       GCN   0.857
+                                                 1.5
+                                                                 9 14    19      25                                               GT    0.681
+                                                 1.0                               14              19             25
+                                                          34        9
+                                                 0.5   0 12
+
+                                                             1.8        1.6      1.4    1.2   1.0         0.8
+                                                                              Negative Loss
+
+
+Figure 13. Range against loss during training for the test split of CORA. Each point is labelled with its epoch. We cut off after 25 epochs
+because both models achieved their highest validation accuracy at epoch 25; after this, the GT overfits, as the spiking range from epoch 25
+to 50 in Figure 12 shows. We can see that, though the GT learns a high range in the very early epochs, it then learns a low range, around 1
+hop, before it overfits and its accuracy drops.
+
+
+Dwivedi et al. (2022); Tönshoff et al. (2023), as the encoding requires fewer parameters, but we found this to have minimal
+impact on model performance.
+We report the updated parameter counts in Table 4.
+
+D.3. Isolated nodes in PEPTIDES
+We discovered that the PEPTIDES dataset contains graphs which are disconnected and may have isolated nodes. To the best
+of our knowledge, this is not reported anywhere in the literature. Though these graphs make up only ∼1% of the dataset, we
+still consider it an issue. Firstly, the existence of disconnected nodes means the reported results of average graph diameter
+are technically erroneous; this value would be infinite. Secondly, many methods propose computing metrics on graphs which
+assume connectivity such as distance metrics of SPD and effective resistance. Moreover, graph Transformer architectures
+will induce an edge between components of the graph which could never interact in an MPNN, regardless of depth.
+To address this, when computing our range measures on these graphs with graph Transformer architectures, we initialize
+distance values to zero and fill the distances by computing them on the respective connected components.
+
+D.4. Jacobian sampling for range measure estimation
+As mentioned in the main text, we sub-sample the Jacobian matrix in order to provide computational speed-ups and avoid
+out-of-memory issues when computing range measures for real-world experiments. We achieve this by randomly sampling
+input/output nodes and input/output channels with given probabilities. The unselected node/channels are masked, producing
+a sparsified Jacobian which results in computational advantage in both time and memory while producing an accurate
+approximation of the range. This is evident in our experiments, where we report multiple seeds across which the resulting
+range estimates have extremely low variance. We list sampling parameters used in our experiments in Table 3.
+Sampling hyperparameters. In Section 3 we present the normalized range as an expectation over the influence distribution.
+When computing the node-level range for a graph, ρ̂G , this becomes an expectation over input/output nodes and input/output
+
+                                                                                              17
+                                    On Measuring Long-Range Interactions in Graph Neural Networks
+
+   0.6
+                                                                             1
+    0.4                                              Model: Acc                                                            Model: Acc
+  res                                                                     spd
+                                                      GT    0.515                                                           GT    0.515
+    0.3                                                                     0.6
+                                                      GCN   0.453                                                           GCN   0.453
+                                                      GCN+VN 0.453         0.4                                              GCN+VN 0.453
+   0.2
+                                                                           0.3
+            0   200   400   600        800    1000                                0   200   400   600        800    1000
+                        Epoch                                                                 Epoch
+
+                                  (a) ρ̂res
+                                        G                                                               (b) ρ̂spd
+                                                                                                              G
+
+Figure 14. Range measures for the AMAZON - RATINGS dataset. There is a clear performance gain from using an attention-based MPNN
+over convolution. GCN+VN induces slightly more long-range interactions but offers no performance gain, suggesting that AMAZON -
+RATINGS may not be long-range.
+
+
+   10                                                                      10
+                                                     Model: Acc                                                            Model: Acc
+  res                                                                     spd
+                                                      GT    0.841                                                           GT    0.841
+        1                                             GCN   0.453                                                           GCN   0.453
+                                                                             1
+                                                      GCN+VN 0.453                                                          GCN+VN 0.453
+
+
+            0   200   400   600        800    1000                                0   200   400   600        800    1000
+                        Epoch                                                                 Epoch
+
+                                  (a) ρ̂res
+                                        G                                                               (b) ρ̂spd
+                                                                                                              G
+
+Figure 15. Range measures for the ROMAN - EMPIRE dataset. There is a clear performance gain from using an attention-based MPNN over
+convolution. GCN+VN induces long-range interactions but offers no performance gain, suggesting that ROMAN - EMPIRE may not be
+long-range.
+
+
+channels. Using a sub-sampling of these allows us to approximate this expectation.
+If we assign the probabilities to be pnode-in , pnode-out , pchannel-in , pchannel-out , then we reduce the Jacobian size by a factor of
+pnode-in × pnode-out × pchannel-in × pchannel-out .
+                                                         n
+                                         1 Pn m ∈
+We construct a binary mask for each component     {0, 1} such that each entry is independently sampled from a Bernoulli
+distribution with probability p, i.e., E n i=1 mi = p.
+We apply the GNN model to the masked input to compute the full output, which is subsequently reduced using the output
+mask. This selective computation results in a reduced Jacobian and computational graph, offering protection against
+out-of-memory errors and yielding significant efficiency gains.
+Additionally, we found that graphs with n > ∼256 can exceed the memory constraints of an A10 NVIDIA GPU (24GB).
+Hence, we set an upper bound of max nodes = 256. We also set a lower bound of min nodes = 16, to ensure we don’t
+under-sample smaller graphs.
+
+D.5. Computational Resources
+Preprocessing, training and range calculations were done on in-house CPUs and GPUs. All experiments were feasible and
+primarily performed on NVIDIA A10s. Some experiments were performed on NVIDIA H100s.
+
+
+
+
+                                                                     18
+                                On Measuring Long-Range Interactions in Graph Neural Networks
+
+
+
+
+Table 3. Sampling probability hyperparameters used for range experiments. We use a probability of 1.0 for input nodes for all experiments
+as we found that it introduced bias to the range and did not reduce compute requirements.
+
+               Dataset                  Input Nodes        Output Nodes        Input Channels        Output Channels
+               VOCSUPERPIXELS                 1.0                0.5                  0.5                    0.5
+               PEPTIDES - FUNC                1.0                0.5                  0.5                    0.5
+               PEPTIDES - STRUCT              1.0                0.5                  0.5                    0.5
+               AMAZON - RATINGS               1.0               0.01                  1.0                    0.8
+               ROMAN - EMPIRE                 1.0               0.01                  1.0                    1.0
+               CORA                           1.0                0.2                  0.2                    1.0
+
+
+
+
+                                                                   19
+                               On Measuring Long-Range Interactions in Graph Neural Networks
+
+
+
+
+Table 4. Hyperparameters for LRGB experiments in Section 6.2.2. The #Param. row in a) and (b) lists the original parameter count from
+Tönshoff et al. (2023) in parentheses alongside our decreased parameter account due to efficient one-hot encodings (see Appendix D).
+
+                                       (a) Hyperparameters for PEPTIDES - FUNC experiments
+
+                               GCN             GINE          GatedGCN            GPS          GCN+VN             GT
+           lr                 0.001            0.001            0.001           0.001           0.001         0.001
+           dropout             0.1              0.1              0.1             0.1              0.1           0.1
+           #layers              6                8                10               6               6              6
+           hidden dim.         235              160               95              76              235            76
+           head depth           3                3                 3               2               3              2
+           PE/SE             RWSE             RWSE             RWSE            LapPE            RSWE          LapPE
+           batch size          200              200              200             200              200           200
+           #epochs             250              250              250             250              250           250
+           norm                 -                -                 -         BatchNorm             -        BatchNorm
+           MPNN                 -                -                 -         GatedGCN           GCN               -
+           #Param.         456k (486k)      472k (491k)      483k (493k)     470k (479k)         456k          464k
+
+                                      (b) Hyperparameters for PEPTIDES - STRUCT experiments
+
+                               GCN             GINE          GatedGCN            GPS          GCN+VN             GT
+           lr                 0.001            0.001            0.001           0.001           0.001         0.001
+           dropout             0.1              0.1              0.1             0.1              0.1           0.1
+           #layers              6                10               8                8               6             8
+           hidden dim.         235              145              100              64              235           64
+           head depth           3                 3               3                2               3             2
+           PE/SE             LapPE            LapPE            LapPE           LapPE            LapPE         LapPE
+           batch size          200              200              200             200              200           200
+           #epochs             250              250              250             250              250           250
+           norm                 -                 -               -          BatchNorm             -        BatchNorm
+           MPNN                 -                 -               -          GatedGCN           GCN              -
+           #Param.         457k (488k)      473k (492k)      433k (445k)     445k (452k)         457k          472k
+
+                                      (c) Hyperparameters for VOCSUPERPIXELS experiments
+
+                                   GCN       GINE      GatedGCN            GPS         GCN+VN             GT
+                  lr               0.001      0.001       0.001          0.001          0.001          0.001
+                  dropout            0.0       0.2         0.2             0.3            0.0            0.1
+                  #layers            10         10          10               8             10              8
+                  hidden dim.       200        145          95              68            200             84
+                  head depth          3          3           3               2              3              2
+                  PE/SE            RWSE       none        none           LapPE          RWSE           LapPE
+                  batch size         50         50          50              50             50             50
+                  #epochs            200       200         200             200            200            200
+                  norm                -          -           -         BatchNorm            -        BatchNorm
+                  MPNN                -          -           -         GatedGCN          GCN               -
+                  #Param.           490k      450k        473k            501k           490k           471k
+
+
+
+
+                                                                  20
+

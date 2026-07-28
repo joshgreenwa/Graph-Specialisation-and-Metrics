@@ -2,7 +2,7 @@
 
 The normative scientific specification is
 [`../README.md`](../README.md), protocol
-`donor-swap-specialisation-carriage-v3`. This package is its public implementation. Historical
+`donor-swap-specialisation-carriage-v4`. This package is its public implementation. Historical
 implementations remain provenance rather than public alternatives. The selected internal
 `carriage/` and `specialisation/` modules supply only checkpoint-compatible low-level GRIT
 machinery where explicitly imported.
@@ -215,14 +215,31 @@ least-squares line would show a different model from the one being reported. The
 the key it never had — the layer colourbar its point colours have always encoded, a marker for
 heads below the activity floor, and a note that the whiskers are 95% nested percentile intervals.
 
+`selectivity_vs_joint_sensitivity` now zooms to the observed `D_rel` support (including its
+intervals) and shades the preregistered selectivity-equivalence region. This prevents a narrow
+generalist cloud from being visually compressed against the mathematically possible `[-1, 1]`
+range. `selectivity_regime_diagnostics` then shows the ordered active-head intervals, bootstrap
+family Jaccard distributions, and interval-containment fractions. Family assignment is rerun in
+all 2,000 coordinate-bootstrap draws; only inclusion probabilities and stability summaries are
+cached, not the full transient draw tensor.
+
+`causal_regime_summary` is the headline regime figure. Its first panel confirms that `J` predicts
+clean and causal importance, its second is a forest plot of gross, necessity, rescue, and induction
+family-by-channel interactions against the causal-equivalence region, and its third tests whether
+the high-`J` central family responds to and rescues both channels after frozen reference scaling.
+The machine-readable `regime_evidence` record makes the ternary call
+(`confirmed_causal_specialisation`, `confirmed_entangled_generalist`, or `mixed_or_unresolved`)
+from the preregistered rule rather than from figure inspection.
+
 `causal_family_endpoints` and `causal_matched_control_endpoints` run their targets down a shared
 vertical axis, one legible copy of the names rather than five rotated illegible ones, with panel
 height following the target count. The matched-control figure shows the full-size frozen controls
 only; the `control_prefix_*` ladder it used to enumerate — one bar category per (control, prefix
 size) pair, around a hundred of them on a ten-layer model — is now drawn where a ladder belongs, as
-a dotted reference line beneath its family's curve in `causal_cumulative_prefix_curves`. That is
-also the comparison the design is for: whether a family separates from its size-matched control as
-heads accumulate.
+a dotted reference line beneath its family's curve in `causal_cumulative_prefix_curves`. The
+prefix figure now uses reference-scaled total and channel-contrast coordinates. Its total panels
+show whether causal importance accumulates; its contrast panels show whether channel selectivity
+accumulates and carry the causal-equivalence band.
 
 Score distance heatmaps are head-resolved. `{channel}_score_distance_heatmaps` draws one row per
 head, blocked by layer with layer 0 in the top block; the companion figure named with the extra
@@ -243,6 +260,11 @@ sign convention. An existing analysis cache is immutable across contracts: a cha
 commit or any other contract mismatch raises before inference instead of being treated as a cache
 miss, and the save path independently refuses replacement. Use a new output directory or analysis
 name for the new contract; the original cache remains untouched.
+
+The v4 regime analysis changes the frozen central-family rule and records mismatch-adjusted
+directional alignment fields, so a v3 causal cache cannot be relabelled as v4. Start v4 in a new
+analysis output directory. Training checkpoints and dataset caches are still reused; once v4
+scores and causal events exist, later figure revisions remain figures-only reruns.
 
 The score cache also retains clean attention distance mass and frozen-family exact/support-
 normalized score profiles as descriptive diagnostics. These never replace the transport score.

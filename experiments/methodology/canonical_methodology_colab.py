@@ -1,7 +1,8 @@
 """Paste/run this lightweight cell in Colab to execute the final methodology.
 
 Edit only TASKS, TRAIN_SEEDS/TASK_TRAIN_SEEDS, PHASES, CHECKPOINTS, TASK_OVERRIDES,
-SIZES, and EXECUTION. Scientific definitions live in ``src/graph_specialisation_metrics/README.md``
+SIZES, FAMILIES, and EXECUTION. Scientific definitions live in
+``src/graph_specialisation_metrics/README.md``
 and the canonical package; this front end merely checks out the chosen repository revision,
 mounts Drive, and dispatches registered tasks.
 """
@@ -40,6 +41,21 @@ SIZES = {
     "sources_per_graph": 6,
     "donors_per_source": 8,
     "bootstrap_replicates": 2_000,  # fixed by the normative protocol
+}
+# Preregister these margins before looking at causal outcomes.  D_rel and the reference-scaled
+# family-by-channel causal interaction live on different scales, so they have separate regions.
+# Equivalence requires the complete nested-bootstrap interval to fit inside the region.
+FAMILIES = {
+    "activity_floor": 0.20,
+    "tail_fraction": 0.20,
+    "central_fraction": 0.20,
+    "central_pool_fraction": 0.50,
+    "equivalence_half_width": 0.10,
+    "causal_equivalence_half_width": 0.20,
+    "membership_stability_floor": 0.60,
+    "generalist_fraction_floor": 0.50,
+    "importance_correlation_floor": 0.10,
+    "causal_response_floor": 0.10,
 }
 EXECUTION = {
     # Runtime-only: increase on large GPUs; CUDA OOM automatically retries smaller groups.
@@ -92,6 +108,7 @@ run(
     checkpoints=CHECKPOINTS,
     task_overrides=TASK_OVERRIDES,
     sizes=SIZES,
+    families=FAMILIES,
     execution=EXECUTION,
     mount=False,
 )
