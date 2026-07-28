@@ -5,7 +5,9 @@ from types import SimpleNamespace
 import matplotlib
 
 matplotlib.use("Agg")
+from matplotlib.collections import PathCollection, PolyCollection
 from matplotlib.container import ErrorbarContainer
+from matplotlib.patches import FancyArrowPatch
 import matplotlib.pyplot as plt
 import numpy as np
 import pytest
@@ -20,12 +22,18 @@ from graph_specialisation_metrics.methodology.graphormer_figure_data import (
     CanonicalHeadMetrics,
     GraphormerDiagnosticExtractor,
     SupplementalCache,
+    select_ranked_heads,
     select_specialist_heads,
 )
 from graph_specialisation_metrics.methodology.graphormer_figure_plots import (
+    plot_attention_grid,
     plot_coordinate_heatmaps,
+    plot_hop_attention_mass,
+    plot_logit_spread,
+    plot_score_heatmaps,
     plot_score_plane,
     plot_selectivity_joint_plane,
+    plot_selectivity_vs_logit_ratio,
 )
 from graph_specialisation_metrics.methodology.tasks import get_task
 
@@ -85,6 +93,16 @@ def test_canonical_adapter_and_active_drel_selection():
     assert metrics.distance_axis[-1] == "graph_token"
 
 
+def test_ranked_head_selection_is_independent_and_deterministic():
+    ranked = select_ranked_heads(synthetic_metrics())
+    assert ranked == {
+        "top_semantic_1": (1, 2),
+        "top_semantic_2": (0, 2),
+        "top_joint_1": (1, 2),
+        "top_joint_2": (0, 0),
+    }
+
+
 def test_supplemental_cache_is_immutable_and_contract_keyed(tmp_path):
     calls = []
     cache = SupplementalCache(tmp_path)
@@ -125,6 +143,15 @@ def test_requested_scatter_figures_have_no_errorbar_artists():
                 if isinstance(container, ErrorbarContainer)
             ]
             assert containers == []
+            highlight_rings = [
+                collection
+                for axis in figure.axes
+                for collection in axis.collections
+                if isinstance(collection, PathCollection)
+                and np.any(np.isclose(collection.get_sizes(), 110))
+            ]
+            assert len(highlight_rings) == 2
+            assert all(len(ring.get_facecolors()) == 0 for ring in highlight_rings)
     finally:
         for figure in figures:
             plt.close(figure)
@@ -138,6 +165,115 @@ def test_coordinate_heatmaps_mask_inactive_selectivity():
         assert len(image_axes) == 2
         rendered = image_axes[0].images[0].get_array()
         assert bool(np.ma.getmaskarray(rendered)[1, 1])
+        assert image_axes[0].images[0].get_cmap().name == "coolwarm"
+        assert image_axes[1].images[0].get_cmap().name == "viridis"
+    finally:
+        plt.close(figure)
+
+
+def test_score_heatmaps_and_scatter_restore_viridis():
+    metrics = synthetic_metrics()
+    heatmaps = plot_score_heatmaps(metrics)
+    scatter = plot_score_plane(metrics)
+    try:
+        assert all(
+            axis.images[0].get_cmap().name == "viridis"
+            for axis in heatmaps.axes
+            if axis.images
+        )
+        layer_collection = next(
+            collection
+            for collection in scatter.axes[0].collections
+            if collection.get_array() is not None
+        )
+        assert layer_collection.get_cmap().name == "viridis"
+    finally:
+        plt.close(heatmaps)
+        plt.close(scatter)
+
+
+def test_hop_plot_separates_graph_token_tick():
+    figure = plot_hop_attention_mass(synthetic_metrics(), (0, 0))
+    try:
+        axis = figure.axes[0]
+        ticks = axis.get_xticks()
+        labels = [label.get_text() for label in axis.get_xticklabels()]
+        assert labels[-1] == "Graph\ntoken"
+        assert ticks[-1] - ticks[-2] > 1.2
+    finally:
+        plt.close(figure)
+
+
+def test_logit_plot_has_uncertainty_bands_and_ratio_is_inverted():
+    metrics = synthetic_metrics()
+    payload = {
+        "dot_std_mean": np.asarray([0.7, 0.9]),
+        "dot_std_std": np.asarray([0.1, 0.12]),
+        "bias_std_mean": np.asarray([1.1, 1.0]),
+        "bias_std_std": np.asarray([0.2, 0.15]),
+        "log_r_mean": np.asarray(
+            [[-0.4, -0.2, 0.0], [0.1, 0.3, 0.5]]
+        ),
+        "n_used": 100,
+    }
+    spread = plot_logit_spread(payload)
+    ratio = plot_selectivity_vs_logit_ratio(metrics, payload)
+    try:
+        bands = [
+            collection
+            for collection in spread.axes[0].collections
+            if isinstance(collection, PolyCollection)
+        ]
+        assert len(bands) == 2
+        layer_collection = next(
+            collection
+            for collection in ratio.axes[0].collections
+            if collection.get_array() is not None
+        )
+        actual_x = np.sort(np.asarray(layer_collection.get_offsets())[:, 0])
+        expected_x = np.sort(-payload["log_r_mean"][metrics.active])
+        assert np.allclose(actual_x, expected_x)
+        assert r"\mathrm{std}(d)/\mathrm{std}(b)" in ratio.axes[0].get_xlabel()
+    finally:
+        plt.close(spread)
+        plt.close(ratio)
+
+
+def test_attention_grid_uses_rdkit_overlays_without_arrows():
+    pytest.importorskip("rdkit")
+    attention = np.asarray(
+        [
+            [0.25, 0.25, 0.25, 0.25],
+            [0.05, 0.60, 0.25, 0.10],
+            [0.05, 0.20, 0.55, 0.20],
+            [0.05, 0.15, 0.25, 0.55],
+        ]
+    )
+    payload = {
+        "examples": [
+            {
+                "dataset_index": index,
+                "smiles": "CCO",
+                "attention": {"semantic": attention},
+            }
+            for index in (0, 5, 80)
+        ]
+    }
+    figure = plot_attention_grid(
+        payload,
+        role="semantic",
+        head=(1, 24),
+        title_label="Semantic specialist",
+    )
+    try:
+        assert not any(
+            isinstance(patch, FancyArrowPatch)
+            for axis in figure.axes
+            for patch in axis.patches
+        )
+        assert figure.axes[1].images
+        assert figure.axes[2].images[0].get_cmap().name == "Blues"
+        assert figure.axes[1].get_title() == "Attention-weighted molecule"
     finally:
         plt.close(figure)
 

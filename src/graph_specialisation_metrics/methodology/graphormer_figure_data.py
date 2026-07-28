@@ -21,6 +21,7 @@ from .cache import ReadOnlyCacheArtifact
 from .graphormer import (
     GraphormerBackend,
     GraphormerGraph,
+    PCQMGraphormerDataset,
     build_graphormer_runtime,
 )
 from .protocol import stable_hash
@@ -196,6 +197,53 @@ def select_specialist_heads(
         order = np.lexsort((-joint, selectivity))
         structural_head = (int(layers[order[0]]), int(heads[order[0]]))
     return {"semantic": semantic_head, "structural": structural_head}
+
+
+def select_ranked_heads(
+    metrics: CanonicalHeadMetrics,
+    *,
+    semantic_count: int = 2,
+    joint_count: int = 2,
+    active_only: bool = True,
+) -> dict[str, Head]:
+    """Rank heads independently by decreasing ``D_rel`` and decreasing ``J``.
+
+    A head may appear in both rankings. Exact ``D_rel`` ties prefer larger
+    ``J``; exact ``J`` ties prefer larger ``D_rel``.
+    """
+
+    semantic_count = int(semantic_count)
+    joint_count = int(joint_count)
+    if semantic_count < 0 or joint_count < 0:
+        raise ValueError("rank counts must be non-negative")
+    finite = np.isfinite(metrics.selectivity) & np.isfinite(
+        metrics.joint_sensitivity
+    )
+    eligible = finite & metrics.active if active_only else finite
+    layers, heads = np.where(eligible)
+    required = max(semantic_count, joint_count)
+    if len(layers) < required:
+        raise ValueError(
+            f"only {len(layers)} eligible heads are available for a top-{required} ranking"
+        )
+
+    selectivity = metrics.selectivity[layers, heads]
+    joint = metrics.joint_sensitivity[layers, heads]
+    semantic_order = np.lexsort((-joint, -selectivity))
+    joint_order = np.lexsort((-selectivity, -joint))
+
+    ranked: dict[str, Head] = {}
+    for rank, position in enumerate(semantic_order[:semantic_count], start=1):
+        ranked[f"top_semantic_{rank}"] = (
+            int(layers[position]),
+            int(heads[position]),
+        )
+    for rank, position in enumerate(joint_order[:joint_count], start=1):
+        ranked[f"top_joint_{rank}"] = (
+            int(layers[position]),
+            int(heads[position]),
+        )
+    return ranked
 
 
 class SupplementalCache:
@@ -443,16 +491,30 @@ def dataset_index(runtime: Any, position: int) -> int:
     return int(indices[position]) if indices is not None else int(position)
 
 
+def graph_at_dataset_index(runtime: Any, index: int) -> GraphormerGraph:
+    """Build one graph by its global PCQM4Mv2 dataset index."""
+
+    eval_dataset = runtime.eval_ds
+    source_dataset = getattr(eval_dataset, "dataset", None)
+    config = getattr(eval_dataset, "config", None)
+    if source_dataset is None or config is None:
+        raise TypeError(
+            "global PCQM graph indices require a PCQMGraphormerDataset-backed runtime"
+        )
+    direct_view = PCQMGraphormerDataset(source_dataset, (int(index),), config)
+    return direct_view[0]
+
+
 def collect_attention_examples(
     figure_runtime: GraphormerFigureRuntime,
     *,
-    example_positions: Sequence[int],
+    graph_indices: Sequence[int],
     heads: Mapping[str, Head],
 ) -> dict[str, Any]:
     extractor = GraphormerDiagnosticExtractor(figure_runtime.backend)
     examples = []
-    for position in example_positions:
-        graph = figure_runtime.runtime.eval_ds[int(position)]
+    for graph_index in graph_indices:
+        graph = graph_at_dataset_index(figure_runtime.runtime, int(graph_index))
         captured = extractor.extract(graph)
         selected = {
             role: captured.attention[layer][head].float().cpu().numpy()
@@ -460,8 +522,7 @@ def collect_attention_examples(
         }
         examples.append(
             {
-                "dataset_position": int(position),
-                "dataset_index": dataset_index(figure_runtime.runtime, int(position)),
+                "dataset_index": int(graph_index),
                 "smiles": str(graph.smiles),
                 "n_atoms": int(graph.num_nodes),
                 "attention": selected,
@@ -734,6 +795,8 @@ __all__ = [
     "build_verified_figure_runtime",
     "collect_attention_examples",
     "compute_av_pca_inputs",
+    "graph_at_dataset_index",
     "label_attention_focus",
+    "select_ranked_heads",
     "select_specialist_heads",
 ]

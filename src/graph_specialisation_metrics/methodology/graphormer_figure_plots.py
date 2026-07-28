@@ -9,8 +9,8 @@ import io
 import json
 
 import matplotlib.pyplot as plt
-from matplotlib.colors import LinearSegmentedColormap, Normalize, TwoSlopeNorm
-from matplotlib.patches import FancyArrowPatch, Rectangle
+from matplotlib.colors import Normalize, TwoSlopeNorm
+from matplotlib.patches import Rectangle
 import numpy as np
 
 from .graphormer_figure_data import CanonicalHeadMetrics, Head
@@ -24,14 +24,8 @@ ORANGE = "#D97706"
 SLATE = "#607080"
 LIGHT_GRID = "#DCE3E8"
 
-ATTENTION_CMAP = LinearSegmentedColormap.from_list(
-    "clear_attention",
-    ["#F7FAFC", "#DCEFF0", "#8EC9C9", "#27969A", "#087078", NAVY],
-)
-SELECTIVITY_CMAP = LinearSegmentedColormap.from_list(
-    "structural_to_semantic",
-    [BLUE, "#93BDD4", "#F7F7F5", "#F3C96B", ORANGE],
-)
+ATTENTION_CMAP = plt.get_cmap("Blues")
+SELECTIVITY_CMAP = plt.get_cmap("coolwarm")
 HEAD_STYLES = {
     "semantic": {"color": GOLD, "label": "Semantic specialist"},
     "structural": {"color": TEAL, "label": "Structural specialist"},
@@ -145,7 +139,7 @@ def plot_score_heatmaps(
         axes[0],
         metrics.normalized_semantic,
         title=r"Semantic score $S_{\rm sem}/\overline{S}_{\rm sem}$",
-        cmap="cividis",
+        cmap="viridis",
         norm=norm,
         selected_heads=selected_heads,
     )
@@ -153,7 +147,7 @@ def plot_score_heatmaps(
         axes[1],
         metrics.normalized_structural,
         title=r"Structural score $S_{\rm str}/\overline{S}_{\rm str}$",
-        cmap="cividis",
+        cmap="viridis",
         norm=norm,
         selected_heads=selected_heads,
     )
@@ -197,7 +191,7 @@ def plot_coordinate_heatmaps(
         axes[1],
         metrics.joint_sensitivity,
         title=r"Joint sensitivity $J$",
-        cmap="YlGnBu",
+        cmap="viridis",
         norm=Normalize(vmin=0.0, vmax=j_max),
         selected_heads=selected_heads,
     )
@@ -239,7 +233,7 @@ def _scatter_heads(
         x.reshape(-1)[finite],
         y.reshape(-1)[finite],
         c=layer_ids[finite],
-        cmap="cividis",
+        cmap="viridis",
         norm=Normalize(0, max(layers - 1, 1)),
         s=42,
         edgecolor="white",
@@ -274,10 +268,10 @@ def _annotate_selected_scatter(
         ax.scatter(
             [point_x],
             [point_y],
-            s=120,
-            facecolor="white",
-            edgecolor=style["color"],
-            linewidth=2.0,
+            s=110,
+            facecolors="none",
+            edgecolors=style["color"],
+            linewidths=2.1,
             zorder=5,
         )
         ax.annotate(
@@ -442,93 +436,52 @@ def _draw_molecule_plain(
     return Image.open(io.BytesIO(drawer.GetDrawingText()))
 
 
-def _attention_edges(
-    matrix: np.ndarray, *, top_k: int = 2
-) -> list[tuple[int, int, float]]:
-    edges: list[tuple[int, int, float]] = []
-    nodes = matrix.shape[0]
-    for query in range(nodes):
-        row = matrix[query].copy()
-        row[query] = -np.inf
-        count = min(int(top_k), max(nodes - 1, 0))
-        if count == 0:
-            continue
-        indices = np.argpartition(-row, count - 1)[:count]
-        indices = indices[np.argsort(-row[indices])]
-        for key in indices:
-            if np.isfinite(row[key]) and row[key] > 0:
-                edges.append((query, int(key), float(row[key])))
-    return edges
-
-
-def _draw_attention_graph(
-    ax,
+def _draw_molecule_attention(
     smiles: str,
-    matrix: np.ndarray,
     *,
-    top_k: int = 2,
-) -> None:
-    _, positions, symbols, bonds = _molecule_geometry(smiles)
-    if len(positions) != matrix.shape[0]:
+    inbound: np.ndarray,
+    vmax: float,
+    figsize: tuple[float, float] = (4.2, 3.7),
+    dpi: int = 180,
+):
+    """RDKit molecule with atom-centered attention inflow highlights."""
+
+    from PIL import Image
+    from rdkit.Chem.Draw import rdMolDraw2D
+
+    molecule, _, _, _ = _molecule_geometry(smiles)
+    inbound = np.asarray(inbound, dtype=np.float64)
+    if molecule.GetNumAtoms() != len(inbound):
         raise ValueError(
-            f"RDKit has {len(positions)} atoms but attention has {matrix.shape[0]}"
+            f"RDKit has {molecule.GetNumAtoms()} atoms but attention has {len(inbound)}"
         )
-    for left, right in bonds:
-        ax.plot(
-            [positions[left][0], positions[right][0]],
-            [positions[left][1], positions[right][1]],
-            color="#AAB5BD",
-            linewidth=2.0,
-            zorder=1,
-        )
+    norm = Normalize(vmin=0.0, vmax=max(float(vmax), 1e-12), clip=True)
+    highlight_atoms = list(range(molecule.GetNumAtoms()))
+    highlight_colors = {}
+    highlight_radii = {}
+    for atom, value in enumerate(inbound):
+        scaled = float(norm(value))
+        rgba = ATTENTION_CMAP(0.18 + 0.72 * scaled)
+        highlight_colors[atom] = tuple(float(channel) for channel in rgba[:3])
+        highlight_radii[atom] = 0.20 + 0.30 * np.sqrt(scaled)
 
-    edges = _attention_edges(matrix, top_k=top_k)
-    maximum = max((weight for _, _, weight in edges), default=1.0)
-    for query, key, weight in sorted(edges, key=lambda item: item[2]):
-        scaled = weight / max(maximum, 1e-12)
-        ax.add_patch(
-            FancyArrowPatch(
-                positions[query],
-                positions[key],
-                arrowstyle="-|>",
-                mutation_scale=9 + 6 * scaled,
-                linewidth=0.7 + 3.4 * scaled,
-                color=TEAL,
-                alpha=0.22 + 0.68 * scaled,
-                connectionstyle="arc3,rad=0.10",
-                shrinkA=12,
-                shrinkB=12,
-                zorder=2,
-            )
-        )
-
-    inbound = matrix.sum(axis=0)
-    inbound /= np.clip(inbound.sum(), 1e-12, None)
-    node_norm = Normalize(vmin=0.0, vmax=max(float(inbound.max()), 1e-12))
-    for atom, (x, y) in positions.items():
-        ax.scatter(
-            [x],
-            [y],
-            s=470,
-            color=ATTENTION_CMAP(node_norm(inbound[atom])),
-            edgecolor=NAVY,
-            linewidth=1.0,
-            zorder=3,
-        )
-        text_color = "white" if node_norm(inbound[atom]) > 0.56 else NAVY
-        ax.text(
-            x,
-            y,
-            f"{symbols[atom]}{atom}",
-            ha="center",
-            va="center",
-            color=text_color,
-            fontsize=8.5,
-            fontweight="bold",
-            zorder=4,
-        )
-    ax.set_aspect("equal")
-    ax.axis("off")
+    width, height = int(figsize[0] * dpi), int(figsize[1] * dpi)
+    drawer = rdMolDraw2D.MolDraw2DCairo(width, height)
+    options = drawer.drawOptions()
+    options.addAtomIndices = False
+    options.fillHighlights = True
+    options.atomHighlightsAreCircles = True
+    for index in highlight_atoms:
+        options.atomLabels[index] = str(index)
+    drawer.DrawMolecule(
+        molecule,
+        legend="",
+        highlightAtoms=highlight_atoms,
+        highlightAtomColors=highlight_colors,
+        highlightAtomRadii=highlight_radii,
+    )
+    drawer.FinishDrawing()
+    return Image.open(io.BytesIO(drawer.GetDrawingText()))
 
 
 def plot_attention_grid(
@@ -536,9 +489,9 @@ def plot_attention_grid(
     *,
     role: str,
     head: Head,
-    top_k: int = 2,
+    title_label: str | None = None,
 ):
-    """Three molecules by RDKit / weighted graph / attention matrix."""
+    """Three molecules by RDKit / attention overlay / attention matrix."""
 
     apply_publication_style()
     examples = list(examples_payload["examples"])
@@ -552,6 +505,10 @@ def plot_attention_grid(
     ]
     matrix_max = max(
         max(float(np.nanpercentile(matrix, 99)), 1e-6) for matrix in matrices
+    )
+    inbound = [matrix.mean(axis=0) for matrix in matrices]
+    inbound_max = max(
+        max(float(np.nanpercentile(values, 99)), 1e-6) for values in inbound
     )
     fig, axes = plt.subplots(
         3,
@@ -574,9 +531,14 @@ def plot_attention_grid(
             color=NAVY,
             bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.85},
         )
-        _draw_attention_graph(
-            axes[row, 1], example["smiles"], matrix, top_k=top_k
+        axes[row, 1].imshow(
+            _draw_molecule_attention(
+                example["smiles"],
+                inbound=inbound[row],
+                vmax=inbound_max,
+            )
         )
+        axes[row, 1].axis("off")
         image = axes[row, 2].imshow(
             matrix,
             cmap=ATTENTION_CMAP,
@@ -593,12 +555,12 @@ def plot_attention_grid(
         axes[row, 2].tick_params(labelsize=6, length=2)
 
     for column, label in enumerate(
-        ["Molecule", "Attention-weighted graph", "Node-conditioned attention"]
+        ["Molecule", "Attention-weighted molecule", "Node-conditioned attention"]
     ):
         axes[0, column].set_title(label, fontsize=12, pad=8)
     style = HEAD_STYLES.get(role, {"label": role.title()})
     fig.suptitle(
-        f"{style['label']} — {_head_label(head)}",
+        f"{title_label or style['label']} — {_head_label(head)}",
         fontsize=18,
         color=NAVY,
         y=1.02,
@@ -712,10 +674,11 @@ def plot_hop_attention_mass(
     layer, index = head
     values = np.asarray(metrics.clean_attention_distance[layer, index])
     labels = list(metrics.distance_axis)
-    x = np.arange(len(values))
     graph_token = np.asarray(
         [label.lower().replace(" ", "_") == "graph_token" for label in labels]
     )
+    x = np.arange(len(values), dtype=np.float64)
+    x[graph_token] += 0.8
     colors = [GOLD if special else TEAL for special in graph_token]
     fig, ax = plt.subplots(figsize=(8.4, 4.8), constrained_layout=True)
     bars = ax.bar(
@@ -729,7 +692,7 @@ def plot_hop_attention_mass(
     ax.set_xticks(x)
     ax.set_xticklabels(
         [
-            "Graph token" if special else str(label)
+            "Graph\ntoken" if special else str(label)
             for label, special in zip(labels, graph_token)
         ]
     )
@@ -761,13 +724,23 @@ def plot_logit_spread(
     *,
     title: str = "Dot-product and structural-bias logit spread",
 ):
-    """Layerwise means over graphs, intentionally without error bars."""
+    """Layerwise means with across-graph standard-deviation bands."""
 
     apply_publication_style()
     dot = np.asarray(logit_payload["dot_std_mean"])
+    dot_error = np.asarray(logit_payload["dot_std_std"])
     bias = np.asarray(logit_payload["bias_std_mean"])
+    bias_error = np.asarray(logit_payload["bias_std_std"])
     layers = np.arange(len(dot))
     fig, ax = plt.subplots(figsize=(8.2, 4.9), constrained_layout=True)
+    ax.fill_between(
+        layers,
+        np.clip(dot - dot_error, 0.0, None),
+        dot + dot_error,
+        color=BLUE,
+        alpha=0.18,
+        linewidth=0,
+    )
     ax.plot(
         layers,
         dot,
@@ -775,7 +748,15 @@ def plot_logit_spread(
         marker="o",
         linewidth=2.0,
         markersize=5,
-        label=r"Dot product $\mathrm{std}(d)$",
+        label=r"Dot product $\mathrm{std}(d)$: mean $\pm 1$ SD",
+    )
+    ax.fill_between(
+        layers,
+        np.clip(bias - bias_error, 0.0, None),
+        bias + bias_error,
+        color=ORANGE,
+        alpha=0.16,
+        linewidth=0,
     )
     ax.plot(
         layers,
@@ -784,7 +765,7 @@ def plot_logit_spread(
         marker="s",
         linewidth=2.0,
         markersize=5,
-        label=r"Structural bias $\mathrm{std}(b)$",
+        label=r"Structural bias $\mathrm{std}(b)$: mean $\pm 1$ SD",
     )
     ax.set_xticks(layers)
     ax.set_xlabel("Layer index")
@@ -828,10 +809,10 @@ def plot_selectivity_vs_logit_ratio(
     *,
     active_only: bool = True,
 ):
-    """Canonical ``D_rel`` versus ``log10(std(b)/std(d))``."""
+    """Canonical ``D_rel`` versus ``log10(std(d)/std(b))``."""
 
     apply_publication_style()
-    ratio = np.asarray(logit_payload["log_r_mean"], dtype=np.float64)
+    ratio = -np.asarray(logit_payload["log_r_mean"], dtype=np.float64)
     if ratio.shape != metrics.shape:
         raise ValueError(f"logit ratio shape {ratio.shape} != canonical {metrics.shape}")
     selectivity = metrics.selectivity
@@ -857,7 +838,7 @@ def plot_selectivity_vs_logit_ratio(
     )
     ax.axhline(0, color=SLATE, linestyle="--", linewidth=1.0)
     ax.axvline(0, color=SLATE, linestyle="--", linewidth=1.0)
-    ax.set_xlabel(r"$\log_{10}\!\left[\mathrm{std}(b)/\mathrm{std}(d)\right]$")
+    ax.set_xlabel(r"$\log_{10}\!\left[\mathrm{std}(d)/\mathrm{std}(b)\right]$")
     ax.set_ylabel(r"Canonical relative selectivity $D_{\rm rel}$")
     ax.set_title(
         "Relative selectivity versus logit-source balance\n"
