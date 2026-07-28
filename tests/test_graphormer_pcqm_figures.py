@@ -36,6 +36,7 @@ from graph_specialisation_metrics.methodology.graphormer_figure_data import (
     select_specialist_heads,
 )
 from graph_specialisation_metrics.methodology.graphormer_figure_plots import (
+    PCA_FOCUS_COLORS,
     plot_attention_grid,
     plot_av_pca,
     plot_coordinate_heatmaps,
@@ -548,7 +549,9 @@ def test_av_pca_focus_palette_is_stable_across_plots():
     rng = np.random.default_rng(23)
     labels_a = (
         ["Ring: aromatic"] * 5
+        + ["Ring: aliphatic"] * 2
         + ["O: carbonyl"] * 4
+        + ["O: hydroxyl"] * 2
         + ["N: amide"] * 3
         + ["other/diffuse"] * 2
     )
@@ -586,10 +589,32 @@ def test_av_pca_focus_palette_is_stable_across_plots():
         second_colors = plotted_colors(second)
         for label in ("O: carbonyl", "N: amide", "other/diffuse"):
             assert np.allclose(first_colors[label], second_colors[label])
-        assert np.allclose(
+        assert not np.allclose(
             first_colors["Ring: aromatic"],
             second_colors["Ring: junction"],
         )
+        assert not np.allclose(
+            first_colors["Ring: aromatic"],
+            first_colors["Ring: aliphatic"],
+        )
+        assert not np.allclose(
+            first_colors["O: carbonyl"],
+            first_colors["O: hydroxyl"],
+        )
+        for label in (
+            "Ring: aromatic",
+            "Ring: aliphatic",
+            "Ring: junction",
+            "O: carbonyl",
+            "O: hydroxyl",
+        ):
+            expected = PCA_FOCUS_COLORS[label]
+            actual = (
+                first_colors[label]
+                if label in first_colors
+                else second_colors[label]
+            )
+            assert np.allclose(actual, to_rgba(expected, alpha=0.78))
         assert np.allclose(
             first_colors["other/diffuse"],
             to_rgba("#B8C2CA", alpha=0.78),

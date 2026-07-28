@@ -31,18 +31,28 @@ HEAD_STYLES = {
     "structural": {"color": TEAL, "label": "Structural specialist"},
 }
 
-# Stable chemistry-focus identities for every pooled A@V PCA. These reuse the
-# established publication palette while reserving neutral greys for uninformative
-# diffuse/rare assignments and saturated colours for chemically specific focus.
+# Stable exact chemistry-focus identities for every pooled A@V PCA. Related
+# chemistry uses related shades, while every distinct focus retains its own colour.
+# Neutral greys are reserved for uninformative diffuse/rare assignments.
 PCA_FOCUS_COLORS = {
-    "Ring": NAVY,
-    "O": ORANGE,
-    "N": "#009E73",
-    "S": "#CCB000",
-    "P": "#8B6F47",
-    "X": "#56B4E9",
-    "Branch": "#6B8E23",
-    "Charge": GOLD,
+    "Ring: junction": "#17324D",
+    "Ring: aromatic": "#2878B5",
+    "Ring: aliphatic": "#56A9D8",
+    "O: carbonyl": "#C45100",
+    "O: ester/carboxyl": "#E17C05",
+    "O: hydroxyl": "#F2B134",
+    "O: other": "#A65D26",
+    "N: aromatic": "#006D5B",
+    "N: nitrile": "#008E72",
+    "N: nitro": "#2AA876",
+    "N: amide": "#57B894",
+    "N: other": "#7EC8AE",
+    "X: halogen": "#7B61A8",
+    "S: sulfur": "#CCB000",
+    "P: phosphorus": "#8B6F47",
+    "Branch: degree>=3": "#6B8E23",
+    "Charge: +": "#C44E52",
+    "Charge: -": "#9C4F96",
     "other/diffuse": "#B8C2CA",
     "Other / rare": "#4B5563",
 }
@@ -662,18 +672,14 @@ def _group_pca_labels(
 def _pca_focus_color(label: str) -> str:
     """Return the invariant publication colour for a chemistry-focus label."""
 
-    label = str(label)
-    if label in {"other/diffuse", "Other / rare"}:
-        return PCA_FOCUS_COLORS[label]
-    group = label.split(":", 1)[0]
-    return PCA_FOCUS_COLORS.get(group, SLATE)
+    return PCA_FOCUS_COLORS.get(str(label), SLATE)
 
 
 def plot_av_pca(
     payload: Mapping[str, Any],
     *,
-    maximum_categories: int = 9,
-    minimum_count: int = 5,
+    maximum_categories: int = 20,
+    minimum_count: int = 1,
     title_label: str | None = None,
     d_rel: float | None = None,
     joint_sensitivity: float | None = None,
@@ -687,8 +693,17 @@ def plot_av_pca(
     )
     counts = Counter(labels)
     categories = [
-        label for label, _ in counts.most_common() if label != "Other / rare"
+        label
+        for label in PCA_FOCUS_COLORS
+        if label in counts and label != "Other / rare"
     ]
+    categories.extend(
+        sorted(
+            label
+            for label in counts
+            if label not in PCA_FOCUS_COLORS and label != "Other / rare"
+        )
+    )
     if "Other / rare" in counts:
         categories.append("Other / rare")
     fig, ax = plt.subplots(figsize=(8.8, 6.2), constrained_layout=True)
