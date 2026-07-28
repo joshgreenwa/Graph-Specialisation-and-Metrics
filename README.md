@@ -13,6 +13,8 @@ The public implementation is
 [`src/graph_specialisation_metrics/methodology/`](src/graph_specialisation_metrics/methodology/README.md),
 exposed through `graph_specialisation_metrics.main()`. The Drive-backed production launcher is
 [`experiments/methodology/canonical_methodology_colab.py`](experiments/methodology/canonical_methodology_colab.py).
+The read-only, PCQM4Mv2-specific reporting notebook is
+[`experiments/methodology/graphormer_pcqm4mv2_figures_colab.ipynb`](experiments/methodology/graphormer_pcqm4mv2_figures_colab.ipynb).
 Module-level READMEs document implementations and historical refinement experiments; where their
 older alternatives differ, the canonical methodology takes precedence.
 

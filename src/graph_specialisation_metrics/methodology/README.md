@@ -80,6 +80,8 @@ The paste-ready clone/mount/dispatch cell is
 | `interventions.py` | One-row semantic replacement and dense-equivalent sparse structural footprint copy. |
 | `backend.py` | Native GRIT `wV`/final-state adapter. |
 | `graphormer.py` | Official checkpoint/dataset loading, native Graphormer transport hooks, graph-token readout adapter. |
+| `graphormer_figure_data.py` | Read-only canonical score adapter and separately contract-cached Graphormer attention, `A@V`, and logit diagnostics. |
+| `graphormer_figure_plots.py` | PCQM-specific publication figures; presentation only, with no canonical score recomputation. |
 | `graphbench.py` | Exact GraphBench runner/checkpoint adapter, edge-semantic donor law, official-GRIT hooks, and nonlinear readout replay. |
 | `scores.py` / `distance.py` | Raw event score, hierarchy, coordinates, and exact SPD accounting. |
 | `carriage.py` | `F_sens` and positive-is-beneficial donor-wise integrated `B`. |

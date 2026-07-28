@@ -23,3 +23,10 @@ with its scalar head. Use `TASK_TRAIN_SEEDS = {"graphormer_pcqm4mv2": (0,)}` so 
 does not inherit GRIT training seeds. `TASK_OVERRIDES` can relocate the PCQM and Hugging Face
 caches or enforce offline loading. The same front end accepts local Graphormer checkpoints once a
 matching task/dataset registration (for example ZINC) is added.
+
+After a completed `graphormer_pcqm4mv2:seed0` score run, open
+[`graphormer_pcqm4mv2_figures_colab.ipynb`](graphormer_pcqm4mv2_figures_colab.ipynb)
+to produce the focused PCQM figure suite. It validates and reads the canonical score cache
+without recomputing the methodology, selects the structural specialist from active-head
+`D_rel`, reuses the cached clean attention-distance profile, and separately contract-caches
+only selected-head attention, pooled `A@V`, and dot/bias logit diagnostics.
