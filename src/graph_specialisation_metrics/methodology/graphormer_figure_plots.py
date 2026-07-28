@@ -489,11 +489,10 @@ def plot_attention_grid(
     *,
     role: str,
     head: Head,
-    d_rel: float,
-    joint_sensitivity: float,
+    per_graph_coordinates: Mapping[int, Mapping[str, float]],
     title_label: str | None = None,
 ):
-    """Three molecules by RDKit / attention overlay / attention matrix."""
+    """Three molecules with graph-local ``D_rel``/``J`` and attention views."""
 
     apply_publication_style()
     examples = list(examples_payload["examples"])
@@ -516,7 +515,7 @@ def plot_attention_grid(
     grid = fig.add_gridspec(
         4,
         3,
-        height_ratios=[0.15, 1.0, 1.0, 1.0],
+        height_ratios=[0.10, 1.0, 1.0, 1.0],
         width_ratios=[1.0, 1.08, 1.12],
     )
     title_axis = fig.add_subplot(grid[0, :])
@@ -529,12 +528,34 @@ def plot_attention_grid(
         dtype=object,
     )
     for row, (example, matrix) in enumerate(zip(examples, matrices)):
+        graph_index = int(example["dataset_index"])
+        graph_coordinates = per_graph_coordinates.get(graph_index)
+        if graph_coordinates is None:
+            graph_coordinates = per_graph_coordinates.get(str(graph_index))
+        if graph_coordinates is None:
+            raise KeyError(
+                f"no graph-local coordinates were supplied for PCQM index {graph_index}"
+            )
+        d_rel = float(
+            graph_coordinates.get(
+                "D_rel",
+                graph_coordinates.get("selectivity", np.nan),
+            )
+        )
+        joint_sensitivity = float(
+            graph_coordinates.get(
+                "J",
+                graph_coordinates.get("joint_sensitivity", np.nan),
+            )
+        )
         axes[row, 0].imshow(_draw_molecule_plain(example["smiles"]))
         axes[row, 0].axis("off")
         axes[row, 0].text(
             0.01,
             0.99,
-            f"PCQM index {example['dataset_index']}",
+            f"PCQM index {graph_index}\n"
+            rf"Graph-local: $D_{{\rm rel}} = {d_rel:+.3f};\ J = "
+            rf"{joint_sensitivity:.3f}$",
             transform=axes[row, 0].transAxes,
             ha="left",
             va="top",
@@ -572,21 +593,11 @@ def plot_attention_grid(
     style = HEAD_STYLES.get(role, {"label": role.title()})
     title_axis.text(
         0.5,
-        0.78,
+        0.5,
         f"{title_label or style['label']} — {_head_label(head)}",
         ha="center",
         va="center",
         fontsize=18,
-        color=NAVY,
-    )
-    title_axis.text(
-        0.5,
-        0.18,
-        rf"$D_{{\rm rel}} = {float(d_rel):+.3f};\quad "
-        rf"J = {float(joint_sensitivity):.3f}$",
-        ha="center",
-        va="center",
-        fontsize=15,
         color=NAVY,
     )
     colorbar = fig.colorbar(

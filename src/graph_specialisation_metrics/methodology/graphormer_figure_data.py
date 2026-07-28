@@ -1,19 +1,22 @@
-"""Read-only canonical score adapters and additive Graphormer figure diagnostics.
+"""Canonical score adapters and additive Graphormer figure diagnostics.
 
 The canonical methodology owns the score definitions and their cache contract.  This
-module does not recompute those scores.  It adapts a validated ``scores/raw.pt`` value
-for reporting and computes only explicitly additive diagnostics (selected attention,
-pooled ``A@V`` vectors, and dot/bias logit spread).  Supplemental caches are immutable
-and keyed to the canonical score artifact SHA and the exact model/runtime contract.
+module never replaces or relabels the canonical aggregate ``scores/raw.pt`` result. It
+adapts that immutable result for reporting and computes explicitly additive diagnostics:
+selected attention, pooled ``A@V`` vectors, dot/bias logit spread, and graph-local
+``D_rel``/``J`` estimates for displayed molecules. The latter call the same central
+event/scoring implementation as canonical runs and are stored only in supplemental,
+contract-keyed caches.
 """
 
 from __future__ import annotations
 
+import json
+import os
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
-import os
-import tempfile
 
 import numpy as np
 
@@ -25,10 +28,19 @@ from .cache import (
 from .graphormer import (
     GraphormerBackend,
     GraphormerGraph,
+    GraphormerRuntime,
     PCQMGraphormerDataset,
     build_graphormer_runtime,
 )
-from .protocol import stable_hash
+from .protocol import (
+    ExecutionPolicy,
+    MethodologyConfig,
+    RunSizes,
+    SplitManifest,
+    stable_hash,
+)
+from .runner import PreparedTask, estimate_graph_local_head_coordinates
+from .sampling import SemanticDonorPool
 from .tasks import get_task
 
 
@@ -45,6 +57,31 @@ def _field(value: Any, name: str) -> Any:
     if isinstance(value, Mapping):
         return value[name]
     return getattr(value, name)
+
+
+def _split_manifest_from_record(record: Mapping[str, Any]) -> SplitManifest:
+    split_record = record.get("splits")
+    if not isinstance(split_record, Mapping):
+        raise StaleCacheError("canonical model record has no valid split manifest")
+    try:
+        splits = SplitManifest(
+            discovery=tuple(int(value) for value in split_record["discovery"]),
+            causal=tuple(int(value) for value in split_record["causal"]),
+            clean_ablation=tuple(
+                int(value) for value in split_record["clean_ablation"]
+            ),
+            semantic_donor_pool=tuple(
+                int(value) for value in split_record["semantic_donor_pool"]
+            ),
+            same_index_space=bool(split_record["same_index_space"]),
+            seed=int(split_record["seed"]),
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise StaleCacheError(
+            f"canonical model record has an invalid split manifest: {error}"
+        ) from error
+    splits.validate()
+    return splits
 
 
 def load_graphormer_score_artifact(path: str | Path) -> ReadOnlyCacheArtifact:
@@ -80,6 +117,43 @@ def load_graphormer_score_artifact(path: str | Path) -> ReadOnlyCacheArtifact:
             f"Graphormer score cache contract is missing {missing}: {artifact.path}"
         )
     return artifact
+
+
+def load_graphormer_model_record(
+    path: str | Path,
+    artifact: ReadOnlyCacheArtifact,
+) -> dict[str, Any]:
+    """Load and bind ``model.json`` to the immutable canonical score artifact."""
+
+    resolved = Path(path).expanduser().resolve()
+    if not resolved.is_file():
+        raise FileNotFoundError(
+            f"canonical Graphormer model record not found: {resolved}"
+        )
+    record = json.loads(resolved.read_text())
+    contract = artifact.metadata["contract"]
+    expected = {
+        "task": contract["task"],
+        "task_adapter_version": contract["task_adapter_version"],
+        "checkpoint_sha256": contract["checkpoint_sha256"],
+        "train_seed": int(contract["train_seed"]),
+    }
+    mismatches = {
+        key: (record.get(key), value)
+        for key, value in expected.items()
+        if record.get(key) != value
+    }
+    if mismatches:
+        raise StaleCacheError(
+            f"{resolved} does not describe the canonical score artifact: {mismatches}"
+        )
+    splits = _split_manifest_from_record(record)
+    if splits.fingerprint != contract["split_fingerprint"]:
+        raise StaleCacheError(
+            f"{resolved} split fingerprint {splits.fingerprint!r} does not match "
+            f"the canonical score cache {contract['split_fingerprint']!r}"
+        )
+    return record
 
 
 @dataclass(frozen=True)
@@ -429,6 +503,171 @@ def build_verified_figure_runtime(
             f"canonical {expected_geometry}"
         )
     return GraphormerFigureRuntime(runtime, backend, descriptor, digest)
+
+
+class _GlobalIndexPCQMDataset:
+    """Sparse view whose keys are global PCQM4Mv2 dataset indices."""
+
+    def __init__(self, source: PCQMGraphormerDataset, allowed: Sequence[int]):
+        self.dataset = source.dataset
+        self.config = source.config
+        self.allowed = frozenset(int(value) for value in allowed)
+
+    def __len__(self) -> int:
+        return len(self.dataset)
+
+    def __getitem__(self, graph_index: int) -> GraphormerGraph:
+        graph_index = int(graph_index)
+        if graph_index not in self.allowed:
+            raise IndexError(
+                f"global PCQM graph {graph_index} is outside this sparse estimate"
+            )
+        return PCQMGraphormerDataset(
+            self.dataset,
+            (graph_index,),
+            self.config,
+        )[0]
+
+
+class GraphormerPerGraphCoordinateEstimator:
+    """Estimate graph-local canonical head coordinates for selected molecules.
+
+    The original canonical semantic donor pool and sampling budgets are replayed,
+    while the supplied global PCQM index is also the graph ID used by deterministic
+    source/donor RNG seeding. No canonical cache file is mutated.
+    """
+
+    ESTIMATOR_VERSION = "canonical-graph-local-head-coordinates-v1"
+
+    def __init__(
+        self,
+        figure_runtime: GraphormerFigureRuntime,
+        artifact: ReadOnlyCacheArtifact,
+        model_record: Mapping[str, Any],
+        *,
+        output_dir: str | Path,
+    ):
+        self.figure_runtime = figure_runtime
+        self.artifact = artifact
+        self.model_record = dict(model_record)
+        self.output_dir = Path(output_dir)
+        self.task = get_task("graphormer_pcqm4mv2")
+        self.contract = dict(artifact.metadata["contract"])
+        self.original_splits = _split_manifest_from_record(self.model_record)
+        if self.original_splits.fingerprint != self.contract["split_fingerprint"]:
+            raise StaleCacheError(
+                "canonical model record and score cache use different split manifests"
+            )
+        required = {"source_cap", "donors_per_source", "sigma"}
+        missing = sorted(required.difference(self.contract))
+        if missing:
+            raise StaleCacheError(
+                f"graph-local estimates require canonical contract fields {missing}"
+            )
+        self._donor_pool: SemanticDonorPool | None = None
+
+    def _semantic_donor_pool(self) -> SemanticDonorPool:
+        if self._donor_pool is None:
+            runtime = self.figure_runtime.runtime
+            self._donor_pool = SemanticDonorPool(
+                [
+                    (graph_id, runtime.donor_ds[graph_id])
+                    for graph_id in self.original_splits.semantic_donor_pool
+                ],
+                adapter=self.task.content_adapter,
+            )
+        return self._donor_pool
+
+    def estimate(self, graph_indices: Sequence[int]) -> dict[int, dict[str, Any]]:
+        indices = tuple(dict.fromkeys(int(value) for value in graph_indices))
+        if not indices:
+            raise ValueError("at least one global PCQM graph index is required")
+        source = self.figure_runtime.runtime.eval_ds
+        source_dataset = getattr(source, "dataset", None)
+        if source_dataset is None or not hasattr(source, "config"):
+            raise TypeError(
+                "graph-local estimates require a PCQMGraphormerDataset-backed runtime"
+            )
+        invalid = [
+            value for value in indices if value < 0 or value >= len(source_dataset)
+        ]
+        if invalid:
+            raise IndexError(f"global PCQM graph indices are out of range: {invalid}")
+
+        sparse_eval = _GlobalIndexPCQMDataset(source, indices)
+        original_runtime = self.figure_runtime.runtime
+        runtime = GraphormerRuntime(
+            original_runtime.model,
+            sparse_eval,
+            original_runtime.donor_ds,
+            device=original_runtime.device,
+            seed=int(self.contract["train_seed"]),
+            metric_fn=self.task.metric_fn,
+        )
+        sigma = np.asarray(self.contract["sigma"], dtype=np.float64)
+        backend = GraphormerBackend(runtime, self.task, sigma=sigma)
+        splits = SplitManifest(
+            discovery=indices,
+            causal=(),
+            clean_ablation=(),
+            semantic_donor_pool=self.original_splits.semantic_donor_pool,
+            same_index_space=False,
+            seed=int(self.original_splits.seed),
+        )
+        prepared = PreparedTask(
+            task=self.task,
+            runtime=runtime,
+            backend=backend,
+            output_dir=self.output_dir,
+            checkpoint=Path("official-graphormer-pcqm4mv2"),
+            checkpoint_sha=str(self.contract["checkpoint_sha256"]),
+            sigma=sigma,
+            splits=splits,
+            donor_pool=self._semantic_donor_pool(),
+            progress=None,
+        )
+        sizes = RunSizes(
+            discovery_graphs=len(indices),
+            causal_graphs=1,
+            clean_ablation_graphs=1,
+            semantic_donor_graphs=len(self.original_splits.semantic_donor_pool),
+            sources_per_graph=int(self.contract["source_cap"]),
+            donors_per_source=int(self.contract["donors_per_source"]),
+        )
+        config = MethodologyConfig(
+            output_dir=str(self.output_dir),
+            tasks=(self.task.name,),
+            train_seeds=(int(self.contract["train_seed"]),),
+            phases=("scores",),
+            sizes=sizes,
+            execution=ExecutionPolicy(graphs_per_batch=1),
+            analysis_seed=int(self.original_splits.seed),
+            accelerator=str(original_runtime.device),
+            resume=False,
+            force=False,
+        )
+        estimate = estimate_graph_local_head_coordinates(prepared, config)
+        output: dict[int, dict[str, Any]] = {}
+        for graph_index in indices:
+            graph_value = dict(estimate["graphs"][graph_index])
+            graph_value["graph_index"] = int(graph_index)
+            graph_value["estimation"] = {
+                "estimator": self.ESTIMATOR_VERSION,
+                "canonical_source_protocol": self.artifact.metadata[
+                    "protocol_version"
+                ],
+                "implementation_protocol": estimate["protocol_version"],
+                "manifest_hash": estimate["manifest_hash"],
+                "graph_id_seed_space": "global PCQM4Mv2 dataset index",
+                "analysis_seed": int(estimate["analysis_seed"]),
+                "sources_per_graph": int(estimate["sources_per_graph"]),
+                "donors_per_source": int(estimate["donors_per_source"]),
+                "semantic_donor_pool_size": len(
+                    self.original_splits.semantic_donor_pool
+                ),
+            }
+            output[graph_index] = graph_value
+        return output
 
 
 @dataclass(frozen=True)
@@ -845,6 +1084,7 @@ __all__ = [
     "GraphormerDiagnosticCapture",
     "GraphormerDiagnosticExtractor",
     "GraphormerFigureRuntime",
+    "GraphormerPerGraphCoordinateEstimator",
     "Head",
     "SupplementalCache",
     "aggregate_logit_spread",
@@ -853,6 +1093,7 @@ __all__ = [
     "compute_av_pca_inputs",
     "graph_at_dataset_index",
     "label_attention_focus",
+    "load_graphormer_model_record",
     "load_graphormer_score_artifact",
     "select_ranked_heads",
     "select_specialist_heads",

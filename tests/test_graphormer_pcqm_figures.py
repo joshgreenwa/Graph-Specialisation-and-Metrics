@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
 import matplotlib
@@ -13,6 +14,7 @@ import numpy as np
 import pytest
 import torch
 
+from graph_specialisation_metrics.methodology import runner
 from graph_specialisation_metrics.methodology.cache import (
     CacheCompatibilityWarning,
     StaleCacheError,
@@ -27,6 +29,7 @@ from graph_specialisation_metrics.methodology.graphormer_figure_data import (
     CanonicalHeadMetrics,
     GraphormerDiagnosticExtractor,
     SupplementalCache,
+    load_graphormer_model_record,
     load_graphormer_score_artifact,
     select_ranked_heads,
     select_specialist_heads,
@@ -43,7 +46,13 @@ from graph_specialisation_metrics.methodology.graphormer_figure_plots import (
     plot_selectivity_vs_logit_ratio,
 )
 from graph_specialisation_metrics.methodology.tasks import get_task
-from graph_specialisation_metrics.methodology.protocol import stable_hash
+from graph_specialisation_metrics.methodology.protocol import (
+    ExecutionPolicy,
+    MethodologyConfig,
+    PROTOCOL_VERSION,
+    SplitManifest,
+    stable_hash,
+)
 
 
 def synthetic_metrics() -> CanonicalHeadMetrics:
@@ -141,6 +150,64 @@ def test_graphormer_figure_loader_explicitly_accepts_valid_v3_cache(tmp_path):
         load_graphormer_score_artifact(path)
 
 
+def test_model_record_is_bound_to_score_cache_split(tmp_path):
+    splits = SplitManifest(
+        discovery=(0, 1),
+        causal=(2,),
+        clean_ablation=(3,),
+        semantic_donor_pool=(4, 5, 6),
+        same_index_space=False,
+        seed=31_415,
+    )
+    contract = {
+        "task": "graphormer_pcqm4mv2",
+        "task_adapter_version": "canonical-graphormer-hf-v1",
+        "checkpoint_sha256": "checkpoint",
+        "train_seed": 0,
+        "model_geometry": {"layers": 12, "heads": 32},
+        "sigma": [1.0],
+        "split_fingerprint": splits.fingerprint,
+        "source_cap": 6,
+        "donors_per_source": 8,
+    }
+    score_path = tmp_path / "raw.pt"
+    torch.save(
+        {
+            "metadata": {
+                "protocol_version": PROTOCOL_VERSION,
+                "contract": contract,
+                "contract_fingerprint": stable_hash(contract),
+            },
+            "value": {"coordinates": "test"},
+        },
+        score_path,
+    )
+    artifact = load_graphormer_score_artifact(score_path)
+    model_path = tmp_path / "model.json"
+    model_record = {
+        "task": contract["task"],
+        "task_adapter_version": contract["task_adapter_version"],
+        "checkpoint_sha256": contract["checkpoint_sha256"],
+        "train_seed": contract["train_seed"],
+        "splits": {
+            "discovery": list(splits.discovery),
+            "causal": list(splits.causal),
+            "clean_ablation": list(splits.clean_ablation),
+            "semantic_donor_pool": list(splits.semantic_donor_pool),
+            "same_index_space": splits.same_index_space,
+            "seed": splits.seed,
+        },
+    }
+    model_path.write_text(json.dumps(model_record))
+    loaded = load_graphormer_model_record(model_path, artifact)
+    assert loaded["splits"]["seed"] == 31_415
+
+    model_record["splits"]["semantic_donor_pool"] = [4, 5]
+    model_path.write_text(json.dumps(model_record))
+    with pytest.raises(StaleCacheError, match="split fingerprint"):
+        load_graphormer_model_record(model_path, artifact)
+
+
 def test_ranked_head_selection_is_independent_and_deterministic():
     ranked = select_ranked_heads(synthetic_metrics())
     assert ranked == {
@@ -194,6 +261,78 @@ def test_supplemental_cache_is_immutable_and_contract_keyed(tmp_path):
     assert not third_hit
     assert calls == [1, 3]
     assert third["value"] == 11
+
+
+def test_graph_local_estimator_normalises_each_graph_independently(monkeypatch):
+    semantic = {
+        10: np.asarray([[4.0, 1.0], [1.0, 2.0]]),
+        20: np.asarray([[1.0, 4.0], [2.0, 1.0]]),
+    }
+    structural = {
+        10: np.asarray([[1.0, 2.0], [4.0, 1.0]]),
+        20: np.asarray([[3.0, 1.0], [1.0, 3.0]]),
+    }
+
+    def fake_score_batch(
+        _prepared,
+        _config,
+        _plan,
+        _clean,
+        axis,
+        channel,
+        graph_ids,
+        *,
+        include_diagnostics,
+    ):
+        assert axis is None
+        assert include_diagnostics is False
+        values = semantic if channel == "semantic" else structural
+        return [
+            {"graph_id": int(graph_id), "score": values[int(graph_id)]}
+            for graph_id in graph_ids
+        ]
+
+    monkeypatch.setattr(runner, "_score_graph_batch", fake_score_batch)
+    monkeypatch.setattr(runner, "_event_item_cost", lambda *args, **kwargs: 1)
+    backend = SimpleNamespace(
+        clean_jacobians_many=lambda bases: [f"clean-{base}" for base in bases]
+    )
+    runtime = SimpleNamespace(
+        eval_ds={10: "graph-10", 20: "graph-20"},
+        sc=SimpleNamespace(seed=0),
+    )
+    prepared = SimpleNamespace(
+        task=SimpleNamespace(name="synthetic"),
+        runtime=runtime,
+        grit=runtime,
+        backend=backend,
+    )
+    plan = {
+        graph_id: {
+            channel: {"records": [], "sources": ()}
+            for channel in ("semantic", "structural")
+        }
+        for graph_id in (10, 20)
+    }
+    config = MethodologyConfig(
+        tasks=("synthetic",),
+        train_seeds=(0,),
+        execution=ExecutionPolicy(graphs_per_batch=2),
+    )
+    result = runner.estimate_graph_local_head_coordinates(
+        prepared,
+        config,
+        plan=plan,
+    )
+
+    first = result["graphs"][10]
+    second = result["graphs"][20]
+    assert np.isclose(first["normalized_semantic"].mean(), 1.0)
+    assert np.isclose(first["normalized_structural"].mean(), 1.0)
+    assert np.isclose(second["normalized_semantic"].mean(), 1.0)
+    assert np.isclose(second["normalized_structural"].mean(), 1.0)
+    assert not np.allclose(first["selectivity"], second["selectivity"])
+    assert result["graph_id_seed_space"] == "caller-supplied graph ID"
 
 
 def test_requested_scatter_figures_have_no_errorbar_artists():
@@ -334,8 +473,11 @@ def test_attention_grid_uses_rdkit_overlays_without_arrows():
         payload,
         role="semantic",
         head=(1, 24),
-        d_rel=0.4815,
-        joint_sensitivity=1.35,
+        per_graph_coordinates={
+            0: {"D_rel": 0.4815, "J": 1.35},
+            5: {"D_rel": 0.102, "J": 0.93},
+            80: {"D_rel": -0.221, "J": 1.71},
+        },
         title_label="Semantic specialist",
     )
     try:
@@ -357,8 +499,20 @@ def test_attention_grid_uses_rdkit_overlays_without_arrows():
         assert weighted_axis.images
         assert matrix_axis.images[0].get_cmap().name == "Blues"
         title = "\n".join(text.get_text() for text in figure.axes[0].texts)
-        assert "D_{\\rm rel} = +0.481" in title
-        assert "J = 1.350" in title
+        assert "Semantic specialist — L1 H24" in title
+        assert "D_{\\rm rel}" not in title
+        labels = "\n".join(
+            text.get_text()
+            for axis in figure.axes
+            for text in axis.texts
+            if "Graph-local" in text.get_text()
+        )
+        assert "D_{\\rm rel} = +0.481" in labels
+        assert "D_{\\rm rel} = +0.102" in labels
+        assert "D_{\\rm rel} = -0.221" in labels
+        assert "J = 1.350" in labels
+        assert "J = 0.930" in labels
+        assert "J = 1.710" in labels
     finally:
         plt.close(figure)
 

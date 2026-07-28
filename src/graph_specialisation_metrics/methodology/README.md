@@ -80,7 +80,7 @@ The paste-ready clone/mount/dispatch cell is
 | `interventions.py` | One-row semantic replacement and dense-equivalent sparse structural footprint copy. |
 | `backend.py` | Native GRIT `wV`/final-state adapter. |
 | `graphormer.py` | Official checkpoint/dataset loading, native Graphormer transport hooks, graph-token readout adapter. |
-| `graphormer_figure_data.py` | Read-only canonical score adapter and separately contract-cached Graphormer attention, `A@V`, and logit diagnostics. |
+| `graphormer_figure_data.py` | Read-only canonical score adapter plus separately contract-cached Graphormer attention, `A@V`, logit, and displayed-graph coordinate diagnostics; graph-local coordinates delegate to `runner.py`. |
 | `graphormer_figure_plots.py` | PCQM-specific publication figures; presentation only, with no canonical score recomputation. |
 | `graphbench.py` | Exact GraphBench runner/checkpoint adapter, edge-semantic donor law, official-GRIT hooks, and nonlinear readout replay. |
 | `scores.py` / `distance.py` | Raw event score, hierarchy, coordinates, and exact SPD accounting. |
@@ -91,7 +91,7 @@ The paste-ready clone/mount/dispatch cell is
 | `audit.py` | Soft numerical/estimability audits: record, log, and continue; strict mode raises. |
 | `execution.py` | Runtime-only multi-graph batching and CUDA-OOM backoff. |
 | `figures.py` | Shared publication theme, exact labels, intervals, PDF+PNG+metadata export. |
-| `runner.py` | Backend-neutral score, causal, carriage, cache, and figure orchestration. |
+| `runner.py` | Backend-neutral score, graph-local coordinate, causal, carriage, cache, and figure orchestration. |
 
 Task-specific presentation can be added without changing cached measurements:
 
