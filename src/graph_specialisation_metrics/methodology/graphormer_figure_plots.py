@@ -489,6 +489,8 @@ def plot_attention_grid(
     *,
     role: str,
     head: Head,
+    d_rel: float,
+    joint_sensitivity: float,
     title_label: str | None = None,
 ):
     """Three molecules by RDKit / attention overlay / attention matrix."""
@@ -510,12 +512,21 @@ def plot_attention_grid(
     inbound_max = max(
         max(float(np.nanpercentile(values, 99)), 1e-6) for values in inbound
     )
-    fig, axes = plt.subplots(
+    fig = plt.figure(figsize=(13.2, 11.2), constrained_layout=True)
+    grid = fig.add_gridspec(
+        4,
         3,
-        3,
-        figsize=(13.2, 10.6),
-        gridspec_kw={"width_ratios": [1.0, 1.08, 1.12]},
-        constrained_layout=True,
+        height_ratios=[0.15, 1.0, 1.0, 1.0],
+        width_ratios=[1.0, 1.08, 1.12],
+    )
+    title_axis = fig.add_subplot(grid[0, :])
+    title_axis.axis("off")
+    axes = np.asarray(
+        [
+            [fig.add_subplot(grid[row + 1, column]) for column in range(3)]
+            for row in range(3)
+        ],
+        dtype=object,
     )
     for row, (example, matrix) in enumerate(zip(examples, matrices)):
         axes[row, 0].imshow(_draw_molecule_plain(example["smiles"]))
@@ -559,11 +570,24 @@ def plot_attention_grid(
     ):
         axes[0, column].set_title(label, fontsize=12, pad=8)
     style = HEAD_STYLES.get(role, {"label": role.title()})
-    fig.suptitle(
+    title_axis.text(
+        0.5,
+        0.78,
         f"{title_label or style['label']} — {_head_label(head)}",
+        ha="center",
+        va="center",
         fontsize=18,
         color=NAVY,
-        y=1.02,
+    )
+    title_axis.text(
+        0.5,
+        0.18,
+        rf"$D_{{\rm rel}} = {float(d_rel):+.3f};\quad "
+        rf"J = {float(joint_sensitivity):.3f}$",
+        ha="center",
+        va="center",
+        fontsize=15,
+        color=NAVY,
     )
     colorbar = fig.colorbar(
         image, ax=axes[:, 2], location="right", shrink=0.72, pad=0.02
@@ -601,6 +625,9 @@ def plot_av_pca(
     *,
     maximum_categories: int = 9,
     minimum_count: int = 5,
+    title_label: str | None = None,
+    d_rel: float | None = None,
+    joint_sensitivity: float | None = None,
 ):
     apply_publication_style()
     coordinates, explained = _pca(np.asarray(payload["vectors"]))
@@ -645,8 +672,21 @@ def plot_av_pca(
     ax.set_xlabel(f"PC1 ({100 * explained[0]:.1f}% variance)")
     ax.set_ylabel(f"PC2 ({100 * explained[1]:.1f}% variance)")
     head = tuple(payload["head"])
+    metric_line = ""
+    if d_rel is not None and joint_sensitivity is not None:
+        metric_line = (
+            "\n"
+            + rf"$D_{{\rm rel}} = {float(d_rel):+.3f};\quad "
+            + rf"J = {float(joint_sensitivity):.3f}$"
+        )
+    descriptor = (
+        f"{title_label} — {_head_label(head)}"
+        if title_label
+        else _head_label(head)
+    )
     ax.set_title(
-        f"Pooled $A@V$ representations — {_head_label(head)}\n"
+        f"Pooled $A@V$ representations — {descriptor}"
+        f"{metric_line}\n"
         f"{payload['n_used']} PCQM4Mv2 molecules",
         fontsize=15,
     )

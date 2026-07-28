@@ -33,6 +33,7 @@ from graph_specialisation_metrics.methodology.graphormer_figure_data import (
 )
 from graph_specialisation_metrics.methodology.graphormer_figure_plots import (
     plot_attention_grid,
+    plot_av_pca,
     plot_coordinate_heatmaps,
     plot_hop_attention_mass,
     plot_logit_spread,
@@ -148,6 +149,29 @@ def test_ranked_head_selection_is_independent_and_deterministic():
         "top_joint_1": (1, 2),
         "top_joint_2": (0, 0),
     }
+
+
+def test_ranked_selection_adds_third_semantic_and_high_j_generalists():
+    ranked = select_ranked_heads(
+        synthetic_metrics(),
+        semantic_count=3,
+        joint_count=3,
+        joint_generalist_max_abs_selectivity=0.3,
+    )
+    assert ranked == {
+        "top_semantic_1": (1, 2),
+        "top_semantic_2": (0, 2),
+        "top_semantic_3": (0, 1),
+        "top_joint_1": (0, 2),
+        "top_joint_2": (1, 0),
+        "top_joint_3": (0, 1),
+    }
+    metrics = synthetic_metrics()
+    assert all(
+        abs(metrics.selectivity[head]) <= 0.3
+        for role, head in ranked.items()
+        if role.startswith("top_joint")
+    )
 
 
 def test_supplemental_cache_is_immutable_and_contract_keyed(tmp_path):
@@ -310,6 +334,8 @@ def test_attention_grid_uses_rdkit_overlays_without_arrows():
         payload,
         role="semantic",
         head=(1, 24),
+        d_rel=0.4815,
+        joint_sensitivity=1.35,
         title_label="Semantic specialist",
     )
     try:
@@ -318,9 +344,44 @@ def test_attention_grid_uses_rdkit_overlays_without_arrows():
             for axis in figure.axes
             for patch in axis.patches
         )
-        assert figure.axes[1].images
-        assert figure.axes[2].images[0].get_cmap().name == "Blues"
-        assert figure.axes[1].get_title() == "Attention-weighted molecule"
+        weighted_axis = next(
+            axis
+            for axis in figure.axes
+            if axis.get_title() == "Attention-weighted molecule"
+        )
+        matrix_axis = next(
+            axis
+            for axis in figure.axes
+            if axis.get_title() == "Node-conditioned attention"
+        )
+        assert weighted_axis.images
+        assert matrix_axis.images[0].get_cmap().name == "Blues"
+        title = "\n".join(text.get_text() for text in figure.axes[0].texts)
+        assert "D_{\\rm rel} = +0.481" in title
+        assert "J = 1.350" in title
+    finally:
+        plt.close(figure)
+
+
+def test_av_pca_identifies_role_and_head_metrics():
+    rng = np.random.default_rng(17)
+    payload = {
+        "head": (7, 14),
+        "vectors": rng.normal(size=(12, 8)),
+        "labels": ["other/diffuse"] * 12,
+        "n_used": 12,
+    }
+    figure = plot_av_pca(
+        payload,
+        title_label="Structural specialist",
+        d_rel=-0.275,
+        joint_sensitivity=1.234,
+    )
+    try:
+        title = figure.axes[0].get_title()
+        assert "Structural specialist — L7 H14" in title
+        assert "D_{\\rm rel} = -0.275" in title
+        assert "J = 1.234" in title
     finally:
         plt.close(figure)
 

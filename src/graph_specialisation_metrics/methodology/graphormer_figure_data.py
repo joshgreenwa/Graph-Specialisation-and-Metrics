@@ -244,11 +244,13 @@ def select_ranked_heads(
     semantic_count: int = 2,
     joint_count: int = 2,
     active_only: bool = True,
+    joint_generalist_max_abs_selectivity: float | None = None,
 ) -> dict[str, Head]:
     """Rank heads independently by decreasing ``D_rel`` and decreasing ``J``.
 
     A head may appear in both rankings. Exact ``D_rel`` ties prefer larger
-    ``J``; exact ``J`` ties prefer larger ``D_rel``.
+    ``J``; exact ``J`` ties prefer larger ``D_rel``. When a generalist bound is
+    supplied, the ``J`` ranking is restricted to ``|D_rel|`` below that bound.
     """
 
     semantic_count = int(semantic_count)
@@ -259,28 +261,43 @@ def select_ranked_heads(
         metrics.joint_sensitivity
     )
     eligible = finite & metrics.active if active_only else finite
-    layers, heads = np.where(eligible)
-    required = max(semantic_count, joint_count)
-    if len(layers) < required:
+    semantic_layers, semantic_heads = np.where(eligible)
+    if len(semantic_layers) < semantic_count:
         raise ValueError(
-            f"only {len(layers)} eligible heads are available for a top-{required} ranking"
+            f"only {len(semantic_layers)} eligible heads are available for a "
+            f"top-{semantic_count} semantic ranking"
         )
 
-    selectivity = metrics.selectivity[layers, heads]
-    joint = metrics.joint_sensitivity[layers, heads]
-    semantic_order = np.lexsort((-joint, -selectivity))
-    joint_order = np.lexsort((-selectivity, -joint))
+    semantic_selectivity = metrics.selectivity[semantic_layers, semantic_heads]
+    semantic_joint = metrics.joint_sensitivity[semantic_layers, semantic_heads]
+    semantic_order = np.lexsort((-semantic_joint, -semantic_selectivity))
+
+    joint_eligible = eligible.copy()
+    if joint_generalist_max_abs_selectivity is not None:
+        bound = float(joint_generalist_max_abs_selectivity)
+        if bound < 0:
+            raise ValueError("joint generalist |D_rel| bound must be non-negative")
+        joint_eligible &= np.abs(metrics.selectivity) <= bound
+    joint_layers, joint_heads = np.where(joint_eligible)
+    if len(joint_layers) < joint_count:
+        raise ValueError(
+            f"only {len(joint_layers)} eligible heads are available for a "
+            f"top-{joint_count} joint-generalist ranking"
+        )
+    joint_selectivity = metrics.selectivity[joint_layers, joint_heads]
+    joint_values = metrics.joint_sensitivity[joint_layers, joint_heads]
+    joint_order = np.lexsort((-joint_selectivity, -joint_values))
 
     ranked: dict[str, Head] = {}
     for rank, position in enumerate(semantic_order[:semantic_count], start=1):
         ranked[f"top_semantic_{rank}"] = (
-            int(layers[position]),
-            int(heads[position]),
+            int(semantic_layers[position]),
+            int(semantic_heads[position]),
         )
     for rank, position in enumerate(joint_order[:joint_count], start=1):
         ranked[f"top_joint_{rank}"] = (
-            int(layers[position]),
-            int(heads[position]),
+            int(joint_layers[position]),
+            int(joint_heads[position]),
         )
     return ranked
 
