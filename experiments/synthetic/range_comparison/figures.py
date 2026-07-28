@@ -1246,6 +1246,86 @@ def figure_counterflow() -> Path:
     return out
 
 
+def figure_performance() -> Path:
+    """Relative performance on one criterion: recovering the exact range."""
+
+    rows = load("counterflow.json")["results"]
+    arms = [
+        ("F_range", r"Functional carriage", CARRIAGE, "s", (0, (3.5, 2.2))),
+        ("jacobian_carrier_anchored", r"Bamberger, carrier-anchored", "#1baf7a", "^", (0, (1.2, 1.6))),
+        ("jacobian_range", r"Bamberger, source-anchored", JACOBIAN, "o", "-"),
+    ]
+
+    def value(row, key):
+        if key == "F_range":
+            return row["measured"]["true_range"]      # the range implied by the F_sens profile
+        return row["measured"][key]
+
+    fig, axes = plt.subplots(1, 2, figsize=(6.4, 2.5))
+    fig.subplots_adjust(wspace=0.34)
+
+    # (a) sweep the saturation; the exact range does not depend on it.
+    ax = axes[0]
+    sub = sorted([r for r in rows if r["gamma"] == 1.0 and r["distance"] == 10 and r["tau"] == 1.0],
+                 key=lambda r: r["kappa"])
+    x = [r["kappa"] for r in sub]
+    ax.plot(x, [r["expected"]["true_range"] for r in sub], color=MUTED, linewidth=4.0,
+            alpha=0.45, solid_capstyle="round", label="exact range", zorder=1)
+    for key, label, colour, marker, style_ in arms:
+        ax.plot(x, [value(r, key) for r in sub], color=colour, marker=marker, markersize=4.4,
+                linestyle=style_, markerfacecolor="white" if key == "jacobian_range" else colour,
+                markeredgewidth=1.2, label=label, zorder=3)
+    ax.set_xscale("log", base=2)
+    ax.set_xticks(x)
+    ax.set_xticklabels([f"{v:g}" for v in x])
+    ax.set_xlabel(r"Saturation $\kappa$")
+    ax.set_ylabel("Range (hops)")
+    ax.set_title(r"Sweeping saturation ($\gamma=1$, $D=10$)", pad=5)
+    ax.set_ylim(0, 8)
+    ax.legend(frameon=False, fontsize=6.2, handlelength=1.6, borderpad=0.1, labelspacing=0.3)
+    ax.grid(axis="y", alpha=0.9)
+    ax.set_axisbelow(True)
+    panel_letter(ax, "a", dx=-0.26)
+
+    # (b) sweep the pathway balance; now the exact range DOES move.
+    ax = axes[1]
+    sub = sorted([r for r in rows if r["kappa"] == 8.0 and r["distance"] == 10 and r["tau"] == 1.0],
+                 key=lambda r: r["gamma"])
+    x = [r["gamma"] for r in sub]
+    ax.plot(x, [r["expected"]["true_range"] for r in sub], color=MUTED, linewidth=4.0,
+            alpha=0.45, solid_capstyle="round", zorder=1)
+    for key, label, colour, marker, style_ in arms:
+        ax.plot(x, [value(r, key) for r in sub], color=colour, marker=marker, markersize=4.4,
+                linestyle=style_, markerfacecolor="white" if key == "jacobian_range" else colour,
+                markeredgewidth=1.2, zorder=3)
+    ax.set_xscale("log")
+    ax.set_xticks(x)
+    ax.set_xticklabels([f"{v:g}" for v in x])
+    ax.set_xlabel(r"Pathway balance $\gamma$")
+    ax.set_ylabel("Range (hops)")
+    ax.set_title(r"Sweeping the balance ($\kappa=8$, $D=10$)", pad=5)
+    ax.set_ylim(0, 10)
+    ax.annotate("exact", xy=(x[0], sub[0]["expected"]["true_range"]), xytext=(2, 5),
+                textcoords="offset points", fontsize=6.2, color=INK)
+    ax.grid(axis="y", alpha=0.9)
+    ax.set_axisbelow(True)
+    panel_letter(ax, "b", dx=-0.26)
+
+    fig.text(
+        0.5, -0.10,
+        "Beneficial carriage is not plotted: its field is signed, so an expected distance is not "
+        "defined for it.\nIts magnitude profile is identical to functional carriage here, and it "
+        "alone also resolves pathway sign and target alignment.",
+        ha="center", va="top", fontsize=5.9, color=MUTED,
+    )
+
+    out = FIGURES / "fig11_performance.png"
+    fig.savefig(out)
+    fig.savefig(out.with_suffix(".pdf"))
+    plt.close(fig)
+    return out
+
+
 def main() -> None:
     style()
     FIGURES.mkdir(parents=True, exist_ok=True)
@@ -1261,6 +1341,7 @@ def main() -> None:
         ("fig8", figure_quantised),
         ("fig9", figure_gate),
         ("fig10", figure_counterflow),
+        ("fig11", figure_performance),
     ]
     for label, builder in builders:
         try:

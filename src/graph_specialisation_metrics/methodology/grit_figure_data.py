@@ -346,6 +346,36 @@ def select_structural_specialist_head(
     )
 
 
+def select_structurally_selective_heads(
+    metrics: CanonicalHeadMetrics,
+    *,
+    maximum_d_rel: float = 0.0,
+    active_only: bool = True,
+) -> tuple[Head, ...]:
+    """Return every structurally selective head, ordered by increasing ``D_rel``."""
+
+    eligible = np.isfinite(metrics.selectivity) & np.isfinite(
+        metrics.joint_sensitivity
+    )
+    if active_only:
+        eligible &= metrics.active
+    eligible &= metrics.selectivity < float(maximum_d_rel)
+    layers, heads = np.where(eligible)
+    if not len(layers):
+        return ()
+    order = np.lexsort(
+        (
+            heads,
+            layers,
+            -metrics.joint_sensitivity[layers, heads],
+            metrics.selectivity[layers, heads],
+        )
+    )
+    return tuple(
+        (int(layers[position]), int(heads[position])) for position in order
+    )
+
+
 def select_attention_grid_indices(
     entries: Sequence[int],
     *,
@@ -440,6 +470,30 @@ class SupplementalCache:
         )
         return self.root / f"{name}-{fingerprint[:16]}.pt"
 
+    def load(
+        self,
+        name: str,
+        contract: Mapping[str, Any],
+    ) -> tuple[Any, Path] | None:
+        """Read one exact supplemental artifact without invoking a compute path."""
+
+        path = self.path_for(name, contract)
+        if not path.exists():
+            return None
+        import torch
+
+        payload = torch.load(path, map_location="cpu", weights_only=False)
+        if (
+            not isinstance(payload, Mapping)
+            or payload.get("schema_version") != self.SCHEMA_VERSION
+            or payload.get("contract") != dict(contract)
+            or "value" not in payload
+        ):
+            raise StaleCacheError(
+                f"supplemental figure cache is malformed: {path}"
+            )
+        return payload["value"], path
+
     def load_or_compute(
         self,
         name: str,
@@ -449,20 +503,11 @@ class SupplementalCache:
         force: bool = False,
     ) -> tuple[Any, Path, bool]:
         path = self.path_for(name, contract)
-        if path.exists() and not force:
-            import torch
-
-            payload = torch.load(path, map_location="cpu", weights_only=False)
-            if (
-                not isinstance(payload, Mapping)
-                or payload.get("schema_version") != self.SCHEMA_VERSION
-                or payload.get("contract") != dict(contract)
-                or "value" not in payload
-            ):
-                raise StaleCacheError(
-                    f"supplemental figure cache is malformed: {path}"
-                )
-            return payload["value"], path, True
+        if not force:
+            cached = self.load(name, contract)
+            if cached is not None:
+                value, cached_path = cached
+                return value, cached_path, True
         value = compute()
         import torch
 

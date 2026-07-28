@@ -30,6 +30,7 @@ from graph_specialisation_metrics.methodology.grit_figure_data import (  # noqa:
     select_ranked_heads,
     select_specialist_heads,
     select_structural_specialist_head,
+    select_structurally_selective_heads,
 )
 from graph_specialisation_metrics.methodology.grit_figure_plots import (  # noqa: E402
     PCA_FOCUS_COLORS,
@@ -115,6 +116,11 @@ def test_head_metrics_and_grit_specialist_selection():
     assert select_structural_specialist_head(
         metrics, excluded_heads=((0, 1),)
     ) == (1, 1)
+    assert select_structurally_selective_heads(metrics) == (
+        (0, 1),
+        (1, 1),
+        (1, 3),
+    )
     ranked = select_ranked_heads(
         metrics,
         semantic_count=3,
@@ -197,6 +203,13 @@ def test_supplemental_cache_is_contract_keyed(tmp_path: Path):
     assert not first_hit and second_hit and not qm9_hit
     assert qm9_path != first_path
     assert calls == ["zinc", "qm9"]
+    loaded = cache.load(
+        "diagnostic", {"task": "zinc", "head": [0, 1]}
+    )
+    assert loaded is not None
+    assert loaded[0] == {"value": 1}
+    assert loaded[1] == first_path
+    assert cache.load("diagnostic", {"task": "missing"}) is None
 
 
 def test_graph_local_estimator_normalises_each_graph_independently(
@@ -524,6 +537,14 @@ def test_colab_notebook_has_valid_python_cells():
     assert payload["nbformat"] == 4
     assert "zinc" in "".join(payload["cells"][1]["source"])
     assert "qm9_gap_dense" in "".join(payload["cells"][1]["source"])
+    source = "\n".join(
+        "".join(cell.get("source", [])) for cell in payload["cells"]
+    )
+    assert '"rdkit"' in source
+    assert "def get_figure_runtime()" in source
+    assert "if figure_runtime is None" in source
+    assert "select_structurally_selective_heads" in source
+    assert "clean_attention_mass_vs_SPD" in source
     for index, cell in enumerate(payload["cells"]):
         if cell["cell_type"] == "code":
             ast.parse(

@@ -37,9 +37,13 @@ vocabulary and bond dictionary, so the attention grids contain index-preserving 
 rather than generic graph layouts; QM9 is reconstructed from its atomic-number and bond-class
 fields. Routed-output PCAs use the same fixed chemical-group labels and colour identities as the
 PCQM suite (plus an explicit-hydrogen category for QM9), and every title names the dataset and
-dense GRIT+RRWP model. GRIT's non-additive relation conditioning is reported as such; its
-node-only versus relation-conditioned raw-logit figure is not labelled as Graphormer
-dot-versus-bias.
+dense GRIT+RRWP model. The notebook installs RDKit explicitly, writes every model-forward
+diagnostic to its exact supplemental cache before rendering, and constructs the GRIT runtime only
+if one of those artifacts is missing. Once populated, styling-only reruns do not rebuild RRWP,
+reload the checkpoint, or execute model forwards. Every active head with negative `D_rel` also
+gets an individual mean clean-attention-mass versus shortest-path-distance plot from the canonical
+score cache. GRIT's non-additive relation conditioning is reported as such; its node-only versus
+relation-conditioned raw-logit figure is not labelled as Graphormer dot-versus-bias.
 
 For the public PCQM model, set `TASKS = ("graphormer_pcqm4mv2",)` and leave `CHECKPOINTS`
 empty. The registered `clefourrier/graphormer-base-pcqm4mv2@refs/pr/4` checkpoint is loaded
