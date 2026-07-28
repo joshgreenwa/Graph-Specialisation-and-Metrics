@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import tempfile
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
@@ -18,6 +19,10 @@ from .protocol import PROTOCOL_VERSION, stable_hash
 
 class StaleCacheError(RuntimeError):
     pass
+
+
+class CacheCompatibilityWarning(UserWarning):
+    """A valid immutable cache was created under another protocol label."""
 
 
 @dataclass(frozen=True)
@@ -203,12 +208,16 @@ class CanonicalCache:
         return path
 
 
-def load_cache_artifact_file(path: str | Path) -> ReadOnlyCacheArtifact:
+def load_cache_artifact_file(
+    path: str | Path,
+    *,
+    strict_protocol: bool = False,
+) -> ReadOnlyCacheArtifact:
     """Load and validate an existing cache without comparing it to the current checkout.
 
-    This is intentionally read-only. It verifies the cache's own protocol and stored contract
-    fingerprint, then exposes that original contract so an additive analysis can bind itself to
-    the exact artifact even when the repository has since advanced.
+    This is intentionally read-only. Protocol-version differences warn and continue by default;
+    callers may request fail-closed version matching with ``strict_protocol=True``. The cache's
+    own contract fingerprint is always verified before any value is exposed.
     """
 
     import torch
@@ -227,11 +236,6 @@ def load_cache_artifact_file(path: str | Path) -> ReadOnlyCacheArtifact:
     ):
         raise StaleCacheError(f"cache payload is malformed: {resolved}")
     metadata = payload["metadata"]
-    if metadata.get("protocol_version") != PROTOCOL_VERSION:
-        raise StaleCacheError(
-            f"{resolved} uses protocol {metadata.get('protocol_version')!r}; "
-            f"expected {PROTOCOL_VERSION!r}"
-        )
     contract = metadata.get("contract")
     if not isinstance(contract, Mapping):
         raise StaleCacheError(f"cache contract is malformed: {resolved}")
@@ -241,6 +245,16 @@ def load_cache_artifact_file(path: str | Path) -> ReadOnlyCacheArtifact:
         raise StaleCacheError(
             f"cache contract fingerprint is internally inconsistent: {resolved}"
         )
+    stored_protocol = metadata.get("protocol_version")
+    if stored_protocol != PROTOCOL_VERSION:
+        message = (
+            f"{resolved} uses protocol {metadata.get('protocol_version')!r}; "
+            f"the current checkout uses {PROTOCOL_VERSION!r}. The internally "
+            "consistent immutable cache will be reused without relabelling."
+        )
+        if strict_protocol:
+            raise StaleCacheError(message)
+        warnings.warn(message, CacheCompatibilityWarning, stacklevel=2)
     return ReadOnlyCacheArtifact(
         path=resolved,
         file_sha256=checkpoint_sha256(resolved),

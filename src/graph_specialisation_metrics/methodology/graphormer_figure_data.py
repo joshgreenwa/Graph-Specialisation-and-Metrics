@@ -17,7 +17,11 @@ import tempfile
 
 import numpy as np
 
-from .cache import ReadOnlyCacheArtifact
+from .cache import (
+    ReadOnlyCacheArtifact,
+    StaleCacheError,
+    load_cache_artifact_file,
+)
 from .graphormer import (
     GraphormerBackend,
     GraphormerGraph,
@@ -41,6 +45,41 @@ def _field(value: Any, name: str) -> Any:
     if isinstance(value, Mapping):
         return value[name]
     return getattr(value, name)
+
+
+def load_graphormer_score_artifact(path: str | Path) -> ReadOnlyCacheArtifact:
+    """Load a validated Graphormer score cache for additive figures.
+
+    This compatibility boundary is intentionally narrower than the canonical
+    analysis loader: it is read-only and requires the stored task and runtime
+    contract to describe the official PCQM4Mv2 Graphormer task.
+    """
+
+    artifact = load_cache_artifact_file(path)
+    contract = artifact.metadata.get("contract")
+    if not isinstance(contract, Mapping):
+        raise StaleCacheError(
+            f"Graphormer score cache has no valid contract: {artifact.path}"
+        )
+    if contract.get("task") != "graphormer_pcqm4mv2":
+        raise StaleCacheError(
+            f"{artifact.path} is for task {contract.get('task')!r}, not "
+            "'graphormer_pcqm4mv2'"
+        )
+    required = {
+        "checkpoint_sha256",
+        "model_geometry",
+        "sigma",
+        "split_fingerprint",
+        "task_adapter_version",
+        "train_seed",
+    }
+    missing = sorted(required.difference(contract))
+    if missing:
+        raise StaleCacheError(
+            f"Graphormer score cache contract is missing {missing}: {artifact.path}"
+        )
+    return artifact
 
 
 @dataclass(frozen=True)
@@ -797,6 +836,7 @@ __all__ = [
     "compute_av_pca_inputs",
     "graph_at_dataset_index",
     "label_attention_focus",
+    "load_graphormer_score_artifact",
     "select_ranked_heads",
     "select_specialist_heads",
 ]

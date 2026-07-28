@@ -13,6 +13,11 @@ import numpy as np
 import pytest
 import torch
 
+from graph_specialisation_metrics.methodology.cache import (
+    CacheCompatibilityWarning,
+    StaleCacheError,
+    load_cache_artifact_file,
+)
 from graph_specialisation_metrics.methodology.graphormer import (
     GraphormerBackend,
     GraphormerRuntime,
@@ -22,6 +27,7 @@ from graph_specialisation_metrics.methodology.graphormer_figure_data import (
     CanonicalHeadMetrics,
     GraphormerDiagnosticExtractor,
     SupplementalCache,
+    load_graphormer_score_artifact,
     select_ranked_heads,
     select_specialist_heads,
 )
@@ -36,6 +42,7 @@ from graph_specialisation_metrics.methodology.graphormer_figure_plots import (
     plot_selectivity_vs_logit_ratio,
 )
 from graph_specialisation_metrics.methodology.tasks import get_task
+from graph_specialisation_metrics.methodology.protocol import stable_hash
 
 
 def synthetic_metrics() -> CanonicalHeadMetrics:
@@ -91,6 +98,46 @@ def test_canonical_adapter_and_active_drel_selection():
     assert metrics.shape == (2, 3)
     assert selected == {"semantic": (1, 2), "structural": (0, 0)}
     assert metrics.distance_axis[-1] == "graph_token"
+
+
+def test_graphormer_figure_loader_explicitly_accepts_valid_v3_cache(tmp_path):
+    contract = {
+        "task": "graphormer_pcqm4mv2",
+        "task_adapter_version": "canonical-graphormer-hf-v1",
+        "checkpoint_sha256": "checkpoint",
+        "train_seed": 0,
+        "model_geometry": {"layers": 12, "heads": 32},
+        "sigma": [1.0],
+        "split_fingerprint": "split",
+    }
+    path = tmp_path / "raw.pt"
+    torch.save(
+        {
+            "metadata": {
+                "protocol_version": "donor-swap-specialisation-carriage-v3",
+                "contract": contract,
+                "contract_fingerprint": stable_hash(contract),
+            },
+            "value": {"coordinates": "test"},
+        },
+        path,
+    )
+
+    with pytest.warns(CacheCompatibilityWarning, match="without relabelling"):
+        artifact = load_cache_artifact_file(path)
+    assert artifact.metadata["protocol_version"].endswith("-v3")
+    with pytest.raises(StaleCacheError, match="without relabelling"):
+        load_cache_artifact_file(path, strict_protocol=True)
+    with pytest.warns(CacheCompatibilityWarning, match="without relabelling"):
+        artifact = load_graphormer_score_artifact(path)
+    assert artifact.metadata["protocol_version"].endswith("-v3")
+    assert artifact.metadata["contract"]["task"] == "graphormer_pcqm4mv2"
+
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    payload["metadata"]["contract_fingerprint"] = "corrupt"
+    torch.save(payload, path)
+    with pytest.raises(StaleCacheError, match="internally inconsistent"):
+        load_graphormer_score_artifact(path)
 
 
 def test_ranked_head_selection_is_independent_and_deterministic():
