@@ -11,8 +11,11 @@ The normative scientific specification is
 The implementation boundary and output layout are documented in
 [`../../src/graph_specialisation_metrics/methodology/README.md`](../../src/graph_specialisation_metrics/methodology/README.md).
 
-Edit only the task list, training seeds, requested phases, checkpoint overrides, and run sizes in
-the launcher. Methodological definitions belong in the canonical package, not in the Colab cell.
+Edit only the task list, training seeds, requested phases, checkpoint overrides, run sizes, and the
+explicitly preregistered `FAMILIES` thresholds in the launcher. Methodological definitions belong
+in the canonical package, not in the Colab cell. `FAMILIES` exposes separate discovery and causal
+equivalence regions plus the stability and dual-channel response floors; set them before looking
+at causal outcomes.
 
 The initial production run is configured for the dense `zinc`, `qm9_gap_dense`,
 `peptides_func`, and `peptides_struct` registrations.

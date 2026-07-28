@@ -208,6 +208,8 @@ def joint_selectivity_plane(
     data: HeadPlotData,
     *,
     title: str | None = None,
+    equivalence_half_width: float | None = None,
+    zoom_to_data: bool = True,
     theme: FigureTheme = FigureTheme(),
 ):
     import matplotlib.pyplot as plt
@@ -233,6 +235,16 @@ def joint_selectivity_plane(
             edgecolor="white",
             linewidth=0.45,
         )
+        if equivalence_half_width is not None:
+            margin = float(equivalence_half_width)
+            ax.axvspan(
+                -margin,
+                margin,
+                color=theme.central_color,
+                alpha=0.10,
+                linewidth=0,
+                label="practical-equivalence region",
+            )
         ax.axvline(0, color="#777777", linestyle="--", linewidth=0.9)
         ax.axhline(
             float(np.nanmin(y[active])) if active.any() else 0,
@@ -240,7 +252,21 @@ def joint_selectivity_plane(
             linestyle=":",
             linewidth=0.8,
         )
-        ax.set_xlim(-1.03, 1.03)
+        if zoom_to_data:
+            candidates = [x[np.isfinite(x)]]
+            if data.selectivity_interval is not None:
+                candidates.extend(
+                    _flatten_heads(value)[np.isfinite(_flatten_heads(value))]
+                    for value in data.selectivity_interval
+                )
+            finite_x = np.concatenate([value for value in candidates if value.size])
+            extent = float(np.max(np.abs(finite_x))) if finite_x.size else 0.0
+            if equivalence_half_width is not None:
+                extent = max(extent, 1.35 * float(equivalence_half_width))
+            extent = min(1.03, max(0.08, 1.12 * extent))
+            ax.set_xlim(-extent, extent)
+        else:
+            ax.set_xlim(-1.03, 1.03)
         ax.set_xlabel(SELECTIVITY_AXIS_LABEL)
         ax.set_ylabel(JOINT_AXIS_LABEL)
         if title:
@@ -250,7 +276,373 @@ def joint_selectivity_plane(
         bar = fig.colorbar(scalar, ax=ax, pad=0.025)
         bar.set_label("Layer")
         bar.set_ticks(np.arange(coordinates.raw_semantic.shape[0]))
+        if equivalence_half_width is not None:
+            ax.legend(frameon=False, fontsize=theme.tick_size, loc="upper left")
     return fig, ax
+
+
+def selectivity_regime_diagnostics(
+    data: HeadPlotData,
+    diagnostics: Mapping[str, Any],
+    families: Mapping[str, Sequence[tuple[int, int]]],
+    *,
+    theme: FigureTheme = FigureTheme(),
+):
+    """Discovery-only evidence for resolved tails versus generalist/entangled heads."""
+
+    import matplotlib.pyplot as plt
+
+    coordinates = data.coordinates
+    D = np.asarray(coordinates.selectivity)
+    active = np.asarray(coordinates.active, dtype=bool)
+    active_items = [
+        (layer, head)
+        for layer in range(D.shape[0])
+        for head in range(D.shape[1])
+        if active[layer, head] and np.isfinite(D[layer, head])
+    ]
+    ordered = sorted(active_items, key=lambda item: (D[item], item))
+    positions = np.arange(len(ordered))
+    values = np.asarray([D[item] for item in ordered])
+    if data.selectivity_interval is not None:
+        interval_low = np.asarray(data.selectivity_interval[0])
+        interval_high = np.asarray(data.selectivity_interval[1])
+        low = np.asarray([interval_low[item] for item in ordered])
+        high = np.asarray([interval_high[item] for item in ordered])
+    else:
+        low, high = values.copy(), values.copy()
+    family_sets = {
+        name: {tuple(value) for value in members}
+        for name, members in families.items()
+    }
+
+    def point_style(item):
+        if item in family_sets.get("semantic_leaning", set()):
+            return theme.semantic_color, "o"
+        if item in family_sets.get("structural_leaning", set()):
+            return theme.structural_color, "s"
+        if item in family_sets.get("central_responsive", set()):
+            return theme.central_color, "^"
+        return "#444444", "."
+
+    margin = float(diagnostics["equivalence_half_width"])
+    membership = diagnostics.get("membership", {})
+    classification = diagnostics.get("classification_fraction", {})
+    with publication_style(theme):
+        fig, axes = plt.subplots(
+            1,
+            3,
+            figsize=(theme.width * 2.35, theme.height),
+            constrained_layout=True,
+            gridspec_kw={"width_ratios": (1.5, 1.0, 1.0)},
+        )
+        ax = axes[0]
+        ax.axhspan(
+            -margin,
+            margin,
+            color=theme.central_color,
+            alpha=0.12,
+            linewidth=0,
+        )
+        if len(positions):
+            ax.vlines(
+                positions,
+                low,
+                high,
+                color="#777777",
+                linewidth=0.65,
+                alpha=0.45,
+            )
+            for position, item, value in zip(positions, ordered, values):
+                color, marker = point_style(item)
+                ax.scatter(
+                    position,
+                    value,
+                    color=color,
+                    marker=marker,
+                    s=theme.marker_size * 0.65,
+                    edgecolor="white",
+                    linewidth=0.35,
+                    zorder=2,
+                )
+        ax.axhline(0, color="#777777", linestyle="--", linewidth=0.8)
+        ax.set_xlabel("Active heads ordered by selectivity")
+        ax.set_ylabel(r"Selectivity $D_{rel}$")
+        ax.set_title("Distribution and 95% intervals")
+        ax.set_xticks([])
+        ax.grid(alpha=theme.grid_alpha, linewidth=0.5, axis="y")
+
+        names = [
+            name
+            for name in (
+                "semantic_leaning",
+                "structural_leaning",
+                "central_responsive",
+            )
+            if name in membership
+        ]
+        y = np.arange(len(names))
+        means = np.asarray([membership[name]["mean_jaccard"] for name in names])
+        lows = np.asarray([membership[name]["jaccard_low"] for name in names])
+        highs = np.asarray([membership[name]["jaccard_high"] for name in names])
+        colors = [
+            (
+                theme.semantic_color
+                if name == "semantic_leaning"
+                else theme.structural_color
+                if name == "structural_leaning"
+                else theme.central_color
+            )
+            for name in names
+        ]
+        for position, mean, lower, upper, color in zip(
+            y, means, lows, highs, colors
+        ):
+            axes[1].errorbar(
+                mean,
+                position,
+                xerr=np.asarray([[mean - lower], [upper - mean]]),
+                fmt="none",
+                ecolor=color,
+                elinewidth=theme.line_width,
+                capsize=3,
+            )
+        axes[1].scatter(means, y, c=colors, s=theme.marker_size, zorder=2)
+        axes[1].axvline(
+            float(diagnostics["interpretation"]["membership_stability_floor"]),
+            color="#777777",
+            linestyle="--",
+            linewidth=0.8,
+        )
+        axes[1].set_xlim(0, 1.02)
+        axes[1].set_yticks(y, [target_label(name) for name in names])
+        axes[1].invert_yaxis()
+        axes[1].set_xlabel("Jaccard with frozen family")
+        axes[1].set_title("Bootstrap membership stability")
+        axes[1].grid(alpha=theme.grid_alpha, linewidth=0.5, axis="x")
+
+        category_order = (
+            "equivalent",
+            "semantic_selective",
+            "structural_selective",
+            "unresolved",
+        )
+        category_labels = (
+            "equivalent",
+            "semantic",
+            "structural",
+            "unresolved",
+        )
+        category_colors = (
+            theme.central_color,
+            theme.semantic_color,
+            theme.structural_color,
+            theme.inactive_color,
+        )
+        fractions = [float(classification.get(name, 0.0)) for name in category_order]
+        axes[2].bar(
+            np.arange(len(category_order)),
+            fractions,
+            color=category_colors,
+            width=0.75,
+        )
+        axes[2].axhline(
+            float(diagnostics["interpretation"]["generalist_fraction_floor"]),
+            color="#777777",
+            linestyle="--",
+            linewidth=0.8,
+        )
+        axes[2].set_ylim(0, 1)
+        axes[2].set_xticks(
+            np.arange(len(category_order)),
+            category_labels,
+            rotation=30,
+            ha="right",
+        )
+        axes[2].set_ylabel("Fraction of active heads")
+        axes[2].set_title("Interval-containment decisions")
+        axes[2].grid(alpha=theme.grid_alpha, linewidth=0.5, axis="y")
+        status = diagnostics.get("interpretation", {}).get("status", "unresolved")
+        fig.suptitle(f"Discovery specialisation regime: {status.replace('_', ' ')}")
+    return fig, axes
+
+
+def causal_regime_summary(
+    evidence: Mapping[str, Any],
+    *,
+    theme: FigureTheme = FigureTheme(),
+):
+    """Activity, family-equivalence, and high-J central evidence in one regime summary."""
+
+    import matplotlib.pyplot as plt
+
+    interaction_labels = {
+        "gross_family_by_channel": "Gross response",
+        "necessity_family_by_channel": "Donor-wise necessity",
+        "rescue_family_by_channel": "Causal rescue",
+        "induction_family_by_channel": "Causal induction",
+    }
+    interaction = evidence.get("family_interactions", {})
+    activity = evidence.get("activity_validation", {})
+    core = evidence.get("central_generalist_core", {})
+    with publication_style(theme):
+        fig, axes = plt.subplots(
+            1,
+            3,
+            figsize=(theme.width * 2.65, theme.height),
+            constrained_layout=True,
+        )
+        activity_labels = {
+            "J_vs_clean_prediction_movement": "Clean necessity",
+            "J_vs_gross_total": "Gross response",
+            "J_vs_necessity_total": "Donor-wise necessity",
+        }
+        activity_names = [name for name in activity_labels if name in activity]
+        if activity_names:
+            y = np.arange(len(activity_names))
+            estimates = np.asarray(
+                [activity[name]["estimate"] for name in activity_names]
+            )
+            lows = np.asarray([activity[name]["low"] for name in activity_names])
+            highs = np.asarray([activity[name]["high"] for name in activity_names])
+            floor = float(
+                activity[activity_names[0]]["importance_correlation_floor"]
+            )
+            axes[0].axvspan(
+                floor,
+                1.0,
+                color=theme.functional_color,
+                alpha=0.08,
+                linewidth=0,
+            )
+            axes[0].axvline(
+                floor,
+                color=theme.functional_color,
+                linestyle=":",
+                linewidth=0.8,
+            )
+            axes[0].errorbar(
+                estimates,
+                y,
+                xerr=np.vstack((estimates - lows, highs - estimates)),
+                fmt="o",
+                color=theme.functional_color,
+                ecolor=theme.functional_color,
+                capsize=3,
+                markersize=4.5,
+            )
+            axes[0].set_yticks(
+                y, [activity_labels[name] for name in activity_names]
+            )
+            axes[0].invert_yaxis()
+        else:
+            axes[0].text(
+                0.5,
+                0.5,
+                "J validation not estimable",
+                ha="center",
+                va="center",
+                transform=axes[0].transAxes,
+            )
+        axes[0].axvline(0, color="#777777", linestyle="--", linewidth=0.8)
+        axes[0].set_xlim(-1.0, 1.0)
+        axes[0].set_xlabel(r"Spearman $\rho$ with joint sensitivity $J$")
+        axes[0].set_title("Active heads predict importance")
+        axes[0].grid(alpha=theme.grid_alpha, linewidth=0.5, axis="x")
+
+        names = [name for name in interaction_labels if name in interaction]
+        if names:
+            y = np.arange(len(names))
+            estimates = np.asarray([interaction[name]["estimate"] for name in names])
+            lows = np.asarray([interaction[name]["low"] for name in names])
+            highs = np.asarray([interaction[name]["high"] for name in names])
+            margin = float(interaction[names[0]]["equivalence_half_width"])
+            axes[1].axvspan(
+                -margin,
+                margin,
+                color=theme.central_color,
+                alpha=0.12,
+                linewidth=0,
+            )
+            axes[1].errorbar(
+                estimates,
+                y,
+                xerr=np.vstack((estimates - lows, highs - estimates)),
+                fmt="o",
+                color="#333333",
+                ecolor="#555555",
+                capsize=3,
+                markersize=4.5,
+            )
+            axes[1].set_yticks(y, [interaction_labels[name] for name in names])
+            axes[1].invert_yaxis()
+        else:
+            axes[1].text(
+                0.5,
+                0.5,
+                "Family interactions not estimable",
+                ha="center",
+                va="center",
+                transform=axes[1].transAxes,
+            )
+        axes[1].axvline(0, color="#777777", linestyle="--", linewidth=0.8)
+        axes[1].set_xlabel("Reference-scaled family-by-channel interaction")
+        axes[1].set_title("Selective-family equivalence")
+        axes[1].grid(alpha=theme.grid_alpha, linewidth=0.5, axis="x")
+
+        endpoint_order = (
+            "gross_response",
+            "donor_wise_necessity",
+            "causal_rescue",
+            "causal_induction",
+        )
+        endpoint_labels = ("Gross", "Necessity", "Rescue", "Induction")
+        endpoints = [name for name in endpoint_order if name in core]
+        x = np.arange(len(endpoints))
+        for channel, color, offset, marker in (
+            ("semantic", theme.semantic_color, -0.08, "o"),
+            ("structural", theme.structural_color, 0.08, "s"),
+        ):
+            records = [core[name]["channels"][channel] for name in endpoints]
+            estimates = np.asarray([record["estimate"] for record in records])
+            lows = np.asarray([record["low"] for record in records])
+            highs = np.asarray([record["high"] for record in records])
+            axes[2].errorbar(
+                x + offset,
+                estimates,
+                yerr=np.vstack((estimates - lows, highs - estimates)),
+                color=color,
+                marker=marker,
+                linestyle="none",
+                capsize=3,
+                label=f"{channel.capitalize()} donor-swap",
+            )
+        if endpoints:
+            floor = float(core[endpoints[0]]["response_floor"])
+            axes[2].axhline(
+                floor,
+                color="#777777",
+                linestyle=":",
+                linewidth=0.8,
+                label="preregistered response floor",
+            )
+        axes[2].axhline(0, color="#777777", linewidth=0.8)
+        axes[2].set_xticks(
+            x,
+            [
+                endpoint_labels[endpoint_order.index(name)]
+                for name in endpoints
+            ],
+            rotation=20,
+            ha="right",
+        )
+        axes[2].set_ylabel("Reference-scaled effect")
+        axes[2].set_title("High-J central family across both channels")
+        axes[2].grid(alpha=theme.grid_alpha, linewidth=0.5, axis="y")
+        axes[2].legend(frameon=False, fontsize=theme.tick_size)
+        regime = evidence.get("regime", "mixed_or_unresolved")
+        fig.suptitle(f"Causal regime: {str(regime).replace('_', ' ')}")
+    return fig, axes
 
 
 def distance_heatmaps(
@@ -718,7 +1110,13 @@ def target_label(name: str) -> str:
     text = text.removesuffix("_control")
     for kind in ("central", "inactive", "random"):
         text = text.replace(f"_{kind}", f" / {kind}")
-    return text.replace("_", " ")
+    labels = {
+        "semantic_leaning": "semantic-leaning (relative tail)",
+        "structural_leaning": "structural-leaning (relative tail)",
+        "central_responsive": "high-J central",
+        "inactive": "inactive",
+    }
+    return labels.get(text, text.replace("_", " "))
 
 
 def causal_family_panels(
@@ -814,6 +1212,89 @@ def cumulative_prefix_curves(
     """
 
     import matplotlib.pyplot as plt
+
+    first = next(iter(curves.values()), {})
+    if "gross_total" in first:
+        panels = (
+            ("gross_total", "Total gross response"),
+            ("gross_contrast", "Gross channel contrast"),
+            ("necessity_total", "Total donor-wise necessity"),
+            ("necessity_contrast", "Necessity channel contrast"),
+        )
+        with publication_style(theme):
+            fig, axes = plt.subplots(
+                2,
+                2,
+                figsize=(theme.width * 1.8, theme.height * 1.65),
+                constrained_layout=True,
+                squeeze=False,
+            )
+            for ax, (endpoint, title) in zip(axes.reshape(-1), panels):
+                is_contrast = endpoint.endswith("contrast")
+                for family, record in curves.items():
+                    x = np.asarray(record["prefix"])
+                    endpoint_record = record[endpoint]
+                    values = np.asarray(endpoint_record["estimate"])
+                    low, high = endpoint_record["interval"]
+                    style = family_style(family, theme)
+                    ax.plot(
+                        x,
+                        values,
+                        linewidth=theme.line_width,
+                        label=target_label(family),
+                        **style,
+                    )
+                    ax.fill_between(
+                        x,
+                        np.asarray(low),
+                        np.asarray(high),
+                        color=style["color"],
+                        alpha=0.12,
+                        linewidth=0,
+                    )
+                    control = endpoint_record.get("control")
+                    if control is not None:
+                        ax.plot(
+                            x,
+                            np.asarray(control),
+                            color=style["color"],
+                            marker=style["marker"],
+                            markersize=3.0,
+                            markerfacecolor="white",
+                            linestyle=":",
+                            linewidth=theme.line_width * 0.8,
+                            alpha=0.75,
+                            label=f"{target_label(family)} matched control",
+                        )
+                    if is_contrast:
+                        margin = float(record["equivalence_half_width"])
+                        ax.axhspan(
+                            -margin,
+                            margin,
+                            color=theme.central_color,
+                            alpha=0.08,
+                            linewidth=0,
+                        )
+                ax.axhline(0, color="#777777", linewidth=0.8)
+                ax.set_xlabel("Cumulative frozen-family prefix size")
+                ax.set_ylabel("Reference-scaled effect")
+                ax.set_title(title)
+                ax.grid(alpha=theme.grid_alpha, linewidth=0.5)
+            handles, entries = axes[0, 0].get_legend_handles_labels()
+            fig.legend(
+                handles,
+                entries,
+                frameon=False,
+                fontsize=theme.tick_size - 1,
+                loc="upper center",
+                bbox_to_anchor=(0.5, 0.0),
+                ncol=2,
+            )
+            fig.suptitle(
+                "Cumulative activity and channel selectivity "
+                "(shading on contrast panels is the equivalence region)"
+            )
+        return fig, axes
 
     with publication_style(theme):
         fig, axes = plt.subplots(

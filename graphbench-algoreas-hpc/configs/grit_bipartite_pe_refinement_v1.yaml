@@ -59,6 +59,7 @@ execution:
   progress_heartbeat_seconds: 30
   gpu_job_time: "06:00:00"
   cpu_finalizer_time: "06:00:00"
+  cpu_finalizer_cpus: 1
 cache:
   atomic_graph_shards: true
   shared_clean_jacobians: true

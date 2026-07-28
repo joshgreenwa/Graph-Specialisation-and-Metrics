@@ -2,7 +2,7 @@
 #SBATCH --job-name=gb-pe-finalize
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=16
+#SBATCH --cpus-per-task=1
 #SBATCH --mem=64G
 #SBATCH --time=06:00:00
 #SBATCH --output=logs/%x-%j.out
@@ -29,8 +29,8 @@ if [[ -n "${ENV_ACTIVATE:-}" ]]; then
   source "${ENV_ACTIVATE}"
 fi
 export PYTHONPATH="${PROJECT_ROOT}/src:${PYTHONPATH:-}"
-export OMP_NUM_THREADS="${OMP_NUM_THREADS:-16}"
-export MKL_NUM_THREADS="${MKL_NUM_THREADS:-16}"
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-${SLURM_CPUS_PER_TASK:-1}}"
+export MKL_NUM_THREADS="${MKL_NUM_THREADS:-${SLURM_CPUS_PER_TASK:-1}}"
 
 python graphbench-algoreas-hpc/bin/grit_pe_refinement.py finalize \
   --split "${FINALIZE_SPLIT}" \

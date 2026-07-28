@@ -41,6 +41,10 @@ class Interval:
     # Draws in which each cell was estimable; below `replicates` means some replicate had no
     # support there. None for intervals recorded before this was tracked.
     estimable_draws: np.ndarray | None = None
+    # Opt-in transient bootstrap distribution.  Production caches strip this after computing
+    # rank/family-stability diagnostics; retaining every draw in every interval would needlessly
+    # inflate the cache.
+    draws: np.ndarray | None = None
 
 
 def _choice(keys: Sequence[Any], rng: np.random.Generator, resample: bool) -> list[Any]:
@@ -115,6 +119,7 @@ def nested_percentile_interval(
     *,
     graph_reduce: Callable[[np.ndarray], np.ndarray] | None = None,
     transform: Callable[[np.ndarray], np.ndarray] | None = None,
+    retain_draws: bool = False,
 ) -> Interval:
     """Run the complete seed->graph->source->donor bootstrap hierarchy."""
 
@@ -153,6 +158,7 @@ def nested_percentile_interval(
         rng_seed=int(policy.rng_seed),
         resampled_levels=tuple(levels),
         estimable_draws=estimable,
+        draws=draws if retain_draws else None,
     )
 
 
@@ -163,6 +169,7 @@ def paired_channel_percentile_interval(
     *,
     transform: Callable[[np.ndarray], np.ndarray],
     resample_source: tuple[bool, bool] = (True, True),
+    retain_draws: bool = False,
 ) -> Interval:
     """Graph-paired bootstrap for channels with different source domains.
 
@@ -260,6 +267,7 @@ def paired_channel_percentile_interval(
         rng_seed=int(policy.rng_seed),
         resampled_levels=tuple(levels),
         estimable_draws=estimable,
+        draws=draws if retain_draws else None,
     )
 
 

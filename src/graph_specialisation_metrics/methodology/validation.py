@@ -99,6 +99,28 @@ def _aggregate(records: Sequence[Mapping[str, Any]], key: str) -> float:
     return float(np.mean(graph_values))
 
 
+def equivalence_decision(
+    estimate: float,
+    low: float,
+    high: float,
+    *,
+    half_width: float,
+) -> str:
+    """Classify an interval against a preregistered practical-equivalence region."""
+
+    values = np.asarray((estimate, low, high), dtype=np.float64)
+    if not np.isfinite(values).all():
+        return "not_estimable"
+    margin = float(half_width)
+    if float(low) >= -margin and float(high) <= margin:
+        return "equivalent"
+    if float(low) > margin:
+        return "specialised"
+    if float(high) < -margin:
+        return "reversed"
+    return "unresolved"
+
+
 def _mismatch_indices(records: Sequence[Any]) -> tuple[list[int], set[int]]:
     """Prefer another donor event for the same source.
 
@@ -541,6 +563,12 @@ def _causal_events(
                 )
                 gross_adjusted = mismatch_adjusted_gross(matched, mismatched)
                 aligned_adjusted = mismatch_adjusted_aligned(matched, mismatched)
+                restoration_aligned_adjusted = (
+                    matched.restoration_aligned - mismatched.restoration_aligned
+                )
+                injection_aligned_adjusted = (
+                    matched.injection_aligned - mismatched.injection_aligned
+                )
                 target_rows: list[dict[str, Any]] = []
                 for position, record in enumerate(records):
                     if position in uncontrolled:
@@ -570,6 +598,12 @@ def _causal_events(
                             "I_gross": float(matched.injection_gross[position]),
                             "R_align": float(matched.restoration_aligned[position]),
                             "I_align": float(matched.injection_aligned[position]),
+                            "R_align_adjusted": float(
+                                restoration_aligned_adjusted[position]
+                            ),
+                            "I_align_adjusted": float(
+                                injection_aligned_adjusted[position]
+                            ),
                             "M_align": float(aligned_adjusted[position]),
                             "necessity": float(
                                 necessity["aligned_necessity"][position]
@@ -637,6 +671,8 @@ def _summarize_causal(
                     "I_gross",
                     "R_align",
                     "I_align",
+                    "R_align_adjusted",
+                    "I_align_adjusted",
                     "necessity",
                     "gross_necessity",
                 )
@@ -692,16 +728,36 @@ def _summarize_causal(
             )
             for channel in CHANNELS
         }
+        calibrated = calibrated_targets(
+            summary[target]["semantic"]["G_c"],
+            summary[target]["structural"]["G_c"],
+            summary[target]["semantic"]["necessity"],
+            summary[target]["structural"]["necessity"],
+            gross_scales=target_gross_scales,
+            necessity_scales=target_necessity_scales,
+        )
+        calibrated.update(
+            {
+                "rescue_semantic": (
+                    summary[target]["semantic"]["R_align_adjusted"]
+                    / target_gross_scales["semantic"]
+                ),
+                "rescue_structural": (
+                    summary[target]["structural"]["R_align_adjusted"]
+                    / target_gross_scales["structural"]
+                ),
+                "induction_semantic": (
+                    summary[target]["semantic"]["I_align_adjusted"]
+                    / target_gross_scales["semantic"]
+                ),
+                "induction_structural": (
+                    summary[target]["structural"]["I_align_adjusted"]
+                    / target_gross_scales["structural"]
+                ),
+            }
+        )
         summary[target]["calibrated"] = {
-            key: float(value)
-            for key, value in calibrated_targets(
-                summary[target]["semantic"]["G_c"],
-                summary[target]["structural"]["G_c"],
-                summary[target]["semantic"]["necessity"],
-                summary[target]["structural"]["necessity"],
-                gross_scales=target_gross_scales,
-                necessity_scales=target_necessity_scales,
-            ).items()
+            key: float(value) for key, value in calibrated.items()
         }
         summary[target]["calibration_reference"] = {
             "targets": reference_names,
@@ -720,8 +776,24 @@ def _summarize_causal(
         "I_gross",
         "R_align",
         "I_align",
+        "R_align_adjusted",
+        "I_align_adjusted",
         "necessity",
         "gross_necessity",
+    )
+    calibrated_order = (
+        "gross_total_for_J",
+        "gross_contrast_for_D_rel",
+        "necessity_total_for_J",
+        "necessity_contrast_for_D_rel",
+        "g_semantic",
+        "g_structural",
+        "n_semantic",
+        "n_structural",
+        "rescue_semantic",
+        "rescue_structural",
+        "induction_semantic",
+        "induction_structural",
     )
     head_positions = [
         position for position, name in enumerate(target_order) if name.startswith("head_")
@@ -746,6 +818,47 @@ def _summarize_causal(
         if paired_channel_sources
         else []
     )
+    semantic_family = "family_semantic_leaning"
+    structural_family = "family_structural_leaning"
+    interaction_order = (
+        (
+            "gross_family_by_channel",
+            "necessity_family_by_channel",
+            "rescue_family_by_channel",
+            "induction_family_by_channel",
+        )
+        if semantic_family in target_order and structural_family in target_order
+        else ()
+    )
+
+    def family_interaction_values(calibrated: np.ndarray) -> np.ndarray:
+        if not interaction_order:
+            return np.empty(0, dtype=np.float64)
+        semantic_position = target_order.index(semantic_family)
+        structural_position = target_order.index(structural_family)
+
+        def difference(column: str) -> float:
+            index = calibrated_order.index(column)
+            return float(
+                calibrated[semantic_position, index]
+                - calibrated[structural_position, index]
+            )
+
+        return np.asarray(
+            (
+                difference("gross_contrast_for_D_rel"),
+                difference("necessity_contrast_for_D_rel"),
+                (
+                    difference("rescue_semantic")
+                    - difference("rescue_structural")
+                ),
+                (
+                    difference("induction_semantic")
+                    - difference("induction_structural")
+                ),
+            ),
+            dtype=np.float64,
+        )
 
     def transform(value):
         # Recompute positive unadjusted reference scales in every bootstrap draw.
@@ -804,22 +917,56 @@ def _summarize_causal(
                 # Non-estimable scales become nan rather than exploding the ratio.
                 a_g = np.where(a_g > config.numerical.effect_floor, a_g, np.nan)
                 a_n = np.where(a_n > config.numerical.effect_floor, a_n, np.nan)
+            g_sem = G[0, target_index] / a_g[0]
+            g_str = G[1, target_index] / a_g[1]
+            n_sem = N[0, target_index] / a_n[0]
+            n_str = N[1, target_index] / a_n[1]
+            rescue_sem = (
+                value[
+                    0,
+                    target_index,
+                    endpoint_order.index("R_align_adjusted"),
+                ]
+                / a_g[0]
+            )
+            rescue_str = (
+                value[
+                    1,
+                    target_index,
+                    endpoint_order.index("R_align_adjusted"),
+                ]
+                / a_g[1]
+            )
+            induction_sem = (
+                value[
+                    0,
+                    target_index,
+                    endpoint_order.index("I_align_adjusted"),
+                ]
+                / a_g[0]
+            )
+            induction_str = (
+                value[
+                    1,
+                    target_index,
+                    endpoint_order.index("I_align_adjusted"),
+                ]
+                / a_g[1]
+            )
             calibrated_rows.append(
                 (
-                    0.5
-                    * (
-                        G[0, target_index] / a_g[0]
-                        + G[1, target_index] / a_g[1]
-                    ),
-                    G[0, target_index] / a_g[0]
-                    - G[1, target_index] / a_g[1],
-                    0.5
-                    * (
-                        N[0, target_index] / a_n[0]
-                        + N[1, target_index] / a_n[1]
-                    ),
-                    N[0, target_index] / a_n[0]
-                    - N[1, target_index] / a_n[1],
+                    0.5 * (g_sem + g_str),
+                    g_sem - g_str,
+                    0.5 * (n_sem + n_str),
+                    n_sem - n_str,
+                    g_sem,
+                    g_str,
+                    n_sem,
+                    n_str,
+                    rescue_sem,
+                    rescue_str,
+                    induction_sem,
+                    induction_str,
                 )
             )
         calibrated = np.asarray(calibrated_rows)
@@ -837,7 +984,12 @@ def _summarize_causal(
             )
         )
         return np.concatenate(
-            (value.reshape(-1), calibrated.reshape(-1), associations)
+            (
+                value.reshape(-1),
+                calibrated.reshape(-1),
+                family_interaction_values(calibrated),
+                associations,
+            )
         )
 
     if complete:
@@ -901,12 +1053,8 @@ def _summarize_causal(
             "target_order": target_order,
             "channel_order": CHANNELS,
             "endpoint_order": endpoint_order,
-            "calibrated_order": (
-                "gross_total_for_J",
-                "gross_contrast_for_D_rel",
-                "necessity_total_for_J",
-                "necessity_contrast_for_D_rel",
-            ),
+            "calibrated_order": calibrated_order,
+            "interaction_order": interaction_order,
             "association_order": (
                 "J_vs_gross_total",
                 "D_rel_vs_gross_contrast_active",
@@ -1160,42 +1308,196 @@ def run_causal_validation(
             -association_count:
         ]
     target_summary = summary["targets"]
-    sem_name = "family_semantic_leaning"
-    str_name = "family_structural_leaning"
-    family_interactions = {}
-    if sem_name in target_summary and str_name in target_summary:
-        semantic_focus = (
-            target_summary[sem_name]["calibrated"]["g_semantic"]
-            - target_summary[sem_name]["calibrated"]["g_structural"]
+    interval_metadata = summary["intervals"]
+    target_order = list(interval_metadata["target_order"])
+    calibrated_order = list(interval_metadata["calibrated_order"])
+    endpoint_order = list(interval_metadata["endpoint_order"])
+    raw_size = len(CHANNELS) * len(target_order) * len(endpoint_order)
+    calibrated_size = len(target_order) * len(calibrated_order)
+    interaction_start = raw_size + calibrated_size
+    interaction_order = list(interval_metadata.get("interaction_order", ()))
+    margin = float(config.families.causal_equivalence_half_width)
+    family_interactions: dict[str, Any] = {}
+    if causal_interval is not None:
+        for position, name in enumerate(interaction_order):
+            index = interaction_start + position
+            estimate = float(causal_interval.estimate[index])
+            low = float(causal_interval.low[index])
+            high = float(causal_interval.high[index])
+            family_interactions[name] = {
+                "estimate": estimate,
+                "low": low,
+                "high": high,
+                "equivalence_half_width": margin,
+                "decision": equivalence_decision(
+                    estimate, low, high, half_width=margin
+                ),
+            }
+
+    core_name = "family_central_responsive"
+    core_profile: dict[str, Any] = {}
+    response_floor = float(config.families.causal_response_floor)
+    if core_name in target_summary:
+        target_position = target_order.index(core_name)
+        profile_columns = {
+            "gross_response": ("g_semantic", "g_structural"),
+            "donor_wise_necessity": ("n_semantic", "n_structural"),
+            "causal_rescue": ("rescue_semantic", "rescue_structural"),
+            "causal_induction": ("induction_semantic", "induction_structural"),
+        }
+        for endpoint, channel_columns in profile_columns.items():
+            channel_records = {}
+            for channel, column in zip(CHANNELS, channel_columns):
+                value = float(target_summary[core_name]["calibrated"][column])
+                column_position = calibrated_order.index(column)
+                flat_position = (
+                    raw_size
+                    + target_position * len(calibrated_order)
+                    + column_position
+                )
+                channel_records[channel] = {
+                    "estimate": value,
+                    "low": (
+                        float(causal_interval.low[flat_position])
+                        if causal_interval is not None
+                        else np.nan
+                    ),
+                    "high": (
+                        float(causal_interval.high[flat_position])
+                        if causal_interval is not None
+                        else np.nan
+                    ),
+                }
+            core_profile[endpoint] = {
+                "channels": channel_records,
+                "response_floor": response_floor,
+                "dual_channel": bool(
+                    all(
+                        np.isfinite(record["low"])
+                        and record["low"] > response_floor
+                        for record in channel_records.values()
+                    )
+                ),
+            }
+
+    importance_floor = float(config.families.importance_correlation_floor)
+    activity_validation: dict[str, Any] = {}
+    clean_interval_metadata = clean.get("_intervals", {})
+    clean_association_interval = clean_interval_metadata.get("association_interval")
+    causal_association_order = list(
+        associations.get("nested_interval_order", ()) or ()
+    )
+    causal_association_low = associations.get("nested_interval_low")
+    causal_association_high = associations.get("nested_interval_high")
+    for name in (
+        "J_vs_clean_prediction_movement",
+        "J_vs_gross_total",
+        "J_vs_necessity_total",
+    ):
+        pooled = associations.get(name, {}).get("pooled", {})
+        estimate = float(pooled.get("rho", np.nan))
+        if name.startswith("J_vs_clean"):
+            clean_order = list(clean_interval_metadata.get("association_order", ()))
+            if clean_association_interval is not None and name in clean_order:
+                position = clean_order.index(name)
+                low = float(clean_association_interval.low[position])
+                high = float(clean_association_interval.high[position])
+            else:
+                low = high = np.nan
+        elif (
+            causal_association_low is not None
+            and causal_association_high is not None
+            and name in causal_association_order
+        ):
+            position = causal_association_order.index(name)
+            low = float(np.asarray(causal_association_low)[position])
+            high = float(np.asarray(causal_association_high)[position])
+        else:
+            low = high = np.nan
+        decision = (
+            "positive"
+            if np.isfinite(low) and low > importance_floor
+            else "negative"
+            if np.isfinite(high) and high < -importance_floor
+            else "unresolved"
         )
-        structural_focus = (
-            target_summary[str_name]["calibrated"]["g_semantic"]
-            - target_summary[str_name]["calibrated"]["g_structural"]
+        activity_validation[name] = {
+            "estimate": estimate,
+            "low": low,
+            "high": high,
+            "importance_correlation_floor": importance_floor,
+            "decision": decision,
+        }
+    importance_validated = bool(
+        activity_validation
+        and all(
+            record["decision"] == "positive"
+            for record in activity_validation.values()
         )
-        family_interactions["gross_score_validation"] = float(
-            semantic_focus - structural_focus
+    )
+
+    score_diagnostics = scores.get("specialisation_diagnostics", {})
+    discovery_interpretation = score_diagnostics.get("interpretation", {})
+    decisions = [
+        record["decision"] for record in family_interactions.values()
+    ]
+    all_interactions_equivalent = bool(
+        decisions and all(value == "equivalent" for value in decisions)
+    )
+    directional_specialisation = bool(
+        family_interactions.get("gross_family_by_channel", {}).get("decision")
+        == "specialised"
+        and any(
+            family_interactions.get(name, {}).get("decision") == "specialised"
+            for name in (
+                "rescue_family_by_channel",
+                "induction_family_by_channel",
+                "necessity_family_by_channel",
+            )
         )
-        sem_a_g = target_summary[sem_name]["calibration_reference"][
-            "gross_scales"
-        ]
-        str_a_g = target_summary[str_name]["calibration_reference"][
-            "gross_scales"
-        ]
-        sem_aligned = (
-            target_summary[sem_name]["semantic"]["M_align"]
-            / sem_a_g["semantic"]
-            - target_summary[sem_name]["structural"]["M_align"]
-            / sem_a_g["structural"]
-        )
-        str_aligned = (
-            target_summary[str_name]["semantic"]["M_align"]
-            / str_a_g["semantic"]
-            - target_summary[str_name]["structural"]["M_align"]
-            / str_a_g["structural"]
-        )
-        family_interactions["aligned_rescue_induction"] = float(
-            sem_aligned - str_aligned
-        )
+    )
+    central_dual_response = bool(
+        core_profile.get("gross_response", {}).get("dual_channel")
+        and core_profile.get("causal_rescue", {}).get("dual_channel")
+    )
+    entangled_generalist = bool(
+        discovery_interpretation.get("entanglement_compatible")
+        and importance_validated
+        and all_interactions_equivalent
+        and central_dual_response
+    )
+    if directional_specialisation:
+        regime = "confirmed_causal_specialisation"
+    elif entangled_generalist:
+        regime = "confirmed_entangled_generalist"
+    else:
+        regime = "mixed_or_unresolved"
+    regime_evidence = {
+        "regime": regime,
+        "discovery_status": discovery_interpretation.get(
+            "status", "not_available"
+        ),
+        "checks": {
+            "discovery_entanglement_compatible": bool(
+                discovery_interpretation.get("entanglement_compatible", False)
+            ),
+            "J_predicts_clean_and_causal_importance": importance_validated,
+            "all_family_interactions_equivalent": all_interactions_equivalent,
+            "central_family_dual_channel_response_and_rescue": central_dual_response,
+            "directional_specialisation": directional_specialisation,
+        },
+        "family_interactions": family_interactions,
+        "activity_validation": activity_validation,
+        "central_generalist_core": core_profile,
+        "decision_rule": (
+            "specialisation requires a practically positive gross family-by-channel interval "
+            "and at least one practically positive directional/necessity interaction; "
+            "entangled-generalist requires discovery entanglement evidence, practically positive "
+            "J-to-clean/gross/necessity rank correlations, every registered family interaction "
+            "wholly inside its equivalence region, and reference-scaled dual-channel response plus "
+            "rescue by the high-J central family"
+        ),
+    }
     output = {
         "protocol_version": PROTOCOL_VERSION,
         "clean_ablation": clean,
@@ -1207,6 +1509,7 @@ def run_causal_validation(
         "families": scores["families"],
         "matched_controls": scores.get("matched_controls", {}),
         "family_interactions": family_interactions,
+        "regime_evidence": regime_evidence,
     }
     cache.save("causal", "validation", output)
     cache.save_audit("causal_manifest", plan)

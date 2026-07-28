@@ -6,7 +6,13 @@ from typing import Any, Mapping, Sequence
 
 from ..carriage import env
 from ..carriage.env import log
-from .protocol import BootstrapPolicy, ExecutionPolicy, MethodologyConfig, RunSizes
+from .protocol import (
+    BootstrapPolicy,
+    ExecutionPolicy,
+    FamilyPolicy,
+    MethodologyConfig,
+    RunSizes,
+)
 from .runner import run_methodology
 from .tasks import get_task
 
@@ -35,6 +41,7 @@ def run(
     output_dir: str = DEFAULT_DRIVE_OUTPUT,
     checkpoints: Mapping[str, str] | None = None,
     sizes: RunSizes | Mapping[str, Any] | None = None,
+    families: FamilyPolicy | Mapping[str, Any] | None = None,
     execution: ExecutionPolicy | Mapping[str, Any] | None = None,
     task_overrides: Mapping[str, Mapping[str, Any]] | None = None,
     figure_overrides: Mapping[str, Any] | None = None,
@@ -71,6 +78,11 @@ def run(
     else:
         log("[deps] using the current runtime (skip_install=True)")
     run_sizes = sizes if isinstance(sizes, RunSizes) else RunSizes(**dict(sizes or {}))
+    family_policy = (
+        families
+        if isinstance(families, FamilyPolicy)
+        else FamilyPolicy(**dict(families or {}))
+    )
     execution_policy = (
         execution
         if isinstance(execution, ExecutionPolicy)
@@ -93,6 +105,7 @@ def run(
         },
         phases=tuple(str(value) for value in phases),
         sizes=run_sizes,
+        families=family_policy,
         execution=execution_policy,
         bootstrap=bootstrap,
         analysis_seed=int(analysis_seed),

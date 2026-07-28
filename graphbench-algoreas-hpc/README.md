@@ -286,7 +286,7 @@ bash graphbench-algoreas-hpc/bin/submit_grit_pe_refinement.sh
 ```
 
 The submitter repeats both official-backend and path/cache preflights before calling `sbatch`.
-Every GPU array element and the CPU finalizer have a six-hour safety limit. The common array has 12 elements (three reusable
+Every GPU array element and the one-CPU finalizer have a six-hour safety limit. The common array has 12 elements (three reusable
 components by four seeds); the dependent arm array has 16 elements (four interventions by four
 seeds). Production starts at 16 score-event graph groups and 24 independently patched heads per
 causal forward, with automatic OOM backoff and graph-level resume. Confirmation event caches are

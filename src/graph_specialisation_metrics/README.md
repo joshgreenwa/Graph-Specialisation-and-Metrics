@@ -8,7 +8,7 @@ scientific definitions of:
 3. semantic and structural functional carriage using `F_sens`; and
 4. semantic and structural beneficial carriage using signed, donor-wise finite-loss paths.
 
-**Protocol version:** `donor-swap-specialisation-carriage-v3`.
+**Protocol version:** `donor-swap-specialisation-carriage-v4`.
 
 The same two intervention distributions are used throughout. Semantic scoring, semantic
 functional carriage, and semantic beneficial carriage use the same semantic donor-swap.
@@ -867,12 +867,40 @@ inactive:               low J
 These are relative, rank-based families: neither leaning family requires an absolute positive or
 negative `D_rel` value. “Central” is likewise relative and means neither tail; it is called
 balanced only when its interval lies within a predeclared equivalence region around `D_rel=0`.
+The central-responsive family is the highest-`J` subset of a preregistered central pool (the
+nearest 50% of active heads to the active-population `D_rel` median by default), rather than simply
+the heads closest to the median. Thus “central” and “responsive” are both enforced by selection.
 Cutoffs or quantiles, family size, layer restrictions, and cumulative ordering are frozen before
 causal evaluation. Report bootstrap membership/rank stability, and do not choose tail sizes by
 optimizing a held-out endpoint. A leaning family is called
 **specialized** only if its predicted family-by-channel interaction is confirmed on the causal
 split. Otherwise report relative leaning without evidence of causal specialization; it is valid
 for a model to contain no confirmed specialist family.
+
+Every paired nested-bootstrap discovery draw reruns the complete normalization, activity gate, and
+family-freezing rule. Report, at minimum:
+
+```text
+per-head probability of membership in each frozen family
+bootstrap Jaccard overlap with each point-estimate family
+rank stability of D_rel among point-estimate active heads
+the active-head 5th-to-95th percentile D_rel span
+the frozen semantic-tail minus structural-tail D_rel separation
+```
+
+For the preregistered selectivity equivalence region `[-delta_D, +delta_D]`, classify an active
+head as:
+
+```text
+equivalent/generalist:  its complete 95% nested interval is inside [-delta_D, +delta_D]
+semantic-selective:     its complete 95% nested interval is above +delta_D
+structural-selective:   its complete 95% nested interval is below -delta_D
+unresolved:             none of the above
+```
+
+Crossing zero is only unresolved; it is not evidence of equivalence. A narrow active distribution,
+low bootstrap family overlap, or a high equivalent-head fraction is discovery evidence compatible
+with entanglement, not by itself a causal conclusion.
 
 ### 9.2 Ablation: clean necessity and donor-wise role
 
@@ -1090,6 +1118,35 @@ For rescue/induction interpretation, apply the same interaction to `M_align,c/a_
 retaining restoration and injection separately. Significance of one family in isolation, or gross
 movement without aligned movement, is insufficient evidence of specialization.
 
+The v4 regime analysis applies the frozen semantic-minus-structural family contrast to four
+reference-scaled endpoints: gross response, donor-wise necessity, causal rescue, and causal
+induction. The directional rescue and induction interactions use their matched-minus-mismatch
+aligned components; the raw matched directions remain visible in the endpoint figure. Each
+interaction is compared with a separately preregistered causal equivalence region
+`[-delta_C, +delta_C]`. Its complete 95% nested-bootstrap interval determines the outcome:
+
+```text
+inside [-delta_C, +delta_C]  equivalent family-by-channel interaction
+entirely above +delta_C      practically positive specialization interaction
+entirely below -delta_C      reversed interaction
+otherwise                    unresolved
+```
+
+The high-`J` central family is evaluated in both channels after division by the same frozen
+positive channel reference scales. A confirmed **entangled-generalist** regime requires all of:
+
+1. discovery evidence compatible with entanglement;
+2. the 95% intervals for `J` against clean necessity, total gross response, and total donor-wise
+   necessity all above the preregistered importance-correlation floor;
+3. every registered leaning-family causal interaction equivalent by interval containment; and
+4. the central-responsive family above the preregistered response floor for both channels in gross
+   response and causal rescue.
+
+Confirmed causal specialization requires a practically positive gross family-by-channel
+interaction and at least one practically positive rescue, induction, or necessity interaction.
+Everything else is reported as mixed or unresolved. This ternary rule is fixed before causal
+outcomes are inspected; weak evidence is never forced into either headline regime.
+
 Test `J` relationships across all estimable heads. Activity-gate only `D_rel`, family assignment,
 and selectivity claims; active-only `J` results are sensitivity analyses. Use Spearman correlation,
 pooled and within-layer views, a layer-adjusted model, and within-layer permutation. Uncertainty
@@ -1122,11 +1179,14 @@ The paper-facing validation is deliberately compact:
 2. `J` against total gross patch response, donor-wise necessity, and clean ablation, plus `D_rel`
    against the corresponding channel contrasts, with pooled, within-layer, and layer-adjusted
    statistics;
-3. channel-by-family gross restoration/injection patch responses, aligned rescue/induction, and
+3. a regime forest plot placing all leaning-family causal interactions against the preregistered
+   equivalence region, paired with the central-responsive dual-channel profile;
+4. channel-by-family gross restoration/injection patch responses, aligned rescue/induction, and
    donor-wise necessity panels for the frozen leaning, central-responsive, inactive, and
    matched-control families; and
-4. where family effects are distributed, a cumulative frozen-prefix ablation/patching curve as a
-   supplementary diagnostic.
+5. cumulative frozen-prefix total-response and channel-contrast curves where family effects are
+   distributed. Contrast panels show the causal equivalence region so accumulation of importance
+   can be separated from accumulation of channel selectivity.
 
 Error bars or confidence bands are mandatory for aggregate points and curves. Matrices are paired
 with machine-readable cell intervals and a compact interval companion where needed; colour alone
@@ -1297,7 +1357,9 @@ A new task joins this methodology by registering, not forking:
 10. score/carriage graph counts, distance bins, and the 10-graph/50-pair reporting floor;
 11. bootstrap RNG seed and which levels are resampled or fixed under the 2,000-replicate percentile
     rule;
-12. activity floor, leaning-family quantiles, family sizes, and equivalence region around zero;
+12. activity floor, leaning-family quantiles, central-pool and family sizes, selectivity and causal
+    equivalence regions, membership-stability/generalist-fraction floors, the importance-
+    correlation floor, and the dual-channel response floor;
 13. disjoint discovery, causal-event, and clean-ablation base splits plus the separately disjoint
     reusable semantic donor pool;
 14. patch mismatch controls, causal effect floor, causal reference populations, and task-specific
