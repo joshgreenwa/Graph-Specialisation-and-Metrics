@@ -1,4 +1,4 @@
-"""Publication figures for the additive canonical Graphormer PCQM analysis."""
+"""Publication figures for the Graphormer PCQM analysis."""
 
 from __future__ import annotations
 
@@ -30,7 +30,7 @@ HEAD_STYLES = {
     "structural": {"color": TEAL, "label": "Structural specialist"},
 }
 
-# Stable exact chemistry-focus identities for every pooled A@V PCA. Related
+# Stable exact chemistry-focus identities for every head-output PCA. Related
 # chemistry uses related shades, while every distinct focus retains its own colour.
 # Neutral greys are reserved for uninformative diffuse/rare assignments.
 PCA_FOCUS_COLORS = {
@@ -119,7 +119,7 @@ def plot_score_heatmaps(
     metrics: CanonicalHeadMetrics,
     selected_heads: Mapping[str, Head] | None = None,
     *,
-    title: str = "Official Graphormer PCQM4Mv2",
+    title: str = "Graphormer PCQM4Mv2",
 ):
     """Normalized semantic and structural scores on a shared scale."""
 
@@ -155,7 +155,7 @@ def plot_score_heatmaps(
         norm=norm,
     )
     colorbar = fig.colorbar(semantic, ax=axes, shrink=0.86, pad=0.015)
-    colorbar.set_label("Within-model normalized score")
+    colorbar.set_label("Normalised score")
     fig.suptitle(title, fontsize=18, y=1.04)
     return fig
 
@@ -164,7 +164,7 @@ def plot_coordinate_heatmaps(
     metrics: CanonicalHeadMetrics,
     selected_heads: Mapping[str, Head] | None = None,
     *,
-    title: str = "Official Graphormer PCQM4Mv2",
+    title: str = "Graphormer PCQM4Mv2",
 ):
     """Active-head ``D_rel`` and all-head ``J`` heatmaps."""
 
@@ -305,7 +305,7 @@ def plot_score_plane(
     metrics: CanonicalHeadMetrics,
     selected_heads: Mapping[str, Head] | None = None,
     *,
-    title: str = "Official Graphormer PCQM4Mv2",
+    title: str = "Graphormer PCQM4Mv2",
 ):
     """Normalized score plane without uncertainty bars."""
 
@@ -351,9 +351,9 @@ def plot_selectivity_joint_plane(
     *,
     xlim: tuple[float, float] | None = None,
     active_only: bool = True,
-    title: str = "Official Graphormer PCQM4Mv2",
+    title: str = "Graphormer PCQM4Mv2",
 ):
-    """Canonical ``D_rel`` versus ``J`` with a focused horizontal range."""
+    """``D_rel`` versus ``J`` with a focused horizontal range."""
 
     apply_publication_style()
     x = metrics.selectivity
@@ -723,9 +723,9 @@ def plot_av_pca(
         else _head_label(head)
     )
     ax.set_title(
-        f"Pooled $A@V$ representations — {descriptor}"
+        f"PCA of head output — {descriptor}"
         f"{metric_line}\n"
-        f"{payload['n_used']} PCQM4Mv2 molecules",
+        f"$n = {int(payload['n_used'])}$ PCQM4Mv2 molecules",
         fontsize=15,
     )
     ax.grid(False)
@@ -744,10 +744,10 @@ def plot_hop_attention_mass(
     *,
     title: str | None = None,
 ):
-    """Plot the already-cached canonical clean attention profile."""
+    """Plot the clean attention profile stored in the score cache."""
 
     if metrics.clean_attention_distance is None:
-        raise ValueError("canonical cache has no clean_attention_distance profile")
+        raise ValueError("score cache has no clean_attention_distance profile")
     apply_publication_style()
     layer, index = head
     values = np.asarray(metrics.clean_attention_distance[layer, index])
@@ -849,7 +849,7 @@ def plot_logit_spread(
     ax.set_xlabel("Layer index")
     ax.set_ylabel("Mean key-wise logit standard deviation")
     ax.set_title(
-        f"{title}\n{int(logit_payload['n_used'])} PCQM4Mv2 molecules",
+        f"{title}\n$n = {int(logit_payload['n_used'])}$ PCQM4Mv2 molecules",
         fontsize=15,
     )
     ax.grid(axis="y")
@@ -887,12 +887,14 @@ def plot_selectivity_vs_logit_ratio(
     *,
     active_only: bool = True,
 ):
-    """Canonical ``D_rel`` versus ``log10(std(d)/std(b))``."""
+    """``D_rel`` versus ``log10(std(d)/std(b))``."""
 
     apply_publication_style()
     ratio = -np.asarray(logit_payload["log_r_mean"], dtype=np.float64)
     if ratio.shape != metrics.shape:
-        raise ValueError(f"logit ratio shape {ratio.shape} != canonical {metrics.shape}")
+        raise ValueError(
+            f"logit ratio shape {ratio.shape} != head metric grid {metrics.shape}"
+        )
     selectivity = metrics.selectivity
     finite = np.isfinite(ratio) & np.isfinite(selectivity)
     if active_only:
@@ -917,10 +919,10 @@ def plot_selectivity_vs_logit_ratio(
     ax.axhline(0, color=SLATE, linestyle="--", linewidth=1.0)
     ax.axvline(0, color=SLATE, linestyle="--", linewidth=1.0)
     ax.set_xlabel(r"$\log_{10}\!\left[\mathrm{std}(d)/\mathrm{std}(b)\right]$")
-    ax.set_ylabel(r"Canonical relative selectivity $D_{\rm rel}$")
+    ax.set_ylabel(r"Relative selectivity $D_{\rm rel}$")
     ax.set_title(
         "Relative selectivity versus logit-source balance\n"
-        f"{int(logit_payload['n_used'])} PCQM4Mv2 molecules"
+        f"$n = {int(logit_payload['n_used'])}$ PCQM4Mv2 molecules"
         f"{correlation_label}",
         fontsize=15,
     )

@@ -112,6 +112,7 @@ def test_canonical_adapter_and_active_drel_selection():
     assert metrics.shape == (2, 3)
     assert selected == {"semantic": (1, 2), "structural": (0, 0)}
     assert metrics.distance_axis[-1] == "graph_token"
+    assert get_task("graphormer_pcqm4mv2").title == "Graphormer PCQM4Mv2"
 
 
 def test_structural_selection_can_exclude_an_entire_head_index():
@@ -420,6 +421,7 @@ def test_coordinate_heatmaps_mask_inactive_selectivity():
     metrics = synthetic_metrics()
     figure = plot_coordinate_heatmaps(metrics)
     try:
+        assert figure._suptitle.get_text() == "Graphormer PCQM4Mv2"
         image_axes = [axis for axis in figure.axes if axis.images]
         assert len(image_axes) == 2
         rendered = image_axes[0].images[0].get_array()
@@ -435,6 +437,9 @@ def test_score_heatmaps_and_scatter_restore_viridis():
     heatmaps = plot_score_heatmaps(metrics)
     scatter = plot_score_plane(metrics)
     try:
+        assert heatmaps._suptitle.get_text() == "Graphormer PCQM4Mv2"
+        assert heatmaps.axes[-1].get_ylabel() == "Normalised score"
+        assert scatter.axes[0].get_title() == "Graphormer PCQM4Mv2"
         assert all(
             axis.images[0].get_cmap().name == "viridis"
             for axis in heatmaps.axes
@@ -510,6 +515,9 @@ def test_logit_plot_has_uncertainty_bands_and_ratio_is_inverted():
         expected_x = np.sort(-payload["log_r_mean"][metrics.active])
         assert np.allclose(actual_x, expected_x)
         assert r"\mathrm{std}(d)/\mathrm{std}(b)" in ratio.axes[0].get_xlabel()
+        assert ratio.axes[0].get_ylabel() == (
+            r"Relative selectivity $D_{\rm rel}$"
+        )
     finally:
         plt.close(spread)
         plt.close(ratio)
@@ -607,6 +615,8 @@ def test_av_pca_identifies_role_and_head_metrics():
     )
     try:
         title = figure.axes[0].get_title()
+        assert title.startswith("PCA of head output")
+        assert "Pooled" not in title
         assert "Structural specialist — L7 H14" in title
         assert "D_{\\rm rel} = -0.275" in title
         assert "J = 1.234" in title

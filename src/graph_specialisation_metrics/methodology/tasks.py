@@ -238,7 +238,7 @@ register(
         backend_kind="graphormer",
         spec=GraphormerTaskSpec(
             name="graphormer_pcqm4mv2",
-            title="Official Graphormer PCQM4Mv2",
+            title="Graphormer PCQM4Mv2",
             model_id="clefourrier/graphormer-base-pcqm4mv2",
             revision="refs/pr/4",
             dataset_name="pcqm4mv2",
