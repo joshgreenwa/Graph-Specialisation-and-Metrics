@@ -506,9 +506,11 @@ def plot_attention_grid(
     role: str,
     head: Head,
     per_graph_coordinates: Mapping[int, Mapping[str, float]],
+    net_d_rel: float,
+    net_joint_sensitivity: float,
     title_label: str | None = None,
 ):
-    """Three molecules with graph-local ``D_rel``/``J`` and attention views."""
+    """Attention views with net head and graph-local ``D_rel``/``J``."""
 
     apply_publication_style()
     examples = list(examples_payload["examples"])
@@ -531,7 +533,7 @@ def plot_attention_grid(
     grid = fig.add_gridspec(
         4,
         3,
-        height_ratios=[0.10, 1.0, 1.0, 1.0],
+        height_ratios=[0.15, 1.0, 1.0, 1.0],
         width_ratios=[1.0, 1.08, 1.12],
     )
     title_axis = fig.add_subplot(grid[0, :])
@@ -609,11 +611,21 @@ def plot_attention_grid(
     style = HEAD_STYLES.get(role, {"label": role.title()})
     title_axis.text(
         0.5,
-        0.5,
+        0.76,
         f"{title_label or style['label']} — {_head_label(head)}",
         ha="center",
         va="center",
         fontsize=18,
+        color=NAVY,
+    )
+    title_axis.text(
+        0.5,
+        0.16,
+        rf"Net: $D_{{\rm rel}} = {float(net_d_rel):+.3f};\quad "
+        rf"J = {float(net_joint_sensitivity):.3f}$",
+        ha="center",
+        va="center",
+        fontsize=14,
         color=NAVY,
     )
     colorbar = fig.colorbar(

@@ -479,6 +479,8 @@ def test_attention_grid_uses_rdkit_overlays_without_arrows():
             5: {"D_rel": 0.102, "J": 0.93},
             80: {"D_rel": -0.221, "J": 1.71},
         },
+        net_d_rel=0.4815,
+        net_joint_sensitivity=1.35,
         title_label="Semantic specialist",
     )
     try:
@@ -501,7 +503,8 @@ def test_attention_grid_uses_rdkit_overlays_without_arrows():
         assert matrix_axis.images[0].get_cmap().name == "Blues"
         title = "\n".join(text.get_text() for text in figure.axes[0].texts)
         assert "Semantic specialist — L1 H24" in title
-        assert "D_{\\rm rel}" not in title
+        assert "Net: $D_{\\rm rel} = +0.481" in title
+        assert "J = 1.350" in title
         labels = "\n".join(
             text.get_text()
             for axis in figure.axes
