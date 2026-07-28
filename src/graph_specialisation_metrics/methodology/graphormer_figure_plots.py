@@ -31,6 +31,22 @@ HEAD_STYLES = {
     "structural": {"color": TEAL, "label": "Structural specialist"},
 }
 
+# Stable chemistry-focus identities for every pooled A@V PCA. These reuse the
+# established publication palette while reserving neutral greys for uninformative
+# diffuse/rare assignments and saturated colours for chemically specific focus.
+PCA_FOCUS_COLORS = {
+    "Ring": NAVY,
+    "O": ORANGE,
+    "N": "#009E73",
+    "S": "#CCB000",
+    "P": "#8B6F47",
+    "X": "#56B4E9",
+    "Branch": "#6B8E23",
+    "Charge": GOLD,
+    "other/diffuse": "#B8C2CA",
+    "Other / rare": "#4B5563",
+}
+
 
 def apply_publication_style() -> None:
     plt.rcParams.update(
@@ -631,6 +647,16 @@ def _group_pca_labels(
     return [label if label in retained else "Other / rare" for label in labels]
 
 
+def _pca_focus_color(label: str) -> str:
+    """Return the invariant publication colour for a chemistry-focus label."""
+
+    label = str(label)
+    if label in {"other/diffuse", "Other / rare"}:
+        return PCA_FOCUS_COLORS[label]
+    group = label.split(":", 1)[0]
+    return PCA_FOCUS_COLORS.get(group, SLATE)
+
+
 def plot_av_pca(
     payload: Mapping[str, Any],
     *,
@@ -653,20 +679,10 @@ def plot_av_pca(
     ]
     if "Other / rare" in counts:
         categories.append("Other / rare")
-    palette = [
-        BLUE,
-        ORANGE,
-        "#009E73",
-        "#56B4E9",
-        "#CCB000",
-        "#6B8E23",
-        "#8B6F47",
-        "#4B5563",
-        "#B8C2CA",
-    ]
     fig, ax = plt.subplots(figsize=(8.8, 6.2), constrained_layout=True)
     labels_array = np.asarray(labels)
-    for category, color in zip(categories, palette):
+    for category in categories:
+        color = _pca_focus_color(category)
         mask = labels_array == category
         ax.scatter(
             coordinates[mask, 0],

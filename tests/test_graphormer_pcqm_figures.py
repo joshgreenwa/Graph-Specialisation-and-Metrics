@@ -7,6 +7,7 @@ import matplotlib
 
 matplotlib.use("Agg")
 from matplotlib.collections import PathCollection, PolyCollection
+from matplotlib.colors import to_rgba
 from matplotlib.container import ErrorbarContainer
 from matplotlib.patches import FancyArrowPatch
 import matplotlib.pyplot as plt
@@ -538,6 +539,65 @@ def test_av_pca_identifies_role_and_head_metrics():
         assert "J = 1.234" in title
     finally:
         plt.close(figure)
+
+
+def test_av_pca_focus_palette_is_stable_across_plots():
+    rng = np.random.default_rng(23)
+    labels_a = (
+        ["Ring: aromatic"] * 5
+        + ["O: carbonyl"] * 4
+        + ["N: amide"] * 3
+        + ["other/diffuse"] * 2
+    )
+    labels_b = (
+        ["other/diffuse"] * 5
+        + ["N: amide"] * 4
+        + ["O: carbonyl"] * 3
+        + ["Ring: junction"] * 2
+    )
+
+    def make_figure(labels):
+        return plot_av_pca(
+            {
+                "head": (1, 24),
+                "vectors": rng.normal(size=(len(labels), 8)),
+                "labels": labels,
+                "n_used": len(labels),
+            },
+            minimum_count=1,
+        )
+
+    first = make_figure(labels_a)
+    second = make_figure(labels_b)
+    try:
+        def plotted_colors(figure):
+            return {
+                collection.get_label().split(" (n=", 1)[0]: tuple(
+                    collection.get_facecolors()[0]
+                )
+                for collection in figure.axes[0].collections
+                if collection.get_label() and collection.get_facecolors().size
+            }
+
+        first_colors = plotted_colors(first)
+        second_colors = plotted_colors(second)
+        for label in ("O: carbonyl", "N: amide", "other/diffuse"):
+            assert np.allclose(first_colors[label], second_colors[label])
+        assert np.allclose(
+            first_colors["Ring: aromatic"],
+            second_colors["Ring: junction"],
+        )
+        assert np.allclose(
+            first_colors["other/diffuse"],
+            to_rgba("#B8C2CA", alpha=0.78),
+        )
+        assert not np.allclose(
+            first_colors["Ring: aromatic"],
+            first_colors["other/diffuse"],
+        )
+    finally:
+        plt.close(first)
+        plt.close(second)
 
 
 def test_graphormer_diagnostic_extractor_matches_exact_attention_sites():
