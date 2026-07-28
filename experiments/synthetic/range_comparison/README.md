@@ -257,10 +257,16 @@ loss increase to `3e-5` — the section 6 identity holds.
 `B` is signed, so it cannot go through the expected-distance formula. The reportable objects are
 §7's accumulations, `S_B(b)` and `B_far(r)`.
 
-**Where the task loss is carried.** In distribution, 8% of the signed loss mass sits beyond four
-hops; out of distribution (64–96 nodes, where graph-exact collapses to 0.004) that rises to **26%**,
-and the `8+` bin goes from `0.008` to `0.635`. The model's task-relevant dependence genuinely
-reaches further on the larger graphs it fails on.
+**Where the task loss is carried.** In distribution, `8.1%` of the signed loss mass sits beyond four
+hops; out of distribution (64–96 nodes, where graph-exact collapses to 0.004) that rises to
+**`30.6%`**, and the `8+` bin goes from `0.008` to `1.795`. The model's task-relevant dependence
+genuinely reaches further on the larger graphs it fails on.
+
+These sums are **inverse-probability weighted**, and they have to be. The source cap force-includes
+both marks, which carry roughly 8× the per-source signed mass of an ordinary node — and it bites
+asymmetrically, capping 2/12 graphs in distribution against 12/12 out of it. Unweighted, the same
+run reports `26%` rather than `30.6%` and overstates the mean event loss increase by 44%. AUROC is
+unaffected (only negatives are sampled); the accumulations are not.
 
 **A ground-truth test that did not survive contact.** The intended test was to score each measure
 by how well it ranks the two marked endpoints above ordinary nodes as intervention sources. It

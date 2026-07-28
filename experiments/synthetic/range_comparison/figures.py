@@ -839,12 +839,13 @@ def figure_beneficial() -> Path:
     data = load("beneficial.json")
     splits = ["id", "ood"]
     labels = {
+        "dose_null": "Donor dose (model-free)",
         "functional_raw": "Functional $F_{\\mathrm{sens}}$ (raw)",
         "beneficial": "Beneficial carriage",
         "functional": "Functional (event-norm.)",
         "jacobian": "Jacobian influence",
     }
-    order = ["functional_raw", "beneficial", "functional", "jacobian"]
+    order = ["dose_null", "functional_raw", "beneficial", "functional", "jacobian"]
 
     fig, axes = plt.subplots(1, 3, figsize=(7.2, 2.3))
     fig.subplots_adjust(wspace=0.52)
@@ -872,7 +873,7 @@ def figure_beneficial() -> Path:
     ax.set_xticklabels([labels[key] for key in order], rotation=32, ha="right", fontsize=6.0)
     ax.set_ylabel("AUROC: marks vs ordinary")
     ax.set_ylim(0, 1.05)
-    ax.set_title("Ranking the load-bearing sources", pad=4)
+    ax.set_title("Confounded: a model-free null wins", pad=4)
     ax.legend(frameon=False, fontsize=6.0, handlelength=1.0, borderpad=0.1, loc="upper right")
     ax.grid(axis="y", alpha=0.9)
     ax.set_axisbelow(True)

@@ -10,12 +10,20 @@ change.
 passes through zero.  Section 7 gives the right accumulations instead: ``S_B(b)``, signed loss mass
 per distance bin, and ``B_far(r)``, mass carried beyond radius ``r``.
 
-THE GROUND-TRUTH TEST.  On this task the labels are determined by the two marked endpoints: node
-``v`` is positive iff it lies on the S--T path.  Corrupting a mark destroys information the model
-cannot recover, since there are only two of them; corrupting one ordinary node removes one row of
-positional encoding out of ``n``, which the message-passing branch can largely compensate for
-(the adjacency is never perturbed).  So a faithful measure should rank ``{S, T}`` above ordinary
-nodes as *sources*, and we can score every measure by that ranking with real labels.
+THE GROUND-TRUTH TEST, AND WHY ITS NAIVE FORM FAILS.  Labels are determined by the two marked
+endpoints, and corrupting a mark costs far more than corrupting an ordinary node (+1.92 against
++0.14 in distribution).  That much is solidly established.  But ranking sources by any measure is
+NOT a faithfulness test, because a mark's ``h0`` row sits 6x further from a typical donor row than
+an ordinary node's: **donor dose alone scores AUROC 1.000**, above every measure it would be used
+to score.  The dose null is therefore computed and reported alongside, and the ranking table must
+be read as a dose-monotonicity ordering, not a faithfulness ordering.
+
+Two mechanism notes, both measured rather than assumed: an unmarked donor's token embedding *is*
+``e_0``, so a token-channel swap at an ordinary node is an exact no-op, and essentially all of an
+ordinary node's damage comes through the RWSE channel -- which is load-bearing here, not
+compensated (zeroing it drops ID F1 from 0.946 to 0.560).  This checkpoint uses
+``structural_channel='rwse'``, so ``batch.spd`` is identically zero and RWSE is the only per-node
+positional input.
 
 Run on both splits: in-distribution, where the model is at 0.98 node accuracy and the loss sits
 near its floor, and out-of-distribution, where it collapses and there is real loss headroom.
@@ -171,9 +179,22 @@ def measure_graph(model, example, args, pool, *, graph_id: int, rng) -> dict:
     is_mark[marks] = True
     mark_in_sources = is_mark[sources]
 
+    # Inverse-probability weights.  Marks are force-included and carry ~8x the per-source signed
+    # mass of an ordinary node, so an unweighted sum over the stratified set would inflate every
+    # section 7 accumulation -- and inflate it far more on the OOD split, where every graph is
+    # capped, than on ID, where almost none are.  AUROC is unaffected (only negatives are
+    # sampled); the SUMS are not, so they are weighted back to the full node set.
+    weights = np.ones(len(sources), dtype=np.float64)
+    if len(sources) < nodes:
+        kept_others = int((~mark_in_sources).sum())
+        if kept_others:
+            weights[~mark_in_sources] = (nodes - marks.size) / kept_others
+
     return {
         "nodes": nodes,
         "sources": sources,
+        "source_weights": weights,
+        "capped": bool(len(sources) < nodes),
         "distances": distances,
         "beneficial": beneficial,
         "functional": functional,
@@ -184,6 +205,8 @@ def measure_graph(model, example, args, pool, *, graph_id: int, rng) -> dict:
         "converged_fraction": converged,
         "mean_event_loss_increase": float(event_loss_increase.mean()),
         "auroc": {
+            # The model-free null this table has to beat, and does not.
+            "dose_null": auroc(dose.mean(axis=1), mark_in_sources),
             "beneficial": auroc(beneficial.sum(axis=0), mark_in_sources),
             "functional": auroc(functional.sum(axis=0), mark_in_sources),
             "functional_raw": auroc(functional_raw.sum(axis=0), mark_in_sources),
@@ -201,7 +224,8 @@ def accumulate_by_distance(records: list[dict], field: str, edges: list[int]) ->
         values = record[field]
         for low, high in zip(edges, edges[1:] + [10**9]):
             cells = (d >= low) & (d < high) & np.isfinite(d)
-            per_graph[low].append(float(values[cells].sum()) if cells.any() else 0.0)
+            weighted = values * record["source_weights"][None, :]
+            per_graph[low].append(float(weighted[cells].sum()) if cells.any() else 0.0)
     return {int(k): float(np.mean(v)) for k, v in per_graph.items()}
 
 
@@ -212,7 +236,8 @@ def far_mass(records: list[dict], field: str, radii: list[int]) -> dict:
         for record in records:
             d = record["distances"][:, record["sources"]]
             cells = (d > radius) & np.isfinite(d)
-            values.append(float(record[field][cells].sum()) if cells.any() else 0.0)
+            weighted = record[field] * record["source_weights"][None, :]
+            values.append(float(weighted[cells].sum()) if cells.any() else 0.0)
         out[int(radius)] = float(np.mean(values))
     return out
 
@@ -256,11 +281,12 @@ def run_split(model, args, split: str, min_n: int, max_n: int, pool) -> dict:
         "F_far": far_mass(records, "functional", radii),
         "auroc": {
             key: float(np.mean([r["auroc"][key] for r in records]))
-            for key in ("beneficial", "functional", "functional_raw", "jacobian")
+            for key in ("dose_null", "beneficial", "functional", "functional_raw", "jacobian")
         },
+        "capped_graphs": int(sum(r["capped"] for r in records)),
         "auroc_per_graph": {
             key: [r["auroc"][key] for r in records]
-            for key in ("beneficial", "functional", "functional_raw", "jacobian")
+            for key in ("dose_null", "beneficial", "functional", "functional_raw", "jacobian")
         },
     }
     print(
@@ -270,7 +296,9 @@ def run_split(model, args, split: str, min_n: int, max_n: int, pool) -> dict:
         flush=True,
     )
     print(f"      mean event loss increase = {summary['mean_event_loss_increase']:+.4f}")
-    print("      AUROC for ranking the two marks as sources:")
+    print(f"      capped graphs: {summary['capped_graphs']}/{summary['graphs']} "
+          "(section 7 sums are inverse-probability weighted)")
+    print("      AUROC for ranking the two marks as sources (dose_null is model-free):")
     for key, value in summary["auroc"].items():
         print(f"        {key:>15}: {value:.3f}")
     print("      S_B by distance bin:", {k: round(v, 4) for k, v in summary["S_B"].items()})
