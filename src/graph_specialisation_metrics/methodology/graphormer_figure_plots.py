@@ -524,10 +524,9 @@ def plot_attention_grid(
 
     apply_publication_style()
     examples = list(examples_payload["examples"])
-    if len(examples) != 3:
-        raise ValueError(
-            f"the 3x3 figure requires exactly 3 examples, got {len(examples)}"
-        )
+    if not examples:
+        raise ValueError("the attention grid requires at least one example")
+    num_rows = len(examples)
     matrices = [
         _node_conditioned_attention(example["attention"][role])
         for example in examples
@@ -539,11 +538,14 @@ def plot_attention_grid(
     inbound_max = max(
         max(float(np.nanpercentile(values, 99)), 1e-6) for values in inbound
     )
-    fig = plt.figure(figsize=(13.2, 11.2), constrained_layout=True)
+    fig = plt.figure(
+        figsize=(13.2, 1.45 + 3.25 * num_rows),
+        constrained_layout=True,
+    )
     grid = fig.add_gridspec(
-        4,
+        num_rows + 1,
         3,
-        height_ratios=[0.15, 1.0, 1.0, 1.0],
+        height_ratios=[0.15, *([1.0] * num_rows)],
         width_ratios=[1.0, 1.08, 1.12],
     )
     title_axis = fig.add_subplot(grid[0, :])
@@ -551,7 +553,7 @@ def plot_attention_grid(
     axes = np.asarray(
         [
             [fig.add_subplot(grid[row + 1, column]) for column in range(3)]
-            for row in range(3)
+            for row in range(num_rows)
         ],
         dtype=object,
     )

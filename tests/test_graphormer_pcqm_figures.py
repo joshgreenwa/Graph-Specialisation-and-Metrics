@@ -32,8 +32,10 @@ from graph_specialisation_metrics.methodology.graphormer_figure_data import (
     SupplementalCache,
     load_graphormer_model_record,
     load_graphormer_score_artifact,
+    select_attention_grid_indices,
     select_ranked_heads,
     select_specialist_heads,
+    select_structural_specialist_head,
 )
 from graph_specialisation_metrics.methodology.graphormer_figure_plots import (
     PCA_FOCUS_COLORS,
@@ -110,6 +112,30 @@ def test_canonical_adapter_and_active_drel_selection():
     assert metrics.shape == (2, 3)
     assert selected == {"semantic": (1, 2), "structural": (0, 0)}
     assert metrics.distance_axis[-1] == "graph_token"
+
+
+def test_structural_selection_can_exclude_an_entire_head_index():
+    metrics = synthetic_metrics()
+    primary = select_structural_specialist_head(metrics)
+    alternative = select_structural_specialist_head(
+        metrics,
+        excluded_heads=(primary,),
+        excluded_head_indices=(primary[1],),
+    )
+    assert primary == (0, 0)
+    assert alternative == (0, 1)
+    assert alternative[1] != primary[1]
+
+
+def test_attention_grid_indices_require_enough_rows_and_truncate_extras():
+    assert select_attention_grid_indices(
+        [0, 5, 80, 100, 200, 300],
+        num_rows=5,
+    ) == [0, 5, 80, 100, 200]
+    with pytest.raises(ValueError, match="needs 5 graph indices"):
+        select_attention_grid_indices([0, 5, 80], num_rows=5)
+    with pytest.raises(ValueError, match="must be positive"):
+        select_attention_grid_indices([0], num_rows=0)
 
 
 def test_graphormer_figure_loader_explicitly_accepts_valid_v3_cache(tmp_path):
@@ -451,7 +477,7 @@ def test_logit_plot_has_uncertainty_bands_and_ratio_is_inverted():
         plt.close(ratio)
 
 
-def test_attention_grid_uses_rdkit_overlays_without_arrows():
+def test_attention_grid_supports_five_rows_without_arrows():
     pytest.importorskip("rdkit")
     attention = np.asarray(
         [
@@ -468,7 +494,7 @@ def test_attention_grid_uses_rdkit_overlays_without_arrows():
                 "smiles": "CCO",
                 "attention": {"semantic": attention},
             }
-            for index in (0, 5, 80)
+            for index in (0, 5, 80, 100, 200)
         ]
     }
     figure = plot_attention_grid(
@@ -479,6 +505,8 @@ def test_attention_grid_uses_rdkit_overlays_without_arrows():
             0: {"D_rel": 0.4815, "J": 1.35},
             5: {"D_rel": 0.102, "J": 0.93},
             80: {"D_rel": -0.221, "J": 1.71},
+            100: {"D_rel": 0.088, "J": 1.11},
+            200: {"D_rel": -0.041, "J": 0.84},
         },
         net_d_rel=0.4815,
         net_joint_sensitivity=1.35,
@@ -518,6 +546,9 @@ def test_attention_grid_uses_rdkit_overlays_without_arrows():
         assert "J = 1.350" in labels
         assert "J = 0.930" in labels
         assert "J = 1.710" in labels
+        assert "J = 1.110" in labels
+        assert "J = 0.840" in labels
+        assert labels.count("Graph-local") == 5
     finally:
         plt.close(figure)
 

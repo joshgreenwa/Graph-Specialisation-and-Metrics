@@ -296,20 +296,63 @@ def select_specialist_heads(
     if structural_head is not None:
         structural_head = validate_head(structural_head, metrics.shape)
     else:
-        finite = np.isfinite(metrics.selectivity) & np.isfinite(
-            metrics.joint_sensitivity
+        structural_head = select_structural_specialist_head(
+            metrics,
+            active_only=active_only,
+            excluded_heads=(semantic_head,),
         )
-        eligible = finite & metrics.active if active_only else finite
-        eligible = eligible.copy()
-        eligible[semantic_head] = False
-        layers, heads = np.where(eligible)
-        if not len(layers):
-            raise ValueError("no eligible head is available for structural selection")
-        selectivity = metrics.selectivity[layers, heads]
-        joint = metrics.joint_sensitivity[layers, heads]
-        order = np.lexsort((-joint, selectivity))
-        structural_head = (int(layers[order[0]]), int(heads[order[0]]))
     return {"semantic": semantic_head, "structural": structural_head}
+
+
+def select_structural_specialist_head(
+    metrics: CanonicalHeadMetrics,
+    *,
+    active_only: bool = True,
+    excluded_heads: Sequence[Head] = (),
+    excluded_head_indices: Sequence[int] = (),
+) -> Head:
+    """Select the smallest-``D_rel`` head after explicit exclusions."""
+
+    finite = np.isfinite(metrics.selectivity) & np.isfinite(
+        metrics.joint_sensitivity
+    )
+    eligible = finite & metrics.active if active_only else finite
+    eligible = eligible.copy()
+    for head in excluded_heads:
+        eligible[validate_head(head, metrics.shape)] = False
+    for head_index in excluded_head_indices:
+        head_index = int(head_index)
+        if not 0 <= head_index < metrics.num_heads:
+            raise IndexError(
+                f"excluded head index H{head_index} is outside [0, {metrics.num_heads})"
+            )
+        eligible[:, head_index] = False
+    layers, heads = np.where(eligible)
+    if not len(layers):
+        raise ValueError("no eligible head is available for structural selection")
+    selectivity = metrics.selectivity[layers, heads]
+    joint = metrics.joint_sensitivity[layers, heads]
+    order = np.lexsort((-joint, selectivity))
+    return int(layers[order[0]]), int(heads[order[0]])
+
+
+def select_attention_grid_indices(
+    entries: Sequence[int],
+    *,
+    num_rows: int,
+) -> list[int]:
+    """Validate a role's configured indices and return its first figure rows."""
+
+    num_rows = int(num_rows)
+    if num_rows < 1:
+        raise ValueError("attention-grid num_rows must be positive")
+    indices = [int(value) for value in entries]
+    if len(indices) < num_rows:
+        raise ValueError(
+            f"attention grid needs {num_rows} graph indices, but only "
+            f"{len(indices)} were configured"
+        )
+    return indices[:num_rows]
 
 
 def select_ranked_heads(
@@ -1095,6 +1138,8 @@ __all__ = [
     "label_attention_focus",
     "load_graphormer_model_record",
     "load_graphormer_score_artifact",
+    "select_attention_grid_indices",
     "select_ranked_heads",
     "select_specialist_heads",
+    "select_structural_specialist_head",
 ]
