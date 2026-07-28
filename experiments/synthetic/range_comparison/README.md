@@ -299,6 +299,129 @@ wrong when the perturbation magnitude is itself part of what makes a node import
 case whenever payload classes differ — as they do for a mark versus an ordinary node. The two
 variants answer different questions and neither is the default.
 
+## Head-to-head on a quantised dependence
+
+`fig8_quantised.png`, `run_quantised.py`. One operator family, a known answer, all three methods
+used as their own specifications intend.
+
+On a cycle of 24 nodes with scalar i.i.d. features, `F(X)_v = a·x_v + b·g_τ(x_{v+k})` with
+`a = b = 1`, `k = 4`, `g_τ(z) = tanh(z/τ)`. Mass sits at distance 0 and `k` and nowhere else; `τ` is
+the only knob, from linear to a sign step whose derivative is zero almost everywhere while the
+functional dependence is undiminished. The cycle removes boundary corrections and scalar features
+remove the `L1`-versus-`L2` channel confound.
+
+**The reference.** A first-order spread decomposition of the operator by Monte Carlo, from the
+operator definition alone: `w_0 = |a|·spread(x)`, `w_k = |b|·spread(g_τ(x))`,
+`range = k·w_k/(w_0+w_k)`. Any spread that is positively homogeneous of degree 1 and
+translation-invariant reduces this **exactly** to the paper's `ρ̂` for linear `g`, so the reference
+agrees with the tangent measure precisely where the tangent measure is provably right — the linear
+control puts truth and every arm at `2.000`. **Three** such conventions are reported (standard
+deviation, mean absolute deviation, Gini mean difference), because each is some measure's own
+sufficient statistic and picking one would decide the winner by definition.
+
+**Two axes, not one — and this is where the first version of this experiment was wrong.** The
+paper prescribes a mean of *per-node ratios* (Table 1); carriage averages donor events *before*
+taking the ratio, and that inner average is what suppresses a Jensen collapse. Separating them at
+`τ = 0.05` (95% graph-bootstrap intervals, 60 graphs, truth `1.88`–`2.20`):
+
+| | ratio per node | ratio pooled / donor-averaged |
+|---|---|---|
+| **tangent** | **0.287** [0.228, 0.345] | 1.382 [1.013, 1.734] |
+| **finite** | 1.257 [1.225, 1.288] | 1.727 [1.685, 1.767] |
+
+Both axes contribute about equally: aggregation moves the tangent by **4.8×**, and switching
+tangent→finite at matched aggregation moves it by **4.4×**. Averaging the *derivative* over
+donor-perturbed inputs does not help (`0.388`) — it is the derivative and the per-node ratio
+compounding, not a shortage of input samples.
+
+**Mean absolute error over the sweep** (hops, including the linear control):
+
+| arm | sd | mad | gmd |
+|---|---|---|---|
+| `√S_B` (Beneficial) | *0.047* | **0.087** | 0.080 |
+| `F_sens` raw | 0.051 | 0.136 | **0.030** |
+| `F_sens` event-normalised | 0.095 | 0.201 | 0.057 |
+| tangent, pooled | 0.207 | 0.338 | 0.179 |
+| **tangent, per node (as specified)** | **0.687** | **0.818** | **0.659** |
+
+**What is established.** The paper's prescribed estimator is last under all three conventions by
+5–20×, and every finite-perturbation variant beats it — that is robust to the convention and the
+gap is far outside the intervals. **What is not:** any ordering *among* the finite variants. `√S_B`
+wins under sd, but that column is circular — `√S_B` is algebraically *identical* to the sd
+reference here, not merely similar — and raw `F_sens` wins under gmd, which is its own sufficient
+statistic. Each measure wins under the convention shaped like itself.
+
+**Three further caveats, all from the audit.** The tangent sweep is **not** monotone: `τ = 2` sits
+below `τ = 1` because the far derivative is capped at `1/τ`, and the truth drops with it. The
+reported completeness residual (`4e-16`) and convergence are **vacuous here** — an MSE loss on an
+affine path is a degree-1 integrand, Gauss–Kronrod is exact, and the adaptive bisection never ran
+(`intervals = 1` on every path), so this experiment says nothing about the integrator. And because
+the targets are the operator's own outputs plus mean-zero noise, every swap hurts: `B` carries no
+sign information here and degenerates to a squared functional-carriage readout, so it is not
+independent evidence on this task.
+
+## A far gate controlling a near value
+
+`fig9_gate.png`, `run_gate.py`. The most informative test in the study, because the nonlinearity is
+realistic rather than adversarial and the failure it exposes is structural.
+
+`F(X)_v = a·x_v + b·σ(x_{v+j}/τ)·x_{v+k}` on a cycle, with the **gate at distance 8** and the value
+it gates **at distance 3**. Multiplicative gating is the mechanism behind attention and gated
+message passing, so this is a mainstream computation, not a constructed cliff; and the nonlinearity
+is an *interaction*, which is a blind spot for any first-order method by definition rather than by
+design. `τ → ∞` collapses the gate to the constant ½ and the map becomes linear — the anchor, where
+every method returns `1.500`.
+
+A far node deciding *whether* near information is used is exactly the "is this task long-range?"
+question, and the two ground truths disagree violently about it: the gate's **first-order Sobol
+index is essentially zero** (its mean effect vanishes because the value it gates is mean-zero)
+while its **total-effect index is ~0.29**. A strictly first-order view puts the range at `1.71`;
+the true total-effect range is `3.54`.
+
+**Seeing the gate at `τ = 0.05`** (share of mass placed at distance 8; truth `0.260`–`0.287`
+depending on convention, 95% graph-bootstrap intervals):
+
+| method | gate share |
+|---|---|
+| `√S_B` | 0.280 [0.270, 0.290] |
+| `F_sens` event-normalised | 0.274 [0.261, 0.283] |
+| `F_sens` raw | 0.254 [0.243, 0.266] |
+| **Jacobian, pooled** | **0.189 [0.137, 0.238]** |
+
+The Jacobian's interval **excludes both total-effect truths**; all three carriage variants reach
+them. It under-detects the far interaction node by roughly 30%. Note it does far better than
+first-order theory predicts (0.033) because it picks the gate up through the gate's *own*
+derivative — so this is not a claim that the Jacobian is blind to interactions, only that it
+systematically under-weights them.
+
+**Mean absolute range error over the sweep** (hops), under three references:
+
+| method | total (variance) | total (absolute) | first-order |
+|---|---|---|---|
+| `√S_B` | *0.035* | 0.160 | 1.035 |
+| `F_sens` event-normalised | 0.150 | 0.045 | 0.920 |
+| `F_sens` raw | 0.201 | **0.006** | 0.870 |
+| Jacobian, pooled | 0.308 | 0.114 | **0.762** |
+
+**What is established.** Raw `F_sens` beats the pooled Jacobian under *both* total-effect
+conventions (`0.201` vs `0.308`, `0.006` vs `0.114`), and the Jacobian's gate share is the only one
+whose interval misses the truth. **What is not:** that `√S_B` is best. It wins the variance column
+by construction — a squared-error loss allocation is algebraically what a variance-based total
+index measures — and it *loses to the Jacobian* under the absolute convention (`0.160` vs `0.114`).
+Each measure wins under the reference shaped like itself, which is why three are reported.
+
+**And the Jacobian wins the first-order column**, as a first-order method should. That column is
+the honest statement of what is really at stake: if "range" means the first-order decomposition,
+the tangent is the right tool and everything else is biased; if it means total effect — which is
+what the long-range question actually asks, since a gate that is invisible to a mean effect still
+decides whether distant information is used — the tangent under-reports and the finite measures do
+not. The experiment does not settle which definition is correct; it shows the choice is
+consequential and quantifies it.
+
+**Caveat carried over.** The path integrator is still not exercised (`intervals = 1`, residual
+`2.7e-15`): an MSE loss on an affine path is a degree-1 integrand and Gauss–Kronrod is exact, so
+`√S_B` here is a closed-form quantity, not a test of the quadrature.
+
 ## Files
 
 | file | what it does |
@@ -309,6 +432,8 @@ variants answer different questions and neither is the default.
 | `run_learned.py` | the same comparison on trained approximators |
 | `run_divergence.py` | dose interpolation, step, oscillation and channel-count sweeps |
 | `run_graphlevel.py` | graph-level task: Hessian range against first-order carriage |
+| `run_gate.py` | the far-gate interaction test: Sobol ground truth, pooled Jacobian, `F_sens`, registered `beneficial_carriage` |
+| `run_quantised.py` | the head-to-head on a quantised dependence, against a Monte-Carlo ground truth |
 | `run_beneficial.py` | Beneficial carriage on both splits: `S_B`, `B_far`, and the source-ranking tests |
 | `run_realmodel.py` | the follow-up on a trained MarkedTreePath model: dose ladder, mechanism test, task-derived reference |
 | `figures.py` | all figures |

@@ -17,4 +17,6 @@ python3 ../training/marked_tree_path_graphgps.py --depths 3 --structural-channel
     --skip-xperm-metrics --run-name range_followup --output-dir models
 python3 run_realmodel.py
 python3 run_beneficial.py
+python3 run_quantised.py
+python3 run_gate.py
 python3 figures.py

@@ -938,6 +938,307 @@ def figure_beneficial() -> Path:
     return out
 
 
+def figure_quantised() -> Path:
+    data = load("quantised.json")
+    rows = data["results"]
+    sweep = [r for r in rows if r["tau"] is not None]
+    tau = [r["tau"] for r in sweep]
+
+    def band(row):
+        vals = [row["truth"][c]["range"] for c in ("sd", "mad", "gmd")]
+        return min(vals), max(vals)
+
+    fig, axes = plt.subplots(1, 3, figsize=(7.2, 2.35))
+    fig.subplots_adjust(wspace=0.50)
+
+    ax = axes[0]
+    lo = [band(r)[0] for r in sweep]
+    hi = [band(r)[1] for r in sweep]
+    ax.fill_between(tau, lo, hi, color=MUTED, alpha=0.35, linewidth=0, label="ground truth")
+    for key, label, colour, marker, style_ in (
+        ("carriage_normalised", "finite, donor-avg", CARRIAGE, "s", (0, (3.5, 2.2))),
+        ("carriage_perevent", "finite, per event", "#1baf7a", "^", (0, (1.2, 1.6))),
+        ("jacobian_ratiomeans", "tangent, pooled", "#eda100", "v", (0, (2.5, 1.5))),
+        ("jacobian_meanratio", "tangent, per node (paper)", JACOBIAN, "o", "-"),
+    ):
+        ax.plot(
+            tau, [r[key]["range"] for r in sweep], color=colour, marker=marker, markersize=3.6,
+            linestyle=style_, markerfacecolor="white" if key == "jacobian_meanratio" else colour,
+            markeredgewidth=1.1, label=label,
+        )
+    ax.set_xscale("log")
+    ax.invert_xaxis()
+    ax.set_xlabel(r"Step width $\tau$  (linear $\rightarrow$ step)")
+    ax.set_ylabel("Range (hops)")
+    ax.set_title("Recovering a known range", pad=4)
+    control = next(r for r in rows if r["tau"] is None)
+    ax.text(
+        0.03, 0.03,
+        "linear control: truth and all\narms at {:.3f}".format(control["truth"]["sd"]["range"]),
+        transform=ax.transAxes, fontsize=5.8, color=INK, va="bottom",
+    )
+    ax.legend(frameon=False, fontsize=5.6, handlelength=1.4, borderpad=0.1, loc="upper right")
+    ax.grid(axis="y", alpha=0.9)
+    ax.set_axisbelow(True)
+    panel_letter(ax, "a", dx=-0.36)
+
+    ax = axes[1]
+    last = sweep[-1]
+    cells = [
+        ("tangent\nper node", "jacobian_meanratio", JACOBIAN),
+        ("tangent\npooled", "jacobian_ratiomeans", JACOBIAN),
+        ("finite\nper event", "carriage_perevent", CARRIAGE),
+        ("finite\ndonor-avg", "carriage_normalised", CARRIAGE),
+    ]
+    positions = np.arange(len(cells))
+    values = [last[key]["range"] for _, key, _ in cells]
+    errors = np.abs(
+        np.array([[last[key]["low"], last[key]["high"]] for _, key, _ in cells]).T - np.array(values)
+    )
+    ax.bar(
+        positions, values, width=0.62,
+        color=[c for _, _, c in cells], alpha=0.85, linewidth=0,
+        yerr=errors, error_kw={"elinewidth": 0.8, "capsize": 2, "ecolor": "#3a3a38"},
+    )
+    low, high = band(last)
+    ax.axhspan(low, high, color=MUTED, alpha=0.35, linewidth=0)
+    ax.text(3.4, high, " truth", fontsize=6.0, color=INK, va="bottom", ha="right")
+    ax.set_xticks(positions)
+    ax.set_xticklabels([n for n, _, _ in cells], fontsize=5.6)
+    ax.set_ylabel("Range (hops)")
+    ax.set_title(r"Both axes matter ($\tau=0.05$)", pad=4)
+    ax.grid(axis="y", alpha=0.9)
+    ax.set_axisbelow(True)
+    panel_letter(ax, "b", dx=-0.36)
+
+    ax = axes[2]
+    arms = [
+        ("beneficial_sqrt", r"$\sqrt{S_B}$"),
+        ("carriage_raw", r"$F_{\mathrm{sens}}$ raw"),
+        ("carriage_normalised", r"$F_{\mathrm{sens}}$ norm."),
+        ("jacobian_ratiomeans", "tangent pooled"),
+        ("jacobian_meanratio", "tangent (paper)"),
+    ]
+    width = 0.26
+    positions = np.arange(len(arms))
+    for offset, conv, colour, hatch in (
+        (-width, "sd", CARRIAGE, None),
+        (0.0, "mad", JACOBIAN, "///"),
+        (width, "gmd", "#1baf7a", "..."),
+    ):
+        mae = [
+            float(np.mean([abs(r[key]["range"] - r["truth"][conv]["range"]) for r in rows]))
+            for key, _ in arms
+        ]
+        ax.bar(positions + offset, mae, width=width, color=colour, alpha=0.85,
+               linewidth=0, hatch=hatch, label=conv)
+    ax.set_xticks(positions)
+    ax.set_xticklabels([n for _, n in arms], rotation=32, ha="right", fontsize=5.8)
+    ax.set_ylabel("Mean abs. error (hops)")
+    ax.set_title("Three spread conventions", pad=4)
+    ax.legend(frameon=False, fontsize=5.8, handlelength=1.0, borderpad=0.1, title=None)
+    ax.grid(axis="y", alpha=0.9)
+    ax.set_axisbelow(True)
+    panel_letter(ax, "c", dx=-0.40)
+
+    out = FIGURES / "fig8_quantised.png"
+    fig.savefig(out)
+    fig.savefig(out.with_suffix(".pdf"))
+    plt.close(fig)
+    return out
+
+
+def figure_gate() -> Path:
+    data = load("gate.json")
+    rows = data["results"]
+    sweep = [r for r in rows if r["tau"] is not None]
+    tau = [r["tau"] for r in sweep]
+    arms = [
+        ("beneficial_sqrt", r"$\sqrt{S_B}$", CARRIAGE, "s", (0, (3.5, 2.2))),
+        ("carriage_raw", r"$F_{\mathrm{sens}}$ raw", "#1baf7a", "^", (0, (1.2, 1.6))),
+        ("carriage_normalised", r"$F_{\mathrm{sens}}$ norm.", "#eda100", "v", (0, (2.5, 1.5))),
+        ("jacobian_pooled", "Jacobian (pooled)", JACOBIAN, "o", "-"),
+    ]
+
+    fig, axes = plt.subplots(1, 3, figsize=(7.2, 2.35))
+    fig.subplots_adjust(wspace=0.50)
+
+    ax = axes[0]
+    ax.fill_between(
+        tau,
+        [min(r["truth"]["total"]["range"], r["truth"]["total_abs"]["range"]) for r in sweep],
+        [max(r["truth"]["total"]["range"], r["truth"]["total_abs"]["range"]) for r in sweep],
+        color=MUTED, alpha=0.35, linewidth=0, label="truth (total effect)",
+    )
+    ax.plot(tau, [r["truth"]["first"]["range"] for r in sweep], color=MUTED,
+            linewidth=1.0, linestyle=(0, (1, 2)), label="truth (first order only)")
+    for key, label, colour, marker, style_ in arms:
+        ax.plot(
+            tau, [r[key]["range"]["estimate"] for r in sweep], color=colour, marker=marker,
+            markersize=3.6, linestyle=style_,
+            markerfacecolor="white" if key == "jacobian_pooled" else colour,
+            markeredgewidth=1.1, label=label,
+        )
+    ax.set_xscale("log")
+    ax.invert_xaxis()
+    ax.set_xlabel(r"Gate sharpness: $\tau$ (soft $\rightarrow$ hard)")
+    ax.set_ylabel("Range (hops)")
+    ax.set_title("Far gate, near value", pad=4)
+    ax.legend(frameon=False, fontsize=5.4, handlelength=1.4, borderpad=0.1, loc="upper left")
+    ax.grid(axis="y", alpha=0.9)
+    ax.set_axisbelow(True)
+    panel_letter(ax, "a", dx=-0.36)
+
+    ax = axes[1]
+    last = sweep[-1]
+    positions = np.arange(len(arms))
+    values = [last[key]["gate_share"]["estimate"] for key, _, _, _, _ in arms]
+    errors = np.abs(
+        np.array([[last[key]["gate_share"]["low"], last[key]["gate_share"]["high"]]
+                  for key, _, _, _, _ in arms]).T - np.array(values)
+    )
+    ax.bar(positions, values, width=0.6, color=[c for _, _, c, _, _ in arms], alpha=0.85,
+           linewidth=0, yerr=errors, error_kw={"elinewidth": 0.8, "capsize": 2, "ecolor": "#3a3a38"})
+    ax.axhspan(last["truth"]["total_abs"]["gate_share"], last["truth"]["total"]["gate_share"],
+               color=MUTED, alpha=0.35, linewidth=0)
+    ax.axhline(last["truth"]["first"]["gate_share"], color=MUTED, linewidth=0.9, linestyle=(0, (2, 2)))
+    ax.text(len(arms) - 0.4, last["truth"]["first"]["gate_share"], " first order",
+            fontsize=5.6, color=MUTED, va="bottom", ha="right")
+    ax.set_xticks(positions)
+    ax.set_xticklabels([l for _, l, _, _, _ in arms], rotation=32, ha="right", fontsize=5.8)
+    ax.set_ylabel("Share of mass at the gate")
+    ax.set_title(r"Seeing the gate ($\tau=0.05$)", pad=4)
+    ax.grid(axis="y", alpha=0.9)
+    ax.set_axisbelow(True)
+    panel_letter(ax, "b", dx=-0.40)
+
+    ax = axes[2]
+    width = 0.38
+    positions = np.arange(len(arms))
+    for offset, conv, colour, hatch, name in (
+        (-width / 2, "total", CARRIAGE, None, "total (variance)"),
+        (width / 2, "total_abs", JACOBIAN, "///", "total (absolute)"),
+    ):
+        mae = [
+            float(np.mean([abs(r[key]["range"]["estimate"] - r["truth"][conv]["range"]) for r in rows]))
+            for key, _, _, _, _ in arms
+        ]
+        ax.bar(positions + offset, mae, width=width, color=colour, alpha=0.85,
+               linewidth=0, hatch=hatch, label=name)
+    ax.set_xticks(positions)
+    ax.set_xticklabels([l for _, l, _, _, _ in arms], rotation=32, ha="right", fontsize=5.8)
+    ax.set_ylabel("Mean abs. error (hops)")
+    ax.set_title("Two total-effect conventions", pad=4)
+    ax.legend(frameon=False, fontsize=5.8, handlelength=1.0, borderpad=0.1)
+    ax.grid(axis="y", alpha=0.9)
+    ax.set_axisbelow(True)
+    panel_letter(ax, "c", dx=-0.40)
+
+    out = FIGURES / "fig9_gate.png"
+    fig.savefig(out)
+    fig.savefig(out.with_suffix(".pdf"))
+    plt.close(fig)
+    return out
+
+
+def figure_counterflow() -> Path:
+    rows = load("counterflow.json")["results"]
+    gamma = 1.0
+
+    fig, axes = plt.subplots(1, 3, figsize=(7.2, 2.35))
+    fig.subplots_adjust(wspace=0.50)
+
+    # (a) the tangent collapses with saturation; the finite response never moves.
+    ax = axes[0]
+    distances = sorted({r["distance"] for r in rows})
+    shades = ["#9dc3ee", JACOBIAN, "#17539c"]
+    for distance, colour in zip(distances, shades):
+        sub = sorted(
+            [r for r in rows if r["gamma"] == gamma and r["distance"] == distance and r["tau"] == 1.0],
+            key=lambda r: r["kappa"],
+        )
+        ax.plot(
+            [r["kappa"] for r in sub], [r["measured"]["jacobian_range"] for r in sub],
+            color=colour, marker="o", markersize=3.6, markerfacecolor="white",
+            markeredgewidth=1.1, label=rf"Jacobian, $D={distance}$",
+        )
+    far = rows[0]["expected"]["F_far"]
+    sub = sorted([r for r in rows if r["gamma"] == gamma and r["distance"] == 10 and r["tau"] == 1.0],
+                 key=lambda r: r["kappa"])
+    ax.plot([r["kappa"] for r in sub], [r["measured"]["F_far"] for r in sub],
+            color=CARRIAGE, marker="s", markersize=3.6, linestyle=(0, (3.5, 2.2)),
+            label=r"$F_{\mathrm{sens}}$ at $d=D$")
+    ax.plot([r["kappa"] for r in sub], [r["measured"]["F_near"] for r in sub],
+            color="#1baf7a", marker="^", markersize=3.6, linestyle=(0, (1.2, 1.6)),
+            label=r"$F_{\mathrm{sens}}$ at $d=1$")
+    ax.set_xscale("log", base=2)
+    ax.set_xticks([r["kappa"] for r in sub])
+    ax.set_xticklabels([f"{r['kappa']:g}" for r in sub])
+    ax.set_xlabel(r"Saturation $\kappa$")
+    ax.set_ylabel("Range / response")
+    ax.set_title("Saturation hides the far pathway", pad=4)
+    ax.legend(frameon=False, fontsize=5.4, handlelength=1.4, borderpad=0.1)
+    ax.grid(axis="y", alpha=0.9)
+    ax.set_axisbelow(True)
+    panel_letter(ax, "a", dx=-0.36)
+
+    # (b) counterflow: the local pathway is adverse, the far one beneficial.
+    ax = axes[1]
+    gammas = sorted({r["gamma"] for r in rows})
+    positions = np.arange(len(gammas))
+    width = 0.36
+    near = [next(r for r in rows if r["gamma"] == g and r["kappa"] == 8.0
+                 and r["distance"] == 10 and r["tau"] == 1.0)["measured"]["B_near"] for g in gammas]
+    farb = [next(r for r in rows if r["gamma"] == g and r["kappa"] == 8.0
+                 and r["distance"] == 10 and r["tau"] == 1.0)["measured"]["B_far"] for g in gammas]
+    ax.bar(positions - width / 2, near, width=width, color="#1baf7a", alpha=0.85,
+           linewidth=0, label=r"$B$ at $d=1$ (local)")
+    ax.bar(positions + width / 2, farb, width=width, color=CARRIAGE, alpha=0.85,
+           linewidth=0, label=r"$B$ at $d=D$ (far)")
+    ax.plot(positions, np.asarray(near) + np.asarray(farb), linestyle="none", marker="D",
+            markersize=4.2, color=INK, label="sum = loss increase")
+    ax.axhline(0.0, color=MUTED, linewidth=0.8)
+    ax.set_xticks(positions)
+    ax.set_xticklabels([f"$\\gamma={g:g}$" for g in gammas], fontsize=6.5)
+    ax.set_ylabel("Beneficial carriage")
+    ax.set_title("Local counterflow", pad=4)
+    ax.legend(frameon=False, fontsize=5.8, handlelength=1.0, borderpad=0.1)
+    ax.grid(axis="y", alpha=0.9)
+    ax.set_axisbelow(True)
+    panel_letter(ax, "b", dx=-0.40)
+
+    # (c) target alignment moves B alone.
+    ax = axes[2]
+    sub = sorted([r for r in rows if r["gamma"] == gamma and r["kappa"] == 8.0 and r["distance"] == 10],
+                 key=lambda r: r["tau"])
+    taus = [r["tau"] for r in sub]
+    for key, label, colour, marker, style_ in (
+        ("B_far", r"$B$ at $d=D$", CARRIAGE, "s", (0, (3.5, 2.2))),
+        ("B_near", r"$B$ at $d=1$", "#1baf7a", "^", (0, (1.2, 1.6))),
+        ("F_far", r"$F_{\mathrm{sens}}$ at $d=D$", "#eda100", "v", (0, (2.5, 1.5))),
+        ("jacobian_range", "Jacobian range", JACOBIAN, "o", "-"),
+    ):
+        ax.plot(taus, [r["measured"][key] for r in sub], color=colour, marker=marker,
+                markersize=3.6, linestyle=style_,
+                markerfacecolor="white" if key == "jacobian_range" else colour,
+                markeredgewidth=1.1, label=label)
+    ax.axhline(0.0, color=MUTED, linewidth=0.8)
+    ax.set_xlabel(r"Target alignment $\tau$  ($y=\tau b$)")
+    ax.set_ylabel("Value")
+    ax.set_xticks(taus)
+    ax.set_title("Only $B$ sees the label", pad=4)
+    ax.legend(frameon=False, fontsize=5.6, handlelength=1.4, borderpad=0.1)
+    ax.grid(axis="y", alpha=0.9)
+    ax.set_axisbelow(True)
+    panel_letter(ax, "c", dx=-0.40)
+
+    out = FIGURES / "fig10_counterflow.png"
+    fig.savefig(out)
+    fig.savefig(out.with_suffix(".pdf"))
+    plt.close(fig)
+    return out
+
+
 def main() -> None:
     style()
     FIGURES.mkdir(parents=True, exist_ok=True)
@@ -950,6 +1251,9 @@ def main() -> None:
         ("fig5", figure_graphlevel),
         ("fig6", figure_realmodel),
         ("fig7", figure_beneficial),
+        ("fig8", figure_quantised),
+        ("fig9", figure_gate),
+        ("fig10", figure_counterflow),
     ]
     for label, builder in builders:
         try:

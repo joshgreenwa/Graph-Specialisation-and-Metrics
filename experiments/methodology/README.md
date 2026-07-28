@@ -25,6 +25,17 @@ that miss; read-only downstream artifact loaders continue to reject incompatible
 The initial production run is configured for the dense `zinc`, `qm9_gap_dense`,
 `peptides_func`, and `peptides_struct` registrations.
 
+After the ZINC and QM9 score caches have completed under
+`canonical_methodology_v4_zinc_qm9`, run
+[`grit_zinc_qm9_figures_colab.ipynb`](grit_zinc_qm9_figures_colab.ipynb) for the focused
+cross-task figure suite. It reads each task's `seed_42/cache/scores/raw.pt` artifact
+read-only, verifies the matching `model.json` and checkpoint before model-forward
+diagnostics, and writes task-separated supplemental caches and figure manifests.
+The score/coordinate figures reuse the PCQM presentation, while attention and routed-output
+diagnostics attach to native GRIT sites. GRIT's non-additive relation conditioning is reported as
+such; its node-only versus relation-conditioned raw-logit figure is not labelled as Graphormer
+dot-versus-bias.
+
 For the public PCQM model, set `TASKS = ("graphormer_pcqm4mv2",)` and leave `CHECKPOINTS`
 empty. The registered `clefourrier/graphormer-base-pcqm4mv2@refs/pr/4` checkpoint is loaded
 with its scalar head. Use `TASK_TRAIN_SEEDS = {"graphormer_pcqm4mv2": (0,)}` so its cache label

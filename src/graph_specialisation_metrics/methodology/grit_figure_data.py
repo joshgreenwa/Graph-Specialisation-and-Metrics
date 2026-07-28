@@ -1,0 +1,1266 @@
+"""Read-only canonical score adapters and additive GRIT figure diagnostics.
+
+The canonical methodology owns ``scores/raw.pt`` and the definitions of
+``D_rel`` and ``J``.  This module validates those artifacts without modifying
+them, reconstructs the matching official GRIT checkpoint, and stores only
+supplemental attention/routed-value diagnostics in separate contract-keyed
+caches.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import json
+import os
+import tempfile
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Callable, Mapping, Sequence
+
+import numpy as np
+
+from .backend import CanonicalGritBackend
+from .cache import (
+    ReadOnlyCacheArtifact,
+    StaleCacheError,
+    checkpoint_sha256,
+    load_cache_artifact_file,
+)
+from .protocol import (
+    BootstrapPolicy,
+    ExecutionPolicy,
+    FamilyPolicy,
+    MethodologyConfig,
+    NumericalPolicy,
+    RunSizes,
+    SplitManifest,
+    stable_hash,
+)
+from .runner import PreparedTask, estimate_graph_local_head_coordinates
+from .sampling import SemanticDonorPool
+from .tasks import CanonicalTask, get_task
+
+
+Head = tuple[int, int]
+
+
+def _as_numpy(value: Any, *, dtype=None) -> np.ndarray:
+    if hasattr(value, "detach"):
+        value = value.detach().cpu().numpy()
+    return np.asarray(value, dtype=dtype)
+
+
+def _field(value: Any, name: str) -> Any:
+    if isinstance(value, Mapping):
+        return value[name]
+    return getattr(value, name)
+
+
+def _split_manifest_from_record(record: Mapping[str, Any]) -> SplitManifest:
+    split_record = record.get("splits")
+    if not isinstance(split_record, Mapping):
+        raise StaleCacheError("canonical model record has no valid split manifest")
+    try:
+        splits = SplitManifest(
+            discovery=tuple(int(value) for value in split_record["discovery"]),
+            causal=tuple(int(value) for value in split_record["causal"]),
+            clean_ablation=tuple(
+                int(value) for value in split_record["clean_ablation"]
+            ),
+            semantic_donor_pool=tuple(
+                int(value) for value in split_record["semantic_donor_pool"]
+            ),
+            same_index_space=bool(split_record["same_index_space"]),
+            seed=int(split_record["seed"]),
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise StaleCacheError(
+            f"canonical model record has an invalid split manifest: {error}"
+        ) from error
+    splits.validate()
+    return splits
+
+
+def load_canonical_score_artifact(
+    path: str | Path,
+    *,
+    expected_task: str,
+) -> ReadOnlyCacheArtifact:
+    """Load a validated score artifact and bind it to one registered task."""
+
+    artifact = load_cache_artifact_file(path)
+    contract = artifact.metadata.get("contract")
+    if not isinstance(contract, Mapping):
+        raise StaleCacheError(
+            f"canonical score cache has no valid contract: {artifact.path}"
+        )
+    if contract.get("task") != str(expected_task):
+        raise StaleCacheError(
+            f"{artifact.path} is for task {contract.get('task')!r}, "
+            f"not {expected_task!r}"
+        )
+    required = {
+        "checkpoint_sha256",
+        "model_geometry",
+        "sigma",
+        "split_fingerprint",
+        "task_adapter_version",
+        "train_seed",
+    }
+    missing = sorted(required.difference(contract))
+    if missing:
+        raise StaleCacheError(
+            f"canonical score cache contract is missing {missing}: {artifact.path}"
+        )
+    task = get_task(str(expected_task))
+    if task.backend_kind != "grit":
+        raise StaleCacheError(
+            f"{expected_task!r} uses backend {task.backend_kind!r}, not GRIT"
+        )
+    return artifact
+
+
+def load_canonical_model_record(
+    path: str | Path,
+    artifact: ReadOnlyCacheArtifact,
+) -> dict[str, Any]:
+    """Load ``model.json`` and verify that it describes ``artifact``."""
+
+    resolved = Path(path).expanduser().resolve()
+    if not resolved.is_file():
+        raise FileNotFoundError(f"canonical model record not found: {resolved}")
+    record = json.loads(resolved.read_text(encoding="utf-8"))
+    contract = artifact.metadata["contract"]
+    expected = {
+        "task": contract["task"],
+        "task_adapter_version": contract["task_adapter_version"],
+        "checkpoint_sha256": contract["checkpoint_sha256"],
+        "train_seed": int(contract["train_seed"]),
+    }
+    mismatches = {
+        key: (record.get(key), value)
+        for key, value in expected.items()
+        if record.get(key) != value
+    }
+    if mismatches:
+        raise StaleCacheError(
+            f"{resolved} does not describe the score artifact: {mismatches}"
+        )
+    splits = _split_manifest_from_record(record)
+    if splits.fingerprint != contract["split_fingerprint"]:
+        raise StaleCacheError(
+            f"{resolved} split fingerprint {splits.fingerprint!r} does not match "
+            f"the score cache {contract['split_fingerprint']!r}"
+        )
+    return record
+
+
+@dataclass(frozen=True)
+class CanonicalHeadMetrics:
+    """Figure-facing arrays copied from a validated canonical score artifact."""
+
+    raw_semantic: np.ndarray
+    raw_structural: np.ndarray
+    normalized_semantic: np.ndarray
+    normalized_structural: np.ndarray
+    joint_sensitivity: np.ndarray
+    selectivity: np.ndarray
+    active: np.ndarray
+    estimable: bool
+    distance_axis: tuple[str, ...]
+    clean_attention_distance: np.ndarray | None
+
+    @property
+    def shape(self) -> tuple[int, int]:
+        return tuple(self.selectivity.shape)
+
+    @property
+    def num_layers(self) -> int:
+        return self.shape[0]
+
+    @property
+    def num_heads(self) -> int:
+        return self.shape[1]
+
+    @classmethod
+    def from_scores(cls, scores: Mapping[str, Any]) -> "CanonicalHeadMetrics":
+        if "coordinates" not in scores:
+            raise KeyError("canonical score payload has no 'coordinates' entry")
+        coordinates = scores["coordinates"]
+        arrays = {
+            "raw_semantic": _as_numpy(
+                _field(coordinates, "raw_semantic"), dtype=np.float64
+            ),
+            "raw_structural": _as_numpy(
+                _field(coordinates, "raw_structural"), dtype=np.float64
+            ),
+            "normalized_semantic": _as_numpy(
+                _field(coordinates, "normalized_semantic"), dtype=np.float64
+            ),
+            "normalized_structural": _as_numpy(
+                _field(coordinates, "normalized_structural"), dtype=np.float64
+            ),
+            "joint_sensitivity": _as_numpy(
+                _field(coordinates, "joint_sensitivity"), dtype=np.float64
+            ),
+            "selectivity": _as_numpy(
+                _field(coordinates, "selectivity"), dtype=np.float64
+            ),
+            "active": _as_numpy(_field(coordinates, "active"), dtype=bool),
+        }
+        shape = arrays["selectivity"].shape
+        if len(shape) != 2:
+            raise ValueError(f"expected canonical head arrays [L,H], got {shape}")
+        for name, array in arrays.items():
+            if array.shape != shape:
+                raise ValueError(
+                    f"canonical {name} has shape {array.shape}; expected {shape}"
+                )
+
+        channels = scores.get("channels", {})
+        for channel, coordinate_name in (
+            ("semantic", "raw_semantic"),
+            ("structural", "raw_structural"),
+        ):
+            if channel in channels and "raw" in channels[channel]:
+                raw = _as_numpy(channels[channel]["raw"], dtype=np.float64)
+                if raw.shape != shape or not np.allclose(
+                    raw, arrays[coordinate_name], equal_nan=True
+                ):
+                    raise ValueError(
+                        f"canonical coordinate and channel arrays disagree for {channel}"
+                    )
+
+        attention_distance = scores.get("clean_attention_distance")
+        if attention_distance is not None:
+            attention_distance = _as_numpy(attention_distance, dtype=np.float64)
+            if (
+                attention_distance.ndim != 3
+                or attention_distance.shape[:2] != shape
+            ):
+                raise ValueError(
+                    "clean_attention_distance must be [L,H,D] and match head arrays; "
+                    f"got {attention_distance.shape} for {shape}"
+                )
+        axis = tuple(str(label) for label in scores.get("axis", ()))
+        if (
+            attention_distance is not None
+            and len(axis) != attention_distance.shape[-1]
+        ):
+            raise ValueError(
+                f"distance axis has {len(axis)} labels for "
+                f"{attention_distance.shape[-1]} bins"
+            )
+        return cls(
+            **arrays,
+            estimable=bool(_field(coordinates, "estimable")),
+            distance_axis=axis,
+            clean_attention_distance=attention_distance,
+        )
+
+    def head_record(self, head: Head) -> dict[str, Any]:
+        layer, index = validate_head(head, self.shape)
+        return {
+            "layer": layer,
+            "head": index,
+            "semantic": float(self.normalized_semantic[layer, index]),
+            "structural": float(self.normalized_structural[layer, index]),
+            "joint_sensitivity": float(self.joint_sensitivity[layer, index]),
+            "selectivity": float(self.selectivity[layer, index]),
+            "active": bool(self.active[layer, index]),
+        }
+
+
+def validate_head(head: Head, shape: tuple[int, int]) -> Head:
+    layer, index = int(head[0]), int(head[1])
+    if not (0 <= layer < shape[0] and 0 <= index < shape[1]):
+        raise IndexError(f"head {(layer, index)} is outside canonical shape {shape}")
+    return layer, index
+
+
+def _select_extreme_head(
+    metrics: CanonicalHeadMetrics,
+    *,
+    largest: bool,
+    active_only: bool = True,
+    excluded_heads: Sequence[Head] = (),
+) -> Head:
+    finite = np.isfinite(metrics.selectivity) & np.isfinite(
+        metrics.joint_sensitivity
+    )
+    eligible = finite & metrics.active if active_only else finite
+    eligible = eligible.copy()
+    for head in excluded_heads:
+        eligible[validate_head(head, metrics.shape)] = False
+    layers, heads = np.where(eligible)
+    if not len(layers):
+        raise ValueError("no eligible head is available for specialist selection")
+    selectivity = metrics.selectivity[layers, heads]
+    joint = metrics.joint_sensitivity[layers, heads]
+    order = (
+        np.lexsort((-joint, -selectivity))
+        if largest
+        else np.lexsort((-joint, selectivity))
+    )
+    return int(layers[order[0]]), int(heads[order[0]])
+
+
+def select_specialist_heads(
+    metrics: CanonicalHeadMetrics,
+    *,
+    semantic_head: Head | None = None,
+    structural_head: Head | None = None,
+    active_only: bool = True,
+) -> dict[str, Head]:
+    """Select the maximum- and minimum-``D_rel`` active heads."""
+
+    if semantic_head is None:
+        semantic_head = _select_extreme_head(
+            metrics, largest=True, active_only=active_only
+        )
+    else:
+        semantic_head = validate_head(semantic_head, metrics.shape)
+    if structural_head is None:
+        structural_head = _select_extreme_head(
+            metrics,
+            largest=False,
+            active_only=active_only,
+            excluded_heads=(semantic_head,),
+        )
+    else:
+        structural_head = validate_head(structural_head, metrics.shape)
+    return {"semantic": semantic_head, "structural": structural_head}
+
+
+def select_structural_specialist_head(
+    metrics: CanonicalHeadMetrics,
+    *,
+    active_only: bool = True,
+    excluded_heads: Sequence[Head] = (),
+) -> Head:
+    return _select_extreme_head(
+        metrics,
+        largest=False,
+        active_only=active_only,
+        excluded_heads=excluded_heads,
+    )
+
+
+def select_attention_grid_indices(
+    entries: Sequence[int],
+    *,
+    num_rows: int,
+) -> list[int]:
+    num_rows = int(num_rows)
+    if num_rows < 1:
+        raise ValueError("attention-grid num_rows must be positive")
+    indices = [int(value) for value in entries]
+    if len(indices) < num_rows:
+        raise ValueError(
+            f"attention grid needs {num_rows} graph indices, but only "
+            f"{len(indices)} were configured"
+        )
+    return indices[:num_rows]
+
+
+def select_ranked_heads(
+    metrics: CanonicalHeadMetrics,
+    *,
+    semantic_count: int = 3,
+    joint_count: int = 3,
+    active_only: bool = True,
+    joint_generalist_max_abs_selectivity: float | None = None,
+) -> dict[str, Head]:
+    """Rank by decreasing ``D_rel`` and by decreasing generalist ``J``."""
+
+    semantic_count = int(semantic_count)
+    joint_count = int(joint_count)
+    if semantic_count < 0 or joint_count < 0:
+        raise ValueError("rank counts must be non-negative")
+    finite = np.isfinite(metrics.selectivity) & np.isfinite(
+        metrics.joint_sensitivity
+    )
+    eligible = finite & metrics.active if active_only else finite
+    semantic_layers, semantic_heads = np.where(eligible)
+    if len(semantic_layers) < semantic_count:
+        raise ValueError(
+            f"only {len(semantic_layers)} eligible heads are available for a "
+            f"top-{semantic_count} semantic ranking"
+        )
+    semantic_selectivity = metrics.selectivity[semantic_layers, semantic_heads]
+    semantic_joint = metrics.joint_sensitivity[semantic_layers, semantic_heads]
+    semantic_order = np.lexsort((-semantic_joint, -semantic_selectivity))
+
+    joint_eligible = eligible.copy()
+    if joint_generalist_max_abs_selectivity is not None:
+        bound = float(joint_generalist_max_abs_selectivity)
+        if bound < 0:
+            raise ValueError("joint generalist |D_rel| bound must be non-negative")
+        joint_eligible &= np.abs(metrics.selectivity) <= bound
+    joint_layers, joint_heads = np.where(joint_eligible)
+    if len(joint_layers) < joint_count:
+        raise ValueError(
+            f"only {len(joint_layers)} eligible heads are available for a "
+            f"top-{joint_count} joint-generalist ranking"
+        )
+    joint_selectivity = metrics.selectivity[joint_layers, joint_heads]
+    joint_values = metrics.joint_sensitivity[joint_layers, joint_heads]
+    joint_order = np.lexsort((-joint_selectivity, -joint_values))
+
+    ranked: dict[str, Head] = {}
+    for rank, position in enumerate(semantic_order[:semantic_count], start=1):
+        ranked[f"top_semantic_{rank}"] = (
+            int(semantic_layers[position]),
+            int(semantic_heads[position]),
+        )
+    for rank, position in enumerate(joint_order[:joint_count], start=1):
+        ranked[f"top_joint_{rank}"] = (
+            int(joint_layers[position]),
+            int(joint_heads[position]),
+        )
+    return ranked
+
+
+class SupplementalCache:
+    """Immutable contract-keyed storage for non-canonical diagnostics."""
+
+    SCHEMA_VERSION = "focused_grit_figure_diagnostics.v1"
+
+    def __init__(self, root: str | Path):
+        self.root = Path(root)
+        self.root.mkdir(parents=True, exist_ok=True)
+
+    def path_for(self, name: str, contract: Mapping[str, Any]) -> Path:
+        fingerprint = stable_hash(
+            {
+                "schema_version": self.SCHEMA_VERSION,
+                "name": str(name),
+                "contract": dict(contract),
+            }
+        )
+        return self.root / f"{name}-{fingerprint[:16]}.pt"
+
+    def load_or_compute(
+        self,
+        name: str,
+        contract: Mapping[str, Any],
+        compute: Callable[[], Any],
+        *,
+        force: bool = False,
+    ) -> tuple[Any, Path, bool]:
+        path = self.path_for(name, contract)
+        if path.exists() and not force:
+            import torch
+
+            payload = torch.load(path, map_location="cpu", weights_only=False)
+            if (
+                not isinstance(payload, Mapping)
+                or payload.get("schema_version") != self.SCHEMA_VERSION
+                or payload.get("contract") != dict(contract)
+                or "value" not in payload
+            ):
+                raise StaleCacheError(
+                    f"supplemental figure cache is malformed: {path}"
+                )
+            return payload["value"], path, True
+        value = compute()
+        import torch
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+        descriptor, temporary = tempfile.mkstemp(
+            prefix=path.name, suffix=".partial", dir=path.parent
+        )
+        os.close(descriptor)
+        temporary_path = Path(temporary)
+        try:
+            torch.save(
+                {
+                    "schema_version": self.SCHEMA_VERSION,
+                    "contract": dict(contract),
+                    "value": value,
+                },
+                temporary_path,
+            )
+            temporary_path.replace(path)
+        finally:
+            if temporary_path.exists():
+                temporary_path.unlink()
+        return value, path, False
+
+
+def methodology_config_from_record(
+    path_or_record: str | Path | Mapping[str, Any],
+    *,
+    accelerator: str | None = None,
+) -> MethodologyConfig:
+    """Reconstruct the canonical public configuration from ``protocol.json``."""
+
+    if isinstance(path_or_record, Mapping):
+        record = dict(path_or_record)
+    else:
+        path = Path(path_or_record).expanduser().resolve()
+        if not path.is_file():
+            raise FileNotFoundError(f"canonical protocol record not found: {path}")
+        record = json.loads(path.read_text(encoding="utf-8"))
+    return MethodologyConfig(
+        output_dir=str(record["output_dir"]),
+        tasks=tuple(str(value) for value in record["tasks"]),
+        train_seeds=tuple(int(value) for value in record["train_seeds"]),
+        task_train_seeds={
+            str(task): tuple(int(seed) for seed in seeds)
+            for task, seeds in record.get("task_train_seeds", {}).items()
+        },
+        phases=(),
+        sizes=RunSizes(**record["sizes"]),
+        numerical=NumericalPolicy(**record["numerical"]),
+        bootstrap=BootstrapPolicy(**record["bootstrap"]),
+        families=FamilyPolicy(**record["families"]),
+        execution=ExecutionPolicy(**record.get("execution", {})),
+        analysis_seed=int(record["analysis_seed"]),
+        accelerator=str(accelerator or record.get("accelerator", "cuda:0")),
+        num_threads=int(record.get("num_threads", 4)),
+        checkpoints=dict(record.get("checkpoints", {})),
+        task_overrides={
+            str(task): dict(values)
+            for task, values in record.get("task_overrides", {}).items()
+        },
+        figure_overrides=dict(record.get("figure_overrides", {})),
+        skip_install=True,
+        resume=True,
+        force=False,
+        strict_audits=bool(record.get("strict_audits", False)),
+        compute_beneficial_carriage=bool(
+            record.get("beneficial_carriage", True)
+        ),
+    )
+
+
+def _task_with_protocol_overrides(
+    task_name: str,
+    task_overrides: Mapping[str, Any],
+) -> CanonicalTask:
+    scientific_names = set(CanonicalTask.__dataclass_fields__) - {
+        "name",
+        "backend_kind",
+        "spec",
+    }
+    scientific = {
+        key: value
+        for key, value in task_overrides.items()
+        if key in scientific_names
+    }
+    task = get_task(task_name, scientific)
+    if {
+        "sigma",
+        "output_representation",
+        "sigma_policy",
+    } & set(task_overrides):
+        sigma_override = task_overrides.get("sigma")
+        if sigma_override is not None and np.isscalar(sigma_override):
+            sigma_override = (float(sigma_override),)
+        task = dataclasses.replace(
+            task,
+            output=dataclasses.replace(
+                task.output,
+                sigma=(
+                    tuple(float(value) for value in sigma_override)
+                    if sigma_override is not None
+                    else task.output.sigma
+                ),
+                representation=str(
+                    task_overrides.get(
+                        "output_representation", task.output.representation
+                    )
+                ),
+                sigma_policy=str(
+                    task_overrides.get("sigma_policy", task.output.sigma_policy)
+                ),
+            ),
+        )
+    return task
+
+
+@dataclass(frozen=True)
+class GritFigureRuntime:
+    """Verified official-GRIT runtime used only for supplemental diagnostics."""
+
+    prepared: PreparedTask
+    checkpoint_descriptor: str
+    checkpoint_sha256: str
+    protocol_config: MethodologyConfig
+
+    @property
+    def runtime(self):
+        return self.prepared.runtime
+
+    @property
+    def backend(self):
+        return self.prepared.backend
+
+
+def build_verified_grit_figure_runtime(
+    artifact: ReadOnlyCacheArtifact,
+    model_record: Mapping[str, Any],
+    protocol_config: MethodologyConfig,
+    *,
+    runtime_output_dir: str | Path,
+) -> GritFigureRuntime:
+    """Reconstruct GRIT and fail if checkpoint, adapter, or geometry differs."""
+
+    from ..carriage import env
+    from ..carriage.tasks import resolve_dataset_dir
+    from ..specialisation.model import GritHeadModel, SpecConfig
+
+    contract = artifact.metadata["contract"]
+    task_name = str(contract["task"])
+    if contract.get("protocol_fingerprint") != protocol_config.fingerprint:
+        raise ValueError(
+            "protocol.json does not describe the scientific configuration bound "
+            "to the canonical score cache"
+        )
+    overrides = dict(protocol_config.task_overrides.get(task_name, {}))
+    task = _task_with_protocol_overrides(task_name, overrides)
+    if task.backend_kind != "grit":
+        raise ValueError(
+            f"focused GRIT runtime cannot load backend {task.backend_kind!r}"
+        )
+    if contract.get("task_adapter_version") != task.adapter_version:
+        raise ValueError(
+            "canonical cache adapter version differs from the current GRIT task"
+        )
+
+    runtime_output_dir = Path(runtime_output_dir)
+    runtime_output_dir.mkdir(parents=True, exist_ok=True)
+    spec = task.spec
+    repo_dir = Path(
+        str(
+            overrides.get(
+                "grit_repo_dir",
+                spec.grit_repo_dir
+                or (f"/content/GRIT_{spec.name}" if spec.env_hooks else "/content/GRIT"),
+            )
+        )
+    )
+    env.clone_grit(repo_dir, spec.grit_repo, spec.grit_commit, force_fresh=False)
+    for hook in spec.env_hooks:
+        hook(repo_dir)
+    env.prepare_inprocess_grit(repo_dir)
+    config_file = str(
+        overrides.get("config_file")
+        or env.resolve_config(spec, repo_dir, runtime_output_dir)
+    )
+    drive_dir = str(overrides.get("drive_dir", spec.drive_dir))
+    dataset_dir = str(
+        overrides.get("dataset_dir") or resolve_dataset_dir(spec, drive_dir)
+    )
+    checkpoint = Path(str(model_record["checkpoint"])).expanduser()
+    if not checkpoint.is_file():
+        raise FileNotFoundError(
+            f"checkpoint recorded by canonical model.json is unavailable: {checkpoint}"
+        )
+    digest = checkpoint_sha256(checkpoint)
+    if digest != str(contract["checkpoint_sha256"]):
+        raise ValueError(
+            "loaded GRIT checkpoint does not match canonical score cache: "
+            f"{digest} != {contract['checkpoint_sha256']}"
+        )
+
+    seed = int(contract["train_seed"])
+    runtime = GritHeadModel(
+        spec,
+        SpecConfig(
+            ckpt=str(checkpoint),
+            out_dir=str(runtime_output_dir),
+            dataset_dir=dataset_dir,
+            config_file=config_file,
+            accelerator=str(protocol_config.accelerator),
+            seed=seed,
+            num_threads=int(protocol_config.num_threads),
+            eval_split=str(overrides.get("eval_split", "test")),
+            donor_split=str(overrides.get("donor_split", "train")),
+            eval_metric=False,
+            analysis_seed=int(protocol_config.analysis_seed),
+            donors=int(contract["donors_per_source"]),
+            content_adapter=spec.content_adapter,
+            resume=True,
+        ),
+    ).load()
+    sigma = np.asarray(contract["sigma"], dtype=np.float64)
+    backend = CanonicalGritBackend(runtime, task, sigma=sigma)
+    expected_geometry = {
+        str(key): int(value) for key, value in contract["model_geometry"].items()
+    }
+    if backend.geometry != expected_geometry:
+        raise ValueError(
+            f"loaded GRIT geometry {backend.geometry} != canonical {expected_geometry}"
+        )
+    expected_parameters = model_record.get("parameter_count")
+    observed_parameters = runtime.checks.get("num_parameters")
+    if (
+        expected_parameters is not None
+        and int(observed_parameters) != int(expected_parameters)
+    ):
+        raise ValueError(
+            f"loaded GRIT parameter count {observed_parameters} != "
+            f"canonical {expected_parameters}"
+        )
+    splits = _split_manifest_from_record(model_record)
+    donor_pool = SemanticDonorPool(
+        [
+            (graph_id, runtime.donor_ds[graph_id])
+            for graph_id in splits.semantic_donor_pool
+        ],
+        adapter=task.content_adapter,
+    )
+    prepared = PreparedTask(
+        task=task,
+        runtime=runtime,
+        backend=backend,
+        output_dir=runtime_output_dir,
+        checkpoint=checkpoint,
+        checkpoint_sha=digest,
+        sigma=sigma,
+        splits=splits,
+        donor_pool=donor_pool,
+        progress=None,
+    )
+    return GritFigureRuntime(
+        prepared=prepared,
+        checkpoint_descriptor=str(checkpoint),
+        checkpoint_sha256=digest,
+        protocol_config=protocol_config,
+    )
+
+
+@dataclass(frozen=True)
+class GritDiagnosticCapture:
+    """One-graph tensors at GRIT's exact sparse attention sites."""
+
+    node_only_logits: tuple[Any, ...]
+    relation_logits: tuple[Any, ...]
+    attention: tuple[Any, ...]
+    transport: tuple[Any, ...]
+
+
+class GritDiagnosticExtractor:
+    """Capture attention, routed output, and GRIT-native raw-logit controls."""
+
+    def __init__(self, figure_runtime: GritFigureRuntime):
+        self.figure_runtime = figure_runtime
+        self.gm = figure_runtime.runtime
+
+    def extract(self, data: Any) -> GritDiagnosticCapture:
+        import torch
+        from torch_geometric.data import Batch
+
+        layers = self.gm.attn_layers
+        node_logits: list[Any | None] = [None] * len(layers)
+        relation_logits: list[Any | None] = [None] * len(layers)
+        attention: list[Any | None] = [None] * len(layers)
+        transport: list[Any | None] = [None] * len(layers)
+        handles = []
+
+        def make_hook(layer_index: int):
+            def hook(module, inputs, output):
+                batch = inputs[0]
+                edge_index = batch.edge_index.long()
+                source, receiver = edge_index[0], edge_index[1]
+                node_score = batch.K_h[source] + batch.Q_h[receiver]
+                node_field = module.act(node_score)
+                node_raw = torch.einsum(
+                    "ehd,dhc->ehc", node_field, module.Aw
+                ).squeeze(-1)
+                relation_field = (
+                    batch.wE.view(-1, module.num_heads, module.out_dim)
+                    if batch.get("wE", None) is not None
+                    else node_field
+                )
+                relation_raw = torch.einsum(
+                    "ehd,dhc->ehc", relation_field, module.Aw
+                ).squeeze(-1)
+                if module.clamp is not None:
+                    node_raw = torch.clamp(
+                        node_raw, min=-module.clamp, max=module.clamp
+                    )
+                    relation_raw = torch.clamp(
+                        relation_raw, min=-module.clamp, max=module.clamp
+                    )
+                n = int(batch.num_nodes)
+                h = int(module.num_heads)
+                node_dense = torch.full(
+                    (h, n, n),
+                    torch.nan,
+                    dtype=node_raw.dtype,
+                    device=node_raw.device,
+                )
+                relation_dense = torch.full_like(node_dense, torch.nan)
+                attention_dense = torch.zeros_like(node_dense)
+                node_dense[:, receiver, source] = node_raw.transpose(0, 1)
+                relation_dense[:, receiver, source] = relation_raw.transpose(0, 1)
+                attention_dense[:, receiver, source] = (
+                    batch.attn.detach().squeeze(-1).transpose(0, 1)
+                )
+                routed = output[0] if isinstance(output, (tuple, list)) else output
+                node_logits[layer_index] = node_dense.detach()
+                relation_logits[layer_index] = relation_dense.detach()
+                attention[layer_index] = attention_dense.detach()
+                transport[layer_index] = routed.detach()
+
+            return hook
+
+        for layer_index, layer in enumerate(layers):
+            handles.append(layer.register_forward_hook(make_hook(layer_index)))
+        try:
+            batch = Batch.from_data_list([data.clone()]).to(self.gm.device)
+            with torch.no_grad():
+                self.gm.model(batch)
+        finally:
+            for handle in handles:
+                handle.remove()
+        groups = (node_logits, relation_logits, attention, transport)
+        if any(any(value is None for value in group) for group in groups):
+            raise RuntimeError("one or more GRIT diagnostic hooks did not fire")
+        n = int(data.num_nodes)
+        return GritDiagnosticCapture(
+            node_only_logits=tuple(value[:, :n, :n] for value in node_logits),
+            relation_logits=tuple(
+                value[:, :n, :n] for value in relation_logits
+            ),
+            attention=tuple(value[:, :n, :n] for value in attention),
+            transport=tuple(value[:n] for value in transport),
+        )
+
+
+_ATOMIC_NUMBERS = {1: "H", 6: "C", 7: "N", 8: "O", 9: "F"}
+
+
+def graph_node_labels(task_name: str, graph: Any) -> list[str]:
+    values = _as_numpy(graph.x).reshape(int(graph.num_nodes), -1)[:, 0]
+    if str(task_name) == "zinc":
+        # PyG ZINC stores categorical atom-type IDs, not a documented atomic-number
+        # vocabulary. Keep those exact IDs rather than inventing element symbols.
+        return [f"type {int(value)}" for value in values]
+    return [
+        _ATOMIC_NUMBERS.get(int(value), f"Z={int(value)}") for value in values
+    ]
+
+
+def graph_edge_index(graph: Any) -> np.ndarray:
+    values = _as_numpy(graph.edge_index, dtype=np.int64)
+    if values.ndim != 2 or values.shape[0] != 2:
+        raise ValueError(f"expected edge_index [2,E], got {values.shape}")
+    return values
+
+
+def collect_attention_examples(
+    figure_runtime: GritFigureRuntime,
+    *,
+    graph_indices: Sequence[int],
+    heads: Mapping[str, Head],
+) -> dict[str, Any]:
+    extractor = GritDiagnosticExtractor(figure_runtime)
+    runtime = figure_runtime.runtime
+    task_name = figure_runtime.prepared.task.name
+    examples = []
+    for graph_index in graph_indices:
+        graph_index = int(graph_index)
+        if not 0 <= graph_index < len(runtime.eval_ds):
+            raise IndexError(
+                f"{task_name} eval index {graph_index} is outside "
+                f"[0, {len(runtime.eval_ds)})"
+            )
+        graph = runtime.eval_ds[graph_index]
+        chemical_edges = graph_edge_index(graph)
+        labels = graph_node_labels(task_name, graph)
+        captured = extractor.extract(graph)
+        selected = {
+            role: captured.attention[layer][head].float().cpu().numpy()
+            for role, (layer, head) in heads.items()
+        }
+        examples.append(
+            {
+                "dataset_index": graph_index,
+                "n_atoms": int(graph.num_nodes),
+                "node_labels": labels,
+                "edge_index": chemical_edges,
+                "attention": selected,
+            }
+        )
+    return {
+        "task": task_name,
+        "index_space": "GRIT evaluation-split position",
+        "heads": dict(heads),
+        "examples": examples,
+    }
+
+
+def label_attention_focus(
+    node_labels: Sequence[str],
+    node_mass: np.ndarray,
+    *,
+    focus_mass: float = 0.75,
+    diffuse_threshold: float = 0.35,
+) -> str:
+    """Label a graph by the node category receiving most selected attention."""
+
+    labels = [str(value) for value in node_labels]
+    mass = np.asarray(node_mass, dtype=np.float64).reshape(-1)
+    if len(labels) != len(mass):
+        raise ValueError("node labels and attention mass have different lengths")
+    total = float(np.sum(mass))
+    if not np.isfinite(total) or total <= 0:
+        return "other/diffuse"
+    mass = mass / total
+    order = np.argsort(-mass)
+    selected: list[int] = []
+    cumulative = 0.0
+    for index in order:
+        selected.append(int(index))
+        cumulative += float(mass[index])
+        if cumulative >= float(focus_mass):
+            break
+    mass_by_label: dict[str, float] = {}
+    for index in selected:
+        label = labels[index]
+        mass_by_label[label] = mass_by_label.get(label, 0.0) + float(mass[index])
+    best, best_mass = max(mass_by_label.items(), key=lambda item: item[1])
+    return f"{best}-focused" if best_mass >= float(diffuse_threshold) else "other/diffuse"
+
+
+def compute_av_pca_inputs(
+    figure_runtime: GritFigureRuntime,
+    *,
+    head: Head,
+    n_graphs: int = 500,
+    focus_mass: float = 0.75,
+    diffuse_threshold: float = 0.35,
+    verbose: bool = True,
+) -> dict[str, Any]:
+    """Collect pooled native GRIT routed-head outputs for one PCA."""
+
+    key = f"{int(head[0])}:{int(head[1])}"
+    return compute_av_pca_inputs_many(
+        figure_runtime,
+        heads=(head,),
+        n_graphs=n_graphs,
+        focus_mass=focus_mass,
+        diffuse_threshold=diffuse_threshold,
+        verbose=verbose,
+    )[key]
+
+
+def compute_av_pca_inputs_many(
+    figure_runtime: GritFigureRuntime,
+    *,
+    heads: Sequence[Head],
+    n_graphs: int = 500,
+    focus_mass: float = 0.75,
+    diffuse_threshold: float = 0.35,
+    verbose: bool = True,
+) -> dict[str, dict[str, Any]]:
+    """Collect several head PCA inputs in one shared model-forward sweep."""
+
+    shape = (
+        int(figure_runtime.runtime.L),
+        int(figure_runtime.runtime.H),
+    )
+    unique_heads = tuple(
+        dict.fromkeys(validate_head(head, shape) for head in heads)
+    )
+    if not unique_heads:
+        raise ValueError("at least one head is required for routed-output PCA")
+    extractor = GritDiagnosticExtractor(figure_runtime)
+    vectors: dict[Head, list[np.ndarray]] = {head: [] for head in unique_heads}
+    labels: dict[Head, list[str]] = {head: [] for head in unique_heads}
+    positions: dict[Head, list[int]] = {head: [] for head in unique_heads}
+    limit = min(int(n_graphs), len(figure_runtime.runtime.eval_ds))
+    task_name = figure_runtime.prepared.task.name
+    for position in range(limit):
+        try:
+            graph = figure_runtime.runtime.eval_ds[position]
+            captured = extractor.extract(graph)
+            node_labels = graph_node_labels(task_name, graph)
+        except Exception as error:
+            if verbose:
+                print(f"  [GRIT routed-output PCA] skipped {position}: {error}")
+            continue
+        for layer, head_index in unique_heads:
+            try:
+                vector = (
+                    captured.transport[layer][:, head_index, :]
+                    .mean(dim=0)
+                    .float()
+                    .cpu()
+                    .numpy()
+                )
+                matrix = (
+                    captured.attention[layer][head_index].float().cpu().numpy()
+                )
+                denominator = np.clip(
+                    matrix.sum(axis=-1, keepdims=True), 1e-12, None
+                )
+                inbound = (matrix / denominator).mean(axis=0)
+                label = label_attention_focus(
+                    node_labels,
+                    inbound,
+                    focus_mass=focus_mass,
+                    diffuse_threshold=diffuse_threshold,
+                )
+            except Exception as error:
+                if verbose:
+                    print(
+                        "  [GRIT routed-output PCA] skipped "
+                        f"{position} for L{layer} H{head_index}: {error}"
+                    )
+                continue
+            head = (layer, head_index)
+            vectors[head].append(vector)
+            labels[head].append(label)
+            positions[head].append(position)
+        if verbose and (position + 1) % 50 == 0:
+            print(f"  [GRIT routed-output PCA] {position + 1}/{limit}")
+    output: dict[str, dict[str, Any]] = {}
+    for head in unique_heads:
+        if len(vectors[head]) < 2:
+            raise RuntimeError(
+                f"fewer than two graphs produced valid vectors for head {head}"
+            )
+        output[f"{head[0]}:{head[1]}"] = {
+            "task": task_name,
+            "head": head,
+            "vectors": np.stack(vectors[head]),
+            "labels": labels[head],
+            "positions": np.asarray(positions[head], dtype=np.int64),
+            "n_requested": int(n_graphs),
+            "n_used": len(vectors[head]),
+            "quantity": (
+                "mean over receiving nodes of native GRIT routed head output wV"
+            ),
+        }
+    return output
+
+
+def _mean_keywise_std(matrix: Any) -> Any:
+    """Per-head mean query-wise std over finite supported keys."""
+
+    import torch
+
+    finite = torch.isfinite(matrix)
+    safe = torch.where(finite, matrix, torch.zeros_like(matrix))
+    count = finite.sum(dim=-1)
+    mean = safe.sum(dim=-1) / count.clamp_min(1)
+    centered = torch.where(
+        finite, matrix - mean.unsqueeze(-1), torch.zeros_like(matrix)
+    )
+    variance = centered.square().sum(dim=-1) / (count - 1).clamp_min(1)
+    std = torch.sqrt(torch.clamp(variance, min=0.0))
+    valid_query = count > 1
+    return (
+        torch.where(valid_query, std, torch.zeros_like(std)).sum(dim=-1)
+        / valid_query.sum(dim=-1).clamp_min(1)
+    )
+
+
+def aggregate_logit_spread(
+    figure_runtime: GritFigureRuntime,
+    *,
+    n_graphs: int = 100,
+    verbose: bool = True,
+) -> dict[str, Any]:
+    """Aggregate GRIT node-only and relation-conditioned raw-logit spread.
+
+    GRIT does not have Graphormer's additive ``dot + structural bias`` logits.
+    The first curve is the exact counterfactual obtained by sending ``K_j+Q_i``
+    through GRIT's activation/projection without the edge/RRWP state; the second
+    is the actual relation-conditioned pre-softmax logit.
+    """
+
+    extractor = GritDiagnosticExtractor(figure_runtime)
+    node_rows: list[np.ndarray] = []
+    relation_rows: list[np.ndarray] = []
+    positions: list[int] = []
+    limit = min(int(n_graphs), len(figure_runtime.runtime.eval_ds))
+    for position in range(limit):
+        try:
+            graph = figure_runtime.runtime.eval_ds[position]
+            captured = extractor.extract(graph)
+            node_rows.append(
+                np.stack(
+                    [
+                        _mean_keywise_std(value).float().cpu().numpy()
+                        for value in captured.node_only_logits
+                    ]
+                )
+            )
+            relation_rows.append(
+                np.stack(
+                    [
+                        _mean_keywise_std(value).float().cpu().numpy()
+                        for value in captured.relation_logits
+                    ]
+                )
+            )
+        except Exception as error:
+            if verbose:
+                print(f"  [GRIT logit spread] skipped {position}: {error}")
+            continue
+        positions.append(position)
+        if verbose and (position + 1) % 10 == 0:
+            print(f"  [GRIT logit spread] {position + 1}/{limit}")
+    if not node_rows:
+        raise RuntimeError("no graph produced valid GRIT logit diagnostics")
+
+    node_per_graph = np.stack(node_rows)
+    relation_per_graph = np.stack(relation_rows)
+    node_layer_per_graph = node_per_graph.mean(axis=-1)
+    relation_layer_per_graph = relation_per_graph.mean(axis=-1)
+    ratio_per_graph = np.log10(
+        np.clip(
+            node_per_graph / np.clip(relation_per_graph, 1e-12, None),
+            1e-12,
+            None,
+        )
+    )
+    ddof = 1 if len(node_rows) > 1 else 0
+    return {
+        "task": figure_runtime.prepared.task.name,
+        "node_std_mean": node_layer_per_graph.mean(axis=0),
+        "node_std_std": node_layer_per_graph.std(axis=0, ddof=ddof),
+        "relation_std_mean": relation_layer_per_graph.mean(axis=0),
+        "relation_std_std": relation_layer_per_graph.std(axis=0, ddof=ddof),
+        "log_r_mean": ratio_per_graph.mean(axis=0),
+        "log_r_std": ratio_per_graph.std(axis=0, ddof=ddof),
+        "node_per_graph": node_per_graph,
+        "relation_per_graph": relation_per_graph,
+        "positions": np.asarray(positions, dtype=np.int64),
+        "n_requested": int(n_graphs),
+        "n_used": len(node_rows),
+        "ratio": "log10(std(node-only counterfactual)/std(relation-conditioned actual))",
+    }
+
+
+class GritPerGraphCoordinateEstimator:
+    """Replay canonical scoring for selected evaluation graphs only."""
+
+    ESTIMATOR_VERSION = "canonical-graph-local-head-coordinates-v1"
+
+    def __init__(
+        self,
+        figure_runtime: GritFigureRuntime,
+        artifact: ReadOnlyCacheArtifact,
+        model_record: Mapping[str, Any],
+        *,
+        output_dir: str | Path,
+    ):
+        self.figure_runtime = figure_runtime
+        self.artifact = artifact
+        self.model_record = dict(model_record)
+        self.output_dir = Path(output_dir)
+        self.contract = dict(artifact.metadata["contract"])
+        self.original_splits = _split_manifest_from_record(self.model_record)
+        if self.original_splits.fingerprint != self.contract["split_fingerprint"]:
+            raise StaleCacheError(
+                "canonical model record and score cache use different split manifests"
+            )
+
+    def estimate(self, graph_indices: Sequence[int]) -> dict[int, dict[str, Any]]:
+        indices = tuple(dict.fromkeys(int(value) for value in graph_indices))
+        if not indices:
+            raise ValueError("at least one evaluation graph index is required")
+        runtime = self.figure_runtime.runtime
+        invalid = [
+            value for value in indices if value < 0 or value >= len(runtime.eval_ds)
+        ]
+        if invalid:
+            raise IndexError(f"GRIT evaluation graph indices are out of range: {invalid}")
+        if self.original_splits.same_index_space and set(indices).intersection(
+            self.original_splits.semantic_donor_pool
+        ):
+            raise ValueError(
+                "displayed graph indices overlap the canonical semantic donor pool "
+                "in a shared eval/donor index space"
+            )
+        splits = SplitManifest(
+            discovery=indices,
+            causal=(),
+            clean_ablation=(),
+            semantic_donor_pool=self.original_splits.semantic_donor_pool,
+            same_index_space=self.original_splits.same_index_space,
+            seed=int(self.original_splits.seed),
+        )
+        prepared = dataclasses.replace(
+            self.figure_runtime.prepared,
+            output_dir=self.output_dir,
+            splits=splits,
+            progress=None,
+        )
+        original = self.figure_runtime.protocol_config
+        sizes = RunSizes(
+            discovery_graphs=len(indices),
+            causal_graphs=1,
+            clean_ablation_graphs=1,
+            semantic_donor_graphs=len(self.original_splits.semantic_donor_pool),
+            sources_per_graph=int(self.contract["source_cap"]),
+            donors_per_source=int(self.contract["donors_per_source"]),
+        )
+        config = dataclasses.replace(
+            original,
+            output_dir=str(self.output_dir),
+            tasks=(prepared.task.name,),
+            train_seeds=(int(self.contract["train_seed"]),),
+            task_train_seeds={},
+            phases=("scores",),
+            sizes=sizes,
+            execution=dataclasses.replace(
+                original.execution, graphs_per_batch=1
+            ),
+            resume=False,
+            force=False,
+        )
+        estimate = estimate_graph_local_head_coordinates(prepared, config)
+        output: dict[int, dict[str, Any]] = {}
+        for graph_index in indices:
+            value = dict(estimate["graphs"][graph_index])
+            value["graph_index"] = int(graph_index)
+            value["estimation"] = {
+                "estimator": self.ESTIMATOR_VERSION,
+                "canonical_source_protocol": self.artifact.metadata[
+                    "protocol_version"
+                ],
+                "implementation_protocol": estimate["protocol_version"],
+                "manifest_hash": estimate["manifest_hash"],
+                "graph_id_seed_space": "GRIT evaluation-split position",
+                "analysis_seed": int(estimate["analysis_seed"]),
+                "sources_per_graph": int(estimate["sources_per_graph"]),
+                "donors_per_source": int(estimate["donors_per_source"]),
+                "semantic_donor_pool_size": len(
+                    self.original_splits.semantic_donor_pool
+                ),
+            }
+            output[graph_index] = value
+        return output
+
+
+__all__ = [
+    "CanonicalHeadMetrics",
+    "GritDiagnosticCapture",
+    "GritDiagnosticExtractor",
+    "GritFigureRuntime",
+    "GritPerGraphCoordinateEstimator",
+    "Head",
+    "SupplementalCache",
+    "aggregate_logit_spread",
+    "build_verified_grit_figure_runtime",
+    "collect_attention_examples",
+    "compute_av_pca_inputs",
+    "compute_av_pca_inputs_many",
+    "graph_node_labels",
+    "label_attention_focus",
+    "load_canonical_model_record",
+    "load_canonical_score_artifact",
+    "methodology_config_from_record",
+    "select_attention_grid_indices",
+    "select_ranked_heads",
+    "select_specialist_heads",
+    "select_structural_specialist_head",
+]

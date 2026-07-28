@@ -1324,6 +1324,111 @@ def _score_graph_batch(
     return results
 
 
+def estimate_graph_local_head_coordinates(
+    prepared: PreparedTask,
+    config: MethodologyConfig,
+    *,
+    plan: Mapping[int, Mapping[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Estimate canonical ``D_rel``/``J`` separately for requested graphs.
+
+    This is an additive reporting diagnostic: it reuses the canonical event
+    planner, clean Jacobians, donor-swap scorer, and graph/source aggregation,
+    but it never writes or relabels the consolidated ``scores/raw.pt`` cache.
+    """
+
+    plan = dict(plan or _stage_plan(prepared, config, "scores"))
+    graph_ids = sorted(int(graph_id) for graph_id in plan)
+    if not graph_ids:
+        raise ValueError("graph-local coordinate estimation needs at least one graph")
+
+    axis = _distance_axis(prepared, graph_ids)
+    clean_by_graph: dict[int, Any] = {}
+    clean_many = getattr(prepared.backend, "clean_jacobians_many", None)
+    configured_batch = int(config.execution.graphs_per_batch)
+    backend_limit = getattr(prepared.backend, "clean_jacobian_batch_size", None)
+    clean_batch = (
+        configured_batch
+        if backend_limit is None
+        else min(configured_batch, max(1, int(backend_limit)))
+    )
+
+    def execute_clean(chunk):
+        bases = [prepared.grit.eval_ds[int(graph_id)] for graph_id in chunk]
+        values = (
+            clean_many(bases)
+            if callable(clean_many)
+            else [prepared.backend.clean_jacobians(base) for base in bases]
+        )
+        if len(values) != len(chunk):
+            raise RuntimeError("grouped clean Jacobians changed the graph count")
+        return list(zip((int(value) for value in chunk), values))
+
+    execute_graph_batches(
+        graph_ids,
+        graphs_per_batch=clean_batch,
+        execute=execute_clean,
+        consume=lambda rows: clean_by_graph.update(rows),
+        oom_backoff=config.execution.oom_backoff,
+    )
+
+    channel_scores: dict[str, dict[int, np.ndarray]] = {
+        channel: {} for channel in CHANNELS
+    }
+    for channel in CHANNELS:
+
+        def consume_score_batch(results):
+            for result in results:
+                channel_scores[channel][int(result["graph_id"])] = np.asarray(
+                    result["score"], dtype=np.float64
+                )
+
+        execute_graph_batches(
+            graph_ids,
+            graphs_per_batch=config.execution.graphs_per_batch,
+            execute=lambda chunk, selected_channel=channel: _score_graph_batch(
+                prepared,
+                config,
+                plan,
+                clean_by_graph,
+                axis,
+                selected_channel,
+                chunk,
+            ),
+            consume=consume_score_batch,
+            oom_backoff=config.execution.oom_backoff,
+            item_cost=lambda graph_id, selected_channel=channel: _event_item_cost(
+                prepared,
+                config,
+                plan,
+                int(graph_id),
+                selected_channel,
+            ),
+            max_cost=config.execution.replica_pair_budget,
+        )
+
+    graphs: dict[int, dict[str, Any]] = {}
+    for graph_id in graph_ids:
+        coordinates = head_coordinates(
+            channel_scores["semantic"][graph_id],
+            channel_scores["structural"][graph_id],
+            score_floor=config.numerical.score_floor,
+            epsilon=config.numerical.selectivity_epsilon,
+            activity_floor=config.families.activity_floor,
+        )
+        graphs[graph_id] = dataclasses.asdict(coordinates)
+    return {
+        "protocol_version": PROTOCOL_VERSION,
+        "estimator": "canonical-graph-local-head-coordinates-v1",
+        "manifest_hash": _manifest_hash(plan),
+        "graph_id_seed_space": "caller-supplied graph ID",
+        "sources_per_graph": int(config.sizes.sources_per_graph),
+        "donors_per_source": int(config.sizes.donors_per_source),
+        "analysis_seed": int(config.analysis_seed),
+        "graphs": graphs,
+    }
+
+
 def run_scores(
     prepared: PreparedTask,
     config: MethodologyConfig,
