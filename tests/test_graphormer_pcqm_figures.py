@@ -390,6 +390,27 @@ def test_requested_scatter_figures_have_no_errorbar_artists():
             ]
             assert len(highlight_rings) == 2
             assert all(len(ring.get_facecolors()) == 0 for ring in highlight_rings)
+            specialist_annotations = {
+                text.get_text().split()[0].lower(): text
+                for axis in figure.axes
+                for text in axis.texts
+                if "specialist" in text.get_text()
+            }
+            assert set(specialist_annotations) == {"semantic", "structural"}
+            for label, expected_color in (
+                ("semantic", "#E6A700"),
+                ("structural", "#087E8B"),
+            ):
+                patch = specialist_annotations[label].get_bbox_patch()
+                assert patch is not None
+                assert np.allclose(
+                    patch.get_facecolor(),
+                    to_rgba("white", alpha=0.94),
+                )
+                assert np.allclose(
+                    patch.get_edgecolor()[:3],
+                    to_rgba(expected_color)[:3],
+                )
     finally:
         for figure in figures:
             plt.close(figure)

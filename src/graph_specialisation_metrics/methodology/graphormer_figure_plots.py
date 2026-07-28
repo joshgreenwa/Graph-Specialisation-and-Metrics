@@ -310,6 +310,13 @@ def _annotate_selected_scatter(
             fontweight="bold",
             ha="right" if x_offset < 0 else "left",
             va="top" if y_offset < 0 else "bottom",
+            bbox={
+                "boxstyle": "round,pad=0.28",
+                "facecolor": "white",
+                "edgecolor": style["color"],
+                "linewidth": 0.8,
+                "alpha": 0.94,
+            },
             arrowprops={
                 "arrowstyle": "-",
                 "color": style["color"],
