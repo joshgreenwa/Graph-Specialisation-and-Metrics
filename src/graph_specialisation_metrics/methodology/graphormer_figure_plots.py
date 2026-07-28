@@ -10,7 +10,6 @@ import json
 
 import matplotlib.pyplot as plt
 from matplotlib.colors import Normalize, TwoSlopeNorm
-from matplotlib.patches import Rectangle
 import numpy as np
 
 from .graphormer_figure_data import CanonicalHeadMetrics, Head
@@ -88,24 +87,6 @@ def _head_label(head: Head) -> str:
     return f"L{head[0]} H{head[1]}"
 
 
-def _mark_heads(ax, selected_heads: Mapping[str, Head] | None) -> None:
-    if not selected_heads:
-        return
-    for role, (layer, head) in selected_heads.items():
-        style = HEAD_STYLES.get(role, {"color": NAVY})
-        ax.add_patch(
-            Rectangle(
-                (head - 0.47, layer - 0.47),
-                0.94,
-                0.94,
-                fill=False,
-                edgecolor=style["color"],
-                linewidth=2.0,
-                zorder=5,
-            )
-        )
-
-
 def _heatmap(
     ax,
     values: np.ndarray,
@@ -113,7 +94,6 @@ def _heatmap(
     title: str,
     cmap,
     norm,
-    selected_heads: Mapping[str, Head] | None,
 ):
     image = ax.imshow(
         values,
@@ -132,7 +112,6 @@ def _heatmap(
     ax.set_yticks(np.arange(layers))
     ax.set_yticklabels(np.arange(layers))
     ax.tick_params(length=0)
-    _mark_heads(ax, selected_heads)
     return image
 
 
@@ -167,7 +146,6 @@ def plot_score_heatmaps(
         title=r"Semantic score $S_{\rm sem}/\overline{S}_{\rm sem}$",
         cmap="viridis",
         norm=norm,
-        selected_heads=selected_heads,
     )
     _heatmap(
         axes[1],
@@ -175,7 +153,6 @@ def plot_score_heatmaps(
         title=r"Structural score $S_{\rm str}/\overline{S}_{\rm str}$",
         cmap="viridis",
         norm=norm,
-        selected_heads=selected_heads,
     )
     colorbar = fig.colorbar(semantic, ax=axes, shrink=0.86, pad=0.015)
     colorbar.set_label("Within-model normalized score")
@@ -211,7 +188,6 @@ def plot_coordinate_heatmaps(
         title=r"Relative selectivity $D_{\rm rel}$ (active heads)",
         cmap=selectivity_cmap,
         norm=TwoSlopeNorm(vmin=-d_max, vcenter=0.0, vmax=d_max),
-        selected_heads=selected_heads,
     )
     joint = _heatmap(
         axes[1],
@@ -219,7 +195,6 @@ def plot_coordinate_heatmaps(
         title=r"Joint sensitivity $J$",
         cmap="viridis",
         norm=Normalize(vmin=0.0, vmax=j_max),
-        selected_heads=selected_heads,
     )
     d_bar = fig.colorbar(selectivity, ax=axes[0], shrink=0.86, pad=0.015)
     d_bar.set_label(

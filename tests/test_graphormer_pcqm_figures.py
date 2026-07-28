@@ -451,6 +451,23 @@ def test_score_heatmaps_and_scatter_restore_viridis():
         plt.close(scatter)
 
 
+def test_heatmaps_do_not_outline_selected_heads():
+    metrics = synthetic_metrics()
+    selected = {"semantic": (1, 2), "structural": (0, 0)}
+    figures = (
+        plot_score_heatmaps(metrics, selected),
+        plot_coordinate_heatmaps(metrics, selected),
+    )
+    try:
+        for figure in figures:
+            image_axes = [axis for axis in figure.axes if axis.images]
+            assert len(image_axes) == 2
+            assert all(len(axis.patches) == 0 for axis in image_axes)
+    finally:
+        for figure in figures:
+            plt.close(figure)
+
+
 def test_hop_plot_separates_graph_token_tick():
     figure = plot_hop_attention_mass(synthetic_metrics(), (0, 0))
     try:
