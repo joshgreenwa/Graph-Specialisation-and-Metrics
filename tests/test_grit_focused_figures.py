@@ -13,17 +13,27 @@ import pytest
 matplotlib.use("Agg")
 
 from graph_specialisation_metrics.methodology.grit_figure_data import (  # noqa: E402
+    CHEMISTRY_FOCUS_VERSION,
     CanonicalHeadMetrics,
     GritDiagnosticExtractor,
     SupplementalCache,
+    ZINC_ATOM_TYPES,
+    atom_chemistry_categories,
+    figure_identity,
+    graph_node_labels,
+    label_attention_focus,
     load_canonical_model_record,
     load_canonical_score_artifact,
     methodology_config_from_record,
+    molecule_from_graph,
+    molecule_record,
     select_ranked_heads,
     select_specialist_heads,
     select_structural_specialist_head,
 )
 from graph_specialisation_metrics.methodology.grit_figure_plots import (  # noqa: E402
+    PCA_FOCUS_COLORS,
+    _pca_focus_color,
     plot_attention_grid,
     plot_av_pca,
     plot_coordinate_heatmaps,
@@ -282,8 +292,64 @@ def test_protocol_record_reconstructs_runtime_configuration(tmp_path: Path):
     assert restored.fingerprint == original.fingerprint
 
 
+def test_zinc_and_qm9_graphs_reconstruct_as_index_preserving_molecules():
+    pytest.importorskip("rdkit")
+
+    zinc = SimpleNamespace(
+        x=np.asarray([[0], [0], [1]], dtype=np.int64),
+        num_nodes=3,
+        edge_index=np.asarray(
+            [[0, 1, 1, 2], [1, 0, 2, 1]], dtype=np.int64
+        ),
+        edge_attr=np.asarray([1, 1, 1, 1], dtype=np.int64),
+    )
+    zinc_molecule = molecule_from_graph("zinc", zinc)
+    zinc_payload = molecule_record("zinc", zinc)
+    assert ZINC_ATOM_TYPES[4] == "C H1"
+    assert graph_node_labels("zinc", zinc) == ["C", "C", "O"]
+    assert [atom.GetSymbol() for atom in zinc_molecule.GetAtoms()] == [
+        "C",
+        "C",
+        "O",
+    ]
+    assert zinc_payload["smiles"] == "CCO"
+    assert zinc_payload["formula"] == "C2H6O"
+    assert zinc_payload["chemistry_focus_version"] == CHEMISTRY_FOCUS_VERSION
+
+    qm9 = SimpleNamespace(
+        x=np.asarray([[8], [1], [1]], dtype=np.int64),
+        num_nodes=3,
+        edge_index=np.asarray(
+            [[0, 1, 0, 2], [1, 0, 2, 0]], dtype=np.int64
+        ),
+        edge_attr=np.asarray([0, 0, 0, 0], dtype=np.int64),
+        name="gdb_1",
+    )
+    qm9_payload = molecule_record("qm9_gap_dense", qm9)
+    assert qm9_payload["formula"] == "H2O"
+    assert qm9_payload["molecule_name"] == "gdb_1"
+    assert figure_identity("qm9_gap_dense")["display_title"] == (
+        "QM9 HOMO–LUMO gap — dense GRIT+RRWP"
+    )
+
+
+def test_pcqm_chemistry_categories_and_pca_colours_are_global():
+    Chem = pytest.importorskip("rdkit.Chem")
+
+    molecule = Chem.MolFromSmiles("CC(=O)O")
+    categories = atom_chemistry_categories(molecule)
+    assert categories[2] == "O: carbonyl"
+    assert categories[3] == "O: ester/carboxyl"
+    mass = np.asarray([0.0, 0.0, 0.9, 0.1])
+    assert label_attention_focus(molecule, mass) == "O: carbonyl"
+    assert _pca_focus_color("O: carbonyl") == PCA_FOCUS_COLORS["O: carbonyl"]
+    assert _pca_focus_color("O: carbonyl") == "#C45100"
+    assert _pca_focus_color("unknown category") == "#607080"
+
+
 def test_grit_plotting_api_accepts_synthetic_payloads():
     import matplotlib.pyplot as plt
+    Chem = pytest.importorskip("rdkit.Chem")
 
     metrics = CanonicalHeadMetrics.from_scores(_score_value())
     selected = {"semantic": (0, 0), "structural": (0, 1)}
@@ -297,14 +363,17 @@ def test_grit_plotting_api_accepts_synthetic_payloads():
     ]
     attention = {
         "task": "zinc",
+        "dataset_label": "ZINC-subset",
+        "model_label": "dense GRIT+RRWP",
+        "display_title": "ZINC-subset — dense GRIT+RRWP",
         "examples": [
             {
                 "dataset_index": 0,
                 "n_atoms": 3,
-                "node_labels": ["C", "O", "N"],
-                "edge_index": np.asarray(
-                    [[0, 1, 1, 2], [1, 0, 2, 1]], dtype=np.int64
-                ),
+                "mol_block": Chem.MolToMolBlock(Chem.MolFromSmiles("CON")),
+                "smiles": "CON",
+                "formula": "CH5NO",
+                "molecule_name": None,
                 "attention": {
                     "semantic": np.asarray(
                         [
@@ -331,15 +400,17 @@ def test_grit_plotting_api_accepts_synthetic_payloads():
         plot_av_pca(
             {
                 "task": "zinc",
+                "display_title": "ZINC-subset — dense GRIT+RRWP",
                 "head": (0, 0),
                 "vectors": np.arange(24, dtype=float).reshape(8, 3),
-                "labels": ["C-focused"] * 4 + ["O-focused"] * 4,
+                "labels": ["Ring: aromatic"] * 4 + ["O: carbonyl"] * 4,
                 "n_used": 8,
             }
         )
     )
     logit = {
         "task": "zinc",
+        "display_title": "ZINC-subset — dense GRIT+RRWP",
         "n_used": 5,
         "node_std_mean": np.asarray([0.5, 0.8]),
         "node_std_std": np.asarray([0.1, 0.1]),

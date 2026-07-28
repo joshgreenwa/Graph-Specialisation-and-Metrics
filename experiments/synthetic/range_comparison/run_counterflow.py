@@ -30,12 +30,24 @@ label-dependent information from mere response magnitude.  It also puts the L1 k
 the integration path (it sits at ``alpha = (1+tau)/2``), which finally exercises the adaptive
 Gauss-Kronrod refinement that a quadratic loss on an affine path leaves untouched.
 
-ORIENTATION.  All three measures are anchored at the source and distributed over carriers.  This is
-the orientation ``F_sens`` and ``B`` are natively defined in, and it is the only informative one
-here: with a single input node, Bamberger's carrier-anchored normalisation is degenerate -- each
-output sees exactly one input, so its per-node ratio collapses to the distance itself and carries no
-sensitivity information at all.  The Jacobian arm is the same influence quantity the paper defines,
-read in the orientation this task admits.
+ORIENTATION -- BOTH ARE REPORTED, because they behave completely differently and reporting only one
+would be unfair.
+
+``rho_src``      source-anchored: normalise the influence over CARRIERS at the fixed source.  This
+                 is the orientation ``F_sens`` and ``B`` are natively defined in, so it is the only
+                 one in which the three measures are comparable.  It collapses to 1 as the far
+                 pathway saturates.
+``rho_carrier``  the paper's own carrier-anchored ``rho_hat_u``, normalised over INPUTS at fixed
+                 output, averaged over estimable outputs.  It is NOT fooled by saturation -- but
+                 only because it is uninformative here: every estimable output node has exactly one
+                 input, so its per-node ratio collapses to that distance and the graph mean is
+                 ``(1 + D) / 2`` for every gamma and every kappa.  It therefore also fails to move
+                 when gamma changes the true balance between the pathways, which the true range
+                 tracks and it does not.
+
+``true_range`` is the expected distance of the finite response.  With a binary input the donor swap
+is the ONLY possible change to it, so that response profile IS the complete functional dependence
+and its expected distance is exact -- there is nothing left for a derivative to add.
 
 Production entry points only: ``functional_carriage`` for F_sens and the registered
 ``beneficial_carriage`` wrapper (with ``pooling='add'``, the README's registered linear carrier
@@ -119,6 +131,13 @@ def measure(graph, model, pool, *, source, near, far, distance, donors, tau, rng
     mass = influence.sum()
     jac_range = float((influence * distances[:, source]).sum() / mass) if mass > 0 else float("nan")
 
+    # The paper's OWN carrier-anchored orientation, for fairness: rho_hat_u normalises over inputs
+    # at fixed output u, then averages over estimable u.  Reported alongside because it behaves
+    # completely differently here -- see the note in the module docstring.
+    full = jac.abs().sum(dim=(1, 3)).detach().numpy()          # [out, in]
+    per_node = R.normalised_range_from_influence(full, distances)
+    jac_carrier = R.safe_nanmean(per_node)
+
     # --- the registered semantic donor swap ---------------------------------------------
     variants, records = build_channel_events(
         graph, graph_id=0, source=int(source), channel="semantic", stage="counterflow",
@@ -136,6 +155,12 @@ def measure(graph, model, pool, *, source, near, far, distance, donors, tau, rng
     readout = torch.autograd.functional.jacobian(pooled, states, vectorize=True)  # [1,N,1]
     delta = (h_clean.unsqueeze(0) - h_event).unsqueeze(0)                          # [1,K,N,1]
     F = functional_carriage(delta, readout)[:, 0].numpy()                          # [carrier]
+
+    # The complete answer.  The input is binary, so the donor swap is the ONLY possible change to
+    # it: the finite response profile is the entire functional dependence, and its expected
+    # distance is the exact range with nothing left for a derivative to add.
+    finite_mass = F.sum()
+    true_range = float((F * distances[:, source]).sum() / finite_mass) if finite_mass > 0 else float("nan")
 
     # --- Beneficial carriage: registered wrapper, add pooling, L1 loss -------------------
     def loss_from_pooled(values: torch.Tensor) -> torch.Tensor:
@@ -157,8 +182,10 @@ def measure(graph, model, pool, *, source, near, far, distance, donors, tau, rng
         "b": b,
         "donor_flipped": flipped,
         "jacobian_range": jac_range,
+        "jacobian_carrier_anchored": float(jac_carrier),
         "jacobian_weight_near": float(influence[near]),
         "jacobian_weight_far": float(influence[far]),
+        "true_range": true_range,
         "F_near": float(F[near]),
         "F_far": float(F[far]),
         "B_near": float(B[near]),
@@ -178,6 +205,10 @@ def analytic(*, gamma: float, kappa: float, distance: int, tau: float) -> dict:
     near_w, far_w = gamma, (1.0 + gamma) * derivative
     return {
         "jacobian_range": (near_w * 1.0 + far_w * distance) / (near_w + far_w),
+        # Carrier-anchored: each estimable output node has exactly ONE input, so its per-node ratio
+        # collapses to that distance and the graph mean is (1 + D) / 2 -- free of gamma and kappa.
+        "jacobian_carrier_anchored": (1.0 + distance) / 2.0,
+        "true_range": (gamma + distance * (1.0 + gamma)) / (1.0 + 2.0 * gamma),
         "F_near": 2.0 * gamma,
         "F_far": 2.0 * (1.0 + gamma),
         "B_near": -2.0 * gamma * tau,
@@ -226,8 +257,8 @@ def run(args) -> dict:
             "expected": expected,
             "measured": {
                 key: float(np.mean([e[key] for e in per_graph]))
-                for key in ("jacobian_range", "F_near", "F_far", "B_near", "B_far", "B_sum",
-                            "loss_increase")
+                for key in ("jacobian_range", "jacobian_carrier_anchored", "true_range",
+                            "F_near", "F_far", "B_near", "B_far", "B_sum", "loss_increase")
             },
             "donor_always_flipped": bool(all(e["donor_flipped"] for e in per_graph)),
             "residual_max": float(max(e["residual"] for e in per_graph)),
@@ -239,7 +270,8 @@ def run(args) -> dict:
         m, x = row["measured"], row["expected"]
         print(
             f"g={gamma:<4} k={kappa:<5} D={distance:<3} t={tau:<4} | "
-            f"rho_J {m['jacobian_range']:6.3f} (exp {x['jacobian_range']:6.3f})  "
+            f"true {m['true_range']:6.3f}  rho_src {m['jacobian_range']:6.3f}"
+            f"  rho_carrier {m['jacobian_carrier_anchored']:5.2f}  "
             f"F {m['F_near']:5.2f}/{m['F_far']:5.2f} (exp {x['F_near']:.2f}/{x['F_far']:.2f})  "
             f"B {m['B_near']:+5.2f}/{m['B_far']:+5.2f} (exp {x['B_near']:+.2f}/{x['B_far']:+.2f})  "
             f"sum {m['B_sum']:+5.2f}  int={row['intervals_max']:.0f}  res={row['residual_max']:.1e}",
@@ -253,7 +285,13 @@ def main() -> None:
     parser.add_argument("--gammas", type=float, nargs="+", default=[0.25, 1.0, 3.0])
     parser.add_argument("--kappas", type=float, nargs="+", default=[0.5, 1.0, 2.0, 4.0, 8.0])
     parser.add_argument("--distances", type=int, nargs="+", default=[2, 5, 10])
-    parser.add_argument("--taus", type=float, nargs="+", default=[1.0])
+    parser.add_argument(
+        "--taus", type=float, nargs="+",
+        # Off-dyadic values are deliberate: a kink landing on a Gauss-Kronrod panel
+        # centre is integrated exactly by odd symmetry WITHOUT refining, so a dyadic
+        # grid alone cannot demonstrate that the adaptive quadrature does any work.
+        default=[1.0, 0.7, 0.5, 0.3, 0.0, -0.3, -0.5],
+    )
     parser.add_argument("--graphs", type=int, default=8)
     parser.add_argument("--donor-graphs", type=int, default=6)
     parser.add_argument("--donors", type=int, default=4)

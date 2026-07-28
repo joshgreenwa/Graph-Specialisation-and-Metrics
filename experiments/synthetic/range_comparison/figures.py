@@ -1160,11 +1160,16 @@ def figure_counterflow() -> Path:
         ax.plot(
             [r["kappa"] for r in sub], [r["measured"]["jacobian_range"] for r in sub],
             color=colour, marker="o", markersize=3.6, markerfacecolor="white",
-            markeredgewidth=1.1, label=rf"Jacobian, $D={distance}$",
+            markeredgewidth=1.1, label=rf"source-anchored, $D={distance}$",
         )
-    far = rows[0]["expected"]["F_far"]
     sub = sorted([r for r in rows if r["gamma"] == gamma and r["distance"] == 10 and r["tau"] == 1.0],
                  key=lambda r: r["kappa"])
+    ax.plot([r["kappa"] for r in sub], [r["measured"]["true_range"] for r in sub],
+            color=MUTED, linewidth=3.0, alpha=0.55, solid_capstyle="round",
+            label=r"exact range, $D=10$", zorder=1)
+    ax.plot([r["kappa"] for r in sub], [r["measured"]["jacobian_carrier_anchored"] for r in sub],
+            color=MUTED, linewidth=1.1, linestyle=(0, (1, 2)),
+            label=r"carrier-anchored $\hat{\rho}$")
     ax.plot([r["kappa"] for r in sub], [r["measured"]["F_far"] for r in sub],
             color=CARRIAGE, marker="s", markersize=3.6, linestyle=(0, (3.5, 2.2)),
             label=r"$F_{\mathrm{sens}}$ at $d=D$")
@@ -1177,7 +1182,8 @@ def figure_counterflow() -> Path:
     ax.set_xlabel(r"Saturation $\kappa$")
     ax.set_ylabel("Range / response")
     ax.set_title("Saturation hides the far pathway", pad=4)
-    ax.legend(frameon=False, fontsize=5.4, handlelength=1.4, borderpad=0.1)
+    ax.legend(frameon=False, fontsize=4.8, handlelength=1.3, borderpad=0.1,
+              labelspacing=0.22, loc="center right")
     ax.grid(axis="y", alpha=0.9)
     ax.set_axisbelow(True)
     panel_letter(ax, "a", dx=-0.36)
@@ -1226,8 +1232,9 @@ def figure_counterflow() -> Path:
     ax.set_xlabel(r"Target alignment $\tau$  ($y=\tau b$)")
     ax.set_ylabel("Value")
     ax.set_xticks(taus)
+    ax.set_ylabel("Carriage / range")
     ax.set_title("Only $B$ sees the label", pad=4)
-    ax.legend(frameon=False, fontsize=5.6, handlelength=1.4, borderpad=0.1)
+    ax.legend(frameon=False, fontsize=5.4, handlelength=1.4, borderpad=0.1, loc="center left")
     ax.grid(axis="y", alpha=0.9)
     ax.set_axisbelow(True)
     panel_letter(ax, "c", dx=-0.40)

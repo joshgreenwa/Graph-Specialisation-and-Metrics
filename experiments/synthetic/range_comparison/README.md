@@ -422,6 +422,73 @@ consequential and quantifies it.
 `2.7e-15`): an MSE loss on an affine path is a degree-1 integrand and Gauss–Kronrod is exact, so
 `√S_B` here is a closed-form quantity, not a test of the quadrature.
 
+## Saturated long-range pathway with local counterflow
+
+`fig10_counterflow.png`, `run_counterflow.py`. A path graph with one source `s`, a near carrier at
+`d=1` and a far carrier at `d=D`. The source feature is `b ∈ {−1,+1}` and
+
+```
+h_1 = −γ·b                    local pathway, linear
+h_D = (1+γ)·φ_κ(b)            far pathway, saturating
+φ_κ(b) = tanh(κb)/tanh(κ)     φ_κ(±1) = ±1 exactly, for every κ
+ŷ = h_1 + h_D                 sum pooling
+```
+
+Because `φ_κ(±1) = ±1` **exactly for all κ**, the map on its data is `ŷ = b` and a donor swap flips
+it to `−b` regardless of `κ`. The finite response is invariant to saturation while the far
+pathway's derivative `(1+γ)φ'_κ(b)` vanishes: `κ` changes neither the function's values on the data
+nor the task, only the tangent. With `±1` payloads, §2.1 eligibility rule 2 *guarantees* the flip —
+the production donor law delivers exactly the required intervention, verified on every event.
+
+**The exact reference.** The input is binary, so the donor swap is the *only* possible change to
+it: the finite response profile is the complete functional dependence and its expected distance is
+the exact range, with nothing left for a derivative to add. (It is computed from `F_sens`, so it
+cannot be used to score `F_sens` — it is the reference for the tangent arms.)
+
+**Both orientations of the Jacobian are reported**, because they behave completely differently and
+showing only one would be unfair:
+
+At `κ = 8`, `D = 10`, varying the pathway balance `γ`:
+
+| γ | exact range | source-anchored `ρ` | **carrier-anchored `ρ̂` (the paper's own)** |
+|---|---|---|---|
+| 0.25 | 8.500 | 1.000 | **5.50** |
+| 1.0 | 7.000 | 1.000 | **5.50** |
+| 3.0 | 6.143 | 1.000 | **5.50** |
+
+The source-anchored reading — the orientation in which `F_sens` and `B` are natively defined, and
+the only one in which the three measures are comparable — collapses to `1.000` (precisely
+`1 + 6.5e-5`, not exactly 1; it reaches 1 only as `κ → ∞`).
+
+**The paper's own carrier-anchored `ρ̂` is not fooled by saturation — but only because it is
+uninformative here.** Every estimable output node has exactly one input, so its per-node ratio
+collapses to that distance and the graph mean is `(1 + D)/2` for **every** `γ` and **every** `κ`.
+It returns `5.50` while the true range moves from `8.50` to `6.14`. That is the more interesting
+finding than the collapse: on this construction their estimator is constant by construction, so it
+cannot be wrong about saturation and equally cannot be right about anything else.
+
+**What the finite measures do.** `F_sens` reports `F(1) = 2γ`, `F(D) = 2(1+γ)` — both pathways,
+correct dominance, invariant to `κ`. `B` additionally separates them by *sign*: at `γ=1` the far
+pathway is beneficial (`+4`) while the local pathway actively **counteracts** it (`−2`), and their
+sum `+2` is exactly the donor-swap loss increase, as §6's completeness identity requires. All 315
+cells match their closed forms: worst deviation `3.3e-14` for the Jacobian (traced to `tanh`
+backward cancelling `1 − tanh²` at `κ = 8`), `0.0` for `F_sens`, `2.6e-7` for `B` at the
+tolerance-limited off-dyadic cells.
+
+**The target-alignment control** (`y = τb`) is the cleanest label-dependence result here. Both
+Jacobian orientations and `F_sens` are numerically unchanged across `τ`; `B` scales exactly
+linearly with it, vanishes at `τ = 0` — functionally active, zero task benefit — and inverts at
+`τ < 0`.
+
+**It also exercises the path integrator, but only at off-dyadic `τ`, and that distinction is the
+point.** The L1 kink sits at `α = (1+τ)/2`. A kink landing on a Gauss–Kronrod panel centre is
+odd-symmetric about it, so both embedded rules cancel to zero, the error estimate is exactly zero
+and the scheme reports convergence **without refining**: `τ ∈ {1, 0.5, 0, −0.5}` use 1–2 intervals
+even though `τ = 0`'s kink is strictly interior. Off-dyadic `τ ∈ {±0.3, 0.7}` use **22–23
+intervals** with residual `~5e-8` — genuine refinement. This is the only result in the study that
+is evidence about the quadrature rather than about a closed form, and it also shows the interval
+count is not a reliable kink-localisation diagnostic on its own.
+
 ## Files
 
 | file | what it does |
@@ -432,6 +499,7 @@ consequential and quantifies it.
 | `run_learned.py` | the same comparison on trained approximators |
 | `run_divergence.py` | dose interpolation, step, oscillation and channel-count sweeps |
 | `run_graphlevel.py` | graph-level task: Hessian range against first-order carriage |
+| `run_counterflow.py` | saturated far pathway with local counterflow: closed-form check of all three measures, plus the target-alignment control |
 | `run_gate.py` | the far-gate interaction test: Sobol ground truth, pooled Jacobian, `F_sens`, registered `beneficial_carriage` |
 | `run_quantised.py` | the head-to-head on a quantised dependence, against a Monte-Carlo ground truth |
 | `run_beneficial.py` | Beneficial carriage on both splits: `S_B`, `B_far`, and the source-ranking tests |

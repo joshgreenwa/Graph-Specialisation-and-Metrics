@@ -833,13 +833,85 @@ class GritDiagnosticExtractor:
 
 _ATOMIC_NUMBERS = {1: "H", 6: "C", 7: "N", 8: "O", 9: "F"}
 
+# Exact vocabulary used to create the PyG ZINC subset.  These are augmented
+# RDKit atom symbols, not latent clusters: the optional H count and formal
+# charge are part of the atom identity.  The source dictionaries are the
+# ``molecules/atom_dict.pickle`` and ``bond_dict.pickle`` files distributed
+# with the benchmarking-GNNs ZINC data from which PyG ZINC was prepared.
+ZINC_ATOM_TYPES = (
+    "C",
+    "O",
+    "N",
+    "F",
+    "C H1",
+    "S",
+    "Cl",
+    "O -",
+    "N H1 +",
+    "Br",
+    "N H3 +",
+    "N H2 +",
+    "N +",
+    "N -",
+    "S -",
+    "I",
+    "P",
+    "O H1 +",
+    "N H1 -",
+    "O +",
+    "S +",
+    "P H1",
+    "P H2",
+    "C H2 -",
+    "P +",
+    "S H1 +",
+    "C H1 -",
+    "P H1 +",
+)
+
+CHEMISTRY_FOCUS_VERSION = "pcqm_chemistry_focus.v1+explicit_hydrogen"
+
+_FIGURE_IDENTITIES = {
+    "zinc": {
+        "dataset_label": "ZINC-subset",
+        "model_label": "dense GRIT+RRWP",
+    },
+    "qm9_gap_dense": {
+        "dataset_label": "QM9 HOMO–LUMO gap",
+        "model_label": "dense GRIT+RRWP",
+    },
+}
+
+
+def figure_identity(task_name: str) -> dict[str, str]:
+    """Return the invariant reader-facing task/model identity for a figure."""
+
+    task_name = str(task_name)
+    identity = dict(
+        _FIGURE_IDENTITIES.get(
+            task_name,
+            {
+                "dataset_label": task_name,
+                "model_label": "GRIT+RRWP",
+            },
+        )
+    )
+    identity["display_title"] = (
+        f"{identity['dataset_label']} — {identity['model_label']}"
+    )
+    return identity
+
 
 def graph_node_labels(task_name: str, graph: Any) -> list[str]:
     values = _as_numpy(graph.x).reshape(int(graph.num_nodes), -1)[:, 0]
     if str(task_name) == "zinc":
-        # PyG ZINC stores categorical atom-type IDs, not a documented atomic-number
-        # vocabulary. Keep those exact IDs rather than inventing element symbols.
-        return [f"type {int(value)}" for value in values]
+        labels = []
+        for value in values:
+            atom_type = int(value)
+            if not 0 <= atom_type < len(ZINC_ATOM_TYPES):
+                raise ValueError(f"unknown PyG ZINC atom-type ID {atom_type}")
+            labels.append(ZINC_ATOM_TYPES[atom_type].split()[0])
+        return labels
     return [
         _ATOMIC_NUMBERS.get(int(value), f"Z={int(value)}") for value in values
     ]
@@ -850,6 +922,238 @@ def graph_edge_index(graph: Any) -> np.ndarray:
     if values.ndim != 2 or values.shape[0] != 2:
         raise ValueError(f"expected edge_index [2,E], got {values.shape}")
     return values
+
+
+def _zinc_atom(token: str):
+    from rdkit import Chem
+
+    fields = str(token).split()
+    atom = Chem.Atom(fields[0])
+    for field in fields[1:]:
+        if field.startswith("H") and field[1:].isdigit():
+            atom.SetNumExplicitHs(int(field[1:]))
+        elif field == "+":
+            atom.SetFormalCharge(1)
+        elif field == "-":
+            atom.SetFormalCharge(-1)
+    return atom
+
+
+def _edge_type_values(graph: Any, edge_count: int) -> np.ndarray:
+    if not hasattr(graph, "edge_attr") or graph.edge_attr is None:
+        raise ValueError("molecular graph has no bond-type edge_attr")
+    values = _as_numpy(graph.edge_attr)
+    if values.ndim == 2 and values.shape[1] > 1:
+        values = np.argmax(values, axis=1)
+    else:
+        values = values.reshape(-1)
+    if len(values) != int(edge_count):
+        raise ValueError(
+            f"edge_attr has {len(values)} rows for {edge_count} graph edges"
+        )
+    return values.astype(np.int64, copy=False)
+
+
+def molecule_from_graph(task_name: str, graph: Any):
+    """Reconstruct an RDKit molecule in the graph's exact node-index order."""
+
+    from rdkit import Chem
+
+    task_name = str(task_name)
+    node_values = _as_numpy(graph.x).reshape(int(graph.num_nodes), -1)[:, 0]
+    molecule = Chem.RWMol()
+    if task_name == "zinc":
+        for value in node_values:
+            atom_type = int(value)
+            if not 0 <= atom_type < len(ZINC_ATOM_TYPES):
+                raise ValueError(f"unknown PyG ZINC atom-type ID {atom_type}")
+            molecule.AddAtom(_zinc_atom(ZINC_ATOM_TYPES[atom_type]))
+        bond_types = {
+            1: Chem.BondType.SINGLE,
+            2: Chem.BondType.DOUBLE,
+            3: Chem.BondType.TRIPLE,
+        }
+    elif task_name == "qm9_gap_dense":
+        for value in node_values:
+            atomic_number = int(value)
+            if atomic_number not in _ATOMIC_NUMBERS:
+                raise ValueError(f"unexpected QM9 atomic number {atomic_number}")
+            atom = Chem.Atom(atomic_number)
+            # QM9 contains all hydrogens explicitly; do not invent additional ones.
+            atom.SetNoImplicit(True)
+            molecule.AddAtom(atom)
+        bond_types = {
+            0: Chem.BondType.SINGLE,
+            1: Chem.BondType.DOUBLE,
+            2: Chem.BondType.TRIPLE,
+            3: Chem.BondType.AROMATIC,
+        }
+    else:
+        raise ValueError(
+            f"no chemistry decoder is registered for GRIT task {task_name!r}"
+        )
+
+    edge_index = graph_edge_index(graph)
+    edge_types = _edge_type_values(graph, edge_index.shape[1])
+    observed: dict[tuple[int, int], int] = {}
+    for edge_position, (source, target) in enumerate(edge_index.T):
+        source, target = int(source), int(target)
+        if source == target:
+            continue
+        pair = tuple(sorted((source, target)))
+        edge_type = int(edge_types[edge_position])
+        if pair in observed and observed[pair] != edge_type:
+            raise ValueError(
+                f"inconsistent bond types for edge {pair}: "
+                f"{observed[pair]} and {edge_type}"
+            )
+        observed[pair] = edge_type
+    for (source, target), edge_type in sorted(observed.items()):
+        if edge_type not in bond_types:
+            raise ValueError(
+                f"unknown {task_name} bond-type ID {edge_type} "
+                f"on edge {(source, target)}"
+            )
+        bond_type = bond_types[edge_type]
+        molecule.AddBond(source, target, bond_type)
+        if bond_type == Chem.BondType.AROMATIC:
+            molecule.GetAtomWithIdx(source).SetIsAromatic(True)
+            molecule.GetAtomWithIdx(target).SetIsAromatic(True)
+    result = molecule.GetMol()
+    Chem.SanitizeMol(result)
+    if result.GetNumAtoms() != int(graph.num_nodes):
+        raise RuntimeError("RDKit reconstruction changed the graph atom count")
+    return result
+
+
+def _optional_graph_text(graph: Any, field: str) -> str | None:
+    value = getattr(graph, field, None)
+    if value is None:
+        return None
+    if hasattr(value, "detach"):
+        value = value.detach().cpu().reshape(-1).tolist()
+    if isinstance(value, (list, tuple)):
+        if len(value) != 1:
+            return None
+        value = value[0]
+    if isinstance(value, bytes):
+        value = value.decode("utf-8")
+    text = str(value).strip()
+    return text or None
+
+
+def molecule_record(task_name: str, graph: Any) -> dict[str, Any]:
+    """Serialisable chemistry record used by cached figure payloads."""
+
+    from rdkit import Chem
+    from rdkit.Chem import rdMolDescriptors
+
+    molecule = molecule_from_graph(task_name, graph)
+    display_molecule = Chem.RemoveHs(Chem.Mol(molecule))
+    identity = figure_identity(task_name)
+    return {
+        "mol_block": Chem.MolToMolBlock(molecule),
+        "smiles": Chem.MolToSmiles(display_molecule, canonical=True),
+        "formula": rdMolDescriptors.CalcMolFormula(molecule),
+        "molecule_name": _optional_graph_text(graph, "name"),
+        "node_labels": [atom.GetSymbol() for atom in molecule.GetAtoms()],
+        "chemistry_decoder": (
+            "benchmarking-GNNs ZINC atom/bond dictionaries"
+            if str(task_name) == "zinc"
+            else "PyG QM9 atomic numbers and four bond classes"
+        ),
+        "chemistry_focus_version": CHEMISTRY_FOCUS_VERSION,
+        **identity,
+    }
+
+
+def atom_chemistry_categories(molecule: Any) -> list[str]:
+    """PCQM-compatible chemical-group categories in RDKit atom order."""
+
+    from rdkit import Chem
+
+    categories: list[str | None] = [None] * molecule.GetNumAtoms()
+
+    def is_carbonyl_carbon(atom) -> bool:
+        return atom.GetSymbol() == "C" and any(
+            bond.GetBondType() == Chem.BondType.DOUBLE
+            and bond.GetOtherAtom(atom).GetSymbol() == "O"
+            for bond in atom.GetBonds()
+        )
+
+    for atom in molecule.GetAtoms():
+        index = atom.GetIdx()
+        symbol = atom.GetSymbol()
+        if symbol == "H":
+            categories[index] = "H: hydrogen"
+        elif symbol == "O":
+            double_carbon = any(
+                bond.GetBondType() == Chem.BondType.DOUBLE
+                and bond.GetOtherAtom(atom).GetSymbol() == "C"
+                for bond in atom.GetBonds()
+            )
+            single_carbonyl = any(
+                bond.GetBondType() == Chem.BondType.SINGLE
+                and is_carbonyl_carbon(bond.GetOtherAtom(atom))
+                for bond in atom.GetBonds()
+            )
+            if double_carbon:
+                categories[index] = "O: carbonyl"
+            elif single_carbonyl:
+                categories[index] = "O: ester/carboxyl"
+            elif atom.GetTotalNumHs() >= 1:
+                categories[index] = "O: hydroxyl"
+            else:
+                categories[index] = "O: other"
+        elif symbol == "N":
+            if atom.GetIsAromatic():
+                categories[index] = "N: aromatic"
+            elif any(
+                bond.GetBondType() == Chem.BondType.TRIPLE
+                and bond.GetOtherAtom(atom).GetSymbol() == "C"
+                for bond in atom.GetBonds()
+            ):
+                categories[index] = "N: nitrile"
+            elif atom.GetFormalCharge() > 0 and sum(
+                neighbour.GetSymbol() == "O"
+                for neighbour in atom.GetNeighbors()
+            ) >= 2:
+                categories[index] = "N: nitro"
+            elif any(
+                is_carbonyl_carbon(neighbour)
+                for neighbour in atom.GetNeighbors()
+            ):
+                categories[index] = "N: amide"
+            else:
+                categories[index] = "N: other"
+        elif symbol == "S":
+            categories[index] = "S: sulfur"
+        elif symbol == "P":
+            categories[index] = "P: phosphorus"
+        elif symbol in {"F", "Cl", "Br", "I"}:
+            categories[index] = "X: halogen"
+
+    ring_info = molecule.GetRingInfo()
+    for atom in molecule.GetAtoms():
+        index = atom.GetIdx()
+        if categories[index] is not None:
+            continue
+        rings = ring_info.NumAtomRings(index)
+        if rings >= 2:
+            categories[index] = "Ring: junction"
+        elif rings == 1:
+            categories[index] = (
+                "Ring: aromatic" if atom.GetIsAromatic() else "Ring: aliphatic"
+            )
+        elif atom.GetDegree() >= 3:
+            categories[index] = "Branch: degree>=3"
+        elif atom.GetFormalCharge() > 0:
+            categories[index] = "Charge: +"
+        elif atom.GetFormalCharge() < 0:
+            categories[index] = "Charge: -"
+        else:
+            categories[index] = "other/diffuse"
+    return [str(value) for value in categories]
 
 
 def collect_attention_examples(
@@ -870,8 +1174,7 @@ def collect_attention_examples(
                 f"[0, {len(runtime.eval_ds)})"
             )
         graph = runtime.eval_ds[graph_index]
-        chemical_edges = graph_edge_index(graph)
-        labels = graph_node_labels(task_name, graph)
+        chemistry = molecule_record(task_name, graph)
         captured = extractor.extract(graph)
         selected = {
             role: captured.attention[layer][head].float().cpu().numpy()
@@ -881,9 +1184,8 @@ def collect_attention_examples(
             {
                 "dataset_index": graph_index,
                 "n_atoms": int(graph.num_nodes),
-                "node_labels": labels,
-                "edge_index": chemical_edges,
                 "attention": selected,
+                **chemistry,
             }
         )
     return {
@@ -891,22 +1193,30 @@ def collect_attention_examples(
         "index_space": "GRIT evaluation-split position",
         "heads": dict(heads),
         "examples": examples,
+        **figure_identity(task_name),
     }
 
 
 def label_attention_focus(
-    node_labels: Sequence[str],
+    molecule: Any,
     node_mass: np.ndarray,
     *,
     focus_mass: float = 0.75,
     diffuse_threshold: float = 0.35,
 ) -> str:
-    """Label a graph by the node category receiving most selected attention."""
+    """Label a graph with the PCQM chemistry group receiving most attention."""
 
-    labels = [str(value) for value in node_labels]
+    if isinstance(molecule, str):
+        from rdkit import Chem
+
+        parsed = Chem.MolFromSmiles(molecule)
+        if parsed is None:
+            raise ValueError(f"RDKit could not parse SMILES {molecule!r}")
+        molecule = parsed
+    labels = atom_chemistry_categories(molecule)
     mass = np.asarray(node_mass, dtype=np.float64).reshape(-1)
     if len(labels) != len(mass):
-        raise ValueError("node labels and attention mass have different lengths")
+        raise ValueError("molecule atoms and attention mass have different lengths")
     total = float(np.sum(mass))
     if not np.isfinite(total) or total <= 0:
         return "other/diffuse"
@@ -924,7 +1234,7 @@ def label_attention_focus(
         label = labels[index]
         mass_by_label[label] = mass_by_label.get(label, 0.0) + float(mass[index])
     best, best_mass = max(mass_by_label.items(), key=lambda item: item[1])
-    return f"{best}-focused" if best_mass >= float(diffuse_threshold) else "other/diffuse"
+    return best if best_mass >= float(diffuse_threshold) else "other/diffuse"
 
 
 def compute_av_pca_inputs(
@@ -979,7 +1289,7 @@ def compute_av_pca_inputs_many(
         try:
             graph = figure_runtime.runtime.eval_ds[position]
             captured = extractor.extract(graph)
-            node_labels = graph_node_labels(task_name, graph)
+            molecule = molecule_from_graph(task_name, graph)
         except Exception as error:
             if verbose:
                 print(f"  [GRIT routed-output PCA] skipped {position}: {error}")
@@ -1001,7 +1311,7 @@ def compute_av_pca_inputs_many(
                 )
                 inbound = (matrix / denominator).mean(axis=0)
                 label = label_attention_focus(
-                    node_labels,
+                    molecule,
                     inbound,
                     focus_mass=focus_mass,
                     diffuse_threshold=diffuse_threshold,
@@ -1036,6 +1346,8 @@ def compute_av_pca_inputs_many(
             "quantity": (
                 "mean over receiving nodes of native GRIT routed head output wV"
             ),
+            "chemistry_focus_version": CHEMISTRY_FOCUS_VERSION,
+            **figure_identity(task_name),
         }
     return output
 
@@ -1122,8 +1434,9 @@ def aggregate_logit_spread(
         )
     )
     ddof = 1 if len(node_rows) > 1 else 0
+    task_name = figure_runtime.prepared.task.name
     return {
-        "task": figure_runtime.prepared.task.name,
+        "task": task_name,
         "node_std_mean": node_layer_per_graph.mean(axis=0),
         "node_std_std": node_layer_per_graph.std(axis=0, ddof=ddof),
         "relation_std_mean": relation_layer_per_graph.mean(axis=0),
@@ -1136,6 +1449,7 @@ def aggregate_logit_spread(
         "n_requested": int(n_graphs),
         "n_used": len(node_rows),
         "ratio": "log10(std(node-only counterfactual)/std(relation-conditioned actual))",
+        **figure_identity(task_name),
     }
 
 

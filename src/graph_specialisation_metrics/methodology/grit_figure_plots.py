@@ -3,15 +3,17 @@
 from __future__ import annotations
 
 from collections import Counter
+import io
 import json
 from pathlib import Path
+import textwrap
 from typing import Any, Mapping
 
 import matplotlib.pyplot as plt
 from matplotlib.colors import Normalize, TwoSlopeNorm
 import numpy as np
 
-from .grit_figure_data import CanonicalHeadMetrics, Head
+from .grit_figure_data import CanonicalHeadMetrics, Head, figure_identity
 
 
 NAVY = "#17324D"
@@ -31,20 +33,35 @@ HEAD_STYLES = {
         "label": "Alternate structural specialist",
     },
 }
-ELEMENT_COLORS = {
-    "H-focused": "#A7B0B8",
-    "C-focused": "#2878B5",
-    "N-focused": "#008E72",
-    "O-focused": "#D97706",
-    "F-focused": "#7B61A8",
-    "P-focused": "#8B6F47",
-    "S-focused": "#CCB000",
-    "Cl-focused": "#6B8E23",
-    "Br-focused": "#9C4F96",
-    "I-focused": "#C44E52",
+# Stable exact chemistry-focus identities shared with the Graphormer PCQM
+# figures.  A label never receives a plot-local or frequency-dependent colour.
+PCA_FOCUS_COLORS = {
+    "Ring: junction": "#17324D",
+    "Ring: aromatic": "#2878B5",
+    "Ring: aliphatic": "#56A9D8",
+    "O: carbonyl": "#C45100",
+    "O: ester/carboxyl": "#E17C05",
+    "O: hydroxyl": "#F2B134",
+    "O: other": "#A65D26",
+    "N: aromatic": "#006D5B",
+    "N: nitrile": "#008E72",
+    "N: nitro": "#2AA876",
+    "N: amide": "#57B894",
+    "N: other": "#7EC8AE",
+    "X: halogen": "#7B61A8",
+    "S: sulfur": "#CCB000",
+    "P: phosphorus": "#8B6F47",
+    "Branch: degree>=3": "#6B8E23",
+    "Charge: +": "#C44E52",
+    "Charge: -": "#9C4F96",
+    "H: hydrogen": "#8C9AA5",
     "other/diffuse": "#B8C2CA",
     "Other / rare": "#4B5563",
 }
+
+# Backwards-compatible public name; values now follow the PCQM chemical-group
+# convention rather than element/type-ID labels.
+ELEMENT_COLORS = PCA_FOCUS_COLORS
 
 
 def apply_publication_style() -> None:
@@ -381,82 +398,128 @@ def _node_conditioned_attention(attention: np.ndarray) -> np.ndarray:
     return attention / denominator
 
 
-def _graph_layout(example: Mapping[str, Any]) -> tuple[dict[int, Any], list[tuple[int, int]]]:
-    import networkx as nx
+def _molecule_from_example(example: Mapping[str, Any]):
+    from rdkit import Chem
 
-    n = int(example["n_atoms"])
-    edge_index = np.asarray(example["edge_index"], dtype=np.int64)
-    graph = nx.Graph()
-    graph.add_nodes_from(range(n))
-    graph.add_edges_from(
-        (int(source), int(target))
-        for source, target in edge_index.T
-        if int(source) != int(target)
+    mol_block = example.get("mol_block")
+    molecule = (
+        Chem.MolFromMolBlock(str(mol_block), removeHs=False, sanitize=True)
+        if mol_block
+        else Chem.MolFromSmiles(str(example["smiles"]))
     )
-    edges = sorted(
-        {
-            tuple(sorted((int(source), int(target))))
-            for source, target in edge_index.T
-            if int(source) != int(target)
-        }
-    )
-    positions = nx.spring_layout(graph, seed=42, weight=None)
-    return positions, edges
+    if molecule is None:
+        raise ValueError("RDKit could not parse the cached molecule")
+    expected = int(example.get("n_atoms", molecule.GetNumAtoms()))
+    if molecule.GetNumAtoms() != expected:
+        raise ValueError(
+            f"cached molecule has {molecule.GetNumAtoms()} atoms; expected {expected}"
+        )
+    return molecule
 
 
-def _draw_graph(
-    ax,
+def _prepare_molecule(example: Mapping[str, Any]):
+    from rdkit.Chem import rdDepictor
+
+    molecule = _molecule_from_example(example)
+    rdDepictor.Compute2DCoords(molecule)
+    return molecule
+
+
+def _draw_molecule_plain(
     example: Mapping[str, Any],
     *,
-    positions: Mapping[int, Any],
-    edges: list[tuple[int, int]],
-    attention_mass: np.ndarray | None = None,
-    vmax: float | None = None,
-) -> None:
-    import networkx as nx
+    figsize: tuple[float, float] = (4.2, 3.7),
+    dpi: int = 180,
+):
+    from PIL import Image
+    from rdkit.Chem.Draw import rdMolDraw2D
 
-    graph = nx.Graph()
-    graph.add_nodes_from(range(int(example["n_atoms"])))
-    graph.add_edges_from(edges)
-    labels = {
-        index: f"{index}\n{element}"
-        for index, element in enumerate(example["node_labels"])
-    }
-    if attention_mass is None:
-        colours = ["#EDF2F5"] * len(labels)
-        sizes = [620] * len(labels)
-        label_colours = {index: NAVY for index in labels}
-    else:
-        values = np.asarray(attention_mass, dtype=np.float64)
-        norm = Normalize(vmin=0.0, vmax=max(float(vmax or values.max()), 1e-12))
-        colours = [ATTENTION_CMAP(0.18 + 0.72 * float(norm(value))) for value in values]
-        sizes = [520 + 620 * np.sqrt(float(norm(value))) for value in values]
-        label_colours = {
-            index: "white" if float(norm(value)) >= 0.48 else NAVY
-            for index, value in enumerate(values)
-        }
-    nx.draw_networkx_edges(
-        graph, positions, ax=ax, edge_color="#8B98A1", width=1.4, alpha=0.85
-    )
-    nx.draw_networkx_nodes(
-        graph,
-        positions,
-        ax=ax,
-        node_color=colours,
-        node_size=sizes,
-        edgecolors=NAVY,
-        linewidths=0.8,
-    )
-    for index, label in labels.items():
-        nx.draw_networkx_labels(
-            graph,
-            positions,
-            labels={index: label},
-            ax=ax,
-            font_size=7,
-            font_color=label_colours[index],
+    molecule = _prepare_molecule(example)
+    width, height = int(figsize[0] * dpi), int(figsize[1] * dpi)
+    drawer = rdMolDraw2D.MolDraw2DCairo(width, height)
+    options = drawer.drawOptions()
+    options.addAtomIndices = True
+    options.padding = 0.08
+    drawer.DrawMolecule(molecule, legend="")
+    drawer.FinishDrawing()
+    return Image.open(io.BytesIO(drawer.GetDrawingText()))
+
+
+def _draw_molecule_attention(
+    example: Mapping[str, Any],
+    *,
+    inbound: np.ndarray,
+    vmax: float,
+    figsize: tuple[float, float] = (4.2, 3.7),
+    dpi: int = 180,
+):
+    """RDKit molecule with atom-centred attention-inflow highlights."""
+
+    from PIL import Image
+    from rdkit.Chem.Draw import rdMolDraw2D
+
+    molecule = _prepare_molecule(example)
+    inbound = np.asarray(inbound, dtype=np.float64)
+    if molecule.GetNumAtoms() != len(inbound):
+        raise ValueError(
+            f"RDKit has {molecule.GetNumAtoms()} atoms but attention has "
+            f"{len(inbound)}"
         )
-    ax.set_axis_off()
+    norm = Normalize(vmin=0.0, vmax=max(float(vmax), 1e-12), clip=True)
+    highlight_atoms = list(range(molecule.GetNumAtoms()))
+    highlight_colors = {}
+    highlight_radii = {}
+    for atom, value in enumerate(inbound):
+        scaled = float(norm(value))
+        rgba = ATTENTION_CMAP(0.18 + 0.72 * scaled)
+        highlight_colors[atom] = tuple(float(channel) for channel in rgba[:3])
+        highlight_radii[atom] = 0.20 + 0.30 * np.sqrt(scaled)
+
+    width, height = int(figsize[0] * dpi), int(figsize[1] * dpi)
+    drawer = rdMolDraw2D.MolDraw2DCairo(width, height)
+    options = drawer.drawOptions()
+    options.addAtomIndices = True
+    options.fillHighlights = True
+    options.atomHighlightsAreCircles = True
+    options.padding = 0.08
+    drawer.DrawMolecule(
+        molecule,
+        legend="",
+        highlightAtoms=highlight_atoms,
+        highlightAtomColors=highlight_colors,
+        highlightAtomRadii=highlight_radii,
+    )
+    drawer.FinishDrawing()
+    return Image.open(io.BytesIO(drawer.GetDrawingText()))
+
+
+def _payload_display_title(payload: Mapping[str, Any]) -> str:
+    if payload.get("display_title"):
+        return str(payload["display_title"])
+    return figure_identity(str(payload.get("task", "GRIT")))["display_title"]
+
+
+def _molecule_caption(
+    example: Mapping[str, Any],
+    *,
+    dataset_label: str,
+) -> str:
+    graph_index = int(example["dataset_index"])
+    name = str(example.get("molecule_name") or "").strip()
+    identifier = f"{dataset_label} eval {graph_index}"
+    if name:
+        identifier += f" · {name}"
+    formula = str(example.get("formula") or "").strip()
+    if formula:
+        identifier += f" · {formula}"
+    smiles = str(example.get("smiles") or "").strip()
+    if smiles:
+        identifier += "\n" + textwrap.fill(
+            f"canonical SMILES: {smiles}",
+            width=52,
+            subsequent_indent="  ",
+        )
+    return identifier
 
 
 def plot_attention_grid(
@@ -506,6 +569,11 @@ def plot_attention_grid(
         dtype=object,
     )
     task = str(examples_payload["task"])
+    dataset_label = str(
+        examples_payload.get(
+            "dataset_label", figure_identity(task)["dataset_label"]
+        )
+    )
     for row, (example, matrix) in enumerate(zip(examples, matrices)):
         graph_index = int(example["dataset_index"])
         graph_coordinates = per_graph_coordinates.get(
@@ -525,34 +593,29 @@ def plot_attention_grid(
                 "J", graph_coordinates.get("joint_sensitivity", np.nan)
             )
         )
-        positions, edges = _graph_layout(example)
-        _draw_graph(
-            axes[row, 0], example, positions=positions, edges=edges
-        )
-        lower, upper = axes[row, 0].get_ylim()
-        axes[row, 0].set_ylim(lower, upper + 0.32 * (upper - lower))
+        axes[row, 0].imshow(_draw_molecule_plain(example))
+        axes[row, 0].axis("off")
         axes[row, 0].text(
             0.01,
             0.99,
-            f"{task} eval index {graph_index}\n"
-            rf"Graph-local $D_{{\rm rel}}={d_rel:+.3f}$"
-            "\n"
-            rf"Graph-local $J={joint:.3f}$",
+            _molecule_caption(example, dataset_label=dataset_label)
+            + "\n"
+            + rf"Graph-local: $D_{{\rm rel}}={d_rel:+.3f};\ J={joint:.3f}$",
             transform=axes[row, 0].transAxes,
             ha="left",
             va="top",
-            fontsize=8.5,
+            fontsize=8.0,
             color=NAVY,
             bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.87},
         )
-        _draw_graph(
-            axes[row, 1],
-            example,
-            positions=positions,
-            edges=edges,
-            attention_mass=inbound[row],
-            vmax=inbound_max,
+        axes[row, 1].imshow(
+            _draw_molecule_attention(
+                example,
+                inbound=inbound[row],
+                vmax=inbound_max,
+            )
         )
+        axes[row, 1].axis("off")
         image = axes[row, 2].imshow(
             matrix,
             cmap=ATTENTION_CMAP,
@@ -568,14 +631,15 @@ def plot_attention_grid(
         axes[row, 2].set_yticks(np.arange(matrix.shape[0]))
         axes[row, 2].tick_params(labelsize=6, length=2)
     for column, label in enumerate(
-        ["Molecular graph", "Attention inflow", "Node-conditioned attention"]
+        ["Molecule", "Attention-weighted molecule", "Node-conditioned attention"]
     ):
         axes[0, column].set_title(label, fontsize=12, pad=8)
     style = HEAD_STYLES.get(role, {"label": role.replace("_", " ").title()})
     title_axis.text(
         0.5,
         0.76,
-        f"{task}: {title_label or style['label']} — {_head_label(head)}",
+        f"{_payload_display_title(examples_payload)} — "
+        f"{title_label or style['label']} — {_head_label(head)}",
         ha="center",
         va="center",
         fontsize=18,
@@ -627,10 +691,16 @@ def _group_pca_labels(
     return [label if label in retained else "Other / rare" for label in labels]
 
 
+def _pca_focus_color(label: str) -> str:
+    """Return the invariant publication colour for a chemistry-focus label."""
+
+    return PCA_FOCUS_COLORS.get(str(label), SLATE)
+
+
 def plot_av_pca(
     payload: Mapping[str, Any],
     *,
-    maximum_categories: int = 12,
+    maximum_categories: int = 21,
     minimum_count: int = 1,
     title_label: str | None = None,
     d_rel: float | None = None,
@@ -645,24 +715,23 @@ def plot_av_pca(
     )
     counts = Counter(labels)
     categories = [
-        label for label in ELEMENT_COLORS if label in counts and label != "Other / rare"
+        label
+        for label in PCA_FOCUS_COLORS
+        if label in counts and label != "Other / rare"
     ]
     categories.extend(
         sorted(
             label
             for label in counts
-            if label not in ELEMENT_COLORS and label != "Other / rare"
+            if label not in PCA_FOCUS_COLORS and label != "Other / rare"
         )
     )
     if "Other / rare" in counts:
         categories.append("Other / rare")
-    dynamic = plt.get_cmap("tab20")
     fig, ax = plt.subplots(figsize=(8.8, 6.2), constrained_layout=True)
     labels_array = np.asarray(labels)
-    for category_index, category in enumerate(categories):
-        color = ELEMENT_COLORS.get(
-            category, dynamic(category_index / max(1, len(categories) - 1))
-        )
+    for category in categories:
+        color = _pca_focus_color(category)
         mask = labels_array == category
         ax.scatter(
             coordinates[mask, 0],
@@ -692,9 +761,10 @@ def plot_av_pca(
         else _head_label(head)
     )
     ax.set_title(
+        f"{_payload_display_title(payload)}\n"
         f"PCA of native GRIT routed head output — {descriptor}"
         f"{metric_line}\n"
-        f"$n={int(payload['n_used'])}$ {payload['task']} graphs",
+        f"$n={int(payload['n_used'])}$ molecules",
         fontsize=15,
     )
     ax.grid(False)
@@ -816,8 +886,8 @@ def plot_logit_spread(
     ax.set_xlabel("Layer index")
     ax.set_ylabel("Mean key-wise raw-logit standard deviation")
     ax.set_title(
-        f"{title}\n$n={int(logit_payload['n_used'])}$ "
-        f"{logit_payload['task']} graphs",
+        f"{_payload_display_title(logit_payload)}\n"
+        f"{title}\n$n={int(logit_payload['n_used'])}$ molecules",
         fontsize=15,
     )
     ax.grid(axis="y")
@@ -891,8 +961,9 @@ def plot_selectivity_vs_logit_ratio(
     )
     ax.set_ylabel(r"Relative selectivity $D_{\rm rel}$")
     ax.set_title(
+        f"{_payload_display_title(logit_payload)}\n"
         "Relative selectivity versus GRIT logit balance\n"
-        f"$n={int(logit_payload['n_used'])}$ {logit_payload['task']} graphs"
+        f"$n={int(logit_payload['n_used'])}$ molecules"
         f"{correlation_label}",
         fontsize=15,
     )

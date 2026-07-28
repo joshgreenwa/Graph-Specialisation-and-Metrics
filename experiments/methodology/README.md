@@ -32,8 +32,13 @@ cross-task figure suite. It reads each task's `seed_42/cache/scores/raw.pt` arti
 read-only, verifies the matching `model.json` and checkpoint before model-forward
 diagnostics, and writes task-separated supplemental caches and figure manifests.
 The score/coordinate figures reuse the PCQM presentation, while attention and routed-output
-diagnostics attach to native GRIT sites. GRIT's non-additive relation conditioning is reported as
-such; its node-only versus relation-conditioned raw-logit figure is not labelled as Graphormer
+diagnostics attach to native GRIT sites. ZINC atom-type IDs are decoded with the exact source
+vocabulary and bond dictionary, so the attention grids contain index-preserving RDKit molecules
+rather than generic graph layouts; QM9 is reconstructed from its atomic-number and bond-class
+fields. Routed-output PCAs use the same fixed chemical-group labels and colour identities as the
+PCQM suite (plus an explicit-hydrogen category for QM9), and every title names the dataset and
+dense GRIT+RRWP model. GRIT's non-additive relation conditioning is reported as such; its
+node-only versus relation-conditioned raw-logit figure is not labelled as Graphormer
 dot-versus-bias.
 
 For the public PCQM model, set `TASKS = ("graphormer_pcqm4mv2",)` and leave `CHECKPOINTS`
