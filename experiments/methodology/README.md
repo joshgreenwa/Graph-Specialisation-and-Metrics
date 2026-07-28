@@ -17,6 +17,11 @@ in the canonical package, not in the Colab cell. `FAMILIES` exposes separate dis
 equivalence regions plus the stability and dual-channel response floors; set them before looking
 at causal outcomes.
 
+Canonical runs resume at the individual derived-artifact level. Repository commit IDs are retained
+as provenance rather than used as cache-validity keys. If a file genuinely belongs to a different
+scientific contract or is unreadable, the runner preserves it under `cache/_stale/` and recomputes
+that miss; read-only downstream artifact loaders continue to reject incompatible inputs.
+
 The initial production run is configured for the dense `zinc`, `qm9_gap_dense`,
 `peptides_func`, and `peptides_struct` registrations.
 

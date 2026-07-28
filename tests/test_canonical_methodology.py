@@ -74,6 +74,7 @@ from graph_specialisation_metrics.methodology.protocol import (
     MethodologyConfig,
     RunSizes,
     deterministic_splits,
+    stable_hash,
 )
 from graph_specialisation_metrics.methodology.sampling import (
     SemanticDonorPool,
@@ -1188,7 +1189,7 @@ def test_cache_rejects_any_contract_change(tmp_path):
     original = path.read_bytes()
     assert cache.load("scores", "raw") == {"ok": True}
     stale = CanonicalCache(tmp_path, contract(event_manifest_hash="other"))
-    with pytest.raises(StaleCacheError):
+    with pytest.raises(StaleCacheError, match="event_manifest_hash"):
         stale.load("scores", "raw")
     with pytest.raises(StaleCacheError, match="refusing to overwrite protected cache"):
         stale.save("scores", "raw", {"replacement": True})
@@ -1196,7 +1197,7 @@ def test_cache_rejects_any_contract_change(tmp_path):
     assert cache.load("scores", "raw") == {"ok": True}
 
 
-def test_cache_protection_includes_unrelated_repository_commit_changes(tmp_path):
+def test_repository_commit_is_provenance_not_cache_validity(tmp_path):
     original = CanonicalCache(tmp_path, contract(repository_commit="commit-a"))
     path = original.save("causal", "validation", {"complete": True})
     original_bytes = path.read_bytes()
@@ -1204,13 +1205,55 @@ def test_cache_protection_includes_unrelated_repository_commit_changes(tmp_path)
     updated_checkout = CanonicalCache(
         tmp_path, contract(repository_commit="commit-b")
     )
-    with pytest.raises(StaleCacheError, match="different output_dir/analysis name"):
-        updated_checkout.load("causal", "validation")
-    with pytest.raises(StaleCacheError, match="left untouched"):
-        updated_checkout.save("causal", "validation", {"complete": False})
-
+    assert updated_checkout.contract.fingerprint == original.contract.fingerprint
+    assert updated_checkout.load("causal", "validation") == {"complete": True}
     assert path.read_bytes() == original_bytes
-    assert original.load("causal", "validation") == {"complete": True}
+
+
+def test_resumable_cache_archives_mismatch_then_recomputes(tmp_path):
+    original = CanonicalCache(tmp_path, contract())
+    path = original.save("scores/semantic", "graph_000032", {"old": True})
+    original_bytes = path.read_bytes()
+
+    resumed = CanonicalCache(
+        tmp_path,
+        contract(event_manifest_hash="new-events"),
+        stale_policy="archive",
+    )
+    assert resumed.load("scores/semantic", "graph_000032") is None
+    assert not path.exists()
+    archived = list(
+        (
+            tmp_path
+            / "zinc"
+            / "seed_42"
+            / "cache"
+            / "_stale"
+            / "scores"
+            / "semantic"
+        ).glob("graph_000032.stale-*.pt")
+    )
+    assert len(archived) == 1
+    assert archived[0].read_bytes() == original_bytes
+
+    resumed.save("scores/semantic", "graph_000032", {"new": True})
+    assert resumed.load("scores/semantic", "graph_000032") == {"new": True}
+
+
+def test_cache_accepts_legacy_commit_bound_fingerprint(tmp_path):
+    cache = CanonicalCache(tmp_path, contract(repository_commit="commit-a"))
+    path = cache.save("scores", "raw", {"legacy": True})
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    payload["metadata"]["contract_fingerprint"] = stable_hash(
+        payload["metadata"]["contract"]
+    )
+    payload["metadata"].pop("provenance_fingerprint")
+    torch.save(payload, path)
+
+    other_checkout = CanonicalCache(
+        tmp_path, contract(repository_commit="commit-b")
+    )
+    assert other_checkout.load("scores", "raw") == {"legacy": True}
 
 
 def test_figure_axis_strings_are_repository_fixed():

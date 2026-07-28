@@ -254,10 +254,13 @@ the cached donor-event rows; raw carriage remains the primary scale-sensitive ou
 Training checkpoints and dataset caches are read-only. Analysis caches bind the protocol
 fingerprint, checkpoint SHA-256, task adapter, output representation and sigma, model geometry,
 split IDs, event manifest, donor/source dose, bootstrap seed, `F_sens`, and the positive-beneficial
-sign convention. An existing analysis cache is immutable across contracts: a changed repository
-commit or any other contract mismatch raises before inference instead of being treated as a cache
-miss, and the save path independently refuses replacement. Use a new output directory or analysis
-name for the new contract; the original cache remains untouched.
+sign convention. The repository commit is stored as provenance, but it is not itself a scientific
+validity field: moving the launcher to a newer commit does not invalidate an otherwise identical
+cache. During a resumable canonical run, a genuinely incompatible or unreadable derived cache is
+atomically moved under that seed's `cache/_stale/` tree and treated as a miss, so only affected
+artifacts are recomputed. The archive includes a JSON sidecar with the old and expected contracts.
+Standalone paper-artifact loaders remain read-only and fail closed on protocol or integrity
+mismatches.
 
 The v4 regime analysis changes the frozen central-family rule and records mismatch-adjusted
 directional alignment fields, so a v3 causal cache cannot be relabelled as v4. Start v4 in a new

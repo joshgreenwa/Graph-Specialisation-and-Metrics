@@ -928,6 +928,7 @@ def _cache(
                 else "graph-uniform/node-uniform/min-gap/iid-replacement"
             ),
         ),
+        stale_policy="archive",
     )
 
 
@@ -3840,17 +3841,18 @@ def finalize_cached_run(config: MethodologyConfig) -> dict[str, Any]:
                 "headline_eligible": not bool(findings),
             }
             run_findings[key] = findings
-    if len(artifact_commits) != 1:
-        raise RuntimeError(
-            "cannot finalize caches produced by different repository commits: "
-            f"{sorted(artifact_commits)}"
-        )
+    source_commits = sorted(artifact_commits)
     protocol_record = config.record()
     protocol_record.update(
         {
             "repository_commit": _repository_commit(),
             "execution_mode": "model-free-cache-finalizer",
-            "source_repository_commit": next(iter(artifact_commits)),
+            # Commits are provenance, not a cache-validity boundary. A resumed run can validly
+            # combine artifacts produced by multiple checkouts under one scientific contract.
+            "source_repository_commit": (
+                source_commits[0] if len(source_commits) == 1 else None
+            ),
+            "source_repository_commits": source_commits,
             "source_cache_contract_fingerprints": artifact_fingerprints,
         }
     )
