@@ -438,6 +438,7 @@ def test_score_heatmaps_and_scatter_restore_viridis():
     heatmaps = plot_score_heatmaps(metrics)
     scatter = plot_score_plane(metrics)
     try:
+        assert plt.rcParams["savefig.dpi"] == 600
         assert heatmaps._suptitle.get_text() == "Graphormer PCQM4Mv2"
         assert heatmaps.axes[-1].get_ylabel() == "Normalised score"
         assert scatter.axes[0].get_title() == "Graphormer PCQM4Mv2"
@@ -475,6 +476,7 @@ def test_heatmaps_do_not_outline_selected_heads():
 
 
 def test_figure_bundle_saves_png_pdf_and_provenance_in_target_folder(tmp_path):
+    assert save_figure_bundle.__kwdefaults__["dpi"] == 600
     figure = plot_score_plane(synthetic_metrics())
     target = tmp_path / "semantic_specialists"
     try:
@@ -483,6 +485,7 @@ def test_figure_bundle_saves_png_pdf_and_provenance_in_target_folder(tmp_path):
             target,
             "example_head",
             metadata={"figure_group": "semantic_specialists"},
+            dpi=100,
         )
     finally:
         plt.close(figure)

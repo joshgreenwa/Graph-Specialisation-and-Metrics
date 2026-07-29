@@ -61,7 +61,7 @@ def apply_publication_style() -> None:
     plt.rcParams.update(
         {
             "figure.dpi": 140,
-            "savefig.dpi": 300,
+            "savefig.dpi": 600,
             "font.family": "sans-serif",
             "font.sans-serif": ["DejaVu Sans", "Arial", "Liberation Sans"],
             "mathtext.fontset": "dejavusans",
@@ -942,9 +942,9 @@ def save_figure_bundle(
     stem: str,
     *,
     metadata: Mapping[str, Any] | None = None,
-    dpi: int = 300,
+    dpi: int = 600,
 ) -> dict[str, Path]:
-    """Save PNG, vector PDF, and a small provenance sidecar."""
+    """Save a high-resolution PNG, vector PDF, and provenance sidecar."""
 
     directory = Path(output_directory)
     directory.mkdir(parents=True, exist_ok=True)
@@ -954,7 +954,12 @@ def save_figure_bundle(
         "metadata": directory / f"{stem}.json",
     }
     figure.savefig(paths["png"], dpi=dpi, bbox_inches="tight", facecolor="white")
-    figure.savefig(paths["pdf"], bbox_inches="tight", facecolor="white")
+    figure.savefig(
+        paths["pdf"],
+        dpi=dpi,
+        bbox_inches="tight",
+        facecolor="white",
+    )
     paths["metadata"].write_text(
         json.dumps(
             {"figure": stem, **dict(metadata or {})},
