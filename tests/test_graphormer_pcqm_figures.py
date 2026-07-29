@@ -30,6 +30,7 @@ from graph_specialisation_metrics.methodology.graphormer_figure_data import (
     CanonicalHeadMetrics,
     GraphormerDiagnosticExtractor,
     SupplementalCache,
+    compute_layer_av_pca_inputs,
     load_graphormer_model_record,
     load_graphormer_score_artifact,
     select_attention_grid_indices,
@@ -43,6 +44,7 @@ from graph_specialisation_metrics.methodology.graphormer_figure_plots import (
     plot_av_pca,
     plot_coordinate_heatmaps,
     plot_hop_attention_mass,
+    plot_layer_av_pca_grid,
     plot_logit_spread,
     plot_score_heatmaps,
     plot_score_plane,
@@ -748,6 +750,136 @@ def test_av_pca_focus_palette_is_stable_across_plots():
     finally:
         plt.close(first)
         plt.close(second)
+
+
+def test_layer_av_pca_collection_reuses_one_forward_per_graph(monkeypatch):
+    num_layers = 3
+    num_heads = 4
+    num_nodes = 3
+    head_width = 2
+    graphs = [
+        SimpleNamespace(smiles=f"graph-{index}", num_nodes=num_nodes)
+        for index in range(3)
+    ]
+    model_layers = [
+        SimpleNamespace(self_attn=SimpleNamespace(num_heads=num_heads))
+        for _ in range(num_layers)
+    ]
+    figure_runtime = SimpleNamespace(
+        backend=SimpleNamespace(
+            model=SimpleNamespace(
+                encoder=SimpleNamespace(
+                    graph_encoder=SimpleNamespace(layers=model_layers)
+                )
+            )
+        ),
+        runtime=SimpleNamespace(eval_ds=graphs),
+    )
+    captured = SimpleNamespace(
+        transport=tuple(
+            torch.arange(
+                num_heads * (num_nodes + 1) * head_width,
+                dtype=torch.float32,
+            ).reshape(num_heads, num_nodes + 1, head_width)
+            + layer
+            for layer in range(num_layers)
+        ),
+        attention=tuple(
+            torch.ones(
+                num_heads,
+                num_nodes + 1,
+                num_nodes + 1,
+                dtype=torch.float32,
+            )
+            for _ in range(num_layers)
+        ),
+    )
+    calls = []
+
+    class FakeExtractor:
+        def __init__(self, backend):
+            assert backend is figure_runtime.backend
+
+        def extract(self, graph):
+            calls.append(graph.smiles)
+            return captured
+
+    monkeypatch.setattr(
+        "graph_specialisation_metrics.methodology.graphormer_figure_data."
+        "GraphormerDiagnosticExtractor",
+        FakeExtractor,
+    )
+    monkeypatch.setattr(
+        "graph_specialisation_metrics.methodology.graphormer_figure_data."
+        "_attention_focus_categories",
+        lambda smiles: ["Ring: aromatic"] * num_nodes,
+    )
+    payload = compute_layer_av_pca_inputs(
+        figure_runtime,
+        layers=(0, 2),
+        n_graphs=3,
+        verbose=False,
+    )
+
+    assert calls == ["graph-0", "graph-1", "graph-2"]
+    assert payload["requested_layers"] == (0, 2)
+    assert payload["num_heads"] == num_heads
+    assert payload["n_used"] == 3
+    for layer in (0, 2):
+        layer_payload = payload["layers"][layer]
+        assert layer_payload["vectors"].shape == (3, num_heads, head_width)
+        assert np.asarray(layer_payload["labels"]).shape == (3, num_heads)
+        assert {
+            label
+            for row in layer_payload["labels"]
+            for label in row
+        } == {"Ring: aromatic"}
+
+
+def test_layer_av_pca_grid_is_4x8_with_readable_legend_below():
+    rng = np.random.default_rng(71)
+    categories = list(PCA_FOCUS_COLORS)[:18]
+    num_graphs = 36
+    payload = {
+        "layer": 1,
+        "vectors": rng.normal(size=(num_graphs, 32, 8)),
+        "labels": [
+            [
+                categories[(graph + head) % len(categories)]
+                for head in range(32)
+            ]
+            for graph in range(num_graphs)
+        ],
+        "n_used": num_graphs,
+    }
+    figure = plot_layer_av_pca_grid(payload)
+    try:
+        figure.canvas.draw()
+        assert len(figure.axes) == 32
+        assert figure.axes[0].get_title().startswith("H0\n")
+        assert figure.axes[-1].get_title().startswith("H31\n")
+        assert {
+            (
+                axis.get_subplotspec().rowspan.start,
+                axis.get_subplotspec().colspan.start,
+            )
+            for axis in figure.axes
+        } == {(row, column) for row in range(4) for column in range(8)}
+
+        assert len(figure.legends) == 1
+        legend = figure.legends[0]
+        assert [text.get_text() for text in legend.get_texts()] == list(
+            PCA_FOCUS_COLORS
+        )
+        renderer = figure.canvas.get_renderer()
+        legend_box = legend.get_window_extent(renderer)
+        axes_bottom = min(
+            axis.get_window_extent(renderer).y0 for axis in figure.axes
+        )
+        assert 0 <= legend_box.x0 < legend_box.x1 <= figure.bbox.width
+        assert 0 <= legend_box.y0 < legend_box.y1 < axes_bottom
+    finally:
+        plt.close(figure)
 
 
 def test_graphormer_diagnostic_extractor_matches_exact_attention_sites():

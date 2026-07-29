@@ -10,6 +10,8 @@ import json
 
 import matplotlib.pyplot as plt
 from matplotlib.colors import Normalize, TwoSlopeNorm
+from matplotlib.lines import Line2D
+from matplotlib.ticker import MaxNLocator
 import numpy as np
 
 from .graphormer_figure_data import CanonicalHeadMetrics, Head
@@ -737,6 +739,131 @@ def plot_av_pca(
     return fig
 
 
+def plot_layer_av_pca_grid(
+    payload: Mapping[str, Any],
+    *,
+    nrows: int = 4,
+    ncols: int = 8,
+):
+    """Plot one independently fitted head-output PCA for every head in a layer."""
+
+    apply_publication_style()
+    layer = int(payload["layer"])
+    vectors = np.asarray(payload["vectors"], dtype=np.float64)
+    labels = np.asarray(payload["labels"], dtype=object)
+    if vectors.ndim != 3:
+        raise ValueError(
+            "layer PCA vectors must have shape [graphs, heads, width], "
+            f"got {vectors.shape}"
+        )
+    if labels.shape != vectors.shape[:2]:
+        raise ValueError(
+            f"layer PCA labels have shape {labels.shape}, expected {vectors.shape[:2]}"
+        )
+    num_graphs, num_heads, _ = vectors.shape
+    if int(nrows) * int(ncols) != num_heads:
+        raise ValueError(
+            f"{nrows}x{ncols} grid has {int(nrows) * int(ncols)} panels "
+            f"for {num_heads} heads"
+        )
+    n_used = int(payload.get("n_used", num_graphs))
+    if n_used != num_graphs:
+        raise ValueError(
+            f"layer PCA n_used={n_used} but vectors contain {num_graphs} graphs"
+        )
+
+    present = {str(label) for label in labels.reshape(-1)}
+    categories = list(PCA_FOCUS_COLORS)
+    categories.extend(sorted(present.difference(PCA_FOCUS_COLORS)))
+    fig, axes = plt.subplots(
+        int(nrows),
+        int(ncols),
+        figsize=(18.0, 10.125),
+        squeeze=False,
+    )
+    for head, ax in enumerate(axes.reshape(-1)):
+        coordinates, explained = _pca(vectors[:, head, :])
+        head_labels = [str(label) for label in labels[:, head]]
+        colors = [_pca_focus_color(label) for label in head_labels]
+        ax.scatter(
+            coordinates[:, 0],
+            coordinates[:, 1],
+            s=9,
+            c=colors,
+            edgecolors="white",
+            linewidths=0.18,
+            alpha=0.76,
+            rasterized=True,
+        )
+        ax.axhline(0, color=LIGHT_GRID, linewidth=0.6, zorder=0)
+        ax.axvline(0, color=LIGHT_GRID, linewidth=0.6, zorder=0)
+        ax.set_title(
+            f"H{head}\n"
+            f"PC1 {100 * explained[0]:.0f}% · PC2 {100 * explained[1]:.0f}%",
+            fontsize=10,
+            pad=3,
+        )
+        ax.xaxis.set_major_locator(MaxNLocator(3))
+        ax.yaxis.set_major_locator(MaxNLocator(3))
+        ax.tick_params(labelsize=8, length=2.5, pad=1.5)
+        row, column = divmod(head, int(ncols))
+        if row == int(nrows) - 1:
+            ax.set_xlabel("PC1", fontsize=9)
+        else:
+            ax.tick_params(labelbottom=False)
+        if column == 0:
+            ax.set_ylabel("PC2", fontsize=9)
+        else:
+            ax.tick_params(labelleft=False)
+        ax.grid(False)
+
+    handles = [
+        Line2D(
+            [0],
+            [0],
+            linestyle="none",
+            marker="o",
+            markersize=6,
+            markerfacecolor=_pca_focus_color(category),
+            markeredgecolor="white",
+            markeredgewidth=0.4,
+            label=category,
+        )
+        for category in categories
+    ]
+    legend_columns = min(7, max(1, len(handles)))
+    legend = fig.legend(
+        handles=handles,
+        labels=categories,
+        title="Attention focus",
+        loc="lower center",
+        bbox_to_anchor=(0.5, 0.018),
+        ncol=legend_columns,
+        frameon=False,
+        fontsize=9.5,
+        title_fontsize=11,
+        handletextpad=0.45,
+        columnspacing=1.2,
+        borderaxespad=0,
+    )
+    legend.get_title().set_color(NAVY)
+    fig.suptitle(
+        f"PCA of head output — Layer {layer} (all heads)\n"
+        f"$n = {n_used}$ PCQM4Mv2 molecules",
+        fontsize=18,
+        y=0.985,
+    )
+    fig.subplots_adjust(
+        left=0.045,
+        right=0.992,
+        top=0.90,
+        bottom=0.145,
+        wspace=0.24,
+        hspace=0.36,
+    )
+    return fig
+
+
 def plot_hop_attention_mass(
     metrics: CanonicalHeadMetrics,
     head: Head,
@@ -980,6 +1107,7 @@ __all__ = [
     "plot_coordinate_heatmaps",
     "plot_hop_attention_mass",
     "plot_logit_spread",
+    "plot_layer_av_pca_grid",
     "plot_score_heatmaps",
     "plot_score_plane",
     "plot_selectivity_joint_plane",

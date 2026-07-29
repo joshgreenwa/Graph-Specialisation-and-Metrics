@@ -952,19 +952,30 @@ def _atom_categories(molecule) -> list[str]:
     return [str(value) for value in categories]
 
 
-def label_attention_focus(
-    smiles: str,
-    atom_mass: np.ndarray,
-    *,
-    focus_mass: float = 0.75,
-    diffuse_threshold: float = 0.35,
-) -> str:
+def _attention_focus_categories(smiles: str) -> list[str]:
+    """Parse one molecule and return its stable per-atom focus categories."""
+
     from rdkit import Chem
 
     molecule = Chem.MolFromSmiles(smiles)
     if molecule is None:
         raise ValueError(f"RDKit could not parse SMILES {smiles!r}")
+    return _atom_categories(molecule)
+
+
+def _label_attention_focus_from_categories(
+    categories: Sequence[str],
+    atom_mass: np.ndarray,
+    *,
+    focus_mass: float = 0.75,
+    diffuse_threshold: float = 0.35,
+) -> str:
     atom_mass = np.asarray(atom_mass, dtype=np.float64)
+    if atom_mass.ndim != 1 or len(atom_mass) != len(categories):
+        raise ValueError(
+            "attention mass and atom categories must be aligned one-dimensional "
+            f"arrays, got {atom_mass.shape} and {len(categories)} categories"
+        )
     order = np.argsort(-atom_mass)
     selected = []
     cumulative = 0.0
@@ -973,7 +984,6 @@ def label_attention_focus(
         cumulative += float(atom_mass[index])
         if cumulative >= float(focus_mass):
             break
-    categories = _atom_categories(molecule)
     mass_by_category: dict[str, float] = {}
     for index in selected:
         category = categories[index]
@@ -982,6 +992,21 @@ def label_attention_focus(
         )
     best, mass = max(mass_by_category.items(), key=lambda item: item[1])
     return best if mass >= float(diffuse_threshold) else "other/diffuse"
+
+
+def label_attention_focus(
+    smiles: str,
+    atom_mass: np.ndarray,
+    *,
+    focus_mass: float = 0.75,
+    diffuse_threshold: float = 0.35,
+) -> str:
+    return _label_attention_focus_from_categories(
+        _attention_focus_categories(smiles),
+        atom_mass,
+        focus_mass=focus_mass,
+        diffuse_threshold=diffuse_threshold,
+    )
 
 
 def compute_av_pca_inputs(
@@ -1047,6 +1072,135 @@ def compute_av_pca_inputs(
         "indices": np.asarray(indices, dtype=np.int64),
         "n_requested": int(n_graphs),
         "n_used": len(vectors),
+    }
+
+
+def compute_layer_av_pca_inputs(
+    figure_runtime: GraphormerFigureRuntime,
+    *,
+    layers: Sequence[int],
+    n_graphs: int = 500,
+    focus_mass: float = 0.75,
+    diffuse_threshold: float = 0.35,
+    verbose: bool = True,
+) -> dict[str, Any]:
+    """Collect pooled ``A@V`` vectors for every head in selected layers.
+
+    The diagnostic extractor captures all heads and layers in one model forward,
+    so the requested layer grids share one sweep over the evaluation molecules.
+    """
+
+    model_layers = figure_runtime.backend.model.encoder.graph_encoder.layers
+    num_layers = len(model_layers)
+    requested_layers = tuple(dict.fromkeys(int(layer) for layer in layers))
+    if not requested_layers:
+        raise ValueError("at least one layer is required for layer-wide PCA")
+    invalid = [
+        layer for layer in requested_layers if layer < 0 or layer >= num_layers
+    ]
+    if invalid:
+        raise IndexError(
+            f"PCA layers {invalid} are outside [0, {num_layers})"
+        )
+    if int(n_graphs) < 2:
+        raise ValueError("layer-wide PCA requires at least two requested graphs")
+
+    num_heads = int(model_layers[requested_layers[0]].self_attn.num_heads)
+    for layer in requested_layers:
+        layer_heads = int(model_layers[layer].self_attn.num_heads)
+        if layer_heads != num_heads:
+            raise ValueError(
+                "layer-wide PCA requires a constant head count; "
+                f"layer {layer} has {layer_heads}, expected {num_heads}"
+            )
+
+    extractor = GraphormerDiagnosticExtractor(figure_runtime.backend)
+    vectors: dict[int, list[np.ndarray]] = {
+        layer: [] for layer in requested_layers
+    }
+    labels: dict[int, list[list[str]]] = {
+        layer: [] for layer in requested_layers
+    }
+    positions: list[int] = []
+    indices: list[int] = []
+    limit = min(int(n_graphs), len(figure_runtime.runtime.eval_ds))
+    for position in range(limit):
+        try:
+            graph = figure_runtime.runtime.eval_ds[position]
+            captured = extractor.extract(graph)
+            atom_categories = _attention_focus_categories(str(graph.smiles))
+            graph_vectors: dict[int, np.ndarray] = {}
+            graph_labels: dict[int, list[str]] = {}
+            for layer in requested_layers:
+                layer_vectors = (
+                    captured.transport[layer][:, 1:, :]
+                    .mean(dim=1)
+                    .float()
+                    .cpu()
+                    .numpy()
+                )
+                matrices = (
+                    captured.attention[layer][:, 1:, 1:]
+                    .float()
+                    .cpu()
+                    .numpy()
+                )
+                matrices = matrices / np.clip(
+                    matrices.sum(axis=-1, keepdims=True),
+                    1e-12,
+                    None,
+                )
+                inbound = matrices.mean(axis=1)
+                if layer_vectors.shape[0] != num_heads:
+                    raise ValueError(
+                        f"layer {layer} produced {layer_vectors.shape[0]} head "
+                        f"vectors, expected {num_heads}"
+                    )
+                graph_vectors[layer] = layer_vectors
+                graph_labels[layer] = [
+                    _label_attention_focus_from_categories(
+                        atom_categories,
+                        inbound[head],
+                        focus_mass=focus_mass,
+                        diffuse_threshold=diffuse_threshold,
+                    )
+                    for head in range(num_heads)
+                ]
+        except Exception as error:
+            if verbose:
+                print(
+                    f"  [layer A@V PCA] skipped eval position {position}: {error}"
+                )
+            continue
+        for layer in requested_layers:
+            vectors[layer].append(graph_vectors[layer])
+            labels[layer].append(graph_labels[layer])
+        positions.append(position)
+        indices.append(dataset_index(figure_runtime.runtime, position))
+        if verbose and (position + 1) % 50 == 0:
+            print(f"  [layer A@V PCA] {position + 1}/{limit}")
+
+    if len(positions) < 2:
+        raise RuntimeError(
+            "fewer than two molecules produced valid layer-wide A@V vectors"
+        )
+    return {
+        "layers": {
+            layer: {
+                "layer": int(layer),
+                "vectors": np.stack(vectors[layer]),
+                "labels": labels[layer],
+                "n_used": len(positions),
+            }
+            for layer in requested_layers
+        },
+        "requested_layers": requested_layers,
+        "num_layers": int(num_layers),
+        "num_heads": int(num_heads),
+        "positions": np.asarray(positions, dtype=np.int64),
+        "indices": np.asarray(indices, dtype=np.int64),
+        "n_requested": int(n_graphs),
+        "n_used": len(positions),
     }
 
 
@@ -1134,6 +1288,7 @@ __all__ = [
     "build_verified_figure_runtime",
     "collect_attention_examples",
     "compute_av_pca_inputs",
+    "compute_layer_av_pca_inputs",
     "graph_at_dataset_index",
     "label_attention_focus",
     "load_graphormer_model_record",
