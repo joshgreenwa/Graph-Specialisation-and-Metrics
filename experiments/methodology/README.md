@@ -51,7 +51,9 @@ each task's figure directory. The notebook also assembles ordered, multi-page PD
 Drive `pdf_sections` directory: `zinc_*.pdf` and `qm9_*.pdf` files for main scores, all distance
 curves, semantic specialists, structural specialists, high-`J` generalists, and mechanism/logit
 diagnostics. Specialist section PDFs keep each attention grid, PCA, and companion SPD curve
-together in display order.
+together in display order. Individual PNGs are lossless 300-DPI exports. PDFs keep typography,
+axes, curves, and annotations as vectors, render dense heatmap/scatter layers and RDKit molecule
+line art at 600 DPI, and are merged into section PDFs without recompression.
 
 For the public PCQM model, set `TASKS = ("graphormer_pcqm4mv2",)` and leave `CHECKPOINTS`
 empty. The registered `clefourrier/graphormer-base-pcqm4mv2@refs/pr/4` checkpoint is loaded

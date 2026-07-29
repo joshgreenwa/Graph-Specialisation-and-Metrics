@@ -27,6 +27,11 @@ SLATE = "#607080"
 LIGHT_GRID = "#DCE3E8"
 ATTENTION_CMAP = plt.get_cmap("Blues")
 SELECTIVITY_CMAP = plt.get_cmap("coolwarm")
+# Publication export policy.  PDF text, paths, and annotations remain vector;
+# only intrinsically image-like artists are rendered at the higher PDF DPI.
+PUBLICATION_PNG_DPI = 300
+PUBLICATION_PDF_RASTER_DPI = 600
+MOLECULE_DRAW_DPI = 600
 HEAD_STYLES = {
     "semantic": {"color": GOLD, "label": "Semantic specialist"},
     "structural": {"color": TEAL, "label": "Structural specialist"},
@@ -70,7 +75,7 @@ def apply_publication_style() -> None:
     plt.rcParams.update(
         {
             "figure.dpi": 140,
-            "savefig.dpi": 300,
+            "savefig.dpi": PUBLICATION_PNG_DPI,
             "font.family": "sans-serif",
             "font.sans-serif": ["DejaVu Sans", "Arial", "Liberation Sans"],
             "mathtext.fontset": "dejavusans",
@@ -431,7 +436,7 @@ def _draw_molecule_plain(
     example: Mapping[str, Any],
     *,
     figsize: tuple[float, float] = (4.2, 3.7),
-    dpi: int = 180,
+    dpi: int = MOLECULE_DRAW_DPI,
 ):
     from PIL import Image
     from rdkit.Chem.Draw import rdMolDraw2D
@@ -453,7 +458,7 @@ def _draw_molecule_attention(
     inbound: np.ndarray,
     vmax: float,
     figsize: tuple[float, float] = (4.2, 3.7),
-    dpi: int = 180,
+    dpi: int = MOLECULE_DRAW_DPI,
 ):
     """RDKit molecule with atom-centred attention-inflow highlights."""
 
@@ -985,8 +990,17 @@ def save_figure_bundle(
     stem: str,
     *,
     metadata: Mapping[str, Any] | None = None,
-    dpi: int = 300,
+    dpi: int = PUBLICATION_PNG_DPI,
+    pdf_raster_dpi: int = PUBLICATION_PDF_RASTER_DPI,
 ) -> dict[str, Path]:
+    """Save lossless PNG and mixed vector/raster publication PDF outputs.
+
+    Matplotlib preserves text and path artists as vectors in the PDF.  Its
+    explicitly rasterized artists (dense scatters and heatmaps) are rendered at
+    ``pdf_raster_dpi``; the section-PDF merger later copies these pages without
+    recompression.
+    """
+
     directory = Path(output_directory)
     directory.mkdir(parents=True, exist_ok=True)
     paths = {
@@ -995,10 +1009,24 @@ def save_figure_bundle(
         "metadata": directory / f"{stem}.json",
     }
     figure.savefig(paths["png"], dpi=dpi, bbox_inches="tight", facecolor="white")
-    figure.savefig(paths["pdf"], bbox_inches="tight", facecolor="white")
+    figure.savefig(
+        paths["pdf"],
+        dpi=pdf_raster_dpi,
+        bbox_inches="tight",
+        facecolor="white",
+    )
     paths["metadata"].write_text(
         json.dumps(
-            {"figure": stem, **dict(metadata or {})},
+            {
+                "figure": stem,
+                "export_quality": {
+                    "png_dpi": int(dpi),
+                    "pdf_raster_dpi": int(pdf_raster_dpi),
+                    "pdf_vector_artists": True,
+                    "molecule_draw_dpi": MOLECULE_DRAW_DPI,
+                },
+                **dict(metadata or {}),
+            },
             indent=2,
             sort_keys=True,
             default=str,

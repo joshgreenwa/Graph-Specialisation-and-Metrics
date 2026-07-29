@@ -33,7 +33,10 @@ from graph_specialisation_metrics.methodology.grit_figure_data import (  # noqa:
     select_structurally_selective_heads,
 )
 from graph_specialisation_metrics.methodology.grit_figure_plots import (  # noqa: E402
+    MOLECULE_DRAW_DPI,
     PCA_FOCUS_COLORS,
+    PUBLICATION_PDF_RASTER_DPI,
+    PUBLICATION_PNG_DPI,
     _pca_focus_color,
     plot_attention_grid,
     plot_av_pca,
@@ -466,6 +469,31 @@ def test_section_pdf_bundles_are_task_prefixed_and_ordered(tmp_path: Path):
     assert record["pages"] == 2
     assert record["figure_stems"] == ["figure_0", "figure_1"]
     assert len(PdfReader(str(record["path"])).pages) == 2
+
+
+def test_figure_bundle_uses_publication_export_resolution(tmp_path: Path):
+    class RecordingFigure:
+        def __init__(self):
+            self.calls = []
+
+        def savefig(self, path, **kwargs):
+            self.calls.append((Path(path), kwargs))
+            Path(path).write_bytes(b"test")
+
+    figure = RecordingFigure()
+    save_figure_bundle(figure, tmp_path, "publication")
+    assert figure.calls[0][0].suffix == ".png"
+    assert figure.calls[0][1]["dpi"] == PUBLICATION_PNG_DPI == 300
+    assert figure.calls[1][0].suffix == ".pdf"
+    assert figure.calls[1][1]["dpi"] == PUBLICATION_PDF_RASTER_DPI == 600
+    assert MOLECULE_DRAW_DPI == 600
+    metadata = json.loads((tmp_path / "publication.json").read_text())
+    assert metadata["export_quality"] == {
+        "png_dpi": 300,
+        "pdf_raster_dpi": 600,
+        "pdf_vector_artists": True,
+        "molecule_draw_dpi": 600,
+    }
 
 
 def test_grit_diagnostic_extractor_captures_native_sparse_sites():
