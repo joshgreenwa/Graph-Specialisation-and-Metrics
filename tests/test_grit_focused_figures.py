@@ -440,6 +440,10 @@ def test_grit_plotting_api_accepts_synthetic_payloads():
     figures.append(
         plot_selectivity_vs_logit_ratio(metrics, logit, selected)
     )
+    np.testing.assert_allclose(
+        figures[2].get_size_inches(),
+        figures[3].get_size_inches(),
+    )
     assert all(figure.axes for figure in figures)
     for figure in figures:
         plt.close(figure)

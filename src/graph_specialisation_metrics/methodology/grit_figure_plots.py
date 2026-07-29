@@ -32,6 +32,7 @@ SELECTIVITY_CMAP = plt.get_cmap("coolwarm")
 PUBLICATION_PNG_DPI = 300
 PUBLICATION_PDF_RASTER_DPI = 600
 MOLECULE_DRAW_DPI = 600
+CORE_SCATTER_FIGSIZE = (8.0, 5.9)
 HEAD_STYLES = {
     "semantic": {"color": GOLD, "label": "Semantic specialist"},
     "structural": {"color": TEAL, "label": "Structural specialist"},
@@ -328,7 +329,9 @@ def plot_score_plane(
 ):
     apply_publication_style()
     x, y = metrics.normalized_structural, metrics.normalized_semantic
-    fig, ax = plt.subplots(figsize=(7.7, 6.5), constrained_layout=True)
+    fig, ax = plt.subplots(
+        figsize=CORE_SCATTER_FIGSIZE, constrained_layout=True
+    )
     scatter = _scatter_heads(ax, x, y)
     maximum = max(float(np.nanmax(x)), float(np.nanmax(y))) * 1.06
     ax.plot([0, maximum], [0, maximum], color=SLATE, linestyle="--", linewidth=1.2)
@@ -372,7 +375,9 @@ def plot_selectivity_joint_plane(
 ):
     apply_publication_style()
     x, y = metrics.selectivity, metrics.joint_sensitivity
-    fig, ax = plt.subplots(figsize=(8.0, 5.9), constrained_layout=True)
+    fig, ax = plt.subplots(
+        figsize=CORE_SCATTER_FIGSIZE, constrained_layout=True
+    )
     scatter = _scatter_heads(
         ax, x, y, active=metrics.active if active_only else None
     )
