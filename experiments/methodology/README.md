@@ -46,7 +46,12 @@ its mean clean-attention-mass versus shortest-path-distance companion. Every oth
 with negative `D_rel` also gets the SPD plot from the canonical score cache afterward, preserving
 complete structural coverage without duplicating named companions. GRIT's non-additive relation
 conditioning is reported as such; its node-only versus relation-conditioned raw-logit figure is
-not labelled as Graphormer dot-versus-bias.
+not labelled as Graphormer dot-versus-bias. Individual PNG/PDF/JSON figure bundles remain under
+each task's figure directory. The notebook also assembles ordered, multi-page PDFs in the shared
+Drive `pdf_sections` directory: `zinc_*.pdf` and `qm9_*.pdf` files for main scores, all distance
+curves, semantic specialists, structural specialists, high-`J` generalists, and mechanism/logit
+diagnostics. Specialist section PDFs keep each attention grid, PCA, and companion SPD curve
+together in display order.
 
 For the public PCQM model, set `TASKS = ("graphormer_pcqm4mv2",)` and leave `CHECKPOINTS`
 empty. The registered `clefourrier/graphormer-base-pcqm4mv2@refs/pr/4` checkpoint is loaded

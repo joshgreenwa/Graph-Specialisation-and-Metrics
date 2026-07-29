@@ -43,6 +43,8 @@ from graph_specialisation_metrics.methodology.grit_figure_plots import (  # noqa
     plot_score_plane,
     plot_selectivity_joint_plane,
     plot_selectivity_vs_logit_ratio,
+    save_figure_bundle,
+    save_section_pdf_bundles,
 )
 from graph_specialisation_metrics.methodology.protocol import (  # noqa: E402
     ExecutionPolicy,
@@ -440,6 +442,32 @@ def test_grit_plotting_api_accepts_synthetic_payloads():
         plt.close(figure)
 
 
+def test_section_pdf_bundles_are_task_prefixed_and_ordered(tmp_path: Path):
+    import matplotlib.pyplot as plt
+
+    PdfReader = pytest.importorskip("pypdf").PdfReader
+    pages = []
+    for index in range(2):
+        figure, axis = plt.subplots()
+        axis.text(0.5, 0.5, f"page {index}", ha="center")
+        paths = save_figure_bundle(
+            figure, tmp_path / "individual", f"figure_{index}"
+        )
+        pages.append((f"figure_{index}", paths["pdf"]))
+        plt.close(figure)
+    outputs = save_section_pdf_bundles(
+        {"semantic_specialists": pages},
+        tmp_path / "sections",
+        task_prefix="zinc",
+        section_titles={"semantic_specialists": "Semantic specialists"},
+    )
+    record = outputs["semantic_specialists"]
+    assert record["path"].name == "zinc_semantic_specialists.pdf"
+    assert record["pages"] == 2
+    assert record["figure_stems"] == ["figure_0", "figure_1"]
+    assert len(PdfReader(str(record["path"])).pages) == 2
+
+
 def test_grit_diagnostic_extractor_captures_native_sparse_sites():
     torch = pytest.importorskip("torch")
     pyg_data = pytest.importorskip("torch_geometric.data")
@@ -541,6 +569,7 @@ def test_colab_notebook_has_valid_python_cells():
         "".join(cell.get("source", [])) for cell in payload["cells"]
     )
     assert '"rdkit"' in source
+    assert '"pypdf"' in source
     assert "def get_figure_runtime()" in source
     assert "if figure_runtime is None" in source
     assert "select_structurally_selective_heads" in source
@@ -553,6 +582,11 @@ def test_colab_notebook_has_valid_python_cells():
         'f"{role}_head_{head[0]}_{head[1]}_clean_attention_mass_vs_SPD"'
     )
     assert "companion_heads = set(all_roles.values())" in runtime_source
+    assert 'PDF_TASK_PREFIXES = {"zinc": "zinc", "qm9_gap_dense": "qm9"}' in source
+    assert "save_section_pdf_bundles(" in runtime_source
+    assert '"semantic_specialists"' in source
+    assert '"distance_curves"' in source
+    assert 'RUN_ROOT / "pdf_sections"' in source
     for index, cell in enumerate(payload["cells"]):
         if cell["cell_type"] == "code":
             ast.parse(

@@ -5,9 +5,11 @@ from __future__ import annotations
 from collections import Counter
 import io
 import json
+import os
 from pathlib import Path
+import tempfile
 import textwrap
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 import matplotlib.pyplot as plt
 from matplotlib.colors import Normalize, TwoSlopeNorm
@@ -1007,6 +1009,78 @@ def save_figure_bundle(
     return paths
 
 
+def save_section_pdf_bundles(
+    section_pages: Mapping[str, Sequence[tuple[str, str | Path]]],
+    output_directory: str | Path,
+    *,
+    task_prefix: str,
+    section_titles: Mapping[str, str] | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Merge ordered individual figure PDFs into task-prefixed section PDFs."""
+
+    from pypdf import PdfReader, PdfWriter
+
+    prefix = str(task_prefix).strip().lower()
+    if not prefix or not prefix.replace("_", "").replace("-", "").isalnum():
+        raise ValueError(f"invalid PDF task prefix {task_prefix!r}")
+    directory = Path(output_directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    outputs: dict[str, dict[str, Any]] = {}
+    for section, entries in section_pages.items():
+        section = str(section)
+        if not entries:
+            continue
+        if not section.replace("_", "").replace("-", "").isalnum():
+            raise ValueError(f"invalid PDF section name {section!r}")
+        writer = PdfWriter()
+        stems: list[str] = []
+        page_count = 0
+        try:
+            for stem, source in entries:
+                source_path = Path(source)
+                if not source_path.is_file():
+                    raise FileNotFoundError(
+                        f"section PDF source does not exist: {source_path}"
+                    )
+                reader = PdfReader(str(source_path))
+                for page in reader.pages:
+                    writer.add_page(page)
+                    page_count += 1
+                stems.append(str(stem))
+            if not page_count:
+                raise ValueError(f"PDF section {section!r} has no pages")
+            title = str((section_titles or {}).get(section, section))
+            writer.add_metadata(
+                {
+                    "/Title": f"{prefix.upper()} — {title}",
+                    "/Subject": "Graph specialisation figure section",
+                }
+            )
+            output_path = directory / f"{prefix}_{section}.pdf"
+            descriptor, temporary = tempfile.mkstemp(
+                prefix=output_path.stem + "-",
+                suffix=".partial.pdf",
+                dir=directory,
+            )
+            os.close(descriptor)
+            temporary_path = Path(temporary)
+            try:
+                with temporary_path.open("wb") as handle:
+                    writer.write(handle)
+                temporary_path.replace(output_path)
+            finally:
+                if temporary_path.exists():
+                    temporary_path.unlink()
+        finally:
+            writer.close()
+        outputs[section] = {
+            "path": output_path,
+            "pages": page_count,
+            "figure_stems": stems,
+        }
+    return outputs
+
+
 __all__ = [
     "apply_publication_style",
     "automatic_selectivity_limits",
@@ -1020,4 +1094,5 @@ __all__ = [
     "plot_selectivity_joint_plane",
     "plot_selectivity_vs_logit_ratio",
     "save_figure_bundle",
+    "save_section_pdf_bundles",
 ]
