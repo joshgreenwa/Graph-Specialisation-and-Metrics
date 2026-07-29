@@ -48,6 +48,7 @@ from graph_specialisation_metrics.methodology.graphormer_figure_plots import (
     plot_score_plane,
     plot_selectivity_joint_plane,
     plot_selectivity_vs_logit_ratio,
+    save_figure_bundle,
 )
 from graph_specialisation_metrics.methodology.tasks import get_task
 from graph_specialisation_metrics.methodology.protocol import (
@@ -471,6 +472,30 @@ def test_heatmaps_do_not_outline_selected_heads():
     finally:
         for figure in figures:
             plt.close(figure)
+
+
+def test_figure_bundle_saves_png_pdf_and_provenance_in_target_folder(tmp_path):
+    figure = plot_score_plane(synthetic_metrics())
+    target = tmp_path / "semantic_specialists"
+    try:
+        paths = save_figure_bundle(
+            figure,
+            target,
+            "example_head",
+            metadata={"figure_group": "semantic_specialists"},
+        )
+    finally:
+        plt.close(figure)
+
+    assert paths == {
+        "png": target / "example_head.png",
+        "pdf": target / "example_head.pdf",
+        "metadata": target / "example_head.json",
+    }
+    assert all(path.is_file() for path in paths.values())
+    assert json.loads(paths["metadata"].read_text())["figure_group"] == (
+        "semantic_specialists"
+    )
 
 
 def test_hop_plot_separates_graph_token_tick():
