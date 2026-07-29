@@ -626,6 +626,13 @@ def test_graphbench_replica_specific_head_batching_matches_serial_patch_and_abla
 def test_pe_refinement_causal_geometry_and_taylor_audit_are_complete(tmp_path):
     graph = six_node_matching_graph()
     runtime = fake_runtime(graph)
+    # Real GraphBench batches pad each graph to the maximum edge-output width in
+    # the validation split. The Taylor Jacobian remains graph-local.
+    runtime.eval_ds.append(
+        SimpleNamespace(
+            edge_index=torch.empty(2, 18, dtype=torch.long),
+        )
+    )
     task = get_task("graphbench_bipartite_matching_hard")
     backend = GraphBenchGritBackend(
         runtime, task, sigma=[1.0], jacobian_output_chunk=4
@@ -687,6 +694,9 @@ def test_pe_refinement_causal_geometry_and_taylor_audit_are_complete(tmp_path):
     assert np.isfinite(result["endpoints"]["G_c"]).all()
     assert result["taylor"]["predicted"].shape == (4, 12, 12)
     assert result["taylor"]["exact"].shape == (4, 12, 12)
+    assert result["taylor"]["padded_output_width"] == 18
+    assert result["taylor"]["actual_output_width"] == 12
+    assert result["taylor"]["padding_max"] == 0.0
     assert np.isfinite(result["taylor"]["relative_error"]).all()
 
 

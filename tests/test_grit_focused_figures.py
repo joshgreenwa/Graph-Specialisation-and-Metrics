@@ -545,6 +545,14 @@ def test_colab_notebook_has_valid_python_cells():
     assert "if figure_runtime is None" in source
     assert "select_structurally_selective_heads" in source
     assert "clean_attention_mass_vs_SPD" in source
+    runtime_source = "".join(payload["cells"][6]["source"])
+    assert runtime_source.index("plot_attention_grid(") < runtime_source.index(
+        "plot_av_pca("
+    )
+    assert runtime_source.index("plot_av_pca(") < runtime_source.index(
+        'f"{role}_head_{head[0]}_{head[1]}_clean_attention_mass_vs_SPD"'
+    )
+    assert "companion_heads = set(all_roles.values())" in runtime_source
     for index, cell in enumerate(payload["cells"]):
         if cell["cell_type"] == "code":
             ast.parse(

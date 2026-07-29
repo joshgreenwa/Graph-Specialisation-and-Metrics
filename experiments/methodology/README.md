@@ -40,10 +40,13 @@ PCQM suite (plus an explicit-hydrogen category for QM9), and every title names t
 dense GRIT+RRWP model. The notebook installs RDKit explicitly, writes every model-forward
 diagnostic to its exact supplemental cache before rendering, and constructs the GRIT runtime only
 if one of those artifacts is missing. Once populated, styling-only reruns do not rebuild RRWP,
-reload the checkpoint, or execute model forwards. Every active head with negative `D_rel` also
-gets an individual mean clean-attention-mass versus shortest-path-distance plot from the canonical
-score cache. GRIT's non-additive relation conditioning is reported as such; its node-only versus
-relation-conditioned raw-logit figure is not labelled as Graphormer dot-versus-bias.
+reload the checkpoint, or execute model forwards. Each named semantic specialist, structural
+specialist, and high-`J` generalist is displayed as an attention grid, routed-output PCA, and then
+its mean clean-attention-mass versus shortest-path-distance companion. Every other active head
+with negative `D_rel` also gets the SPD plot from the canonical score cache afterward, preserving
+complete structural coverage without duplicating named companions. GRIT's non-additive relation
+conditioning is reported as such; its node-only versus relation-conditioned raw-logit figure is
+not labelled as Graphormer dot-versus-bias.
 
 For the public PCQM model, set `TASKS = ("graphormer_pcqm4mv2",)` and leave `CHECKPOINTS`
 empty. The registered `clefourrier/graphormer-base-pcqm4mv2@refs/pr/4` checkpoint is loaded

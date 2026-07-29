@@ -1552,14 +1552,43 @@ def _causal_graph(
             .cpu()
             .numpy()
         )
+        if exact_injection.shape[-1] < predicted.shape[-1]:
+            raise RuntimeError(
+                "Taylor exact injection has fewer outputs than the graph-local "
+                "clean Jacobian"
+            )
+        padded_output_width = int(exact_injection.shape[-1])
+        actual_output_width = int(predicted.shape[-1])
+        padding = exact_injection[..., actual_output_width:]
+        padding_max = (
+            float(np.max(np.abs(padding))) if padding.size else 0.0
+        )
+        within_tolerance(
+            padding_max,
+            prepared.config.numerical.reconstruction_tolerance,
+            "pe_refinement.taylor_output_padding",
+            "padded Taylor output response",
+            context={
+                "graph": graph_id,
+                "channel": channel,
+                "arm": arm,
+                "split": stage,
+                "actual_outputs": actual_output_width,
+                "padded_outputs": padded_output_width,
+            },
+        )
+        exact_graph_outputs = exact_injection[..., :actual_output_width]
         taylor = {
             **_taylor_metrics(
                 predicted,
-                exact_injection,
+                exact_graph_outputs,
                 effect_floor=prepared.config.numerical.effect_floor,
             ),
             "predicted": predicted,
-            "exact": exact_injection,
+            "exact": exact_graph_outputs,
+            "actual_output_width": actual_output_width,
+            "padded_output_width": padded_output_width,
+            "padding_max": padding_max,
         }
     if not all(
         np.isfinite(value[:, controlled]).all()
