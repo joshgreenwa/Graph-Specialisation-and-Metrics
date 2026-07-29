@@ -312,7 +312,7 @@ def plot_score_plane(
     apply_publication_style()
     x = metrics.normalized_structural
     y = metrics.normalized_semantic
-    fig, ax = plt.subplots(figsize=(7.7, 6.5), constrained_layout=True)
+    fig, ax = plt.subplots(figsize=(8.0, 5.9), constrained_layout=True)
     scatter = _scatter_heads(ax, x, y)
     maximum = max(float(np.nanmax(x)), float(np.nanmax(y))) * 1.06
     ax.plot([0, maximum], [0, maximum], color=SLATE, linestyle="--", linewidth=1.2)

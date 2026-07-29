@@ -375,6 +375,11 @@ def test_requested_scatter_figures_have_no_errorbar_artists():
         ),
     )
     try:
+        assert np.allclose(figures[0].get_size_inches(), (8.0, 5.9))
+        assert np.allclose(
+            figures[0].get_size_inches(),
+            figures[1].get_size_inches(),
+        )
         for figure in figures:
             containers = [
                 container
