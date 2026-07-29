@@ -37,6 +37,7 @@ from graph_specialisation_metrics.methodology.graphbench_pe_refinement import (
     _run_causal_component,
     render_refinement_figures,
     run_common_ablation,
+    semantic_event_manifest,
     structural_pair_manifest,
 )
 from graph_specialisation_metrics.methodology.protocol import BootstrapPolicy
@@ -623,7 +624,21 @@ def test_graphbench_replica_specific_head_batching_matches_serial_patch_and_abla
     assert torch.allclose(z_batched_ablation, serial_ablation, atol=1.0e-6)
 
 
-def test_pe_refinement_causal_geometry_and_taylor_audit_are_complete(tmp_path):
+@pytest.mark.parametrize(
+    ("channel", "arm"),
+    (
+        ("semantic", None),
+        ("structural", "rrwp_copy"),
+        ("structural", "rrwp_transpose"),
+        ("structural", "complete_pe_copy"),
+        ("structural", "complete_pe_transpose"),
+    ),
+)
+def test_pe_refinement_causal_geometry_and_taylor_audit_are_complete(
+    tmp_path,
+    channel,
+    arm,
+):
     graph = six_node_matching_graph()
     runtime = fake_runtime(graph)
     # Real GraphBench batches pad each graph to the maximum edge-output width in
@@ -660,44 +675,53 @@ def test_pe_refinement_causal_geometry_and_taylor_audit_are_complete(tmp_path):
         config=config,
         runtime=runtime,
         backend=backend,
+        donor_pool=GraphBenchEdgeDonorPool([(0, graph)]),
         progress=SimpleNamespace(emit=lambda *_args, **_kwargs: None),
     )
-    manifest = structural_pair_manifest(prepared, "refinement", (0,))
+    manifest = (
+        semantic_event_manifest(prepared, "refinement", (0,))
+        if channel == "semantic"
+        else structural_pair_manifest(prepared, "refinement", (0,))
+    )
     rows = manifest[0]
 
-    assert len(rows) == 12
-    assert all(row["realised_donor_count"] == 2 for row in rows)
-    assert all(
-        len(
-            {
-                row["donor_node"]
-                for row in rows
-                if row["source"] == source
-            }
+    if channel == "structural":
+        assert len(rows) == 12
+        assert all(row["realised_donor_count"] == 2 for row in rows)
+        assert all(
+            len(
+                {
+                    row["donor_node"]
+                    for row in rows
+                    if row["source"] == source
+                }
+            )
+            == 2
+            for source in range(6)
         )
-        == 2
-        for source in range(6)
-    )
 
     result = _causal_graph(
         prepared,
         graph_id=0,
-        channel="structural",
-        arm="complete_pe_transpose",
+        channel=channel,
+        arm=arm,
         stage="refinement",
         manifest_rows=rows,
         clean_taylor=backend.clean_jacobians(graph),
     )
 
     assert result["controlled"].all()
-    assert result["endpoints"]["G_c"].shape == (4, 12)
+    assert result["endpoints"]["G_c"].shape == (4, len(rows))
     assert np.isfinite(result["endpoints"]["G_c"]).all()
-    assert result["taylor"]["predicted"].shape == (4, 12, 12)
-    assert result["taylor"]["exact"].shape == (4, 12, 12)
+    assert result["taylor"]["predicted"].shape == (4, len(rows), 12)
+    assert result["taylor"]["exact"].shape == (4, len(rows), 12)
     assert result["taylor"]["padded_output_width"] == 18
     assert result["taylor"]["actual_output_width"] == 12
     assert result["taylor"]["padding_max"] == 0.0
-    assert np.isfinite(result["taylor"]["relative_error"]).all()
+    assert np.isfinite(result["taylor"]["predicted"]).all()
+    assert np.isfinite(result["taylor"]["exact"]).all()
+    estimable = result["taylor"]["estimable"]
+    assert np.isfinite(result["taylor"]["relative_error"][estimable]).all()
 
 
 def test_pe_refinement_vectorized_permutation_respects_layer_strata():
