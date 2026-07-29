@@ -365,7 +365,7 @@ def test_graph_local_estimator_normalises_each_graph_independently(monkeypatch):
     assert result["graph_id_seed_space"] == "caller-supplied graph ID"
 
 
-def test_requested_scatter_figures_have_no_errorbar_artists():
+def test_requested_scatter_figures_have_matching_export_geometry(tmp_path):
     metrics = synthetic_metrics()
     selected = {"semantic": (1, 2), "structural": (0, 0)}
     figures = (
@@ -380,7 +380,16 @@ def test_requested_scatter_figures_have_no_errorbar_artists():
             figures[0].get_size_inches(),
             figures[1].get_size_inches(),
         )
-        for figure in figures:
+        assert figures[0].axes[0].get_aspect() == "auto"
+        exported_shapes = []
+        for index, figure in enumerate(figures):
+            paths = save_figure_bundle(
+                figure,
+                tmp_path,
+                f"scatter_{index}",
+                dpi=72,
+            )
+            exported_shapes.append(plt.imread(paths["png"]).shape[:2])
             containers = [
                 container
                 for axis in figure.axes
@@ -418,6 +427,7 @@ def test_requested_scatter_figures_have_no_errorbar_artists():
                     patch.get_edgecolor()[:3],
                     to_rgba(expected_color)[:3],
                 )
+        assert exported_shapes[0] == exported_shapes[1]
     finally:
         for figure in figures:
             plt.close(figure)

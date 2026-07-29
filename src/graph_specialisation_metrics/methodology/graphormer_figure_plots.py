@@ -318,7 +318,6 @@ def plot_score_plane(
     ax.plot([0, maximum], [0, maximum], color=SLATE, linestyle="--", linewidth=1.2)
     ax.set_xlim(0, maximum)
     ax.set_ylim(0, maximum)
-    ax.set_aspect("equal", adjustable="box")
     ax.set_xlabel(r"Structural score $S_{\rm str}/\overline{S}_{\rm str}$")
     ax.set_ylabel(r"Semantic score $S_{\rm sem}/\overline{S}_{\rm sem}$")
     ax.set_title(title, fontsize=17, pad=12)
