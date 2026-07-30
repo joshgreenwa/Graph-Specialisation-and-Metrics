@@ -447,6 +447,9 @@ def _draw_molecule_plain(
     drawer = rdMolDraw2D.MolDraw2DCairo(width, height)
     options = drawer.drawOptions()
     options.addAtomIndices = False
+    options.bondLineWidth = 5.0
+    options.fixedFontSize = 44
+    options.padding = 0.06
     for index in range(molecule.GetNumAtoms()):
         options.atomLabels[index] = str(index)
     drawer.DrawMolecule(molecule, legend="")
@@ -489,6 +492,9 @@ def _draw_molecule_attention(
     options.addAtomIndices = False
     options.fillHighlights = True
     options.atomHighlightsAreCircles = True
+    options.bondLineWidth = 5.0
+    options.fixedFontSize = 44
+    options.padding = 0.06
     for index in highlight_atoms:
         options.atomLabels[index] = str(index)
     drawer.DrawMolecule(
@@ -531,13 +537,13 @@ def plot_attention_grid(
         max(float(np.nanpercentile(values, 99)), 1e-6) for values in inbound
     )
     fig = plt.figure(
-        figsize=(13.2, 1.45 + 3.25 * num_rows),
+        figsize=(13.2, 1.65 + 3.35 * num_rows + 0.72),
         constrained_layout=True,
     )
     grid = fig.add_gridspec(
-        num_rows + 1,
+        num_rows + 2,
         3,
-        height_ratios=[0.15, *([1.0] * num_rows)],
+        height_ratios=[0.16, *([1.0] * num_rows), 0.11],
         width_ratios=[1.0, 1.08, 1.12],
     )
     title_axis = fig.add_subplot(grid[0, :])
@@ -549,6 +555,7 @@ def plot_attention_grid(
         ],
         dtype=object,
     )
+    colorbar_axis = fig.add_subplot(grid[-1, :])
     for row, (example, matrix) in enumerate(zip(examples, matrices)):
         graph_index = int(example["dataset_index"])
         graph_coordinates = per_graph_coordinates.get(graph_index)
@@ -581,9 +588,9 @@ def plot_attention_grid(
             transform=axes[row, 0].transAxes,
             ha="left",
             va="top",
-            fontsize=9,
+            fontsize=13,
             color=NAVY,
-            bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.85},
+            bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.90},
         )
         axes[row, 1].imshow(
             _draw_molecule_attention(
@@ -602,16 +609,16 @@ def plot_attention_grid(
             aspect="equal",
             rasterized=True,
         )
-        axes[row, 2].set_xlabel("Key atom")
-        axes[row, 2].set_ylabel("Query atom")
+        axes[row, 2].set_xlabel("Key atom", fontsize=13)
+        axes[row, 2].set_ylabel("Query atom", fontsize=13)
         axes[row, 2].set_xticks(np.arange(matrix.shape[0]))
         axes[row, 2].set_yticks(np.arange(matrix.shape[0]))
-        axes[row, 2].tick_params(labelsize=6, length=2)
+        axes[row, 2].tick_params(labelsize=8, length=2.5)
 
     for column, label in enumerate(
         ["Molecule", "Attention-weighted molecule", "Node-conditioned attention"]
     ):
-        axes[0, column].set_title(label, fontsize=12, pad=8)
+        axes[0, column].set_title(label, fontsize=16, pad=10)
     style = HEAD_STYLES.get(role, {"label": role.title()})
     title_axis.text(
         0.5,
@@ -619,7 +626,7 @@ def plot_attention_grid(
         f"{title_label or style['label']} — {_head_label(head)}",
         ha="center",
         va="center",
-        fontsize=18,
+        fontsize=20,
         color=NAVY,
     )
     title_axis.text(
@@ -629,13 +636,29 @@ def plot_attention_grid(
         rf"J = {float(net_joint_sensitivity):.3f}$",
         ha="center",
         va="center",
-        fontsize=14,
+        fontsize=16,
         color=NAVY,
     )
-    colorbar = fig.colorbar(
-        image, ax=axes[:, 2], location="right", shrink=0.72, pad=0.02
+    colorbar = fig.colorbar(image, cax=colorbar_axis, orientation="horizontal")
+    colorbar.set_label("Attention weight", fontsize=14, labelpad=7)
+    colorbar.ax.tick_params(labelsize=11, length=3)
+    for tick_label in colorbar.ax.get_xticklabels():
+        tick_label.set_fontweight("medium")
+
+    # Let constrained layout settle the full grid before shortening the
+    # horizontal colour bar. Disabling the engine afterwards preserves the
+    # publication geometry through both PNG and PDF save passes.
+    fig.canvas.draw()
+    colorbar_position = colorbar_axis.get_position()
+    fig.set_layout_engine("none")
+    colorbar_axis.set_position(
+        [
+            colorbar_position.x0 + 0.08 * colorbar_position.width,
+            colorbar_position.y0,
+            0.84 * colorbar_position.width,
+            colorbar_position.height,
+        ]
     )
-    colorbar.set_label("Attention weight")
     return fig
 
 

@@ -765,8 +765,31 @@ def test_attention_grid_supports_five_rows_without_arrows():
             for axis in figure.axes
             if axis.get_title() == "Node-conditioned attention"
         )
+        colorbar_axis = next(
+            axis
+            for axis in figure.axes
+            if axis.get_xlabel() == "Attention weight"
+        )
         assert weighted_axis.images
         assert matrix_axis.images[0].get_cmap().name == "Blues"
+        assert weighted_axis.title.get_fontsize() == 16
+        assert matrix_axis.title.get_fontsize() == 16
+        assert matrix_axis.xaxis.label.get_fontsize() == 13
+        assert matrix_axis.yaxis.label.get_fontsize() == 13
+        assert colorbar_axis.xaxis.label.get_fontsize() == 14
+        assert all(
+            tick.get_fontsize() == 11
+            and tick.get_fontweight() == "medium"
+            for tick in colorbar_axis.get_xticklabels()
+        )
+        image_axes = [axis for axis in figure.axes if axis.images]
+        assert colorbar_axis.get_position().y1 < min(
+            axis.get_position().y0 for axis in image_axes
+        )
+        image_span = max(
+            axis.get_position().x1 for axis in image_axes
+        ) - min(axis.get_position().x0 for axis in image_axes)
+        assert colorbar_axis.get_position().width < image_span
         title = "\n".join(text.get_text() for text in figure.axes[0].texts)
         assert "Semantic specialist — L1 H24" in title
         assert "Net: $D_{\\rm rel} = +0.481" in title
@@ -786,6 +809,13 @@ def test_attention_grid_supports_five_rows_without_arrows():
         assert "J = 1.110" in labels
         assert "J = 0.840" in labels
         assert labels.count("Graph-local") == 5
+        graph_labels = [
+            text
+            for axis in figure.axes
+            for text in axis.texts
+            if "Graph-local" in text.get_text()
+        ]
+        assert all(text.get_fontsize() == 13 for text in graph_labels)
     finally:
         plt.close(figure)
 
