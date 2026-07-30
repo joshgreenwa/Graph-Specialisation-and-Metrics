@@ -17,6 +17,42 @@ BENEFICIAL_NAME = "Beneficial carriage"
 BENEFICIAL_SIGN = "positive-is-beneficial"
 
 
+def event_normalise_functional(event_field, *, effect_floor: float):
+    """Normalize non-negative Functional-carriage events across carriers.
+
+    Args:
+        event_field: array-like ``[..., carrier]`` donor-resolved magnitudes.
+        effect_floor: events with total mass at or below this value are non-estimable.
+    Returns:
+        ``(normalised, eligible, denominator)`` as NumPy arrays. Non-estimable rows are NaN.
+
+    This is the public implementation of the event normalisation registered in methodology
+    Section 7. Raw Functional carriage remains the primary field.
+    """
+
+    values = np.asarray(event_field, dtype=np.float64)
+    if values.ndim < 1:
+        raise ValueError("event_field must include a carrier axis")
+    if float(effect_floor) <= 0:
+        raise ValueError("effect_floor must be positive")
+    if np.any(np.isfinite(values) & (values < 0)):
+        raise ValueError("Functional-carriage event magnitudes must be non-negative")
+    denominator = np.sum(values, axis=-1)
+    eligible = (
+        np.isfinite(values).all(axis=-1)
+        & np.isfinite(denominator)
+        & (denominator > float(effect_floor))
+    )
+    normalised = np.full_like(values, np.nan, dtype=np.float64)
+    np.divide(
+        values,
+        denominator[..., None],
+        out=normalised,
+        where=eligible[..., None],
+    )
+    return normalised, eligible, denominator
+
+
 def functional_carriage(delta, clean_gradient):
     """Compute F_sens with eventwise output magnitude before donor averaging.
 

@@ -38,6 +38,7 @@ from .cache import (
 from .carriage import (
     additive_beneficial_mass,
     beneficial_carriage,
+    event_normalise_functional,
     functional_carriage_events,
 )
 from .distance import (
@@ -2611,16 +2612,17 @@ def _event_normalised_carriage_rows(
             [float(result[position]["F_sens"]) for position in positions],
             dtype=np.float64,
         )
-        functional_denominator = float(np.sum(functional))
-        functional_ok = bool(
-            np.isfinite(functional).all()
-            and np.isfinite(functional_denominator)
-            and functional_denominator > functional_floor
+        functional_normalised, functional_eligible, _ = (
+            event_normalise_functional(
+                functional[None, :],
+                effect_floor=functional_floor,
+            )
         )
+        functional_ok = bool(functional_eligible[0])
         eligible_functional += int(functional_ok)
-        for position, value in zip(positions, functional):
-            result[position]["F_sens_event_normalised"] = (
-                float(value / functional_denominator) if functional_ok else np.nan
+        for index, position in enumerate(positions):
+            result[position]["F_sens_event_normalised"] = float(
+                functional_normalised[0, index]
             )
 
         if not beneficial_present:

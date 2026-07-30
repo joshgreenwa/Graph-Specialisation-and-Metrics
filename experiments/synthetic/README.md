@@ -3,6 +3,44 @@
 This folder contains controlled graph tasks for studying symbolic and structural
 attention behaviour outside ZINC.
 
+## Graph-native query routing with a hard behavioural oracle
+
+`analysis/query_routing_carriage_colab.py` is the implementation of the Chapter 6
+Jacobian-versus-finite-intervention experiment. It trains a compact GraphGPS-style model on
+heterogeneous random graphs containing a categorical query and one key-value record per key.
+The target is the sum of a query-local term and the value at the uniquely selected record. This
+gives an exact, donor-resolved hard-routing oracle while retaining a realistic learned
+message-passing encoder, softmax routing bottleneck, variable topology, and long-distance OOD
+split.
+
+Paste the complete frontend into one Colab cell. It mounts Drive, clones or updates the repository,
+installs the package, and runs the selected phase. Generated graph splits, immutable experiment
+contract, checkpoints, training histories, full donor-level measurement payloads, CSV/JSON
+summaries, figure metadata, and every PNG/PDF are cached below
+`MyDrive/graph_specialisation_metrics/query_routing_carriage_v1/`. All PNG figures are displayed
+inline at the end of the cell; the health and primary-contrast tables are also shown. The
+supplements include ID/OOD and individual-seed profiles, the off-protocol donor-dose convergence
+ladder, the raw-response scale, the entrywise-L1 Jacobian comparison, and signed Beneficial
+carriage. After a completed measurement run, set `PHASE = "figures"` to regenerate the figures
+from Drive caches without loading a model or checkpoint. Data generation writes contract-bound
+64-graph chunks, measurement writes a checkpoint-bound shard after every graph, and training
+writes an atomic progress checkpoint after every epoch. A disconnected Colab therefore resumes
+the current phase, and missing consolidated split or seed/split caches can be rebuilt from their
+Drive shards.
+
+Local equivalent:
+
+```bash
+python -m graph_specialisation_metrics.synthetic.query_routing_carriage \
+  --phase all \
+  --output-dir outputs/query_routing_carriage_v1 \
+  --seeds 0,1,2,3
+```
+
+For an end-to-end contract smoke test, add `--fast-dev-run`. The smoke configuration is
+deliberately too small to support scientific conclusions, and failed model-health gates are
+printed on the learned-model figures.
+
 ## Finite-intervention range under nonlinear saturation
 
 `analysis/saturation_carriage_colab.py` is a standalone Colab frontend for the focused
