@@ -77,8 +77,8 @@ class ZincReachConfig:
 
     tasks: tuple[str, ...] = TASKS
     seed: int = 0
-    graphs: int = 12
-    sources_per_graph: int = 4
+    graphs: int = 16
+    sources_per_graph: int = 6
     donors_per_source: int = 4
     semantic_donor_graphs: int = 256
     bamberger_output_nodes: int = 6
@@ -1574,8 +1574,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--tasks", default=",".join(TASKS))
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--graphs", type=int, default=12)
-    parser.add_argument("--sources-per-graph", type=int, default=4)
+    parser.add_argument("--graphs", type=int, default=16)
+    parser.add_argument("--sources-per-graph", type=int, default=6)
     parser.add_argument("--donors-per-source", type=int, default=4)
     parser.add_argument("--semantic-donor-graphs", type=int, default=256)
     parser.add_argument("--bamberger-output-nodes", type=int, default=6)
