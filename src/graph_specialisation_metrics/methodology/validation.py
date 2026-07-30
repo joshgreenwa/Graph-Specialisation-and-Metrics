@@ -33,6 +33,14 @@ def _targets(prepared: Any, scores: Mapping[str, Any]) -> dict[str, tuple[tuple[
         for layer in range(int(prepared.grit.L))
         for head in range(int(prepared.grit.H))
     }
+    if (
+        prepared.task.name == "graphbench_bipartite_matching_hard"
+        and scores.get("specialist_classification")
+    ):
+        # The locked matching analysis derives directional candidate groups from
+        # immutable individual-head/event caches on CPU. Joint rank-tail
+        # families, prefix ladders, and their controls are outside its scope.
+        return result
     for name, family in scores["families"].items():
         if family:
             result[f"family_{name}"] = tuple(tuple(value) for value in family)
@@ -1067,6 +1075,355 @@ def _summarize_causal(
     }
 
 
+def _focused_specialist_validation(
+    event_output: Mapping[str, Any],
+    scores: Mapping[str, Any],
+    config: Any,
+    *,
+    source_resampling: tuple[bool, bool],
+) -> dict[str, Any]:
+    """Estimate continuous and strongest-candidate validation from head events."""
+
+    classification = scores.get("specialist_classification")
+    if not classification:
+        return {
+            "status": "not_estimable",
+            "reason": "score cache has no directional-head classification",
+        }
+    candidate_record = classification["candidate_analysis"]
+    confirmed_record = classification["confirmed_95_robustness"]
+    pair_sets: dict[str, tuple[Mapping[str, Any], ...]] = {}
+    if candidate_record["status"] == "estimable":
+        pair_sets["strongest_candidates"] = tuple(
+            candidate_record["j_matching"]["pairs"]
+        )
+    if confirmed_record["status"] == "available":
+        pair_sets["confirmed_95"] = tuple(
+            confirmed_record["j_matching"]["pairs"]
+        )
+
+    records = event_output["records"]
+    head_targets = sorted(
+        (name for name in records if name.startswith("head_")),
+        key=lambda name: tuple(
+            int(value)
+            for value in name.removeprefix("head_L").replace("_H", ",").split(",")
+        ),
+    )
+    head_position = {name: position for position, name in enumerate(head_targets)}
+
+    def target_name(head: Sequence[int]) -> str:
+        return f"head_L{int(head[0])}_H{int(head[1])}"
+
+    endpoint_order = (
+        "P_gross_matched",
+        "gross_necessity",
+        "R_align_adjusted",
+        "I_align_adjusted",
+        "necessity_fraction",
+        "gross_necessity_fraction",
+    )
+    channel_observations: dict[str, list[Observation]] = {}
+    effect_floor = float(config.numerical.effect_floor)
+    for channel in CHANNELS:
+        by_key: dict[tuple[int, int, int], np.ndarray] = {}
+        for target_index, target in enumerate(head_targets):
+            for row in records[target][channel]:
+                key = (
+                    int(row["graph"]),
+                    int(row["source"]),
+                    int(row["donor"]),
+                )
+                by_key.setdefault(
+                    key,
+                    np.full(
+                        (len(head_targets), len(endpoint_order)),
+                        np.nan,
+                        dtype=np.float64,
+                    ),
+                )
+                event_effect = float(row["event_effect"])
+                by_key[key][target_index] = (
+                    float(row["P_gross_matched"]),
+                    float(row["gross_necessity"]),
+                    float(row["R_align_adjusted"]),
+                    float(row["I_align_adjusted"]),
+                    (
+                        float(row["necessity"]) / event_effect
+                        if event_effect > effect_floor
+                        else np.nan
+                    ),
+                    (
+                        float(row["gross_necessity"]) / event_effect
+                        if event_effect > effect_floor
+                        else np.nan
+                    ),
+                )
+        channel_observations[channel] = [
+            Observation(0, key[0], key[1], key[2], value)
+            for key, value in sorted(by_key.items())
+            if np.isfinite(value).all()
+        ]
+
+    if any(not channel_observations[channel] for channel in CHANNELS):
+        return {
+            "status": "not_estimable",
+            "reason": "no complete individual-head causal event matrices",
+            "pair_sets": {
+                name: {"pair_count": len(pairs)}
+                for name, pairs in pair_sets.items()
+            },
+        }
+
+    metric_order = (
+        "restoration",
+        "injection",
+        "necessity_fraction",
+        "gross_necessity_fraction",
+    )
+    continuous_metric_order = (
+        "restoration",
+        "injection",
+        "necessity_fraction",
+    )
+    cell_order = (
+        "semantic_candidate_on_semantic",
+        "semantic_candidate_on_structural",
+        "structural_candidate_on_semantic",
+        "structural_candidate_on_structural",
+        "double_difference",
+    )
+    statistic_order = ("spearman_rho", "J_and_layer_adjusted_standardized_beta")
+    coordinates: HeadCoordinates = scores["coordinates"]
+    D = np.asarray(coordinates.selectivity, dtype=np.float64).reshape(-1)
+    J = np.asarray(coordinates.joint_sensitivity, dtype=np.float64).reshape(-1)
+    active = np.asarray(coordinates.active, dtype=bool).reshape(-1)
+    layers = np.repeat(
+        np.arange(coordinates.joint_sensitivity.shape[0]),
+        coordinates.joint_sensitivity.shape[1],
+    )
+
+    def adjusted_beta(y: np.ndarray) -> float:
+        mask = (
+            active
+            & np.isfinite(D)
+            & np.isfinite(J)
+            & np.isfinite(np.asarray(y, dtype=np.float64))
+        )
+        x = D[mask]
+        outcome = np.asarray(y, dtype=np.float64)[mask]
+        joint = J[mask]
+        layer = layers[mask]
+        if len(x) < 4:
+            return np.nan
+
+        def standardize(value: np.ndarray) -> np.ndarray | None:
+            scale = float(np.std(value))
+            if not np.isfinite(scale) or scale <= effect_floor:
+                return None
+            return (value - np.mean(value)) / scale
+
+        x_scaled = standardize(x)
+        y_scaled = standardize(outcome)
+        j_scaled = standardize(joint)
+        if x_scaled is None or y_scaled is None or j_scaled is None:
+            return np.nan
+        unique_layers = sorted(set(int(value) for value in layer))
+        indicators = (
+            np.column_stack(
+                [
+                    (layer == value).astype(np.float64)
+                    for value in unique_layers[1:]
+                ]
+            )
+            if len(unique_layers) > 1
+            else np.empty((len(layer), 0), dtype=np.float64)
+        )
+        design = np.column_stack(
+            (
+                np.ones(len(x_scaled), dtype=np.float64),
+                x_scaled,
+                j_scaled,
+                indicators,
+            )
+        )
+        return float(np.linalg.lstsq(design, y_scaled, rcond=None)[0][1])
+
+    def transform(value: np.ndarray) -> np.ndarray:
+        # value: channel x individual-head x cached endpoint
+        gross_scale = np.mean(
+            value[:, :, endpoint_order.index("P_gross_matched")],
+            axis=1,
+        )
+        gross_scale = np.where(
+            gross_scale > effect_floor,
+            gross_scale,
+            np.nan,
+        )
+        metric_values = {
+            "restoration": (
+                value[:, :, endpoint_order.index("R_align_adjusted")]
+                / gross_scale[:, None]
+            ),
+            "injection": (
+                value[:, :, endpoint_order.index("I_align_adjusted")]
+                / gross_scale[:, None]
+            ),
+            "necessity_fraction": value[
+                :, :, endpoint_order.index("necessity_fraction")
+            ],
+            "gross_necessity_fraction": value[
+                :, :, endpoint_order.index("gross_necessity_fraction")
+            ],
+        }
+        pair_output = []
+        for pairs in pair_sets.values():
+            semantic_positions = [
+                head_position[target_name(pair["semantic"])] for pair in pairs
+            ]
+            structural_positions = [
+                head_position[target_name(pair["structural"])] for pair in pairs
+            ]
+            set_values = []
+            for metric in metric_order:
+                values = metric_values[metric]
+                sem_sem = float(np.mean(values[0, semantic_positions]))
+                sem_str = float(np.mean(values[1, semantic_positions]))
+                str_sem = float(np.mean(values[0, structural_positions]))
+                str_str = float(np.mean(values[1, structural_positions]))
+                interaction = (sem_sem - sem_str) - (str_sem - str_str)
+                set_values.append(
+                    (sem_sem, sem_str, str_sem, str_str, interaction)
+                )
+            pair_output.append(set_values)
+        pair_values = np.asarray(pair_output, dtype=np.float64).reshape(
+            len(pair_sets),
+            len(metric_order),
+            len(cell_order),
+        )
+        head_contrasts = np.stack(
+            [
+                metric_values[metric][0] - metric_values[metric][1]
+                for metric in metric_order
+            ]
+        )
+        continuous = np.asarray(
+            [
+                (
+                    _spearman(D[active], head_contrasts[position, active])["rho"],
+                    adjusted_beta(head_contrasts[position]),
+                )
+                for position, metric in enumerate(continuous_metric_order)
+            ],
+            dtype=np.float64,
+        )
+        return np.concatenate(
+            (
+                pair_values.reshape(-1),
+                continuous.reshape(-1),
+                head_contrasts.reshape(-1),
+            )
+        )
+
+    interval = paired_channel_percentile_interval(
+        channel_observations["semantic"],
+        channel_observations["structural"],
+        config.bootstrap,
+        transform=transform,
+        resample_source=source_resampling,
+    )
+
+    cursor = 0
+
+    def interval_slice(shape: tuple[int, ...]):
+        nonlocal cursor
+        count = int(np.prod(shape, dtype=np.int64))
+        selection = slice(cursor, cursor + count)
+        cursor += count
+
+        def take(value):
+            if value is None:
+                return None
+            return np.asarray(value)[selection].reshape(shape)
+
+        return dataclasses.replace(
+            interval,
+            estimate=take(interval.estimate),
+            low=take(interval.low),
+            high=take(interval.high),
+            estimable_draws=take(interval.estimable_draws),
+            draws=None,
+        )
+
+    pair_interval = interval_slice(
+        (len(pair_sets), len(metric_order), len(cell_order))
+    )
+    continuous_interval = interval_slice(
+        (len(continuous_metric_order), len(statistic_order))
+    )
+    head_contrast_interval = interval_slice((len(metric_order), len(head_targets)))
+    if cursor != int(np.asarray(interval.estimate).size):
+        raise RuntimeError("focused causal interval layout did not reconstruct")
+
+    candidate_count = int(
+        candidate_record["j_matching"]["matched_pair_count"]
+    )
+    return {
+        "status": (
+            "estimable"
+            if candidate_record["status"] == "estimable"
+            else "continuous_only"
+        ),
+        "categorical_reason": (
+            None
+            if candidate_record["status"] == "estimable"
+            else (
+                f"strongest-candidate analysis has {candidate_count} matched "
+                f"pairs; requires {candidate_record['minimum_pairs_per_seed']}"
+            )
+        ),
+        "selection_uses_causal_outcomes": False,
+        "channel_calibration": (
+            "restoration and injection divided by the within-draw mean "
+            "individual-head matched gross response for that channel"
+        ),
+        "aggregation": (
+            "donor->source->graph; graph paired and channel sources resampled "
+            "independently"
+        ),
+        "pair_set_order": tuple(pair_sets),
+        "pair_sets": {
+            name: {
+                "pair_count": len(pairs),
+                "pairs": pairs,
+                "role": (
+                    "key strongest-D_rel target"
+                    if name == "strongest_candidates"
+                    else "95%-confirmed robustness"
+                ),
+            }
+            for name, pairs in pair_sets.items()
+        },
+        "metric_order": metric_order,
+        "cell_order": cell_order,
+        "interval": pair_interval,
+        "continuous_analysis": {
+            "status": "estimable",
+            "head_population": "all active heads with J >= activity floor",
+            "metric_order": continuous_metric_order,
+            "statistic_order": statistic_order,
+            "interval": continuous_interval,
+            "head_order": tuple(head_targets),
+            "head_contrast_metric_order": metric_order,
+            "head_contrast_interval": head_contrast_interval,
+            "interpretation": (
+                "positive values mean increasing raw D_rel predicts a more "
+                "semantic-minus-structural causal response"
+            ),
+        },
+    }
+
+
 def _spearman(x: Any, y: Any) -> dict[str, float]:
     from scipy.stats import spearmanr
 
@@ -1283,16 +1640,23 @@ def run_causal_validation(
     events = _causal_events(
         prepared, config, scores, targets, plan, cache=cache
     )
+    source_resampling = tuple(
+        _channel_bootstrap_policy(prepared, config, plan, channel).resample_source
+        for channel in CHANNELS
+    )
     summary = _summarize_causal(
         events,
         targets,
         config,
         scores,
         paired_channel_sources=prepared.task.paired_channel_sources,
-        source_resampling=tuple(
-            _channel_bootstrap_policy(prepared, config, plan, channel).resample_source
-            for channel in CHANNELS
-        ),
+        source_resampling=source_resampling,
+    )
+    focused_specialists = _focused_specialist_validation(
+        events,
+        scores,
+        config,
+        source_resampling=source_resampling,
     )
     associations = _association_report(prepared, scores, summary, clean, config)
     causal_interval = summary["intervals"]["interval"]
@@ -1509,6 +1873,7 @@ def run_causal_validation(
         "families": scores["families"],
         "matched_controls": scores.get("matched_controls", {}),
         "family_interactions": family_interactions,
+        "focused_specialists": focused_specialists,
         "regime_evidence": regime_evidence,
     }
     cache.save("causal", "validation", output)

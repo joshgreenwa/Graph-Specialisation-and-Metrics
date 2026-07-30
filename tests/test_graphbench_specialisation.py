@@ -12,6 +12,7 @@ import torch
 
 from graph_specialisation_metrics.methodology import validation as validation_module
 from graph_specialisation_metrics.methodology.bootstrap import (
+    Interval,
     Observation,
     paired_channel_percentile_interval,
 )
@@ -32,6 +33,7 @@ from graph_specialisation_metrics.methodology.graphbench import (
     verify_structural_pe_intervention,
 )
 from graph_specialisation_metrics.methodology.scores import event_head_score_systems
+from graph_specialisation_metrics.methodology.scores import event_head_scores
 from graph_specialisation_metrics.methodology.graphbench_pe_refinement import (
     PERefinementConfig,
     PERefinementSizes,
@@ -64,6 +66,7 @@ from graph_specialisation_metrics.methodology.protocol import (
 )
 from graph_specialisation_metrics.methodology.runner import (
     PreparedTask,
+    _event_rng,
     _stage_plan,
     finalize_cached_run,
     run_carriage,
@@ -142,7 +145,28 @@ def test_graphbench_tasks_are_explicit_protocol_extensions():
         assert task.backend_kind == "graphbench_grit"
         assert task.semantic_source_kind == "edge"
         assert task.paired_channel_sources is False
-        assert task.protocol_extension == "graphbench-edge-semantic-v1"
+        assert task.protocol_extension == "graphbench-complete-pe-coherent-v2"
+        assert task.raw_score_system == "coherent"
+
+
+def test_graphbench_event_manifests_are_paired_across_training_seeds():
+    task = get_task("graphbench_bipartite_matching_hard")
+    config = MethodologyConfig(
+        tasks=(task.name,),
+        train_seeds=(0, 1),
+    )
+    draws = []
+    for seed in (0, 1):
+        prepared = SimpleNamespace(
+            task=task,
+            grit=SimpleNamespace(sc=SimpleNamespace(seed=seed)),
+        )
+        draws.append(
+            _event_rng(prepared, config, "scores", 7, "structural", 3).integers(
+                0, 10_000, size=16
+            )
+        )
+    assert np.array_equal(draws[0], draws[1])
 
 
 def test_matching_edge_semantic_swap_updates_one_reciprocal_unit_only():
@@ -168,6 +192,44 @@ def test_graphbench_structural_swap_is_rrwp_row_column_self_on_fixed_support():
     assert torch.equal(changed.edge_index, graph.edge_index)
     assert torch.equal(changed.edge_value, graph.edge_value)
     assert torch.equal(changed.node_type, graph.node_type)
+
+
+def test_main_graphbench_structural_events_use_complete_pe_without_degree_matching():
+    pairs = ((0, 3), (0, 4), (1, 4), (2, 5))
+    directed = [edge for pair in pairs for edge in (pair, pair[::-1])]
+    graph = Graph(
+        node_type=torch.zeros(6, dtype=torch.long),
+        edge_index=torch.tensor(directed, dtype=torch.long).t().contiguous(),
+        edge_value=torch.arange(1, 9, dtype=torch.float32),
+        target=torch.zeros(8),
+        task_type="edge_binary",
+        num_nodes=6,
+        spd=torch.zeros(6, 6, dtype=torch.long),
+        rwse=torch.zeros(6, 16),
+        rrwp=torch.arange(6 * 6 * 17, dtype=torch.float32).reshape(6, 6, 17),
+    )
+
+    variants, records = build_graphbench_channel_events(
+        graph,
+        graph_id=3,
+        source=0,
+        channel="structural",
+        stage="scores",
+        donors=8,
+        rng=np.random.default_rng(7),
+        semantic_pool=None,
+        rrwp_steps=16,
+    )
+
+    assert {record.donor_node for record in records} == {1, 2}
+    assert all(record.degree_gap == 1 for record in records)
+    assert all(record.realised_donor_count == 2 for record in records)
+    assert all(record.eligible_pool_size == 2 for record in records)
+    for event in variants:
+        assert event.degree_override[0].item() == 1.0
+        assert torch.equal(event.rrwp[..., 16], graph.rrwp[..., 16])
+        assert torch.equal(event.edge_index, graph.edge_index)
+        assert torch.equal(event.edge_value, graph.edge_value)
 
 
 @pytest.mark.parametrize(
@@ -255,6 +317,9 @@ def test_mass_coherent_and_cancellation_score_identities():
     assert systems["coherent"][0, 0].tolist() == pytest.approx([0.0, 2.0])
     assert systems["carrier_coherence"][0, 0].tolist() == pytest.approx(
         [0.0, 1.0]
+    )
+    assert event_head_scores(q, system="coherent")[0, 0].tolist() == pytest.approx(
+        [0.0, 2.0]
     )
 
 
@@ -408,6 +473,195 @@ def test_causal_summary_uses_graph_paired_independent_channel_sources(monkeypatc
     assert result["intervals"]["interval"] == "independent-interval"
     assert result["intervals"]["pairing"] == (
         "graph-paired/channel-source-independent"
+    )
+
+
+def test_focused_specialists_use_strong_j_matched_heads_and_channel_calibration(
+    monkeypatch,
+):
+    def row(*, restoration, injection, necessity, gross_necessity):
+        return {
+            "graph": 4,
+            "source": 2,
+            "donor": 1,
+            "P_gross_matched": 2.0,
+            "gross_necessity": gross_necessity,
+            "R_align_adjusted": restoration,
+            "I_align_adjusted": injection,
+            "necessity": necessity,
+            "event_effect": 0.4,
+        }
+
+    records = {
+        "head_L0_H0": {
+            "semantic": [
+                row(
+                    restoration=1.0,
+                    injection=0.5,
+                    necessity=0.2,
+                    gross_necessity=0.4,
+                )
+            ],
+            "structural": [
+                row(
+                    restoration=0.1,
+                    injection=0.05,
+                    necessity=0.02,
+                    gross_necessity=0.04,
+                )
+            ],
+        },
+        "head_L0_H1": {
+            "semantic": [
+                row(
+                    restoration=0.2,
+                    injection=0.1,
+                    necessity=0.04,
+                    gross_necessity=0.08,
+                )
+            ],
+            "structural": [
+                row(
+                    restoration=0.8,
+                    injection=0.4,
+                    necessity=0.16,
+                    gross_necessity=0.32,
+                )
+            ],
+        },
+    }
+    pair = {
+        "semantic": (0, 0),
+        "structural": (0, 1),
+    }
+
+    def fake_interval(left, right, policy, *, transform, resample_source):
+        assert resample_source == (True, False)
+        value = np.stack((left[0].value, right[0].value))
+        estimate = transform(value)
+        return Interval(
+            estimate=estimate,
+            low=estimate - 0.01,
+            high=estimate + 0.01,
+            replicates=2000,
+            rng_seed=31_415,
+            resampled_levels=("graph",),
+            estimable_draws=np.full(estimate.shape, 2000),
+        )
+
+    monkeypatch.setattr(
+        validation_module,
+        "paired_channel_percentile_interval",
+        fake_interval,
+    )
+    result = validation_module._focused_specialist_validation(
+        {"records": records},
+        {
+            "specialist_classification": {
+                "candidate_analysis": {
+                    "status": "estimable",
+                    "minimum_pairs_per_seed": 1,
+                    "j_matching": {
+                        "pairs": (pair,),
+                        "matched_pair_count": 1,
+                    },
+                },
+                "confirmed_95_robustness": {
+                    "status": "not_estimable",
+                    "j_matching": {
+                        "pairs": (),
+                        "matched_pair_count": 0,
+                    },
+                },
+            },
+            "coordinates": SimpleNamespace(
+                selectivity=np.asarray([[-0.5, 0.5]]),
+                joint_sensitivity=np.ones((1, 2)),
+                active=np.ones((1, 2), dtype=bool),
+            ),
+        },
+        SimpleNamespace(
+            numerical=SimpleNamespace(effect_floor=1.0e-12),
+            bootstrap=BootstrapPolicy(),
+        ),
+        source_resampling=(True, False),
+    )
+
+    assert result["status"] == "estimable"
+    assert result["pair_sets"]["strongest_candidates"]["pair_count"] == 1
+    restoration = result["interval"].estimate[0, 0]
+    assert restoration[:4] == pytest.approx((0.5, 0.05, 0.1, 0.4))
+    assert restoration[4] == pytest.approx(0.75)
+    necessity = result["interval"].estimate[0, 2]
+    assert necessity[:4] == pytest.approx((0.5, 0.05, 0.1, 0.4))
+    assert necessity[4] == pytest.approx(0.75)
+    continuous = result["continuous_analysis"]
+    assert continuous["status"] == "estimable"
+    assert continuous["head_contrast_interval"].estimate[0] == pytest.approx(
+        (0.45, -0.30)
+    )
+
+    fallback = validation_module._focused_specialist_validation(
+        {"records": records},
+        {
+            "specialist_classification": {
+                "candidate_analysis": {
+                    "status": "not_estimable",
+                    "minimum_pairs_per_seed": 3,
+                    "j_matching": {
+                        "pairs": (pair,),
+                        "matched_pair_count": 1,
+                    },
+                },
+                "confirmed_95_robustness": {
+                    "status": "not_estimable",
+                    "j_matching": {
+                        "pairs": (),
+                        "matched_pair_count": 0,
+                    },
+                },
+            },
+            "coordinates": SimpleNamespace(
+                selectivity=np.asarray([[-0.5, 0.5]]),
+                joint_sensitivity=np.ones((1, 2)),
+                active=np.ones((1, 2), dtype=bool),
+            ),
+        },
+        SimpleNamespace(
+            numerical=SimpleNamespace(effect_floor=1.0e-12),
+            bootstrap=BootstrapPolicy(),
+        ),
+        source_resampling=(True, False),
+    )
+    assert fallback["status"] == "continuous_only"
+    assert fallback["pair_set_order"] == ()
+    assert fallback["continuous_analysis"]["status"] == "estimable"
+
+
+def test_bipartite_focused_validation_runs_individual_head_targets_only():
+    prepared = SimpleNamespace(
+        task=SimpleNamespace(name="graphbench_bipartite_matching_hard"),
+        grit=SimpleNamespace(L=2, H=2),
+    )
+    targets = validation_module._targets(
+        prepared,
+        {
+            "specialist_classification": {"frozen": True},
+            "families": {
+                "semantic_leaning": ((0, 0),),
+                "structural_leaning": ((1, 1),),
+            },
+            "matched_controls": {
+                "semantic_leaning_random": ((0, 1),),
+            },
+        },
+    )
+
+    assert tuple(targets) == (
+        "head_L0_H0",
+        "head_L0_H1",
+        "head_L1_H0",
+        "head_L1_H1",
     )
 
 
@@ -1551,7 +1805,9 @@ def test_graphbench_score_and_carriage_components_resume_from_graph_shards(tmp_p
     assert len(score_shards) == 3
     assert len(carriage_shards) == 3
     assert scores["interval_pairing"] == "graph-paired/channel-source-independent"
-    assert carriage["channels"]["structural"]["resample_source"] is False
+    # This three-node toy has only two same-side-estimable structural sources;
+    # unlike the production n=16 graphs, its structural source set is sampled.
+    assert carriage["channels"]["structural"]["resample_source"] is True
 
     resumed_scores = run_scores(prepared, config, plan=score_plan)
     resumed_carriage = run_carriage(prepared, config, plan=carriage_plan)
@@ -1644,6 +1900,7 @@ def test_model_free_finalizer_owns_shared_four_seed_summaries(
     assert len(rendered) == 7
     assert (tasks[0], 0) not in rendered
     assert results[f"{tasks[0]}:seed0"]["figures"]["complete"]
+    assert results[f"{tasks[0]}:seed0"]["carriage"] is None
     assert len(json.loads((tmp_path / "index.json").read_text())["runs"]) == 8
     for task in tasks:
         population = json.loads(

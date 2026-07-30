@@ -1,5 +1,5 @@
-protocol: donor-swap-specialisation-carriage-v3
-extension: graphbench-edge-semantic-v1
+protocol: donor-swap-specialisation-carriage-v4
+extension: graphbench-complete-pe-coherent-v2
 tasks:
   - graphbench_bipartite_matching_hard
   - graphbench_flow_hard
@@ -24,9 +24,39 @@ sources:
     donor_matching: minimum_endpoint_degree_signature_l1_gap
   structural:
     unit: node
-    intervention: fixed_topology_rrwp_row_column_self_copy
-  uncertainty: graph_paired_channel_source_independent
+    intervention: fixed_topology_complete_pe_donor_copy
+    fields: [model_visible_rrwp_row_column_self, degree, derived_log_degree]
+    degree_matching: false
+    donor_sampling: balanced_near_middle_far_without_replacement
+scores:
+  primary: coherent_output_movement
+  secondary_diagnostic: transport_mass
+specialists:
+  activity_floor: 0.20
+  preference_threshold: 0.10
+  continuous_analysis: all_active_heads_raw_D_rel
+  candidate_rule: point_estimate_beyond_threshold
+  candidate_limit_per_direction: 6
+  minimum_matched_pairs_per_seed: 3
+  generalists: excluded_from_categorical_test
+  matching: minimum_total_absolute_J_within_seed_without_replacement
+  layer: balance_audit_not_hard_gate
+  strength_ranking: descending_absolute_D_rel_within_direction
+  confirmed_95_rule: entire_directional_interval_beyond_threshold
+  confirmed_population_rule: at_least_8_pairs_across_at_least_3_seeds
+causal_deliverables:
+  - specialist_map
+  - continuous_D_rel_vs_causal_channel_contrasts
+  - strongest_D_rel_J_matched_double_dissociation
+  - mismatch_adjusted_restoration_and_injection_double_dissociation
+  - donor_wise_necessity_fraction
+  - J_vs_clean_head_ablation_prediction_movement
+uncertainty: graph_paired_channel_source_independent
 execution:
+  gpu_phases: [scores, causal]
+  cpu_finalizer_requires: [scores, causal]
+  carriage: optional
+  gpu_time_limit: "06:00:00"
   graphs_per_batch: 32
   replica_pair_budget: 2000000
   jacobian_output_chunk: 64

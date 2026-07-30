@@ -48,6 +48,7 @@ def build_channel_events(
             donors=int(donors),
             rng=rng,
             semantic_pool=semantic_pool,
+            rrwp_steps=int(getattr(task.spec, "rrwp_steps", 16)),
         )
     source = int(source)
     degrees = node_degrees(base)

@@ -6,6 +6,8 @@ import torch
 
 import graph_specialisation_metrics.zinc_reach_analysis as reach
 from graph_specialisation_metrics.zinc_reach_analysis import (
+    QM9_PROFILE,
+    QM9_TASKS,
     TASKS,
     ZincReachConfig,
     discover_seed_checkpoint,
@@ -51,7 +53,11 @@ def test_semantic_interpolation_scales_linear_functional_mass(monkeypatch):
         ),
         backend=Backend(),
     )
-    monkeypatch.setattr(reach, "_atom_embedding", lambda _net: embedding)
+    monkeypatch.setattr(
+        reach,
+        "_atom_embedding",
+        lambda _net, *, vocab_size: embedding,
+    )
     base = Data(raw_atoms[:, None])
     variant = Data(torch.tensor([[1], [6], [7]]))
     event = SimpleNamespace(source=1)
@@ -107,11 +113,11 @@ def test_discover_seed_checkpoint_selects_highest_standard_epoch(tmp_path: Path)
     assert discover_seed_checkpoint(tmp_path / "results", seed=0) == expected
 
 
-def _raw_rows():
+def _raw_rows(tasks=TASKS):
     donor = []
     bamberger = []
     interpolation = []
-    for task_index, task in enumerate(TASKS):
+    for task_index, task in enumerate(tasks):
         for graph in (0, 1):
             for channel in ("semantic", "structural"):
                 for distance in (0, 1, 2):
@@ -276,3 +282,41 @@ def test_figure_only_builds_png_and_pdf(tmp_path: Path):
     for formats in result["figures"].values():
         assert Path(formats["png"]).is_file()
         assert Path(formats["pdf"]).is_file()
+
+
+def test_qm9_profile_builds_dataset_specific_figures(tmp_path: Path):
+    donor, bamberger, interpolation = _raw_rows(QM9_TASKS)
+    results = tmp_path / "results"
+    results.mkdir()
+
+    import csv
+
+    for path, rows in (
+        (results / "donor_carrier_mass.csv", donor),
+        (results / "bamberger_input_output_influence.csv", bamberger),
+        (results / "semantic_interpolation_mass.csv", interpolation),
+    ):
+        with path.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
+            writer.writeheader()
+            writer.writerows(rows)
+
+    result = figures(
+        ZincReachConfig(
+            profile=QM9_PROFILE,
+            tasks=QM9_TASKS,
+            bootstrap_replicates=40,
+        ),
+        output_dir=tmp_path,
+    )
+    assert set(result["figures"]) == {
+        "interpolation_sweep",
+        "semantic_functional",
+        "semantic_bamberger",
+        "structural_functional",
+        "expected_distance",
+    }
+    assert all(
+        Path(formats["png"]).name.startswith("qm9_")
+        for formats in result["figures"].values()
+    )

@@ -75,6 +75,8 @@ from .figures import (
     score_distance_profiles,
     score_plane,
     selectivity_regime_diagnostics,
+    specialist_causal_panels,
+    strong_specialist_map,
 )
 from .protocol import (
     CHANNELS,
@@ -91,6 +93,7 @@ from .scores import (
     event_head_scores,
     freeze_families,
     freeze_matched_controls,
+    freeze_threshold_specialists,
     head_coordinates,
     project_transport,
     specialisation_diagnostics,
@@ -231,6 +234,21 @@ def _model_audits(
 def _rng(config: MethodologyConfig, *parts: Any) -> np.random.Generator:
     digest = stable_hash({"seed": int(config.analysis_seed), "parts": parts}, length=16)
     return np.random.default_rng(int(digest, 16))
+
+
+def _event_rng(
+    prepared: PreparedTask,
+    config: MethodologyConfig,
+    *parts: Any,
+) -> np.random.Generator:
+    """Return a replay RNG, pairing GraphBench event manifests across model seeds."""
+
+    model_seed = (
+        ()
+        if getattr(prepared.task, "backend_kind", None) == "graphbench_grit"
+        else (int(prepared.grit.sc.seed),)
+    )
+    return _rng(config, prepared.task.name, *model_seed, *parts)
 
 
 def _channel_bootstrap_policy(
@@ -441,6 +459,9 @@ def _prepare_graphbench_task(
         "output_representation": task.output.representation,
         "sigma": sigma.tolist(),
         "task_adapter_version": task.adapter_version,
+        "raw_score_system": task.raw_score_system,
+        "structural_intervention": "complete_pe_copy",
+        "structural_degree_matching": False,
         "semantic_source_kind": task.semantic_source_kind,
         "paired_channel_sources": task.paired_channel_sources,
         "carrier_policy": task.carrier_policy,
@@ -744,10 +765,9 @@ def _stage_plan(
         entry: dict[str, Any] = {}
         shared_sources: np.ndarray | None = None
         if prepared.task.paired_channel_sources:
-            source_rng = _rng(
+            source_rng = _event_rng(
+                prepared,
                 config,
-                prepared.task.name,
-                prepared.grit.sc.seed,
                 stage,
                 graph_id,
                 "sources",
@@ -804,10 +824,9 @@ def _stage_plan(
                         sources = np.sort(eligible)
                     else:
                         sources = np.sort(
-                            _rng(
+                            _event_rng(
+                                prepared,
                                 config,
-                                prepared.task.name,
-                                prepared.grit.sc.seed,
                                 stage,
                                 graph_id,
                                 channel,
@@ -824,10 +843,9 @@ def _stage_plan(
                     channel=channel,
                     stage=stage,
                     donors=int(config.sizes.donors_per_source),
-                    rng=_rng(
+                    rng=_event_rng(
+                        prepared,
                         config,
-                        prepared.task.name,
-                        prepared.grit.sc.seed,
                         stage,
                         graph_id,
                         channel,
@@ -922,11 +940,30 @@ def _cache(
             bootstrap_seed=int(config.bootstrap.rng_seed),
             repository_commit=_repository_commit(),
             bootstrap_replicates=int(config.bootstrap.replicates),
+            raw_score_aggregation=(
+                f"{getattr(prepared.task, 'raw_score_system', 'mass')}"
+                "->donor->source->graph"
+            ),
             semantic_donor_law=(
                 "graph-uniform/edge-uniform/min-endpoint-degree-signature-gap/"
                 "iid-replacement"
                 if prepared.task.semantic_source_kind == "edge"
                 else "graph-uniform/node-uniform/min-gap/iid-replacement"
+            ),
+            structural_donor_law=(
+                "same-side/node-type/nonidentical-rrwp/"
+                "near-middle-far/no-degree-match/without-replacement/"
+                "complete-pe-copy"
+                if (
+                    prepared.task.backend_kind == "graphbench_grit"
+                    and prepared.task.spec.task_type == "edge_binary"
+                )
+                else (
+                    "nonidentical-rrwp/near-middle-far/no-degree-match/"
+                    "without-replacement/complete-pe-copy"
+                    if prepared.task.backend_kind == "graphbench_grit"
+                    else "node-uniform/min-gap/iid-replacement"
+                )
             ),
         ),
         stale_policy="archive",
@@ -952,10 +989,9 @@ def _rebuild_graph_events(
             channel=channel,
             stage=stage,
             donors=int(config.sizes.donors_per_source),
-            rng=_rng(
+            rng=_event_rng(
+                prepared,
                 config,
-                prepared.task.name,
-                prepared.grit.sc.seed,
                 stage,
                 graph_id,
                 channel,
@@ -1241,7 +1277,8 @@ def _score_graph_batch(
         transport = torch.stack(event_capture.transport, dim=1)
         delta = transport[0:1] - transport[1:]
         q = project_transport(delta, clean.transport)
-        scores = event_head_scores(q).detach().cpu().numpy()
+        score_system = getattr(prepared.task, "raw_score_system", "mass")
+        scores = event_head_scores(q, system=score_system).detach().cpu().numpy()
         source_ids = [record.source for record in records]
         gids = [graph_id] * len(records)
         _, one_graph, _ = aggregate_event_scores(scores, gids, source_ids)
@@ -1260,6 +1297,7 @@ def _score_graph_batch(
                 {
                     **record.record(),
                     "score": scores[position],
+                    "score_system": score_system,
                     "distance_contribution": contribution[0],
                     "distance_support": support[0],
                 }
@@ -1421,6 +1459,7 @@ def estimate_graph_local_head_coordinates(
     return {
         "protocol_version": PROTOCOL_VERSION,
         "estimator": "canonical-graph-local-head-coordinates-v1",
+        "score_system": getattr(prepared.task, "raw_score_system", "mass"),
         "manifest_hash": _manifest_hash(plan),
         "graph_id_seed_space": "caller-supplied graph ID",
         "sources_per_graph": int(config.sizes.sources_per_graph),
@@ -1455,6 +1494,11 @@ def run_scores(
     axis = _distance_axis(prepared, graph_ids)
     output: dict[str, Any] = {
         "protocol_version": PROTOCOL_VERSION,
+        "score_system": getattr(prepared.task, "raw_score_system", "mass"),
+        # Carrier-distance contributions remain an additive transport-mass
+        # diagnostic. Coherent movement cannot be decomposed additively across
+        # carriers without changing its estimand.
+        "distance_score_system": "mass",
         "axis": axis.labels,
         "manifest_hash": _manifest_hash(plan),
         "channels": {},
@@ -1560,7 +1604,11 @@ def run_scores(
             graph_contribution,
             graph_support,
             reconstruction_tolerance=config.numerical.reconstruction_tolerance,
-            graph_scores=graph_scores,
+            graph_scores=(
+                graph_scores
+                if getattr(prepared.task, "raw_score_system", "mass") == "mass"
+                else None
+            ),
         )
         output["channels"][channel] = {
             "raw": raw,
@@ -1805,6 +1853,17 @@ def run_scores(
         output["interval_pairing"] = "graph-paired/channel-source-independent"
     coordinate_interval = output.get("intervals")
     if coordinate_interval is not None and coordinate_interval.draws is not None:
+        output["specialist_classification"] = freeze_threshold_specialists(
+            coordinates,
+            selectivity_interval=(
+                coordinate_interval.low[5],
+                coordinate_interval.high[5],
+            ),
+            preference_threshold=config.families.equivalence_half_width,
+            activity_threshold=config.families.activity_floor,
+            candidate_limit=config.families.specialist_candidate_limit,
+            minimum_candidate_pairs=config.families.specialist_minimum_pairs,
+        )
         output["specialisation_diagnostics"] = specialisation_diagnostics(
             coordinates,
             output["families"],
@@ -1866,6 +1925,7 @@ def _carriage_graph_batch(
                 "graph_id": graph_id,
                 "base": base,
                 "sources": sources,
+                "records": records,
                 "clean": clean_by_graph[graph_id],
             }
         )
@@ -1881,19 +1941,56 @@ def _carriage_graph_batch(
         graph_id = context["graph_id"]
         base = context["base"]
         sources = context["sources"]
+        records = context["records"]
         clean = context["clean"]
-        K = int(config.sizes.donors_per_source)
         S = len(sources)
         h_clean = captured.final_state[0]
         carriers, width = int(h_clean.shape[-2]), int(h_clean.shape[-1])
-        h_event = captured.final_state[1:].reshape(S, K, carriers, width)
-        delta = h_clean[None, None, :, :] - h_event
+        donor_counts = tuple(
+            sum(int(record.source) == int(source) for record in records)
+            for source in sources
+        )
+        if any(count < 1 for count in donor_counts):
+            raise RuntimeError(
+                f"carriage graph {graph_id} has a source without donor events"
+            )
+        if sum(donor_counts) != int(captured.final_state.shape[0]) - 1:
+            raise RuntimeError(
+                f"carriage graph {graph_id} event count does not align with its manifest"
+            )
+        flat_h_event = captured.final_state[1:]
+        h_event_by_source = tuple(
+            value.unsqueeze(0)
+            for value in torch.split(flat_h_event, donor_counts, dim=0)
+        )
         functional_events = getattr(
             prepared.backend, "functional_carriage_events", functional_carriage_events
         )
-        event_f = functional_events(delta, clean.final_state)
-        F = event_f.mean(dim=1).t().detach().cpu().numpy()
-        integrated = None
+        event_f_by_source = tuple(
+            functional_events(
+                h_clean[None, None, :, :] - source_events,
+                clean.final_state,
+            )[0]
+            for source_events in h_event_by_source
+        )
+        F = (
+            torch.stack([value.mean(dim=0) for value in event_f_by_source])
+            .t()
+            .detach()
+            .cpu()
+            .numpy()
+        )
+        max_donors = max(donor_counts)
+
+        def pad_event_values(values, *, fill=float("nan")):
+            shape = (S, max_donors) + tuple(values[0].shape[1:])
+            padded = values[0].new_full(shape, fill)
+            for source_position, value in enumerate(values):
+                padded[source_position, : value.shape[0]] = value
+            return padded
+
+        event_f = pad_event_values(event_f_by_source)
+        integrated_by_source = None
         endpoint_replay_error = 0.0
         B = None
         if config.compute_beneficial_carriage:
@@ -1903,46 +2000,50 @@ def _carriage_graph_batch(
             )
             if callable(state_loss_factory):
                 replay_loss = state_loss_factory(base, target)
-                integrated = beneficial_carriage(
-                    h_clean,
-                    h_event,
-                    loss_from_states=replay_loss,
-                    atol=config.numerical.integrated_atol,
-                    rtol=config.numerical.integrated_rtol,
-                    max_intervals=config.numerical.integrated_max_intervals,
-                    tolerance=max(
-                        config.numerical.integrated_atol * 5,
-                        config.numerical.reconstruction_tolerance,
-                    ),
+                integrated_by_source = tuple(
+                    beneficial_carriage(
+                        h_clean,
+                        source_events,
+                        loss_from_states=replay_loss,
+                        atol=config.numerical.integrated_atol,
+                        rtol=config.numerical.integrated_rtol,
+                        max_intervals=config.numerical.integrated_max_intervals,
+                        tolerance=max(
+                            config.numerical.integrated_atol * 5,
+                            config.numerical.reconstruction_tolerance,
+                        ),
+                    )
+                    for source_events in h_event_by_source
                 )
                 replay_clean_states = h_clean.unsqueeze(0)
-                replay_event_states = h_event.reshape(
-                    S * K, carriers, width
-                )
+                replay_event_states = flat_h_event
                 with torch.no_grad():
                     replay_clean_loss = replay_loss(replay_clean_states)
                     replay_event_loss = replay_loss(replay_event_states)
             else:
                 carrier_weights = prepared.backend.carriage_weights(base, h_clean)
                 replay_loss = prepared.backend.loss_from_pooled(target)
-                integrated = beneficial_carriage(
-                    h_clean,
-                    h_event,
-                    replay_loss,
-                    carrier_weights=carrier_weights,
-                    atol=config.numerical.integrated_atol,
-                    rtol=config.numerical.integrated_rtol,
-                    max_intervals=config.numerical.integrated_max_intervals,
-                    tolerance=max(
-                        config.numerical.integrated_atol * 5,
-                        config.numerical.reconstruction_tolerance,
-                    ),
+                integrated_by_source = tuple(
+                    beneficial_carriage(
+                        h_clean,
+                        source_events,
+                        replay_loss,
+                        carrier_weights=carrier_weights,
+                        atol=config.numerical.integrated_atol,
+                        rtol=config.numerical.integrated_rtol,
+                        max_intervals=config.numerical.integrated_max_intervals,
+                        tolerance=max(
+                            config.numerical.integrated_atol * 5,
+                            config.numerical.reconstruction_tolerance,
+                        ),
+                    )
+                    for source_events in h_event_by_source
                 )
                 pooled_clean = project_final_states(
                     h_clean.unsqueeze(0), carrier_weights
                 )
                 pooled_event = project_final_states(
-                    h_event.reshape(S * K, carriers, width), carrier_weights
+                    flat_h_event, carrier_weights
                 )
                 with torch.no_grad():
                     replay_clean_loss = replay_loss(pooled_clean)
@@ -1969,13 +2070,22 @@ def _carriage_graph_batch(
                 "pooling-to-readout replay error",
                 context={"graph": graph_id, "channel": channel},
             )
-            B = integrated.field.detach().cpu().numpy()
+            B = (
+                torch.cat(
+                    [value.field for value in integrated_by_source],
+                    dim=1,
+                )
+                .detach()
+                .cpu()
+                .numpy()
+            )
         pristine = shortest_path_distances(base.edge_index, int(base.num_nodes))
         distance = prepared.backend.carriage_distance_matrix(
             base, sources, pristine, channel=channel
         )
         graph_field = {
             "sources": tuple(sources),
+            "donor_counts": donor_counts,
             "F_sens": F,
             "distance": distance,
             "carrier_kinds": tuple(
@@ -1987,28 +2097,52 @@ def _carriage_graph_batch(
             "event_F_sens": event_f.detach().cpu().numpy(),
             "endpoint_replay_error": endpoint_replay_error,
         }
-        if integrated is not None:
+        if integrated_by_source is not None:
+            event_b_tensor = pad_event_values(
+                tuple(value.event_field[0] for value in integrated_by_source)
+            )
+            event_loss_tensor = pad_event_values(
+                tuple(
+                    value.event_loss_increase[0, :, None]
+                    for value in integrated_by_source
+                )
+            ).squeeze(-1)
+            quadrature_tensor = pad_event_values(
+                tuple(
+                    value.quadrature_error[0, :, None]
+                    for value in integrated_by_source
+                )
+            ).squeeze(-1)
+            residual_tensor = pad_event_values(
+                tuple(
+                    value.completeness_residual[0, :, None]
+                    for value in integrated_by_source
+                )
+            ).squeeze(-1)
+            converged_tensor = pad_event_values(
+                tuple(
+                    value.converged[0, :, None]
+                    for value in integrated_by_source
+                ),
+                fill=False,
+            ).squeeze(-1)
             graph_field.update(
                 {
                     "B": B,
-                    "event_B": integrated.event_field.detach().cpu().numpy(),
-                    "event_loss_increase": (
-                        integrated.event_loss_increase.detach().cpu().numpy()
-                    ),
-                    "quadrature_error": integrated.quadrature_error.detach().cpu().numpy(),
-                    "completeness_residual": (
-                        integrated.completeness_residual.detach().cpu().numpy()
-                    ),
-                    "converged": integrated.converged.detach().cpu().numpy(),
+                    "event_B": event_b_tensor.detach().cpu().numpy(),
+                    "event_loss_increase": event_loss_tensor.detach().cpu().numpy(),
+                    "quadrature_error": quadrature_tensor.detach().cpu().numpy(),
+                    "completeness_residual": residual_tensor.detach().cpu().numpy(),
+                    "converged": converged_tensor.detach().cpu().numpy(),
                 }
             )
-            event_b = integrated.event_field.detach().cpu().numpy()
+            event_b = event_b_tensor.detach().cpu().numpy()
         else:
             event_b = None
         event_f_np = event_f.detach().cpu().numpy()
         pair_rows: list[dict[str, Any]] = []
         for source_position, source in enumerate(sources):
-            for donor in range(K):
+            for donor in range(donor_counts[source_position]):
                 for carrier in range(carriers):
                     pair_rows.append(
                         {
@@ -2037,12 +2171,16 @@ def _carriage_graph_batch(
                 "graph_field": graph_field,
                 "pair_rows": pair_rows,
                 "paths": (
-                    int(integrated.converged.numel()) if integrated is not None else 0
+                    sum(
+                        int(value.converged.numel())
+                        for value in (integrated_by_source or ())
+                    )
                 ),
                 "capped": (
-                    int((~integrated.converged).sum().item())
-                    if integrated is not None
-                    else 0
+                    sum(
+                        int((~value.converged).sum().item())
+                        for value in (integrated_by_source or ())
+                    )
                 ),
             }
         )
@@ -2209,8 +2347,15 @@ def run_carriage(
             )
             event_b = np.asarray(field["event_B"])
             distance = np.asarray(field["distance"])
+            donor_counts = tuple(
+                int(value)
+                for value in field.get(
+                    "donor_counts",
+                    (event_b.shape[1],) * len(field["sources"]),
+                )
+            )
             for source_position, source in enumerate(field["sources"]):
-                for donor in range(event_b.shape[1]):
+                for donor in range(donor_counts[source_position]):
                     source_values = event_b[source_position, donor]
                     bin_values = [
                         np.sum(
@@ -2716,6 +2861,24 @@ def make_figures(
         metadata={"task": prepared.task.name, "seed": int(prepared.grit.sc.seed)},
     )
     saved["coordinate_plane"] = [str(path) for path in paths]
+    if scores.get("specialist_classification"):
+        fig, axes = strong_specialist_map(
+            plot_data,
+            scores["specialist_classification"],
+            title=prepared.task.title,
+            theme=theme,
+        )
+        paths = builder.save(
+            "strongest_D_rel_candidate_map",
+            fig,
+            axes,
+            metadata={
+                "task": prepared.task.name,
+                "seed": int(prepared.grit.sc.seed),
+                "classification": scores["specialist_classification"],
+            },
+        )
+        saved["strongest_candidate_map"] = [str(path) for path in paths]
     if scores.get("specialisation_diagnostics"):
         fig, axes = selectivity_regime_diagnostics(
             plot_data,
@@ -3004,6 +3167,157 @@ def make_figures(
         )
         saved["attention_distance"] = [str(path) for path in paths]
     if causal is not None:
+        focused = causal.get("focused_specialists", {})
+        if focused.get("status") in {"estimable", "continuous_only"}:
+            continuous = focused.get("continuous_analysis", {})
+            if continuous.get("status") == "estimable":
+                continuous_metrics = list(continuous["metric_order"])
+                statistics = list(continuous["statistic_order"])
+                continuous_interval = continuous["interval"]
+                contrast_interval = continuous["head_contrast_interval"]
+                contrast_metrics = list(
+                    continuous["head_contrast_metric_order"]
+                )
+                coordinates = scores["coordinates"]
+                score_interval = scores["intervals"]
+                D = coordinates.selectivity.reshape(-1)
+                active = coordinates.active.reshape(-1)
+                layers = np.repeat(
+                    np.arange(coordinates.joint_sensitivity.shape[0]),
+                    coordinates.joint_sensitivity.shape[1],
+                )
+                titles = {
+                    "restoration": "Restoration contrast",
+                    "injection": "Injection contrast",
+                    "necessity_fraction": "Necessity-fraction contrast",
+                }
+                panels = []
+                for metric_position, metric in enumerate(continuous_metrics):
+                    contrast_position = contrast_metrics.index(metric)
+                    rho_position = statistics.index("spearman_rho")
+                    beta_position = statistics.index(
+                        "J_and_layer_adjusted_standardized_beta"
+                    )
+                    beta = float(
+                        continuous_interval.estimate[
+                            metric_position, beta_position
+                        ]
+                    )
+                    beta_low = float(
+                        continuous_interval.low[
+                            metric_position, beta_position
+                        ]
+                    )
+                    beta_high = float(
+                        continuous_interval.high[
+                            metric_position, beta_position
+                        ]
+                    )
+                    panels.append(
+                        {
+                            "x": D,
+                            "y": contrast_interval.estimate[
+                                contrast_position
+                            ],
+                            "x_interval": (
+                                score_interval.low[5].reshape(-1),
+                                score_interval.high[5].reshape(-1),
+                            ),
+                            "y_interval": (
+                                contrast_interval.low[contrast_position],
+                                contrast_interval.high[contrast_position],
+                            ),
+                            "active": active,
+                            "layer": layers,
+                            "xlabel": r"Raw selectivity $D_{rel}$",
+                            "ylabel": (
+                                "Semantic minus structural causal response"
+                            ),
+                            "title": (
+                                f"{titles[metric]}\n"
+                                f"adjusted β={beta:.2f} "
+                                f"[{beta_low:.2f}, {beta_high:.2f}]"
+                            ),
+                            "statistic": {
+                                "rho": float(
+                                    continuous_interval.estimate[
+                                        metric_position, rho_position
+                                    ]
+                                ),
+                                "low": float(
+                                    continuous_interval.low[
+                                        metric_position, rho_position
+                                    ]
+                                ),
+                                "high": float(
+                                    continuous_interval.high[
+                                        metric_position, rho_position
+                                    ]
+                                ),
+                                "n": int(np.sum(active)),
+                            },
+                            "zero_x": True,
+                            "zero_y": True,
+                        }
+                    )
+                fig, axes = causal_scatter_grid(panels, theme=theme)
+                paths = builder.save(
+                    "continuous_D_rel_causal_contrasts",
+                    fig,
+                    axes,
+                    metadata={
+                        "task": prepared.task.name,
+                        "seed": int(prepared.grit.sc.seed),
+                        "continuous_analysis": continuous,
+                    },
+                )
+                saved["continuous_D_rel_causal"] = [
+                    str(path) for path in paths
+                ]
+            for pair_set in focused["pair_set_order"]:
+                fig, axes = specialist_causal_panels(
+                    focused,
+                    pair_set=pair_set,
+                    metrics=("restoration", "injection"),
+                    theme=theme,
+                )
+                paths = builder.save(
+                    f"{pair_set}_specialist_restoration_injection",
+                    fig,
+                    axes,
+                    metadata={
+                        "task": prepared.task.name,
+                        "seed": int(prepared.grit.sc.seed),
+                        "pair_set": pair_set,
+                        "focused_specialists": focused,
+                    },
+                )
+                saved[f"{pair_set}_specialist_patching"] = [
+                    str(path) for path in paths
+                ]
+                fig, axes = specialist_causal_panels(
+                    focused,
+                    pair_set=pair_set,
+                    metrics=(
+                        "necessity_fraction",
+                        "gross_necessity_fraction",
+                    ),
+                    theme=theme,
+                )
+                paths = builder.save(
+                    f"{pair_set}_specialist_donor_necessity",
+                    fig,
+                    axes,
+                    metadata={
+                        "task": prepared.task.name,
+                        "seed": int(prepared.grit.sc.seed),
+                        "pair_set": pair_set,
+                        "focused_specialists": focused,
+                    },
+                )
+                saved[f"{pair_set}_specialist_necessity"] = [
+                    str(path) for path in paths
+                ]
         if causal.get("regime_evidence"):
             fig, axes = causal_regime_summary(
                 causal["regime_evidence"],
@@ -3215,6 +3529,19 @@ def make_figures(
                 "zero_y": True,
             },
         ]
+        fig, axes = causal_scatter_grid([panels[0]], theme=theme)
+        paths = builder.save(
+            "joint_sensitivity_vs_clean_head_ablation",
+            fig,
+            axes,
+            metadata={
+                "task": prepared.task.name,
+                "seed": int(prepared.grit.sc.seed),
+                "association": clean_statistic,
+                "endpoint": "individual-head clean-ablation prediction movement",
+            },
+        )
+        saved["clean_ablation_vs_J"] = [str(path) for path in paths]
         fig, axes = causal_scatter_grid(panels, theme=theme)
         paths = builder.save(
             "causal_validation_coordinates",
@@ -3621,6 +3948,36 @@ def _write_run_summaries(
                         ),
                     }
                 )
+            specialists = scores.get("specialist_classification")
+            if specialists:
+                row.update(
+                    {
+                        "semantic_candidate_pool_count": len(
+                            specialists["heads"]["semantic_candidate_pool"]
+                        ),
+                        "structural_candidate_pool_count": len(
+                            specialists["heads"]["structural_candidate_pool"]
+                        ),
+                        "semantic_selected_count": len(
+                            specialists["heads"]["semantic_selected"]
+                        ),
+                        "structural_selected_count": len(
+                            specialists["heads"]["structural_selected"]
+                        ),
+                        "semantic_confirmed_95_count": len(
+                            specialists["heads"]["semantic_confirmed_95"]
+                        ),
+                        "structural_confirmed_95_count": len(
+                            specialists["heads"]["structural_confirmed_95"]
+                        ),
+                        "strongest_candidate_matched_pair_count": int(
+                            specialists["j_matching"]["matched_pair_count"]
+                        ),
+                        "strongest_candidate_mean_absolute_J_gap": float(
+                            specialists["j_matching"]["mean_absolute_J_gap"]
+                        ),
+                    }
+                )
             causal_value = value.get("causal")
             if causal_value is not None:
                 association = causal_value["associations"]
@@ -3646,6 +4003,46 @@ def _write_run_summaries(
                 ).items():
                     if isinstance(record, Mapping) and "estimate" in record:
                         row[f"interaction_{name}"] = float(record["estimate"])
+                focused = causal_value.get("focused_specialists", {})
+                if focused.get("status") in {"estimable", "continuous_only"}:
+                    continuous = focused.get("continuous_analysis", {})
+                    if continuous.get("status") == "estimable":
+                        continuous_metrics = list(continuous["metric_order"])
+                        statistics = list(continuous["statistic_order"])
+                        continuous_interval = continuous["interval"]
+                        for metric_position, metric in enumerate(
+                            continuous_metrics
+                        ):
+                            for statistic_position, statistic in enumerate(
+                                statistics
+                            ):
+                                row[
+                                    f"continuous_{metric}_{statistic}"
+                                ] = float(
+                                    continuous_interval.estimate[
+                                        metric_position,
+                                        statistic_position,
+                                    ]
+                                )
+                    pair_sets = list(focused["pair_set_order"])
+                    metrics = list(focused["metric_order"])
+                    interval = focused["interval"]
+                    for pair_set in pair_sets:
+                        set_position = pair_sets.index(pair_set)
+                        row[f"{pair_set}_specialist_pair_count"] = int(
+                            focused["pair_sets"][pair_set]["pair_count"]
+                        )
+                        for metric in metrics:
+                            metric_position = metrics.index(metric)
+                            row[
+                                f"{pair_set}_{metric}_double_difference"
+                            ] = float(
+                                interval.estimate[
+                                    set_position,
+                                    metric_position,
+                                    4,
+                                ]
+                            )
             seed_rows.append(row)
         if not seed_rows:
             if require_complete:
@@ -3708,6 +4105,121 @@ def _write_run_summaries(
                 "Fewer than three trained seeds: report seed estimates and within-seed "
                 "graph intervals, not a seed-population confidence interval."
             )
+        focused_population: dict[str, Any] = {
+            "strongest_candidates": {},
+            "confirmed_95": {},
+            "population_unit": "training seed; heads are not aligned across seeds",
+        }
+        for pair_set in ("strongest_candidates", "confirmed_95"):
+            pair_seed_rows = []
+            for value in task_results:
+                focused = (value.get("causal") or {}).get(
+                    "focused_specialists", {}
+                )
+                if pair_set not in focused.get("pair_set_order", ()):
+                    continue
+                set_position = list(focused["pair_set_order"]).index(pair_set)
+                metrics = list(focused["metric_order"])
+                interval = focused["interval"]
+                pair_seed_rows.append(
+                    {
+                        "seed": int(value["seed"]),
+                        "pair_count": int(
+                            focused["pair_sets"][pair_set]["pair_count"]
+                        ),
+                        "interaction": {
+                            metric: {
+                                "estimate": float(
+                                    interval.estimate[
+                                        set_position,
+                                        metric_position,
+                                        4,
+                                    ]
+                                ),
+                                "low": float(
+                                    interval.low[
+                                        set_position,
+                                        metric_position,
+                                        4,
+                                    ]
+                                ),
+                                "high": float(
+                                    interval.high[
+                                        set_position,
+                                        metric_position,
+                                        4,
+                                    ]
+                                ),
+                            }
+                            for metric_position, metric in enumerate(metrics)
+                        },
+                    }
+                )
+            total_pairs = sum(row["pair_count"] for row in pair_seed_rows)
+            covered_seeds = len(pair_seed_rows)
+            if pair_set == "strongest_candidates":
+                eligible = covered_seeds >= 3
+                rule = (
+                    "at least 3 trained seeds, each already satisfying the "
+                    "minimum 3 matched-pair seed rule"
+                )
+            else:
+                eligible = covered_seeds >= 3 and total_pairs >= 8
+                rule = "at least 8 total pairs across at least 3 trained seeds"
+            pair_record: dict[str, Any] = {
+                "status": "estimable" if eligible else "not_estimable",
+                "eligibility_rule": rule,
+                "covered_seed_count": covered_seeds,
+                "total_pair_count": total_pairs,
+                "seed_estimates": pair_seed_rows,
+            }
+            if eligible:
+                metric_order = list(
+                    next(
+                        value["causal"]["focused_specialists"]["metric_order"]
+                        for value in task_results
+                        if value.get("causal")
+                        and pair_set
+                        in value["causal"]["focused_specialists"].get(
+                            "pair_set_order", ()
+                        )
+                    )
+                )
+                matrix = np.asarray(
+                    [
+                        [
+                            row["interaction"][metric]["estimate"]
+                            for metric in metric_order
+                        ]
+                        for row in pair_seed_rows
+                    ],
+                    dtype=np.float64,
+                )
+                rng = np.random.default_rng(config.bootstrap.rng_seed + 17)
+                draws = np.stack(
+                    [
+                        matrix[
+                            rng.integers(
+                                0,
+                                len(matrix),
+                                size=len(matrix),
+                            )
+                        ].mean(axis=0)
+                        for _ in range(config.bootstrap.replicates)
+                    ]
+                )
+                pair_record["population_interval"] = {
+                    "metric_order": metric_order,
+                    "estimate": np.mean(matrix, axis=0),
+                    "low": np.quantile(draws, 0.025, axis=0),
+                    "high": np.quantile(draws, 0.975, axis=0),
+                    "replicates": int(config.bootstrap.replicates),
+                    "rng_seed": int(config.bootstrap.rng_seed + 17),
+                }
+            else:
+                pair_record["population_interval"] = None
+            focused_population[pair_set] = pair_record
+        task_population["focused_specialist_validation"] = focused_population
         path = config.root / task_name / "population.json"
         atomic_json(path, task_population)
         population[task_name] = {"path": str(path), **task_population}
@@ -3892,15 +4404,29 @@ def finalize_cached_run(config: MethodologyConfig) -> dict[str, Any]:
         for train_seed in config.seeds_for(task_name):
             key = f"{task_name}:seed{int(train_seed)}"
             output_dir = config.root / task_name / f"seed_{int(train_seed)}"
-            required = {
+            cache_paths = {
                 "scores": output_dir / "cache" / "scores" / "raw.pt",
                 "carriage": output_dir / "cache" / "carriage" / "fields.pt",
                 "causal": output_dir / "cache" / "causal" / "validation.pt",
             }
             artifacts = {
                 name: load_cache_artifact_file(path)
-                for name, path in required.items()
+                for name, path in cache_paths.items()
+                if name != "carriage" or path.exists()
             }
+            missing_required = [
+                name
+                for name in ("scores", "causal")
+                if name not in artifacts
+            ]
+            if missing_required:
+                missing_paths = ", ".join(
+                    str(cache_paths[name]) for name in missing_required
+                )
+                raise FileNotFoundError(
+                    "cached causal finalization requires score and causal caches; "
+                    f"missing {missing_paths}"
+                )
             artifact_fingerprints[key] = {}
             for name, artifact in artifacts.items():
                 contract = artifact.metadata["contract"]
@@ -3941,7 +4467,11 @@ def finalize_cached_run(config: MethodologyConfig) -> dict[str, Any]:
                 "seed": int(train_seed),
                 "output_dir": str(output_dir),
                 "scores": artifacts["scores"].value,
-                "carriage": artifacts["carriage"].value,
+                "carriage": (
+                    artifacts["carriage"].value
+                    if "carriage" in artifacts
+                    else None
+                ),
                 "causal": artifacts["causal"].value,
                 "figures": figures,
                 "audit_findings": findings,

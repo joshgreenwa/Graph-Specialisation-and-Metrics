@@ -93,6 +93,7 @@ from graph_specialisation_metrics.methodology.scores import (
     event_head_scores,
     head_coordinates,
     freeze_families,
+    freeze_threshold_specialists,
     project_transport,
     specialisation_diagnostics,
 )
@@ -832,6 +833,130 @@ def test_transport_projection_event_norm_and_hierarchical_aggregation():
     )
     assert total[0, 0] == pytest.approx((6.0 + 14.0) / 2)
     assert sources[(0, 0)][0, 0] == 6.0
+
+
+def test_threshold_specialists_exclude_generalists_and_match_j_within_seed():
+    selectivity = np.asarray([[-0.50, -0.05, 0.05, 0.50]])
+    coordinates = head_coordinates(
+        1.0 + selectivity,
+        1.0 - selectivity,
+        score_floor=1.0e-12,
+        epsilon=1.0e-12,
+        activity_floor=0.20,
+    )
+    result = freeze_threshold_specialists(
+        coordinates,
+        selectivity_interval=(
+            np.asarray([[-0.60, -0.10, 0.00, 0.40]]),
+            np.asarray([[-0.40, 0.00, 0.10, 0.60]]),
+        ),
+        preference_threshold=0.10,
+        activity_threshold=0.20,
+    )
+
+    assert result["heads"]["structural_candidate_pool"] == ((0, 0),)
+    assert result["heads"]["semantic_candidate_pool"] == ((0, 3),)
+    assert result["heads"]["structural_confirmed_95"] == ((0, 0),)
+    assert result["heads"]["semantic_confirmed_95"] == ((0, 3),)
+    assert result["heads"]["generalist"] == ((0, 1), (0, 2))
+    assert result["heads"]["unresolved"] == ()
+    assert result["j_matching"]["matched_pair_count"] == 1
+    assert result["j_matching"]["pairs"][0]["semantic"] == (0, 3)
+    assert result["j_matching"]["pairs"][0]["structural"] == (0, 0)
+    assert result["strength_ranking"]["semantic_candidates"][0][
+        "absolute_D_rel"
+    ] == pytest.approx(0.50)
+    assert result["candidate_analysis"]["status"] == "not_estimable"
+    assert result["confirmed_95_robustness"]["status"] == "available"
+
+
+def test_threshold_specialist_matching_does_not_require_the_same_layer():
+    selectivity = np.asarray([[-0.50], [0.50]])
+    coordinates = head_coordinates(
+        1.0 + selectivity,
+        1.0 - selectivity,
+        score_floor=1.0e-12,
+        epsilon=1.0e-12,
+        activity_floor=0.20,
+    )
+    result = freeze_threshold_specialists(
+        coordinates,
+        selectivity_interval=(
+            np.asarray([[-0.60], [0.40]]),
+            np.asarray([[-0.40], [0.60]]),
+        ),
+        preference_threshold=0.10,
+        activity_threshold=0.20,
+    )
+
+    pair = result["j_matching"]["pairs"][0]
+    assert pair["semantic"] == (1, 0)
+    assert pair["structural"] == (0, 0)
+    assert pair["absolute_layer_gap"] == 1
+    assert result["j_matching"]["matched_pair_count"] == 1
+
+
+def test_strongest_candidate_fallback_keeps_top_six_without_95pct_confirmation():
+    selectivity = np.asarray(
+        [[
+            -0.80,
+            -0.70,
+            -0.60,
+            -0.50,
+            -0.40,
+            -0.30,
+            -0.20,
+            -0.15,
+            0.15,
+            0.20,
+            0.30,
+            0.40,
+            0.50,
+            0.60,
+            0.70,
+            0.80,
+        ]]
+    )
+    coordinates = head_coordinates(
+        1.0 + selectivity,
+        1.0 - selectivity,
+        score_floor=1.0e-12,
+        epsilon=1.0e-12,
+        activity_floor=0.20,
+    )
+    result = freeze_threshold_specialists(
+        coordinates,
+        selectivity_interval=(
+            np.full(selectivity.shape, -1.0),
+            np.full(selectivity.shape, 1.0),
+        ),
+        preference_threshold=0.10,
+        activity_threshold=0.20,
+        candidate_limit=6,
+        minimum_candidate_pairs=3,
+    )
+
+    assert result["candidate_analysis"]["status"] == "estimable"
+    assert result["j_matching"]["matched_pair_count"] == 6
+    assert result["heads"]["semantic_selected"] == (
+        (0, 15),
+        (0, 14),
+        (0, 13),
+        (0, 12),
+        (0, 11),
+        (0, 10),
+    )
+    assert result["heads"]["structural_selected"] == (
+        (0, 0),
+        (0, 1),
+        (0, 2),
+        (0, 3),
+        (0, 4),
+        (0, 5),
+    )
+    assert result["heads"]["semantic_confirmed_95"] == ()
+    assert result["heads"]["structural_confirmed_95"] == ()
+    assert result["confirmed_95_robustness"]["status"] == "not_estimable"
 
 
 def test_head_coordinates_use_within_model_means_and_gate_only_selectivity():

@@ -5,7 +5,7 @@
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=128G
-#SBATCH --time=04:00:00
+#SBATCH --time=06:00:00
 #SBATCH --array=0-3%1
 #SBATCH --output=logs/%x-%A-%a.out
 #SBATCH --error=logs/%x-%A-%a.err
@@ -17,7 +17,7 @@ GRIT_ROOT="${GRIT_ROOT:-${PROJECT_ROOT}/external/GRIT}"
 GRAPHBENCH_DATASET_ROOT="${GRAPHBENCH_DATASET_ROOT:-/rds/user/jgg45/hpc-work/graphbench-algoreas/datasets}"
 GRAPHBENCH_PE_CACHE_ROOT="${GRAPHBENCH_PE_CACHE_ROOT:-/rds/user/jgg45/hpc-work/graphbench-algoreas/pe_cache}"
 GRAPHBENCH_TRAINING_OUTPUT_ROOT="${GRAPHBENCH_TRAINING_OUTPUT_ROOT:-/rds/user/jgg45/hpc-work/graphbench-algoreas/outputs/graphbench_algoreas_hpc_base_v1}"
-GRAPHBENCH_ANALYSIS_OUTPUT_ROOT="${GRAPHBENCH_ANALYSIS_OUTPUT_ROOT:-/rds/user/jgg45/hpc-work/graphbench-algoreas/outputs/grit_specialisation_graphbench_edge_v1}"
+GRAPHBENCH_ANALYSIS_OUTPUT_ROOT="${GRAPHBENCH_ANALYSIS_OUTPUT_ROOT:-/rds/user/jgg45/hpc-work/graphbench-algoreas/outputs/grit_specialisation_graphbench_complete_pe_v2}"
 
 cd "${PROJECT_ROOT}"
 mkdir -p graphbench-algoreas-hpc/logs "${GRAPHBENCH_ANALYSIS_OUTPUT_ROOT}"
@@ -43,15 +43,19 @@ if (( SLURM_ARRAY_TASK_ID >= ${#SEED_VALUES[@]} )); then
 fi
 SEED="${SEED_VALUES[${SLURM_ARRAY_TASK_ID}]}"
 SEEDS_CSV="$(IFS=,; echo "${SEED_VALUES[*]}")"
+ANALYSIS_TASKS_CSV="${TASK_LIST:-bipartite_matching_hard}"
+ANALYSIS_TASKS_CSV="${ANALYSIS_TASKS_CSV//:/,}"
+PHASES_CSV="${PHASE_LIST:-scores:causal}"
+PHASES_CSV="${PHASES_CSV//:/,}"
 
 python graphbench-algoreas-hpc/bin/check_official_backends.py --models grit
 
 python graphbench-algoreas-hpc/bin/grit_specialisation.py \
-  --tasks bipartite_matching_hard,flow_hard \
+  --tasks "${ANALYSIS_TASKS_CSV}" \
   --seeds "${SEEDS_CSV}" \
   --worker-task "${ANALYSIS_TASK}" \
   --worker-seed "${SEED}" \
-  --phases "${PHASES:-scores,causal,carriage}" \
+  --phases "${PHASES_CSV}" \
   --profile "${PROFILE:-production}" \
   --training-output-root "${GRAPHBENCH_TRAINING_OUTPUT_ROOT}" \
   --analysis-output-root "${GRAPHBENCH_ANALYSIS_OUTPUT_ROOT}" \

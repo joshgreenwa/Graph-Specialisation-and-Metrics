@@ -1,8 +1,9 @@
-"""Standalone Colab frontend for ZINC Bamberger-versus-carriage reach.
+"""Standalone Colab frontend for QM9 Bamberger-versus-carriage reach.
 
-Paste this complete file into one Colab cell.  It loads the seed-0 checkpoints
-for 1-hop, 2-hop, 1-hop+VNode, and dense GRIT, caches graph-level measurements
-to Drive, saves PNG/PDF figures, and displays every PNG in the notebook.
+Paste this complete file into one Colab cell. It loads the seed-0 dense,
+1-hop, and 1-hop+VNode GRIT checkpoints for the QM9 HOMO--LUMO gap target,
+caches graph-level measurements to Drive, saves PNG/PDF figures, and displays
+every PNG in the notebook.
 
 After the first completed run, set ``PHASE = "figures"`` to rebuild figures
 without reinstalling GRIT or loading checkpoints.
@@ -29,9 +30,9 @@ SECRET_NAME = "dissertation_key"
 PHASE = "all"  # "all", "measure", or "figures"
 OUTPUT_DIR = Path(
     "/content/drive/MyDrive/graph_specialisation_metrics/"
-    "zinc_bamberger_functional_reach_v6"
+    "qm9_bamberger_functional_reach_v1"
 )
-TASKS = "zinc_1hop,zinc_2hop,zinc_1hop_vnode,zinc"
+TASKS = "qm9_gap_1hop,qm9_gap_1hop_vnode,qm9_gap_dense"
 SEED = 0
 GRAPHS = 16
 SOURCES_PER_GRAPH = 6
@@ -142,7 +143,7 @@ def bootstrap() -> None:
 
     source_path = (COLAB_REPOSITORY / "src").resolve()
     backend_path = (
-        source_path / "graph_specialisation_metrics" / "zinc_reach_analysis.py"
+        source_path / "graph_specialisation_metrics" / "qm9_reach_analysis.py"
     )
     if not backend_path.is_file():
         raise RuntimeError(
@@ -161,11 +162,13 @@ def bootstrap() -> None:
 
 bootstrap()
 
-from graph_specialisation_metrics.zinc_reach_analysis import main
+from graph_specialisation_metrics.qm9_reach_analysis import main
 
 
 print(
-    "\n[scope] Semantic: literal Bamberger pre-pooling Jacobian range and "
+    "\n[scope] Dataset: QM9 HOMO-LUMO gap, comparing dense, 1-hop, and "
+    "1-hop+VNode GRIT checkpoints.\n"
+    "[scope] Semantic: literal Bamberger pre-pooling Jacobian range and "
     "finite Functional carriage.\n"
     "[scope] Structural: finite Functional carriage only; "
     "Bamberger has no canonical structural intervention analogue.\n"
@@ -177,9 +180,8 @@ print(
     "Bamberger profile tests local linearisation versus finite intervention.\n"
     "[scope] Fairness: checkpoints, graphs, SPD and carrier site are shared; "
     "literal Bamberger remains output-centric and channel-subsampled.\n"
-    "[scope] Interpretation: this is an estimand comparison, not a claim that "
-    "the two methods measure the same quantity. There is no learned-route ground "
-    "truth on ZINC.\n"
+    "[scope] Interpretation: this is an estimand comparison, not a learned-route "
+    "ground-truth test.\n"
     "[scope] Uncertainty: 95% held-out-graph bootstrap from one seed-0 checkpoint "
     "per architecture; it does not include training-seed variance.\n",
     flush=True,

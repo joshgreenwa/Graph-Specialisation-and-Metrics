@@ -1,7 +1,11 @@
 # Bipartite matching GRIT structural-PE refinement
 
-**Status:** implemented and locally verified; ready for HPC preflight; not yet queued  
-**Last updated:** 2026-07-28  
+The focused causal-validation specification for the locked method is maintained
+in
+[`bipartite_matching_causal_validation_plan.md`](bipartite_matching_causal_validation_plan.md).
+
+**Status:** refinement complete; production choice locked
+**Last updated:** 2026-07-30
 **Implementation branch:** `expansion/graphormer_specialisation`  
 **Protocol:** `graphbench-bipartite-pe-refinement-v1`  
 **Task:** `graphbench_bipartite_matching_hard` only  
@@ -18,6 +22,10 @@ score system before returning to carriage or distance analyses.
 
 The semantic reciprocal-edge-unit donor swap is fixed. Topology, edge values, node types, labels,
 and output/readout coordinates remain fixed during every structural intervention.
+
+**Locked production choice:** `complete_pe_copy` with `coherent` output-movement scoring.
+Node transposition is rejected. RRWP-only donor-copy remains a positive ablation and transport mass
+remains a secondary diagnostic.
 
 ## 2. Registered four-arm factorial
 
@@ -265,9 +273,9 @@ Soft audits are cached and flagged but do not terminate production.
 - [x] Atomic common/arm caches and component progress.
 - [x] Slurm common/arm/finalizer DAG with six-hour GPU and CPU safety limits.
 - [x] Complete local unit/static/contract verification (`198 passed, 1 skipped`).
-- [ ] Refresh HPC checkout and run new preflight.
-- [ ] Queue production DAG.
-- [ ] Inspect refinement outputs and write selection lock.
+- [x] Refresh HPC checkout and run new preflight.
+- [x] Queue production DAG.
+- [x] Inspect refinement outputs and write selection lock.
 - [ ] Run confirmation finalizer for the locked candidate.
 
 ## 12. Results log
@@ -276,3 +284,4 @@ Soft audits are cached and flagged but do not terminate production.
 |---|---|---|---|---|
 | 2026-07-27 | draft | earlier degree-law rerun | superseded | Replaced by four-arm PE factorial |
 | 2026-07-28 | v1 | implementation | ready | Dedicated matching-only core runner; full local suite passes |
+| 2026-07-30 | v1 | refinement decision | locked | Complete-PE donor-copy + coherent score selected; transposition rejected |

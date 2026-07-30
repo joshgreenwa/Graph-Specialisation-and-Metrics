@@ -48,12 +48,16 @@ from .methodology.sampling import sample_sources
 
 ANALYSIS_VERSION = "zinc-bamberger-functional-reach-v6"
 TASKS = ("zinc_1hop", "zinc_2hop", "zinc_1hop_vnode", "zinc")
+QM9_TASKS = ("qm9_gap_1hop", "qm9_gap_1hop_vnode", "qm9_gap_dense")
 DEFAULT_INTERPOLATION_DOSES = (0.02, 0.05, 0.10, 0.25, 0.50, 1.00)
 TASK_LABELS = {
     "zinc_1hop": "1-hop GRIT",
     "zinc_2hop": "2-hop GRIT",
     "zinc_1hop_vnode": "1-hop GRIT + VN",
     "zinc": "Dense GRIT",
+    "qm9_gap_1hop": "1-hop GRIT",
+    "qm9_gap_1hop_vnode": "1-hop GRIT + VN",
+    "qm9_gap_dense": "Dense GRIT",
 }
 CHANNELS = ("semantic", "structural")
 DONOR_METHODS = ("functional_carriage",)
@@ -79,25 +83,77 @@ MODEL_COLOURS = {
     "zinc_2hop": "#009E73",
     "zinc_1hop_vnode": "#CC79A7",
     "zinc": "#D55E00",
+    "qm9_gap_1hop": "#0072B2",
+    "qm9_gap_1hop_vnode": "#CC79A7",
+    "qm9_gap_dense": "#D55E00",
 }
 MODEL_MARKERS = {
     "zinc_1hop": "o",
     "zinc_2hop": "^",
     "zinc_1hop_vnode": "D",
     "zinc": "s",
+    "qm9_gap_1hop": "o",
+    "qm9_gap_1hop_vnode": "D",
+    "qm9_gap_dense": "s",
 }
 MODEL_LINESTYLES = {
     "zinc_1hop": "-",
     "zinc_2hop": "--",
     "zinc_1hop_vnode": "-.",
     "zinc": ":",
+    "qm9_gap_1hop": "-",
+    "qm9_gap_1hop_vnode": "-.",
+    "qm9_gap_dense": ":",
 }
+
+
+@dataclass(frozen=True)
+class ReachProfile:
+    """Dataset-specific controls for the shared reach experiment."""
+
+    name: str
+    analysis_version: str
+    tasks: tuple[str, ...]
+    reference_task: str
+    atom_vocab_size: int
+    event_stage: str
+    figure_prefix: str
+    default_output_dir: str
+
+
+ZINC_PROFILE = ReachProfile(
+    name="ZINC",
+    analysis_version=ANALYSIS_VERSION,
+    tasks=TASKS,
+    reference_task="zinc",
+    atom_vocab_size=21,
+    event_stage="zinc_reach",
+    figure_prefix="zinc",
+    default_output_dir=(
+        "/content/drive/MyDrive/graph_specialisation_metrics/"
+        "zinc_bamberger_functional_reach_v6"
+    ),
+)
+QM9_PROFILE = ReachProfile(
+    name="QM9",
+    analysis_version="qm9-bamberger-functional-reach-v1",
+    tasks=QM9_TASKS,
+    reference_task="qm9_gap_dense",
+    atom_vocab_size=10,
+    event_stage="qm9_reach",
+    figure_prefix="qm9",
+    default_output_dir=(
+        "/content/drive/MyDrive/graph_specialisation_metrics/"
+        "qm9_bamberger_functional_reach_v1"
+    ),
+)
 
 
 @dataclass(frozen=True)
 class ZincReachConfig:
     """Scientific and runtime controls for the standalone analysis."""
 
+    profile: ReachProfile = ZINC_PROFILE
     tasks: tuple[str, ...] = TASKS
     seed: int = 0
     graphs: int = 16
@@ -115,8 +171,8 @@ class ZincReachConfig:
     num_threads: int = 4
 
     def validate(self) -> None:
-        if not self.tasks or any(task not in TASKS for task in self.tasks):
-            raise ValueError(f"tasks must be drawn from {TASKS}")
+        if not self.tasks or any(task not in self.profile.tasks for task in self.tasks):
+            raise ValueError(f"tasks must be drawn from {self.profile.tasks}")
         for name in (
             "graphs",
             "sources_per_graph",
@@ -147,7 +203,8 @@ class ZincReachConfig:
     @property
     def scientific_record(self) -> dict[str, Any]:
         return {
-            "analysis_version": ANALYSIS_VERSION,
+            "analysis_version": self.profile.analysis_version,
+            "dataset": self.profile.name,
             "tasks": list(self.tasks),
             "seed": int(self.seed),
             "graphs": int(self.graphs),
@@ -344,8 +401,8 @@ def _methodology_config(
     )
 
 
-def _atom_embedding(net: Any) -> Any:
-    """Find the checkpoint's unique 21-type ZINC atom embedding."""
+def _atom_embedding(net: Any, *, vocab_size: int) -> Any:
+    """Find the checkpoint's unique atomic-number/type embedding."""
 
     import torch
 
@@ -353,16 +410,23 @@ def _atom_embedding(net: Any) -> Any:
     candidates = [
         module
         for module in node_encoder.modules()
-        if isinstance(module, torch.nn.Embedding) and int(module.num_embeddings) == 21
+        if isinstance(module, torch.nn.Embedding)
+        and int(module.num_embeddings) == int(vocab_size)
     ] if node_encoder is not None else []
     if len(candidates) != 1:
         raise RuntimeError(
-            f"expected one 21-type atom embedding, found {len(candidates)}"
+            f"expected one {int(vocab_size)}-type atom embedding, "
+            f"found {len(candidates)}"
         )
     return candidates[0]
 
 
-def _after_feature_encoder(prepared: Any, graphs: Sequence[Any]) -> tuple[Any, Any, Any]:
+def _after_feature_encoder(
+    prepared: Any,
+    graphs: Sequence[Any],
+    *,
+    atom_vocab_size: int,
+) -> tuple[Any, Any, Any]:
     """Run only the categorical node/edge encoder."""
 
     from torch_geometric.data import Batch
@@ -375,12 +439,14 @@ def _after_feature_encoder(prepared: Any, graphs: Sequence[Any]) -> tuple[Any, A
     )
     raw_atoms = batch.x[:, 0].long().detach().clone()
     encoded = net.encoder(batch)
-    embedding = _atom_embedding(net)
+    embedding = _atom_embedding(net, vocab_size=int(atom_vocab_size))
     expected = embedding(raw_atoms)
     if encoded.x.shape != expected.shape:
-        raise RuntimeError("ZINC atom encoder geometry is not the expected single embedding")
+        raise RuntimeError("atom encoder geometry is not the expected single embedding")
     if not bool((encoded.x.detach() - expected.detach()).abs().max() <= 1.0e-6):
-        raise RuntimeError("ZINC node encoder is not equivalent to the registered atom embedding")
+        raise RuntimeError(
+            "node encoder is not equivalent to the registered atom embedding"
+        )
     return encoded, raw_atoms, embedding
 
 
@@ -430,7 +496,11 @@ def _bamberger_rows(
     import torch.nn.functional as functional
 
     net = prepared.runtime.model.model
-    after_encoder, raw_atoms, embedding = _after_feature_encoder(prepared, [base])
+    after_encoder, raw_atoms, embedding = _after_feature_encoder(
+        prepared,
+        [base],
+        atom_vocab_size=int(config.profile.atom_vocab_size),
+    )
     nodes = int(base.num_nodes)
     one_hot = functional.one_hot(
         raw_atoms,
@@ -486,7 +556,7 @@ def _bamberger_rows(
         for input_node in range(nodes):
             rows.append(
                 {
-                    "analysis_version": ANALYSIS_VERSION,
+                    "analysis_version": config.profile.analysis_version,
                     "fingerprint": config.fingerprint,
                     "task": task,
                     "model_label": TASK_LABELS[task],
@@ -548,7 +618,10 @@ def _semantic_interpolation_mass(
     output[full_index] = full_mass
 
     net = prepared.runtime.model.model
-    embedding = _atom_embedding(net)
+    embedding = _atom_embedding(
+        net,
+        vocab_size=int(config.profile.atom_vocab_size),
+    )
 
     conditions = [
         (dose_index, event_index)
@@ -665,7 +738,7 @@ def _donor_rows(
             raise RuntimeError("event source is absent from the frozen source set")
         for carrier in range(int(base.num_nodes)):
             row = {
-                "analysis_version": ANALYSIS_VERSION,
+                "analysis_version": config.profile.analysis_version,
                 "fingerprint": config.fingerprint,
                 "task": task,
                 "model_label": TASK_LABELS[task],
@@ -688,7 +761,7 @@ def _donor_rows(
                 for dose_index, dose in enumerate(config.interpolation_doses):
                     interpolation_rows.append(
                         {
-                            "analysis_version": ANALYSIS_VERSION,
+                            "analysis_version": config.profile.analysis_version,
                             "fingerprint": config.fingerprint,
                             "task": task,
                             "model_label": TASK_LABELS[task],
@@ -750,7 +823,7 @@ def _measure_graph(
                 graph_id=int(graph_id),
                 source=int(source),
                 channel=channel,
-                stage="zinc_reach",
+                stage=config.profile.event_stage,
                 donors=int(config.donors_per_source),
                 rng=np.random.default_rng(
                     _seed(config, "events", graph_id, channel, int(source))
@@ -785,7 +858,7 @@ def _measure_graph(
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
     return {
-        "analysis_version": ANALYSIS_VERSION,
+        "analysis_version": config.profile.analysis_version,
         "fingerprint": config.fingerprint,
         "checkpoint_sha256": str(prepared.checkpoint_sha),
         "task": task,
@@ -803,6 +876,7 @@ def _shard_path(output_dir: Path, task: str, graph_id: int) -> Path:
 def _load_shard(
     path: Path,
     *,
+    analysis_version: str,
     fingerprint: str,
     checkpoint_sha256: str,
 ) -> dict[str, Any] | None:
@@ -815,7 +889,7 @@ def _load_shard(
     except Exception:
         return None
     if (
-        payload.get("analysis_version") != ANALYSIS_VERSION
+        payload.get("analysis_version") != analysis_version
         or payload.get("fingerprint") != fingerprint
         or payload.get("checkpoint_sha256") != checkpoint_sha256
         or not {"donor_rows", "interpolation_rows", "bamberger_rows"}.issubset(payload)
@@ -895,6 +969,7 @@ def measure(
             path = _shard_path(output_dir, task, int(graph_id))
             shard = _load_shard(
                 path,
+                analysis_version=config.profile.analysis_version,
                 fingerprint=config.fingerprint,
                 checkpoint_sha256=str(prepared.checkpoint_sha),
             )
@@ -943,9 +1018,15 @@ def measure(
                     "finite Functional carriage only; no canonical Bamberger "
                     "structural quantity is claimed"
                 ),
+                "structural_interpretation": (
+                    "source-conditioned structural usage, not pure hop-by-hop "
+                    "transport: globally encoded RRWP relations may be accessed "
+                    "directly by a carrier"
+                ),
                 "ground_truth": (
-                    "none for learned ZINC range; architecture constrains accessibility "
-                    "but does not specify the learned usage distribution"
+                    f"none for learned {config.profile.name} range; architecture "
+                    "constrains accessibility but does not specify the learned usage "
+                    "distribution"
                 ),
             },
             "comparison_fairness": {
@@ -1407,8 +1488,9 @@ def summarise_dense_profile_contrasts(
     *,
     bootstrap_replicates: int,
     bootstrap_seed: int,
+    reference_task: str = "zinc",
 ) -> list[dict[str, Any]]:
-    """Compute paired graph-level profile differences from dense GRIT."""
+    """Compute paired graph-level profile differences from a reference model."""
 
     profiles: dict[tuple[str, int, str, str], dict[int, float]] = defaultdict(dict)
     for row in graph_rows:
@@ -1425,7 +1507,7 @@ def summarise_dense_profile_contrasts(
         {
             (str(row["task"]), str(row["channel"]), str(row["method"]))
             for row in graph_rows
-            if str(row["task"]) != "zinc"
+            if str(row["task"]) != reference_task
         }
     )
     contrasts: list[dict[str, Any]] = []
@@ -1437,14 +1519,14 @@ def summarise_dense_profile_contrasts(
             and candidate_channel == channel
             and candidate_method == method
         }
-        dense_graphs = {
+        reference_graphs = {
             graph
             for candidate_task, graph, candidate_channel, candidate_method in profiles
-            if candidate_task == "zinc"
+            if candidate_task == reference_task
             and candidate_channel == channel
             and candidate_method == method
         }
-        paired_graphs = sorted(model_graphs & dense_graphs)
+        paired_graphs = sorted(model_graphs & reference_graphs)
         if not paired_graphs:
             continue
         distances = sorted(
@@ -1453,7 +1535,7 @@ def summarise_dense_profile_contrasts(
                 for graph in paired_graphs
                 for profile in (
                     profiles[(task, graph, channel, method)],
-                    profiles[("zinc", graph, channel, method)],
+                    profiles[(reference_task, graph, channel, method)],
                 )
                 for distance in profile
             }
@@ -1461,7 +1543,9 @@ def summarise_dense_profile_contrasts(
         for distance in distances:
             values = [
                 profiles[(task, graph, channel, method)].get(distance, 0.0)
-                - profiles[("zinc", graph, channel, method)].get(distance, 0.0)
+                - profiles[
+                    (reference_task, graph, channel, method)
+                ].get(distance, 0.0)
                 for graph in paired_graphs
             ]
             mean, low, high = _bootstrap_interval(
@@ -1487,8 +1571,8 @@ def summarise_dense_profile_contrasts(
                 {
                     "task": task,
                     "model_label": TASK_LABELS[task],
-                    "reference_task": "zinc",
-                    "reference_model_label": TASK_LABELS["zinc"],
+                    "reference_task": reference_task,
+                    "reference_model_label": TASK_LABELS[reference_task],
                     "channel": channel,
                     "method": method,
                     "distance": int(distance),
@@ -1547,6 +1631,8 @@ def plot_model_profiles(
     title: str,
     filename: str,
     figures_dir: Path,
+    tasks: Sequence[str] = TASKS,
+    reference_task: str = "zinc",
 ) -> dict[str, str]:
     import matplotlib.pyplot as plt
 
@@ -1559,7 +1645,7 @@ def plot_model_profiles(
         gridspec_kw={"height_ratios": (2.8, 1.25), "hspace": 0.08},
     )
     maximum_distance = 0
-    for draw_order, task in enumerate(TASKS):
+    for draw_order, task in enumerate(tasks):
         values = sorted(
             (
                 row
@@ -1601,7 +1687,8 @@ def plot_model_profiles(
         )
 
     contrast_bound = 0.0
-    for draw_order, task in enumerate(TASKS[:-1]):
+    comparison_tasks = [task for task in tasks if task != reference_task]
+    for draw_order, task in enumerate(comparison_tasks):
         values = sorted(
             (
                 row
@@ -1648,7 +1735,9 @@ def plot_model_profiles(
     profile_axis.set_ylabel("Normalised usage mass")
     profile_axis.set_ylim(bottom=0)
     contrast_axis.axhline(0, color="#666666", linewidth=0.9, zorder=0)
-    contrast_axis.set_ylabel("Difference from\nDense GRIT")
+    contrast_axis.set_ylabel(
+        f"Difference from\n{TASK_LABELS[reference_task]}"
+    )
     contrast_axis.set_xlabel("Shortest-path distance")
     if contrast_bound > 0:
         contrast_bound *= 1.12
@@ -1673,7 +1762,7 @@ def plot_model_profiles(
         labels,
         loc="upper center",
         bbox_to_anchor=(0.5, 0.925),
-        ncol=4,
+        ncol=len(tasks),
         frameon=False,
         handlelength=2.7,
         columnspacing=1.4,
@@ -1700,6 +1789,8 @@ def plot_interpolation_sweep(
     rows: Sequence[Mapping[str, Any]],
     *,
     figures_dir: Path,
+    tasks: Sequence[str] = TASKS,
+    figure_prefix: str = "zinc",
 ) -> dict[str, str]:
     """Plot departure from Bamberger as the semantic donor fraction grows."""
 
@@ -1718,7 +1809,7 @@ def plot_interpolation_sweep(
     if not all_doses:
         raise RuntimeError("interpolation sweep is empty; rerun PHASE='all'")
     for axis, (metric, ylabel) in zip(axes, metric_specs):
-        for draw_order, task in enumerate(TASKS):
+        for draw_order, task in enumerate(tasks):
             values = sorted(
                 (
                     row
@@ -1791,7 +1882,7 @@ def plot_interpolation_sweep(
         labels,
         loc="upper center",
         bbox_to_anchor=(0.5, 0.91),
-        ncol=4,
+        ncol=len(tasks),
         frameon=False,
         handlelength=2.7,
         columnspacing=1.4,
@@ -1816,19 +1907,26 @@ def plot_interpolation_sweep(
         top=0.75,
         wspace=0.22,
     )
-    return _save_figure(fig, figures_dir, "zinc_semantic_interpolation_sweep")
+    return _save_figure(
+        fig,
+        figures_dir,
+        f"{figure_prefix}_semantic_interpolation_sweep",
+    )
 
 
 def plot_expected_distance(
     rows: Sequence[Mapping[str, Any]],
     *,
     figures_dir: Path,
+    tasks: Sequence[str] = TASKS,
+    dataset_label: str = "ZINC",
+    figure_prefix: str = "zinc",
 ) -> dict[str, str]:
     import matplotlib.pyplot as plt
 
     _figure_theme()
     fig, axes = plt.subplots(1, 2, figsize=(10.8, 4.1), sharey=True)
-    positions = np.arange(len(TASKS), dtype=np.float64)
+    positions = np.arange(len(tasks), dtype=np.float64)
     for axis, channel in zip(axes, CHANNELS):
         methods = (
             ("bamberger", *DONOR_METHODS)
@@ -1847,7 +1945,7 @@ def plot_expected_distance(
             means: list[float] = []
             lows: list[float] = []
             highs: list[float] = []
-            for index, task in enumerate(TASKS):
+            for index, task in enumerate(tasks):
                 if task not in values_by_task:
                     continue
                 value = values_by_task[task]
@@ -1875,7 +1973,7 @@ def plot_expected_distance(
         axis.set_title(f"{channel.capitalize()} perturbations")
         axis.set_xticks(positions)
         axis.set_xticklabels(
-            [TASK_LABELS[task] for task in TASKS],
+            [TASK_LABELS[task] for task in tasks],
             rotation=22,
             ha="right",
         )
@@ -1899,9 +1997,13 @@ def plot_expected_distance(
         ncol=2,
         frameon=False,
     )
-    fig.suptitle("Expected distance of model usage on ZINC", fontsize=13, y=0.985)
+    fig.suptitle(
+        f"Expected distance of model usage on {dataset_label}",
+        fontsize=13,
+        y=0.985,
+    )
     fig.subplots_adjust(left=0.085, right=0.99, bottom=0.27, top=0.72, wspace=0.22)
-    return _save_figure(fig, figures_dir, "zinc_expected_reach")
+    return _save_figure(fig, figures_dir, f"{figure_prefix}_expected_reach")
 
 
 def figures(
@@ -1953,6 +2055,7 @@ def figures(
         graph_rows,
         bootstrap_replicates=int(config.bootstrap_replicates),
         bootstrap_seed=int(config.analysis_seed) + 200,
+        reference_task=config.profile.reference_task,
     )
     _write_csv(results_dir / "graph_distance_profiles.csv", graph_rows)
     _write_csv(results_dir / "distance_profile_summary.csv", profile_rows)
@@ -1976,6 +2079,8 @@ def figures(
         "interpolation_sweep": plot_interpolation_sweep(
             interpolation_summary,
             figures_dir=figures_dir,
+            tasks=config.tasks,
+            figure_prefix=config.profile.figure_prefix,
         ),
         "semantic_functional": plot_model_profiles(
             profile_rows,
@@ -1983,8 +2088,10 @@ def figures(
             channel="semantic",
             method="functional_carriage",
             title="Semantic usage by Functional carriage",
-            filename="zinc_semantic_functional_profiles",
+            filename=f"{config.profile.figure_prefix}_semantic_functional_profiles",
             figures_dir=figures_dir,
+            tasks=config.tasks,
+            reference_task=config.profile.reference_task,
         ),
         "semantic_bamberger": plot_model_profiles(
             profile_rows,
@@ -1992,8 +2099,10 @@ def figures(
             channel="semantic",
             method="bamberger",
             title="Semantic usage by Bamberger Jacobian range",
-            filename="zinc_semantic_bamberger_profiles",
+            filename=f"{config.profile.figure_prefix}_semantic_bamberger_profiles",
             figures_dir=figures_dir,
+            tasks=config.tasks,
+            reference_task=config.profile.reference_task,
         ),
         "structural_functional": plot_model_profiles(
             profile_rows,
@@ -2001,18 +2110,23 @@ def figures(
             channel="structural",
             method="functional_carriage",
             title="Structural usage by Functional carriage",
-            filename="zinc_structural_functional_profiles",
+            filename=f"{config.profile.figure_prefix}_structural_functional_profiles",
             figures_dir=figures_dir,
+            tasks=config.tasks,
+            reference_task=config.profile.reference_task,
         ),
         "expected_distance": plot_expected_distance(
             expected_rows,
             figures_dir=figures_dir,
+            tasks=config.tasks,
+            dataset_label=config.profile.name,
+            figure_prefix=config.profile.figure_prefix,
         ),
     }
     _write_json(
         results_dir / "figure_manifest.json",
         {
-            "analysis_version": ANALYSIS_VERSION,
+            "analysis_version": config.profile.analysis_version,
             "fingerprint": config.fingerprint,
             "figures": paths,
             "uncertainty": (
@@ -2033,17 +2147,16 @@ def figures(
     }
 
 
-def build_parser() -> argparse.ArgumentParser:
+def build_parser(
+    profile: ReachProfile = ZINC_PROFILE,
+) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--phase", choices=("all", "measure", "figures"), default="all")
     parser.add_argument(
         "--output-dir",
-        default=(
-            "/content/drive/MyDrive/graph_specialisation_metrics/"
-            "zinc_bamberger_functional_reach_v6"
-        ),
+        default=profile.default_output_dir,
     )
-    parser.add_argument("--tasks", default=",".join(TASKS))
+    parser.add_argument("--tasks", default=",".join(profile.tasks))
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--graphs", type=int, default=16)
     parser.add_argument("--sources-per-graph", type=int, default=6)
@@ -2066,9 +2179,14 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: Sequence[str] | None = None) -> dict[str, Any]:
-    args = build_parser().parse_args(argv)
+def main(
+    argv: Sequence[str] | None = None,
+    *,
+    profile: ReachProfile = ZINC_PROFILE,
+) -> dict[str, Any]:
+    args = build_parser(profile).parse_args(argv)
     config = ZincReachConfig(
+        profile=profile,
         tasks=tuple(value.strip() for value in args.tasks.split(",") if value.strip()),
         seed=int(args.seed),
         graphs=int(args.graphs),

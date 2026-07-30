@@ -175,17 +175,19 @@ All rows must pass. Environment notes and likely import failures are listed in
 # GRIT specialisation and carriage
 
 The trained GRIT checkpoints for `bipartite_matching_hard` and `flow_hard` are supported by the
-canonical `donor-swap-specialisation-carriage-v3` implementation through the explicitly labelled
-`graphbench-edge-semantic-v1` extension. GCN+ checkpoints are intentionally rejected: there is no
+canonical `donor-swap-specialisation-carriage-v4` implementation through the explicitly labelled
+`graphbench-complete-pe-coherent-v2` extension. GCN+ checkpoints are intentionally rejected: there is no
 GCN+ transport-site adapter in the canonical methodology.
 
 GraphBench has no swappable node-content row for these tasks. The semantic source is therefore one
 normalized weighted edge from the model input. Flow uses one ordered directed edge; matching treats
 a reciprocal pair as one semantic unit when both orientations are present. The external training
 donor law is graph-balanced and matches the source's endpoint-degree signature before drawing an
-edge value. The structural intervention remains the canonical fixed-support node intervention and
-copies one RRWP row/column/self footprint without changing topology, weights, labels, or flow
-source/sink markers.
+edge value. The structural intervention is the locked fixed-support complete-PE donor-copy: it
+copies one model-visible RRWP row/column/self footprint plus degree, from which the official
+adapter re-derives log-degree. It does not degree-match donors and never changes topology, weights,
+labels, or flow source/sink markers. GraphBench raw scores use coherent output movement; transport
+mass remains a secondary diagnostic.
 
 Production defaults are recorded in
 [`configs/grit_specialisation_graphbench_edge_v1.yaml`](configs/grit_specialisation_graphbench_edge_v1.yaml):
@@ -216,19 +218,20 @@ cd /rds/user/jgg45/hpc-work/Graph-Specialisation-and-Metrics
 
 ENV_ACTIVATE=$PWD/graphbench-algoreas-hpc/activate_graphbench_algoreas \
 PROFILE=production \
-MAX_PARALLEL=1 \
+ANALYSIS_TASKS=bipartite_matching_hard \
+PHASES=scores,causal \
+MAX_PARALLEL=4 \
 bash graphbench-algoreas-hpc/bin/submit_grit_specialisation.sh
 ```
 
-This submits separate four-seed arrays for matching and flow. Set `MAX_PARALLEL=4` only when the
-GPU allocation permits four simultaneous seeds per task; the recorded `gpu1` workflow uses
-`MAX_PARALLEL=1`. Each worker writes only
+The focused default submits one four-seed matching array. Set
+`ANALYSIS_TASKS=bipartite_matching_hard,flow_hard` only when both registered tasks are intended.
+Each worker writes only
 `<analysis-root>/<task>/seed_<seed>/`, so workers never race on task or root summaries. One
-`afterok` CPU job verifies that all eight cache contracts came from the same scientific
-configuration and repository commit, renders every seed's figures, then writes both
-`population.json` files and the root `protocol.json`, `audits.json`, and `index.json`.
-Each GPU array element requests four hours; interrupted runs resume from their completed atomic
-graph and target shards.
+`afterok` CPU job verifies the selected seeds' cache contracts, renders every figure, and writes
+the task `population.json` plus the root summaries. Each GPU array element requests six hours;
+interrupted runs resume from completed atomic graph and target shards. The focused run caches
+scores and causal results only; carriage is optional and is not required by the finalizer.
 The launcher validates `GRIT_ROOT` as the pinned official Git checkout and transports the four
 seeds through Slurm as a colon-separated list, avoiding the comma semantics of `--export`.
 
@@ -244,18 +247,23 @@ reopening the dataset:
 
 ```bash
 python graphbench-algoreas-hpc/bin/grit_specialisation.py \
-  --tasks bipartite_matching_hard,flow_hard \
+  --tasks bipartite_matching_hard \
   --seeds 0,1,2,3 \
   --phases figures \
   --accelerator cpu
 ```
 
-This requires all eight consolidated score, carriage, and causal caches. It regenerates figure
-artifacts and atomically rebuilds the complete four-seed population and root indexes. The canonical
-figure suite contains the same six paper-facing views used by the mixed synthetic plan
-(specialisation plane, score/causal association, double-dissociation endpoints, cumulative family
-ablation, joint/selectivity validation, and family controls), plus the required distance,
-attention, support, and carriage diagnostics.
+This requires the four consolidated score and causal caches; carriage is loaded only when present.
+It regenerates figure artifacts and atomically rebuilds the complete four-seed population and root
+indexes.
+
+For bipartite matching, the key categorical test selects active heads with point-estimate
+`D_rel > +0.10` or `< -0.10`, keeps at most the six strongest per direction, and optimally matches
+them on `J`; a seed requires three pairs. The continuous all-active-head analysis remains
+estimable when this count fails. Heads whose complete 95% interval clears the same threshold form
+a separately labelled robustness tier, promoted at population level only with at least eight
+pairs across at least three seeds. All of these are CPU-side subsets/statistics of the cached
+individual-head causal events.
 
 ## Bipartite structural-PE refinement
 
@@ -295,7 +303,7 @@ candidate is explicitly locked:
 
 ```bash
 python graphbench-algoreas-hpc/bin/grit_pe_refinement.py lock \
-  --arm complete_pe_transpose \
+  --arm complete_pe_copy \
   --score-system coherent
 
 sbatch -A mlmi-jgg45-sl2-cpu -p sapphire --qos=cpu1 \

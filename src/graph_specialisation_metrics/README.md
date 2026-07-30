@@ -260,7 +260,8 @@ The sign convention is always `clean - intervention`.
 
 ## 4. Raw semantic and structural head scores
 
-The production head score is graph-balanced **output-projected transport**:
+The production head score is graph-balanced **output-projected transport**. Carrier aggregation is
+part of the task registration. The task-general transport-mass score is:
 
 ```text
 E^{lh,c}_{g,s,k}
@@ -272,6 +273,18 @@ S_{c,g}(l,h)
 S_c(l,h)
     = mean_g S_{c,g}(l,h)
 ```
+
+For the registered official-GRIT GraphBench extension, the PE-refinement experiment instead locked
+**coherent output movement**:
+
+```text
+E^{lh,c}_{g,s,k}
+    = ||sum_i q^{lh,c}_{g,s,k,i,:}||_2
+```
+
+This is the only GraphBench production score. It measures the net first-order movement supported
+by a head and does not reward carrier effects that cancel in model-output space. Transport mass is
+retained as a secondary cancellation/distance diagnostic, not mixed into `J` or `D_rel`.
 
 Therefore:
 
@@ -287,15 +300,17 @@ The order of operations is mandatory:
 
 1. project each event at each carrier;
 2. take the `L2` magnitude across output dimensions for that event and carrier;
-3. sum carrier magnitudes;
+3. apply the registered carrier aggregation (sum magnitudes, or for GraphBench sum vectors before
+   taking their magnitude);
 4. average donor events within source;
 5. average sources within graph; and
 6. average graphs equally.
 
 Magnitude is taken before donor averaging, so valid events with opposite directions do not cancel.
-Carrier magnitudes are summed before graph averaging, so strong internal transport is not erased
-when carriers have opposing output directions. Large graphs do not dominate merely because they
-contain more sampled sources.
+For mass scoring, carrier magnitudes are summed before graph averaging. For coherent GraphBench
+scoring, carrier vectors are summed before their output norm so opposing effects cancel as they do
+at the model output. Large graphs do not dominate merely because they contain more sampled
+sources.
 
 No normalization, ratio, selectivity coordinate, attention-only statistic, task loss, or causal
 ablation is part of either raw score.

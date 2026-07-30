@@ -143,8 +143,8 @@ def _errorbars(ax, x, y, x_interval, y_interval, theme):
     ax.errorbar(
         x,
         y,
-        xerr=np.vstack((x - xlo, xhi - x)),
-        yerr=np.vstack((y - ylo, yhi - y)),
+        xerr=np.maximum(0.0, np.vstack((x - xlo, xhi - x))),
+        yerr=np.maximum(0.0, np.vstack((y - ylo, yhi - y))),
         fmt="none",
         ecolor="#555555",
         alpha=theme.error_alpha,
@@ -279,6 +279,255 @@ def joint_selectivity_plane(
         if equivalence_half_width is not None:
             ax.legend(frameon=False, fontsize=theme.tick_size, loc="upper left")
     return fig, ax
+
+
+def strong_specialist_map(
+    data: HeadPlotData,
+    classification: Mapping[str, Any],
+    *,
+    title: str | None = None,
+    theme: FigureTheme = FigureTheme(),
+):
+    """Show strongest directional candidates, confidence, and J-matched pairs."""
+
+    import matplotlib.pyplot as plt
+
+    coordinates = data.coordinates
+    x = _flatten_heads(coordinates.selectivity)
+    y = _flatten_heads(coordinates.joint_sensitivity)
+    shape = coordinates.joint_sensitivity.shape
+    masks = {
+        name: _flatten_heads(mask).astype(bool)
+        for name, mask in classification["masks"].items()
+    }
+    display_masks = {
+        "semantic_selected": masks["semantic_selected"],
+        "structural_selected": masks["structural_selected"],
+        "semantic_unselected": (
+            masks["semantic_candidate"] & ~masks["semantic_selected"]
+        ),
+        "structural_unselected": (
+            masks["structural_candidate"] & ~masks["structural_selected"]
+        ),
+        "generalist": masks["generalist"],
+        "unresolved": masks["unresolved"],
+        "inactive": masks["inactive"],
+    }
+    styles = {
+        "semantic_selected": (
+            theme.semantic_color,
+            "o",
+            "Selected semantic candidate",
+            1.0,
+        ),
+        "structural_selected": (
+            theme.structural_color,
+            "s",
+            "Selected structural candidate",
+            1.0,
+        ),
+        "semantic_unselected": (
+            theme.semantic_color,
+            "o",
+            "Other semantic candidate",
+            0.30,
+        ),
+        "structural_unselected": (
+            theme.structural_color,
+            "s",
+            "Other structural candidate",
+            0.30,
+        ),
+        "generalist": (theme.central_color, "D", "Generalist", 0.65),
+        "unresolved": ("#D69E2E", "^", "Unresolved", 0.70),
+        "inactive": (theme.inactive_color, "x", "Inactive", 0.70),
+    }
+    with publication_style(theme):
+        fig, ax = plt.subplots(figsize=(theme.width, theme.height))
+        if data.selectivity_interval is not None:
+            low, high = (_flatten_heads(value) for value in data.selectivity_interval)
+            ax.errorbar(
+                x,
+                y,
+                xerr=np.maximum(0.0, np.vstack((x - low, high - x))),
+                fmt="none",
+                ecolor="#777777",
+                alpha=theme.error_alpha,
+                linewidth=0.55,
+                capsize=0,
+                zorder=1,
+            )
+        threshold = float(classification["preference_threshold"])
+        activity = float(classification["activity_threshold"])
+        ax.axvspan(
+            -threshold,
+            threshold,
+            color=theme.central_color,
+            alpha=0.09,
+            linewidth=0,
+        )
+        ax.axvline(-threshold, color="#999999", linestyle=":", linewidth=0.8)
+        ax.axvline(threshold, color="#999999", linestyle=":", linewidth=0.8)
+        ax.axhline(activity, color="#777777", linestyle="--", linewidth=0.9)
+        for pair in classification["candidate_analysis"]["j_matching"]["pairs"]:
+            sem = np.ravel_multi_index(tuple(pair["semantic"]), shape)
+            struct = np.ravel_multi_index(tuple(pair["structural"]), shape)
+            ax.plot(
+                [x[sem], x[struct]],
+                [y[sem], y[struct]],
+                color="#B0B0B0",
+                linewidth=0.65,
+                alpha=0.65,
+                zorder=1,
+            )
+        for name, (colour, marker, label, alpha) in styles.items():
+            mask = display_masks[name]
+            if not mask.any():
+                continue
+            ax.scatter(
+                x[mask],
+                y[mask],
+                c=colour,
+                marker=marker,
+                s=theme.marker_size,
+                edgecolor=("none" if marker == "x" else "white"),
+                linewidth=0.5,
+                label=f"{label} (n={int(mask.sum())})",
+                alpha=alpha,
+                zorder=2,
+            )
+        confirmed = (
+            masks["semantic_confirmed_95"] | masks["structural_confirmed_95"]
+        )
+        if confirmed.any():
+            ax.scatter(
+                x[confirmed],
+                y[confirmed],
+                facecolors="none",
+                edgecolors="#111111",
+                marker="o",
+                s=theme.marker_size * 1.75,
+                linewidth=0.8,
+                label=f"95%-confirmed (n={int(confirmed.sum())})",
+                zorder=3,
+            )
+        finite_x = x[np.isfinite(x)]
+        extent = max(
+            threshold * 1.35,
+            float(np.max(np.abs(finite_x))) * 1.12 if finite_x.size else threshold,
+        )
+        ax.set_xlim(-min(1.03, extent), min(1.03, extent))
+        ax.set_ylim(bottom=0)
+        ax.set_xlabel(SELECTIVITY_AXIS_LABEL)
+        ax.set_ylabel(JOINT_AXIS_LABEL)
+        if title:
+            ax.set_title(title)
+        ax.grid(alpha=theme.grid_alpha, linewidth=0.5)
+        ax.legend(frameon=False, fontsize=theme.tick_size, loc="best")
+    return fig, ax
+
+
+def specialist_causal_panels(
+    validation: Mapping[str, Any],
+    *,
+    pair_set: str = "primary",
+    metrics: Sequence[str] = ("restoration", "injection"),
+    theme: FigureTheme = FigureTheme(),
+):
+    """Plot channel-by-specialist cells and their double differences."""
+
+    import matplotlib.pyplot as plt
+
+    pair_sets = list(validation["pair_set_order"])
+    if pair_set not in pair_sets:
+        raise KeyError(f"unknown specialist pair set {pair_set!r}")
+    set_position = pair_sets.index(pair_set)
+    metric_order = list(validation["metric_order"])
+    interval = validation["interval"]
+    estimates = np.asarray(interval.estimate)[set_position]
+    lows = np.asarray(interval.low)[set_position]
+    highs = np.asarray(interval.high)[set_position]
+    labels = {
+        "restoration": "Calibrated aligned restoration",
+        "injection": "Calibrated aligned injection",
+        "necessity_fraction": "Aligned event effect removed (fraction)",
+        "gross_necessity_fraction": "Gross event effect removed (fraction)",
+    }
+    with publication_style(theme):
+        fig, axes = plt.subplots(
+            1,
+            len(metrics),
+            figsize=(theme.width * len(metrics), theme.height),
+            squeeze=False,
+        )
+        for ax, metric in zip(axes[0], metrics):
+            position = metric_order.index(metric)
+            estimate = estimates[position]
+            low = lows[position]
+            high = highs[position]
+            channels = np.arange(2, dtype=np.float64)
+            for values, lower, upper, offset, colour, marker, label in (
+                (
+                    estimate[0:2],
+                    low[0:2],
+                    high[0:2],
+                    -0.08,
+                    theme.semantic_color,
+                    "o",
+                    "Semantic-direction heads",
+                ),
+                (
+                    estimate[2:4],
+                    low[2:4],
+                    high[2:4],
+                    0.08,
+                    theme.structural_color,
+                    "s",
+                    "Structural-direction heads",
+                ),
+            ):
+                ax.errorbar(
+                    channels + offset,
+                    values,
+                    yerr=np.maximum(
+                        0.0,
+                        np.vstack((values - lower, upper - values)),
+                    ),
+                    color=colour,
+                    marker=marker,
+                    markersize=5.5,
+                    linewidth=theme.line_width,
+                    capsize=2.5,
+                    label=label,
+                )
+            interaction = float(estimate[4])
+            interaction_low = float(low[4])
+            interaction_high = float(high[4])
+            ax.text(
+                0.02,
+                0.98,
+                (
+                    r"$\Delta\Delta$="
+                    f"{interaction:.2f} "
+                    f"[{interaction_low:.2f}, {interaction_high:.2f}]"
+                ),
+                transform=ax.transAxes,
+                ha="left",
+                va="top",
+                fontsize=theme.tick_size,
+            )
+            ax.axhline(0, color="#777777", linestyle="--", linewidth=0.8)
+            ax.set_xticks(channels, ("Semantic event", "Structural event"))
+            ax.set_ylabel(labels[metric])
+            ax.set_title(metric.replace("_", " ").title())
+            ax.grid(alpha=theme.grid_alpha, linewidth=0.5)
+        axes[0, 0].legend(frameon=False, fontsize=theme.tick_size, loc="best")
+        fig.suptitle(
+            f"{pair_set.replace('_', ' ').title()} "
+            f"(n={validation['pair_sets'][pair_set]['pair_count']} pairs)",
+            fontsize=theme.title_size,
+        )
+    return fig, axes
 
 
 def selectivity_regime_diagnostics(
@@ -991,7 +1240,7 @@ def causal_scatter_grid(
     import matplotlib.pyplot as plt
     from matplotlib.lines import Line2D
 
-    columns = 3
+    columns = min(3, max(1, len(panels)))
     rows = int(np.ceil(len(panels) / columns))
     layer_max = max(
         (int(np.asarray(panel.get("layer", [0])).max(initial=0)) for panel in panels),
