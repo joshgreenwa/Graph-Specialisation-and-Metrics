@@ -33,6 +33,7 @@ from graph_specialisation_metrics.methodology.graphormer_figure_data import (
     GraphormerDiagnosticExtractor,
     SupplementalCache,
     compute_layer_av_pca_inputs,
+    compute_selected_head_transport_profiles,
     load_graphormer_model_record,
     load_graphormer_score_artifact,
     select_attention_examples_for_grid,
@@ -52,6 +53,7 @@ from graph_specialisation_metrics.methodology.graphormer_figure_plots import (
     plot_hop_attention_mass,
     plot_layer_av_pca_grid,
     plot_logit_spread,
+    plot_routing_transport_profiles,
     plot_score_heatmaps,
     plot_score_plane,
     plot_selectivity_joint_plane,
@@ -94,6 +96,54 @@ def synthetic_metrics() -> CanonicalHeadMetrics:
             "clean_attention_distance": np.full((2, 3, 4), 0.25),
         }
     )
+
+
+def synthetic_transport_scores() -> dict:
+    metrics = synthetic_metrics()
+    fractions = np.asarray([0.10, 0.20, 0.30, 0.40])
+    channels = {}
+    for channel, raw in (
+        ("semantic", metrics.raw_semantic),
+        ("structural", metrics.raw_structural),
+    ):
+        profile = raw[..., None] * fractions
+        graph_contribution = {
+            10: profile * 0.8,
+            20: profile * 1.2,
+        }
+        channels[channel] = {
+            "raw": raw,
+            "graph_distance_contribution": graph_contribution,
+            "distance_support": {
+                "axis": (0, 1, 2, "graph_token"),
+                "reportable": np.ones(4, dtype=bool),
+            },
+            "events": [
+                {
+                    "graph_id": graph_id,
+                    "source": 0,
+                    "draw": 0,
+                    "distance_contribution": contribution,
+                }
+                for graph_id, contribution in graph_contribution.items()
+            ],
+            "resample_source": channel == "structural",
+        }
+    return {
+        "coordinates": SimpleNamespace(
+            raw_semantic=metrics.raw_semantic,
+            raw_structural=metrics.raw_structural,
+            normalized_semantic=metrics.normalized_semantic,
+            normalized_structural=metrics.normalized_structural,
+            joint_sensitivity=metrics.joint_sensitivity,
+            selectivity=metrics.selectivity,
+            active=metrics.active,
+            estimable=metrics.estimable,
+        ),
+        "channels": channels,
+        "axis": (0, 1, 2, "graph_token"),
+        "clean_attention_distance": metrics.clean_attention_distance,
+    }
 
 
 def tiny_graph(config):
@@ -212,6 +262,12 @@ def test_graphormer_figure_notebook_routes_every_grid_through_live_config():
         in source
     )
     assert "attention_{ATTENTION_GRID_NUM_ROWS}x3" not in source
+    assert (
+        "TRANSPORT_PROFILE_HEADS = ((7, 14), (9, 3), (0, 31), (1, 24))"
+        in source
+    )
+    assert "compute_selected_head_transport_profiles(" in source
+    assert "plot_routing_transport_profiles(" in source
 
 
 def test_graphormer_figure_loader_explicitly_accepts_valid_v3_cache(tmp_path):
@@ -365,6 +421,71 @@ def test_supplemental_cache_is_immutable_and_contract_keyed(tmp_path):
     assert not third_hit
     assert calls == [1, 3]
     assert third["value"] == 11
+
+
+def test_selected_head_transport_profiles_reconstruct_normalised_scores():
+    scores = synthetic_transport_scores()
+    heads = ((0, 0), (1, 2))
+    payload = compute_selected_head_transport_profiles(
+        scores,
+        heads,
+        bootstrap=False,
+    )
+
+    assert payload["heads"] == heads
+    assert payload["n_graphs"] == 2
+    assert payload["graph_ids"] == (10, 20)
+    for channel in (
+        "semantic",
+        "structural",
+    ):
+        result = payload["channels"][channel]
+        raw = np.asarray(scores["channels"][channel]["raw"])
+        expected = raw / raw.mean()
+        assert result["replicates"] == 0
+        assert np.all(result["reportable"])
+        assert np.allclose(
+            result["estimate"].sum(axis=-1),
+            [expected[head] for head in heads],
+        )
+        assert np.allclose(result["low"], result["estimate"])
+        assert np.allclose(result["high"], result["estimate"])
+
+
+def test_selected_head_transport_profiles_use_nested_event_bootstrap(monkeypatch):
+    scores = synthetic_transport_scores()
+    heads = ((0, 0), (1, 2))
+    calls = []
+
+    def fake_interval(observations, policy, *, graph_reduce):
+        calls.append((observations, policy))
+        estimate = graph_reduce(
+            np.stack([observation.value for observation in observations])
+        )
+        return SimpleNamespace(
+            estimate=estimate,
+            low=estimate * 0.9,
+            high=estimate * 1.1,
+            replicates=2000,
+            rng_seed=17071,
+            resampled_levels=("graph", "source", "donor"),
+        )
+
+    monkeypatch.setattr(
+        "graph_specialisation_metrics.methodology.graphormer_figure_data."
+        "nested_percentile_interval",
+        fake_interval,
+    )
+    payload = compute_selected_head_transport_profiles(scores, heads)
+
+    assert len(calls) == 2
+    assert all(len(observations) == 2 for observations, _ in calls)
+    assert calls[0][1].resample_source is False
+    assert calls[1][1].resample_source is True
+    assert all(
+        payload["channels"][channel]["replicates"] == 2000
+        for channel in ("semantic", "structural")
+    )
 
 
 def test_graph_local_estimator_normalises_each_graph_independently(monkeypatch):
@@ -673,6 +794,43 @@ def test_hop_plot_separates_graph_token_tick():
         labels = [label.get_text() for label in axis.get_xticklabels()]
         assert labels[-1] == "Graph\ntoken"
         assert ticks[-1] - ticks[-2] > 1.2
+    finally:
+        plt.close(figure)
+
+
+def test_routing_transport_figure_has_four_head_facets_and_uncertainty_bands():
+    scores = synthetic_transport_scores()
+    metrics = CanonicalHeadMetrics.from_scores(scores)
+    heads = ((0, 0), (0, 1), (0, 2), (1, 2))
+    payload = compute_selected_head_transport_profiles(
+        scores,
+        heads,
+        bootstrap=False,
+    )
+    figure = plot_routing_transport_profiles(metrics, payload)
+    try:
+        assert np.allclose(figure.get_size_inches(), (17.0, 8.5))
+        assert len(figure.axes) == 8
+        assert [axis.get_title().splitlines()[0] for axis in figure.axes[:4]] == [
+            "L0 H0",
+            "L0 H1",
+            "L0 H2",
+            "L1 H2",
+        ]
+        assert figure.axes[0].get_ylabel() == "Mean clean attention mass"
+        assert figure.axes[4].get_ylabel() == "Normalised transport response"
+        bands = [
+            collection
+            for axis in figure.axes[4:]
+            for collection in axis.collections
+            if isinstance(collection, PolyCollection)
+        ]
+        assert len(bands) == 8
+        assert len(figure.legends) == 1
+        assert [text.get_text() for text in figure.legends[0].get_texts()] == [
+            "Semantic intervention",
+            "Structural intervention",
+        ]
     finally:
         plt.close(figure)
 

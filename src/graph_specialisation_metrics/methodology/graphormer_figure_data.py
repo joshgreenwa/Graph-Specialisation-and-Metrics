@@ -20,6 +20,7 @@ from typing import Any, Callable, Mapping, Sequence
 
 import numpy as np
 
+from .bootstrap import Observation, nested_percentile_interval
 from .cache import (
     ReadOnlyCacheArtifact,
     StaleCacheError,
@@ -33,6 +34,7 @@ from .graphormer import (
     build_graphormer_runtime,
 )
 from .protocol import (
+    BootstrapPolicy,
     ExecutionPolicy,
     MethodologyConfig,
     RunSizes,
@@ -45,6 +47,9 @@ from .tasks import get_task
 
 
 Head = tuple[int, int]
+SELECTED_HEAD_TRANSPORT_PROFILE_VERSION = (
+    "selected-head-transport-response-by-carrier-distance-v1"
+)
 
 
 def _as_numpy(value: Any, *, dtype=None) -> np.ndarray:
@@ -277,6 +282,207 @@ def validate_head(head: Head, shape: tuple[int, int]) -> Head:
     if not (0 <= layer < shape[0] and 0 <= index < shape[1]):
         raise IndexError(f"head {(layer, index)} is outside canonical shape {shape}")
     return layer, index
+
+
+def compute_selected_head_transport_profiles(
+    scores: Mapping[str, Any],
+    heads: Sequence[Head],
+    *,
+    bootstrap: bool = True,
+    seed: int = 0,
+) -> dict[str, Any]:
+    """Resolve selected heads' score mass by carrier distance.
+
+    Each curve is the exact additive distance decomposition of the canonical
+    transport score. Semantic and structural curves are divided by the same
+    fixed within-model channel means used to construct ``D_rel`` and ``J``;
+    consequently, a head's curve sums to its corresponding normalised channel
+    score. When requested, uncertainty follows the registered
+    seed->graph->source->donor bootstrap, using only sufficient statistics
+    already stored in the score cache.
+    """
+
+    metrics = CanonicalHeadMetrics.from_scores(scores)
+    selected = tuple(validate_head(head, metrics.shape) for head in heads)
+    if not selected:
+        raise ValueError("at least one head is required")
+    if len(set(selected)) != len(selected):
+        raise ValueError("selected transport-profile heads must be unique")
+    axis = tuple(str(label) for label in scores.get("axis", ()))
+    if not axis:
+        raise ValueError("score cache has no carrier-distance axis")
+
+    channels = scores.get("channels")
+    if not isinstance(channels, Mapping):
+        raise ValueError("score cache has no channel sufficient statistics")
+
+    result_channels: dict[str, Any] = {}
+    channel_graph_ids: dict[str, tuple[int, ...]] = {}
+    for channel in ("semantic", "structural"):
+        channel_scores = channels.get(channel)
+        if not isinstance(channel_scores, Mapping):
+            raise ValueError(f"score cache has no {channel!r} channel")
+        raw = _as_numpy(channel_scores.get("raw"), dtype=np.float64)
+        if raw.shape != metrics.shape:
+            raise ValueError(
+                f"{channel} raw scores have shape {raw.shape}; expected {metrics.shape}"
+            )
+        scale = float(np.mean(raw))
+        if not np.isfinite(scale) or scale <= 0:
+            raise ValueError(f"{channel} within-model normalisation is not positive")
+
+        graph_contribution = channel_scores.get("graph_distance_contribution")
+        if not isinstance(graph_contribution, Mapping) or not graph_contribution:
+            raise ValueError(
+                f"{channel} score cache has no graph-distance contributions"
+            )
+        graph_ids = tuple(sorted(int(value) for value in graph_contribution))
+        channel_graph_ids[channel] = graph_ids
+        graph_rows = []
+        for graph_id in graph_ids:
+            contribution = _as_numpy(
+                graph_contribution[graph_id], dtype=np.float64
+            )
+            expected = metrics.shape + (len(axis),)
+            if contribution.shape != expected:
+                raise ValueError(
+                    f"{channel} graph {graph_id} distance contribution has shape "
+                    f"{contribution.shape}; expected {expected}"
+                )
+            graph_rows.append(
+                np.stack([contribution[layer, head] for layer, head in selected])
+            )
+        point = np.stack(graph_rows).mean(axis=0)
+        selected_raw = np.asarray(
+            [raw[layer, head] for layer, head in selected], dtype=np.float64
+        )
+        reconstructed = point.sum(axis=-1)
+        if not np.allclose(
+            reconstructed,
+            selected_raw,
+            rtol=2e-5,
+            atol=1e-8,
+            equal_nan=True,
+        ):
+            residual = float(np.nanmax(np.abs(reconstructed - selected_raw)))
+            raise ValueError(
+                f"{channel} carrier-distance profiles do not reconstruct selected "
+                f"head scores (max residual {residual:.3e})"
+            )
+
+        support = channel_scores.get("distance_support")
+        if not isinstance(support, Mapping) or "reportable" not in support:
+            raise ValueError(
+                f"{channel} score cache has no registered distance-reporting mask"
+            )
+        support_axis = tuple(str(label) for label in support.get("axis", axis))
+        if support_axis != axis:
+            raise ValueError(
+                f"{channel} support axis {support_axis} does not match {axis}"
+            )
+        reportable = _as_numpy(support["reportable"], dtype=bool)
+        if reportable.shape != (len(axis),):
+            raise ValueError(
+                f"{channel} reporting mask has shape {reportable.shape}; "
+                f"expected {(len(axis),)}"
+            )
+
+        normalised_point = point / scale
+        if bootstrap:
+            events = channel_scores.get("events")
+            if not isinstance(events, Sequence) or not events:
+                raise ValueError(
+                    f"{channel} score cache has no event table for uncertainty"
+                )
+            observations: list[Observation] = []
+            for row in events:
+                contribution = _as_numpy(
+                    row["distance_contribution"], dtype=np.float64
+                )
+                expected = metrics.shape + (len(axis),)
+                if contribution.shape != expected:
+                    raise ValueError(
+                        f"{channel} event contribution has shape "
+                        f"{contribution.shape}; expected {expected}"
+                    )
+                observations.append(
+                    Observation(
+                        seed=int(seed),
+                        graph=int(row["graph_id"]),
+                        source=int(row["source"]),
+                        donor=int(row["draw"]),
+                        value=np.stack(
+                            [
+                                contribution[layer, head]
+                                for layer, head in selected
+                            ]
+                        ),
+                    )
+                )
+            policy = BootstrapPolicy(
+                resample_source=bool(
+                    channel_scores.get("resample_source", True)
+                )
+            )
+            interval = nested_percentile_interval(
+                observations,
+                policy,
+                graph_reduce=lambda rows: np.mean(rows, axis=0),
+            )
+            if not np.allclose(
+                interval.estimate,
+                point,
+                rtol=2e-5,
+                atol=1e-8,
+                equal_nan=True,
+            ):
+                raise ValueError(
+                    f"{channel} event table does not reconstruct graph-level "
+                    "distance contributions"
+                )
+            low = np.asarray(interval.low, dtype=np.float64) / scale
+            high = np.asarray(interval.high, dtype=np.float64) / scale
+            interval_metadata = {
+                "replicates": int(interval.replicates),
+                "rng_seed": int(interval.rng_seed),
+                "resampled_levels": tuple(interval.resampled_levels),
+            }
+        else:
+            low = normalised_point.copy()
+            high = normalised_point.copy()
+            interval_metadata = {
+                "replicates": 0,
+                "rng_seed": None,
+                "resampled_levels": (),
+            }
+
+        result_channels[channel] = {
+            "estimate": normalised_point,
+            "low": low,
+            "high": high,
+            "reportable": reportable,
+            "normalisation_mean": scale,
+            "normalised_head_total": selected_raw / scale,
+            "raw_head_total": selected_raw,
+            "reconstruction_max_abs": float(
+                np.max(np.abs(reconstructed - selected_raw))
+            ),
+            **interval_metadata,
+        }
+
+    if channel_graph_ids["semantic"] != channel_graph_ids["structural"]:
+        raise ValueError(
+            "semantic and structural transport profiles use different graph IDs"
+        )
+    return {
+        "estimator": SELECTED_HEAD_TRANSPORT_PROFILE_VERSION,
+        "heads": selected,
+        "axis": axis,
+        "graph_ids": channel_graph_ids["semantic"],
+        "n_graphs": len(channel_graph_ids["semantic"]),
+        "normalisation": "fixed within-model channel mean used by D_rel and J",
+        "channels": result_channels,
+    }
 
 
 def select_specialist_heads(
@@ -1326,12 +1532,14 @@ __all__ = [
     "GraphormerFigureRuntime",
     "GraphormerPerGraphCoordinateEstimator",
     "Head",
+    "SELECTED_HEAD_TRANSPORT_PROFILE_VERSION",
     "SupplementalCache",
     "aggregate_logit_spread",
     "build_verified_figure_runtime",
     "collect_attention_examples",
     "compute_av_pca_inputs",
     "compute_layer_av_pca_inputs",
+    "compute_selected_head_transport_profiles",
     "graph_at_dataset_index",
     "label_attention_focus",
     "load_graphormer_model_record",
