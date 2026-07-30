@@ -109,9 +109,23 @@ def bootstrap() -> None:
         REPOSITORY_URL,
     )
     command(sys.executable, "-m", "pip", "install", "-q", "-e", str(COLAB_REPOSITORY))
-    source = str(COLAB_REPOSITORY / "src")
-    if source not in sys.path:
-        sys.path.insert(0, source)
+    source_path = (COLAB_REPOSITORY / "src").resolve()
+    backend_path = (
+        source_path
+        / "graph_specialisation_metrics"
+        / "synthetic"
+        / "saturation_carriage.py"
+    )
+    if not backend_path.is_file():
+        raise RuntimeError(
+            f"Checked-out branch {REPOSITORY_BRANCH!r} does not contain {backend_path}"
+        )
+
+    # Colab can retain an older editable checkout earlier on sys.path. Always move this
+    # checkout to the front, even when its path is already present elsewhere in the list.
+    source = str(source_path)
+    sys.path[:] = [entry for entry in sys.path if entry != source]
+    sys.path.insert(0, source)
     for module_name in tuple(sys.modules):
         if module_name == "graph_specialisation_metrics" or module_name.startswith(
             "graph_specialisation_metrics."
