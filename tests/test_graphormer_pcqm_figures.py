@@ -199,6 +199,7 @@ def test_graphormer_figure_notebook_routes_every_grid_through_live_config():
     ) in source
     assert "select_attention_examples_for_grid(" in source
     assert "rendering {len(graph_indices)} rows" in source
+    assert "del sys.modules[module_name]" in source
     assert (
         'attention_stem = f"{role}_head_{head[0]}_{head[1]}_attention_grid"'
         in source
