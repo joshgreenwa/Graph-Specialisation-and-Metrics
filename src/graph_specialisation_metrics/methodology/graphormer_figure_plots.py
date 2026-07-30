@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections import Counter
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 import io
 import json
 
@@ -1069,11 +1069,24 @@ def save_figure_bundle(
     *,
     metadata: Mapping[str, Any] | None = None,
     dpi: int = 600,
+    supersede_stem_globs: Sequence[str] = (),
 ) -> dict[str, Path]:
-    """Save a high-resolution PNG, vector PDF, and provenance sidecar."""
+    """Save a high-resolution PNG, vector PDF, and provenance sidecar.
+
+    ``supersede_stem_globs`` removes replaceable figure bundles only after the
+    new bundle has been written successfully. Patterns are restricted to direct
+    children of the output directory and to the three generated file types.
+    """
 
     directory = Path(output_directory)
     directory.mkdir(parents=True, exist_ok=True)
+    supersede_patterns = tuple(str(pattern) for pattern in supersede_stem_globs)
+    for pattern in supersede_patterns:
+        if Path(pattern).name != pattern:
+            raise ValueError(
+                "superseded figure patterns must be direct filename globs, "
+                f"got {pattern!r}"
+            )
     paths = {
         "png": directory / f"{stem}.png",
         "pdf": directory / f"{stem}.pdf",
@@ -1096,6 +1109,16 @@ def save_figure_bundle(
         + "\n",
         encoding="utf-8",
     )
+    current_paths = {path.resolve() for path in paths.values()}
+    generated_suffixes = {".png", ".pdf", ".json"}
+    for pattern in supersede_patterns:
+        for candidate in directory.glob(pattern):
+            if (
+                candidate.is_file()
+                and candidate.suffix.lower() in generated_suffixes
+                and candidate.resolve() not in current_paths
+            ):
+                candidate.unlink()
     return paths
 
 

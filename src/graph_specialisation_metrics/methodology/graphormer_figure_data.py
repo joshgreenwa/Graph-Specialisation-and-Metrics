@@ -352,7 +352,50 @@ def select_attention_grid_indices(
             f"attention grid needs {num_rows} graph indices, but only "
             f"{len(indices)} were configured"
         )
-    return indices[:num_rows]
+    selected = indices[:num_rows]
+    if len(set(selected)) != len(selected):
+        raise ValueError(
+            "attention-grid graph indices must be unique within the displayed rows"
+        )
+    return selected
+
+
+def select_attention_examples_for_grid(
+    payload: Mapping[str, Any],
+    *,
+    graph_indices: Sequence[int],
+) -> dict[str, Any]:
+    """Return examples in the exact configured order and row count.
+
+    The supplemental-cache contract normally prevents a payload for one graph
+    selection from being reused for another. This additional boundary check
+    ensures a stale or manually copied cache can never silently control the
+    rendered rows.
+    """
+
+    expected = [int(value) for value in graph_indices]
+    if not expected:
+        raise ValueError("attention-grid graph indices must not be empty")
+    if len(set(expected)) != len(expected):
+        raise ValueError("attention-grid graph indices must be unique")
+    examples = list(payload.get("examples", ()))
+    by_index: dict[int, Mapping[str, Any]] = {}
+    for example in examples:
+        graph_index = int(example["dataset_index"])
+        if graph_index in by_index:
+            raise ValueError(
+                f"attention payload contains duplicate PCQM index {graph_index}"
+            )
+        by_index[graph_index] = example
+    missing = [index for index in expected if index not in by_index]
+    if missing:
+        raise ValueError(
+            "attention payload does not contain the configured PCQM indices "
+            f"{missing}; cached indices are {sorted(by_index)}"
+        )
+    selected = dict(payload)
+    selected["examples"] = [by_index[index] for index in expected]
+    return selected
 
 
 def select_ranked_heads(
@@ -1294,6 +1337,7 @@ __all__ = [
     "load_graphormer_model_record",
     "load_graphormer_score_artifact",
     "select_attention_grid_indices",
+    "select_attention_examples_for_grid",
     "select_ranked_heads",
     "select_specialist_heads",
     "select_structural_specialist_head",

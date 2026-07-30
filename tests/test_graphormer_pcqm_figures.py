@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import matplotlib
@@ -33,6 +34,7 @@ from graph_specialisation_metrics.methodology.graphormer_figure_data import (
     compute_layer_av_pca_inputs,
     load_graphormer_model_record,
     load_graphormer_score_artifact,
+    select_attention_examples_for_grid,
     select_attention_grid_indices,
     select_ranked_heads,
     select_specialist_heads,
@@ -133,6 +135,10 @@ def test_structural_selection_can_exclude_an_entire_head_index():
 
 def test_attention_grid_indices_require_enough_rows_and_truncate_extras():
     assert select_attention_grid_indices(
+        [11, 22, 33, 44, 55],
+        num_rows=4,
+    ) == [11, 22, 33, 44]
+    assert select_attention_grid_indices(
         [0, 5, 80, 100, 200, 300],
         num_rows=5,
     ) == [0, 5, 80, 100, 200]
@@ -140,6 +146,64 @@ def test_attention_grid_indices_require_enough_rows_and_truncate_extras():
         select_attention_grid_indices([0, 5, 80], num_rows=5)
     with pytest.raises(ValueError, match="must be positive"):
         select_attention_grid_indices([0], num_rows=0)
+    with pytest.raises(ValueError, match="must be unique"):
+        select_attention_grid_indices([0, 5, 5, 80], num_rows=4)
+
+
+def test_attention_grid_payload_is_reordered_and_trimmed_to_configuration():
+    payload = {
+        "heads": {"semantic": (1, 24)},
+        "examples": [
+            {"dataset_index": index, "value": f"graph-{index}"}
+            for index in (200, 80, 0, 100, 5)
+        ],
+    }
+    selected = select_attention_examples_for_grid(
+        payload,
+        graph_indices=[5, 100, 0, 80],
+    )
+
+    assert payload["examples"][0]["dataset_index"] == 200
+    assert selected["heads"] == payload["heads"]
+    assert [example["dataset_index"] for example in selected["examples"]] == [
+        5,
+        100,
+        0,
+        80,
+    ]
+    with pytest.raises(ValueError, match="does not contain"):
+        select_attention_examples_for_grid(
+            payload,
+            graph_indices=[5, 999],
+        )
+
+
+def test_graphormer_figure_notebook_routes_every_grid_through_live_config():
+    notebook_path = (
+        Path(__file__).parents[1]
+        / "experiments"
+        / "methodology"
+        / "graphormer_pcqm4mv2_figures_colab.ipynb"
+    )
+    notebook = json.loads(notebook_path.read_text())
+    source = "\n".join(
+        "".join(cell.get("source", ()))
+        for cell in notebook["cells"]
+        if cell.get("cell_type") == "code"
+    )
+
+    assert "ATTENTION_GRID_NUM_ROWS = 4" in source
+    assert (
+        "ATTENTION_GRID_GRAPH_INDICES[role],\n"
+        "        num_rows=ATTENTION_GRID_NUM_ROWS"
+    ) in source
+    assert "select_attention_examples_for_grid(" in source
+    assert "rendering {len(graph_indices)} rows" in source
+    assert (
+        'attention_stem = f"{role}_head_{head[0]}_{head[1]}_attention_grid"'
+        in source
+    )
+    assert "attention_{ATTENTION_GRID_NUM_ROWS}x3" not in source
 
 
 def test_graphormer_figure_loader_explicitly_accepts_valid_v3_cache(tmp_path):
@@ -518,6 +582,36 @@ def test_figure_bundle_saves_png_pdf_and_provenance_in_target_folder(tmp_path):
     )
 
 
+def test_figure_bundle_removes_only_superseded_generated_outputs(tmp_path):
+    target = tmp_path / "semantic_specialists"
+    target.mkdir()
+    legacy_stem = "semantic_head_1_24_attention_5x3"
+    for suffix in (".png", ".pdf", ".json"):
+        (target / f"{legacy_stem}{suffix}").write_text("replaceable")
+    unrelated = target / "semantic_head_1_24_attention_notes.txt"
+    unrelated.write_text("keep")
+    figure = plot_score_plane(synthetic_metrics())
+    try:
+        paths = save_figure_bundle(
+            figure,
+            target,
+            "semantic_head_1_24_attention_grid",
+            dpi=72,
+            supersede_stem_globs=(
+                "semantic_head_1_24_attention_*x3.*",
+            ),
+        )
+    finally:
+        plt.close(figure)
+
+    assert all(path.is_file() for path in paths.values())
+    assert not any(
+        (target / f"{legacy_stem}{suffix}").exists()
+        for suffix in (".png", ".pdf", ".json")
+    )
+    assert unrelated.read_text() == "keep"
+
+
 def test_hop_plot_separates_graph_token_tick():
     figure = plot_hop_attention_mass(synthetic_metrics(), (0, 0))
     try:
@@ -640,6 +734,50 @@ def test_attention_grid_supports_five_rows_without_arrows():
         assert "J = 1.110" in labels
         assert "J = 0.840" in labels
         assert labels.count("Graph-local") == 5
+    finally:
+        plt.close(figure)
+
+
+def test_attention_grid_renders_exactly_four_configured_rows_in_order():
+    pytest.importorskip("rdkit")
+    attention = np.full((4, 4), 0.25)
+    payload = select_attention_examples_for_grid(
+        {
+            "examples": [
+                {
+                    "dataset_index": index,
+                    "smiles": "CCO",
+                    "attention": {"semantic": attention},
+                }
+                for index in (0, 5, 80, 100, 200)
+            ]
+        },
+        graph_indices=(200, 5, 100, 0),
+    )
+    coordinates = {
+        index: {"D_rel": index / 1000.0, "J": 1.0}
+        for index in (200, 5, 100, 0)
+    }
+    figure = plot_attention_grid(
+        payload,
+        role="semantic",
+        head=(1, 24),
+        per_graph_coordinates=coordinates,
+        net_d_rel=0.4,
+        net_joint_sensitivity=1.2,
+    )
+    try:
+        labels = [
+            text.get_text()
+            for axis in figure.axes
+            for text in axis.texts
+            if "Graph-local" in text.get_text()
+        ]
+        assert len(labels) == 4
+        assert [
+            int(label.splitlines()[0].removeprefix("PCQM index "))
+            for label in labels
+        ] == [200, 5, 100, 0]
     finally:
         plt.close(figure)
 
