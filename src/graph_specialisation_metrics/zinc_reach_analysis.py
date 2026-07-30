@@ -44,7 +44,7 @@ from .methodology.runner import prepare_task
 from .methodology.sampling import sample_sources
 
 
-ANALYSIS_VERSION = "zinc-bamberger-functional-reach-v1"
+ANALYSIS_VERSION = "zinc-bamberger-functional-reach-v2"
 TASKS = ("zinc_1hop", "zinc_2hop", "zinc_1hop_vnode", "zinc")
 TASK_LABELS = {
     "zinc_1hop": "1-hop GRIT",
@@ -83,7 +83,7 @@ class ZincReachConfig:
     semantic_donor_graphs: int = 256
     bamberger_output_nodes: int = 6
     bamberger_output_channels: int = 8
-    local_epsilon: float = 5.0e-4
+    local_epsilon: float = 5.0e-3
     effect_floor: float = 1.0e-12
     bootstrap_replicates: int = 2_000
     analysis_seed: int = 91_021
@@ -131,7 +131,9 @@ class ZincReachConfig:
             ),
             "local_estimand": (
                 "centered derivative at the clean encoded input along the exact "
-                "clean-minus-donor direction, projected through the same output Jacobian"
+                "clean-minus-donor direction, projected through the same output Jacobian; "
+                "hold clean discrete attention support fixed when a structural donor "
+                "changes sparse support"
             ),
             "bamberger_estimand": (
                 "mean node-level pre-pooling range from entrywise-absolute Jacobians "
@@ -155,6 +157,7 @@ class EncodedDirection:
     real_mask: Any
     repetitions: int
     real_nodes: int
+    support_changed: bool
 
 
 def _write_json(path: Path, payload: Mapping[str, Any]) -> None:
@@ -356,13 +359,75 @@ def _after_feature_encoder(prepared: Any, graphs: Sequence[Any]) -> tuple[Any, A
     return encoded, raw_atoms, embedding
 
 
-def _finish_encoding(net: Any, after_encoder: Any) -> Any:
-    """Run RRWP, optional pre-MP, and optional VNode up to the layer input."""
+def _align_edge_attributes(
+    source_index: Any,
+    source_attr: Any,
+    target_index: Any,
+    *,
+    num_nodes: int,
+) -> Any:
+    """Place encoded edge attributes on a fixed target support, zero-filling new pairs."""
+
+    import torch
+
+    if int(source_index.shape[1]) == 0:
+        return source_attr.new_zeros(
+            (int(target_index.shape[1]), int(source_attr.shape[1]))
+        )
+    source_linear = (
+        source_index[0].to(torch.long) * int(num_nodes)
+        + source_index[1].to(torch.long)
+    )
+    target_linear = (
+        target_index[0].to(torch.long) * int(num_nodes)
+        + target_index[1].to(torch.long)
+    )
+    order = torch.argsort(source_linear)
+    sorted_linear = source_linear[order]
+    positions = torch.searchsorted(sorted_linear, target_linear)
+    valid = positions < int(sorted_linear.numel())
+    safe_positions = positions.clamp(max=int(sorted_linear.numel()) - 1)
+    valid = valid & (sorted_linear[safe_positions] == target_linear)
+    result = source_attr.new_zeros(
+        (int(target_index.shape[1]), int(source_attr.shape[1]))
+    )
+    if bool(valid.any()):
+        result[valid] = source_attr[order[safe_positions[valid]]]
+    return result
+
+
+def _finish_encoding(
+    net: Any,
+    after_encoder: Any,
+    *,
+    support_override: Any | None = None,
+) -> Any:
+    """Run positional encoders, optionally holding the clean sparse support fixed."""
 
     data = after_encoder
     if hasattr(net, "rrwp_abs_encoder"):
         data = net.rrwp_abs_encoder(data)
-        data = net.rrwp_rel_encoder(data)
+        relative = net.rrwp_rel_encoder
+        if support_override is None:
+            data = relative(data)
+        else:
+            if not hasattr(relative, "max_hops"):
+                raise RuntimeError(
+                    "support override requested for an encoder without a k-hop mask"
+                )
+            data.edge_attr = _align_edge_attributes(
+                data.edge_index,
+                data.edge_attr,
+                support_override,
+                num_nodes=int(data.num_nodes),
+            )
+            data.edge_index = support_override
+            max_hops = relative.max_hops
+            relative.max_hops = None
+            try:
+                data = relative(data)
+            finally:
+                relative.max_hops = max_hops
     if hasattr(net, "pre_mp"):
         data = net.pre_mp(data)
     global_vnode = getattr(net, "global_vnode", None)
@@ -371,9 +436,18 @@ def _finish_encoding(net: Any, after_encoder: Any) -> Any:
     return data
 
 
-def _layer_input(prepared: Any, graphs: Sequence[Any]) -> Any:
+def _layer_input(
+    prepared: Any,
+    graphs: Sequence[Any],
+    *,
+    support_override: Any | None = None,
+) -> Any:
     after_encoder, _, _ = _after_feature_encoder(prepared, graphs)
-    return _finish_encoding(prepared.runtime.model.model, after_encoder)
+    return _finish_encoding(
+        prepared.runtime.model.model,
+        after_encoder,
+        support_override=support_override,
+    )
 
 
 def _real_mask(data: Any) -> Any:
@@ -398,9 +472,24 @@ def _encoded_direction(
         raise ValueError("clean and event graph batches must be non-empty and aligned")
     clean = _layer_input(prepared, clean_graphs)
     event = _layer_input(prepared, event_graphs)
+    support_changed = not torch.equal(clean.edge_index, event.edge_index)
+    if support_changed:
+        clean_mask = _real_mask(clean)
+        real_edges = (
+            clean_mask[clean.edge_index[0]]
+            & clean_mask[clean.edge_index[1]]
+        )
+        clean_real_support = clean.edge_index[:, real_edges]
+        event = _layer_input(
+            prepared,
+            event_graphs,
+            support_override=clean_real_support,
+        )
     for name in ("edge_index", "batch"):
         if not torch.equal(getattr(clean, name), getattr(event, name)):
-            raise RuntimeError(f"donor event changed encoded {name}")
+            raise RuntimeError(
+                f"clean-support local encoding did not align {name}"
+            )
     clean_mask = _real_mask(clean)
     event_mask = _real_mask(event)
     if not torch.equal(clean_mask, event_mask):
@@ -414,6 +503,7 @@ def _encoded_direction(
         real_mask=clean_mask,
         repetitions=len(clean_graphs),
         real_nodes=int(clean_graphs[0].num_nodes),
+        support_changed=support_changed,
     )
 
 
@@ -431,8 +521,8 @@ def centered_final_direction(
     event_graphs: Sequence[Any],
     *,
     epsilon: float,
-) -> tuple[Any, float]:
-    """Centered local derivative of final real-node states with an epsilon audit."""
+) -> tuple[Any, dict[str, Any]]:
+    """Stable centered derivative with an epsilon audit and fixed clean support."""
 
     import torch
 
@@ -457,26 +547,43 @@ def centered_final_direction(
             )
         return (plus - minus) / (2.0 * step)
 
-    fine = evaluate(float(epsilon))
-    coarse = evaluate(float(epsilon) * 2.0)
-    if not bool(torch.isfinite(fine).all() and torch.isfinite(coarse).all()):
+    steps = (float(epsilon) * 2.0, float(epsilon), float(epsilon) / 2.0)
+    derivatives = tuple(evaluate(step) for step in steps)
+    if not all(bool(torch.isfinite(value).all()) for value in derivatives):
         raise RuntimeError("non-finite centered donor-direction derivative")
-    numerator = torch.linalg.vector_norm((fine - coarse).reshape(-1))
-    denominator = torch.linalg.vector_norm(fine.reshape(-1)).clamp_min(1.0e-12)
-    relative_error = float((numerator / denominator).detach().cpu())
+    errors: list[float] = []
+    for coarse, fine in zip(derivatives[:-1], derivatives[1:]):
+        numerator = torch.linalg.vector_norm((fine - coarse).reshape(-1))
+        denominator = torch.linalg.vector_norm(fine.reshape(-1)).clamp_min(1.0e-12)
+        errors.append(float((numerator / denominator).detach().cpu()))
+    selected_pair = int(np.argmin(np.asarray(errors, dtype=np.float64)))
+    selected = derivatives[selected_pair + 1]
+    selected_epsilon = steps[selected_pair + 1]
+    relative_error = errors[selected_pair]
     expected_rows = direction.repetitions * direction.real_nodes
-    if int(fine.shape[0]) != expected_rows:
+    if int(selected.shape[0]) != expected_rows:
         raise RuntimeError(
-            f"local derivative returned {int(fine.shape[0])} real rows; "
+            f"local derivative returned {int(selected.shape[0])} real rows; "
             f"expected {expected_rows}"
         )
     return (
-        fine.reshape(
+        selected.reshape(
             direction.repetitions,
             direction.real_nodes,
-            int(fine.shape[-1]),
+            int(selected.shape[-1]),
         ).detach(),
-        relative_error,
+        {
+            "requested_epsilon": float(epsilon),
+            "selected_epsilon": float(selected_epsilon),
+            "epsilon_halving_relative_error": float(relative_error),
+            "candidate_relative_errors": errors,
+            "support_policy": (
+                "clean_discrete_support"
+                if direction.support_changed
+                else "unchanged_support"
+            ),
+            "support_changed": bool(direction.support_changed),
+        },
     )
 
 
@@ -600,11 +707,14 @@ def _donor_rows(
 
     capture = prepared.backend.capture_groups([[base, *variants]])[0]
     finite_change = clean_jacobians.capture.final_state.unsqueeze(0) - capture.final_state[1:]
-    local_change, relative_error = centered_final_direction(
+    local_change, derivative_diagnostic = centered_final_direction(
         prepared,
         [base for _ in variants],
         variants,
         epsilon=float(config.local_epsilon),
+    )
+    relative_error = float(
+        derivative_diagnostic["epsilon_halving_relative_error"]
     )
     gradient = clean_jacobians.final_state
     finite_mass = _project_final_change(finite_change, gradient)
@@ -656,9 +766,8 @@ def _donor_rows(
         "graph": int(graph_id),
         "channel": channel,
         "method": "centered_difference",
-        "epsilon": float(config.local_epsilon),
-        "epsilon_halving_relative_error": relative_error,
         "events": int(len(events)),
+        **derivative_diagnostic,
     }
     return rows, diagnostic
 
@@ -1580,7 +1689,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--semantic-donor-graphs", type=int, default=256)
     parser.add_argument("--bamberger-output-nodes", type=int, default=6)
     parser.add_argument("--bamberger-output-channels", type=int, default=8)
-    parser.add_argument("--local-epsilon", type=float, default=5.0e-4)
+    parser.add_argument("--local-epsilon", type=float, default=5.0e-3)
     parser.add_argument("--effect-floor", type=float, default=1.0e-12)
     parser.add_argument("--bootstrap-replicates", type=int, default=2_000)
     parser.add_argument("--analysis-seed", type=int, default=91_021)

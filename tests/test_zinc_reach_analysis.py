@@ -5,6 +5,7 @@ import pytest
 from graph_specialisation_metrics.zinc_reach_analysis import (
     TASKS,
     ZincReachConfig,
+    _align_edge_attributes,
     discover_seed_checkpoint,
     figures,
     finite_local_tv,
@@ -12,6 +13,25 @@ from graph_specialisation_metrics.zinc_reach_analysis import (
     graph_donor_profiles,
     summarise_graph_profiles,
 )
+
+
+def test_clean_support_edge_alignment_preserves_matches_and_zero_fills():
+    torch = pytest.importorskip("torch")
+    source_index = torch.tensor([[0, 1], [1, 0]])
+    source_attr = torch.tensor([[2.0, 3.0], [5.0, 7.0]])
+    target_index = torch.tensor([[0, 0, 1], [0, 1, 0]])
+
+    aligned = _align_edge_attributes(
+        source_index,
+        source_attr,
+        target_index,
+        num_nodes=2,
+    )
+
+    assert torch.equal(
+        aligned,
+        torch.tensor([[0.0, 0.0], [2.0, 3.0], [5.0, 7.0]]),
+    )
 
 
 def test_discover_seed_checkpoint_prefers_recovery_best(tmp_path: Path):
