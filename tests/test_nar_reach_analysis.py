@@ -169,6 +169,25 @@ def test_local_comparator_is_clean_directional_jvp_not_finite_difference():
     assert tangent.values[0][0, 1, 0, 0].item() == pytest.approx(0.0)
 
 
+def test_nonfinite_exact_jvp_uses_audited_centered_fallback(monkeypatch):
+    def nonfinite_jvp(function, primals, _tangents, **_kwargs):
+        output = function(*primals)
+        return output, tuple(torch.full_like(value, torch.nan) for value in output)
+
+    monkeypatch.setattr(torch.autograd.functional, "jvp", nonfinite_jvp)
+
+    tangent = _encoded_transport_jvp(
+        _ToyModel(),
+        [_toy_graph(2)],
+        [_toy_graph(1)],
+    )
+
+    assert tangent.method == "centred_difference_fallback:FloatingPointError"
+    assert tangent.relative_error is not None
+    assert tangent.values[0][0, 0, 0, 0].item() == pytest.approx(4.0, rel=1.0e-3)
+    assert torch.isfinite(tangent.values[0]).all()
+
+
 def test_clean_reach_capture_reuses_one_graph_for_carrier_and_input_jacobians():
     model = _ToyModel()
 

@@ -336,6 +336,21 @@ def _encoded_transport_jvp(
             raise RuntimeError("NAR routed-message hook did not fire during JVP")
         return tuple(routed)
 
+    def centred(epsilon: float) -> tuple[Any, ...]:
+        with torch.no_grad():
+            plus = forward(
+                clean_x + epsilon * direction_x,
+                clean_edge + epsilon * direction_edge,
+            )
+            minus = forward(
+                clean_x - epsilon * direction_x,
+                clean_edge - epsilon * direction_edge,
+            )
+        return tuple(
+            (positive - negative) / (2.0 * epsilon)
+            for positive, negative in zip(plus, minus)
+        )
+
     method = "exact_autograd_jvp"
     relative_error: float | None = None
     try:
@@ -347,29 +362,22 @@ def _encoded_transport_jvp(
                 create_graph=False,
                 strict=False,
             )
-        except (NotImplementedError, RuntimeError) as error:
-            # Some torch-scatter/PyG builds do not expose the second derivatives used by
-            # torch.autograd.functional.jvp. A centered local difference is an auditable
-            # numerical Jacobian-vector product, not the finite donor endpoint response.
-            method = f"centred_difference_fallback:{type(error).__name__}"
-
-            def centred(epsilon: float) -> tuple[Any, ...]:
-                with torch.no_grad():
-                    plus = forward(
-                        clean_x + epsilon * direction_x,
-                        clean_edge + epsilon * direction_edge,
-                    )
-                    minus = forward(
-                        clean_x - epsilon * direction_x,
-                        clean_edge - epsilon * direction_edge,
-                    )
-                return tuple(
-                    (positive - negative) / (2.0 * epsilon)
-                    for positive, negative in zip(plus, minus)
+            if not all(bool(torch.isfinite(value).all()) for value in tangent):
+                raise FloatingPointError(
+                    "exact GRIT JVP returned non-finite routed-message derivatives"
                 )
-
+        except (FloatingPointError, NotImplementedError, RuntimeError) as error:
+            # Some torch-scatter/PyG builds do not expose the second derivatives used by
+            # torch.autograd.functional.jvp; others return non-finite values without raising.
+            # A centered local difference is an auditable numerical Jacobian-vector product,
+            # not the finite donor endpoint response.
+            method = f"centred_difference_fallback:{type(error).__name__}"
             coarse = centred(1.0e-3)
             tangent = centred(5.0e-4)
+            if not all(bool(torch.isfinite(value).all()) for value in tangent):
+                raise RuntimeError(
+                    "centered local derivative also returned non-finite transport"
+                ) from error
             numerator = torch.sqrt(
                 sum((left - right).square().sum() for left, right in zip(coarse, tangent))
             )
