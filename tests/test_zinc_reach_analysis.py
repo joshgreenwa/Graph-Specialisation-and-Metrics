@@ -1,10 +1,7 @@
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
-import torch
 
-import graph_specialisation_metrics.zinc_reach_analysis as reach
 from graph_specialisation_metrics.zinc_reach_analysis import (
     TASKS,
     ZincReachConfig,
@@ -15,93 +12,6 @@ from graph_specialisation_metrics.zinc_reach_analysis import (
     summarise_dense_profile_contrasts,
     summarise_graph_profiles,
 )
-
-
-def test_donor_direction_jacobian_matches_linear_response(monkeypatch):
-    class Data:
-        def __init__(self, x, edge_attr=None):
-            self.x = x
-            self.edge_attr = edge_attr
-
-        def clone(self):
-            return Data(self.x.clone(), self.edge_attr)
-
-    class Layers(torch.nn.Module):
-        def __init__(self, mixing):
-            super().__init__()
-            self.register_buffer("mixing", mixing)
-
-        def forward(self, data):
-            output = data.clone()
-            output.x = self.mixing @ data.x
-            return output
-
-    embedding = torch.nn.Embedding(21, 3)
-    with torch.no_grad():
-        embedding.weight.copy_(torch.arange(63, dtype=torch.float32).reshape(21, 3) / 10)
-    raw_atoms = torch.tensor([1, 4, 7], dtype=torch.long)
-    mixing = torch.tensor(
-        [[1.0, 0.5, 0.0], [0.25, 1.0, 0.5], [0.0, 0.75, 1.0]]
-    )
-    net = SimpleNamespace(layers=Layers(mixing))
-    prepared = SimpleNamespace(
-        runtime=SimpleNamespace(model=SimpleNamespace(model=net))
-    )
-    after_encoder = Data(embedding(raw_atoms).detach())
-    monkeypatch.setattr(
-        reach,
-        "_after_feature_encoder",
-        lambda _prepared, _graphs: (after_encoder, raw_atoms, embedding),
-    )
-    variants = [
-        Data(torch.tensor([[1], [6], [7]])),
-        Data(torch.tensor([[1], [6], [7]])),
-    ]
-    events = [SimpleNamespace(source=1), SimpleNamespace(source=1)]
-
-    actual, diagnostics = reach._semantic_directional_jacobian_mass(
-        prepared,
-        base=Data(raw_atoms[:, None]),
-        variants=variants,
-        events=events,
-    )
-    donor_direction = embedding.weight[6] - embedding.weight[4]
-    expected = (
-        mixing[:, 1].abs() * torch.linalg.vector_norm(donor_direction)
-    ).repeat(2, 1)
-    assert torch.allclose(actual, expected)
-    assert all(
-        row["method"] in {"exact_forward_ad_jvp", "exact_reverse_ad_jvp"}
-        for row in diagnostics
-    )
-
-
-def test_nonfinite_exact_jvps_use_audited_centered_fallback(monkeypatch):
-    def nonfinite_forward_jvp(function, primals, _tangents):
-        output = function(*primals)
-        return output, torch.full_like(output, torch.nan)
-
-    def nonfinite_reverse_jvp(function, primal, _tangent, **_kwargs):
-        output = function(primal)
-        return output, torch.full_like(output, torch.nan)
-
-    monkeypatch.setattr(torch.func, "jvp", nonfinite_forward_jvp)
-    monkeypatch.setattr(torch.autograd.functional, "jvp", nonfinite_reverse_jvp)
-    clean = torch.tensor([1.5, -0.5])
-    direction = torch.tensor([0.25, 2.0])
-    tangent, diagnostic = reach._directional_jvp(
-        lambda value: value.square(),
-        clean,
-        direction,
-    )
-
-    assert torch.allclose(tangent, 2 * clean * direction, rtol=1.0e-3, atol=1.0e-3)
-    assert diagnostic["method"] == "audited_centered_difference"
-    assert diagnostic["relative_error"] < 1.0e-3
-    assert diagnostic["failures"] == [
-        "forward_ad:FloatingPointError",
-        "reverse_ad:FloatingPointError",
-    ]
 
 
 def test_discover_seed_checkpoint_prefers_recovery_best(tmp_path: Path):
@@ -149,9 +59,6 @@ def _raw_rows():
                         ),
                     }
                     if channel == "semantic":
-                        row["directional_jacobian"] = (
-                            (3 - distance) + 0.1 * task_index
-                        )
                         row["finite_hidden_response"] = (
                             2 + 0.5 * distance + 0.15 * task_index
                         )
@@ -194,7 +101,6 @@ def test_profile_scope_and_normalisation():
         if row["channel"] == "semantic"
     } == {
         "bamberger",
-        "directional_jacobian",
         "finite_hidden_response",
         "functional_carriage",
     }

@@ -29,7 +29,7 @@ SECRET_NAME = "dissertation_key"
 PHASE = "all"  # "all", "measure", or "figures"
 OUTPUT_DIR = Path(
     "/content/drive/MyDrive/graph_specialisation_metrics/"
-    "zinc_bamberger_functional_reach_v4"
+    "zinc_bamberger_functional_reach_v5"
 )
 TASKS = "zinc_1hop,zinc_2hop,zinc_1hop_vnode,zinc"
 SEED = 0
@@ -164,13 +164,13 @@ from graph_specialisation_metrics.zinc_reach_analysis import main
 
 print(
     "\n[scope] Semantic: literal Bamberger pre-pooling Jacobian range and "
-    "finite Functional carriage, decomposed through a donor-direction Jacobian "
-    "and raw finite hidden-state response.\n"
+    "finite Functional carriage, with the raw finite hidden-state response "
+    "shown as a matched intermediate estimand.\n"
     "[scope] Structural: finite Functional carriage only; "
     "Bamberger has no canonical structural intervention analogue.\n"
     "[scope] Fairness: checkpoints, graphs, SPD and carrier site are shared. "
-    "The donor-direction, raw-finite and Functional profiles use identical donor "
-    "events; literal Bamberger remains output-centric and channel-subsampled.\n"
+    "The raw-finite and Functional profiles use identical donor events; literal "
+    "Bamberger remains output-centric and channel-subsampled.\n"
     "[scope] Interpretation: this is an estimand comparison, not a claim that "
     "the two methods measure the same quantity. There is no learned-route ground "
     "truth on ZINC.\n"
@@ -213,27 +213,6 @@ if not INSTALL_DEPENDENCIES:
     CELL_ARGS.append("--skip-dependency-install")
 
 result = main(CELL_ARGS)
-
-directional_diagnostics = result.get("measurement", {}).get(
-    "directional_diagnostics",
-    [],
-)
-if directional_diagnostics:
-    estimator_counts = {}
-    for row in directional_diagnostics:
-        estimator = str(row["directional_estimator"])
-        estimator_counts[estimator] = estimator_counts.get(estimator, 0) + 1
-    fallback_errors = [
-        float(row["directional_relative_error"])
-        for row in directional_diagnostics
-        if row["directional_relative_error"] != ""
-    ]
-    print(
-        "\n[directional-jvp] estimator counts="
-        f"{estimator_counts}; maximum fallback error="
-        f"{max(fallback_errors) if fallback_errors else 'n/a'}",
-        flush=True,
-    )
 
 if "health" in result.get("measurement", {}):
     from IPython.display import display
