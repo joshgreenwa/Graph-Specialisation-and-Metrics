@@ -1,5 +1,5 @@
 #!/bin/bash
-# Submit the bipartite-only GRIT PE refinement as common, arm, and CPU-finalizer stages.
+# Submit GRIT PE refinement as either a full DAG or one immediate arms array plus finalizer.
 
 set -euo pipefail
 
@@ -11,6 +11,7 @@ ANALYSIS_SPLIT="${ANALYSIS_SPLIT:-refinement}"
 SEEDS="${SEEDS:-0,1,2,3}"
 MAX_PARALLEL="${MAX_PARALLEL:-4}"
 COMMON_ARRAY="${COMMON_ARRAY:-0-11}"
+GPU_STAGE="${GPU_STAGE:-full}"
 GRAPHBENCH_ANALYSIS_OUTPUT_ROOT="${GRAPHBENCH_ANALYSIS_OUTPUT_ROOT:-/rds/user/jgg45/hpc-work/graphbench-algoreas/outputs/grit_specialisation_matching_pe_refinement_v2}"
 GRAPHBENCH_TRAINING_OUTPUT_ROOT="${GRAPHBENCH_TRAINING_OUTPUT_ROOT:-/rds/user/jgg45/hpc-work/graphbench-algoreas/outputs/graphbench_algoreas_hpc_base_v1}"
 GRAPHBENCH_DATASET_ROOT="${GRAPHBENCH_DATASET_ROOT:-/rds/user/jgg45/hpc-work/graphbench-algoreas/datasets}"
@@ -49,6 +50,10 @@ if [[ ! "${MAX_PARALLEL}" =~ ^[1-9][0-9]*$ ]]; then
   echo "MAX_PARALLEL must be a positive integer" >&2
   exit 2
 fi
+if [[ "${GPU_STAGE}" != "full" && "${GPU_STAGE}" != "arms-only" ]]; then
+  echo "GPU_STAGE must be full or arms-only" >&2
+  exit 2
+fi
 if [[ "${COMMON_ARRAY}" != "0-11" && "${COMMON_ARRAY}" != "4-7" ]]; then
   echo "COMMON_ARRAY must be 0-11 (full run) or 4-7 (causal recovery)" >&2
   exit 2
@@ -69,6 +74,9 @@ SEED_LIST="${SEEDS//,/:}"
 PREFLIGHT_ARGS=()
 if [[ "${COMMON_ARRAY}" == "4-7" ]]; then
   PREFLIGHT_ARGS+=(--require-causal-recovery-prerequisites)
+fi
+if [[ "${GPU_STAGE}" == "arms-only" ]]; then
+  PREFLIGHT_ARGS=(--require-arm-recovery-prerequisites)
 fi
 
 for SEED in "${SEED_VALUES[@]}"; do
@@ -107,27 +115,34 @@ mkdir -p graphbench-algoreas-hpc/logs "${GRAPHBENCH_ANALYSIS_OUTPUT_ROOT}"
 
 COMMON_EXPORT="ALL,PROJECT_ROOT=${PROJECT_ROOT},ENV_ACTIVATE=${ENV_ACTIVATE},PROFILE=${PROFILE},ANALYSIS_SPLIT=${ANALYSIS_SPLIT},FINALIZE_SPLIT=${ANALYSIS_SPLIT},SEED_LIST=${SEED_LIST},GRIT_ROOT=${GRIT_ROOT},GRAPHBENCH_ANALYSIS_OUTPUT_ROOT=${GRAPHBENCH_ANALYSIS_OUTPUT_ROOT},GRAPHBENCH_TRAINING_OUTPUT_ROOT=${GRAPHBENCH_TRAINING_OUTPUT_ROOT},GRAPHBENCH_DATASET_ROOT=${GRAPHBENCH_DATASET_ROOT},GRAPHBENCH_PE_CACHE_ROOT=${GRAPHBENCH_PE_CACHE_ROOT},GRAPHBENCH_PE_CACHE_NAMESPACE=${GRAPHBENCH_PE_CACHE_NAMESPACE},GRAPHBENCH_PE_CACHE_DTYPE=${GRAPHBENCH_PE_CACHE_DTYPE},GRAPHS_PER_BATCH=${GRAPHS_PER_BATCH},HEAD_BATCH_SIZE=${HEAD_BATCH_SIZE},REPLICA_PAIR_BUDGET=${REPLICA_PAIR_BUDGET},JACOBIAN_OUTPUT_CHUNK=${JACOBIAN_OUTPUT_CHUNK}"
 
-COMMON_JOB="$(
-  sbatch --parsable \
-    -A mlmi-jgg45-sl2-gpu -p ampere --qos=gpu1 \
-    --nodes=1 --ntasks=1 --gres=gpu:1 \
-    --array="${COMMON_ARRAY}%${MAX_PARALLEL}" \
-    --job-name=gb-pe-common \
-    --chdir="${PROJECT_ROOT}" \
-    --output="${HPC_ROOT}/logs/%x-%A-%a.out" \
-    --error="${HPC_ROOT}/logs/%x-%A-%a.err" \
-    --export="${COMMON_EXPORT},WORKER_GROUP=common" \
-    graphbench-algoreas-hpc/slurm/grit_pe_refinement_worker.sbatch
-)"
-COMMON_JOB="${COMMON_JOB%%;*}"
-echo "common_array=${COMMON_JOB}"
+COMMON_JOB=""
+ARM_DEPENDENCY=()
+if [[ "${GPU_STAGE}" == "full" ]]; then
+  COMMON_JOB="$(
+    sbatch --parsable \
+      -A mlmi-jgg45-sl2-gpu -p ampere --qos=gpu1 \
+      --nodes=1 --ntasks=1 --gres=gpu:1 \
+      --array="${COMMON_ARRAY}%${MAX_PARALLEL}" \
+      --job-name=gb-pe-common \
+      --chdir="${PROJECT_ROOT}" \
+      --output="${HPC_ROOT}/logs/%x-%A-%a.out" \
+      --error="${HPC_ROOT}/logs/%x-%A-%a.err" \
+      --export="${COMMON_EXPORT},WORKER_GROUP=common" \
+      graphbench-algoreas-hpc/slurm/grit_pe_refinement_worker.sbatch
+  )"
+  COMMON_JOB="${COMMON_JOB%%;*}"
+  ARM_DEPENDENCY=(--dependency="afterok:${COMMON_JOB}")
+  echo "common_array=${COMMON_JOB}"
+else
+  echo "common_array=reused"
+fi
 
 ARM_JOB="$(
   sbatch --parsable \
     -A mlmi-jgg45-sl2-gpu -p ampere --qos=gpu1 \
     --nodes=1 --ntasks=1 --gres=gpu:1 \
     --array="0-15%${MAX_PARALLEL}" \
-    --dependency="afterok:${COMMON_JOB}" \
+    "${ARM_DEPENDENCY[@]}" \
     --job-name=gb-pe-arms \
     --chdir="${PROJECT_ROOT}" \
     --output="${HPC_ROOT}/logs/%x-%A-%a.out" \
@@ -154,4 +169,4 @@ FINAL_JOB="${FINAL_JOB%%;*}"
 
 echo "refinement_finalizer=${FINAL_JOB}"
 echo "analysis_root=${GRAPHBENCH_ANALYSIS_OUTPUT_ROOT}"
-echo "monitor: squeue -j ${COMMON_JOB},${ARM_JOB},${FINAL_JOB}"
+echo "monitor: squeue -j ${ARM_JOB},${FINAL_JOB}"

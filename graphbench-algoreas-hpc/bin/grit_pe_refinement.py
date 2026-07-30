@@ -25,6 +25,7 @@ from graph_specialisation_metrics.methodology.graphbench_pe_refinement import ( 
     lock_pe_refinement_selection,
     run_arm_component,
     run_common_component,
+    validate_arm_recovery_prerequisites,
     validate_causal_recovery_prerequisites,
 )
 from graph_specialisation_metrics.methodology.protocol import ExecutionPolicy  # noqa: E402
@@ -113,6 +114,10 @@ def parser() -> argparse.ArgumentParser:
         "--require-causal-recovery-prerequisites",
         action="store_true",
     )
+    value.add_argument(
+        "--require-arm-recovery-prerequisites",
+        action="store_true",
+    )
     value.add_argument("--force", action="store_true")
     value.add_argument("--no-resume", action="store_true")
     return value
@@ -148,6 +153,7 @@ def _preflight(
     config: PERefinementConfig,
     *,
     require_causal_recovery_prerequisites: bool,
+    require_arm_recovery_prerequisites: bool,
 ) -> None:
     config.validate()
     missing = []
@@ -239,6 +245,8 @@ def _preflight(
     audit_existing_pe_refinement_cache(config)
     if require_causal_recovery_prerequisites:
         validate_causal_recovery_prerequisites(config)
+    if require_arm_recovery_prerequisites:
+        validate_arm_recovery_prerequisites(config)
 
 
 def main(argv: Sequence[str] | None = None) -> None:
@@ -250,6 +258,9 @@ def main(argv: Sequence[str] | None = None) -> None:
             config,
             require_causal_recovery_prerequisites=bool(
                 args.require_causal_recovery_prerequisites
+            ),
+            require_arm_recovery_prerequisites=bool(
+                args.require_arm_recovery_prerequisites
             ),
         )
         return

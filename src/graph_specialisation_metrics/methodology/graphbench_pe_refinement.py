@@ -51,6 +51,7 @@ from .tasks import get_task
 
 
 PE_REFINEMENT_VERSION = "graphbench-matching-pe-refinement-v2"
+LEGACY_PE_REFINEMENT_VERSION = "graphbench-bipartite-pe-refinement-v1"
 TASK_NAME = "graphbench_bipartite_matching_hard"
 STRUCTURAL_ARMS = (
     "rrwp_copy",
@@ -242,6 +243,7 @@ def _validate_protected_metadata(
     expected_contract: Mapping[str, Any],
     *,
     path: Path,
+    compatible_contracts: Sequence[Mapping[str, Any]] = (),
 ) -> None:
     """Validate both current and legacy commit-bound PE-refinement caches."""
 
@@ -272,7 +274,14 @@ def _validate_protected_metadata(
             f"provenance fingerprint: {path}"
         )
     expected_scientific = _cache_scientific_fingerprint(expected_contract)
-    if stored_scientific != expected_scientific:
+    compatible_scientific = {
+        _cache_scientific_fingerprint(contract)
+        for contract in compatible_contracts
+    }
+    if (
+        stored_scientific != expected_scientific
+        and stored_scientific not in compatible_scientific
+    ):
         differing = _contract_difference_fields(
             _cache_scientific_contract(stored_contract),
             _cache_scientific_contract(expected_contract),
@@ -284,6 +293,33 @@ def _validate_protected_metadata(
             f"protected PE-refinement shard has another scientific contract: "
             f"{path}; differing fields: {detail}"
         )
+
+
+def _legacy_v1_scientific_fingerprint(config: PERefinementConfig) -> str:
+    """Reconstruct the exact registered v1 identity for common-cache reuse only."""
+
+    record = dict(config.scientific_record)
+    record.pop("released_task_semantics", None)
+    record["version"] = LEGACY_PE_REFINEMENT_VERSION
+    record["structural_pair_law"] = (
+        "same node type and inferred bipartition side; non-identical RRWP role; "
+        "near/middle/far RRWP-role strata; unique without replacement; no degree match"
+    )
+    return stable_hash(record)
+
+
+def _compatible_legacy_common_contracts(
+    expected_contract: Mapping[str, Any],
+    config: PERefinementConfig,
+) -> tuple[dict[str, Any], ...]:
+    """Allow only common products that are invariant to the corrected donor law."""
+
+    if expected_contract.get("namespace") != "common":
+        return ()
+    legacy = dict(expected_contract)
+    legacy["version"] = LEGACY_PE_REFINEMENT_VERSION
+    legacy["scientific_fingerprint"] = _legacy_v1_scientific_fingerprint(config)
+    return (legacy,)
 
 
 class ProtectedShardStore:
@@ -330,7 +366,15 @@ class ProtectedShardStore:
                 f"protected PE-refinement shard is malformed: {path}"
             )
         metadata = payload.get("metadata", {})
-        _validate_protected_metadata(metadata, self.contract, path=path)
+        _validate_protected_metadata(
+            metadata,
+            self.contract,
+            path=path,
+            compatible_contracts=_compatible_legacy_common_contracts(
+                self.contract,
+                self.prepared.config,
+            ),
+        )
         return payload.get("value")
 
     def save(self, stage: str, name: str, value: Any) -> Path:
@@ -479,6 +523,10 @@ def audit_existing_pe_refinement_cache(config: PERefinementConfig) -> int:
                 payload.get("metadata", {}),
                 expected,
                 path=path,
+                compatible_contracts=_compatible_legacy_common_contracts(
+                    expected,
+                    config,
+                ),
             )
             checked += 1
             del payload
@@ -764,6 +812,72 @@ def validate_causal_recovery_prerequisites(
     print(
         f"[OK] causal-recovery prerequisites: {checked} required common "
         "artifact(s) present",
+        flush=True,
+    )
+    return checked
+
+
+def validate_arm_recovery_prerequisites(
+    config: PERefinementConfig,
+) -> int:
+    """Require every common artifact after the preceding full metadata audit."""
+
+    splits = deterministic_splits(
+        4_000,
+        40_000,
+        _registered_split_sizes(config),
+        int(config.analysis_seed),
+        same_index_space=False,
+    )
+    fixed = (
+        ("scores/semantic", "summary"),
+        ("clean_ablation", "summary"),
+        ("causal/refinement/semantic", "summary"),
+        ("causal", "semantic_summary"),
+        ("audits", "common-scores"),
+        ("audits", "common-causal"),
+        ("audits", "common-causal-refinement"),
+        ("audits", "common-ablation"),
+        ("audits", "model"),
+    )
+    checked = 0
+    taylor_ids = tuple(int(value) for value in splits.causal)[
+        : int(config.sizes.taylor_graphs)
+    ]
+    graph_requirements = [
+        *(
+            ("clean_jacobians/discovery", f"graph_{int(graph_id):06d}")
+            for graph_id in splits.discovery
+        ),
+        *(
+            ("clean_jacobians/taylor", f"graph_{int(graph_id):06d}")
+            for graph_id in taylor_ids
+        ),
+        *(
+            ("causal/refinement/semantic", f"graph_{int(graph_id):06d}")
+            for graph_id in tuple(int(value) for value in splits.causal)[
+                : int(config.sizes.refinement_graphs)
+            ]
+        ),
+    ]
+    for seed in config.seeds:
+        for stage, name in (*fixed, *graph_requirements):
+            path = (
+                config.root
+                / TASK_NAME
+                / f"seed_{int(seed)}"
+                / "common"
+                / stage
+                / f"{name}.pt"
+            )
+            if not path.is_file():
+                raise FileNotFoundError(
+                    f"required completed common artifact is missing: {path}"
+                )
+            checked += 1
+    print(
+        "[OK] arms-only recovery prerequisites: "
+        f"{checked} completed common artifact(s) reusable",
         flush=True,
     )
     return checked
@@ -2525,7 +2639,15 @@ def _read_protected(
         # Finalization does not rebuild the dataset, but the stored split remains a
         # required scientific identity field and is checked for internal consistency.
         expected["split_fingerprint"] = stored_contract["split_fingerprint"]
-    _validate_protected_metadata(metadata, expected, path=path)
+    _validate_protected_metadata(
+        metadata,
+        expected,
+        path=path,
+        compatible_contracts=_compatible_legacy_common_contracts(
+            expected,
+            config,
+        ),
+    )
     return payload["value"]
 
 

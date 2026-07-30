@@ -287,6 +287,23 @@ MAX_PARALLEL=4 \
 bash graphbench-algoreas-hpc/bin/submit_grit_pe_refinement.sh
 ```
 
+If all v1 common components completed but the structural arms failed, reuse only those
+donor-law-invariant common products and place all corrected arm tasks into the GPU queue
+immediately:
+
+```bash
+GPU_STAGE=arms-only \
+GRAPHBENCH_ANALYSIS_OUTPUT_ROOT=/rds/user/jgg45/hpc-work/graphbench-algoreas/outputs/grit_specialisation_bipartite_pe_refinement_v1 \
+ENV_ACTIVATE=$PWD/graphbench-algoreas-hpc/activate_graphbench_algoreas \
+PROFILE=production \
+MAX_PARALLEL=4 \
+bash graphbench-algoreas-hpc/bin/submit_grit_pe_refinement.sh
+```
+
+This mode hard-validates every required common shard and accepts the legacy contract only in the
+`common` namespace. It submits one 16-element GPU arm array with no GPU dependency, followed by
+the dependent CPU finalizer. Legacy structural-arm caches are always rejected.
+
 The submitter repeats both official-backend and path/cache preflights before calling `sbatch`.
 The latter loads the exact registered validation graphs and PE tensors, verifies donor feasibility,
 and constructs all four interventions before any job is queued.

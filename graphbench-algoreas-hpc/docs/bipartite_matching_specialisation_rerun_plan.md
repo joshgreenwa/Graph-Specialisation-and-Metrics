@@ -228,6 +228,11 @@ Production is a three-stage Slurm DAG:
 2. one 16-element arm array: four arms by four seeds, after all common elements succeed;
 3. one model-free CPU refinement finalizer.
 
+For recovery after the completed v1 common stage, `GPU_STAGE=arms-only` validates and reuses only
+the scientifically invariant common namespace. It submits the complete 16-element corrected arm
+array immediately, without a GPU dependency; only the CPU finalizer retains an `afterok`
+dependency. Legacy arm caches are not compatible with v2 and cannot be reused.
+
 Every GPU element requests one untyped Ampere GPU and at most six hours. The production default
 starts at 16 graph event groups per score forward and 24 independently patched heads per causal
 forward (two saturated passes over 48 heads), with automatic OOM backoff. Heartbeats report

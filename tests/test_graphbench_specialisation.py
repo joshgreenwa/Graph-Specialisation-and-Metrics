@@ -33,16 +33,19 @@ from graph_specialisation_metrics.methodology.graphbench import (
 )
 from graph_specialisation_metrics.methodology.scores import event_head_score_systems
 from graph_specialisation_metrics.methodology.graphbench_pe_refinement import (
+    LEGACY_PE_REFINEMENT_VERSION,
     PE_REFINEMENT_VERSION,
     PERefinementConfig,
     PERefinementSizes,
     PreparedPERefinement,
     ProtectedShardStore,
     _candidate_public_summary,
+    _cache_scientific_fingerprint,
     _causal_graph,
     _permuted_spearman_values,
     _registered_split_sizes,
     _run_causal_component,
+    _legacy_v1_scientific_fingerprint,
     audit_existing_pe_refinement_cache,
     audit_matching_input_caches,
     finalize_pe_refinement,
@@ -1143,6 +1146,60 @@ def test_pe_refinement_cache_accepts_legacy_commit_bound_fingerprint(
         )
 
 
+def test_pe_refinement_reuses_only_legacy_common_not_legacy_arm_caches(
+    tmp_path,
+):
+    config = PERefinementConfig(
+        output_dir=str(tmp_path / "analysis"),
+        training_output_root=str(tmp_path / "training"),
+        dataset_root=str(tmp_path / "dataset"),
+        pe_cache_root=str(tmp_path / "pe"),
+        runner_path=str(tmp_path / "runner.py"),
+        sizes=PERefinementSizes(
+            discovery_graphs=1,
+            refinement_graphs=1,
+            confirmation_graphs=1,
+            clean_ablation_graphs=1,
+            semantic_donor_graphs=1,
+            semantic_sources_per_graph=1,
+            donors_per_source=1,
+            taylor_graphs=1,
+        ),
+        accelerator="cpu",
+    )
+    prepared = SimpleNamespace(
+        config=config,
+        seed=0,
+        seed_dir=config.root / "graphbench_bipartite_matching_hard" / "seed_0",
+        checkpoint_sha="checkpoint",
+        splits=SimpleNamespace(fingerprint="split"),
+    )
+
+    def rewrite_as_legacy(path):
+        payload = torch.load(path, map_location="cpu", weights_only=False)
+        contract = payload["metadata"]["contract"]
+        contract["version"] = LEGACY_PE_REFINEMENT_VERSION
+        contract["scientific_fingerprint"] = (
+            _legacy_v1_scientific_fingerprint(config)
+        )
+        payload["metadata"]["fingerprint"] = _cache_scientific_fingerprint(
+            contract
+        )
+        payload["metadata"]["provenance_fingerprint"] = stable_hash(contract)
+        torch.save(payload, path)
+
+    common = ProtectedShardStore(prepared, "common")
+    common_path = common.save("scores/semantic", "summary", {"legacy": True})
+    rewrite_as_legacy(common_path)
+    assert common.load("scores/semantic", "summary") == {"legacy": True}
+
+    arm = ProtectedShardStore(prepared, "arms/rrwp_copy")
+    arm_path = arm.save("scores/structural", "summary", {"legacy": True})
+    rewrite_as_legacy(arm_path)
+    with pytest.raises(StaleCacheError, match="another scientific contract"):
+        arm.load("scores/structural", "summary")
+
+
 def test_pe_refinement_preflight_audits_existing_shards_without_loading_model(
     tmp_path,
     monkeypatch,
@@ -1480,6 +1537,31 @@ def test_pe_refinement_four_seed_cached_pipeline_finalizes_end_to_end(tmp_path):
         common.save("audits", "common-scores", [])
         common.save("audits", "common-ablation", [])
         common.save("audits", "model", [])
+        # Production recovery reuses completed v1 common products while every
+        # newly computed structural arm carries the corrected v2 contract.
+        for common_path in (
+            config.root
+            / "graphbench_bipartite_matching_hard"
+            / f"seed_{seed}"
+            / "common"
+        ).rglob("*.pt"):
+            payload = torch.load(
+                common_path,
+                map_location="cpu",
+                weights_only=False,
+            )
+            contract = payload["metadata"]["contract"]
+            contract["version"] = LEGACY_PE_REFINEMENT_VERSION
+            contract["scientific_fingerprint"] = (
+                _legacy_v1_scientific_fingerprint(config)
+            )
+            payload["metadata"]["fingerprint"] = (
+                _cache_scientific_fingerprint(contract)
+            )
+            payload["metadata"]["provenance_fingerprint"] = stable_hash(
+                contract
+            )
+            torch.save(payload, common_path)
         for arm in (
             "rrwp_copy",
             "rrwp_transpose",
