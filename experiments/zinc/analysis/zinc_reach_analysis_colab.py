@@ -29,7 +29,7 @@ SECRET_NAME = "dissertation_key"
 PHASE = "all"  # "all", "measure", or "figures"
 OUTPUT_DIR = Path(
     "/content/drive/MyDrive/graph_specialisation_metrics/"
-    "zinc_bamberger_functional_reach_v1"
+    "zinc_bamberger_functional_reach_v3"
 )
 TASKS = "zinc_1hop,zinc_2hop,zinc_1hop_vnode,zinc"
 SEED = 0
@@ -163,9 +163,9 @@ from graph_specialisation_metrics.zinc_reach_analysis import main
 
 
 print(
-    "\n[scope] Semantic: literal Bamberger pre-pooling Jacobian range, "
-    "matched local donor-direction Jacobian, and finite Functional carriage.\n"
-    "[scope] Structural: matched local and finite donor estimators only; "
+    "\n[scope] Semantic: literal Bamberger pre-pooling Jacobian range and "
+    "finite Functional carriage.\n"
+    "[scope] Structural: finite Functional carriage only; "
     "Bamberger has no canonical structural intervention analogue.\n"
     "[scope] Interpretation: compare distance-profile shape and model ordering. "
     "There is no learned-route ground truth on ZINC.\n"
@@ -228,15 +228,13 @@ if "expected_rows" in result:
 
         print("\nExpected-distance summary", flush=True)
         display(pd.DataFrame(result["expected_rows"]))
-        print("\nFinite–local disagreement", flush=True)
-        display(pd.DataFrame(result["tv_rows"]))
     except ImportError:
         pass
 
 if "figures" in result:
     from IPython.display import Image, display
 
-    for name in ("profiles", "expected_distance", "finite_local_disagreement"):
+    for name in ("profiles", "expected_distance"):
         path = result["figures"][name]["png"]
         print(f"\n[display] {name}: {path}", flush=True)
         display(Image(filename=path))

@@ -5,33 +5,12 @@ import pytest
 from graph_specialisation_metrics.zinc_reach_analysis import (
     TASKS,
     ZincReachConfig,
-    _align_edge_attributes,
     discover_seed_checkpoint,
     figures,
-    finite_local_tv,
     graph_bamberger_profiles,
     graph_donor_profiles,
     summarise_graph_profiles,
 )
-
-
-def test_clean_support_edge_alignment_preserves_matches_and_zero_fills():
-    torch = pytest.importorskip("torch")
-    source_index = torch.tensor([[0, 1], [1, 0]])
-    source_attr = torch.tensor([[2.0, 3.0], [5.0, 7.0]])
-    target_index = torch.tensor([[0, 0, 1], [0, 1, 0]])
-
-    aligned = _align_edge_attributes(
-        source_index,
-        source_attr,
-        target_index,
-        num_nodes=2,
-    )
-
-    assert torch.equal(
-        aligned,
-        torch.tensor([[0.0, 0.0], [2.0, 3.0], [5.0, 7.0]]),
-    )
 
 
 def test_discover_seed_checkpoint_prefers_recovery_best(tmp_path: Path):
@@ -75,7 +54,6 @@ def _raw_rows():
                             "donor_node": 1,
                             "draw": 0,
                             "distance": distance,
-                            "local_jacobian": (3 - distance) + 0.1 * graph,
                             "functional_carriage": (
                                 (1 + distance) + 0.2 * task_index
                             ),
@@ -119,14 +97,8 @@ def test_profile_scope_and_normalisation():
         bootstrap_replicates=40,
         bootstrap_seed=7,
     )
-    tv = finite_local_tv(
-        graph_rows,
-        bootstrap_replicates=40,
-        bootstrap_seed=8,
-    )
     assert profiles and expected
-    assert len(tv) == len(TASKS) * 2
-    assert all(0 <= row["mean"] <= 1 for row in tv)
+    assert not any(row["method"] == "local_jacobian" for row in graph_rows)
 
 
 def test_figure_only_builds_png_and_pdf(tmp_path: Path):
@@ -152,7 +124,6 @@ def test_figure_only_builds_png_and_pdf(tmp_path: Path):
     assert set(result["figures"]) == {
         "profiles",
         "expected_distance",
-        "finite_local_disagreement",
     }
     for formats in result["figures"].values():
         assert Path(formats["png"]).is_file()

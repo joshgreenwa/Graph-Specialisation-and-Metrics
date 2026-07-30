@@ -5,13 +5,12 @@ This extension keeps two comparisons separate:
 * The literal Bamberger et al. graph-level proxy is the mean node-level
   pre-pooling Jacobian range.  For categorical ZINC atoms, the input is a
   differentiable one-hot vector followed by the checkpoint's learned embedding.
-* Functional carriage and a matched local donor-direction Jacobian are evaluated
-  at final pre-pooling node states for the exact same semantic or structural
-  donor events.
+* Functional carriage is evaluated at final pre-pooling node states for exact
+  semantic or structural donor events.
 
 The Bamberger proxy has no canonical structural-donor counterpart.  It is
-therefore shown only in the semantic row; the structural row compares the
-matched local and finite estimators without inventing a prior-work quantity.
+therefore shown only in the semantic row; the structural row reports Functional
+carriage without inventing a prior-work quantity.
 """
 
 from __future__ import annotations
@@ -44,7 +43,7 @@ from .methodology.runner import prepare_task
 from .methodology.sampling import sample_sources
 
 
-ANALYSIS_VERSION = "zinc-bamberger-functional-reach-v2"
+ANALYSIS_VERSION = "zinc-bamberger-functional-reach-v3"
 TASKS = ("zinc_1hop", "zinc_2hop", "zinc_1hop_vnode", "zinc")
 TASK_LABELS = {
     "zinc_1hop": "1-hop GRIT",
@@ -53,20 +52,17 @@ TASK_LABELS = {
     "zinc": "Dense GRIT",
 }
 CHANNELS = ("semantic", "structural")
-DONOR_METHODS = ("local_jacobian", "functional_carriage")
+DONOR_METHODS = ("functional_carriage",)
 METHOD_LABELS = {
     "bamberger": "Bamberger Jacobian range",
-    "local_jacobian": "Local donor-direction Jacobian",
     "functional_carriage": "Functional carriage",
 }
 METHOD_COLOURS = {
     "bamberger": "#202020",
-    "local_jacobian": "#0072B2",
     "functional_carriage": "#D55E00",
 }
 METHOD_MARKERS = {
     "bamberger": "^",
-    "local_jacobian": "o",
     "functional_carriage": "s",
 }
 
@@ -83,7 +79,6 @@ class ZincReachConfig:
     semantic_donor_graphs: int = 256
     bamberger_output_nodes: int = 6
     bamberger_output_channels: int = 8
-    local_epsilon: float = 5.0e-3
     effect_floor: float = 1.0e-12
     bootstrap_replicates: int = 2_000
     analysis_seed: int = 91_021
@@ -105,8 +100,8 @@ class ZincReachConfig:
         ):
             if int(getattr(self, name)) < 1:
                 raise ValueError(f"{name} must be positive")
-        if float(self.local_epsilon) <= 0 or float(self.effect_floor) <= 0:
-            raise ValueError("local_epsilon and effect_floor must be positive")
+        if float(self.effect_floor) <= 0:
+            raise ValueError("effect_floor must be positive")
 
     @property
     def scientific_record(self) -> dict[str, Any]:
@@ -120,7 +115,6 @@ class ZincReachConfig:
             "semantic_donor_graphs": int(self.semantic_donor_graphs),
             "bamberger_output_nodes": int(self.bamberger_output_nodes),
             "bamberger_output_channels": int(self.bamberger_output_channels),
-            "local_epsilon": float(self.local_epsilon),
             "effect_floor": float(self.effect_floor),
             "bootstrap_replicates": int(self.bootstrap_replicates),
             "analysis_seed": int(self.analysis_seed),
@@ -128,12 +122,6 @@ class ZincReachConfig:
             "finite_estimand": (
                 "clean-minus-donor final pre-pooling node-state change, projected "
                 "through the clean graph-output Jacobian"
-            ),
-            "local_estimand": (
-                "centered derivative at the clean encoded input along the exact "
-                "clean-minus-donor direction, projected through the same output Jacobian; "
-                "hold clean discrete attention support fixed when a structural donor "
-                "changes sparse support"
             ),
             "bamberger_estimand": (
                 "mean node-level pre-pooling range from entrywise-absolute Jacobians "
@@ -147,18 +135,6 @@ class ZincReachConfig:
     @property
     def fingerprint(self) -> str:
         return stable_hash(self.scientific_record)
-
-
-@dataclass(frozen=True)
-class EncodedDirection:
-    clean: Any
-    direction_x: Any
-    direction_edge: Any
-    real_mask: Any
-    repetitions: int
-    real_nodes: int
-    support_changed: bool
-
 
 def _write_json(path: Path, payload: Mapping[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -359,95 +335,19 @@ def _after_feature_encoder(prepared: Any, graphs: Sequence[Any]) -> tuple[Any, A
     return encoded, raw_atoms, embedding
 
 
-def _align_edge_attributes(
-    source_index: Any,
-    source_attr: Any,
-    target_index: Any,
-    *,
-    num_nodes: int,
-) -> Any:
-    """Place encoded edge attributes on a fixed target support, zero-filling new pairs."""
-
-    import torch
-
-    if int(source_index.shape[1]) == 0:
-        return source_attr.new_zeros(
-            (int(target_index.shape[1]), int(source_attr.shape[1]))
-        )
-    source_linear = (
-        source_index[0].to(torch.long) * int(num_nodes)
-        + source_index[1].to(torch.long)
-    )
-    target_linear = (
-        target_index[0].to(torch.long) * int(num_nodes)
-        + target_index[1].to(torch.long)
-    )
-    order = torch.argsort(source_linear)
-    sorted_linear = source_linear[order]
-    positions = torch.searchsorted(sorted_linear, target_linear)
-    valid = positions < int(sorted_linear.numel())
-    safe_positions = positions.clamp(max=int(sorted_linear.numel()) - 1)
-    valid = valid & (sorted_linear[safe_positions] == target_linear)
-    result = source_attr.new_zeros(
-        (int(target_index.shape[1]), int(source_attr.shape[1]))
-    )
-    if bool(valid.any()):
-        result[valid] = source_attr[order[safe_positions[valid]]]
-    return result
-
-
-def _finish_encoding(
-    net: Any,
-    after_encoder: Any,
-    *,
-    support_override: Any | None = None,
-) -> Any:
-    """Run positional encoders, optionally holding the clean sparse support fixed."""
+def _finish_encoding(net: Any, after_encoder: Any) -> Any:
+    """Run RRWP, optional pre-MP, and optional VNode up to the layer input."""
 
     data = after_encoder
     if hasattr(net, "rrwp_abs_encoder"):
         data = net.rrwp_abs_encoder(data)
-        relative = net.rrwp_rel_encoder
-        if support_override is None:
-            data = relative(data)
-        else:
-            if not hasattr(relative, "max_hops"):
-                raise RuntimeError(
-                    "support override requested for an encoder without a k-hop mask"
-                )
-            data.edge_attr = _align_edge_attributes(
-                data.edge_index,
-                data.edge_attr,
-                support_override,
-                num_nodes=int(data.num_nodes),
-            )
-            data.edge_index = support_override
-            max_hops = relative.max_hops
-            relative.max_hops = None
-            try:
-                data = relative(data)
-            finally:
-                relative.max_hops = max_hops
+        data = net.rrwp_rel_encoder(data)
     if hasattr(net, "pre_mp"):
         data = net.pre_mp(data)
     global_vnode = getattr(net, "global_vnode", None)
     if global_vnode is not None:
         data = global_vnode(data)
     return data
-
-
-def _layer_input(
-    prepared: Any,
-    graphs: Sequence[Any],
-    *,
-    support_override: Any | None = None,
-) -> Any:
-    after_encoder, _, _ = _after_feature_encoder(prepared, graphs)
-    return _finish_encoding(
-        prepared.runtime.model.model,
-        after_encoder,
-        support_override=support_override,
-    )
 
 
 def _real_mask(data: Any) -> Any:
@@ -459,132 +359,12 @@ def _real_mask(data: Any) -> Any:
     return mask
 
 
-def _encoded_direction(
-    prepared: Any,
-    clean_graphs: Sequence[Any],
-    event_graphs: Sequence[Any],
-) -> EncodedDirection:
-    """Construct the exact clean-minus-event direction at the layer input."""
-
-    import torch
-
-    if not clean_graphs or len(clean_graphs) != len(event_graphs):
-        raise ValueError("clean and event graph batches must be non-empty and aligned")
-    clean = _layer_input(prepared, clean_graphs)
-    event = _layer_input(prepared, event_graphs)
-    support_changed = not torch.equal(clean.edge_index, event.edge_index)
-    if support_changed:
-        clean_mask = _real_mask(clean)
-        real_edges = (
-            clean_mask[clean.edge_index[0]]
-            & clean_mask[clean.edge_index[1]]
-        )
-        clean_real_support = clean.edge_index[:, real_edges]
-        event = _layer_input(
-            prepared,
-            event_graphs,
-            support_override=clean_real_support,
-        )
-    for name in ("edge_index", "batch"):
-        if not torch.equal(getattr(clean, name), getattr(event, name)):
-            raise RuntimeError(
-                f"clean-support local encoding did not align {name}"
-            )
-    clean_mask = _real_mask(clean)
-    event_mask = _real_mask(event)
-    if not torch.equal(clean_mask, event_mask):
-        raise RuntimeError("donor event changed the real-node mask")
-    if clean.x.shape != event.x.shape or clean.edge_attr.shape != event.edge_attr.shape:
-        raise RuntimeError("donor event changed encoded tensor geometry")
-    return EncodedDirection(
-        clean=clean,
-        direction_x=clean.x.detach() - event.x.detach(),
-        direction_edge=clean.edge_attr.detach() - event.edge_attr.detach(),
-        real_mask=clean_mask,
-        repetitions=len(clean_graphs),
-        real_nodes=int(clean_graphs[0].num_nodes),
-        support_changed=support_changed,
-    )
-
-
 def _forward_final(net: Any, template: Any, x: Any, edge_attr: Any, real_mask: Any) -> Any:
     data = copy.copy(template)
     data.x = x
     data.edge_attr = edge_attr
     output = net.layers(data)
     return output.x[real_mask]
-
-
-def centered_final_direction(
-    prepared: Any,
-    clean_graphs: Sequence[Any],
-    event_graphs: Sequence[Any],
-    *,
-    epsilon: float,
-) -> tuple[Any, dict[str, Any]]:
-    """Stable centered derivative with an epsilon audit and fixed clean support."""
-
-    import torch
-
-    direction = _encoded_direction(prepared, clean_graphs, event_graphs)
-    net = prepared.runtime.model.model
-
-    def evaluate(step: float) -> Any:
-        with torch.no_grad():
-            plus = _forward_final(
-                net,
-                direction.clean,
-                direction.clean.x.detach() + step * direction.direction_x,
-                direction.clean.edge_attr.detach() + step * direction.direction_edge,
-                direction.real_mask,
-            )
-            minus = _forward_final(
-                net,
-                direction.clean,
-                direction.clean.x.detach() - step * direction.direction_x,
-                direction.clean.edge_attr.detach() - step * direction.direction_edge,
-                direction.real_mask,
-            )
-        return (plus - minus) / (2.0 * step)
-
-    steps = (float(epsilon) * 2.0, float(epsilon), float(epsilon) / 2.0)
-    derivatives = tuple(evaluate(step) for step in steps)
-    if not all(bool(torch.isfinite(value).all()) for value in derivatives):
-        raise RuntimeError("non-finite centered donor-direction derivative")
-    errors: list[float] = []
-    for coarse, fine in zip(derivatives[:-1], derivatives[1:]):
-        numerator = torch.linalg.vector_norm((fine - coarse).reshape(-1))
-        denominator = torch.linalg.vector_norm(fine.reshape(-1)).clamp_min(1.0e-12)
-        errors.append(float((numerator / denominator).detach().cpu()))
-    selected_pair = int(np.argmin(np.asarray(errors, dtype=np.float64)))
-    selected = derivatives[selected_pair + 1]
-    selected_epsilon = steps[selected_pair + 1]
-    relative_error = errors[selected_pair]
-    expected_rows = direction.repetitions * direction.real_nodes
-    if int(selected.shape[0]) != expected_rows:
-        raise RuntimeError(
-            f"local derivative returned {int(selected.shape[0])} real rows; "
-            f"expected {expected_rows}"
-        )
-    return (
-        selected.reshape(
-            direction.repetitions,
-            direction.real_nodes,
-            int(selected.shape[-1]),
-        ).detach(),
-        {
-            "requested_epsilon": float(epsilon),
-            "selected_epsilon": float(selected_epsilon),
-            "epsilon_halving_relative_error": float(relative_error),
-            "candidate_relative_errors": errors,
-            "support_policy": (
-                "clean_discrete_support"
-                if direction.support_changed
-                else "unchanged_support"
-            ),
-            "support_changed": bool(direction.support_changed),
-        },
-    )
 
 
 def _bamberger_rows(
@@ -700,35 +480,19 @@ def _donor_rows(
     variants: Sequence[Any],
     events: Sequence[Any],
     clean_jacobians: Any,
-) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """Evaluate matched finite and local mass for one graph/channel."""
+) -> list[dict[str, Any]]:
+    """Evaluate finite Functional-carriage mass for one graph/channel."""
 
     import torch
 
     capture = prepared.backend.capture_groups([[base, *variants]])[0]
     finite_change = clean_jacobians.capture.final_state.unsqueeze(0) - capture.final_state[1:]
-    local_change, derivative_diagnostic = centered_final_direction(
-        prepared,
-        [base for _ in variants],
-        variants,
-        epsilon=float(config.local_epsilon),
-    )
-    relative_error = float(
-        derivative_diagnostic["epsilon_halving_relative_error"]
-    )
     gradient = clean_jacobians.final_state
     finite_mass = _project_final_change(finite_change, gradient)
-    local_mass = _project_final_change(local_change, gradient)
-    if not bool(torch.isfinite(finite_mass).all() and torch.isfinite(local_mass).all()):
+    if not bool(torch.isfinite(finite_mass).all()):
         raise RuntimeError("non-finite final-state reach mass")
     if len(events) != int(finite_mass.shape[0]):
         raise RuntimeError("event manifest and carrier tensor are misaligned")
-    if relative_error > 5.0e-2:
-        print(
-            f"[reach:warning] epsilon-halving error={relative_error:.3g} "
-            f"({task}, graph={graph_id}, {channel})",
-            flush=True,
-        )
 
     distances = shortest_path_distances(base.edge_index, int(base.num_nodes))
     rows: list[dict[str, Any]] = []
@@ -753,23 +517,12 @@ def _donor_rows(
                     "dose": float(event.dose),
                     "carrier": int(carrier),
                     "distance": int(distances[source, carrier]),
-                    "local_jacobian": float(
-                        local_mass[event_index, carrier].detach().cpu()
-                    ),
                     "functional_carriage": float(
                         finite_mass[event_index, carrier].detach().cpu()
                     ),
                 }
             )
-    diagnostic = {
-        "task": task,
-        "graph": int(graph_id),
-        "channel": channel,
-        "method": "centered_difference",
-        "events": int(len(events)),
-        **derivative_diagnostic,
-    }
-    return rows, diagnostic
+    return rows
 
 
 def _measure_graph(
@@ -799,7 +552,6 @@ def _measure_graph(
         base=base,
     )
     donor_rows: list[dict[str, Any]] = []
-    diagnostics: list[dict[str, Any]] = []
     for channel in CHANNELS:
         variants: list[Any] = []
         events: list[Any] = []
@@ -827,7 +579,7 @@ def _measure_graph(
                 flush=True,
             )
             continue
-        rows, diagnostic = _donor_rows(
+        rows = _donor_rows(
             config,
             prepared,
             task=task,
@@ -840,7 +592,6 @@ def _measure_graph(
             clean_jacobians=clean_jacobians,
         )
         donor_rows.extend(rows)
-        diagnostics.append(diagnostic)
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
     return {
@@ -851,7 +602,6 @@ def _measure_graph(
         "graph": int(graph_id),
         "donor_rows": donor_rows,
         "bamberger_rows": bamberger,
-        "diagnostics": diagnostics,
     }
 
 
@@ -877,7 +627,7 @@ def _load_shard(
         payload.get("analysis_version") != ANALYSIS_VERSION
         or payload.get("fingerprint") != fingerprint
         or payload.get("checkpoint_sha256") != checkpoint_sha256
-        or not {"donor_rows", "bamberger_rows", "diagnostics"}.issubset(payload)
+        or not {"donor_rows", "bamberger_rows"}.issubset(payload)
     ):
         return None
     return payload
@@ -926,7 +676,6 @@ def measure(
 
     donor_rows: list[dict[str, Any]] = []
     bamberger_rows: list[dict[str, Any]] = []
-    diagnostics: list[dict[str, Any]] = []
     health: list[dict[str, Any]] = []
     completed = 0
     total = len(config.tasks) * int(config.graphs)
@@ -967,7 +716,6 @@ def measure(
                 _save_shard(path, shard)
             donor_rows.extend(shard["donor_rows"])
             bamberger_rows.extend(shard["bamberger_rows"])
-            diagnostics.extend(shard["diagnostics"])
             completed += 1
             if progress:
                 print(
@@ -979,7 +727,6 @@ def measure(
     results_dir = output_dir / "results"
     _write_csv(results_dir / "donor_carrier_mass.csv", donor_rows)
     _write_csv(results_dir / "bamberger_input_output_influence.csv", bamberger_rows)
-    _write_csv(results_dir / "local_derivative_diagnostics.csv", diagnostics)
     _write_csv(results_dir / "model_health.csv", health)
     _write_json(
         results_dir / "measurement_manifest.json",
@@ -994,12 +741,12 @@ def measure(
             "bamberger_rows": len(bamberger_rows),
             "comparison_scope": {
                 "semantic": (
-                    "literal Bamberger pre-pooling Jacobian proxy plus matched local "
-                    "and finite donor estimators"
+                    "literal Bamberger pre-pooling Jacobian proxy plus finite "
+                    "Functional carriage"
                 ),
                 "structural": (
-                    "matched local and finite donor estimators only; no canonical "
-                    "Bamberger structural quantity is claimed"
+                    "finite Functional carriage only; no canonical Bamberger "
+                    "structural quantity is claimed"
                 ),
                 "ground_truth": (
                     "none for learned ZINC range; architecture constrains accessibility "
@@ -1011,7 +758,6 @@ def measure(
     return {
         "donor_rows": donor_rows,
         "bamberger_rows": bamberger_rows,
-        "diagnostics": diagnostics,
         "health": health,
     }
 
@@ -1267,70 +1013,6 @@ def summarise_graph_profiles(
     return profiles, expected
 
 
-def finite_local_tv(
-    graph_rows: Sequence[Mapping[str, Any]],
-    *,
-    bootstrap_replicates: int,
-    bootstrap_seed: int,
-) -> list[dict[str, Any]]:
-    """Paired graph-level total variation between finite and local profiles."""
-
-    lookup: dict[tuple[Any, ...], float] = {}
-    for row in graph_rows:
-        if str(row["method"]) not in DONOR_METHODS:
-            continue
-        lookup[
-            (
-                str(row["task"]),
-                _integer(row, "graph"),
-                str(row["channel"]),
-                str(row["method"]),
-                _integer(row, "distance"),
-            )
-        ] = _float(row, "mass")
-    cells: dict[tuple[str, int, str], set[int]] = defaultdict(set)
-    for task, graph, channel, _method, distance in lookup:
-        cells[(task, graph, channel)].add(distance)
-    grouped: dict[tuple[str, str], list[float]] = defaultdict(list)
-    for (task, graph, channel), distances in cells.items():
-        if not all(
-            (task, graph, channel, method, distance) in lookup
-            for method in DONOR_METHODS
-            for distance in distances
-        ):
-            continue
-        grouped[(task, channel)].append(
-            0.5
-            * sum(
-                abs(
-                    lookup[(task, graph, channel, "functional_carriage", distance)]
-                    - lookup[(task, graph, channel, "local_jacobian", distance)]
-                )
-                for distance in distances
-            )
-        )
-    output: list[dict[str, Any]] = []
-    for key, values in grouped.items():
-        task, channel = key
-        mean, low, high = _bootstrap_interval(
-            values,
-            replicates=int(bootstrap_replicates),
-            seed=int(bootstrap_seed) + int(stable_hash({"tv": key}, length=8), 16),
-        )
-        output.append(
-            {
-                "task": task,
-                "model_label": TASK_LABELS[task],
-                "channel": channel,
-                "mean": mean,
-                "low": low,
-                "high": high,
-                "graphs": int(len(values)),
-            }
-        )
-    return output
-
-
 def _figure_theme() -> None:
     import matplotlib as mpl
 
@@ -1452,7 +1134,7 @@ def plot_profiles(
         labels,
         loc="upper center",
         bbox_to_anchor=(0.5, 0.935),
-        ncol=3,
+        ncol=2,
         frameon=False,
     )
     fig.suptitle("Distance profiles of model usage on ZINC", fontsize=13, y=0.99)
@@ -1544,61 +1226,12 @@ def plot_expected_distance(
         labels,
         loc="upper center",
         bbox_to_anchor=(0.5, 0.90),
-        ncol=3,
+        ncol=2,
         frameon=False,
     )
     fig.suptitle("Expected distance of model usage on ZINC", fontsize=13, y=0.985)
     fig.subplots_adjust(left=0.085, right=0.99, bottom=0.27, top=0.72, wspace=0.22)
     return _save_figure(fig, figures_dir, "zinc_expected_reach")
-
-
-def plot_finite_local_tv(
-    rows: Sequence[Mapping[str, Any]],
-    *,
-    figures_dir: Path,
-) -> dict[str, str]:
-    import matplotlib.pyplot as plt
-
-    _figure_theme()
-    fig, axes = plt.subplots(1, 2, figsize=(10.4, 3.5), sharey=True, constrained_layout=True)
-    positions = np.arange(len(TASKS))
-    channel_colours = {"semantic": "#009E73", "structural": "#CC79A7"}
-    for axis, channel in zip(axes, CHANNELS):
-        values = {
-            str(row["task"]): row
-            for row in rows
-            if str(row["channel"]) == channel
-        }
-        means = np.asarray([_float(values[task], "mean") for task in TASKS])
-        lows = np.asarray([_float(values[task], "low") for task in TASKS])
-        highs = np.asarray([_float(values[task], "high") for task in TASKS])
-        axis.bar(
-            positions,
-            means,
-            color=channel_colours[channel],
-            alpha=0.82,
-            width=0.66,
-        )
-        axis.errorbar(
-            positions,
-            means,
-            yerr=np.vstack((means - lows, highs - means)),
-            fmt="none",
-            ecolor="#222222",
-            capsize=3,
-            linewidth=1.2,
-        )
-        axis.set_title(f"{channel.capitalize()} perturbations")
-        axis.set_xticks(positions)
-        axis.set_xticklabels(
-            [TASK_LABELS[task] for task in TASKS],
-            rotation=22,
-            ha="right",
-        )
-        axis.set_ylabel("Total variation distance")
-        axis.set_ylim(0, 1)
-    fig.suptitle("Finite–local disagreement in distance usage", fontsize=13)
-    return _save_figure(fig, figures_dir, "zinc_finite_local_disagreement")
 
 
 def figures(
@@ -1629,25 +1262,15 @@ def figures(
         bootstrap_replicates=int(config.bootstrap_replicates),
         bootstrap_seed=int(config.analysis_seed) + 100,
     )
-    tv_rows = finite_local_tv(
-        donor_graph,
-        bootstrap_replicates=int(config.bootstrap_replicates),
-        bootstrap_seed=int(config.analysis_seed) + 200,
-    )
     _write_csv(results_dir / "graph_distance_profiles.csv", graph_rows)
     _write_csv(results_dir / "distance_profile_summary.csv", profile_rows)
     _write_csv(results_dir / "expected_distance_summary.csv", expected_rows)
-    _write_csv(results_dir / "finite_local_tv_summary.csv", tv_rows)
 
     figures_dir = output_dir / "figures"
     paths = {
         "profiles": plot_profiles(profile_rows, figures_dir=figures_dir),
         "expected_distance": plot_expected_distance(
             expected_rows,
-            figures_dir=figures_dir,
-        ),
-        "finite_local_disagreement": plot_finite_local_tv(
-            tv_rows,
             figures_dir=figures_dir,
         ),
     }
@@ -1667,7 +1290,6 @@ def figures(
         "figures": paths,
         "profile_rows": profile_rows,
         "expected_rows": expected_rows,
-        "tv_rows": tv_rows,
     }
 
 
@@ -1678,7 +1300,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--output-dir",
         default=(
             "/content/drive/MyDrive/graph_specialisation_metrics/"
-            "zinc_bamberger_functional_reach_v1"
+            "zinc_bamberger_functional_reach_v3"
         ),
     )
     parser.add_argument("--tasks", default=",".join(TASKS))
@@ -1689,7 +1311,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--semantic-donor-graphs", type=int, default=256)
     parser.add_argument("--bamberger-output-nodes", type=int, default=6)
     parser.add_argument("--bamberger-output-channels", type=int, default=8)
-    parser.add_argument("--local-epsilon", type=float, default=5.0e-3)
     parser.add_argument("--effect-floor", type=float, default=1.0e-12)
     parser.add_argument("--bootstrap-replicates", type=int, default=2_000)
     parser.add_argument("--analysis-seed", type=int, default=91_021)
@@ -1711,7 +1332,6 @@ def main(argv: Sequence[str] | None = None) -> dict[str, Any]:
         semantic_donor_graphs=int(args.semantic_donor_graphs),
         bamberger_output_nodes=int(args.bamberger_output_nodes),
         bamberger_output_channels=int(args.bamberger_output_channels),
-        local_epsilon=float(args.local_epsilon),
         effect_floor=float(args.effect_floor),
         bootstrap_replicates=int(args.bootstrap_replicates),
         analysis_seed=int(args.analysis_seed),
