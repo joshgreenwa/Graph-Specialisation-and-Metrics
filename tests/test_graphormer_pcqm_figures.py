@@ -41,7 +41,10 @@ from graph_specialisation_metrics.methodology.graphormer_figure_data import (
     select_structural_specialist_head,
 )
 from graph_specialisation_metrics.methodology.graphormer_figure_plots import (
+    MOLECULE_RENDER_DPI,
     PCA_FOCUS_COLORS,
+    PUBLICATION_PDF_RASTER_DPI,
+    PUBLICATION_PNG_DPI,
     plot_attention_grid,
     plot_av_pca,
     plot_coordinate_heatmaps,
@@ -193,6 +196,9 @@ def test_graphormer_figure_notebook_routes_every_grid_through_live_config():
     )
 
     assert "ATTENTION_GRID_NUM_ROWS = 4" in source
+    assert "PNG_DPI = 600" in source
+    assert "PDF_RASTER_DPI = 1200" in source
+    assert "pdf_dpi=PDF_RASTER_DPI" in source
     assert (
         "ATTENTION_GRID_GRAPH_INDICES[role],\n"
         "        num_rows=ATTENTION_GRID_NUM_ROWS"
@@ -455,6 +461,7 @@ def test_requested_scatter_figures_have_matching_export_geometry(tmp_path):
                 tmp_path,
                 f"scatter_{index}",
                 dpi=72,
+                pdf_dpi=72,
             )
             exported_shapes.append(plt.imread(paths["png"]).shape[:2])
             containers = [
@@ -520,7 +527,9 @@ def test_score_heatmaps_and_scatter_restore_viridis():
     heatmaps = plot_score_heatmaps(metrics)
     scatter = plot_score_plane(metrics)
     try:
-        assert plt.rcParams["savefig.dpi"] == 600
+        assert plt.rcParams["savefig.dpi"] == PUBLICATION_PNG_DPI
+        assert plt.rcParams["pdf.fonttype"] == 42
+        assert plt.rcParams["pdf.compression"] == 9
         assert heatmaps._suptitle.get_text() == "Graphormer PCQM4Mv2"
         assert heatmaps.axes[-1].get_ylabel() == "Normalised score"
         assert scatter.axes[0].get_title() == "Graphormer PCQM4Mv2"
@@ -558,7 +567,12 @@ def test_heatmaps_do_not_outline_selected_heads():
 
 
 def test_figure_bundle_saves_png_pdf_and_provenance_in_target_folder(tmp_path):
-    assert save_figure_bundle.__kwdefaults__["dpi"] == 600
+    assert save_figure_bundle.__kwdefaults__["dpi"] == PUBLICATION_PNG_DPI
+    assert (
+        save_figure_bundle.__kwdefaults__["pdf_dpi"]
+        == PUBLICATION_PDF_RASTER_DPI
+    )
+    assert MOLECULE_RENDER_DPI == 600
     figure = plot_score_plane(synthetic_metrics())
     target = tmp_path / "semantic_specialists"
     try:
@@ -568,6 +582,7 @@ def test_figure_bundle_saves_png_pdf_and_provenance_in_target_folder(tmp_path):
             "example_head",
             metadata={"figure_group": "semantic_specialists"},
             dpi=100,
+            pdf_dpi=200,
         )
     finally:
         plt.close(figure)
@@ -578,9 +593,44 @@ def test_figure_bundle_saves_png_pdf_and_provenance_in_target_folder(tmp_path):
         "metadata": target / "example_head.json",
     }
     assert all(path.is_file() for path in paths.values())
-    assert json.loads(paths["metadata"].read_text())["figure_group"] == (
-        "semantic_specialists"
+    metadata = json.loads(paths["metadata"].read_text())
+    assert metadata["figure_group"] == "semantic_specialists"
+    assert metadata["export_quality"] == {
+        "png_dpi": 100,
+        "pdf_raster_dpi": 200,
+        "pdf_vector_text_and_paths": True,
+        "pdf_font_embedding": "TrueType (fonttype 42)",
+        "molecule_render_dpi": 600,
+    }
+
+
+def test_figure_bundle_uses_independent_publication_dpi_for_png_and_pdf(
+    tmp_path,
+):
+    calls = []
+
+    class RecordingFigure:
+        def savefig(self, path, **kwargs):
+            calls.append((Path(path), kwargs))
+            Path(path).write_bytes(b"figure")
+
+    paths = save_figure_bundle(
+        RecordingFigure(),
+        tmp_path,
+        "publication_export",
+        dpi=600,
+        pdf_dpi=1200,
     )
+
+    assert calls[0][0] == paths["png"]
+    assert calls[0][1]["dpi"] == 600
+    assert calls[1][0] == paths["pdf"]
+    assert calls[1][1]["dpi"] == 1200
+    assert calls[1][1]["metadata"] == {
+        "Title": "publication_export",
+        "Creator": "Graph Specialisation and Metrics",
+        "Subject": "Publication figure",
+    }
 
 
 def test_figure_bundle_removes_only_superseded_generated_outputs(tmp_path):
@@ -598,6 +648,7 @@ def test_figure_bundle_removes_only_superseded_generated_outputs(tmp_path):
             target,
             "semantic_head_1_24_attention_grid",
             dpi=72,
+            pdf_dpi=72,
             supersede_stem_globs=(
                 "semantic_head_1_24_attention_*x3.*",
             ),
@@ -1009,6 +1060,11 @@ def test_layer_av_pca_grid_is_4x8_with_readable_legend_below():
         legend = figure.legends[0]
         assert [text.get_text() for text in legend.get_texts()] == list(
             PCA_FOCUS_COLORS
+        )
+        assert all(
+            not collection.get_rasterized()
+            for axis in figure.axes
+            for collection in axis.collections
         )
         renderer = figure.canvas.get_renderer()
         legend_box = legend.get_window_extent(renderer)

@@ -25,6 +25,10 @@ ORANGE = "#D97706"
 SLATE = "#607080"
 LIGHT_GRID = "#DCE3E8"
 
+PUBLICATION_PNG_DPI = 600
+PUBLICATION_PDF_RASTER_DPI = 1200
+MOLECULE_RENDER_DPI = 600
+
 ATTENTION_CMAP = plt.get_cmap("Blues")
 SELECTIVITY_CMAP = plt.get_cmap("coolwarm")
 HEAD_STYLES = {
@@ -63,7 +67,9 @@ def apply_publication_style() -> None:
     plt.rcParams.update(
         {
             "figure.dpi": 140,
-            "savefig.dpi": 600,
+            "savefig.dpi": PUBLICATION_PNG_DPI,
+            "savefig.transparent": False,
+            "savefig.pad_inches": 0.04,
             "font.family": "sans-serif",
             "font.sans-serif": ["DejaVu Sans", "Arial", "Liberation Sans"],
             "mathtext.fontset": "dejavusans",
@@ -80,7 +86,10 @@ def apply_publication_style() -> None:
             "grid.alpha": 0.75,
             "legend.frameon": False,
             "pdf.fonttype": 42,
+            "pdf.compression": 9,
+            "pdf.use14corefonts": False,
             "ps.fonttype": 42,
+            "path.simplify": False,
         }
     )
 
@@ -428,7 +437,7 @@ def _draw_molecule_plain(
     smiles: str,
     *,
     figsize: tuple[float, float] = (4.2, 3.7),
-    dpi: int = 180,
+    dpi: int = MOLECULE_RENDER_DPI,
 ):
     from PIL import Image
     from rdkit.Chem.Draw import rdMolDraw2D
@@ -451,7 +460,7 @@ def _draw_molecule_attention(
     inbound: np.ndarray,
     vmax: float,
     figsize: tuple[float, float] = (4.2, 3.7),
-    dpi: int = 180,
+    dpi: int = MOLECULE_RENDER_DPI,
 ):
     """RDKit molecule with atom-centered attention inflow highlights."""
 
@@ -793,7 +802,6 @@ def plot_layer_av_pca_grid(
             edgecolors="white",
             linewidths=0.18,
             alpha=0.76,
-            rasterized=True,
         )
         ax.axhline(0, color=LIGHT_GRID, linewidth=0.6, zorder=0)
         ax.axvline(0, color=LIGHT_GRID, linewidth=0.6, zorder=0)
@@ -1068,16 +1076,21 @@ def save_figure_bundle(
     stem: str,
     *,
     metadata: Mapping[str, Any] | None = None,
-    dpi: int = 600,
+    dpi: int = PUBLICATION_PNG_DPI,
+    pdf_dpi: int = PUBLICATION_PDF_RASTER_DPI,
     supersede_stem_globs: Sequence[str] = (),
 ) -> dict[str, Path]:
-    """Save a high-resolution PNG, vector PDF, and provenance sidecar.
+    """Save a publication PNG, hybrid-vector PDF, and provenance sidecar.
 
     ``supersede_stem_globs`` removes replaceable figure bundles only after the
     new bundle has been written successfully. Patterns are restricted to direct
     children of the output directory and to the three generated file types.
     """
 
+    dpi = int(dpi)
+    pdf_dpi = int(pdf_dpi)
+    if dpi < 1 or pdf_dpi < 1:
+        raise ValueError("PNG and PDF raster DPI must both be positive")
     directory = Path(output_directory)
     directory.mkdir(parents=True, exist_ok=True)
     supersede_patterns = tuple(str(pattern) for pattern in supersede_stem_globs)
@@ -1092,16 +1105,39 @@ def save_figure_bundle(
         "pdf": directory / f"{stem}.pdf",
         "metadata": directory / f"{stem}.json",
     }
-    figure.savefig(paths["png"], dpi=dpi, bbox_inches="tight", facecolor="white")
     figure.savefig(
-        paths["pdf"],
+        paths["png"],
         dpi=dpi,
         bbox_inches="tight",
+        pad_inches=0.04,
         facecolor="white",
     )
+    figure.savefig(
+        paths["pdf"],
+        dpi=pdf_dpi,
+        bbox_inches="tight",
+        pad_inches=0.04,
+        facecolor="white",
+        metadata={
+            "Title": str(stem),
+            "Creator": "Graph Specialisation and Metrics",
+            "Subject": "Publication figure",
+        },
+    )
+    export_metadata = {
+        "png_dpi": dpi,
+        "pdf_raster_dpi": pdf_dpi,
+        "pdf_vector_text_and_paths": True,
+        "pdf_font_embedding": "TrueType (fonttype 42)",
+        "molecule_render_dpi": MOLECULE_RENDER_DPI,
+    }
     paths["metadata"].write_text(
         json.dumps(
-            {"figure": stem, **dict(metadata or {})},
+            {
+                "figure": stem,
+                "export_quality": export_metadata,
+                **dict(metadata or {}),
+            },
             indent=2,
             sort_keys=True,
             default=str,
@@ -1123,6 +1159,9 @@ def save_figure_bundle(
 
 
 __all__ = [
+    "MOLECULE_RENDER_DPI",
+    "PUBLICATION_PDF_RASTER_DPI",
+    "PUBLICATION_PNG_DPI",
     "apply_publication_style",
     "automatic_selectivity_limits",
     "plot_attention_grid",
