@@ -267,15 +267,15 @@ git -C external/GRIT checkout 6c988ea600a606fbb49a2246c64a2d37396b3ab5
 ```
 
 For a fresh clone, recreate `graphbench-algoreas-hpc/activate_graphbench_algoreas` using the
-environment block near the top of this document. Then run the preflight and verify all eight
-checkpoints:
+environment block near the top of this document. Then run the preflight and verify the four
+matching checkpoints:
 
 ```bash
 cd /rds/user/jgg45/hpc-work/Graph-Specialisation-and-Metrics
 source graphbench-algoreas-hpc/activate_graphbench_algoreas
 python graphbench-algoreas-hpc/bin/check_official_backends.py --models grit
 
-for TASK in bipartite_matching_hard flow_hard; do
+for TASK in bipartite_matching_hard; do
   for SEED in 0 1 2 3; do
     test -s "/rds/user/jgg45/hpc-work/graphbench-algoreas/outputs/graphbench_algoreas_hpc_base_v1/${TASK}/grit/seed${SEED}/best.pt"
   done
@@ -290,8 +290,10 @@ cd /rds/user/jgg45/hpc-work/Graph-Specialisation-and-Metrics
 
 ENV_ACTIVATE=$PWD/graphbench-algoreas-hpc/activate_graphbench_algoreas \
 PROFILE=smoke \
+ANALYSIS_TASKS=bipartite_matching_hard \
+PHASES=scores,causal \
 MAX_PARALLEL=1 \
-GRAPHBENCH_ANALYSIS_OUTPUT_ROOT=/rds/user/jgg45/hpc-work/graphbench-algoreas/outputs/grit_specialisation_graphbench_edge_v1_smoke \
+GRAPHBENCH_ANALYSIS_OUTPUT_ROOT=/rds/user/jgg45/hpc-work/graphbench-algoreas/outputs/grit_specialisation_graphbench_complete_pe_v2_smoke \
 bash graphbench-algoreas-hpc/bin/submit_grit_specialisation.sh
 ```
 
@@ -302,17 +304,18 @@ cd /rds/user/jgg45/hpc-work/Graph-Specialisation-and-Metrics
 
 ENV_ACTIVATE=$PWD/graphbench-algoreas-hpc/activate_graphbench_algoreas \
 PROFILE=production \
-MAX_PARALLEL=1 \
-GRAPHBENCH_ANALYSIS_OUTPUT_ROOT=/rds/user/jgg45/hpc-work/graphbench-algoreas/outputs/grit_specialisation_graphbench_edge_v1 \
+ANALYSIS_TASKS=bipartite_matching_hard \
+PHASES=scores,causal \
+MAX_PARALLEL=4 \
+GRAPHBENCH_ANALYSIS_OUTPUT_ROOT=/rds/user/jgg45/hpc-work/graphbench-algoreas/outputs/grit_specialisation_graphbench_complete_pe_v2 \
 bash graphbench-algoreas-hpc/bin/submit_grit_specialisation.sh
 ```
 
-The launcher submits separate `0-3` arrays for matching and flow, then one CPU finalizer with an
-`afterok` dependency on both complete arrays. `MAX_PARALLEL=1` follows the confirmed `gpu1`
-workflow. If the allocation permits concurrent jobs, set `MAX_PARALLEL=2` or `4`; this cap applies
-to each task array, and the scheduler still enforces account-wide limits. Every submission
+The focused launcher submits one `0-3%4` matching array, then one CPU finalizer with an `afterok`
+dependency on the complete array. Set
+`ANALYSIS_TASKS=bipartite_matching_hard,flow_hard` only when both tasks are intended. Every submission
 explicitly requests `--nodes=1 --ntasks=1 --gres=gpu:1`, as required by the Cambridge site
-wrapper; the `ampere` partition selects the GPU class. Each seed worker requests four hours and
+wrapper; the `ampere` partition selects the GPU class. Each seed worker requests six hours and
 can be resubmitted against the same contract-bound output root to resume completed shards.
 Production workers use 32 base graphs per batch, a 2,000,000 dense-replica budget, and
 64-output matching VJPs. CUDA OOM automatically halves graph batches and keeps the stable smaller
@@ -321,22 +324,20 @@ The launcher exports the four seeds internally as colon-separated `SEED_LIST=0:1
 cannot be embedded directly in Slurm's `--export` list because Slurm treats them as variable
 separators. It also refuses submission unless `GRIT_ROOT` is a Git checkout at the pinned commit.
 
-Monitor the three job IDs printed by the launcher:
+Monitor the matching array and CPU-finalizer job IDs printed by the launcher:
 
 ```bash
 squeue -u jgg45 -o "%.18i %.9P %.24j %.8T %.10M %.6D %R" \
-  | grep -E "gb-grit-match|gb-grit-flow|gb-grit-finalize|JOBID"
+  | grep -E "gb-grit-match|gb-grit-finalize|JOBID"
 tail -f graphbench-algoreas-hpc/logs/gb-grit-match-*.out
-tail -f graphbench-algoreas-hpc/logs/gb-grit-flow-*.out
 ```
 
 After completion, verify the finalizer and four-seed population summaries:
 
 ```bash
-ANALYSIS_ROOT=/rds/user/jgg45/hpc-work/graphbench-algoreas/outputs/grit_specialisation_graphbench_edge_v1
+ANALYSIS_ROOT=/rds/user/jgg45/hpc-work/graphbench-algoreas/outputs/grit_specialisation_graphbench_complete_pe_v2
 test -s "${ANALYSIS_ROOT}/index.json"
 test -s "${ANALYSIS_ROOT}/graphbench_bipartite_matching_hard/population.json"
-test -s "${ANALYSIS_ROOT}/graphbench_flow_hard/population.json"
 find "${ANALYSIS_ROOT}" -path "*/seed_*/figures.json" -print | sort
 ```
 

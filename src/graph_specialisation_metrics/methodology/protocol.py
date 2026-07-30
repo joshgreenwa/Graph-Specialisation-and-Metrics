@@ -117,6 +117,12 @@ class BootstrapPolicy:
 @dataclass(frozen=True)
 class FamilyPolicy:
     activity_floor: float = 0.20
+    # The focused GraphBench test selects at most this many point-estimate
+    # directional candidates per channel, before one-to-one J matching.
+    specialist_candidate_limit: int = 6
+    # A seed-level strongest-candidate interaction is headline-estimable only
+    # with at least this many matched pairs.
+    specialist_minimum_pairs: int = 3
     tail_fraction: float = 0.20
     central_fraction: float = 0.20
     # Select the high-J central family from this nearest-to-median D_rel pool.  This keeps
@@ -141,6 +147,15 @@ class FamilyPolicy:
     def validate(self) -> None:
         if self.activity_floor < 0:
             raise ValueError("activity_floor must be non-negative")
+        if int(self.specialist_candidate_limit) < 1:
+            raise ValueError("specialist_candidate_limit must be positive")
+        if not 1 <= int(self.specialist_minimum_pairs) <= int(
+            self.specialist_candidate_limit
+        ):
+            raise ValueError(
+                "specialist_minimum_pairs must lie between 1 and "
+                "specialist_candidate_limit"
+            )
         for name in ("tail_fraction", "central_fraction"):
             value = float(getattr(self, name))
             if not 0 < value <= 0.5:
@@ -286,7 +301,7 @@ class MethodologyConfig:
             },
             "task_protocol_extensions": {
                 task: {
-                    "version": "graphbench-edge-semantic-v1",
+                    "version": "graphbench-complete-pe-coherent-v2",
                     "semantic_source": (
                         "one ordered edge for flow; one reciprocal edge unit for matching"
                     ),
@@ -295,7 +310,20 @@ class MethodologyConfig:
                         "L1 gap; uniform eligible graph then uniform eligible edge; "
                         "iid replacement"
                     ),
-                    "structural_source": "node RRWP row/column/self footprint",
+                    "structural_source": (
+                        "complete-PE node role: model-visible RRWP row/column/self plus "
+                        "degree and derived log-degree; donor copy, not transposition"
+                    ),
+                    "structural_donor_law": (
+                        "non-identical RRWP role; no degree matching; balanced "
+                        "near/middle/far role distance; unique without replacement; "
+                        "matching donors additionally preserve bipartition side and node type"
+                    ),
+                    "raw_score_system": "coherent output movement",
+                    "secondary_score_diagnostic": "transport mass",
+                    "event_manifest_pairing": (
+                        "identical graph/source/donor manifests across training seeds"
+                    ),
                     "channel_source_pairing": (
                         "graph-paired; edge/node sources independently sampled"
                     ),
@@ -303,7 +331,46 @@ class MethodologyConfig:
                 for task in self.tasks
                 if str(task).startswith("graphbench_")
             },
-            "raw_score_aggregation": "event -> source -> graph",
+            "raw_score_aggregation": {
+                task: (
+                    "coherent carrier sum -> event -> source -> graph"
+                    if str(task).startswith("graphbench_")
+                    else "transport mass -> event -> source -> graph"
+                )
+                for task in self.tasks
+            },
+            "strong_specialist_validation": {
+                "activity_rule": "J >= families.activity_floor",
+                "continuous_analysis": (
+                    "all active heads; raw D_rel versus restoration, injection, "
+                    "and necessity channel contrasts; Spearman plus J/layer-adjusted "
+                    "standardized regression"
+                ),
+                "candidate_rule": (
+                    "point D_rel beyond +/- families.equivalence_half_width; "
+                    f"strongest {int(self.families.specialist_candidate_limit)} "
+                    "per direction"
+                ),
+                "candidate_seed_minimum_pairs": int(
+                    self.families.specialist_minimum_pairs
+                ),
+                "primary_matching": (
+                    "minimum-total-absolute-J one-to-one assignment within seed, "
+                    "without replacement; layer retained as a balance audit"
+                ),
+                "confirmed_95_rule": (
+                    "semantic lower interval bound above +threshold or structural "
+                    "upper interval bound below -threshold"
+                ),
+                "confirmed_population_rule": (
+                    "at least 8 total pairs across at least 3 trained seeds"
+                ),
+                "bipartite_gpu_targets": (
+                    "individual heads only; directional groups are CPU-side "
+                    "subsets of cached head events"
+                ),
+                "selection_uses_causal_outcomes": False,
+            },
             "functional_estimand": "F_sens",
             "beneficial_carriage": bool(self.compute_beneficial_carriage),
             "beneficial_sign": (

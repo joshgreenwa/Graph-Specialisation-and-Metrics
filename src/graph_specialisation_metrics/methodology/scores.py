@@ -41,10 +41,19 @@ def project_transport(delta, clean_gradient):
     return torch.einsum("elnhd,tlnhd->elhnt", delta, clean_gradient)
 
 
-def event_head_scores(q):
-    """Take output L2 per event/carrier, then sum carriers."""
+def event_head_scores(q, *, system: str = "mass"):
+    """Return one registered event/head score system.
 
-    return q.square().sum(dim=-1).sqrt().sum(dim=-1)
+    ``mass`` takes an output norm at each carrier before summing carriers.
+    ``coherent`` first sums the carrier output-movement vectors and then takes
+    the output norm, so mutually cancelling carrier effects are not counted as
+    independent evidence of head engagement.
+    """
+
+    systems = event_head_score_systems(q)
+    if system not in {"mass", "coherent"}:
+        raise ValueError(f"unknown head score system {system!r}")
+    return systems[system]
 
 
 def event_head_score_systems(q, *, mass_floor: float = 0.0) -> dict[str, Any]:
@@ -198,6 +207,279 @@ def freeze_families(
         central_fraction=central_fraction,
         central_pool_fraction=central_pool_fraction,
     )
+
+
+def freeze_threshold_specialists(
+    coordinates: HeadCoordinates,
+    *,
+    selectivity_interval: tuple[Any, Any],
+    preference_threshold: float,
+    activity_threshold: float,
+    candidate_limit: int = 6,
+    minimum_candidate_pairs: int = 3,
+) -> dict[str, Any]:
+    """Freeze strongest directional candidates and a 95%-confirmed tier.
+
+    The key categorical analysis uses at most ``candidate_limit`` heads on each
+    side whose point estimate clears the fixed preference threshold, ranked by
+    absolute ``D_rel`` and optimally matched on ``J``. The stricter confidence-
+    interval rule is retained as a separately labelled robustness population.
+    Neither selection uses a causal endpoint.
+    """
+
+    J = np.asarray(coordinates.joint_sensitivity, dtype=np.float64)
+    D = np.asarray(coordinates.selectivity, dtype=np.float64)
+    active = np.asarray(coordinates.active, dtype=bool)
+    low, high = (
+        np.asarray(value, dtype=np.float64) for value in selectivity_interval
+    )
+    if (
+        J.shape != D.shape
+        or J.shape != active.shape
+        or low.shape != J.shape
+        or high.shape != J.shape
+    ):
+        raise ValueError(
+            "specialist coordinates and intervals must share [layer,head] shape"
+        )
+    threshold = float(preference_threshold)
+    if threshold <= 0:
+        raise ValueError("specialist preference threshold must be positive")
+    activity_floor = float(activity_threshold)
+    if activity_floor < 0:
+        raise ValueError("specialist activity threshold must be non-negative")
+    candidate_limit = int(candidate_limit)
+    minimum_candidate_pairs = int(minimum_candidate_pairs)
+    if candidate_limit < 1:
+        raise ValueError("specialist candidate limit must be positive")
+    if not 1 <= minimum_candidate_pairs <= candidate_limit:
+        raise ValueError(
+            "minimum candidate pairs must lie between 1 and candidate limit"
+        )
+    active = active & (J >= activity_floor)
+    finite = np.isfinite(J) & np.isfinite(D) & np.isfinite(low) & np.isfinite(high)
+    semantic_candidate_mask = active & finite & (D > threshold)
+    structural_candidate_mask = active & finite & (D < -threshold)
+    semantic_confirmed_mask = semantic_candidate_mask & (low > threshold)
+    structural_confirmed_mask = structural_candidate_mask & (high < -threshold)
+    generalist_mask = active & finite & (D >= -threshold) & (D <= threshold)
+    unresolved_mask = active & ~finite
+    inactive_mask = ~active
+
+    def heads(mask: np.ndarray) -> tuple[tuple[int, int], ...]:
+        return tuple(
+            (int(layer), int(head))
+            for layer, head in np.argwhere(mask).tolist()
+        )
+
+    def mask_for(selected: Sequence[tuple[int, int]]) -> np.ndarray:
+        mask = np.zeros(J.shape, dtype=bool)
+        for head in selected:
+            mask[head] = True
+        return mask
+
+    semantic_candidates = heads(semantic_candidate_mask)
+    structural_candidates = heads(structural_candidate_mask)
+    semantic_confirmed = heads(semantic_confirmed_mask)
+    structural_confirmed = heads(structural_confirmed_mask)
+    ranked_semantic = tuple(
+        sorted(semantic_candidates, key=lambda item: (-float(D[item]), item))
+    )
+    ranked_structural = tuple(
+        sorted(structural_candidates, key=lambda item: (float(D[item]), item))
+    )
+    selected_semantic = ranked_semantic[:candidate_limit]
+    selected_structural = ranked_structural[:candidate_limit]
+
+    def head_record(head: tuple[int, int]) -> dict[str, Any]:
+        direction = "semantic" if float(D[head]) > 0 else "structural"
+        conservative_margin = (
+            float(low[head] - threshold)
+            if direction == "semantic"
+            else float(-threshold - high[head])
+        )
+        return {
+            "head": head,
+            "J": float(J[head]),
+            "D_rel": float(D[head]),
+            "absolute_D_rel": abs(float(D[head])),
+            "conservative_margin": conservative_margin,
+            "confirmed_95": bool(
+                semantic_confirmed_mask[head] or structural_confirmed_mask[head]
+            ),
+        }
+
+    def match(
+        semantic_heads: Sequence[tuple[int, int]],
+        structural_heads: Sequence[tuple[int, int]],
+    ) -> dict[str, Any]:
+        pairs: list[dict[str, Any]] = []
+        if semantic_heads and structural_heads:
+            from scipy.optimize import linear_sum_assignment
+
+            cost = np.asarray(
+                [
+                    [
+                        abs(float(J[sem]) - float(J[struct]))
+                        for struct in structural_heads
+                    ]
+                    for sem in semantic_heads
+                ],
+                dtype=np.float64,
+            )
+            semantic_positions, structural_positions = linear_sum_assignment(cost)
+            for sem_position, struct_position in zip(
+                semantic_positions.tolist(),
+                structural_positions.tolist(),
+            ):
+                sem = tuple(semantic_heads[sem_position])
+                struct = tuple(structural_heads[struct_position])
+                gap = float(cost[sem_position, struct_position])
+                pairs.append(
+                    {
+                        "semantic": sem,
+                        "structural": struct,
+                        "semantic_layer": int(sem[0]),
+                        "structural_layer": int(struct[0]),
+                        "absolute_layer_gap": abs(int(sem[0]) - int(struct[0])),
+                        "semantic_J": float(J[sem]),
+                        "structural_J": float(J[struct]),
+                        "absolute_J_gap": gap,
+                        "semantic_D_rel": float(D[sem]),
+                        "structural_D_rel": float(D[struct]),
+                        "pair_strength": min(abs(float(D[sem])), abs(float(D[struct]))),
+                        "semantic_confirmed_95": bool(
+                            semantic_confirmed_mask[sem]
+                        ),
+                        "structural_confirmed_95": bool(
+                            structural_confirmed_mask[struct]
+                        ),
+                        "pair_confirmed_95": bool(
+                            semantic_confirmed_mask[sem]
+                            and structural_confirmed_mask[struct]
+                        ),
+                    }
+                )
+        semantic_j = np.asarray(
+            [row["semantic_J"] for row in pairs], dtype=np.float64
+        )
+        structural_j = np.asarray(
+            [row["structural_J"] for row in pairs], dtype=np.float64
+        )
+        pooled_scale = (
+            float(np.sqrt(0.5 * (np.var(semantic_j) + np.var(structural_j))))
+            if len(pairs) > 1
+            else np.nan
+        )
+        standardized_difference = (
+            float((np.mean(semantic_j) - np.mean(structural_j)) / pooled_scale)
+            if np.isfinite(pooled_scale) and pooled_scale > 0
+            else np.nan
+        )
+        return {
+            "method": (
+                "minimum-total-absolute-J one-to-one assignment within seed, "
+                "without replacement; layer is a balance audit, not a gate"
+            ),
+            "pairs": tuple(pairs),
+            "matched_pair_count": len(pairs),
+            "mean_semantic_J": (
+                float(np.mean(semantic_j)) if semantic_j.size else np.nan
+            ),
+            "mean_structural_J": (
+                float(np.mean(structural_j)) if structural_j.size else np.nan
+            ),
+            "mean_absolute_J_gap": (
+                float(np.mean([row["absolute_J_gap"] for row in pairs]))
+                if pairs
+                else np.nan
+            ),
+            "mean_absolute_layer_gap": (
+                float(np.mean([row["absolute_layer_gap"] for row in pairs]))
+                if pairs
+                else np.nan
+            ),
+            "exact_layer_pair_fraction": (
+                float(np.mean([row["absolute_layer_gap"] == 0 for row in pairs]))
+                if pairs
+                else np.nan
+            ),
+            "standardized_J_difference": standardized_difference,
+        }
+
+    candidate_matching = match(selected_semantic, selected_structural)
+    confirmed_matching = match(semantic_confirmed, structural_confirmed)
+    candidate_count = int(candidate_matching["matched_pair_count"])
+    confirmed_count = int(confirmed_matching["matched_pair_count"])
+
+    return {
+        "preference_threshold": threshold,
+        "activity_threshold": activity_floor,
+        "selection_uses_causal_outcomes": False,
+        "rule": (
+            "strongest candidates use active point estimates beyond +/- threshold; "
+            "95%-confirmed specialists require the complete D_rel interval beyond "
+            "the same threshold"
+        ),
+        "heads": {
+            "semantic_candidate_pool": semantic_candidates,
+            "structural_candidate_pool": structural_candidates,
+            "semantic_selected": selected_semantic,
+            "structural_selected": selected_structural,
+            "semantic_confirmed_95": semantic_confirmed,
+            "structural_confirmed_95": structural_confirmed,
+            "generalist": heads(generalist_mask),
+            "unresolved": heads(unresolved_mask),
+            "inactive": heads(inactive_mask),
+        },
+        "strength_ranking": {
+            "measure": "descending absolute point-estimate D_rel within direction",
+            "semantic_candidates": tuple(
+                head_record(head) for head in ranked_semantic
+            ),
+            "structural_candidates": tuple(
+                head_record(head) for head in ranked_structural
+            ),
+        },
+        "masks": {
+            "semantic_candidate": semantic_candidate_mask,
+            "structural_candidate": structural_candidate_mask,
+            "semantic_selected": mask_for(selected_semantic),
+            "structural_selected": mask_for(selected_structural),
+            "semantic_confirmed_95": semantic_confirmed_mask,
+            "structural_confirmed_95": structural_confirmed_mask,
+            "generalist": generalist_mask,
+            "unresolved": unresolved_mask,
+            "inactive": inactive_mask,
+        },
+        "candidate_analysis": {
+            "status": (
+                "estimable"
+                if candidate_count >= minimum_candidate_pairs
+                else "not_estimable"
+            ),
+            "candidate_limit_per_direction": candidate_limit,
+            "minimum_pairs_per_seed": minimum_candidate_pairs,
+            "semantic_pool_count": len(semantic_candidates),
+            "structural_pool_count": len(structural_candidates),
+            "selected_semantic_count": len(selected_semantic),
+            "selected_structural_count": len(selected_structural),
+            "j_matching": candidate_matching,
+        },
+        "confirmed_95_robustness": {
+            "status": "available" if confirmed_count else "not_estimable",
+            "population_rule": (
+                "headline robustness requires at least 8 total pairs across at "
+                "least 3 trained seeds"
+            ),
+            "semantic_count": len(semantic_confirmed),
+            "structural_count": len(structural_confirmed),
+            "j_matching": confirmed_matching,
+        },
+        # Compatibility alias for consumers that only need the key categorical
+        # matching record. It now denotes the strongest-candidate analysis.
+        "j_matching": candidate_matching,
+    }
 
 
 def _freeze_family_arrays(

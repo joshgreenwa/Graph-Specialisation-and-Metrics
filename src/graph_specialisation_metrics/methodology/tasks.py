@@ -109,6 +109,9 @@ class CanonicalTask:
     paired_channel_sources: bool = True
     semantic_source_kind: str = "node"
     protocol_extension: str | None = None
+    # GraphBench registers coherent carrier aggregation after the PE-refinement
+    # experiment; the task-general legacy default remains transport mass.
+    raw_score_system: str = "mass"
     bootstrap_seed: int = 17_071
     extra_known_fields: tuple[str, ...] = (
         "num_nodes",
@@ -166,6 +169,7 @@ class GraphBenchTaskSpec:
     task_type: str
     eval_split: str = "val"
     donor_split: str = "train"
+    rrwp_steps: int = 16
     metric_fn: Callable = staticmethod(mae_metric)
     content_adapter: ContentAdapter = field(default_factory=FullNodeContentAdapter)
 
@@ -183,6 +187,11 @@ def register(task: CanonicalTask) -> CanonicalTask:
     if not callable(task.loss_per_graph):
         raise ValueError(
             f"canonical task {task.name!r} must register a callable per-graph loss"
+        )
+    if task.raw_score_system not in {"mass", "coherent"}:
+        raise ValueError(
+            f"canonical task {task.name!r} has unknown raw score system "
+            f"{task.raw_score_system!r}"
         )
     TASKS[task.name] = task
     return task
@@ -317,10 +326,11 @@ for _name, _title, _task_type, _metric in (
             carrier_policy=(
                 "readout_edges" if _task_type == "edge_binary" else "real_nodes"
             ),
-            adapter_version="graphbench-official-grit-edge-semantic-v1",
+            adapter_version="graphbench-official-grit-complete-pe-coherent-v2",
             paired_channel_sources=False,
             semantic_source_kind="edge",
-            protocol_extension="graphbench-edge-semantic-v1",
+            protocol_extension="graphbench-complete-pe-coherent-v2",
+            raw_score_system="coherent",
             extra_known_fields=("num_nodes", "task_type"),
         )
     )

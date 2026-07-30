@@ -44,10 +44,12 @@ Official-GRIT GraphBench AlgoReas use is provided by the repository frontend
 `graphbench-algoreas-hpc/bin/grit_specialisation.py`. It reuses the training runner's exact
 GraphBench conversion, PE cache, upstream GRIT layers, prediction heads, and checkpoint geometry.
 Because matching and flow expose weighted edges rather than swappable node-content rows, this is
-recorded as protocol extension `graphbench-edge-semantic-v1`: semantic sources are edges and
-structural sources remain nodes. Their bootstrap is paired at the graph level while independently
-resampling the two source domains. Existing registered tasks keep the unmodified node-content v3
-intervention and source-paired hierarchy.
+recorded as protocol extension `graphbench-complete-pe-coherent-v2`: semantic sources are edges and
+structural sources remain nodes. The structural event copies the donor's model-visible RRWP role
+plus degree (with log-degree re-derived), and raw scores use coherent output movement. Their
+bootstrap is paired at the graph level while independently resampling the two source domains.
+Existing registered tasks keep the unmodified node-content intervention and source-paired
+hierarchy.
 
 `0` is a stable cache label for the one public model, not a claim about its training seed. A local
 Hugging Face model directory can be supplied in `checkpoints`; a raw `.pt`, `.bin`, or
@@ -237,6 +239,14 @@ range. `selectivity_regime_diagnostics` then shows the ordered active-head inter
 family Jaccard distributions, and interval-containment fractions. Family assignment is rerun in
 all 2,000 coordinate-bootstrap draws; only inclusion probabilities and stability summaries are
 cached, not the full transient draw tensor.
+
+The focused GraphBench bipartite-matching validation adds two score-frozen views.
+`continuous_D_rel_causal_contrasts` uses every active head and reports raw-selectivity Spearman
+correlations plus standardized `J`/layer-adjusted coefficients for restoration, injection, and
+necessity contrasts. `strongest_D_rel_candidate_map` marks the at-most-six strongest point-threshold
+candidates per direction, their optimal `J` matches, and which candidates additionally clear the
+95% interval rule. The candidate double dissociation requires three pairs within seed; the
+confirmed-only cross-seed robustness requires eight pairs across three seeds.
 
 `causal_regime_summary` is the headline regime figure. Its first panel confirms that `J` predicts
 clean and causal importance, its second is a forest plot of gross, necessity, rescue, and induction

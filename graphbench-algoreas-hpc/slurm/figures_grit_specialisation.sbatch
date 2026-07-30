@@ -11,7 +11,7 @@
 set -euo pipefail
 
 PROJECT_ROOT="${PROJECT_ROOT:-/rds/user/jgg45/hpc-work/Graph-Specialisation-and-Metrics}"
-GRAPHBENCH_ANALYSIS_OUTPUT_ROOT="${GRAPHBENCH_ANALYSIS_OUTPUT_ROOT:-/rds/user/jgg45/hpc-work/graphbench-algoreas/outputs/grit_specialisation_graphbench_edge_v1}"
+GRAPHBENCH_ANALYSIS_OUTPUT_ROOT="${GRAPHBENCH_ANALYSIS_OUTPUT_ROOT:-/rds/user/jgg45/hpc-work/graphbench-algoreas/outputs/grit_specialisation_graphbench_complete_pe_v2}"
 GRAPHBENCH_DATASET_ROOT="${GRAPHBENCH_DATASET_ROOT:-/rds/user/jgg45/hpc-work/graphbench-algoreas/datasets}"
 GRAPHBENCH_PE_CACHE_ROOT="${GRAPHBENCH_PE_CACHE_ROOT:-/rds/user/jgg45/hpc-work/graphbench-algoreas/pe_cache}"
 GRAPHBENCH_TRAINING_OUTPUT_ROOT="${GRAPHBENCH_TRAINING_OUTPUT_ROOT:-/rds/user/jgg45/hpc-work/graphbench-algoreas/outputs/graphbench_algoreas_hpc_base_v1}"
@@ -25,9 +25,11 @@ if [[ -n "${ENV_ACTIVATE:-}" ]]; then
 fi
 IFS=':' read -r -a SEED_VALUES <<< "${SEED_LIST:-0:1:2:3}"
 SEEDS_CSV="$(IFS=,; echo "${SEED_VALUES[*]}")"
+ANALYSIS_TASKS_CSV="${TASK_LIST:-bipartite_matching_hard}"
+ANALYSIS_TASKS_CSV="${ANALYSIS_TASKS_CSV//:/,}"
 
 python graphbench-algoreas-hpc/bin/grit_specialisation.py \
-  --tasks bipartite_matching_hard,flow_hard \
+  --tasks "${ANALYSIS_TASKS_CSV}" \
   --seeds "${SEEDS_CSV}" \
   --phases figures \
   --profile "${PROFILE:-production}" \

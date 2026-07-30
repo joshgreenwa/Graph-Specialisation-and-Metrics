@@ -2,8 +2,8 @@
 
 This module deliberately reuses the training runner's data conversion, PE cache, official GRIT
 layers, and prediction heads.  It adds only the task boundary needed by the canonical donor-swap
-estimators: weighted edges are semantic content, while the fixed-topology RRWP footprint is the
-structural channel.
+estimators: weighted edges are semantic content, while the fixed-topology complete positional
+footprint (model-visible RRWP plus degree and derived log-degree) is the structural channel.
 """
 
 from __future__ import annotations
@@ -366,6 +366,16 @@ class GraphBenchDonorEvent(DonorEvent):
     donor_degree_signature: tuple[int, int] | None = None
 
 
+@dataclass(frozen=True)
+class GraphBenchStructuralDonorEvent(DonorEvent):
+    """Auditable complete-PE donor pair selected without degree matching."""
+
+    rrwp_role_distance: float = 0.0
+    distance_stratum: str = ""
+    eligible_pool_size: int = 0
+    realised_donor_count: int = 0
+
+
 class GraphBenchEdgeDonorPool:
     """Graph-balanced, degree-signature-matched edge donor law."""
 
@@ -426,8 +436,8 @@ class GraphBenchEdgeDonorPool:
         return tuple(result)
 
 
-def _rrwp_footprints(graph: Any) -> tuple[bytes, ...]:
-    rrwp = graph.rrwp.detach().cpu().numpy()
+def _rrwp_footprints(graph: Any, *, rrwp_steps: int) -> tuple[bytes, ...]:
+    rrwp = graph.rrwp.detach().cpu().numpy()[..., : int(rrwp_steps)]
     return tuple(
         b"\x1f".join(
             (
@@ -437,6 +447,155 @@ def _rrwp_footprints(graph: Any) -> tuple[bytes, ...]:
         )
         for node in range(int(graph.num_nodes))
     )
+
+
+def _bipartition_sides(graph: Any) -> np.ndarray:
+    """Deterministically two-colour a bipartite matching support."""
+
+    n = int(graph.num_nodes)
+    neighbours: list[set[int]] = [set() for _ in range(n)]
+    for left, right in graph.edge_index.detach().cpu().numpy().T:
+        left, right = int(left), int(right)
+        neighbours[left].add(right)
+        neighbours[right].add(left)
+    side = np.full(n, -1, dtype=np.int64)
+    for root in range(n):
+        if side[root] >= 0:
+            continue
+        side[root] = 0
+        queue = [root]
+        cursor = 0
+        while cursor < len(queue):
+            node = queue[cursor]
+            cursor += 1
+            for other in sorted(neighbours[node]):
+                if side[other] < 0:
+                    side[other] = 1 - side[node]
+                    queue.append(other)
+                elif side[other] == side[node]:
+                    raise RuntimeError("GraphBench matching support is not bipartite")
+    return side
+
+
+def _rrwp_role_distance(
+    graph: Any,
+    source: int,
+    donor: int,
+    *,
+    rrwp_steps: int,
+) -> float:
+    rrwp = graph.rrwp.detach().float()[..., : int(rrwp_steps)]
+    delta = np.concatenate(
+        (
+            (rrwp[int(source), :] - rrwp[int(donor), :])
+            .cpu()
+            .numpy()
+            .reshape(-1),
+            (rrwp[:, int(source)] - rrwp[:, int(donor)])
+            .cpu()
+            .numpy()
+            .reshape(-1),
+        )
+    ).astype(np.float64)
+    return float(np.sqrt(np.mean(np.square(delta))))
+
+
+def _balanced_structural_donors(
+    graph: Any,
+    source: int,
+    footprints: Sequence[bytes],
+    *,
+    count: int,
+    rrwp_steps: int,
+    rng: np.random.Generator,
+) -> tuple[tuple[tuple[int, str, float], ...], int]:
+    """Sample near/middle/far RRWP roles without replacement or degree matching."""
+
+    source = int(source)
+    node_type = graph.node_type.detach().cpu().numpy().reshape(-1)
+    matching = graph.task_type == "edge_binary"
+    sides = _bipartition_sides(graph) if matching else None
+    candidates = [
+        donor
+        for donor in range(int(graph.num_nodes))
+        if donor != source
+        and footprints[donor] != footprints[source]
+        and (
+            not matching
+            or (
+                int(node_type[donor]) == int(node_type[source])
+                and int(sides[donor]) == int(sides[source])
+            )
+        )
+    ]
+    if not candidates:
+        return (), 0
+    distances = {
+        donor: _rrwp_role_distance(
+            graph, source, donor, rrwp_steps=int(rrwp_steps)
+        )
+        for donor in candidates
+    }
+    ordered = sorted(candidates, key=lambda donor: (distances[donor], donor))
+    groups = {
+        label: [int(value) for value in chunk.tolist()]
+        for label, chunk in zip(
+            ("near", "middle", "far"),
+            np.array_split(np.asarray(ordered, dtype=np.int64), 3),
+        )
+    }
+    for label, values in groups.items():
+        if values:
+            groups[label] = [
+                int(value)
+                for value in rng.permutation(np.asarray(values, dtype=np.int64))
+            ]
+    selected: list[tuple[int, str, float]] = []
+    limit = min(int(count), len(candidates))
+    while len(selected) < limit:
+        progressed = False
+        for label in ("near", "middle", "far"):
+            if groups[label]:
+                donor = groups[label].pop()
+                selected.append((donor, label, distances[donor]))
+                progressed = True
+                if len(selected) == limit:
+                    break
+        if not progressed:
+            break
+    return tuple(selected), len(candidates)
+
+
+def _complete_pe_dose(
+    base: Any,
+    event: Any,
+    *,
+    rrwp_steps: int,
+) -> float:
+    """Equal-component standardized dose over RRWP, degree, and log-degree."""
+
+    import torch
+
+    clean_rrwp = base.rrwp.detach().float()[..., : int(rrwp_steps)]
+    event_rrwp = event.rrwp.detach().float()[..., : int(rrwp_steps)]
+    rrwp_rms = torch.sqrt(torch.mean((event_rrwp - clean_rrwp).square()))
+    rrwp_scale = torch.clamp(clean_rrwp.std(), min=1.0e-6)
+    clean_degree = _model_degree(base).detach().float()
+    event_degree = _model_degree(event).detach().float()
+    degree_rms = torch.sqrt(torch.mean((event_degree - clean_degree).square()))
+    degree_scale = max(float(clean_degree.std().item()), 1.0)
+    log_clean = torch.log1p(clean_degree)
+    log_event = torch.log1p(event_degree)
+    log_rms = torch.sqrt(torch.mean((log_event - log_clean).square()))
+    log_scale = max(float(log_clean.std().item()), 1.0e-6)
+    components = torch.stack(
+        (
+            rrwp_rms / rrwp_scale,
+            degree_rms / degree_scale,
+            log_rms / log_scale,
+        )
+    )
+    return float(torch.sqrt(torch.mean(components.square())).item())
 
 
 def build_graphbench_channel_events(
@@ -449,9 +608,8 @@ def build_graphbench_channel_events(
     donors: int,
     rng: np.random.Generator,
     semantic_pool: GraphBenchEdgeDonorPool,
+    rrwp_steps: int = 16,
 ) -> tuple[list[Any], list[DonorEvent]]:
-    from .sampling import draw_structural_donors
-
     variants: list[Any] = []
     records: list[DonorEvent] = []
     if channel == "semantic":
@@ -491,24 +649,39 @@ def build_graphbench_channel_events(
         return variants, records
     if channel != "structural":
         raise ValueError(f"unknown GraphBench channel {channel!r}")
-    footprints = _rrwp_footprints(base)
+    rrwp_steps = min(int(rrwp_steps), int(base.rrwp.shape[-1]))
+    footprints = _rrwp_footprints(base, rrwp_steps=rrwp_steps)
     degrees = _graph_degrees(base)
-    selected = draw_structural_donors(
-        footprints,
-        degrees,
+    selected, eligible_pool_size = _balanced_structural_donors(
+        base,
         int(source),
-        int(donors),
-        rng,
-        equal=lambda left, right: left == right,
+        footprints,
+        count=int(donors),
+        rrwp_steps=rrwp_steps,
+        rng=rng,
     )
-    for draw, donor in enumerate(selected):
+    for draw, (donor, stratum, role_distance) in enumerate(selected):
         donor = int(donor)
-        event = structural_rrwp_swap(base, source, donor)
-        verify_structural_rrwp_swap(base, event, source, donor)
-        delta = event.rrwp.float() - base.rrwp.float()
+        event = structural_pe_intervention(
+            base,
+            source,
+            donor,
+            complete_pe=True,
+            transpose=False,
+            rrwp_steps=rrwp_steps,
+        )
+        verify_structural_pe_intervention(
+            base,
+            event,
+            source,
+            donor,
+            complete_pe=True,
+            transpose=False,
+            rrwp_steps=rrwp_steps,
+        )
         variants.append(event)
         records.append(
-            DonorEvent(
+            GraphBenchStructuralDonorEvent(
                 channel=channel,
                 stage=stage,
                 graph_id=int(graph_id),
@@ -518,11 +691,21 @@ def build_graphbench_channel_events(
                 source_degree=int(degrees[source]),
                 donor_degree=int(degrees[donor]),
                 degree_gap=abs(int(degrees[source]) - int(degrees[donor])),
-                dose=float(delta.square().mean().sqrt()),
+                dose=_complete_pe_dose(
+                    base, event, rrwp_steps=rrwp_steps
+                ),
                 payload_fingerprint=stable_hash(
-                    {"structural_footprint": footprints[donor].hex()}
+                    {
+                        "intervention": "complete_pe_copy",
+                        "rrwp_footprint": footprints[donor].hex(),
+                        "degree": int(degrees[donor]),
+                    }
                 ),
                 draw=int(draw),
+                rrwp_role_distance=float(role_distance),
+                distance_stratum=str(stratum),
+                eligible_pool_size=int(eligible_pool_size),
+                realised_donor_count=len(selected),
             )
         )
     return variants, records

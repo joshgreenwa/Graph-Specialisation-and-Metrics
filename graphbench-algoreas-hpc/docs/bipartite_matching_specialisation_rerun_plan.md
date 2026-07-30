@@ -1,11 +1,15 @@
 # Bipartite matching GRIT structural-PE refinement
 
-**Status:** corrected v2 implementation locally verified; ready for exact-data HPC preflight
-**Last updated:** 2026-07-30
-**Implementation branch:** `expansion/graphormer_specialisation`
-**Protocol:** `graphbench-matching-pe-refinement-v2`
-**Task:** `graphbench_bipartite_matching_hard` only
-**Models:** official-GRIT checkpoints, training seeds `0,1,2,3`
+The focused causal-validation specification for the locked method is maintained
+in
+[`bipartite_matching_causal_validation_plan.md`](bipartite_matching_causal_validation_plan.md).
+
+**Status:** refinement complete; production choice locked
+**Last updated:** 2026-07-31
+**Implementation branch:** `expansion/graphormer_specialisation`  
+**Protocol:** `graphbench-matching-pe-refinement-v2`  
+**Task:** `graphbench_bipartite_matching_hard` only  
+**Models:** official-GRIT checkpoints, training seeds `0,1,2,3`  
 **Analysis population:** GraphBench `n=16` validation split  
 
 ## 1. Decision this run must make
@@ -23,6 +27,10 @@ The released task identifier is misleading: the official GraphBench generator sa
 graphs and labels `networkx.max_weight_matching`. The released graphs have no bipartition feature,
 and many supports contain odd cycles. No partition may therefore be inferred or used as a donor
 constraint. The v1 attempt did so and is scientifically invalid; v2 uses a fresh output namespace.
+
+**Locked production choice:** `complete_pe_copy` with `coherent` output-movement scoring.
+Node transposition is rejected. RRWP-only donor-copy remains a positive ablation and transport mass
+remains a secondary diagnostic.
 
 ## 2. Registered four-arm factorial
 
@@ -281,10 +289,10 @@ Soft audits are cached and flagged but do not terminate production.
 - [x] Refinement/confirmation lockbox.
 - [x] Atomic common/arm caches and component progress.
 - [x] Slurm common/arm/finalizer DAG with six-hour GPU and CPU safety limits.
-- [x] Complete corrected v2 local unit/static/contract verification (`240 passed, 1 skipped`).
-- [ ] Refresh HPC checkout and run new preflight.
-- [ ] Queue production DAG.
-- [ ] Inspect refinement outputs and write selection lock.
+- [x] Inspect refinement outputs and write selection lock.
+- [x] Complete corrected v2 and locked causal-protocol verification (`252 passed, 1 skipped`).
+- [ ] Refresh HPC checkout and run the focused causal preflight.
+- [ ] Queue focused causal production.
 - [ ] Run confirmation finalizer for the locked candidate.
 
 ## 12. Results log
@@ -293,4 +301,5 @@ Soft audits are cached and flagged but do not terminate production.
 |---|---|---|---|---|
 | 2026-07-27 | draft | earlier degree-law rerun | superseded | Replaced by four-arm PE factorial |
 | 2026-07-28 | v1 | implementation | invalidated | Incorrectly assumed released supports were bipartite |
-| 2026-07-30 | v2 | correction | in progress | Registered released general-graph maximum-weight-matching semantics |
+| 2026-07-30 | v2 | correction | complete | Registered released general-graph maximum-weight-matching semantics |
+| 2026-07-31 | v2 | refinement decision | locked | Complete-PE donor-copy + coherent score selected; transposition rejected |

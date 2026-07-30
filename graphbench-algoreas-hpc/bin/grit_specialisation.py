@@ -92,7 +92,7 @@ def parser() -> argparse.ArgumentParser:
         type=Path,
         default=Path(
             "/rds/user/jgg45/hpc-work/graphbench-algoreas/outputs/"
-            "grit_specialisation_graphbench_edge_v1"
+            "grit_specialisation_graphbench_complete_pe_v2"
         ),
     )
     value.add_argument(
