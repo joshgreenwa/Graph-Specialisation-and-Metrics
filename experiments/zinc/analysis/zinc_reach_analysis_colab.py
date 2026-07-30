@@ -29,7 +29,7 @@ SECRET_NAME = "dissertation_key"
 PHASE = "all"  # "all", "measure", or "figures"
 OUTPUT_DIR = Path(
     "/content/drive/MyDrive/graph_specialisation_metrics/"
-    "zinc_bamberger_functional_reach_v3"
+    "zinc_bamberger_functional_reach_v4"
 )
 TASKS = "zinc_1hop,zinc_2hop,zinc_1hop_vnode,zinc"
 SEED = 0
@@ -164,11 +164,16 @@ from graph_specialisation_metrics.zinc_reach_analysis import main
 
 print(
     "\n[scope] Semantic: literal Bamberger pre-pooling Jacobian range and "
-    "finite Functional carriage.\n"
+    "finite Functional carriage, decomposed through a donor-direction Jacobian "
+    "and raw finite hidden-state response.\n"
     "[scope] Structural: finite Functional carriage only; "
     "Bamberger has no canonical structural intervention analogue.\n"
-    "[scope] Interpretation: compare distance-profile shape and model ordering. "
-    "There is no learned-route ground truth on ZINC.\n"
+    "[scope] Fairness: checkpoints, graphs, SPD and carrier site are shared. "
+    "The donor-direction, raw-finite and Functional profiles use identical donor "
+    "events; literal Bamberger remains output-centric and channel-subsampled.\n"
+    "[scope] Interpretation: this is an estimand comparison, not a claim that "
+    "the two methods measure the same quantity. There is no learned-route ground "
+    "truth on ZINC.\n"
     "[scope] Uncertainty: 95% held-out-graph bootstrap from one seed-0 checkpoint "
     "per architecture; it does not include training-seed variance.\n",
     flush=True,
@@ -235,6 +240,7 @@ if "figures" in result:
     from IPython.display import Image, display
 
     for name in (
+        "semantic_decomposition",
         "semantic_functional",
         "semantic_bamberger",
         "structural_functional",

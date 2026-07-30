@@ -7,6 +7,8 @@ This extension keeps two comparisons separate:
   differentiable one-hot vector followed by the checkpoint's learned embedding.
 * Functional carriage is evaluated at final pre-pooling node states for exact
   semantic or structural donor events.
+* Semantic profiles are decomposed into the realised donor-direction Jacobian,
+  raw finite hidden-state response, and task-projected Functional carriage.
 
 The Bamberger proxy has no canonical structural-donor counterpart.  It is
 therefore shown only for semantic usage; structural usage reports Functional
@@ -43,7 +45,7 @@ from .methodology.runner import prepare_task
 from .methodology.sampling import sample_sources
 
 
-ANALYSIS_VERSION = "zinc-bamberger-functional-reach-v3"
+ANALYSIS_VERSION = "zinc-bamberger-functional-reach-v4"
 TASKS = ("zinc_1hop", "zinc_2hop", "zinc_1hop_vnode", "zinc")
 TASK_LABELS = {
     "zinc_1hop": "1-hop GRIT",
@@ -53,17 +55,40 @@ TASK_LABELS = {
 }
 CHANNELS = ("semantic", "structural")
 DONOR_METHODS = ("functional_carriage",)
+DONOR_PROFILE_METHODS = (
+    "directional_jacobian",
+    "finite_hidden_response",
+    "functional_carriage",
+)
+DECOMPOSITION_METHODS = (
+    "bamberger",
+    "directional_jacobian",
+    "finite_hidden_response",
+    "functional_carriage",
+)
 METHOD_LABELS = {
-    "bamberger": "Bamberger Jacobian range",
-    "functional_carriage": "Functional carriage",
+    "bamberger": "Bamberger (coordinatewise Jacobian)",
+    "directional_jacobian": "Donor-direction Jacobian",
+    "finite_hidden_response": "Finite hidden-state response",
+    "functional_carriage": "Functional carriage (task-projected)",
 }
 METHOD_COLOURS = {
     "bamberger": "#202020",
+    "directional_jacobian": "#0072B2",
+    "finite_hidden_response": "#009E73",
     "functional_carriage": "#D55E00",
 }
 METHOD_MARKERS = {
     "bamberger": "^",
+    "directional_jacobian": "o",
+    "finite_hidden_response": "D",
     "functional_carriage": "s",
+}
+METHOD_LINESTYLES = {
+    "bamberger": "-",
+    "directional_jacobian": "--",
+    "finite_hidden_response": "-.",
+    "functional_carriage": ":",
 }
 MODEL_COLOURS = {
     "zinc_1hop": "#0072B2",
@@ -144,6 +169,13 @@ class ZincReachConfig:
             "bamberger_estimand": (
                 "mean node-level pre-pooling range from entrywise-absolute Jacobians "
                 "with respect to differentiable one-hot atom inputs"
+            ),
+            "directional_jacobian_estimand": (
+                "pre-pooling hidden-state Jacobian-vector response along each realised "
+                "clean-to-donor one-hot atom direction"
+            ),
+            "finite_hidden_estimand": (
+                "finite clean-minus-donor final pre-pooling hidden-state response"
             ),
             "aggregation": (
                 "donor-normalise; donor -> source -> graph; 95% graph bootstrap"
@@ -473,6 +505,68 @@ def _bamberger_rows(
     return rows
 
 
+def _semantic_directional_jacobian_mass(
+    prepared: Any,
+    *,
+    base: Any,
+    variants: Sequence[Any],
+    events: Sequence[Any],
+) -> Any:
+    """Return ``[event, carrier]`` clean-point JVP norms for realised donor directions."""
+
+    import torch
+    import torch.nn.functional as functional
+
+    if len(variants) != len(events):
+        raise ValueError("semantic variants and events are misaligned")
+    net = prepared.runtime.model.model
+    with torch.no_grad():
+        after_encoder, raw_atoms, embedding = _after_feature_encoder(prepared, [base])
+    clean_one_hot = functional.one_hot(
+        raw_atoms,
+        num_classes=int(embedding.num_embeddings),
+    ).to(dtype=embedding.weight.dtype)
+
+    def forward(atom_probabilities: Any) -> Any:
+        data = after_encoder.clone()
+        data.x = atom_probabilities @ embedding.weight
+        layer_input = _finish_encoding(net, data)
+        return _forward_final(
+            net,
+            layer_input,
+            layer_input.x,
+            layer_input.edge_attr,
+            _real_mask(layer_input),
+        )
+
+    cached: dict[tuple[int, int], Any] = {}
+    responses: list[Any] = []
+    for variant, event in zip(variants, events):
+        source = int(event.source)
+        donor_atom = int(variant.x[source].reshape(-1)[0])
+        clean_atom = int(raw_atoms[source])
+        key = (source, donor_atom)
+        if key not in cached:
+            if donor_atom == clean_atom:
+                raise RuntimeError("semantic donor direction is identically zero")
+            direction = torch.zeros_like(clean_one_hot)
+            direction[source, donor_atom] = 1
+            direction[source, clean_atom] = -1
+            _, tangent = torch.autograd.functional.jvp(
+                forward,
+                clean_one_hot,
+                direction,
+                create_graph=False,
+                strict=False,
+            )
+            response = torch.linalg.vector_norm(tangent, dim=-1)
+            if not bool(torch.isfinite(response).all()):
+                raise RuntimeError("non-finite donor-direction Jacobian response")
+            cached[key] = response.detach()
+        responses.append(cached[key])
+    return torch.stack(responses, dim=0)
+
+
 def _project_final_change(change: Any, clean_gradient: Any) -> Any:
     """Project ``[E,N,W]`` changes through ``[T,N,W]`` and return ``[E,N]``."""
 
@@ -498,6 +592,7 @@ def _donor_rows(
     variants: Sequence[Any],
     events: Sequence[Any],
     clean_jacobians: Any,
+    directional_mass: Any | None,
 ) -> list[dict[str, Any]]:
     """Evaluate finite Functional-carriage mass for one graph/channel."""
 
@@ -507,10 +602,21 @@ def _donor_rows(
     finite_change = clean_jacobians.capture.final_state.unsqueeze(0) - capture.final_state[1:]
     gradient = clean_jacobians.final_state
     finite_mass = _project_final_change(finite_change, gradient)
-    if not bool(torch.isfinite(finite_mass).all()):
+    finite_hidden_mass = torch.linalg.vector_norm(finite_change, dim=-1)
+    if not bool(
+        torch.isfinite(finite_mass).all()
+        and torch.isfinite(finite_hidden_mass).all()
+    ):
         raise RuntimeError("non-finite final-state reach mass")
     if len(events) != int(finite_mass.shape[0]):
         raise RuntimeError("event manifest and carrier tensor are misaligned")
+    if channel == "semantic":
+        if directional_mass is None:
+            raise RuntimeError("semantic events require donor-direction Jacobian mass")
+        if tuple(directional_mass.shape) != tuple(finite_mass.shape):
+            raise RuntimeError("directional and finite carrier geometries differ")
+    elif directional_mass is not None:
+        raise RuntimeError("directional Jacobian mass is semantic-only")
 
     distances = shortest_path_distances(base.edge_index, int(base.num_nodes))
     rows: list[dict[str, Any]] = []
@@ -519,27 +625,33 @@ def _donor_rows(
         if source not in sources:
             raise RuntimeError("event source is absent from the frozen source set")
         for carrier in range(int(base.num_nodes)):
-            rows.append(
-                {
-                    "analysis_version": ANALYSIS_VERSION,
-                    "fingerprint": config.fingerprint,
-                    "task": task,
-                    "model_label": TASK_LABELS[task],
-                    "seed": int(config.seed),
-                    "graph": int(graph_id),
-                    "channel": channel,
-                    "source": source,
-                    "donor_graph": int(event.donor_graph_id),
-                    "donor_node": int(event.donor_node),
-                    "draw": int(event.draw),
-                    "dose": float(event.dose),
-                    "carrier": int(carrier),
-                    "distance": int(distances[source, carrier]),
-                    "functional_carriage": float(
-                        finite_mass[event_index, carrier].detach().cpu()
-                    ),
-                }
-            )
+            row = {
+                "analysis_version": ANALYSIS_VERSION,
+                "fingerprint": config.fingerprint,
+                "task": task,
+                "model_label": TASK_LABELS[task],
+                "seed": int(config.seed),
+                "graph": int(graph_id),
+                "channel": channel,
+                "source": source,
+                "donor_graph": int(event.donor_graph_id),
+                "donor_node": int(event.donor_node),
+                "draw": int(event.draw),
+                "dose": float(event.dose),
+                "carrier": int(carrier),
+                "distance": int(distances[source, carrier]),
+                "functional_carriage": float(
+                    finite_mass[event_index, carrier].detach().cpu()
+                ),
+            }
+            if channel == "semantic":
+                row["directional_jacobian"] = float(
+                    directional_mass[event_index, carrier].detach().cpu()
+                )
+                row["finite_hidden_response"] = float(
+                    finite_hidden_mass[event_index, carrier].detach().cpu()
+                )
+            rows.append(row)
     return rows
 
 
@@ -597,6 +709,16 @@ def _measure_graph(
                 flush=True,
             )
             continue
+        directional_mass = (
+            _semantic_directional_jacobian_mass(
+                prepared,
+                base=base,
+                variants=variants,
+                events=events,
+            )
+            if channel == "semantic"
+            else None
+        )
         rows = _donor_rows(
             config,
             prepared,
@@ -608,6 +730,7 @@ def _measure_graph(
             variants=variants,
             events=events,
             clean_jacobians=clean_jacobians,
+            directional_mass=directional_mass,
         )
         donor_rows.extend(rows)
         if torch.cuda.is_available():
@@ -759,7 +882,8 @@ def measure(
             "bamberger_rows": len(bamberger_rows),
             "comparison_scope": {
                 "semantic": (
-                    "literal Bamberger pre-pooling Jacobian proxy plus finite "
+                    "literal Bamberger pre-pooling Jacobian proxy, realised donor-direction "
+                    "Jacobian response, raw finite hidden-state response, and task-projected "
                     "Functional carriage"
                 ),
                 "structural": (
@@ -769,6 +893,27 @@ def measure(
                 "ground_truth": (
                     "none for learned ZINC range; architecture constrains accessibility "
                     "but does not specify the learned usage distribution"
+                ),
+            },
+            "comparison_fairness": {
+                "shared": (
+                    "checkpoint, held-out graphs, original-graph SPD, final pre-pooling "
+                    "carrier site, and graph-level bootstrap unit"
+                ),
+                "matched_decomposition": (
+                    "directional Jacobian, finite hidden response, and Functional carriage "
+                    "share sources, donor draws, source-to-carrier distances, and event-wise "
+                    "normalisation"
+                ),
+                "literal_bamberger_difference": (
+                    "Bamberger remains output-centric, uses all input nodes and sampled "
+                    "output nodes/channels, sums absolute coordinatewise derivatives, and "
+                    "normalises per output node"
+                ),
+                "interpretation": (
+                    "fair comparison of operational estimands, not an estimator-equivalence "
+                    "test; the matched three-stage decomposition isolates local direction, "
+                    "finite nonlinearity, and task-readout filtering"
                 ),
             },
         },
@@ -821,7 +966,14 @@ def graph_donor_profiles(
             int(task_max_distance[task]),
             int(distances.max(initial=0)),
         )
-        for method in DONOR_METHODS:
+        for method in DONOR_PROFILE_METHODS:
+            availability = [method in row and row[method] != "" for row in event_rows]
+            if not any(availability):
+                continue
+            if not all(availability):
+                raise RuntimeError(
+                    f"method {method!r} is present for only part of one donor event"
+                )
             masses = np.asarray(
                 [_float(row, method) for row in event_rows],
                 dtype=np.float64,
@@ -1325,6 +1477,113 @@ def plot_model_profiles(
     return _save_figure(fig, figures_dir, filename)
 
 
+def plot_semantic_decomposition(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    figures_dir: Path,
+) -> dict[str, str]:
+    """Plot the four-stage semantic estimand decomposition in model facets."""
+
+    import matplotlib.pyplot as plt
+
+    _figure_theme()
+    fig, axes = plt.subplots(
+        2,
+        2,
+        figsize=(11.8, 7.8),
+        sharex=True,
+        sharey=True,
+    )
+    maximum_distance = 0
+    for axis, task in zip(axes.reshape(-1), TASKS):
+        for draw_order, method in enumerate(DECOMPOSITION_METHODS):
+            values = sorted(
+                (
+                    row
+                    for row in rows
+                    if str(row["task"]) == task
+                    and str(row["channel"]) == "semantic"
+                    and str(row["method"]) == method
+                ),
+                key=lambda row: _integer(row, "distance"),
+            )
+            if not values:
+                raise RuntimeError(
+                    f"semantic decomposition is missing {method!r} for {task!r}; "
+                    "rerun PHASE='all' with the current analysis version"
+                )
+            x = np.asarray([_integer(value, "distance") for value in values])
+            y = np.asarray([_float(value, "mean") for value in values])
+            low = np.asarray([_float(value, "low") for value in values])
+            high = np.asarray([_float(value, "high") for value in values])
+            maximum_distance = max(maximum_distance, int(x.max(initial=0)))
+            axis.fill_between(
+                x,
+                low,
+                high,
+                color=METHOD_COLOURS[method],
+                alpha=0.07,
+                linewidth=0,
+                zorder=1 + draw_order,
+            )
+            axis.plot(
+                x,
+                y,
+                color=METHOD_COLOURS[method],
+                marker=METHOD_MARKERS[method],
+                linestyle=METHOD_LINESTYLES[method],
+                markerfacecolor="white",
+                markeredgewidth=1.0,
+                markersize=4.2,
+                linewidth=1.8,
+                label=METHOD_LABELS[method],
+                zorder=5 + draw_order,
+            )
+        axis.set_title(TASK_LABELS[task])
+        axis.set_ylim(bottom=0)
+        axis.xaxis.set_major_locator(plt.MaxNLocator(integer=True))
+
+    for axis in axes[:, 0]:
+        axis.set_ylabel("Normalised usage mass")
+    for axis in axes[-1, :]:
+        axis.set_xlabel("Shortest-path distance")
+    for axis in axes.reshape(-1):
+        axis.set_xlim(-0.15, maximum_distance + 0.15)
+
+    handles, labels = axes[0, 0].get_legend_handles_labels()
+    fig.legend(
+        handles,
+        labels,
+        loc="upper center",
+        bbox_to_anchor=(0.5, 0.938),
+        ncol=2,
+        frameon=False,
+        handlelength=3.0,
+        columnspacing=2.0,
+    )
+    fig.suptitle("Semantic distance profiles across influence estimands", fontsize=13, y=0.992)
+    fig.text(
+        0.5,
+        0.842,
+        (
+            "Donor-direction, finite-response and Functional profiles share donor events; "
+            "Bamberger retains its output-centric sampling"
+        ),
+        ha="center",
+        color="#666666",
+        fontsize=8.5,
+    )
+    fig.subplots_adjust(
+        left=0.08,
+        right=0.985,
+        bottom=0.09,
+        top=0.79,
+        hspace=0.22,
+        wspace=0.10,
+    )
+    return _save_figure(fig, figures_dir, "zinc_semantic_estimand_decomposition")
+
+
 def plot_expected_distance(
     rows: Sequence[Mapping[str, Any]],
     *,
@@ -1450,6 +1709,10 @@ def figures(
 
     figures_dir = output_dir / "figures"
     paths = {
+        "semantic_decomposition": plot_semantic_decomposition(
+            profile_rows,
+            figures_dir=figures_dir,
+        ),
         "semantic_functional": plot_model_profiles(
             profile_rows,
             contrast_rows,
@@ -1511,7 +1774,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--output-dir",
         default=(
             "/content/drive/MyDrive/graph_specialisation_metrics/"
-            "zinc_bamberger_functional_reach_v3"
+            "zinc_bamberger_functional_reach_v4"
         ),
     )
     parser.add_argument("--tasks", default=",".join(TASKS))

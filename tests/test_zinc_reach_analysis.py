@@ -1,7 +1,10 @@
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
+import torch
 
+import graph_specialisation_metrics.zinc_reach_analysis as reach
 from graph_specialisation_metrics.zinc_reach_analysis import (
     TASKS,
     ZincReachConfig,
@@ -12,6 +15,61 @@ from graph_specialisation_metrics.zinc_reach_analysis import (
     summarise_dense_profile_contrasts,
     summarise_graph_profiles,
 )
+
+
+def test_donor_direction_jacobian_matches_linear_response(monkeypatch):
+    class Data:
+        def __init__(self, x, edge_attr=None):
+            self.x = x
+            self.edge_attr = edge_attr
+
+        def clone(self):
+            return Data(self.x.clone(), self.edge_attr)
+
+    class Layers(torch.nn.Module):
+        def __init__(self, mixing):
+            super().__init__()
+            self.register_buffer("mixing", mixing)
+
+        def forward(self, data):
+            output = data.clone()
+            output.x = self.mixing @ data.x
+            return output
+
+    embedding = torch.nn.Embedding(21, 3)
+    with torch.no_grad():
+        embedding.weight.copy_(torch.arange(63, dtype=torch.float32).reshape(21, 3) / 10)
+    raw_atoms = torch.tensor([1, 4, 7], dtype=torch.long)
+    mixing = torch.tensor(
+        [[1.0, 0.5, 0.0], [0.25, 1.0, 0.5], [0.0, 0.75, 1.0]]
+    )
+    net = SimpleNamespace(layers=Layers(mixing))
+    prepared = SimpleNamespace(
+        runtime=SimpleNamespace(model=SimpleNamespace(model=net))
+    )
+    after_encoder = Data(embedding(raw_atoms).detach())
+    monkeypatch.setattr(
+        reach,
+        "_after_feature_encoder",
+        lambda _prepared, _graphs: (after_encoder, raw_atoms, embedding),
+    )
+    variants = [
+        Data(torch.tensor([[1], [6], [7]])),
+        Data(torch.tensor([[1], [6], [7]])),
+    ]
+    events = [SimpleNamespace(source=1), SimpleNamespace(source=1)]
+
+    actual = reach._semantic_directional_jacobian_mass(
+        prepared,
+        base=Data(raw_atoms[:, None]),
+        variants=variants,
+        events=events,
+    )
+    donor_direction = embedding.weight[6] - embedding.weight[4]
+    expected = (
+        mixing[:, 1].abs() * torch.linalg.vector_norm(donor_direction)
+    ).repeat(2, 1)
+    assert torch.allclose(actual, expected)
 
 
 def test_discover_seed_checkpoint_prefers_recovery_best(tmp_path: Path):
@@ -45,21 +103,27 @@ def _raw_rows():
         for graph in (0, 1):
             for channel in ("semantic", "structural"):
                 for distance in (0, 1, 2):
-                    donor.append(
-                        {
-                            "task": task,
-                            "graph": graph,
-                            "channel": channel,
-                            "source": 0,
-                            "donor_graph": 9,
-                            "donor_node": 1,
-                            "draw": 0,
-                            "distance": distance,
-                            "functional_carriage": (
-                                (1 + distance) + 0.2 * task_index
-                            ),
-                        }
-                    )
+                    row = {
+                        "task": task,
+                        "graph": graph,
+                        "channel": channel,
+                        "source": 0,
+                        "donor_graph": 9,
+                        "donor_node": 1,
+                        "draw": 0,
+                        "distance": distance,
+                        "functional_carriage": (
+                            (1 + distance) + 0.2 * task_index
+                        ),
+                    }
+                    if channel == "semantic":
+                        row["directional_jacobian"] = (
+                            (3 - distance) + 0.1 * task_index
+                        )
+                        row["finite_hidden_response"] = (
+                            2 + 0.5 * distance + 0.15 * task_index
+                        )
+                    donor.append(row)
             for output_node in (0, 1):
                 for input_node, distance in enumerate((0, 1, 2)):
                     bamberger.append(
@@ -92,6 +156,21 @@ def test_profile_scope_and_normalisation():
         row["channel"] == "structural" and row["method"] == "bamberger"
         for row in graph_rows
     )
+    assert {
+        row["method"]
+        for row in graph_rows
+        if row["channel"] == "semantic"
+    } == {
+        "bamberger",
+        "directional_jacobian",
+        "finite_hidden_response",
+        "functional_carriage",
+    }
+    assert {
+        row["method"]
+        for row in graph_rows
+        if row["channel"] == "structural"
+    } == {"functional_carriage"}
 
     profiles, expected = summarise_graph_profiles(
         graph_rows,
@@ -136,6 +215,7 @@ def test_figure_only_builds_png_and_pdf(tmp_path: Path):
         output_dir=tmp_path,
     )
     assert set(result["figures"]) == {
+        "semantic_decomposition",
         "semantic_functional",
         "semantic_bamberger",
         "structural_functional",
