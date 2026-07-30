@@ -4,6 +4,10 @@ This experiment is intentionally separate from the canonical carriage runner. It
 official GraphBench/GRIT adapter, its per-head routed-value hook, semantic donor swap, exact
 activation patch sites, soft audit ledger, and graph-balanced estimators while narrowing the
 scientific scope to the structural-intervention decision.
+
+Despite the released ``bipartite_matching`` identifier, GraphBench generates ordinary graphs and
+labels a NetworkX maximum-weight matching.  The released input has no bipartition feature.  This
+module therefore treats the support as a general graph and never invents a partition role.
 """
 
 from __future__ import annotations
@@ -15,6 +19,7 @@ import subprocess
 from dataclasses import asdict, dataclass
 from functools import lru_cache
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Mapping, Sequence
 
 import numpy as np
@@ -45,7 +50,7 @@ from .scores import event_head_score_systems, head_coordinates, project_transpor
 from .tasks import get_task
 
 
-PE_REFINEMENT_VERSION = "graphbench-bipartite-pe-refinement-v1"
+PE_REFINEMENT_VERSION = "graphbench-matching-pe-refinement-v2"
 TASK_NAME = "graphbench_bipartite_matching_hard"
 STRUCTURAL_ARMS = (
     "rrwp_copy",
@@ -141,13 +146,17 @@ class PERefinementConfig:
             "structural_arms": list(STRUCTURAL_ARMS),
             "score_systems": list(SCORE_SYSTEMS),
             "semantic_intervention": "reciprocal-edge-unit donor value swap",
+            "released_task_semantics": (
+                "general undirected graph; maximum-weight matching; the released "
+                "bipartite_matching identifier does not supply a bipartition"
+            ),
             "semantic_donor_law": (
                 "external training graph; different edge value; minimum endpoint-degree-signature "
                 "gap; graph-uniform then edge-uniform; iid replacement"
             ),
             "structural_pair_law": (
-                "same node type and inferred bipartition side; non-identical RRWP role; "
-                "near/middle/far RRWP-role strata; unique without replacement; no degree match"
+                "same model-visible node type; non-identical RRWP role; near/middle/far "
+                "RRWP-role strata; unique without replacement; no degree or partition match"
             ),
             "structural_interventions": {
                 "rrwp_copy": "RRWP incident row/column/self donor copy",
@@ -386,10 +395,33 @@ def _registered_split_sizes(config: PERefinementConfig) -> RunSizes:
     )
 
 
-def audit_existing_pe_refinement_cache(config: PERefinementConfig) -> int:
-    """Fail on incompatible/corrupt existing shards before submitting GPU jobs."""
+def _load_torch_payload(path: Path, *, mmap: bool = False) -> Any:
+    """Read a Torch payload across the PyTorch 2.2 and current path APIs."""
 
     import torch
+
+    resolved = str(Path(path))
+    if mmap:
+        try:
+            return torch.load(
+                resolved,
+                map_location="cpu",
+                weights_only=False,
+                mmap=True,
+            )
+        except (TypeError, ValueError, RuntimeError):
+            # PyTorch 2.2 has a narrower mmap/path contract, and some valid legacy
+            # archives cannot be memory-mapped.  The ordinary read is equivalent.
+            pass
+    return torch.load(
+        resolved,
+        map_location="cpu",
+        weights_only=False,
+    )
+
+
+def audit_existing_pe_refinement_cache(config: PERefinementConfig) -> int:
+    """Fail on incompatible/corrupt existing shards before submitting GPU jobs."""
 
     config.validate()
     # Production preflight already requires the registered 40k-train/4k-validation
@@ -422,19 +454,7 @@ def audit_existing_pe_refinement_cache(config: PERefinementConfig) -> int:
                     )
                 namespace = f"arms/{relative.parts[1]}"
             try:
-                try:
-                    payload = torch.load(
-                        str(path),
-                        map_location="cpu",
-                        weights_only=False,
-                        mmap=True,
-                    )
-                except (TypeError, ValueError, RuntimeError):
-                    payload = torch.load(
-                        str(path),
-                        map_location="cpu",
-                        weights_only=False,
-                    )
+                payload = _load_torch_payload(path, mmap=True)
             except (OSError, RuntimeError, EOFError) as error:
                 raise StaleCacheError(
                     f"protected PE-refinement shard is unreadable during "
@@ -468,6 +488,254 @@ def audit_existing_pe_refinement_cache(config: PERefinementConfig) -> int:
         flush=True,
     )
     return checked
+
+
+def audit_matching_input_caches(
+    config: PERefinementConfig,
+    *,
+    subset_cache: Path,
+    pe_cache: Path,
+) -> dict[str, Any]:
+    """Exercise the exact registered graph/PE donor path before any Slurm call.
+
+    This is intentionally a production-data preflight, not a synthetic smoke test.
+    It validates every discovery/causal graph selected by the frozen split, proves
+    that every source has a legal structural donor under the registered law, and
+    constructs/verifies all four interventions on the released tensors.
+    """
+
+    import torch
+
+    subset_cache = Path(subset_cache)
+    pe_cache = Path(pe_cache)
+    try:
+        subset = _load_torch_payload(subset_cache, mmap=True)
+        pe = _load_torch_payload(pe_cache, mmap=True)
+    except (OSError, RuntimeError, EOFError) as error:
+        raise RuntimeError(
+            "registered GraphBench matching input cache is unreadable: "
+            f"{subset_cache} / {pe_cache}"
+        ) from error
+    if not isinstance(subset, Mapping) or not isinstance(pe, Mapping):
+        raise RuntimeError("registered GraphBench matching input cache is malformed")
+    for payload, path, expected in (
+        (
+            subset,
+            subset_cache,
+            {
+                "task": "bipartite_matching_hard",
+                "split": "val",
+            },
+        ),
+        (
+            pe,
+            pe_cache,
+            {
+                "task": "bipartite_matching_hard",
+                "split": "val",
+                "dtype": config.pe_cache_dtype,
+                "rrwp_steps": 16,
+            },
+        ),
+    ):
+        mismatched = {
+            key: (payload.get(key), value)
+            for key, value in expected.items()
+            if payload.get(key) != value
+        }
+        if mismatched:
+            raise RuntimeError(
+                f"registered GraphBench matching cache has the wrong contract: "
+                f"{path}; mismatches={mismatched}"
+            )
+    graphs = subset.get("graphs")
+    pe_items = pe.get("pe")
+    if (
+        not isinstance(graphs, Sequence)
+        or not isinstance(pe_items, Sequence)
+        or len(graphs) != 4_000
+        or len(pe_items) != len(graphs)
+    ):
+        raise RuntimeError(
+            "registered GraphBench matching validation caches must contain "
+            f"4000 aligned graphs; got graphs={getattr(graphs, '__len__', lambda: -1)()} "
+            f"pe={getattr(pe_items, '__len__', lambda: -1)()}"
+        )
+    splits = deterministic_splits(
+        len(graphs),
+        40_000,
+        _registered_split_sizes(config),
+        int(config.analysis_seed),
+        same_index_space=False,
+    )
+    graph_ids = tuple(
+        sorted(
+            {
+                *(int(value) for value in splits.discovery),
+                *(int(value) for value in splits.causal),
+            }
+        )
+    )
+    candidate_counts: list[int] = []
+    non_bipartite = 0
+    sources = 0
+    prepared_graphs: dict[int, Any] = {}
+    for graph_id in graph_ids:
+        raw_graph = graphs[graph_id]
+        raw_pe = pe_items[graph_id]
+        if not isinstance(raw_graph, Mapping) or not isinstance(raw_pe, Mapping):
+            raise RuntimeError(
+                f"GraphBench matching cache graph {graph_id} is malformed"
+            )
+        required_graph_fields = (
+            "node_type",
+            "edge_index",
+            "edge_value",
+            "target",
+            "task_type",
+            "num_nodes",
+        )
+        missing = [
+            field for field in required_graph_fields if field not in raw_graph
+        ]
+        if missing or any(
+            field not in raw_pe for field in ("spd", "rwse", "rrwp")
+        ):
+            raise RuntimeError(
+                f"GraphBench matching cache graph {graph_id} is missing "
+                f"required fields: {missing}"
+            )
+        n = int(raw_graph["num_nodes"])
+        node_type = torch.as_tensor(raw_graph["node_type"]).reshape(-1)
+        edge_index = torch.as_tensor(raw_graph["edge_index"]).long()
+        edge_value = torch.as_tensor(raw_graph["edge_value"]).reshape(-1)
+        target = torch.as_tensor(raw_graph["target"]).reshape(-1)
+        rrwp = torch.as_tensor(raw_pe["rrwp"])
+        if (
+            n != 16
+            or node_type.numel() != n
+            or edge_index.ndim != 2
+            or tuple(edge_index.shape[:1]) != (2,)
+            or edge_value.numel() != edge_index.shape[1]
+            or target.numel() != edge_index.shape[1]
+            or tuple(rrwp.shape[:2]) != (n, n)
+            or rrwp.shape[-1] < 16
+            or not bool(torch.isfinite(rrwp[..., :16]).all())
+        ):
+            raise RuntimeError(
+                f"GraphBench matching cache graph {graph_id} has incompatible "
+                "n=16 edge-output/RRWP geometry"
+            )
+        if not _support_is_bipartite(edge_index, n):
+            non_bipartite += 1
+        footprints = _rrwp_footprints_from_tensor(rrwp, rrwp_steps=16)
+        first_pair: tuple[int, int] | None = None
+        for source in range(n):
+            candidates = _eligible_structural_donors(
+                node_type.detach().cpu().numpy(),
+                footprints,
+                source,
+            )
+            if not candidates:
+                raise RuntimeError(
+                    f"registered structural donor law has no donor for "
+                    f"GraphBench graph={graph_id} source={source}"
+                )
+            candidate_counts.append(len(candidates))
+            sources += 1
+            if first_pair is None:
+                first_pair = (source, int(candidates[0]))
+        base = SimpleNamespace(
+            node_type=node_type,
+            edge_index=edge_index,
+            edge_value=edge_value,
+            target=torch.as_tensor(raw_graph["target"]),
+            task_type=str(raw_graph["task_type"]),
+            num_nodes=n,
+            spd=torch.as_tensor(raw_pe["spd"]),
+            rwse=torch.as_tensor(raw_pe["rwse"]),
+            rrwp=rrwp,
+            degree_override=None,
+        )
+        prepared_graphs[graph_id] = base
+        assert first_pair is not None
+        source, donor = first_pair
+        for complete_pe, transpose in (
+            (False, False),
+            (False, True),
+            (True, False),
+            (True, True),
+        ):
+            event = structural_pe_intervention(
+                base,
+                source,
+                donor,
+                complete_pe=complete_pe,
+                transpose=transpose,
+                rrwp_steps=16,
+            )
+            verify_structural_pe_intervention(
+                base,
+                event,
+                source,
+                donor,
+                complete_pe=complete_pe,
+                transpose=transpose,
+                rrwp_steps=16,
+            )
+    manifest_probe = SimpleNamespace(
+        config=config,
+        runtime=SimpleNamespace(
+            runner=SimpleNamespace(RRWP_STEPS=16),
+            eval_ds=prepared_graphs,
+        ),
+    )
+    refinement_boundary = int(config.sizes.refinement_graphs)
+    causal_ids = tuple(int(value) for value in splits.causal)
+    stage_ids = (
+        ("scores", tuple(int(value) for value in splits.discovery)),
+        ("refinement", causal_ids[:refinement_boundary]),
+        ("confirmation", causal_ids[refinement_boundary:]),
+    )
+    manifest_events = 0
+    for stage, selected_ids in stage_ids:
+        manifest = structural_pair_manifest(
+            manifest_probe,
+            stage,
+            selected_ids,
+        )
+        for graph_id in selected_ids:
+            rows = manifest[int(graph_id)]
+            observed_sources = {int(row["source"]) for row in rows}
+            if observed_sources != set(range(16)):
+                raise RuntimeError(
+                    f"registered structural manifest lost sources for "
+                    f"stage={stage} graph={graph_id}: "
+                    f"observed={sorted(observed_sources)}"
+                )
+            manifest_events += len(rows)
+    result = {
+        "graphs": len(graph_ids),
+        "sources": sources,
+        "non_bipartite_graphs": non_bipartite,
+        "minimum_candidate_pool": min(candidate_counts),
+        "maximum_candidate_pool": max(candidate_counts),
+        "manifest_events": manifest_events,
+        "split_fingerprint": splits.fingerprint,
+    }
+    print(
+        "[OK] matching input semantics: general-graph maximum-weight matching; "
+        f"non-bipartite selected supports={non_bipartite}/{len(graph_ids)}",
+        flush=True,
+    )
+    print(
+        "[OK] structural donor/intervention preflight: "
+        f"graphs={len(graph_ids)} sources={sources} "
+        f"candidate_pool={min(candidate_counts)}-{max(candidate_counts)} "
+        f"manifest_events={manifest_events} arms=4",
+        flush=True,
+    )
+    return result
 
 
 def validate_causal_recovery_prerequisites(
@@ -620,13 +888,19 @@ def _rng(config: PERefinementConfig, *parts: Any) -> np.random.Generator:
     return np.random.default_rng(int(digest, 16))
 
 
-def _bipartition_sides(graph: Any) -> np.ndarray:
-    """Deterministically two-colour the fixed graph support."""
+def _support_is_bipartite(edge_index: Any, num_nodes: int) -> bool:
+    """Return a diagnostic property; it is never used to select donors."""
 
-    n = int(graph.num_nodes)
+    n = int(num_nodes)
     neighbours: list[set[int]] = [set() for _ in range(n)]
-    for left, right in graph.edge_index.detach().cpu().numpy().T:
-        left, right = int(left), int(right)
+    for raw_left, raw_right in edge_index.detach().cpu().numpy().T:
+        left, right = int(raw_left), int(raw_right)
+        if not 0 <= left < n or not 0 <= right < n:
+            raise RuntimeError(
+                f"GraphBench matching edge endpoint {(left, right)} is outside 0..{n - 1}"
+            )
+        if left == right:
+            return False
         neighbours[left].add(right)
         neighbours[right].add(left)
     side = np.full(n, -1, dtype=np.int64)
@@ -644,8 +918,8 @@ def _bipartition_sides(graph: Any) -> np.ndarray:
                     side[other] = 1 - side[node]
                     queue.append(other)
                 elif side[other] == side[node]:
-                    raise RuntimeError("GraphBench matching support is not bipartite")
-    return side
+                    return False
+    return True
 
 
 def _rrwp_role_distance(
@@ -670,7 +944,15 @@ def _visible_rrwp_footprints(
     graph: Any,
 ) -> tuple[bytes, ...]:
     steps = int(prepared.runtime.runner.RRWP_STEPS)
-    rrwp = graph.rrwp.detach().cpu().numpy()[..., :steps]
+    return _rrwp_footprints_from_tensor(graph.rrwp, rrwp_steps=steps)
+
+
+def _rrwp_footprints_from_tensor(
+    rrwp_tensor: Any,
+    *,
+    rrwp_steps: int,
+) -> tuple[bytes, ...]:
+    rrwp = rrwp_tensor.detach().cpu().numpy()[..., : int(rrwp_steps)]
     return tuple(
         b"\x1f".join(
             (
@@ -678,7 +960,29 @@ def _visible_rrwp_footprints(
                 np.ascontiguousarray(rrwp[:, node]).tobytes(),
             )
         )
-        for node in range(int(graph.num_nodes))
+        for node in range(int(rrwp.shape[0]))
+    )
+
+
+def _eligible_structural_donors(
+    node_type: np.ndarray,
+    footprints: Sequence[bytes],
+    source: int,
+) -> tuple[int, ...]:
+    """Apply the complete registered donor-role matcher.
+
+    GraphBench's released matching task has a general-graph support and an all-zero
+    node feature.  Degree and any inferred graph colouring are deliberately absent:
+    the intervention is intended to transplant a different PE role, not match it away.
+    """
+
+    source = int(source)
+    return tuple(
+        donor
+        for donor in range(len(footprints))
+        if donor != source
+        and int(node_type[donor]) == int(node_type[source])
+        and footprints[donor] != footprints[source]
     )
 
 
@@ -734,26 +1038,22 @@ def structural_pair_manifest(
     for graph_id in graph_ids:
         graph_id = int(graph_id)
         graph = prepared.runtime.eval_ds[graph_id]
-        sides = _bipartition_sides(graph)
         node_type = graph.node_type.detach().cpu().numpy().reshape(-1)
         degrees = _graph_degrees(graph)
         footprints = _visible_rrwp_footprints(prepared, graph)
         rrwp_steps = int(prepared.runtime.runner.RRWP_STEPS)
         rows: list[dict[str, Any]] = []
         for source in range(int(graph.num_nodes)):
-            candidates = [
-                donor
-                for donor in range(int(graph.num_nodes))
-                if donor != source
-                and int(node_type[donor]) == int(node_type[source])
-                and int(sides[donor]) == int(sides[source])
-                and footprints[donor] != footprints[source]
-            ]
+            candidates = _eligible_structural_donors(
+                node_type,
+                footprints,
+                source,
+            )
             if not candidates:
                 audit_check(
                     False,
                     "pe_refinement.no_structural_donor",
-                    "structural source has no same-role, non-identical RRWP donor",
+                    "structural source has no same-node-type, non-identical RRWP donor",
                     context={"graph": graph_id, "source": source, "stage": stage},
                 )
                 continue
@@ -783,8 +1083,8 @@ def structural_pair_manifest(
                         "source_degree": int(degrees[source]),
                         "donor_degree": int(degrees[donor]),
                         "degree_gap": abs(int(degrees[source]) - int(degrees[donor])),
-                        "bipartition_side": int(sides[source]),
                         "source_node_type": int(node_type[source]),
+                        "donor_node_type": int(node_type[donor]),
                         "rrwp_role_distance": float(distances[donor]),
                         "distance_stratum": strata[donor],
                         "eligible_pool_size": int(len(candidates)),

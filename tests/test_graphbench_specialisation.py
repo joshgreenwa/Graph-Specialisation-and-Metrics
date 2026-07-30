@@ -33,6 +33,7 @@ from graph_specialisation_metrics.methodology.graphbench import (
 )
 from graph_specialisation_metrics.methodology.scores import event_head_score_systems
 from graph_specialisation_metrics.methodology.graphbench_pe_refinement import (
+    PE_REFINEMENT_VERSION,
     PERefinementConfig,
     PERefinementSizes,
     PreparedPERefinement,
@@ -43,6 +44,7 @@ from graph_specialisation_metrics.methodology.graphbench_pe_refinement import (
     _registered_split_sizes,
     _run_causal_component,
     audit_existing_pe_refinement_cache,
+    audit_matching_input_caches,
     finalize_pe_refinement,
     render_refinement_figures,
     run_arm_causal,
@@ -122,6 +124,44 @@ def six_node_matching_graph() -> Graph:
         ),
         target=torch.tensor(
             [float(index % 4 == 0) for index in range(len(directed))]
+        ),
+        task_type="edge_binary",
+        num_nodes=6,
+        spd=torch.zeros(6, 6, dtype=torch.long),
+        rwse=torch.zeros(6, 16),
+        rrwp=torch.arange(
+            6 * 6 * 17, dtype=torch.float32
+        ).reshape(6, 6, 17) / 100.0,
+    )
+
+
+def six_node_general_matching_graph() -> Graph:
+    """Match the released GraphBench task: weighted matching on a general graph."""
+
+    undirected = (
+        (0, 1),
+        (1, 2),
+        (2, 0),  # odd cycle: there is no valid bipartition role
+        (2, 3),
+        (3, 4),
+        (4, 5),
+        (5, 3),  # second odd cycle
+        (0, 4),
+    )
+    directed = [edge for pair in undirected for edge in (pair, pair[::-1])]
+    matched = {(0, 1), (2, 3), (4, 5)}
+    return Graph(
+        node_type=torch.zeros(6, dtype=torch.long),
+        edge_index=torch.tensor(directed, dtype=torch.long).t().contiguous(),
+        edge_value=torch.tensor(
+            [float(1 + index // 2) for index in range(len(directed))],
+            dtype=torch.float32,
+        ),
+        target=torch.tensor(
+            [
+                float((left, right) in matched or (right, left) in matched)
+                for left, right in directed
+            ]
         ),
         task_type="edge_binary",
         num_nodes=6,
@@ -655,7 +695,7 @@ def test_pe_refinement_causal_geometry_and_taylor_audit_are_complete(
     channel,
     arm,
 ):
-    graph = six_node_matching_graph()
+    graph = six_node_general_matching_graph()
     runtime = fake_runtime(graph)
     # Real GraphBench batches pad each graph to the maximum edge-output width in
     # the validation split. The Taylor Jacobian remains graph-local.
@@ -704,6 +744,8 @@ def test_pe_refinement_causal_geometry_and_taylor_audit_are_complete(
     if channel == "structural":
         assert len(rows) == 12
         assert all(row["realised_donor_count"] == 2 for row in rows)
+        assert all(row["eligible_pool_size"] == 5 for row in rows)
+        assert all("bipartition_side" not in row for row in rows)
         assert all(
             len(
                 {
@@ -729,10 +771,19 @@ def test_pe_refinement_causal_geometry_and_taylor_audit_are_complete(
     assert result["controlled"].all()
     assert result["endpoints"]["G_c"].shape == (4, len(rows))
     assert np.isfinite(result["endpoints"]["G_c"]).all()
-    assert result["taylor"]["predicted"].shape == (4, len(rows), 12)
-    assert result["taylor"]["exact"].shape == (4, len(rows), 12)
+    actual_outputs = int(graph.edge_index.shape[1])
+    assert result["taylor"]["predicted"].shape == (
+        4,
+        len(rows),
+        actual_outputs,
+    )
+    assert result["taylor"]["exact"].shape == (
+        4,
+        len(rows),
+        actual_outputs,
+    )
     assert result["taylor"]["padded_output_width"] == 18
-    assert result["taylor"]["actual_output_width"] == 12
+    assert result["taylor"]["actual_output_width"] == actual_outputs
     assert result["taylor"]["padding_max"] == 0.0
     assert np.isfinite(result["taylor"]["predicted"]).all()
     assert np.isfinite(result["taylor"]["exact"]).all()
@@ -1209,8 +1260,86 @@ def test_pe_refinement_preflight_audits_existing_shards_without_loading_model(
     assert validate_causal_recovery_prerequisites(config) == 20
 
 
+def test_pe_refinement_production_input_preflight_accepts_general_graph_matching(
+    tmp_path,
+):
+    graph = six_node_general_matching_graph()
+    graph_payload = {
+        "node_type": graph.node_type,
+        "edge_index": graph.edge_index,
+        "edge_value": graph.edge_value,
+        "target": graph.target,
+        "task_type": graph.task_type,
+        "num_nodes": 16,
+    }
+    # Pad the six-node odd-cycle support to the registered n=16 geometry.  The
+    # isolated nodes have distinct PE roles, as can occur in a general graph cache.
+    graph_payload["node_type"] = torch.zeros(16, dtype=torch.long)
+    rrwp = torch.arange(
+        16 * 16 * 17, dtype=torch.float32
+    ).reshape(16, 16, 17) / 10_000.0
+    pe_item = {
+        "spd": torch.zeros(16, 16, dtype=torch.long),
+        "rwse": torch.zeros(16, 16),
+        "rrwp": rrwp,
+    }
+    subset_path = tmp_path / "subset.pt"
+    pe_path = tmp_path / "pe.pt"
+    torch.save(
+        {
+            "version": "hpc_base_v1_5task_5k_pe_cache_matched_params",
+            "task": "bipartite_matching_hard",
+            "split": "val",
+            "graphs": [graph_payload] * 4_000,
+        },
+        subset_path,
+    )
+    torch.save(
+        {
+            "version": "hpc_base_v1_5task_5k_pe_cache_matched_params",
+            "task": "bipartite_matching_hard",
+            "split": "val",
+            "dtype": "float32",
+            "rw_steps": 16,
+            "rrwp_steps": 16,
+            "pe": [pe_item] * 4_000,
+        },
+        pe_path,
+    )
+    config = PERefinementConfig(
+        output_dir=str(tmp_path / "analysis"),
+        training_output_root=str(tmp_path / "training"),
+        dataset_root=str(tmp_path / "dataset"),
+        pe_cache_root=str(tmp_path / "pe-root"),
+        runner_path=str(tmp_path / "runner.py"),
+        sizes=PERefinementSizes(
+            discovery_graphs=1,
+            refinement_graphs=1,
+            confirmation_graphs=1,
+            clean_ablation_graphs=1,
+            semantic_donor_graphs=1,
+            semantic_sources_per_graph=1,
+            donors_per_source=2,
+            taylor_graphs=1,
+        ),
+        accelerator="cpu",
+    )
+
+    result = audit_matching_input_caches(
+        config,
+        subset_cache=subset_path,
+        pe_cache=pe_path,
+    )
+
+    assert PE_REFINEMENT_VERSION == "graphbench-matching-pe-refinement-v2"
+    assert result["graphs"] == 3
+    assert result["sources"] == 48
+    assert result["non_bipartite_graphs"] == 3
+    assert result["minimum_candidate_pool"] == 15
+
+
 def test_pe_refinement_causal_workers_default_to_refinement_only(tmp_path):
-    graph = six_node_matching_graph()
+    graph = six_node_general_matching_graph()
     runtime = fake_runtime(graph)
     task = get_task("graphbench_bipartite_matching_hard")
     backend = GraphBenchGritBackend(
@@ -1288,7 +1417,7 @@ def test_pe_refinement_causal_workers_default_to_refinement_only(tmp_path):
 
 
 def test_pe_refinement_four_seed_cached_pipeline_finalizes_end_to_end(tmp_path):
-    graph = six_node_matching_graph()
+    graph = six_node_general_matching_graph()
     config = PERefinementConfig(
         output_dir=str(tmp_path / "analysis"),
         training_output_root=str(tmp_path / "training"),

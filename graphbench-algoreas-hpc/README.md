@@ -259,9 +259,11 @@ attention, support, and carriage diagnostics.
 
 ## Bipartite structural-PE refinement
 
-The focused `graphbench-bipartite-pe-refinement-v1` experiment is separate from the preceding
-score/carriage run. It compares RRWP donor copy, RRWP node transposition, complete-PE donor copy,
-and complete-PE node transposition on bipartite matching only. Each arm is evaluated with
+The focused `graphbench-matching-pe-refinement-v2` experiment is separate from the preceding
+score/carriage run. The official GraphBench identifier is `bipartite_matching_hard`, but the
+released generator applies maximum-weight matching to ordinary graphs and supplies no
+bipartition. The experiment compares RRWP donor copy, RRWP node transposition, complete-PE donor
+copy, and complete-PE node transposition on that matching task. Each arm is evaluated with
 transport-mass and coherent output-movement scores, matched/mismatch causal patching, `J`/`D_rel`
 validation, cancellation, and Taylor-fidelity audits across seeds `0,1,2,3`.
 
@@ -286,6 +288,8 @@ bash graphbench-algoreas-hpc/bin/submit_grit_pe_refinement.sh
 ```
 
 The submitter repeats both official-backend and path/cache preflights before calling `sbatch`.
+The latter loads the exact registered validation graphs and PE tensors, verifies donor feasibility,
+and constructs all four interventions before any job is queued.
 Every GPU array element and the one-CPU finalizer have a six-hour safety limit. The common array has 12 elements (three reusable
 components by four seeds); the dependent arm array has 16 elements (four interventions by four
 seeds). Production starts at 16 score-event graph groups and 24 independently patched heads per

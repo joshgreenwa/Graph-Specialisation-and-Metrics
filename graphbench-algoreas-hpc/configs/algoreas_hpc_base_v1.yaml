@@ -160,8 +160,9 @@ tasks:
     type: edge_binary
     primary_metric: f1
     generator_params: graphbench_table_19_max_matching
-    edge_features: [adjacency]
-    node_features: bipartition_indicator_if_supplied_or_derivable
+    edge_features: [matching_weight]
+    node_features: released_all_zero_node_type
+    released_task_semantics: general_graph_maximum_weight_matching_no_bipartition
   bridges:
     graphbench_id: bridges_hard
     type: edge_binary

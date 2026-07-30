@@ -1,5 +1,10 @@
-protocol: graphbench-bipartite-pe-refinement-v1
+protocol: graphbench-matching-pe-refinement-v2
 task: graphbench_bipartite_matching_hard
+released_task_semantics:
+  support: general_undirected_graph
+  objective: maximum_weight_matching
+  partition_feature: absent
+  note: released_bipartite_matching_identifier_is_a_misnomer
 model: official_grit
 seeds: [0, 1, 2, 3]
 split:
@@ -19,9 +24,9 @@ sizes:
   permutation_replicates: 2000
 structural_pair_law:
   node_type: same
-  bipartition_side: same_inferred_side
   footprint: non_identical_rrwp_role
   degree_matching: false
+  partition_matching: false
   distance_strata: [near, middle, far]
   replacement: false
 arms:

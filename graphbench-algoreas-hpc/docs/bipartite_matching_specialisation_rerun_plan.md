@@ -1,11 +1,11 @@
 # Bipartite matching GRIT structural-PE refinement
 
-**Status:** implemented and locally verified; ready for HPC preflight; not yet queued  
-**Last updated:** 2026-07-28  
-**Implementation branch:** `expansion/graphormer_specialisation`  
-**Protocol:** `graphbench-bipartite-pe-refinement-v1`  
-**Task:** `graphbench_bipartite_matching_hard` only  
-**Models:** official-GRIT checkpoints, training seeds `0,1,2,3`  
+**Status:** corrected v2 implementation locally verified; ready for exact-data HPC preflight
+**Last updated:** 2026-07-30
+**Implementation branch:** `expansion/graphormer_specialisation`
+**Protocol:** `graphbench-matching-pe-refinement-v2`
+**Task:** `graphbench_bipartite_matching_hard` only
+**Models:** official-GRIT checkpoints, training seeds `0,1,2,3`
 **Analysis population:** GraphBench `n=16` validation split  
 
 ## 1. Decision this run must make
@@ -18,6 +18,11 @@ score system before returning to carriage or distance analyses.
 
 The semantic reciprocal-edge-unit donor swap is fixed. Topology, edge values, node types, labels,
 and output/readout coordinates remain fixed during every structural intervention.
+
+The released task identifier is misleading: the official GraphBench generator samples ordinary
+graphs and labels `networkx.max_weight_matching`. The released graphs have no bipartition feature,
+and many supports contain odd cycles. No partition may therefore be inferred or used as a donor
+constraint. The v1 attempt did so and is scientifically invalid; v2 uses a fresh output namespace.
 
 ## 2. Registered four-arm factorial
 
@@ -39,9 +44,9 @@ consumed by this GRIT path. Bond/edge values are semantic inputs and stay fixed.
 ## 3. Common source/donor law
 
 - Enumerate every eligible node source.
-- Require donor and source to have the same node type and inferred bipartition side.
+- Require donor and source to have the same model-visible node type.
 - Exclude the source itself and identical RRWP-role footprints.
-- Do not degree match.
+- Do not degree match or partition match.
 - Partition candidates into near/middle/far clean RRWP-role-distance strata.
 - Draw across strata without replacement, up to eight donors.
 - Never duplicate donors to fill a ragged source.
@@ -52,7 +57,7 @@ The paired manifest retains degree gap. Calibration is repeated for gap `0`, gap
 `2+`, so the former degree-matched regime is available as a prespecified sensitivity slice without
 shrinking the donor pool or changing pairs between arms.
 
-Cache graph/source/donor IDs, inferred side, node type, degrees, degree gap, footprint hashes,
+Cache graph/source/donor IDs, node type, degrees, degree gap, footprint hashes,
 RRWP-role distance and stratum, eligible-pool size, realised count, exhaustion, RRWP RMS dose,
 degree/log-degree dose, and a standardised full-input dose.
 
@@ -180,7 +185,7 @@ Output root:
 
 ```text
 /rds/user/jgg45/hpc-work/graphbench-algoreas/outputs/
-  grit_specialisation_bipartite_pe_refinement_v1/
+  grit_specialisation_matching_pe_refinement_v2/
 ```
 
 Logical layout:
@@ -211,6 +216,11 @@ graphbench_bipartite_matching_hard/
 All graph shards are atomic and protected by protocol, checkpoint, split, repository, namespace,
 and event-manifest contracts. Figures can be regenerated without GPU work. Common discovery and
 Taylor Jacobians are computed once per seed and reused by all four arm jobs.
+
+Before any `sbatch` call, the submitter loads the exact frozen n=16 validation subset and PE cache.
+It validates the registered discovery/causal graph tensors, donor feasibility for every source, and
+constructs plus verifies all four intervention arms. This production-data gate specifically
+prevents synthetic bipartite fixtures from masking a released-data representation error.
 
 Production is a three-stage Slurm DAG:
 
@@ -255,6 +265,8 @@ Soft audits are cached and flagged but do not terminate production.
 - [x] Four structural interventions.
 - [x] Analysis-only degree override with unchanged training behaviour.
 - [x] Common paired source/donor manifests with role and dose metadata.
+- [x] General-graph matching semantics; no invented bipartition role.
+- [x] Exact production-data donor/intervention preflight before Slurm submission.
 - [x] Transport-mass and coherent score systems.
 - [x] Event-level carrier coherence/cancellation.
 - [x] Replica-specific all-head batched patching.
@@ -264,7 +276,7 @@ Soft audits are cached and flagged but do not terminate production.
 - [x] Refinement/confirmation lockbox.
 - [x] Atomic common/arm caches and component progress.
 - [x] Slurm common/arm/finalizer DAG with six-hour GPU and CPU safety limits.
-- [x] Complete local unit/static/contract verification (`198 passed, 1 skipped`).
+- [x] Complete corrected v2 local unit/static/contract verification (`240 passed, 1 skipped`).
 - [ ] Refresh HPC checkout and run new preflight.
 - [ ] Queue production DAG.
 - [ ] Inspect refinement outputs and write selection lock.
@@ -275,4 +287,5 @@ Soft audits are cached and flagged but do not terminate production.
 | Date | Version | Component | Status | Observation |
 |---|---|---|---|---|
 | 2026-07-27 | draft | earlier degree-law rerun | superseded | Replaced by four-arm PE factorial |
-| 2026-07-28 | v1 | implementation | ready | Dedicated matching-only core runner; full local suite passes |
+| 2026-07-28 | v1 | implementation | invalidated | Incorrectly assumed released supports were bipartite |
+| 2026-07-30 | v2 | correction | in progress | Registered released general-graph maximum-weight-matching semantics |

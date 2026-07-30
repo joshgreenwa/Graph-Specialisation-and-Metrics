@@ -20,6 +20,7 @@ from graph_specialisation_metrics.methodology.graphbench_pe_refinement import ( 
     PERefinementConfig,
     PERefinementSizes,
     audit_existing_pe_refinement_cache,
+    audit_matching_input_caches,
     finalize_pe_refinement,
     lock_pe_refinement_selection,
     run_arm_component,
@@ -72,7 +73,7 @@ def parser() -> argparse.ArgumentParser:
         type=Path,
         default=Path(
             "/rds/user/jgg45/hpc-work/graphbench-algoreas/outputs/"
-            "grit_specialisation_bipartite_pe_refinement_v1"
+            "grit_specialisation_matching_pe_refinement_v2"
         ),
     )
     value.add_argument(
@@ -174,21 +175,50 @@ def _preflight(
         / "hpc_base_v1_5task_5k_pe_cache_matched_params"
         / config.pe_cache_namespace
     )
-    required_cache_patterns = (
-        "bipartite_matching_hard_train_graphs40000_nodes16_"
-        f"*_rrwp16_{config.pe_cache_dtype}.pt",
-        "bipartite_matching_hard_val_graphs4000_nodes16_"
-        f"*_rrwp16_{config.pe_cache_dtype}.pt",
+    required_cache_paths = (
+        cache_namespace
+        / (
+            "bipartite_matching_hard_train_graphs40000_nodes16_"
+            f"seed101_rw16_rrwp16_{config.pe_cache_dtype}.pt"
+        ),
+        cache_namespace
+        / (
+            "bipartite_matching_hard_val_graphs4000_nodes16_"
+            f"seed211_rw16_rrwp16_{config.pe_cache_dtype}.pt"
+        ),
+        cache_namespace
+        / (
+            "bipartite_matching_hard_test_graphs4000_nodes64_"
+            f"seed307_rw16_rrwp16_{config.pe_cache_dtype}.pt"
+        ),
     )
-    missing_patterns = [
-        str(cache_namespace / pattern)
-        for pattern in required_cache_patterns
-        if not any(cache_namespace.glob(pattern))
+    subset_cache_root = Path(config.dataset_root) / "_hpc_subset_cache"
+    required_subset_paths = (
+        subset_cache_root
+        / (
+            "bipartite_matching_hard_train_graphs40000_nodes16_seed101_"
+            "hpc_base_v1_5task_5k_pe_cache_matched_params.pt"
+        ),
+        subset_cache_root
+        / (
+            "bipartite_matching_hard_val_graphs4000_nodes16_seed211_"
+            "hpc_base_v1_5task_5k_pe_cache_matched_params.pt"
+        ),
+        subset_cache_root
+        / (
+            "bipartite_matching_hard_test_graphs4000_nodes64_seed307_"
+            "hpc_base_v1_5task_5k_pe_cache_matched_params.pt"
+        ),
+    )
+    missing_paths = [
+        str(path)
+        for path in (*required_cache_paths, *required_subset_paths)
+        if not path.is_file()
     ]
-    if missing_patterns:
+    if missing_paths:
         raise FileNotFoundError(
-            "missing required bipartite-matching PE cache(s):\n"
-            + "\n".join(missing_patterns)
+            "missing required GraphBench matching input cache(s):\n"
+            + "\n".join(missing_paths)
         )
     print("[OK] PE-refinement configuration is valid")
     print("[OK] checkpoints: seeds 0,1,2,3")
@@ -196,6 +226,16 @@ def _preflight(
     print(f"[OK] PE cache: {cache_namespace}")
     print(f"[OK] output: {config.output_dir}")
     print(f"[OK] fingerprint: {config.fingerprint}")
+    print(
+        "[preflight] validating exact frozen validation graphs, donor manifests, "
+        "and four structural interventions",
+        flush=True,
+    )
+    audit_matching_input_caches(
+        config,
+        subset_cache=required_subset_paths[1],
+        pe_cache=required_cache_paths[1],
+    )
     audit_existing_pe_refinement_cache(config)
     if require_causal_recovery_prerequisites:
         validate_causal_recovery_prerequisites(config)
