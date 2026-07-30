@@ -9,6 +9,7 @@ from graph_specialisation_metrics.zinc_reach_analysis import (
     figures,
     graph_bamberger_profiles,
     graph_donor_profiles,
+    summarise_dense_profile_contrasts,
     summarise_graph_profiles,
 )
 
@@ -99,6 +100,19 @@ def test_profile_scope_and_normalisation():
     )
     assert profiles and expected
     assert not any(row["method"] == "local_jacobian" for row in graph_rows)
+    contrasts = summarise_dense_profile_contrasts(
+        graph_rows,
+        bootstrap_replicates=40,
+        bootstrap_seed=9,
+    )
+    assert contrasts
+    assert all(row["task"] != "zinc" for row in contrasts)
+    assert all(row["paired_graphs"] == 2 for row in contrasts)
+    assert any(
+        abs(row["mean"]) > 0
+        for row in contrasts
+        if row["method"] == "functional_carriage"
+    )
 
 
 def test_figure_only_builds_png_and_pdf(tmp_path: Path):
@@ -122,9 +136,12 @@ def test_figure_only_builds_png_and_pdf(tmp_path: Path):
         output_dir=tmp_path,
     )
     assert set(result["figures"]) == {
-        "profiles",
+        "semantic_functional",
+        "semantic_bamberger",
+        "structural_functional",
         "expected_distance",
     }
+    assert (results / "dense_profile_contrasts.csv").is_file()
     for formats in result["figures"].values():
         assert Path(formats["png"]).is_file()
         assert Path(formats["pdf"]).is_file()

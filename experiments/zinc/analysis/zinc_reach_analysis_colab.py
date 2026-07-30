@@ -234,7 +234,12 @@ if "expected_rows" in result:
 if "figures" in result:
     from IPython.display import Image, display
 
-    for name in ("profiles", "expected_distance"):
+    for name in (
+        "semantic_functional",
+        "semantic_bamberger",
+        "structural_functional",
+        "expected_distance",
+    ):
         path = result["figures"][name]["png"]
         print(f"\n[display] {name}: {path}", flush=True)
         display(Image(filename=path))

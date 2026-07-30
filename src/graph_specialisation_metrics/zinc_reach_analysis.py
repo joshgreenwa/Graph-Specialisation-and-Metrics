@@ -9,7 +9,7 @@ This extension keeps two comparisons separate:
   semantic or structural donor events.
 
 The Bamberger proxy has no canonical structural-donor counterpart.  It is
-therefore shown only in the semantic row; the structural row reports Functional
+therefore shown only for semantic usage; structural usage reports Functional
 carriage without inventing a prior-work quantity.
 """
 
@@ -64,6 +64,24 @@ METHOD_COLOURS = {
 METHOD_MARKERS = {
     "bamberger": "^",
     "functional_carriage": "s",
+}
+MODEL_COLOURS = {
+    "zinc_1hop": "#0072B2",
+    "zinc_2hop": "#009E73",
+    "zinc_1hop_vnode": "#CC79A7",
+    "zinc": "#D55E00",
+}
+MODEL_MARKERS = {
+    "zinc_1hop": "o",
+    "zinc_2hop": "^",
+    "zinc_1hop_vnode": "D",
+    "zinc": "s",
+}
+MODEL_LINESTYLES = {
+    "zinc_1hop": "-",
+    "zinc_2hop": "--",
+    "zinc_1hop_vnode": "-.",
+    "zinc": ":",
 }
 
 
@@ -1013,6 +1031,105 @@ def summarise_graph_profiles(
     return profiles, expected
 
 
+def summarise_dense_profile_contrasts(
+    graph_rows: Sequence[Mapping[str, Any]],
+    *,
+    bootstrap_replicates: int,
+    bootstrap_seed: int,
+) -> list[dict[str, Any]]:
+    """Compute paired graph-level profile differences from dense GRIT."""
+
+    profiles: dict[tuple[str, int, str, str], dict[int, float]] = defaultdict(dict)
+    for row in graph_rows:
+        profiles[
+            (
+                str(row["task"]),
+                _integer(row, "graph"),
+                str(row["channel"]),
+                str(row["method"]),
+            )
+        ][_integer(row, "distance")] = _float(row, "mass")
+
+    combinations = sorted(
+        {
+            (str(row["task"]), str(row["channel"]), str(row["method"]))
+            for row in graph_rows
+            if str(row["task"]) != "zinc"
+        }
+    )
+    contrasts: list[dict[str, Any]] = []
+    for task, channel, method in combinations:
+        model_graphs = {
+            graph
+            for candidate_task, graph, candidate_channel, candidate_method in profiles
+            if candidate_task == task
+            and candidate_channel == channel
+            and candidate_method == method
+        }
+        dense_graphs = {
+            graph
+            for candidate_task, graph, candidate_channel, candidate_method in profiles
+            if candidate_task == "zinc"
+            and candidate_channel == channel
+            and candidate_method == method
+        }
+        paired_graphs = sorted(model_graphs & dense_graphs)
+        if not paired_graphs:
+            continue
+        distances = sorted(
+            {
+                distance
+                for graph in paired_graphs
+                for profile in (
+                    profiles[(task, graph, channel, method)],
+                    profiles[("zinc", graph, channel, method)],
+                )
+                for distance in profile
+            }
+        )
+        for distance in distances:
+            values = [
+                profiles[(task, graph, channel, method)].get(distance, 0.0)
+                - profiles[("zinc", graph, channel, method)].get(distance, 0.0)
+                for graph in paired_graphs
+            ]
+            mean, low, high = _bootstrap_interval(
+                values,
+                replicates=int(bootstrap_replicates),
+                seed=int(bootstrap_seed)
+                + int(
+                    stable_hash(
+                        {
+                            "dense_profile_contrast": (
+                                task,
+                                channel,
+                                method,
+                                distance,
+                            )
+                        },
+                        length=8,
+                    ),
+                    16,
+                ),
+            )
+            contrasts.append(
+                {
+                    "task": task,
+                    "model_label": TASK_LABELS[task],
+                    "reference_task": "zinc",
+                    "reference_model_label": TASK_LABELS["zinc"],
+                    "channel": channel,
+                    "method": method,
+                    "distance": int(distance),
+                    "mean": mean,
+                    "low": low,
+                    "high": high,
+                    "paired_graphs": int(len(values)),
+                }
+            )
+    return contrasts
+
+
 def _figure_theme() -> None:
     import matplotlib as mpl
 
@@ -1050,103 +1167,162 @@ def _save_figure(fig: Any, figures_dir: Path, name: str) -> dict[str, str]:
     return paths
 
 
-def plot_profiles(
+def plot_model_profiles(
     rows: Sequence[Mapping[str, Any]],
+    contrast_rows: Sequence[Mapping[str, Any]],
     *,
+    channel: str,
+    method: str,
+    title: str,
+    filename: str,
     figures_dir: Path,
 ) -> dict[str, str]:
     import matplotlib.pyplot as plt
 
     _figure_theme()
-    fig, axes = plt.subplots(
+    fig, (profile_axis, contrast_axis) = plt.subplots(
         2,
-        len(TASKS),
-        figsize=(13.2, 6.4),
+        1,
+        figsize=(8.8, 6.2),
         sharex=True,
-        sharey=True,
+        gridspec_kw={"height_ratios": (2.8, 1.25), "hspace": 0.08},
     )
-    for column, task in enumerate(TASKS):
-        for row_index, channel in enumerate(CHANNELS):
-            axis = axes[row_index, column]
-            methods = (
-                ("bamberger", *DONOR_METHODS)
-                if channel == "semantic"
-                else DONOR_METHODS
-            )
-            for method in methods:
-                values = sorted(
-                    (
-                        row
-                        for row in rows
-                        if str(row["task"]) == task
-                        and str(row["channel"]) == channel
-                        and str(row["method"]) == method
-                    ),
-                    key=lambda row: _integer(row, "distance"),
-                )
-                if not values:
-                    continue
-                x = np.asarray([_integer(value, "distance") for value in values])
-                y = np.asarray([_float(value, "mean") for value in values])
-                low = np.asarray([_float(value, "low") for value in values])
-                high = np.asarray([_float(value, "high") for value in values])
-                axis.plot(
-                    x,
-                    y,
-                    color=METHOD_COLOURS[method],
-                    marker=METHOD_MARKERS[method],
-                    markersize=4,
-                    linewidth=1.7,
-                    label=METHOD_LABELS[method],
-                )
-                axis.fill_between(
-                    x,
-                    low,
-                    high,
-                    color=METHOD_COLOURS[method],
-                    alpha=0.12,
-                    linewidth=0,
-                )
-            if row_index == 0:
-                axis.set_title(TASK_LABELS[task])
-            if column == 0:
-                axis.set_ylabel(
-                    "Semantic\nnormalised usage"
-                    if channel == "semantic"
-                    else "Structural\nnormalised usage"
-                )
-            if row_index == 1:
-                axis.set_xlabel("Shortest-path distance")
-            axis.set_ylim(bottom=0)
-            axis.xaxis.set_major_locator(plt.MaxNLocator(integer=True))
-    axes[1, 0].text(
-        0.03,
-        0.95,
-        "No canonical Bamberger\nstructural analogue",
-        transform=axes[1, 0].transAxes,
-        va="top",
+    maximum_distance = 0
+    for draw_order, task in enumerate(TASKS):
+        values = sorted(
+            (
+                row
+                for row in rows
+                if str(row["task"]) == task
+                and str(row["channel"]) == channel
+                and str(row["method"]) == method
+            ),
+            key=lambda row: _integer(row, "distance"),
+        )
+        if not values:
+            continue
+        x = np.asarray([_integer(value, "distance") for value in values])
+        y = np.asarray([_float(value, "mean") for value in values])
+        low = np.asarray([_float(value, "low") for value in values])
+        high = np.asarray([_float(value, "high") for value in values])
+        maximum_distance = max(maximum_distance, int(x.max(initial=0)))
+        profile_axis.fill_between(
+            x,
+            low,
+            high,
+            color=MODEL_COLOURS[task],
+            alpha=0.08,
+            linewidth=0,
+            zorder=1 + draw_order,
+        )
+        profile_axis.plot(
+            x,
+            y,
+            color=MODEL_COLOURS[task],
+            marker=MODEL_MARKERS[task],
+            linestyle=MODEL_LINESTYLES[task],
+            markerfacecolor="white",
+            markeredgewidth=1.15,
+            markersize=5.4,
+            linewidth=2.0,
+            label=TASK_LABELS[task],
+            zorder=5 + draw_order,
+        )
+
+    contrast_bound = 0.0
+    for draw_order, task in enumerate(TASKS[:-1]):
+        values = sorted(
+            (
+                row
+                for row in contrast_rows
+                if str(row["task"]) == task
+                and str(row["channel"]) == channel
+                and str(row["method"]) == method
+            ),
+            key=lambda row: _integer(row, "distance"),
+        )
+        if not values:
+            continue
+        x = np.asarray([_integer(value, "distance") for value in values])
+        y = np.asarray([_float(value, "mean") for value in values])
+        low = np.asarray([_float(value, "low") for value in values])
+        high = np.asarray([_float(value, "high") for value in values])
+        maximum_distance = max(maximum_distance, int(x.max(initial=0)))
+        contrast_bound = max(
+            contrast_bound,
+            float(np.max(np.abs(np.concatenate((low, high))))),
+        )
+        contrast_axis.fill_between(
+            x,
+            low,
+            high,
+            color=MODEL_COLOURS[task],
+            alpha=0.10,
+            linewidth=0,
+            zorder=1 + draw_order,
+        )
+        contrast_axis.plot(
+            x,
+            y,
+            color=MODEL_COLOURS[task],
+            marker=MODEL_MARKERS[task],
+            linestyle=MODEL_LINESTYLES[task],
+            markerfacecolor="white",
+            markeredgewidth=1.05,
+            markersize=4.7,
+            linewidth=1.7,
+            zorder=5 + draw_order,
+        )
+
+    profile_axis.set_ylabel("Normalised usage mass")
+    profile_axis.set_ylim(bottom=0)
+    contrast_axis.axhline(0, color="#666666", linewidth=0.9, zorder=0)
+    contrast_axis.set_ylabel("Difference from\nDense GRIT")
+    contrast_axis.set_xlabel("Shortest-path distance")
+    if contrast_bound > 0:
+        contrast_bound *= 1.12
+        contrast_axis.set_ylim(-contrast_bound, contrast_bound)
+    else:
+        contrast_axis.set_ylim(-0.01, 0.01)
+    contrast_axis.set_xlim(-0.15, maximum_distance + 0.15)
+    contrast_axis.xaxis.set_major_locator(plt.MaxNLocator(integer=True))
+    contrast_axis.text(
+        0.995,
+        0.04,
+        "Paired by held-out graph",
+        transform=contrast_axis.transAxes,
+        ha="right",
+        va="bottom",
         color="#666666",
         fontsize=8,
     )
-    handles, labels = axes[0, 0].get_legend_handles_labels()
+    handles, labels = profile_axis.get_legend_handles_labels()
     fig.legend(
         handles,
         labels,
         loc="upper center",
-        bbox_to_anchor=(0.5, 0.935),
-        ncol=2,
+        bbox_to_anchor=(0.5, 0.925),
+        ncol=4,
         frameon=False,
+        handlelength=2.7,
+        columnspacing=1.4,
     )
-    fig.suptitle("Distance profiles of model usage on ZINC", fontsize=13, y=0.99)
+    fig.suptitle(title, fontsize=13, y=0.988)
+    fig.text(
+        0.5,
+        0.865,
+        "Mean with 95% graph-bootstrap confidence interval",
+        ha="center",
+        color="#666666",
+        fontsize=8.5,
+    )
     fig.subplots_adjust(
-        left=0.075,
-        right=0.995,
-        bottom=0.10,
+        left=0.115,
+        right=0.985,
+        bottom=0.105,
         top=0.82,
-        hspace=0.16,
-        wspace=0.10,
     )
-    return _save_figure(fig, figures_dir, "zinc_reach_profiles")
+    return _save_figure(fig, figures_dir, filename)
 
 
 def plot_expected_distance(
@@ -1262,13 +1438,45 @@ def figures(
         bootstrap_replicates=int(config.bootstrap_replicates),
         bootstrap_seed=int(config.analysis_seed) + 100,
     )
+    contrast_rows = summarise_dense_profile_contrasts(
+        graph_rows,
+        bootstrap_replicates=int(config.bootstrap_replicates),
+        bootstrap_seed=int(config.analysis_seed) + 200,
+    )
     _write_csv(results_dir / "graph_distance_profiles.csv", graph_rows)
     _write_csv(results_dir / "distance_profile_summary.csv", profile_rows)
+    _write_csv(results_dir / "dense_profile_contrasts.csv", contrast_rows)
     _write_csv(results_dir / "expected_distance_summary.csv", expected_rows)
 
     figures_dir = output_dir / "figures"
     paths = {
-        "profiles": plot_profiles(profile_rows, figures_dir=figures_dir),
+        "semantic_functional": plot_model_profiles(
+            profile_rows,
+            contrast_rows,
+            channel="semantic",
+            method="functional_carriage",
+            title="Semantic usage by Functional carriage",
+            filename="zinc_semantic_functional_profiles",
+            figures_dir=figures_dir,
+        ),
+        "semantic_bamberger": plot_model_profiles(
+            profile_rows,
+            contrast_rows,
+            channel="semantic",
+            method="bamberger",
+            title="Semantic usage by Bamberger Jacobian range",
+            filename="zinc_semantic_bamberger_profiles",
+            figures_dir=figures_dir,
+        ),
+        "structural_functional": plot_model_profiles(
+            profile_rows,
+            contrast_rows,
+            channel="structural",
+            method="functional_carriage",
+            title="Structural usage by Functional carriage",
+            filename="zinc_structural_functional_profiles",
+            figures_dir=figures_dir,
+        ),
         "expected_distance": plot_expected_distance(
             expected_rows,
             figures_dir=figures_dir,
@@ -1282,13 +1490,16 @@ def figures(
             "figures": paths,
             "uncertainty": (
                 "95% percentile bootstrap over held-out graphs; one trained "
-                "checkpoint per architecture, so intervals do not include training-seed variance"
+                "checkpoint per architecture, so intervals do not include training-seed "
+                "variance. Difference panels use paired graph-level bootstraps against "
+                "Dense GRIT."
             ),
         },
     )
     return {
         "figures": paths,
         "profile_rows": profile_rows,
+        "contrast_rows": contrast_rows,
         "expected_rows": expected_rows,
     }
 
