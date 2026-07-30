@@ -172,7 +172,8 @@ class ZincReachConfig:
             ),
             "directional_jacobian_estimand": (
                 "pre-pooling hidden-state Jacobian-vector response along each realised "
-                "clean-to-donor one-hot atom direction"
+                "clean-to-donor one-hot atom direction; exact forward-mode JVP preferred, "
+                "exact reverse-mode JVP second, epsilon-halving-audited centered fallback"
             ),
             "finite_hidden_estimand": (
                 "finite clean-minus-donor final pre-pooling hidden-state response"
@@ -505,13 +506,77 @@ def _bamberger_rows(
     return rows
 
 
+def _directional_jvp(
+    forward: Any,
+    clean: Any,
+    direction: Any,
+) -> tuple[Any, dict[str, Any]]:
+    """Compute a JVP, with an audited numerical fallback for masked-attention kernels."""
+
+    import torch
+
+    failures: list[str] = []
+    try:
+        _, tangent = torch.func.jvp(
+            forward,
+            (clean,),
+            (direction,),
+        )
+        if not bool(torch.isfinite(tangent).all()):
+            raise FloatingPointError("forward-mode JVP returned non-finite values")
+        return tangent.detach(), {
+            "method": "exact_forward_ad_jvp",
+            "relative_error": None,
+            "failures": failures,
+        }
+    except (AttributeError, FloatingPointError, NotImplementedError, RuntimeError) as error:
+        failures.append(f"forward_ad:{type(error).__name__}")
+
+    try:
+        _, tangent = torch.autograd.functional.jvp(
+            forward,
+            clean,
+            direction,
+            create_graph=False,
+            strict=False,
+        )
+        if not bool(torch.isfinite(tangent).all()):
+            raise FloatingPointError("reverse-over-reverse JVP returned non-finite values")
+        return tangent.detach(), {
+            "method": "exact_reverse_ad_jvp",
+            "relative_error": None,
+            "failures": failures,
+        }
+    except (FloatingPointError, NotImplementedError, RuntimeError) as error:
+        failures.append(f"reverse_ad:{type(error).__name__}")
+
+    def centred(epsilon: float) -> Any:
+        with torch.no_grad():
+            positive = forward(clean + float(epsilon) * direction)
+            negative = forward(clean - float(epsilon) * direction)
+        return (positive - negative) / (2.0 * float(epsilon))
+
+    coarse = centred(1.0e-3)
+    tangent = centred(5.0e-4)
+    if not bool(torch.isfinite(tangent).all()):
+        raise RuntimeError("centered donor-direction derivative returned non-finite values")
+    numerator = torch.linalg.vector_norm((tangent - coarse).reshape(-1))
+    denominator = torch.linalg.vector_norm(tangent.reshape(-1)).clamp_min(1.0e-12)
+    relative_error = float((numerator / denominator).detach().cpu())
+    return tangent.detach(), {
+        "method": "audited_centered_difference",
+        "relative_error": relative_error,
+        "failures": failures,
+    }
+
+
 def _semantic_directional_jacobian_mass(
     prepared: Any,
     *,
     base: Any,
     variants: Sequence[Any],
     events: Sequence[Any],
-) -> Any:
+) -> tuple[Any, list[dict[str, Any]]]:
     """Return ``[event, carrier]`` clean-point JVP norms for realised donor directions."""
 
     import torch
@@ -540,7 +605,9 @@ def _semantic_directional_jacobian_mass(
         )
 
     cached: dict[tuple[int, int], Any] = {}
+    cached_diagnostics: dict[tuple[int, int], dict[str, Any]] = {}
     responses: list[Any] = []
+    diagnostics: list[dict[str, Any]] = []
     for variant, event in zip(variants, events):
         source = int(event.source)
         donor_atom = int(variant.x[source].reshape(-1)[0])
@@ -552,19 +619,19 @@ def _semantic_directional_jacobian_mass(
             direction = torch.zeros_like(clean_one_hot)
             direction[source, donor_atom] = 1
             direction[source, clean_atom] = -1
-            _, tangent = torch.autograd.functional.jvp(
+            tangent, diagnostic = _directional_jvp(
                 forward,
                 clean_one_hot,
                 direction,
-                create_graph=False,
-                strict=False,
             )
             response = torch.linalg.vector_norm(tangent, dim=-1)
             if not bool(torch.isfinite(response).all()):
                 raise RuntimeError("non-finite donor-direction Jacobian response")
             cached[key] = response.detach()
+            cached_diagnostics[key] = diagnostic
         responses.append(cached[key])
-    return torch.stack(responses, dim=0)
+        diagnostics.append(cached_diagnostics[key])
+    return torch.stack(responses, dim=0), diagnostics
 
 
 def _project_final_change(change: Any, clean_gradient: Any) -> Any:
@@ -593,6 +660,7 @@ def _donor_rows(
     events: Sequence[Any],
     clean_jacobians: Any,
     directional_mass: Any | None,
+    directional_diagnostics: Sequence[Mapping[str, Any]] | None,
 ) -> list[dict[str, Any]]:
     """Evaluate finite Functional-carriage mass for one graph/channel."""
 
@@ -611,11 +679,13 @@ def _donor_rows(
     if len(events) != int(finite_mass.shape[0]):
         raise RuntimeError("event manifest and carrier tensor are misaligned")
     if channel == "semantic":
-        if directional_mass is None:
+        if directional_mass is None or directional_diagnostics is None:
             raise RuntimeError("semantic events require donor-direction Jacobian mass")
         if tuple(directional_mass.shape) != tuple(finite_mass.shape):
             raise RuntimeError("directional and finite carrier geometries differ")
-    elif directional_mass is not None:
+        if len(directional_diagnostics) != len(events):
+            raise RuntimeError("directional diagnostics and donor events are misaligned")
+    elif directional_mass is not None or directional_diagnostics is not None:
         raise RuntimeError("directional Jacobian mass is semantic-only")
 
     distances = shortest_path_distances(base.edge_index, int(base.num_nodes))
@@ -650,6 +720,15 @@ def _donor_rows(
                 )
                 row["finite_hidden_response"] = float(
                     finite_hidden_mass[event_index, carrier].detach().cpu()
+                )
+                diagnostic = directional_diagnostics[event_index]
+                row["directional_estimator"] = str(diagnostic["method"])
+                relative_error = diagnostic.get("relative_error")
+                row["directional_relative_error"] = (
+                    "" if relative_error is None else float(relative_error)
+                )
+                row["directional_exact_failures"] = "|".join(
+                    str(value) for value in diagnostic.get("failures", ())
                 )
             rows.append(row)
     return rows
@@ -709,7 +788,7 @@ def _measure_graph(
                 flush=True,
             )
             continue
-        directional_mass = (
+        directional_result = (
             _semantic_directional_jacobian_mass(
                 prepared,
                 base=base,
@@ -719,6 +798,26 @@ def _measure_graph(
             if channel == "semantic"
             else None
         )
+        directional_mass, directional_diagnostics = (
+            directional_result if directional_result is not None else (None, None)
+        )
+        if directional_diagnostics is not None:
+            fallbacks = [
+                row
+                for row in directional_diagnostics
+                if str(row["method"]) == "audited_centered_difference"
+            ]
+            if fallbacks:
+                maximum_error = max(
+                    float(row["relative_error"])
+                    for row in fallbacks
+                )
+                print(
+                    f"[reach:warning] {task} graph={graph_id}: "
+                    f"{len(fallbacks)}/{len(directional_diagnostics)} donor directions "
+                    f"used the centered JVP fallback (max halving error={maximum_error:.3g})",
+                    flush=True,
+                )
         rows = _donor_rows(
             config,
             prepared,
@@ -731,6 +830,7 @@ def _measure_graph(
             events=events,
             clean_jacobians=clean_jacobians,
             directional_mass=directional_mass,
+            directional_diagnostics=directional_diagnostics,
         )
         donor_rows.extend(rows)
         if torch.cuda.is_available():
@@ -866,8 +966,35 @@ def measure(
                 )
 
     results_dir = output_dir / "results"
+    diagnostic_fields = (
+        "task",
+        "graph",
+        "source",
+        "donor_graph",
+        "donor_node",
+        "draw",
+        "directional_estimator",
+        "directional_relative_error",
+        "directional_exact_failures",
+    )
+    diagnostic_by_event: dict[tuple[Any, ...], dict[str, Any]] = {}
+    for row in donor_rows:
+        if str(row["channel"]) != "semantic":
+            continue
+        key = tuple(row[field] for field in diagnostic_fields[:6])
+        diagnostic_by_event[key] = {
+            field: row.get(field, "")
+            for field in diagnostic_fields
+        }
+    directional_diagnostics = list(diagnostic_by_event.values())
+    fallback_diagnostics = [
+        row
+        for row in directional_diagnostics
+        if str(row["directional_estimator"]) == "audited_centered_difference"
+    ]
     _write_csv(results_dir / "donor_carrier_mass.csv", donor_rows)
     _write_csv(results_dir / "bamberger_input_output_influence.csv", bamberger_rows)
+    _write_csv(results_dir / "directional_jvp_diagnostics.csv", directional_diagnostics)
     _write_csv(results_dir / "model_health.csv", health)
     _write_json(
         results_dir / "measurement_manifest.json",
@@ -880,6 +1007,17 @@ def measure(
             "completed_graph_shards": completed,
             "donor_rows": len(donor_rows),
             "bamberger_rows": len(bamberger_rows),
+            "directional_jvp": {
+                "events": len(directional_diagnostics),
+                "fallback_events": len(fallback_diagnostics),
+                "maximum_fallback_relative_error": max(
+                    (
+                        float(row["directional_relative_error"])
+                        for row in fallback_diagnostics
+                    ),
+                    default=None,
+                ),
+            },
             "comparison_scope": {
                 "semantic": (
                     "literal Bamberger pre-pooling Jacobian proxy, realised donor-direction "
@@ -921,6 +1059,7 @@ def measure(
     return {
         "donor_rows": donor_rows,
         "bamberger_rows": bamberger_rows,
+        "directional_diagnostics": directional_diagnostics,
         "health": health,
     }
 

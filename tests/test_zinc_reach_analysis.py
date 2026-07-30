@@ -59,7 +59,7 @@ def test_donor_direction_jacobian_matches_linear_response(monkeypatch):
     ]
     events = [SimpleNamespace(source=1), SimpleNamespace(source=1)]
 
-    actual = reach._semantic_directional_jacobian_mass(
+    actual, diagnostics = reach._semantic_directional_jacobian_mass(
         prepared,
         base=Data(raw_atoms[:, None]),
         variants=variants,
@@ -70,6 +70,38 @@ def test_donor_direction_jacobian_matches_linear_response(monkeypatch):
         mixing[:, 1].abs() * torch.linalg.vector_norm(donor_direction)
     ).repeat(2, 1)
     assert torch.allclose(actual, expected)
+    assert all(
+        row["method"] in {"exact_forward_ad_jvp", "exact_reverse_ad_jvp"}
+        for row in diagnostics
+    )
+
+
+def test_nonfinite_exact_jvps_use_audited_centered_fallback(monkeypatch):
+    def nonfinite_forward_jvp(function, primals, _tangents):
+        output = function(*primals)
+        return output, torch.full_like(output, torch.nan)
+
+    def nonfinite_reverse_jvp(function, primal, _tangent, **_kwargs):
+        output = function(primal)
+        return output, torch.full_like(output, torch.nan)
+
+    monkeypatch.setattr(torch.func, "jvp", nonfinite_forward_jvp)
+    monkeypatch.setattr(torch.autograd.functional, "jvp", nonfinite_reverse_jvp)
+    clean = torch.tensor([1.5, -0.5])
+    direction = torch.tensor([0.25, 2.0])
+    tangent, diagnostic = reach._directional_jvp(
+        lambda value: value.square(),
+        clean,
+        direction,
+    )
+
+    assert torch.allclose(tangent, 2 * clean * direction, rtol=1.0e-3, atol=1.0e-3)
+    assert diagnostic["method"] == "audited_centered_difference"
+    assert diagnostic["relative_error"] < 1.0e-3
+    assert diagnostic["failures"] == [
+        "forward_ad:FloatingPointError",
+        "reverse_ad:FloatingPointError",
+    ]
 
 
 def test_discover_seed_checkpoint_prefers_recovery_best(tmp_path: Path):

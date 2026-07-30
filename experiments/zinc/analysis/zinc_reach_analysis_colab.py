@@ -214,6 +214,27 @@ if not INSTALL_DEPENDENCIES:
 
 result = main(CELL_ARGS)
 
+directional_diagnostics = result.get("measurement", {}).get(
+    "directional_diagnostics",
+    [],
+)
+if directional_diagnostics:
+    estimator_counts = {}
+    for row in directional_diagnostics:
+        estimator = str(row["directional_estimator"])
+        estimator_counts[estimator] = estimator_counts.get(estimator, 0) + 1
+    fallback_errors = [
+        float(row["directional_relative_error"])
+        for row in directional_diagnostics
+        if row["directional_relative_error"] != ""
+    ]
+    print(
+        "\n[directional-jvp] estimator counts="
+        f"{estimator_counts}; maximum fallback error="
+        f"{max(fallback_errors) if fallback_errors else 'n/a'}",
+        flush=True,
+    )
+
 if "health" in result.get("measurement", {}):
     from IPython.display import display
 
