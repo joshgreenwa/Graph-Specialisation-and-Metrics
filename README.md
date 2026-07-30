@@ -16,6 +16,28 @@ exposed through `graph_specialisation_metrics.main()`. The Drive-backed producti
 Module-level READMEs document implementations and historical refinement experiments; where their
 older alternatives differ, the canonical methodology takes precedence.
 
+## NAR reach analysis
+
+The standalone launcher
+[`experiments/synthetic/analysis/nar_reach_analysis_colab.py`](experiments/synthetic/analysis/nar_reach_analysis_colab.py)
+reports the original Bamberger semantic encoded-input/central-output Jacobian range, then compares
+a matched local donor-direction Jacobian with finite Functional carriage on the same semantic or
+structural donor event and native routed-message carrier sites. The original estimator has no
+canonical structural donor-swap analogue, so it is not relabelled as one. The launcher reads the
+existing `nar_grit_fixed_n_v3` checkpoints for 1-hop, 2-hop, and dense GRIT at `N=8,16,64`, caches
+graph-level measurements under
+`canonical_nar_analysis_d128/extensions/nar_reach_analysis_v1`, saves PNG/PDF figures, and displays
+them in Colab. Set `PHASE = "figures"` for a checkpoint-free figure rerun.
+
+Layer-1 distance curves are the primary learned-reach result and expected layer-1 carrier distance
+is secondary. Layer 2 is retained as an arrival/readout check: because NAR classifies only the
+central node, output-projected final-layer mass should collapse to the central carrier at the known
+query/readout (`d=2`) or record/readout (`d=1`) distance. NAR otherwise supplies architecture
+support ceilings but no unique ground-truth learned carrier distribution. Structural RRWP swaps are
+diagnostic counterfactuals because fixed-N NAR has the same topology and RRWP in every training
+example. Beneficial carriage is shown separately as signed task benefit at the central final-state
+readout, not as a distributed reach oracle.
+
 The long-term project scope covers:
 
 - training and evaluation files for Graphormer, GraphGPS, GRIT, CSA, and Exphormer;
