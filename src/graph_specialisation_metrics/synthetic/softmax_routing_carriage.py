@@ -705,23 +705,19 @@ def render_figure(output_dir: Path, config: ExperimentConfig) -> dict[str, str]:
             float(multipliers.max()),
         )
     ]
-    shares = np.asarray(
-        [
-            [
-                np.mean([record["jacobian_near_share"] for record in high_records]),
-                np.mean([record["jacobian_far_share"] for record in high_records]),
-            ],
-            [
-                np.mean([record["functional_near_share"] for record in high_records]),
-                np.mean([record["functional_far_share"] for record in high_records]),
-            ],
-            [
-                np.mean([record["oracle_near_share"] for record in high_records]),
-                np.mean([record["oracle_far_share"] for record in high_records]),
-            ],
-        ],
+    high_jacobian = np.asarray(
+        [float(record["jacobian_range"]) for record in high_records],
         dtype=np.float64,
     )
+    high_functional = np.asarray(
+        [float(record["functional_range"]) for record in high_records],
+        dtype=np.float64,
+    )
+    high_oracle = np.asarray(
+        [float(record["oracle_range"]) for record in high_records],
+        dtype=np.float64,
+    )
+    high_test_mae = float(np.mean([record["test_mae"] for record in high_records]))
 
     plt.rcParams.update(
         {
@@ -753,43 +749,116 @@ def render_figure(output_dir: Path, config: ExperimentConfig) -> dict[str, str]:
     purple = "#CC79A7"
     grey = "#7A7A76"
     light_blue = "#56B4E9"
+    yellow = "#F0E442"
     ink = "#202020"
     grid = "#DDDCD8"
+    pale = "#F4F3EF"
 
-    fig, axes = plt.subplots(1, 3, figsize=(7.35, 2.55), constrained_layout=True)
+    fig, axes = plt.subplots(1, 3, figsize=(7.6, 2.65), constrained_layout=True)
     fig.suptitle(
-        "Finite swaps recover saturated softmax routing",
+        "Range estimation in a learned softmax-routing task",
         fontsize=10.0,
         fontweight="semibold",
     )
 
     ax = axes[0]
-    for seed_index in range(len(seeds)):
-        ax.plot(
-            confidence[seed_index],
-            np.maximum(test_mae[seed_index], 1.0e-7),
-            color=blue,
-            alpha=0.22,
-            linewidth=0.9,
-        )
-    ax.plot(
-        confidence.mean(axis=0),
-        np.maximum(test_mae.mean(axis=0), 1.0e-7),
-        color=blue,
-        marker="o",
-        markersize=4.1,
-        markerfacecolor="white",
-        markeredgewidth=1.2,
+    ax.set_xlim(0.0, 1.0)
+    ax.set_ylim(0.0, 1.0)
+    ax.axis("off")
+    ax.text(
+        0.12,
+        0.62,
+        "Query source\nkey A",
+        ha="center",
+        va="center",
+        fontsize=7.7,
+        bbox={
+            "boxstyle": "round,pad=0.35",
+            "facecolor": yellow,
+            "edgecolor": ink,
+            "linewidth": 0.8,
+        },
     )
-    ax.set_yscale("log")
-    ax.set_xlim(max(0.0, float(confidence.min()) - 0.035), 1.005)
-    ax.set_xlabel("Matched-key probability")
-    ax.set_ylabel("Test MAE")
-    ax.set_title("Retrieval remains accurate at saturation", pad=5)
-    ax.grid(axis="y", color=grid, linewidth=0.6)
-    ax.set_axisbelow(True)
+    ax.text(
+        0.48,
+        0.78,
+        "Near carrier\n$c_A$",
+        ha="center",
+        va="center",
+        fontsize=7.6,
+        bbox={
+            "boxstyle": "round,pad=0.3",
+            "facecolor": light_blue,
+            "edgecolor": ink,
+            "linewidth": 0.8,
+        },
+    )
+    ax.text(
+        0.83,
+        0.73,
+        "Matched far record\nkey A; payload $v_A$",
+        ha="center",
+        va="center",
+        fontsize=7.0,
+        color="white",
+        bbox={
+            "boxstyle": "round,pad=0.3",
+            "facecolor": purple,
+            "edgecolor": ink,
+            "linewidth": 0.8,
+        },
+    )
+    ax.text(
+        0.84,
+        0.39,
+        "Other records\nkeys B–F",
+        ha="center",
+        va="center",
+        fontsize=7.2,
+        bbox={
+            "boxstyle": "round,pad=0.3",
+            "facecolor": "#E7E6E2",
+            "edgecolor": grey,
+            "linewidth": 0.8,
+        },
+    )
+    for end in ((0.39, 0.73), (0.73, 0.70), (0.73, 0.43)):
+        ax.annotate(
+            "",
+            xy=end,
+            xytext=(0.21, 0.62),
+            arrowprops={
+                "arrowstyle": "-|>",
+                "color": grey,
+                "linewidth": 1.0,
+                "shrinkA": 2,
+                "shrinkB": 2,
+            },
+        )
+    ax.text(0.29, 0.72, "$d=1$", fontsize=7.2, color=ink, ha="center")
+    ax.text(0.56, 0.61, f"$d={config.far_distance}$", fontsize=7.2, color=ink)
+    ax.text(
+        0.5,
+        0.18,
+        r"Known target:  $y=c_A+v_A$",
+        ha="center",
+        va="center",
+        fontsize=8.0,
+        fontweight="semibold",
+    )
+    ax.text(
+        0.5,
+        0.07,
+        r"Valid swap $A\!\rightarrow\!B$ selects record B",
+        ha="center",
+        va="center",
+        fontsize=7.2,
+        color=grey,
+    )
+    ax.set_title("Task and ground truth", pad=5)
 
     ax = axes[1]
+    ax.axvspan(0.95, 1.005, color=pale, zorder=0)
     for values, color in (
         (jacobian_range, blue),
         (functional_range, orange),
@@ -810,7 +879,7 @@ def render_figure(output_dir: Path, config: ExperimentConfig) -> dict[str, str]:
         markersize=4.1,
         markerfacecolor="white",
         markeredgewidth=1.2,
-        label="Local Jacobian",
+        label="Local Jacobian estimate",
     )
     ax.plot(
         confidence.mean(axis=0),
@@ -819,7 +888,7 @@ def render_figure(output_dir: Path, config: ExperimentConfig) -> dict[str, str]:
         marker="s",
         markersize=3.8,
         linestyle=(0, (3.2, 1.8)),
-        label="Finite carriage",
+        label="Finite-carriage estimate",
     )
     ax.plot(
         confidence.mean(axis=0),
@@ -827,65 +896,95 @@ def render_figure(output_dir: Path, config: ExperimentConfig) -> dict[str, str]:
         color=grey,
         linestyle=(0, (1.5, 1.8)),
         linewidth=1.2,
-        label="Hard-routing oracle",
+        label="Known target range",
     )
     ax.set_xlim(max(0.0, float(confidence.min()) - 0.035), 1.005)
-    ax.set_xlabel("Matched-key probability")
-    ax.set_ylabel("Expected distance (hops)")
-    ax.set_title("Finite range tracks the oracle", pad=5)
+    ax.set_xlabel("Routing confidence  $p$(matched record)")
+    ax.set_ylabel("Estimated range (hops)")
+    ax.set_title("Range across routing confidence", pad=5)
     ax.grid(axis="y", color=grid, linewidth=0.6)
     ax.set_axisbelow(True)
     ax.legend(frameon=False, loc="best", handlelength=1.8, labelspacing=0.25)
+    ax.text(
+        0.97,
+        0.53,
+        f"At rightmost point:\nmean test MAE = {high_test_mae:.3f}",
+        transform=ax.transAxes,
+        ha="right",
+        va="center",
+        fontsize=7.0,
+        color=ink,
+        bbox={
+            "boxstyle": "round,pad=0.2",
+            "facecolor": "white",
+            "edgecolor": "none",
+            "alpha": 0.86,
+        },
+    )
 
     ax = axes[2]
-    x = np.arange(3)
-    ax.bar(
+    x = np.arange(2)
+    method_values = np.asarray(
+        [high_jacobian.mean(), high_functional.mean()],
+        dtype=np.float64,
+    )
+    bars = ax.bar(
         x,
-        shares[:, 0],
-        width=0.62,
-        color=light_blue,
+        method_values,
+        width=0.58,
+        color=(blue, orange),
         zorder=2,
     )
-    ax.bar(
-        x,
-        shares[:, 1],
-        width=0.62,
-        bottom=shares[:, 0],
-        color=purple,
-        zorder=2,
+    target_range = float(high_oracle.mean())
+    ax.axhline(
+        target_range,
+        color=grey,
+        linestyle=(0, (1.5, 1.8)),
+        linewidth=1.4,
+        zorder=3,
     )
-    for method, (near_share, far_share) in enumerate(shares):
-        if near_share >= 0.08:
-            ax.text(
-                method,
-                near_share / 2,
-                f"Near\n{near_share:.0%}",
-                ha="center",
-                va="center",
-                fontsize=7.3,
-                color=ink,
-            )
-        if far_share >= 0.08:
-            ax.text(
-                method,
-                near_share + far_share / 2,
-                f"Far\n{far_share:.0%}",
-                ha="center",
-                va="center",
-                fontsize=7.3,
-                color="white",
-                fontweight="semibold",
-            )
-    ax.set_xticks(x, ["Local\nJacobian", "Finite\ncarriage", "Oracle"])
-    ax.set_ylim(0.0, 1.05)
-    ax.set_ylabel("Share of response")
-    ax.set_title("Carrier location at sharp routing", pad=5)
+    offsets = np.linspace(-0.055, 0.055, len(seeds))
+    for method, seed_values in enumerate((high_jacobian, high_functional)):
+        ax.scatter(
+            method + offsets,
+            seed_values,
+            s=13,
+            facecolor="white",
+            edgecolor=ink,
+            linewidth=0.6,
+            zorder=4,
+        )
+    for method, (bar, value) in enumerate(zip(bars, method_values)):
+        ax.text(
+            bar.get_x() + bar.get_width() / 2,
+            value + 0.12 if method == 0 else value - 0.22,
+            f"{value:.2f}",
+            ha="center",
+            va="bottom" if method == 0 else "top",
+            fontsize=7.8,
+            color=ink if method == 0 else "white",
+            fontweight="semibold",
+        )
+    ax.text(
+        0.03,
+        target_range + 0.08,
+        f"Known target: {target_range:.2f} hops",
+        transform=ax.get_yaxis_transform(),
+        ha="left",
+        va="bottom",
+        fontsize=7.2,
+        color=grey,
+    )
+    ax.set_xticks(x, ["Local Jacobian\nestimate", "Finite-carriage\nestimate"])
+    ax.set_ylim(0.0, max(5.8, target_range + 0.55))
+    ax.set_ylabel("Estimated range (hops)")
+    ax.set_title("High-confidence comparison", pad=5)
     ax.grid(axis="y", color=grid, linewidth=0.6)
     ax.set_axisbelow(True)
 
     for letter, ax in zip(("a", "b", "c"), axes):
         ax.text(
-            -0.18,
+            -0.13,
             1.08,
             letter,
             transform=ax.transAxes,
@@ -905,7 +1004,7 @@ def render_figure(output_dir: Path, config: ExperimentConfig) -> dict[str, str]:
     plt.close(fig)
 
     metadata = {
-        "title": "Finite swaps recover saturated softmax routing",
+        "title": "Range estimation in a learned softmax-routing task",
         "protocol_version": PROTOCOL_VERSION,
         "fingerprint": config.fingerprint,
         "seeds": seeds,
