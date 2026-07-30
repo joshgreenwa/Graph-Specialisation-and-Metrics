@@ -397,15 +397,17 @@ def select_ranked_heads(
     metrics: CanonicalHeadMetrics,
     *,
     semantic_count: int = 3,
+    structural_count: int = 0,
     joint_count: int = 3,
     active_only: bool = True,
     joint_generalist_max_abs_selectivity: float | None = None,
 ) -> dict[str, Head]:
-    """Rank by decreasing ``D_rel`` and by decreasing generalist ``J``."""
+    """Rank semantic, structural, and high-``J`` generalist heads."""
 
     semantic_count = int(semantic_count)
+    structural_count = int(structural_count)
     joint_count = int(joint_count)
-    if semantic_count < 0 or joint_count < 0:
+    if semantic_count < 0 or structural_count < 0 or joint_count < 0:
         raise ValueError("rank counts must be non-negative")
     finite = np.isfinite(metrics.selectivity) & np.isfinite(
         metrics.joint_sensitivity
@@ -420,6 +422,14 @@ def select_ranked_heads(
     semantic_selectivity = metrics.selectivity[semantic_layers, semantic_heads]
     semantic_joint = metrics.joint_sensitivity[semantic_layers, semantic_heads]
     semantic_order = np.lexsort((-semantic_joint, -semantic_selectivity))
+    if len(semantic_layers) < structural_count:
+        raise ValueError(
+            f"only {len(semantic_layers)} eligible heads are available for a "
+            f"top-{structural_count} structural ranking"
+        )
+    structural_order = np.lexsort(
+        (-semantic_joint, semantic_selectivity)
+    )
 
     joint_eligible = eligible.copy()
     if joint_generalist_max_abs_selectivity is not None:
@@ -440,6 +450,13 @@ def select_ranked_heads(
     ranked: dict[str, Head] = {}
     for rank, position in enumerate(semantic_order[:semantic_count], start=1):
         ranked[f"top_semantic_{rank}"] = (
+            int(semantic_layers[position]),
+            int(semantic_heads[position]),
+        )
+    for rank, position in enumerate(
+        structural_order[:structural_count], start=1
+    ):
+        ranked[f"top_structural_{rank}"] = (
             int(semantic_layers[position]),
             int(semantic_heads[position]),
         )
@@ -1397,6 +1414,137 @@ def compute_av_pca_inputs_many(
     return output
 
 
+def compute_layer_av_pca_inputs(
+    figure_runtime: GritFigureRuntime,
+    *,
+    layers: Sequence[int],
+    n_graphs: int = 500,
+    focus_mass: float = 0.75,
+    diffuse_threshold: float = 0.35,
+    verbose: bool = True,
+) -> dict[str, Any]:
+    """Collect routed-output PCA inputs for every head in selected layers.
+
+    GRIT exposes every layer/head transport tensor in one diagnostic forward,
+    so all requested layer overviews share one sweep over evaluation molecules.
+    A molecule is retained only when every requested layer and head produced a
+    valid routed vector and chemistry-focus label.
+    """
+
+    runtime = figure_runtime.runtime
+    num_layers = int(runtime.L)
+    num_heads = int(runtime.H)
+    requested_layers = tuple(dict.fromkeys(int(layer) for layer in layers))
+    if not requested_layers:
+        raise ValueError("at least one layer is required for layer-wide PCA")
+    invalid = [
+        layer for layer in requested_layers if layer < 0 or layer >= num_layers
+    ]
+    if invalid:
+        raise IndexError(
+            f"PCA layers {invalid} are outside [0, {num_layers})"
+        )
+    if int(n_graphs) < 2:
+        raise ValueError("layer-wide PCA requires at least two requested graphs")
+
+    extractor = GritDiagnosticExtractor(figure_runtime)
+    vectors: dict[int, list[np.ndarray]] = {
+        layer: [] for layer in requested_layers
+    }
+    labels: dict[int, list[list[str]]] = {
+        layer: [] for layer in requested_layers
+    }
+    positions: list[int] = []
+    limit = min(int(n_graphs), len(runtime.eval_ds))
+    task_name = figure_runtime.prepared.task.name
+    for position in range(limit):
+        try:
+            graph = runtime.eval_ds[position]
+            captured = extractor.extract(graph)
+            molecule = molecule_from_graph(task_name, graph)
+            graph_vectors: dict[int, np.ndarray] = {}
+            graph_labels: dict[int, list[str]] = {}
+            for layer in requested_layers:
+                layer_vectors = (
+                    captured.transport[layer]
+                    .mean(dim=0)
+                    .float()
+                    .cpu()
+                    .numpy()
+                )
+                matrices = (
+                    captured.attention[layer].float().cpu().numpy()
+                )
+                matrices = matrices / np.clip(
+                    matrices.sum(axis=-1, keepdims=True),
+                    1e-12,
+                    None,
+                )
+                inbound = matrices.mean(axis=1)
+                if layer_vectors.shape[0] != num_heads:
+                    raise ValueError(
+                        f"layer {layer} produced {layer_vectors.shape[0]} head "
+                        f"vectors, expected {num_heads}"
+                    )
+                if inbound.shape[0] != num_heads:
+                    raise ValueError(
+                        f"layer {layer} produced {inbound.shape[0]} attention "
+                        f"profiles, expected {num_heads}"
+                    )
+                graph_vectors[layer] = layer_vectors
+                graph_labels[layer] = [
+                    label_attention_focus(
+                        molecule,
+                        inbound[head],
+                        focus_mass=focus_mass,
+                        diffuse_threshold=diffuse_threshold,
+                    )
+                    for head in range(num_heads)
+                ]
+        except Exception as error:
+            if verbose:
+                print(
+                    "[GRIT layer routed-output PCA] skipped eval position "
+                    f"{position}: {error}"
+                )
+            continue
+        for layer in requested_layers:
+            vectors[layer].append(graph_vectors[layer])
+            labels[layer].append(graph_labels[layer])
+        positions.append(position)
+        if verbose and (position + 1) % 50 == 0:
+            print(f"  [GRIT layer routed-output PCA] {position + 1}/{limit}")
+
+    if len(positions) < 2:
+        raise RuntimeError(
+            "fewer than two molecules produced valid layer-wide routed outputs"
+        )
+    return {
+        "layers": {
+            layer: {
+                "task": task_name,
+                "layer": int(layer),
+                "vectors": np.stack(vectors[layer]),
+                "labels": labels[layer],
+                "n_used": len(positions),
+                **figure_identity(task_name),
+            }
+            for layer in requested_layers
+        },
+        "requested_layers": requested_layers,
+        "num_layers": num_layers,
+        "num_heads": num_heads,
+        "positions": np.asarray(positions, dtype=np.int64),
+        "n_requested": int(n_graphs),
+        "n_used": len(positions),
+        "quantity": (
+            "mean over receiving nodes of native GRIT routed head output wV"
+        ),
+        "chemistry_focus_version": CHEMISTRY_FOCUS_VERSION,
+        **figure_identity(task_name),
+    }
+
+
 def _mean_keywise_std(matrix: Any) -> Any:
     """Per-head mean query-wise std over finite supported keys."""
 
@@ -1613,6 +1761,7 @@ __all__ = [
     "collect_attention_examples",
     "compute_av_pca_inputs",
     "compute_av_pca_inputs_many",
+    "compute_layer_av_pca_inputs",
     "graph_node_labels",
     "label_attention_focus",
     "load_canonical_model_record",

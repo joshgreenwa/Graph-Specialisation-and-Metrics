@@ -80,8 +80,8 @@ The paste-ready clone/mount/dispatch cell is
 | `interventions.py` | One-row semantic replacement and dense-equivalent sparse structural footprint copy. |
 | `backend.py` | Native GRIT `wV`/final-state adapter. |
 | `graphormer.py` | Official checkpoint/dataset loading, native Graphormer transport hooks, graph-token readout adapter. |
-| `grit_figure_data.py` | Read-only canonical score/model validation plus contract-cached GRIT attention, routed-output PCA, raw-logit, and displayed-graph coordinate diagnostics. |
-| `grit_figure_plots.py` | Shared focused ZINC/QM9 presentation layer with graph-native attention rendering. |
+| `grit_figure_data.py` | Read-only canonical score/model validation plus contract-cached GRIT attention, selected/all-head routed-output PCA, raw-logit, and displayed-graph coordinate diagnostics. |
+| `grit_figure_plots.py` | PCQM-aligned ZINC/QM9 presentation layer with RDKit attention rendering, layer-PCA grids, and publication exports. |
 | `graphbench.py` | Exact GraphBench runner/checkpoint adapter, edge-semantic donor law, official-GRIT hooks, and nonlinear readout replay. |
 | `scores.py` / `distance.py` | Raw event score, hierarchy, coordinates, and exact SPD accounting. |
 | `carriage.py` | `F_sens` and positive-is-beneficial donor-wise integrated `B`. |
