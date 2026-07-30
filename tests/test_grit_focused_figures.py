@@ -19,6 +19,7 @@ from graph_specialisation_metrics.methodology.grit_figure_data import (  # noqa:
     SupplementalCache,
     ZINC_ATOM_TYPES,
     atom_chemistry_categories,
+    compute_layer_av_pca_inputs,
     figure_identity,
     graph_node_labels,
     label_attention_focus,
@@ -34,6 +35,7 @@ from graph_specialisation_metrics.methodology.grit_figure_data import (  # noqa:
 )
 from graph_specialisation_metrics.methodology.grit_figure_plots import (  # noqa: E402
     MOLECULE_DRAW_DPI,
+    MOLECULE_RENDER_DPI,
     PCA_FOCUS_COLORS,
     PUBLICATION_PDF_RASTER_DPI,
     PUBLICATION_PNG_DPI,
@@ -41,6 +43,7 @@ from graph_specialisation_metrics.methodology.grit_figure_plots import (  # noqa
     plot_attention_grid,
     plot_av_pca,
     plot_coordinate_heatmaps,
+    plot_layer_av_pca_grid,
     plot_logit_spread,
     plot_score_heatmaps,
     plot_score_plane,
@@ -129,10 +132,12 @@ def test_head_metrics_and_grit_specialist_selection():
     ranked = select_ranked_heads(
         metrics,
         semantic_count=3,
+        structural_count=3,
         joint_count=3,
         joint_generalist_max_abs_selectivity=0.10,
     )
     assert ranked["top_semantic_1"] == (0, 0)
+    assert ranked["top_structural_1"] == (0, 1)
     assert ranked["top_joint_1"] == (0, 2)
 
 
@@ -426,6 +431,21 @@ def test_grit_plotting_api_accepts_synthetic_payloads():
             }
         )
     )
+    figures.append(
+        plot_layer_av_pca_grid(
+            {
+                "task": "zinc",
+                "display_title": "ZINC-subset — dense GRIT+RRWP",
+                "layer": 0,
+                "vectors": np.arange(96, dtype=float).reshape(8, 4, 3),
+                "labels": [
+                    ["Ring: aromatic", "O: carbonyl"] * 2
+                    for _ in range(8)
+                ],
+                "n_used": 8,
+            }
+        )
+    )
     logit = {
         "task": "zinc",
         "display_title": "ZINC-subset — dense GRIT+RRWP",
@@ -444,8 +464,50 @@ def test_grit_plotting_api_accepts_synthetic_payloads():
         figures[2].get_size_inches(),
         figures[3].get_size_inches(),
     )
+    assert figures[4].axes[-1].get_xlabel() == "Attention weight"
+    assert all(
+        text.get_fontsize() == 9.5
+        for text in figures[5].axes[0].get_legend().get_texts()
+    )
+    assert figures[6].legends[0].get_title().get_text() == "Attention focus"
     assert all(figure.axes for figure in figures)
     for figure in figures:
+        plt.close(figure)
+
+
+def test_pca_legend_is_ranked_by_observed_frequency():
+    import matplotlib.pyplot as plt
+
+    labels = (
+        ["Ring: aromatic"] * 2
+        + ["O: carbonyl"] * 5
+        + ["N: amide"] * 3
+        + ["other/diffuse"]
+    )
+    figure = plot_av_pca(
+        {
+            "task": "zinc",
+            "display_title": "ZINC-subset — dense GRIT+RRWP",
+            "head": (0, 0),
+            "vectors": np.arange(len(labels) * 3, dtype=float).reshape(
+                len(labels), 3
+            ),
+            "labels": labels,
+            "n_used": len(labels),
+        }
+    )
+    try:
+        observed = [
+            text.get_text().split(" (n=", 1)[0]
+            for text in figure.axes[0].get_legend().get_texts()
+        ]
+        assert observed == [
+            "O: carbonyl",
+            "N: amide",
+            "Ring: aromatic",
+            "other/diffuse",
+        ]
+    finally:
         plt.close(figure)
 
 
@@ -458,7 +520,11 @@ def test_section_pdf_bundles_are_task_prefixed_and_ordered(tmp_path: Path):
         figure, axis = plt.subplots()
         axis.text(0.5, 0.5, f"page {index}", ha="center")
         paths = save_figure_bundle(
-            figure, tmp_path / "individual", f"figure_{index}"
+            figure,
+            tmp_path / "individual",
+            f"figure_{index}",
+            dpi=72,
+            pdf_dpi=72,
         )
         pages.append((f"figure_{index}", paths["pdf"]))
         plt.close(figure)
@@ -487,24 +553,24 @@ def test_figure_bundle_uses_publication_export_resolution(tmp_path: Path):
     figure = RecordingFigure()
     save_figure_bundle(figure, tmp_path, "publication")
     assert figure.calls[0][0].suffix == ".png"
-    assert figure.calls[0][1]["dpi"] == PUBLICATION_PNG_DPI == 300
+    assert figure.calls[0][1]["dpi"] == PUBLICATION_PNG_DPI == 600
     assert figure.calls[1][0].suffix == ".pdf"
-    assert figure.calls[1][1]["dpi"] == PUBLICATION_PDF_RASTER_DPI == 600
-    assert MOLECULE_DRAW_DPI == 600
+    assert figure.calls[1][1]["dpi"] == PUBLICATION_PDF_RASTER_DPI == 1200
+    assert MOLECULE_DRAW_DPI == MOLECULE_RENDER_DPI == 600
+    assert figure.calls[1][1]["metadata"]["Title"] == "publication"
     metadata = json.loads((tmp_path / "publication.json").read_text())
     assert metadata["export_quality"] == {
-        "png_dpi": 300,
-        "pdf_raster_dpi": 600,
-        "pdf_vector_artists": True,
-        "molecule_draw_dpi": 600,
-        "bbox_inches": "tight",
+        "png_dpi": 600,
+        "pdf_raster_dpi": 1200,
+        "pdf_vector_text_and_paths": True,
+        "pdf_font_embedding": "TrueType (fonttype 42)",
+        "molecule_render_dpi": 600,
     }
 
 
-def test_core_scatter_exports_keep_matching_page_dimensions(tmp_path: Path):
+def test_core_scatter_exports_keep_matching_tight_geometry(tmp_path: Path):
     import matplotlib.pyplot as plt
 
-    PdfReader = pytest.importorskip("pypdf").PdfReader
     metrics = CanonicalHeadMetrics.from_scores(_score_value())
     selected = {"semantic": (0, 0), "structural": (0, 1)}
     figures = [
@@ -513,29 +579,112 @@ def test_core_scatter_exports_keep_matching_page_dimensions(tmp_path: Path):
             metrics, selected, title="Synthetic GRIT"
         ),
     ]
-    pdf_sizes = []
+    exported_shapes = []
     try:
+        assert figures[0].axes[0].get_aspect() == "auto"
         for index, figure in enumerate(figures):
             paths = save_figure_bundle(
                 figure,
                 tmp_path,
                 f"scatter_{index}",
-                bbox_inches=None,
+                dpi=72,
+                pdf_dpi=72,
             )
-            page = PdfReader(str(paths["pdf"])).pages[0]
-            pdf_sizes.append(
-                (float(page.mediabox.width), float(page.mediabox.height))
-            )
-        np.testing.assert_allclose(pdf_sizes[0], pdf_sizes[1], atol=0.01)
-        np.testing.assert_allclose(
-            pdf_sizes[0],
-            np.asarray([8.0, 5.9]) * 72.0,
-            atol=0.01,
-        )
-        assert figures[0].axes[0].get_aspect() == 1.0
+            exported_shapes.append(plt.imread(paths["png"]).shape[:2])
+        assert exported_shapes[0] == exported_shapes[1]
     finally:
         for figure in figures:
             plt.close(figure)
+
+
+def test_layer_pca_collection_reuses_one_grit_forward_per_graph(monkeypatch):
+    torch = pytest.importorskip("torch")
+    num_layers = 3
+    num_heads = 4
+    num_nodes = 3
+    head_width = 2
+    graphs = [
+        SimpleNamespace(num_nodes=num_nodes, graph_index=index)
+        for index in range(3)
+    ]
+    runtime = SimpleNamespace(
+        L=num_layers,
+        H=num_heads,
+        eval_ds=graphs,
+    )
+    figure_runtime = SimpleNamespace(
+        runtime=runtime,
+        prepared=SimpleNamespace(task=SimpleNamespace(name="zinc")),
+    )
+    captured = SimpleNamespace(
+        transport=tuple(
+            torch.arange(
+                num_nodes * num_heads * head_width,
+                dtype=torch.float32,
+            ).reshape(num_nodes, num_heads, head_width)
+            + layer
+            for layer in range(num_layers)
+        ),
+        attention=tuple(
+            torch.ones(
+                num_heads,
+                num_nodes,
+                num_nodes,
+                dtype=torch.float32,
+            )
+            for _ in range(num_layers)
+        ),
+    )
+    calls = []
+
+    class FakeExtractor:
+        def __init__(self, received):
+            assert received is figure_runtime
+
+        def extract(self, graph):
+            calls.append(graph.graph_index)
+            return captured
+
+    monkeypatch.setattr(
+        "graph_specialisation_metrics.methodology.grit_figure_data."
+        "GritDiagnosticExtractor",
+        FakeExtractor,
+    )
+    molecule = object()
+    monkeypatch.setattr(
+        "graph_specialisation_metrics.methodology.grit_figure_data."
+        "molecule_from_graph",
+        lambda task_name, graph: molecule,
+    )
+    monkeypatch.setattr(
+        "graph_specialisation_metrics.methodology.grit_figure_data."
+        "label_attention_focus",
+        lambda received, mass, **kwargs: "Ring: aromatic",
+    )
+    payload = compute_layer_av_pca_inputs(
+        figure_runtime,
+        layers=(0, 2),
+        n_graphs=3,
+        verbose=False,
+    )
+
+    assert calls == [0, 1, 2]
+    assert payload["requested_layers"] == (0, 2)
+    assert payload["num_heads"] == num_heads
+    assert payload["n_used"] == 3
+    for layer in (0, 2):
+        layer_payload = payload["layers"][layer]
+        assert layer_payload["vectors"].shape == (
+            3,
+            num_heads,
+            head_width,
+        )
+        assert np.asarray(layer_payload["labels"]).shape == (3, num_heads)
+        assert {
+            label
+            for row in layer_payload["labels"]
+            for label in row
+        } == {"Ring: aromatic"}
 
 
 def test_grit_diagnostic_extractor_captures_native_sparse_sites():
@@ -640,9 +789,17 @@ def test_colab_notebook_has_valid_python_cells():
     )
     assert '"rdkit"' in source
     assert '"pypdf"' in source
+    assert 'TASK_SELECTION = "zinc"  # @param ["zinc", "qm9", "both"]' in source
+    assert '"zinc": ("zinc",)' in source
+    assert '"qm9": ("qm9_gap_dense",)' in source
+    assert "HEADS_PER_FAMILY = 5" in source
+    assert "PNG_DPI = 600" in source
+    assert "PDF_RASTER_DPI = 1200" in source
+    assert "del sys.modules[module_name]" in source
     assert "def get_figure_runtime()" in source
     assert "if figure_runtime is None" in source
-    assert "select_structurally_selective_heads" in source
+    assert "structural_count=HEADS_PER_FAMILY + 1" in source
+    assert 'all_roles = dict(context["display_heads"])' in source
     assert "clean_attention_mass_vs_SPD" in source
     runtime_source = "".join(payload["cells"][6]["source"])
     assert runtime_source.index("plot_attention_grid(") < runtime_source.index(
@@ -651,11 +808,15 @@ def test_colab_notebook_has_valid_python_cells():
     assert runtime_source.index("plot_av_pca(") < runtime_source.index(
         'f"{role}_head_{head[0]}_{head[1]}_clean_attention_mass_vs_SPD"'
     )
-    assert "companion_heads = set(all_roles.values())" in runtime_source
+    assert "companion_heads = set(all_roles.values())" not in runtime_source
+    assert "additional structural head" not in runtime_source
+    assert "compute_layer_av_pca_inputs(" in runtime_source
+    assert "plot_layer_av_pca_grid(" in runtime_source
     assert 'PDF_TASK_PREFIXES = {"zinc": "zinc", "qm9_gap_dense": "qm9"}' in source
     assert "save_section_pdf_bundles(" in runtime_source
     assert '"semantic_specialists"' in source
     assert '"distance_curves"' in source
+    assert '"layer_pca_overviews"' in source
     assert 'RUN_ROOT / "pdf_sections"' in source
     for index, cell in enumerate(payload["cells"]):
         if cell["cell_type"] == "code":

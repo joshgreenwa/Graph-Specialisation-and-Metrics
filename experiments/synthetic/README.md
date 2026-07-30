@@ -3,6 +3,35 @@
 This folder contains controlled graph tasks for studying symbolic and structural
 attention behaviour outside ZINC.
 
+## Finite-intervention range under nonlinear saturation
+
+`analysis/saturation_carriage_colab.py` is a standalone Colab frontend for the focused
+carriage validation experiment. It trains four tiny two-path models across five saturation
+strengths, then compares:
+
+- the expected range inferred from local Jacobian influence;
+- the expected range measured by finite Functional carriage; and
+- signed Beneficial carriage under an MAE target.
+
+The far path preserves the same finite donor-swap response while its endpoint Jacobian
+saturates. This gives a controlled test of the distinction between infinitesimal influence and
+finite intervention. The near path is deliberately task-adverse and the far path task-beneficial,
+so Beneficial-carriage signs and completeness are also directly checkable.
+
+In Colab, paste the complete frontend into one cell and run it. Checkpoints, measurement caches,
+CSV/JSON results, and the PNG/PDF figure are saved under
+`MyDrive/graph_specialisation_metrics/saturation_carriage_v1/`. Change `PHASE = "figures"` to
+regenerate the paper figure entirely from cached measurements.
+
+Local equivalent:
+
+```bash
+python -m graph_specialisation_metrics.synthetic.saturation_carriage \
+  --phase all \
+  --output-dir outputs/saturation_carriage_v1 \
+  --seeds 0,1,2,3
+```
+
 ## Fixed-N associative recall: canonical analysis
 
 `training/nar_grit_colab.py` trains the three-seed 1-hop, 2-hop, and dense fixed-N GRIT

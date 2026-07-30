@@ -13,6 +13,8 @@ from typing import Any, Mapping, Sequence
 
 import matplotlib.pyplot as plt
 from matplotlib.colors import Normalize, TwoSlopeNorm
+from matplotlib.lines import Line2D
+from matplotlib.ticker import MaxNLocator
 import numpy as np
 
 from .grit_figure_data import CanonicalHeadMetrics, Head, figure_identity
@@ -27,11 +29,11 @@ SLATE = "#607080"
 LIGHT_GRID = "#DCE3E8"
 ATTENTION_CMAP = plt.get_cmap("Blues")
 SELECTIVITY_CMAP = plt.get_cmap("coolwarm")
-# Publication export policy.  PDF text, paths, and annotations remain vector;
-# only intrinsically image-like artists are rendered at the higher PDF DPI.
-PUBLICATION_PNG_DPI = 300
-PUBLICATION_PDF_RASTER_DPI = 600
-MOLECULE_DRAW_DPI = 600
+PUBLICATION_PNG_DPI = 600
+PUBLICATION_PDF_RASTER_DPI = 1200
+MOLECULE_RENDER_DPI = 600
+# Backwards-compatible name retained for existing figure metadata consumers.
+MOLECULE_DRAW_DPI = MOLECULE_RENDER_DPI
 CORE_SCATTER_FIGSIZE = (8.0, 5.9)
 HEAD_STYLES = {
     "semantic": {"color": GOLD, "label": "Semantic specialist"},
@@ -77,6 +79,8 @@ def apply_publication_style() -> None:
         {
             "figure.dpi": 140,
             "savefig.dpi": PUBLICATION_PNG_DPI,
+            "savefig.transparent": False,
+            "savefig.pad_inches": 0.04,
             "font.family": "sans-serif",
             "font.sans-serif": ["DejaVu Sans", "Arial", "Liberation Sans"],
             "mathtext.fontset": "dejavusans",
@@ -93,7 +97,10 @@ def apply_publication_style() -> None:
             "grid.alpha": 0.75,
             "legend.frameon": False,
             "pdf.fonttype": 42,
+            "pdf.compression": 9,
+            "pdf.use14corefonts": False,
             "ps.fonttype": 42,
+            "path.simplify": False,
         }
     )
 
@@ -116,7 +123,7 @@ def _heatmap(ax, values, *, title: str, cmap, norm):
     ax.set_xlabel("Head index")
     ax.set_ylabel("Layer index")
     ax.set_xticks(np.arange(heads))
-    ax.set_xticklabels(np.arange(heads), fontsize=7)
+    ax.set_xticklabels(np.arange(heads), fontsize=6.5)
     ax.set_yticks(np.arange(layers))
     ax.set_yticklabels(np.arange(layers))
     ax.tick_params(length=0)
@@ -142,7 +149,7 @@ def plot_score_heatmaps(
     fig, axes = plt.subplots(
         1,
         2,
-        figsize=(12.0, 5.2),
+        figsize=(14.0, 5.2),
         sharex=True,
         sharey=True,
         constrained_layout=True,
@@ -198,7 +205,7 @@ def plot_coordinate_heatmaps(
     fig, axes = plt.subplots(
         1,
         2,
-        figsize=(12.0, 5.2),
+        figsize=(14.0, 5.2),
         sharex=True,
         sharey=True,
         constrained_layout=True,
@@ -335,8 +342,8 @@ def plot_score_plane(
     scatter = _scatter_heads(ax, x, y)
     maximum = max(float(np.nanmax(x)), float(np.nanmax(y))) * 1.06
     ax.plot([0, maximum], [0, maximum], color=SLATE, linestyle="--", linewidth=1.2)
-    ax.set(xlim=(0, maximum), ylim=(0, maximum))
-    ax.set_aspect("equal", adjustable="box")
+    ax.set_xlim(0, maximum)
+    ax.set_ylim(0, maximum)
     ax.set_xlabel(r"Structural score $S_{\rm str}/\overline{S}_{\rm str}$")
     ax.set_ylabel(r"Semantic score $S_{\rm sem}/\overline{S}_{\rm sem}$")
     ax.set_title(title, fontsize=17, pad=12)
@@ -441,7 +448,7 @@ def _draw_molecule_plain(
     example: Mapping[str, Any],
     *,
     figsize: tuple[float, float] = (4.2, 3.7),
-    dpi: int = MOLECULE_DRAW_DPI,
+    dpi: int = MOLECULE_RENDER_DPI,
 ):
     from PIL import Image
     from rdkit.Chem.Draw import rdMolDraw2D
@@ -450,8 +457,12 @@ def _draw_molecule_plain(
     width, height = int(figsize[0] * dpi), int(figsize[1] * dpi)
     drawer = rdMolDraw2D.MolDraw2DCairo(width, height)
     options = drawer.drawOptions()
-    options.addAtomIndices = True
-    options.padding = 0.08
+    options.addAtomIndices = False
+    options.bondLineWidth = 5.0
+    options.fixedFontSize = 44
+    options.padding = 0.06
+    for index in range(molecule.GetNumAtoms()):
+        options.atomLabels[index] = str(index)
     drawer.DrawMolecule(molecule, legend="")
     drawer.FinishDrawing()
     return Image.open(io.BytesIO(drawer.GetDrawingText()))
@@ -463,7 +474,7 @@ def _draw_molecule_attention(
     inbound: np.ndarray,
     vmax: float,
     figsize: tuple[float, float] = (4.2, 3.7),
-    dpi: int = MOLECULE_DRAW_DPI,
+    dpi: int = MOLECULE_RENDER_DPI,
 ):
     """RDKit molecule with atom-centred attention-inflow highlights."""
 
@@ -490,10 +501,14 @@ def _draw_molecule_attention(
     width, height = int(figsize[0] * dpi), int(figsize[1] * dpi)
     drawer = rdMolDraw2D.MolDraw2DCairo(width, height)
     options = drawer.drawOptions()
-    options.addAtomIndices = True
+    options.addAtomIndices = False
     options.fillHighlights = True
     options.atomHighlightsAreCircles = True
-    options.padding = 0.08
+    options.bondLineWidth = 5.0
+    options.fixedFontSize = 44
+    options.padding = 0.06
+    for index in highlight_atoms:
+        options.atomLabels[index] = str(index)
     drawer.DrawMolecule(
         molecule,
         legend="",
@@ -563,12 +578,13 @@ def plot_attention_grid(
     )
     num_rows = len(examples)
     fig = plt.figure(
-        figsize=(13.2, 1.45 + 3.25 * num_rows), constrained_layout=True
+        figsize=(13.2, 1.65 + 3.35 * num_rows + 0.72),
+        constrained_layout=True,
     )
     grid = fig.add_gridspec(
-        num_rows + 1,
+        num_rows + 2,
         3,
-        height_ratios=[0.15, *([1.0] * num_rows)],
+        height_ratios=[0.16, *([1.0] * num_rows), 0.11],
         width_ratios=[1.0, 1.08, 1.12],
     )
     title_axis = fig.add_subplot(grid[0, :])
@@ -580,6 +596,7 @@ def plot_attention_grid(
         ],
         dtype=object,
     )
+    colorbar_axis = fig.add_subplot(grid[-1, :])
     task = str(examples_payload["task"])
     dataset_label = str(
         examples_payload.get(
@@ -612,13 +629,13 @@ def plot_attention_grid(
             0.99,
             _molecule_caption(example, dataset_label=dataset_label)
             + "\n"
-            + rf"Graph-local: $D_{{\rm rel}}={d_rel:+.3f};\ J={joint:.3f}$",
+            + rf"Graph-local: $D_{{\rm rel}} = {d_rel:+.3f};\ J = {joint:.3f}$",
             transform=axes[row, 0].transAxes,
             ha="left",
             va="top",
-            fontsize=8.0,
+            fontsize=10.5,
             color=NAVY,
-            bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.87},
+            bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.90},
         )
         axes[row, 1].imshow(
             _draw_molecule_attention(
@@ -637,15 +654,15 @@ def plot_attention_grid(
             aspect="equal",
             rasterized=True,
         )
-        axes[row, 2].set_xlabel("Key atom")
-        axes[row, 2].set_ylabel("Query atom")
+        axes[row, 2].set_xlabel("Key atom", fontsize=13)
+        axes[row, 2].set_ylabel("Query atom", fontsize=13)
         axes[row, 2].set_xticks(np.arange(matrix.shape[0]))
         axes[row, 2].set_yticks(np.arange(matrix.shape[0]))
-        axes[row, 2].tick_params(labelsize=6, length=2)
+        axes[row, 2].tick_params(labelsize=8, length=2.5)
     for column, label in enumerate(
         ["Molecule", "Attention-weighted molecule", "Node-conditioned attention"]
     ):
-        axes[0, column].set_title(label, fontsize=12, pad=8)
+        axes[0, column].set_title(label, fontsize=16, pad=10)
     style = HEAD_STYLES.get(role, {"label": role.replace("_", " ").title()})
     title_axis.text(
         0.5,
@@ -654,23 +671,38 @@ def plot_attention_grid(
         f"{title_label or style['label']} — {_head_label(head)}",
         ha="center",
         va="center",
-        fontsize=18,
+        fontsize=20,
         color=NAVY,
     )
     title_axis.text(
         0.5,
         0.16,
-        rf"Aggregate: $D_{{\rm rel}}={float(net_d_rel):+.3f};\quad "
-        rf"J={float(net_joint_sensitivity):.3f}$",
+        rf"Net: $D_{{\rm rel}} = {float(net_d_rel):+.3f};\quad "
+        rf"J = {float(net_joint_sensitivity):.3f}$",
         ha="center",
         va="center",
-        fontsize=14,
+        fontsize=16,
         color=NAVY,
     )
     colorbar = fig.colorbar(
-        image, ax=axes[:, 2], location="right", shrink=0.72, pad=0.02
+        image, cax=colorbar_axis, orientation="horizontal"
     )
-    colorbar.set_label("Attention weight")
+    colorbar.set_label("Attention weight", fontsize=14, labelpad=7)
+    colorbar.ax.tick_params(labelsize=11, length=3)
+    for tick_label in colorbar.ax.get_xticklabels():
+        tick_label.set_fontweight("medium")
+
+    fig.canvas.draw()
+    colorbar_position = colorbar_axis.get_position()
+    fig.set_layout_engine("none")
+    colorbar_axis.set_position(
+        [
+            colorbar_position.x0 + 0.08 * colorbar_position.width,
+            colorbar_position.y0,
+            0.84 * colorbar_position.width,
+            colorbar_position.height,
+        ]
+    )
     return fig
 
 
@@ -709,10 +741,28 @@ def _pca_focus_color(label: str) -> str:
     return PCA_FOCUS_COLORS.get(str(label), SLATE)
 
 
+def _ordered_pca_categories(labels: Sequence[str]) -> list[str]:
+    """Order observed focus labels by count, with deterministic ties."""
+
+    counts = Counter(str(label) for label in labels)
+    palette_order = {
+        label: position for position, label in enumerate(PCA_FOCUS_COLORS)
+    }
+    return sorted(
+        counts,
+        key=lambda label: (
+            -counts[label],
+            palette_order.get(label, len(palette_order)),
+            label.casefold(),
+            label,
+        ),
+    )
+
+
 def plot_av_pca(
     payload: Mapping[str, Any],
     *,
-    maximum_categories: int = 21,
+    maximum_categories: int = 20,
     minimum_count: int = 1,
     title_label: str | None = None,
     d_rel: float | None = None,
@@ -725,21 +775,7 @@ def plot_av_pca(
         maximum_categories=maximum_categories,
         minimum_count=minimum_count,
     )
-    counts = Counter(labels)
-    categories = [
-        label
-        for label in PCA_FOCUS_COLORS
-        if label in counts and label != "Other / rare"
-    ]
-    categories.extend(
-        sorted(
-            label
-            for label in counts
-            if label not in PCA_FOCUS_COLORS and label != "Other / rare"
-        )
-    )
-    if "Other / rare" in counts:
-        categories.append("Other / rare")
+    categories = _ordered_pca_categories(labels)
     fig, ax = plt.subplots(figsize=(8.8, 6.2), constrained_layout=True)
     labels_array = np.asarray(labels)
     for category in categories:
@@ -764,8 +800,8 @@ def plot_av_pca(
     if d_rel is not None and joint_sensitivity is not None:
         metric_line = (
             "\n"
-            + rf"$D_{{\rm rel}}={float(d_rel):+.3f};\quad "
-            + rf"J={float(joint_sensitivity):.3f}$"
+            + rf"$D_{{\rm rel}} = {float(d_rel):+.3f};\quad "
+            + rf"J = {float(joint_sensitivity):.3f}$"
         )
     descriptor = (
         f"{title_label} — {_head_label(head)}"
@@ -774,17 +810,159 @@ def plot_av_pca(
     )
     ax.set_title(
         f"{_payload_display_title(payload)}\n"
-        f"PCA of native GRIT routed head output — {descriptor}"
+        f"PCA of routed head output — {descriptor}"
         f"{metric_line}\n"
-        f"$n={int(payload['n_used'])}$ molecules",
+        f"$n = {int(payload['n_used'])}$ molecules",
         fontsize=15,
     )
     ax.grid(False)
     ax.legend(
         loc="center left",
         bbox_to_anchor=(1.01, 0.5),
-        fontsize=8,
+        fontsize=9.5,
+        markerscale=1.15,
+        handletextpad=0.55,
+    )
+    return fig
+
+
+def _layer_pca_grid_shape(num_heads: int) -> tuple[int, int]:
+    """Choose the closest practical 16:9 panel grid for one GRIT layer."""
+
+    num_heads = int(num_heads)
+    if num_heads < 1:
+        raise ValueError("a layer PCA grid requires at least one head")
+    ncols = min(8, max(1, int(np.ceil(np.sqrt(num_heads * 16 / 9)))))
+    nrows = int(np.ceil(num_heads / ncols))
+    return nrows, ncols
+
+
+def plot_layer_av_pca_grid(
+    payload: Mapping[str, Any],
+    *,
+    nrows: int | None = None,
+    ncols: int | None = None,
+):
+    """Plot independently fitted routed-output PCA panels for one layer."""
+
+    apply_publication_style()
+    layer = int(payload["layer"])
+    vectors = np.asarray(payload["vectors"], dtype=np.float64)
+    labels = np.asarray(payload["labels"], dtype=object)
+    if vectors.ndim != 3:
+        raise ValueError(
+            "layer PCA vectors must have shape [graphs, heads, width], "
+            f"got {vectors.shape}"
+        )
+    if labels.shape != vectors.shape[:2]:
+        raise ValueError(
+            f"layer PCA labels have shape {labels.shape}, expected {vectors.shape[:2]}"
+        )
+    num_graphs, num_heads, _ = vectors.shape
+    default_rows, default_columns = _layer_pca_grid_shape(num_heads)
+    nrows = default_rows if nrows is None else int(nrows)
+    ncols = default_columns if ncols is None else int(ncols)
+    if nrows < 1 or ncols < 1 or nrows * ncols < num_heads:
+        raise ValueError(
+            f"{nrows}x{ncols} grid cannot contain {num_heads} heads"
+        )
+    n_used = int(payload.get("n_used", num_graphs))
+    if n_used != num_graphs:
+        raise ValueError(
+            f"layer PCA n_used={n_used} but vectors contain {num_graphs} graphs"
+        )
+
+    categories = _ordered_pca_categories(
+        [str(label) for label in labels.reshape(-1)]
+    )
+    fig, axes = plt.subplots(
+        nrows,
+        ncols,
+        figsize=(max(9.0, 2.25 * ncols), 2.15 * nrows + 1.55),
+        squeeze=False,
+    )
+    flat_axes = axes.reshape(-1)
+    for head, ax in enumerate(flat_axes[:num_heads]):
+        coordinates, explained = _pca(vectors[:, head, :])
+        head_labels = [str(label) for label in labels[:, head]]
+        colors = [_pca_focus_color(label) for label in head_labels]
+        ax.scatter(
+            coordinates[:, 0],
+            coordinates[:, 1],
+            s=9,
+            c=colors,
+            edgecolors="white",
+            linewidths=0.18,
+            alpha=0.76,
+        )
+        ax.axhline(0, color=LIGHT_GRID, linewidth=0.6, zorder=0)
+        ax.axvline(0, color=LIGHT_GRID, linewidth=0.6, zorder=0)
+        ax.set_title(
+            f"H{head}\n"
+            f"PC1 {100 * explained[0]:.0f}% · PC2 {100 * explained[1]:.0f}%",
+            fontsize=10,
+            pad=3,
+        )
+        ax.xaxis.set_major_locator(MaxNLocator(3))
+        ax.yaxis.set_major_locator(MaxNLocator(3))
+        ax.tick_params(labelsize=8, length=2.5, pad=1.5)
+        row, column = divmod(head, ncols)
+        if row == nrows - 1:
+            ax.set_xlabel("PC1", fontsize=9)
+        else:
+            ax.tick_params(labelbottom=False)
+        if column == 0:
+            ax.set_ylabel("PC2", fontsize=9)
+        else:
+            ax.tick_params(labelleft=False)
+        ax.grid(False)
+    for ax in flat_axes[num_heads:]:
+        ax.axis("off")
+
+    handles = [
+        Line2D(
+            [0],
+            [0],
+            linestyle="none",
+            marker="o",
+            markersize=7,
+            markerfacecolor=_pca_focus_color(category),
+            markeredgecolor="white",
+            markeredgewidth=0.4,
+            label=category,
+        )
+        for category in categories
+    ]
+    legend_columns = min(7, max(1, len(handles)))
+    legend = fig.legend(
+        handles=handles,
+        labels=categories,
+        title="Attention focus",
+        loc="lower center",
+        bbox_to_anchor=(0.5, 0.018),
+        ncol=legend_columns,
+        frameon=False,
+        fontsize=10.5,
+        title_fontsize=12,
         handletextpad=0.5,
+        columnspacing=1.25,
+        borderaxespad=0,
+    )
+    legend.get_title().set_color(NAVY)
+    fig.suptitle(
+        f"{_payload_display_title(payload)}\n"
+        f"PCA of routed head output — Layer {layer} (all heads); "
+        f"$n = {n_used}$ molecules",
+        fontsize=18,
+        y=0.985,
+    )
+    fig.subplots_adjust(
+        left=0.055,
+        right=0.992,
+        top=0.84,
+        bottom=0.20,
+        wspace=0.24,
+        hspace=0.36,
     )
     return fig
 
@@ -996,19 +1174,29 @@ def save_figure_bundle(
     *,
     metadata: Mapping[str, Any] | None = None,
     dpi: int = PUBLICATION_PNG_DPI,
-    pdf_raster_dpi: int = PUBLICATION_PDF_RASTER_DPI,
-    bbox_inches: str | None = "tight",
+    pdf_dpi: int = PUBLICATION_PDF_RASTER_DPI,
+    supersede_stem_globs: Sequence[str] = (),
 ) -> dict[str, Path]:
-    """Save lossless PNG and mixed vector/raster publication PDF outputs.
+    """Save a publication PNG, hybrid-vector PDF, and provenance sidecar.
 
-    Matplotlib preserves text and path artists as vectors in the PDF.  Its
-    explicitly rasterized artists (dense scatters and heatmaps) are rendered at
-    ``pdf_raster_dpi``; the section-PDF merger later copies these pages without
-    recompression.
+    ``supersede_stem_globs`` removes replaceable figure bundles only after the
+    new bundle has been written successfully. Patterns are restricted to direct
+    children of the output directory and to the three generated file types.
     """
 
+    dpi = int(dpi)
+    pdf_dpi = int(pdf_dpi)
+    if dpi < 1 or pdf_dpi < 1:
+        raise ValueError("PNG and PDF raster DPI must both be positive")
     directory = Path(output_directory)
     directory.mkdir(parents=True, exist_ok=True)
+    supersede_patterns = tuple(str(pattern) for pattern in supersede_stem_globs)
+    for pattern in supersede_patterns:
+        if Path(pattern).name != pattern:
+            raise ValueError(
+                "superseded figure patterns must be direct filename globs, "
+                f"got {pattern!r}"
+            )
     paths = {
         "png": directory / f"{stem}.png",
         "pdf": directory / f"{stem}.pdf",
@@ -1017,26 +1205,34 @@ def save_figure_bundle(
     figure.savefig(
         paths["png"],
         dpi=dpi,
-        bbox_inches=bbox_inches,
+        bbox_inches="tight",
+        pad_inches=0.04,
         facecolor="white",
     )
     figure.savefig(
         paths["pdf"],
-        dpi=pdf_raster_dpi,
-        bbox_inches=bbox_inches,
+        dpi=pdf_dpi,
+        bbox_inches="tight",
+        pad_inches=0.04,
         facecolor="white",
+        metadata={
+            "Title": str(stem),
+            "Creator": "Graph Specialisation and Metrics",
+            "Subject": "Publication figure",
+        },
     )
+    export_metadata = {
+        "png_dpi": dpi,
+        "pdf_raster_dpi": pdf_dpi,
+        "pdf_vector_text_and_paths": True,
+        "pdf_font_embedding": "TrueType (fonttype 42)",
+        "molecule_render_dpi": MOLECULE_RENDER_DPI,
+    }
     paths["metadata"].write_text(
         json.dumps(
             {
                 "figure": stem,
-                "export_quality": {
-                    "png_dpi": int(dpi),
-                    "pdf_raster_dpi": int(pdf_raster_dpi),
-                    "pdf_vector_artists": True,
-                    "molecule_draw_dpi": MOLECULE_DRAW_DPI,
-                    "bbox_inches": bbox_inches,
-                },
+                "export_quality": export_metadata,
                 **dict(metadata or {}),
             },
             indent=2,
@@ -1046,6 +1242,16 @@ def save_figure_bundle(
         + "\n",
         encoding="utf-8",
     )
+    current_paths = {path.resolve() for path in paths.values()}
+    generated_suffixes = {".png", ".pdf", ".json"}
+    for pattern in supersede_patterns:
+        for candidate in directory.glob(pattern):
+            if (
+                candidate.is_file()
+                and candidate.suffix.lower() in generated_suffixes
+                and candidate.resolve() not in current_paths
+            ):
+                candidate.unlink()
     return paths
 
 
@@ -1122,12 +1328,16 @@ def save_section_pdf_bundles(
 
 
 __all__ = [
+    "MOLECULE_RENDER_DPI",
+    "PUBLICATION_PDF_RASTER_DPI",
+    "PUBLICATION_PNG_DPI",
     "apply_publication_style",
     "automatic_selectivity_limits",
     "plot_attention_grid",
     "plot_av_pca",
     "plot_coordinate_heatmaps",
     "plot_hop_attention_mass",
+    "plot_layer_av_pca_grid",
     "plot_logit_spread",
     "plot_score_heatmaps",
     "plot_score_plane",

@@ -30,7 +30,9 @@ After the ZINC and QM9 score caches have completed under
 [`grit_zinc_qm9_figures_colab.ipynb`](grit_zinc_qm9_figures_colab.ipynb) for the focused
 cross-task figure suite. It reads each task's `seed_42/cache/scores/raw.pt` artifact
 read-only, verifies the matching `model.json` and checkpoint before model-forward
-diagnostics, and writes task-separated supplemental caches and figure manifests.
+diagnostics, and writes task-separated supplemental caches and figure manifests. The
+`TASK_SELECTION` Colab control runs `zinc`, `qm9`, or `both`; choosing one task does not
+construct, validate, or render the other.
 The score/coordinate figures reuse the PCQM presentation, while attention and routed-output
 diagnostics attach to native GRIT sites. ZINC atom-type IDs are decoded with the exact source
 vocabulary and bond dictionary, so the attention grids contain index-preserving RDKit molecules
@@ -42,18 +44,20 @@ diagnostic to its exact supplemental cache before rendering, and constructs the 
 if one of those artifacts is missing. Once populated, styling-only reruns do not rebuild RRWP,
 reload the checkpoint, or execute model forwards. Each named semantic specialist, structural
 specialist, and high-`J` generalist is displayed as an attention grid, routed-output PCA, and then
-its mean clean-attention-mass versus shortest-path-distance companion. Every other active head
-with negative `D_rel` also gets the SPD plot from the canonical score cache afterward, preserving
-complete structural coverage without duplicating named companions. GRIT's non-additive relation
-conditioning is reported as such; its node-only versus relation-conditioned raw-logit figure is
-not labelled as Graphormer dot-versus-bias. Individual PNG/PDF/JSON figure bundles remain under
-each task's figure directory. The notebook also assembles ordered, multi-page PDFs in the shared
-Drive `pdf_sections` directory: `zinc_*.pdf` and `qm9_*.pdf` files for main scores, all distance
-curves, semantic specialists, structural specialists, high-`J` generalists, and mechanism/logit
-diagnostics. Specialist section PDFs keep each attention grid, PCA, and companion SPD curve
-together in display order. Individual PNGs are lossless 300-DPI exports. PDFs keep typography,
-axes, curves, and annotations as vectors, render dense heatmap/scatter layers and RDKit molecule
-line art at 600 DPI, and are merged into section PDFs without recompression.
+its mean clean-attention-mass versus shortest-path-distance companion. The notebook selects five
+distinct heads in each family (semantic, structural, and high-`J` generalist), and emits no distance
+curves for heads outside those 15 identified examples. Optional first-, second-, and final-layer
+all-head routed-output PCA grids share one additional contract-cached sweep. GRIT's non-additive
+relation conditioning is reported as such; its node-only versus relation-conditioned raw-logit
+figure is not labelled as Graphormer dot-versus-bias. Individual PNG/PDF/JSON figure bundles remain
+under each task's figure directory. The notebook also assembles ordered, multi-page PDFs in the
+shared Drive `pdf_sections` directory: `zinc_*.pdf` and `qm9_*.pdf` files for main scores, selected
+distance curves, semantic specialists, structural specialists, high-`J` generalists,
+mechanism/logit diagnostics, and layer-PCA overviews. Specialist section PDFs keep each attention
+grid, PCA, and companion SPD curve together in display order. Individual PNGs are lossless
+600-DPI exports. PDFs keep typography, axes, curves, and annotations as vectors, render dense
+heatmap/scatter layers at 1200 DPI and RDKit molecule line art at 600 DPI, and are merged into
+section PDFs without recompression.
 
 For the public PCQM model, set `TASKS = ("graphormer_pcqm4mv2",)` and leave `CHECKPOINTS`
 empty. The registered `clefourrier/graphormer-base-pcqm4mv2@refs/pr/4` checkpoint is loaded
