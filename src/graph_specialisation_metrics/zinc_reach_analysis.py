@@ -548,22 +548,7 @@ def _semantic_interpolation_mass(
     output[full_index] = full_mass
 
     net = prepared.runtime.model.model
-    with torch.no_grad():
-        clean_encoded, _, _ = _after_feature_encoder(prepared, [base])
-        clean_layer_input = _finish_encoding(net, clean_encoded)
-        manual_clean = _forward_final(
-            net,
-            clean_layer_input,
-            clean_layer_input.x,
-            clean_layer_input.edge_attr,
-            _real_mask(clean_layer_input),
-        )
-        if tuple(manual_clean.shape) != tuple(clean_final.shape):
-            raise RuntimeError("interpolation clean-state geometry differs from capture")
-        error = torch.linalg.vector_norm((manual_clean - clean_final).reshape(-1))
-        scale = torch.linalg.vector_norm(clean_final.reshape(-1)).clamp_min(1.0e-12)
-        if float((error / scale).detach().cpu()) > 1.0e-5:
-            raise RuntimeError("interpolation clean-state audit failed")
+    embedding = _atom_embedding(net)
 
     conditions = [
         (dose_index, event_index)
@@ -574,43 +559,54 @@ def _semantic_interpolation_mass(
     batch_size = int(config.interpolation_batch_size)
     for start in range(0, len(conditions), batch_size):
         chunk = conditions[start : start + batch_size]
-        with torch.no_grad():
-            encoded, raw_atoms, embedding = _after_feature_encoder(
-                prepared,
-                [base] * len(chunk),
-            )
-            dosed_x = encoded.x.clone()
-            for batch_index, (dose_index, event_index) in enumerate(chunk):
+        hook_calls = 0
+
+        def interpolate_embedding(_module: Any, inputs: Any, result: Any) -> Any:
+            nonlocal hook_calls
+            hook_calls += 1
+            expected_nodes = (len(chunk) + 1) * nodes
+            if int(result.shape[0]) != expected_nodes:
+                raise RuntimeError("interpolation embedding batch lost node alignment")
+            atom_types = inputs[0].reshape(-1)
+            modified = result.clone()
+            for condition_index, (dose_index, event_index) in enumerate(chunk):
                 source = int(events[event_index].source)
-                global_source = batch_index * nodes + source
-                clean_atom = int(raw_atoms[global_source])
+                global_source = (condition_index + 1) * nodes + source
+                clean_atom = int(atom_types[global_source])
                 donor_atom = int(variants[event_index].x[source].reshape(-1)[0])
                 if donor_atom == clean_atom:
                     raise RuntimeError("semantic interpolation direction is zero")
                 dose = doses[dose_index]
-                dosed_x[global_source] = (
+                modified[global_source] = (
                     (1.0 - dose) * embedding.weight[clean_atom]
                     + dose * embedding.weight[donor_atom]
                 )
-            encoded.x = dosed_x
-            layer_input = _finish_encoding(net, encoded)
-            dosed_final = _forward_final(
-                net,
-                layer_input,
-                layer_input.x,
-                layer_input.edge_attr,
-                _real_mask(layer_input),
+            return modified
+
+        handle = embedding.register_forward_hook(interpolate_embedding)
+        try:
+            with torch.no_grad():
+                captured = prepared.backend.capture(
+                    [base] * (len(chunk) + 1),
+                    require_grad=False,
+                )
+        finally:
+            handle.remove()
+        if hook_calls != 1:
+            raise RuntimeError(
+                f"atom embedding fired {hook_calls} times during interpolation"
             )
-            expected_nodes = len(chunk) * nodes
-            if int(dosed_final.shape[0]) != expected_nodes:
-                raise RuntimeError("interpolation batch lost real-node alignment")
-            dosed_final = dosed_final.reshape(
-                len(chunk),
-                nodes,
-                int(dosed_final.shape[-1]),
-            )
+        batch_clean = captured.final_state[0]
+        if tuple(batch_clean.shape) != tuple(clean_final.shape):
+            raise RuntimeError("interpolation clean-state geometry differs from capture")
+        error = torch.linalg.vector_norm((batch_clean - clean_final).reshape(-1))
+        scale = torch.linalg.vector_norm(clean_final.reshape(-1)).clamp_min(1.0e-12)
+        if float((error / scale).detach().cpu()) > 1.0e-5:
+            raise RuntimeError("interpolation clean-state audit failed")
+        dosed_final = captured.final_state[1:]
+        with torch.no_grad():
             masses = _project_final_change(
-                manual_clean.unsqueeze(0) - dosed_final,
+                batch_clean.unsqueeze(0) - dosed_final,
                 clean_gradient,
             )
             if not bool(torch.isfinite(masses).all()):

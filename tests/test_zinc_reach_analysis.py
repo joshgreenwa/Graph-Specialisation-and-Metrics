@@ -26,20 +26,6 @@ def test_semantic_interpolation_scales_linear_functional_mass(monkeypatch):
             self.edge_attr = None
             self.num_nodes = 3
 
-    class Layers(torch.nn.Module):
-        def __init__(self, mixing):
-            super().__init__()
-            self.register_buffer("mixing", mixing)
-
-        def forward(self, data):
-            output = Data(data.x)
-            blocks = data.x.reshape(-1, 3, int(data.x.shape[-1]))
-            output.x = torch.einsum("ij,bjw->biw", self.mixing, blocks).reshape(
-                -1,
-                int(data.x.shape[-1]),
-            )
-            return output
-
     embedding = torch.nn.Embedding(21, 3)
     with torch.no_grad():
         embedding.weight.copy_(
@@ -49,17 +35,23 @@ def test_semantic_interpolation_scales_linear_functional_mass(monkeypatch):
     mixing = torch.tensor(
         [[1.0, 0.5, 0.0], [0.25, 1.0, 0.5], [0.0, 0.75, 1.0]]
     )
+    net = SimpleNamespace()
+
+    class Backend:
+        def capture(self, data_list, *, require_grad):
+            assert not require_grad
+            embedded = embedding(raw_atoms.repeat(len(data_list)))
+            blocks = embedded.reshape(len(data_list), 3, 3)
+            final = torch.einsum("ij,bjw->biw", mixing, blocks)
+            return SimpleNamespace(final_state=final)
+
     prepared = SimpleNamespace(
         runtime=SimpleNamespace(
-            model=SimpleNamespace(model=SimpleNamespace(layers=Layers(mixing)))
-        )
+            model=SimpleNamespace(model=net)
+        ),
+        backend=Backend(),
     )
-
-    def encoded_batch(_prepared, graphs):
-        repeated_atoms = raw_atoms.repeat(len(graphs))
-        return Data(embedding(repeated_atoms)), repeated_atoms, embedding
-
-    monkeypatch.setattr(reach, "_after_feature_encoder", encoded_batch)
+    monkeypatch.setattr(reach, "_atom_embedding", lambda _net: embedding)
     base = Data(raw_atoms[:, None])
     variant = Data(torch.tensor([[1], [6], [7]]))
     event = SimpleNamespace(source=1)
