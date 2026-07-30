@@ -984,6 +984,7 @@ def test_av_pca_focus_palette_is_stable_across_plots():
             expected = sorted(
                 counts,
                 key=lambda label: (
+                    label.casefold() == "other/diffuse",
                     -counts[label],
                     palette_order.get(label, len(palette_order)),
                     label.casefold(),
@@ -991,6 +992,8 @@ def test_av_pca_focus_palette_is_stable_across_plots():
                 ),
             )
             assert observed == expected
+            if "other/diffuse" in counts:
+                assert observed[-1] == "other/diffuse"
     finally:
         plt.close(first)
         plt.close(second)
@@ -1127,6 +1130,7 @@ def test_layer_av_pca_grid_is_4x8_with_readable_legend_below():
         expected_categories = sorted(
             counts,
             key=lambda label: (
+                label.casefold() == "other/diffuse",
                 -counts[label],
                 palette_order.get(label, len(palette_order)),
                 label.casefold(),

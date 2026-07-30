@@ -702,6 +702,7 @@ def _ordered_pca_categories(labels: Sequence[str]) -> list[str]:
     return sorted(
         counts,
         key=lambda label: (
+            label.casefold() == "other/diffuse",
             -counts[label],
             palette_order.get(label, len(palette_order)),
             label.casefold(),
