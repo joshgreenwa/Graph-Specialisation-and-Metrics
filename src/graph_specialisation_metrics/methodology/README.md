@@ -98,7 +98,9 @@ The focused ZINC/QM9 Colab workflow is
 It keeps canonical caches immutable and writes supplemental diagnostics below a separate
 task/seed namespace. Its GRIT raw-logit comparison is deliberately architecture-native:
 node-only counterfactual versus actual relation/RRWP-conditioned logits, rather than
-Graphormer's additive dot-versus-bias decomposition.
+Graphormer's additive dot-versus-bias decomposition. That shared diagnostic sweep also
+caches normalised clean-attention entropy for the entropy-versus-`D_rel` and
+entropy-versus-`J` figures.
 
 Task-specific presentation can be added without changing cached measurements:
 

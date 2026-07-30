@@ -63,7 +63,9 @@ PCA_FOCUS_COLORS = {
     "Branch: degree>=3": "#6B8E23",
     "Charge: +": "#C44E52",
     "Charge: -": "#9C4F96",
-    "H: hydrogen": "#8C9AA5",
+    # A saturated rose keeps explicit QM9 hydrogen visually distinct from the
+    # neutral greys reserved for diffuse and rare assignments.
+    "H: hydrogen": "#D65F8D",
     "other/diffuse": "#B8C2CA",
     "Other / rare": "#4B5563",
 }
@@ -523,9 +525,14 @@ def _draw_molecule_attention(
 
 
 def _payload_display_title(payload: Mapping[str, Any]) -> str:
+    # Cached diagnostic payloads may predate a presentation-only title change.
+    # Resolve known task identities at render time so restyling never requires
+    # an expensive model-forward cache refresh.
+    if payload.get("task") is not None:
+        return figure_identity(str(payload["task"]))["display_title"]
     if payload.get("display_title"):
         return str(payload["display_title"])
-    return figure_identity(str(payload.get("task", "GRIT")))["display_title"]
+    return "GRIT"
 
 
 def _molecule_caption(
@@ -593,11 +600,9 @@ def plot_attention_grid(
     )
     colorbar_axis = fig.add_subplot(grid[-1, :])
     task = str(examples_payload["task"])
-    dataset_label = str(
-        examples_payload.get(
-            "dataset_label", figure_identity(task)["dataset_label"]
-        )
-    )
+    # As with the main title, take the current reader-facing dataset label
+    # rather than a potentially stale label stored in a reusable cache.
+    dataset_label = figure_identity(task)["dataset_label"]
     for row, (example, matrix) in enumerate(zip(examples, matrices)):
         graph_index = int(example["dataset_index"])
         graph_coordinates = per_graph_coordinates.get(
@@ -1163,6 +1168,118 @@ def plot_selectivity_vs_logit_ratio(
     return fig
 
 
+def _plot_coordinate_vs_attention_entropy(
+    metrics: CanonicalHeadMetrics,
+    logit_payload: Mapping[str, Any],
+    selected_heads: Mapping[str, Head] | None,
+    *,
+    coordinate: np.ndarray,
+    coordinate_label: str,
+    title_label: str,
+    active_only: bool,
+    legend_location: str,
+    zero_reference: bool,
+):
+    apply_publication_style()
+    entropy = np.asarray(
+        logit_payload["attention_entropy_mean"], dtype=np.float64
+    )
+    if entropy.shape != metrics.shape:
+        raise ValueError(
+            f"attention entropy shape {entropy.shape} != "
+            f"head metric grid {metrics.shape}"
+        )
+    coordinate = np.asarray(coordinate, dtype=np.float64)
+    finite = np.isfinite(entropy) & np.isfinite(coordinate)
+    if active_only:
+        finite &= metrics.active
+    correlation = (
+        _spearman_correlation(entropy[finite], coordinate[finite])
+        if finite.sum() >= 3
+        else float("nan")
+    )
+    correlation_label = (
+        rf"; active-head Spearman $\rho={correlation:.2f}$"
+        if np.isfinite(correlation)
+        else ""
+    )
+    fig, ax = plt.subplots(figsize=(8.1, 5.8), constrained_layout=True)
+    scatter = _scatter_heads(
+        ax,
+        entropy,
+        coordinate,
+        active=metrics.active if active_only else None,
+    )
+    if zero_reference:
+        ax.axhline(0, color=SLATE, linestyle="--", linewidth=1.0)
+    ax.set_xlim(-0.02, 1.02)
+    if not zero_reference:
+        ax.set_ylim(bottom=0, top=float(np.nanmax(coordinate)) * 1.08)
+    ax.set_xlabel("Mean normalised clean-attention entropy")
+    ax.set_ylabel(coordinate_label)
+    ax.set_title(
+        f"{_payload_display_title(logit_payload)}\n"
+        f"{title_label}\n"
+        f"$n={int(logit_payload['n_used'])}$ molecules"
+        f"{correlation_label}",
+        fontsize=15,
+    )
+    ax.grid(True)
+    _annotate_selected_scatter(
+        ax, entropy, coordinate, selected_heads
+    )
+    if active_only and np.any(~metrics.active):
+        ax.legend(loc=legend_location, fontsize=9)
+    colorbar = fig.colorbar(scatter, ax=ax, pad=0.02)
+    colorbar.set_label("Layer")
+    colorbar.set_ticks(np.arange(metrics.num_layers))
+    return fig
+
+
+def plot_selectivity_vs_attention_entropy(
+    metrics: CanonicalHeadMetrics,
+    logit_payload: Mapping[str, Any],
+    selected_heads: Mapping[str, Head] | None = None,
+    *,
+    active_only: bool = True,
+):
+    """``D_rel`` versus mean normalised clean-attention entropy."""
+
+    return _plot_coordinate_vs_attention_entropy(
+        metrics,
+        logit_payload,
+        selected_heads,
+        coordinate=metrics.selectivity,
+        coordinate_label=r"Relative selectivity $D_{\rm rel}$",
+        title_label="Relative selectivity versus attention entropy",
+        active_only=active_only,
+        legend_location="lower left",
+        zero_reference=True,
+    )
+
+
+def plot_joint_sensitivity_vs_attention_entropy(
+    metrics: CanonicalHeadMetrics,
+    logit_payload: Mapping[str, Any],
+    selected_heads: Mapping[str, Head] | None = None,
+    *,
+    active_only: bool = True,
+):
+    """``J`` versus mean normalised clean-attention entropy."""
+
+    return _plot_coordinate_vs_attention_entropy(
+        metrics,
+        logit_payload,
+        selected_heads,
+        coordinate=metrics.joint_sensitivity,
+        coordinate_label=r"Joint sensitivity $J$",
+        title_label="Joint sensitivity versus attention entropy",
+        active_only=active_only,
+        legend_location="upper left",
+        zero_reference=False,
+    )
+
+
 def save_figure_bundle(
     figure,
     output_directory: str | Path,
@@ -1333,11 +1450,13 @@ __all__ = [
     "plot_av_pca",
     "plot_coordinate_heatmaps",
     "plot_hop_attention_mass",
+    "plot_joint_sensitivity_vs_attention_entropy",
     "plot_layer_av_pca_grid",
     "plot_logit_spread",
     "plot_score_heatmaps",
     "plot_score_plane",
     "plot_selectivity_joint_plane",
+    "plot_selectivity_vs_attention_entropy",
     "plot_selectivity_vs_logit_ratio",
     "save_figure_bundle",
     "save_section_pdf_bundles",

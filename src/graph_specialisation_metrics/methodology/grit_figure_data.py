@@ -935,12 +935,12 @@ CHEMISTRY_FOCUS_VERSION = "pcqm_chemistry_focus.v1+explicit_hydrogen"
 
 _FIGURE_IDENTITIES = {
     "zinc": {
-        "dataset_label": "ZINC-subset",
-        "model_label": "dense GRIT+RRWP",
+        "dataset_label": "ZINC",
+        "model_label": "GRIT",
     },
     "qm9_gap_dense": {
         "dataset_label": "QM9 HOMO–LUMO gap",
-        "model_label": "dense GRIT+RRWP",
+        "model_label": "GRIT",
     },
 }
 
@@ -954,7 +954,7 @@ def figure_identity(task_name: str) -> dict[str, str]:
             task_name,
             {
                 "dataset_label": task_name,
-                "model_label": "GRIT+RRWP",
+                "model_label": "GRIT",
             },
         )
     )
@@ -1566,6 +1566,38 @@ def _mean_keywise_std(matrix: Any) -> Any:
     )
 
 
+def _normalised_attention_entropy(matrix: Any) -> Any:
+    """Mean query entropy per head, normalised by supported key count."""
+
+    import torch
+
+    attention = torch.clamp(matrix.float(), min=0.0)
+    row_mass = attention.sum(dim=-1, keepdim=True)
+    valid_query = row_mass.squeeze(-1) > 1e-12
+    probabilities = attention / row_mass.clamp_min(1e-12)
+    entropy = -(
+        probabilities
+        * torch.where(
+            probabilities > 0,
+            probabilities.clamp_min(1e-12).log(),
+            torch.zeros_like(probabilities),
+        )
+    ).sum(dim=-1)
+    support = (attention > 0).sum(dim=-1)
+    normaliser = support.clamp_min(2).to(entropy.dtype).log()
+    normalised = torch.clamp(
+        entropy / normaliser.clamp_min(1e-12),
+        min=0.0,
+        max=1.0,
+    )
+    return (
+        torch.where(valid_query, normalised, torch.zeros_like(normalised)).sum(
+            dim=-1
+        )
+        / valid_query.sum(dim=-1).clamp_min(1)
+    )
+
+
 def aggregate_logit_spread(
     figure_runtime: GritFigureRuntime,
     *,
@@ -1583,32 +1615,38 @@ def aggregate_logit_spread(
     extractor = GritDiagnosticExtractor(figure_runtime)
     node_rows: list[np.ndarray] = []
     relation_rows: list[np.ndarray] = []
+    entropy_rows: list[np.ndarray] = []
     positions: list[int] = []
     limit = min(int(n_graphs), len(figure_runtime.runtime.eval_ds))
     for position in range(limit):
         try:
             graph = figure_runtime.runtime.eval_ds[position]
             captured = extractor.extract(graph)
-            node_rows.append(
-                np.stack(
-                    [
-                        _mean_keywise_std(value).float().cpu().numpy()
-                        for value in captured.node_only_logits
-                    ]
-                )
+            node_row = np.stack(
+                [
+                    _mean_keywise_std(value).float().cpu().numpy()
+                    for value in captured.node_only_logits
+                ]
             )
-            relation_rows.append(
-                np.stack(
-                    [
-                        _mean_keywise_std(value).float().cpu().numpy()
-                        for value in captured.relation_logits
-                    ]
-                )
+            relation_row = np.stack(
+                [
+                    _mean_keywise_std(value).float().cpu().numpy()
+                    for value in captured.relation_logits
+                ]
+            )
+            entropy_row = np.stack(
+                [
+                    _normalised_attention_entropy(value).float().cpu().numpy()
+                    for value in captured.attention
+                ]
             )
         except Exception as error:
             if verbose:
                 print(f"  [GRIT logit spread] skipped {position}: {error}")
             continue
+        node_rows.append(node_row)
+        relation_rows.append(relation_row)
+        entropy_rows.append(entropy_row)
         positions.append(position)
         if verbose and (position + 1) % 10 == 0:
             print(f"  [GRIT logit spread] {position + 1}/{limit}")
@@ -1617,6 +1655,7 @@ def aggregate_logit_spread(
 
     node_per_graph = np.stack(node_rows)
     relation_per_graph = np.stack(relation_rows)
+    entropy_per_graph = np.stack(entropy_rows)
     node_layer_per_graph = node_per_graph.mean(axis=-1)
     relation_layer_per_graph = relation_per_graph.mean(axis=-1)
     ratio_per_graph = np.log10(
@@ -1636,12 +1675,18 @@ def aggregate_logit_spread(
         "relation_std_std": relation_layer_per_graph.std(axis=0, ddof=ddof),
         "log_r_mean": ratio_per_graph.mean(axis=0),
         "log_r_std": ratio_per_graph.std(axis=0, ddof=ddof),
+        "attention_entropy_mean": entropy_per_graph.mean(axis=0),
+        "attention_entropy_std": entropy_per_graph.std(axis=0, ddof=ddof),
         "node_per_graph": node_per_graph,
         "relation_per_graph": relation_per_graph,
+        "attention_entropy_per_graph": entropy_per_graph,
         "positions": np.asarray(positions, dtype=np.int64),
         "n_requested": int(n_graphs),
         "n_used": len(node_rows),
         "ratio": "log10(std(node-only counterfactual)/std(relation-conditioned actual))",
+        "attention_entropy_definition": (
+            "mean query entropy normalised by log(supported key count)"
+        ),
         **figure_identity(task_name),
     }
 

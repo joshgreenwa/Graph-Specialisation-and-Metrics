@@ -18,6 +18,7 @@ from graph_specialisation_metrics.methodology.grit_figure_data import (  # noqa:
     GritDiagnosticExtractor,
     SupplementalCache,
     ZINC_ATOM_TYPES,
+    _normalised_attention_entropy,
     atom_chemistry_categories,
     compute_layer_av_pca_inputs,
     figure_identity,
@@ -44,11 +45,13 @@ from graph_specialisation_metrics.methodology.grit_figure_plots import (  # noqa
     plot_av_pca,
     plot_coordinate_heatmaps,
     plot_hop_attention_mass,
+    plot_joint_sensitivity_vs_attention_entropy,
     plot_layer_av_pca_grid,
     plot_logit_spread,
     plot_score_heatmaps,
     plot_score_plane,
     plot_selectivity_joint_plane,
+    plot_selectivity_vs_attention_entropy,
     plot_selectivity_vs_logit_ratio,
     save_figure_bundle,
     save_section_pdf_bundles,
@@ -140,6 +143,18 @@ def test_head_metrics_and_grit_specialist_selection():
     assert ranked["top_semantic_1"] == (0, 0)
     assert ranked["top_structural_1"] == (0, 1)
     assert ranked["top_joint_1"] == (0, 2)
+
+
+def test_normalised_attention_entropy_has_zero_and_uniform_endpoints():
+    torch = pytest.importorskip("torch")
+    attention = torch.asarray(
+        [
+            [[0.5, 0.5], [0.5, 0.5]],
+            [[1.0, 0.0], [0.0, 1.0]],
+        ]
+    )
+    entropy = _normalised_attention_entropy(attention)
+    torch.testing.assert_close(entropy, torch.asarray([1.0, 0.0]))
 
 
 def test_score_and_model_artifacts_are_bound_to_one_task(tmp_path: Path):
@@ -353,8 +368,13 @@ def test_zinc_and_qm9_graphs_reconstruct_as_index_preserving_molecules():
     assert qm9_payload["formula"] == "H2O"
     assert qm9_payload["molecule_name"] == "gdb_1"
     assert figure_identity("qm9_gap_dense")["display_title"] == (
-        "QM9 HOMO–LUMO gap — dense GRIT+RRWP"
+        "QM9 HOMO–LUMO gap — GRIT"
     )
+    assert figure_identity("zinc") == {
+        "dataset_label": "ZINC",
+        "model_label": "GRIT",
+        "display_title": "ZINC — GRIT",
+    }
 
 
 def test_pcqm_chemistry_categories_and_pca_colours_are_global():
@@ -368,6 +388,11 @@ def test_pcqm_chemistry_categories_and_pca_colours_are_global():
     assert label_attention_focus(molecule, mass) == "O: carbonyl"
     assert _pca_focus_color("O: carbonyl") == PCA_FOCUS_COLORS["O: carbonyl"]
     assert _pca_focus_color("O: carbonyl") == "#C45100"
+    assert _pca_focus_color("H: hydrogen") == "#D65F8D"
+    assert (
+        _pca_focus_color("H: hydrogen")
+        != _pca_focus_color("other/diffuse")
+    )
     assert _pca_focus_color("unknown category") == "#607080"
 
 
@@ -387,6 +412,8 @@ def test_grit_plotting_api_accepts_synthetic_payloads():
     ]
     attention = {
         "task": "zinc",
+        # Simulate an existing supplemental cache from before the title
+        # simplification; render-time task identity must take precedence.
         "dataset_label": "ZINC-subset",
         "model_label": "dense GRIT+RRWP",
         "display_title": "ZINC-subset — dense GRIT+RRWP",
@@ -424,7 +451,7 @@ def test_grit_plotting_api_accepts_synthetic_payloads():
         plot_av_pca(
             {
                 "task": "zinc",
-                "display_title": "ZINC-subset — dense GRIT+RRWP",
+                "display_title": "ZINC — GRIT",
                 "head": (0, 0),
                 "vectors": np.arange(24, dtype=float).reshape(8, 3),
                 "labels": ["Ring: aromatic"] * 4 + ["O: carbonyl"] * 4,
@@ -436,7 +463,7 @@ def test_grit_plotting_api_accepts_synthetic_payloads():
         plot_layer_av_pca_grid(
             {
                 "task": "zinc",
-                "display_title": "ZINC-subset — dense GRIT+RRWP",
+                "display_title": "ZINC — GRIT",
                 "layer": 0,
                 "vectors": np.arange(96, dtype=float).reshape(8, 4, 3),
                 "labels": [
@@ -456,16 +483,34 @@ def test_grit_plotting_api_accepts_synthetic_payloads():
         "relation_std_mean": np.asarray([0.7, 0.9]),
         "relation_std_std": np.asarray([0.1, 0.2]),
         "log_r_mean": np.zeros((2, 4)),
+        "attention_entropy_mean": np.asarray(
+            [[0.20, 0.35, 0.50, 0.65], [0.30, 0.45, 0.60, 0.75]]
+        ),
+        "attention_entropy_definition": (
+            "mean query entropy normalised by log(supported key count)"
+        ),
     }
     figures.append(plot_logit_spread(logit))
     figures.append(
         plot_selectivity_vs_logit_ratio(metrics, logit, selected)
+    )
+    figures.append(
+        plot_selectivity_vs_attention_entropy(metrics, logit, selected)
+    )
+    figures.append(
+        plot_joint_sensitivity_vs_attention_entropy(
+            metrics, logit, selected
+        )
     )
     np.testing.assert_allclose(
         figures[2].get_size_inches(),
         figures[3].get_size_inches(),
     )
     assert figures[4].axes[-1].get_xlabel() == "Attention weight"
+    assert figures[4].axes[0].texts[0].get_text().startswith(
+        "ZINC — GRIT — Semantic specialist"
+    )
+    assert figures[4].axes[1].texts[0].get_text().startswith("ZINC eval 0")
     np.testing.assert_allclose(figures[4].get_size_inches(), (13.2, 5.72))
     assert [text.get_fontsize() for text in figures[4].axes[0].texts] == [
         20,
@@ -488,6 +533,15 @@ def test_grit_plotting_api_accepts_synthetic_payloads():
         for text in figures[5].axes[0].get_legend().get_texts()
     )
     assert figures[6].legends[0].get_title().get_text() == "Attention focus"
+    assert figures[7].axes[0].get_title().startswith("ZINC — GRIT\n")
+    assert figures[8].axes[0].get_title().startswith("ZINC — GRIT\n")
+    assert figures[9].axes[0].get_xlabel() == (
+        "Mean normalised clean-attention entropy"
+    )
+    assert figures[9].axes[0].get_ylabel() == (
+        r"Relative selectivity $D_{\rm rel}$"
+    )
+    assert figures[10].axes[0].get_ylabel() == r"Joint sensitivity $J$"
     assert all(figure.axes for figure in figures)
     for figure in figures:
         plt.close(figure)
@@ -505,7 +559,7 @@ def test_pca_legend_is_ranked_by_observed_frequency():
     figure = plot_av_pca(
         {
             "task": "zinc",
-            "display_title": "ZINC-subset — dense GRIT+RRWP",
+            "display_title": "ZINC — GRIT",
             "head": (0, 0),
             "vectors": np.arange(len(labels) * 3, dtype=float).reshape(
                 len(labels), 3
@@ -541,36 +595,42 @@ def test_pcqm_aligned_figure_dimensions():
     selected = {"semantic": (0, 0), "structural": (0, 1)}
     logit = {
         "task": "zinc",
-        "display_title": "ZINC-subset — dense GRIT+RRWP",
+        "display_title": "ZINC — GRIT",
         "n_used": 5,
         "node_std_mean": np.asarray([0.5, 0.8]),
         "node_std_std": np.asarray([0.1, 0.1]),
         "relation_std_mean": np.asarray([0.7, 0.9]),
         "relation_std_std": np.asarray([0.1, 0.2]),
         "log_r_mean": np.zeros((2, 4)),
+        "attention_entropy_mean": np.asarray(
+            [[0.20, 0.35, 0.50, 0.65], [0.30, 0.45, 0.60, 0.75]]
+        ),
+        "attention_entropy_definition": (
+            "mean query entropy normalised by log(supported key count)"
+        ),
     }
     figures_and_sizes = [
         (
             plot_score_heatmaps(
-                metrics, selected, title="ZINC-subset — dense GRIT+RRWP"
+                metrics, selected, title="ZINC — GRIT"
             ),
             (14.0, 5.2),
         ),
         (
             plot_coordinate_heatmaps(
-                metrics, selected, title="ZINC-subset — dense GRIT+RRWP"
+                metrics, selected, title="ZINC — GRIT"
             ),
             (14.0, 5.2),
         ),
         (
             plot_score_plane(
-                metrics, selected, title="ZINC-subset — dense GRIT+RRWP"
+                metrics, selected, title="ZINC — GRIT"
             ),
             (8.0, 5.9),
         ),
         (
             plot_selectivity_joint_plane(
-                metrics, selected, title="ZINC-subset — dense GRIT+RRWP"
+                metrics, selected, title="ZINC — GRIT"
             ),
             (8.0, 5.9),
         ),
@@ -581,6 +641,18 @@ def test_pcqm_aligned_figure_dimensions():
         (plot_logit_spread(logit), (8.2, 4.9)),
         (
             plot_selectivity_vs_logit_ratio(metrics, logit, selected),
+            (8.1, 5.8),
+        ),
+        (
+            plot_selectivity_vs_attention_entropy(
+                metrics, logit, selected
+            ),
+            (8.1, 5.8),
+        ),
+        (
+            plot_joint_sensitivity_vs_attention_entropy(
+                metrics, logit, selected
+            ),
             (8.1, 5.8),
         ),
     ]
@@ -600,7 +672,7 @@ def test_coordinate_heatmap_header_is_visible_and_separate_from_panel_titles():
 
     figure = plot_coordinate_heatmaps(
         CanonicalHeadMetrics.from_scores(_score_value()),
-        title="ZINC-subset — dense GRIT+RRWP",
+        title="ZINC — GRIT",
     )
     try:
         figure.canvas.draw()
@@ -908,6 +980,11 @@ def test_colab_notebook_has_valid_python_cells():
     assert '"zinc": ("zinc",)' in source
     assert '"qm9": ("qm9_gap_dense",)' in source
     assert "HEADS_PER_FAMILY = 5" in source
+    assert 'f"semantic_{rank}": "Semantic specialist"' in source
+    assert 'f"structural_{rank}": "Structural specialist"' in source
+    assert 'f"generalist_{rank}": r"High-$J$ generalist"' in source
+    assert "specialist {rank}" not in source
+    assert "generalist {rank}" not in source
     assert "PNG_DPI = 600" in source
     assert "PDF_RASTER_DPI = 1200" in source
     assert "del sys.modules[module_name]" in source
@@ -927,6 +1004,12 @@ def test_colab_notebook_has_valid_python_cells():
     assert "additional structural head" not in runtime_source
     assert "compute_layer_av_pca_inputs(" in runtime_source
     assert "plot_layer_av_pca_grid(" in runtime_source
+    assert "plot_selectivity_vs_attention_entropy(" in runtime_source
+    assert "plot_joint_sensitivity_vs_attention_entropy(" in runtime_source
+    assert "GRIT_raw_attention_logit_spread_and_entropy_v2" in runtime_source
+    assert (
+        "grit-logit-spread-and-attention-entropy-v2" in runtime_source
+    )
     assert 'PDF_TASK_PREFIXES = {"zinc": "zinc", "qm9_gap_dense": "qm9"}' in source
     assert "save_section_pdf_bundles(" in runtime_source
     assert '"semantic_specialists"' in source

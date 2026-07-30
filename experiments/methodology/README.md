@@ -39,7 +39,7 @@ vocabulary and bond dictionary, so the attention grids contain index-preserving 
 rather than generic graph layouts; QM9 is reconstructed from its atomic-number and bond-class
 fields. Routed-output PCAs use the same fixed chemical-group labels and colour identities as the
 PCQM suite (plus an explicit-hydrogen category for QM9), and every title names the dataset and
-dense GRIT+RRWP model. The notebook installs RDKit explicitly, writes every model-forward
+GRIT model. The notebook installs RDKit explicitly, writes every model-forward
 diagnostic to its exact supplemental cache before rendering, and constructs the GRIT runtime only
 if one of those artifacts is missing. Once populated, styling-only reruns do not rebuild RRWP,
 reload the checkpoint, or execute model forwards. Each named semantic specialist, structural
@@ -49,7 +49,9 @@ distinct heads in each family (semantic, structural, and high-`J` generalist), a
 curves for heads outside those 15 identified examples. Optional first-, second-, and final-layer
 all-head routed-output PCA grids share one additional contract-cached sweep. GRIT's non-additive
 relation conditioning is reported as such; its node-only versus relation-conditioned raw-logit
-figure is not labelled as Graphormer dot-versus-bias. Individual PNG/PDF/JSON figure bundles remain
+figure is not labelled as Graphormer dot-versus-bias. The same cached diagnostic sweep records
+normalised clean-attention entropy and relates it separately to relative selectivity and joint
+sensitivity. Individual PNG/PDF/JSON figure bundles remain
 under each task's figure directory. The notebook also assembles ordered, multi-page PDFs in the
 shared Drive `pdf_sections` directory: `zinc_*.pdf` and `qm9_*.pdf` files for main scores, selected
 distance curves, semantic specialists, structural specialists, high-`J` generalists,
