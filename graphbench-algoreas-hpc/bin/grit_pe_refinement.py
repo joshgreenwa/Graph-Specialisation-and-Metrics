@@ -24,6 +24,7 @@ from graph_specialisation_metrics.methodology.graphbench_pe_refinement import ( 
     lock_pe_refinement_selection,
     run_arm_component,
     run_common_component,
+    validate_causal_recovery_prerequisites,
 )
 from graph_specialisation_metrics.methodology.protocol import ExecutionPolicy  # noqa: E402
 
@@ -107,6 +108,10 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument("--progress-heartbeat-seconds", type=float, default=30.0)
     value.add_argument("--analysis-seed", type=int, default=31_415)
     value.add_argument("--strict-audits", action="store_true")
+    value.add_argument(
+        "--require-causal-recovery-prerequisites",
+        action="store_true",
+    )
     value.add_argument("--force", action="store_true")
     value.add_argument("--no-resume", action="store_true")
     return value
@@ -138,7 +143,11 @@ def build_config(args: argparse.Namespace) -> PERefinementConfig:
     )
 
 
-def _preflight(config: PERefinementConfig) -> None:
+def _preflight(
+    config: PERefinementConfig,
+    *,
+    require_causal_recovery_prerequisites: bool,
+) -> None:
     config.validate()
     missing = []
     for seed in config.seeds:
@@ -188,6 +197,8 @@ def _preflight(config: PERefinementConfig) -> None:
     print(f"[OK] output: {config.output_dir}")
     print(f"[OK] fingerprint: {config.fingerprint}")
     audit_existing_pe_refinement_cache(config)
+    if require_causal_recovery_prerequisites:
+        validate_causal_recovery_prerequisites(config)
 
 
 def main(argv: Sequence[str] | None = None) -> None:
@@ -195,7 +206,12 @@ def main(argv: Sequence[str] | None = None) -> None:
     config = build_config(args)
     config.validate()
     if args.mode == "preflight":
-        _preflight(config)
+        _preflight(
+            config,
+            require_causal_recovery_prerequisites=bool(
+                args.require_causal_recovery_prerequisites
+            ),
+        )
         return
     if args.mode == "worker":
         if args.seed is None or args.component is None:
@@ -203,11 +219,21 @@ def main(argv: Sequence[str] | None = None) -> None:
         if args.component == "arm":
             if args.arm is None:
                 raise ValueError("arm worker requires --arm")
-            run_arm_component(config, int(args.seed), str(args.arm))
+            run_arm_component(
+                config,
+                int(args.seed),
+                str(args.arm),
+                split=str(args.split),
+            )
         else:
             if args.arm is not None:
                 raise ValueError("common worker cannot receive --arm")
-            run_common_component(config, int(args.seed), str(args.component))
+            run_common_component(
+                config,
+                int(args.seed),
+                str(args.component),
+                split=str(args.split),
+            )
         return
     if args.mode == "finalize":
         finalize_pe_refinement(config, split=str(args.split))

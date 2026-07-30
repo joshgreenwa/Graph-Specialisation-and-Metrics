@@ -70,6 +70,7 @@ python graphbench-algoreas-hpc/bin/grit_pe_refinement.py worker \
   --seed "${SEED}" \
   "${ARM_ARGS[@]}" \
   --profile "${PROFILE:-production}" \
+  --split "${ANALYSIS_SPLIT:-refinement}" \
   --training-output-root "${GRAPHBENCH_TRAINING_OUTPUT_ROOT}" \
   --analysis-output-root "${GRAPHBENCH_ANALYSIS_OUTPUT_ROOT}" \
   --dataset-root "${GRAPHBENCH_DATASET_ROOT}" \

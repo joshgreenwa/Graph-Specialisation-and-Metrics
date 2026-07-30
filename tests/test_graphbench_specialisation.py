@@ -43,10 +43,16 @@ from graph_specialisation_metrics.methodology.graphbench_pe_refinement import (
     _registered_split_sizes,
     _run_causal_component,
     audit_existing_pe_refinement_cache,
+    finalize_pe_refinement,
     render_refinement_figures,
+    run_arm_causal,
+    run_arm_scores,
     run_common_ablation,
+    run_common_causal,
+    run_common_scores,
     semantic_event_manifest,
     structural_pair_manifest,
+    validate_causal_recovery_prerequisites,
 )
 from graph_specialisation_metrics.methodology.protocol import BootstrapPolicy
 from graph_specialisation_metrics.methodology.protocol import (
@@ -1157,6 +1163,206 @@ def test_pe_refinement_preflight_audits_existing_shards_without_loading_model(
     )
 
     assert audit_existing_pe_refinement_cache(config) == 1
+    with pytest.raises(FileNotFoundError, match="required PE-refinement cache"):
+        validate_causal_recovery_prerequisites(config)
+
+    required = (
+        ("scores/semantic", "summary"),
+        ("clean_ablation", "summary"),
+        ("audits", "common-scores"),
+        ("audits", "common-ablation"),
+        ("audits", "model"),
+    )
+    for seed in config.seeds:
+        checkpoint = (
+            Path(config.training_output_root)
+            / "bipartite_matching_hard"
+            / "grit"
+            / f"seed{seed}"
+            / "best.pt"
+        )
+        prepared = SimpleNamespace(
+            config=config,
+            seed=int(seed),
+            seed_dir=(
+                config.root
+                / "graphbench_bipartite_matching_hard"
+                / f"seed_{seed}"
+            ),
+            checkpoint_sha=checkpoint_sha256(checkpoint),
+            splits=splits,
+        )
+        store = ProtectedShardStore(prepared, "common")
+        for stage, name in required:
+            store.save(stage, name, {"complete": True})
+
+    assert validate_causal_recovery_prerequisites(config) == 20
+
+
+def test_pe_refinement_causal_workers_default_to_refinement_only(tmp_path):
+    graph = six_node_matching_graph()
+    runtime = fake_runtime(graph)
+    task = get_task("graphbench_bipartite_matching_hard")
+    backend = GraphBenchGritBackend(
+        runtime,
+        task,
+        sigma=[1.0],
+        jacobian_output_chunk=4,
+    )
+    config = PERefinementConfig(
+        output_dir=str(tmp_path / "analysis"),
+        training_output_root=str(tmp_path / "training"),
+        dataset_root=str(tmp_path / "dataset"),
+        pe_cache_root=str(tmp_path / "pe"),
+        runner_path=str(tmp_path / "runner.py"),
+        sizes=PERefinementSizes(
+            discovery_graphs=1,
+            refinement_graphs=1,
+            confirmation_graphs=1,
+            clean_ablation_graphs=1,
+            semantic_donor_graphs=1,
+            semantic_sources_per_graph=1,
+            donors_per_source=2,
+            taylor_graphs=1,
+        ),
+        accelerator="cpu",
+        head_batch_size=2,
+    )
+    prepared = PreparedPERefinement(
+        config=config,
+        runtime=runtime,
+        backend=backend,
+        task=task,
+        donor_pool=GraphBenchEdgeDonorPool([(0, graph)]),
+        splits=SimpleNamespace(
+            causal=(0, 0),
+            fingerprint="fake-split",
+        ),
+        checkpoint=tmp_path / "best.pt",
+        checkpoint_sha="fake-checkpoint",
+        seed=0,
+        progress=SimpleNamespace(emit=lambda *_args, **_kwargs: None),
+    )
+
+    semantic = run_common_causal(prepared)
+    structural = run_arm_causal(prepared, "rrwp_copy")
+
+    assert set(semantic) == {"refinement"}
+    assert set(structural) == {"refinement"}
+    seed_dir = config.root / "graphbench_bipartite_matching_hard" / "seed_0"
+    assert (
+        seed_dir
+        / "common"
+        / "causal"
+        / "refinement"
+        / "semantic"
+        / "summary.pt"
+    ).exists()
+    assert not (
+        seed_dir
+        / "common"
+        / "causal"
+        / "confirmation"
+        / "semantic"
+        / "summary.pt"
+    ).exists()
+    assert not (
+        seed_dir
+        / "arms"
+        / "rrwp_copy"
+        / "causal"
+        / "confirmation"
+        / "structural"
+        / "summary.pt"
+    ).exists()
+
+
+def test_pe_refinement_four_seed_cached_pipeline_finalizes_end_to_end(tmp_path):
+    graph = six_node_matching_graph()
+    config = PERefinementConfig(
+        output_dir=str(tmp_path / "analysis"),
+        training_output_root=str(tmp_path / "training"),
+        dataset_root=str(tmp_path / "dataset"),
+        pe_cache_root=str(tmp_path / "pe"),
+        runner_path=str(tmp_path / "runner.py"),
+        sizes=PERefinementSizes(
+            discovery_graphs=1,
+            refinement_graphs=1,
+            confirmation_graphs=1,
+            clean_ablation_graphs=1,
+            semantic_donor_graphs=1,
+            semantic_sources_per_graph=1,
+            donors_per_source=2,
+            taylor_graphs=1,
+            permutation_replicates=8,
+        ),
+        accelerator="cpu",
+        head_batch_size=2,
+    )
+    for seed in config.seeds:
+        checkpoint = (
+            Path(config.training_output_root)
+            / "bipartite_matching_hard"
+            / "grit"
+            / f"seed{seed}"
+            / "best.pt"
+        )
+        checkpoint.parent.mkdir(parents=True, exist_ok=True)
+        checkpoint.write_bytes(f"checkpoint-{seed}".encode())
+        runtime = fake_runtime(graph)
+        task = get_task("graphbench_bipartite_matching_hard")
+        backend = GraphBenchGritBackend(
+            runtime,
+            task,
+            sigma=[1.0],
+            jacobian_output_chunk=4,
+        )
+        prepared = PreparedPERefinement(
+            config=config,
+            runtime=runtime,
+            backend=backend,
+            task=task,
+            donor_pool=GraphBenchEdgeDonorPool([(0, graph)]),
+            splits=SimpleNamespace(
+                discovery=(0,),
+                causal=(0, 0),
+                clean_ablation=(0,),
+                fingerprint="four-seed-fake-split",
+            ),
+            checkpoint=checkpoint,
+            checkpoint_sha=checkpoint_sha256(checkpoint),
+            seed=int(seed),
+            progress=SimpleNamespace(emit=lambda *_args, **_kwargs: None),
+        )
+        run_common_scores(prepared)
+        run_common_causal(prepared)
+        run_common_ablation(prepared)
+        common = ProtectedShardStore(prepared, "common")
+        common.save("audits", "common-scores", [])
+        common.save("audits", "common-ablation", [])
+        common.save("audits", "model", [])
+        for arm in (
+            "rrwp_copy",
+            "rrwp_transpose",
+            "complete_pe_copy",
+            "complete_pe_transpose",
+        ):
+            run_arm_scores(prepared, arm)
+            run_arm_causal(prepared, arm)
+            arm_store = ProtectedShardStore(prepared, f"arms/{arm}")
+            arm_store.save("audits", "scores", [])
+
+    summary = finalize_pe_refinement(config, split="refinement")
+
+    assert summary["seed_count"] == 4
+    assert len(summary["candidates"]) == 8
+    assert len(summary["selection_table"]) == 8
+    assert {
+        row["registered_rank"] for row in summary["selection_table"]
+    } == set(range(1, 9))
+    assert summary["figures"]
+    for paths in summary["figures"].values():
+        assert all(Path(path).is_file() for path in paths)
 
 
 def test_graphbench_flow_backend_replays_exact_mean_max_readout():

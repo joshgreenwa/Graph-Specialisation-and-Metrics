@@ -470,6 +470,37 @@ def audit_existing_pe_refinement_cache(config: PERefinementConfig) -> int:
     return checked
 
 
+def validate_causal_recovery_prerequisites(
+    config: PERefinementConfig,
+) -> int:
+    """Require completed common products omitted by the 4-7 recovery array."""
+
+    required = (
+        ("scores/semantic", "summary"),
+        ("clean_ablation", "summary"),
+        ("audits", "common-scores"),
+        ("audits", "common-ablation"),
+        ("audits", "model"),
+    )
+    checked = 0
+    for seed in config.seeds:
+        for stage, name in required:
+            _read_protected(
+                config,
+                seed=int(seed),
+                namespace="common",
+                stage=stage,
+                name=name,
+            )
+            checked += 1
+    print(
+        f"[OK] causal-recovery prerequisites: {checked} required common "
+        "artifact(s) present",
+        flush=True,
+    )
+    return checked
+
+
 def prepare_pe_refinement(
     config: PERefinementConfig,
     seed: int,
@@ -1891,8 +1922,15 @@ def _run_causal_component(
     return summary
 
 
-def run_common_causal(prepared: PreparedPERefinement) -> dict[str, Any]:
+def run_common_causal(
+    prepared: PreparedPERefinement,
+    *,
+    splits: Sequence[str] = ("refinement",),
+) -> dict[str, Any]:
     store = ProtectedShardStore(prepared, "common")
+    requested = tuple(str(split) for split in splits)
+    if not requested or any(split not in CAUSAL_SPLITS for split in requested):
+        raise ValueError(f"invalid common causal split request: {requested}")
     taylor_ids = taylor_graph_ids(prepared)
     clean = ensure_clean_jacobians(
         prepared,
@@ -1900,8 +1938,13 @@ def run_common_causal(prepared: PreparedPERefinement) -> dict[str, Any]:
         population="taylor",
         allow_compute=True,
     )
-    summaries = {}
-    for split in CAUSAL_SPLITS:
+    summaries = (
+        store.load("causal", "semantic_summary")
+        if prepared.config.resume and not prepared.config.force
+        else None
+    )
+    summaries = dict(summaries or {})
+    for split in requested:
         with audit_scope(
             f"{TASK_NAME}:seed{prepared.seed}:common-causal:{split}"
         ) as split_scope:
@@ -1929,8 +1972,13 @@ def run_common_causal(prepared: PreparedPERefinement) -> dict[str, Any]:
 def run_arm_causal(
     prepared: PreparedPERefinement,
     arm: str,
+    *,
+    splits: Sequence[str] = ("refinement",),
 ) -> dict[str, Any]:
     store = ProtectedShardStore(prepared, f"arms/{arm}")
+    requested = tuple(str(split) for split in splits)
+    if not requested or any(split not in CAUSAL_SPLITS for split in requested):
+        raise ValueError(f"invalid arm causal split request: {requested}")
     taylor_ids = taylor_graph_ids(prepared)
     clean = ensure_clean_jacobians(
         prepared,
@@ -1938,8 +1986,13 @@ def run_arm_causal(
         population="taylor",
         allow_compute=False,
     )
-    summaries = {}
-    for split in CAUSAL_SPLITS:
+    summaries = (
+        store.load("causal", "structural_summary")
+        if prepared.config.resume and not prepared.config.force
+        else None
+    )
+    summaries = dict(summaries or {})
+    for split in requested:
         with audit_scope(
             f"{TASK_NAME}:seed{prepared.seed}:arm-{arm}:causal:{split}"
         ) as split_scope:
@@ -2050,9 +2103,13 @@ def run_common_component(
     config: PERefinementConfig,
     seed: int,
     component: str,
+    *,
+    split: str = "refinement",
 ) -> dict[str, Any]:
     if component not in {"common-scores", "common-causal", "common-ablation"}:
         raise ValueError(component)
+    if split not in CAUSAL_SPLITS:
+        raise ValueError(split)
     prepared = prepare_pe_refinement(config, seed, component=component)
     prepared.progress.start()
     try:
@@ -2070,7 +2127,7 @@ def run_common_component(
                     result = run_common_scores(prepared)
                     result["model_audits"] = model_audits
                 elif component == "common-causal":
-                    result = run_common_causal(prepared)
+                    result = run_common_causal(prepared, splits=(split,))
                 else:
                     result = run_common_ablation(prepared)
         findings = log_summary(scope, header=f"{component} seed={seed}")
@@ -2088,9 +2145,13 @@ def run_arm_component(
     config: PERefinementConfig,
     seed: int,
     arm: str,
+    *,
+    split: str = "refinement",
 ) -> dict[str, Any]:
     if arm not in STRUCTURAL_ARMS:
         raise ValueError(arm)
+    if split not in CAUSAL_SPLITS:
+        raise ValueError(split)
     component = f"arm-{arm}"
     prepared = prepare_pe_refinement(config, seed, component=component)
     prepared.progress.start()
@@ -2109,7 +2170,7 @@ def run_arm_component(
             score_store.save_json("audits", "scores", score_findings)
             score_store.save("audits", "scores", score_findings)
             with prepared.progress.component("causal", context={"arm": arm}):
-                causal = run_arm_causal(prepared, arm)
+                causal = run_arm_causal(prepared, arm, splits=(split,))
         findings = log_summary(scope, header=f"{component} seed={seed}")
         store = ProtectedShardStore(prepared, f"arms/{arm}")
         store.save_json("audits", "worker", findings)
@@ -2586,8 +2647,16 @@ def _seed_candidate_analysis(
         activity_floor=0.20,
     )
     if not coordinates.estimable:
-        raise RuntimeError(
-            f"non-estimable coordinates for seed={seed} arm={arm} score={score_system}"
+        audit_check(
+            False,
+            "pe_refinement.coordinates_non_estimable",
+            "semantic/structural score coordinates are below the registered "
+            "score floor and are reported as non-estimable",
+            context={
+                "seed": seed,
+                "arm": arm,
+                "score_system": score_system,
+            },
         )
     shape = semantic_raw.shape
     layers = np.repeat(np.arange(shape[0]), shape[1])
@@ -2637,6 +2706,17 @@ def _seed_candidate_analysis(
                     "channel": name,
                 },
             )
+    for channel in ("semantic", "structural"):
+        if (
+            not np.isfinite(gross_scale[channel])
+            or gross_scale[channel] <= config.numerical.effect_floor
+        ):
+            gross_scale[channel] = np.nan
+        if (
+            not np.isfinite(necessity_scale[channel])
+            or necessity_scale[channel] <= config.numerical.effect_floor
+        ):
+            necessity_scale[channel] = np.nan
     g_sem = endpoint["semantic"]["G_c"] / gross_scale["semantic"]
     g_str = endpoint["structural"]["G_c"] / gross_scale["structural"]
     gross_total = 0.5 * (g_sem + g_str)
