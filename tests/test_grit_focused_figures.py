@@ -497,7 +497,45 @@ def test_figure_bundle_uses_publication_export_resolution(tmp_path: Path):
         "pdf_raster_dpi": 600,
         "pdf_vector_artists": True,
         "molecule_draw_dpi": 600,
+        "bbox_inches": "tight",
     }
+
+
+def test_core_scatter_exports_keep_matching_page_dimensions(tmp_path: Path):
+    import matplotlib.pyplot as plt
+
+    PdfReader = pytest.importorskip("pypdf").PdfReader
+    metrics = CanonicalHeadMetrics.from_scores(_score_value())
+    selected = {"semantic": (0, 0), "structural": (0, 1)}
+    figures = [
+        plot_score_plane(metrics, selected, title="Synthetic GRIT"),
+        plot_selectivity_joint_plane(
+            metrics, selected, title="Synthetic GRIT"
+        ),
+    ]
+    pdf_sizes = []
+    try:
+        for index, figure in enumerate(figures):
+            paths = save_figure_bundle(
+                figure,
+                tmp_path,
+                f"scatter_{index}",
+                bbox_inches=None,
+            )
+            page = PdfReader(str(paths["pdf"])).pages[0]
+            pdf_sizes.append(
+                (float(page.mediabox.width), float(page.mediabox.height))
+            )
+        np.testing.assert_allclose(pdf_sizes[0], pdf_sizes[1], atol=0.01)
+        np.testing.assert_allclose(
+            pdf_sizes[0],
+            np.asarray([8.0, 5.9]) * 72.0,
+            atol=0.01,
+        )
+        assert figures[0].axes[0].get_aspect() == 1.0
+    finally:
+        for figure in figures:
+            plt.close(figure)
 
 
 def test_grit_diagnostic_extractor_captures_native_sparse_sites():

@@ -997,6 +997,7 @@ def save_figure_bundle(
     metadata: Mapping[str, Any] | None = None,
     dpi: int = PUBLICATION_PNG_DPI,
     pdf_raster_dpi: int = PUBLICATION_PDF_RASTER_DPI,
+    bbox_inches: str | None = "tight",
 ) -> dict[str, Path]:
     """Save lossless PNG and mixed vector/raster publication PDF outputs.
 
@@ -1013,11 +1014,16 @@ def save_figure_bundle(
         "pdf": directory / f"{stem}.pdf",
         "metadata": directory / f"{stem}.json",
     }
-    figure.savefig(paths["png"], dpi=dpi, bbox_inches="tight", facecolor="white")
+    figure.savefig(
+        paths["png"],
+        dpi=dpi,
+        bbox_inches=bbox_inches,
+        facecolor="white",
+    )
     figure.savefig(
         paths["pdf"],
         dpi=pdf_raster_dpi,
-        bbox_inches="tight",
+        bbox_inches=bbox_inches,
         facecolor="white",
     )
     paths["metadata"].write_text(
@@ -1029,6 +1035,7 @@ def save_figure_bundle(
                     "pdf_raster_dpi": int(pdf_raster_dpi),
                     "pdf_vector_artists": True,
                     "molecule_draw_dpi": MOLECULE_DRAW_DPI,
+                    "bbox_inches": bbox_inches,
                 },
                 **dict(metadata or {}),
             },
