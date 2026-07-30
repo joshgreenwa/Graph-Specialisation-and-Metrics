@@ -29,7 +29,7 @@ SECRET_NAME = "dissertation_key"
 PHASE = "all"  # "all", "measure", or "figures"
 OUTPUT_DIR = Path(
     "/content/drive/MyDrive/graph_specialisation_metrics/"
-    "zinc_bamberger_functional_reach_v5"
+    "zinc_bamberger_functional_reach_v6"
 )
 TASKS = "zinc_1hop,zinc_2hop,zinc_1hop_vnode,zinc"
 SEED = 0
@@ -39,6 +39,8 @@ DONORS_PER_SOURCE = 4
 SEMANTIC_DONOR_GRAPHS = 256
 BAMBERGER_OUTPUT_NODES = 6
 BAMBERGER_OUTPUT_CHANNELS = 8
+INTERPOLATION_DOSES = "0.02,0.05,0.1,0.25,0.5,1.0"
+INTERPOLATION_BATCH_SIZE = 32
 BOOTSTRAP_REPLICATES = 2_000
 ANALYSIS_SEED = 91_021
 ACCELERATOR = "cuda:0"
@@ -164,13 +166,14 @@ from graph_specialisation_metrics.zinc_reach_analysis import main
 
 print(
     "\n[scope] Semantic: literal Bamberger pre-pooling Jacobian range and "
-    "finite Functional carriage, with the raw finite hidden-state response "
-    "shown as a matched intermediate estimand.\n"
+    "finite Functional carriage.\n"
     "[scope] Structural: finite Functional carriage only; "
     "Bamberger has no canonical structural intervention analogue.\n"
-    "[scope] Fairness: checkpoints, graphs, SPD and carrier site are shared. "
-    "The raw-finite and Functional profiles use identical donor events; literal "
-    "Bamberger remains output-centric and channel-subsampled.\n"
+    "[scope] Core check: semantic Functional carriage is recomputed along the "
+    "same clean-to-donor event at increasing donor fractions. Departure from the "
+    "Bamberger profile tests local linearisation versus finite intervention.\n"
+    "[scope] Fairness: checkpoints, graphs, SPD and carrier site are shared; "
+    "literal Bamberger remains output-centric and channel-subsampled.\n"
     "[scope] Interpretation: this is an estimand comparison, not a claim that "
     "the two methods measure the same quantity. There is no learned-route ground "
     "truth on ZINC.\n"
@@ -200,6 +203,10 @@ CELL_ARGS = [
     str(BAMBERGER_OUTPUT_NODES),
     "--bamberger-output-channels",
     str(BAMBERGER_OUTPUT_CHANNELS),
+    "--interpolation-doses",
+    INTERPOLATION_DOSES,
+    "--interpolation-batch-size",
+    str(INTERPOLATION_BATCH_SIZE),
     "--bootstrap-replicates",
     str(BOOTSTRAP_REPLICATES),
     "--analysis-seed",
@@ -236,11 +243,22 @@ if "expected_rows" in result:
     except ImportError:
         pass
 
+if "interpolation_rows" in result:
+    from IPython.display import display
+
+    try:
+        import pandas as pd
+
+        print("\nInterpolation-sweep summary", flush=True)
+        display(pd.DataFrame(result["interpolation_rows"]))
+    except ImportError:
+        pass
+
 if "figures" in result:
     from IPython.display import Image, display
 
     for name in (
-        "semantic_decomposition",
+        "interpolation_sweep",
         "semantic_functional",
         "semantic_bamberger",
         "structural_functional",

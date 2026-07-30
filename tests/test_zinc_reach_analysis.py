@@ -1,7 +1,10 @@
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
+import torch
 
+import graph_specialisation_metrics.zinc_reach_analysis as reach
 from graph_specialisation_metrics.zinc_reach_analysis import (
     TASKS,
     ZincReachConfig,
@@ -9,9 +12,83 @@ from graph_specialisation_metrics.zinc_reach_analysis import (
     figures,
     graph_bamberger_profiles,
     graph_donor_profiles,
+    graph_interpolation_profiles,
     summarise_dense_profile_contrasts,
     summarise_graph_profiles,
+    summarise_interpolation_contrasts,
 )
+
+
+def test_semantic_interpolation_scales_linear_functional_mass(monkeypatch):
+    class Data:
+        def __init__(self, x):
+            self.x = x
+            self.edge_attr = None
+            self.num_nodes = 3
+
+    class Layers(torch.nn.Module):
+        def __init__(self, mixing):
+            super().__init__()
+            self.register_buffer("mixing", mixing)
+
+        def forward(self, data):
+            output = Data(data.x)
+            blocks = data.x.reshape(-1, 3, int(data.x.shape[-1]))
+            output.x = torch.einsum("ij,bjw->biw", self.mixing, blocks).reshape(
+                -1,
+                int(data.x.shape[-1]),
+            )
+            return output
+
+    embedding = torch.nn.Embedding(21, 3)
+    with torch.no_grad():
+        embedding.weight.copy_(
+            torch.arange(63, dtype=torch.float32).reshape(21, 3) / 10
+        )
+    raw_atoms = torch.tensor([1, 4, 7], dtype=torch.long)
+    mixing = torch.tensor(
+        [[1.0, 0.5, 0.0], [0.25, 1.0, 0.5], [0.0, 0.75, 1.0]]
+    )
+    prepared = SimpleNamespace(
+        runtime=SimpleNamespace(
+            model=SimpleNamespace(model=SimpleNamespace(layers=Layers(mixing)))
+        )
+    )
+
+    def encoded_batch(_prepared, graphs):
+        repeated_atoms = raw_atoms.repeat(len(graphs))
+        return Data(embedding(repeated_atoms)), repeated_atoms, embedding
+
+    monkeypatch.setattr(reach, "_after_feature_encoder", encoded_batch)
+    base = Data(raw_atoms[:, None])
+    variant = Data(torch.tensor([[1], [6], [7]]))
+    event = SimpleNamespace(source=1)
+    clean_final = mixing @ embedding(raw_atoms)
+    full_final = clean_final + torch.outer(
+        mixing[:, 1],
+        embedding.weight[6] - embedding.weight[4],
+    )
+    gradient = torch.ones(1, 3, 3)
+    full_mass = reach._project_final_change(
+        (clean_final - full_final).unsqueeze(0),
+        gradient,
+    )
+
+    actual = reach._semantic_interpolation_mass(
+        ZincReachConfig(
+            interpolation_doses=(0.25, 1.0),
+            interpolation_batch_size=4,
+        ),
+        prepared,
+        base=base,
+        variants=[variant],
+        events=[event],
+        clean_final=clean_final,
+        clean_gradient=gradient,
+        full_mass=full_mass,
+    )
+    assert torch.allclose(actual[0], 0.25 * full_mass, atol=1.0e-6)
+    assert torch.allclose(actual[1], full_mass)
 
 
 def test_discover_seed_checkpoint_prefers_recovery_best(tmp_path: Path):
@@ -41,6 +118,7 @@ def test_discover_seed_checkpoint_selects_highest_standard_epoch(tmp_path: Path)
 def _raw_rows():
     donor = []
     bamberger = []
+    interpolation = []
     for task_index, task in enumerate(TASKS):
         for graph in (0, 1):
             for channel in ("semantic", "structural"):
@@ -58,11 +136,26 @@ def _raw_rows():
                             (1 + distance) + 0.2 * task_index
                         ),
                     }
-                    if channel == "semantic":
-                        row["finite_hidden_response"] = (
-                            2 + 0.5 * distance + 0.15 * task_index
-                        )
                     donor.append(row)
+            for dose in (0.02, 0.10, 0.50, 1.00):
+                for distance in (0, 1, 2):
+                    interpolation.append(
+                        {
+                            "task": task,
+                            "graph": graph,
+                            "source": 0,
+                            "donor_graph": 9,
+                            "donor_node": 1,
+                            "draw": 0,
+                            "interpolation_dose": dose,
+                            "distance": distance,
+                            "functional_carriage": (
+                                (1 - dose) * (3 - distance)
+                                + dose * (1 + distance)
+                                + 0.2 * task_index
+                            ),
+                        }
+                    )
             for output_node in (0, 1):
                 for input_node, distance in enumerate((0, 1, 2)):
                     bamberger.append(
@@ -75,11 +168,11 @@ def _raw_rows():
                             "influence": 3 - distance,
                         }
                     )
-    return donor, bamberger
+    return donor, bamberger, interpolation
 
 
 def test_profile_scope_and_normalisation():
-    donor, bamberger = _raw_rows()
+    donor, bamberger, interpolation = _raw_rows()
     graph_rows = [
         *graph_donor_profiles(donor, effect_floor=1e-12),
         *graph_bamberger_profiles(bamberger, effect_floor=1e-12),
@@ -101,7 +194,6 @@ def test_profile_scope_and_normalisation():
         if row["channel"] == "semantic"
     } == {
         "bamberger",
-        "finite_hidden_response",
         "functional_carriage",
     }
     assert {
@@ -130,10 +222,37 @@ def test_profile_scope_and_normalisation():
         for row in contrasts
         if row["method"] == "functional_carriage"
     )
+    interpolation_graph = graph_interpolation_profiles(
+        interpolation,
+        effect_floor=1e-12,
+    )
+    grouped_interpolation = {}
+    for row in interpolation_graph:
+        key = (row["task"], row["graph"], row["interpolation_dose"])
+        grouped_interpolation.setdefault(key, 0.0)
+        grouped_interpolation[key] += row["mass"]
+    assert all(
+        value == pytest.approx(1.0)
+        for value in grouped_interpolation.values()
+    )
+    graph_contrasts, sweep = summarise_interpolation_contrasts(
+        interpolation_graph,
+        [
+            row
+            for row in graph_rows
+            if row["method"] == "bamberger"
+        ],
+        bootstrap_replicates=40,
+        bootstrap_seed=11,
+    )
+    assert graph_contrasts and sweep
+    assert {
+        row["metric"] for row in sweep
+    } == {"profile_tv", "expected_distance_difference"}
 
 
 def test_figure_only_builds_png_and_pdf(tmp_path: Path):
-    donor, bamberger = _raw_rows()
+    donor, bamberger, interpolation = _raw_rows()
     results = tmp_path / "results"
     results.mkdir()
 
@@ -142,6 +261,7 @@ def test_figure_only_builds_png_and_pdf(tmp_path: Path):
     for path, rows in (
         (results / "donor_carrier_mass.csv", donor),
         (results / "bamberger_input_output_influence.csv", bamberger),
+        (results / "semantic_interpolation_mass.csv", interpolation),
     ):
         with path.open("w", newline="", encoding="utf-8") as handle:
             writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
@@ -153,13 +273,14 @@ def test_figure_only_builds_png_and_pdf(tmp_path: Path):
         output_dir=tmp_path,
     )
     assert set(result["figures"]) == {
-        "semantic_decomposition",
+        "interpolation_sweep",
         "semantic_functional",
         "semantic_bamberger",
         "structural_functional",
         "expected_distance",
     }
     assert (results / "dense_profile_contrasts.csv").is_file()
+    assert (results / "interpolation_sweep_summary.csv").is_file()
     for formats in result["figures"].values():
         assert Path(formats["png"]).is_file()
         assert Path(formats["pdf"]).is_file()

@@ -7,8 +7,9 @@ This extension keeps two comparisons separate:
   differentiable one-hot vector followed by the checkpoint's learned embedding.
 * Functional carriage is evaluated at final pre-pooling node states for exact
   semantic or structural donor events.
-* Semantic profiles additionally expose the raw finite hidden-state response,
-  separating finite propagation from task-readout projection.
+* A semantic interpolation sweep varies the donor-swap fraction while holding
+  donor events fixed, testing whether the finite profile departs progressively
+  from the Bamberger Jacobian profile.
 
 The Bamberger proxy has no canonical structural-donor counterpart.  It is
 therefore shown only for semantic usage; structural usage reports Functional
@@ -45,8 +46,9 @@ from .methodology.runner import prepare_task
 from .methodology.sampling import sample_sources
 
 
-ANALYSIS_VERSION = "zinc-bamberger-functional-reach-v5"
+ANALYSIS_VERSION = "zinc-bamberger-functional-reach-v6"
 TASKS = ("zinc_1hop", "zinc_2hop", "zinc_1hop_vnode", "zinc")
+DEFAULT_INTERPOLATION_DOSES = (0.02, 0.05, 0.10, 0.25, 0.50, 1.00)
 TASK_LABELS = {
     "zinc_1hop": "1-hop GRIT",
     "zinc_2hop": "2-hop GRIT",
@@ -55,33 +57,21 @@ TASK_LABELS = {
 }
 CHANNELS = ("semantic", "structural")
 DONOR_METHODS = ("functional_carriage",)
-DONOR_PROFILE_METHODS = (
-    "finite_hidden_response",
-    "functional_carriage",
-)
-DECOMPOSITION_METHODS = (
-    "bamberger",
-    "finite_hidden_response",
-    "functional_carriage",
-)
+DONOR_PROFILE_METHODS = DONOR_METHODS
 METHOD_LABELS = {
     "bamberger": "Bamberger (coordinatewise Jacobian)",
-    "finite_hidden_response": "Finite hidden-state response",
     "functional_carriage": "Functional carriage (task-projected)",
 }
 METHOD_COLOURS = {
     "bamberger": "#202020",
-    "finite_hidden_response": "#0072B2",
     "functional_carriage": "#D55E00",
 }
 METHOD_MARKERS = {
     "bamberger": "^",
-    "finite_hidden_response": "D",
     "functional_carriage": "s",
 }
 METHOD_LINESTYLES = {
     "bamberger": "-",
-    "finite_hidden_response": "--",
     "functional_carriage": ":",
 }
 MODEL_COLOURS = {
@@ -116,6 +106,8 @@ class ZincReachConfig:
     semantic_donor_graphs: int = 256
     bamberger_output_nodes: int = 6
     bamberger_output_channels: int = 8
+    interpolation_doses: tuple[float, ...] = DEFAULT_INTERPOLATION_DOSES
+    interpolation_batch_size: int = 32
     effect_floor: float = 1.0e-12
     bootstrap_replicates: int = 2_000
     analysis_seed: int = 91_021
@@ -132,6 +124,7 @@ class ZincReachConfig:
             "semantic_donor_graphs",
             "bamberger_output_nodes",
             "bamberger_output_channels",
+            "interpolation_batch_size",
             "bootstrap_replicates",
             "num_threads",
         ):
@@ -139,6 +132,17 @@ class ZincReachConfig:
                 raise ValueError(f"{name} must be positive")
         if float(self.effect_floor) <= 0:
             raise ValueError("effect_floor must be positive")
+        doses = tuple(float(value) for value in self.interpolation_doses)
+        if (
+            not doses
+            or any(not 0 < value <= 1 for value in doses)
+            or tuple(sorted(set(doses))) != doses
+            or not np.isclose(doses[-1], 1.0)
+        ):
+            raise ValueError(
+                "interpolation_doses must be unique, increasing, in (0, 1], "
+                "and end at 1"
+            )
 
     @property
     def scientific_record(self) -> dict[str, Any]:
@@ -152,6 +156,9 @@ class ZincReachConfig:
             "semantic_donor_graphs": int(self.semantic_donor_graphs),
             "bamberger_output_nodes": int(self.bamberger_output_nodes),
             "bamberger_output_channels": int(self.bamberger_output_channels),
+            "interpolation_doses": [
+                float(value) for value in self.interpolation_doses
+            ],
             "effect_floor": float(self.effect_floor),
             "bootstrap_replicates": int(self.bootstrap_replicates),
             "analysis_seed": int(self.analysis_seed),
@@ -164,8 +171,10 @@ class ZincReachConfig:
                 "mean node-level pre-pooling range from entrywise-absolute Jacobians "
                 "with respect to differentiable one-hot atom inputs"
             ),
-            "finite_hidden_estimand": (
-                "finite clean-minus-donor final pre-pooling hidden-state response"
+            "interpolation_estimand": (
+                "Functional carriage under convex interpolation from the clean atom "
+                "embedding to the realised donor atom embedding, retaining the clean "
+                "graph-output projection"
             ),
             "aggregation": (
                 "donor-normalise; donor -> source -> graph; 95% graph bootstrap"
@@ -508,6 +517,109 @@ def _project_final_change(change: Any, clean_gradient: Any) -> Any:
     return torch.linalg.vector_norm(contribution, dim=-1)
 
 
+def _semantic_interpolation_mass(
+    config: ZincReachConfig,
+    prepared: Any,
+    *,
+    base: Any,
+    variants: Sequence[Any],
+    events: Sequence[Any],
+    clean_final: Any,
+    clean_gradient: Any,
+    full_mass: Any,
+) -> Any:
+    """Return task-projected mass as ``[dose, event, carrier]``."""
+
+    import torch
+
+    if len(variants) != len(events):
+        raise ValueError("semantic variants and events are misaligned")
+    nodes = int(base.num_nodes)
+    event_count = len(events)
+    doses = tuple(float(value) for value in config.interpolation_doses)
+    output = torch.empty(
+        (len(doses), event_count, nodes),
+        dtype=full_mass.dtype,
+        device=full_mass.device,
+    )
+    full_index = next(
+        index for index, dose in enumerate(doses) if np.isclose(dose, 1.0)
+    )
+    output[full_index] = full_mass
+
+    net = prepared.runtime.model.model
+    with torch.no_grad():
+        clean_encoded, _, _ = _after_feature_encoder(prepared, [base])
+        clean_layer_input = _finish_encoding(net, clean_encoded)
+        manual_clean = _forward_final(
+            net,
+            clean_layer_input,
+            clean_layer_input.x,
+            clean_layer_input.edge_attr,
+            _real_mask(clean_layer_input),
+        )
+        if tuple(manual_clean.shape) != tuple(clean_final.shape):
+            raise RuntimeError("interpolation clean-state geometry differs from capture")
+        error = torch.linalg.vector_norm((manual_clean - clean_final).reshape(-1))
+        scale = torch.linalg.vector_norm(clean_final.reshape(-1)).clamp_min(1.0e-12)
+        if float((error / scale).detach().cpu()) > 1.0e-5:
+            raise RuntimeError("interpolation clean-state audit failed")
+
+    conditions = [
+        (dose_index, event_index)
+        for dose_index, dose in enumerate(doses)
+        if dose_index != full_index
+        for event_index in range(event_count)
+    ]
+    batch_size = int(config.interpolation_batch_size)
+    for start in range(0, len(conditions), batch_size):
+        chunk = conditions[start : start + batch_size]
+        with torch.no_grad():
+            encoded, raw_atoms, embedding = _after_feature_encoder(
+                prepared,
+                [base] * len(chunk),
+            )
+            dosed_x = encoded.x.clone()
+            for batch_index, (dose_index, event_index) in enumerate(chunk):
+                source = int(events[event_index].source)
+                global_source = batch_index * nodes + source
+                clean_atom = int(raw_atoms[global_source])
+                donor_atom = int(variants[event_index].x[source].reshape(-1)[0])
+                if donor_atom == clean_atom:
+                    raise RuntimeError("semantic interpolation direction is zero")
+                dose = doses[dose_index]
+                dosed_x[global_source] = (
+                    (1.0 - dose) * embedding.weight[clean_atom]
+                    + dose * embedding.weight[donor_atom]
+                )
+            encoded.x = dosed_x
+            layer_input = _finish_encoding(net, encoded)
+            dosed_final = _forward_final(
+                net,
+                layer_input,
+                layer_input.x,
+                layer_input.edge_attr,
+                _real_mask(layer_input),
+            )
+            expected_nodes = len(chunk) * nodes
+            if int(dosed_final.shape[0]) != expected_nodes:
+                raise RuntimeError("interpolation batch lost real-node alignment")
+            dosed_final = dosed_final.reshape(
+                len(chunk),
+                nodes,
+                int(dosed_final.shape[-1]),
+            )
+            masses = _project_final_change(
+                manual_clean.unsqueeze(0) - dosed_final,
+                clean_gradient,
+            )
+            if not bool(torch.isfinite(masses).all()):
+                raise RuntimeError("non-finite interpolation carriage mass")
+            for batch_index, (dose_index, event_index) in enumerate(chunk):
+                output[dose_index, event_index] = masses[batch_index]
+    return output
+
+
 def _donor_rows(
     config: ZincReachConfig,
     prepared: Any,
@@ -520,7 +632,7 @@ def _donor_rows(
     variants: Sequence[Any],
     events: Sequence[Any],
     clean_jacobians: Any,
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Evaluate finite Functional-carriage mass for one graph/channel."""
 
     import torch
@@ -529,17 +641,28 @@ def _donor_rows(
     finite_change = clean_jacobians.capture.final_state.unsqueeze(0) - capture.final_state[1:]
     gradient = clean_jacobians.final_state
     finite_mass = _project_final_change(finite_change, gradient)
-    finite_hidden_mass = torch.linalg.vector_norm(finite_change, dim=-1)
-    if not bool(
-        torch.isfinite(finite_mass).all()
-        and torch.isfinite(finite_hidden_mass).all()
-    ):
+    if not bool(torch.isfinite(finite_mass).all()):
         raise RuntimeError("non-finite final-state reach mass")
     if len(events) != int(finite_mass.shape[0]):
         raise RuntimeError("event manifest and carrier tensor are misaligned")
+    interpolation_mass = (
+        _semantic_interpolation_mass(
+            config,
+            prepared,
+            base=base,
+            variants=variants,
+            events=events,
+            clean_final=clean_jacobians.capture.final_state,
+            clean_gradient=gradient,
+            full_mass=finite_mass,
+        )
+        if channel == "semantic"
+        else None
+    )
 
     distances = shortest_path_distances(base.edge_index, int(base.num_nodes))
     rows: list[dict[str, Any]] = []
+    interpolation_rows: list[dict[str, Any]] = []
     for event_index, event in enumerate(events):
         source = int(event.source)
         if source not in sources:
@@ -564,12 +687,34 @@ def _donor_rows(
                     finite_mass[event_index, carrier].detach().cpu()
                 ),
             }
-            if channel == "semantic":
-                row["finite_hidden_response"] = float(
-                    finite_hidden_mass[event_index, carrier].detach().cpu()
-                )
             rows.append(row)
-    return rows
+            if interpolation_mass is not None:
+                for dose_index, dose in enumerate(config.interpolation_doses):
+                    interpolation_rows.append(
+                        {
+                            "analysis_version": ANALYSIS_VERSION,
+                            "fingerprint": config.fingerprint,
+                            "task": task,
+                            "model_label": TASK_LABELS[task],
+                            "seed": int(config.seed),
+                            "graph": int(graph_id),
+                            "source": source,
+                            "donor_graph": int(event.donor_graph_id),
+                            "donor_node": int(event.donor_node),
+                            "draw": int(event.draw),
+                            "interpolation_dose": float(dose),
+                            "carrier": int(carrier),
+                            "distance": int(distances[source, carrier]),
+                            "functional_carriage": float(
+                                interpolation_mass[
+                                    dose_index,
+                                    event_index,
+                                    carrier,
+                                ].detach().cpu()
+                            ),
+                        }
+                    )
+    return rows, interpolation_rows
 
 
 def _measure_graph(
@@ -599,6 +744,7 @@ def _measure_graph(
         base=base,
     )
     donor_rows: list[dict[str, Any]] = []
+    interpolation_rows: list[dict[str, Any]] = []
     for channel in CHANNELS:
         variants: list[Any] = []
         events: list[Any] = []
@@ -626,7 +772,7 @@ def _measure_graph(
                 flush=True,
             )
             continue
-        rows = _donor_rows(
+        rows, channel_interpolation_rows = _donor_rows(
             config,
             prepared,
             task=task,
@@ -639,6 +785,7 @@ def _measure_graph(
             clean_jacobians=clean_jacobians,
         )
         donor_rows.extend(rows)
+        interpolation_rows.extend(channel_interpolation_rows)
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
     return {
@@ -648,6 +795,7 @@ def _measure_graph(
         "task": task,
         "graph": int(graph_id),
         "donor_rows": donor_rows,
+        "interpolation_rows": interpolation_rows,
         "bamberger_rows": bamberger,
     }
 
@@ -674,7 +822,7 @@ def _load_shard(
         payload.get("analysis_version") != ANALYSIS_VERSION
         or payload.get("fingerprint") != fingerprint
         or payload.get("checkpoint_sha256") != checkpoint_sha256
-        or not {"donor_rows", "bamberger_rows"}.issubset(payload)
+        or not {"donor_rows", "interpolation_rows", "bamberger_rows"}.issubset(payload)
     ):
         return None
     return payload
@@ -722,6 +870,7 @@ def measure(
     )
 
     donor_rows: list[dict[str, Any]] = []
+    interpolation_rows: list[dict[str, Any]] = []
     bamberger_rows: list[dict[str, Any]] = []
     health: list[dict[str, Any]] = []
     completed = 0
@@ -762,6 +911,7 @@ def measure(
                 )
                 _save_shard(path, shard)
             donor_rows.extend(shard["donor_rows"])
+            interpolation_rows.extend(shard["interpolation_rows"])
             bamberger_rows.extend(shard["bamberger_rows"])
             completed += 1
             if progress:
@@ -773,6 +923,7 @@ def measure(
 
     results_dir = output_dir / "results"
     _write_csv(results_dir / "donor_carrier_mass.csv", donor_rows)
+    _write_csv(results_dir / "semantic_interpolation_mass.csv", interpolation_rows)
     _write_csv(results_dir / "bamberger_input_output_influence.csv", bamberger_rows)
     _write_csv(results_dir / "model_health.csv", health)
     _write_json(
@@ -785,11 +936,12 @@ def measure(
             "health": health,
             "completed_graph_shards": completed,
             "donor_rows": len(donor_rows),
+            "interpolation_rows": len(interpolation_rows),
             "bamberger_rows": len(bamberger_rows),
             "comparison_scope": {
                 "semantic": (
-                    "literal Bamberger pre-pooling Jacobian proxy, raw finite "
-                    "hidden-state response, and task-projected Functional carriage"
+                    "literal Bamberger pre-pooling Jacobian proxy and task-projected "
+                    "Functional carriage"
                 ),
                 "structural": (
                     "finite Functional carriage only; no canonical Bamberger "
@@ -805,9 +957,10 @@ def measure(
                     "checkpoint, held-out graphs, original-graph SPD, final pre-pooling "
                     "carrier site, and graph-level bootstrap unit"
                 ),
-                "matched_decomposition": (
-                    "finite hidden response and Functional carriage share sources, donor "
-                    "draws, source-to-carrier distances, and event-wise normalisation"
+                "interpolation_sweep": (
+                    "Functional carriage at every nonzero donor fraction shares sources, "
+                    "donor draws, source-to-carrier distances, clean output projection, "
+                    "and event-wise normalisation"
                 ),
                 "literal_bamberger_difference": (
                     "Bamberger remains output-centric, uses all input nodes and sampled "
@@ -816,14 +969,15 @@ def measure(
                 ),
                 "interpretation": (
                     "fair comparison of operational estimands, not an estimator-equivalence "
-                    "test; the matched finite pair isolates task-readout filtering from "
-                    "the propagated hidden-state response"
+                    "test; dose-dependent departure from Bamberger isolates the effect of "
+                    "moving from a local derivative to a finite semantic intervention"
                 ),
             },
         },
     )
     return {
         "donor_rows": donor_rows,
+        "interpolation_rows": interpolation_rows,
         "bamberger_rows": bamberger_rows,
         "health": health,
     }
@@ -982,6 +1136,77 @@ def graph_bamberger_profiles(
     return output
 
 
+def graph_interpolation_profiles(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    effect_floor: float,
+) -> list[dict[str, Any]]:
+    """Normalise each semantic event and aggregate profiles per graph and dose."""
+
+    events: dict[tuple[Any, ...], list[Mapping[str, Any]]] = defaultdict(list)
+    for row in rows:
+        key = (
+            str(row["task"]),
+            _integer(row, "graph"),
+            _integer(row, "source"),
+            _integer(row, "donor_graph"),
+            _integer(row, "donor_node"),
+            _integer(row, "draw"),
+            _float(row, "interpolation_dose"),
+        )
+        events[key].append(row)
+
+    source_values: dict[tuple[Any, ...], list[float]] = defaultdict(list)
+    task_max_distance: dict[str, int] = defaultdict(int)
+    for key, event_rows in events.items():
+        task, graph, source, _donor_graph, _donor_node, _draw, dose = key
+        distances = np.asarray(
+            [_integer(row, "distance") for row in event_rows],
+            dtype=np.int64,
+        )
+        task_max_distance[task] = max(
+            int(task_max_distance[task]),
+            int(distances.max(initial=0)),
+        )
+        masses = np.asarray(
+            [_float(row, "functional_carriage") for row in event_rows],
+            dtype=np.float64,
+        )
+        total = float(masses.sum())
+        if not np.isfinite(total) or total <= float(effect_floor):
+            continue
+        for distance in np.unique(distances):
+            source_values[(task, graph, source, dose, int(distance))].append(
+                float(masses[distances == int(distance)].sum() / total)
+            )
+
+    graph_values: dict[tuple[Any, ...], list[float]] = defaultdict(list)
+    present_sources = {key[:4] for key in source_values}
+    for task, graph, source, dose in present_sources:
+        for distance in range(int(task_max_distance[task]) + 1):
+            values = source_values.get(
+                (task, graph, source, dose, distance),
+                [],
+            )
+            graph_values[(task, graph, dose, distance)].append(
+                float(np.mean(values)) if values else 0.0
+            )
+
+    output: list[dict[str, Any]] = []
+    for (task, graph, dose, distance), values in graph_values.items():
+        output.append(
+            {
+                "task": task,
+                "model_label": TASK_LABELS[task],
+                "graph": int(graph),
+                "interpolation_dose": float(dose),
+                "distance": int(distance),
+                "mass": float(np.mean(values)),
+            }
+        )
+    return output
+
+
 def _bootstrap_interval(
     values: Sequence[float],
     *,
@@ -998,6 +1223,100 @@ def _bootstrap_interval(
     indices = rng.integers(0, len(array), size=(int(replicates), len(array)))
     draws = array[indices].mean(axis=1)
     return mean, float(np.quantile(draws, 0.025)), float(np.quantile(draws, 0.975))
+
+
+def summarise_interpolation_contrasts(
+    interpolation_rows: Sequence[Mapping[str, Any]],
+    bamberger_rows: Sequence[Mapping[str, Any]],
+    *,
+    bootstrap_replicates: int,
+    bootstrap_seed: int,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Compare each finite-dose profile with Bamberger on the same held-out graph."""
+
+    interpolation_profiles: dict[
+        tuple[str, int, float],
+        dict[int, float],
+    ] = defaultdict(dict)
+    for row in interpolation_rows:
+        interpolation_profiles[
+            (
+                str(row["task"]),
+                _integer(row, "graph"),
+                _float(row, "interpolation_dose"),
+            )
+        ][_integer(row, "distance")] = _float(row, "mass")
+
+    bamberger_profiles: dict[tuple[str, int], dict[int, float]] = defaultdict(dict)
+    for row in bamberger_rows:
+        bamberger_profiles[
+            (str(row["task"]), _integer(row, "graph"))
+        ][_integer(row, "distance")] = _float(row, "mass")
+
+    graph_contrasts: list[dict[str, Any]] = []
+    for (task, graph, dose), finite_profile in sorted(interpolation_profiles.items()):
+        bamberger_profile = bamberger_profiles.get((task, graph))
+        if not bamberger_profile:
+            continue
+        distances = sorted(set(finite_profile) | set(bamberger_profile))
+        finite = np.asarray(
+            [finite_profile.get(distance, 0.0) for distance in distances],
+            dtype=np.float64,
+        )
+        bamberger = np.asarray(
+            [bamberger_profile.get(distance, 0.0) for distance in distances],
+            dtype=np.float64,
+        )
+        graph_contrasts.append(
+            {
+                "task": task,
+                "model_label": TASK_LABELS[task],
+                "graph": int(graph),
+                "interpolation_dose": float(dose),
+                "profile_tv": float(0.5 * np.abs(finite - bamberger).sum()),
+                "expected_distance_difference": float(
+                    sum(distance * value for distance, value in zip(distances, finite))
+                    - sum(
+                        distance * value
+                        for distance, value in zip(distances, bamberger)
+                    )
+                ),
+            }
+        )
+
+    grouped: dict[tuple[str, float, str], list[float]] = defaultdict(list)
+    for row in graph_contrasts:
+        for metric in ("profile_tv", "expected_distance_difference"):
+            grouped[
+                (
+                    str(row["task"]),
+                    _float(row, "interpolation_dose"),
+                    metric,
+                )
+            ].append(_float(row, metric))
+
+    summary: list[dict[str, Any]] = []
+    for key, values in sorted(grouped.items()):
+        task, dose, metric = key
+        mean, low, high = _bootstrap_interval(
+            values,
+            replicates=int(bootstrap_replicates),
+            seed=int(bootstrap_seed)
+            + int(stable_hash({"interpolation": key}, length=8), 16),
+        )
+        summary.append(
+            {
+                "task": task,
+                "model_label": TASK_LABELS[task],
+                "interpolation_dose": float(dose),
+                "metric": metric,
+                "mean": mean,
+                "low": low,
+                "high": high,
+                "graphs": len(values),
+            }
+        )
+    return graph_contrasts, summary
 
 
 def summarise_graph_profiles(
@@ -1381,111 +1700,127 @@ def plot_model_profiles(
     return _save_figure(fig, figures_dir, filename)
 
 
-def plot_semantic_decomposition(
+def plot_interpolation_sweep(
     rows: Sequence[Mapping[str, Any]],
     *,
     figures_dir: Path,
 ) -> dict[str, str]:
-    """Plot the semantic estimand comparison in model facets."""
+    """Plot departure from Bamberger as the semantic donor fraction grows."""
 
     import matplotlib.pyplot as plt
 
     _figure_theme()
-    fig, axes = plt.subplots(
-        2,
-        2,
-        figsize=(11.8, 7.8),
-        sharex=True,
-        sharey=True,
+    fig, axes = plt.subplots(1, 2, figsize=(10.8, 4.4), sharex=True)
+    metric_specs = (
+        ("profile_tv", "Profile distance from Bamberger (TV)"),
+        (
+            "expected_distance_difference",
+            "Expected-distance difference from Bamberger",
+        ),
     )
-    maximum_distance = 0
-    for axis, task in zip(axes.reshape(-1), TASKS):
-        for draw_order, method in enumerate(DECOMPOSITION_METHODS):
+    all_doses = sorted({_float(row, "interpolation_dose") for row in rows})
+    if not all_doses:
+        raise RuntimeError("interpolation sweep is empty; rerun PHASE='all'")
+    for axis, (metric, ylabel) in zip(axes, metric_specs):
+        for draw_order, task in enumerate(TASKS):
             values = sorted(
                 (
                     row
                     for row in rows
                     if str(row["task"]) == task
-                    and str(row["channel"]) == "semantic"
-                    and str(row["method"]) == method
+                    and str(row["metric"]) == metric
                 ),
-                key=lambda row: _integer(row, "distance"),
+                key=lambda row: _float(row, "interpolation_dose"),
             )
             if not values:
                 raise RuntimeError(
-                    f"semantic decomposition is missing {method!r} for {task!r}; "
+                    f"interpolation sweep is missing {metric!r} for {task!r}; "
                     "rerun PHASE='all' with the current analysis version"
                 )
-            x = np.asarray([_integer(value, "distance") for value in values])
+            x = np.asarray([_float(value, "interpolation_dose") for value in values])
             y = np.asarray([_float(value, "mean") for value in values])
             low = np.asarray([_float(value, "low") for value in values])
             high = np.asarray([_float(value, "high") for value in values])
-            maximum_distance = max(maximum_distance, int(x.max(initial=0)))
             axis.fill_between(
                 x,
                 low,
                 high,
-                color=METHOD_COLOURS[method],
-                alpha=0.07,
+                color=MODEL_COLOURS[task],
+                alpha=0.09,
                 linewidth=0,
                 zorder=1 + draw_order,
             )
             axis.plot(
                 x,
                 y,
-                color=METHOD_COLOURS[method],
-                marker=METHOD_MARKERS[method],
-                linestyle=METHOD_LINESTYLES[method],
+                color=MODEL_COLOURS[task],
+                marker=MODEL_MARKERS[task],
+                linestyle=MODEL_LINESTYLES[task],
                 markerfacecolor="white",
-                markeredgewidth=1.0,
-                markersize=4.2,
-                linewidth=1.8,
-                label=METHOD_LABELS[method],
+                markeredgewidth=1.1,
+                markersize=5.0,
+                linewidth=1.9,
+                label=TASK_LABELS[task],
                 zorder=5 + draw_order,
             )
-        axis.set_title(TASK_LABELS[task])
-        axis.set_ylim(bottom=0)
-        axis.xaxis.set_major_locator(plt.MaxNLocator(integer=True))
+        axis.set_xscale("log")
+        axis.set_xticks(all_doses)
+        axis.set_xticklabels([f"{dose:g}" for dose in all_doses])
+        axis.set_xlabel(r"Donor-swap fraction $\alpha$")
+        axis.set_ylabel(ylabel)
+    axes[0].set_ylim(bottom=0)
+    axes[1].axhline(0, color="#666666", linewidth=0.9, zorder=0)
+    axes[0].text(
+        0.03,
+        0.95,
+        "0 = identical distance profile",
+        transform=axes[0].transAxes,
+        va="top",
+        color="#666666",
+        fontsize=8,
+    )
+    axes[1].text(
+        0.03,
+        0.95,
+        "0 = identical expected distance",
+        transform=axes[1].transAxes,
+        va="top",
+        color="#666666",
+        fontsize=8,
+    )
 
-    for axis in axes[:, 0]:
-        axis.set_ylabel("Normalised usage mass")
-    for axis in axes[-1, :]:
-        axis.set_xlabel("Shortest-path distance")
-    for axis in axes.reshape(-1):
-        axis.set_xlim(-0.15, maximum_distance + 0.15)
-
-    handles, labels = axes[0, 0].get_legend_handles_labels()
+    handles, labels = axes[0].get_legend_handles_labels()
     fig.legend(
         handles,
         labels,
         loc="upper center",
-        bbox_to_anchor=(0.5, 0.938),
-        ncol=3,
+        bbox_to_anchor=(0.5, 0.91),
+        ncol=4,
         frameon=False,
-        handlelength=3.0,
-        columnspacing=2.0,
+        handlelength=2.7,
+        columnspacing=1.4,
     )
-    fig.suptitle("Semantic distance profiles across influence estimands", fontsize=13, y=0.992)
+    fig.suptitle(
+        "Semantic distance-profile change across donor-swap magnitude",
+        fontsize=13,
+        y=0.985,
+    )
     fig.text(
         0.5,
-        0.865,
-        (
-            "Finite-response and Functional profiles share donor events; "
-            "Bamberger retains its output-centric sampling"
-        ),
+        0.82,
+        "Paired held-out graphs; mean with 95% graph-bootstrap confidence interval",
         ha="center",
         color="#666666",
         fontsize=8.5,
     )
     fig.subplots_adjust(
-        left=0.08,
+        left=0.09,
         right=0.985,
-        bottom=0.09,
-        top=0.81,
-        hspace=0.22,
-        wspace=0.10,
+        bottom=0.16,
+        top=0.75,
+        wspace=0.22,
     )
-    return _save_figure(fig, figures_dir, "zinc_semantic_estimand_decomposition")
+    return _save_figure(fig, figures_dir, "zinc_semantic_interpolation_sweep")
 
 
 def plot_expected_distance(
@@ -1582,8 +1917,13 @@ def figures(
 
     results_dir = output_dir / "results"
     donor_path = results_dir / "donor_carrier_mass.csv"
+    interpolation_path = results_dir / "semantic_interpolation_mass.csv"
     bamberger_path = results_dir / "bamberger_input_output_influence.csv"
-    if not donor_path.is_file() or not bamberger_path.is_file():
+    if (
+        not donor_path.is_file()
+        or not interpolation_path.is_file()
+        or not bamberger_path.is_file()
+    ):
         raise FileNotFoundError(
             "cached measurement CSVs are missing; run PHASE='measure' or 'all' first"
         )
@@ -1594,6 +1934,18 @@ def figures(
     bamberger_graph = graph_bamberger_profiles(
         _read_csv(bamberger_path),
         effect_floor=float(config.effect_floor),
+    )
+    interpolation_graph = graph_interpolation_profiles(
+        _read_csv(interpolation_path),
+        effect_floor=float(config.effect_floor),
+    )
+    interpolation_contrasts, interpolation_summary = (
+        summarise_interpolation_contrasts(
+            interpolation_graph,
+            bamberger_graph,
+            bootstrap_replicates=int(config.bootstrap_replicates),
+            bootstrap_seed=int(config.analysis_seed) + 300,
+        )
     )
     graph_rows = [*donor_graph, *bamberger_graph]
     profile_rows, expected_rows = summarise_graph_profiles(
@@ -1610,11 +1962,23 @@ def figures(
     _write_csv(results_dir / "distance_profile_summary.csv", profile_rows)
     _write_csv(results_dir / "dense_profile_contrasts.csv", contrast_rows)
     _write_csv(results_dir / "expected_distance_summary.csv", expected_rows)
+    _write_csv(
+        results_dir / "interpolation_graph_profiles.csv",
+        interpolation_graph,
+    )
+    _write_csv(
+        results_dir / "interpolation_graph_contrasts.csv",
+        interpolation_contrasts,
+    )
+    _write_csv(
+        results_dir / "interpolation_sweep_summary.csv",
+        interpolation_summary,
+    )
 
     figures_dir = output_dir / "figures"
     paths = {
-        "semantic_decomposition": plot_semantic_decomposition(
-            profile_rows,
+        "interpolation_sweep": plot_interpolation_sweep(
+            interpolation_summary,
             figures_dir=figures_dir,
         ),
         "semantic_functional": plot_model_profiles(
@@ -1659,7 +2023,8 @@ def figures(
                 "95% percentile bootstrap over held-out graphs; one trained "
                 "checkpoint per architecture, so intervals do not include training-seed "
                 "variance. Difference panels use paired graph-level bootstraps against "
-                "Dense GRIT."
+                "Dense GRIT; the interpolation sweep pairs each graph with its "
+                "Bamberger profile."
             ),
         },
     )
@@ -1668,6 +2033,7 @@ def figures(
         "profile_rows": profile_rows,
         "contrast_rows": contrast_rows,
         "expected_rows": expected_rows,
+        "interpolation_rows": interpolation_summary,
     }
 
 
@@ -1678,7 +2044,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--output-dir",
         default=(
             "/content/drive/MyDrive/graph_specialisation_metrics/"
-            "zinc_bamberger_functional_reach_v5"
+            "zinc_bamberger_functional_reach_v6"
         ),
     )
     parser.add_argument("--tasks", default=",".join(TASKS))
@@ -1689,6 +2055,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--semantic-donor-graphs", type=int, default=256)
     parser.add_argument("--bamberger-output-nodes", type=int, default=6)
     parser.add_argument("--bamberger-output-channels", type=int, default=8)
+    parser.add_argument(
+        "--interpolation-doses",
+        default=",".join(f"{value:g}" for value in DEFAULT_INTERPOLATION_DOSES),
+    )
+    parser.add_argument("--interpolation-batch-size", type=int, default=32)
     parser.add_argument("--effect-floor", type=float, default=1.0e-12)
     parser.add_argument("--bootstrap-replicates", type=int, default=2_000)
     parser.add_argument("--analysis-seed", type=int, default=91_021)
@@ -1710,6 +2081,12 @@ def main(argv: Sequence[str] | None = None) -> dict[str, Any]:
         semantic_donor_graphs=int(args.semantic_donor_graphs),
         bamberger_output_nodes=int(args.bamberger_output_nodes),
         bamberger_output_channels=int(args.bamberger_output_channels),
+        interpolation_doses=tuple(
+            float(value.strip())
+            for value in args.interpolation_doses.split(",")
+            if value.strip()
+        ),
+        interpolation_batch_size=int(args.interpolation_batch_size),
         effect_floor=float(args.effect_floor),
         bootstrap_replicates=int(args.bootstrap_replicates),
         analysis_seed=int(args.analysis_seed),
