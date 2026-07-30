@@ -692,6 +692,24 @@ def _pca_focus_color(label: str) -> str:
     return PCA_FOCUS_COLORS.get(str(label), SLATE)
 
 
+def _ordered_pca_categories(labels: Sequence[str]) -> list[str]:
+    """Order observed focus labels by count, with deterministic tie-breaking."""
+
+    counts = Counter(str(label) for label in labels)
+    palette_order = {
+        label: position for position, label in enumerate(PCA_FOCUS_COLORS)
+    }
+    return sorted(
+        counts,
+        key=lambda label: (
+            -counts[label],
+            palette_order.get(label, len(palette_order)),
+            label.casefold(),
+            label,
+        ),
+    )
+
+
 def plot_av_pca(
     payload: Mapping[str, Any],
     *,
@@ -709,20 +727,7 @@ def plot_av_pca(
         minimum_count=minimum_count,
     )
     counts = Counter(labels)
-    categories = [
-        label
-        for label in PCA_FOCUS_COLORS
-        if label in counts and label != "Other / rare"
-    ]
-    categories.extend(
-        sorted(
-            label
-            for label in counts
-            if label not in PCA_FOCUS_COLORS and label != "Other / rare"
-        )
-    )
-    if "Other / rare" in counts:
-        categories.append("Other / rare")
+    categories = _ordered_pca_categories(labels)
     fig, ax = plt.subplots(figsize=(8.8, 6.2), constrained_layout=True)
     labels_array = np.asarray(labels)
     for category in categories:
@@ -765,8 +770,9 @@ def plot_av_pca(
     ax.legend(
         loc="center left",
         bbox_to_anchor=(1.01, 0.5),
-        fontsize=8,
-        handletextpad=0.5,
+        fontsize=9.5,
+        markerscale=1.15,
+        handletextpad=0.55,
     )
     return fig
 
@@ -804,9 +810,9 @@ def plot_layer_av_pca_grid(
             f"layer PCA n_used={n_used} but vectors contain {num_graphs} graphs"
         )
 
-    present = {str(label) for label in labels.reshape(-1)}
-    categories = list(PCA_FOCUS_COLORS)
-    categories.extend(sorted(present.difference(PCA_FOCUS_COLORS)))
+    categories = _ordered_pca_categories(
+        [str(label) for label in labels.reshape(-1)]
+    )
     fig, axes = plt.subplots(
         int(nrows),
         int(ncols),
@@ -854,7 +860,7 @@ def plot_layer_av_pca_grid(
             [0],
             linestyle="none",
             marker="o",
-            markersize=6,
+            markersize=7,
             markerfacecolor=_pca_focus_color(category),
             markeredgecolor="white",
             markeredgewidth=0.4,
@@ -871,10 +877,10 @@ def plot_layer_av_pca_grid(
         bbox_to_anchor=(0.5, 0.018),
         ncol=legend_columns,
         frameon=False,
-        fontsize=9.5,
-        title_fontsize=11,
-        handletextpad=0.45,
-        columnspacing=1.2,
+        fontsize=10.5,
+        title_fontsize=12,
+        handletextpad=0.5,
+        columnspacing=1.25,
         borderaxespad=0,
     )
     legend.get_title().set_color(NAVY)
@@ -888,7 +894,7 @@ def plot_layer_av_pca_grid(
         left=0.045,
         right=0.992,
         top=0.90,
-        bottom=0.145,
+        bottom=0.16,
         wspace=0.24,
         hspace=0.36,
     )

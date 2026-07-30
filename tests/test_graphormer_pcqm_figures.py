@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import Counter
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -885,6 +886,9 @@ def test_av_pca_identifies_role_and_head_metrics():
         assert "Structural specialist — L7 H14" in title
         assert "D_{\\rm rel} = -0.275" in title
         assert "J = 1.234" in title
+        legend = figure.axes[0].get_legend()
+        assert legend is not None
+        assert all(text.get_fontsize() == 9.5 for text in legend.get_texts())
     finally:
         plt.close(figure)
 
@@ -967,6 +971,26 @@ def test_av_pca_focus_palette_is_stable_across_plots():
             first_colors["Ring: aromatic"],
             first_colors["other/diffuse"],
         )
+        for figure, labels in ((first, labels_a), (second, labels_b)):
+            observed = [
+                text.get_text().split(" (n=", 1)[0]
+                for text in figure.axes[0].get_legend().get_texts()
+            ]
+            counts = Counter(labels)
+            palette_order = {
+                label: position
+                for position, label in enumerate(PCA_FOCUS_COLORS)
+            }
+            expected = sorted(
+                counts,
+                key=lambda label: (
+                    -counts[label],
+                    palette_order.get(label, len(palette_order)),
+                    label.casefold(),
+                    label,
+                ),
+            )
+            assert observed == expected
     finally:
         plt.close(first)
         plt.close(second)
@@ -1088,9 +1112,31 @@ def test_layer_av_pca_grid_is_4x8_with_readable_legend_below():
 
         assert len(figure.legends) == 1
         legend = figure.legends[0]
-        assert [text.get_text() for text in legend.get_texts()] == list(
-            PCA_FOCUS_COLORS
+        observed_categories = [
+            text.get_text() for text in legend.get_texts()
+        ]
+        counts = Counter(
+            str(label)
+            for row in payload["labels"]
+            for label in row
         )
+        palette_order = {
+            label: position
+            for position, label in enumerate(PCA_FOCUS_COLORS)
+        }
+        expected_categories = sorted(
+            counts,
+            key=lambda label: (
+                -counts[label],
+                palette_order.get(label, len(palette_order)),
+                label.casefold(),
+                label,
+            ),
+        )
+        assert observed_categories == expected_categories
+        assert all(text.get_fontsize() == 10.5 for text in legend.get_texts())
+        assert legend.get_title().get_fontsize() == 12
+        assert all(handle.get_markersize() == 7 for handle in legend.legend_handles)
         assert all(
             not collection.get_rasterized()
             for axis in figure.axes
