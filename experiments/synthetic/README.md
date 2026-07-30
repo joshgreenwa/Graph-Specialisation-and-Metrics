@@ -32,6 +32,34 @@ python -m graph_specialisation_metrics.synthetic.saturation_carriage \
   --seeds 0,1,2,3
 ```
 
+## Learned softmax routing: finite versus local carriage
+
+`analysis/softmax_routing_carriage_colab.py` is the more realistic follow-up. Each graph contains
+a categorical query source, a near carrier, and a randomly ordered record for every key at a
+controlled far distance. Record payloads vary independently, and the regression target is the
+sum of a query-local code and the payload at the uniquely matching record. A tiny compatibility
+model must therefore learn key-value routing through an ordinary softmax.
+
+Every semantic donor is another key already represented in the same graph. The hard-routing
+teacher identifies the exact carriers that should change, providing an eventwise oracle. The
+experiment compares this oracle with canonical finite Functional carriage and with the clean
+Jacobian projected onto the same donor direction. Scaling the learned attention logits changes
+routing confidence without changing the selected key.
+
+The default run trains four seeds and caches checkpoints, measurements, CSV/JSON tables, and the
+PNG/PDF paper figure under
+`MyDrive/graph_specialisation_metrics/softmax_routing_carriage_v1/`. The Colab frontend displays
+the generated PNG inline as well as saving it. Set `PHASE = "figures"` for model-free regeneration.
+
+Local equivalent:
+
+```bash
+python -m graph_specialisation_metrics.synthetic.softmax_routing_carriage \
+  --phase all \
+  --output-dir outputs/softmax_routing_carriage_v1 \
+  --seeds 0,1,2,3
+```
+
 ## Fixed-N associative recall: canonical analysis
 
 `training/nar_grit_colab.py` trains the three-seed 1-hop, 2-hop, and dense fixed-N GRIT

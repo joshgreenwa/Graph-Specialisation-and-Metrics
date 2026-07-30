@@ -43,6 +43,12 @@ def run_saturation_carriage(*args, **kwargs):
     return main(*args, **kwargs)
 
 
+def run_softmax_routing_carriage(*args, **kwargs):
+    from .softmax_routing_carriage import main
+
+    return main(*args, **kwargs)
+
+
 __all__ = [
     "run_nar_causal_transition",
     "run_nar_canonical_analysis",
@@ -51,4 +57,5 @@ __all__ = [
     "run_nar_methodology_paper",
     "run_nar_methodology_paper_v3",
     "run_saturation_carriage",
+    "run_softmax_routing_carriage",
 ]
