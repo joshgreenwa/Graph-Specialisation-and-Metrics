@@ -424,14 +424,14 @@ def audit_existing_pe_refinement_cache(config: PERefinementConfig) -> int:
             try:
                 try:
                     payload = torch.load(
-                        path,
+                        str(path),
                         map_location="cpu",
                         weights_only=False,
                         mmap=True,
                     )
-                except (TypeError, RuntimeError):
+                except (TypeError, ValueError, RuntimeError):
                     payload = torch.load(
-                        path,
+                        str(path),
                         map_location="cpu",
                         weights_only=False,
                     )

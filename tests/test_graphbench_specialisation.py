@@ -1161,6 +1161,16 @@ def test_pe_refinement_preflight_audits_existing_shards_without_loading_model(
         "_repository_commit",
         lambda: "commit-after-fix",
     )
+    original_torch_load = torch.load
+
+    def torch_22_compatible_load(path, *args, **kwargs):
+        if kwargs.get("mmap") and not isinstance(path, str):
+            raise ValueError(
+                "f must be a string filename in order to use mmap argument"
+            )
+        return original_torch_load(path, *args, **kwargs)
+
+    monkeypatch.setattr(torch, "load", torch_22_compatible_load)
 
     assert audit_existing_pe_refinement_cache(config) == 1
     with pytest.raises(FileNotFoundError, match="required PE-refinement cache"):
