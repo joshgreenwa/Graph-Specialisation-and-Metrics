@@ -20,7 +20,7 @@ from urllib.parse import quote
 
 
 REPOSITORY_URL = "https://github.com/joshgreenwa/Graph-Specialisation-and-Metrics.git"
-REPOSITORY_BRANCH = "main"
+REPOSITORY_BRANCH = "expansion/carriage_experiments"
 COLAB_REPOSITORY = Path("/content/Graph-Specialisation-and-Metrics")
 SECRET_NAME = "dissertation_key"
 
