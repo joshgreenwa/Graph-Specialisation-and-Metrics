@@ -203,6 +203,80 @@ def _repository_commit() -> str:
         return "unknown"
 
 
+def _cache_scientific_contract(
+    contract: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Return cache-validity fields while retaining the checkout as provenance."""
+
+    record = dict(contract)
+    record.pop("repository_commit", None)
+    return record
+
+
+def _cache_scientific_fingerprint(contract: Mapping[str, Any]) -> str:
+    return stable_hash(_cache_scientific_contract(contract))
+
+
+def _contract_difference_fields(
+    stored: Mapping[str, Any],
+    expected: Mapping[str, Any],
+) -> list[str]:
+    return [
+        str(key)
+        for key in sorted(set(stored) | set(expected))
+        if stored.get(key) != expected.get(key)
+    ]
+
+
+def _validate_protected_metadata(
+    metadata: Any,
+    expected_contract: Mapping[str, Any],
+    *,
+    path: Path,
+) -> None:
+    """Validate both current and legacy commit-bound PE-refinement caches."""
+
+    if not isinstance(metadata, Mapping):
+        raise StaleCacheError(
+            f"protected PE-refinement shard has malformed metadata: {path}"
+        )
+    stored_contract = metadata.get("contract")
+    if not isinstance(stored_contract, Mapping):
+        raise StaleCacheError(
+            f"protected PE-refinement shard has a malformed contract: {path}"
+        )
+    claimed = metadata.get("fingerprint")
+    stored_scientific = _cache_scientific_fingerprint(stored_contract)
+    legacy_claim = stable_hash(dict(stored_contract))
+    # Earlier v1 shards included repository_commit in the validity fingerprint.
+    # Accept that representation when it is internally consistent, then compare
+    # only the scientific contract below.
+    if claimed not in {stored_scientific, legacy_claim}:
+        raise StaleCacheError(
+            f"protected PE-refinement shard has an internally inconsistent "
+            f"fingerprint: {path}"
+        )
+    provenance_claim = metadata.get("provenance_fingerprint")
+    if provenance_claim is not None and provenance_claim != legacy_claim:
+        raise StaleCacheError(
+            f"protected PE-refinement shard has an internally inconsistent "
+            f"provenance fingerprint: {path}"
+        )
+    expected_scientific = _cache_scientific_fingerprint(expected_contract)
+    if stored_scientific != expected_scientific:
+        differing = _contract_difference_fields(
+            _cache_scientific_contract(stored_contract),
+            _cache_scientific_contract(expected_contract),
+        )
+        detail = ", ".join(differing[:8]) or "unknown"
+        if len(differing) > 8:
+            detail += f", +{len(differing) - 8} more"
+        raise StaleCacheError(
+            f"protected PE-refinement shard has another scientific contract: "
+            f"{path}; differing fields: {detail}"
+        )
+
+
 class ProtectedShardStore:
     """Atomic, contract-bound shards shared safely across component jobs."""
 
@@ -224,7 +298,10 @@ class ProtectedShardStore:
             "repository_commit": _repository_commit(),
             "namespace": self.namespace,
         }
-        self.fingerprint = stable_hash(self.contract)
+        # The exact checkout is retained for provenance. Scientific compatibility
+        # is governed by the registered methodology/configuration fields, so an
+        # audit-only or plotting commit does not invalidate expensive tensors.
+        self.fingerprint = _cache_scientific_fingerprint(self.contract)
 
     def path(self, stage: str, name: str) -> Path:
         return self.root / stage / f"{name}.pt"
@@ -239,12 +316,12 @@ class ProtectedShardStore:
             payload = torch.load(path, map_location="cpu", weights_only=False)
         except (OSError, RuntimeError, EOFError) as error:
             raise StaleCacheError(f"protected PE-refinement shard is unreadable: {path}") from error
-        metadata = payload.get("metadata", {}) if isinstance(payload, Mapping) else {}
-        if metadata.get("fingerprint") != self.fingerprint:
+        if not isinstance(payload, Mapping):
             raise StaleCacheError(
-                f"protected PE-refinement shard has another contract: {path}; "
-                "select a new output root"
+                f"protected PE-refinement shard is malformed: {path}"
             )
+        metadata = payload.get("metadata", {})
+        _validate_protected_metadata(metadata, self.contract, path=path)
         return payload.get("value")
 
     def save(self, stage: str, name: str, value: Any) -> Path:
@@ -257,6 +334,7 @@ class ProtectedShardStore:
         payload = {
             "metadata": {
                 "fingerprint": self.fingerprint,
+                "provenance_fingerprint": stable_hash(self.contract),
                 "contract": self.contract,
             },
             "value": value,
@@ -273,6 +351,7 @@ class ProtectedShardStore:
             {
                 "metadata": {
                     "fingerprint": self.fingerprint,
+                    "provenance_fingerprint": stable_hash(self.contract),
                     "contract": self.contract,
                 },
                 "value": value,
@@ -294,6 +373,101 @@ def _checkpoint_path(config: PERefinementConfig, seed: int) -> Path:
 @lru_cache(maxsize=16)
 def _cached_checkpoint_sha(path: str) -> str:
     return checkpoint_sha256(Path(path))
+
+
+def _registered_split_sizes(config: PERefinementConfig) -> RunSizes:
+    return RunSizes(
+        discovery_graphs=int(config.sizes.discovery_graphs),
+        causal_graphs=int(config.sizes.causal_graphs),
+        clean_ablation_graphs=int(config.sizes.clean_ablation_graphs),
+        semantic_donor_graphs=int(config.sizes.semantic_donor_graphs),
+        sources_per_graph=16,
+        donors_per_source=int(config.sizes.donors_per_source),
+    )
+
+
+def audit_existing_pe_refinement_cache(config: PERefinementConfig) -> int:
+    """Fail on incompatible/corrupt existing shards before submitting GPU jobs."""
+
+    import torch
+
+    config.validate()
+    # Production preflight already requires the registered 40k-train/4k-validation
+    # subset caches. Computing the deterministic split here avoids loading GRIT or
+    # the dataset merely to validate existing result metadata.
+    splits = deterministic_splits(
+        4_000,
+        40_000,
+        _registered_split_sizes(config),
+        int(config.analysis_seed),
+        same_index_space=False,
+    )
+    checked = 0
+    for seed in config.seeds:
+        seed = int(seed)
+        seed_dir = config.root / TASK_NAME / f"seed_{seed}"
+        checkpoint = _checkpoint_path(config, seed).expanduser().resolve()
+        expected_checkpoint = _cached_checkpoint_sha(str(checkpoint))
+        for path in sorted(seed_dir.rglob("*.pt")):
+            relative = path.relative_to(seed_dir)
+            if "_stale" in relative.parts:
+                continue
+            if not relative.parts:
+                continue
+            namespace = relative.parts[0]
+            if namespace == "arms":
+                if len(relative.parts) < 2:
+                    raise StaleCacheError(
+                        f"cannot infer arm namespace for protected cache: {path}"
+                    )
+                namespace = f"arms/{relative.parts[1]}"
+            try:
+                try:
+                    payload = torch.load(
+                        path,
+                        map_location="cpu",
+                        weights_only=False,
+                        mmap=True,
+                    )
+                except (TypeError, RuntimeError):
+                    payload = torch.load(
+                        path,
+                        map_location="cpu",
+                        weights_only=False,
+                    )
+            except (OSError, RuntimeError, EOFError) as error:
+                raise StaleCacheError(
+                    f"protected PE-refinement shard is unreadable during "
+                    f"preflight: {path}"
+                ) from error
+            if not isinstance(payload, Mapping):
+                raise StaleCacheError(
+                    f"protected PE-refinement shard is malformed during "
+                    f"preflight: {path}"
+                )
+            expected = {
+                "version": PE_REFINEMENT_VERSION,
+                "scientific_fingerprint": config.fingerprint,
+                "task": TASK_NAME,
+                "seed": seed,
+                "checkpoint_sha256": expected_checkpoint,
+                "split_fingerprint": splits.fingerprint,
+                "repository_commit": _repository_commit(),
+                "namespace": namespace,
+            }
+            _validate_protected_metadata(
+                payload.get("metadata", {}),
+                expected,
+                path=path,
+            )
+            checked += 1
+            del payload
+    print(
+        f"[OK] existing PE-refinement cache contracts: {checked} shard(s) "
+        "compatible",
+        flush=True,
+    )
+    return checked
 
 
 def prepare_pe_refinement(
@@ -339,18 +513,10 @@ def prepare_pe_refinement(
         np.asarray([1.0], dtype=np.float64),
         jacobian_output_chunk=int(config.execution.jacobian_output_chunk),
     )
-    split_sizes = RunSizes(
-        discovery_graphs=int(config.sizes.discovery_graphs),
-        causal_graphs=int(config.sizes.causal_graphs),
-        clean_ablation_graphs=int(config.sizes.clean_ablation_graphs),
-        semantic_donor_graphs=int(config.sizes.semantic_donor_graphs),
-        sources_per_graph=16,
-        donors_per_source=int(config.sizes.donors_per_source),
-    )
     splits = deterministic_splits(
         len(runtime.eval_ds),
         len(runtime.donor_ds),
-        split_sizes,
+        _registered_split_sizes(config),
         int(config.analysis_seed),
         same_index_space=False,
     )
@@ -1976,8 +2142,9 @@ def _read_protected(
     if not path.exists():
         raise FileNotFoundError(f"required PE-refinement cache is missing: {path}")
     payload = torch.load(path, map_location="cpu", weights_only=False)
-    metadata = payload.get("metadata", {}) if isinstance(payload, Mapping) else {}
-    contract = metadata.get("contract", {})
+    if not isinstance(payload, Mapping):
+        raise StaleCacheError(f"required PE-refinement cache is malformed: {path}")
+    metadata = payload.get("metadata", {})
     expected_checkpoint = _cached_checkpoint_sha(
         str(_checkpoint_path(config, seed).expanduser().resolve())
     )
@@ -1990,14 +2157,14 @@ def _read_protected(
         "repository_commit": _repository_commit(),
         "namespace": namespace,
     }
-    for key, value in expected.items():
-        if contract.get(key) != value:
-            raise StaleCacheError(
-                f"cache contract field {key!r} differs in {path}: "
-                f"{contract.get(key)!r} != {value!r}"
-            )
-    if metadata.get("fingerprint") != stable_hash(contract):
-        raise StaleCacheError(f"cache fingerprint is internally inconsistent: {path}")
+    stored_contract = (
+        metadata.get("contract", {}) if isinstance(metadata, Mapping) else {}
+    )
+    if isinstance(stored_contract, Mapping) and "split_fingerprint" in stored_contract:
+        # Finalization does not rebuild the dataset, but the stored split remains a
+        # required scientific identity field and is checked for internal consistency.
+        expected["split_fingerprint"] = stored_contract["split_fingerprint"]
+    _validate_protected_metadata(metadata, expected, path=path)
     return payload["value"]
 
 
@@ -3474,7 +3641,6 @@ def finalize_pe_refinement(
         expected_lock = {
             "version": PE_REFINEMENT_VERSION,
             "scientific_fingerprint": config.fingerprint,
-            "repository_commit": _repository_commit(),
             "refinement_summary": str(refinement),
             "refinement_summary_sha256": (
                 checkpoint_sha256(refinement) if refinement.exists() else None
@@ -3615,7 +3781,6 @@ def lock_pe_refinement_selection(
     expected_summary = {
         "version": PE_REFINEMENT_VERSION,
         "scientific_fingerprint": config.fingerprint,
-        "repository_commit": _repository_commit(),
         "task": TASK_NAME,
         "split": "refinement",
     }
@@ -3644,7 +3809,9 @@ def lock_pe_refinement_selection(
     }
     if path.exists():
         existing = json.loads(path.read_text(encoding="utf-8"))
-        if existing != payload:
+        if _cache_scientific_contract(existing) != _cache_scientific_contract(
+            payload
+        ):
             raise RuntimeError(
                 f"selection lock already exists with another choice: {path}"
             )

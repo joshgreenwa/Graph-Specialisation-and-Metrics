@@ -9,6 +9,7 @@ ENV_ACTIVATE="${ENV_ACTIVATE:-${HPC_ROOT}/activate_graphbench_algoreas}"
 PROFILE="${PROFILE:-production}"
 SEEDS="${SEEDS:-0,1,2,3}"
 MAX_PARALLEL="${MAX_PARALLEL:-4}"
+COMMON_ARRAY="${COMMON_ARRAY:-0-11}"
 GRAPHBENCH_ANALYSIS_OUTPUT_ROOT="${GRAPHBENCH_ANALYSIS_OUTPUT_ROOT:-/rds/user/jgg45/hpc-work/graphbench-algoreas/outputs/grit_specialisation_bipartite_pe_refinement_v1}"
 GRAPHBENCH_TRAINING_OUTPUT_ROOT="${GRAPHBENCH_TRAINING_OUTPUT_ROOT:-/rds/user/jgg45/hpc-work/graphbench-algoreas/outputs/graphbench_algoreas_hpc_base_v1}"
 GRAPHBENCH_DATASET_ROOT="${GRAPHBENCH_DATASET_ROOT:-/rds/user/jgg45/hpc-work/graphbench-algoreas/datasets}"
@@ -41,6 +42,10 @@ if [[ "${PROFILE}" != "production" && "${PROFILE}" != "smoke" ]]; then
 fi
 if [[ ! "${MAX_PARALLEL}" =~ ^[1-9][0-9]*$ ]]; then
   echo "MAX_PARALLEL must be a positive integer" >&2
+  exit 2
+fi
+if [[ "${COMMON_ARRAY}" != "0-11" && "${COMMON_ARRAY}" != "4-7" ]]; then
+  echo "COMMON_ARRAY must be 0-11 (full run) or 4-7 (causal recovery)" >&2
   exit 2
 fi
 for VALUE_NAME in GRAPHS_PER_BATCH HEAD_BATCH_SIZE REPLICA_PAIR_BUDGET JACOBIAN_OUTPUT_CHUNK; do
@@ -96,7 +101,7 @@ COMMON_JOB="$(
   sbatch --parsable \
     -A mlmi-jgg45-sl2-gpu -p ampere --qos=gpu1 \
     --nodes=1 --ntasks=1 --gres=gpu:1 \
-    --array="0-11%${MAX_PARALLEL}" \
+    --array="${COMMON_ARRAY}%${MAX_PARALLEL}" \
     --job-name=gb-pe-common \
     --chdir="${PROJECT_ROOT}" \
     --output="${HPC_ROOT}/logs/%x-%A-%a.out" \

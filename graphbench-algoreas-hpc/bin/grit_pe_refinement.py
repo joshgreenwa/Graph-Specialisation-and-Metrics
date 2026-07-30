@@ -19,6 +19,7 @@ from graph_specialisation_metrics.methodology.graphbench_pe_refinement import ( 
     STRUCTURAL_ARMS,
     PERefinementConfig,
     PERefinementSizes,
+    audit_existing_pe_refinement_cache,
     finalize_pe_refinement,
     lock_pe_refinement_selection,
     run_arm_component,
@@ -186,6 +187,7 @@ def _preflight(config: PERefinementConfig) -> None:
     print(f"[OK] PE cache: {cache_namespace}")
     print(f"[OK] output: {config.output_dir}")
     print(f"[OK] fingerprint: {config.fingerprint}")
+    audit_existing_pe_refinement_cache(config)
 
 
 def main(argv: Sequence[str] | None = None) -> None:

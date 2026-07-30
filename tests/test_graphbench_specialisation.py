@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -15,6 +16,10 @@ from graph_specialisation_metrics.methodology.bootstrap import (
     paired_channel_percentile_interval,
 )
 from graph_specialisation_metrics.methodology.carriage import beneficial_carriage
+from graph_specialisation_metrics.methodology.cache import (
+    StaleCacheError,
+    checkpoint_sha256,
+)
 from graph_specialisation_metrics.methodology.graphbench import (
     GraphBenchEdgeDonorPool,
     GraphBenchGritBackend,
@@ -31,10 +36,13 @@ from graph_specialisation_metrics.methodology.graphbench_pe_refinement import (
     PERefinementConfig,
     PERefinementSizes,
     PreparedPERefinement,
+    ProtectedShardStore,
     _candidate_public_summary,
     _causal_graph,
     _permuted_spearman_values,
+    _registered_split_sizes,
     _run_causal_component,
+    audit_existing_pe_refinement_cache,
     render_refinement_figures,
     run_common_ablation,
     semantic_event_manifest,
@@ -45,6 +53,8 @@ from graph_specialisation_metrics.methodology.protocol import (
     MethodologyConfig,
     RunSizes,
     SplitManifest,
+    deterministic_splits,
+    stable_hash,
 )
 from graph_specialisation_metrics.methodology.runner import (
     PreparedTask,
@@ -995,6 +1005,158 @@ def test_pe_refinement_causal_component_resumes_with_manifest_validation(tmp_pat
 
     assert first["manifest_hash"] == resumed["manifest_hash"]
     assert first["support"] == resumed["support"]
+
+
+def test_pe_refinement_cache_accepts_legacy_commit_bound_fingerprint(
+    tmp_path,
+    monkeypatch,
+):
+    config = PERefinementConfig(
+        output_dir=str(tmp_path / "analysis"),
+        training_output_root=str(tmp_path / "training"),
+        dataset_root=str(tmp_path / "dataset"),
+        pe_cache_root=str(tmp_path / "pe"),
+        runner_path=str(tmp_path / "runner.py"),
+        sizes=PERefinementSizes(
+            discovery_graphs=1,
+            refinement_graphs=1,
+            confirmation_graphs=1,
+            clean_ablation_graphs=1,
+            semantic_donor_graphs=1,
+            semantic_sources_per_graph=1,
+            donors_per_source=1,
+            taylor_graphs=1,
+        ),
+        accelerator="cpu",
+    )
+    prepared = SimpleNamespace(
+        config=config,
+        seed=0,
+        seed_dir=config.root / "graphbench_bipartite_matching_hard" / "seed_0",
+        checkpoint_sha="checkpoint",
+        splits=SimpleNamespace(fingerprint="split"),
+    )
+    monkeypatch.setattr(
+        "graph_specialisation_metrics.methodology.graphbench_pe_refinement."
+        "_repository_commit",
+        lambda: "commit-a",
+    )
+    original = ProtectedShardStore(prepared, "common")
+    path = original.save(
+        "clean_jacobians/taylor",
+        "graph_000093",
+        {"reusable": True},
+    )
+
+    # Recreate the v1 representation written by the original production jobs:
+    # its fingerprint included repository_commit.
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    payload["metadata"]["fingerprint"] = stable_hash(
+        payload["metadata"]["contract"]
+    )
+    payload["metadata"].pop("provenance_fingerprint")
+    torch.save(payload, path)
+    legacy_bytes = path.read_bytes()
+
+    monkeypatch.setattr(
+        "graph_specialisation_metrics.methodology.graphbench_pe_refinement."
+        "_repository_commit",
+        lambda: "commit-b",
+    )
+    resumed = ProtectedShardStore(prepared, "common")
+
+    assert resumed.fingerprint == original.fingerprint
+    assert resumed.load(
+        "clean_jacobians/taylor",
+        "graph_000093",
+    ) == {"reusable": True}
+    assert path.read_bytes() == legacy_bytes
+
+    changed_config = dataclasses.replace(config, analysis_seed=27)
+    changed = SimpleNamespace(
+        **{
+            **prepared.__dict__,
+            "config": changed_config,
+        }
+    )
+    with pytest.raises(StaleCacheError, match="scientific contract"):
+        ProtectedShardStore(changed, "common").load(
+            "clean_jacobians/taylor",
+            "graph_000093",
+        )
+
+
+def test_pe_refinement_preflight_audits_existing_shards_without_loading_model(
+    tmp_path,
+    monkeypatch,
+):
+    config = PERefinementConfig(
+        output_dir=str(tmp_path / "analysis"),
+        training_output_root=str(tmp_path / "training"),
+        dataset_root=str(tmp_path / "dataset"),
+        pe_cache_root=str(tmp_path / "pe"),
+        runner_path=str(tmp_path / "runner.py"),
+        sizes=PERefinementSizes(
+            discovery_graphs=1,
+            refinement_graphs=1,
+            confirmation_graphs=1,
+            clean_ablation_graphs=1,
+            semantic_donor_graphs=1,
+            semantic_sources_per_graph=1,
+            donors_per_source=1,
+            taylor_graphs=1,
+        ),
+        accelerator="cpu",
+    )
+    for seed in config.seeds:
+        checkpoint = (
+            Path(config.training_output_root)
+            / "bipartite_matching_hard"
+            / "grit"
+            / f"seed{seed}"
+            / "best.pt"
+        )
+        checkpoint.parent.mkdir(parents=True, exist_ok=True)
+        checkpoint.write_bytes(f"seed-{seed}".encode())
+
+    splits = deterministic_splits(
+        4_000,
+        40_000,
+        _registered_split_sizes(config),
+        config.analysis_seed,
+        same_index_space=False,
+    )
+    checkpoint = (
+        Path(config.training_output_root)
+        / "bipartite_matching_hard"
+        / "grit"
+        / "seed0"
+        / "best.pt"
+    )
+    prepared = SimpleNamespace(
+        config=config,
+        seed=0,
+        seed_dir=config.root / "graphbench_bipartite_matching_hard" / "seed_0",
+        checkpoint_sha=checkpoint_sha256(checkpoint),
+        splits=splits,
+    )
+    monkeypatch.setattr(
+        "graph_specialisation_metrics.methodology.graphbench_pe_refinement."
+        "_repository_commit",
+        lambda: "commit-before-fix",
+    )
+    ProtectedShardStore(prepared, "common").save(
+        "clean_jacobians/taylor",
+        "graph_000093",
+        {"metadata_only_preflight": True},
+    )
+    monkeypatch.setattr(
+        "graph_specialisation_metrics.methodology.graphbench_pe_refinement."
+        "_repository_commit",
+        lambda: "commit-after-fix",
+    )
+
+    assert audit_existing_pe_refinement_cache(config) == 1
 
 
 def test_graphbench_flow_backend_replays_exact_mean_max_readout():
