@@ -100,7 +100,13 @@ task/seed namespace. Its GRIT raw-logit comparison is deliberately architecture-
 node-only counterfactual versus actual relation/RRWP-conditioned logits, rather than
 Graphormer's additive dot-versus-bias decomposition. That shared diagnostic sweep also
 caches normalised clean-attention entropy for the entropy-versus-`D_rel` and
-entropy-versus-`J` figures.
+entropy-versus-`J` figures. For the eight registered ZINC heads, a separate versioned
+supplemental artifact derives the same selected-head transport-response profiles as the PCQM
+workflow directly from canonical score-cache sufficient statistics: clean attention mass by
+query-key distance above, and exact semantic/structural canonical-score contribution by
+source-carrier distance below. The response curves use the canonical within-model channel
+normalisation, reconstruct each selected head's normalised channel score, and include registered
+nested-bootstrap intervals without rerunning GRIT.
 
 Task-specific presentation can be added without changing cached measurements:
 

@@ -1025,6 +1025,281 @@ def plot_hop_attention_mass(
     return fig
 
 
+def plot_routing_transport_profiles(
+    metrics: CanonicalHeadMetrics,
+    transport_payload: Mapping[str, Any],
+    *,
+    heads: Sequence[Head] | None = None,
+    title: str = "Routing geometry and transport response",
+    dataset_label: str = "Discovery set",
+):
+    """Compare clean routing with intervention response for selected heads.
+
+    The upper panels show clean query-key attention by shortest-path distance.
+    The lower panels show the exact additive canonical score contribution by
+    source-carrier distance, separately for semantic and structural
+    interventions. Shading is the registered 95% nested-bootstrap interval.
+    """
+
+    if metrics.clean_attention_distance is None:
+        raise ValueError("score cache has no clean_attention_distance profile")
+    apply_publication_style()
+    payload_heads = tuple(
+        tuple(int(value) for value in head)
+        for head in transport_payload["heads"]
+    )
+    if not payload_heads:
+        raise ValueError("transport-profile figure needs at least one head")
+    if heads is None:
+        selected_heads = payload_heads
+        selected_positions = np.arange(len(payload_heads), dtype=np.int64)
+    else:
+        selected_heads = tuple(
+            tuple(int(value) for value in head) for head in heads
+        )
+        if not selected_heads:
+            raise ValueError("transport-profile figure needs at least one head")
+        if len(set(selected_heads)) != len(selected_heads):
+            raise ValueError("transport-profile figure heads must be unique")
+        missing = [
+            head for head in selected_heads if head not in payload_heads
+        ]
+        if missing:
+            raise ValueError(
+                f"transport payload does not contain requested heads {missing}"
+            )
+        selected_positions = np.asarray(
+            [payload_heads.index(head) for head in selected_heads],
+            dtype=np.int64,
+        )
+
+    labels = tuple(str(label) for label in transport_payload["axis"])
+    if labels != tuple(metrics.distance_axis):
+        raise ValueError(
+            "clean-attention and transport-response distance axes differ"
+        )
+    channels = transport_payload["channels"]
+    for channel in ("semantic", "structural"):
+        if channel not in channels:
+            raise ValueError(f"transport payload has no {channel!r} channel")
+        for field in ("estimate", "low", "high"):
+            values = np.asarray(
+                channels[channel][field], dtype=np.float64
+            )
+            if values.shape != (len(payload_heads), len(labels)):
+                raise ValueError(
+                    f"{channel} {field} has shape {values.shape}; expected "
+                    f"{(len(payload_heads), len(labels))}"
+                )
+
+    special_distance = np.asarray(
+        [
+            label.lower().replace(" ", "_")
+            in {"graph_token", "virtual"}
+            for label in labels
+        ]
+    )
+    x = np.arange(len(labels), dtype=np.float64)
+    x[special_distance] += 0.75
+    tick_labels = []
+    for label, special in zip(labels, special_distance):
+        if special:
+            tick_labels.append(label.replace("_", "\n").title())
+        elif label.lstrip("-").isdigit():
+            distance = int(label)
+            tick_labels.append(
+                label if distance <= 4 or distance % 2 == 0 else ""
+            )
+        else:
+            tick_labels.append(label.replace("_", "\n"))
+
+    fig, axes = plt.subplots(
+        2,
+        len(selected_heads),
+        figsize=(4.25 * len(selected_heads), 8.5),
+        sharex="col",
+        sharey="row",
+        squeeze=False,
+    )
+    response_styles = {
+        "semantic": {
+            "color": GOLD,
+            "marker": "o",
+            "label": "Semantic intervention",
+        },
+        "structural": {
+            "color": TEAL,
+            "marker": "s",
+            "label": "Structural intervention",
+        },
+    }
+
+    for column, (head, payload_position) in enumerate(
+        zip(selected_heads, selected_positions)
+    ):
+        layer, index = head
+        record = metrics.head_record(head)
+        clean = np.asarray(
+            metrics.clean_attention_distance[layer, index],
+            dtype=np.float64,
+        )
+        clean_ax = axes[0, column]
+        clean_ax.bar(
+            x,
+            clean,
+            width=0.72,
+            color=[
+                GOLD if special else TEAL
+                for special in special_distance
+            ],
+            edgecolor="white",
+            linewidth=0.55,
+        )
+        clean_ax.set_ylim(bottom=0)
+        clean_ax.set_title(
+            rf"{_head_label(head)}"
+            "\n"
+            rf"$D_{{\rm rel}}={record['selectivity']:.2f};\ "
+            rf"J={record['joint_sensitivity']:.2f}$",
+            fontsize=13.5,
+            pad=8,
+            linespacing=1.35,
+        )
+        clean_ax.grid(axis="y")
+        clean_ax.set_axisbelow(True)
+
+        response_ax = axes[1, column]
+        for channel, style in response_styles.items():
+            channel_payload = channels[channel]
+            reportable = np.asarray(
+                channel_payload["reportable"], dtype=bool
+            )
+            estimate = np.asarray(
+                channel_payload["estimate"], dtype=np.float64
+            )[payload_position].copy()
+            low = np.asarray(
+                channel_payload["low"], dtype=np.float64
+            )[payload_position].copy()
+            high = np.asarray(
+                channel_payload["high"], dtype=np.float64
+            )[payload_position].copy()
+            valid = (
+                reportable
+                & np.isfinite(estimate)
+                & np.isfinite(low)
+                & np.isfinite(high)
+            )
+            estimate[~valid] = np.nan
+            low[~valid] = np.nan
+            high[~valid] = np.nan
+            response_ax.fill_between(
+                x,
+                low,
+                high,
+                color=style["color"],
+                alpha=0.17,
+                linewidth=0,
+            )
+            response_ax.plot(
+                x,
+                estimate,
+                color=style["color"],
+                linewidth=2.0,
+                marker=style["marker"],
+                markersize=4.2,
+                markeredgecolor="white",
+                markeredgewidth=0.55,
+                label=style["label"],
+                zorder=3,
+            )
+        response_ax.set_ylim(bottom=0)
+        response_ax.grid(True)
+        response_ax.set_axisbelow(True)
+        response_ax.set_xticks(x)
+        response_ax.set_xticklabels(tick_labels)
+
+    axes[0, 0].set_ylabel("Mean clean attention mass", fontsize=11.5)
+    axes[1, 0].set_ylabel(
+        "Normalised transport response", fontsize=11.5
+    )
+    n_graphs = int(transport_payload["n_graphs"])
+    replicates = max(
+        int(channels[channel].get("replicates", 0))
+        for channel in ("semantic", "structural")
+    )
+    fig.suptitle(title, fontsize=18, y=0.988)
+    interval_text = (
+        f"; shaded bands: 95% nested bootstrap ({replicates:,} draws)"
+        if replicates
+        else ""
+    )
+    fig.text(
+        0.5,
+        0.947,
+        f"{dataset_label} ($n={n_graphs}$ molecules){interval_text}",
+        ha="center",
+        va="top",
+        fontsize=11.5,
+        color=NAVY,
+    )
+    fig.text(
+        0.5,
+        0.905,
+        "Clean routing by query-key shortest-path distance",
+        ha="center",
+        va="top",
+        fontsize=12.5,
+        color=NAVY,
+    )
+    fig.text(
+        0.5,
+        0.475,
+        "Intervention-conditioned head-output response by "
+        "source-carrier distance",
+        ha="center",
+        va="top",
+        fontsize=12.5,
+        color=NAVY,
+    )
+    fig.supxlabel(
+        "Carrier distance from intervention source",
+        fontsize=12,
+        y=0.082,
+    )
+    handles = [
+        Line2D(
+            [0],
+            [0],
+            color=style["color"],
+            linewidth=2.2,
+            marker=style["marker"],
+            markersize=5,
+            markeredgecolor="white",
+            markeredgewidth=0.55,
+            label=style["label"],
+        )
+        for style in response_styles.values()
+    ]
+    fig.legend(
+        handles=handles,
+        loc="lower center",
+        bbox_to_anchor=(0.5, 0.012),
+        ncol=2,
+        fontsize=10.5,
+        handlelength=2.6,
+        columnspacing=2.2,
+    )
+    fig.subplots_adjust(
+        left=0.065,
+        right=0.992,
+        top=0.825,
+        bottom=0.145,
+        wspace=0.14,
+        hspace=0.58,
+    )
+    return fig
+
+
 def plot_logit_spread(
     logit_payload: Mapping[str, Any],
     *,
@@ -1453,6 +1728,7 @@ __all__ = [
     "plot_joint_sensitivity_vs_attention_entropy",
     "plot_layer_av_pca_grid",
     "plot_logit_spread",
+    "plot_routing_transport_profiles",
     "plot_score_heatmaps",
     "plot_score_plane",
     "plot_selectivity_joint_plane",

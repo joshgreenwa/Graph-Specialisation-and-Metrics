@@ -51,7 +51,16 @@ all-head routed-output PCA grids share one additional contract-cached sweep. GRI
 relation conditioning is reported as such; its node-only versus relation-conditioned raw-logit
 figure is not labelled as Graphormer dot-versus-bias. The same cached diagnostic sweep records
 normalised clean-attention entropy and relates it separately to relative selectivity and joint
-sensitivity. Individual PNG/PDF/JSON figure bundles remain
+sensitivity. For ZINC, the notebook additionally reproduces the PCQM selected-head transport
+response analysis for the registered heads `(L1,H2)`, `(L1,H7)`, `(L4,H7)`, `(L6,H0)`,
+`(L6,H3)`, `(L7,H6)`, `(L9,H1)`, and `(L8,H4)`. Its upper row shows clean attention mass by
+query-key shortest-path distance, while its lower row gives the exact additive semantic and
+structural canonical-score contributions by source-carrier distance. The lower curves use the
+same within-model channel normalisation as `D_rel` and `J`, reconstruct the selected heads'
+normalised scores, and carry 95% registered nested-bootstrap intervals. The analysis is computed
+from the canonical score cache's event sufficient statistics, written once to a versioned
+supplemental cache for all eight heads, and rendered as two four-head paper-size pages without a
+model forward. Individual PNG/PDF/JSON figure bundles remain
 under each task's figure directory. The notebook also assembles ordered, multi-page PDFs in the
 shared Drive `pdf_sections` directory: `zinc_*.pdf` and `qm9_*.pdf` files for main scores, selected
 distance curves, semantic specialists, structural specialists, high-`J` generalists,

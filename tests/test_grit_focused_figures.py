@@ -7,6 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import matplotlib
+from matplotlib.collections import PolyCollection
 import numpy as np
 import pytest
 
@@ -21,6 +22,7 @@ from graph_specialisation_metrics.methodology.grit_figure_data import (  # noqa:
     _normalised_attention_entropy,
     atom_chemistry_categories,
     compute_layer_av_pca_inputs,
+    compute_selected_head_transport_profiles,
     figure_identity,
     graph_node_labels,
     label_attention_focus,
@@ -48,6 +50,7 @@ from graph_specialisation_metrics.methodology.grit_figure_plots import (  # noqa
     plot_joint_sensitivity_vs_attention_entropy,
     plot_layer_av_pca_grid,
     plot_logit_spread,
+    plot_routing_transport_profiles,
     plot_score_heatmaps,
     plot_score_plane,
     plot_selectivity_joint_plane,
@@ -94,6 +97,42 @@ def _score_value():
         "axis": ("0", "1", "2"),
         "clean_attention_distance": np.full((2, 4, 3), 1.0 / 3.0),
     }
+
+
+def _transport_score_value():
+    scores = _score_value()
+    metrics = CanonicalHeadMetrics.from_scores(scores)
+    fractions = np.asarray([0.20, 0.30, 0.50])
+    channels = {}
+    for channel, raw in (
+        ("semantic", metrics.raw_semantic),
+        ("structural", metrics.raw_structural),
+    ):
+        profile = raw[..., None] * fractions
+        graph_contribution = {
+            10: profile * 0.8,
+            20: profile * 1.2,
+        }
+        channels[channel] = {
+            "raw": raw,
+            "graph_distance_contribution": graph_contribution,
+            "distance_support": {
+                "axis": ("0", "1", "2"),
+                "reportable": np.ones(3, dtype=bool),
+            },
+            "events": [
+                {
+                    "graph_id": graph_id,
+                    "source": 0,
+                    "draw": 0,
+                    "distance_contribution": contribution,
+                }
+                for graph_id, contribution in graph_contribution.items()
+            ],
+            "resample_source": channel == "structural",
+        }
+    scores["channels"] = channels
+    return scores
 
 
 def _contract(splits: SplitManifest) -> dict:
@@ -155,6 +194,123 @@ def test_normalised_attention_entropy_has_zero_and_uniform_endpoints():
     )
     entropy = _normalised_attention_entropy(attention)
     torch.testing.assert_close(entropy, torch.asarray([1.0, 0.0]))
+
+
+def test_selected_head_transport_profiles_reconstruct_normalised_scores():
+    scores = _transport_score_value()
+    heads = ((0, 0), (1, 2))
+    payload = compute_selected_head_transport_profiles(
+        scores,
+        heads,
+        bootstrap=False,
+    )
+
+    assert payload["heads"] == heads
+    assert payload["n_graphs"] == 2
+    assert payload["graph_ids"] == (10, 20)
+    for channel in ("semantic", "structural"):
+        result = payload["channels"][channel]
+        raw = np.asarray(scores["channels"][channel]["raw"])
+        expected = raw / raw.mean()
+        assert result["replicates"] == 0
+        assert np.all(result["reportable"])
+        assert np.allclose(
+            result["estimate"].sum(axis=-1),
+            [expected[head] for head in heads],
+        )
+        assert np.allclose(result["low"], result["estimate"])
+        assert np.allclose(result["high"], result["estimate"])
+
+
+def test_selected_head_transport_profiles_use_nested_event_bootstrap(
+    monkeypatch,
+):
+    scores = _transport_score_value()
+    heads = ((0, 0), (1, 2))
+    calls = []
+
+    def fake_interval(observations, policy, *, graph_reduce):
+        calls.append((observations, policy))
+        estimate = graph_reduce(
+            np.stack(
+                [observation.value for observation in observations]
+            )
+        )
+        return SimpleNamespace(
+            estimate=estimate,
+            low=estimate * 0.9,
+            high=estimate * 1.1,
+            replicates=2000,
+            rng_seed=17071,
+            resampled_levels=("graph", "source", "donor"),
+        )
+
+    monkeypatch.setattr(
+        "graph_specialisation_metrics.methodology.grit_figure_data."
+        "nested_percentile_interval",
+        fake_interval,
+    )
+    payload = compute_selected_head_transport_profiles(scores, heads)
+
+    assert len(calls) == 2
+    assert all(len(observations) == 2 for observations, _ in calls)
+    assert calls[0][1].resample_source is False
+    assert calls[1][1].resample_source is True
+    assert all(
+        payload["channels"][channel]["replicates"] == 2000
+        for channel in ("semantic", "structural")
+    )
+
+
+def test_routing_transport_figure_facets_requested_payload_subset():
+    import matplotlib.pyplot as plt
+
+    scores = _transport_score_value()
+    metrics = CanonicalHeadMetrics.from_scores(scores)
+    payload_heads = (
+        (0, 0),
+        (0, 1),
+        (0, 2),
+        (0, 3),
+        (1, 0),
+        (1, 2),
+    )
+    displayed_heads = ((0, 1), (0, 3), (1, 0), (1, 2))
+    payload = compute_selected_head_transport_profiles(
+        scores,
+        payload_heads,
+        bootstrap=False,
+    )
+    figure = plot_routing_transport_profiles(
+        metrics,
+        payload,
+        heads=displayed_heads,
+        title="ZINC — GRIT — routing geometry and transport response",
+        dataset_label="ZINC discovery set",
+    )
+    try:
+        assert np.allclose(figure.get_size_inches(), (17.0, 8.5))
+        assert len(figure.axes) == 8
+        assert [
+            axis.get_title().splitlines()[0] for axis in figure.axes[:4]
+        ] == ["L0 H1", "L0 H3", "L1 H0", "L1 H2"]
+        assert figure.axes[0].get_ylabel() == "Mean clean attention mass"
+        assert figure.axes[4].get_ylabel() == (
+            "Normalised transport response"
+        )
+        bands = [
+            collection
+            for axis in figure.axes[4:]
+            for collection in axis.collections
+            if isinstance(collection, PolyCollection)
+        ]
+        assert len(bands) == 8
+        assert [text.get_text() for text in figure.legends[0].get_texts()] == [
+            "Semantic intervention",
+            "Structural intervention",
+        ]
+    finally:
+        plt.close(figure)
 
 
 def test_score_and_model_artifacts_are_bound_to_one_task(tmp_path: Path):
@@ -1009,6 +1165,18 @@ def test_colab_notebook_has_valid_python_cells():
     assert "GRIT_raw_attention_logit_spread_and_entropy_v2" in runtime_source
     assert (
         "grit-logit-spread-and-attention-entropy-v2" in runtime_source
+    )
+    assert "BOOTSTRAP_REPLICATES" in source
+    assert "ZINC_TRANSPORT_PROFILE_HEAD_GROUPS" in source
+    assert "((1, 2), (1, 7), (4, 7), (6, 0))" in source
+    assert "((6, 3), (7, 6), (9, 1), (8, 4))" in source
+    assert "compute_selected_head_transport_profiles(" in runtime_source
+    assert "plot_routing_transport_profiles(" in runtime_source
+    assert 'if task_name == "zinc" else ()' in runtime_source
+    assert "selected-head-transport-response-by-distance" in runtime_source
+    assert (
+        'f"routing_geometry_vs_transport_response_zinc_heads_{group_index}"'
+        in runtime_source
     )
     assert 'PDF_TASK_PREFIXES = {"zinc": "zinc", "qm9_gap_dense": "qm9"}' in source
     assert "save_section_pdf_bundles(" in runtime_source
