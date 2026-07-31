@@ -988,7 +988,7 @@ def plot_routing_transport_profiles(
     metrics: CanonicalHeadMetrics,
     transport_payload: Mapping[str, Any],
     *,
-    title: str = "Routing geometry and transport response",
+    title: str = "Distance breakdown of semantic and structural scores",
 ):
     """Compare clean routing with intervention response for selected heads.
 
@@ -1024,10 +1024,20 @@ def plot_routing_transport_profiles(
     graph_token = np.asarray(
         [label.lower().replace(" ", "_") == "graph_token" for label in labels]
     )
-    x = np.arange(len(labels), dtype=np.float64)
-    x[graph_token] += 0.75
+    numeric_distance = np.asarray(
+        [int(label) if label.lstrip("-").isdigit() else -1 for label in labels]
+    )
+    displayed = graph_token | (
+        (numeric_distance >= 0) & (numeric_distance <= 14)
+    )
+    display_labels = tuple(
+        label for label, keep in zip(labels, displayed) if keep
+    )
+    display_graph_token = graph_token[displayed]
+    x = np.arange(len(display_labels), dtype=np.float64)
+    x[display_graph_token] += 0.75
     tick_labels = []
-    for label, special in zip(labels, graph_token):
+    for label, special in zip(display_labels, display_graph_token):
         if special:
             tick_labels.append("Graph\ntoken")
         elif label.lstrip("-").isdigit():
@@ -1041,7 +1051,7 @@ def plot_routing_transport_profiles(
     fig, axes = plt.subplots(
         2,
         len(heads),
-        figsize=(4.25 * len(heads), 8.5),
+        figsize=(4.25 * len(heads), 7.7),
         sharex="col",
         sharey="row",
         squeeze=False,
@@ -1050,12 +1060,12 @@ def plot_routing_transport_profiles(
         "semantic": {
             "color": GOLD,
             "marker": "o",
-            "label": "Semantic intervention",
+            "label": "Semantic score",
         },
         "structural": {
             "color": TEAL,
             "marker": "s",
-            "label": "Structural intervention",
+            "label": "Structural score",
         },
     }
 
@@ -1064,7 +1074,7 @@ def plot_routing_transport_profiles(
         record = metrics.head_record(head)
         clean = np.asarray(
             metrics.clean_attention_distance[layer, index], dtype=np.float64
-        )
+        )[displayed]
         clean_ax = axes[0, column]
         clean_ax.bar(
             x,
@@ -1111,6 +1121,9 @@ def plot_routing_transport_profiles(
             estimate[~valid] = np.nan
             low[~valid] = np.nan
             high[~valid] = np.nan
+            estimate = estimate[displayed]
+            low = low[displayed]
+            high = high[displayed]
             response_ax.fill_between(
                 x,
                 low,
@@ -1136,52 +1149,26 @@ def plot_routing_transport_profiles(
         response_ax.set_axisbelow(True)
         response_ax.set_xticks(x)
         response_ax.set_xticklabels(tick_labels)
+        clean_ax.tick_params(axis="x", labelbottom=True)
 
     axes[0, 0].set_ylabel("Mean clean attention mass", fontsize=11.5)
     axes[1, 0].set_ylabel(
-        "Normalised transport response", fontsize=11.5
+        "Normalised score", fontsize=11.5
     )
     n_graphs = int(transport_payload["n_graphs"])
-    replicates = max(
-        int(channels[channel].get("replicates", 0))
-        for channel in ("semantic", "structural")
-    )
-    fig.suptitle(title, fontsize=18, y=0.988)
-    interval_text = (
-        f"; shaded bands: 95% nested bootstrap ({replicates:,} draws)"
-        if replicates
-        else ""
-    )
+    fig.suptitle(title, fontsize=18, y=0.985)
     fig.text(
         0.5,
-        0.947,
-        f"PCQM4Mv2 discovery set ($n={n_graphs}$ molecules){interval_text}",
+        0.943,
+        f"PCQM4Mv2 ($n = {n_graphs}$ molecules).",
         ha="center",
         va="top",
-        fontsize=11.5,
-        color=NAVY,
-    )
-    fig.text(
-        0.5,
-        0.905,
-        "Clean routing by query-key shortest-path distance",
-        ha="center",
-        va="top",
-        fontsize=12.5,
-        color=NAVY,
-    )
-    fig.text(
-        0.5,
-        0.475,
-        "Intervention-conditioned head-output response by source-carrier distance",
-        ha="center",
-        va="top",
-        fontsize=12.5,
+        fontsize=14.5,
         color=NAVY,
     )
     fig.supxlabel(
-        "Carrier distance from intervention source",
-        fontsize=12,
+        "Shortest path-distance (SPD) from intervened node",
+        fontsize=15,
         y=0.082,
     )
     handles = [
@@ -1203,17 +1190,17 @@ def plot_routing_transport_profiles(
         loc="lower center",
         bbox_to_anchor=(0.5, 0.012),
         ncol=2,
-        fontsize=10.5,
+        fontsize=13,
         handlelength=2.6,
         columnspacing=2.2,
     )
     fig.subplots_adjust(
         left=0.065,
         right=0.992,
-        top=0.825,
-        bottom=0.145,
-        wspace=0.14,
-        hspace=0.58,
+        top=0.845,
+        bottom=0.165,
+        wspace=0.08,
+        hspace=0.28,
     )
     return fig
 

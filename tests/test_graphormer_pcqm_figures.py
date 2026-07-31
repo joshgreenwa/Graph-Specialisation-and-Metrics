@@ -811,8 +811,28 @@ def test_routing_transport_figure_has_four_head_facets_and_uncertainty_bands():
     )
     figure = plot_routing_transport_profiles(metrics, payload)
     try:
-        assert np.allclose(figure.get_size_inches(), (17.0, 8.5))
+        assert np.allclose(figure.get_size_inches(), (17.0, 7.7))
         assert len(figure.axes) == 8
+        assert figure._suptitle.get_text() == (
+            "Distance breakdown of semantic and structural scores"
+        )
+        assert figure._supxlabel.get_text() == (
+            "Shortest path-distance (SPD) from intervened node"
+        )
+        assert figure._supxlabel.get_fontsize() == 15
+        subtitles = [
+            text
+            for text in figure.texts
+            if text.get_text().startswith("PCQM4Mv2")
+        ]
+        assert len(subtitles) == 1
+        assert subtitles[0].get_text() == "PCQM4Mv2 ($n = 2$ molecules)."
+        assert subtitles[0].get_fontsize() == 14.5
+        assert not any(
+            "Clean routing" in text.get_text()
+            or "Intervention-conditioned" in text.get_text()
+            for text in figure.texts
+        )
         assert [axis.get_title().splitlines()[0] for axis in figure.axes[:4]] == [
             "L0 H0",
             "L0 H1",
@@ -820,7 +840,11 @@ def test_routing_transport_figure_has_four_head_facets_and_uncertainty_bands():
             "L1 H2",
         ]
         assert figure.axes[0].get_ylabel() == "Mean clean attention mass"
-        assert figure.axes[4].get_ylabel() == "Normalised transport response"
+        assert figure.axes[4].get_ylabel() == "Normalised score"
+        assert all(
+            any(label.get_visible() for label in axis.get_xticklabels())
+            for axis in figure.axes[:4]
+        )
         bands = [
             collection
             for axis in figure.axes[4:]
@@ -830,9 +854,71 @@ def test_routing_transport_figure_has_four_head_facets_and_uncertainty_bands():
         assert len(bands) == 8
         assert len(figure.legends) == 1
         assert [text.get_text() for text in figure.legends[0].get_texts()] == [
-            "Semantic intervention",
-            "Structural intervention",
+            "Semantic score",
+            "Structural score",
         ]
+        assert all(
+            text.get_fontsize() == 13
+            for text in figure.legends[0].get_texts()
+        )
+    finally:
+        plt.close(figure)
+
+
+def test_routing_transport_figure_caps_spd_at_14_and_keeps_graph_token():
+    labels = tuple(str(distance) for distance in range(17)) + ("graph_token",)
+    values = np.linspace(0.02, 0.20, len(labels), dtype=np.float64)
+    metrics = SimpleNamespace(
+        distance_axis=labels,
+        clean_attention_distance=values.reshape(1, 1, -1),
+        head_record=lambda head: {
+            "selectivity": 0.25,
+            "joint_sensitivity": 1.1,
+        },
+    )
+    channel = {
+        "estimate": values.reshape(1, -1),
+        "low": np.clip(values - 0.01, 0.0, None).reshape(1, -1),
+        "high": (values + 0.01).reshape(1, -1),
+        "reportable": np.ones(len(labels), dtype=bool),
+        "replicates": 2000,
+    }
+    payload = {
+        "heads": ((0, 0),),
+        "axis": labels,
+        "n_graphs": 128,
+        "channels": {"semantic": channel, "structural": channel},
+    }
+
+    figure = plot_routing_transport_profiles(metrics, payload)
+    try:
+        top_axis, bottom_axis = figure.axes
+        expected_labels = [
+            "0",
+            "1",
+            "2",
+            "3",
+            "4",
+            "",
+            "6",
+            "",
+            "8",
+            "",
+            "10",
+            "",
+            "12",
+            "",
+            "14",
+            "Graph\ntoken",
+        ]
+        assert [text.get_text() for text in top_axis.get_xticklabels()] == (
+            expected_labels
+        )
+        assert [text.get_text() for text in bottom_axis.get_xticklabels()] == (
+            expected_labels
+        )
+        assert len(top_axis.patches) == 16
+        assert all(len(line.get_xdata()) == 16 for line in bottom_axis.lines)
     finally:
         plt.close(figure)
 
