@@ -47,6 +47,31 @@ def _graph_major_order(graph_index):
     return torch.argsort(graph_index, stable=True)
 
 
+def _graph_diameter(data) -> int:
+    """Exact undirected diameter for one small molecular graph."""
+
+    edge_index = data.edge_index.detach().cpu().numpy()
+    nodes = int(data.num_nodes)
+    adjacency: list[list[int]] = [[] for _ in range(nodes)]
+    for left, right in edge_index.T:
+        adjacency[int(left)].append(int(right))
+        adjacency[int(right)].append(int(left))
+    diameter = 0
+    for source in range(nodes):
+        distances = [-1] * nodes
+        distances[source] = 0
+        queue = [source]
+        for node in queue:
+            for neighbour in adjacency[node]:
+                if distances[neighbour] < 0:
+                    distances[neighbour] = distances[node] + 1
+                    queue.append(neighbour)
+        finite = [distance for distance in distances if distance >= 0]
+        if finite:
+            diameter = max(diameter, max(finite))
+    return int(diameter)
+
+
 def _enable_grit_reregistration() -> None:
     """Backward-compatible alias for the shared carriage/specialisation registry guard."""
     from ..carriage.env import enable_grit_reregistration
@@ -228,7 +253,10 @@ class GritHeadModel:
                        or (self.task.paper_metric[0] if self.task.paper_metric else "metric"))
         if sc.eval_metric:
             t0 = time.perf_counter()
-            preds, trues = self._collect_preds(loaders[2])
+            preds, trues, test_metadata = self._collect_preds(
+                loaders[2],
+                collect_metadata=True,
+            )
             test_metric = float(self.task.metric_fn(preds, trues))
             pm = f" (paper {self.task.paper_metric[0]} ~{self.task.paper_metric[1]})" if self.task.paper_metric else ""
             log(f"[verify] test {metric_name} recomputed from checkpoint: {test_metric:.5f}{pm} "
@@ -243,6 +271,9 @@ class GritHeadModel:
                     f"not load correctly. Refusing to report specialisation scores.")
             self.test_metric = test_metric
             self.checks["test_metric"] = test_metric
+            self.test_predictions = preds
+            self.test_targets = trues
+            self.test_graph_metadata = test_metadata
             # Validation metric alongside test (loaders[1]=val), for reporting only -- no abort.
             t0 = time.perf_counter()
             vpreds, vtrues = self._collect_preds(loaders[1])
@@ -256,20 +287,41 @@ class GritHeadModel:
             self.checks["test_metric"] = None
             self.val_metric = None
             self.checks["val_metric"] = None
+            self.test_predictions = None
+            self.test_targets = None
+            self.test_graph_metadata = None
         self.checks["test_metric_name"] = metric_name
         self.checks["val_metric_name"] = metric_name
         return self
 
-    def _collect_preds(self, loader):
+    def _collect_preds(self, loader, *, collect_metadata: bool = False):
         import torch
         ps, ts = [], []
+        metadata: list[dict[str, int]] = []
+        graph_index = 0
         with torch.no_grad():
             for batch in loader:
+                if collect_metadata:
+                    for graph in batch.to_data_list():
+                        metadata.append(
+                            {
+                                "graph": int(graph_index),
+                                "num_nodes": int(graph.num_nodes),
+                                "diameter": _graph_diameter(graph),
+                            }
+                        )
+                        graph_index += 1
                 batch = batch.to(self.device)
                 pred, true = self.model(batch)
                 ps.append(pred.detach().cpu().numpy().reshape(pred.shape[0], -1))
                 ts.append(true.detach().cpu().numpy().reshape(true.shape[0], -1))
-        return np.concatenate(ps), np.concatenate(ts)
+        predictions = np.concatenate(ps)
+        targets = np.concatenate(ts)
+        if collect_metadata:
+            if len(metadata) != int(predictions.shape[0]):
+                raise RuntimeError("test metadata and predictions lost graph alignment")
+            return predictions, targets, metadata
+        return predictions, targets
 
     # ---- per-head capture ------------------------------------------------------------
     def capture(self, batch, *, want_grad: bool, want_attn: bool = False,

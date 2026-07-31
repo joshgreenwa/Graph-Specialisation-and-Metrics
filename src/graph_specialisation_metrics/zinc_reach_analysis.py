@@ -940,6 +940,44 @@ def _save_shard(path: Path, payload: Mapping[str, Any]) -> None:
     os.replace(temporary, path)
 
 
+def _full_test_rows(
+    config: ZincReachConfig,
+    prepared: Any,
+    *,
+    task: str,
+) -> list[dict[str, Any]]:
+    """Return checkpoint-recomputed per-molecule test errors and scale metadata."""
+
+    predictions = getattr(prepared.runtime, "test_predictions", None)
+    targets = getattr(prepared.runtime, "test_targets", None)
+    metadata = getattr(prepared.runtime, "test_graph_metadata", None)
+    if predictions is None or targets is None or metadata is None:
+        raise RuntimeError("full-test predictions were not retained by the GRIT loader")
+    predictions = np.asarray(predictions, dtype=np.float64)
+    targets = np.asarray(targets, dtype=np.float64)
+    if predictions.shape != targets.shape or len(metadata) != int(predictions.shape[0]):
+        raise RuntimeError("full-test prediction, target and metadata rows are misaligned")
+    errors = np.abs(predictions - targets).mean(axis=1)
+    output: list[dict[str, Any]] = []
+    for index, meta in enumerate(metadata):
+        output.append(
+            {
+                "analysis_version": config.profile.analysis_version,
+                "fingerprint": config.fingerprint,
+                "task": task,
+                "model_label": TASK_LABELS[task],
+                "seed": int(config.seed),
+                "test_graph": int(meta["graph"]),
+                "num_nodes": int(meta["num_nodes"]),
+                "diameter": int(meta["diameter"]),
+                "prediction": float(predictions[index].mean()),
+                "target": float(targets[index].mean()),
+                "graph_mae": float(errors[index]),
+            }
+        )
+    return output
+
+
 def measure(
     config: ZincReachConfig,
     *,
@@ -976,6 +1014,7 @@ def measure(
     interpolation_rows: list[dict[str, Any]] = []
     bamberger_rows: list[dict[str, Any]] = []
     graph_records: list[dict[str, Any]] = []
+    full_test_records: list[dict[str, Any]] = []
     health: list[dict[str, Any]] = []
     completed = 0
     total = len(config.tasks) * int(config.graphs)
@@ -998,6 +1037,11 @@ def measure(
                 "parameters": prepared.runtime.checks.get("num_parameters"),
             }
         )
+        full_test_records.extend(
+            _full_test_rows(config, prepared, task=task)
+        )
+        results_dir = output_dir / "results"
+        _write_csv(results_dir / "full_test_metrics.csv", full_test_records)
         graph_ids = tuple(prepared.splits.discovery)[: int(config.graphs)]
         for graph_id in graph_ids:
             path = _shard_path(output_dir, task, int(graph_id))
@@ -1046,6 +1090,7 @@ def measure(
             "interpolation_rows": len(interpolation_rows),
             "bamberger_rows": len(bamberger_rows),
             "graph_metric_rows": len(graph_records),
+            "full_test_metric_rows": len(full_test_records),
             "comparison_scope": {
                 "semantic": (
                     "literal Bamberger pre-pooling Jacobian proxy and task-projected "
@@ -1100,6 +1145,7 @@ def measure(
         "interpolation_rows": interpolation_rows,
         "bamberger_rows": bamberger_rows,
         "graph_records": graph_records,
+        "full_test_records": full_test_records,
         "health": health,
     }
 
@@ -1556,30 +1602,132 @@ def summarise_graph_profiles(
     return profiles, expected
 
 
+def _adaptive_scale_bins(
+    values_by_graph: Mapping[int, int],
+) -> tuple[dict[int, int], dict[int, str], dict[int, float], dict[int, int]]:
+    """Merge adjacent integer values toward equal-count, density-adaptive bins."""
+
+    frequencies: dict[int, int] = defaultdict(int)
+    for value in values_by_graph.values():
+        frequencies[int(value)] += 1
+    if not frequencies:
+        raise ValueError("cannot bin an empty scale descriptor")
+    observations = len(values_by_graph)
+    maximum_bins = min(len(frequencies), min(12, max(4, round(np.sqrt(observations)))))
+    provisional: dict[int, list[int]] = defaultdict(list)
+    cumulative = 0
+    for value, count in sorted(frequencies.items()):
+        midpoint = cumulative + 0.5 * int(count)
+        quantile_bin = min(
+            maximum_bins - 1,
+            int(midpoint * maximum_bins / observations),
+        )
+        provisional[quantile_bin].append(int(value))
+        cumulative += int(count)
+    grouped_values = list(provisional.values())
+
+    value_to_bin = {
+        value: bin_index
+        for bin_index, values in enumerate(grouped_values)
+        for value in values
+    }
+    graph_bins = {
+        int(graph): int(value_to_bin[int(value)])
+        for graph, value in values_by_graph.items()
+    }
+    labels: dict[int, str] = {}
+    means: dict[int, float] = {}
+    counts: dict[int, int] = {}
+    for bin_index, bin_values in enumerate(grouped_values):
+        value_set = set(bin_values)
+        members = [
+            int(value)
+            for value in values_by_graph.values()
+            if int(value) in value_set
+        ]
+        labels[bin_index] = (
+            str(min(bin_values))
+            if min(bin_values) == max(bin_values)
+            else f"{min(bin_values)}–{max(bin_values)}"
+        )
+        means[bin_index] = float(np.mean(members))
+        counts[bin_index] = int(len(members))
+    return graph_bins, labels, means, counts
+
+
+def _bootstrap_slope(
+    x: Sequence[float],
+    y: Sequence[float],
+    *,
+    replicates: int,
+    seed: int,
+) -> tuple[float, float, float]:
+    """OLS slope with a paired graph bootstrap, evaluated in bounded chunks."""
+
+    x_array = np.asarray(x, dtype=np.float64)
+    y_array = np.asarray(y, dtype=np.float64)
+    if len(x_array) != len(y_array) or len(x_array) < 2:
+        return np.nan, np.nan, np.nan
+
+    def slope(x_value: np.ndarray, y_value: np.ndarray) -> np.ndarray:
+        centered_x = x_value - x_value.mean(axis=-1, keepdims=True)
+        centered_y = y_value - y_value.mean(axis=-1, keepdims=True)
+        denominator = np.square(centered_x).sum(axis=-1)
+        numerator = (centered_x * centered_y).sum(axis=-1)
+        return np.divide(
+            numerator,
+            denominator,
+            out=np.full_like(numerator, np.nan, dtype=np.float64),
+            where=denominator > 0,
+        )
+
+    estimate = float(slope(x_array[None, :], y_array[None, :])[0])
+    rng = np.random.default_rng(int(seed))
+    draws: list[np.ndarray] = []
+    chunk_size = 128
+    for start in range(0, int(replicates), chunk_size):
+        count = min(chunk_size, int(replicates) - start)
+        indices = rng.integers(0, len(x_array), size=(count, len(x_array)))
+        draws.append(slope(x_array[indices], y_array[indices]))
+    samples = np.concatenate(draws)
+    samples = samples[np.isfinite(samples)]
+    if not samples.size:
+        return estimate, np.nan, np.nan
+    return estimate, float(np.quantile(samples, 0.025)), float(np.quantile(samples, 0.975))
+
+
 def summarise_scale_dependence(
     graph_rows: Sequence[Mapping[str, Any]],
     graph_records: Sequence[Mapping[str, Any]],
+    full_test_records: Sequence[Mapping[str, Any]],
     *,
     tasks: Sequence[str],
     reference_task: str,
     bootstrap_replicates: int,
     bootstrap_seed: int,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Pair per-molecule error and semantic reach across molecular-scale bins."""
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    """Summarise full-test performance and sampled carriage on separate supports."""
 
-    metadata = {
+    sampled_metadata = {
         (str(row["task"]), _integer(row, "graph")): row
         for row in graph_records
     }
-    reference_records = {
+    sampled_reference = {
         _integer(row, "graph"): row
         for row in graph_records
         if str(row["task"]) == reference_task
     }
-    if not reference_records:
-        raise RuntimeError(
-            f"no graph metrics are available for reference task {reference_task!r}"
-        )
+    test_metadata = {
+        (str(row["task"]), _integer(row, "test_graph")): row
+        for row in full_test_records
+    }
+    test_reference = {
+        _integer(row, "test_graph"): row
+        for row in full_test_records
+        if str(row["task"]) == reference_task
+    }
+    if not sampled_reference or not test_reference:
+        raise RuntimeError("scale analysis is missing sampled or full-test reference rows")
 
     reach_groups: dict[tuple[str, int], list[Mapping[str, Any]]] = defaultdict(list)
     for row in graph_rows:
@@ -1602,55 +1750,48 @@ def summarise_scale_dependence(
 
     joined: list[dict[str, Any]] = []
     for descriptor in ("num_nodes", "diameter"):
-        descriptor_values = {
-            graph: _integer(row, descriptor)
-            for graph, row in reference_records.items()
-        }
-        values = np.asarray(list(descriptor_values.values()), dtype=np.float64)
-        quantiles = np.quantile(values, (1.0 / 3.0, 2.0 / 3.0), method="higher")
-        boundaries = sorted(
-            {
-                int(value)
-                for value in quantiles
-                if float(values.min()) <= value < float(values.max())
+        for analysis, reference_rows in (
+            ("performance", test_reference),
+            ("reach", sampled_reference),
+        ):
+            descriptor_values = {
+                graph: _integer(row, descriptor)
+                for graph, row in reference_rows.items()
             }
-        )
-        graph_bins = {
-            graph: int(sum(value > boundary for boundary in boundaries))
-            for graph, value in descriptor_values.items()
-        }
-        members: dict[int, list[int]] = defaultdict(list)
-        for graph, bin_index in graph_bins.items():
-            members[bin_index].append(descriptor_values[graph])
-        bin_labels = {
-            bin_index: (
-                str(min(bin_values))
-                if min(bin_values) == max(bin_values)
-                else f"{min(bin_values)}–{max(bin_values)}"
+            graph_bins, labels, means, counts = _adaptive_scale_bins(
+                descriptor_values
             )
-            for bin_index, bin_values in members.items()
-        }
-        bin_means = {
-            bin_index: float(np.mean(bin_values))
-            for bin_index, bin_values in members.items()
-        }
-
-        for task in tasks:
-            for graph, reference_row in reference_records.items():
-                row = metadata.get((task, graph))
-                reach = expected_reach.get((task, graph))
-                if row is None or reach is None:
-                    continue
-                if (
-                    _integer(row, "num_nodes") != _integer(reference_row, "num_nodes")
-                    or _integer(row, "diameter") != _integer(reference_row, "diameter")
-                ):
-                    raise RuntimeError(
-                        "paired model records disagree on molecular graph geometry"
+            for task in tasks:
+                for graph, reference_row in reference_rows.items():
+                    row = (
+                        test_metadata.get((task, graph))
+                        if analysis == "performance"
+                        else sampled_metadata.get((task, graph))
                     )
-                bin_index = graph_bins[graph]
-                joined.append(
-                    {
+                    if row is None:
+                        continue
+                    if (
+                        _integer(row, "num_nodes")
+                        != _integer(reference_row, "num_nodes")
+                        or _integer(row, "diameter")
+                        != _integer(reference_row, "diameter")
+                    ):
+                        raise RuntimeError(
+                            "paired model records disagree on molecular graph geometry"
+                        )
+                    if analysis == "performance" and not np.isclose(
+                        _float(row, "target"),
+                        _float(reference_row, "target"),
+                        rtol=0,
+                        atol=1.0e-7,
+                    ):
+                        raise RuntimeError("paired full-test targets differ across models")
+                    reach = expected_reach.get((task, graph))
+                    if analysis == "reach" and reach is None:
+                        continue
+                    bin_index = graph_bins[graph]
+                    output = {
+                        "analysis": analysis,
                         "task": task,
                         "model_label": TASK_LABELS[task],
                         "reference_task": reference_task,
@@ -1658,28 +1799,38 @@ def summarise_scale_dependence(
                         "descriptor": descriptor,
                         "descriptor_value": int(descriptor_values[graph]),
                         "scale_bin": int(bin_index),
-                        "scale_label": bin_labels[bin_index],
-                        "bin_descriptor_mean": bin_means[bin_index],
-                        "graph_mae": _float(row, "graph_mae"),
-                        "reference_graph_mae": _float(reference_row, "graph_mae"),
-                        "mae_difference_from_reference": (
-                            _float(row, "graph_mae")
-                            - _float(reference_row, "graph_mae")
-                        ),
-                        "functional_expected_distance": float(reach),
+                        "scale_label": labels[bin_index],
+                        "bin_descriptor_mean": means[bin_index],
+                        "bin_graphs": counts[bin_index],
                     }
-                )
+                    if analysis == "performance":
+                        output.update(
+                            {
+                                "graph_mae": _float(row, "graph_mae"),
+                                "reference_graph_mae": _float(
+                                    reference_row, "graph_mae"
+                                ),
+                                "mae_difference_from_reference": (
+                                    _float(row, "graph_mae")
+                                    - _float(reference_row, "graph_mae")
+                                ),
+                            }
+                        )
+                    else:
+                        output["functional_expected_distance"] = float(reach)
+                    joined.append(output)
 
-    grouped: dict[tuple[str, int, str, str], list[float]] = defaultdict(list)
-    group_meta: dict[tuple[str, int, str, str], Mapping[str, Any]] = {}
-    metrics = (
-        "graph_mae",
-        "mae_difference_from_reference",
-        "functional_expected_distance",
-    )
+    grouped: dict[tuple[str, str, int, str, str], list[float]] = defaultdict(list)
+    group_meta: dict[tuple[str, str, int, str, str], Mapping[str, Any]] = {}
     for row in joined:
+        metrics = (
+            ("graph_mae", "mae_difference_from_reference")
+            if str(row["analysis"]) == "performance"
+            else ("functional_expected_distance",)
+        )
         for metric in metrics:
             key = (
+                str(row["analysis"]),
                 str(row["descriptor"]),
                 _integer(row, "scale_bin"),
                 str(row["task"]),
@@ -1690,7 +1841,7 @@ def summarise_scale_dependence(
 
     summary: list[dict[str, Any]] = []
     for key, values in sorted(grouped.items()):
-        descriptor, bin_index, task, metric = key
+        analysis, descriptor, bin_index, task, metric = key
         mean, low, high = _bootstrap_interval(
             values,
             replicates=int(bootstrap_replicates),
@@ -1700,6 +1851,7 @@ def summarise_scale_dependence(
         exemplar = group_meta[key]
         summary.append(
             {
+                "analysis": analysis,
                 "task": task,
                 "model_label": TASK_LABELS[task],
                 "reference_task": reference_task,
@@ -1714,7 +1866,50 @@ def summarise_scale_dependence(
                 "graphs": int(len(values)),
             }
         )
-    return joined, summary
+
+    trend_rows: list[dict[str, Any]] = []
+    trend_metrics = {
+        "performance": "mae_difference_from_reference",
+        "reach": "functional_expected_distance",
+    }
+    for analysis, metric in trend_metrics.items():
+        for descriptor in ("num_nodes", "diameter"):
+            for task in tasks:
+                values = [
+                    row
+                    for row in joined
+                    if str(row["analysis"]) == analysis
+                    and str(row["descriptor"]) == descriptor
+                    and str(row["task"]) == task
+                ]
+                slope, low, high = _bootstrap_slope(
+                    [_float(row, "descriptor_value") for row in values],
+                    [_float(row, metric) for row in values],
+                    replicates=int(bootstrap_replicates),
+                    seed=int(bootstrap_seed)
+                    + int(
+                        stable_hash(
+                            {"scale_slope": (analysis, descriptor, task, metric)},
+                            length=8,
+                        ),
+                        16,
+                    ),
+                )
+                trend_rows.append(
+                    {
+                        "analysis": analysis,
+                        "task": task,
+                        "model_label": TASK_LABELS[task],
+                        "reference_task": reference_task,
+                        "descriptor": descriptor,
+                        "metric": metric,
+                        "slope": slope,
+                        "low": low,
+                        "high": high,
+                        "graphs": int(len(values)),
+                    }
+                )
+    return joined, summary, trend_rows
 
 
 def summarise_dense_profile_contrasts(
@@ -2283,29 +2478,25 @@ def plot_scale_dependence(
     import matplotlib.pyplot as plt
 
     _figure_theme()
-    fig, axes = plt.subplots(2, 2, figsize=(10.8, 7.0), sharex="col")
+    fig, axes = plt.subplots(2, 2, figsize=(10.8, 7.0))
     descriptor_specs = (
         ("num_nodes", "Molecule size", "Atoms per molecule"),
         ("diameter", "Graph diameter", "Diameter (shortest-path hops)"),
     )
     metric_specs = (
         (
+            "performance",
             "mae_difference_from_reference",
             f"Per-molecule MAE difference\nfrom {TASK_LABELS[reference_task]}",
         ),
         (
+            "reach",
             "functional_expected_distance",
             "Semantic Functional-carriage\nexpected distance",
         ),
     )
     for column_index, (descriptor, title, xlabel) in enumerate(descriptor_specs):
-        labels_by_bin = {
-            _integer(row, "scale_bin"): str(row["scale_label"])
-            for row in rows
-            if str(row["descriptor"]) == descriptor
-        }
-        ordered_bins = sorted(labels_by_bin)
-        for row_index, (metric, ylabel) in enumerate(metric_specs):
+        for row_index, (analysis, metric, ylabel) in enumerate(metric_specs):
             axis = axes[row_index, column_index]
             for draw_order, task in enumerate(tasks):
                 values = sorted(
@@ -2313,15 +2504,16 @@ def plot_scale_dependence(
                         row
                         for row in rows
                         if str(row["descriptor"]) == descriptor
+                        and str(row["analysis"]) == analysis
                         and str(row["metric"]) == metric
                         and str(row["task"]) == task
                     ),
-                    key=lambda row: _integer(row, "scale_bin"),
+                    key=lambda row: _float(row, "bin_descriptor_mean"),
                 )
                 if not values:
                     continue
                 x = np.asarray(
-                    [_integer(value, "scale_bin") for value in values],
+                    [_float(value, "bin_descriptor_mean") for value in values],
                     dtype=np.float64,
                 )
                 y = np.asarray([_float(value, "mean") for value in values])
@@ -2350,14 +2542,37 @@ def plot_scale_dependence(
                     zorder=5 + draw_order,
                 )
             axis.set_ylabel(ylabel)
-            axis.set_xticks(ordered_bins)
-            axis.set_xticklabels([labels_by_bin[index] for index in ordered_bins])
+            axis.xaxis.set_major_locator(plt.MaxNLocator(integer=True))
+            counts = sorted(
+                {
+                    _integer(row, "graphs")
+                    for row in rows
+                    if str(row["descriptor"]) == descriptor
+                    and str(row["analysis"]) == analysis
+                    and str(row["metric"]) == metric
+                }
+            )
+            count_text = (
+                f"n={counts[0]} per bin"
+                if len(counts) == 1
+                else f"n={counts[0]}–{counts[-1]} per bin"
+            ) if counts else ""
+            axis.text(
+                0.98,
+                0.05 if row_index == 0 else 0.95,
+                count_text,
+                transform=axis.transAxes,
+                ha="right",
+                va="bottom" if row_index == 0 else "top",
+                color="#666666",
+                fontsize=7.5,
+            )
             if row_index == 0:
                 axis.set_title(title)
                 axis.axhline(0, color="#666666", linewidth=0.9, zorder=0)
             else:
-                axis.set_xlabel(xlabel)
                 axis.set_ylim(bottom=0)
+            axis.set_xlabel(xlabel)
     axes[0, 0].text(
         0.03,
         0.95,
@@ -2379,14 +2594,14 @@ def plot_scale_dependence(
         columnspacing=1.4,
     )
     fig.suptitle(
-        f"Performance and semantic functional reach across {dataset_label} scale",
+        f"Full-test performance and semantic functional reach across {dataset_label} scale",
         fontsize=13,
         y=0.992,
     )
     fig.text(
         0.5,
         0.872,
-        "Shared scale bins; paired molecules; mean with 95% graph-bootstrap interval",
+        "Adjacent-value adaptive bins; paired molecules; 95% graph-bootstrap interval",
         ha="center",
         color="#666666",
         fontsize=8.5,
@@ -2406,6 +2621,117 @@ def plot_scale_dependence(
     )
 
 
+def plot_scale_slopes(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    figures_dir: Path,
+    tasks: Sequence[str],
+    reference_task: str,
+    dataset_label: str,
+    figure_prefix: str,
+) -> dict[str, str]:
+    """Forest plot of bin-independent continuous scale trends."""
+
+    import matplotlib.pyplot as plt
+
+    _figure_theme()
+    fig, axes = plt.subplots(2, 2, figsize=(10.8, 6.7))
+    descriptor_specs = (
+        ("num_nodes", "Molecule size", "per additional atom"),
+        ("diameter", "Graph diameter", "per additional hop"),
+    )
+    analysis_specs = (
+        (
+            "performance",
+            f"MAE difference slope from\n{TASK_LABELS[reference_task]}",
+        ),
+        ("reach", "Functional expected-distance slope"),
+    )
+    positions = np.arange(len(tasks), dtype=np.float64)
+    for row_index, (analysis, xlabel) in enumerate(analysis_specs):
+        for column_index, (descriptor, title, unit) in enumerate(descriptor_specs):
+            axis = axes[row_index, column_index]
+            values_by_task = {
+                str(row["task"]): row
+                for row in rows
+                if str(row["analysis"]) == analysis
+                and str(row["descriptor"]) == descriptor
+            }
+            for index, task in enumerate(tasks):
+                value = values_by_task.get(task)
+                if value is None:
+                    continue
+                mean = _float(value, "slope")
+                low = _float(value, "low")
+                high = _float(value, "high")
+                if not np.isfinite([mean, low, high]).all():
+                    continue
+                axis.errorbar(
+                    mean,
+                    positions[index],
+                    xerr=np.asarray([[mean - low], [high - mean]]),
+                    fmt=MODEL_MARKERS[task],
+                    markerfacecolor="white",
+                    markeredgewidth=1.2,
+                    markersize=5.5,
+                    capsize=2.5,
+                    color=MODEL_COLOURS[task],
+                    linewidth=1.4,
+                )
+            axis.axvline(0, color="#666666", linewidth=0.9, zorder=0)
+            axis.set_yticks(positions)
+            axis.set_yticklabels([TASK_LABELS[task] for task in tasks])
+            axis.invert_yaxis()
+            axis.set_xlabel(f"{xlabel} ({unit})")
+            if row_index == 0:
+                axis.set_title(title)
+            finite_intervals = [
+                abs(_float(value, key))
+                for value in values_by_task.values()
+                for key in ("low", "high")
+                if np.isfinite(_float(value, key))
+            ]
+            if not finite_intervals:
+                axis.text(
+                    0.5,
+                    0.5,
+                    "Not estimable:\nno descriptor variation",
+                    transform=axis.transAxes,
+                    ha="center",
+                    va="center",
+                    color="#666666",
+                    fontsize=8,
+                )
+            elif max(finite_intervals) < 1.0e-12:
+                axis.set_xlim(-1.0e-6, 1.0e-6)
+    fig.suptitle(
+        f"Continuous molecular-scale trends on {dataset_label}",
+        fontsize=13,
+        y=0.985,
+    )
+    fig.text(
+        0.5,
+        0.915,
+        "OLS slope with 95% paired-molecule bootstrap confidence interval",
+        ha="center",
+        color="#666666",
+        fontsize=8.5,
+    )
+    fig.subplots_adjust(
+        left=0.16,
+        right=0.985,
+        bottom=0.10,
+        top=0.84,
+        wspace=0.30,
+        hspace=0.40,
+    )
+    return _save_figure(
+        fig,
+        figures_dir,
+        f"{figure_prefix}_scale_slopes",
+    )
+
+
 def figures(
     config: ZincReachConfig,
     *,
@@ -2418,11 +2744,13 @@ def figures(
     interpolation_path = results_dir / "semantic_interpolation_mass.csv"
     bamberger_path = results_dir / "bamberger_input_output_influence.csv"
     graph_metrics_path = results_dir / "graph_metrics.csv"
+    full_test_metrics_path = results_dir / "full_test_metrics.csv"
     if (
         not donor_path.is_file()
         or not interpolation_path.is_file()
         or not bamberger_path.is_file()
         or not graph_metrics_path.is_file()
+        or not full_test_metrics_path.is_file()
     ):
         raise FileNotFoundError(
             "cached measurement CSVs are missing; run PHASE='measure' or 'all' first"
@@ -2460,9 +2788,10 @@ def figures(
         bootstrap_seed=int(config.analysis_seed) + 200,
         reference_task=config.profile.reference_task,
     )
-    scale_rows, scale_summary = summarise_scale_dependence(
+    scale_rows, scale_summary, scale_trends = summarise_scale_dependence(
         graph_rows,
         _read_csv(graph_metrics_path),
+        _read_csv(full_test_metrics_path),
         tasks=config.tasks,
         reference_task=config.profile.reference_task,
         bootstrap_replicates=int(config.bootstrap_replicates),
@@ -2486,6 +2815,7 @@ def figures(
     )
     _write_csv(results_dir / "scale_dependence_graph_rows.csv", scale_rows)
     _write_csv(results_dir / "scale_dependence_summary.csv", scale_summary)
+    _write_csv(results_dir / "scale_trend_slopes.csv", scale_trends)
 
     figures_dir = output_dir / "figures"
     paths = {
@@ -2543,6 +2873,14 @@ def figures(
             dataset_label=config.profile.name,
             figure_prefix=config.profile.figure_prefix,
         ),
+        "scale_slopes": plot_scale_slopes(
+            scale_trends,
+            figures_dir=figures_dir,
+            tasks=config.tasks,
+            reference_task=config.profile.reference_task,
+            dataset_label=config.profile.name,
+            figure_prefix=config.profile.figure_prefix,
+        ),
     }
     _write_json(
         results_dir / "figure_manifest.json",
@@ -2555,8 +2893,10 @@ def figures(
                 "checkpoint per architecture, so intervals do not include training-seed "
                 "variance. Difference panels use paired graph-level bootstraps against "
                 "Dense GRIT; the interpolation sweep pairs each graph with its "
-                "Bamberger and matched smallest-dose profiles. Scale analyses use "
-                "shared molecule bins and paired per-graph MAE differences."
+                "Bamberger and matched smallest-dose profiles. Performance-scale "
+                "analysis uses every test molecule; carriage-scale analysis uses the "
+                "registered graph sample. Adjacent integer values are merged into "
+                "density-adaptive bins, and continuous slopes use paired bootstraps."
             ),
         },
     )
@@ -2567,6 +2907,7 @@ def figures(
         "expected_rows": expected_rows,
         "interpolation_rows": interpolation_summary,
         "scale_rows": scale_summary,
+        "scale_trends": scale_trends,
     }
 
 

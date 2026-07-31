@@ -185,6 +185,40 @@ def _raw_graph_records(tasks=TASKS):
     ]
 
 
+def _raw_full_test_records(tasks=TASKS):
+    return [
+        {
+            "task": task,
+            "model_label": reach.TASK_LABELS[task],
+            "test_graph": graph,
+            "num_nodes": 8 + graph // 3,
+            "diameter": 3 + graph // 6,
+            "target": 0.5 + 0.01 * graph,
+            "prediction": 0.5 + 0.01 * graph + 0.005 * (task_index + 1),
+            "graph_mae": 0.02 + 0.003 * task_index + 0.001 * graph,
+        }
+        for task_index, task in enumerate(tasks)
+        for graph in range(24)
+    ]
+
+
+def test_adaptive_scale_bins_use_available_integer_resolution():
+    values = {graph: 8 + graph % 12 for graph in range(120)}
+
+    graph_bins, labels, _means, counts = reach._adaptive_scale_bins(values)
+
+    assert len(set(graph_bins.values())) == 11
+    assert len(labels) == 11
+    assert min(counts.values()) == 10
+    assert max(counts.values()) == 20
+    assert all(
+        graph_bins[left] == graph_bins[right]
+        for left in values
+        for right in values
+        if values[left] == values[right]
+    )
+
+
 def test_profile_scope_and_normalisation():
     donor, bamberger, interpolation = _raw_rows()
     graph_rows = [
@@ -276,15 +310,16 @@ def test_profile_scope_and_normalisation():
     assert matched_origin
     assert all(row["profile_tv"] == pytest.approx(0.0) for row in matched_origin)
 
-    scale_rows, scale_summary = summarise_scale_dependence(
+    scale_rows, scale_summary, scale_trends = summarise_scale_dependence(
         graph_rows,
         _raw_graph_records(),
+        _raw_full_test_records(),
         tasks=TASKS,
         reference_task="zinc",
         bootstrap_replicates=40,
         bootstrap_seed=13,
     )
-    assert scale_rows and scale_summary
+    assert scale_rows and scale_summary and scale_trends
     assert {row["descriptor"] for row in scale_summary} == {
         "num_nodes",
         "diameter",
@@ -292,8 +327,13 @@ def test_profile_scope_and_normalisation():
     assert all(
         row["mae_difference_from_reference"] == pytest.approx(0.0)
         for row in scale_rows
+        if row["analysis"] == "performance"
         if row["task"] == "zinc"
     )
+    assert {row["analysis"] for row in scale_trends} == {
+        "performance",
+        "reach",
+    }
 
 
 def test_figure_only_builds_png_and_pdf(tmp_path: Path):
@@ -308,6 +348,7 @@ def test_figure_only_builds_png_and_pdf(tmp_path: Path):
         (results / "bamberger_input_output_influence.csv", bamberger),
         (results / "semantic_interpolation_mass.csv", interpolation),
         (results / "graph_metrics.csv", _raw_graph_records()),
+        (results / "full_test_metrics.csv", _raw_full_test_records()),
     ):
         with path.open("w", newline="", encoding="utf-8") as handle:
             writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
@@ -325,6 +366,7 @@ def test_figure_only_builds_png_and_pdf(tmp_path: Path):
         "structural_functional",
         "expected_distance",
         "scale_dependence",
+        "scale_slopes",
     }
     assert (results / "dense_profile_contrasts.csv").is_file()
     assert (results / "interpolation_sweep_summary.csv").is_file()
@@ -345,6 +387,10 @@ def test_qm9_profile_builds_dataset_specific_figures(tmp_path: Path):
         (results / "bamberger_input_output_influence.csv", bamberger),
         (results / "semantic_interpolation_mass.csv", interpolation),
         (results / "graph_metrics.csv", _raw_graph_records(QM9_TASKS)),
+        (
+            results / "full_test_metrics.csv",
+            _raw_full_test_records(QM9_TASKS),
+        ),
     ):
         with path.open("w", newline="", encoding="utf-8") as handle:
             writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
@@ -366,6 +412,7 @@ def test_qm9_profile_builds_dataset_specific_figures(tmp_path: Path):
         "structural_functional",
         "expected_distance",
         "scale_dependence",
+        "scale_slopes",
     }
     assert all(
         Path(formats["png"]).name.startswith("qm9_")

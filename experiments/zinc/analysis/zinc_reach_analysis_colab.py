@@ -178,8 +178,9 @@ print(
     "[scope] Matched control: every dose is also compared with alpha=0.01 on "
     "identical graphs, donors, carriers and task projections. This separates "
     "finite nonlinear change from the residual Bamberger estimand mismatch.\n"
-    "[scope] Scale analysis: paired per-molecule MAE and semantic Functional "
-    "reach are stratified by atom count and graph diameter.\n"
+    "[scope] Scale analysis: MAE uses every test molecule; Functional reach uses "
+    "the 64 carriage graphs. Adjacent values are grouped adaptively by data density, "
+    "and continuous paired-bootstrap slopes avoid dependence on bin boundaries.\n"
     "[scope] Fairness: checkpoints, graphs, SPD and carrier site are shared; "
     "literal Bamberger remains output-centric and channel-subsampled.\n"
     "[scope] Interpretation: this is an estimand comparison, not a claim that "
@@ -273,6 +274,17 @@ if "scale_rows" in result:
     except ImportError:
         pass
 
+if "scale_trends" in result:
+    from IPython.display import display
+
+    try:
+        import pandas as pd
+
+        print("\nContinuous molecular-scale trends", flush=True)
+        display(pd.DataFrame(result["scale_trends"]))
+    except ImportError:
+        pass
+
 if "figures" in result:
     from IPython.display import Image, display
 
@@ -283,6 +295,7 @@ if "figures" in result:
         "structural_functional",
         "expected_distance",
         "scale_dependence",
+        "scale_slopes",
     ):
         path = result["figures"][name]["png"]
         print(f"\n[display] {name}: {path}", flush=True)
