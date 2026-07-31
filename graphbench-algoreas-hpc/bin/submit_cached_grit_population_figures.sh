@@ -57,21 +57,21 @@ add_complete_root() {
   COMPLETE_ROOTS+=("${candidate}")
 }
 
-if [[ -n "${REQUESTED_ROOT}" ]]; then
-  add_complete_root "${REQUESTED_ROOT}"
-fi
-
 CACHE_SUFFIX="/graphbench_bipartite_matching_hard/seed_0/cache/scores/raw.pt"
-while IFS= read -r score_cache; do
-  add_complete_root "${score_cache%${CACHE_SUFFIX}}"
-done < <(
-  find "${OUTPUT_BASE}" \
-    -type f \
-    -path "*${CACHE_SUFFIX}" \
-    -print \
-    2>/dev/null \
-    | sort
-)
+if [[ -n "${REQUESTED_ROOT}" ]] && cache_root_complete "${REQUESTED_ROOT}"; then
+  COMPLETE_ROOTS+=("${REQUESTED_ROOT}")
+else
+  while IFS= read -r score_cache; do
+    add_complete_root "${score_cache%${CACHE_SUFFIX}}"
+  done < <(
+    find "${OUTPUT_BASE}" \
+      -type f \
+      -path "*${CACHE_SUFFIX}" \
+      -print \
+      2>/dev/null \
+      | sort
+  )
+fi
 
 if (( ${#COMPLETE_ROOTS[@]} == 0 )); then
   echo "No complete four-seed matching cache root was found under ${OUTPUT_BASE}." >&2

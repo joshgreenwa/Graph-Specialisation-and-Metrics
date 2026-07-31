@@ -79,3 +79,26 @@ def test_cached_figure_submitter_refuses_ambiguous_complete_roots(tmp_path):
     assert str(first) in result.stderr
     assert str(second) in result.stderr
     assert "cpu_finalizer=" not in result.stdout
+
+
+def test_cached_figure_submitter_uses_explicit_complete_root_when_several_exist(
+    tmp_path,
+):
+    first = tmp_path / "outputs" / "analysis_a"
+    second = tmp_path / "outputs" / "analysis_b"
+    _complete_cache(first)
+    _complete_cache(second)
+    environment = _environment(tmp_path)
+    environment["GRAPHBENCH_ANALYSIS_OUTPUT_ROOT"] = str(second)
+
+    result = subprocess.run(
+        ["bash", str(SCRIPT)],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert f"analysis_root={second}" in result.stdout
+    assert str(first) not in result.stdout
