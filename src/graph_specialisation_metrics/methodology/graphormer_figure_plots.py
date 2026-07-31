@@ -584,14 +584,13 @@ def plot_attention_grid(
         axes[row, 0].text(
             0.01,
             0.99,
-            f"PCQM index {graph_index}\n"
             rf"Graph-local: $D_{{\rm rel}} = {d_rel:+.3f};\ J = "
             rf"{joint_sensitivity:.3f}$",
             transform=axes[row, 0].transAxes,
             ha="left",
             va="top",
-            fontsize=16.25,
-            color=NAVY,
+            fontsize=18,
+            color="black",
             bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.90},
         )
         axes[row, 1].imshow(
@@ -611,8 +610,8 @@ def plot_attention_grid(
             aspect="equal",
             rasterized=True,
         )
-        axes[row, 2].set_xlabel("Key atom", fontsize=16.25)
-        axes[row, 2].set_ylabel("Query atom", fontsize=16.25)
+        axes[row, 2].set_xlabel("Key atom", fontsize=20)
+        axes[row, 2].set_ylabel("Query atom", fontsize=20)
         axes[row, 2].set_xticks(np.arange(matrix.shape[0]))
         axes[row, 2].set_yticks(np.arange(matrix.shape[0]))
         axes[row, 2].tick_params(labelsize=10, length=2.5)
@@ -766,15 +765,10 @@ def plot_av_pca(
             + rf"$D_{{\rm rel}} = {float(d_rel):+.3f};\quad "
             + rf"J = {float(joint_sensitivity):.3f}$"
         )
-    descriptor = (
-        f"{title_label} — {_head_label(head)}"
-        if title_label
-        else _head_label(head)
-    )
     ax.set_title(
-        f"PCA of head output — {descriptor}"
-        f"{metric_line}\n"
-        f"$n = {int(payload['n_used'])}$ PCQM4Mv2 molecules",
+        f"PCA of Head Output - {_head_label(head)} "
+        f"({int(payload['n_used'])} molecules)"
+        f"{metric_line}",
         fontsize=15,
     )
     ax.grid(False)

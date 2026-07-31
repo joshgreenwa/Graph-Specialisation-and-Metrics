@@ -1022,8 +1022,8 @@ def test_attention_grid_supports_five_rows_without_arrows():
         assert np.allclose(figure.get_size_inches(), (15.5, 20.15))
         assert weighted_axis.title.get_fontsize() == 25
         assert matrix_axis.title.get_fontsize() == 25
-        assert matrix_axis.xaxis.label.get_fontsize() == 16.25
-        assert matrix_axis.yaxis.label.get_fontsize() == 16.25
+        assert matrix_axis.xaxis.label.get_fontsize() == 20
+        assert matrix_axis.yaxis.label.get_fontsize() == 20
         assert all(
             tick.get_fontsize() == 10
             for tick in matrix_axis.get_xticklabels()
@@ -1067,13 +1067,15 @@ def test_attention_grid_supports_five_rows_without_arrows():
         assert "J = 1.110" in labels
         assert "J = 0.840" in labels
         assert labels.count("Graph-local") == 5
+        assert "PCQM index" not in labels
         graph_labels = [
             text
             for axis in figure.axes
             for text in axis.texts
             if "Graph-local" in text.get_text()
         ]
-        assert all(text.get_fontsize() == 16.25 for text in graph_labels)
+        assert all(text.get_fontsize() == 18 for text in graph_labels)
+        assert all(text.get_color() == "black" for text in graph_labels)
     finally:
         plt.close(figure)
 
@@ -1115,9 +1117,10 @@ def test_attention_grid_renders_exactly_four_configured_rows_in_order():
         ]
         assert len(labels) == 4
         assert [
-            int(label.splitlines()[0].removeprefix("PCQM index "))
+            label.split(" = ", 1)[1].split(";", 1)[0]
             for label in labels
-        ] == [200, 5, 100, 0]
+        ] == ["+0.200", "+0.005", "+0.100", "+0.000"]
+        assert all("PCQM index" not in label for label in labels)
     finally:
         plt.close(figure)
 
@@ -1138,9 +1141,12 @@ def test_av_pca_identifies_role_and_head_metrics():
     )
     try:
         title = figure.axes[0].get_title()
-        assert title.startswith("PCA of head output")
+        assert title.startswith("PCA of Head Output")
         assert "Pooled" not in title
-        assert "Structural specialist — L7 H14" in title
+        assert "PCA of Head Output - L7 H14 (12 molecules)" in title
+        assert "Structural specialist" not in title
+        assert "PCQM4Mv2" not in title
+        assert "$n =" not in title
         assert "D_{\\rm rel} = -0.275" in title
         assert "J = 1.234" in title
         figure.canvas.draw()
