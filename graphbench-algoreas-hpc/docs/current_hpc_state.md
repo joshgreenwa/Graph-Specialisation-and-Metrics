@@ -338,8 +338,22 @@ After completion, verify the finalizer and four-seed population summaries:
 ANALYSIS_ROOT=/rds/user/jgg45/hpc-work/graphbench-algoreas/outputs/grit_specialisation_graphbench_complete_pe_v2
 test -s "${ANALYSIS_ROOT}/index.json"
 test -s "${ANALYSIS_ROOT}/graphbench_bipartite_matching_hard/population.json"
-find "${ANALYSIS_ROOT}" -path "*/seed_*/figures.json" -print | sort
+find "${ANALYSIS_ROOT}/graphbench_bipartite_matching_hard/population_figures" \
+  -maxdepth 1 -type f -print | sort
 ```
+
+When all four immutable score and causal caches already exist, regenerate only the focused
+population figures with the cache-aware CPU launcher:
+
+```bash
+cd /rds/user/jgg45/hpc-work/Graph-Specialisation-and-Metrics
+bash graphbench-algoreas-hpc/bin/submit_cached_grit_population_figures.sh
+```
+
+This launcher scans the GraphBench output area before submission. It requires score, causal, and
+audit caches for seeds 0-3, automatically uses a uniquely complete analysis root, and submits no
+job if no complete root or multiple complete roots are found. This prevents an empty default
+directory from reaching the Slurm queue.
 
 ## Mechanistic Analysis
 
