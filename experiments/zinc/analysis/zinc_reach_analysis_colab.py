@@ -244,6 +244,30 @@ if "health" in result.get("measurement", {}):
     except ImportError:
         print(result["measurement"]["health"], flush=True)
 
+output_audit = result.get("output_carriage_audit") or result.get(
+    "measurement", {}
+).get("output_carriage_audit")
+if output_audit:
+    from IPython.display import display
+
+    try:
+        import pandas as pd
+
+        print("\nSigned output-carriage numerical audit (estimates retained)", flush=True)
+        display(pd.DataFrame(output_audit))
+    except ImportError:
+        print(output_audit, flush=True)
+
+output_failures = result.get("output_carriage_failures") or result.get(
+    "measurement", {}
+).get("output_carriage_failures")
+if output_failures:
+    print("\nSigned output-carriage skipped-graph audit", flush=True)
+    try:
+        display(pd.DataFrame(output_failures))
+    except (ImportError, NameError):
+        print(output_failures, flush=True)
+
 if "expected_rows" in result:
     from IPython.display import display
 

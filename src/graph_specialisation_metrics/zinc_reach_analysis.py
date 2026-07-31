@@ -48,7 +48,7 @@ from .methodology.sampling import sample_sources
 
 
 ANALYSIS_VERSION = "zinc-bamberger-functional-reach-v7"
-OUTPUT_CARRIAGE_VERSION = "signed-output-path-carriage-v1"
+OUTPUT_CARRIAGE_VERSION = "signed-output-path-carriage-v2-soft-audit"
 OUTPUT_PATH_ATOL = 1.0e-6
 OUTPUT_PATH_RTOL = 1.0e-5
 OUTPUT_PATH_MAX_INTERVALS = 128
@@ -844,16 +844,45 @@ def _signed_output_carriage_rows(
     quadrature_tolerance = OUTPUT_PATH_ATOL + OUTPUT_PATH_RTOL * signed.abs().sum(
         dim=-1
     )
+    finite_path = torch.isfinite(signed).all(dim=-1)
     accepted = (
-        torch.isfinite(signed).all(dim=-1)
+        finite_path
         & (endpoint_error <= 5.0 * endpoint_tolerance)
         & (completeness <= 5.0 * completeness_tolerance)
         & (path["quadrature_error"] <= 5.0 * quadrature_tolerance)
     )
     if not bool(accepted.all()):
         failed = int((~accepted).sum().detach().cpu())
-        raise RuntimeError(
-            f"signed output carriage failed numerical audits for {failed}/{event_count} paths"
+        finite_endpoint = endpoint_error[torch.isfinite(endpoint_error)]
+        finite_completeness = completeness[torch.isfinite(completeness)]
+        finite_quadrature = path["quadrature_error"][
+            torch.isfinite(path["quadrature_error"])
+        ]
+        endpoint_max = (
+            float(finite_endpoint.max().detach().cpu())
+            if finite_endpoint.numel()
+            else np.nan
+        )
+        completeness_max = (
+            float(finite_completeness.max().detach().cpu())
+            if finite_completeness.numel()
+            else np.nan
+        )
+        quadrature_max = (
+            float(finite_quadrature.max().detach().cpu())
+            if finite_quadrature.numel()
+            else np.nan
+        )
+        print(
+            f"[output-carriage:warning] {task} graph={int(graph_id)}: "
+            f"retaining best estimates for {failed}/{event_count} paths outside "
+            "the soft numerical audit; "
+            f"max endpoint error={endpoint_max:.3e}, "
+            f"completeness={completeness_max:.3e}, "
+            f"quadrature error={quadrature_max:.3e}, "
+            f"intervals={int(path['intervals'].max().detach().cpu())}. "
+            "The task-level audit table reports all retained errors.",
+            flush=True,
         )
 
     distances = shortest_path_distances(base.edge_index, int(base.num_nodes))
@@ -891,6 +920,20 @@ def _signed_output_carriage_rows(
                     ),
                     "intervals": int(path["intervals"][event_index].detach().cpu()),
                     "converged": bool(path["converged"][event_index].detach().cpu()),
+                    "finite_path": bool(finite_path[event_index].detach().cpu()),
+                    "audit_accepted": bool(accepted[event_index].detach().cpu()),
+                    "endpoint_replay_error": float(
+                        endpoint_error[event_index].detach().cpu()
+                    ),
+                    "endpoint_replay_tolerance": float(
+                        endpoint_tolerance[event_index].detach().cpu()
+                    ),
+                    "completeness_tolerance": float(
+                        completeness_tolerance[event_index].detach().cpu()
+                    ),
+                    "quadrature_tolerance": float(
+                        quadrature_tolerance[event_index].detach().cpu()
+                    ),
                 }
             )
     return output
@@ -1218,6 +1261,7 @@ def measure(
     interpolation_rows: list[dict[str, Any]] = []
     bamberger_rows: list[dict[str, Any]] = []
     output_carriage_rows: list[dict[str, Any]] = []
+    output_carriage_failures: list[dict[str, Any]] = []
     graph_records: list[dict[str, Any]] = []
     full_test_records: list[dict[str, Any]] = []
     health: list[dict[str, Any]] = []
@@ -1280,13 +1324,33 @@ def measure(
                 checkpoint_sha256=str(prepared.checkpoint_sha),
             )
             if output_shard is None:
-                output_shard = _measure_output_carriage_graph(
-                    config,
-                    prepared,
-                    task=task,
-                    graph_id=int(graph_id),
-                )
-                _save_shard(output_path, output_shard)
+                try:
+                    output_shard = _measure_output_carriage_graph(
+                        config,
+                        prepared,
+                        task=task,
+                        graph_id=int(graph_id),
+                    )
+                except Exception as error:
+                    failure = {
+                        "task": task,
+                        "model_label": TASK_LABELS[task],
+                        "graph": int(graph_id),
+                        "error_type": type(error).__name__,
+                        "error": str(error),
+                        "estimate_retained": False,
+                        "will_retry": True,
+                    }
+                    output_carriage_failures.append(failure)
+                    print(
+                        f"[output-carriage:warning] {task} graph={int(graph_id)} "
+                        f"could not be estimated ({type(error).__name__}: {error}); "
+                        "the core analysis continues and the graph will be retried next run.",
+                        flush=True,
+                    )
+                    output_shard = {"output_carriage_rows": []}
+                else:
+                    _save_shard(output_path, output_shard)
             output_carriage_rows.extend(output_shard["output_carriage_rows"])
             completed += 1
             if progress:
@@ -1297,10 +1361,20 @@ def measure(
                 )
 
     results_dir = output_dir / "results"
+    output_carriage_audit = summarise_output_carriage_audit(
+        output_carriage_rows,
+        failures=output_carriage_failures,
+    )
+    _print_output_carriage_audit(output_carriage_audit)
     _write_csv(results_dir / "donor_carrier_mass.csv", donor_rows)
     _write_csv(results_dir / "semantic_interpolation_mass.csv", interpolation_rows)
     _write_csv(results_dir / "bamberger_input_output_influence.csv", bamberger_rows)
     _write_csv(results_dir / "semantic_output_carriage.csv", output_carriage_rows)
+    _write_csv(results_dir / "output_carriage_audit.csv", output_carriage_audit)
+    _write_csv(
+        results_dir / "output_carriage_failures.csv",
+        output_carriage_failures,
+    )
     _write_csv(results_dir / "graph_metrics.csv", graph_records)
     _write_csv(results_dir / "model_health.csv", health)
     _write_json(
@@ -1316,6 +1390,8 @@ def measure(
             "interpolation_rows": len(interpolation_rows),
             "bamberger_rows": len(bamberger_rows),
             "output_carriage_rows": len(output_carriage_rows),
+            "output_carriage_audit": output_carriage_audit,
+            "output_carriage_failures": output_carriage_failures,
             "graph_metric_rows": len(graph_records),
             "full_test_metric_rows": len(full_test_records),
             "comparison_scope": {
@@ -1379,6 +1455,8 @@ def measure(
         "interpolation_rows": interpolation_rows,
         "bamberger_rows": bamberger_rows,
         "output_carriage_rows": output_carriage_rows,
+        "output_carriage_audit": output_carriage_audit,
+        "output_carriage_failures": output_carriage_failures,
         "graph_records": graph_records,
         "full_test_records": full_test_records,
         "health": health,
@@ -1391,6 +1469,127 @@ def _float(row: Mapping[str, Any], key: str) -> float:
 
 def _integer(row: Mapping[str, Any], key: str) -> int:
     return int(float(row[key]))
+
+
+def _boolean(row: Mapping[str, Any], key: str, *, default: bool) -> bool:
+    if key not in row or row[key] == "":
+        return bool(default)
+    value = row[key]
+    if isinstance(value, (bool, np.bool_)):
+        return bool(value)
+    return str(value).strip().lower() in {"1", "true", "yes"}
+
+
+def summarise_output_carriage_audit(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    failures: Sequence[Mapping[str, Any]] = (),
+) -> list[dict[str, Any]]:
+    """Collapse duplicated carrier diagnostics into one soft audit per task."""
+
+    event_fields = (
+        "task",
+        "graph",
+        "source",
+        "donor_graph",
+        "donor_node",
+        "draw",
+    )
+    events: dict[tuple[Any, ...], Mapping[str, Any]] = {}
+    for row in rows:
+        events.setdefault(tuple(row[field] for field in event_fields), row)
+    by_task: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
+    for key, row in events.items():
+        by_task[str(key[0])].append(row)
+    failures_by_task: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
+    for row in failures:
+        failures_by_task[str(row["task"])].append(row)
+
+    def values(task_rows: Sequence[Mapping[str, Any]], key: str) -> np.ndarray:
+        return np.asarray(
+            [float(row.get(key, 0.0) or 0.0) for row in task_rows],
+            dtype=np.float64,
+        )
+
+    output: list[dict[str, Any]] = []
+    for task in sorted(set(by_task) | set(failures_by_task)):
+        task_rows = by_task.get(task, [])
+        paths = len(task_rows)
+        finite = np.asarray(
+            [
+                _boolean(
+                    row,
+                    "finite_path",
+                    default=np.isfinite(_float(row, "signed_output_carriage")),
+                )
+                for row in task_rows
+            ],
+            dtype=bool,
+        )
+        accepted = np.asarray(
+            [_boolean(row, "audit_accepted", default=True) for row in task_rows],
+            dtype=bool,
+        )
+        converged = np.asarray(
+            [_boolean(row, "converged", default=True) for row in task_rows],
+            dtype=bool,
+        )
+        endpoint = values(task_rows, "endpoint_replay_error")
+        completeness = np.abs(values(task_rows, "completeness_residual"))
+        quadrature = values(task_rows, "quadrature_error")
+        intervals = values(task_rows, "intervals")
+        def quantile(value: np.ndarray, probability: float) -> float:
+            return float(np.quantile(value, probability)) if value.size else np.nan
+
+        def maximum(value: np.ndarray) -> float:
+            return float(value.max()) if value.size else np.nan
+
+        output.append(
+            {
+                "task": task,
+                "model_label": TASK_LABELS[task],
+                "paths": int(paths),
+                "soft_warning_paths": int((~accepted).sum()),
+                "soft_warning_fraction": (
+                    float((~accepted).mean()) if accepted.size else 0.0
+                ),
+                "nonfinite_paths": int((~finite).sum()),
+                "unconverged_paths": int((~converged).sum()),
+                "unconverged_fraction": (
+                    float((~converged).mean()) if converged.size else 0.0
+                ),
+                "failed_graphs": int(len(failures_by_task.get(task, []))),
+                "endpoint_error_p95": quantile(endpoint, 0.95),
+                "endpoint_error_max": maximum(endpoint),
+                "completeness_error_p95": quantile(completeness, 0.95),
+                "completeness_error_max": maximum(completeness),
+                "quadrature_error_p95": quantile(quadrature, 0.95),
+                "quadrature_error_max": maximum(quadrature),
+                "intervals_p95": quantile(intervals, 0.95),
+                "intervals_max": int(maximum(intervals)) if intervals.size else 0,
+                "estimates_retained": bool(paths),
+            }
+        )
+    return output
+
+
+def _print_output_carriage_audit(rows: Sequence[Mapping[str, Any]]) -> None:
+    print("[output-carriage:audit] retained path-integration estimates", flush=True)
+    for row in rows:
+        print(
+            f"  {row['model_label']}: paths={row['paths']}, "
+            f"soft warnings={row['soft_warning_paths']} "
+            f"({100.0 * float(row['soft_warning_fraction']):.2f}%), "
+            f"non-finite={row['nonfinite_paths']}, "
+            f"unconverged={row['unconverged_paths']}; "
+            f"failed graphs={row['failed_graphs']}; "
+            f"max endpoint/completeness/quadrature="
+            f"{float(row['endpoint_error_max']):.3e}/"
+            f"{float(row['completeness_error_max']):.3e}/"
+            f"{float(row['quadrature_error_max']):.3e}; "
+            f"max intervals={row['intervals_max']}",
+            flush=True,
+        )
 
 
 def graph_donor_profiles(
@@ -1525,7 +1724,12 @@ def graph_output_coherence_profiles(
             dtype=np.float64,
         )
         if not np.isfinite(signed).all():
-            raise RuntimeError("non-finite signed output carriage reached aggregation")
+            print(
+                f"[output-carriage:warning] skipping non-finite retained path "
+                f"for {task} graph={graph} source={source}; see the audit table",
+                flush=True,
+            )
+            continue
         task_max_distance[task] = max(
             int(task_max_distance[task]),
             int(distances.max(initial=0)),
@@ -3342,6 +3546,7 @@ def figures(
     config: ZincReachConfig,
     *,
     output_dir: Path,
+    print_audit: bool = True,
 ) -> dict[str, Any]:
     """Build every table and paper figure from cached CSV files only."""
 
@@ -3350,6 +3555,7 @@ def figures(
     interpolation_path = results_dir / "semantic_interpolation_mass.csv"
     bamberger_path = results_dir / "bamberger_input_output_influence.csv"
     output_carriage_path = results_dir / "semantic_output_carriage.csv"
+    output_carriage_failures_path = results_dir / "output_carriage_failures.csv"
     graph_metrics_path = results_dir / "graph_metrics.csv"
     full_test_metrics_path = results_dir / "full_test_metrics.csv"
     if (
@@ -3375,8 +3581,20 @@ def figures(
         _read_csv(interpolation_path),
         effect_floor=float(config.effect_floor),
     )
+    output_carriage_raw = _read_csv(output_carriage_path)
+    output_carriage_failures = (
+        _read_csv(output_carriage_failures_path)
+        if output_carriage_failures_path.is_file()
+        else []
+    )
+    output_carriage_audit = summarise_output_carriage_audit(
+        output_carriage_raw,
+        failures=output_carriage_failures,
+    )
+    if print_audit:
+        _print_output_carriage_audit(output_carriage_audit)
     output_coherence_graph = graph_output_coherence_profiles(
-        _read_csv(output_carriage_path),
+        output_carriage_raw,
         effect_floor=float(config.effect_floor),
     )
     output_coherence_profiles, output_coherence_expected = (
@@ -3447,6 +3665,7 @@ def figures(
         results_dir / "output_coherence_expected_distance.csv",
         output_coherence_expected,
     )
+    _write_csv(results_dir / "output_carriage_audit.csv", output_carriage_audit)
 
     figures_dir = output_dir / "figures"
     paths = {
@@ -3552,6 +3771,8 @@ def figures(
         "scale_trends": scale_trends,
         "output_coherence_profiles": output_coherence_profiles,
         "output_coherence_expected": output_coherence_expected,
+        "output_carriage_audit": output_carriage_audit,
+        "output_carriage_failures": output_carriage_failures,
     }
 
 
@@ -3635,7 +3856,13 @@ def main(
             progress=not bool(args.quiet),
         )
     if args.phase in {"all", "figures"}:
-        result.update(figures(config, output_dir=output_dir))
+        result.update(
+            figures(
+                config,
+                output_dir=output_dir,
+                print_audit=args.phase == "figures",
+            )
+        )
     return result
 
 

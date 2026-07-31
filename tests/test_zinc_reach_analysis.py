@@ -92,7 +92,10 @@ def test_semantic_interpolation_scales_linear_functional_mass(monkeypatch):
     assert torch.allclose(actual[1], full_mass)
 
 
-def test_signed_output_path_carriage_is_complete_and_preserves_cancellation():
+def test_signed_output_path_carriage_is_complete_and_preserves_cancellation(
+    monkeypatch,
+    capsys,
+):
     clean = torch.tensor([[2.0], [1.0]])
     intervened = torch.tensor([[1.0], [2.0]])
     capture = SimpleNamespace(
@@ -138,6 +141,31 @@ def test_signed_output_path_carriage_is_complete_and_preserves_cancellation():
     assert signed == pytest.approx([1.0, -1.0])
     assert sum(signed) == pytest.approx(0.0)
     assert all(abs(row["completeness_residual"]) < 1.0e-7 for row in rows)
+
+    exact_integrator = reach.integrated_loss_carriage
+
+    def unconverged_integrator(*args, **kwargs):
+        result = exact_integrator(*args, **kwargs)
+        result["quadrature_error"] = torch.ones_like(result["quadrature_error"])
+        result["converged"] = torch.zeros_like(result["converged"])
+        return result
+
+    monkeypatch.setattr(reach, "integrated_loss_carriage", unconverged_integrator)
+    retained = reach._signed_output_carriage_rows(
+        ZincReachConfig(tasks=("zinc",)),
+        prepared,
+        task="zinc",
+        graph_id=0,
+        base=base,
+        variants=[SimpleNamespace()],
+        events=[event],
+    )
+    assert not retained[0]["audit_accepted"]
+    assert retained[0]["signed_output_carriage"] == pytest.approx(1.0)
+    assert "retaining best estimates" in capsys.readouterr().out
+    audit = reach.summarise_output_carriage_audit(retained)
+    assert audit[0]["soft_warning_paths"] == 1
+    assert audit[0]["unconverged_paths"] == 1
 
 
 def test_discover_seed_checkpoint_prefers_recovery_best(tmp_path: Path):
