@@ -32,6 +32,7 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 
 from .carriage import env
+from .carriage.core import integrated_loss_carriage
 from .carriage.tasks import get_task as get_grit_task
 from .methodology.distance import shortest_path_distances
 from .methodology.events import build_channel_events
@@ -47,6 +48,10 @@ from .methodology.sampling import sample_sources
 
 
 ANALYSIS_VERSION = "zinc-bamberger-functional-reach-v7"
+OUTPUT_CARRIAGE_VERSION = "signed-output-path-carriage-v1"
+OUTPUT_PATH_ATOL = 1.0e-6
+OUTPUT_PATH_RTOL = 1.0e-5
+OUTPUT_PATH_MAX_INTERVALS = 128
 TASKS = ("zinc_1hop", "zinc_2hop", "zinc_1hop_vnode", "zinc")
 QM9_TASKS = ("qm9_gap_1hop", "qm9_gap_1hop_vnode", "qm9_gap_dense")
 DEFAULT_INTERPOLATION_DOSES = (0.01, 0.02, 0.05, 0.10, 0.25, 0.50, 1.00)
@@ -792,6 +797,166 @@ def _donor_rows(
     return rows, interpolation_rows
 
 
+def _signed_output_carriage_rows(
+    config: ZincReachConfig,
+    prepared: Any,
+    *,
+    task: str,
+    graph_id: int,
+    base: Any,
+    variants: Sequence[Any],
+    events: Sequence[Any],
+) -> list[dict[str, Any]]:
+    """Integrate signed scalar-output contribution for each semantic donor path."""
+
+    import torch
+
+    if len(variants) != len(events) or not events:
+        raise ValueError("signed output carriage requires aligned donor events")
+    capture = prepared.backend.capture_groups([[base, *variants]])[0]
+    event_count = len(events)
+    clean = capture.final_state[0].unsqueeze(0).expand(event_count, -1, -1)
+    intervened = capture.final_state[1:]
+    if tuple(intervened.shape) != tuple(clean.shape):
+        raise RuntimeError("output-carriage endpoint states lost event alignment")
+    output_from_pooled = prepared.backend.output_from_pooled(capture.target[0:1])
+    path = integrated_loss_carriage(
+        clean,
+        intervened,
+        output_from_pooled,
+        carrier_weights=prepared.backend.carriage_weights(base, clean),
+        atol=OUTPUT_PATH_ATOL,
+        rtol=OUTPUT_PATH_RTOL,
+        max_intervals=OUTPUT_PATH_MAX_INTERVALS,
+    )
+    signed = path["carriage"]
+    if tuple(signed.shape) != (event_count, int(base.num_nodes)):
+        raise RuntimeError("signed output carriage has invalid carrier geometry")
+    expected_delta = (
+        capture.z[0].reshape(-1)[0] - capture.z[1:].reshape(event_count, -1)[:, 0]
+    )
+    endpoint_error = (path["loss_delta"] - expected_delta).abs()
+    endpoint_tolerance = OUTPUT_PATH_ATOL + OUTPUT_PATH_RTOL * expected_delta.abs()
+    completeness = path["completeness_residual"].abs()
+    completeness_tolerance = OUTPUT_PATH_ATOL + OUTPUT_PATH_RTOL * path[
+        "loss_delta"
+    ].abs()
+    quadrature_tolerance = OUTPUT_PATH_ATOL + OUTPUT_PATH_RTOL * signed.abs().sum(
+        dim=-1
+    )
+    accepted = (
+        torch.isfinite(signed).all(dim=-1)
+        & (endpoint_error <= 5.0 * endpoint_tolerance)
+        & (completeness <= 5.0 * completeness_tolerance)
+        & (path["quadrature_error"] <= 5.0 * quadrature_tolerance)
+    )
+    if not bool(accepted.all()):
+        failed = int((~accepted).sum().detach().cpu())
+        raise RuntimeError(
+            f"signed output carriage failed numerical audits for {failed}/{event_count} paths"
+        )
+
+    distances = shortest_path_distances(base.edge_index, int(base.num_nodes))
+    output: list[dict[str, Any]] = []
+    for event_index, event in enumerate(events):
+        source = int(event.source)
+        for carrier in range(int(base.num_nodes)):
+            value = float(signed[event_index, carrier].detach().cpu())
+            output.append(
+                {
+                    "analysis_version": config.profile.analysis_version,
+                    "fingerprint": config.fingerprint,
+                    "output_carriage_version": OUTPUT_CARRIAGE_VERSION,
+                    "task": task,
+                    "model_label": TASK_LABELS[task],
+                    "seed": int(config.seed),
+                    "graph": int(graph_id),
+                    "channel": "semantic",
+                    "source": source,
+                    "donor_graph": int(event.donor_graph_id),
+                    "donor_node": int(event.donor_node),
+                    "draw": int(event.draw),
+                    "carrier": int(carrier),
+                    "distance": int(distances[source, carrier]),
+                    "signed_output_carriage": value,
+                    "absolute_output_carriage": abs(value),
+                    "event_output_delta": float(
+                        path["loss_delta"][event_index].detach().cpu()
+                    ),
+                    "completeness_residual": float(
+                        path["completeness_residual"][event_index].detach().cpu()
+                    ),
+                    "quadrature_error": float(
+                        path["quadrature_error"][event_index].detach().cpu()
+                    ),
+                    "intervals": int(path["intervals"][event_index].detach().cpu()),
+                    "converged": bool(path["converged"][event_index].detach().cpu()),
+                }
+            )
+    return output
+
+
+def _measure_output_carriage_graph(
+    config: ZincReachConfig,
+    prepared: Any,
+    *,
+    task: str,
+    graph_id: int,
+) -> dict[str, Any]:
+    """Measure semantic signed-output carriage without recomputing base reach caches."""
+
+    base = prepared.runtime.eval_ds[int(graph_id)]
+    sources = tuple(
+        int(value)
+        for value in sample_sources(
+            int(base.num_nodes),
+            int(config.sources_per_graph),
+            np.random.default_rng(_seed(config, "sources", graph_id)),
+        )
+    )
+    variants: list[Any] = []
+    events: list[Any] = []
+    for source in sources:
+        source_variants, source_events = build_channel_events(
+            base,
+            graph_id=int(graph_id),
+            source=int(source),
+            channel="semantic",
+            stage=config.profile.event_stage,
+            donors=int(config.donors_per_source),
+            rng=np.random.default_rng(
+                _seed(config, "events", graph_id, "semantic", int(source))
+            ),
+            task=prepared.task,
+            semantic_pool=prepared.donor_pool,
+            duplicate_tolerance=1.0e-7,
+        )
+        variants.extend(source_variants)
+        events.extend(source_events)
+    rows = (
+        _signed_output_carriage_rows(
+            config,
+            prepared,
+            task=task,
+            graph_id=int(graph_id),
+            base=base,
+            variants=variants,
+            events=events,
+        )
+        if variants
+        else []
+    )
+    return {
+        "output_carriage_version": OUTPUT_CARRIAGE_VERSION,
+        "analysis_version": config.profile.analysis_version,
+        "fingerprint": config.fingerprint,
+        "checkpoint_sha256": str(prepared.checkpoint_sha),
+        "task": task,
+        "graph": int(graph_id),
+        "output_carriage_rows": rows,
+    }
+
+
 def _measure_graph(
     config: ZincReachConfig,
     prepared: Any,
@@ -901,6 +1066,19 @@ def _shard_path(output_dir: Path, task: str, graph_id: int) -> Path:
     return output_dir / "cache" / task / f"graph_{int(graph_id):06d}.pt"
 
 
+def _output_carriage_shard_path(
+    output_dir: Path,
+    task: str,
+    graph_id: int,
+) -> Path:
+    return (
+        output_dir
+        / "output_carriage_cache"
+        / task
+        / f"graph_{int(graph_id):06d}.pt"
+    )
+
+
 def _load_shard(
     path: Path,
     *,
@@ -938,6 +1116,32 @@ def _save_shard(path: Path, payload: Mapping[str, Any]) -> None:
     temporary = path.with_suffix(".tmp")
     torch.save(dict(payload), temporary)
     os.replace(temporary, path)
+
+
+def _load_output_carriage_shard(
+    path: Path,
+    *,
+    analysis_version: str,
+    fingerprint: str,
+    checkpoint_sha256: str,
+) -> dict[str, Any] | None:
+    if not path.is_file():
+        return None
+    import torch
+
+    try:
+        payload = torch.load(path, map_location="cpu", weights_only=False)
+    except Exception:
+        return None
+    if (
+        payload.get("output_carriage_version") != OUTPUT_CARRIAGE_VERSION
+        or payload.get("analysis_version") != analysis_version
+        or payload.get("fingerprint") != fingerprint
+        or payload.get("checkpoint_sha256") != checkpoint_sha256
+        or "output_carriage_rows" not in payload
+    ):
+        return None
+    return payload
 
 
 def _full_test_rows(
@@ -1013,6 +1217,7 @@ def measure(
     donor_rows: list[dict[str, Any]] = []
     interpolation_rows: list[dict[str, Any]] = []
     bamberger_rows: list[dict[str, Any]] = []
+    output_carriage_rows: list[dict[str, Any]] = []
     graph_records: list[dict[str, Any]] = []
     full_test_records: list[dict[str, Any]] = []
     health: list[dict[str, Any]] = []
@@ -1063,6 +1268,26 @@ def measure(
             interpolation_rows.extend(shard["interpolation_rows"])
             bamberger_rows.extend(shard["bamberger_rows"])
             graph_records.append(dict(shard["graph_record"]))
+            output_path = _output_carriage_shard_path(
+                output_dir,
+                task,
+                int(graph_id),
+            )
+            output_shard = _load_output_carriage_shard(
+                output_path,
+                analysis_version=config.profile.analysis_version,
+                fingerprint=config.fingerprint,
+                checkpoint_sha256=str(prepared.checkpoint_sha),
+            )
+            if output_shard is None:
+                output_shard = _measure_output_carriage_graph(
+                    config,
+                    prepared,
+                    task=task,
+                    graph_id=int(graph_id),
+                )
+                _save_shard(output_path, output_shard)
+            output_carriage_rows.extend(output_shard["output_carriage_rows"])
             completed += 1
             if progress:
                 print(
@@ -1075,6 +1300,7 @@ def measure(
     _write_csv(results_dir / "donor_carrier_mass.csv", donor_rows)
     _write_csv(results_dir / "semantic_interpolation_mass.csv", interpolation_rows)
     _write_csv(results_dir / "bamberger_input_output_influence.csv", bamberger_rows)
+    _write_csv(results_dir / "semantic_output_carriage.csv", output_carriage_rows)
     _write_csv(results_dir / "graph_metrics.csv", graph_records)
     _write_csv(results_dir / "model_health.csv", health)
     _write_json(
@@ -1089,6 +1315,7 @@ def measure(
             "donor_rows": len(donor_rows),
             "interpolation_rows": len(interpolation_rows),
             "bamberger_rows": len(bamberger_rows),
+            "output_carriage_rows": len(output_carriage_rows),
             "graph_metric_rows": len(graph_records),
             "full_test_metric_rows": len(full_test_records),
             "comparison_scope": {
@@ -1131,6 +1358,13 @@ def measure(
                     "carrier, clean task-output projection, event normalisation, and "
                     "graph aggregation; its zero-dose-end TV is zero by construction"
                 ),
+                "output_coherence": (
+                    "signed scalar z-output carriage is integrated along each finite "
+                    "semantic donor path. Carrier contributions sum to the exact "
+                    "clean-minus-intervened output change; apparent shell mass sums "
+                    "magnitudes before carrier aggregation and coherent shell mass "
+                    "takes magnitude after signed carrier aggregation"
+                ),
                 "interpretation": (
                     "literal Bamberger versus Functional carriage remains an operational "
                     "estimand comparison. Departure from the matched smallest-dose profile "
@@ -1144,6 +1378,7 @@ def measure(
         "donor_rows": donor_rows,
         "interpolation_rows": interpolation_rows,
         "bamberger_rows": bamberger_rows,
+        "output_carriage_rows": output_carriage_rows,
         "graph_records": graph_records,
         "full_test_records": full_test_records,
         "health": health,
@@ -1248,6 +1483,208 @@ def graph_donor_profiles(
             }
         )
     return output
+
+
+def graph_output_coherence_profiles(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    effect_floor: float,
+) -> list[dict[str, Any]]:
+    """Build graph-balanced apparent/coherent profiles from signed output paths."""
+
+    event_fields = (
+        "task",
+        "graph",
+        "source",
+        "donor_graph",
+        "donor_node",
+        "draw",
+    )
+    events: dict[tuple[Any, ...], list[Mapping[str, Any]]] = defaultdict(list)
+    for row in rows:
+        events[tuple(row[field] for field in event_fields)].append(row)
+
+    source_profiles: dict[tuple[str, int, int, str, int], list[float]] = defaultdict(
+        list
+    )
+    active_sources: set[tuple[str, int, int, str]] = set()
+    ratio_numerator: dict[tuple[str, int, int], float] = defaultdict(float)
+    ratio_denominator: dict[tuple[str, int, int], float] = defaultdict(float)
+    task_max_distance: dict[str, int] = defaultdict(int)
+    for key, event_rows in events.items():
+        task, graph, source, _donor_graph, _donor_node, _draw = key
+        task = str(task)
+        graph = int(graph)
+        source = int(source)
+        distances = np.asarray(
+            [_integer(row, "distance") for row in event_rows],
+            dtype=np.int64,
+        )
+        signed = np.asarray(
+            [_float(row, "signed_output_carriage") for row in event_rows],
+            dtype=np.float64,
+        )
+        if not np.isfinite(signed).all():
+            raise RuntimeError("non-finite signed output carriage reached aggregation")
+        task_max_distance[task] = max(
+            int(task_max_distance[task]),
+            int(distances.max(initial=0)),
+        )
+        apparent_by_distance: dict[int, float] = {}
+        coherent_by_distance: dict[int, float] = {}
+        for distance in np.unique(distances):
+            selected = signed[distances == int(distance)]
+            apparent = float(np.abs(selected).sum())
+            coherent = float(abs(selected.sum()))
+            apparent_by_distance[int(distance)] = apparent
+            coherent_by_distance[int(distance)] = coherent
+            ratio_numerator[(task, graph, int(distance))] += coherent
+            ratio_denominator[(task, graph, int(distance))] += apparent
+        apparent_total = float(sum(apparent_by_distance.values()))
+        coherent_total = float(sum(coherent_by_distance.values()))
+        if apparent_total > float(effect_floor):
+            active_sources.add((task, graph, source, "apparent_mass"))
+            for distance, value in apparent_by_distance.items():
+                source_profiles[
+                    (task, graph, source, "apparent_mass", distance)
+                ].append(value / apparent_total)
+        if coherent_total > float(effect_floor):
+            active_sources.add((task, graph, source, "coherent_mass"))
+            for distance, value in coherent_by_distance.items():
+                source_profiles[
+                    (task, graph, source, "coherent_mass", distance)
+                ].append(value / coherent_total)
+
+    graph_profiles: dict[tuple[str, int, str, int], list[float]] = defaultdict(list)
+    for task, graph, source, metric in active_sources:
+        for distance in range(int(task_max_distance[task]) + 1):
+            donor_values = source_profiles.get(
+                (task, graph, source, metric, distance),
+                [],
+            )
+            graph_profiles[(task, graph, metric, distance)].append(
+                float(np.mean(donor_values)) if donor_values else 0.0
+            )
+
+    graph_keys = sorted({(key[0], key[1]) for key in graph_profiles})
+    output: list[dict[str, Any]] = []
+    for task, graph in graph_keys:
+        for distance in range(int(task_max_distance[task]) + 1):
+            apparent_values = graph_profiles.get(
+                (task, graph, "apparent_mass", distance),
+                [],
+            )
+            coherent_values = graph_profiles.get(
+                (task, graph, "coherent_mass", distance),
+                [],
+            )
+            denominator = ratio_denominator.get((task, graph, distance), 0.0)
+            output.append(
+                {
+                    "task": task,
+                    "model_label": TASK_LABELS[task],
+                    "graph": int(graph),
+                    "channel": "semantic",
+                    "distance": int(distance),
+                    "apparent_mass": (
+                        float(np.mean(apparent_values)) if apparent_values else 0.0
+                    ),
+                    "coherent_mass": (
+                        float(np.mean(coherent_values)) if coherent_values else 0.0
+                    ),
+                    "coherence_ratio": (
+                        ratio_numerator[(task, graph, distance)] / denominator
+                        if denominator > float(effect_floor)
+                        else np.nan
+                    ),
+                }
+            )
+    return output
+
+
+def summarise_output_coherence(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    bootstrap_replicates: int,
+    bootstrap_seed: int,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Summarise distance profiles and paired expected-distance contraction."""
+
+    profile_groups: dict[tuple[str, str, int], list[float]] = defaultdict(list)
+    for row in rows:
+        for metric in ("apparent_mass", "coherent_mass", "coherence_ratio"):
+            value = _float(row, metric)
+            if np.isfinite(value):
+                profile_groups[
+                    (str(row["task"]), metric, _integer(row, "distance"))
+                ].append(value)
+    profiles: list[dict[str, Any]] = []
+    for key, values in sorted(profile_groups.items()):
+        task, metric, distance = key
+        mean, low, high = _bootstrap_interval(
+            values,
+            replicates=int(bootstrap_replicates),
+            seed=int(bootstrap_seed)
+            + int(stable_hash({"output_coherence": key}, length=8), 16),
+        )
+        profiles.append(
+            {
+                "task": task,
+                "model_label": TASK_LABELS[task],
+                "metric": metric,
+                "distance": int(distance),
+                "mean": mean,
+                "low": low,
+                "high": high,
+                "graphs": int(len(values)),
+            }
+        )
+
+    by_graph: dict[tuple[str, int], list[Mapping[str, Any]]] = defaultdict(list)
+    for row in rows:
+        by_graph[(str(row["task"]), _integer(row, "graph"))].append(row)
+    expected_by_task: dict[tuple[str, str], list[float]] = defaultdict(list)
+    for (task, _graph), graph_rows in by_graph.items():
+        expected: dict[str, float] = {}
+        for metric in ("apparent_mass", "coherent_mass"):
+            mass = np.asarray(
+                [_float(row, metric) for row in graph_rows],
+                dtype=np.float64,
+            )
+            distances = np.asarray(
+                [_integer(row, "distance") for row in graph_rows],
+                dtype=np.float64,
+            )
+            total = float(mass.sum())
+            if total > 0:
+                expected[metric] = float(np.dot(mass, distances) / total)
+                expected_by_task[(task, metric)].append(expected[metric])
+        if {"apparent_mass", "coherent_mass"}.issubset(expected):
+            expected_by_task[(task, "expected_distance_change")].append(
+                expected["coherent_mass"] - expected["apparent_mass"]
+            )
+
+    expected_rows: list[dict[str, Any]] = []
+    for key, values in sorted(expected_by_task.items()):
+        task, metric = key
+        mean, low, high = _bootstrap_interval(
+            values,
+            replicates=int(bootstrap_replicates),
+            seed=int(bootstrap_seed)
+            + int(stable_hash({"output_expected": key}, length=8), 16),
+        )
+        expected_rows.append(
+            {
+                "task": task,
+                "model_label": TASK_LABELS[task],
+                "metric": metric,
+                "mean": mean,
+                "low": low,
+                "high": high,
+                "graphs": int(len(values)),
+            }
+        )
+    return profiles, expected_rows
 
 
 def graph_bamberger_profiles(
@@ -2464,6 +2901,175 @@ def plot_expected_distance(
     return _save_figure(fig, figures_dir, f"{figure_prefix}_expected_reach")
 
 
+def plot_output_coherence(
+    profile_rows: Sequence[Mapping[str, Any]],
+    expected_rows: Sequence[Mapping[str, Any]],
+    *,
+    figures_dir: Path,
+    tasks: Sequence[str],
+    dataset_label: str,
+    figure_prefix: str,
+) -> dict[str, str]:
+    """Show how much finite semantic output carriage survives carrier cancellation."""
+
+    import matplotlib.pyplot as plt
+
+    _figure_theme()
+    fig, axes = plt.subplots(2, 2, figsize=(10.8, 7.0))
+    profile_specs = (
+        (
+            axes[0, 0],
+            "apparent_mass",
+            "Apparent output carriage",
+            "Normalised output-carriage mass",
+        ),
+        (
+            axes[0, 1],
+            "coherent_mass",
+            "Coherent output carriage",
+            "Normalised output-carriage mass",
+        ),
+        (
+            axes[1, 0],
+            "coherence_ratio",
+            "Carriage surviving within-shell cancellation",
+            "Coherent / apparent mass",
+        ),
+    )
+    for axis, metric, title, ylabel in profile_specs:
+        for draw_order, task in enumerate(tasks):
+            values = sorted(
+                (
+                    row
+                    for row in profile_rows
+                    if str(row["task"]) == task and str(row["metric"]) == metric
+                ),
+                key=lambda row: _integer(row, "distance"),
+            )
+            if not values:
+                continue
+            x = np.asarray([_integer(value, "distance") for value in values])
+            mean = np.asarray([_float(value, "mean") for value in values])
+            low = np.asarray([_float(value, "low") for value in values])
+            high = np.asarray([_float(value, "high") for value in values])
+            axis.fill_between(
+                x,
+                low,
+                high,
+                color=MODEL_COLOURS[task],
+                alpha=0.09,
+                linewidth=0,
+                zorder=1 + draw_order,
+            )
+            axis.plot(
+                x,
+                mean,
+                color=MODEL_COLOURS[task],
+                marker=MODEL_MARKERS[task],
+                linestyle=MODEL_LINESTYLES[task],
+                markerfacecolor="white",
+                markeredgewidth=1.0,
+                markersize=4.2,
+                linewidth=1.8,
+                label=TASK_LABELS[task],
+                zorder=5 + draw_order,
+            )
+        axis.set_title(title)
+        axis.set_xlabel("Shortest-path distance")
+        axis.set_ylabel(ylabel)
+        axis.set_ylim(bottom=0)
+        axis.xaxis.set_major_locator(plt.MaxNLocator(integer=True))
+    top_limit = max(axes[0, 0].get_ylim()[1], axes[0, 1].get_ylim()[1])
+    axes[0, 0].set_ylim(0, top_limit)
+    axes[0, 1].set_ylim(0, top_limit)
+    axes[1, 0].set_ylim(0, 1.05)
+    axes[1, 0].axhline(1, color="#777777", linewidth=0.8, zorder=0)
+    axes[1, 0].text(
+        0.97,
+        0.94,
+        "1 = no within-shell cancellation",
+        transform=axes[1, 0].transAxes,
+        ha="right",
+        va="top",
+        color="#666666",
+        fontsize=7.5,
+    )
+
+    contraction_axis = axes[1, 1]
+    positions = np.arange(len(tasks), dtype=np.float64)
+    values_by_task = {
+        str(row["task"]): row
+        for row in expected_rows
+        if str(row["metric"]) == "expected_distance_change"
+    }
+    for index, task in enumerate(tasks):
+        value = values_by_task.get(task)
+        if value is None:
+            continue
+        mean = _float(value, "mean")
+        low = _float(value, "low")
+        high = _float(value, "high")
+        contraction_axis.errorbar(
+            positions[index],
+            mean,
+            yerr=np.asarray([[mean - low], [high - mean]]),
+            fmt=MODEL_MARKERS[task],
+            markerfacecolor="white",
+            markeredgewidth=1.2,
+            markersize=5.5,
+            capsize=2.5,
+            color=MODEL_COLOURS[task],
+            linewidth=1.4,
+        )
+    contraction_axis.axhline(0, color="#666666", linewidth=0.9, zorder=0)
+    contraction_axis.set_title("Expected-distance change after cancellation")
+    contraction_axis.set_ylabel("Coherent minus apparent distance")
+    contraction_axis.set_xticks(positions)
+    contraction_axis.set_xticklabels(
+        [TASK_LABELS[task] for task in tasks],
+        rotation=22,
+        ha="right",
+    )
+
+    handles, labels = axes[0, 0].get_legend_handles_labels()
+    fig.legend(
+        handles,
+        labels,
+        loc="upper center",
+        bbox_to_anchor=(0.5, 0.925),
+        ncol=len(tasks),
+        frameon=False,
+        handlelength=2.7,
+        columnspacing=1.4,
+    )
+    fig.suptitle(
+        f"Apparent and coherent finite semantic carriage on {dataset_label}",
+        fontsize=13,
+        y=0.992,
+    )
+    fig.text(
+        0.5,
+        0.872,
+        "Signed scalar-output path integration; mean with 95% graph-bootstrap interval",
+        ha="center",
+        color="#666666",
+        fontsize=8.5,
+    )
+    fig.subplots_adjust(
+        left=0.09,
+        right=0.985,
+        bottom=0.13,
+        top=0.82,
+        wspace=0.25,
+        hspace=0.38,
+    )
+    return _save_figure(
+        fig,
+        figures_dir,
+        f"{figure_prefix}_semantic_output_coherence",
+    )
+
+
 def plot_scale_dependence(
     rows: Sequence[Mapping[str, Any]],
     *,
@@ -2743,12 +3349,14 @@ def figures(
     donor_path = results_dir / "donor_carrier_mass.csv"
     interpolation_path = results_dir / "semantic_interpolation_mass.csv"
     bamberger_path = results_dir / "bamberger_input_output_influence.csv"
+    output_carriage_path = results_dir / "semantic_output_carriage.csv"
     graph_metrics_path = results_dir / "graph_metrics.csv"
     full_test_metrics_path = results_dir / "full_test_metrics.csv"
     if (
         not donor_path.is_file()
         or not interpolation_path.is_file()
         or not bamberger_path.is_file()
+        or not output_carriage_path.is_file()
         or not graph_metrics_path.is_file()
         or not full_test_metrics_path.is_file()
     ):
@@ -2766,6 +3374,17 @@ def figures(
     interpolation_graph = graph_interpolation_profiles(
         _read_csv(interpolation_path),
         effect_floor=float(config.effect_floor),
+    )
+    output_coherence_graph = graph_output_coherence_profiles(
+        _read_csv(output_carriage_path),
+        effect_floor=float(config.effect_floor),
+    )
+    output_coherence_profiles, output_coherence_expected = (
+        summarise_output_coherence(
+            output_coherence_graph,
+            bootstrap_replicates=int(config.bootstrap_replicates),
+            bootstrap_seed=int(config.analysis_seed) + 500,
+        )
     )
     interpolation_contrasts, interpolation_summary = (
         summarise_interpolation_contrasts(
@@ -2816,6 +3435,18 @@ def figures(
     _write_csv(results_dir / "scale_dependence_graph_rows.csv", scale_rows)
     _write_csv(results_dir / "scale_dependence_summary.csv", scale_summary)
     _write_csv(results_dir / "scale_trend_slopes.csv", scale_trends)
+    _write_csv(
+        results_dir / "output_coherence_graph_profiles.csv",
+        output_coherence_graph,
+    )
+    _write_csv(
+        results_dir / "output_coherence_profile_summary.csv",
+        output_coherence_profiles,
+    )
+    _write_csv(
+        results_dir / "output_coherence_expected_distance.csv",
+        output_coherence_expected,
+    )
 
     figures_dir = output_dir / "figures"
     paths = {
@@ -2865,6 +3496,14 @@ def figures(
             dataset_label=config.profile.name,
             figure_prefix=config.profile.figure_prefix,
         ),
+        "output_coherence": plot_output_coherence(
+            output_coherence_profiles,
+            output_coherence_expected,
+            figures_dir=figures_dir,
+            tasks=config.tasks,
+            dataset_label=config.profile.name,
+            figure_prefix=config.profile.figure_prefix,
+        ),
         "scale_dependence": plot_scale_dependence(
             scale_summary,
             figures_dir=figures_dir,
@@ -2897,6 +3536,9 @@ def figures(
                 "analysis uses every test molecule; carriage-scale analysis uses the "
                 "registered graph sample. Adjacent integer values are merged into "
                 "density-adaptive bins, and continuous slopes use paired bootstraps."
+                " Output-coherence profiles integrate the scalar z-output along each "
+                "finite semantic donor path and compare carrier magnitudes before and "
+                "after signed within-distance aggregation."
             ),
         },
     )
@@ -2908,6 +3550,8 @@ def figures(
         "interpolation_rows": interpolation_summary,
         "scale_rows": scale_summary,
         "scale_trends": scale_trends,
+        "output_coherence_profiles": output_coherence_profiles,
+        "output_coherence_expected": output_coherence_expected,
     }
 
 

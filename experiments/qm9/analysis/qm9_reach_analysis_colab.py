@@ -184,6 +184,9 @@ print(
     "[scope] Scale analysis: MAE uses every test molecule; Functional reach uses "
     "the 64 carriage graphs. Adjacent values are grouped adaptively by data density, "
     "and continuous paired-bootstrap slopes avoid dependence on bin boundaries.\n"
+    "[scope] Cancellation analysis: signed scalar-output carriage is integrated "
+    "along each finite semantic donor path. Apparent mass sums carrier magnitudes; "
+    "coherent mass sums signed carriers before taking magnitude.\n"
     "[scope] Fairness: checkpoints, graphs, SPD and carrier site are shared; "
     "literal Bamberger remains output-centric and channel-subsampled.\n"
     "[scope] Interpretation: this is an estimand comparison, not a learned-route "
@@ -287,6 +290,17 @@ if "scale_trends" in result:
     except ImportError:
         pass
 
+if "output_coherence_expected" in result:
+    from IPython.display import display
+
+    try:
+        import pandas as pd
+
+        print("\nApparent-versus-coherent expected distance", flush=True)
+        display(pd.DataFrame(result["output_coherence_expected"]))
+    except ImportError:
+        pass
+
 if "figures" in result:
     from IPython.display import Image, display
 
@@ -296,6 +310,7 @@ if "figures" in result:
         "semantic_bamberger",
         "structural_functional",
         "expected_distance",
+        "output_coherence",
         "scale_dependence",
         "scale_slopes",
     ):

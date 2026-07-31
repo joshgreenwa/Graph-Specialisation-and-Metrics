@@ -420,6 +420,22 @@ class CanonicalGritBackend:
 
         return evaluate
 
+    def output_from_pooled(self, target):
+        """Differentiable exact pooled-state replay in canonical z-output space."""
+
+        from ..carriage.grit_runner import _pooled_head_predictions
+
+        def evaluate(pooled):
+            prediction = _pooled_head_predictions(self.gm.model, pooled, target)
+            output = self._z(prediction).reshape(int(pooled.shape[0]), -1)
+            if int(output.shape[1]) != 1:
+                raise ValueError(
+                    "signed output carriage requires exactly one transformed output"
+                )
+            return output[:, 0]
+
+        return evaluate
+
     def carriage_weights(self, data: Any, final_state) -> Any:
         """Linear real-node pooling weights used by the exact carriage integral."""
 

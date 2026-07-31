@@ -15,9 +15,11 @@ from graph_specialisation_metrics.zinc_reach_analysis import (
     graph_bamberger_profiles,
     graph_donor_profiles,
     graph_interpolation_profiles,
+    graph_output_coherence_profiles,
     summarise_dense_profile_contrasts,
     summarise_graph_profiles,
     summarise_interpolation_contrasts,
+    summarise_output_coherence,
     summarise_scale_dependence,
 )
 
@@ -88,6 +90,54 @@ def test_semantic_interpolation_scales_linear_functional_mass(monkeypatch):
     )
     assert torch.allclose(actual[0], 0.25 * full_mass, atol=1.0e-6)
     assert torch.allclose(actual[1], full_mass)
+
+
+def test_signed_output_path_carriage_is_complete_and_preserves_cancellation():
+    clean = torch.tensor([[2.0], [1.0]])
+    intervened = torch.tensor([[1.0], [2.0]])
+    capture = SimpleNamespace(
+        final_state=torch.stack((clean, intervened)),
+        z=torch.tensor([[3.0], [3.0]]),
+        target=torch.zeros(2, 1),
+    )
+
+    class Backend:
+        def capture_groups(self, groups):
+            assert len(groups) == 1 and len(groups[0]) == 2
+            return [capture]
+
+        def output_from_pooled(self, target):
+            assert tuple(target.shape) == (1, 1)
+            return lambda pooled: pooled[:, 0]
+
+        def carriage_weights(self, _base, states):
+            return torch.ones(states.shape[-2])
+
+    prepared = SimpleNamespace(backend=Backend())
+    base = SimpleNamespace(
+        num_nodes=2,
+        edge_index=torch.tensor([[0, 1], [1, 0]], dtype=torch.long),
+    )
+    event = SimpleNamespace(
+        source=0,
+        donor_graph_id=9,
+        donor_node=1,
+        draw=0,
+    )
+    rows = reach._signed_output_carriage_rows(
+        ZincReachConfig(tasks=("zinc",)),
+        prepared,
+        task="zinc",
+        graph_id=0,
+        base=base,
+        variants=[SimpleNamespace()],
+        events=[event],
+    )
+
+    signed = [row["signed_output_carriage"] for row in rows]
+    assert signed == pytest.approx([1.0, -1.0])
+    assert sum(signed) == pytest.approx(0.0)
+    assert all(abs(row["completeness_residual"]) < 1.0e-7 for row in rows)
 
 
 def test_discover_seed_checkpoint_prefers_recovery_best(tmp_path: Path):
@@ -200,6 +250,54 @@ def _raw_full_test_records(tasks=TASKS):
         for task_index, task in enumerate(tasks)
         for graph in range(24)
     ]
+
+
+def _raw_output_carriage(tasks=TASKS):
+    values = ((0, 0, 1.0), (1, 1, 2.0), (2, 1, -1.0), (3, 2, 0.5))
+    return [
+        {
+            "task": task,
+            "model_label": reach.TASK_LABELS[task],
+            "graph": graph,
+            "channel": "semantic",
+            "source": 0,
+            "donor_graph": 9,
+            "donor_node": 1,
+            "draw": 0,
+            "carrier": carrier,
+            "distance": distance,
+            "signed_output_carriage": signed,
+        }
+        for task in tasks
+        for graph in (0, 1)
+        for carrier, distance, signed in values
+    ]
+
+
+def test_output_coherence_reveals_within_shell_cancellation():
+    graph_rows = graph_output_coherence_profiles(
+        _raw_output_carriage(("zinc",)),
+        effect_floor=1.0e-12,
+    )
+    distance_one = next(
+        row
+        for row in graph_rows
+        if row["graph"] == 0 and row["distance"] == 1
+    )
+    assert distance_one["apparent_mass"] == pytest.approx(3.0 / 4.5)
+    assert distance_one["coherent_mass"] == pytest.approx(1.0 / 2.5)
+    assert distance_one["coherence_ratio"] == pytest.approx(1.0 / 3.0)
+
+    profiles, expected = summarise_output_coherence(
+        graph_rows,
+        bootstrap_replicates=40,
+        bootstrap_seed=12,
+    )
+    assert profiles
+    change = next(
+        row for row in expected if row["metric"] == "expected_distance_change"
+    )
+    assert change["mean"] == pytest.approx(0.8 - 4.0 / 4.5)
 
 
 def test_adaptive_scale_bins_use_available_integer_resolution():
@@ -349,6 +447,7 @@ def test_figure_only_builds_png_and_pdf(tmp_path: Path):
         (results / "semantic_interpolation_mass.csv", interpolation),
         (results / "graph_metrics.csv", _raw_graph_records()),
         (results / "full_test_metrics.csv", _raw_full_test_records()),
+        (results / "semantic_output_carriage.csv", _raw_output_carriage()),
     ):
         with path.open("w", newline="", encoding="utf-8") as handle:
             writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
@@ -365,6 +464,7 @@ def test_figure_only_builds_png_and_pdf(tmp_path: Path):
         "semantic_bamberger",
         "structural_functional",
         "expected_distance",
+        "output_coherence",
         "scale_dependence",
         "scale_slopes",
     }
@@ -391,6 +491,10 @@ def test_qm9_profile_builds_dataset_specific_figures(tmp_path: Path):
             results / "full_test_metrics.csv",
             _raw_full_test_records(QM9_TASKS),
         ),
+        (
+            results / "semantic_output_carriage.csv",
+            _raw_output_carriage(QM9_TASKS),
+        ),
     ):
         with path.open("w", newline="", encoding="utf-8") as handle:
             writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
@@ -411,6 +515,7 @@ def test_qm9_profile_builds_dataset_specific_figures(tmp_path: Path):
         "semantic_bamberger",
         "structural_functional",
         "expected_distance",
+        "output_coherence",
         "scale_dependence",
         "scale_slopes",
     }
