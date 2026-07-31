@@ -767,7 +767,8 @@ def _plot_head_scatter(
             ax.set_ylim(bottom=0.0)
         elif guides == "ablation":
             ax.set_xlim(left=0.0)
-            ax.set_ylim(bottom=0.0)
+            # Keep the population-correlation annotation above the observed cloud.
+            ax.set_ylim(0.0, 16.0)
         ax.set_xlabel(xlabel)
         ax.set_ylabel(ylabel)
         ax.set_title(title)
