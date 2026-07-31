@@ -219,7 +219,6 @@ def build_graphbench_population_figure_data(
         raw_structural = np.asarray(_value(coordinates, "raw_structural"), dtype=np.float64)
         joint = np.asarray(_value(coordinates, "joint_sensitivity"), dtype=np.float64)
         selectivity = np.asarray(_value(coordinates, "selectivity"), dtype=np.float64)
-        active = np.asarray(_value(coordinates, "active"), dtype=bool)
         layers, heads = joint.shape
         names = [
             f"head_L{layer}_H{head}"
@@ -244,9 +243,7 @@ def build_graphbench_population_figure_data(
                 "raw_structural": raw_structural,
                 "joint_sensitivity": joint,
                 "selectivity": selectivity,
-                "active": active,
                 "clean_ablation": clean,
-                "layer": np.repeat(np.arange(layers), heads).reshape(joint.shape),
             }
         )
 
@@ -297,7 +294,18 @@ def _theme(config: MethodologyConfig) -> FigureTheme:
         values[FOCUSED_GRAPHBENCH_TASK], Mapping
     ):
         values = values[FOCUSED_GRAPHBENCH_TASK]
-    return FigureTheme().with_overrides(values)
+    return FigureTheme(
+        width=4.2,
+        height=3.55,
+        dpi=600,
+        font_size=9.5,
+        label_size=10.0,
+        title_size=10.5,
+        tick_size=8.5,
+        marker_size=32.0,
+        line_width=1.2,
+        grid_alpha=0.14,
+    ).with_overrides(values)
 
 
 def _seed_handles(seeds: Sequence[int], theme: FigureTheme):
@@ -311,6 +319,7 @@ def _seed_handles(seeds: Sequence[int], theme: FigureTheme):
             marker=SEED_MARKERS[position % len(SEED_MARKERS)],
             linestyle="none",
             markerfacecolor="none",
+            markeredgewidth=0.9,
             label=f"Seed {int(seed)}",
         )
         for position, seed in enumerate(seeds)
@@ -326,7 +335,9 @@ def _family_handles(theme: FigureTheme):
             [0],
             color=color,
             marker="o",
-            linewidth=theme.line_width,
+            linestyle="none",
+            markeredgecolor="white",
+            markeredgewidth=0.5,
             label=f"{family.title()}-scoring heads",
         )
         for family, color in zip(
@@ -334,6 +345,90 @@ def _family_handles(theme: FigureTheme):
             (theme.semantic_color, theme.structural_color),
         )
     ]
+
+
+def _style_axis(ax: Any) -> None:
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.grid(axis="y", alpha=0.14, linewidth=0.55)
+    ax.set_axisbelow(True)
+
+
+def _colour_intervention_ticks(ax: Any, theme: FigureTheme) -> None:
+    labels = ax.get_xticklabels()
+    if len(labels) >= 2:
+        labels[0].set_color(theme.semantic_color)
+        labels[1].set_color(theme.structural_color)
+
+
+def _legend_below(fig: Any, handles: Sequence[Any], *, ncol: int) -> None:
+    fig.legend(
+        handles=handles,
+        frameon=False,
+        loc="lower center",
+        bbox_to_anchor=(0.5, 0.01),
+        ncol=ncol,
+        columnspacing=1.15,
+        handletextpad=0.45,
+        borderaxespad=0,
+    )
+
+
+def _family_population_marks(
+    ax: Any,
+    values: np.ndarray,
+    population: Mapping[str, Any],
+    seeds: Sequence[int],
+    theme: FigureTheme,
+) -> None:
+    """Categorical four-seed points plus the seed-bootstrap population interval."""
+
+    x = np.arange(2, dtype=np.float64)
+    seed_jitter = np.linspace(-0.027, 0.027, len(seeds))
+    for family_position, (color, offset) in enumerate(
+        zip(
+            (theme.semantic_color, theme.structural_color),
+            (-0.13, 0.13),
+        )
+    ):
+        for seed_position, _seed in enumerate(seeds):
+            ax.scatter(
+                x + offset + seed_jitter[seed_position],
+                values[seed_position, family_position],
+                marker=SEED_MARKERS[seed_position % len(SEED_MARKERS)],
+                s=theme.marker_size * 0.56,
+                facecolors="white",
+                edgecolors=color,
+                linewidths=0.85,
+                alpha=0.90,
+                zorder=4,
+            )
+        estimate = np.asarray(population["estimate"], dtype=np.float64)[
+            family_position
+        ]
+        low = np.asarray(population["low"], dtype=np.float64)[family_position]
+        high = np.asarray(population["high"], dtype=np.float64)[family_position]
+        yerr = np.maximum(
+            0.0,
+            np.vstack((estimate - low, high - estimate)),
+        )
+        ax.errorbar(
+            x + offset,
+            estimate,
+            yerr=yerr if np.isfinite(yerr).all() else None,
+            fmt="o",
+            color=color,
+            markerfacecolor=color,
+            markeredgecolor="white",
+            markeredgewidth=0.55,
+            markersize=6.0,
+            linewidth=1.25,
+            capsize=3.0,
+            capthick=1.0,
+            linestyle="none",
+            zorder=5,
+        )
+    ax.set_xlim(-0.28, 1.28)
 
 
 def _plot_family_by_channel(
@@ -349,59 +444,22 @@ def _plot_family_by_channel(
 
     with publication_style(theme):
         fig, ax = plt.subplots(figsize=(theme.width, theme.height))
-        x = np.arange(2, dtype=np.float64)
-        colors = (theme.semantic_color, theme.structural_color)
-        offsets = (-0.11, 0.11)
-        for family_position, (color, offset) in enumerate(zip(colors, offsets)):
-            for seed_position, _seed in enumerate(seeds):
-                ax.scatter(
-                    x + offset,
-                    values[seed_position, family_position],
-                    marker=SEED_MARKERS[seed_position % len(SEED_MARKERS)],
-                    s=theme.marker_size * 0.68,
-                    facecolors="none",
-                    edgecolors=color,
-                    linewidths=0.9,
-                    alpha=0.72,
-                    zorder=4,
-                )
-            estimate = np.asarray(population["estimate"])[family_position]
-            low = np.asarray(population["low"])[family_position]
-            high = np.asarray(population["high"])[family_position]
-            ax.plot(
-                x + offset,
-                estimate,
-                color=color,
-                marker="o",
-                linewidth=theme.line_width,
-                markersize=5.2,
-                zorder=3,
-            )
-            if np.isfinite(low).all() and np.isfinite(high).all():
-                ax.errorbar(
-                    x + offset,
-                    estimate,
-                    yerr=np.vstack((estimate - low, high - estimate)),
-                    fmt="none",
-                    color=color,
-                    linewidth=1.0,
-                    capsize=2.5,
-                    zorder=2,
-                )
-        ax.axhline(0.0, color=theme.central_color, linewidth=0.8, alpha=0.8)
-        ax.set_xticks(x, ("Semantic event", "Structural event"))
+        _family_population_marks(ax, values, population, seeds, theme)
+        ax.axhline(0.0, color="#9A9A9A", linewidth=0.75)
+        ax.set_xticks(
+            np.arange(2, dtype=np.float64),
+            ("Semantic intervention", "Structural intervention"),
+        )
+        _colour_intervention_ticks(ax, theme)
         ax.set_ylabel(ylabel)
         ax.set_title(title)
-        ax.grid(axis="y", alpha=theme.grid_alpha, linewidth=0.5)
-        fig.legend(
-            handles=_family_handles(theme) + _seed_handles(seeds, theme),
-            frameon=False,
-            loc="upper center",
-            bbox_to_anchor=(0.5, 0.02),
+        _style_axis(ax)
+        _legend_below(
+            fig,
+            _family_handles(theme) + _seed_handles(seeds, theme),
             ncol=3,
-            fontsize=theme.tick_size - 0.5,
         )
-        fig.subplots_adjust(bottom=0.25)
+        fig.subplots_adjust(bottom=0.27, left=0.16, right=0.98, top=0.90)
     return fig, ax
 
 
@@ -415,75 +473,41 @@ def _plot_absolute_patching(data: Mapping[str, Any], theme: FigureTheme):
         fig, axes = plt.subplots(
             1,
             2,
-            figsize=(theme.width * 1.72, theme.height),
-            sharey=False,
+            figsize=(theme.width * 2.0, theme.height),
+            sharey=True,
         )
-        for metric_position, (ax, title, ylabel) in enumerate(
+        for metric_position, (ax, title) in enumerate(
             zip(
                 axes,
-                ("Restoration", "Injection"),
-                ("Aligned restoration", "Aligned injection"),
+                ("Causal restoration", "Causal injection"),
             )
         ):
-            x = np.arange(2, dtype=np.float64)
-            for family_position, (color, offset) in enumerate(
-                zip(
-                    (theme.semantic_color, theme.structural_color),
-                    (-0.11, 0.11),
-                )
-            ):
-                for seed_position, _seed in enumerate(seeds):
-                    ax.scatter(
-                        x + offset,
-                        values[seed_position, metric_position, family_position],
-                        marker=SEED_MARKERS[seed_position % len(SEED_MARKERS)],
-                        s=theme.marker_size * 0.68,
-                        facecolors="none",
-                        edgecolors=color,
-                        linewidths=0.9,
-                        alpha=0.72,
-                        zorder=4,
-                    )
-                estimate = np.asarray(population["estimate"])[
-                    metric_position, family_position
-                ]
-                low = np.asarray(population["low"])[metric_position, family_position]
-                high = np.asarray(population["high"])[metric_position, family_position]
-                ax.plot(
-                    x + offset,
-                    estimate,
-                    color=color,
-                    marker="o",
-                    linewidth=theme.line_width,
-                    markersize=5.2,
-                    zorder=3,
-                )
-                if np.isfinite(low).all() and np.isfinite(high).all():
-                    ax.errorbar(
-                        x + offset,
-                        estimate,
-                        yerr=np.vstack((estimate - low, high - estimate)),
-                        fmt="none",
-                        color=color,
-                        linewidth=1.0,
-                        capsize=2.5,
-                        zorder=2,
-                    )
-            ax.axhline(0.0, color=theme.central_color, linewidth=0.8, alpha=0.8)
-            ax.set_xticks(x, ("Semantic event", "Structural event"))
+            metric_population = {
+                key: np.asarray(population[key])[metric_position]
+                for key in ("estimate", "low", "high")
+            }
+            _family_population_marks(
+                ax,
+                values[:, metric_position],
+                metric_population,
+                seeds,
+                theme,
+            )
+            ax.axhline(0.0, color="#9A9A9A", linewidth=0.75)
+            ax.set_xticks(
+                np.arange(2, dtype=np.float64),
+                ("Semantic intervention", "Structural intervention"),
+            )
+            _colour_intervention_ticks(ax, theme)
             ax.set_title(title)
-            ax.set_ylabel(ylabel)
-            ax.grid(axis="y", alpha=theme.grid_alpha, linewidth=0.5)
-        fig.suptitle("Absolute raw matched-graph patch response")
-        fig.legend(
-            handles=_family_handles(theme) + _seed_handles(seeds, theme),
-            frameon=False,
-            loc="upper center",
-            bbox_to_anchor=(0.5, 0.02),
-            ncol=3,
-            fontsize=theme.tick_size - 0.5,
+            _style_axis(ax)
+        axes[0].set_ylabel("Aligned change in model output")
+        _legend_below(
+            fig,
+            _family_handles(theme) + _seed_handles(seeds, theme),
+            ncol=6,
         )
-        fig.subplots_adjust(bottom=0.25, top=0.84, wspace=0.30)
+        fig.subplots_adjust(bottom=0.23, left=0.09, right=0.99, top=0.89, wspace=0.16)
     return fig, axes
 
 
@@ -497,40 +521,60 @@ def _plot_preferential_mediation(data: Mapping[str, Any], theme: FigureTheme):
     x = np.arange(2, dtype=np.float64)
     with publication_style(theme):
         fig, ax = plt.subplots(figsize=(theme.width, theme.height))
-        for seed_position, seed in enumerate(seeds):
+        seed_jitter = np.linspace(-0.035, 0.035, len(seeds))
+        for seed_position, _seed in enumerate(seeds):
             ax.scatter(
-                x,
+                x + seed_jitter[seed_position],
                 values[seed_position],
                 marker=SEED_MARKERS[seed_position % len(SEED_MARKERS)],
-                s=theme.marker_size * 0.8,
-                facecolors="none",
+                s=theme.marker_size * 0.62,
+                facecolors="white",
                 edgecolors=theme.central_color,
-                linewidths=1.0,
-                alpha=0.8,
-                label=f"Seed {int(seed)} (n={int(data['pair_counts'][seed_position])} pairs)",
-                zorder=2,
+                linewidths=0.85,
+                alpha=0.9,
+                zorder=4,
             )
         estimate = np.asarray(population["estimate"])
         low = np.asarray(population["low"])
         high = np.asarray(population["high"])
-        ax.scatter(x, estimate, marker="D", s=theme.marker_size * 1.05, color="#222222", zorder=4)
-        if np.isfinite(low).all() and np.isfinite(high).all():
-            ax.errorbar(
-                x,
-                estimate,
-                yerr=np.vstack((estimate - low, high - estimate)),
-                fmt="none",
-                color="#222222",
-                linewidth=1.2,
-                capsize=3,
-                zorder=3,
-            )
-        ax.axhline(0.0, color=theme.central_color, linewidth=0.8)
+        yerr = np.maximum(0.0, np.vstack((estimate - low, high - estimate)))
+        ax.errorbar(
+            x,
+            estimate,
+            yerr=yerr if np.isfinite(yerr).all() else None,
+            fmt="o",
+            color="#4F4F4F",
+            markerfacecolor="#4F4F4F",
+            markeredgecolor="white",
+            markeredgewidth=0.55,
+            markersize=6.2,
+            linewidth=1.3,
+            capsize=3.0,
+            capthick=1.0,
+            linestyle="none",
+            zorder=5,
+        )
+        ax.axhline(0.0, color="#9A9A9A", linewidth=0.75)
         ax.set_xticks(x, ("Restoration", "Injection"))
-        ax.set_ylabel(r"Matched-$J$ family-by-channel interaction $\Delta\Delta$")
-        ax.set_title("Preferential causal mediation")
-        ax.grid(axis="y", alpha=theme.grid_alpha, linewidth=0.5)
-        ax.legend(frameon=False, fontsize=theme.tick_size - 0.5, loc="best")
+        ax.set_ylabel(r"Intervention-specific mediation, $\Delta\Delta$")
+        ax.set_title("Causal mediation contrasts")
+        _style_axis(ax)
+        from matplotlib.lines import Line2D
+
+        mean_handle = Line2D(
+            [0],
+            [0],
+            color="#4F4F4F",
+            marker="o",
+            linestyle="none",
+            label="Four-seed mean (95% CI)",
+        )
+        _legend_below(
+            fig,
+            _seed_handles(seeds, theme) + [mean_handle],
+            ncol=3,
+        )
+        fig.subplots_adjust(bottom=0.27, left=0.17, right=0.98, top=0.90)
     return fig, ax
 
 
@@ -544,70 +588,78 @@ def _plot_head_scatter(
     ylabel: str,
     title: str,
     guides: str | None = None,
+    statistic: str | None = None,
 ):
     import matplotlib.pyplot as plt
 
     seeds = data["seeds"]
-    layer_count = max(int(np.max(row["layer"])) for row in data["heads"]) + 1
-    normalizer = plt.Normalize(0, max(1, layer_count - 1))
-    cmap = plt.get_cmap(theme.layer_cmap)
     with publication_style(theme):
-        fig, ax = plt.subplots(figsize=(theme.width * 1.08, theme.height))
+        fig, ax = plt.subplots(figsize=(theme.width, theme.height))
         all_x: list[np.ndarray] = []
         all_y: list[np.ndarray] = []
         for seed_position, row in enumerate(data["heads"]):
             x = np.asarray(row[x_name]).reshape(-1)
             y = np.asarray(row[y_name]).reshape(-1)
-            layer = np.asarray(row["layer"]).reshape(-1)
             finite = np.isfinite(x) & np.isfinite(y)
             all_x.append(x[finite])
             all_y.append(y[finite])
             ax.scatter(
                 x[finite],
                 y[finite],
-                c=layer[finite],
-                cmap=cmap,
-                norm=normalizer,
                 marker=SEED_MARKERS[seed_position % len(SEED_MARKERS)],
-                s=theme.marker_size * 0.52,
-                alpha=0.62,
+                s=theme.marker_size * 0.46,
+                color="#666666",
+                alpha=0.48,
                 linewidths=0.25,
-                edgecolors="face",
+                edgecolors="white",
                 zorder=2,
             )
         if guides == "identity":
             finite_values = np.concatenate(all_x + all_y)
-            lower, upper = float(np.min(finite_values)), float(np.max(finite_values))
+            upper = max(1e-12, float(np.max(finite_values)) * 1.04)
             ax.plot(
-                (lower, upper),
-                (lower, upper),
-                color=theme.central_color,
-                linewidth=0.8,
+                (0.0, upper),
+                (0.0, upper),
+                color="#9A9A9A",
+                linewidth=0.75,
                 linestyle="--",
-                alpha=0.8,
+                zorder=1,
             )
-        elif guides == "specialisation":
-            threshold = float(data["preference_threshold"])
-            floor = float(data["activity_floor"])
-            ax.axvspan(-threshold, threshold, color=theme.central_color, alpha=0.08)
-            ax.axvline(-threshold, color=theme.central_color, linewidth=0.7, linestyle="--")
-            ax.axvline(threshold, color=theme.central_color, linewidth=0.7, linestyle="--")
-            ax.axhline(floor, color=theme.central_color, linewidth=0.8, linestyle="--")
+            ax.set(xlim=(0.0, upper), ylim=(0.0, upper))
+            ax.set_aspect("equal", adjustable="box")
+        elif guides == "selectivity":
+            ax.axvline(0.0, color="#9A9A9A", linewidth=0.75, zorder=1)
+            ax.set_xlim(-1.02, 1.02)
+            ax.set_ylim(bottom=0.0)
+        elif guides == "ablation":
+            ax.set_xlim(left=0.0)
+            ax.set_ylim(bottom=0.0)
         ax.set_xlabel(xlabel)
         ax.set_ylabel(ylabel)
         ax.set_title(title)
-        ax.grid(alpha=theme.grid_alpha, linewidth=0.5)
-        colorbar = fig.colorbar(
-            plt.cm.ScalarMappable(norm=normalizer, cmap=cmap),
-            ax=ax,
-            pad=0.02,
-        )
-        colorbar.set_label("Layer")
-        ax.legend(
-            handles=_seed_handles(seeds, theme),
-            frameon=False,
-            fontsize=theme.tick_size - 0.5,
-            loc="best",
+        _style_axis(ax)
+        handles = _seed_handles(seeds, theme)
+        if statistic is not None:
+            ax.text(
+                0.025,
+                0.975,
+                statistic,
+                transform=ax.transAxes,
+                ha="left",
+                va="top",
+                color=theme.central_color,
+                fontsize=theme.tick_size,
+            )
+        _legend_below(fig, handles, ncol=4)
+        bottom = {
+            "identity": 0.29,
+            "selectivity": 0.32,
+        }.get(guides, 0.22)
+        fig.subplots_adjust(
+            bottom=bottom,
+            left=0.16,
+            right=0.98,
+            top=0.90,
         )
     return fig, ax
 
@@ -622,8 +674,6 @@ def render_graphbench_population_figures(
     if task_name != FOCUSED_GRAPHBENCH_TASK:
         return {}
     data = build_graphbench_population_figure_data(config, task_results)
-    data["activity_floor"] = float(config.families.activity_floor)
-    data["preference_threshold"] = float(config.families.equivalence_half_width)
     theme = _theme(config)
     output_dir = config.root / task_name / "population_figures"
     builder = FigureBuilder(
@@ -636,6 +686,7 @@ def render_graphbench_population_figures(
             "population_unit": "training seed",
             "seeds": data["seeds"].tolist(),
         },
+        preserve_canvas=True,
     )
     saved: dict[str, list[str]] = {}
 
@@ -678,8 +729,8 @@ def render_graphbench_population_figures(
         data["necessity"]["population"],
         data["seeds"],
         theme,
-        ylabel="Fraction of donor-event effect removed",
-        title=r"Donor-wise necessity (matched-$J$ candidates)",
+        ylabel="Fraction of intervention effect removed",
+        title="Head necessity by intervention type",
     )
     paths = builder.save(
         "03_population_donor_necessity",
@@ -698,18 +749,19 @@ def render_graphbench_population_figures(
     rho = float(np.asarray(rho_population["estimate"]).reshape(-1)[0])
     rho_low = float(np.asarray(rho_population["low"]).reshape(-1)[0])
     rho_high = float(np.asarray(rho_population["high"]).reshape(-1)[0])
-    rho_title = f"Joint sensitivity and clean-head necessity (mean seed ρ={rho:.2f}"
+    correlation_label = rf"Mean seed $\rho$ = {rho:.2f}"
     if np.isfinite(rho_low) and np.isfinite(rho_high):
-        rho_title += f", 95% CI [{rho_low:.2f}, {rho_high:.2f}]"
-    rho_title += ")"
+        correlation_label += rf"  [{rho_low:.2f}, {rho_high:.2f}]"
     fig, axes = _plot_head_scatter(
         data,
         theme,
         x_name="joint_sensitivity",
         y_name="clean_ablation",
-        xlabel=r"Joint sensitivity $J$",
-        ylabel="Clean head-ablation prediction movement",
-        title=rho_title,
+        xlabel=r"Joint sensitivity, $J$",
+        ylabel="Output change after head ablation",
+        title="Joint sensitivity and head-ablation impact",
+        guides="ablation",
+        statistic=correlation_label,
     )
     paths = builder.save(
         "04_population_joint_sensitivity_clean_ablation",
@@ -728,9 +780,9 @@ def render_graphbench_population_figures(
         theme,
         x_name="raw_structural",
         y_name="raw_semantic",
-        xlabel="Raw structural score (coherent movement)",
-        ylabel="Raw semantic score (coherent movement)",
-        title="Raw head scores across training seeds",
+        xlabel="Structural score",
+        ylabel="Semantic score",
+        title="Semantic and structural head scores",
         guides="identity",
     )
     paths = builder.save(
@@ -749,10 +801,15 @@ def render_graphbench_population_figures(
         theme,
         x_name="selectivity",
         y_name="joint_sensitivity",
-        xlabel=r"Selectivity $D_{rel}$",
-        ylabel=r"Joint sensitivity $J$",
-        title="Joint sensitivity and selectivity across training seeds",
-        guides="specialisation",
+        xlabel=(
+            "Relative selectivity, "
+            r"$D_{\mathrm{rel}}$"
+            "\n"
+            r"$\leftarrow$ structural  |  semantic $\rightarrow$"
+        ),
+        ylabel=r"Joint sensitivity, $J$",
+        title="Joint sensitivity and relative selectivity",
+        guides="selectivity",
     )
     paths = builder.save(
         "06_population_joint_sensitivity_selectivity",
@@ -761,8 +818,6 @@ def render_graphbench_population_figures(
         metadata={
             "estimand": "within-seed normalized individual-head score coordinates",
             "head_alignment": "not assumed across seeds",
-            "activity_floor": data["activity_floor"],
-            "preference_threshold": data["preference_threshold"],
         },
     )
     saved["joint_sensitivity_selectivity"] = [str(path) for path in paths]

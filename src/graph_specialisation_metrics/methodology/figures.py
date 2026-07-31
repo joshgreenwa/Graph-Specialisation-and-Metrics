@@ -1620,6 +1620,9 @@ class FigureBuilder:
     theme: FigureTheme = field(default_factory=FigureTheme)
     modifier: Callable[[str, Any, Any], None] | None = None
     common_metadata: Mapping[str, Any] = field(default_factory=dict)
+    # Population figures intended for side-by-side placement retain an exact canvas.
+    # Historical figures keep tight cropping by default.
+    preserve_canvas: bool = False
 
     def save(
         self,
@@ -1641,8 +1644,8 @@ class FigureBuilder:
             fig.savefig(
                 path,
                 dpi=self.theme.dpi,
-                bbox_inches="tight",
-                pad_inches=0.04,
+                bbox_inches=None if self.preserve_canvas else "tight",
+                pad_inches=0.0 if self.preserve_canvas else 0.04,
             )
             paths.append(path)
         atomic_json(

@@ -2139,7 +2139,7 @@ def test_matching_population_renderer_uses_all_seed_caches_and_writes_six_figure
         train_seeds=(0, 1, 2, 3),
         phases=("figures",),
         accelerator="cpu",
-        figure_overrides={"formats": ("png",), "dpi": 72},
+        figure_overrides={"formats": ("pdf", "png"), "dpi": 72},
     )
     results = []
     for seed in config.train_seeds:
@@ -2258,8 +2258,8 @@ def test_matching_population_renderer_uses_all_seed_caches_and_writes_six_figure
 
     saved = render_graphbench_population_figures(config, task, results)
     assert len(saved) == 6
-    assert all(len(paths) == 1 for paths in saved.values())
-    assert all(Path(paths[0]).is_file() for paths in saved.values())
+    assert all(len(paths) == 2 for paths in saved.values())
+    assert all(Path(path).is_file() for paths in saved.values() for path in paths)
     manifest = json.loads(
         (
             tmp_path
