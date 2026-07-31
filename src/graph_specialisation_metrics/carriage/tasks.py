@@ -287,6 +287,24 @@ register(GritTaskSpec(
     node_content_desc="atom type",
 ))
 
+# Descriptive alias used by the reach experiment and new notebooks.  Keep the
+# historical ``zinc_1hop_local`` registration above so existing cached carriage
+# runs and command lines remain valid.
+register(GritTaskSpec(
+    name="zinc_1hop_localrrwp",
+    title="GRIT+RRWP ZINC-subset (1-hop masked, local-only RRWP)",
+    config_path="configs/GRIT/zinc-GRIT-RRWP-1hop-localrrwp.yaml",
+    expected_params=473_473,
+    drive_dir="/content/drive/MyDrive/grit_zinc_1hop_localrrwp",
+    paper_metric=None,
+    metric_fn=staticmethod(metrics.mae_metric),
+    metric_higher_better=False,
+    metric_abort=0.6,
+    env_hooks=_onehop_localrrwp_hooks(),
+    grit_repo_dir="/content/GRIT_zinc_1hop_localrrwp",
+    node_content_desc="atom type",
+))
+
 
 # ---------------------------------------------------------------------------------------
 # k-hop / virtual-node ZINC controls, reconstructed by the packaged training-compatible patch

@@ -1,6 +1,7 @@
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 
@@ -17,10 +18,16 @@ from graph_specialisation_metrics.zinc_reach_analysis import (
     graph_interpolation_profiles,
     graph_output_coherence_profiles,
     summarise_dense_profile_contrasts,
+    summarise_beneficial_carriage,
     summarise_graph_profiles,
     summarise_interpolation_contrasts,
     summarise_output_coherence,
     summarise_scale_dependence,
+    summarise_shell_survival,
+)
+from graph_specialisation_metrics.reach_redundancy import (
+    minimum_gap_derangement,
+    survival_components,
 )
 
 
@@ -126,6 +133,11 @@ def test_signed_output_path_carriage_is_complete_and_preserves_cancellation(
         donor_graph_id=9,
         donor_node=1,
         draw=0,
+        source_degree=1,
+        donor_degree=1,
+        degree_gap=0,
+        dose=1.0,
+        payload_fingerprint="fixture",
     )
     rows = reach._signed_output_carriage_rows(
         ZincReachConfig(tasks=("zinc",)),
@@ -166,6 +178,63 @@ def test_signed_output_path_carriage_is_complete_and_preserves_cancellation(
     audit = reach.summarise_output_carriage_audit(retained)
     assert audit[0]["soft_warning_paths"] == 1
     assert audit[0]["unconverged_paths"] == 1
+
+
+def test_beneficial_carriage_uses_positive_is_beneficial_loss_sign():
+    clean = torch.tensor([[2.0], [1.0]])
+    intervened = torch.tensor([[3.0], [1.0]])
+    capture = SimpleNamespace(
+        final_state=torch.stack((clean, intervened)),
+        prediction=torch.tensor([[3.0], [4.0]]),
+        target=torch.zeros(2, 1),
+    )
+
+    class Backend:
+        def capture_groups(self, groups):
+            assert len(groups) == 1 and len(groups[0]) == 2
+            return [capture]
+
+        def loss_from_pooled(self, target):
+            assert tuple(target.shape) == (1, 1)
+            return lambda pooled: pooled[:, 0].abs()
+
+        def loss_per_graph(self, prediction, target):
+            return (prediction[:, 0] - target[:, 0]).abs()
+
+        def carriage_weights(self, _base, states):
+            return torch.ones(states.shape[-2])
+
+    prepared = SimpleNamespace(backend=Backend())
+    base = SimpleNamespace(
+        num_nodes=2,
+        edge_index=torch.tensor([[0, 1], [1, 0]], dtype=torch.long),
+    )
+    event = SimpleNamespace(
+        source=0,
+        donor_graph_id=9,
+        donor_node=1,
+        draw=0,
+        source_degree=1,
+        donor_degree=1,
+        degree_gap=0,
+        dose=1.0,
+        payload_fingerprint="fixture",
+    )
+    rows = reach._beneficial_rows_for_channel(
+        ZincReachConfig(tasks=("zinc",)),
+        prepared,
+        task="zinc",
+        graph_id=0,
+        channel="semantic",
+        base=base,
+        variants=[SimpleNamespace()],
+        events=[event],
+    )
+
+    assert sum(row["beneficial_carriage"] for row in rows) == pytest.approx(1.0)
+    assert rows[0]["event_loss_increase"] == pytest.approx(1.0)
+    assert rows[0]["direct_loss_increase"] == pytest.approx(1.0)
+    assert all(row["audit_accepted"] for row in rows)
 
 
 def test_discover_seed_checkpoint_prefers_recovery_best(tmp_path: Path):
@@ -300,6 +369,123 @@ def _raw_output_carriage(tasks=TASKS):
         for graph in (0, 1)
         for carrier, distance, signed in values
     ]
+
+
+def _raw_beneficial_carriage(tasks=TASKS):
+    return [
+        {
+            "task": task,
+            "model_label": reach.TASK_LABELS[task],
+            "graph": graph,
+            "channel": channel,
+            "source": 0,
+            "donor_graph": 9,
+            "donor_node": 1,
+            "draw": 0,
+            "carrier": carrier,
+            "distance": distance,
+            "beneficial_carriage": value + 0.002 * task_index,
+        }
+        for task_index, task in enumerate(tasks)
+        for graph in (0, 1)
+        for channel in ("semantic", "structural")
+        for carrier, (distance, value) in enumerate(
+            ((0, 0.04), (1, -0.02), (2, 0.01))
+        )
+    ]
+
+
+def _raw_shell_survival(tasks=TASKS):
+    rows = []
+    for task_index, task in enumerate(tasks):
+        for graph in (0, 1):
+            for condition in ("exact_shell", "far_tail"):
+                for radius in (1, 2):
+                    for draw in (0, 1):
+                        for intervention, offset in (
+                            ("shell_permutation", 0.0),
+                            ("shell_replacement", 0.25),
+                        ):
+                            survival = 0.35 + offset + 0.01 * task_index
+                            additive = 0.25 + 0.5 * offset
+                            rows.append(
+                                {
+                                    "task": task,
+                                    "model_label": reach.TASK_LABELS[task],
+                                    "graph": graph,
+                                    "carrier": 0,
+                                    "draw": draw,
+                                    "condition": condition,
+                                    "radius": radius,
+                                    "intervention": intervention,
+                                    "coalition_size": radius + 1,
+                                    "carrier_survival": survival,
+                                    "carrier_additive_survival": additive,
+                                    "carrier_nonlinear_residual": survival - additive,
+                                    "output_survival": survival + 0.05,
+                                    "output_additive_survival": additive + 0.02,
+                                    "output_nonlinear_residual": survival - additive + 0.03,
+                                }
+                            )
+    return rows
+
+
+def test_survival_decomposition_is_unclipped_and_exact():
+    result = survival_components(
+        [[1.0, 0.0], [-1.0, 0.0]],
+        [3.0, 0.0],
+        effect_floor=1.0e-12,
+    )
+    assert result["apparent_mass"] == pytest.approx(2.0)
+    assert result["additive_survival"] == pytest.approx(0.0)
+    assert result["survival"] == pytest.approx(1.5)
+    assert result["nonlinear_residual"] == pytest.approx(1.5)
+
+
+def test_shell_derangement_handles_repeated_atom_types_without_losing_multiset():
+    payloads = np.asarray([[6], [6], [8]])
+    degrees = np.asarray([2, 2, 1])
+    result = minimum_gap_derangement(
+        (0, 1, 2),
+        payloads,
+        degrees,
+        np.random.default_rng(4),
+    )
+    assert result is not None
+    donors, exact = result
+    assert exact
+    assert sorted(donors) == [0, 1, 2]
+    assert all(source != donor for source, donor in zip((0, 1, 2), donors))
+    assert sum(
+        payloads[source].tolist() != payloads[donor].tolist()
+        for source, donor in zip((0, 1, 2), donors)
+    ) == 2
+
+
+def test_new_analysis_summaries_bootstrap_at_graph_level():
+    beneficial_graph, beneficial = summarise_beneficial_carriage(
+        _raw_beneficial_carriage(("zinc",)),
+        bootstrap_replicates=40,
+        bootstrap_seed=21,
+    )
+    survival_graph, survival, contrasts = summarise_shell_survival(
+        _raw_shell_survival(("zinc",)),
+        bootstrap_replicates=40,
+        bootstrap_seed=22,
+    )
+    assert beneficial_graph and beneficial
+    assert survival_graph and survival and contrasts
+    assert all(row["graphs"] == 2 for row in beneficial)
+    assert all(row["graphs"] == 2 for row in survival)
+    assert all(row["paired_graphs"] == 2 for row in contrasts)
+    primary = next(
+        row
+        for row in contrasts
+        if row["metric"] == "carrier_survival"
+        and row["condition"] == "exact_shell"
+        and row["radius"] == 1
+    )
+    assert primary["mean"] == pytest.approx(0.25)
 
 
 def test_output_coherence_reveals_within_shell_cancellation():
@@ -476,6 +662,8 @@ def test_figure_only_builds_png_and_pdf(tmp_path: Path):
         (results / "graph_metrics.csv", _raw_graph_records()),
         (results / "full_test_metrics.csv", _raw_full_test_records()),
         (results / "semantic_output_carriage.csv", _raw_output_carriage()),
+        (results / "beneficial_carriage.csv", _raw_beneficial_carriage()),
+        (results / "shell_survival.csv", _raw_shell_survival()),
     ):
         with path.open("w", newline="", encoding="utf-8") as handle:
             writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
@@ -493,11 +681,15 @@ def test_figure_only_builds_png_and_pdf(tmp_path: Path):
         "structural_functional",
         "expected_distance",
         "output_coherence",
+        "beneficial_carriage",
+        "shell_redundancy",
+        "tail_redundancy",
         "scale_dependence",
         "scale_slopes",
     }
     assert (results / "dense_profile_contrasts.csv").is_file()
     assert (results / "interpolation_sweep_summary.csv").is_file()
+    assert (results / "shell_survival_by_coalition_size.csv").is_file()
     for formats in result["figures"].values():
         assert Path(formats["png"]).is_file()
         assert Path(formats["pdf"]).is_file()
@@ -523,6 +715,14 @@ def test_qm9_profile_builds_dataset_specific_figures(tmp_path: Path):
             results / "semantic_output_carriage.csv",
             _raw_output_carriage(QM9_TASKS),
         ),
+        (
+            results / "beneficial_carriage.csv",
+            _raw_beneficial_carriage(QM9_TASKS),
+        ),
+        (
+            results / "shell_survival.csv",
+            _raw_shell_survival(QM9_TASKS),
+        ),
     ):
         with path.open("w", newline="", encoding="utf-8") as handle:
             writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
@@ -544,6 +744,9 @@ def test_qm9_profile_builds_dataset_specific_figures(tmp_path: Path):
         "structural_functional",
         "expected_distance",
         "output_coherence",
+        "beneficial_carriage",
+        "shell_redundancy",
+        "tail_redundancy",
         "scale_dependence",
         "scale_slopes",
     }

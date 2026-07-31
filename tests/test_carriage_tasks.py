@@ -18,6 +18,16 @@ def test_zinc_1hop_local_task_matches_onehop_except_local_rrwp_reconstruction():
     assert len(local.env_hooks) == 1
 
 
+def test_zinc_1hop_localrrwp_alias_preserves_checkpoint_contract():
+    historical = get_task("zinc_1hop_local")
+    descriptive = get_task("zinc_1hop_localrrwp")
+
+    assert descriptive.drive_dir == historical.drive_dir
+    assert descriptive.config_path == historical.config_path
+    assert descriptive.expected_params == historical.expected_params
+    assert descriptive.grit_repo_dir == historical.grit_repo_dir
+
+
 def test_zinc_1hop_local_hook_routes_to_exact_training_patch(monkeypatch, tmp_path):
     calls = []
     monkeypatch.setattr(

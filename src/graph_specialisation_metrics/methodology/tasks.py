@@ -229,6 +229,7 @@ for _name in (
     "zinc",
     "zinc_1hop",
     "zinc_1hop_local",
+    "zinc_1hop_localrrwp",
     "zinc_2hop",
     "zinc_1hop_vnode",
     "zinc_2hop_vnode",

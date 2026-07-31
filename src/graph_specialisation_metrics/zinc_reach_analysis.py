@@ -45,18 +45,33 @@ from .methodology.protocol import (
 )
 from .methodology.runner import prepare_task
 from .methodology.sampling import sample_sources
+from .reach_redundancy import (
+    SemanticCoalition,
+    build_shell_permutation,
+    build_shell_replacement,
+    survival_components,
+)
 
 
-ANALYSIS_VERSION = "zinc-bamberger-functional-reach-v7"
+ANALYSIS_VERSION = "zinc-bamberger-functional-reach-v8"
 OUTPUT_CARRIAGE_VERSION = "signed-output-path-carriage-v2-soft-audit"
+BENEFICIAL_CARRIAGE_VERSION = "positive-beneficial-path-carriage-v1"
+SURVIVAL_VERSION = "shell-coalition-survival-v1"
 OUTPUT_PATH_ATOL = 1.0e-6
 OUTPUT_PATH_RTOL = 1.0e-5
 OUTPUT_PATH_MAX_INTERVALS = 128
-TASKS = ("zinc_1hop", "zinc_2hop", "zinc_1hop_vnode", "zinc")
+TASKS = (
+    "zinc_1hop",
+    "zinc_1hop_localrrwp",
+    "zinc_2hop",
+    "zinc_1hop_vnode",
+    "zinc",
+)
 QM9_TASKS = ("qm9_gap_1hop", "qm9_gap_1hop_vnode", "qm9_gap_dense")
 DEFAULT_INTERPOLATION_DOSES = (0.01, 0.02, 0.05, 0.10, 0.25, 0.50, 1.00)
 TASK_LABELS = {
     "zinc_1hop": "1-hop GRIT",
+    "zinc_1hop_localrrwp": "1-hop GRIT + local RRWP",
     "zinc_2hop": "2-hop GRIT",
     "zinc_1hop_vnode": "1-hop GRIT + VN",
     "zinc": "Dense GRIT",
@@ -85,6 +100,7 @@ METHOD_LINESTYLES = {
 }
 MODEL_COLOURS = {
     "zinc_1hop": "#0072B2",
+    "zinc_1hop_localrrwp": "#E69F00",
     "zinc_2hop": "#009E73",
     "zinc_1hop_vnode": "#CC79A7",
     "zinc": "#D55E00",
@@ -94,6 +110,7 @@ MODEL_COLOURS = {
 }
 MODEL_MARKERS = {
     "zinc_1hop": "o",
+    "zinc_1hop_localrrwp": "P",
     "zinc_2hop": "^",
     "zinc_1hop_vnode": "D",
     "zinc": "s",
@@ -103,6 +120,7 @@ MODEL_MARKERS = {
 }
 MODEL_LINESTYLES = {
     "zinc_1hop": "-",
+    "zinc_1hop_localrrwp": (0, (3, 1, 1, 1)),
     "zinc_2hop": "--",
     "zinc_1hop_vnode": "-.",
     "zinc": ":",
@@ -136,12 +154,12 @@ ZINC_PROFILE = ReachProfile(
     figure_prefix="zinc",
     default_output_dir=(
         "/content/drive/MyDrive/graph_specialisation_metrics/"
-        "zinc_bamberger_functional_reach_v7"
+        "zinc_bamberger_functional_reach_v8"
     ),
 )
 QM9_PROFILE = ReachProfile(
     name="QM9",
-    analysis_version="qm9-bamberger-functional-reach-v2",
+    analysis_version="qm9-bamberger-functional-reach-v3",
     tasks=QM9_TASKS,
     reference_task="qm9_gap_dense",
     atom_vocab_size=10,
@@ -149,7 +167,7 @@ QM9_PROFILE = ReachProfile(
     figure_prefix="qm9",
     default_output_dir=(
         "/content/drive/MyDrive/graph_specialisation_metrics/"
-        "qm9_bamberger_functional_reach_v2"
+        "qm9_bamberger_functional_reach_v3"
     ),
 )
 
@@ -161,7 +179,7 @@ class ZincReachConfig:
     profile: ReachProfile = ZINC_PROFILE
     tasks: tuple[str, ...] = TASKS
     seed: int = 0
-    graphs: int = 64
+    graphs: int = 128
     sources_per_graph: int = 6
     donors_per_source: int = 4
     semantic_donor_graphs: int = 256
@@ -169,6 +187,16 @@ class ZincReachConfig:
     bamberger_output_channels: int = 8
     interpolation_doses: tuple[float, ...] = DEFAULT_INTERPOLATION_DOSES
     interpolation_batch_size: int = 64
+    survival_carriers_per_graph: int = 6
+    survival_draws: int = 4
+    survival_tail_radii: tuple[int, ...] = (2, 3, 4, 5)
+    survival_replacement_candidates: int = 32
+    survival_exact_limit: int = 12
+    survival_random_attempts: int = 512
+    survival_replica_batch_size: int = 128
+    beneficial_atol: float = 1.0e-6
+    beneficial_rtol: float = 1.0e-5
+    beneficial_max_intervals: int = 128
     effect_floor: float = 1.0e-12
     bootstrap_replicates: int = 2_000
     analysis_seed: int = 91_021
@@ -186,6 +214,13 @@ class ZincReachConfig:
             "bamberger_output_nodes",
             "bamberger_output_channels",
             "interpolation_batch_size",
+            "survival_carriers_per_graph",
+            "survival_draws",
+            "survival_replacement_candidates",
+            "survival_exact_limit",
+            "survival_random_attempts",
+            "survival_replica_batch_size",
+            "beneficial_max_intervals",
             "bootstrap_replicates",
             "num_threads",
         ):
@@ -193,6 +228,11 @@ class ZincReachConfig:
                 raise ValueError(f"{name} must be positive")
         if float(self.effect_floor) <= 0:
             raise ValueError("effect_floor must be positive")
+        if float(self.beneficial_atol) < 0 or float(self.beneficial_rtol) < 0:
+            raise ValueError("beneficial integration tolerances must be non-negative")
+        radii = tuple(int(value) for value in self.survival_tail_radii)
+        if not radii or tuple(sorted(set(radii))) != radii or radii[0] < 1:
+            raise ValueError("survival_tail_radii must be unique increasing positive integers")
         doses = tuple(float(value) for value in self.interpolation_doses)
         if (
             not doses
@@ -221,6 +261,24 @@ class ZincReachConfig:
             "interpolation_doses": [
                 float(value) for value in self.interpolation_doses
             ],
+            "survival_carriers_per_graph": int(self.survival_carriers_per_graph),
+            "survival_draws": int(self.survival_draws),
+            "survival_tail_radii": [
+                int(value) for value in self.survival_tail_radii
+            ],
+            "survival_replacement_candidates": int(
+                self.survival_replacement_candidates
+            ),
+            "survival_exact_limit": int(self.survival_exact_limit),
+            "survival_random_attempts": int(self.survival_random_attempts),
+            "survival_replica_batch_size": int(self.survival_replica_batch_size),
+            "beneficial_path": {
+                "version": BENEFICIAL_CARRIAGE_VERSION,
+                "atol": float(self.beneficial_atol),
+                "rtol": float(self.beneficial_rtol),
+                "max_intervals": int(self.beneficial_max_intervals),
+                "sign": "positive means the donor intervention increases task loss",
+            },
             "matched_reference_dose": float(min(self.interpolation_doses)),
             "effect_floor": float(self.effect_floor),
             "bootstrap_replicates": int(self.bootstrap_replicates),
@@ -246,6 +304,15 @@ class ZincReachConfig:
             ),
             "aggregation": (
                 "donor-normalise; donor -> source -> graph; 95% graph bootstrap"
+            ),
+            "survival_estimand": (
+                "signed task-output-projected singleton vectors versus the actual joint "
+                "semantic intervention: R=J/A, additive survival=C/A, and nonlinear "
+                "residual=(J-C)/A; exact shells and independently permuted far tails"
+            ),
+            "shell_replacement_control": (
+                "the identical source coalition receives external graph-balanced, "
+                "minimum-degree-gap semantic donors selected by pre-outcome dose matching"
             ),
         }
 
@@ -596,6 +663,18 @@ def _project_final_change(change: Any, clean_gradient: Any) -> Any:
         raise ValueError("carrier change and output-gradient geometry differ")
     contribution = torch.einsum("enw,tnw->ent", change, clean_gradient)
     return torch.linalg.vector_norm(contribution, dim=-1)
+
+
+def _project_final_vector(change: Any, clean_gradient: Any) -> Any:
+    """Project ``[E,N,W]`` changes through ``[T,N,W]`` into ``[E,N,T]``."""
+
+    import torch
+
+    if change.ndim != 3 or clean_gradient.ndim != 3:
+        raise ValueError("change and gradient must be [E,N,W] and [T,N,W]")
+    if tuple(change.shape[1:]) != tuple(clean_gradient.shape[1:]):
+        raise ValueError("carrier change and output-gradient geometry differ")
+    return torch.einsum("enw,tnw->ent", change, clean_gradient)
 
 
 def _semantic_interpolation_mass(
@@ -1000,6 +1079,483 @@ def _measure_output_carriage_graph(
     }
 
 
+def _beneficial_rows_for_channel(
+    config: ZincReachConfig,
+    prepared: Any,
+    *,
+    task: str,
+    graph_id: int,
+    channel: str,
+    base: Any,
+    variants: Sequence[Any],
+    events: Sequence[Any],
+) -> list[dict[str, Any]]:
+    """Integrate positive-is-beneficial task-loss carriage for donor events."""
+
+    import torch
+
+    if len(variants) != len(events) or not variants:
+        return []
+    capture = prepared.backend.capture_groups([[base, *variants]])[0]
+    event_count = len(events)
+    clean = capture.final_state[0].unsqueeze(0).expand(event_count, -1, -1)
+    intervened = capture.final_state[1:]
+    path = integrated_loss_carriage(
+        clean,
+        intervened,
+        prepared.backend.loss_from_pooled(capture.target[0:1]),
+        carrier_weights=prepared.backend.carriage_weights(base, clean),
+        atol=float(config.beneficial_atol),
+        rtol=float(config.beneficial_rtol),
+        max_intervals=int(config.beneficial_max_intervals),
+    )
+    # The numerical engine integrates intervention -> clean.  Canonical B is
+    # positive when the clean learned function reduces the intervention loss.
+    event_b = -path["carriage"]
+    event_loss_increase = -path["loss_delta"]
+    direct_losses = prepared.backend.loss_per_graph(
+        capture.prediction,
+        capture.target,
+    ).reshape(-1)
+    direct_increase = direct_losses[1:] - direct_losses[0]
+    endpoint_error = (event_loss_increase - direct_increase).abs()
+    completeness = event_b.sum(dim=-1) - event_loss_increase
+    finite = (
+        torch.isfinite(event_b).all(dim=-1)
+        & torch.isfinite(event_loss_increase)
+        & torch.isfinite(direct_increase)
+    )
+    tolerance = float(config.beneficial_atol) + float(config.beneficial_rtol) * (
+        event_loss_increase.abs() + event_b.abs().sum(dim=-1)
+    )
+    accepted = (
+        finite
+        & path["converged"]
+        & (endpoint_error <= 5.0 * tolerance)
+        & (completeness.abs() <= 5.0 * tolerance)
+        & (path["quadrature_error"] <= 5.0 * tolerance)
+    )
+    if not bool(accepted.all()):
+        print(
+            f"[beneficial:warning] {task} {channel} graph={int(graph_id)}: "
+            f"retaining {int((~accepted).sum().detach().cpu())}/{event_count} "
+            "paths outside the soft numerical audit",
+            flush=True,
+        )
+    distances = shortest_path_distances(base.edge_index, int(base.num_nodes))
+    rows: list[dict[str, Any]] = []
+    for event_index, event in enumerate(events):
+        source = int(event.source)
+        for carrier in range(int(base.num_nodes)):
+            rows.append(
+                {
+                    "analysis_version": config.profile.analysis_version,
+                    "fingerprint": config.fingerprint,
+                    "beneficial_version": BENEFICIAL_CARRIAGE_VERSION,
+                    "task": task,
+                    "model_label": TASK_LABELS[task],
+                    "seed": int(config.seed),
+                    "graph": int(graph_id),
+                    "channel": channel,
+                    "source": source,
+                    "donor_graph": int(event.donor_graph_id),
+                    "donor_node": int(event.donor_node),
+                    "draw": int(event.draw),
+                    "source_degree": int(event.source_degree),
+                    "donor_degree": int(event.donor_degree),
+                    "degree_gap": int(event.degree_gap),
+                    "dose": float(event.dose),
+                    "payload_fingerprint": str(event.payload_fingerprint),
+                    "carrier": int(carrier),
+                    "distance": int(distances[source, carrier]),
+                    "beneficial_carriage": float(
+                        event_b[event_index, carrier].detach().cpu()
+                    ),
+                    "event_loss_increase": float(
+                        event_loss_increase[event_index].detach().cpu()
+                    ),
+                    "direct_loss_increase": float(
+                        direct_increase[event_index].detach().cpu()
+                    ),
+                    "completeness_residual": float(
+                        completeness[event_index].detach().cpu()
+                    ),
+                    "endpoint_replay_error": float(
+                        endpoint_error[event_index].detach().cpu()
+                    ),
+                    "quadrature_error": float(
+                        path["quadrature_error"][event_index].detach().cpu()
+                    ),
+                    "intervals": int(path["intervals"][event_index].detach().cpu()),
+                    "converged": bool(path["converged"][event_index].detach().cpu()),
+                    "audit_accepted": bool(accepted[event_index].detach().cpu()),
+                }
+            )
+    return rows
+
+
+def _measure_beneficial_graph(
+    config: ZincReachConfig,
+    prepared: Any,
+    *,
+    task: str,
+    graph_id: int,
+) -> dict[str, Any]:
+    """Measure both semantic and structural Beneficial carriage in one cache shard."""
+
+    base = prepared.runtime.eval_ds[int(graph_id)]
+    sources = tuple(
+        int(value)
+        for value in sample_sources(
+            int(base.num_nodes),
+            int(config.sources_per_graph),
+            np.random.default_rng(_seed(config, "sources", graph_id)),
+        )
+    )
+    rows: list[dict[str, Any]] = []
+    for channel in CHANNELS:
+        variants: list[Any] = []
+        events: list[Any] = []
+        for source in sources:
+            source_variants, source_events = build_channel_events(
+                base,
+                graph_id=int(graph_id),
+                source=source,
+                channel=channel,
+                stage=f"{config.profile.event_stage}_beneficial",
+                donors=int(config.donors_per_source),
+                rng=np.random.default_rng(
+                    _seed(config, "events", graph_id, channel, source)
+                ),
+                task=prepared.task,
+                semantic_pool=prepared.donor_pool,
+                duplicate_tolerance=1.0e-7,
+            )
+            variants.extend(source_variants)
+            events.extend(source_events)
+        rows.extend(
+            _beneficial_rows_for_channel(
+                config,
+                prepared,
+                task=task,
+                graph_id=int(graph_id),
+                channel=channel,
+                base=base,
+                variants=variants,
+                events=events,
+            )
+        )
+    return {
+        "beneficial_version": BENEFICIAL_CARRIAGE_VERSION,
+        "analysis_version": config.profile.analysis_version,
+        "fingerprint": config.fingerprint,
+        "checkpoint_sha256": str(prepared.checkpoint_sha),
+        "task": task,
+        "graph": int(graph_id),
+        "beneficial_rows": rows,
+    }
+
+
+def _empty_survival_row(
+    config: ZincReachConfig,
+    *,
+    task: str,
+    graph_id: int,
+    carrier: int,
+    draw: int,
+    condition: str,
+    radius: int,
+    shell_sizes: Sequence[int],
+    reason: str,
+    intervention: str,
+) -> dict[str, Any]:
+    return {
+        "analysis_version": config.profile.analysis_version,
+        "fingerprint": config.fingerprint,
+        "survival_version": SURVIVAL_VERSION,
+        "task": task,
+        "model_label": TASK_LABELS[task],
+        "seed": int(config.seed),
+        "graph": int(graph_id),
+        "carrier": int(carrier),
+        "draw": int(draw),
+        "condition": condition,
+        "radius": int(radius),
+        "intervention": intervention,
+        "coalition_size": 0,
+        "shell_sizes": json.dumps([int(value) for value in shell_sizes]),
+        "skipped_shell_sizes": json.dumps([int(value) for value in shell_sizes]),
+        "carrier_estimable": False,
+        "output_estimable": False,
+        "exclusion_reason": reason,
+    }
+
+
+def _coalition_survival_row(
+    config: ZincReachConfig,
+    *,
+    task: str,
+    graph_id: int,
+    carrier: int,
+    draw: int,
+    condition: str,
+    radius: int,
+    coalition: SemanticCoalition,
+    capture: Any,
+    clean_gradient: Any,
+) -> dict[str, Any]:
+    """Evaluate one coalition at both carrier and graph-output levels."""
+
+    event_count = len(coalition.assignments)
+    clean_final = capture.final_state[0]
+    delta = clean_final.unsqueeze(0) - capture.final_state[1:]
+    if int(delta.shape[0]) != event_count + 1:
+        raise RuntimeError("coalition capture lost singleton/joint alignment")
+    projected = _project_final_vector(delta, clean_gradient)
+    carrier_result = survival_components(
+        projected[:-1, int(carrier), :].detach().cpu().numpy(),
+        projected[-1, int(carrier), :].detach().cpu().numpy(),
+        effect_floor=float(config.effect_floor),
+    )
+    output_delta = (
+        capture.z[0].reshape(1, -1) - capture.z[1:].reshape(event_count + 1, -1)
+    )
+    output_result = survival_components(
+        output_delta[:-1].detach().cpu().numpy(),
+        output_delta[-1].detach().cpu().numpy(),
+        effect_floor=float(config.effect_floor),
+    )
+    assignments = [
+        {
+            "source": item.source,
+            "donor_graph": item.donor_graph,
+            "donor_node": item.donor_node,
+            "source_degree": item.source_degree,
+            "donor_degree": item.donor_degree,
+            "dose": item.dose,
+        }
+        for item in coalition.assignments
+    ]
+    row: dict[str, Any] = {
+        "analysis_version": config.profile.analysis_version,
+        "fingerprint": config.fingerprint,
+        "survival_version": SURVIVAL_VERSION,
+        "task": task,
+        "model_label": TASK_LABELS[task],
+        "seed": int(config.seed),
+        "graph": int(graph_id),
+        "carrier": int(carrier),
+        "draw": int(draw),
+        "condition": condition,
+        "radius": int(radius),
+        "intervention": coalition.intervention,
+        "coalition_size": int(event_count),
+        "shell_sizes": json.dumps(list(coalition.shell_sizes)),
+        "skipped_shell_sizes": json.dumps(list(coalition.skipped_shell_sizes)),
+        "exact_derangement": bool(coalition.exact_derangement),
+        "matching_error": float(coalition.matching_error),
+        "assignments": json.dumps(assignments, sort_keys=True),
+        "mean_dose": float(np.mean(coalition.doses)),
+        "mean_degree_gap": float(
+            np.mean(
+                [
+                    abs(item.source_degree - item.donor_degree)
+                    for item in coalition.assignments
+                ]
+            )
+        ),
+        "exclusion_reason": "",
+    }
+    row.update({f"carrier_{key}": value for key, value in carrier_result.items()})
+    row.update({f"output_{key}": value for key, value in output_result.items()})
+    return row
+
+
+def _evaluate_survival_batch(
+    config: ZincReachConfig,
+    prepared: Any,
+    *,
+    task: str,
+    graph_id: int,
+    base: Any,
+    clean_gradient: Any,
+    pending: Sequence[tuple[int, int, str, int, SemanticCoalition]],
+) -> list[dict[str, Any]]:
+    """Evaluate a bounded batch of heterogeneous coalition replica groups."""
+
+    if not pending:
+        return []
+    groups = [
+        [base, *coalition.singleton_variants, coalition.joint_variant]
+        for _carrier, _draw, _condition, _radius, coalition in pending
+    ]
+    captures = prepared.backend.capture_groups(groups)
+    if len(captures) != len(pending):
+        raise RuntimeError("batched survival captures lost coalition alignment")
+    return [
+        _coalition_survival_row(
+            config,
+            task=task,
+            graph_id=int(graph_id),
+            carrier=carrier,
+            draw=draw,
+            condition=condition,
+            radius=radius,
+            coalition=coalition,
+            capture=capture,
+            clean_gradient=clean_gradient,
+        )
+        for (carrier, draw, condition, radius, coalition), capture in zip(
+            pending, captures
+        )
+    ]
+
+
+def _measure_survival_graph(
+    config: ZincReachConfig,
+    prepared: Any,
+    *,
+    task: str,
+    graph_id: int,
+) -> dict[str, Any]:
+    """Measure exact-shell and far-tail assignment survival for one graph."""
+
+    base = prepared.runtime.eval_ds[int(graph_id)]
+    nodes = int(base.num_nodes)
+    distances = shortest_path_distances(base.edge_index, nodes)
+    carriers = tuple(
+        int(value)
+        for value in sample_sources(
+            nodes,
+            int(config.survival_carriers_per_graph),
+            np.random.default_rng(_seed(config, "survival_carriers", graph_id)),
+        )
+    )
+    clean = prepared.backend.clean_jacobians(base)
+    rows: list[dict[str, Any]] = []
+    pending: list[tuple[int, int, str, int, SemanticCoalition]] = []
+    pending_replicas = 0
+
+    def flush_pending() -> None:
+        nonlocal pending_replicas
+        rows.extend(
+            _evaluate_survival_batch(
+                config,
+                prepared,
+                task=task,
+                graph_id=int(graph_id),
+                base=base,
+                clean_gradient=clean.final_state,
+                pending=pending,
+            )
+        )
+        pending.clear()
+        pending_replicas = 0
+
+    for carrier in carriers:
+        finite = distances[carrier][np.isfinite(distances[carrier])]
+        maximum = int(finite.max(initial=0))
+        exact_conditions = [
+            ("exact_shell", distance, [
+                np.flatnonzero(distances[carrier] == distance).astype(np.int64).tolist()
+            ])
+            for distance in range(1, maximum + 1)
+        ]
+        tail_conditions = []
+        for radius in config.survival_tail_radii:
+            groups = [
+                np.flatnonzero(distances[carrier] == distance).astype(np.int64).tolist()
+                for distance in range(int(radius), maximum + 1)
+            ]
+            tail_conditions.append(("far_tail", int(radius), groups))
+        for condition, radius, shell_groups in (*exact_conditions, *tail_conditions):
+            for draw in range(int(config.survival_draws)):
+                permutation = build_shell_permutation(
+                    base,
+                    shell_groups,
+                    graph_id=int(graph_id),
+                    task=prepared.task,
+                    rng=np.random.default_rng(
+                        _seed(
+                            config,
+                            "survival",
+                            graph_id,
+                            carrier,
+                            condition,
+                            radius,
+                            draw,
+                        )
+                    ),
+                    exact_limit=int(config.survival_exact_limit),
+                    random_attempts=int(config.survival_random_attempts),
+                )
+                if permutation is None:
+                    for intervention in (
+                        "shell_permutation",
+                        "shell_replacement",
+                    ):
+                        rows.append(
+                            _empty_survival_row(
+                                config,
+                                task=task,
+                                graph_id=int(graph_id),
+                                carrier=carrier,
+                                draw=draw,
+                                condition=condition,
+                                radius=radius,
+                                shell_sizes=[len(group) for group in shell_groups],
+                                reason=(
+                                    "no nonzero multiset-preserving shell permutation"
+                                    if intervention == "shell_permutation"
+                                    else "paired shell permutation unavailable"
+                                ),
+                                intervention=intervention,
+                            )
+                        )
+                    continue
+                replacement = build_shell_replacement(
+                    base,
+                    permutation,
+                    task=prepared.task,
+                    semantic_pool=prepared.donor_pool,
+                    rng=np.random.default_rng(
+                        _seed(
+                            config,
+                            "survival_replacement",
+                            graph_id,
+                            carrier,
+                            condition,
+                            radius,
+                            draw,
+                        )
+                    ),
+                    candidates=int(config.survival_replacement_candidates),
+                )
+                pair = (permutation, replacement)
+                pair_replicas = sum(len(coalition.assignments) + 2 for coalition in pair)
+                if (
+                    pending
+                    and pending_replicas + pair_replicas
+                    > int(config.survival_replica_batch_size)
+                ):
+                    flush_pending()
+                for coalition in pair:
+                    pending.append((carrier, draw, condition, radius, coalition))
+                    pending_replicas += len(coalition.assignments) + 2
+                if pending_replicas >= int(config.survival_replica_batch_size):
+                    flush_pending()
+    flush_pending()
+    return {
+        "survival_version": SURVIVAL_VERSION,
+        "analysis_version": config.profile.analysis_version,
+        "fingerprint": config.fingerprint,
+        "checkpoint_sha256": str(prepared.checkpoint_sha),
+        "task": task,
+        "graph": int(graph_id),
+        "survival_rows": rows,
+    }
+
+
 def _measure_graph(
     config: ZincReachConfig,
     prepared: Any,
@@ -1122,6 +1678,14 @@ def _output_carriage_shard_path(
     )
 
 
+def _beneficial_shard_path(output_dir: Path, task: str, graph_id: int) -> Path:
+    return output_dir / "beneficial_cache" / task / f"graph_{int(graph_id):06d}.pt"
+
+
+def _survival_shard_path(output_dir: Path, task: str, graph_id: int) -> Path:
+    return output_dir / "survival_cache" / task / f"graph_{int(graph_id):06d}.pt"
+
+
 def _load_shard(
     path: Path,
     *,
@@ -1182,6 +1746,37 @@ def _load_output_carriage_shard(
         or payload.get("fingerprint") != fingerprint
         or payload.get("checkpoint_sha256") != checkpoint_sha256
         or "output_carriage_rows" not in payload
+    ):
+        return None
+    return payload
+
+
+def _load_extension_shard(
+    path: Path,
+    *,
+    version_key: str,
+    version: str,
+    rows_key: str,
+    analysis_version: str,
+    fingerprint: str,
+    checkpoint_sha256: str,
+) -> dict[str, Any] | None:
+    """Load one independently versioned extension shard."""
+
+    if not path.is_file():
+        return None
+    import torch
+
+    try:
+        payload = torch.load(path, map_location="cpu", weights_only=False)
+    except Exception:
+        return None
+    if (
+        payload.get(version_key) != version
+        or payload.get("analysis_version") != analysis_version
+        or payload.get("fingerprint") != fingerprint
+        or payload.get("checkpoint_sha256") != checkpoint_sha256
+        or rows_key not in payload
     ):
         return None
     return payload
@@ -1262,6 +1857,10 @@ def measure(
     bamberger_rows: list[dict[str, Any]] = []
     output_carriage_rows: list[dict[str, Any]] = []
     output_carriage_failures: list[dict[str, Any]] = []
+    beneficial_rows: list[dict[str, Any]] = []
+    beneficial_failures: list[dict[str, Any]] = []
+    survival_rows: list[dict[str, Any]] = []
+    survival_failures: list[dict[str, Any]] = []
     graph_records: list[dict[str, Any]] = []
     full_test_records: list[dict[str, Any]] = []
     health: list[dict[str, Any]] = []
@@ -1352,6 +1951,89 @@ def measure(
                 else:
                     _save_shard(output_path, output_shard)
             output_carriage_rows.extend(output_shard["output_carriage_rows"])
+            beneficial_path = _beneficial_shard_path(
+                output_dir,
+                task,
+                int(graph_id),
+            )
+            beneficial_shard = _load_extension_shard(
+                beneficial_path,
+                version_key="beneficial_version",
+                version=BENEFICIAL_CARRIAGE_VERSION,
+                rows_key="beneficial_rows",
+                analysis_version=config.profile.analysis_version,
+                fingerprint=config.fingerprint,
+                checkpoint_sha256=str(prepared.checkpoint_sha),
+            )
+            if beneficial_shard is None:
+                try:
+                    beneficial_shard = _measure_beneficial_graph(
+                        config,
+                        prepared,
+                        task=task,
+                        graph_id=int(graph_id),
+                    )
+                except Exception as error:
+                    beneficial_failures.append(
+                        {
+                            "task": task,
+                            "model_label": TASK_LABELS[task],
+                            "graph": int(graph_id),
+                            "error_type": type(error).__name__,
+                            "error": str(error),
+                            "will_retry": True,
+                        }
+                    )
+                    print(
+                        f"[beneficial:warning] {task} graph={int(graph_id)} "
+                        f"could not be estimated ({type(error).__name__}: {error}); "
+                        "the graph will be retried next run.",
+                        flush=True,
+                    )
+                    beneficial_shard = {"beneficial_rows": []}
+                else:
+                    _save_shard(beneficial_path, beneficial_shard)
+            beneficial_rows.extend(beneficial_shard["beneficial_rows"])
+
+            survival_path = _survival_shard_path(output_dir, task, int(graph_id))
+            survival_shard = _load_extension_shard(
+                survival_path,
+                version_key="survival_version",
+                version=SURVIVAL_VERSION,
+                rows_key="survival_rows",
+                analysis_version=config.profile.analysis_version,
+                fingerprint=config.fingerprint,
+                checkpoint_sha256=str(prepared.checkpoint_sha),
+            )
+            if survival_shard is None:
+                try:
+                    survival_shard = _measure_survival_graph(
+                        config,
+                        prepared,
+                        task=task,
+                        graph_id=int(graph_id),
+                    )
+                except Exception as error:
+                    survival_failures.append(
+                        {
+                            "task": task,
+                            "model_label": TASK_LABELS[task],
+                            "graph": int(graph_id),
+                            "error_type": type(error).__name__,
+                            "error": str(error),
+                            "will_retry": True,
+                        }
+                    )
+                    print(
+                        f"[survival:warning] {task} graph={int(graph_id)} "
+                        f"could not be estimated ({type(error).__name__}: {error}); "
+                        "the graph will be retried next run.",
+                        flush=True,
+                    )
+                    survival_shard = {"survival_rows": []}
+                else:
+                    _save_shard(survival_path, survival_shard)
+            survival_rows.extend(survival_shard["survival_rows"])
             completed += 1
             if progress:
                 print(
@@ -1370,11 +2052,15 @@ def measure(
     _write_csv(results_dir / "semantic_interpolation_mass.csv", interpolation_rows)
     _write_csv(results_dir / "bamberger_input_output_influence.csv", bamberger_rows)
     _write_csv(results_dir / "semantic_output_carriage.csv", output_carriage_rows)
+    _write_csv(results_dir / "beneficial_carriage.csv", beneficial_rows)
+    _write_csv(results_dir / "shell_survival.csv", survival_rows)
     _write_csv(results_dir / "output_carriage_audit.csv", output_carriage_audit)
     _write_csv(
         results_dir / "output_carriage_failures.csv",
         output_carriage_failures,
     )
+    _write_csv(results_dir / "beneficial_failures.csv", beneficial_failures)
+    _write_csv(results_dir / "survival_failures.csv", survival_failures)
     _write_csv(results_dir / "graph_metrics.csv", graph_records)
     _write_csv(results_dir / "model_health.csv", health)
     _write_json(
@@ -1392,6 +2078,10 @@ def measure(
             "output_carriage_rows": len(output_carriage_rows),
             "output_carriage_audit": output_carriage_audit,
             "output_carriage_failures": output_carriage_failures,
+            "beneficial_rows": len(beneficial_rows),
+            "beneficial_failures": beneficial_failures,
+            "survival_rows": len(survival_rows),
+            "survival_failures": survival_failures,
             "graph_metric_rows": len(graph_records),
             "full_test_metric_rows": len(full_test_records),
             "comparison_scope": {
@@ -1441,6 +2131,17 @@ def measure(
                     "magnitudes before carrier aggregation and coherent shell mass "
                     "takes magnitude after signed carrier aggregation"
                 ),
+                "beneficial_carriage": (
+                    "exact signed task-loss allocation along each donor path; positive "
+                    "means the clean learned function avoids loss caused by the semantic "
+                    "or structural donor intervention"
+                ),
+                "shell_survival": (
+                    "within-shell permutations preserve each shell multiset and test "
+                    "assignment redundancy; external shell replacements use the same "
+                    "source coalition with degree-law and dose matching to test aggregate "
+                    "content sensitivity"
+                ),
                 "interpretation": (
                     "literal Bamberger versus Functional carriage remains an operational "
                     "estimand comparison. Departure from the matched smallest-dose profile "
@@ -1457,6 +2158,10 @@ def measure(
         "output_carriage_rows": output_carriage_rows,
         "output_carriage_audit": output_carriage_audit,
         "output_carriage_failures": output_carriage_failures,
+        "beneficial_rows": beneficial_rows,
+        "beneficial_failures": beneficial_failures,
+        "survival_rows": survival_rows,
+        "survival_failures": survival_failures,
         "graph_records": graph_records,
         "full_test_records": full_test_records,
         "health": health,
@@ -2655,6 +3360,388 @@ def summarise_dense_profile_contrasts(
     return contrasts
 
 
+def summarise_beneficial_carriage(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    bootstrap_replicates: int,
+    bootstrap_seed: int,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Aggregate signed B donor -> source -> graph, retaining task-loss units."""
+
+    events: dict[tuple[Any, ...], list[Mapping[str, Any]]] = defaultdict(list)
+    task_max_distance: dict[str, int] = defaultdict(int)
+    for row in rows:
+        key = (
+            str(row["task"]),
+            _integer(row, "graph"),
+            str(row["channel"]),
+            _integer(row, "source"),
+            _integer(row, "donor_graph"),
+            _integer(row, "donor_node"),
+            _integer(row, "draw"),
+        )
+        events[key].append(row)
+        task_max_distance[key[0]] = max(
+            task_max_distance[key[0]], _integer(row, "distance")
+        )
+
+    source_profiles: dict[tuple[Any, ...], list[float]] = defaultdict(list)
+    source_far: dict[tuple[Any, ...], list[float]] = defaultdict(list)
+    for key, event_rows in events.items():
+        task, graph, channel, source, *_ = key
+        distance = np.asarray(
+            [_integer(row, "distance") for row in event_rows], dtype=np.int64
+        )
+        values = np.asarray(
+            [_float(row, "beneficial_carriage") for row in event_rows],
+            dtype=np.float64,
+        )
+        if not np.isfinite(values).all():
+            continue
+        for current in range(task_max_distance[task] + 1):
+            source_profiles[(task, graph, channel, source, current)].append(
+                float(values[distance == current].sum())
+            )
+        for threshold in range(task_max_distance[task]):
+            source_far[(task, graph, channel, source, threshold)].append(
+                float(values[distance > threshold].sum())
+            )
+
+    graph_rows: list[dict[str, Any]] = []
+    for kind, container in (("distance", source_profiles), ("far", source_far)):
+        graph_values: dict[tuple[Any, ...], list[float]] = defaultdict(list)
+        for (task, graph, channel, _source, index), donor_values in container.items():
+            graph_values[(task, graph, channel, index)].append(
+                float(np.mean(donor_values))
+            )
+        for (task, graph, channel, index), source_values in sorted(graph_values.items()):
+            graph_rows.append(
+                {
+                    "task": task,
+                    "model_label": TASK_LABELS[task],
+                    "graph": int(graph),
+                    "channel": channel,
+                    "estimand": kind,
+                    "index": int(index),
+                    "beneficial_carriage": float(np.mean(source_values)),
+                    "sampled_sources": int(len(source_values)),
+                }
+            )
+
+    grouped: dict[tuple[Any, ...], list[float]] = defaultdict(list)
+    for row in graph_rows:
+        grouped[
+            (
+                str(row["task"]),
+                str(row["channel"]),
+                str(row["estimand"]),
+                _integer(row, "index"),
+            )
+        ].append(_float(row, "beneficial_carriage"))
+    summary: list[dict[str, Any]] = []
+    for (task, channel, estimand, index), values in sorted(grouped.items()):
+        mean, low, high = _bootstrap_interval(
+            values,
+            replicates=int(bootstrap_replicates),
+            seed=int(
+                stable_hash(
+                    {
+                        "seed": int(bootstrap_seed),
+                        "analysis": "beneficial",
+                        "task": task,
+                        "channel": channel,
+                        "estimand": estimand,
+                        "index": index,
+                    },
+                    length=8,
+                ),
+                16,
+            ),
+        )
+        summary.append(
+            {
+                "task": task,
+                "model_label": TASK_LABELS[task],
+                "channel": channel,
+                "estimand": estimand,
+                "index": int(index),
+                "mean": mean,
+                "low": low,
+                "high": high,
+                "graphs": int(len(values)),
+            }
+        )
+    return graph_rows, summary
+
+
+def summarise_shell_survival(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    bootstrap_replicates: int,
+    bootstrap_seed: int,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    """Average draws/carriers inside graph, then bootstrap held-out graphs."""
+
+    metrics = (
+        "carrier_survival",
+        "carrier_additive_survival",
+        "carrier_nonlinear_residual",
+        "output_survival",
+        "output_additive_survival",
+        "output_nonlinear_residual",
+    )
+    graph_values: dict[tuple[Any, ...], list[float]] = defaultdict(list)
+    graph_sizes: dict[tuple[Any, ...], list[int]] = defaultdict(list)
+    total: dict[tuple[Any, ...], int] = defaultdict(int)
+    for row in rows:
+        base_key = (
+            str(row["task"]),
+            _integer(row, "graph"),
+            str(row["intervention"]),
+            str(row["condition"]),
+            _integer(row, "radius"),
+        )
+        total[base_key] += 1
+        if _integer(row, "coalition_size") < 1:
+            continue
+        graph_sizes[base_key].append(_integer(row, "coalition_size"))
+        for metric in metrics:
+            if metric not in row or row[metric] == "":
+                continue
+            value = _float(row, metric)
+            if np.isfinite(value):
+                graph_values[(*base_key, metric)].append(value)
+
+    graph_rows: list[dict[str, Any]] = []
+    for key, values in sorted(graph_values.items()):
+        task, graph, intervention, condition, radius, metric = key
+        base_key = key[:-1]
+        sizes = graph_sizes[base_key]
+        graph_rows.append(
+            {
+                "task": task,
+                "model_label": TASK_LABELS[task],
+                "graph": int(graph),
+                "intervention": intervention,
+                "condition": condition,
+                "radius": int(radius),
+                "metric": metric,
+                "value": float(np.mean(values)),
+                "coalitions": int(len(values)),
+                "mean_coalition_size": float(np.mean(sizes)),
+                "estimable_fraction": float(
+                    len(values) / max(1, total[base_key])
+                ),
+            }
+        )
+
+    grouped: dict[tuple[Any, ...], list[Mapping[str, Any]]] = defaultdict(list)
+    for row in graph_rows:
+        grouped[
+            (
+                str(row["task"]),
+                str(row["intervention"]),
+                str(row["condition"]),
+                _integer(row, "radius"),
+                str(row["metric"]),
+            )
+        ].append(row)
+    summary: list[dict[str, Any]] = []
+    for (task, intervention, condition, radius, metric), group in sorted(grouped.items()):
+        values = [_float(row, "value") for row in group]
+        mean, low, high = _bootstrap_interval(
+            values,
+            replicates=int(bootstrap_replicates),
+            seed=int(
+                stable_hash(
+                    {
+                        "seed": int(bootstrap_seed),
+                        "analysis": "survival",
+                        "task": task,
+                        "intervention": intervention,
+                        "condition": condition,
+                        "radius": radius,
+                        "metric": metric,
+                    },
+                    length=8,
+                ),
+                16,
+            ),
+        )
+        summary.append(
+            {
+                "task": task,
+                "model_label": TASK_LABELS[task],
+                "intervention": intervention,
+                "condition": condition,
+                "radius": int(radius),
+                "metric": metric,
+                "mean": mean,
+                "low": low,
+                "high": high,
+                "graphs": int(len(values)),
+                "mean_coalition_size": float(
+                    np.mean([_float(row, "mean_coalition_size") for row in group])
+                ),
+                "mean_estimable_fraction": float(
+                    np.mean([_float(row, "estimable_fraction") for row in group])
+                ),
+            }
+        )
+
+    # Paired control differences use the exact same graph/carrier/draw/condition.
+    paired: dict[tuple[Any, ...], dict[str, Mapping[str, Any]]] = defaultdict(dict)
+    for row in rows:
+        if _integer(row, "coalition_size") < 1:
+            continue
+        key = (
+            str(row["task"]),
+            _integer(row, "graph"),
+            _integer(row, "carrier"),
+            _integer(row, "draw"),
+            str(row["condition"]),
+            _integer(row, "radius"),
+        )
+        paired[key][str(row["intervention"])] = row
+    graph_differences: dict[tuple[Any, ...], list[float]] = defaultdict(list)
+    for key, pair in paired.items():
+        if not {"shell_permutation", "shell_replacement"}.issubset(pair):
+            continue
+        task, graph, _carrier, _draw, condition, radius = key
+        for metric in metrics:
+            left = pair["shell_permutation"].get(metric, "")
+            right = pair["shell_replacement"].get(metric, "")
+            if left == "" or right == "":
+                continue
+            difference = float(right) - float(left)
+            if np.isfinite(difference):
+                graph_differences[(task, graph, condition, radius, metric)].append(
+                    difference
+                )
+    contrast_groups: dict[tuple[Any, ...], list[float]] = defaultdict(list)
+    for (task, _graph, condition, radius, metric), values in graph_differences.items():
+        contrast_groups[(task, condition, radius, metric)].append(float(np.mean(values)))
+    contrasts: list[dict[str, Any]] = []
+    for (task, condition, radius, metric), values in sorted(contrast_groups.items()):
+        mean, low, high = _bootstrap_interval(
+            values,
+            replicates=int(bootstrap_replicates),
+            seed=int(
+                stable_hash(
+                    {
+                        "seed": int(bootstrap_seed),
+                        "analysis": "survival_control_contrast",
+                        "task": task,
+                        "condition": condition,
+                        "radius": radius,
+                        "metric": metric,
+                    },
+                    length=8,
+                ),
+                16,
+            ),
+        )
+        contrasts.append(
+            {
+                "task": task,
+                "model_label": TASK_LABELS[task],
+                "condition": condition,
+                "radius": int(radius),
+                "metric": metric,
+                "contrast": "shell_replacement - shell_permutation",
+                "mean": mean,
+                "low": low,
+                "high": high,
+                "paired_graphs": int(len(values)),
+            }
+        )
+    return graph_rows, summary, contrasts
+
+
+def summarise_shell_survival_by_size(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    bootstrap_replicates: int,
+    bootstrap_seed: int,
+) -> list[dict[str, Any]]:
+    """Sensitivity table stratified by realised nonzero coalition size."""
+
+    metrics = (
+        "carrier_survival",
+        "carrier_additive_survival",
+        "carrier_nonlinear_residual",
+        "output_survival",
+    )
+    within_graph: dict[tuple[Any, ...], list[float]] = defaultdict(list)
+    for row in rows:
+        size = _integer(row, "coalition_size")
+        if size < 1:
+            continue
+        for metric in metrics:
+            if metric not in row or row[metric] == "":
+                continue
+            value = _float(row, metric)
+            if not np.isfinite(value):
+                continue
+            within_graph[
+                (
+                    str(row["task"]),
+                    _integer(row, "graph"),
+                    str(row["intervention"]),
+                    str(row["condition"]),
+                    _integer(row, "radius"),
+                    int(size),
+                    metric,
+                )
+            ].append(value)
+    across_graphs: dict[tuple[Any, ...], list[float]] = defaultdict(list)
+    for key, values in within_graph.items():
+        task, _graph, intervention, condition, radius, size, metric = key
+        across_graphs[(task, intervention, condition, radius, size, metric)].append(
+            float(np.mean(values))
+        )
+    output: list[dict[str, Any]] = []
+    for (task, intervention, condition, radius, size, metric), values in sorted(
+        across_graphs.items()
+    ):
+        mean, low, high = _bootstrap_interval(
+            values,
+            replicates=int(bootstrap_replicates),
+            seed=int(
+                stable_hash(
+                    {
+                        "seed": int(bootstrap_seed),
+                        "analysis": "survival_by_coalition_size",
+                        "task": task,
+                        "intervention": intervention,
+                        "condition": condition,
+                        "radius": radius,
+                        "coalition_size": size,
+                        "metric": metric,
+                    },
+                    length=8,
+                ),
+                16,
+            ),
+        )
+        output.append(
+            {
+                "task": task,
+                "model_label": TASK_LABELS[task],
+                "intervention": intervention,
+                "condition": condition,
+                "radius": int(radius),
+                "coalition_size": int(size),
+                "metric": metric,
+                "mean": mean,
+                "low": low,
+                "high": high,
+                "graphs": int(len(values)),
+            }
+        )
+    return output
+
+
 def _figure_theme() -> None:
     import matplotlib as mpl
 
@@ -2690,6 +3777,217 @@ def _save_figure(fig: Any, figures_dir: Path, name: str) -> dict[str, str]:
     fig.savefig(paths["pdf"], bbox_inches="tight", facecolor="white")
     plt.close(fig)
     return paths
+
+
+def plot_beneficial_carriage(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    figures_dir: Path,
+    tasks: Sequence[str],
+    dataset_label: str,
+    figure_prefix: str,
+) -> dict[str, str]:
+    """Signed B(d) and additive B_far(k), in native task-loss units."""
+
+    import matplotlib.pyplot as plt
+
+    _figure_theme()
+    fig, axes = plt.subplots(2, 2, figsize=(11.0, 7.0), sharex="col")
+    for row_index, channel in enumerate(CHANNELS):
+        for column_index, (estimand, xlabel, ylabel) in enumerate(
+            (
+                ("distance", "Source–carrier distance d", "Mean B(d) per source"),
+                ("far", "Threshold k", r"Additive $B_{far}(k)$ per source"),
+            )
+        ):
+            axis = axes[row_index, column_index]
+            plotted = False
+            magnitude: list[float] = []
+            for task in tasks:
+                values = sorted(
+                    (
+                        row
+                        for row in rows
+                        if str(row["task"]) == task
+                        and str(row["channel"]) == channel
+                        and str(row["estimand"]) == estimand
+                    ),
+                    key=lambda row: _integer(row, "index"),
+                )
+                if not values:
+                    continue
+                x = np.asarray([_integer(row, "index") for row in values])
+                mean = np.asarray([_float(row, "mean") for row in values])
+                low = np.asarray([_float(row, "low") for row in values])
+                high = np.asarray([_float(row, "high") for row in values])
+                finite = np.isfinite(mean) & np.isfinite(low) & np.isfinite(high)
+                if not finite.any():
+                    continue
+                plotted = True
+                magnitude.extend(np.abs(np.concatenate((mean[finite], low[finite], high[finite]))))
+                axis.plot(
+                    x[finite],
+                    mean[finite],
+                    color=MODEL_COLOURS[task],
+                    marker=MODEL_MARKERS[task],
+                    linestyle=MODEL_LINESTYLES[task],
+                    linewidth=1.7,
+                    markersize=4.3,
+                    label=TASK_LABELS[task],
+                )
+                axis.fill_between(
+                    x[finite], low[finite], high[finite],
+                    color=MODEL_COLOURS[task], alpha=0.13, linewidth=0,
+                )
+            axis.axhline(0.0, color="#555555", linewidth=0.9, zorder=0)
+            finite_magnitude = [value for value in magnitude if np.isfinite(value) and value > 0]
+            if finite_magnitude:
+                axis.set_yscale(
+                    "symlog",
+                    linthresh=max(1.0e-9, float(np.quantile(finite_magnitude, 0.25)) * 0.2),
+                )
+            if not plotted:
+                axis.text(0.5, 0.5, "No estimable paths", transform=axis.transAxes,
+                          ha="center", va="center", color="#666666")
+            axis.set_xlabel(xlabel)
+            axis.set_ylabel(ylabel)
+            if row_index == 0:
+                axis.set_title("Distance profile" if estimand == "distance" else "Far-distance total")
+            if column_index == 0:
+                axis.text(
+                    -0.22,
+                    0.5,
+                    channel.capitalize(),
+                    transform=axis.transAxes,
+                    rotation=90,
+                    ha="center",
+                    va="center",
+                    fontsize=10.5,
+                    fontweight="bold",
+                )
+    handles, labels = axes[0, 0].get_legend_handles_labels()
+    if handles:
+        fig.legend(handles, labels, loc="upper center", bbox_to_anchor=(0.5, 0.945),
+                   ncol=min(len(handles), 5), frameon=False)
+    fig.suptitle(
+        f"Beneficial carriage on {dataset_label}: where information improves task loss",
+        fontsize=13,
+        y=0.99,
+    )
+    fig.text(
+        0.5,
+        0.885,
+        "Positive = intervention increases loss; donor → source → graph; 95% graph bootstrap",
+        ha="center",
+        color="#666666",
+        fontsize=8.5,
+    )
+    fig.subplots_adjust(left=0.12, right=0.985, bottom=0.09, top=0.81,
+                        wspace=0.28, hspace=0.32)
+    return _save_figure(fig, figures_dir, f"{figure_prefix}_beneficial_carriage")
+
+
+def plot_shell_survival(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    condition: str,
+    figures_dir: Path,
+    tasks: Sequence[str],
+    dataset_label: str,
+    figure_prefix: str,
+) -> dict[str, str]:
+    """Plot the complete R=C/A+(J-C)/A carrier-level decomposition."""
+
+    import matplotlib.pyplot as plt
+
+    if condition not in {"exact_shell", "far_tail"}:
+        raise ValueError(f"unknown survival condition {condition!r}")
+    _figure_theme()
+    interventions = ("shell_permutation", "shell_replacement")
+    metric_specs = (
+        ("carrier_survival", r"Joint survival $R=J/A$", 1.0),
+        ("carrier_additive_survival", r"Additive survival $C/A$", 1.0),
+        ("carrier_nonlinear_residual", r"Nonlinear residual $(J-C)/A$", 0.0),
+    )
+    fig, axes = plt.subplots(3, 2, figsize=(11.0, 8.3), sharex=True)
+    for row_index, (metric, ylabel, reference) in enumerate(metric_specs):
+        for column_index, intervention in enumerate(interventions):
+            axis = axes[row_index, column_index]
+            plotted = False
+            for task in tasks:
+                values = sorted(
+                    (
+                        row
+                        for row in rows
+                        if str(row["task"]) == task
+                        and str(row["condition"]) == condition
+                        and str(row["intervention"]) == intervention
+                        and str(row["metric"]) == metric
+                    ),
+                    key=lambda row: _integer(row, "radius"),
+                )
+                if not values:
+                    continue
+                x = np.asarray([_integer(row, "radius") for row in values])
+                mean = np.asarray([_float(row, "mean") for row in values])
+                low = np.asarray([_float(row, "low") for row in values])
+                high = np.asarray([_float(row, "high") for row in values])
+                finite = np.isfinite(mean) & np.isfinite(low) & np.isfinite(high)
+                if not finite.any():
+                    continue
+                plotted = True
+                axis.plot(
+                    x[finite], mean[finite],
+                    color=MODEL_COLOURS[task],
+                    marker=MODEL_MARKERS[task],
+                    linestyle=MODEL_LINESTYLES[task],
+                    linewidth=1.65,
+                    markersize=4.1,
+                    label=TASK_LABELS[task],
+                )
+                axis.fill_between(
+                    x[finite], low[finite], high[finite],
+                    color=MODEL_COLOURS[task], alpha=0.13, linewidth=0,
+                )
+            axis.axhline(reference, color="#666666", linewidth=0.9, zorder=0)
+            axis.set_ylabel(ylabel)
+            if row_index == 0:
+                axis.set_title(
+                    "Within-shell permutation\n(multiset preserved)"
+                    if intervention == "shell_permutation"
+                    else "External shell replacement\n(multiset changed)"
+                )
+            if row_index == 2:
+                axis.set_xlabel(
+                    "Exact shell distance d"
+                    if condition == "exact_shell"
+                    else "Far-tail radius r (all shells d ≥ r)"
+                )
+            if not plotted:
+                axis.text(0.5, 0.5, "No estimable coalitions", transform=axis.transAxes,
+                          ha="center", va="center", color="#666666")
+    handles, labels = axes[0, 0].get_legend_handles_labels()
+    if handles:
+        fig.legend(handles, labels, loc="upper center", bbox_to_anchor=(0.5, 0.947),
+                   ncol=min(len(handles), 5), frameon=False)
+    scope = "exact distance shells" if condition == "exact_shell" else "cumulative far tails"
+    fig.suptitle(
+        f"Functional-carriage survival under joint semantic interventions: {scope}",
+        fontsize=13,
+        y=0.992,
+    )
+    fig.text(
+        0.5,
+        0.89,
+        f"{dataset_label}; signed task-output vectors; no ratio clipping; draws/carriers → graph; 95% graph bootstrap",
+        ha="center",
+        color="#666666",
+        fontsize=8.5,
+    )
+    fig.subplots_adjust(left=0.12, right=0.985, bottom=0.075, top=0.80,
+                        wspace=0.25, hspace=0.28)
+    suffix = "shell_redundancy" if condition == "exact_shell" else "tail_redundancy"
+    return _save_figure(fig, figures_dir, f"{figure_prefix}_{suffix}")
 
 
 def plot_model_profiles(
@@ -3555,6 +4853,8 @@ def figures(
     interpolation_path = results_dir / "semantic_interpolation_mass.csv"
     bamberger_path = results_dir / "bamberger_input_output_influence.csv"
     output_carriage_path = results_dir / "semantic_output_carriage.csv"
+    beneficial_path = results_dir / "beneficial_carriage.csv"
+    survival_path = results_dir / "shell_survival.csv"
     output_carriage_failures_path = results_dir / "output_carriage_failures.csv"
     graph_metrics_path = results_dir / "graph_metrics.csv"
     full_test_metrics_path = results_dir / "full_test_metrics.csv"
@@ -3563,6 +4863,8 @@ def figures(
         or not interpolation_path.is_file()
         or not bamberger_path.is_file()
         or not output_carriage_path.is_file()
+        or not beneficial_path.is_file()
+        or not survival_path.is_file()
         or not graph_metrics_path.is_file()
         or not full_test_metrics_path.is_file()
     ):
@@ -3603,6 +4905,22 @@ def figures(
             bootstrap_replicates=int(config.bootstrap_replicates),
             bootstrap_seed=int(config.analysis_seed) + 500,
         )
+    )
+    beneficial_graph, beneficial_summary = summarise_beneficial_carriage(
+        _read_csv(beneficial_path),
+        bootstrap_replicates=int(config.bootstrap_replicates),
+        bootstrap_seed=int(config.analysis_seed) + 600,
+    )
+    survival_raw = _read_csv(survival_path)
+    survival_graph, survival_summary, survival_contrasts = summarise_shell_survival(
+        survival_raw,
+        bootstrap_replicates=int(config.bootstrap_replicates),
+        bootstrap_seed=int(config.analysis_seed) + 700,
+    )
+    survival_by_size = summarise_shell_survival_by_size(
+        survival_raw,
+        bootstrap_replicates=int(config.bootstrap_replicates),
+        bootstrap_seed=int(config.analysis_seed) + 800,
     )
     interpolation_contrasts, interpolation_summary = (
         summarise_interpolation_contrasts(
@@ -3666,6 +4984,12 @@ def figures(
         output_coherence_expected,
     )
     _write_csv(results_dir / "output_carriage_audit.csv", output_carriage_audit)
+    _write_csv(results_dir / "beneficial_graph_profiles.csv", beneficial_graph)
+    _write_csv(results_dir / "beneficial_carriage_summary.csv", beneficial_summary)
+    _write_csv(results_dir / "shell_survival_graph_rows.csv", survival_graph)
+    _write_csv(results_dir / "shell_survival_summary.csv", survival_summary)
+    _write_csv(results_dir / "shell_survival_control_contrasts.csv", survival_contrasts)
+    _write_csv(results_dir / "shell_survival_by_coalition_size.csv", survival_by_size)
 
     figures_dir = output_dir / "figures"
     paths = {
@@ -3723,6 +5047,29 @@ def figures(
             dataset_label=config.profile.name,
             figure_prefix=config.profile.figure_prefix,
         ),
+        "beneficial_carriage": plot_beneficial_carriage(
+            beneficial_summary,
+            figures_dir=figures_dir,
+            tasks=config.tasks,
+            dataset_label=config.profile.name,
+            figure_prefix=config.profile.figure_prefix,
+        ),
+        "shell_redundancy": plot_shell_survival(
+            survival_summary,
+            condition="exact_shell",
+            figures_dir=figures_dir,
+            tasks=config.tasks,
+            dataset_label=config.profile.name,
+            figure_prefix=config.profile.figure_prefix,
+        ),
+        "tail_redundancy": plot_shell_survival(
+            survival_summary,
+            condition="far_tail",
+            figures_dir=figures_dir,
+            tasks=config.tasks,
+            dataset_label=config.profile.name,
+            figure_prefix=config.profile.figure_prefix,
+        ),
         "scale_dependence": plot_scale_dependence(
             scale_summary,
             figures_dir=figures_dir,
@@ -3758,6 +5105,10 @@ def figures(
                 " Output-coherence profiles integrate the scalar z-output along each "
                 "finite semantic donor path and compare carrier magnitudes before and "
                 "after signed within-distance aggregation."
+                " Beneficial carriage is an exact positive-is-beneficial task-loss "
+                "allocation. Shell-survival figures average repeated coalitions and "
+                "sampled carriers within graph before bootstrapping graphs; external "
+                "replacement-minus-permutation contrasts remain paired through draw."
             ),
         },
     )
@@ -3773,6 +5124,12 @@ def figures(
         "output_coherence_expected": output_coherence_expected,
         "output_carriage_audit": output_carriage_audit,
         "output_carriage_failures": output_carriage_failures,
+        "beneficial_graph": beneficial_graph,
+        "beneficial_summary": beneficial_summary,
+        "survival_graph": survival_graph,
+        "survival_summary": survival_summary,
+        "survival_contrasts": survival_contrasts,
+        "survival_by_size": survival_by_size,
     }
 
 
@@ -3787,7 +5144,7 @@ def build_parser(
     )
     parser.add_argument("--tasks", default=",".join(profile.tasks))
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--graphs", type=int, default=64)
+    parser.add_argument("--graphs", type=int, default=128)
     parser.add_argument("--sources-per-graph", type=int, default=6)
     parser.add_argument("--donors-per-source", type=int, default=4)
     parser.add_argument("--semantic-donor-graphs", type=int, default=256)
@@ -3798,6 +5155,16 @@ def build_parser(
         default=",".join(f"{value:g}" for value in DEFAULT_INTERPOLATION_DOSES),
     )
     parser.add_argument("--interpolation-batch-size", type=int, default=64)
+    parser.add_argument("--survival-carriers-per-graph", type=int, default=6)
+    parser.add_argument("--survival-draws", type=int, default=4)
+    parser.add_argument("--survival-tail-radii", default="2,3,4,5")
+    parser.add_argument("--survival-replacement-candidates", type=int, default=32)
+    parser.add_argument("--survival-exact-limit", type=int, default=12)
+    parser.add_argument("--survival-random-attempts", type=int, default=512)
+    parser.add_argument("--survival-replica-batch-size", type=int, default=128)
+    parser.add_argument("--beneficial-atol", type=float, default=1.0e-6)
+    parser.add_argument("--beneficial-rtol", type=float, default=1.0e-5)
+    parser.add_argument("--beneficial-max-intervals", type=int, default=128)
     parser.add_argument("--effect-floor", type=float, default=1.0e-12)
     parser.add_argument("--bootstrap-replicates", type=int, default=2_000)
     parser.add_argument("--analysis-seed", type=int, default=91_021)
@@ -3830,6 +5197,20 @@ def main(
             if value.strip()
         ),
         interpolation_batch_size=int(args.interpolation_batch_size),
+        survival_carriers_per_graph=int(args.survival_carriers_per_graph),
+        survival_draws=int(args.survival_draws),
+        survival_tail_radii=tuple(
+            int(value.strip())
+            for value in args.survival_tail_radii.split(",")
+            if value.strip()
+        ),
+        survival_replacement_candidates=int(args.survival_replacement_candidates),
+        survival_exact_limit=int(args.survival_exact_limit),
+        survival_random_attempts=int(args.survival_random_attempts),
+        survival_replica_batch_size=int(args.survival_replica_batch_size),
+        beneficial_atol=float(args.beneficial_atol),
+        beneficial_rtol=float(args.beneficial_rtol),
+        beneficial_max_intervals=int(args.beneficial_max_intervals),
         effect_floor=float(args.effect_floor),
         bootstrap_replicates=int(args.bootstrap_replicates),
         analysis_seed=int(args.analysis_seed),

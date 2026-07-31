@@ -1,7 +1,7 @@
 """Standalone Colab frontend for ZINC Bamberger-versus-carriage reach.
 
 Paste this complete file into one Colab cell.  It loads the seed-0 checkpoints
-for 1-hop, 2-hop, 1-hop+VNode, and dense GRIT, caches graph-level measurements
+for 1-hop, local-RRWP 1-hop, 2-hop, 1-hop+VNode, and dense GRIT, caches graph-level measurements
 to Drive, saves PNG/PDF figures, and displays every PNG in the notebook.
 
 After the first completed run, set ``PHASE = "figures"`` to rebuild figures
@@ -29,11 +29,11 @@ SECRET_NAME = "dissertation_key"
 PHASE = "all"  # "all", "measure", or "figures"
 OUTPUT_DIR = Path(
     "/content/drive/MyDrive/graph_specialisation_metrics/"
-    "zinc_bamberger_functional_reach_v7"
+    "zinc_bamberger_functional_reach_v8"
 )
-TASKS = "zinc_1hop,zinc_2hop,zinc_1hop_vnode,zinc"
+TASKS = "zinc_1hop,zinc_1hop_localrrwp,zinc_2hop,zinc_1hop_vnode,zinc"
 SEED = 0
-GRAPHS = 64
+GRAPHS = 128
 SOURCES_PER_GRAPH = 6
 DONORS_PER_SOURCE = 4
 SEMANTIC_DONOR_GRAPHS = 256
@@ -41,6 +41,16 @@ BAMBERGER_OUTPUT_NODES = 6
 BAMBERGER_OUTPUT_CHANNELS = 8
 INTERPOLATION_DOSES = "0.01,0.02,0.05,0.1,0.25,0.5,1.0"
 INTERPOLATION_BATCH_SIZE = 64
+SURVIVAL_CARRIERS_PER_GRAPH = 6
+SURVIVAL_DRAWS = 4
+SURVIVAL_TAIL_RADII = "2,3,4,5"
+SURVIVAL_REPLACEMENT_CANDIDATES = 32
+SURVIVAL_EXACT_LIMIT = 12
+SURVIVAL_RANDOM_ATTEMPTS = 512
+SURVIVAL_REPLICA_BATCH_SIZE = 128
+BENEFICIAL_ATOL = 1.0e-6
+BENEFICIAL_RTOL = 1.0e-5
+BENEFICIAL_MAX_INTERVALS = 128
 BOOTSTRAP_REPLICATES = 2_000
 ANALYSIS_SEED = 91_021
 ACCELERATOR = "cuda:0"
@@ -179,11 +189,20 @@ print(
     "identical graphs, donors, carriers and task projections. This separates "
     "finite nonlinear change from the residual Bamberger estimand mismatch.\n"
     "[scope] Scale analysis: MAE uses every test molecule; Functional reach uses "
-    "the 64 carriage graphs. Adjacent values are grouped adaptively by data density, "
+    "the 128 carriage graphs. Adjacent values are grouped adaptively by data density, "
     "and continuous paired-bootstrap slopes avoid dependence on bin boundaries.\n"
     "[scope] Cancellation analysis: signed scalar-output carriage is integrated "
     "along each finite semantic donor path. Apparent mass sums carrier magnitudes; "
     "coherent mass sums signed carriers before taking magnitude.\n"
+    "[scope] Beneficial carriage: exact task-loss path integration for semantic and "
+    "structural donors; positive means the clean function avoids intervention loss.\n"
+    "[scope] Redundancy: R=J/A compares the actual joint response with apparent "
+    "singleton carriage. C/A isolates additive cancellation and (J-C)/A the nonlinear "
+    "residual. Exact shells and cumulative far tails are both evaluated.\n"
+    "[scope] Shell control: within-shell semantic permutations preserve the exact shell "
+    "multiset; external degree-law donors change it while matching the source coalition "
+    "and intervention dose. Thus permutation tests assignment redundancy, while "
+    "replacement tests aggregate content sensitivity.\n"
     "[scope] Fairness: checkpoints, graphs, SPD and carrier site are shared; "
     "literal Bamberger remains output-centric and channel-subsampled.\n"
     "[scope] Interpretation: this is an estimand comparison, not a claim that "
@@ -219,6 +238,26 @@ CELL_ARGS = [
     INTERPOLATION_DOSES,
     "--interpolation-batch-size",
     str(INTERPOLATION_BATCH_SIZE),
+    "--survival-carriers-per-graph",
+    str(SURVIVAL_CARRIERS_PER_GRAPH),
+    "--survival-draws",
+    str(SURVIVAL_DRAWS),
+    "--survival-tail-radii",
+    SURVIVAL_TAIL_RADII,
+    "--survival-replacement-candidates",
+    str(SURVIVAL_REPLACEMENT_CANDIDATES),
+    "--survival-exact-limit",
+    str(SURVIVAL_EXACT_LIMIT),
+    "--survival-random-attempts",
+    str(SURVIVAL_RANDOM_ATTEMPTS),
+    "--survival-replica-batch-size",
+    str(SURVIVAL_REPLICA_BATCH_SIZE),
+    "--beneficial-atol",
+    str(BENEFICIAL_ATOL),
+    "--beneficial-rtol",
+    str(BENEFICIAL_RTOL),
+    "--beneficial-max-intervals",
+    str(BENEFICIAL_MAX_INTERVALS),
     "--bootstrap-replicates",
     str(BOOTSTRAP_REPLICATES),
     "--analysis-seed",
@@ -267,6 +306,18 @@ if output_failures:
         display(pd.DataFrame(output_failures))
     except (ImportError, NameError):
         print(output_failures, flush=True)
+
+for failure_key, failure_title in (
+    ("beneficial_failures", "Beneficial-carriage skipped-graph audit"),
+    ("survival_failures", "Shell-survival skipped-graph audit"),
+):
+    failures = result.get(failure_key) or result.get("measurement", {}).get(failure_key)
+    if failures:
+        print(f"\n{failure_title}", flush=True)
+        try:
+            display(pd.DataFrame(failures))
+        except (ImportError, NameError):
+            print(failures, flush=True)
 
 if "expected_rows" in result:
     from IPython.display import display
@@ -323,6 +374,28 @@ if "output_coherence_expected" in result:
     except ImportError:
         pass
 
+if "beneficial_summary" in result:
+    from IPython.display import display
+
+    try:
+        import pandas as pd
+
+        print("\nBeneficial-carriage summary", flush=True)
+        display(pd.DataFrame(result["beneficial_summary"]))
+    except ImportError:
+        pass
+
+if "survival_contrasts" in result:
+    from IPython.display import display
+
+    try:
+        import pandas as pd
+
+        print("\nShell replacement-minus-permutation contrasts", flush=True)
+        display(pd.DataFrame(result["survival_contrasts"]))
+    except ImportError:
+        pass
+
 if "figures" in result:
     from IPython.display import Image, display
 
@@ -333,6 +406,9 @@ if "figures" in result:
         "structural_functional",
         "expected_distance",
         "output_coherence",
+        "beneficial_carriage",
+        "shell_redundancy",
+        "tail_redundancy",
         "scale_dependence",
         "scale_slopes",
     ):
