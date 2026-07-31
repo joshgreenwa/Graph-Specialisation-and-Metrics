@@ -10,6 +10,7 @@ from typing import Any, Mapping, Sequence
 
 import numpy as np
 
+from ..carriage.env import log
 from .bootstrap import (
     Observation,
     nested_percentile_interval,
@@ -34,7 +35,7 @@ from .scores import (
 )
 
 
-FOCUSED_CAUSAL_VERSION = "graphormer-pcqm-focused-causal-v3"
+FOCUSED_CAUSAL_VERSION = "graphormer-pcqm-focused-causal-v4"
 PATCH_METRICS = (
     "R_gross_matched",
     "R_gross_null",
@@ -185,6 +186,7 @@ def run_confidence_gate(
     if config.resume and not config.force:
         cached = cache.load("focused", "gate", strict=True)
         if cached is not None:
+            log("[cache] loaded focused bootstrap-confidence specialist gate")
             return cached
 
     coordinates = scores["coordinates"]
@@ -200,6 +202,18 @@ def run_confidence_gate(
         return np.stack((derived.joint_sensitivity, derived.selectivity))
 
     observations = _score_observations(scores, int(prepared.grit.sc.seed))
+    log(
+        "[focused] bootstrapping the specialist gate: 2,000 CPU draws over "
+        "graph/source/donor score summaries"
+    )
+
+    def report_gate_draw(completed: int, total: int) -> None:
+        if completed == 1 or completed % 100 == 0 or completed == total:
+            log(
+                "[focused] specialist-gate bootstrap "
+                f"draws={completed}/{total}"
+            )
+
     interval = paired_channel_percentile_interval(
         observations["semantic"],
         observations["structural"],
@@ -210,6 +224,7 @@ def run_confidence_gate(
             for channel in CHANNELS
         ),
         retain_draws=True,
+        on_draw=report_gate_draw,
     )
     if interval.draws is None:
         raise RuntimeError("specialist gate bootstrap did not retain its transient draws")
@@ -244,6 +259,12 @@ def run_confidence_gate(
     )
     gate["score_manifest_hash"] = str(scores["manifest_hash"])
     cache.save("focused", "gate", gate)
+    log(
+        "[focused] specialist gate complete: "
+        f"{len(gate['heads']['semantic_specialist'])} semantic, "
+        f"{len(gate['heads']['structural_specialist'])} structural, "
+        f"status={gate['status']}"
+    )
     return gate
 
 
@@ -1073,7 +1094,7 @@ def _artifact_paths(root: Path) -> dict[str, Path]:
     base = root / "graphormer_pcqm4mv2" / "seed_0"
     return {
         "model": base / "model.json",
-        "scores": base / "cache" / "scores" / "raw.pt",
+        "scores": base / "cache" / "focused" / "scores" / "raw_inputs_v1.pt",
         "gate": base / "cache" / "focused" / "gate.pt",
         "core": base / "cache" / "focused" / "core_tests.pt",
         "figures": base / "figures" / "focused_causal",
@@ -1195,7 +1216,7 @@ def run(
     atomic_json(root / "focused_causal_protocol.json", protocol)
     prepared = prepare_task(config, "graphormer_pcqm4mv2", 0)
     score_plan = _stage_plan(prepared, config, "scores")
-    scores = run_scores(prepared, config, plan=score_plan)
+    scores = run_scores(prepared, config, plan=score_plan, focused_only=True)
     gate = run_confidence_gate(prepared, config, scores)
     core = run_focused_analysis(
         prepared,

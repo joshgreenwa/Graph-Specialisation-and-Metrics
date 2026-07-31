@@ -112,6 +112,115 @@ def test_activation_control_is_same_source_tier_distinct_payload_and_nearest_dos
     assert not controlled[5]
 
 
+def test_focused_score_consolidation_reuses_canonical_shards_without_diagnostics(
+    monkeypatch, tmp_path
+):
+    from graph_specialisation_metrics.methodology import runner as runner_module
+
+    shape = (2, 3)
+
+    def shard(channel):
+        score = np.full(shape, 2.0 if channel == "semantic" else 1.0)
+        return {
+            "graph_id": 0,
+            "score": score,
+            "event_rows": [
+                {
+                    "graph_id": 0,
+                    "source": 0,
+                    "draw": 0,
+                    "score": score,
+                }
+            ],
+            # Complete canonical shards contain these fields, but the focused
+            # consolidation must neither consume nor recompute them.
+            "contribution": np.ones((*shape, 2)),
+            "support": np.ones(2),
+            "observations": (),
+            "distance_observations": (),
+            "throughput": np.ones(shape),
+            "attention": np.ones((*shape, 2)),
+        }
+
+    class FakeCache:
+        def __init__(self):
+            self.saved = []
+            self.loads = []
+
+        def load(self, stage, name, *, strict=False):
+            del strict
+            self.loads.append((stage, name))
+            if stage == "scores/semantic" and name == "graph_000000":
+                return shard("semantic")
+            if stage == "scores/structural" and name == "graph_000000":
+                return shard("structural")
+            return None
+
+        def save(self, stage, name, value):
+            self.saved.append((stage, name, value))
+
+        def save_audit(self, name, value):
+            self.saved.append(("audit", name, value))
+
+    cache = FakeCache()
+    monkeypatch.setattr(runner_module, "_cache", lambda *_args: cache)
+    monkeypatch.setattr(
+        runner_module,
+        "_prepare_clean_jacobians",
+        lambda *_args: ({}, {"focused_cache_only": True}),
+    )
+    monkeypatch.setattr(
+        runner_module,
+        "_channel_bootstrap_policy",
+        lambda *_args: SimpleNamespace(resample_source=True),
+    )
+    monkeypatch.setattr(
+        runner_module,
+        "score_heatmaps",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("focused scores must skip distance heatmaps")
+        ),
+    )
+    monkeypatch.setattr(
+        runner_module,
+        "nested_percentile_interval",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("focused scores must skip canonical bootstraps")
+        ),
+    )
+
+    config = production_config(
+        output_dir=str(tmp_path),
+        dataset_root=str(tmp_path / "pcqm"),
+        cache_dir=str(tmp_path / "hf"),
+        accelerator="cpu",
+    )
+    prepared = SimpleNamespace(
+        task=SimpleNamespace(name="graphormer_pcqm4mv2", raw_score_system="mass"),
+        progress=None,
+    )
+    plan = {
+        0: {
+            "semantic": {"sources": (0,), "records": ()},
+            "structural": {"sources": (0,), "records": ()},
+        }
+    }
+    result = runner_module.run_scores(
+        prepared,
+        config,
+        plan=plan,
+        focused_only=True,
+    )
+    assert result["focused_score_inputs_version"] == "focused-raw-score-inputs-v1"
+    assert "distance_intervals" not in result["channels"]["semantic"]
+    assert ("scores/semantic", "graph_000000") in cache.loads
+    assert ("scores/structural", "graph_000000") in cache.loads
+    assert any(
+        stage == "focused/scores" and name == "raw_inputs_v1"
+        for stage, name, _value in cache.saved
+    )
+
+
 def test_graph_local_diagnostic_uses_frozen_aggregate_normalization():
     coordinates = synthetic_coordinates()
     coordinates = HeadCoordinates(

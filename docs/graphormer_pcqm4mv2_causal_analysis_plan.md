@@ -188,7 +188,10 @@ test and no OLS trend line is plotted for the rank correlation.
 that head but changes it at every carrier token. Execution head/event batch sizes and CUDA OOM
 backoff do not alter the scientific fingerprint.
 
-The Drive output root contains canonical score shards plus the focused artifacts:
+The Drive output root contains focused score shards plus the focused artifacts. Complete
+canonical graph shards from an interrupted earlier run are accepted as read-through inputs, but
+the focused consolidation deliberately skips distance-profile, attention, family, and canonical
+coordinate bootstraps:
 
 ```text
 <OUTPUT_ROOT>/
@@ -196,8 +199,10 @@ The Drive output root contains canonical score shards plus the focused artifacts
   graphormer_pcqm4mv2/seed_0/
     model.json
     cache/
-      scores/raw.pt
       focused/
+        scores/
+          raw_inputs_v1.pt
+          {semantic,structural}/graph_*.pt
         gate.pt
         events/{semantic,structural}/graph_*.pt
         clean_ablation/graph_*.pt
@@ -218,7 +223,7 @@ manifest, thresholds, control rule, endpoint version, and bootstrap policy. Inco
 are archived by the canonical cache layer and recomputed.
 
 `PHASE = "run"` runs/resumes measurements, `"all"` also renders, and `"figures"` reads only the
-score/gate/core cache and does not load Graphormer or PCQM4Mv2. Because `OUTPUT_ROOT` is under the
+focused score/gate/core cache and does not load Graphormer or PCQM4Mv2. Because `OUTPUT_ROOT` is under the
 mounted Drive, both caches and exported figures survive Colab restarts.
 
 ## Figure contract

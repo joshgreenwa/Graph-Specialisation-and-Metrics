@@ -1219,9 +1219,11 @@ def _score_graph_batch(
     config: MethodologyConfig,
     plan: Mapping[int, Mapping[str, Any]],
     clean_by_graph: Mapping[int, Any],
-    axis: DistanceAxis,
+    axis: DistanceAxis | None,
     channel: str,
     graph_ids: Sequence[int],
+    *,
+    diagnostics: bool = True,
 ) -> list[dict[str, Any]]:
     """Run one multi-graph event forward and return graph-local score sufficient statistics."""
 
@@ -1243,7 +1245,11 @@ def _score_graph_batch(
                 "deterministic score-event replay changed its manifest for "
                 f"graph={graph_id} channel={channel}; refusing misaligned results"
             )
-        pristine = shortest_path_distances(base.edge_index, int(base.num_nodes))
+        pristine = (
+            shortest_path_distances(base.edge_index, int(base.num_nodes))
+            if diagnostics
+            else None
+        )
         contexts.append(
             {
                 "graph_id": graph_id,
@@ -1276,54 +1282,67 @@ def _score_graph_batch(
         event_c, event_o, rows = [], [], []
         score_observations, distance_rows = [], []
         for position, record in enumerate(records):
-            distances = prepared.backend.transport_distances(
-                base, int(record.source), pristine, channel=channel
-            )
-            contribution, support = distance_event_contributions(
-                q[position : position + 1], distances, axis
-            )
-            event_c.append(contribution[0])
-            event_o.append(support[0])
-            rows.append(
-                {
-                    **record.record(),
-                    "score": scores[position],
-                    "score_system": score_system,
-                    "distance_contribution": contribution[0],
-                    "distance_support": support[0],
-                }
-            )
-            score_observations.append(
-                Observation(
-                    seed=int(prepared.grit.sc.seed),
-                    graph=graph_id,
-                    source=int(record.source),
-                    donor=int(record.draw),
-                    value=scores[position],
+            row = {
+                **record.record(),
+                "score": scores[position],
+                "score_system": score_system,
+            }
+            if diagnostics:
+                if axis is None:
+                    raise RuntimeError("score diagnostics require a distance axis")
+                distances = prepared.backend.transport_distances(
+                    base, int(record.source), pristine, channel=channel
                 )
-            )
-            distance_rows.append(
-                Observation(
-                    seed=int(prepared.grit.sc.seed),
-                    graph=graph_id,
-                    source=int(record.source),
-                    donor=int(record.draw),
-                    value=np.stack(
-                        (
-                            contribution[0],
-                            np.broadcast_to(
-                                support[0][None, None, :], contribution[0].shape
-                            ),
-                        )
-                    ),
+                contribution, support = distance_event_contributions(
+                    q[position : position + 1], distances, axis
                 )
+                event_c.append(contribution[0])
+                event_o.append(support[0])
+                row.update(
+                    {
+                        "distance_contribution": contribution[0],
+                        "distance_support": support[0],
+                    }
+                )
+                score_observations.append(
+                    Observation(
+                        seed=int(prepared.grit.sc.seed),
+                        graph=graph_id,
+                        source=int(record.source),
+                        donor=int(record.draw),
+                        value=scores[position],
+                    )
+                )
+                distance_rows.append(
+                    Observation(
+                        seed=int(prepared.grit.sc.seed),
+                        graph=graph_id,
+                        source=int(record.source),
+                        donor=int(record.draw),
+                        value=np.stack(
+                            (
+                                contribution[0],
+                                np.broadcast_to(
+                                    support[0][None, None, :],
+                                    contribution[0].shape,
+                                ),
+                            )
+                        ),
+                    )
+                )
+            rows.append(row)
+        if diagnostics:
+            contribution_graph, support_graph = aggregate_distance_events(
+                np.stack(event_c), np.stack(event_o), gids, source_ids
             )
-        contribution_graph, support_graph = aggregate_distance_events(
-            np.stack(event_c), np.stack(event_o), gids, source_ids
-        )
+            graph_contribution = contribution_graph[graph_id]
+            graph_support = support_graph[graph_id]
+        else:
+            graph_contribution = None
+            graph_support = None
         throughput = None
         attention = None
-        if channel == "semantic":
+        if diagnostics and channel == "semantic":
             clean_transport = torch.stack(clean.capture.transport, dim=0)
             projected_clean = torch.einsum(
                 "lnhd,tlnhd->lhnt", clean_transport, clean.transport
@@ -1342,8 +1361,8 @@ def _score_graph_batch(
             {
                 "graph_id": graph_id,
                 "score": one_graph[graph_id],
-                "contribution": contribution_graph[graph_id],
-                "support": support_graph[graph_id],
+                "contribution": graph_contribution,
+                "support": graph_support,
                 "event_rows": rows,
                 "observations": score_observations,
                 "distance_observations": distance_rows,
@@ -1465,24 +1484,39 @@ def run_scores(
     config: MethodologyConfig,
     *,
     plan: Mapping[int, Mapping[str, Any]] | None = None,
+    focused_only: bool = False,
 ) -> dict[str, Any]:
-    """Compute and cache raw S_sem/S_str plus exact distance sufficient statistics."""
+    """Compute canonical scores, optionally omitting out-of-scope diagnostics.
+
+    ``focused_only`` retains exactly the event/head score inputs required by the
+    PCQM causal follow-up. It uses a separate consolidated cache and shard
+    namespace, while accepting complete canonical graph shards as a compatible
+    read-through source. This avoids running distance-profile bootstraps merely
+    to select causal heads.
+    """
 
     import torch
 
     plan = dict(plan or _stage_plan(prepared, config, "scores"))
     cache = _cache(prepared, config, plan)
+    consolidated_stage = "focused/scores" if focused_only else "scores"
+    consolidated_name = "raw_inputs_v1" if focused_only else "raw"
     if config.resume and not config.force:
-        cached = cache.load("scores", "raw", strict=True)
+        cached = cache.load(consolidated_stage, consolidated_name, strict=True)
         if cached is not None:
-            log(f"[cache] loaded canonical scores for {prepared.task.name}")
+            log(
+                f"[cache] loaded {'focused' if focused_only else 'canonical'} "
+                f"scores for {prepared.task.name}"
+            )
             if prepared.progress is not None:
                 prepared.progress.emit(
-                    "cache_hit", phase="scores", cache="consolidated"
+                    "cache_hit",
+                    phase="scores",
+                    cache="focused_consolidated" if focused_only else "consolidated",
                 )
             return cached
     graph_ids = sorted(plan)
-    axis = _distance_axis(prepared, graph_ids)
+    axis = None if focused_only else _distance_axis(prepared, graph_ids)
     output: dict[str, Any] = {
         "protocol_version": PROTOCOL_VERSION,
         "score_system": getattr(prepared.task, "raw_score_system", "mass"),
@@ -1490,10 +1524,12 @@ def run_scores(
         # diagnostic. Coherent movement cannot be decomposed additively across
         # carriers without changing its estimand.
         "distance_score_system": "mass",
-        "axis": axis.labels,
+        "axis": tuple() if axis is None else axis.labels,
         "manifest_hash": _manifest_hash(plan),
         "channels": {},
     }
+    if focused_only:
+        output["focused_score_inputs_version"] = "focused-raw-score-inputs-v1"
     observations: dict[str, list[Observation]] = {channel: [] for channel in CHANNELS}
     distance_observations: dict[str, list[Observation]] = {
         channel: [] for channel in CHANNELS
@@ -1508,15 +1544,24 @@ def run_scores(
     }
     for channel in CHANNELS:
         for graph_id in graph_ids:
-            shard = (
-                cache.load(
-                    f"scores/{channel}",
+            shard = None
+            if config.resume and not config.force:
+                shard = cache.load(
+                    (
+                        f"focused/scores/{channel}"
+                        if focused_only
+                        else f"scores/{channel}"
+                    ),
                     f"graph_{int(graph_id):06d}",
                     strict=True,
                 )
-                if config.resume and not config.force
-                else None
-            )
+                # A complete canonical shard contains every focused score input.
+                if shard is None and focused_only:
+                    shard = cache.load(
+                        f"scores/{channel}",
+                        f"graph_{int(graph_id):06d}",
+                        strict=True,
+                    )
             if shard is None:
                 missing_graphs[channel].append(int(graph_id))
             else:
@@ -1538,20 +1583,33 @@ def run_scores(
             for result in results:
                 graph_id = int(result["graph_id"])
                 graph_scores[graph_id] = result["score"]
-                graph_contribution[graph_id] = result["contribution"]
-                graph_support[graph_id] = result["support"]
-                event_rows.extend(result["event_rows"])
-                observations[channel].extend(result["observations"])
-                distance_observations[channel].extend(
-                    result["distance_observations"]
-                )
-                if result["throughput"] is not None:
-                    throughput_graph[graph_id] = result["throughput"]
-                if result["attention"] is not None:
-                    attention_graph[graph_id] = result["attention"]
+                if focused_only:
+                    event_rows.extend(
+                        {
+                            key: row[key]
+                            for key in ("graph_id", "source", "draw", "score")
+                        }
+                        for row in result["event_rows"]
+                    )
+                else:
+                    event_rows.extend(result["event_rows"])
+                    graph_contribution[graph_id] = result["contribution"]
+                    graph_support[graph_id] = result["support"]
+                    observations[channel].extend(result["observations"])
+                    distance_observations[channel].extend(
+                        result["distance_observations"]
+                    )
+                    if result["throughput"] is not None:
+                        throughput_graph[graph_id] = result["throughput"]
+                    if result["attention"] is not None:
+                        attention_graph[graph_id] = result["attention"]
                 if persist:
                     cache.save(
-                        f"scores/{channel}",
+                        (
+                            f"focused/scores/{channel}"
+                            if focused_only
+                            else f"scores/{channel}"
+                        ),
                         f"graph_{graph_id:06d}",
                         result,
                     )
@@ -1571,6 +1629,7 @@ def run_scores(
                 axis,
                 channel,
                 chunk,
+                diagnostics=not focused_only,
             ),
             consume=consume_score_batch,
             oom_backoff=config.execution.oom_backoff,
@@ -1591,6 +1650,21 @@ def run_scores(
             "cache_misses": len(missing_graphs[channel]),
         }
         raw = np.stack([graph_scores[key] for key in graph_ids]).mean(axis=0)
+        if focused_only:
+            output["channels"][channel] = {
+                "raw": raw,
+                "graph_scores": graph_scores,
+                "events": event_rows,
+                "resample_source": bool(
+                    _channel_bootstrap_policy(
+                        prepared, config, plan, channel
+                    ).resample_source
+                ),
+            }
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            continue
         heatmaps = score_heatmaps(
             graph_contribution,
             graph_support,
@@ -1700,6 +1774,14 @@ def run_scores(
         activity_floor=config.families.activity_floor,
     )
     output["coordinates"] = coordinates
+    if focused_only:
+        log(
+            "[focused] score forwards complete; skipped distance-profile, "
+            "attention, family, and canonical coordinate bootstraps"
+        )
+        cache.save(consolidated_stage, consolidated_name, output)
+        cache.save_audit("focused_scores_manifest", plan)
+        return output
     output["clean_throughput"] = np.stack(
         [throughput_graph[key] for key in sorted(throughput_graph)]
     ).mean(axis=0)
