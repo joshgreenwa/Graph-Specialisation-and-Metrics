@@ -37,6 +37,7 @@ from graph_specialisation_metrics.methodology.grit_figure_data import (  # noqa:
     select_structurally_selective_heads,
 )
 from graph_specialisation_metrics.methodology.grit_figure_plots import (  # noqa: E402
+    MOLECULE_ATOM_FONT_SIZE,
     MOLECULE_DRAW_DPI,
     MOLECULE_RENDER_DPI,
     PCA_FOCUS_COLORS,
@@ -285,18 +286,37 @@ def test_routing_transport_figure_facets_requested_payload_subset():
         metrics,
         payload,
         heads=displayed_heads,
-        title="ZINC — GRIT — routing geometry and transport response",
-        dataset_label="ZINC discovery set",
+        dataset_label="ZINC",
     )
     try:
-        assert np.allclose(figure.get_size_inches(), (17.0, 8.5))
+        assert np.allclose(figure.get_size_inches(), (17.0, 7.7))
         assert len(figure.axes) == 8
+        assert figure._suptitle.get_text() == (
+            "Distance breakdown of semantic and structural scores"
+        )
+        assert figure._supxlabel.get_text() == (
+            "Shortest path-distance (SPD) from intervened node"
+        )
+        assert figure._supxlabel.get_fontsize() == 15
+        subtitles = [
+            text for text in figure.texts if text.get_text().startswith("ZINC")
+        ]
+        assert len(subtitles) == 1
+        assert subtitles[0].get_text() == "ZINC ($n = 2$ molecules)."
+        assert subtitles[0].get_fontsize() == 14.5
+        assert not any(
+            "Clean routing" in text.get_text()
+            or "Intervention-conditioned" in text.get_text()
+            for text in figure.texts
+        )
         assert [
             axis.get_title().splitlines()[0] for axis in figure.axes[:4]
         ] == ["L0 H1", "L0 H3", "L1 H0", "L1 H2"]
         assert figure.axes[0].get_ylabel() == "Mean clean attention mass"
-        assert figure.axes[4].get_ylabel() == (
-            "Normalised transport response"
+        assert figure.axes[4].get_ylabel() == "Normalised score"
+        assert all(
+            any(label.get_visible() for label in axis.get_xticklabels())
+            for axis in figure.axes[:4]
         )
         bands = [
             collection
@@ -306,9 +326,73 @@ def test_routing_transport_figure_facets_requested_payload_subset():
         ]
         assert len(bands) == 8
         assert [text.get_text() for text in figure.legends[0].get_texts()] == [
-            "Semantic intervention",
-            "Structural intervention",
+            "Semantic score",
+            "Structural score",
         ]
+        assert all(
+            text.get_fontsize() == 13
+            for text in figure.legends[0].get_texts()
+        )
+    finally:
+        plt.close(figure)
+
+
+def test_routing_transport_figure_caps_spd_at_14_and_keeps_special_bin():
+    import matplotlib.pyplot as plt
+
+    labels = tuple(str(distance) for distance in range(17)) + ("virtual",)
+    values = np.linspace(0.02, 0.20, len(labels), dtype=np.float64)
+    metrics = SimpleNamespace(
+        distance_axis=labels,
+        clean_attention_distance=values.reshape(1, 1, -1),
+        head_record=lambda head: {
+            "selectivity": 0.25,
+            "joint_sensitivity": 1.1,
+        },
+    )
+    channel = {
+        "estimate": values.reshape(1, -1),
+        "low": np.clip(values - 0.01, 0.0, None).reshape(1, -1),
+        "high": (values + 0.01).reshape(1, -1),
+        "reportable": np.ones(len(labels), dtype=bool),
+        "replicates": 2000,
+    }
+    payload = {
+        "heads": ((0, 0),),
+        "axis": labels,
+        "n_graphs": 128,
+        "channels": {"semantic": channel, "structural": channel},
+    }
+
+    figure = plot_routing_transport_profiles(metrics, payload)
+    try:
+        top_axis, bottom_axis = figure.axes
+        expected_labels = [
+            "0",
+            "1",
+            "2",
+            "3",
+            "4",
+            "",
+            "6",
+            "",
+            "8",
+            "",
+            "10",
+            "",
+            "12",
+            "",
+            "14",
+            "Virtual",
+        ]
+        assert [text.get_text() for text in top_axis.get_xticklabels()] == (
+            expected_labels
+        )
+        assert [text.get_text() for text in bottom_axis.get_xticklabels()] == (
+            expected_labels
+        )
+        assert len(top_axis.patches) == 16
+        assert all(len(line.get_xdata()) == 16 for line in bottom_axis.lines)
     finally:
         plt.close(figure)
 
@@ -664,29 +748,43 @@ def test_grit_plotting_api_accepts_synthetic_payloads():
     )
     assert figures[4].axes[-1].get_xlabel() == "Attention weight"
     assert figures[4].axes[0].texts[0].get_text().startswith(
-        "ZINC — GRIT — Semantic specialist"
+        "Semantic specialist — L0 H0"
     )
-    assert figures[4].axes[1].texts[0].get_text().startswith("ZINC eval 0")
-    np.testing.assert_allclose(figures[4].get_size_inches(), (13.2, 5.72))
+    assert figures[4].axes[1].texts[0].get_text().startswith("Graph-local")
+    assert "ZINC eval" not in figures[4].axes[1].texts[0].get_text()
+    np.testing.assert_allclose(figures[4].get_size_inches(), (15.5, 6.75))
     assert [text.get_fontsize() for text in figures[4].axes[0].texts] == [
-        20,
-        16,
+        29,
+        25,
     ]
-    assert figures[4].axes[1].texts[0].get_fontsize() == 13
-    assert figures[4].axes[3].xaxis.label.get_fontsize() == 13
-    assert figures[4].axes[3].yaxis.label.get_fontsize() == 13
+    assert [text.get_position() for text in figures[4].axes[0].texts] == [
+        (0.5, 0.84),
+        (0.5, 0.04),
+    ]
     assert all(
-        label.get_fontsize() == 8
+        axis.title.get_fontsize() == 25
+        for axis in figures[4].axes[1:4]
+    )
+    assert figures[4].axes[1].texts[0].get_fontsize() == 18
+    assert figures[4].axes[1].texts[0].get_color() == "black"
+    assert figures[4].axes[3].xaxis.label.get_fontsize() == 20
+    assert figures[4].axes[3].yaxis.label.get_fontsize() == 20
+    assert all(
+        label.get_fontsize() == 10
         for label in figures[4].axes[3].get_xticklabels()
     )
-    assert figures[4].axes[-1].xaxis.label.get_fontsize() == 14
+    assert figures[4].axes[-1].xaxis.label.get_fontsize() == 25
     assert all(
-        label.get_fontsize() == 11
+        label.get_fontsize() == 25
         for label in figures[4].axes[-1].get_xticklabels()
     )
+    assert figures[5].axes[0].get_title().startswith(
+        "PCA of Head Output - L0 H0 (8 molecules)"
+    )
+    assert figures[5].axes[0].get_legend() is None
     assert all(
-        text.get_fontsize() == 9.5
-        for text in figures[5].axes[0].get_legend().get_texts()
+        text.get_fontsize() == 13.75
+        for text in figures[5].legends[0].get_texts()
     )
     assert figures[6].legends[0].get_title().get_text() == "Attention focus"
     assert figures[7].axes[0].get_title().startswith("ZINC — GRIT\n")
@@ -722,12 +820,15 @@ def test_pca_legend_is_ranked_by_observed_frequency():
             ),
             "labels": labels,
             "n_used": len(labels),
-        }
+        },
+        title_label="Structural specialist",
+        d_rel=-0.275,
+        joint_sensitivity=1.234,
     )
     try:
         observed = [
             text.get_text().split(" (n=", 1)[0]
-            for text in figure.axes[0].get_legend().get_texts()
+            for text in figure.legends[0].get_texts()
         ]
         assert observed == [
             "O: carbonyl",
@@ -735,6 +836,29 @@ def test_pca_legend_is_ranked_by_observed_frequency():
             "Ring: aromatic",
             "other/diffuse",
         ]
+        figure.canvas.draw()
+        axis = figure.axes[0]
+        assert axis.get_title().startswith(
+            "PCA of Head Output - L0 H0 (16 molecules)"
+        )
+        assert "Structural specialist" not in axis.get_title()
+        assert "ZINC" not in axis.get_title()
+        assert "D_{\\rm rel} = -0.275" in axis.get_title()
+        assert "J = 1.234" in axis.get_title()
+        assert axis.get_legend() is None
+        assert axis.xaxis.label.get_fontsize() == 13.75
+        assert axis.yaxis.label.get_fontsize() == 13.75
+        assert all(
+            text.get_fontsize() == 11.25
+            for text in axis.get_xticklabels() + axis.get_yticklabels()
+        )
+        legend = figure.legends[0]
+        assert all(text.get_fontsize() == 13.75 for text in legend.get_texts())
+        renderer = figure.canvas.get_renderer()
+        legend_box = legend.get_window_extent(renderer)
+        axes_bottom = axis.get_window_extent(renderer).y0
+        assert 0 <= legend_box.x0 < legend_box.x1 <= figure.bbox.width
+        assert 0 <= legend_box.y0 < legend_box.y1 < axes_bottom
     finally:
         plt.close(figure)
 
@@ -900,6 +1024,7 @@ def test_figure_bundle_uses_publication_export_resolution(tmp_path: Path):
     assert figure.calls[1][0].suffix == ".pdf"
     assert figure.calls[1][1]["dpi"] == PUBLICATION_PDF_RASTER_DPI == 1200
     assert MOLECULE_DRAW_DPI == MOLECULE_RENDER_DPI == 600
+    assert MOLECULE_ATOM_FONT_SIZE == 55
     assert figure.calls[1][1]["metadata"]["Title"] == "publication"
     metadata = json.loads((tmp_path / "publication.json").read_text())
     assert metadata["export_quality"] == {
@@ -1174,6 +1299,8 @@ def test_colab_notebook_has_valid_python_cells():
     assert "plot_routing_transport_profiles(" in runtime_source
     assert 'if task_name == "zinc" else ()' in runtime_source
     assert "selected-head-transport-response-by-distance" in runtime_source
+    assert 'dataset_label="ZINC"' in runtime_source
+    assert '"routing geometry and transport response"' not in runtime_source
     assert (
         'f"routing_geometry_vs_transport_response_zinc_heads_{group_index}"'
         in runtime_source

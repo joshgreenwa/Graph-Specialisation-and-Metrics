@@ -53,8 +53,11 @@ diagnostics attach to native GRIT sites. ZINC atom-type IDs are decoded with the
 vocabulary and bond dictionary, so the attention grids contain index-preserving RDKit molecules
 rather than generic graph layouts; QM9 is reconstructed from its atomic-number and bond-class
 fields. Routed-output PCAs use the same fixed chemical-group labels and colour identities as the
-PCQM suite (plus an explicit-hydrogen category for QM9), and every title names the dataset and
-GRIT model. The notebook installs RDKit explicitly, writes every model-forward
+PCQM suite (plus an explicit-hydrogen category for QM9). Attention grids, individual routed-output
+PCAs, and selected-head distance score breakdowns mirror the current PCQM publication layout,
+typography, simplified titles, axis wording, and legend placement; task identity remains explicit
+in the distance-figure subtitle, export names, and provenance. The notebook installs RDKit
+explicitly, writes every model-forward
 diagnostic to its exact supplemental cache before rendering, and constructs the GRIT runtime only
 if one of those artifacts is missing. Once populated, styling-only reruns do not rebuild RRWP,
 reload the checkpoint, or execute model forwards. Each named semantic specialist, structural

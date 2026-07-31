@@ -31,6 +31,7 @@ SELECTIVITY_CMAP = plt.get_cmap("coolwarm")
 PUBLICATION_PNG_DPI = 600
 PUBLICATION_PDF_RASTER_DPI = 1200
 MOLECULE_RENDER_DPI = 600
+MOLECULE_ATOM_FONT_SIZE = 55
 # Backwards-compatible name retained for existing figure metadata consumers.
 MOLECULE_DRAW_DPI = MOLECULE_RENDER_DPI
 CORE_SCATTER_FIGSIZE = (8.0, 5.9)
@@ -463,7 +464,7 @@ def _draw_molecule_plain(
     options = drawer.drawOptions()
     options.addAtomIndices = False
     options.bondLineWidth = 5.0
-    options.fixedFontSize = 44
+    options.fixedFontSize = MOLECULE_ATOM_FONT_SIZE
     options.padding = 0.06
     for index in range(molecule.GetNumAtoms()):
         options.atomLabels[index] = str(index)
@@ -509,7 +510,7 @@ def _draw_molecule_attention(
     options.fillHighlights = True
     options.atomHighlightsAreCircles = True
     options.bondLineWidth = 5.0
-    options.fixedFontSize = 44
+    options.fixedFontSize = MOLECULE_ATOM_FONT_SIZE
     options.padding = 0.06
     for index in highlight_atoms:
         options.atomLabels[index] = str(index)
@@ -533,22 +534,6 @@ def _payload_display_title(payload: Mapping[str, Any]) -> str:
     if payload.get("display_title"):
         return str(payload["display_title"])
     return "GRIT"
-
-
-def _molecule_caption(
-    example: Mapping[str, Any],
-    *,
-    dataset_label: str,
-) -> str:
-    graph_index = int(example["dataset_index"])
-    name = str(example.get("molecule_name") or "").strip()
-    identifier = f"{dataset_label} eval {graph_index}"
-    if name:
-        identifier += f" · {name}"
-    formula = str(example.get("formula") or "").strip()
-    if formula:
-        identifier += f" · {formula}"
-    return identifier
 
 
 def plot_attention_grid(
@@ -579,8 +564,9 @@ def plot_attention_grid(
         max(float(np.nanpercentile(values, 99)), 1e-6) for values in inbound
     )
     num_rows = len(examples)
+    figure_height = 3.4 + 3.35 * num_rows
     fig = plt.figure(
-        figsize=(13.2, 1.65 + 3.35 * num_rows + 0.72),
+        figsize=(15.5, figure_height),
         constrained_layout=True,
     )
     grid = fig.add_gridspec(
@@ -599,10 +585,6 @@ def plot_attention_grid(
         dtype=object,
     )
     colorbar_axis = fig.add_subplot(grid[-1, :])
-    task = str(examples_payload["task"])
-    # As with the main title, take the current reader-facing dataset label
-    # rather than a potentially stale label stored in a reusable cache.
-    dataset_label = figure_identity(task)["dataset_label"]
     for row, (example, matrix) in enumerate(zip(examples, matrices)):
         graph_index = int(example["dataset_index"])
         graph_coordinates = per_graph_coordinates.get(
@@ -627,14 +609,13 @@ def plot_attention_grid(
         axes[row, 0].text(
             0.01,
             0.99,
-            _molecule_caption(example, dataset_label=dataset_label)
-            + "\n"
-            + rf"Graph-local: $D_{{\rm rel}} = {d_rel:+.3f};\ J = {joint:.3f}$",
+            rf"Graph-local: $D_{{\rm rel}} = {d_rel:+.3f};\ J = "
+            rf"{joint:.3f}$",
             transform=axes[row, 0].transAxes,
             ha="left",
             va="top",
-            fontsize=13,
-            color=NAVY,
+            fontsize=18,
+            color="black",
             bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.90},
         )
         axes[row, 1].imshow(
@@ -654,41 +635,40 @@ def plot_attention_grid(
             aspect="equal",
             rasterized=True,
         )
-        axes[row, 2].set_xlabel("Key atom", fontsize=13)
-        axes[row, 2].set_ylabel("Query atom", fontsize=13)
+        axes[row, 2].set_xlabel("Key atom", fontsize=20)
+        axes[row, 2].set_ylabel("Query atom", fontsize=20)
         axes[row, 2].set_xticks(np.arange(matrix.shape[0]))
         axes[row, 2].set_yticks(np.arange(matrix.shape[0]))
-        axes[row, 2].tick_params(labelsize=8, length=2.5)
+        axes[row, 2].tick_params(labelsize=10, length=2.5)
     for column, label in enumerate(
         ["Molecule", "Attention-weighted molecule", "Node-conditioned attention"]
     ):
-        axes[0, column].set_title(label, fontsize=16, pad=10)
+        axes[0, column].set_title(label, fontsize=25, pad=10)
     style = HEAD_STYLES.get(role, {"label": role.replace("_", " ").title()})
     title_axis.text(
         0.5,
-        0.76,
-        f"{_payload_display_title(examples_payload)} — "
+        0.84,
         f"{title_label or style['label']} — {_head_label(head)}",
         ha="center",
         va="center",
-        fontsize=20,
+        fontsize=29,
         color=NAVY,
     )
     title_axis.text(
         0.5,
-        0.16,
+        0.04,
         rf"Net: $D_{{\rm rel}} = {float(net_d_rel):+.3f};\quad "
         rf"J = {float(net_joint_sensitivity):.3f}$",
         ha="center",
         va="center",
-        fontsize=16,
+        fontsize=25,
         color=NAVY,
     )
     colorbar = fig.colorbar(
         image, cax=colorbar_axis, orientation="horizontal"
     )
-    colorbar.set_label("Attention weight", fontsize=14, labelpad=7)
-    colorbar.ax.tick_params(labelsize=11, length=3)
+    colorbar.set_label("Attention weight", fontsize=25, labelpad=7)
+    colorbar.ax.tick_params(labelsize=25, length=3)
     for tick_label in colorbar.ax.get_xticklabels():
         tick_label.set_fontweight("medium")
 
@@ -698,7 +678,7 @@ def plot_attention_grid(
     colorbar_axis.set_position(
         [
             colorbar_position.x0 + 0.08 * colorbar_position.width,
-            colorbar_position.y0,
+            colorbar_position.y0 - 0.92 / figure_height,
             0.84 * colorbar_position.width,
             colorbar_position.height,
         ]
@@ -777,7 +757,11 @@ def plot_av_pca(
         minimum_count=minimum_count,
     )
     categories = _ordered_pca_categories(labels)
-    fig, ax = plt.subplots(figsize=(8.8, 6.2), constrained_layout=True)
+    legend_columns = min(3, max(1, len(categories)))
+    legend_rows = int(np.ceil(len(categories) / legend_columns))
+    legend_space_inches = 0.65 + 0.42 * legend_rows
+    figure_height = 6.4 + legend_space_inches
+    fig, ax = plt.subplots(figsize=(9.6, figure_height))
     labels_array = np.asarray(labels)
     for category in categories:
         color = _pca_focus_color(category)
@@ -796,6 +780,11 @@ def plot_av_pca(
     ax.axvline(0, color=LIGHT_GRID, linewidth=0.8, zorder=0)
     ax.set_xlabel(f"PC1 ({100 * explained[0]:.1f}% variance)")
     ax.set_ylabel(f"PC2 ({100 * explained[1]:.1f}% variance)")
+    axis_title_size = 1.25 * float(plt.rcParams["axes.labelsize"])
+    axis_tick_size = 1.25 * float(plt.rcParams["xtick.labelsize"])
+    ax.xaxis.label.set_fontsize(axis_title_size)
+    ax.yaxis.label.set_fontsize(axis_title_size)
+    ax.tick_params(axis="both", labelsize=axis_tick_size)
     head = tuple(payload["head"])
     metric_line = ""
     if d_rel is not None and joint_sensitivity is not None:
@@ -804,25 +793,32 @@ def plot_av_pca(
             + rf"$D_{{\rm rel}} = {float(d_rel):+.3f};\quad "
             + rf"J = {float(joint_sensitivity):.3f}$"
         )
-    descriptor = (
-        f"{title_label} — {_head_label(head)}"
-        if title_label
-        else _head_label(head)
-    )
     ax.set_title(
-        f"{_payload_display_title(payload)}\n"
-        f"PCA of routed head output — {descriptor}"
-        f"{metric_line}\n"
-        f"$n = {int(payload['n_used'])}$ molecules",
+        f"PCA of Head Output - {_head_label(head)} "
+        f"({int(payload['n_used'])} molecules)"
+        f"{metric_line}",
         fontsize=15,
     )
     ax.grid(False)
-    ax.legend(
-        loc="center left",
-        bbox_to_anchor=(1.01, 0.5),
-        fontsize=9.5,
-        markerscale=1.15,
-        handletextpad=0.55,
+    handles, legend_labels = ax.get_legend_handles_labels()
+    fig.legend(
+        handles,
+        legend_labels,
+        loc="lower center",
+        bbox_to_anchor=(0.5, 0.02),
+        ncol=legend_columns,
+        fontsize=axis_title_size,
+        markerscale=1.25,
+        handletextpad=0.5,
+        columnspacing=1.25,
+        labelspacing=0.75,
+        borderaxespad=0.0,
+    )
+    fig.subplots_adjust(
+        left=0.115,
+        right=0.975,
+        top=1.0 - 1.45 / figure_height,
+        bottom=(legend_space_inches + 0.20) / figure_height,
     )
     return fig
 
@@ -1030,7 +1026,7 @@ def plot_routing_transport_profiles(
     transport_payload: Mapping[str, Any],
     *,
     heads: Sequence[Head] | None = None,
-    title: str = "Routing geometry and transport response",
+    title: str = "Distance breakdown of semantic and structural scores",
     dataset_label: str = "Discovery set",
 ):
     """Compare clean routing with intervention response for selected heads.
@@ -1099,10 +1095,20 @@ def plot_routing_transport_profiles(
             for label in labels
         ]
     )
-    x = np.arange(len(labels), dtype=np.float64)
-    x[special_distance] += 0.75
+    numeric_distance = np.asarray(
+        [int(label) if label.lstrip("-").isdigit() else -1 for label in labels]
+    )
+    displayed = special_distance | (
+        (numeric_distance >= 0) & (numeric_distance <= 14)
+    )
+    display_labels = tuple(
+        label for label, keep in zip(labels, displayed) if keep
+    )
+    display_special_distance = special_distance[displayed]
+    x = np.arange(len(display_labels), dtype=np.float64)
+    x[display_special_distance] += 0.75
     tick_labels = []
-    for label, special in zip(labels, special_distance):
+    for label, special in zip(display_labels, display_special_distance):
         if special:
             tick_labels.append(label.replace("_", "\n").title())
         elif label.lstrip("-").isdigit():
@@ -1116,7 +1122,7 @@ def plot_routing_transport_profiles(
     fig, axes = plt.subplots(
         2,
         len(selected_heads),
-        figsize=(4.25 * len(selected_heads), 8.5),
+        figsize=(4.25 * len(selected_heads), 7.7),
         sharex="col",
         sharey="row",
         squeeze=False,
@@ -1125,12 +1131,12 @@ def plot_routing_transport_profiles(
         "semantic": {
             "color": GOLD,
             "marker": "o",
-            "label": "Semantic intervention",
+            "label": "Semantic score",
         },
         "structural": {
             "color": TEAL,
             "marker": "s",
-            "label": "Structural intervention",
+            "label": "Structural score",
         },
     }
 
@@ -1142,7 +1148,7 @@ def plot_routing_transport_profiles(
         clean = np.asarray(
             metrics.clean_attention_distance[layer, index],
             dtype=np.float64,
-        )
+        )[displayed]
         clean_ax = axes[0, column]
         clean_ax.bar(
             x,
@@ -1150,7 +1156,7 @@ def plot_routing_transport_profiles(
             width=0.72,
             color=[
                 GOLD if special else TEAL
-                for special in special_distance
+                for special in display_special_distance
             ],
             edgecolor="white",
             linewidth=0.55,
@@ -1192,6 +1198,9 @@ def plot_routing_transport_profiles(
             estimate[~valid] = np.nan
             low[~valid] = np.nan
             high[~valid] = np.nan
+            estimate = estimate[displayed]
+            low = low[displayed]
+            high = high[displayed]
             response_ax.fill_between(
                 x,
                 low,
@@ -1217,53 +1226,26 @@ def plot_routing_transport_profiles(
         response_ax.set_axisbelow(True)
         response_ax.set_xticks(x)
         response_ax.set_xticklabels(tick_labels)
+        clean_ax.tick_params(axis="x", labelbottom=True)
 
     axes[0, 0].set_ylabel("Mean clean attention mass", fontsize=11.5)
     axes[1, 0].set_ylabel(
-        "Normalised transport response", fontsize=11.5
+        "Normalised score", fontsize=11.5
     )
     n_graphs = int(transport_payload["n_graphs"])
-    replicates = max(
-        int(channels[channel].get("replicates", 0))
-        for channel in ("semantic", "structural")
-    )
-    fig.suptitle(title, fontsize=18, y=0.988)
-    interval_text = (
-        f"; shaded bands: 95% nested bootstrap ({replicates:,} draws)"
-        if replicates
-        else ""
-    )
+    fig.suptitle(title, fontsize=18, y=0.985)
     fig.text(
         0.5,
-        0.947,
-        f"{dataset_label} ($n={n_graphs}$ molecules){interval_text}",
+        0.943,
+        f"{dataset_label} ($n = {n_graphs}$ molecules).",
         ha="center",
         va="top",
-        fontsize=11.5,
-        color=NAVY,
-    )
-    fig.text(
-        0.5,
-        0.905,
-        "Clean routing by query-key shortest-path distance",
-        ha="center",
-        va="top",
-        fontsize=12.5,
-        color=NAVY,
-    )
-    fig.text(
-        0.5,
-        0.475,
-        "Intervention-conditioned head-output response by "
-        "source-carrier distance",
-        ha="center",
-        va="top",
-        fontsize=12.5,
+        fontsize=14.5,
         color=NAVY,
     )
     fig.supxlabel(
-        "Carrier distance from intervention source",
-        fontsize=12,
+        "Shortest path-distance (SPD) from intervened node",
+        fontsize=15,
         y=0.082,
     )
     handles = [
@@ -1285,17 +1267,17 @@ def plot_routing_transport_profiles(
         loc="lower center",
         bbox_to_anchor=(0.5, 0.012),
         ncol=2,
-        fontsize=10.5,
+        fontsize=13,
         handlelength=2.6,
         columnspacing=2.2,
     )
     fig.subplots_adjust(
         left=0.065,
         right=0.992,
-        top=0.825,
-        bottom=0.145,
-        wspace=0.14,
-        hspace=0.58,
+        top=0.845,
+        bottom=0.165,
+        wspace=0.08,
+        hspace=0.28,
     )
     return fig
 
@@ -1716,6 +1698,7 @@ def save_section_pdf_bundles(
 
 
 __all__ = [
+    "MOLECULE_ATOM_FONT_SIZE",
     "MOLECULE_RENDER_DPI",
     "PUBLICATION_PDF_RASTER_DPI",
     "PUBLICATION_PNG_DPI",

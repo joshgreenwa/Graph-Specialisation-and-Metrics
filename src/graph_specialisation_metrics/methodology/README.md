@@ -116,7 +116,10 @@ workflow directly from canonical score-cache sufficient statistics: clean attent
 query-key distance above, and exact semantic/structural canonical-score contribution by
 source-carrier distance below. The response curves use the canonical within-model channel
 normalisation, reconstruct each selected head's normalised channel score, and include registered
-nested-bootstrap intervals without rerunning GRIT.
+nested-bootstrap intervals without rerunning GRIT. Its attention grids, individual routed-output
+PCAs, and distance score breakdowns also share the current PCQM figure geometry, typography,
+titles, axes, and legend placement; these presentation-only revisions do not invalidate any
+supplemental cache.
 
 Task-specific presentation can be added without changing cached measurements:
 
