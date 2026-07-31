@@ -241,6 +241,8 @@ task/seed/component/channel, cache use, graph counts, elapsed time, heartbeat, a
 Numerical/no-op/attention/replay/completeness gates are soft by default and make the run
 `headline_eligible=false`; checkpoint geometry, event-manifest alignment, patch geometry, and
 cache corruption remain hard failures. Add `--strict-audits` for release verification.
+Non-finite projected-transport entries and impossible negative/norm-rounding score artefacts are
+recorded, conservatively repaired, and allowed to finish rather than terminating a queued worker.
 
 The finalizer can be rerun manually on CPU without importing GRIT, loading a checkpoint, or
 reopening the dataset:

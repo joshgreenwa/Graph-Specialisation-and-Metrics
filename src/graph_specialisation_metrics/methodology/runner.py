@@ -950,19 +950,11 @@ def _cache(
                 else "graph-uniform/node-uniform/min-gap/iid-replacement"
             ),
             structural_donor_law=(
-                "same-side/node-type/nonidentical-rrwp/"
-                "near-middle-far/no-degree-match/without-replacement/"
+                "node-type/nonidentical-rrwp/near-middle-far/"
+                "no-degree-match/no-partition-match/without-replacement/"
                 "complete-pe-copy"
-                if (
-                    prepared.task.backend_kind == "graphbench_grit"
-                    and prepared.task.spec.task_type == "edge_binary"
-                )
-                else (
-                    "nonidentical-rrwp/near-middle-far/no-degree-match/"
-                    "without-replacement/complete-pe-copy"
-                    if prepared.task.backend_kind == "graphbench_grit"
-                    else "node-uniform/min-gap/iid-replacement"
-                )
+                if prepared.task.backend_kind == "graphbench_grit"
+                else "node-uniform/min-gap/iid-replacement"
             ),
         ),
         stale_policy="archive",

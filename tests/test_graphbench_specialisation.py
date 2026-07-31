@@ -71,6 +71,7 @@ from graph_specialisation_metrics.methodology.protocol import (
 )
 from graph_specialisation_metrics.methodology.runner import (
     PreparedTask,
+    _cache,
     _event_rng,
     _stage_plan,
     finalize_cached_run,
@@ -1983,6 +1984,9 @@ def test_graphbench_score_and_carriage_components_resume_from_graph_shards(tmp_p
         compute_beneficial_carriage=False,
     )
     score_plan = _stage_plan(prepared, config, "scores")
+    score_cache = _cache(prepared, config, score_plan)
+    assert "same-side" not in score_cache.contract.structural_donor_law
+    assert "no-partition-match" in score_cache.contract.structural_donor_law
     scores = run_scores(prepared, config, plan=score_plan)
     clean_shards = list(
         (prepared.output_dir / "cache" / "clean_jacobians").glob("graph_*.pt")

@@ -91,6 +91,7 @@ from graph_specialisation_metrics.methodology.scores import (
     STRUCTURAL_AXIS_LABEL,
     aggregate_event_scores,
     event_head_scores,
+    event_head_score_systems,
     head_coordinates,
     freeze_families,
     freeze_threshold_specialists,
@@ -833,6 +834,29 @@ def test_transport_projection_event_norm_and_hierarchical_aggregation():
     )
     assert total[0, 0] == pytest.approx((6.0 + 14.0) / 2)
     assert sources[(0, 0)][0, 0] == 6.0
+
+
+def test_transport_numerical_anomalies_are_flagged_and_do_not_abort():
+    delta = torch.tensor([[[[[float("nan")]]]]])
+    gradient = torch.tensor([[[[[1.0]]]]])
+    with audit_scope("soft-transport") as scope:
+        q = project_transport(delta, gradient)
+        systems = event_head_score_systems(q)
+    assert torch.isfinite(q).all()
+    assert torch.isfinite(systems["coherent"]).all()
+    assert [row["name"] for row in scope.records()] == [
+        "scores.non_finite_transport_input"
+    ]
+
+    coordinates = head_coordinates(
+        np.asarray([[-1.0, 2.0]]),
+        np.asarray([[1.0, -2.0]]),
+        score_floor=1.0e-12,
+        epsilon=1.0e-12,
+        activity_floor=0.20,
+    )
+    assert np.all(coordinates.raw_semantic >= 0.0)
+    assert np.all(coordinates.raw_structural >= 0.0)
 
 
 def test_threshold_specialists_exclude_generalists_and_match_j_within_seed():

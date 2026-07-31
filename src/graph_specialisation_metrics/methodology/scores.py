@@ -7,6 +7,8 @@ from typing import Any, Mapping, Sequence
 
 import numpy as np
 
+from .audit import audit_check
+
 
 SEMANTIC_AXIS_LABEL = r"Semantic score  $S_{sem}/\overline{S}_{sem}$"
 STRUCTURAL_AXIS_LABEL = r"Structural score  $S_{str}/\overline{S}_{str}$"
@@ -36,8 +38,24 @@ def project_transport(delta, clean_gradient):
             f"transport/gradient geometry differs: {tuple(delta.shape)} vs "
             f"{tuple(clean_gradient.shape)}"
         )
-    if not torch.isfinite(delta).all() or not torch.isfinite(clean_gradient).all():
-        raise ValueError("transport projection inputs must be finite")
+    finite_delta = torch.isfinite(delta)
+    finite_gradient = torch.isfinite(clean_gradient)
+    if not bool(finite_delta.all() and finite_gradient.all()):
+        audit_check(
+            False,
+            "scores.non_finite_transport_input",
+            "non-finite transport/Jacobian entries were replaced by zero; "
+            "the run continues but is not headline eligible",
+            context={
+                "non_finite_delta": int((~finite_delta).sum().item()),
+                "non_finite_gradient": int((~finite_gradient).sum().item()),
+            },
+            strict=False,
+        )
+        delta = torch.nan_to_num(delta, nan=0.0, posinf=0.0, neginf=0.0)
+        clean_gradient = torch.nan_to_num(
+            clean_gradient, nan=0.0, posinf=0.0, neginf=0.0
+        )
     return torch.einsum("elnhd,tlnhd->elhnt", delta, clean_gradient)
 
 
@@ -68,16 +86,37 @@ def event_head_score_systems(q, *, mass_floor: float = 0.0) -> dict[str, Any]:
 
     if q.ndim != 5:
         raise ValueError("projected transport must be [event,layer,head,carrier,output]")
-    if not torch.isfinite(q).all():
-        raise ValueError("projected transport must be finite")
+    finite_q = torch.isfinite(q)
+    if not bool(finite_q.all()):
+        audit_check(
+            False,
+            "scores.non_finite_projected_transport",
+            "non-finite projected transport entries were replaced by zero; "
+            "the run continues but is not headline eligible",
+            context={"non_finite_entries": int((~finite_q).sum().item())},
+            strict=False,
+        )
+        q = torch.nan_to_num(q, nan=0.0, posinf=0.0, neginf=0.0)
     mass = q.square().sum(dim=-1).sqrt().sum(dim=-1)
     coherent_vector = q.sum(dim=-2)
     coherent = coherent_vector.square().sum(dim=-1).sqrt()
     tolerance = 32.0 * torch.finfo(q.dtype).eps * torch.maximum(
         mass, torch.ones_like(mass)
     )
-    if bool((coherent > mass + tolerance).any()):
-        raise RuntimeError("coherent movement exceeds transport mass beyond numerical tolerance")
+    violation = coherent > mass + tolerance
+    if bool(violation.any()):
+        maximum_excess = float((coherent - mass)[violation].max().item())
+        audit_check(
+            False,
+            "scores.coherent_exceeds_mass",
+            "coherent movement exceeded transport mass numerically and was clipped "
+            "to the triangle-inequality bound",
+            observed=maximum_excess,
+            tolerance=float(tolerance[violation].max().item()),
+            context={"affected_entries": int(violation.sum().item())},
+            strict=False,
+        )
+    coherent = torch.minimum(coherent, mass)
     coherence = torch.full_like(mass, float("nan"))
     estimable = mass > float(mass_floor)
     coherence[estimable] = coherent[estimable] / mass[estimable]
@@ -144,8 +183,23 @@ def head_coordinates(
     structural = np.asarray(structural, dtype=np.float64)
     if semantic.shape != structural.shape or semantic.ndim != 2:
         raise ValueError("raw semantic and structural scores must share [layer,head] shape")
-    if np.any(semantic < 0) or np.any(structural < 0):
-        raise ValueError("raw scores must be non-negative")
+    negative = (semantic < 0) | (structural < 0)
+    if np.any(negative):
+        negative_values = np.concatenate(
+            (semantic[semantic < 0], structural[structural < 0])
+        )
+        audit_check(
+            False,
+            "scores.negative_raw_score",
+            "negative raw scores were clipped to zero; the run continues but is "
+            "not headline eligible",
+            observed=float(abs(np.min(negative_values))),
+            tolerance=0.0,
+            context={"affected_heads": int(np.sum(negative))},
+            strict=False,
+        )
+        semantic = np.maximum(semantic, 0.0)
+        structural = np.maximum(structural, 0.0)
     semantic_mean = float(np.mean(semantic))
     structural_mean = float(np.mean(structural))
     estimable = bool(

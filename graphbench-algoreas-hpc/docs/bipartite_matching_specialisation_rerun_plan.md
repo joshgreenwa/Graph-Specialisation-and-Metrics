@@ -290,7 +290,7 @@ Soft audits are cached and flagged but do not terminate production.
 - [x] Atomic common/arm caches and component progress.
 - [x] Slurm common/arm/finalizer DAG with six-hour GPU and CPU safety limits.
 - [x] Inspect refinement outputs and write selection lock.
-- [x] Complete corrected v2 and locked causal-protocol verification (`252 passed, 1 skipped`).
+- [x] Complete corrected v2 and locked causal-protocol verification (`253 passed, 1 skipped`).
 - [ ] Refresh HPC checkout and run the focused causal preflight.
 - [ ] Queue focused causal production.
 - [ ] Run confirmation finalizer for the locked candidate.
