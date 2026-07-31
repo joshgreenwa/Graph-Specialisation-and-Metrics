@@ -44,6 +44,7 @@ from graph_specialisation_metrics.methodology.graphormer_figure_data import (
 )
 from graph_specialisation_metrics.methodology.graphormer_figure_plots import (
     MOLECULE_RENDER_DPI,
+    MOLECULE_ATOM_FONT_SIZE,
     PCA_FOCUS_COLORS,
     PUBLICATION_PDF_RASTER_DPI,
     PUBLICATION_PNG_DPI,
@@ -695,6 +696,7 @@ def test_figure_bundle_saves_png_pdf_and_provenance_in_target_folder(tmp_path):
         == PUBLICATION_PDF_RASTER_DPI
     )
     assert MOLECULE_RENDER_DPI == 600
+    assert MOLECULE_ATOM_FONT_SIZE == 55
     figure = plot_score_plane(synthetic_metrics())
     target = tmp_path / "semantic_specialists"
     try:
@@ -931,13 +933,19 @@ def test_attention_grid_supports_five_rows_without_arrows():
         )
         assert weighted_axis.images
         assert matrix_axis.images[0].get_cmap().name == "Blues"
-        assert weighted_axis.title.get_fontsize() == 16
-        assert matrix_axis.title.get_fontsize() == 16
-        assert matrix_axis.xaxis.label.get_fontsize() == 13
-        assert matrix_axis.yaxis.label.get_fontsize() == 13
-        assert colorbar_axis.xaxis.label.get_fontsize() == 14
+        assert np.allclose(figure.get_size_inches(), (15.5, 20.15))
+        assert weighted_axis.title.get_fontsize() == 25
+        assert matrix_axis.title.get_fontsize() == 25
+        assert matrix_axis.xaxis.label.get_fontsize() == 16.25
+        assert matrix_axis.yaxis.label.get_fontsize() == 16.25
         assert all(
-            tick.get_fontsize() == 11
+            tick.get_fontsize() == 10
+            for tick in matrix_axis.get_xticklabels()
+            + matrix_axis.get_yticklabels()
+        )
+        assert colorbar_axis.xaxis.label.get_fontsize() == 25
+        assert all(
+            tick.get_fontsize() == 25
             and tick.get_fontweight() == "medium"
             for tick in colorbar_axis.get_xticklabels()
         )
@@ -953,6 +961,11 @@ def test_attention_grid_supports_five_rows_without_arrows():
         assert "Semantic specialist — L1 H24" in title
         assert "Net: $D_{\\rm rel} = +0.481" in title
         assert "J = 1.350" in title
+        title_text, subtitle_text = figure.axes[0].texts
+        assert title_text.get_fontsize() == 29
+        assert subtitle_text.get_fontsize() == 25
+        assert title_text.get_position() == (0.5, 0.84)
+        assert subtitle_text.get_position() == (0.5, 0.04)
         labels = "\n".join(
             text.get_text()
             for axis in figure.axes
@@ -974,7 +987,7 @@ def test_attention_grid_supports_five_rows_without_arrows():
             for text in axis.texts
             if "Graph-local" in text.get_text()
         ]
-        assert all(text.get_fontsize() == 13 for text in graph_labels)
+        assert all(text.get_fontsize() == 16.25 for text in graph_labels)
     finally:
         plt.close(figure)
 
