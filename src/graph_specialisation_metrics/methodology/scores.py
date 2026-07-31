@@ -16,6 +16,7 @@ SELECTIVITY_AXIS_LABEL = (
     r"Selectivity $D_{rel}$  (structural $\leftarrow$ 0 $\rightarrow$ semantic)"
 )
 JOINT_AXIS_LABEL = r"Joint sensitivity $J$"
+CONFIDENCE_SPECIALIST_VERSION = "bootstrap-confidence-specialists-v1"
 
 
 def project_transport(delta, clean_gradient):
@@ -242,6 +243,237 @@ def head_coordinates(
         active,
         True,
     )
+
+
+def confidence_specialists_from_draws(
+    coordinates: HeadCoordinates,
+    joint_draws: Any,
+    selectivity_draws: Any,
+    *,
+    activity_floor: float = 0.20,
+    preference_threshold: float = 0.10,
+    confidence: float = 0.95,
+    minimum_pairs: int = 3,
+) -> dict[str, Any]:
+    """Freeze reliable directional specialists from discovery bootstrap support.
+
+    A specialist must clear the activity and directional-margin rules jointly in
+    at least ``confidence`` of complete nested-bootstrap draws. Opposite-sign
+    point-active heads form the causal comparison pools but receive no
+    specialist label unless they independently clear this confidence gate.
+    """
+
+    J = np.asarray(coordinates.joint_sensitivity, dtype=np.float64)
+    D = np.asarray(coordinates.selectivity, dtype=np.float64)
+    j_draws = np.asarray(joint_draws, dtype=np.float64)
+    d_draws = np.asarray(selectivity_draws, dtype=np.float64)
+    if J.shape != D.shape or J.ndim != 2:
+        raise ValueError("specialist point coordinates must share [layer,head] shape")
+    if j_draws.shape != d_draws.shape or j_draws.ndim != 3:
+        raise ValueError("J and D_rel draws must share [replicate,layer,head] shape")
+    if tuple(j_draws.shape[1:]) != tuple(J.shape):
+        raise ValueError("bootstrap head geometry does not match point coordinates")
+    if not 0.5 < float(confidence) < 1.0:
+        raise ValueError("specialist confidence must lie in (0.5, 1)")
+    if float(preference_threshold) <= 0:
+        raise ValueError("specialist preference threshold must be positive")
+    if float(activity_floor) < 0:
+        raise ValueError("specialist activity floor must be non-negative")
+    if int(minimum_pairs) < 1:
+        raise ValueError("minimum specialist pairs must be positive")
+
+    finite = np.isfinite(j_draws) & np.isfinite(d_draws)
+    semantic_support = np.mean(
+        finite
+        & (j_draws >= float(activity_floor))
+        & (d_draws > float(preference_threshold)),
+        axis=0,
+    )
+    structural_support = np.mean(
+        finite
+        & (j_draws >= float(activity_floor))
+        & (d_draws < -float(preference_threshold)),
+        axis=0,
+    )
+    generalist_support = np.mean(
+        finite
+        & (j_draws >= float(activity_floor))
+        & (np.abs(d_draws) <= float(preference_threshold)),
+        axis=0,
+    )
+    activity_support = np.mean(
+        np.isfinite(j_draws) & (j_draws >= float(activity_floor)), axis=0
+    )
+    point_active = (
+        np.asarray(coordinates.active, dtype=bool)
+        & np.isfinite(J)
+        & np.isfinite(D)
+    )
+    semantic_mask = point_active & (semantic_support >= float(confidence))
+    structural_mask = point_active & (structural_support >= float(confidence))
+    generalist_mask = (
+        point_active
+        & ~semantic_mask
+        & ~structural_mask
+        & (generalist_support >= float(confidence))
+    )
+    unresolved_mask = point_active & ~semantic_mask & ~structural_mask & ~generalist_mask
+    inactive_mask = ~point_active
+
+    def heads(mask: np.ndarray) -> tuple[tuple[int, int], ...]:
+        return tuple(
+            (int(layer), int(head))
+            for layer, head in np.argwhere(mask).tolist()
+        )
+
+    semantic = heads(semantic_mask)
+    structural = heads(structural_mask)
+
+    def optimal_match(
+        left: Sequence[tuple[int, int]],
+        right: Sequence[tuple[int, int]],
+        *,
+        left_label: str,
+        right_label: str,
+    ) -> dict[str, Any]:
+        pairs: list[dict[str, Any]] = []
+        if left and right:
+            from scipy.optimize import linear_sum_assignment
+
+            cost = np.asarray(
+                [[abs(float(J[a]) - float(J[b])) for b in right] for a in left],
+                dtype=np.float64,
+            )
+            left_positions, right_positions = linear_sum_assignment(cost)
+            for left_position, right_position in zip(
+                left_positions.tolist(), right_positions.tolist()
+            ):
+                a = tuple(left[left_position])
+                b = tuple(right[right_position])
+                pairs.append(
+                    {
+                        left_label: a,
+                        right_label: b,
+                        f"{left_label}_J": float(J[a]),
+                        f"{right_label}_J": float(J[b]),
+                        "absolute_J_gap": float(cost[left_position, right_position]),
+                        "absolute_layer_gap": abs(int(a[0]) - int(b[0])),
+                    }
+                )
+        return {
+            "method": "minimum-total-absolute-J assignment without replacement",
+            "left_label": left_label,
+            "right_label": right_label,
+            "pairs": tuple(pairs),
+            "pair_count": len(pairs),
+            "mean_absolute_J_gap": (
+                float(np.mean([row["absolute_J_gap"] for row in pairs]))
+                if pairs
+                else np.nan
+            ),
+            "mean_absolute_layer_gap": (
+                float(np.mean([row["absolute_layer_gap"] for row in pairs]))
+                if pairs
+                else np.nan
+            ),
+        }
+
+    specialist_matching = optimal_match(
+        semantic,
+        structural,
+        left_label="semantic",
+        right_label="structural",
+    )
+    negative_pool = heads(point_active & (D < 0))
+    positive_pool = heads(point_active & (D > 0))
+    semantic_null_matching = optimal_match(
+        semantic,
+        negative_pool,
+        left_label="specialist",
+        right_label="null",
+    )
+    structural_null_matching = optimal_match(
+        structural,
+        positive_pool,
+        left_label="specialist",
+        right_label="null",
+    )
+
+    return {
+        "version": CONFIDENCE_SPECIALIST_VERSION,
+        "selection_uses_causal_outcomes": False,
+        "activity_floor": float(activity_floor),
+        "preference_threshold": float(preference_threshold),
+        "bootstrap_confidence": float(confidence),
+        "minimum_pairs": int(minimum_pairs),
+        "support": {
+            "activity": activity_support,
+            "semantic": semantic_support,
+            "structural": structural_support,
+            "generalist": generalist_support,
+        },
+        "masks": {
+            "semantic_specialist": semantic_mask,
+            "structural_specialist": structural_mask,
+            "persistent_generalist": generalist_mask,
+            "unresolved": unresolved_mask,
+            "inactive": inactive_mask,
+        },
+        "heads": {
+            "semantic_specialist": semantic,
+            "structural_specialist": structural,
+            "persistent_generalist": heads(generalist_mask),
+            "unresolved": heads(unresolved_mask),
+            "inactive": heads(inactive_mask),
+            "semantic_null_pool": negative_pool,
+            "structural_null_pool": positive_pool,
+        },
+        "specialist_J_matching": specialist_matching,
+        "semantic_null_J_matching": semantic_null_matching,
+        "structural_null_J_matching": structural_null_matching,
+        "status": (
+            "estimable"
+            if int(specialist_matching["pair_count"]) >= int(minimum_pairs)
+            else "not_estimable"
+        ),
+    }
+
+
+def graph_local_fixed_normalization(
+    semantic_graph_scores: Mapping[int, Any],
+    structural_graph_scores: Mapping[int, Any],
+    coordinates: HeadCoordinates,
+    *,
+    epsilon: float,
+    preference_threshold: float = 0.10,
+) -> dict[str, Any]:
+    """Molecule-level diagnostic under frozen aggregate channel normalization."""
+
+    graph_ids = sorted(set(semantic_graph_scores) & set(structural_graph_scores))
+    if not graph_ids:
+        raise ValueError("semantic and structural score caches share no graph IDs")
+    if not coordinates.estimable:
+        raise ValueError("graph-local D_rel is unavailable for non-estimable coordinates")
+    semantic = np.stack(
+        [np.asarray(semantic_graph_scores[key], dtype=np.float64) for key in graph_ids]
+    ) / float(coordinates.semantic_mean)
+    structural = np.stack(
+        [np.asarray(structural_graph_scores[key], dtype=np.float64) for key in graph_ids]
+    ) / float(coordinates.structural_mean)
+    joint = 0.5 * (semantic + structural)
+    selectivity = (semantic - structural) / (
+        semantic + structural + float(epsilon)
+    )
+    threshold = float(preference_threshold)
+    return {
+        "graph_ids": tuple(int(value) for value in graph_ids),
+        "joint_sensitivity": joint,
+        "selectivity": selectivity,
+        "semantic_fraction": np.mean(selectivity > threshold, axis=0),
+        "structural_fraction": np.mean(selectivity < -threshold, axis=0),
+        "central_fraction": np.mean(np.abs(selectivity) <= threshold, axis=0),
+        "normalization": "frozen aggregate discovery channel means",
+    }
 
 
 def freeze_families(

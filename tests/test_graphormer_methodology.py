@@ -301,6 +301,49 @@ def test_graphormer_backend_hooks_patch_and_graph_token_replay():
     assert torch.allclose(prediction, captured.prediction[0:1], atol=1e-6, rtol=0.0)
     assert torch.allclose(z, captured.z[0:1], atol=1e-6, rtol=0.0)
 
+    # One assigned head per replica is an execution-only batching optimization.
+    # It must agree with the established sequential native patch/ablation calls.
+    assignments = ((0, 0), (1, 1))
+    changed_replacements = [value.clone() for value in captured.transport]
+    changed_replacements[0][0, :, 0, :] += 0.25
+    changed_replacements[1][1, :, 1, :] -= 0.15
+    individual_replacements = tuple(
+        value.permute(1, 0, 2, 3) for value in changed_replacements
+    )
+    _, individual_z, _ = backend.patch_individual_heads(
+        [data, data], individual_replacements, assignments
+    )
+    sequential_z = []
+    for replica, assignment in enumerate(assignments):
+        donor = tuple(
+            value[:, replica : replica + 1]
+            for value in individual_replacements
+        )
+        sequential_z.append(backend.patch(data, donor, (assignment,))[1])
+    assert torch.allclose(
+        individual_z,
+        torch.cat(sequential_z, dim=0),
+        atol=1e-6,
+        rtol=0.0,
+    )
+
+    _, individual_ablation_z, _ = backend.ablate_individual_heads(
+        [data, small], assignments
+    )
+    sequential_ablation_z = torch.cat(
+        [
+            backend.ablate([target], (assignment,))[1]
+            for target, assignment in zip((data, small), assignments)
+        ],
+        dim=0,
+    )
+    assert torch.allclose(
+        individual_ablation_z,
+        sequential_ablation_z,
+        atol=1e-6,
+        rtol=0.0,
+    )
+
     weights = backend.carriage_weights(data, captured.final_state[0])
     assert weights.tolist() == [1.0, 0.0, 0.0, 0.0]
     replay = backend.loss_from_pooled(captured.target[0:1])

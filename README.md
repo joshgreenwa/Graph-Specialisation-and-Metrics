@@ -16,6 +16,13 @@ exposed through `graph_specialisation_metrics.main()`. The Drive-backed producti
 Module-level READMEs document implementations and historical refinement experiments; where their
 older alternatives differ, the canonical methodology takes precedence.
 
+The focused official-Graphormer causal follow-up is
+[`experiments/methodology/graphormer_pcqm4mv2_causal_colab.ipynb`](experiments/methodology/graphormer_pcqm4mv2_causal_colab.ipynb).
+It freezes bootstrap-confidence semantic/structural specialists from 128 discovery molecules,
+then runs restoration, injection, donor-wise necessity, and all-head clean ablation on independent
+128-molecule splits. Its Drive-backed graph shards support resume, and a figures-only phase exports
+the four focused PNG/PDF/JSON bundles without loading the model.
+
 The long-term project scope covers:
 
 - training and evaluation files for Graphormer, GraphGPS, GRIT, CSA, and Exphormer;

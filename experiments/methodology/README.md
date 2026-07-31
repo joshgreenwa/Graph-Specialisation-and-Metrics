@@ -25,6 +25,21 @@ that miss; read-only downstream artifact loaders continue to reject incompatible
 The initial production run is configured for the dense `zinc`, `qm9_gap_dense`,
 `peptides_func`, and `peptides_struct` registrations.
 
+## Focused PCQM4Mv2 causal analysis
+
+[`graphormer_pcqm4mv2_causal_colab.ipynb`](graphormer_pcqm4mv2_causal_colab.ipynb)
+is the Drive-backed frontend for the four focused Graphormer tests: the frozen specialist map,
+restoration/injection with a same-source nearest-dose alternative donor, donor-wise necessity, and
+`J` versus clean single-head ablation. Discovery, causal, and clean-ablation splits each contain
+128 disjoint molecules. A directional specialist must clear `J >= 0.20` and the relevant
+`D_rel = +/-0.10` margin jointly in at least 95% of the registered discovery bootstrap draws;
+three `J`-matched semantic/structural pairs are required for the causal group panels.
+
+Set `PHASE = "run"` to populate/resume graph shards, `"all"` to run and render, or `"figures"`
+to redraw solely from Drive caches without loading the checkpoint or PCQM4Mv2. The exact endpoint,
+control, cache, and figure contracts are recorded in
+[`../../docs/graphormer_pcqm4mv2_causal_analysis_plan.md`](../../docs/graphormer_pcqm4mv2_causal_analysis_plan.md).
+
 After the ZINC and QM9 score caches have completed under
 `canonical_methodology_v4_zinc_qm9`, run
 [`grit_zinc_qm9_figures_colab.ipynb`](grit_zinc_qm9_figures_colab.ipynb) for the focused

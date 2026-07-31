@@ -72,6 +72,12 @@ run(
 The paste-ready clone/mount/dispatch cell is
 [`../../../experiments/methodology/canonical_methodology_colab.py`](../../../experiments/methodology/canonical_methodology_colab.py).
 
+The focused PCQM4Mv2 causal frontend is
+[`../../../experiments/methodology/graphormer_pcqm4mv2_causal_colab.ipynb`](../../../experiments/methodology/graphormer_pcqm4mv2_causal_colab.ipynb).
+It uses three disjoint 128-molecule splits, freezes specialists by joint bootstrap confidence in
+`J` and `D_rel`, and caches selected-head restoration, injection, necessity, and every-head clean
+ablation below `cache/focused/`. Its `figures` phase is model- and dataset-free.
+
 ## Module boundary
 
 | Module | Responsibility |
@@ -82,6 +88,8 @@ The paste-ready clone/mount/dispatch cell is
 | `interventions.py` | One-row semantic replacement and dense-equivalent sparse structural footprint copy. |
 | `backend.py` | Native GRIT `wV`/final-state adapter. |
 | `graphormer.py` | Official checkpoint/dataset loading, native Graphormer transport hooks, graph-token readout adapter. |
+| `graphormer_causal_analysis.py` | Focused PCQM specialist gate, individual-head causal execution, graph shards, aggregation, and figures-only dispatch. |
+| `graphormer_causal_plots.py` | Four focused PCQM causal figures and publication exports. |
 | `grit_figure_data.py` | Read-only canonical score/model validation plus contract-cached GRIT attention, selected/all-head routed-output PCA, raw-logit, and displayed-graph coordinate diagnostics. |
 | `grit_figure_plots.py` | PCQM-aligned ZINC/QM9 presentation layer with RDKit attention rendering, layer-PCA grids, and publication exports. |
 | `graphbench.py` | Exact GraphBench runner/checkpoint adapter, edge-semantic donor law, official-GRIT hooks, and nonlinear readout replay. |

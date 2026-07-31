@@ -520,6 +520,96 @@ class _TransportHooks:
         self.handles.clear()
 
 
+class _IndividualTransportHooks:
+    """Patch or ablate one independently assigned head in each batch replica."""
+
+    def __init__(
+        self,
+        model: Any,
+        assignments: Sequence[tuple[int, int]],
+        *,
+        replacements: Sequence[Any] | None = None,
+        ablate: bool = False,
+    ):
+        import torch
+
+        if not assignments:
+            raise ValueError("individual Graphormer head assignments cannot be empty")
+        self.model = model
+        self.assignments = torch.as_tensor(assignments, dtype=torch.long)
+        self.replacements = replacements
+        self.ablate = bool(ablate)
+        self.handles = []
+
+        layers = len(model.encoder.graph_encoder.layers)
+        heads = int(model.encoder.graph_encoder.layers[0].self_attn.num_heads)
+        if bool((self.assignments[:, 0] < 0).any()) or bool(
+            (self.assignments[:, 0] >= layers).any()
+        ):
+            raise IndexError("individual Graphormer layer assignment is outside the model")
+        if bool((self.assignments[:, 1] < 0).any()) or bool(
+            (self.assignments[:, 1] >= heads).any()
+        ):
+            raise IndexError("individual Graphormer head assignment is outside the model")
+        if not self.ablate and (
+            replacements is None or len(replacements) != layers
+        ):
+            raise ValueError(
+                "individual Graphormer patching requires one replacement tensor per layer"
+            )
+
+    def _hook(self, layer_index: int):
+        def hook(_module, args):
+            value = args[0]
+            layer = self.model.encoder.graph_encoder.layers[layer_index]
+            heads = int(layer.self_attn.num_heads)
+            tokens, batch, width = value.shape
+            if batch != int(self.assignments.shape[0]):
+                raise RuntimeError(
+                    "individual Graphormer assignments do not match the forward batch"
+                )
+            routed = value.view(tokens, batch, heads, width // heads)
+            selected = __import__("torch").nonzero(
+                self.assignments[:, 0] == int(layer_index), as_tuple=False
+            ).reshape(-1)
+            if not int(selected.numel()):
+                return None
+            selected = selected.to(device=routed.device)
+            selected_heads = self.assignments[selected.cpu(), 1].to(
+                device=routed.device
+            )
+            changed = routed.clone()
+            if self.ablate:
+                changed[:, selected, selected_heads, :] = 0.0
+            else:
+                donor = self.replacements[layer_index].to(
+                    device=changed.device, dtype=changed.dtype
+                )
+                if tuple(donor.shape) != tuple(changed.shape):
+                    raise RuntimeError(
+                        f"individual Graphormer patch geometry differs at layer "
+                        f"{layer_index}: {tuple(donor.shape)} vs {tuple(changed.shape)}"
+                    )
+                changed[:, selected, selected_heads, :] = donor[
+                    :, selected, selected_heads, :
+                ]
+            return (changed.reshape_as(value), *args[1:])
+
+        return hook
+
+    def __enter__(self):
+        for index, layer in enumerate(self.model.encoder.graph_encoder.layers):
+            self.handles.append(
+                layer.self_attn.out_proj.register_forward_pre_hook(self._hook(index))
+            )
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        for handle in self.handles:
+            handle.remove()
+        self.handles.clear()
+
+
 class GraphormerBackend:
     """Canonical backend at Graphormer's native routed-value and graph-token sites."""
 
@@ -909,6 +999,30 @@ class GraphormerBackend:
         )
         return captured.prediction, captured.z, captured.target
 
+    def _native_forward_individual_heads(
+        self,
+        data_list,
+        assignments,
+        *,
+        replacements=None,
+        ablate: bool,
+    ):
+        values = list(data_list)
+        assigned = tuple((int(layer), int(head)) for layer, head in assignments)
+        if not values or len(values) != len(assigned):
+            raise ValueError(
+                "individual Graphormer targets and head assignments must align"
+            )
+        inputs, target = self._batch(values)
+        with _IndividualTransportHooks(
+            self.model,
+            assigned,
+            replacements=replacements,
+            ablate=bool(ablate),
+        ), __import__("torch").no_grad():
+            output = self.model(**inputs, return_dict=True)
+        return output.logits, self._z(output.logits), target
+
     def ablate(self, data_list, family):
         return self._native_forward(data_list, family=family)
 
@@ -917,6 +1031,21 @@ class GraphormerBackend:
 
     def patch_many(self, targets, donor_transport, family):
         return self._native_forward(targets, family=family, replacements=donor_transport)
+
+    def ablate_individual_heads(self, data_list, assignments):
+        return self._native_forward_individual_heads(
+            data_list,
+            assignments,
+            ablate=True,
+        )
+
+    def patch_individual_heads(self, targets, donor_transport, assignments):
+        return self._native_forward_individual_heads(
+            targets,
+            assignments,
+            replacements=donor_transport,
+            ablate=False,
+        )
 
     def replacement_batch(
         self,

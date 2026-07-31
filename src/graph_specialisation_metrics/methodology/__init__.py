@@ -1,6 +1,11 @@
 """Canonical donor-swap specialisation and carriage methodology."""
 
 from .graphormer import register_graphormer_dataset
+from .graphormer_causal_analysis import (
+    FocusedExecution,
+    render_cached_focused_figures,
+    run as run_graphormer_pcqm_causal,
+)
 from .protocol import (
     BOOTSTRAP_REPLICATES,
     PROTOCOL_VERSION,
@@ -33,6 +38,7 @@ __all__ = [
     "CanonicalTask",
     "ExecutionPolicy",
     "FamilyPolicy",
+    "FocusedExecution",
     "GraphBenchTaskSpec",
     "GraphormerTaskSpec",
     "MethodologyConfig",
@@ -43,7 +49,9 @@ __all__ = [
     "finalize_cached_run",
     "register",
     "register_graphormer_dataset",
+    "render_cached_focused_figures",
     "render_cached_figures",
     "run_methodology",
+    "run_graphormer_pcqm_causal",
     "run_worker",
 ]
