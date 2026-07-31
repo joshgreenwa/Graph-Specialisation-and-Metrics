@@ -46,10 +46,10 @@ from .methodology.runner import prepare_task
 from .methodology.sampling import sample_sources
 
 
-ANALYSIS_VERSION = "zinc-bamberger-functional-reach-v6"
+ANALYSIS_VERSION = "zinc-bamberger-functional-reach-v7"
 TASKS = ("zinc_1hop", "zinc_2hop", "zinc_1hop_vnode", "zinc")
 QM9_TASKS = ("qm9_gap_1hop", "qm9_gap_1hop_vnode", "qm9_gap_dense")
-DEFAULT_INTERPOLATION_DOSES = (0.02, 0.05, 0.10, 0.25, 0.50, 1.00)
+DEFAULT_INTERPOLATION_DOSES = (0.01, 0.02, 0.05, 0.10, 0.25, 0.50, 1.00)
 TASK_LABELS = {
     "zinc_1hop": "1-hop GRIT",
     "zinc_2hop": "2-hop GRIT",
@@ -131,12 +131,12 @@ ZINC_PROFILE = ReachProfile(
     figure_prefix="zinc",
     default_output_dir=(
         "/content/drive/MyDrive/graph_specialisation_metrics/"
-        "zinc_bamberger_functional_reach_v6"
+        "zinc_bamberger_functional_reach_v7"
     ),
 )
 QM9_PROFILE = ReachProfile(
     name="QM9",
-    analysis_version="qm9-bamberger-functional-reach-v1",
+    analysis_version="qm9-bamberger-functional-reach-v2",
     tasks=QM9_TASKS,
     reference_task="qm9_gap_dense",
     atom_vocab_size=10,
@@ -144,7 +144,7 @@ QM9_PROFILE = ReachProfile(
     figure_prefix="qm9",
     default_output_dir=(
         "/content/drive/MyDrive/graph_specialisation_metrics/"
-        "qm9_bamberger_functional_reach_v1"
+        "qm9_bamberger_functional_reach_v2"
     ),
 )
 
@@ -156,14 +156,14 @@ class ZincReachConfig:
     profile: ReachProfile = ZINC_PROFILE
     tasks: tuple[str, ...] = TASKS
     seed: int = 0
-    graphs: int = 16
+    graphs: int = 64
     sources_per_graph: int = 6
     donors_per_source: int = 4
     semantic_donor_graphs: int = 256
     bamberger_output_nodes: int = 6
     bamberger_output_channels: int = 8
     interpolation_doses: tuple[float, ...] = DEFAULT_INTERPOLATION_DOSES
-    interpolation_batch_size: int = 32
+    interpolation_batch_size: int = 64
     effect_floor: float = 1.0e-12
     bootstrap_replicates: int = 2_000
     analysis_seed: int = 91_021
@@ -216,6 +216,7 @@ class ZincReachConfig:
             "interpolation_doses": [
                 float(value) for value in self.interpolation_doses
             ],
+            "matched_reference_dose": float(min(self.interpolation_doses)),
             "effect_floor": float(self.effect_floor),
             "bootstrap_replicates": int(self.bootstrap_replicates),
             "analysis_seed": int(self.analysis_seed),
@@ -232,6 +233,11 @@ class ZincReachConfig:
                 "Functional carriage under convex interpolation from the clean atom "
                 "embedding to the realised donor atom embedding, retaining the clean "
                 "graph-output projection"
+            ),
+            "matched_reference_estimand": (
+                "each finite-dose profile compared with the smallest-dose profile on "
+                "the identical graph, source, donor direction, carrier set, task "
+                "projection, and aggregation"
             ),
             "aggregation": (
                 "donor-normalise; donor -> source -> graph; 95% graph bootstrap"
@@ -805,6 +811,27 @@ def _measure_graph(
         )
     )
     clean_jacobians = prepared.backend.clean_jacobians(base)
+    graph_distances = shortest_path_distances(base.edge_index, int(base.num_nodes))
+    finite_distances = graph_distances[np.isfinite(graph_distances)]
+    if not finite_distances.size:
+        raise RuntimeError("molecule has no finite shortest-path distances")
+    graph_loss = prepared.backend.loss_per_graph(
+        clean_jacobians.capture.prediction,
+        clean_jacobians.capture.target,
+    ).reshape(-1)
+    if int(graph_loss.numel()) != 1 or not bool(torch.isfinite(graph_loss).all()):
+        raise RuntimeError("expected one finite clean per-graph loss")
+    graph_record = {
+        "analysis_version": config.profile.analysis_version,
+        "fingerprint": config.fingerprint,
+        "task": task,
+        "model_label": TASK_LABELS[task],
+        "seed": int(config.seed),
+        "graph": int(graph_id),
+        "num_nodes": int(base.num_nodes),
+        "diameter": int(finite_distances.max()),
+        "graph_mae": float(graph_loss[0].detach().cpu()),
+    }
     bamberger = _bamberger_rows(
         config,
         prepared,
@@ -863,6 +890,7 @@ def _measure_graph(
         "checkpoint_sha256": str(prepared.checkpoint_sha),
         "task": task,
         "graph": int(graph_id),
+        "graph_record": graph_record,
         "donor_rows": donor_rows,
         "interpolation_rows": interpolation_rows,
         "bamberger_rows": bamberger,
@@ -892,7 +920,12 @@ def _load_shard(
         payload.get("analysis_version") != analysis_version
         or payload.get("fingerprint") != fingerprint
         or payload.get("checkpoint_sha256") != checkpoint_sha256
-        or not {"donor_rows", "interpolation_rows", "bamberger_rows"}.issubset(payload)
+        or not {
+            "graph_record",
+            "donor_rows",
+            "interpolation_rows",
+            "bamberger_rows",
+        }.issubset(payload)
     ):
         return None
     return payload
@@ -942,6 +975,7 @@ def measure(
     donor_rows: list[dict[str, Any]] = []
     interpolation_rows: list[dict[str, Any]] = []
     bamberger_rows: list[dict[str, Any]] = []
+    graph_records: list[dict[str, Any]] = []
     health: list[dict[str, Any]] = []
     completed = 0
     total = len(config.tasks) * int(config.graphs)
@@ -984,6 +1018,7 @@ def measure(
             donor_rows.extend(shard["donor_rows"])
             interpolation_rows.extend(shard["interpolation_rows"])
             bamberger_rows.extend(shard["bamberger_rows"])
+            graph_records.append(dict(shard["graph_record"]))
             completed += 1
             if progress:
                 print(
@@ -996,6 +1031,7 @@ def measure(
     _write_csv(results_dir / "donor_carrier_mass.csv", donor_rows)
     _write_csv(results_dir / "semantic_interpolation_mass.csv", interpolation_rows)
     _write_csv(results_dir / "bamberger_input_output_influence.csv", bamberger_rows)
+    _write_csv(results_dir / "graph_metrics.csv", graph_records)
     _write_csv(results_dir / "model_health.csv", health)
     _write_json(
         results_dir / "measurement_manifest.json",
@@ -1009,6 +1045,7 @@ def measure(
             "donor_rows": len(donor_rows),
             "interpolation_rows": len(interpolation_rows),
             "bamberger_rows": len(bamberger_rows),
+            "graph_metric_rows": len(graph_records),
             "comparison_scope": {
                 "semantic": (
                     "literal Bamberger pre-pooling Jacobian proxy and task-projected "
@@ -1044,10 +1081,16 @@ def measure(
                     "output nodes/channels, sums absolute coordinatewise derivatives, and "
                     "normalises per output node"
                 ),
+                "matched_small_dose_reference": (
+                    "the smallest-dose comparison fixes graph, source, donor direction, "
+                    "carrier, clean task-output projection, event normalisation, and "
+                    "graph aggregation; its zero-dose-end TV is zero by construction"
+                ),
                 "interpretation": (
-                    "fair comparison of operational estimands, not an estimator-equivalence "
-                    "test; dose-dependent departure from Bamberger isolates the effect of "
-                    "moving from a local derivative to a finite semantic intervention"
+                    "literal Bamberger versus Functional carriage remains an operational "
+                    "estimand comparison. Departure from the matched smallest-dose profile "
+                    "more cleanly isolates finite nonlinear change; the residual smallest-dose "
+                    "TV from Bamberger measures estimand and sampling mismatch"
                 ),
             },
         },
@@ -1056,6 +1099,7 @@ def measure(
         "donor_rows": donor_rows,
         "interpolation_rows": interpolation_rows,
         "bamberger_rows": bamberger_rows,
+        "graph_records": graph_records,
         "health": health,
     }
 
@@ -1308,8 +1352,9 @@ def summarise_interpolation_contrasts(
     *,
     bootstrap_replicates: int,
     bootstrap_seed: int,
+    matched_reference_dose: float | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Compare each finite-dose profile with Bamberger on the same held-out graph."""
+    """Compare finite profiles with literal and fully matched local references."""
 
     interpolation_profiles: dict[
         tuple[str, int, float],
@@ -1324,6 +1369,20 @@ def summarise_interpolation_contrasts(
             )
         ][_integer(row, "distance")] = _float(row, "mass")
 
+    available_doses = sorted({key[2] for key in interpolation_profiles})
+    if not available_doses:
+        raise RuntimeError("interpolation profiles are empty")
+    reference_dose = (
+        float(available_doses[0])
+        if matched_reference_dose is None
+        else float(matched_reference_dose)
+    )
+    if not any(np.isclose(reference_dose, dose) for dose in available_doses):
+        raise ValueError(
+            f"matched reference dose {reference_dose:g} is absent from "
+            f"{available_doses}"
+        )
+
     bamberger_profiles: dict[tuple[str, int], dict[int, float]] = defaultdict(dict)
     for row in bamberger_rows:
         bamberger_profiles[
@@ -1333,48 +1392,60 @@ def summarise_interpolation_contrasts(
     graph_contrasts: list[dict[str, Any]] = []
     for (task, graph, dose), finite_profile in sorted(interpolation_profiles.items()):
         bamberger_profile = bamberger_profiles.get((task, graph))
-        if not bamberger_profile:
-            continue
-        distances = sorted(set(finite_profile) | set(bamberger_profile))
-        finite = np.asarray(
-            [finite_profile.get(distance, 0.0) for distance in distances],
-            dtype=np.float64,
+        matched_profile = interpolation_profiles.get((task, graph, reference_dose))
+        references = (
+            ("bamberger", bamberger_profile),
+            ("matched_small_dose", matched_profile),
         )
-        bamberger = np.asarray(
-            [bamberger_profile.get(distance, 0.0) for distance in distances],
-            dtype=np.float64,
-        )
-        graph_contrasts.append(
-            {
-                "task": task,
-                "model_label": TASK_LABELS[task],
-                "graph": int(graph),
-                "interpolation_dose": float(dose),
-                "profile_tv": float(0.5 * np.abs(finite - bamberger).sum()),
-                "expected_distance_difference": float(
-                    sum(distance * value for distance, value in zip(distances, finite))
-                    - sum(
-                        distance * value
-                        for distance, value in zip(distances, bamberger)
-                    )
-                ),
-            }
-        )
+        for baseline, reference_profile in references:
+            if not reference_profile:
+                continue
+            distances = sorted(set(finite_profile) | set(reference_profile))
+            finite = np.asarray(
+                [finite_profile.get(distance, 0.0) for distance in distances],
+                dtype=np.float64,
+            )
+            reference = np.asarray(
+                [reference_profile.get(distance, 0.0) for distance in distances],
+                dtype=np.float64,
+            )
+            graph_contrasts.append(
+                {
+                    "task": task,
+                    "model_label": TASK_LABELS[task],
+                    "graph": int(graph),
+                    "interpolation_dose": float(dose),
+                    "baseline": baseline,
+                    "matched_reference_dose": float(reference_dose),
+                    "profile_tv": float(0.5 * np.abs(finite - reference).sum()),
+                    "expected_distance_difference": float(
+                        sum(
+                            distance * value
+                            for distance, value in zip(distances, finite)
+                        )
+                        - sum(
+                            distance * value
+                            for distance, value in zip(distances, reference)
+                        )
+                    ),
+                }
+            )
 
-    grouped: dict[tuple[str, float, str], list[float]] = defaultdict(list)
+    grouped: dict[tuple[str, float, str, str], list[float]] = defaultdict(list)
     for row in graph_contrasts:
         for metric in ("profile_tv", "expected_distance_difference"):
             grouped[
                 (
                     str(row["task"]),
                     _float(row, "interpolation_dose"),
+                    str(row["baseline"]),
                     metric,
                 )
             ].append(_float(row, metric))
 
     summary: list[dict[str, Any]] = []
     for key, values in sorted(grouped.items()):
-        task, dose, metric = key
+        task, dose, baseline, metric = key
         mean, low, high = _bootstrap_interval(
             values,
             replicates=int(bootstrap_replicates),
@@ -1386,6 +1457,8 @@ def summarise_interpolation_contrasts(
                 "task": task,
                 "model_label": TASK_LABELS[task],
                 "interpolation_dose": float(dose),
+                "baseline": baseline,
+                "matched_reference_dose": float(reference_dose),
                 "metric": metric,
                 "mean": mean,
                 "low": low,
@@ -1481,6 +1554,167 @@ def summarise_graph_profiles(
             }
         )
     return profiles, expected
+
+
+def summarise_scale_dependence(
+    graph_rows: Sequence[Mapping[str, Any]],
+    graph_records: Sequence[Mapping[str, Any]],
+    *,
+    tasks: Sequence[str],
+    reference_task: str,
+    bootstrap_replicates: int,
+    bootstrap_seed: int,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Pair per-molecule error and semantic reach across molecular-scale bins."""
+
+    metadata = {
+        (str(row["task"]), _integer(row, "graph")): row
+        for row in graph_records
+    }
+    reference_records = {
+        _integer(row, "graph"): row
+        for row in graph_records
+        if str(row["task"]) == reference_task
+    }
+    if not reference_records:
+        raise RuntimeError(
+            f"no graph metrics are available for reference task {reference_task!r}"
+        )
+
+    reach_groups: dict[tuple[str, int], list[Mapping[str, Any]]] = defaultdict(list)
+    for row in graph_rows:
+        if (
+            str(row["channel"]) == "semantic"
+            and str(row["method"]) == "functional_carriage"
+        ):
+            reach_groups[(str(row["task"]), _integer(row, "graph"))].append(row)
+    expected_reach: dict[tuple[str, int], float] = {}
+    for key, values in reach_groups.items():
+        total = sum(_float(row, "mass") for row in values)
+        if total > 0:
+            expected_reach[key] = float(
+                sum(
+                    _float(row, "mass") * _integer(row, "distance")
+                    for row in values
+                )
+                / total
+            )
+
+    joined: list[dict[str, Any]] = []
+    for descriptor in ("num_nodes", "diameter"):
+        descriptor_values = {
+            graph: _integer(row, descriptor)
+            for graph, row in reference_records.items()
+        }
+        values = np.asarray(list(descriptor_values.values()), dtype=np.float64)
+        quantiles = np.quantile(values, (1.0 / 3.0, 2.0 / 3.0), method="higher")
+        boundaries = sorted(
+            {
+                int(value)
+                for value in quantiles
+                if float(values.min()) <= value < float(values.max())
+            }
+        )
+        graph_bins = {
+            graph: int(sum(value > boundary for boundary in boundaries))
+            for graph, value in descriptor_values.items()
+        }
+        members: dict[int, list[int]] = defaultdict(list)
+        for graph, bin_index in graph_bins.items():
+            members[bin_index].append(descriptor_values[graph])
+        bin_labels = {
+            bin_index: (
+                str(min(bin_values))
+                if min(bin_values) == max(bin_values)
+                else f"{min(bin_values)}–{max(bin_values)}"
+            )
+            for bin_index, bin_values in members.items()
+        }
+        bin_means = {
+            bin_index: float(np.mean(bin_values))
+            for bin_index, bin_values in members.items()
+        }
+
+        for task in tasks:
+            for graph, reference_row in reference_records.items():
+                row = metadata.get((task, graph))
+                reach = expected_reach.get((task, graph))
+                if row is None or reach is None:
+                    continue
+                if (
+                    _integer(row, "num_nodes") != _integer(reference_row, "num_nodes")
+                    or _integer(row, "diameter") != _integer(reference_row, "diameter")
+                ):
+                    raise RuntimeError(
+                        "paired model records disagree on molecular graph geometry"
+                    )
+                bin_index = graph_bins[graph]
+                joined.append(
+                    {
+                        "task": task,
+                        "model_label": TASK_LABELS[task],
+                        "reference_task": reference_task,
+                        "graph": int(graph),
+                        "descriptor": descriptor,
+                        "descriptor_value": int(descriptor_values[graph]),
+                        "scale_bin": int(bin_index),
+                        "scale_label": bin_labels[bin_index],
+                        "bin_descriptor_mean": bin_means[bin_index],
+                        "graph_mae": _float(row, "graph_mae"),
+                        "reference_graph_mae": _float(reference_row, "graph_mae"),
+                        "mae_difference_from_reference": (
+                            _float(row, "graph_mae")
+                            - _float(reference_row, "graph_mae")
+                        ),
+                        "functional_expected_distance": float(reach),
+                    }
+                )
+
+    grouped: dict[tuple[str, int, str, str], list[float]] = defaultdict(list)
+    group_meta: dict[tuple[str, int, str, str], Mapping[str, Any]] = {}
+    metrics = (
+        "graph_mae",
+        "mae_difference_from_reference",
+        "functional_expected_distance",
+    )
+    for row in joined:
+        for metric in metrics:
+            key = (
+                str(row["descriptor"]),
+                _integer(row, "scale_bin"),
+                str(row["task"]),
+                metric,
+            )
+            grouped[key].append(_float(row, metric))
+            group_meta[key] = row
+
+    summary: list[dict[str, Any]] = []
+    for key, values in sorted(grouped.items()):
+        descriptor, bin_index, task, metric = key
+        mean, low, high = _bootstrap_interval(
+            values,
+            replicates=int(bootstrap_replicates),
+            seed=int(bootstrap_seed)
+            + int(stable_hash({"scale": key}, length=8), 16),
+        )
+        exemplar = group_meta[key]
+        summary.append(
+            {
+                "task": task,
+                "model_label": TASK_LABELS[task],
+                "reference_task": reference_task,
+                "descriptor": descriptor,
+                "scale_bin": int(bin_index),
+                "scale_label": str(exemplar["scale_label"]),
+                "bin_descriptor_mean": _float(exemplar, "bin_descriptor_mean"),
+                "metric": metric,
+                "mean": mean,
+                "low": low,
+                "high": high,
+                "graphs": int(len(values)),
+            }
+        )
+    return joined, summary
 
 
 def summarise_dense_profile_contrasts(
@@ -1792,96 +2026,124 @@ def plot_interpolation_sweep(
     tasks: Sequence[str] = TASKS,
     figure_prefix: str = "zinc",
 ) -> dict[str, str]:
-    """Plot departure from Bamberger as the semantic donor fraction grows."""
+    """Plot literal-method and matched finite-dose departures side by side."""
 
     import matplotlib.pyplot as plt
 
     _figure_theme()
-    fig, axes = plt.subplots(1, 2, figsize=(10.8, 4.4), sharex=True)
+    fig, axes = plt.subplots(2, 2, figsize=(10.8, 7.0), sharex=True)
     metric_specs = (
-        ("profile_tv", "Profile distance from Bamberger (TV)"),
+        ("profile_tv", "Profile distance (TV)"),
         (
             "expected_distance_difference",
-            "Expected-distance difference from Bamberger",
+            "Expected-distance difference",
+        ),
+    )
+    baseline_specs = (
+        ("bamberger", "Reference: literal Bamberger Jacobian range"),
+        (
+            "matched_small_dose",
+            "Reference: matched smallest finite dose",
         ),
     )
     all_doses = sorted({_float(row, "interpolation_dose") for row in rows})
     if not all_doses:
         raise RuntimeError("interpolation sweep is empty; rerun PHASE='all'")
-    for axis, (metric, ylabel) in zip(axes, metric_specs):
-        for draw_order, task in enumerate(tasks):
-            values = sorted(
-                (
-                    row
-                    for row in rows
-                    if str(row["task"]) == task
-                    and str(row["metric"]) == metric
-                ),
-                key=lambda row: _float(row, "interpolation_dose"),
-            )
-            if not values:
-                raise RuntimeError(
-                    f"interpolation sweep is missing {metric!r} for {task!r}; "
-                    "rerun PHASE='all' with the current analysis version"
+    reference_doses = {
+        _float(row, "matched_reference_dose")
+        for row in rows
+        if str(row["baseline"]) == "matched_small_dose"
+    }
+    if len(reference_doses) != 1:
+        raise RuntimeError("matched interpolation reference dose is ambiguous")
+    reference_dose = next(iter(reference_doses))
+    for row_index, (baseline, row_title) in enumerate(baseline_specs):
+        for column_index, (metric, ylabel) in enumerate(metric_specs):
+            axis = axes[row_index, column_index]
+            for draw_order, task in enumerate(tasks):
+                values = sorted(
+                    (
+                        row
+                        for row in rows
+                        if str(row["task"]) == task
+                        and str(row["metric"]) == metric
+                        and str(row["baseline"]) == baseline
+                    ),
+                    key=lambda row: _float(row, "interpolation_dose"),
                 )
-            x = np.asarray([_float(value, "interpolation_dose") for value in values])
-            y = np.asarray([_float(value, "mean") for value in values])
-            low = np.asarray([_float(value, "low") for value in values])
-            high = np.asarray([_float(value, "high") for value in values])
-            axis.fill_between(
-                x,
-                low,
-                high,
-                color=MODEL_COLOURS[task],
-                alpha=0.09,
-                linewidth=0,
-                zorder=1 + draw_order,
+                if not values:
+                    raise RuntimeError(
+                        f"interpolation sweep is missing {baseline!r}/{metric!r} "
+                        f"for {task!r}; rerun PHASE='all' with the current version"
+                    )
+                x = np.asarray(
+                    [_float(value, "interpolation_dose") for value in values]
+                )
+                y = np.asarray([_float(value, "mean") for value in values])
+                low = np.asarray([_float(value, "low") for value in values])
+                high = np.asarray([_float(value, "high") for value in values])
+                axis.fill_between(
+                    x,
+                    low,
+                    high,
+                    color=MODEL_COLOURS[task],
+                    alpha=0.09,
+                    linewidth=0,
+                    zorder=1 + draw_order,
+                )
+                axis.plot(
+                    x,
+                    y,
+                    color=MODEL_COLOURS[task],
+                    marker=MODEL_MARKERS[task],
+                    linestyle=MODEL_LINESTYLES[task],
+                    markerfacecolor="white",
+                    markeredgewidth=1.1,
+                    markersize=4.7,
+                    linewidth=1.8,
+                    label=TASK_LABELS[task],
+                    zorder=5 + draw_order,
+                )
+            axis.set_xscale("log")
+            axis.set_xticks(all_doses)
+            axis.set_xticklabels([f"{dose:g}" for dose in all_doses])
+            axis.set_ylabel(ylabel)
+            if metric == "profile_tv":
+                axis.set_ylim(bottom=0)
+                zero_text = "0 = identical profile"
+            else:
+                axis.axhline(0, color="#666666", linewidth=0.9, zorder=0)
+                zero_text = "0 = identical expected distance"
+            axis.text(
+                0.03,
+                0.94,
+                zero_text,
+                transform=axis.transAxes,
+                va="top",
+                color="#666666",
+                fontsize=7.5,
             )
-            axis.plot(
-                x,
-                y,
-                color=MODEL_COLOURS[task],
-                marker=MODEL_MARKERS[task],
-                linestyle=MODEL_LINESTYLES[task],
-                markerfacecolor="white",
-                markeredgewidth=1.1,
-                markersize=5.0,
-                linewidth=1.9,
-                label=TASK_LABELS[task],
-                zorder=5 + draw_order,
-            )
-        axis.set_xscale("log")
-        axis.set_xticks(all_doses)
-        axis.set_xticklabels([f"{dose:g}" for dose in all_doses])
+            if column_index == 0:
+                axis.set_title(row_title, loc="left", fontsize=9.5)
+    for axis in axes[-1]:
         axis.set_xlabel(r"Donor-swap fraction $\alpha$")
-        axis.set_ylabel(ylabel)
-    axes[0].set_ylim(bottom=0)
-    axes[1].axhline(0, color="#666666", linewidth=0.9, zorder=0)
-    axes[0].text(
-        0.03,
-        0.95,
-        "0 = identical distance profile",
-        transform=axes[0].transAxes,
+    axes[1, 0].text(
+        0.97,
+        0.94,
+        rf"matched reference: $\alpha={reference_dose:g}$",
+        transform=axes[1, 0].transAxes,
+        ha="right",
         va="top",
         color="#666666",
-        fontsize=8,
-    )
-    axes[1].text(
-        0.03,
-        0.95,
-        "0 = identical expected distance",
-        transform=axes[1].transAxes,
-        va="top",
-        color="#666666",
-        fontsize=8,
+        fontsize=7.5,
     )
 
-    handles, labels = axes[0].get_legend_handles_labels()
+    handles, labels = axes[0, 0].get_legend_handles_labels()
     fig.legend(
         handles,
         labels,
         loc="upper center",
-        bbox_to_anchor=(0.5, 0.91),
+        bbox_to_anchor=(0.5, 0.925),
         ncol=len(tasks),
         frameon=False,
         handlelength=2.7,
@@ -1890,11 +2152,11 @@ def plot_interpolation_sweep(
     fig.suptitle(
         "Semantic distance-profile change across donor-swap magnitude",
         fontsize=13,
-        y=0.985,
+        y=0.992,
     )
     fig.text(
         0.5,
-        0.82,
+        0.872,
         "Paired held-out graphs; mean with 95% graph-bootstrap confidence interval",
         ha="center",
         color="#666666",
@@ -1903,9 +2165,10 @@ def plot_interpolation_sweep(
     fig.subplots_adjust(
         left=0.09,
         right=0.985,
-        bottom=0.16,
-        top=0.75,
+        bottom=0.09,
+        top=0.82,
         wspace=0.22,
+        hspace=0.30,
     )
     return _save_figure(
         fig,
@@ -2006,6 +2269,143 @@ def plot_expected_distance(
     return _save_figure(fig, figures_dir, f"{figure_prefix}_expected_reach")
 
 
+def plot_scale_dependence(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    figures_dir: Path,
+    tasks: Sequence[str],
+    reference_task: str,
+    dataset_label: str,
+    figure_prefix: str,
+) -> dict[str, str]:
+    """Plot paired performance and semantic reach against molecular scale."""
+
+    import matplotlib.pyplot as plt
+
+    _figure_theme()
+    fig, axes = plt.subplots(2, 2, figsize=(10.8, 7.0), sharex="col")
+    descriptor_specs = (
+        ("num_nodes", "Molecule size", "Atoms per molecule"),
+        ("diameter", "Graph diameter", "Diameter (shortest-path hops)"),
+    )
+    metric_specs = (
+        (
+            "mae_difference_from_reference",
+            f"Per-molecule MAE difference\nfrom {TASK_LABELS[reference_task]}",
+        ),
+        (
+            "functional_expected_distance",
+            "Semantic Functional-carriage\nexpected distance",
+        ),
+    )
+    for column_index, (descriptor, title, xlabel) in enumerate(descriptor_specs):
+        labels_by_bin = {
+            _integer(row, "scale_bin"): str(row["scale_label"])
+            for row in rows
+            if str(row["descriptor"]) == descriptor
+        }
+        ordered_bins = sorted(labels_by_bin)
+        for row_index, (metric, ylabel) in enumerate(metric_specs):
+            axis = axes[row_index, column_index]
+            for draw_order, task in enumerate(tasks):
+                values = sorted(
+                    (
+                        row
+                        for row in rows
+                        if str(row["descriptor"]) == descriptor
+                        and str(row["metric"]) == metric
+                        and str(row["task"]) == task
+                    ),
+                    key=lambda row: _integer(row, "scale_bin"),
+                )
+                if not values:
+                    continue
+                x = np.asarray(
+                    [_integer(value, "scale_bin") for value in values],
+                    dtype=np.float64,
+                )
+                y = np.asarray([_float(value, "mean") for value in values])
+                low = np.asarray([_float(value, "low") for value in values])
+                high = np.asarray([_float(value, "high") for value in values])
+                axis.fill_between(
+                    x,
+                    low,
+                    high,
+                    color=MODEL_COLOURS[task],
+                    alpha=0.09,
+                    linewidth=0,
+                    zorder=1 + draw_order,
+                )
+                axis.plot(
+                    x,
+                    y,
+                    color=MODEL_COLOURS[task],
+                    marker=MODEL_MARKERS[task],
+                    linestyle=MODEL_LINESTYLES[task],
+                    markerfacecolor="white",
+                    markeredgewidth=1.1,
+                    markersize=5.0,
+                    linewidth=1.9,
+                    label=TASK_LABELS[task],
+                    zorder=5 + draw_order,
+                )
+            axis.set_ylabel(ylabel)
+            axis.set_xticks(ordered_bins)
+            axis.set_xticklabels([labels_by_bin[index] for index in ordered_bins])
+            if row_index == 0:
+                axis.set_title(title)
+                axis.axhline(0, color="#666666", linewidth=0.9, zorder=0)
+            else:
+                axis.set_xlabel(xlabel)
+                axis.set_ylim(bottom=0)
+    axes[0, 0].text(
+        0.03,
+        0.95,
+        "positive = higher error than dense",
+        transform=axes[0, 0].transAxes,
+        va="top",
+        color="#666666",
+        fontsize=7.5,
+    )
+    handles, labels = axes[0, 0].get_legend_handles_labels()
+    fig.legend(
+        handles,
+        labels,
+        loc="upper center",
+        bbox_to_anchor=(0.5, 0.925),
+        ncol=len(tasks),
+        frameon=False,
+        handlelength=2.7,
+        columnspacing=1.4,
+    )
+    fig.suptitle(
+        f"Performance and semantic functional reach across {dataset_label} scale",
+        fontsize=13,
+        y=0.992,
+    )
+    fig.text(
+        0.5,
+        0.872,
+        "Shared scale bins; paired molecules; mean with 95% graph-bootstrap interval",
+        ha="center",
+        color="#666666",
+        fontsize=8.5,
+    )
+    fig.subplots_adjust(
+        left=0.105,
+        right=0.985,
+        bottom=0.10,
+        top=0.82,
+        wspace=0.24,
+        hspace=0.22,
+    )
+    return _save_figure(
+        fig,
+        figures_dir,
+        f"{figure_prefix}_scale_dependence",
+    )
+
+
 def figures(
     config: ZincReachConfig,
     *,
@@ -2017,10 +2417,12 @@ def figures(
     donor_path = results_dir / "donor_carrier_mass.csv"
     interpolation_path = results_dir / "semantic_interpolation_mass.csv"
     bamberger_path = results_dir / "bamberger_input_output_influence.csv"
+    graph_metrics_path = results_dir / "graph_metrics.csv"
     if (
         not donor_path.is_file()
         or not interpolation_path.is_file()
         or not bamberger_path.is_file()
+        or not graph_metrics_path.is_file()
     ):
         raise FileNotFoundError(
             "cached measurement CSVs are missing; run PHASE='measure' or 'all' first"
@@ -2043,6 +2445,7 @@ def figures(
             bamberger_graph,
             bootstrap_replicates=int(config.bootstrap_replicates),
             bootstrap_seed=int(config.analysis_seed) + 300,
+            matched_reference_dose=float(min(config.interpolation_doses)),
         )
     )
     graph_rows = [*donor_graph, *bamberger_graph]
@@ -2056,6 +2459,14 @@ def figures(
         bootstrap_replicates=int(config.bootstrap_replicates),
         bootstrap_seed=int(config.analysis_seed) + 200,
         reference_task=config.profile.reference_task,
+    )
+    scale_rows, scale_summary = summarise_scale_dependence(
+        graph_rows,
+        _read_csv(graph_metrics_path),
+        tasks=config.tasks,
+        reference_task=config.profile.reference_task,
+        bootstrap_replicates=int(config.bootstrap_replicates),
+        bootstrap_seed=int(config.analysis_seed) + 400,
     )
     _write_csv(results_dir / "graph_distance_profiles.csv", graph_rows)
     _write_csv(results_dir / "distance_profile_summary.csv", profile_rows)
@@ -2073,6 +2484,8 @@ def figures(
         results_dir / "interpolation_sweep_summary.csv",
         interpolation_summary,
     )
+    _write_csv(results_dir / "scale_dependence_graph_rows.csv", scale_rows)
+    _write_csv(results_dir / "scale_dependence_summary.csv", scale_summary)
 
     figures_dir = output_dir / "figures"
     paths = {
@@ -2122,6 +2535,14 @@ def figures(
             dataset_label=config.profile.name,
             figure_prefix=config.profile.figure_prefix,
         ),
+        "scale_dependence": plot_scale_dependence(
+            scale_summary,
+            figures_dir=figures_dir,
+            tasks=config.tasks,
+            reference_task=config.profile.reference_task,
+            dataset_label=config.profile.name,
+            figure_prefix=config.profile.figure_prefix,
+        ),
     }
     _write_json(
         results_dir / "figure_manifest.json",
@@ -2134,7 +2555,8 @@ def figures(
                 "checkpoint per architecture, so intervals do not include training-seed "
                 "variance. Difference panels use paired graph-level bootstraps against "
                 "Dense GRIT; the interpolation sweep pairs each graph with its "
-                "Bamberger profile."
+                "Bamberger and matched smallest-dose profiles. Scale analyses use "
+                "shared molecule bins and paired per-graph MAE differences."
             ),
         },
     )
@@ -2144,6 +2566,7 @@ def figures(
         "contrast_rows": contrast_rows,
         "expected_rows": expected_rows,
         "interpolation_rows": interpolation_summary,
+        "scale_rows": scale_summary,
     }
 
 
@@ -2158,7 +2581,7 @@ def build_parser(
     )
     parser.add_argument("--tasks", default=",".join(profile.tasks))
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--graphs", type=int, default=16)
+    parser.add_argument("--graphs", type=int, default=64)
     parser.add_argument("--sources-per-graph", type=int, default=6)
     parser.add_argument("--donors-per-source", type=int, default=4)
     parser.add_argument("--semantic-donor-graphs", type=int, default=256)
@@ -2168,7 +2591,7 @@ def build_parser(
         "--interpolation-doses",
         default=",".join(f"{value:g}" for value in DEFAULT_INTERPOLATION_DOSES),
     )
-    parser.add_argument("--interpolation-batch-size", type=int, default=32)
+    parser.add_argument("--interpolation-batch-size", type=int, default=64)
     parser.add_argument("--effect-floor", type=float, default=1.0e-12)
     parser.add_argument("--bootstrap-replicates", type=int, default=2_000)
     parser.add_argument("--analysis-seed", type=int, default=91_021)

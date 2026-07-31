@@ -29,18 +29,18 @@ SECRET_NAME = "dissertation_key"
 PHASE = "all"  # "all", "measure", or "figures"
 OUTPUT_DIR = Path(
     "/content/drive/MyDrive/graph_specialisation_metrics/"
-    "zinc_bamberger_functional_reach_v6"
+    "zinc_bamberger_functional_reach_v7"
 )
 TASKS = "zinc_1hop,zinc_2hop,zinc_1hop_vnode,zinc"
 SEED = 0
-GRAPHS = 16
+GRAPHS = 64
 SOURCES_PER_GRAPH = 6
 DONORS_PER_SOURCE = 4
 SEMANTIC_DONOR_GRAPHS = 256
 BAMBERGER_OUTPUT_NODES = 6
 BAMBERGER_OUTPUT_CHANNELS = 8
-INTERPOLATION_DOSES = "0.02,0.05,0.1,0.25,0.5,1.0"
-INTERPOLATION_BATCH_SIZE = 32
+INTERPOLATION_DOSES = "0.01,0.02,0.05,0.1,0.25,0.5,1.0"
+INTERPOLATION_BATCH_SIZE = 64
 BOOTSTRAP_REPLICATES = 2_000
 ANALYSIS_SEED = 91_021
 ACCELERATOR = "cuda:0"
@@ -175,6 +175,11 @@ print(
     "[scope] Core check: semantic Functional carriage is recomputed along the "
     "same clean-to-donor event at increasing donor fractions. Departure from the "
     "Bamberger profile tests local linearisation versus finite intervention.\n"
+    "[scope] Matched control: every dose is also compared with alpha=0.01 on "
+    "identical graphs, donors, carriers and task projections. This separates "
+    "finite nonlinear change from the residual Bamberger estimand mismatch.\n"
+    "[scope] Scale analysis: paired per-molecule MAE and semantic Functional "
+    "reach are stratified by atom count and graph diameter.\n"
     "[scope] Fairness: checkpoints, graphs, SPD and carrier site are shared; "
     "literal Bamberger remains output-centric and channel-subsampled.\n"
     "[scope] Interpretation: this is an estimand comparison, not a claim that "
@@ -257,6 +262,17 @@ if "interpolation_rows" in result:
     except ImportError:
         pass
 
+if "scale_rows" in result:
+    from IPython.display import display
+
+    try:
+        import pandas as pd
+
+        print("\nMolecular-scale summary", flush=True)
+        display(pd.DataFrame(result["scale_rows"]))
+    except ImportError:
+        pass
+
 if "figures" in result:
     from IPython.display import Image, display
 
@@ -266,6 +282,7 @@ if "figures" in result:
         "semantic_bamberger",
         "structural_functional",
         "expected_distance",
+        "scale_dependence",
     ):
         path = result["figures"][name]["png"]
         print(f"\n[display] {name}: {path}", flush=True)

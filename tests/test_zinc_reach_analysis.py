@@ -18,6 +18,7 @@ from graph_specialisation_metrics.zinc_reach_analysis import (
     summarise_dense_profile_contrasts,
     summarise_graph_profiles,
     summarise_interpolation_contrasts,
+    summarise_scale_dependence,
 )
 
 
@@ -135,7 +136,7 @@ def _raw_rows(tasks=TASKS):
                         ),
                     }
                     donor.append(row)
-            for dose in (0.02, 0.10, 0.50, 1.00):
+            for dose in (0.01, 0.02, 0.10, 0.50, 1.00):
                 for distance in (0, 1, 2):
                     interpolation.append(
                         {
@@ -167,6 +168,21 @@ def _raw_rows(tasks=TASKS):
                         }
                     )
     return donor, bamberger, interpolation
+
+
+def _raw_graph_records(tasks=TASKS):
+    return [
+        {
+            "task": task,
+            "model_label": reach.TASK_LABELS[task],
+            "graph": graph,
+            "num_nodes": 3 + graph,
+            "diameter": 2,
+            "graph_mae": 0.10 + 0.01 * task_index + 0.02 * graph,
+        }
+        for task_index, task in enumerate(tasks)
+        for graph in (0, 1)
+    ]
 
 
 def test_profile_scope_and_normalisation():
@@ -247,6 +263,37 @@ def test_profile_scope_and_normalisation():
     assert {
         row["metric"] for row in sweep
     } == {"profile_tv", "expected_distance_difference"}
+    assert {row["baseline"] for row in sweep} == {
+        "bamberger",
+        "matched_small_dose",
+    }
+    matched_origin = [
+        row
+        for row in graph_contrasts
+        if row["baseline"] == "matched_small_dose"
+        and row["interpolation_dose"] == pytest.approx(0.01)
+    ]
+    assert matched_origin
+    assert all(row["profile_tv"] == pytest.approx(0.0) for row in matched_origin)
+
+    scale_rows, scale_summary = summarise_scale_dependence(
+        graph_rows,
+        _raw_graph_records(),
+        tasks=TASKS,
+        reference_task="zinc",
+        bootstrap_replicates=40,
+        bootstrap_seed=13,
+    )
+    assert scale_rows and scale_summary
+    assert {row["descriptor"] for row in scale_summary} == {
+        "num_nodes",
+        "diameter",
+    }
+    assert all(
+        row["mae_difference_from_reference"] == pytest.approx(0.0)
+        for row in scale_rows
+        if row["task"] == "zinc"
+    )
 
 
 def test_figure_only_builds_png_and_pdf(tmp_path: Path):
@@ -260,6 +307,7 @@ def test_figure_only_builds_png_and_pdf(tmp_path: Path):
         (results / "donor_carrier_mass.csv", donor),
         (results / "bamberger_input_output_influence.csv", bamberger),
         (results / "semantic_interpolation_mass.csv", interpolation),
+        (results / "graph_metrics.csv", _raw_graph_records()),
     ):
         with path.open("w", newline="", encoding="utf-8") as handle:
             writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
@@ -276,6 +324,7 @@ def test_figure_only_builds_png_and_pdf(tmp_path: Path):
         "semantic_bamberger",
         "structural_functional",
         "expected_distance",
+        "scale_dependence",
     }
     assert (results / "dense_profile_contrasts.csv").is_file()
     assert (results / "interpolation_sweep_summary.csv").is_file()
@@ -295,6 +344,7 @@ def test_qm9_profile_builds_dataset_specific_figures(tmp_path: Path):
         (results / "donor_carrier_mass.csv", donor),
         (results / "bamberger_input_output_influence.csv", bamberger),
         (results / "semantic_interpolation_mass.csv", interpolation),
+        (results / "graph_metrics.csv", _raw_graph_records(QM9_TASKS)),
     ):
         with path.open("w", newline="", encoding="utf-8") as handle:
             writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
@@ -315,6 +365,7 @@ def test_qm9_profile_builds_dataset_specific_figures(tmp_path: Path):
         "semantic_bamberger",
         "structural_functional",
         "expected_distance",
+        "scale_dependence",
     }
     assert all(
         Path(formats["png"]).name.startswith("qm9_")
