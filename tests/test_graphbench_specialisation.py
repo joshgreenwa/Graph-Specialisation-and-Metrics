@@ -875,6 +875,9 @@ def test_graphbench_backend_captures_chunked_vjps_and_native_patch_site():
     assert capture.prediction.shape == (2, 4)
     assert capture.transport[0].shape == (2, 3, 2, 2)
     assert capture.final_state.shape == (2, 4, 21)
+    attention = backend.clean_attention_matrices(graph)
+    assert attention.shape == (2, 2, 3, 3)
+    assert np.allclose(attention.sum(axis=-1), 1.0)
 
     clean = backend.clean_jacobians(graph)
     assert clean.transport.shape == (4, 2, 3, 2, 2)

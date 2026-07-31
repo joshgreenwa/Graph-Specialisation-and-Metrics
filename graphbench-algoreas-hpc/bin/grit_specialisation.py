@@ -130,6 +130,16 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument("--force", action="store_true")
     value.add_argument("--no-resume", action="store_true")
     value.add_argument("--skip-beneficial-carriage", action="store_true")
+    value.add_argument(
+        "--attention-visualisation",
+        action="store_true",
+        help=(
+            "Run the cached-score, CPU-only selected-head attention extraction and figure."
+        ),
+    )
+    value.add_argument("--attention-seed", type=int, default=0)
+    value.add_argument("--attention-graph", type=int, default=0)
+    value.add_argument("--attention-top-k", type=int, default=2)
     return value
 
 
@@ -196,6 +206,21 @@ def main(argv: Sequence[str] | None = None) -> None:
     config.validate()
     if (args.worker_task is None) != (args.worker_seed is None):
         raise ValueError("--worker-task and --worker-seed must be supplied together")
+    if args.attention_visualisation:
+        from graph_specialisation_metrics.methodology.graphbench_attention_figures import (
+            render_graphbench_attention_visualisation,
+        )
+
+        if len(config.tasks) != 1:
+            raise ValueError("attention visualisation requires exactly one task")
+        render_graphbench_attention_visualisation(
+            config,
+            config.tasks[0],
+            seed=int(args.attention_seed),
+            graph_id=int(args.attention_graph),
+            top_k_per_receiver=int(args.attention_top_k),
+        )
+        return
     if args.worker_task is not None:
         worker_task = TASK_ALIASES.get(args.worker_task, args.worker_task)
         run_worker(config, worker_task, int(args.worker_seed))

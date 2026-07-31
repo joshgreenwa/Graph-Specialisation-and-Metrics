@@ -536,6 +536,7 @@ def prepare_task(
         "build_missing_pe_cache",
         "force_reload_data",
         "metric_reproduction_tolerance",
+        "skip_checkpoint_metric_reproduction",
         "expected_grit_commit",
         "split_seed",
         "train_size",

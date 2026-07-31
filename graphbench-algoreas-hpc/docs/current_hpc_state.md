@@ -355,6 +355,25 @@ audit caches for seeds 0-3, automatically uses a uniquely complete analysis root
 job if no complete root or multiple complete roots are found. This prevents an empty default
 directory from reaching the Slurm queue.
 
+### Selected-head clean-attention figure (CPU only)
+
+The qualitative attention figure uses seed 0 and validation graph 0 by default. It selects the two
+largest semantic `D_rel` heads, the most negative structural `D_rel` head, and the highest-`J`
+threshold generalist from the immutable score cache. One CPU forward captures official GRIT's exact
+post-softmax attention; the capture is then cached for model-free figure restyling.
+
+```bash
+cd /rds/user/jgg45/hpc-work/Graph-Specialisation-and-Metrics
+
+ENV_ACTIVATE=$PWD/graphbench-algoreas-hpc/activate_graphbench_algoreas \
+GRAPHBENCH_ANALYSIS_OUTPUT_ROOT=/rds/user/jgg45/hpc-work/graphbench-algoreas/outputs/grit_specialisation_bipartite_complete_pe_causal_v3 \
+bash graphbench-algoreas-hpc/bin/submit_grit_attention_visualisation.sh
+```
+
+The launcher requests two CPU cores for at most one hour and no GPU. The final PDF/PNG are written
+under `graphbench_bipartite_matching_hard/population_figures/`; the reusable attention matrix cache
+is under `graphbench_bipartite_matching_hard/attention_cache/`.
+
 ## Mechanistic Analysis
 
 Primary script:

@@ -845,48 +845,60 @@ def build_graphbench_runtime(
     if target_stats is None:
         target_stats = runner.compute_target_stats(splits["train"])
     pos_weight = runner.compute_pos_weight(splits["train"])
-    watch_size = int(getattr(cfg, "val_watch_size", len(splits["val"])))
-    watch_graphs = runner.deterministic_subset(
-        splits["val"],
-        min(watch_size, len(splits["val"])),
-        int(cfg.split_seed) + 4099,
+    checkpoint_metrics = dict(checkpoint.get("val_metrics", {}))
+    skip_metric_reproduction = bool(
+        overrides.get("skip_checkpoint_metric_reproduction", False)
     )
-    watch = runner.OfficialGraphDataset(
-        watch_graphs, task_name=expected_task, split="val_watch"
-    )
-    print(
-        f"[graphbench] reproducing checkpoint watch metric "
-        f"task={expected_task} seed={train_seed} graphs={len(watch)}",
-        flush=True,
-    )
-    metrics, _ = runner.evaluate_model(
-        model,
-        watch,
-        int(runner.eval_batch_size_for("grit", cfg)),
-        device,
-        False,
-        int(train_seed),
-        pos_weight,
-        target_stats,
-    )
-    print(
-        f"[graphbench] reproduced watch primary={float(metrics['primary']):.8g}",
-        flush=True,
-    )
-    checkpoint_metric = checkpoint.get("val_metrics", {}).get("primary")
-    if checkpoint_metric is not None:
-        within_tolerance(
-            abs(float(metrics["primary"]) - float(checkpoint_metric)),
-            float(overrides.get("metric_reproduction_tolerance", 5.0e-6)),
-            "graphbench.checkpoint_metric_reproduction",
-            "checkpoint watch-metric reproduction error",
-            context={
-                "task": expected_task,
-                "seed": int(train_seed),
-                "reproduced": float(metrics["primary"]),
-                "checkpoint": float(checkpoint_metric),
-            },
+    if skip_metric_reproduction:
+        metrics = checkpoint_metrics
+        print(
+            "[graphbench] checkpoint watch-metric reproduction skipped for "
+            "the cached qualitative attention extraction",
+            flush=True,
         )
+    else:
+        watch_size = int(getattr(cfg, "val_watch_size", len(splits["val"])))
+        watch_graphs = runner.deterministic_subset(
+            splits["val"],
+            min(watch_size, len(splits["val"])),
+            int(cfg.split_seed) + 4099,
+        )
+        watch = runner.OfficialGraphDataset(
+            watch_graphs, task_name=expected_task, split="val_watch"
+        )
+        print(
+            f"[graphbench] reproducing checkpoint watch metric "
+            f"task={expected_task} seed={train_seed} graphs={len(watch)}",
+            flush=True,
+        )
+        metrics, _ = runner.evaluate_model(
+            model,
+            watch,
+            int(runner.eval_batch_size_for("grit", cfg)),
+            device,
+            False,
+            int(train_seed),
+            pos_weight,
+            target_stats,
+        )
+        print(
+            f"[graphbench] reproduced watch primary={float(metrics['primary']):.8g}",
+            flush=True,
+        )
+        checkpoint_metric = checkpoint_metrics.get("primary")
+        if checkpoint_metric is not None:
+            within_tolerance(
+                abs(float(metrics["primary"]) - float(checkpoint_metric)),
+                float(overrides.get("metric_reproduction_tolerance", 5.0e-6)),
+                "graphbench.checkpoint_metric_reproduction",
+                "checkpoint watch-metric reproduction error",
+                context={
+                    "task": expected_task,
+                    "seed": int(train_seed),
+                    "reproduced": float(metrics["primary"]),
+                    "checkpoint": float(checkpoint_metric),
+                },
+            )
     runtime = GraphBenchRuntime(
         runner=runner,
         model=model,
@@ -908,12 +920,17 @@ def build_graphbench_runtime(
                 "hidden_width": int(cfg.hidden_dim),
             },
             "metric_reproduction": dict(metrics),
+            "metric_reproduction_skipped": skip_metric_reproduction,
             "jacobian_output_chunk": int(jacobian_output_chunk),
             "official_grit_root": str(grit_root),
             "official_grit_commit": observed_grit_commit,
             "graphbench_package_version": _graphbench_version(),
         },
-        val_metric=float(metrics["primary"]),
+        val_metric=(
+            float(metrics["primary"])
+            if metrics.get("primary") is not None
+            else None
+        ),
     )
     return runtime, str(checkpoint_path)
 
@@ -1504,6 +1521,26 @@ class GraphBenchGritBackend:
                 error, float(torch.max(torch.abs(mass[valid] - 1.0)).item())
             )
         return error
+
+    def clean_attention_matrices(self, data: Any) -> np.ndarray:
+        """Return exact post-softmax clean attention as ``[L,H,receiver,sender]``."""
+
+        raw = self._forward_capture([data], require_grad=False)
+        matrices = np.zeros(
+            (
+                int(self.runtime.L),
+                int(self.runtime.H),
+                int(data.num_nodes),
+                int(data.num_nodes),
+            ),
+            dtype=np.float32,
+        )
+        for layer, edge_index, attention in raw["attention"]:
+            edge = edge_index.detach().cpu().numpy()
+            values = attention.squeeze(-1).detach().cpu().numpy()
+            layer_matrix = matrices[int(layer)]
+            layer_matrix[:, edge[1], edge[0]] = values.T
+        return matrices
 
     def clean_attention_distance(self, data: Any, pristine, axis):
         raw = self._forward_capture([data], require_grad=False)
