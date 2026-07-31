@@ -21,6 +21,7 @@ FOCUSED_GRAPHBENCH_TASK = "graphbench_bipartite_matching_hard"
 SEED_MARKERS = ("o", "s", "^", "D", "P", "X", "v", "<", ">")
 CHANNELS = ("semantic", "structural")
 FAMILIES = ("semantic", "structural")
+NECESSITY_FAMILIES = ("semantic", "structural", "j_matched_null")
 
 
 def _value(record: Any, name: str) -> Any:
@@ -73,6 +74,113 @@ def _family_event_mean(
     )
     finite = values[np.isfinite(values)]
     return float(np.mean(finite)) if finite.size else np.nan
+
+
+def _hierarchical_necessity_fraction(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    effect_floor: float,
+) -> float:
+    """Reduce event-wise necessity fractions over the registered hierarchy."""
+
+    transformed = []
+    for row in rows:
+        event_effect = float(row["event_effect"])
+        transformed.append(
+            {
+                **row,
+                "necessity_fraction": (
+                    float(row["necessity"]) / event_effect
+                    if event_effect > effect_floor
+                    else np.nan
+                ),
+            }
+        )
+    return _hierarchical_mean(transformed, "necessity_fraction")
+
+
+def _family_necessity_mean(
+    event_records: Mapping[str, Any],
+    heads: Sequence[Sequence[int]],
+    channel: str,
+    *,
+    effect_floor: float,
+) -> float:
+    values = np.asarray(
+        [
+            _hierarchical_necessity_fraction(
+                event_records[_head_name(head)][channel],
+                effect_floor=effect_floor,
+            )
+            for head in heads
+            if _head_name(head) in event_records
+        ],
+        dtype=np.float64,
+    )
+    finite = values[np.isfinite(values)]
+    return float(np.mean(finite)) if finite.size else np.nan
+
+
+def _j_matched_null_heads(
+    joint_sensitivity: np.ndarray,
+    selected_heads: Sequence[Sequence[int]],
+) -> dict[str, Any]:
+    """Select non-target heads with the closest joint-sensitivity distribution."""
+
+    selected = tuple(dict.fromkeys(tuple(map(int, head)) for head in selected_heads))
+    selected_set = set(selected)
+    candidates = tuple(
+        (int(layer), int(head))
+        for layer, head in np.ndindex(joint_sensitivity.shape)
+        if (int(layer), int(head)) not in selected_set
+        and np.isfinite(joint_sensitivity[layer, head])
+    )
+    targets = tuple(
+        head for head in selected if np.isfinite(joint_sensitivity[head])
+    )
+    if not targets or not candidates:
+        return {
+            "method": "minimum-total-absolute-J assignment without replacement",
+            "heads": (),
+            "matches": (),
+            "mean_absolute_J_gap": np.nan,
+        }
+
+    from scipy.optimize import linear_sum_assignment
+
+    cost = np.asarray(
+        [
+            [
+                abs(float(joint_sensitivity[target]) - float(joint_sensitivity[candidate]))
+                for candidate in candidates
+            ]
+            for target in targets
+        ],
+        dtype=np.float64,
+    )
+    # Deterministic tie-breaking is tiny enough not to change a substantive match.
+    tie_break = np.arange(len(candidates), dtype=np.float64)[None, :] * 1.0e-12
+    target_positions, candidate_positions = linear_sum_assignment(cost + tie_break)
+    matches = tuple(
+        {
+            "target": targets[target_position],
+            "null": candidates[candidate_position],
+            "target_J": float(joint_sensitivity[targets[target_position]]),
+            "null_J": float(joint_sensitivity[candidates[candidate_position]]),
+            "absolute_J_gap": float(cost[target_position, candidate_position]),
+        }
+        for target_position, candidate_position in zip(
+            target_positions.tolist(), candidate_positions.tolist()
+        )
+    )
+    return {
+        "method": "minimum-total-absolute-J assignment without replacement",
+        "heads": tuple(row["null"] for row in matches),
+        "matches": matches,
+        "mean_absolute_J_gap": float(
+            np.mean([row["absolute_J_gap"] for row in matches])
+        ),
+    }
 
 
 def _average_ranks(values: np.ndarray) -> np.ndarray:
@@ -143,7 +251,7 @@ def build_graphbench_population_figure_data(
     config: MethodologyConfig,
     task_results: Sequence[Mapping[str, Any]],
 ) -> dict[str, Any]:
-    """Build all six plot payloads without touching a model, dataset, or GPU."""
+    """Build the publication plot payloads without touching a model, dataset, or GPU."""
 
     ordered = sorted(task_results, key=lambda value: int(value["seed"]))
     seeds = np.asarray([int(value["seed"]) for value in ordered], dtype=np.int64)
@@ -155,6 +263,7 @@ def build_graphbench_population_figure_data(
     necessity_rows = []
     head_rows: list[dict[str, Any]] = []
     pair_counts: list[int] = []
+    null_matches: list[dict[str, Any]] = []
     seed_rhos: list[float] = []
     for result in ordered:
         scores = result["scores"]
@@ -164,8 +273,16 @@ def build_graphbench_population_figure_data(
         if pair_set not in focused.get("pair_set_order", ()):
             absolute_rows.append(np.full((2, 2, 2), np.nan))
             mediation_rows.append(np.full(2, np.nan))
-            necessity_rows.append(np.full((2, 2), np.nan))
+            necessity_rows.append(np.full((3, 2), np.nan))
             pair_counts.append(0)
+            null_matches.append(
+                {
+                    "method": "minimum-total-absolute-J assignment without replacement",
+                    "heads": (),
+                    "matches": (),
+                    "mean_absolute_J_gap": np.nan,
+                }
+            )
         else:
             pairs = tuple(focused["pair_sets"][pair_set]["pairs"])
             pair_counts.append(len(pairs))
@@ -175,7 +292,9 @@ def build_graphbench_population_figure_data(
             }
             event_records = causal["event_records"]
             absolute = np.empty((2, 2, 2), dtype=np.float64)
-            for metric_position, field in enumerate(("R_align", "I_align")):
+            for metric_position, field in enumerate(
+                ("R_align_adjusted", "I_align_adjusted")
+            ):
                 for family_position, family in enumerate(FAMILIES):
                     for channel_position, channel in enumerate(CHANNELS):
                         absolute[metric_position, family_position, channel_position] = (
@@ -206,13 +325,31 @@ def build_graphbench_population_figure_data(
                     dtype=np.float64,
                 )
             )
-            necessity_position = metric_order.index("necessity_fraction")
-            necessity_rows.append(
-                np.asarray(
-                    interval.estimate[set_position, necessity_position, :4],
-                    dtype=np.float64,
-                ).reshape(2, 2)
+            joint = np.asarray(
+                _value(scores["coordinates"], "joint_sensitivity"),
+                dtype=np.float64,
             )
+            null_match = _j_matched_null_heads(
+                joint,
+                selected["semantic"] + selected["structural"],
+            )
+            null_matches.append(null_match)
+            necessity_heads = {
+                **selected,
+                "j_matched_null": null_match["heads"],
+            }
+            necessity = np.empty((3, 2), dtype=np.float64)
+            for family_position, family in enumerate(NECESSITY_FAMILIES):
+                for channel_position, channel in enumerate(CHANNELS):
+                    necessity[family_position, channel_position] = (
+                        _family_necessity_mean(
+                            event_records,
+                            necessity_heads[family],
+                            channel,
+                            effect_floor=float(config.numerical.effect_floor),
+                        )
+                    )
+            necessity_rows.append(necessity)
 
         coordinates = scores["coordinates"]
         raw_semantic = np.asarray(_value(coordinates, "raw_semantic"), dtype=np.float64)
@@ -239,6 +376,10 @@ def build_graphbench_population_figure_data(
         head_rows.append(
             {
                 "seed": int(result["seed"]),
+                "layer": np.broadcast_to(
+                    np.arange(layers, dtype=np.int64)[:, None],
+                    joint.shape,
+                ).copy(),
                 "raw_semantic": raw_semantic,
                 "raw_structural": raw_structural,
                 "joint_sensitivity": joint,
@@ -272,8 +413,9 @@ def build_graphbench_population_figure_data(
         },
         "necessity": {
             "values": necessity_values,
-            "family_order": FAMILIES,
+            "family_order": NECESSITY_FAMILIES,
             "channel_order": CHANNELS,
+            "null_matches": null_matches,
             "population": _seed_population_interval(
                 necessity_values, config, seed_offset=107
             ),
@@ -326,9 +468,15 @@ def _seed_handles(seeds: Sequence[int], theme: FigureTheme):
     ]
 
 
-def _family_handles(theme: FigureTheme):
+def _family_handles(theme: FigureTheme, *, include_null: bool = False):
     from matplotlib.lines import Line2D
 
+    families = [
+        ("Semantic-scoring heads", theme.semantic_color),
+        ("Structural-scoring heads", theme.structural_color),
+    ]
+    if include_null:
+        families.append((r"$J$-matched null heads", "#777777"))
     return [
         Line2D(
             [0],
@@ -338,12 +486,9 @@ def _family_handles(theme: FigureTheme):
             linestyle="none",
             markeredgecolor="white",
             markeredgewidth=0.5,
-            label=f"{family.title()}-scoring heads",
+            label=label,
         )
-        for family, color in zip(
-            FAMILIES,
-            (theme.semantic_color, theme.structural_color),
-        )
+        for label, color in families
     ]
 
 
@@ -361,8 +506,14 @@ def _colour_intervention_ticks(ax: Any, theme: FigureTheme) -> None:
         labels[1].set_color(theme.structural_color)
 
 
-def _legend_below(fig: Any, handles: Sequence[Any], *, ncol: int) -> None:
-    fig.legend(
+def _legend_below(
+    fig: Any,
+    handles: Sequence[Any],
+    *,
+    ncol: int,
+    title: str | None = None,
+) -> None:
+    legend = fig.legend(
         handles=handles,
         frameon=False,
         loc="lower center",
@@ -371,38 +522,30 @@ def _legend_below(fig: Any, handles: Sequence[Any], *, ncol: int) -> None:
         columnspacing=1.15,
         handletextpad=0.45,
         borderaxespad=0,
+        title=title,
     )
+    if title is not None:
+        legend.get_title().set_fontsize(8.5)
 
 
 def _family_population_marks(
     ax: Any,
-    values: np.ndarray,
     population: Mapping[str, Any],
-    seeds: Sequence[int],
     theme: FigureTheme,
+    *,
+    include_null: bool = False,
 ) -> None:
-    """Categorical four-seed points plus the seed-bootstrap population interval."""
+    """Categorical population means and seed-bootstrap confidence intervals."""
 
     x = np.arange(2, dtype=np.float64)
-    seed_jitter = np.linspace(-0.027, 0.027, len(seeds))
+    colors = [theme.semantic_color, theme.structural_color]
+    offsets = [-0.13, 0.13]
+    if include_null:
+        colors = [theme.semantic_color, theme.structural_color, "#777777"]
+        offsets = [-0.18, 0.0, 0.18]
     for family_position, (color, offset) in enumerate(
-        zip(
-            (theme.semantic_color, theme.structural_color),
-            (-0.13, 0.13),
-        )
+        zip(colors, offsets)
     ):
-        for seed_position, _seed in enumerate(seeds):
-            ax.scatter(
-                x + offset + seed_jitter[seed_position],
-                values[seed_position, family_position],
-                marker=SEED_MARKERS[seed_position % len(SEED_MARKERS)],
-                s=theme.marker_size * 0.56,
-                facecolors="white",
-                edgecolors=color,
-                linewidths=0.85,
-                alpha=0.90,
-                zorder=4,
-            )
         estimate = np.asarray(population["estimate"], dtype=np.float64)[
             family_position
         ]
@@ -431,55 +574,23 @@ def _family_population_marks(
     ax.set_xlim(-0.28, 1.28)
 
 
-def _plot_family_by_channel(
-    values: np.ndarray,
-    population: Mapping[str, Any],
-    seeds: Sequence[int],
-    theme: FigureTheme,
-    *,
-    ylabel: str,
-    title: str,
-):
-    import matplotlib.pyplot as plt
-
-    with publication_style(theme):
-        fig, ax = plt.subplots(figsize=(theme.width, theme.height))
-        _family_population_marks(ax, values, population, seeds, theme)
-        ax.axhline(0.0, color="#9A9A9A", linewidth=0.75)
-        ax.set_xticks(
-            np.arange(2, dtype=np.float64),
-            ("Semantic intervention", "Structural intervention"),
-        )
-        _colour_intervention_ticks(ax, theme)
-        ax.set_ylabel(ylabel)
-        ax.set_title(title)
-        _style_axis(ax)
-        _legend_below(
-            fig,
-            _family_handles(theme) + _seed_handles(seeds, theme),
-            ncol=3,
-        )
-        fig.subplots_adjust(bottom=0.27, left=0.16, right=0.98, top=0.90)
-    return fig, ax
-
-
 def _plot_absolute_patching(data: Mapping[str, Any], theme: FigureTheme):
     import matplotlib.pyplot as plt
 
-    values = np.asarray(data["absolute_patching"]["values"])
     population = data["absolute_patching"]["population"]
-    seeds = data["seeds"]
     with publication_style(theme):
         fig, axes = plt.subplots(
             1,
-            2,
-            figsize=(theme.width * 2.0, theme.height),
-            sharey=True,
+            3,
+            figsize=(theme.width * 3.0, theme.height),
         )
         for metric_position, (ax, title) in enumerate(
             zip(
-                axes,
-                ("Causal restoration", "Causal injection"),
+                axes[:2],
+                (
+                    "Clean head state in an intervened graph",
+                    "Intervened head state in a clean graph",
+                ),
             )
         ):
             metric_population = {
@@ -488,9 +599,7 @@ def _plot_absolute_patching(data: Mapping[str, Any], theme: FigureTheme):
             }
             _family_population_marks(
                 ax,
-                values[:, metric_position],
                 metric_population,
-                seeds,
                 theme,
             )
             ax.axhline(0.0, color="#9A9A9A", linewidth=0.75)
@@ -501,13 +610,37 @@ def _plot_absolute_patching(data: Mapping[str, Any], theme: FigureTheme):
             _colour_intervention_ticks(ax, theme)
             ax.set_title(title)
             _style_axis(ax)
-        axes[0].set_ylabel("Aligned change in model output")
+        axes[0].set_ylabel("Output effect beyond mismatch control")
+
+        necessity = data["necessity"]
+        _family_population_marks(
+            axes[2],
+            necessity["population"],
+            theme,
+            include_null=True,
+        )
+        axes[2].axhline(0.0, color="#9A9A9A", linewidth=0.75)
+        axes[2].set_xticks(
+            np.arange(2, dtype=np.float64),
+            ("Semantic intervention", "Structural intervention"),
+        )
+        _colour_intervention_ticks(axes[2], theme)
+        axes[2].set_ylabel("Intervention effect removed (fraction)")
+        axes[2].set_title("Head necessity")
+        _style_axis(axes[2])
         _legend_below(
             fig,
-            _family_handles(theme) + _seed_handles(seeds, theme),
-            ncol=6,
+            _family_handles(theme, include_null=True),
+            ncol=3,
+            title="Mean and 95% bootstrap CI across four seeds",
         )
-        fig.subplots_adjust(bottom=0.23, left=0.09, right=0.99, top=0.89, wspace=0.16)
+        fig.subplots_adjust(
+            bottom=0.27,
+            left=0.065,
+            right=0.995,
+            top=0.88,
+            wspace=0.32,
+        )
     return fig, axes
 
 
@@ -515,25 +648,10 @@ def _plot_preferential_mediation(data: Mapping[str, Any], theme: FigureTheme):
     import matplotlib.pyplot as plt
 
     record = data["preferential_mediation"]
-    values = np.asarray(record["values"])
     population = record["population"]
-    seeds = data["seeds"]
     x = np.arange(2, dtype=np.float64)
     with publication_style(theme):
         fig, ax = plt.subplots(figsize=(theme.width, theme.height))
-        seed_jitter = np.linspace(-0.035, 0.035, len(seeds))
-        for seed_position, _seed in enumerate(seeds):
-            ax.scatter(
-                x + seed_jitter[seed_position],
-                values[seed_position],
-                marker=SEED_MARKERS[seed_position % len(SEED_MARKERS)],
-                s=theme.marker_size * 0.62,
-                facecolors="white",
-                edgecolors=theme.central_color,
-                linewidths=0.85,
-                alpha=0.9,
-                zorder=4,
-            )
         estimate = np.asarray(population["estimate"])
         low = np.asarray(population["low"])
         high = np.asarray(population["high"])
@@ -567,12 +685,12 @@ def _plot_preferential_mediation(data: Mapping[str, Any], theme: FigureTheme):
             color="#4F4F4F",
             marker="o",
             linestyle="none",
-            label="Four-seed mean (95% CI)",
+            label="Mean and 95% bootstrap CI across four seeds",
         )
         _legend_below(
             fig,
-            _seed_handles(seeds, theme) + [mean_handle],
-            ncol=3,
+            [mean_handle],
+            ncol=1,
         )
         fig.subplots_adjust(bottom=0.27, left=0.17, right=0.98, top=0.90)
     return fig, ax
@@ -590,27 +708,44 @@ def _plot_head_scatter(
     guides: str | None = None,
     statistic: str | None = None,
 ):
+    import matplotlib as mpl
     import matplotlib.pyplot as plt
 
     seeds = data["seeds"]
     with publication_style(theme):
-        fig, ax = plt.subplots(figsize=(theme.width, theme.height))
+        # Fixed axes rectangles make these three panels align exactly when placed
+        # side by side, independent of tick-label or data-limit differences.
+        fig = plt.figure(figsize=(theme.width, theme.height))
+        ax = fig.add_axes((0.17, 0.25, 0.56, 0.66))
+        colorbar_ax = fig.add_axes((0.80, 0.25, 0.035, 0.66))
+        maximum_layer = max(
+            int(np.nanmax(np.asarray(row["layer"]))) for row in data["heads"]
+        )
+        layer_count = maximum_layer + 1
+        cmap = plt.get_cmap("viridis", layer_count)
+        norm = mpl.colors.BoundaryNorm(
+            np.arange(-0.5, layer_count + 0.5, 1.0),
+            cmap.N,
+        )
         all_x: list[np.ndarray] = []
         all_y: list[np.ndarray] = []
         for seed_position, row in enumerate(data["heads"]):
             x = np.asarray(row[x_name]).reshape(-1)
             y = np.asarray(row[y_name]).reshape(-1)
-            finite = np.isfinite(x) & np.isfinite(y)
+            layer = np.asarray(row["layer"]).reshape(-1)
+            finite = np.isfinite(x) & np.isfinite(y) & np.isfinite(layer)
             all_x.append(x[finite])
             all_y.append(y[finite])
             ax.scatter(
                 x[finite],
                 y[finite],
+                c=layer[finite],
+                cmap=cmap,
+                norm=norm,
                 marker=SEED_MARKERS[seed_position % len(SEED_MARKERS)],
-                s=theme.marker_size * 0.46,
-                color="#666666",
-                alpha=0.48,
-                linewidths=0.25,
+                s=theme.marker_size * 0.54,
+                alpha=0.68,
+                linewidths=0.22,
                 edgecolors="white",
                 zorder=2,
             )
@@ -626,7 +761,6 @@ def _plot_head_scatter(
                 zorder=1,
             )
             ax.set(xlim=(0.0, upper), ylim=(0.0, upper))
-            ax.set_aspect("equal", adjustable="box")
         elif guides == "selectivity":
             ax.axvline(0.0, color="#9A9A9A", linewidth=0.75, zorder=1)
             ax.set_xlim(-1.02, 1.02)
@@ -638,6 +772,19 @@ def _plot_head_scatter(
         ax.set_ylabel(ylabel)
         ax.set_title(title)
         _style_axis(ax)
+        layer_ticks = np.unique(
+            np.rint(
+                np.linspace(0, maximum_layer, min(layer_count, 6))
+            ).astype(int)
+        )
+        colorbar = fig.colorbar(
+            mpl.cm.ScalarMappable(norm=norm, cmap=cmap),
+            cax=colorbar_ax,
+            ticks=layer_ticks,
+        )
+        colorbar.set_label("Layer")
+        colorbar.outline.set_linewidth(0.55)
+        colorbar.ax.tick_params(length=2.5, width=0.55)
         handles = _seed_handles(seeds, theme)
         if statistic is not None:
             ax.text(
@@ -651,16 +798,6 @@ def _plot_head_scatter(
                 fontsize=theme.tick_size,
             )
         _legend_below(fig, handles, ncol=4)
-        bottom = {
-            "identity": 0.29,
-            "selectivity": 0.32,
-        }.get(guides, 0.22)
-        fig.subplots_adjust(
-            bottom=bottom,
-            left=0.16,
-            right=0.98,
-            top=0.90,
-        )
     return fig, ax
 
 
@@ -669,13 +806,16 @@ def render_graphbench_population_figures(
     task_name: str,
     task_results: Sequence[Mapping[str, Any]],
 ) -> dict[str, list[str]]:
-    """Write the focused six-figure suite and a compact population manifest."""
+    """Write the focused publication suite and a compact population manifest."""
 
     if task_name != FOCUSED_GRAPHBENCH_TASK:
         return {}
     data = build_graphbench_population_figure_data(config, task_results)
     theme = _theme(config)
     output_dir = config.root / task_name / "population_figures"
+    for suffix in ("pdf", "png", "metadata.json"):
+        obsolete = output_dir / f"03_population_donor_necessity.{suffix}"
+        obsolete.unlink(missing_ok=True)
     builder = FigureBuilder(
         output_dir,
         theme,
@@ -697,12 +837,20 @@ def render_graphbench_population_figures(
         axes,
         metadata={
             "estimand": (
-                "raw matched aligned patch response; donors within source, sources "
-                "within graph, graphs within selected-head family, then seeds"
+                "mismatch-adjusted aligned patch response for clean-state restoration "
+                "and intervened-state injection; donors within source, sources within "
+                "graph, graphs within selected-head family, then seeds; necessity is "
+                "aligned event effect removed divided by donor-event output effect"
             ),
             "pair_set": "strongest_candidates",
             "pair_counts": data["pair_counts"],
-            "population": data["absolute_patching"]["population"],
+            "patching_population": data["absolute_patching"]["population"],
+            "necessity_population": data["necessity"]["population"],
+            "necessity_null": {
+                "matching_variable": "joint sensitivity J",
+                "selection_uses_causal_outcomes": False,
+                "matches": data["necessity"]["null_matches"],
+            },
         },
     )
     saved["absolute_restoration_injection"] = [str(path) for path in paths]
@@ -723,27 +871,6 @@ def render_graphbench_population_figures(
         },
     )
     saved["preferential_mediation"] = [str(path) for path in paths]
-
-    fig, axes = _plot_family_by_channel(
-        data["necessity"]["values"],
-        data["necessity"]["population"],
-        data["seeds"],
-        theme,
-        ylabel="Fraction of intervention effect removed",
-        title="Head necessity by intervention type",
-    )
-    paths = builder.save(
-        "03_population_donor_necessity",
-        fig,
-        axes,
-        metadata={
-            "estimand": "aligned necessity divided by the donor event output effect",
-            "pair_set": "strongest_candidates",
-            "pair_counts": data["pair_counts"],
-            "population": data["necessity"]["population"],
-        },
-    )
-    saved["donor_necessity"] = [str(path) for path in paths]
 
     rho_population = data["clean_ablation"]["rho_population"]
     rho = float(np.asarray(rho_population["estimate"]).reshape(-1)[0])
@@ -771,6 +898,8 @@ def render_graphbench_population_figures(
             "estimand": "within-seed Spearman correlation; seed-level population mean",
             "seed_rho": data["clean_ablation"]["seed_rho"],
             "rho_population": rho_population,
+            "point_color": "transformer layer",
+            "point_shape": "training seed",
         },
     )
     saved["joint_sensitivity_clean_ablation"] = [str(path) for path in paths]
@@ -792,6 +921,8 @@ def render_graphbench_population_figures(
         metadata={
             "estimand": "individual-head raw coherent output-movement scores",
             "head_alignment": "not assumed across seeds",
+            "point_color": "transformer layer",
+            "point_shape": "training seed",
         },
     )
     saved["raw_semantic_structural_scores"] = [str(path) for path in paths]
@@ -802,10 +933,8 @@ def render_graphbench_population_figures(
         x_name="selectivity",
         y_name="joint_sensitivity",
         xlabel=(
-            "Relative selectivity, "
-            r"$D_{\mathrm{rel}}$"
-            "\n"
-            r"$\leftarrow$ structural  |  semantic $\rightarrow$"
+            r"Head selectivity, $D_{\mathrm{rel}}$ "
+            r"(structural $\leftarrow$ 0 $\rightarrow$ semantic)"
         ),
         ylabel=r"Joint sensitivity, $J$",
         title="Joint sensitivity and relative selectivity",
@@ -818,6 +947,8 @@ def render_graphbench_population_figures(
         metadata={
             "estimand": "within-seed normalized individual-head score coordinates",
             "head_alignment": "not assumed across seeds",
+            "point_color": "transformer layer",
+            "point_shape": "training seed",
         },
     )
     saved["joint_sensitivity_selectivity"] = [str(path) for path in paths]

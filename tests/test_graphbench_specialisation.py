@@ -2129,7 +2129,7 @@ def test_model_free_finalizer_owns_shared_four_seed_summaries(
         assert population["population_interval"]["level"] == "training seed"
 
 
-def test_matching_population_renderer_uses_all_seed_caches_and_writes_six_figures(
+def test_matching_population_renderer_uses_all_seed_caches_and_writes_publication_figures(
     tmp_path,
 ):
     task = "graphbench_bipartite_matching_hard"
@@ -2143,8 +2143,18 @@ def test_matching_population_renderer_uses_all_seed_caches_and_writes_six_figure
     )
     results = []
     for seed in config.train_seeds:
-        raw_semantic = np.asarray([[0.8 + 0.1 * seed, 0.4 + 0.05 * seed]])
-        raw_structural = np.asarray([[0.3 + 0.04 * seed, 0.9 + 0.08 * seed]])
+        raw_semantic = np.asarray(
+            [
+                [0.8 + 0.1 * seed, 0.4 + 0.05 * seed],
+                [0.7 + 0.03 * seed, 0.5 + 0.02 * seed],
+            ]
+        )
+        raw_structural = np.asarray(
+            [
+                [0.3 + 0.04 * seed, 0.9 + 0.08 * seed],
+                [0.6 + 0.02 * seed, 0.55 + 0.02 * seed],
+            ]
+        )
         semantic_norm = raw_semantic / np.mean(raw_semantic)
         structural_norm = raw_structural / np.mean(raw_structural)
         joint = 0.5 * (semantic_norm + structural_norm)
@@ -2172,7 +2182,9 @@ def test_matching_population_renderer_uses_all_seed_caches_and_writes_six_figure
             resampled_levels=("graph", "source", "donor"),
         )
         event_records = {}
-        for head_position, name in enumerate(("head_L0_H0", "head_L0_H1")):
+        for head_position, name in enumerate(
+            ("head_L0_H0", "head_L0_H1", "head_L1_H0", "head_L1_H1")
+        ):
             event_records[name] = {}
             for channel_position, channel in enumerate(("semantic", "structural")):
                 event_records[name][channel] = [
@@ -2194,12 +2206,35 @@ def test_matching_population_renderer_uses_all_seed_caches_and_writes_six_figure
                             + 0.01 * seed
                             + 0.005 * graph
                         ),
+                        "R_align_adjusted": (
+                            0.16
+                            + 0.08 * head_position
+                            + 0.04 * channel_position
+                            + 0.01 * seed
+                            + 0.005 * graph
+                        ),
+                        "I_align_adjusted": (
+                            0.08
+                            + 0.03 * head_position
+                            + 0.02 * channel_position
+                            + 0.01 * seed
+                            + 0.005 * graph
+                        ),
+                        "necessity": (
+                            0.04
+                            + 0.01 * head_position
+                            + 0.005 * channel_position
+                            + 0.002 * seed
+                        ),
+                        "event_effect": 0.4 + 0.01 * graph,
                     }
                     for graph in (0, 1)
                 ]
         clean = {
             "head_L0_H0": {"prediction_movement": 0.4 + 0.02 * seed},
             "head_L0_H1": {"prediction_movement": 0.2 + 0.01 * seed},
+            "head_L1_H0": {"prediction_movement": 0.3 + 0.01 * seed},
+            "head_L1_H1": {"prediction_movement": 0.25 + 0.01 * seed},
         }
         results.append(
             {
@@ -2250,14 +2285,25 @@ def test_matching_population_renderer_uses_all_seed_caches_and_writes_six_figure
     population = build_graphbench_population_figure_data(config, results)
     assert population["seeds"].tolist() == [0, 1, 2, 3]
     assert population["absolute_patching"]["values"].shape == (4, 2, 2, 2)
+    assert np.isclose(population["absolute_patching"]["values"][0, 0, 0, 0], 0.1625)
     assert population["preferential_mediation"]["values"].shape == (4, 2)
-    assert population["necessity"]["values"].shape == (4, 2, 2)
+    assert population["necessity"]["values"].shape == (4, 3, 2)
+    assert all(
+        len(record["heads"]) == 2
+        for record in population["necessity"]["null_matches"]
+    )
     assert population["clean_ablation"]["rho_population"][
         "included_seed_count"
     ] == 4
 
+    population_dir = tmp_path / task / "population_figures"
+    population_dir.mkdir(parents=True)
+    obsolete = population_dir / "03_population_donor_necessity.pdf"
+    obsolete.write_text("obsolete", encoding="utf-8")
     saved = render_graphbench_population_figures(config, task, results)
-    assert len(saved) == 6
+    assert len(saved) == 5
+    assert "donor_necessity" not in saved
+    assert not obsolete.exists()
     assert all(len(paths) == 2 for paths in saved.values())
     assert all(Path(path).is_file() for paths in saved.values() for path in paths)
     manifest = json.loads(
