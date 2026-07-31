@@ -238,19 +238,9 @@ def test_graphbench_structural_swap_is_rrwp_row_column_self_on_fixed_support():
 
 
 def test_main_graphbench_structural_events_use_complete_pe_without_degree_matching():
-    pairs = ((0, 3), (0, 4), (1, 4), (2, 5))
-    directed = [edge for pair in pairs for edge in (pair, pair[::-1])]
-    graph = Graph(
-        node_type=torch.zeros(6, dtype=torch.long),
-        edge_index=torch.tensor(directed, dtype=torch.long).t().contiguous(),
-        edge_value=torch.arange(1, 9, dtype=torch.float32),
-        target=torch.zeros(8),
-        task_type="edge_binary",
-        num_nodes=6,
-        spd=torch.zeros(6, 6, dtype=torch.long),
-        rwse=torch.zeros(6, 16),
-        rrwp=torch.arange(6 * 6 * 17, dtype=torch.float32).reshape(6, 6, 17),
-    )
+    # The released task is maximum-weight matching on a general graph.  Odd
+    # cycles deliberately make any accidental bipartition constraint fail.
+    graph = six_node_general_matching_graph()
 
     variants, records = build_graphbench_channel_events(
         graph,
@@ -264,12 +254,12 @@ def test_main_graphbench_structural_events_use_complete_pe_without_degree_matchi
         rrwp_steps=16,
     )
 
-    assert {record.donor_node for record in records} == {1, 2}
-    assert all(record.degree_gap == 1 for record in records)
-    assert all(record.realised_donor_count == 2 for record in records)
-    assert all(record.eligible_pool_size == 2 for record in records)
-    for event in variants:
-        assert event.degree_override[0].item() == 1.0
+    assert {record.donor_node for record in records} == {1, 2, 3, 4, 5}
+    assert {record.degree_gap for record in records} == {0, 1}
+    assert all(record.realised_donor_count == 5 for record in records)
+    assert all(record.eligible_pool_size == 5 for record in records)
+    for event, record in zip(variants, records):
+        assert event.degree_override[0].item() == record.donor_degree
         assert torch.equal(event.rrwp[..., 16], graph.rrwp[..., 16])
         assert torch.equal(event.edge_index, graph.edge_index)
         assert torch.equal(event.edge_value, graph.edge_value)
@@ -2016,9 +2006,9 @@ def test_graphbench_score_and_carriage_components_resume_from_graph_shards(tmp_p
     assert len(score_shards) == 3
     assert len(carriage_shards) == 3
     assert scores["interval_pairing"] == "graph-paired/channel-source-independent"
-    # This three-node toy has only two same-side-estimable structural sources;
-    # unlike the production n=16 graphs, its structural source set is sampled.
-    assert carriage["channels"]["structural"]["resample_source"] is True
+    # Without an invented partition constraint, all three nodes have two
+    # admissible PE-role donors and the complete source set is enumerated.
+    assert carriage["channels"]["structural"]["resample_source"] is False
 
     resumed_scores = run_scores(prepared, config, plan=score_plan)
     resumed_carriage = run_carriage(prepared, config, plan=carriage_plan)

@@ -449,34 +449,6 @@ def _rrwp_footprints(graph: Any, *, rrwp_steps: int) -> tuple[bytes, ...]:
     )
 
 
-def _bipartition_sides(graph: Any) -> np.ndarray:
-    """Deterministically two-colour a bipartite matching support."""
-
-    n = int(graph.num_nodes)
-    neighbours: list[set[int]] = [set() for _ in range(n)]
-    for left, right in graph.edge_index.detach().cpu().numpy().T:
-        left, right = int(left), int(right)
-        neighbours[left].add(right)
-        neighbours[right].add(left)
-    side = np.full(n, -1, dtype=np.int64)
-    for root in range(n):
-        if side[root] >= 0:
-            continue
-        side[root] = 0
-        queue = [root]
-        cursor = 0
-        while cursor < len(queue):
-            node = queue[cursor]
-            cursor += 1
-            for other in sorted(neighbours[node]):
-                if side[other] < 0:
-                    side[other] = 1 - side[node]
-                    queue.append(other)
-                elif side[other] == side[node]:
-                    raise RuntimeError("GraphBench matching support is not bipartite")
-    return side
-
-
 def _rrwp_role_distance(
     graph: Any,
     source: int,
@@ -509,24 +481,21 @@ def _balanced_structural_donors(
     rrwp_steps: int,
     rng: np.random.Generator,
 ) -> tuple[tuple[tuple[int, str, float], ...], int]:
-    """Sample near/middle/far RRWP roles without replacement or degree matching."""
+    """Sample near/middle/far RRWP roles without degree or partition matching.
+
+    The released ``bipartite_matching`` task is maximum-weight matching on a
+    general graph and exposes no bipartition.  Node type remains matched so the
+    donor law changes only the model-visible positional role.
+    """
 
     source = int(source)
     node_type = graph.node_type.detach().cpu().numpy().reshape(-1)
-    matching = graph.task_type == "edge_binary"
-    sides = _bipartition_sides(graph) if matching else None
     candidates = [
         donor
         for donor in range(int(graph.num_nodes))
         if donor != source
         and footprints[donor] != footprints[source]
-        and (
-            not matching
-            or (
-                int(node_type[donor]) == int(node_type[source])
-                and int(sides[donor]) == int(sides[source])
-            )
-        )
+        and int(node_type[donor]) == int(node_type[source])
     ]
     if not candidates:
         return (), 0

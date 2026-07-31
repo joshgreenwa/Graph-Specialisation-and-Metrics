@@ -317,7 +317,7 @@ class MethodologyConfig:
                     "structural_donor_law": (
                         "non-identical RRWP role; no degree matching; balanced "
                         "near/middle/far role distance; unique without replacement; "
-                        "matching donors additionally preserve bipartition side and node type"
+                        "preserve model-visible node type; no inferred partition constraint"
                     ),
                     "raw_score_system": "coherent output movement",
                     "secondary_score_diagnostic": "transport mass",
