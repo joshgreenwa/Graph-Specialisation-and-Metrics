@@ -728,7 +728,11 @@ def plot_av_pca(
         minimum_count=minimum_count,
     )
     categories = _ordered_pca_categories(labels)
-    fig, ax = plt.subplots(figsize=(8.8, 6.2), constrained_layout=True)
+    legend_columns = min(3, max(1, len(categories)))
+    legend_rows = int(np.ceil(len(categories) / legend_columns))
+    legend_space_inches = 0.65 + 0.42 * legend_rows
+    figure_height = 6.4 + legend_space_inches
+    fig, ax = plt.subplots(figsize=(9.6, figure_height))
     labels_array = np.asarray(labels)
     for category in categories:
         color = _pca_focus_color(category)
@@ -747,6 +751,11 @@ def plot_av_pca(
     ax.axvline(0, color=LIGHT_GRID, linewidth=0.8, zorder=0)
     ax.set_xlabel(f"PC1 ({100 * explained[0]:.1f}% variance)")
     ax.set_ylabel(f"PC2 ({100 * explained[1]:.1f}% variance)")
+    axis_title_size = 1.25 * float(plt.rcParams["axes.labelsize"])
+    axis_tick_size = 1.25 * float(plt.rcParams["xtick.labelsize"])
+    ax.xaxis.label.set_fontsize(axis_title_size)
+    ax.yaxis.label.set_fontsize(axis_title_size)
+    ax.tick_params(axis="both", labelsize=axis_tick_size)
     head = tuple(payload["head"])
     metric_line = ""
     if d_rel is not None and joint_sensitivity is not None:
@@ -767,12 +776,25 @@ def plot_av_pca(
         fontsize=15,
     )
     ax.grid(False)
-    ax.legend(
-        loc="center left",
-        bbox_to_anchor=(1.01, 0.5),
-        fontsize=9.5,
-        markerscale=1.15,
-        handletextpad=0.55,
+    handles, legend_labels = ax.get_legend_handles_labels()
+    fig.legend(
+        handles,
+        legend_labels,
+        loc="lower center",
+        bbox_to_anchor=(0.5, 0.02),
+        ncol=legend_columns,
+        fontsize=axis_title_size,
+        markerscale=1.25,
+        handletextpad=0.5,
+        columnspacing=1.25,
+        labelspacing=0.75,
+        borderaxespad=0.0,
+    )
+    fig.subplots_adjust(
+        left=0.115,
+        right=0.975,
+        top=1.0 - 1.45 / figure_height,
+        bottom=(legend_space_inches + 0.20) / figure_height,
     )
     return fig
 

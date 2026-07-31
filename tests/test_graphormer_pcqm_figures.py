@@ -1044,9 +1044,23 @@ def test_av_pca_identifies_role_and_head_metrics():
         assert "Structural specialist — L7 H14" in title
         assert "D_{\\rm rel} = -0.275" in title
         assert "J = 1.234" in title
-        legend = figure.axes[0].get_legend()
-        assert legend is not None
-        assert all(text.get_fontsize() == 9.5 for text in legend.get_texts())
+        figure.canvas.draw()
+        axis = figure.axes[0]
+        assert axis.get_legend() is None
+        assert axis.xaxis.label.get_fontsize() == 13.75
+        assert axis.yaxis.label.get_fontsize() == 13.75
+        assert all(
+            text.get_fontsize() == 11.25
+            for text in axis.get_xticklabels() + axis.get_yticklabels()
+        )
+        assert len(figure.legends) == 1
+        legend = figure.legends[0]
+        assert all(text.get_fontsize() == 13.75 for text in legend.get_texts())
+        renderer = figure.canvas.get_renderer()
+        legend_box = legend.get_window_extent(renderer)
+        axes_bottom = axis.get_window_extent(renderer).y0
+        assert 0 <= legend_box.x0 < legend_box.x1 <= figure.bbox.width
+        assert 0 <= legend_box.y0 < legend_box.y1 < axes_bottom
     finally:
         plt.close(figure)
 
@@ -1132,7 +1146,7 @@ def test_av_pca_focus_palette_is_stable_across_plots():
         for figure, labels in ((first, labels_a), (second, labels_b)):
             observed = [
                 text.get_text().split(" (n=", 1)[0]
-                for text in figure.axes[0].get_legend().get_texts()
+                for text in figure.legends[0].get_texts()
             ]
             counts = Counter(labels)
             palette_order = {
