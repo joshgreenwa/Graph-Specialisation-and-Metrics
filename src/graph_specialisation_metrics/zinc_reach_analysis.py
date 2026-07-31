@@ -49,6 +49,7 @@ from .reach_redundancy import (
     SemanticCoalition,
     build_shell_permutation,
     build_shell_replacement,
+    combine_semantic_coalitions,
     survival_components,
 )
 
@@ -56,7 +57,7 @@ from .reach_redundancy import (
 ANALYSIS_VERSION = "zinc-bamberger-functional-reach-v8"
 OUTPUT_CARRIAGE_VERSION = "signed-output-path-carriage-v2-soft-audit"
 BENEFICIAL_CARRIAGE_VERSION = "positive-beneficial-path-carriage-v1"
-SURVIVAL_VERSION = "shell-coalition-survival-v1"
+SURVIVAL_VERSION = "shell-coalition-survival-v2-reused-singletons"
 OUTPUT_PATH_ATOL = 1.0e-6
 OUTPUT_PATH_RTOL = 1.0e-5
 OUTPUT_PATH_MAX_INTERVALS = 128
@@ -179,7 +180,7 @@ class ZincReachConfig:
     profile: ReachProfile = ZINC_PROFILE
     tasks: tuple[str, ...] = TASKS
     seed: int = 0
-    graphs: int = 128
+    graphs: int = 64
     sources_per_graph: int = 6
     donors_per_source: int = 4
     semantic_donor_graphs: int = 256
@@ -187,16 +188,17 @@ class ZincReachConfig:
     bamberger_output_channels: int = 8
     interpolation_doses: tuple[float, ...] = DEFAULT_INTERPOLATION_DOSES
     interpolation_batch_size: int = 64
-    survival_carriers_per_graph: int = 6
-    survival_draws: int = 4
+    survival_carriers_per_graph: int = 1
+    survival_draws: int = 1
     survival_tail_radii: tuple[int, ...] = (2, 3, 4, 5)
     survival_replacement_candidates: int = 32
     survival_exact_limit: int = 12
     survival_random_attempts: int = 512
-    survival_replica_batch_size: int = 128
-    beneficial_atol: float = 1.0e-6
-    beneficial_rtol: float = 1.0e-5
-    beneficial_max_intervals: int = 128
+    survival_replica_batch_size: int = 2_048
+    beneficial_donors_per_source: int = 1
+    beneficial_atol: float = 1.0e-5
+    beneficial_rtol: float = 1.0e-4
+    beneficial_max_intervals: int = 64
     effect_floor: float = 1.0e-12
     bootstrap_replicates: int = 2_000
     analysis_seed: int = 91_021
@@ -220,6 +222,7 @@ class ZincReachConfig:
             "survival_exact_limit",
             "survival_random_attempts",
             "survival_replica_batch_size",
+            "beneficial_donors_per_source",
             "beneficial_max_intervals",
             "bootstrap_replicates",
             "num_threads",
@@ -271,7 +274,7 @@ class ZincReachConfig:
             ),
             "survival_exact_limit": int(self.survival_exact_limit),
             "survival_random_attempts": int(self.survival_random_attempts),
-            "survival_replica_batch_size": int(self.survival_replica_batch_size),
+            "beneficial_donors_per_source": int(self.beneficial_donors_per_source),
             "beneficial_path": {
                 "version": BENEFICIAL_CARRIAGE_VERSION,
                 "atol": float(self.beneficial_atol),
@@ -308,7 +311,8 @@ class ZincReachConfig:
             "survival_estimand": (
                 "signed task-output-projected singleton vectors versus the actual joint "
                 "semantic intervention: R=J/A, additive survival=C/A, and nonlinear "
-                "residual=(J-C)/A; exact shells and independently permuted far tails"
+                "residual=(J-C)/A; one mapping per exact shell, with the same singleton "
+                "responses and mappings composed into cumulative far tails"
             ),
             "shell_replacement_control": (
                 "the identical source coalition receives external graph-balanced, "
@@ -319,6 +323,105 @@ class ZincReachConfig:
     @property
     def fingerprint(self) -> str:
         return stable_hash(self.scientific_record)
+
+    @property
+    def core_cache_fingerprint(self) -> str:
+        """Scientific identity of the original reach shard only."""
+
+        return stable_hash(
+            {
+                "component": "reach-core-v8",
+                "analysis_version": self.profile.analysis_version,
+                "dataset": self.profile.name,
+                "seed": int(self.seed),
+                "analysis_seed": int(self.analysis_seed),
+                "sources_per_graph": int(self.sources_per_graph),
+                "donors_per_source": int(self.donors_per_source),
+                "semantic_donor_graphs": int(self.semantic_donor_graphs),
+                "bamberger_output_nodes": int(self.bamberger_output_nodes),
+                "bamberger_output_channels": int(self.bamberger_output_channels),
+                "interpolation_doses": list(self.interpolation_doses),
+                "atom_vocab_size": int(self.profile.atom_vocab_size),
+                "event_stage": self.profile.event_stage,
+            }
+        )
+
+    @property
+    def output_cache_fingerprint(self) -> str:
+        return stable_hash(
+            {
+                "component": OUTPUT_CARRIAGE_VERSION,
+                "core_events": self.core_cache_fingerprint,
+                "atol": OUTPUT_PATH_ATOL,
+                "rtol": OUTPUT_PATH_RTOL,
+                "max_intervals": OUTPUT_PATH_MAX_INTERVALS,
+            }
+        )
+
+    @property
+    def beneficial_cache_fingerprint(self) -> str:
+        return stable_hash(
+            {
+                "component": BENEFICIAL_CARRIAGE_VERSION,
+                "analysis_version": self.profile.analysis_version,
+                "dataset": self.profile.name,
+                "seed": int(self.seed),
+                "analysis_seed": int(self.analysis_seed),
+                "sources_per_graph": int(self.sources_per_graph),
+                "donors_per_source": int(self.beneficial_donors_per_source),
+                "semantic_donor_graphs": int(self.semantic_donor_graphs),
+                "atol": float(self.beneficial_atol),
+                "rtol": float(self.beneficial_rtol),
+                "max_intervals": int(self.beneficial_max_intervals),
+                "channels": list(CHANNELS),
+            }
+        )
+
+    @property
+    def survival_cache_fingerprint(self) -> str:
+        return stable_hash(
+            {
+                "component": SURVIVAL_VERSION,
+                "analysis_version": self.profile.analysis_version,
+                "dataset": self.profile.name,
+                "seed": int(self.seed),
+                "analysis_seed": int(self.analysis_seed),
+                "semantic_donor_graphs": int(self.semantic_donor_graphs),
+                "carriers_per_graph": int(self.survival_carriers_per_graph),
+                "draws": int(self.survival_draws),
+                "tail_radii": list(self.survival_tail_radii),
+                "replacement_candidates": int(
+                    self.survival_replacement_candidates
+                ),
+                "exact_limit": int(self.survival_exact_limit),
+                "random_attempts": int(self.survival_random_attempts),
+                "effect_floor": float(self.effect_floor),
+            }
+        )
+
+
+def _legacy_slow_run_fingerprint(config: ZincReachConfig) -> str:
+    """Fingerprint emitted by the initial, prohibitively expensive v8/v3 run."""
+
+    record = copy.deepcopy(config.scientific_record)
+    record["graphs"] = 128
+    record["survival_carriers_per_graph"] = 6
+    record["survival_draws"] = 4
+    record["survival_replica_batch_size"] = 128
+    record.pop("beneficial_donors_per_source", None)
+    record["beneficial_path"] = {
+        "version": BENEFICIAL_CARRIAGE_VERSION,
+        "atol": 1.0e-6,
+        "rtol": 1.0e-5,
+        "max_intervals": 128,
+        "sign": "positive means the donor intervention increases task loss",
+    }
+    record["survival_estimand"] = (
+        "signed task-output-projected singleton vectors versus the actual joint "
+        "semantic intervention: R=J/A, additive survival=C/A, and nonlinear "
+        "residual=(J-C)/A; exact shells and independently permuted far tails"
+    )
+    return stable_hash(record)
 
 def _write_json(path: Path, payload: Mapping[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1072,6 +1175,7 @@ def _measure_output_carriage_graph(
         "output_carriage_version": OUTPUT_CARRIAGE_VERSION,
         "analysis_version": config.profile.analysis_version,
         "fingerprint": config.fingerprint,
+        "cache_fingerprint": config.output_cache_fingerprint,
         "checkpoint_sha256": str(prepared.checkpoint_sha),
         "task": task,
         "graph": int(graph_id),
@@ -1089,6 +1193,7 @@ def _beneficial_rows_for_channel(
     base: Any,
     variants: Sequence[Any],
     events: Sequence[Any],
+    capture: Any | None = None,
 ) -> list[dict[str, Any]]:
     """Integrate positive-is-beneficial task-loss carriage for donor events."""
 
@@ -1096,7 +1201,8 @@ def _beneficial_rows_for_channel(
 
     if len(variants) != len(events) or not variants:
         return []
-    capture = prepared.backend.capture_groups([[base, *variants]])[0]
+    if capture is None:
+        capture = prepared.backend.capture_groups([[base, *variants]])[0]
     event_count = len(events)
     clean = capture.final_state[0].unsqueeze(0).expand(event_count, -1, -1)
     intervened = capture.final_state[1:]
@@ -1212,7 +1318,7 @@ def _measure_beneficial_graph(
             np.random.default_rng(_seed(config, "sources", graph_id)),
         )
     )
-    rows: list[dict[str, Any]] = []
+    channel_batches: list[tuple[str, list[Any], list[Any]]] = []
     for channel in CHANNELS:
         variants: list[Any] = []
         events: list[Any] = []
@@ -1223,7 +1329,7 @@ def _measure_beneficial_graph(
                 source=source,
                 channel=channel,
                 stage=f"{config.profile.event_stage}_beneficial",
-                donors=int(config.donors_per_source),
+                donors=int(config.beneficial_donors_per_source),
                 rng=np.random.default_rng(
                     _seed(config, "events", graph_id, channel, source)
                 ),
@@ -1233,6 +1339,13 @@ def _measure_beneficial_graph(
             )
             variants.extend(source_variants)
             events.extend(source_events)
+        if variants:
+            channel_batches.append((channel, variants, events))
+    captures = prepared.backend.capture_groups(
+        [[base, *variants] for _channel, variants, _events in channel_batches]
+    ) if channel_batches else []
+    rows: list[dict[str, Any]] = []
+    for (channel, variants, events), capture in zip(channel_batches, captures):
         rows.extend(
             _beneficial_rows_for_channel(
                 config,
@@ -1243,12 +1356,14 @@ def _measure_beneficial_graph(
                 base=base,
                 variants=variants,
                 events=events,
+                capture=capture,
             )
         )
     return {
         "beneficial_version": BENEFICIAL_CARRIAGE_VERSION,
         "analysis_version": config.profile.analysis_version,
         "fingerprint": config.fingerprint,
+        "cache_fingerprint": config.beneficial_cache_fingerprint,
         "checkpoint_sha256": str(prepared.checkpoint_sha),
         "task": task,
         "graph": int(graph_id),
@@ -1291,7 +1406,25 @@ def _empty_survival_row(
     }
 
 
-def _coalition_survival_row(
+@dataclass(frozen=True)
+class _SurvivalCondition:
+    condition: str
+    radius: int
+    coalition: SemanticCoalition
+    singleton_positions: tuple[int, ...]
+    joint_position: int
+
+
+@dataclass(frozen=True)
+class _SurvivalCaptureGroup:
+    carrier: int
+    draw: int
+    intervention: str
+    variants: tuple[Any, ...]
+    conditions: tuple[_SurvivalCondition, ...]
+
+
+def _coalition_survival_row_from_vectors(
     config: ZincReachConfig,
     *,
     task: str,
@@ -1301,28 +1434,22 @@ def _coalition_survival_row(
     condition: str,
     radius: int,
     coalition: SemanticCoalition,
-    capture: Any,
-    clean_gradient: Any,
+    singleton_vectors: Any,
+    joint_vector: Any,
+    output_singletons: Any,
+    output_joint: Any,
 ) -> dict[str, Any]:
     """Evaluate one coalition at both carrier and graph-output levels."""
 
     event_count = len(coalition.assignments)
-    clean_final = capture.final_state[0]
-    delta = clean_final.unsqueeze(0) - capture.final_state[1:]
-    if int(delta.shape[0]) != event_count + 1:
-        raise RuntimeError("coalition capture lost singleton/joint alignment")
-    projected = _project_final_vector(delta, clean_gradient)
     carrier_result = survival_components(
-        projected[:-1, int(carrier), :].detach().cpu().numpy(),
-        projected[-1, int(carrier), :].detach().cpu().numpy(),
+        singleton_vectors.detach().cpu().numpy(),
+        joint_vector.detach().cpu().numpy(),
         effect_floor=float(config.effect_floor),
     )
-    output_delta = (
-        capture.z[0].reshape(1, -1) - capture.z[1:].reshape(event_count + 1, -1)
-    )
     output_result = survival_components(
-        output_delta[:-1].detach().cpu().numpy(),
-        output_delta[-1].detach().cpu().numpy(),
+        output_singletons.detach().cpu().numpy(),
+        output_joint.detach().cpu().numpy(),
         effect_floor=float(config.effect_floor),
     )
     assignments = [
@@ -1371,7 +1498,82 @@ def _coalition_survival_row(
     return row
 
 
-def _evaluate_survival_batch(
+def _build_survival_capture_group(
+    base: Any,
+    *,
+    carrier: int,
+    draw: int,
+    intervention: str,
+    shell_coalitions: Mapping[int, SemanticCoalition],
+    tail_radii: Sequence[int],
+    task: Any,
+) -> _SurvivalCaptureGroup:
+    """Create one forward group reusing each singleton across every condition."""
+
+    variants: list[Any] = []
+    source_position: dict[int, int] = {}
+    for distance in sorted(shell_coalitions):
+        coalition = shell_coalitions[distance]
+        if len(coalition.assignments) != len(coalition.singleton_variants):
+            raise RuntimeError("shell assignments and singleton variants are misaligned")
+        for assignment, variant in zip(
+            coalition.assignments, coalition.singleton_variants
+        ):
+            if assignment.source in source_position:
+                raise RuntimeError("a source appears in more than one exact shell")
+            source_position[assignment.source] = len(variants)
+            variants.append(variant)
+
+    conditions: list[_SurvivalCondition] = []
+    for distance, coalition in sorted(shell_coalitions.items()):
+        joint_position = len(variants)
+        variants.append(coalition.joint_variant)
+        conditions.append(
+            _SurvivalCondition(
+                condition="exact_shell",
+                radius=int(distance),
+                coalition=coalition,
+                singleton_positions=tuple(
+                    source_position[item.source] for item in coalition.assignments
+                ),
+                joint_position=joint_position,
+            )
+        )
+    for radius in tail_radii:
+        tail = combine_semantic_coalitions(
+            base,
+            [
+                coalition
+                for distance, coalition in sorted(shell_coalitions.items())
+                if int(distance) >= int(radius)
+            ],
+            task=task,
+        )
+        if tail is None:
+            continue
+        joint_position = len(variants)
+        variants.append(tail.joint_variant)
+        conditions.append(
+            _SurvivalCondition(
+                condition="far_tail",
+                radius=int(radius),
+                coalition=tail,
+                singleton_positions=tuple(
+                    source_position[item.source] for item in tail.assignments
+                ),
+                joint_position=joint_position,
+            )
+        )
+    return _SurvivalCaptureGroup(
+        carrier=int(carrier),
+        draw=int(draw),
+        intervention=intervention,
+        variants=tuple(variants),
+        conditions=tuple(conditions),
+    )
+
+
+def _evaluate_survival_groups(
     config: ZincReachConfig,
     prepared: Any,
     *,
@@ -1379,36 +1581,51 @@ def _evaluate_survival_batch(
     graph_id: int,
     base: Any,
     clean_gradient: Any,
-    pending: Sequence[tuple[int, int, str, int, SemanticCoalition]],
+    pending: Sequence[_SurvivalCaptureGroup],
 ) -> list[dict[str, Any]]:
-    """Evaluate a bounded batch of heterogeneous coalition replica groups."""
+    """Evaluate nested intervention groups in one strong PyG batch."""
 
     if not pending:
         return []
-    groups = [
-        [base, *coalition.singleton_variants, coalition.joint_variant]
-        for _carrier, _draw, _condition, _radius, coalition in pending
-    ]
+    groups = [[base, *group.variants] for group in pending]
     captures = prepared.backend.capture_groups(groups)
     if len(captures) != len(pending):
-        raise RuntimeError("batched survival captures lost coalition alignment")
-    return [
-        _coalition_survival_row(
-            config,
-            task=task,
-            graph_id=int(graph_id),
-            carrier=carrier,
-            draw=draw,
-            condition=condition,
-            radius=radius,
-            coalition=coalition,
-            capture=capture,
-            clean_gradient=clean_gradient,
+        raise RuntimeError("batched nested survival captures lost group alignment")
+    rows: list[dict[str, Any]] = []
+    for group, capture in zip(pending, captures):
+        clean_final = capture.final_state[0]
+        delta = clean_final.unsqueeze(0) - capture.final_state[1:]
+        if int(delta.shape[0]) != len(group.variants):
+            raise RuntimeError("nested survival capture lost variant alignment")
+        projected = _project_final_vector(delta, clean_gradient)
+        output_delta = capture.z[0].reshape(1, -1) - capture.z[1:].reshape(
+            len(group.variants), -1
         )
-        for (carrier, draw, condition, radius, coalition), capture in zip(
-            pending, captures
-        )
-    ]
+        for condition in group.conditions:
+            positions = list(condition.singleton_positions)
+            if len(positions) != len(condition.coalition.assignments):
+                raise RuntimeError("nested singleton positions lost coalition alignment")
+            rows.append(
+                _coalition_survival_row_from_vectors(
+                    config,
+                    task=task,
+                    graph_id=int(graph_id),
+                    carrier=group.carrier,
+                    draw=group.draw,
+                    condition=condition.condition,
+                    radius=condition.radius,
+                    coalition=condition.coalition,
+                    singleton_vectors=projected[
+                        positions, int(group.carrier), :
+                    ],
+                    joint_vector=projected[
+                        condition.joint_position, int(group.carrier), :
+                    ],
+                    output_singletons=output_delta[positions],
+                    output_joint=output_delta[condition.joint_position],
+                )
+            )
+    return rows
 
 
 def _measure_survival_graph(
@@ -1433,13 +1650,14 @@ def _measure_survival_graph(
     )
     clean = prepared.backend.clean_jacobians(base)
     rows: list[dict[str, Any]] = []
-    pending: list[tuple[int, int, str, int, SemanticCoalition]] = []
+    pending: list[_SurvivalCaptureGroup] = []
     pending_replicas = 0
+    total_forward_replicas = 0
 
     def flush_pending() -> None:
         nonlocal pending_replicas
         rows.extend(
-            _evaluate_survival_batch(
+            _evaluate_survival_groups(
                 config,
                 prepared,
                 task=task,
@@ -1455,24 +1673,19 @@ def _measure_survival_graph(
     for carrier in carriers:
         finite = distances[carrier][np.isfinite(distances[carrier])]
         maximum = int(finite.max(initial=0))
-        exact_conditions = [
-            ("exact_shell", distance, [
-                np.flatnonzero(distances[carrier] == distance).astype(np.int64).tolist()
-            ])
+        shell_nodes = {
+            distance: np.flatnonzero(distances[carrier] == distance)
+            .astype(np.int64)
+            .tolist()
             for distance in range(1, maximum + 1)
-        ]
-        tail_conditions = []
-        for radius in config.survival_tail_radii:
-            groups = [
-                np.flatnonzero(distances[carrier] == distance).astype(np.int64).tolist()
-                for distance in range(int(radius), maximum + 1)
-            ]
-            tail_conditions.append(("far_tail", int(radius), groups))
-        for condition, radius, shell_groups in (*exact_conditions, *tail_conditions):
-            for draw in range(int(config.survival_draws)):
+        }
+        for draw in range(int(config.survival_draws)):
+            permutation_shells: dict[int, SemanticCoalition] = {}
+            replacement_shells: dict[int, SemanticCoalition] = {}
+            for distance, nodes_at_distance in shell_nodes.items():
                 permutation = build_shell_permutation(
                     base,
-                    shell_groups,
+                    [nodes_at_distance],
                     graph_id=int(graph_id),
                     task=prepared.task,
                     rng=np.random.default_rng(
@@ -1481,8 +1694,8 @@ def _measure_survival_graph(
                             "survival",
                             graph_id,
                             carrier,
-                            condition,
-                            radius,
+                            "exact_shell",
+                            distance,
                             draw,
                         )
                     ),
@@ -1501,9 +1714,9 @@ def _measure_survival_graph(
                                 graph_id=int(graph_id),
                                 carrier=carrier,
                                 draw=draw,
-                                condition=condition,
-                                radius=radius,
-                                shell_sizes=[len(group) for group in shell_groups],
+                                condition="exact_shell",
+                                radius=distance,
+                                shell_sizes=[len(nodes_at_distance)],
                                 reason=(
                                     "no nonzero multiset-preserving shell permutation"
                                     if intervention == "shell_permutation"
@@ -1513,6 +1726,7 @@ def _measure_survival_graph(
                             )
                         )
                     continue
+                permutation_shells[int(distance)] = permutation
                 replacement = build_shell_replacement(
                     base,
                     permutation,
@@ -1524,24 +1738,72 @@ def _measure_survival_graph(
                             "survival_replacement",
                             graph_id,
                             carrier,
-                            condition,
-                            radius,
+                            "exact_shell",
+                            distance,
                             draw,
                         )
                     ),
                     candidates=int(config.survival_replacement_candidates),
                 )
-                pair = (permutation, replacement)
-                pair_replicas = sum(len(coalition.assignments) + 2 for coalition in pair)
+                replacement_shells[int(distance)] = replacement
+
+            for radius in config.survival_tail_radii:
+                if any(distance >= int(radius) for distance in permutation_shells):
+                    continue
+                shell_sizes = [
+                    len(nodes_at_distance)
+                    for distance, nodes_at_distance in shell_nodes.items()
+                    if distance >= int(radius)
+                ]
+                for intervention in ("shell_permutation", "shell_replacement"):
+                    rows.append(
+                        _empty_survival_row(
+                            config,
+                            task=task,
+                            graph_id=int(graph_id),
+                            carrier=carrier,
+                            draw=draw,
+                            condition="far_tail",
+                            radius=int(radius),
+                            shell_sizes=shell_sizes,
+                            reason="no estimable exact shell in this far tail",
+                            intervention=intervention,
+                        )
+                    )
+
+            pair = (
+                _build_survival_capture_group(
+                    base,
+                    carrier=carrier,
+                    draw=draw,
+                    intervention="shell_permutation",
+                    shell_coalitions=permutation_shells,
+                    tail_radii=config.survival_tail_radii,
+                    task=prepared.task,
+                ),
+                _build_survival_capture_group(
+                    base,
+                    carrier=carrier,
+                    draw=draw,
+                    intervention="shell_replacement",
+                    shell_coalitions=replacement_shells,
+                    tail_radii=config.survival_tail_radii,
+                    task=prepared.task,
+                ),
+            )
+            pair = tuple(group for group in pair if group.variants)
+            pair_replicas = sum(len(group.variants) + 1 for group in pair)
+            if pair:
+                total_forward_replicas += pair_replicas
                 if (
                     pending
                     and pending_replicas + pair_replicas
                     > int(config.survival_replica_batch_size)
                 ):
                     flush_pending()
-                for coalition in pair:
-                    pending.append((carrier, draw, condition, radius, coalition))
-                    pending_replicas += len(coalition.assignments) + 2
+                for group in pair:
+                    pending.append(group)
+                    pending_replicas += len(group.variants) + 1
                 if pending_replicas >= int(config.survival_replica_batch_size):
                     flush_pending()
     flush_pending()
@@ -1549,10 +1811,13 @@ def _measure_survival_graph(
         "survival_version": SURVIVAL_VERSION,
         "analysis_version": config.profile.analysis_version,
         "fingerprint": config.fingerprint,
+        "cache_fingerprint": config.survival_cache_fingerprint,
         "checkpoint_sha256": str(prepared.checkpoint_sha),
         "task": task,
         "graph": int(graph_id),
         "survival_rows": rows,
+        "forward_replicas": int(total_forward_replicas),
+        "sampled_carriers": int(len(carriers)),
     }
 
 
@@ -1651,6 +1916,7 @@ def _measure_graph(
     return {
         "analysis_version": config.profile.analysis_version,
         "fingerprint": config.fingerprint,
+        "cache_fingerprint": config.core_cache_fingerprint,
         "checkpoint_sha256": str(prepared.checkpoint_sha),
         "task": task,
         "graph": int(graph_id),
@@ -1691,7 +1957,9 @@ def _load_shard(
     *,
     analysis_version: str,
     fingerprint: str,
+    cache_fingerprint: str,
     checkpoint_sha256: str,
+    compatible_legacy_fingerprints: Sequence[str] = (),
 ) -> dict[str, Any] | None:
     if not path.is_file():
         return None
@@ -1701,9 +1969,16 @@ def _load_shard(
         payload = torch.load(path, map_location="cpu", weights_only=False)
     except Exception:
         return None
+    observed_cache = payload.get("cache_fingerprint")
+    identity_matches = (
+        observed_cache == cache_fingerprint
+        if observed_cache is not None
+        else payload.get("fingerprint")
+        in {fingerprint, *compatible_legacy_fingerprints}
+    )
     if (
         payload.get("analysis_version") != analysis_version
-        or payload.get("fingerprint") != fingerprint
+        or not identity_matches
         or payload.get("checkpoint_sha256") != checkpoint_sha256
         or not {
             "graph_record",
@@ -1730,7 +2005,9 @@ def _load_output_carriage_shard(
     *,
     analysis_version: str,
     fingerprint: str,
+    cache_fingerprint: str,
     checkpoint_sha256: str,
+    compatible_legacy_fingerprints: Sequence[str] = (),
 ) -> dict[str, Any] | None:
     if not path.is_file():
         return None
@@ -1740,10 +2017,17 @@ def _load_output_carriage_shard(
         payload = torch.load(path, map_location="cpu", weights_only=False)
     except Exception:
         return None
+    observed_cache = payload.get("cache_fingerprint")
+    identity_matches = (
+        observed_cache == cache_fingerprint
+        if observed_cache is not None
+        else payload.get("fingerprint")
+        in {fingerprint, *compatible_legacy_fingerprints}
+    )
     if (
         payload.get("output_carriage_version") != OUTPUT_CARRIAGE_VERSION
         or payload.get("analysis_version") != analysis_version
-        or payload.get("fingerprint") != fingerprint
+        or not identity_matches
         or payload.get("checkpoint_sha256") != checkpoint_sha256
         or "output_carriage_rows" not in payload
     ):
@@ -1759,7 +2043,9 @@ def _load_extension_shard(
     rows_key: str,
     analysis_version: str,
     fingerprint: str,
+    cache_fingerprint: str,
     checkpoint_sha256: str,
+    compatible_legacy_fingerprints: Sequence[str] = (),
 ) -> dict[str, Any] | None:
     """Load one independently versioned extension shard."""
 
@@ -1771,10 +2057,17 @@ def _load_extension_shard(
         payload = torch.load(path, map_location="cpu", weights_only=False)
     except Exception:
         return None
+    observed_cache = payload.get("cache_fingerprint")
+    identity_matches = (
+        observed_cache == cache_fingerprint
+        if observed_cache is not None
+        else payload.get("fingerprint")
+        in {fingerprint, *compatible_legacy_fingerprints}
+    )
     if (
         payload.get(version_key) != version
         or payload.get("analysis_version") != analysis_version
-        or payload.get("fingerprint") != fingerprint
+        or not identity_matches
         or payload.get("checkpoint_sha256") != checkpoint_sha256
         or rows_key not in payload
     ):
@@ -1851,6 +2144,7 @@ def measure(
         output_dir=output_dir,
         checkpoints=resolved,
     )
+    compatible_slow_fingerprints = (_legacy_slow_run_fingerprint(config),)
 
     donor_rows: list[dict[str, Any]] = []
     interpolation_rows: list[dict[str, Any]] = []
@@ -1861,6 +2155,7 @@ def measure(
     beneficial_failures: list[dict[str, Any]] = []
     survival_rows: list[dict[str, Any]] = []
     survival_failures: list[dict[str, Any]] = []
+    survival_execution: list[dict[str, Any]] = []
     graph_records: list[dict[str, Any]] = []
     full_test_records: list[dict[str, Any]] = []
     health: list[dict[str, Any]] = []
@@ -1897,15 +2192,31 @@ def measure(
                 path,
                 analysis_version=config.profile.analysis_version,
                 fingerprint=config.fingerprint,
+                cache_fingerprint=config.core_cache_fingerprint,
                 checkpoint_sha256=str(prepared.checkpoint_sha),
+                compatible_legacy_fingerprints=compatible_slow_fingerprints,
             )
             if shard is None:
+                if progress:
+                    print(
+                        f"[reach:core] {TASK_LABELS[task]} graph={int(graph_id)}",
+                        flush=True,
+                    )
                 shard = _measure_graph(
                     config,
                     prepared,
                     task=task,
                     graph_id=int(graph_id),
                 )
+                _save_shard(path, shard)
+            elif "cache_fingerprint" not in shard:
+                if progress:
+                    print(
+                        f"[reach:cache] reusing completed core shard for "
+                        f"{TASK_LABELS[task]} graph={int(graph_id)}",
+                        flush=True,
+                    )
+                shard = {**shard, "cache_fingerprint": config.core_cache_fingerprint}
                 _save_shard(path, shard)
             donor_rows.extend(shard["donor_rows"])
             interpolation_rows.extend(shard["interpolation_rows"])
@@ -1920,10 +2231,18 @@ def measure(
                 output_path,
                 analysis_version=config.profile.analysis_version,
                 fingerprint=config.fingerprint,
+                cache_fingerprint=config.output_cache_fingerprint,
                 checkpoint_sha256=str(prepared.checkpoint_sha),
+                compatible_legacy_fingerprints=compatible_slow_fingerprints,
             )
             if output_shard is None:
                 try:
+                    if progress:
+                        print(
+                            f"[reach:output-path] {TASK_LABELS[task]} "
+                            f"graph={int(graph_id)}",
+                            flush=True,
+                        )
                     output_shard = _measure_output_carriage_graph(
                         config,
                         prepared,
@@ -1950,6 +2269,18 @@ def measure(
                     output_shard = {"output_carriage_rows": []}
                 else:
                     _save_shard(output_path, output_shard)
+            elif "cache_fingerprint" not in output_shard:
+                if progress:
+                    print(
+                        f"[reach:cache] reusing completed output-path shard for "
+                        f"{TASK_LABELS[task]} graph={int(graph_id)}",
+                        flush=True,
+                    )
+                output_shard = {
+                    **output_shard,
+                    "cache_fingerprint": config.output_cache_fingerprint,
+                }
+                _save_shard(output_path, output_shard)
             output_carriage_rows.extend(output_shard["output_carriage_rows"])
             beneficial_path = _beneficial_shard_path(
                 output_dir,
@@ -1963,10 +2294,18 @@ def measure(
                 rows_key="beneficial_rows",
                 analysis_version=config.profile.analysis_version,
                 fingerprint=config.fingerprint,
+                cache_fingerprint=config.beneficial_cache_fingerprint,
                 checkpoint_sha256=str(prepared.checkpoint_sha),
             )
             if beneficial_shard is None:
                 try:
+                    if progress:
+                        print(
+                            f"[reach:beneficial] {TASK_LABELS[task]} "
+                            f"graph={int(graph_id)} | "
+                            f"{int(config.beneficial_donors_per_source)} donor/source",
+                            flush=True,
+                        )
                     beneficial_shard = _measure_beneficial_graph(
                         config,
                         prepared,
@@ -2003,10 +2342,19 @@ def measure(
                 rows_key="survival_rows",
                 analysis_version=config.profile.analysis_version,
                 fingerprint=config.fingerprint,
+                cache_fingerprint=config.survival_cache_fingerprint,
                 checkpoint_sha256=str(prepared.checkpoint_sha),
             )
             if survival_shard is None:
                 try:
+                    if progress:
+                        print(
+                            f"[reach:survival] {TASK_LABELS[task]} "
+                            f"graph={int(graph_id)} | "
+                            f"{int(config.survival_carriers_per_graph)} carrier, "
+                            f"{int(config.survival_draws)} draw; shared singletons",
+                            flush=True,
+                        )
                     survival_shard = _measure_survival_graph(
                         config,
                         prepared,
@@ -2034,6 +2382,21 @@ def measure(
                 else:
                     _save_shard(survival_path, survival_shard)
             survival_rows.extend(survival_shard["survival_rows"])
+            if "forward_replicas" in survival_shard:
+                survival_execution.append(
+                    {
+                        "task": task,
+                        "model_label": TASK_LABELS[task],
+                        "graph": int(graph_id),
+                        "forward_replicas": int(survival_shard["forward_replicas"]),
+                        "sampled_carriers": int(
+                            survival_shard.get(
+                                "sampled_carriers",
+                                config.survival_carriers_per_graph,
+                            )
+                        ),
+                    }
+                )
             completed += 1
             if progress:
                 print(
@@ -2061,6 +2424,7 @@ def measure(
     )
     _write_csv(results_dir / "beneficial_failures.csv", beneficial_failures)
     _write_csv(results_dir / "survival_failures.csv", survival_failures)
+    _write_csv(results_dir / "survival_execution.csv", survival_execution)
     _write_csv(results_dir / "graph_metrics.csv", graph_records)
     _write_csv(results_dir / "model_health.csv", health)
     _write_json(
@@ -2082,6 +2446,15 @@ def measure(
             "beneficial_failures": beneficial_failures,
             "survival_rows": len(survival_rows),
             "survival_failures": survival_failures,
+            "survival_forward_replicas": int(
+                sum(row["forward_replicas"] for row in survival_execution)
+            ),
+            "component_cache_fingerprints": {
+                "core": config.core_cache_fingerprint,
+                "output": config.output_cache_fingerprint,
+                "beneficial": config.beneficial_cache_fingerprint,
+                "survival": config.survival_cache_fingerprint,
+            },
             "graph_metric_rows": len(graph_records),
             "full_test_metric_rows": len(full_test_records),
             "comparison_scope": {
@@ -2162,6 +2535,7 @@ def measure(
         "beneficial_failures": beneficial_failures,
         "survival_rows": survival_rows,
         "survival_failures": survival_failures,
+        "survival_execution": survival_execution,
         "graph_records": graph_records,
         "full_test_records": full_test_records,
         "health": health,
@@ -5144,7 +5518,7 @@ def build_parser(
     )
     parser.add_argument("--tasks", default=",".join(profile.tasks))
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--graphs", type=int, default=128)
+    parser.add_argument("--graphs", type=int, default=64)
     parser.add_argument("--sources-per-graph", type=int, default=6)
     parser.add_argument("--donors-per-source", type=int, default=4)
     parser.add_argument("--semantic-donor-graphs", type=int, default=256)
@@ -5155,16 +5529,17 @@ def build_parser(
         default=",".join(f"{value:g}" for value in DEFAULT_INTERPOLATION_DOSES),
     )
     parser.add_argument("--interpolation-batch-size", type=int, default=64)
-    parser.add_argument("--survival-carriers-per-graph", type=int, default=6)
-    parser.add_argument("--survival-draws", type=int, default=4)
+    parser.add_argument("--survival-carriers-per-graph", type=int, default=1)
+    parser.add_argument("--survival-draws", type=int, default=1)
     parser.add_argument("--survival-tail-radii", default="2,3,4,5")
     parser.add_argument("--survival-replacement-candidates", type=int, default=32)
     parser.add_argument("--survival-exact-limit", type=int, default=12)
     parser.add_argument("--survival-random-attempts", type=int, default=512)
-    parser.add_argument("--survival-replica-batch-size", type=int, default=128)
-    parser.add_argument("--beneficial-atol", type=float, default=1.0e-6)
-    parser.add_argument("--beneficial-rtol", type=float, default=1.0e-5)
-    parser.add_argument("--beneficial-max-intervals", type=int, default=128)
+    parser.add_argument("--survival-replica-batch-size", type=int, default=2_048)
+    parser.add_argument("--beneficial-donors-per-source", type=int, default=1)
+    parser.add_argument("--beneficial-atol", type=float, default=1.0e-5)
+    parser.add_argument("--beneficial-rtol", type=float, default=1.0e-4)
+    parser.add_argument("--beneficial-max-intervals", type=int, default=64)
     parser.add_argument("--effect-floor", type=float, default=1.0e-12)
     parser.add_argument("--bootstrap-replicates", type=int, default=2_000)
     parser.add_argument("--analysis-seed", type=int, default=91_021)
@@ -5208,6 +5583,7 @@ def main(
         survival_exact_limit=int(args.survival_exact_limit),
         survival_random_attempts=int(args.survival_random_attempts),
         survival_replica_batch_size=int(args.survival_replica_batch_size),
+        beneficial_donors_per_source=int(args.beneficial_donors_per_source),
         beneficial_atol=float(args.beneficial_atol),
         beneficial_rtol=float(args.beneficial_rtol),
         beneficial_max_intervals=int(args.beneficial_max_intervals),

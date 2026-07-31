@@ -33,7 +33,7 @@ OUTPUT_DIR = Path(
 )
 TASKS = "zinc_1hop,zinc_1hop_localrrwp,zinc_2hop,zinc_1hop_vnode,zinc"
 SEED = 0
-GRAPHS = 128
+GRAPHS = 64
 SOURCES_PER_GRAPH = 6
 DONORS_PER_SOURCE = 4
 SEMANTIC_DONOR_GRAPHS = 256
@@ -41,16 +41,17 @@ BAMBERGER_OUTPUT_NODES = 6
 BAMBERGER_OUTPUT_CHANNELS = 8
 INTERPOLATION_DOSES = "0.01,0.02,0.05,0.1,0.25,0.5,1.0"
 INTERPOLATION_BATCH_SIZE = 64
-SURVIVAL_CARRIERS_PER_GRAPH = 6
-SURVIVAL_DRAWS = 4
+SURVIVAL_CARRIERS_PER_GRAPH = 1
+SURVIVAL_DRAWS = 1
 SURVIVAL_TAIL_RADII = "2,3,4,5"
 SURVIVAL_REPLACEMENT_CANDIDATES = 32
 SURVIVAL_EXACT_LIMIT = 12
 SURVIVAL_RANDOM_ATTEMPTS = 512
-SURVIVAL_REPLICA_BATCH_SIZE = 128
-BENEFICIAL_ATOL = 1.0e-6
-BENEFICIAL_RTOL = 1.0e-5
-BENEFICIAL_MAX_INTERVALS = 128
+SURVIVAL_REPLICA_BATCH_SIZE = 2_048
+BENEFICIAL_DONORS_PER_SOURCE = 1
+BENEFICIAL_ATOL = 1.0e-5
+BENEFICIAL_RTOL = 1.0e-4
+BENEFICIAL_MAX_INTERVALS = 64
 BOOTSTRAP_REPLICATES = 2_000
 ANALYSIS_SEED = 91_021
 ACCELERATOR = "cuda:0"
@@ -189,7 +190,7 @@ print(
     "identical graphs, donors, carriers and task projections. This separates "
     "finite nonlinear change from the residual Bamberger estimand mismatch.\n"
     "[scope] Scale analysis: MAE uses every test molecule; Functional reach uses "
-    "the 128 carriage graphs. Adjacent values are grouped adaptively by data density, "
+    "the 64 carriage graphs. Adjacent values are grouped adaptively by data density, "
     "and continuous paired-bootstrap slopes avoid dependence on bin boundaries.\n"
     "[scope] Cancellation analysis: signed scalar-output carriage is integrated "
     "along each finite semantic donor path. Apparent mass sums carrier magnitudes; "
@@ -199,10 +200,16 @@ print(
     "[scope] Redundancy: R=J/A compares the actual joint response with apparent "
     "singleton carriage. C/A isolates additive cancellation and (J-C)/A the nonlinear "
     "residual. Exact shells and cumulative far tails are both evaluated.\n"
+    "[scope] Survival sampling: one carrier and one shell draw per held-out graph. "
+    "Every singleton is forwarded once and reused across exact-shell and far-tail "
+    "conditions; permutation and replacement replicas share one A100 batch.\n"
     "[scope] Shell control: within-shell semantic permutations preserve the exact shell "
     "multiset; external degree-law donors change it while matching the source coalition "
     "and intervention dose. Thus permutation tests assignment redundancy, while "
     "replacement tests aggregate content sensitivity.\n"
+    "[scope] Beneficial sampling: one donor per sampled source and channel, with "
+    "canonical path-integration tolerances; semantic and structural endpoints share "
+    "one model forward.\n"
     "[scope] Fairness: checkpoints, graphs, SPD and carrier site are shared; "
     "literal Bamberger remains output-centric and channel-subsampled.\n"
     "[scope] Interpretation: this is an estimand comparison, not a claim that "
@@ -252,6 +259,8 @@ CELL_ARGS = [
     str(SURVIVAL_RANDOM_ATTEMPTS),
     "--survival-replica-batch-size",
     str(SURVIVAL_REPLICA_BATCH_SIZE),
+    "--beneficial-donors-per-source",
+    str(BENEFICIAL_DONORS_PER_SOURCE),
     "--beneficial-atol",
     str(BENEFICIAL_ATOL),
     "--beneficial-rtol",

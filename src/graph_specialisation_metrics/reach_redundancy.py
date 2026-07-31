@@ -335,6 +335,68 @@ def build_shell_replacement(
     )
 
 
+def combine_semantic_coalitions(
+    base: Any,
+    coalitions: Sequence[SemanticCoalition],
+    *,
+    task: Any,
+) -> SemanticCoalition | None:
+    """Compose disjoint exact-shell assignments into one tail intervention.
+
+    Singleton variants are reused verbatim.  Only the joint variant is newly
+    materialised, which is the key computational saving for cumulative tails.
+    """
+
+    selected = tuple(coalition for coalition in coalitions if coalition.assignments)
+    if not selected:
+        return None
+    interventions = {coalition.intervention for coalition in selected}
+    if len(interventions) != 1:
+        raise ValueError("combined coalitions must use one intervention law")
+    assignments = tuple(
+        assignment
+        for coalition in selected
+        for assignment in coalition.assignments
+    )
+    sources = [assignment.source for assignment in assignments]
+    if len(set(sources)) != len(sources):
+        raise ValueError("combined exact shells contain a repeated source")
+    joint = base.clone()
+    for assignment in assignments:
+        joint = semantic_donor_swap(
+            joint,
+            assignment.source,
+            assignment.payload,
+            adapter=task.content_adapter,
+        )
+    weights = np.asarray(
+        [len(coalition.assignments) for coalition in selected], dtype=np.float64
+    )
+    errors = np.asarray(
+        [coalition.matching_error for coalition in selected], dtype=np.float64
+    )
+    return SemanticCoalition(
+        intervention=selected[0].intervention,
+        assignments=assignments,
+        singleton_variants=tuple(
+            variant
+            for coalition in selected
+            for variant in coalition.singleton_variants
+        ),
+        joint_variant=joint,
+        shell_sizes=tuple(
+            size for coalition in selected for size in coalition.shell_sizes
+        ),
+        skipped_shell_sizes=tuple(
+            size
+            for coalition in selected
+            for size in coalition.skipped_shell_sizes
+        ),
+        exact_derangement=all(coalition.exact_derangement for coalition in selected),
+        matching_error=float(np.average(errors, weights=weights)),
+    )
+
+
 def survival_components(
     singleton_vectors: Any,
     joint_vector: Any,

@@ -1,3 +1,5 @@
+import copy
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -26,6 +28,8 @@ from graph_specialisation_metrics.zinc_reach_analysis import (
     summarise_shell_survival,
 )
 from graph_specialisation_metrics.reach_redundancy import (
+    SemanticAssignment,
+    SemanticCoalition,
     minimum_gap_derangement,
     survival_components,
 )
@@ -486,6 +490,117 @@ def test_new_analysis_summaries_bootstrap_at_graph_level():
         and row["radius"] == 1
     )
     assert primary["mean"] == pytest.approx(0.25)
+
+
+def test_sampled_defaults_and_component_cache_fingerprints():
+    config = ZincReachConfig()
+    assert config.graphs == 64
+    assert config.survival_carriers_per_graph == 1
+    assert config.survival_draws == 1
+    assert config.beneficial_donors_per_source == 1
+    changed_runtime_scope = replace(
+        config,
+        graphs=32,
+        survival_replica_batch_size=512,
+    )
+    assert changed_runtime_scope.fingerprint != config.fingerprint
+    assert changed_runtime_scope.core_cache_fingerprint == config.core_cache_fingerprint
+    changed_survival = replace(config, survival_draws=2)
+    assert changed_survival.core_cache_fingerprint == config.core_cache_fingerprint
+    assert changed_survival.survival_cache_fingerprint != config.survival_cache_fingerprint
+
+
+def test_nested_survival_group_reuses_singletons_for_every_tail():
+    class Data:
+        def __init__(self, x):
+            self.x = x
+
+        def clone(self):
+            return copy.deepcopy(self)
+
+    base = Data(torch.tensor([[6], [7]], dtype=torch.long))
+    task = SimpleNamespace(content_adapter=None)
+
+    def coalition(source, payload, intervention):
+        variant = base.clone()
+        variant.x[source] = payload
+        assignment = SemanticAssignment(
+            source=source,
+            donor_graph=9,
+            donor_node=source,
+            source_degree=1,
+            donor_degree=1,
+            dose=1.0,
+            payload=(payload,),
+        )
+        return SemanticCoalition(
+            intervention=intervention,
+            assignments=(assignment,),
+            singleton_variants=(variant,),
+            joint_variant=variant.clone(),
+            shell_sizes=(1,),
+            skipped_shell_sizes=(),
+            exact_derangement=True,
+            matching_error=0.0,
+        )
+
+    first = coalition(0, 8, "shell_replacement")
+    second = coalition(1, 9, "shell_replacement")
+    group = reach._build_survival_capture_group(
+        base,
+        carrier=0,
+        draw=0,
+        intervention="shell_replacement",
+        shell_coalitions={1: first, 2: second},
+        tail_radii=(1, 2, 3),
+        task=task,
+    )
+
+    # Two singletons, two exact joints and two tail joints. Without reuse the
+    # two tails alone would add three more singleton forwards.
+    assert len(group.variants) == 6
+    assert len(group.conditions) == 4
+    exact, exact_two, tail_one, tail_two = group.conditions
+    assert exact.singleton_positions == (0,)
+    assert exact_two.singleton_positions == (1,)
+    assert tail_one.singleton_positions == (0, 1)
+    assert tail_two.singleton_positions == (1,)
+
+
+def test_completed_slow_run_core_shard_is_reused_and_upgradable(tmp_path: Path):
+    config = ZincReachConfig(tasks=("zinc",))
+    legacy = reach._legacy_slow_run_fingerprint(config)
+    path = tmp_path / "graph.pt"
+    torch.save(
+        {
+            "analysis_version": config.profile.analysis_version,
+            "fingerprint": legacy,
+            "checkpoint_sha256": "checkpoint",
+            "graph_record": {},
+            "donor_rows": [],
+            "interpolation_rows": [],
+            "bamberger_rows": [],
+        },
+        path,
+    )
+
+    loaded = reach._load_shard(
+        path,
+        analysis_version=config.profile.analysis_version,
+        fingerprint=config.fingerprint,
+        cache_fingerprint=config.core_cache_fingerprint,
+        checkpoint_sha256="checkpoint",
+        compatible_legacy_fingerprints=(legacy,),
+    )
+    assert loaded is not None
+    rejected = reach._load_shard(
+        path,
+        analysis_version=config.profile.analysis_version,
+        fingerprint=config.fingerprint,
+        cache_fingerprint=config.core_cache_fingerprint,
+        checkpoint_sha256="checkpoint",
+    )
+    assert rejected is None
 
 
 def test_output_coherence_reveals_within_shell_cancellation():
