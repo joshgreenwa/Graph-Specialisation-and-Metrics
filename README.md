@@ -93,3 +93,12 @@ Large datasets and checkpoints should stay out of git unless they are intentiona
 - Implement attention-head and layer-level specialisation metrics.
 - Add structural and symbolic probing tasks beyond ZINC.
 - Add visualisations for comparing model architectures and training stages.
+
+### Dense-ZINC head mediation check
+
+`experiments/zinc/analysis/zinc_head_mediation_colab.py` is a lightweight,
+figures-only comparison of canonical internal head specialisation
+\(S_x(h)\) with symmetric finite head mediation \(M_x(h)\) for semantic and
+structural donor swaps. It reads the completed dense-ZINC score and causal
+caches, loads no model or dataset, and writes two paper-oriented figures plus
+head-level CSV tables to Drive.
