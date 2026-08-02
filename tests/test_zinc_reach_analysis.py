@@ -1,4 +1,5 @@
 import copy
+import json
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -1158,6 +1159,7 @@ def test_lightweight_core_only_figures_do_not_require_extension_caches(
             bootstrap_replicates=40,
         ),
         output_dir=tmp_path,
+        display_max_distance=2,
     )
     assert set(result["figures"]) == {
         "trajectory_decomposition",
@@ -1168,6 +1170,9 @@ def test_lightweight_core_only_figures_do_not_require_extension_caches(
         "semantic_bamberger",
         "expected_distance",
     }
+    with (results / "figure_manifest.json").open(encoding="utf-8") as handle:
+        manifest = json.load(handle)
+    assert manifest["display_max_distance"] == 2
 
 
 def test_qm9_profile_builds_dataset_specific_figures(tmp_path: Path):

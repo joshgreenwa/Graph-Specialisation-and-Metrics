@@ -24,7 +24,7 @@ SECRET_NAME = "dissertation_key"
 
 # ----------------------------- experiment controls -----------------------------
 
-PHASE = "all"  # "all", "measure", or "figures"
+PHASE = "figures"  # Cached rerun; use "all" for a fresh measurement.
 PILOT = True
 # In pilot mode, sample only the required official-split graphs before RRWP is
 # materialised.  The base molecular archive is read once, but the 15,535-graph
@@ -49,6 +49,10 @@ BAMBERGER_OUTPUT_CHANNELS = 2 if PILOT else 8
 INTERPOLATION_DOSES = "0.01,0.1,0.5,1.0" if PILOT else "0.01,0.02,0.05,0.1,0.25,0.5,1.0"
 INTERPOLATION_BATCH_SIZE = 4 if PILOT else 8
 BOOTSTRAP_REPLICATES = 500 if PILOT else 2_000
+# Display-only crop: full-distance tails remain in every CSV, TV, and expected-
+# distance calculation.  Increase this value if the regenerated plots show
+# material mass against the right boundary; use 0 for the complete raw axis.
+DISPLAY_MAX_DISTANCE = 24
 
 # These extensions are not needed for the finite/Jacobian trajectory headline
 # and are expensive on ~150-node Peptides graphs.  They can be enabled later;
@@ -190,6 +194,7 @@ CELL_ARGS = [
     "--beneficial-rtol", str(BENEFICIAL_RTOL),
     "--beneficial-max-intervals", str(BENEFICIAL_MAX_INTERVALS),
     "--bootstrap-replicates", str(BOOTSTRAP_REPLICATES),
+    "--display-max-distance", str(DISPLAY_MAX_DISTANCE),
     "--analysis-seed", str(ANALYSIS_SEED),
     "--accelerator", ACCELERATOR,
     "--num-threads", str(NUM_THREADS),

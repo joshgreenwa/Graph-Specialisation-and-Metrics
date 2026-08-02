@@ -5189,6 +5189,7 @@ def plot_model_profiles(
     figures_dir: Path,
     tasks: Sequence[str] = TASKS,
     reference_task: str = "zinc",
+    display_max_distance: int | None = None,
 ) -> dict[str, str]:
     import matplotlib.pyplot as plt
 
@@ -5300,7 +5301,11 @@ def plot_model_profiles(
         contrast_axis.set_ylim(-contrast_bound, contrast_bound)
     else:
         contrast_axis.set_ylim(-0.01, 0.01)
-    contrast_axis.set_xlim(-0.15, maximum_distance + 0.15)
+    shown_distance = min(
+        maximum_distance,
+        int(display_max_distance) if display_max_distance is not None else maximum_distance,
+    )
+    contrast_axis.set_xlim(-0.15, shown_distance + 0.15)
     contrast_axis.xaxis.set_major_locator(plt.MaxNLocator(integer=True))
     contrast_axis.text(
         0.995,
@@ -5312,6 +5317,17 @@ def plot_model_profiles(
         color="#666666",
         fontsize=8,
     )
+    if shown_distance < maximum_distance:
+        profile_axis.text(
+            0.995,
+            0.96,
+            f"Displayed $d\\leq${shown_distance}; full tail retained in summaries",
+            transform=profile_axis.transAxes,
+            ha="right",
+            va="top",
+            color="#666666",
+            fontsize=7.8,
+        )
     handles, labels = profile_axis.get_legend_handles_labels()
     fig.legend(
         handles,
@@ -5349,6 +5365,7 @@ def plot_semantic_usage_estimands(
     tasks: Sequence[str],
     dataset_label: str,
     figure_prefix: str,
+    display_max_distance: int | None = None,
 ) -> dict[str, str]:
     """Compare shell-summed and shell-size-adjusted semantic usage."""
 
@@ -5522,9 +5539,25 @@ def plot_semantic_usage_estimands(
             if row_index == len(available_tasks) - 1:
                 axis.set_xlabel("Shortest-path distance")
 
+    shown_distance = min(
+        maximum_distance,
+        int(display_max_distance) if display_max_distance is not None else maximum_distance,
+    )
     for axis in axes[-1]:
-        axis.set_xlim(-0.15, maximum_distance + 0.15)
+        axis.set_xlim(-0.15, shown_distance + 0.15)
         axis.xaxis.set_major_locator(plt.MaxNLocator(integer=True))
+
+    if shown_distance < maximum_distance:
+        axes[0, -1].text(
+            0.98,
+            0.82,
+            f"Displayed $d\\leq${shown_distance}\nfull tail retained",
+            transform=axes[0, -1].transAxes,
+            ha="right",
+            va="top",
+            color="#666666",
+            fontsize=7.5,
+        )
 
     legend_handles = [
         Line2D(
@@ -5787,6 +5820,7 @@ def plot_profile_trajectory_distance_components(
     tasks: Sequence[str],
     dataset_label: str,
     figure_prefix: str,
+    display_max_distance: int | None = None,
 ) -> dict[str, str]:
     """Show where finite drift reinforces or offsets local-reference mismatch."""
 
@@ -5882,10 +5916,25 @@ def plot_profile_trajectory_distance_components(
             fontsize=8.5,
         )
     bound = max(absolute_bound * 1.12, 0.01)
+    shown_distance = min(
+        maximum_distance,
+        int(display_max_distance) if display_max_distance is not None else maximum_distance,
+    )
     for axis in axes[:, 0]:
         axis.set_ylim(-bound, bound)
-        axis.set_xlim(-0.15, maximum_distance + 0.15)
+        axis.set_xlim(-0.15, shown_distance + 0.15)
         axis.xaxis.set_major_locator(plt.MaxNLocator(integer=True))
+    if shown_distance < maximum_distance:
+        axes[0, 0].text(
+            0.995,
+            0.94,
+            f"Displayed $d\\leq${shown_distance}; full tail retained",
+            transform=axes[0, 0].transAxes,
+            ha="right",
+            va="top",
+            color="#666666",
+            fontsize=7.8,
+        )
     axes[-1, 0].set_xlabel("Shortest-path distance")
 
     handles = [
@@ -6641,6 +6690,7 @@ def figures(
     *,
     output_dir: Path,
     print_audit: bool = True,
+    display_max_distance: int | None = None,
 ) -> dict[str, Any]:
     """Build every table and paper figure from cached CSV files only."""
 
@@ -6883,6 +6933,7 @@ def figures(
                 tasks=config.tasks,
                 dataset_label=config.profile.name,
                 figure_prefix=config.profile.figure_prefix,
+                display_max_distance=display_max_distance,
             )
         ),
         "semantic_estimand_comparison": plot_semantic_usage_estimands(
@@ -6892,6 +6943,7 @@ def figures(
             tasks=config.tasks,
             dataset_label=config.profile.name,
             figure_prefix=config.profile.figure_prefix,
+            display_max_distance=display_max_distance,
         ),
         "interpolation_sweep": plot_interpolation_sweep(
             interpolation_summary,
@@ -6909,6 +6961,7 @@ def figures(
             figures_dir=figures_dir,
             tasks=config.tasks,
             reference_task=config.profile.reference_task,
+            display_max_distance=display_max_distance,
         ),
         "semantic_bamberger": plot_model_profiles(
             profile_rows,
@@ -6920,6 +6973,7 @@ def figures(
             figures_dir=figures_dir,
             tasks=config.tasks,
             reference_task=config.profile.reference_task,
+            display_max_distance=display_max_distance,
         ),
         "expected_distance": plot_expected_distance(
             expected_rows,
@@ -6941,6 +6995,7 @@ def figures(
             figures_dir=figures_dir,
             tasks=config.tasks,
             reference_task=config.profile.reference_task,
+            display_max_distance=display_max_distance,
         )
     if config.compute_output_carriage:
         paths["output_coherence"] = plot_output_coherence(
@@ -6998,6 +7053,7 @@ def figures(
         {
             "analysis_version": config.profile.analysis_version,
             "fingerprint": config.fingerprint,
+            "display_max_distance": display_max_distance,
             "figures": paths,
             "uncertainty": (
                 "95% percentile bootstrap over held-out graphs; one trained "
@@ -7118,6 +7174,12 @@ def build_parser(
         action=argparse.BooleanOptionalAction,
         default=False,
     )
+    parser.add_argument(
+        "--display-max-distance",
+        type=int,
+        default=0,
+        help="Plot distances up to this value; 0 retains the complete axis.",
+    )
     parser.add_argument("--skip-dependency-install", action="store_true")
     parser.add_argument("--quiet", action="store_true")
     return parser
@@ -7183,6 +7245,11 @@ def main(
             **asdict(config),
             "fingerprint": config.fingerprint,
             "repository_commit": _repository_commit(),
+            "figure_display_max_distance": (
+                int(args.display_max_distance)
+                if int(args.display_max_distance) > 0
+                else None
+            ),
         },
     )
     result: dict[str, Any] = {"config": config, "output_dir": str(output_dir)}
@@ -7200,6 +7267,11 @@ def main(
                     config,
                     output_dir=output_dir,
                     print_audit=args.phase == "figures",
+                    display_max_distance=(
+                        int(args.display_max_distance)
+                        if int(args.display_max_distance) > 0
+                        else None
+                    ),
                 )
             )
         except Exception as error:
