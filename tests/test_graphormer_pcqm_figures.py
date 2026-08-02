@@ -43,11 +43,13 @@ from graph_specialisation_metrics.methodology.graphormer_figure_data import (
     select_structural_specialist_head,
 )
 from graph_specialisation_metrics.methodology.graphormer_figure_plots import (
+    ATTENTION_FAMILY_CMAP_NAMES,
     MOLECULE_RENDER_DPI,
     MOLECULE_ATOM_FONT_SIZE,
     PCA_FOCUS_COLORS,
     PUBLICATION_PDF_RASTER_DPI,
     PUBLICATION_PNG_DPI,
+    attention_cmap_name,
     plot_attention_grid,
     plot_av_pca,
     plot_coordinate_heatmaps,
@@ -248,6 +250,9 @@ def test_graphormer_figure_notebook_routes_every_grid_through_live_config():
     )
 
     assert "ATTENTION_GRID_NUM_ROWS = 4" in source
+    assert "ATTENTION_FAMILY_CMAP_NAMES" in source
+    assert '"attention_colormap": attention_cmap_name(role)' in source
+    assert '"attention_family_colormaps": dict(ATTENTION_FAMILY_CMAP_NAMES)' in source
     assert "PNG_DPI = 600" in source
     assert "PDF_RASTER_DPI = 1200" in source
     assert "pdf_dpi=PDF_RASTER_DPI" in source
@@ -1018,7 +1023,7 @@ def test_attention_grid_supports_five_rows_without_arrows():
             if axis.get_xlabel() == "Attention weight"
         )
         assert weighted_axis.images
-        assert matrix_axis.images[0].get_cmap().name == "Blues"
+        assert matrix_axis.images[0].get_cmap().name == "Oranges"
         assert np.allclose(figure.get_size_inches(), (15.5, 20.15))
         assert weighted_axis.title.get_fontsize() == 25
         assert matrix_axis.title.get_fontsize() == 25
@@ -1078,6 +1083,21 @@ def test_attention_grid_supports_five_rows_without_arrows():
         assert all(text.get_color() == "black" for text in graph_labels)
     finally:
         plt.close(figure)
+
+
+def test_attention_family_colormaps_cover_graphormer_role_names():
+    assert ATTENTION_FAMILY_CMAP_NAMES == {
+        "semantic": "Oranges",
+        "structural": "Blues",
+        "generalist": "Purples",
+    }
+    assert attention_cmap_name("semantic") == "Oranges"
+    assert attention_cmap_name("top_semantic_3") == "Oranges"
+    assert attention_cmap_name("structural") == "Blues"
+    assert attention_cmap_name("structural_non_h14") == "Blues"
+    assert attention_cmap_name("generalist_2") == "Purples"
+    assert attention_cmap_name("top_joint_3") == "Purples"
+    assert attention_cmap_name("unregistered") == "Blues"
 
 
 def test_attention_grid_renders_exactly_four_configured_rows_in_order():

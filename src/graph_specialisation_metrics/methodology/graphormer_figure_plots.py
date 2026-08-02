@@ -31,6 +31,11 @@ MOLECULE_RENDER_DPI = 600
 MOLECULE_ATOM_FONT_SIZE = 55
 
 ATTENTION_CMAP = plt.get_cmap("Blues")
+ATTENTION_FAMILY_CMAP_NAMES = {
+    "semantic": "Oranges",
+    "structural": "Blues",
+    "generalist": "Purples",
+}
 SELECTIVITY_CMAP = plt.get_cmap("coolwarm")
 HEAD_STYLES = {
     "semantic": {"color": GOLD, "label": "Semantic specialist"},
@@ -62,6 +67,29 @@ PCA_FOCUS_COLORS = {
     "other/diffuse": "#B8C2CA",
     "Other / rare": "#4B5563",
 }
+
+
+def attention_cmap_name(role: str) -> str:
+    """Return the stable attention colour map for a displayed head family."""
+
+    normalised_role = str(role).strip().lower()
+    if normalised_role == "semantic" or normalised_role.startswith(
+        ("semantic_", "top_semantic_")
+    ):
+        return ATTENTION_FAMILY_CMAP_NAMES["semantic"]
+    if normalised_role == "structural" or normalised_role.startswith(
+        "structural_"
+    ):
+        return ATTENTION_FAMILY_CMAP_NAMES["structural"]
+    if normalised_role == "generalist" or normalised_role.startswith(
+        ("generalist_", "top_joint_")
+    ):
+        return ATTENTION_FAMILY_CMAP_NAMES["generalist"]
+    return ATTENTION_CMAP.name
+
+
+def _attention_cmap(role: str):
+    return plt.get_cmap(attention_cmap_name(role))
 
 
 def apply_publication_style() -> None:
@@ -463,6 +491,7 @@ def _draw_molecule_attention(
     *,
     inbound: np.ndarray,
     vmax: float,
+    cmap=None,
     figsize: tuple[float, float] = (4.2, 3.7),
     dpi: int = MOLECULE_RENDER_DPI,
 ):
@@ -478,12 +507,13 @@ def _draw_molecule_attention(
             f"RDKit has {molecule.GetNumAtoms()} atoms but attention has {len(inbound)}"
         )
     norm = Normalize(vmin=0.0, vmax=max(float(vmax), 1e-12), clip=True)
+    cmap = ATTENTION_CMAP if cmap is None else cmap
     highlight_atoms = list(range(molecule.GetNumAtoms()))
     highlight_colors = {}
     highlight_radii = {}
     for atom, value in enumerate(inbound):
         scaled = float(norm(value))
-        rgba = ATTENTION_CMAP(0.18 + 0.72 * scaled)
+        rgba = cmap(0.18 + 0.72 * scaled)
         highlight_colors[atom] = tuple(float(channel) for channel in rgba[:3])
         highlight_radii[atom] = 0.20 + 0.30 * np.sqrt(scaled)
 
@@ -522,6 +552,7 @@ def plot_attention_grid(
     """Attention views with net head and graph-local ``D_rel``/``J``."""
 
     apply_publication_style()
+    attention_cmap = _attention_cmap(role)
     examples = list(examples_payload["examples"])
     if not examples:
         raise ValueError("the attention grid requires at least one example")
@@ -598,12 +629,13 @@ def plot_attention_grid(
                 example["smiles"],
                 inbound=inbound[row],
                 vmax=inbound_max,
+                cmap=attention_cmap,
             )
         )
         axes[row, 1].axis("off")
         image = axes[row, 2].imshow(
             matrix,
-            cmap=ATTENTION_CMAP,
+            cmap=attention_cmap,
             vmin=0,
             vmax=matrix_max,
             interpolation="nearest",
@@ -1427,11 +1459,13 @@ def save_figure_bundle(
 
 
 __all__ = [
+    "ATTENTION_FAMILY_CMAP_NAMES",
     "MOLECULE_ATOM_FONT_SIZE",
     "MOLECULE_RENDER_DPI",
     "PUBLICATION_PDF_RASTER_DPI",
     "PUBLICATION_PNG_DPI",
     "apply_publication_style",
+    "attention_cmap_name",
     "automatic_selectivity_limits",
     "plot_attention_grid",
     "plot_av_pca",

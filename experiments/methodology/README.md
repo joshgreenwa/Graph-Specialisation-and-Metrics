@@ -32,4 +32,8 @@ After a completed `graphormer_pcqm4mv2:seed0` score run, open
 to produce the focused PCQM figure suite. It validates and reads the canonical score cache
 without recomputing the methodology, selects the structural specialist from active-head
 `D_rel`, reuses the cached clean attention-distance profile, and separately contract-caches
-only selected-head attention, pooled `A@V`, and dot/bias logit diagnostics.
+only selected-head attention, pooled `A@V`, and dot/bias logit diagnostics. Attention figures use
+the same stable family palette as the ZINC/QM9 suite: orange for semantic specialists, blue for
+structural specialists, and purple for high-$J$ generalists. The palette is applied consistently to
+the attention-weighted molecule, node-conditioned matrix, and colour bar, and remains a render-only
+choice that does not invalidate cached attention tensors.
