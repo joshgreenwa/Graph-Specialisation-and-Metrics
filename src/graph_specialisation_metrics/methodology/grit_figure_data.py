@@ -825,13 +825,15 @@ def methodology_config_for_artifact(
     protocol_paths: Sequence[str | Path],
     *,
     accelerator: str | None = None,
-) -> tuple[MethodologyConfig, Path]:
+) -> tuple[MethodologyConfig, Path, str]:
     """Load the protocol record scientifically bound to a score artifact.
 
     Task/seed protocol records are immutable run inputs, whereas a shared root
     record may later be rewritten by finalisation or another canonical run.
-    Candidate order is therefore significant, but a candidate is accepted only
-    when its reconstructed scientific fingerprint exactly matches the cache.
+    Candidate order is therefore significant. A current record is accepted when
+    its reconstructed fingerprint matches; a legacy record is accepted when its
+    stored fingerprint matches, because later protocol-schema additions can
+    change reconstruction without changing the recorded run configuration.
     """
 
     contract = artifact.metadata.get("contract", {})
@@ -850,8 +852,9 @@ def methodology_config_for_artifact(
             checked.append(f"{path} (missing)")
             continue
         try:
+            record = json.loads(path.read_text(encoding="utf-8"))
             config = methodology_config_from_record(
-                path,
+                record,
                 accelerator=accelerator,
             )
         except (
@@ -863,9 +866,23 @@ def methodology_config_for_artifact(
         ) as error:
             checked.append(f"{path} (invalid: {error})")
             continue
-        if config.fingerprint == expected:
-            return config, path
-        checked.append(f"{path} (fingerprint {config.fingerprint})")
+        task_name = str(contract.get("task", ""))
+        train_seed = int(contract.get("train_seed", -1))
+        if (
+            record.get("protocol_version") != artifact.metadata.get("protocol_version")
+            or task_name not in config.tasks
+            or train_seed not in config.seeds_for(task_name)
+        ):
+            checked.append(f"{path} (task, seed, or protocol version mismatch)")
+            continue
+        recorded = str(record.get("fingerprint", ""))
+        reconstructed = config.fingerprint
+        if expected in {recorded, reconstructed}:
+            return config, path, expected
+        checked.append(
+            f"{path} (recorded fingerprint {recorded or 'missing'}; "
+            f"reconstructed fingerprint {reconstructed})"
+        )
 
     details = "; ".join(checked) if checked else "no candidates supplied"
     raise ValueError(
@@ -941,6 +958,7 @@ def build_verified_grit_figure_runtime(
     artifact: ReadOnlyCacheArtifact,
     model_record: Mapping[str, Any],
     protocol_config: MethodologyConfig,
+    protocol_record_fingerprint: str,
     *,
     runtime_output_dir: str | Path,
 ) -> GritFigureRuntime:
@@ -952,7 +970,7 @@ def build_verified_grit_figure_runtime(
 
     contract = artifact.metadata["contract"]
     task_name = str(contract["task"])
-    if contract.get("protocol_fingerprint") != protocol_config.fingerprint:
+    if contract.get("protocol_fingerprint") != str(protocol_record_fingerprint):
         raise ValueError(
             "protocol.json does not describe the scientific configuration bound "
             "to the canonical score cache"

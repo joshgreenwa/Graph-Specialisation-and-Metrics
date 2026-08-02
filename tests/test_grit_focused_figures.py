@@ -600,18 +600,54 @@ def test_task_protocol_is_selected_when_shared_root_protocol_has_drifted(
     task_path.write_text(json.dumps(bound.record()), encoding="utf-8")
     artifact = SimpleNamespace(
         metadata={
-            "contract": {"protocol_fingerprint": bound.fingerprint},
+            "protocol_version": PROTOCOL_VERSION,
+            "contract": {
+                "protocol_fingerprint": bound.fingerprint,
+                "task": "zinc",
+                "train_seed": 42,
+            },
         }
     )
 
-    restored, selected_path = methodology_config_for_artifact(
+    restored, selected_path, matched_fingerprint = methodology_config_for_artifact(
         artifact,
         (task_path, root_path),
         accelerator="cpu",
     )
 
     assert selected_path == task_path.resolve()
+    assert matched_fingerprint == bound.fingerprint
     assert restored.fingerprint == bound.fingerprint
+    assert restored.accelerator == "cpu"
+
+
+def test_legacy_stored_protocol_fingerprint_remains_a_valid_binding(
+    tmp_path: Path,
+):
+    config = MethodologyConfig(output_dir=str(tmp_path / "canonical"))
+    legacy_fingerprint = "legacy-bound-fingerprint"
+    record = config.record()
+    record["fingerprint"] = legacy_fingerprint
+    path = tmp_path / "protocol.json"
+    path.write_text(json.dumps(record), encoding="utf-8")
+    artifact = SimpleNamespace(
+        metadata={
+            "protocol_version": PROTOCOL_VERSION,
+            "contract": {
+                "protocol_fingerprint": legacy_fingerprint,
+                "task": "zinc",
+                "train_seed": 42,
+            },
+        }
+    )
+
+    restored, selected_path, matched_fingerprint = (
+        methodology_config_for_artifact(artifact, (path,), accelerator="cpu")
+    )
+
+    assert selected_path == path.resolve()
+    assert matched_fingerprint == legacy_fingerprint
+    assert restored.fingerprint != legacy_fingerprint
     assert restored.accelerator == "cpu"
 
 
@@ -623,7 +659,12 @@ def test_bound_protocol_loader_reports_every_mismatched_candidate(
     root_path.write_text(json.dumps(config.record()), encoding="utf-8")
     artifact = SimpleNamespace(
         metadata={
-            "contract": {"protocol_fingerprint": "expected-fingerprint"},
+            "protocol_version": PROTOCOL_VERSION,
+            "contract": {
+                "protocol_fingerprint": "expected-fingerprint",
+                "task": "zinc",
+                "train_seed": 42,
+            },
         }
     )
 
@@ -1476,16 +1517,21 @@ def test_colab_notebook_has_valid_python_cells():
         '(task_root / "protocol.json", CANONICAL_ROOT / "protocol.json")'
         in source
     )
-    assert '"protocol_config": protocol_config' in source
-    assert '"canonical_protocol_record": str(protocol_path)' in source
+    assert '"protocol_paths": protocol_paths' in source
+    assert '"canonical_protocol_candidates"' in source
     assert "protocol_config = methodology_config_from_record(" not in source
     assert "def get_figure_runtime()" in source
     assert "if figure_runtime is None" in source
     assert "structural_count=HEADS_PER_FAMILY + 1" in source
     assert 'all_roles = dict(context["display_heads"])' in source
     assert "clean_attention_mass_vs_SPD" in source
+    initialization_source = "".join(payload["cells"][4]["source"])
+    assert "methodology_config_for_artifact(" not in initialization_source
     runtime_source = "".join(payload["cells"][6]["source"])
-    assert 'context["protocol_config"]' in runtime_source
+    assert "methodology_config_for_artifact(" in runtime_source
+    assert 'context["protocol_paths"]' in runtime_source
+    assert "protocol_fingerprint," in runtime_source
+    assert 'context["common_provenance"]["canonical_protocol_record"]' in runtime_source
     assert "ATTENTION_GRID_GRAPH_INDICES[task_name][family]" in runtime_source
     assert "family_cache_graph_indices" in runtime_source
     assert "family_display_graph_indices" in runtime_source
