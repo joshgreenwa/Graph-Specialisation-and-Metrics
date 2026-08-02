@@ -301,6 +301,29 @@ def test_graphormer_backend_hooks_patch_and_graph_token_replay():
     assert torch.allclose(prediction, captured.prediction[0:1], atol=1e-6, rtol=0.0)
     assert torch.allclose(z, captured.z[0:1], atol=1e-6, rtol=0.0)
 
+    variant = data.clone()
+    variant.x[0, 0] += 1
+    pair = backend.capture([data, variant], require_grad=False)
+    donor_one = backend.replacement_batch(pair, [1])
+    expected = []
+    for head in (0, 1):
+        _, patched_z, _ = backend.patch(data, donor_one, ((0, head),))
+        expected.append(patched_z[0])
+    donor_two = backend.replacement_batch(pair, [1, 1])
+    _, masked_z, _ = backend.patch_masked_many(
+        [data, data],
+        donor_two,
+        [
+            {
+                "family": ((0, head),),
+                "nodes": tuple(range(data.num_nodes)),
+                "special_carriers": ("graph_token",),
+            }
+            for head in (0, 1)
+        ],
+    )
+    assert torch.allclose(masked_z, torch.stack(expected), atol=1e-6, rtol=0.0)
+
     weights = backend.carriage_weights(data, captured.final_state[0])
     assert weights.tolist() == [1.0, 0.0, 0.0, 0.0]
     replay = backend.loss_from_pooled(captured.target[0:1])

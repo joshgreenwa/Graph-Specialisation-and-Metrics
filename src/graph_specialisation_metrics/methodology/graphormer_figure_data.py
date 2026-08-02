@@ -687,6 +687,32 @@ class SupplementalCache:
         )
         return self.root / f"{name}-{fingerprint[:16]}.pt"
 
+    def load(
+        self, name: str, contract: Mapping[str, Any]
+    ) -> tuple[Any, Path] | None:
+        """Read a matching supplemental result without invoking model code."""
+
+        path = self.path_for(name, contract)
+        if not path.is_file():
+            return None
+        import torch
+
+        try:
+            payload = torch.load(path, map_location="cpu", weights_only=False)
+        except (OSError, RuntimeError, EOFError) as error:
+            print(
+                f"[supplemental-cache:warning] unreadable {path}; "
+                f"treating it as a cache miss ({type(error).__name__}: {error})"
+            )
+            return None
+        if not isinstance(payload, Mapping):
+            return None
+        if payload.get("schema_version") != self.SCHEMA_VERSION:
+            return None
+        if payload.get("contract_fingerprint") != stable_hash(dict(contract)):
+            return None
+        return payload["value"], path
+
     def load_or_compute(
         self,
         name: str,
@@ -698,17 +724,10 @@ class SupplementalCache:
         """Return ``(value, path, cache_hit)`` for an additive diagnostic."""
 
         path = self.path_for(name, contract)
-        if path.exists() and not force:
-            import torch
-
-            payload = torch.load(path, map_location="cpu", weights_only=False)
-            if (
-                isinstance(payload, Mapping)
-                and payload.get("schema_version") == self.SCHEMA_VERSION
-                and payload.get("contract_fingerprint")
-                == stable_hash(dict(contract))
-            ):
-                return payload["value"], path, True
+        if not force:
+            cached = self.load(name, contract)
+            if cached is not None:
+                return cached[0], cached[1], True
 
         value = compute()
         payload = {
@@ -745,6 +764,14 @@ class GraphormerFigureRuntime:
     backend: GraphormerBackend
     checkpoint_descriptor: str
     checkpoint_sha256: str
+
+
+@dataclass(frozen=True)
+class GraphormerCausalRuntime:
+    """Verified official runtime plus the canonical event-replay context."""
+
+    prepared: PreparedTask
+    protocol_config: MethodologyConfig
 
 
 def build_verified_figure_runtime(
@@ -795,6 +822,95 @@ def build_verified_figure_runtime(
             f"canonical {expected_geometry}"
         )
     return GraphormerFigureRuntime(runtime, backend, descriptor, digest)
+
+
+def build_verified_causal_runtime(
+    artifact: ReadOnlyCacheArtifact,
+    model_record: Mapping[str, Any],
+    *,
+    dataset_root: str,
+    output_dir: str | Path,
+    sources_per_graph: int,
+    donors_per_source: int,
+    accelerator: str = "cuda:0",
+    cache_dir: str | None = None,
+    local_files_only: bool = False,
+) -> GraphormerCausalRuntime:
+    """Rebuild the score-bound PCQM runtime for held-out causal event replay.
+
+    The score artifact supplies the checkpoint, adapter, geometry, scale, and
+    sampling budget. ``model.json`` supplies the immutable split manifest and its
+    analysis seed. Only the requested causal source/donor caps may be smaller.
+    """
+
+    figure_runtime = build_verified_figure_runtime(
+        artifact,
+        dataset_root=str(dataset_root),
+        accelerator=str(accelerator),
+        cache_dir=cache_dir,
+        local_files_only=bool(local_files_only),
+    )
+    contract = artifact.metadata["contract"]
+    splits = _split_manifest_from_record(model_record)
+    if splits.fingerprint != contract["split_fingerprint"]:
+        raise StaleCacheError(
+            "canonical Graphormer model record and score cache use different splits"
+        )
+    requested_sources = int(sources_per_graph)
+    requested_donors = int(donors_per_source)
+    if requested_sources > int(contract["source_cap"]):
+        raise ValueError(
+            "causal spatial support cannot exceed the score-bound source cap: "
+            f"{requested_sources} > {contract['source_cap']}"
+        )
+    if requested_donors > int(contract["donors_per_source"]):
+        raise ValueError(
+            "causal spatial support cannot exceed the score-bound donor cap: "
+            f"{requested_donors} > {contract['donors_per_source']}"
+        )
+
+    task = get_task("graphormer_pcqm4mv2")
+    runtime = figure_runtime.runtime
+    donor_pool = SemanticDonorPool(
+        [
+            (graph_id, runtime.donor_ds[graph_id])
+            for graph_id in splits.semantic_donor_pool
+        ],
+        adapter=task.content_adapter,
+    )
+    sizes = RunSizes(
+        discovery_graphs=max(1, len(splits.discovery)),
+        causal_graphs=max(1, len(splits.causal)),
+        clean_ablation_graphs=max(1, len(splits.clean_ablation)),
+        semantic_donor_graphs=max(1, len(splits.semantic_donor_pool)),
+        sources_per_graph=requested_sources,
+        donors_per_source=requested_donors,
+    )
+    protocol_config = MethodologyConfig(
+        output_dir=str(output_dir),
+        tasks=(task.name,),
+        train_seeds=(int(contract["train_seed"]),),
+        phases=("causal",),
+        sizes=sizes,
+        execution=ExecutionPolicy(graphs_per_batch=1),
+        analysis_seed=int(splits.seed),
+        accelerator=str(accelerator),
+        resume=False,
+        force=False,
+    )
+    prepared = PreparedTask(
+        task=task,
+        runtime=runtime,
+        backend=figure_runtime.backend,
+        output_dir=Path(output_dir),
+        checkpoint=Path("official-graphormer-pcqm4mv2"),
+        checkpoint_sha=str(contract["checkpoint_sha256"]),
+        sigma=np.asarray(contract["sigma"], dtype=np.float64),
+        splits=splits,
+        donor_pool=donor_pool,
+        progress=None,
+    )
+    return GraphormerCausalRuntime(prepared, protocol_config)
 
 
 class _GlobalIndexPCQMDataset:
@@ -1527,6 +1643,7 @@ def aggregate_logit_spread(
 
 __all__ = [
     "CanonicalHeadMetrics",
+    "GraphormerCausalRuntime",
     "GraphormerDiagnosticCapture",
     "GraphormerDiagnosticExtractor",
     "GraphormerFigureRuntime",
@@ -1535,6 +1652,7 @@ __all__ = [
     "SELECTED_HEAD_TRANSPORT_PROFILE_VERSION",
     "SupplementalCache",
     "aggregate_logit_spread",
+    "build_verified_causal_runtime",
     "build_verified_figure_runtime",
     "collect_attention_examples",
     "compute_av_pca_inputs",

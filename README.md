@@ -15,6 +15,10 @@ exposed through `graph_specialisation_metrics.main()`. The Drive-backed producti
 [`experiments/methodology/canonical_methodology_colab.py`](experiments/methodology/canonical_methodology_colab.py).
 The read-only, PCQM4Mv2-specific reporting notebook is
 [`experiments/methodology/graphormer_pcqm4mv2_figures_colab.ipynb`](experiments/methodology/graphormer_pcqm4mv2_figures_colab.ipynb).
+The separate Drive-resumable PCQM4Mv2 causal spatial-support frontend is
+[`experiments/methodology/graphormer_pcqm4mv2_causal_spatial_support_colab.py`](experiments/methodology/graphormer_pcqm4mv2_causal_spatial_support_colab.py),
+with its estimands documented in
+[`experiments/methodology/causal_spatial_support.md`](experiments/methodology/causal_spatial_support.md).
 Module-level READMEs document implementations and historical refinement experiments; where their
 older alternatives differ, the canonical methodology takes precedence.
 

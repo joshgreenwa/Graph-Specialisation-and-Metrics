@@ -37,3 +37,10 @@ the same stable family palette as the ZINC/QM9 suite: orange for semantic specia
 structural specialists, and purple for high-$J$ generalists. The palette is applied consistently to
 the attention-weighted molecule, node-conditioned matrix, and colour bar, and remains a render-only
 choice that does not invalidate cached attention tensors.
+
+To measure where those frozen PCQM head families realise output-relevant computation, run
+[`graphormer_pcqm4mv2_causal_spatial_support_colab.py`](graphormer_pcqm4mv2_causal_spatial_support_colab.py).
+It reuses the immutable score cache for family selection and internal response, then caches only
+the new held-out source-conditioned attention and symmetric shell-patching measurements. The
+graph token remains an explicit non-SPD carrier. Successful graph/channel shards resume
+independently, and `PHASE = "figures"` redraws without loading the model or dataset.

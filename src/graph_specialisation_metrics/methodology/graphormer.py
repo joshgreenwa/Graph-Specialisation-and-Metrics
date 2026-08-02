@@ -465,10 +465,14 @@ class _TransportHooks:
         *,
         ablate: Mapping[int, Sequence[int]] | None = None,
         replacements: Sequence[Any] | None = None,
+        masked_conditions: Sequence[Mapping[str, Any]] | None = None,
     ):
         self.model = model
         self.ablate = {int(key): tuple(int(value) for value in values) for key, values in (ablate or {}).items()}
         self.replacements = replacements
+        self.masked_conditions = (
+            tuple(masked_conditions) if masked_conditions is not None else None
+        )
         self.values: list[Any | None] = [None] * len(model.encoder.graph_encoder.layers)
         self.handles = []
 
@@ -484,7 +488,7 @@ class _TransportHooks:
             if selected:
                 changed = changed.clone()
                 changed[:, :, list(selected), :] = 0.0
-            if self.replacements is not None and selected:
+            if self.replacements is not None:
                 donor = self.replacements[layer_index].to(
                     device=changed.device, dtype=changed.dtype
                 )
@@ -493,9 +497,48 @@ class _TransportHooks:
                         f"Graphormer patch geometry differs at layer {layer_index}: "
                         f"{tuple(donor.shape)} vs {tuple(changed.shape)}"
                     )
-                if changed is routed:
+                if self.masked_conditions is not None:
+                    if len(self.masked_conditions) != int(batch):
+                        raise RuntimeError(
+                            "Graphormer masked patch condition count differs from "
+                            f"batch size: {len(self.masked_conditions)} vs {batch}"
+                        )
                     changed = changed.clone()
-                changed[:, :, list(selected), :] = donor[:, :, list(selected), :]
+                    for replica, condition in enumerate(self.masked_conditions):
+                        layer_heads = tuple(
+                            int(head)
+                            for layer, head in condition.get("family", ())
+                            if int(layer) == int(layer_index)
+                        )
+                        if not layer_heads:
+                            continue
+                        carrier_tokens = [
+                            int(node) + 1 for node in condition.get("nodes", ())
+                        ]
+                        special = tuple(condition.get("special_carriers", ()))
+                        unknown = [label for label in special if label != "graph_token"]
+                        if unknown:
+                            raise ValueError(
+                                f"unknown Graphormer special carriers: {unknown}"
+                            )
+                        if "graph_token" in special:
+                            carrier_tokens.insert(0, 0)
+                        if any(
+                            token < 0 or token >= int(tokens)
+                            for token in carrier_tokens
+                        ):
+                            raise IndexError(
+                                "Graphormer masked patch carrier is outside the "
+                                f"token axis of length {tokens}: {carrier_tokens}"
+                            )
+                        for token in carrier_tokens:
+                            changed[token, replica, list(layer_heads), :] = donor[
+                                token, replica, list(layer_heads), :
+                            ]
+                elif selected:
+                    if changed is routed:
+                        changed = changed.clone()
+                    changed[:, :, list(selected), :] = donor[:, :, list(selected), :]
             flattened = changed.reshape_as(value)
             # Keep the exact head-shaped tensor that feeds the flattened out-projection
             # input. Creating a new view only after the forward would not itself lie on
@@ -620,6 +663,7 @@ class GraphormerBackend:
         include_virtual_transport: bool = True,
         family: Sequence[tuple[int, int]] = (),
         replacements: Sequence[Any] | None = None,
+        masked_conditions: Sequence[Mapping[str, Any]] | None = None,
     ) -> BackendCapture:
         del include_virtual_transport
         inputs, target = self._batch(data_list)
@@ -638,6 +682,7 @@ class GraphormerBackend:
                 self.model,
                 ablate=by_layer,
                 replacements=replacements,
+                masked_conditions=masked_conditions,
             ) as hooks, context:
                 output = self.model(**inputs, return_dict=True)
         finally:
@@ -918,6 +963,29 @@ class GraphormerBackend:
     def patch_many(self, targets, donor_transport, family):
         return self._native_forward(targets, family=family, replacements=donor_transport)
 
+    def patch_masked_many(self, targets, donor_transport, conditions):
+        """Patch replica-specific molecular-node shells at native head outputs.
+
+        ``condition['nodes']`` uses graph-local molecular node indices. Graphormer's
+        token zero is reserved for the graph token, so molecular carriers are shifted
+        by one here, at the backend boundary. A graph-token carrier is requested
+        explicitly through ``special_carriers=('graph_token',)``.
+        """
+
+        values = list(targets)
+        records = list(conditions)
+        if len(values) != len(records):
+            raise ValueError(
+                "masked Graphormer patches need one condition per target graph"
+            )
+        captured = self.capture(
+            values,
+            require_grad=False,
+            replacements=donor_transport,
+            masked_conditions=records,
+        )
+        return captured.prediction, captured.z, captured.target
+
     def replacement_batch(
         self,
         capture: BackendCapture,
@@ -970,6 +1038,19 @@ class GraphormerBackend:
 
         return max(
             float(torch.max(torch.abs(value.sum(dim=-1) - 1.0)).item())
+            for value in self._attention(data)
+        )
+
+    def source_attention_by_receiver(self, data: GraphormerGraph, source: int):
+        """Return per-layer ``[receiver token, head]`` access from one node key."""
+
+        source_token = int(source) + 1
+        if source_token < 1 or source_token > int(data.num_nodes):
+            raise IndexError(
+                f"source node {source} is outside graph with {data.num_nodes} nodes"
+            )
+        return tuple(
+            value[0, :, :, source_token].permute(1, 0).detach()
             for value in self._attention(data)
         )
 
