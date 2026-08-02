@@ -118,6 +118,26 @@ python -m graph_specialisation_metrics.synthetic.molecular_redundancy_reach \
 
 Use `--phase figures` to regenerate the PNG/PDF entirely from cached CSV files.
 
+## Internal head specialisation versus output mediation
+
+`head_specialisation_mediation.py` is an instant local control for the distinction between a
+head's channel-selective internal response and its finite causal contribution to the output. Six
+hard-routed heads operate on a rooted path. Each semantic/structural channel has a direct signal
+head, a redundant far signal head, and a strongly responsive far nuisance head. A learned
+minimum-norm readout solves the task using only the signal heads.
+
+The experiment compares finite internal specialisation (S_x(h,d)) with symmetric finite
+injection/restoration mediation (M_x(h,d)). The signal heads are positive controls; the nuisance
+heads are perfectly channel-specialised but output-silent. This also shows how distance-resolved
+internal scores can overstate the functional range of specialised computation.
+
+Local command (approximately one second):
+
+```bash
+python -m graph_specialisation_metrics.synthetic.head_specialisation_mediation \
+  --output-dir outputs/head_specialisation_mediation_v1
+```
+
 ## Learned softmax routing: finite versus local carriage
 
 `analysis/softmax_routing_carriage_colab.py` is the more realistic follow-up. Each graph contains

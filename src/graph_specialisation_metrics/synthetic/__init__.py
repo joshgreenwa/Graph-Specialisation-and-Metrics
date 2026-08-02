@@ -67,6 +67,12 @@ def run_molecular_redundancy_reach(*args, **kwargs):
     return main(*args, **kwargs)
 
 
+def run_head_specialisation_mediation(*args, **kwargs):
+    from .head_specialisation_mediation import main
+
+    return main(*args, **kwargs)
+
+
 __all__ = [
     "run_nar_causal_transition",
     "run_nar_canonical_analysis",
@@ -74,6 +80,7 @@ __all__ = [
     "run_nar_methodology_extension",
     "run_nar_methodology_paper",
     "run_nar_methodology_paper_v3",
+    "run_head_specialisation_mediation",
     "run_molecular_nonlinear_reach",
     "run_molecular_redundancy_reach",
     "run_query_routing_carriage",
