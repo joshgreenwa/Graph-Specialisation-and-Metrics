@@ -3594,6 +3594,272 @@ def summarise_interpolation_contrasts(
     return graph_contrasts, summary
 
 
+def graph_profile_trajectory_decomposition(
+    interpolation_rows: Sequence[Mapping[str, Any]],
+    bamberger_rows: Sequence[Mapping[str, Any]],
+    *,
+    effect_floor: float,
+    small_dose: float | None = None,
+    full_dose: float | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Decompose the finite endpoint gap into local mismatch and finite drift.
+
+    For every paired graph, ``p_full - p_J`` is written exactly as
+    ``(p_small - p_J) + (p_full - p_small)``.  This distinguishes disagreement
+    already present near the clean input from subsequent finite-dose movement.
+    """
+
+    interpolation_profiles: dict[
+        tuple[str, int, float],
+        dict[int, float],
+    ] = defaultdict(dict)
+    for row in interpolation_rows:
+        interpolation_profiles[
+            (
+                str(row["task"]),
+                _integer(row, "graph"),
+                _float(row, "interpolation_dose"),
+            )
+        ][_integer(row, "distance")] = _float(row, "mass")
+
+    bamberger_profiles: dict[tuple[str, int], dict[int, float]] = defaultdict(dict)
+    for row in bamberger_rows:
+        bamberger_profiles[
+            (str(row["task"]), _integer(row, "graph"))
+        ][_integer(row, "distance")] = _float(row, "mass")
+
+    doses = sorted({key[2] for key in interpolation_profiles})
+    if not doses:
+        print(
+            "[reach:warning] profile trajectory decomposition has no finite "
+            "interpolation profiles",
+            flush=True,
+        )
+        return [], []
+    small = float(doses[0] if small_dose is None else small_dose)
+    full = float(doses[-1] if full_dose is None else full_dose)
+    if not any(np.isclose(small, dose) for dose in doses):
+        print(
+            f"[reach:warning] requested trajectory small dose {small:g} is "
+            f"absent from {doses}; no decomposition produced",
+            flush=True,
+        )
+        return [], []
+    if not any(np.isclose(full, dose) for dose in doses):
+        print(
+            f"[reach:warning] requested trajectory full dose {full:g} is "
+            f"absent from {doses}; no decomposition produced",
+            flush=True,
+        )
+        return [], []
+    small = min(doses, key=lambda dose: abs(dose - small))
+    full = min(doses, key=lambda dose: abs(dose - full))
+
+    graph_rows: list[dict[str, Any]] = []
+    distance_rows: list[dict[str, Any]] = []
+    candidate_graphs = sorted({key[:2] for key in interpolation_profiles})
+    missing = 0
+    maximum_identity_error = 0.0
+    for task, graph in candidate_graphs:
+        jacobian_profile = bamberger_profiles.get((task, graph))
+        small_profile = interpolation_profiles.get((task, graph, small))
+        full_profile = interpolation_profiles.get((task, graph, full))
+        if not jacobian_profile or not small_profile or not full_profile:
+            missing += 1
+            continue
+        distances = sorted(
+            set(jacobian_profile) | set(small_profile) | set(full_profile)
+        )
+        jacobian = np.asarray(
+            [jacobian_profile.get(distance, 0.0) for distance in distances],
+            dtype=np.float64,
+        )
+        finite_small = np.asarray(
+            [small_profile.get(distance, 0.0) for distance in distances],
+            dtype=np.float64,
+        )
+        finite_full = np.asarray(
+            [full_profile.get(distance, 0.0) for distance in distances],
+            dtype=np.float64,
+        )
+        totals = tuple(float(values.sum()) for values in (jacobian, finite_small, finite_full))
+        if any(
+            not np.isfinite(total) or total <= float(effect_floor)
+            for total in totals
+        ):
+            missing += 1
+            continue
+        jacobian /= totals[0]
+        finite_small /= totals[1]
+        finite_full /= totals[2]
+
+        baseline = finite_small - jacobian
+        drift = finite_full - finite_small
+        endpoint = finite_full - jacobian
+        identity_error = float(np.max(np.abs(endpoint - baseline - drift)))
+        maximum_identity_error = max(maximum_identity_error, identity_error)
+        baseline_tv = float(0.5 * np.abs(baseline).sum())
+        drift_tv = float(0.5 * np.abs(drift).sum())
+        endpoint_tv = float(0.5 * np.abs(endpoint).sum())
+        tv_path_length = baseline_tv + drift_tv
+        cancellation = (
+            float(np.clip(1.0 - endpoint_tv / tv_path_length, 0.0, 1.0))
+            if tv_path_length > float(effect_floor)
+            else np.nan
+        )
+        baseline_norm = float(np.linalg.vector_norm(baseline))
+        drift_norm = float(np.linalg.vector_norm(drift))
+        cosine = (
+            float(np.dot(baseline, drift) / (baseline_norm * drift_norm))
+            if baseline_norm > float(effect_floor)
+            and drift_norm > float(effect_floor)
+            else np.nan
+        )
+        distance_values = np.asarray(distances, dtype=np.float64)
+        graph_rows.append(
+            {
+                "task": task,
+                "model_label": TASK_LABELS[task],
+                "graph": int(graph),
+                "small_dose": float(small),
+                "full_dose": float(full),
+                "baseline_tv": baseline_tv,
+                "finite_drift_tv": drift_tv,
+                "endpoint_tv": endpoint_tv,
+                "discrepancy_cancellation": cancellation,
+                "directional_cosine": cosine,
+                "baseline_expected_distance": float(
+                    np.dot(distance_values, baseline)
+                ),
+                "finite_drift_expected_distance": float(
+                    np.dot(distance_values, drift)
+                ),
+                "endpoint_expected_distance": float(
+                    np.dot(distance_values, endpoint)
+                ),
+                "identity_error": identity_error,
+            }
+        )
+        for index, distance in enumerate(distances):
+            for component, values in (
+                ("baseline_mismatch", baseline),
+                ("finite_drift", drift),
+                ("endpoint_gap", endpoint),
+            ):
+                distance_rows.append(
+                    {
+                        "task": task,
+                        "model_label": TASK_LABELS[task],
+                        "graph": int(graph),
+                        "small_dose": float(small),
+                        "full_dose": float(full),
+                        "component": component,
+                        "distance": int(distance),
+                        "value": float(values[index]),
+                    }
+                )
+
+    if missing:
+        print(
+            f"[reach:warning] profile trajectory decomposition skipped {missing}/"
+            f"{len(candidate_graphs)} graph-model pairs with incomplete profiles",
+            flush=True,
+        )
+    if maximum_identity_error > 1.0e-10:
+        print(
+            "[reach:warning] profile trajectory identity residual reached "
+            f"{maximum_identity_error:.3e}; retaining estimates",
+            flush=True,
+        )
+    return graph_rows, distance_rows
+
+
+def summarise_profile_trajectory_decomposition(
+    graph_rows: Sequence[Mapping[str, Any]],
+    distance_rows: Sequence[Mapping[str, Any]],
+    *,
+    bootstrap_replicates: int,
+    bootstrap_seed: int,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Bootstrap scalar and distance-wise trajectory components by graph."""
+
+    scalar_metrics = (
+        "baseline_tv",
+        "finite_drift_tv",
+        "endpoint_tv",
+        "discrepancy_cancellation",
+        "directional_cosine",
+        "baseline_expected_distance",
+        "finite_drift_expected_distance",
+        "endpoint_expected_distance",
+    )
+    scalar_groups: dict[tuple[str, str], list[float]] = defaultdict(list)
+    for row in graph_rows:
+        for metric in scalar_metrics:
+            value = _float(row, metric)
+            if np.isfinite(value):
+                scalar_groups[(str(row["task"]), metric)].append(value)
+
+    scalar_summary: list[dict[str, Any]] = []
+    for key, values in sorted(scalar_groups.items()):
+        task, metric = key
+        mean, low, high = _bootstrap_interval(
+            values,
+            replicates=int(bootstrap_replicates),
+            seed=int(bootstrap_seed)
+            + int(stable_hash({"trajectory_scalar": key}, length=8), 16),
+        )
+        example = next(row for row in graph_rows if str(row["task"]) == task)
+        scalar_summary.append(
+            {
+                "task": task,
+                "model_label": TASK_LABELS[task],
+                "small_dose": _float(example, "small_dose"),
+                "full_dose": _float(example, "full_dose"),
+                "metric": metric,
+                "mean": mean,
+                "low": low,
+                "high": high,
+                "graphs": int(len(values)),
+            }
+        )
+
+    distance_groups: dict[tuple[str, str, int], list[float]] = defaultdict(list)
+    for row in distance_rows:
+        value = _float(row, "value")
+        if np.isfinite(value):
+            distance_groups[
+                (
+                    str(row["task"]),
+                    str(row["component"]),
+                    _integer(row, "distance"),
+                )
+            ].append(value)
+
+    distance_summary: list[dict[str, Any]] = []
+    for key, values in sorted(distance_groups.items()):
+        task, component, distance = key
+        mean, low, high = _bootstrap_interval(
+            values,
+            replicates=int(bootstrap_replicates),
+            seed=int(bootstrap_seed)
+            + int(stable_hash({"trajectory_distance": key}, length=8), 16),
+        )
+        distance_summary.append(
+            {
+                "task": task,
+                "model_label": TASK_LABELS[task],
+                "component": component,
+                "distance": int(distance),
+                "mean": mean,
+                "low": low,
+                "high": high,
+                "graphs": int(len(values)),
+            }
+        )
+    return scalar_summary, distance_summary
+
+
 def summarise_graph_profiles(
     graph_rows: Sequence[Mapping[str, Any]],
     *,
@@ -5134,6 +5400,356 @@ def plot_semantic_usage_estimands(
     )
 
 
+def plot_profile_trajectory_decomposition(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    figures_dir: Path,
+    tasks: Sequence[str],
+    dataset_label: str,
+    figure_prefix: str,
+) -> dict[str, str]:
+    """Plot local mismatch, finite drift, and their resulting endpoint gap."""
+
+    import matplotlib.pyplot as plt
+
+    _figure_theme()
+    available_tasks = [
+        task for task in tasks if any(str(row["task"]) == task for row in rows)
+    ]
+    if not available_tasks:
+        print(
+            "[reach:warning] profile trajectory summary is empty; writing an "
+            "empty audit figure",
+            flush=True,
+        )
+        fig, axis = plt.subplots(figsize=(8.0, 3.0))
+        axis.axis("off")
+        axis.text(
+            0.5,
+            0.5,
+            "No estimable profile trajectories",
+            transform=axis.transAxes,
+            ha="center",
+            va="center",
+            color="#666666",
+        )
+        return _save_figure(
+            fig,
+            figures_dir,
+            f"{figure_prefix}_semantic_trajectory_decomposition",
+        )
+
+    dose_row = next(
+        row
+        for row in rows
+        if str(row["task"]) == available_tasks[0]
+    )
+    small_dose = _float(dose_row, "small_dose")
+    full_dose = _float(dose_row, "full_dose")
+    fig, axes = plt.subplots(
+        1,
+        3,
+        figsize=(13.2, 4.8),
+        gridspec_kw={"width_ratios": (1.05, 1.05, 0.9), "wspace": 0.36},
+    )
+    component_specs = (
+        ("baseline", rf"Local mismatch\n$p_{{{small_dose:g}}}-p_J$"),
+        (
+            "finite_drift",
+            rf"Finite drift\n$p_{{{full_dose:g}}}-p_{{{small_dose:g}}}$",
+        ),
+        ("endpoint", rf"Endpoint gap\n$p_{{{full_dose:g}}}-p_J$"),
+    )
+    positions = np.arange(len(component_specs), dtype=np.float64)
+    for task in available_tasks:
+        task_rows = {
+            str(row["metric"]): row
+            for row in rows
+            if str(row["task"]) == task
+        }
+        tv_values = [task_rows[f"{name}_tv"] for name, _label in component_specs]
+        expected_values = [
+            task_rows[f"{name}_expected_distance"]
+            for name, _label in component_specs
+        ]
+        for axis, values in zip(axes[:2], (tv_values, expected_values)):
+            means = np.asarray([_float(value, "mean") for value in values])
+            lows = np.asarray([_float(value, "low") for value in values])
+            highs = np.asarray([_float(value, "high") for value in values])
+            axis.fill_between(
+                positions,
+                lows,
+                highs,
+                color=MODEL_COLOURS[task],
+                alpha=0.09,
+                linewidth=0,
+            )
+            axis.plot(
+                positions,
+                means,
+                color=MODEL_COLOURS[task],
+                marker=MODEL_MARKERS[task],
+                linestyle=MODEL_LINESTYLES[task],
+                markerfacecolor="white",
+                markeredgewidth=1.1,
+                markersize=5.0,
+                linewidth=1.8,
+                label=TASK_LABELS[task],
+            )
+
+    labels = [label.replace("\\n", "\n") for _name, label in component_specs]
+    axes[0].set_xticks(positions, labels)
+    axes[0].set_ylabel("Profile distance (TV)")
+    axes[0].set_ylim(bottom=0)
+    axes[0].set_title("Magnitude of each profile change", fontsize=10)
+    axes[1].set_xticks(positions, labels)
+    axes[1].axhline(0, color="#666666", linewidth=0.9, zorder=0)
+    axes[1].set_ylabel("Expected-distance component")
+    axes[1].set_title("Signed movement in expected distance", fontsize=10)
+
+    cancellation_by_task = {
+        task: next(
+            row
+            for row in rows
+            if str(row["task"]) == task
+            and str(row["metric"]) == "discrepancy_cancellation"
+        )
+        for task in available_tasks
+    }
+    y_positions = np.arange(len(available_tasks), dtype=np.float64)
+    for position, task in zip(y_positions, available_tasks):
+        value = cancellation_by_task[task]
+        mean = _float(value, "mean")
+        low = _float(value, "low")
+        high = _float(value, "high")
+        axes[2].errorbar(
+            mean,
+            position,
+            xerr=np.asarray([[mean - low], [high - mean]]),
+            color=MODEL_COLOURS[task],
+            marker=MODEL_MARKERS[task],
+            markerfacecolor="white",
+            markeredgewidth=1.1,
+            markersize=5.2,
+            linewidth=1.4,
+            capsize=2.5,
+        )
+    axes[2].set_yticks(
+        y_positions,
+        [TASK_LABELS[task] for task in available_tasks],
+    )
+    axes[2].tick_params(axis="y", labelsize=8.2)
+    axes[2].invert_yaxis()
+    axes[2].set_xlim(-0.03, 1.03)
+    axes[2].set_xlabel("Discrepancy cancellation")
+    axes[2].set_title("Direction of finite drift", fontsize=10)
+    axes[2].text(
+        0.02,
+        0.03,
+        "0 = reinforcing\n1 = fully opposing",
+        transform=axes[2].transAxes,
+        ha="left",
+        va="bottom",
+        color="#666666",
+        fontsize=7.5,
+    )
+
+    handles, legend_labels = axes[0].get_legend_handles_labels()
+    fig.legend(
+        handles,
+        legend_labels,
+        loc="upper center",
+        bbox_to_anchor=(0.5, 0.84),
+        ncol=len(available_tasks),
+        frameon=False,
+        handlelength=2.5,
+        columnspacing=1.2,
+    )
+    fig.suptitle(
+        f"Bamberger mismatch and finite semantic drift on {dataset_label}",
+        fontsize=13,
+        y=0.992,
+    )
+    fig.text(
+        0.5,
+        0.895,
+        (
+            rf"$p_{{{full_dose:g}}}-p_J="
+            rf"(p_{{{small_dose:g}}}-p_J)+"
+            rf"(p_{{{full_dose:g}}}-p_{{{small_dose:g}}})$; "
+            "mean with 95% paired-graph bootstrap interval"
+        ),
+        ha="center",
+        color="#666666",
+        fontsize=8.4,
+    )
+    fig.subplots_adjust(left=0.075, right=0.985, bottom=0.17, top=0.69)
+    return _save_figure(
+        fig,
+        figures_dir,
+        f"{figure_prefix}_semantic_trajectory_decomposition",
+    )
+
+
+def plot_profile_trajectory_distance_components(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    figures_dir: Path,
+    tasks: Sequence[str],
+    dataset_label: str,
+    figure_prefix: str,
+) -> dict[str, str]:
+    """Show where finite drift reinforces or offsets local-reference mismatch."""
+
+    import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
+
+    _figure_theme()
+    available_tasks = [
+        task for task in tasks if any(str(row["task"]) == task for row in rows)
+    ]
+    if not available_tasks:
+        print(
+            "[reach:warning] distance-wise profile trajectory is empty; writing "
+            "an empty audit figure",
+            flush=True,
+        )
+        fig, axis = plt.subplots(figsize=(8.0, 3.0))
+        axis.axis("off")
+        axis.text(
+            0.5,
+            0.5,
+            "No estimable distance-wise trajectory",
+            transform=axis.transAxes,
+            ha="center",
+            va="center",
+            color="#666666",
+        )
+        return _save_figure(
+            fig,
+            figures_dir,
+            f"{figure_prefix}_semantic_trajectory_distance_components",
+        )
+
+    component_specs = (
+        ("baseline_mismatch", "Local mismatch", "#222222", "--", "^"),
+        ("finite_drift", "Finite drift", "#D55E00", ":", "s"),
+        ("endpoint_gap", "Endpoint gap", "#0072B2", "-", "o"),
+    )
+    fig, axes = plt.subplots(
+        len(available_tasks),
+        1,
+        figsize=(8.9, 1.85 * len(available_tasks) + 1.8),
+        sharex=True,
+        squeeze=False,
+    )
+    maximum_distance = 0
+    absolute_bound = 0.0
+    for row_index, task in enumerate(available_tasks):
+        axis = axes[row_index, 0]
+        for component, _label, colour, linestyle, marker in component_specs:
+            values = sorted(
+                (
+                    row
+                    for row in rows
+                    if str(row["task"]) == task
+                    and str(row["component"]) == component
+                ),
+                key=lambda row: _integer(row, "distance"),
+            )
+            if not values:
+                continue
+            x = np.asarray([_integer(value, "distance") for value in values])
+            mean = np.asarray([_float(value, "mean") for value in values])
+            low = np.asarray([_float(value, "low") for value in values])
+            high = np.asarray([_float(value, "high") for value in values])
+            maximum_distance = max(maximum_distance, int(x.max(initial=0)))
+            absolute_bound = max(
+                absolute_bound,
+                float(np.max(np.abs(np.concatenate((low, high))))),
+            )
+            axis.fill_between(
+                x,
+                low,
+                high,
+                color=colour,
+                alpha=0.08,
+                linewidth=0,
+            )
+            axis.plot(
+                x,
+                mean,
+                color=colour,
+                linestyle=linestyle,
+                marker=marker,
+                markerfacecolor="white",
+                markeredgewidth=1.0,
+                markersize=4.2,
+                linewidth=1.6,
+            )
+        axis.axhline(0, color="#777777", linewidth=0.8, zorder=0)
+        axis.set_ylabel(
+            f"{TASK_LABELS[task]}\n$\\Delta$ mass",
+            fontsize=8.5,
+        )
+    bound = max(absolute_bound * 1.12, 0.01)
+    for axis in axes[:, 0]:
+        axis.set_ylim(-bound, bound)
+        axis.set_xlim(-0.15, maximum_distance + 0.15)
+        axis.xaxis.set_major_locator(plt.MaxNLocator(integer=True))
+    axes[-1, 0].set_xlabel("Shortest-path distance")
+
+    handles = [
+        Line2D(
+            [0],
+            [0],
+            color=colour,
+            linestyle=linestyle,
+            marker=marker,
+            markerfacecolor="white",
+            linewidth=1.6,
+            label=label,
+        )
+        for _component, label, colour, linestyle, marker in component_specs
+    ]
+    fig.legend(
+        handles=handles,
+        loc="upper center",
+        bbox_to_anchor=(0.5, 0.915),
+        ncol=3,
+        frameon=False,
+        handlelength=2.5,
+    )
+    fig.suptitle(
+        f"Distance-wise finite–Jacobian profile decomposition on {dataset_label}",
+        fontsize=13,
+        y=0.992,
+    )
+    fig.text(
+        0.5,
+        0.855,
+        (
+            "Endpoint gap = local-reference mismatch + finite drift; "
+            "mean with 95% paired-graph bootstrap interval"
+        ),
+        ha="center",
+        color="#666666",
+        fontsize=8.4,
+    )
+    fig.subplots_adjust(
+        left=0.14,
+        right=0.985,
+        bottom=0.09,
+        top=0.80,
+        hspace=0.30,
+    )
+    return _save_figure(
+        fig,
+        figures_dir,
+        f"{figure_prefix}_semantic_trajectory_distance_components",
+    )
+
+
 def plot_interpolation_sweep(
     rows: Sequence[Mapping[str, Any]],
     *,
@@ -5926,6 +6542,23 @@ def figures(
             matched_reference_dose=float(min(config.interpolation_doses)),
         )
     )
+    trajectory_graph, trajectory_distance_graph = (
+        graph_profile_trajectory_decomposition(
+            interpolation_graph,
+            bamberger_graph,
+            effect_floor=float(config.effect_floor),
+            small_dose=float(min(config.interpolation_doses)),
+            full_dose=float(max(config.interpolation_doses)),
+        )
+    )
+    trajectory_summary, trajectory_distance_summary = (
+        summarise_profile_trajectory_decomposition(
+            trajectory_graph,
+            trajectory_distance_graph,
+            bootstrap_replicates=int(config.bootstrap_replicates),
+            bootstrap_seed=int(config.analysis_seed) + 1_000,
+        )
+    )
     graph_rows = [*donor_graph, *bamberger_graph]
     profile_rows, expected_rows = summarise_graph_profiles(
         graph_rows,
@@ -5975,6 +6608,22 @@ def figures(
         results_dir / "interpolation_sweep_summary.csv",
         interpolation_summary,
     )
+    _write_csv(
+        results_dir / "profile_trajectory_graph_decomposition.csv",
+        trajectory_graph,
+    )
+    _write_csv(
+        results_dir / "profile_trajectory_summary.csv",
+        trajectory_summary,
+    )
+    _write_csv(
+        results_dir / "profile_trajectory_distance_graph_rows.csv",
+        trajectory_distance_graph,
+    )
+    _write_csv(
+        results_dir / "profile_trajectory_distance_summary.csv",
+        trajectory_distance_summary,
+    )
     _write_csv(results_dir / "scale_dependence_graph_rows.csv", scale_rows)
     _write_csv(results_dir / "scale_dependence_summary.csv", scale_summary)
     _write_csv(results_dir / "scale_trend_slopes.csv", scale_trends)
@@ -6000,6 +6649,22 @@ def figures(
 
     figures_dir = output_dir / "figures"
     paths = {
+        "trajectory_decomposition": plot_profile_trajectory_decomposition(
+            trajectory_summary,
+            figures_dir=figures_dir,
+            tasks=config.tasks,
+            dataset_label=config.profile.name,
+            figure_prefix=config.profile.figure_prefix,
+        ),
+        "trajectory_distance_components": (
+            plot_profile_trajectory_distance_components(
+                trajectory_distance_summary,
+                figures_dir=figures_dir,
+                tasks=config.tasks,
+                dataset_label=config.profile.name,
+                figure_prefix=config.profile.figure_prefix,
+            )
+        ),
         "semantic_estimand_comparison": plot_semantic_usage_estimands(
             semantic_usage_profiles,
             semantic_usage_contrasts,
@@ -6113,8 +6778,12 @@ def figures(
                 "checkpoint per architecture, so intervals do not include training-seed "
                 "variance. Difference panels use paired graph-level bootstraps against "
                 "Dense GRIT; the interpolation sweep pairs each graph with its "
-                "Bamberger and matched smallest-dose profiles. Performance-scale "
-                "analysis uses every test molecule; carriage-scale analysis uses the "
+                "Bamberger and matched smallest-dose profiles. "
+                "The profile-trajectory decomposition writes the finite endpoint "
+                "gap exactly as local-reference mismatch plus finite-dose drift; "
+                "all component intervals remain paired by graph. "
+                "Performance-scale analysis uses every test molecule; "
+                "carriage-scale analysis uses the "
                 "registered graph sample. Adjacent integer values are merged into "
                 "density-adaptive bins, and continuous slopes use paired bootstraps."
                 " The semantic estimand comparison is rebuilt entirely from cached "
@@ -6140,6 +6809,10 @@ def figures(
         "semantic_usage_profiles": semantic_usage_profiles,
         "semantic_usage_contrasts": semantic_usage_contrasts,
         "interpolation_rows": interpolation_summary,
+        "trajectory_graph": trajectory_graph,
+        "trajectory_summary": trajectory_summary,
+        "trajectory_distance_graph": trajectory_distance_graph,
+        "trajectory_distance_summary": trajectory_distance_summary,
         "scale_rows": scale_summary,
         "scale_trends": scale_trends,
         "output_coherence_profiles": output_coherence_profiles,

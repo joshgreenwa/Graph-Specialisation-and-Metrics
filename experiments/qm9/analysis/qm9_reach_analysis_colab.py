@@ -195,6 +195,9 @@ print(
     "[scope] Estimand decomposition: cached carrier rows separately report "
     "shell-summed radial allocation and shell-size-adjusted per-carrier "
     "sensitivity. PHASE='figures' requires no model forwards.\n"
+    "[scope] Trajectory decomposition: the full-swap gap from Bamberger is "
+    "split exactly into smallest-dose mismatch plus subsequent finite drift, "
+    "using paired cached graph profiles.\n"
     "[scope] Scale analysis: MAE uses every test molecule; Functional reach uses "
     "the 64 carriage graphs. Adjacent values are grouped adaptively by data density, "
     "and continuous paired-bootstrap slopes avoid dependence on bin boundaries.\n"
@@ -388,6 +391,17 @@ if "output_coherence_expected" in result:
     except ImportError:
         pass
 
+if "trajectory_summary" in result:
+    from IPython.display import display
+
+    try:
+        import pandas as pd
+
+        print("\nFinite profile-trajectory decomposition", flush=True)
+        display(pd.DataFrame(result["trajectory_summary"]))
+    except ImportError:
+        pass
+
 if "semantic_usage_contrasts" in result:
     from IPython.display import display
 
@@ -425,6 +439,8 @@ if "figures" in result:
     from IPython.display import Image, display
 
     for name in (
+        "trajectory_decomposition",
+        "trajectory_distance_components",
         "semantic_estimand_comparison",
         "interpolation_sweep",
         "semantic_functional",

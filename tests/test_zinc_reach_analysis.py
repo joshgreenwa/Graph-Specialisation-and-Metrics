@@ -19,12 +19,14 @@ from graph_specialisation_metrics.zinc_reach_analysis import (
     graph_donor_profiles,
     graph_interpolation_profiles,
     graph_output_coherence_profiles,
+    graph_profile_trajectory_decomposition,
     graph_semantic_usage_estimands,
     summarise_dense_profile_contrasts,
     summarise_beneficial_carriage,
     summarise_graph_profiles,
     summarise_interpolation_contrasts,
     summarise_output_coherence,
+    summarise_profile_trajectory_decomposition,
     summarise_scale_dependence,
     summarise_semantic_usage_estimands,
     summarise_shell_survival,
@@ -852,6 +854,81 @@ def test_semantic_usage_estimands_separate_shell_mass_from_per_carrier_shape():
     assert tv["normalised_per_carrier_sensitivity"] == pytest.approx(1.0 / 3.0)
 
 
+def test_profile_trajectory_separates_baseline_mismatch_from_finite_drift():
+    interpolation_rows = []
+    bamberger_rows = []
+    profiles = {
+        0.01: (0.4, 0.4, 0.2),
+        1.00: (0.5, 0.3, 0.2),
+    }
+    for graph in (0, 1):
+        for dose, values in profiles.items():
+            for distance, mass in enumerate(values):
+                interpolation_rows.append(
+                    {
+                        "task": "zinc",
+                        "graph": graph,
+                        "interpolation_dose": dose,
+                        "distance": distance,
+                        "mass": mass,
+                    }
+                )
+        for distance, mass in enumerate((0.5, 0.5, 0.0)):
+            bamberger_rows.append(
+                {
+                    "task": "zinc",
+                    "graph": graph,
+                    "distance": distance,
+                    "mass": mass,
+                }
+            )
+
+    graph_rows, distance_rows = graph_profile_trajectory_decomposition(
+        interpolation_rows,
+        bamberger_rows,
+        effect_floor=1.0e-12,
+    )
+    assert len(graph_rows) == 2
+    first = graph_rows[0]
+    assert first["baseline_tv"] == pytest.approx(0.2)
+    assert first["finite_drift_tv"] == pytest.approx(0.1)
+    assert first["endpoint_tv"] == pytest.approx(0.2)
+    assert first["discrepancy_cancellation"] == pytest.approx(1.0 / 3.0)
+    assert first["baseline_expected_distance"] == pytest.approx(0.3)
+    assert first["finite_drift_expected_distance"] == pytest.approx(-0.1)
+    assert first["endpoint_expected_distance"] == pytest.approx(0.2)
+    assert first["identity_error"] < 1.0e-12
+
+    by_component = {
+        row["component"]: []
+        for row in distance_rows
+        if row["graph"] == 0
+    }
+    for row in distance_rows:
+        if row["graph"] == 0:
+            by_component[row["component"]].append(row["value"])
+    assert by_component["baseline_mismatch"] == pytest.approx([-0.1, -0.1, 0.2])
+    assert by_component["finite_drift"] == pytest.approx([0.1, -0.1, 0.0])
+    assert by_component["endpoint_gap"] == pytest.approx([0.0, -0.2, 0.2])
+
+    scalar_summary, distance_summary = summarise_profile_trajectory_decomposition(
+        graph_rows,
+        distance_rows,
+        bootstrap_replicates=40,
+        bootstrap_seed=23,
+    )
+    assert scalar_summary and distance_summary
+    assert all(row["graphs"] == 2 for row in scalar_summary)
+    assert {
+        row["metric"] for row in scalar_summary
+    } >= {
+        "baseline_tv",
+        "finite_drift_tv",
+        "endpoint_tv",
+        "discrepancy_cancellation",
+    }
+
+
 def test_figure_only_builds_png_and_pdf(tmp_path: Path):
     donor, bamberger, interpolation = _raw_rows()
     results = tmp_path / "results"
@@ -879,6 +956,8 @@ def test_figure_only_builds_png_and_pdf(tmp_path: Path):
         output_dir=tmp_path,
     )
     assert set(result["figures"]) == {
+        "trajectory_decomposition",
+        "trajectory_distance_components",
         "semantic_estimand_comparison",
         "interpolation_sweep",
         "semantic_functional",
@@ -896,6 +975,8 @@ def test_figure_only_builds_png_and_pdf(tmp_path: Path):
     assert (results / "interpolation_sweep_summary.csv").is_file()
     assert (results / "semantic_usage_estimand_summary.csv").is_file()
     assert (results / "semantic_usage_estimand_contrasts.csv").is_file()
+    assert (results / "profile_trajectory_summary.csv").is_file()
+    assert (results / "profile_trajectory_distance_summary.csv").is_file()
     assert (results / "shell_survival_by_coalition_size.csv").is_file()
     for formats in result["figures"].values():
         assert Path(formats["png"]).is_file()
@@ -945,6 +1026,8 @@ def test_qm9_profile_builds_dataset_specific_figures(tmp_path: Path):
         output_dir=tmp_path,
     )
     assert set(result["figures"]) == {
+        "trajectory_decomposition",
+        "trajectory_distance_components",
         "semantic_estimand_comparison",
         "interpolation_sweep",
         "semantic_functional",
