@@ -697,6 +697,32 @@ def _load_task_context(config: Config, task: str) -> dict[str, Any]:
     model_record = load_canonical_model_record(task_root / "model.json", artifact)
     metrics = CanonicalHeadMetrics.from_scores(artifact.value)
     roles = select_role_heads(artifact.value, metrics, count=config.heads_per_family)
+    protocol_config = None
+    matched_protocol_path = None
+    protocol_attempts = []
+    for protocol_path in (
+        task_root / "protocol.json",
+        config.canonical_root / "protocol.json",
+    ):
+        if not protocol_path.is_file():
+            continue
+        candidate = methodology_config_from_record(
+            protocol_path, accelerator=config.accelerator
+        )
+        protocol_attempts.append((str(protocol_path), candidate.fingerprint))
+        if candidate.fingerprint == artifact.metadata["contract"].get(
+            "protocol_fingerprint"
+        ):
+            protocol_config = candidate
+            matched_protocol_path = protocol_path
+            break
+    if protocol_config is None:
+        expected = artifact.metadata["contract"].get("protocol_fingerprint")
+        raise ValueError(
+            "no protocol.json matches the scientific configuration bound to "
+            f"{task} score cache (expected {expected}; tried {protocol_attempts})"
+        )
+    print(f"[protocol] {task}: {matched_protocol_path}")
     contract = _measurement_contract(config, task, artifact, roles)
     cache = SupplementalCache(config.output_dir / task / "cache")
     return {
@@ -705,6 +731,7 @@ def _load_task_context(config: Config, task: str) -> dict[str, Any]:
         "model_record": model_record,
         "metrics": metrics,
         "role_heads": roles,
+        "protocol_config": protocol_config,
         "contract": contract,
         "cache": cache,
     }
@@ -716,9 +743,7 @@ def measure_task(config: Config, task: str, context: Mapping[str, Any]) -> dict[
         value, path = cached
         print(f"[cache] loaded {task} causal spatial support: {path}")
         return value
-    protocol_config = methodology_config_from_record(
-        config.canonical_root / "protocol.json", accelerator=config.accelerator
-    )
+    protocol_config = context["protocol_config"]
     runtime = build_verified_grit_figure_runtime(
         context["artifact"],
         context["model_record"],

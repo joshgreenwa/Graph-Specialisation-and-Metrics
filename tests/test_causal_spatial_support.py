@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -9,8 +10,10 @@ from torch_geometric.data import Data
 
 from graph_specialisation_metrics.methodology.backend import CanonicalGritBackend
 from graph_specialisation_metrics.methodology.causal_spatial_support import (
+    Config,
     _event_conditions,
     _graph_profile_matrix,
+    _load_task_context,
     _normalise_profile,
     _profile_interval,
     select_role_heads,
@@ -142,3 +145,46 @@ def test_profile_interval_derives_long_range_share() -> None:
     )
     assert profile["expected_distance"] == 1.75
     assert profile["long_range_share"] == 0.5
+
+
+def test_task_bound_protocol_is_preferred_over_stale_root_protocol(
+    tmp_path, monkeypatch
+) -> None:
+    from graph_specialisation_metrics.methodology import causal_spatial_support as module
+
+    task_root = tmp_path / "zinc" / "seed_42"
+    task_root.mkdir(parents=True)
+    (task_root / "protocol.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "protocol.json").write_text("{}", encoding="utf-8")
+    artifact = SimpleNamespace(
+        value={},
+        file_sha256="score-sha",
+        metadata={
+            "contract_fingerprint": "contract-fingerprint",
+            "contract": {
+                "protocol_fingerprint": "wanted",
+                "checkpoint_sha256": "checkpoint-sha",
+                "split_fingerprint": "split-fingerprint",
+                "model_geometry": {"layers": 1, "heads": 1},
+            },
+        },
+    )
+    monkeypatch.setattr(module, "load_canonical_score_artifact", lambda *a, **k: artifact)
+    monkeypatch.setattr(module, "load_canonical_model_record", lambda *a, **k: {})
+    monkeypatch.setattr(module.CanonicalHeadMetrics, "from_scores", lambda *a, **k: object())
+    monkeypatch.setattr(module, "select_role_heads", lambda *a, **k: {"semantic": ((0, 0),)})
+    seen = []
+
+    def protocol(path, **_kwargs):
+        seen.append(path)
+        return SimpleNamespace(
+            fingerprint="wanted" if Path(path).parent == task_root else "stale"
+        )
+
+    monkeypatch.setattr(module, "methodology_config_from_record", protocol)
+    context = _load_task_context(
+        Config(canonical_root=tmp_path, output_dir=tmp_path / "output", tasks=("zinc",)),
+        "zinc",
+    )
+    assert context["protocol_config"].fingerprint == "wanted"
+    assert seen == [task_root / "protocol.json"]
