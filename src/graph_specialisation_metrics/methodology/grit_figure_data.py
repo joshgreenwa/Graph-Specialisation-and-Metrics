@@ -666,6 +666,7 @@ def build_verified_grit_figure_runtime(
     protocol_config: MethodologyConfig,
     *,
     runtime_output_dir: str | Path,
+    require_protocol_match: bool = True,
 ) -> GritFigureRuntime:
     """Reconstruct GRIT and fail if checkpoint, adapter, or geometry differs."""
 
@@ -675,7 +676,10 @@ def build_verified_grit_figure_runtime(
 
     contract = artifact.metadata["contract"]
     task_name = str(contract["task"])
-    if contract.get("protocol_fingerprint") != protocol_config.fingerprint:
+    if (
+        require_protocol_match
+        and contract.get("protocol_fingerprint") != protocol_config.fingerprint
+    ):
         raise ValueError(
             "protocol.json does not describe the scientific configuration bound "
             "to the canonical score cache"

@@ -699,13 +699,30 @@ def _load_task_context(config: Config, task: str) -> dict[str, Any]:
     metrics = CanonicalHeadMetrics.from_scores(artifact.value)
     roles = select_role_heads(artifact.value, metrics, count=config.heads_per_family)
     expected_protocol = artifact.metadata["contract"].get("protocol_fingerprint")
-    protocol_config, protocol_source = _resolve_protocol_config(
+    protocol_config, protocol_source, protocol_exact = _resolve_protocol_config(
         config,
         task=task,
         task_root=task_root,
         expected_fingerprint=str(expected_protocol),
     )
+    if not protocol_exact:
+        canonical_contract = artifact.metadata["contract"]
+        protocol_config = dataclasses.replace(
+            protocol_config,
+            sizes=dataclasses.replace(
+                protocol_config.sizes,
+                sources_per_graph=int(canonical_contract["source_cap"]),
+                donors_per_source=int(canonical_contract["donors_per_source"]),
+            ),
+            analysis_seed=int(model_record["splits"]["seed"]),
+        )
     print(f"[protocol] {task}: {protocol_source}")
+    if not protocol_exact:
+        print(
+            "[protocol:warning] historical whole-run protocol was unavailable; "
+            "runtime identity will instead be verified from the score contract and "
+            "model.json (checkpoint, adapter, geometry, parameters, sigma, and splits)"
+        )
     contract = _measurement_contract(config, task, artifact, roles)
     cache = SupplementalCache(config.output_dir / task / "cache")
     return {
@@ -715,6 +732,7 @@ def _load_task_context(config: Config, task: str) -> dict[str, Any]:
         "metrics": metrics,
         "role_heads": roles,
         "protocol_config": protocol_config,
+        "protocol_exact": protocol_exact,
         "contract": contract,
         "cache": cache,
     }
@@ -726,7 +744,7 @@ def _resolve_protocol_config(
     task: str,
     task_root: Path,
     expected_fingerprint: str,
-) -> tuple[Any, str]:
+) -> tuple[Any, str, bool]:
     """Find, or exactly reconstruct, the protocol cryptographically bound to a cache."""
 
     preferred = [task_root / "protocol.json", config.canonical_root / "protocol.json"]
@@ -745,6 +763,7 @@ def _resolve_protocol_config(
                     yield path
 
     attempts: list[tuple[str, str]] = []
+    fallback: tuple[Any, str] | None = None
     for protocol_path in protocol_paths():
         if not protocol_path.is_file():
             continue
@@ -785,8 +804,12 @@ def _resolve_protocol_config(
                 attempts.append((source, f"{type(error).__name__}: {error}"))
                 continue
             attempts.append((source, candidate.fingerprint))
+            if fallback is None and task in tuple(candidate.tasks):
+                fallback = (candidate, source)
             if candidate.fingerprint == expected_fingerprint:
-                return candidate, source
+                return candidate, source, True
+    if fallback is not None:
+        return fallback[0], f"{fallback[1]}#task-artifact-verified-fallback", False
     preview = attempts[:12]
     raise ValueError(
         "no available protocol record matches the scientific configuration bound "
@@ -807,6 +830,7 @@ def measure_task(config: Config, task: str, context: Mapping[str, Any]) -> dict[
         context["model_record"],
         protocol_config,
         runtime_output_dir=config.output_dir / task / "runtime",
+        require_protocol_match=bool(context["protocol_exact"]),
     )
     if runtime.prepared.task.virtual_node:
         raise ValueError(f"{task} uses a VNode; this experiment is registered for dense models")

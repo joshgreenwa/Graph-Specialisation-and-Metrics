@@ -178,7 +178,8 @@ def test_task_bound_protocol_is_preferred_over_stale_root_protocol(
     def protocol(record, **_kwargs):
         seen.append(record["marker"])
         return SimpleNamespace(
-            fingerprint="wanted" if record["marker"] == "task" else "stale"
+            fingerprint="wanted" if record["marker"] == "task" else "stale",
+            tasks=("zinc",),
         )
 
     monkeypatch.setattr(module, "methodology_config_from_record", protocol)
@@ -212,7 +213,7 @@ def test_protocol_task_subset_is_exactly_reconstructed(tmp_path, monkeypatch) ->
         return SimpleNamespace(fingerprint=fingerprint, tasks=tasks)
 
     monkeypatch.setattr(module, "methodology_config_from_record", protocol)
-    resolved, source = module._resolve_protocol_config(
+    resolved, source, exact = module._resolve_protocol_config(
         Config(canonical_root=canonical_root, output_dir=tmp_path / "output"),
         task="zinc",
         task_root=canonical_root / "zinc" / "seed_42",
@@ -220,3 +221,31 @@ def test_protocol_task_subset_is_exactly_reconstructed(tmp_path, monkeypatch) ->
     )
     assert resolved.tasks == ("zinc", "qm9_gap_dense")
     assert source.endswith("#tasks=zinc,qm9_gap_dense")
+    assert exact is True
+
+
+def test_protocol_falls_back_to_task_artifact_verification(tmp_path, monkeypatch) -> None:
+    from graph_specialisation_metrics.methodology import causal_spatial_support as module
+
+    canonical_root = tmp_path / "canonical"
+    canonical_root.mkdir()
+    (canonical_root / "protocol.json").write_text(
+        json.dumps({"tasks": ["zinc"], "task_train_seeds": {}, "task_overrides": {}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        module,
+        "methodology_config_from_record",
+        lambda record, **kwargs: SimpleNamespace(
+            fingerprint="stale", tasks=tuple(record["tasks"])
+        ),
+    )
+    resolved, source, exact = module._resolve_protocol_config(
+        Config(canonical_root=canonical_root, output_dir=tmp_path / "output"),
+        task="zinc",
+        task_root=canonical_root / "zinc" / "seed_42",
+        expected_fingerprint="wanted",
+    )
+    assert resolved.tasks == ("zinc",)
+    assert source.endswith("#task-artifact-verified-fallback")
+    assert exact is False

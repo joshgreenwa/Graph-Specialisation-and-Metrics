@@ -107,10 +107,24 @@ available = [root for root in CANONICAL_ROOT_CANDIDATES if complete_root(root)]
 canonical_root = available[0] if available else CANONICAL_ROOT_CANDIDATES[0]
 if not available:
     print(f"[cache:warning] canonical ZINC/QM9 root was not found; expected {canonical_root}")
-if PHASE != "figures" and INSTALL_DEPENDENCIES:
-    from graph_specialisation_metrics.carriage import env
+def dependency_stack_ready() -> bool:
+    try:
+        import ogb  # noqa: F401
+        import pytorch_lightning  # noqa: F401
+        import torch_geometric  # noqa: F401
+        import yacs  # noqa: F401
+    except Exception:
+        return False
+    return True
 
-    env.install_dependencies(pyg_version="2.2.0")
+
+if PHASE != "figures" and INSTALL_DEPENDENCIES:
+    if dependency_stack_ready():
+        print("[deps] Existing compatible Python stack detected; skipping reinstall.")
+    else:
+        from graph_specialisation_metrics.carriage import env
+
+        env.install_dependencies(pyg_version="2.2.0")
 
 from graph_specialisation_metrics.methodology.causal_spatial_support import main
 
@@ -124,7 +138,8 @@ print(
     "[A] Clean direct attention from each intervened source to receivers by pristine SPD.\n"
     "[S] Immutable canonical discovery-split internal response by source-carrier SPD.\n"
     "[M] Held-out symmetric injection/restoration when only one carrier shell is patched.\n"
-    "[families] Three semantic specialists, three structural specialists, three high-J "
+    f"[families] {HEADS_PER_FAMILY} semantic specialists, "
+    f"{HEADS_PER_FAMILY} structural specialists, {HEADS_PER_FAMILY} high-J "
     "generalists, and registered same-layer central controls.\n"
     "[overlap] Each family is patched jointly and individually; joint/sum below one "
     "indicates overlapping realised pathways, not minimal task necessity.\n"
