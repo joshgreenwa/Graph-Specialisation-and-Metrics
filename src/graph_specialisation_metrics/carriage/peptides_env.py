@@ -56,6 +56,38 @@ def apply_peptides_patches(repo_dir: Path) -> None:
     log(f"[peptides] GRIT_PE_STREAM_CHUNK_SIZE={os.environ['GRIT_PE_STREAM_CHUNK_SIZE']}")
 
 
+def apply_peptides_struct_onehop_patch(repo_dir: Path) -> None:
+    """Reconstruct the exact sparse Peptides-struct model used for training.
+
+    The source intervention is the shared masked-RRWP 1-hop patch.  Its training
+    helper is parameterised through module constants, so set those constants to
+    the Peptides config only for the duration of the patch and restore them
+    afterwards.  This keeps repeated dense/1-hop preparation in one process
+    deterministic.
+    """
+
+    from ..grit_patches import peptides as pc
+    from ..grit_patches import zinc_onehop as onehop
+
+    previous = (
+        onehop.DENSE_OFFICIAL_CFG,
+        onehop.OFFICIAL_CFG,
+        onehop.ONE_HOP_CFG_TEXT,
+    )
+    try:
+        onehop.DENSE_OFFICIAL_CFG = pc.DENSE_OFFICIAL_CFG
+        onehop.OFFICIAL_CFG = pc.ONEHOP_OFFICIAL_CFG
+        onehop.ONE_HOP_CFG_TEXT = pc.PEPTIDES_STRUCT_ONEHOP_CFG_TEXT
+        onehop.apply_parameter_matched_onehop_patch(Path(repo_dir), Path(repo_dir))
+    finally:
+        (
+            onehop.DENSE_OFFICIAL_CFG,
+            onehop.OFFICIAL_CFG,
+            onehop.ONE_HOP_CFG_TEXT,
+        ) = previous
+    log("[peptides] applied checkpoint-compatible Peptides-struct 1-hop patch")
+
+
 def ensure_repo_root_on_path(repo_dir: Path = None) -> None:
     """Retained compatibility hook for callers that also need repository-local resources."""
     env.ensure_repo_root_on_path()

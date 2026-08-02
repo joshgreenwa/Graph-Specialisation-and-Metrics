@@ -71,6 +71,7 @@ TASKS = (
     "zinc",
 )
 QM9_TASKS = ("qm9_gap_1hop", "qm9_gap_1hop_vnode", "qm9_gap_dense")
+PEPTIDES_STRUCT_TASKS = ("peptides_struct_1hop", "peptides_struct")
 DEFAULT_INTERPOLATION_DOSES = (0.01, 0.02, 0.05, 0.10, 0.25, 0.50, 1.00)
 TASK_LABELS = {
     "zinc_1hop": "1-hop GRIT",
@@ -81,6 +82,8 @@ TASK_LABELS = {
     "qm9_gap_1hop": "1-hop GRIT",
     "qm9_gap_1hop_vnode": "1-hop GRIT + VN",
     "qm9_gap_dense": "Dense GRIT",
+    "peptides_struct_1hop": "1-hop GRIT",
+    "peptides_struct": "Dense GRIT",
 }
 CHANNELS = ("semantic", "structural")
 DONOR_METHODS = ("functional_carriage",)
@@ -121,6 +124,8 @@ MODEL_COLOURS = {
     "qm9_gap_1hop": "#0072B2",
     "qm9_gap_1hop_vnode": "#CC79A7",
     "qm9_gap_dense": "#D55E00",
+    "peptides_struct_1hop": "#0072B2",
+    "peptides_struct": "#D55E00",
 }
 MODEL_MARKERS = {
     "zinc_1hop": "o",
@@ -131,6 +136,8 @@ MODEL_MARKERS = {
     "qm9_gap_1hop": "o",
     "qm9_gap_1hop_vnode": "D",
     "qm9_gap_dense": "s",
+    "peptides_struct_1hop": "o",
+    "peptides_struct": "s",
 }
 MODEL_LINESTYLES = {
     "zinc_1hop": "-",
@@ -141,6 +148,8 @@ MODEL_LINESTYLES = {
     "qm9_gap_1hop": "-",
     "qm9_gap_1hop_vnode": "-.",
     "qm9_gap_dense": ":",
+    "peptides_struct_1hop": "-",
+    "peptides_struct": ":",
 }
 
 
@@ -152,7 +161,8 @@ class ReachProfile:
     analysis_version: str
     tasks: tuple[str, ...]
     reference_task: str
-    atom_vocab_size: int
+    atom_vocab_size: int | None
+    node_feature_fields: int
     event_stage: str
     figure_prefix: str
     default_output_dir: str
@@ -164,6 +174,7 @@ ZINC_PROFILE = ReachProfile(
     tasks=TASKS,
     reference_task="zinc",
     atom_vocab_size=21,
+    node_feature_fields=1,
     event_stage="zinc_reach",
     figure_prefix="zinc",
     default_output_dir=(
@@ -177,11 +188,26 @@ QM9_PROFILE = ReachProfile(
     tasks=QM9_TASKS,
     reference_task="qm9_gap_dense",
     atom_vocab_size=10,
+    node_feature_fields=1,
     event_stage="qm9_reach",
     figure_prefix="qm9",
     default_output_dir=(
         "/content/drive/MyDrive/graph_specialisation_metrics/"
         "qm9_bamberger_functional_reach_v3"
+    ),
+)
+PEPTIDES_STRUCT_PROFILE = ReachProfile(
+    name="Peptides-struct",
+    analysis_version="peptides-struct-bamberger-functional-reach-v1",
+    tasks=PEPTIDES_STRUCT_TASKS,
+    reference_task="peptides_struct",
+    atom_vocab_size=None,
+    node_feature_fields=9,
+    event_stage="peptides_struct_reach",
+    figure_prefix="peptides_struct",
+    default_output_dir=(
+        "/content/drive/MyDrive/graph_specialisation_metrics/"
+        "peptides_struct_bamberger_functional_reach_v1"
     ),
 )
 
@@ -192,6 +218,7 @@ class ZincReachConfig:
 
     profile: ReachProfile = ZINC_PROFILE
     tasks: tuple[str, ...] = TASKS
+    channels: tuple[str, ...] = CHANNELS
     seed: int = 0
     graphs: int = 64
     sources_per_graph: int = 6
@@ -217,10 +244,16 @@ class ZincReachConfig:
     analysis_seed: int = 91_021
     accelerator: str = "cuda:0"
     num_threads: int = 4
+    compute_output_carriage: bool = True
+    compute_beneficial: bool = True
+    compute_survival: bool = True
+    compute_scale_analysis: bool = True
 
     def validate(self) -> None:
         if not self.tasks or any(task not in self.profile.tasks for task in self.tasks):
             raise ValueError(f"tasks must be drawn from {self.profile.tasks}")
+        if not self.channels or any(channel not in CHANNELS for channel in self.channels):
+            raise ValueError(f"channels must be drawn from {CHANNELS}")
         for name in (
             "graphs",
             "sources_per_graph",
@@ -267,6 +300,7 @@ class ZincReachConfig:
             "analysis_version": self.profile.analysis_version,
             "dataset": self.profile.name,
             "tasks": list(self.tasks),
+            "channels": list(self.channels),
             "seed": int(self.seed),
             "graphs": int(self.graphs),
             "sources_per_graph": int(self.sources_per_graph),
@@ -299,7 +333,12 @@ class ZincReachConfig:
             "effect_floor": float(self.effect_floor),
             "bootstrap_replicates": int(self.bootstrap_replicates),
             "analysis_seed": int(self.analysis_seed),
-            "channels": list(CHANNELS),
+            "extensions": {
+                "output_carriage": bool(self.compute_output_carriage),
+                "beneficial": bool(self.compute_beneficial),
+                "survival": bool(self.compute_survival),
+                "scale_analysis": bool(self.compute_scale_analysis),
+            },
             "finite_estimand": (
                 "clean-minus-donor final pre-pooling node-state change, projected "
                 "through the clean graph-output Jacobian"
@@ -354,7 +393,13 @@ class ZincReachConfig:
                 "bamberger_output_nodes": int(self.bamberger_output_nodes),
                 "bamberger_output_channels": int(self.bamberger_output_channels),
                 "interpolation_doses": list(self.interpolation_doses),
-                "atom_vocab_size": int(self.profile.atom_vocab_size),
+                "atom_vocab_size": (
+                    None
+                    if self.profile.atom_vocab_size is None
+                    else int(self.profile.atom_vocab_size)
+                ),
+                "node_feature_fields": int(self.profile.node_feature_fields),
+                "channels": list(self.channels),
                 "event_stage": self.profile.event_stage,
             }
         )
@@ -386,7 +431,7 @@ class ZincReachConfig:
                 "atol": float(self.beneficial_atol),
                 "rtol": float(self.beneficial_rtol),
                 "max_intervals": int(self.beneficial_max_intervals),
-                "channels": list(CHANNELS),
+                "channels": list(self.channels),
             }
         )
 
@@ -615,12 +660,48 @@ def _atom_embedding(net: Any, *, vocab_size: int) -> Any:
     return candidates[0]
 
 
+def _atom_embeddings(net: Any, *, profile: ReachProfile) -> tuple[Any, ...]:
+    """Return the ordered categorical embeddings used by the node encoder.
+
+    ZINC and QM9 have one categorical atom field.  OGB Peptides has nine and
+    its AtomEncoder sums one embedding per field.  Restrict discovery to the
+    node encoder so bond embeddings cannot be selected accidentally.
+    """
+
+    import torch
+
+    if int(profile.node_feature_fields) == 1:
+        if profile.atom_vocab_size is None:
+            raise RuntimeError("single-field input requires an atom vocabulary size")
+        return (
+            _atom_embedding(net, vocab_size=int(profile.atom_vocab_size)),
+        )
+
+    node_encoder = getattr(getattr(net, "encoder", None), "node_encoder", None)
+    candidates = (
+        tuple(
+            module
+            for module in node_encoder.modules()
+            if isinstance(module, torch.nn.Embedding)
+        )
+        if node_encoder is not None
+        else ()
+    )
+    expected = int(profile.node_feature_fields)
+    if len(candidates) != expected:
+        raise RuntimeError(
+            f"expected {expected} categorical node-feature embeddings, "
+            f"found {len(candidates)}"
+        )
+    return candidates
+
+
 def _after_feature_encoder(
     prepared: Any,
     graphs: Sequence[Any],
     *,
-    atom_vocab_size: int,
-) -> tuple[Any, Any, Any]:
+    profile: ReachProfile,
+) -> tuple[Any, Any, tuple[Any, ...]]:
     """Run only the categorical node/edge encoder."""
 
     from torch_geometric.data import Batch
@@ -631,17 +712,27 @@ def _after_feature_encoder(
     batch = Batch.from_data_list([graph.clone() for graph in graphs]).to(
         prepared.runtime.device
     )
-    raw_atoms = batch.x[:, 0].long().detach().clone()
+    raw_features = batch.x.long().detach().clone()
+    if raw_features.ndim == 1:
+        raw_features = raw_features[:, None]
+    if int(raw_features.shape[1]) != int(profile.node_feature_fields):
+        raise RuntimeError(
+            f"expected {int(profile.node_feature_fields)} node-feature fields, "
+            f"found {int(raw_features.shape[1])}"
+        )
     encoded = net.encoder(batch)
-    embedding = _atom_embedding(net, vocab_size=int(atom_vocab_size))
-    expected = embedding(raw_atoms)
+    embeddings = _atom_embeddings(net, profile=profile)
+    expected = sum(
+        embedding(raw_features[:, field])
+        for field, embedding in enumerate(embeddings)
+    )
     if encoded.x.shape != expected.shape:
-        raise RuntimeError("atom encoder geometry is not the expected single embedding")
+        raise RuntimeError("atom encoder geometry differs from its categorical embeddings")
     if not bool((encoded.x.detach() - expected.detach()).abs().max() <= 1.0e-6):
         raise RuntimeError(
-            "node encoder is not equivalent to the registered atom embedding"
+            "node encoder is not equivalent to the registered categorical embeddings"
         )
-    return encoded, raw_atoms, embedding
+    return encoded, raw_features, embeddings
 
 
 def _finish_encoding(net: Any, after_encoder: Any) -> Any:
@@ -690,20 +781,26 @@ def _bamberger_rows(
     import torch.nn.functional as functional
 
     net = prepared.runtime.model.model
-    after_encoder, raw_atoms, embedding = _after_feature_encoder(
+    after_encoder, raw_features, embeddings = _after_feature_encoder(
         prepared,
         [base],
-        atom_vocab_size=int(config.profile.atom_vocab_size),
+        profile=config.profile,
     )
     nodes = int(base.num_nodes)
-    one_hot = functional.one_hot(
-        raw_atoms,
-        num_classes=int(embedding.num_embeddings),
-    ).to(dtype=embedding.weight.dtype)
-    one_hot.requires_grad_(True)
+    relaxed_inputs = []
+    encoded_input = None
+    for field, embedding in enumerate(embeddings):
+        one_hot = functional.one_hot(
+            raw_features[:, field],
+            num_classes=int(embedding.num_embeddings),
+        ).to(dtype=embedding.weight.dtype)
+        one_hot.requires_grad_(True)
+        relaxed_inputs.append(one_hot)
+        contribution = one_hot @ embedding.weight
+        encoded_input = contribution if encoded_input is None else encoded_input + contribution
 
     data = after_encoder.clone()
-    data.x = one_hot @ embedding.weight
+    data.x = encoded_input
     layer_input = _finish_encoding(net, data)
     mask = _real_mask(layer_input)
     final = _forward_final(
@@ -740,14 +837,19 @@ def _bamberger_rows(
         influence = torch.zeros(nodes, device=final.device, dtype=final.dtype)
         for output_channel in output_channels:
             completed += 1
-            gradient = torch.autograd.grad(
+            gradients = torch.autograd.grad(
                 final[int(output_node), int(output_channel)],
-                one_hot,
+                tuple(relaxed_inputs),
                 retain_graph=completed < calls,
                 allow_unused=False,
-            )[0]
-            influence += gradient.abs().sum(dim=-1)
+            )
+            influence += sum(
+                gradient.abs().sum(dim=-1) for gradient in gradients
+            )
         for input_node in range(nodes):
+            distance = distances[int(output_node), input_node]
+            if not np.isfinite(distance):
+                continue
             rows.append(
                 {
                     "analysis_version": config.profile.analysis_version,
@@ -758,10 +860,14 @@ def _bamberger_rows(
                     "graph": int(graph_id),
                     "output_node": int(output_node),
                     "input_node": int(input_node),
-                    "distance": int(distances[int(output_node), input_node]),
+                    "distance": int(distance),
                     "influence": float(influence[input_node].detach().cpu()),
                     "sampled_output_channels": int(len(output_channels)),
-                    "input_space": "differentiable one-hot atom type",
+                    "input_space": (
+                        "differentiable one-hot atom type"
+                        if len(embeddings) == 1
+                        else "differentiable concatenated one-hot OGB atom features"
+                    ),
                     "output_space": "final pre-pooling node embedding",
                 }
             )
@@ -824,10 +930,7 @@ def _semantic_interpolation_mass(
     output[full_index] = full_mass
 
     net = prepared.runtime.model.model
-    embedding = _atom_embedding(
-        net,
-        vocab_size=int(config.profile.atom_vocab_size),
-    )
+    embeddings = _atom_embeddings(net, profile=config.profile)
 
     conditions = [
         (dose_index, event_index)
@@ -838,31 +941,41 @@ def _semantic_interpolation_mass(
     batch_size = int(config.interpolation_batch_size)
     for start in range(0, len(conditions), batch_size):
         chunk = conditions[start : start + batch_size]
-        hook_calls = 0
+        hook_calls = [0 for _ in embeddings]
 
-        def interpolate_embedding(_module: Any, inputs: Any, result: Any) -> Any:
-            nonlocal hook_calls
-            hook_calls += 1
-            expected_nodes = (len(chunk) + 1) * nodes
-            if int(result.shape[0]) != expected_nodes:
-                raise RuntimeError("interpolation embedding batch lost node alignment")
-            atom_types = inputs[0].reshape(-1)
-            modified = result.clone()
-            for condition_index, (dose_index, event_index) in enumerate(chunk):
-                source = int(events[event_index].source)
-                global_source = (condition_index + 1) * nodes + source
-                clean_atom = int(atom_types[global_source])
-                donor_atom = int(variants[event_index].x[source].reshape(-1)[0])
-                if donor_atom == clean_atom:
-                    raise RuntimeError("semantic interpolation direction is zero")
-                dose = doses[dose_index]
-                modified[global_source] = (
-                    (1.0 - dose) * embedding.weight[clean_atom]
-                    + dose * embedding.weight[donor_atom]
-                )
-            return modified
+        def make_interpolation_hook(field: int, embedding: Any):
+            def interpolate_embedding(
+                _module: Any,
+                inputs: Any,
+                result: Any,
+            ) -> Any:
+                hook_calls[field] += 1
+                expected_nodes = (len(chunk) + 1) * nodes
+                if int(result.shape[0]) != expected_nodes:
+                    raise RuntimeError("interpolation embedding batch lost node alignment")
+                feature_values = inputs[0].reshape(-1)
+                modified = result.clone()
+                for condition_index, (dose_index, event_index) in enumerate(chunk):
+                    source = int(events[event_index].source)
+                    global_source = (condition_index + 1) * nodes + source
+                    clean_value = int(feature_values[global_source])
+                    donor_row = variants[event_index].x[source].reshape(-1)
+                    donor_value = int(donor_row[field])
+                    dose = doses[dose_index]
+                    modified[global_source] = (
+                        (1.0 - dose) * embedding.weight[clean_value]
+                        + dose * embedding.weight[donor_value]
+                    )
+                return modified
 
-        handle = embedding.register_forward_hook(interpolate_embedding)
+            return interpolate_embedding
+
+        handles = [
+            embedding.register_forward_hook(
+                make_interpolation_hook(field, embedding)
+            )
+            for field, embedding in enumerate(embeddings)
+        ]
         try:
             with torch.no_grad():
                 captured = prepared.backend.capture(
@@ -870,10 +983,11 @@ def _semantic_interpolation_mass(
                     require_grad=False,
                 )
         finally:
-            handle.remove()
-        if hook_calls != 1:
+            for handle in handles:
+                handle.remove()
+        if any(calls != 1 for calls in hook_calls):
             raise RuntimeError(
-                f"atom embedding fired {hook_calls} times during interpolation"
+                f"atom embeddings fired {hook_calls} times during interpolation"
             )
         batch_clean = captured.final_state[0]
         if tuple(batch_clean.shape) != tuple(clean_final.shape):
@@ -943,6 +1057,9 @@ def _donor_rows(
         if source not in sources:
             raise RuntimeError("event source is absent from the frozen source set")
         for carrier in range(int(base.num_nodes)):
+            distance = distances[source, carrier]
+            if not np.isfinite(distance):
+                continue
             row = {
                 "analysis_version": config.profile.analysis_version,
                 "fingerprint": config.fingerprint,
@@ -957,7 +1074,7 @@ def _donor_rows(
                 "draw": int(event.draw),
                 "dose": float(event.dose),
                 "carrier": int(carrier),
-                "distance": int(distances[source, carrier]),
+                "distance": int(distance),
                 "functional_carriage": float(
                     finite_mass[event_index, carrier].detach().cpu()
                 ),
@@ -979,7 +1096,7 @@ def _donor_rows(
                             "draw": int(event.draw),
                             "interpolation_dose": float(dose),
                             "carrier": int(carrier),
-                            "distance": int(distances[source, carrier]),
+                            "distance": int(distance),
                             "functional_carriage": float(
                                 interpolation_mass[
                                     dose_index,
@@ -1085,6 +1202,9 @@ def _signed_output_carriage_rows(
     for event_index, event in enumerate(events):
         source = int(event.source)
         for carrier in range(int(base.num_nodes)):
+            distance = distances[source, carrier]
+            if not np.isfinite(distance):
+                continue
             value = float(signed[event_index, carrier].detach().cpu())
             output.append(
                 {
@@ -1101,7 +1221,7 @@ def _signed_output_carriage_rows(
                     "donor_node": int(event.donor_node),
                     "draw": int(event.draw),
                     "carrier": int(carrier),
-                    "distance": int(distances[source, carrier]),
+                    "distance": int(distance),
                     "signed_output_carriage": value,
                     "absolute_output_carriage": abs(value),
                     "event_output_delta": float(
@@ -1266,6 +1386,9 @@ def _beneficial_rows_for_channel(
     for event_index, event in enumerate(events):
         source = int(event.source)
         for carrier in range(int(base.num_nodes)):
+            distance = distances[source, carrier]
+            if not np.isfinite(distance):
+                continue
             rows.append(
                 {
                     "analysis_version": config.profile.analysis_version,
@@ -1286,7 +1409,7 @@ def _beneficial_rows_for_channel(
                     "dose": float(event.dose),
                     "payload_fingerprint": str(event.payload_fingerprint),
                     "carrier": int(carrier),
-                    "distance": int(distances[source, carrier]),
+                    "distance": int(distance),
                     "beneficial_carriage": float(
                         event_b[event_index, carrier].detach().cpu()
                     ),
@@ -1332,7 +1455,7 @@ def _measure_beneficial_graph(
         )
     )
     channel_batches: list[tuple[str, list[Any], list[Any]]] = []
-    for channel in CHANNELS:
+    for channel in config.channels:
         variants: list[Any] = []
         events: list[Any] = []
         for source in sources:
@@ -1883,7 +2006,7 @@ def _measure_graph(
     )
     donor_rows: list[dict[str, Any]] = []
     interpolation_rows: list[dict[str, Any]] = []
-    for channel in CHANNELS:
+    for channel in config.channels:
         variants: list[Any] = []
         events: list[Any] = []
         for source in sources:
@@ -2162,6 +2285,7 @@ def measure(
     donor_rows: list[dict[str, Any]] = []
     interpolation_rows: list[dict[str, Any]] = []
     bamberger_rows: list[dict[str, Any]] = []
+    core_failures: list[dict[str, Any]] = []
     output_carriage_rows: list[dict[str, Any]] = []
     output_carriage_failures: list[dict[str, Any]] = []
     beneficial_rows: list[dict[str, Any]] = []
@@ -2193,9 +2317,10 @@ def measure(
                 "parameters": prepared.runtime.checks.get("num_parameters"),
             }
         )
-        full_test_records.extend(
-            _full_test_rows(config, prepared, task=task)
-        )
+        if config.compute_scale_analysis:
+            full_test_records.extend(
+                _full_test_rows(config, prepared, task=task)
+            )
         results_dir = output_dir / "results"
         _write_csv(results_dir / "full_test_metrics.csv", full_test_records)
         graph_ids = tuple(prepared.splits.discovery)[: int(config.graphs)]
@@ -2210,18 +2335,38 @@ def measure(
                 compatible_legacy_fingerprints=compatible_slow_fingerprints,
             )
             if shard is None:
-                if progress:
+                try:
+                    if progress:
+                        print(
+                            f"[reach:core] {TASK_LABELS[task]} graph={int(graph_id)}",
+                            flush=True,
+                        )
+                    shard = _measure_graph(
+                        config,
+                        prepared,
+                        task=task,
+                        graph_id=int(graph_id),
+                    )
+                except Exception as error:
+                    core_failures.append(
+                        {
+                            "task": task,
+                            "model_label": TASK_LABELS[task],
+                            "graph": int(graph_id),
+                            "error_type": type(error).__name__,
+                            "error": str(error),
+                            "will_retry": True,
+                        }
+                    )
                     print(
-                        f"[reach:core] {TASK_LABELS[task]} graph={int(graph_id)}",
+                        f"[reach:warning] {task} graph={int(graph_id)} core reach "
+                        f"could not be estimated ({type(error).__name__}: {error}); "
+                        "the analysis continues and the graph will be retried next run.",
                         flush=True,
                     )
-                shard = _measure_graph(
-                    config,
-                    prepared,
-                    task=task,
-                    graph_id=int(graph_id),
-                )
-                _save_shard(path, shard)
+                    continue
+                else:
+                    _save_shard(path, shard)
             elif "cache_fingerprint" not in shard:
                 if progress:
                     print(
@@ -2240,13 +2385,17 @@ def measure(
                 task,
                 int(graph_id),
             )
-            output_shard = _load_output_carriage_shard(
-                output_path,
-                analysis_version=config.profile.analysis_version,
-                fingerprint=config.fingerprint,
-                cache_fingerprint=config.output_cache_fingerprint,
-                checkpoint_sha256=str(prepared.checkpoint_sha),
-                compatible_legacy_fingerprints=compatible_slow_fingerprints,
+            output_shard = (
+                _load_output_carriage_shard(
+                    output_path,
+                    analysis_version=config.profile.analysis_version,
+                    fingerprint=config.fingerprint,
+                    cache_fingerprint=config.output_cache_fingerprint,
+                    checkpoint_sha256=str(prepared.checkpoint_sha),
+                    compatible_legacy_fingerprints=compatible_slow_fingerprints,
+                )
+                if config.compute_output_carriage
+                else {"output_carriage_rows": []}
             )
             if output_shard is None:
                 try:
@@ -2282,7 +2431,7 @@ def measure(
                     output_shard = {"output_carriage_rows": []}
                 else:
                     _save_shard(output_path, output_shard)
-            elif "cache_fingerprint" not in output_shard:
+            elif config.compute_output_carriage and "cache_fingerprint" not in output_shard:
                 if progress:
                     print(
                         f"[reach:cache] reusing completed output-path shard for "
@@ -2300,15 +2449,19 @@ def measure(
                 task,
                 int(graph_id),
             )
-            beneficial_shard = _load_extension_shard(
-                beneficial_path,
-                version_key="beneficial_version",
-                version=BENEFICIAL_CARRIAGE_VERSION,
-                rows_key="beneficial_rows",
-                analysis_version=config.profile.analysis_version,
-                fingerprint=config.fingerprint,
-                cache_fingerprint=config.beneficial_cache_fingerprint,
-                checkpoint_sha256=str(prepared.checkpoint_sha),
+            beneficial_shard = (
+                _load_extension_shard(
+                    beneficial_path,
+                    version_key="beneficial_version",
+                    version=BENEFICIAL_CARRIAGE_VERSION,
+                    rows_key="beneficial_rows",
+                    analysis_version=config.profile.analysis_version,
+                    fingerprint=config.fingerprint,
+                    cache_fingerprint=config.beneficial_cache_fingerprint,
+                    checkpoint_sha256=str(prepared.checkpoint_sha),
+                )
+                if config.compute_beneficial
+                else {"beneficial_rows": []}
             )
             if beneficial_shard is None:
                 try:
@@ -2348,15 +2501,19 @@ def measure(
             beneficial_rows.extend(beneficial_shard["beneficial_rows"])
 
             survival_path = _survival_shard_path(output_dir, task, int(graph_id))
-            survival_shard = _load_extension_shard(
-                survival_path,
-                version_key="survival_version",
-                version=SURVIVAL_VERSION,
-                rows_key="survival_rows",
-                analysis_version=config.profile.analysis_version,
-                fingerprint=config.fingerprint,
-                cache_fingerprint=config.survival_cache_fingerprint,
-                checkpoint_sha256=str(prepared.checkpoint_sha),
+            survival_shard = (
+                _load_extension_shard(
+                    survival_path,
+                    version_key="survival_version",
+                    version=SURVIVAL_VERSION,
+                    rows_key="survival_rows",
+                    analysis_version=config.profile.analysis_version,
+                    fingerprint=config.fingerprint,
+                    cache_fingerprint=config.survival_cache_fingerprint,
+                    checkpoint_sha256=str(prepared.checkpoint_sha),
+                )
+                if config.compute_survival
+                else {"survival_rows": []}
             )
             if survival_shard is None:
                 try:
@@ -2427,6 +2584,7 @@ def measure(
     _write_csv(results_dir / "donor_carrier_mass.csv", donor_rows)
     _write_csv(results_dir / "semantic_interpolation_mass.csv", interpolation_rows)
     _write_csv(results_dir / "bamberger_input_output_influence.csv", bamberger_rows)
+    _write_csv(results_dir / "core_failures.csv", core_failures)
     _write_csv(results_dir / "semantic_output_carriage.csv", output_carriage_rows)
     _write_csv(results_dir / "beneficial_carriage.csv", beneficial_rows)
     _write_csv(results_dir / "shell_survival.csv", survival_rows)
@@ -2452,6 +2610,7 @@ def measure(
             "donor_rows": len(donor_rows),
             "interpolation_rows": len(interpolation_rows),
             "bamberger_rows": len(bamberger_rows),
+            "core_failures": core_failures,
             "output_carriage_rows": len(output_carriage_rows),
             "output_carriage_audit": output_carriage_audit,
             "output_carriage_failures": output_carriage_failures,
@@ -2541,6 +2700,7 @@ def measure(
         "donor_rows": donor_rows,
         "interpolation_rows": interpolation_rows,
         "bamberger_rows": bamberger_rows,
+        "core_failures": core_failures,
         "output_carriage_rows": output_carriage_rows,
         "output_carriage_audit": output_carriage_audit,
         "output_carriage_failures": output_carriage_failures,
@@ -5913,15 +6073,23 @@ def plot_expected_distance(
     *,
     figures_dir: Path,
     tasks: Sequence[str] = TASKS,
+    channels: Sequence[str] = CHANNELS,
     dataset_label: str = "ZINC",
     figure_prefix: str = "zinc",
 ) -> dict[str, str]:
     import matplotlib.pyplot as plt
 
     _figure_theme()
-    fig, axes = plt.subplots(1, 2, figsize=(10.8, 4.1), sharey=True)
+    fig, axes_grid = plt.subplots(
+        1,
+        len(channels),
+        figsize=(5.4 * len(channels), 4.1),
+        sharey=True,
+        squeeze=False,
+    )
+    axes = axes_grid[0]
     positions = np.arange(len(tasks), dtype=np.float64)
-    for axis, channel in zip(axes, CHANNELS):
+    for axis, channel in zip(axes, channels):
         methods = (
             ("bamberger", *DONOR_METHODS)
             if channel == "semantic"
@@ -5973,15 +6141,17 @@ def plot_expected_distance(
         )
         axis.set_ylabel("Expected shortest-path distance")
         axis.set_ylim(bottom=0)
-    axes[1].text(
-        0.03,
-        0.95,
-        "Bamberger structural analogue not defined",
-        transform=axes[1].transAxes,
-        va="top",
-        color="#666666",
-        fontsize=8,
-    )
+    if "structural" in channels:
+        structural_axis = axes[list(channels).index("structural")]
+        structural_axis.text(
+            0.03,
+            0.95,
+            "Bamberger structural analogue not defined",
+            transform=structural_axis.transAxes,
+            va="top",
+            color="#666666",
+            fontsize=8,
+        )
     handles, labels = axes[0].get_legend_handles_labels()
     fig.legend(
         handles,
@@ -6455,16 +6625,22 @@ def figures(
     output_carriage_failures_path = results_dir / "output_carriage_failures.csv"
     graph_metrics_path = results_dir / "graph_metrics.csv"
     full_test_metrics_path = results_dir / "full_test_metrics.csv"
-    if (
-        not donor_path.is_file()
-        or not interpolation_path.is_file()
-        or not bamberger_path.is_file()
-        or not output_carriage_path.is_file()
-        or not beneficial_path.is_file()
-        or not survival_path.is_file()
-        or not graph_metrics_path.is_file()
-        or not full_test_metrics_path.is_file()
-    ):
+    required_paths = [
+        donor_path,
+        interpolation_path,
+        bamberger_path,
+        graph_metrics_path,
+    ]
+    output_carriage_failures: list[dict[str, Any]] = []
+    if config.compute_output_carriage:
+        required_paths.append(output_carriage_path)
+    if config.compute_beneficial:
+        required_paths.append(beneficial_path)
+    if config.compute_survival:
+        required_paths.append(survival_path)
+    if config.compute_scale_analysis:
+        required_paths.append(full_test_metrics_path)
+    if any(not path.is_file() for path in required_paths):
         raise FileNotFoundError(
             "cached measurement CSVs are missing; run PHASE='measure' or 'all' first"
         )
@@ -6494,45 +6670,56 @@ def figures(
         _read_csv(interpolation_path),
         effect_floor=float(config.effect_floor),
     )
-    output_carriage_raw = _read_csv(output_carriage_path)
-    output_carriage_failures = (
-        _read_csv(output_carriage_failures_path)
-        if output_carriage_failures_path.is_file()
-        else []
-    )
-    output_carriage_audit = summarise_output_carriage_audit(
-        output_carriage_raw,
-        failures=output_carriage_failures,
-    )
-    if print_audit:
-        _print_output_carriage_audit(output_carriage_audit)
-    output_coherence_graph = graph_output_coherence_profiles(
-        output_carriage_raw,
-        effect_floor=float(config.effect_floor),
-    )
-    output_coherence_profiles, output_coherence_expected = (
-        summarise_output_coherence(
+    output_carriage_audit: list[dict[str, Any]] = []
+    output_coherence_graph: list[dict[str, Any]] = []
+    output_coherence_profiles: list[dict[str, Any]] = []
+    output_coherence_expected: list[dict[str, Any]] = []
+    if config.compute_output_carriage:
+        output_carriage_raw = _read_csv(output_carriage_path)
+        output_carriage_failures = (
+            _read_csv(output_carriage_failures_path)
+            if output_carriage_failures_path.is_file()
+            else []
+        )
+        output_carriage_audit = summarise_output_carriage_audit(
+            output_carriage_raw,
+            failures=output_carriage_failures,
+        )
+        if print_audit:
+            _print_output_carriage_audit(output_carriage_audit)
+        output_coherence_graph = graph_output_coherence_profiles(
+            output_carriage_raw,
+            effect_floor=float(config.effect_floor),
+        )
+        output_coherence_profiles, output_coherence_expected = summarise_output_coherence(
             output_coherence_graph,
             bootstrap_replicates=int(config.bootstrap_replicates),
             bootstrap_seed=int(config.analysis_seed) + 500,
         )
-    )
-    beneficial_graph, beneficial_summary = summarise_beneficial_carriage(
-        _read_csv(beneficial_path),
-        bootstrap_replicates=int(config.bootstrap_replicates),
-        bootstrap_seed=int(config.analysis_seed) + 600,
-    )
-    survival_raw = _read_csv(survival_path)
-    survival_graph, survival_summary, survival_contrasts = summarise_shell_survival(
-        survival_raw,
-        bootstrap_replicates=int(config.bootstrap_replicates),
-        bootstrap_seed=int(config.analysis_seed) + 700,
-    )
-    survival_by_size = summarise_shell_survival_by_size(
-        survival_raw,
-        bootstrap_replicates=int(config.bootstrap_replicates),
-        bootstrap_seed=int(config.analysis_seed) + 800,
-    )
+    beneficial_graph: list[dict[str, Any]] = []
+    beneficial_summary: list[dict[str, Any]] = []
+    if config.compute_beneficial:
+        beneficial_graph, beneficial_summary = summarise_beneficial_carriage(
+            _read_csv(beneficial_path),
+            bootstrap_replicates=int(config.bootstrap_replicates),
+            bootstrap_seed=int(config.analysis_seed) + 600,
+        )
+    survival_graph: list[dict[str, Any]] = []
+    survival_summary: list[dict[str, Any]] = []
+    survival_contrasts: list[dict[str, Any]] = []
+    survival_by_size: list[dict[str, Any]] = []
+    if config.compute_survival:
+        survival_raw = _read_csv(survival_path)
+        survival_graph, survival_summary, survival_contrasts = summarise_shell_survival(
+            survival_raw,
+            bootstrap_replicates=int(config.bootstrap_replicates),
+            bootstrap_seed=int(config.analysis_seed) + 700,
+        )
+        survival_by_size = summarise_shell_survival_by_size(
+            survival_raw,
+            bootstrap_replicates=int(config.bootstrap_replicates),
+            bootstrap_seed=int(config.analysis_seed) + 800,
+        )
     interpolation_contrasts, interpolation_summary = (
         summarise_interpolation_contrasts(
             interpolation_graph,
@@ -6571,15 +6758,19 @@ def figures(
         bootstrap_seed=int(config.analysis_seed) + 200,
         reference_task=config.profile.reference_task,
     )
-    scale_rows, scale_summary, scale_trends = summarise_scale_dependence(
-        graph_rows,
-        _read_csv(graph_metrics_path),
-        _read_csv(full_test_metrics_path),
-        tasks=config.tasks,
-        reference_task=config.profile.reference_task,
-        bootstrap_replicates=int(config.bootstrap_replicates),
-        bootstrap_seed=int(config.analysis_seed) + 400,
-    )
+    scale_rows: list[dict[str, Any]] = []
+    scale_summary: list[dict[str, Any]] = []
+    scale_trends: list[dict[str, Any]] = []
+    if config.compute_scale_analysis:
+        scale_rows, scale_summary, scale_trends = summarise_scale_dependence(
+            graph_rows,
+            _read_csv(graph_metrics_path),
+            _read_csv(full_test_metrics_path),
+            tasks=config.tasks,
+            reference_task=config.profile.reference_task,
+            bootstrap_replicates=int(config.bootstrap_replicates),
+            bootstrap_seed=int(config.analysis_seed) + 400,
+        )
     _write_csv(results_dir / "graph_distance_profiles.csv", graph_rows)
     _write_csv(results_dir / "distance_profile_summary.csv", profile_rows)
     _write_csv(results_dir / "dense_profile_contrasts.csv", contrast_rows)
@@ -6701,7 +6892,17 @@ def figures(
             tasks=config.tasks,
             reference_task=config.profile.reference_task,
         ),
-        "structural_functional": plot_model_profiles(
+        "expected_distance": plot_expected_distance(
+            expected_rows,
+            figures_dir=figures_dir,
+            tasks=config.tasks,
+            channels=config.channels,
+            dataset_label=config.profile.name,
+            figure_prefix=config.profile.figure_prefix,
+        ),
+    }
+    if "structural" in config.channels:
+        paths["structural_functional"] = plot_model_profiles(
             profile_rows,
             contrast_rows,
             channel="structural",
@@ -6711,62 +6912,58 @@ def figures(
             figures_dir=figures_dir,
             tasks=config.tasks,
             reference_task=config.profile.reference_task,
-        ),
-        "expected_distance": plot_expected_distance(
-            expected_rows,
-            figures_dir=figures_dir,
-            tasks=config.tasks,
-            dataset_label=config.profile.name,
-            figure_prefix=config.profile.figure_prefix,
-        ),
-        "output_coherence": plot_output_coherence(
+        )
+    if config.compute_output_carriage:
+        paths["output_coherence"] = plot_output_coherence(
             output_coherence_profiles,
             output_coherence_expected,
             figures_dir=figures_dir,
             tasks=config.tasks,
             dataset_label=config.profile.name,
             figure_prefix=config.profile.figure_prefix,
-        ),
-        "beneficial_carriage": plot_beneficial_carriage(
+        )
+    if config.compute_beneficial:
+        paths["beneficial_carriage"] = plot_beneficial_carriage(
             beneficial_summary,
             figures_dir=figures_dir,
             tasks=config.tasks,
             dataset_label=config.profile.name,
             figure_prefix=config.profile.figure_prefix,
-        ),
-        "shell_redundancy": plot_shell_survival(
+        )
+    if config.compute_survival:
+        paths["shell_redundancy"] = plot_shell_survival(
             survival_summary,
             condition="exact_shell",
             figures_dir=figures_dir,
             tasks=config.tasks,
             dataset_label=config.profile.name,
             figure_prefix=config.profile.figure_prefix,
-        ),
-        "tail_redundancy": plot_shell_survival(
+        )
+        paths["tail_redundancy"] = plot_shell_survival(
             survival_summary,
             condition="far_tail",
             figures_dir=figures_dir,
             tasks=config.tasks,
             dataset_label=config.profile.name,
             figure_prefix=config.profile.figure_prefix,
-        ),
-        "scale_dependence": plot_scale_dependence(
+        )
+    if config.compute_scale_analysis:
+        paths["scale_dependence"] = plot_scale_dependence(
             scale_summary,
             figures_dir=figures_dir,
             tasks=config.tasks,
             reference_task=config.profile.reference_task,
             dataset_label=config.profile.name,
             figure_prefix=config.profile.figure_prefix,
-        ),
-        "scale_slopes": plot_scale_slopes(
+        )
+        paths["scale_slopes"] = plot_scale_slopes(
             scale_trends,
             figures_dir=figures_dir,
             tasks=config.tasks,
             reference_task=config.profile.reference_task,
             dataset_label=config.profile.name,
             figure_prefix=config.profile.figure_prefix,
-        ),
-    }
+        )
     _write_json(
         results_dir / "figure_manifest.json",
         {
@@ -6838,6 +7035,7 @@ def build_parser(
         default=profile.default_output_dir,
     )
     parser.add_argument("--tasks", default=",".join(profile.tasks))
+    parser.add_argument("--channels", default=",".join(CHANNELS))
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--graphs", type=int, default=64)
     parser.add_argument("--sources-per-graph", type=int, default=6)
@@ -6866,6 +7064,26 @@ def build_parser(
     parser.add_argument("--analysis-seed", type=int, default=91_021)
     parser.add_argument("--accelerator", default="cuda:0")
     parser.add_argument("--num-threads", type=int, default=4)
+    parser.add_argument(
+        "--output-carriage",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument(
+        "--beneficial",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument(
+        "--survival",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument(
+        "--scale-analysis",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     parser.add_argument("--skip-dependency-install", action="store_true")
     parser.add_argument("--quiet", action="store_true")
     return parser
@@ -6880,6 +7098,9 @@ def main(
     config = ZincReachConfig(
         profile=profile,
         tasks=tuple(value.strip() for value in args.tasks.split(",") if value.strip()),
+        channels=tuple(
+            value.strip() for value in args.channels.split(",") if value.strip()
+        ),
         seed=int(args.seed),
         graphs=int(args.graphs),
         sources_per_graph=int(args.sources_per_graph),
@@ -6913,6 +7134,10 @@ def main(
         analysis_seed=int(args.analysis_seed),
         accelerator=str(args.accelerator),
         num_threads=int(args.num_threads),
+        compute_output_carriage=bool(args.output_carriage),
+        compute_beneficial=bool(args.beneficial),
+        compute_survival=bool(args.survival),
+        compute_scale_analysis=bool(args.scale_analysis),
     )
     config.validate()
     output_dir = Path(args.output_dir)
@@ -6934,13 +7159,26 @@ def main(
             progress=not bool(args.quiet),
         )
     if args.phase in {"all", "figures"}:
-        result.update(
-            figures(
-                config,
-                output_dir=output_dir,
-                print_audit=args.phase == "figures",
+        try:
+            result.update(
+                figures(
+                    config,
+                    output_dir=output_dir,
+                    print_audit=args.phase == "figures",
+                )
             )
-        )
+        except Exception as error:
+            failure = {
+                "error_type": type(error).__name__,
+                "error": str(error),
+                "phase": str(args.phase),
+            }
+            result["figure_failures"] = [failure]
+            print(
+                f"[figures:warning] figures could not be generated "
+                f"({type(error).__name__}: {error}); cached measurements are retained.",
+                flush=True,
+            )
     return result
 
 

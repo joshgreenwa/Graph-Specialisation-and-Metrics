@@ -167,6 +167,19 @@ def _peptides_hooks():
     return (hook,)
 
 
+def _peptides_struct_onehop_hooks():
+    """Deferred reconstruction of the trained Peptides-struct 1-hop control."""
+    from . import peptides_env
+
+    def hook(repo_dir):
+        peptides_env.ensure_repo_root_on_path()
+        peptides_env.install_peptides_deps()
+        peptides_env.apply_peptides_patches(repo_dir)
+        peptides_env.apply_peptides_struct_onehop_patch(repo_dir)
+
+    return (hook,)
+
+
 def _qm9_hooks(
     attention: str,
     hops: int = 1,
@@ -396,5 +409,23 @@ register(GritTaskSpec(
     metric_higher_better=False,
     metric_abort=0.40,     # a correctly loaded model is ~0.246; above 0.40 => broken load
     env_hooks=_peptides_hooks(),
+    node_content_desc="OGB atom features (9)",
+))
+
+
+# Parameter-matched 1-hop Peptides-struct control trained with global RRWP
+# retained on the local bond/self support.
+register(GritTaskSpec(
+    name="peptides_struct_1hop",
+    title="GRIT+RRWP Peptides-struct (1-hop masked)",
+    config_path="configs/GRIT/peptides-struct-GRIT-RRWP-1hop.yaml",
+    expected_params=None,
+    drive_dir="/content/drive/MyDrive/grit_peptides_struct_1hop",
+    paper_metric=None,
+    metric_fn=staticmethod(metrics.mae_metric),
+    metric_higher_better=False,
+    metric_abort=0.40,
+    env_hooks=_peptides_struct_onehop_hooks(),
+    grit_repo_dir="/content/GRIT_peptides_struct_1hop",
     node_content_desc="OGB atom features (9)",
 ))

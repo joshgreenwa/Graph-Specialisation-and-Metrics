@@ -9,6 +9,8 @@ import torch
 
 import graph_specialisation_metrics.zinc_reach_analysis as reach
 from graph_specialisation_metrics.zinc_reach_analysis import (
+    PEPTIDES_STRUCT_PROFILE,
+    PEPTIDES_STRUCT_TASKS,
     QM9_PROFILE,
     QM9_TASKS,
     TASKS,
@@ -31,6 +33,7 @@ from graph_specialisation_metrics.zinc_reach_analysis import (
     summarise_semantic_usage_estimands,
     summarise_shell_survival,
 )
+from graph_specialisation_metrics.carriage.tasks import get_task
 from graph_specialisation_metrics.reach_redundancy import (
     SemanticAssignment,
     SemanticCoalition,
@@ -105,6 +108,106 @@ def test_semantic_interpolation_scales_linear_functional_mass(monkeypatch):
     )
     assert torch.allclose(actual[0], 0.25 * full_mass, atol=1.0e-6)
     assert torch.allclose(actual[1], full_mass)
+
+
+def test_peptides_multifield_interpolation_changes_all_atom_fields():
+    class Data:
+        def __init__(self, x):
+            self.x = x
+            self.edge_attr = None
+            self.num_nodes = 3
+
+    class AtomNodeEncoder(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.atom_embedding_list = torch.nn.ModuleList(
+                (torch.nn.Embedding(4, 3), torch.nn.Embedding(5, 3))
+            )
+
+    encoder = AtomNodeEncoder()
+    with torch.no_grad():
+        for index, embedding in enumerate(encoder.atom_embedding_list):
+            values = torch.arange(
+                embedding.num_embeddings * 3,
+                dtype=torch.float32,
+            ).reshape(embedding.num_embeddings, 3)
+            embedding.weight.copy_((index + 1) * values / 10)
+    raw = torch.tensor([[0, 1], [1, 2], [2, 3]], dtype=torch.long)
+    mixing = torch.tensor(
+        [[1.0, 0.5, 0.0], [0.25, 1.0, 0.5], [0.0, 0.75, 1.0]]
+    )
+    net = SimpleNamespace(encoder=SimpleNamespace(node_encoder=encoder))
+
+    class Backend:
+        def capture(self, data_list, *, require_grad):
+            assert not require_grad
+            repeated = raw.repeat(len(data_list), 1)
+            embedded = sum(
+                embedding(repeated[:, field])
+                for field, embedding in enumerate(encoder.atom_embedding_list)
+            )
+            blocks = embedded.reshape(len(data_list), 3, 3)
+            return SimpleNamespace(
+                final_state=torch.einsum("ij,bjw->biw", mixing, blocks)
+            )
+
+    prepared = SimpleNamespace(
+        runtime=SimpleNamespace(model=SimpleNamespace(model=net)),
+        backend=Backend(),
+    )
+    profile = replace(
+        PEPTIDES_STRUCT_PROFILE,
+        tasks=("peptides_struct",),
+        node_feature_fields=2,
+    )
+    config = ZincReachConfig(
+        profile=profile,
+        tasks=("peptides_struct",),
+        interpolation_doses=(0.25, 1.0),
+        interpolation_batch_size=4,
+    )
+    base = Data(raw)
+    variant = Data(torch.tensor([[0, 1], [3, 4], [2, 3]], dtype=torch.long))
+    event = SimpleNamespace(source=1)
+    clean_embedded = sum(
+        embedding(raw[:, field])
+        for field, embedding in enumerate(encoder.atom_embedding_list)
+    )
+    donor_embedded = clean_embedded.clone()
+    donor_embedded[1] = sum(
+        embedding(variant.x[1, field])
+        for field, embedding in enumerate(encoder.atom_embedding_list)
+    )
+    clean_final = mixing @ clean_embedded
+    full_final = mixing @ donor_embedded
+    gradient = torch.ones(1, 3, 3)
+    full_mass = reach._project_final_change(
+        (clean_final - full_final).unsqueeze(0),
+        gradient,
+    )
+
+    actual = reach._semantic_interpolation_mass(
+        config,
+        prepared,
+        base=base,
+        variants=[variant],
+        events=[event],
+        clean_final=clean_final,
+        clean_gradient=gradient,
+        full_mass=full_mass,
+    )
+    assert torch.allclose(actual[0], 0.25 * full_mass, atol=1.0e-6)
+    assert torch.allclose(actual[1], full_mass)
+
+
+def test_peptides_struct_profile_and_checkpoint_tasks_are_registered():
+    assert PEPTIDES_STRUCT_PROFILE.tasks == PEPTIDES_STRUCT_TASKS
+    assert get_task("peptides_struct").drive_dir.endswith(
+        "grit_peptides_struct_official"
+    )
+    assert get_task("peptides_struct_1hop").drive_dir.endswith(
+        "grit_peptides_struct_1hop"
+    )
 
 
 def test_signed_output_path_carriage_is_complete_and_preserves_cancellation(
@@ -981,6 +1084,50 @@ def test_figure_only_builds_png_and_pdf(tmp_path: Path):
     for formats in result["figures"].values():
         assert Path(formats["png"]).is_file()
         assert Path(formats["pdf"]).is_file()
+
+
+def test_lightweight_core_only_figures_do_not_require_extension_caches(
+    tmp_path: Path,
+):
+    donor, bamberger, interpolation = _raw_rows(("zinc",))
+    donor = [row for row in donor if row["channel"] == "semantic"]
+    results = tmp_path / "results"
+    results.mkdir()
+
+    import csv
+
+    for path, rows in (
+        (results / "donor_carrier_mass.csv", donor),
+        (results / "bamberger_input_output_influence.csv", bamberger),
+        (results / "semantic_interpolation_mass.csv", interpolation),
+        (results / "graph_metrics.csv", _raw_graph_records(("zinc",))),
+    ):
+        with path.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
+            writer.writeheader()
+            writer.writerows(rows)
+
+    result = figures(
+        ZincReachConfig(
+            tasks=("zinc",),
+            channels=("semantic",),
+            compute_output_carriage=False,
+            compute_beneficial=False,
+            compute_survival=False,
+            compute_scale_analysis=False,
+            bootstrap_replicates=40,
+        ),
+        output_dir=tmp_path,
+    )
+    assert set(result["figures"]) == {
+        "trajectory_decomposition",
+        "trajectory_distance_components",
+        "semantic_estimand_comparison",
+        "interpolation_sweep",
+        "semantic_functional",
+        "semantic_bamberger",
+        "expected_distance",
+    }
 
 
 def test_qm9_profile_builds_dataset_specific_figures(tmp_path: Path):
