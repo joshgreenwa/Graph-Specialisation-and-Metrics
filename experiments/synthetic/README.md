@@ -70,6 +70,30 @@ python -m graph_specialisation_metrics.synthetic.saturation_carriage \
   --seeds 0,1,2,3
 ```
 
+## Nonlinear semantic reach on molecular graph supports
+
+`analysis/molecular_nonlinear_reach_colab.py` places a controlled node-level task on real ZINC
+molecular topologies. The known target combines a local linear semantic channel at `d=0` with a
+distant channel at a chosen shortest-path distance. The distant channel passes through a
+normalised saturating transform that is identical on every legal binary payload but progressively
+flatter at those payloads.
+
+This is a behaviour-preserving estimator test: clean predictions, complete donor swaps, and the
+known target remain unchanged across saturation, while the local Jacobian can change. The trained
+radial graph filter has support at every distance, so the target shell is learned rather than
+inserted into the measured profile. The figure reports the literal carrier-normalised Bamberger
+range, a dose-matched directional tangent, finite Functional carriage, and the exact target.
+
+Local equivalent:
+
+```bash
+python -m graph_specialisation_metrics.synthetic.molecular_nonlinear_reach \
+  --phase all \
+  --output-dir outputs/molecular_nonlinear_reach_v1
+```
+
+Use `--phase figures` to regenerate the PNG/PDF entirely from cached CSV files.
+
 ## Learned softmax routing: finite versus local carriage
 
 `analysis/softmax_routing_carriage_colab.py` is the more realistic follow-up. Each graph contains
