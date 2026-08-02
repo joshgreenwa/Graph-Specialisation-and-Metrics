@@ -111,3 +111,5 @@ quantify overlap among realised head pathways. Graph/channel shards are
 resumable, while a figures-only rerun loads no model or dataset.
 The frontend defaults to a four-graph, ZINC-only pilot; setting `PILOT = False`
 enables the denser ZINC--QM9 comparison after the direction is validated.
+The complete estimand and interpretation are documented in
+`experiments/methodology/causal_spatial_support.md`.
