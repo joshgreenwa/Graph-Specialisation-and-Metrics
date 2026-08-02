@@ -192,6 +192,9 @@ print(
     "[scope] Matched control: every dose is also compared with alpha=0.01 on "
     "identical graphs, donors, carriers and task projections. This separates "
     "finite nonlinear change from the residual Bamberger estimand mismatch.\n"
+    "[scope] Estimand decomposition: cached carrier rows separately report "
+    "shell-summed radial allocation and shell-size-adjusted per-carrier "
+    "sensitivity. PHASE='figures' requires no model forwards.\n"
     "[scope] Scale analysis: MAE uses every test molecule; Functional reach uses "
     "the 64 carriage graphs. Adjacent values are grouped adaptively by data density, "
     "and continuous paired-bootstrap slopes avoid dependence on bin boundaries.\n"
@@ -385,6 +388,17 @@ if "output_coherence_expected" in result:
     except ImportError:
         pass
 
+if "semantic_usage_contrasts" in result:
+    from IPython.display import display
+
+    try:
+        import pandas as pd
+
+        print("\nPaired semantic-estimand contrasts", flush=True)
+        display(pd.DataFrame(result["semantic_usage_contrasts"]))
+    except ImportError:
+        pass
+
 if "beneficial_summary" in result:
     from IPython.display import display
 
@@ -411,6 +425,7 @@ if "figures" in result:
     from IPython.display import Image, display
 
     for name in (
+        "semantic_estimand_comparison",
         "interpolation_sweep",
         "semantic_functional",
         "semantic_bamberger",

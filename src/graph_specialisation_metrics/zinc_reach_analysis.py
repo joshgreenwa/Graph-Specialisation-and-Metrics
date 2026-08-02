@@ -10,6 +10,8 @@ This extension keeps two comparisons separate:
 * A semantic interpolation sweep varies the donor-swap fraction while holding
   donor events fixed, testing whether the finite profile departs progressively
   from the Bamberger Jacobian profile.
+* A cache-only estimand decomposition separates shell-summed radial allocation
+  from shell-size-adjusted per-carrier sensitivity for both methods.
 
 The Bamberger proxy has no canonical structural-donor counterpart.  It is
 therefore shown only for semantic usage; structural usage reports Functional
@@ -98,6 +100,17 @@ METHOD_MARKERS = {
 METHOD_LINESTYLES = {
     "bamberger": "-",
     "functional_carriage": ":",
+}
+USAGE_ESTIMANDS = (
+    "radial_allocation",
+    "normalised_per_carrier_sensitivity",
+)
+USAGE_ESTIMAND_LABELS = {
+    "radial_allocation": "Normalised radial allocation\n(shell-summed)",
+    "normalised_per_carrier_sensitivity": (
+        "Normalised per-carrier sensitivity\n(shell-size adjusted)"
+    ),
+    "shell_opportunity": "Uniform-carrier opportunity",
 }
 MODEL_COLOURS = {
     "zinc_1hop": "#0072B2",
@@ -3023,6 +3036,352 @@ def graph_bamberger_profiles(
     return output
 
 
+def _usage_profiles_for_event(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    value_field: str,
+    maximum_distance: int,
+    effect_floor: float,
+) -> dict[str, np.ndarray] | None:
+    """Return matched shell-summed and per-carrier profiles for one event."""
+
+    distances = np.asarray(
+        [_integer(row, "distance") for row in rows],
+        dtype=np.int64,
+    )
+    values = np.asarray(
+        [_float(row, value_field) for row in rows],
+        dtype=np.float64,
+    )
+    if (
+        not len(values)
+        or not np.isfinite(values).all()
+        or np.any(values < 0)
+        or int(distances.min(initial=0)) < 0
+    ):
+        return None
+    shell_mass = np.bincount(
+        distances,
+        weights=values,
+        minlength=int(maximum_distance) + 1,
+    ).astype(np.float64, copy=False)[: int(maximum_distance) + 1]
+    shell_count = np.bincount(
+        distances,
+        minlength=int(maximum_distance) + 1,
+    ).astype(np.float64, copy=False)[: int(maximum_distance) + 1]
+    total_mass = float(shell_mass.sum())
+    if not np.isfinite(total_mass) or total_mass <= float(effect_floor):
+        return None
+
+    mean_per_carrier = np.zeros_like(shell_mass)
+    available = shell_count > 0
+    mean_per_carrier[available] = shell_mass[available] / shell_count[available]
+    per_carrier_total = float(mean_per_carrier.sum())
+    carrier_total = float(shell_count.sum())
+    if (
+        not np.isfinite(per_carrier_total)
+        or per_carrier_total <= float(effect_floor)
+        or carrier_total <= 0
+    ):
+        return None
+
+    radial = shell_mass / total_mass
+    per_carrier = mean_per_carrier / per_carrier_total
+    opportunity = shell_count / carrier_total
+    reconstructed = shell_count * mean_per_carrier
+    reconstructed /= float(reconstructed.sum())
+    error = float(np.max(np.abs(radial - reconstructed), initial=0.0))
+    if error > 1.0e-10:
+        print(
+            "[reach:warning] shell decomposition reconstruction error "
+            f"{error:.3e}; retaining estimate",
+            flush=True,
+        )
+    return {
+        "radial_allocation": radial,
+        "normalised_per_carrier_sensitivity": per_carrier,
+        "shell_opportunity": opportunity,
+        "absolute_per_carrier_sensitivity": mean_per_carrier,
+    }
+
+
+def graph_semantic_usage_estimands(
+    donor_rows: Sequence[Mapping[str, Any]],
+    bamberger_rows: Sequence[Mapping[str, Any]],
+    *,
+    effect_floor: float,
+) -> list[dict[str, Any]]:
+    """Build matched semantic range estimands entirely from cached raw rows.
+
+    Radial allocation sums carrier mass within a distance shell before event
+    normalisation. Per-carrier sensitivity first averages within each shell and
+    then normalises over distance, removing shell cardinality while retaining
+    the shape of absolute per-carrier response. Functional events aggregate
+    donor -> source -> graph; Bamberger events aggregate output node -> graph.
+    """
+
+    semantic_donor_rows = [
+        row for row in donor_rows if str(row.get("channel", "")) == "semantic"
+    ]
+    maximum_by_task: dict[str, int] = defaultdict(int)
+    for row in semantic_donor_rows:
+        task = str(row["task"])
+        maximum_by_task[task] = max(
+            maximum_by_task[task],
+            _integer(row, "distance"),
+        )
+    for row in bamberger_rows:
+        task = str(row["task"])
+        maximum_by_task[task] = max(
+            maximum_by_task[task],
+            _integer(row, "distance"),
+        )
+
+    finite_fields = (
+        "task",
+        "graph",
+        "source",
+        "donor_graph",
+        "donor_node",
+        "draw",
+    )
+    finite_events: dict[tuple[Any, ...], list[Mapping[str, Any]]] = defaultdict(list)
+    for row in semantic_donor_rows:
+        finite_events[tuple(row[field] for field in finite_fields)].append(row)
+
+    source_values: dict[tuple[Any, ...], list[float]] = defaultdict(list)
+    active_sources: set[tuple[str, int, int]] = set()
+    for key, event_rows in finite_events.items():
+        task, graph, source, *_ = key
+        task = str(task)
+        graph = int(graph)
+        source = int(source)
+        profiles = _usage_profiles_for_event(
+            event_rows,
+            value_field="functional_carriage",
+            maximum_distance=int(maximum_by_task[task]),
+            effect_floor=float(effect_floor),
+        )
+        if profiles is None:
+            continue
+        active_sources.add((task, graph, source))
+        for estimand, values in profiles.items():
+            for distance, value in enumerate(values):
+                if (
+                    estimand == "absolute_per_carrier_sensitivity"
+                    and profiles["shell_opportunity"][distance] <= 0
+                ):
+                    continue
+                source_values[
+                    (task, graph, source, estimand, int(distance))
+                ].append(float(value))
+
+    graph_values: dict[tuple[Any, ...], list[float]] = defaultdict(list)
+    for task, graph, source in active_sources:
+        for estimand in (
+            *USAGE_ESTIMANDS,
+            "shell_opportunity",
+            "absolute_per_carrier_sensitivity",
+        ):
+            for distance in range(int(maximum_by_task[task]) + 1):
+                values = source_values.get(
+                    (task, graph, source, estimand, distance),
+                    [],
+                )
+                if values:
+                    graph_values[
+                        (
+                            task,
+                            graph,
+                            "functional_carriage",
+                            estimand,
+                            distance,
+                        )
+                    ].append(float(np.mean(values)))
+
+    bamberger_events: dict[tuple[Any, ...], list[Mapping[str, Any]]] = defaultdict(list)
+    for row in bamberger_rows:
+        bamberger_events[
+            (
+                str(row["task"]),
+                _integer(row, "graph"),
+                _integer(row, "output_node"),
+            )
+        ].append(row)
+    for (task, graph, _output_node), event_rows in bamberger_events.items():
+        profiles = _usage_profiles_for_event(
+            event_rows,
+            value_field="influence",
+            maximum_distance=int(maximum_by_task[task]),
+            effect_floor=float(effect_floor),
+        )
+        if profiles is None:
+            continue
+        for estimand, values in profiles.items():
+            for distance, value in enumerate(values):
+                if (
+                    estimand == "absolute_per_carrier_sensitivity"
+                    and profiles["shell_opportunity"][distance] <= 0
+                ):
+                    continue
+                graph_values[
+                    (task, graph, "bamberger", estimand, int(distance))
+                ].append(float(value))
+
+    output: list[dict[str, Any]] = []
+    for (task, graph, method, estimand, distance), values in sorted(
+        graph_values.items()
+    ):
+        output.append(
+            {
+                "task": task,
+                "model_label": TASK_LABELS[task],
+                "graph": int(graph),
+                "channel": "semantic",
+                "method": method,
+                "estimand": estimand,
+                "distance": int(distance),
+                "value": float(np.mean(values)),
+                "centres": int(len(values)),
+            }
+        )
+    return output
+
+
+def summarise_semantic_usage_estimands(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    bootstrap_replicates: int,
+    bootstrap_seed: int,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Bootstrap estimand profiles and paired finite-versus-Jacobian gaps."""
+
+    groups: dict[tuple[Any, ...], list[float]] = defaultdict(list)
+    for row in rows:
+        value = _float(row, "value")
+        if np.isfinite(value):
+            groups[
+                (
+                    str(row["task"]),
+                    str(row["method"]),
+                    str(row["estimand"]),
+                    _integer(row, "distance"),
+                )
+            ].append(value)
+
+    profiles: list[dict[str, Any]] = []
+    for key, values in sorted(groups.items()):
+        task, method, estimand, distance = key
+        mean, low, high = _bootstrap_interval(
+            values,
+            replicates=int(bootstrap_replicates),
+            seed=int(bootstrap_seed)
+            + int(stable_hash({"semantic_estimand_profile": key}, length=8), 16),
+        )
+        profiles.append(
+            {
+                "task": task,
+                "model_label": TASK_LABELS[task],
+                "method": method,
+                "estimand": estimand,
+                "distance": int(distance),
+                "mean": mean,
+                "low": low,
+                "high": high,
+                "graphs": int(len(values)),
+            }
+        )
+
+    graph_profiles: dict[tuple[Any, ...], dict[int, float]] = defaultdict(dict)
+    for row in rows:
+        estimand = str(row["estimand"])
+        if estimand not in USAGE_ESTIMANDS:
+            continue
+        graph_profiles[
+            (
+                str(row["task"]),
+                _integer(row, "graph"),
+                str(row["method"]),
+                estimand,
+            )
+        ][_integer(row, "distance")] = _float(row, "value")
+
+    paired_values: dict[tuple[str, str, str], list[float]] = defaultdict(list)
+    tasks = sorted({key[0] for key in graph_profiles})
+    for task in tasks:
+        for estimand in USAGE_ESTIMANDS:
+            finite_graphs = {
+                key[1]
+                for key in graph_profiles
+                if key[0] == task
+                and key[2] == "functional_carriage"
+                and key[3] == estimand
+            }
+            bamberger_graphs = {
+                key[1]
+                for key in graph_profiles
+                if key[0] == task
+                and key[2] == "bamberger"
+                and key[3] == estimand
+            }
+            for graph in sorted(finite_graphs & bamberger_graphs):
+                finite = graph_profiles[
+                    (task, graph, "functional_carriage", estimand)
+                ]
+                bamberger = graph_profiles[(task, graph, "bamberger", estimand)]
+                distances = sorted(set(finite) | set(bamberger))
+                finite_values = np.asarray(
+                    [finite.get(distance, 0.0) for distance in distances],
+                    dtype=np.float64,
+                )
+                bamberger_values = np.asarray(
+                    [bamberger.get(distance, 0.0) for distance in distances],
+                    dtype=np.float64,
+                )
+                finite_total = float(finite_values.sum())
+                bamberger_total = float(bamberger_values.sum())
+                if finite_total <= 0 or bamberger_total <= 0:
+                    continue
+                finite_values /= finite_total
+                bamberger_values /= bamberger_total
+                distance_values = np.asarray(distances, dtype=np.float64)
+                paired_values[(task, estimand, "profile_tv")].append(
+                    float(0.5 * np.abs(finite_values - bamberger_values).sum())
+                )
+                paired_values[
+                    (task, estimand, "expected_distance_difference")
+                ].append(
+                    float(
+                        np.dot(finite_values, distance_values)
+                        - np.dot(bamberger_values, distance_values)
+                    )
+                )
+
+    contrasts: list[dict[str, Any]] = []
+    for key, values in sorted(paired_values.items()):
+        task, estimand, metric = key
+        mean, low, high = _bootstrap_interval(
+            values,
+            replicates=int(bootstrap_replicates),
+            seed=int(bootstrap_seed)
+            + int(stable_hash({"semantic_estimand_contrast": key}, length=8), 16),
+        )
+        contrasts.append(
+            {
+                "task": task,
+                "model_label": TASK_LABELS[task],
+                "estimand": estimand,
+                "metric": metric,
+                "mean": mean,
+                "low": low,
+                "high": high,
+                "paired_graphs": int(len(values)),
+                "contrast": "functional_carriage - bamberger",
+            }
+        )
+    return profiles, contrasts
+
+
 def graph_interpolation_profiles(
     rows: Sequence[Mapping[str, Any]],
     *,
@@ -4527,6 +4886,254 @@ def plot_model_profiles(
     return _save_figure(fig, figures_dir, filename)
 
 
+def plot_semantic_usage_estimands(
+    profile_rows: Sequence[Mapping[str, Any]],
+    contrast_rows: Sequence[Mapping[str, Any]],
+    *,
+    figures_dir: Path,
+    tasks: Sequence[str],
+    dataset_label: str,
+    figure_prefix: str,
+) -> dict[str, str]:
+    """Compare shell-summed and shell-size-adjusted semantic usage."""
+
+    import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
+
+    _figure_theme()
+    available_tasks = [
+        task
+        for task in tasks
+        if any(str(row["task"]) == task for row in profile_rows)
+    ]
+    if not available_tasks:
+        print(
+            "[reach:warning] semantic usage estimand plot has no available "
+            "tasks; writing an empty audit figure",
+            flush=True,
+        )
+        fig, axis = plt.subplots(figsize=(8.0, 3.0))
+        axis.axis("off")
+        axis.text(
+            0.5,
+            0.5,
+            "No estimable semantic usage profiles",
+            transform=axis.transAxes,
+            ha="center",
+            va="center",
+            color="#666666",
+        )
+        fig.suptitle(
+            f"Finite and Jacobian semantic usage on {dataset_label}",
+            fontsize=13,
+        )
+        return _save_figure(
+            fig,
+            figures_dir,
+            f"{figure_prefix}_semantic_usage_estimand_comparison",
+        )
+    figure_height = 2.05 * len(available_tasks) + 2.0
+    fig, axes = plt.subplots(
+        len(available_tasks),
+        len(USAGE_ESTIMANDS),
+        figsize=(10.2, figure_height),
+        sharex=True,
+        sharey="col",
+        squeeze=False,
+    )
+    maximum_distance = 0
+    for row_index, task in enumerate(available_tasks):
+        for column_index, estimand in enumerate(USAGE_ESTIMANDS):
+            axis = axes[row_index, column_index]
+            for draw_order, method in enumerate(
+                ("bamberger", "functional_carriage")
+            ):
+                values = sorted(
+                    (
+                        row
+                        for row in profile_rows
+                        if str(row["task"]) == task
+                        and str(row["method"]) == method
+                        and str(row["estimand"]) == estimand
+                    ),
+                    key=lambda row: _integer(row, "distance"),
+                )
+                if not values:
+                    continue
+                x = np.asarray(
+                    [_integer(value, "distance") for value in values],
+                    dtype=np.int64,
+                )
+                y = np.asarray(
+                    [_float(value, "mean") for value in values],
+                    dtype=np.float64,
+                )
+                low = np.asarray(
+                    [_float(value, "low") for value in values],
+                    dtype=np.float64,
+                )
+                high = np.asarray(
+                    [_float(value, "high") for value in values],
+                    dtype=np.float64,
+                )
+                maximum_distance = max(
+                    maximum_distance,
+                    int(x.max(initial=0)),
+                )
+                axis.fill_between(
+                    x,
+                    low,
+                    high,
+                    color=METHOD_COLOURS[method],
+                    alpha=0.09,
+                    linewidth=0,
+                    zorder=1 + draw_order,
+                )
+                axis.plot(
+                    x,
+                    y,
+                    color=METHOD_COLOURS[method],
+                    marker=METHOD_MARKERS[method],
+                    linestyle=METHOD_LINESTYLES[method],
+                    markerfacecolor="white",
+                    markeredgewidth=1.1,
+                    markersize=4.6,
+                    linewidth=1.8,
+                    zorder=5 + draw_order,
+                )
+
+            if estimand == "radial_allocation":
+                opportunity = sorted(
+                    (
+                        row
+                        for row in profile_rows
+                        if str(row["task"]) == task
+                        and str(row["method"]) == "functional_carriage"
+                        and str(row["estimand"]) == "shell_opportunity"
+                    ),
+                    key=lambda row: _integer(row, "distance"),
+                )
+                if opportunity:
+                    x = np.asarray(
+                        [_integer(value, "distance") for value in opportunity],
+                        dtype=np.int64,
+                    )
+                    y = np.asarray(
+                        [_float(value, "mean") for value in opportunity],
+                        dtype=np.float64,
+                    )
+                    axis.plot(
+                        x,
+                        y,
+                        color="#8A8A8A",
+                        linestyle=(0, (2, 2)),
+                        linewidth=1.15,
+                        alpha=0.8,
+                        zorder=2,
+                    )
+
+            tv = next(
+                (
+                    row
+                    for row in contrast_rows
+                    if str(row["task"]) == task
+                    and str(row["estimand"]) == estimand
+                    and str(row["metric"]) == "profile_tv"
+                ),
+                None,
+            )
+            if tv is not None:
+                axis.text(
+                    0.98,
+                    0.94,
+                    (
+                        f"TV={_float(tv, 'mean'):.2f} "
+                        f"[{_float(tv, 'low'):.2f}, {_float(tv, 'high'):.2f}]"
+                    ),
+                    transform=axis.transAxes,
+                    ha="right",
+                    va="top",
+                    color="#555555",
+                    fontsize=7.7,
+                )
+            axis.set_ylim(bottom=0)
+            if row_index == 0:
+                axis.set_title(USAGE_ESTIMAND_LABELS[estimand], pad=8)
+            if column_index == 0:
+                axis.set_ylabel(
+                    f"{TASK_LABELS[task]}\nNormalised mass",
+                    fontsize=8.7,
+                )
+            if row_index == len(available_tasks) - 1:
+                axis.set_xlabel("Shortest-path distance")
+
+    for axis in axes[-1]:
+        axis.set_xlim(-0.15, maximum_distance + 0.15)
+        axis.xaxis.set_major_locator(plt.MaxNLocator(integer=True))
+
+    legend_handles = [
+        Line2D(
+            [0],
+            [0],
+            color=METHOD_COLOURS[method],
+            marker=METHOD_MARKERS[method],
+            linestyle=METHOD_LINESTYLES[method],
+            markerfacecolor="white",
+            linewidth=1.8,
+            label=METHOD_LABELS[method],
+        )
+        for method in ("bamberger", "functional_carriage")
+    ]
+    legend_handles.append(
+        Line2D(
+            [0],
+            [0],
+            color="#8A8A8A",
+            linestyle=(0, (2, 2)),
+            linewidth=1.15,
+            label="Finite-source shell opportunity",
+        )
+    )
+    fig.legend(
+        handles=legend_handles,
+        loc="upper center",
+        bbox_to_anchor=(0.5, 0.92),
+        ncol=3,
+        frameon=False,
+        handlelength=2.7,
+        columnspacing=1.35,
+    )
+    fig.suptitle(
+        f"Finite and Jacobian semantic usage on {dataset_label}",
+        fontsize=13,
+        y=0.992,
+    )
+    fig.text(
+        0.5,
+        0.865,
+        (
+            "Radial allocation ∝ mean per-carrier sensitivity × carriers in "
+            "shell; 95% held-out-graph bootstrap intervals"
+        ),
+        ha="center",
+        color="#666666",
+        fontsize=8.4,
+    )
+    fig.subplots_adjust(
+        left=0.13,
+        right=0.985,
+        bottom=0.075,
+        top=0.82,
+        hspace=0.35,
+        wspace=0.18,
+    )
+    return _save_figure(
+        fig,
+        figures_dir,
+        f"{figure_prefix}_semantic_usage_estimand_comparison",
+    )
+
+
 def plot_interpolation_sweep(
     rows: Sequence[Mapping[str, Any]],
     *,
@@ -5245,13 +5852,27 @@ def figures(
         raise FileNotFoundError(
             "cached measurement CSVs are missing; run PHASE='measure' or 'all' first"
         )
+    donor_raw = _read_csv(donor_path)
+    bamberger_raw = _read_csv(bamberger_path)
     donor_graph = graph_donor_profiles(
-        _read_csv(donor_path),
+        donor_raw,
         effect_floor=float(config.effect_floor),
     )
     bamberger_graph = graph_bamberger_profiles(
-        _read_csv(bamberger_path),
+        bamberger_raw,
         effect_floor=float(config.effect_floor),
+    )
+    semantic_usage_graph = graph_semantic_usage_estimands(
+        donor_raw,
+        bamberger_raw,
+        effect_floor=float(config.effect_floor),
+    )
+    semantic_usage_profiles, semantic_usage_contrasts = (
+        summarise_semantic_usage_estimands(
+            semantic_usage_graph,
+            bootstrap_replicates=int(config.bootstrap_replicates),
+            bootstrap_seed=int(config.analysis_seed) + 900,
+        )
     )
     interpolation_graph = graph_interpolation_profiles(
         _read_csv(interpolation_path),
@@ -5331,6 +5952,18 @@ def figures(
     _write_csv(results_dir / "dense_profile_contrasts.csv", contrast_rows)
     _write_csv(results_dir / "expected_distance_summary.csv", expected_rows)
     _write_csv(
+        results_dir / "semantic_usage_estimand_graph_profiles.csv",
+        semantic_usage_graph,
+    )
+    _write_csv(
+        results_dir / "semantic_usage_estimand_summary.csv",
+        semantic_usage_profiles,
+    )
+    _write_csv(
+        results_dir / "semantic_usage_estimand_contrasts.csv",
+        semantic_usage_contrasts,
+    )
+    _write_csv(
         results_dir / "interpolation_graph_profiles.csv",
         interpolation_graph,
     )
@@ -5367,6 +6000,14 @@ def figures(
 
     figures_dir = output_dir / "figures"
     paths = {
+        "semantic_estimand_comparison": plot_semantic_usage_estimands(
+            semantic_usage_profiles,
+            semantic_usage_contrasts,
+            figures_dir=figures_dir,
+            tasks=config.tasks,
+            dataset_label=config.profile.name,
+            figure_prefix=config.profile.figure_prefix,
+        ),
         "interpolation_sweep": plot_interpolation_sweep(
             interpolation_summary,
             figures_dir=figures_dir,
@@ -5476,6 +6117,10 @@ def figures(
                 "analysis uses every test molecule; carriage-scale analysis uses the "
                 "registered graph sample. Adjacent integer values are merged into "
                 "density-adaptive bins, and continuous slopes use paired bootstraps."
+                " The semantic estimand comparison is rebuilt entirely from cached "
+                "carrier-level rows: radial allocation sums within shells, while "
+                "normalised per-carrier sensitivity averages within shells before "
+                "normalising over distance. Its TV intervals pair methods by graph."
                 " Output-coherence profiles integrate the scalar z-output along each "
                 "finite semantic donor path and compare carrier magnitudes before and "
                 "after signed within-distance aggregation."
@@ -5491,6 +6136,9 @@ def figures(
         "profile_rows": profile_rows,
         "contrast_rows": contrast_rows,
         "expected_rows": expected_rows,
+        "semantic_usage_graph": semantic_usage_graph,
+        "semantic_usage_profiles": semantic_usage_profiles,
+        "semantic_usage_contrasts": semantic_usage_contrasts,
         "interpolation_rows": interpolation_summary,
         "scale_rows": scale_summary,
         "scale_trends": scale_trends,

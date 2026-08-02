@@ -19,12 +19,14 @@ from graph_specialisation_metrics.zinc_reach_analysis import (
     graph_donor_profiles,
     graph_interpolation_profiles,
     graph_output_coherence_profiles,
+    graph_semantic_usage_estimands,
     summarise_dense_profile_contrasts,
     summarise_beneficial_carriage,
     summarise_graph_profiles,
     summarise_interpolation_contrasts,
     summarise_output_coherence,
     summarise_scale_dependence,
+    summarise_semantic_usage_estimands,
     summarise_shell_survival,
 )
 from graph_specialisation_metrics.reach_redundancy import (
@@ -763,6 +765,93 @@ def test_profile_scope_and_normalisation():
     }
 
 
+def test_semantic_usage_estimands_separate_shell_mass_from_per_carrier_shape():
+    donor_rows = []
+    bamberger_rows = []
+    for graph in (0, 1):
+        for carrier, (distance, mass) in enumerate(((0, 2.0), (1, 1.0), (1, 1.0))):
+            donor_rows.append(
+                {
+                    "task": "zinc",
+                    "graph": graph,
+                    "channel": "semantic",
+                    "source": 0,
+                    "donor_graph": 9,
+                    "donor_node": 2,
+                    "draw": 0,
+                    "carrier": carrier,
+                    "distance": distance,
+                    "functional_carriage": mass,
+                }
+            )
+        for input_node, (distance, influence) in enumerate(
+            ((0, 1.0), (1, 2.0), (1, 2.0))
+        ):
+            bamberger_rows.append(
+                {
+                    "task": "zinc",
+                    "graph": graph,
+                    "output_node": 0,
+                    "input_node": input_node,
+                    "distance": distance,
+                    "influence": influence,
+                }
+            )
+
+    graph_rows = graph_semantic_usage_estimands(
+        donor_rows,
+        bamberger_rows,
+        effect_floor=1.0e-12,
+    )
+
+    def profile(method, estimand, graph=0):
+        values = sorted(
+            (
+                row
+                for row in graph_rows
+                if row["method"] == method
+                and row["estimand"] == estimand
+                and row["graph"] == graph
+            ),
+            key=lambda row: row["distance"],
+        )
+        return np.asarray([row["value"] for row in values])
+
+    assert profile("functional_carriage", "radial_allocation") == pytest.approx(
+        [0.5, 0.5]
+    )
+    assert profile(
+        "functional_carriage", "normalised_per_carrier_sensitivity"
+    ) == pytest.approx([2.0 / 3.0, 1.0 / 3.0])
+    assert profile("functional_carriage", "shell_opportunity") == pytest.approx(
+        [1.0 / 3.0, 2.0 / 3.0]
+    )
+    assert profile(
+        "functional_carriage", "absolute_per_carrier_sensitivity"
+    ) == pytest.approx([2.0, 1.0])
+    assert profile("bamberger", "radial_allocation") == pytest.approx([0.2, 0.8])
+    assert profile(
+        "bamberger", "normalised_per_carrier_sensitivity"
+    ) == pytest.approx([1.0 / 3.0, 2.0 / 3.0])
+
+    for method in ("functional_carriage", "bamberger"):
+        for estimand in reach.USAGE_ESTIMANDS:
+            assert profile(method, estimand).sum() == pytest.approx(1.0)
+
+    _summary, contrasts = summarise_semantic_usage_estimands(
+        graph_rows,
+        bootstrap_replicates=40,
+        bootstrap_seed=19,
+    )
+    tv = {
+        row["estimand"]: row["mean"]
+        for row in contrasts
+        if row["metric"] == "profile_tv"
+    }
+    assert tv["radial_allocation"] == pytest.approx(0.3)
+    assert tv["normalised_per_carrier_sensitivity"] == pytest.approx(1.0 / 3.0)
+
+
 def test_figure_only_builds_png_and_pdf(tmp_path: Path):
     donor, bamberger, interpolation = _raw_rows()
     results = tmp_path / "results"
@@ -790,6 +879,7 @@ def test_figure_only_builds_png_and_pdf(tmp_path: Path):
         output_dir=tmp_path,
     )
     assert set(result["figures"]) == {
+        "semantic_estimand_comparison",
         "interpolation_sweep",
         "semantic_functional",
         "semantic_bamberger",
@@ -804,6 +894,8 @@ def test_figure_only_builds_png_and_pdf(tmp_path: Path):
     }
     assert (results / "dense_profile_contrasts.csv").is_file()
     assert (results / "interpolation_sweep_summary.csv").is_file()
+    assert (results / "semantic_usage_estimand_summary.csv").is_file()
+    assert (results / "semantic_usage_estimand_contrasts.csv").is_file()
     assert (results / "shell_survival_by_coalition_size.csv").is_file()
     for formats in result["figures"].values():
         assert Path(formats["png"]).is_file()
@@ -853,6 +945,7 @@ def test_qm9_profile_builds_dataset_specific_figures(tmp_path: Path):
         output_dir=tmp_path,
     )
     assert set(result["figures"]) == {
+        "semantic_estimand_comparison",
         "interpolation_sweep",
         "semantic_functional",
         "semantic_bamberger",
