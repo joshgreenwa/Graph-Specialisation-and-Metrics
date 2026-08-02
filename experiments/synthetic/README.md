@@ -94,6 +94,30 @@ python -m graph_specialisation_metrics.synthetic.molecular_nonlinear_reach \
 
 Use `--phase figures` to regenerate the PNG/PDF entirely from cached CSV files.
 
+## Apparent molecular reach versus task necessity
+
+`analysis/molecular_redundancy_reach_colab.py` tests a separate limitation shared by Jacobian
+range and finite Functional carriage. On real ZINC molecular topologies, a binary target cue is
+available locally and copied to nodes at increasing shortest-path distances. A minimum-norm radial
+graph filter learns to distribute weight across these interchangeable inputs, so both estimators
+report growing long-range use even though the local cue alone is sufficient.
+
+The headline figure distinguishes apparent reach from two behavioural controls: frozen-model
+reliance, measured by deleting every far cue without changing the fitted model, and task
+necessity, measured by fitting the same model class using only the local cue. A matched control
+places the target cue only at the farthest node. Thus redundant and genuinely essential
+long-range computation have similar apparent reach but opposite local-refit outcomes.
+
+Local equivalent:
+
+```bash
+python -m graph_specialisation_metrics.synthetic.molecular_redundancy_reach \
+  --phase all \
+  --output-dir outputs/molecular_redundancy_reach_v1
+```
+
+Use `--phase figures` to regenerate the PNG/PDF entirely from cached CSV files.
+
 ## Learned softmax routing: finite versus local carriage
 
 `analysis/softmax_routing_carriage_colab.py` is the more realistic follow-up. Each graph contains

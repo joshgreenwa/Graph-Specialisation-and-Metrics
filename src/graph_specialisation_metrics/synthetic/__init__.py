@@ -61,6 +61,12 @@ def run_molecular_nonlinear_reach(*args, **kwargs):
     return main(*args, **kwargs)
 
 
+def run_molecular_redundancy_reach(*args, **kwargs):
+    from .molecular_redundancy_reach import main
+
+    return main(*args, **kwargs)
+
+
 __all__ = [
     "run_nar_causal_transition",
     "run_nar_canonical_analysis",
@@ -69,6 +75,7 @@ __all__ = [
     "run_nar_methodology_paper",
     "run_nar_methodology_paper_v3",
     "run_molecular_nonlinear_reach",
+    "run_molecular_redundancy_reach",
     "run_query_routing_carriage",
     "run_saturation_carriage",
     "run_softmax_routing_carriage",
