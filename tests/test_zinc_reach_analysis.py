@@ -34,6 +34,9 @@ from graph_specialisation_metrics.zinc_reach_analysis import (
     summarise_shell_survival,
 )
 from graph_specialisation_metrics.carriage.tasks import get_task
+from graph_specialisation_metrics.methodology.tasks import (
+    get_task as get_canonical_task,
+)
 from graph_specialisation_metrics.reach_redundancy import (
     SemanticAssignment,
     SemanticCoalition,
@@ -208,6 +211,9 @@ def test_peptides_struct_profile_and_checkpoint_tasks_are_registered():
     assert get_task("peptides_struct_1hop").drive_dir.endswith(
         "grit_peptides_struct_1hop"
     )
+    canonical = get_canonical_task("peptides_struct_1hop")
+    assert canonical.output.sigma_policy == "training_target_std"
+    assert canonical.output.representation == "evaluation_regression"
 
 
 def test_signed_output_path_carriage_is_complete_and_preserves_cancellation(

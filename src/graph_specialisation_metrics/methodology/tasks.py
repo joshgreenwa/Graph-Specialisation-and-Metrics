@@ -202,7 +202,7 @@ def _known_grit_task(name: str) -> CanonicalTask:
     if name == "peptides_func":
         output = OutputGeometry("logits", None, "unit")
         loss = _bce_per_graph
-    elif name == "peptides_struct":
+    elif name in {"peptides_struct", "peptides_struct_1hop"}:
         output = OutputGeometry("evaluation_regression", None, "training_target_std")
         loss = _mae_per_graph
     else:
@@ -238,6 +238,7 @@ for _name in (
     "qm9_gap_1hop_vnode",
     "peptides_func",
     "peptides_struct",
+    "peptides_struct_1hop",
 ):
     register(_known_grit_task(_name))
 
