@@ -1106,7 +1106,10 @@ def plot_routing_transport_profiles(
             x,
             clean,
             width=0.72,
-            color=[GOLD if special else TEAL for special in graph_token],
+            color=[
+                GOLD if special else TEAL
+                for special in display_graph_token
+            ],
             edgecolor="white",
             linewidth=0.55,
         )

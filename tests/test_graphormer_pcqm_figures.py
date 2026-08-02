@@ -923,6 +923,14 @@ def test_routing_transport_figure_caps_spd_at_14_and_keeps_graph_token():
             expected_labels
         )
         assert len(top_axis.patches) == 16
+        assert all(
+            np.allclose(patch.get_facecolor(), to_rgba("#087E8B"))
+            for patch in top_axis.patches[:-1]
+        )
+        assert np.allclose(
+            top_axis.patches[-1].get_facecolor(),
+            to_rgba("#E6A700"),
+        )
         assert all(len(line.get_xdata()) == 16 for line in bottom_axis.lines)
     finally:
         plt.close(figure)
