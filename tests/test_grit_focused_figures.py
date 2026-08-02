@@ -37,6 +37,7 @@ from graph_specialisation_metrics.methodology.grit_figure_data import (  # noqa:
     select_structurally_selective_heads,
 )
 from graph_specialisation_metrics.methodology.grit_figure_plots import (  # noqa: E402
+    ATTENTION_FAMILY_CMAP_NAMES,
     MOLECULE_ATOM_FONT_SIZE,
     MOLECULE_DRAW_DPI,
     MOLECULE_RENDER_DPI,
@@ -44,6 +45,7 @@ from graph_specialisation_metrics.methodology.grit_figure_plots import (  # noqa
     PUBLICATION_PDF_RASTER_DPI,
     PUBLICATION_PNG_DPI,
     _pca_focus_color,
+    attention_cmap_name,
     plot_attention_grid,
     plot_av_pca,
     plot_coordinate_heatmaps,
@@ -801,6 +803,105 @@ def test_grit_plotting_api_accepts_synthetic_payloads():
         plt.close(figure)
 
 
+def test_attention_grid_matches_four_row_graphormer_publication_contract(
+    monkeypatch,
+):
+    import matplotlib.pyplot as plt
+
+    blank_molecule = np.ones((64, 72, 3), dtype=np.float64)
+    monkeypatch.setattr(
+        "graph_specialisation_metrics.methodology.grit_figure_plots."
+        "_draw_molecule_plain",
+        lambda example: blank_molecule,
+    )
+    molecule_attention_cmaps = []
+    monkeypatch.setattr(
+        "graph_specialisation_metrics.methodology.grit_figure_plots."
+        "_draw_molecule_attention",
+        lambda example, *, inbound, vmax, cmap: (
+            molecule_attention_cmaps.append(cmap.name) or blank_molecule
+        ),
+    )
+    examples = [
+        {
+            "dataset_index": index,
+            "attention": {"semantic": np.full((3, 3), 1.0 / 3.0)},
+        }
+        for index in range(4)
+    ]
+    figure = plot_attention_grid(
+        {"task": "zinc", "examples": examples},
+        role="semantic",
+        head=(7, 6),
+        per_graph_coordinates={
+            index: {"D_rel": 0.1 * index, "J": 1.0 + index}
+            for index in range(4)
+        },
+        net_d_rel=0.218,
+        net_joint_sensitivity=1.902,
+    )
+    try:
+        np.testing.assert_allclose(figure.get_size_inches(), (15.5, 16.8))
+        assert len(figure.axes) == 14
+        title, subtitle = figure.axes[0].texts
+        assert title.get_text() == "Semantic specialist — L7 H6"
+        assert title.get_fontsize() == 29
+        assert title.get_color() == "#17324D"
+        assert subtitle.get_fontsize() == 25
+        assert subtitle.get_color() == "#17324D"
+        assert [axis.get_title() for axis in figure.axes[1:4]] == [
+            "Molecule",
+            "Attention-weighted molecule",
+            "Node-conditioned attention",
+        ]
+        assert all(
+            axis.title.get_fontsize() == 25
+            and axis.title.get_color() == "black"
+            for axis in figure.axes[1:4]
+        )
+        graph_local = [
+            text
+            for axis in figure.axes
+            for text in axis.texts
+            if text.get_text().startswith("Graph-local")
+        ]
+        assert len(graph_local) == 4
+        assert all(
+            text.get_fontsize() == 18 and text.get_color() == "black"
+            for text in graph_local
+        )
+        matrix_axes = figure.axes[3:13:3]
+        assert molecule_attention_cmaps == ["Oranges"] * 4
+        assert all(
+            axis.images[0].get_cmap().name == "Oranges"
+            for axis in matrix_axes
+        )
+        assert all(axis.xaxis.label.get_fontsize() == 20 for axis in matrix_axes)
+        assert all(axis.yaxis.label.get_fontsize() == 20 for axis in matrix_axes)
+        colorbar_axis = figure.axes[-1]
+        assert colorbar_axis.xaxis.label.get_fontsize() == 25
+        assert all(
+            tick.get_fontsize() == 25 and tick.get_color() == "black"
+            for tick in colorbar_axis.get_xticklabels()
+        )
+    finally:
+        plt.close(figure)
+
+
+def test_attention_family_colormaps_are_stable_across_ranked_roles():
+    assert ATTENTION_FAMILY_CMAP_NAMES == {
+        "semantic": "Oranges",
+        "structural": "Blues",
+        "generalist": "Purples",
+    }
+    assert attention_cmap_name("semantic") == "Oranges"
+    assert attention_cmap_name("semantic_5") == "Oranges"
+    assert attention_cmap_name("structural") == "Blues"
+    assert attention_cmap_name("structural_alternate") == "Blues"
+    assert attention_cmap_name("generalist_3") == "Purples"
+    assert attention_cmap_name("unregistered") == "Blues"
+
+
 def test_pca_legend_is_ranked_by_observed_frequency():
     import matplotlib.pyplot as plt
 
@@ -838,6 +939,7 @@ def test_pca_legend_is_ranked_by_observed_frequency():
         ]
         figure.canvas.draw()
         axis = figure.axes[0]
+        np.testing.assert_allclose(figure.get_size_inches(), (9.6, 7.89))
         assert axis.get_title().startswith(
             "PCA of Head Output - L0 H0 (16 molecules)"
         )
@@ -845,15 +947,20 @@ def test_pca_legend_is_ranked_by_observed_frequency():
         assert "ZINC" not in axis.get_title()
         assert "D_{\\rm rel} = -0.275" in axis.get_title()
         assert "J = 1.234" in axis.get_title()
+        assert axis.title.get_fontsize() == 15
+        assert axis.title.get_color() == "black"
         assert axis.get_legend() is None
         assert axis.xaxis.label.get_fontsize() == 13.75
         assert axis.yaxis.label.get_fontsize() == 13.75
+        assert axis.xaxis.label.get_color() == "black"
+        assert axis.yaxis.label.get_color() == "black"
         assert all(
             text.get_fontsize() == 11.25
             for text in axis.get_xticklabels() + axis.get_yticklabels()
         )
         legend = figure.legends[0]
         assert all(text.get_fontsize() == 13.75 for text in legend.get_texts())
+        assert all(text.get_color() == "black" for text in legend.get_texts())
         renderer = figure.canvas.get_renderer()
         legend_box = legend.get_window_extent(renderer)
         axes_bottom = axis.get_window_extent(renderer).y0
@@ -1261,6 +1368,11 @@ def test_colab_notebook_has_valid_python_cells():
     assert '"zinc": ("zinc",)' in source
     assert '"qm9": ("qm9_gap_dense",)' in source
     assert "HEADS_PER_FAMILY = 5" in source
+    assert "ATTENTION_GRID_NUM_ROWS = 4" in source
+    assert "ATTENTION_CACHE_NUM_ROWS = 5" in source
+    assert "ATTENTION_FAMILY_CMAP_NAMES" in source
+    assert '"attention_colormap": attention_cmap_name(role)' in source
+    assert '"attention_family_colormaps": dict(ATTENTION_FAMILY_CMAP_NAMES)' in source
     assert 'f"semantic_{rank}": "Semantic specialist"' in source
     assert 'f"structural_{rank}": "Structural specialist"' in source
     assert 'f"generalist_{rank}": r"High-$J$ generalist"' in source
@@ -1275,6 +1387,11 @@ def test_colab_notebook_has_valid_python_cells():
     assert 'all_roles = dict(context["display_heads"])' in source
     assert "clean_attention_mass_vs_SPD" in source
     runtime_source = "".join(payload["cells"][6]["source"])
+    assert "num_rows=ATTENTION_CACHE_NUM_ROWS" in runtime_source
+    assert "num_rows=ATTENTION_GRID_NUM_ROWS" in runtime_source
+    assert "display_attention_payload" in runtime_source
+    assert "for graph_index in display_graph_indices" in runtime_source
+    assert '"cache_graph_indices": graph_indices' in runtime_source
     assert runtime_source.index("plot_attention_grid(") < runtime_source.index(
         "plot_av_pca("
     )

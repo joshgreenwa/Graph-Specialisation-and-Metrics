@@ -27,6 +27,11 @@ ORANGE = "#D97706"
 SLATE = "#607080"
 LIGHT_GRID = "#DCE3E8"
 ATTENTION_CMAP = plt.get_cmap("Blues")
+ATTENTION_FAMILY_CMAP_NAMES = {
+    "semantic": "Oranges",
+    "structural": "Blues",
+    "generalist": "Purples",
+}
 SELECTIVITY_CMAP = plt.get_cmap("coolwarm")
 PUBLICATION_PNG_DPI = 600
 PUBLICATION_PDF_RASTER_DPI = 1200
@@ -74,6 +79,20 @@ PCA_FOCUS_COLORS = {
 # Backwards-compatible public name; values now follow the PCQM chemical-group
 # convention rather than element/type-ID labels.
 ELEMENT_COLORS = PCA_FOCUS_COLORS
+
+
+def attention_cmap_name(role: str) -> str:
+    """Return the stable attention colour map for a displayed head family."""
+
+    normalised_role = str(role).strip().lower()
+    for family, cmap_name in ATTENTION_FAMILY_CMAP_NAMES.items():
+        if normalised_role == family or normalised_role.startswith(f"{family}_"):
+            return cmap_name
+    return ATTENTION_CMAP.name
+
+
+def _attention_cmap(role: str):
+    return plt.get_cmap(attention_cmap_name(role))
 
 
 def apply_publication_style() -> None:
@@ -478,6 +497,7 @@ def _draw_molecule_attention(
     *,
     inbound: np.ndarray,
     vmax: float,
+    cmap=None,
     figsize: tuple[float, float] = (4.2, 3.7),
     dpi: int = MOLECULE_RENDER_DPI,
 ):
@@ -494,12 +514,13 @@ def _draw_molecule_attention(
             f"{len(inbound)}"
         )
     norm = Normalize(vmin=0.0, vmax=max(float(vmax), 1e-12), clip=True)
+    cmap = ATTENTION_CMAP if cmap is None else cmap
     highlight_atoms = list(range(molecule.GetNumAtoms()))
     highlight_colors = {}
     highlight_radii = {}
     for atom, value in enumerate(inbound):
         scaled = float(norm(value))
-        rgba = ATTENTION_CMAP(0.18 + 0.72 * scaled)
+        rgba = cmap(0.18 + 0.72 * scaled)
         highlight_colors[atom] = tuple(float(channel) for channel in rgba[:3])
         highlight_radii[atom] = 0.20 + 0.30 * np.sqrt(scaled)
 
@@ -546,12 +567,14 @@ def plot_attention_grid(
     net_joint_sensitivity: float,
     title_label: str | None = None,
 ):
-    """GRIT attention views with aggregate and graph-local coordinates."""
+    """Attention views with net head and graph-local ``D_rel``/``J``."""
 
     apply_publication_style()
+    attention_cmap = _attention_cmap(role)
     examples = list(examples_payload["examples"])
     if not examples:
         raise ValueError("the attention grid requires at least one example")
+    num_rows = len(examples)
     matrices = [
         _node_conditioned_attention(example["attention"][role])
         for example in examples
@@ -563,7 +586,6 @@ def plot_attention_grid(
     inbound_max = max(
         max(float(np.nanpercentile(values, 99)), 1e-6) for values in inbound
     )
-    num_rows = len(examples)
     figure_height = 3.4 + 3.35 * num_rows
     fig = plt.figure(
         figsize=(15.5, figure_height),
@@ -587,21 +609,23 @@ def plot_attention_grid(
     colorbar_axis = fig.add_subplot(grid[-1, :])
     for row, (example, matrix) in enumerate(zip(examples, matrices)):
         graph_index = int(example["dataset_index"])
-        graph_coordinates = per_graph_coordinates.get(
-            graph_index, per_graph_coordinates.get(str(graph_index))
-        )
+        graph_coordinates = per_graph_coordinates.get(graph_index)
+        if graph_coordinates is None:
+            graph_coordinates = per_graph_coordinates.get(str(graph_index))
         if graph_coordinates is None:
             raise KeyError(
                 f"no graph-local coordinates were supplied for eval index {graph_index}"
             )
         d_rel = float(
             graph_coordinates.get(
-                "D_rel", graph_coordinates.get("selectivity", np.nan)
+                "D_rel",
+                graph_coordinates.get("selectivity", np.nan),
             )
         )
-        joint = float(
+        joint_sensitivity = float(
             graph_coordinates.get(
-                "J", graph_coordinates.get("joint_sensitivity", np.nan)
+                "J",
+                graph_coordinates.get("joint_sensitivity", np.nan),
             )
         )
         axes[row, 0].imshow(_draw_molecule_plain(example))
@@ -610,7 +634,7 @@ def plot_attention_grid(
             0.01,
             0.99,
             rf"Graph-local: $D_{{\rm rel}} = {d_rel:+.3f};\ J = "
-            rf"{joint:.3f}$",
+            rf"{joint_sensitivity:.3f}$",
             transform=axes[row, 0].transAxes,
             ha="left",
             va="top",
@@ -623,12 +647,13 @@ def plot_attention_grid(
                 example,
                 inbound=inbound[row],
                 vmax=inbound_max,
+                cmap=attention_cmap,
             )
         )
         axes[row, 1].axis("off")
         image = axes[row, 2].imshow(
             matrix,
-            cmap=ATTENTION_CMAP,
+            cmap=attention_cmap,
             vmin=0,
             vmax=matrix_max,
             interpolation="nearest",
@@ -640,11 +665,12 @@ def plot_attention_grid(
         axes[row, 2].set_xticks(np.arange(matrix.shape[0]))
         axes[row, 2].set_yticks(np.arange(matrix.shape[0]))
         axes[row, 2].tick_params(labelsize=10, length=2.5)
+
     for column, label in enumerate(
         ["Molecule", "Attention-weighted molecule", "Node-conditioned attention"]
     ):
         axes[0, column].set_title(label, fontsize=25, pad=10)
-    style = HEAD_STYLES.get(role, {"label": role.replace("_", " ").title()})
+    style = HEAD_STYLES.get(role, {"label": role.title()})
     title_axis.text(
         0.5,
         0.84,
@@ -664,14 +690,15 @@ def plot_attention_grid(
         fontsize=25,
         color=NAVY,
     )
-    colorbar = fig.colorbar(
-        image, cax=colorbar_axis, orientation="horizontal"
-    )
+    colorbar = fig.colorbar(image, cax=colorbar_axis, orientation="horizontal")
     colorbar.set_label("Attention weight", fontsize=25, labelpad=7)
     colorbar.ax.tick_params(labelsize=25, length=3)
     for tick_label in colorbar.ax.get_xticklabels():
         tick_label.set_fontweight("medium")
 
+    # Let constrained layout settle the full grid before shortening the
+    # horizontal colour bar. Disabling the engine afterwards preserves the
+    # publication geometry through both PNG and PDF save passes.
     fig.canvas.draw()
     colorbar_position = colorbar_axis.get_position()
     fig.set_layout_engine("none")
@@ -1698,11 +1725,13 @@ def save_section_pdf_bundles(
 
 
 __all__ = [
+    "ATTENTION_FAMILY_CMAP_NAMES",
     "MOLECULE_ATOM_FONT_SIZE",
     "MOLECULE_RENDER_DPI",
     "PUBLICATION_PDF_RASTER_DPI",
     "PUBLICATION_PNG_DPI",
     "apply_publication_style",
+    "attention_cmap_name",
     "automatic_selectivity_limits",
     "plot_attention_grid",
     "plot_av_pca",
