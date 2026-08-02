@@ -102,3 +102,10 @@ figures-only comparison of canonical internal head specialisation
 structural donor swaps. It reads the completed dense-ZINC score and causal
 caches, loads no model or dataset, and writes two paper-oriented figures plus
 head-level CSV tables to Drive.
+
+`experiments/methodology/causal_spatial_support_colab.py` extends that check to
+the causal spatial support of specialist heads on dense ZINC and dense QM9. It
+separates source-conditioned attention access, canonical internal response,
+and held-out shell-specific output mediation; jointly patched frozen families
+quantify overlap among realised head pathways. Graph/channel shards are
+resumable, while a figures-only rerun loads no model or dataset.

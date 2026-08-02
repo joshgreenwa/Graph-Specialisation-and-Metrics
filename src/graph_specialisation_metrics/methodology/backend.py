@@ -630,6 +630,108 @@ class CanonicalGritBackend:
             ablate=False,
         )
 
+    def patch_masked_many(
+        self,
+        targets: Sequence[Any],
+        donor_transport: Sequence[Any],
+        conditions: Sequence[dict[str, Any]],
+    ):
+        """Patch different head families on different real-node masks in one batch.
+
+        Each target is one replica of the same graph geometry. ``conditions[k]``
+        supplies ``family`` (``(layer, head)`` pairs) and the local real-node
+        indices ``nodes`` to patch in replica ``k``. This is the native operation
+        required by distance-resolved head mediation: every carrier shell is
+        intervened on separately while sharing one GRIT forward.
+
+        Dense ZINC/QM9 models have no virtual node. VNode row ordering is
+        intentionally rejected here rather than silently applying an ambiguous
+        carrier mask.
+        """
+
+        import torch
+        from torch_geometric.data import Batch
+
+        targets = list(targets)
+        conditions = list(conditions)
+        if not targets or len(targets) != len(conditions):
+            raise ValueError("masked patching requires one condition per target replica")
+        if self.task.virtual_node:
+            raise ValueError("masked head-distance patching is not registered for VNode models")
+        counts = [int(data.num_nodes) for data in targets]
+        if len(set(counts)) != 1:
+            raise ValueError("masked patch replicas must share one graph geometry")
+        if len(donor_transport) != int(self.gm.L):
+            raise ValueError("replacement activations must contain one tensor per layer")
+        nodes_per_graph = counts[0]
+        normalised: list[dict[str, Any]] = []
+        layers_used: set[int] = set()
+        for condition in conditions:
+            family = tuple(
+                sorted(
+                    {
+                        (int(layer), int(head))
+                        for layer, head in condition.get("family", ())
+                    }
+                )
+            )
+            nodes = tuple(sorted({int(node) for node in condition.get("nodes", ())}))
+            if not family:
+                raise ValueError("every masked patch condition needs at least one head")
+            if not nodes or min(nodes) < 0 or max(nodes) >= nodes_per_graph:
+                raise ValueError("masked patch condition has invalid or empty real-node indices")
+            for layer, head in family:
+                if not (0 <= layer < int(self.gm.L) and 0 <= head < int(self.gm.H)):
+                    raise IndexError(f"masked patch head {(layer, head)} is outside model geometry")
+                layers_used.add(layer)
+            normalised.append({"family": family, "nodes": nodes})
+
+        handles = []
+        for layer in sorted(layers_used):
+
+            def make_hook(layer_index: int):
+                def hook(_module, _inputs, output):
+                    routed, edge = output
+                    changed = routed.clone()
+                    donor = donor_transport[layer_index].to(
+                        device=changed.device, dtype=changed.dtype
+                    )
+                    if donor.shape != changed.shape:
+                        raise RuntimeError(
+                            f"masked patch geometry differs at layer {layer_index}: "
+                            f"{tuple(donor.shape)} vs {tuple(changed.shape)}"
+                        )
+                    for replica, condition in enumerate(normalised):
+                        heads = [
+                            head
+                            for selected_layer, head in condition["family"]
+                            if selected_layer == layer_index
+                        ]
+                        if not heads:
+                            continue
+                        rows = torch.as_tensor(
+                            [replica * nodes_per_graph + node for node in condition["nodes"]],
+                            device=changed.device,
+                            dtype=torch.long,
+                        )
+                        for head in heads:
+                            changed[rows, head, :] = donor[rows, head, :]
+                    return changed, edge
+
+                return hook
+
+            handles.append(
+                self.gm.attn_layers[layer].register_forward_hook(make_hook(layer))
+            )
+        try:
+            batch = Batch.from_data_list([data.clone() for data in targets]).to(self.gm.device)
+            with torch.no_grad():
+                prediction, target = self.gm.model(batch)
+        finally:
+            for handle in handles:
+                handle.remove()
+        return prediction, self._z(prediction), target
+
     def replacement_batch(
         self,
         capture: BackendCapture,
