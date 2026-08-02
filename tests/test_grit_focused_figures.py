@@ -29,6 +29,7 @@ from graph_specialisation_metrics.methodology.grit_figure_data import (  # noqa:
     label_attention_focus,
     load_canonical_model_record,
     load_canonical_score_artifact,
+    methodology_config_for_artifact,
     methodology_config_from_record,
     molecule_from_graph,
     molecule_record,
@@ -580,6 +581,59 @@ def test_protocol_record_reconstructs_runtime_configuration(tmp_path: Path):
     assert restored.phases == ()
     assert restored.accelerator == "cpu"
     assert restored.fingerprint == original.fingerprint
+
+
+def test_task_protocol_is_selected_when_shared_root_protocol_has_drifted(
+    tmp_path: Path,
+):
+    bound = MethodologyConfig(
+        output_dir=str(tmp_path / "canonical"),
+        tasks=("zinc", "qm9_gap_dense"),
+        train_seeds=(42,),
+        phases=("scores",),
+    )
+    drifted = dataclasses.replace(bound, tasks=("zinc",))
+    root_path = tmp_path / "protocol.json"
+    task_path = tmp_path / "zinc" / "seed_42" / "protocol.json"
+    task_path.parent.mkdir(parents=True)
+    root_path.write_text(json.dumps(drifted.record()), encoding="utf-8")
+    task_path.write_text(json.dumps(bound.record()), encoding="utf-8")
+    artifact = SimpleNamespace(
+        metadata={
+            "contract": {"protocol_fingerprint": bound.fingerprint},
+        }
+    )
+
+    restored, selected_path = methodology_config_for_artifact(
+        artifact,
+        (task_path, root_path),
+        accelerator="cpu",
+    )
+
+    assert selected_path == task_path.resolve()
+    assert restored.fingerprint == bound.fingerprint
+    assert restored.accelerator == "cpu"
+
+
+def test_bound_protocol_loader_reports_every_mismatched_candidate(
+    tmp_path: Path,
+):
+    config = MethodologyConfig(output_dir=str(tmp_path / "canonical"))
+    root_path = tmp_path / "protocol.json"
+    root_path.write_text(json.dumps(config.record()), encoding="utf-8")
+    artifact = SimpleNamespace(
+        metadata={
+            "contract": {"protocol_fingerprint": "expected-fingerprint"},
+        }
+    )
+
+    with pytest.raises(ValueError, match="expected-fingerprint") as error:
+        methodology_config_for_artifact(
+            artifact,
+            (tmp_path / "missing.json", root_path),
+        )
+    assert "missing" in str(error.value)
+    assert str(root_path.resolve()) in str(error.value)
 
 
 def test_zinc_and_qm9_graphs_reconstruct_as_index_preserving_molecules():
@@ -1417,12 +1471,21 @@ def test_colab_notebook_has_valid_python_cells():
     assert "PNG_DPI = 600" in source
     assert "PDF_RASTER_DPI = 1200" in source
     assert "del sys.modules[module_name]" in source
+    assert "methodology_config_for_artifact(" in source
+    assert (
+        '(task_root / "protocol.json", CANONICAL_ROOT / "protocol.json")'
+        in source
+    )
+    assert '"protocol_config": protocol_config' in source
+    assert '"canonical_protocol_record": str(protocol_path)' in source
+    assert "protocol_config = methodology_config_from_record(" not in source
     assert "def get_figure_runtime()" in source
     assert "if figure_runtime is None" in source
     assert "structural_count=HEADS_PER_FAMILY + 1" in source
     assert 'all_roles = dict(context["display_heads"])' in source
     assert "clean_attention_mass_vs_SPD" in source
     runtime_source = "".join(payload["cells"][6]["source"])
+    assert 'context["protocol_config"]' in runtime_source
     assert "ATTENTION_GRID_GRAPH_INDICES[task_name][family]" in runtime_source
     assert "family_cache_graph_indices" in runtime_source
     assert "family_display_graph_indices" in runtime_source

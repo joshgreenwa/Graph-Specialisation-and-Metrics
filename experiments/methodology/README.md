@@ -67,7 +67,10 @@ purple. Each figure applies its family colour map consistently to the attention-
 node-conditioned matrix, and colour bar; this is render-only metadata and does not invalidate the
 cached attention tensors. The notebook installs RDKit explicitly, writes every model-forward
 diagnostic to its exact supplemental cache before rendering, and constructs the GRIT runtime only
-if one of those artifacts is missing. Once populated, styling-only reruns do not rebuild RRWP,
+if one of those artifacts is missing. Runtime reconstruction selects the immutable task/seed
+`protocol.json` whose scientific fingerprint is bound to the canonical score cache; the shared
+root record is accepted only as an exact-matching fallback, since finalisation or another run may
+have rewritten it. Once populated, styling-only reruns do not rebuild RRWP,
 reload the checkpoint, or execute model forwards. Each named semantic specialist, structural
 specialist, and high-`J` generalist is displayed as an attention grid, routed-output PCA, and then
 its mean clean-attention-mass versus shortest-path-distance companion. The notebook selects five

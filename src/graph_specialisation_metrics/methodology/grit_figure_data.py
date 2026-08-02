@@ -820,6 +820,60 @@ def methodology_config_from_record(
     )
 
 
+def methodology_config_for_artifact(
+    artifact: ReadOnlyCacheArtifact,
+    protocol_paths: Sequence[str | Path],
+    *,
+    accelerator: str | None = None,
+) -> tuple[MethodologyConfig, Path]:
+    """Load the protocol record scientifically bound to a score artifact.
+
+    Task/seed protocol records are immutable run inputs, whereas a shared root
+    record may later be rewritten by finalisation or another canonical run.
+    Candidate order is therefore significant, but a candidate is accepted only
+    when its reconstructed scientific fingerprint exactly matches the cache.
+    """
+
+    contract = artifact.metadata.get("contract", {})
+    expected = str(contract.get("protocol_fingerprint", ""))
+    if not expected:
+        raise ValueError("canonical score cache has no protocol fingerprint")
+
+    checked: list[str] = []
+    seen: set[Path] = set()
+    for value in protocol_paths:
+        path = Path(value).expanduser().resolve()
+        if path in seen:
+            continue
+        seen.add(path)
+        if not path.is_file():
+            checked.append(f"{path} (missing)")
+            continue
+        try:
+            config = methodology_config_from_record(
+                path,
+                accelerator=accelerator,
+            )
+        except (
+            OSError,
+            json.JSONDecodeError,
+            KeyError,
+            TypeError,
+            ValueError,
+        ) as error:
+            checked.append(f"{path} (invalid: {error})")
+            continue
+        if config.fingerprint == expected:
+            return config, path
+        checked.append(f"{path} (fingerprint {config.fingerprint})")
+
+    details = "; ".join(checked) if checked else "no candidates supplied"
+    raise ValueError(
+        "no protocol.json describes the scientific configuration bound to the "
+        f"canonical score cache (expected fingerprint {expected}); checked: {details}"
+    )
+
+
 def _task_with_protocol_overrides(
     task_name: str,
     task_overrides: Mapping[str, Any],
@@ -2036,6 +2090,7 @@ __all__ = [
     "label_attention_focus",
     "load_canonical_model_record",
     "load_canonical_score_artifact",
+    "methodology_config_for_artifact",
     "methodology_config_from_record",
     "select_attention_grid_indices",
     "select_ranked_heads",
