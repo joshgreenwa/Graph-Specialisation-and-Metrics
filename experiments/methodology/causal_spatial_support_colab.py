@@ -152,12 +152,24 @@ if FORCE:
     args.append("--force")
 result = main(args)
 
-from IPython.display import Image, display
+from IPython.display import Image, Markdown, display
 
-for key in ("headline_png", "overlap_png"):
-    path = result.get("figures", {}).get(key)
+figures = result.get("figures", {})
+ordered_keys = ["headline_png", "overlap_png"]
+ordered_keys.extend(
+    key
+    for key in figures
+    if key.endswith("_png") and key not in ordered_keys
+)
+displayed = 0
+for key in ordered_keys:
+    path = figures.get(key)
     if path and Path(path).is_file():
+        display(Markdown(f"### {key.removesuffix('_png').replace('_', ' ').title()}"))
         display(Image(filename=path))
+        displayed += 1
+if not displayed:
+    print("[figure:warning] no generated PNG figure was available for inline display")
 
 try:
     import pandas as pd
