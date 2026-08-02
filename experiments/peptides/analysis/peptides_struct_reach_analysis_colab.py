@@ -26,6 +26,10 @@ SECRET_NAME = "dissertation_key"
 
 PHASE = "all"  # "all", "measure", or "figures"
 PILOT = True
+# In pilot mode, sample only the required official-split graphs before RRWP is
+# materialised.  The base molecular archive is read once, but the 15,535-graph
+# RRWP transform and full-split checkpoint evaluation are avoided.
+LIMIT_DATASET_TO_ANALYSIS = PILOT
 OUTPUT_DIR = Path(
     "/content/drive/MyDrive/graph_specialisation_metrics/"
     "peptides_struct_bamberger_functional_reach_v1"
@@ -153,6 +157,8 @@ print(
     "[scope] Disconnected node pairs have undefined SPD and are excluded from "
     "both radial profiles.\n"
     f"[scope] Pilot={PILOT}; tasks={TASKS}; graphs={GRAPHS}; channels={CHANNELS}.\n"
+    f"[scope] Analysis-only dataset loading={LIMIT_DATASET_TO_ANALYSIS}; pilot "
+    "samples the required official-split graphs before RRWP.\n"
     "[scope] Core graph shards are cached independently, so increasing GRAPHS or "
     "enabling extensions reuses completed compatible work.\n",
     flush=True,
@@ -196,6 +202,8 @@ if not RUN_SURVIVAL:
     CELL_ARGS.append("--no-survival")
 if not RUN_SCALE_ANALYSIS:
     CELL_ARGS.append("--no-scale-analysis")
+if LIMIT_DATASET_TO_ANALYSIS:
+    CELL_ARGS.append("--limit-dataset-to-analysis")
 if not INSTALL_DEPENDENCIES:
     CELL_ARGS.append("--skip-dependency-install")
 

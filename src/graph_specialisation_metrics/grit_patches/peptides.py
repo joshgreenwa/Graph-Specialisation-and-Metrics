@@ -343,22 +343,45 @@ def apply_peptides_dataset_compat_patch(base: Any, repo_dir: Path) -> None:
             raise FileNotFoundError(f"Official Peptides dataset file not found: {path}")
         text = path.read_text(encoding="utf-8", errors="replace")
         original = text
-        text = text.replace(
-            "from ogb.utils import smiles2graph\n",
-            (
-                "try:\n"
-                "    from ogb.utils import smiles2graph\n"
-                "except ImportError:\n"
-                "    try:\n"
-                "        from ogb.utils.mol import smiles2graph\n"
-                "    except ImportError:\n"
-                "        from ogb.utils.features import smiles2graph\n"
-            ),
-            1,
-        )
+        if "\nimport os\n" not in text:
+            text = text.replace(
+                "import os.path as osp\n",
+                "import os\nimport os.path as osp\n",
+                1,
+            )
+        if "try:\n    from ogb.utils import smiles2graph\n" not in text:
+            text = text.replace(
+                "from ogb.utils import smiles2graph\n",
+                (
+                    "try:\n"
+                    "    from ogb.utils import smiles2graph\n"
+                    "except ImportError:\n"
+                    "    try:\n"
+                    "        from ogb.utils.mol import smiles2graph\n"
+                    "    except ImportError:\n"
+                    "        from ogb.utils.features import smiles2graph\n"
+                ),
+                1,
+            )
         text = text.replace(
             "        if decide_download(self.url):\n",
             "        if True:  # Colab runner: non-interactive official dataset download.\n",
+            1,
+        )
+        text = text.replace(
+            "        self.data, self.slices = torch.load(self.processed_paths[0])\n",
+            (
+                "        if os.environ.get('GSM_PEPTIDES_ANALYSIS_SPLIT_LIMITS'):\n"
+                "            try:\n"
+                "                self.data, self.slices = torch.load(\n"
+                "                    self.processed_paths[0], mmap=True)\n"
+                "            except (TypeError, RuntimeError):\n"
+                "                self.data, self.slices = torch.load(\n"
+                "                    self.processed_paths[0])\n"
+                "        else:\n"
+                "            self.data, self.slices = torch.load(\n"
+                "                self.processed_paths[0])\n"
+            ),
             1,
         )
         if text != original:
@@ -368,6 +391,86 @@ def apply_peptides_dataset_compat_patch(base: Any, repo_dir: Path) -> None:
 
     if not patched_any:
         base.log("[dataset-compat] Peptides loader compatibility patch already present.")
+
+    master_loader = repo_dir / "grit" / "loader" / "master_loader.py"
+    if not master_loader.exists():
+        raise FileNotFoundError(f"Official GRIT master loader not found: {master_loader}")
+    master_text = master_loader.read_text(encoding="utf-8", errors="replace")
+    subset_marker = "GSM_PEPTIDES_ANALYSIS_SPLIT_LIMITS"
+    if subset_marker not in master_text:
+        master_text = master_text.replace(
+            "import logging\nimport os.path as osp\n",
+            "import json\nimport logging\nimport os\nimport os.path as osp\n",
+            1,
+        )
+        old = """\
+    s_dict = dataset.get_idx_split()
+    dataset.split_idxs = [s_dict[s] for s in ['train', 'val', 'test']]
+    return dataset
+
+
+def preformat_TUDataset(dataset_dir, name):
+"""
+        new = """\
+    s_dict = dataset.get_idx_split()
+    dataset.split_idxs = [s_dict[s] for s in ['train', 'val', 'test']]
+
+    # Analysis-only pilot mode: retain a deterministic sample from each official
+    # split before positional encodings are materialised.  The base collated
+    # molecular dataset is read once, but RRWP, loaders, and model forwards see
+    # only this subset.  Training never sets this environment variable.
+    subset_spec = os.environ.get('GSM_PEPTIDES_ANALYSIS_SPLIT_LIMITS', '').strip()
+    if subset_spec:
+        limits = json.loads(subset_spec)
+        seed = int(limits.pop('seed', 0))
+        selected = []
+        local_splits = []
+        cursor = 0
+        for offset, split_name in enumerate(['train', 'val', 'test']):
+            original = torch.as_tensor(s_dict[split_name], dtype=torch.long)
+            count = min(int(limits[split_name]), int(original.numel()))
+            if count < 1:
+                raise ValueError(f'analysis subset for {split_name} must be non-empty')
+            generator = torch.Generator().manual_seed(seed + offset)
+            chosen = original[torch.randperm(len(original), generator=generator)[:count]]
+            selected.append(chosen)
+            local_splits.append(torch.arange(cursor, cursor + count, dtype=torch.long))
+            cursor += count
+
+        train_index = torch.as_tensor(s_dict['train'], dtype=torch.long)
+        full_train_y = dataset.data.y[train_index].reshape(len(train_index), -1)
+        full_train_std = full_train_y.std(dim=0, correction=0)
+        subset = dataset[torch.cat(selected)]
+        data_list = [data for data in subset]
+        subset._indices = None
+        subset._data_list = data_list
+        subset.data, subset.slices = subset.collate(data_list)
+        subset.split_idxs = local_splits
+        subset._gsm_full_training_target_std = full_train_std
+        subset._gsm_analysis_split_limits = {
+            key: int(value) for key, value in limits.items()
+        }
+        dataset = subset
+        logging.info(
+            'Peptides analysis subset before PE: train=%d val=%d test=%d',
+            *(len(values) for values in local_splits),
+        )
+    return dataset
+
+
+def preformat_TUDataset(dataset_dir, name):
+"""
+        if old not in master_text:
+            raise RuntimeError(
+                "Could not locate the official Peptides preformatter for the "
+                "analysis-subset patch."
+            )
+        master_loader.write_text(master_text.replace(old, new, 1), encoding="utf-8")
+        base.log(
+            "[memory] Added analysis-only Peptides split subsetting before RRWP."
+        )
+    else:
+        base.log("[memory] Peptides analysis split-subset patch already present.")
 
 
 def apply_peptides_streaming_rrwp_patch(base: Any, repo_dir: Path) -> None:

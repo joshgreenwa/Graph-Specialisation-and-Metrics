@@ -248,12 +248,23 @@ class ZincReachConfig:
     compute_beneficial: bool = True
     compute_survival: bool = True
     compute_scale_analysis: bool = True
+    limit_dataset_to_analysis: bool = False
 
     def validate(self) -> None:
         if not self.tasks or any(task not in self.profile.tasks for task in self.tasks):
             raise ValueError(f"tasks must be drawn from {self.profile.tasks}")
         if not self.channels or any(channel not in CHANNELS for channel in self.channels):
             raise ValueError(f"channels must be drawn from {CHANNELS}")
+        if self.limit_dataset_to_analysis and self.profile.name != PEPTIDES_STRUCT_PROFILE.name:
+            raise ValueError(
+                "analysis-only dataset loading is currently registered for "
+                "Peptides-struct only"
+            )
+        if self.limit_dataset_to_analysis and self.compute_scale_analysis:
+            raise ValueError(
+                "scale analysis requires the full dataset; disable either "
+                "limit_dataset_to_analysis or compute_scale_analysis"
+            )
         for name in (
             "graphs",
             "sources_per_graph",
@@ -339,6 +350,7 @@ class ZincReachConfig:
                 "survival": bool(self.compute_survival),
                 "scale_analysis": bool(self.compute_scale_analysis),
             },
+            "limit_dataset_to_analysis": bool(self.limit_dataset_to_analysis),
             "finite_estimand": (
                 "clean-minus-donor final pre-pooling node-state change, projected "
                 "through the clean graph-output Jacobian"
@@ -400,6 +412,7 @@ class ZincReachConfig:
                 ),
                 "node_feature_fields": int(self.profile.node_feature_fields),
                 "channels": list(self.channels),
+                "limit_dataset_to_analysis": bool(self.limit_dataset_to_analysis),
                 "event_stage": self.profile.event_stage,
             }
         )
@@ -622,6 +635,21 @@ def _methodology_config(
         sources_per_graph=int(config.sources_per_graph),
         donors_per_source=int(config.donors_per_source),
     )
+    task_overrides: dict[str, dict[str, Any]] = {}
+    if config.limit_dataset_to_analysis:
+        split_limits = {
+            "train": int(config.semantic_donor_graphs),
+            "val": 1,
+            "test": int(config.graphs) + 2,
+            "seed": int(config.analysis_seed),
+        }
+        task_overrides = {
+            task: {
+                "analysis_split_limits": split_limits,
+                "eval_metric": False,
+            }
+            for task in config.tasks
+        }
     return MethodologyConfig(
         output_dir=str(output_dir / "prepared"),
         tasks=tuple(config.tasks),
@@ -637,6 +665,7 @@ def _methodology_config(
         resume=True,
         strict_audits=False,
         compute_beneficial_carriage=False,
+        task_overrides=task_overrides,
     )
 
 
@@ -7084,6 +7113,11 @@ def build_parser(
         action=argparse.BooleanOptionalAction,
         default=True,
     )
+    parser.add_argument(
+        "--limit-dataset-to-analysis",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
     parser.add_argument("--skip-dependency-install", action="store_true")
     parser.add_argument("--quiet", action="store_true")
     return parser
@@ -7138,6 +7172,7 @@ def main(
         compute_beneficial=bool(args.beneficial),
         compute_survival=bool(args.survival),
         compute_scale_analysis=bool(args.scale_analysis),
+        limit_dataset_to_analysis=bool(args.limit_dataset_to_analysis),
     )
     config.validate()
     output_dir = Path(args.output_dir)

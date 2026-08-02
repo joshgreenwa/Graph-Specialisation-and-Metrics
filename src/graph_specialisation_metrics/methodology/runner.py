@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import dataclasses
 import gc
+import json
+import os
 import platform
 import subprocess
 import sys
@@ -533,6 +535,8 @@ def prepare_task(
         "build_missing_pe_cache",
         "force_reload_data",
         "metric_reproduction_tolerance",
+        "analysis_split_limits",
+        "eval_metric",
         "expected_grit_commit",
         "split_seed",
         "train_size",
@@ -661,23 +665,54 @@ def prepare_task(
         num_threads=int(config.num_threads),
         eval_split=str(task_overrides.get("eval_split", "test")),
         donor_split=str(task_overrides.get("donor_split", "train")),
-        eval_metric=True,
+        eval_metric=bool(task_overrides.get("eval_metric", True)),
         analysis_seed=int(config.analysis_seed),
         donors=int(config.sizes.donors_per_source),
         content_adapter=spec.content_adapter,
         resume=bool(config.resume),
     )
-    grit = GritHeadModel(spec, model_config).load()
+    subset_limits = task_overrides.get("analysis_split_limits")
+    subset_environment = "GSM_PEPTIDES_ANALYSIS_SPLIT_LIMITS"
+    previous_subset = os.environ.get(subset_environment)
+    try:
+        if subset_limits is not None:
+            os.environ[subset_environment] = json.dumps(
+                dict(subset_limits),
+                sort_keys=True,
+            )
+        else:
+            os.environ.pop(subset_environment, None)
+        grit = GritHeadModel(spec, model_config).load()
+    finally:
+        if previous_subset is None:
+            os.environ.pop(subset_environment, None)
+        else:
+            os.environ[subset_environment] = previous_subset
     with torch.no_grad():
         first = Batch.from_data_list([grit.eval_ds[0].clone()]).to(grit.device)
         first_prediction, _ = grit.model(first)
     outputs = int(first_prediction.reshape(1, -1).shape[1])
-    training_targets = (
-        training_target_matrix(grit.loaders[0])
-        if task.output.sigma_policy == "training_target_std"
-        else None
+    registered_training_std = getattr(
+        grit.loaders[0].dataset,
+        "_gsm_full_training_target_std",
+        None,
     )
-    sigma = task.output.resolve(outputs, training_targets=training_targets)
+    if task.output.sigma_policy == "training_target_std" and registered_training_std is not None:
+        registered_training_std = np.asarray(
+            registered_training_std.detach().cpu(),
+            dtype=np.float64,
+        ).reshape(-1)
+        sigma = dataclasses.replace(
+            task.output,
+            sigma=tuple(float(value) for value in registered_training_std),
+        ).resolve(outputs)
+    else:
+        training_targets = (
+            training_target_matrix(grit.loaders[0])
+            if task.output.sigma_policy == "training_target_std"
+            else None
+        )
+        sigma = task.output.resolve(outputs, training_targets=training_targets)
     backend = CanonicalGritBackend(grit, task, sigma)
     with audit_scope(f"{task_name}:seed{int(train_seed)}:model") as model_scope:
         audit_checks = _model_audits(grit, backend, task, config)

@@ -216,6 +216,40 @@ def test_peptides_struct_profile_and_checkpoint_tasks_are_registered():
     assert canonical.output.representation == "evaluation_regression"
 
 
+def test_peptides_pilot_limits_splits_before_model_preprocessing(tmp_path: Path):
+    config = ZincReachConfig(
+        profile=PEPTIDES_STRUCT_PROFILE,
+        tasks=PEPTIDES_STRUCT_TASKS,
+        channels=("semantic",),
+        graphs=4,
+        semantic_donor_graphs=32,
+        compute_scale_analysis=False,
+        limit_dataset_to_analysis=True,
+    )
+    methodology = reach._methodology_config(
+        config,
+        output_dir=tmp_path,
+        checkpoints={f"{task}:41": "/unused.ckpt" for task in config.tasks},
+    )
+    for task in config.tasks:
+        override = methodology.task_overrides[task]
+        assert override["analysis_split_limits"] == {
+            "train": 32,
+            "val": 1,
+            "test": 6,
+            "seed": config.analysis_seed,
+        }
+        assert override["eval_metric"] is False
+
+
+def test_analysis_only_dataset_loading_is_peptides_specific():
+    with pytest.raises(ValueError, match="Peptides-struct only"):
+        ZincReachConfig(
+            compute_scale_analysis=False,
+            limit_dataset_to_analysis=True,
+        ).validate()
+
+
 def test_signed_output_path_carriage_is_complete_and_preserves_cancellation(
     monkeypatch,
     capsys,
