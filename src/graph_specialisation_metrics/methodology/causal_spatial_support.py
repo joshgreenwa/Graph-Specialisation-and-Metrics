@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import csv
 import dataclasses
+import itertools
 import json
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -697,32 +698,14 @@ def _load_task_context(config: Config, task: str) -> dict[str, Any]:
     model_record = load_canonical_model_record(task_root / "model.json", artifact)
     metrics = CanonicalHeadMetrics.from_scores(artifact.value)
     roles = select_role_heads(artifact.value, metrics, count=config.heads_per_family)
-    protocol_config = None
-    matched_protocol_path = None
-    protocol_attempts = []
-    for protocol_path in (
-        task_root / "protocol.json",
-        config.canonical_root / "protocol.json",
-    ):
-        if not protocol_path.is_file():
-            continue
-        candidate = methodology_config_from_record(
-            protocol_path, accelerator=config.accelerator
-        )
-        protocol_attempts.append((str(protocol_path), candidate.fingerprint))
-        if candidate.fingerprint == artifact.metadata["contract"].get(
-            "protocol_fingerprint"
-        ):
-            protocol_config = candidate
-            matched_protocol_path = protocol_path
-            break
-    if protocol_config is None:
-        expected = artifact.metadata["contract"].get("protocol_fingerprint")
-        raise ValueError(
-            "no protocol.json matches the scientific configuration bound to "
-            f"{task} score cache (expected {expected}; tried {protocol_attempts})"
-        )
-    print(f"[protocol] {task}: {matched_protocol_path}")
+    expected_protocol = artifact.metadata["contract"].get("protocol_fingerprint")
+    protocol_config, protocol_source = _resolve_protocol_config(
+        config,
+        task=task,
+        task_root=task_root,
+        expected_fingerprint=str(expected_protocol),
+    )
+    print(f"[protocol] {task}: {protocol_source}")
     contract = _measurement_contract(config, task, artifact, roles)
     cache = SupplementalCache(config.output_dir / task / "cache")
     return {
@@ -735,6 +718,81 @@ def _load_task_context(config: Config, task: str) -> dict[str, Any]:
         "contract": contract,
         "cache": cache,
     }
+
+
+def _resolve_protocol_config(
+    config: Config,
+    *,
+    task: str,
+    task_root: Path,
+    expected_fingerprint: str,
+) -> tuple[Any, str]:
+    """Find, or exactly reconstruct, the protocol cryptographically bound to a cache."""
+
+    preferred = [task_root / "protocol.json", config.canonical_root / "protocol.json"]
+    search_root = config.canonical_root.parent
+
+    def protocol_paths():
+        seen: set[Path] = set()
+        for path in preferred:
+            if path not in seen:
+                seen.add(path)
+                yield path
+        if search_root.is_dir():
+            for path in search_root.rglob("protocol.json"):
+                if path not in seen:
+                    seen.add(path)
+                    yield path
+
+    attempts: list[tuple[str, str]] = []
+    for protocol_path in protocol_paths():
+        if not protocol_path.is_file():
+            continue
+        try:
+            record = json.loads(protocol_path.read_text(encoding="utf-8"))
+        except Exception as error:
+            attempts.append((str(protocol_path), f"{type(error).__name__}: {error}"))
+            continue
+        candidates: list[tuple[str, Mapping[str, Any]]] = [(str(protocol_path), record)]
+        tasks = tuple(str(value) for value in record.get("tasks", ()))
+        if task in tasks and len(tasks) <= 10:
+            for width in range(1, len(tasks) + 1):
+                for positions in itertools.combinations(range(len(tasks)), width):
+                    subset = tuple(tasks[position] for position in positions)
+                    if task not in subset or subset == tasks:
+                        continue
+                    derived = dict(record)
+                    derived["tasks"] = list(subset)
+                    derived["task_train_seeds"] = {
+                        name: seeds
+                        for name, seeds in record.get("task_train_seeds", {}).items()
+                        if name in subset
+                    }
+                    derived["task_overrides"] = {
+                        name: values
+                        for name, values in record.get("task_overrides", {}).items()
+                        if name in subset
+                    }
+                    candidates.append(
+                        (f"{protocol_path}#tasks={','.join(subset)}", derived)
+                    )
+        for source, candidate_record in candidates:
+            try:
+                candidate = methodology_config_from_record(
+                    candidate_record, accelerator=config.accelerator
+                )
+            except Exception as error:
+                attempts.append((source, f"{type(error).__name__}: {error}"))
+                continue
+            attempts.append((source, candidate.fingerprint))
+            if candidate.fingerprint == expected_fingerprint:
+                return candidate, source
+    preview = attempts[:12]
+    raise ValueError(
+        "no available protocol record matches the scientific configuration bound "
+        f"to {task} score cache (expected {expected_fingerprint}; "
+        f"tested {len(attempts)} candidates; first attempts {preview})"
+    )
 
 
 def measure_task(config: Config, task: str, context: Mapping[str, Any]) -> dict[str, Any]:

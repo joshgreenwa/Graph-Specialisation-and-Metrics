@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from pathlib import Path
+import json
 from types import SimpleNamespace
 
 import numpy as np
@@ -154,8 +154,8 @@ def test_task_bound_protocol_is_preferred_over_stale_root_protocol(
 
     task_root = tmp_path / "zinc" / "seed_42"
     task_root.mkdir(parents=True)
-    (task_root / "protocol.json").write_text("{}", encoding="utf-8")
-    (tmp_path / "protocol.json").write_text("{}", encoding="utf-8")
+    (task_root / "protocol.json").write_text('{"marker": "task"}', encoding="utf-8")
+    (tmp_path / "protocol.json").write_text('{"marker": "root"}', encoding="utf-8")
     artifact = SimpleNamespace(
         value={},
         file_sha256="score-sha",
@@ -175,10 +175,10 @@ def test_task_bound_protocol_is_preferred_over_stale_root_protocol(
     monkeypatch.setattr(module, "select_role_heads", lambda *a, **k: {"semantic": ((0, 0),)})
     seen = []
 
-    def protocol(path, **_kwargs):
-        seen.append(path)
+    def protocol(record, **_kwargs):
+        seen.append(record["marker"])
         return SimpleNamespace(
-            fingerprint="wanted" if Path(path).parent == task_root else "stale"
+            fingerprint="wanted" if record["marker"] == "task" else "stale"
         )
 
     monkeypatch.setattr(module, "methodology_config_from_record", protocol)
@@ -187,4 +187,36 @@ def test_task_bound_protocol_is_preferred_over_stale_root_protocol(
         "zinc",
     )
     assert context["protocol_config"].fingerprint == "wanted"
-    assert seen == [task_root / "protocol.json"]
+    assert seen == ["task"]
+
+
+def test_protocol_task_subset_is_exactly_reconstructed(tmp_path, monkeypatch) -> None:
+    from graph_specialisation_metrics.methodology import causal_spatial_support as module
+
+    canonical_root = tmp_path / "canonical"
+    canonical_root.mkdir()
+    (canonical_root / "protocol.json").write_text(
+        json.dumps(
+            {
+                "tasks": ["zinc", "qm9_gap_dense", "peptides_func", "peptides_struct"],
+                "task_train_seeds": {},
+                "task_overrides": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def protocol(record, **_kwargs):
+        tasks = tuple(record["tasks"])
+        fingerprint = "wanted" if tasks == ("zinc", "qm9_gap_dense") else "stale"
+        return SimpleNamespace(fingerprint=fingerprint, tasks=tasks)
+
+    monkeypatch.setattr(module, "methodology_config_from_record", protocol)
+    resolved, source = module._resolve_protocol_config(
+        Config(canonical_root=canonical_root, output_dir=tmp_path / "output"),
+        task="zinc",
+        task_root=canonical_root / "zinc" / "seed_42",
+        expected_fingerprint="wanted",
+    )
+    assert resolved.tasks == ("zinc", "qm9_gap_dense")
+    assert source.endswith("#tasks=zinc,qm9_gap_dense")
