@@ -25,20 +25,21 @@ SECRET_NAME = "dissertation_key"
 # ----------------------------- experiment controls -----------------------------
 
 PHASE = "all"  # "all", "measure", or "figures"
+PILOT = True  # Fast ZINC-only directional check; set False for the two-task run.
 DRIVE_ROOT = Path("/content/drive/MyDrive")
 CANONICAL_ROOT_CANDIDATES = (
     DRIVE_ROOT / "graph_specialisation_metrics/canonical_methodology_v4_zinc_qm9",
     DRIVE_ROOT / "graph_specialisation_metrics/canonical_methodology",
 )
 OUTPUT_DIR = DRIVE_ROOT / "graph_specialisation_metrics/causal_spatial_support_v1"
-TASKS = "zinc,qm9_gap_dense"
+TASKS = "zinc" if PILOT else "zinc,qm9_gap_dense"
 TRAIN_SEED = 42
-GRAPHS = 8
-SOURCES_PER_GRAPH = 2
+GRAPHS = 4 if PILOT else 8
+SOURCES_PER_GRAPH = 1 if PILOT else 2
 DONORS_PER_SOURCE = 1
-HEADS_PER_FAMILY = 3
+HEADS_PER_FAMILY = 2 if PILOT else 3
 LONG_RANGE_RADIUS = 2
-BOOTSTRAP_REPLICATES = 2_000
+BOOTSTRAP_REPLICATES = 1_000 if PILOT else 2_000
 ANALYSIS_SEED = 72_019
 ACCELERATOR = "cuda:0"
 INSTALL_DEPENDENCIES = True
@@ -115,7 +116,10 @@ from graph_specialisation_metrics.methodology.causal_spatial_support import main
 
 
 print(
-    "\n[question] Which spatial portion of a causally important specialist head "
+    f"\n[preset] {'pilot' if PILOT else 'full'}: tasks={TASKS}; graphs={GRAPHS}; "
+    f"sources/graph={SOURCES_PER_GRAPH}; donors/source={DONORS_PER_SOURCE}; "
+    f"heads/family={HEADS_PER_FAMILY}\n"
+    "[question] Which spatial portion of a causally important specialist head "
     "actually mediates the output?\n"
     "[A] Clean direct attention from each intervened source to receivers by pristine SPD.\n"
     "[S] Immutable canonical discovery-split internal response by source-carrier SPD.\n"
