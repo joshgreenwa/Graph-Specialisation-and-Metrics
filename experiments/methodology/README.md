@@ -57,12 +57,15 @@ PCQM suite (plus an explicit-hydrogen category for QM9). Attention grids, indivi
 PCAs, and selected-head distance score breakdowns mirror the current PCQM publication layout,
 typography, simplified titles, axis wording, and legend placement; task identity remains explicit
 in the distance-figure subtitle, export names, and provenance. Like the PCQM notebook, each
-attention figure uses four configurable molecule rows. Attention colour is stable by head family:
+attention figure uses four configurable molecule rows. ZINC and QM9 each expose independent
+ordered graph-index lists for semantic, structural, and generalist attention figures. The notebook
+caches the stable five-row union once, then slices the configured four-row family view for every
+head in that family; unchanged defaults therefore continue to hit the existing shared cache.
+Attention colour is stable by head family:
 semantic specialists use orange, structural specialists use blue, and high-$J$ generalists use
 purple. Each figure applies its family colour map consistently to the attention-weighted molecule,
 node-conditioned matrix, and colour bar; this is render-only metadata and does not invalidate the
-cached attention tensors. The notebook installs RDKit
-explicitly, writes every model-forward
+cached attention tensors. The notebook installs RDKit explicitly, writes every model-forward
 diagnostic to its exact supplemental cache before rendering, and constructs the GRIT runtime only
 if one of those artifacts is missing. Once populated, styling-only reruns do not rebuild RRWP,
 reload the checkpoint, or execute model forwards. Each named semantic specialist, structural

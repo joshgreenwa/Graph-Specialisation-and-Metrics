@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import matplotlib
 from matplotlib.collections import PolyCollection
+from matplotlib.colors import to_rgba
 import numpy as np
 import pytest
 
@@ -394,6 +395,14 @@ def test_routing_transport_figure_caps_spd_at_14_and_keeps_special_bin():
             expected_labels
         )
         assert len(top_axis.patches) == 16
+        assert all(
+            np.allclose(patch.get_facecolor(), to_rgba("#087E8B"))
+            for patch in top_axis.patches[:-1]
+        )
+        assert np.allclose(
+            top_axis.patches[-1].get_facecolor(),
+            to_rgba("#E6A700"),
+        )
         assert all(len(line.get_xdata()) == 16 for line in bottom_axis.lines)
     finally:
         plt.close(figure)
@@ -1357,6 +1366,30 @@ def test_colab_notebook_has_valid_python_cells():
     )
     payload = json.loads(notebook.read_text(encoding="utf-8"))
     assert payload["nbformat"] == 4
+    configuration = {}
+    exec(
+        compile(
+            "".join(payload["cells"][1]["source"]),
+            f"{notebook}:configuration",
+            "exec",
+        ),
+        configuration,
+    )
+    attention_indices = configuration["ATTENTION_GRID_GRAPH_INDICES"]
+    for task_name in ("zinc", "qm9_gap_dense"):
+        assert tuple(attention_indices[task_name]) == (
+            "semantic",
+            "structural",
+            "generalist",
+        )
+        default_union = list(
+            dict.fromkeys(
+                graph_index
+                for family in ("semantic", "structural", "generalist")
+                for graph_index in attention_indices[task_name][family]
+            )
+        )
+        assert default_union == [0, 5, 80, 100, 200]
     assert "zinc" in "".join(payload["cells"][1]["source"])
     assert "qm9_gap_dense" in "".join(payload["cells"][1]["source"])
     source = "\n".join(
@@ -1370,6 +1403,9 @@ def test_colab_notebook_has_valid_python_cells():
     assert "HEADS_PER_FAMILY = 5" in source
     assert "ATTENTION_GRID_NUM_ROWS = 4" in source
     assert "ATTENTION_CACHE_NUM_ROWS = 5" in source
+    assert 'ATTENTION_FAMILIES = ("semantic", "structural", "generalist")' in source
+    assert "def attention_role_family(role):" in source
+    assert "Edit semantic, structural, and generalist rows independently" in source
     assert "ATTENTION_FAMILY_CMAP_NAMES" in source
     assert '"attention_colormap": attention_cmap_name(role)' in source
     assert '"attention_family_colormaps": dict(ATTENTION_FAMILY_CMAP_NAMES)' in source
@@ -1387,11 +1423,27 @@ def test_colab_notebook_has_valid_python_cells():
     assert 'all_roles = dict(context["display_heads"])' in source
     assert "clean_attention_mass_vs_SPD" in source
     runtime_source = "".join(payload["cells"][6]["source"])
+    assert "ATTENTION_GRID_GRAPH_INDICES[task_name][family]" in runtime_source
+    assert "family_cache_graph_indices" in runtime_source
+    assert "family_display_graph_indices" in runtime_source
+    assert "for family in ATTENTION_FAMILIES" in runtime_source
+    assert "graph_indices = list(dict.fromkeys(" in runtime_source
+    assert 'f"{task_name} {family} attention rows: "' in runtime_source
     assert "num_rows=ATTENTION_CACHE_NUM_ROWS" in runtime_source
     assert "num_rows=ATTENTION_GRID_NUM_ROWS" in runtime_source
     assert "display_attention_payload" in runtime_source
+    assert "family = attention_role_family(role)" in runtime_source
+    assert "display_graph_indices = family_display_graph_indices[family]" in runtime_source
     assert "for graph_index in display_graph_indices" in runtime_source
+    assert '"attention_family": family' in runtime_source
+    assert (
+        '"family_cache_graph_indices": family_cache_graph_indices[family]'
+        in runtime_source
+    )
     assert '"cache_graph_indices": graph_indices' in runtime_source
+    assert '"attention_grid_graph_indices_by_family"' in runtime_source
+    assert '"attention_cache_graph_indices_by_family"' in runtime_source
+    assert '"attention_cache_union_graph_indices"' in runtime_source
     assert runtime_source.index("plot_attention_grid(") < runtime_source.index(
         "plot_av_pca("
     )
