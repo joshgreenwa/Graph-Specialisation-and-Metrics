@@ -75,7 +75,10 @@ predates later derived-record fields, while still binding the exact recorded run
 styling-only reruns do not rebuild RRWP,
 reload the checkpoint, or execute model forwards. Each named semantic specialist, structural
 specialist, and high-`J` generalist is displayed as an attention grid, routed-output PCA, and then
-its mean clean-attention-mass versus shortest-path-distance companion. The notebook selects five
+its mean clean-attention-mass versus shortest-path-distance companion. Each companion uses the
+title `Attention mass by hop distance - Lx Hy` and inherits its paired PCA's complete export
+canvas, including the reserved legend area, so their PNG and PDF dimensions match exactly for
+side-by-side composition. The notebook selects five
 distinct heads in each family (semantic, structural, and high-`J` generalist), and emits no distance
 curves for heads outside those 15 identified examples. Optional first-, second-, and final-layer
 all-head routed-output PCA grids share one additional contract-cached sweep. GRIT's non-additive

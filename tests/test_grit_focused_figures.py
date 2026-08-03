@@ -1074,6 +1074,81 @@ def test_pca_legend_is_ranked_by_observed_frequency():
         plt.close(figure)
 
 
+def test_hop_attention_export_exactly_matches_paired_pca_canvas(
+    tmp_path: Path,
+):
+    import matplotlib.pyplot as plt
+
+    labels = (
+        ["Ring: aromatic"] * 2
+        + ["O: carbonyl"] * 5
+        + ["N: amide"] * 3
+        + ["other/diffuse"] * 6
+    )
+    pca_figure = plot_av_pca(
+        {
+            "task": "zinc",
+            "display_title": "ZINC — GRIT",
+            "head": (2, 3),
+            "vectors": np.arange(len(labels) * 3, dtype=float).reshape(
+                len(labels), 3
+            ),
+            "labels": labels,
+            "n_used": len(labels),
+        },
+        d_rel=-0.275,
+        joint_sensitivity=1.234,
+    )
+    metrics = CanonicalHeadMetrics.from_scores(_score_value())
+    distance_metrics = dataclasses.replace(
+        metrics,
+        distance_axis=("0", "1", "graph_token"),
+        clean_attention_distance=np.full((2, 4, 3), 1 / 3),
+    )
+    paired_size = tuple(float(value) for value in pca_figure.get_size_inches())
+    hop_figure = plot_hop_attention_mass(
+        distance_metrics,
+        (0, 0),
+        figsize=paired_size,
+    )
+    try:
+        np.testing.assert_allclose(hop_figure.get_size_inches(), paired_size)
+        assert hop_figure.axes[0].get_title() == (
+            "Attention mass by hop distance - L0 H0"
+        )
+        assert not hop_figure.legends
+        pca_paths = save_figure_bundle(
+            pca_figure,
+            tmp_path,
+            "paired_pca",
+            dpi=72,
+            pdf_dpi=72,
+        )
+        hop_paths = save_figure_bundle(
+            hop_figure,
+            tmp_path,
+            "paired_hop",
+            dpi=72,
+            pdf_dpi=72,
+        )
+        assert plt.imread(pca_paths["png"]).shape[:2] == plt.imread(
+            hop_paths["png"]
+        ).shape[:2]
+        PdfReader = pytest.importorskip("pypdf").PdfReader
+        pca_page = PdfReader(str(pca_paths["pdf"])).pages[0]
+        hop_page = PdfReader(str(hop_paths["pdf"])).pages[0]
+        assert (
+            float(pca_page.mediabox.width),
+            float(pca_page.mediabox.height),
+        ) == (
+            float(hop_page.mediabox.width),
+            float(hop_page.mediabox.height),
+        )
+    finally:
+        plt.close(pca_figure)
+        plt.close(hop_figure)
+
+
 def test_pcqm_aligned_figure_dimensions():
     import matplotlib.pyplot as plt
 
@@ -1127,7 +1202,7 @@ def test_pcqm_aligned_figure_dimensions():
         ),
         (
             plot_hop_attention_mass(distance_metrics, (0, 0)),
-            (8.4, 4.8),
+            (9.6, 7.89),
         ),
         (plot_logit_spread(logit), (8.2, 4.9)),
         (
@@ -1228,6 +1303,9 @@ def test_figure_bundle_uses_publication_export_resolution(tmp_path: Path):
             self.calls.append((Path(path), kwargs))
             Path(path).write_bytes(b"test")
 
+        def get_size_inches(self):
+            return np.asarray([6.4, 4.8])
+
     figure = RecordingFigure()
     save_figure_bundle(figure, tmp_path, "publication")
     assert figure.calls[0][0].suffix == ".png"
@@ -1244,6 +1322,8 @@ def test_figure_bundle_uses_publication_export_resolution(tmp_path: Path):
         "pdf_vector_text_and_paths": True,
         "pdf_font_embedding": "TrueType (fonttype 42)",
         "molecule_render_dpi": 600,
+        "preserve_canvas": False,
+        "figure_size_inches": [6.4, 4.8],
     }
 
 
@@ -1559,6 +1639,11 @@ def test_colab_notebook_has_valid_python_cells():
     assert runtime_source.index("plot_av_pca(") < runtime_source.index(
         'f"{role}_head_{head[0]}_{head[1]}_clean_attention_mass_vs_SPD"'
     )
+    assert "pca_figure = plot_av_pca(" in runtime_source
+    assert "paired_figure_size = tuple(" in runtime_source
+    assert "figsize=paired_figure_size" in runtime_source
+    assert '"paired_PCA_figure_size_inches"' in runtime_source
+    assert "Mean clean attention mass vs SPD" not in runtime_source
     assert "companion_heads = set(all_roles.values())" not in runtime_source
     assert "additional structural head" not in runtime_source
     assert "compute_layer_av_pca_inputs(" in runtime_source
