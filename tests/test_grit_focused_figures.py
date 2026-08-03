@@ -811,10 +811,36 @@ def test_invalid_qm9_valence_uses_index_preserving_rdkit_fallback():
 def test_canonical_task_root_resolution_prefers_configured_then_discovers(
     tmp_path: Path,
 ):
-    def complete(root: Path, task: str) -> Path:
+    torch = pytest.importorskip("torch")
+
+    def complete(
+        root: Path,
+        task: str,
+        *,
+        protocol_version: str = PROTOCOL_VERSION,
+    ) -> Path:
         task_root = root / task / "seed_42"
         (task_root / "cache/scores").mkdir(parents=True)
-        (task_root / "cache/scores/raw.pt").touch()
+        contract = {
+            "task": task,
+            "checkpoint_sha256": "checkpoint-sha",
+            "model_geometry": {"layers": 10, "heads": 8},
+            "sigma": 1.0,
+            "split_fingerprint": "split-fingerprint",
+            "task_adapter_version": "test-adapter-v1",
+            "train_seed": 42,
+        }
+        torch.save(
+            {
+                "metadata": {
+                    "protocol_version": protocol_version,
+                    "contract": contract,
+                    "contract_fingerprint": stable_hash(contract),
+                },
+                "value": {},
+            },
+            task_root / "cache/scores/raw.pt",
+        )
         (task_root / "model.json").write_text("{}", encoding="utf-8")
         return task_root
 
@@ -840,26 +866,81 @@ def test_canonical_task_root_resolution_prefers_configured_then_discovers(
         search_root=metrics_root,
     ) == discovered_task.resolve()
 
+    stale_task = complete(
+        metrics_root / "canonical_old",
+        "zinc_2hop",
+        protocol_version="donor-swap-specialisation-carriage-v3",
+    )
+    valid_task = complete(metrics_root / "canonical_v4", "zinc_2hop")
+    assert resolve_canonical_task_root(
+        "zinc_2hop",
+        42,
+        (metrics_root / "canonical_old",),
+        search_root=metrics_root,
+    ) == valid_task.resolve()
+    assert stale_task != valid_task
+
 
 def test_canonical_task_root_resolution_rejects_ambiguous_or_missing_caches(
     tmp_path: Path,
 ):
-    def complete(root: Path) -> None:
+    torch = pytest.importorskip("torch")
+
+    def complete(
+        root: Path,
+        *,
+        protocol_version: str = PROTOCOL_VERSION,
+    ) -> None:
         task_root = root / "zinc_2hop" / "seed_42"
         (task_root / "cache/scores").mkdir(parents=True)
-        (task_root / "cache/scores/raw.pt").touch()
+        contract = {
+            "task": "zinc_2hop",
+            "checkpoint_sha256": "checkpoint-sha",
+            "model_geometry": {"layers": 10, "heads": 8},
+            "sigma": 1.0,
+            "split_fingerprint": "split-fingerprint",
+            "task_adapter_version": "test-adapter-v1",
+            "train_seed": 42,
+        }
+        torch.save(
+            {
+                "metadata": {
+                    "protocol_version": protocol_version,
+                    "contract": contract,
+                    "contract_fingerprint": stable_hash(contract),
+                },
+                "value": {},
+            },
+            task_root / "cache/scores/raw.pt",
+        )
         (task_root / "model.json").touch()
 
     metrics_root = tmp_path / "graph_specialisation_metrics"
     complete(metrics_root / "canonical_a")
     complete(metrics_root / "canonical_b")
-    with pytest.raises(ValueError, match="multiple complete canonical caches"):
+    with pytest.raises(ValueError, match="multiple compatible canonical caches"):
         resolve_canonical_task_root(
             "zinc_2hop",
             42,
             (),
             search_root=metrics_root,
         )
+    stale_root = metrics_root / "canonical_stale"
+    complete(
+        stale_root,
+        protocol_version="donor-swap-specialisation-carriage-v3",
+    )
+    with pytest.raises(
+        FileNotFoundError,
+        match="Rejected incompatible caches",
+    ) as stale_error:
+        resolve_canonical_task_root(
+            "zinc_2hop",
+            42,
+            (stale_root,),
+            search_root=tmp_path / "no-search",
+        )
+    assert "donor-swap-specialisation-carriage-v3" in str(stale_error.value)
     with pytest.raises(FileNotFoundError, match="qm9_gap_1hop"):
         resolve_canonical_task_root(
             "qm9_gap_1hop",
@@ -1698,7 +1779,44 @@ def test_colab_notebook_has_valid_python_cells():
     )
     attention_indices = configuration["ATTENTION_GRID_GRAPH_INDICES"]
     zinc_union = [100, 200, 750, 80, 120, 160, 0, 220]
-    qm9_union = [0, 5, 80, 100, 200]
+    qm9_union = [
+        0,
+        5,
+        80,
+        160,
+        240,
+        320,
+        400,
+        480,
+        560,
+        640,
+        720,
+        800,
+        16,
+        64,
+        112,
+        208,
+        304,
+        416,
+        512,
+        608,
+        704,
+        816,
+        912,
+        1008,
+        24,
+        72,
+        120,
+        216,
+        312,
+        408,
+        504,
+        600,
+        696,
+        792,
+        888,
+        984,
+    ]
     expected_unions = {
         **{task_name: zinc_union for task_name in ZINC_FIGURE_TASKS},
         **{task_name: qm9_union for task_name in QM9_FIGURE_TASKS},

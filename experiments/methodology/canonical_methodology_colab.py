@@ -1,7 +1,7 @@
 """Paste/run this lightweight cell in Colab to execute the final methodology.
 
-Edit only TASKS, TRAIN_SEEDS/TASK_TRAIN_SEEDS, PHASES, CHECKPOINTS, TASK_OVERRIDES,
-SIZES, FAMILIES, and EXECUTION. Scientific definitions live in
+Edit only TASKS, TRAIN_SEEDS/TASK_TRAIN_SEEDS, PHASES, OUTPUT_DIR, CHECKPOINTS,
+TASK_OVERRIDES, SIZES, FAMILIES, and EXECUTION. Scientific definitions live in
 ``src/graph_specialisation_metrics/README.md``
 and the canonical package; this front end merely checks out the chosen repository revision,
 mounts Drive, and dispatches registered tasks.
@@ -16,6 +16,10 @@ REPO_URL = "https://github.com/joshgreenwa/Graph-Specialisation-and-Metrics.git"
 BRANCH = "main"
 REPO_DIR = "/content/Graph-Specialisation-and-Metrics"
 SECRET_NAME = "dissertation_key"
+OUTPUT_DIR = (
+    "/content/drive/MyDrive/graph_specialisation_metrics/"
+    "canonical_methodology_v4_zinc_qm9"
+)
 
 # First production run: all registered dense task families.
 TASKS = ("zinc", "qm9_gap_dense", "peptides_func", "peptides_struct")
@@ -121,6 +125,7 @@ run(
     sizes=SIZES,
     families=FAMILIES,
     execution=EXECUTION,
+    output_dir=OUTPUT_DIR,
     mount=False,
 )
 # On a runtime where GRIT/PyG dependencies are already installed, add skip_install=True.

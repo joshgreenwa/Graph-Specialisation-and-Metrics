@@ -1314,11 +1314,13 @@ def resolve_canonical_task_root(
     *,
     search_root: str | Path | None = None,
 ) -> Path:
-    """Locate one complete task/seed canonical cache without guessing silently.
+    """Locate one compatible task/seed canonical cache without guessing.
 
     Configured roots are checked in order. If none contains the task, an optional
     one-level search finds canonical output roots under the shared metrics folder.
-    A complete candidate must contain both ``scores/raw.pt`` and ``model.json``.
+    A candidate must contain both ``scores/raw.pt`` and ``model.json`` and pass
+    the current canonical score-artifact validation, including protocol version.
+    Structurally complete but stale caches are reported rather than selected.
     """
 
     task_name = str(task_name)
@@ -1328,15 +1330,25 @@ def resolve_canonical_task_root(
         for root in canonical_roots
     ]
     checked: list[Path] = []
+    rejected: dict[Path, str] = {}
+
+    def compatible(candidate: Path) -> bool:
+        score_path = candidate / "cache/scores/raw.pt"
+        if not score_path.is_file() or not (candidate / "model.json").is_file():
+            return False
+        try:
+            load_canonical_score_artifact(score_path, expected_task=task_name)
+        except (FileNotFoundError, StaleCacheError) as error:
+            rejected[candidate] = str(error)
+            return False
+        return True
+
     for candidate in configured:
         candidate = candidate.resolve()
         if candidate in checked:
             continue
         checked.append(candidate)
-        if (
-            (candidate / "cache/scores/raw.pt").is_file()
-            and (candidate / "model.json").is_file()
-        ):
+        if compatible(candidate):
             return candidate
 
     discovered: list[Path] = []
@@ -1348,24 +1360,30 @@ def resolve_canonical_task_root(
                 if candidate in checked:
                     continue
                 checked.append(candidate)
-                if (
-                    (candidate / "cache/scores/raw.pt").is_file()
-                    and (candidate / "model.json").is_file()
-                ):
+                if compatible(candidate):
                     discovered.append(candidate)
     if len(discovered) == 1:
         return discovered[0]
     if len(discovered) > 1:
         choices = "\n".join(f"  - {path}" for path in discovered)
         raise ValueError(
-            f"multiple complete canonical caches found for {task_name} seed "
+            f"multiple compatible canonical caches found for {task_name} seed "
             f"{train_seed}; add the intended root to CANONICAL_ROOT_CANDIDATES:\n"
             f"{choices}"
         )
     locations = "\n".join(f"  - {path}" for path in checked)
+    rejection_details = "\n".join(
+        f"  - {path}: {reason}" for path, reason in rejected.items()
+    )
+    rejected_message = (
+        f"\nRejected incompatible caches:\n{rejection_details}"
+        if rejection_details
+        else ""
+    )
     raise FileNotFoundError(
-        f"no complete canonical score cache was found for {task_name} seed "
+        f"no compatible canonical score cache was found for {task_name} seed "
         f"{train_seed}. Checked:\n{locations or '  - no candidate roots'}\n"
+        f"{rejected_message}\n"
         "Run the canonical methodology scores phase for this registered task, "
         "or add its existing output root to CANONICAL_ROOT_CANDIDATES."
     )
