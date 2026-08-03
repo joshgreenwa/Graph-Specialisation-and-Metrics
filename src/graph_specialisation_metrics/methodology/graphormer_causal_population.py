@@ -663,6 +663,14 @@ def _event_interval(
     alpha = (1.0 - float(config.bootstrap.confidence)) / 2.0
     low = np.nanquantile(draws, alpha, axis=0)
     high = np.nanquantile(draws, 1.0 - alpha, axis=0)
+    pairing_estimate = (estimate[0, 0] - estimate[0, 1]) - (
+        estimate[1, 0] - estimate[1, 1]
+    )
+    pairing_draws = (draws[:, 0, 0] - draws[:, 0, 1]) - (
+        draws[:, 1, 0] - draws[:, 1, 1]
+    )
+    pairing_low = np.nanquantile(pairing_draws, alpha, axis=0)
+    pairing_high = np.nanquantile(pairing_draws, 1.0 - alpha, axis=0)
     return {
         "metric_order": tuple(metric_order),
         "family_order": tuple(family_order),
@@ -670,6 +678,9 @@ def _event_interval(
         "estimate": estimate,
         "low": low,
         "high": high,
+        "correct_pairing_advantage": pairing_estimate,
+        "correct_pairing_low": pairing_low,
+        "correct_pairing_high": pairing_high,
         "replicates": int(interval.replicates),
         "resampled_levels": interval.resampled_levels + ("matched head pair",),
         "event_counts": {channel: len(observations[channel]) for channel in CHANNELS},
@@ -691,6 +702,15 @@ def _endpoint(summary: Mapping[str, Any], metric: str) -> dict[str, Any]:
         "low": low,
         "high": high,
         "double_difference": float(interaction),
+        "correct_pairing_advantage": float(
+            np.asarray(summary["correct_pairing_advantage"])[position]
+        ),
+        "correct_pairing_low": float(
+            np.asarray(summary["correct_pairing_low"])[position]
+        ),
+        "correct_pairing_high": float(
+            np.asarray(summary["correct_pairing_high"])[position]
+        ),
         "replicates": summary["replicates"],
         "resampled_levels": summary["resampled_levels"],
         "event_counts": summary["event_counts"],
@@ -783,7 +803,16 @@ def aggregate_population_tests(
     *,
     progress: Any | None = None,
 ) -> dict[str, Any]:
-    patch = _event_interval(
+    raw_patch = _event_interval(
+        causal_rows,
+        population_gate,
+        config,
+        metric_order=("R_align_matched", "I_align_matched"),
+        require_controlled=False,
+        seed_offset=397,
+        progress=progress,
+    )
+    mismatch_adjusted_patch = _event_interval(
         causal_rows,
         population_gate,
         config,
@@ -811,8 +840,11 @@ def aggregate_population_tests(
             "donors_per_source": int(config.sizes.donors_per_source),
         },
         "population_gate": population_gate,
-        "restoration": _endpoint(patch, "R_align_adj"),
-        "injection": _endpoint(patch, "I_align_adj"),
+        "raw_primary_version": "donor-averaged-direction-aligned-v1",
+        "raw_restoration": _endpoint(raw_patch, "R_align_matched"),
+        "raw_injection": _endpoint(raw_patch, "I_align_matched"),
+        "restoration": _endpoint(mismatch_adjusted_patch, "R_align_adj"),
+        "injection": _endpoint(mismatch_adjusted_patch, "I_align_adj"),
         "necessity": _endpoint(necessity, "N_fraction"),
         "clean_ablation": _add_clean_diagnostics(
             _clean_ablation_interval(clean_rows, scores, config, progress=progress)
@@ -842,7 +874,11 @@ def run_population_analysis(
     _, cache = _population_cache(prepared, config, population_gate)
     if config.resume and not config.force:
         cached = cache.load("focused_population", "core_tests", strict=True)
-        if cached is not None:
+        if (
+            cached is not None
+            and "raw_restoration" in cached
+            and "correct_pairing_advantage" in cached.get("necessity", {})
+        ):
             log("[cache] loaded complete Graphormer causal population analysis")
             if prepared.progress is not None:
                 prepared.progress.emit(
@@ -851,6 +887,58 @@ def run_population_analysis(
                     cache="core_tests",
                 )
             return cached
+        if cached is not None:
+            log(
+                "[cache] deriving donor-averaged primary endpoints from existing "
+                "causal event shards"
+            )
+            causal_rows, cache, _audits = run_population_events(
+                prepared,
+                config,
+                confidence_gate,
+                population_gate,
+                execution=execution,
+            )
+            raw_patch = _event_interval(
+                causal_rows,
+                population_gate,
+                config,
+                metric_order=("R_align_matched", "I_align_matched"),
+                require_controlled=False,
+                seed_offset=397,
+                progress=prepared.progress,
+            )
+            necessity = _event_interval(
+                causal_rows,
+                population_gate,
+                config,
+                metric_order=("N_fraction",),
+                require_controlled=False,
+                seed_offset=409,
+                progress=prepared.progress,
+            )
+            upgraded = dict(cached)
+            upgraded.update(
+                {
+                    "raw_primary_version": "donor-averaged-direction-aligned-v1",
+                    "raw_restoration": _endpoint(raw_patch, "R_align_matched"),
+                    "raw_injection": _endpoint(raw_patch, "I_align_matched"),
+                    "necessity": _endpoint(necessity, "N_fraction"),
+                }
+            )
+            cache.save("focused_population", "core_tests", upgraded)
+            if prepared.progress is not None:
+                prepared.progress.emit(
+                    "cache_upgrade_complete",
+                    cache="core_tests",
+                    added=(
+                        "raw_restoration",
+                        "raw_injection",
+                        "necessity.correct_pairing_interval",
+                    ),
+                    model_forwards=0,
+                )
+            return upgraded
     if population_gate["status"] != "estimable":
         raise RuntimeError(population_gate["status_reason"])
     causal_rows, cache, audits = run_population_events(

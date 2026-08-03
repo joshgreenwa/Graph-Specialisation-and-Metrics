@@ -34,9 +34,17 @@ these rules after seeing causal outcomes.
 
 The first panel inserts each head's clean routed output into the intervened graph (restoration).
 The second inserts its intervention-state output into the clean graph (injection). Both report the
-direction-aligned movement beyond the same-source, same-tier, nearest-dose alternative-donor
-activation control. The third independently ablates the head in clean and intervened runs and
-reports the fraction of the intervention effect removed.
+raw direction-aligned movement, averaged across donor interventions. This directly tests the
+aggregate claim behind `D_rel`: whether semantic-scoring heads respond more to semantic events and
+structural-scoring heads respond more to structural events. The third independently ablates the
+head in clean and intervened runs and reports the fraction of the intervention effect removed.
+
+Each panel also reports one "correct-pairing advantage": semantic heads on semantic rather than
+structural events, combined with structural heads on structural rather than semantic events. Its
+bootstrap interval directly states whether the two score-defined families have different causal
+roles. A separate retained figure subtracts the same-source, same-tier, nearest-dose
+alternative-donor response. That stricter donor-specific analysis is a robustness check, not the
+primary test of aggregate semantic/structural specialization.
 
 The semantic and structural populations are evaluated on both intervention channels. The
 `J`-matched null family is shown for necessity. Confidence intervals jointly resample held-out molecules,
@@ -80,6 +88,8 @@ and 30-second device-wide GPU utilization, VRAM, and power heartbeats.
 Outputs are vector PDFs, 600-DPI PNGs, and JSON provenance sidecars under
 `figures/focused_causal_population/`:
 
-- `01_population_restoration_injection_necessity`;
+- `01_population_raw_restoration_injection_necessity` (primary);
+- `01b_correct_pairing_advantage` (direct matching-versus-crossed summary);
+- `01_population_restoration_injection_necessity` (retained mismatch-adjusted robustness check);
 - `02_J_vs_clean_ablation`; and
 - `S01_population_head_selection`.

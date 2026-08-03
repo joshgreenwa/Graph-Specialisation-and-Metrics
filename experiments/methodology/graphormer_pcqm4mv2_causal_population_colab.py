@@ -22,6 +22,8 @@ OUTPUT_ROOT = DRIVE_ROOT / "graph_specialisation_metrics/graphormer_pcqm4mv2_cau
 PCQM_DATASET_ROOT = DRIVE_ROOT / "graph_specialisation_metrics/cache/pcqm4mv2"
 HF_CACHE_DIR = DRIVE_ROOT / "graph_specialisation_metrics/cache/huggingface"
 
+# Keep "all" for the first rerun: cached event rows are re-aggregated into the
+# donor-averaged primary analysis without repeating completed model forwards.
 PHASE = "all"  # "run", "figures", or "all"
 FORCE = False
 ACCELERATOR = "cuda:0"

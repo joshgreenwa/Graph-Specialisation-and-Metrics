@@ -208,6 +208,9 @@ def test_population_interval_resamples_complete_matched_head_families(tmp_path):
     )
     assert summary["estimate"].shape == (3, 2, 1)
     assert summary["low"].shape == summary["estimate"].shape
+    assert summary["correct_pairing_advantage"].shape == (1,)
+    assert summary["correct_pairing_low"].shape == (1,)
+    assert summary["correct_pairing_high"].shape == (1,)
     assert summary["head_pair_count"] == 2
     assert summary["null_head_count"] == 4
     assert "matched head pair" in summary["resampled_levels"]
@@ -226,23 +229,25 @@ def test_population_figures_export_vector_pdf_and_600_dpi_png(tmp_path):
     layers = np.repeat(np.arange(3), 10)
     movement = 0.02 + 0.03 * J + 0.003 * layers
     partial = layer_adjusted_components(J, movement, layers)
+
+    def endpoint(values, spread):
+        pairing = float((values[0, 0] - values[0, 1]) - (values[1, 0] - values[1, 1]))
+        return {
+            "estimate": values,
+            "low": values - spread,
+            "high": values + spread,
+            "correct_pairing_advantage": pairing,
+            "correct_pairing_low": pairing - spread,
+            "correct_pairing_high": pairing + spread,
+        }
+
     core = {
         "population_gate": gate,
-        "restoration": {
-            "estimate": estimate,
-            "low": estimate - 0.02,
-            "high": estimate + 0.02,
-        },
-        "injection": {
-            "estimate": estimate * 0.9,
-            "low": estimate * 0.9 - 0.02,
-            "high": estimate * 0.9 + 0.02,
-        },
-        "necessity": {
-            "estimate": necessity,
-            "low": necessity - 0.03,
-            "high": necessity + 0.03,
-        },
+        "raw_restoration": endpoint(estimate * 1.2, 0.02),
+        "raw_injection": endpoint(estimate, 0.02),
+        "restoration": endpoint(estimate * 0.8, 0.02),
+        "injection": endpoint(estimate * 0.7, 0.02),
+        "necessity": endpoint(necessity, 0.03),
         "clean_ablation": {
             "J": J,
             "layers": layers,
@@ -268,7 +273,9 @@ def test_population_figures_export_vector_pdf_and_600_dpi_png(tmp_path):
         common_metadata={"test": True},
     )
     assert set(outputs) == {
-        "population_causal_tests",
+        "population_causal_tests_raw",
+        "population_causal_tests_mismatch_adjusted",
+        "correct_pairing_advantage",
         "J_vs_clean_ablation",
         "population_selection",
     }

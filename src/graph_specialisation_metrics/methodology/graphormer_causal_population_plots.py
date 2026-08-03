@@ -53,7 +53,7 @@ def _family_handles(*, include_null: bool):
         ("Structural-scoring heads", STRUCTURAL),
     ]
     if include_null:
-        values.append((r"$J$-matched null heads", NULL))
+        values.append((r"$J$-matched control heads", NULL))
     return [
         Line2D(
             [0],
@@ -102,8 +102,14 @@ def _population_marks(ax: Any, endpoint: Mapping[str, Any], *, include_null: boo
     ax.set_xlim(-0.30, 1.30)
 
 
-def plot_population_causal_tests(core: Mapping[str, Any]):
-    """Restoration, injection, and necessity in one compact primary figure."""
+def plot_population_causal_tests(
+    core: Mapping[str, Any],
+    *,
+    restoration_key: str = "restoration",
+    injection_key: str = "injection",
+    output_label: str = "Output effect beyond mismatch control",
+):
+    """Restoration, injection, and necessity in one compact figure."""
 
     import matplotlib.pyplot as plt
 
@@ -112,7 +118,7 @@ def plot_population_causal_tests(core: Mapping[str, Any]):
         fig, axes = plt.subplots(1, 3, figsize=(theme.width * 3.0, theme.height))
         for ax, endpoint_name, title in zip(
             axes[:2],
-            ("restoration", "injection"),
+            (restoration_key, injection_key),
             (
                 "Clean head state in an intervened graph",
                 "Intervened head state in a clean graph",
@@ -127,7 +133,7 @@ def plot_population_causal_tests(core: Mapping[str, Any]):
             _colour_intervention_ticks(ax)
             ax.set_title(title)
             _style_axis(ax)
-        axes[0].set_ylabel("Output effect beyond mismatch control")
+        axes[0].set_ylabel(output_label)
 
         _population_marks(axes[2], core["necessity"], include_null=True)
         axes[2].axhline(0.0, color="#9A9A9A", linewidth=0.75)
@@ -153,7 +159,7 @@ def plot_population_causal_tests(core: Mapping[str, Any]):
             borderaxespad=0,
             title=(
                 "Mean and 95% paired bootstrap CI over molecules, donor events, "
-                f"and heads  ({pair_count} specialist pairs; {null_count} null heads)"
+                f"and heads  ({pair_count} specialist pairs; {null_count} control heads)"
             ),
         )
         legend.get_title().set_fontsize(theme.tick_size)
@@ -165,6 +171,66 @@ def plot_population_causal_tests(core: Mapping[str, Any]):
             wspace=0.34,
         )
     return fig, axes
+
+
+def plot_correct_pairing_advantage(core: Mapping[str, Any]):
+    """Direct summary of matching versus crossed head/intervention effects."""
+
+    import matplotlib.pyplot as plt
+
+    endpoints = (
+        ("Restoration", core["raw_restoration"]),
+        ("Injection", core["raw_injection"]),
+        ("Head necessity", core["necessity"]),
+    )
+    estimate = np.asarray(
+        [row["correct_pairing_advantage"] for _label, row in endpoints],
+        dtype=np.float64,
+    )
+    low = np.asarray(
+        [row["correct_pairing_low"] for _label, row in endpoints],
+        dtype=np.float64,
+    )
+    high = np.asarray(
+        [row["correct_pairing_high"] for _label, row in endpoints],
+        dtype=np.float64,
+    )
+    positions = np.arange(len(endpoints))[::-1]
+    theme = _theme()
+    with publication_style(theme):
+        fig, ax = plt.subplots(figsize=(5.8, 2.7))
+        ax.errorbar(
+            estimate,
+            positions,
+            xerr=np.maximum(0.0, np.vstack((estimate - low, high - estimate))),
+            fmt="o",
+            color="#315F86",
+            markerfacecolor="#315F86",
+            markeredgecolor="white",
+            markeredgewidth=0.6,
+            markersize=6.5,
+            linewidth=1.3,
+            capsize=3.0,
+        )
+        ax.axvline(0.0, color="#888888", linewidth=0.8)
+        ax.set_yticks(positions, [label for label, _row in endpoints])
+        ax.set_xlabel("Correct-pairing advantage (matching minus crossed)")
+        ax.set_title("Do heads affect their matching intervention more?")
+        ax.grid(axis="x", alpha=0.14, linewidth=0.55)
+        ax.set_axisbelow(True)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        fig.text(
+            0.5,
+            0.02,
+            "Positive values support semantic/structural causal specialization.",
+            ha="center",
+            va="bottom",
+            fontsize=theme.tick_size,
+            color="#4A4A4A",
+        )
+        fig.tight_layout(rect=(0, 0.10, 1, 1))
+    return fig, ax
 
 
 def plot_population_selection(scores: Mapping[str, Any], gate: Mapping[str, Any]):
@@ -200,7 +266,7 @@ def plot_population_selection(scores: Mapping[str, Any], gate: Mapping[str, Any]
         for pairs, colour, marker, label in (
             (semantic, SEMANTIC, "o", "Semantic-scoring heads"),
             (structural, STRUCTURAL, "s", "Structural-scoring heads"),
-            (null, NULL, "D", r"$J$-matched null heads"),
+            (null, NULL, "D", r"$J$-matched control heads"),
         ):
             ax.scatter(
                 values(pairs, D),
@@ -225,7 +291,7 @@ def plot_population_selection(scores: Mapping[str, Any], gate: Mapping[str, Any]
             (
                 r"specialist $J$ SMD="
                 f"{balance['semantic_vs_structural']['standardized_J_difference']:+.2f}\n"
-                r"specialist-null $J$ SMD="
+                r"specialist-control $J$ SMD="
                 f"{balance['specialists_vs_null']['standardized_J_difference']:+.2f}"
             ),
             transform=ax.transAxes,
@@ -377,20 +443,56 @@ def render_population_figure_suite(
     )
     outputs: dict[str, list[str]] = {}
 
+    figure, axes = plot_population_causal_tests(
+        core,
+        restoration_key="raw_restoration",
+        injection_key="raw_injection",
+        output_label="Direction-aligned output movement",
+    )
+    paths = builder.save(
+        "01_population_raw_restoration_injection_necessity",
+        figure,
+        axes,
+        metadata={
+            "figure_role": "primary donor-averaged causal tests",
+            "restoration": core["raw_restoration"],
+            "injection": core["raw_injection"],
+            "necessity": core["necessity"],
+            "matching_balance": gate["matching_balance"],
+        },
+    )
+    outputs["population_causal_tests_raw"] = [str(path) for path in paths]
+
+    figure, ax = plot_correct_pairing_advantage(core)
+    paths = builder.save(
+        "01b_correct_pairing_advantage",
+        figure,
+        ax,
+        metadata={
+            "figure_role": "direct matching-versus-crossed causal summary",
+            "restoration": core["raw_restoration"],
+            "injection": core["raw_injection"],
+            "necessity": core["necessity"],
+        },
+    )
+    outputs["correct_pairing_advantage"] = [str(path) for path in paths]
+
     figure, axes = plot_population_causal_tests(core)
     paths = builder.save(
         "01_population_restoration_injection_necessity",
         figure,
         axes,
         metadata={
-            "figure_role": "three primary causal tests",
+            "figure_role": "mismatch-adjusted causal robustness tests",
             "restoration": core["restoration"],
             "injection": core["injection"],
             "necessity": core["necessity"],
             "matching_balance": gate["matching_balance"],
         },
     )
-    outputs["population_causal_tests"] = [str(path) for path in paths]
+    outputs["population_causal_tests_mismatch_adjusted"] = [
+        str(path) for path in paths
+    ]
 
     figure, axes = plot_J_ablation(core["clean_ablation"])
     paths = builder.save(
@@ -420,6 +522,7 @@ def render_population_figure_suite(
 
 __all__ = [
     "plot_J_ablation",
+    "plot_correct_pairing_advantage",
     "plot_population_causal_tests",
     "plot_population_selection",
     "render_population_figure_suite",

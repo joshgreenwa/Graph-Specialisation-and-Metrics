@@ -28,7 +28,8 @@ The publication-strength population frontend is
 Its paper preset uses disjoint 256-molecule discovery, causal, and clean-ablation populations,
 16 discovery-selected, `J`-matched semantic/structural head pairs, and distinct `J`-matched null
 controls. It renders the three causal tests beside a transparent raw and layer-adjusted
-`J`--ablation analysis.
+`J`--ablation analysis. Donor-averaged restoration/injection is primary; the previously generated
+mismatch-adjusted result is retained as a robustness output.
 
 The long-term project scope covers:
 
