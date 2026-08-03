@@ -65,10 +65,20 @@ PILOT_VERSION = "zinc-semantic-structural-interaction-carriage-v2"
 OUTPUT_MODULATION_VERSION = "zinc-output-semantic-structural-modulation-v1"
 TERMS = ("semantic", "structural", "interaction")
 DEFAULT_TASKS = ("zinc_1hop", "zinc_2hop", "zinc_1hop_vnode", "zinc")
-OUTPUT_MODULATION_TASKS = ("zinc_1hop_localrrwp", "zinc_1hop", "zinc")
+OUTPUT_MODULATION_TASKS = (
+    "zinc_1hop_localrrwp",
+    "zinc_1hop",
+    "zinc_1hop_vnode",
+    "zinc_2hop",
+    "zinc_2hop_vnode",
+    "zinc",
+)
 OUTPUT_MODULATION_LABELS = {
     "zinc_1hop_localrrwp": "1-hop + local RRWP",
     "zinc_1hop": "1-hop + global RRWP",
+    "zinc_1hop_vnode": "1-hop + VN",
+    "zinc_2hop": "2-hop",
+    "zinc_2hop_vnode": "2-hop + VN",
     "zinc": "Dense + global RRWP",
 }
 
@@ -147,12 +157,12 @@ class OutputModulationConfig:
     output_dir: Path
     tasks: tuple[str, ...] = OUTPUT_MODULATION_TASKS
     seed: int = 0
-    graphs: int = 64
+    graphs: int = 128
     sources_per_graph: int = 6
     donor_pairs_per_source: int = 2
     semantic_donor_graphs: int = 64
     effect_floor: float = 1.0e-6
-    graphs_per_batch: int = 4
+    graphs_per_batch: int = 8
     bootstrap_replicates: int = 2_000
     analysis_seed: int = 260_803
     accelerator: str = "cuda:0"
@@ -182,9 +192,7 @@ class OutputModulationConfig:
     def scientific_record(self) -> dict[str, Any]:
         return {
             "analysis_version": OUTPUT_MODULATION_VERSION,
-            "tasks": list(self.tasks),
             "seed": int(self.seed),
-            "graphs": int(self.graphs),
             "sources_per_graph": int(self.sources_per_graph),
             "donor_pairs_per_source": int(self.donor_pairs_per_source),
             "semantic_donor_graphs": int(self.semantic_donor_graphs),
@@ -1151,6 +1159,133 @@ def _derive_output_modulation_rows(
     return output
 
 
+def _compatible_output_cache(
+    payload: Mapping[str, Any],
+    config: OutputModulationConfig,
+) -> bool:
+    """Whether an older cache used the identical intervention sampling law."""
+
+    integer_fields = (
+        "seed",
+        "sources_per_graph",
+        "donor_pairs_per_source",
+        "semantic_donor_graphs",
+        "analysis_seed",
+    )
+    try:
+        return all(int(payload[field]) == int(getattr(config, field)) for field in integer_fields)
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
+def _merge_compatible_output_caches(
+    config: OutputModulationConfig,
+    *,
+    events: Sequence[Mapping[str, Any]],
+    completed: Sequence[Mapping[str, Any]],
+    health: Sequence[Mapping[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], list[str]]:
+    """Import compatible task/graph prefixes from earlier cache directories."""
+
+    event_by_key: dict[tuple[str, int, int, int], dict[str, Any]] = {
+        (
+            str(row["task"]),
+            int(row["graph"]),
+            int(row["source"]),
+            int(row["pair"]),
+        ): dict(row)
+        for row in events
+    }
+    completed_keys = {(str(row["task"]), int(row["graph"])) for row in completed}
+    health_by_task = {str(row["task"]): dict(row) for row in health}
+    imported: list[str] = []
+    cache_root = config.output_dir / "output_modulation"
+    if not cache_root.is_dir():
+        return list(event_by_key.values()), list(completed), list(health), imported
+    for directory in sorted(path for path in cache_root.iterdir() if path.is_dir()):
+        if directory == config.cache_dir:
+            continue
+        config_path = directory / "output_modulation_config.json"
+        events_path = directory / "output_modulation_events.csv"
+        if not config_path.is_file() or not events_path.is_file():
+            continue
+        try:
+            payload = json.loads(config_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not _compatible_output_cache(payload, config):
+            continue
+        directory_imported = False
+        for row in _read_csv(events_path):
+            task = str(row.get("task"))
+            if task not in config.tasks or row.get("analysis_version") != OUTPUT_MODULATION_VERSION:
+                continue
+            key = (
+                task,
+                int(row["graph"]),
+                int(row["source"]),
+                int(row["pair"]),
+            )
+            candidate = {**dict(row), "fingerprint": config.fingerprint}
+            existing = event_by_key.get(key)
+            if existing is not None:
+                identity_fields = (
+                    "semantic_donor_graph",
+                    "semantic_donor_node",
+                    "structural_donor_node",
+                )
+                endpoint_fields = (
+                    "output_clean",
+                    "output_semantic",
+                    "output_structural",
+                    "output_joint",
+                )
+                if any(
+                    int(existing[field]) != int(candidate[field]) for field in identity_fields
+                ) or any(
+                    not np.isclose(
+                        float(existing[field]),
+                        float(candidate[field]),
+                        atol=1.0e-8,
+                        rtol=1.0e-7,
+                    )
+                    for field in endpoint_fields
+                ):
+                    raise RuntimeError(f"compatible output caches disagree for event {key}")
+            else:
+                event_by_key[key] = candidate
+                directory_imported = True
+        completed_path = directory / "completed_graphs.csv"
+        if completed_path.is_file():
+            event_graphs = {event_key[:2] for event_key in event_by_key}
+            for row in _read_csv(completed_path):
+                task = str(row.get("task"))
+                key = (task, int(row["graph"]))
+                if task in config.tasks and key in event_graphs:
+                    completed_keys.add(key)
+        health_path = directory / "model_health.csv"
+        if health_path.is_file():
+            for row in _read_csv(health_path):
+                task = str(row.get("task"))
+                if task in config.tasks and task not in health_by_task:
+                    health_by_task[task] = {
+                        **dict(row),
+                        "fingerprint": config.fingerprint,
+                    }
+        if directory_imported:
+            imported.append(str(directory))
+    completed_rows = [
+        {"fingerprint": config.fingerprint, "task": task, "graph": graph}
+        for task, graph in sorted(completed_keys)
+    ]
+    return (
+        list(event_by_key.values()),
+        completed_rows,
+        list(health_by_task.values()),
+        imported,
+    )
+
+
 def measure_output_modulation(
     config: OutputModulationConfig,
     *,
@@ -1200,9 +1335,24 @@ def measure_output_modulation(
     health_path = config.cache_dir / "model_health.csv"
     cached_events = _read_csv(events_path) if events_path.is_file() else []
     cached_completed = _read_csv(completed_path) if completed_path.is_file() else []
-    for row in [*cached_events, *cached_completed]:
+    cached_health = _read_csv(health_path) if health_path.is_file() else []
+    for row in [*cached_events, *cached_completed, *cached_health]:
         if row.get("fingerprint") != config.fingerprint:
             raise RuntimeError("cached output-modulation fingerprint does not match config")
+    cached_events, cached_completed, cached_health, imported = _merge_compatible_output_caches(
+        config,
+        events=cached_events,
+        completed=cached_completed,
+        health=cached_health,
+    )
+    if imported:
+        _write_csv(events_path, cached_events)
+        _write_csv(completed_path, cached_completed)
+        _write_csv(health_path, cached_health)
+        print(
+            f"[output-modulation] imported compatible caches from {len(imported)} run(s)",
+            flush=True,
+        )
     event_by_key: dict[tuple[str, int, int, int], dict[str, Any]] = {
         (
             str(row["task"]),
@@ -1216,8 +1366,7 @@ def measure_output_modulation(
         (str(row["task"]), int(row["graph"])) for row in cached_completed
     }
     health_by_task: dict[str, dict[str, Any]] = {
-        str(row["task"]): dict(row)
-        for row in (_read_csv(health_path) if health_path.is_file() else [])
+        str(row["task"]): dict(row) for row in cached_health
     }
     reference_task = config.tasks[0]
     reference_manifests = _cached_output_manifests(
@@ -1496,11 +1645,14 @@ def plot_output_modulation(
     colours = {
         "zinc_1hop_localrrwp": "#E69F00",
         "zinc_1hop": "#0072B2",
+        "zinc_1hop_vnode": "#56B4E9",
+        "zinc_2hop": "#009E73",
+        "zinc_2hop_vnode": "#CC79A7",
         "zinc": "#D55E00",
     }
     positions = {task: index for index, task in enumerate(tasks)}
     summary_lookup = {(str(row["task"]), str(row["metric"])): row for row in summary_rows}
-    fig, axes = plt.subplots(1, 3, figsize=(11.0, 3.45))
+    fig, axes = plt.subplots(1, 3, figsize=(15.0, 3.8))
 
     modulation = {
         (str(row["task"]), int(row["graph"])): float(row["value"])
@@ -1617,7 +1769,7 @@ def plot_output_modulation(
 
     labels = [_output_model_label(task) for task in tasks]
     for axis in axes:
-        axis.set_xticks(range(len(tasks)), labels, rotation=18, ha="right")
+        axis.set_xticks(range(len(tasks)), labels, rotation=24, ha="right")
     fig.suptitle("Does structural context change the semantic output effect?", y=1.02, fontsize=12)
     fig.tight_layout()
     return _save_figure(fig, figures_dir, "zinc_output_semantic_modulation")
@@ -2348,12 +2500,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Plot numeric distances through this value; 0 retains all distances.",
     )
     parser.add_argument("--output-tasks", default=",".join(OUTPUT_MODULATION_TASKS))
-    parser.add_argument("--output-graphs", type=int, default=64)
+    parser.add_argument("--output-graphs", type=int, default=128)
     parser.add_argument("--output-sources-per-graph", type=int, default=6)
     parser.add_argument("--output-donor-pairs-per-source", type=int, default=2)
     parser.add_argument("--output-semantic-donor-graphs", type=int, default=64)
     parser.add_argument("--output-effect-floor", type=float, default=1.0e-6)
-    parser.add_argument("--output-graphs-per-batch", type=int, default=4)
+    parser.add_argument("--output-graphs-per-batch", type=int, default=8)
     parser.add_argument("--checkpoint", action="append", default=[])
     parser.add_argument("--skip-dependency-install", action="store_true")
     return parser

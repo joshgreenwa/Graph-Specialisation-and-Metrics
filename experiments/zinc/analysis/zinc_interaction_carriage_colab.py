@@ -1,9 +1,9 @@
 """Standalone Colab frontend for ZINC interaction carriage and output modulation.
 
 The default lightweight phase compares local-RRWP 1-hop, global-RRWP 1-hop,
-and dense GRIT using exact scalar-output endpoints only.  It caches every clean,
-semantic-only, structural-only, and joint prediction to Drive.  The original
-full carriage phases remain available below.
+1-hop+VN, 2-hop, 2-hop+VN, and dense GRIT using exact scalar-output endpoints
+only. It caches every clean, semantic-only, structural-only, and joint
+prediction to Drive. The original full carriage phases remain available below.
 
 After a completed lightweight run, set ``PHASE = "output-figures"`` to rebuild
 all M tables and figures from cached CSV files without loading the models.
@@ -47,13 +47,13 @@ NUM_THREADS = 4
 DISPLAY_MAX_DISTANCE = 0  # 0 keeps the complete observed distance axis.
 
 # Lightweight exact-output M pilot. These controls do not run carriage or Jacobians.
-OUTPUT_TASKS = "zinc_1hop_localrrwp,zinc_1hop,zinc"
-OUTPUT_GRAPHS = 64
+OUTPUT_TASKS = "zinc_1hop_localrrwp,zinc_1hop,zinc_1hop_vnode,zinc_2hop,zinc_2hop_vnode,zinc"
+OUTPUT_GRAPHS = 128
 OUTPUT_SOURCES_PER_GRAPH = 6
 OUTPUT_DONOR_PAIRS_PER_SOURCE = 2
 OUTPUT_SEMANTIC_DONOR_GRAPHS = 64
 OUTPUT_EFFECT_FLOOR = 1.0e-6
-OUTPUT_GRAPHS_PER_BATCH = 4
+OUTPUT_GRAPHS_PER_BATCH = 8
 
 # Set False only when this runtime already has the canonical GRIT/PyG stack.
 INSTALL_DEPENDENCIES = True
@@ -140,7 +140,7 @@ print(
     "[scope] M asks how much the semantic output effect changes after the structural "
     "context is swapped; it is bounded from 0 to 2.\n"
     "[scope] Graph, source, and donor identities are sampled once under local RRWP "
-    "and replayed exactly for global-RRWP 1-hop and dense models.\n"
+    "and replayed exactly for all sparse, virtual-node, and dense models.\n"
     "[scope] M measures model response, not task necessity. All four signed endpoint "
     "predictions are cached for alternative summaries without model reruns.\n"
     "[scope] The legacy carriage phases retain the following interpretation.\n"

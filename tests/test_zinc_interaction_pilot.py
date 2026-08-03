@@ -93,9 +93,10 @@ def test_output_all_cli_accepts_legacy_and_output_task_defaults(tmp_path, monkey
 
 def test_output_validation_defaults_prioritise_graphs_then_sources():
     args = pilot_module.build_parser().parse_args(["--phase", "output-all"])
-    assert args.output_graphs == 64
+    assert args.output_graphs == 128
     assert args.output_sources_per_graph == 6
     assert args.output_donor_pairs_per_source == 2
+    assert args.output_graphs_per_batch == 8
 
 
 def test_output_modulation_aggregates_pairs_then_sources_then_graphs():
@@ -123,7 +124,7 @@ def test_output_modulation_aggregates_pairs_then_sources_then_graphs():
 
 
 def test_output_modulation_pairing_audit_requires_identical_donors():
-    tasks = ("zinc_1hop_localrrwp", "zinc_1hop", "zinc")
+    tasks = OUTPUT_MODULATION_TASKS
     rows = [
         {
             "task": task,
@@ -138,7 +139,7 @@ def test_output_modulation_pairing_audit_requires_identical_donors():
     ]
     assert audit_output_modulation_pairing(rows, tasks=tasks) == {
         "paired_events": 1,
-        "models": 3,
+        "models": 6,
     }
     rows[-1]["structural_donor_node"] = 5
     with pytest.raises(RuntimeError, match="donor identities differ"):
@@ -157,6 +158,9 @@ def test_output_modulation_figures_rebuild_from_cached_endpoints(tmp_path):
     joint_by_task = {
         "zinc_1hop_localrrwp": 6.0,
         "zinc_1hop": 5.0,
+        "zinc_1hop_vnode": 5.2,
+        "zinc_2hop": 5.5,
+        "zinc_2hop_vnode": 5.4,
         "zinc": 4.0,
     }
     rows = []
@@ -202,6 +206,58 @@ def test_output_modulation_figures_rebuild_from_cached_endpoints(tmp_path):
     assert high_floor.cache_dir == config.cache_dir
     rebuilt = figures_output_modulation(high_floor)
     assert not any(row["metric"] == "modulation_m" for row in rebuilt["output_modulation_summary"])
+
+
+def test_output_modulation_imports_compatible_smaller_task_cache(tmp_path):
+    config = OutputModulationConfig(output_dir=tmp_path)
+    legacy_dir = tmp_path / "output_modulation" / "legacy-cache"
+    pilot_module._write_json(
+        legacy_dir / "output_modulation_config.json",
+        {
+            "seed": config.seed,
+            "sources_per_graph": config.sources_per_graph,
+            "donor_pairs_per_source": config.donor_pairs_per_source,
+            "semantic_donor_graphs": config.semantic_donor_graphs,
+            "analysis_seed": config.analysis_seed,
+            "graphs": 64,
+            "tasks": ["zinc_1hop_localrrwp", "zinc_1hop", "zinc"],
+        },
+    )
+    legacy_event = {
+        "analysis_version": pilot_module.OUTPUT_MODULATION_VERSION,
+        "fingerprint": "legacy",
+        "task": "zinc_1hop_localrrwp",
+        "graph": 3,
+        "source": 1,
+        "pair": 0,
+        "semantic_donor_graph": 9,
+        "semantic_donor_node": 2,
+        "structural_donor_node": 4,
+        "output_clean": 10.0,
+        "output_semantic": 8.0,
+        "output_structural": 7.0,
+        "output_joint": 6.0,
+    }
+    _write_csv(legacy_dir / "output_modulation_events.csv", [legacy_event])
+    _write_csv(
+        legacy_dir / "completed_graphs.csv",
+        [{"fingerprint": "legacy", "task": "zinc_1hop_localrrwp", "graph": 3}],
+    )
+    events, completed, _health, imported = pilot_module._merge_compatible_output_caches(
+        config,
+        events=[],
+        completed=[],
+        health=[],
+    )
+    assert imported == [str(legacy_dir)]
+    assert events[0]["fingerprint"] == config.fingerprint
+    assert completed == [
+        {
+            "fingerprint": config.fingerprint,
+            "task": "zinc_1hop_localrrwp",
+            "graph": 3,
+        }
+    ]
 
 
 def test_distance_summary_does_not_normalise_a_null_interaction():
