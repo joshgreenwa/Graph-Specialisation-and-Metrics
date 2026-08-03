@@ -1987,3 +1987,15 @@ def test_colab_notebook_has_valid_python_cells():
                 "".join(cell["source"]),
                 filename=f"{notebook}:cell_{index}",
             )
+
+
+def test_canonical_colab_frontend_clones_the_methodology_api_branch():
+    frontend_path = (
+        Path(__file__).parents[1]
+        / "experiments/methodology/canonical_methodology_colab.py"
+    )
+    source = frontend_path.read_text(encoding="utf-8")
+    ast.parse(source, filename=str(frontend_path))
+    assert 'BRANCH = "expansion/graphormer_specialisation"' in source
+    assert "families=FAMILIES" in source
+    assert "output_dir=OUTPUT_DIR" in source

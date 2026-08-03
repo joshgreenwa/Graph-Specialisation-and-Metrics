@@ -13,7 +13,7 @@ import subprocess
 import sys
 
 REPO_URL = "https://github.com/joshgreenwa/Graph-Specialisation-and-Metrics.git"
-BRANCH = "main"
+BRANCH = "expansion/graphormer_specialisation"
 REPO_DIR = "/content/Graph-Specialisation-and-Metrics"
 SECRET_NAME = "dissertation_key"
 OUTPUT_DIR = (
