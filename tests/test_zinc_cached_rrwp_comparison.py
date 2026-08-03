@@ -17,13 +17,13 @@ from graph_specialisation_metrics.zinc_cached_rrwp_comparison import (
     cache_inventory,
     carriage_profile,
     group_distance,
-    head_profile_alignment_permutation,
     head_profile_alignment_rows,
     load_compatible_cache_artifact_file,
     load_or_compute_head_profile_alignment,
     run,
     score_interval_width_profile,
     score_profile,
+    summarise_layerwise_head_profile_alignment,
 )
 
 
@@ -264,35 +264,44 @@ def test_cached_interval_width_and_carriage_are_normalized():
     assert events == 2
 
 
-def test_same_head_alignment_exceeds_same_layer_other_head_null(tmp_path):
+def test_layerwise_alignment_summarises_consistency_and_low_outliers(tmp_path):
     model = _model(tmp_path, "zinc_1hop", include_virtual=False)
     score = model.score
     width = len(score["axis"])
-    patterns = np.zeros((2, 2, width), dtype=np.float64)
-    patterns[:, 0, 0] = 1.0
-    patterns[:, 1, 2] = 1.0
-    for channel in ("semantic", "structural"):
-        score["channels"][channel]["heatmap_exact_head"] = patterns.copy()
-        score["channels"][channel][
-            "heatmap_per_opportunity_head"
-        ] = patterns.copy()
-        score["channels"][channel]["raw"] = patterns.sum(axis=-1)
+    semantic = np.zeros((2, 8, width), dtype=np.float64)
+    structural = np.zeros_like(semantic)
+    semantic[..., 0] = 1.0
+    structural[..., 0] = 1.0
+    structural[:, 7, 0] = 0.0
+    structural[:, 7, 2] = 1.0
+    for field in ("heatmap_exact_head", "heatmap_per_opportunity_head"):
+        score["channels"]["semantic"][field] = semantic.copy()
+        score["channels"]["structural"][field] = structural.copy()
+    score["channels"]["semantic"]["raw"] = semantic.sum(axis=-1)
+    score["channels"]["structural"]["raw"] = structural.sum(axis=-1)
 
     rows = head_profile_alignment_rows([model])
-    mass = [row for row in rows if row["profile_kind"] == "score_mass"]
-    same = [row["cosine"] for row in mass if row["pairing"] == "same_head"]
-    other = [row["cosine"] for row in mass if row["pairing"] == "other_head"]
-    assert np.mean(same) == pytest.approx(1.0)
-    assert np.mean(other) == pytest.approx(0.0)
-
-    permutation = head_profile_alignment_permutation(rows, permutations=500)
-    cosine = next(
+    assert len(rows) == 2 * 2 * 8
+    layerwise, outliers = summarise_layerwise_head_profile_alignment(rows)
+    mass_layer_zero = next(
         row
-        for row in permutation
-        if row["profile_kind"] == "score_mass" and row["metric"] == "cosine"
+        for row in layerwise
+        if row["profile_kind"] == "score_mass" and row["layer"] == 0
     )
-    assert cosine["observed_same_head"] == pytest.approx(1.0)
-    assert cosine["alignment_excess"] > 0.4
+    assert mass_layer_zero["overlap_median"] == pytest.approx(1.0)
+    assert mass_layer_zero["overlap_iqr"] == pytest.approx(0.0)
+    assert mass_layer_zero["overlap_min_head"] == 7
+    assert mass_layer_zero["low_overlap_outlier_heads"] == "7"
+    assert mass_layer_zero["low_overlap_outlier_count"] == 1
+    assert {
+        (row["profile_kind"], row["layer"], row["head"])
+        for row in outliers
+    } == {
+        ("score_mass", 0, 7),
+        ("score_mass", 1, 7),
+        ("per_opportunity", 0, 7),
+        ("per_opportunity", 1, 7),
+    }
 
 
 def test_run_identifies_the_model_that_failed_to_load(tmp_path, monkeypatch):
@@ -349,7 +358,9 @@ def test_fast_run_writes_tables_and_aligned_figures(tmp_path, monkeypatch):
     assert (output / "pairwise_comparisons.csv").is_file()
     assert (output / "head_profile_alignment.csv").is_file()
     assert (output / "head_profile_alignment_summary.csv").is_file()
-    assert (output / "head_profile_alignment_permutation.csv").is_file()
+    assert (output / "head_profile_alignment_layerwise.csv").is_file()
+    assert (output / "head_profile_alignment_outliers.csv").is_file()
+    assert not (output / "head_profile_alignment_permutation.csv").exists()
     assert (output / "cache/head_profile_alignment.json").is_file()
     assert (output / "summary.json").is_file()
     with (output / "model_summary.csv").open(encoding="utf-8", newline="") as handle:

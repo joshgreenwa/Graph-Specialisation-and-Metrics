@@ -307,8 +307,8 @@ print("[run] Models with validated canonical scores: " + ", ".join(available_tas
 print("[scope] Cache-only: no dataset, checkpoint, model, forward pass, or score recomputation.")
 print("[scope] All intervals are canonical cached one-checkpoint intervals, not seed uncertainty.")
 print(
-    "[scope] Head co-location uses cached exact per-head score-distance tensors and a "
-    "same-layer shuffled-head null; its derived table is fingerprint-cached."
+    "[scope] Layerwise head co-location uses cached exact per-head score-distance tensors; "
+    "medians, IQRs, ranges, and descriptive low-overlap outliers are fingerprint-cached."
 )
 print(f"[scope] Output directory: {OUTPUT_DIR}")
 try:
@@ -353,24 +353,31 @@ print(
     "Head-profile co-location cache: "
     f"{alignment_result['cache_status']} ({alignment_result['cache']})"
 )
-print("Same-head semantic–structural alignment against the same-layer shuffled null")
-alignment_table = pd.read_csv(OUTPUT_DIR / "head_profile_alignment_permutation.csv")
+print("Layerwise within-head semantic–structural profile overlap")
+alignment_table = pd.read_csv(OUTPUT_DIR / "head_profile_alignment_layerwise.csv")
 display(
     alignment_table.loc[
-        alignment_table["metric"].isin(
-            ["cosine", "overlap", "peak_match", "centroid_gap_abs"]
-        ),
+        :,
         [
             "task",
             "profile_kind",
-            "metric",
-            "observed_same_head",
-            "null_mean",
-            "alignment_excess",
-            "permutation_p_value",
+            "layer",
+            "valid_heads",
+            "overlap_median",
+            "overlap_iqr",
+            "overlap_min",
+            "overlap_min_head",
+            "low_overlap_outlier_count",
+            "low_overlap_outlier_heads",
         ],
     ]
 )
+outlier_table = OUTPUT_DIR / "head_profile_alignment_outliers.csv"
+if outlier_table.stat().st_size:
+    print("Descriptive within-layer low-overlap outlier heads")
+    display(pd.read_csv(outlier_table))
+else:
+    print("[outliers] No heads fall below their layer's Tukey low-overlap fence.")
 for path in result["figures"]:
     if str(path).endswith(".png") and Path(path).is_file():
         display(Image(filename=path))
