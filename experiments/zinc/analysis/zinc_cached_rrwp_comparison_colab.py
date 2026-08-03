@@ -92,11 +92,43 @@ for module_name in tuple(sys.modules):
         del sys.modules[module_name]
 os.chdir(REPO_DIR)
 
+from graph_specialisation_metrics.carriage.env import find_checkpoint
+from graph_specialisation_metrics.carriage.tasks import get_task as get_training_task
 from graph_specialisation_metrics.zinc_cached_rrwp_comparison import (
     artifact_task_candidates,
     cache_inventory,
     run,
 )
+
+# These Drive roots are the exact locations registered by the training-compatible
+# task definitions. ``find_checkpoint`` applies the same policy as the existing
+# analysis notebooks: GraphGym ``**/ckpt/*.ckpt`` first, then Colab recovery
+# ``best.ckpt``, ``latest.ckpt``, or ``first_after_resume.ckpt``.
+checkpoint_rows = []
+for task in TASKS:
+    training_task = get_training_task(task)
+    results_root = Path(training_task.drive_dir) / "results"
+    try:
+        checkpoint, checkpoint_epoch = find_checkpoint(results_root)
+        checkpoint_rows.append(
+            {
+                "task": task,
+                "training_drive_root": training_task.drive_dir,
+                "checkpoint": str(checkpoint),
+                "checkpoint_epoch": checkpoint_epoch,
+                "checkpoint_exists": True,
+            }
+        )
+    except FileNotFoundError as error:
+        checkpoint_rows.append(
+            {
+                "task": task,
+                "training_drive_root": training_task.drive_dir,
+                "checkpoint": str(error),
+                "checkpoint_epoch": None,
+                "checkpoint_exists": False,
+            }
+        )
 
 inventory = cache_inventory(CANONICAL_ROOTS, tasks=TASKS, train_seed=TRAIN_SEED)
 
@@ -152,6 +184,8 @@ for task_record in inventory:
 import pandas as pd
 from IPython.display import Image, display
 
+print("Training checkpoint inventory (path lookup only; checkpoints are not loaded)")
+display(pd.DataFrame(checkpoint_rows))
 print("Canonical cache inventory")
 display(pd.DataFrame(inventory_rows))
 missing = missing_tasks(inventory)
@@ -173,22 +207,36 @@ if missing:
     if nearby:
         print("Nearby caches found, but not used because task/seed completeness differs")
         display(pd.DataFrame(nearby))
-    expected = "\n".join(
-        str(root / artifact_task / f"seed_{TRAIN_SEED}" / "cache/scores/raw.pt")
-        for task in missing
-        for artifact_task in artifact_task_candidates(task)
-        for root in CANONICAL_ROOTS
+    missing_checkpoint_state = [
+        row for row in checkpoint_rows if row["task"] in missing
+    ]
+    print(
+        "The rows below distinguish an available trained checkpoint from a missing "
+        "canonical specialisation-score cache. A checkpoint alone is not a raw.pt score artifact."
     )
+    display(pd.DataFrame(missing_checkpoint_state))
+    print(
+        "[skip] Missing canonical score caches; these models will not be included: "
+        + ", ".join(missing)
+    )
+
+available_tasks = tuple(
+    record["task"]
+    for record in inventory
+    if int(record["complete_score_locations"]) >= 1
+)
+if not available_tasks:
     raise FileNotFoundError(
-        f"Missing canonical score+model artifacts for {missing}. Checked:\n{expected}"
+        "No complete canonical score+model artifacts were found for any requested ZINC model."
     )
+print("[run] Models with validated canonical scores: " + ", ".join(available_tasks))
 
 print("[scope] Cache-only: no dataset, checkpoint, model, forward pass, or score recomputation.")
 print("[scope] All intervals are canonical cached one-checkpoint intervals, not seed uncertainty.")
 result = run(
     CANONICAL_ROOTS,
     OUTPUT_DIR,
-    tasks=TASKS,
+    tasks=available_tasks,
     train_seed=TRAIN_SEED,
     require_carriage=REQUIRE_CARRIAGE,
 )
