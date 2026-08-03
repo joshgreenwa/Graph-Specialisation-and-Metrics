@@ -4,6 +4,7 @@ import pytest
 import graph_specialisation_metrics.zinc_interaction_pilot as pilot_module
 from graph_specialisation_metrics.zinc_interaction_pilot import (
     OUTPUT_MODULATION_TASKS,
+    QM9_OUTPUT_MODULATION_TASKS,
     OutputModulationConfig,
     _write_csv,
     audit_output_modulation_pairing,
@@ -97,6 +98,60 @@ def test_output_validation_defaults_prioritise_graphs_then_sources():
     assert args.output_sources_per_graph == 6
     assert args.output_donor_pairs_per_source == 2
     assert args.output_graphs_per_batch == 8
+
+
+def test_qm9_output_modulation_suite_is_registered_separately(tmp_path):
+    zinc = OutputModulationConfig(output_dir=tmp_path)
+    qm9 = OutputModulationConfig(
+        output_dir=tmp_path,
+        tasks=QM9_OUTPUT_MODULATION_TASKS,
+    )
+    zinc.validate()
+    qm9.validate()
+    assert zinc.suite == "zinc"
+    assert qm9.suite == "qm9"
+    assert zinc.cache_dir != qm9.cache_dir
+
+
+def test_output_all_cli_accepts_qm9_suite(tmp_path, monkeypatch):
+    calls = []
+
+    def fake_measure(config, **_kwargs):
+        calls.append(("measure", config.suite, tuple(config.tasks)))
+        return {"events": 0}
+
+    def fake_figures(config):
+        calls.append(("figures", config.suite, tuple(config.tasks)))
+        return {"output_modulation_figures": {}}
+
+    monkeypatch.setattr(pilot_module, "measure_output_modulation", fake_measure)
+    monkeypatch.setattr(pilot_module, "figures_output_modulation", fake_figures)
+    pilot_module.main(
+        [
+            "--phase",
+            "output-all",
+            "--output-dir",
+            str(tmp_path),
+            "--output-tasks",
+            ",".join(QM9_OUTPUT_MODULATION_TASKS),
+            "--output-graphs",
+            "1",
+            "--output-sources-per-graph",
+            "1",
+            "--output-donor-pairs-per-source",
+            "1",
+            "--output-semantic-donor-graphs",
+            "1",
+            "--bootstrap-replicates",
+            "2",
+            "--skip-dependency-install",
+        ]
+    )
+    assert calls == [
+        ("measure", "qm9", QM9_OUTPUT_MODULATION_TASKS),
+        ("figures", "qm9", QM9_OUTPUT_MODULATION_TASKS),
+    ]
+    assert not (tmp_path / "analysis_config.json").exists()
 
 
 def test_output_modulation_aggregates_pairs_then_sources_then_graphs():

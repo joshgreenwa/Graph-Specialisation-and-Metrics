@@ -51,6 +51,7 @@ from .methodology.runner import prepare_task
 from .methodology.sampling import payload_array
 from .methodology.scores import project_transport
 from .zinc_reach_analysis import (
+    QM9_PROFILE,
     TASK_LABELS,
     ZINC_PROFILE,
     ZincReachConfig,
@@ -73,6 +74,15 @@ OUTPUT_MODULATION_TASKS = (
     "zinc_2hop_vnode",
     "zinc",
 )
+QM9_OUTPUT_MODULATION_TASKS = (
+    "qm9_gap_1hop",
+    "qm9_gap_1hop_vnode",
+    "qm9_gap_dense",
+)
+OUTPUT_MODULATION_SUITES = {
+    "zinc": OUTPUT_MODULATION_TASKS,
+    "qm9": QM9_OUTPUT_MODULATION_TASKS,
+}
 OUTPUT_MODULATION_LABELS = {
     "zinc_1hop_localrrwp": "1-hop + local RRWP",
     "zinc_1hop": "1-hop + global RRWP",
@@ -80,11 +90,25 @@ OUTPUT_MODULATION_LABELS = {
     "zinc_2hop": "2-hop",
     "zinc_2hop_vnode": "2-hop + VN",
     "zinc": "Dense + global RRWP",
+    "qm9_gap_1hop": "1-hop",
+    "qm9_gap_1hop_vnode": "1-hop + VN",
+    "qm9_gap_dense": "Dense",
 }
 
 
 def _output_model_label(task: str) -> str:
     return OUTPUT_MODULATION_LABELS.get(task, TASK_LABELS.get(task, task))
+
+
+def _output_suite(tasks: Sequence[str]) -> str:
+    ordered = tuple(tasks)
+    for suite, registered in OUTPUT_MODULATION_SUITES.items():
+        if ordered == registered:
+            return suite
+    raise ValueError(
+        "output modulation tasks must exactly match one registered ordered suite: "
+        f"{OUTPUT_MODULATION_SUITES}"
+    )
 
 
 @dataclass(frozen=True)
@@ -169,11 +193,7 @@ class OutputModulationConfig:
     num_threads: int = 4
 
     def validate(self) -> None:
-        if tuple(self.tasks) != OUTPUT_MODULATION_TASKS:
-            raise ValueError(
-                "output modulation currently requires the ordered tasks "
-                f"{OUTPUT_MODULATION_TASKS} so interventions remain exactly paired"
-            )
+        _output_suite(self.tasks)
         for name in (
             "graphs",
             "sources_per_graph",
@@ -192,6 +212,7 @@ class OutputModulationConfig:
     def scientific_record(self) -> dict[str, Any]:
         return {
             "analysis_version": OUTPUT_MODULATION_VERSION,
+            "suite": self.suite,
             "seed": int(self.seed),
             "sources_per_graph": int(self.sources_per_graph),
             "donor_pairs_per_source": int(self.donor_pairs_per_source),
@@ -208,6 +229,10 @@ class OutputModulationConfig:
     @property
     def fingerprint(self) -> str:
         return stable_hash(self.scientific_record)
+
+    @property
+    def suite(self) -> str:
+        return _output_suite(self.tasks)
 
     @property
     def cache_dir(self) -> Path:
@@ -892,8 +917,8 @@ def _output_modulation_group(
 ) -> tuple[list[Any], list[dict[str, Any]]]:
     """Build one clean/semantic/structural/joint prediction group.
 
-    Donors are sampled once with the local-RRWP model.  The resulting graph and
-    node identities are then replayed for the global-RRWP and dense models, so
+    Donors are sampled once with the suite's first reference model. The resulting
+    graph and node identities are then replayed for every comparison model, so
     architecture contrasts never conflate model response with a different draw.
     """
 
@@ -1098,7 +1123,7 @@ def _output_modulation_rows(
 
     values = predictions.reshape(int(predictions.shape[0]), -1)
     if int(values.shape[1]) != 1:
-        raise ValueError("ZINC output modulation requires a scalar transformed output")
+        raise ValueError("output modulation requires a scalar transformed output")
     expected = 1 + 3 * len(manifests)
     if int(values.shape[0]) != expected:
         raise RuntimeError(
@@ -1310,6 +1335,7 @@ def measure_output_modulation(
         overrides=checkpoints,
     )
     reach_config = ZincReachConfig(
+        profile=QM9_PROFILE if config.suite == "qm9" else ZINC_PROFILE,
         tasks=config.tasks,
         channels=("semantic", "structural"),
         seed=int(config.seed),
@@ -1402,7 +1428,7 @@ def measure_output_modulation(
             for graph_id in graph_batch:
                 if task != reference_task and int(graph_id) not in reference_manifests:
                     raise RuntimeError(
-                        f"paired local-RRWP donor manifest is missing for graph {int(graph_id)}"
+                        f"paired reference-model donor manifest is missing for graph {int(graph_id)}"
                     )
                 group, manifests = _output_modulation_group(
                     config,
@@ -1649,6 +1675,9 @@ def plot_output_modulation(
         "zinc_2hop": "#009E73",
         "zinc_2hop_vnode": "#CC79A7",
         "zinc": "#D55E00",
+        "qm9_gap_1hop": "#0072B2",
+        "qm9_gap_1hop_vnode": "#CC79A7",
+        "qm9_gap_dense": "#D55E00",
     }
     positions = {task: index for index, task in enumerate(tasks)}
     summary_lookup = {(str(row["task"]), str(row["metric"])): row for row in summary_rows}
@@ -2513,6 +2542,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> dict[str, Any]:
     args = build_parser().parse_args(argv)
+    legacy_phase = args.phase in {"all", "measure", "figures"}
+    output_phase = args.phase in {"output-all", "output-measure", "output-figures"}
     config = PilotConfig(
         output_dir=args.output_dir,
         tasks=tuple(value.strip() for value in args.tasks.split(",") if value.strip()),
@@ -2547,48 +2578,51 @@ def main(argv: Sequence[str] | None = None) -> dict[str, Any]:
     )
     output_config.validate()
     config.output_dir.mkdir(parents=True, exist_ok=True)
-    _write_json(
-        config.output_dir / "analysis_config.json",
-        {
-            **asdict(config),
-            "fingerprint": config.fingerprint,
-            "repository_commit": _repository_commit(),
-            "pre_registered_decision": {
-                "primary": (
-                    "report final-state semantic, structural, and interaction distance "
-                    "profiles, plus layer/head-transport profiles using the same contrasts"
-                ),
-                "distance": "report only for events above both estimability floors",
-                "necessity": "make no necessity claim; compare checkpoint test MAE only",
-                "aggregation": "donor pair -> source -> graph; bootstrap graphs",
-                "layer_caveat": "layer sites are comparable diagnostics, not additive stages",
+    if legacy_phase:
+        _write_json(
+            config.output_dir / "analysis_config.json",
+            {
+                **asdict(config),
+                "fingerprint": config.fingerprint,
+                "repository_commit": _repository_commit(),
+                "pre_registered_decision": {
+                    "primary": (
+                        "report final-state semantic, structural, and interaction distance "
+                        "profiles, plus layer/head-transport profiles using the same contrasts"
+                    ),
+                    "distance": "report only for events above both estimability floors",
+                    "necessity": "make no necessity claim; compare checkpoint test MAE only",
+                    "aggregation": "donor pair -> source -> graph; bootstrap graphs",
+                    "layer_caveat": ("layer sites are comparable diagnostics, not additive stages"),
+                },
             },
-        },
-    )
-    output_config.cache_dir.mkdir(parents=True, exist_ok=True)
-    _write_json(
-        output_config.cache_dir / "output_modulation_config.json",
-        {
-            **asdict(output_config),
-            "fingerprint": output_config.fingerprint,
-            "repository_commit": _repository_commit(),
-            "cached_endpoints": (
-                "clean, semantic-only, structural-only, and joint transformed predictions"
-            ),
-            "pre_registered_decision": {
-                "primary": (
-                    "M = absolute semantic-effect change between original and swapped "
-                    "structural contexts, divided by their mean absolute magnitude"
+        )
+    if output_phase:
+        output_config.cache_dir.mkdir(parents=True, exist_ok=True)
+        _write_json(
+            output_config.cache_dir / "output_modulation_config.json",
+            {
+                **asdict(output_config),
+                "fingerprint": output_config.fingerprint,
+                "repository_commit": _repository_commit(),
+                "cached_endpoints": (
+                    "clean, semantic-only, structural-only, and joint transformed predictions"
                 ),
-                "pairing": (
-                    "sample graph/source/donor identities once under local RRWP and replay "
-                    "the exact identities under global-RRWP 1-hop and dense models"
-                ),
-                "aggregation": "donor pair -> source -> graph; bootstrap graphs",
-                "interpretation": "model response, not task necessity",
+                "pre_registered_decision": {
+                    "primary": (
+                        "M = absolute semantic-effect change between original and swapped "
+                        "structural contexts, divided by their mean absolute magnitude"
+                    ),
+                    "pairing": (
+                        f"sample graph/source/donor identities once under "
+                        f"{_output_model_label(output_config.tasks[0])} and replay the exact "
+                        "identities under every comparison model"
+                    ),
+                    "aggregation": "donor pair -> source -> graph; bootstrap graphs",
+                    "interpretation": "model response, not task necessity",
+                },
             },
-        },
-    )
+        )
     result: dict[str, Any] = {
         "config": config,
         "output_dir": str(config.output_dir),
