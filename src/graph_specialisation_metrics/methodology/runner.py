@@ -4369,6 +4369,21 @@ def run_methodology(
     for task_name in config.tasks:
         for train_seed in config.seeds_for(task_name):
             key = f"{task_name}:seed{int(train_seed)}"
+            task_protocol_record = dict(protocol_record)
+            task_protocol_record.update(
+                {
+                    "execution_mode": "in-process-canonical-run",
+                    "run_task": task_name,
+                    "run_seed": int(train_seed),
+                }
+            )
+            atomic_json(
+                config.root
+                / task_name
+                / f"seed_{int(train_seed)}"
+                / "protocol.json",
+                task_protocol_record,
+            )
             log(f"\n[canonical] {key}")
             with audit_scope(key) as scope:
                 prepared = prepare_task(

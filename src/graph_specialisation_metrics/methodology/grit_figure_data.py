@@ -825,7 +825,8 @@ def methodology_config_for_artifact(
     protocol_paths: Sequence[str | Path],
     *,
     accelerator: str | None = None,
-) -> tuple[MethodologyConfig, Path, str]:
+    model_record: Mapping[str, Any] | None = None,
+) -> tuple[MethodologyConfig, Path | str, str]:
     """Load the protocol record scientifically bound to a score artifact.
 
     Task/seed protocol records are immutable run inputs, whereas a shared root
@@ -842,6 +843,7 @@ def methodology_config_for_artifact(
         raise ValueError("canonical score cache has no protocol fingerprint")
 
     checked: list[str] = []
+    runtime_templates: list[tuple[Path, MethodologyConfig]] = []
     seen: set[Path] = set()
     for value in protocol_paths:
         path = Path(value).expanduser().resolve()
@@ -866,6 +868,10 @@ def methodology_config_for_artifact(
         ) as error:
             checked.append(f"{path} (invalid: {error})")
             continue
+        if record.get("protocol_version") == artifact.metadata.get(
+            "protocol_version"
+        ):
+            runtime_templates.append((path, config))
         task_name = str(contract.get("task", ""))
         train_seed = int(contract.get("train_seed", -1))
         if (
@@ -883,6 +889,94 @@ def methodology_config_for_artifact(
             f"{path} (recorded fingerprint {recorded or 'missing'}; "
             f"reconstructed fingerprint {reconstructed})"
         )
+
+    if model_record is not None:
+        task_name = str(contract.get("task", ""))
+        train_seed = int(contract.get("train_seed", -1))
+        expected_model = {
+            "task": task_name,
+            "train_seed": train_seed,
+            "checkpoint_sha256": str(contract.get("checkpoint_sha256", "")),
+            "task_adapter_version": str(
+                contract.get("task_adapter_version", "")
+            ),
+        }
+        model_mismatches = {
+            key: (model_record.get(key), value)
+            for key, value in expected_model.items()
+            if model_record.get(key) != value
+        }
+        if model_mismatches:
+            raise ValueError(
+                "cannot reconstruct a figure runtime from a model record that "
+                f"does not bind to the score cache: {model_mismatches}"
+            )
+        splits = _split_manifest_from_record(model_record)
+        if splits.fingerprint != str(contract.get("split_fingerprint", "")):
+            raise ValueError(
+                "cannot reconstruct a figure runtime because model.json and "
+                "scores/raw.pt use different split manifests"
+            )
+        template_path, template = (
+            runtime_templates[0]
+            if runtime_templates
+            else (None, MethodologyConfig())
+        )
+        bootstrap_replicates = int(
+            contract.get(
+                "bootstrap_replicates",
+                template.bootstrap.replicates,
+            )
+        )
+        sizes = RunSizes(
+            discovery_graphs=len(splits.discovery),
+            causal_graphs=len(splits.causal),
+            clean_ablation_graphs=len(splits.clean_ablation),
+            semantic_donor_graphs=len(splits.semantic_donor_pool),
+            sources_per_graph=int(contract["source_cap"]),
+            donors_per_source=int(contract["donors_per_source"]),
+            bootstrap_replicates=bootstrap_replicates,
+        )
+        task_override = template.task_overrides.get(task_name)
+        inferred = dataclasses.replace(
+            template,
+            output_dir=str(artifact.path.parents[4]),
+            tasks=(task_name,),
+            train_seeds=(train_seed,),
+            task_train_seeds={},
+            phases=(),
+            sizes=sizes,
+            bootstrap=dataclasses.replace(
+                template.bootstrap,
+                rng_seed=int(
+                    contract.get(
+                        "bootstrap_seed",
+                        template.bootstrap.rng_seed,
+                    )
+                ),
+                replicates=bootstrap_replicates,
+            ),
+            analysis_seed=int(splits.seed),
+            accelerator=str(accelerator or template.accelerator),
+            checkpoints={},
+            task_overrides=(
+                {task_name: dict(task_override)}
+                if task_override is not None
+                else {}
+            ),
+            figure_overrides={},
+            skip_install=True,
+            resume=True,
+            force=False,
+        )
+        inferred.validate()
+        source = (
+            f"artifact/model compatibility fallback; runtime policy template: "
+            f"{template_path}"
+            if template_path is not None
+            else "artifact/model compatibility fallback; current runtime defaults"
+        )
+        return inferred, source, expected
 
     details = "; ".join(checked) if checked else "no candidates supplied"
     raise ValueError(

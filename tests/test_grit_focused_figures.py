@@ -79,6 +79,7 @@ from graph_specialisation_metrics.methodology.protocol import (  # noqa: E402
     stable_hash,
 )
 from graph_specialisation_metrics.methodology import runner  # noqa: E402
+from graph_specialisation_metrics.methodology.tasks import get_task  # noqa: E402
 
 
 def _score_value():
@@ -682,6 +683,131 @@ def test_bound_protocol_loader_reports_every_mismatched_candidate(
         )
     assert "missing" in str(error.value)
     assert str(root_path.resolve()) in str(error.value)
+
+
+def test_artifact_model_fallback_survives_shared_protocol_overwrite(
+    tmp_path: Path,
+):
+    task_name = "qm9_gap_dense"
+    train_seed = 42
+    splits = SplitManifest(
+        discovery=(0, 1, 2),
+        causal=(3,),
+        clean_ablation=(4,),
+        semantic_donor_pool=(5, 6, 7, 8),
+        same_index_space=False,
+        seed=31_415,
+    )
+    stale_root = MethodologyConfig(
+        output_dir=str(tmp_path / "canonical"),
+        tasks=("zinc_1hop",),
+        train_seeds=(42,),
+        phases=("scores",),
+    )
+    root_path = tmp_path / "protocol.json"
+    root_path.write_text(json.dumps(stale_root.record()), encoding="utf-8")
+    raw_path = (
+        tmp_path
+        / "canonical"
+        / task_name
+        / "seed_42"
+        / "cache/scores/raw.pt"
+    )
+    contract = {
+        "protocol_fingerprint": "historical-qm9-fingerprint",
+        "task": task_name,
+        "train_seed": train_seed,
+        "checkpoint_sha256": "checkpoint-sha",
+        "task_adapter_version": get_task(task_name).adapter_version,
+        "split_fingerprint": splits.fingerprint,
+        "source_cap": 6,
+        "donors_per_source": 8,
+        "bootstrap_seed": 17_071,
+        "bootstrap_replicates": 2_000,
+    }
+    artifact = SimpleNamespace(
+        path=raw_path,
+        metadata={
+            "protocol_version": PROTOCOL_VERSION,
+            "contract": contract,
+        },
+    )
+    model_record = {
+        "task": task_name,
+        "train_seed": train_seed,
+        "checkpoint_sha256": "checkpoint-sha",
+        "task_adapter_version": get_task(task_name).adapter_version,
+        "splits": dataclasses.asdict(splits),
+    }
+
+    restored, source, fingerprint = methodology_config_for_artifact(
+        artifact,
+        (tmp_path / "missing.json", root_path),
+        accelerator="cpu",
+        model_record=model_record,
+    )
+
+    assert restored.tasks == (task_name,)
+    assert restored.train_seeds == (train_seed,)
+    assert restored.sizes.discovery_graphs == len(splits.discovery)
+    assert restored.sizes.semantic_donor_graphs == len(
+        splits.semantic_donor_pool
+    )
+    assert restored.sizes.sources_per_graph == contract["source_cap"]
+    assert restored.sizes.donors_per_source == contract["donors_per_source"]
+    assert restored.analysis_seed == splits.seed
+    assert restored.accelerator == "cpu"
+    assert "artifact/model compatibility fallback" in str(source)
+    assert fingerprint == contract["protocol_fingerprint"]
+
+
+def test_in_process_canonical_run_writes_task_local_protocol(
+    tmp_path: Path,
+    monkeypatch,
+):
+    config = MethodologyConfig(
+        output_dir=str(tmp_path / "canonical"),
+        tasks=("zinc",),
+        train_seeds=(42,),
+        phases=(),
+    )
+    output_dir = config.root / "zinc" / "seed_42"
+    monkeypatch.setattr(
+        runner,
+        "prepare_task",
+        lambda *args, **kwargs: SimpleNamespace(),
+    )
+    monkeypatch.setattr(
+        runner,
+        "run_prepared",
+        lambda prepared, active_config: {
+            "task": "zinc",
+            "seed": 42,
+            "output_dir": str(output_dir),
+            "scores": None,
+            "carriage": None,
+            "causal": None,
+            "figures": None,
+            "audit_findings": [],
+            "headline_eligible": True,
+        },
+    )
+    monkeypatch.setattr(runner, "_release_runtime_memory", lambda: None)
+    monkeypatch.setattr(
+        runner,
+        "_write_run_summaries",
+        lambda *args, **kwargs: {},
+    )
+
+    runner.run_methodology(config)
+
+    task_protocol = json.loads(
+        (output_dir / "protocol.json").read_text(encoding="utf-8")
+    )
+    assert task_protocol["fingerprint"] == config.fingerprint
+    assert task_protocol["execution_mode"] == "in-process-canonical-run"
+    assert task_protocol["run_task"] == "zinc"
+    assert task_protocol["run_seed"] == 42
 
 
 def test_zinc_and_qm9_graphs_reconstruct_as_index_preserving_molecules():
@@ -1917,6 +2043,7 @@ def test_colab_notebook_has_valid_python_cells():
     assert "methodology_config_for_artifact(" not in initialization_source
     runtime_source = "".join(payload["cells"][6]["source"])
     assert "methodology_config_for_artifact(" in runtime_source
+    assert 'model_record=context["model_record"]' in runtime_source
     assert 'context["protocol_paths"]' in runtime_source
     assert "protocol_fingerprint," in runtime_source
     assert 'context["common_provenance"]["canonical_protocol_record"]' in runtime_source
