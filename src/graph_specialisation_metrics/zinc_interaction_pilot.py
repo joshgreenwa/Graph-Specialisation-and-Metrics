@@ -2338,6 +2338,12 @@ def carrier_alignment_specificity_analysis(
                         source_event_values[(*key, "matched")].append(matched)
                         source_event_values[(*key, "within_source_shuffle")].append(shuffled)
                         source_event_values[(*key, "matched_minus_shuffle")].append(advantage)
+                        if metric == "explained_energy":
+                            headroom = 1.0 - shuffled
+                            if headroom > 1.0e-8:
+                                source_event_values[(*key, "headroom_normalized_advantage")].append(
+                                    advantage / headroom
+                                )
 
     graph_values: dict[tuple[Any, ...], list[float]] = defaultdict(list)
     for key, values in source_event_values.items():
@@ -2361,6 +2367,117 @@ def carrier_alignment_specificity_analysis(
     ]
 
 
+def marginal_profile_diversity_analysis(
+    rows: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Measure donor-pair profile diversity within each graph and source.
+
+    Diversity is ``1 - mean off-pair R²₀`` after allowing one fitted gain.  A
+    channel with greater diversity has more opportunity to win a same-pair
+    shuffle test, so this is the required calibration for comparing structural
+    and semantic event specificity.
+    """
+
+    if not rows:
+        return []
+    signed_columns = {
+        "semantic_projection",
+        "structural_projection",
+        "interaction_projection",
+    }
+    modes = ["absolute_mass"]
+    if signed_columns.issubset(rows[0].keys()):
+        modes.append("signed_projection")
+    grouped: dict[tuple[str, int, int], dict[int, list[Mapping[str, Any]]]] = defaultdict(
+        lambda: defaultdict(list)
+    )
+    for row in rows:
+        grouped[(str(row["task"]), int(row["graph"]), int(row["source"]))][int(row["pair"])].append(
+            row
+        )
+
+    source_values: dict[tuple[Any, ...], float] = {}
+    for (task, graph, source), pair_rows in grouped.items():
+        ordered = {
+            pair: sorted(event_rows, key=lambda row: int(row["carrier"]))
+            for pair, event_rows in pair_rows.items()
+        }
+        carrier_ids = {
+            pair: tuple(int(row["carrier"]) for row in event_rows)
+            for pair, event_rows in ordered.items()
+        }
+        pairs = sorted(ordered)
+        for mode in modes:
+            suffix = "mass" if mode == "absolute_mass" else "projection"
+            for reference in ("structural", "semantic"):
+                pairwise_r2: list[float] = []
+                for left_index, left_pair in enumerate(pairs):
+                    for right_pair in pairs[left_index + 1 :]:
+                        if carrier_ids[left_pair] != carrier_ids[right_pair]:
+                            continue
+                        left = np.asarray(
+                            [_as_float(row[f"{reference}_{suffix}"]) for row in ordered[left_pair]],
+                            dtype=np.float64,
+                        )
+                        right = np.asarray(
+                            [
+                                _as_float(row[f"{reference}_{suffix}"])
+                                for row in ordered[right_pair]
+                            ],
+                            dtype=np.float64,
+                        )
+                        fitted = _carrier_alignment_metrics(left, right)
+                        if fitted is not None:
+                            pairwise_r2.append(float(fitted[0]["explained_energy"]))
+                if pairwise_r2:
+                    source_values[(task, graph, source, mode, reference)] = float(
+                        1.0 - np.mean(pairwise_r2)
+                    )
+
+    graph_values: dict[tuple[Any, ...], list[float]] = defaultdict(list)
+    for (task, graph, _source, mode, reference), value in source_values.items():
+        graph_values[(task, graph, mode, reference)].append(value)
+    return [
+        {
+            "task": task,
+            "model_label": TASK_LABELS[str(task)],
+            "graph": int(graph),
+            "mode": mode,
+            "reference": reference,
+            "metric": "explained_energy",
+            "analysis": "between_pair_diversity",
+            "value": float(np.mean(values)),
+            "eligible_sources": len(values),
+        }
+        for (task, graph, mode, reference), values in sorted(graph_values.items())
+    ]
+
+
+def paired_reference_diversity_advantages(
+    diversity_rows: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Form structural-minus-semantic marginal-diversity contrasts by graph."""
+
+    grouped: dict[tuple[Any, ...], dict[str, float]] = defaultdict(dict)
+    for row in diversity_rows:
+        grouped[(row["task"], int(row["graph"]), row["mode"], row["metric"])][
+            str(row["reference"])
+        ] = float(row["value"])
+    return [
+        {
+            "task": task,
+            "model_label": TASK_LABELS[str(task)],
+            "graph": int(graph),
+            "mode": mode,
+            "metric": metric,
+            "comparison": "reference_diversity",
+            "value": float(values["structural"] - values["semantic"]),
+        }
+        for (task, graph, mode, metric), values in sorted(grouped.items())
+        if {"structural", "semantic"}.issubset(values)
+    ]
+
+
 def paired_reference_advantages(
     alignment_rows: Sequence[Mapping[str, Any]],
     specificity_rows: Sequence[Mapping[str, Any]],
@@ -2376,17 +2493,25 @@ def paired_reference_advantages(
         actual[(row["task"], int(row["graph"]), row["mode"], metric)][str(row["reference"])] = (
             float(row["value"])
         )
-    specificity: dict[tuple[Any, ...], dict[str, float]] = defaultdict(dict)
+    specificity_by_analysis: dict[str, dict[tuple[Any, ...], dict[str, float]]] = {
+        "event_specificity": defaultdict(dict),
+        "normalized_event_specificity": defaultdict(dict),
+    }
+    analysis_names = {
+        "matched_minus_shuffle": "event_specificity",
+        "headroom_normalized_advantage": "normalized_event_specificity",
+    }
     for row in specificity_rows:
-        if row["analysis"] != "matched_minus_shuffle":
+        comparison = analysis_names.get(str(row["analysis"]))
+        if comparison is None:
             continue
-        specificity[(row["task"], int(row["graph"]), row["mode"], row["metric"])][
-            str(row["reference"])
-        ] = float(row["value"])
+        specificity_by_analysis[comparison][
+            (row["task"], int(row["graph"]), row["mode"], row["metric"])
+        ][str(row["reference"])] = float(row["value"])
 
     for comparison, values_by_key in (
         ("actual_fit", actual),
-        ("event_specificity", specificity),
+        *specificity_by_analysis.items(),
     ):
         for (task, graph, mode, metric), values in sorted(values_by_key.items()):
             if not {"structural", "semantic"}.issubset(values):
@@ -2997,12 +3122,17 @@ def plot_alignment_specificity(
     axes[0].set_title("True pair versus same-source shuffle")
     axes[0].set_ylabel(r"Same-pair advantage in $R^2_0$")
 
-    comparison_colours = {"actual_fit": "#4C72B0", "event_specificity": "#B4475A"}
+    comparison_colours = {
+        "actual_fit": "#4C72B0",
+        "event_specificity": "#B4475A",
+        "normalized_event_specificity": "#7A5195",
+    }
     comparison_labels = {
         "actual_fit": "Raw fit advantage",
         "event_specificity": "Same-pair advantage difference",
+        "normalized_event_specificity": "Headroom-normalized difference",
     }
-    for offset, comparison in zip((-0.11, 0.11), comparison_colours, strict=True):
+    for offset, comparison in zip((-0.17, 0.0, 0.17), comparison_colours, strict=True):
         selected = {
             str(row["task"]): row
             for row in paired_rows
@@ -3041,6 +3171,120 @@ def plot_alignment_specificity(
     )
     fig.tight_layout(rect=(0, 0, 1, 0.96))
     return _save_figure(fig, figures_dir, f"zinc_interaction_specificity_{mode}")
+
+
+def plot_specificity_calibration(
+    diversity_rows: Sequence[Mapping[str, Any]],
+    specificity_rows: Sequence[Mapping[str, Any]],
+    paired_rows: Sequence[Mapping[str, Any]],
+    *,
+    tasks: Sequence[str],
+    mode: str,
+    figures_dir: Path,
+) -> dict[str, str]:
+    """Show whether structural specificity survives unequal reference diversity."""
+
+    import matplotlib.pyplot as plt
+
+    _figure_theme()
+    x = np.arange(len(tasks), dtype=np.float64)
+    fig, axes = plt.subplots(1, 3, figsize=(11.4, 3.4))
+    reference_colours = {"structural": "#168294", "semantic": "#E69F00"}
+
+    for axis, rows, analysis, title, ylabel in (
+        (
+            axes[0],
+            diversity_rows,
+            "between_pair_diversity",
+            "Marginal donor-pair diversity",
+            r"$1-$ off-pair $R^2_0$",
+        ),
+        (
+            axes[1],
+            specificity_rows,
+            "headroom_normalized_advantage",
+            "Specificity after opportunity correction",
+            "Fraction of available headroom",
+        ),
+    ):
+        for offset, reference in zip((-0.11, 0.11), ("structural", "semantic"), strict=True):
+            selected = {
+                str(row["task"]): row
+                for row in rows
+                if row["mode"] == mode
+                and row["reference"] == reference
+                and row["metric"] == "explained_energy"
+                and row["analysis"] == analysis
+            }
+            valid_tasks = [task for task in tasks if task in selected]
+            if not valid_tasks:
+                continue
+            positions = np.asarray([x[tasks.index(task)] + offset for task in valid_tasks])
+            means = np.asarray([float(selected[task]["mean"]) for task in valid_tasks])
+            lows = np.asarray([float(selected[task]["low"]) for task in valid_tasks])
+            highs = np.asarray([float(selected[task]["high"]) for task in valid_tasks])
+            axis.errorbar(
+                positions,
+                means,
+                yerr=np.vstack((np.maximum(0.0, means - lows), np.maximum(0.0, highs - means))),
+                fmt="o",
+                ms=5,
+                capsize=3,
+                color=reference_colours[reference],
+                label=f"{reference.capitalize()} reference",
+            )
+        axis.set_title(title)
+        axis.set_ylabel(ylabel)
+        axis.axhline(0.0, color="#666666", lw=1.0, ls="--")
+        axis.legend(frameon=False, loc="best")
+
+    comparison_colours = {
+        "normalized_event_specificity": "#7A5195",
+        "reference_diversity": "#5F6B6D",
+    }
+    comparison_labels = {
+        "normalized_event_specificity": "Normalized specificity",
+        "reference_diversity": "Reference diversity",
+    }
+    for offset, comparison in zip((-0.11, 0.11), comparison_colours, strict=True):
+        selected = {
+            str(row["task"]): row
+            for row in paired_rows
+            if row["mode"] == mode
+            and row["metric"] == "explained_energy"
+            and row["comparison"] == comparison
+        }
+        valid_tasks = [task for task in tasks if task in selected]
+        if not valid_tasks:
+            continue
+        positions = np.asarray([x[tasks.index(task)] + offset for task in valid_tasks])
+        means = np.asarray([float(selected[task]["mean"]) for task in valid_tasks])
+        lows = np.asarray([float(selected[task]["low"]) for task in valid_tasks])
+        highs = np.asarray([float(selected[task]["high"]) for task in valid_tasks])
+        axes[2].errorbar(
+            positions,
+            means,
+            yerr=np.vstack((np.maximum(0.0, means - lows), np.maximum(0.0, highs - means))),
+            fmt="o",
+            ms=5,
+            capsize=3,
+            color=comparison_colours[comparison],
+            label=comparison_labels[comparison],
+        )
+    axes[2].set_title("Structural minus semantic")
+    axes[2].set_ylabel("Paired difference")
+    axes[2].axhline(0.0, color="#666666", lw=1.0, ls="--")
+    axes[2].legend(frameon=False, loc="best")
+    for axis in axes:
+        axis.set_xticks(x, [TASK_LABELS[task] for task in tasks], rotation=24, ha="right")
+    qualifier = "signed carrier projections" if mode == "signed_projection" else "carrier masses"
+    fig.suptitle(
+        f"Does structural specificity survive unequal reference identifiability? ({qualifier})",
+        y=1.08,
+        fontsize=12,
+    )
+    fig.tight_layout(rect=(0, 0, 1, 0.96))
+    return _save_figure(fig, figures_dir, f"zinc_interaction_specificity_calibration_{mode}")
 
 
 def plot_residual_profiles(
@@ -3294,7 +3538,11 @@ def figures(
     absolute_graph = graph_absolute_distance_profiles(carrier_rows)
     alignment_graph, residual_graph, alignment_modes = carrier_alignment_analysis(carrier_rows)
     specificity_graph = carrier_alignment_specificity_analysis(carrier_rows)
-    paired_advantage_graph = paired_reference_advantages(alignment_graph, specificity_graph)
+    diversity_graph = marginal_profile_diversity_analysis(carrier_rows)
+    paired_advantage_graph = [
+        *paired_reference_advantages(alignment_graph, specificity_graph),
+        *paired_reference_diversity_advantages(diversity_graph),
+    ]
     layer_graph = graph_distance_profiles(_read_csv(required["layer_distances"]), layerwise=True)
     final_metrics_graph = graph_metric_rows(_read_csv(required["events"]), layerwise=False)
     layer_metrics_graph = graph_metric_rows(_read_csv(required["layer_events"]), layerwise=True)
@@ -3343,6 +3591,11 @@ def figures(
         bootstrap_replicates=config.bootstrap_replicates,
         bootstrap_seed=config.analysis_seed + 900,
     )
+    diversity_summary = summarise_specificity_metrics(
+        diversity_graph,
+        bootstrap_replicates=config.bootstrap_replicates,
+        bootstrap_seed=config.analysis_seed + 1_000,
+    )
     for name, values in (
         ("final_graph_profiles.csv", final_graph),
         ("final_profile_summary.csv", final_summary),
@@ -3362,6 +3615,8 @@ def figures(
         ("carrier_alignment_specificity_summary.csv", specificity_summary),
         ("carrier_alignment_paired_advantage_graph_metrics.csv", paired_advantage_graph),
         ("carrier_alignment_paired_advantage_summary.csv", paired_advantage_summary),
+        ("carrier_alignment_reference_diversity_graph_metrics.csv", diversity_graph),
+        ("carrier_alignment_reference_diversity_summary.csv", diversity_summary),
     ):
         _write_csv(results_dir / name, values)
     figures_dir = config.output_dir / "figures"
@@ -3416,6 +3671,14 @@ def figures(
             mode=mode,
             figures_dir=figures_dir,
         )
+        paths[f"carrier_specificity_calibration_{mode}"] = plot_specificity_calibration(
+            diversity_summary,
+            specificity_summary,
+            paired_advantage_summary,
+            tasks=config.tasks,
+            mode=mode,
+            figures_dir=figures_dir,
+        )
     _write_json(
         results_dir / "figure_manifest.json",
         {
@@ -3444,6 +3707,11 @@ def figures(
                 "Post-hoc falsification diagnostic motivated by the observed structural/"
                 "interaction profile similarity; it is not part of the preregistered pilot."
             ),
+            "specificity_calibration": (
+                "Marginal donor-pair diversity is one minus mean off-pair R-squared "
+                "within each graph/source/channel. Headroom-normalized specificity divides "
+                "the matched-minus-shuffle R-squared gain by one minus shuffled R-squared."
+            ),
             "carrier_alignment_modes": list(alignment_modes),
             "signed_alignment_available": "signed_projection" in alignment_modes,
         },
@@ -3459,6 +3727,7 @@ def figures(
         "carrier_residual_summary": residual_summary,
         "carrier_specificity_summary": specificity_summary,
         "carrier_paired_advantage_summary": paired_advantage_summary,
+        "carrier_reference_diversity_summary": diversity_summary,
         "carrier_alignment_modes": alignment_modes,
     }
 

@@ -16,9 +16,11 @@ from graph_specialisation_metrics.zinc_interaction_pilot import (
     graph_absolute_distance_profiles,
     graph_distance_profiles,
     layer_event_summary,
+    marginal_profile_diversity_analysis,
     output_modulation_graph_metrics,
     output_modulation_metrics,
     paired_reference_advantages,
+    paired_reference_diversity_advantages,
 )
 
 
@@ -507,7 +509,33 @@ def test_same_source_shuffle_separates_event_specific_fit_from_locality_envelope
     assert structural["value"] == pytest.approx(2.0 / 3.0)
     assert semantic["value"] == pytest.approx(0.0)
 
-    paired = paired_reference_advantages(alignment, specificity)
+    structural_normalized = next(
+        row
+        for row in specificity
+        if row["reference"] == "structural"
+        and row["metric"] == "explained_energy"
+        and row["analysis"] == "headroom_normalized_advantage"
+    )
+    semantic_normalized = next(
+        row
+        for row in specificity
+        if row["reference"] == "semantic"
+        and row["metric"] == "explained_energy"
+        and row["analysis"] == "headroom_normalized_advantage"
+    )
+    assert structural_normalized["value"] == pytest.approx(1.0)
+    assert semantic_normalized["value"] == pytest.approx(0.0)
+
+    diversity = marginal_profile_diversity_analysis(rows)
+    structural_diversity = next(row for row in diversity if row["reference"] == "structural")
+    semantic_diversity = next(row for row in diversity if row["reference"] == "semantic")
+    assert structural_diversity["value"] == pytest.approx(2.0 / 3.0)
+    assert semantic_diversity["value"] == pytest.approx(0.0)
+
+    paired = [
+        *paired_reference_advantages(alignment, specificity),
+        *paired_reference_diversity_advantages(diversity),
+    ]
     actual = next(
         row
         for row in paired
@@ -520,3 +548,16 @@ def test_same_source_shuffle_separates_event_specific_fit_from_locality_envelope
     )
     assert actual["value"] == pytest.approx(1.0 / 3.0)
     assert event_specificity["value"] == pytest.approx(2.0 / 3.0)
+    normalized_specificity = next(
+        row
+        for row in paired
+        if row["metric"] == "explained_energy"
+        and row["comparison"] == "normalized_event_specificity"
+    )
+    diversity_advantage = next(
+        row
+        for row in paired
+        if row["metric"] == "explained_energy" and row["comparison"] == "reference_diversity"
+    )
+    assert normalized_specificity["value"] == pytest.approx(1.0)
+    assert diversity_advantage["value"] == pytest.approx(2.0 / 3.0)

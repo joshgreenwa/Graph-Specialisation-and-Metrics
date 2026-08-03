@@ -4,7 +4,8 @@ The default ``figures`` phase is cache-only. It adds four diagnostics for the
 apparent structural/interaction profile match: unnormalised carriage, a
 carrier-level proportional fit against both structural and semantic carriage,
 the distance profile left after that fit, and a same-source donor-pair shuffle
-that tests event-specific alignment beyond generic locality. Existing v2 caches
+that tests event-specific alignment beyond generic locality. It also calibrates
+that test for unequal donor-pair diversity between channels. Existing v2 caches
 immediately support an absolute-mass profile screen. A newly measured cache also stores the
 already-computed signed scalar carrier projections and enables the decisive
 signed cosine/gain/R2 diagnostic without any later model rerun.
@@ -171,6 +172,9 @@ print(
     "donor-pair profile at the same graph and source, preserving carrier identities and "
     "the complete distance envelope. Positive matched-minus-shuffle values indicate "
     "event-specific alignment beyond generic locality.\n"
+    "[scope] Reference diversity is 1 - mean off-pair R2 within each graph/source. "
+    "Opportunity-corrected specificity divides the matched R2 gain by the remaining "
+    "headroom above the shuffled baseline.\n"
     "[scope] This shuffle is a post-hoc falsification diagnostic prompted by the observed "
     "structural/interaction similarity, not a preregistered primary result.\n"
     "[scope] An old cache can only screen proportionality of non-negative carrier masses. "
@@ -295,9 +299,16 @@ try:
         display(
             specificity[
                 (specificity["metric"] == "explained_energy")
-                & (specificity["analysis"] == "matched_minus_shuffle")
+                & specificity["analysis"].isin(
+                    ["matched_minus_shuffle", "headroom_normalized_advantage"]
+                )
             ]
         )
+    diversity_path = OUTPUT_DIR / "results" / "carrier_alignment_reference_diversity_summary.csv"
+    if diversity_path.is_file():
+        diversity = pd.read_csv(diversity_path)
+        print("\nMarginal donor-pair profile diversity", flush=True)
+        display(diversity)
     paired_path = OUTPUT_DIR / "results" / "carrier_alignment_paired_advantage_summary.csv"
     if paired_path.is_file():
         paired = pd.read_csv(paired_path)
@@ -340,6 +351,8 @@ try:
         "carrier_residual_signed_projection",
         "carrier_specificity_absolute_mass",
         "carrier_specificity_signed_projection",
+        "carrier_specificity_calibration_absolute_mass",
+        "carrier_specificity_calibration_signed_projection",
     ):
         path = result.get("figures", {}).get(name, {}).get("png")
         if path:
