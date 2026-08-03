@@ -8,6 +8,7 @@ model and never recomputes specialisation scores.
 # ============================ paste from here ============================
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -24,7 +25,6 @@ CANONICAL_ROOTS = (
     DRIVE_ROOT / "graph_specialisation_metrics/canonical_methodology_v4_zinc_qm9",
     DRIVE_ROOT / "graph_specialisation_metrics/canonical_methodology",
 )
-CANONICAL_SEARCH_ROOT = DRIVE_ROOT / "graph_specialisation_metrics"
 OUTPUT_DIR = DRIVE_ROOT / "graph_specialisation_metrics/zinc_cached_rrwp_comparison"
 TRAIN_SEED = 42
 REQUIRE_CARRIAGE = False
@@ -37,6 +37,36 @@ TASKS = (
     "zinc_2hop_vnode",
     "zinc",
 )
+TRAINING_DRIVE_ROOTS = {
+    "zinc_1hop_localrrwp": DRIVE_ROOT / "grit_zinc_1hop_localrrwp",
+    "zinc_1hop": DRIVE_ROOT / "grit_zinc_1hop",
+    "zinc_1hop_vnode": DRIVE_ROOT / "grit_zinc_1hop_vnode",
+    "zinc_2hop": DRIVE_ROOT / "grit_zinc_2hop",
+    "zinc_2hop_vnode": DRIVE_ROOT / "grit_zinc_2hop_vnode",
+    "zinc": DRIVE_ROOT / "grit_zinc_official",
+}
+KNOWN_RECOVERY_CHECKPOINTS = {
+    "zinc_1hop_localrrwp": (
+        TRAINING_DRIVE_ROOTS["zinc_1hop_localrrwp"]
+        / "results/_recovery_checkpoints/seed0_ColabDrive.1hopLocalRRWP.GRITwRRWP"
+    ),
+    "zinc_1hop": (
+        TRAINING_DRIVE_ROOTS["zinc_1hop"]
+        / "results/_recovery_checkpoints/seed0_ColabDrive.1hop.GRITwRRWP"
+    ),
+    "zinc_1hop_vnode": (
+        TRAINING_DRIVE_ROOTS["zinc_1hop_vnode"]
+        / "results/_recovery_checkpoints/seed0_ColabDrive.1hop.GRITwRRWP.VNode"
+    ),
+    "zinc_2hop": (
+        TRAINING_DRIVE_ROOTS["zinc_2hop"]
+        / "results/_recovery_checkpoints/seed0_ColabDrive.2hop.GRITwRRWP"
+    ),
+    "zinc_2hop_vnode": (
+        TRAINING_DRIVE_ROOTS["zinc_2hop_vnode"]
+        / "results/_recovery_checkpoints/seed0_ColabDrive.2hop.GRITwRRWP.VNode"
+    ),
+}
 
 from google.colab import drive, userdata
 
@@ -92,43 +122,10 @@ for module_name in tuple(sys.modules):
         del sys.modules[module_name]
 os.chdir(REPO_DIR)
 
-from graph_specialisation_metrics.carriage.env import find_checkpoint
-from graph_specialisation_metrics.carriage.tasks import get_task as get_training_task
 from graph_specialisation_metrics.zinc_cached_rrwp_comparison import (
-    artifact_task_candidates,
     cache_inventory,
     run,
 )
-
-# These Drive roots are the exact locations registered by the training-compatible
-# task definitions. ``find_checkpoint`` applies the same policy as the existing
-# analysis notebooks: GraphGym ``**/ckpt/*.ckpt`` first, then Colab recovery
-# ``best.ckpt``, ``latest.ckpt``, or ``first_after_resume.ckpt``.
-checkpoint_rows = []
-for task in TASKS:
-    training_task = get_training_task(task)
-    results_root = Path(training_task.drive_dir) / "results"
-    try:
-        checkpoint, checkpoint_epoch = find_checkpoint(results_root)
-        checkpoint_rows.append(
-            {
-                "task": task,
-                "training_drive_root": training_task.drive_dir,
-                "checkpoint": str(checkpoint),
-                "checkpoint_epoch": checkpoint_epoch,
-                "checkpoint_exists": True,
-            }
-        )
-    except FileNotFoundError as error:
-        checkpoint_rows.append(
-            {
-                "task": task,
-                "training_drive_root": training_task.drive_dir,
-                "checkpoint": str(error),
-                "checkpoint_epoch": None,
-                "checkpoint_exists": False,
-            }
-        )
 
 inventory = cache_inventory(CANONICAL_ROOTS, tasks=TASKS, train_seed=TRAIN_SEED)
 
@@ -140,20 +137,6 @@ def missing_tasks(records):
         if int(record["complete_score_locations"]) < 1
     ]
 
-
-# Older runs sometimes used another canonical root (and the local-RRWP model
-# historically used the task name ``zinc_1hop_local``). Discover exact seed-42
-# canonical layouts, but never silently mix another seed into this comparison.
-extra_roots = []
-for requested_task in missing_tasks(inventory):
-    for artifact_task in artifact_task_candidates(requested_task):
-        pattern = f"**/{artifact_task}/seed_{TRAIN_SEED}/cache/scores/raw.pt"
-        for score_path in CANONICAL_SEARCH_ROOT.glob(pattern):
-            if (score_path.parents[2] / "model.json").is_file():
-                extra_roots.append(score_path.parents[4])
-if extra_roots:
-    CANONICAL_ROOTS = tuple(dict.fromkeys((*CANONICAL_ROOTS, *extra_roots)))
-    inventory = cache_inventory(CANONICAL_ROOTS, tasks=TASKS, train_seed=TRAIN_SEED)
 
 inventory_rows = []
 for task_record in inventory:
@@ -181,32 +164,60 @@ for task_record in inventory:
             }
         )
 
+
+def checkpoint_from_canonical_record(task_record):
+    for match in task_record["matches"]:
+        if not match["model_exists"]:
+            continue
+        model_record = json.loads(Path(match["model"]).read_text(encoding="utf-8"))
+        checkpoint = model_record.get("checkpoint")
+        if checkpoint:
+            return Path(str(checkpoint)), model_record.get("checkpoint_epoch")
+    return None, None
+
+
+checkpoint_rows = []
+for task_record in inventory:
+    task = task_record["task"]
+    checkpoint, checkpoint_epoch = checkpoint_from_canonical_record(task_record)
+    source_kind = "canonical model.json"
+    if checkpoint is None and task in KNOWN_RECOVERY_CHECKPOINTS:
+        recovery_root = KNOWN_RECOVERY_CHECKPOINTS[task]
+        candidates = tuple(
+            recovery_root / name
+            for name in ("best.ckpt", "latest.ckpt", "first_after_resume.ckpt")
+        )
+        checkpoint = next((path for path in candidates if path.is_file()), candidates[0])
+        checkpoint_epoch = -1
+        source_kind = "training runner stable path"
+    checkpoint_rows.append(
+        {
+            "task": task,
+            "training_drive_root": str(TRAINING_DRIVE_ROOTS[task]),
+            "checkpoint": None if checkpoint is None else str(checkpoint),
+            "checkpoint_epoch": checkpoint_epoch,
+            "checkpoint_exists": bool(checkpoint is not None and checkpoint.is_file()),
+            "path_source": source_kind if checkpoint is not None else "not recorded",
+        }
+    )
+
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+checkpoint_manifest = OUTPUT_DIR / "checkpoint_paths.json"
+checkpoint_manifest.write_text(
+    json.dumps(checkpoint_rows, indent=2, sort_keys=True) + "\n",
+    encoding="utf-8",
+)
+
 import pandas as pd
 from IPython.display import Image, display
 
-print("Training checkpoint inventory (path lookup only; checkpoints are not loaded)")
+print("Exact training checkpoint inventory (no recursive Drive search; checkpoints not loaded)")
 display(pd.DataFrame(checkpoint_rows))
+print(f"[checkpoint-manifest] {checkpoint_manifest}")
 print("Canonical cache inventory")
 display(pd.DataFrame(inventory_rows))
 missing = missing_tasks(inventory)
 if missing:
-    nearby = []
-    for requested_task in missing:
-        for artifact_task in artifact_task_candidates(requested_task):
-            pattern = f"**/{artifact_task}/seed_*/cache/scores/raw.pt"
-            for score_path in CANONICAL_SEARCH_ROOT.glob(pattern):
-                nearby.append(
-                    {
-                        "requested_task": requested_task,
-                        "artifact_task": artifact_task,
-                        "seed_directory": score_path.parents[2].name,
-                        "score": str(score_path),
-                        "model_json": (score_path.parents[2] / "model.json").is_file(),
-                    }
-                )
-    if nearby:
-        print("Nearby caches found, but not used because task/seed completeness differs")
-        display(pd.DataFrame(nearby))
     missing_checkpoint_state = [
         row for row in checkpoint_rows if row["task"] in missing
     ]
