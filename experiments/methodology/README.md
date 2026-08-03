@@ -40,6 +40,15 @@ to redraw solely from Drive caches without loading the checkpoint or PCQM4Mv2. T
 control, cache, and figure contracts are recorded in
 [`../../docs/graphormer_pcqm4mv2_causal_analysis_plan.md`](../../docs/graphormer_pcqm4mv2_causal_analysis_plan.md).
 
+For the paper-facing population revision, use
+[`graphormer_pcqm4mv2_causal_population_colab.py`](graphormer_pcqm4mv2_causal_population_colab.py).
+It reuses the same Drive root and reads through compatible focused graph/head shards, then measures
+only heads missing from the 12-pair semantic/structural population and its `J`-matched
+controls. It exports one compact restoration/injection/necessity figure, a raw plus layer-adjusted
+`J`--ablation figure, and a discovery-only matching audit. The fixed estimands, matching diagnostics,
+uncertainty, and interpretation of the adjusted coefficient are documented in
+[`../../docs/graphormer_pcqm4mv2_causal_population.md`](../../docs/graphormer_pcqm4mv2_causal_population.md).
+
 After the requested ZINC and QM9 score caches have completed, run
 [`grit_zinc_qm9_figures_colab.ipynb`](grit_zinc_qm9_figures_colab.ipynb) for the focused
 cross-task figure suite. It reads each task's `seed_42/cache/scores/raw.pt` artifact

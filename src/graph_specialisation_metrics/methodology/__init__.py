@@ -6,6 +6,11 @@ from .graphormer_causal_analysis import (
     render_cached_focused_figures,
     run as run_graphormer_pcqm_causal,
 )
+from .graphormer_causal_population import (
+    PopulationPolicy,
+    render_cached_population_figures,
+    run as run_graphormer_pcqm_causal_population,
+)
 from .protocol import (
     BOOTSTRAP_REPLICATES,
     PROTOCOL_VERSION,
@@ -44,14 +49,17 @@ __all__ = [
     "MethodologyConfig",
     "NumericalPolicy",
     "OutputGeometry",
+    "PopulationPolicy",
     "RunSizes",
     "get_task",
     "finalize_cached_run",
     "register",
     "register_graphormer_dataset",
     "render_cached_focused_figures",
+    "render_cached_population_figures",
     "render_cached_figures",
     "run_methodology",
     "run_graphormer_pcqm_causal",
+    "run_graphormer_pcqm_causal_population",
     "run_worker",
 ]

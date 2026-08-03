@@ -23,6 +23,12 @@ then runs restoration, injection, donor-wise necessity, and all-head clean ablat
 128-molecule splits. Its Drive-backed graph shards support resume, and a figures-only phase exports
 the four focused PNG/PDF/JSON bundles without loading the model.
 
+The publication-strength population frontend is
+[`experiments/methodology/graphormer_pcqm4mv2_causal_population_colab.py`](experiments/methodology/graphormer_pcqm4mv2_causal_population_colab.py).
+It expands the primary comparison to 12 discovery-selected, `J`-matched semantic/structural head
+pairs plus distinct `J`-matched null controls, reuses compatible focused caches, and renders the
+three causal tests beside a transparent raw and layer-adjusted `J`--ablation analysis.
+
 The long-term project scope covers:
 
 - training and evaluation files for Graphormer, GraphGPS, GRIT, CSA, and Exphormer;
