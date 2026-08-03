@@ -1097,6 +1097,170 @@ def plot_hop_attention_mass(
     return fig
 
 
+def _transport_distance_view(
+    labels: Sequence[str],
+    *,
+    max_spd: int,
+) -> tuple[np.ndarray, np.ndarray, tuple[str, ...], list[str]]:
+    """Return a compact numeric-SPD view while retaining special carriers."""
+
+    max_spd = int(max_spd)
+    if max_spd < 0:
+        raise ValueError("max_spd must be non-negative")
+    labels = tuple(str(label) for label in labels)
+    special = np.asarray(
+        [
+            label.lower().replace(" ", "_")
+            in {"graph_token", "virtual"}
+            for label in labels
+        ],
+        dtype=bool,
+    )
+    numeric = np.asarray(
+        [int(label) if label.lstrip("-").isdigit() else -1 for label in labels]
+    )
+    displayed = special | ((numeric >= 0) & (numeric <= max_spd))
+    display_labels = tuple(
+        label for label, keep in zip(labels, displayed) if keep
+    )
+    display_special = special[displayed]
+    tick_labels: list[str] = []
+    for label, is_special in zip(display_labels, display_special):
+        if is_special:
+            tick_labels.append(label.replace("_", "\n").title())
+        elif label.lstrip("-").isdigit():
+            distance = int(label)
+            tick_labels.append(
+                label if distance <= 4 or distance % 2 == 0 else ""
+            )
+        else:
+            tick_labels.append(label.replace("_", "\n"))
+    return displayed, display_special, display_labels, tick_labels
+
+
+def plot_head_transport_profile(
+    metrics: CanonicalHeadMetrics,
+    transport_payload: Mapping[str, Any],
+    head: Head,
+    *,
+    max_spd: int = 14,
+):
+    """Plot one head's exact semantic/structural score decomposition by SPD."""
+
+    apply_publication_style()
+    head = tuple(int(value) for value in head)
+    payload_heads = tuple(
+        tuple(int(value) for value in value)
+        for value in transport_payload["heads"]
+    )
+    if head not in payload_heads:
+        raise ValueError(f"transport payload does not contain requested head {head}")
+    position = payload_heads.index(head)
+    labels = tuple(str(label) for label in transport_payload["axis"])
+    if labels != tuple(metrics.distance_axis):
+        raise ValueError(
+            "head metrics and transport-response distance axes differ"
+        )
+    displayed, display_special, display_labels, tick_labels = (
+        _transport_distance_view(labels, max_spd=max_spd)
+    )
+    if not display_labels:
+        raise ValueError("transport profile has no displayable distance bins")
+    x = np.arange(len(display_labels), dtype=np.float64)
+    x[display_special] += 0.75
+    channels = transport_payload.get("channels")
+    if not isinstance(channels, Mapping):
+        raise ValueError("transport payload has no channels")
+    response_styles = {
+        "semantic": {
+            "color": GOLD,
+            "marker": "o",
+            "label": "Semantic score",
+        },
+        "structural": {
+            "color": TEAL,
+            "marker": "s",
+            "label": "Structural score",
+        },
+    }
+
+    fig, ax = plt.subplots(figsize=(8.8, 5.9), constrained_layout=True)
+    for channel, style in response_styles.items():
+        channel_payload = channels.get(channel)
+        if not isinstance(channel_payload, Mapping):
+            raise ValueError(f"transport payload has no {channel!r} channel")
+        reportable = np.asarray(
+            channel_payload["reportable"], dtype=bool
+        )
+        if reportable.shape != (len(labels),):
+            raise ValueError(
+                f"{channel} reporting mask has shape {reportable.shape}; "
+                f"expected {(len(labels),)}"
+            )
+        fields = {}
+        for field in ("estimate", "low", "high"):
+            values = np.asarray(channel_payload[field], dtype=np.float64)
+            if values.shape != (len(payload_heads), len(labels)):
+                raise ValueError(
+                    f"{channel} {field} has shape {values.shape}; expected "
+                    f"{(len(payload_heads), len(labels))}"
+                )
+            fields[field] = values[position].copy()
+        valid = reportable.copy()
+        for values in fields.values():
+            valid &= np.isfinite(values)
+        for field, values in fields.items():
+            values[~valid] = np.nan
+            fields[field] = values[displayed]
+        ax.fill_between(
+            x,
+            fields["low"],
+            fields["high"],
+            color=style["color"],
+            alpha=0.17,
+            linewidth=0,
+        )
+        ax.plot(
+            x,
+            fields["estimate"],
+            color=style["color"],
+            linewidth=2.25,
+            marker=style["marker"],
+            markersize=5.5,
+            markeredgecolor="white",
+            markeredgewidth=0.6,
+            label=style["label"],
+            zorder=3,
+        )
+
+    record = metrics.head_record(head)
+    ax.set_title(
+        "Distance breakdown of semantic and structural scores - "
+        f"{_head_label(head)}\n"
+        rf"$D_{{\rm rel}} = {record['selectivity']:+.3f};\quad "
+        rf"J = {record['joint_sensitivity']:.3f}$",
+        fontsize=15,
+    )
+    ax.set_xlabel("Shortest-path distance from intervened atom", fontsize=13.75)
+    ax.set_ylabel("Normalised score contribution", fontsize=13.75)
+    ax.set_xticks(x)
+    ax.set_xticklabels(tick_labels)
+    ax.tick_params(axis="both", labelsize=11.25)
+    for tick, is_special in zip(ax.get_xticklabels(), display_special):
+        if is_special:
+            tick.set_color(GOLD)
+            tick.set_fontweight("bold")
+    ax.set_ylim(bottom=0)
+    ax.grid(True)
+    ax.set_axisbelow(True)
+    ax.legend(
+        loc="upper right",
+        fontsize=12.5,
+        handlelength=2.4,
+    )
+    return fig
+
+
 def plot_routing_transport_profiles(
     metrics: CanonicalHeadMetrics,
     transport_payload: Mapping[str, Any],
@@ -1104,6 +1268,7 @@ def plot_routing_transport_profiles(
     heads: Sequence[Head] | None = None,
     title: str = "Distance breakdown of semantic and structural scores",
     dataset_label: str = "Discovery set",
+    max_spd: int = 14,
 ):
     """Compare clean routing with intervention response for selected heads.
 
@@ -1164,36 +1329,11 @@ def plot_routing_transport_profiles(
                     f"{(len(payload_heads), len(labels))}"
                 )
 
-    special_distance = np.asarray(
-        [
-            label.lower().replace(" ", "_")
-            in {"graph_token", "virtual"}
-            for label in labels
-        ]
+    displayed, display_special_distance, display_labels, tick_labels = (
+        _transport_distance_view(labels, max_spd=max_spd)
     )
-    numeric_distance = np.asarray(
-        [int(label) if label.lstrip("-").isdigit() else -1 for label in labels]
-    )
-    displayed = special_distance | (
-        (numeric_distance >= 0) & (numeric_distance <= 14)
-    )
-    display_labels = tuple(
-        label for label, keep in zip(labels, displayed) if keep
-    )
-    display_special_distance = special_distance[displayed]
     x = np.arange(len(display_labels), dtype=np.float64)
     x[display_special_distance] += 0.75
-    tick_labels = []
-    for label, special in zip(display_labels, display_special_distance):
-        if special:
-            tick_labels.append(label.replace("_", "\n").title())
-        elif label.lstrip("-").isdigit():
-            distance = int(label)
-            tick_labels.append(
-                label if distance <= 4 or distance % 2 == 0 else ""
-            )
-        else:
-            tick_labels.append(label.replace("_", "\n"))
 
     fig, axes = plt.subplots(
         2,
@@ -1794,6 +1934,7 @@ __all__ = [
     "plot_attention_grid",
     "plot_av_pca",
     "plot_coordinate_heatmaps",
+    "plot_head_transport_profile",
     "plot_hop_attention_mass",
     "plot_joint_sensitivity_vs_attention_entropy",
     "plot_layer_av_pca_grid",

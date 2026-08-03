@@ -58,6 +58,7 @@ from graph_specialisation_metrics.methodology.grit_figure_plots import (  # noqa
     plot_attention_grid,
     plot_av_pca,
     plot_coordinate_heatmaps,
+    plot_head_transport_profile,
     plot_hop_attention_mass,
     plot_joint_sensitivity_vs_attention_entropy,
     plot_layer_av_pca_grid,
@@ -413,6 +414,71 @@ def test_routing_transport_figure_caps_spd_at_14_and_keeps_special_bin():
             to_rgba("#E6A700"),
         )
         assert all(len(line.get_xdata()) == 16 for line in bottom_axis.lines)
+    finally:
+        plt.close(figure)
+
+
+def test_individual_head_transport_profile_uses_requested_spd_cap():
+    import matplotlib.pyplot as plt
+
+    labels = tuple(str(distance) for distance in range(17)) + ("virtual",)
+    values = np.linspace(0.02, 0.20, len(labels), dtype=np.float64)
+    metrics = SimpleNamespace(
+        distance_axis=labels,
+        head_record=lambda head: {
+            "selectivity": 0.25,
+            "joint_sensitivity": 1.1,
+        },
+    )
+    channel = {
+        "estimate": values.reshape(1, -1),
+        "low": np.clip(values - 0.01, 0.0, None).reshape(1, -1),
+        "high": (values + 0.01).reshape(1, -1),
+        "reportable": np.ones(len(labels), dtype=bool),
+        "replicates": 2000,
+    }
+    payload = {
+        "heads": ((0, 0),),
+        "axis": labels,
+        "n_graphs": 128,
+        "channels": {"semantic": channel, "structural": channel},
+    }
+
+    figure = plot_head_transport_profile(
+        metrics,
+        payload,
+        (0, 0),
+        max_spd=10,
+    )
+    try:
+        axis = figure.axes[0]
+        assert [text.get_text() for text in axis.get_xticklabels()] == [
+            "0",
+            "1",
+            "2",
+            "3",
+            "4",
+            "",
+            "6",
+            "",
+            "8",
+            "",
+            "10",
+            "Virtual",
+        ]
+        assert all(len(line.get_xdata()) == 12 for line in axis.lines)
+        assert [text.get_text() for text in axis.get_legend().get_texts()] == [
+            "Semantic score",
+            "Structural score",
+        ]
+        assert axis.get_title().startswith(
+            "Distance breakdown of semantic and structural scores - L0 H0"
+        )
+        assert axis.get_xlabel() == (
+            "Shortest-path distance from intervened atom"
+        )
+        assert axis.get_ylabel() == "Normalised score contribution"
+        assert axis.get_xticklabels()[-1].get_color() == "#E6A700"
     finally:
         plt.close(figure)
 
@@ -2036,6 +2102,9 @@ def test_colab_notebook_has_valid_python_cells():
     assert "resolve_canonical_task_root(" in source
     assert "search_root=METRICS_ROOT" in source
     assert "HEADS_PER_FAMILY = 5" in source
+    assert "TRANSPORT_PROFILE_MAX_SPD" in source
+    assert "**{task_name: 14 for task_name in ZINC_TASKS}" in source
+    assert "**{task_name: 10 for task_name in QM9_TASKS}" in source
     assert "ATTENTION_GRID_NUM_ROWS = 3" in source
     assert "ATTENTION_CACHE_NUM_ROWS = 3" in source
     assert (
@@ -2113,7 +2182,10 @@ def test_colab_notebook_has_valid_python_cells():
         "plot_av_pca("
     )
     assert runtime_source.index("plot_av_pca(") < runtime_source.index(
-        'f"{role}_head_{head[0]}_{head[1]}_clean_attention_mass_vs_SPD"'
+        "plot_hop_attention_mass("
+    )
+    assert runtime_source.index("plot_hop_attention_mass(") < runtime_source.index(
+        "plot_head_transport_profile("
     )
     assert "pca_figure = plot_av_pca(" in runtime_source
     assert "paired_figure_size = tuple(" in runtime_source
@@ -2135,6 +2207,11 @@ def test_colab_notebook_has_valid_python_cells():
     assert "((1, 2), (1, 7), (4, 7), (6, 0))" in source
     assert "((6, 3), (7, 6), (9, 1), (8, 4))" in source
     assert "compute_selected_head_transport_profiles(" in runtime_source
+    assert "transport_profile_heads = tuple(dict.fromkeys(" in runtime_source
+    assert "(*all_roles.values(), *configured_transport_heads)" in runtime_source
+    assert "plot_head_transport_profile(" in runtime_source
+    assert "semantic_structural_scores_vs_SPD" in runtime_source
+    assert '"transport_profile_max_spd"' in runtime_source
     assert "plot_routing_transport_profiles(" in runtime_source
     assert 'if task_name == "zinc" else ()' in runtime_source
     assert "selected-head-transport-response-by-distance" in runtime_source
