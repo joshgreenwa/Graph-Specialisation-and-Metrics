@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any, Sequence
+from typing import Any
 
 from .audit import audit_check
 
@@ -43,7 +44,7 @@ class CanonicalGritBackend:
             "heads": int(self.gm.H),
             "head_width": int(self.gm.dh),
             "hidden_width": int(self.gm.dim_h),
-            "outputs": int(len(self.sigma)),
+            "outputs": len(self.sigma),
         }
 
     @property
@@ -610,6 +611,139 @@ class CanonicalGritBackend:
         return self._native_forward(
             targets,
             family=family,
+            replacements=donor_transport,
+            ablate=False,
+        )
+
+    def _native_forward_individual_heads(
+        self,
+        data_list: Sequence[Any],
+        assignments: Sequence[tuple[int, int]],
+        *,
+        replacements: Sequence[Any] | None = None,
+        ablate: bool,
+    ):
+        """Patch one independently assigned head in every graph replica.
+
+        GRIT stores routed head outputs in node-major PyG order.  Mapping each
+        routed row through the collated ``batch`` vector therefore supports both
+        the same-geometry intervention replicas and variable-sized molecules in
+        the clean-ablation sweep.  Patched virtual-node models append one routed
+        row per graph after the real-node rows; that layout is handled explicitly
+        even though the dense ZINC/QM9 population runners do not use a VNode.
+        """
+
+        import torch
+        from torch_geometric.data import Batch
+
+        values = list(data_list)
+        assigned = tuple((int(layer), int(head)) for layer, head in assignments)
+        if not values or len(values) != len(assigned):
+            raise ValueError(
+                "individual GRIT targets and head assignments must align and be non-empty"
+            )
+        assignment = torch.as_tensor(assigned, dtype=torch.long, device=self.gm.device)
+        if bool((assignment[:, 0] < 0).any()) or bool(
+            (assignment[:, 0] >= int(self.gm.L)).any()
+        ):
+            raise IndexError("individual-head layer assignment is outside the GRIT model")
+        if bool((assignment[:, 1] < 0).any()) or bool(
+            (assignment[:, 1] >= int(self.gm.H)).any()
+        ):
+            raise IndexError("individual-head index is outside the GRIT model")
+        if not ablate:
+            if replacements is None or len(replacements) != int(self.gm.L):
+                raise ValueError("individual-head patching requires one replacement per layer")
+            for layer, replacement in enumerate(replacements):
+                if replacement.ndim != 3 or tuple(replacement.shape[1:]) != (
+                    int(self.gm.H),
+                    int(self.gm.dh),
+                ):
+                    raise RuntimeError(
+                        f"replacement geometry differs at layer {layer}: "
+                        f"{tuple(replacement.shape)} does not end in "
+                        f"({int(self.gm.H)}, {int(self.gm.dh)})"
+                    )
+
+        batch = Batch.from_data_list([data.clone() for data in values]).to(self.gm.device)
+        real_node_graph = batch.batch.detach().clone().long()
+        replicas = len(values)
+        handles = []
+        for layer in range(int(self.gm.L)):
+            if not bool((assignment[:, 0] == layer).any()):
+                continue
+
+            def make_hook(layer_index: int):
+                def hook(_module, _inputs, output):
+                    routed, edge = output
+                    node_graph = real_node_graph
+                    if int(routed.shape[0]) == int(real_node_graph.numel()) + replicas:
+                        node_graph = torch.cat(
+                            (
+                                real_node_graph,
+                                torch.arange(
+                                    replicas,
+                                    dtype=torch.long,
+                                    device=real_node_graph.device,
+                                ),
+                            )
+                        )
+                    if int(routed.shape[0]) != int(node_graph.numel()):
+                        raise RuntimeError(
+                            f"layer {layer_index} routed {int(routed.shape[0])} rows, but "
+                            f"the graph assignment contains {int(node_graph.numel())}"
+                        )
+                    changed = routed.clone()
+                    active = assignment[node_graph, 0] == int(layer_index)
+                    rows = torch.nonzero(active, as_tuple=False).reshape(-1)
+                    heads = assignment[node_graph[rows], 1]
+                    if ablate:
+                        changed[rows, heads, :] = 0.0
+                    else:
+                        donor = replacements[layer_index].to(
+                            device=changed.device, dtype=changed.dtype
+                        )
+                        if donor.shape != changed.shape:
+                            raise RuntimeError(
+                                f"replacement geometry differs at layer {layer_index}: "
+                                f"{tuple(donor.shape)} vs {tuple(changed.shape)}"
+                            )
+                        changed[rows, heads, :] = donor[rows, heads, :]
+                    return changed, edge
+
+                return hook
+
+            handles.append(
+                self.gm.attn_layers[layer].register_forward_hook(make_hook(layer))
+            )
+        try:
+            with torch.no_grad():
+                prediction, target = self.gm.model(batch)
+        finally:
+            for handle in handles:
+                handle.remove()
+        return prediction, self._z(prediction), target
+
+    def ablate_individual_heads(
+        self,
+        data_list: Sequence[Any],
+        assignments: Sequence[tuple[int, int]],
+    ):
+        return self._native_forward_individual_heads(
+            data_list,
+            assignments,
+            ablate=True,
+        )
+
+    def patch_individual_heads(
+        self,
+        targets: Sequence[Any],
+        donor_transport: Sequence[Any],
+        assignments: Sequence[tuple[int, int]],
+    ):
+        return self._native_forward_individual_heads(
+            targets,
+            assignments,
             replacements=donor_transport,
             ablate=False,
         )

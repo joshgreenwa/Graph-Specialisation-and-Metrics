@@ -124,6 +124,8 @@ def build_population_gate(
     scores: Mapping[str, Any],
     confidence_gate: Mapping[str, Any],
     policy: PopulationPolicy = DEFAULT_POPULATION_POLICY,
+    *,
+    analysis_version: str = POPULATION_CAUSAL_VERSION,
 ) -> dict[str, Any]:
     """Freeze adequately sized directional and neutral populations without outcomes.
 
@@ -299,7 +301,7 @@ def build_population_gate(
     complete_nulls = len(null_pairs) == 2 * pair_count
     eligible_j_scale = float(np.std(J[eligible]))
     return {
-        "version": POPULATION_CAUSAL_VERSION,
+        "version": str(analysis_version),
         "selection_uses_causal_outcomes": False,
         "policy": dataclasses.asdict(policy),
         "activity_floor": activity_floor,
@@ -374,13 +376,15 @@ def _population_cache(
     prepared: Any,
     config: MethodologyConfig,
     gate: Mapping[str, Any],
+    *,
+    analysis_version: str = POPULATION_CAUSAL_VERSION,
 ) -> tuple[Mapping[int, Mapping[str, Any]], CanonicalCache]:
     from .runner import _cache, _stage_plan
 
     plan = _stage_plan(prepared, config, "causal")
     base = _cache(prepared, config, plan)
     manifest = {
-        "version": POPULATION_CAUSAL_VERSION,
+        "version": str(analysis_version),
         "policy": gate["policy"],
         "specialist_pairs": gate["specialist_pairs"],
         "null_pairs": gate["null_pairs"],
@@ -432,11 +436,17 @@ def run_population_events(
     population_gate: Mapping[str, Any],
     *,
     execution: FocusedExecution,
+    analysis_version: str = POPULATION_CAUSAL_VERSION,
 ) -> tuple[list[dict[str, Any]], CanonicalCache, list[dict[str, Any]]]:
     """Reuse complete focused rows and compute only missing population heads."""
 
     execution.validate()
-    plan, cache = _population_cache(prepared, config, population_gate)
+    plan, cache = _population_cache(
+        prepared,
+        config,
+        population_gate,
+        analysis_version=analysis_version,
+    )
     _, legacy_cache = _focused_causal_cache(prepared, config, confidence_gate)
     targets = set(_target_heads(population_gate))
     rows: list[dict[str, Any]] = []
@@ -1040,6 +1050,7 @@ def aggregate_population_tests(
     audits: Sequence[Mapping[str, Any]] = (),
     *,
     progress: Any | None = None,
+    analysis_version: str = POPULATION_CAUSAL_VERSION,
 ) -> dict[str, Any]:
     raw_patch = _event_interval(
         causal_rows,
@@ -1076,7 +1087,7 @@ def aggregate_population_tests(
         progress=progress,
     )
     return {
-        "version": POPULATION_CAUSAL_VERSION,
+        "version": str(analysis_version),
         "sample_sizes": {
             "discovery_molecules": int(config.sizes.discovery_graphs),
             "causal_molecules": int(config.sizes.causal_graphs),
@@ -1115,9 +1126,15 @@ def run_population_analysis(
     population_gate: Mapping[str, Any],
     *,
     execution: FocusedExecution,
+    analysis_version: str = POPULATION_CAUSAL_VERSION,
 ) -> dict[str, Any]:
     execution.validate()
-    _, cache = _population_cache(prepared, config, population_gate)
+    _, cache = _population_cache(
+        prepared,
+        config,
+        population_gate,
+        analysis_version=analysis_version,
+    )
     if config.resume and not config.force:
         cached = cache.load("focused_population", "core_tests", strict=True)
         if (
@@ -1126,7 +1143,7 @@ def run_population_analysis(
             and "correct_pairing_advantage" in cached.get("necessity", {})
             and "causal_preference" in cached
         ):
-            log("[cache] loaded complete Graphormer causal population analysis")
+            log("[cache] loaded complete causal population analysis")
             if prepared.progress is not None:
                 prepared.progress.emit(
                     "cache_hit",
@@ -1145,6 +1162,7 @@ def run_population_analysis(
                 confidence_gate,
                 population_gate,
                 execution=execution,
+                analysis_version=analysis_version,
             )
             raw_patch = _event_interval(
                 causal_rows,
@@ -1208,6 +1226,7 @@ def run_population_analysis(
         confidence_gate,
         population_gate,
         execution=execution,
+        analysis_version=analysis_version,
     )
     _, legacy_cache = _focused_causal_cache(prepared, config, confidence_gate)
     clean_rows = _clean_ablation_graphs(prepared, config, legacy_cache, execution)
@@ -1219,6 +1238,7 @@ def run_population_analysis(
         config,
         audits,
         progress=prepared.progress,
+        analysis_version=analysis_version,
     )
     core["execution"] = dataclasses.asdict(execution)
     cache.save("focused_population", "core_tests", core)

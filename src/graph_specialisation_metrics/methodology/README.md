@@ -78,6 +78,11 @@ It uses three disjoint 128-molecule splits, freezes specialists by joint bootstr
 `J` and `D_rel`, and caches selected-head restoration, injection, necessity, and every-head clean
 ablation below `cache/focused/`. Its `figures` phase is model- and dataset-free.
 
+The population frontend for the registered dense ZINC and QM9 GRIT checkpoints is
+[`../../../experiments/methodology/grit_dense_causal_population_colab.py`](../../../experiments/methodology/grit_dense_causal_population_colab.py).
+It reuses the PCQM4Mv2 discovery-only matching and causal estimands through GRIT's native routed
+head-output hooks, keeps the two task caches separate, and supports checkpoint-free figure reruns.
+
 ## Module boundary
 
 | Module | Responsibility |
@@ -89,6 +94,7 @@ ablation below `cache/focused/`. Its `figures` phase is model- and dataset-free.
 | `backend.py` | Native GRIT `wV`/final-state adapter. |
 | `graphormer.py` | Official checkpoint/dataset loading, native Graphormer transport hooks, graph-token readout adapter. |
 | `graphormer_causal_analysis.py` | Focused PCQM specialist gate, individual-head causal execution, graph shards, aggregation, and figures-only dispatch. |
+| `grit_causal_population.py` | Dense ZINC/QM9 population configuration, per-task orchestration, cache validation, and figures-only dispatch. |
 | `graphormer_causal_plots.py` | Four focused PCQM causal figures and publication exports. |
 | `grit_figure_data.py` | Read-only canonical score/model validation plus contract-cached GRIT attention, selected/all-head routed-output PCA, raw-logit, and displayed-graph coordinate diagnostics. |
 | `grit_figure_plots.py` | PCQM-aligned ZINC/QM9 presentation layer with RDKit attention rendering, layer-PCA grids, and publication exports. |

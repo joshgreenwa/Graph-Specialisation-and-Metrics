@@ -1,4 +1,4 @@
-"""Paper figures for the Graphormer causal head-population analysis."""
+"""Paper figures for the causal head-population analysis."""
 
 from __future__ import annotations
 
@@ -311,7 +311,11 @@ def plot_population_selection(scores: Mapping[str, Any], gate: Mapping[str, Any]
     return fig, ax
 
 
-def plot_J_ablation(clean: Mapping[str, Any]):
+def plot_J_ablation(
+    clean: Mapping[str, Any],
+    *,
+    model_label: str = "PCQM4Mv2",
+):
     """Raw and layer-adjusted views of J versus clean head ablation."""
 
     import matplotlib as mpl
@@ -400,7 +404,7 @@ def plot_J_ablation(clean: Mapping[str, Any]):
         colorbar.set_ticks(np.arange(maximum_layer + 1))
         fig.suptitle(
             "Joint sensitivity predicts clean-input head importance\n"
-            f"PCQM4Mv2 ({clean['head_count']} heads; "
+            f"{model_label} ({clean['head_count']} heads; "
             f"{clean['graph_count']} held-out molecules)",
             fontsize=theme.title_size + 0.8,
         )
@@ -426,7 +430,11 @@ def plot_J_ablation(clean: Mapping[str, Any]):
     return fig, axes
 
 
-def plot_causal_preference(summary: Mapping[str, Any]):
+def plot_causal_preference(
+    summary: Mapping[str, Any],
+    *,
+    model_label: str = "PCQM4Mv2",
+):
     """Discovery D_rel versus semantic-minus-structural causal response."""
 
     import matplotlib as mpl
@@ -537,7 +545,7 @@ def plot_causal_preference(summary: Mapping[str, Any]):
         colorbar.set_ticks(np.arange(maximum_layer + 1))
         fig.suptitle(
             "Relative selectivity predicts causal preference\n"
-            f"PCQM4Mv2 ({summary['head_count']} selected and matched heads; "
+            f"{model_label} ({summary['head_count']} selected and matched heads; "
             f"{summary['graph_count']} held-out molecules)",
             fontsize=theme.title_size + 0.8,
         )
@@ -570,6 +578,7 @@ def render_population_figure_suite(
     *,
     output_dir: str | Path,
     common_metadata: Mapping[str, Any],
+    model_label: str = "PCQM4Mv2",
 ) -> dict[str, list[str]]:
     theme = _theme()
     builder = FigureBuilder(
@@ -631,7 +640,10 @@ def render_population_figure_suite(
         str(path) for path in paths
     ]
 
-    figure, axes = plot_J_ablation(core["clean_ablation"])
+    figure, axes = plot_J_ablation(
+        core["clean_ablation"],
+        model_label=model_label,
+    )
     paths = builder.save(
         "02_J_vs_clean_ablation",
         figure,
@@ -643,7 +655,10 @@ def render_population_figure_suite(
     )
     outputs["J_vs_clean_ablation"] = [str(path) for path in paths]
 
-    figure, axes = plot_causal_preference(core["causal_preference"])
+    figure, axes = plot_causal_preference(
+        core["causal_preference"],
+        model_label=model_label,
+    )
     paths = builder.save(
         "03_Drel_vs_causal_preference",
         figure,

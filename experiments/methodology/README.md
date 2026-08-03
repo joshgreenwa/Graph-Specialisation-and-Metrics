@@ -51,6 +51,18 @@ The fixed estimands, matching diagnostics,
 uncertainty, and interpretation of the adjusted coefficient are documented in
 [`../../docs/graphormer_pcqm4mv2_causal_population.md`](../../docs/graphormer_pcqm4mv2_causal_population.md).
 
+## Dense ZINC and QM9 GRIT causal populations
+
+[`grit_dense_causal_population_colab.py`](grit_dense_causal_population_colab.py) repeats that
+population analysis for the registered dense `zinc` and `qm9_gap_dense` GRIT checkpoints. It uses
+the same disjoint 256/256/256 molecule populations, 2,000-molecule semantic donor pool, 16-pair
+request, 12-pair estimability floor, discovery-only matching, donor-averaged primary estimands,
+continuous causal-preference test, and all-head clean-ablation analysis. Patching and ablation act
+at GRIT's native routed per-head output before head mixing. ZINC and QM9 write separate
+`task/seed_42` caches and figures; a non-estimable gate is saved and reported without relaxing the
+preregistered policy or preventing the other task from running. The complete contract is in
+[`../../docs/grit_dense_causal_population.md`](../../docs/grit_dense_causal_population.md).
+
 After the requested ZINC and QM9 score caches have completed, run
 [`grit_zinc_qm9_figures_colab.ipynb`](grit_zinc_qm9_figures_colab.ipynb) for the focused
 cross-task figure suite. It reads each task's `seed_42/cache/scores/raw.pt` artifact
