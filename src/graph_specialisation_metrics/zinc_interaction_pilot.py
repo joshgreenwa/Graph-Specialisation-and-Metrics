@@ -95,11 +95,8 @@ class PilotConfig:
     num_threads: int = 4
 
     def validate(self) -> None:
-        if tuple(self.tasks) != OUTPUT_MODULATION_TASKS:
-            raise ValueError(
-                "output modulation currently requires the ordered tasks "
-                f"{OUTPUT_MODULATION_TASKS} so interventions remain exactly paired"
-            )
+        if not self.tasks or any(task not in ZINC_PROFILE.tasks for task in self.tasks):
+            raise ValueError(f"tasks must be drawn from {ZINC_PROFILE.tasks}")
         for name in (
             "graphs",
             "sources_per_graph",
@@ -162,8 +159,11 @@ class OutputModulationConfig:
     num_threads: int = 4
 
     def validate(self) -> None:
-        if not self.tasks or any(task not in ZINC_PROFILE.tasks for task in self.tasks):
-            raise ValueError(f"tasks must be drawn from {ZINC_PROFILE.tasks}")
+        if tuple(self.tasks) != OUTPUT_MODULATION_TASKS:
+            raise ValueError(
+                "output modulation currently requires the ordered tasks "
+                f"{OUTPUT_MODULATION_TASKS} so interventions remain exactly paired"
+            )
         for name in (
             "graphs",
             "sources_per_graph",

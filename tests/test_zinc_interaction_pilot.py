@@ -1,6 +1,7 @@
 import numpy as np
 import pytest
 
+import graph_specialisation_metrics.zinc_interaction_pilot as pilot_module
 from graph_specialisation_metrics.zinc_interaction_pilot import (
     OUTPUT_MODULATION_TASKS,
     OutputModulationConfig,
@@ -50,6 +51,44 @@ def test_output_modulation_m_does_not_normalise_a_null_semantic_effect():
     result = output_modulation_metrics(10.0, 10.0, 7.0, 7.0, effect_floor=1.0e-6)
     assert result["modulation_estimable"] is False
     assert np.isnan(result["modulation_m"])
+
+
+def test_output_all_cli_accepts_legacy_and_output_task_defaults(tmp_path, monkeypatch):
+    calls = []
+
+    def fake_measure(config, **_kwargs):
+        calls.append(("measure", tuple(config.tasks)))
+        return {"events": 0}
+
+    def fake_figures(config):
+        calls.append(("figures", tuple(config.tasks)))
+        return {"output_modulation_figures": {}}
+
+    monkeypatch.setattr(pilot_module, "measure_output_modulation", fake_measure)
+    monkeypatch.setattr(pilot_module, "figures_output_modulation", fake_figures)
+    pilot_module.main(
+        [
+            "--phase",
+            "output-all",
+            "--output-dir",
+            str(tmp_path),
+            "--output-graphs",
+            "1",
+            "--output-sources-per-graph",
+            "1",
+            "--output-donor-pairs-per-source",
+            "1",
+            "--output-semantic-donor-graphs",
+            "1",
+            "--bootstrap-replicates",
+            "2",
+            "--skip-dependency-install",
+        ]
+    )
+    assert calls == [
+        ("measure", OUTPUT_MODULATION_TASKS),
+        ("figures", OUTPUT_MODULATION_TASKS),
+    ]
 
 
 def test_output_modulation_aggregates_pairs_then_sources_then_graphs():
