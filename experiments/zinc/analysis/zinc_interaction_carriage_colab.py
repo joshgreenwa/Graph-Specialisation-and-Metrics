@@ -1,12 +1,12 @@
-"""Standalone Colab frontend for ZINC interaction carriage.
+"""Standalone Colab frontend for ZINC interaction carriage and output modulation.
 
-Paste this complete file into one Colab cell.  It loads the seed-0 1-hop,
-2-hop, 1-hop+virtual-node, and dense GRIT checkpoints; caches finite semantic,
-structural, and joint interventions to Drive; and displays the final-state and
-layer-by-distance figures.
+The default lightweight phase compares local-RRWP 1-hop, global-RRWP 1-hop,
+and dense GRIT using exact scalar-output endpoints only.  It caches every clean,
+semantic-only, structural-only, and joint prediction to Drive.  The original
+full carriage phases remain available below.
 
-After a completed measurement run, set ``PHASE = "figures"`` to rebuild all
-tables and figures from cached CSV files without loading the models.
+After a completed lightweight run, set ``PHASE = "output-figures"`` to rebuild
+all M tables and figures from cached CSV files without loading the models.
 """
 
 from __future__ import annotations
@@ -26,7 +26,7 @@ SECRET_NAME = "dissertation_key"
 
 # ----------------------------- experiment controls -----------------------------
 
-PHASE = "all"  # "all", "measure", or "figures"
+PHASE = "output-all"  # "output-all", "output-measure", or "output-figures"
 OUTPUT_DIR = Path(
     "/content/drive/MyDrive/graph_specialisation_metrics/"
     "zinc_semantic_structural_interaction_carriage_v2"
@@ -45,6 +45,15 @@ ANALYSIS_SEED = 260_803
 ACCELERATOR = "cuda:0"
 NUM_THREADS = 4
 DISPLAY_MAX_DISTANCE = 0  # 0 keeps the complete observed distance axis.
+
+# Lightweight exact-output M pilot. These controls do not run carriage or Jacobians.
+OUTPUT_TASKS = "zinc_1hop_localrrwp,zinc_1hop,zinc"
+OUTPUT_GRAPHS = 16
+OUTPUT_SOURCES_PER_GRAPH = 4
+OUTPUT_DONOR_PAIRS_PER_SOURCE = 2
+OUTPUT_SEMANTIC_DONOR_GRAPHS = 64
+OUTPUT_EFFECT_FLOOR = 1.0e-6
+OUTPUT_GRAPHS_PER_BATCH = 4
 
 # Set False only when this runtime already has the canonical GRIT/PyG stack.
 INSTALL_DEPENDENCIES = True
@@ -125,8 +134,16 @@ bootstrap()
 from graph_specialisation_metrics.zinc_interaction_pilot import main
 
 print(
-    "\n[scope] Each source uses matched clean, semantic-only, structural-only, and "
+    "\n[scope] The output-M phase uses predictions only: no Jacobians or layer hooks.\n"
+    "[scope] Each source uses matched clean, semantic-only, structural-only, and "
     "joint donor endpoints.\n"
+    "[scope] M asks how much the semantic output effect changes after the structural "
+    "context is swapped; it is bounded from 0 to 2.\n"
+    "[scope] Graph, source, and donor identities are sampled once under local RRWP "
+    "and replayed exactly for global-RRWP 1-hop and dense models.\n"
+    "[scope] M measures model response, not task necessity. All four signed endpoint "
+    "predictions are cached for alternative summaries without model reruns.\n"
+    "[scope] The legacy carriage phases retain the following interpretation.\n"
     "[scope] Semantic and structural carriage are clean-condition marginals; "
     "interaction carriage is the signed 2x2 contrast before any norm is taken.\n"
     "[scope] Final-state profiles show aggregate functional allocation. Layer profiles "
@@ -177,6 +194,20 @@ CELL_ARGS = [
     str(NUM_THREADS),
     "--display-max-distance",
     str(DISPLAY_MAX_DISTANCE),
+    "--output-tasks",
+    OUTPUT_TASKS,
+    "--output-graphs",
+    str(OUTPUT_GRAPHS),
+    "--output-sources-per-graph",
+    str(OUTPUT_SOURCES_PER_GRAPH),
+    "--output-donor-pairs-per-source",
+    str(OUTPUT_DONOR_PAIRS_PER_SOURCE),
+    "--output-semantic-donor-graphs",
+    str(OUTPUT_SEMANTIC_DONOR_GRAPHS),
+    "--output-effect-floor",
+    str(OUTPUT_EFFECT_FLOOR),
+    "--output-graphs-per-batch",
+    str(OUTPUT_GRAPHS_PER_BATCH),
 ]
 if not INSTALL_DEPENDENCIES:
     CELL_ARGS.append("--skip-dependency-install")
@@ -208,6 +239,30 @@ try:
         ]
         print("\nLayer summary", flush=True)
         display(selected)
+
+    output_cache_value = result.get("output_modulation_cache_dir")
+    if output_cache_value:
+        output_cache = Path(output_cache_value)
+        output_health = output_cache / "model_health.csv"
+        if output_health.is_file():
+            print("\nOutput-M model health", flush=True)
+            display(pd.read_csv(output_health))
+        output_summary = output_cache / "output_modulation_summary.csv"
+        if output_summary.is_file():
+            print("\nOutput-M summary", flush=True)
+            display(pd.read_csv(output_summary))
+        output_contrasts = output_cache / "output_modulation_paired_contrasts.csv"
+        if output_contrasts.is_file():
+            contrasts = pd.read_csv(output_contrasts)
+            print("\nPaired model contrasts", flush=True)
+            display(contrasts[contrasts["metric"] == "modulation_m"])
+
+    output_figure = (
+        result.get("output_modulation_figures", {}).get("output_modulation", {}).get("png")
+    )
+    if output_figure:
+        print(f"\n[display] output_modulation: {output_figure}", flush=True)
+        display(Image(filename=output_figure))
 
     for name in (
         "final_profiles",

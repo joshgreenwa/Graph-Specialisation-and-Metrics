@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any, Sequence
+from typing import Any
 
 from .audit import audit_check
 
@@ -43,7 +44,7 @@ class CanonicalGritBackend:
             "heads": int(self.gm.H),
             "head_width": int(self.gm.dh),
             "hidden_width": int(self.gm.dim_h),
-            "outputs": int(len(self.sigma)),
+            "outputs": len(self.sigma),
         }
 
     @property
@@ -227,6 +228,36 @@ class CanonicalGritBackend:
             )
             replica_offset += replicas
         return outputs
+
+    def predict_groups(self, groups: Sequence[Sequence[Any]]) -> list[Any]:
+        """Evaluate graph groups without installing any attribution hooks.
+
+        This is the inexpensive path for exact output-level factorial contrasts:
+        graphs may have different sizes, and only transformed predictions are
+        returned.  Inputs are cloned because the native GRIT encoders mutate the
+        PyG batch in place.
+        """
+
+        import torch
+        from torch_geometric.data import Batch
+
+        normalised = [list(group) for group in groups]
+        if not normalised or any(not group for group in normalised):
+            raise ValueError("predict_groups requires non-empty graph groups")
+        flat = [data for group in normalised for data in group]
+        batch = Batch.from_data_list([data.clone() for data in flat]).to(self.gm.device)
+        with torch.no_grad():
+            prediction, _target = self.gm.model(batch)
+        z = self._z(prediction).detach()
+        output: list[Any] = []
+        offset = 0
+        for group in normalised:
+            stop = offset + len(group)
+            output.append(z[offset:stop])
+            offset = stop
+        if offset != int(z.shape[0]):
+            raise RuntimeError("prediction groups do not reconstruct the native batch")
+        return output
 
     def clean_jacobians(self, data: Any) -> CleanJacobians:
         import torch

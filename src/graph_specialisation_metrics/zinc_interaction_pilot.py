@@ -1,5 +1,10 @@
 """ZINC semantic, structural, and interaction-carriage analysis.
 
+The lightweight output-modulation phase evaluates the same four endpoints with
+ordinary batched predictions.  Its statistic ``M`` measures how much the signed
+semantic output effect changes under a matched structural swap; it installs no
+Jacobians or layer-attribution hooks and caches all endpoints for reanalysis.
+
 The analysis forms paired semantic and structural donor interventions at the same
 source node and evaluates the four endpoints ``clean``, ``semantic``,
 ``structural``, and ``joint``.  The final-state contrast
@@ -36,7 +41,11 @@ import numpy as np
 
 from .methodology.distance import shortest_path_distances
 from .methodology.events import build_channel_events
-from .methodology.interventions import semantic_donor_swap, structural_donor_swap
+from .methodology.interventions import (
+    semantic_donor_swap,
+    structural_donor_swap,
+    structural_intervention_dose,
+)
 from .methodology.protocol import stable_hash
 from .methodology.runner import prepare_task
 from .methodology.sampling import payload_array
@@ -53,8 +62,19 @@ from .zinc_reach_analysis import (
 )
 
 PILOT_VERSION = "zinc-semantic-structural-interaction-carriage-v2"
+OUTPUT_MODULATION_VERSION = "zinc-output-semantic-structural-modulation-v1"
 TERMS = ("semantic", "structural", "interaction")
 DEFAULT_TASKS = ("zinc_1hop", "zinc_2hop", "zinc_1hop_vnode", "zinc")
+OUTPUT_MODULATION_TASKS = ("zinc_1hop_localrrwp", "zinc_1hop", "zinc")
+OUTPUT_MODULATION_LABELS = {
+    "zinc_1hop_localrrwp": "1-hop + local RRWP",
+    "zinc_1hop": "1-hop + global RRWP",
+    "zinc": "Dense + global RRWP",
+}
+
+
+def _output_model_label(task: str) -> str:
+    return OUTPUT_MODULATION_LABELS.get(task, TASK_LABELS.get(task, task))
 
 
 @dataclass(frozen=True)
@@ -75,8 +95,11 @@ class PilotConfig:
     num_threads: int = 4
 
     def validate(self) -> None:
-        if not self.tasks or any(task not in ZINC_PROFILE.tasks for task in self.tasks):
-            raise ValueError(f"tasks must be drawn from {ZINC_PROFILE.tasks}")
+        if tuple(self.tasks) != OUTPUT_MODULATION_TASKS:
+            raise ValueError(
+                "output modulation currently requires the ordered tasks "
+                f"{OUTPUT_MODULATION_TASKS} so interventions remain exactly paired"
+            )
         for name in (
             "graphs",
             "sources_per_graph",
@@ -120,6 +143,69 @@ class PilotConfig:
         return stable_hash(self.scientific_record)
 
 
+@dataclass(frozen=True)
+class OutputModulationConfig:
+    """Controls for the cheap exact output-level semantic-context test."""
+
+    output_dir: Path
+    tasks: tuple[str, ...] = OUTPUT_MODULATION_TASKS
+    seed: int = 0
+    graphs: int = 16
+    sources_per_graph: int = 4
+    donor_pairs_per_source: int = 2
+    semantic_donor_graphs: int = 64
+    effect_floor: float = 1.0e-6
+    graphs_per_batch: int = 4
+    bootstrap_replicates: int = 2_000
+    analysis_seed: int = 260_803
+    accelerator: str = "cuda:0"
+    num_threads: int = 4
+
+    def validate(self) -> None:
+        if not self.tasks or any(task not in ZINC_PROFILE.tasks for task in self.tasks):
+            raise ValueError(f"tasks must be drawn from {ZINC_PROFILE.tasks}")
+        for name in (
+            "graphs",
+            "sources_per_graph",
+            "donor_pairs_per_source",
+            "semantic_donor_graphs",
+            "graphs_per_batch",
+            "bootstrap_replicates",
+            "num_threads",
+        ):
+            if int(getattr(self, name)) < 1:
+                raise ValueError(f"{name} must be positive")
+        if float(self.effect_floor) <= 0:
+            raise ValueError("effect_floor must be positive")
+
+    @property
+    def scientific_record(self) -> dict[str, Any]:
+        return {
+            "analysis_version": OUTPUT_MODULATION_VERSION,
+            "tasks": list(self.tasks),
+            "seed": int(self.seed),
+            "graphs": int(self.graphs),
+            "sources_per_graph": int(self.sources_per_graph),
+            "donor_pairs_per_source": int(self.donor_pairs_per_source),
+            "semantic_donor_graphs": int(self.semantic_donor_graphs),
+            "analysis_seed": int(self.analysis_seed),
+            "estimand": (
+                "absolute exact output 2x2 contrast divided by the mean absolute "
+                "semantic effect under original and swapped structural context"
+            ),
+            "aggregation": "donor pair -> source -> graph; bootstrap graphs",
+            "interpretation": "structural modulation of semantic output effect, not necessity",
+        }
+
+    @property
+    def fingerprint(self) -> str:
+        return stable_hash(self.scientific_record)
+
+    @property
+    def cache_dir(self) -> Path:
+        return self.output_dir / "output_modulation" / self.fingerprint[:12]
+
+
 def four_state_contrast(
     clean: Any,
     semantic: Any,
@@ -127,6 +213,49 @@ def four_state_contrast(
     joint: Any,
 ) -> Any:
     return clean - semantic - structural + joint
+
+
+def output_modulation_metrics(
+    clean: float,
+    semantic: float,
+    structural: float,
+    joint: float,
+    *,
+    effect_floor: float,
+) -> dict[str, float | bool]:
+    """Return the exact scalar-output semantic modulation statistic ``M``.
+
+    ``semantic_effect_original`` is the semantic donor effect under the clean
+    structural context; ``semantic_effect_swapped_structure`` is the same
+    semantic donor effect after the matched structural swap.  Their difference
+    is exactly the four-state interaction contrast.
+    """
+
+    values = np.asarray([clean, semantic, structural, joint], dtype=np.float64)
+    if not np.isfinite(values).all():
+        raise ValueError("output modulation endpoints must be finite")
+    semantic_original = float(clean - semantic)
+    semantic_swapped = float(structural - joint)
+    structural_original = float(clean - structural)
+    structural_swapped = float(semantic - joint)
+    interaction = float(semantic_original - semantic_swapped)
+    structural_identity = float(structural_original - structural_swapped)
+    if not np.isclose(interaction, structural_identity, atol=1.0e-10, rtol=1.0e-8):
+        raise RuntimeError("the two exact 2x2 interaction identities disagree")
+    semantic_reference = 0.5 * (abs(semantic_original) + abs(semantic_swapped))
+    estimable = bool(semantic_reference > float(effect_floor))
+    modulation = abs(interaction) / semantic_reference if estimable else float("nan")
+    return {
+        "semantic_effect_original": semantic_original,
+        "semantic_effect_swapped_structure": semantic_swapped,
+        "structural_effect_original": structural_original,
+        "structural_effect_swapped_semantic": structural_swapped,
+        "interaction_signed": interaction,
+        "interaction_abs": abs(interaction),
+        "semantic_reference_abs": semantic_reference,
+        "modulation_m": modulation,
+        "modulation_estimable": estimable,
+    }
 
 
 def event_distance_summary(
@@ -744,6 +873,817 @@ def _as_bool(value: Any) -> bool:
     if isinstance(value, bool):
         return value
     return str(value).strip().lower() in {"1", "true", "yes"}
+
+
+def _output_modulation_group(
+    config: OutputModulationConfig,
+    prepared: Any,
+    *,
+    graph_id: int,
+    reference_manifests: Sequence[Mapping[str, Any]] | None = None,
+) -> tuple[list[Any], list[dict[str, Any]]]:
+    """Build one clean/semantic/structural/joint prediction group.
+
+    Donors are sampled once with the local-RRWP model.  The resulting graph and
+    node identities are then replayed for the global-RRWP and dense models, so
+    architecture contrasts never conflate model response with a different draw.
+    """
+
+    base = prepared.runtime.eval_ds[int(graph_id)]
+    if reference_manifests is not None:
+        rows = payload_array(base, prepared.task.content_adapter)
+        endpoints: list[Any] = []
+        manifests: list[dict[str, Any]] = []
+        ordered = sorted(
+            reference_manifests,
+            key=lambda row: (int(row["source"]), int(row["pair"])),
+        )
+        for reference in ordered:
+            source = int(reference["source"])
+            donor_graph_id = int(reference["semantic_donor_graph"])
+            donor_node_id = int(reference["semantic_donor_node"])
+            structural_donor = int(reference["structural_donor_node"])
+            donor_nodes = prepared.donor_pool.by_graph.get(donor_graph_id)
+            if donor_nodes is None or donor_node_id >= len(donor_nodes):
+                raise RuntimeError(
+                    "the paired semantic donor is absent from this model's donor pool"
+                )
+            semantic_donor = donor_nodes[donor_node_id]
+            if int(semantic_donor.node) != donor_node_id:
+                raise RuntimeError("semantic donor-pool node ordering changed across models")
+            semantic_variant = semantic_donor_swap(
+                base,
+                source,
+                semantic_donor.payload,
+                adapter=prepared.task.content_adapter,
+            )
+            structural_variant = structural_donor_swap(
+                base,
+                source,
+                structural_donor,
+                task=prepared.task,
+                duplicate_tolerance=1.0e-7,
+            )
+            joint = _joint_variant(
+                prepared,
+                semantic_variant,
+                structural_variant,
+                source=source,
+                structural_donor=structural_donor,
+            )
+            endpoints.extend((semantic_variant, structural_variant, joint))
+            manifests.append(
+                {
+                    "source": source,
+                    "pair": int(reference["pair"]),
+                    "semantic_donor_graph": donor_graph_id,
+                    "semantic_donor_node": donor_node_id,
+                    "semantic_dose": float(
+                        np.linalg.norm(
+                            np.asarray(semantic_donor.payload, dtype=np.float64)
+                            - np.asarray(rows[source], dtype=np.float64).reshape(-1)
+                        )
+                    ),
+                    "structural_donor_node": structural_donor,
+                    "structural_dose": float(
+                        structural_intervention_dose(
+                            base,
+                            structural_variant,
+                            prepared.task,
+                            tolerance=1.0e-7,
+                        )
+                    ),
+                }
+            )
+        return [base, *endpoints], manifests
+
+    seed_config = ZincReachConfig(analysis_seed=int(config.analysis_seed))
+    source_rng = np.random.default_rng(
+        _seed(seed_config, OUTPUT_MODULATION_VERSION, int(graph_id), "sources")
+    )
+    sources = tuple(
+        int(value)
+        for value in source_rng.choice(
+            int(base.num_nodes),
+            size=min(int(base.num_nodes), int(config.sources_per_graph)),
+            replace=False,
+        )
+    )
+    endpoints: list[Any] = []
+    manifests: list[dict[str, Any]] = []
+    for source in sources:
+        semantic_variants, semantic_events = build_channel_events(
+            base,
+            graph_id=int(graph_id),
+            source=int(source),
+            channel="semantic",
+            stage=OUTPUT_MODULATION_VERSION,
+            donors=int(config.donor_pairs_per_source),
+            rng=np.random.default_rng(
+                _seed(
+                    seed_config,
+                    OUTPUT_MODULATION_VERSION,
+                    int(graph_id),
+                    int(source),
+                    "semantic",
+                )
+            ),
+            task=prepared.task,
+            semantic_pool=prepared.donor_pool,
+            duplicate_tolerance=1.0e-7,
+        )
+        structural_variants, structural_events = build_channel_events(
+            base,
+            graph_id=int(graph_id),
+            source=int(source),
+            channel="structural",
+            stage=OUTPUT_MODULATION_VERSION,
+            donors=int(config.donor_pairs_per_source),
+            rng=np.random.default_rng(
+                _seed(
+                    seed_config,
+                    OUTPUT_MODULATION_VERSION,
+                    int(graph_id),
+                    int(source),
+                    "structural",
+                )
+            ),
+            task=prepared.task,
+            semantic_pool=prepared.donor_pool,
+            duplicate_tolerance=1.0e-7,
+        )
+        if not (
+            len(semantic_variants) == len(structural_variants) == int(config.donor_pairs_per_source)
+        ):
+            raise RuntimeError("paired output-modulation donors have the wrong count")
+        for pair, (sem_graph, sem_event, str_graph, str_event) in enumerate(
+            zip(
+                semantic_variants,
+                semantic_events,
+                structural_variants,
+                structural_events,
+                strict=True,
+            )
+        ):
+            joint = _joint_variant(
+                prepared,
+                sem_graph,
+                str_graph,
+                source=int(source),
+                structural_donor=int(str_event.donor_node),
+            )
+            endpoints.extend((sem_graph, str_graph, joint))
+            manifests.append(
+                {
+                    "source": int(source),
+                    "pair": int(pair),
+                    "semantic_donor_graph": int(sem_event.donor_graph_id),
+                    "semantic_donor_node": int(sem_event.donor_node),
+                    "semantic_dose": float(sem_event.dose),
+                    "structural_donor_node": int(str_event.donor_node),
+                    "structural_dose": float(str_event.dose),
+                }
+            )
+    return [base, *endpoints], manifests
+
+
+def _cached_output_manifests(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    task: str,
+) -> dict[int, list[dict[str, Any]]]:
+    output: dict[int, list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        if str(row["task"]) != task:
+            continue
+        output[int(row["graph"])].append(
+            {
+                "source": int(row["source"]),
+                "pair": int(row["pair"]),
+                "semantic_donor_graph": int(row["semantic_donor_graph"]),
+                "semantic_donor_node": int(row["semantic_donor_node"]),
+                "structural_donor_node": int(row["structural_donor_node"]),
+            }
+        )
+    for graph_rows in output.values():
+        graph_rows.sort(key=lambda row: (int(row["source"]), int(row["pair"])))
+    return dict(output)
+
+
+def _prediction_only_groups(prepared: Any, groups: Sequence[Sequence[Any]]) -> list[Any]:
+    predict_groups = getattr(prepared.backend, "predict_groups", None)
+    if callable(predict_groups):
+        return list(predict_groups(groups))
+    captures = prepared.backend.capture_groups(groups)
+    return [capture.z for capture in captures]
+
+
+def _output_modulation_rows(
+    config: OutputModulationConfig,
+    *,
+    task: str,
+    graph_id: int,
+    manifests: Sequence[Mapping[str, Any]],
+    predictions: Any,
+) -> list[dict[str, Any]]:
+    import torch
+
+    values = predictions.reshape(int(predictions.shape[0]), -1)
+    if int(values.shape[1]) != 1:
+        raise ValueError("ZINC output modulation requires a scalar transformed output")
+    expected = 1 + 3 * len(manifests)
+    if int(values.shape[0]) != expected:
+        raise RuntimeError(
+            f"output modulation received {int(values.shape[0])} endpoints; expected {expected}"
+        )
+    clean = float(values[0, 0].detach().cpu())
+    endpoints = values[1:, 0].reshape(len(manifests), 3)
+    output: list[dict[str, Any]] = []
+    for index, manifest in enumerate(manifests):
+        semantic = float(endpoints[index, 0].detach().cpu())
+        structural = float(endpoints[index, 1].detach().cpu())
+        joint = float(endpoints[index, 2].detach().cpu())
+        metrics = output_modulation_metrics(
+            clean,
+            semantic,
+            structural,
+            joint,
+            effect_floor=float(config.effect_floor),
+        )
+        output.append(
+            {
+                "analysis_version": OUTPUT_MODULATION_VERSION,
+                "fingerprint": config.fingerprint,
+                "task": task,
+                "model_label": _output_model_label(task),
+                "seed": int(config.seed),
+                "graph": int(graph_id),
+                **manifest,
+                "output_clean": clean,
+                "output_semantic": semantic,
+                "output_structural": structural,
+                "output_joint": joint,
+                **metrics,
+            }
+        )
+    if not bool(torch.isfinite(values).all()):
+        raise RuntimeError("non-finite output modulation predictions")
+    return output
+
+
+def _derive_output_modulation_rows(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    effect_floor: float,
+) -> list[dict[str, Any]]:
+    """Recompute every derived field from cached signed endpoints."""
+
+    output: list[dict[str, Any]] = []
+    for row in rows:
+        derived = output_modulation_metrics(
+            _as_float(row.get("output_clean")),
+            _as_float(row.get("output_semantic")),
+            _as_float(row.get("output_structural")),
+            _as_float(row.get("output_joint")),
+            effect_floor=float(effect_floor),
+        )
+        output.append({**dict(row), **derived})
+    return output
+
+
+def measure_output_modulation(
+    config: OutputModulationConfig,
+    *,
+    checkpoints: Mapping[str, str] | None = None,
+    install_dependencies: bool = True,
+) -> dict[str, Any]:
+    """Measure exact output modulation with resumable prediction-only batches."""
+
+    config.validate()
+    config.cache_dir.mkdir(parents=True, exist_ok=True)
+    if install_dependencies:
+        from .carriage import env
+
+        env.install_dependencies(pyg_version="2.2.0")
+        env.apply_compat_patches()
+    import torch
+
+    torch.set_num_threads(int(config.num_threads))
+    resolved = checkpoint_registry(
+        config.tasks,
+        seed=int(config.seed),
+        overrides=checkpoints,
+    )
+    reach_config = ZincReachConfig(
+        tasks=config.tasks,
+        channels=("semantic", "structural"),
+        seed=int(config.seed),
+        graphs=int(config.graphs),
+        sources_per_graph=int(config.sources_per_graph),
+        donors_per_source=int(config.donor_pairs_per_source),
+        semantic_donor_graphs=int(config.semantic_donor_graphs),
+        analysis_seed=int(config.analysis_seed),
+        accelerator=str(config.accelerator),
+        num_threads=int(config.num_threads),
+        compute_output_carriage=False,
+        compute_beneficial=False,
+        compute_survival=False,
+        compute_scale_analysis=False,
+    )
+    methodology = _methodology_config(
+        reach_config,
+        output_dir=config.cache_dir,
+        checkpoints=resolved,
+    )
+    events_path = config.cache_dir / "output_modulation_events.csv"
+    completed_path = config.cache_dir / "completed_graphs.csv"
+    health_path = config.cache_dir / "model_health.csv"
+    cached_events = _read_csv(events_path) if events_path.is_file() else []
+    cached_completed = _read_csv(completed_path) if completed_path.is_file() else []
+    for row in [*cached_events, *cached_completed]:
+        if row.get("fingerprint") != config.fingerprint:
+            raise RuntimeError("cached output-modulation fingerprint does not match config")
+    event_by_key: dict[tuple[str, int, int, int], dict[str, Any]] = {
+        (
+            str(row["task"]),
+            int(row["graph"]),
+            int(row["source"]),
+            int(row["pair"]),
+        ): dict(row)
+        for row in cached_events
+    }
+    completed: set[tuple[str, int]] = {
+        (str(row["task"]), int(row["graph"])) for row in cached_completed
+    }
+    health_by_task: dict[str, dict[str, Any]] = {
+        str(row["task"]): dict(row)
+        for row in (_read_csv(health_path) if health_path.is_file() else [])
+    }
+    reference_task = config.tasks[0]
+    reference_manifests = _cached_output_manifests(
+        list(event_by_key.values()),
+        task=reference_task,
+    )
+    reference_graph_ids: tuple[int, ...] | None = None
+    for task in config.tasks:
+        if sum(task_name == task for task_name, _graph in completed) >= int(config.graphs):
+            print(f"[output-modulation] {_output_model_label(task)} already cached", flush=True)
+            continue
+        prepared = prepare_task(methodology, task, int(config.seed), force_fresh_grit=False)
+        graph_ids = tuple(int(value) for value in prepared.splits.discovery)[: int(config.graphs)]
+        if reference_graph_ids is None:
+            reference_graph_ids = graph_ids
+        elif graph_ids != reference_graph_ids:
+            raise RuntimeError("output-modulation tasks do not share discovery graph IDs")
+        health_by_task[task] = {
+            "fingerprint": config.fingerprint,
+            "task": task,
+            "model_label": _output_model_label(task),
+            "seed": int(config.seed),
+            "checkpoint": str(prepared.checkpoint),
+            "checkpoint_sha256": str(prepared.checkpoint_sha),
+            "test_mae": prepared.runtime.test_metric,
+            "validation_mae": prepared.runtime.val_metric,
+        }
+        pending = [graph for graph in graph_ids if (task, int(graph)) not in completed]
+        for start in range(0, len(pending), int(config.graphs_per_batch)):
+            graph_batch = pending[start : start + int(config.graphs_per_batch)]
+            groups: list[list[Any]] = []
+            manifests_by_graph: list[list[dict[str, Any]]] = []
+            for graph_id in graph_batch:
+                if task != reference_task and int(graph_id) not in reference_manifests:
+                    raise RuntimeError(
+                        f"paired local-RRWP donor manifest is missing for graph {int(graph_id)}"
+                    )
+                group, manifests = _output_modulation_group(
+                    config,
+                    prepared,
+                    graph_id=int(graph_id),
+                    reference_manifests=(
+                        None if task == reference_task else reference_manifests.get(int(graph_id))
+                    ),
+                )
+                groups.append(group)
+                manifests_by_graph.append(manifests)
+            predictions = _prediction_only_groups(prepared, groups)
+            if len(predictions) != len(graph_batch):
+                raise RuntimeError("prediction-only batch changed the number of graphs")
+            for graph_id, manifests, graph_predictions in zip(
+                graph_batch,
+                manifests_by_graph,
+                predictions,
+                strict=True,
+            ):
+                for row in _output_modulation_rows(
+                    config,
+                    task=task,
+                    graph_id=int(graph_id),
+                    manifests=manifests,
+                    predictions=graph_predictions,
+                ):
+                    key = (
+                        str(row["task"]),
+                        int(row["graph"]),
+                        int(row["source"]),
+                        int(row["pair"]),
+                    )
+                    event_by_key[key] = row
+                completed.add((task, int(graph_id)))
+            if task == reference_task:
+                reference_manifests = _cached_output_manifests(
+                    list(event_by_key.values()),
+                    task=reference_task,
+                )
+            _write_csv(events_path, list(event_by_key.values()))
+            _write_csv(
+                completed_path,
+                [
+                    {"fingerprint": config.fingerprint, "task": task_name, "graph": graph}
+                    for task_name, graph in sorted(completed)
+                ],
+            )
+            _write_csv(health_path, list(health_by_task.values()))
+            print(
+                f"[output-modulation] {_output_model_label(task)} "
+                f"graphs {min(start + len(graph_batch), len(pending))}/{len(pending)}",
+                flush=True,
+            )
+    return {
+        "cache_dir": str(config.cache_dir),
+        "events": len(event_by_key),
+        "completed_graphs": len(completed),
+        "models": len(health_by_task),
+    }
+
+
+def audit_output_modulation_pairing(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    tasks: Sequence[str],
+) -> dict[str, int]:
+    """Require matched graphs, sources, and donor identities across models."""
+
+    grouped: dict[tuple[int, int, int], dict[str, tuple[int, int, int]]] = defaultdict(dict)
+    for row in rows:
+        key = (int(row["graph"]), int(row["source"]), int(row["pair"]))
+        grouped[key][str(row["task"])] = (
+            int(row["semantic_donor_graph"]),
+            int(row["semantic_donor_node"]),
+            int(row["structural_donor_node"]),
+        )
+    complete = 0
+    for key, by_task in grouped.items():
+        missing = [task for task in tasks if task not in by_task]
+        if missing:
+            raise RuntimeError(f"output-modulation event {key} is missing tasks {missing}")
+        identities = {by_task[task] for task in tasks}
+        if len(identities) != 1:
+            raise RuntimeError(
+                f"output-modulation donor identities differ across tasks for event {key}"
+            )
+        complete += 1
+    return {"paired_events": complete, "models": len(tasks)}
+
+
+def output_modulation_graph_metrics(
+    rows: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Aggregate exact output metrics pair -> source -> graph."""
+
+    metrics = (
+        "modulation_m",
+        "modulation_estimable",
+        "interaction_abs",
+        "semantic_reference_abs",
+        "semantic_effect_original_abs",
+        "semantic_effect_swapped_structure_abs",
+    )
+    source_values: dict[tuple[str, int, int, str], list[float]] = defaultdict(list)
+    for row in rows:
+        values = {
+            "modulation_m": _as_float(row.get("modulation_m")),
+            "modulation_estimable": float(_as_bool(row.get("modulation_estimable"))),
+            "interaction_abs": _as_float(row.get("interaction_abs")),
+            "semantic_reference_abs": _as_float(row.get("semantic_reference_abs")),
+            "semantic_effect_original_abs": abs(_as_float(row.get("semantic_effect_original"))),
+            "semantic_effect_swapped_structure_abs": abs(
+                _as_float(row.get("semantic_effect_swapped_structure"))
+            ),
+        }
+        for metric in metrics:
+            value = values[metric]
+            if np.isfinite(value):
+                source_values[
+                    (
+                        str(row["task"]),
+                        int(row["graph"]),
+                        int(row["source"]),
+                        metric,
+                    )
+                ].append(float(value))
+    graph_values: dict[tuple[str, int, str], list[float]] = defaultdict(list)
+    for (task, graph, _source, metric), values in source_values.items():
+        graph_values[(task, graph, metric)].append(float(np.mean(values)))
+    return [
+        {
+            "task": task,
+            "model_label": _output_model_label(task),
+            "graph": int(graph),
+            "metric": metric,
+            "value": float(np.mean(values)),
+            "eligible_sources": len(values),
+        }
+        for (task, graph, metric), values in sorted(graph_values.items())
+    ]
+
+
+def summarise_output_modulation(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    bootstrap_replicates: int,
+    bootstrap_seed: int,
+) -> list[dict[str, Any]]:
+    grouped: dict[tuple[str, str], list[float]] = defaultdict(list)
+    for row in rows:
+        grouped[(str(row["task"]), str(row["metric"]))].append(float(row["value"]))
+    output: list[dict[str, Any]] = []
+    for index, ((task, metric), values) in enumerate(sorted(grouped.items())):
+        mean, low, high = _bootstrap_interval(
+            values,
+            replicates=int(bootstrap_replicates),
+            seed=int(bootstrap_seed) + index,
+        )
+        output.append(
+            {
+                "task": task,
+                "model_label": _output_model_label(task),
+                "metric": metric,
+                "mean": mean,
+                "low": low,
+                "high": high,
+                "graphs": len(values),
+            }
+        )
+    return output
+
+
+def paired_output_modulation_contrasts(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    tasks: Sequence[str],
+    bootstrap_replicates: int,
+    bootstrap_seed: int,
+) -> list[dict[str, Any]]:
+    lookup = {
+        (str(row["task"]), int(row["graph"]), str(row["metric"])): float(row["value"])
+        for row in rows
+    }
+    output: list[dict[str, Any]] = []
+    comparisons = [
+        (tasks[left], tasks[right])
+        for left in range(len(tasks))
+        for right in range(left + 1, len(tasks))
+    ]
+    metrics = sorted({str(row["metric"]) for row in rows})
+    for index, (reference, target) in enumerate(comparisons):
+        for metric_index, metric in enumerate(metrics):
+            graphs = sorted(
+                {
+                    int(row["graph"])
+                    for row in rows
+                    if row["task"] == reference
+                    and (target, int(row["graph"]), metric) in lookup
+                    and (reference, int(row["graph"]), metric) in lookup
+                }
+            )
+            differences = [
+                lookup[(target, graph, metric)] - lookup[(reference, graph, metric)]
+                for graph in graphs
+            ]
+            if not differences:
+                continue
+            mean, low, high = _bootstrap_interval(
+                differences,
+                replicates=int(bootstrap_replicates),
+                seed=int(bootstrap_seed) + 100 * index + metric_index,
+            )
+            output.append(
+                {
+                    "reference_task": reference,
+                    "reference_label": _output_model_label(reference),
+                    "target_task": target,
+                    "target_label": _output_model_label(target),
+                    "metric": metric,
+                    "mean_difference": mean,
+                    "low": low,
+                    "high": high,
+                    "graphs": len(differences),
+                }
+            )
+    return output
+
+
+def plot_output_modulation(
+    graph_rows: Sequence[Mapping[str, Any]],
+    summary_rows: Sequence[Mapping[str, Any]],
+    *,
+    tasks: Sequence[str],
+    figures_dir: Path,
+) -> dict[str, str]:
+    import matplotlib.pyplot as plt
+
+    _figure_theme()
+    colours = {
+        "zinc_1hop_localrrwp": "#E69F00",
+        "zinc_1hop": "#0072B2",
+        "zinc": "#D55E00",
+    }
+    positions = {task: index for index, task in enumerate(tasks)}
+    summary_lookup = {(str(row["task"]), str(row["metric"])): row for row in summary_rows}
+    fig, axes = plt.subplots(1, 3, figsize=(11.0, 3.45))
+
+    modulation = {
+        (str(row["task"]), int(row["graph"])): float(row["value"])
+        for row in graph_rows
+        if row["metric"] == "modulation_m"
+    }
+    common_graphs = sorted(
+        set.intersection(
+            *({graph for task_name, graph in modulation if task_name == task} for task in tasks)
+        )
+    )
+    for graph in common_graphs:
+        axes[0].plot(
+            range(len(tasks)),
+            [modulation[(task, graph)] for task in tasks],
+            color="#A8A8A8",
+            alpha=0.28,
+            linewidth=0.7,
+            zorder=1,
+        )
+    plotted_modulation = False
+    for task in tasks:
+        x = positions[task]
+        values = [
+            float(row["value"])
+            for row in graph_rows
+            if row["task"] == task and row["metric"] == "modulation_m"
+        ]
+        if values:
+            jitter = np.linspace(-0.06, 0.06, len(values))
+            axes[0].scatter(
+                x + jitter,
+                values,
+                s=12,
+                color=colours.get(task, "#555555"),
+                alpha=0.35,
+                linewidth=0,
+                zorder=2,
+            )
+        summary = summary_lookup.get((task, "modulation_m"))
+        if summary is None:
+            continue
+        plotted_modulation = True
+        axes[0].errorbar(
+            x,
+            float(summary["mean"]),
+            yerr=[
+                [float(summary["mean"]) - float(summary["low"])],
+                [float(summary["high"]) - float(summary["mean"])],
+            ],
+            fmt="o",
+            ms=6,
+            capsize=3,
+            color=colours.get(task, "#555555"),
+            zorder=3,
+        )
+    if not plotted_modulation:
+        axes[0].text(
+            0.5,
+            0.5,
+            "No semantic effects above the floor",
+            ha="center",
+            va="center",
+            transform=axes[0].transAxes,
+        )
+    axes[0].set_title("Structural modulation of semantic effect")
+    axes[0].set_ylabel(r"$M=|s_0-s_1|/[0.5(|s_0|+|s_1|)]$")
+    axes[0].set_ylim(0, 2.05)
+
+    component_metrics = (
+        ("semantic_reference_abs", "Mean semantic effect"),
+        ("interaction_abs", "Interaction difference"),
+    )
+    offsets = (-0.10, 0.10)
+    for task in tasks:
+        for offset, (metric, label) in zip(offsets, component_metrics, strict=True):
+            summary = summary_lookup[(task, metric)]
+            axes[1].errorbar(
+                positions[task] + offset,
+                float(summary["mean"]),
+                yerr=[
+                    [float(summary["mean"]) - float(summary["low"])],
+                    [float(summary["high"]) - float(summary["mean"])],
+                ],
+                fmt="o" if metric == "semantic_reference_abs" else "s",
+                ms=5.5,
+                capsize=3,
+                color=colours.get(task, "#555555"),
+                fillstyle="full" if metric == "semantic_reference_abs" else "none",
+                label=label if task == tasks[0] else None,
+            )
+    axes[1].set_title("Absolute transformed-output effects")
+    axes[1].set_ylabel("Mean absolute effect")
+    axes[1].set_ylim(bottom=0)
+    axes[1].legend(frameon=False, loc="best")
+
+    for task in tasks:
+        summary = summary_lookup[(task, "modulation_estimable")]
+        axes[2].errorbar(
+            positions[task],
+            float(summary["mean"]),
+            yerr=[
+                [float(summary["mean"]) - float(summary["low"])],
+                [float(summary["high"]) - float(summary["mean"])],
+            ],
+            fmt="o",
+            ms=6,
+            capsize=3,
+            color=colours.get(task, "#555555"),
+        )
+    axes[2].set_title("Estimable paired interventions")
+    axes[2].set_ylabel("Fraction")
+    axes[2].set_ylim(0, 1.02)
+
+    labels = [_output_model_label(task) for task in tasks]
+    for axis in axes:
+        axis.set_xticks(range(len(tasks)), labels, rotation=18, ha="right")
+    fig.suptitle("Does structural context change the semantic output effect?", y=1.02, fontsize=12)
+    fig.tight_layout()
+    return _save_figure(fig, figures_dir, "zinc_output_semantic_modulation")
+
+
+def figures_output_modulation(config: OutputModulationConfig) -> dict[str, Any]:
+    """Build the exact-output M analysis entirely from its cached endpoints."""
+
+    events_path = config.cache_dir / "output_modulation_events.csv"
+    if not events_path.is_file():
+        raise FileNotFoundError(
+            "cached output-modulation endpoints are missing; run phase='output-measure' first"
+        )
+    events = _read_csv(events_path)
+    if any(row.get("fingerprint") != config.fingerprint for row in events):
+        raise RuntimeError("cached output-modulation fingerprint does not match config")
+    if not events:
+        raise RuntimeError("cached output-modulation endpoints are empty")
+    events = _derive_output_modulation_rows(events, effect_floor=float(config.effect_floor))
+    pairing = audit_output_modulation_pairing(events, tasks=config.tasks)
+    graph_rows = output_modulation_graph_metrics(events)
+    summary_rows = summarise_output_modulation(
+        graph_rows,
+        bootstrap_replicates=int(config.bootstrap_replicates),
+        bootstrap_seed=int(config.analysis_seed) + 1_000,
+    )
+    contrasts = paired_output_modulation_contrasts(
+        graph_rows,
+        tasks=config.tasks,
+        bootstrap_replicates=int(config.bootstrap_replicates),
+        bootstrap_seed=int(config.analysis_seed) + 2_000,
+    )
+    _write_csv(config.cache_dir / "output_modulation_graph_metrics.csv", graph_rows)
+    _write_csv(config.cache_dir / "output_modulation_derived_events.csv", events)
+    _write_csv(config.cache_dir / "output_modulation_summary.csv", summary_rows)
+    _write_csv(config.cache_dir / "output_modulation_paired_contrasts.csv", contrasts)
+    paths = {
+        "output_modulation": plot_output_modulation(
+            graph_rows,
+            summary_rows,
+            tasks=config.tasks,
+            figures_dir=config.cache_dir / "figures",
+        )
+    }
+    _write_json(
+        config.cache_dir / "figure_manifest.json",
+        {
+            "analysis_version": OUTPUT_MODULATION_VERSION,
+            "fingerprint": config.fingerprint,
+            "pairing_audit": pairing,
+            "figures": paths,
+            "interpretation": (
+                "M is the exact transformed-output semantic effect difference between "
+                "original and swapped structural contexts. Endpoints are paired across "
+                "models; donor pair -> source -> graph aggregation precedes graph bootstrap. "
+                "M measures model response, not task necessity."
+            ),
+        },
+    )
+    return {
+        "output_modulation_figures": paths,
+        "output_modulation_cache_dir": str(config.cache_dir),
+        "output_modulation_pairing": pairing,
+        "output_modulation_summary": summary_rows,
+        "output_modulation_contrasts": contrasts,
+    }
 
 
 def graph_distance_profiles(
@@ -1371,7 +2311,18 @@ def _parse_mapping(values: Sequence[str]) -> dict[str, str]:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--phase", choices=("all", "measure", "figures"), default="all")
+    parser.add_argument(
+        "--phase",
+        choices=(
+            "all",
+            "measure",
+            "figures",
+            "output-all",
+            "output-measure",
+            "output-figures",
+        ),
+        default="all",
+    )
     parser.add_argument(
         "--output-dir",
         type=Path,
@@ -1396,6 +2347,13 @@ def build_parser() -> argparse.ArgumentParser:
         default=0,
         help="Plot numeric distances through this value; 0 retains all distances.",
     )
+    parser.add_argument("--output-tasks", default=",".join(OUTPUT_MODULATION_TASKS))
+    parser.add_argument("--output-graphs", type=int, default=16)
+    parser.add_argument("--output-sources-per-graph", type=int, default=4)
+    parser.add_argument("--output-donor-pairs-per-source", type=int, default=2)
+    parser.add_argument("--output-semantic-donor-graphs", type=int, default=64)
+    parser.add_argument("--output-effect-floor", type=float, default=1.0e-6)
+    parser.add_argument("--output-graphs-per-batch", type=int, default=4)
     parser.add_argument("--checkpoint", action="append", default=[])
     parser.add_argument("--skip-dependency-install", action="store_true")
     return parser
@@ -1420,6 +2378,22 @@ def main(argv: Sequence[str] | None = None) -> dict[str, Any]:
         num_threads=int(args.num_threads),
     )
     config.validate()
+    output_config = OutputModulationConfig(
+        output_dir=args.output_dir,
+        tasks=tuple(value.strip() for value in args.output_tasks.split(",") if value.strip()),
+        seed=int(args.seed),
+        graphs=int(args.output_graphs),
+        sources_per_graph=int(args.output_sources_per_graph),
+        donor_pairs_per_source=int(args.output_donor_pairs_per_source),
+        semantic_donor_graphs=int(args.output_semantic_donor_graphs),
+        effect_floor=float(args.output_effect_floor),
+        graphs_per_batch=int(args.output_graphs_per_batch),
+        bootstrap_replicates=int(args.bootstrap_replicates),
+        analysis_seed=int(args.analysis_seed),
+        accelerator=str(args.accelerator),
+        num_threads=int(args.num_threads),
+    )
+    output_config.validate()
     config.output_dir.mkdir(parents=True, exist_ok=True)
     _write_json(
         config.output_dir / "analysis_config.json",
@@ -1439,7 +2413,35 @@ def main(argv: Sequence[str] | None = None) -> dict[str, Any]:
             },
         },
     )
-    result: dict[str, Any] = {"config": config, "output_dir": str(config.output_dir)}
+    output_config.cache_dir.mkdir(parents=True, exist_ok=True)
+    _write_json(
+        output_config.cache_dir / "output_modulation_config.json",
+        {
+            **asdict(output_config),
+            "fingerprint": output_config.fingerprint,
+            "repository_commit": _repository_commit(),
+            "cached_endpoints": (
+                "clean, semantic-only, structural-only, and joint transformed predictions"
+            ),
+            "pre_registered_decision": {
+                "primary": (
+                    "M = absolute semantic-effect change between original and swapped "
+                    "structural contexts, divided by their mean absolute magnitude"
+                ),
+                "pairing": (
+                    "sample graph/source/donor identities once under local RRWP and replay "
+                    "the exact identities under global-RRWP 1-hop and dense models"
+                ),
+                "aggregation": "donor pair -> source -> graph; bootstrap graphs",
+                "interpretation": "model response, not task necessity",
+            },
+        },
+    )
+    result: dict[str, Any] = {
+        "config": config,
+        "output_dir": str(config.output_dir),
+        "output_modulation_cache_dir": str(output_config.cache_dir),
+    }
     if args.phase in {"all", "measure"}:
         result["measurement"] = measure(
             config,
@@ -1455,12 +2457,22 @@ def main(argv: Sequence[str] | None = None) -> dict[str, Any]:
                 ),
             )
         )
+    if args.phase in {"output-all", "output-measure"}:
+        result["output_modulation_measurement"] = measure_output_modulation(
+            output_config,
+            checkpoints=_parse_mapping(args.checkpoint),
+            install_dependencies=not bool(args.skip_dependency_install),
+        )
+    if args.phase in {"output-all", "output-figures"}:
+        result.update(figures_output_modulation(output_config))
     print(
         json.dumps(
             {
                 "output_dir": str(config.output_dir),
                 "measurement": result.get("measurement"),
                 "figures": sorted(result.get("figures", {})),
+                "output_modulation_measurement": result.get("output_modulation_measurement"),
+                "output_modulation_cache_dir": result.get("output_modulation_cache_dir"),
             },
             indent=2,
             sort_keys=True,
