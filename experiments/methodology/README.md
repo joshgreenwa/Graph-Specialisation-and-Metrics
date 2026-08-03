@@ -56,11 +56,11 @@ fields. Routed-output PCAs use the same fixed chemical-group labels and colour i
 PCQM suite (plus an explicit-hydrogen category for QM9). Attention grids, individual routed-output
 PCAs, and selected-head distance score breakdowns mirror the current PCQM publication layout,
 typography, simplified titles, axis wording, and legend placement; task identity remains explicit
-in the distance-figure subtitle, export names, and provenance. Like the PCQM notebook, each
-attention figure uses four configurable molecule rows. ZINC and QM9 each expose independent
-ordered graph-index lists for semantic, structural, and generalist attention figures. The notebook
-caches the stable five-row union once, then slices the configured four-row family view for every
-head in that family; unchanged defaults therefore continue to hit the existing shared cache.
+in the distance-figure subtitle, export names, and provenance. Each attention figure uses three
+configurable molecule rows. ZINC and QM9 each expose independent ordered graph-index lists for
+semantic, structural, and generalist attention figures. The notebook caches the union of each
+family's three selected rows once, then reuses the configured family view for every head in that
+family.
 Attention colour is stable by head family:
 semantic specialists use orange, structural specialists use blue, and high-$J$ generalists use
 purple. Each figure applies its family colour map consistently to the attention-weighted molecule,

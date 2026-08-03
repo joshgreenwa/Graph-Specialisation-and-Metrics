@@ -1551,6 +1551,10 @@ def test_colab_notebook_has_valid_python_cells():
         configuration,
     )
     attention_indices = configuration["ATTENTION_GRID_GRAPH_INDICES"]
+    expected_unions = {
+        "zinc": [100, 200, 750, 80, 120, 160, 0, 220],
+        "qm9_gap_dense": [0, 5, 80, 100, 200],
+    }
     for task_name in ("zinc", "qm9_gap_dense"):
         assert tuple(attention_indices[task_name]) == (
             "semantic",
@@ -1564,7 +1568,7 @@ def test_colab_notebook_has_valid_python_cells():
                 for graph_index in attention_indices[task_name][family]
             )
         )
-        assert default_union == [0, 5, 80, 100, 200]
+        assert default_union == expected_unions[task_name]
     assert "zinc" in "".join(payload["cells"][1]["source"])
     assert "qm9_gap_dense" in "".join(payload["cells"][1]["source"])
     source = "\n".join(
@@ -1576,8 +1580,23 @@ def test_colab_notebook_has_valid_python_cells():
     assert '"zinc": ("zinc",)' in source
     assert '"qm9": ("qm9_gap_dense",)' in source
     assert "HEADS_PER_FAMILY = 5" in source
-    assert "ATTENTION_GRID_NUM_ROWS = 4" in source
-    assert "ATTENTION_CACHE_NUM_ROWS = 5" in source
+    assert "ATTENTION_GRID_NUM_ROWS = 3" in source
+    assert "ATTENTION_CACHE_NUM_ROWS = 3" in source
+    assert (
+        '"semantic": [100,200,750],'
+        '#[100,200,250,350,450,550,650,750], #100,200,750'
+        in source
+    )
+    assert (
+        '"structural": [80, 120, 160], '
+        '#[0, 5, 80, 120, 160, 220, 260, 340], #80, 120, 160'
+        in source
+    )
+    assert (
+        '"generalist": [0, 80, 220], '
+        '#[0, 5, 80, 120, 160, 220, 260, 340], #0, 80, 220,'
+        in source
+    )
     assert 'ATTENTION_FAMILIES = ("semantic", "structural", "generalist")' in source
     assert "def attention_role_family(role):" in source
     assert "Edit semantic, structural, and generalist rows independently" in source
