@@ -11,7 +11,6 @@ import json
 import matplotlib.pyplot as plt
 from matplotlib.colors import Normalize, TwoSlopeNorm
 from matplotlib.lines import Line2D
-from matplotlib.patches import Patch
 from matplotlib.ticker import MaxNLocator
 import numpy as np
 
@@ -965,8 +964,6 @@ def plot_hop_attention_mass(
     *,
     title: str | None = None,
     figsize: Sequence[float] = DEFAULT_INDIVIDUAL_PCA_FIGSIZE,
-    d_rel: float | None = None,
-    joint_sensitivity: float | None = None,
 ):
     """Plot the clean attention profile stored in the score cache."""
 
@@ -1011,19 +1008,8 @@ def plot_hop_attention_mass(
     ax.yaxis.label.set_fontsize(axis_title_size)
     ax.tick_params(axis="both", labelsize=axis_tick_size)
     ax.set_ylim(0, max(float(values.max()) * 1.18, 0.05))
-    metric_line = ""
-    if d_rel is not None and joint_sensitivity is not None:
-        metric_line = (
-            "\n"
-            + rf"$D_{{\rm rel}} = {float(d_rel):+.3f};\quad "
-            + rf"J = {float(joint_sensitivity):.3f}$"
-        )
     ax.set_title(
-        title
-        or (
-            f"Attention mass by hop distance - {_head_label(head)}"
-            f"{metric_line}"
-        ),
+        title or f"Attention mass by hop distance - {_head_label(head)}",
         fontsize=15,
     )
     ax.grid(axis="y")
@@ -1043,27 +1029,11 @@ def plot_hop_attention_mass(
         0.65,
         figure_height - INDIVIDUAL_PCA_BASE_HEIGHT,
     )
-    if np.any(graph_token):
-        legend_handles = [Patch(facecolor=TEAL, label="Finite SPD")]
-        legend_handles.append(Patch(facecolor=GOLD, label="Graph token"))
-    footer_fraction = (paired_legend_space + 0.20) / figure_height
-    if np.any(graph_token):
-        fig.legend(
-            handles=legend_handles,
-            loc="center",
-            bbox_to_anchor=(0.545, 0.5 * footer_fraction),
-            ncol=len(legend_handles),
-            fontsize=axis_title_size,
-            handlelength=1.4,
-            handletextpad=0.5,
-            columnspacing=1.6,
-            borderaxespad=0.0,
-        )
     fig.subplots_adjust(
         left=0.115,
         right=0.975,
         top=1.0 - 1.45 / figure_height,
-        bottom=footer_fraction,
+        bottom=(paired_legend_space + 0.20) / figure_height,
     )
     return fig
 

@@ -277,11 +277,6 @@ def test_graphormer_figure_notebook_routes_every_grid_through_live_config():
     assert "pca_figure = plot_av_pca(" in source
     assert "paired_figure_size = tuple(" in source
     assert "figsize=paired_figure_size" in source
-    assert 'd_rel=head_record["selectivity"]' in source
-    assert (
-        'joint_sensitivity=head_record["joint_sensitivity"]'
-        in source
-    )
     assert '"paired_PCA_figure_size_inches"' in source
     assert "ALL_DISPLAYED_HEADS" not in source
     assert "attention mass by hop distance —" not in source
@@ -819,26 +814,7 @@ def test_hop_plot_separates_graph_token_tick():
         assert ticks[-1] - ticks[-2] > 1.2
         assert axis.get_title() == "Attention mass by hop distance - L0 H0"
         assert np.allclose(figure.get_size_inches(), (9.6, 7.89))
-        assert [text.get_text() for text in figure.legends[0].get_texts()] == [
-            "Finite SPD",
-            "Graph token",
-        ]
-    finally:
-        plt.close(figure)
-
-
-def test_hop_plot_without_graph_token_has_contiguous_finite_spd_bars():
-    metrics = SimpleNamespace(
-        clean_attention_distance=np.asarray([[[0.2, 0.5, 0.3]]]),
-        distance_axis=("0", "1", "2"),
-    )
-    figure = plot_hop_attention_mass(metrics, (0, 0))
-    try:
-        axis = figure.axes[0]
-        np.testing.assert_allclose(axis.get_xticks(), (0.0, 1.0, 2.0))
         assert not figure.legends
-        bar_colors = [patch.get_facecolor() for patch in axis.patches]
-        assert all(np.allclose(color, bar_colors[0]) for color in bar_colors[1:])
     finally:
         plt.close(figure)
 
@@ -866,15 +842,9 @@ def test_hop_attention_export_exactly_matches_paired_pca_canvas(tmp_path):
         synthetic_metrics(),
         (0, 0),
         figsize=paired_size,
-        d_rel=-0.275,
-        joint_sensitivity=1.234,
     )
     try:
         np.testing.assert_allclose(hop_figure.get_size_inches(), paired_size)
-        assert hop_figure.axes[0].get_title() == (
-            "Attention mass by hop distance - L0 H0\n"
-            "$D_{\\rm rel} = -0.275;\\quad J = 1.234$"
-        )
         pca_paths = save_figure_bundle(
             pca_figure,
             tmp_path,
