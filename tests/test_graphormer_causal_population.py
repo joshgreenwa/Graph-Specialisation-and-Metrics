@@ -71,18 +71,18 @@ def test_production_config_accepts_paper_scale_disjoint_populations(tmp_path):
         dataset_root=str(tmp_path / "pcqm"),
         cache_dir=str(tmp_path / "hf"),
         accelerator="cpu",
-        discovery_graphs=512,
-        causal_graphs=512,
-        clean_ablation_graphs=512,
+        discovery_graphs=256,
+        causal_graphs=256,
+        clean_ablation_graphs=256,
         semantic_donor_graphs=2_000,
         sources_per_graph=6,
         donors_per_source=8,
         graphs_per_batch=8,
     )
     config.validate()
-    assert config.sizes.discovery_graphs == 512
-    assert config.sizes.causal_graphs == 512
-    assert config.sizes.clean_ablation_graphs == 512
+    assert config.sizes.discovery_graphs == 256
+    assert config.sizes.causal_graphs == 256
+    assert config.sizes.clean_ablation_graphs == 256
     assert config.sizes.semantic_donor_graphs == 2_000
     assert config.sizes.sources_per_graph == 6
     assert config.sizes.donors_per_source == 8

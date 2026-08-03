@@ -8,7 +8,7 @@ This analysis turns the earlier focused causal diagnostics into two paper-facing
    semantic versus structural interventions; and
 2. whether joint sensitivity `J` predicts clean-input head importance across all 384 heads.
 
-The paper Colab uses mutually disjoint sets of 512 discovery, 512 causal-event, and 512
+The paper Colab uses mutually disjoint sets of 256 discovery, 256 causal-event, and 256
 clean-ablation molecules. Selection and matching use discovery scores only. No restoration,
 injection, necessity, or clean-ablation outcome enters the head gate. The semantic donor pool
 remains disjoint and contains 2,000 additional molecules.
@@ -55,13 +55,13 @@ layer-adjusted standardized `beta`.
 Thus `beta = 0.75` means that, comparing heads at the same layer, one global standard deviation
 higher `J` predicts about `0.75` global standard deviations more clean-output movement. Adjustment
 removes between-layer baseline differences; it does not prove causality, allow layer-specific
-slopes, or generalize beyond the trained checkpoint. The paper preset's 95% interval resamples 512
+slopes, or generalize beyond the trained checkpoint. The paper preset's 95% interval resamples 256
 held-out molecules while treating the 384 trained heads and discovery `J` values as fixed.
 
 ## Cache reuse and outputs
 
 The population runner reads existing focused per-graph event shards and all-head clean-ablation
-shards before scheduling work when the scientific contract is unchanged. The 512/512/512 paper
+shards before scheduling work when the scientific contract is unchanged. The 256/256/256 paper
 contract is stored under a separate Drive root, preserving the exploratory 128-molecule caches.
 Dataset and checkpoint downloads remain shared. A new graph/channel shard contains reused rows plus
 only the missing population heads. Styling-only reruns use `PHASE = "figures"` and do not load

@@ -42,7 +42,7 @@ control, cache, and figure contracts are recorded in
 
 For the paper-facing population revision, use
 [`graphormer_pcqm4mv2_causal_population_colab.py`](graphormer_pcqm4mv2_causal_population_colab.py).
-It uses a separate, resumable paper cache with disjoint 512-molecule discovery, causal, and
+It uses a separate, resumable paper cache with disjoint 256-molecule discovery, causal, and
 clean-ablation populations, then measures a 16-pair semantic/structural population and its
 `J`-matched controls. It exports one compact restoration/injection/necessity figure, a raw plus layer-adjusted
 `J`--ablation figure, and a discovery-only matching audit. The fixed estimands, matching diagnostics,

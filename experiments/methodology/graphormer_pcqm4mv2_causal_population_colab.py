@@ -28,9 +28,9 @@ ACCELERATOR = "cuda:0"
 
 # Paper-scale, mutually disjoint evaluation populations. Increasing independent
 # molecules is more informative than multiplying within-molecule donor draws.
-DISCOVERY_GRAPHS = 512
-CAUSAL_GRAPHS = 512
-CLEAN_ABLATION_GRAPHS = 512
+DISCOVERY_GRAPHS = 256
+CAUSAL_GRAPHS = 256
+CLEAN_ABLATION_GRAPHS = 256
 SEMANTIC_DONOR_GRAPHS = 2_000
 SOURCES_PER_GRAPH = 6
 DONORS_PER_SOURCE = 8
