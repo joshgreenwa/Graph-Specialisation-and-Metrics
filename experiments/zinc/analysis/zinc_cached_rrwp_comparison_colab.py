@@ -305,13 +305,25 @@ print("[run] Models with validated canonical scores: " + ", ".join(available_tas
 
 print("[scope] Cache-only: no dataset, checkpoint, model, forward pass, or score recomputation.")
 print("[scope] All intervals are canonical cached one-checkpoint intervals, not seed uncertainty.")
-result = run(
-    CANONICAL_ROOTS,
-    OUTPUT_DIR,
-    tasks=available_tasks,
-    train_seed=TRAIN_SEED,
-    require_carriage=REQUIRE_CARRIAGE,
-)
+print(f"[scope] Output directory: {OUTPUT_DIR}")
+try:
+    result = run(
+        CANONICAL_ROOTS,
+        OUTPUT_DIR,
+        tasks=available_tasks,
+        train_seed=TRAIN_SEED,
+        require_carriage=REQUIRE_CARRIAGE,
+        verbose=True,
+    )
+except Exception as error:
+    print(
+        "[analysis-failed] "
+        f"{type(error).__name__}: {error}\n"
+        f"[analysis-failed] tasks={list(available_tasks)}\n"
+        f"[analysis-failed] roots={[str(root) for root in CANONICAL_ROOTS]}\n"
+        f"[analysis-failed] output={OUTPUT_DIR}"
+    )
+    raise
 
 compatibility = result["cache_compatibility"]
 print("Cache compatibility")
@@ -326,7 +338,11 @@ if not compatibility["same_structural_donor_law"]:
 print("Model summary")
 display(pd.read_csv(OUTPUT_DIR / "model_summary.csv"))
 print("Local/global and cross-architecture comparisons")
-display(pd.read_csv(OUTPUT_DIR / "pairwise_comparisons.csv"))
+comparison_table = OUTPUT_DIR / "pairwise_comparisons.csv"
+if comparison_table.stat().st_size:
+    display(pd.read_csv(comparison_table))
+else:
+    print("[skip] Pairwise comparisons require at least two available models.")
 for path in result["figures"]:
     if str(path).endswith(".png") and Path(path).is_file():
         display(Image(filename=path))

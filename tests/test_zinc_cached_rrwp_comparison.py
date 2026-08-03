@@ -1,3 +1,4 @@
+import csv
 from pathlib import Path
 
 import numpy as np
@@ -116,7 +117,13 @@ def _carriage():
     return {"channels": {channel: {"pairs": rows} for channel in ("semantic", "structural")}}
 
 
-def _model(tmp_path: Path, task: str, *, include_virtual: bool) -> CachedModel:
+def _model(
+    tmp_path: Path,
+    task: str,
+    *,
+    include_virtual: bool,
+    include_carriage: bool = True,
+) -> CachedModel:
     axis = (0, 1, 2, 3, 4, 8, "virtual") if include_virtual else (0, 1, 2, 3, 4, 8)
     score = _score(axis)
     score_artifact = ReadOnlyCacheArtifact(
@@ -125,12 +132,16 @@ def _model(tmp_path: Path, task: str, *, include_virtual: bool) -> CachedModel:
         metadata={"contract_fingerprint": f"contract-{task}"},
         value=score,
     )
-    carriage = _carriage()
-    carriage_artifact = ReadOnlyCacheArtifact(
-        path=tmp_path / task / "fields.pt",
-        file_sha256="carriage-sha",
-        metadata={"contract_fingerprint": f"carriage-{task}"},
-        value=carriage,
+    carriage = _carriage() if include_carriage else None
+    carriage_artifact = (
+        ReadOnlyCacheArtifact(
+            path=tmp_path / task / "fields.pt",
+            file_sha256="carriage-sha",
+            metadata={"contract_fingerprint": f"carriage-{task}"},
+            value=carriage,
+        )
+        if carriage is not None
+        else None
     )
     return CachedModel(
         task=task,
@@ -249,14 +260,46 @@ def test_cached_interval_width_and_carriage_are_normalized():
     assert events == 2
 
 
+def test_run_identifies_the_model_that_failed_to_load(tmp_path, monkeypatch):
+    local = _model(tmp_path, "zinc_1hop_localrrwp", include_virtual=False)
+
+    def load_one(*args, **kwargs):
+        task = kwargs["tasks"][0]
+        if task == "zinc_1hop":
+            raise ValueError("corrupt score fixture")
+        return [local]
+
+    monkeypatch.setattr(
+        "graph_specialisation_metrics.zinc_cached_rrwp_comparison.load_cached_models",
+        load_one,
+    )
+    with pytest.raises(
+        RuntimeError,
+        match="while loading zinc_1hop: ValueError: corrupt score fixture",
+    ):
+        run(
+            [tmp_path],
+            tmp_path / "output",
+            tasks=("zinc_1hop_localrrwp", "zinc_1hop"),
+            verbose=False,
+        )
+
+
 def test_fast_run_writes_tables_and_aligned_figures(tmp_path, monkeypatch):
     models = [
-        _model(tmp_path, "zinc_1hop_localrrwp", include_virtual=False),
+        _model(
+            tmp_path,
+            "zinc_1hop_localrrwp",
+            include_virtual=False,
+            include_carriage=False,
+        ),
         _model(tmp_path, "zinc_1hop", include_virtual=True),
     ]
     monkeypatch.setattr(
         "graph_specialisation_metrics.zinc_cached_rrwp_comparison.load_cached_models",
-        lambda *args, **kwargs: models,
+        lambda *args, **kwargs: [
+            model for model in models if model.task in kwargs["tasks"]
+        ],
     )
     output = tmp_path / "output"
     result = run(
@@ -270,6 +313,11 @@ def test_fast_run_writes_tables_and_aligned_figures(tmp_path, monkeypatch):
     assert (output / "head_score_distance.csv").is_file()
     assert (output / "pairwise_comparisons.csv").is_file()
     assert (output / "summary.json").is_file()
+    with (output / "model_summary.csv").open(encoding="utf-8", newline="") as handle:
+        summary_rows = list(csv.DictReader(handle))
+    assert len(summary_rows) == 2
+    assert summary_rows[0]["semantic_carriage_total"] == ""
+    assert float(summary_rows[1]["semantic_carriage_total"]) == pytest.approx(4.0)
     assert len(result["pairwise_comparisons"]) == 1
     assert np.isfinite(
         result["pairwise_comparisons"][0]["semantic_score_profile_total_variation"]

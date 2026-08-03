@@ -783,8 +783,12 @@ def summarise_model(model: CachedModel) -> dict[str, Any]:
 def _write_csv(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     if not rows:
+        path.write_text("", encoding="utf-8")
         return
-    fields = list(rows[0])
+    # Optional carriage fields make model-summary rows heterogeneous. Preserve
+    # first-seen order while including every field before constructing the
+    # strict DictWriter.
+    fields = list(dict.fromkeys(key for row in rows for key in row))
     with path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields)
         writer.writeheader()
@@ -1149,14 +1153,46 @@ def run(
     tasks: Sequence[str] = TASKS,
     train_seed: int = 42,
     require_carriage: bool = False,
+    verbose: bool = True,
 ) -> dict[str, Any]:
-    models = load_cached_models(
-        roots,
-        tasks=tasks,
-        train_seed=train_seed,
-        require_carriage=require_carriage,
-    )
-    records = [summarise_model(model) for model in models]
+    def log(stage: str, message: str) -> None:
+        if verbose:
+            print(f"[zinc-cache:{stage}] {message}", flush=True)
+
+    log("load", f"tasks={list(tasks)} seed={int(train_seed)}")
+    models = []
+    for task in tasks:
+        log("load", f"resolving {task}")
+        try:
+            loaded = load_cached_models(
+                roots,
+                tasks=(task,),
+                train_seed=train_seed,
+                require_carriage=require_carriage,
+            )
+        except Exception as error:
+            raise RuntimeError(
+                f"ZINC cache analysis failed while loading {task}: "
+                f"{type(error).__name__}: {error}"
+            ) from error
+        models.extend(loaded)
+        model = loaded[0]
+        log(
+            "load",
+            f"selected {model.task}: "
+            f"protocol={model.score_artifact.metadata.get('protocol_version')} "
+            f"score={model.score_artifact.path} carriage={model.carriage is not None}",
+        )
+    records = []
+    for model in models:
+        log("summarise", model.task)
+        try:
+            records.append(summarise_model(model))
+        except Exception as error:
+            raise RuntimeError(
+                f"ZINC cache analysis failed while summarising {model.task}: "
+                f"{type(error).__name__}: {error}"
+            ) from error
     protocols = sorted({str(record["cache_protocol"]) for record in records})
     semantic_laws = sorted({str(record["semantic_donor_law"]) for record in records})
     structural_laws = sorted(
@@ -1195,14 +1231,39 @@ def run(
         row for record in records for row in record["head_distance_rows"]
     ]
     comparison_rows = pairwise_comparisons(records)
-    _write_csv(output_dir / "model_summary.csv", summary_rows)
-    _write_csv(output_dir / "head_scores.csv", head_rows)
-    _write_csv(output_dir / "head_score_distance.csv", head_distance_rows)
-    _write_csv(output_dir / "pairwise_comparisons.csv", comparison_rows)
-    figures = [*_plot_core(records, output_dir)]
-    carriage_figure = _plot_carriage_variability(records, output_dir)
-    if carriage_figure:
-        figures.extend(carriage_figure)
+    tables = {
+        "model_summary.csv": summary_rows,
+        "head_scores.csv": head_rows,
+        "head_score_distance.csv": head_distance_rows,
+        "pairwise_comparisons.csv": comparison_rows,
+    }
+    for name, rows in tables.items():
+        log("table", f"{name}: {len(rows)} rows")
+        try:
+            _write_csv(output_dir / name, rows)
+        except Exception as error:
+            raise RuntimeError(
+                f"ZINC cache analysis failed while writing {name}: "
+                f"{type(error).__name__}: {error}"
+            ) from error
+    log("figure", "01_performance_scores_distance")
+    try:
+        figures = [*_plot_core(records, output_dir)]
+    except Exception as error:
+        raise RuntimeError(
+            "ZINC cache analysis failed while plotting performance/scores/distance: "
+            f"{type(error).__name__}: {error}"
+        ) from error
+    log("figure", "02_profile_precision_and_carriage")
+    try:
+        carriage_figure = _plot_carriage_variability(records, output_dir)
+        if carriage_figure:
+            figures.extend(carriage_figure)
+    except Exception as error:
+        raise RuntimeError(
+            "ZINC cache analysis failed while plotting precision/carriage: "
+            f"{type(error).__name__}: {error}"
+        ) from error
     result = {
         "analysis_version": ANALYSIS_VERSION,
         "train_seed": int(train_seed),
@@ -1245,7 +1306,15 @@ def run(
             ),
         },
     }
-    _write_json(output_dir / "summary.json", result)
+    log("json", "summary.json")
+    try:
+        _write_json(output_dir / "summary.json", result)
+    except Exception as error:
+        raise RuntimeError(
+            "ZINC cache analysis failed while writing summary.json: "
+            f"{type(error).__name__}: {error}"
+        ) from error
+    log("done", str(output_dir))
     return result
 
 
