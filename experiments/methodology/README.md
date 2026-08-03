@@ -78,7 +78,9 @@ specialist, and high-`J` generalist is displayed as an attention grid, routed-ou
 its mean clean-attention-mass versus shortest-path-distance companion. Each companion uses the
 title `Attention mass by hop distance - Lx Hy` and inherits its paired PCA's complete export
 canvas, including the reserved legend area, so their PNG and PDF dimensions match exactly for
-side-by-side composition. The notebook selects five
+side-by-side composition. The footer distinguishes finite SPD mass from a graph token or virtual
+node only when that distinction exists; when neither special token is present the redundant
+legend is omitted and the hop axis remains contiguous. The notebook selects five
 distinct heads in each family (semantic, structural, and high-`J` generalist), and emits no distance
 curves for heads outside those 15 identified examples. Optional first-, second-, and final-layer
 all-head routed-output PCA grids share one additional contract-cached sweep. GRIT's non-additive
