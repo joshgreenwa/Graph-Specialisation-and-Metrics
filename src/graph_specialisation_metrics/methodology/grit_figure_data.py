@@ -1228,16 +1228,131 @@ ZINC_ATOM_TYPES = (
 
 CHEMISTRY_FOCUS_VERSION = "pcqm_chemistry_focus.v1+explicit_hydrogen"
 
+ZINC_FIGURE_TASKS = (
+    "zinc",
+    "zinc_1hop",
+    "zinc_2hop",
+    "zinc_1hop_vnode",
+    "zinc_2hop_vnode",
+)
+QM9_FIGURE_TASKS = (
+    "qm9_gap_dense",
+    "qm9_gap_1hop",
+    "qm9_gap_1hop_vnode",
+)
+SUPPORTED_GRIT_FIGURE_TASKS = ZINC_FIGURE_TASKS + QM9_FIGURE_TASKS
+
 _FIGURE_IDENTITIES = {
     "zinc": {
         "dataset_label": "ZINC",
         "model_label": "GRIT",
     },
+    "zinc_1hop": {
+        "dataset_label": "ZINC",
+        "model_label": "GRIT (1-hop)",
+    },
+    "zinc_2hop": {
+        "dataset_label": "ZINC",
+        "model_label": "GRIT (2-hop)",
+    },
+    "zinc_1hop_vnode": {
+        "dataset_label": "ZINC",
+        "model_label": "GRIT (1-hop + VN)",
+    },
+    "zinc_2hop_vnode": {
+        "dataset_label": "ZINC",
+        "model_label": "GRIT (2-hop + VN)",
+    },
     "qm9_gap_dense": {
         "dataset_label": "QM9 HOMO–LUMO gap",
         "model_label": "GRIT",
     },
+    "qm9_gap_1hop": {
+        "dataset_label": "QM9 HOMO–LUMO gap",
+        "model_label": "GRIT (1-hop)",
+    },
+    "qm9_gap_1hop_vnode": {
+        "dataset_label": "QM9 HOMO–LUMO gap",
+        "model_label": "GRIT (1-hop + VN)",
+    },
 }
+
+
+def molecular_task_family(task_name: str) -> str:
+    """Return the shared chemistry/evaluation family for a GRIT task."""
+
+    task_name = str(task_name)
+    if task_name in ZINC_FIGURE_TASKS:
+        return "zinc"
+    if task_name in QM9_FIGURE_TASKS:
+        return "qm9"
+    raise ValueError(
+        f"no molecular figure family is registered for GRIT task {task_name!r}"
+    )
+
+
+def resolve_canonical_task_root(
+    task_name: str,
+    train_seed: int,
+    canonical_roots: Sequence[str | Path],
+    *,
+    search_root: str | Path | None = None,
+) -> Path:
+    """Locate one complete task/seed canonical cache without guessing silently.
+
+    Configured roots are checked in order. If none contains the task, an optional
+    one-level search finds canonical output roots under the shared metrics folder.
+    A complete candidate must contain both ``scores/raw.pt`` and ``model.json``.
+    """
+
+    task_name = str(task_name)
+    seed_name = f"seed_{int(train_seed)}"
+    configured = [
+        Path(root).expanduser() / task_name / seed_name
+        for root in canonical_roots
+    ]
+    checked: list[Path] = []
+    for candidate in configured:
+        candidate = candidate.resolve()
+        if candidate in checked:
+            continue
+        checked.append(candidate)
+        if (
+            (candidate / "cache/scores/raw.pt").is_file()
+            and (candidate / "model.json").is_file()
+        ):
+            return candidate
+
+    discovered: list[Path] = []
+    if search_root is not None:
+        root = Path(search_root).expanduser().resolve()
+        if root.is_dir():
+            for candidate in sorted(root.glob(f"*/{task_name}/{seed_name}")):
+                candidate = candidate.resolve()
+                if candidate in checked:
+                    continue
+                checked.append(candidate)
+                if (
+                    (candidate / "cache/scores/raw.pt").is_file()
+                    and (candidate / "model.json").is_file()
+                ):
+                    discovered.append(candidate)
+    if len(discovered) == 1:
+        return discovered[0]
+    if len(discovered) > 1:
+        choices = "\n".join(f"  - {path}" for path in discovered)
+        raise ValueError(
+            f"multiple complete canonical caches found for {task_name} seed "
+            f"{train_seed}; add the intended root to CANONICAL_ROOT_CANDIDATES:\n"
+            f"{choices}"
+        )
+    locations = "\n".join(f"  - {path}" for path in checked)
+    raise FileNotFoundError(
+        f"no complete canonical score cache was found for {task_name} seed "
+        f"{train_seed}. Checked:\n{locations or '  - no candidate roots'}\n"
+        "Run the canonical methodology scores phase for this registered task, "
+        "or add its existing output root to CANONICAL_ROOT_CANDIDATES."
+    )
 
 
 def figure_identity(task_name: str) -> dict[str, str]:
@@ -1261,7 +1376,7 @@ def figure_identity(task_name: str) -> dict[str, str]:
 
 def graph_node_labels(task_name: str, graph: Any) -> list[str]:
     values = _as_numpy(graph.x).reshape(int(graph.num_nodes), -1)[:, 0]
-    if str(task_name) == "zinc":
+    if molecular_task_family(task_name) == "zinc":
         labels = []
         for value in values:
             atom_type = int(value)
@@ -1317,9 +1432,10 @@ def molecule_from_graph(task_name: str, graph: Any):
     from rdkit import Chem
 
     task_name = str(task_name)
+    task_family = molecular_task_family(task_name)
     node_values = _as_numpy(graph.x).reshape(int(graph.num_nodes), -1)[:, 0]
     molecule = Chem.RWMol()
-    if task_name == "zinc":
+    if task_family == "zinc":
         for value in node_values:
             atom_type = int(value)
             if not 0 <= atom_type < len(ZINC_ATOM_TYPES):
@@ -1330,7 +1446,7 @@ def molecule_from_graph(task_name: str, graph: Any):
             2: Chem.BondType.DOUBLE,
             3: Chem.BondType.TRIPLE,
         }
-    elif task_name == "qm9_gap_dense":
+    elif task_family == "qm9":
         for value in node_values:
             atomic_number = int(value)
             if atomic_number not in _ATOMIC_NUMBERS:
@@ -1416,7 +1532,7 @@ def molecule_record(task_name: str, graph: Any) -> dict[str, Any]:
         "node_labels": [atom.GetSymbol() for atom in molecule.GetAtoms()],
         "chemistry_decoder": (
             "benchmarking-GNNs ZINC atom/bond dictionaries"
-            if str(task_name) == "zinc"
+            if molecular_task_family(task_name) == "zinc"
             else "PyG QM9 atomic numbers and four bond classes"
         ),
         "chemistry_focus_version": CHEMISTRY_FOCUS_VERSION,
@@ -2095,8 +2211,11 @@ __all__ = [
     "GritFigureRuntime",
     "GritPerGraphCoordinateEstimator",
     "Head",
+    "QM9_FIGURE_TASKS",
     "SELECTED_HEAD_TRANSPORT_PROFILE_VERSION",
+    "SUPPORTED_GRIT_FIGURE_TASKS",
     "SupplementalCache",
+    "ZINC_FIGURE_TASKS",
     "aggregate_logit_spread",
     "build_verified_grit_figure_runtime",
     "collect_attention_examples",
@@ -2110,6 +2229,8 @@ __all__ = [
     "load_canonical_score_artifact",
     "methodology_config_for_artifact",
     "methodology_config_from_record",
+    "molecular_task_family",
+    "resolve_canonical_task_root",
     "select_attention_grid_indices",
     "select_ranked_heads",
     "select_specialist_heads",

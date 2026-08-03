@@ -18,7 +18,10 @@ from graph_specialisation_metrics.methodology.grit_figure_data import (  # noqa:
     CHEMISTRY_FOCUS_VERSION,
     CanonicalHeadMetrics,
     GritDiagnosticExtractor,
+    QM9_FIGURE_TASKS,
+    SUPPORTED_GRIT_FIGURE_TASKS,
     SupplementalCache,
+    ZINC_FIGURE_TASKS,
     ZINC_ATOM_TYPES,
     _normalised_attention_entropy,
     atom_chemistry_categories,
@@ -31,8 +34,10 @@ from graph_specialisation_metrics.methodology.grit_figure_data import (  # noqa:
     load_canonical_score_artifact,
     methodology_config_for_artifact,
     methodology_config_from_record,
+    molecular_task_family,
     molecule_from_graph,
     molecule_record,
+    resolve_canonical_task_root,
     select_ranked_heads,
     select_specialist_heads,
     select_structural_specialist_head,
@@ -688,18 +693,23 @@ def test_zinc_and_qm9_graphs_reconstruct_as_index_preserving_molecules():
         ),
         edge_attr=np.asarray([1, 1, 1, 1], dtype=np.int64),
     )
-    zinc_molecule = molecule_from_graph("zinc", zinc)
-    zinc_payload = molecule_record("zinc", zinc)
     assert ZINC_ATOM_TYPES[4] == "C H1"
-    assert graph_node_labels("zinc", zinc) == ["C", "C", "O"]
-    assert [atom.GetSymbol() for atom in zinc_molecule.GetAtoms()] == [
-        "C",
-        "C",
-        "O",
-    ]
-    assert zinc_payload["smiles"] == "CCO"
-    assert zinc_payload["formula"] == "C2H6O"
-    assert zinc_payload["chemistry_focus_version"] == CHEMISTRY_FOCUS_VERSION
+    for task_name in ZINC_FIGURE_TASKS:
+        zinc_molecule = molecule_from_graph(task_name, zinc)
+        zinc_payload = molecule_record(task_name, zinc)
+        assert molecular_task_family(task_name) == "zinc"
+        assert graph_node_labels(task_name, zinc) == ["C", "C", "O"]
+        assert [atom.GetSymbol() for atom in zinc_molecule.GetAtoms()] == [
+            "C",
+            "C",
+            "O",
+        ]
+        assert zinc_payload["smiles"] == "CCO"
+        assert zinc_payload["formula"] == "C2H6O"
+        assert (
+            zinc_payload["chemistry_focus_version"]
+            == CHEMISTRY_FOCUS_VERSION
+        )
 
     qm9 = SimpleNamespace(
         x=np.asarray([[8], [1], [1]], dtype=np.int64),
@@ -710,9 +720,11 @@ def test_zinc_and_qm9_graphs_reconstruct_as_index_preserving_molecules():
         edge_attr=np.asarray([0, 0, 0, 0], dtype=np.int64),
         name="gdb_1",
     )
-    qm9_payload = molecule_record("qm9_gap_dense", qm9)
-    assert qm9_payload["formula"] == "H2O"
-    assert qm9_payload["molecule_name"] == "gdb_1"
+    for task_name in QM9_FIGURE_TASKS:
+        qm9_payload = molecule_record(task_name, qm9)
+        assert molecular_task_family(task_name) == "qm9"
+        assert qm9_payload["formula"] == "H2O"
+        assert qm9_payload["molecule_name"] == "gdb_1"
     assert figure_identity("qm9_gap_dense")["display_title"] == (
         "QM9 HOMO–LUMO gap — GRIT"
     )
@@ -721,6 +733,79 @@ def test_zinc_and_qm9_graphs_reconstruct_as_index_preserving_molecules():
         "model_label": "GRIT",
         "display_title": "ZINC — GRIT",
     }
+    assert figure_identity("zinc_1hop_vnode")["display_title"] == (
+        "ZINC — GRIT (1-hop + VN)"
+    )
+    assert figure_identity("zinc_2hop")["display_title"] == (
+        "ZINC — GRIT (2-hop)"
+    )
+    assert figure_identity("qm9_gap_1hop")["display_title"] == (
+        "QM9 HOMO–LUMO gap — GRIT (1-hop)"
+    )
+    assert figure_identity("qm9_gap_1hop_vnode")["display_title"] == (
+        "QM9 HOMO–LUMO gap — GRIT (1-hop + VN)"
+    )
+
+
+def test_canonical_task_root_resolution_prefers_configured_then_discovers(
+    tmp_path: Path,
+):
+    def complete(root: Path, task: str) -> Path:
+        task_root = root / task / "seed_42"
+        (task_root / "cache/scores").mkdir(parents=True)
+        (task_root / "cache/scores/raw.pt").touch()
+        (task_root / "model.json").write_text("{}", encoding="utf-8")
+        return task_root
+
+    metrics_root = tmp_path / "graph_specialisation_metrics"
+    configured_root = metrics_root / "canonical_dense"
+    configured_task = complete(configured_root, "zinc_1hop")
+    complete(metrics_root / "canonical_newer", "zinc_1hop")
+    assert resolve_canonical_task_root(
+        "zinc_1hop",
+        42,
+        (configured_root,),
+        search_root=metrics_root,
+    ) == configured_task.resolve()
+
+    discovered_task = complete(
+        metrics_root / "canonical_controls",
+        "qm9_gap_1hop_vnode",
+    )
+    assert resolve_canonical_task_root(
+        "qm9_gap_1hop_vnode",
+        42,
+        (metrics_root / "missing",),
+        search_root=metrics_root,
+    ) == discovered_task.resolve()
+
+
+def test_canonical_task_root_resolution_rejects_ambiguous_or_missing_caches(
+    tmp_path: Path,
+):
+    def complete(root: Path) -> None:
+        task_root = root / "zinc_2hop" / "seed_42"
+        (task_root / "cache/scores").mkdir(parents=True)
+        (task_root / "cache/scores/raw.pt").touch()
+        (task_root / "model.json").touch()
+
+    metrics_root = tmp_path / "graph_specialisation_metrics"
+    complete(metrics_root / "canonical_a")
+    complete(metrics_root / "canonical_b")
+    with pytest.raises(ValueError, match="multiple complete canonical caches"):
+        resolve_canonical_task_root(
+            "zinc_2hop",
+            42,
+            (),
+            search_root=metrics_root,
+        )
+    with pytest.raises(FileNotFoundError, match="qm9_gap_1hop"):
+        resolve_canonical_task_root(
+            "qm9_gap_1hop",
+            42,
+            (),
+            search_root=metrics_root,
+        )
 
 
 def test_pcqm_chemistry_categories_and_pca_colours_are_global():
@@ -1551,11 +1636,16 @@ def test_colab_notebook_has_valid_python_cells():
         configuration,
     )
     attention_indices = configuration["ATTENTION_GRID_GRAPH_INDICES"]
+    zinc_union = [100, 200, 750, 80, 120, 160, 0, 220]
+    qm9_union = [0, 5, 80, 100, 200]
     expected_unions = {
-        "zinc": [100, 200, 750, 80, 120, 160, 0, 220],
-        "qm9_gap_dense": [0, 5, 80, 100, 200],
+        **{task_name: zinc_union for task_name in ZINC_FIGURE_TASKS},
+        **{task_name: qm9_union for task_name in QM9_FIGURE_TASKS},
     }
-    for task_name in ("zinc", "qm9_gap_dense"):
+    assert tuple(configuration["SUPPORTED_TASKS"]) == (
+        SUPPORTED_GRIT_FIGURE_TASKS
+    )
+    for task_name in SUPPORTED_GRIT_FIGURE_TASKS:
         assert tuple(attention_indices[task_name]) == (
             "semantic",
             "structural",
@@ -1576,9 +1666,21 @@ def test_colab_notebook_has_valid_python_cells():
     )
     assert '"rdkit"' in source
     assert '"pypdf"' in source
-    assert 'TASK_SELECTION = "zinc"  # @param ["zinc", "qm9", "both"]' in source
+    assert 'TASK_SELECTION = "zinc"  # @param [' in source
     assert '"zinc": ("zinc",)' in source
+    assert '"zinc_1hop": ("zinc_1hop",)' in source
+    assert '"zinc_1hop_vnode": ("zinc_1hop_vnode",)' in source
+    assert '"zinc_2hop": ("zinc_2hop",)' in source
+    assert '"zinc_2hop_vnode": ("zinc_2hop_vnode",)' in source
     assert '"qm9": ("qm9_gap_dense",)' in source
+    assert '"qm9_gap_1hop": ("qm9_gap_1hop",)' in source
+    assert '"qm9_gap_1hop_vnode": ("qm9_gap_1hop_vnode",)' in source
+    assert '"zinc_all": ZINC_TASKS' in source
+    assert '"qm9_all": QM9_TASKS' in source
+    assert '"all": SUPPORTED_TASKS' in source
+    assert "CANONICAL_ROOT_CANDIDATES = (CANONICAL_ROOT,)" in source
+    assert "resolve_canonical_task_root(" in source
+    assert "search_root=METRICS_ROOT" in source
     assert "HEADS_PER_FAMILY = 5" in source
     assert "ATTENTION_GRID_NUM_ROWS = 3" in source
     assert "ATTENTION_CACHE_NUM_ROWS = 3" in source
@@ -1613,7 +1715,7 @@ def test_colab_notebook_has_valid_python_cells():
     assert "del sys.modules[module_name]" in source
     assert "methodology_config_for_artifact(" in source
     assert (
-        '(task_root / "protocol.json", CANONICAL_ROOT / "protocol.json")'
+        '(task_root / "protocol.json", canonical_root / "protocol.json")'
         in source
     )
     assert '"protocol_paths": protocol_paths' in source
@@ -1687,7 +1789,9 @@ def test_colab_notebook_has_valid_python_cells():
         'f"routing_geometry_vs_transport_response_zinc_heads_{group_index}"'
         in runtime_source
     )
-    assert 'PDF_TASK_PREFIXES = {"zinc": "zinc", "qm9_gap_dense": "qm9"}' in source
+    assert '"zinc_1hop_vnode": "zinc_1hop_vnode"' in source
+    assert '"qm9_gap_1hop": "qm9_1hop"' in source
+    assert '"qm9_gap_1hop_vnode": "qm9_1hop_vnode"' in source
     assert "save_section_pdf_bundles(" in runtime_source
     assert '"semantic_specialists"' in source
     assert '"distance_curves"' in source

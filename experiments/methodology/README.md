@@ -40,14 +40,20 @@ to redraw solely from Drive caches without loading the checkpoint or PCQM4Mv2. T
 control, cache, and figure contracts are recorded in
 [`../../docs/graphormer_pcqm4mv2_causal_analysis_plan.md`](../../docs/graphormer_pcqm4mv2_causal_analysis_plan.md).
 
-After the ZINC and QM9 score caches have completed under
-`canonical_methodology_v4_zinc_qm9`, run
+After the requested ZINC and QM9 score caches have completed, run
 [`grit_zinc_qm9_figures_colab.ipynb`](grit_zinc_qm9_figures_colab.ipynb) for the focused
 cross-task figure suite. It reads each task's `seed_42/cache/scores/raw.pt` artifact
 read-only, verifies the matching `model.json` and checkpoint before model-forward
-diagnostics, and writes task-separated supplemental caches and figure manifests. The
-`TASK_SELECTION` Colab control runs `zinc`, `qm9`, or `both`; choosing one task does not
-construct, validate, or render the other.
+diagnostics, and writes task-separated supplemental caches and figure manifests. Dense, 1-hop,
+2-hop, 1-hop+VN, and 2-hop+VN ZINC tasks are supported, as are dense, 1-hop, and 1-hop+VN QM9
+tasks. `TASK_SELECTION` exposes every task separately plus `zinc_all`, `qm9_all`, and `all`
+groups; choosing one task does not construct, validate, or render another. The known
+`canonical_methodology_v4_zinc_qm9` root is checked first. Existing variant caches under another
+direct child of `graph_specialisation_metrics` are discovered automatically; ambiguous matches
+must be resolved explicitly with `CANONICAL_ROOT_CANDIDATES`. If a cache is absent, the canonical
+frontend contains a ready task tuple for the six receptive-field controls. Their registered task
+specifications already point to the Drive roots used by training, including recovery-checkpoint
+layouts for the ZINC k-hop/VN runs.
 The score/coordinate figures reuse the PCQM presentation, while attention and routed-output
 diagnostics attach to native GRIT sites. ZINC atom-type IDs are decoded with the exact source
 vocabulary and bond dictionary, so the attention grids contain index-preserving RDKit molecules
@@ -85,7 +91,7 @@ all-head routed-output PCA grids share one additional contract-cached sweep. GRI
 relation conditioning is reported as such; its node-only versus relation-conditioned raw-logit
 figure is not labelled as Graphormer dot-versus-bias. The same cached diagnostic sweep records
 normalised clean-attention entropy and relates it separately to relative selectivity and joint
-sensitivity. For ZINC, the notebook additionally reproduces the PCQM selected-head transport
+sensitivity. For dense ZINC, the notebook additionally reproduces the PCQM selected-head transport
 response analysis for the registered heads `(L1,H2)`, `(L1,H7)`, `(L4,H7)`, `(L6,H0)`,
 `(L6,H3)`, `(L7,H6)`, `(L9,H1)`, and `(L8,H4)`. Its upper row shows clean attention mass by
 query-key shortest-path distance, while its lower row gives the exact additive semantic and
@@ -96,8 +102,9 @@ from the canonical score cache's event sufficient statistics, written once to a 
 supplemental cache for all eight heads, and rendered as two four-head paper-size pages without a
 model forward. Individual PNG/PDF/JSON figure bundles remain
 under each task's figure directory. The notebook also assembles ordered, multi-page PDFs in the
-shared Drive `pdf_sections` directory: `zinc_*.pdf` and `qm9_*.pdf` files for main scores, selected
-distance curves, semantic specialists, structural specialists, high-`J` generalists,
+shared Drive `pdf_sections` directory. Model-qualified prefixes such as `zinc_1hop_*` and
+`qm9_1hop_vnode_*` prevent variants from overwriting one another; each task gets files for main
+scores, selected distance curves, semantic specialists, structural specialists, high-`J` generalists,
 mechanism/logit diagnostics, and layer-PCA overviews. Specialist section PDFs keep each attention
 grid, PCA, and companion SPD curve together in display order. Individual PNGs are lossless
 600-DPI exports. PDFs keep typography, axes, curves, and annotations as vectors, render dense

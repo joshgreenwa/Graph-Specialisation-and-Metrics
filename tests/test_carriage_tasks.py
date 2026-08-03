@@ -1,7 +1,31 @@
 from pathlib import Path
 
+import pytest
+
 from graph_specialisation_metrics.carriage import env, onehop_env
 from graph_specialisation_metrics.carriage.tasks import get_task
+
+
+@pytest.mark.parametrize(
+    "name,expected_params",
+    [
+        ("zinc_1hop", 473_473),
+        ("zinc_2hop", 473_473),
+        ("zinc_1hop_vnode", 473_537),
+        ("zinc_2hop_vnode", 473_537),
+        ("qm9_gap_1hop", 472_769),
+        ("qm9_gap_1hop_vnode", 472_833),
+    ],
+)
+def test_requested_receptive_field_tasks_have_registered_drive_checkpoints(
+    name,
+    expected_params,
+):
+    task = get_task(name)
+    assert task.drive_dir
+    assert task.expected_params == expected_params
+    assert task.grit_repo_dir
+    assert len(task.env_hooks) == 1
 
 
 def test_zinc_1hop_local_task_matches_onehop_except_local_rrwp_reconstruction():

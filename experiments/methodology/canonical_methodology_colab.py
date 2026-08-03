@@ -19,6 +19,17 @@ SECRET_NAME = "dissertation_key"
 
 # First production run: all registered dense task families.
 TASKS = ("zinc", "qm9_gap_dense", "peptides_func", "peptides_struct")
+# Receptive-field control suite (uncomment instead when building missing score caches):
+# TASKS = (
+#     "zinc_1hop",
+#     "zinc_1hop_vnode",
+#     "zinc_2hop",
+#     "zinc_2hop_vnode",
+#     "qm9_gap_1hop",
+#     "qm9_gap_1hop_vnode",
+# )
+# Their registered task specifications already point at the corresponding Drive checkpoint roots;
+# leave CHECKPOINTS empty unless overriding one exact checkpoint file.
 TRAIN_SEEDS = (42,)
 # A public checkpoint has no training-seed ensemble; use a stable seed label for its cache.
 # Example: TASKS = ("graphormer_pcqm4mv2",)
