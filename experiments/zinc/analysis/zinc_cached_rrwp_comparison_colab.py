@@ -310,6 +310,10 @@ print(
     "[scope] Layerwise head co-location uses cached exact per-head score-distance tensors; "
     "medians, IQRs, ranges, and descriptive low-overlap outliers are fingerprint-cached."
 )
+print(
+    "[scope] Follow-ups decompose overlap loss by distance and isolate the virtual score "
+    "bin; all quantities are derived from the same cached tensors."
+)
 print(f"[scope] Output directory: {OUTPUT_DIR}")
 try:
     result = run(
@@ -378,6 +382,46 @@ if outlier_table.stat().st_size:
     display(pd.read_csv(outlier_table))
 else:
     print("[outliers] No heads fall below their layer's Tukey low-overlap fence.")
+distance_table = pd.read_csv(
+    OUTPUT_DIR / "head_profile_distance_decomposition_layerwise.csv"
+)
+print("Largest opportunity-corrected distance contributions to mean overlap loss")
+display(
+    distance_table.loc[
+        distance_table["profile_kind"] == "per_opportunity",
+        [
+            "task",
+            "layer",
+            "distance_group",
+            "structural_minus_semantic_mean",
+            "tv_contribution_mean",
+        ],
+    ]
+    .sort_values("tv_contribution_mean", ascending=False)
+    .head(20)
+)
+vnode_table = OUTPUT_DIR / "vnode_profile_alignment_layerwise.csv"
+if vnode_table.stat().st_size:
+    print("Virtual-carrier allocation and overlap after removing the virtual bin")
+    vnode_summary = pd.read_csv(vnode_table)
+    display(
+        vnode_summary.loc[
+            :,
+            [
+                "task",
+                "profile_kind",
+                "layer",
+                "full_overlap_median",
+                "molecular_only_overlap_median",
+                "molecular_minus_full_overlap_median",
+                "semantic_virtual_share_median",
+                "structural_virtual_share_median",
+                "virtual_tv_contribution_median",
+            ],
+        ]
+    )
+else:
+    print("[vnode] No available cached model contains a reportable virtual carrier bin.")
 for path in result["figures"]:
     if str(path).endswith(".png") and Path(path).is_file():
         display(Image(filename=path))

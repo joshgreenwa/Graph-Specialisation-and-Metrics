@@ -18,12 +18,16 @@ from graph_specialisation_metrics.zinc_cached_rrwp_comparison import (
     carriage_profile,
     group_distance,
     head_profile_alignment_rows,
+    head_profile_distance_decomposition_rows,
     load_compatible_cache_artifact_file,
     load_or_compute_head_profile_alignment,
     run,
     score_interval_width_profile,
     score_profile,
+    summarise_layerwise_distance_decomposition,
     summarise_layerwise_head_profile_alignment,
+    summarise_layerwise_vnode_profiles,
+    vnode_profile_rows,
 )
 
 
@@ -303,6 +307,55 @@ def test_layerwise_alignment_summarises_consistency_and_low_outliers(tmp_path):
         ("per_opportunity", 1, 7),
     }
 
+    distance_rows = head_profile_distance_decomposition_rows([model])
+    displaced = [
+        row
+        for row in distance_rows
+        if row["profile_kind"] == "score_mass"
+        and row["layer"] == 0
+        and row["head"] == 7
+    ]
+    assert sum(float(row["tv_contribution"]) for row in displaced) == pytest.approx(1.0)
+    assert {
+        row["distance"]: row["structural_minus_semantic"] for row in displaced
+    } == {"0": -1.0, "1": 0.0, "2": 1.0, "3": 0.0, "4": 0.0, "8": 0.0}
+    distance_layerwise = summarise_layerwise_distance_decomposition(distance_rows)
+    assert any(
+        row["profile_kind"] == "score_mass"
+        and row["layer"] == 0
+        and row["distance_group"] == "2"
+        and row["tv_contribution_mean"] == pytest.approx(0.5 / 8.0)
+        for row in distance_layerwise
+    )
+
+
+def test_vnode_diagnostic_removes_and_renormalizes_virtual_bin(tmp_path):
+    model = _model(tmp_path, "zinc_1hop_vnode", include_virtual=True)
+    width = len(model.score["axis"])
+    semantic = np.zeros((2, 2, width), dtype=np.float64)
+    structural = np.zeros_like(semantic)
+    semantic[..., 0] = 1.0
+    semantic[..., -1] = 1.0
+    structural[..., 0] = 1.0
+    structural[..., -1] = 3.0
+    for field in ("heatmap_exact_head", "heatmap_per_opportunity_head"):
+        model.score["channels"]["semantic"][field] = semantic.copy()
+        model.score["channels"]["structural"][field] = structural.copy()
+    model.score["channels"]["semantic"]["raw"] = semantic.sum(axis=-1)
+    model.score["channels"]["structural"]["raw"] = structural.sum(axis=-1)
+
+    rows = vnode_profile_rows([model])
+    assert len(rows) == 2 * 2 * 2
+    first = rows[0]
+    assert first["full_overlap"] == pytest.approx(0.75)
+    assert first["molecular_only_overlap"] == pytest.approx(1.0)
+    assert first["semantic_virtual_share"] == pytest.approx(0.5)
+    assert first["structural_virtual_share"] == pytest.approx(0.75)
+    assert first["virtual_tv_contribution"] == pytest.approx(0.125)
+    layerwise = summarise_layerwise_vnode_profiles(rows)
+    assert len(layerwise) == 2 * 2
+    assert layerwise[0]["molecular_minus_full_overlap_median"] == pytest.approx(0.25)
+
 
 def test_run_identifies_the_model_that_failed_to_load(tmp_path, monkeypatch):
     local = _model(tmp_path, "zinc_1hop_localrrwp", include_virtual=False)
@@ -360,6 +413,10 @@ def test_fast_run_writes_tables_and_aligned_figures(tmp_path, monkeypatch):
     assert (output / "head_profile_alignment_summary.csv").is_file()
     assert (output / "head_profile_alignment_layerwise.csv").is_file()
     assert (output / "head_profile_alignment_outliers.csv").is_file()
+    assert (output / "head_profile_distance_decomposition.csv").is_file()
+    assert (output / "head_profile_distance_decomposition_layerwise.csv").is_file()
+    assert (output / "vnode_profile_alignment.csv").is_file()
+    assert (output / "vnode_profile_alignment_layerwise.csv").is_file()
     assert not (output / "head_profile_alignment_permutation.csv").exists()
     assert (output / "cache/head_profile_alignment.json").is_file()
     assert (output / "summary.json").is_file()
@@ -378,5 +435,5 @@ def test_fast_run_writes_tables_and_aligned_figures(tmp_path, monkeypatch):
     )
     assert cache_path == output / "cache/head_profile_alignment.json"
     assert cache_status == "hit"
-    assert len(result["figures"]) == 6
+    assert len(result["figures"]) == 10
     assert all(Path(path).is_file() for path in result["figures"])

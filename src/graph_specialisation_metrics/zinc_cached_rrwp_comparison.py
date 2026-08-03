@@ -35,8 +35,8 @@ from .methodology.grit_figure_data import (
 )
 from .methodology.protocol import PROTOCOL_VERSION, stable_hash
 
-ANALYSIS_VERSION = "zinc-cached-rrwp-comparison-v3"
-ALIGNMENT_CACHE_VERSION = "zinc-head-profile-colocalization-v2"
+ANALYSIS_VERSION = "zinc-cached-rrwp-comparison-v4"
+ALIGNMENT_CACHE_VERSION = "zinc-head-profile-colocalization-v3"
 SUPPORTED_CACHE_PROTOCOLS = (
     "donor-swap-specialisation-carriage-v3",
     PROTOCOL_VERSION,
@@ -831,12 +831,12 @@ def _distance_reportable_mask(
     return reportable
 
 
-def _profile_pair_metrics(
+def _profile_pair_components(
     semantic: Any,
     structural: Any,
     axis: Sequence[Any],
     reportable: Any,
-) -> dict[str, Any] | None:
+) -> dict[str, np.ndarray] | None:
     semantic = _as_numpy(semantic).reshape(-1)
     structural = _as_numpy(structural).reshape(-1)
     reportable = _as_numpy(reportable, dtype=bool).reshape(-1)
@@ -856,8 +856,31 @@ def _profile_pair_metrics(
     structural_mass = float(np.sum(structural))
     if semantic_mass <= 1.0e-12 or structural_mass <= 1.0e-12:
         return None
-    semantic_profile = semantic / semantic_mass
-    structural_profile = structural / structural_mass
+    return {
+        "semantic": semantic,
+        "structural": structural,
+        "semantic_profile": semantic / semantic_mass,
+        "structural_profile": structural / structural_mass,
+        "labels": labels,
+    }
+
+
+def _profile_pair_metrics(
+    semantic: Any,
+    structural: Any,
+    axis: Sequence[Any],
+    reportable: Any,
+) -> dict[str, Any] | None:
+    components = _profile_pair_components(semantic, structural, axis, reportable)
+    if components is None:
+        return None
+    semantic = components["semantic"]
+    structural = components["structural"]
+    semantic_profile = components["semantic_profile"]
+    structural_profile = components["structural_profile"]
+    labels = components["labels"]
+    semantic_mass = float(np.sum(semantic))
+    structural_mass = float(np.sum(structural))
     denominator = float(
         np.linalg.norm(semantic_profile) * np.linalg.norm(structural_profile)
     )
@@ -905,8 +928,18 @@ def _profile_pair_metrics(
         "centroid_gap_abs": abs(centroid_difference),
         "semantic_mass": semantic_mass,
         "structural_mass": structural_mass,
-        "shared_reportable_bins": int(np.sum(valid)),
+        "shared_reportable_bins": len(labels),
     }
+
+
+def _distance_group_label(value: Any) -> str:
+    distance = _numeric_distance(value)
+    if distance is None:
+        return str(value).replace("_", " ")
+    for name, lower, upper in DISPLAY_BINS:
+        if lower <= distance <= upper:
+            return name
+    raise ValueError(f"non-negative distance {distance} has no display bin")
 
 
 def head_profile_alignment_rows(models: Sequence[CachedModel]) -> list[dict[str, Any]]:
@@ -973,6 +1006,296 @@ def head_profile_alignment_rows(models: Sequence[CachedModel]) -> list[dict[str,
     return rows
 
 
+def head_profile_distance_decomposition_rows(
+    models: Sequence[CachedModel],
+) -> list[dict[str, Any]]:
+    """Decompose each head's profile mismatch into signed exact-distance terms.
+
+    ``structural_minus_semantic`` locates the direction of the mismatch, while
+    ``tv_contribution`` is non-negative and sums exactly to ``1 - overlap`` for
+    each head.  Display-bin summaries sum exact-bin contributions before any
+    aggregation across heads.
+    """
+
+    profile_fields = {
+        "score_mass": "heatmap_exact_head",
+        "per_opportunity": "heatmap_per_opportunity_head",
+    }
+    rows: list[dict[str, Any]] = []
+    for model in models:
+        score = model.score
+        axis = tuple(score["axis"])
+        semantic_channel = score["channels"]["semantic"]
+        structural_channel = score["channels"]["structural"]
+        joint_reportable = _distance_reportable_mask(
+            score, "semantic", len(axis)
+        ) & _distance_reportable_mask(score, "structural", len(axis))
+        for profile_kind, field in profile_fields.items():
+            if field not in semantic_channel or field not in structural_channel:
+                continue
+            semantic = _as_numpy(semantic_channel[field])
+            structural = _as_numpy(structural_channel[field])
+            if semantic.ndim != 3 or semantic.shape != structural.shape:
+                raise ValueError(
+                    f"{model.task} {profile_kind} head profiles do not align: "
+                    f"semantic={semantic.shape}, structural={structural.shape}"
+                )
+            layers, heads, _ = semantic.shape
+            for layer in range(layers):
+                for head in range(heads):
+                    components = _profile_pair_components(
+                        semantic[layer, head],
+                        structural[layer, head],
+                        axis,
+                        joint_reportable,
+                    )
+                    if components is None:
+                        continue
+                    for index, label in enumerate(components["labels"]):
+                        semantic_share = float(components["semantic_profile"][index])
+                        structural_share = float(
+                            components["structural_profile"][index]
+                        )
+                        difference = structural_share - semantic_share
+                        rows.append(
+                            {
+                                "task": model.task,
+                                "profile_kind": profile_kind,
+                                "layer": layer,
+                                "head": head,
+                                "distance": str(label).replace("_", " "),
+                                "distance_order": (
+                                    _numeric_distance(label)
+                                    if _numeric_distance(label) is not None
+                                    else 1_000_000
+                                ),
+                                "distance_group": _distance_group_label(label),
+                                "semantic_share": semantic_share,
+                                "structural_share": structural_share,
+                                "structural_minus_semantic": difference,
+                                "tv_contribution": 0.5 * abs(difference),
+                                "semantic_raw_mass": float(
+                                    components["semantic"][index]
+                                ),
+                                "structural_raw_mass": float(
+                                    components["structural"][index]
+                                ),
+                            }
+                        )
+    return rows
+
+
+def summarise_layerwise_distance_decomposition(
+    rows: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Sum exact terms into display bins, then summarize heads within layers."""
+
+    head_groups: dict[
+        tuple[str, str, int, int, str], dict[str, float]
+    ] = {}
+    for row in rows:
+        key = (
+            str(row["task"]),
+            str(row["profile_kind"]),
+            int(row["layer"]),
+            int(row["head"]),
+            str(row["distance_group"]),
+        )
+        target = head_groups.setdefault(
+            key,
+            {
+                "semantic_share": 0.0,
+                "structural_share": 0.0,
+                "structural_minus_semantic": 0.0,
+                "tv_contribution": 0.0,
+            },
+        )
+        for field in target:
+            target[field] += float(row[field])
+    layer_groups: dict[
+        tuple[str, str, int, str], list[dict[str, float]]
+    ] = {}
+    for (task, profile_kind, layer, _head, distance_group), values in head_groups.items():
+        layer_groups.setdefault(
+            (task, profile_kind, layer, distance_group), []
+        ).append(values)
+    output: list[dict[str, Any]] = []
+    metrics = (
+        "semantic_share",
+        "structural_share",
+        "structural_minus_semantic",
+        "tv_contribution",
+    )
+    for (task, profile_kind, layer, distance_group), group in sorted(
+        layer_groups.items()
+    ):
+        record: dict[str, Any] = {
+            "task": task,
+            "profile_kind": profile_kind,
+            "layer": layer,
+            "distance_group": distance_group,
+            "valid_heads": len(group),
+        }
+        for metric in metrics:
+            values = np.asarray([row[metric] for row in group], dtype=np.float64)
+            record[f"{metric}_mean"] = float(np.mean(values))
+            record[f"{metric}_median"] = float(np.median(values))
+            record[f"{metric}_q1"] = float(np.quantile(values, 0.25))
+            record[f"{metric}_q3"] = float(np.quantile(values, 0.75))
+        output.append(record)
+    return output
+
+
+def vnode_profile_rows(models: Sequence[CachedModel]) -> list[dict[str, Any]]:
+    """Isolate virtual-carrier score allocation and molecular-only overlap."""
+
+    profile_fields = {
+        "score_mass": "heatmap_exact_head",
+        "per_opportunity": "heatmap_per_opportunity_head",
+    }
+    rows: list[dict[str, Any]] = []
+    for model in models:
+        score = model.score
+        axis = tuple(score["axis"])
+        virtual_positions = [
+            index
+            for index, label in enumerate(axis)
+            if str(label).replace("_", " ").lower() == "virtual"
+        ]
+        if not virtual_positions:
+            continue
+        if len(virtual_positions) != 1:
+            raise ValueError(f"{model.task} has multiple virtual distance bins")
+        semantic_channel = score["channels"]["semantic"]
+        structural_channel = score["channels"]["structural"]
+        joint_reportable = _distance_reportable_mask(
+            score, "semantic", len(axis)
+        ) & _distance_reportable_mask(score, "structural", len(axis))
+        for profile_kind, field in profile_fields.items():
+            if field not in semantic_channel or field not in structural_channel:
+                continue
+            semantic = _as_numpy(semantic_channel[field])
+            structural = _as_numpy(structural_channel[field])
+            layers, heads, _ = semantic.shape
+            for layer in range(layers):
+                for head in range(heads):
+                    components = _profile_pair_components(
+                        semantic[layer, head],
+                        structural[layer, head],
+                        axis,
+                        joint_reportable,
+                    )
+                    if components is None:
+                        continue
+                    labels = [str(label).replace("_", " ") for label in components["labels"]]
+                    if "virtual" not in [label.lower() for label in labels]:
+                        continue
+                    virtual = next(
+                        index for index, label in enumerate(labels) if label.lower() == "virtual"
+                    )
+                    semantic_profile = components["semantic_profile"]
+                    structural_profile = components["structural_profile"]
+                    full_overlap = float(
+                        np.minimum(semantic_profile, structural_profile).sum()
+                    )
+                    molecular = np.arange(len(labels)) != virtual
+                    semantic_molecular_mass = float(
+                        components["semantic"][molecular].sum()
+                    )
+                    structural_molecular_mass = float(
+                        components["structural"][molecular].sum()
+                    )
+                    molecular_overlap = float("nan")
+                    if (
+                        semantic_molecular_mass > 1.0e-12
+                        and structural_molecular_mass > 1.0e-12
+                    ):
+                        semantic_molecular = (
+                            components["semantic"][molecular]
+                            / semantic_molecular_mass
+                        )
+                        structural_molecular = (
+                            components["structural"][molecular]
+                            / structural_molecular_mass
+                        )
+                        molecular_overlap = float(
+                            np.minimum(semantic_molecular, structural_molecular).sum()
+                        )
+                    semantic_virtual_share = float(semantic_profile[virtual])
+                    structural_virtual_share = float(structural_profile[virtual])
+                    virtual_difference = structural_virtual_share - semantic_virtual_share
+                    rows.append(
+                        {
+                            "task": model.task,
+                            "profile_kind": profile_kind,
+                            "layer": layer,
+                            "head": head,
+                            "full_overlap": full_overlap,
+                            "molecular_only_overlap": molecular_overlap,
+                            "molecular_minus_full_overlap": molecular_overlap
+                            - full_overlap,
+                            "semantic_virtual_share": semantic_virtual_share,
+                            "structural_virtual_share": structural_virtual_share,
+                            "structural_minus_semantic_virtual_share": virtual_difference,
+                            "virtual_tv_contribution": 0.5 * abs(virtual_difference),
+                            "semantic_virtual_raw_mass": float(
+                                components["semantic"][virtual]
+                            ),
+                            "structural_virtual_raw_mass": float(
+                                components["structural"][virtual]
+                            ),
+                            "semantic_total_raw_mass": float(
+                                components["semantic"].sum()
+                            ),
+                            "structural_total_raw_mass": float(
+                                components["structural"].sum()
+                            ),
+                        }
+                    )
+    return rows
+
+
+def summarise_layerwise_vnode_profiles(
+    rows: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    groups: dict[tuple[str, str, int], list[Mapping[str, Any]]] = {}
+    for row in rows:
+        key = (str(row["task"]), str(row["profile_kind"]), int(row["layer"]))
+        groups.setdefault(key, []).append(row)
+    metrics = (
+        "full_overlap",
+        "molecular_only_overlap",
+        "molecular_minus_full_overlap",
+        "semantic_virtual_share",
+        "structural_virtual_share",
+        "structural_minus_semantic_virtual_share",
+        "virtual_tv_contribution",
+        "semantic_virtual_raw_mass",
+        "structural_virtual_raw_mass",
+    )
+    output: list[dict[str, Any]] = []
+    for (task, profile_kind, layer), group in sorted(groups.items()):
+        record: dict[str, Any] = {
+            "task": task,
+            "profile_kind": profile_kind,
+            "layer": layer,
+            "valid_heads": len(group),
+        }
+        for metric in metrics:
+            values = np.asarray([float(row[metric]) for row in group])
+            finite = values[np.isfinite(values)]
+            if not len(finite):
+                for suffix in ("mean", "median", "q1", "q3"):
+                    record[f"{metric}_{suffix}"] = float("nan")
+                continue
+            record[f"{metric}_mean"] = float(np.mean(finite))
+            record[f"{metric}_median"] = float(np.median(finite))
+            record[f"{metric}_q1"] = float(np.quantile(finite, 0.25))
+            record[f"{metric}_q3"] = float(np.quantile(finite, 0.75))
+        output.append(record)
+    return output
+
+
 def summarise_head_profile_alignment(
     rows: Sequence[Mapping[str, Any]],
 ) -> list[dict[str, Any]]:
@@ -1028,8 +1351,14 @@ def summarise_layerwise_head_profile_alignment(
         ordered = sorted(group, key=lambda row: int(row["head"]))
         overlap = np.asarray([float(row["overlap"]) for row in ordered])
         cosine = np.asarray([float(row["cosine"]) for row in ordered])
+        centroid_difference = np.asarray(
+            [float(row["centroid_difference"]) for row in ordered]
+        )
         finite_overlap = overlap[np.isfinite(overlap)]
         finite_cosine = cosine[np.isfinite(cosine)]
+        finite_centroid_difference = centroid_difference[
+            np.isfinite(centroid_difference)
+        ]
         if not len(finite_overlap):
             continue
         overlap_q1, overlap_median, overlap_q3 = np.quantile(
@@ -1087,6 +1416,29 @@ def summarise_layerwise_head_profile_alignment(
                 "peak_match_fraction": float(
                     np.mean([float(row["peak_match"]) for row in ordered])
                 ),
+                "centroid_difference_mean": (
+                    float(np.mean(finite_centroid_difference))
+                    if len(finite_centroid_difference)
+                    else float("nan")
+                ),
+                "centroid_difference_median": (
+                    float(np.median(finite_centroid_difference))
+                    if len(finite_centroid_difference)
+                    else float("nan")
+                ),
+                "centroid_difference_iqr": (
+                    float(
+                        np.quantile(finite_centroid_difference, 0.75)
+                        - np.quantile(finite_centroid_difference, 0.25)
+                    )
+                    if len(finite_centroid_difference)
+                    else float("nan")
+                ),
+                "fraction_structural_centroid_farther": (
+                    float(np.mean(finite_centroid_difference > 0.0))
+                    if len(finite_centroid_difference)
+                    else float("nan")
+                ),
             }
         )
         for row in ordered:
@@ -1126,6 +1478,12 @@ def _head_profile_alignment_contract(
         "layer_summary": (
             "median, IQR, range, threshold fractions, and Tukey low-overlap outliers"
         ),
+        "distance_decomposition": (
+            "exact structural-minus-semantic share and additive total-variation terms"
+        ),
+        "virtual_node": (
+            "virtual score share and overlap after molecular-only renormalization"
+        ),
         "models": [
             {
                 "task": model.task,
@@ -1161,6 +1519,10 @@ def load_or_compute_head_profile_alignment(
                 and isinstance(value.get("summary_rows"), list)
                 and isinstance(value.get("layer_summary_rows"), list)
                 and isinstance(value.get("outlier_rows"), list)
+                and isinstance(value.get("distance_rows"), list)
+                and isinstance(value.get("distance_layer_rows"), list)
+                and isinstance(value.get("vnode_rows"), list)
+                and isinstance(value.get("vnode_layer_rows"), list)
             ):
                 return value, path, "hit"
         except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
@@ -1169,11 +1531,19 @@ def load_or_compute_head_profile_alignment(
     layer_summary_rows, outlier_rows = summarise_layerwise_head_profile_alignment(
         comparison_rows
     )
+    distance_rows = head_profile_distance_decomposition_rows(models)
+    distance_layer_rows = summarise_layerwise_distance_decomposition(distance_rows)
+    virtual_rows = vnode_profile_rows(models)
+    virtual_layer_rows = summarise_layerwise_vnode_profiles(virtual_rows)
     value = {
         "comparison_rows": comparison_rows,
         "summary_rows": summarise_head_profile_alignment(comparison_rows),
         "layer_summary_rows": layer_summary_rows,
         "outlier_rows": outlier_rows,
+        "distance_rows": distance_rows,
+        "distance_layer_rows": distance_layer_rows,
+        "vnode_rows": virtual_rows,
+        "vnode_layer_rows": virtual_layer_rows,
     }
     _write_json(
         path,
@@ -1649,6 +2019,235 @@ def _plot_head_profile_alignment(
     return [png, pdf]
 
 
+def _plot_head_profile_distance_decomposition(
+    records: Sequence[Mapping[str, Any]],
+    layer_rows: Sequence[Mapping[str, Any]],
+    output_dir: Path,
+) -> list[Path]:
+    import matplotlib.pyplot as plt
+
+    tasks = [
+        str(record["task"])
+        for record in records
+        if any(str(row["task"]) == str(record["task"]) for row in layer_rows)
+    ]
+    if not tasks:
+        return []
+    observed_groups = {str(row["distance_group"]) for row in layer_rows}
+    distance_groups = [
+        name for name, _, _ in DISPLAY_BINS if name in observed_groups
+    ] + sorted(
+        observed_groups.difference({name for name, _, _ in DISPLAY_BINS})
+    )
+    layers = sorted({int(row["layer"]) for row in layer_rows})
+    layer_index = {layer: index for index, layer in enumerate(layers)}
+    distance_index = {
+        distance_group: index
+        for index, distance_group in enumerate(distance_groups)
+    }
+    values = np.asarray(
+        [float(row["structural_minus_semantic_mean"]) for row in layer_rows],
+        dtype=np.float64,
+    )
+    finite = np.abs(values[np.isfinite(values)])
+    colour_limit = max(float(np.quantile(finite, 0.98)) if len(finite) else 0.0, 0.05)
+    figure, axes = plt.subplots(
+        2,
+        len(tasks),
+        figsize=(3.25 * len(tasks) + 1.2, 7.4),
+        squeeze=False,
+        constrained_layout=True,
+    )
+    image = None
+    for row_index, (profile_kind, row_label) in enumerate(
+        (("score_mass", "score mass"), ("per_opportunity", "per opportunity"))
+    ):
+        for column_index, task in enumerate(tasks):
+            axis = axes[row_index, column_index]
+            matrix = np.full(
+                (len(layers), len(distance_groups)), np.nan, dtype=np.float64
+            )
+            for row in layer_rows:
+                if (
+                    str(row["task"]) != task
+                    or str(row["profile_kind"]) != profile_kind
+                ):
+                    continue
+                matrix[
+                    layer_index[int(row["layer"])],
+                    distance_index[str(row["distance_group"])],
+                ] = float(row["structural_minus_semantic_mean"])
+            image = axis.imshow(
+                np.ma.masked_invalid(matrix),
+                aspect="auto",
+                interpolation="nearest",
+                cmap="RdBu_r",
+                vmin=-colour_limit,
+                vmax=colour_limit,
+            )
+            for layer_position in range(len(layers)):
+                for distance_position in range(len(distance_groups)):
+                    value = matrix[layer_position, distance_position]
+                    if np.isfinite(value) and abs(value) >= 0.04:
+                        axis.text(
+                            distance_position,
+                            layer_position,
+                            f"{value:+.2f}",
+                            ha="center",
+                            va="center",
+                            fontsize=6.3,
+                            color="black",
+                        )
+            axis.set_xticks(
+                np.arange(len(distance_groups)),
+                distance_groups,
+                rotation=45,
+                ha="right",
+            )
+            axis.set_yticks(np.arange(len(layers)), [str(layer) for layer in layers])
+            axis.set_xlabel("source-to-carrier distance")
+            if column_index == 0:
+                axis.set_ylabel(f"{row_label}\nlayer")
+            else:
+                axis.tick_params(axis="y", labelleft=False)
+            if row_index == 0:
+                axis.set_title(TASK_LABELS.get(task, task).replace("\n", " "))
+    if image is not None:
+        colourbar = figure.colorbar(
+            image,
+            ax=axes,
+            fraction=0.018,
+            pad=0.015,
+            extend="both",
+        )
+        colourbar.set_label("mean structural share − semantic share")
+    figure.suptitle(
+        "ZINC cached canonical analysis: where do semantic and structural profiles diverge?",
+        fontsize=15,
+    )
+    figure.text(
+        0.5,
+        -0.01,
+        "Red indicates greater structural score allocation; blue indicates greater semantic "
+        "allocation. Shares are normalized within each learned head before averaging. "
+        "Additive absolute contributions to 1 − overlap are retained in the CSV.",
+        ha="center",
+        fontsize=8.5,
+    )
+    figures = output_dir / "figures"
+    figures.mkdir(parents=True, exist_ok=True)
+    png = figures / "04_head_profile_distance_decomposition.png"
+    pdf = figures / "04_head_profile_distance_decomposition.pdf"
+    figure.savefig(png, dpi=220, bbox_inches="tight")
+    figure.savefig(pdf, bbox_inches="tight")
+    plt.close(figure)
+    return [png, pdf]
+
+
+def _plot_vnode_profile_diagnostics(
+    records: Sequence[Mapping[str, Any]],
+    layer_rows: Sequence[Mapping[str, Any]],
+    output_dir: Path,
+) -> list[Path]:
+    import matplotlib.pyplot as plt
+
+    tasks = [
+        str(record["task"])
+        for record in records
+        if any(str(row["task"]) == str(record["task"]) for row in layer_rows)
+    ]
+    if not tasks:
+        return []
+    figure, axes = plt.subplots(2, 2, figsize=(12.0, 7.5), constrained_layout=True)
+    panels = (
+        (axes[0, 0], "score_mass", "overlap", "a", "Score-mass overlap"),
+        (
+            axes[0, 1],
+            "per_opportunity",
+            "overlap",
+            "b",
+            "Opportunity-corrected overlap",
+        ),
+        (axes[1, 0], "score_mass", "share", "c", "Virtual-carrier score share"),
+        (
+            axes[1, 1],
+            "per_opportunity",
+            "share",
+            "d",
+            "Opportunity-corrected virtual share",
+        ),
+    )
+    for axis, profile_kind, panel_kind, panel, title in panels:
+        for task in tasks:
+            selected = sorted(
+                (
+                    row
+                    for row in layer_rows
+                    if str(row["task"]) == task
+                    and str(row["profile_kind"]) == profile_kind
+                ),
+                key=lambda row: int(row["layer"]),
+            )
+            if not selected:
+                continue
+            layers = np.asarray([int(row["layer"]) for row in selected])
+            task_label = TASK_LABELS.get(task, task).replace("\n", " ")
+            if panel_kind == "overlap":
+                series = (
+                    ("full_overlap", "full profile", "-", "o"),
+                    ("molecular_only_overlap", "molecular only", "--", "s"),
+                )
+            else:
+                series = (
+                    ("semantic_virtual_share", "semantic", "-", "o"),
+                    ("structural_virtual_share", "structural", "--", "s"),
+                )
+            colours = ("#0072B2", "#D55E00")
+            for colour, (field, label, linestyle, marker) in zip(colours, series):
+                median = np.asarray(
+                    [float(row[f"{field}_median"]) for row in selected]
+                )
+                q1 = np.asarray([float(row[f"{field}_q1"]) for row in selected])
+                q3 = np.asarray([float(row[f"{field}_q3"]) for row in selected])
+                axis.plot(
+                    layers,
+                    median,
+                    color=colour,
+                    linestyle=linestyle,
+                    marker=marker,
+                    linewidth=1.8,
+                    markersize=4,
+                    label=f"{task_label}: {label}",
+                )
+                axis.fill_between(layers, q1, q3, color=colour, alpha=0.13)
+        axis.set_ylim(-0.02, 1.02)
+        axis.set_xlabel("layer")
+        axis.set_ylabel("profile overlap" if panel_kind == "overlap" else "score share")
+        axis.set_title(f"{panel}  {title}")
+        axis.legend(frameon=False, fontsize=7.5)
+    figure.suptitle(
+        "ZINC cached canonical analysis: what role does the virtual carrier play?",
+        fontsize=15,
+    )
+    figure.text(
+        0.5,
+        -0.01,
+        "Lines are across-head medians and shading is the within-layer IQR. Molecular-only "
+        "overlap removes the virtual bin and renormalizes both profiles; virtual shares are "
+        "reported alongside raw virtual score mass in the cached tables.",
+        ha="center",
+        fontsize=8.5,
+    )
+    figures = output_dir / "figures"
+    figures.mkdir(parents=True, exist_ok=True)
+    png = figures / "05_vnode_profile_diagnostics.png"
+    pdf = figures / "05_vnode_profile_diagnostics.pdf"
+    figure.savefig(png, dpi=220, bbox_inches="tight")
+    figure.savefig(pdf, bbox_inches="tight")
+    plt.close(figure)
+    return [png, pdf]
+
+
 def run(
     roots: Sequence[Path],
     output_dir: Path,
@@ -1721,6 +2320,10 @@ def run(
     alignment_summary_rows = alignment["summary_rows"]
     alignment_layer_rows = alignment["layer_summary_rows"]
     alignment_outlier_rows = alignment["outlier_rows"]
+    alignment_distance_rows = alignment["distance_rows"]
+    alignment_distance_layer_rows = alignment["distance_layer_rows"]
+    vnode_rows = alignment["vnode_rows"]
+    vnode_layer_rows = alignment["vnode_layer_rows"]
     summary_rows = [
         {
             key: value
@@ -1761,6 +2364,12 @@ def run(
         "head_profile_alignment_summary.csv": alignment_summary_rows,
         "head_profile_alignment_layerwise.csv": alignment_layer_rows,
         "head_profile_alignment_outliers.csv": alignment_outlier_rows,
+        "head_profile_distance_decomposition.csv": alignment_distance_rows,
+        "head_profile_distance_decomposition_layerwise.csv": (
+            alignment_distance_layer_rows
+        ),
+        "vnode_profile_alignment.csv": vnode_rows,
+        "vnode_profile_alignment_layerwise.csv": vnode_layer_rows,
     }
     for name, rows in tables.items():
         log("table", f"{name}: {len(rows)} rows")
@@ -1808,6 +2417,34 @@ def run(
             "ZINC cache analysis failed while plotting head-profile co-location: "
             f"{type(error).__name__}: {error}"
         ) from error
+    log("figure", "04_head_profile_distance_decomposition")
+    try:
+        figures.extend(
+            _plot_head_profile_distance_decomposition(
+                records,
+                alignment_distance_layer_rows,
+                output_dir,
+            )
+        )
+    except Exception as error:
+        raise RuntimeError(
+            "ZINC cache analysis failed while plotting profile-distance decomposition: "
+            f"{type(error).__name__}: {error}"
+        ) from error
+    log("figure", "05_vnode_profile_diagnostics")
+    try:
+        figures.extend(
+            _plot_vnode_profile_diagnostics(
+                records,
+                vnode_layer_rows,
+                output_dir,
+            )
+        )
+    except Exception as error:
+        raise RuntimeError(
+            "ZINC cache analysis failed while plotting virtual-node diagnostics: "
+            f"{type(error).__name__}: {error}"
+        ) from error
     result = {
         "analysis_version": ANALYSIS_VERSION,
         "train_seed": int(train_seed),
@@ -1821,6 +2458,8 @@ def run(
             "summary": alignment_summary_rows,
             "layerwise": alignment_layer_rows,
             "outliers": alignment_outlier_rows,
+            "distance_decomposition": alignment_distance_layer_rows,
+            "vnode_layerwise": vnode_layer_rows,
         },
         "cache_compatibility": {
             "protocols": protocols,
@@ -1850,6 +2489,14 @@ def run(
             "head_profile_consistency": (
                 "layer medians, IQRs, ranges, threshold fractions, and descriptive Tukey "
                 "low-overlap outliers from one cached checkpoint per architecture"
+            ),
+            "head_profile_distance_decomposition": (
+                "within-head normalized structural share minus semantic share at each exact "
+                "distance; half its absolute value sums to one minus profile overlap"
+            ),
+            "virtual_node_profile": (
+                "virtual-carrier semantic/structural score share and molecular-only overlap "
+                "after removing the virtual bin and renormalizing within each head"
             ),
             "profile_precision": (
                 "cached exact-distance marginal 95% interval width divided by total "
