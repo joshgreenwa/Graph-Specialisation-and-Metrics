@@ -22,14 +22,24 @@ from typing import Any
 import numpy as np
 
 from .methodology.bootstrap import trimmed_mean
-from .methodology.cache import ReadOnlyCacheArtifact, load_cache_artifact_file
+from .methodology.cache import (
+    ReadOnlyCacheArtifact,
+    StaleCacheError,
+    checkpoint_sha256,
+    load_cache_artifact_file,
+)
 from .methodology.grit_figure_data import (
     CanonicalHeadMetrics,
     load_canonical_model_record,
     load_canonical_score_artifact,
 )
+from .methodology.protocol import PROTOCOL_VERSION, stable_hash
 
 ANALYSIS_VERSION = "zinc-cached-rrwp-comparison-v1"
+SUPPORTED_CACHE_PROTOCOLS = (
+    "donor-swap-specialisation-carriage-v3",
+    PROTOCOL_VERSION,
+)
 TASKS = (
     "zinc_1hop_localrrwp",
     "zinc_1hop",
@@ -123,6 +133,84 @@ def artifact_task_candidates(task: str) -> tuple[str, ...]:
     return TASK_ARTIFACT_ALIASES.get(str(task), (str(task),))
 
 
+def load_compatible_cache_artifact_file(path: str | Path) -> ReadOnlyCacheArtifact:
+    """Load current caches or a fingerprint-valid v3 artifact read-only.
+
+    The canonical loader remains fail-closed. This compatibility boundary is
+    intentionally local to the descriptive ZINC comparison and never rewrites,
+    upgrades, or relabels an older artifact.
+    """
+
+    try:
+        return load_cache_artifact_file(path)
+    except StaleCacheError:
+        import torch
+
+        resolved = Path(path)
+        try:
+            payload = torch.load(resolved, map_location="cpu", weights_only=False)
+        except (OSError, RuntimeError, EOFError) as error:
+            raise StaleCacheError(f"unreadable cache {resolved}") from error
+        if not isinstance(payload, Mapping) or not {"metadata", "value"} <= set(payload):
+            raise StaleCacheError(f"cache payload is malformed: {resolved}")
+        metadata = payload["metadata"]
+        protocol = metadata.get("protocol_version")
+        if protocol != "donor-swap-specialisation-carriage-v3":
+            raise
+        contract = metadata.get("contract")
+        if not isinstance(contract, Mapping):
+            raise StaleCacheError(f"cache contract is malformed: {resolved}")
+        complete_contract = dict(contract)
+        scientific_contract = dict(complete_contract)
+        scientific_contract.pop("repository_commit", None)
+        complete_fingerprint = stable_hash(complete_contract)
+        scientific_fingerprint = stable_hash(scientific_contract)
+        claimed = metadata.get("contract_fingerprint")
+        if claimed not in {complete_fingerprint, scientific_fingerprint}:
+            raise StaleCacheError(
+                f"legacy cache contract fingerprint is inconsistent: {resolved}"
+            )
+        provenance = metadata.get("provenance_fingerprint")
+        if provenance is not None and provenance != complete_fingerprint:
+            raise StaleCacheError(
+                f"legacy cache provenance fingerprint is inconsistent: {resolved}"
+            )
+        return ReadOnlyCacheArtifact(
+            path=resolved,
+            file_sha256=checkpoint_sha256(resolved),
+            metadata=metadata,
+            value=payload["value"],
+        )
+
+
+def load_compatible_score_artifact(
+    path: str | Path, *, expected_task: str
+) -> ReadOnlyCacheArtifact:
+    try:
+        return load_canonical_score_artifact(path, expected_task=expected_task)
+    except StaleCacheError:
+        artifact = load_compatible_cache_artifact_file(path)
+    contract = artifact.metadata.get("contract")
+    if not isinstance(contract, Mapping) or contract.get("task") != expected_task:
+        raise StaleCacheError(
+            f"{artifact.path} is not a valid {expected_task!r} score artifact"
+        )
+    required = {
+        "checkpoint_sha256",
+        "model_geometry",
+        "sigma",
+        "split_fingerprint",
+        "task_adapter_version",
+        "train_seed",
+    }
+    missing = sorted(required.difference(contract))
+    if missing:
+        raise StaleCacheError(
+            f"legacy score cache contract is missing {missing}: {artifact.path}"
+        )
+    return artifact
+
+
 def cache_inventory(
     roots: Sequence[Path],
     *,
@@ -183,7 +271,7 @@ def _resolve_task_root(
             fingerprints = []
             for root in candidates:
                 path = _task_dir(root, artifact_task, train_seed) / "cache/scores/raw.pt"
-                artifact = load_canonical_score_artifact(
+                artifact = load_compatible_score_artifact(
                     path, expected_task=artifact_task
                 )
                 fingerprints.append(str(artifact.metadata["contract_fingerprint"]))
@@ -244,7 +332,7 @@ def load_cached_models(
     for task in tasks:
         root, artifact_task = _resolve_task_root(roots, str(task), int(train_seed))
         task_dir = _task_dir(root, artifact_task, int(train_seed))
-        score_artifact = load_canonical_score_artifact(
+        score_artifact = load_compatible_score_artifact(
             task_dir / "cache/scores/raw.pt", expected_task=artifact_task
         )
         model_record = load_canonical_model_record(
@@ -254,7 +342,7 @@ def load_cached_models(
         carriage_artifact = None
         carriage = None
         if carriage_path.is_file():
-            carriage_artifact = load_cache_artifact_file(carriage_path)
+            carriage_artifact = load_compatible_cache_artifact_file(carriage_path)
             _validate_carriage(
                 carriage_artifact,
                 score_artifact,
@@ -556,9 +644,19 @@ def carriage_profile(
 
 def summarise_model(model: CachedModel) -> dict[str, Any]:
     metrics = CanonicalHeadMetrics.from_scores(model.score)
+    metadata = model.score_artifact.metadata
+    contract = metadata.get("contract", {})
     record: dict[str, Any] = {
         "task": model.task,
         "artifact_task": model.artifact_task,
+        "cache_protocol": str(metadata.get("protocol_version", "unknown")),
+        "raw_score_aggregation": str(
+            contract.get("raw_score_aggregation", "unknown")
+        ),
+        "semantic_donor_law": str(contract.get("semantic_donor_law", "unknown")),
+        "structural_donor_law": str(
+            contract.get("structural_donor_law", "unknown")
+        ),
         "label": TASK_LABELS.get(model.task, model.task),
         "train_seed": int(model.model_record["train_seed"]),
         "test_mae": float(model.model_record["test_metric"]),
@@ -722,6 +820,20 @@ def _align_values(
     return np.asarray([source.get(str(label), fill) for label in target], dtype=np.float64)
 
 
+def _record_label(
+    record: Mapping[str, Any], *, multiline: bool, show_protocol: bool
+) -> str:
+    task = str(record["task"])
+    label = TASK_LABELS.get(task, task)
+    if not multiline:
+        label = label.replace("\n", " ")
+    if not show_protocol:
+        return label
+    protocol = str(record.get("cache_protocol", "unknown")).rsplit("-", 1)[-1]
+    separator = "\n" if multiline else " "
+    return f"{label}{separator}[{protocol}]"
+
+
 def _profile_total_variation(
     left: Mapping[str, Any],
     right: Mapping[str, Any],
@@ -753,6 +865,11 @@ def pairwise_comparisons(
         row: dict[str, Any] = {
             "left_task": left["task"],
             "right_task": right["task"],
+            "left_cache_protocol": left["cache_protocol"],
+            "right_cache_protocol": right["cache_protocol"],
+            "same_structural_donor_law": (
+                left["structural_donor_law"] == right["structural_donor_law"]
+            ),
             "test_mae_right_minus_left": float(right["test_mae"] - left["test_mae"]),
             "parameter_ratio_right_over_left": float(
                 right["parameters"] / left["parameters"]
@@ -802,7 +919,11 @@ def _plot_core(records: Sequence[Mapping[str, Any]], output_dir: Path) -> list[P
 
     figure, axes = plt.subplots(2, 2, figsize=(13.5, 9.2), constrained_layout=True)
     tasks = [str(record["task"]) for record in records]
-    labels = [TASK_LABELS.get(task, task) for task in tasks]
+    show_protocol = len({str(record["cache_protocol"]) for record in records}) > 1
+    labels = [
+        _record_label(record, multiline=True, show_protocol=show_protocol)
+        for record in records
+    ]
     colours = [TASK_COLOURS.get(task, "#777777") for task in tasks]
     x = np.arange(len(tasks))
 
@@ -874,7 +995,9 @@ def _plot_core(records: Sequence[Mapping[str, Any]], output_dir: Path) -> list[P
                 linewidth=1.8,
                 markersize=5,
                 color=TASK_COLOURS.get(task, "#777777"),
-                label=TASK_LABELS.get(task, task).replace("\n", " "),
+                label=_record_label(
+                    record, multiline=False, show_protocol=show_protocol
+                ),
             )
         axis.set_xticks(np.arange(len(distance_labels)), distance_labels)
         axis.set_xlabel("source-to-carrier graph distance")
@@ -904,6 +1027,7 @@ def _plot_carriage_variability(
     import matplotlib.pyplot as plt
 
     available = [record for record in records if record.get("carriage_cache")]
+    show_protocol = len({str(record["cache_protocol"]) for record in records}) > 1
     figure, axes = plt.subplots(
         2,
         2,
@@ -930,7 +1054,9 @@ def _plot_carriage_variability(
                 linewidth=1.8,
                 markersize=5,
                 color=TASK_COLOURS.get(task, "#777777"),
-                label=TASK_LABELS.get(task, task).replace("\n", " "),
+                label=_record_label(
+                    record, multiline=False, show_protocol=show_protocol
+                ),
             )
         axis.set_xticks(np.arange(len(labels)), labels)
         axis.set_xlabel("exact source-to-carrier graph distance")
@@ -959,7 +1085,9 @@ def _plot_carriage_variability(
                 linewidth=1.8,
                 markersize=5,
                 color=TASK_COLOURS.get(task, "#777777"),
-                label=TASK_LABELS.get(task, task).replace("\n", " "),
+                label=_record_label(
+                    record, multiline=False, show_protocol=show_protocol
+                ),
             )
         if labels:
             axis.set_xticks(np.arange(len(labels)), labels)
@@ -1007,6 +1135,11 @@ def run(
         require_carriage=require_carriage,
     )
     records = [summarise_model(model) for model in models]
+    protocols = sorted({str(record["cache_protocol"]) for record in records})
+    semantic_laws = sorted({str(record["semantic_donor_law"]) for record in records})
+    structural_laws = sorted(
+        {str(record["structural_donor_law"]) for record in records}
+    )
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     summary_rows = [
@@ -1055,9 +1188,26 @@ def run(
         "tasks": list(tasks),
         "models": records,
         "pairwise_comparisons": comparison_rows,
+        "cache_compatibility": {
+            "protocols": protocols,
+            "semantic_donor_laws": semantic_laws,
+            "structural_donor_laws": structural_laws,
+            "same_semantic_donor_law": len(semantic_laws) == 1,
+            "same_structural_donor_law": len(structural_laws) == 1,
+            "interpretation": (
+                "strictly comparable cached score estimands"
+                if len(semantic_laws) == 1 and len(structural_laws) == 1
+                else "mixed donor laws: semantic and structural channels must be "
+                "interpreted according to their per-model stored contracts"
+            ),
+        },
         "figures": [str(path) for path in figures],
         "interpretation_contract": {
             "scores": "immutable canonical cached donor-swap learned-head scores",
+            "legacy_protocols": (
+                "v3 is loaded read-only only after contract-fingerprint validation; "
+                "the original protocol and donor laws are retained in every table"
+            ),
             "score_distance": "exact per-head score mass grouped only for display",
             "profile_precision": (
                 "cached exact-distance marginal 95% interval width divided by total "

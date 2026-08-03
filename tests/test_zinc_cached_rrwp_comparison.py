@@ -1,14 +1,21 @@
 from pathlib import Path
 
 import numpy as np
+import pytest
+import torch
 
 from graph_specialisation_metrics.methodology.bootstrap import Interval
-from graph_specialisation_metrics.methodology.cache import ReadOnlyCacheArtifact
+from graph_specialisation_metrics.methodology.cache import (
+    ReadOnlyCacheArtifact,
+    StaleCacheError,
+)
+from graph_specialisation_metrics.methodology.protocol import stable_hash
 from graph_specialisation_metrics.zinc_cached_rrwp_comparison import (
     CachedModel,
     cache_inventory,
     carriage_profile,
     group_distance,
+    load_compatible_cache_artifact_file,
     run,
     score_interval_width_profile,
     score_profile,
@@ -165,6 +172,32 @@ def test_inventory_recognizes_historical_local_rrwp_task_name(tmp_path):
     )
     assert inventory[0]["complete_score_locations"] == 1
     assert inventory[0]["matches"][0]["artifact_task"] == "zinc_1hop_local"
+
+
+def test_legacy_v3_cache_is_read_only_and_fingerprint_validated(tmp_path):
+    contract = {
+        "task": "zinc_1hop",
+        "checkpoint_sha256": "checkpoint",
+        "repository_commit": "legacy-commit",
+    }
+    path = tmp_path / "raw.pt"
+    payload = {
+        "metadata": {
+            "protocol_version": "donor-swap-specialisation-carriage-v3",
+            "contract": contract,
+            "contract_fingerprint": stable_hash(contract),
+        },
+        "value": {"sentinel": 7},
+    }
+    torch.save(payload, path)
+    artifact = load_compatible_cache_artifact_file(path)
+    assert artifact.value == {"sentinel": 7}
+    assert artifact.metadata["protocol_version"].endswith("v3")
+
+    payload["metadata"]["contract_fingerprint"] = "corrupt"
+    torch.save(payload, path)
+    with pytest.raises(StaleCacheError, match="fingerprint"):
+        load_compatible_cache_artifact_file(path)
 
 
 def test_cached_interval_width_and_carriage_are_normalized():

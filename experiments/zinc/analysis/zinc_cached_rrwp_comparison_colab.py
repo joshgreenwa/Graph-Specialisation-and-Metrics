@@ -252,6 +252,16 @@ result = run(
     require_carriage=REQUIRE_CARRIAGE,
 )
 
+compatibility = result["cache_compatibility"]
+print("Cache compatibility")
+display(pd.DataFrame([compatibility]))
+if not compatibility["same_structural_donor_law"]:
+    print(
+        "[compatibility-warning] Score formulas match, but stored structural donor laws differ. "
+        "Treat small cross-protocol structural-score differences as exploratory; per-model "
+        "protocol and donor-law columns are retained in the tables."
+    )
+
 print("Model summary")
 display(pd.read_csv(OUTPUT_DIR / "model_summary.csv"))
 print("Local/global and cross-architecture comparisons")
