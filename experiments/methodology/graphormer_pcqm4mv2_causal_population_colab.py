@@ -35,10 +35,10 @@ SEMANTIC_DONOR_GRAPHS = 2_000
 SOURCES_PER_GRAPH = 6
 DONORS_PER_SOURCE = 8
 
-# A100-oriented throughput preset. Head chunks back off automatically on OOM;
-# lower GRAPHS_PER_BATCH first if a smaller GPU cannot fit clean ablation.
-GRAPHS_PER_BATCH = 8
-HEAD_BATCH_SIZE = 32
+# A100 80 GB-oriented throughput preset. Graph-score and head chunks back off
+# automatically on OOM; lower GRAPHS_PER_BATCH first on a smaller GPU.
+GRAPHS_PER_BATCH = 16
+HEAD_BATCH_SIZE = 64
 EVENT_BATCH_SIZE = SOURCES_PER_GRAPH * DONORS_PER_SOURCE
 
 # Primary paper population: 16 J-matched semantic/structural pairs (32 heads)

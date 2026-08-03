@@ -11,7 +11,9 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import time
 from collections.abc import Mapping, Sequence
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -441,6 +443,20 @@ def run_population_events(
     audits: list[dict[str, Any]] = []
     if population_gate["status"] != "estimable":
         return rows, cache, audits
+    total_items = len(plan) * len(CHANNELS)
+    completed_items = 0
+    cache_hits = 0
+    computed_items = 0
+    started = time.monotonic()
+    if prepared.progress is not None:
+        prepared.progress.emit(
+            "population_causal_plan",
+            total_graphs=len(plan),
+            total_graph_channels=total_items,
+            total_heads=len(targets),
+            head_batch_size=int(execution.head_batch_size),
+            event_batch_size=int(execution.event_batch_size),
+        )
     for graph_id in sorted(plan):
         for channel in CHANNELS:
             stage = f"focused_population/events/{channel}"
@@ -448,6 +464,8 @@ def run_population_events(
             cached = (
                 cache.load(stage, name, strict=True) if config.resume and not config.force else None
             )
+            was_cached = cached is not None
+            did_compute = False
             if cached is None:
                 reused = _legacy_rows(
                     legacy_cache.path(f"focused/events/{channel}", name),
@@ -476,6 +494,7 @@ def run_population_events(
                         "event_same_condition_patch_max": 0.0,
                     }
                 )
+                did_compute = bool(missing)
                 merged = reused + list(measured["rows"])
                 cached = {
                     "graph": int(graph_id),
@@ -495,6 +514,9 @@ def run_population_events(
                     ),
                 }
                 cache.save(stage, name, cached)
+                computed_items += int(did_compute)
+            else:
+                cache_hits += 1
             rows.extend(cached["rows"])
             audits.append(
                 {
@@ -513,6 +535,31 @@ def run_population_events(
                     )
                 }
             )
+            completed_items += 1
+            elapsed = max(time.monotonic() - started, 1e-9)
+            computed_rate = computed_items / elapsed if computed_items else 0.0
+            overall_rate = completed_items / elapsed
+            should_report = (
+                not was_cached
+                or completed_items == total_items
+                or completed_items % 16 == 0
+            )
+            if should_report and prepared.progress is not None:
+                remaining_items = max(0, total_items - completed_items)
+                prepared.progress.emit(
+                    "population_causal_progress",
+                    graph=int(graph_id),
+                    channel=str(channel),
+                    completed_graph_channels=completed_items,
+                    total_graph_channels=total_items,
+                    cache_hits=cache_hits,
+                    computed_graph_channels=computed_items,
+                    reused_heads=int(cached.get("reused_head_count") or 0),
+                    computed_heads=int(cached.get("computed_head_count") or 0),
+                    computed_graph_channels_per_second=computed_rate,
+                    graph_channels_per_second=overall_rate,
+                    eta_seconds=remaining_items / overall_rate,
+                )
     return rows, cache, audits
 
 
@@ -524,6 +571,7 @@ def _event_interval(
     metric_order: Sequence[str],
     require_controlled: bool,
     seed_offset: int,
+    progress: Any | None = None,
 ) -> dict[str, Any]:
     head_order = _target_heads(gate)
     head_position = {head: position for position, head in enumerate(head_order)}
@@ -552,6 +600,17 @@ def _event_interval(
     }
     if any(not observations[channel] for channel in CHANNELS):
         raise ValueError("population causal cache has no complete channel event matrix")
+    def report_draw(completed: int, total: int) -> None:
+        if progress is not None and (
+            completed == 1 or completed % 100 == 0 or completed == total
+        ):
+            progress.emit(
+                "population_causal_bootstrap_progress",
+                metrics=tuple(metric_order),
+                completed_draws=int(completed),
+                total_draws=int(total),
+            )
+
     interval = paired_channel_percentile_interval(
         observations["semantic"],
         observations["structural"],
@@ -559,6 +618,7 @@ def _event_interval(
         transform=lambda value: value,
         resample_source=(True, True),
         retain_draws=True,
+        on_draw=report_draw,
     )
     if interval.draws is None:
         raise RuntimeError("population event bootstrap did not retain draws")
@@ -720,6 +780,8 @@ def aggregate_population_tests(
     scores: Mapping[str, Any],
     config: MethodologyConfig,
     audits: Sequence[Mapping[str, Any]] = (),
+    *,
+    progress: Any | None = None,
 ) -> dict[str, Any]:
     patch = _event_interval(
         causal_rows,
@@ -728,6 +790,7 @@ def aggregate_population_tests(
         metric_order=("R_align_adj", "I_align_adj"),
         require_controlled=True,
         seed_offset=401,
+        progress=progress,
     )
     necessity = _event_interval(
         causal_rows,
@@ -736,6 +799,7 @@ def aggregate_population_tests(
         metric_order=("N_fraction",),
         require_controlled=False,
         seed_offset=409,
+        progress=progress,
     )
     return {
         "version": POPULATION_CAUSAL_VERSION,
@@ -751,7 +815,7 @@ def aggregate_population_tests(
         "injection": _endpoint(patch, "I_align_adj"),
         "necessity": _endpoint(necessity, "N_fraction"),
         "clean_ablation": _add_clean_diagnostics(
-            _clean_ablation_interval(clean_rows, scores, config)
+            _clean_ablation_interval(clean_rows, scores, config, progress=progress)
         ),
         "execution_audit": {
             "shards": tuple(audits),
@@ -779,6 +843,13 @@ def run_population_analysis(
     if config.resume and not config.force:
         cached = cache.load("focused_population", "core_tests", strict=True)
         if cached is not None:
+            log("[cache] loaded complete Graphormer causal population analysis")
+            if prepared.progress is not None:
+                prepared.progress.emit(
+                    "cache_hit",
+                    phase="population_causal",
+                    cache="core_tests",
+                )
             return cached
     if population_gate["status"] != "estimable":
         raise RuntimeError(population_gate["status_reason"])
@@ -798,6 +869,7 @@ def run_population_analysis(
         scores,
         config,
         audits,
+        progress=prepared.progress,
     )
     core["execution"] = dataclasses.asdict(execution)
     cache.save("focused_population", "core_tests", core)
@@ -930,45 +1002,88 @@ def run(
         },
     )
     prepared = prepare_task(config, "graphormer_pcqm4mv2", 0)
-    scores = run_scores(
-        prepared,
-        config,
-        plan=_stage_plan(prepared, config, "scores"),
-        focused_only=True,
-    )
-    confidence_gate = run_confidence_gate(prepared, config, scores)
-    population_gate = build_population_gate(scores, confidence_gate, policy)
-    _, cache = _population_cache(prepared, config, population_gate)
-    existing_gate = (
-        cache.load("focused_population", "gate", strict=True)
-        if config.resume and not config.force
-        else None
-    )
-    if existing_gate is None:
-        cache.save("focused_population", "gate", population_gate)
-    else:
-        population_gate = existing_gate
-    core = run_population_analysis(
-        prepared,
-        config,
-        scores,
-        confidence_gate,
-        population_gate,
-        execution=execution,
-    )
-    result = {
-        "analysis_version": POPULATION_CAUSAL_VERSION,
-        "output_dir": str(root),
-        "population_status": population_gate["status"],
-        "head_pair_count": len(population_gate["specialist_pairs"]),
-        "null_head_count": len(population_gate["null_pairs"]),
-        "sample_sizes": core["sample_sizes"],
-        "matching_balance": population_gate["matching_balance"],
-        "execution_audit": core["execution_audit"],
-    }
-    if phase == "all":
-        result["manifest"] = render_cached_population_figures(root)
-    return result
+    progress = prepared.progress
+    if progress is not None:
+        progress.update(task="graphormer_pcqm4mv2", train_seed=0)
+        progress.start()
+        progress.emit(
+            "population_run_start",
+            message=(
+                "paper causal run "
+                f"discovery={config.sizes.discovery_graphs} "
+                f"causal={config.sizes.causal_graphs} "
+                f"clean_ablation={config.sizes.clean_ablation_graphs} "
+                f"graph_batch={config.execution.graphs_per_batch} "
+                f"head_batch={execution.head_batch_size} "
+                f"event_batch={execution.event_batch_size}"
+            ),
+            phase=phase,
+            sample_sizes=dataclasses.asdict(config.sizes),
+            population_policy=dataclasses.asdict(policy),
+            execution=dataclasses.asdict(execution),
+            graphs_per_batch=int(config.execution.graphs_per_batch),
+        )
+    try:
+        context = progress.component("population_scores") if progress else nullcontext()
+        with context:
+            scores = run_scores(
+                prepared,
+                config,
+                plan=_stage_plan(prepared, config, "scores"),
+                focused_only=True,
+            )
+        context = progress.component("population_selection") if progress else nullcontext()
+        with context:
+            confidence_gate = run_confidence_gate(prepared, config, scores)
+            population_gate = build_population_gate(scores, confidence_gate, policy)
+            _, cache = _population_cache(prepared, config, population_gate)
+            existing_gate = (
+                cache.load("focused_population", "gate", strict=True)
+                if config.resume and not config.force
+                else None
+            )
+            if existing_gate is None:
+                cache.save("focused_population", "gate", population_gate)
+            else:
+                population_gate = existing_gate
+            if progress is not None:
+                progress.emit(
+                    "population_selection_complete",
+                    status=population_gate["status"],
+                    specialist_pairs=len(population_gate["specialist_pairs"]),
+                    null_heads=len(population_gate["null_pairs"]),
+                    candidate_counts=population_gate["candidate_counts"],
+                    matching_balance=population_gate["matching_balance"],
+                )
+        context = progress.component("population_causal") if progress else nullcontext()
+        with context:
+            core = run_population_analysis(
+                prepared,
+                config,
+                scores,
+                confidence_gate,
+                population_gate,
+                execution=execution,
+            )
+        result = {
+            "analysis_version": POPULATION_CAUSAL_VERSION,
+            "output_dir": str(root),
+            "population_status": population_gate["status"],
+            "head_pair_count": len(population_gate["specialist_pairs"]),
+            "null_head_count": len(population_gate["null_pairs"]),
+            "sample_sizes": core["sample_sizes"],
+            "matching_balance": population_gate["matching_balance"],
+            "execution_audit": core["execution_audit"],
+        }
+        if phase == "all":
+            context = progress.component("population_figures") if progress else nullcontext()
+            with context:
+                result["manifest"] = render_cached_population_figures(root)
+        return result
+    finally:
+        if progress is not None:
+            progress.emit("population_run_stop")
+            progress.close()
 
 
 __all__ = [

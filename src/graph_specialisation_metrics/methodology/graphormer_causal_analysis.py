@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -588,16 +589,36 @@ def _causal_graph_channel(
         except torch.cuda.OutOfMemoryError:
             if len(selected_heads) <= 1:
                 raise
+            if prepared.progress is not None:
+                prepared.progress.emit(
+                    "focused_causal_oom_backoff",
+                    graph=int(graph_id),
+                    channel=str(channel),
+                    attempted_heads=len(selected_heads),
+                    retry_heads=max(1, len(selected_heads) // 2),
+                    event_batch_size=int(execution.event_batch_size),
+                )
             torch.cuda.empty_cache()
             split_rows: list[dict[str, Any]] = []
             for smaller in _split_head_chunk(selected_heads):
                 split_rows.extend(process_head_chunk(smaller))
             return split_rows
 
+    completed_heads = 0
     for start in range(0, len(heads), int(execution.head_batch_size)):
-        output_rows.extend(
-            process_head_chunk(heads[start : start + int(execution.head_batch_size)])
-        )
+        selected_heads = heads[start : start + int(execution.head_batch_size)]
+        output_rows.extend(process_head_chunk(selected_heads))
+        completed_heads += len(selected_heads)
+        if prepared.progress is not None:
+            prepared.progress.emit(
+                "focused_causal_head_progress",
+                graph=int(graph_id),
+                channel=str(channel),
+                completed_heads=int(completed_heads),
+                total_heads=len(heads),
+                event_count=len(records),
+                event_batch_size=int(execution.event_batch_size),
+            )
     return {
         "graph": int(graph_id),
         "channel": channel,
@@ -696,6 +717,18 @@ def _clean_ablation_graphs(
         rows.extend(cached_by_graph[graph_id]["rows"])
 
     graph_batch = max(1, int(config.execution.graphs_per_batch))
+    started = time.monotonic()
+    completed_missing = 0
+    if prepared.progress is not None:
+        prepared.progress.emit(
+            "clean_ablation_plan",
+            total_graphs=len(graph_ids),
+            cache_hits=len(cached_by_graph),
+            cache_misses=len(missing),
+            total_heads=len(heads),
+            graphs_per_batch=graph_batch,
+            heads_per_batch=int(execution.head_batch_size),
+        )
     for graph_start in range(0, len(missing), graph_batch):
         selected_ids = missing[graph_start : graph_start + graph_batch]
         bases = [prepared.grit.eval_ds[int(graph_id)] for graph_id in selected_ids]
@@ -724,17 +757,33 @@ def _clean_ablation_graphs(
             except torch.cuda.OutOfMemoryError:
                 if len(selected_heads) <= 1:
                     raise
+                if prepared.progress is not None:
+                    prepared.progress.emit(
+                        "clean_ablation_oom_backoff",
+                        batch_graphs=len(selected_ids),  # noqa: B023
+                        attempted_heads=len(selected_heads),
+                        retry_heads=max(1, len(selected_heads) // 2),
+                    )
                 torch.cuda.empty_cache()
                 first, second = _split_head_chunk(selected_heads)
                 process_head_chunk(first, offset)
                 if second:
                     process_head_chunk(second, offset + len(first))
 
+        completed_heads = 0
         for head_start in range(0, len(heads), int(execution.head_batch_size)):
-            process_head_chunk(
-                heads[head_start : head_start + int(execution.head_batch_size)],
-                head_start,
-            )
+            selected_heads = heads[
+                head_start : head_start + int(execution.head_batch_size)
+            ]
+            process_head_chunk(selected_heads, head_start)
+            completed_heads += len(selected_heads)
+            if prepared.progress is not None:
+                prepared.progress.emit(
+                    "clean_ablation_head_progress",
+                    batch_graphs=len(selected_ids),
+                    completed_heads=int(completed_heads),
+                    total_heads=len(heads),
+                )
         for graph_position, graph_id in enumerate(selected_ids):
             graph_rows = [
                 {
@@ -750,6 +799,20 @@ def _clean_ablation_graphs(
                 "focused/clean_ablation", f"graph_{int(graph_id):06d}", payload
             )
             rows.extend(graph_rows)
+        completed_missing += len(selected_ids)
+        elapsed = max(time.monotonic() - started, 1e-9)
+        rate = completed_missing / elapsed
+        if prepared.progress is not None:
+            prepared.progress.emit(
+                "clean_ablation_progress",
+                completed_graphs=len(cached_by_graph) + completed_missing,
+                total_graphs=len(graph_ids),
+                computed_graphs=completed_missing,
+                cache_hits=len(cached_by_graph),
+                batch_graphs=len(selected_ids),
+                graphs_per_second=rate,
+                eta_seconds=(len(missing) - completed_missing) / rate,
+            )
     return rows
 
 
@@ -933,6 +996,8 @@ def _clean_ablation_interval(
     rows: Sequence[Mapping[str, Any]],
     scores: Mapping[str, Any],
     config: MethodologyConfig,
+    *,
+    progress: Any | None = None,
 ) -> dict[str, Any]:
     from scipy.stats import spearmanr
 
@@ -961,8 +1026,21 @@ def _clean_ablation_interval(
         beta = _standardized_layer_coefficient(J, value, layers)
         return np.concatenate((value, np.asarray((rho, beta))))
 
+    def report_draw(completed: int, total: int) -> None:
+        if progress is not None and (
+            completed == 1 or completed % 100 == 0 or completed == total
+        ):
+            progress.emit(
+                "clean_ablation_bootstrap_progress",
+                completed_draws=int(completed),
+                total_draws=int(total),
+            )
+
     interval = nested_percentile_interval(
-        observations, config.bootstrap, transform=transform
+        observations,
+        config.bootstrap,
+        transform=transform,
+        on_draw=report_draw,
     )
     count = len(heads)
     return {

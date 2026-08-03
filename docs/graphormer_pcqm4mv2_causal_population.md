@@ -67,10 +67,15 @@ Dataset and checkpoint downloads remain shared. A new graph/channel shard contai
 only the missing population heads. Styling-only reruns use `PHASE = "figures"` and do not load
 Graphormer or PCQM4Mv2.
 
-The Colab defaults target an A100-class runtime: eight clean-ablation graphs, 32 heads, and all
-48 source/donor events are attempted per batch. Head batches recursively back off after a CUDA OOM;
-on smaller GPUs, reduce `GRAPHS_PER_BATCH` first. `FORCE = False` keeps every completed per-graph
-shard resumable across interrupted sessions.
+The Colab defaults target an 80 GB A100-class runtime: 16 clean-ablation graphs, 64 heads, and all
+48 source/donor events are attempted per batch. Graph-score batches and head batches recursively
+back off after a CUDA OOM; on smaller GPUs, reduce `GRAPHS_PER_BATCH` first. `FORCE = False` keeps
+every completed per-graph shard resumable across interrupted sessions.
+
+Execution progress is printed to the Colab output and appended to `progress.jsonl`. It records
+stage transitions, score batches, cache hits and misses, causal graph-channel and head completion,
+clean-ablation graph/head completion, throughput and ETA, bootstrap draws, CUDA allocation peaks,
+and 30-second device-wide GPU utilization, VRAM, and power heartbeats.
 
 Outputs are vector PDFs, 600-DPI PNGs, and JSON provenance sidecars under
 `figures/focused_causal_population/`:

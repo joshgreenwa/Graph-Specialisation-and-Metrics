@@ -7,6 +7,10 @@ import matplotlib
 matplotlib.use("Agg")
 import numpy as np
 
+from graph_specialisation_metrics.methodology.bootstrap import (
+    Observation,
+    nested_percentile_interval,
+)
 from graph_specialisation_metrics.methodology.graphormer_causal_analysis import (
     production_config,
 )
@@ -20,6 +24,29 @@ from graph_specialisation_metrics.methodology.graphormer_causal_population_plots
     render_population_figure_suite,
 )
 from graph_specialisation_metrics.methodology.scores import HeadCoordinates
+
+
+def test_nested_bootstrap_progress_callback_reports_all_draws():
+    calls = []
+    observations = [
+        Observation(seed=0, graph=graph, source=0, donor=0, value=float(graph))
+        for graph in range(10)
+    ]
+    config = production_config(
+        output_dir="/tmp/bootstrap-progress",
+        dataset_root="/tmp/pcqm",
+        cache_dir="/tmp/hf",
+        accelerator="cpu",
+    )
+    interval = nested_percentile_interval(
+        observations,
+        config.bootstrap,
+        on_draw=lambda completed, total: calls.append((completed, total)),
+    )
+    assert interval.replicates == 2_000
+    assert calls[0] == (1, 2_000)
+    assert calls[-1] == (2_000, 2_000)
+    assert len(calls) == 2_000
 
 
 def _scores():
@@ -77,7 +104,7 @@ def test_production_config_accepts_paper_scale_disjoint_populations(tmp_path):
         semantic_donor_graphs=2_000,
         sources_per_graph=6,
         donors_per_source=8,
-        graphs_per_batch=8,
+        graphs_per_batch=16,
     )
     config.validate()
     assert config.sizes.discovery_graphs == 256
@@ -86,7 +113,7 @@ def test_production_config_accepts_paper_scale_disjoint_populations(tmp_path):
     assert config.sizes.semantic_donor_graphs == 2_000
     assert config.sizes.sources_per_graph == 6
     assert config.sizes.donors_per_source == 8
-    assert config.execution.graphs_per_batch == 8
+    assert config.execution.graphs_per_batch == 16
 
 
 def test_population_gate_is_discovery_only_balanced_and_nonoverlapping():

@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import Any, Callable, Sequence
+from typing import Any
 
 import numpy as np
 
@@ -120,6 +121,7 @@ def nested_percentile_interval(
     graph_reduce: Callable[[np.ndarray], np.ndarray] | None = None,
     transform: Callable[[np.ndarray], np.ndarray] | None = None,
     retain_draws: bool = False,
+    on_draw: Callable[[int, int], None] | None = None,
 ) -> Interval:
     """Run the complete seed->graph->source->donor bootstrap hierarchy."""
 
@@ -132,12 +134,12 @@ def nested_percentile_interval(
     apply = transform or (lambda value: value)
     estimate = apply(_nested_estimate(observations, None, policy, reduce))
     rng = np.random.default_rng(int(policy.rng_seed))
-    draws = np.stack(
-        [
-            apply(_nested_estimate(observations, rng, policy, reduce))
-            for _ in range(policy.replicates)
-        ]
-    )
+    draw_values = []
+    for draw in range(int(policy.replicates)):
+        draw_values.append(apply(_nested_estimate(observations, rng, policy, reduce)))
+        if on_draw is not None:
+            on_draw(draw + 1, int(policy.replicates))
+    draws = np.stack(draw_values)
     alpha = (1.0 - float(policy.confidence)) / 2.0
     low, high, estimable = _percentiles(draws, alpha)
     levels = [
@@ -307,6 +309,6 @@ def reportable_bin(
     policy: BootstrapPolicy,
 ) -> bool:
     return (
-        len(set(int(value) for value in graph_ids)) >= int(policy.minimum_graphs)
+        len({int(value) for value in graph_ids}) >= int(policy.minimum_graphs)
         and int(pair_count) >= int(policy.minimum_pairs)
     )
