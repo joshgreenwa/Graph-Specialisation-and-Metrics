@@ -24,6 +24,7 @@ CANONICAL_ROOTS = (
     DRIVE_ROOT / "graph_specialisation_metrics/canonical_methodology_v4_zinc_qm9",
     DRIVE_ROOT / "graph_specialisation_metrics/canonical_methodology",
 )
+CANONICAL_SEARCH_ROOT = DRIVE_ROOT / "graph_specialisation_metrics"
 OUTPUT_DIR = DRIVE_ROOT / "graph_specialisation_metrics/zinc_cached_rrwp_comparison"
 TRAIN_SEED = 42
 REQUIRE_CARRIAGE = False
@@ -92,11 +93,36 @@ for module_name in tuple(sys.modules):
 os.chdir(REPO_DIR)
 
 from graph_specialisation_metrics.zinc_cached_rrwp_comparison import (
+    artifact_task_candidates,
     cache_inventory,
     run,
 )
 
 inventory = cache_inventory(CANONICAL_ROOTS, tasks=TASKS, train_seed=TRAIN_SEED)
+
+
+def missing_tasks(records):
+    return [
+        record["task"]
+        for record in records
+        if int(record["complete_score_locations"]) < 1
+    ]
+
+
+# Older runs sometimes used another canonical root (and the local-RRWP model
+# historically used the task name ``zinc_1hop_local``). Discover exact seed-42
+# canonical layouts, but never silently mix another seed into this comparison.
+extra_roots = []
+for requested_task in missing_tasks(inventory):
+    for artifact_task in artifact_task_candidates(requested_task):
+        pattern = f"**/{artifact_task}/seed_{TRAIN_SEED}/cache/scores/raw.pt"
+        for score_path in CANONICAL_SEARCH_ROOT.glob(pattern):
+            if (score_path.parents[2] / "model.json").is_file():
+                extra_roots.append(score_path.parents[4])
+if extra_roots:
+    CANONICAL_ROOTS = tuple(dict.fromkeys((*CANONICAL_ROOTS, *extra_roots)))
+    inventory = cache_inventory(CANONICAL_ROOTS, tasks=TASKS, train_seed=TRAIN_SEED)
+
 inventory_rows = []
 for task_record in inventory:
     if task_record["matches"]:
@@ -104,6 +130,7 @@ for task_record in inventory:
             inventory_rows.append(
                 {
                     "task": task_record["task"],
+                    "artifact_task": match["artifact_task"],
                     "root": match["root"],
                     "score": match["score_exists"],
                     "model": match["model_exists"],
@@ -114,6 +141,7 @@ for task_record in inventory:
         inventory_rows.append(
             {
                 "task": task_record["task"],
+                "artifact_task": "not found",
                 "root": "not found",
                 "score": False,
                 "model": False,
@@ -126,15 +154,29 @@ from IPython.display import Image, display
 
 print("Canonical cache inventory")
 display(pd.DataFrame(inventory_rows))
-missing = [
-    record["task"]
-    for record in inventory
-    if int(record["complete_score_locations"]) < 1
-]
+missing = missing_tasks(inventory)
 if missing:
+    nearby = []
+    for requested_task in missing:
+        for artifact_task in artifact_task_candidates(requested_task):
+            pattern = f"**/{artifact_task}/seed_*/cache/scores/raw.pt"
+            for score_path in CANONICAL_SEARCH_ROOT.glob(pattern):
+                nearby.append(
+                    {
+                        "requested_task": requested_task,
+                        "artifact_task": artifact_task,
+                        "seed_directory": score_path.parents[2].name,
+                        "score": str(score_path),
+                        "model_json": (score_path.parents[2] / "model.json").is_file(),
+                    }
+                )
+    if nearby:
+        print("Nearby caches found, but not used because task/seed completeness differs")
+        display(pd.DataFrame(nearby))
     expected = "\n".join(
-        str(root / task / f"seed_{TRAIN_SEED}" / "cache/scores/raw.pt")
+        str(root / artifact_task / f"seed_{TRAIN_SEED}" / "cache/scores/raw.pt")
         for task in missing
+        for artifact_task in artifact_task_candidates(task)
         for root in CANONICAL_ROOTS
     )
     raise FileNotFoundError(

@@ -38,8 +38,15 @@ TASKS = (
     "zinc_2hop_vnode",
     "zinc",
 )
+TASK_ARTIFACT_ALIASES = {
+    # Historical canonical runs used this name. Both registrations reconstruct
+    # the same parameter-matched local-RRWP checkpoint, but the stored task
+    # identity must still be validated under its original name.
+    "zinc_1hop_localrrwp": ("zinc_1hop_localrrwp", "zinc_1hop_local"),
+}
 TASK_LABELS = {
     "zinc_1hop_localrrwp": "1-hop\nlocal RRWP",
+    "zinc_1hop_local": "1-hop\nlocal RRWP",
     "zinc_1hop": "1-hop\nglobal RRWP",
     "zinc_1hop_vnode": "1-hop + VN",
     "zinc_2hop": "2-hop",
@@ -48,6 +55,7 @@ TASK_LABELS = {
 }
 TASK_COLOURS = {
     "zinc_1hop_localrrwp": "#E69F00",
+    "zinc_1hop_local": "#E69F00",
     "zinc_1hop": "#0072B2",
     "zinc_1hop_vnode": "#CC79A7",
     "zinc_2hop": "#009E73",
@@ -56,6 +64,7 @@ TASK_COLOURS = {
 }
 TASK_MARKERS = {
     "zinc_1hop_localrrwp": "o",
+    "zinc_1hop_local": "o",
     "zinc_1hop": "s",
     "zinc_1hop_vnode": "^",
     "zinc_2hop": "D",
@@ -64,6 +73,7 @@ TASK_MARKERS = {
 }
 TASK_LINESTYLES = {
     "zinc_1hop_localrrwp": "-",
+    "zinc_1hop_local": "-",
     "zinc_1hop": "--",
     "zinc_1hop_vnode": "-.",
     "zinc_2hop": ":",
@@ -84,6 +94,7 @@ DISPLAY_BINS = (
 @dataclass(frozen=True)
 class CachedModel:
     task: str
+    artifact_task: str
     root: Path
     score_artifact: ReadOnlyCacheArtifact
     score: Mapping[str, Any]
@@ -108,6 +119,10 @@ def _task_dir(root: Path, task: str, train_seed: int) -> Path:
     return root / task / f"seed_{int(train_seed)}"
 
 
+def artifact_task_candidates(task: str) -> tuple[str, ...]:
+    return TASK_ARTIFACT_ALIASES.get(str(task), (str(task),))
+
+
 def cache_inventory(
     roots: Sequence[Path],
     *,
@@ -120,22 +135,24 @@ def cache_inventory(
     for task in tasks:
         matches = []
         for root in roots:
-            task_dir = _task_dir(Path(root), str(task), int(train_seed))
-            score = task_dir / "cache" / "scores" / "raw.pt"
-            carriage = task_dir / "cache" / "carriage" / "fields.pt"
-            model = task_dir / "model.json"
-            if score.is_file() or model.is_file() or carriage.is_file():
-                matches.append(
-                    {
-                        "root": str(Path(root)),
-                        "score": str(score),
-                        "score_exists": score.is_file(),
-                        "model": str(model),
-                        "model_exists": model.is_file(),
-                        "carriage": str(carriage),
-                        "carriage_exists": carriage.is_file(),
-                    }
-                )
+            for artifact_task in artifact_task_candidates(str(task)):
+                task_dir = _task_dir(Path(root), artifact_task, int(train_seed))
+                score = task_dir / "cache" / "scores" / "raw.pt"
+                carriage = task_dir / "cache" / "carriage" / "fields.pt"
+                model = task_dir / "model.json"
+                if score.is_file() or model.is_file() or carriage.is_file():
+                    matches.append(
+                        {
+                            "root": str(Path(root)),
+                            "artifact_task": artifact_task,
+                            "score": str(score),
+                            "score_exists": score.is_file(),
+                            "model": str(model),
+                            "model_exists": model.is_file(),
+                            "carriage": str(carriage),
+                            "carriage_exists": carriage.is_file(),
+                        }
+                    )
         rows.append(
             {
                 "task": str(task),
@@ -151,34 +168,40 @@ def cache_inventory(
 
 def _resolve_task_root(
     roots: Sequence[Path], task: str, train_seed: int
-) -> Path:
-    candidates = []
-    for root in roots:
-        task_dir = _task_dir(Path(root), task, train_seed)
-        score = task_dir / "cache" / "scores" / "raw.pt"
-        model = task_dir / "model.json"
-        if score.is_file() and model.is_file():
-            candidates.append(Path(root))
-    if not candidates:
-        expected = "\n".join(
-            str(_task_dir(Path(root), task, train_seed) / "cache/scores/raw.pt")
-            for root in roots
-        )
-        raise FileNotFoundError(
-            f"no complete canonical score cache for {task!r}, seed {train_seed}; "
-            f"checked:\n{expected}"
-        )
-    if len(candidates) > 1:
-        fingerprints = []
-        for root in candidates:
-            path = _task_dir(root, task, train_seed) / "cache/scores/raw.pt"
-            artifact = load_canonical_score_artifact(path, expected_task=task)
-            fingerprints.append(str(artifact.metadata["contract_fingerprint"]))
-        if len(set(fingerprints)) != 1:
-            raise RuntimeError(
-                f"multiple non-identical canonical score caches found for {task}: {candidates}"
-            )
-    return candidates[0]
+) -> tuple[Path, str]:
+    for artifact_task in artifact_task_candidates(task):
+        candidates = []
+        for root in roots:
+            task_dir = _task_dir(Path(root), artifact_task, train_seed)
+            score = task_dir / "cache" / "scores" / "raw.pt"
+            model = task_dir / "model.json"
+            if score.is_file() and model.is_file():
+                candidates.append(Path(root))
+        if not candidates:
+            continue
+        if len(candidates) > 1:
+            fingerprints = []
+            for root in candidates:
+                path = _task_dir(root, artifact_task, train_seed) / "cache/scores/raw.pt"
+                artifact = load_canonical_score_artifact(
+                    path, expected_task=artifact_task
+                )
+                fingerprints.append(str(artifact.metadata["contract_fingerprint"]))
+            if len(set(fingerprints)) != 1:
+                raise RuntimeError(
+                    "multiple non-identical canonical score caches found for "
+                    f"{artifact_task}: {candidates}"
+                )
+        return candidates[0], artifact_task
+    expected = "\n".join(
+        str(_task_dir(Path(root), candidate, train_seed) / "cache/scores/raw.pt")
+        for candidate in artifact_task_candidates(task)
+        for root in roots
+    )
+    raise FileNotFoundError(
+        f"no complete canonical score cache for {task!r}, seed {train_seed}; "
+        f"checked:\n{expected}"
+    )
 
 
 def _validate_carriage(
@@ -219,10 +242,10 @@ def load_cached_models(
 
     result: list[CachedModel] = []
     for task in tasks:
-        root = _resolve_task_root(roots, str(task), int(train_seed))
-        task_dir = _task_dir(root, str(task), int(train_seed))
+        root, artifact_task = _resolve_task_root(roots, str(task), int(train_seed))
+        task_dir = _task_dir(root, artifact_task, int(train_seed))
         score_artifact = load_canonical_score_artifact(
-            task_dir / "cache/scores/raw.pt", expected_task=str(task)
+            task_dir / "cache/scores/raw.pt", expected_task=artifact_task
         )
         model_record = load_canonical_model_record(
             task_dir / "model.json", score_artifact
@@ -235,7 +258,7 @@ def load_cached_models(
             _validate_carriage(
                 carriage_artifact,
                 score_artifact,
-                task=str(task),
+                task=artifact_task,
                 train_seed=int(train_seed),
             )
             carriage = carriage_artifact.value
@@ -244,6 +267,7 @@ def load_cached_models(
         result.append(
             CachedModel(
                 task=str(task),
+                artifact_task=artifact_task,
                 root=root,
                 score_artifact=score_artifact,
                 score=score_artifact.value,
@@ -534,6 +558,7 @@ def summarise_model(model: CachedModel) -> dict[str, Any]:
     metrics = CanonicalHeadMetrics.from_scores(model.score)
     record: dict[str, Any] = {
         "task": model.task,
+        "artifact_task": model.artifact_task,
         "label": TASK_LABELS.get(model.task, model.task),
         "train_seed": int(model.model_record["train_seed"]),
         "test_mae": float(model.model_record["test_metric"]),

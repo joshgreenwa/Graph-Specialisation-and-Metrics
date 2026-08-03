@@ -6,6 +6,7 @@ from graph_specialisation_metrics.methodology.bootstrap import Interval
 from graph_specialisation_metrics.methodology.cache import ReadOnlyCacheArtifact
 from graph_specialisation_metrics.zinc_cached_rrwp_comparison import (
     CachedModel,
+    cache_inventory,
     carriage_profile,
     group_distance,
     run,
@@ -125,6 +126,7 @@ def _model(tmp_path: Path, task: str, *, include_virtual: bool) -> CachedModel:
     )
     return CachedModel(
         task=task,
+        artifact_task=task,
         root=tmp_path,
         score_artifact=score_artifact,
         score=score,
@@ -151,6 +153,18 @@ def test_grouped_head_profile_reconstructs_and_normalizes():
     _, equal_head, activity_weighted = score_profile(score, "semantic")
     np.testing.assert_allclose(equal_head.sum(), 1.0)
     np.testing.assert_allclose(activity_weighted.sum(), 1.0)
+
+
+def test_inventory_recognizes_historical_local_rrwp_task_name(tmp_path):
+    task_dir = tmp_path / "zinc_1hop_local" / "seed_42"
+    (task_dir / "cache/scores").mkdir(parents=True)
+    (task_dir / "cache/scores/raw.pt").touch()
+    (task_dir / "model.json").touch()
+    inventory = cache_inventory(
+        [tmp_path], tasks=("zinc_1hop_localrrwp",), train_seed=42
+    )
+    assert inventory[0]["complete_score_locations"] == 1
+    assert inventory[0]["matches"][0]["artifact_task"] == "zinc_1hop_local"
 
 
 def test_cached_interval_width_and_carriage_are_normalized():
