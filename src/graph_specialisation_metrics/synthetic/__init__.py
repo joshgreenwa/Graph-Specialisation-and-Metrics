@@ -79,9 +79,22 @@ def run_local_messages_nonlocal_structure(*args, **kwargs):
     return main(*args, **kwargs)
 
 
+def run_local_nonlocal_specialisation(*args, **kwargs):
+    from .local_nonlocal_specialisation import main
+
+    return main(*args, **kwargs)
+
+
+def run_rrwp_score_distance_comparison(*args, **kwargs):
+    from .rrwp_score_distance_comparison import main
+
+    return main(*args, **kwargs)
+
+
 __all__ = [
     "run_head_specialisation_mediation",
     "run_local_messages_nonlocal_structure",
+    "run_local_nonlocal_specialisation",
     "run_molecular_nonlinear_reach",
     "run_molecular_redundancy_reach",
     "run_nar_canonical_analysis",
@@ -91,6 +104,7 @@ __all__ = [
     "run_nar_methodology_paper",
     "run_nar_methodology_paper_v3",
     "run_query_routing_carriage",
+    "run_rrwp_score_distance_comparison",
     "run_saturation_carriage",
     "run_softmax_routing_carriage",
 ]

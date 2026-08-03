@@ -31,6 +31,54 @@ The run writes raw CSV tables, a JSON summary, and PNG/PDF versions of both
 figures. The evidence-calibrated interpretation is in
 `chapter6_local_nonlocal_pilot.md`.
 
+## What specialisation can see after preprocessing
+
+`local_nonlocal_specialisation.py` is the metric-identifiability follow-up to
+the horizon pilot. It compares a partially reliable short structural clue, an
+exact multi-hop clue consumed at the same local candidate, and a behaviourally
+identical positive control whose semantic response is registered at a carrier
+four hops away.
+
+The experiment applies the canonical projected-transport construction
+`q = (z_clean - z_event) * dy/dz`, channel normalization, `J`, `D_rel`, and
+source-to-carrier distance accounting to a four-head layout containing pure and
+mixed semantic/structural heads. A six-point clue-reliability sweep separately
+tests whether raw and normalized specialisation are scales of task usefulness.
+
+Local command (about two seconds):
+
+```bash
+python -m graph_specialisation_metrics.synthetic.local_nonlocal_specialisation \
+  --output-dir outputs/chapter6_local_nonlocal_specialisation_v1
+```
+
+The interpretation and its consequences for Chapter 6 are in
+`chapter6_specialisation_identifiability_pilot.md`.
+
+## RRWP performance versus score-distance geometry
+
+`rrwp_score_distance_comparison.py` is the paired follow-up that deliberately
+creates a local/global RRWP performance gap. Each graph contains a cycle and a
+chain candidate with independent semantic values. A one-step local-pair clue is
+correct 75% of the time, whereas diagonal RRWP through order 16 provides the
+global model with a substantially more reliable structural clue. The local and
+global gates have the same input width and parameter count.
+
+The experiment reports freely fitted models and a diagnostic comparison that
+matches their confidence while preserving which candidate each model selects.
+It then measures canonical raw semantic/structural scores and their
+source-to-carrier distance profiles under an identical two-step carrier map.
+
+Local command (about ten seconds):
+
+```bash
+python -m graph_specialisation_metrics.synthetic.rrwp_score_distance_comparison \
+  --output-dir outputs/chapter6_rrwp_score_distance_v1
+```
+
+The numerical interpretation and limits of this deliberately controlled result
+are in `chapter6_rrwp_score_distance_pilot.md`.
+
 ## Graph-native query routing with a hard behavioural oracle
 
 `analysis/query_routing_carriage_colab.py` is the implementation of the Chapter 6
