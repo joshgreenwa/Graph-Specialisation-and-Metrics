@@ -4145,9 +4145,10 @@ def _write_run_summaries(
             "regime_calls": [
                 {
                     "seed": int(value["seed"]),
-                    "regime": value.get("causal", {})
-                    .get("regime_evidence", {})
-                    .get("regime", "not_available"),
+                    "regime": (
+                        (value.get("causal") or {}).get("regime_evidence")
+                        or {}
+                    ).get("regime", "not_available"),
                 }
                 for value in task_results
                 if value.get("scores") is not None

@@ -812,6 +812,45 @@ def test_in_process_canonical_run_writes_task_local_protocol(
     assert task_protocol["run_seed"] == 42
 
 
+def test_score_only_run_summary_handles_absent_causal_result(tmp_path: Path):
+    config = MethodologyConfig(
+        output_dir=str(tmp_path / "canonical"),
+        tasks=("zinc",),
+        train_seeds=(42,),
+        phases=("scores",),
+    )
+    coordinates = SimpleNamespace(
+        selectivity=np.asarray([[0.5, -0.5]], dtype=np.float64),
+        active=np.asarray([[True, True]], dtype=bool),
+    )
+    key = "zinc:seed42"
+    results = {
+        key: {
+            "task": "zinc",
+            "seed": 42,
+            "output_dir": str(config.root / "zinc" / "seed_42"),
+            "scores": {
+                "coordinates": coordinates,
+                "channels": {
+                    "semantic": {"raw": np.asarray([[2.0, 1.0]])},
+                    "structural": {"raw": np.asarray([[1.0, 2.0]])},
+                },
+            },
+            "carriage": None,
+            "causal": None,
+            "figures": None,
+            "audit_findings": [],
+            "headline_eligible": True,
+        }
+    }
+
+    population = runner._write_run_summaries(config, results, {key: []})
+
+    assert population["zinc"]["regime_calls"] == [
+        {"seed": 42, "regime": "not_available"}
+    ]
+
+
 def test_zinc_and_qm9_graphs_reconstruct_as_index_preserving_molecules():
     pytest.importorskip("rdkit")
 
