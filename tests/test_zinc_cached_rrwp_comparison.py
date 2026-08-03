@@ -17,7 +17,10 @@ from graph_specialisation_metrics.zinc_cached_rrwp_comparison import (
     cache_inventory,
     carriage_profile,
     group_distance,
+    head_profile_alignment_permutation,
+    head_profile_alignment_rows,
     load_compatible_cache_artifact_file,
+    load_or_compute_head_profile_alignment,
     run,
     score_interval_width_profile,
     score_profile,
@@ -41,6 +44,7 @@ def _score(axis=(0, 1, 2, 3, 4, 8, "virtual")):
         return {
             "raw": raw,
             "heatmap_exact_head": exact,
+            "heatmap_per_opportunity_head": exact,
             "distance_intervals": Interval(
                 estimate=point,
                 low=point * 0.9,
@@ -260,6 +264,37 @@ def test_cached_interval_width_and_carriage_are_normalized():
     assert events == 2
 
 
+def test_same_head_alignment_exceeds_same_layer_other_head_null(tmp_path):
+    model = _model(tmp_path, "zinc_1hop", include_virtual=False)
+    score = model.score
+    width = len(score["axis"])
+    patterns = np.zeros((2, 2, width), dtype=np.float64)
+    patterns[:, 0, 0] = 1.0
+    patterns[:, 1, 2] = 1.0
+    for channel in ("semantic", "structural"):
+        score["channels"][channel]["heatmap_exact_head"] = patterns.copy()
+        score["channels"][channel][
+            "heatmap_per_opportunity_head"
+        ] = patterns.copy()
+        score["channels"][channel]["raw"] = patterns.sum(axis=-1)
+
+    rows = head_profile_alignment_rows([model])
+    mass = [row for row in rows if row["profile_kind"] == "score_mass"]
+    same = [row["cosine"] for row in mass if row["pairing"] == "same_head"]
+    other = [row["cosine"] for row in mass if row["pairing"] == "other_head"]
+    assert np.mean(same) == pytest.approx(1.0)
+    assert np.mean(other) == pytest.approx(0.0)
+
+    permutation = head_profile_alignment_permutation(rows, permutations=500)
+    cosine = next(
+        row
+        for row in permutation
+        if row["profile_kind"] == "score_mass" and row["metric"] == "cosine"
+    )
+    assert cosine["observed_same_head"] == pytest.approx(1.0)
+    assert cosine["alignment_excess"] > 0.4
+
+
 def test_run_identifies_the_model_that_failed_to_load(tmp_path, monkeypatch):
     local = _model(tmp_path, "zinc_1hop_localrrwp", include_virtual=False)
 
@@ -312,6 +347,10 @@ def test_fast_run_writes_tables_and_aligned_figures(tmp_path, monkeypatch):
     assert (output / "head_scores.csv").is_file()
     assert (output / "head_score_distance.csv").is_file()
     assert (output / "pairwise_comparisons.csv").is_file()
+    assert (output / "head_profile_alignment.csv").is_file()
+    assert (output / "head_profile_alignment_summary.csv").is_file()
+    assert (output / "head_profile_alignment_permutation.csv").is_file()
+    assert (output / "cache/head_profile_alignment.json").is_file()
     assert (output / "summary.json").is_file()
     with (output / "model_summary.csv").open(encoding="utf-8", newline="") as handle:
         summary_rows = list(csv.DictReader(handle))
@@ -322,5 +361,11 @@ def test_fast_run_writes_tables_and_aligned_figures(tmp_path, monkeypatch):
     assert np.isfinite(
         result["pairwise_comparisons"][0]["semantic_score_profile_total_variation"]
     )
-    assert len(result["figures"]) == 4
+    assert result["head_profile_alignment"]["cache_status"] == "miss"
+    _, cache_path, cache_status = load_or_compute_head_profile_alignment(
+        models, output
+    )
+    assert cache_path == output / "cache/head_profile_alignment.json"
+    assert cache_status == "hit"
+    assert len(result["figures"]) == 6
     assert all(Path(path).is_file() for path in result["figures"])

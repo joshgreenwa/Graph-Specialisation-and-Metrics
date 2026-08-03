@@ -35,7 +35,9 @@ from .methodology.grit_figure_data import (
 )
 from .methodology.protocol import PROTOCOL_VERSION, stable_hash
 
-ANALYSIS_VERSION = "zinc-cached-rrwp-comparison-v1"
+ANALYSIS_VERSION = "zinc-cached-rrwp-comparison-v2"
+ALIGNMENT_CACHE_VERSION = "zinc-head-profile-colocalization-v1"
+ALIGNMENT_PERMUTATIONS = 5_000
 SUPPORTED_CACHE_PROTOCOLS = (
     "donor-swap-specialisation-carriage-v3",
     PROTOCOL_VERSION,
@@ -816,6 +818,390 @@ def _write_json(path: Path, payload: Any) -> None:
         handle.write("\n")
 
 
+def _distance_reportable_mask(
+    score: Mapping[str, Any], channel: str, width: int
+) -> np.ndarray:
+    support = score["channels"][channel].get("distance_support")
+    if support is None or "reportable" not in support:
+        return np.ones(width, dtype=bool)
+    reportable = _as_numpy(support["reportable"], dtype=bool).reshape(-1)
+    if len(reportable) != width:
+        raise ValueError(
+            f"{channel} reportable mask has width {len(reportable)}, expected {width}"
+        )
+    return reportable
+
+
+def _profile_pair_metrics(
+    semantic: Any,
+    structural: Any,
+    axis: Sequence[Any],
+    reportable: Any,
+) -> dict[str, Any] | None:
+    semantic = _as_numpy(semantic).reshape(-1)
+    structural = _as_numpy(structural).reshape(-1)
+    reportable = _as_numpy(reportable, dtype=bool).reshape(-1)
+    if not (len(semantic) == len(structural) == len(axis) == len(reportable)):
+        raise ValueError("semantic, structural, axis, and reportable profiles must align")
+    valid = reportable & np.isfinite(semantic) & np.isfinite(structural)
+    if not np.any(valid):
+        return None
+    semantic = semantic[valid]
+    structural = structural[valid]
+    labels = np.asarray(tuple(axis), dtype=object)[valid]
+    if np.nanmin(semantic) < -1.0e-10 or np.nanmin(structural) < -1.0e-10:
+        raise ValueError("canonical score-distance profiles must be non-negative")
+    semantic = np.maximum(semantic, 0.0)
+    structural = np.maximum(structural, 0.0)
+    semantic_mass = float(np.sum(semantic))
+    structural_mass = float(np.sum(structural))
+    if semantic_mass <= 1.0e-12 or structural_mass <= 1.0e-12:
+        return None
+    semantic_profile = semantic / semantic_mass
+    structural_profile = structural / structural_mass
+    denominator = float(
+        np.linalg.norm(semantic_profile) * np.linalg.norm(structural_profile)
+    )
+    cosine = (
+        float(np.dot(semantic_profile, structural_profile) / denominator)
+        if denominator > 1.0e-12
+        else float("nan")
+    )
+    overlap = float(np.minimum(semantic_profile, structural_profile).sum())
+    semantic_peak = int(np.argmax(semantic_profile))
+    structural_peak = int(np.argmax(structural_profile))
+    numeric = np.asarray(
+        [
+            float(distance) if (distance := _numeric_distance(label)) is not None else np.nan
+            for label in labels
+        ],
+        dtype=np.float64,
+    )
+    numeric_mask = np.isfinite(numeric)
+    semantic_centroid = float("nan")
+    structural_centroid = float("nan")
+    if np.any(numeric_mask):
+        semantic_numeric_mass = float(semantic[numeric_mask].sum())
+        structural_numeric_mass = float(structural[numeric_mask].sum())
+        if semantic_numeric_mass > 1.0e-12 and structural_numeric_mass > 1.0e-12:
+            semantic_centroid = float(
+                np.dot(semantic[numeric_mask], numeric[numeric_mask])
+                / semantic_numeric_mass
+            )
+            structural_centroid = float(
+                np.dot(structural[numeric_mask], numeric[numeric_mask])
+                / structural_numeric_mass
+            )
+    centroid_difference = structural_centroid - semantic_centroid
+    return {
+        "cosine": cosine,
+        "overlap": overlap,
+        "total_variation": float(1.0 - overlap),
+        "peak_match": float(semantic_peak == structural_peak),
+        "semantic_peak": str(labels[semantic_peak]).replace("_", " "),
+        "structural_peak": str(labels[structural_peak]).replace("_", " "),
+        "semantic_centroid": semantic_centroid,
+        "structural_centroid": structural_centroid,
+        "centroid_difference": centroid_difference,
+        "centroid_gap_abs": abs(centroid_difference),
+        "semantic_mass": semantic_mass,
+        "structural_mass": structural_mass,
+        "shared_reportable_bins": int(np.sum(valid)),
+    }
+
+
+def head_profile_alignment_rows(models: Sequence[CachedModel]) -> list[dict[str, Any]]:
+    """Compare same-head channel geometry with every same-layer head pairing.
+
+    ``score_mass`` asks where total score mass is allocated. ``per_opportunity``
+    repeats the comparison after controlling for the number of available
+    source--carrier pairs in each distance shell.
+    """
+
+    profile_fields = {
+        "score_mass": "heatmap_exact_head",
+        "per_opportunity": "heatmap_per_opportunity_head",
+    }
+    rows: list[dict[str, Any]] = []
+    for model in models:
+        score = model.score
+        axis = tuple(score["axis"])
+        semantic_channel = score["channels"]["semantic"]
+        structural_channel = score["channels"]["structural"]
+        joint_reportable = _distance_reportable_mask(
+            score, "semantic", len(axis)
+        ) & _distance_reportable_mask(score, "structural", len(axis))
+        for profile_kind, field in profile_fields.items():
+            if field not in semantic_channel or field not in structural_channel:
+                continue
+            semantic = _as_numpy(semantic_channel[field])
+            structural = _as_numpy(structural_channel[field])
+            if semantic.ndim != 3 or semantic.shape != structural.shape:
+                raise ValueError(
+                    f"{model.task} {profile_kind} head profiles do not align: "
+                    f"semantic={semantic.shape}, structural={structural.shape}"
+                )
+            if semantic.shape[-1] != len(axis):
+                raise ValueError(
+                    f"{model.task} {profile_kind} profile width "
+                    f"{semantic.shape[-1]} does not match axis width {len(axis)}"
+                )
+            layers, heads, _ = semantic.shape
+            for layer in range(layers):
+                for semantic_head in range(heads):
+                    for structural_head in range(heads):
+                        metrics = _profile_pair_metrics(
+                            semantic[layer, semantic_head],
+                            structural[layer, structural_head],
+                            axis,
+                            joint_reportable,
+                        )
+                        if metrics is None:
+                            continue
+                        rows.append(
+                            {
+                                "task": model.task,
+                                "cache_protocol": str(
+                                    model.score_artifact.metadata.get(
+                                        "protocol_version", "unknown"
+                                    )
+                                ),
+                                "profile_kind": profile_kind,
+                                "layer": layer,
+                                "semantic_head": semantic_head,
+                                "structural_head": structural_head,
+                                "pairing": (
+                                    "same_head"
+                                    if semantic_head == structural_head
+                                    else "other_head"
+                                ),
+                                **metrics,
+                            }
+                        )
+    return rows
+
+
+def summarise_head_profile_alignment(
+    rows: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    metrics = (
+        "cosine",
+        "overlap",
+        "total_variation",
+        "peak_match",
+        "semantic_centroid",
+        "structural_centroid",
+        "centroid_difference",
+        "centroid_gap_abs",
+    )
+    groups: dict[tuple[str, str, str], list[Mapping[str, Any]]] = {}
+    for row in rows:
+        key = (str(row["task"]), str(row["profile_kind"]), str(row["pairing"]))
+        groups.setdefault(key, []).append(row)
+    output: list[dict[str, Any]] = []
+    for (task, profile_kind, pairing), group in sorted(groups.items()):
+        result: dict[str, Any] = {
+            "task": task,
+            "profile_kind": profile_kind,
+            "pairing": pairing,
+            "valid_comparisons": len(group),
+        }
+        for metric in metrics:
+            values = np.asarray([float(row[metric]) for row in group], dtype=np.float64)
+            result[f"{metric}_mean"] = (
+                float(np.mean(values[np.isfinite(values)]))
+                if np.isfinite(values).any()
+                else float("nan")
+            )
+        output.append(result)
+    return output
+
+
+def head_profile_alignment_permutation(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    permutations: int = ALIGNMENT_PERMUTATIONS,
+) -> list[dict[str, Any]]:
+    """Conditional same-layer head-pairing randomization test.
+
+    The null independently permutes structural-head identities within every
+    layer. It therefore preserves each channel's model/layer distance geometry
+    and asks only whether the learned head pairing carries extra alignment.
+    """
+
+    if int(permutations) < 1:
+        raise ValueError("permutations must be positive")
+    metrics = ("cosine", "overlap", "peak_match", "centroid_gap_abs")
+    grouped: dict[tuple[str, str], list[Mapping[str, Any]]] = {}
+    for row in rows:
+        grouped.setdefault(
+            (str(row["task"]), str(row["profile_kind"])), []
+        ).append(row)
+    output: list[dict[str, Any]] = []
+    for (task, profile_kind), group in sorted(grouped.items()):
+        layers: dict[int, dict[str, np.ndarray]] = {}
+        for layer in sorted({int(row["layer"]) for row in group}):
+            layer_rows = [row for row in group if int(row["layer"]) == layer]
+            heads = sorted(
+                {int(row["semantic_head"]) for row in layer_rows}
+                | {int(row["structural_head"]) for row in layer_rows}
+            )
+            position = {head: index for index, head in enumerate(heads)}
+            matrices = {
+                metric: np.full((len(heads), len(heads)), np.nan, dtype=np.float64)
+                for metric in metrics
+            }
+            for row in layer_rows:
+                left = position[int(row["semantic_head"])]
+                right = position[int(row["structural_head"])]
+                for metric in metrics:
+                    matrices[metric][left, right] = float(row[metric])
+            layers[layer] = matrices
+        observed: dict[str, float] = {}
+        for metric in metrics:
+            values = np.concatenate(
+                [np.diag(matrices[metric]) for matrices in layers.values()]
+            )
+            finite = values[np.isfinite(values)]
+            observed[metric] = (
+                float(np.mean(finite)) if len(finite) else float("nan")
+            )
+        rng_seed = int(
+            stable_hash(
+                {
+                    "cache_version": ALIGNMENT_CACHE_VERSION,
+                    "task": task,
+                    "profile_kind": profile_kind,
+                },
+                length=16,
+            ),
+            16,
+        )
+        rng = np.random.default_rng(rng_seed)
+        null_draws = {
+            metric: np.full(int(permutations), np.nan, dtype=np.float64)
+            for metric in metrics
+        }
+        for replicate in range(int(permutations)):
+            sampled = {metric: [] for metric in metrics}
+            for matrices in layers.values():
+                heads = matrices[metrics[0]].shape[0]
+                permutation = rng.permutation(heads)
+                indices = np.arange(heads)
+                for metric in metrics:
+                    sampled[metric].extend(matrices[metric][indices, permutation])
+            for metric in metrics:
+                values = np.asarray(sampled[metric], dtype=np.float64)
+                finite = values[np.isfinite(values)]
+                if len(finite):
+                    null_draws[metric][replicate] = float(np.mean(finite))
+        for metric in metrics:
+            draws = null_draws[metric]
+            draws = draws[np.isfinite(draws)]
+            estimate = observed[metric]
+            if not np.isfinite(estimate) or not len(draws):
+                continue
+            lower_is_aligned = metric == "centroid_gap_abs"
+            if lower_is_aligned:
+                p_value = float((1 + np.sum(draws <= estimate)) / (len(draws) + 1))
+                excess_draws = draws - estimate
+            else:
+                p_value = float((1 + np.sum(draws >= estimate)) / (len(draws) + 1))
+                excess_draws = estimate - draws
+            output.append(
+                {
+                    "task": task,
+                    "profile_kind": profile_kind,
+                    "metric": metric,
+                    "observed_same_head": estimate,
+                    "null_mean": float(np.mean(draws)),
+                    "null_low": float(np.quantile(draws, 0.025)),
+                    "null_high": float(np.quantile(draws, 0.975)),
+                    "alignment_excess": float(np.mean(excess_draws)),
+                    "alignment_excess_low": float(np.quantile(excess_draws, 0.025)),
+                    "alignment_excess_high": float(np.quantile(excess_draws, 0.975)),
+                    "permutation_p_value": p_value,
+                    "permutations": int(permutations),
+                    "rng_seed": rng_seed,
+                    "alternative": "less" if lower_is_aligned else "greater",
+                }
+            )
+    return output
+
+
+def _head_profile_alignment_contract(
+    models: Sequence[CachedModel], *, permutations: int
+) -> dict[str, Any]:
+    return {
+        "cache_version": ALIGNMENT_CACHE_VERSION,
+        "permutations": int(permutations),
+        "profile_fields": {
+            "score_mass": "heatmap_exact_head",
+            "per_opportunity": "heatmap_per_opportunity_head",
+        },
+        "null": "independent structural-head permutation within every model layer",
+        "models": [
+            {
+                "task": model.task,
+                "score_sha256": model.score_artifact.file_sha256,
+                "score_contract": model.score_artifact.metadata.get(
+                    "contract_fingerprint"
+                ),
+                "protocol": model.score_artifact.metadata.get("protocol_version"),
+            }
+            for model in models
+        ],
+    }
+
+
+def load_or_compute_head_profile_alignment(
+    models: Sequence[CachedModel],
+    output_dir: Path,
+    *,
+    permutations: int = ALIGNMENT_PERMUTATIONS,
+) -> tuple[dict[str, Any], Path, str]:
+    """Load a fingerprinted derived cache or compute it from immutable scores."""
+
+    contract = _head_profile_alignment_contract(models, permutations=permutations)
+    fingerprint = stable_hash(contract)
+    path = Path(output_dir) / "cache" / "head_profile_alignment.json"
+    if path.is_file():
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            metadata = payload["metadata"]
+            value = payload["value"]
+            if (
+                metadata.get("cache_version") == ALIGNMENT_CACHE_VERSION
+                and metadata.get("fingerprint") == fingerprint
+                and isinstance(value.get("comparison_rows"), list)
+                and isinstance(value.get("summary_rows"), list)
+                and isinstance(value.get("permutation_rows"), list)
+            ):
+                return value, path, "hit"
+        except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+            pass
+    comparison_rows = head_profile_alignment_rows(models)
+    value = {
+        "comparison_rows": comparison_rows,
+        "summary_rows": summarise_head_profile_alignment(comparison_rows),
+        "permutation_rows": head_profile_alignment_permutation(
+            comparison_rows, permutations=permutations
+        ),
+    }
+    _write_json(
+        path,
+        {
+            "metadata": {
+                "cache_version": ALIGNMENT_CACHE_VERSION,
+                "fingerprint": fingerprint,
+                "contract": contract,
+            },
+            "value": value,
+        },
+    )
+    return value, path, "miss"
+
+
 def _ordered_union(records: Sequence[Mapping[str, Any]], field: str) -> tuple[str, ...]:
     observed = {
         str(label)
@@ -1146,6 +1532,203 @@ def _plot_carriage_variability(
     return [png, pdf]
 
 
+def _plot_head_profile_alignment(
+    records: Sequence[Mapping[str, Any]],
+    comparison_rows: Sequence[Mapping[str, Any]],
+    permutation_rows: Sequence[Mapping[str, Any]],
+    output_dir: Path,
+) -> list[Path]:
+    import matplotlib.pyplot as plt
+
+    tasks = [str(record["task"]) for record in records]
+    labels = [
+        _record_label(record, multiline=True, show_protocol=False)
+        for record in records
+    ]
+    x = np.arange(len(tasks), dtype=np.float64)
+    figure, axes = plt.subplots(2, 2, figsize=(13.5, 9.2), constrained_layout=True)
+
+    def permutation_row(task: str, profile_kind: str, metric: str):
+        return next(
+            (
+                row
+                for row in permutation_rows
+                if row["task"] == task
+                and row["profile_kind"] == profile_kind
+                and row["metric"] == metric
+            ),
+            None,
+        )
+
+    for axis, profile_kind, panel, title in (
+        (
+            axes[0, 0],
+            "score_mass",
+            "a",
+            "Score-mass profile alignment",
+        ),
+        (
+            axes[0, 1],
+            "per_opportunity",
+            "b",
+            "Opportunity-corrected profile alignment",
+        ),
+    ):
+        for position, task in zip(x, tasks):
+            row = permutation_row(task, profile_kind, "cosine")
+            if row is None:
+                continue
+            null_mean = float(row["null_mean"])
+            null_low = float(row["null_low"])
+            null_high = float(row["null_high"])
+            observed = float(row["observed_same_head"])
+            axis.vlines(
+                position + 0.12,
+                null_low,
+                null_high,
+                color="#777777",
+                linewidth=2.0,
+                alpha=0.65,
+            )
+            axis.scatter(
+                position + 0.12,
+                null_mean,
+                color="#777777",
+                marker="o",
+                s=34,
+                zorder=3,
+            )
+            axis.scatter(
+                position - 0.12,
+                observed,
+                color=TASK_COLOURS.get(task, "#555555"),
+                marker="D",
+                s=48,
+                edgecolor="#222222",
+                linewidth=0.5,
+                zorder=4,
+            )
+        axis.set_xticks(x, labels)
+        axis.set_ylim(-0.02, 1.02)
+        axis.set_ylabel("Semantic–structural profile cosine")
+        axis.set_title(f"{panel}  {title}")
+    axes[0, 0].scatter(
+        [], [], marker="D", color="#777777", label="same learned head"
+    )
+    axes[0, 0].scatter(
+        [], [], marker="o", color="#777777", label="same-layer shuffled null"
+    )
+    axes[0, 0].legend(frameon=False, fontsize=8)
+
+    axis = axes[1, 0]
+    for offset, profile_kind, marker, label in (
+        (-0.13, "score_mass", "o", "score mass"),
+        (0.13, "per_opportunity", "^", "per opportunity"),
+    ):
+        for position, task in zip(x, tasks):
+            row = permutation_row(task, profile_kind, "overlap")
+            if row is None:
+                continue
+            value = float(row["alignment_excess"])
+            low = float(row["alignment_excess_low"])
+            high = float(row["alignment_excess_high"])
+            axis.errorbar(
+                position + offset,
+                value,
+                yerr=[[max(value - low, 0.0)], [max(high - value, 0.0)]],
+                color=TASK_COLOURS.get(task, "#555555"),
+                marker=marker,
+                markersize=6,
+                capsize=3,
+                linewidth=1.2,
+            )
+    axis.axhline(0.0, color="#777777", linestyle="--", linewidth=1.0)
+    axis.set_xticks(x, labels)
+    axis.set_ylabel("Same-head overlap minus shuffled null")
+    axis.set_title("c  Is co-location specific to the learned head pairing?")
+    axis.plot([], [], marker="o", linestyle="", color="#555555", label="score mass")
+    axis.plot(
+        [], [], marker="^", linestyle="", color="#555555", label="per opportunity"
+    )
+    axis.legend(frameon=False, fontsize=8)
+
+    axis = axes[1, 1]
+    finite_centroids = []
+    for task in tasks:
+        task_rows = [
+            row
+            for row in comparison_rows
+            if row["task"] == task
+            and row["profile_kind"] == "score_mass"
+            and row["pairing"] == "same_head"
+            and row.get("semantic_centroid") is not None
+            and row.get("structural_centroid") is not None
+            and np.isfinite(float(row["semantic_centroid"]))
+            and np.isfinite(float(row["structural_centroid"]))
+        ]
+        if not task_rows:
+            continue
+        semantic = np.asarray(
+            [float(row["semantic_centroid"]) for row in task_rows]
+        )
+        structural = np.asarray(
+            [float(row["structural_centroid"]) for row in task_rows]
+        )
+        finite_centroids.extend(semantic)
+        finite_centroids.extend(structural)
+        colour = TASK_COLOURS.get(task, "#555555")
+        axis.scatter(
+            semantic,
+            structural,
+            color=colour,
+            alpha=0.18,
+            s=20,
+            edgecolors="none",
+        )
+        axis.scatter(
+            float(np.mean(semantic)),
+            float(np.mean(structural)),
+            color=colour,
+            marker=TASK_MARKERS.get(task, "o"),
+            s=70,
+            edgecolor="#222222",
+            linewidth=0.6,
+            label=TASK_LABELS.get(task, task).replace("\n", " "),
+            zorder=4,
+        )
+    if finite_centroids:
+        upper = max(float(np.max(finite_centroids)) * 1.05, 1.0)
+        axis.plot((0.0, upper), (0.0, upper), color="#777777", linestyle="--")
+        axis.set_xlim(-0.03 * upper, upper)
+        axis.set_ylim(-0.03 * upper, upper)
+    axis.set_xlabel("Semantic mean molecular distance")
+    axis.set_ylabel("Structural mean molecular distance")
+    axis.set_title("d  Where are the two sensitivities centred within heads?")
+    axis.legend(frameon=False, fontsize=7, ncol=2)
+
+    figure.suptitle(
+        "ZINC cached canonical analysis: within-head semantic–structural co-location",
+        fontsize=15,
+    )
+    figure.text(
+        0.5,
+        -0.01,
+        "Null independently permutes structural-head identities within each layer "
+        f"({ALIGNMENT_PERMUTATIONS:,} draws). Intervals are conditional randomization "
+        "ranges, not seed uncertainty.",
+        ha="center",
+        fontsize=8.5,
+    )
+    figures = output_dir / "figures"
+    figures.mkdir(parents=True, exist_ok=True)
+    png = figures / "03_head_profile_colocalization.png"
+    pdf = figures / "03_head_profile_colocalization.pdf"
+    figure.savefig(png, dpi=220, bbox_inches="tight")
+    figure.savefig(pdf, bbox_inches="tight")
+    plt.close(figure)
+    return [png, pdf]
+
+
 def run(
     roots: Sequence[Path],
     output_dir: Path,
@@ -1200,6 +1783,23 @@ def run(
     )
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    log("alignment-cache", "validating head-profile co-location cache")
+    try:
+        alignment, alignment_cache, alignment_cache_status = (
+            load_or_compute_head_profile_alignment(models, output_dir)
+        )
+    except Exception as error:
+        raise RuntimeError(
+            "ZINC cache analysis failed during head-profile co-location analysis: "
+            f"{type(error).__name__}: {error}"
+        ) from error
+    log(
+        "alignment-cache",
+        f"{alignment_cache_status}: {alignment_cache}",
+    )
+    alignment_rows = alignment["comparison_rows"]
+    alignment_summary_rows = alignment["summary_rows"]
+    alignment_permutation_rows = alignment["permutation_rows"]
     summary_rows = [
         {
             key: value
@@ -1236,6 +1836,9 @@ def run(
         "head_scores.csv": head_rows,
         "head_score_distance.csv": head_distance_rows,
         "pairwise_comparisons.csv": comparison_rows,
+        "head_profile_alignment.csv": alignment_rows,
+        "head_profile_alignment_summary.csv": alignment_summary_rows,
+        "head_profile_alignment_permutation.csv": alignment_permutation_rows,
     }
     for name, rows in tables.items():
         log("table", f"{name}: {len(rows)} rows")
@@ -1264,6 +1867,21 @@ def run(
             "ZINC cache analysis failed while plotting precision/carriage: "
             f"{type(error).__name__}: {error}"
         ) from error
+    log("figure", "03_head_profile_colocalization")
+    try:
+        figures.extend(
+            _plot_head_profile_alignment(
+                records,
+                alignment_rows,
+                alignment_permutation_rows,
+                output_dir,
+            )
+        )
+    except Exception as error:
+        raise RuntimeError(
+            "ZINC cache analysis failed while plotting head-profile co-location: "
+            f"{type(error).__name__}: {error}"
+        ) from error
     result = {
         "analysis_version": ANALYSIS_VERSION,
         "train_seed": int(train_seed),
@@ -1271,6 +1889,12 @@ def run(
         "tasks": list(tasks),
         "models": records,
         "pairwise_comparisons": comparison_rows,
+        "head_profile_alignment": {
+            "cache": str(alignment_cache),
+            "cache_status": alignment_cache_status,
+            "summary": alignment_summary_rows,
+            "permutation": alignment_permutation_rows,
+        },
         "cache_compatibility": {
             "protocols": protocols,
             "semantic_donor_laws": semantic_laws,
@@ -1292,6 +1916,16 @@ def run(
                 "the original protocol and donor laws are retained in every table"
             ),
             "score_distance": "exact per-head score mass grouped only for display",
+            "head_profile_colocalization": (
+                "same-head semantic/structural distance-profile alignment against "
+                "a conditional null that permutes structural heads within each layer; "
+                "reported for score mass and opportunity-corrected profiles"
+            ),
+            "head_profile_randomization": (
+                "5,000 checkpoint-conditional head-identity permutations; this tests "
+                "head-specific pairing beyond shared model/layer geometry, not seed-level "
+                "generalization"
+            ),
             "profile_precision": (
                 "cached exact-distance marginal 95% interval width divided by total "
                 "reportable score mass; one seed is checkpoint-conditional"

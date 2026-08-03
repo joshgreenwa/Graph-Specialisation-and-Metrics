@@ -303,8 +303,13 @@ if not available_tasks:
     )
 print("[run] Models with validated canonical scores: " + ", ".join(available_tasks))
 
+
 print("[scope] Cache-only: no dataset, checkpoint, model, forward pass, or score recomputation.")
 print("[scope] All intervals are canonical cached one-checkpoint intervals, not seed uncertainty.")
+print(
+    "[scope] Head co-location uses cached exact per-head score-distance tensors and a "
+    "same-layer shuffled-head null; its derived table is fingerprint-cached."
+)
 print(f"[scope] Output directory: {OUTPUT_DIR}")
 try:
     result = run(
@@ -343,6 +348,29 @@ if comparison_table.stat().st_size:
     display(pd.read_csv(comparison_table))
 else:
     print("[skip] Pairwise comparisons require at least two available models.")
+alignment_result = result["head_profile_alignment"]
+print(
+    "Head-profile co-location cache: "
+    f"{alignment_result['cache_status']} ({alignment_result['cache']})"
+)
+print("Same-head semantic–structural alignment against the same-layer shuffled null")
+alignment_table = pd.read_csv(OUTPUT_DIR / "head_profile_alignment_permutation.csv")
+display(
+    alignment_table.loc[
+        alignment_table["metric"].isin(
+            ["cosine", "overlap", "peak_match", "centroid_gap_abs"]
+        ),
+        [
+            "task",
+            "profile_kind",
+            "metric",
+            "observed_same_head",
+            "null_mean",
+            "alignment_excess",
+            "permutation_p_value",
+        ],
+    ]
+)
 for path in result["figures"]:
     if str(path).endswith(".png") and Path(path).is_file():
         display(Image(filename=path))

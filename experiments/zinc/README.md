@@ -30,8 +30,13 @@ the six trained variants: local-RRWP 1-hop, global-RRWP 1-hop, 1-hop+VN, 2-hop,
 The score loader verifies the canonical task/checkpoint/split contract, and the
 carriage loader verifies that it matches the score artifact. The run writes model
 and head-level tables, exact per-head score-distance rows, pairwise profile
-distances, and two focused figures. It does not construct a model, load ZINC, or
-recompute scores.
+distances, and three focused figures. The third analysis tests whether a head's
+semantic distance profile is more aligned with its own structural profile than
+with a same-layer shuffled-head null. It reports both score-mass and
+opportunity-corrected profiles, saves the complete comparison and 5,000-draw
+conditional-randomization tables, and reuses a fingerprinted derived cache at
+`<output-dir>/cache/head_profile_alignment.json`. It does not construct a model,
+load ZINC, or recompute scores.
 
 For a mounted local canonical root, the same analysis can be run directly:
 
