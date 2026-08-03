@@ -1862,6 +1862,10 @@ def test_colab_notebook_has_valid_python_cells():
     assert '"qm9_all": QM9_TASKS' in source
     assert '"all": SUPPORTED_TASKS' in source
     assert "CANONICAL_ROOT_CANDIDATES = (CANONICAL_ROOT,)" in source
+    assert "missing_selected_tasks = [" in source
+    assert "if missing_selected_tasks:" in source
+    assert "Full notebook/backend task registries differ" in source
+    assert "if tuple(SUPPORTED_TASKS) != tuple(" not in source
     assert "resolve_canonical_task_root(" in source
     assert "search_root=METRICS_ROOT" in source
     assert "HEADS_PER_FAMILY = 5" in source
