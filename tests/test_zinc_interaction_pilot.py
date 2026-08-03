@@ -9,6 +9,7 @@ from graph_specialisation_metrics.zinc_interaction_pilot import (
     _write_csv,
     audit_output_modulation_pairing,
     carrier_alignment_analysis,
+    carrier_alignment_specificity_analysis,
     event_distance_summary,
     figures_output_modulation,
     four_state_contrast,
@@ -17,6 +18,7 @@ from graph_specialisation_metrics.zinc_interaction_pilot import (
     layer_event_summary,
     output_modulation_graph_metrics,
     output_modulation_metrics,
+    paired_reference_advantages,
 )
 
 
@@ -464,3 +466,57 @@ def test_carrier_alignment_distinguishes_signed_fit_from_mass_only_screen():
     ]
     _, _, legacy_modes = carrier_alignment_analysis(legacy_rows)
     assert legacy_modes == ("absolute_mass",)
+
+
+def test_same_source_shuffle_separates_event_specific_fit_from_locality_envelope():
+    rows = []
+    structural_profiles = ((1.0, 0.0), (0.0, 1.0), (1.0, 1.0))
+    semantic_profiles = ((1.0, 1.0),) * 3
+    for pair in range(3):
+        for carrier in range(2):
+            rows.append(
+                {
+                    "task": "zinc_1hop",
+                    "graph": 3,
+                    "source": 0,
+                    "pair": pair,
+                    "carrier": carrier,
+                    "distance": carrier,
+                    "semantic_mass": semantic_profiles[pair][carrier],
+                    "structural_mass": structural_profiles[pair][carrier],
+                    "interaction_mass": structural_profiles[pair][carrier],
+                    "interaction_estimable": True,
+                }
+            )
+    alignment, _residuals, _modes = carrier_alignment_analysis(rows)
+    specificity = carrier_alignment_specificity_analysis(rows)
+    structural = next(
+        row
+        for row in specificity
+        if row["reference"] == "structural"
+        and row["metric"] == "explained_energy"
+        and row["analysis"] == "matched_minus_shuffle"
+    )
+    semantic = next(
+        row
+        for row in specificity
+        if row["reference"] == "semantic"
+        and row["metric"] == "explained_energy"
+        and row["analysis"] == "matched_minus_shuffle"
+    )
+    assert structural["value"] == pytest.approx(2.0 / 3.0)
+    assert semantic["value"] == pytest.approx(0.0)
+
+    paired = paired_reference_advantages(alignment, specificity)
+    actual = next(
+        row
+        for row in paired
+        if row["metric"] == "explained_energy" and row["comparison"] == "actual_fit"
+    )
+    event_specificity = next(
+        row
+        for row in paired
+        if row["metric"] == "explained_energy" and row["comparison"] == "event_specificity"
+    )
+    assert actual["value"] == pytest.approx(1.0 / 3.0)
+    assert event_specificity["value"] == pytest.approx(2.0 / 3.0)

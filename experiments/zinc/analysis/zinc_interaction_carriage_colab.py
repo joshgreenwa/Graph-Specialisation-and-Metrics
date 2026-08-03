@@ -1,10 +1,11 @@
 """Standalone Colab frontend for ZINC interaction carriage and output modulation.
 
-The default ``figures`` phase is cache-only.  It adds three diagnostics for the
+The default ``figures`` phase is cache-only. It adds four diagnostics for the
 apparent structural/interaction profile match: unnormalised carriage, a
 carrier-level proportional fit against both structural and semantic carriage,
-and the distance profile left after that fit.  Existing v2 caches immediately
-support an absolute-mass profile screen.  A newly measured cache also stores the
+the distance profile left after that fit, and a same-source donor-pair shuffle
+that tests event-specific alignment beyond generic locality. Existing v2 caches
+immediately support an absolute-mass profile screen. A newly measured cache also stores the
 already-computed signed scalar carrier projections and enables the decisive
 signed cosine/gain/R2 diagnostic without any later model rerun.
 
@@ -166,6 +167,12 @@ print(
     "q_int = lambda q_reference within each paired intervention. Structural and semantic "
     "references are compared using cosine, gain, explained interaction energy, and "
     "distance-resolved residual carriage.\n"
+    "[scope] Event specificity compares the true marginal profile with every other "
+    "donor-pair profile at the same graph and source, preserving carrier identities and "
+    "the complete distance envelope. Positive matched-minus-shuffle values indicate "
+    "event-specific alignment beyond generic locality.\n"
+    "[scope] This shuffle is a post-hoc falsification diagnostic prompted by the observed "
+    "structural/interaction similarity, not a preregistered primary result.\n"
     "[scope] An old cache can only screen proportionality of non-negative carrier masses. "
     "Signed alignment is shown only when signed scalar projections are present; the "
     "notebook will never trigger an expensive remeasurement implicitly.\n"
@@ -281,6 +288,22 @@ try:
                 flush=True,
             )
 
+    specificity_path = OUTPUT_DIR / "results" / "carrier_alignment_specificity_summary.csv"
+    if specificity_path.is_file():
+        specificity = pd.read_csv(specificity_path)
+        print("\nSame-event alignment versus locality-preserving donor-pair shuffle", flush=True)
+        display(
+            specificity[
+                (specificity["metric"] == "explained_energy")
+                & (specificity["analysis"] == "matched_minus_shuffle")
+            ]
+        )
+    paired_path = OUTPUT_DIR / "results" / "carrier_alignment_paired_advantage_summary.csv"
+    if paired_path.is_file():
+        paired = pd.read_csv(paired_path)
+        print("\nPaired structural-minus-semantic alignment advantage", flush=True)
+        display(paired[paired["metric"] == "explained_energy"])
+
     output_cache_value = result.get("output_modulation_cache_dir")
     if output_cache_value:
         output_cache = Path(output_cache_value)
@@ -315,6 +338,8 @@ try:
         "carrier_residual_absolute_mass",
         "carrier_alignment_signed_projection",
         "carrier_residual_signed_projection",
+        "carrier_specificity_absolute_mass",
+        "carrier_specificity_signed_projection",
     ):
         path = result.get("figures", {}).get(name, {}).get("png")
         if path:

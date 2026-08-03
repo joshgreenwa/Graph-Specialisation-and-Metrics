@@ -2234,6 +2234,181 @@ def carrier_alignment_analysis(
     )
 
 
+def carrier_alignment_specificity_analysis(
+    rows: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Test same-event alignment against a locality-preserving donor-pair shuffle.
+
+    For each estimable target interaction, the null substitutes marginal carrier
+    profiles from other donor pairs at the *same graph and source*.  Carrier
+    identities, intervention location, graph geometry, and distance decay are
+    therefore fixed.  A positive ``matched_minus_shuffle`` value means the
+    interaction is more closely tied to its own marginal response than to the
+    generic locality envelope at that source.
+    """
+
+    if not rows:
+        return []
+    signed_columns = {
+        "semantic_projection",
+        "structural_projection",
+        "interaction_projection",
+    }
+    modes = ["absolute_mass"]
+    if signed_columns.issubset(rows[0].keys()):
+        modes.append("signed_projection")
+
+    grouped: dict[tuple[str, int, int], dict[int, list[Mapping[str, Any]]]] = defaultdict(
+        lambda: defaultdict(list)
+    )
+    for row in rows:
+        grouped[(str(row["task"]), int(row["graph"]), int(row["source"]))][int(row["pair"])].append(
+            row
+        )
+
+    fit_metrics = ("cosine", "explained_energy", "residual_fraction")
+    source_event_values: dict[tuple[Any, ...], list[float]] = defaultdict(list)
+    for (task, graph, source), pair_rows in grouped.items():
+        ordered = {
+            pair: sorted(event_rows, key=lambda row: int(row["carrier"]))
+            for pair, event_rows in pair_rows.items()
+        }
+        carrier_ids = {
+            pair: tuple(int(row["carrier"]) for row in event_rows)
+            for pair, event_rows in ordered.items()
+        }
+        for target_pair, target_rows in ordered.items():
+            if not _as_bool(target_rows[0].get("interaction_estimable", False)):
+                continue
+            candidate_pairs = [
+                pair
+                for pair in ordered
+                if pair != target_pair and carrier_ids[pair] == carrier_ids[target_pair]
+            ]
+            if not candidate_pairs:
+                continue
+            for mode in modes:
+                suffix = "mass" if mode == "absolute_mass" else "projection"
+                interaction = np.asarray(
+                    [_as_float(row[f"interaction_{suffix}"]) for row in target_rows],
+                    dtype=np.float64,
+                )
+                for reference in ("structural", "semantic"):
+                    matched_reference = np.asarray(
+                        [_as_float(row[f"{reference}_{suffix}"]) for row in target_rows],
+                        dtype=np.float64,
+                    )
+                    matched_fit = _carrier_alignment_metrics(matched_reference, interaction)
+                    if matched_fit is None:
+                        continue
+                    matched_metrics = matched_fit[0]
+                    shuffled_metrics: dict[str, list[float]] = defaultdict(list)
+                    for candidate_pair in candidate_pairs:
+                        shuffled_reference = np.asarray(
+                            [
+                                _as_float(row[f"{reference}_{suffix}"])
+                                for row in ordered[candidate_pair]
+                            ],
+                            dtype=np.float64,
+                        )
+                        shuffled_fit = _carrier_alignment_metrics(
+                            shuffled_reference,
+                            interaction,
+                        )
+                        if shuffled_fit is None:
+                            continue
+                        for metric in fit_metrics:
+                            value = float(shuffled_fit[0][metric])
+                            if np.isfinite(value):
+                                shuffled_metrics[metric].append(value)
+                    for metric in fit_metrics:
+                        matched = float(matched_metrics[metric])
+                        null_values = shuffled_metrics[metric]
+                        if not np.isfinite(matched) or not null_values:
+                            continue
+                        shuffled = float(np.mean(null_values))
+                        # For residual fraction, smaller is the better fit; all
+                        # reported advantages retain the convention positive=matched better.
+                        advantage = (
+                            shuffled - matched
+                            if metric == "residual_fraction"
+                            else matched - shuffled
+                        )
+                        key = (task, graph, source, mode, reference, metric)
+                        source_event_values[(*key, "matched")].append(matched)
+                        source_event_values[(*key, "within_source_shuffle")].append(shuffled)
+                        source_event_values[(*key, "matched_minus_shuffle")].append(advantage)
+
+    graph_values: dict[tuple[Any, ...], list[float]] = defaultdict(list)
+    for key, values in source_event_values.items():
+        task, graph, _source, mode, reference, metric, analysis = key
+        graph_values[(task, graph, mode, reference, metric, analysis)].append(
+            float(np.mean(values))
+        )
+    return [
+        {
+            "task": task,
+            "model_label": TASK_LABELS[str(task)],
+            "graph": int(graph),
+            "mode": mode,
+            "reference": reference,
+            "metric": metric,
+            "analysis": analysis,
+            "value": float(np.mean(values)),
+            "eligible_sources": len(values),
+        }
+        for (task, graph, mode, reference, metric, analysis), values in sorted(graph_values.items())
+    ]
+
+
+def paired_reference_advantages(
+    alignment_rows: Sequence[Mapping[str, Any]],
+    specificity_rows: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Form paired structural-minus-semantic fit contrasts within each graph."""
+
+    output: list[dict[str, Any]] = []
+    actual: dict[tuple[Any, ...], dict[str, float]] = defaultdict(dict)
+    for row in alignment_rows:
+        metric = str(row["metric"])
+        if metric not in {"cosine", "explained_energy", "residual_fraction"}:
+            continue
+        actual[(row["task"], int(row["graph"]), row["mode"], metric)][str(row["reference"])] = (
+            float(row["value"])
+        )
+    specificity: dict[tuple[Any, ...], dict[str, float]] = defaultdict(dict)
+    for row in specificity_rows:
+        if row["analysis"] != "matched_minus_shuffle":
+            continue
+        specificity[(row["task"], int(row["graph"]), row["mode"], row["metric"])][
+            str(row["reference"])
+        ] = float(row["value"])
+
+    for comparison, values_by_key in (
+        ("actual_fit", actual),
+        ("event_specificity", specificity),
+    ):
+        for (task, graph, mode, metric), values in sorted(values_by_key.items()):
+            if not {"structural", "semantic"}.issubset(values):
+                continue
+            if comparison == "actual_fit" and metric == "residual_fraction":
+                value = values["semantic"] - values["structural"]
+            else:
+                value = values["structural"] - values["semantic"]
+            output.append(
+                {
+                    "task": task,
+                    "model_label": TASK_LABELS[str(task)],
+                    "graph": int(graph),
+                    "mode": mode,
+                    "metric": metric,
+                    "comparison": comparison,
+                    "value": float(value),
+                }
+            )
+    return output
+
+
 def graph_metric_rows(
     rows: Sequence[Mapping[str, Any]],
     *,
@@ -2451,6 +2626,82 @@ def summarise_alignment_metrics(
     return output
 
 
+def summarise_specificity_metrics(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    bootstrap_replicates: int,
+    bootstrap_seed: int,
+) -> list[dict[str, Any]]:
+    grouped: dict[tuple[Any, ...], list[float]] = defaultdict(list)
+    for row in rows:
+        grouped[
+            (
+                row["task"],
+                row["mode"],
+                row["reference"],
+                row["metric"],
+                row["analysis"],
+            )
+        ].append(float(row["value"]))
+    output: list[dict[str, Any]] = []
+    for index, (key, values) in enumerate(sorted(grouped.items())):
+        task, mode, reference, metric, analysis = key
+        mean, low, high = _bootstrap_interval(
+            values,
+            replicates=int(bootstrap_replicates),
+            seed=int(bootstrap_seed) + index,
+        )
+        output.append(
+            {
+                "task": task,
+                "model_label": TASK_LABELS[str(task)],
+                "mode": mode,
+                "reference": reference,
+                "metric": metric,
+                "analysis": analysis,
+                "mean": mean,
+                "low": low,
+                "high": high,
+                "graphs": len(values),
+            }
+        )
+    return output
+
+
+def summarise_paired_reference_advantages(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    bootstrap_replicates: int,
+    bootstrap_seed: int,
+) -> list[dict[str, Any]]:
+    grouped: dict[tuple[Any, ...], list[float]] = defaultdict(list)
+    for row in rows:
+        grouped[(row["task"], row["mode"], row["metric"], row["comparison"])].append(
+            float(row["value"])
+        )
+    output: list[dict[str, Any]] = []
+    for index, ((task, mode, metric, comparison), values) in enumerate(sorted(grouped.items())):
+        mean, low, high = _bootstrap_interval(
+            values,
+            replicates=int(bootstrap_replicates),
+            seed=int(bootstrap_seed) + index,
+        )
+        output.append(
+            {
+                "task": task,
+                "model_label": TASK_LABELS[str(task)],
+                "mode": mode,
+                "metric": metric,
+                "comparison": comparison,
+                "mean": mean,
+                "low": low,
+                "high": high,
+                "graphs": len(values),
+            }
+        )
+    return output
+
+
 def summarise_residual_profiles(
     rows: Sequence[Mapping[str, Any]],
     *,
@@ -2648,9 +2899,14 @@ def plot_carrier_alignment(
     reference_colours = {"structural": "#168294", "semantic": "#E69F00"}
     x = np.arange(len(tasks), dtype=np.float64)
     fig, axes = plt.subplots(1, 3, figsize=(11.2, 3.35))
+    gain_title = (
+        r"Fitted gain $q_{int}=\lambda q_{ref}$"
+        if mode == "signed_projection"
+        else r"Fitted gain $m_{int}=\lambda m_{ref}$"
+    )
     specifications = (
         ("cosine", "Carrier-profile cosine", "Cosine"),
-        ("gain", r"Fitted gain $q_{int}=\lambda q_{ref}$", r"$\lambda$"),
+        ("gain", gain_title, r"$\lambda$"),
         ("explained_energy", "Interaction energy explained", r"$R^2_0$"),
     )
     for axis, (metric, title, ylabel) in zip(axes, specifications, strict=True):
@@ -2693,6 +2949,98 @@ def plot_carrier_alignment(
     fig.suptitle(title, y=1.13, fontsize=12)
     fig.tight_layout(rect=(0, 0, 1, 0.93))
     return _save_figure(fig, figures_dir, f"zinc_interaction_alignment_{mode}")
+
+
+def plot_alignment_specificity(
+    specificity_rows: Sequence[Mapping[str, Any]],
+    paired_rows: Sequence[Mapping[str, Any]],
+    *,
+    tasks: Sequence[str],
+    mode: str,
+    figures_dir: Path,
+) -> dict[str, str]:
+    """Plot the locality-preserving null and paired reference contrast."""
+
+    import matplotlib.pyplot as plt
+
+    _figure_theme()
+    x = np.arange(len(tasks), dtype=np.float64)
+    fig, axes = plt.subplots(1, 2, figsize=(8.5, 3.4), sharey=True)
+
+    reference_colours = {"structural": "#168294", "semantic": "#E69F00"}
+    for offset, reference in zip((-0.11, 0.11), ("structural", "semantic"), strict=True):
+        selected = {
+            str(row["task"]): row
+            for row in specificity_rows
+            if row["mode"] == mode
+            and row["reference"] == reference
+            and row["metric"] == "explained_energy"
+            and row["analysis"] == "matched_minus_shuffle"
+        }
+        valid_tasks = [task for task in tasks if task in selected]
+        if not valid_tasks:
+            continue
+        positions = np.asarray([x[tasks.index(task)] + offset for task in valid_tasks])
+        means = np.asarray([float(selected[task]["mean"]) for task in valid_tasks])
+        lows = np.asarray([float(selected[task]["low"]) for task in valid_tasks])
+        highs = np.asarray([float(selected[task]["high"]) for task in valid_tasks])
+        axes[0].errorbar(
+            positions,
+            means,
+            yerr=np.vstack((np.maximum(0.0, means - lows), np.maximum(0.0, highs - means))),
+            fmt="o",
+            ms=5,
+            capsize=3,
+            color=reference_colours[reference],
+            label=f"{reference.capitalize()} reference",
+        )
+    axes[0].set_title("True pair versus same-source shuffle")
+    axes[0].set_ylabel(r"Same-pair advantage in $R^2_0$")
+
+    comparison_colours = {"actual_fit": "#4C72B0", "event_specificity": "#B4475A"}
+    comparison_labels = {
+        "actual_fit": "Raw fit advantage",
+        "event_specificity": "Same-pair advantage difference",
+    }
+    for offset, comparison in zip((-0.11, 0.11), comparison_colours, strict=True):
+        selected = {
+            str(row["task"]): row
+            for row in paired_rows
+            if row["mode"] == mode
+            and row["metric"] == "explained_energy"
+            and row["comparison"] == comparison
+        }
+        valid_tasks = [task for task in tasks if task in selected]
+        if not valid_tasks:
+            continue
+        positions = np.asarray([x[tasks.index(task)] + offset for task in valid_tasks])
+        means = np.asarray([float(selected[task]["mean"]) for task in valid_tasks])
+        lows = np.asarray([float(selected[task]["low"]) for task in valid_tasks])
+        highs = np.asarray([float(selected[task]["high"]) for task in valid_tasks])
+        axes[1].errorbar(
+            positions,
+            means,
+            yerr=np.vstack((np.maximum(0.0, means - lows), np.maximum(0.0, highs - means))),
+            fmt="o",
+            ms=5,
+            capsize=3,
+            color=comparison_colours[comparison],
+            label=comparison_labels[comparison],
+        )
+    axes[1].set_title("Structural minus semantic")
+    for axis in axes:
+        axis.axhline(0.0, color="#666666", lw=1.0, ls="--")
+        axis.set_xticks(x, [TASK_LABELS[task] for task in tasks], rotation=24, ha="right")
+        axis.set_ylabel(r"Difference in $R^2_0$")
+        axis.legend(frameon=False, loc="best")
+    qualifier = "signed carrier projections" if mode == "signed_projection" else "carrier masses"
+    fig.suptitle(
+        f"Is interaction alignment event-specific, beyond the locality envelope? ({qualifier})",
+        y=1.08,
+        fontsize=12,
+    )
+    fig.tight_layout(rect=(0, 0, 1, 0.96))
+    return _save_figure(fig, figures_dir, f"zinc_interaction_specificity_{mode}")
 
 
 def plot_residual_profiles(
@@ -2945,6 +3293,8 @@ def figures(
     final_graph = graph_distance_profiles(carrier_rows, layerwise=False)
     absolute_graph = graph_absolute_distance_profiles(carrier_rows)
     alignment_graph, residual_graph, alignment_modes = carrier_alignment_analysis(carrier_rows)
+    specificity_graph = carrier_alignment_specificity_analysis(carrier_rows)
+    paired_advantage_graph = paired_reference_advantages(alignment_graph, specificity_graph)
     layer_graph = graph_distance_profiles(_read_csv(required["layer_distances"]), layerwise=True)
     final_metrics_graph = graph_metric_rows(_read_csv(required["events"]), layerwise=False)
     layer_metrics_graph = graph_metric_rows(_read_csv(required["layer_events"]), layerwise=True)
@@ -2983,6 +3333,16 @@ def figures(
         bootstrap_replicates=config.bootstrap_replicates,
         bootstrap_seed=config.analysis_seed + 700,
     )
+    specificity_summary = summarise_specificity_metrics(
+        specificity_graph,
+        bootstrap_replicates=config.bootstrap_replicates,
+        bootstrap_seed=config.analysis_seed + 800,
+    )
+    paired_advantage_summary = summarise_paired_reference_advantages(
+        paired_advantage_graph,
+        bootstrap_replicates=config.bootstrap_replicates,
+        bootstrap_seed=config.analysis_seed + 900,
+    )
     for name, values in (
         ("final_graph_profiles.csv", final_graph),
         ("final_profile_summary.csv", final_summary),
@@ -2998,6 +3358,10 @@ def figures(
         ("carrier_alignment_summary.csv", alignment_summary),
         ("carrier_alignment_residual_graph_profiles.csv", residual_graph),
         ("carrier_alignment_residual_summary.csv", residual_summary),
+        ("carrier_alignment_specificity_graph_metrics.csv", specificity_graph),
+        ("carrier_alignment_specificity_summary.csv", specificity_summary),
+        ("carrier_alignment_paired_advantage_graph_metrics.csv", paired_advantage_graph),
+        ("carrier_alignment_paired_advantage_summary.csv", paired_advantage_summary),
     ):
         _write_csv(results_dir / name, values)
     figures_dir = config.output_dir / "figures"
@@ -3045,6 +3409,13 @@ def figures(
             figures_dir=figures_dir,
             display_max_distance=display_max_distance,
         )
+        paths[f"carrier_specificity_{mode}"] = plot_alignment_specificity(
+            specificity_summary,
+            paired_advantage_summary,
+            tasks=config.tasks,
+            mode=mode,
+            figures_dir=figures_dir,
+        )
     _write_json(
         results_dir / "figure_manifest.json",
         {
@@ -3064,6 +3435,15 @@ def figures(
                 "screen only; signed-projection alignment is emitted only when the cache "
                 "contains signed scalar carrier projections."
             ),
+            "specificity_null": (
+                "For each estimable interaction, substitute marginal carrier profiles "
+                "from every other donor pair at the same task, graph, and source. This "
+                "preserves carrier identities and the complete locality envelope."
+            ),
+            "specificity_status": (
+                "Post-hoc falsification diagnostic motivated by the observed structural/"
+                "interaction profile similarity; it is not part of the preregistered pilot."
+            ),
             "carrier_alignment_modes": list(alignment_modes),
             "signed_alignment_available": "signed_projection" in alignment_modes,
         },
@@ -3077,6 +3457,8 @@ def figures(
         "absolute_profile_summary": absolute_summary,
         "carrier_alignment_summary": alignment_summary,
         "carrier_residual_summary": residual_summary,
+        "carrier_specificity_summary": specificity_summary,
+        "carrier_paired_advantage_summary": paired_advantage_summary,
         "carrier_alignment_modes": alignment_modes,
     }
 
