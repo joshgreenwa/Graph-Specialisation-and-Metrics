@@ -1227,6 +1227,14 @@ ZINC_ATOM_TYPES = (
 )
 
 CHEMISTRY_FOCUS_VERSION = "pcqm_chemistry_focus.v1+explicit_hydrogen"
+QM9_VALENCE_TOLERANT_CHEMISTRY_VERSION = (
+    f"{CHEMISTRY_FOCUS_VERSION}+qm9_valence_tolerant_v1"
+)
+
+_RDKIT_SANITIZED_PROPERTY = "_graph_specialisation_sanitized"
+_RDKIT_SANITIZATION_ERROR_PROPERTY = (
+    "_graph_specialisation_sanitization_error"
+)
 
 ZINC_FIGURE_TASKS = (
     "zinc",
@@ -1289,6 +1297,14 @@ def molecular_task_family(task_name: str) -> str:
     raise ValueError(
         f"no molecular figure family is registered for GRIT task {task_name!r}"
     )
+
+
+def chemistry_focus_version(task_name: str) -> str:
+    """Return the task-scoped chemistry/cache contract version."""
+
+    if molecular_task_family(task_name) == "qm9":
+        return QM9_VALENCE_TOLERANT_CHEMISTRY_VERSION
+    return CHEMISTRY_FOCUS_VERSION
 
 
 def resolve_canonical_task_root(
@@ -1427,9 +1443,16 @@ def _edge_type_values(graph: Any, edge_count: int) -> np.ndarray:
 
 
 def molecule_from_graph(task_name: str, graph: Any):
-    """Reconstruct an RDKit molecule in the graph's exact node-index order."""
+    """Reconstruct an RDKit molecule in the graph's exact node-index order.
 
-    from rdkit import Chem
+    Some QM9-derived graph records encode a chemically invalid explicit
+    valence.  RDKit sanitization is useful metadata validation, but it must not
+    remove a graph or atom from an index-aligned attention visualization.  Such
+    records therefore fall back to a property-cache/ring initialization that
+    tolerates the invalid valence while preserving every original node.
+    """
+
+    from rdkit import Chem, rdBase
 
     task_name = str(task_name)
     task_family = molecular_task_family(task_name)
@@ -1493,7 +1516,19 @@ def molecule_from_graph(task_name: str, graph: Any):
             molecule.GetAtomWithIdx(source).SetIsAromatic(True)
             molecule.GetAtomWithIdx(target).SetIsAromatic(True)
     result = molecule.GetMol()
-    Chem.SanitizeMol(result)
+    try:
+        # Sanitization errors are retained as structured cache metadata rather
+        # than emitted as noisy RDKit stderr messages during a long Colab run.
+        with rdBase.BlockLogs():
+            Chem.SanitizeMol(result)
+    except Chem.MolSanitizeException as error:
+        result = molecule.GetMol()
+        result.UpdatePropertyCache(strict=False)
+        Chem.GetSymmSSSR(result)
+        result.SetBoolProp(_RDKIT_SANITIZED_PROPERTY, False)
+        result.SetProp(_RDKIT_SANITIZATION_ERROR_PROPERTY, str(error))
+    else:
+        result.SetBoolProp(_RDKIT_SANITIZED_PROPERTY, True)
     if result.GetNumAtoms() != int(graph.num_nodes):
         raise RuntimeError("RDKit reconstruction changed the graph atom count")
     return result
@@ -1522,12 +1557,31 @@ def molecule_record(task_name: str, graph: Any) -> dict[str, Any]:
     from rdkit.Chem import rdMolDescriptors
 
     molecule = molecule_from_graph(task_name, graph)
-    display_molecule = Chem.RemoveHs(Chem.Mol(molecule))
+    sanitized = (
+        molecule.GetBoolProp(_RDKIT_SANITIZED_PROPERTY)
+        if molecule.HasProp(_RDKIT_SANITIZED_PROPERTY)
+        else True
+    )
+    sanitization_error = (
+        molecule.GetProp(_RDKIT_SANITIZATION_ERROR_PROPERTY)
+        if molecule.HasProp(_RDKIT_SANITIZATION_ERROR_PROPERTY)
+        else None
+    )
+    # RemoveHs can itself request sanitization.  Keep the full, index-aligned
+    # graph for tolerant records; this representation is also the one cached
+    # in mol_block for the attention depiction.
+    display_molecule = (
+        Chem.RemoveHs(Chem.Mol(molecule))
+        if sanitized
+        else Chem.Mol(molecule)
+    )
     identity = figure_identity(task_name)
     return {
         "mol_block": Chem.MolToMolBlock(molecule),
         "smiles": Chem.MolToSmiles(display_molecule, canonical=True),
         "formula": rdMolDescriptors.CalcMolFormula(molecule),
+        "rdkit_sanitized": bool(sanitized),
+        "rdkit_sanitization_error": sanitization_error,
         "molecule_name": _optional_graph_text(graph, "name"),
         "node_labels": [atom.GetSymbol() for atom in molecule.GetAtoms()],
         "chemistry_decoder": (
@@ -1535,7 +1589,7 @@ def molecule_record(task_name: str, graph: Any) -> dict[str, Any]:
             if molecular_task_family(task_name) == "zinc"
             else "PyG QM9 atomic numbers and four bond classes"
         ),
-        "chemistry_focus_version": CHEMISTRY_FOCUS_VERSION,
+        "chemistry_focus_version": chemistry_focus_version(task_name),
         **identity,
     }
 
@@ -1819,7 +1873,7 @@ def compute_av_pca_inputs_many(
             "quantity": (
                 "mean over receiving nodes of native GRIT routed head output wV"
             ),
-            "chemistry_focus_version": CHEMISTRY_FOCUS_VERSION,
+            "chemistry_focus_version": chemistry_focus_version(task_name),
             **figure_identity(task_name),
         }
     return output
@@ -1951,7 +2005,7 @@ def compute_layer_av_pca_inputs(
         "quantity": (
             "mean over receiving nodes of native GRIT routed head output wV"
         ),
-        "chemistry_focus_version": CHEMISTRY_FOCUS_VERSION,
+        "chemistry_focus_version": chemistry_focus_version(task_name),
         **figure_identity(task_name),
     }
 
@@ -2219,6 +2273,7 @@ __all__ = [
     "aggregate_logit_spread",
     "build_verified_grit_figure_runtime",
     "collect_attention_examples",
+    "chemistry_focus_version",
     "compute_av_pca_inputs",
     "compute_av_pca_inputs_many",
     "compute_layer_av_pca_inputs",

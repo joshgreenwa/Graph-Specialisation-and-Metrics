@@ -25,6 +25,7 @@ from graph_specialisation_metrics.methodology.grit_figure_data import (  # noqa:
     ZINC_ATOM_TYPES,
     _normalised_attention_entropy,
     atom_chemistry_categories,
+    chemistry_focus_version,
     compute_layer_av_pca_inputs,
     compute_selected_head_transport_profiles,
     figure_identity,
@@ -51,6 +52,7 @@ from graph_specialisation_metrics.methodology.grit_figure_plots import (  # noqa
     PCA_FOCUS_COLORS,
     PUBLICATION_PDF_RASTER_DPI,
     PUBLICATION_PNG_DPI,
+    _molecule_from_example,
     _pca_focus_color,
     attention_cmap_name,
     plot_attention_grid,
@@ -745,6 +747,65 @@ def test_zinc_and_qm9_graphs_reconstruct_as_index_preserving_molecules():
     assert figure_identity("qm9_gap_1hop_vnode")["display_title"] == (
         "QM9 HOMO–LUMO gap — GRIT (1-hop + VN)"
     )
+
+
+def test_invalid_qm9_valence_uses_index_preserving_rdkit_fallback():
+    import matplotlib.pyplot as plt
+
+    pytest.importorskip("rdkit")
+
+    # Neutral nitrogen with four explicit single bonds reproduces the RDKit
+    # AtomValenceException seen in the QM9-derived evaluation graph.
+    edge_pairs = [(0, 1), (0, 2), (0, 3), (0, 4)]
+    directed_edges = [
+        edge
+        for source, target in edge_pairs
+        for edge in ((source, target), (target, source))
+    ]
+    graph = SimpleNamespace(
+        x=np.asarray([[7], [6], [6], [6], [6]], dtype=np.int64),
+        num_nodes=5,
+        edge_index=np.asarray(directed_edges, dtype=np.int64).T,
+        edge_attr=np.zeros(len(directed_edges), dtype=np.int64),
+        name="invalid-valence-example",
+    )
+
+    molecule = molecule_from_graph("qm9_gap_1hop", graph)
+    assert molecule.GetNumAtoms() == graph.num_nodes
+    assert molecule.GetBoolProp("_graph_specialisation_sanitized") is False
+    assert len(atom_chemistry_categories(molecule)) == graph.num_nodes
+
+    record = molecule_record("qm9_gap_1hop", graph)
+    assert record["rdkit_sanitized"] is False
+    assert "Explicit valence" in record["rdkit_sanitization_error"]
+    assert record["formula"] == "C4N"
+    assert record["chemistry_focus_version"] == chemistry_focus_version(
+        "qm9_gap_1hop"
+    )
+    assert record["chemistry_focus_version"] != CHEMISTRY_FOCUS_VERSION
+    reparsed = _molecule_from_example({**record, "n_atoms": graph.num_nodes})
+    assert reparsed.GetNumAtoms() == graph.num_nodes
+
+    figure = plot_attention_grid(
+        {
+            "task": "qm9_gap_1hop",
+            "examples": [
+                {
+                    **record,
+                    "dataset_index": 0,
+                    "n_atoms": graph.num_nodes,
+                    "attention": {"semantic": np.eye(graph.num_nodes)},
+                }
+            ],
+        },
+        role="semantic",
+        head=(0, 0),
+        per_graph_coordinates={0: {"D_rel": 0.5, "J": 1.0}},
+        net_d_rel=0.5,
+        net_joint_sensitivity=1.0,
+    )
+    assert figure is not None
+    plt.close(figure)
 
 
 def test_canonical_task_root_resolution_prefers_configured_then_discovers(

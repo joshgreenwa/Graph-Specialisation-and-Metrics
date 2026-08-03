@@ -446,16 +446,37 @@ def _node_conditioned_attention(attention: np.ndarray) -> np.ndarray:
 
 
 def _molecule_from_example(example: Mapping[str, Any]):
-    from rdkit import Chem
+    from rdkit import Chem, rdBase
 
     mol_block = example.get("mol_block")
-    molecule = (
-        Chem.MolFromMolBlock(str(mol_block), removeHs=False, sanitize=True)
-        if mol_block
-        else Chem.MolFromSmiles(str(example["smiles"]))
-    )
+    sanitize = bool(example.get("rdkit_sanitized", True))
+    with rdBase.BlockLogs():
+        if mol_block:
+            molecule = Chem.MolFromMolBlock(
+                str(mol_block),
+                removeHs=False,
+                sanitize=sanitize,
+            )
+            # Old caches do not carry rdkit_sanitized.  If strict parsing
+            # rejects their MolBlock, recover the index-preserving graph.
+            if molecule is None and sanitize:
+                molecule = Chem.MolFromMolBlock(
+                    str(mol_block),
+                    removeHs=False,
+                    sanitize=False,
+                )
+                sanitize = False
+        else:
+            smiles = str(example["smiles"])
+            molecule = Chem.MolFromSmiles(smiles, sanitize=sanitize)
+            if molecule is None and sanitize:
+                molecule = Chem.MolFromSmiles(smiles, sanitize=False)
+                sanitize = False
     if molecule is None:
         raise ValueError("RDKit could not parse the cached molecule")
+    if not sanitize:
+        molecule.UpdatePropertyCache(strict=False)
+        Chem.GetSymmSSSR(molecule)
     expected = int(example.get("n_atoms", molecule.GetNumAtoms()))
     if molecule.GetNumAtoms() != expected:
         raise ValueError(
