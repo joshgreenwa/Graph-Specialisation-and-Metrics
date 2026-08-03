@@ -124,6 +124,7 @@ os.chdir(REPO_DIR)
 
 from graph_specialisation_metrics.zinc_cached_rrwp_comparison import (
     cache_inventory,
+    load_compatible_score_artifact,
     run,
 )
 
@@ -139,6 +140,7 @@ def missing_tasks(records):
 
 
 inventory_rows = []
+protocol_rows = []
 for task_record in inventory:
     if task_record["matches"]:
         for match in task_record["matches"]:
@@ -152,6 +154,25 @@ for task_record in inventory:
                     "carriage": match["carriage_exists"],
                 }
             )
+            if match["score_exists"] and match["model_exists"]:
+                artifact = load_compatible_score_artifact(
+                    match["score"], expected_task=match["artifact_task"]
+                )
+                contract = artifact.metadata["contract"]
+                protocol_rows.append(
+                    {
+                        "task": task_record["task"],
+                        "artifact_task": match["artifact_task"],
+                        "protocol": artifact.metadata["protocol_version"],
+                        "semantic_donor_law": contract.get(
+                            "semantic_donor_law", "unknown"
+                        ),
+                        "structural_donor_law": contract.get(
+                            "structural_donor_law", "unknown"
+                        ),
+                        "score_cache": match["score"],
+                    }
+                )
     else:
         inventory_rows.append(
             {
@@ -207,6 +228,11 @@ checkpoint_manifest.write_text(
     json.dumps(checkpoint_rows, indent=2, sort_keys=True) + "\n",
     encoding="utf-8",
 )
+protocol_manifest = OUTPUT_DIR / "cache_protocol_inventory.json"
+protocol_manifest.write_text(
+    json.dumps(protocol_rows, indent=2, sort_keys=True) + "\n",
+    encoding="utf-8",
+)
 
 import pandas as pd
 from IPython.display import Image, display
@@ -216,6 +242,19 @@ display(pd.DataFrame(checkpoint_rows))
 print(f"[checkpoint-manifest] {checkpoint_manifest}")
 print("Canonical cache inventory")
 display(pd.DataFrame(inventory_rows))
+print("Canonical score protocol inventory")
+display(pd.DataFrame(protocol_rows))
+print(f"[protocol-manifest] {protocol_manifest}")
+for protocol in sorted({row["protocol"] for row in protocol_rows}):
+    protocol_tasks = [row["task"] for row in protocol_rows if row["protocol"] == protocol]
+    print(f"[{protocol.rsplit('-', 1)[-1]}] " + ", ".join(protocol_tasks))
+v3_tasks = [
+    row["task"]
+    for row in protocol_rows
+    if row["protocol"] == "donor-swap-specialisation-carriage-v3"
+]
+if v3_tasks:
+    print("[recompute-v4] " + ", ".join(v3_tasks))
 missing = missing_tasks(inventory)
 if missing:
     missing_checkpoint_state = [
