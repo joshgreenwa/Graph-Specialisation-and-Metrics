@@ -16,9 +16,11 @@ from graph_specialisation_metrics.methodology.graphormer_causal_analysis import 
 )
 from graph_specialisation_metrics.methodology.graphormer_causal_population import (
     PopulationPolicy,
+    _causal_preference_analysis,
     _event_interval,
     build_population_gate,
     layer_adjusted_components,
+    response_adjusted_components,
 )
 from graph_specialisation_metrics.methodology.graphormer_causal_population_plots import (
     render_population_figure_suite,
@@ -152,6 +154,34 @@ def test_layer_adjusted_partial_slope_equals_fixed_effect_regression():
     assert set(result["leave_one_layer_out"]) == {"0", "1", "2"}
 
 
+def test_response_adjusted_slope_matches_direct_regression():
+    layers = np.repeat(np.arange(3), 10)
+    selectivity = np.linspace(-0.5, 0.6, len(layers)) + 0.03 * layers
+    response = 0.7 + 0.2 * np.sin(np.arange(len(layers))) + 0.02 * layers
+    preference = (
+        0.7 * selectivity
+        + 0.4 * response
+        + np.asarray([0.0, 0.8, -0.5])[layers]
+    )
+    result = response_adjusted_components(
+        selectivity, preference, response, layers
+    )
+
+    scaled = [
+        (values - np.mean(values)) / np.std(values)
+        for values in (selectivity, preference, response)
+    ]
+    x_scaled, y_scaled, response_scaled = scaled
+    indicators = np.column_stack(
+        ((layers == 1).astype(float), (layers == 2).astype(float))
+    )
+    design = np.column_stack(
+        (np.ones(len(selectivity)), x_scaled, response_scaled, indicators)
+    )
+    expected = float(np.linalg.lstsq(design, y_scaled, rcond=None)[0][1])
+    assert np.isclose(result["beta"], expected)
+
+
 def test_population_interval_resamples_complete_matched_head_families(tmp_path):
     config = production_config(
         output_dir=str(tmp_path),
@@ -211,9 +241,77 @@ def test_population_interval_resamples_complete_matched_head_families(tmp_path):
     assert summary["correct_pairing_advantage"].shape == (1,)
     assert summary["correct_pairing_low"].shape == (1,)
     assert summary["correct_pairing_high"].shape == (1,)
+    assert summary["head_estimate"].shape == (2, 8, 1)
+    assert summary["head_draws"].shape == (2_000, 2, 8, 1)
     assert summary["head_pair_count"] == 2
     assert summary["null_head_count"] == 4
     assert "matched head pair" in summary["resampled_levels"]
+
+
+def test_causal_preference_uses_semantic_minus_structural_effect(tmp_path):
+    config = production_config(
+        output_dir=str(tmp_path),
+        dataset_root=str(tmp_path / "pcqm"),
+        cache_dir=str(tmp_path / "hf"),
+        accelerator="cpu",
+    )
+    gate = {
+        "specialist_pairs": (
+            {"semantic": (0, 0), "structural": (0, 4)},
+            {"semantic": (1, 0), "structural": (1, 4)},
+        ),
+        "null_pairs": (
+            {"target": (0, 0), "null": (0, 8)},
+            {"target": (0, 4), "null": (0, 9)},
+            {"target": (1, 0), "null": (1, 8)},
+            {"target": (1, 4), "null": (1, 9)},
+        ),
+    }
+    head_order = tuple(
+        sorted(
+            {
+                tuple(row[key])
+                for row in gate["specialist_pairs"]
+                for key in ("semantic", "structural")
+            }
+            | {tuple(row["null"]) for row in gate["null_pairs"]}
+        )
+    )
+    scores = _scores()
+    coordinates = scores["coordinates"]
+    selectivity = np.asarray(
+        [coordinates.selectivity[head] for head in head_order]
+    )
+    response = np.asarray(
+        [0.02 + 0.003 * coordinates.joint_sensitivity[head] for head in head_order]
+    )
+    point = np.empty((2, len(head_order), 2), dtype=np.float64)
+    point[0, :, 0] = response + 0.006 * selectivity
+    point[1, :, 0] = response - 0.006 * selectivity
+    point[0, :, 1] = response + 0.004 * selectivity
+    point[1, :, 1] = response - 0.004 * selectivity
+    rng = np.random.default_rng(5)
+    draws = point[None] + rng.normal(0.0, 1.0e-4, size=(40, *point.shape))
+    result = _causal_preference_analysis(
+        {
+            "head_order": head_order,
+            "head_estimate": point,
+            "head_draws": draws,
+            "metric_order": ("R_align_matched", "I_align_matched"),
+            "resampled_levels": ("graph", "source", "donor", "matched head pair"),
+        },
+        scores,
+        gate,
+        config,
+    )
+    expected_restoration = 0.012 * selectivity
+    assert np.allclose(
+        result["endpoints"]["restoration"]["causal_preference"],
+        expected_restoration,
+    )
+    assert result["endpoints"]["restoration"]["spearman_rho"] > 0.99
+    assert "matched head pair" not in result["resampled_levels"]
+    assert "matched four-head block" in result["resampled_levels"]
 
 
 def test_population_figures_export_vector_pdf_and_600_dpi_png(tmp_path):
@@ -264,6 +362,41 @@ def test_population_figures_export_vector_pdf_and_600_dpi_png(tmp_path):
             "graph_count": 128,
             "layer_adjusted_partial": partial,
         },
+        "causal_preference": {
+            "selectivity": scores["coordinates"].selectivity.reshape(-1),
+            "layers": layers,
+            "head_count": len(J),
+            "graph_count": 128,
+            "endpoints": {
+                name: {
+                    "causal_preference": values,
+                    "preference_low": values - 0.015,
+                    "preference_high": values + 0.015,
+                    "spearman_rho": 0.46 + 0.04 * position,
+                    "spearman_low": 0.35 + 0.04 * position,
+                    "spearman_high": 0.56 + 0.04 * position,
+                    "response_layer_adjusted_beta": 0.62 + 0.05 * position,
+                    "response_layer_adjusted_low": 0.48 + 0.05 * position,
+                    "response_layer_adjusted_high": 0.75 + 0.05 * position,
+                }
+                for position, (name, values) in enumerate(
+                    (
+                        (
+                            "restoration",
+                            0.05
+                            * scores["coordinates"].selectivity.reshape(-1)
+                            + 0.002 * layers,
+                        ),
+                        (
+                            "injection",
+                            0.04
+                            * scores["coordinates"].selectivity.reshape(-1)
+                            + 0.001 * layers,
+                        ),
+                    )
+                )
+            },
+        },
     }
     outputs = render_population_figure_suite(
         scores,
@@ -277,6 +410,7 @@ def test_population_figures_export_vector_pdf_and_600_dpi_png(tmp_path):
         "population_causal_tests_mismatch_adjusted",
         "correct_pairing_advantage",
         "J_vs_clean_ablation",
+        "Drel_vs_causal_preference",
         "population_selection",
     }
     for paths in outputs.values():

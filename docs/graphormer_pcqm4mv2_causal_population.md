@@ -46,6 +46,14 @@ roles. A separate retained figure subtracts the same-source, same-tier, nearest-
 alternative-donor response. That stricter donor-specific analysis is a robustness check, not the
 primary test of aggregate semantic/structural specialization.
 
+A complementary continuous test avoids relying only on the two specialist labels. For every
+selected or matched head, causal preference is its semantic-event effect minus its
+structural-event effect. The analysis tests whether discovery `D_rel` predicts this preference for
+restoration and injection. It reports raw Spearman correlation and a standardized regression
+coefficient that also accounts for the head's mean absolute causal response and layer. This
+controls overall responsiveness without dividing by a potentially near-zero response. Intervals
+jointly resample intervention events and the matched four-head blocks.
+
 The semantic and structural populations are evaluated on both intervention channels. The
 `J`-matched null family is shown for necessity. Confidence intervals jointly resample held-out molecules,
 channel-specific sources, donors, and matched head pairs. These intervals characterize this one
@@ -73,7 +81,9 @@ shards before scheduling work when the scientific contract is unchanged. The 256
 contract is stored under a separate Drive root, preserving the exploratory 128-molecule caches.
 Dataset and checkpoint downloads remain shared. A new graph/channel shard contains reused rows plus
 only the missing population heads. Styling-only reruns use `PHASE = "figures"` and do not load
-Graphormer or PCQM4Mv2.
+Graphormer or PCQM4Mv2. To add the continuous causal-preference result to a cache made by an older
+notebook revision, run once with `PHASE = "all"`; the upgrade rebuilds bootstrap summaries from the
+event shards with zero model forwards.
 
 The Colab defaults target an 80 GB A100-class runtime: 16 clean-ablation graphs, 64 heads, and all
 48 source/donor events are attempted per batch. Graph-score batches and head batches recursively
@@ -91,5 +101,6 @@ Outputs are vector PDFs, 600-DPI PNGs, and JSON provenance sidecars under
 - `01_population_raw_restoration_injection_necessity` (primary);
 - `01b_correct_pairing_advantage` (direct matching-versus-crossed summary);
 - `01_population_restoration_injection_necessity` (retained mismatch-adjusted robustness check);
-- `02_J_vs_clean_ablation`; and
+- `02_J_vs_clean_ablation`;
+- `03_Drel_vs_causal_preference`; and
 - `S01_population_head_selection`.

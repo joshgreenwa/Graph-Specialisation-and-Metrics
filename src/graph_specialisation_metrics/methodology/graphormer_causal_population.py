@@ -648,8 +648,9 @@ def _event_interval(
         family_order.append("j_matched_null")
     estimate = reduce(np.asarray(interval.estimate), families)
     rng = np.random.default_rng(int(config.bootstrap.rng_seed) + int(seed_offset))
-    draws = []
-    for draw in np.asarray(interval.draws):
+    head_draws = np.asarray(interval.draws, dtype=np.float64)
+    family_draws = []
+    for draw in head_draws:
         pair_sample = rng.integers(0, len(specialist_pairs), size=len(specialist_pairs))
         selected = [
             semantic_positions[pair_sample],
@@ -658,16 +659,16 @@ def _event_interval(
         if include_null:
             null_sample = rng.integers(0, len(null_positions), size=len(null_positions))
             selected.append(null_positions[null_sample])
-        draws.append(reduce(draw, selected))
-    draws = np.asarray(draws, dtype=np.float64)
+        family_draws.append(reduce(draw, selected))
+    family_draws = np.asarray(family_draws, dtype=np.float64)
     alpha = (1.0 - float(config.bootstrap.confidence)) / 2.0
-    low = np.nanquantile(draws, alpha, axis=0)
-    high = np.nanquantile(draws, 1.0 - alpha, axis=0)
+    low = np.nanquantile(family_draws, alpha, axis=0)
+    high = np.nanquantile(family_draws, 1.0 - alpha, axis=0)
     pairing_estimate = (estimate[0, 0] - estimate[0, 1]) - (
         estimate[1, 0] - estimate[1, 1]
     )
-    pairing_draws = (draws[:, 0, 0] - draws[:, 0, 1]) - (
-        draws[:, 1, 0] - draws[:, 1, 1]
+    pairing_draws = (family_draws[:, 0, 0] - family_draws[:, 0, 1]) - (
+        family_draws[:, 1, 0] - family_draws[:, 1, 1]
     )
     pairing_low = np.nanquantile(pairing_draws, alpha, axis=0)
     pairing_high = np.nanquantile(pairing_draws, 1.0 - alpha, axis=0)
@@ -686,6 +687,9 @@ def _event_interval(
         "event_counts": {channel: len(observations[channel]) for channel in CHANNELS},
         "head_pair_count": len(specialist_pairs),
         "null_head_count": len(null_positions),
+        "head_order": head_order,
+        "head_estimate": np.asarray(interval.estimate, dtype=np.float64),
+        "head_draws": head_draws,
     }
 
 
@@ -714,6 +718,240 @@ def _endpoint(summary: Mapping[str, Any], metric: str) -> dict[str, Any]:
         "replicates": summary["replicates"],
         "resampled_levels": summary["resampled_levels"],
         "event_counts": summary["event_counts"],
+    }
+
+
+def response_adjusted_components(
+    selectivity: Sequence[float],
+    preference: Sequence[float],
+    mean_response: Sequence[float],
+    layers: Sequence[int],
+) -> dict[str, Any]:
+    """Adjust causal preference for response magnitude and layer.
+
+    The reported coefficient is the coefficient of globally standardized
+    ``D_rel`` in a regression of standardized causal preference on ``D_rel``,
+    mean absolute causal response, and layer fixed effects.  Treating response
+    magnitude as a covariate avoids the instability of dividing by an effect
+    that can be close to zero.
+    """
+
+    selectivity = np.asarray(selectivity, dtype=np.float64)
+    preference = np.asarray(preference, dtype=np.float64)
+    mean_response = np.asarray(mean_response, dtype=np.float64)
+    layers = np.asarray(layers, dtype=np.int64)
+    finite = (
+        np.isfinite(selectivity)
+        & np.isfinite(preference)
+        & np.isfinite(mean_response)
+    )
+    selectivity = selectivity[finite]
+    preference = preference[finite]
+    mean_response = mean_response[finite]
+    layers = layers[finite]
+    if len(selectivity) < 4:
+        return {"beta": np.nan, "head_count": len(selectivity)}
+
+    def standardize(values: np.ndarray) -> np.ndarray | None:
+        scale = float(np.std(values))
+        if not np.isfinite(scale) or scale <= 0:
+            return None
+        return (values - np.mean(values)) / scale
+
+    x = standardize(selectivity)
+    y = standardize(preference)
+    response = standardize(mean_response)
+    if x is None or y is None or response is None:
+        return {"beta": np.nan, "head_count": len(selectivity)}
+    unique_layers = sorted({int(value) for value in layers})
+    indicators = (
+        np.column_stack(
+            [(layers == value).astype(np.float64) for value in unique_layers[1:]]
+        )
+        if len(unique_layers) > 1
+        else np.empty((len(selectivity), 0), dtype=np.float64)
+    )
+    nuisance = np.column_stack((np.ones(len(selectivity)), response, indicators))
+    x_residual = x - nuisance @ np.linalg.lstsq(nuisance, x, rcond=None)[0]
+    y_residual = y - nuisance @ np.linalg.lstsq(nuisance, y, rcond=None)[0]
+    denominator = float(np.dot(x_residual, x_residual))
+    beta = (
+        float(np.dot(x_residual, y_residual) / denominator)
+        if denominator > 0
+        else np.nan
+    )
+    return {
+        "beta": beta,
+        "head_count": len(selectivity),
+        "selectivity_residual": x_residual,
+        "preference_residual": y_residual,
+        "layers": layers,
+        "definition": (
+            "standardized D_rel coefficient after controlling for globally "
+            "standardized mean absolute causal response and layer fixed effects"
+        ),
+    }
+
+
+def _causal_preference_analysis(
+    raw_summary: Mapping[str, Any],
+    scores: Mapping[str, Any],
+    population_gate: Mapping[str, Any],
+    config: MethodologyConfig,
+    *,
+    progress: Any | None = None,
+) -> dict[str, Any]:
+    """Relate discovery D_rel to semantic-minus-structural causal effects."""
+
+    from scipy.stats import spearmanr
+
+    head_order = tuple(_head_tuple(head) for head in raw_summary["head_order"])
+    coordinates = scores["coordinates"]
+    selectivity = np.asarray(
+        [float(coordinates.selectivity[head]) for head in head_order],
+        dtype=np.float64,
+    )
+    joint_sensitivity = np.asarray(
+        [float(coordinates.joint_sensitivity[head]) for head in head_order],
+        dtype=np.float64,
+    )
+    layers = np.asarray([head[0] for head in head_order], dtype=np.int64)
+    head_position = {head: position for position, head in enumerate(head_order)}
+    null_by_target = {
+        _head_tuple(row["target"]): _head_tuple(row["null"])
+        for row in population_gate["null_pairs"]
+    }
+    blocks = []
+    for pair in population_gate["specialist_pairs"]:
+        semantic = _head_tuple(pair["semantic"])
+        structural = _head_tuple(pair["structural"])
+        blocks.append(
+            np.asarray(
+                [
+                    head_position[semantic],
+                    head_position[structural],
+                    head_position[null_by_target[semantic]],
+                    head_position[null_by_target[structural]],
+                ],
+                dtype=np.int64,
+            )
+        )
+    if not blocks:
+        raise ValueError("causal preference analysis requires matched head blocks")
+    blocks = np.stack(blocks)
+
+    point = np.asarray(raw_summary["head_estimate"], dtype=np.float64)
+    event_draws = np.asarray(raw_summary["head_draws"], dtype=np.float64)
+    metric_order = tuple(raw_summary["metric_order"])
+    alpha = (1.0 - float(config.bootstrap.confidence)) / 2.0
+    rng = np.random.default_rng(int(config.bootstrap.rng_seed) + 421)
+    endpoints: dict[str, Any] = {}
+    for endpoint_name, metric in (
+        ("restoration", "R_align_matched"),
+        ("injection", "I_align_matched"),
+    ):
+        metric_position = metric_order.index(metric)
+        head_effect = point[:, :, metric_position]
+        preference = head_effect[0] - head_effect[1]
+        mean_response = 0.5 * (np.abs(head_effect[0]) + np.abs(head_effect[1]))
+        preference_draws = (
+            event_draws[:, 0, :, metric_position]
+            - event_draws[:, 1, :, metric_position]
+        )
+        response_draws = 0.5 * (
+            np.abs(event_draws[:, 0, :, metric_position])
+            + np.abs(event_draws[:, 1, :, metric_position])
+        )
+        raw_rho = float(spearmanr(selectivity, preference).statistic)
+        adjusted = response_adjusted_components(
+            selectivity,
+            preference,
+            mean_response,
+            layers,
+        )
+        rho_draws = []
+        beta_draws = []
+        for draw_position in range(event_draws.shape[0]):
+            sampled_blocks = blocks[
+                rng.integers(0, len(blocks), size=len(blocks))
+            ].reshape(-1)
+            draw_preference = preference_draws[draw_position, sampled_blocks]
+            draw_response = response_draws[draw_position, sampled_blocks]
+            draw_selectivity = selectivity[sampled_blocks]
+            draw_layers = layers[sampled_blocks]
+            rho_draws.append(
+                float(spearmanr(draw_selectivity, draw_preference).statistic)
+            )
+            beta_draws.append(
+                float(
+                    response_adjusted_components(
+                        draw_selectivity,
+                        draw_preference,
+                        draw_response,
+                        draw_layers,
+                    )["beta"]
+                )
+            )
+            completed = draw_position + 1
+            if progress is not None and (
+                completed == 1
+                or completed % 100 == 0
+                or completed == event_draws.shape[0]
+            ):
+                progress.emit(
+                    "causal_preference_bootstrap_progress",
+                    endpoint=endpoint_name,
+                    completed_draws=completed,
+                    total_draws=int(event_draws.shape[0]),
+                )
+        rho_draws = np.asarray(rho_draws, dtype=np.float64)
+        beta_draws = np.asarray(beta_draws, dtype=np.float64)
+        endpoints[endpoint_name] = {
+            "causal_preference": preference,
+            "preference_low": np.nanquantile(preference_draws, alpha, axis=0),
+            "preference_high": np.nanquantile(
+                preference_draws, 1.0 - alpha, axis=0
+            ),
+            "average_response": mean_response,
+            "semantic_effect": head_effect[0],
+            "structural_effect": head_effect[1],
+            "spearman_rho": raw_rho,
+            "spearman_low": float(np.nanquantile(rho_draws, alpha)),
+            "spearman_high": float(np.nanquantile(rho_draws, 1.0 - alpha)),
+            "response_layer_adjusted_beta": float(adjusted["beta"]),
+            "response_layer_adjusted_low": float(
+                np.nanquantile(beta_draws, alpha)
+            ),
+            "response_layer_adjusted_high": float(
+                np.nanquantile(beta_draws, 1.0 - alpha)
+            ),
+            "response_adjusted_components": adjusted,
+        }
+    return {
+        "version": "causal-preference-v1",
+        "head_order": head_order,
+        "selectivity": selectivity,
+        "joint_sensitivity": joint_sensitivity,
+        "layers": layers,
+        "head_count": len(head_order),
+        "graph_count": int(config.sizes.causal_graphs),
+        "matched_block_count": len(blocks),
+        "replicates": int(event_draws.shape[0]),
+        "resampled_levels": tuple(
+            level
+            for level in raw_summary["resampled_levels"]
+            if level != "matched head pair"
+        )
+        + ("matched four-head block",),
+        "response_definition": (
+            "mean absolute direction-aligned response across semantic and "
+            "structural intervention channels"
+        ),
+        "preference_definition": (
+            "semantic-event direction-aligned effect minus structural-event "
+            "direction-aligned effect"
+        ),
+        "endpoints": endpoints,
     }
 
 
@@ -830,6 +1068,13 @@ def aggregate_population_tests(
         seed_offset=409,
         progress=progress,
     )
+    causal_preference = _causal_preference_analysis(
+        raw_patch,
+        scores,
+        population_gate,
+        config,
+        progress=progress,
+    )
     return {
         "version": POPULATION_CAUSAL_VERSION,
         "sample_sizes": {
@@ -843,6 +1088,7 @@ def aggregate_population_tests(
         "raw_primary_version": "donor-averaged-direction-aligned-v1",
         "raw_restoration": _endpoint(raw_patch, "R_align_matched"),
         "raw_injection": _endpoint(raw_patch, "I_align_matched"),
+        "causal_preference": causal_preference,
         "restoration": _endpoint(mismatch_adjusted_patch, "R_align_adj"),
         "injection": _endpoint(mismatch_adjusted_patch, "I_align_adj"),
         "necessity": _endpoint(necessity, "N_fraction"),
@@ -878,6 +1124,7 @@ def run_population_analysis(
             cached is not None
             and "raw_restoration" in cached
             and "correct_pairing_advantage" in cached.get("necessity", {})
+            and "causal_preference" in cached
         ):
             log("[cache] loaded complete Graphormer causal population analysis")
             if prepared.progress is not None:
@@ -908,13 +1155,25 @@ def run_population_analysis(
                 seed_offset=397,
                 progress=prepared.progress,
             )
-            necessity = _event_interval(
-                causal_rows,
+            cached_necessity = cached.get("necessity", {})
+            if "correct_pairing_advantage" in cached_necessity:
+                necessity_endpoint = cached_necessity
+            else:
+                necessity = _event_interval(
+                    causal_rows,
+                    population_gate,
+                    config,
+                    metric_order=("N_fraction",),
+                    require_controlled=False,
+                    seed_offset=409,
+                    progress=prepared.progress,
+                )
+                necessity_endpoint = _endpoint(necessity, "N_fraction")
+            causal_preference = _causal_preference_analysis(
+                raw_patch,
+                scores,
                 population_gate,
                 config,
-                metric_order=("N_fraction",),
-                require_controlled=False,
-                seed_offset=409,
                 progress=prepared.progress,
             )
             upgraded = dict(cached)
@@ -923,7 +1182,8 @@ def run_population_analysis(
                     "raw_primary_version": "donor-averaged-direction-aligned-v1",
                     "raw_restoration": _endpoint(raw_patch, "R_align_matched"),
                     "raw_injection": _endpoint(raw_patch, "I_align_matched"),
-                    "necessity": _endpoint(necessity, "N_fraction"),
+                    "causal_preference": causal_preference,
+                    "necessity": necessity_endpoint,
                 }
             )
             cache.save("focused_population", "core_tests", upgraded)
@@ -934,6 +1194,7 @@ def run_population_analysis(
                     added=(
                         "raw_restoration",
                         "raw_injection",
+                        "causal_preference",
                         "necessity.correct_pairing_interval",
                     ),
                     model_forwards=0,
@@ -1181,5 +1442,6 @@ __all__ = [
     "build_population_gate",
     "layer_adjusted_components",
     "render_cached_population_figures",
+    "response_adjusted_components",
     "run",
 ]

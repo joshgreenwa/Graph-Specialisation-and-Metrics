@@ -426,6 +426,143 @@ def plot_J_ablation(clean: Mapping[str, Any]):
     return fig, axes
 
 
+def plot_causal_preference(summary: Mapping[str, Any]):
+    """Discovery D_rel versus semantic-minus-structural causal response."""
+
+    import matplotlib as mpl
+    import matplotlib.pyplot as plt
+
+    selectivity = np.asarray(summary["selectivity"], dtype=np.float64)
+    layers = np.asarray(summary["layers"], dtype=np.int64)
+    maximum_layer = int(np.max(layers))
+    cmap = plt.get_cmap("viridis", maximum_layer + 1)
+    norm = mpl.colors.BoundaryNorm(
+        np.arange(-0.5, maximum_layer + 1.5, 1.0), cmap.N
+    )
+    theme = _theme()
+    with publication_style(theme):
+        fig, axes = plt.subplots(1, 2, figsize=(10.2, 4.25), sharex=True)
+        for ax, endpoint_name, title in zip(
+            axes,
+            ("restoration", "injection"),
+            ("Restoration", "Injection"),
+        ):
+            endpoint = summary["endpoints"][endpoint_name]
+            preference = np.asarray(
+                endpoint["causal_preference"], dtype=np.float64
+            )
+            low = np.asarray(endpoint["preference_low"], dtype=np.float64)
+            high = np.asarray(endpoint["preference_high"], dtype=np.float64)
+            ax.errorbar(
+                selectivity,
+                preference,
+                yerr=np.maximum(
+                    0.0, np.vstack((preference - low, high - preference))
+                ),
+                fmt="none",
+                ecolor="#777777",
+                alpha=0.14,
+                linewidth=0.45,
+                zorder=1,
+            )
+            ax.scatter(
+                selectivity,
+                preference,
+                c=layers,
+                cmap=cmap,
+                norm=norm,
+                s=25,
+                edgecolor="white",
+                linewidth=0.35,
+                alpha=0.90,
+                zorder=2,
+            )
+            finite = np.isfinite(selectivity) & np.isfinite(preference)
+            if int(np.sum(finite)) >= 2 and float(np.ptp(selectivity[finite])) > 0:
+                slope, intercept = np.polyfit(
+                    selectivity[finite], preference[finite], 1
+                )
+                extent = np.asarray(
+                    [np.min(selectivity[finite]), np.max(selectivity[finite])]
+                )
+                ax.plot(
+                    extent,
+                    intercept + slope * extent,
+                    color="#333333",
+                    linewidth=1.2,
+                    zorder=3,
+                )
+            ax.axhline(0.0, color="#A0A0A0", linewidth=0.65)
+            ax.axvline(0.0, color="#A0A0A0", linewidth=0.65)
+            ax.set_xlabel(
+                r"Relative selectivity $D_{rel}$"
+                "\n"
+                r"(structural $\leftarrow$ 0 $\rightarrow$ semantic)"
+            )
+            ax.set_title(title)
+            ax.text(
+                0.03,
+                0.97,
+                (
+                    f"Spearman $\\rho$={endpoint['spearman_rho']:.2f} "
+                    f"[{endpoint['spearman_low']:.2f}, "
+                    f"{endpoint['spearman_high']:.2f}]\n"
+                    f"adjusted $\\beta$="
+                    f"{endpoint['response_layer_adjusted_beta']:.2f} "
+                    f"[{endpoint['response_layer_adjusted_low']:.2f}, "
+                    f"{endpoint['response_layer_adjusted_high']:.2f}]"
+                ),
+                transform=ax.transAxes,
+                ha="left",
+                va="top",
+                fontsize=theme.tick_size,
+                bbox={
+                    "facecolor": "white",
+                    "edgecolor": "none",
+                    "alpha": 0.84,
+                    "pad": 2.0,
+                },
+                zorder=5,
+            )
+            _style_axis(ax)
+        axes[0].set_ylabel(
+            "Causal preference\n(semantic − structural effect)"
+        )
+
+        colorbar_ax = fig.add_axes((0.925, 0.23, 0.018, 0.59))
+        colorbar = fig.colorbar(
+            mpl.cm.ScalarMappable(norm=norm, cmap=cmap), cax=colorbar_ax
+        )
+        colorbar.set_label("Layer")
+        colorbar.set_ticks(np.arange(maximum_layer + 1))
+        fig.suptitle(
+            "Relative selectivity predicts causal preference\n"
+            f"PCQM4Mv2 ({summary['head_count']} selected and matched heads; "
+            f"{summary['graph_count']} held-out molecules)",
+            fontsize=theme.title_size + 0.8,
+        )
+        fig.text(
+            0.48,
+            0.012,
+            (
+                r"Adjusted $\beta$ accounts for mean absolute causal response and layer; "
+                "intervals resample intervention events and matched head blocks."
+            ),
+            ha="center",
+            va="bottom",
+            fontsize=theme.tick_size,
+            color="#4A4A4A",
+        )
+        fig.subplots_adjust(
+            bottom=0.25,
+            left=0.095,
+            right=0.90,
+            top=0.77,
+            wspace=0.34,
+        )
+    return fig, axes
+
+
 def render_population_figure_suite(
     scores: Mapping[str, Any],
     gate: Mapping[str, Any],
@@ -506,6 +643,20 @@ def render_population_figure_suite(
     )
     outputs["J_vs_clean_ablation"] = [str(path) for path in paths]
 
+    figure, axes = plot_causal_preference(core["causal_preference"])
+    paths = builder.save(
+        "03_Drel_vs_causal_preference",
+        figure,
+        axes,
+        metadata={
+            "figure_role": (
+                "continuous discovery selectivity versus donor-averaged causal preference"
+            ),
+            "causal_preference": core["causal_preference"],
+        },
+    )
+    outputs["Drel_vs_causal_preference"] = [str(path) for path in paths]
+
     figure, ax = plot_population_selection(scores, gate)
     paths = builder.save(
         "S01_population_head_selection",
@@ -522,6 +673,7 @@ def render_population_figure_suite(
 
 __all__ = [
     "plot_J_ablation",
+    "plot_causal_preference",
     "plot_correct_pairing_advantage",
     "plot_population_causal_tests",
     "plot_population_selection",
