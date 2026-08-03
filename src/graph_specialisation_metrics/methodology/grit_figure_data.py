@@ -1239,6 +1239,7 @@ _RDKIT_SANITIZATION_ERROR_PROPERTY = (
 ZINC_FIGURE_TASKS = (
     "zinc",
     "zinc_1hop",
+    "zinc_1hop_local",
     "zinc_2hop",
     "zinc_1hop_vnode",
     "zinc_2hop_vnode",
@@ -1258,6 +1259,10 @@ _FIGURE_IDENTITIES = {
     "zinc_1hop": {
         "dataset_label": "ZINC",
         "model_label": "GRIT (1-hop)",
+    },
+    "zinc_1hop_local": {
+        "dataset_label": "ZINC",
+        "model_label": "GRIT (1-hop + local RRWP)",
     },
     "zinc_2hop": {
         "dataset_label": "ZINC",

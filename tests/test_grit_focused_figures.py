@@ -738,6 +738,9 @@ def test_zinc_and_qm9_graphs_reconstruct_as_index_preserving_molecules():
     assert figure_identity("zinc_1hop_vnode")["display_title"] == (
         "ZINC — GRIT (1-hop + VN)"
     )
+    assert figure_identity("zinc_1hop_local")["display_title"] == (
+        "ZINC — GRIT (1-hop + local RRWP)"
+    )
     assert figure_identity("zinc_2hop")["display_title"] == (
         "ZINC — GRIT (2-hop)"
     )
@@ -1848,6 +1851,7 @@ def test_colab_notebook_has_valid_python_cells():
     assert 'TASK_SELECTION = "zinc"  # @param [' in source
     assert '"zinc": ("zinc",)' in source
     assert '"zinc_1hop": ("zinc_1hop",)' in source
+    assert '"zinc_1hop_local": ("zinc_1hop_local",)' in source
     assert '"zinc_1hop_vnode": ("zinc_1hop_vnode",)' in source
     assert '"zinc_2hop": ("zinc_2hop",)' in source
     assert '"zinc_2hop_vnode": ("zinc_2hop_vnode",)' in source
@@ -1969,6 +1973,7 @@ def test_colab_notebook_has_valid_python_cells():
         in runtime_source
     )
     assert '"zinc_1hop_vnode": "zinc_1hop_vnode"' in source
+    assert '"zinc_1hop_local": "zinc_1hop_local"' in source
     assert '"qm9_gap_1hop": "qm9_1hop"' in source
     assert '"qm9_gap_1hop_vnode": "qm9_1hop_vnode"' in source
     assert "save_section_pdf_bundles(" in runtime_source

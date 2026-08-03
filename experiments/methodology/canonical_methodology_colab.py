@@ -26,6 +26,7 @@ TASKS = ("zinc", "qm9_gap_dense", "peptides_func", "peptides_struct")
 # Receptive-field control suite (uncomment instead when building missing score caches):
 # TASKS = (
 #     "zinc_1hop",
+#     "zinc_1hop_local",
 #     "zinc_1hop_vnode",
 #     "zinc_2hop",
 #     "zinc_2hop_vnode",

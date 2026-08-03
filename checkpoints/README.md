@@ -21,6 +21,7 @@ required when these Drive folders retain their training layout.
 | Canonical task | Parameters |
 | --- | ---: |
 | `zinc_1hop` | 473,473 |
+| `zinc_1hop_local` | 473,473 |
 | `zinc_1hop_vnode` | 473,537 |
 | `zinc_2hop` | 473,473 |
 | `zinc_2hop_vnode` | 473,537 |

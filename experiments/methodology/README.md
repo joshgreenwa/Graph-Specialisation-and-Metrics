@@ -45,7 +45,7 @@ After the requested ZINC and QM9 score caches have completed, run
 cross-task figure suite. It reads each task's `seed_42/cache/scores/raw.pt` artifact
 read-only, verifies the matching `model.json` and checkpoint before model-forward
 diagnostics, and writes task-separated supplemental caches and figure manifests. Dense, 1-hop,
-2-hop, 1-hop+VN, and 2-hop+VN ZINC tasks are supported, as are dense, 1-hop, and 1-hop+VN QM9
+1-hop+local-RRWP, 2-hop, 1-hop+VN, and 2-hop+VN ZINC tasks are supported, as are dense, 1-hop, and 1-hop+VN QM9
 tasks. `TASK_SELECTION` exposes every task separately plus `zinc_all`, `qm9_all`, and `all`
 groups; choosing one task does not construct, validate, or render another. The known
 `canonical_methodology_v4_zinc_qm9` root is checked first. Existing variant caches under another
@@ -53,7 +53,7 @@ direct child of `graph_specialisation_metrics` are discovered automatically. Dis
 the protocol metadata before selecting a cache, so a legacy v3 artifact is skipped rather than
 passed into the v4 figure pipeline. Ambiguous compatible matches must be resolved explicitly with
 `CANONICAL_ROOT_CANDIDATES`. If a v4 cache is absent, the canonical
-frontend contains a ready task tuple for the six receptive-field controls. Their registered task
+frontend contains a ready task tuple for the seven receptive-field controls. Their registered task
 specifications already point to the Drive roots used by training, including recovery-checkpoint
 layouts for the ZINC k-hop/VN runs. Its explicit `OUTPUT_DIR` defaults to the same
 `canonical_methodology_v4_zinc_qm9` root used by the figure notebook.
