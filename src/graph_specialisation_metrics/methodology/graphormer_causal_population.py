@@ -879,6 +879,12 @@ def run(
     event_batch_size: int = 8,
     population_head_pairs: int = 12,
     population_minimum_pairs: int = 8,
+    discovery_graphs: int = 128,
+    causal_graphs: int = 128,
+    clean_ablation_graphs: int = 128,
+    semantic_donor_graphs: int = 2_000,
+    sources_per_graph: int = 6,
+    donors_per_source: int = 8,
 ) -> dict[str, Any]:
     """Colab-facing run/all/figures dispatcher for the population analysis."""
 
@@ -898,6 +904,12 @@ def run(
         accelerator=accelerator,
         force=force,
         graphs_per_batch=graphs_per_batch,
+        discovery_graphs=discovery_graphs,
+        causal_graphs=causal_graphs,
+        clean_ablation_graphs=clean_ablation_graphs,
+        semantic_donor_graphs=semantic_donor_graphs,
+        sources_per_graph=sources_per_graph,
+        donors_per_source=donors_per_source,
     )
     policy = PopulationPolicy(
         head_pairs=int(population_head_pairs),

@@ -25,9 +25,10 @@ the four focused PNG/PDF/JSON bundles without loading the model.
 
 The publication-strength population frontend is
 [`experiments/methodology/graphormer_pcqm4mv2_causal_population_colab.py`](experiments/methodology/graphormer_pcqm4mv2_causal_population_colab.py).
-It expands the primary comparison to 12 discovery-selected, `J`-matched semantic/structural head
-pairs plus distinct `J`-matched null controls, reuses compatible focused caches, and renders the
-three causal tests beside a transparent raw and layer-adjusted `J`--ablation analysis.
+Its paper preset uses disjoint 512-molecule discovery, causal, and clean-ablation populations,
+16 discovery-selected, `J`-matched semantic/structural head pairs, and distinct `J`-matched null
+controls. It renders the three causal tests beside a transparent raw and layer-adjusted
+`J`--ablation analysis.
 
 The long-term project scope covers:
 

@@ -1,8 +1,7 @@
-"""Paste/run this cell in Colab for the PCQM4Mv2 causal population analysis.
+"""Paste/run this cell in Colab for the paper-scale PCQM4Mv2 causal analysis.
 
-The analysis reuses the focused score, causal-event, and all-head clean-
-ablation shards already stored under OUTPUT_ROOT.  Only selected heads absent
-from the population cache are measured.
+The analysis is fully resumable at the per-graph level. Dataset/checkpoint caches
+are shared with earlier runs, while paper measurements use a separate output root.
 """
 
 # ============================ paste from here ============================
@@ -18,22 +17,34 @@ REPO_DIR = Path("/content/Graph-Specialisation-and-Metrics")
 GITHUB_SECRET = "dissertation_key"
 
 DRIVE_ROOT = Path("/content/drive/MyDrive")
-# Keep the existing focused-causal root: compatible graph/head shards are read through.
-OUTPUT_ROOT = DRIVE_ROOT / "graph_specialisation_metrics/graphormer_pcqm4mv2_causal"
+# Preserve the exploratory 128-molecule caches under their original root.
+OUTPUT_ROOT = DRIVE_ROOT / "graph_specialisation_metrics/graphormer_pcqm4mv2_causal_paper"
 PCQM_DATASET_ROOT = DRIVE_ROOT / "graph_specialisation_metrics/cache/pcqm4mv2"
 HF_CACHE_DIR = DRIVE_ROOT / "graph_specialisation_metrics/cache/huggingface"
 
 PHASE = "all"  # "run", "figures", or "all"
 FORCE = False
 ACCELERATOR = "cuda:0"
-GRAPHS_PER_BATCH = 2
-HEAD_BATCH_SIZE = 4
-EVENT_BATCH_SIZE = 8
 
-# Primary paper population: 12 J-matched semantic/structural pairs (24 heads)
-# plus one distinct J-matched null for every selected specialist (24 controls).
-POPULATION_HEAD_PAIRS = 12
-POPULATION_MINIMUM_PAIRS = 8
+# Paper-scale, mutually disjoint evaluation populations. Increasing independent
+# molecules is more informative than multiplying within-molecule donor draws.
+DISCOVERY_GRAPHS = 512
+CAUSAL_GRAPHS = 512
+CLEAN_ABLATION_GRAPHS = 512
+SEMANTIC_DONOR_GRAPHS = 2_000
+SOURCES_PER_GRAPH = 6
+DONORS_PER_SOURCE = 8
+
+# A100-oriented throughput preset. Head chunks back off automatically on OOM;
+# lower GRAPHS_PER_BATCH first if a smaller GPU cannot fit clean ablation.
+GRAPHS_PER_BATCH = 8
+HEAD_BATCH_SIZE = 32
+EVENT_BATCH_SIZE = SOURCES_PER_GRAPH * DONORS_PER_SOURCE
+
+# Primary paper population: 16 J-matched semantic/structural pairs (32 heads)
+# plus one distinct J-matched null for every selected specialist (32 controls).
+POPULATION_HEAD_PAIRS = 16
+POPULATION_MINIMUM_PAIRS = 12
 
 from google.colab import drive, userdata
 
@@ -103,6 +114,12 @@ result = run(
     event_batch_size=EVENT_BATCH_SIZE,
     population_head_pairs=POPULATION_HEAD_PAIRS,
     population_minimum_pairs=POPULATION_MINIMUM_PAIRS,
+    discovery_graphs=DISCOVERY_GRAPHS,
+    causal_graphs=CAUSAL_GRAPHS,
+    clean_ablation_graphs=CLEAN_ABLATION_GRAPHS,
+    semantic_donor_graphs=SEMANTIC_DONOR_GRAPHS,
+    sources_per_graph=SOURCES_PER_GRAPH,
+    donors_per_source=DONORS_PER_SOURCE,
 )
 print(json.dumps(result, indent=2, default=str))
 

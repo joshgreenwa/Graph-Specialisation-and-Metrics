@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import dataclasses
 import json
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any
 
 import numpy as np
 
@@ -33,7 +34,6 @@ from .scores import (
     graph_local_fixed_normalization,
     head_coordinates,
 )
-
 
 FOCUSED_CAUSAL_VERSION = "graphormer-pcqm-focused-causal-v4"
 PATCH_METRICS = (
@@ -78,8 +78,14 @@ def production_config(
     accelerator: str = "cuda:0",
     force: bool = False,
     graphs_per_batch: int = 2,
+    discovery_graphs: int = 128,
+    causal_graphs: int = 128,
+    clean_ablation_graphs: int = 128,
+    semantic_donor_graphs: int = 2_000,
+    sources_per_graph: int = 6,
+    donors_per_source: int = 8,
 ) -> MethodologyConfig:
-    """Return the fixed 128/128/128 PCQM causal configuration."""
+    """Return a PCQM causal configuration with explicit disjoint split sizes."""
 
     return MethodologyConfig(
         output_dir=str(output_dir),
@@ -88,12 +94,12 @@ def production_config(
         task_train_seeds={"graphormer_pcqm4mv2": (0,)},
         phases=("scores",),
         sizes=RunSizes(
-            discovery_graphs=128,
-            causal_graphs=128,
-            clean_ablation_graphs=128,
-            semantic_donor_graphs=2_000,
-            sources_per_graph=6,
-            donors_per_source=8,
+            discovery_graphs=int(discovery_graphs),
+            causal_graphs=int(causal_graphs),
+            clean_ablation_graphs=int(clean_ablation_graphs),
+            semantic_donor_graphs=int(semantic_donor_graphs),
+            sources_per_graph=int(sources_per_graph),
+            donors_per_source=int(donors_per_source),
             bootstrap_replicates=2_000,
         ),
         families=FamilyPolicy(
@@ -254,9 +260,7 @@ def run_confidence_gate(
         epsilon=config.numerical.selectivity_epsilon,
         preference_threshold=config.families.equivalence_half_width,
     )
-    gate["discovery_graph_count"] = int(
-        len(gate["molecule_diagnostic"]["graph_ids"])
-    )
+    gate["discovery_graph_count"] = len(gate["molecule_diagnostic"]["graph_ids"])
     gate["score_manifest_hash"] = str(scores["manifest_hash"])
     cache.save("focused", "gate", gate)
     log(
@@ -503,7 +507,8 @@ def _causal_graph_channel(
                     epsilon=config.numerical.effect_floor,
                 )
 
-                reshape = lambda value: np.asarray(value).reshape(b, event_count)
+                def reshape(value: Any, event_count: int = event_count) -> np.ndarray:
+                    return np.asarray(value).reshape(b, event_count)
                 arrays = {
                     "R_gross_matched": reshape(matched.restoration_gross),
                     "R_gross_null": reshape(null.restoration_gross),
@@ -702,16 +707,20 @@ def _clean_ablation_graphs(
             import torch
 
             try:
-                targets = [base for _head in selected_heads for base in bases]
-                assignments = [head for head in selected_heads for _base in bases]
+                targets = [base for _head in selected_heads for base in bases]  # noqa: B023
+                assignments = [
+                    head for head in selected_heads for _base in bases  # noqa: B023
+                ]
                 _, z_ablated, _ = prepared.backend.ablate_individual_heads(
                     targets, assignments
                 )
                 values = z_ablated.detach().cpu().numpy().reshape(
-                    len(selected_heads), len(bases), -1
+                    len(selected_heads), len(bases), -1  # noqa: B023
                 )
-                movement = np.linalg.norm(values - clean_np[None, :, :], axis=-1)
-                matrix[:, offset : offset + len(selected_heads)] = movement.T
+                movement = np.linalg.norm(
+                    values - clean_np[None, :, :], axis=-1  # noqa: B023
+                )
+                matrix[:, offset : offset + len(selected_heads)] = movement.T  # noqa: B023
             except torch.cuda.OutOfMemoryError:
                 if len(selected_heads) <= 1:
                     raise
@@ -910,7 +919,7 @@ def _standardized_layer_coefficient(x: np.ndarray, y: np.ndarray, layers: np.nda
         return np.nan
     x = (x - np.mean(x)) / np.std(x)
     y = (y - np.mean(y)) / np.std(y)
-    unique = sorted(set(int(value) for value in layers))
+    unique = sorted({int(value) for value in layers})
     indicators = (
         np.column_stack([(layers == value).astype(float) for value in unique[1:]])
         if len(unique) > 1
@@ -1060,10 +1069,11 @@ def run_focused_analysis(
     scores: Mapping[str, Any],
     gate: Mapping[str, Any],
     *,
-    execution: FocusedExecution = FocusedExecution(),
+    execution: FocusedExecution | None = None,
 ) -> dict[str, Any]:
     """Run/resume selected-head causal events and every-head clean ablation."""
 
+    execution = execution or FocusedExecution()
     execution.validate()
     plan, cache = _focused_causal_cache(prepared, config, gate)
     del plan
