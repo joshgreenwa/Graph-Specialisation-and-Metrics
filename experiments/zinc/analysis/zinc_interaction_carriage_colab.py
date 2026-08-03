@@ -1,12 +1,15 @@
 """Standalone Colab frontend for ZINC interaction carriage and output modulation.
 
-The default lightweight phase compares local-RRWP 1-hop, global-RRWP 1-hop,
-1-hop+VN, 2-hop, 2-hop+VN, and dense GRIT using exact scalar-output endpoints
-only. It caches every clean, semantic-only, structural-only, and joint
-prediction to Drive. The original full carriage phases remain available below.
+The default ``figures`` phase is cache-only.  It adds three diagnostics for the
+apparent structural/interaction profile match: unnormalised carriage, a
+carrier-level proportional fit against both structural and semantic carriage,
+and the distance profile left after that fit.  Existing v2 caches immediately
+support an absolute-mass profile screen.  A newly measured cache also stores the
+already-computed signed scalar carrier projections and enables the decisive
+signed cosine/gain/R2 diagnostic without any later model rerun.
 
-After a completed lightweight run, set ``PHASE = "output-figures"`` to rebuild
-all M tables and figures from cached CSV files without loading the models.
+The exact-output M phases remain available as ``output-all``, ``output-measure``,
+and ``output-figures``.
 """
 
 from __future__ import annotations
@@ -26,7 +29,12 @@ SECRET_NAME = "dissertation_key"
 
 # ----------------------------- experiment controls -----------------------------
 
-PHASE = "output-all"  # "output-all", "output-measure", or "output-figures"
+# Safe default: rebuild every carriage table/figure from the existing Drive cache.
+# Use "all" only for a deliberately requested full carriage remeasurement; it is
+# expensive. New measurements retain signed carrier projections at no extra
+# inference cost. Output-M choices are "output-all", "output-measure", and
+# "output-figures".
+PHASE = "figures"
 OUTPUT_DIR = Path(
     "/content/drive/MyDrive/graph_specialisation_metrics/"
     "zinc_semantic_structural_interaction_carriage_v2"
@@ -154,6 +162,13 @@ print(
     "[scope] Interaction distance is shown only above absolute and marginal-relative "
     "estimability floors. Raw interaction strength and the estimable fraction are "
     "reported alongside it.\n"
+    "[scope] The new alignment analysis first retains absolute effect scale, then fits "
+    "q_int = lambda q_reference within each paired intervention. Structural and semantic "
+    "references are compared using cosine, gain, explained interaction energy, and "
+    "distance-resolved residual carriage.\n"
+    "[scope] An old cache can only screen proportionality of non-negative carrier masses. "
+    "Signed alignment is shown only when signed scalar projections are present; the "
+    "notebook will never trigger an expensive remeasurement implicitly.\n"
     "[scope] Dense versus sparse comparisons describe trained model organisation. "
     "Near-equal test MAE supports architectural sufficiency, not task necessity.\n"
     "[scope] Uncertainty is a held-out-graph bootstrap from one checkpoint per "
@@ -240,6 +255,32 @@ try:
         print("\nLayer summary", flush=True)
         display(selected)
 
+    alignment_path = OUTPUT_DIR / "results" / "carrier_alignment_summary.csv"
+    if alignment_path.is_file():
+        alignment = pd.read_csv(alignment_path)
+        print("\nCarrier-level interaction alignment", flush=True)
+        display(
+            alignment[
+                alignment["metric"].isin(
+                    ["cosine", "gain", "explained_energy", "residual_fraction"]
+                )
+            ]
+        )
+        modes = set(alignment["mode"].astype(str))
+        if "signed_projection" in modes:
+            print(
+                "[cache] Signed carrier projections found: direction-aware alignment "
+                "figures were rebuilt without model inference.",
+                flush=True,
+            )
+        else:
+            print(
+                "[cache] Legacy mass-only cache: the new absolute and proportionality "
+                "figures are available now. Signed alignment would require one deliberate "
+                "full measurement run; it was not started automatically.",
+                flush=True,
+            )
+
     output_cache_value = result.get("output_modulation_cache_dir")
     if output_cache_value:
         output_cache = Path(output_cache_value)
@@ -269,6 +310,11 @@ try:
         "layer_heatmaps",
         "layer_reach",
         "interaction_strength",
+        "absolute_profiles",
+        "carrier_alignment_absolute_mass",
+        "carrier_residual_absolute_mass",
+        "carrier_alignment_signed_projection",
+        "carrier_residual_signed_projection",
     ):
         path = result.get("figures", {}).get(name, {}).get("png")
         if path:

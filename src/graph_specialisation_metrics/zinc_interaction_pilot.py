@@ -609,6 +609,8 @@ def _measure_graph(
     semantic_vector = _project_final_vector(semantic_delta, gradient)
     structural_vector = _project_final_vector(structural_delta, gradient)
     interaction_vector = _project_final_vector(interaction_delta, gradient)
+    if int(semantic_vector.shape[-1]) != 1:
+        raise RuntimeError("signed carrier alignment currently requires ZINC's scalar output")
     semantic_mass = torch.linalg.vector_norm(semantic_vector, dim=-1)
     structural_mass = torch.linalg.vector_norm(structural_vector, dim=-1)
     interaction_mass = torch.linalg.vector_norm(interaction_vector, dim=-1)
@@ -697,6 +699,19 @@ def _measure_graph(
                     "structural_mass": float(structural_mass[event_index, carrier].detach().cpu()),
                     "interaction_mass": float(
                         interaction_mass[event_index, carrier].detach().cpu()
+                    ),
+                    # ZINC has a scalar graph output.  Retaining the signed
+                    # carrier projections costs no additional inference and
+                    # lets figure-only reruns distinguish genuinely aligned
+                    # interaction carriage from merely similar norm profiles.
+                    "semantic_projection": float(
+                        semantic_vector[event_index, carrier].reshape(-1)[0].detach().cpu()
+                    ),
+                    "structural_projection": float(
+                        structural_vector[event_index, carrier].reshape(-1)[0].detach().cpu()
+                    ),
+                    "interaction_projection": float(
+                        interaction_vector[event_index, carrier].reshape(-1)[0].detach().cpu()
                     ),
                     "interaction_estimable": bool(summary["interaction_estimable"]),
                 }
@@ -1961,6 +1976,264 @@ def graph_distance_profiles(
     )
 
 
+def graph_absolute_distance_profiles(
+    rows: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Average unnormalised carrier mass with pair -> source -> graph weighting.
+
+    Unlike :func:`graph_distance_profiles`, this deliberately retains scale.  It
+    therefore shows whether two matching allocation-share curves are simply
+    proportional copies with different absolute effect magnitudes.
+    """
+
+    event_values: dict[tuple[Any, ...], dict[tuple[str, int], float]] = defaultdict(
+        lambda: defaultdict(float)
+    )
+    task_distances: dict[str, set[int]] = defaultdict(set)
+    for row in rows:
+        task = str(row["task"])
+        event_key = (
+            task,
+            int(row["graph"]),
+            int(row["source"]),
+            int(row["pair"]),
+        )
+        distance = int(_as_float(row["distance"]))
+        task_distances[task].add(distance)
+        for term in TERMS:
+            if term == "interaction" and not _as_bool(row.get("interaction_estimable", False)):
+                continue
+            value = _as_float(row.get(f"{term}_mass"))
+            if np.isfinite(value):
+                event_values[event_key][(term, distance)] += value
+
+    source_values: dict[tuple[Any, ...], list[float]] = defaultdict(list)
+    for (task, graph, source, _pair), values in event_values.items():
+        eligible_terms = {term for term, _distance in values}
+        for term in eligible_terms:
+            for distance in task_distances[task]:
+                source_values[(task, graph, source, term, distance)].append(
+                    float(values.get((term, distance), 0.0))
+                )
+    graph_values: dict[tuple[Any, ...], list[float]] = defaultdict(list)
+    for (task, graph, _source, term, distance), values in source_values.items():
+        graph_values[(task, graph, term, distance)].append(float(np.mean(values)))
+    return [
+        {
+            "task": task,
+            "model_label": TASK_LABELS[task],
+            "graph": int(graph),
+            "term": term,
+            "distance": int(distance),
+            "distance_label": str(int(distance)),
+            "distance_order": int(distance),
+            "carrier_kind": "molecular_node",
+            "mass": float(np.mean(values)),
+            "eligible_sources": len(values),
+        }
+        for (task, graph, term, distance), values in sorted(graph_values.items())
+    ]
+
+
+def _carrier_alignment_metrics(
+    reference: np.ndarray,
+    interaction: np.ndarray,
+) -> tuple[dict[str, float], np.ndarray] | None:
+    """Fit interaction = gain * reference for one paired intervention."""
+
+    valid = np.isfinite(reference) & np.isfinite(interaction)
+    x = np.asarray(reference[valid], dtype=np.float64)
+    y = np.asarray(interaction[valid], dtype=np.float64)
+    if not len(x):
+        return None
+    x_energy = float(np.dot(x, x))
+    y_energy = float(np.dot(y, y))
+    if x_energy <= 0.0 or y_energy <= 0.0:
+        return None
+    gain = float(np.dot(x, y) / x_energy)
+    residual = y - gain * x
+    full_residual = np.full(reference.shape, np.nan, dtype=np.float64)
+    full_residual[valid] = residual
+    residual_energy = float(np.dot(residual, residual))
+    cosine = float(np.dot(x, y) / np.sqrt(x_energy * y_energy))
+    return (
+        {
+            "cosine": float(np.clip(cosine, -1.0, 1.0)),
+            "gain": gain,
+            "explained_energy": float(np.clip(1.0 - residual_energy / y_energy, 0.0, 1.0)),
+            "residual_fraction": float(np.sqrt(residual_energy / y_energy)),
+            "absolute_mass_ratio": float(np.abs(y).sum() / np.abs(x).sum())
+            if float(np.abs(x).sum()) > 0.0
+            else float("nan"),
+        },
+        full_residual,
+    )
+
+
+def carrier_alignment_analysis(
+    rows: Sequence[Mapping[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], tuple[str, ...]]:
+    """Compare interaction carriage with structural and semantic carriage.
+
+    Every cache supports ``absolute_mass`` mode.  New measurements additionally
+    support ``signed_projection`` mode, which is the decisive direction-aware
+    test.  Metrics are fitted within each donor-pair event before the registered
+    pair -> source -> graph averaging hierarchy is applied.
+    """
+
+    if not rows:
+        return [], [], ()
+    signed_columns = {
+        "semantic_projection",
+        "structural_projection",
+        "interaction_projection",
+    }
+    modes = ["absolute_mass"]
+    if signed_columns.issubset(rows[0].keys()):
+        modes.append("signed_projection")
+
+    events: dict[tuple[Any, ...], list[Mapping[str, Any]]] = defaultdict(list)
+    for row in rows:
+        if not _as_bool(row.get("interaction_estimable", False)):
+            continue
+        events[
+            (
+                str(row["task"]),
+                int(row["graph"]),
+                int(row["source"]),
+                int(row["pair"]),
+            )
+        ].append(row)
+
+    event_metrics: list[dict[str, Any]] = []
+    event_residuals: list[dict[str, Any]] = []
+    for (task, graph, source, pair), event_rows in events.items():
+        ordered = sorted(event_rows, key=lambda row: int(row["carrier"]))
+        distances = np.asarray([int(row["distance"]) for row in ordered], dtype=np.int64)
+        for mode in modes:
+            suffix = "mass" if mode == "absolute_mass" else "projection"
+            interaction = np.asarray(
+                [_as_float(row[f"interaction_{suffix}"]) for row in ordered],
+                dtype=np.float64,
+            )
+            for reference in ("structural", "semantic"):
+                reference_values = np.asarray(
+                    [_as_float(row[f"{reference}_{suffix}"]) for row in ordered],
+                    dtype=np.float64,
+                )
+                fitted = _carrier_alignment_metrics(reference_values, interaction)
+                if fitted is None:
+                    continue
+                metrics, residual = fitted
+                for metric, value in metrics.items():
+                    if np.isfinite(value):
+                        event_metrics.append(
+                            {
+                                "task": task,
+                                "graph": graph,
+                                "source": source,
+                                "pair": pair,
+                                "mode": mode,
+                                "reference": reference,
+                                "metric": metric,
+                                "value": float(value),
+                            }
+                        )
+                for distance in np.unique(distances):
+                    at_distance = residual[distances == distance]
+                    at_distance = at_distance[np.isfinite(at_distance)]
+                    if not len(at_distance):
+                        continue
+                    event_residuals.append(
+                        {
+                            "task": task,
+                            "graph": graph,
+                            "source": source,
+                            "pair": pair,
+                            "mode": mode,
+                            "reference": reference,
+                            "distance": int(distance),
+                            "residual_mass": float(np.abs(at_distance).sum()),
+                        }
+                    )
+
+    def aggregate(values: Sequence[Mapping[str, Any]], value_field: str) -> list[dict[str, Any]]:
+        if value_field == "residual_mass":
+            distance_sets: dict[tuple[str, str, str], set[int]] = defaultdict(set)
+            event_groups: dict[tuple[Any, ...], dict[int, float]] = defaultdict(dict)
+            for row in values:
+                distance_sets[(row["task"], row["mode"], row["reference"])].add(
+                    int(row["distance"])
+                )
+                event_groups[
+                    (
+                        row["task"],
+                        int(row["graph"]),
+                        int(row["source"]),
+                        int(row["pair"]),
+                        row["mode"],
+                        row["reference"],
+                    )
+                ][int(row["distance"])] = float(row["residual_mass"])
+            completed: list[dict[str, Any]] = []
+            for (
+                task,
+                graph,
+                source,
+                pair,
+                mode,
+                reference,
+            ), distance_values in event_groups.items():
+                for distance in distance_sets[(task, mode, reference)]:
+                    completed.append(
+                        {
+                            "task": task,
+                            "graph": graph,
+                            "source": source,
+                            "pair": pair,
+                            "mode": mode,
+                            "reference": reference,
+                            "distance": distance,
+                            "residual_mass": float(distance_values.get(distance, 0.0)),
+                        }
+                    )
+            values = completed
+        source_buckets: dict[tuple[Any, ...], list[float]] = defaultdict(list)
+        metadata_fields = (
+            ("mode", "reference", "metric")
+            if value_field == "value"
+            else ("mode", "reference", "distance")
+        )
+        for row in values:
+            tail = tuple(row[field] for field in metadata_fields)
+            source_buckets[(row["task"], int(row["graph"]), int(row["source"]), *tail)].append(
+                float(row[value_field])
+            )
+        graph_buckets: dict[tuple[Any, ...], list[float]] = defaultdict(list)
+        for key, bucket in source_buckets.items():
+            task, graph, _source, *tail = key
+            graph_buckets[(task, graph, *tail)].append(float(np.mean(bucket)))
+        output: list[dict[str, Any]] = []
+        for key, bucket in sorted(graph_buckets.items()):
+            task, graph, *tail = key
+            row = {
+                "task": task,
+                "model_label": TASK_LABELS[str(task)],
+                "graph": int(graph),
+                **dict(zip(metadata_fields, tail, strict=True)),
+                value_field: float(np.mean(bucket)),
+                "eligible_sources": len(bucket),
+            }
+            output.append(row)
+        return output
+
+    return (
+        aggregate(event_metrics, "value"),
+        aggregate(event_residuals, "residual_mass"),
+        tuple(modes),
+    )
+
+
 def graph_metric_rows(
     rows: Sequence[Mapping[str, Any]],
     *,
@@ -2113,6 +2386,105 @@ def summarise_graph_metrics(
     return output
 
 
+def summarise_absolute_profiles(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    bootstrap_replicates: int,
+    bootstrap_seed: int,
+) -> list[dict[str, Any]]:
+    grouped: dict[tuple[Any, ...], list[float]] = defaultdict(list)
+    for row in rows:
+        grouped[(row["task"], row["term"], int(row["distance"]))].append(float(row["mass"]))
+    output: list[dict[str, Any]] = []
+    for index, ((task, term, distance), values) in enumerate(sorted(grouped.items())):
+        mean, low, high = _bootstrap_interval(
+            values,
+            replicates=int(bootstrap_replicates),
+            seed=int(bootstrap_seed) + index,
+        )
+        output.append(
+            {
+                "task": task,
+                "model_label": TASK_LABELS[str(task)],
+                "term": term,
+                "distance": int(distance),
+                "mean": mean,
+                "low": low,
+                "high": high,
+                "graphs": len(values),
+            }
+        )
+    return output
+
+
+def summarise_alignment_metrics(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    bootstrap_replicates: int,
+    bootstrap_seed: int,
+) -> list[dict[str, Any]]:
+    grouped: dict[tuple[Any, ...], list[float]] = defaultdict(list)
+    for row in rows:
+        grouped[(row["task"], row["mode"], row["reference"], row["metric"])].append(
+            float(row["value"])
+        )
+    output: list[dict[str, Any]] = []
+    for index, ((task, mode, reference, metric), values) in enumerate(sorted(grouped.items())):
+        mean, low, high = _bootstrap_interval(
+            values,
+            replicates=int(bootstrap_replicates),
+            seed=int(bootstrap_seed) + index,
+        )
+        output.append(
+            {
+                "task": task,
+                "model_label": TASK_LABELS[str(task)],
+                "mode": mode,
+                "reference": reference,
+                "metric": metric,
+                "mean": mean,
+                "low": low,
+                "high": high,
+                "graphs": len(values),
+            }
+        )
+    return output
+
+
+def summarise_residual_profiles(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    bootstrap_replicates: int,
+    bootstrap_seed: int,
+) -> list[dict[str, Any]]:
+    grouped: dict[tuple[Any, ...], list[float]] = defaultdict(list)
+    for row in rows:
+        grouped[(row["task"], row["mode"], row["reference"], int(row["distance"]))].append(
+            float(row["residual_mass"])
+        )
+    output: list[dict[str, Any]] = []
+    for index, ((task, mode, reference, distance), values) in enumerate(sorted(grouped.items())):
+        mean, low, high = _bootstrap_interval(
+            values,
+            replicates=int(bootstrap_replicates),
+            seed=int(bootstrap_seed) + index,
+        )
+        output.append(
+            {
+                "task": task,
+                "model_label": TASK_LABELS[str(task)],
+                "mode": mode,
+                "reference": reference,
+                "distance": int(distance),
+                "mean": mean,
+                "low": low,
+                "high": high,
+                "graphs": len(values),
+            }
+        )
+    return output
+
+
 def _figure_theme() -> None:
     import matplotlib as mpl
 
@@ -2205,6 +2577,180 @@ def plot_final_profiles(
     fig.suptitle("Final-state carriage allocation", y=1.13, fontsize=12)
     fig.tight_layout(rect=(0, 0, 1, 0.93))
     return _save_figure(fig, figures_dir, "zinc_interaction_final_profiles")
+
+
+def plot_absolute_profiles(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    tasks: Sequence[str],
+    figures_dir: Path,
+    display_max_distance: int | None,
+) -> dict[str, str]:
+    """Plot effect scale before per-event allocation normalisation."""
+
+    import matplotlib.pyplot as plt
+
+    _figure_theme()
+    colours = _task_colours(tasks)
+    fig, axes = plt.subplots(1, 3, figsize=(11.2, 3.2), sharey=True)
+    for axis, term in zip(axes, TERMS, strict=True):
+        for task in tasks:
+            selected = [
+                row
+                for row in rows
+                if row["task"] == task
+                and row["term"] == term
+                and (
+                    display_max_distance is None
+                    or int(row["distance"]) <= int(display_max_distance)
+                )
+            ]
+            selected.sort(key=lambda row: int(row["distance"]))
+            if not selected:
+                continue
+            x = np.asarray([int(row["distance"]) for row in selected])
+            y = np.asarray([float(row["mean"]) for row in selected])
+            low = np.asarray([float(row["low"]) for row in selected])
+            high = np.asarray([float(row["high"]) for row in selected])
+            axis.plot(x, y, marker="o", ms=3, lw=1.6, color=colours[task], label=TASK_LABELS[task])
+            axis.fill_between(x, low, high, color=colours[task], alpha=0.14, linewidth=0)
+        axis.set_title(f"{term.capitalize()} carriage")
+        axis.set_xlabel("Graph distance from intervention")
+        axis.set_ylim(bottom=0)
+    axes[0].set_ylabel("Mean absolute projected effect")
+    handles, labels = axes[-1].get_legend_handles_labels()
+    fig.legend(
+        handles,
+        labels,
+        loc="upper center",
+        bbox_to_anchor=(0.5, 1.02),
+        ncol=len(tasks),
+        frameon=False,
+    )
+    fig.suptitle("Final-state carriage before allocation normalisation", y=1.13, fontsize=12)
+    fig.tight_layout(rect=(0, 0, 1, 0.93))
+    return _save_figure(fig, figures_dir, "zinc_interaction_absolute_profiles")
+
+
+def plot_carrier_alignment(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    tasks: Sequence[str],
+    mode: str,
+    figures_dir: Path,
+) -> dict[str, str]:
+    """Plot proportional fit of interaction to structural or semantic carriage."""
+
+    import matplotlib.pyplot as plt
+
+    _figure_theme()
+    references = ("structural", "semantic")
+    reference_colours = {"structural": "#168294", "semantic": "#E69F00"}
+    x = np.arange(len(tasks), dtype=np.float64)
+    fig, axes = plt.subplots(1, 3, figsize=(11.2, 3.35))
+    specifications = (
+        ("cosine", "Carrier-profile cosine", "Cosine"),
+        ("gain", r"Fitted gain $q_{int}=\lambda q_{ref}$", r"$\lambda$"),
+        ("explained_energy", "Interaction energy explained", r"$R^2_0$"),
+    )
+    for axis, (metric, title, ylabel) in zip(axes, specifications, strict=True):
+        for offset, reference in zip((-0.11, 0.11), references, strict=True):
+            selected = {
+                str(row["task"]): row
+                for row in rows
+                if row["mode"] == mode and row["reference"] == reference and row["metric"] == metric
+            }
+            valid_tasks = [task for task in tasks if task in selected]
+            if not valid_tasks:
+                continue
+            positions = np.asarray([x[tasks.index(task)] + offset for task in valid_tasks])
+            means = np.asarray([float(selected[task]["mean"]) for task in valid_tasks])
+            lows = np.asarray([float(selected[task]["low"]) for task in valid_tasks])
+            highs = np.asarray([float(selected[task]["high"]) for task in valid_tasks])
+            axis.errorbar(
+                positions,
+                means,
+                yerr=np.vstack((np.maximum(0.0, means - lows), np.maximum(0.0, highs - means))),
+                fmt="o",
+                ms=5,
+                capsize=3,
+                color=reference_colours[reference],
+                label=f"{reference.capitalize()} reference",
+            )
+        axis.set_title(title)
+        axis.set_ylabel(ylabel)
+        axis.set_xticks(x, [TASK_LABELS[task] for task in tasks], rotation=24, ha="right")
+        if metric in {"cosine", "explained_energy"}:
+            axis.set_ylim((-1.05, 1.05) if metric == "cosine" else (-0.05, 1.05))
+    handles, labels = axes[-1].get_legend_handles_labels()
+    fig.legend(
+        handles, labels, loc="upper center", bbox_to_anchor=(0.5, 1.02), ncol=2, frameon=False
+    )
+    if mode == "signed_projection":
+        title = "Is interaction carriage a scaled copy of a marginal carrier vector?"
+    else:
+        title = "Mass-profile proportionality screen (legacy cache; carrier signs unavailable)"
+    fig.suptitle(title, y=1.13, fontsize=12)
+    fig.tight_layout(rect=(0, 0, 1, 0.93))
+    return _save_figure(fig, figures_dir, f"zinc_interaction_alignment_{mode}")
+
+
+def plot_residual_profiles(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    tasks: Sequence[str],
+    mode: str,
+    figures_dir: Path,
+    display_max_distance: int | None,
+) -> dict[str, str]:
+    import matplotlib.pyplot as plt
+
+    _figure_theme()
+    colours = _task_colours(tasks)
+    fig, axes = plt.subplots(1, 2, figsize=(8.1, 3.2), sharey=True)
+    for axis, reference in zip(axes, ("structural", "semantic"), strict=True):
+        for task in tasks:
+            selected = [
+                row
+                for row in rows
+                if row["task"] == task
+                and row["mode"] == mode
+                and row["reference"] == reference
+                and (
+                    display_max_distance is None
+                    or int(row["distance"]) <= int(display_max_distance)
+                )
+            ]
+            selected.sort(key=lambda row: int(row["distance"]))
+            if not selected:
+                continue
+            x = np.asarray([int(row["distance"]) for row in selected])
+            y = np.asarray([float(row["mean"]) for row in selected])
+            low = np.asarray([float(row["low"]) for row in selected])
+            high = np.asarray([float(row["high"]) for row in selected])
+            axis.plot(x, y, marker="o", ms=3, lw=1.5, color=colours[task], label=TASK_LABELS[task])
+            axis.fill_between(x, low, high, color=colours[task], alpha=0.14, linewidth=0)
+        axis.set_title(f"After fitting {reference} carriage")
+        axis.set_xlabel("Graph distance from intervention")
+        axis.set_ylim(bottom=0)
+    axes[0].set_ylabel("Mean absolute residual carriage")
+    handles, labels = axes[-1].get_legend_handles_labels()
+    fig.legend(
+        handles,
+        labels,
+        loc="upper center",
+        bbox_to_anchor=(0.5, 1.02),
+        ncol=len(tasks),
+        frameon=False,
+    )
+    qualifier = "signed carriers" if mode == "signed_projection" else "mass profiles only"
+    fig.suptitle(
+        f"What interaction carriage remains after a one-gain fit? ({qualifier})",
+        y=1.13,
+        fontsize=12,
+    )
+    fig.tight_layout(rect=(0, 0, 1, 0.93))
+    return _save_figure(fig, figures_dir, f"zinc_interaction_residual_{mode}")
 
 
 def plot_layer_heatmaps(
@@ -2395,7 +2941,10 @@ def figures(
             "cached measurement CSVs are missing; run PHASE='measure' or 'all' first: "
             + ", ".join(missing)
         )
-    final_graph = graph_distance_profiles(_read_csv(required["carriers"]), layerwise=False)
+    carrier_rows = _read_csv(required["carriers"])
+    final_graph = graph_distance_profiles(carrier_rows, layerwise=False)
+    absolute_graph = graph_absolute_distance_profiles(carrier_rows)
+    alignment_graph, residual_graph, alignment_modes = carrier_alignment_analysis(carrier_rows)
     layer_graph = graph_distance_profiles(_read_csv(required["layer_distances"]), layerwise=True)
     final_metrics_graph = graph_metric_rows(_read_csv(required["events"]), layerwise=False)
     layer_metrics_graph = graph_metric_rows(_read_csv(required["layer_events"]), layerwise=True)
@@ -2419,6 +2968,21 @@ def figures(
         bootstrap_replicates=config.bootstrap_replicates,
         bootstrap_seed=config.analysis_seed + 400,
     )
+    absolute_summary = summarise_absolute_profiles(
+        absolute_graph,
+        bootstrap_replicates=config.bootstrap_replicates,
+        bootstrap_seed=config.analysis_seed + 500,
+    )
+    alignment_summary = summarise_alignment_metrics(
+        alignment_graph,
+        bootstrap_replicates=config.bootstrap_replicates,
+        bootstrap_seed=config.analysis_seed + 600,
+    )
+    residual_summary = summarise_residual_profiles(
+        residual_graph,
+        bootstrap_replicates=config.bootstrap_replicates,
+        bootstrap_seed=config.analysis_seed + 700,
+    )
     for name, values in (
         ("final_graph_profiles.csv", final_graph),
         ("final_profile_summary.csv", final_summary),
@@ -2428,6 +2992,12 @@ def figures(
         ("final_metric_summary.csv", final_metric_summary),
         ("layer_graph_metrics.csv", layer_metrics_graph),
         ("layer_metric_summary.csv", layer_metric_summary),
+        ("final_absolute_graph_profiles.csv", absolute_graph),
+        ("final_absolute_profile_summary.csv", absolute_summary),
+        ("carrier_alignment_graph_metrics.csv", alignment_graph),
+        ("carrier_alignment_summary.csv", alignment_summary),
+        ("carrier_alignment_residual_graph_profiles.csv", residual_graph),
+        ("carrier_alignment_residual_summary.csv", residual_summary),
     ):
         _write_csv(results_dir / name, values)
     figures_dir = config.output_dir / "figures"
@@ -2454,7 +3024,27 @@ def figures(
             tasks=config.tasks,
             figures_dir=figures_dir,
         ),
+        "absolute_profiles": plot_absolute_profiles(
+            absolute_summary,
+            tasks=config.tasks,
+            figures_dir=figures_dir,
+            display_max_distance=display_max_distance,
+        ),
     }
+    for mode in alignment_modes:
+        paths[f"carrier_alignment_{mode}"] = plot_carrier_alignment(
+            alignment_summary,
+            tasks=config.tasks,
+            mode=mode,
+            figures_dir=figures_dir,
+        )
+        paths[f"carrier_residual_{mode}"] = plot_residual_profiles(
+            residual_summary,
+            tasks=config.tasks,
+            mode=mode,
+            figures_dir=figures_dir,
+            display_max_distance=display_max_distance,
+        )
     _write_json(
         results_dir / "figure_manifest.json",
         {
@@ -2467,8 +3057,15 @@ def figures(
                 "pair -> source -> graph. Interaction profiles condition on the registered "
                 "estimability floor. Layer transport mass takes output norms before summing "
                 "heads; layers are diagnostic sites and are not additive causal stages. "
-                "Virtual-node allocation is retained as a separate VN column."
+                "Virtual-node allocation is retained as a separate VN column. Absolute "
+                "profiles retain scale before event normalisation. Carrier-alignment fits "
+                "are performed within each paired intervention before hierarchical "
+                "aggregation. Absolute-mass alignment is a backward-compatible shape "
+                "screen only; signed-projection alignment is emitted only when the cache "
+                "contains signed scalar carrier projections."
             ),
+            "carrier_alignment_modes": list(alignment_modes),
+            "signed_alignment_available": "signed_projection" in alignment_modes,
         },
     )
     return {
@@ -2477,6 +3074,10 @@ def figures(
         "layer_profile_summary": layer_summary,
         "final_metric_summary": final_metric_summary,
         "layer_metric_summary": layer_metric_summary,
+        "absolute_profile_summary": absolute_summary,
+        "carrier_alignment_summary": alignment_summary,
+        "carrier_residual_summary": residual_summary,
+        "carrier_alignment_modes": alignment_modes,
     }
 
 

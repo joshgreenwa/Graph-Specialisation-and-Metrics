@@ -8,9 +8,11 @@ from graph_specialisation_metrics.zinc_interaction_pilot import (
     OutputModulationConfig,
     _write_csv,
     audit_output_modulation_pairing,
+    carrier_alignment_analysis,
     event_distance_summary,
     figures_output_modulation,
     four_state_contrast,
+    graph_absolute_distance_profiles,
     graph_distance_profiles,
     layer_event_summary,
     output_modulation_graph_metrics,
@@ -388,3 +390,77 @@ def test_graph_profiles_average_pairs_then_sources_and_skip_null_interactions():
     }
     assert semantic == pytest.approx({0: 0.75, 1: 0.25})
     assert interaction == pytest.approx({0: 1.0, 1: 0.0})
+
+
+def test_absolute_profiles_retain_scale_instead_of_allocation_share():
+    rows = [
+        {
+            "task": "zinc_1hop",
+            "graph": 3,
+            "source": 0,
+            "pair": 0,
+            "carrier": distance,
+            "distance": distance,
+            "semantic_mass": mass,
+            "structural_mass": 2.0 * mass,
+            "interaction_mass": 4.0 * mass,
+            "interaction_estimable": True,
+        }
+        for distance, mass in enumerate((1.0, 3.0))
+    ]
+    profiles = graph_absolute_distance_profiles(rows)
+    interaction = {
+        int(row["distance"]): row["mass"] for row in profiles if row["term"] == "interaction"
+    }
+    assert interaction == pytest.approx({0: 4.0, 1: 12.0})
+
+
+def test_carrier_alignment_distinguishes_signed_fit_from_mass_only_screen():
+    rows = []
+    for carrier, values in enumerate(
+        (
+            (1.0, 1.0, 2.0, -1.0, 1.0, 2.0),
+            (1.0, 2.0, 4.0, 1.0, -2.0, -4.0),
+        )
+    ):
+        sem_mass, struct_mass, int_mass, sem_q, struct_q, int_q = values
+        rows.append(
+            {
+                "task": "zinc_1hop",
+                "graph": 3,
+                "source": 0,
+                "pair": 0,
+                "carrier": carrier,
+                "distance": carrier,
+                "semantic_mass": sem_mass,
+                "structural_mass": struct_mass,
+                "interaction_mass": int_mass,
+                "semantic_projection": sem_q,
+                "structural_projection": struct_q,
+                "interaction_projection": int_q,
+                "interaction_estimable": True,
+            }
+        )
+    metrics, residuals, modes = carrier_alignment_analysis(rows)
+    assert modes == ("absolute_mass", "signed_projection")
+    structural = {
+        row["metric"]: row["value"]
+        for row in metrics
+        if row["mode"] == "signed_projection" and row["reference"] == "structural"
+    }
+    assert structural["cosine"] == pytest.approx(1.0)
+    assert structural["gain"] == pytest.approx(2.0)
+    assert structural["explained_energy"] == pytest.approx(1.0)
+    assert structural["residual_fraction"] == pytest.approx(0.0)
+    assert all(
+        row["residual_mass"] == pytest.approx(0.0)
+        for row in residuals
+        if row["mode"] == "signed_projection" and row["reference"] == "structural"
+    )
+
+    legacy_rows = [
+        {key: value for key, value in row.items() if not key.endswith("_projection")}
+        for row in rows
+    ]
+    _, _, legacy_modes = carrier_alignment_analysis(legacy_rows)
+    assert legacy_modes == ("absolute_mass",)
