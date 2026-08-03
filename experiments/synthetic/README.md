@@ -3,6 +3,34 @@
 This folder contains controlled graph tasks for studying symbolic and structural
 attention behaviour outside ZINC.
 
+## Local messages with non-local structural preprocessing
+
+`local_messages_nonlocal_structure.py` is the lightweight capability control for
+the proposed Chapter 6 direction. A connected graph contains two degree-two
+candidate nodes with exactly isomorphic radius-two neighbourhoods: one candidate
+lies on a cycle and one lies inside a long chain. Independent semantic values are
+placed on the candidates, and the target is the value on the cycle.
+
+A shared candidate-local gate selects between those values using only diagonal
+RRWP. Every horizon condition has the same 18 parameters and 17-channel RRWP
+encoder width; higher-order channels are zeroed when unavailable. Sweeping cycle
+lengths 6, 8, and 10 tests the registered prediction that structural separation
+and held-out performance should begin only when the RRWP horizon reaches the
+corresponding remote structure. A deterministic companion check adds an edge six
+hops from a selected node and measures when the selected self-pair and adjacent
+bond RRWP entries first change.
+
+Local command (about three seconds):
+
+```bash
+python -m graph_specialisation_metrics.synthetic.local_messages_nonlocal_structure \
+  --output-dir outputs/chapter6_local_nonlocal_synthetic_v1
+```
+
+The run writes raw CSV tables, a JSON summary, and PNG/PDF versions of both
+figures. The evidence-calibrated interpretation is in
+`chapter6_local_nonlocal_pilot.md`.
+
 ## Graph-native query routing with a hard behavioural oracle
 
 `analysis/query_routing_carriage_colab.py` is the implementation of the Chapter 6

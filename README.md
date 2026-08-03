@@ -48,9 +48,10 @@ The long-term project scope covers:
 
 ## Current Contents
 
-The first component is a ZINC test case with four training notebooks and extracted Python scripts:
+The first component is a ZINC test case with five training notebooks and extracted Python scripts:
 
 - `experiments/zinc/notebooks/grit_ZINC_core.ipynb`
+- `experiments/zinc/notebooks/grit_ZINC_dense_localrrwp.ipynb`
 - `experiments/zinc/notebooks/graphormer_ZINC_core.ipynb`
 - `experiments/zinc/notebooks/CSA_ZINC_core.ipynb`
 - `experiments/zinc/notebooks/graphgps_ZINC_core.ipynb`
@@ -58,6 +59,11 @@ The first component is a ZINC test case with four training notebooks and extract
 - `experiments/zinc/training/graphormer_zinc_core.py`
 - `experiments/zinc/training/csa_zinc_core.py`
 - `experiments/zinc/training/graphgps_zinc_core.py`
+
+The dense GRIT runner accepts `--rrwp-horizon 1` to retain official dense
+attention while limiting RRWP to identity and one-step random-walk information.
+The dedicated `grit_ZINC_dense_localrrwp.ipynb` notebook launches that control
+with isolated GRIT, dataset-cache, result, and checkpoint directories.
 
 The repository also includes controlled synthetic graph tasks:
 

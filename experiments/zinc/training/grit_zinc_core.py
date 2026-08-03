@@ -10,8 +10,14 @@ repository and launches the official ZINC RRWP config:
 
     python -u main.py --cfg configs/GRIT/zinc-GRIT-RRWP.yaml wandb.use False
 
-with only non-scientific runtime overrides for Google Drive output/checkpoints,
-notebook-safe console filtering, and resume behavior. Compact stdout prints
+Pass ``--rrwp-horizon 1`` for the parameter-matched dense-attention/local-RRWP
+control.  That control keeps the official complete-graph attention support but
+zeros RRWP channels above one random-walk step before encoding.  Non-local
+pairs therefore remain available to attention with zero RRWP features.
+
+Both modes use only non-scientific runtime overrides for Google Drive
+output/checkpoints, notebook-safe console filtering, and resume behavior.
+Compact stdout prints
 current train/val/test loss+MAE every selected epoch, plus the best validation
 epoch so far. The official ZINC model/task/training config is validated before
 launch. The repo is pinned by default to a known official main-branch commit,
@@ -69,6 +75,7 @@ OFFICIAL_CFG = "configs/GRIT/zinc-GRIT-RRWP.yaml"
 # Current official main-branch commit observed from GitHub commit history.
 OFFICIAL_COMMIT = "6c988ea600a606fbb49a2246c64a2d37396b3ab5"
 EXPECTED_ZINC_GRIT_RRWP_PARAMS = 473_473
+GLOBAL_RRWP_HORIZON = -1
 EXPECTED_CFG_VALUES = {
     ("metric_best",): "mae",
     ("metric_agg",): "argmin",
@@ -138,6 +145,142 @@ EXPECTED_CFG_VALUES = {
 
 class CommandError(RuntimeError):
     pass
+
+
+def _read_text_preserve_newlines(path: Path) -> str:
+    with path.open("r", encoding="utf-8", newline="") as handle:
+        return handle.read()
+
+
+def _write_text_preserve_newlines(path: Path, text: str) -> None:
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        handle.write(text)
+
+
+def _insert_after_exact(
+    path: Path,
+    *,
+    anchor: str,
+    insertion: str,
+    marker: str,
+    label: str,
+) -> bool:
+    """Apply one pinned-source insertion, while remaining safe to rerun."""
+    text = _read_text_preserve_newlines(path)
+    if marker in text:
+        log(f"[patch] {label}: already present")
+        return False
+
+    newline = "\r\n" if "\r\n" in text else "\n"
+    anchor_native = anchor.replace("\n", newline)
+    insertion_native = insertion.replace("\n", newline)
+    if anchor_native not in text:
+        raise RuntimeError(
+            f"Could not apply `{label}` to {path}. "
+            "The pinned GRIT source no longer matches the expected layout."
+        )
+    _write_text_preserve_newlines(
+        path,
+        text.replace(anchor_native, anchor_native + insertion_native, 1),
+    )
+    log(f"[patch] {label}: applied")
+    return True
+
+
+def apply_dense_local_rrwp_patch(repo_dir: Path) -> None:
+    """Add an RRWP walk-horizon option without changing dense attention.
+
+    With ``local_horizon=1`` and the official ``add_identity=True`` setting,
+    channels 0 and 1 (I and P) are retained and all longer-walk channels are
+    zeroed.  The official dense RRWP edge encoder then pads absent/non-local
+    pairs to the complete graph with zeros, exactly as it already does.
+    """
+    log("\n[patch] Adding dense-attention/local-RRWP support.")
+
+    _insert_after_exact(
+        repo_dir / "grit" / "config" / "posenc_config.py",
+        anchor="    cfg.posenc_RRWP.spd = False\n",
+        insertion="    cfg.posenc_RRWP.local_horizon = -1\n",
+        marker="cfg.posenc_RRWP.local_horizon",
+        label="RRWP local_horizon config default",
+    )
+
+    rrwp_transform = repo_dir / "grit" / "transform" / "rrwp.py"
+    _insert_after_exact(
+        rrwp_transform,
+        anchor="                  spd=False,\n",
+        insertion="                  local_horizon=None,\n",
+        marker="                  local_horizon=None,",
+        label="RRWP local_horizon transform argument",
+    )
+    _insert_after_exact(
+        rrwp_transform,
+        anchor="    edge_index, edge_weight = data.edge_index, data.edge_weight\n",
+        insertion=(
+            "\n"
+            "    if local_horizon is None:\n"
+            "        try:\n"
+            "            local_horizon = int(getattr(cfg.posenc_RRWP, 'local_horizon', -1))\n"
+            "        except Exception:\n"
+            "            local_horizon = -1\n"
+            "    local_horizon = int(local_horizon)\n"
+        ),
+        marker="local_horizon = int(getattr(cfg.posenc_RRWP",
+        label="resolve RRWP local_horizon",
+    )
+    _insert_after_exact(
+        rrwp_transform,
+        anchor="    pe = torch.stack(pe_list, dim=-1) # n x n x k\n",
+        insertion=(
+            "\n"
+            "    if local_horizon >= 0:\n"
+            "        # With add_identity=True, channel 0 is I and channel k is P^k.\n"
+            "        keep_channels = local_horizon + 1 if add_identity else local_horizon\n"
+            "        keep_channels = max(0, min(int(keep_channels), pe.size(-1)))\n"
+            "        if keep_channels < pe.size(-1):\n"
+            "            pe[..., keep_channels:] = 0\n"
+        ),
+        marker="keep_channels = local_horizon + 1 if add_identity else local_horizon",
+        label="truncate RRWP channels to the configured local horizon",
+    )
+
+    _insert_after_exact(
+        repo_dir / "grit" / "transform" / "posenc_stats.py",
+        anchor="                            spd=param.spd, # by default False\n",
+        insertion="                            local_horizon=param.get('local_horizon', -1),\n",
+        marker="local_horizon=param.get('local_horizon'",
+        label="pass RRWP local_horizon to preprocessing",
+    )
+
+
+def write_dense_local_rrwp_provenance(
+    drive_dir: Path,
+    *,
+    horizon: int,
+    commit: str,
+) -> Path:
+    note = drive_dir / "patches" / "zinc_grit_dense_localrrwp_patch.txt"
+    note.parent.mkdir(parents=True, exist_ok=True)
+    note.write_text(
+        "\n".join(
+            [
+                "Parameter-matched dense-attention/local-RRWP GRIT ZINC control",
+                f"official_repo: {OFFICIAL_REPO}",
+                f"official_commit: {commit}",
+                f"official_config: {OFFICIAL_CFG}",
+                f"rrwp_local_horizon: {horizon}",
+                "attention_support: complete graph (official dense GRIT)",
+                "rrwp_support: identity plus walks up to local_horizon; later channels zeroed",
+                "nonlocal_pairs: retained in dense attention with zero RRWP features",
+                "rrwp_encoder_dimensionality: ksteps=21 retained",
+                f"parameter_count_guard: {EXPECTED_ZINC_GRIT_RRWP_PARAMS}",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    log(f"[patch] wrote patch provenance note: {note}")
+    return note
 
 
 def log(msg: str) -> None:
@@ -666,16 +809,35 @@ def install_dependencies(args: argparse.Namespace) -> None:
     pyg_wheel_url = f"https://data.pyg.org/whl/torch-{torch_version}+{cuda_tag}.html"
     log(f"[deps] PyG wheel index: {pyg_wheel_url}")
 
-    # Install compiled PyG extensions matched to the active torch/CUDA build.
+    # Install the compiled PyG extensions used by the GRIT RRWP path. Current
+    # Colab images can move ahead of the complete PyG wheel matrix; in
+    # particular, torch-spline-conv may lag behind a new Torch release even
+    # though this ZINC model does not use it.
     pip_install([
         "pyg-lib",
         "torch-scatter",
         "torch-sparse",
         "torch-cluster",
-        "torch-spline-conv",
         "-f",
         pyg_wheel_url,
     ])
+    spline_proc = run_cmd(
+        [
+            sys.executable,
+            "-m",
+            "pip",
+            "install",
+            "torch-spline-conv",
+            "-f",
+            pyg_wheel_url,
+        ],
+        check=False,
+    )
+    if spline_proc.returncode != 0:
+        log(
+            "[deps-warning] torch-spline-conv is unavailable for this "
+            "Torch/CUDA/Python stack; continuing because GRIT ZINC RRWP does not use it."
+        )
 
     # GRIT README says PyG v2.2 is required. Keep this explicit and configurable.
     pip_install([f"torch-geometric=={args.pyg_version}"])
@@ -701,15 +863,22 @@ def clone_or_update_repo(repo_dir: Path, repo_url: str, branch: str, commit: str
         log(f"[repo] Removing existing repo: {repo_dir}")
         shutil.rmtree(repo_dir)
 
-    if not repo_dir.exists():
+    fresh_clone = not repo_dir.exists()
+    if fresh_clone:
         run_cmd(["git", "clone", "--branch", branch, repo_url, str(repo_dir)])
     else:
         log(f"[repo] Existing repo found: {repo_dir}")
         run_cmd(["git", "fetch", "origin"], cwd=repo_dir)
-        run_cmd(["git", "checkout", branch], cwd=repo_dir)
-        run_cmd(["git", "pull", "--ff-only", "origin", branch], cwd=repo_dir)
+        if commit:
+            # Patched experiment checkouts intentionally contain tracked source
+            # edits. Re-checking out the same pinned commit is safe, whereas an
+            # unnecessary trip through the moving branch can conflict with them.
+            run_cmd(["git", "checkout", commit], cwd=repo_dir)
+        else:
+            run_cmd(["git", "checkout", branch], cwd=repo_dir)
+            run_cmd(["git", "pull", "--ff-only", "origin", branch], cwd=repo_dir)
 
-    if commit:
+    if commit and fresh_clone:
         log(f"[repo] Pinning GRIT to commit: {commit}")
         run_cmd(["git", "checkout", commit], cwd=repo_dir)
 
@@ -787,6 +956,24 @@ def validate_official_config(repo_dir: Path, allow_drift: bool) -> None:
     log(f"[paper-check] Expected paper parameter count: {EXPECTED_ZINC_GRIT_RRWP_PARAMS}")
 
 
+def validate_rrwp_horizon(horizon: int) -> None:
+    if horizon < GLOBAL_RRWP_HORIZON:
+        raise ValueError("--rrwp-horizon must be -1 (global) or a non-negative integer")
+    # The official config has ksteps=21 with channel 0 reserved for identity,
+    # hence walk horizons above 20 cannot expose any additional channel.
+    if horizon > 20:
+        raise ValueError("--rrwp-horizon cannot exceed 20 for official RRWP ksteps=21")
+    if horizon >= 0:
+        log(
+            "[control] Dense attention retained; RRWP is restricted to identity "
+            f"plus random-walk steps <= {horizon}."
+        )
+        log(
+            "[control] All non-local pairs remain in the complete attention graph "
+            "with zero RRWP features."
+        )
+
+
 def build_training_command(args: argparse.Namespace, drive_dir: Path) -> List[str]:
     results_dir = drive_dir / "results"
     dataset_dir = drive_dir / "datasets"
@@ -829,6 +1016,8 @@ def build_training_command(args: argparse.Namespace, drive_dir: Path) -> List[st
     ]
     if args.accelerator:
         cmd.extend(["accelerator", args.accelerator])
+    if args.rrwp_horizon >= 0:
+        cmd.extend(["posenc_RRWP.local_horizon", str(args.rrwp_horizon)])
     return cmd
 
 
@@ -890,32 +1079,57 @@ def _strip_colab_kernel_args(argv: Sequence[str]) -> List[str]:
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        description="Train official GRIT+RRWP on the ZINC subset in Colab, saving checkpoints to Drive.",
+        description=(
+            "Train official dense GRIT+RRWP on ZINC, optionally restricting RRWP "
+            "to a local walk horizon while retaining dense attention."
+        ),
         epilog=textwrap.dedent(
             """
             Examples:
-              !python train_grit_zinc_official_colab.py
-              %run train_grit_zinc_official_colab.py
-              !python train_grit_zinc_official_colab.py --seed 42 --name-tag GRITwRRWP.seed42
-              !python train_grit_zinc_official_colab.py --skip-install --auto-resume
+              !python grit_zinc_core.py
+              !python grit_zinc_core.py --rrwp-horizon 1
+              !python grit_zinc_core.py --rrwp-horizon 1 --seed 42
+              !python grit_zinc_core.py --rrwp-horizon 1 --skip-install --auto-resume
             """
         ),
     )
     p.add_argument("--drive-mount", type=Path, default=Path("/content/drive"))
-    p.add_argument("--drive-dir", type=Path, default=Path("/content/drive/MyDrive/grit_zinc_official"))
-    p.add_argument("--repo-dir", type=Path, default=Path("/content/GRIT"))
+    p.add_argument(
+        "--drive-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Drive output root. Defaults to grit_zinc_official for global RRWP or "
+            "grit_zinc_dense_localrrwp for --rrwp-horizon 1."
+        ),
+    )
+    p.add_argument(
+        "--repo-dir",
+        type=Path,
+        default=None,
+        help="GRIT checkout. Uses a separate checkout for local-RRWP runs by default.",
+    )
     p.add_argument("--repo-url", type=str, default=OFFICIAL_REPO)
     p.add_argument("--branch", type=str, default="main")
     p.add_argument("--commit", type=str, default=OFFICIAL_COMMIT, help="Pin the official GRIT repo to this commit. Pass an empty string to use the branch HEAD.")
     p.add_argument("--expected-params", type=int, default=EXPECTED_ZINC_GRIT_RRWP_PARAMS, help="Abort unless GRIT logs this exact model parameter count.")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--repeat", type=int, default=1)
-    p.add_argument("--name-tag", type=str, default="ColabDrive.official.GRITwRRWP")
+    p.add_argument("--name-tag", type=str, default=None)
+    p.add_argument(
+        "--rrwp-horizon",
+        type=int,
+        default=GLOBAL_RRWP_HORIZON,
+        help=(
+            "Maximum random-walk step visible to RRWP. -1 keeps official global RRWP; "
+            "1 gives local RRWP (I and P only) while attention stays dense."
+        ),
+    )
     p.add_argument("--num-threads", type=int, default=4)
     p.add_argument("--pyg-version", type=str, default="2.2.0")
     p.add_argument("--skip-install", action="store_true", help="Do not pip-install dependencies.")
     p.add_argument("--official-torch112", action="store_true", help="Try to install torch==1.12.1+cu113. Requires Python <=3.10 and may not work on current Colab.")
-    p.add_argument("--force-fresh-repo", action="store_true", help="Delete and reclone /content/GRIT before running.")
+    p.add_argument("--force-fresh-repo", action="store_true", help="Delete and reclone the selected GRIT checkout before running.")
     p.add_argument("--allow-upstream-config-drift", action="store_true", help="Warn instead of aborting if upstream config differs from expected official values.")
     p.add_argument("--allow-param-count-drift", action="store_true", help="Warn instead of aborting if Num parameters is not the expected ZINC GRIT+RRWP paper count.")
     p.add_argument("--wandb", action="store_true", help="Enable W&B. Default is disabled for unattended Colab runs.")
@@ -926,7 +1140,32 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     p.add_argument("--no-auto-resume", action="store_false", dest="auto_resume")
     argv = list(sys.argv[1:] if argv is None else argv)
     argv = _strip_colab_kernel_args(argv)
-    return p.parse_args(argv)
+    args = p.parse_args(argv)
+    validate_rrwp_horizon(args.rrwp_horizon)
+
+    is_local = args.rrwp_horizon >= 0
+    horizon_suffix = f"h{args.rrwp_horizon}"
+    if args.drive_dir is None:
+        drive_name = (
+            "grit_zinc_dense_localrrwp"
+            if args.rrwp_horizon == 1
+            else f"grit_zinc_dense_localrrwp_{horizon_suffix}"
+        ) if is_local else "grit_zinc_official"
+        args.drive_dir = Path("/content/drive/MyDrive") / drive_name
+    if args.repo_dir is None:
+        repo_name = (
+            "GRIT_dense_localrrwp"
+            if args.rrwp_horizon == 1
+            else f"GRIT_dense_localrrwp_{horizon_suffix}"
+        ) if is_local else "GRIT"
+        args.repo_dir = Path("/content") / repo_name
+    if args.name_tag is None:
+        args.name_tag = (
+            f"ColabDrive.dense.LocalRRWP.h{args.rrwp_horizon}.GRITwRRWP"
+            if is_local
+            else "ColabDrive.official.GRITwRRWP"
+        )
+    return args
 
 
 def main(argv: Sequence[str] | None = None) -> None:
@@ -935,6 +1174,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     In a Colab cell, prefer calling e.g.
 
         main([])
+        main(["--rrwp-horizon", "1"])
         main(["--skip-install"])
         main(["--skip-install", "--seed", "42"])
 
@@ -956,12 +1196,26 @@ def main(argv: Sequence[str] | None = None) -> None:
         log("[deps] Skipping dependency installation (--skip-install).")
 
     commit = clone_or_update_repo(args.repo_dir, args.repo_url, args.branch, args.commit or None, args.force_fresh_repo)
+    if args.rrwp_horizon >= 0:
+        apply_dense_local_rrwp_patch(args.repo_dir)
     install_grit_editable(args.repo_dir)
     validate_official_config(args.repo_dir, args.allow_upstream_config_drift)
+    validate_rrwp_horizon(args.rrwp_horizon)
+    if args.rrwp_horizon >= 0:
+        write_dense_local_rrwp_provenance(
+            args.drive_dir,
+            horizon=args.rrwp_horizon,
+            commit=commit,
+        )
     print_environment_summary(args.drive_dir, args.repo_dir, commit)
 
     cmd = build_training_command(args, args.drive_dir)
-    wrapper_log = args.drive_dir / "wrapper_logs" / f"grit_zinc_seed{args.seed}_{time.strftime('%Y%m%d_%H%M%S')}.log"
+    wrapper_prefix = (
+        "grit_zinc"
+        if args.rrwp_horizon < 0
+        else f"grit_zinc_dense_localrrwp_h{args.rrwp_horizon}"
+    )
+    wrapper_log = args.drive_dir / "wrapper_logs" / f"{wrapper_prefix}_seed{args.seed}_{time.strftime('%Y%m%d_%H%M%S')}.log"
     train_env = env_with_py312_compat(compat_shim_dir)
     rc = run_streaming_to_console_and_log(
         cmd,
