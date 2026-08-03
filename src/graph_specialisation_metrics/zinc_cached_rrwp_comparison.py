@@ -258,29 +258,51 @@ def _resolve_task_root(
     roots: Sequence[Path], task: str, train_seed: int
 ) -> tuple[Path, str]:
     for artifact_task in artifact_task_candidates(task):
-        candidates = []
+        candidates: list[tuple[Path, ReadOnlyCacheArtifact]] = []
         for root in roots:
             task_dir = _task_dir(Path(root), artifact_task, train_seed)
             score = task_dir / "cache" / "scores" / "raw.pt"
             model = task_dir / "model.json"
             if score.is_file() and model.is_file():
-                candidates.append(Path(root))
+                candidates.append(
+                    (
+                        Path(root),
+                        load_compatible_score_artifact(
+                            score, expected_task=artifact_task
+                        ),
+                    )
+                )
         if not candidates:
             continue
-        if len(candidates) > 1:
-            fingerprints = []
-            for root in candidates:
-                path = _task_dir(root, artifact_task, train_seed) / "cache/scores/raw.pt"
-                artifact = load_compatible_score_artifact(
-                    path, expected_task=artifact_task
-                )
-                fingerprints.append(str(artifact.metadata["contract_fingerprint"]))
-            if len(set(fingerprints)) != 1:
-                raise RuntimeError(
-                    "multiple non-identical canonical score caches found for "
-                    f"{artifact_task}: {candidates}"
-                )
-        return candidates[0], artifact_task
+        protocol_rank = {
+            protocol: rank for rank, protocol in enumerate(SUPPORTED_CACHE_PROTOCOLS)
+        }
+        best_rank = max(
+            protocol_rank.get(
+                str(artifact.metadata.get("protocol_version")), -1
+            )
+            for _, artifact in candidates
+        )
+        preferred = [
+            (root, artifact)
+            for root, artifact in candidates
+            if protocol_rank.get(
+                str(artifact.metadata.get("protocol_version")), -1
+            )
+            == best_rank
+        ]
+        fingerprints = {
+            str(artifact.metadata["contract_fingerprint"])
+            for _, artifact in preferred
+        }
+        if len(fingerprints) != 1:
+            locations = [str(root) for root, _ in preferred]
+            protocol = preferred[0][1].metadata.get("protocol_version")
+            raise RuntimeError(
+                f"multiple non-identical {protocol} score caches found for "
+                f"{artifact_task}: {locations}"
+            )
+        return preferred[0][0], artifact_task
     expected = "\n".join(
         str(_task_dir(Path(root), candidate, train_seed) / "cache/scores/raw.pt")
         for candidate in artifact_task_candidates(task)

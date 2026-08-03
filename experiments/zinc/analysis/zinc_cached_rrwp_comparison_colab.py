@@ -185,6 +185,19 @@ for task_record in inventory:
             }
         )
 
+for task in TASKS:
+    task_rows = [row for row in protocol_rows if row["task"] == task]
+    has_v4 = any(
+        row["protocol"] == "donor-swap-specialisation-carriage-v4"
+        for row in task_rows
+    )
+    for row in task_rows:
+        row["preferred"] = (
+            row["protocol"] == "donor-swap-specialisation-carriage-v4"
+            if has_v4
+            else row["protocol"] == "donor-swap-specialisation-carriage-v3"
+        )
+
 
 def checkpoint_from_canonical_record(task_record):
     for match in task_record["matches"]:
@@ -246,15 +259,24 @@ print("Canonical score protocol inventory")
 display(pd.DataFrame(protocol_rows))
 print(f"[protocol-manifest] {protocol_manifest}")
 for protocol in sorted({row["protocol"] for row in protocol_rows}):
-    protocol_tasks = [row["task"] for row in protocol_rows if row["protocol"] == protocol]
-    print(f"[{protocol.rsplit('-', 1)[-1]}] " + ", ".join(protocol_tasks))
-v3_tasks = [
+    protocol_tasks = [
+        task
+        for task in TASKS
+        if any(
+            row["task"] == task and row["protocol"] == protocol
+            for row in protocol_rows
+        )
+    ]
+    print(f"[{protocol.rsplit('-', 1)[-1]} available] " + ", ".join(protocol_tasks))
+v4_tasks = {
     row["task"]
     for row in protocol_rows
-    if row["protocol"] == "donor-swap-specialisation-carriage-v3"
-]
-if v3_tasks:
-    print("[recompute-v4] " + ", ".join(v3_tasks))
+    if row["protocol"] == "donor-swap-specialisation-carriage-v4"
+}
+print("[v4 selected by default] " + ", ".join(task for task in TASKS if task in v4_tasks))
+recompute_v4 = [task for task in TASKS if task not in v4_tasks]
+if recompute_v4:
+    print("[recompute-v4] " + ", ".join(recompute_v4))
 missing = missing_tasks(inventory)
 if missing:
     missing_checkpoint_state = [

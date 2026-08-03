@@ -12,6 +12,7 @@ from graph_specialisation_metrics.methodology.cache import (
 from graph_specialisation_metrics.methodology.protocol import stable_hash
 from graph_specialisation_metrics.zinc_cached_rrwp_comparison import (
     CachedModel,
+    _resolve_task_root,
     cache_inventory,
     carriage_profile,
     group_distance,
@@ -198,6 +199,38 @@ def test_legacy_v3_cache_is_read_only_and_fingerprint_validated(tmp_path):
     torch.save(payload, path)
     with pytest.raises(StaleCacheError, match="fingerprint"):
         load_compatible_cache_artifact_file(path)
+
+
+def test_root_resolution_prefers_v4_over_nonidentical_v3(tmp_path, monkeypatch):
+    roots = [tmp_path / "v3_root", tmp_path / "v4_root"]
+    protocols = (
+        "donor-swap-specialisation-carriage-v3",
+        "donor-swap-specialisation-carriage-v4",
+    )
+    artifacts = {}
+    for root, protocol in zip(roots, protocols):
+        task_dir = root / "zinc_1hop" / "seed_42"
+        score = task_dir / "cache/scores/raw.pt"
+        score.parent.mkdir(parents=True)
+        score.touch()
+        (task_dir / "model.json").touch()
+        artifacts[score] = ReadOnlyCacheArtifact(
+            path=score,
+            file_sha256="sha",
+            metadata={
+                "protocol_version": protocol,
+                "contract_fingerprint": protocol,
+            },
+            value={},
+        )
+    monkeypatch.setattr(
+        "graph_specialisation_metrics.zinc_cached_rrwp_comparison."
+        "load_compatible_score_artifact",
+        lambda path, expected_task: artifacts[Path(path)],
+    )
+    root, artifact_task = _resolve_task_root(roots, "zinc_1hop", 42)
+    assert root == roots[1]
+    assert artifact_task == "zinc_1hop"
 
 
 def test_cached_interval_width_and_carriage_are_normalized():
