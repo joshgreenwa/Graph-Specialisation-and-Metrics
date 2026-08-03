@@ -24,6 +24,10 @@ GOLD = "#E6A700"
 ORANGE = "#D97706"
 SLATE = "#607080"
 LIGHT_GRID = "#DCE3E8"
+INDIVIDUAL_PCA_FIGURE_WIDTH = 9.6
+INDIVIDUAL_PCA_BASE_HEIGHT = 6.4
+DEFAULT_INDIVIDUAL_PCA_FIGSIZE = (9.6, 7.89)
+_PRESERVE_CANVAS_ATTRIBUTE = "_graph_specialisation_preserve_canvas"
 
 PUBLICATION_PNG_DPI = 600
 PUBLICATION_PDF_RASTER_DPI = 1200
@@ -764,8 +768,11 @@ def plot_av_pca(
     legend_columns = min(3, max(1, len(categories)))
     legend_rows = int(np.ceil(len(categories) / legend_columns))
     legend_space_inches = 0.65 + 0.42 * legend_rows
-    figure_height = 6.4 + legend_space_inches
-    fig, ax = plt.subplots(figsize=(9.6, figure_height))
+    figure_height = INDIVIDUAL_PCA_BASE_HEIGHT + legend_space_inches
+    fig, ax = plt.subplots(
+        figsize=(INDIVIDUAL_PCA_FIGURE_WIDTH, figure_height)
+    )
+    setattr(fig, _PRESERVE_CANVAS_ATTRIBUTE, True)
     labels_array = np.asarray(labels)
     for category in categories:
         color = _pca_focus_color(category)
@@ -956,6 +963,7 @@ def plot_hop_attention_mass(
     head: Head,
     *,
     title: str | None = None,
+    figsize: Sequence[float] = DEFAULT_INDIVIDUAL_PCA_FIGSIZE,
 ):
     """Plot the clean attention profile stored in the score cache."""
 
@@ -971,7 +979,12 @@ def plot_hop_attention_mass(
     x = np.arange(len(values), dtype=np.float64)
     x[graph_token] += 0.8
     colors = [GOLD if special else TEAL for special in graph_token]
-    fig, ax = plt.subplots(figsize=(8.4, 4.8), constrained_layout=True)
+    figure_size = tuple(float(value) for value in figsize)
+    if len(figure_size) != 2 or min(figure_size) <= 0:
+        raise ValueError("hop-attention figsize must contain two positive values")
+    figure_height = figure_size[1]
+    fig, ax = plt.subplots(figsize=figure_size)
+    setattr(fig, _PRESERVE_CANVAS_ATTRIBUTE, True)
     bars = ax.bar(
         x,
         values,
@@ -989,9 +1002,14 @@ def plot_hop_attention_mass(
     )
     ax.set_xlabel("Shortest-path distance")
     ax.set_ylabel("Mean clean attention mass")
+    axis_title_size = 1.25 * float(plt.rcParams["axes.labelsize"])
+    axis_tick_size = 1.25 * float(plt.rcParams["xtick.labelsize"])
+    ax.xaxis.label.set_fontsize(axis_title_size)
+    ax.yaxis.label.set_fontsize(axis_title_size)
+    ax.tick_params(axis="both", labelsize=axis_tick_size)
     ax.set_ylim(0, max(float(values.max()) * 1.18, 0.05))
     ax.set_title(
-        title or f"Attention mass by hop distance — {_head_label(head)}",
+        title or f"Attention mass by hop distance - {_head_label(head)}",
         fontsize=15,
     )
     ax.grid(axis="y")
@@ -1007,6 +1025,16 @@ def plot_hop_attention_mass(
                 fontsize=8,
                 color=NAVY,
             )
+    paired_legend_space = max(
+        0.65,
+        figure_height - INDIVIDUAL_PCA_BASE_HEIGHT,
+    )
+    fig.subplots_adjust(
+        left=0.115,
+        right=0.975,
+        top=1.0 - 1.45 / figure_height,
+        bottom=(paired_legend_space + 0.20) / figure_height,
+    )
     return fig
 
 
@@ -1408,18 +1436,23 @@ def save_figure_bundle(
         "pdf": directory / f"{stem}.pdf",
         "metadata": directory / f"{stem}.json",
     }
+    preserve_canvas = bool(
+        getattr(figure, _PRESERVE_CANVAS_ATTRIBUTE, False)
+    )
+    bbox_inches = None if preserve_canvas else "tight"
+    pad_inches = 0.0 if preserve_canvas else 0.04
     figure.savefig(
         paths["png"],
         dpi=dpi,
-        bbox_inches="tight",
-        pad_inches=0.04,
+        bbox_inches=bbox_inches,
+        pad_inches=pad_inches,
         facecolor="white",
     )
     figure.savefig(
         paths["pdf"],
         dpi=pdf_dpi,
-        bbox_inches="tight",
-        pad_inches=0.04,
+        bbox_inches=bbox_inches,
+        pad_inches=pad_inches,
         facecolor="white",
         metadata={
             "Title": str(stem),
@@ -1433,6 +1466,10 @@ def save_figure_bundle(
         "pdf_vector_text_and_paths": True,
         "pdf_font_embedding": "TrueType (fonttype 42)",
         "molecule_render_dpi": MOLECULE_RENDER_DPI,
+        "preserve_canvas": preserve_canvas,
+        "figure_size_inches": [
+            float(value) for value in figure.get_size_inches()
+        ],
     }
     paths["metadata"].write_text(
         json.dumps(

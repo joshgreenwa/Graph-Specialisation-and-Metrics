@@ -274,6 +274,12 @@ def test_graphormer_figure_notebook_routes_every_grid_through_live_config():
     )
     assert "compute_selected_head_transport_profiles(" in source
     assert "plot_routing_transport_profiles(" in source
+    assert "pca_figure = plot_av_pca(" in source
+    assert "paired_figure_size = tuple(" in source
+    assert "figsize=paired_figure_size" in source
+    assert '"paired_PCA_figure_size_inches"' in source
+    assert "ALL_DISPLAYED_HEADS" not in source
+    assert "attention mass by hop distance —" not in source
 
 
 def test_graphormer_figure_loader_explicitly_accepts_valid_v3_cache(tmp_path):
@@ -730,6 +736,8 @@ def test_figure_bundle_saves_png_pdf_and_provenance_in_target_folder(tmp_path):
         "pdf_vector_text_and_paths": True,
         "pdf_font_embedding": "TrueType (fonttype 42)",
         "molecule_render_dpi": 600,
+        "preserve_canvas": False,
+        "figure_size_inches": [8.0, 5.9],
     }
 
 
@@ -739,6 +747,9 @@ def test_figure_bundle_uses_independent_publication_dpi_for_png_and_pdf(
     calls = []
 
     class RecordingFigure:
+        def get_size_inches(self):
+            return np.asarray([6.4, 4.8])
+
         def savefig(self, path, **kwargs):
             calls.append((Path(path), kwargs))
             Path(path).write_bytes(b"figure")
@@ -801,8 +812,69 @@ def test_hop_plot_separates_graph_token_tick():
         labels = [label.get_text() for label in axis.get_xticklabels()]
         assert labels[-1] == "Graph\ntoken"
         assert ticks[-1] - ticks[-2] > 1.2
+        assert axis.get_title() == "Attention mass by hop distance - L0 H0"
+        assert np.allclose(figure.get_size_inches(), (9.6, 7.89))
+        assert not figure.legends
     finally:
         plt.close(figure)
+
+
+def test_hop_attention_export_exactly_matches_paired_pca_canvas(tmp_path):
+    rng = np.random.default_rng(17)
+    labels = (
+        ["Ring: aromatic"] * 2
+        + ["O: carbonyl"] * 5
+        + ["N: amide"] * 3
+        + ["other/diffuse"] * 6
+    )
+    pca_figure = plot_av_pca(
+        {
+            "head": (7, 14),
+            "vectors": rng.normal(size=(len(labels), 8)),
+            "labels": labels,
+            "n_used": len(labels),
+        },
+        d_rel=-0.275,
+        joint_sensitivity=1.234,
+    )
+    paired_size = tuple(float(value) for value in pca_figure.get_size_inches())
+    hop_figure = plot_hop_attention_mass(
+        synthetic_metrics(),
+        (0, 0),
+        figsize=paired_size,
+    )
+    try:
+        np.testing.assert_allclose(hop_figure.get_size_inches(), paired_size)
+        pca_paths = save_figure_bundle(
+            pca_figure,
+            tmp_path,
+            "paired_pca",
+            dpi=72,
+            pdf_dpi=72,
+        )
+        hop_paths = save_figure_bundle(
+            hop_figure,
+            tmp_path,
+            "paired_hop",
+            dpi=72,
+            pdf_dpi=72,
+        )
+        assert plt.imread(pca_paths["png"]).shape[:2] == plt.imread(
+            hop_paths["png"]
+        ).shape[:2]
+        PdfReader = pytest.importorskip("pypdf").PdfReader
+        pca_page = PdfReader(str(pca_paths["pdf"])).pages[0]
+        hop_page = PdfReader(str(hop_paths["pdf"])).pages[0]
+        assert (
+            float(pca_page.mediabox.width),
+            float(pca_page.mediabox.height),
+        ) == (
+            float(hop_page.mediabox.width),
+            float(hop_page.mediabox.height),
+        )
+    finally:
+        plt.close(pca_figure)
+        plt.close(hop_figure)
 
 
 def test_routing_transport_figure_has_four_head_facets_and_uncertainty_bands():
