@@ -91,6 +91,13 @@ def test_output_all_cli_accepts_legacy_and_output_task_defaults(tmp_path, monkey
     ]
 
 
+def test_output_validation_defaults_prioritise_graphs_then_sources():
+    args = pilot_module.build_parser().parse_args(["--phase", "output-all"])
+    assert args.output_graphs == 64
+    assert args.output_sources_per_graph == 6
+    assert args.output_donor_pairs_per_source == 2
+
+
 def test_output_modulation_aggregates_pairs_then_sources_then_graphs():
     rows = []
     for source, values in ((0, (0.0, 2.0)), (1, (2.0, 2.0))):

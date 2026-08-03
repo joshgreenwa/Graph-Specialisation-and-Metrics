@@ -147,8 +147,8 @@ class OutputModulationConfig:
     output_dir: Path
     tasks: tuple[str, ...] = OUTPUT_MODULATION_TASKS
     seed: int = 0
-    graphs: int = 16
-    sources_per_graph: int = 4
+    graphs: int = 64
+    sources_per_graph: int = 6
     donor_pairs_per_source: int = 2
     semantic_donor_graphs: int = 64
     effect_floor: float = 1.0e-6
@@ -2348,8 +2348,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="Plot numeric distances through this value; 0 retains all distances.",
     )
     parser.add_argument("--output-tasks", default=",".join(OUTPUT_MODULATION_TASKS))
-    parser.add_argument("--output-graphs", type=int, default=16)
-    parser.add_argument("--output-sources-per-graph", type=int, default=4)
+    parser.add_argument("--output-graphs", type=int, default=64)
+    parser.add_argument("--output-sources-per-graph", type=int, default=6)
     parser.add_argument("--output-donor-pairs-per-source", type=int, default=2)
     parser.add_argument("--output-semantic-donor-graphs", type=int, default=64)
     parser.add_argument("--output-effect-floor", type=float, default=1.0e-6)

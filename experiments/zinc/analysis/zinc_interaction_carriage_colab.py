@@ -48,8 +48,8 @@ DISPLAY_MAX_DISTANCE = 0  # 0 keeps the complete observed distance axis.
 
 # Lightweight exact-output M pilot. These controls do not run carriage or Jacobians.
 OUTPUT_TASKS = "zinc_1hop_localrrwp,zinc_1hop,zinc"
-OUTPUT_GRAPHS = 16
-OUTPUT_SOURCES_PER_GRAPH = 4
+OUTPUT_GRAPHS = 64
+OUTPUT_SOURCES_PER_GRAPH = 6
 OUTPUT_DONOR_PAIRS_PER_SOURCE = 2
 OUTPUT_SEMANTIC_DONOR_GRAPHS = 64
 OUTPUT_EFFECT_FLOOR = 1.0e-6
