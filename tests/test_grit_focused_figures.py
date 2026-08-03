@@ -1110,19 +1110,13 @@ def test_hop_attention_export_exactly_matches_paired_pca_canvas(
         distance_metrics,
         (0, 0),
         figsize=paired_size,
-        d_rel=-0.275,
-        joint_sensitivity=1.234,
     )
     try:
         np.testing.assert_allclose(hop_figure.get_size_inches(), paired_size)
         assert hop_figure.axes[0].get_title() == (
-            "Attention mass by hop distance - L0 H0\n"
-            "$D_{\\rm rel} = -0.275;\\quad J = 1.234$"
+            "Attention mass by hop distance - L0 H0"
         )
-        assert [text.get_text() for text in hop_figure.legends[0].get_texts()] == [
-            "Finite SPD",
-            "Graph token",
-        ]
+        assert not hop_figure.legends
         pca_paths = save_figure_bundle(
             pca_figure,
             tmp_path,
@@ -1153,38 +1147,6 @@ def test_hop_attention_export_exactly_matches_paired_pca_canvas(
     finally:
         plt.close(pca_figure)
         plt.close(hop_figure)
-
-
-def test_hop_attention_footer_adapts_without_graph_token():
-    import matplotlib.pyplot as plt
-
-    finite_metrics = SimpleNamespace(
-        clean_attention_distance=np.asarray([[[0.2, 0.5, 0.3]]]),
-        distance_axis=("0", "1", "2"),
-    )
-    virtual_metrics = SimpleNamespace(
-        clean_attention_distance=np.asarray([[[0.2, 0.5, 0.3]]]),
-        distance_axis=("0", "1", "virtual"),
-    )
-    finite_figure = plot_hop_attention_mass(finite_metrics, (0, 0))
-    virtual_figure = plot_hop_attention_mass(virtual_metrics, (0, 0))
-    try:
-        np.testing.assert_allclose(
-            finite_figure.axes[0].get_xticks(),
-            (0.0, 1.0, 2.0),
-        )
-        assert not finite_figure.legends
-        assert [
-            text.get_text() for text in virtual_figure.legends[0].get_texts()
-        ] == ["Finite SPD", "Virtual node"]
-        assert (
-            virtual_figure.axes[0].get_xticks()[-1]
-            - virtual_figure.axes[0].get_xticks()[-2]
-            > 1.2
-        )
-    finally:
-        plt.close(finite_figure)
-        plt.close(virtual_figure)
 
 
 def test_pcqm_aligned_figure_dimensions():
@@ -1699,11 +1661,6 @@ def test_colab_notebook_has_valid_python_cells():
     assert "pca_figure = plot_av_pca(" in runtime_source
     assert "paired_figure_size = tuple(" in runtime_source
     assert "figsize=paired_figure_size" in runtime_source
-    assert 'd_rel=head_record["selectivity"]' in runtime_source
-    assert (
-        'joint_sensitivity=head_record["joint_sensitivity"]'
-        in runtime_source
-    )
     assert '"paired_PCA_figure_size_inches"' in runtime_source
     assert "Mean clean attention mass vs SPD" not in runtime_source
     assert "companion_heads = set(all_roles.values())" not in runtime_source
