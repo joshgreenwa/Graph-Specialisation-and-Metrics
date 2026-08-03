@@ -890,6 +890,24 @@ def methodology_config_for_artifact(
             f"reconstructed fingerprint {reconstructed})"
         )
 
+    if model_record is None:
+        artifact_path = getattr(artifact, "path", None)
+        adjacent_model_path = (
+            Path(artifact_path).parents[2] / "model.json"
+            if artifact_path is not None
+            else None
+        )
+        if adjacent_model_path is not None and adjacent_model_path.is_file():
+            try:
+                model_record = load_canonical_model_record(
+                    adjacent_model_path,
+                    artifact,
+                )
+            except (OSError, ValueError, StaleCacheError) as error:
+                checked.append(
+                    f"{adjacent_model_path} (invalid compatibility model: {error})"
+                )
+
     if model_record is not None:
         task_name = str(contract.get("task", ""))
         train_seed = int(contract.get("train_seed", -1))

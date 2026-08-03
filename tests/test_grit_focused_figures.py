@@ -739,12 +739,14 @@ def test_artifact_model_fallback_survives_shared_protocol_overwrite(
         "task_adapter_version": get_task(task_name).adapter_version,
         "splits": dataclasses.asdict(splits),
     }
+    model_path = raw_path.parents[2] / "model.json"
+    model_path.parent.mkdir(parents=True, exist_ok=True)
+    model_path.write_text(json.dumps(model_record), encoding="utf-8")
 
     restored, source, fingerprint = methodology_config_for_artifact(
         artifact,
         (tmp_path / "missing.json", root_path),
         accelerator="cpu",
-        model_record=model_record,
     )
 
     assert restored.tasks == (task_name,)
