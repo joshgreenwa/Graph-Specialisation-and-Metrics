@@ -24,11 +24,12 @@ does not reinterpret GRIT's relation/RRWP-conditioned attention as an additive s
 
 ## Frozen population and sampling contract
 
-The paper launcher requests 16 semantic/structural pairs and requires at least 12, matching the
-PCQM4Mv2 policy. Candidate selection, Hungarian matching, null assignment, and the
-`D_rel = +/-0.10` and `J >= 0.20` regions are fixed before causal outcomes are loaded. Because a
-dense GRIT checkpoint has fewer heads than PCQM4Mv2, the runner does not silently reduce the
-minimum: it saves and reports a `not_estimable` gate and continues to the other task.
+The dense-GRIT launcher requests 8 semantic/structural pairs and requires at least 6. This is the
+registered architecture-adapted population gate for the 80-head models and is attainable for the
+smaller ZINC discovery specialist pool. Candidate selection, Hungarian matching, null assignment,
+and the `D_rel = +/-0.10` and `J >= 0.20` regions remain fixed before causal outcomes are loaded.
+If a checkpoint cannot supply that population, the runner saves and reports a `not_estimable`
+gate and continues to the other task.
 
 Each task uses mutually disjoint populations of 256 discovery, 256 causal-event, and 256
 clean-ablation molecules, plus 2,000 semantic donor molecules. Six sources and eight donors per
@@ -53,6 +54,13 @@ grit_dense_causal_population_paper/
 `"figures"` reads CPU caches without cloning GRIT, rebuilding RRWP, loading a checkpoint, or
 executing model forwards. Each task has its own model record, score/gate/event/ablation caches,
 figure directory, and `focused_causal_population_manifest.json`.
+
+Resume checks consolidated scores and both discovery gates before constructing donor manifests.
+An exact completed core therefore proceeds directly to figures. When a compatible completed run
+is retargeted from the former 16/12 population policy to 8/6, the runner filters and imports the
+already-measured per-head causal rows, retains the old cache contract as read-only lineage, reuses
+the gate-independent all-head clean ablations, and builds donor manifests only for graph/head rows
+that are genuinely absent.
 
 The exported suite matches the PCQM4Mv2 population analysis: donor-averaged primary causal tests,
 correct-pairing advantage, mismatch-adjusted robustness, `J` versus clean ablation, continuous

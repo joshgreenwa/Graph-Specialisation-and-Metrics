@@ -437,23 +437,38 @@ def run_population_events(
     *,
     execution: FocusedExecution,
     analysis_version: str = POPULATION_CAUSAL_VERSION,
+    plan: Mapping[int, Mapping[str, Any]] | None = None,
+    cache: CanonicalCache | None = None,
+    graph_ids: Sequence[int] | None = None,
+    reuse_caches: Sequence[CanonicalCache] = (),
+    reuse_legacy: bool = True,
 ) -> tuple[list[dict[str, Any]], CanonicalCache, list[dict[str, Any]]]:
     """Reuse complete focused rows and compute only missing population heads."""
 
     execution.validate()
-    plan, cache = _population_cache(
-        prepared,
-        config,
-        population_gate,
-        analysis_version=analysis_version,
+    if cache is None:
+        if plan is not None:
+            raise ValueError("a supplied population plan requires its matching cache")
+        plan, cache = _population_cache(
+            prepared,
+            config,
+            population_gate,
+            analysis_version=analysis_version,
+        )
+    else:
+        plan = dict(plan or {})
+    selected_graph_ids = tuple(
+        sorted(int(graph_id) for graph_id in (graph_ids if graph_ids is not None else plan))
     )
-    _, legacy_cache = _focused_causal_cache(prepared, config, confidence_gate)
+    legacy_cache = None
+    if reuse_legacy:
+        _, legacy_cache = _focused_causal_cache(prepared, config, confidence_gate)
     targets = set(_target_heads(population_gate))
     rows: list[dict[str, Any]] = []
     audits: list[dict[str, Any]] = []
     if population_gate["status"] != "estimable":
         return rows, cache, audits
-    total_items = len(plan) * len(CHANNELS)
+    total_items = len(selected_graph_ids) * len(CHANNELS)
     completed_items = 0
     cache_hits = 0
     computed_items = 0
@@ -461,29 +476,77 @@ def run_population_events(
     if prepared.progress is not None:
         prepared.progress.emit(
             "population_causal_plan",
-            total_graphs=len(plan),
+            total_graphs=len(selected_graph_ids),
             total_graph_channels=total_items,
             total_heads=len(targets),
             head_batch_size=int(execution.head_batch_size),
             event_batch_size=int(execution.event_batch_size),
         )
-    for graph_id in sorted(plan):
+    for graph_id in selected_graph_ids:
         for channel in CHANNELS:
             stage = f"focused_population/events/{channel}"
             name = f"graph_{int(graph_id):06d}"
-            cached = (
-                cache.load(stage, name, strict=True) if config.resume and not config.force else None
-            )
+            reusable_payloads = []
+            for source_cache in reuse_caches:
+                try:
+                    reusable = source_cache.load(stage, name, strict=True)
+                except StaleCacheError:
+                    reusable = None
+                if reusable is not None:
+                    reusable_payloads.append(reusable)
+            cached = None
+            if not reusable_payloads and config.resume and not config.force:
+                cached = cache.load(stage, name, strict=True)
             was_cached = cached is not None
             did_compute = False
             if cached is None:
-                reused = _legacy_rows(
-                    legacy_cache.path(f"focused/events/{channel}", name),
-                    targets,
-                    expected_contract_fingerprint=legacy_cache.contract.fingerprint,
-                )
-                present = {_head_tuple(row["head"]) for row in reused}
+                reused: list[dict[str, Any]] = []
+                present: set[tuple[int, int]] = set()
+                audit_source: Mapping[str, Any] = {}
+                for reusable in reusable_payloads:
+                    available = {
+                        _head_tuple(row["head"])
+                        for row in reusable.get("rows", ())
+                    }
+                    accepted = (targets - present) & available
+                    if not accepted:
+                        continue
+                    reused.extend(
+                        dict(row)
+                        for row in reusable.get("rows", ())
+                        if _head_tuple(row["head"]) in accepted
+                    )
+                    present.update(accepted)
+                    if not audit_source:
+                        audit_source = reusable
+                if legacy_cache is not None and present != targets:
+                    legacy_rows = _legacy_rows(
+                        legacy_cache.path(f"focused/events/{channel}", name),
+                        targets - present,
+                        expected_contract_fingerprint=legacy_cache.contract.fingerprint,
+                    )
+                    legacy_heads = {_head_tuple(row["head"]) for row in legacy_rows}
+                    reused.extend(legacy_rows)
+                    present.update(legacy_heads)
                 missing = tuple(sorted(targets - present))
+                if missing and int(graph_id) not in plan:
+                    from .runner import _stage_plan
+
+                    plan.update(
+                        _stage_plan(
+                            prepared,
+                            config,
+                            "causal",
+                            graph_ids=(int(graph_id),),
+                            allow_empty=True,
+                        )
+                    )
+                if missing and int(graph_id) not in plan:
+                    log(
+                        "[population] skipped a causal graph with no source "
+                        f"estimable under both channels: {int(graph_id)}"
+                    )
+                    continue
                 measured = (
                     _causal_graph_channel(
                         prepared,
@@ -497,11 +560,19 @@ def run_population_events(
                     if missing
                     else {
                         "rows": [],
-                        "event_count": 0,
-                        "controlled_event_count": 0,
-                        "uncontrolled_event_count": 0,
-                        "clean_same_condition_patch_max": 0.0,
-                        "event_same_condition_patch_max": 0.0,
+                        "event_count": int(audit_source.get("event_count", 0)),
+                        "controlled_event_count": int(
+                            audit_source.get("controlled_event_count", 0)
+                        ),
+                        "uncontrolled_event_count": int(
+                            audit_source.get("uncontrolled_event_count", 0)
+                        ),
+                        "clean_same_condition_patch_max": float(
+                            audit_source.get("clean_same_condition_patch_max", 0.0)
+                        ),
+                        "event_same_condition_patch_max": float(
+                            audit_source.get("event_same_condition_patch_max", 0.0)
+                        ),
                     }
                 )
                 did_compute = bool(missing)
@@ -1127,14 +1198,25 @@ def run_population_analysis(
     *,
     execution: FocusedExecution,
     analysis_version: str = POPULATION_CAUSAL_VERSION,
+    plan: Mapping[int, Mapping[str, Any]] | None = None,
+    cache: CanonicalCache | None = None,
+    graph_ids: Sequence[int] | None = None,
+    reuse_caches: Sequence[CanonicalCache] = (),
+    reuse_legacy: bool = True,
+    clean_rows: Sequence[Mapping[str, Any]] | None = None,
+    clean_cache: CanonicalCache | None = None,
+    clean_cache_stage: str = "focused/clean_ablation",
 ) -> dict[str, Any]:
     execution.validate()
-    _, cache = _population_cache(
-        prepared,
-        config,
-        population_gate,
-        analysis_version=analysis_version,
-    )
+    if cache is None:
+        if plan is not None:
+            raise ValueError("a supplied population plan requires its matching cache")
+        plan, cache = _population_cache(
+            prepared,
+            config,
+            population_gate,
+            analysis_version=analysis_version,
+        )
     if config.resume and not config.force:
         cached = cache.load("focused_population", "core_tests", strict=True)
         if (
@@ -1163,6 +1245,11 @@ def run_population_analysis(
                 population_gate,
                 execution=execution,
                 analysis_version=analysis_version,
+                plan=plan,
+                cache=cache,
+                graph_ids=graph_ids,
+                reuse_caches=reuse_caches,
+                reuse_legacy=reuse_legacy,
             )
             raw_patch = _event_interval(
                 causal_rows,
@@ -1227,9 +1314,22 @@ def run_population_analysis(
         population_gate,
         execution=execution,
         analysis_version=analysis_version,
+        plan=plan,
+        cache=cache,
+        graph_ids=graph_ids,
+        reuse_caches=reuse_caches,
+        reuse_legacy=reuse_legacy,
     )
-    _, legacy_cache = _focused_causal_cache(prepared, config, confidence_gate)
-    clean_rows = _clean_ablation_graphs(prepared, config, legacy_cache, execution)
+    if clean_rows is None:
+        if clean_cache is None:
+            _, clean_cache = _focused_causal_cache(prepared, config, confidence_gate)
+        clean_rows = _clean_ablation_graphs(
+            prepared,
+            config,
+            clean_cache,
+            execution,
+            cache_stage=clean_cache_stage,
+        )
     core = aggregate_population_tests(
         causal_rows,
         clean_rows,

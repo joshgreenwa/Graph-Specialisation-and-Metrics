@@ -759,11 +759,26 @@ def _stage_plan(
     prepared: PreparedTask,
     config: MethodologyConfig,
     stage: str,
+    *,
+    graph_ids: Sequence[int] | None = None,
+    allow_empty: bool = False,
 ) -> dict[int, dict[str, Any]]:
     """Freeze source IDs and both independently drawn donor manifests before inference."""
 
     plan: dict[int, dict[str, Any]] = {}
-    for graph_id in _stage_ids(prepared, stage):
+    selected_ids = (
+        _stage_ids(prepared, stage)
+        if graph_ids is None
+        else tuple(int(graph_id) for graph_id in graph_ids)
+    )
+    allowed_ids = set(_stage_ids(prepared, stage))
+    unexpected = sorted(set(selected_ids) - allowed_ids)
+    if unexpected:
+        raise ValueError(
+            f"stage {stage!r} graph subset contains IDs outside its frozen split: "
+            f"{unexpected[:8]}"
+        )
+    for graph_id in selected_ids:
         base = prepared.grit.eval_ds[int(graph_id)]
         eligible_source_fn = getattr(prepared.backend, "eligible_sources", None)
         entry: dict[str, Any] = {}
@@ -901,7 +916,7 @@ def _stage_plan(
             )
             continue
         plan[int(graph_id)] = entry
-    if not plan:
+    if not plan and not allow_empty:
         # Nothing is estimable anywhere, so no stage quantity exists to report on.
         raise RuntimeError(
             f"stage {stage!r} retained no graph with a source estimable under both channels"

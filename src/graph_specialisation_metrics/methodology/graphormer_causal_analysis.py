@@ -696,6 +696,8 @@ def _clean_ablation_graphs(
     config: MethodologyConfig,
     cache: CanonicalCache,
     execution: FocusedExecution,
+    *,
+    cache_stage: str = "focused/clean_ablation",
 ) -> list[dict[str, Any]]:
     heads = _all_heads(prepared)
     rows: list[dict[str, Any]] = []
@@ -705,7 +707,7 @@ def _clean_ablation_graphs(
     for graph_id in graph_ids:
         name = f"graph_{int(graph_id):06d}"
         cached = (
-            cache.load("focused/clean_ablation", name, strict=True)
+            cache.load(cache_stage, name, strict=True)
             if config.resume and not config.force
             else None
         )
@@ -795,9 +797,7 @@ def _clean_ablation_graphs(
                 for position, head in enumerate(heads)
             ]
             payload = {"graph": int(graph_id), "rows": graph_rows}
-            cache.save(
-                "focused/clean_ablation", f"graph_{int(graph_id):06d}", payload
-            )
+            cache.save(cache_stage, f"graph_{int(graph_id):06d}", payload)
             rows.extend(graph_rows)
         completed_missing += len(selected_ids)
         elapsed = max(time.monotonic() - started, 1e-9)
