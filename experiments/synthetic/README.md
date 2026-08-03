@@ -79,6 +79,67 @@ python -m graph_specialisation_metrics.synthetic.rrwp_score_distance_comparison 
 The numerical interpretation and limits of this deliberately controlled result
 are in `chapter6_rrwp_score_distance_pilot.md`.
 
+This is an analytic scale/geometry control: it has no learned attention heads
+and imposes its carrier map. It must not be used as evidence about per-head
+score-distance organisation.
+
+## Learned RRWP-guided semantic relay
+
+`rrwp_semantic_relay.py` is the lightweight learned-head experiment for the
+Chapter 6 PE-mediation question. Two candidate values enter a three-node relay.
+A noisy candidate-degree cue is visible to one-step RRWP, while higher-order
+RRWP exposes which candidate belongs to a remotely closed cycle. Three
+parameter-matched 1-hop attention arms compare local RRWP, global RRWP, and a
+control in which the higher-order channels are shuffled independently of the
+cycle label.
+
+The experiment captures every native routed head output and computes exact
+semantic and structural projected scores by seed, layer, head, carrier, and
+shortest-path distance. Final-state Functional carriage is measured separately.
+The primary five-seed CPU run is still lightweight:
+
+```bash
+PYTHONPATH=src python -m graph_specialisation_metrics.synthetic.rrwp_semantic_relay \
+  --output-dir outputs/chapter6_rrwp_semantic_relay_s5_v2 \
+  --seeds 0,1,2,3,4 \
+  --local-clue-reliability 0.75
+```
+
+The robustness run changes only `--local-clue-reliability 0.90`. Saved
+measurements can be replotted without retraining using `--reanalyze-only`.
+The result and its later dose/null audit are in
+`chapter6_rrwp_semantic_relay_pilot.md`.
+
+## Molecular-sites RRWP follow-up
+
+`rrwp_molecular_sites.py` is an independent, molecular-inspired test of the
+same mechanism without the relay scaffold. A 37-node graph contains three
+reporter sites with scalar values, remotely open/closed arms, and a noisy local
+single/triple-bond proxy. The primary follow-up property mixes the local bond
+state and remote closure state equally; `--remote-target-weight 1` recovers the
+pure remote-selection stress test.
+Closure is five bonds from its reporter, beyond twice the two-layer message
+depth, while global RRWP makes that state visible on the same one-hop message
+support.
+
+Local, global, and shuffled-global arms have 10,065 parameters. The shuffled
+control preserves the true `I,P` channels and changes only higher-order RRWP.
+The analysis uses in-support symmetric sign flips for semantic interventions,
+fixed-support bond-order structural events, event-norm reporting, an ordinary
+all-node linear readout, seed-aware selection fidelity, architecture-level
+profile intervals, and a same-layer other-head alignment null.
+
+```bash
+PYTHONPATH=src python -m graph_specialisation_metrics.synthetic.rrwp_molecular_sites \
+  --output-dir outputs/chapter6_rrwp_molecular_sites_mixed50_s5_v1 \
+  --seeds 0,1,2,3,4 \
+  --remote-target-weight 0.5
+```
+
+Trained checkpoints and every raw event/head/distance table are retained.
+`--reanalyze-only` rebuilds all summaries and figures without retraining. The
+scientific comparison is in `chapter6_rrwp_molecular_sites_pilot.md`.
+
 ## Graph-native query routing with a hard behavioural oracle
 
 `analysis/query_routing_carriage_colab.py` is the implementation of the Chapter 6

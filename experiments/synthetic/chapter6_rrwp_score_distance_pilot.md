@@ -1,5 +1,10 @@
 # Chapter 6 synthetic iteration: RRWP performance versus score distance
 
+> **Superseded for learned-head claims.** This experiment uses an analytic gate
+> and a fixed carrier kernel. It remains a scale/identifiability control, but it
+> does not measure learned per-head score distance. The learned replacement is
+> `chapter6_rrwp_semantic_relay_pilot.md`.
+
 ## Decision
 
 This is a useful conceptual control and supports proceeding to the paired ZINC

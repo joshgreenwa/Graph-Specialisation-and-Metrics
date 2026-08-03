@@ -65,6 +65,7 @@ class Config:
     learning_rate: float = 3.0e-3
     weight_decay: float = 1.0e-4
     route_auxiliary_weight: float = 0.25
+    local_clue_reliability: float = 0.75
     bootstrap_replicates: int = 500
     data_seed: int = 53_011
 
@@ -90,6 +91,8 @@ class Config:
             raise ValueError("seeds must be non-empty and unique")
         if self.learning_rate <= 0 or self.weight_decay < 0:
             raise ValueError("optimizer settings are invalid")
+        if not 0.5 < self.local_clue_reliability < 1.0:
+            raise ValueError("local_clue_reliability must lie in (0.5,1)")
         if self.bootstrap_replicates < 100:
             raise ValueError("bootstrap_replicates must be at least 100")
 
@@ -245,8 +248,14 @@ def build_graph_types(config: Config) -> tuple[GraphType, ...]:
 def make_dataset(config: Config, *, count: int, seed: int) -> Dataset:
     rng = np.random.default_rng(int(seed))
     cycle_side = rng.integers(0, 2, size=int(count))
-    # 75% correct, evenly split between weak and strong cases.
-    category = rng.choice(4, size=int(count), p=(0.375, 0.375, 0.125, 0.125))
+    # Correct and incorrect examples are each evenly split between weak and
+    # strong local margins.
+    reliability = float(config.local_clue_reliability)
+    category = rng.choice(
+        4,
+        size=int(count),
+        p=(reliability / 2, reliability / 2, (1 - reliability) / 2, (1 - reliability) / 2),
+    )
     return Dataset(
         type_index=4 * cycle_side + category,
         values=rng.standard_normal((int(count), 2)).astype(np.float32),
@@ -638,6 +647,19 @@ def measure_scores_and_carriage(
             final_projected = torch.abs(
                 torch.sum((clean_final - event_final) * final_gradient, dim=-1)
             ).cpu().numpy()
+            signed_complete = torch.sum(
+                (clean_final - event_final) * final_gradient,
+                dim=(-1, -2),
+            )
+            with torch.no_grad():
+                event_prediction = _forward(model, event)
+            if not torch.allclose(
+                signed_complete,
+                prediction.detach() - event_prediction,
+                atol=2.0e-5,
+                rtol=2.0e-5,
+            ):
+                raise RuntimeError("final-state carriage does not reconstruct output movement")
             for graph_position in range(len(index)):
                 source = int(source_nodes[graph_position])
                 carrier_distance = distances[graph_position, source]
@@ -761,8 +783,16 @@ def summarise_intervals(
                 "profile_ci_width": profile_high - profile_low,
             }
         )
+    carriage_graph = (
+        carriage.groupby(
+            ["seed", "graph", "arm", "channel", "distance"], as_index=False
+        )["value"]
+        .mean()
+    )
     carriage_summary: list[dict[str, Any]] = []
-    for key, rows in carriage.groupby(["arm", "channel", "distance"], sort=True):
+    for key, rows in carriage_graph.groupby(
+        ["arm", "channel", "distance"], sort=True
+    ):
         point, low, high = _bootstrap_interval(
             rows,
             replicates=config.bootstrap_replicates,
@@ -827,7 +857,7 @@ def plot_core_questions(
     figure, axes = plt.subplots(2, 2, figsize=(10.5, 7.3))
     figure.subplots_adjust(left=0.08, right=0.985, bottom=0.10, top=0.87, wspace=0.28, hspace=0.38)
     figure.suptitle(
-        "Global RRWP improves learned semantic selection without a new carriage route",
+        "Learned RRWP relay: performance, head scores, and carriage",
         fontsize=14.5,
         y=0.97,
         color=TEXT,
@@ -1014,11 +1044,27 @@ def plot_score_distance(
 
 
 def plot_exact_head_heatmaps(
-    score_summary: pd.DataFrame,
+    score_distance: pd.DataFrame,
     config: Config,
 ) -> tuple[Path, Path]:
     _configure_style()
-    figure, axes = plt.subplots(2, 2, figsize=(10.3, 8.1), sharex=True, sharey=True)
+    head_profiles = (
+        score_distance.groupby(
+            ["seed", "arm", "channel", "layer", "head", "distance"]
+        )["value"]
+        .mean()
+        .reset_index()
+    )
+    seeds = sorted(int(seed) for seed in head_profiles["seed"].unique())
+    heads_per_seed = config.layers * config.heads
+    figure_height = max(8.1, 2.0 + 0.16 * heads_per_seed * len(seeds))
+    figure, axes = plt.subplots(
+        2,
+        2,
+        figsize=(10.3, figure_height),
+        sharex=True,
+        sharey=True,
+    )
     figure.subplots_adjust(
         left=0.12,
         right=0.92,
@@ -1033,24 +1079,26 @@ def plot_exact_head_heatmaps(
         y=0.97,
         color=TEXT,
     )
-    maximum = float(score_summary["mean"].max())
+    maximum = float(head_profiles["value"].max())
     image_handle = None
     for row, arm in enumerate(MEASURED_ARMS):
         for column, channel in enumerate(CHANNELS):
             axis = axes[row, column]
             _panel_label(axis, chr(ord("a") + 2 * row + column))
-            selected = score_summary[
-                (score_summary["arm"] == arm)
-                & (score_summary["channel"] == channel)
+            selected = head_profiles[
+                (head_profiles["arm"] == arm)
+                & (head_profiles["channel"] == channel)
             ].copy()
             selected["head_index"] = (
-                selected["layer"].astype(int) * config.heads
+                selected["seed"].map({seed: index for index, seed in enumerate(seeds)})
+                * heads_per_seed
+                + selected["layer"].astype(int) * config.heads
                 + selected["head"].astype(int)
             )
             matrix = selected.pivot(
-                index="head_index", columns="distance", values="mean"
+                index="head_index", columns="distance", values="value"
             ).reindex(
-                index=range(config.layers * config.heads),
+                index=range(heads_per_seed * len(seeds)),
                 columns=range(config.layers + 1),
                 fill_value=0.0,
             )
@@ -1065,11 +1113,20 @@ def plot_exact_head_heatmaps(
             axis.set_title(f"{arm.capitalize()} RRWP — {channel}")
             axis.set_xticks(range(config.layers + 1))
             labels = [
-                f"L{layer + 1}H{head + 1}"
+                f"S{seed}·L{layer + 1}H{head + 1}"
+                for seed in seeds
                 for layer in range(config.layers)
                 for head in range(config.heads)
             ]
             axis.set_yticks(range(len(labels)), labels)
+            axis.tick_params(axis="y", labelsize=5.5)
+            for seed_boundary in range(1, len(seeds)):
+                axis.axhline(
+                    seed_boundary * heads_per_seed - 0.5,
+                    color="white",
+                    linewidth=0.45,
+                    alpha=0.65,
+                )
             if row == 1:
                 axis.set_xlabel("source-to-carrier distance")
             if column == 0:
@@ -1080,6 +1137,295 @@ def plot_exact_head_heatmaps(
     figures = config.output_dir / "figures"
     png = figures / "03_exact_per_head_score_distance.png"
     pdf = figures / "03_exact_per_head_score_distance.pdf"
+    figure.savefig(png, dpi=240, bbox_inches="tight")
+    figure.savefig(pdf, bbox_inches="tight")
+    plt.close(figure)
+    return png, pdf
+
+
+def plot_reliability_sensitivity(
+    run_directories: Sequence[Path],
+    output_directory: Path,
+) -> tuple[Path, Path]:
+    """Compare completed runs that differ only in local-cue reliability."""
+    records: list[dict[str, Any]] = []
+    for directory in run_directories:
+        with (directory / "summary.json").open(encoding="utf-8") as handle:
+            payload = json.load(handle)
+        reliability = float(payload["config"].get("local_clue_reliability", 0.75))
+        records.append(
+            {
+                "reliability": reliability,
+                "results": payload["results"],
+            }
+        )
+    records.sort(key=lambda record: record["reliability"])
+    if len(records) < 2:
+        raise ValueError("sensitivity comparison needs at least two completed runs")
+
+    reliability = np.asarray(
+        [record["reliability"] for record in records], dtype=float
+    )
+    _configure_style()
+    figure, axes = plt.subplots(2, 2, figsize=(10.5, 7.3))
+    figure.subplots_adjust(
+        left=0.09,
+        right=0.985,
+        bottom=0.10,
+        top=0.87,
+        wspace=0.30,
+        hspace=0.40,
+    )
+    figure.suptitle(
+        "Robustness to the quality of the local structural cue",
+        fontsize=14.5,
+        y=0.97,
+        color=TEXT,
+    )
+    figure.text(
+        0.5,
+        0.92,
+        "Only cue reliability changes; architecture, parameter count, data size, and optimization are fixed",
+        ha="center",
+        fontsize=9.0,
+        color=GREY,
+    )
+
+    axis = axes[0, 0]
+    _panel_label(axis, "a")
+    for arm in ARMS:
+        values = [
+            record["results"]["performance"][arm]["test_mse"]
+            for record in records
+        ]
+        axis.plot(
+            reliability,
+            values,
+            marker="o" if arm == "local" else "s",
+            color=ARM_COLOURS[arm],
+            linewidth=1.8,
+            label=arm.replace("_", " "),
+        )
+    axis.set_title("Global advantage persists as the local cue improves")
+    axis.set_ylabel("held-out MSE")
+    axis.set_ylim(bottom=0.0)
+    axis.legend(frameon=False, loc="best")
+    _clean_axis(axis)
+
+    axis = axes[0, 1]
+    _panel_label(axis, "b")
+    for arm in MEASURED_ARMS:
+        for channel in CHANNELS:
+            values = [
+                record["results"]["head_scores"][arm][f"{channel}_raw_mean"]
+                for record in records
+            ]
+            axis.plot(
+                reliability,
+                values,
+                marker=CHANNEL_MARKERS[channel],
+                linestyle="-" if arm == "local" else "--",
+                color=ARM_COLOURS[arm],
+                linewidth=1.8,
+                label=f"{arm} {channel}",
+            )
+    axis.set_title("Raw score separation is stable")
+    axis.set_ylabel("mean raw head score")
+    axis.set_ylim(bottom=0.0)
+    axis.legend(frameon=False, loc="best", ncols=2, fontsize=7.3)
+    _clean_axis(axis)
+
+    axis = axes[1, 0]
+    _panel_label(axis, "c")
+    for channel in CHANNELS:
+        values = [
+            record["results"]["distance"][channel][
+                "carriage_profile_total_variation"
+            ]
+            for record in records
+        ]
+        axis.plot(
+            reliability,
+            values,
+            marker=CHANNEL_MARKERS[channel],
+            color=BLUE if channel == "semantic" else ORANGE,
+            linewidth=1.8,
+            label=channel,
+        )
+    axis.set_title("Carriage geometry can converge (0 = exact match)")
+    axis.set_ylabel("local/global profile TV")
+    axis.set_ylim(bottom=0.0)
+    axis.legend(frameon=False, loc="best")
+    _clean_axis(axis)
+
+    axis = axes[1, 1]
+    _panel_label(axis, "d")
+    axis.axhline(1.0, color=GREY, linewidth=1.0, linestyle=":")
+    for channel in CHANNELS:
+        values = [
+            record["results"]["distance"][channel][
+                "score_profile_ci_width_ratio_local_over_global"
+            ]
+            for record in records
+        ]
+        axis.plot(
+            reliability,
+            values,
+            marker=CHANNEL_MARKERS[channel],
+            color=BLUE if channel == "semantic" else ORANGE,
+            linewidth=1.8,
+            label=channel,
+        )
+    axis.set_title("Local score intervals are not wider")
+    axis.set_ylabel("profile interval width: local / global")
+    axis.set_ylim(bottom=0.0)
+    axis.legend(frameon=False, loc="best")
+    _clean_axis(axis)
+
+    for axis in axes[1, :]:
+        axis.set_xlabel("probability local cue is correct")
+    for axis in axes.flat:
+        axis.set_xticks(reliability)
+        axis.set_xticklabels([f"{value:.2f}" for value in reliability])
+
+    figures = output_directory / "figures"
+    figures.mkdir(parents=True, exist_ok=True)
+    png = figures / "04_local_cue_reliability_sensitivity.png"
+    pdf = figures / "04_local_cue_reliability_sensitivity.pdf"
+    figure.savefig(png, dpi=240, bbox_inches="tight")
+    figure.savefig(pdf, bbox_inches="tight")
+    plt.close(figure)
+    return png, pdf
+
+
+def plot_mediation_alignment(
+    run_directories: Sequence[Path],
+    output_directory: Path,
+) -> tuple[Path, Path]:
+    """Show whether semantic and structural distance profiles align per seed."""
+    records: list[dict[str, Any]] = []
+    for directory in run_directories:
+        with (directory / "summary.json").open(encoding="utf-8") as handle:
+            payload = json.load(handle)
+        reliability = float(payload["config"].get("local_clue_reliability", 0.75))
+        scores = pd.read_csv(directory / "score_distance_per_graph.csv")
+        profiles = (
+            scores.groupby(["seed", "arm", "layer", "head", "channel", "distance"])[
+                "value"
+            ]
+            .mean()
+            .reset_index()
+        )
+        for (seed, arm), seed_rows in profiles.groupby(["seed", "arm"]):
+            cosines: list[float] = []
+            peak_matches: list[float] = []
+            for (_, _), head_rows in seed_rows.groupby(["layer", "head"]):
+                channel_profiles = {
+                    channel: head_rows[head_rows["channel"] == channel]
+                    .sort_values("distance")["value"]
+                    .to_numpy()
+                    for channel in CHANNELS
+                }
+                semantic = channel_profiles["semantic"]
+                structural = channel_profiles["structural"]
+                denominator = float(
+                    np.linalg.norm(semantic) * np.linalg.norm(structural)
+                )
+                if denominator > 1.0e-12:
+                    cosines.append(float(np.dot(semantic, structural) / denominator))
+                peak_matches.append(float(np.argmax(semantic) == np.argmax(structural)))
+            records.append(
+                {
+                    "reliability": reliability,
+                    "seed": int(seed),
+                    "arm": str(arm),
+                    "cosine": float(np.mean(cosines)),
+                    "peak_match": float(np.mean(peak_matches)),
+                }
+            )
+    table = pd.DataFrame(records).sort_values(["reliability", "seed", "arm"])
+    reliabilities = sorted(float(value) for value in table["reliability"].unique())
+    _configure_style()
+    figure, axes = plt.subplots(1, 2, figsize=(10.5, 4.2))
+    figure.subplots_adjust(
+        left=0.08,
+        right=0.985,
+        bottom=0.20,
+        top=0.79,
+        wspace=0.30,
+    )
+    figure.suptitle(
+        "Does global RRWP improve structural–semantic mediation alignment?",
+        fontsize=14.5,
+        y=0.97,
+        color=TEXT,
+    )
+    figure.text(
+        0.5,
+        0.88,
+        "Each line pairs local and global models for one training seed; metrics use every learned head",
+        ha="center",
+        fontsize=9.0,
+        color=GREY,
+    )
+    metrics = (
+        ("cosine", "Mean profile cosine", "Distance profiles align more under global RRWP"),
+        ("peak_match", "Fraction with same peak distance", "Peak distance agrees more often under global RRWP"),
+    )
+    positions: dict[tuple[float, str], float] = {}
+    labels: list[str] = []
+    tick_positions: list[float] = []
+    for reliability_index, reliability in enumerate(reliabilities):
+        base = reliability_index * 2.7
+        for arm_index, arm in enumerate(MEASURED_ARMS):
+            position = base + arm_index
+            positions[(reliability, arm)] = position
+            tick_positions.append(position)
+            labels.append(f"{arm}\nr={reliability:.2f}")
+    for panel, (metric, ylabel, title) in enumerate(metrics):
+        axis = axes[panel]
+        _panel_label(axis, "a" if panel == 0 else "b")
+        for reliability in reliabilities:
+            selected = table[table["reliability"] == reliability]
+            pivot = selected.pivot(index="seed", columns="arm", values=metric)
+            local_x = positions[(reliability, "local")]
+            global_x = positions[(reliability, "global")]
+            for _, row in pivot.iterrows():
+                axis.plot(
+                    [local_x, global_x],
+                    [row["local"], row["global"]],
+                    color=LIGHT_GREY,
+                    linewidth=1.0,
+                    zorder=1,
+                )
+            for arm, position in (("local", local_x), ("global", global_x)):
+                values = pivot[arm].to_numpy()
+                axis.scatter(
+                    np.full(len(values), position),
+                    values,
+                    color=ARM_COLOURS[arm],
+                    s=26,
+                    zorder=2,
+                )
+                axis.hlines(
+                    float(values.mean()),
+                    position - 0.20,
+                    position + 0.20,
+                    color=TEXT,
+                    linewidth=1.5,
+                    zorder=3,
+                )
+        axis.set_xticks(tick_positions, labels)
+        axis.set_ylabel(ylabel)
+        axis.set_title(title)
+        axis.set_ylim(0.0, 1.0)
+        _clean_axis(axis)
+
+    figures = output_directory / "figures"
+    figures.mkdir(parents=True, exist_ok=True)
+    png = figures / "05_semantic_structural_alignment.png"
+    pdf = figures / "05_semantic_structural_alignment.pdf"
+    table.to_csv(output_directory / "mediation_alignment_by_seed.csv", index=False)
     figure.savefig(png, dpi=240, bbox_inches="tight")
     figure.savefig(pdf, bbox_inches="tight")
     plt.close(figure)
@@ -1113,6 +1459,7 @@ def _head_summary(head_scores: pd.DataFrame) -> pd.DataFrame:
 def _summary_payload(
     performance: pd.DataFrame,
     head_summary: pd.DataFrame,
+    score_distance: pd.DataFrame,
     score_summary: pd.DataFrame,
     carriage_summary: pd.DataFrame,
 ) -> dict[str, Any]:
@@ -1134,14 +1481,20 @@ def _summary_payload(
             "semantic_leaning_fraction": float(counts.get("semantic-leaning", 0.0)),
             "structural_leaning_fraction": float(counts.get("structural-leaning", 0.0)),
         }
-        distance_rows = score_summary[score_summary["arm"] == arm]
+        distance_rows = (
+            score_distance[score_distance["arm"] == arm]
+            .groupby(["seed", "layer", "head", "channel", "distance"])["value"]
+            .mean()
+            .reset_index()
+        )
         peak_matches: list[float] = []
         profile_cosines: list[float] = []
-        for (layer, head), head_distance in distance_rows.groupby(["layer", "head"]):
-            del layer, head
+        for (_, _, _), head_distance in distance_rows.groupby(
+            ["seed", "layer", "head"]
+        ):
             profiles = {
                 channel: head_distance[head_distance["channel"] == channel]
-                .sort_values("distance")["mean"]
+                .sort_values("distance")["value"]
                 .to_numpy()
                 for channel in CHANNELS
             }
@@ -1274,17 +1627,65 @@ def run(config: Config) -> dict[str, Any]:
     figures = [
         *plot_core_questions(performance, head_scores, carriage_summary, config),
         *plot_score_distance(score_summary, config),
-        *plot_exact_head_heatmaps(score_summary, config),
+        *plot_exact_head_heatmaps(score_distance, config),
     ]
     summary = {
         "config": {**asdict(config), "output_dir": str(config.output_dir)},
         "results": _summary_payload(
-            performance, head_summary, score_summary, carriage_summary
+            performance,
+            head_summary,
+            score_distance,
+            score_summary,
+            carriage_summary,
         ),
         "health": health,
         "figures": [str(path) for path in figures],
     }
     with (config.output_dir / "summary.json").open("w", encoding="utf-8") as handle:
+        json.dump(summary, handle, indent=2)
+        handle.write("\n")
+    return summary
+
+
+def reanalyze_output(output_directory: Path) -> dict[str, Any]:
+    """Regenerate summaries and figures from saved measurements, without training."""
+    with (output_directory / "summary.json").open(encoding="utf-8") as handle:
+        previous = json.load(handle)
+    config_payload = dict(previous["config"])
+    config_payload["output_dir"] = output_directory
+    config_payload["seeds"] = tuple(int(seed) for seed in config_payload["seeds"])
+    config = Config(**config_payload)
+    performance = pd.read_csv(output_directory / "performance.csv")
+    score_distance = pd.read_csv(output_directory / "score_distance_per_graph.csv")
+    carriage = pd.read_csv(output_directory / "carriage_distance_per_graph.csv")
+    head_scores = pd.read_csv(output_directory / "head_scores_per_graph.csv")
+    score_summary, carriage_summary = summarise_intervals(
+        score_distance, carriage, config
+    )
+    head_summary = _head_summary(head_scores)
+    score_summary.to_csv(output_directory / "score_distance_summary.csv", index=False)
+    carriage_summary.to_csv(
+        output_directory / "carriage_distance_summary.csv", index=False
+    )
+    head_summary.to_csv(output_directory / "head_scores_summary.csv", index=False)
+    figures = [
+        *plot_core_questions(performance, head_scores, carriage_summary, config),
+        *plot_score_distance(score_summary, config),
+        *plot_exact_head_heatmaps(score_distance, config),
+    ]
+    summary = {
+        "config": {**asdict(config), "output_dir": str(config.output_dir)},
+        "results": _summary_payload(
+            performance,
+            head_summary,
+            score_distance,
+            score_summary,
+            carriage_summary,
+        ),
+        "health": previous["health"],
+        "figures": [str(path) for path in figures],
+    }
+    with (output_directory / "summary.json").open("w", encoding="utf-8") as handle:
         json.dump(summary, handle, indent=2)
         handle.write("\n")
     return summary
@@ -1303,7 +1704,13 @@ def main(argv: Sequence[str] | None = None) -> dict[str, Any]:
     parser.add_argument("--test-examples", type=int, default=1_024)
     parser.add_argument("--measurement-examples", type=int, default=192)
     parser.add_argument("--bootstrap-replicates", type=int, default=500)
+    parser.add_argument("--local-clue-reliability", type=float, default=0.75)
+    parser.add_argument("--reanalyze-only", action="store_true")
     args = parser.parse_args(argv)
+    if args.reanalyze_only:
+        result = reanalyze_output(args.output_dir)
+        print(json.dumps(result, indent=2))
+        return result
     config = Config(
         output_dir=args.output_dir,
         seeds=tuple(int(value) for value in args.seeds.split(",") if value),
@@ -1312,6 +1719,7 @@ def main(argv: Sequence[str] | None = None) -> dict[str, Any]:
         test_examples=int(args.test_examples),
         measurement_examples=int(args.measurement_examples),
         bootstrap_replicates=int(args.bootstrap_replicates),
+        local_clue_reliability=float(args.local_clue_reliability),
     )
     result = run(config)
     print(json.dumps(result, indent=2))
