@@ -946,9 +946,14 @@ def _canonical_head_activity(
     score: Mapping[str, Any], shape: tuple[int, int]
 ) -> tuple[np.ndarray, np.ndarray]:
     coordinates = score.get("coordinates")
-    if not isinstance(coordinates, Mapping) or "joint_sensitivity" not in coordinates:
-        raise KeyError("canonical score cache is missing coordinates.joint_sensitivity")
-    joint = _as_numpy(coordinates["joint_sensitivity"])
+    if coordinates is None:
+        raise KeyError("canonical score cache is missing coordinates")
+    try:
+        joint = _as_numpy(_field(coordinates, "joint_sensitivity"))
+    except (AttributeError, KeyError) as error:
+        raise KeyError(
+            "canonical score cache is missing coordinates.joint_sensitivity"
+        ) from error
     if joint.shape != shape:
         raise ValueError(
             f"joint-sensitivity shape {joint.shape} does not match head shape {shape}"
@@ -956,7 +961,10 @@ def _canonical_head_activity(
     if np.any(joint[np.isfinite(joint)] < -1.0e-10):
         raise ValueError("canonical joint sensitivity must be non-negative")
     joint = np.maximum(joint, 0.0)
-    active_value = coordinates.get("active")
+    try:
+        active_value = _field(coordinates, "active")
+    except (AttributeError, KeyError):
+        active_value = None
     active = (
         np.isfinite(joint) & (joint > 0.0)
         if active_value is None

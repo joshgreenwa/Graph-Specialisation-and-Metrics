@@ -1,5 +1,6 @@
 import csv
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -287,6 +288,7 @@ def test_layerwise_alignment_summarises_consistency_and_low_outliers(tmp_path):
     joint_sensitivity[:, 7] = 9.0
     score["coordinates"]["joint_sensitivity"] = joint_sensitivity
     score["coordinates"]["active"] = np.ones((2, 8), dtype=bool)
+    score["coordinates"] = SimpleNamespace(**score["coordinates"])
 
     rows = head_profile_alignment_rows([model])
     assert len(rows) == 2 * 2 * 8
