@@ -318,6 +318,10 @@ print(
     "[scope] Activity-weighted overlap uses each head's cached canonical joint sensitivity "
     "J and is reported beside the ordinary headwise median."
 )
+print(
+    "[scope] Per-head expected-distance heatmaps use normalized score mass over reportable "
+    "molecular bins; virtual carriers remain separate."
+)
 print(f"[scope] Output directory: {OUTPUT_DIR}")
 try:
     result = run(
@@ -445,6 +449,34 @@ display(
             "joint_sensitivity_share_overlap_below_0_8",
         ],
     ]
+)
+print("Heads with the largest semantic–structural expected-distance separation")
+expected_distance_table = pd.read_csv(
+    OUTPUT_DIR / "head_expected_score_distance.csv"
+)
+expected_score_mass = expected_distance_table.loc[
+    expected_distance_table["profile_kind"] == "score_mass"
+].copy()
+expected_score_mass["absolute_expected_distance_gap"] = expected_score_mass[
+    "structural_minus_semantic_expected_distance"
+].abs()
+display(
+    expected_score_mass.loc[
+        :,
+        [
+            "task",
+            "layer",
+            "head",
+            "semantic_expected_molecular_distance",
+            "structural_expected_molecular_distance",
+            "structural_minus_semantic_expected_distance",
+            "absolute_expected_distance_gap",
+            "joint_sensitivity",
+            "active",
+        ],
+    ]
+    .sort_values("absolute_expected_distance_gap", ascending=False)
+    .head(20)
 )
 for path in result["figures"]:
     if str(path).endswith(".png") and Path(path).is_file():

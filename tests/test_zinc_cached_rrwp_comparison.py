@@ -18,6 +18,7 @@ from graph_specialisation_metrics.zinc_cached_rrwp_comparison import (
     cache_inventory,
     carriage_profile,
     group_distance,
+    head_expected_distance_rows,
     head_profile_alignment_rows,
     head_profile_distance_decomposition_rows,
     load_compatible_cache_artifact_file,
@@ -311,6 +312,23 @@ def test_layerwise_alignment_summarises_consistency_and_low_outliers(tmp_path):
     assert mass_layer_zero[
         "joint_sensitivity_share_overlap_below_0_7"
     ] == pytest.approx(9.0 / 16.0)
+    expected_rows = head_expected_distance_rows(rows)
+    displaced_expected = next(
+        row
+        for row in expected_rows
+        if row["profile_kind"] == "score_mass"
+        and row["layer"] == 0
+        and row["head"] == 7
+    )
+    assert displaced_expected["semantic_expected_molecular_distance"] == pytest.approx(
+        0.0
+    )
+    assert displaced_expected[
+        "structural_expected_molecular_distance"
+    ] == pytest.approx(2.0)
+    assert displaced_expected[
+        "structural_minus_semantic_expected_distance"
+    ] == pytest.approx(2.0)
     assert {
         (row["profile_kind"], row["layer"], row["head"])
         for row in outliers
@@ -432,6 +450,7 @@ def test_fast_run_writes_tables_and_aligned_figures(tmp_path, monkeypatch):
     assert (output / "vnode_profile_alignment.csv").is_file()
     assert (output / "vnode_profile_alignment_layerwise.csv").is_file()
     assert (output / "head_profile_activity_weighted_overlap.csv").is_file()
+    assert (output / "head_expected_score_distance.csv").is_file()
     assert not (output / "head_profile_alignment_permutation.csv").exists()
     assert (output / "cache/head_profile_alignment.json").is_file()
     assert (output / "summary.json").is_file()
@@ -450,5 +469,5 @@ def test_fast_run_writes_tables_and_aligned_figures(tmp_path, monkeypatch):
     )
     assert cache_path == output / "cache/head_profile_alignment.json"
     assert cache_status == "hit"
-    assert len(result["figures"]) == 12
+    assert len(result["figures"]) == 16
     assert all(Path(path).is_file() for path in result["figures"])

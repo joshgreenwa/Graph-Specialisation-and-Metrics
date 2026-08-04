@@ -35,7 +35,7 @@ from .methodology.grit_figure_data import (
 )
 from .methodology.protocol import PROTOCOL_VERSION, stable_hash
 
-ANALYSIS_VERSION = "zinc-cached-rrwp-comparison-v5"
+ANALYSIS_VERSION = "zinc-cached-rrwp-comparison-v6"
 ALIGNMENT_CACHE_VERSION = "zinc-head-profile-colocalization-v4"
 SUPPORTED_CACHE_PROTOCOLS = (
     "donor-swap-specialisation-carriage-v3",
@@ -1425,6 +1425,34 @@ def summarise_head_profile_alignment(
     return output
 
 
+def head_expected_distance_rows(
+    rows: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Expose each head's semantic and structural molecular score centroid."""
+
+    output: list[dict[str, Any]] = []
+    for row in rows:
+        semantic = float(row["semantic_centroid"])
+        structural = float(row["structural_centroid"])
+        output.append(
+            {
+                "task": str(row["task"]),
+                "profile_kind": str(row["profile_kind"]),
+                "layer": int(row["layer"]),
+                "head": int(row["head"]),
+                "semantic_expected_molecular_distance": semantic,
+                "structural_expected_molecular_distance": structural,
+                "structural_minus_semantic_expected_distance": structural
+                - semantic,
+                "semantic_score_mass": float(row["semantic_mass"]),
+                "structural_score_mass": float(row["structural_mass"]),
+                "joint_sensitivity": float(row["joint_sensitivity"]),
+                "active": bool(row["active"]),
+            }
+        )
+    return output
+
+
 def summarise_layerwise_head_profile_alignment(
     rows: Sequence[Mapping[str, Any]],
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -2476,6 +2504,111 @@ def _plot_activity_weighted_profile_overlap(
     return [png, pdf]
 
 
+def _plot_per_head_expected_score_distance(
+    records: Sequence[Mapping[str, Any]],
+    expected_rows: Sequence[Mapping[str, Any]],
+    output_dir: Path,
+) -> list[Path]:
+    import matplotlib.pyplot as plt
+
+    score_rows = [
+        row for row in expected_rows if str(row["profile_kind"]) == "score_mass"
+    ]
+    tasks = [
+        str(record["task"])
+        for record in records
+        if any(str(row["task"]) == str(record["task"]) for row in score_rows)
+    ]
+    if not tasks:
+        return []
+    finite_distances = np.asarray(
+        [
+            float(row[field])
+            for row in score_rows
+            for field in (
+                "semantic_expected_molecular_distance",
+                "structural_expected_molecular_distance",
+            )
+            if np.isfinite(float(row[field]))
+        ],
+        dtype=np.float64,
+    )
+    distance_upper = max(float(np.max(finite_distances)), 1.0)
+    figures_dir = output_dir / "figures"
+    figures_dir.mkdir(parents=True, exist_ok=True)
+    paths: list[Path] = []
+    for figure_number, channel, title in (
+        ("07", "semantic", "Semantic score"),
+        ("08", "structural", "Structural score"),
+    ):
+        field = f"{channel}_expected_molecular_distance"
+        figure, axes = plt.subplots(
+            1,
+            len(tasks),
+            figsize=(3.15 * len(tasks) + 1.1, 4.9),
+            squeeze=False,
+            sharey=True,
+            constrained_layout=True,
+        )
+        image = None
+        for column, task in enumerate(tasks):
+            axis = axes[0, column]
+            selected = [row for row in score_rows if str(row["task"]) == task]
+            layers = sorted({int(row["layer"]) for row in selected})
+            heads = sorted({int(row["head"]) for row in selected})
+            layer_index = {layer: index for index, layer in enumerate(layers)}
+            head_index = {head: index for index, head in enumerate(heads)}
+            matrix = np.full((len(layers), len(heads)), np.nan, dtype=np.float64)
+            for row in selected:
+                matrix[
+                    layer_index[int(row["layer"])],
+                    head_index[int(row["head"])],
+                ] = float(row[field])
+            image = axis.imshow(
+                np.ma.masked_invalid(matrix),
+                aspect="auto",
+                interpolation="nearest",
+                cmap="viridis",
+                vmin=0.0,
+                vmax=distance_upper,
+            )
+            axis.set_xticks(np.arange(len(heads)), [str(head) for head in heads])
+            axis.set_yticks(np.arange(len(layers)), [str(layer) for layer in layers])
+            axis.set_xlabel("head")
+            if column == 0:
+                axis.set_ylabel("layer")
+            axis.set_title(TASK_LABELS.get(task, task).replace("\n", " "))
+        if image is not None:
+            colourbar = figure.colorbar(
+                image,
+                ax=axes,
+                fraction=0.022,
+                pad=0.015,
+            )
+            colourbar.set_label("expected molecular graph distance")
+        figure.suptitle(
+            f"ZINC cached canonical analysis: per-head {title.lower()} distance",
+            fontsize=15,
+        )
+        figure.text(
+            0.5,
+            -0.01,
+            f"Each cell is the expected molecular distance under that head's normalized "
+            f"{channel} score-mass profile. Non-reportable bins are excluded; the virtual "
+            "carrier has no molecular graph distance and is analysed separately.",
+            ha="center",
+            fontsize=8.5,
+        )
+        stem = f"{figure_number}_{channel}_head_expected_distance"
+        png = figures_dir / f"{stem}.png"
+        pdf = figures_dir / f"{stem}.pdf"
+        figure.savefig(png, dpi=220, bbox_inches="tight")
+        figure.savefig(pdf, bbox_inches="tight")
+        plt.close(figure)
+        paths.extend((png, pdf))
+    return paths
+
+
 def run(
     roots: Sequence[Path],
     output_dir: Path,
@@ -2573,6 +2706,7 @@ def run(
         {field: row[field] for field in activity_alignment_fields}
         for row in alignment_layer_rows
     ]
+    expected_distance_rows = head_expected_distance_rows(alignment_rows)
     summary_rows = [
         {
             key: value
@@ -2620,6 +2754,7 @@ def run(
         "vnode_profile_alignment.csv": vnode_rows,
         "vnode_profile_alignment_layerwise.csv": vnode_layer_rows,
         "head_profile_activity_weighted_overlap.csv": activity_alignment_rows,
+        "head_expected_score_distance.csv": expected_distance_rows,
     }
     for name, rows in tables.items():
         log("table", f"{name}: {len(rows)} rows")
@@ -2709,6 +2844,20 @@ def run(
             "ZINC cache analysis failed while plotting activity-weighted overlap: "
             f"{type(error).__name__}: {error}"
         ) from error
+    log("figure", "07-08_per_head_expected_score_distance")
+    try:
+        figures.extend(
+            _plot_per_head_expected_score_distance(
+                records,
+                expected_distance_rows,
+                output_dir,
+            )
+        )
+    except Exception as error:
+        raise RuntimeError(
+            "ZINC cache analysis failed while plotting per-head expected distances: "
+            f"{type(error).__name__}: {error}"
+        ) from error
     result = {
         "analysis_version": ANALYSIS_VERSION,
         "train_seed": int(train_seed),
@@ -2725,6 +2874,7 @@ def run(
             "distance_decomposition": alignment_distance_layer_rows,
             "vnode_layerwise": vnode_layer_rows,
             "activity_weighted_layerwise": activity_alignment_rows,
+            "head_expected_distance": expected_distance_rows,
         },
         "cache_compatibility": {
             "protocols": protocols,
@@ -2766,6 +2916,10 @@ def run(
             "activity_weighted_overlap": (
                 "within-head profile overlap weighted by canonical joint sensitivity J; "
                 "reported beside the ordinary headwise mean and median"
+            ),
+            "per_head_expected_distance": (
+                "score-mass-weighted expected molecular graph distance within each head "
+                "and channel; virtual carriers remain a separate non-molecular category"
             ),
             "profile_precision": (
                 "cached exact-distance marginal 95% interval width divided by total "
