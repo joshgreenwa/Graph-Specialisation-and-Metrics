@@ -21,6 +21,7 @@ from graph_specialisation_metrics.zinc_cached_rrwp_comparison import (
     head_expected_distance_rows,
     head_profile_alignment_rows,
     head_profile_distance_decomposition_rows,
+    head_spatial_width_rows,
     load_compatible_cache_artifact_file,
     load_or_compute_head_profile_alignment,
     run,
@@ -29,6 +30,7 @@ from graph_specialisation_metrics.zinc_cached_rrwp_comparison import (
     summarise_layerwise_distance_decomposition,
     summarise_layerwise_head_profile_alignment,
     summarise_layerwise_vnode_profiles,
+    summarise_spatial_width_alignment,
     vnode_profile_rows,
 )
 
@@ -389,6 +391,65 @@ def test_vnode_diagnostic_removes_and_renormalizes_virtual_bin(tmp_path):
     assert layerwise[0]["molecular_minus_full_overlap_median"] == pytest.approx(0.25)
 
 
+def test_spatial_width_distinguishes_broad_profiles_with_the_same_centroid(tmp_path):
+    model = _model(tmp_path, "zinc_1hop", include_virtual=False)
+    width = len(model.score["axis"])
+    semantic = np.zeros((2, 2, width), dtype=np.float64)
+    structural = np.zeros_like(semantic)
+    semantic[..., 1] = 1.0
+    structural[..., 1] = 1.0
+    semantic[0, 0] = 0.0
+    semantic[0, 0, 0] = 0.5
+    semantic[0, 0, 2] = 0.5
+    for field in ("heatmap_exact_head", "heatmap_per_opportunity_head"):
+        model.score["channels"]["semantic"][field] = semantic.copy()
+        model.score["channels"]["structural"][field] = structural.copy()
+
+    alignment_rows = head_profile_alignment_rows([model])
+    width_rows = head_spatial_width_rows(alignment_rows)
+    broad = next(
+        row
+        for row in width_rows
+        if row["profile_kind"] == "score_mass"
+        and row["layer"] == 0
+        and row["head"] == 0
+    )
+    alignment = next(
+        row
+        for row in alignment_rows
+        if row["profile_kind"] == "score_mass"
+        and row["layer"] == 0
+        and row["head"] == 0
+    )
+    assert alignment["semantic_centroid"] == pytest.approx(1.0)
+    assert alignment["structural_centroid"] == pytest.approx(1.0)
+    assert broad["semantic_spatial_variance"] == pytest.approx(1.0)
+    assert broad["structural_spatial_variance"] == pytest.approx(0.0)
+    assert broad["semantic_spatial_entropy_nats"] == pytest.approx(np.log(2.0))
+    assert broad["structural_spatial_entropy_nats"] == pytest.approx(0.0)
+    assert broad["semantic_effective_distance_bins"] == pytest.approx(2.0)
+
+
+def test_spatial_width_alignment_reports_rank_and_identity_agreement():
+    rows = [
+        {
+            "task": "zinc_1hop",
+            "profile_kind": "score_mass",
+            "semantic_spatial_variance": value,
+            "structural_spatial_variance": 2.0 * value,
+            "semantic_spatial_entropy_nats": value,
+            "structural_spatial_entropy_nats": 2.0 * value,
+        }
+        for value in (1.0, 2.0, 3.0)
+    ]
+    summaries = summarise_spatial_width_alignment(rows)
+    variance = next(row for row in summaries if row["metric"] == "spatial_variance")
+    assert variance["pearson_correlation"] == pytest.approx(1.0)
+    assert variance["spearman_correlation"] == pytest.approx(1.0)
+    assert variance["concordance_correlation"] < 1.0
+    assert variance["structural_minus_semantic_median"] == pytest.approx(2.0)
+
+
 def test_run_identifies_the_model_that_failed_to_load(tmp_path, monkeypatch):
     local = _model(tmp_path, "zinc_1hop_localrrwp", include_virtual=False)
 
@@ -451,6 +512,8 @@ def test_fast_run_writes_tables_and_aligned_figures(tmp_path, monkeypatch):
     assert (output / "vnode_profile_alignment_layerwise.csv").is_file()
     assert (output / "head_profile_activity_weighted_overlap.csv").is_file()
     assert (output / "head_expected_score_distance.csv").is_file()
+    assert (output / "head_score_spatial_width.csv").is_file()
+    assert (output / "head_score_spatial_width_alignment.csv").is_file()
     assert not (output / "head_profile_alignment_permutation.csv").exists()
     assert (output / "cache/head_profile_alignment.json").is_file()
     assert (output / "summary.json").is_file()
@@ -469,5 +532,5 @@ def test_fast_run_writes_tables_and_aligned_figures(tmp_path, monkeypatch):
     )
     assert cache_path == output / "cache/head_profile_alignment.json"
     assert cache_status == "hit"
-    assert len(result["figures"]) == 16
+    assert len(result["figures"]) == 28
     assert all(Path(path).is_file() for path in result["figures"])

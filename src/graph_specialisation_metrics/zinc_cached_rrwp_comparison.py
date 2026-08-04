@@ -35,8 +35,8 @@ from .methodology.grit_figure_data import (
 )
 from .methodology.protocol import PROTOCOL_VERSION, stable_hash
 
-ANALYSIS_VERSION = "zinc-cached-rrwp-comparison-v6"
-ALIGNMENT_CACHE_VERSION = "zinc-head-profile-colocalization-v4"
+ANALYSIS_VERSION = "zinc-cached-rrwp-comparison-v7"
+ALIGNMENT_CACHE_VERSION = "zinc-head-profile-colocalization-v5"
 SUPPORTED_CACHE_PROTOCOLS = (
     "donor-swap-specialisation-carriage-v3",
     PROTOCOL_VERSION,
@@ -902,18 +902,60 @@ def _profile_pair_metrics(
     numeric_mask = np.isfinite(numeric)
     semantic_centroid = float("nan")
     structural_centroid = float("nan")
+    semantic_variance = float("nan")
+    structural_variance = float("nan")
+    semantic_entropy = float("nan")
+    structural_entropy = float("nan")
+    semantic_normalized_entropy = float("nan")
+    structural_normalized_entropy = float("nan")
     if np.any(numeric_mask):
         semantic_numeric_mass = float(semantic[numeric_mask].sum())
         structural_numeric_mass = float(structural[numeric_mask].sum())
         if semantic_numeric_mass > 1.0e-12 and structural_numeric_mass > 1.0e-12:
+            semantic_numeric_profile = (
+                semantic[numeric_mask] / semantic_numeric_mass
+            )
+            structural_numeric_profile = (
+                structural[numeric_mask] / structural_numeric_mass
+            )
+            numeric_distances = numeric[numeric_mask]
             semantic_centroid = float(
-                np.dot(semantic[numeric_mask], numeric[numeric_mask])
-                / semantic_numeric_mass
+                np.dot(semantic_numeric_profile, numeric_distances)
             )
             structural_centroid = float(
-                np.dot(structural[numeric_mask], numeric[numeric_mask])
-                / structural_numeric_mass
+                np.dot(structural_numeric_profile, numeric_distances)
             )
+            semantic_variance = float(
+                np.dot(
+                    semantic_numeric_profile,
+                    np.square(numeric_distances - semantic_centroid),
+                )
+            )
+            structural_variance = float(
+                np.dot(
+                    structural_numeric_profile,
+                    np.square(numeric_distances - structural_centroid),
+                )
+            )
+            semantic_positive = semantic_numeric_profile[
+                semantic_numeric_profile > 0.0
+            ]
+            structural_positive = structural_numeric_profile[
+                structural_numeric_profile > 0.0
+            ]
+            semantic_entropy = float(
+                -np.dot(semantic_positive, np.log(semantic_positive))
+            )
+            structural_entropy = float(
+                -np.dot(structural_positive, np.log(structural_positive))
+            )
+            entropy_ceiling = math.log(int(np.count_nonzero(numeric_mask)))
+            if entropy_ceiling > 0.0:
+                semantic_normalized_entropy = semantic_entropy / entropy_ceiling
+                structural_normalized_entropy = structural_entropy / entropy_ceiling
+            else:
+                semantic_normalized_entropy = 0.0
+                structural_normalized_entropy = 0.0
     centroid_difference = structural_centroid - semantic_centroid
     return {
         "cosine": cosine,
@@ -926,6 +968,19 @@ def _profile_pair_metrics(
         "structural_centroid": structural_centroid,
         "centroid_difference": centroid_difference,
         "centroid_gap_abs": abs(centroid_difference),
+        "semantic_variance": semantic_variance,
+        "structural_variance": structural_variance,
+        "variance_difference": structural_variance - semantic_variance,
+        "semantic_entropy": semantic_entropy,
+        "structural_entropy": structural_entropy,
+        "entropy_difference": structural_entropy - semantic_entropy,
+        "semantic_normalized_entropy": semantic_normalized_entropy,
+        "structural_normalized_entropy": structural_normalized_entropy,
+        "normalized_entropy_difference": (
+            structural_normalized_entropy - semantic_normalized_entropy
+        ),
+        "semantic_effective_distance_bins": math.exp(semantic_entropy),
+        "structural_effective_distance_bins": math.exp(structural_entropy),
         "semantic_mass": semantic_mass,
         "structural_mass": structural_mass,
         "shared_reportable_bins": len(labels),
@@ -1453,6 +1508,147 @@ def head_expected_distance_rows(
     return output
 
 
+def head_spatial_width_rows(
+    rows: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Expose molecular distance-profile width for every learned head.
+
+    Variance is measured in squared graph hops. Entropy is Shannon entropy in
+    nats, with an additional normalization by the log of the shared reportable
+    molecular support. Virtual carriers are excluded from all width measures.
+    """
+
+    output: list[dict[str, Any]] = []
+    for row in rows:
+        semantic_entropy = float(row["semantic_entropy"])
+        structural_entropy = float(row["structural_entropy"])
+        output.append(
+            {
+                "task": str(row["task"]),
+                "profile_kind": str(row["profile_kind"]),
+                "layer": int(row["layer"]),
+                "head": int(row["head"]),
+                "semantic_spatial_variance": float(row["semantic_variance"]),
+                "structural_spatial_variance": float(row["structural_variance"]),
+                "structural_minus_semantic_spatial_variance": float(
+                    row["variance_difference"]
+                ),
+                "semantic_spatial_entropy_nats": semantic_entropy,
+                "structural_spatial_entropy_nats": structural_entropy,
+                "structural_minus_semantic_spatial_entropy_nats": float(
+                    row["entropy_difference"]
+                ),
+                "semantic_normalized_spatial_entropy": float(
+                    row["semantic_normalized_entropy"]
+                ),
+                "structural_normalized_spatial_entropy": float(
+                    row["structural_normalized_entropy"]
+                ),
+                "structural_minus_semantic_normalized_spatial_entropy": float(
+                    row["normalized_entropy_difference"]
+                ),
+                "semantic_effective_distance_bins": math.exp(semantic_entropy),
+                "structural_effective_distance_bins": math.exp(structural_entropy),
+                "semantic_score_mass": float(row["semantic_mass"]),
+                "structural_score_mass": float(row["structural_mass"]),
+                "joint_sensitivity": float(row["joint_sensitivity"]),
+                "active": bool(row["active"]),
+            }
+        )
+    return output
+
+
+def summarise_spatial_width_alignment(
+    rows: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Summarise semantic--structural concordance of profile width across heads."""
+
+    from scipy.stats import spearmanr
+
+    groups: dict[tuple[str, str], list[Mapping[str, Any]]] = {}
+    for row in rows:
+        key = (str(row["task"]), str(row["profile_kind"]))
+        groups.setdefault(key, []).append(row)
+    output: list[dict[str, Any]] = []
+    for (task, profile_kind), group in sorted(groups.items()):
+        for metric, semantic_field, structural_field in (
+            (
+                "spatial_variance",
+                "semantic_spatial_variance",
+                "structural_spatial_variance",
+            ),
+            (
+                "spatial_entropy_nats",
+                "semantic_spatial_entropy_nats",
+                "structural_spatial_entropy_nats",
+            ),
+        ):
+            semantic = np.asarray(
+                [float(row[semantic_field]) for row in group], dtype=np.float64
+            )
+            structural = np.asarray(
+                [float(row[structural_field]) for row in group], dtype=np.float64
+            )
+            valid = np.isfinite(semantic) & np.isfinite(structural)
+            semantic = semantic[valid]
+            structural = structural[valid]
+            if not len(semantic):
+                continue
+            semantic_variance = float(np.var(semantic))
+            structural_variance = float(np.var(structural))
+            covariance = float(
+                np.mean(
+                    (semantic - np.mean(semantic))
+                    * (structural - np.mean(structural))
+                )
+            )
+            concordance_denominator = (
+                semantic_variance
+                + structural_variance
+                + float(np.mean(semantic) - np.mean(structural)) ** 2
+            )
+            pearson = (
+                float(np.corrcoef(semantic, structural)[0, 1])
+                if len(semantic) > 1
+                and semantic_variance > 0.0
+                and structural_variance > 0.0
+                else float("nan")
+            )
+            spearman = (
+                float(spearmanr(semantic, structural).statistic)
+                if len(semantic) > 1
+                and semantic_variance > 0.0
+                and structural_variance > 0.0
+                else float("nan")
+            )
+            difference = structural - semantic
+            output.append(
+                {
+                    "task": task,
+                    "profile_kind": profile_kind,
+                    "metric": metric,
+                    "valid_heads": len(semantic),
+                    "semantic_mean": float(np.mean(semantic)),
+                    "structural_mean": float(np.mean(structural)),
+                    "structural_minus_semantic_mean": float(np.mean(difference)),
+                    "structural_minus_semantic_median": float(
+                        np.median(difference)
+                    ),
+                    "median_absolute_difference": float(
+                        np.median(np.abs(difference))
+                    ),
+                    "pearson_correlation": pearson,
+                    "spearman_correlation": spearman,
+                    "concordance_correlation": (
+                        float(2.0 * covariance / concordance_denominator)
+                        if concordance_denominator > 0.0
+                        else 1.0
+                    ),
+                }
+            )
+    return output
+
+
 def summarise_layerwise_head_profile_alignment(
     rows: Sequence[Mapping[str, Any]],
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -1613,6 +1809,10 @@ def _head_profile_alignment_contract(
         ),
         "virtual_node": (
             "virtual score share and overlap after molecular-only renormalization"
+        ),
+        "spatial_width": (
+            "molecular-only per-head variance and Shannon entropy in nats, with "
+            "virtual carriers retained as a separate category"
         ),
         "models": [
             {
@@ -2609,6 +2809,281 @@ def _plot_per_head_expected_score_distance(
     return paths
 
 
+def _plot_per_head_spatial_width(
+    records: Sequence[Mapping[str, Any]],
+    width_rows: Sequence[Mapping[str, Any]],
+    output_dir: Path,
+) -> list[Path]:
+    import matplotlib.pyplot as plt
+
+    score_rows = [
+        row for row in width_rows if str(row["profile_kind"]) == "score_mass"
+    ]
+    tasks = [
+        str(record["task"])
+        for record in records
+        if any(str(row["task"]) == str(record["task"]) for row in score_rows)
+    ]
+    if not tasks:
+        return []
+    metric_configs = {
+        "variance": {
+            "semantic_field": "semantic_spatial_variance",
+            "structural_field": "structural_spatial_variance",
+            "colourbar": "spatial variance (graph hops²)",
+            "title": "spatial variance",
+        },
+        "entropy": {
+            "semantic_field": "semantic_spatial_entropy_nats",
+            "structural_field": "structural_spatial_entropy_nats",
+            "colourbar": "spatial entropy (nats)",
+            "title": "spatial entropy",
+        },
+    }
+    upper_by_metric: dict[str, float] = {}
+    for metric, config in metric_configs.items():
+        values = np.asarray(
+            [
+                float(row[field])
+                for row in score_rows
+                for field in (
+                    str(config["semantic_field"]),
+                    str(config["structural_field"]),
+                )
+                if np.isfinite(float(row[field]))
+            ],
+            dtype=np.float64,
+        )
+        upper_by_metric[metric] = max(float(np.max(values)), 1.0e-12)
+    figures_dir = output_dir / "figures"
+    figures_dir.mkdir(parents=True, exist_ok=True)
+    paths: list[Path] = []
+    configurations = (
+        ("09", "semantic", "variance"),
+        ("10", "structural", "variance"),
+        ("11", "semantic", "entropy"),
+        ("12", "structural", "entropy"),
+    )
+    for figure_number, channel, metric in configurations:
+        config = metric_configs[metric]
+        field = str(config[f"{channel}_field"])
+        figure, axes = plt.subplots(
+            1,
+            len(tasks),
+            figsize=(3.15 * len(tasks) + 1.1, 4.9),
+            squeeze=False,
+            sharey=True,
+            constrained_layout=True,
+        )
+        image = None
+        for column, task in enumerate(tasks):
+            axis = axes[0, column]
+            selected = [row for row in score_rows if str(row["task"]) == task]
+            layers = sorted({int(row["layer"]) for row in selected})
+            heads = sorted({int(row["head"]) for row in selected})
+            layer_index = {layer: index for index, layer in enumerate(layers)}
+            head_index = {head: index for index, head in enumerate(heads)}
+            matrix = np.full((len(layers), len(heads)), np.nan, dtype=np.float64)
+            for row in selected:
+                matrix[
+                    layer_index[int(row["layer"])],
+                    head_index[int(row["head"])],
+                ] = float(row[field])
+            image = axis.imshow(
+                np.ma.masked_invalid(matrix),
+                aspect="auto",
+                interpolation="nearest",
+                cmap="magma",
+                vmin=0.0,
+                vmax=upper_by_metric[metric],
+            )
+            axis.set_xticks(np.arange(len(heads)), [str(head) for head in heads])
+            axis.set_yticks(np.arange(len(layers)), [str(layer) for layer in layers])
+            axis.set_xlabel("head")
+            if column == 0:
+                axis.set_ylabel("layer")
+            axis.set_title(TASK_LABELS.get(task, task).replace("\n", " "))
+        if image is not None:
+            colourbar = figure.colorbar(
+                image,
+                ax=axes,
+                fraction=0.022,
+                pad=0.015,
+            )
+            colourbar.set_label(str(config["colourbar"]))
+        figure.suptitle(
+            "ZINC cached canonical analysis: per-head "
+            f"{channel} {config['title']}",
+            fontsize=15,
+        )
+        figure.text(
+            0.5,
+            -0.01,
+            "Width is computed from each head's normalized score mass over reportable "
+            "molecular distances. Variance and entropy use shared semantic/structural "
+            "colour scales; virtual carriers are analysed separately.",
+            ha="center",
+            fontsize=8.5,
+        )
+        stem = f"{figure_number}_{channel}_head_spatial_{metric}"
+        png = figures_dir / f"{stem}.png"
+        pdf = figures_dir / f"{stem}.pdf"
+        figure.savefig(png, dpi=220, bbox_inches="tight")
+        figure.savefig(pdf, bbox_inches="tight")
+        plt.close(figure)
+        paths.extend((png, pdf))
+    return paths
+
+
+def _plot_spatial_width_alignment(
+    records: Sequence[Mapping[str, Any]],
+    width_rows: Sequence[Mapping[str, Any]],
+    alignment_rows: Sequence[Mapping[str, Any]],
+    output_dir: Path,
+) -> list[Path]:
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import Normalize
+
+    score_rows = [
+        row for row in width_rows if str(row["profile_kind"]) == "score_mass"
+    ]
+    tasks = [
+        str(record["task"])
+        for record in records
+        if any(str(row["task"]) == str(record["task"]) for row in score_rows)
+    ]
+    if not tasks:
+        return []
+    summary_index = {
+        (str(row["task"]), str(row["metric"])): row
+        for row in alignment_rows
+        if str(row["profile_kind"]) == "score_mass"
+    }
+    maximum_layer = max(int(row["layer"]) for row in score_rows)
+    layer_normalization = Normalize(vmin=0, vmax=max(maximum_layer, 1))
+    figures_dir = output_dir / "figures"
+    figures_dir.mkdir(parents=True, exist_ok=True)
+    paths: list[Path] = []
+    for figure_number, metric, semantic_field, structural_field, label in (
+        (
+            "13",
+            "spatial_variance",
+            "semantic_spatial_variance",
+            "structural_spatial_variance",
+            "spatial variance (graph hops²)",
+        ),
+        (
+            "14",
+            "spatial_entropy_nats",
+            "semantic_spatial_entropy_nats",
+            "structural_spatial_entropy_nats",
+            "spatial entropy (nats)",
+        ),
+    ):
+        upper = max(
+            [
+                float(row[field])
+                for row in score_rows
+                for field in (semantic_field, structural_field)
+                if np.isfinite(float(row[field]))
+            ]
+            + [1.0e-12]
+        )
+        upper *= 1.04
+        figure, axes = plt.subplots(
+            1,
+            len(tasks),
+            figsize=(3.2 * len(tasks) + 1.1, 4.9),
+            squeeze=False,
+            sharex=True,
+            sharey=True,
+            constrained_layout=True,
+        )
+        scatter = None
+        for column, task in enumerate(tasks):
+            axis = axes[0, column]
+            selected = [row for row in score_rows if str(row["task"]) == task]
+            semantic = np.asarray(
+                [float(row[semantic_field]) for row in selected], dtype=np.float64
+            )
+            structural = np.asarray(
+                [float(row[structural_field]) for row in selected], dtype=np.float64
+            )
+            layers = np.asarray(
+                [int(row["layer"]) for row in selected], dtype=np.float64
+            )
+            valid = np.isfinite(semantic) & np.isfinite(structural)
+            scatter = axis.scatter(
+                semantic[valid],
+                structural[valid],
+                c=layers[valid],
+                cmap="viridis",
+                norm=layer_normalization,
+                s=24,
+                alpha=0.72,
+                edgecolors="none",
+            )
+            axis.plot((0.0, upper), (0.0, upper), "--", color="0.45", linewidth=1.1)
+            axis.set_xlim(0.0, upper)
+            axis.set_ylim(0.0, upper)
+            axis.set_aspect("equal", adjustable="box")
+            axis.set_xlabel(f"semantic {label}")
+            if column == 0:
+                axis.set_ylabel(f"structural {label}")
+            axis.set_title(TASK_LABELS.get(task, task).replace("\n", " "))
+            summary = summary_index.get((task, metric))
+            if summary is not None:
+                concordance = float(summary["concordance_correlation"])
+                rank_correlation = float(summary["spearman_correlation"])
+                concordance_label = (
+                    f"{concordance:.2f}" if np.isfinite(concordance) else "NA"
+                )
+                rank_label = (
+                    f"{rank_correlation:.2f}"
+                    if np.isfinite(rank_correlation)
+                    else "NA"
+                )
+                axis.text(
+                    0.04,
+                    0.96,
+                    f"CCC={concordance_label}\nρ={rank_label}",
+                    transform=axis.transAxes,
+                    ha="left",
+                    va="top",
+                    fontsize=8.5,
+                )
+        if scatter is not None:
+            colourbar = figure.colorbar(
+                scatter,
+                ax=axes,
+                fraction=0.022,
+                pad=0.015,
+            )
+            colourbar.set_label("layer")
+        figure.suptitle(
+            "ZINC cached canonical analysis: within-head semantic–structural "
+            f"{metric.replace('_nats', '').replace('_', ' ')} alignment",
+            fontsize=15,
+        )
+        figure.text(
+            0.5,
+            -0.01,
+            "Each point is one learned head; the dashed identity line denotes equal "
+            "semantic and structural width. CCC measures identity agreement, while "
+            "Spearman ρ measures rank alignment across heads.",
+            ha="center",
+            fontsize=8.5,
+        )
+        stem = f"{figure_number}_{metric}_alignment"
+        png = figures_dir / f"{stem}.png"
+        pdf = figures_dir / f"{stem}.pdf"
+        figure.savefig(png, dpi=220, bbox_inches="tight")
+        figure.savefig(pdf, bbox_inches="tight")
+        plt.close(figure)
+        paths.extend((png, pdf))
+    return paths
+
+
 def run(
     roots: Sequence[Path],
     output_dir: Path,
@@ -2707,6 +3182,10 @@ def run(
         for row in alignment_layer_rows
     ]
     expected_distance_rows = head_expected_distance_rows(alignment_rows)
+    spatial_width_rows = head_spatial_width_rows(alignment_rows)
+    spatial_width_alignment_rows = summarise_spatial_width_alignment(
+        spatial_width_rows
+    )
     summary_rows = [
         {
             key: value
@@ -2755,6 +3234,8 @@ def run(
         "vnode_profile_alignment_layerwise.csv": vnode_layer_rows,
         "head_profile_activity_weighted_overlap.csv": activity_alignment_rows,
         "head_expected_score_distance.csv": expected_distance_rows,
+        "head_score_spatial_width.csv": spatial_width_rows,
+        "head_score_spatial_width_alignment.csv": spatial_width_alignment_rows,
     }
     for name, rows in tables.items():
         log("table", f"{name}: {len(rows)} rows")
@@ -2858,6 +3339,35 @@ def run(
             "ZINC cache analysis failed while plotting per-head expected distances: "
             f"{type(error).__name__}: {error}"
         ) from error
+    log("figure", "09-12_per_head_spatial_width")
+    try:
+        figures.extend(
+            _plot_per_head_spatial_width(
+                records,
+                spatial_width_rows,
+                output_dir,
+            )
+        )
+    except Exception as error:
+        raise RuntimeError(
+            "ZINC cache analysis failed while plotting per-head spatial width: "
+            f"{type(error).__name__}: {error}"
+        ) from error
+    log("figure", "13-14_spatial_width_alignment")
+    try:
+        figures.extend(
+            _plot_spatial_width_alignment(
+                records,
+                spatial_width_rows,
+                spatial_width_alignment_rows,
+                output_dir,
+            )
+        )
+    except Exception as error:
+        raise RuntimeError(
+            "ZINC cache analysis failed while plotting spatial-width alignment: "
+            f"{type(error).__name__}: {error}"
+        ) from error
     result = {
         "analysis_version": ANALYSIS_VERSION,
         "train_seed": int(train_seed),
@@ -2875,6 +3385,8 @@ def run(
             "vnode_layerwise": vnode_layer_rows,
             "activity_weighted_layerwise": activity_alignment_rows,
             "head_expected_distance": expected_distance_rows,
+            "head_spatial_width": spatial_width_rows,
+            "spatial_width_alignment": spatial_width_alignment_rows,
         },
         "cache_compatibility": {
             "protocols": protocols,
@@ -2920,6 +3432,15 @@ def run(
             "per_head_expected_distance": (
                 "score-mass-weighted expected molecular graph distance within each head "
                 "and channel; virtual carriers remain a separate non-molecular category"
+            ),
+            "per_head_spatial_width": (
+                "molecular-only spatial variance in squared graph hops and Shannon "
+                "entropy in nats for semantic and structural profiles; normalized entropy "
+                "is retained in the exact table as a support-size robustness diagnostic"
+            ),
+            "spatial_width_alignment": (
+                "matched-head semantic versus structural width, summarized using Pearson "
+                "and rank correlation plus Lin-style concordance with the identity line"
             ),
             "profile_precision": (
                 "cached exact-distance marginal 95% interval width divided by total "

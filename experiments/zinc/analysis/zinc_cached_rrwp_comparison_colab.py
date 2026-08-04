@@ -322,6 +322,10 @@ print(
     "[scope] Per-head expected-distance heatmaps use normalized score mass over reportable "
     "molecular bins; virtual carriers remain separate."
 )
+print(
+    "[scope] Spatial-width heatmaps add molecular-distance variance and Shannon entropy; "
+    "matched-head alignment is reported with identity concordance and rank correlation."
+)
 print(f"[scope] Output directory: {OUTPUT_DIR}")
 try:
     result = run(
@@ -477,6 +481,27 @@ display(
     ]
     .sort_values("absolute_expected_distance_gap", ascending=False)
     .head(20)
+)
+print("Semantic–structural alignment of per-head spatial width")
+spatial_width_alignment = pd.read_csv(
+    OUTPUT_DIR / "head_score_spatial_width_alignment.csv"
+)
+display(
+    spatial_width_alignment.loc[
+        spatial_width_alignment["profile_kind"] == "score_mass",
+        [
+            "task",
+            "metric",
+            "valid_heads",
+            "semantic_mean",
+            "structural_mean",
+            "structural_minus_semantic_median",
+            "median_absolute_difference",
+            "pearson_correlation",
+            "spearman_correlation",
+            "concordance_correlation",
+        ],
+    ]
 )
 for path in result["figures"]:
     if str(path).endswith(".png") and Path(path).is_file():
