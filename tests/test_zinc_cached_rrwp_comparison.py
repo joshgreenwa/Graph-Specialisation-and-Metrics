@@ -283,6 +283,10 @@ def test_layerwise_alignment_summarises_consistency_and_low_outliers(tmp_path):
         score["channels"]["structural"][field] = structural.copy()
     score["channels"]["semantic"]["raw"] = semantic.sum(axis=-1)
     score["channels"]["structural"]["raw"] = structural.sum(axis=-1)
+    joint_sensitivity = np.ones((2, 8), dtype=np.float64)
+    joint_sensitivity[:, 7] = 9.0
+    score["coordinates"]["joint_sensitivity"] = joint_sensitivity
+    score["coordinates"]["active"] = np.ones((2, 8), dtype=bool)
 
     rows = head_profile_alignment_rows([model])
     assert len(rows) == 2 * 2 * 8
@@ -297,6 +301,14 @@ def test_layerwise_alignment_summarises_consistency_and_low_outliers(tmp_path):
     assert mass_layer_zero["overlap_min_head"] == 7
     assert mass_layer_zero["low_overlap_outlier_heads"] == "7"
     assert mass_layer_zero["low_overlap_outlier_count"] == 1
+    assert mass_layer_zero["overlap_mean"] == pytest.approx(7.0 / 8.0)
+    assert mass_layer_zero["activity_weighted_overlap"] == pytest.approx(7.0 / 16.0)
+    assert mass_layer_zero["activity_weighted_minus_median"] == pytest.approx(
+        -9.0 / 16.0
+    )
+    assert mass_layer_zero[
+        "joint_sensitivity_share_overlap_below_0_7"
+    ] == pytest.approx(9.0 / 16.0)
     assert {
         (row["profile_kind"], row["layer"], row["head"])
         for row in outliers
@@ -417,6 +429,7 @@ def test_fast_run_writes_tables_and_aligned_figures(tmp_path, monkeypatch):
     assert (output / "head_profile_distance_decomposition_layerwise.csv").is_file()
     assert (output / "vnode_profile_alignment.csv").is_file()
     assert (output / "vnode_profile_alignment_layerwise.csv").is_file()
+    assert (output / "head_profile_activity_weighted_overlap.csv").is_file()
     assert not (output / "head_profile_alignment_permutation.csv").exists()
     assert (output / "cache/head_profile_alignment.json").is_file()
     assert (output / "summary.json").is_file()
@@ -435,5 +448,5 @@ def test_fast_run_writes_tables_and_aligned_figures(tmp_path, monkeypatch):
     )
     assert cache_path == output / "cache/head_profile_alignment.json"
     assert cache_status == "hit"
-    assert len(result["figures"]) == 10
+    assert len(result["figures"]) == 12
     assert all(Path(path).is_file() for path in result["figures"])

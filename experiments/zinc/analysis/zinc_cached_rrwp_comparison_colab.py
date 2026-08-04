@@ -314,6 +314,10 @@ print(
     "[scope] Follow-ups decompose overlap loss by distance and isolate the virtual score "
     "bin; all quantities are derived from the same cached tensors."
 )
+print(
+    "[scope] Activity-weighted overlap uses each head's cached canonical joint sensitivity "
+    "J and is reported beside the ordinary headwise median."
+)
 print(f"[scope] Output directory: {OUTPUT_DIR}")
 try:
     result = run(
@@ -422,6 +426,26 @@ if vnode_table.stat().st_size:
     )
 else:
     print("[vnode] No available cached model contains a reportable virtual carrier bin.")
+print("Canonical-activity-weighted overlap versus ordinary headwise median")
+activity_table = pd.read_csv(
+    OUTPUT_DIR / "head_profile_activity_weighted_overlap.csv"
+)
+display(
+    activity_table.loc[
+        :,
+        [
+            "task",
+            "profile_kind",
+            "layer",
+            "overlap_median",
+            "overlap_mean",
+            "activity_weighted_overlap",
+            "activity_weighted_minus_median",
+            "joint_sensitivity_share_overlap_below_0_7",
+            "joint_sensitivity_share_overlap_below_0_8",
+        ],
+    ]
+)
 for path in result["figures"]:
     if str(path).endswith(".png") and Path(path).is_file():
         display(Image(filename=path))

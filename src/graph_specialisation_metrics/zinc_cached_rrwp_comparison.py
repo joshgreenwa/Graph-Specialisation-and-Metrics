@@ -35,8 +35,8 @@ from .methodology.grit_figure_data import (
 )
 from .methodology.protocol import PROTOCOL_VERSION, stable_hash
 
-ANALYSIS_VERSION = "zinc-cached-rrwp-comparison-v4"
-ALIGNMENT_CACHE_VERSION = "zinc-head-profile-colocalization-v3"
+ANALYSIS_VERSION = "zinc-cached-rrwp-comparison-v5"
+ALIGNMENT_CACHE_VERSION = "zinc-head-profile-colocalization-v4"
 SUPPORTED_CACHE_PROTOCOLS = (
     "donor-swap-specialisation-carriage-v3",
     PROTOCOL_VERSION,
@@ -942,6 +942,31 @@ def _distance_group_label(value: Any) -> str:
     raise ValueError(f"non-negative distance {distance} has no display bin")
 
 
+def _canonical_head_activity(
+    score: Mapping[str, Any], shape: tuple[int, int]
+) -> tuple[np.ndarray, np.ndarray]:
+    coordinates = score.get("coordinates")
+    if not isinstance(coordinates, Mapping) or "joint_sensitivity" not in coordinates:
+        raise KeyError("canonical score cache is missing coordinates.joint_sensitivity")
+    joint = _as_numpy(coordinates["joint_sensitivity"])
+    if joint.shape != shape:
+        raise ValueError(
+            f"joint-sensitivity shape {joint.shape} does not match head shape {shape}"
+        )
+    if np.any(joint[np.isfinite(joint)] < -1.0e-10):
+        raise ValueError("canonical joint sensitivity must be non-negative")
+    joint = np.maximum(joint, 0.0)
+    active_value = coordinates.get("active")
+    active = (
+        np.isfinite(joint) & (joint > 0.0)
+        if active_value is None
+        else _as_numpy(active_value, dtype=bool)
+    )
+    if active.shape != shape:
+        raise ValueError(f"active-head shape {active.shape} does not match {shape}")
+    return joint, active
+
+
 def head_profile_alignment_rows(models: Sequence[CachedModel]) -> list[dict[str, Any]]:
     """Measure semantic--structural distance-profile overlap within learned heads.
 
@@ -979,6 +1004,9 @@ def head_profile_alignment_rows(models: Sequence[CachedModel]) -> list[dict[str,
                     f"{semantic.shape[-1]} does not match axis width {len(axis)}"
                 )
             layers, heads, _ = semantic.shape
+            joint_sensitivity, active = _canonical_head_activity(
+                score, (layers, heads)
+            )
             for layer in range(layers):
                 for head in range(heads):
                     metrics = _profile_pair_metrics(
@@ -1000,6 +1028,10 @@ def head_profile_alignment_rows(models: Sequence[CachedModel]) -> list[dict[str,
                             "profile_kind": profile_kind,
                             "layer": layer,
                             "head": head,
+                            "joint_sensitivity": float(
+                                joint_sensitivity[layer, head]
+                            ),
+                            "active": bool(active[layer, head]),
                             **metrics,
                         }
                     )
@@ -1296,6 +1328,59 @@ def summarise_layerwise_vnode_profiles(
     return output
 
 
+def _activity_weighted_overlap_statistics(
+    rows: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    overlap = np.asarray([float(row["overlap"]) for row in rows], dtype=np.float64)
+    weights = np.asarray(
+        [float(row["joint_sensitivity"]) for row in rows], dtype=np.float64
+    )
+    finite_overlap = overlap[np.isfinite(overlap)]
+    ordinary_mean = (
+        float(np.mean(finite_overlap)) if len(finite_overlap) else float("nan")
+    )
+    ordinary_median = (
+        float(np.median(finite_overlap)) if len(finite_overlap) else float("nan")
+    )
+    weighted_mask = np.isfinite(overlap) & np.isfinite(weights) & (weights > 0.0)
+    total_weight = float(weights[weighted_mask].sum())
+    weighted_overlap = (
+        float(np.average(overlap[weighted_mask], weights=weights[weighted_mask]))
+        if total_weight > 0.0
+        else float("nan")
+    )
+    active_overlap = np.asarray(
+        [
+            float(row["overlap"])
+            for row in rows
+            if bool(row["active"]) and np.isfinite(float(row["overlap"]))
+        ],
+        dtype=np.float64,
+    )
+
+    def activity_share_below(threshold: float) -> float:
+        if total_weight <= 0.0:
+            return float("nan")
+        selected = weighted_mask & (overlap < threshold)
+        return float(weights[selected].sum() / total_weight)
+
+    return {
+        "overlap_mean": ordinary_mean,
+        "overlap_median": ordinary_median,
+        "activity_weighted_overlap": weighted_overlap,
+        "activity_weighted_minus_mean": weighted_overlap - ordinary_mean,
+        "activity_weighted_minus_median": weighted_overlap - ordinary_median,
+        "joint_sensitivity_total": total_weight,
+        "weighted_head_count": int(np.sum(weighted_mask)),
+        "active_head_count": len(active_overlap),
+        "active_only_overlap_median": (
+            float(np.median(active_overlap)) if len(active_overlap) else float("nan")
+        ),
+        "joint_sensitivity_share_overlap_below_0_7": activity_share_below(0.7),
+        "joint_sensitivity_share_overlap_below_0_8": activity_share_below(0.8),
+    }
+
+
 def summarise_head_profile_alignment(
     rows: Sequence[Mapping[str, Any]],
 ) -> list[dict[str, Any]]:
@@ -1327,6 +1412,7 @@ def summarise_head_profile_alignment(
                 if np.isfinite(values).any()
                 else float("nan")
             )
+        result.update(_activity_weighted_overlap_statistics(group))
         output.append(result)
     return output
 
@@ -1374,6 +1460,7 @@ def summarise_layerwise_head_profile_alignment(
             if np.isfinite(float(row["overlap"]))
             and float(row["overlap"]) < low_fence
         ]
+        activity_statistics = _activity_weighted_overlap_statistics(ordered)
         summaries.append(
             {
                 "task": task,
@@ -1439,6 +1526,7 @@ def summarise_layerwise_head_profile_alignment(
                     if len(finite_centroid_difference)
                     else float("nan")
                 ),
+                **activity_statistics,
             }
         )
         for row in ordered:
@@ -1450,6 +1538,8 @@ def summarise_layerwise_head_profile_alignment(
                         "profile_kind": profile_kind,
                         "layer": layer,
                         "head": int(row["head"]),
+                        "joint_sensitivity": float(row["joint_sensitivity"]),
+                        "active": bool(row["active"]),
                         "overlap": value,
                         "layer_median_overlap": float(overlap_median),
                         "difference_from_layer_median": value
@@ -1477,6 +1567,10 @@ def _head_profile_alignment_contract(
         "pairing": "semantic and structural profiles from the same learned head",
         "layer_summary": (
             "median, IQR, range, threshold fractions, and Tukey low-overlap outliers"
+        ),
+        "activity_weighting": (
+            "canonical coordinates.joint_sensitivity weights compared with ordinary "
+            "headwise overlap mean and median"
         ),
         "distance_decomposition": (
             "exact structural-minus-semantic share and additive total-variation terms"
@@ -2248,6 +2342,132 @@ def _plot_vnode_profile_diagnostics(
     return [png, pdf]
 
 
+def _plot_activity_weighted_profile_overlap(
+    records: Sequence[Mapping[str, Any]],
+    layer_rows: Sequence[Mapping[str, Any]],
+    output_dir: Path,
+) -> list[Path]:
+    import matplotlib.pyplot as plt
+
+    tasks = [str(record["task"]) for record in records]
+    labels = [
+        _record_label(record, multiline=True, show_protocol=False)
+        for record in records
+    ]
+    layers = sorted({int(row["layer"]) for row in layer_rows})
+    if not layers:
+        return []
+    task_index = {task: index for index, task in enumerate(tasks)}
+    layer_index = {layer: index for index, layer in enumerate(layers)}
+    delta_values = np.asarray(
+        [float(row["activity_weighted_minus_median"]) for row in layer_rows],
+        dtype=np.float64,
+    )
+    finite_delta = np.abs(delta_values[np.isfinite(delta_values)])
+    delta_limit = max(
+        float(np.quantile(finite_delta, 0.98)) if len(finite_delta) else 0.0,
+        0.05,
+    )
+    figure, axes = plt.subplots(2, 2, figsize=(14.5, 7.8), constrained_layout=True)
+    panels = (
+        (
+            axes[0, 0],
+            "score_mass",
+            "activity_weighted_overlap",
+            "a",
+            "Score-mass activity-weighted overlap",
+        ),
+        (
+            axes[0, 1],
+            "score_mass",
+            "activity_weighted_minus_median",
+            "b",
+            "Weighted overlap minus ordinary median",
+        ),
+        (
+            axes[1, 0],
+            "per_opportunity",
+            "activity_weighted_overlap",
+            "c",
+            "Opportunity-corrected activity-weighted overlap",
+        ),
+        (
+            axes[1, 1],
+            "per_opportunity",
+            "activity_weighted_minus_median",
+            "d",
+            "Weighted overlap minus ordinary median",
+        ),
+    )
+    for axis, profile_kind, field, panel, title in panels:
+        matrix = np.full((len(tasks), len(layers)), np.nan, dtype=np.float64)
+        for row in layer_rows:
+            task = str(row["task"])
+            if task not in task_index or str(row["profile_kind"]) != profile_kind:
+                continue
+            matrix[task_index[task], layer_index[int(row["layer"])]] = float(row[field])
+        is_overlap = field == "activity_weighted_overlap"
+        image = axis.imshow(
+            np.ma.masked_invalid(matrix),
+            aspect="auto",
+            interpolation="nearest",
+            cmap="viridis" if is_overlap else "PiYG",
+            vmin=0.0 if is_overlap else -delta_limit,
+            vmax=1.0 if is_overlap else delta_limit,
+        )
+        for row_index in range(len(tasks)):
+            for column_index in range(len(layers)):
+                value = matrix[row_index, column_index]
+                if not np.isfinite(value):
+                    continue
+                if is_overlap:
+                    text_colour = "white" if value < 0.42 else "black"
+                    label = f"{value:.2f}"
+                else:
+                    text_colour = "black"
+                    label = f"{value:+.2f}"
+                axis.text(
+                    column_index,
+                    row_index,
+                    label,
+                    ha="center",
+                    va="center",
+                    fontsize=7.2,
+                    color=text_colour,
+                )
+        axis.set_xticks(np.arange(len(layers)), [str(layer) for layer in layers])
+        axis.set_yticks(np.arange(len(tasks)), labels)
+        axis.set_xlabel("layer")
+        axis.set_title(f"{panel}  {title}")
+        colourbar = figure.colorbar(image, ax=axis, fraction=0.045, pad=0.025)
+        colourbar.set_label(
+            "activity-weighted overlap"
+            if is_overlap
+            else "weighted overlap − median"
+        )
+    figure.suptitle(
+        "ZINC cached canonical analysis: is responsive capacity more spatially aligned?",
+        fontsize=15,
+    )
+    figure.text(
+        0.5,
+        -0.01,
+        "Each head is weighted by its canonical joint sensitivity J. Positive differences "
+        "mean that more responsive heads are more aligned than the ordinary headwise median; "
+        "negative differences place responsive capacity in less-aligned heads.",
+        ha="center",
+        fontsize=8.5,
+    )
+    figures = output_dir / "figures"
+    figures.mkdir(parents=True, exist_ok=True)
+    png = figures / "06_activity_weighted_profile_overlap.png"
+    pdf = figures / "06_activity_weighted_profile_overlap.pdf"
+    figure.savefig(png, dpi=220, bbox_inches="tight")
+    figure.savefig(pdf, bbox_inches="tight")
+    plt.close(figure)
+    return [png, pdf]
+
+
 def run(
     roots: Sequence[Path],
     output_dir: Path,
@@ -2324,6 +2544,27 @@ def run(
     alignment_distance_layer_rows = alignment["distance_layer_rows"]
     vnode_rows = alignment["vnode_rows"]
     vnode_layer_rows = alignment["vnode_layer_rows"]
+    activity_alignment_fields = (
+        "task",
+        "profile_kind",
+        "layer",
+        "valid_heads",
+        "overlap_mean",
+        "overlap_median",
+        "active_only_overlap_median",
+        "activity_weighted_overlap",
+        "activity_weighted_minus_mean",
+        "activity_weighted_minus_median",
+        "joint_sensitivity_total",
+        "weighted_head_count",
+        "active_head_count",
+        "joint_sensitivity_share_overlap_below_0_7",
+        "joint_sensitivity_share_overlap_below_0_8",
+    )
+    activity_alignment_rows = [
+        {field: row[field] for field in activity_alignment_fields}
+        for row in alignment_layer_rows
+    ]
     summary_rows = [
         {
             key: value
@@ -2370,6 +2611,7 @@ def run(
         ),
         "vnode_profile_alignment.csv": vnode_rows,
         "vnode_profile_alignment_layerwise.csv": vnode_layer_rows,
+        "head_profile_activity_weighted_overlap.csv": activity_alignment_rows,
     }
     for name, rows in tables.items():
         log("table", f"{name}: {len(rows)} rows")
@@ -2445,6 +2687,20 @@ def run(
             "ZINC cache analysis failed while plotting virtual-node diagnostics: "
             f"{type(error).__name__}: {error}"
         ) from error
+    log("figure", "06_activity_weighted_profile_overlap")
+    try:
+        figures.extend(
+            _plot_activity_weighted_profile_overlap(
+                records,
+                alignment_layer_rows,
+                output_dir,
+            )
+        )
+    except Exception as error:
+        raise RuntimeError(
+            "ZINC cache analysis failed while plotting activity-weighted overlap: "
+            f"{type(error).__name__}: {error}"
+        ) from error
     result = {
         "analysis_version": ANALYSIS_VERSION,
         "train_seed": int(train_seed),
@@ -2460,6 +2716,7 @@ def run(
             "outliers": alignment_outlier_rows,
             "distance_decomposition": alignment_distance_layer_rows,
             "vnode_layerwise": vnode_layer_rows,
+            "activity_weighted_layerwise": activity_alignment_rows,
         },
         "cache_compatibility": {
             "protocols": protocols,
@@ -2497,6 +2754,10 @@ def run(
             "virtual_node_profile": (
                 "virtual-carrier semantic/structural score share and molecular-only overlap "
                 "after removing the virtual bin and renormalizing within each head"
+            ),
+            "activity_weighted_overlap": (
+                "within-head profile overlap weighted by canonical joint sensitivity J; "
+                "reported beside the ordinary headwise mean and median"
             ),
             "profile_precision": (
                 "cached exact-distance marginal 95% interval width divided by total "
