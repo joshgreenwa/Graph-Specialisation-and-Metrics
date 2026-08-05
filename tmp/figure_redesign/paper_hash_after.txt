@@ -1,0 +1,2 @@
+a2d75692ef1727a713d6cd8b09de5615c16b62bf89d803b343459fe1bb523295  output/pdf/figure_redesign/synthetic_figure_paper_suite.pdf
+474c4ec20d4695d10744b6c6a9e926995630b3e9da049ecff4b806ebc6a68fbd  output/figure_redesign/paper_section_layout.png

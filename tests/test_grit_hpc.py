@@ -201,6 +201,31 @@ def test_csd3_launcher_stays_within_400_gpu_hours():
     assert "/rds/user/jgg45/hpc-work" in script
 
 
+@pytest.mark.parametrize(
+    ("relative_path", "call"),
+    [
+        (
+            "src/graph_specialisation_metrics/grit_patches/khop_zinc.py",
+            "compat_shim_dir = write_py312_compat_shim(args.drive_dir)",
+        ),
+        (
+            "src/graph_specialisation_metrics/grit_patches/qm9_gap.py",
+            "compat_shim_dir = write_py312_compat_shim(args.drive_dir)",
+        ),
+        (
+            "experiments/peptides/training/GRIT_peptides_khop.py",
+            "compat_shim_dir = base.write_py312_compat_shim(args.drive_dir)",
+        ),
+    ],
+)
+def test_hpc_runners_enable_dependency_compatibility_on_python310(
+    relative_path, call
+):
+    source = (ROOT / relative_path).read_text(encoding="utf-8")
+    assert call in source
+    assert "compat_shim_dir = None\n    if sys.version_info >= (3, 12):" not in source
+
+
 def test_gpu_worker_requires_staged_dataset(hpc, tmp_path):
     job = hpc.Job("zinc.dense.s0", "zinc", "dense", 1, False, -1, 0)
     manifest = tmp_path / "jobs.jsonl"

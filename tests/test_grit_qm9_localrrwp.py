@@ -69,3 +69,15 @@ def test_old_khop_encoder_is_upgraded_to_frozen_support(tmp_path: Path) -> None:
     upgraded = encoder.read_text(encoding="utf-8")
     assert 'batch.get("rrwp_attention_edge_index", None)' in upgraded
     assert "Backward-compatible fallback" in upgraded
+
+
+def test_runtime_shim_repairs_removed_sklearn_squared_argument(tmp_path: Path) -> None:
+    shim_dir = qm9_gap.write_py312_compat_shim(tmp_path)
+    shim = (shim_dir / "sitecustomize.py").read_text(encoding="utf-8")
+
+    assert 'if "squared" not in _mse_sig.parameters:' in shim
+    assert "def _compat_mean_squared_error(" in shim
+    assert "return _np.sqrt(mse)" in shim
+    assert qm9_gap.env_with_py312_compat(shim_dir)["PYTHONPATH"].split(":", 1)[0] == str(
+        shim_dir
+    )

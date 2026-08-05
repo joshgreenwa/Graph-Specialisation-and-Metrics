@@ -1076,9 +1076,9 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     args.drive_dir.mkdir(parents=True, exist_ok=True)
 
-    compat_shim_dir = None
-    if sys.version_info >= (3, 12):
-        compat_shim_dir = base.write_py312_compat_shim(args.drive_dir)
+    # The shim also handles dependency-version drift on older Python versions
+    # (notably sklearn >=1.6 under Python 3.10 on CSD3).
+    compat_shim_dir = base.write_py312_compat_shim(args.drive_dir)
 
     if not args.skip_install:
         base.install_dependencies(args)

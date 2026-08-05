@@ -1,0 +1,2 @@
+f8553f38d64bc31bfc3f958b7117180872c935b32572f7771fdcf838f55ea55e  output/pdf/figure_redesign/synthetic_figure_redesign_suite.pdf
+29ea471aa7a1d04c262346432ae6e31412e124885c7a2acfa4907cbf9fd253cf  output/figure_redesign/redesign_section_layout.png

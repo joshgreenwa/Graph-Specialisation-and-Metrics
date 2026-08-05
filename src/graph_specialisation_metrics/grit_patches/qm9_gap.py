@@ -51,7 +51,7 @@ Notes:
   environment. Modern Colab images usually ship newer Python/PyTorch. By default
   this script keeps Colab's preinstalled torch and installs torch-geometric==2.2.0
   plus matching PyG extension wheels for the active torch/CUDA build.
-- On Python 3.12 / modern Colab, the runner injects a subprocess-local
+- On modern Python/dependency combinations, the runner injects a subprocess-local
   compatibility shim for old Lightning/pkg_resources imports, restores legacy
   torch.load behavior for PyG processed dataset files under PyTorch >=2.6,
   restores the legacy scikit-learn mean_squared_error(..., squared=False)
@@ -577,11 +577,13 @@ def run_streaming_to_console_and_log(
 
 
 def write_py312_compat_shim(base_dir: Path) -> Path:
-    """Create a sitecustomize.py shim for Python 3.12 + older GRIT deps.
+    """Create a sitecustomize.py shim for modern runtimes + older GRIT deps.
 
-    Current Colab runtimes may use Python 3.12, while the official GRIT
-    environment was Python 3.10-era. Old setuptools/pkg_resources code imported
-    through PyG/Lightning can hit two Python-3.12 removals:
+    The historical function name is retained for callers. Compatibility is not
+    determined by the Python version alone: for example, scikit-learn >=1.6 can
+    be installed under Python 3.10 and removes an API used by GRIT's logger.
+    Old setuptools/pkg_resources code imported through PyG/Lightning can also
+    hit two Python-3.12 removals:
 
       1. pkgutil.ImpImporter no longer exists.
       2. importlib.machinery.FileFinder no longer exposes find_module().
@@ -710,7 +712,7 @@ except Exception:
 """.lstrip(),
         encoding="utf-8",
     )
-    log(f"[compat] Wrote Python 3.12 compatibility shim: {sitecustomize}")
+    log(f"[compat] Wrote GRIT runtime compatibility shim: {sitecustomize}")
     return shim_dir
 
 
@@ -2229,9 +2231,10 @@ def main(argv: Sequence[str] | None = None) -> None:
     mount_drive(args.drive_mount)
     args.drive_dir.mkdir(parents=True, exist_ok=True)
 
-    compat_shim_dir = None
-    if sys.version_info >= (3, 12):
-        compat_shim_dir = write_py312_compat_shim(args.drive_dir)
+    # Dependency compatibility is independent of the Python minor version.
+    # CSD3 currently combines Python 3.10 with sklearn >=1.6, whose removed
+    # `squared` argument otherwise crashes GRIT after the first epoch.
+    compat_shim_dir = write_py312_compat_shim(args.drive_dir)
 
     if not args.skip_install:
         install_dependencies(args)
