@@ -19,7 +19,7 @@ export GRIT_MANIFEST="${GRIT_MANIFEST:-${HPC_WORK_ROOT}/grit_manifests/grit_all_
 export GRIT_RESUBMIT_LEDGER="${GRIT_RESUBMIT_LEDGER:-${HPC_WORK_ROOT}/grit_manifests/grit_all_3seeds.resubmissions.tsv}"
 export GRIT_SOURCE_REPO="${GRIT_SOURCE_REPO:-${HPC_WORK_ROOT}/GRIT_pristine}"
 export GRIT_RECOVERY_CKPT_PERIOD="${GRIT_RECOVERY_CKPT_PERIOD:-10}"
-export GRIT_WANDB="${GRIT_WANDB:-0}"
+export GRIT_WANDB=0
 TRAIN_TIME_LIMIT="${GRIT_JOB_TIME_LIMIT:-06:00:00}"
 
 if [[ ! -f "${GRIT_MANIFEST}" ]]; then
@@ -27,17 +27,13 @@ if [[ ! -f "${GRIT_MANIFEST}" ]]; then
   exit 2
 fi
 
-for task in zinc qm9_gap peptides_func peptides_struct; do
-  marker="${GRIT_DATA_ROOT}/${task}/.grit_base_dataset_ready.json"
-  if [[ ! -f "${marker}" ]]; then
-    echo "Dataset readiness marker is missing: ${marker}" >&2
-    exit 2
-  fi
-done
+python "${PROJECT_ROOT}/experiments/grit_hpc/bin/grit_hpc.py" check-datasets \
+  --tasks zinc,qm9_gap,peptides_func,peptides_struct \
+  --dataset-root "${GRIT_DATA_ROOT}"
 
 cd "${PROJECT_ROOT}"
 RESUBMIT_JOB="$(sbatch --parsable \
-  --export=ALL,WANDB_API_KEY,WANDB_MODE,WANDB_PROJECT \
+  --export=ALL \
   -A mlmi-jgg45-sl2-gpu -p ampere --qos=gpu1 \
   -N 1 --ntasks=1 --gres=gpu:1 \
   --time="${TRAIN_TIME_LIMIT}" \

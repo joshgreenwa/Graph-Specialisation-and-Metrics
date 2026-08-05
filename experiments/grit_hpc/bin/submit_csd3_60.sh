@@ -14,7 +14,9 @@ export GRIT_TRACKING_FILE="${GRIT_TRACKING_FILE:-${HPC_WORK_ROOT}/grit_manifests
 export GRIT_STAGE_TRACKING_FILE="${GRIT_STAGE_TRACKING_FILE:-${HPC_WORK_ROOT}/grit_manifests/grit_dataset_staging.jobs.tsv}"
 export GRIT_SOURCE_REPO="${GRIT_SOURCE_REPO:-${HPC_WORK_ROOT}/GRIT_pristine}"
 export GRIT_RECOVERY_CKPT_PERIOD="${GRIT_RECOVERY_CKPT_PERIOD:-10}"
-export GRIT_WANDB="${GRIT_WANDB:-0}"
+# This batch is intentionally W&B-free. Do not inherit a stale interactive
+# GRIT_WANDB=1 from the submission shell.
+export GRIT_WANDB=0
 
 TRAIN_TIME_LIMIT="${GRIT_JOB_TIME_LIMIT:-06:00:00}"
 STAGE_TIME_LIMIT="${GRIT_STAGE_TIME_LIMIT:-01:00:00}"
@@ -90,7 +92,7 @@ STAGE_JOB="${STAGE_JOB%%;*}"
 
 # 60 x 6 hours = 360 requested GPU-hours against the 400-hour GPU balance.
 TRAIN_JOB="$(sbatch --parsable \
-  --export=ALL,WANDB_API_KEY,WANDB_MODE,WANDB_PROJECT \
+  --export=ALL \
   -A mlmi-jgg45-sl2-gpu -p ampere --qos=gpu1 \
   -N 1 --ntasks=1 --gres=gpu:1 \
   --time="${TRAIN_TIME_LIMIT}" \
@@ -107,7 +109,7 @@ python "${PROJECT_ROOT}/experiments/grit_hpc/bin/grit_hpc.py" write-tracking \
   --log-root "${PROJECT_ROOT}/logs" \
   --output "${GRIT_TRACKING_FILE}"
 
-echo "Dataset staging array: ${STAGE_JOB} (${STAGE_TIME_LIMIT} each; ${STAGE_REQUEST_HOURS} CPU-hours max)"
+echo "Dataset staging job:   ${STAGE_JOB} (${STAGE_TIME_LIMIT}; ${STAGE_REQUEST_HOURS} CPU-hours max)"
 echo "Training array:        ${TRAIN_JOB} (${TRAIN_TIME_LIMIT} each; ${TRAIN_REQUEST_HOURS} GPU-hours max)"
 echo "Initial GPU request:   ${TOTAL_REQUEST_HOURS} GPU-hours maximum"
 echo "Persistent outputs:    ${GRIT_OUTPUT_ROOT}"

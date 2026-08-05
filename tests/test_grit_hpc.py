@@ -4,6 +4,7 @@ import csv
 import importlib.util
 import json
 import sys
+import zipfile
 from types import SimpleNamespace
 from pathlib import Path
 
@@ -105,7 +106,10 @@ def test_manifest_round_trip_and_dry_run_reserves_output(hpc, tmp_path):
     assert hpc.read_manifest(manifest) == [job]
 
     marker = hpc.dataset_ready_path(tmp_path / "datasets", job.task)
-    hpc.atomic_write_json(marker, {"task": job.task})
+    hpc.atomic_write_json(
+        marker,
+        {"task": job.task, "layout_version": hpc.DATASET_LAYOUT_VERSION},
+    )
     hpc.main(
         [
             "run",
@@ -191,6 +195,8 @@ def test_csd3_launcher_stays_within_400_gpu_hours():
     assert "mlmi-jgg45-sl2-cpu -p sapphire --qos=intr" in script
     assert "--array=0-3" not in script
     assert "2 * ${STAGE_SECONDS}" in script
+    assert "export GRIT_WANDB=0" in script
+    assert "WANDB_API_KEY" not in script
     assert "mlmi-jgg45-sl2-gpu" in script
     assert "/rds/user/jgg45/hpc-work" in script
 
@@ -211,3 +217,58 @@ def test_gpu_worker_requires_staged_dataset(hpc, tmp_path):
                 "--dry-run",
             ]
         )
+
+
+def test_gpu_worker_rejects_stale_dataset_layout(hpc, tmp_path):
+    marker = hpc.dataset_ready_path(tmp_path / "datasets", "zinc")
+    hpc.atomic_write_json(marker, {"task": "zinc", "layout_version": 1})
+    with pytest.raises(RuntimeError, match="layout version"):
+        hpc.require_dataset_ready(tmp_path / "datasets", "zinc")
+
+    with pytest.raises(RuntimeError, match="layout version"):
+        hpc.main(
+            [
+                "check-datasets",
+                "--tasks",
+                "zinc",
+                "--dataset-root",
+                str(tmp_path / "datasets"),
+            ]
+        )
+
+
+def test_zinc_staging_matches_grit_cache_and_recovers_corrupt_zip(
+    hpc, tmp_path, monkeypatch
+):
+    torch_geometric_datasets = pytest.importorskip("torch_geometric.datasets")
+    calls = []
+
+    class FakeZINC:
+        def __init__(self, root, subset, split):
+            assert subset is True
+            root_path = Path(root)
+            calls.append((root_path, split))
+            root_path.mkdir(parents=True, exist_ok=True)
+            if len(calls) == 1:
+                (root_path / "molecules.zip").write_bytes(b"truncated")
+                raise zipfile.BadZipFile("simulated interrupted download")
+            processed = root_path / "processed"
+            processed.mkdir(parents=True, exist_ok=True)
+            (processed / f"{split}.pt").touch()
+
+    monkeypatch.setattr(torch_geometric_datasets, "ZINC", FakeZINC)
+    dataset_root = tmp_path / "datasets"
+    hpc.stage_one_dataset(
+        "zinc",
+        dataset_root,
+        tmp_path / "scratch",
+        "unused-for-zinc",
+    )
+
+    expected_root = dataset_root / "zinc" / "ZINC"
+    assert [root for root, _split in calls] == [expected_root] * 4
+    assert [split for _root, split in calls] == ["train", "train", "val", "test"]
+    assert not (expected_root / "molecules.zip").exists()
+    assert hpc.dataset_marker_is_current(
+        hpc.dataset_ready_path(dataset_root, "zinc"), "zinc"
+    )

@@ -17,6 +17,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import zipfile
 from collections import Counter
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -40,6 +41,7 @@ TASK_HOP_LIMITS = {
     "peptides_struct": 23,
 }
 READY_FILE = ".grit_base_dataset_ready.json"
+DATASET_LAYOUT_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -179,11 +181,22 @@ def dataset_ready_path(dataset_root: Path, task: str) -> Path:
     return task_dataset_dir(dataset_root, task) / READY_FILE
 
 
+def dataset_marker_is_current(marker: Path, task: str) -> bool:
+    if not marker.is_file():
+        return False
+    try:
+        payload = json.loads(marker.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return False
+    return payload.get("task") == task and payload.get("layout_version") == DATASET_LAYOUT_VERSION
+
+
 def require_dataset_ready(dataset_root: Path, task: str) -> None:
     marker = dataset_ready_path(dataset_root, task)
-    if not marker.is_file():
+    if not dataset_marker_is_current(marker, task):
         raise RuntimeError(
-            f"base dataset for {task} is not staged ({marker} missing). "
+            f"base dataset for {task} is not staged with layout version "
+            f"{DATASET_LAYOUT_VERSION} ({marker} missing or stale). "
             "Run the dataset staging Slurm job before launching the GPU array."
         )
 
@@ -332,7 +345,7 @@ def stage_one_dataset(task: str, dataset_root: Path, scratch_root: Path, grit_so
     lock_dir.mkdir(parents=True, exist_ok=True)
     with (lock_dir / f"{task}.lock").open("a+") as lock_handle:
         fcntl.flock(lock_handle, fcntl.LOCK_EX)
-        if marker.is_file():
+        if dataset_marker_is_current(marker, task):
             log(f"[dataset] already staged: {task} -> {destination}")
             return
         destination.mkdir(parents=True, exist_ok=True)
@@ -340,12 +353,25 @@ def stage_one_dataset(task: str, dataset_root: Path, scratch_root: Path, grit_so
         if task == "zinc":
             from torch_geometric.datasets import ZINC
 
-            for split in ("train", "val", "test"):
-                ZINC(root=str(destination), subset=True, split=split)
+            # GRIT's PyG master loader appends the dataset class name to
+            # dataset.dir before constructing ZINC.
+            pyg_root = destination / "ZINC"
+            try:
+                for split in ("train", "val", "test"):
+                    ZINC(root=str(pyg_root), subset=True, split=split)
+            except zipfile.BadZipFile:
+                # A prior concurrent first download can leave this exact
+                # archive truncated. Remove only the corrupt archive and retry.
+                corrupt_archive = pyg_root / "molecules.zip"
+                if corrupt_archive.is_file():
+                    corrupt_archive.unlink()
+                for split in ("train", "val", "test"):
+                    ZINC(root=str(pyg_root), subset=True, split=split)
         elif task == "qm9_gap":
             from torch_geometric.datasets import QM9
 
-            QM9(root=str(destination))
+            # The patched GRIT PyG-QM9 route likewise appends "QM9".
+            QM9(root=str(destination / "QM9"))
         else:
             from graph_specialisation_metrics.grit_patches import peptides as peptide_helpers
 
@@ -372,7 +398,12 @@ def stage_one_dataset(task: str, dataset_root: Path, scratch_root: Path, grit_so
             raise RuntimeError(f"dataset staging produced no processed .pt files under {destination}")
         atomic_write_json(
             marker,
-            {"task": task, "processed_files": sorted(processed), "grit_commit": OFFICIAL_GRIT_COMMIT},
+            {
+                "task": task,
+                "layout_version": DATASET_LAYOUT_VERSION,
+                "processed_files": sorted(processed),
+                "grit_commit": OFFICIAL_GRIT_COMMIT,
+            },
         )
         log(f"[dataset] staged {task}: {marker}")
 
@@ -545,6 +576,15 @@ def command_stage(args: argparse.Namespace) -> None:
         stage_one_dataset(task, args.dataset_root, args.scratch_root, args.grit_source)
 
 
+def command_check_datasets(args: argparse.Namespace) -> None:
+    tasks = split_csv(args.tasks)
+    for task in tasks:
+        if task not in TASKS:
+            raise ValueError(f"unknown task {task!r}")
+        require_dataset_ready(args.dataset_root, task)
+    log(f"[dataset] current readiness markers verified: {','.join(tasks)}")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -602,6 +642,13 @@ def build_parser() -> argparse.ArgumentParser:
     stage.add_argument("--scratch-root", type=Path, required=True)
     stage.add_argument("--grit-source", default=OFFICIAL_GRIT_REPO)
     stage.set_defaults(func=command_stage)
+
+    check = subparsers.add_parser(
+        "check-datasets", help="Verify versioned base-dataset readiness markers."
+    )
+    check.add_argument("--tasks", default=",".join(TASKS))
+    check.add_argument("--dataset-root", type=Path, required=True)
+    check.set_defaults(func=command_check_datasets)
     return parser
 
 

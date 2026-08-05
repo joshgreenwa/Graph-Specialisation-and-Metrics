@@ -36,14 +36,13 @@ cd /rds/user/jgg45/hpc-work/Graph-Specialisation-and-Metrics
 # Optional if the current shell environment is not sufficient on compute nodes:
 export ENV_ACTIVATE=/rds/user/jgg45/hpc-work/venvs/grit/bin/activate
 
-# Optional W&B; tracking remains disabled unless GRIT_WANDB=1.
-export WANDB_API_KEY=...
-export WANDB_MODE=online
-export WANDB_PROJECT=grit-multi-dataset
-export GRIT_WANDB=1
-
 bash experiments/grit_hpc/bin/submit_csd3_60.sh
 ```
+
+The prepared CSD3 launcher deliberately forces W&B off so an inherited
+`GRIT_WANDB` or stale API key cannot make a training job fail. Slurm job IDs,
+logs, checkpoints, and progress remain available through the local tracking
+ledger and status command below.
 
 The script uses:
 
@@ -196,10 +195,12 @@ Do this before the GPU array:
 (cd "$PROJECT_ROOT" && sbatch experiments/grit_hpc/slurm/stage_datasets.sbatch)
 ```
 
-The staging job processes the four datasets sequentially and writes a readiness
-marker for each. GPU workers fail early if a marker is absent, rather than
-racing to download/process the same shared cache. RRWP statistics are still
-computed by each model using that model's configured horizon.
+The staging job processes the four datasets sequentially and writes a
+versioned readiness marker for each. ZINC and QM9 are staged at the nested PyG
+cache roots used by GRIT (`zinc/ZINC` and `qm9_gap/QM9`). GPU workers fail early
+if a marker is absent or stale, rather than racing to download/process the same
+shared cache. RRWP statistics are still computed by each model using that
+model's configured horizon.
 
 Then launch the GPU array:
 
