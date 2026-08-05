@@ -363,6 +363,20 @@ def apply_peptides_dataset_compat_patch(base: Any, repo_dir: Path) -> None:
                 ),
                 1,
             )
+        # Pandas 2.1+ warns once per graph when a Series is implicitly consumed
+        # positionally by torch.Tensor([series]). Convert explicitly instead.
+        text = text.replace(
+            "            smiles = smiles_list[i]\n",
+            "            smiles = smiles_list.iloc[i]\n",
+        )
+        text = text.replace(
+            "            data.y = torch.Tensor([y])\n",
+            (
+                "            data.y = torch.from_numpy(\n"
+                "                y.to_numpy(dtype='float32')).view(1, -1)\n"
+            ),
+            1,
+        )
         text = text.replace(
             "        if decide_download(self.url):\n",
             "        if True:  # Colab runner: non-interactive official dataset download.\n",

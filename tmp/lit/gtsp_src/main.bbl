@@ -1,0 +1,218 @@
+\begin{thebibliography}{38}
+\providecommand{\natexlab}[1]{#1}
+
+\bibitem[{Bian et~al.(2021)Bian, Huang, Cai, Yuan, and
+  Church}]{redundancy-attention}
+Bian, Y.; Huang, J.; Cai, X.; Yuan, J.; and Church, K. 2021.
+\newblock On Attention Redundancy: A Comprehensive Study.
+\newblock In \emph{ACL}.
+
+\bibitem[{Chen et~al.(2023)Chen, Gao, Li, and He}]{nagphormer}
+Chen, J.; Gao, K.; Li, G.; and He, K. 2023.
+\newblock {NAG}phormer: A Tokenized Graph Transformer for Node Classification
+  in Large Graphs.
+\newblock In \emph{ICLR}.
+
+\bibitem[{Chen et~al.(2021{\natexlab{a}})Chen, Cheng, Gan, Yuan, Zhang, and
+  Wang}]{svite}
+Chen, T.; Cheng, Y.; Gan, Z.; Yuan, L.; Zhang, L.; and Wang, Z.
+  2021{\natexlab{a}}.
+\newblock Chasing sparsity in vision transformers: An end-to-end exploration.
+\newblock \emph{NeurIPS}, 34: 19974--19988.
+
+\bibitem[{Chen et~al.(2021{\natexlab{b}})Chen, Sui, Chen, Zhang, and
+  Wang}]{ugs}
+Chen, T.; Sui, Y.; Chen, X.; Zhang, A.; and Wang, Z. 2021{\natexlab{b}}.
+\newblock A unified lottery ticket hypothesis for graph neural networks.
+\newblock In \emph{ICML}.
+
+\bibitem[{Clark et~al.(2019)Clark, Khandelwal, Levy, and Manning}]{JS-distance}
+Clark, K.; Khandelwal, U.; Levy, O.; and Manning, C.~D. 2019.
+\newblock What Does {BERT} Look at? An Analysis of {BERT}{'}s Attention.
+\newblock In \emph{ACL Workshop}.
+
+\bibitem[{Dalvi et~al.(2020)Dalvi, Sajjad, Durrani, and
+  Belinkov}]{redundancy-ana}
+Dalvi, F.; Sajjad, H.; Durrani, N.; and Belinkov, Y. 2020.
+\newblock Analyzing Redundancy in Pretrained Transformer Models.
+\newblock In \emph{EMNLP}.
+
+\bibitem[{Dwivedi and Bresson(2021)}]{graph-transformer}
+Dwivedi, V.~P.; and Bresson, X. 2021.
+\newblock A Generalization of Transformer Networks to Graphs.
+\newblock \emph{AAAI Workshop}.
+
+\bibitem[{Evci et~al.(2020)Evci, Gale, Menick, Castro, and Elsen}]{growth-rigl}
+Evci, U.; Gale, T.; Menick, J.; Castro, P.~S.; and Elsen, E. 2020.
+\newblock Rigging the lottery: Making all tickets winners.
+\newblock In \emph{ICML}.
+
+\bibitem[{Fan, Grave, and Joulin(2020)}]{layer-prune}
+Fan, A.; Grave, E.; and Joulin, A. 2020.
+\newblock Reducing Transformer Depth on Demand with Structured Dropout.
+\newblock In \emph{ICLR}.
+
+\bibitem[{Frankle and Carbin(2019)}]{lth}
+Frankle, J.; and Carbin, M. 2019.
+\newblock The Lottery Ticket Hypothesis: Finding Sparse, Trainable Neural
+  Networks.
+\newblock In \emph{ICLR}.
+
+\bibitem[{Hoefler et~al.(2021)Hoefler, Alistarh, Ben-Nun, Dryden, and
+  Peste}]{survey-pruning}
+Hoefler, T.; Alistarh, D.; Ben-Nun, T.; Dryden, N.; and Peste, A. 2021.
+\newblock Sparsity in deep learning: Pruning and growth for efficient inference
+  and training in neural networks.
+\newblock \emph{JMLR}, 22(1): 10882--11005.
+
+\bibitem[{Hu et~al.(2020)Hu, Fey, Zitnik et~al.}]{ogb-dataset}
+Hu, W.; Fey, M.; Zitnik, M.; et~al. 2020.
+\newblock Open Graph Benchmark: Datasets for Machine Learning on Graphs.
+\newblock \emph{arXiv:2005.00687}.
+
+\bibitem[{Huang et~al.(2016)Huang, Sun, Liu, Sedra, and
+  Weinberger}]{layer-drop}
+Huang, G.; Sun, Y.; Liu, Z.; Sedra, D.; and Weinberger, K.~Q. 2016.
+\newblock Deep networks with stochastic depth.
+\newblock In \emph{ECCV}.
+
+\bibitem[{Hui et~al.(2023)Hui, Yan, Ma, and Ku}]{glt}
+Hui, B.; Yan, D.; Ma, X.; and Ku, W.-S. 2023.
+\newblock Rethinking Graph Lottery Tickets: Graph Sparsity Matters.
+\newblock In \emph{ICLR}.
+
+\bibitem[{Hussain, Zaki, and Subramanian(2022)}]{egt}
+Hussain, M.~S.; Zaki, M.~J.; and Subramanian, D. 2022.
+\newblock Global Self-Attention as a Replacement for Graph Convolution.
+\newblock In \emph{SIGKDD}.
+
+\bibitem[{Kim et~al.(2022)Kim, Shen, Thorsley, Gholami, Kwon, Hassoun, and
+  Keutzer}]{ltp}
+Kim, S.; Shen, S.; Thorsley, D.; Gholami, A.; Kwon, W.; Hassoun, J.; and
+  Keutzer, K. 2022.
+\newblock Learned Token Pruning for Transformers.
+\newblock In \emph{SIGKDD}.
+
+\bibitem[{Kipf and Welling(2017)}]{gcn}
+Kipf, T.~N.; and Welling, M. 2017.
+\newblock Semi-Supervised Classification with Graph Convolutional Networks.
+\newblock In \emph{ICLR}.
+
+\bibitem[{Kornblith et~al.(2019)Kornblith, Norouzi, Lee, and Hinton}]{cka}
+Kornblith, S.; Norouzi, M.; Lee, H.; and Hinton, G. 2019.
+\newblock Similarity of Neural Network Representations Revisited.
+\newblock In \emph{ICML}.
+
+\bibitem[{Kreuzer et~al.(2021)Kreuzer, Beaini, Hamilton, L{\'e}tourneau, and
+  Tossou}]{san}
+Kreuzer, D.; Beaini, D.; Hamilton, W.~L.; L{\'e}tourneau, V.; and Tossou, P.
+  2021.
+\newblock Rethinking Graph Transformers with Spectral Attention.
+\newblock In \emph{NeurIPS}.
+
+\bibitem[{Liang et~al.(2022)Liang, GE, Tong, Song, Wang, and Xie}]{evit}
+Liang, Y.; GE, C.; Tong, Z.; Song, Y.; Wang, J.; and Xie, P. 2022.
+\newblock {EV}iT: Expediting Vision Transformers via Token Reorganizations.
+\newblock In \emph{ICLR}.
+
+\bibitem[{Liu et~al.(2023)Liu, Ma, Zhan et~al.}]{cgp}
+Liu, C.; Ma, X.; Zhan, Y.; et~al. 2023.
+\newblock Comprehensive Graph Gradual Pruning for Sparse Training in Graph
+  Neural Networks.
+\newblock \emph{IEEE TNNLS}.
+
+\bibitem[{Liu et~al.(2021)Liu, Chen, Chen et~al.}]{granet}
+Liu, S.; Chen, T.; Chen, X.; et~al. 2021.
+\newblock Sparse training via boosting pruning plasticity with
+  neuroregeneration.
+\newblock In \emph{NeurIPS}.
+
+\bibitem[{Liu et~al.(2022)Liu, Yan, Deng et~al.}]{surve-graph-pruning}
+Liu, X.; Yan, M.; Deng, L.; et~al. 2022.
+\newblock Survey on Graph Neural Network Acceleration: An Algorithmic
+  Perspective.
+\newblock In \emph{IJCAI}.
+
+\bibitem[{Michel, Levy, and Neubig(2019)}]{head-sixteen}
+Michel, P.; Levy, O.; and Neubig, G. 2019.
+\newblock Are sixteen heads really better than one?
+\newblock In \emph{NeurIPS}.
+
+\bibitem[{Min et~al.(2022)Min, Chen, Bian et~al.}]{transformer-review}
+Min, E.; Chen, R.; Bian, Y.; et~al. 2022.
+\newblock Transformer for Graphs: An Overview from Architecture Perspective.
+\newblock \emph{arXiv:2202.08455}.
+
+\bibitem[{Mocanu et~al.(2018)Mocanu, Mocanu, Stone et~al.}]{growth-set}
+Mocanu, D.~C.; Mocanu, E.; Stone, P.; et~al. 2018.
+\newblock Scalable training of artificial neural networks with adaptive sparse
+  connectivity inspired by network science.
+\newblock \emph{Nature communications}.
+
+\bibitem[{Ramp\'{a}\v{s}ek et~al.(2022)Ramp\'{a}\v{s}ek, Galkin, Dwivedi
+  et~al.}]{graphgps}
+Ramp\'{a}\v{s}ek, L.; Galkin, M.; Dwivedi, V.~P.; et~al. 2022.
+\newblock {Recipe for a General, Powerful, Scalable Graph Transformer}.
+\newblock In \emph{NeurIPS}.
+
+\bibitem[{Rong et~al.(2020)Rong, Bian, Xu et~al.}]{grover}
+Rong, Y.; Bian, Y.; Xu, T.; et~al. 2020.
+\newblock Self-Supervised Graph Transformer on Large-Scale Molecular Data.
+\newblock In \emph{NeurIPS}.
+
+\bibitem[{Sz{\'e}kely, Rizzo, and Bakirov(2007)}]{dcor}
+Sz{\'e}kely, G.~J.; Rizzo, M.~L.; and Bakirov, N.~K. 2007.
+\newblock Measuring and testing dependence by correlation of distances.
+\newblock \emph{The Annals of Statistics}.
+
+\bibitem[{Vaswani et~al.(2017)Vaswani, Shazeer, Parmar et~al.}]{transformer}
+Vaswani, A.; Shazeer, N.; Parmar, N.; et~al. 2017.
+\newblock Attention is All you Need.
+\newblock In \emph{NeurIPS}.
+
+\bibitem[{Voita et~al.(2019)Voita, Talbot, Moiseev, Sennrich, and
+  Titov}]{head-analysis}
+Voita, E.; Talbot, D.; Moiseev, F.; Sennrich, R.; and Titov, I. 2019.
+\newblock Analyzing Multi-Head Self-Attention: Specialized Heads Do the Heavy
+  Lifting, the Rest Can Be Pruned.
+\newblock In \emph{ACL}.
+
+\bibitem[{Wu et~al.(2021)Wu, Jain, Wright et~al.}]{graphtrans}
+Wu, Z.; Jain, P.; Wright, M.; et~al. 2021.
+\newblock Representing Long-Range Context for Graph Neural Networks with Global
+  Attention.
+\newblock In \emph{NeurIPS}.
+
+\bibitem[{Ying et~al.(2021)Ying, Cai, Luo et~al.}]{graphormer-v1}
+Ying, C.; Cai, T.; Luo, S.; et~al. 2021.
+\newblock Do Transformers Really Perform Badly for Graph Representation?
+\newblock In \emph{NeurIPS}.
+
+\bibitem[{You et~al.(2022)You, Lu, Zhou, Fu, and Lin}]{gebt}
+You, H.; Lu, Z.; Zhou, Z.; Fu, Y.; and Lin, Y. 2022.
+\newblock Early-Bird GCNs: Graph-Network Co-Optimization Towards More Efficient
+  GCN Training and Inference via Drawing Early-Bird Lottery Tickets.
+\newblock In \emph{AAAI}.
+
+\bibitem[{Yu et~al.(2022)Yu, Huang, Wang et~al.}]{wdpruning}
+Yu, F.; Huang, K.; Wang, M.; et~al. 2022.
+\newblock Width \& depth pruning for vision transformers.
+\newblock In \emph{AAAI}.
+
+\bibitem[{Zhang et~al.(2022)Zhang, Liu, Hu, and Lee}]{ans-gt}
+Zhang, Z.; Liu, Q.; Hu, Q.; and Lee, C.-K. 2022.
+\newblock Hierarchical graph transformer with adaptive node sampling.
+\newblock In \emph{NeurIPS}.
+
+\bibitem[{Zhao et~al.(2023)Zhao, Ma, Zhang, Deng, and Wei}]{deepgraph}
+Zhao, H.; Ma, S.; Zhang, D.; Deng, Z.-H.; and Wei, F. 2023.
+\newblock Are More Layers Beneficial to Graph Transformers?
+\newblock In \emph{ICLR}.
+
+\bibitem[{Zhu and Gupta(2017)}]{gradual-prune}
+Zhu, M.; and Gupta, S. 2017.
+\newblock To prune, or not to prune: exploring the efficacy of pruning for
+  model compression.
+\newblock \emph{arXiv:1710.01878}.
+
+\end{thebibliography}

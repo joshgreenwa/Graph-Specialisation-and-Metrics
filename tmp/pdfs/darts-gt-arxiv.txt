@@ -1,0 +1,1542 @@
+
+=== PAGE 1 ===
+JOURNAL OF LATEX CLASS FILES, VOL., NO., OCTOBER 2025 1
+DARTS-GT: Differentiable Architecture Search for
+Graph Transformers with Quantifiable
+Instance-Specific Interpretability Analysis
+Shruti Sarika Chakraborty Peter Minary
+Abstract—Graph Transformers (GTs) have emerged as pow- Current state-of-the-art GTs incorporate graph structure
+erful architectures for graph-structured data, yet remain con- through GNN-Transformer combinations [2], [6], specialized
+strained by rigid designs and lack quantifiable interpretability positional encodings [7], and attention augmentation with
+methods. Current state-of-the-art GTs commit to fixed GNN
+structural biases [8]. However, these architectures commit to
+types across all layers, missing potential benefits of depth-
+a fixed GNN type throughout all layers or a predetermined
+specific component selection, while their increasingly complex
+architectures become opaque black boxes where performance encoding scheme. This rigidity prompts an investigation into
+gains cannot be distinguished between meaningful structural whether GTs benefit from depth-specific component selection.
+patterns and spurious correlations. We redesign the GT attention Depth-specific, task-adaptive GNN selection is motivated by
+mechanism through asymmetry, decoupling structural encoding
+recent neural-architecture-search (NAS) successes in GNNs.
+from feature representation. Queries derive directly from node
+Methods like GraphNAS [9], SANE [10], and PAS [11] show
+features, while keys and values come from graph neural network
+(GNN) transformations, separating how the model learns features that heterogeneous architectures employing different GNN
+from how it encodes graph structure. Within this asymmetric operations across depths outperform homogeneous models.
+framework, we use Differentiable ARchiTecture Search (DARTS) These works reveal that optimal architectures develop dataset-
+to select optimal GNN operators at each layer, enabling depth-
+adaptive depth-wise specialization, learning complementary
+wise heterogeneity inside the transformer attention itself, hence
+patterns at different scales. In GTs, where multiple attention
+the name DARTS-GT. To understand these discovered architec-
+tures, we develop the first quantitative interpretability framework heads already capture diverse node-node interactions, depth-
+for GTs through causal ablation that identifies which heads and wise architectural diversity becomes even more compelling,
+nodes actually drive predictions. Our metrics: Head-deviation, yet remains unexplored.
+Specialization, and Focus, reveal the specific components re-
+Relaxing architectural constraints introduces a broader chal-
+sponsible for each prediction while enabling broader model
+lenge. As Graph Transformer variants become more flexible,
+comparison. Experiments across eight benchmarks demonstrate
+that DARTS-GT achieves state-of-the-art performance on four their internal decision processes become increasingly opaque.
+datasets while remaining competitive on others, with discovered Without interpretability methods, it is difficult to determine
+architectures revealing dataset-specific patterns ranging from whether reported gains reflect meaningful structural patterns
+highly specialized to balanced GNN distributions. Our inter-
+or spurious correlations. This, for example, forms a crucial
+pretability analysis reveals that visual attention salience and
+distinction in scientific domains such as drug discovery, where
+causal importance do not necessarily correlate, indicating that
+widely used visualization approaches may miss the components predictions must be justifiable. However, this issue is not
+that actually matter for predictions. Crucially, the heterogeneous specific to a particular GT design: for instance, in GraphGPS
+architectures found by DARTS-GT consistently produced more (also referred to as GPS) [6], which has a hybrid-GT architec-
+interpretable models than baseline GTs, establishing that Graph
+ture by combining message-passing-neural-networks (MPNN)
+Transformers do not need to choose between performance and
+in parallel with transformer attention, it is unclear whether
+interpretability.
+improvements arise from the auxiliary MPNN or the Trans-
+Index Terms—Graph Transformers, Neural Architecture
+former path. Similarly, in Graph-Trans [12] and SAT [2], the
+Search, Interpretability, Causal Ablation, Graph Neural Net-
+contribution of the GNN pre-encoding or k-subtree extraction,
+works
+respectively, is similarly entangled. In short, regardless of
+the GT approach, interpretability is essential to clarify which
+I. INTRODUCTION components and structures truly drive model performance.
+Recent NAS efforts for GTs include EGTAS [13], Au-
+For graph-structured data, Graph Transformers (GTs) have
+toGT [14], UNIFIEDGT [15] and UGAS [16]. EGTAS
+become a dominant architectural choice, combining attention
+uses evolutionary search to explore topologies and graph-
+mechanisms with graph-awareness [1], [2]. Their success
+aware strategies by searching through established architec-
+spans protein structure-to-function prediction [3], drug dis-
+tural paradigms from state-of-the-art designs. This essentially
+covery [4], and materials design [5], where understanding
+navigates between existing construction patterns, selecting in
+complex structural patterns is crucial.
+this process a single GNN block type, applied uniformly
+across depth. AutoGT employs evolutionary strategies over
+Department of Computer Science, University of Oxford, Oxford
+established GT templates and encodings, without depth-wise
+OX1 3QG, UK. Emails: shruti.chakraborty@cs.ox.ac.uk,
+peter.minary@cs.ox.ac.uk. GNN selection. UNIFIEDGT exposes modular search over
+5202
+tcO
+03
+]GL.sc[
+2v63341.0152:viXra
+
+=== PAGE 2 ===
+JOURNAL OF LATEX CLASS FILES, VOL., NO., OCTOBER 2025 2
+components and selects an overall configuration rather than mechanism rather than through external augmentation, thereby
+layer-wise GNN selection within attention blocks. UGAS uses rewiring how GTs capture graph structure. The search proce-
+Differentiable ARchiTecture Search (DARTS) or Genetic Al- dure is powered by DARTS [27], which leverages gradient-
+gorithms (GA) to search over subsets of MPNN modules (e.g., based optimization of the continuously relaxed architecture
+GCN [17], GAT [18]) and GT modules (Transformer [19], space, avoiding the expense of training discrete candidates
+Performer [20]) deployed in parallel within each layer. Each from scratch. DARTS has been extensively validated in prior
+layer may contain only MPNNs, only GTs, or any mixture, graph NAS studies (e.g., SANE [10], GASSO [28], PAS [11],
+with GTs treated as optional candidates rather than architec- UGAS), underscoring its computational efficiency and robust-
+tural foundations. ness in navigating combinatorial design spaces.
+The selection of depth-specific GNN presents a formidable Second, we introduce a Fidelity like [29], [30], instance-
+optimization problem: with n GNN variants across L layers, level, ablation-grounded score: Head-deviation, quantifying
+the search space contains nL configurations. Thus, system- prediction changes when specific heads are masked. From per-
+atic exploration of this search space is infeasible in most head effects on each instance, we compute two complementary
+practical applications. An effective search must intelligently metrics: Specialization captures head distinguishability as dis-
+adapt to datasets and tasks, determining which GNN types to persion of head impacts (high = few heads carry causal load;
+deploy and their optimal layer positions (depth). This requires low = heads act interchangeably); Focus captures consensus
+automated search techniques, specifically NAS, capable of over graph regions by measuring top-head agreement on top-k
+navigating this vast configuration space. nodes (high = heads converge on same salient substructures
+These discovered architectures must also be interpretable for or nodes). Aggregating per-instance values by dataset median
+trustworthiness and scientific validity. Unlike well-developed yields robust model-level summaries. Together, these form
+GNN explainability methods [21] that identify prediction- our interpretability framework that we propose to analyse
+critical subgraphs, GT interpretation, widely regarded as a our model along with existing models for comparison. Head-
+blackbox [22], remains dominated by attention visualiza- deviation provides head and graph-region attributions per
+tion [23] lacking quantitative metrics and the ability to differ- input, while median Specialization and median Focus enable
+entiate visually prominent but functionally irrelevant patterns dataset-level GT comparison indicating which model is easier
+from subtle yet critical ones. More recently, noteworthy efforts to interpret at matched accuracy.
+in GT interpretability have focused on analyzing attention This interpretation is particularly valuable in applica-
+graphs (i.e. aggregating head/layer attention into an atten- tions like drug toxicity prediction. When identifying toxic
+tion graph) [24]. However, none of the prior methods test molecules, practitioners must verify the focus on actual tox-
+faithfulness (whether heads/nodes causally affect predictions) icophores versus spurious correlations critical for regulatory
+nor enable cross-model comparison via standardized scores. approval and scientific validity. Also, without methods to
+Task-specific self-explanations exist but do not generalize to quantify the difficulty of interpretation, meaningful archi-
+arbitrary GTs or provide head attributions [25]. We seek a GT- tecture comparison remains impossible. Our framework pro-
+agnostic instance-level interpretability framework grounded vides quantifiable metrics representing the first quantitative
+in perturbation/ablation that delivers model-level scores for framework for both globally evaluating and comparing GT
+comparing GT interpretability. interpretability while providing instance-specific analysis that
+Hence, our investigation addresses two complementary re- traces predictions from architectural components to graph
+search questions: Q1: Can Graph Transformers achieve im- regions.
+proved performance and adaptability by dynamically selecting Our specific contributions:
+GNN types per layer (depthwise) and creating dataset-specific 1) The first DARTS-based architecture search for depth-
+architectures ranging from uniform to heterogeneous? Q2: wise GNN selection within GT layers, exploring het-
+How can we quantitatively assess the interpretability of a erogeneity through layer-specific GNN operators within
+GT and identify which regions of the graph and architectural attention blocks. Our approach maintains computational
+components drive specific predictions? efficiency to find depth-wise optimal GNN selections
+These questions are inter-linked: Q1 explores performance among the possible configurations (n GNN variants,
+potential, while Q2 ensures interpretability and trustworthi- L layers). This enables automated discovery of task
+ness, essential for high-stakes domains. optimal architectures.
+To address these challenges, we introduce a comprehensive 2) Strong empirical performance achieving competitive or
+framework with two synergistic components: SOTA results on multiple benchmarks. Our architec-
+First, we employ DARTS to select GNN operators within ture consistently outperforms standard GTs [19] across
+the attention blocks at each layer. In doing so, we reimagine dense and sparse attention mechanisms, while match-
+the asymmetric attention mechanism initially proposed by ing or exceeding established baselines: Recent GNNs
+GMTPool [26], but in a more computationally efficient form: (e.g. GCN [17], GIN [31], GatedGCN [32]), recent
+queries are derived directly from node features, while keys GT architectures (e.g. GPS [6], Graphormer [8]), and
+and values are obtained through GNN transformations of those NAS-based approaches (e.g. EGTAS [13], AutoGT [14],
+features. This design explicitly separates structural encoding UGAS [16]).
+from feature representation and enables depth-wise hetero- 3) To our knowledge, we also introduce the first GT-
+geneity across layers, embedding it directly inside the attention agnostic interpretability framework that is both instance-
+
+=== PAGE 3 ===
+JOURNAL OF LATEX CLASS FILES, VOL., NO., OCTOBER 2025 3
+level and quantitative. We compute an ablation-grounded suffers from computational inefficiency: each attention head
+Head-deviation metric per input, then derive Specializa- requires independent GNN operations for its keys and values,
+tion (head distinguishability) and Focus (consensus of scaling complexity linearly with head count. Moreover, their
+top-head node sets). Dataset-level medians provide ro- framework remains confined to graph-level pooling rather than
+bust model-level summaries, enabling both local evalua- general transformation layers. We borrow the idea of asymmet-
+tion (which heads/nodes mattered) and global evaluation ric query–key/value sources, but reimagine it within full GT
+(which model is easier to interpret). Our analyses reveal layers with a computationally efficient approach: queries come
+that visually broad attention can emerge as functionally directly from node features (instead of node embeddings in
+irrelevant, while sparse patterns can be decisively pre- GMT that undergo another layer of GNN), while keys/values
+dictive: underscoring the limits of visualization-based are produced by layer-specific GNN operators, shared across
+approaches. heads for efficiency and generalization beyond graph-level
+4) We apply the interpretability framework across three ar- pooling.
+chitectures (DARTS-GT, GPS [6] and standard (Vanilla) NAS for Graphs and Graph Transformers: Early
+GT [19]) and show that the DARTS-GT derived model Graph neural-architecture-search (GNAS) studies such as
+is more consistent overall in terms of overall consensus GASSO [28], SANE [10], GraphNAS [9] and PAS [11] are
+(Focus) and head-distinguishability (Specialization). searched over message-passing cells on pure GNN based
+In summary, we (i) propose a differentiable NAS backbone supernets. However, for GTs, AutoGT [14] de-
+framework that builds depth-wise heterogeneous Graph fines a unified GT formulation and searches Transformer
+Transformers through direct redesigning of the attention hyperparameters plus structural/positional encodings, but the
+mechanism rather than auxiliary GNN augmentation and resulting architecture is globally tied rather than layer-wise
+(ii) develop quantitative interpretability metrics at head- heterogeneous. EGTAS [13] expands the GT search space with
+and node-level per instance. Our code is available at: macro- (topology) and micro- (graph-aware strategies) design
+https://github.com/shrutiOx/DARTS GT. and uses evolutionary search to assemble end-to-end GTs.
+UGAS [16] proposes a Unified Graph Neural Architecture
+II. RELATED WORK Search that explores which subsets of MPNN modules and
+We discuss three interconnected themes related to this work GT modules to activate in parallel per layer, with GTs treated
+in separate paragraphs. as optional candidates rather than foundational components.
+Graph Transformer : A broad line of recent work Complementary frameworks such as UNIFIEDGT [15] mod-
+combines global self-attention with graph inductive bias ularize GT components (sampling, structural priors, attention,
+(GNNs) [12]. GraphGPS [6] interleaves local message passing local/global mixing, FFNs) to instantiate many GT variants.
+with global attention and aggregates rich positional/structural Our work is orthogonal. We keep the GT spine and search
+encodings, effectively in a parallel MPNN and transformer for the local operator (GNN) per layer with DARTS, yielding
+attention design, setting a strong template for hybrid GTs. adaptive uniform/heterogeneous architectures while preserving
+SAN [7] injects spectral positional information and runs a global attention. This enables direct analysis of how structural
+fully connected Transformer, showing that learned spectral PEs encoding choices impact performance within a consistent
+can offset oversquashing while preserving structure. SAT [2] computational framework.
+goes further and makes attention itself structure-aware by Interpretability of (Graph) Transformers Existing trans-
+extracting k-subtree/k-subgraph features with a base GNN be- former studies investigate head importance for pruning [33],
+fore computing attention, consistently improving performance i.e., measuring global accuracy drops to compress models,
+over baseline GTs. Graphormer [8] augments attention with or through head ablation to assess model performance under
+centrality, shortest-path and edge encodings, and demonstrated masking [34], [35]. We instead quantify instance-specific
+state-of-the-art molecular property prediction at scale. Variants importance for interpretability, identifying which heads and
+in other modalities (e.g. Mesh Graphormer [1]) reinforce nodes drive individual predictions rather than finding glob-
+the pattern of mixing graph convolution with attention to ally redundant components. This connects to the broader
+capture local+global interactions. Graph-Trans [12] integrates line of causal interventions known as activation patching,
+a preliminary stack of GNN layers before Transformer blocks, where internal components are ablated or replaced, and the
+using the GNN to encode local structural patterns that the output change is measured [36] [37]. Zero-ablation, as we
+subsequent attention layers can then exploit. Our work sits in employ, is a popular variant [36] amongst other causal-tracing
+this stream but differs in how the local component is chosen: techniques. Our contribution adapts this causal, instance-level
+instead of a fixed GNN extractor or a single hybrid template, paradigm to Graph Transformers, introducing head-specific
+we dynamically select the GNN type per Transformer layer to ablations with novel metrics. Although GNN explainability has
+yield dataset-specific, potentially heterogeneous stacks. matured through tools like GNNExplainer [21] that identify
+A related pooling-centric line is Graph Multiset Transformer prediction-critical subgraphs, graph transformers lack equiva-
+(GMT) [26], which builds graph-level representations with lent methodologies. Most GT interpretability either visualizes
+attention-based pooling. GMT computes K/V via GNNs to attention [23] or aggregates it across layers. Methods based
+explicitly encode structure while forming queries from node on attention flow track information paths through attention,
+embeddings, improving over linear projections used in stan- but remain correlational [24]. Lastly, some protein structure to
+dard multi-head-attention (MHA). Yet GMT’s implementation function prediction papers [3] use GradCAM in GT attention
+
+=== PAGE 4 ===
+JOURNAL OF LATEX CLASS FILES, VOL., NO., OCTOBER 2025 4
+to identify ’important’ residues, but this only shows where 2) Multi-Head Concatenation: Each head outputs Y
+m
+∈
+gradients flow, not whether those regions actually help correct R n × dm, with d m = d/M . We concatenate the head outputs
+prediction i.e. if it truly contributes to accuracy. Our study along the feature dimension and project back to the model
+complements this space with causal ablations at two levels: (i) dimension d:
+Specialization (indicates whether heads are easily distinguish- Y = [Y Y Y ] W ,
+1 2 M out
+able by their causal impact) and (ii) Focus (are top-performing ∥ ∥ · · · ∥ (6)
+head agree on node consensus). The proposed metrics align where W out ∈ R (Mdm) × d = R d × d.
+with established interpretability principles for GNNs (e.g. 3) Feed-Forward Layers and Skip Connections: Following
+sparsity, consistency, fidelity) [29] while tying interpretations the attention module, each block applies a two-layer position-
+directly to measured performance changes under controlled wise feed-forward network with residual connections and
+deletions. normalization applied after each sublayer:
+Zˆ (ℓ) = Norm Z(ℓ) + Y(ℓ) , (7)
+III. METHODS
+A. Preliminaries Z˜ (ℓ) = σ Zˆ (ℓ) (cid:0)W 1 (ℓ) + b( 1 ℓ) (cid:1) W 2 (ℓ) + b( 2 ℓ), (8)
+Z(ℓ+1) = N(cid:0)orm Zˆ (ℓ) + Z˜ (ℓ) (cid:1), (9)
+We consider a graph G = (V, E) with node features F
+∈
+R n × d, where n = V and d is the feature dimension. A Graph where σ is the nonlinear(cid:0)ity (we use R(cid:1) ELU in our implemen-
+Transformer consis | ts | of L layers, each containing multi-head tation), W 1 (ℓ) ∈ R d × rd, W 2 (ℓ) ∈ R rd × d, and b( 1 ℓ), b( 2 ℓ) are
+attention followed by feed-forward modules. Let Z(ℓ) R n × d biases. We use r=2 in our implementation, and Norm denotes
+∈
+denote the node embeddings in layer ℓ. either LayerNorm or BatchNorm depending on configuration.
+For brevity, we omit the layer index ℓ when the context is
+clear. With M attention heads where m [1, 2, ..., M ], the
+∈ B. DARTS-GT
+attention components are computed as:
+Problem. Layer-wise Operation Selection
+Q = ZW , K = ZW , V = ZW (1) For a Graph Transformer with L layers and a set of candidate
+m Q,m m K,m m V,m
+operations = o , o , ..., o , where = n, the goal is to
+1 2 n
+where Q m , K m , V m R n × dm, W Q,m , W K,m , W V,m find the op O timal { sequence of } layer-wis | e O o | perations from the
+∈ ∈
+R d × dm and d m = d/M . We assume that d m Z>0 (i.e. d is search space of nL possible configurations leading to the
+∈
+divisible by M ). S
+optimal architecture , an ordered sequence of layer-wise
+∗
+A
+operations (one per layer):
+1) Attention Mechanisms: In our study, we explore dense
+and sparse attention. ∗ = o(1) ∗ , o(2) ∗ , ..., o(L) ∗ (10)
+A { }
+a) Full Attention:: Each node attends to all others:
+Here o(ℓ) denotes the selected operation at layer ℓ.
+∗
+∈ O
+Q K Formally, this architecture search is formulated as:
+S = softmax m ⊤m , Y = S V (2)
+m m m m
+√d
+(cid:18) m (cid:19) ∗ = arg min val (w ∗ ( ), ) (11)
+A L A A
+where S m R n × n, Y m R n × dm and softmax is ap- A∈S
+∈ ∈ subject to:
+plied row-wise for full attention (per-query normalization).
+This leads to a complexity of (n2d m ) per head and w ∗ ( A ) = arg m w in L train (w, A ) (12)
+O
+(n2 d ) = (n2d) across M heads.
+O m m O where denotes the search space of all nL architectures, w
+b) Sparse Attention: In this formulation, nodes attend S
+(cid:80) represents the network weights, and w ∗ ( ) are the optimal
+only to graph neighbors. This leads to a complexity of A
+weights for architecture . The following sections describe the
+( E d ) per head and ( E d ) = ( E d) across A
+O | | m O | | m m O | | approach we chose to solve the architecture search problem
+M heads. For the edge set E = (i, j) where i and j denote
+{(cid:80) } and the set of candidate operations, and hence, the search
+source and target nodes. For each edge (i, j), we compute the
+space.
+attention coefficient between source node i and target node j.
+1) Bilevel Optimization via DARTS: Enumerating all pos-
+Thus for edge (i, j) E:
+∈ sible configurations in is generally infeasible, so we adopt
+S
+[K ] , [Q ] the Differential Architecture Search (DARTS) [27] framework
+m i m j
+β = ⟨ ⟩ (3)
+m,ij √d to solve the optimization problem formulated by equations 11
+m
+and 12. DARTS reformulates discrete selection as a contin-
+exp(β ) uous, differentiable optimization. Specifically, it introduces
+m,ij
+s = (4)
+m,ij exp(β ) a softmax relaxation over candidate operations, casting the
+i′:(i′,j)
+∈
+E m,i′j
+architecture search as the following bilevel optimisation prob-
+(cid:80) lem [38]:
+[Y ] = s [V ] (5)
+m j m,ij m i
+i:(i(cid:88),j)
+∈
+E
+min (w (α), α, )
+where [Y m ] j , [Q m ] j , [K m ] i , and [V m ] i denote the j-th and α L val ∗ D DARTSval (13)
+i-th rows of the respective matrices. s.t. w ∗ (α) = arg min train (w, α, DARTStrain )
+w L D
+
+=== PAGE 5 ===
+JOURNAL OF LATEX CLASS FILES, VOL., NO., OCTOBER 2025 5
+where w represents the network weights and α = α(ℓ)
+o
+{ |
+o , ℓ 1, ..., L are continuous architecture parameters,
+wi
+∈
+th
+O
+α o
+(ℓ)∈ {
+R repres
+}
+e
+}
+nting the architecture weight (importance
+∈
+factor) for the operation o at layer ℓ. Rather than solving
+the full bilevel optimization, we adopt the efficient first-order
+approximation of DARTS [27], which avoids Hessian–vector
+products. In practice, we first randomly shuffle the entire
+training dataset and partition it into darts-training split,
+train
+D
+for updating weights w and darts-validation split,
+DARTStrain
+D
+for updating architecture parameters α, alternating
+DARTSval
+D
+the single gradient steps [27]. More details about this approach
+can be found in [27]. Although the second-order DARTS
+update is more accurate, it requires expensive Hessian–vector
+products and offers limited practical gains in our setting.
+2) Search Space Definition: In our work, we use the fol-
+lowing set of candidate operations: = GINE [39], GATv2
+O {
+[40], GatedGCN [32] . Hence, = n = 3 leads to a search
+} |O|
+space of 3L architectures.
+The following operators were selected because they rep-
+resent very distinct message-passing paradigms that capture
+complementary aspects of graph structure.
+GINE: Extends GIN [31] with edge features via
+•
+permutation-invariant MLP aggregation,
+GATv2: Employs dynamic, edge-aware attention-based
+•
+aggregation,
+GatedGCN: Uses edge-gated message propagation with
+•
+soft edge selection.
+This diversity ensures that our search space covers com-
+plementary inductive biases while remaining computationally
+efficient.
+Fig. 1: DARTS-GT with interpretability framework. Node 3) Asymmetric Attention Design: Departing from the stan-
+features produce Query via a global MLP/identity, while dard transformer formalism outlined in the Preliminaries sec-
+Key, V alue come from a single GNN applied once per layer tion, the novelty of our approach includes an asymmetric
+and shared across all heads; heads differ only in their per- design: queries are derived directly from node features, while
+head linear projections, reducing cost versus per-head GNNs. keys and values are produced by layer-specific GNN operators.
+The violet disc denotes the DARTS mixed operation over This is initially motivated by the GMH design of GMT [26],
+candidate GNNs (GINE, GATv2, GatedGCN) during search; where they demonstrated that decoupling the computational
+after search, exactly one GNN is fixed per layer (e.g. final sources for the attention components enhances graph-aware
+searched network in the supplementary). Grey discs indicate representations. In GMT, node features are first transformed by
+the per-head linear transformations (matrix multiplications a GNN to obtain H, with queries taken directly as Q = H and
+with learned weights). The yellow is the score computation each head computing its own keys and values via an additional
+×
+QueryKey ⊤ (followed by Softmax), and the green is the GNN applied to H. This asymmetry separates structural en-
+×
+matrix product of the Softmax expression with V alue yielding coding from feature representation, but at the cost of computa-
+the attention output. An edge pathway (edge embedding tional inefficiency, since every key and value inside every head
+→
+edge processing) supplies an optional gated residual added requires an independent GNN. In contrast, our design takes
+before Norm–FFN–Norm. Interpretability (bottom): on each node features directly into Q, and shares the GNN operator
+test graph, mask one head at a time and recompute loss across heads within a layer, producing an efficient formulation
+to obtain Head Deviation; from these, compute per-instance that still preserves the benefits of feature–structure decoupling.
+Specialization (spread across heads) and Focus (agreement of More broadly, rather than augmenting Graph Transformers
+top-k heads on top-r% nodes), then report dataset medians. externally with auxiliary MPNNs, a widely practiced approach
+[6], [16], we demonstrate that graph awareness can emerge
+from an architectural redesign of the attention mechanism
+itself.
+
+=== PAGE 6 ===
+JOURNAL OF LATEX CLASS FILES, VOL., NO., OCTOBER 2025 6
+Algorithm 1 DARTS-GT: Two-Phase Architecture Search
+Require: Graph dataset , candidate operations , L layers
+Q( m ℓ) = ϕ(Z(ℓ))W Q (ℓ , ) m (14) Ensure: Optimized archi D tecture ∗ with trained O weights
+A
+K(ℓ) = o(ℓ)(Z(ℓ), E)W(ℓ) (15) 1: Phase 1: Architecture Search (first-order) with Mixed
+m K,m
+Operations
+V m (ℓ) = o(ℓ)(Z(ℓ), E)W V (ℓ , ) m (16) 2: Randomly partition train into DARTStrain (60%) and
+D D
+(40%)
+DARTSval
+where ϕ is a learned transformation (implemented as a two- 3: D Initialize architecture parameters to zeroes, α = α o (ℓ)
+layer MLP when additional expressiveness is beneficial, or { }
+for all o , ℓ [L]
+identity otherwise) and o(ℓ) is the operator (GNN variant) at ∈ O ∈
+4: Initialize network weights w
+layer ℓ and o(ℓ)(Z(ℓ), E) ∈ R n × d ; W Q (ℓ , ) m , W K (ℓ) ,m , W V (ℓ , ) m ∈ 5: for epoch = 1 to E search do
+R d × dm. This design decouples the query space from the 6: Sample mini-batch from DARTStrain and DARTSval
+structural encoding, allowing the attention mechanism to learn 7: Update w by w train (w, D α) ▷ First-or D der step (no
+optimal feature-structure alignments through the query-key Hessian terms) ∇ L
+interaction. 8: Update α by α val (w, α) ▷ First-order step ▷
+∇ L
+4) Continuous relaxation (DARTS).: During the search Single gradient step
+phase, DARTS [27] relaxes the selection of discrete operators 9: end for
+into a continuous mixture. At each layer ℓ, instead of selecting 10: Extract optimal operations:
+a single operator, we compute a weighted combination: 11: for each layer ℓ [L] do
+exp(α(ℓ)) 12: o(ℓ) ∗ ← arg m ∈ ax o ∈O α o (ℓ)
+o(ℓ)(Z(ℓ), E) = o o(Z(ℓ), E) (17) 13: end for
+o (cid:88)∈O o′∈O exp(α o (ℓ ′ )) · 1
+1
+4
+5
+:
+:
+A
+Ph
+∗
+a
+←
+se
+{
+2
+o
+:
+(
+D
+1)
+i
+∗
+s
+,
+c
+o
+r
+(
+e
+2
+t
+)
+e
+∗ ,
+A
+..
+r
+.,
+c
+o
+h
+(
+i
+L
+te
+) ∗
+c
+}
+ture Training
+(cid:80)
+where: 16: Instantiate fresh model discrete with architecture ∗
+M A
+o(ℓ) denotes the mixed (continuous) operator at layer ℓ, 17: Train discrete on full train for E final epochs
+M D
+• distinguished from the final discrete selection, 18: return Trained model discrete
+M
+α o (ℓ) R is the learnable architecture parameter for
+• ∈
+operator o at layer ℓ,
+o(Z(ℓ), E) is the output of applying operator o to the node 6) Edge Residual Stream: We inject a gated edge term into
+• features Z(ℓ) and edge set E. the post-attention residual (before the first normalization). For
+a) Use in attention during search.: During search, the edge features e (i,j) ∈ R de:
+mixed operator output o(ℓ)(Z(ℓ), E) provides the structural e˜ = MLP e , (20)
+(i,j) edge (i,j)
+path for the keys and values:
+he
+j
+dge = e˜ ((cid:0)i,j) , (cid:1) (21)
+K(
+m
+ℓ) = o(ℓ)(Z(ℓ), E) W
+K
+(ℓ)
+,m
+, (18a) (i,(cid:88)j)
+∈
+E
+V m (ℓ) = o(ℓ)(Z(ℓ), E) W V (ℓ , ) m . (18b) Hedge = he 1 dge · · · he n dge ⊤ ∈ R n × d, (22)
+Y(ℓ) (cid:2) Y(ℓ) + σ g γ(ℓ) H (cid:3) edge (23)
+←
+We compute o(ℓ)(Z(ℓ), E) once per layer and share it across
+a c l r l et h iz e a a t d io s n t , o o f ( o ℓ) rm is K re ( m p ℓ l ) ac a e n d d b V y m (ℓ t ) h , e m sel ∈ ec [ t 1 e , d . . o . p , e M rat ] o . r A o f ( t ℓ e ) r ∗ ( d s i e s e - σ le g a M ( r x n L ) ab P i l s e edg t s e h c e a : la s R r ig d c m e o o n → i t d ro R l f l u d in n g i c s ti t o h a n e , t(cid:0)w g a a o n t - e d l ; a(cid:1)y γ Y e ( r ℓ ( ) ℓ) M ∈ i L s R P th i w e s i p t a h re p - d r e r e r o s - p i l d a o y u u e a t r ; l
+5) below). Attention may be dense or sparse, as that only
+attention output. MLP is shared across layers and Hedge is
+changes the softmax normalization (all-pairs vs. edge-softmax) edge
+computed once per forward pass. Please see Supplementary
+and does not alter the source of K , V .
+m m
+Table I for ablation studies related to the edge residual
+5) Discretization and Final Architecture Training: Upon
+stream. This edge residual stream operates independently of
+search completion, we derive the discrete architecture by
+the selected GNN operations, allowing the model to leverage
+selecting the operator with maximum architecture weight at
+edge information even when the discretized architecture uses
+each layer:
+operations with limited utilization of edge features.
+7) Computational Cost: Our proposed asymmetric block
+o(ℓ) ∗ = arg max α o (ℓ) (19) applies a single GNN per layer to produce the structural
+o
+∈O representations used in both K and V . In contrast, GMT’s
+Following the standard DARTS protocol, the final dis- Graph Multi-head Attention (GMH) [26] instantiates per-head
+cretized architecture = o(1) , ..., o(L) is then re- GNNs for both keys and values, i.e. GNNK, GNNV M .
+A ∗ { ∗ ∗ } { i i }i=1
+trained from scratch using the full training data. In our Consequently, the GNN forward cost in GMH scales as
+implementation, we instantiate a fresh model containing only (2M cost ), while in our design it is (1 cost )
+GNN GNN
+O · O ·
+the selected operations per layer. The algorithm is discussed per layer, where cost denotes the computational cost of a
+GNN
+in Algorithm 1. single GNN forward pass per layer. Thus, we preserve the fea-
+
+=== PAGE 7 ===
+JOURNAL OF LATEX CLASS FILES, VOL., NO., OCTOBER 2025 7
+ture–structure interaction (Q from features; K, V from GNN) Definition 2 (Specialization). For graph G i ,
+while reducing the structural computation across heads. From
+the perspective of architecture search overhead, DARTS [27] Spec(G i ) = std δ m,ℓ,i m , ℓ , (25)
+{ } ∈M ∈L
+uses a first-order approximation that avoids Hessian–vector (cid:16) (cid:17)
+where std(.) denotes the standard deviation across all heads’
+product overhead.
+deviations with = 1, ..., M , = 1, ..., L where M is
+M { } L { }
+C. Interpretability Framework the number of attention-heads and L total number of layers,
+defined earlier.
+1) Framework Overview: We propose a systematic frame-
+work to quantify Graph Transformer interpretability through
+High specialization indicates that heads are easily distin-
+head-level and node-level analysis. Our approach goes beyond
+guishable by their causal impact, whereas low specialization
+visualization and yields quantitative, instance-specific evi-
+suggests similar head impacts, making it harder to isolate
+dence of which components causally drive the predictions. We
+drivers unless complemented by the focus metric.
+introduce Head-Deviation, Specialization, and Focus, aligned
+with established interpretability principles where fidelity, spar- Definition 3 (Focus). Let Pi∗ =
+{
+p 1 , . . . , p k
+}
+be the top-
+sity, and consensus are standard evaluation criteria [29], [30]. k head-layer pairs for instance G i , ranked according to
+Because these metrics are ablation-based, they measure causal the head-ranking rule defined above, where p j = (i ′j , i ′j′ ),
+contribution rather than correlation, allowing robust, fair com- j = 1, ..., k, i ′j
+∈ M
+, i ′j′
+∈ L
+and i ′j , i ′j′ are index variables.
+parisons of interpretability across architectures. For a pair p, we define N p as the set of top-r% nodes by
+a) Masking protocol (causal ablation).: For head m in incoming attention mass for that head on G i . N p contains the
+layer ℓ, we implement a weight-level ablation that removes its top-r% nodes by the following values:
+contribution at inference. Concretely, we silence head m in Dense attention: with head softmax matrix S(ℓ) , incoming
+m
+layer ℓ, by zeroing its pre-concatenation output Y m (ℓ) (equiv- • mass for node j is i [S( m ℓ)] ij ;
+alently, zeroing the corresponding slice of W out in Eq. 6). Sparse attention: with edge-softmax s m,ij on (i, j) E,
+• (cid:80) ∈
+All other parameters, including the outputs of other heads, incoming mass for node j is s .
+i:(i,j) E m,ij
+layer norms, and feed-forward sublayers, are left unchanged. ∈
+The Focus metric computes the average Jaccard similarity
+The models are evaluated in eval mode (no dropout), with a (cid:80)
+between all unique pairs:
+fixed seed and without any retraining or adaptation.
+ual
+2)
+att
+H
+en
+e
+t
+a
+i
+d
+on
+D
+h
+e
+e
+v
+a
+ia
+d
+t
+s
+i
+,
+o
+w
+n:
+e
+T
+m
+o
+ea
+q
+s
+u
+u
+a
+r
+n
+e
+ti
+h
+fy
+ow
+th
+t
+e
+h
+i
+e
+m
+ir
+p
+r
+o
+e
+r
+m
+ta
+o
+n
+v
+c
+a
+e
+l
+o
+a
+f
+ff
+i
+e
+n
+c
+d
+ts
+iv
+t
+i
+h
+d
+e
+-
+Focus(G i ) =
+1
+k
+k − 1 k
+|
+N
+N
+pj
+∩
+N
+N
+pm|
+, (26)
+task loss. For a graph G with the true label y , let f (G ) 2 j=1 m=j+1 |
+pj
+∪
+pm|
+i i i (cid:88) (cid:88)
+denote the prediction of the model and f − m,ℓ(G i ) denote the where k = k(k − 1) is t (cid:0) he (cid:1) number of unique head pairs.
+prediction with head m in layer ℓ masked. 2 2
+Unle(cid:0)ss(cid:1)stated otherwise, in our implementation, we use k=5
+Definition 1 (Head Deviation). The head deviation measures
+and a r = 10% node fraction. This metric quantifies the degree
+the change in task loss when head m in layer ℓ is masked:
+of consensus among the most causally important heads, i.e.
+δ m,ℓ,i = loss f − m,ℓ(G i ), y i loss(f (G i ), y i ) , (24) measure top-k-head agreement on top-r% nodes. A high Focus
+−
+Here, loss( , )(cid:0) denotes the l(cid:1)oss appropriate to the ma- score indicates that the model’s key components agree on the
+· ·
+chine learning task (e.g., MAE for regression, binary cross- same salient graph substructures, simplifying interpretation.
+entropy for binary classification, cross-entropy for multi-class 4) Dataset-Level Aggregation: For dataset with N
+D
+classification). We quantify head importance through causal graphs, we use the median for robustness to instance variability
+intervention: the deviation δ measures how the prediction and outliers:
+m,ℓ,i
+changes when head m in layer ℓ is ablated, providing direct
+Spec = medianN Spec(G ) , (27)
+evidence of its functional necessity rather than mere correla- i=1{ i }
+tional patterns. This approach asks ”what happens without this Focus = medianN i=1{ Focus(G i ) } . (28)
+head?” , distinguishes truly important components from those
+5) Interpretation Guidelines: The combination of special-
+that merely appear salient in visualizations.
+ization and focus determines how interpretable an instance-
+a) Head ranking: For each instance, we rank the heads
+level prediction is.
+by their deviation δ in descending order. Beneficial heads
+m,ℓ,i
+(δ > 0, masking increases loss) thus appear first, while High Spec + High Focus: Most interpretable. Few heads
+m,ℓ,i •
+harmful heads (δ < 0) appear last. When we need a sign- dominate and agree on important nodes.
+m,ℓ,i
+agnostic view, we report the magnitude δ as a measure High Spec + Low Focus: Important heads are identifiable
+| m,ℓ,i | •
+of head impact. but attend to different nodes, suggesting complementary
+3) Global Interpretability Metrics: Beyond individual head strategies.
+importance, we summarize how interpretable the model is for Low Spec + High Focus: Uniform head importance but
+•
+a given instance across all heads. We define two complemen- consensus on nodes. Clear node-level attribution despite
+tary metrics: specialization (importance concentration or head- unclear head roles.
+distinguishability) and focus (consensus of important heads on Low Spec + Low Focus: Least interpretable. Uniform
+•
+nodes). importance with disparate attention patterns.
+
+=== PAGE 8 ===
+JOURNAL OF LATEX CLASS FILES, VOL., NO., OCTOBER 2025 8
+Algorithm 2 Graph Transformer Interpretability Analysis 5) Quantitative interpretability analysis using our novel
+Require: Model f , Test set , Top heads k framework to assess model transparency. Our evaluation
+test
+D
+Ensure: Spec(G i ), Focus(G i ) for each G i of the interpretability framework operates on two levels.
+{ }
+1: Phase 1: Compute Head Deviations a) At the population level, we quantify overall model
+2: for ℓ = 1 to L do interpretability through metrics (Specialization, Fo-
+3: for m = 1 to M do cus) that characterize potentially how easily prac-
+4: f − m,ℓ model with head m in layer ℓ masked titioners can identify important heads and nodes
+←
+5: for G i test do driving predictions.
+∈ D
+6: e base loss(f (G i ), y i ) b) At the instance level, we demonstrate how our
+←
+7: e masked loss f − m,ℓ(G i ), y i framework reveals specific graph components crit-
+←
+8: δ m,ℓ,i e masked e base ical for individual predictions.
+← (cid:0) − (cid:1)
+9: end for To ensure a robust evaluation, we perform experiments with
+10: end for 4 random seeds for SOTA baseline comparisons (Tables III-
+11: end for IV) and vanilla-GT versus DARTS-GT comparisons (Table II)
+12: Phase 2: Compute Metrics following the benchmarking protocol introduced in [41], while
+13: for G i test do using 3 seeds for architectural analysis experiments (Tables
+∈ D
+14: ∆ i δ m,ℓ,i : m = 1..M, ℓ = 1..L V-VII,VIII) due to computational constraints, which is also
+← { }
+15: Spec(G i ) std(∆ i ) widely followed protocol [6].
+←
+16: Pi∗
+←
+top-k pairs of head m in layer l: (m, ℓ) ranked
+by δ m,ℓ,i (descending) A. Dataset and Task Selection
+17: for p ∈ Pi∗ do We evaluated DARTS-GT against three categories of base-
+18: N pi ← top-r% nodes by incoming attention mass lines: SOTA GNN architectures (e.g. GCN [17], GIN [31],
+for p on G
+i GatedGCN [32], PNA [42]), recent Graph Transformer models
+19: end for (e.g. SAN [7], Graphormer [8], GPS [6]), and neural archi-
+20: Focus(G i ) ← ( 1 k 2 ) k j= − 1 1 k m=j+1 | | N N p p j j ∩ ∪ N N p p m m | | tecture search methods for Graph Transformers (UGAS [16],
+21: end for (cid:80) (cid:80) EGTAS [13], AutoGT [14]). Our evaluation spans eight di-
+22: return (Spec(G i ), Focus(G i )) : G i test verse datasets that encompasses both graph-level and node-
+{ ∈ D }
+level prediction tasks, as detailed in Table I.
+TABLE I: Dataset Statistics and Characteristics
+Focus [0, 1] measures consensus on node attribution.
+∈
+Spec [0, ) measures concentration of head importance Dataset #Graphs Avg# Avg# Prediction Task
+∈ ∞ Nodes Edges Level
+or head-distinguishability. Together, they reveal which heads
+ZINC 12,000 23.2 24.9 Graph Regression
+matter (specialization) and what they attend to (focus), pro-
+OGBG-MolHIV 41,127 25.5 27.5 Graph Binary Cls.
+viding faithful, comparable, instance-level interpretability and OGBG-MolPCBA 437,929 26.0 28.1 Graph Multi-task Cls.
+MalNet-Tiny 5,000 1,410.3 2,859.9 Graph Multi-class Cls.
+a principled route to model-level comparison. The complete
+PATTERN 14,000 118.9 3,039.3 Node Binary Cls.
+process is depicted in Algorithm 2. CLUSTER 12,000 117.2 2,150.9 Node Multi-class Cls.
+Peptides-Struct 15,535 150.9 307.3 Graph Multi-task Reg.
+Peptides-Func 15,535 150.9 307.3 Graph Multi-task Cls.
+The selected benchmarks [6] provide comprehensive cover-
+IV. EXPERIMENTAL RESULTS
+age in multiple dimensions. This range accommodates diverse
+tasks such as graph regression (single and multi-task), graph
+In this section, we comprehensively evaluate DARTS-GT
+classification (binary, multi-class, and multi-task), and node-
+in multiple aspects to establish both its performance advan-
+level predictions (binary and multi-class classifications). The
+tages and its interpretability characteristics. Our experimental
+datasets exhibit substantial variation in scale, from small
+analysis comprises five key components:
+molecular graphs in ZINC (averaging 23 nodes) to large-
+1) Direct comparison with standard (vanilla) Graph Trans- scale graphs in MalNet-Tiny (averaging 1,410 nodes), testing
+former [19] to isolate the impact of our architectural the ability of our architecture to handle varying structural
+innovations; complexities. Dataset sizes range from 5,000 to more than
+2) Comparison against state-of-the-art baselines including 437,000 graphs, ensuring robust evaluation across different
+hand-designed GNNs, recent Graph Transformers, and dataset sizes. This diversity, spanning molecular property
+neural architecture search methods; prediction (OGBG), biological sequences (Peptides), and syn-
+3) Analysis of heterogeneous versus uniform architectures thetic benchmarks (PATTERN, CLUSTER), demonstrates that
+and random-search obtained architectures, to validate the our architectural choices generalize beyond domain-specific
+benefits of layer-wise GNN diversity through DARTS patterns. Notably, the inclusion of two Long-Range Graph
+search; Benchmark (LRGB) datasets, Peptides-Struct and Peptides-
+4) Ablation studies examining the role of asymmetric de- Func, facilitated evaluation of the capacity of our model
+sign while understanding edge features role is given in to capture long-range dependencies, a critical challenge for
+the supplementary; Graph Transformers.
+
+=== PAGE 9 ===
+JOURNAL OF LATEX CLASS FILES, VOL., NO., OCTOBER 2025 9
+TABLE III: Test Performance on Standard Benchmarks.
+B. Comparison Against Standard Graph Transformers
+Shown is the mean ± std across 4 seeds. Best performance
+Table II presents the performance comparison of DARTS-
+is bolded while second best is underlined. Datasets where we
+GT with the standard Graph Transformer (Vanilla-GT) intro-
+have outperformed GPS (but not best) is marked with asterisks
+duced by Dwivedi et al. [19], which forms the foundation
+of many subsequent works [16]. Unlike recent approaches Model ZINC MALNET PATTERN CLUSTER
+that enhance graph transformers through parallel MPNN paths MAE ↓ Acc ↑ Acc ↑ Acc ↑
+[6], novel positional encoding [7], or structural encoding-
+GCN [17] 0.367±0.011 NA 71.892±0.334 68.498±0.976
+augmented attention [8], DARTS-GT alters the core attention GIN [31] 0.526±0.051 NA 85.387±0.136 64.716±1.553
+mechanism through asymmetric query-key value computation GAT [18] 0.384±0.007 NA 78.271±0.186 70.587±0.447
+and heterogeneous per-layer GNN selection. This is a signif- GatedGCN [12] 0.282±0.015 0.9223±0.65 85.568±0.088 73.840±0.326
+icant departure from standard GT where Q, K, V share the GatedGCN-LSPE [43] 0.090±0.001 NA NA NA
+same computational source without GNNs. This experiment PNA [42] 0.188±0.004 NA NA NA
+quantifies the improvement of DARTS-GT over the baseline DGN [44] 0.168±0.003 NA 86.680±0.034 NA
+GSN [45] 0.101±0.010 NA NA NA
+it extends. For rigorous comparison, we standardized most
+CIN [46] 0.079±0.006 NA NA NA
+experimental conditions using the GPS configuration [6]. We
+CRaWl [47] 0.085±0.004 NA NA NA
+extend our implementation from their opensource repository,
+GIN-AK+ [48] 0.080±0.001 NA 86.850±0.057 NA
+adopting their fixed positional encoding, hidden dimensions,
+attention heads, dropout rates, and pre/post-processing com- EGTAS [13] 0.075±0.073 NA 86.742±0.053 79.236±0.215
+UGAS [16] NA NA 86.89±0.02 78.14±0.21
+ponents for both models. Only the layer count was ad-
+justed to maintain a comparable parameter budget range. This SAN [7] 0.139±0.006 NA 86.581±0.037 76.691±0.65
+controlled setup (Supplementary-Tables II,III,IV), prioritizing Graphormer [8] 0.122±0.006 NA NA NA
+methodological clarity over peak performance, ensures that K-Subgraph SAT [2] 0.094±0.008 NA 86.848±0.037 77.856±0.104
+EGT [23] 0.108±0.009 NA 86.821±0.020 79.232±0.348
+observed improvements stem from design changes rather than
+GPS [6] 0.070±0.004 0.9264±0.78 86.685±0.059 78.016±0.180
+hyperparameter tuning or auxiliary components.
+DARTS-GT 0.066±0.003 0.9325±0.006 86.68±0.036 78.299±0.07*
+TABLE II: Performance Comparison: Vanilla-GT vs DARTS-
+GT across diverse datasets with Dense and Sparse
+Attention Mechanisms. ∆ represents the relative im- gains stem primarily from the MPNN path itself, or from the
+synergistic interaction where MPNN features and transformer
+provement of DARTS-GT over Vanilla-GT, calculated as
+| DARTS-GT − Vanilla-GT | 100%, where improvement direction ac- attention are jointly fed into subsequent layers? The DARTS-
+count|s Va f n o il r la m -G e T t|ric typ × e (decrease for MAE, increase for others). GT design removes this ambiguity by demonstrating compet-
+itive performance using only enhanced attention mechanisms
+Shown is the mean ± std across 4 seeds. Best performances
+without any parallel MPNN component. This isolation proves
+are highlighted in bold.
+that the Graph Transformer itself can be made structurally
+Attn. Model Pep-Struct Pep-Func PATTERN MolHIV MolPCBA aware through architectural innovation in the attention mech-
+MAE AP Acc AUROC AP anism, rather than relying on auxiliary components or cross-
+↓ ↑ ↑ ↑ ↑
+pathway synergies.
+Vanilla-GT 0.254±.002 0.623±.009 0.678±.164 0.761±.009 0.048±.007
+Dense DARTS-GT 0.247±.001 0.669±.004 0.852±.001 0.766±.016 0.201±.008
+C. Comparison Against SOTA leaderboard
+∆(%) 2.8% 7.4% 25.7% 0.7% 318%
+Table III and Table IV benchmark DARTS-GT against
+Vanilla-GT 0.268±.001 0.557±.005 0.681±.199 0.758±.009 0.241±.032
+three categories of methods: hand-designed GNNs (e.g., GCN,
+Sparse DARTS-GT 0.263±.001 0.609±.014 0.867±.000 0.776±.006 0.258±.004
+GIN, GatedGCN, PNA), Graph Transformers (e.g., SAN,
+∆(%) 1.9% 9.3% 27.3% 2.4% 7.1%
+Graphormer, GPS), and NAS-based GT approaches (EGTAS,
+We tested both dense (full attention) and sparse attention AutoGT, UGAS). Each method is reported under its validation-
+mechanisms to understand how architectural improvements selected configuration (dense or sparse). Full settings are
+translate across different computational settings. The results available in supplementary. DARTS-GT achieves state-of-
+reveal consistent gains across all benchmarks, with particularly the-art results on four datasets: ZINC (0.066), MalNet-Tiny
+striking improvements on PATTERN (25-27% relative accu- (93.25%), and both LRGB benchmarks: Peptides-Func (0.669)
+racy increase) and OGBG-MolPCBA (318% relative improve- and Peptides-Struc (0.246). Most notably, for the other four
+ment in average precision for dense attention). Even on long- datasets, PATTERN, CLUSTER, MolHIV, MolPCBA, there
+range benchmarks (Peptides), where standard transformers are distinct best performing methods, namely EGTAS (for
+already perform reasonably, DARTS-GT achieves meaningful CLUSTER), UGAS (for PATTERN), CIN (for MolHIV) and
+non-trivial improvements over the baseline. Our comparison CRAW1 (for MolPCBA). Therefore, DARTS-GT substantially
+reveals that standard Graph Transformers, when isolated from stands out as outperforming all methods in four datasets,
+auxiliary components, exhibit significant limitations, partic- while none of the other four highlighted methods or any other
+ularly evident in MolPCBA dense attention. This raises a methods outperformed all methods for more than one dataset.
+critical question about hybrid architectures like GPS (which For LRGB [49] benchmarks, DARTS-GT advances beyond
+uses dense attention with parallel MPNN): do performance both GPS and the recent UGAS method, with considerably
+
+=== PAGE 10 ===
+JOURNAL OF LATEX CLASS FILES, VOL., NO., OCTOBER 2025 10
+TABLE IV: Test Performance on OGB and LRGB Bench-
+marks. Shown is the mean ± std across 4 seeds. Best perfor-
+mance is bolded while second best is underlined.
+Model MolHIV MOLPCBA PEP-FUNC PEP-STRUC
+AUROC AP AP MAE
+↑ ↑ ↑ ↓
+GCN NA NA 0.5930 ± 0.002 0.3496 ± 0.0013
+GINE [39] NA NA 0.5498 ± 0.0079 0.3547 ± 0.0045
+GCN+virtualnode [6] 0.7599±0.0119 0.2424±0.0034 NA NA
+GIN+virtualnode [6] 0.7707±0.0149 0.2703±0.0023 NA NA
+GatedGCN NA NA 0.5864 ± 0.0077 0.3420 ± 0.0013
+GatedGCN-LSPE NA 0.267±0.002 NA NA
+PNA 0.7905±0.0132 0.2838±0.0035 NA NA
+DeeperGCN [6] 0.7858±0.0117 0.2781±0.0038 NA NA
+DGN 0.7970±0.0097 0.2885±0.0030 NA NA
+GSN(directional) 0.8039±0.0090 NA NA NA
+CIN 0.8094±0.0057 NA NA NA
+CRaWl NA 0.2986±0.0025 NA NA Fig. 2: Heatmap showing the proportion of each GNN type
+GIN-AK+ 0.7961±0.0119 0.2930±0.0044 NA NA selected by DARTS-GT across different datasets. The values
+ExpC [50] 0.7799±0.0082 0.2342±0.0029 NA NA indicate fraction of total layers using each GNN operation,
+AUTOGT 0.7495±0.0102 NA NA NA that is averaged over 4 seeds. Color intensity reflects the usage
+EGTAS 0.7981±0.0117 NA NA NA frequency as indicated
+UGAS 0.7997±0.51 NA 0.667±0.007 0.247±0.002
+SAN 0.7785±0.2470 0.2765±0.0042 NA NA TABLE V: Comparison of DARTS-GT against uniform (ho-
+SAN+LAPPE [6] NA NA 0.6384±0.0121 0.2683±0.0043 mogeneous) and random-searched architectures across differ-
+GraphTrans [12] NA 0.2761±0.0029 NA NA ent attention types and dataset variety. Shown is the mean ±
+GPS [6] 0.7880±0.0101 0.2907±0.0028 0.6535±0.0041 0.2500±0.0005 std across 3 seeds. Best results are in bold.
+DARTS-GT 0.7766±0.006 0.2584±0.004 0.669±0.004 0.246±0.0006
+Dataset Attn-Type Model Type Perf
+Random 0.7388±0.0741
+lower variance on Peptides-Struc than the latter (±0.0006
+Uniform-GINE 0.7688±0.0018
+vs UGAS’s ±0.002), indicating more stable solutions. The
+consistent gains across diverse tasks validate that differen- CLUSTER Sparse Uniform-GATEDGCN 0.7047±0.069
+tiable architecture search discovers effective designs within the Uniform-GATV2 0.7805±0.00213
+transformer framework. In addition to the SOTA performance DARTS-GT (ours) 0.7835±0.0004
+achieved by the DARTS-GT discovered architectures, they ex-
+Random 0.646±0.0048
+hibit enhanced interpretability characteristics, as demonstrated
+Uniform-GINE 0.6555±0.0093
+in sections IV-F and IV-G.
+Peptides-Func Dense Uniform-GATEDGCN 0.6718±0.0035
+Uniform-GATV2 0.6530±0.0081
+D. Dissecting DARTS-GT’s Architecture Discovery Patterns
+DARTS-GT (ours) 0.6730±0.0056
+Figure 2 visualizes the GNN distributions discovered by
+Random 0.919±0.0081
+DARTS across eight datasets, revealing prominent diversity
+Uniform-GINE 0.919±0.0081
+in architectural choices. The selection patterns range from
+Malnet-Tiny Sparse Uniform-GATEDGCN 0.929±0.0060
+highly specialized (MolPCBA with 81% GINE dominance)
+Uniform-GATV2 0.922±0.0098
+to nearly uniform distributions (ZINC, MolHIV with balanced
+GNN usage). This demonstrates that DARTS adapts to dataset- DARTS-GT (ours) 0.934±0.0057
+specific requirements rather than converging to a univer-
+sal solution, as expected from a neural architecture search
+(NAS) algorithm. Interestingly, node-level tasks (PATTERN, performance (examples of a few searched architectures are
+CLUSTER) favored GatedGCN. We could also observe the given in Supplementary Figure 2).
+complete absence of GATV2 in Peptides datasets, coupled with Although Figure 2 reveals that GatedGCN dominates in
+GatedGCN’s dominance (87.5% in Peptides-Func). However, CLUSTER (67.2%), this prevalence does not indicate supe-
+these proportions only show that the GNN selection is utilised, riority as a standalone operation. Table V exposes a counter-
+but the layer-wise positioning of each GNN, which DARTS intuitive phenomenon: The most-used GNN in a heterogeneous
+optimizes through gradient-based search, is equally critical. architecture may not be the best performing uniform architec-
+A dataset might use 50% GINE, but whether these appear in ture.
+early or late layers inherently impacts feature extraction and Table V compares DARTS-GT against uniform architec-
+
+=== PAGE 11 ===
+JOURNAL OF LATEX CLASS FILES, VOL., NO., OCTOBER 2025 11
+TABLE VI: Ablation Study: Symmetric (Q ,K and V ) vs
+tures and random heterogeneous selection (mean of 3 dif- m m m
+Asymmetric Attention Design (DARTS-GT design ).Shown is
+ferent random configurations). Despite dominant operations
+in DARTS-GT architectures (e.g., GatedGCN at 67.2% in
+the mean ± std across 3 seeds. Best performance is bolded.
+CLUSTER, 87.5% in Peptides-Func), uniform deployment
+Dataset Attn-Type Model Type Performance
+of these same operations underperforms: uniform GatedGCN
+achieves 0.7047 vs DARTS-GT’s 0.7835 on CLUSTER and Symmetric 78.2±0.0010
+CLUSTER Sparse
+0.6718 vs 0.6730 on Peptides-Func. On MalNet-Tiny, uniform DARTS-GT (Asymmetric) 78.35±0.0004
+GatedGCN outperforms uniform GINE despite GINE dom-
+Symmetric 0.667±0.009
+inating (62.5%) the DARTS architecture. This demonstrates Peptides-Func Dense
+that no single operation is universally optimal, and ”popu- DARTS-GT (Asymmetric) 0.6730±0.0056
+lar” operations in DARTS-GT architecture can underperform Symmetric 0.923±0.008
+MalNet-Tiny Sparse
+when deployed homogeneously. Although DARTS-GT’s gains
+DARTS-GT (Asymmetric) 0.9334±0.0057
+appear modest, they align with typical graph benchmark
+improvements where SOTA advances are often under 1% (as
+seen in SAN, GPS, UGAS and our Tables III-IV). These pretable decisions. Having established DARTS-GT’s com-
+gains are consistent across datasets/seeds, not isolated cases. petitive performance, in this section, we examine whether
+Moreover, finding even the best uniform architecture requires these heterogeneous architectures offer advantages in model
+testing n separate models, while the heterogeneous space transparency using the framework introduced in Section III-C.
+grows exponentially (34 = 81 for 4 layers; 310 = 59, 049 for 1) Quantitative Interpretability Metrics: Table VII presents
+10 layers). DARTS-GT efficiently navigates this space without the interpretability metrics derived from our causal ablation
+exhaustive enumeration. framework (Section III-C). Through systematic head masking
+Three key insights emerge: (1) DARTS discovers synergistic on each test instance, we compute head deviations that quan-
+layer-wise combinations rather than repeating the strongest tify causal importance, then aggregate using median values
+operation; (2) DARTS-GT consistently outperforms random for robustness to outliers. The median Specialization captures
+heterogeneous architectures, confirming principled optimiza- the typical concentration of head importance across instances,
+tion beats chance; (3) DARTS-GT’s value lies in removing while median Focus measures consensus among important
+the rigid commitment to uniformity or heterogeneity in ad- heads on critical nodes. Supplementary Figures 4 and 5 show
+vance. It adaptively recovers strong uniform solutions when population-level distributions as scatter plots, with median
+sufficient and heterogeneous mixtures when advantageous. Our values indicated, for all tests under consideration. We eval-
+contribution extends beyond numerical improvements. While uated on two diverse benchmarks: MolHIV (OGB, molecular
+prior GTs relied on auxiliary GNN paths or hand-designed graphs, classification) and Pep-Struc (LRGB, peptide graphs,
+uniform backbones, we show that the core transformer archi- regression), representing different domains, graph sizes, and
+tecture itself can be systematically optimized. This reframes task types. For transparency, we report GPS [6] with both
+GT design as an open direction for principled exploration, sparse attention (matching our implementation) and dense
+where the demonstrated consistent improvements evidence yet attention (authors’ original) on MolHIV, revealing how atten-
+unexplored directions in Graph Transformers. tion mechanism choices significantly impact interpretability (
+Focus: 0.5734 sparse vs 0.111 dense).
+E. Ablation Studies: Assymetric vs Symmetric attention Higher Focus facilitates identifying critical nodes as im-
+Although Table II demonstrated DARTS-GT’s superiority portant heads converge on common graph regions, while
+over Vanilla-GT (standard GT), a critical question remains: Is higher Specialization enables distinguishing which heads drive
+asymmetric attention design essential, or would a symmetric predictions. The combination of these metrics determines the
+variant where Q ,K and V all derive from GNN outputs practical effort required to understand model decisions.
+m m m
+perform better? DARTS-GT demonstrates consistent interpretability across
+To address this, we conducted controlled experiments across both datasets, achieving best Specialization on MolHIV
+3 seeds comparing our asymmetric design against its symmet- (0.00124) and best Focus on Pep-Struc (0.129), while securing
+ric counterpart. All other experimental conditions remained second-best performance on the complementary metrics. This
+identical between models. consistency across diverse domains suggests that DARTS-
+The results obtained consistently favored the DARTS-GT GT’s produces reliably interpretable models. In contrast, GPS
+asymmetric design over the symmetric variant in all configura- and Vanilla-GT show more variable patterns: GPS (sparse)
+tions tested. This validates our architectural choice: decoupling achieves the best Focus but minimal Specialization on Mol-
+queries from structural encoding (Q from features, K /V HIV, making head importance indistinguishable, while Vanilla-
+m m m
+from GNNs) provides superior performance compared to the GT shows the best Specialization but lowest Focus on Pep-
+seemingly natural approach of deriving all attention compo- Struc, requiring reconciliation of divergent attention patterns.
+nents from the same GNN source. These metrics characterize the complexity of the interpreta-
+tion rather than establishing absolute superiority. Our evalua-
+F. Interpretability Analysis tion on two datasets provides initial empirical evidence on real-
+Although performance gains demonstrate DARTS-GT’s ef- world applications but, like any empirical study, cannot guar-
+fectiveness, modern applications increasingly demand inter- antee trends generalize across all benchmarks. However, one
+
+=== PAGE 12 ===
+JOURNAL OF LATEX CLASS FILES, VOL., NO., OCTOBER 2025 12
+TABLE VII: Quantitative interpretability metrics across archi-
+Figure 3 presents a representative instance from the
+tectures. Median Specialization: concentration of importance
+Peptides-Struc datasets, where deviation profiles identify
+in fewer heads; Median Focus: consensus on important nodes.
+truly important heads regardless of visual prominence,
+Best values in bold while second-best are underlined. and attention heatmaps of these top-k heads reveal criti-
+cal graph regions. Each attention head is uniquely iden-
+Dataset Model Specialization Focus tified by its layer and head index, following the for-
+mat L<layer_index>_H<head_index>. For example,
+Vanilla-GT (sparse) 0.000634 0.533
+L0 H0 refers to the first head in the first layer. While we
+MolHIV GPS (sparse) 0.000044 0.5734
+demonstrate Peptides-struct example here, MolHIV is moved
+GPS (dense) 0.000091 0.111
+to supplementary (Supplementary Figure 3) for space con-
+DARTS-GT (sparse) 0.00124 0.555
+straints.
+Vanilla-GT (dense) 0.055 0.067 Graph 1 (Figure 3, Peptides-Struct, 209 nodes) demonstrates
+the attention visualization paradox where visual prominence
+Pep-Struc GPS (dense) 0.038 0.085
+does not always correlate with importance. (a) DARTS-GT:
+DARTS-GT (dense) 0.044 0.129
+Top heads L1 H1 (δ = 0.228), L0 H3 (δ = 0.146), L0 H0
+(δ = 0.139) all exhibit low standard deviation of their atten-
+tion distributions (stdev) (0.0076, 0.0029, 0.0038) producing
+of our primary contributions, the interpretability framework
+uniformly colorful attention patterns, while targeting different
+itself, enables practitioners to quantify the difficulty of in-
+nodes as L1 H1 focuses most on nodes 27-28, L0 H3 on node
+terpretation. Instance-level analysis (Supplementary Figures 4
+47,197 and L0 H0 on nodes 32,141. Moderate specialization
+and 5) reveals considerable variation across graphs, reminding
+(Spec= 0.085) with low Focus (0.059) indicates distinguish-
+us that specific instances may present unique interpretability
+able heads attending to disparate regions. (b) GPS: Demon-
+challenges regardless of model-level trends.
+strates the paradox clearly—the most important head L0 H0
+In our next section, we demonstrate how our framework
+(δ = 0.317, stdev = 0.0063) appears dark/sparse concentrating
+enables granular, instance-specific interpretation grounded in
+most on node 191 (attention score 17.93) followed by 202
+causal head ablation, moving beyond aggregate statistics to
+(attention score 2.20), while visually prominent colorful head
+understand individual prediction drivers.
+with overall uniform attention, such as L0 H2 (δ = 0.113,
+stdev = 0.0026) have minimal impact with a much weaker
+attention on node 197 (attention score 2.657). Very low Focus
+G. Instance-Specific Interpretation Analysis
+(0.036) further confirms disparate mechanisms. (c) Vanilla-
+Having established the interpretability characteristics at GT: Inverts the GPS pattern—highest impact head L0 H0
+the dataset level, we now demonstrate how our framework (δ = 0.262, stdev = 0.0043) shows uniform/colorful attention
+provides actionable, instance-specific insights to understand across nodes 54,203,26,113 and more (attn score around
+individual predictions. Unlike aggregate metrics that charac- 4.0) while L2 H1 (δ = 0.188, stdev = 0.0179) displays a
+terize general model behavior, instance-level analysis reveals concentrated dark pattern on node 46 (attn score 13.07) despite
+which specific graph components causally drive predictions lower importance. Highest specialization (Spec= 0.127) with
+for particular test cases through systematic head ablation. low Focus (0.064) suggests strongly differentiated but unco-
+This approach is analogous to how GNNExplainer [21] iden- ordinated heads for this particular instance under this method.
+tifies critical subgraphs for GNNs but is adapted for Graph To our knowledge, the above is the first instance-specific
+Transformer attention mechanisms. It grounds interpretation quantitative method for Graph Transformers to identify which
+in causal evidence rather than correlational attention patterns, heads and nodes causally drive predictions. We have quantita-
+revealing not just where models attend but which attention tively shown further (Supplementary Figure 1, Supplementary
+heads causally influence outcomes. Section I), that entropy heuristics cannot replace our head-
+Our framework automatically generates per-instance JSON deviation based causal ablation method. Although space con-
+outputs containing head deviations, top-k important heads (we straints limit us to two representative examples (additional
+keep k = 4 for MolHIV and k = 3 for Peptides-struct for instances available in our GitHub repository), these were
+our experiments), their attended nodes, attention distribution strategically selected: Graph 1 (Peptides-struct) showcases a
+statistics, and interpretability metrics (Specialization, Focus). deliberate paradox where visual prominence do not always
+The higher absolute deviation ( δ ) indicates greater head correlate with causal importance while Graph 50 (MolHIV)
+| |
+significance, i.e. removing such heads causes larger prediction presented in supplementary section III, demonstrates our
+errors, providing causal evidence of their contribution. framework’s standard operation and how these metrics varies
+Additionally, we computed the standard deviation of each based on attention types.
+head’s attention distribution to characterize its focus pattern. Across instances, we did not observe a reliable correlation
+Although not a central metric, this simple statistic provides between attention salience and causal head importance. In
+useful context: a low standard deviation indicates that a head GPS, the most critical head (L0 H0, δ = 0.317) appears
+distributes attention uniformly across nodes (broad emphasis), sparse/dark while colorful heads contribute minimally. In con-
+while a high standard deviation suggests concentrated attention trast, in Vanilla-GT, a visually prominent dark pattern (L2 H1)
+on specific nodes (selective emphasis). proves causally less important than a uniform/colorful head
+
+=== PAGE 13 ===
+JOURNAL OF LATEX CLASS FILES, VOL., NO., OCTOBER 2025 13
+(a) DARTS-GT
+(b) GPS
+(c) Vanilla-GT
+Fig. 3: Instance analysis of Graph 1 (Peptides-Struc, 209 nodes) demonstrating deviation profiles and top-3 attention heatmaps.In
+the attention heatmaps, columns represent target nodes that receive attention.
+
+=== PAGE 14 ===
+JOURNAL OF LATEX CLASS FILES, VOL., NO., OCTOBER 2025 14
+(L0 H0, δ = 0.262). This instance-specific variability, where drive predictions, while visually prominent patterns prove
+concentrated attention may be causally critical, irrelevant, dispensable. This invalidates current visualization-based inter-
+or anywhere between, demonstrates that practitioners cannot pretation practices [23], [24] and establishes causal deviation
+determine head importance from visualization alone. The analysis as essential to understand Graph Transformer deci-
+quantitative deviation analysis of our framework resolves this sions.
+ambiguity by directly measuring the casual contribution of Future Directions: The convergence of improved perfor-
+each head through ablation, regardless of visual appearance. mance and quantifiable interpretability opens exciting pos-
+This enables reliable identification of functionally significant sibilities for scientific discovery. An appropriate real-world
+components that attention visualization would miss or misrep- impactful domain application to test our DARTS-GT with
+resent. Users can generate similar analyses for any instance the interpretability framework would be the protein structure-
+using our code provided, extending beyond these illustrative to-function prediction problem, where given a protein with
+examples to their specific use cases. known functions [F 1, F 2, F 3, F 4], DARTS-GT could not only
+predict these functions accurately, but also identify which
+V. CONCLUSION AND FUTURE DIRECTIONS structural motifs causally contribute to each function. When
+This work introduced DARTS-GT, a differentiable architec- the model makes a confident prediction on a novel protein,
+ture search framework for Graph Transformers that discovers our interpretability framework can distinguish whether the
+optimal depth-wise GNN configurations while providing quan- prediction relies on established structural patterns (suggesting
+tifiable interpretability. We now revisit the research questions genuine functional similarity) or spurious correlations (indi-
+posed at the outset. cating potential overfitting).
+Addressing Q1 - Architectural Performance and Adapt- In conclusion, DARTS-GT demonstrates that Graph Trans-
+ability: Our experiments demonstrate that Graph Transformers formers do not need to choose between performance and in-
+can achieve superior performance through dynamic, layer- terpretability. By redesigning the attention mechanism through
+wise GNN selection. DARTS-GT consistently outperformed differentiable architecture search and grounding interpretation
+vanilla Graph Transformers on all benchmarks, with relative in causal analysis, we provide a path toward models that are
+improvements ranging from 0.7% to 318% depending on both more capable and more trustworthy: essential qualities for
+the complexity of the dataset. Against state-of-the-art meth- deployment in high-stakes scientific and medical applications.
+ods, DARTS-GT achieved the best new results on 4 of 8
+datasets (ZINC, MalNet-Tiny, Peptides-Func, and Peptides-
+VI. ACKNOWLEDGMENTS
+Struc), while remaining competitive on others.
+This research was funded by Google DeepMind, with S.C.
+The architectures discovered reveal DARTS’ adaptive na-
+being supported by Google DeepMind Scholarship for her
+ture: selection patterns range from highly specialized (81%
+DPhil studies. The authors also thank Dr.Petar Velicˇkovic´
+GINE on MolPCBA) to nearly uniform distributions (balanced
+for helpful discussions. For the purpose of Open Access, the
+usage on ZINC). This dataset-specific optimization validates
+authors have applied a CC BY public copyright license to any
+that no universal architecture exists; rather, optimal configu-
+Author Accepted Manuscript (AAM) version arising from this
+rations emerge from the interplay between task requirements
+submission. The authors acknowledge the use of the University
+and graph properties. Our ablation studies further confirmed
+of Oxford Advanced Research Computing (ARC) facility in
+that the asymmetric attention design (Q from features, K/V
+carrying out this work. https://doi.org/10.5281/zenodo.22558.
+from GNNs) consistently outperforms symmetric variants,
+demonstrating that decoupling structural encoding from fea-
+ture queries improves graph understanding. This suggests that REFERENCES
+without auxillary MPNNs and by redesigning the attention
+[1] K. Lin, L. Wang, and Z. Liu, “Mesh Graphormer,” Aug. 2021,
+mechanism itself, comparable SOTA performance can be
+arXiv:2104.00272 [cs]. [Online]. Available: http://arxiv.org/abs/2104.
+achieved. 00272
+Addressing Q2 - Quantifiable Interpretability: Our inter- [2] D. Chen, L. O’Bray, and K. Borgwardt, “Structure-Aware Transformer
+for Graph Representation Learning,” Jun. 2022, arXiv:2202.03036
+pretability framework provides the first quantitative method to
+[stat]. [Online]. Available: http://arxiv.org/abs/2202.03036
+understand Graph Transformer decisions at both the population [3] Z. Gu, X. Luo, J. Chen, M. Deng, and L. Lai, “Hierarchical graph
+and the instance levels. The median-based aggregation of transformer with contrastive learning for protein function prediction,”
+Bioinformatics, vol. 39, no. 7, p. btad410, Jul. 2023. [Online].
+Specialization and Focus metrics offers robust dataset-level
+Available: https://academic.oup.com/bioinformatics/article/doi/10.1093/
+characterization. Practitioners can quickly assess whether the bioinformatics/btad410/7208864
+prediction of a model will be easily interpretable (high Special- [4] M. Gao, D. Zhang, Y. Chen, Y. Zhang, Z. Wang, X. Wang,
+S. Li, Y. Guo, G. I. Webb, A. T. N. Nguyen, L. May, and
+ization, high Focus) or require extensive analysis (low values
+J. Song, “GraphormerDTI: A graph transformer-based approach
+on both). These population-level metrics serve as practical for drug-target interaction prediction,” Computers in Biology and
+guidelines for model selection in deployment scenarios where Medicine, vol. 173, p. 108339, May 2024. [Online]. Available:
+https://www.sciencedirect.com/science/article/pii/S0010482524004232
+interpretability matters.
+[5] C. Yuan, K. Zhao, E. E. Kuruoglu, L. Wang, T. Xu, W. Huang,
+At the instance level, our framework reveals a critical find- D. Zhao, H. Cheng, and Y. Rong, “A Survey of Graph Transformers:
+ing: visual attention salience does not reliably indicate func- Architectures, Theories and Applications,” Feb. 2025, arXiv:2502.16533
+[cs] version: 2. [Online]. Available: http://arxiv.org/abs/2502.16533
+tional importance. Through systematic ablation, we demon-
+[6] L. Rampa´, M. Galkin, V. P. Dwivedi, A. T. Luu, G. Wolf, and D. Beaini,
+strated cases where sparse, nearly invisible attention patterns “Recipe for a General, Powerful, Scalable Graph Transformer.”
+
+=== PAGE 15 ===
+JOURNAL OF LATEX CLASS FILES, VOL., NO., OCTOBER 2025 15
+[7] D. Kreuzer, D. Beaini, W. L. Hamilton, V. Le´tourneau, and P. Tossou, [27] H. Liu, K. Simonyan, and Y. Yang, “DARTS: Differentiable
+“Rethinking Graph Transformers with Spectral Attention,” Oct. 2021, Architecture Search,” Apr. 2019, arXiv:1806.09055 [cs]. [Online].
+arXiv:2106.03893 [cs]. [Online]. Available: http://arxiv.org/abs/2106. Available: http://arxiv.org/abs/1806.09055
+03893 [28] Y. Qin, X. Wang, Z. Zhang, and W. Zhu, “Graph Differentiable
+[8] C. Ying, T. Cai, S. Luo, S. Zheng, G. Ke, D. He, Y. Shen, Architecture Search with Structure Learning,” Nov. 2021. [Online].
+and T.-Y. Liu, “Do Transformers Really Perform Bad for Graph Available: https://openreview.net/forum?id=kSv AMdehh3
+Representation?” Nov. 2021, arXiv:2106.05234 [cs]. [Online]. Available: [29] K. Lukyanov, G. Sazonov, S. Boyarsky, and I. Makarov, “Robustness
+http://arxiv.org/abs/2106.05234 questions the interpretability of graph neural networks: what to
+[9] Y. Gao, H. Yang, P. Zhang, C. Zhou, and Y. Hu, “GraphNAS: Graph do?” May 2025, arXiv:2505.02566 [cs]. [Online]. Available: http:
+Neural Architecture Search with Reinforcement Learning,” Aug. 2019, //arxiv.org/abs/2505.02566
+arXiv:1904.09981 [cs]. [Online]. Available: http://arxiv.org/abs/1904. [30] K. Amara, R. Ying, Z. Zhang, Z. Han, Y. Shan, U. Brandes,
+09981 S. Schemm, and C. Zhang, “GraphFramEx: Towards Systematic
+[10] H. Zhao, Q. Yao, and W. Tu, “Search to aggregate neighborhood for Evaluation of Explainability Methods for Graph Neural Networks,”
+graph neural network,” Apr. 2021, arXiv:2104.06608 [cs]. [Online]. May 2024, arXiv:2206.09677 [cs]. [Online]. Available: http://arxiv.org/
+Available: http://arxiv.org/abs/2104.06608 abs/2206.09677
+[11] L. Wei, H. Zhao, Z. He, and Q. Yao, “Neural Architecture Search for [31] K. Xu, W. Hu, J. Leskovec, and S. Jegelka, “How Powerful are
+GNN-Based Graph Classification,” ACM Transactions on Information Graph Neural Networks?” Feb. 2019, arXiv:1810.00826 [cs]. [Online].
+Systems, vol. 42, no. 1, pp. 1–29, Jan. 2024. [Online]. Available: Available: http://arxiv.org/abs/1810.00826
+https://dl.acm.org/doi/10.1145/3584945 [32] X. Bresson and T. Laurent, “Residual Gated Graph ConvNets,” Apr.
+[12] Z. Wu, P. Jain, M. A. Wright, A. Mirhoseini, J. E. Gonzalez, 2018, arXiv:1711.07553 [cs]. [Online]. Available: http://arxiv.org/abs/
+and I. Stoica, “Representing Long-Range Context for Graph Neural 1711.07553
+Networks with Global Attention,” Jan. 2022, arXiv:2201.08821 [cs]. [33] P. Michel, O. Levy, and G. Neubig, “Are Sixteen Heads Really Better
+[Online]. Available: http://arxiv.org/abs/2201.08821 than One?” Nov. 2019, arXiv:1905.10650 [cs]. [Online]. Available:
+[13] C. Wang, J. Zhao, L. Li, L. Jiao, F. Liu, and S. Yang, “Automatic http://arxiv.org/abs/1905.10650
+Graph Topology-Aware Transformer,” Aug. 2024, arXiv:2405.19779 [34] N. Pochinkov, B. Pasero, and S. Shibayama, “Investigating Neuron
+[cs]. [Online]. Available: http://arxiv.org/abs/2405.19779 Ablation in Attention Heads: The Case for Peak Activation Centering.”
+[14] Z. Zhang, X. Wang, C. Guan, Z. Zhang, H. Li, and W. Zhu, “AU- [35] N. Bahador, “Mechanistic Interpretability of Fine-Tuned Vision Trans-
+TOGT: AUTOMATED GRAPH TRANSFORMER ARCHI- TECTURE formers on Distorted Images: Decoding Attention Head Behavior for
+SEARCH,” 2023. Transparent and Trustworthy AI.”
+[15] J. Lin, X. Guo, S. Zhang, D. Zhou, Y. Zhu, and J. Shun, “UnifiedGT: [36] S. Heimersheim and N. Nanda, “How to use and interpret activation
+Towards a Universal Framework of Transformers in Large-Scale Graph patching,” Apr. 2024, arXiv:2404.15255 [cs]. [Online]. Available:
+Learning,” in 2024 IEEE International Conference on Big Data http://arxiv.org/abs/2404.15255
+(BigData). Washington, DC, USA: IEEE, Dec. 2024, pp. 1057–1066. [37] F. Zhang and N. Nanda, “Towards Best Practices of Activation
+[Online]. Available: https://ieeexplore.ieee.org/document/10825327/ Patching in Language Models: Metrics and Methods,” Jan. 2024,
+[16] W. Song, X. Wu, B. Yang, Y. Zhou, Y. Xiao, Y. Liang, H. Ge, arXiv:2309.16042 [cs]. [Online]. Available: http://arxiv.org/abs/2309.
+H. P. Lee, and C. Wu, “Towards Efficient Few-shot Graph Neural 16042
+Architecture Search via Partitioning Gradient Contribution,” Jun. 2025, [38] G. Anandalingam and T. L. Friesz, “Hierarchical optimization: An
+arXiv:2506.01231 [cs]. [Online]. Available: http://arxiv.org/abs/2506. introduction,” Annals of Operations Research, vol. 34, no. 1, pp. 1–11,
+01231 Dec. 1992. [Online]. Available: http://www.scopus.com/inward/record.
+[17] T. N. Kipf and M. Welling, “Semi-Supervised Classification with Graph url?scp=0002633543&partnerID=8YFLogxK
+Convolutional Networks,” Feb. 2017, arXiv:1609.02907 [cs]. [Online]. [39] H. Wang, H. Yin, M. Zhang, and P. Li, “EQUIVARIANT AND STA-
+Available: http://arxiv.org/abs/1609.02907 BLE POSITIONAL ENCODING FOR MORE POWERFUL GRAPH
+[18] P. Velicˇkovic´, G. Cucurull, A. Casanova, A. Romero, P. Lio`, and NEURAL NETWORKS,” 2022.
+Y. Bengio, “Graph Attention Networks,” Feb. 2018, arXiv:1710.10903 [40] S. Brody, U. Alon, and E. Yahav, “How Attentive are Graph Attention
+[stat]. [Online]. Available: http://arxiv.org/abs/1710.10903 Networks?” Jan. 2022, arXiv:2105.14491 [cs]. [Online]. Available:
+[19] V. P. Dwivedi and X. Bresson, “A Generalization of Transformer http://arxiv.org/abs/2105.14491
+Networks to Graphs,” Jan. 2021, arXiv:2012.09699 [cs]. [Online]. [41] V. P. Dwivedi, C. K. Joshi, A. T. Luu, T. Laurent, Y. Bengio, and
+Available: http://arxiv.org/abs/2012.09699 X. Bresson, “Benchmarking Graph Neural Networks,” Dec. 2022,
+[20] K. Choromanski, V. Likhosherstov, D. Dohan, X. Song, A. Gane, arXiv:2003.00982 [cs]. [Online]. Available: http://arxiv.org/abs/2003.
+T. Sarlos, P. Hawkins, J. Davis, A. Mohiuddin, L. Kaiser, D. Belanger, 00982
+L. Colwell, and A. Weller, “Rethinking Attention with Performers,” [42] G. Corso, L. Cavalleri, D. Beaini, P. Lio`, and P. Velicˇkovic´,
+Nov. 2022, arXiv:2009.14794 [cs]. [Online]. Available: http://arxiv.org/ “Principal Neighbourhood Aggregation for Graph Nets,” Dec. 2020,
+abs/2009.14794 arXiv:2004.05718 [cs]. [Online]. Available: http://arxiv.org/abs/2004.
+[21] R. Ying, D. Bourgeois, J. You, M. Zitnik, and J. Leskovec, 05718
+“GNNExplainer: Generating Explanations for Graph Neural Networks,” [43] V. P. Dwivedi, A. T. Luu, T. Laurent, Y. Bengio, and X. Bresson,
+Nov. 2019, arXiv:1903.03894 [cs]. [Online]. Available: http://arxiv.org/ “Graph Neural Networks with Learnable Structural and Positional
+abs/1903.03894 Representations,” Feb. 2022, arXiv:2110.07875 [cs]. [Online]. Available:
+[22] A. Shehzad, F. Xia, S. Abid, C. Peng, S. Yu, D. Zhang, and K. Verspoor, http://arxiv.org/abs/2110.07875
+“Graph Transformers: A Survey,” Jul. 2024, arXiv:2407.09777 [cs]. [44] D. Beaini, S. Passaro, V. Le´tourneau, W. L. Hamilton, G. Corso, and
+[Online]. Available: http://arxiv.org/abs/2407.09777 P. Lio`, “Directional Graph Networks,” Apr. 2021, arXiv:2010.02863
+[23] M. S. Hussain, M. J. Zaki, and D. Subramanian, “Global Self-Attention [cs]. [Online]. Available: http://arxiv.org/abs/2010.02863
+as a Replacement for Graph Convolution,” in Proceedings of the 28th [45] G. Bouritsas, F. Frasca, S. Zafeiriou, and M. M. Bronstein, “Improving
+ACM SIGKDD Conference on Knowledge Discovery and Data Mining, Graph Neural Network Expressivity via Subgraph Isomorphism
+Aug. 2022, pp. 655–665, arXiv:2108.03348 [cs]. [Online]. Available: Counting,” IEEE Transactions on Pattern Analysis and Machine
+http://arxiv.org/abs/2108.03348 Intelligence, vol. 45, no. 1, pp. 657–668, Jan. 2023, arXiv:2006.09252
+[24] B. El, D. Choudhury, P. Lio`, and C. K. Joshi, “Towards Mechanistic [cs]. [Online]. Available: http://arxiv.org/abs/2006.09252
+Interpretability of Graph Transformers via Attention Graphs,” Feb. [46] C. Bodnar, F. Frasca, N. Otter, Y. G. Wang, P. Lio`, G. Montu´far,
+2025, arXiv:2502.12352 [cs]. [Online]. Available: http://arxiv.org/abs/ and M. Bronstein, “Weisfeiler and Lehman Go Cellular: CW
+2502.12352 Networks,” Jan. 2022, arXiv:2106.12575 [cs]. [Online]. Available:
+[25] L. Li, J. Liu, X. Ji, M. Wang, and Z. Zhang, “Self-Explainable Graph http://arxiv.org/abs/2106.12575
+Transformer for Link Sign Prediction,” Dec. 2024, arXiv:2408.08754 [47] J. To¨nshoff, M. Ritzert, H. Wolf, and M. Grohe, “Walking Out of
+[cs]. [Online]. Available: http://arxiv.org/abs/2408.08754 the Weisfeiler Leman Hierarchy: Graph Learning Beyond Message
+[26] J. Baek, M. Kang, and S. J. Hwang, “Accurate Learning of Passing,” Aug. 2023, arXiv:2102.08786 [cs]. [Online]. Available:
+Graph Representations with Graph Multiset Pooling,” Jun. 2021, http://arxiv.org/abs/2102.08786
+arXiv:2102.11533 [cs]. [Online]. Available: http://arxiv.org/abs/2102. [48] L. Zhao, W. Jin, L. Akoglu, and N. Shah, “From Stars to Subgraphs:
+11533 Uplifting Any GNN with Local Structure Awareness,” Apr. 2022,
+
+=== PAGE 16 ===
+JOURNAL OF LATEX CLASS FILES, VOL., NO., OCTOBER 2025 16
+arXiv:2110.03753 [cs]. [Online]. Available: http://arxiv.org/abs/2110.
+03753
+[49] V. P. Dwivedi, L. Rampa´sˇek, M. Galkin, A. Parviz, G. Wolf, A. T.
+Luu, and D. Beaini, “Long Range Graph Benchmark,” Nov. 2023,
+arXiv:2206.08164 [cs]. [Online]. Available: http://arxiv.org/abs/2206.
+08164
+[50] M. Yang, R. Wang, Y. Shen, H. Qi, and B. Yin, “Breaking the
+Expression Bottleneck of Graph Neural Networks,” IEEE Transactions
+on Knowledge and Data Engineering, vol. 35, no. 6, pp. 5652–5664,
+Jun. 2023. [Online]. Available: https://ieeexplore.ieee.org/document/
+9759979/
+
+=== PAGE 17 ===
+JOURNAL OF LATEX CLASS FILES, VOL., NO., OCTOBER 2025 1
+Supplementary Materials - DARTS-GT:
+Differentiable Architecture Search for Graph
+Transformers with Quantifiable Instance-Specific
+Interpretability Analysis
+Shruti Sarika Chakraborty Peter Minary
+I. RELATIONSHIP BETWEEN ATTENTION CONCENTRATION The weak median correlation (0.167) combined with high
+AND FUNCTIONAL IMPORTANCE variance (0.437) demonstrates that attention concentration
+We investigate if heads with concentrated attention patterns (entropy) is not a reliable predictor of functional importance.
+exhibit higher functional importance. We test this system- The relationship varies fundamentally across instances i.e.
+atically by correlating attention entropy with head devia- concentrated attention may indicate critical heads, dispensable
+tion across all test instances for one representative dataset : heads, or have no relationship to importance at all. This proves
+that attention-based visualization or entropy heuristics cannot
+Peptides-Struc for one method - DARTS-GT.
+a) Methodology.: For each graph G with n nodes, head substitute for causal ablation methods. Our head deviation
+i
+m in layer ℓ, we compute attention entropy from the attention framework remains necessary for faithful interpretation, as it
+matrix A( m ℓ) R n × n. First, we sum incoming attention for directly measures functional contribution rather than relying
+∈ on correlational attention patterns that may be misleading.
+each target node:
+n
+S(ℓ)[j] = A(ℓ)[k, j] (1) II. ABLATION STUDIES: DATASET-DEPENDENT ROLE OF
+m m
+k=1
+EDGE INFORMATION
+X
+Then normalize to obtain a probability distribution: Here we examine the impact of edge residual connections
+S(ℓ)[j] across different attention mechanisms and datasets. While our
+P (ℓ)[j] = m (2) GNN experts (GINE, GatedGCN, GATV2) inherently utilize
+m n j′=1 S m (ℓ)[j ′ ] edge features, these ablation studies demonstrate whether
+Finally, compute Shannon enPtropy: adding explicit edge residual connections to the attention
+mechanism provides additional benefits. Supplementary Ta-
+n
+H(m, ℓ, i) = P (ℓ)[j] log P (ℓ)[j] (3) ble I presents results across four datasets comparing dense and
+− m m sparse attention with and without edge residual connections.
+j=1
+X
+For computational efficiency, ZINC experiments use 1000
+where low entropy indicates concentrated attention on few
+epochs, sufficient to demonstrate relative performance trends.
+nodes and high entropy indicates diffuse attention. For each
+The results reveal dataset-specific utility of edge residuals.
+instance i, we compute the Spearman rank correlation between
+These findings demonstrate that edge residual connections
+H(m, ℓ, i) and δ across all heads
+{ } m ∈M ,ℓ ∈L { m,ℓ,i } m ∈M ,ℓ ∈L are not universally beneficial, validating our design choice of
+and layers.
+making them optional.
+b) Results on Peptides-Struct: We apply this analysis
+to DARTS-GT on the Peptides-Struct dataset. Supplementary
+Figure 1 shows the distribution of per-instance correlations.
+III. INSTANCE-SPECIFIC INTERPRETABILITY ANALYSIS
+The left histogram reveals correlations spanning from -1.0 to FOR MOLHIV :
++1.0, with a median of only 0.167 and standard deviation Here we demonstrate instance-specific interpretability anal-
+of 0.437. Notably, the standard deviation exceeds twice the ysis for MolHIV’s graph number: 50. For Graph-50 (17 nodes)
+median value. The right boxplot confirms this inconsistency: of MolHIV, head deviation profiles and attention patterns
+the interquartile range crosses zero, and whiskers extend (Supplementary Figure 3) reveal distinct interpretability char-
+across nearly the full correlation range. Substantial portions acteristics. In the attention heatmaps, columns represent target
+of instances exhibit negative correlations (where concentrated nodes that receive attention. (a) DARTS-GT: Clear head spe-
+attention corresponds to low importance), near-zero correla- cialization (Spec= 0.00288) with top heads forming two con-
+tions (no relationship), and positive correlations (concentrated sensus pairs - L0 H3 (δ = 0.016 - highest) /L1 H1 attending
+attention corresponds to high importance). to target node 1, L2 H0/L1 H0 attending to target node 9. The
+Focus for this instance is 0.333. (b) GPS with dense attention:
+Department of Computer Science, University of Oxford, Oxford Minimal head specialization (Spec= 1.01 10 9) with nearly
+OX1 3QG, UK. Emails: shruti.chakraborty@cs.ox.ac.uk, × −
+peter.minary@cs.ox.ac.uk. imperceptible deviations (highest δ = 4.87 10 − 9 at L5 H1),
+×
+
+=== PAGE 18 ===
+JOURNAL OF LATEX CLASS FILES, VOL., NO., OCTOBER 2025 2
+Supplementary Figure 1: Distribution of per-instance Spearman correlations between attention entropy and head deviation on
+Peptides-Struct.
+Supplementary Table I: Effect of edge features on Graph
+biases, with the search adapting operator selection based on
+Transformer performance across multiple datasets and atten-
+both network depth and dataset characteristics.
+tion types. Shown is the mean ± std across 3 seeds. Best results
+are in bold.
+Dataset Attn Type Mode Perf
+No edge 0.1054±0.0055
+Dense
+Edge 0.098±0.0082
+ZINC*
+No edge 0.0812±0.0043
+Sparse
+Edge 0.0782±0.006
+No edge 0.2011±0.0101
+Dense
+Edge 0.2224±0.004
+MOLPCBA
+No edge 0.258±0.0043
+Sparse
+Edge 0.2545±0.003
+No edge 0.2693±0.0013
+Dense
+Edge 0.3107±0.0122
+CLUSTER
+No edge 0.7773±0.0020
+Sparse
+Edge 0.7835±0.0004
+No edge 0.2466±0.0003
+Dense
+Edge 0.248±0.0025
+Peptides-Struc
+No edge 0.263±0.0004
+Sparse
+Edge 0.263±0.0008
+suggests uniform head importance. Partial consensus with
+L5 H1/L0 H1 attending to target node 10 while others target
+nodes 7,11. The overall Focus attained is 0.167. (c) GPS with
+sparse attention: Low head specialization (Spec= 7.39 10 5)
+−
+×
+with low deviations (highest δ = 0.0003 at L4 H3) . High
+consensus with L4 H3/L6 H0/L5 H3 attending to target node
+9 while L6 H2 target node 14. The overall Focus attained
+Supplementary Figure 2: Discovered layer-wise operators
+is very high 0.5. (d) Vanilla-GT: Low specialization (Spec=
+after DARTS. For each layer, the search selects exactly one
+2.47 10 5). Similar partial consensus with L14 H1/L3 H2
+× − operator from GINE, GATv2, GatedGCN . CLUSTER (left,
+attending to target node 14, others targeting nodes 8,5 and { }
+L0–L15): the architecture is dominated by GatedGCN across
+overall Focus is same as GPS (dense attention) with 0.167.
+depth, with brief GINE selections around L5–L6 and GATv2
+Despite similar Focus values in GPS (dense attn) and Vanilla-
+at L0-L1. ZINC (right, L0–L7): shallow layers favor GINE
+GT, their vastly different Specialization values indicate distinct
+(L0–L1, L7), the mid-depth region prefers GATv2 (L3–L5),
+interpretation challenges.
+and GatedGCN appears at L2 and L6. These dataset-specific,
+depth-varying patterns indicate that the search adapts inductive
+IV. LAYER-WISE ARCHITECTURE DISCOVERY VIA DARTS biases per layer, rather than converging to a uniform choice.
+After search, the selected per-layer GNN is used once to
+The DARTS search process automatically discovers optimal
+produce K, V and is shared across heads.
+GNN operators for each layer, as illustrated in Supplementary
+Figure 2 for CLUSTER and ZINC datasets. These results
+demonstrate that different layers require different inductive
+
+=== PAGE 19 ===
+JOURNAL OF LATEX CLASS FILES, VOL., NO., OCTOBER 2025 3
+(a) DARTS-GT
+(b) GPS
+(c) Vanilla-GT
+Supplementary Figure 3: Instance analysis of Graph 50 (MolHIV, 17 nodes). Deviation profiles and top-4 attention heatmaps
+for each model, with columns representing target nodes. GPS with dense attention is given here.
+
+=== PAGE 20 ===
+JOURNAL OF LATEX CLASS FILES, VOL., NO., OCTOBER 2025 4
+(d) GPS (sparse)
+Supplementary Figure 3: (continued) Instance analysis of Graph 50 - GPS with sparse attention.
+V. POPULATION LEVEL INTERPRETABILITY ANALYSIS
+Supplementary figures 4 and 5 visualize population-level
+interpretability distributions across two test sets : Peptide-
+Struc and MolHIV respectively, revealing distinct patterns
+between architectures and datasets. The plots demonstrate
+that interpretability is inherently dataset-dependent and varies
+significantly at the instance level. While we report median
+values for dataset-level comparison, each point represents
+an individual graph with its own Specialization and Focus
+values derived from our causal ablation framework. This
+instance-level variation, visible as the scatter around median
+values, underscores that some graphs remain challenging to
+interpret regardless of model choice, while others yield clear
+interpretability patterns.
+Supplementary Figure 4: Instance-level interpretability distri-
+butions on Peptides-Struc test set. (a) Vanilla-GT model (dense
+attention). Each point represents a single test graph positioned
+by its Specialization (head importance concentration) and
+Focus (consensus among important heads).
+
+=== PAGE 21 ===
+JOURNAL OF LATEX CLASS FILES, VOL., NO., OCTOBER 2025 5
+(a) GPS (Pep-Struc, dense) (b) DARTS-GT (Pep-Struc, dense)
+Supplementary Figure 4: (continued) (b) GPS model shows different clustering patterns compared to Vanilla-GT. (c) DARTS-
+GT achieves the highest median Focus (0.129), indicating stronger node consensus. All models use dense attention. Note
+the different scale compared to MolHIV (Supplementary Figure 5), with Specialization value, suggesting dataset-specific
+interpretability characteristics.
+Supplementary Table II: Hyperparameters across all datasets Supplementary Table III: Hyperparameters across all datasets
+(Part 1) (Part 2)
+Hyperparameters ZINC MolHIV MOLPCBA MALNET Hyperparameters PATTERN CLUSTER PEP-FUNC PEP-STRUC
+Architecture Parameters Architecture Parameters
+Number of Layers 8 8 4 4 Number of Layers 6 16 2 2
+Hidden dim 64 64 384 64 Hidden dim 64 48 120 120
+Attention type Sparse Sparse Sparse Sparse Attention type Sparse Sparse Dense Dense
+Heads 4 4 4 4 Heads 4 8 4 4
+Dropout 0 0.05 0.2 0 Dropout 0 0 0 0
+Attention dropout 0.5 0.5 0.5 0.5 Attention dropout 0.5 0.5 0.5 0.5
+Edge residual weight 0.1 NA NA 0.1 Edge residual weight 0.1 0.1 NA NA
+Q-projection Identity Identity Identity Identity Q-projection Identity Identity MLP MLP
+DARTS Parameters DARTS Parameters
+DARTS epochs 120 30 30 30 DARTS epochs 20 25 50 50
+DARTS splits ratio 0.6 0.6 0.6 0.6 DARTS splits ratio 0.6 0.6 0.6 0.6
+Architecture LR 4.00E-04 4.00E-04 4.00E-04 4.00E-04 Architecture LR 4.00E-04 4.00E-04 4.00E-04 4.00E-04
+Grad clip 5 5 5 5 Grad clip 5 5 5 5
+Training Parameters Training Parameters
+LR reduce factor 0.5 0.5 0.5 0.5 LR reduce factor 0.5 0.5 0.5 0.5
+LR schedule patience 10 10 10 10 LR schedule patience 10 10 10 10
+Min learning rate 1.00E-06 1.00E-06 1.00E-06 1.00E-06 Min learning rate 1.00E-06 1.00E-06 1.00E-06 1.00E-06
+Initial learning rate 0.0025 0.0025 0.0025 0.0025 Initial learning rate 0.0025 0.0025 0.0025 0.0025
+Weight decay 3.00E-04 3.00E-04 3.00E-04 3.00E-04 Weight decay 3.00E-04 3.00E-04 3.00E-04 3.00E-04
+Epochs 2000 100 100 100 Epochs 100 100 200 200
+Warmup epochs 50 5 5 10 Warmup epochs 5 5 0 0
+Graph-specific Parameters Graph-specific Parameters
+Graph pooling sum mean mean max Graph pooling NA NA mean mean
+Positional Encoding RWSE-20 RWSE-16 RWSE-16 None Positional Encoding LapPE-16 LapPE-10 LapPE-10 LapPE-10
+PE dim 28 16 20 NA PE dim 16 16 16 16
+PE encoder linear linear linear NA PE encoder DeepSet DeepSet DeepSet DeepSet
+Computational Resources Computational Resources
+DARTS-Parameters 641989 583017 10186472 327893 DARTS-Parameters 487369 728678 604817 604696
+Discrete-Parameters 412397 344929 5707484 208329 Discrete-Parameters 338775 511250 426341 448240
+Total DARTS time 4490.0s 2777.0s 4441.0s 630.0s Total DARTS time 1320.45s 3454.26s 409.0s 411.54s
+Discrete phase time 26.0s/15.0h 63.0s/2.37h 158.0s/5.0h 16.0s/0.645h Discrete phase time 58.0s/1.87h 97.4s/3.88h 12.49s/0.775h 12.5s/0.845h
+
+=== PAGE 22 ===
+JOURNAL OF LATEX CLASS FILES, VOL., NO., OCTOBER 2025 6
+(a) Vanilla-GT (MolHIV, sparse) (b) GPS (MolHIV, sparse)
+(c) GPS (MolHIV, dense) (d) DARTS-GT (MolHIV, sparse)
+Supplementary Figure 5: Instance-level interpretability distributions on MolHIV test set. Each point represents a single test
+graph positioned by its Specialization (head importance concentration) and Focus (consensus among important heads). GPS
+shown with both sparse and dense attention to demonstrate architectural impact on interpretability.
+Supplementary Table IV: Comprehensive parameter comparison across all models and datasets. Best (lowest) parameter count
+is highlighted in bold
+Model Attention ZINC MolHIV MOLPCBA MALNET PATTERN CLUSTER PEP-STRUC PEP-FUNC
+Dense Attention
+Vanilla-GT Dense 3,56,261 4,51,793 84,06,236 5,03,749 3,02,385 3,85,126 4,29,611 4,29,490
+GPS Dense 4,23,717 5,58,625 97,44,496 5,27,237 3,37,201 5,02,054 5,04,459 5,04,362
+DARTS-GT Dense 4,41,751 3,98,289 85,57,152 NA 3,61,591 5,07,206 4,26,341 4,48,240
+Sparse Attention
+Vanilla-GT Sparse 3,56,261 4,51,793 84,06,236 NA 3,02,385 3,38,086 4,12,397 4,29,490
+DARTS-GT Sparse 4,28,333 3,44,929 57,07,484 2,08,329 3,38,775 5,11,250 3,97,301 4,08,160

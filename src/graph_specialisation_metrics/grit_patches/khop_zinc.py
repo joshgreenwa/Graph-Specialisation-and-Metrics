@@ -79,12 +79,12 @@ OFFICIAL_COMMIT = "6c988ea600a606fbb49a2246c64a2d37396b3ab5"
 EXPECTED_ZINC_GRIT_RRWP_PARAMS = 473_473
 VNODE_PARAM_COUNT = 64
 KHOP_CFG_TEMPLATE = """\
-# Configurable k-hop sparse-control variant of the official ZINC GRIT RRWP config.
+# Configurable dense/k-hop variant of the official ZINC GRIT RRWP config.
 #
 # This file intentionally keeps the official ZINC subset model, optimizer,
 # training schedule, RRWP dimensions, and decoder settings. The only scientific
-# intervention is `gt.attn.sparsity: k_hop`. The local patch keeps node pairs
-# whose shortest-path distance is <= `gt.attn.hops`. An optional learned global
+# attention mode is selected by `gt.attn.sparsity`. The local patch keeps node
+# pairs whose shortest-path distance is <= `gt.attn.hops` for k-hop runs. An optional learned global
 # VNode is connected bidirectionally to every real node in every attention layer.
 out_dir: results
 metric_best: mae
@@ -97,7 +97,7 @@ mlflow:
   name: {run_name}
 wandb:
   use: False
-  project: ZINC
+  project: {wandb_project}
 dataset:
   format: PyG-ZINC
   name: subset
@@ -143,8 +143,8 @@ gt:
   attn:
     clamp: 5.
     act: 'relu'
-    full_attn: False
-    sparsity: k_hop
+    full_attn: {full_attn}
+    sparsity: {sparsity}
     hops: {hops}
     global_vnode: {global_vnode}
     edge_enhance: True
@@ -213,8 +213,6 @@ EXPECTED_CFG_VALUES = {
     ("gt", "update_e"): True,
     ("gt", "attn", "clamp"): 5.0,
     ("gt", "attn", "act"): "relu",
-    ("gt", "attn", "full_attn"): False,
-    ("gt", "attn", "sparsity"): "k_hop",
     ("gt", "attn", "edge_enhance"): True,
     ("gt", "attn", "O_e"): True,
     ("gt", "attn", "norm_e"): True,
@@ -909,25 +907,30 @@ def _replace_if_present(path: Path, old: str, new: str, label: str) -> bool:
 
 
 def apply_khop_patch(repo_dir: Path, drive_dir: Path, args: argparse.Namespace) -> None:
-    """Apply configurable k-hop support and optional global-VNode patches."""
+    """Apply configurable dense/k-hop support and optional global-VNode patches."""
+    is_dense = args.attention == "dense"
+    attention_label = "dense" if is_dense else f"{args.hops}-hop"
     log(
-        f"\n[patch] Applying {args.hops}-hop GRIT control patch "
+        f"\n[patch] Applying {attention_label} GRIT control patch "
         f"(global_vnode={args.global_vnode})."
     )
 
     cfg_path = repo_dir / OFFICIAL_CFG
     cfg_path.parent.mkdir(parents=True, exist_ok=True)
     config_text = KHOP_CFG_TEMPLATE.format(
-        run_name=f"zinc-GRIT-RRWP-{args.hops}hop" + ("-vnode" if args.global_vnode else ""),
+        run_name=f"zinc-GRIT-RRWP-{attention_label}" + ("-vnode" if args.global_vnode else ""),
+        wandb_project=json.dumps(args.wandb_project or "ZINC"),
+        full_attn="True" if is_dense else "False",
+        sparsity="full" if is_dense else "k_hop",
         hops=args.hops,
         global_vnode="True" if args.global_vnode else "False",
     )
     current_cfg = _read_text_preserve_newlines(cfg_path) if cfg_path.exists() else ""
     if current_cfg != config_text:
         _write_text_preserve_newlines(cfg_path, config_text)
-        log(f"[patch] wrote exact {args.hops}-hop ZINC config: {cfg_path}")
+        log(f"[patch] wrote exact {attention_label} ZINC config: {cfg_path}")
     else:
-        log(f"[patch] exact {args.hops}-hop ZINC config already present: {cfg_path}")
+        log(f"[patch] exact {attention_label} ZINC config already present: {cfg_path}")
 
     gt_config = repo_dir / "grit" / "config" / "gt_config.py"
     _replace_exact(
@@ -1480,6 +1483,9 @@ def validate_official_config(
         cfg = yaml.safe_load(f)
 
     expected_values = dict(EXPECTED_CFG_VALUES)
+    is_dense = args.attention == "dense"
+    expected_values[("gt", "attn", "full_attn")] = is_dense
+    expected_values[("gt", "attn", "sparsity")] = "full" if is_dense else "k_hop"
     expected_values[("gt", "attn", "hops")] = args.hops
     expected_values[("gt", "attn", "global_vnode")] = args.global_vnode
 
@@ -1501,16 +1507,17 @@ def validate_official_config(
         else:
             raise RuntimeError(msg + "\nPass --allow-upstream-config-drift to run anyway.")
 
-    log(f"[config] {args.hops}-hop GRIT ZINC+RRWP config validated (global_vnode={args.global_vnode}).")
-    log(f"[config] Key setup: PyG-ZINC/subset, graph regression, RRWP, GritTransformer, <= {args.hops}-hop attention support, 10 layers, 64 hidden dim, 8 heads, batch 32, L1/MAE, 2000 epochs, eval every epoch.")
+    attention_label = "dense" if is_dense else f"<={args.hops}-hop"
+    log(f"[config] {attention_label} GRIT ZINC+RRWP config validated (global_vnode={args.global_vnode}).")
+    log(f"[config] Key setup: PyG-ZINC/subset, graph regression, RRWP, GritTransformer, {attention_label} attention support, 10 layers, 64 hidden dim, 8 heads, batch 32, L1/MAE, 2000 epochs, eval every epoch.")
     log("[paper-check] Dense-reference GRIT paper Table 9 ZINC settings are preserved: layers=10, hidden_dim=64, heads=8, dropout=0, attn_dropout=0.2, pooling=sum/add, PE=RRWP-21, PE_encoder=linear, batch=32, lr=0.001, epochs=2000, warmup=50, weight_decay=1e-5.")
-    log(f"[paper-check] Control intervention: full_attn=False, sparsity=k_hop, hops={args.hops}, global_vnode={args.global_vnode}. No width/depth/head/schedule changes.")
+    log(f"[paper-check] Attention intervention: mode={args.attention}, hops={args.hops}, global_vnode={args.global_vnode}. No width/depth/head/schedule changes.")
     log(f"[paper-check] Expected trainable parameter count: {expected_param_count(args)}")
 
 
 def build_training_command(args: argparse.Namespace, drive_dir: Path) -> List[str]:
     results_dir = drive_dir / "results"
-    dataset_dir = drive_dir / "datasets"
+    dataset_dir = args.dataset_dir if args.dataset_dir is not None else drive_dir / "datasets"
     results_dir.mkdir(parents=True, exist_ok=True)
     dataset_dir.mkdir(parents=True, exist_ok=True)
     ckpt_best = not args.checkpoint_every_epoch
@@ -1763,11 +1770,12 @@ def _strip_colab_kernel_args(argv: Sequence[str]) -> List[str]:
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        description="Train configurable k-hop GRIT+RRWP on the ZINC subset in Colab, with an optional global VNode.",
+        description="Train dense or configurable k-hop GRIT+RRWP on ZINC, with an optional global VNode.",
         epilog=textwrap.dedent(
             """
             Examples:
-              !python GRIT_khop_ZINC.py --hops 2
+              !python GRIT_khop_ZINC.py --attention dense
+              !python GRIT_khop_ZINC.py --attention khop --hops 2
               %run GRIT_khop_ZINC.py --hops 3 --global-vnode
               !python GRIT_khop_ZINC.py --skip-install --hops 1 --auto-resume
             """
@@ -1775,10 +1783,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     p.add_argument("--drive-mount", type=Path, default=Path("/content/drive"))
     p.add_argument("--drive-dir", type=Path, default=Path("/content/drive/MyDrive/grit_zinc_khop"))
+    p.add_argument("--dataset-dir", type=Path, default=None, help="Optional shared ZINC dataset cache. Default: DRIVE_DIR/datasets.")
     p.add_argument("--repo-dir", type=Path, default=Path("/content/GRIT_khop"))
     p.add_argument("--repo-url", type=str, default=OFFICIAL_REPO)
     p.add_argument("--branch", type=str, default="main")
     p.add_argument("--commit", type=str, default=OFFICIAL_COMMIT, help="Pin the official GRIT repo to this commit. Pass an empty string to use the branch HEAD.")
+    p.add_argument("--attention", choices=["dense", "khop"], default="khop", help="Complete-graph or exact <=k-hop attention. Default: khop.")
     p.add_argument("--hops", "-k", type=int, default=1, help="Attention radius in graph hops (1..20 with RRWP-21). Default: 1.")
     p.add_argument("--global-vnode", action="store_true", help="Add one learned global virtual node per graph to all attention layers; exclude it from final pooling.")
     p.add_argument("--expected-params", type=int, default=None, help="Override the automatic parameter-count guard (473473 without VNode; 473537 with VNode).")
@@ -1789,11 +1799,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     p.add_argument("--num-threads", type=int, default=4)
     p.add_argument("--pyg-version", type=str, default="2.2.0")
     p.add_argument("--skip-install", action="store_true", help="Do not pip-install dependencies.")
+    p.add_argument("--skip-editable-install", action="store_true", help="Do not run pip install -e on the patched checkout; recommended for parallel cluster jobs.")
     p.add_argument("--official-torch112", action="store_true", help="Try to install torch==1.12.1+cu113. Requires Python <=3.10 and may not work on current Colab.")
     p.add_argument("--force-fresh-repo", action="store_true", help="Delete and reclone the GRIT repo directory before running.")
     p.add_argument("--allow-upstream-config-drift", action="store_true", help="Warn instead of aborting if upstream config differs from expected official values.")
     p.add_argument("--allow-param-count-drift", action="store_true", help="Warn instead of aborting if Num parameters is not the expected ZINC GRIT+RRWP paper count.")
     p.add_argument("--wandb", action="store_true", help="Enable W&B. Default is disabled for unattended Colab runs.")
+    p.add_argument("--wandb-project", type=str, default=None, help="Override the W&B project name when tracking is enabled.")
     p.add_argument("--console-verbosity", choices=["compact", "standard", "full"], default="compact", help="Notebook stdout filtering. Full raw output is always saved to Drive.")
     p.add_argument("--console-epoch-period", type=int, default=1, help="In compact/standard mode, print every Nth official epoch summary. Default: every epoch.")
     p.add_argument("--accelerator", type=str, default="cuda:0", help="Runtime device override passed to GRIT. Default: cuda:0 for Colab GPU.")
@@ -1838,7 +1850,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     if not 1 <= args.hops <= 20:
         p.error("--hops must be between 1 and 20 because RRWP-21 stores identity plus walks of lengths 1..20")
     if args.name_tag is None:
-        args.name_tag = f"ColabDrive.{args.hops}hop.GRITwRRWP" + (".VNode" if args.global_vnode else "")
+        variant = "dense" if args.attention == "dense" else f"{args.hops}hop"
+        args.name_tag = f"ColabDrive.{variant}.GRITwRRWP" + (".VNode" if args.global_vnode else "")
     return args
 
 
@@ -1872,12 +1885,15 @@ def main(argv: Sequence[str] | None = None) -> None:
     apply_khop_patch(args.repo_dir, args.drive_dir, args)
     verify_khop_attention_patch(args.repo_dir)
     verify_recovery_checkpoint_patch(args.repo_dir)
-    install_grit_editable(args.repo_dir)
+    if args.skip_editable_install:
+        log("[deps] Skipping editable GRIT install; main.py imports the job-local checkout.")
+    else:
+        install_grit_editable(args.repo_dir)
     validate_official_config(args.repo_dir, args.allow_upstream_config_drift, args)
     print_environment_summary(args.drive_dir, args.repo_dir, commit)
 
     cmd = build_training_command(args, args.drive_dir)
-    variant = f"{args.hops}hop" + ("_vnode" if args.global_vnode else "")
+    variant = ("dense" if args.attention == "dense" else f"{args.hops}hop") + ("_vnode" if args.global_vnode else "")
     wrapper_log = args.drive_dir / "wrapper_logs" / f"grit_zinc_{variant}_seed{args.seed}_{time.strftime('%Y%m%d_%H%M%S')}.log"
     train_env = env_with_py312_compat(compat_shim_dir)
     if args.guaranteed_checkpoints:
