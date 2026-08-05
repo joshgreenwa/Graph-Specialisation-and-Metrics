@@ -25,7 +25,7 @@ The prepared CSD3 launcher creates exactly this grid:
 - Seeds: 0, 1, 2
 - Total: 60 independent array rows, requested as `0-59%60`
 - Training limit: 6 hours per row (`360` requested GPU-hours)
-- Dataset staging limit: 1 hour for each of four Sapphire CPU rows (`4` CPU-hours)
+- Dataset staging limit: one Sapphire/INTR job, 2 CPUs for 1 hour (`2` CPU-core-hours)
 - Initial GPU request total: at most `360` GPU-hours
 
 From the repository checkout on RDS:
@@ -67,8 +67,8 @@ Persistent state is stored at:
 
 Immediately after `sbatch`, `grit_all_3seeds.jobs.tsv` records every model's
 array index, Slurm handle (`<array-job-id>_<index>`), run ID, task, variant,
-seed, output directory, and stdout/stderr paths. Dataset-staging IDs are written
-to `grit_dataset_staging.jobs.tsv`. Each model also records the actual
+seed, output directory, and stdout/stderr paths. The single dataset-staging ID
+is written to `grit_dataset_staging.jobs.tsv`. Each model also records the actual
 `SLURM_JOB_ID`, array ID, task ID, and node under its `hpc_attempts/` directory.
 
 Display the mappings plus current and historical Slurm states with:
@@ -184,7 +184,7 @@ dependency:
 bash "$PROJECT_ROOT/experiments/grit_hpc/bin/submit_all.sh"
 ```
 
-The four staging tasks can run concurrently. After all four succeed, the model array
+The four datasets are staged sequentially in one INTR job. After it succeeds, the model array
 starts with one model per GPU. Existing readiness markers make later staging
 submissions cheap no-ops.
 
@@ -196,7 +196,7 @@ Do this before the GPU array:
 (cd "$PROJECT_ROOT" && sbatch experiments/grit_hpc/slurm/stage_datasets.sbatch)
 ```
 
-The staging array processes the four datasets independently and writes a readiness
+The staging job processes the four datasets sequentially and writes a readiness
 marker for each. GPU workers fail early if a marker is absent, rather than
 racing to download/process the same shared cache. RRWP statistics are still
 computed by each model using that model's configured horizon.

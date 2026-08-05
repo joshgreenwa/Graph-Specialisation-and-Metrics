@@ -36,7 +36,7 @@ STAGE_SECONDS="$(time_to_seconds "${STAGE_TIME_LIMIT}")"
 REQUESTED_SECONDS=$((60 * TRAIN_SECONDS))
 BUDGET_SECONDS=$((400 * 3600))
 TRAIN_REQUEST_HOURS="$(awk "BEGIN { printf \"%.2f\", 60 * ${TRAIN_SECONDS} / 3600 }")"
-STAGE_REQUEST_HOURS="$(awk "BEGIN { printf \"%.2f\", 4 * ${STAGE_SECONDS} / 3600 }")"
+STAGE_REQUEST_HOURS="$(awk "BEGIN { printf \"%.2f\", 2 * ${STAGE_SECONDS} / 3600 }")"
 TOTAL_REQUEST_HOURS="$(awk "BEGIN { printf \"%.2f\", ${REQUESTED_SECONDS} / 3600 }")"
 if (( REQUESTED_SECONDS > BUDGET_SECONDS )); then
   printf 'Refusing submission: requested maximum is %.2f GPU-hours, above the 400-hour budget.\n' \
@@ -74,22 +74,18 @@ python "${PROJECT_ROOT}/experiments/grit_hpc/bin/grit_hpc.py" print-jobs \
 
 cd "${PROJECT_ROOT}"
 
-# Four one-time CPU staging tasks. They can run together because every task has
-# an independent dataset directory and lock.
+# INTR permits only one submitted job per user. This single CPU allocation
+# stages all four datasets sequentially before releasing the GPU dependency.
 STAGE_JOB="$(sbatch --parsable \
   --export=ALL \
   -A mlmi-jgg45-sl2-cpu -p sapphire --qos=intr \
   -N 1 --ntasks=1 --cpus-per-task=2 --mem=16G \
   --time="${STAGE_TIME_LIMIT}" \
-  --array=0-3%4 \
   experiments/grit_hpc/slurm/stage_datasets.sbatch)"
 STAGE_JOB="${STAGE_JOB%%;*}"
 {
-  printf 'array_index\tarray_job_id\tslurm_handle\tdataset\n'
-  printf '0\t%s\t%s_0\tzinc\n' "${STAGE_JOB}" "${STAGE_JOB}"
-  printf '1\t%s\t%s_1\tqm9_gap\n' "${STAGE_JOB}" "${STAGE_JOB}"
-  printf '2\t%s\t%s_2\tpeptides_func\n' "${STAGE_JOB}" "${STAGE_JOB}"
-  printf '3\t%s\t%s_3\tpeptides_struct\n' "${STAGE_JOB}" "${STAGE_JOB}"
+  printf 'job_id\tdataset\n'
+  printf '%s\tzinc,qm9_gap,peptides_func,peptides_struct\n' "${STAGE_JOB}"
 } >"${GRIT_STAGE_TRACKING_FILE}"
 
 # 60 x 6 hours = 360 requested GPU-hours against the 400-hour GPU balance.

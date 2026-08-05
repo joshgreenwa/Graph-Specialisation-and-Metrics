@@ -189,7 +189,8 @@ def test_csd3_launcher_stays_within_400_gpu_hours():
     assert "REQUESTED_SECONDS=$((60 * TRAIN_SECONDS))" in script
     assert "REQUESTED_SECONDS > BUDGET_SECONDS" in script
     assert "mlmi-jgg45-sl2-cpu -p sapphire --qos=intr" in script
-    assert "--array=0-3%4" in script
+    assert "--array=0-3" not in script
+    assert "2 * ${STAGE_SECONDS}" in script
     assert "mlmi-jgg45-sl2-gpu" in script
     assert "/rds/user/jgg45/hpc-work" in script
 

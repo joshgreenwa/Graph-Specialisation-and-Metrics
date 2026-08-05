@@ -38,7 +38,7 @@ if [[ -f "${STAGE_TRACKING_FILE}" ]]; then
   else
     cat "${STAGE_TRACKING_FILE}"
   fi
-  STAGE_ARRAY_JOB_ID="$(awk -F '\t' 'NR == 2 { print $2 }' "${STAGE_TRACKING_FILE}")"
+  STAGE_ARRAY_JOB_ID="$(awk -F '\t' 'NR == 2 { print $1 }' "${STAGE_TRACKING_FILE}")"
   echo "Current staging queue state:"
   squeue -r -j "${STAGE_ARRAY_JOB_ID}" \
     -o '%.20i %.10T %.10M %.10l %.24R' || true

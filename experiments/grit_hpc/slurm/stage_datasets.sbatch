@@ -3,9 +3,8 @@
 #SBATCH --cpus-per-task=2
 #SBATCH --mem=16G
 #SBATCH --time=01:00:00
-#SBATCH --array=0-3%4
-#SBATCH --output=logs/grit-stage-%A-%a.out
-#SBATCH --error=logs/grit-stage-%A-%a.err
+#SBATCH --output=logs/grit-stage-%j.out
+#SBATCH --error=logs/grit-stage-%j.err
 
 set -euo pipefail
 
@@ -23,13 +22,11 @@ export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-16}"
 export TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1
 export PYTHONWARNINGS="ignore::FutureWarning"
 
-TASKS=(zinc qm9_gap peptides_func peptides_struct)
-TASK="${TASKS[${SLURM_ARRAY_TASK_ID}]}"
 SCRATCH_BASE="${GRIT_SCRATCH_ROOT:-${SLURM_TMPDIR:-/tmp}/grit_hpc_stage}"
 mkdir -p "${SCRATCH_BASE}" "${GRIT_DATA_ROOT}"
 
 exec python experiments/grit_hpc/bin/grit_hpc.py stage-datasets \
-  --tasks "${TASK}" \
+  --tasks zinc,qm9_gap,peptides_func,peptides_struct \
   --dataset-root "${GRIT_DATA_ROOT}" \
   --scratch-root "${SCRATCH_BASE}" \
   --grit-source "${GRIT_SOURCE_REPO:-https://github.com/LiamMa/GRIT.git}"
