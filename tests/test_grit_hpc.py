@@ -186,8 +186,10 @@ def test_csd3_launcher_stays_within_400_gpu_hours():
     assert "--array=0-59%60" in script
     assert 'TRAIN_TIME_LIMIT="${GRIT_JOB_TIME_LIMIT:-06:00:00}"' in script
     assert 'STAGE_TIME_LIMIT="${GRIT_STAGE_TIME_LIMIT:-01:00:00}"' in script
-    assert "REQUESTED_SECONDS=$((60 * TRAIN_SECONDS + 4 * STAGE_SECONDS))" in script
+    assert "REQUESTED_SECONDS=$((60 * TRAIN_SECONDS))" in script
     assert "REQUESTED_SECONDS > BUDGET_SECONDS" in script
+    assert "mlmi-jgg45-sl2-cpu -p sapphire --qos=intr" in script
+    assert "--array=0-3%4" in script
     assert "mlmi-jgg45-sl2-gpu" in script
     assert "/rds/user/jgg45/hpc-work" in script
 

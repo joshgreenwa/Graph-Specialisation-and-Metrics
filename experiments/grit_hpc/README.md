@@ -25,8 +25,8 @@ The prepared CSD3 launcher creates exactly this grid:
 - Seeds: 0, 1, 2
 - Total: 60 independent array rows, requested as `0-59%60`
 - Training limit: 6 hours per row (`360` requested GPU-hours)
-- Dataset staging limit: 1 hour for each of four rows (`4` requested GPU-hours)
-- Initial request total: at most `364` GPU-hours
+- Dataset staging limit: 1 hour for each of four Sapphire CPU rows (`4` CPU-hours)
+- Initial GPU request total: at most `360` GPU-hours
 
 From the repository checkout on RDS:
 
@@ -111,10 +111,10 @@ The original manifest and output locations are reused, and auto-resume is on.
 The index blocks are ZINC `0-14`, QM9 `15-29`, Peptides-func `30-44`, and
 Peptides-struct `45-59`. Run `grit_hpc.py print-jobs` for the exact row mapping.
 
-The 364-hour figure is a cap for the initial submission, not a guarantee that
+The 360-hour figure is a cap for the initial GPU submission, not a guarantee that
 all models finish within six hours. Any resubmission consumes additional
 allocation. The first run therefore also provides exact per-task runtime data;
-use that before spending the remaining 36 hours.
+use that before spending the remaining 40 GPU-hours.
 
 ## One-time cluster setup
 
@@ -184,7 +184,7 @@ dependency:
 bash "$PROJECT_ROOT/experiments/grit_hpc/bin/submit_all.sh"
 ```
 
-The four staging tasks run serially. After all four succeed, the model array
+The four staging tasks can run concurrently. After all four succeed, the model array
 starts with one model per GPU. Existing readiness markers make later staging
 submissions cheap no-ops.
 
@@ -196,7 +196,7 @@ Do this before the GPU array:
 (cd "$PROJECT_ROOT" && sbatch experiments/grit_hpc/slurm/stage_datasets.sbatch)
 ```
 
-The staging array processes the four datasets serially and writes a readiness
+The staging array processes the four datasets independently and writes a readiness
 marker for each. GPU workers fail early if a marker is absent, rather than
 racing to download/process the same shared cache. RRWP statistics are still
 computed by each model using that model's configured horizon.

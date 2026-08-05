@@ -33,7 +33,7 @@ time_to_seconds() {
 
 TRAIN_SECONDS="$(time_to_seconds "${TRAIN_TIME_LIMIT}")"
 STAGE_SECONDS="$(time_to_seconds "${STAGE_TIME_LIMIT}")"
-REQUESTED_SECONDS=$((60 * TRAIN_SECONDS + 4 * STAGE_SECONDS))
+REQUESTED_SECONDS=$((60 * TRAIN_SECONDS))
 BUDGET_SECONDS=$((400 * 3600))
 TRAIN_REQUEST_HOURS="$(awk "BEGIN { printf \"%.2f\", 60 * ${TRAIN_SECONDS} / 3600 }")"
 STAGE_REQUEST_HOURS="$(awk "BEGIN { printf \"%.2f\", 4 * ${STAGE_SECONDS} / 3600 }")"
@@ -74,13 +74,14 @@ python "${PROJECT_ROOT}/experiments/grit_hpc/bin/grit_hpc.py" print-jobs \
 
 cd "${PROJECT_ROOT}"
 
-# Four serial one-time staging tasks at one GPU-hour maximum each.
+# Four one-time CPU staging tasks. They can run together because every task has
+# an independent dataset directory and lock.
 STAGE_JOB="$(sbatch --parsable \
-  --export=ALL,WANDB_API_KEY,WANDB_MODE,WANDB_PROJECT \
-  -A mlmi-jgg45-sl2-gpu -p ampere --qos=gpu1 \
-  -N 1 --ntasks=1 --gres=gpu:1 \
+  --export=ALL \
+  -A mlmi-jgg45-sl2-cpu -p sapphire --qos=intr \
+  -N 1 --ntasks=1 --cpus-per-task=2 --mem=16G \
   --time="${STAGE_TIME_LIMIT}" \
-  --array=0-3%1 \
+  --array=0-3%4 \
   experiments/grit_hpc/slurm/stage_datasets.sbatch)"
 STAGE_JOB="${STAGE_JOB%%;*}"
 {
@@ -91,8 +92,7 @@ STAGE_JOB="${STAGE_JOB%%;*}"
   printf '3\t%s\t%s_3\tpeptides_struct\n' "${STAGE_JOB}" "${STAGE_JOB}"
 } >"${GRIT_STAGE_TRACKING_FILE}"
 
-# 60 x 6 hours = 360 requested GPU-hours. Including staging, the initial
-# submission requests at most 364 GPU-hours against the 400-hour balance.
+# 60 x 6 hours = 360 requested GPU-hours against the 400-hour GPU balance.
 TRAIN_JOB="$(sbatch --parsable \
   --export=ALL,WANDB_API_KEY,WANDB_MODE,WANDB_PROJECT \
   -A mlmi-jgg45-sl2-gpu -p ampere --qos=gpu1 \
@@ -111,9 +111,9 @@ python "${PROJECT_ROOT}/experiments/grit_hpc/bin/grit_hpc.py" write-tracking \
   --log-root "${PROJECT_ROOT}/logs" \
   --output "${GRIT_TRACKING_FILE}"
 
-echo "Dataset staging array: ${STAGE_JOB} (${STAGE_TIME_LIMIT} each; ${STAGE_REQUEST_HOURS} GPU-hours max)"
+echo "Dataset staging array: ${STAGE_JOB} (${STAGE_TIME_LIMIT} each; ${STAGE_REQUEST_HOURS} CPU-hours max)"
 echo "Training array:        ${TRAIN_JOB} (${TRAIN_TIME_LIMIT} each; ${TRAIN_REQUEST_HOURS} GPU-hours max)"
-echo "Initial request total: ${TOTAL_REQUEST_HOURS} GPU-hours maximum"
+echo "Initial GPU request:   ${TOTAL_REQUEST_HOURS} GPU-hours maximum"
 echo "Persistent outputs:    ${GRIT_OUTPUT_ROOT}"
 echo "Manifest:              ${GRIT_MANIFEST}"
 echo "Job tracking ledger:   ${GRIT_TRACKING_FILE}"

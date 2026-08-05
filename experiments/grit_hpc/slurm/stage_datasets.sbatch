@@ -1,9 +1,9 @@
 #!/bin/bash
 #SBATCH --job-name=grit-stage-data
-#SBATCH --cpus-per-task=16
-#SBATCH --mem=128G
-#SBATCH --time=24:00:00
-#SBATCH --array=0-3%1
+#SBATCH --cpus-per-task=2
+#SBATCH --mem=16G
+#SBATCH --time=01:00:00
+#SBATCH --array=0-3%4
 #SBATCH --output=logs/grit-stage-%A-%a.out
 #SBATCH --error=logs/grit-stage-%A-%a.err
 
