@@ -11,7 +11,6 @@ from graph_specialisation_metrics.chapter6_spatial_explorer import (
     layer_distance_profiles,
     layer_summary,
     load_models,
-    receptive_field_profiles,
     run,
     spatial_width_bootstrap,
 )
@@ -158,11 +157,6 @@ def test_head_metrics_keep_width_uncertainty_and_attention_separate(tmp_path):
         "score_mass",
         "per_opportunity",
     }
-    receptive_rows = receptive_field_profiles(models, summary)
-    first_reach = next(
-        row for row in receptive_rows if row["layer"] == 0 and row["channel"] == "structural"
-    )
-    assert first_reach["nominal_receptive_radius"] == pytest.approx(1.0)
     bootstrap_rows = spatial_width_bootstrap(models, replicates=200, seed=0)
     assert len(bootstrap_rows) == 2
     assert bootstrap_rows[0]["graphs"] == 2
@@ -209,7 +203,6 @@ def test_run_skips_missing_components_and_writes_exploratory_outputs(tmp_path):
         "score_profile_uncertainty.csv",
         "layer_distance_profiles.csv",
         "vnode_layer_allocation.csv",
-        "receptive_field_normalized_reach.csv",
         "spatial_width_graph_bootstrap.csv",
         "summary.json",
     ):
@@ -226,6 +219,5 @@ def test_run_skips_missing_components_and_writes_exploratory_outputs(tmp_path):
         "08_raw_vs_opportunity_reach.png",
         "09_layer_distance_profiles_raw.png",
         "10_layer_distance_profiles_opportunity.png",
-        "12_receptive_field_normalized_reach.png",
-        "13_structural_minus_semantic_width.png",
+        "12_structural_minus_semantic_width.png",
     }

@@ -42,7 +42,7 @@ from .zinc_cached_rrwp_comparison import (
     vnode_profile_rows,
 )
 
-ANALYSIS_VERSION = "chapter6-spatial-explorer-v2"
+ANALYSIS_VERSION = "chapter6-spatial-explorer-v3"
 CHANNELS = ("semantic", "structural")
 
 
@@ -819,63 +819,6 @@ def vnode_layer_profiles(models: Sequence[SpatialModel]) -> list[dict[str, Any]]
     return summarise_layerwise_vnode_profiles(per_head)
 
 
-def _nominal_receptive_radius(task: str, layer: int, maximum: float) -> float:
-    """Nominal molecular radius available at a layer output for each architecture."""
-
-    task = str(task)
-    if task == "zinc":
-        return maximum
-    hops = 2 if "2hop" in task else 1
-    if "vnode" in task and layer >= 1:
-        return maximum
-    return min(float(hops * (layer + 1)), maximum)
-
-
-def receptive_field_profiles(
-    models: Sequence[SpatialModel], layer_rows: Sequence[Mapping[str, Any]]
-) -> list[dict[str, Any]]:
-    """Normalize raw expected score distance by nominal layerwise architectural reach."""
-
-    maximum_by_task: dict[str, float] = {}
-    for model in models:
-        numeric = [
-            value
-            for label in model.score["axis"]
-            if (value := _numeric_distance(label)) is not None
-        ]
-        if numeric:
-            maximum_by_task[model.task] = float(max(numeric))
-    output: list[dict[str, Any]] = []
-    for row in layer_rows:
-        source = str(row["source"])
-        if source not in CHANNELS:
-            continue
-        task = str(row["task"])
-        if task not in maximum_by_task:
-            continue
-        layer = int(row["layer"])
-        maximum = maximum_by_task[task]
-        radius = _nominal_receptive_radius(task, layer, maximum)
-        expected = float(row["expected_distance_mean"])
-        output.append(
-            {
-                "task": task,
-                "layer": layer,
-                "channel": source,
-                "expected_distance": expected,
-                "nominal_receptive_radius": radius,
-                "maximum_molecular_distance": maximum,
-                "fraction_of_receptive_radius": (
-                    expected / radius if radius > 1.0e-12 else float("nan")
-                ),
-                "fraction_of_graph_span": (
-                    expected / maximum if maximum > 1.0e-12 else float("nan")
-                ),
-            }
-        )
-    return output
-
-
 def _graph_layer_widths(
     channel_score: Mapping[str, Any], axis: Sequence[Any], reportable: np.ndarray
 ) -> dict[str, np.ndarray]:
@@ -1541,56 +1484,6 @@ def _plot_vnode_allocation(
     return paths
 
 
-def _plot_receptive_field_profiles(
-    rows: Sequence[Mapping[str, Any]], tasks: Sequence[str], figures_dir: Path
-) -> list[Path]:
-    import matplotlib.pyplot as plt
-
-    tasks = [task for task in tasks if any(str(row["task"]) == task for row in rows)]
-    if not rows or not tasks:
-        return []
-    figure, axes = plt.subplots(
-        1,
-        len(tasks),
-        figsize=(3.25 * len(tasks), 4.0),
-        squeeze=False,
-        sharey=True,
-        constrained_layout=True,
-    )
-    for column, task in enumerate(tasks):
-        axis = axes[0, column]
-        for channel, colour, marker in (
-            ("semantic", "#0072B2", "o"),
-            ("structural", "#D55E00", "s"),
-        ):
-            selected = sorted(
-                [
-                    row
-                    for row in rows
-                    if str(row["task"]) == task and str(row["channel"]) == channel
-                ],
-                key=lambda row: int(row["layer"]),
-            )
-            axis.plot(
-                [int(row["layer"]) for row in selected],
-                [float(row["fraction_of_receptive_radius"]) for row in selected],
-                color=colour,
-                marker=marker,
-                linewidth=1.6,
-                label=channel,
-            )
-        axis.axhline(1.0, color="#777777", linestyle="--", linewidth=0.8)
-        axis.set_xlabel("layer")
-        axis.set_title(_task_label(task), fontsize=10)
-        if column == 0:
-            axis.set_ylabel("expected distance / nominal reach")
-            axis.legend(frameon=False, fontsize=8)
-    figure.suptitle("Score reach relative to architectural receptive field")
-    paths = _save_figure(figure, figures_dir, "12_receptive_field_normalized_reach")
-    plt.close(figure)
-    return paths
-
-
 def _plot_width_difference(
     rows: Sequence[Mapping[str, Any]], tasks: Sequence[str], figures_dir: Path
 ) -> list[Path]:
@@ -1632,7 +1525,7 @@ def _plot_width_difference(
         if column == 0:
             axis.set_ylabel("structural − semantic variance (hops²)")
     figure.suptitle("Structural excess in spatial width (95% graph-bootstrap CI)")
-    paths = _save_figure(figure, figures_dir, "13_structural_minus_semantic_width")
+    paths = _save_figure(figure, figures_dir, "12_structural_minus_semantic_width")
     plt.close(figure)
     return paths
 
@@ -1703,6 +1596,15 @@ def run(
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     figures_dir = output_dir / "figures"
+    for stale_path in (
+        output_dir / "receptive_field_normalized_reach.csv",
+        figures_dir / "12_receptive_field_normalized_reach.png",
+        figures_dir / "12_receptive_field_normalized_reach.pdf",
+        figures_dir / "13_structural_minus_semantic_width.png",
+        figures_dir / "13_structural_minus_semantic_width.pdf",
+    ):
+        if stale_path.is_file():
+            stale_path.unlink()
     inventory_rows = inventory(roots, tasks, seed=int(seed))
     _write_csv(output_dir / "cache_inventory.csv", inventory_rows)
     models, warnings = load_models(roots, tasks, seed=int(seed))
@@ -1723,7 +1625,6 @@ def run(
     uncertainty_rows = uncertainty_profiles(models)
     distance_rows = layer_distance_profiles(models)
     vnode_rows = vnode_layer_profiles(models)
-    receptive_rows = receptive_field_profiles(models, layer_rows)
     width_bootstrap_rows = spatial_width_bootstrap(models)
     tables = {
         "head_spatial_metrics.csv": head_rows,
@@ -1733,7 +1634,6 @@ def run(
         "score_profile_uncertainty.csv": uncertainty_rows,
         "layer_distance_profiles.csv": distance_rows,
         "vnode_layer_allocation.csv": vnode_rows,
-        "receptive_field_normalized_reach.csv": receptive_rows,
         "spatial_width_graph_bootstrap.csv": width_bootstrap_rows,
     }
     for name, rows in tables.items():
@@ -1767,7 +1667,6 @@ def run(
         )
     )
     figures.extend(_plot_vnode_allocation(vnode_rows, available_tasks, figures_dir))
-    figures.extend(_plot_receptive_field_profiles(receptive_rows, available_tasks, figures_dir))
     figures.extend(_plot_width_difference(width_bootstrap_rows, available_tasks, figures_dir))
     summary = {
         "analysis_version": ANALYSIS_VERSION,
@@ -1801,7 +1700,6 @@ def run(
             "uncertainty": "standard error of expected distance across cached held-out graphs",
             "width_interval": "paired graph-bootstrap interval; heads remain fixed",
             "opportunity_correction": "score mass per available source-carrier opportunity in each distance shell",
-            "receptive_field": "expected score distance divided by nominal layerwise architectural reach",
             "virtual_node": "reported separately because it has no molecular graph distance",
             "attention": "clean attention mass by graph distance, not a causal score",
             "carriage": "final-state response under the same intervention family, not task necessity",
@@ -1819,7 +1717,6 @@ def run(
         "representative_rows": representative_rows,
         "distance_rows": distance_rows,
         "vnode_rows": vnode_rows,
-        "receptive_rows": receptive_rows,
         "width_bootstrap_rows": width_bootstrap_rows,
     }
 
@@ -1833,7 +1730,6 @@ __all__ = [
     "layer_summary",
     "load_models",
     "model_profiles",
-    "receptive_field_profiles",
     "representative_heads",
     "run",
     "spatial_width_bootstrap",
