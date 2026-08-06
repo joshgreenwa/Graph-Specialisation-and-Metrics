@@ -413,16 +413,19 @@ def test_grit_plotting_api_accepts_synthetic_payloads():
             }
         ],
     }
-    figures.append(
-        plot_attention_grid(
-            attention,
-            role="semantic",
-            head=(0, 0),
-            per_graph_coordinates={0: {"D_rel": 0.8, "J": 1.3}},
-            net_d_rel=0.8,
-            net_joint_sensitivity=1.3,
-        )
+    attention_figure = plot_attention_grid(
+        attention,
+        role="semantic",
+        head=(0, 0),
+        per_graph_coordinates={0: {"D_rel": 0.8, "J": 1.3}},
+        net_d_rel=0.8,
+        net_joint_sensitivity=1.3,
     )
+    attention_figure.canvas.draw()
+    attention_panel_axes = attention_figure.axes[:3]
+    assert all(axis.get_position().width > 0.15 for axis in attention_panel_axes)
+    assert all(axis.get_position().height > 0.25 for axis in attention_panel_axes)
+    figures.append(attention_figure)
     figures.append(
         plot_av_pca(
             {
@@ -468,7 +471,7 @@ def test_grit_plotting_api_accepts_synthetic_payloads():
         figures[2].get_size_inches(),
         figures[3].get_size_inches(),
     )
-    assert figures[4].axes[-1].get_xlabel() == "Attention weight"
+    assert figures[4].axes[-1].get_xlabel() == "Node-conditioned attention"
     assert all(
         text.get_fontsize() == 9.5
         for text in figures[5].axes[0].get_legend().get_texts()

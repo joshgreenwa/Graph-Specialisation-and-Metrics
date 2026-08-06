@@ -578,25 +578,27 @@ def plot_attention_grid(
     )
     num_rows = len(examples)
     fig = plt.figure(
-        figsize=(13.2, 1.65 + 3.35 * num_rows + 0.72),
-        constrained_layout=True,
+        figsize=(13.2, 2.35 + 2.75 * num_rows),
+        constrained_layout=False,
     )
     grid = fig.add_gridspec(
-        num_rows + 2,
+        num_rows,
         3,
-        height_ratios=[0.16, *([1.0] * num_rows), 0.11],
-        width_ratios=[1.0, 1.08, 1.12],
+        left=0.035,
+        right=0.965,
+        bottom=0.15,
+        top=0.80,
+        wspace=0.14,
+        hspace=0.20,
+        width_ratios=[1.0, 1.0, 1.08],
     )
-    title_axis = fig.add_subplot(grid[0, :])
-    title_axis.axis("off")
     axes = np.asarray(
         [
-            [fig.add_subplot(grid[row + 1, column]) for column in range(3)]
+            [fig.add_subplot(grid[row, column]) for column in range(3)]
             for row in range(num_rows)
         ],
         dtype=object,
     )
-    colorbar_axis = fig.add_subplot(grid[-1, :])
     task = str(examples_payload["task"])
     dataset_label = str(
         examples_payload.get(
@@ -612,7 +614,10 @@ def plot_attention_grid(
             )
         axes[row, 0].imshow(_draw_molecule_plain(example))
         axes[row, 0].axis("off")
-        caption = _molecule_caption(example, dataset_label=dataset_label)
+        graph_label = f"{dataset_label} eval {graph_index}"
+        formula = str(example.get("formula") or "").strip()
+        if formula:
+            graph_label += f" · {formula}"
         if graph_coordinates is not None:
             d_rel = float(
                 graph_coordinates.get(
@@ -624,20 +629,19 @@ def plot_attention_grid(
                     "J", graph_coordinates.get("joint_sensitivity", np.nan)
                 )
             )
-            caption += (
-                "\n"
-                + rf"Graph-local: $D_{{\rm rel}} = {d_rel:+.3f};\ J = {joint:.3f}$"
+            graph_label += (
+                rf" · $D_{{\rm rel}}={d_rel:+.3f}$, $J={joint:.3f}$"
             )
         axes[row, 0].text(
-            0.01,
-            0.99,
-            caption,
+            0.5,
+            0.015,
+            graph_label,
             transform=axes[row, 0].transAxes,
-            ha="left",
-            va="top",
-            fontsize=10.5,
+            ha="center",
+            va="bottom",
+            fontsize=9.5,
             color=NAVY,
-            bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.90},
+            bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.88},
         )
         axes[row, 1].imshow(
             _draw_molecule_attention(
@@ -660,51 +664,60 @@ def plot_attention_grid(
         axes[row, 2].set_ylabel("Query atom", fontsize=13)
         axes[row, 2].set_xticks(np.arange(matrix.shape[0]))
         axes[row, 2].set_yticks(np.arange(matrix.shape[0]))
-        axes[row, 2].tick_params(labelsize=8, length=2.5)
+        axes[row, 2].tick_params(labelsize=7, length=2.2)
     for column, label in enumerate(
         ["Molecule", "Attention-weighted molecule", "Node-conditioned attention"]
     ):
         axes[0, column].set_title(label, fontsize=16, pad=10)
     style = HEAD_STYLES.get(role, {"label": role.replace("_", " ").title()})
-    title_axis.text(
+    fig.text(
         0.5,
-        0.76,
+        0.955,
         f"{_payload_display_title(examples_payload)} — "
         f"{title_label or style['label']} — {_head_label(head)}",
         ha="center",
         va="center",
-        fontsize=20,
+        fontsize=15.5,
         color=NAVY,
     )
-    title_axis.text(
+    fig.text(
         0.5,
-        0.16,
+        0.895,
         rf"Net: $D_{{\rm rel}} = {float(net_d_rel):+.3f};\quad "
         rf"J = {float(net_joint_sensitivity):.3f}$",
         ha="center",
         va="center",
-        fontsize=16,
+        fontsize=13,
         color=NAVY,
     )
-    colorbar = fig.colorbar(
-        image, cax=colorbar_axis, orientation="horizontal"
-    )
-    colorbar.set_label("Attention weight", fontsize=14, labelpad=7)
-    colorbar.ax.tick_params(labelsize=11, length=3)
-    for tick_label in colorbar.ax.get_xticklabels():
-        tick_label.set_fontweight("medium")
 
+    # These panels use different normalisations: molecule colour represents
+    # mean inbound attention, whereas the matrix is query-conditioned. Separate
+    # compact colour bars keep that distinction explicit without shrinking the
+    # three principal columns.
     fig.canvas.draw()
-    colorbar_position = colorbar_axis.get_position()
-    fig.set_layout_engine("none")
-    colorbar_axis.set_position(
-        [
-            colorbar_position.x0 + 0.08 * colorbar_position.width,
-            colorbar_position.y0,
-            0.84 * colorbar_position.width,
-            colorbar_position.height,
-        ]
+    inbound_position = axes[-1, 1].get_position()
+    matrix_position = axes[-1, 2].get_position()
+    inbound_colorbar_axis = fig.add_axes(
+        [inbound_position.x0, 0.055, inbound_position.width, 0.018]
     )
+    matrix_colorbar_axis = fig.add_axes(
+        [matrix_position.x0, 0.055, matrix_position.width, 0.018]
+    )
+    inbound_colorbar = fig.colorbar(
+        plt.cm.ScalarMappable(
+            norm=Normalize(vmin=0.0, vmax=inbound_max), cmap=ATTENTION_CMAP
+        ),
+        cax=inbound_colorbar_axis,
+        orientation="horizontal",
+    )
+    inbound_colorbar.set_label("Mean inbound attention", fontsize=10, labelpad=4)
+    inbound_colorbar.ax.tick_params(labelsize=8, length=2.5)
+    matrix_colorbar = fig.colorbar(
+        image, cax=matrix_colorbar_axis, orientation="horizontal"
+    )
+    matrix_colorbar.set_label("Node-conditioned attention", fontsize=10, labelpad=4)
+    matrix_colorbar.ax.tick_params(labelsize=8, length=2.5)
     return fig
 
 
