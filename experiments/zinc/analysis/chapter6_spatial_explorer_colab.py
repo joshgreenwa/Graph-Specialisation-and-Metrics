@@ -1,12 +1,9 @@
 """Single-cell Colab frontend for the Chapter 6 spatial explorer.
 
-Paste this file into one Colab cell.  The default run is cache-only: it finds
-every available canonical score cache, creates the spatial tables and figures,
-and rebuilds interaction figures only when their existing cache is present.
-
-Set ``INTERACTION_PHASE = "all"`` only when a full 2x2 semantic/structural
-interaction measurement is intended.  Missing attention, carriage, interaction,
-or individual model artifacts disable only the corresponding outputs.
+Paste this file into one Colab cell. The run is cache-only: it finds every
+available canonical score cache and creates the spatial tables and figures.
+Missing attention, carriage, or individual model artifacts disable only the
+corresponding outputs.
 """
 
 # The backend import intentionally follows the Colab clone/install step.
@@ -53,24 +50,6 @@ TASKS = (
 )
 TRAIN_SEED = 42
 REPRESENTATIVE_ACTIVITY_QUANTILE = 0.25
-
-# "off" does nothing. "figures" is cache-only. "all" measures the full 2x2
-# semantic/structural interaction and then plots it. A missing figures cache is
-# reported and skipped; it never blocks the spatial explorer.
-INTERACTION_PHASE = "figures"  # "off", "figures", "measure", or "all"
-INTERACTION_OUTPUT_DIR = (
-    DRIVE_ROOT
-    / "graph_specialisation_metrics/zinc_semantic_structural_interaction_carriage_v2"
-)
-INTERACTION_TASKS = "zinc_1hop,zinc_2hop,zinc_1hop_vnode,zinc"
-INTERACTION_SEED = 0
-INTERACTION_GRAPHS = 64
-INTERACTION_SOURCES_PER_GRAPH = 6
-INTERACTION_DONOR_PAIRS_PER_SOURCE = 4
-INTERACTION_SEMANTIC_DONOR_GRAPHS = 256
-INTERACTION_BOOTSTRAP_REPLICATES = 2_000
-ACCELERATOR = "cuda:0"
-NUM_THREADS = 4
 
 
 def command(*parts: str) -> None:
@@ -207,7 +186,24 @@ print("\nModel-level alignment summary", flush=True)
 display(alignment_summary)
 
 print("\nRepresentative high- and low-alignment heads", flush=True)
-display(pd.read_csv(OUTPUT_DIR / "representative_heads.csv"))
+representative_table = pd.read_csv(OUTPUT_DIR / "representative_heads.csv")
+display(
+    representative_table.loc[
+        :,
+        [
+            "task",
+            "role",
+            "layer",
+            "head",
+            "family",
+            "overlap",
+            "raw_semantic_score",
+            "raw_structural_score",
+            "selectivity",
+            "joint_sensitivity",
+        ],
+    ]
+)
 
 layer_table = pd.read_csv(OUTPUT_DIR / "layer_spatial_summary.csv")
 print("\nLayerwise expected distance", flush=True)
@@ -232,58 +228,6 @@ for path in result["figures"]:
         print(f"\n[display] {Path(path).stem}", flush=True)
         display(Image(filename=path))
 
-
-# ------------------------- optional interaction stage -------------------------
-
-if INTERACTION_PHASE != "off":
-    if INTERACTION_PHASE not in {"figures", "measure", "all"}:
-        raise ValueError("INTERACTION_PHASE must be 'off', 'figures', 'measure', or 'all'")
-    print(
-        "\n[interaction] Running the matched clean / semantic-only / structural-only / "
-        f"joint stage in {INTERACTION_PHASE!r} mode.",
-        flush=True,
-    )
-    try:
-        from graph_specialisation_metrics.zinc_interaction_pilot import main as interaction_main
-
-        interaction_args = [
-            "--phase",
-            INTERACTION_PHASE,
-            "--output-dir",
-            str(INTERACTION_OUTPUT_DIR),
-            "--tasks",
-            INTERACTION_TASKS,
-            "--seed",
-            str(INTERACTION_SEED),
-            "--graphs",
-            str(INTERACTION_GRAPHS),
-            "--sources-per-graph",
-            str(INTERACTION_SOURCES_PER_GRAPH),
-            "--donor-pairs-per-source",
-            str(INTERACTION_DONOR_PAIRS_PER_SOURCE),
-            "--semantic-donor-graphs",
-            str(INTERACTION_SEMANTIC_DONOR_GRAPHS),
-            "--bootstrap-replicates",
-            str(INTERACTION_BOOTSTRAP_REPLICATES),
-            "--accelerator",
-            ACCELERATOR,
-            "--num-threads",
-            str(NUM_THREADS),
-        ]
-        interaction_result = interaction_main(interaction_args)
-        for name, paths in interaction_result.get("figures", {}).items():
-            path = paths.get("png") if isinstance(paths, dict) else None
-            if path and Path(path).is_file():
-                print(f"\n[display:interaction] {name}", flush=True)
-                display(Image(filename=path))
-    except (OSError, RuntimeError, ValueError, KeyError, ImportError) as error:
-        print(
-            "[interaction:skip] "
-            f"{type(error).__name__}: {error}\n"
-            "Set INTERACTION_PHASE='all' to deliberately compute a missing cache. "
-            "The completed spatial analysis is unaffected.",
-            flush=True,
-        )
 
 print(f"\n[done] Chapter 6 exploration saved under {OUTPUT_DIR}", flush=True)
 # ============================= paste to here =============================

@@ -63,8 +63,18 @@ def _score() -> dict:
             "structural": channel(structural, 0.1),
         },
         "coordinates": {
+            "raw_semantic": raw_semantic,
+            "raw_structural": raw_structural,
+            "normalized_semantic": raw_semantic / raw_semantic.mean(),
+            "normalized_structural": raw_structural / raw_structural.mean(),
             "joint_sensitivity": joint,
             "selectivity": (raw_semantic - raw_structural) / joint,
+        },
+        "families": {
+            "semantic_leaning": ((0, 0),),
+            "structural_leaning": ((1, 0),),
+            "central_responsive": ((0, 1),),
+            "inactive": (),
         },
         "clean_attention_distance": np.full_like(semantic, 1.0 / len(axis)),
     }
@@ -121,10 +131,43 @@ def test_head_metrics_keep_width_uncertainty_and_attention_separate(tmp_path):
     assert first["attention_expected_distance"] == pytest.approx(1.0)
     assert first["overlap"] == pytest.approx(0.0)
     assert np.isfinite(first["semantic_expected_distance_sem"])
+    assert first["family"] == "semantic_leaning"
+    assert first["raw_semantic_score"] == pytest.approx(1.0)
 
     summary = layer_summary(rows)
     sources = {row["source"] for row in summary}
     assert sources == {"semantic", "structural", "attention"}
+    semantic_layer_zero = next(
+        row
+        for row in summary
+        if row["source"] == "semantic" and row["layer"] == 0
+    )
+    assert np.isfinite(semantic_layer_zero["spatial_variance_q1"])
+    assert np.isfinite(semantic_layer_zero["spatial_variance_q3"])
+
+
+def test_loader_falls_back_to_equivalent_duplicate_carriage(tmp_path):
+    preferred = tmp_path / "preferred"
+    fallback = tmp_path / "fallback"
+    _write_artifact(preferred, "zinc_1hop", with_carriage=False)
+    _write_artifact(fallback, "zinc_1hop", with_carriage=True)
+    preferred_score = preferred / "zinc_1hop/seed_42/cache/scores/raw.pt"
+    payload = torch.load(preferred_score, map_location="cpu", weights_only=False)
+    payload["metadata"]["protocol_version"] = "donor-swap-specialisation-carriage-v4"
+    torch.save(payload, preferred_score)
+    fallback_score = fallback / "zinc_1hop/seed_42/cache/scores/raw.pt"
+    payload = torch.load(fallback_score, map_location="cpu", weights_only=False)
+    payload["metadata"]["protocol_version"] = "donor-swap-specialisation-carriage-v3"
+    torch.save(payload, fallback_score)
+
+    models, warnings = load_models(
+        [preferred, fallback], ["zinc_1hop"], seed=42
+    )
+    assert models[0].score_path == preferred_score
+    assert models[0].carriage_path == (
+        fallback / "zinc_1hop/seed_42/cache/carriage/fields.pt"
+    )
+    assert any("equivalent carriage artifact" in warning for warning in warnings)
 
 
 def test_run_skips_missing_components_and_writes_exploratory_outputs(tmp_path):
@@ -156,6 +199,6 @@ def test_run_skips_missing_components_and_writes_exploratory_outputs(tmp_path):
         "03_alignment_heatmaps.png",
         "04_layerwise_score_attention_distance.png",
         "05_spatial_width_and_uncertainty.png",
-        "06_representative_head_profiles.png",
+        "06_alignment_and_head_roles.png",
         "07_score_and_final_state_response.png",
     }

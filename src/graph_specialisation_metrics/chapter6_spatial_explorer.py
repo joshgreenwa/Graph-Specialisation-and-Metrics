@@ -264,15 +264,28 @@ def load_models(
                     f"{task}: could not read model.json ({type(error).__name__}: {error})"
                 )
         carriage = None
-        carriage_path = selected["carriage_path"] if selected["carriage_exists"] else None
-        if carriage_path is not None:
+        carriage_path = None
+        carriage_candidates = [
+            candidate
+            for candidate, _candidate_score, _candidate_metadata in loaded
+            if candidate["carriage_exists"]
+        ]
+        for carriage_candidate in carriage_candidates:
+            candidate_path = Path(carriage_candidate["carriage_path"])
             try:
-                carriage, _ = _load_payload(carriage_path)
+                carriage, _ = _load_payload(candidate_path)
+                carriage_path = candidate_path
+                if carriage_candidate is not selected:
+                    warnings.append(
+                        f"{task}: selected score cache has no carriage; using equivalent "
+                        f"carriage artifact {candidate_path}"
+                    )
+                break
             except (OSError, RuntimeError, EOFError, TypeError, ValueError, KeyError) as error:
                 warnings.append(
-                    f"{task}: carriage cache unavailable ({type(error).__name__}: {error})"
+                    f"{task}: ignored carriage cache {candidate_path} "
+                    f"({type(error).__name__}: {error})"
                 )
-                carriage_path = None
         models.append(
             SpatialModel(
                 task=str(task),
@@ -326,6 +339,23 @@ def _head_activity(score: Mapping[str, Any], shape: tuple[int, int]) -> tuple[np
     if joint_array.shape != shape or selectivity_array.shape != shape:
         raise ValueError("head coordinate arrays do not match score profile shape")
     return joint_array, selectivity_array
+
+
+def _head_family_lookup(score: Mapping[str, Any]) -> dict[tuple[int, int], str]:
+    families = score.get("families", {})
+    if not isinstance(families, Mapping):
+        return {}
+    lookup: dict[tuple[int, int], str] = {}
+    for family in (
+        "semantic_leaning",
+        "structural_leaning",
+        "central_responsive",
+        "inactive",
+    ):
+        for head in families.get(family, ()):
+            if isinstance(head, Sequence) and len(head) == 2:
+                lookup[(int(head[0]), int(head[1]))] = family
+    return lookup
 
 
 def _molecular_profile(values: Any, axis: Sequence[Any], reportable: Any) -> tuple[np.ndarray, np.ndarray]:
@@ -461,6 +491,22 @@ def head_metrics(models: Sequence[SpatialModel]) -> list[dict[str, Any]]:
         structural = _as_numpy(score["channels"]["structural"]["heatmap_exact_head"])
         layers, heads, _ = semantic.shape
         joint, selectivity = _head_activity(score, (layers, heads))
+        coordinates = score.get("coordinates", {})
+        raw_semantic = _as_numpy(score["channels"]["semantic"]["raw"])
+        raw_structural = _as_numpy(score["channels"]["structural"]["raw"])
+        normalized_semantic_value = _field(coordinates, "normalized_semantic")
+        normalized_structural_value = _field(coordinates, "normalized_structural")
+        normalized_semantic = (
+            _as_numpy(normalized_semantic_value)
+            if normalized_semantic_value is not None
+            else raw_semantic / max(float(np.nanmean(raw_semantic)), 1.0e-12)
+        )
+        normalized_structural = (
+            _as_numpy(normalized_structural_value)
+            if normalized_structural_value is not None
+            else raw_structural / max(float(np.nanmean(raw_structural)), 1.0e-12)
+        )
+        family_lookup = _head_family_lookup(score)
         reportable = _reportable(score, "semantic") & _reportable(score, "structural")
         uncertainty: dict[str, np.ndarray | None] = {}
         for channel in CHANNELS:
@@ -494,6 +540,15 @@ def head_metrics(models: Sequence[SpatialModel]) -> list[dict[str, Any]]:
                         "task": model.task,
                         "layer": layer,
                         "head": head,
+                        "family": family_lookup.get((layer, head), "other"),
+                        "raw_semantic_score": float(raw_semantic[layer, head]),
+                        "raw_structural_score": float(raw_structural[layer, head]),
+                        "normalized_semantic_score": float(
+                            normalized_semantic[layer, head]
+                        ),
+                        "normalized_structural_score": float(
+                            normalized_structural[layer, head]
+                        ),
                         "joint_sensitivity": float(joint[layer, head]),
                         "selectivity": float(selectivity[layer, head]),
                         **{
@@ -567,6 +622,21 @@ def layer_summary(rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
                     ),
                     "spatial_variance_mean": (
                         float(np.mean(widths)) if widths.size else float("nan")
+                    ),
+                    "spatial_variance_q1": (
+                        float(np.quantile(widths, 0.25))
+                        if widths.size
+                        else float("nan")
+                    ),
+                    "spatial_variance_q3": (
+                        float(np.quantile(widths, 0.75))
+                        if widths.size
+                        else float("nan")
+                    ),
+                    "headwise_spatial_variance_sem": (
+                        float(np.std(widths, ddof=1) / math.sqrt(widths.size))
+                        if widths.size > 1
+                        else float("nan")
                     ),
                     "estimation_sem_mean": (
                         float(np.mean(uncertainties))
@@ -834,6 +904,109 @@ def _plot_alignment_heatmaps(
     return paths
 
 
+def _plot_alignment_head_roles(
+    rows: Sequence[Mapping[str, Any]], tasks: Sequence[str], figures_dir: Path
+) -> list[Path]:
+    """Relate profile alignment directly to the established J/D_rel coordinates."""
+
+    import matplotlib.pyplot as plt
+
+    family_styles = {
+        "semantic_leaning": ("#0072B2", "semantic-leaning"),
+        "structural_leaning": ("#D55E00", "structural-leaning"),
+        "central_responsive": ("#7A5195", "high-J central"),
+        "inactive": ("#999999", "inactive"),
+        "other": ("#009E73", "other active"),
+    }
+    figure, axes = plt.subplots(
+        1,
+        len(tasks),
+        figsize=(3.25 * len(tasks), 4.2),
+        squeeze=False,
+        sharex=True,
+        sharey=True,
+        constrained_layout=True,
+    )
+    for column, task in enumerate(tasks):
+        axis = axes[0, column]
+        selected = [row for row in rows if str(row["task"]) == task]
+        finite_joint = np.asarray(
+            [float(row["joint_sensitivity"]) for row in selected], dtype=np.float64
+        )
+        finite_joint = finite_joint[np.isfinite(finite_joint)]
+        scale = (
+            max(float(np.quantile(finite_joint, 0.90)), 1.0e-12)
+            if finite_joint.size
+            else 1.0
+        )
+        for family, (colour, label) in family_styles.items():
+            family_rows = [row for row in selected if str(row.get("family", "other")) == family]
+            if not family_rows:
+                continue
+            size = np.asarray(
+                [float(row["joint_sensitivity"]) for row in family_rows],
+                dtype=np.float64,
+            )
+            size = 18.0 + 72.0 * np.clip(size / scale, 0.0, 1.5)
+            axis.scatter(
+                [float(row["selectivity"]) for row in family_rows],
+                [float(row["overlap"]) for row in family_rows],
+                s=size,
+                color=colour,
+                alpha=0.78,
+                edgecolor="white",
+                linewidth=0.45,
+                label=label,
+            )
+        eligible = [
+            row
+            for row in selected
+            if np.isfinite(float(row["overlap"]))
+            and np.isfinite(float(row["joint_sensitivity"]))
+        ]
+        if eligible:
+            activity_floor = float(
+                np.quantile(
+                    [float(row["joint_sensitivity"]) for row in eligible], 0.25
+                )
+            )
+            labelled = sorted(
+                [row for row in eligible if float(row["joint_sensitivity"]) >= activity_floor],
+                key=lambda row: float(row["overlap"]),
+            )[:2]
+            for row in labelled:
+                axis.annotate(
+                    f"ℓ{int(row['layer'])},h{int(row['head'])}",
+                    (float(row["selectivity"]), float(row["overlap"])),
+                    xytext=(3, -9),
+                    textcoords="offset points",
+                    fontsize=7,
+                    color="#333333",
+                )
+        axis.axvline(0.0, color="#777777", linestyle="--", linewidth=0.8)
+        axis.set_xlim(-1.02, 1.02)
+        axis.set_ylim(0.0, 1.03)
+        axis.set_xlabel(r"relative selectivity $D_{\rm rel}$")
+        axis.set_title(_task_label(task), fontsize=10)
+        if column == 0:
+            axis.set_ylabel("semantic–structural profile overlap")
+    handles, labels = axes[0, 0].get_legend_handles_labels()
+    if handles:
+        figure.legend(
+            handles,
+            labels,
+            loc="lower center",
+            bbox_to_anchor=(0.5, -0.035),
+            ncol=min(len(handles), 5),
+            frameon=False,
+            fontsize=8,
+        )
+    figure.suptitle("Does spatial alignment track head specialisation? (point size: J)")
+    paths = _save_figure(figure, figures_dir, "06_alignment_and_head_roles")
+    plt.close(figure)
+    return paths
+
+
 def _plot_layerwise_distance(
     summary: Sequence[Mapping[str, Any]], tasks: Sequence[str], figures_dir: Path
 ) -> list[Path]:
@@ -895,8 +1068,18 @@ def _plot_width_uncertainty(
                 continue
             layer = np.asarray([int(row["layer"]) for row in source_rows])
             width = np.asarray([float(row["spatial_variance_mean"]) for row in source_rows])
+            width_q1 = np.asarray([float(row["spatial_variance_q1"]) for row in source_rows])
+            width_q3 = np.asarray([float(row["spatial_variance_q3"]) for row in source_rows])
             uncertainty = np.asarray([float(row["estimation_sem_mean"]) for row in source_rows])
             axes[0, column].plot(layer, width, color=colour, marker=marker, label=source)
+            axes[0, column].fill_between(
+                layer,
+                width_q1,
+                width_q3,
+                color=colour,
+                alpha=0.13,
+                linewidth=0,
+            )
             if np.isfinite(uncertainty).any():
                 any_uncertainty = True
                 axes[1, column].plot(layer, uncertainty, color=colour, marker=marker, label=source)
@@ -1057,7 +1240,7 @@ def run(
     figures.extend(_plot_alignment_heatmaps(head_rows, available_tasks, figures_dir))
     figures.extend(_plot_layerwise_distance(layer_rows, available_tasks, figures_dir))
     figures.extend(_plot_width_uncertainty(layer_rows, available_tasks, figures_dir))
-    figures.extend(_plot_representatives(models, representative_rows, figures_dir))
+    figures.extend(_plot_alignment_head_roles(head_rows, available_tasks, figures_dir))
     figures.extend(_plot_score_carriage(profile_rows, available_tasks, figures_dir))
     summary = {
         "analysis_version": ANALYSIS_VERSION,
