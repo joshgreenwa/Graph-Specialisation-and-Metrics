@@ -949,19 +949,30 @@ _FIGURE_IDENTITIES = {
 }
 
 
+def _chemistry_task_family(task_name: str) -> str | None:
+    task_name = str(task_name)
+    if task_name == "zinc" or task_name.startswith("zinc_"):
+        return "zinc"
+    if task_name == "qm9_gap_dense" or task_name.startswith("qm9_"):
+        return "qm9"
+    return None
+
+
 def figure_identity(task_name: str) -> dict[str, str]:
     """Return the invariant reader-facing task/model identity for a figure."""
 
     task_name = str(task_name)
-    identity = dict(
-        _FIGURE_IDENTITIES.get(
-            task_name,
-            {
-                "dataset_label": task_name,
-                "model_label": "GRIT+RRWP",
-            },
-        )
-    )
+    default = {
+        "dataset_label": (
+            "ZINC-subset"
+            if _chemistry_task_family(task_name) == "zinc"
+            else "QM9 HOMO–LUMO gap"
+            if _chemistry_task_family(task_name) == "qm9"
+            else task_name
+        ),
+        "model_label": "GRIT+RRWP",
+    }
+    identity = dict(_FIGURE_IDENTITIES.get(task_name, default))
     identity["display_title"] = (
         f"{identity['dataset_label']} — {identity['model_label']}"
     )
@@ -970,7 +981,7 @@ def figure_identity(task_name: str) -> dict[str, str]:
 
 def graph_node_labels(task_name: str, graph: Any) -> list[str]:
     values = _as_numpy(graph.x).reshape(int(graph.num_nodes), -1)[:, 0]
-    if str(task_name) == "zinc":
+    if _chemistry_task_family(task_name) == "zinc":
         labels = []
         for value in values:
             atom_type = int(value)
@@ -1028,7 +1039,8 @@ def molecule_from_graph(task_name: str, graph: Any):
     task_name = str(task_name)
     node_values = _as_numpy(graph.x).reshape(int(graph.num_nodes), -1)[:, 0]
     molecule = Chem.RWMol()
-    if task_name == "zinc":
+    task_family = _chemistry_task_family(task_name)
+    if task_family == "zinc":
         for value in node_values:
             atom_type = int(value)
             if not 0 <= atom_type < len(ZINC_ATOM_TYPES):
@@ -1039,7 +1051,7 @@ def molecule_from_graph(task_name: str, graph: Any):
             2: Chem.BondType.DOUBLE,
             3: Chem.BondType.TRIPLE,
         }
-    elif task_name == "qm9_gap_dense":
+    elif task_family == "qm9":
         for value in node_values:
             atomic_number = int(value)
             if atomic_number not in _ATOMIC_NUMBERS:
@@ -1125,7 +1137,7 @@ def molecule_record(task_name: str, graph: Any) -> dict[str, Any]:
         "node_labels": [atom.GetSymbol() for atom in molecule.GetAtoms()],
         "chemistry_decoder": (
             "benchmarking-GNNs ZINC atom/bond dictionaries"
-            if str(task_name) == "zinc"
+            if _chemistry_task_family(task_name) == "zinc"
             else "PyG QM9 atomic numbers and four bond classes"
         ),
         "chemistry_focus_version": CHEMISTRY_FOCUS_VERSION,

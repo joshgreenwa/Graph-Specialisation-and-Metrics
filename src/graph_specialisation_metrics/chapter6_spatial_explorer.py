@@ -34,11 +34,15 @@ from .zinc_cached_rrwp_comparison import (
     TASK_LABELS,
     carriage_profile,
     group_distance,
+    head_profile_distance_decomposition_rows,
     score_interval_width_profile,
     score_profile,
+    summarise_layerwise_distance_decomposition,
+    summarise_layerwise_vnode_profiles,
+    vnode_profile_rows,
 )
 
-ANALYSIS_VERSION = "chapter6-spatial-explorer-v1"
+ANALYSIS_VERSION = "chapter6-spatial-explorer-v2"
 CHANNELS = ("semantic", "structural")
 
 
@@ -106,9 +110,7 @@ def _load_payload(path: Path) -> tuple[Mapping[str, Any], Mapping[str, Any]]:
     return value, metadata if isinstance(metadata, Mapping) else {}
 
 
-def _candidate_records(
-    roots: Sequence[Path], task: str, seed: int
-) -> list[dict[str, Any]]:
+def _candidate_records(roots: Sequence[Path], task: str, seed: int) -> list[dict[str, Any]]:
     aliases = TASK_ARTIFACT_ALIASES.get(str(task), (str(task),))
     records: list[dict[str, Any]] = []
     for root_index, root in enumerate(roots):
@@ -137,9 +139,7 @@ def _candidate_records(
     return records
 
 
-def inventory(
-    roots: Sequence[Path], tasks: Sequence[str], *, seed: int
-) -> list[dict[str, Any]]:
+def inventory(roots: Sequence[Path], tasks: Sequence[str], *, seed: int) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for task in tasks:
         candidates = _candidate_records(roots, str(task), int(seed))
@@ -160,11 +160,7 @@ def inventory(
         for candidate in candidates:
             rows.append(
                 {
-                    key: (
-                        str(value)
-                        if isinstance(value, Path)
-                        else value
-                    )
+                    key: (str(value) if isinstance(value, Path) else value)
                     for key, value in candidate.items()
                     if key not in {"root_index", "alias_index", "model_path", "carriage_path"}
                 }
@@ -226,8 +222,7 @@ def load_models(
                 loaded.append((candidate, score, metadata))
             except (OSError, RuntimeError, EOFError, TypeError, ValueError, KeyError) as error:
                 warnings.append(
-                    f"{task}: ignored {candidate['score_path']} "
-                    f"({type(error).__name__}: {error})"
+                    f"{task}: ignored {candidate['score_path']} ({type(error).__name__}: {error})"
                 )
         if not loaded:
             warnings.append(f"{task}: no usable score cache; task skipped")
@@ -313,7 +308,9 @@ def _reportable(score: Mapping[str, Any], channel: str) -> np.ndarray:
     return np.ones(width, dtype=bool)
 
 
-def _head_activity(score: Mapping[str, Any], shape: tuple[int, int]) -> tuple[np.ndarray, np.ndarray]:
+def _head_activity(
+    score: Mapping[str, Any], shape: tuple[int, int]
+) -> tuple[np.ndarray, np.ndarray]:
     coordinates = score.get("coordinates", {})
     joint = _field(coordinates, "joint_sensitivity")
     selectivity = _field(coordinates, "selectivity")
@@ -358,7 +355,9 @@ def _head_family_lookup(score: Mapping[str, Any]) -> dict[tuple[int, int], str]:
     return lookup
 
 
-def _molecular_profile(values: Any, axis: Sequence[Any], reportable: Any) -> tuple[np.ndarray, np.ndarray]:
+def _molecular_profile(
+    values: Any, axis: Sequence[Any], reportable: Any
+) -> tuple[np.ndarray, np.ndarray]:
     distances = np.asarray(
         [
             float(value) if (value := _numeric_distance(label)) is not None else np.nan
@@ -420,7 +419,12 @@ def _profile_alignment(
     right = np.maximum(_as_numpy(structural), 0.0)
     mask = _as_numpy(reportable, dtype=bool) & np.isfinite(left) & np.isfinite(right)
     if not np.any(mask) or min(float(left[mask].sum()), float(right[mask].sum())) <= 1.0e-12:
-        return {"overlap": float("nan"), "cosine": float("nan"), "wasserstein": float("nan"), "wasserstein_similarity": float("nan")}
+        return {
+            "overlap": float("nan"),
+            "cosine": float("nan"),
+            "wasserstein": float("nan"),
+            "wasserstein_similarity": float("nan"),
+        }
     left = left[mask] / float(left[mask].sum())
     right = right[mask] / float(right[mask].sum())
     overlap = float(np.minimum(left, right).sum())
@@ -489,6 +493,16 @@ def head_metrics(models: Sequence[SpatialModel]) -> list[dict[str, Any]]:
         axis = tuple(score["axis"])
         semantic = _as_numpy(score["channels"]["semantic"]["heatmap_exact_head"])
         structural = _as_numpy(score["channels"]["structural"]["heatmap_exact_head"])
+        opportunity: dict[str, np.ndarray | None] = {}
+        for channel in CHANNELS:
+            candidate = score["channels"][channel].get("heatmap_per_opportunity_head")
+            if candidate is None:
+                opportunity[channel] = None
+                continue
+            candidate_array = _as_numpy(candidate)
+            opportunity[channel] = (
+                candidate_array if candidate_array.shape == semantic.shape else None
+            )
         layers, heads, _ = semantic.shape
         joint, selectivity = _head_activity(score, (layers, heads))
         coordinates = score.get("coordinates", {})
@@ -521,11 +535,17 @@ def head_metrics(models: Sequence[SpatialModel]) -> list[dict[str, Any]]:
                 attention_array = candidate
         for layer in range(layers):
             for head in range(heads):
-                semantic_stats = _profile_statistics(
-                    semantic[layer, head], axis, reportable
+                semantic_stats = _profile_statistics(semantic[layer, head], axis, reportable)
+                structural_stats = _profile_statistics(structural[layer, head], axis, reportable)
+                semantic_opportunity_stats = (
+                    _profile_statistics(opportunity["semantic"][layer, head], axis, reportable)
+                    if opportunity["semantic"] is not None
+                    else {}
                 )
-                structural_stats = _profile_statistics(
-                    structural[layer, head], axis, reportable
+                structural_opportunity_stats = (
+                    _profile_statistics(opportunity["structural"][layer, head], axis, reportable)
+                    if opportunity["structural"] is not None
+                    else {}
                 )
                 alignment = _profile_alignment(
                     semantic[layer, head], structural[layer, head], axis, reportable
@@ -543,27 +563,22 @@ def head_metrics(models: Sequence[SpatialModel]) -> list[dict[str, Any]]:
                         "family": family_lookup.get((layer, head), "other"),
                         "raw_semantic_score": float(raw_semantic[layer, head]),
                         "raw_structural_score": float(raw_structural[layer, head]),
-                        "normalized_semantic_score": float(
-                            normalized_semantic[layer, head]
-                        ),
-                        "normalized_structural_score": float(
-                            normalized_structural[layer, head]
-                        ),
+                        "normalized_semantic_score": float(normalized_semantic[layer, head]),
+                        "normalized_structural_score": float(normalized_structural[layer, head]),
                         "joint_sensitivity": float(joint[layer, head]),
                         "selectivity": float(selectivity[layer, head]),
+                        **{f"semantic_{key}": value for key, value in semantic_stats.items()},
+                        **{f"structural_{key}": value for key, value in structural_stats.items()},
                         **{
-                            f"semantic_{key}": value
-                            for key, value in semantic_stats.items()
+                            f"semantic_opportunity_{key}": value
+                            for key, value in semantic_opportunity_stats.items()
                         },
                         **{
-                            f"structural_{key}": value
-                            for key, value in structural_stats.items()
+                            f"structural_opportunity_{key}": value
+                            for key, value in structural_opportunity_stats.items()
                         },
                         **alignment,
-                        **{
-                            f"attention_{key}": value
-                            for key, value in attention_stats.items()
-                        },
+                        **{f"attention_{key}": value for key, value in attention_stats.items()},
                         "semantic_expected_distance_sem": (
                             float(uncertainty["semantic"][layer, head])
                             if uncertainty["semantic"] is not None
@@ -584,13 +599,17 @@ def layer_summary(rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
     for row in rows:
         groups.setdefault((str(row["task"]), int(row["layer"])), []).append(row)
     output: list[dict[str, Any]] = []
-    sources = ("semantic", "structural", "attention")
+    sources = (
+        "semantic",
+        "structural",
+        "semantic_opportunity",
+        "structural_opportunity",
+        "attention",
+    )
     for (task, layer), group in sorted(groups.items()):
         for source in sources:
             field = f"{source}_expected_distance"
-            values = np.asarray(
-                [float(row.get(field, np.nan)) for row in group], dtype=np.float64
-            )
+            values = np.asarray([float(row.get(field, np.nan)) for row in group], dtype=np.float64)
             values = values[np.isfinite(values)]
             if not values.size:
                 continue
@@ -624,14 +643,10 @@ def layer_summary(rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
                         float(np.mean(widths)) if widths.size else float("nan")
                     ),
                     "spatial_variance_q1": (
-                        float(np.quantile(widths, 0.25))
-                        if widths.size
-                        else float("nan")
+                        float(np.quantile(widths, 0.25)) if widths.size else float("nan")
                     ),
                     "spatial_variance_q3": (
-                        float(np.quantile(widths, 0.75))
-                        if widths.size
-                        else float("nan")
+                        float(np.quantile(widths, 0.75)) if widths.size else float("nan")
                     ),
                     "headwise_spatial_variance_sem": (
                         float(np.std(widths, ddof=1) / math.sqrt(widths.size))
@@ -639,9 +654,7 @@ def layer_summary(rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
                         else float("nan")
                     ),
                     "estimation_sem_mean": (
-                        float(np.mean(uncertainties))
-                        if uncertainties.size
-                        else float("nan")
+                        float(np.mean(uncertainties)) if uncertainties.size else float("nan")
                     ),
                 }
             )
@@ -657,9 +670,15 @@ def representative_heads(
     output: list[dict[str, Any]] = []
     for group in by_task.values():
         finite_joint = np.asarray(
-            [float(row["joint_sensitivity"]) for row in group if np.isfinite(float(row["joint_sensitivity"]))]
+            [
+                float(row["joint_sensitivity"])
+                for row in group
+                if np.isfinite(float(row["joint_sensitivity"]))
+            ]
         )
-        floor = float(np.quantile(finite_joint, activity_quantile)) if finite_joint.size else -np.inf
+        floor = (
+            float(np.quantile(finite_joint, activity_quantile)) if finite_joint.size else -np.inf
+        )
         eligible = [
             row
             for row in group
@@ -667,11 +686,51 @@ def representative_heads(
         ]
         if not eligible:
             continue
-        for role, selected in (
-            ("high alignment", max(eligible, key=lambda row: float(row["overlap"]))),
-            ("low alignment", min(eligible, key=lambda row: float(row["overlap"]))),
-        ):
-            output.append({"role": role, **dict(selected)})
+        lower = min(eligible, key=lambda row: float(row["overlap"]))
+        upper_floor = float(np.quantile([float(row["overlap"]) for row in eligible], 0.75))
+        comparison_pool = [
+            row for row in eligible if row is not lower and float(row["overlap"]) >= upper_floor
+        ]
+        if not comparison_pool:
+            comparison_pool = [row for row in eligible if row is not lower]
+        if comparison_pool:
+            lower_joint = max(float(lower["joint_sensitivity"]), 1.0e-12)
+            lower_family = str(lower.get("family"))
+            lower_layer = int(lower["layer"])
+
+            def match_cost(
+                row: Mapping[str, Any],
+                lower_joint: float = lower_joint,
+                lower_family: str = lower_family,
+                lower_layer: int = lower_layer,
+            ) -> float:
+                joint = max(float(row["joint_sensitivity"]), 1.0e-12)
+                family_penalty = (
+                    0.0 if str(row.get("family")) == lower_family else 0.35
+                )
+                return (
+                    abs(math.log(joint / lower_joint))
+                    + 0.08 * abs(int(row["layer"]) - lower_layer)
+                    + family_penalty
+                )
+
+            higher = min(comparison_pool, key=match_cost)
+            pair = (
+                ("lower alignment", lower),
+                ("J-matched higher alignment", higher),
+            )
+        else:
+            pair = (("lower alignment", lower),)
+        for role, selected in pair:
+            output.append(
+                {
+                    "role": role,
+                    "comparison_overlap_gap": float(selected["overlap"]) - float(lower["overlap"]),
+                    "reference_layer": int(lower["layer"]),
+                    "reference_head": int(lower["head"]),
+                    **dict(selected),
+                }
+            )
     return output
 
 
@@ -742,6 +801,157 @@ def uncertainty_profiles(models: Sequence[SpatialModel]) -> list[dict[str, Any]]
                     }
                 )
     return rows
+
+
+def layer_distance_profiles(
+    models: Sequence[SpatialModel],
+) -> list[dict[str, Any]]:
+    """Return equal-head semantic and structural mass in each layer and distance bin."""
+
+    exact_rows = head_profile_distance_decomposition_rows(models)  # type: ignore[arg-type]
+    return summarise_layerwise_distance_decomposition(exact_rows)
+
+
+def vnode_layer_profiles(models: Sequence[SpatialModel]) -> list[dict[str, Any]]:
+    """Keep virtual-node allocation separate from molecular graph distance."""
+
+    per_head = vnode_profile_rows(models)  # type: ignore[arg-type]
+    return summarise_layerwise_vnode_profiles(per_head)
+
+
+def _nominal_receptive_radius(task: str, layer: int, maximum: float) -> float:
+    """Nominal molecular radius available at a layer output for each architecture."""
+
+    task = str(task)
+    if task == "zinc":
+        return maximum
+    hops = 2 if "2hop" in task else 1
+    if "vnode" in task and layer >= 1:
+        return maximum
+    return min(float(hops * (layer + 1)), maximum)
+
+
+def receptive_field_profiles(
+    models: Sequence[SpatialModel], layer_rows: Sequence[Mapping[str, Any]]
+) -> list[dict[str, Any]]:
+    """Normalize raw expected score distance by nominal layerwise architectural reach."""
+
+    maximum_by_task: dict[str, float] = {}
+    for model in models:
+        numeric = [
+            value
+            for label in model.score["axis"]
+            if (value := _numeric_distance(label)) is not None
+        ]
+        if numeric:
+            maximum_by_task[model.task] = float(max(numeric))
+    output: list[dict[str, Any]] = []
+    for row in layer_rows:
+        source = str(row["source"])
+        if source not in CHANNELS:
+            continue
+        task = str(row["task"])
+        if task not in maximum_by_task:
+            continue
+        layer = int(row["layer"])
+        maximum = maximum_by_task[task]
+        radius = _nominal_receptive_radius(task, layer, maximum)
+        expected = float(row["expected_distance_mean"])
+        output.append(
+            {
+                "task": task,
+                "layer": layer,
+                "channel": source,
+                "expected_distance": expected,
+                "nominal_receptive_radius": radius,
+                "maximum_molecular_distance": maximum,
+                "fraction_of_receptive_radius": (
+                    expected / radius if radius > 1.0e-12 else float("nan")
+                ),
+                "fraction_of_graph_span": (
+                    expected / maximum if maximum > 1.0e-12 else float("nan")
+                ),
+            }
+        )
+    return output
+
+
+def _graph_layer_widths(
+    channel_score: Mapping[str, Any], axis: Sequence[Any], reportable: np.ndarray
+) -> dict[str, np.ndarray]:
+    contributions = channel_score.get("graph_distance_contribution")
+    if not isinstance(contributions, Mapping):
+        return {}
+    distances = np.asarray(
+        [value if (value := _numeric_distance(label)) is not None else np.nan for label in axis],
+        dtype=np.float64,
+    )
+    mask = np.isfinite(distances) & _as_numpy(reportable, dtype=bool)
+    distances = distances[mask]
+    output: dict[str, np.ndarray] = {}
+    for graph_id, values in contributions.items():
+        array = _as_numpy(values)
+        if array.ndim != 3 or array.shape[-1] != len(axis):
+            continue
+        mass = np.maximum(array[..., mask], 0.0)
+        total = np.sum(mass, axis=-1, keepdims=True)
+        profile = np.full_like(mass, np.nan, dtype=np.float64)
+        np.divide(mass, total, out=profile, where=total > 1.0e-12)
+        expected = np.sum(profile * distances, axis=-1)
+        variance = np.sum(profile * np.square(distances - expected[..., None]), axis=-1)
+        output[str(graph_id)] = np.nanmean(variance, axis=1)
+    return output
+
+
+def spatial_width_bootstrap(
+    models: Sequence[SpatialModel], *, replicates: int = 2000, seed: int = 2026
+) -> list[dict[str, Any]]:
+    """Paired graph-bootstrap intervals for semantic and structural profile width."""
+
+    output: list[dict[str, Any]] = []
+    for model_index, model in enumerate(models):
+        score = model.score
+        reportable = _reportable(score, "semantic") & _reportable(score, "structural")
+        by_channel = {
+            channel: _graph_layer_widths(score["channels"][channel], score["axis"], reportable)
+            for channel in CHANNELS
+        }
+        graph_ids = sorted(set(by_channel["semantic"]) & set(by_channel["structural"]))
+        if not graph_ids:
+            continue
+        semantic = np.stack([by_channel["semantic"][graph_id] for graph_id in graph_ids])
+        structural = np.stack([by_channel["structural"][graph_id] for graph_id in graph_ids])
+        if semantic.shape != structural.shape:
+            continue
+        generator = np.random.default_rng(int(seed) + model_index)
+        indices = generator.integers(
+            0, len(graph_ids), size=(max(int(replicates), 1), len(graph_ids))
+        )
+        semantic_boot = np.nanmean(semantic[indices], axis=1)
+        structural_boot = np.nanmean(structural[indices], axis=1)
+        difference_boot = structural_boot - semantic_boot
+        for layer in range(semantic.shape[1]):
+            record: dict[str, Any] = {
+                "task": model.task,
+                "layer": layer,
+                "graphs": len(graph_ids),
+                "bootstrap_replicates": int(replicates),
+            }
+            for name, values, boot in (
+                ("semantic", semantic, semantic_boot),
+                ("structural", structural, structural_boot),
+                ("structural_minus_semantic", structural - semantic, difference_boot),
+            ):
+                finite = boot[:, layer][np.isfinite(boot[:, layer])]
+                record[f"{name}_mean"] = float(np.nanmean(values[:, layer]))
+                record[f"{name}_low"] = (
+                    float(np.quantile(finite, 0.025)) if finite.size else float("nan")
+                )
+                record[f"{name}_high"] = (
+                    float(np.quantile(finite, 0.975)) if finite.size else float("nan")
+                )
+            output.append(record)
+    return output
 
 
 def _write_csv(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
@@ -934,11 +1144,7 @@ def _plot_alignment_head_roles(
             [float(row["joint_sensitivity"]) for row in selected], dtype=np.float64
         )
         finite_joint = finite_joint[np.isfinite(finite_joint)]
-        scale = (
-            max(float(np.quantile(finite_joint, 0.90)), 1.0e-12)
-            if finite_joint.size
-            else 1.0
-        )
+        scale = max(float(np.quantile(finite_joint, 0.90)), 1.0e-12) if finite_joint.size else 1.0
         for family, (colour, label) in family_styles.items():
             family_rows = [row for row in selected if str(row.get("family", "other")) == family]
             if not family_rows:
@@ -961,14 +1167,11 @@ def _plot_alignment_head_roles(
         eligible = [
             row
             for row in selected
-            if np.isfinite(float(row["overlap"]))
-            and np.isfinite(float(row["joint_sensitivity"]))
+            if np.isfinite(float(row["overlap"])) and np.isfinite(float(row["joint_sensitivity"]))
         ]
         if eligible:
             activity_floor = float(
-                np.quantile(
-                    [float(row["joint_sensitivity"]) for row in eligible], 0.25
-                )
+                np.quantile([float(row["joint_sensitivity"]) for row in eligible], 0.25)
             )
             labelled = sorted(
                 [row for row in eligible if float(row["joint_sensitivity"]) >= activity_floor],
@@ -1013,7 +1216,12 @@ def _plot_layerwise_distance(
     import matplotlib.pyplot as plt
 
     figure, axes = plt.subplots(
-        1, len(tasks), figsize=(3.25 * len(tasks), 4.1), squeeze=False, sharey=True, constrained_layout=True
+        1,
+        len(tasks),
+        figsize=(3.25 * len(tasks), 4.1),
+        squeeze=False,
+        sharey=True,
+        constrained_layout=True,
     )
     styles = {
         "semantic": ("#0072B2", "o", "semantic score"),
@@ -1053,7 +1261,12 @@ def _plot_width_uncertainty(
     import matplotlib.pyplot as plt
 
     figure, axes = plt.subplots(
-        2, len(tasks), figsize=(3.25 * len(tasks), 7.2), squeeze=False, sharex="col", constrained_layout=True
+        2,
+        len(tasks),
+        figsize=(3.25 * len(tasks), 7.2),
+        squeeze=False,
+        sharex="col",
+        constrained_layout=True,
     )
     styles = {"semantic": ("#0072B2", "o"), "structural": ("#D55E00", "s")}
     any_uncertainty = False
@@ -1091,59 +1304,335 @@ def _plot_width_uncertainty(
             axes[0, column].legend(frameon=False, fontsize=8)
     if not any_uncertainty:
         for axis in axes[1]:
-            axis.text(0.5, 0.5, "per-graph contributions unavailable", ha="center", va="center", transform=axis.transAxes, fontsize=8)
+            axis.text(
+                0.5,
+                0.5,
+                "per-graph contributions unavailable",
+                ha="center",
+                va="center",
+                transform=axis.transAxes,
+                fontsize=8,
+            )
     figure.suptitle("Spatial width and estimation uncertainty")
     paths = _save_figure(figure, figures_dir, "05_spatial_width_and_uncertainty")
     plt.close(figure)
     return paths
 
 
-def _profile_for_head(
-    model: SpatialModel, layer: int, head: int, channel: str
-) -> tuple[tuple[str, ...], np.ndarray]:
-    values = model.score["channels"][channel]["heatmap_exact_head"][layer, head]
-    labels, grouped = group_distance(values, model.score["axis"])
-    return labels, _normalise(grouped)
-
-
-def _plot_representatives(
-    models: Sequence[SpatialModel], representatives: Sequence[Mapping[str, Any]], figures_dir: Path
+def _plot_raw_opportunity_reach(
+    summary: Sequence[Mapping[str, Any]], tasks: Sequence[str], figures_dir: Path
 ) -> list[Path]:
     import matplotlib.pyplot as plt
 
-    if not representatives:
+    if not any(str(row["source"]).endswith("_opportunity") for row in summary):
         return []
-    tasks = [model.task for model in models if any(str(row["task"]) == model.task for row in representatives)]
-    by_task = {model.task: model for model in models}
     figure, axes = plt.subplots(
-        len(tasks), 2, figsize=(9.0, 2.6 * len(tasks)), squeeze=False, constrained_layout=True
+        1,
+        len(tasks),
+        figsize=(3.25 * len(tasks), 4.1),
+        squeeze=False,
+        sharey=True,
+        constrained_layout=True,
     )
+    for column, task in enumerate(tasks):
+        axis = axes[0, column]
+        selected = [row for row in summary if str(row["task"]) == task]
+        for channel, colour, marker in (
+            ("semantic", "#0072B2", "o"),
+            ("structural", "#D55E00", "s"),
+        ):
+            for source, linestyle, suffix in (
+                (channel, "-", "raw mass"),
+                (f"{channel}_opportunity", "--", "per opportunity"),
+            ):
+                source_rows = sorted(
+                    [row for row in selected if str(row["source"]) == source],
+                    key=lambda row: int(row["layer"]),
+                )
+                if not source_rows:
+                    continue
+                axis.plot(
+                    [int(row["layer"]) for row in source_rows],
+                    [float(row["expected_distance_mean"]) for row in source_rows],
+                    color=colour,
+                    marker=marker,
+                    linestyle=linestyle,
+                    linewidth=1.6,
+                    label=f"{channel}, {suffix}",
+                )
+        axis.set_xlabel("layer")
+        axis.set_title(_task_label(task), fontsize=10)
+        if column == 0:
+            axis.set_ylabel("expected graph distance")
+            axis.legend(frameon=False, fontsize=7)
+    figure.suptitle("Raw and opportunity-corrected score reach")
+    paths = _save_figure(figure, figures_dir, "08_raw_vs_opportunity_reach")
+    plt.close(figure)
+    return paths
+
+
+def _distance_groups(rows: Sequence[Mapping[str, Any]]) -> list[str]:
+    preferred = ("0", "1", "2", "3", "4-7", "8+")
+    observed = {str(row["distance_group"]) for row in rows}
+    return [label for label in preferred if label in observed] + sorted(observed - set(preferred))
+
+
+def _plot_layer_distance_profiles(
+    rows: Sequence[Mapping[str, Any]],
+    tasks: Sequence[str],
+    figures_dir: Path,
+    *,
+    profile_kind: str,
+    stem: str,
+) -> list[Path]:
+    import matplotlib.pyplot as plt
+
+    selected_rows = [row for row in rows if str(row["profile_kind"]) == profile_kind]
+    tasks = [task for task in tasks if any(str(row["task"]) == task for row in selected_rows)]
+    if not selected_rows or not tasks:
+        return []
+    labels = _distance_groups(selected_rows)
+    fields = (
+        ("semantic_share_mean", "semantic"),
+        ("structural_share_mean", "structural"),
+        ("structural_minus_semantic_mean", "structural − semantic"),
+    )
+    positive_values = np.asarray(
+        [
+            float(row[field])
+            for row in selected_rows
+            for field in ("semantic_share_mean", "structural_share_mean")
+            if np.isfinite(float(row[field]))
+        ]
+    )
+    difference_values = np.asarray(
+        [
+            abs(float(row["structural_minus_semantic_mean"]))
+            for row in selected_rows
+            if np.isfinite(float(row["structural_minus_semantic_mean"]))
+        ]
+    )
+    positive_upper = max(float(np.max(positive_values)), 1.0e-12)
+    difference_upper = max(float(np.max(difference_values)), 1.0e-12)
+    figure, axes = plt.subplots(
+        len(tasks),
+        3,
+        figsize=(10.0, 2.25 * len(tasks) + 0.8),
+        squeeze=False,
+        constrained_layout=True,
+    )
+    positive_image = difference_image = None
     for row_index, task in enumerate(tasks):
-        for column, role in enumerate(("high alignment", "low alignment")):
+        task_rows = [row for row in selected_rows if str(row["task"]) == task]
+        layers = sorted({int(row["layer"]) for row in task_rows})
+        for column, (field, title) in enumerate(fields):
             axis = axes[row_index, column]
-            selected = next(
-                row for row in representatives if str(row["task"]) == task and str(row["role"]) == role
-            )
-            model = by_task[task]
-            labels, semantic = _profile_for_head(model, int(selected["layer"]), int(selected["head"]), "semantic")
-            _, structural = _profile_for_head(model, int(selected["layer"]), int(selected["head"]), "structural")
-            x = np.arange(len(labels))
-            axis.plot(x, semantic, color="#0072B2", marker="o", label="semantic")
-            axis.plot(x, structural, color="#D55E00", marker="s", label="structural")
-            axis.set_xticks(x, labels)
-            axis.set_ylim(bottom=0.0)
-            axis.set_title(
-                f"{_task_label(task)} · {role}\n"
-                f"(ℓ{int(selected['layer'])}, h{int(selected['head'])}), overlap={float(selected['overlap']):.2f}",
-                fontsize=9,
-            )
-            if column == 0:
-                axis.set_ylabel("normalized score mass")
+            matrix = np.full((len(layers), len(labels)), np.nan)
+            lookup = {
+                (int(row["layer"]), str(row["distance_group"])): float(row[field])
+                for row in task_rows
+            }
+            for layer_index, layer in enumerate(layers):
+                for distance_index, label in enumerate(labels):
+                    matrix[layer_index, distance_index] = lookup.get((layer, label), np.nan)
+            if column < 2:
+                positive_image = axis.imshow(
+                    matrix,
+                    aspect="auto",
+                    interpolation="nearest",
+                    cmap="viridis",
+                    vmin=0.0,
+                    vmax=positive_upper,
+                )
+            else:
+                difference_image = axis.imshow(
+                    matrix,
+                    aspect="auto",
+                    interpolation="nearest",
+                    cmap="coolwarm",
+                    vmin=-difference_upper,
+                    vmax=difference_upper,
+                )
+            axis.set_xticks(np.arange(len(labels)), labels)
+            axis.set_yticks(np.arange(len(layers)), layers)
             if row_index == len(tasks) - 1:
                 axis.set_xlabel("distance")
-    axes[0, 0].legend(frameon=False, fontsize=8)
-    figure.suptitle("Representative aligned and misaligned head profiles")
-    paths = _save_figure(figure, figures_dir, "06_representative_head_profiles")
+            if column == 0:
+                axis.set_ylabel(f"{_task_label(task)}\nlayer")
+            if row_index == 0:
+                axis.set_title(title, fontsize=10)
+    if positive_image is not None:
+        figure.colorbar(
+            positive_image,
+            ax=axes[:, :2],
+            fraction=0.016,
+            pad=0.012,
+            label="mean normalized mass",
+        )
+    if difference_image is not None:
+        figure.colorbar(
+            difference_image,
+            ax=axes[:, 2],
+            fraction=0.032,
+            pad=0.012,
+            label="mass difference",
+        )
+    title = (
+        "Raw score-mass decomposition"
+        if profile_kind == "score_mass"
+        else "Opportunity-corrected score decomposition"
+    )
+    figure.suptitle(title)
+    paths = _save_figure(figure, figures_dir, stem)
+    plt.close(figure)
+    return paths
+
+
+def _plot_vnode_allocation(
+    rows: Sequence[Mapping[str, Any]], tasks: Sequence[str], figures_dir: Path
+) -> list[Path]:
+    import matplotlib.pyplot as plt
+
+    tasks = [task for task in tasks if any(str(row["task"]) == task for row in rows)]
+    if not rows or not tasks:
+        return []
+    figure, axes = plt.subplots(
+        1,
+        len(tasks),
+        figsize=(3.6 * len(tasks), 4.0),
+        squeeze=False,
+        sharey=True,
+        constrained_layout=True,
+    )
+    for column, task in enumerate(tasks):
+        axis = axes[0, column]
+        selected = [row for row in rows if str(row["task"]) == task]
+        for profile_kind, linestyle, suffix in (
+            ("score_mass", "-", "raw mass"),
+            ("per_opportunity", "--", "per opportunity"),
+        ):
+            for channel, colour, marker in (
+                ("semantic", "#0072B2", "o"),
+                ("structural", "#D55E00", "s"),
+            ):
+                source_rows = sorted(
+                    [row for row in selected if str(row["profile_kind"]) == profile_kind],
+                    key=lambda row: int(row["layer"]),
+                )
+                if not source_rows:
+                    continue
+                axis.plot(
+                    [int(row["layer"]) for row in source_rows],
+                    [float(row[f"{channel}_virtual_share_mean"]) for row in source_rows],
+                    color=colour,
+                    marker=marker,
+                    linestyle=linestyle,
+                    linewidth=1.6,
+                    label=f"{channel}, {suffix}",
+                )
+        axis.set_xlabel("layer")
+        axis.set_title(_task_label(task), fontsize=10)
+        if column == 0:
+            axis.set_ylabel("virtual-node score share")
+            axis.legend(frameon=False, fontsize=7)
+    figure.suptitle("Virtual-node allocation")
+    paths = _save_figure(figure, figures_dir, "11_vnode_allocation")
+    plt.close(figure)
+    return paths
+
+
+def _plot_receptive_field_profiles(
+    rows: Sequence[Mapping[str, Any]], tasks: Sequence[str], figures_dir: Path
+) -> list[Path]:
+    import matplotlib.pyplot as plt
+
+    tasks = [task for task in tasks if any(str(row["task"]) == task for row in rows)]
+    if not rows or not tasks:
+        return []
+    figure, axes = plt.subplots(
+        1,
+        len(tasks),
+        figsize=(3.25 * len(tasks), 4.0),
+        squeeze=False,
+        sharey=True,
+        constrained_layout=True,
+    )
+    for column, task in enumerate(tasks):
+        axis = axes[0, column]
+        for channel, colour, marker in (
+            ("semantic", "#0072B2", "o"),
+            ("structural", "#D55E00", "s"),
+        ):
+            selected = sorted(
+                [
+                    row
+                    for row in rows
+                    if str(row["task"]) == task and str(row["channel"]) == channel
+                ],
+                key=lambda row: int(row["layer"]),
+            )
+            axis.plot(
+                [int(row["layer"]) for row in selected],
+                [float(row["fraction_of_receptive_radius"]) for row in selected],
+                color=colour,
+                marker=marker,
+                linewidth=1.6,
+                label=channel,
+            )
+        axis.axhline(1.0, color="#777777", linestyle="--", linewidth=0.8)
+        axis.set_xlabel("layer")
+        axis.set_title(_task_label(task), fontsize=10)
+        if column == 0:
+            axis.set_ylabel("expected distance / nominal reach")
+            axis.legend(frameon=False, fontsize=8)
+    figure.suptitle("Score reach relative to architectural receptive field")
+    paths = _save_figure(figure, figures_dir, "12_receptive_field_normalized_reach")
+    plt.close(figure)
+    return paths
+
+
+def _plot_width_difference(
+    rows: Sequence[Mapping[str, Any]], tasks: Sequence[str], figures_dir: Path
+) -> list[Path]:
+    import matplotlib.pyplot as plt
+
+    tasks = [task for task in tasks if any(str(row["task"]) == task for row in rows)]
+    if not rows or not tasks:
+        return []
+    figure, axes = plt.subplots(
+        1,
+        len(tasks),
+        figsize=(3.25 * len(tasks), 4.0),
+        squeeze=False,
+        sharey=True,
+        constrained_layout=True,
+    )
+    for column, task in enumerate(tasks):
+        axis = axes[0, column]
+        selected = sorted(
+            [row for row in rows if str(row["task"]) == task],
+            key=lambda row: int(row["layer"]),
+        )
+        layer = np.asarray([int(row["layer"]) for row in selected])
+        mean = np.asarray([float(row["structural_minus_semantic_mean"]) for row in selected])
+        low = np.asarray([float(row["structural_minus_semantic_low"]) for row in selected])
+        high = np.asarray([float(row["structural_minus_semantic_high"]) for row in selected])
+        axis.errorbar(
+            layer,
+            mean,
+            yerr=np.vstack((mean - low, high - mean)),
+            color="#7A5195",
+            marker="o",
+            linewidth=1.5,
+            capsize=2.5,
+        )
+        axis.axhline(0.0, color="#777777", linestyle="--", linewidth=0.8)
+        axis.set_xlabel("layer")
+        axis.set_title(_task_label(task), fontsize=10)
+        if column == 0:
+            axis.set_ylabel("structural − semantic variance (hops²)")
+    figure.suptitle("Structural excess in spatial width (95% graph-bootstrap CI)")
+    paths = _save_figure(figure, figures_dir, "13_structural_minus_semantic_width")
     plt.close(figure)
     return paths
 
@@ -1156,7 +1645,12 @@ def _plot_score_carriage(
     if not any(str(row["source"]).endswith("_carriage") for row in profile_rows):
         return []
     figure, axes = plt.subplots(
-        2, len(tasks), figsize=(3.25 * len(tasks), 7.0), squeeze=False, sharey="row", constrained_layout=True
+        2,
+        len(tasks),
+        figsize=(3.25 * len(tasks), 7.0),
+        squeeze=False,
+        sharey="row",
+        constrained_layout=True,
     )
     for row_index, channel in enumerate(CHANNELS):
         for column, task in enumerate(tasks):
@@ -1165,7 +1659,9 @@ def _plot_score_carriage(
             sources = (f"{channel}_score", f"{channel}_carriage")
             labels = []
             for source in sources:
-                labels.extend(str(row["distance"]) for row in selected if str(row["source"]) == source)
+                labels.extend(
+                    str(row["distance"]) for row in selected if str(row["source"]) == source
+                )
             labels = list(dict.fromkeys(labels))
             for source, colour, marker, name in (
                 (sources[0], "#4C78A8", "o", "mean head score"),
@@ -1216,7 +1712,8 @@ def run(
         for warning in warnings:
             print(f"[chapter6:warning] {warning}", flush=True)
         print(
-            "[chapter6:load] " + ", ".join(f"{model.task} ({model.score_path})" for model in models),
+            "[chapter6:load] "
+            + ", ".join(f"{model.task} ({model.score_path})" for model in models),
             flush=True,
         )
     head_rows = head_metrics(models)
@@ -1224,12 +1721,20 @@ def run(
     representative_rows = representative_heads(head_rows, activity_quantile=activity_quantile)
     profile_rows = model_profiles(models)
     uncertainty_rows = uncertainty_profiles(models)
+    distance_rows = layer_distance_profiles(models)
+    vnode_rows = vnode_layer_profiles(models)
+    receptive_rows = receptive_field_profiles(models, layer_rows)
+    width_bootstrap_rows = spatial_width_bootstrap(models)
     tables = {
         "head_spatial_metrics.csv": head_rows,
         "layer_spatial_summary.csv": layer_rows,
         "representative_heads.csv": representative_rows,
         "model_distance_profiles.csv": profile_rows,
         "score_profile_uncertainty.csv": uncertainty_rows,
+        "layer_distance_profiles.csv": distance_rows,
+        "vnode_layer_allocation.csv": vnode_rows,
+        "receptive_field_normalized_reach.csv": receptive_rows,
+        "spatial_width_graph_bootstrap.csv": width_bootstrap_rows,
     }
     for name, rows in tables.items():
         _write_csv(output_dir / name, rows)
@@ -1242,6 +1747,28 @@ def run(
     figures.extend(_plot_width_uncertainty(layer_rows, available_tasks, figures_dir))
     figures.extend(_plot_alignment_head_roles(head_rows, available_tasks, figures_dir))
     figures.extend(_plot_score_carriage(profile_rows, available_tasks, figures_dir))
+    figures.extend(_plot_raw_opportunity_reach(layer_rows, available_tasks, figures_dir))
+    figures.extend(
+        _plot_layer_distance_profiles(
+            distance_rows,
+            available_tasks,
+            figures_dir,
+            profile_kind="score_mass",
+            stem="09_layer_distance_profiles_raw",
+        )
+    )
+    figures.extend(
+        _plot_layer_distance_profiles(
+            distance_rows,
+            available_tasks,
+            figures_dir,
+            profile_kind="per_opportunity",
+            stem="10_layer_distance_profiles_opportunity",
+        )
+    )
+    figures.extend(_plot_vnode_allocation(vnode_rows, available_tasks, figures_dir))
+    figures.extend(_plot_receptive_field_profiles(receptive_rows, available_tasks, figures_dir))
+    figures.extend(_plot_width_difference(width_bootstrap_rows, available_tasks, figures_dir))
     summary = {
         "analysis_version": ANALYSIS_VERSION,
         "tasks_requested": list(tasks),
@@ -1257,7 +1784,9 @@ def run(
                 "protocol": str(model.score_metadata.get("protocol_version", "unknown")),
                 "attention_available": model.score.get("clean_attention_distance") is not None,
                 "per_graph_contributions_available": all(
-                    isinstance(model.score["channels"][channel].get("graph_distance_contribution"), Mapping)
+                    isinstance(
+                        model.score["channels"][channel].get("graph_distance_contribution"), Mapping
+                    )
                     for channel in CHANNELS
                 ),
                 "carriage": None if model.carriage_path is None else str(model.carriage_path),
@@ -1270,6 +1799,10 @@ def run(
             "expected_distance": "molecular-only expected graph distance; virtual carriers remain separate",
             "spatial_width": "variance of normalized molecular score mass over graph distance",
             "uncertainty": "standard error of expected distance across cached held-out graphs",
+            "width_interval": "paired graph-bootstrap interval; heads remain fixed",
+            "opportunity_correction": "score mass per available source-carrier opportunity in each distance shell",
+            "receptive_field": "expected score distance divided by nominal layerwise architectural reach",
+            "virtual_node": "reported separately because it has no molecular graph distance",
             "attention": "clean attention mass by graph distance, not a causal score",
             "carriage": "final-state response under the same intervention family, not task necessity",
         },
@@ -1284,6 +1817,10 @@ def run(
         "head_rows": head_rows,
         "layer_rows": layer_rows,
         "representative_rows": representative_rows,
+        "distance_rows": distance_rows,
+        "vnode_rows": vnode_rows,
+        "receptive_rows": receptive_rows,
+        "width_bootstrap_rows": width_bootstrap_rows,
     }
 
 
@@ -1292,10 +1829,14 @@ __all__ = [
     "SpatialModel",
     "head_metrics",
     "inventory",
+    "layer_distance_profiles",
     "layer_summary",
     "load_models",
     "model_profiles",
+    "receptive_field_profiles",
     "representative_heads",
     "run",
+    "spatial_width_bootstrap",
     "uncertainty_profiles",
+    "vnode_layer_profiles",
 ]

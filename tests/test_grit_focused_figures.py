@@ -328,6 +328,7 @@ def test_zinc_and_qm9_graphs_reconstruct_as_index_preserving_molecules():
     )
     zinc_molecule = molecule_from_graph("zinc", zinc)
     zinc_payload = molecule_record("zinc", zinc)
+    sparse_zinc_payload = molecule_record("zinc_2hop", zinc)
     assert ZINC_ATOM_TYPES[4] == "C H1"
     assert graph_node_labels("zinc", zinc) == ["C", "C", "O"]
     assert [atom.GetSymbol() for atom in zinc_molecule.GetAtoms()] == [
@@ -338,6 +339,9 @@ def test_zinc_and_qm9_graphs_reconstruct_as_index_preserving_molecules():
     assert zinc_payload["smiles"] == "CCO"
     assert zinc_payload["formula"] == "C2H6O"
     assert zinc_payload["chemistry_focus_version"] == CHEMISTRY_FOCUS_VERSION
+    assert sparse_zinc_payload["smiles"] == "CCO"
+    assert graph_node_labels("zinc_1hop_vnode", zinc) == ["C", "C", "O"]
+    assert figure_identity("zinc_2hop")["dataset_label"] == "ZINC-subset"
 
     qm9 = SimpleNamespace(
         x=np.asarray([[8], [1], [1]], dtype=np.int64),

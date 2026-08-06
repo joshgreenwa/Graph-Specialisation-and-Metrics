@@ -554,7 +554,7 @@ def plot_attention_grid(
     *,
     role: str,
     head: Head,
-    per_graph_coordinates: Mapping[int, Mapping[str, float]],
+    per_graph_coordinates: Mapping[int, Mapping[str, float]] | None,
     net_d_rel: float,
     net_joint_sensitivity: float,
     title_label: str | None = None,
@@ -605,31 +605,33 @@ def plot_attention_grid(
     )
     for row, (example, matrix) in enumerate(zip(examples, matrices)):
         graph_index = int(example["dataset_index"])
-        graph_coordinates = per_graph_coordinates.get(
-            graph_index, per_graph_coordinates.get(str(graph_index))
-        )
-        if graph_coordinates is None:
-            raise KeyError(
-                f"no graph-local coordinates were supplied for eval index {graph_index}"
+        graph_coordinates = None
+        if per_graph_coordinates is not None:
+            graph_coordinates = per_graph_coordinates.get(
+                graph_index, per_graph_coordinates.get(str(graph_index))
             )
-        d_rel = float(
-            graph_coordinates.get(
-                "D_rel", graph_coordinates.get("selectivity", np.nan)
-            )
-        )
-        joint = float(
-            graph_coordinates.get(
-                "J", graph_coordinates.get("joint_sensitivity", np.nan)
-            )
-        )
         axes[row, 0].imshow(_draw_molecule_plain(example))
         axes[row, 0].axis("off")
+        caption = _molecule_caption(example, dataset_label=dataset_label)
+        if graph_coordinates is not None:
+            d_rel = float(
+                graph_coordinates.get(
+                    "D_rel", graph_coordinates.get("selectivity", np.nan)
+                )
+            )
+            joint = float(
+                graph_coordinates.get(
+                    "J", graph_coordinates.get("joint_sensitivity", np.nan)
+                )
+            )
+            caption += (
+                "\n"
+                + rf"Graph-local: $D_{{\rm rel}} = {d_rel:+.3f};\ J = {joint:.3f}$"
+            )
         axes[row, 0].text(
             0.01,
             0.99,
-            _molecule_caption(example, dataset_label=dataset_label)
-            + "\n"
-            + rf"Graph-local: $D_{{\rm rel}} = {d_rel:+.3f};\ J = {joint:.3f}$",
+            caption,
             transform=axes[row, 0].transAxes,
             ha="left",
             va="top",

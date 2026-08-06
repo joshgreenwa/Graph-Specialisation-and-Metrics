@@ -8,9 +8,12 @@ import torch
 
 from graph_specialisation_metrics.chapter6_spatial_explorer import (
     head_metrics,
+    layer_distance_profiles,
     layer_summary,
     load_models,
+    receptive_field_profiles,
     run,
+    spatial_width_bootstrap,
 )
 
 matplotlib.use("Agg")
@@ -133,17 +136,36 @@ def test_head_metrics_keep_width_uncertainty_and_attention_separate(tmp_path):
     assert np.isfinite(first["semantic_expected_distance_sem"])
     assert first["family"] == "semantic_leaning"
     assert first["raw_semantic_score"] == pytest.approx(1.0)
+    assert first["semantic_opportunity_expected_distance"] == pytest.approx(0.0)
 
     summary = layer_summary(rows)
     sources = {row["source"] for row in summary}
-    assert sources == {"semantic", "structural", "attention"}
+    assert sources == {
+        "semantic",
+        "structural",
+        "semantic_opportunity",
+        "structural_opportunity",
+        "attention",
+    }
     semantic_layer_zero = next(
-        row
-        for row in summary
-        if row["source"] == "semantic" and row["layer"] == 0
+        row for row in summary if row["source"] == "semantic" and row["layer"] == 0
     )
     assert np.isfinite(semantic_layer_zero["spatial_variance_q1"])
     assert np.isfinite(semantic_layer_zero["spatial_variance_q3"])
+
+    distance_rows = layer_distance_profiles(models)
+    assert {row["profile_kind"] for row in distance_rows} == {
+        "score_mass",
+        "per_opportunity",
+    }
+    receptive_rows = receptive_field_profiles(models, summary)
+    first_reach = next(
+        row for row in receptive_rows if row["layer"] == 0 and row["channel"] == "structural"
+    )
+    assert first_reach["nominal_receptive_radius"] == pytest.approx(1.0)
+    bootstrap_rows = spatial_width_bootstrap(models, replicates=200, seed=0)
+    assert len(bootstrap_rows) == 2
+    assert bootstrap_rows[0]["graphs"] == 2
 
 
 def test_loader_falls_back_to_equivalent_duplicate_carriage(tmp_path):
@@ -160,13 +182,9 @@ def test_loader_falls_back_to_equivalent_duplicate_carriage(tmp_path):
     payload["metadata"]["protocol_version"] = "donor-swap-specialisation-carriage-v3"
     torch.save(payload, fallback_score)
 
-    models, warnings = load_models(
-        [preferred, fallback], ["zinc_1hop"], seed=42
-    )
+    models, warnings = load_models([preferred, fallback], ["zinc_1hop"], seed=42)
     assert models[0].score_path == preferred_score
-    assert models[0].carriage_path == (
-        fallback / "zinc_1hop/seed_42/cache/carriage/fields.pt"
-    )
+    assert models[0].carriage_path == (fallback / "zinc_1hop/seed_42/cache/carriage/fields.pt")
     assert any("equivalent carriage artifact" in warning for warning in warnings)
 
 
@@ -189,6 +207,10 @@ def test_run_skips_missing_components_and_writes_exploratory_outputs(tmp_path):
         "representative_heads.csv",
         "model_distance_profiles.csv",
         "score_profile_uncertainty.csv",
+        "layer_distance_profiles.csv",
+        "vnode_layer_allocation.csv",
+        "receptive_field_normalized_reach.csv",
+        "spatial_width_graph_bootstrap.csv",
         "summary.json",
     ):
         assert (output / name).is_file()
@@ -201,4 +223,9 @@ def test_run_skips_missing_components_and_writes_exploratory_outputs(tmp_path):
         "05_spatial_width_and_uncertainty.png",
         "06_alignment_and_head_roles.png",
         "07_score_and_final_state_response.png",
+        "08_raw_vs_opportunity_reach.png",
+        "09_layer_distance_profiles_raw.png",
+        "10_layer_distance_profiles_opportunity.png",
+        "12_receptive_field_normalized_reach.png",
+        "13_structural_minus_semantic_width.png",
     }
