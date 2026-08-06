@@ -7,12 +7,17 @@ import pytest
 import torch
 
 from graph_specialisation_metrics.chapter6_spatial_explorer import (
+    graph_spatial_metrics,
     head_metrics,
     layer_distance_profiles,
     layer_summary,
     load_models,
+    molecular_scale_relationships,
     run,
     spatial_width_bootstrap,
+    vnode_cross_layer_relationships,
+    width_by_head_role,
+    width_contribution_profiles,
 )
 
 matplotlib.use("Agg")
@@ -47,6 +52,10 @@ def _score() -> dict:
             "heatmap_exact_head": values,
             "heatmap_per_opportunity_head": values,
             "graph_distance_contribution": {10: graph_zero, 11: graph_one},
+            "graph_distance_support": {
+                10: np.ones(len(axis)),
+                11: np.ones(len(axis)),
+            },
             "distance_intervals": {
                 "estimate": point,
                 "low": point * 0.9,
@@ -160,6 +169,16 @@ def test_head_metrics_keep_width_uncertainty_and_attention_separate(tmp_path):
     bootstrap_rows = spatial_width_bootstrap(models, replicates=200, seed=0)
     assert len(bootstrap_rows) == 2
     assert bootstrap_rows[0]["graphs"] == 2
+    contribution_rows = width_contribution_profiles(models)
+    assert {row["weighting"] for row in contribution_rows} == {
+        "equal_head",
+        "J_weighted",
+    }
+    role_rows = width_by_head_role(rows)
+    assert any(row["family"] == "all_active" for row in role_rows)
+    graph_rows = graph_spatial_metrics(models)
+    assert all(row["num_nodes"] == pytest.approx(3.0) for row in graph_rows)
+    assert all(row["diameter"] == pytest.approx(2.0) for row in graph_rows)
 
 
 def test_loader_falls_back_to_equivalent_duplicate_carriage(tmp_path):
@@ -180,6 +199,46 @@ def test_loader_falls_back_to_equivalent_duplicate_carriage(tmp_path):
     assert models[0].score_path == preferred_score
     assert models[0].carriage_path == (fallback / "zinc_1hop/seed_42/cache/carriage/fields.pt")
     assert any("equivalent carriage artifact" in warning for warning in warnings)
+
+
+def test_graphwise_followups_recover_cross_layer_and_scale_relationships():
+    rows = []
+    for graph in range(6):
+        scale = float(graph + 3)
+        rows.extend(
+            [
+                {
+                    "task": "zinc_1hop_vnode",
+                    "graph_id": graph,
+                    "layer": 0,
+                    "num_nodes": scale,
+                    "diameter": scale,
+                    "semantic_vnode_share": scale,
+                    "structural_vnode_share": 0.0,
+                    "semantic_expected_distance": 0.0,
+                    "structural_expected_distance": 0.0,
+                    "structural_excess_width": scale,
+                },
+                {
+                    "task": "zinc_1hop_vnode",
+                    "graph_id": graph,
+                    "layer": 1,
+                    "num_nodes": scale,
+                    "diameter": scale,
+                    "semantic_vnode_share": scale,
+                    "structural_vnode_share": 0.0,
+                    "semantic_expected_distance": scale,
+                    "structural_expected_distance": scale,
+                    "structural_excess_width": scale,
+                },
+            ]
+        )
+    cross_layer = vnode_cross_layer_relationships(rows)
+    assert all(row["spearman_rho"] == pytest.approx(1.0) for row in cross_layer)
+    scale_rows = molecular_scale_relationships(rows)
+    width_rows = [row for row in scale_rows if row["outcome"] == "structural_excess_width"]
+    assert width_rows
+    assert all(row["spearman_rho"] == pytest.approx(1.0) for row in width_rows)
 
 
 def test_run_skips_missing_components_and_writes_exploratory_outputs(tmp_path):
@@ -204,6 +263,11 @@ def test_run_skips_missing_components_and_writes_exploratory_outputs(tmp_path):
         "layer_distance_profiles.csv",
         "vnode_layer_allocation.csv",
         "spatial_width_graph_bootstrap.csv",
+        "width_contributions_by_distance.csv",
+        "width_by_head_role.csv",
+        "graph_spatial_metrics.csv",
+        "vnode_cross_layer_relationships.csv",
+        "molecular_scale_relationships.csv",
         "summary.json",
     ):
         assert (output / name).is_file()
@@ -220,4 +284,15 @@ def test_run_skips_missing_components_and_writes_exploratory_outputs(tmp_path):
         "09_layer_distance_profiles_raw.png",
         "10_layer_distance_profiles_opportunity.png",
         "12_structural_minus_semantic_width.png",
+        "13_width_excess_by_distance.png",
+        "14_width_excess_by_head_role.png",
+        "16_scale_and_structural_width.png",
     }
+
+
+def test_colab_enables_two_molecular_attention_examples_by_default():
+    source = Path("experiments/zinc/analysis/chapter6_spatial_explorer_colab.py").read_text(
+        encoding="utf-8"
+    )
+    assert "GENERATE_HEAD_CONTEXT = True" in source
+    assert "HEAD_CONTEXT_GRAPH_INDICES = (0, 1)" in source

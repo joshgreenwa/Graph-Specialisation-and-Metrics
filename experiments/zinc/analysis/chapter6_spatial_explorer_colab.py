@@ -1,9 +1,9 @@
 """Single-cell Colab frontend for the Chapter 6 spatial explorer.
 
-Paste this file into one Colab cell. The run is cache-only: it finds every
-available canonical score cache and creates the spatial tables and figures.
-Missing attention, carriage, or individual model artifacts disable only the
-corresponding outputs.
+Paste this file into one Colab cell. The core explorer is cache-only: it finds
+every available canonical score cache and creates the spatial tables and
+figures. The enabled head-context follow-up computes and caches two molecular
+attention examples for each selected head when they are not already present.
 """
 
 # The backend import intentionally follows the Colab clone/install step.
@@ -54,7 +54,7 @@ REPRESENTATIVE_ACTIVITY_QUANTILE = 0.25
 # Optional: two matched heads per selected model, shown on real molecules.
 # The core explorer above remains entirely cache-only. Turning this on reuses an
 # exact supplemental cache and computes only the missing attention examples.
-GENERATE_HEAD_CONTEXT = False
+GENERATE_HEAD_CONTEXT = True
 HEAD_CONTEXT_TASKS = ("zinc_1hop_vnode", "zinc_2hop", "zinc")
 HEAD_CONTEXT_GRAPH_INDICES = (0, 1)
 HEAD_CONTEXT_COMPUTE_MISSING = True

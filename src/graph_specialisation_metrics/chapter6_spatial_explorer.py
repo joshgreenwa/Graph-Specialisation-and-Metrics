@@ -42,7 +42,7 @@ from .zinc_cached_rrwp_comparison import (
     vnode_profile_rows,
 )
 
-ANALYSIS_VERSION = "chapter6-spatial-explorer-v3"
+ANALYSIS_VERSION = "chapter6-spatial-explorer-v4"
 CHANNELS = ("semantic", "structural")
 
 
@@ -705,9 +705,7 @@ def representative_heads(
                 lower_layer: int = lower_layer,
             ) -> float:
                 joint = max(float(row["joint_sensitivity"]), 1.0e-12)
-                family_penalty = (
-                    0.0 if str(row.get("family")) == lower_family else 0.35
-                )
+                family_penalty = 0.0 if str(row.get("family")) == lower_family else 0.35
                 return (
                     abs(math.log(joint / lower_joint))
                     + 0.08 * abs(int(row["layer"]) - lower_layer)
@@ -894,6 +892,331 @@ def spatial_width_bootstrap(
                     float(np.quantile(finite, 0.975)) if finite.size else float("nan")
                 )
             output.append(record)
+    return output
+
+
+def width_contribution_profiles(
+    models: Sequence[SpatialModel],
+) -> list[dict[str, Any]]:
+    """Locate the distance bins that contribute to semantic and structural width."""
+
+    output: list[dict[str, Any]] = []
+    for model in models:
+        score = model.score
+        axis = tuple(score["axis"])
+        reportable = _reportable(score, "semantic") & _reportable(score, "structural")
+        profiles: dict[str, np.ndarray] = {}
+        distances = None
+        for channel in CHANNELS:
+            values = score["channels"][channel]["heatmap_exact_head"]
+            channel_distances, profiles[channel] = _molecular_profile(values, axis, reportable)
+            distances = channel_distances
+        if distances is None or not len(distances):
+            continue
+        joint, _ = _head_activity(score, profiles["semantic"].shape[:2])
+        contributions: dict[str, np.ndarray] = {}
+        labels: tuple[str, ...] | None = None
+        for channel in CHANNELS:
+            profile = profiles[channel]
+            expected = np.sum(profile * distances, axis=-1)
+            exact = profile * np.square(distances - expected[..., None])
+            labels, contributions[channel] = group_distance(exact, tuple(distances))
+        if labels is None:
+            continue
+        for layer in range(profiles["semantic"].shape[0]):
+            weights = np.maximum(joint[layer], 0.0)
+            for weighting in ("equal_head", "J_weighted"):
+                if weighting == "equal_head":
+                    semantic = np.nanmean(contributions["semantic"][layer], axis=0)
+                    structural = np.nanmean(contributions["structural"][layer], axis=0)
+                    valid_heads = int(profiles["semantic"].shape[1])
+                else:
+                    valid = np.isfinite(weights) & (weights > 0.0)
+                    valid_heads = int(np.count_nonzero(valid))
+                    if not valid_heads:
+                        continue
+                    denominator = float(np.sum(weights[valid]))
+                    semantic = (
+                        np.nansum(
+                            contributions["semantic"][layer, valid] * weights[valid, None],
+                            axis=0,
+                        )
+                        / denominator
+                    )
+                    structural = (
+                        np.nansum(
+                            contributions["structural"][layer, valid] * weights[valid, None],
+                            axis=0,
+                        )
+                        / denominator
+                    )
+                for label, semantic_value, structural_value in zip(labels, semantic, structural):
+                    output.append(
+                        {
+                            "task": model.task,
+                            "layer": layer,
+                            "weighting": weighting,
+                            "distance_group": label,
+                            "valid_heads": valid_heads,
+                            "semantic_width_contribution": float(semantic_value),
+                            "structural_width_contribution": float(structural_value),
+                            "structural_minus_semantic_width_contribution": float(
+                                structural_value - semantic_value
+                            ),
+                        }
+                    )
+    return output
+
+
+def width_by_head_role(
+    rows: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Summarize spatial width by established head family and by J weighting."""
+
+    by_task: dict[str, list[Mapping[str, Any]]] = {}
+    for row in rows:
+        by_task.setdefault(str(row["task"]), []).append(row)
+    output: list[dict[str, Any]] = []
+    family_order = (
+        "all_active",
+        "semantic_leaning",
+        "structural_leaning",
+        "central_responsive",
+        "other",
+        "inactive",
+    )
+    for task, task_rows in by_task.items():
+        for family in family_order:
+            if family == "all_active":
+                selected = [
+                    row
+                    for row in task_rows
+                    if str(row.get("family")) != "inactive"
+                    and float(row["joint_sensitivity"]) > 0.0
+                ]
+            else:
+                selected = [row for row in task_rows if str(row.get("family")) == family]
+            if not selected:
+                continue
+            semantic = np.asarray([float(row["semantic_spatial_variance"]) for row in selected])
+            structural = np.asarray([float(row["structural_spatial_variance"]) for row in selected])
+            weights = np.maximum(
+                np.asarray([float(row["joint_sensitivity"]) for row in selected]),
+                0.0,
+            )
+            valid = np.isfinite(semantic) & np.isfinite(structural)
+            weighted = valid & np.isfinite(weights) & (weights > 0.0)
+            if not np.any(valid):
+                continue
+            record = {
+                "task": task,
+                "family": family,
+                "heads": int(np.count_nonzero(valid)),
+                "semantic_width_mean": float(np.mean(semantic[valid])),
+                "structural_width_mean": float(np.mean(structural[valid])),
+                "structural_excess_mean": float(np.mean(structural[valid] - semantic[valid])),
+                "mean_J": float(np.mean(weights[valid])),
+                "semantic_width_J_weighted": float("nan"),
+                "structural_width_J_weighted": float("nan"),
+                "structural_excess_J_weighted": float("nan"),
+            }
+            if np.any(weighted):
+                denominator = float(np.sum(weights[weighted]))
+                semantic_weighted = float(
+                    np.sum(semantic[weighted] * weights[weighted]) / denominator
+                )
+                structural_weighted = float(
+                    np.sum(structural[weighted] * weights[weighted]) / denominator
+                )
+                record.update(
+                    {
+                        "semantic_width_J_weighted": semantic_weighted,
+                        "structural_width_J_weighted": structural_weighted,
+                        "structural_excess_J_weighted": structural_weighted - semantic_weighted,
+                    }
+                )
+            output.append(record)
+    return output
+
+
+def _graph_profile_statistics(
+    values: Any, axis: Sequence[Any], reportable: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    distances, profile = _molecular_profile(values, axis, reportable)
+    expected = np.sum(profile * distances, axis=-1)
+    variance = np.sum(profile * np.square(distances - expected[..., None]), axis=-1)
+    return np.nanmean(expected, axis=1), np.nanmean(variance, axis=1)
+
+
+def _graph_virtual_share(values: Any, axis: Sequence[Any], reportable: np.ndarray) -> np.ndarray:
+    virtual = np.asarray([str(label).replace("_", " ").lower() == "virtual" for label in axis])
+    if not np.any(virtual):
+        array = _as_numpy(values)
+        return np.full(array.shape[0], np.nan)
+    array = np.maximum(_as_numpy(values), 0.0)
+    mask = _as_numpy(reportable, dtype=bool)
+    total = np.sum(array[..., mask], axis=-1)
+    virtual_mass = np.sum(array[..., virtual & mask], axis=-1)
+    share = np.full(total.shape, np.nan)
+    np.divide(virtual_mass, total, out=share, where=total > 1.0e-12)
+    return np.nanmean(share, axis=1)
+
+
+def graph_spatial_metrics(models: Sequence[SpatialModel]) -> list[dict[str, Any]]:
+    """Graph-local spatial metrics with molecule size and diameter from cached support."""
+
+    output: list[dict[str, Any]] = []
+    for model in models:
+        score = model.score
+        axis = tuple(score["axis"])
+        numeric = np.asarray(
+            [value if (value := _numeric_distance(label)) is not None else np.nan for label in axis]
+        )
+        numeric_mask = np.isfinite(numeric)
+        reportable = _reportable(score, "semantic") & _reportable(score, "structural")
+        contributions = {
+            channel: score["channels"][channel].get("graph_distance_contribution", {})
+            for channel in CHANNELS
+        }
+        supports = score["channels"]["semantic"].get("graph_distance_support", {})
+        if not all(isinstance(value, Mapping) for value in (*contributions.values(), supports)):
+            continue
+        ids = sorted(
+            {str(value) for value in contributions["semantic"]}
+            & {str(value) for value in contributions["structural"]}
+            & {str(value) for value in supports}
+        )
+        for graph_id in ids:
+
+            def lookup(mapping: Mapping[Any, Any], graph_id: str = graph_id) -> Any:
+                return next(value for key, value in mapping.items() if str(key) == graph_id)
+
+            support = _as_numpy(lookup(supports))
+            if support.shape[-1] != len(axis):
+                continue
+            if support.ndim > 1:
+                support = np.nanmean(support.reshape(-1, len(axis)), axis=0)
+            molecular_support = support[numeric_mask]
+            num_nodes = float(np.sum(molecular_support))
+            present = numeric_mask & (support > 1.0e-12)
+            diameter = float(np.max(numeric[present])) if np.any(present) else float("nan")
+            graph_values = {
+                channel: _as_numpy(lookup(contributions[channel])) for channel in CHANNELS
+            }
+            if any(
+                values.ndim != 3 or values.shape[-1] != len(axis)
+                for values in graph_values.values()
+            ):
+                continue
+            statistics = {
+                channel: _graph_profile_statistics(values, axis, reportable)
+                for channel, values in graph_values.items()
+            }
+            virtual = {
+                channel: _graph_virtual_share(values, axis, reportable)
+                for channel, values in graph_values.items()
+            }
+            layers = graph_values["semantic"].shape[0]
+            for layer in range(layers):
+                output.append(
+                    {
+                        "task": model.task,
+                        "graph_id": graph_id,
+                        "layer": layer,
+                        "num_nodes": num_nodes,
+                        "diameter": diameter,
+                        "semantic_expected_distance": float(statistics["semantic"][0][layer]),
+                        "structural_expected_distance": float(statistics["structural"][0][layer]),
+                        "semantic_width": float(statistics["semantic"][1][layer]),
+                        "structural_width": float(statistics["structural"][1][layer]),
+                        "structural_excess_width": float(
+                            statistics["structural"][1][layer] - statistics["semantic"][1][layer]
+                        ),
+                        "semantic_vnode_share": float(virtual["semantic"][layer]),
+                        "structural_vnode_share": float(virtual["structural"][layer]),
+                    }
+                )
+    return output
+
+
+def _spearman(left: Sequence[float], right: Sequence[float]) -> tuple[int, float]:
+    from scipy.stats import spearmanr
+
+    left_array = np.asarray(left, dtype=np.float64)
+    right_array = np.asarray(right, dtype=np.float64)
+    valid = np.isfinite(left_array) & np.isfinite(right_array)
+    if np.count_nonzero(valid) < 3:
+        return int(np.count_nonzero(valid)), float("nan")
+    if np.std(left_array[valid]) <= 1.0e-12 or np.std(right_array[valid]) <= 1.0e-12:
+        return int(np.count_nonzero(valid)), float("nan")
+    result = spearmanr(left_array[valid], right_array[valid])
+    return int(np.count_nonzero(valid)), float(result.statistic)
+
+
+def vnode_cross_layer_relationships(
+    rows: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Relate semantic VN allocation to next-layer molecular organisation."""
+
+    lookup = {(str(row["task"]), str(row["graph_id"]), int(row["layer"])): row for row in rows}
+    groups: dict[tuple[str, int], list[tuple[Mapping[str, Any], Mapping[str, Any]]]] = {}
+    for (task, graph_id, layer), row in lookup.items():
+        following = lookup.get((task, graph_id, layer + 1))
+        if following is not None and np.isfinite(float(row["semantic_vnode_share"])):
+            groups.setdefault((task, layer), []).append((row, following))
+    output: list[dict[str, Any]] = []
+    for (task, layer), pairs in sorted(groups.items()):
+        source = [float(left["semantic_vnode_share"]) for left, _ in pairs]
+        for outcome in (
+            "semantic_expected_distance",
+            "structural_expected_distance",
+            "structural_excess_width",
+        ):
+            count, rho = _spearman(source, [float(right[outcome]) for _, right in pairs])
+            output.append(
+                {
+                    "task": task,
+                    "source_layer": layer,
+                    "target_layer": layer + 1,
+                    "outcome": outcome,
+                    "graphs": count,
+                    "spearman_rho": rho,
+                }
+            )
+    return output
+
+
+def molecular_scale_relationships(
+    rows: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Measure whether graph size or diameter predicts VN use and spatial breadth."""
+
+    groups: dict[tuple[str, int], list[Mapping[str, Any]]] = {}
+    for row in rows:
+        groups.setdefault((str(row["task"]), int(row["layer"])), []).append(row)
+    output: list[dict[str, Any]] = []
+    for (task, layer), group in sorted(groups.items()):
+        for scale in ("num_nodes", "diameter"):
+            left = [float(row[scale]) for row in group]
+            for outcome in (
+                "semantic_vnode_share",
+                "structural_vnode_share",
+                "semantic_expected_distance",
+                "structural_expected_distance",
+                "structural_excess_width",
+            ):
+                count, rho = _spearman(left, [float(row[outcome]) for row in group])
+                if count:
+                    output.append(
+                        {
+                            "task": task,
+                            "layer": layer,
+                            "scale": scale,
+                            "outcome": outcome,
+                            "graphs": count,
+                            "spearman_rho": rho,
+                        }
+                    )
     return output
 
 
@@ -1530,6 +1853,249 @@ def _plot_width_difference(
     return paths
 
 
+def _plot_width_contributions(
+    rows: Sequence[Mapping[str, Any]], tasks: Sequence[str], figures_dir: Path
+) -> list[Path]:
+    import matplotlib.pyplot as plt
+
+    selected_rows = [row for row in rows if str(row["weighting"]) == "J_weighted"]
+    tasks = [task for task in tasks if any(str(row["task"]) == task for row in selected_rows)]
+    if not selected_rows or not tasks:
+        return []
+    labels = _distance_groups(selected_rows)
+    values = np.asarray(
+        [
+            abs(float(row["structural_minus_semantic_width_contribution"]))
+            for row in selected_rows
+            if np.isfinite(float(row["structural_minus_semantic_width_contribution"]))
+        ]
+    )
+    upper = max(float(np.max(values)), 1.0e-12)
+    figure, axes = plt.subplots(
+        1,
+        len(tasks),
+        figsize=(3.25 * len(tasks), 4.2),
+        squeeze=False,
+        sharey=True,
+        constrained_layout=True,
+    )
+    image = None
+    for column, task in enumerate(tasks):
+        axis = axes[0, column]
+        task_rows = [row for row in selected_rows if str(row["task"]) == task]
+        layers = sorted({int(row["layer"]) for row in task_rows})
+        lookup = {
+            (int(row["layer"]), str(row["distance_group"])): float(
+                row["structural_minus_semantic_width_contribution"]
+            )
+            for row in task_rows
+        }
+        matrix = np.full((len(layers), len(labels)), np.nan)
+        for layer_index, layer in enumerate(layers):
+            for distance_index, label in enumerate(labels):
+                matrix[layer_index, distance_index] = lookup.get((layer, label), np.nan)
+        image = axis.imshow(
+            matrix,
+            aspect="auto",
+            interpolation="nearest",
+            cmap="coolwarm",
+            vmin=-upper,
+            vmax=upper,
+        )
+        axis.set_xticks(np.arange(len(labels)), labels)
+        axis.set_yticks(np.arange(len(layers)), layers)
+        axis.set_xlabel("distance")
+        axis.set_title(_task_label(task), fontsize=10)
+        if column == 0:
+            axis.set_ylabel("layer")
+    if image is not None:
+        figure.colorbar(
+            image,
+            ax=axes,
+            fraction=0.018,
+            pad=0.012,
+            label="structural − semantic width contribution",
+        )
+    figure.suptitle("Where does structural spatial width arise? (J-weighted heads)")
+    paths = _save_figure(figure, figures_dir, "13_width_excess_by_distance")
+    plt.close(figure)
+    return paths
+
+
+def _plot_width_by_head_role(
+    rows: Sequence[Mapping[str, Any]], tasks: Sequence[str], figures_dir: Path
+) -> list[Path]:
+    import matplotlib.pyplot as plt
+
+    tasks = [task for task in tasks if any(str(row["task"]) == task for row in rows)]
+    if not rows or not tasks:
+        return []
+    order = (
+        "all_active",
+        "semantic_leaning",
+        "structural_leaning",
+        "central_responsive",
+        "other",
+        "inactive",
+    )
+    labels = {
+        "all_active": "all active",
+        "semantic_leaning": "semantic",
+        "structural_leaning": "structural",
+        "central_responsive": "generalist",
+        "other": "other",
+        "inactive": "inactive",
+    }
+    figure, axes = plt.subplots(
+        1,
+        len(tasks),
+        figsize=(3.45 * len(tasks), 4.25),
+        squeeze=False,
+        sharey=True,
+        constrained_layout=True,
+    )
+    for column, task in enumerate(tasks):
+        axis = axes[0, column]
+        task_rows = {str(row["family"]): row for row in rows if str(row["task"]) == task}
+        present = [family for family in order if family in task_rows]
+        x = np.arange(len(present))
+        axis.axhline(0.0, color="#777777", linestyle="--", linewidth=0.8)
+        axis.scatter(
+            x,
+            [float(task_rows[family]["structural_excess_mean"]) for family in present],
+            color="#777777",
+            marker="o",
+            label="equal head",
+        )
+        axis.scatter(
+            x,
+            [float(task_rows[family]["structural_excess_J_weighted"]) for family in present],
+            color="#7A5195",
+            marker="s",
+            label="J weighted",
+        )
+        axis.set_xticks(x, [labels[family] for family in present], rotation=38, ha="right")
+        axis.set_title(_task_label(task), fontsize=10)
+        if column == 0:
+            axis.set_ylabel("structural − semantic variance (hops²)")
+            axis.legend(frameon=False, fontsize=8)
+    figure.suptitle("Which head roles produce structural spatial width?")
+    paths = _save_figure(figure, figures_dir, "14_width_excess_by_head_role")
+    plt.close(figure)
+    return paths
+
+
+def _plot_vnode_cross_layer(
+    rows: Sequence[Mapping[str, Any]], tasks: Sequence[str], figures_dir: Path
+) -> list[Path]:
+    import matplotlib.pyplot as plt
+
+    tasks = [task for task in tasks if any(str(row["task"]) == task for row in rows)]
+    if not rows or not tasks:
+        return []
+    styles = {
+        "semantic_expected_distance": ("#0072B2", "o", "next-layer semantic reach"),
+        "structural_expected_distance": ("#D55E00", "s", "next-layer structural reach"),
+        "structural_excess_width": ("#7A5195", "^", "next-layer width excess"),
+    }
+    figure, axes = plt.subplots(
+        1,
+        len(tasks),
+        figsize=(4.1 * len(tasks), 4.0),
+        squeeze=False,
+        sharey=True,
+        constrained_layout=True,
+    )
+    for column, task in enumerate(tasks):
+        axis = axes[0, column]
+        for outcome, (colour, marker, label) in styles.items():
+            selected = sorted(
+                [
+                    row
+                    for row in rows
+                    if str(row["task"]) == task and str(row["outcome"]) == outcome
+                ],
+                key=lambda row: int(row["source_layer"]),
+            )
+            axis.plot(
+                [int(row["source_layer"]) for row in selected],
+                [float(row["spearman_rho"]) for row in selected],
+                color=colour,
+                marker=marker,
+                linewidth=1.5,
+                label=label,
+            )
+        axis.axhline(0.0, color="#777777", linestyle="--", linewidth=0.8)
+        axis.set_ylim(-1.02, 1.02)
+        axis.set_xlabel("VN source layer")
+        axis.set_title(_task_label(task), fontsize=10)
+        if column == 0:
+            axis.set_ylabel("graphwise Spearman correlation")
+            axis.legend(frameon=False, fontsize=8)
+    figure.suptitle("Does semantic VN allocation predict next-layer organisation?")
+    paths = _save_figure(figure, figures_dir, "15_vnode_cross_layer_relationships")
+    plt.close(figure)
+    return paths
+
+
+def _plot_scale_relationship(
+    rows: Sequence[Mapping[str, Any]],
+    tasks: Sequence[str],
+    figures_dir: Path,
+    *,
+    outcome: str,
+    title: str,
+    stem: str,
+) -> list[Path]:
+    import matplotlib.pyplot as plt
+
+    selected_rows = [row for row in rows if str(row["outcome"]) == outcome]
+    tasks = [task for task in tasks if any(str(row["task"]) == task for row in selected_rows)]
+    if not selected_rows or not tasks:
+        return []
+    figure, axes = plt.subplots(
+        1,
+        len(tasks),
+        figsize=(3.25 * len(tasks), 4.0),
+        squeeze=False,
+        sharey=True,
+        constrained_layout=True,
+    )
+    for column, task in enumerate(tasks):
+        axis = axes[0, column]
+        for scale, colour, marker, label in (
+            ("num_nodes", "#0072B2", "o", "number of atoms"),
+            ("diameter", "#D55E00", "s", "molecular diameter"),
+        ):
+            selected = sorted(
+                [
+                    row
+                    for row in selected_rows
+                    if str(row["task"]) == task and str(row["scale"]) == scale
+                ],
+                key=lambda row: int(row["layer"]),
+            )
+            axis.plot(
+                [int(row["layer"]) for row in selected],
+                [float(row["spearman_rho"]) for row in selected],
+                color=colour,
+                marker=marker,
+                linewidth=1.5,
+                label=label,
+            )
+        axis.axhline(0.0, color="#777777", linestyle="--", linewidth=0.8)
+        axis.set_ylim(-1.02, 1.02)
+        axis.set_xlabel("layer")
+        axis.set_title(_task_label(task), fontsize=10)
+        if column == 0:
+            axis.set_ylabel("graphwise Spearman correlation")
+            axis.legend(frameon=False, fontsize=8)
+    figure.suptitle(title)
+    paths = _save_figure(figure, figures_dir, stem)
+    plt.close(figure)
+    return paths
+
+
 def _plot_score_carriage(
     profile_rows: Sequence[Mapping[str, Any]], tasks: Sequence[str], figures_dir: Path
 ) -> list[Path]:
@@ -1626,6 +2192,11 @@ def run(
     distance_rows = layer_distance_profiles(models)
     vnode_rows = vnode_layer_profiles(models)
     width_bootstrap_rows = spatial_width_bootstrap(models)
+    width_contribution_rows = width_contribution_profiles(models)
+    width_role_rows = width_by_head_role(head_rows)
+    graph_rows = graph_spatial_metrics(models)
+    vnode_cross_layer_rows = vnode_cross_layer_relationships(graph_rows)
+    scale_rows = molecular_scale_relationships(graph_rows)
     tables = {
         "head_spatial_metrics.csv": head_rows,
         "layer_spatial_summary.csv": layer_rows,
@@ -1635,6 +2206,11 @@ def run(
         "layer_distance_profiles.csv": distance_rows,
         "vnode_layer_allocation.csv": vnode_rows,
         "spatial_width_graph_bootstrap.csv": width_bootstrap_rows,
+        "width_contributions_by_distance.csv": width_contribution_rows,
+        "width_by_head_role.csv": width_role_rows,
+        "graph_spatial_metrics.csv": graph_rows,
+        "vnode_cross_layer_relationships.csv": vnode_cross_layer_rows,
+        "molecular_scale_relationships.csv": scale_rows,
     }
     for name, rows in tables.items():
         _write_csv(output_dir / name, rows)
@@ -1668,6 +2244,29 @@ def run(
     )
     figures.extend(_plot_vnode_allocation(vnode_rows, available_tasks, figures_dir))
     figures.extend(_plot_width_difference(width_bootstrap_rows, available_tasks, figures_dir))
+    figures.extend(_plot_width_contributions(width_contribution_rows, available_tasks, figures_dir))
+    figures.extend(_plot_width_by_head_role(width_role_rows, available_tasks, figures_dir))
+    figures.extend(_plot_vnode_cross_layer(vnode_cross_layer_rows, available_tasks, figures_dir))
+    figures.extend(
+        _plot_scale_relationship(
+            scale_rows,
+            available_tasks,
+            figures_dir,
+            outcome="structural_excess_width",
+            title="Does molecular scale predict structural spatial width?",
+            stem="16_scale_and_structural_width",
+        )
+    )
+    figures.extend(
+        _plot_scale_relationship(
+            scale_rows,
+            available_tasks,
+            figures_dir,
+            outcome="semantic_vnode_share",
+            title="Does molecular scale predict semantic VN allocation?",
+            stem="17_scale_and_vnode_allocation",
+        )
+    )
     summary = {
         "analysis_version": ANALYSIS_VERSION,
         "tasks_requested": list(tasks),
@@ -1699,8 +2298,12 @@ def run(
             "spatial_width": "variance of normalized molecular score mass over graph distance",
             "uncertainty": "standard error of expected distance across cached held-out graphs",
             "width_interval": "paired graph-bootstrap interval; heads remain fixed",
+            "width_contribution": "per-distance contribution to molecular profile variance around each head's own expected distance",
+            "head_weighting": "equal-head and joint-sensitivity-weighted summaries are reported separately",
             "opportunity_correction": "score mass per available source-carrier opportunity in each distance shell",
             "virtual_node": "reported separately because it has no molecular graph distance",
+            "cross_layer": "graphwise association between semantic VN allocation at layer l and molecular organisation at layer l+1",
+            "molecular_scale": "graphwise Spearman association with cached carrier count and molecular diameter",
             "attention": "clean attention mass by graph distance, not a causal score",
             "carriage": "final-state response under the same intervention family, not task necessity",
         },
@@ -1718,21 +2321,31 @@ def run(
         "distance_rows": distance_rows,
         "vnode_rows": vnode_rows,
         "width_bootstrap_rows": width_bootstrap_rows,
+        "width_contribution_rows": width_contribution_rows,
+        "width_role_rows": width_role_rows,
+        "graph_rows": graph_rows,
+        "vnode_cross_layer_rows": vnode_cross_layer_rows,
+        "scale_rows": scale_rows,
     }
 
 
 __all__ = [
     "ANALYSIS_VERSION",
     "SpatialModel",
+    "graph_spatial_metrics",
     "head_metrics",
     "inventory",
     "layer_distance_profiles",
     "layer_summary",
     "load_models",
     "model_profiles",
+    "molecular_scale_relationships",
     "representative_heads",
     "run",
     "spatial_width_bootstrap",
     "uncertainty_profiles",
+    "vnode_cross_layer_relationships",
     "vnode_layer_profiles",
+    "width_by_head_role",
+    "width_contribution_profiles",
 ]
