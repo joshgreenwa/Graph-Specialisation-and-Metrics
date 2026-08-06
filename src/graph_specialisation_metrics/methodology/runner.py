@@ -81,6 +81,10 @@ from .figures import (
     specialist_causal_panels,
     strong_specialist_map,
 )
+from .graphbench_population_figures import (
+    FOCUSED_GRAPHBENCH_TASK,
+    render_graphbench_population_figures,
+)
 from .protocol import (
     CHANNELS,
     PROTOCOL_VERSION,
@@ -4380,6 +4384,21 @@ def _write_run_summaries(
                 pair_record["population_interval"] = None
             focused_population[pair_set] = pair_record
         task_population["focused_specialist_validation"] = focused_population
+        if (
+            task_name == FOCUSED_GRAPHBENCH_TASK
+            and "figures" in config.phases
+            and all(value.get("scores") is not None for value in task_results)
+            and all(value.get("causal") is not None for value in task_results)
+        ):
+            # Keep the general score/selectivity/ablation triptych and add the
+            # GraphBench-specific causal population suite alongside it.
+            task_population.setdefault("figures", {}).update(
+                render_graphbench_population_figures(
+                    config,
+                    task_name,
+                    task_results,
+                )
+            )
         path = config.root / task_name / "population.json"
         atomic_json(path, task_population)
         population[task_name] = {"path": str(path), **task_population}
@@ -4616,16 +4635,27 @@ def finalize_cached_run(config: MethodologyConfig) -> dict[str, Any]:
                 )
             audit_record = json.loads(audit_path.read_text(encoding="utf-8"))
             findings = list(audit_record.get("findings", ()))
-            figures = (
-                _load_complete_figure_manifest(output_dir)
-                if config.resume and not config.force
-                else None
-            )
-            if figures is None:
-                log(f"[finalize] rendering {key}")
-                figures = render_cached_figures(config, task_name, int(train_seed))
+            if task_name == FOCUSED_GRAPHBENCH_TASK:
+                # This focused four-seed task is summarized by the population
+                # renderer below.  Avoid regenerating four superseded per-seed
+                # suites during a CPU-only cached figures pass.
+                figures = {}
+                log(f"[finalize] collecting population inputs for {key}")
             else:
-                log(f"[finalize] reusing complete figures for {key}")
+                figures = (
+                    _load_complete_figure_manifest(output_dir)
+                    if config.resume and not config.force
+                    else None
+                )
+                if figures is None:
+                    log(f"[finalize] rendering {key}")
+                    figures = render_cached_figures(
+                        config,
+                        task_name,
+                        int(train_seed),
+                    )
+                else:
+                    log(f"[finalize] reusing complete figures for {key}")
             results[key] = {
                 "task": task_name,
                 "seed": int(train_seed),

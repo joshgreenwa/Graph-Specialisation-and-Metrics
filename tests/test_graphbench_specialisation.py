@@ -56,6 +56,12 @@ from graph_specialisation_metrics.methodology.graphbench_pe_refinement import (
     structural_pair_manifest,
     validate_causal_recovery_prerequisites,
 )
+from graph_specialisation_metrics.methodology.graphbench_population_figures import (
+    _plot_absolute_patching,
+    _theme,
+    build_graphbench_population_figure_data,
+    render_graphbench_population_figures,
+)
 from graph_specialisation_metrics.methodology.protocol import BootstrapPolicy
 from graph_specialisation_metrics.methodology.protocol import (
     MethodologyConfig,
@@ -1862,12 +1868,21 @@ def test_model_free_finalizer_owns_shared_four_seed_summaries(
                     "structural": {"raw": np.full((1, 2), seed + 2.0)},
                 },
                 "coordinates": SimpleNamespace(
+                    normalized_semantic=np.asarray([[1.2, 0.8]]),
+                    normalized_structural=np.asarray([[0.7, 1.3]]),
+                    joint_sensitivity=np.asarray([[0.95, 1.05]]),
                     selectivity=np.asarray([[0.1, -0.1]]),
                     active=np.asarray([[True, True]]),
                 ),
             }
         elif stage == "causal":
-            value = {"associations": {}}
+            value = {
+                "associations": {},
+                "clean_ablation": {
+                    "head_L0_H0": {"prediction_movement": 0.4 + 0.01 * seed},
+                    "head_L0_H1": {"prediction_movement": 0.3 + 0.01 * seed},
+                },
+            }
         else:
             value = {}
         return SimpleNamespace(
@@ -1893,15 +1908,28 @@ def test_model_free_finalizer_owns_shared_four_seed_summaries(
         "graph_specialisation_metrics.methodology.runner.render_cached_figures",
         lambda _config, task, seed: rendered.append((task, seed)) or {"ok": []},
     )
+    population_rendered = []
+    monkeypatch.setattr(
+        "graph_specialisation_metrics.methodology.runner.render_graphbench_population_figures",
+        lambda _config, task, values: population_rendered.append(
+            (task, tuple(value["seed"] for value in values))
+        )
+        or {"population": ["population.pdf"]},
+    )
 
     results = finalize_cached_run(config)
 
     assert len(results) == 8
-    assert len(rendered) == 7
-    assert (tasks[0], 0) not in rendered
-    assert results[f"{tasks[0]}:seed0"]["figures"]["complete"]
+    assert rendered == [(tasks[1], seed) for seed in config.train_seeds]
+    assert population_rendered == [(tasks[0], config.train_seeds)]
+    assert results[f"{tasks[0]}:seed0"]["figures"] == {}
     assert results[f"{tasks[0]}:seed0"]["carriage"] is None
-    assert len(json.loads((tmp_path / "index.json").read_text())["runs"]) == 8
+    index = json.loads((tmp_path / "index.json").read_text())
+    assert len(index["runs"]) == 8
+    assert index["population"][tasks[0]]["figures"]["population"]
+    assert index["population"][tasks[0]]["figures"][
+        "score_selectivity_clean_ablation_triptych"
+    ]
     for task in tasks:
         population = json.loads(
             (tmp_path / task / "population.json").read_text(encoding="utf-8")
@@ -1909,6 +1937,241 @@ def test_model_free_finalizer_owns_shared_four_seed_summaries(
         assert [row["seed"] for row in population["seed_estimates"]] == [0, 1, 2, 3]
         assert population["population_interval"]["level"] == "training seed"
 
+
+def test_matching_population_renderer_uses_all_seed_caches_and_writes_publication_figures(
+    tmp_path,
+):
+    task = "graphbench_bipartite_matching_hard"
+    config = MethodologyConfig(
+        output_dir=str(tmp_path),
+        tasks=(task,),
+        train_seeds=(0, 1, 2, 3),
+        phases=("figures",),
+        accelerator="cpu",
+        figure_overrides={"formats": ("pdf", "png"), "dpi": 72},
+    )
+    results = []
+    for seed in config.train_seeds:
+        raw_semantic = np.asarray(
+            [
+                [0.8 + 0.1 * seed, 0.4 + 0.05 * seed],
+                [0.7 + 0.03 * seed, 0.5 + 0.02 * seed],
+            ]
+        )
+        raw_structural = np.asarray(
+            [
+                [0.3 + 0.04 * seed, 0.9 + 0.08 * seed],
+                [0.6 + 0.02 * seed, 0.55 + 0.02 * seed],
+            ]
+        )
+        semantic_norm = raw_semantic / np.mean(raw_semantic)
+        structural_norm = raw_structural / np.mean(raw_structural)
+        joint = 0.5 * (semantic_norm + structural_norm)
+        selectivity = (semantic_norm - structural_norm) / (
+            semantic_norm + structural_norm
+        )
+        coordinates = SimpleNamespace(
+            raw_semantic=raw_semantic,
+            raw_structural=raw_structural,
+            joint_sensitivity=joint,
+            selectivity=selectivity,
+            active=joint >= config.families.activity_floor,
+        )
+        pair_values = np.zeros((1, 4, 5), dtype=np.float64)
+        pair_values[0, 0] = (0.7, 0.4, 0.5, 0.6, 0.4 + 0.01 * seed)
+        pair_values[0, 1] = (0.6, 0.5, 0.4, 0.5, 0.2 + 0.01 * seed)
+        pair_values[0, 2] = (0.8, 0.5, 0.4, 0.7, 0.6 + 0.01 * seed)
+        pair_values[0, 3] = (0.4, 0.3, 0.2, 0.5, 0.4 + 0.01 * seed)
+        interval = Interval(
+            estimate=pair_values,
+            low=pair_values - 0.05,
+            high=pair_values + 0.05,
+            replicates=2_000,
+            rng_seed=seed,
+            resampled_levels=("graph", "source", "donor"),
+        )
+        event_records = {}
+        for head_position, name in enumerate(
+            ("head_L0_H0", "head_L0_H1", "head_L1_H0", "head_L1_H1")
+        ):
+            event_records[name] = {}
+            for channel_position, channel in enumerate(("semantic", "structural")):
+                event_records[name][channel] = [
+                    {
+                        "graph": graph,
+                        "source": 0,
+                        "donor": 0,
+                        "R_align": (
+                            0.2
+                            + 0.1 * head_position
+                            + 0.05 * channel_position
+                            + 0.01 * seed
+                            + 0.005 * graph
+                        ),
+                        "I_align": (
+                            0.1
+                            + 0.04 * head_position
+                            + 0.03 * channel_position
+                            + 0.01 * seed
+                            + 0.005 * graph
+                        ),
+                        "R_align_adjusted": (
+                            0.16
+                            + 0.08 * head_position
+                            + 0.04 * channel_position
+                            + 0.01 * seed
+                            + 0.005 * graph
+                        ),
+                        "I_align_adjusted": (
+                            0.08
+                            + 0.03 * head_position
+                            + 0.02 * channel_position
+                            + 0.01 * seed
+                            + 0.005 * graph
+                        ),
+                        "necessity": (
+                            0.04
+                            + 0.01 * head_position
+                            + 0.005 * channel_position
+                            + 0.002 * seed
+                        ),
+                        "event_effect": 0.4 + 0.01 * graph,
+                    }
+                    for graph in (0, 1)
+                ]
+        clean = {
+            "head_L0_H0": {"prediction_movement": 0.4 + 0.02 * seed},
+            "head_L0_H1": {"prediction_movement": 0.2 + 0.01 * seed},
+            "head_L1_H0": {"prediction_movement": 0.3 + 0.01 * seed},
+            "head_L1_H1": {"prediction_movement": 0.25 + 0.01 * seed},
+        }
+        results.append(
+            {
+                "task": task,
+                "seed": seed,
+                "scores": {"coordinates": coordinates},
+                "causal": {
+                    "event_records": event_records,
+                    "clean_ablation": clean,
+                    "associations": {
+                        "J_vs_clean_prediction_movement": {
+                            "pooled": {"rho": 0.3 + 0.05 * seed}
+                        }
+                    },
+                    "focused_specialists": {
+                        "status": "estimable",
+                        "pair_set_order": ("strongest_candidates",),
+                        "pair_sets": {
+                            "strongest_candidates": {
+                                "pair_count": 1,
+                                "pairs": (
+                                    {
+                                        "semantic": (0, 0),
+                                        "structural": (0, 1),
+                                    },
+                                ),
+                            }
+                        },
+                        "metric_order": (
+                            "restoration",
+                            "injection",
+                            "necessity_fraction",
+                            "gross_necessity_fraction",
+                        ),
+                        "cell_order": (
+                            "semantic_candidate_on_semantic",
+                            "semantic_candidate_on_structural",
+                            "structural_candidate_on_semantic",
+                            "structural_candidate_on_structural",
+                            "double_difference",
+                        ),
+                        "interval": interval,
+                    },
+                },
+            }
+        )
+
+    population = build_graphbench_population_figure_data(config, results)
+    assert population["seeds"].tolist() == [0, 1, 2, 3]
+    assert population["absolute_patching"]["values"].shape == (4, 2, 2, 2)
+    assert np.isclose(population["absolute_patching"]["values"][0, 0, 0, 0], 0.1625)
+    assert population["preferential_mediation"]["values"].shape == (4, 2)
+    assert population["necessity"]["values"].shape == (4, 3, 2)
+    assert all(
+        len(record["heads"]) == 2
+        for record in population["necessity"]["null_matches"]
+    )
+    figure, axes = _plot_absolute_patching(population, _theme(config))
+    assert [axis.get_title() for axis in axes] == [
+        "Restoration",
+        "Injection",
+        "Role-specific necessity",
+    ]
+    assert all(
+        [tick.get_text() for tick in axis.get_xticklabels()]
+        == ["Semantic donor-swap", "Structural donor-swap"]
+        for axis in axes
+    )
+    assert axes[2].get_ylabel() == "Donor-swap effect removed (fraction)"
+    assert axes[0].get_ylabel() == "Aligned output effect"
+    legend = figure.legends[0]
+    assert all(
+        text.get_fontsize() == pytest.approx(_theme(config).font_size * 1.25)
+        for text in legend.get_texts()
+    )
+    assert legend.get_title().get_fontsize() == pytest.approx(8.5 * 1.25)
+    from matplotlib import pyplot as plt
+
+    plt.close(figure)
+    assert population["clean_ablation"]["rho_population"][
+        "included_seed_count"
+    ] == 4
+
+    population_dir = tmp_path / task / "population_figures"
+    population_dir.mkdir(parents=True)
+    obsolete = population_dir / "03_population_donor_necessity.pdf"
+    obsolete.write_text("obsolete", encoding="utf-8")
+    saved = render_graphbench_population_figures(config, task, results)
+    assert len(saved) == 5
+    assert "donor_necessity" not in saved
+    assert not obsolete.exists()
+    assert all(len(paths) == 2 for paths in saved.values())
+    assert all(Path(path).is_file() for paths in saved.values() for path in paths)
+    pdf_paths = [
+        Path(path)
+        for paths in saved.values()
+        for path in paths
+        if Path(path).suffix == ".pdf"
+    ]
+    assert len(pdf_paths) == 5
+    for pdf_path in pdf_paths:
+        pdf_bytes = pdf_path.read_bytes()
+        assert b"/Subtype /Type3" not in pdf_bytes
+        assert b"/CIDFontType2" in pdf_bytes
+        assert b"/FontFile2" in pdf_bytes
+    absolute_metadata = json.loads(
+        (population_dir / "01_population_restoration_injection.metadata.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert absolute_metadata["pdf_export"] == {
+        "compression": 9,
+        "embedded_font_program": "TrueType/CIDFontType2",
+        "font_type": 42,
+        "path_simplification": False,
+        "raster_fallback_dpi": 1200,
+        "vector_first": True,
+    }
+    manifest = json.loads(
+        (
+            tmp_path
+            / task
+            / "population_figures"
+            / "population_figures.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert manifest["seeds"] == [0, 1, 2, 3]
+    assert set(manifest["figures"]) == set(saved)
 
 def test_seed_worker_writes_no_shared_root_or_task_summaries(tmp_path, monkeypatch):
     task = "graphbench_bipartite_matching_hard"
