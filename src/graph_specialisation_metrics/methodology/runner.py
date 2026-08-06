@@ -2896,7 +2896,14 @@ def make_figures(
     scores: Mapping[str, Any],
     carriage: Mapping[str, Any] | None,
     causal: Mapping[str, Any] | None = None,
+    *,
+    source_protocol_fingerprint: str | None = None,
 ) -> dict[str, list[str]]:
+    render_protocol_fingerprint = (
+        str(source_protocol_fingerprint)
+        if source_protocol_fingerprint is not None
+        else config.fingerprint
+    )
     figure_values = config.figure_overrides
     if prepared.task.name in figure_values and isinstance(
         figure_values[prepared.task.name], Mapping
@@ -2910,7 +2917,7 @@ def make_figures(
         common_metadata={
             "protocol_version": PROTOCOL_VERSION,
             "repository_commit": _repository_commit(),
-            "protocol_fingerprint": config.fingerprint,
+            "protocol_fingerprint": render_protocol_fingerprint,
             "checkpoint_sha256": prepared.checkpoint_sha,
             "output_representation": prepared.task.output.representation,
             "sigma": prepared.sigma.tolist(),
@@ -3809,7 +3816,7 @@ def make_figures(
             common_metadata={
                 "protocol_version": PROTOCOL_VERSION,
                 "repository_commit": _repository_commit(),
-                "protocol_fingerprint": config.fingerprint,
+                "protocol_fingerprint": render_protocol_fingerprint,
                 "checkpoint_sha256": prepared.checkpoint_sha,
             },
         )
@@ -4432,6 +4439,8 @@ def render_cached_figures(
     config: MethodologyConfig,
     task_name: str,
     train_seed: int,
+    *,
+    source_protocol_fingerprint: str | None = None,
 ) -> dict[str, list[str]]:
     """Regenerate figures from CPU caches without loading a checkpoint or dataset."""
 
@@ -4476,7 +4485,14 @@ def render_cached_figures(
         donor_pool=None,
         progress=None,
     )
-    return make_figures(prepared, config, scores, carriage, causal)
+    return make_figures(
+        prepared,
+        config,
+        scores,
+        carriage,
+        causal,
+        source_protocol_fingerprint=source_protocol_fingerprint,
+    )
 
 
 def _load_complete_figure_manifest(
@@ -4530,6 +4546,7 @@ def finalize_cached_run(config: MethodologyConfig) -> dict[str, Any]:
     run_findings: dict[str, list[dict[str, Any]]] = {}
     artifact_commits: set[str] = set()
     artifact_fingerprints: dict[str, dict[str, str]] = {}
+    artifact_protocol_fingerprints: dict[str, str] = {}
     for task_name in config.tasks:
         for train_seed in config.seeds_for(task_name):
             key = f"{task_name}:seed{int(train_seed)}"
@@ -4558,6 +4575,7 @@ def finalize_cached_run(config: MethodologyConfig) -> dict[str, Any]:
                     f"missing {missing_paths}"
                 )
             artifact_fingerprints[key] = {}
+            cache_protocol_fingerprints: set[str] = set()
             for name, artifact in artifacts.items():
                 contract = artifact.metadata["contract"]
                 if contract.get("task") != task_name or int(
@@ -4566,14 +4584,30 @@ def finalize_cached_run(config: MethodologyConfig) -> dict[str, Any]:
                     raise RuntimeError(
                         f"{artifact.path} is not the registered {key} {name} cache"
                     )
-                if contract.get("protocol_fingerprint") != config.fingerprint:
+                protocol_fingerprint = str(
+                    contract.get("protocol_fingerprint", "")
+                )
+                if not protocol_fingerprint:
                     raise RuntimeError(
-                        f"{artifact.path} was produced under another scientific "
-                        "configuration; use the matching worker/finalizer arguments"
+                        f"{artifact.path} has no frozen protocol fingerprint"
                     )
+                cache_protocol_fingerprints.add(protocol_fingerprint)
                 artifact_commits.add(str(contract.get("repository_commit", "unknown")))
                 artifact_fingerprints[key][name] = str(
                     artifact.metadata["contract_fingerprint"]
+                )
+            if len(cache_protocol_fingerprints) != 1:
+                raise RuntimeError(
+                    f"{key} score, causal, and carriage caches were produced under "
+                    "different scientific configurations"
+                )
+            source_protocol_fingerprint = cache_protocol_fingerprints.pop()
+            artifact_protocol_fingerprints[key] = source_protocol_fingerprint
+            if source_protocol_fingerprint != config.fingerprint:
+                log(
+                    f"[finalize] {key} uses completed cache-bound protocol "
+                    f"{source_protocol_fingerprint}; the current launcher fingerprint "
+                    f"is {config.fingerprint}"
                 )
             audit_path = output_dir / "audits.json"
             if not audit_path.exists():
@@ -4604,7 +4638,12 @@ def finalize_cached_run(config: MethodologyConfig) -> dict[str, Any]:
                 )
                 if figures is None:
                     log(f"[finalize] rendering {key}")
-                    figures = render_cached_figures(config, task_name, int(train_seed))
+                    figures = render_cached_figures(
+                        config,
+                        task_name,
+                        int(train_seed),
+                        source_protocol_fingerprint=source_protocol_fingerprint,
+                    )
                 else:
                     log(f"[finalize] reusing complete figures for {key}")
             results[key] = {
@@ -4636,6 +4675,7 @@ def finalize_cached_run(config: MethodologyConfig) -> dict[str, Any]:
             ),
             "source_repository_commits": source_commits,
             "source_cache_contract_fingerprints": artifact_fingerprints,
+            "source_cache_protocol_fingerprints": artifact_protocol_fingerprints,
         }
     )
     atomic_json(config.root / "protocol.json", protocol_record)

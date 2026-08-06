@@ -21,8 +21,10 @@ OUTPUT_DIR = (
     "canonical_methodology_v4_zinc_qm9"
 )
 
-# Keep this complete task tuple: it is part of the existing cache contract.
-TASKS = ("zinc", "qm9_gap_dense", "peptides_func", "peptides_struct")
+# The figures-only finalizer binds each task to its completed cache contract.
+TASKS = ("zinc", "qm9_gap_dense")
+# Full new canonical experiment (not needed for this cache-only paper redraw):
+# TASKS = ("zinc", "qm9_gap_dense", "peptides_func", "peptides_struct")
 # Receptive-field control suite (uncomment instead when building missing score caches):
 # TASKS = (
 #     "zinc_1hop",

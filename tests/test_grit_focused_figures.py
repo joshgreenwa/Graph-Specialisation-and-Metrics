@@ -2249,6 +2249,7 @@ def test_canonical_colab_frontend_clones_the_methodology_api_branch():
     source = frontend_path.read_text(encoding="utf-8")
     ast.parse(source, filename=str(frontend_path))
     assert 'BRANCH = "expansion/graphormer_specialisation"' in source
+    assert 'TASKS = ("zinc", "qm9_gap_dense")' in source
     assert 'PHASES = ("figures",)' in source
     assert 'ACCELERATOR = "cpu" if PHASES == ("figures",)' in source
     assert "accelerator=ACCELERATOR" in source

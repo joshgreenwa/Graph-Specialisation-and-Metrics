@@ -22,11 +22,13 @@ as provenance rather than used as cache-validity keys. If a file genuinely belon
 scientific contract or is unreadable, the runner preserves it under `cache/_stale/` and recomputes
 that miss; read-only downstream artifact loaders continue to reject incompatible inputs.
 
-The launcher keeps the dense `zinc`, `qm9_gap_dense`, `peptides_func`, and
-`peptides_struct` task tuple because it is part of the completed cache contract. It now defaults
-to `PHASES = ("figures",)`, which dispatches the model-free CPU cache finalizer: it does not
-install GRIT, load a checkpoint or dataset, or recompute scores, interventions, or bootstraps.
-Restore the full phase tuple only for a genuinely new canonical experiment.
+The launcher selects the dense `zinc` and `qm9_gap_dense` caches and defaults to
+`PHASES = ("figures",)`, which dispatches the model-free CPU cache finalizer. Figures-only
+finalization uses the scientific fingerprint frozen inside each task's mutually consistent score,
+causal, and optional carriage artifacts; it does not require a newly reconstructed launcher
+fingerprint to be identical. It does not install GRIT, load a checkpoint or dataset, or recompute
+scores, interventions, or bootstraps. Restore the full task and phase tuples only for a genuinely
+new canonical experiment.
 
 ## ZINC and QM9 causal paper figures
 

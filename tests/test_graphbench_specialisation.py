@@ -2034,6 +2034,7 @@ def test_model_free_finalizer_owns_shared_four_seed_summaries(
     tmp_path,
     monkeypatch,
 ):
+    source_protocol_fingerprint = "completed-worker-protocol"
     tasks = (
         "graphbench_bipartite_matching_hard",
         "graphbench_flow_hard",
@@ -2091,7 +2092,7 @@ def test_model_free_finalizer_owns_shared_four_seed_summaries(
                 "contract": {
                     "task": task,
                     "train_seed": seed,
-                    "protocol_fingerprint": config.fingerprint,
+                    "protocol_fingerprint": source_protocol_fingerprint,
                     "repository_commit": "worker-commit",
                 },
                 "contract_fingerprint": f"{task}:{seed}:{stage}",
@@ -2106,7 +2107,10 @@ def test_model_free_finalizer_owns_shared_four_seed_summaries(
     )
     monkeypatch.setattr(
         "graph_specialisation_metrics.methodology.runner.render_cached_figures",
-        lambda _config, task, seed: rendered.append((task, seed)) or {"ok": []},
+        lambda _config, task, seed, *, source_protocol_fingerprint: rendered.append(
+            (task, seed, source_protocol_fingerprint)
+        )
+        or {"ok": []},
     )
     population_rendered = []
     monkeypatch.setattr(
@@ -2120,13 +2124,20 @@ def test_model_free_finalizer_owns_shared_four_seed_summaries(
     results = finalize_cached_run(config)
 
     assert len(results) == 8
-    assert rendered == [(tasks[1], seed) for seed in config.train_seeds]
+    assert rendered == [
+        (tasks[1], seed, source_protocol_fingerprint)
+        for seed in config.train_seeds
+    ]
     assert population_rendered == [(tasks[0], config.train_seeds)]
     assert results[f"{tasks[0]}:seed0"]["figures"] == {}
     assert results[f"{tasks[0]}:seed0"]["carriage"] is None
     index = json.loads((tmp_path / "index.json").read_text())
     assert len(index["runs"]) == 8
     assert index["population"][tasks[0]]["figures"]["population"]
+    protocol = json.loads((tmp_path / "protocol.json").read_text())
+    assert set(protocol["source_cache_protocol_fingerprints"].values()) == {
+        source_protocol_fingerprint
+    }
     for task in tasks:
         population = json.loads(
             (tmp_path / task / "population.json").read_text(encoding="utf-8")
