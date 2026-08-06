@@ -185,6 +185,7 @@ def _qm9_hooks(
     hops: int = 1,
     *,
     global_vnode: bool = False,
+    rrwp_horizon: int = -1,
 ):
     """Deferred checkpoint-compatible reconstruction hook for a QM9 gap model."""
     from . import qm9_env
@@ -194,6 +195,7 @@ def _qm9_hooks(
             attention=attention,
             hops=hops,
             global_vnode=global_vnode,
+            rrwp_horizon=rrwp_horizon,
         ),
     )
 
@@ -218,9 +220,9 @@ register(GritTaskSpec(
 
 
 # ---------------------------------------------------------------------------------------
-# QM9 HOMO-LUMO gap controls, reconstructed by the packaged training-compatible patch. Both models
-# use the identical target/features/split contract and differ only in attention support.
-# The training runs deliberately share one PyG QM9 cache outside either results directory.
+# QM9 HOMO-LUMO gap controls, reconstructed by the packaged training-compatible patch. All models
+# use the identical target/features/split contract and differ only in attention support, RRWP
+# horizon, and/or the optional VNode. The training runs deliberately share one PyG QM9 cache.
 # ---------------------------------------------------------------------------------------
 
 register(GritTaskSpec(
@@ -261,6 +263,46 @@ register(GritTaskSpec(
 
 
 register(GritTaskSpec(
+    name="qm9_gap_1hop_local",
+    title="GRIT+RRWP QM9 HOMO-LUMO gap (1-hop masked, local-only RRWP)",
+    config_path="configs/GRIT/qm9-gap-GRIT-RRWP.yaml",
+    expected_params=472_769,
+    drive_dir="/content/drive/MyDrive/grit_qm9_gap_1hop_localrrwp",
+    dataset_dir="/content/drive/MyDrive/grit_qm9_gap_data",
+    paper_metric=None,
+    metric_name="MAE (eV)",
+    metric_fn=staticmethod(metrics.mae_metric),
+    metric_higher_better=False,
+    metric_abort=0.5,
+    env_hooks=_qm9_hooks(
+        attention="khop",
+        hops=1,
+        rrwp_horizon=1,
+    ),
+    grit_repo_dir="/content/GRIT_qm9_gap_1hop_local",
+    node_content_desc="atomic number",
+))
+
+
+register(GritTaskSpec(
+    name="qm9_gap_2hop",
+    title="GRIT+RRWP QM9 HOMO-LUMO gap (2-hop masked)",
+    config_path="configs/GRIT/qm9-gap-GRIT-RRWP.yaml",
+    expected_params=472_769,
+    drive_dir="/content/drive/MyDrive/grit_qm9_gap_2hop",
+    dataset_dir="/content/drive/MyDrive/grit_qm9_gap_data",
+    paper_metric=None,
+    metric_name="MAE (eV)",
+    metric_fn=staticmethod(metrics.mae_metric),
+    metric_higher_better=False,
+    metric_abort=0.5,
+    env_hooks=_qm9_hooks(attention="khop", hops=2),
+    grit_repo_dir="/content/GRIT_qm9_gap_2hop",
+    node_content_desc="atomic number",
+))
+
+
+register(GritTaskSpec(
     name="qm9_gap_1hop_vnode",
     title="GRIT+RRWP QM9 HOMO-LUMO gap (1-hop masked + global VNode)",
     config_path="configs/GRIT/qm9-gap-GRIT-RRWP.yaml",
@@ -278,6 +320,28 @@ register(GritTaskSpec(
         global_vnode=True,
     ),
     grit_repo_dir="/content/GRIT_qm9_gap_1hop_vnode",
+    node_content_desc="atomic number",
+))
+
+
+register(GritTaskSpec(
+    name="qm9_gap_2hop_vnode",
+    title="GRIT+RRWP QM9 HOMO-LUMO gap (2-hop masked + global VNode)",
+    config_path="configs/GRIT/qm9-gap-GRIT-RRWP.yaml",
+    expected_params=472_833,
+    drive_dir="/content/drive/MyDrive/grit_qm9_gap_2hop_vnode",
+    dataset_dir="/content/drive/MyDrive/grit_qm9_gap_data",
+    paper_metric=None,
+    metric_name="MAE (eV)",
+    metric_fn=staticmethod(metrics.mae_metric),
+    metric_higher_better=False,
+    metric_abort=0.5,
+    env_hooks=_qm9_hooks(
+        attention="khop",
+        hops=2,
+        global_vnode=True,
+    ),
+    grit_repo_dir="/content/GRIT_qm9_gap_2hop_vnode",
     node_content_desc="atomic number",
 ))
 

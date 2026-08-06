@@ -1,9 +1,9 @@
 """QM9 gap GRIT environment hooks: replay the checkpoint-compatible training patch.
 
-The dense and 1-hop checkpoints were produced with a training patch that modifies the pinned
-official GRIT checkout with
-the QM9 loader (target column 4 in eV, atomic-number node content, categorical bonds and
-the seeded 110000/10000/remainder split) plus dense/configurable-k-hop attention support.
+The dense, k-hop, local-RRWP, and VNode checkpoints were produced with a training patch that
+modifies the pinned official GRIT checkout with the QM9 loader (target column 4 in eV,
+atomic-number node content, categorical bonds and the seeded 110000/10000/remainder split) plus
+dense/configurable-k-hop attention support.
 
 Analysis must replay that patch before importing GRIT. Reusing the training function avoids a
 second loader/model reconstruction. Its one-hop encoder has one parameter-neutral analysis
@@ -36,12 +36,15 @@ def make_qm9_hook(
     hops: int = 1,
     *,
     global_vnode: bool = False,
+    rrwp_horizon: int = -1,
 ) -> Callable[[Path], None]:
     """Return a hook reconstructing either dense or exact ``<=k``-hop QM9 GRIT."""
     if attention not in {"dense", "khop"}:
         raise ValueError(f"attention must be 'dense' or 'khop', got {attention!r}")
     if not 1 <= int(hops) <= 20:
         raise ValueError("hops must be in [1, 20] for the RRWP-21 QM9 configuration")
+    if not -1 <= int(rrwp_horizon) <= 20:
+        raise ValueError("rrwp_horizon must be -1 or in [0, 20]")
 
     def hook(repo_dir: Path) -> None:
         apply_qm9_patch, verify_qm9_model_patch = _import_qm9_patch()
@@ -49,9 +52,11 @@ def make_qm9_hook(
             attention=str(attention),
             hops=int(hops),
             global_vnode=bool(global_vnode),
+            rrwp_horizon=int(rrwp_horizon),
             batch_size=128,
             epochs=300,
             warmup_epochs=10,
+            wandb_project=None,
             # The training runner's provenance note calls expected_param_count(args).
             expected_params=None,
         )
@@ -62,6 +67,8 @@ def make_qm9_hook(
         variant = "dense" if attention == "dense" else f"{int(hops)}-hop"
         if global_vnode:
             variant += "+VNode"
+        if rrwp_horizon >= 0:
+            variant += f"+local-RRWP-h{int(rrwp_horizon)}"
         log(
             f"[qm9] applied checkpoint-compatible QM9-gap {variant} patch "
             "(target=column 4 eV; split=110000/10000/remainder, seed=42)."

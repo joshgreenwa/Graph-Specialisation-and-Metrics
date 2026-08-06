@@ -789,12 +789,23 @@ def test_registered_grit_geometry_covers_dense_local_khop_and_vnode():
         "zinc_2hop",
         "zinc_1hop_vnode",
         "zinc_2hop_vnode",
+        "qm9_gap_dense",
+        "qm9_gap_1hop",
+        "qm9_gap_1hop_local",
+        "qm9_gap_2hop",
+        "qm9_gap_1hop_vnode",
+        "qm9_gap_2hop_vnode",
     }
     assert expected <= set(TASKS)
     assert not TASKS["zinc"].virtual_node
     assert not TASKS["zinc_2hop"].virtual_node
     assert TASKS["zinc_1hop_vnode"].virtual_node
     assert TASKS["zinc_2hop_vnode"].carrier_policy == (
+        "real_nodes_plus_internal_vnode"
+    )
+    assert not TASKS["qm9_gap_1hop_local"].virtual_node
+    assert TASKS["qm9_gap_1hop_vnode"].virtual_node
+    assert TASKS["qm9_gap_2hop_vnode"].carrier_policy == (
         "real_nodes_plus_internal_vnode"
     )
 
