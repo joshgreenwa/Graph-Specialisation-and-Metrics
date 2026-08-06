@@ -4435,6 +4435,43 @@ def run_methodology(
     return results
 
 
+def _cached_figure_geometry(
+    model_record: Mapping[str, Any],
+    scores: Mapping[str, Any],
+    *,
+    model_path: Path,
+) -> tuple[int, int]:
+    """Resolve figure geometry from scientific scores, checking optional metadata."""
+
+    coordinates = scores.get("coordinates")
+    joint = (
+        coordinates.get("joint_sensitivity")
+        if isinstance(coordinates, Mapping)
+        else getattr(coordinates, "joint_sensitivity", None)
+    )
+    joint_shape = np.asarray(joint).shape
+    if len(joint_shape) != 2 or min(joint_shape, default=0) < 1:
+        raise ValueError(
+            "figures-only score cache must contain a two-dimensional "
+            "coordinates.joint_sensitivity matrix"
+        )
+    inferred = (int(joint_shape[0]), int(joint_shape[1]))
+    geometry = model_record.get("model_geometry") or {}
+    if not geometry:
+        log(
+            f"[figures] {model_path} predates model_geometry; inferred "
+            f"layers={inferred[0]}, heads={inferred[1]} from the score cache"
+        )
+        return inferred
+    recorded = (int(geometry["layers"]), int(geometry["heads"]))
+    if recorded != inferred:
+        raise RuntimeError(
+            f"{model_path} geometry {recorded} disagrees with cached score "
+            f"geometry {inferred}"
+        )
+    return recorded
+
+
 def render_cached_figures(
     config: MethodologyConfig,
     task_name: str,
@@ -4452,11 +4489,6 @@ def render_cached_figures(
     if not model_path.exists():
         raise FileNotFoundError(f"figures-only pass requires {model_path}")
     model_record = json.loads(model_path.read_text(encoding="utf-8"))
-    geometry = model_record.get("model_geometry") or {}
-    if not geometry:
-        raise ValueError(
-            f"{model_path} has no model_geometry; rerun model preparation once"
-        )
 
     def consolidated(stage: str, name: str, *, required: bool):
         path = output_dir / "cache" / stage / f"{name}.pt"
@@ -4469,12 +4501,17 @@ def render_cached_figures(
     scores = consolidated("scores", "raw", required=True)
     carriage = consolidated("carriage", "fields", required=False)
     causal = consolidated("causal", "validation", required=False)
+    layers, heads = _cached_figure_geometry(
+        model_record,
+        scores,
+        model_path=model_path,
+    )
     prepared = PreparedTask(
         task=get_task(task_name),
         runtime=SimpleNamespace(
             sc=SimpleNamespace(seed=int(train_seed)),
-            L=int(geometry["layers"]),
-            H=int(geometry["heads"]),
+            L=layers,
+            H=heads,
         ),
         backend=None,
         output_dir=output_dir,

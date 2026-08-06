@@ -78,6 +78,7 @@ from graph_specialisation_metrics.methodology.protocol import (
 from graph_specialisation_metrics.methodology.runner import (
     PreparedTask,
     _cache,
+    _cached_figure_geometry,
     _event_rng,
     _load_complete_figure_manifest,
     _stage_plan,
@@ -2156,7 +2157,6 @@ def test_cached_figure_manifest_requires_new_paper_outputs(tmp_path):
         json.dumps({"old_figure": [str(old_figure)]}),
         encoding="utf-8",
     )
-
     assert _load_complete_figure_manifest(tmp_path) == {
         "old_figure": [str(old_figure)]
     }
@@ -2167,6 +2167,30 @@ def test_cached_figure_manifest_requires_new_paper_outputs(tmp_path):
         )
         is None
     )
+
+
+def test_cached_figure_geometry_is_inferred_when_legacy_model_record_omits_it(
+    tmp_path,
+):
+    model_path = tmp_path / "model.json"
+    scores = {
+        "coordinates": SimpleNamespace(
+            joint_sensitivity=np.ones((10, 8), dtype=np.float64)
+        )
+    }
+
+    assert _cached_figure_geometry({}, scores, model_path=model_path) == (10, 8)
+    assert _cached_figure_geometry(
+        {"model_geometry": {"layers": 10, "heads": 8}},
+        scores,
+        model_path=model_path,
+    ) == (10, 8)
+    with pytest.raises(RuntimeError, match="disagrees with cached score geometry"):
+        _cached_figure_geometry(
+            {"model_geometry": {"layers": 8, "heads": 10}},
+            scores,
+            model_path=model_path,
+        )
 
 
 def test_matching_population_renderer_uses_all_seed_caches_and_writes_publication_figures(
