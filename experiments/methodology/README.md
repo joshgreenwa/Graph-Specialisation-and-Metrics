@@ -22,8 +22,20 @@ as provenance rather than used as cache-validity keys. If a file genuinely belon
 scientific contract or is unreadable, the runner preserves it under `cache/_stale/` and recomputes
 that miss; read-only downstream artifact loaders continue to reject incompatible inputs.
 
-The initial production run is configured for the dense `zinc`, `qm9_gap_dense`,
-`peptides_func`, and `peptides_struct` registrations.
+The launcher keeps the dense `zinc`, `qm9_gap_dense`, `peptides_func`, and
+`peptides_struct` task tuple because it is part of the completed cache contract. It now defaults
+to `PHASES = ("figures",)`, which dispatches the model-free CPU cache finalizer: it does not
+install GRIT, load a checkpoint or dataset, or recompute scores, interventions, or bootstraps.
+Restore the full phase tuple only for a genuinely new canonical experiment.
+
+## ZINC and QM9 causal paper figures
+
+[`canonical_methodology_colab.py`](canonical_methodology_colab.py) is the ZINC/QM9 causal
+figure frontend. For each dense task, its figures-only pass reads the completed canonical
+`scores/raw.pt` and `causal/validation.pt` artifacts and writes two independent paper figures
+under `seed_42/figures/paper_causal`: `01_joint_sensitivity_head_ablation.pdf` and
+`02_causal_validation.pdf`. Their layout and typography come from the approved GraphBench
+population renderer. Existing figure manifests are regenerated if either paper output is absent.
 
 ## Focused PCQM4Mv2 causal analysis
 
@@ -40,9 +52,10 @@ to redraw solely from Drive caches without loading the checkpoint or PCQM4Mv2. T
 control, cache, and figure contracts are recorded in
 [`../../docs/graphormer_pcqm4mv2_causal_analysis_plan.md`](../../docs/graphormer_pcqm4mv2_causal_analysis_plan.md).
 
-After the requested ZINC and QM9 score caches have completed, run
+For the separate attention and routed-output supplement, run
 [`grit_zinc_qm9_figures_colab.ipynb`](grit_zinc_qm9_figures_colab.ipynb) for the focused
-cross-task figure suite. It reads each task's `seed_42/cache/scores/raw.pt` artifact
+cross-task figure suite. This notebook does not load causal-validation caches or render causal
+paper panels. It reads each task's `seed_42/cache/scores/raw.pt` artifact
 read-only, verifies the matching `model.json` and checkpoint before model-forward
 diagnostics, and writes task-separated supplemental caches and figure manifests. Dense, 1-hop,
 1-hop+local-RRWP, 2-hop, 1-hop+VN, and 2-hop+VN ZINC tasks are supported, as are dense, 1-hop, and 1-hop+VN QM9

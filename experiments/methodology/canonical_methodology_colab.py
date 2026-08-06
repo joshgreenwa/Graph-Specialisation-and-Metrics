@@ -21,7 +21,7 @@ OUTPUT_DIR = (
     "canonical_methodology_v4_zinc_qm9"
 )
 
-# First production run: all registered dense task families.
+# Keep this complete task tuple: it is part of the existing cache contract.
 TASKS = ("zinc", "qm9_gap_dense", "peptides_func", "peptides_struct")
 # Receptive-field control suite (uncomment instead when building missing score caches):
 # TASKS = (
@@ -39,7 +39,8 @@ TRAIN_SEEDS = (42,)
 # A public checkpoint has no training-seed ensemble; use a stable seed label for its cache.
 # Example: TASKS = ("graphormer_pcqm4mv2",)
 TASK_TRAIN_SEEDS = {"graphormer_pcqm4mv2": (0,)}
-PHASES = ("scores", "causal", "carriage", "figures")
+PHASES = ("figures",)  # CPU-only redraw from completed canonical caches.
+ACCELERATOR = "cpu" if PHASES == ("figures",) else "cuda:0"
 CHECKPOINTS = {}  # e.g. {"graphormer_zinc:42": "/content/drive/MyDrive/.../checkpoint.pt"}
 TASK_OVERRIDES = {
     # Optional PCQM cache location or Hugging Face cache/offline controls:
@@ -126,6 +127,7 @@ run(
     sizes=SIZES,
     families=FAMILIES,
     execution=EXECUTION,
+    accelerator=ACCELERATOR,
     output_dir=OUTPUT_DIR,
     mount=False,
 )

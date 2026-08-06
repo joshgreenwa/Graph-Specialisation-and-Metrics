@@ -2135,11 +2135,9 @@ def test_colab_notebook_has_valid_python_cells():
     assert "generalist {rank}" not in source
     assert "PNG_DPI = 600" in source
     assert "PDF_RASTER_DPI = 1200" in source
-    assert "PAPER_CAUSAL_ONLY = True" in source
-    assert 'PAPER_CAUSAL_TASKS = ("zinc", "qm9_gap_dense")' in source
-    assert "render_canonical_paper_causal_figures(" in source
-    assert 'cache/causal/validation.pt' in source
-    assert "Paper-only mode: supplemental GRIT runtime skipped." in source
+    assert "PAPER_CAUSAL_ONLY" not in source
+    assert "render_canonical_paper_causal_figures" not in source
+    assert 'cache/causal/validation.pt' not in source
     assert "del sys.modules[module_name]" in source
     assert "methodology_config_for_artifact(" in source
     assert (
@@ -2251,5 +2249,46 @@ def test_canonical_colab_frontend_clones_the_methodology_api_branch():
     source = frontend_path.read_text(encoding="utf-8")
     ast.parse(source, filename=str(frontend_path))
     assert 'BRANCH = "expansion/graphormer_specialisation"' in source
+    assert 'PHASES = ("figures",)' in source
+    assert 'ACCELERATOR = "cpu" if PHASES == ("figures",)' in source
+    assert "accelerator=ACCELERATOR" in source
     assert "families=FAMILIES" in source
     assert "output_dir=OUTPUT_DIR" in source
+
+
+def test_colab_figures_only_dispatches_to_model_free_finalizer(monkeypatch, tmp_path):
+    from graph_specialisation_metrics.methodology import colab as colab_module
+
+    monkeypatch.setattr(
+        colab_module.env,
+        "install_dependencies",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("figures-only rendering must not install GRIT dependencies")
+        ),
+    )
+    captured = {}
+
+    def finalize(config):
+        captured["config"] = config
+        return {"rendered": True}
+
+    monkeypatch.setattr(colab_module, "finalize_cached_run", finalize)
+    monkeypatch.setattr(
+        colab_module,
+        "run_methodology",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("figures-only rendering must not prepare a model")
+        ),
+    )
+
+    result = colab_module.run(
+        tasks=("zinc", "qm9_gap_dense"),
+        phases=("figures",),
+        output_dir=str(tmp_path),
+        accelerator="cpu",
+        mount=False,
+    )
+
+    assert result == {"rendered": True}
+    assert captured["config"].phases == ("figures",)
+    assert captured["config"].accelerator == "cpu"

@@ -13,7 +13,7 @@ from .protocol import (
     MethodologyConfig,
     RunSizes,
 )
-from .runner import run_methodology
+from .runner import finalize_cached_run, run_methodology
 from .tasks import get_task
 
 
@@ -67,8 +67,12 @@ def run(
         task_names = tuple(part.strip() for part in tasks.split(",") if part.strip())
     else:
         task_names = tuple(str(value) for value in tasks)
+    phase_names = tuple(str(value) for value in phases)
+    figures_only = phase_names == ("figures",)
     backend_kinds = {get_task(name).backend_kind for name in task_names}
-    if not skip_install:
+    if figures_only:
+        log("[deps] figures-only finalization requires no model dependencies")
+    elif not skip_install:
         if "grit" in backend_kinds:
             env.install_dependencies(pyg_version="2.2.0")
         if "graphormer" in backend_kinds:
@@ -103,7 +107,7 @@ def run(
             str(task): tuple(int(value) for value in seeds)
             for task, seeds in dict(task_train_seeds or {}).items()
         },
-        phases=tuple(str(value) for value in phases),
+        phases=phase_names,
         sizes=run_sizes,
         families=family_policy,
         execution=execution_policy,
@@ -117,4 +121,7 @@ def run(
         force=bool(force),
         strict_audits=bool(strict_audits),
     )
+    if figures_only:
+        log("[figures] using the model-free canonical cache finalizer")
+        return finalize_cached_run(config)
     return run_methodology(config, force_fresh_grit=force_fresh_grit)

@@ -81,6 +81,7 @@ from .graphbench_population_figures import (
     FOCUSED_GRAPHBENCH_TASK,
     render_graphbench_population_figures,
 )
+from .paper_causal_figures import render_canonical_paper_causal_figures
 from .protocol import (
     CHANNELS,
     PROTOCOL_VERSION,
@@ -3798,6 +3799,21 @@ def make_figures(
                     },
                 )
                 saved["causal_prefixes"] = [str(path) for path in paths]
+    if causal is not None and prepared.task.name in {"zinc", "qm9_gap_dense"}:
+        paper_outputs = render_canonical_paper_causal_figures(
+            scores,
+            causal,
+            output_dir=prepared.output_dir / "figures" / "paper_causal",
+            task_name=prepared.task.name,
+            seed=int(prepared.grit.sc.seed),
+            common_metadata={
+                "protocol_version": PROTOCOL_VERSION,
+                "repository_commit": _repository_commit(),
+                "protocol_fingerprint": config.fingerprint,
+                "checkpoint_sha256": prepared.checkpoint_sha,
+            },
+        )
+        saved.update(paper_outputs)
     atomic_json(prepared.output_dir / "figures.json", saved)
     return saved
 
@@ -4463,7 +4479,11 @@ def render_cached_figures(
     return make_figures(prepared, config, scores, carriage, causal)
 
 
-def _load_complete_figure_manifest(output_dir: Path) -> dict[str, list[str]] | None:
+def _load_complete_figure_manifest(
+    output_dir: Path,
+    *,
+    required_keys: Sequence[str] = (),
+) -> dict[str, list[str]] | None:
     """Return an atomic per-seed manifest only when every declared artifact is intact."""
 
     import json
@@ -4476,6 +4496,8 @@ def _load_complete_figure_manifest(output_dir: Path) -> dict[str, list[str]] | N
     except (OSError, json.JSONDecodeError):
         return None
     if not isinstance(payload, Mapping) or not payload:
+        return None
+    if not set(required_keys).issubset(payload):
         return None
     figure_root = (output_dir / "figures").resolve()
     for paths in payload.values():
@@ -4567,8 +4589,16 @@ def finalize_cached_run(config: MethodologyConfig) -> dict[str, Any]:
                 figures = {}
                 log(f"[finalize] collecting {key} for population figures")
             else:
+                required_figure_keys = (
+                    ("paper_head_ablation", "paper_causal_validation")
+                    if task_name in {"zinc", "qm9_gap_dense"}
+                    else ()
+                )
                 figures = (
-                    _load_complete_figure_manifest(output_dir)
+                    _load_complete_figure_manifest(
+                        output_dir,
+                        required_keys=required_figure_keys,
+                    )
                     if config.resume and not config.force
                     else None
                 )

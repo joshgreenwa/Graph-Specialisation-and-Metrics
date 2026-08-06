@@ -79,6 +79,7 @@ from graph_specialisation_metrics.methodology.runner import (
     PreparedTask,
     _cache,
     _event_rng,
+    _load_complete_figure_manifest,
     _stage_plan,
     finalize_cached_run,
     run_carriage,
@@ -2132,6 +2133,29 @@ def test_model_free_finalizer_owns_shared_four_seed_summaries(
         )
         assert [row["seed"] for row in population["seed_estimates"]] == [0, 1, 2, 3]
         assert population["population_interval"]["level"] == "training seed"
+
+
+def test_cached_figure_manifest_requires_new_paper_outputs(tmp_path):
+    figure_dir = tmp_path / "figures"
+    figure_dir.mkdir()
+    old_figure = figure_dir / "old.pdf"
+    old_figure.write_bytes(b"old")
+    old_figure.with_suffix(".metadata.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "figures.json").write_text(
+        json.dumps({"old_figure": [str(old_figure)]}),
+        encoding="utf-8",
+    )
+
+    assert _load_complete_figure_manifest(tmp_path) == {
+        "old_figure": [str(old_figure)]
+    }
+    assert (
+        _load_complete_figure_manifest(
+            tmp_path,
+            required_keys=("paper_head_ablation", "paper_causal_validation"),
+        )
+        is None
+    )
 
 
 def test_matching_population_renderer_uses_all_seed_caches_and_writes_publication_figures(
