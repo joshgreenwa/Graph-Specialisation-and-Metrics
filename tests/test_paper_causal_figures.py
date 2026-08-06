@@ -6,6 +6,11 @@ from pathlib import Path
 import numpy as np
 
 from graph_specialisation_metrics.methodology.bootstrap import Interval
+from graph_specialisation_metrics.methodology.graphbench_population_figures import (
+    ABLATION_SCATTER_ALPHA,
+    _plot_head_scatter,
+    population_figure_theme,
+)
 from graph_specialisation_metrics.methodology.paper_causal_figures import (
     canonical_paper_figure_data,
     render_canonical_paper_causal_figures,
@@ -113,6 +118,40 @@ def _canonical_cache_values():
         },
     }
     return scores, causal
+
+
+def test_head_ablation_scatter_uses_opaque_points_and_boxed_black_statistic():
+    import matplotlib.pyplot as plt
+
+    data = {
+        "seeds": np.asarray((42,)),
+        "heads": (
+            {
+                "joint_sensitivity": np.asarray((0.4, 0.8, 1.2)),
+                "clean_ablation": np.asarray((0.2, 0.5, 0.9)),
+                "layer": np.asarray((0, 1, 2)),
+            },
+        ),
+    }
+    figure, axis = _plot_head_scatter(
+        data,
+        population_figure_theme(),
+        x_name="joint_sensitivity",
+        y_name="clean_ablation",
+        xlabel=r"Joint sensitivity, $J$",
+        ylabel="Head-ablation impact",
+        title="Joint sensitivity and head-ablation impact",
+        statistic=r"Spearman $\rho$ = 0.53  [0.48, 0.56]",
+    )
+    try:
+        assert axis.collections[0].get_alpha() == ABLATION_SCATTER_ALPHA
+        statistic = axis.texts[-1]
+        assert statistic.get_color() == "black"
+        box = statistic.get_bbox_patch()
+        assert np.allclose(box.get_facecolor()[:3], (1.0, 1.0, 1.0))
+        assert box.get_alpha() == 0.96
+    finally:
+        plt.close(figure)
 
 
 def test_canonical_cache_adapter_writes_two_graphbench_matched_paper_pdfs(tmp_path):

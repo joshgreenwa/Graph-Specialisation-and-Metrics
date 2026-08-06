@@ -21,6 +21,8 @@ SEED_MARKERS = ("o", "s", "^", "D", "P", "X", "v", "<", ">")
 CHANNELS = ("semantic", "structural")
 FAMILIES = ("semantic", "structural")
 NECESSITY_FAMILIES = ("semantic", "structural", "j_matched_null")
+HEAD_SCATTER_ALPHA = 0.68
+ABLATION_SCATTER_ALPHA = 0.86
 
 
 def _value(record: Any, name: str) -> Any:
@@ -755,6 +757,11 @@ def _plot_head_scatter(
         )
         all_x: list[np.ndarray] = []
         all_y: list[np.ndarray] = []
+        point_alpha = (
+            ABLATION_SCATTER_ALPHA
+            if y_name == "clean_ablation"
+            else HEAD_SCATTER_ALPHA
+        )
         for seed_position, row in enumerate(data["heads"]):
             x = np.asarray(row[x_name]).reshape(-1)
             y = np.asarray(row[y_name]).reshape(-1)
@@ -770,7 +777,7 @@ def _plot_head_scatter(
                 norm=norm,
                 marker=SEED_MARKERS[seed_position % len(SEED_MARKERS)],
                 s=theme.marker_size * 0.54,
-                alpha=0.68,
+                alpha=point_alpha,
                 linewidths=0.22,
                 edgecolors="white",
                 zorder=2,
@@ -821,8 +828,16 @@ def _plot_head_scatter(
                 transform=ax.transAxes,
                 ha="left",
                 va="top",
-                color=theme.central_color,
+                color="black",
                 fontsize=theme.tick_size,
+                bbox={
+                    "boxstyle": "square,pad=0.24",
+                    "facecolor": "white",
+                    "edgecolor": "#C8C8C8",
+                    "linewidth": 0.5,
+                    "alpha": 0.96,
+                },
+                zorder=4,
             )
         _legend_below(fig, handles, ncol=4)
     return fig, ax
