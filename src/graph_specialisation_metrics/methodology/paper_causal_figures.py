@@ -320,7 +320,7 @@ def graphormer_focused_paper_figure_data(
             "method": "cached Graphormer J matching",
             "heads": null_heads,
         },
-        "source": "focused Graphormer score, gate, and core causal caches",
+        "source": "focused Graphormer gate and core causal caches",
     }
 
 

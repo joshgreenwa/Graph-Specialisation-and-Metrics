@@ -1103,27 +1103,30 @@ def _artifact_paths(root: Path) -> dict[str, Path]:
 
 
 def render_cached_focused_figures(output_dir: str | Path) -> dict[str, Any]:
-    """Render every focused figure from CPU caches without loading Graphormer."""
+    """Render focused figures from CPU caches without loading Graphormer.
+
+    Gate and core caches are sufficient for the two paper figures.  The focused
+    score cache is optional and enables the older diagnostic figure suite when
+    it is present.
+    """
 
     from .graphormer_causal_plots import render_focused_figure_suite
+    from .paper_causal_figures import (
+        graphormer_focused_paper_figure_data,
+        render_paper_causal_figures,
+    )
 
     paths = _artifact_paths(Path(output_dir))
-    missing = [name for name in ("scores", "gate", "core") if not paths[name].is_file()]
+    missing = [name for name in ("gate", "core") if not paths[name].is_file()]
     if missing:
         raise FileNotFoundError(
             "figures-only focused run is missing "
             + ", ".join(str(paths[name]) for name in missing)
         )
-    scores_artifact = load_cache_artifact_file(paths["scores"])
     gate_artifact = load_cache_artifact_file(paths["gate"])
     core_artifact = load_cache_artifact_file(paths["core"])
-    scores = scores_artifact.value
     gate = gate_artifact.value
     core = core_artifact.value
-    if gate.get("score_manifest_hash") != scores.get("manifest_hash"):
-        raise RuntimeError(
-            "focused gate and canonical score cache have different event manifests"
-        )
     if core.get("version") != FOCUSED_CAUSAL_VERSION:
         raise RuntimeError(
             f"focused core cache uses {core.get('version')!r}; "
@@ -1136,29 +1139,57 @@ def render_cached_focused_figures(output_dir: str | Path) -> dict[str, Any]:
         if paths["model"].is_file()
         else {}
     )
-    figures = render_focused_figure_suite(
-        scores,
-        gate,
-        core,
-        output_dir=paths["figures"],
-        common_metadata={
-            "analysis_version": FOCUSED_CAUSAL_VERSION,
-            "score_cache": str(paths["scores"]),
-            "score_cache_sha256": scores_artifact.file_sha256,
-            "score_contract_fingerprint": scores_artifact.metadata[
-                "contract_fingerprint"
-            ],
-            "gate_cache": str(paths["gate"]),
-            "gate_cache_sha256": gate_artifact.file_sha256,
-            "core_cache": str(paths["core"]),
-            "core_cache_sha256": core_artifact.file_sha256,
-            "checkpoint_sha256": model_record.get("checkpoint_sha256"),
-        },
-    )
+    common_metadata = {
+        "analysis_version": FOCUSED_CAUSAL_VERSION,
+        "gate_cache": str(paths["gate"]),
+        "gate_cache_sha256": gate_artifact.file_sha256,
+        "core_cache": str(paths["core"]),
+        "core_cache_sha256": core_artifact.file_sha256,
+        "checkpoint_sha256": model_record.get("checkpoint_sha256"),
+    }
+    if paths["scores"].is_file():
+        scores_artifact = load_cache_artifact_file(paths["scores"])
+        scores = scores_artifact.value
+        if gate.get("score_manifest_hash") != scores.get("manifest_hash"):
+            raise RuntimeError(
+                "focused gate and canonical score cache have different event manifests"
+            )
+        common_metadata.update(
+            {
+                "score_cache": str(paths["scores"]),
+                "score_cache_sha256": scores_artifact.file_sha256,
+                "score_contract_fingerprint": scores_artifact.metadata[
+                    "contract_fingerprint"
+                ],
+            }
+        )
+        figures = render_focused_figure_suite(
+            scores,
+            gate,
+            core,
+            output_dir=paths["figures"],
+            common_metadata=common_metadata,
+        )
+        render_scope = "full-focused-suite"
+    else:
+        log(
+            "[figures] focused score cache is absent; rendering the two paper "
+            "figures from gate/core caches"
+        )
+        figure_data = graphormer_focused_paper_figure_data(core, gate, seed=0)
+        figures = render_paper_causal_figures(
+            figure_data,
+            output_dir=paths["figures"],
+            task_name="graphormer_pcqm4mv2",
+            seed=0,
+            common_metadata=common_metadata,
+        )
+        render_scope = "paper-only"
     manifest = {
         "analysis_version": FOCUSED_CAUSAL_VERSION,
+        "render_scope": render_scope,
         "model_record": str(paths["model"]),
-        "score_cache": str(paths["scores"]),
+        "score_cache": str(paths["scores"]) if paths["scores"].is_file() else None,
         "gate_cache": str(paths["gate"]),
         "core_cache": str(paths["core"]),
         "sample_sizes": core["sample_sizes"],

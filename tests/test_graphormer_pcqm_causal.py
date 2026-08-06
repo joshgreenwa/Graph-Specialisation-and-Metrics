@@ -9,11 +9,16 @@ import matplotlib
 matplotlib.use("Agg")
 import numpy as np
 
+from graph_specialisation_metrics.methodology import (
+    graphormer_causal_analysis as graphormer_causal_analysis_module,
+)
 from graph_specialisation_metrics.methodology.graphormer_causal_analysis import (
+    FOCUSED_CAUSAL_VERSION,
     NECESSITY_METRICS,
     PATCH_METRICS,
     _mismatch_indices,
     production_config,
+    render_cached_focused_figures,
 )
 from graph_specialisation_metrics.methodology.graphormer_causal_plots import (
     render_focused_figure_suite,
@@ -262,7 +267,7 @@ def _summary(metric_order, *, cells=5, nulls=2):
     }
 
 
-def test_focused_figures_export_png_pdf_and_metadata(tmp_path):
+def _focused_figure_inputs():
     coordinates = synthetic_coordinates()
     gate = synthetic_gate()
     gate["coordinate_interval"] = {
@@ -275,6 +280,8 @@ def test_focused_figures_export_png_pdf_and_metadata(tmp_path):
         "central_fraction": np.full((2, 3), 0.25),
     }
     core = {
+        "version": FOCUSED_CAUSAL_VERSION,
+        "target_heads": ((0, 0), (0, 1)),
         "patch": _summary(PATCH_METRICS),
         "necessity": _summary(NECESSITY_METRICS),
         "clean_ablation": {
@@ -292,8 +299,18 @@ def test_focused_figures_export_png_pdf_and_metadata(tmp_path):
             "head_count": 6,
             "graph_count": 128,
         },
+        "sample_sizes": {
+            "discovery_graphs": 128,
+            "causal_graphs": 128,
+            "clean_ablation_graphs": 128,
+        },
         "control_audit": {"controlled_fraction": 0.95},
     }
+    return coordinates, gate, core
+
+
+def test_focused_figures_export_png_pdf_and_metadata(tmp_path):
+    coordinates, gate, core = _focused_figure_inputs()
     outputs = render_focused_figure_suite(
         {"coordinates": coordinates},
         gate,
@@ -338,6 +355,49 @@ def test_focused_figures_export_png_pdf_and_metadata(tmp_path):
         "paper_head_ablation",
         "paper_causal_validation",
     }
+
+
+def test_figures_phase_renders_paper_outputs_without_optional_score_cache(
+    monkeypatch, tmp_path
+):
+    _coordinates, gate, core = _focused_figure_inputs()
+    paths = graphormer_causal_analysis_module._artifact_paths(tmp_path)
+    for name in ("gate", "core"):
+        paths[name].parent.mkdir(parents=True, exist_ok=True)
+        paths[name].touch()
+
+    artifacts = {
+        paths["gate"]: SimpleNamespace(
+            value=gate,
+            file_sha256="gate-sha256",
+            metadata={"contract_fingerprint": "gate-contract"},
+        ),
+        paths["core"]: SimpleNamespace(
+            value=core,
+            file_sha256="core-sha256",
+            metadata={"contract_fingerprint": "core-contract"},
+        ),
+    }
+    monkeypatch.setattr(
+        graphormer_causal_analysis_module,
+        "load_cache_artifact_file",
+        lambda path: artifacts[Path(path)],
+    )
+
+    manifest = render_cached_focused_figures(tmp_path)
+
+    assert manifest["render_scope"] == "paper-only"
+    assert manifest["score_cache"] is None
+    assert set(manifest["figures"]) == {
+        "paper_head_ablation",
+        "paper_causal_validation",
+    }
+    for stem in (
+        "01_joint_sensitivity_head_ablation",
+        "02_causal_validation",
+    ):
+        assert (paths["figures"] / f"{stem}.pdf").stat().st_size > 0
+        assert (paths["figures"] / f"{stem}.png").stat().st_size > 0
 
 
 def test_production_config_and_colab_freeze_128_molecule_splits():
