@@ -47,12 +47,19 @@ def make_khop_hook(hops: int, global_vnode: bool) -> Callable[[Path], None]:
 
     def hook(repo_dir: Path) -> None:
         apply_khop_patch = _import_khop_patch()
-        # apply_khop_patch reads args.hops, args.global_vnode, and args.expected_params
-        # (via expected_param_count). expected_params=None keeps the automatic guard
-        # (473473 without VNode, +64 with VNode). The drive_dir argument is used only to
-        # drop a provenance note; point it at the clone so we never write to the user's Drive.
-        args = argparse.Namespace(hops=int(hops), global_vnode=bool(global_vnode),
-                                  expected_params=None)
+        # Reconstruct the relevant subset of the training runner's parsed arguments.  These
+        # analysis tasks are always k-hop controls; ``wandb_project=None`` preserves the
+        # training patch's default ZINC project label.  ``expected_params=None`` keeps the
+        # automatic guard (473473 without VNode, +64 with VNode).  The drive_dir argument is
+        # used only to drop a provenance note; point it at the clone so we never write to the
+        # user's Drive.
+        args = argparse.Namespace(
+            attention="khop",
+            hops=int(hops),
+            global_vnode=bool(global_vnode),
+            expected_params=None,
+            wandb_project=None,
+        )
         apply_khop_patch(Path(repo_dir), Path(repo_dir), args)
         log(f"[khop] applied k-hop patch (hops={hops}, global_vnode={global_vnode}; "
             "masked RRWP edge encoder, sparsity=k_hop).")

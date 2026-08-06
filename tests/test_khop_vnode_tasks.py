@@ -52,10 +52,19 @@ def test_khop_hook_routes_to_exact_training_patch(name, hops, vnode, monkeypatch
     monkeypatch.setattr(
         khop_zinc, "apply_khop_patch",
         lambda repo_dir, drive_dir, args: calls.append(
-            (Path(repo_dir), int(args.hops), bool(args.global_vnode))),
+            (
+                Path(repo_dir),
+                Path(drive_dir),
+                args.attention,
+                int(args.hops),
+                bool(args.global_vnode),
+                args.expected_params,
+                args.wandb_project,
+            )
+        ),
     )
     get_task(name).env_hooks[0](tmp_path)
-    assert calls == [(tmp_path, hops, vnode)]
+    assert calls == [(tmp_path, tmp_path, "khop", hops, vnode, None, None)]
 
 
 def test_checkpoint_discovery_prefers_best_recovery_checkpoint(tmp_path):
