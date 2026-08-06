@@ -36,6 +36,12 @@ from .scores import (
 
 
 FOCUSED_CAUSAL_VERSION = "graphormer-pcqm-focused-causal-v4"
+FOCUSED_CAUSAL_READ_VERSIONS = frozenset(
+    {
+        "graphormer-pcqm-focused-causal-v3",
+        FOCUSED_CAUSAL_VERSION,
+    }
+)
 PATCH_METRICS = (
     "R_gross_matched",
     "R_gross_null",
@@ -1127,10 +1133,16 @@ def render_cached_focused_figures(output_dir: str | Path) -> dict[str, Any]:
     core_artifact = load_cache_artifact_file(paths["core"])
     gate = gate_artifact.value
     core = core_artifact.value
-    if core.get("version") != FOCUSED_CAUSAL_VERSION:
+    source_analysis_version = str(core.get("version"))
+    if source_analysis_version not in FOCUSED_CAUSAL_READ_VERSIONS:
         raise RuntimeError(
-            f"focused core cache uses {core.get('version')!r}; "
-            f"expected {FOCUSED_CAUSAL_VERSION!r}"
+            f"focused core cache uses unsupported schema {source_analysis_version!r}; "
+            f"read-compatible schemas are {sorted(FOCUSED_CAUSAL_READ_VERSIONS)!r}"
+        )
+    if source_analysis_version != FOCUSED_CAUSAL_VERSION:
+        log(
+            f"[figures] reading compatible focused causal cache "
+            f"{source_analysis_version}; new runs write {FOCUSED_CAUSAL_VERSION}"
         )
     if tuple(map(tuple, core.get("target_heads", ()))) != _target_heads(gate):
         raise RuntimeError("focused core cache and gate have different target heads")
@@ -1141,6 +1153,12 @@ def render_cached_focused_figures(output_dir: str | Path) -> dict[str, Any]:
     )
     common_metadata = {
         "analysis_version": FOCUSED_CAUSAL_VERSION,
+        "source_cache_analysis_version": source_analysis_version,
+        "source_cache_compatibility": (
+            "native"
+            if source_analysis_version == FOCUSED_CAUSAL_VERSION
+            else "backward-compatible"
+        ),
         "gate_cache": str(paths["gate"]),
         "gate_cache_sha256": gate_artifact.file_sha256,
         "core_cache": str(paths["core"]),
@@ -1187,6 +1205,10 @@ def render_cached_focused_figures(output_dir: str | Path) -> dict[str, Any]:
         render_scope = "paper-only"
     manifest = {
         "analysis_version": FOCUSED_CAUSAL_VERSION,
+        "source_cache_analysis_version": source_analysis_version,
+        "source_cache_compatibility": common_metadata[
+            "source_cache_compatibility"
+        ],
         "render_scope": render_scope,
         "model_record": str(paths["model"]),
         "score_cache": str(paths["scores"]) if paths["scores"].is_file() else None,
@@ -1273,6 +1295,7 @@ def run(
 
 
 __all__ = [
+    "FOCUSED_CAUSAL_READ_VERSIONS",
     "FOCUSED_CAUSAL_VERSION",
     "FocusedExecution",
     "aggregate_core_tests",

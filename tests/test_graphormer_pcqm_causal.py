@@ -361,6 +361,7 @@ def test_figures_phase_renders_paper_outputs_without_optional_score_cache(
     monkeypatch, tmp_path
 ):
     _coordinates, gate, core = _focused_figure_inputs()
+    core["version"] = "graphormer-pcqm-focused-causal-v3"
     paths = graphormer_causal_analysis_module._artifact_paths(tmp_path)
     for name in ("gate", "core"):
         paths[name].parent.mkdir(parents=True, exist_ok=True)
@@ -388,6 +389,11 @@ def test_figures_phase_renders_paper_outputs_without_optional_score_cache(
 
     assert manifest["render_scope"] == "paper-only"
     assert manifest["score_cache"] is None
+    assert (
+        manifest["source_cache_analysis_version"]
+        == "graphormer-pcqm-focused-causal-v3"
+    )
+    assert manifest["source_cache_compatibility"] == "backward-compatible"
     assert set(manifest["figures"]) == {
         "paper_head_ablation",
         "paper_causal_validation",
