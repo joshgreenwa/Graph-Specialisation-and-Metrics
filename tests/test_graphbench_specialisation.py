@@ -62,6 +62,8 @@ from graph_specialisation_metrics.methodology.graphbench_pe_refinement import (
     validate_causal_recovery_prerequisites,
 )
 from graph_specialisation_metrics.methodology.graphbench_population_figures import (
+    _plot_absolute_patching,
+    _theme,
     build_graphbench_population_figure_data,
     render_graphbench_population_figures,
 )
@@ -2295,6 +2297,28 @@ def test_matching_population_renderer_uses_all_seed_caches_and_writes_publicatio
         len(record["heads"]) == 2
         for record in population["necessity"]["null_matches"]
     )
+    figure, axes = _plot_absolute_patching(population, _theme(config))
+    assert [axis.get_title() for axis in axes] == [
+        "Restoration",
+        "Injection",
+        "Role-specific necessity",
+    ]
+    assert all(
+        [tick.get_text() for tick in axis.get_xticklabels()]
+        == ["Semantic donor-swap", "Structural donor-swap"]
+        for axis in axes
+    )
+    assert axes[2].get_ylabel() == "Donor-swap effect removed (fraction)"
+    assert axes[0].get_ylabel() == "Aligned output effect"
+    legend = figure.legends[0]
+    assert all(
+        text.get_fontsize() == pytest.approx(_theme(config).font_size * 1.25)
+        for text in legend.get_texts()
+    )
+    assert legend.get_title().get_fontsize() == pytest.approx(8.5 * 1.25)
+    from matplotlib import pyplot as plt
+
+    plt.close(figure)
     assert population["clean_ablation"]["rho_population"][
         "included_seed_count"
     ] == 4
@@ -2309,6 +2333,31 @@ def test_matching_population_renderer_uses_all_seed_caches_and_writes_publicatio
     assert not obsolete.exists()
     assert all(len(paths) == 2 for paths in saved.values())
     assert all(Path(path).is_file() for paths in saved.values() for path in paths)
+    pdf_paths = [
+        Path(path)
+        for paths in saved.values()
+        for path in paths
+        if Path(path).suffix == ".pdf"
+    ]
+    assert len(pdf_paths) == 5
+    for pdf_path in pdf_paths:
+        pdf_bytes = pdf_path.read_bytes()
+        assert b"/Subtype /Type3" not in pdf_bytes
+        assert b"/CIDFontType2" in pdf_bytes
+        assert b"/FontFile2" in pdf_bytes
+    absolute_metadata = json.loads(
+        (population_dir / "01_population_restoration_injection.metadata.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert absolute_metadata["pdf_export"] == {
+        "compression": 9,
+        "embedded_font_program": "TrueType/CIDFontType2",
+        "font_type": 42,
+        "path_simplification": False,
+        "raster_fallback_dpi": 1200,
+        "vector_first": True,
+    }
     manifest = json.loads(
         (
             tmp_path

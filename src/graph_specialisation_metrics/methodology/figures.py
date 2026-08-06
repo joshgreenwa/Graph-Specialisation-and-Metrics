@@ -21,6 +21,7 @@ from .scores import (
 
 
 TASK_FIGURE_MODIFIERS: dict[str, Callable[[str, Any, Any], None]] = {}
+PUBLICATION_PDF_RASTER_DPI = 1200
 
 
 def register_task_figure_modifier(
@@ -78,9 +79,17 @@ def publication_style(theme: FigureTheme):
         "ytick.labelsize": theme.tick_size,
         "axes.linewidth": 0.8,
         "pdf.fonttype": 42,
+        "pdf.use14corefonts": False,
+        "pdf.compression": 9,
         "ps.fonttype": 42,
+        "svg.fonttype": "none",
+        "path.simplify": False,
+        "agg.path.chunksize": 0,
+        "image.composite_image": False,
+        "image.interpolation": "none",
         "savefig.bbox": "tight",
         "savefig.pad_inches": 0.04,
+        "savefig.transparent": False,
     }
     with mpl.rc_context(settings):
         yield
@@ -1635,24 +1644,60 @@ class FigureBuilder:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         if self.modifier is not None:
             self.modifier(name, fig, axes)
+        import matplotlib as mpl
+
+        export_settings = {
+            "font.family": self.theme.font_family,
+            "pdf.fonttype": 42,
+            "pdf.use14corefonts": False,
+            "pdf.compression": 9,
+            "ps.fonttype": 42,
+            "svg.fonttype": "none",
+            "path.simplify": False,
+            "agg.path.chunksize": 0,
+            "image.composite_image": False,
+            "image.interpolation": "none",
+            "savefig.transparent": False,
+        }
+        pdf_raster_dpi = max(int(self.theme.dpi), PUBLICATION_PDF_RASTER_DPI)
         paths: list[Path] = []
         for suffix in self.theme.formats:
             path = self.output_dir / f"{name}.{suffix}"
             # `publication_style` sets savefig.bbox, but its rc context closed when the figure
             # function returned, so the bound has to be given here or anything drawn outside the
             # axes -- a legend below the panels, a rotated tick label -- is cropped away silently.
-            fig.savefig(
-                path,
-                dpi=self.theme.dpi,
-                bbox_inches=None if self.preserve_canvas else "tight",
-                pad_inches=0.0 if self.preserve_canvas else 0.04,
+            is_pdf = str(suffix).lower() == "pdf"
+            save_metadata = (
+                {
+                    "Creator": "Graph Specialisation and Metrics",
+                    "Title": name,
+                    "Subject": "Vector-first publication figure",
+                }
+                if is_pdf
+                else None
             )
+            with mpl.rc_context(export_settings):
+                fig.savefig(
+                    path,
+                    dpi=pdf_raster_dpi if is_pdf else self.theme.dpi,
+                    bbox_inches=None if self.preserve_canvas else "tight",
+                    pad_inches=0.0 if self.preserve_canvas else 0.04,
+                    metadata=save_metadata,
+                )
             paths.append(path)
         atomic_json(
             self.output_dir / f"{name}.metadata.json",
             {
                 "figure": name,
                 "theme": dataclasses.asdict(self.theme),
+                "pdf_export": {
+                    "vector_first": True,
+                    "font_type": 42,
+                    "embedded_font_program": "TrueType/CIDFontType2",
+                    "raster_fallback_dpi": pdf_raster_dpi,
+                    "compression": 9,
+                    "path_simplification": False,
+                },
                 **dict(self.common_metadata),
                 **dict(metadata),
             },

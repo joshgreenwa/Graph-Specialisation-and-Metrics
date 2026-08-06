@@ -476,7 +476,7 @@ def _family_handles(theme: FigureTheme, *, include_null: bool = False):
         ("Structural-scoring heads", theme.structural_color),
     ]
     if include_null:
-        families.append((r"$J$-matched null heads", "#777777"))
+        families.append((r"$J$-matched null heads", theme.central_color))
     return [
         Line2D(
             [0],
@@ -512,6 +512,8 @@ def _legend_below(
     *,
     ncol: int,
     title: str | None = None,
+    font_size: float | None = None,
+    title_font_size: float | None = None,
 ) -> None:
     legend = fig.legend(
         handles=handles,
@@ -523,9 +525,12 @@ def _legend_below(
         handletextpad=0.45,
         borderaxespad=0,
         title=title,
+        fontsize=font_size,
     )
     if title is not None:
-        legend.get_title().set_fontsize(8.5)
+        legend.get_title().set_fontsize(
+            8.5 if title_font_size is None else title_font_size
+        )
 
 
 def _family_population_marks(
@@ -541,7 +546,7 @@ def _family_population_marks(
     colors = [theme.semantic_color, theme.structural_color]
     offsets = [-0.13, 0.13]
     if include_null:
-        colors = [theme.semantic_color, theme.structural_color, "#777777"]
+        colors = [theme.semantic_color, theme.structural_color, theme.central_color]
         offsets = [-0.18, 0.0, 0.18]
     for family_position, (color, offset) in enumerate(
         zip(colors, offsets)
@@ -563,11 +568,11 @@ def _family_population_marks(
             color=color,
             markerfacecolor=color,
             markeredgecolor="white",
-            markeredgewidth=0.55,
-            markersize=6.0,
-            linewidth=1.25,
-            capsize=3.0,
-            capthick=1.0,
+            markeredgewidth=0.65,
+            markersize=6.4,
+            linewidth=1.45,
+            capsize=3.2,
+            capthick=1.15,
             linestyle="none",
             zorder=5,
         )
@@ -578,6 +583,13 @@ def _plot_absolute_patching(data: Mapping[str, Any], theme: FigureTheme):
     import matplotlib.pyplot as plt
 
     population = data["absolute_patching"]["population"]
+    mark_theme = theme.with_overrides(
+        {
+            "semantic_color": "#B63B47",
+            "structural_color": "#3568A8",
+            "central_color": "#595959",
+        }
+    )
     with publication_style(theme):
         fig, axes = plt.subplots(
             1,
@@ -588,8 +600,8 @@ def _plot_absolute_patching(data: Mapping[str, Any], theme: FigureTheme):
             zip(
                 axes[:2],
                 (
-                    "Clean head state in an intervened graph",
-                    "Intervened head state in a clean graph",
+                    "Restoration",
+                    "Injection",
                 ),
             )
         ):
@@ -600,39 +612,41 @@ def _plot_absolute_patching(data: Mapping[str, Any], theme: FigureTheme):
             _family_population_marks(
                 ax,
                 metric_population,
-                theme,
+                mark_theme,
             )
-            ax.axhline(0.0, color="#9A9A9A", linewidth=0.75)
+            ax.axhline(0.0, color="#7F7F7F", linewidth=0.9)
             ax.set_xticks(
                 np.arange(2, dtype=np.float64),
-                ("Semantic intervention", "Structural intervention"),
+                ("Semantic donor-swap", "Structural donor-swap"),
             )
-            _colour_intervention_ticks(ax, theme)
+            _colour_intervention_ticks(ax, mark_theme)
             ax.set_title(title)
             _style_axis(ax)
-        axes[0].set_ylabel("Output effect beyond mismatch control")
+        axes[0].set_ylabel("Aligned output effect")
 
         necessity = data["necessity"]
         _family_population_marks(
             axes[2],
             necessity["population"],
-            theme,
+            mark_theme,
             include_null=True,
         )
-        axes[2].axhline(0.0, color="#9A9A9A", linewidth=0.75)
+        axes[2].axhline(0.0, color="#7F7F7F", linewidth=0.9)
         axes[2].set_xticks(
             np.arange(2, dtype=np.float64),
-            ("Semantic intervention", "Structural intervention"),
+            ("Semantic donor-swap", "Structural donor-swap"),
         )
-        _colour_intervention_ticks(axes[2], theme)
-        axes[2].set_ylabel("Intervention effect removed (fraction)")
-        axes[2].set_title("Head necessity")
+        _colour_intervention_ticks(axes[2], mark_theme)
+        axes[2].set_ylabel("Donor-swap effect removed (fraction)")
+        axes[2].set_title("Role-specific necessity")
         _style_axis(axes[2])
         _legend_below(
             fig,
-            _family_handles(theme, include_null=True),
+            _family_handles(mark_theme, include_null=True),
             ncol=3,
             title="Mean and 95% bootstrap CI across four seeds",
+            font_size=theme.font_size * 1.25,
+            title_font_size=8.5 * 1.25,
         )
         fig.subplots_adjust(
             bottom=0.27,
@@ -838,10 +852,11 @@ def render_graphbench_population_figures(
         axes,
         metadata={
             "estimand": (
-                "mismatch-adjusted aligned patch response for clean-state restoration "
-                "and intervened-state injection; donors within source, sources within "
-                "graph, graphs within selected-head family, then seeds; necessity is "
-                "aligned event effect removed divided by donor-event output effect"
+                "mismatch-adjusted aligned restoration using original head output and "
+                "injection using donor-swapped head output; donors within source, "
+                "sources within graph, graphs within selected-head family, then seeds; "
+                "role-specific necessity is aligned donor-swap effect removed divided "
+                "by donor-swap output effect"
             ),
             "pair_set": "strongest_candidates",
             "pair_counts": data["pair_counts"],
