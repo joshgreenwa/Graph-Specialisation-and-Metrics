@@ -306,6 +306,8 @@ def test_focused_figures_export_png_pdf_and_metadata(tmp_path):
         "restoration_injection",
         "necessity",
         "J_clean_ablation",
+        "paper_head_ablation",
+        "paper_causal_validation",
     }
     for paths in outputs.values():
         assert {Path(path).suffix for path in paths} == {".pdf", ".png"}
@@ -313,6 +315,29 @@ def test_focused_figures_export_png_pdf_and_metadata(tmp_path):
             assert Path(path).stat().st_size > 0
         metadata = Path(paths[0]).with_suffix(".metadata.json")
         assert metadata.stat().st_size > 0
+    for key in ("paper_head_ablation", "paper_causal_validation"):
+        pdf_path = next(Path(path) for path in outputs[key] if path.endswith(".pdf"))
+        pdf_bytes = pdf_path.read_bytes()
+        assert b"/Subtype /Type3" not in pdf_bytes
+        assert b"/CIDFontType2" in pdf_bytes
+        assert b"/FontFile2" in pdf_bytes
+    causal_metadata = json.loads(
+        (tmp_path / "02_causal_validation.metadata.json").read_text(encoding="utf-8")
+    )
+    assert causal_metadata["aligned_effect_axis"] == "Aligned output effect"
+    assert causal_metadata["panel_order"] == [
+        "Restoration",
+        "Injection",
+        "Role-specific necessity",
+    ]
+    assert causal_metadata["pdf_export"]["raster_fallback_dpi"] == 1200
+    paper_manifest = json.loads(
+        (tmp_path / "paper_causal_figures.json").read_text(encoding="utf-8")
+    )
+    assert set(paper_manifest["figures"]) == {
+        "paper_head_ablation",
+        "paper_causal_validation",
+    }
 
 
 def test_production_config_and_colab_freeze_128_molecule_splits():
@@ -339,7 +364,9 @@ def test_production_config_and_colab_freeze_128_molecule_splits():
         for cell in notebook["cells"]
         if cell.get("cell_type") == "code"
     )
-    assert 'PHASE = "all"' in source
+    assert 'PHASE = "figures"' in source
     assert "OUTPUT_ROOT" in source
     assert "phase=PHASE" in source
     assert "load_cache_artifact_file" in source
+    assert "01_joint_sensitivity_head_ablation.pdf" in source
+    assert "02_causal_validation.pdf" in source

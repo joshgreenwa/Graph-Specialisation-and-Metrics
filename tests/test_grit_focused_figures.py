@@ -2135,6 +2135,11 @@ def test_colab_notebook_has_valid_python_cells():
     assert "generalist {rank}" not in source
     assert "PNG_DPI = 600" in source
     assert "PDF_RASTER_DPI = 1200" in source
+    assert "PAPER_CAUSAL_ONLY = True" in source
+    assert 'PAPER_CAUSAL_TASKS = ("zinc", "qm9_gap_dense")' in source
+    assert "render_canonical_paper_causal_figures(" in source
+    assert 'cache/causal/validation.pt' in source
+    assert "Paper-only mode: supplemental GRIT runtime skipped." in source
     assert "del sys.modules[module_name]" in source
     assert "methodology_config_for_artifact(" in source
     assert (

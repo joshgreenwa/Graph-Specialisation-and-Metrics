@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any
 
 import numpy as np
 
 from .figures import FigureBuilder, FigureTheme, publication_style
-
+from .paper_causal_figures import (
+    graphormer_focused_paper_figure_data,
+    render_paper_causal_figures,
+)
 
 SEMANTIC = "#C44E52"
 STRUCTURAL = "#4C72B0"
@@ -494,6 +498,17 @@ def render_focused_figure_suite(
         },
     )
     outputs["J_clean_ablation"] = [str(path) for path in paths]
+
+    paper_data = graphormer_focused_paper_figure_data(core, gate, seed=0)
+    outputs.update(
+        render_paper_causal_figures(
+            paper_data,
+            output_dir=output_dir,
+            task_name="graphormer_pcqm4mv2",
+            seed=0,
+            common_metadata=common_metadata,
+        )
+    )
     return outputs
 
 

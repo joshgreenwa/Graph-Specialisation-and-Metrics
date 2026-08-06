@@ -7,15 +7,14 @@ trained models as if they were exchangeable observations.
 
 from __future__ import annotations
 
-from pathlib import Path
-from typing import Any, Mapping, Sequence
+from collections.abc import Mapping, Sequence
+from typing import Any
 
 import numpy as np
 
 from .cache import atomic_json
 from .figures import FigureBuilder, FigureTheme, publication_style
 from .protocol import PROTOCOL_VERSION, MethodologyConfig
-
 
 FOCUSED_GRAPHBENCH_TASK = "graphbench_bipartite_matching_hard"
 SEED_MARKERS = ("o", "s", "^", "D", "P", "X", "v", "<", ">")
@@ -430,12 +429,11 @@ def build_graphbench_population_figure_data(
     }
 
 
-def _theme(config: MethodologyConfig) -> FigureTheme:
-    values: Mapping[str, Any] = config.figure_overrides
-    if FOCUSED_GRAPHBENCH_TASK in values and isinstance(
-        values[FOCUSED_GRAPHBENCH_TASK], Mapping
-    ):
-        values = values[FOCUSED_GRAPHBENCH_TASK]
+def population_figure_theme(
+    values: Mapping[str, Any] | None = None,
+) -> FigureTheme:
+    """The shared paper theme for GraphBench and molecular causal validation."""
+
     return FigureTheme(
         width=4.2,
         height=3.55,
@@ -447,7 +445,16 @@ def _theme(config: MethodologyConfig) -> FigureTheme:
         marker_size=32.0,
         line_width=1.2,
         grid_alpha=0.14,
-    ).with_overrides(values)
+    ).with_overrides(values or {})
+
+
+def _theme(config: MethodologyConfig) -> FigureTheme:
+    values: Mapping[str, Any] = config.figure_overrides
+    if FOCUSED_GRAPHBENCH_TASK in values and isinstance(
+        values[FOCUSED_GRAPHBENCH_TASK], Mapping
+    ):
+        values = values[FOCUSED_GRAPHBENCH_TASK]
+    return population_figure_theme(values)
 
 
 def _seed_handles(seeds: Sequence[int], theme: FigureTheme):
@@ -579,7 +586,12 @@ def _family_population_marks(
     ax.set_xlim(-0.28, 1.28)
 
 
-def _plot_absolute_patching(data: Mapping[str, Any], theme: FigureTheme):
+def _plot_absolute_patching(
+    data: Mapping[str, Any],
+    theme: FigureTheme,
+    *,
+    legend_title: str = "Mean and 95% bootstrap CI across four seeds",
+):
     import matplotlib.pyplot as plt
 
     population = data["absolute_patching"]["population"]
@@ -644,7 +656,7 @@ def _plot_absolute_patching(data: Mapping[str, Any], theme: FigureTheme):
             fig,
             _family_handles(mark_theme, include_null=True),
             ncol=3,
-            title="Mean and 95% bootstrap CI across four seeds",
+            title=legend_title,
             font_size=theme.font_size * 1.25,
             title_font_size=8.5 * 1.25,
         )
