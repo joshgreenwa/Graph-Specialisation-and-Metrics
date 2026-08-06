@@ -296,3 +296,31 @@ def test_colab_enables_two_molecular_attention_examples_by_default():
     )
     assert "GENERATE_HEAD_CONTEXT = True" in source
     assert "HEAD_CONTEXT_GRAPH_INDICES = (0, 1)" in source
+    assert "if not head_context[\"outputs\"]" in source
+
+
+def test_head_context_records_missing_representatives(tmp_path):
+    from graph_specialisation_metrics.chapter6_head_context import (
+        generate_head_context,
+    )
+
+    result = generate_head_context(
+        [{"task": "zinc", "artifact_task": "zinc", "score": "/missing/raw.pt"}],
+        [],
+        tmp_path,
+        tasks=("zinc",),
+        graph_indices=(0, 1),
+        verbose=False,
+    )
+    assert not result["outputs"]
+    assert "no representative head rows" in result["warnings"][0]
+    summary = json.loads(Path(result["summary_path"]).read_text(encoding="utf-8"))
+    assert summary["graph_indices"] == [0, 1]
+    assert summary["tasks"][0]["status"] == "skipped"
+
+
+def test_head_context_uses_permissive_protocol_runtime():
+    source = Path("src/graph_specialisation_metrics/chapter6_head_context.py").read_text(
+        encoding="utf-8"
+    )
+    assert "require_protocol_match=False" in source

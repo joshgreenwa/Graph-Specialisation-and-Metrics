@@ -259,6 +259,11 @@ if GENERATE_HEAD_CONTEXT:
     )
     for warning in head_context["warnings"]:
         print(f"[head-context:warning] {warning}", flush=True)
+    if not head_context["outputs"]:
+        raise RuntimeError(
+            "Head-context generation produced no figures. See the task-stage "
+            f"diagnostics in {head_context['summary_path']} and the warnings above."
+        )
     for record in head_context["outputs"]:
         print(
             f"\n[display] {record['task']} · {record['role']} · "
