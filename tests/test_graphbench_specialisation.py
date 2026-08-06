@@ -83,6 +83,7 @@ from graph_specialisation_metrics.methodology.runner import (
     _load_complete_figure_manifest,
     _stage_plan,
     finalize_cached_run,
+    render_cached_figures,
     run_carriage,
     run_scores,
     run_worker,
@@ -2191,6 +2192,138 @@ def test_cached_figure_geometry_is_inferred_when_legacy_model_record_omits_it(
             scores,
             model_path=model_path,
         )
+
+
+def test_cached_zinc_renderer_skips_the_supplemental_figure_suite(
+    monkeypatch,
+    tmp_path,
+):
+    config = MethodologyConfig(
+        output_dir=str(tmp_path),
+        tasks=("zinc",),
+        train_seeds=(42,),
+        phases=("figures",),
+        accelerator="cpu",
+    )
+    output_dir = tmp_path / "zinc" / "seed_42"
+    output_dir.mkdir(parents=True)
+    (output_dir / "model.json").write_text(
+        json.dumps({"checkpoint_sha256": "checkpoint-sha"}),
+        encoding="utf-8",
+    )
+    score_path = output_dir / "cache" / "scores" / "raw.pt"
+    causal_path = output_dir / "cache" / "causal" / "validation.pt"
+    score_path.parent.mkdir(parents=True)
+    causal_path.parent.mkdir(parents=True)
+    score_path.touch()
+    causal_path.touch()
+    scores = {"coordinates": SimpleNamespace(joint_sensitivity=np.ones((10, 8)))}
+    causal = {"focused_specialists": {"status": "estimable"}}
+    monkeypatch.setattr(
+        "graph_specialisation_metrics.methodology.runner.load_cache_value_file",
+        lambda path: scores if Path(path) == score_path else causal,
+    )
+    captured = {}
+
+    def render_paper(score_value, causal_value, **kwargs):
+        captured.update(kwargs)
+        assert score_value is scores
+        assert causal_value is causal
+        return {
+            "paper_head_ablation": ["head-ablation.pdf", "head-ablation.png"],
+            "paper_causal_validation": ["causal.pdf", "causal.png"],
+        }
+
+    monkeypatch.setattr(
+        "graph_specialisation_metrics.methodology.runner.render_canonical_paper_causal_figures",
+        render_paper,
+    )
+    monkeypatch.setattr(
+        "graph_specialisation_metrics.methodology.runner.make_figures",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("paper-only rendering must skip the supplemental suite")
+        ),
+    )
+
+    figures = render_cached_figures(
+        config,
+        "zinc",
+        42,
+        source_protocol_fingerprint="completed-cache-protocol",
+    )
+
+    assert set(figures) == {"paper_head_ablation", "paper_causal_validation"}
+    assert captured["common_metadata"]["render_scope"] == "paper-only"
+    assert (
+        captured["common_metadata"]["protocol_fingerprint"]
+        == "completed-cache-protocol"
+    )
+    assert captured["output_dir"] == output_dir / "figures" / "paper_causal"
+
+
+def test_paper_only_finalizer_does_not_load_carriage_cache(monkeypatch, tmp_path):
+    config = MethodologyConfig(
+        output_dir=str(tmp_path),
+        tasks=("zinc",),
+        train_seeds=(42,),
+        phases=("figures",),
+        accelerator="cpu",
+    )
+    output_dir = tmp_path / "zinc" / "seed_42"
+    (output_dir / "cache" / "scores").mkdir(parents=True)
+    (output_dir / "cache" / "causal").mkdir(parents=True)
+    (output_dir / "cache" / "carriage").mkdir(parents=True)
+    for path in (
+        output_dir / "cache" / "scores" / "raw.pt",
+        output_dir / "cache" / "causal" / "validation.pt",
+        output_dir / "cache" / "carriage" / "fields.pt",
+    ):
+        path.touch()
+    (output_dir / "audits.json").write_text(
+        json.dumps({"findings": []}),
+        encoding="utf-8",
+    )
+    loaded = []
+
+    def artifact(path):
+        stage = Path(path).parent.name
+        if stage == "carriage":
+            raise AssertionError("paper-only finalization must not load carriage")
+        loaded.append(stage)
+        return SimpleNamespace(
+            path=Path(path),
+            metadata={
+                "contract": {
+                    "task": "zinc",
+                    "train_seed": 42,
+                    "protocol_fingerprint": "completed-cache-protocol",
+                    "repository_commit": "worker-commit",
+                },
+                "contract_fingerprint": f"zinc:42:{stage}",
+            },
+            value={"stage": stage},
+        )
+
+    monkeypatch.setattr(
+        "graph_specialisation_metrics.methodology.runner.load_cache_artifact_file",
+        artifact,
+    )
+    monkeypatch.setattr(
+        "graph_specialisation_metrics.methodology.runner.render_cached_figures",
+        lambda *_args, **_kwargs: {
+            "paper_head_ablation": ["ablation.pdf"],
+            "paper_causal_validation": ["causal.pdf"],
+        },
+    )
+    monkeypatch.setattr(
+        "graph_specialisation_metrics.methodology.runner._write_run_summaries",
+        lambda *_args, **_kwargs: None,
+    )
+
+    results = finalize_cached_run(config)
+
+    assert loaded == ["scores", "causal"]
+    assert results["zinc:seed42"]["carriage"] is None
 
 
 def test_matching_population_renderer_uses_all_seed_caches_and_writes_publication_figures(

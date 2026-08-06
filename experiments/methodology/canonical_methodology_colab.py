@@ -132,6 +132,9 @@ run(
     accelerator=ACCELERATOR,
     output_dir=OUTPUT_DIR,
     mount=False,
+    # Redraw the two paper figures with the checked-out plotting code even if an
+    # older complete figure manifest is already present. Scientific caches remain immutable.
+    force=PHASES == ("figures",),
 )
 # On a runtime where GRIT/PyG dependencies are already installed, add skip_install=True.
 # ============================ paste to here ============================

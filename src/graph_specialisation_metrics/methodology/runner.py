@@ -4499,8 +4499,32 @@ def render_cached_figures(
         return load_cache_value_file(path)
 
     scores = consolidated("scores", "raw", required=True)
+    paper_only = task_name in {"zinc", "qm9_gap_dense"}
+    causal = consolidated("causal", "validation", required=paper_only)
+    if paper_only:
+        log(f"[figures] rendering only the two paper figures for {task_name}:seed{train_seed}")
+        figures = render_canonical_paper_causal_figures(
+            scores,
+            causal,
+            output_dir=output_dir / "figures" / "paper_causal",
+            task_name=task_name,
+            seed=int(train_seed),
+            common_metadata={
+                "protocol_version": PROTOCOL_VERSION,
+                "repository_commit": _repository_commit(),
+                "protocol_fingerprint": (
+                    str(source_protocol_fingerprint)
+                    if source_protocol_fingerprint is not None
+                    else config.fingerprint
+                ),
+                "checkpoint_sha256": model_record.get("checkpoint_sha256"),
+                "render_scope": "paper-only",
+            },
+        )
+        atomic_json(output_dir / "figures.json", figures)
+        return figures
+
     carriage = consolidated("carriage", "fields", required=False)
-    causal = consolidated("causal", "validation", required=False)
     layers, heads = _cached_figure_geometry(
         model_record,
         scores,
@@ -4588,6 +4612,7 @@ def finalize_cached_run(config: MethodologyConfig) -> dict[str, Any]:
         for train_seed in config.seeds_for(task_name):
             key = f"{task_name}:seed{int(train_seed)}"
             output_dir = config.root / task_name / f"seed_{int(train_seed)}"
+            paper_only = task_name in {"zinc", "qm9_gap_dense"}
             cache_paths = {
                 "scores": output_dir / "cache" / "scores" / "raw.pt",
                 "carriage": output_dir / "cache" / "carriage" / "fields.pt",
@@ -4596,7 +4621,7 @@ def finalize_cached_run(config: MethodologyConfig) -> dict[str, Any]:
             artifacts = {
                 name: load_cache_artifact_file(path)
                 for name, path in cache_paths.items()
-                if name != "carriage" or path.exists()
+                if name != "carriage" or (not paper_only and path.exists())
             }
             missing_required = [
                 name
@@ -4662,7 +4687,7 @@ def finalize_cached_run(config: MethodologyConfig) -> dict[str, Any]:
             else:
                 required_figure_keys = (
                     ("paper_head_ablation", "paper_causal_validation")
-                    if task_name in {"zinc", "qm9_gap_dense"}
+                    if paper_only
                     else ()
                 )
                 figures = (
