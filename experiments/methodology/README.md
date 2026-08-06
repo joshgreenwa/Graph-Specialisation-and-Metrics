@@ -22,8 +22,11 @@ as provenance rather than used as cache-validity keys. If a file genuinely belon
 scientific contract or is unreadable, the runner preserves it under `cache/_stale/` and recomputes
 that miss; read-only downstream artifact loaders continue to reject incompatible inputs.
 
-The initial production run is configured for the dense `zinc`, `qm9_gap_dense`,
-`peptides_func`, and `peptides_struct` registrations.
+The checked-in launcher is configured to complete `scores` and `carriage` for all six QM9 gap
+controls: 1-hop, 1-hop with local-only RRWP, 2-hop, 1-hop+VNode, 2-hop+VNode, and dense. It uses
+eight graphs per runtime batch with automatic CUDA OOM backoff and then validates both atomic
+48-graph consolidated caches for every task. Existing compatible caches and graph shards resume;
+the execution batch size does not alter their scientific contract.
 
 After the ZINC and QM9 score caches have completed under
 `canonical_methodology_v4_zinc_qm9`, run

@@ -1,36 +1,41 @@
-"""Paste/run this lightweight cell in Colab to execute the final methodology.
+"""Paste/run this lightweight cell in Colab to complete canonical QM9 scores and carriage.
 
 Edit only TASKS, TRAIN_SEEDS/TASK_TRAIN_SEEDS, PHASES, CHECKPOINTS, TASK_OVERRIDES,
-SIZES, FAMILIES, and EXECUTION. Scientific definitions live in
+OUTPUT_DIR, SIZES, FAMILIES, and EXECUTION. Scientific definitions live in
 ``src/graph_specialisation_metrics/README.md``
 and the canonical package; this front end merely checks out the chosen repository revision,
-mounts Drive, and dispatches registered tasks.
+mounts Drive, dispatches registered tasks, and verifies the completed consolidated caches.
 """
 
 # ============================ paste from here ============================
 import os
 import subprocess
 import sys
+from pathlib import Path
 
 REPO_URL = "https://github.com/joshgreenwa/Graph-Specialisation-and-Metrics.git"
-BRANCH = "main"
+BRANCH = "expansion/carriage_experiments"
 REPO_DIR = "/content/Graph-Specialisation-and-Metrics"
 SECRET_NAME = "dissertation_key"
+OUTPUT_DIR = "/content/drive/MyDrive/graph_specialisation_metrics/canonical_methodology"
 
-# First production run: all registered dense task families.
-TASKS = ("zinc", "qm9_gap_dense", "peptides_func", "peptides_struct")
+# Complete every registered QM9 attention/RRWP/VNode control under one scientific contract.
+TASKS = (
+    "qm9_gap_1hop",
+    "qm9_gap_1hop_local",
+    "qm9_gap_2hop",
+    "qm9_gap_1hop_vnode",
+    "qm9_gap_2hop_vnode",
+    "qm9_gap_dense",
+)
 TRAIN_SEEDS = (42,)
-# A public checkpoint has no training-seed ensemble; use a stable seed label for its cache.
-# Example: TASKS = ("graphormer_pcqm4mv2",)
-TASK_TRAIN_SEEDS = {"graphormer_pcqm4mv2": (0,)}
-PHASES = ("scores", "causal", "carriage", "figures")
+TASK_TRAIN_SEEDS = {}
+PHASES = ("scores", "carriage")
 CHECKPOINTS = {}  # e.g. {"graphormer_zinc:42": "/content/drive/MyDrive/.../checkpoint.pt"}
 TASK_OVERRIDES = {
-    # Optional PCQM cache location or Hugging Face cache/offline controls:
-    # "graphormer_pcqm4mv2": {
-    #     "dataset_root": "/content/drive/MyDrive/datasets/pcqm4mv2",
-    #     "cache_dir": "/content/drive/MyDrive/huggingface",
-    #     "local_files_only": False,
+    # Override only if a trained checkpoint directory differs from the registered default:
+    # "qm9_gap_2hop": {
+    #     "drive_dir": "/content/drive/MyDrive/your_actual_qm9_2hop_directory",
     # },
 }
 SIZES = {
@@ -58,8 +63,8 @@ FAMILIES = {
     "causal_response_floor": 0.10,
 }
 EXECUTION = {
-    # Runtime-only: increase on large GPUs; CUDA OOM automatically retries smaller groups.
-    "graphs_per_batch": 4,
+    # Runtime-only: an OOM automatically halves the failing group without duplicating results.
+    "graphs_per_batch": 8,
     "oom_backoff": True,
 }
 
@@ -98,13 +103,14 @@ for module in [
 
 from graph_specialisation_metrics.methodology.colab import run  # noqa: E402
 
-run(
+results = run(
     tasks=TASKS,
     train_seeds=TRAIN_SEEDS,
     task_train_seeds={
         task: seeds for task, seeds in TASK_TRAIN_SEEDS.items() if task in TASKS
     },
     phases=PHASES,
+    output_dir=OUTPUT_DIR,
     checkpoints=CHECKPOINTS,
     task_overrides=TASK_OVERRIDES,
     sizes=SIZES,
@@ -113,4 +119,83 @@ run(
     mount=False,
 )
 # On a runtime where GRIT/PyG dependencies are already installed, add skip_install=True.
+
+# Fail closed unless every requested task has internally valid, complete 48-graph consolidated
+# score and carriage caches under the requested seed/config/checkpoint contract.
+from graph_specialisation_metrics.methodology.cache import (  # noqa: E402
+    load_cache_artifact_file,
+)
+
+expected_graphs = int(SIZES["discovery_graphs"])
+expected_channels = {"semantic", "structural"}
+expected_runs = sum(
+    len(TASK_TRAIN_SEEDS.get(task, TRAIN_SEEDS))
+    for task in TASKS
+)
+assert len(results) == expected_runs, (len(results), expected_runs)
+
+for task in TASKS:
+    for seed in TASK_TRAIN_SEEDS.get(task, TRAIN_SEEDS):
+        seed_root = Path(OUTPUT_DIR) / task / f"seed_{int(seed)}"
+        artifacts = {
+            "scores": load_cache_artifact_file(
+                seed_root / "cache" / "scores" / "raw.pt"
+            ),
+            "carriage": load_cache_artifact_file(
+                seed_root / "cache" / "carriage" / "fields.pt"
+            ),
+        }
+        for stage, artifact in artifacts.items():
+            contract = artifact.metadata["contract"]
+            assert contract["task"] == task, (stage, contract["task"], task)
+            assert int(contract["train_seed"]) == int(seed)
+            assert int(contract["source_cap"]) == int(SIZES["sources_per_graph"])
+            assert int(contract["donors_per_source"]) == int(
+                SIZES["donors_per_source"]
+            )
+            assert int(contract["bootstrap_replicates"]) == int(
+                SIZES["bootstrap_replicates"]
+            )
+            assert set(artifact.value["channels"]) == expected_channels
+
+        for channel in sorted(expected_channels):
+            score_graphs = len(
+                artifacts["scores"].value["channels"][channel]["graph_scores"]
+            )
+            carriage_graphs = len(
+                artifacts["carriage"].value["channels"][channel]["graph_fields"]
+            )
+            assert score_graphs == expected_graphs, (
+                task,
+                seed,
+                channel,
+                "scores",
+                score_graphs,
+            )
+            assert carriage_graphs == expected_graphs, (
+                task,
+                seed,
+                channel,
+                "carriage",
+                carriage_graphs,
+            )
+
+        score_contract = artifacts["scores"].metadata["contract"]
+        carriage_contract = artifacts["carriage"].metadata["contract"]
+        assert score_contract["protocol_fingerprint"] == carriage_contract[
+            "protocol_fingerprint"
+        ]
+        assert score_contract["checkpoint_sha256"] == carriage_contract[
+            "checkpoint_sha256"
+        ]
+        partials = list(seed_root.glob("cache/**/*.partial"))
+        assert not partials, partials
+        print(
+            f"[complete] {task}:seed{seed} "
+            f"scores={expected_graphs}/{expected_graphs}, "
+            f"carriage={expected_graphs}/{expected_graphs}",
+            flush=True,
+        )
+
+print(f"[complete] Validated all {expected_runs} QM9 canonical runs.", flush=True)
 # ============================ paste to here ============================

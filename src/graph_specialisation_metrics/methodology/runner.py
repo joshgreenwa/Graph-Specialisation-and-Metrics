@@ -3858,12 +3858,37 @@ def run_prepared(prepared: PreparedTask, config: MethodologyConfig) -> dict[str,
 
 
 def _release_runtime_memory() -> None:
+    """Best-effort removal of model references and stale CUDA allocator state."""
+
     gc.collect()
     try:
         import torch
 
-        if torch.cuda.is_available():
+        if not torch.cuda.is_available():
+            return
+        try:
+            # Finish queued work before releasing blocks owned by the completed model.
+            torch.cuda.synchronize()
+        except Exception as error:  # noqa: BLE001
+            log(f"[memory-warning] CUDA synchronize during model cleanup failed: {error}")
+        try:
             torch.cuda.empty_cache()
+        except Exception as error:  # noqa: BLE001
+            log(f"[memory-warning] CUDA cache cleanup failed: {error}")
+        try:
+            # Release cached inter-process blocks when the runtime exposes this API.
+            ipc_collect = getattr(torch.cuda, "ipc_collect", None)
+            if callable(ipc_collect):
+                ipc_collect()
+        except Exception as error:  # noqa: BLE001
+            log(f"[memory-warning] CUDA IPC cleanup failed: {error}")
+        try:
+            reset_peak = getattr(torch.cuda, "reset_peak_memory_stats", None)
+            if callable(reset_peak):
+                reset_peak()
+        except Exception as error:  # noqa: BLE001
+            log(f"[memory-warning] CUDA peak-stat reset failed: {error}")
+        log("[memory] released completed model and cleared stale CUDA allocator state")
     except ImportError:
         pass
 

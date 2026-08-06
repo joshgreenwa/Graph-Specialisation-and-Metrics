@@ -84,6 +84,7 @@ from graph_specialisation_metrics.methodology.sampling import (
 from graph_specialisation_metrics.methodology.runner import (
     _carriage_profile,
     _event_normalised_carriage_rows,
+    _release_runtime_memory,
     _write_run_summaries,
 )
 from graph_specialisation_metrics.methodology.scores import (
@@ -226,6 +227,67 @@ def test_run_summary_handles_an_omitted_causal_phase(tmp_path):
     ]
     assert (tmp_path / task / "population.json").exists()
     assert (tmp_path / "index.json").exists()
+
+
+def test_model_cleanup_synchronizes_and_clears_stale_cuda_state(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(
+        "graph_specialisation_metrics.methodology.runner.gc.collect",
+        lambda: calls.append("gc"),
+    )
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: calls.append("synchronize"))
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: calls.append("empty_cache"))
+    monkeypatch.setattr(torch.cuda, "ipc_collect", lambda: calls.append("ipc_collect"))
+    monkeypatch.setattr(
+        torch.cuda,
+        "reset_peak_memory_stats",
+        lambda: calls.append("reset_peak_memory_stats"),
+    )
+
+    _release_runtime_memory()
+
+    assert calls == [
+        "gc",
+        "synchronize",
+        "empty_cache",
+        "ipc_collect",
+        "reset_peak_memory_stats",
+    ]
+
+
+def test_model_cleanup_still_empties_cache_if_cuda_synchronize_fails(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(
+        "graph_specialisation_metrics.methodology.runner.gc.collect",
+        lambda: calls.append("gc"),
+    )
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+
+    def fail_synchronize():
+        calls.append("synchronize")
+        raise RuntimeError("stale asynchronous CUDA error")
+
+    monkeypatch.setattr(torch.cuda, "synchronize", fail_synchronize)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: calls.append("empty_cache"))
+    monkeypatch.setattr(torch.cuda, "ipc_collect", lambda: calls.append("ipc_collect"))
+    monkeypatch.setattr(
+        torch.cuda,
+        "reset_peak_memory_stats",
+        lambda: calls.append("reset_peak_memory_stats"),
+    )
+
+    _release_runtime_memory()
+
+    assert calls == [
+        "gc",
+        "synchronize",
+        "empty_cache",
+        "ipc_collect",
+        "reset_peak_memory_stats",
+    ]
 
 
 def test_numerical_audits_are_soft_by_default_and_strict_on_request():
