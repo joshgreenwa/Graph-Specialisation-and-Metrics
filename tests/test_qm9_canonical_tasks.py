@@ -99,6 +99,7 @@ def test_all_qm9_controls_are_registered_for_canonical_analysis(
     assert task.metric_abort == 0.5
     assert len(task.env_hooks) == 1
     assert CANONICAL_TASKS[name].virtual_node is vnode
+    assert "rrwp_attention_edge_index" in CANONICAL_TASKS[name].fixed_support_fields
     assert CANONICAL_TASKS[name].carrier_policy == (
         "real_nodes_plus_internal_vnode" if vnode else "real_nodes"
     )

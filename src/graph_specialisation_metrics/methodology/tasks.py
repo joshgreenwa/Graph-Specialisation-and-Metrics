@@ -218,7 +218,12 @@ def _known_grit_task(name: str) -> CanonicalTask:
         output=output,
         loss_per_graph=loss,
         fixed_support_fields=(
-            FIXED_SUPPORT_FIELDS + (("pos",) if name.startswith("qm9_") else ())
+            FIXED_SUPPORT_FIELDS
+            + (
+                ("pos", "rrwp_attention_edge_index")
+                if name.startswith("qm9_")
+                else ()
+            )
         ),
         virtual_node=virtual,
         carrier_policy=("real_nodes_plus_internal_vnode" if virtual else "real_nodes"),

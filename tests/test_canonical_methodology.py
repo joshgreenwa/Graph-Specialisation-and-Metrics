@@ -951,6 +951,28 @@ def test_structural_swap_matches_dense_row_column_self_and_fixed_support():
     assert torch.equal(event.rrwp[2], base.rrwp[2])  # donor is not transposed
 
 
+def test_qm9_frozen_attention_support_is_registered_and_preserved():
+    task = get_task("qm9_gap_1hop")
+    base = structural_graph()
+    base.pos = torch.arange(9, dtype=torch.float32).reshape(3, 3)
+    base.rrwp_attention_edge_index = torch.tensor(
+        [[0, 0, 1, 1, 2, 2], [0, 1, 0, 2, 1, 2]],
+        dtype=torch.long,
+    )
+
+    event = structural_donor_swap(
+        base,
+        0,
+        2,
+        task=task,
+        duplicate_tolerance=1e-7,
+    )
+
+    assert "rrwp_attention_edge_index" in task.fixed_support_fields
+    assert torch.equal(event.rrwp_attention_edge_index, base.rrwp_attention_edge_index)
+    assert torch.equal(event.pos, base.pos)
+
+
 def test_sparse_duplicates_agree_or_abort():
     index = torch.tensor([[0, 0, 1], [1, 1, 0]])
     value = torch.tensor([[2.0], [2.0 + 1e-9], [3.0]])
