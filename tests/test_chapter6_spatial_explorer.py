@@ -8,12 +8,15 @@ import torch
 
 from graph_specialisation_metrics.chapter6_spatial_explorer import (
     graph_spatial_metrics,
+    head_role_score_allocation,
     head_metrics,
     layer_distance_profiles,
+    layer_score_organisation,
     layer_summary,
     load_models,
     molecular_scale_relationships,
     run,
+    score_organisation_similarity,
     spatial_width_bootstrap,
     vnode_cross_layer_relationships,
     width_by_head_role,
@@ -179,6 +182,24 @@ def test_head_metrics_keep_width_uncertainty_and_attention_separate(tmp_path):
     graph_rows = graph_spatial_metrics(models)
     assert all(row["num_nodes"] == pytest.approx(3.0) for row in graph_rows)
     assert all(row["diameter"] == pytest.approx(2.0) for row in graph_rows)
+    organisation_rows = layer_score_organisation(rows)
+    assert sum(row["joint_sensitivity_share"] for row in organisation_rows) == pytest.approx(
+        1.0
+    )
+    role_allocation = head_role_score_allocation(models, rows, tail_distance=2.0)
+    assert sum(row["joint_sensitivity_share"] for row in role_allocation) == pytest.approx(
+        1.0
+    )
+    assert sum(
+        row["structural_tail_share"]
+        for row in role_allocation
+        if np.isfinite(row["structural_tail_share"])
+    ) == pytest.approx(1.0)
+    similarity_rows = score_organisation_similarity(
+        distance_rows, organisation_rows, ["zinc_1hop"]
+    )
+    assert similarity_rows[0]["model_wide_similarity"] == pytest.approx(1.0)
+    assert similarity_rows[0]["layer_resolved_similarity"] == pytest.approx(1.0)
 
 
 def test_loader_falls_back_to_equivalent_duplicate_carriage(tmp_path):
@@ -265,6 +286,9 @@ def test_run_skips_missing_components_and_writes_exploratory_outputs(tmp_path):
         "spatial_width_graph_bootstrap.csv",
         "width_contributions_by_distance.csv",
         "width_by_head_role.csv",
+        "layer_score_organisation.csv",
+        "head_role_score_allocation.csv",
+        "score_organisation_similarity.csv",
         "graph_spatial_metrics.csv",
         "vnode_cross_layer_relationships.csv",
         "molecular_scale_relationships.csv",
@@ -287,6 +311,9 @@ def test_run_skips_missing_components_and_writes_exploratory_outputs(tmp_path):
         "13_width_excess_by_distance.png",
         "14_width_excess_by_head_role.png",
         "16_scale_and_structural_width.png",
+        "18_layerwise_score_organisation.png",
+        "19_head_role_score_allocation.png",
+        "20_score_organisation_similarity.png",
     }
 
 

@@ -42,8 +42,15 @@ from .zinc_cached_rrwp_comparison import (
     vnode_profile_rows,
 )
 
-ANALYSIS_VERSION = "chapter6-spatial-explorer-v4"
+ANALYSIS_VERSION = "chapter6-spatial-explorer-v5"
 CHANNELS = ("semantic", "structural")
+ORGANISATION_FAMILIES = (
+    "semantic_leaning",
+    "structural_leaning",
+    "central_responsive",
+    "other",
+    "inactive",
+)
 
 
 @dataclass(frozen=True)
@@ -1036,6 +1043,260 @@ def width_by_head_role(
                     }
                 )
             output.append(record)
+    return output
+
+
+def layer_score_organisation(
+    rows: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Locate total head sensitivity and semantic--structural balance over depth."""
+
+    by_task: dict[str, list[Mapping[str, Any]]] = {}
+    for row in rows:
+        by_task.setdefault(str(row["task"]), []).append(row)
+    output: list[dict[str, Any]] = []
+    for task, task_rows in by_task.items():
+        total_joint = float(
+            np.sum(
+                [
+                    max(float(row["joint_sensitivity"]), 0.0)
+                    for row in task_rows
+                    if np.isfinite(float(row["joint_sensitivity"]))
+                ]
+            )
+        )
+        for layer in sorted({int(row["layer"]) for row in task_rows}):
+            selected = [row for row in task_rows if int(row["layer"]) == layer]
+            joint = np.asarray(
+                [max(float(row["joint_sensitivity"]), 0.0) for row in selected],
+                dtype=np.float64,
+            )
+            selectivity = np.asarray(
+                [float(row["selectivity"]) for row in selected], dtype=np.float64
+            )
+            valid = np.isfinite(joint) & np.isfinite(selectivity) & (joint > 0.0)
+            layer_joint = float(np.sum(joint[np.isfinite(joint)]))
+            weighted_selectivity = (
+                float(np.sum(joint[valid] * selectivity[valid]) / np.sum(joint[valid]))
+                if np.any(valid)
+                else float("nan")
+            )
+            output.append(
+                {
+                    "task": task,
+                    "layer": layer,
+                    "heads": len(selected),
+                    "active_heads": int(
+                        sum(str(row.get("family")) != "inactive" for row in selected)
+                    ),
+                    "joint_sensitivity_sum": layer_joint,
+                    "joint_sensitivity_share": (
+                        layer_joint / total_joint if total_joint > 1.0e-12 else float("nan")
+                    ),
+                    "joint_weighted_selectivity": weighted_selectivity,
+                }
+            )
+    return output
+
+
+def head_role_score_allocation(
+    models: Sequence[SpatialModel],
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    tail_distance: float = 4.0,
+) -> list[dict[str, Any]]:
+    """Allocate total sensitivity and long-range score mass across head roles."""
+
+    row_lookup = {
+        (str(row["task"]), int(row["layer"]), int(row["head"])): row
+        for row in rows
+    }
+    output: list[dict[str, Any]] = []
+    for model in models:
+        score = model.score
+        axis = tuple(score["axis"])
+        numeric = np.asarray(
+            [
+                value if (value := _numeric_distance(label)) is not None else np.nan
+                for label in axis
+            ],
+            dtype=np.float64,
+        )
+        molecular_masks = {
+            channel: np.isfinite(numeric) & _reportable(score, channel)
+            for channel in CHANNELS
+        }
+        tail_masks = {
+            channel: molecular_masks[channel] & (numeric >= float(tail_distance))
+            for channel in CHANNELS
+        }
+        accumulators = {
+            family: {
+                "heads": 0,
+                "J": 0.0,
+                "semantic_total": 0.0,
+                "semantic_tail": 0.0,
+                "structural_total": 0.0,
+                "structural_tail": 0.0,
+            }
+            for family in ORGANISATION_FAMILIES
+        }
+        semantic = np.maximum(
+            _as_numpy(score["channels"]["semantic"]["heatmap_exact_head"]), 0.0
+        )
+        structural = np.maximum(
+            _as_numpy(score["channels"]["structural"]["heatmap_exact_head"]), 0.0
+        )
+        for layer in range(semantic.shape[0]):
+            for head in range(semantic.shape[1]):
+                row = row_lookup[(model.task, layer, head)]
+                family = str(row.get("family", "other"))
+                if family not in accumulators:
+                    family = "other"
+                target = accumulators[family]
+                target["heads"] += 1
+                target["J"] += max(float(row["joint_sensitivity"]), 0.0)
+                for channel, values in (
+                    ("semantic", semantic[layer, head]),
+                    ("structural", structural[layer, head]),
+                ):
+                    target[f"{channel}_total"] += float(
+                        np.sum(values[molecular_masks[channel]])
+                    )
+                    target[f"{channel}_tail"] += float(
+                        np.sum(values[tail_masks[channel]])
+                    )
+        total_joint = sum(float(value["J"]) for value in accumulators.values())
+        total_tail = {
+            channel: sum(
+                float(value[f"{channel}_tail"]) for value in accumulators.values()
+            )
+            for channel in CHANNELS
+        }
+        for family in ORGANISATION_FAMILIES:
+            values = accumulators[family]
+            record: dict[str, Any] = {
+                "task": model.task,
+                "family": family,
+                "heads": int(values["heads"]),
+                "tail_distance": float(tail_distance),
+                "joint_sensitivity_mass": float(values["J"]),
+                "joint_sensitivity_share": (
+                    float(values["J"]) / total_joint
+                    if total_joint > 1.0e-12
+                    else float("nan")
+                ),
+            }
+            for channel in CHANNELS:
+                channel_total = float(values[f"{channel}_total"])
+                channel_tail = float(values[f"{channel}_tail"])
+                record[f"{channel}_tail_mass"] = channel_tail
+                record[f"{channel}_tail_share"] = (
+                    channel_tail / total_tail[channel]
+                    if total_tail[channel] > 1.0e-12
+                    else float("nan")
+                )
+                record[f"{channel}_within_family_tail_fraction"] = (
+                    channel_tail / channel_total
+                    if channel_total > 1.0e-12
+                    else float("nan")
+                )
+            output.append(record)
+    return output
+
+
+def _jensen_shannon_similarity(left: np.ndarray, right: np.ndarray) -> float:
+    left = np.maximum(np.asarray(left, dtype=np.float64), 0.0)
+    right = np.maximum(np.asarray(right, dtype=np.float64), 0.0)
+    if left.shape != right.shape or left.sum() <= 0.0 or right.sum() <= 0.0:
+        return float("nan")
+    left = left / left.sum()
+    right = right / right.sum()
+    midpoint = 0.5 * (left + right)
+
+    def divergence(values: np.ndarray) -> float:
+        valid = values > 0.0
+        return float(np.sum(values[valid] * np.log2(values[valid] / midpoint[valid])))
+
+    distance = math.sqrt(max(0.0, 0.5 * divergence(left) + 0.5 * divergence(right)))
+    return float(np.clip(1.0 - distance, 0.0, 1.0))
+
+
+def score_organisation_similarity(
+    distance_rows: Sequence[Mapping[str, Any]],
+    layer_organisation_rows: Sequence[Mapping[str, Any]],
+    tasks: Sequence[str],
+) -> list[dict[str, Any]]:
+    """Compare model-wide score geometry with its layer-resolved placement."""
+
+    tasks = [
+        str(task)
+        for task in tasks
+        if any(str(row["task"]) == str(task) for row in distance_rows)
+    ]
+    global_keys = sorted(
+        {
+            (channel, str(row["distance_group"]))
+            for row in distance_rows
+            if str(row["profile_kind"]) == "score_mass"
+            for channel in CHANNELS
+        }
+    )
+    layer_keys = sorted(
+        {
+            (int(row["layer"]), channel, str(row["distance_group"]))
+            for row in distance_rows
+            if str(row["profile_kind"]) == "score_mass"
+            for channel in CHANNELS
+        }
+    )
+    global_vectors: dict[str, np.ndarray] = {}
+    layer_vectors: dict[str, np.ndarray] = {}
+    for task in tasks:
+        layer_weight = {
+            int(row["layer"]): float(row["joint_sensitivity_share"])
+            for row in layer_organisation_rows
+            if str(row["task"]) == task
+        }
+        layer_lookup: dict[tuple[int, str, str], float] = {}
+        for row in distance_rows:
+            if str(row["task"]) != task or str(row["profile_kind"]) != "score_mass":
+                continue
+            for channel in CHANNELS:
+                layer_lookup[
+                    (int(row["layer"]), channel, str(row["distance_group"]))
+                ] = float(row[f"{channel}_share_mean"]) * layer_weight.get(
+                    int(row["layer"]), 0.0
+                )
+        layer_vector = np.asarray(
+            [layer_lookup.get(key, 0.0) for key in layer_keys], dtype=np.float64
+        )
+        layer_vectors[task] = layer_vector
+        global_lookup = {key: 0.0 for key in global_keys}
+        for (_layer, channel, distance), value in zip(layer_keys, layer_vector):
+            global_lookup[(channel, distance)] += float(value)
+        global_vectors[task] = np.asarray(
+            [global_lookup[key] for key in global_keys], dtype=np.float64
+        )
+    output: list[dict[str, Any]] = []
+    for left_task in tasks:
+        for right_task in tasks:
+            global_similarity = _jensen_shannon_similarity(
+                global_vectors[left_task], global_vectors[right_task]
+            )
+            layer_similarity = _jensen_shannon_similarity(
+                layer_vectors[left_task], layer_vectors[right_task]
+            )
+            output.append(
+                {
+                    "task_a": left_task,
+                    "task_b": right_task,
+                    "model_wide_similarity": global_similarity,
+                    "layer_resolved_similarity": layer_similarity,
+                    "placement_gap": global_similarity - layer_similarity,
+                    "similarity": "one minus Jensen--Shannon distance",
+                }
+            )
     return output
 
 
@@ -2096,6 +2357,211 @@ def _plot_scale_relationship(
     return paths
 
 
+def _plot_layer_score_organisation(
+    rows: Sequence[Mapping[str, Any]], tasks: Sequence[str], figures_dir: Path
+) -> list[Path]:
+    import matplotlib.pyplot as plt
+
+    tasks = [task for task in tasks if any(str(row["task"]) == task for row in rows)]
+    if not rows or not tasks:
+        return []
+    figure, axes = plt.subplots(
+        2,
+        len(tasks),
+        figsize=(3.25 * len(tasks), 6.6),
+        squeeze=False,
+        sharex="col",
+        sharey="row",
+        constrained_layout=True,
+    )
+    for column, task in enumerate(tasks):
+        selected = sorted(
+            [row for row in rows if str(row["task"]) == task],
+            key=lambda row: int(row["layer"]),
+        )
+        layers = [int(row["layer"]) for row in selected]
+        axes[0, column].plot(
+            layers,
+            [float(row["joint_sensitivity_share"]) for row in selected],
+            color="#5B5F97",
+            marker="o",
+            linewidth=1.7,
+        )
+        axes[1, column].plot(
+            layers,
+            [float(row["joint_weighted_selectivity"]) for row in selected],
+            color="#7A5195",
+            marker="s",
+            linewidth=1.7,
+        )
+        axes[1, column].axhline(0.0, color="#777777", linestyle="--", linewidth=0.8)
+        axes[0, column].set_title(_task_label(task), fontsize=10)
+        axes[1, column].set_xlabel("layer")
+        if column == 0:
+            axes[0, column].set_ylabel("share of total $J$")
+            axes[1, column].set_ylabel(r"$J$-weighted $D_{\rm rel}$")
+    axes[1, 0].set_ylim(-1.02, 1.02)
+    figure.suptitle("Where is semantic–structural computation allocated across depth?")
+    paths = _save_figure(figure, figures_dir, "18_layerwise_score_organisation")
+    plt.close(figure)
+    return paths
+
+
+def _plot_head_role_score_allocation(
+    rows: Sequence[Mapping[str, Any]], tasks: Sequence[str], figures_dir: Path
+) -> list[Path]:
+    import matplotlib.pyplot as plt
+
+    tasks = [task for task in tasks if any(str(row["task"]) == task for row in rows)]
+    if not rows or not tasks:
+        return []
+    family_labels = {
+        "semantic_leaning": "semantic-leaning",
+        "structural_leaning": "structural-leaning",
+        "central_responsive": "high-$J$ generalist",
+        "other": "other active",
+        "inactive": "low-$J$",
+    }
+    family_colours = {
+        "semantic_leaning": "#0072B2",
+        "structural_leaning": "#D55E00",
+        "central_responsive": "#7A5195",
+        "other": "#009E73",
+        "inactive": "#AAAAAA",
+    }
+    panels = (
+        ("joint_sensitivity_share", "Total sensitivity $J$"),
+        ("semantic_tail_share", r"Semantic score at $d\geq4$"),
+        ("structural_tail_share", r"Structural score at $d\geq4$"),
+    )
+    figure, axes = plt.subplots(
+        1,
+        len(panels),
+        figsize=(15.2, 4.8),
+        squeeze=False,
+        sharey=True,
+        constrained_layout=True,
+    )
+    x = np.arange(len(tasks))
+    for column, (field, title) in enumerate(panels):
+        axis = axes[0, column]
+        bottom = np.zeros(len(tasks), dtype=np.float64)
+        for family in ORGANISATION_FAMILIES:
+            lookup = {
+                str(row["task"]): float(row[field])
+                for row in rows
+                if str(row["family"]) == family
+            }
+            values = np.asarray([lookup.get(task, 0.0) for task in tasks])
+            values = np.where(np.isfinite(values), values, 0.0)
+            axis.bar(
+                x,
+                values,
+                bottom=bottom,
+                color=family_colours[family],
+                width=0.72,
+                label=family_labels[family],
+            )
+            bottom += values
+        axis.set_title(title, fontsize=11)
+        axis.set_xticks(
+            x,
+            [_task_label(task) for task in tasks],
+            rotation=28,
+            ha="right",
+        )
+        axis.set_ylim(0.0, 1.02)
+        if column == 0:
+            axis.set_ylabel("fraction allocated to head family")
+    handles, labels = axes[0, 0].get_legend_handles_labels()
+    figure.legend(
+        handles,
+        labels,
+        loc="lower center",
+        bbox_to_anchor=(0.5, -0.025),
+        ncol=len(ORGANISATION_FAMILIES),
+        frameon=False,
+        fontsize=8,
+    )
+    figure.suptitle("How do architectures divide computation across head roles?")
+    paths = _save_figure(figure, figures_dir, "19_head_role_score_allocation")
+    plt.close(figure)
+    return paths
+
+
+def _plot_score_organisation_similarity(
+    rows: Sequence[Mapping[str, Any]], tasks: Sequence[str], figures_dir: Path
+) -> list[Path]:
+    import matplotlib.pyplot as plt
+
+    tasks = [task for task in tasks if any(str(row["task_a"]) == task for row in rows)]
+    if not rows or not tasks:
+        return []
+    lookup = {
+        (str(row["task_a"]), str(row["task_b"])): row for row in rows
+    }
+    fields = (
+        ("model_wide_similarity", "Model-wide profile similarity"),
+        ("layer_resolved_similarity", "Layer-resolved similarity"),
+        ("placement_gap", "Profile similarity minus layer similarity"),
+    )
+    matrices: list[np.ndarray] = []
+    for field, _title in fields:
+        matrices.append(
+            np.asarray(
+                [
+                    [float(lookup[(left, right)][field]) for right in tasks]
+                    for left in tasks
+                ],
+                dtype=np.float64,
+            )
+        )
+    gap_limit = max(float(np.nanmax(np.abs(matrices[2]))), 0.05)
+    figure, axes = plt.subplots(
+        1,
+        3,
+        figsize=(15.0, 5.0),
+        squeeze=False,
+        constrained_layout=True,
+    )
+    labels = [_task_label(task) for task in tasks]
+    for column, ((field, title), matrix) in enumerate(zip(fields, matrices)):
+        del field
+        axis = axes[0, column]
+        if column < 2:
+            image = axis.imshow(matrix, cmap="viridis", vmin=0.0, vmax=1.0)
+        else:
+            image = axis.imshow(
+                matrix, cmap="coolwarm", vmin=-gap_limit, vmax=gap_limit
+            )
+        axis.set_xticks(np.arange(len(tasks)), labels, rotation=42, ha="right", fontsize=8)
+        axis.set_yticks(np.arange(len(tasks)), labels, fontsize=8)
+        axis.set_title(title, fontsize=11)
+        for row_index in range(len(tasks)):
+            for task_index in range(len(tasks)):
+                value = matrix[row_index, task_index]
+                axis.text(
+                    task_index,
+                    row_index,
+                    f"{value:.2f}",
+                    ha="center",
+                    va="center",
+                    fontsize=7,
+                    color=(
+                        "white"
+                        if abs(value) > (0.55 if column < 2 else 0.55 * gap_limit)
+                        else "black"
+                    ),
+                )
+        figure.colorbar(image, ax=axis, fraction=0.046, pad=0.03)
+    figure.suptitle(
+        "Do architectures preserve global score geometry while reallocating it across layers?"
+    )
+    paths = _save_figure(figure, figures_dir, "20_score_organisation_similarity")
+    plt.close(figure)
+    return paths
+
+
 def _plot_score_carriage(
     profile_rows: Sequence[Mapping[str, Any]], tasks: Sequence[str], figures_dir: Path
 ) -> list[Path]:
@@ -2194,6 +2660,11 @@ def run(
     width_bootstrap_rows = spatial_width_bootstrap(models)
     width_contribution_rows = width_contribution_profiles(models)
     width_role_rows = width_by_head_role(head_rows)
+    layer_organisation_rows = layer_score_organisation(head_rows)
+    role_allocation_rows = head_role_score_allocation(models, head_rows)
+    organisation_similarity_rows = score_organisation_similarity(
+        distance_rows, layer_organisation_rows, [model.task for model in models]
+    )
     graph_rows = graph_spatial_metrics(models)
     vnode_cross_layer_rows = vnode_cross_layer_relationships(graph_rows)
     scale_rows = molecular_scale_relationships(graph_rows)
@@ -2208,6 +2679,9 @@ def run(
         "spatial_width_graph_bootstrap.csv": width_bootstrap_rows,
         "width_contributions_by_distance.csv": width_contribution_rows,
         "width_by_head_role.csv": width_role_rows,
+        "layer_score_organisation.csv": layer_organisation_rows,
+        "head_role_score_allocation.csv": role_allocation_rows,
+        "score_organisation_similarity.csv": organisation_similarity_rows,
         "graph_spatial_metrics.csv": graph_rows,
         "vnode_cross_layer_relationships.csv": vnode_cross_layer_rows,
         "molecular_scale_relationships.csv": scale_rows,
@@ -2267,6 +2741,21 @@ def run(
             stem="17_scale_and_vnode_allocation",
         )
     )
+    figures.extend(
+        _plot_layer_score_organisation(
+            layer_organisation_rows, available_tasks, figures_dir
+        )
+    )
+    figures.extend(
+        _plot_head_role_score_allocation(
+            role_allocation_rows, available_tasks, figures_dir
+        )
+    )
+    figures.extend(
+        _plot_score_organisation_similarity(
+            organisation_similarity_rows, available_tasks, figures_dir
+        )
+    )
     summary = {
         "analysis_version": ANALYSIS_VERSION,
         "tasks_requested": list(tasks),
@@ -2293,19 +2782,51 @@ def run(
         ],
         "figures": [str(path) for path in figures],
         "interpretation": {
-            "alignment": "overlap of normalized within-head profiles, equal to 1 minus total variation",
-            "expected_distance": "molecular-only expected graph distance; virtual carriers remain separate",
+            "alignment": (
+                "overlap of normalized within-head profiles, equal to 1 minus "
+                "total variation"
+            ),
+            "expected_distance": (
+                "molecular-only expected graph distance; virtual carriers remain "
+                "separate"
+            ),
             "spatial_width": "variance of normalized molecular score mass over graph distance",
             "uncertainty": "standard error of expected distance across cached held-out graphs",
             "width_interval": "paired graph-bootstrap interval; heads remain fixed",
-            "width_contribution": "per-distance contribution to molecular profile variance around each head's own expected distance",
-            "head_weighting": "equal-head and joint-sensitivity-weighted summaries are reported separately",
-            "opportunity_correction": "score mass per available source-carrier opportunity in each distance shell",
+            "width_contribution": (
+                "per-distance contribution to molecular profile variance around each "
+                "head's own expected distance"
+            ),
+            "head_weighting": (
+                "equal-head and joint-sensitivity-weighted summaries are reported "
+                "separately"
+            ),
+            "opportunity_correction": (
+                "score mass per available source-carrier opportunity in each distance "
+                "shell"
+            ),
             "virtual_node": "reported separately because it has no molecular graph distance",
-            "cross_layer": "graphwise association between semantic VN allocation at layer l and molecular organisation at layer l+1",
-            "molecular_scale": "graphwise Spearman association with cached carrier count and molecular diameter",
+            "cross_layer": (
+                "graphwise association between semantic VN allocation at layer l and "
+                "molecular organisation at layer l+1"
+            ),
+            "molecular_scale": (
+                "graphwise Spearman association with cached carrier count and "
+                "molecular diameter"
+            ),
+            "score_organisation": (
+                "total J allocation over layers and established head families; "
+                "long-range tails use molecular distances d >= 4"
+            ),
+            "organisation_similarity": (
+                "one minus Jensen--Shannon distance, comparing J-weighted score "
+                "profiles before and after retaining layer identity"
+            ),
             "attention": "clean attention mass by graph distance, not a causal score",
-            "carriage": "final-state response under the same intervention family, not task necessity",
+            "carriage": (
+                "final-state response under the same intervention family, not task "
+                "necessity"
+            ),
         },
     }
     (output_dir / "summary.json").write_text(
@@ -2323,6 +2844,9 @@ def run(
         "width_bootstrap_rows": width_bootstrap_rows,
         "width_contribution_rows": width_contribution_rows,
         "width_role_rows": width_role_rows,
+        "layer_organisation_rows": layer_organisation_rows,
+        "role_allocation_rows": role_allocation_rows,
+        "organisation_similarity_rows": organisation_similarity_rows,
         "graph_rows": graph_rows,
         "vnode_cross_layer_rows": vnode_cross_layer_rows,
         "scale_rows": scale_rows,
@@ -2334,14 +2858,17 @@ __all__ = [
     "SpatialModel",
     "graph_spatial_metrics",
     "head_metrics",
+    "head_role_score_allocation",
     "inventory",
     "layer_distance_profiles",
+    "layer_score_organisation",
     "layer_summary",
     "load_models",
     "model_profiles",
     "molecular_scale_relationships",
     "representative_heads",
     "run",
+    "score_organisation_similarity",
     "spatial_width_bootstrap",
     "uncertainty_profiles",
     "vnode_cross_layer_relationships",
