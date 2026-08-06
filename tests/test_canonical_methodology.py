@@ -84,6 +84,7 @@ from graph_specialisation_metrics.methodology.sampling import (
 from graph_specialisation_metrics.methodology.runner import (
     _carriage_profile,
     _event_normalised_carriage_rows,
+    _write_run_summaries,
 )
 from graph_specialisation_metrics.methodology.scores import (
     JOINT_AXIS_LABEL,
@@ -180,6 +181,51 @@ def test_task_specific_seed_labels_support_mixed_backends():
     assert config.scientific_record["task_train_seeds"] == {
         "graphormer_pcqm4mv2": [0]
     }
+
+
+def test_run_summary_handles_an_omitted_causal_phase(tmp_path):
+    task = "zinc_2hop_vnode"
+    output = tmp_path / task / "seed_42"
+    config = MethodologyConfig(
+        output_dir=str(tmp_path),
+        tasks=(task,),
+        train_seeds=(42,),
+        phases=("scores", "carriage"),
+        accelerator="cpu",
+    )
+    results = {
+        f"{task}:seed42": {
+            "task": task,
+            "seed": 42,
+            "output_dir": str(output),
+            "scores": {
+                "channels": {
+                    "semantic": {"raw": np.asarray([[1.0, 2.0]])},
+                    "structural": {"raw": np.asarray([[3.0, 4.0]])},
+                },
+                "coordinates": SimpleNamespace(
+                    selectivity=np.asarray([[0.2, -0.1]]),
+                    active=np.asarray([[True, False]]),
+                ),
+            },
+            "carriage": {},
+            "causal": None,
+            "figures": {},
+            "headline_eligible": True,
+        }
+    }
+
+    population = _write_run_summaries(
+        config,
+        results,
+        {f"{task}:seed42": []},
+    )
+
+    assert population[task]["regime_calls"] == [
+        {"seed": 42, "regime": "not_available"}
+    ]
+    assert (tmp_path / task / "population.json").exists()
+    assert (tmp_path / "index.json").exists()
 
 
 def test_numerical_audits_are_soft_by_default_and_strict_on_request():
