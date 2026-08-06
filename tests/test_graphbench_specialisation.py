@@ -81,6 +81,7 @@ from graph_specialisation_metrics.methodology.runner import (
     _cached_figure_geometry,
     _event_rng,
     _load_complete_figure_manifest,
+    _paper_focused_specialists,
     _stage_plan,
     finalize_cached_run,
     render_cached_figures,
@@ -2324,6 +2325,40 @@ def test_paper_only_finalizer_does_not_load_carriage_cache(monkeypatch, tmp_path
 
     assert loaded == ["scores", "causal"]
     assert results["zinc:seed42"]["carriage"] is None
+
+
+def test_legacy_paper_focused_sidecar_is_derived_only_once(monkeypatch, tmp_path):
+    config = MethodologyConfig(
+        output_dir=str(tmp_path),
+        tasks=("zinc",),
+        train_seeds=(42,),
+        phases=("figures",),
+        accelerator="cpu",
+    )
+    calls = []
+    focused = {"status": "estimable", "pair_set_order": ("strongest_candidates",)}
+
+    def derive(scores, causal, *, config):
+        calls.append((scores, causal, config))
+        return focused
+
+    monkeypatch.setattr(
+        "graph_specialisation_metrics.methodology.runner.derive_legacy_focused_specialists",
+        derive,
+    )
+    kwargs = {
+        "output_dir": tmp_path / "zinc" / "seed_42",
+        "task_name": "zinc",
+        "train_seed": 42,
+        "source_protocol_fingerprint": "completed-cache-protocol",
+    }
+
+    first = _paper_focused_specialists({"scores": True}, {"causal": True}, config, **kwargs)
+    second = _paper_focused_specialists({"scores": True}, {"causal": True}, config, **kwargs)
+
+    assert first == focused
+    assert second == focused
+    assert len(calls) == 1
 
 
 def test_matching_population_renderer_uses_all_seed_caches_and_writes_publication_figures(

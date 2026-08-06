@@ -13,7 +13,12 @@ from graph_specialisation_metrics.methodology.graphbench_population_figures impo
 )
 from graph_specialisation_metrics.methodology.paper_causal_figures import (
     canonical_paper_figure_data,
+    derive_legacy_focused_specialists,
     render_canonical_paper_causal_figures,
+)
+from graph_specialisation_metrics.methodology.protocol import (
+    FamilyPolicy,
+    MethodologyConfig,
 )
 from graph_specialisation_metrics.methodology.scores import HeadCoordinates
 
@@ -118,6 +123,55 @@ def _canonical_cache_values():
         },
     }
     return scores, causal
+
+
+def test_legacy_causal_cache_materializes_missing_focused_summary(tmp_path):
+    scores, causal = _canonical_cache_values()
+    causal = dict(causal)
+    causal.pop("focused_specialists")
+    selectivity = np.asarray(scores["coordinates"].selectivity)
+    score_estimate = np.zeros((6, *selectivity.shape), dtype=np.float64)
+    score_estimate[5] = selectivity
+    scores = {
+        **scores,
+        "intervals": Interval(
+            estimate=score_estimate,
+            low=score_estimate - 0.02,
+            high=score_estimate + 0.02,
+            replicates=2_000,
+            rng_seed=17_071,
+            resampled_levels=("graph", "source", "donor"),
+        ),
+    }
+    for head_position, channels in enumerate(causal["event_records"].values()):
+        for channel_position, rows in enumerate(channels.values()):
+            for row in rows:
+                row.update(
+                    {
+                        "P_gross_matched": 0.40 + 0.01 * head_position,
+                        "gross_necessity": 0.08 + 0.01 * head_position,
+                        "R_align_adjusted": (
+                            0.16 + 0.01 * head_position + 0.01 * channel_position
+                        ),
+                        "I_align_adjusted": (
+                            0.12 + 0.01 * head_position + 0.01 * channel_position
+                        ),
+                    }
+                )
+    config = MethodologyConfig(
+        output_dir=str(tmp_path),
+        tasks=("zinc",),
+        train_seeds=(42,),
+        phases=("figures",),
+        accelerator="cpu",
+        families=FamilyPolicy(specialist_minimum_pairs=1),
+    )
+
+    focused = derive_legacy_focused_specialists(scores, causal, config=config)
+
+    assert focused["status"] == "estimable"
+    assert focused["pair_sets"]["strongest_candidates"]["pair_count"] == 1
+    assert np.isfinite(focused["interval"].estimate).all()
 
 
 def test_head_ablation_scatter_uses_opaque_points_and_boxed_black_statistic():

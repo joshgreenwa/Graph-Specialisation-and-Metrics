@@ -227,6 +227,69 @@ def canonical_paper_figure_data(
     }
 
 
+def derive_legacy_focused_specialists(
+    scores: Mapping[str, Any],
+    causal: Mapping[str, Any],
+    *,
+    config: Any,
+) -> dict[str, Any]:
+    """Materialize the focused summary from complete pre-focused CPU caches.
+
+    Canonical ZINC/QM9 caches produced before the focused validation extension
+    already contain every individual-head causal event and the joint score
+    interval.  Only the small derived summary is absent.  Rebuilding it invokes
+    no model, dataset, checkpoint, or intervention.
+    """
+
+    from .scores import freeze_threshold_specialists
+    from .validation import _focused_specialist_validation
+
+    classification = scores.get("specialist_classification")
+    if not classification:
+        coordinate_interval = scores.get("intervals")
+        if coordinate_interval is None:
+            raise ValueError(
+                "legacy paper rendering requires the cached joint score interval"
+            )
+        low = _interval_array(coordinate_interval, "low")
+        high = _interval_array(coordinate_interval, "high")
+        if low.ndim != 3 or high.shape != low.shape or low.shape[0] < 6:
+            raise ValueError(
+                "legacy joint score interval must contain the six canonical "
+                "coordinate planes"
+            )
+        classification = freeze_threshold_specialists(
+            scores["coordinates"],
+            selectivity_interval=(low[5], high[5]),
+            preference_threshold=config.families.equivalence_half_width,
+            activity_threshold=config.families.activity_floor,
+            candidate_limit=config.families.specialist_candidate_limit,
+            minimum_candidate_pairs=config.families.specialist_minimum_pairs,
+        )
+    records = causal.get("event_records")
+    if not records:
+        raise ValueError(
+            "legacy paper rendering requires cached individual-head causal events"
+        )
+    adapted_scores = dict(scores)
+    adapted_scores["specialist_classification"] = classification
+    focused = _focused_specialist_validation(
+        {"records": records},
+        adapted_scores,
+        config,
+        source_resampling=(
+            bool(config.bootstrap.resample_source),
+            bool(config.bootstrap.resample_source),
+        ),
+    )
+    if focused.get("status") != "estimable":
+        raise ValueError(
+            "cached ZINC/QM9 events do not yield an estimable strongest-candidate "
+            f"analysis: {focused.get('reason') or focused.get('categorical_reason')}"
+        )
+    return focused
+
+
 def graphormer_focused_paper_figure_data(
     core: Mapping[str, Any],
     gate: Mapping[str, Any],
@@ -466,6 +529,7 @@ __all__ = [
     "PAPER_ABLATION_STEM",
     "PAPER_CAUSAL_STEM",
     "canonical_paper_figure_data",
+    "derive_legacy_focused_specialists",
     "graphormer_focused_paper_figure_data",
     "render_canonical_paper_causal_figures",
     "render_paper_causal_figures",

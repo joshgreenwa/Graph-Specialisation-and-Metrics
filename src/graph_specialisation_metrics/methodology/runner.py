@@ -81,7 +81,10 @@ from .graphbench_population_figures import (
     FOCUSED_GRAPHBENCH_TASK,
     render_graphbench_population_figures,
 )
-from .paper_causal_figures import render_canonical_paper_causal_figures
+from .paper_causal_figures import (
+    derive_legacy_focused_specialists,
+    render_canonical_paper_causal_figures,
+)
 from .protocol import (
     CHANNELS,
     PROTOCOL_VERSION,
@@ -4472,6 +4475,73 @@ def _cached_figure_geometry(
     return recorded
 
 
+def _paper_focused_specialists(
+    scores: Mapping[str, Any],
+    causal: Mapping[str, Any],
+    config: MethodologyConfig,
+    *,
+    output_dir: Path,
+    task_name: str,
+    train_seed: int,
+    source_protocol_fingerprint: str,
+) -> Mapping[str, Any]:
+    """Load or derive the additive focused summary for a legacy causal cache."""
+
+    import torch
+
+    version = "canonical-paper-focused-from-events-v1"
+    derivation_contract = {
+        "version": version,
+        "task": str(task_name),
+        "train_seed": int(train_seed),
+        "source_protocol_fingerprint": str(source_protocol_fingerprint),
+        "bootstrap": dataclasses.asdict(config.bootstrap),
+        "selection": {
+            "activity_floor": float(config.families.activity_floor),
+            "equivalence_half_width": float(
+                config.families.equivalence_half_width
+            ),
+            "candidate_limit": int(config.families.specialist_candidate_limit),
+            "minimum_pairs": int(config.families.specialist_minimum_pairs),
+        },
+        "effect_floor": float(config.numerical.effect_floor),
+    }
+    fingerprint = stable_hash(derivation_contract)
+    path = output_dir / "cache" / "paper_causal" / "focused_specialists_v1.pt"
+    if path.exists():
+        try:
+            payload = torch.load(path, map_location="cpu", weights_only=False)
+        except (OSError, RuntimeError, EOFError):
+            payload = None
+        if (
+            isinstance(payload, Mapping)
+            and payload.get("derivation_fingerprint") == fingerprint
+            and isinstance(payload.get("value"), Mapping)
+            and payload["value"].get("status") == "estimable"
+        ):
+            log(f"[figures] loaded cached paper-focused summary from {path}")
+            return payload["value"]
+
+    log(
+        "[figures] legacy causal cache predates the paper-focused summary; "
+        "deriving it once from cached individual-head events on CPU"
+    )
+    focused = derive_legacy_focused_specialists(scores, causal, config=config)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".partial")
+    torch.save(
+        {
+            "derivation_contract": derivation_contract,
+            "derivation_fingerprint": fingerprint,
+            "value": focused,
+        },
+        temporary,
+    )
+    temporary.replace(path)
+    log(f"[figures] cached paper-focused summary at {path}")
+    return focused
+
+
 def render_cached_figures(
     config: MethodologyConfig,
     task_name: str,
@@ -4502,6 +4572,22 @@ def render_cached_figures(
     paper_only = task_name in {"zinc", "qm9_gap_dense"}
     causal = consolidated("causal", "validation", required=paper_only)
     if paper_only:
+        if not causal.get("focused_specialists"):
+            protocol_fingerprint = (
+                str(source_protocol_fingerprint)
+                if source_protocol_fingerprint is not None
+                else config.fingerprint
+            )
+            causal = dict(causal)
+            causal["focused_specialists"] = _paper_focused_specialists(
+                scores,
+                causal,
+                config,
+                output_dir=output_dir,
+                task_name=task_name,
+                train_seed=int(train_seed),
+                source_protocol_fingerprint=protocol_fingerprint,
+            )
         log(f"[figures] rendering only the two paper figures for {task_name}:seed{train_seed}")
         figures = render_canonical_paper_causal_figures(
             scores,
