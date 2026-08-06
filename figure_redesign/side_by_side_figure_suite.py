@@ -46,7 +46,7 @@ THIRD_WIDTH = (TEXT_WIDTH - 2.0 * TRIPTYCH_GAP) / 3.0
 
 PAIR_SIZE = (HALF_WIDTH, 3.12)
 CAUSAL_SIZE = (THIRD_WIDTH, 2.36)
-MATRIX_SIZE = (HALF_WIDTH, 2.68)
+MATRIX_SIZE = (HALF_WIDTH, 2.70)
 
 SEMANTIC = base.SEMANTIC
 STRUCTURAL = base.STRUCTURAL
@@ -70,8 +70,14 @@ def save_component(fig: mpl.figure.Figure, stem: str) -> tuple[Path, Path]:
         "Title": stem,
         "Subject": "Synthetic-data side-by-side figure mockup",
     }
-    fig.savefig(png, dpi=300, facecolor=base.PAPER, bbox_inches=None)
-    fig.savefig(pdf, dpi=300, facecolor=base.PAPER, bbox_inches=None, metadata=metadata)
+    fig.savefig(png, dpi=base.PNG_DPI, facecolor=base.PAPER, bbox_inches=None)
+    fig.savefig(
+        pdf,
+        dpi=base.PDF_RASTER_DPI,
+        facecolor=base.PAPER,
+        bbox_inches=None,
+        metadata=metadata,
+    )
     plt.close(fig)
     return png, pdf
 
@@ -143,12 +149,9 @@ def draw_heads(
     y_values: Sequence[float],
     *,
     selected_rings: bool = False,
-    dim_unreliable: bool = False,
     marker_size: float = 27.0,
 ) -> None:
     for point, x, y in zip(points, x_values, y_values):
-        reliable = point.joint_sensitivity >= 0.5
-        alpha = 0.90 if (reliable or not dim_unreliable) else 0.16
         marker = base.SEED_MARKERS[point.seed]
         ax.scatter(
             x,
@@ -158,7 +161,7 @@ def draw_heads(
             facecolor=base.LAYER_COLOURS[point.layer],
             edgecolor=base.PAPER,
             linewidth=0.45,
-            alpha=alpha,
+            alpha=0.90,
             zorder=3,
         )
         selected = (
@@ -224,22 +227,21 @@ def raw_score_figure(points: Sequence[base.HeadPoint]) -> tuple[Path, Path]:
     ax.set_xlabel(r"Structural score $S_{\mathrm{str}}$")
     ax.set_ylabel(r"Semantic score $S_{\mathrm{sem}}$")
     ax.set_box_aspect(1.0)
-    base.panel_label(ax, "(a)", "Raw task scores")
+    ax.set_title("(a)  Raw task scores", loc="left")
     base.style_axes(ax, xgrid=True, ygrid=True)
-    _shared_head_legend(fig, y=0.085)
     selection_handles, selection_labels = _selection_handles()
     fig.legend(
         selection_handles,
         selection_labels,
         loc="lower center",
-        bbox_to_anchor=(0.5, 0.015),
+        bbox_to_anchor=(0.5, 0.045),
         ncol=2,
         columnspacing=0.80,
         handletextpad=0.30,
         borderaxespad=0,
         fontsize=7.0,
     )
-    fig.subplots_adjust(left=0.19, right=0.975, bottom=0.29, top=0.88)
+    fig.subplots_adjust(left=0.19, right=0.975, bottom=0.22, top=0.88)
     return save_component(fig, "side_fig1a_raw_scores")
 
 
@@ -291,10 +293,10 @@ def joint_selectivity_figure(points: Sequence[base.HeadPoint]) -> tuple[Path, Pa
     ax.set_xlabel(r"Head selectivity $D_{\mathrm{rel}}$")
     ax.set_ylabel(r"Joint sensitivity $J$")
     ax.set_box_aspect(1.0)
-    base.panel_label(ax, "(b)", "Sensitivity and selectivity")
+    ax.set_title("(b)  Sensitivity and selectivity", loc="left")
     base.style_axes(ax, xgrid=False, ygrid=True)
-    _shared_head_legend(fig, y=0.085)
-    fig.subplots_adjust(left=0.19, right=0.975, bottom=0.29, top=0.88)
+    _shared_head_legend(fig, y=0.045)
+    fig.subplots_adjust(left=0.19, right=0.975, bottom=0.22, top=0.88)
     return save_component(fig, "side_fig1b_joint_selectivity")
 
 
@@ -337,38 +339,34 @@ def causal_figures(
             "Ablation impact",
             "(a) Sensitivity vs impact",
             "causal_a_sensitivity_impact",
-            False,
         ),
         (
             selectivity,
             ablation,
             r"Selectivity $D_{\mathrm{rel}}$",
-            "Ablation role",
+            "Ablation contrast",
             "(b) Selectivity vs ablation",
             "causal_b_selectivity_ablation",
-            True,
         ),
         (
             selectivity,
             rescue,
             r"Selectivity $D_{\mathrm{rel}}$",
-            "Rescue role",
+            "Rescue contrast",
             "(c) Selectivity vs rescue",
             "causal_c_selectivity_rescue",
-            True,
         ),
     )
     outputs = []
     for index, spec in enumerate(specs):
-        x, y, xlabel, ylabel, title, stem, dim_unreliable = spec
+        x, y, xlabel, ylabel, title, stem = spec
         fig, ax = plt.subplots(figsize=CAUSAL_SIZE)
         draw_heads(
             ax,
             points,
             x,
             y,
-            dim_unreliable=dim_unreliable,
-            marker_size=21.0,
+            marker_size=23.5,
         )
         ax.set_title(title, loc="left", fontsize=8.2, fontweight="semibold", pad=4.0)
         ax.set_xlabel(xlabel, fontsize=8.0)
@@ -383,7 +381,17 @@ def causal_figures(
             ax.set_xlim(-1.03, 1.03)
             if index == 1:
                 ax.set_ylim(-1.03, 1.03)
-            _rho_note(ax, rf"$\rho_{{\rm rel}}={base._spearman(x[reliable], y[reliable]):.2f}$")
+            rho_all = base._spearman(x, y)
+            rho_reliable = base._spearman(x[reliable], y[reliable])
+            _rho_note(
+                ax,
+                "\n".join(
+                    (
+                        rf"$\rho_{{\mathrm{{all}}}}={rho_all:.2f}$",
+                        rf"$\rho_{{J\geq 0.5}}={rho_reliable:.2f}$",
+                    )
+                ),
+            )
         base.style_axes(ax, xgrid=False, ygrid=True)
         fig.subplots_adjust(left=0.235, right=0.975, bottom=0.22, top=0.84)
         outputs.append(save_component(fig, stem))
@@ -403,8 +411,8 @@ def _draw_matrix(
     ticks: Sequence[float],
 ) -> tuple[Path, Path]:
     fig = plt.figure(figsize=MATRIX_SIZE)
-    ax = fig.add_axes([0.30, 0.31, 0.57, 0.57])
-    colorbar_ax = fig.add_axes([0.30, 0.095, 0.57, 0.036])
+    ax = fig.add_axes([0.27, 0.305, 0.63, 0.60])
+    colorbar_ax = fig.add_axes([0.27, 0.105, 0.66, 0.034])
     vmax = max(abs(float(np.nanmin(matrix))), abs(float(np.nanmax(matrix))), 1.0e-6)
     norm = TwoSlopeNorm(vmin=-vmax, vcenter=0.0, vmax=vmax)
     for row in range(matrix.shape[0]):
@@ -438,14 +446,22 @@ def _draw_matrix(
     ax.set_xticks(np.arange(len(col_labels)), col_labels)
     ax.set_yticks(np.arange(len(row_labels)), row_labels)
     ax.tick_params(axis="both", length=0, pad=4, labelsize=7.0)
-    ax.set_xlabel(xlabel, fontsize=8.2)
+    ax.set_xlabel(xlabel, fontsize=8.2, labelpad=1.0)
     ax.set_ylabel(ylabel, fontsize=8.2)
-    ax.set_title(title, loc="left", fontsize=8.6, fontweight="semibold", pad=4.5)
+    fig.text(
+        0.27,
+        0.965,
+        title,
+        ha="left",
+        va="top",
+        fontsize=8.6,
+        fontweight="semibold",
+    )
     for spine in ax.spines.values():
         spine.set_visible(False)
     scalar = mpl.cm.ScalarMappable(norm=norm, cmap=EFFECT_CMAP)
     colorbar = fig.colorbar(scalar, cax=colorbar_ax, orientation="horizontal", ticks=ticks)
-    colorbar.set_label(colorbar_label, labelpad=1.8, fontsize=7.0)
+    colorbar.set_label(colorbar_label, labelpad=1.0, fontsize=7.0)
     colorbar.outline.set_linewidth(0.5)
     colorbar.outline.set_edgecolor(base.AXIS)
     colorbar.ax.tick_params(labelsize=7.0, length=2.0, pad=1.3)
@@ -461,7 +477,7 @@ def matrix_figures() -> list[tuple[Path, Path]]:
         col_labels=("Semantic", "Structural"),
         xlabel="Evaluation task",
         ylabel="Ablated family",
-        colorbar_label=r"Change in cross-entropy ($\Delta$CE)",
+        colorbar_label=r"$\Delta$ Cross-Entropy",
         ticks=(-0.05, 0.00, 0.05),
     )
     rescue = _draw_matrix(
@@ -472,7 +488,7 @@ def matrix_figures() -> list[tuple[Path, Path]]:
         col_labels=("Semantic", "Structural"),
         xlabel="Corruption",
         ylabel="Patched family",
-        colorbar_label="Mediated-effect fraction",
+        colorbar_label="Mediated fraction",
         ticks=(-0.15, 0.00, 0.15),
     )
     return [necessity, rescue]

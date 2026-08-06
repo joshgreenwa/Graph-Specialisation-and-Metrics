@@ -1,0 +1,48 @@
+{
+  "data_source": "coordinates recovered losslessly to PDF plotting precision from the original vector population panels",
+  "figure": "06_population_joint_sensitivity_selectivity",
+  "pdf_export": {
+    "compression": 9,
+    "embedded_font_program": "TrueType/CIDFontType2",
+    "font_type": 42,
+    "path_simplification": false,
+    "raster_fallback_dpi": 1200,
+    "vector_first": true
+  },
+  "point_color": "transformer layer",
+  "point_shape": "training seed",
+  "population_unit": "training seed",
+  "seeds": [
+    0,
+    1,
+    2,
+    3
+  ],
+  "task": "graphbench_bipartite_matching_hard",
+  "theme": {
+    "beneficial_color": "#55A868",
+    "central_color": "#6E6E6E",
+    "dpi": 600,
+    "error_alpha": 0.22,
+    "font_family": "DejaVu Sans",
+    "font_size": 9.5,
+    "formats": [
+      "pdf",
+      "png"
+    ],
+    "functional_color": "#4C72B0",
+    "grid_alpha": 0.14,
+    "height": 3.55,
+    "inactive_color": "#B8B8B8",
+    "label_size": 10.0,
+    "layer_cmap": "viridis",
+    "line_width": 1.2,
+    "marker_size": 32.0,
+    "max_distance_points": 14,
+    "semantic_color": "#C44E52",
+    "structural_color": "#4C72B0",
+    "tick_size": 8.5,
+    "title_size": 10.5,
+    "width": 4.2
+  }
+}

@@ -60,8 +60,14 @@ def save_paper_figure(fig: mpl.figure.Figure, stem: str) -> tuple[Path, Path]:
         "Title": stem,
         "Subject": "Synthetic-data paper-layout figure mockup",
     }
-    fig.savefig(png, dpi=300, facecolor=base.PAPER, bbox_inches=None)
-    fig.savefig(pdf, dpi=300, facecolor=base.PAPER, bbox_inches=None, metadata=metadata)
+    fig.savefig(png, dpi=base.PNG_DPI, facecolor=base.PAPER, bbox_inches=None)
+    fig.savefig(
+        pdf,
+        dpi=base.PDF_RASTER_DPI,
+        facecolor=base.PAPER,
+        bbox_inches=None,
+        metadata=metadata,
+    )
     plt.close(fig)
     return png, pdf
 

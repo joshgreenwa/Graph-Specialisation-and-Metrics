@@ -1,0 +1,161 @@
+{
+  "data_source": "population estimates and interval endpoints recovered from source PDF vector geometry",
+  "figure": "01_population_restoration_injection",
+  "injection_population": {
+    "estimate": [
+      [
+        0.049045279786890376,
+        -0.001995756709593796
+      ],
+      [
+        0.03009113096936834,
+        0.12654393204331457
+      ]
+    ],
+    "high": [
+      [
+        0.06098987883205404,
+        0.0021224131746258256
+      ],
+      [
+        0.03583287936306919,
+        0.17506456844459506
+      ]
+    ],
+    "low": [
+      [
+        0.03710065171054509,
+        -0.004719578294449199
+      ],
+      [
+        0.024349382575667492,
+        0.07802327628791302
+      ]
+    ]
+  },
+  "legend_font_size": 11.875,
+  "legend_title_font_size": 10.625,
+  "necessity_population": {
+    "estimate": [
+      [
+        0.11765460795466902,
+        0.08743854981196876
+      ],
+      [
+        0.06748953755848308,
+        0.05155995868880442
+      ],
+      [
+        0.0581032661690557,
+        0.04044110026721251
+      ]
+    ],
+    "high": [
+      [
+        0.14090953947879387,
+        0.10606674162480428
+      ],
+      [
+        0.0850167726235523,
+        0.06910198760418997
+      ],
+      [
+        0.06214034522974606,
+        0.04569663739794587
+      ]
+    ],
+    "low": [
+      [
+        0.09451775418585036,
+        0.07184623356474147
+      ],
+      [
+        0.054329343955622764,
+        0.03920343787571298
+      ],
+      [
+        0.050823463100907774,
+        0.035036236643257904
+      ]
+    ]
+  },
+  "necessity_ylabel": "Donor-swap effect removed (fraction)",
+  "panel_titles": [
+    "Restoration",
+    "Injection",
+    "Role-specific necessity"
+  ],
+  "pdf_export": {
+    "compression": 9,
+    "embedded_font_program": "TrueType/CIDFontType2",
+    "font_type": 42,
+    "path_simplification": false,
+    "raster_fallback_dpi": 1200,
+    "vector_first": true
+  },
+  "population_unit": "training seed",
+  "restoration_injection_ylabel": "Aligned output effect",
+  "restoration_population": {
+    "estimate": [
+      [
+        0.13953258494853374,
+        0.012553771732378217
+      ],
+      [
+        0.07786720886207803,
+        0.19840657054904243
+      ]
+    ],
+    "high": [
+      [
+        0.15691143104741934,
+        0.017458645610161888
+      ],
+      [
+        0.11399159576318546,
+        0.27085513214313073
+      ]
+    ],
+    "low": [
+      [
+        0.11386403305732612,
+        0.007648897854594546
+      ],
+      [
+        0.05687030814054029,
+        0.1259580089549541
+      ]
+    ]
+  },
+  "task": "graphbench_bipartite_matching_hard",
+  "theme": {
+    "beneficial_color": "#55A868",
+    "central_color": "#6E6E6E",
+    "dpi": 600,
+    "error_alpha": 0.22,
+    "font_family": "DejaVu Sans",
+    "font_size": 9.5,
+    "formats": [
+      "pdf",
+      "png"
+    ],
+    "functional_color": "#4C72B0",
+    "grid_alpha": 0.14,
+    "height": 3.55,
+    "inactive_color": "#B8B8B8",
+    "label_size": 10.0,
+    "layer_cmap": "viridis",
+    "line_width": 1.2,
+    "marker_size": 32.0,
+    "max_distance_points": 14,
+    "semantic_color": "#C44E52",
+    "structural_color": "#4C72B0",
+    "tick_size": 8.5,
+    "title_size": 10.5,
+    "width": 4.2
+  },
+  "x_categories": [
+    "Semantic donor-swap",
+    "Structural donor-swap"
+  ]
+}

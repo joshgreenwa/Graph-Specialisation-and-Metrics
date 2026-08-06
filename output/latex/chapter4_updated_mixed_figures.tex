@@ -1,0 +1,73 @@
+% Preamble requirement:
+% \usepackage{graphicx}
+
+% Head scores and derived sensitivity/selectivity coordinates.
+\begin{figure}[htbp]
+    \centering
+    \includegraphics[width=0.485\linewidth]{Chapter4/updated_mixed_figs/fig1a_raw_task_scores.pdf}%
+    \hfill
+    \includegraphics[width=0.485\linewidth]{Chapter4/updated_mixed_figs/fig1b_sensitivity_selectivity.pdf}
+    \caption[Head-level sensitivity and selectivity]{%
+        Head-level task scores and specialisation coordinates. 
+        \textbf{(a)} Raw semantic and structural scores for heads with both scores at least $10^{-4}$; coloured rings mark the score-selected semantic and structural families. 
+        \textbf{(b)} Joint sensitivity $J$ versus relative selectivity $D_{\mathrm{rel}}$, where positive values indicate semantic preference and negative values structural preference. 
+        Colour denotes layer and marker shape denotes seed.%
+    }
+    \label{fig:mixed-head-metrics}
+\end{figure}
+
+% Three matched causal-validation panels.
+\begin{figure}[htbp]
+    \centering
+    \includegraphics[width=0.318\linewidth]{Chapter4/updated_mixed_figs/fig2a_sensitivity_impact.pdf}%
+    \hfill
+    \includegraphics[width=0.318\linewidth]{Chapter4/updated_mixed_figs/fig2b_selectivity_ablation.pdf}%
+    \hfill
+    \includegraphics[width=0.318\linewidth]{Chapter4/updated_mixed_figs/fig2c_selectivity_rescue.pdf}
+    \caption[Head-level causal validation]{%
+        Causal validation of the head metrics. 
+        \textbf{(a)} Joint sensitivity $J$ versus cross-task ablation impact. 
+        \textbf{(b)} Selectivity $D_{\mathrm{rel}}$ versus semantic--structural ablation contrast. 
+        \textbf{(c)} Selectivity versus semantic--structural rescue contrast. 
+        Boxes report pooled Spearman correlations for all heads and for reliable heads with $J \geq 0.5$.%
+    }
+    \label{fig:mixed-causal-validation}
+\end{figure}
+
+% Full-width joint-ablation grid.
+\begin{figure}[htbp]
+    \centering
+    \includegraphics[width=\linewidth]{Chapter4/updated_mixed_figs/fig3_joint_ablation_tests.pdf}
+    \caption[Joint ablation of head families]{%
+        Joint ablation of semantic specialists, structural specialists, high-$J$ generalists, and low-$J$/inert heads. 
+        Curves show the across-seed mean functional impact (top) and accuracy drop (bottom) as progressively more heads are ablated on the semantic (left) and structural (right) tasks; bands show the observed seed range.%
+    }
+    \label{fig:mixed-joint-ablation}
+\end{figure}
+
+% Necessity and rescue matrices.
+\begin{figure}[htbp]
+    \centering
+    \includegraphics[width=0.485\linewidth]{Chapter4/updated_mixed_figs/fig4a_necessity.pdf}%
+    \hfill
+    \includegraphics[width=0.485\linewidth]{Chapter4/updated_mixed_figs/fig4b_rescue.pdf}
+    \caption[Necessity and rescue double dissociation]{%
+        Double-dissociation interventions. 
+        \textbf{(a)} Change in cross-entropy after ablating each head family on each evaluation task. 
+        \textbf{(b)} Fraction of the corruption effect mediated by clean-to-corrupt patching of each family. 
+        Rows denote the intervened family and columns the evaluation task or corruption.%
+    }
+    \label{fig:mixed-double-dissociation}
+\end{figure}
+
+% Full-width attention visualisation.
+\begin{figure}[htbp]
+    \centering
+    \includegraphics[width=\linewidth]{Chapter4/updated_mixed_figs/fig5_attention_visualisations.pdf}
+    \caption[Representative attention patterns]{%
+        Representative attention patterns for a semantic specialist, structural specialist, high-$J$ generalist, and first-layer head. 
+        Each graph colours source nodes by their attention into the query; the adjacent matrix shows destination/query rows and source/key columns. 
+        Outlines mark the query row and source column, and the colour scale is shared across heads.%
+    }
+    \label{fig:mixed-attention}
+\end{figure}

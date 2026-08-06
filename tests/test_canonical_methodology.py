@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import json
 import warnings
 from copy import deepcopy
 from types import SimpleNamespace
@@ -557,11 +558,54 @@ def test_saved_figures_keep_content_drawn_outside_the_axes(tmp_path):
     paths = FigureBuilder(tmp_path, theme, common_metadata={}).save(
         "controls", figure, axes, metadata={}
     )
+    pdf = next(path for path in paths if path.suffix == ".pdf")
+    pdf_bytes = pdf.read_bytes()
+    assert b"/Subtype /Type3" not in pdf_bytes
+    assert b"/CIDFontType2" in pdf_bytes
+    assert b"/FontFile2" in pdf_bytes
+    export_metadata = json.loads(
+        (tmp_path / "controls.metadata.json").read_text(encoding="utf-8")
+    )["pdf_export"]
+    assert export_metadata["vector_first"] is True
+    assert export_metadata["raster_fallback_dpi"] == 1200
     png = next(path for path in paths if path.suffix == ".png")
     # The legend is drawn below the panels. Saving without a tight bound crops it away silently,
     # leaving an image no taller than the nominal canvas.
     nominal = max(theme.height, 0.42 * len(names) + 1.5) * theme.dpi
     assert mpimg.imread(png).shape[0] > nominal
+
+
+def test_multi_seed_triptych_pdf_is_fully_vector(tmp_path):
+    from graph_specialisation_metrics.methodology.figures import (
+        FigureBuilder,
+        FigureTheme,
+        multi_seed_score_causal_triptych,
+    )
+
+    records = [
+        {
+            "seed": seed,
+            "structural": np.asarray([0.4, 1.1, 1.7, 2.2]) + 0.05 * seed,
+            "semantic": np.asarray([0.6, 0.9, 1.8, 2.0]) + 0.04 * seed,
+            "selectivity": np.asarray([-0.4, -0.1, 0.2, 0.6]),
+            "joint": np.asarray([0.5, 0.9, 1.4, 1.8]),
+            "clean_ablation_impact": np.asarray([1.2, 2.4, 4.8, 7.1]),
+            "layer": np.asarray([0, 0, 1, 1]),
+        }
+        for seed in (0, 1)
+    ]
+    theme = FigureTheme(dpi=100, formats=("pdf",))
+    figure, axes = multi_seed_score_causal_triptych(records, theme=theme)
+    pdf = FigureBuilder(tmp_path, theme).save(
+        "triptych",
+        figure,
+        axes,
+        metadata={},
+    )[0]
+    pdf_bytes = pdf.read_bytes()
+    assert b"/Subtype /Type3" not in pdf_bytes
+    assert b"/Subtype /Image" not in pdf_bytes
+    assert b"/CIDFontType2" in pdf_bytes
 
 
 def test_display_bins_fit_the_budget_and_keep_the_near_field_at_unit_resolution():

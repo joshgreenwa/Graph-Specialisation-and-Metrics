@@ -1,0 +1,56 @@
+{
+  "clean_ablation_impact_ylim": [
+    0,
+    16
+  ],
+  "data_source": "coordinates recovered losslessly to PDF plotting precision from the original vector population panels",
+  "figure": "score_selectivity_clean_ablation_triptych",
+  "layer_colorbar": "discrete vector bands",
+  "pdf_export": {
+    "compression": 9,
+    "embedded_font_program": "TrueType/CIDFontType2",
+    "font_type": 42,
+    "path_simplification": false,
+    "raster_fallback_dpi": 1200,
+    "vector_first": true
+  },
+  "population_unit": "training seed; heads are not aligned across seeds",
+  "rho_statistic": {
+    "high": 0.78,
+    "low": 0.74,
+    "rho": 0.76
+  },
+  "seeds": [
+    0,
+    1,
+    2,
+    3
+  ],
+  "task": "graphbench_bipartite_matching_hard",
+  "theme": {
+    "beneficial_color": "#55A868",
+    "central_color": "#6E6E6E",
+    "dpi": 600,
+    "error_alpha": 0.22,
+    "font_family": "DejaVu Sans",
+    "font_size": 11.0,
+    "formats": [
+      "pdf",
+      "png"
+    ],
+    "functional_color": "#4C72B0",
+    "grid_alpha": 0.18,
+    "height": 4.4,
+    "inactive_color": "#B8B8B8",
+    "label_size": 12.4,
+    "layer_cmap": "viridis",
+    "line_width": 1.3,
+    "marker_size": 46.0,
+    "max_distance_points": 14,
+    "semantic_color": "#C44E52",
+    "structural_color": "#4C72B0",
+    "tick_size": 10.2,
+    "title_size": 13.5,
+    "width": 5.0
+  }
+}

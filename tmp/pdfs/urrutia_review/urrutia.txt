@@ -1,0 +1,1909 @@
+                                                D ECOUPLING P OSITIONAL AND S YMBOLIC ATTENTION
+                                                          B EHAVIOR IN T RANSFORMERS
+
+
+                                                                   Felipe Urrutia                                    Jorge Salas
+                                                            University of Chile & CENIA                                CENIA
+                                                                  Santiago, Chile                                   Santiago, Chile
+                                                            furrutia@dim.uchile.cl                              jorge.salas@cenia.cl
+
+
+
+
+arXiv:2511.11579v1 [cs.LG] 3 Oct 2025
+                                                  Alexander Kozachinskiy                 Cristian Buc Calderon                Hector Pasten
+                                                         CENIA                                   CENIA               CENIA & Faculty of mathematics UC
+                                                      Santiago, Chile                        Santiago, Chile                 Santiago, Chile
+                                            alexander.kozachinskyi@cenia.cl             cristian.buc@cenia.cl            hector.pasten@uc.cl
+
+                                                                                            Cristobal Rojas
+                                                                                           IMC UC & CENIA
+                                                                                             Santiago, Chile
+                                                                                          luis.rojas@uc.cl
+
+
+
+
+                                                                                               A BSTRACT
+                                                 An important aspect subtending language understanding and production is the ability to independently
+                                                 encode positional and symbolic information of the words within a sentence. In Transformers,
+                                                 positional information is typically encoded using Positional Encodings (PEs). One such popular
+                                                 PE, namely Rotary PE (RoPE), has been widely used due to its empirical success. Recently, it has
+                                                 been argued that part of RoPE’s success emerges from its ability to encode robust positional and
+                                                 semantic information using large and small frequencies, respectively. In this work, we perform a
+                                                 deeper dive into the positional versus symbolic dichotomy of attention heads behavior, both at the
+                                                 theoretical and empirical level. We provide general definitions of what it means for a head to behave
+                                                 positionally or symbolically, prove that these are two mutually exclusive behaviors and develop a
+                                                 metric to quantify them. We apply our framework to analyze Transformer-based LLMs using RoPE
+                                                 and find that all heads exhibit a strong correspondence between behavior and frequency use. Finally,
+                                                 we introduce canonical tasks designed to be either purely positional or symbolic, and demonstrate
+                                                 that the Transformer performance causally relates to the ability of attention heads to leverage the
+                                                 appropriate frequencies. In particular, we show that we can control the Transformer performance
+                                                 by controlling which frequencies the attention heads can access. Altogether, our work provides a
+                                                 detailed understanding of RoPE, and how its properties relate to model behavior.
+
+                                        Keywords Positional encodings · Transformers · Interpretability
+
+                                        1    Introduction
+                                                 “[...]Man is not truly one, but truly two.”
+
+                                                                                      — Robert Louis Stevenson, The Strange Case of Dr. Jekyll and Mr. Hyde.
+                                        Positional Encodings (PEs) play a critical role in how modern Transformer-based Large Language Models (LLMs)
+                                        function. Such criticality is, for example, illustrated by the fact that encoder-only Transformers with No Positional
+                                        Encoding (NoPE) are invariant under permutations of prompt’s tokens [Pérez et al., 2021], severely limiting their
+                                        expressivity. While decoder-only Transformers using NoPE can in theory recover positional information [Kazemnejad
+et al., 2023], they are unable to learn some matrices observed in practice [Barbero et al., 2024]. Regardless, at
+the practical scale, adding a component to explicitly inject positional information is the current standard choice in
+state-of-the-art Transformer-based LLMs.
+Rotary PE (RoPE) has increasingly become one of the most popular choices to inject positional information. These PEs
+are given by a sequence θ1 , . . . , θd/2 of d/2 angles (where the embedding dimension d is assumed to be even), each
+of which acts as a corresponding rotation on a different rotational plane. By rotating query and key vector pairs, they
+account for the relative positional distance between them, thereby incorporating the positional information into the
+computed representations. Conventionally, RoPE is believed to be helpful because it facilitates token dependency decay
+with increasing distance. Yet, more recent evidence suggests that RoPE’s utility lies in its ability to leverage different
+frequency bands for different purposes. In Barbero et al. [2024] for instance, the authors show that while certain models
+largely prefer to use low frequencies (which they conjecture to implement “information channels”), they also find that
+specific particular heads use high frequencies to produce “robust positional attention patterns” that also play a key role
+in the overall workings of the model.
+Moreover, the choice of the base in RoPE (which determines the total frequency range) has also been shown to play
+an important role when extrapolating models to longer contexts. On the one hand, there is evidence that improved
+performance in long-context fine-tuning can be achieved by decreasing the base (i.e., increasing the frequencies) in
+RoPE [Liu et al., 2023], a phenomenon often attributed to the fact that higher frequencies bias the Transformer towards
+attending more to closer tokens. On the other hand, decreasing the base negatively affects the ability to accurately
+retrieve information in such long contexts [Men et al., 2024]. Indeed, information retrieval (in long contexts) requires
+attending to similar tokens even when their relative distance is large, an ability suggested to be improved by selecting
+larger (rather than smaller) bases [Men et al., 2024], thereby shifting the range towards lower frequencies.
+At a conceptual level, all these works seem to point towards the fact that different frequency bands in RoPE are used by
+attention heads to implement two opposite core abilities: one more concerned with positional information and one with
+symbolic information, creating a tension between the two. Achieving a deeper understanding of this tension is a crucial
+step towards improving the mechanisms of Transformers by optimally striking the positional-symbolic balance in a
+given task context.
+In particular, the following questions remain open:
+
+          • What are the mathematical properties that underlie these two core abilities?
+          • How can we measure if an attention head’s behavior is exhibiting either of these abilities?
+          • How do these abilities relate to the use of the different frequencies in RoPE?
+          • How is model performance affected by the choice of these frequencies?
+
+Contributions. In this work, we perform a detailed theoretical and empirical1 study of all these questions. Due to
+space constrains, we defer our further related work discussion to Appendix 1.1. We rely on the G EMMA -2, Q WEN -2,
+and LL A MA-3 families of large language models for our empirical analysis. In summary:
+
+        1. We provide formal definitions of what it means for an arbitrary attention head to behave purely positionally or
+           purely symbolically on a given input. We prove that these behaviors are mutually exclusive, unless the attention
+           pattern follows a uniform distribution. Moreover, we prove that certain intrinsically positional operations
+           cannot be implemented by heads that behave symbolically, whereas certain symbolic operations cannot be
+           implemented by heads that behave positionally.
+        2. We introduce a novel metric intended to provide scores that reflect the extent to which a given head behaves
+           positionally or symbolically on a given input. Our metric can be flexibly applied to analyze a given model at
+           different levels of granularity, from specific heads on specific inputs and at specific frequencies in the case of
+           RoPE-based attention, to a single pair of scores per head, enabling the characterization and visualization of the
+           positional-symbolic profile of the model.
+        3. We apply our metric to inspect the behavior of attention heads in Transformer-based LLMs using RoPE,
+           specifically the G EMMA -2, Q WEN -2, and LL A MA-3 families. By analyzing these scores along the different
+           frequency ranges, we reveal a surprisingly sharp connection between frequencies and attention head behavior:
+           lower frequencies are preferred by symbolic heads, while moderately larger frequencies tend to correspond to
+           positional heads. On the other hand, larger frequencies are used by heads achieving high values in both scores,
+           a phenomenon that forces an approximately uniform distribution of attention weights.
+   1
+       Code for our experiments can be found at   positional-and-symbolic-iclr2026-5B3E.
+
+
+
+                                                              2
+           4. We then study attention heads in order to understand how frequency choices affect their performance in
+              canonical tasks designed to intrinsically be either positional or symbolic. We find that a head can act positionally
+              (and thus perform well on the respective task) only when given access to relatively large frequencies, while
+              forcing it to work with lower frequencies inevitably leads to poor performance. We show that in this case,
+              a U -shaped accuracy pattern tends to emerge. Similarly, attention heads can perform well on intrinsically
+              symbolic tasks if given access to low frequencies. Interestingly, forcing it to rely on higher frequencies also
+              harms performance, but this time leading to an inverted U -shaped accuracy pattern. Our observations are
+              supported by both theoretical and empirical results.
+
+1.1        Related Work
+
+Given the success of RoPE, several studies have dived into its mechanisms to provide: (i) better long-context perfor-
+mance, and (ii) a deeper knowledge of how the RoPE’s mechanisms relate to the type of information encoded in the
+Transformer.
+
+Extending context windows. Much work has been done to modify or extend the mechanisms of RoPE in order
+to extend the context window length of LLMs. It has been shown down-scaling position indices on RoPE, within
+the pre-trained context-length limit and alongside small amounts of fine-tuning, avoids catastrophic attention scores
+blow-ups seen in naive extrapolation, thereby promoting extrapolation in unseen ranges [Chen et al., 2023]. In the same
+vein, Peng et al. [2023] propose YaRN, a method that combines Neural-Tangent-Kernel aware position interpolation
+with attention scaling to improve long context window performance. Other researchers have found that increasing the
+RoPE base frequency improves long-context information retrieval [Xiong et al., 2023]. More recently, LongRoPE
+proposes the addition of non-uniform position interpolation with a fine-tuning curriculum strategy as shown to further
+increase the ability of long-context performance (up to 2,048k tokens) [Ding et al., 2024]. Finally, by analyzing attention
+scores in the Needle In A Haystack 2 benchmark, Yang et al. [2025] observed that NoPE was related to higher attention
+mass over the needle (compared to RoPE), leading them to propose RNoPE, i.e., alternating NoPE and RoPE layers.
+RNoPE resulted in better performance, particularly within question-answering contexts .
+
+Mechanisms of RoPE and their relation to information encoding. Despite its importance to improve model
+performance, much less work has focused on generating a deeper theoretical knowledge of the mechanisms subtending
+RoPE, and how these relate to the behavior of attention heads, and in turn to model performance. Chen and Yan [2024]
+observed that the 2d pair rotation direction highly depends on Query/Key pair weight angle. These authors observe
+empirically, and theoretically demonstrate, that non-orthogonal weight vector pairs are more sensitive to positional
+information, while orthogonal ones focus rather on semantics. Their theoretical advances was then used to devise an
+efficient fine-tuning method (Angle-based Weight Masking) that primarily focuses on updated semantics-related weights.
+Closest to our work is that of Barbero et al. [2024]. In their work, they theoretically prove (and empirically observe
+in Gemma 7B) that RoPE can learn specific positional (diagonal and off-diagonal) attention head patterns, which is
+not the case for NoPE. Furthermore, they relate the ability to learn these position attention patterns as leveraging high
+frequencies in RoPE. Conversely, semantic attention patterns are attributed to leveraging low frequencies. Furthermore,
+they suggest to truncate low-level frequencies to avoid arbitrary (irrational) rotation values in long contexts, and observe
+better performance when doing so (when keeping 75% of the highest RoPE frequencies).
+Our work extends current knowledge by: (i) mathematically defining positional or symbolic attention head behavior, (ii)
+offering a novel metric to quantify these behaviors at different levels of granularity (from heads to full model), (iii)
+theoretically proving that position and symbolic attention heads are mutually exclusive, (iv) theoretically proving that
+some positional tasks cannot be performed by symbolic heads, and vice-versa, and (v), empirically demonstrating that
+we can causally control the accuracy pattern in by gating access to specific frequencies.
+Moreover, as described in the main text, we use a toy 1-head decoder-only transformer to gain a deeper understanding
+of the RoPE properties. Such a model allows us to have a strong hold on the interpretation of the RoPE mechanism,
+otherwise lost when working with deeper and wider models. Other works following this approach have demonstrated
+important features of Transformers. For instance, such toy models have been used to characterize transformer loss
+landscapes [Makkuva et al., 2024, 2025]. Furthermore, 1-layer transformers have also been used to evaluate their
+expressivity Li et al. [2024a], Quirke and Barez [2023], Sanford et al. [2023, 2024], Kozachinskiy et al. [2025].
+Moreover, these models have been used to understand the learning dynamics and properties in transformers [Tian et al.,
+2023, Li et al., 2024b, Huang et al., 2024, Yang et al., 2024, Chen et al., 2024].
+      2
+          https://github.com/gkamradt/LLMTest_NeedleInAHaystack
+
+
+
+
+                                                                  3
+2     Preliminaries
+ Definition 1 (Attention Head). A d-dimensional decoder-only attention head is a function H : (Rd )∗ → (Rd )∗ given
+ by a continuous “Logits function” L : (Rd × N)2 → R, a continuous “Value function” VAL : Rd → Rd , and a
+ continuous “activation function” F : Rd × Rd → Rd . Given an input sequence of vectors x̄ = (x1 , . . . , xn ) ∈ (Rd )n ,
+ the head H outputs a sequence of vectors
+                                   P ȳ = (y1 , . . . , yn ) = H(x̄), computed as follows. First, the “attention weights”
+ are computed as wji = exp(λij )/ k≤i exp(λik ), with λij = L(xi , i, xj , j); then, a sequence ā = (a1 , . . . , an ) of
+                          Pi
+“attention vectors”: ai = j=1 wji · VAL(xj ); and finally, one sets: yi = F (ai , xi ), i = 1, . . . , n.
+
+Transformer architecture. A (decoder-only) transformer ME MB for the vocabulary Σ is composed of an embedding
+function E MB : Σ → Rd where d is the embedding dimension, a finite sequence of d-dimensional Attention Heads
+H1 , ..., Hℓ , and a function r : Rd → R|Σ| . Given a sequence s = (σ1 , ..., σn ) in the vocabulary Σ, the transformer M
+returns a probability distribution on Σ as follows: Define xi = E MB(σi ). Then, apply Hℓ ◦ ... ◦ H1 to (x1 , ..., xn ) to
+obtain (u1 , ..., un ). Subsequently, define v = r(un ) ∈ R|Σ| and finally the desired probability distribution is given by
+µ = softmax(v). When µ is maximized at a unique symbol σ ∈ Σ for an input s, we set ME MB (s) = σ.
+About the Logits function. Of particular interest for us are the Logits functions of following form:
+                            L(xi , i, xj , j) = ⟨U j Kxj , U i Qxi ⟩,   i, j = 1, . . . , n   j ≤ i,                    (1)
+where Q and K are the (learnable) “query" and “key" matrices and U : Rd → Rd is a unitary linear operator whose
+role is to incorporate the relative positional information between xi and xj given by positional inputs i > 0 and j > 0.
+We note that both NoPE and RoPE are special cases.
+
+3     Positional versus Symbolic attention
+As done in previous transformer explainability [Ali et al., 2025, Sakarvadia et al., 2023, Ferrando et al., 2023, Ameisen
+et al., 2025] and RoPE analysis work [Barbero et al., 2024], and for the sake of simplicity, we choose to base our
+theoretical analyses directly on the Logits function, while attention weights are used for empirical observations. All
+proofs are deferred to the Appendix.
+
+3.1   Definitions
+
+In this section, we provide formal definitions of what it means for a head to behave positionally or symbolically on a
+given input. In the following, Si will denote the set of permutations of [i].
+Definition 2 (Positional and Symbolic attention). We say that a head H acts positionally on an input x =
+(x1 , x2 , ..., xn ) at query i ≤ n if its logit sequence is invariant under permutation of the key vectors. That is, if
+for all π ∈ Si−1 :
+                                        L(xi , i, xπ(j) , j) = L(xi , i, xj , j) ∀j < i.
+On the other hand, we will say that H acts symbolically on x = (x1 , x2 , ..., xn ) ∈ (Rd )n at query i ≤ n if its logit
+sequence is equivariant under permutations of the key vectors. That is, if
+                             L(xi , i, xj , π(j)) = L(xi , i, xj , j)   ∀π ∈ Si−1 ,       ∀j < i.
+
+In other words, suppose we are querying on a given input from position i to all positions j ≤ i. A head H is positional
+when L(xi , i, xj , j) depends only on the position j, and not on the value of the key vector xj . In contrast, H will be
+symbolic when L(xi , i, xj , j) only depends on the key-vector xj (the “symbol”), regardless of the position j. See
+Figure 4 for an illustration (Appendix A.1).
+Let us mention a few important examples. First, it is easy to see that a NoPE head acts symbolically on every input (the
+logits function does not depend on j in this case). Second, if an input x̄ is such that the key vectors Kxj are all the
+same for j = 1 . . . i − 1, say equal to some vector v, then any head with Logits as in equation 1 will act positionally on
+it, simply because L(xi , i, xj , j) = ⟨v, U i−j Qxi ⟩, which only depends on j. Note that for such an input, a NoPE head
+will act both positionally and symbolically. In this case, the logits L(xi , i, xj , j) will have the same value for all xj
+with j < i, yielding a uniform attention pattern.
+
+
+
+
+                                                                4
+3.2   The positional-symbolic exclusion principle
+
+Let L be a logit function and x̄ = (x1 , ..., xn ) an input. Here, we assume we are querying from i = n. For a permutation
+π ∈ Sn−1 and j ∈ [n − 1], define
+                                    pos
+                                   δL,x̄ (π, j) = L(xn , n, xπ(j) , j) − L(xn , n, xj , j),
+                                    sym
+                                   δL,x̄ (π, j) = L(xn , n, xj , π(j)) − L(xn , n, xj , j).
+            pos       sym
+We view δL,x̄   and δL,x̄  as real ((n − 1)! · (n − 1))-dimensional vectors with coordinates, indexed by elements of
+Sn−1 × [n − 1]. By definition, a head acts positionally (respectively, symbolically) at i = n on the input x̄ if and only
+    pos                      symb
+if δL,x̄ = 0 (respectively, δL,x̄  = 0). One could imagine that some attention heads in real-life transformers, although
+                                                                   pos      sym
+not being exactly positional or symbolic, have one of the vectors δL,x̄ or δL,x̄ really close to 0, thus exhibiting “almost”
+positional or symbolic behavior. Based on this idea, in the next section we define positional and symbolic scores.
+We now use these norms in a result that intuitively states the following: If the head’s behavior on x̄ is close to both
+positional and symbolic, then the attention weights form an approximately constant sequence. This is an instance of
+the positional-symbolic duality: only at the cost of a uniform non-focused attention, we can have both positional and
+symbolic behavior.
+Theorem 1 (The positional-symbolic exclusion principle). Let H be an arbitrary attention head with the logit function
+L. Let x̄ = (x1 , ..., xn ) be an input and let λ = (λ1 , ..., λn−1 ) be the sequence of logits on this input, excluding
+L(xn , n, xn , n); namely, λj = L(xn , n, xj , j). Then, denoting by µ the average value of λj ’s, we have
+                                                                  pos 2      sym 2
+                                              1 X              ∥δL,x̄ ∥2 + ∥δL,x̄ ∥2
+                                 Var(λ) =          (λj − µ)2 ≤
+                                             n−1 j              (n − 1)! · (n − 1)
+
+3.3   Positional and Symbolic Scores and their application to realistic models
+
+In this section, we introduce scores to measure the extent to which each head in a model behaves positionally or
+symbolically, and apply them to inspect the google/gemma-2-2b-it model (similar analyses on four other models
+are presented in the Appendix A.5). Our evaluation is grounded in the binding task, which tests whether the model can
+correctly associate entities with their attributes [Feng and Steinhardt, 2023]. Specifically, we construct inputs consisting
+of n = 256 entity–attribute pairs, where entities are proper names and attributes are colors (e.g., Alice likes the color
+Red; Bob likes the color Blue). At the end of the sequence, a query probes the attribute of one entity (e.g., What color
+does Alice like the most?). We choose this task for two reasons. First, it can intuitively be approached by a combination
+of positional and symbolic mechanisms. Second, we have control over the location at which a given entity-attribute pair
+appears in the prompt. This allows for a clearer comparison of the model behavior’s when the pair location ranges from
+the beginning to the end of the prompt.
+
+From Logits to Attention weights. Given an arbitrary head H with logits function L and an input x̄, we define
+the logits produced when querying the final token xn as L(x) = L(xn , n, xj , j) : j ≤ n . Then, we define the
+corresponding attention weights as D(x) = softmax(L(x)).
+
+
+
+
+                                                              5
+       A                            All heads in Pos/Sym Plane                     B                                  Positional Score                      C                 L=6, H=0                    L=12, H=0
+                 1.0                                                                              0                                                                1.0                          1.0
+
+                                                                                   Head ID                                                                 Score
+                 0.8                                                                                                                                               0.5                          0.5
+                                                                                                  5
+
+
+
+Symbolic Score
+                 0.6                                                                                                                                               0.0                          0.0
+                                                                                                        0         5        10     15         20       25                 0           100              0           100
+
+                 0.4                                                                                                   Symbolic Score                                        L=15, H=0                    L=23, H=2
+                                                                                                  0                                                                1.0                          1.0
+
+                                                                                   Head ID
+                 0.2
+                                                                                                                                                           Score
+                                        Layer Depth                                                                                                                0.5                          0.5
+                                                                                                  5
+                 0.0            0           10          20
+                                                                                                                                                                   0.0                          0.0
+                          0.0         0.2         0.4        0.6    0.8   1.0                           0         5        10      15        20       25                 0           100              0           100
+                                            Positional Score                                                                Layer ID                                         Frequency ID                 Frequency ID
+
+            D                                                                       E                                    Frecuency ID=127              Frecuency ID=83                      Frecuency ID=0
+                              Avg. Norm of Logits per Frecuency                                                 1 32                        1 96                              1 160                        1 224
+                                                                                                        1                          1                                 1                           1
+
+
+                                                                                     Attention Weight
+                        200
+                                                                                                                   Pos:                        Pos:                     Pos:                        Pos:
+      Norm                                                                                                         0.00
+                                                                                                                   Sym:
+                                                                                                                                               0.00
+                                                                                                                                               Sym:
+                                                                                                                                                                        0.00
+                                                                                                                                                                        Sym:
+                                                                                                                                                                                                    0.00
+                                                                                                                                                                                                    Sym:
+                                                                                                                   1.00                        1.00                     1.00                        1.00
+                          0                                                                             0                          0                                 0                           0
+                              0         25          50     75 100         125                               0    1000                   0    1000                      0     1000                  0     1000
+                                                   Frecuency ID
+            F                 Selected Frec. IDs in Pos/Sym Plane                                               128 32                      128 96                           128 160                      128 224
+                                                                                                        1                          1                                 1                           1
+
+
+                                                                                     Attention Weight
+                        1.0       127                                     0                                Pos:                       Pos:                              Pos:                        Pos:
+                                                                                                           1.00                       1.00                              1.00                        1.00
+                        0.8                                                                                Sym:                       Sym:                              Sym:                        Sym:
+                                                                                                           0.00                       0.00                              0.00                        0.00
+
+
+
+       Symbolic Score
+                                                                                                        0                          0                                 0                           0
+                        0.6                                                                               0     1000                 0     1000                        0     1000                  0     1000
+
+                        0.4                                                                                     256 32                      256 96                           256 160                      256 224
+                                                                                                        1                          1                                 1                           1
+
+
+                                                                                     Attention Weight
+                        0.2                                                                                Pos:                       Pos:                              Pos:                        Pos:
+                                                                                                           0.96                       0.99                              0.98                        0.60
+                                                                              83                           Sym:                       Sym:                              Sym:                        Sym:
+                        0.0                                                                                0.95                       0.96                              0.98                        1.00
+                                                                                                        0                          0                                 0                           0
+                              0.0       0.2         0.4       0.6   0.8   1.0                             0     1000                 0     1000                        0     1000                  0     1000
+                                                 Positional Score                                             Token ID                   Token ID                          Token ID                    Token ID
+     Figure 1: Global and local analysis of attention head behavior. A. Each head in the positional–symbolic plane.
+     B. Heatmaps of positional and symbolic scores for each head across all layers. C. For the same heads, we plot their
+     positional and symbolic scores as a function of RoPE frequencies. By convention, lower frequency IDs correspond to
+     higher angular frequencies, and conversely, higher frequency IDs correspond to lower angular frequencies. D. norms
+     of the logits at each frequency for head (12:0). E. Attention weight patterns as a function of permutations. Top rows
+     (green traces): Behavior of a symbolic head whose attention weight mass follows the permutations. Middle rows (red
+     traces): Behavior of a positional head whose attention weight mass is invariant to the permutations. Bottom rows
+     (blue traces): Behavior of a (mix) attention head with both high symbolic and positional scores, displaying a uniform
+     mass with low attention weight scores. Note that symbolic, positional, and mix head behavior ar associated with low,
+     relatively large, and the largest frequencies, respectively. F. Location on the positional-symbolic plane of head (12:0) as
+     a function of the selected frequency.
+
+     Computation of Positional and Symbolic Scores. We partition the sequence x into contiguous m blocks and
+     compute the sequence d = (d1 , ..., dm ), where di is the average attention weight of D(x) over the block i. To analyze
+     how attention behaves under input permutations, we focus on simple block swaps (e.g., exchanging block i with
+     block j). For each such permutation, we represent the corresponding block averages before and after the swap into
+                                                                          ′
+     two-dimensional vectors vij = (di , dj ) (before the swap) and vij      = (d′i , d′j ) (after the swap, but on the same block
+     locations). Using cosine similarity on the two-dimensional vectors v and v ′ , we define two scores: the positional score
+                                                                                                                 ′
+     sPOS (x̄), which measures the stability of block averages under permutations (i.e, we compare each vij        against vij ), and
+     the symbolic score sSYM (x̄), which measures whether block averages move consistently with the permutation (i.e. we
+                      ′
+     compare each vij   against vji ). The full details of how the metric is computed can be found in Appendix A.3.
+
+
+                                                                                                                            6
+Visualizing heads in the Positional-Symbolic Plane. The pair of scores P S(H, x̄) := (sPOS (x̄), sSYM (x̄)) defines a
+point in what we call the positional-symbolic plane. In order to visualize the behavior of an entire model on a given task,
+we can fix a prompt σ̄ = (σ1 , . . . , σn ) and compute the scores for all heads in the model based on their corresponding
+inputs x̄ = (y1ℓ−1 , . . . , ynℓ−1 ), with ℓ defining the layer number. This allows us to reveal the behavior of the entire model
+and visualize its behavior’s profile in the positional-symbolic plane.
+Figure 1 shows this profile for the entire gemma-2-2b-it model on the binding task. Each dot on Figure 1A represents
+the location of an attention head on the positional-symbolic plane (with color coding layer depth). We observe that
+early layer heads are associated to high positional scores, whereas late layer heads tend to be more symbolic. Figure
+1B, illustrates an important feature of our work. Compared to previous studies [Barbero et al., 2024], we now can
+depict a full model attention head behavior snapshot, for all heads and layers. This snapshot provides a strong empirical
+support for our theoretical positional-symbolic exclusion principle. Indeed, the scores in both heatmaps are negatively
+correlated. Furthermore, Figure 7 shows the predominance of symbolic head behavior when querying block 1, and how
+the positional and symbolic scores gradually revert when the queried blocks gradually move from block 1 to 256.
+
+Positional and Symbolic Scores in RoPE. We now take a closer look into how attention heads use the different
+RoPE frequencies. We do this by first decomposing a given head H into m distinct projection heads, each of which can
+be seen as an individual 2-dimensional head with a single associated frequency (see Appendix A.3 for details of logits
+per frequency). By computing the positional and symbolic scores for each projected head, we can visualize how the
+behavior of the combined head H depends on each of the frequencies in RoPE. As can be seen in Figure 1C, there is a
+sharp correspondence between attention head behavior type (i.e., symbolic or positional) and frequency, with relatively
+high frequencies associated to positional behavior and lower frequencies to symbolic behavior, mirroring the results
+observed in some specific heads by Barbero et al. [2024], but now generalized to all heads and layers (see Figure 5).
+Our method allows to reveal a new empirical observation. We find that for the highest frequencies, some heads display
+large positional and symbolic scores. According to Theorem 1, these should correspond to heads exhibiting a uniform
+attention pattern.
+We then took an even deeper look at the first head from layer 12 (head 12:0; see top right of Figure 1C). Figure 1E
+depicts the behavior of this head for three different frequencies exhibiting symbolic (green traces), positional (red
+traces) and both (blue traces) behaviors, respectively. As expected from our definitions, symbolic behavior is reflected
+by changes in the attention weight mass that moves with the permutation, whereas the attention weight profile remains
+unchanged for the positional behavior. One can also clearly see a uniform attention pattern for the frequencies where the
+head displays both behaviors. Finally, head (12:0) also allows us to understand the underlying reasons for the location
+of heads on the positional-symbolic plane, as this head exhibits both high symbolic and positional scores (see red star
+on Figure 1A ). For this head, we analyzed the norms of the key vectors at each frequency (Figure 1D), and noted that
+most of the norm mass is concentrated on the smallest frequencies, which therefore contribute more to the global head’s
+behavior, and explains a relative high symbolic score. Additionally, some mass is distributed over a large range of
+intermediate frequencies, in turn explaining a relatively high positional score.
+
+4       Positional and symbolic canonical tasks
+In this section3 , we aim at deepening our theoretical understanding of positional and symbolic heads. In particular,
+we introduce non-trivial tasks that can be solved by pure positional (symbolic) heads using a 1–layer attention-only
+transformer. Our goal is to show how simple models can give us important clues with respect to the fundamental tension
+between tasks requiring the extraction of either positional or symbolic information from the input.
+
+Index Task. We now introduce a task intended to be intrinsically positional. Consider an input sequence sP OS =
+(σ0 , σ1 , . . . , σn−1 , j), where each σi is a symbol from a finite vocabulary Σ, and j is an integer index in the range
+0 ≤ j < n. The goal of the task is to output the symbol at position j (determined by the last token in sP OS ), σj . Thus, to
+solve this task, one needs a transformer that computes the function fP OS defined by fP OS ((σ0 , σ1 , . . . , σn−1 , j)) = σj .
+Intuitively, any mechanism allowing to solve this task should be highly sensitive to the position being asked for, while
+it can ignore the actual symbols. We now proceed to prove that fP OS can never be solved by a 1-layer decoder-only
+transformer ME MB with a single head H that acts symbolically.
+Theorem 2. For an arbitrary attention head H, if H acts symbolically on a non constant input x̄ then ME MB ̸= fP OS .
+Note that Theorem 2 does not assume any specific form in which the positional information is incorporated into the
+logit function. On the other hand, our next result shows that fP OS can be solved by a simple and purely positional
+attention head.
+    3
+        All proofs for this section can be found in Appendix B.
+
+
+                                                                  7
+Theorem 3. For each n > 0 there is a purely positional attention head HP OS that uses RoPE with a single angle and
+no value or activation function, such that ME MB = fP OS for every sP OS of length n.
+
+Even though solving fP OS seems rather simple, Theorems 2 and 3 characterize it as a purely positional task. Interestingly,
+not every angle of RoPE is appropriate for the construction of HP OS . In fact, if the angle is greater than 2π/n, attention
+weights are not maximized in just one position of the input, which could lead to confusion on the model’s output. Later
+we will see how this effect emerges also empirically, having a direct impact on a model’s capacity for solving tasks like
+fP OS .
+
+Information retrieval Task. Here, we consider inputs of the form sS YM = (σ1 #i1 , σ2 #i2 , . . . , σn−1 #in−1 , σj #)
+where ik is an integer for every k < n. The goal for this task is to retrieve the correct symbol σj #ij , associated to
+the last symbol σj (the query). We assume for this task that σj appears just once in the sequence before the query.
+Formally, the solution function fS YM is defined as fS YM ((σ0 #i0 , σ1 #i1 , . . . , σn−1 #in−1 , σj #)) = σj #ij . Clearly,
+this task only depends on the symbols and positional information is irrelevant to the answer. Similar to the previous
+task, we can show that any simple head that acts positionally can not compute fS YM . Here, by H being simple we mean
+that VAL is the identity, the activation function F is just a projection, and that E MB = O NE H OT.
+Theorem 4. Let H be any simple attention head. If H acts positionally on an input x̄, then MO NE H OT ̸= fS YM .
+
+We remark that if we allow F to be a general MLP, then one can use it to override the attention mechanism and produce
+a (rather artificial) counterexample (see Appendix section B.6). We proceed by showing that a purely symbolic attention
+head H can naturally solve fS YM .
+Theorem 5. For every n > 0 there exists a purely symbolic attention head HS YM , without value or activation function,
+such that MO NE H OT = fS YM on every sS YM of size n.
+
+Experiments on positional versus symbolic heads. Our results show that a simple 1-head transformer can perfectly
+solve fP OS and fS YM . Namely, the 1-RoPE HP OS for fP OS and the NoPE HS YM for fS YM . In order to test if such heads
+can be learned during training and at the same time explore how the choice of the angle θ affects accuracy, we trained a
+simple 1-RoPE architecture for different values of θ on both tasks. While we observe that a 1-RoPE converges to a
+proper solution for the appropriate angles (Figure 2A), we also find that the chosen RoPE angle has a direct impact
+on the learning abilities of the model. Indeed, as expected from our theoretical results, small frequencies (large ID)
+are not suitable for solving the Index (positional) task, while larger ones are inadequate for the Information Retrieval
+(symbolic) one. Note the striking resemblance of these accuracy curves with the positional and symbolic scores curves
+from Figure 1C.
+ A                     Iter 64                    Iter 256               Iter 448           Epoch 1            Epoch 2              Epoch 5                   Epoch 100
+           100              Index
+                            Retrieval
+
+Accuracy
+            50
+
+
+             0
+                 0         5                0         5            0         5         0         5        0         5          0         5            0             5
+ B                   Frecuency ID
+                       Iter 64
+                                                Frecuency ID
+                                                  Iter 256
+                                                                       Frecuency ID
+                                                                         Iter 448
+                                                                                           Frecuency ID
+                                                                                            Epoch 1
+                                                                                                              Frecuency ID
+                                                                                                               Epoch 2
+                                                                                                                                   Frecuency ID
+                                                                                                                                    Epoch 5
+                                                                                                                                                              Frecuency ID
+                                                                                                                                                              Epoch 100
+           100                     1­frec
+                                   2­frec
+
+Accuracy
+            50
+
+
+             0
+                 0         5                0         5            0         5         0         5        0         5          0         5            0             5
+                     Frecuency ID               Frecuency ID           Frecuency ID        Frecuency ID       Frecuency ID         Frecuency ID               Frecuency ID
+
+                 C
+                               9                               8                                      7            6         5 4       3 2        1       0
+                               0                                       0.01 2 /n                          0.10 2 /n                                   2 /n
+                                                                                      Angle (log scale)
+Figure 2: Performance on the canonical tasks across training iterations and epochs. A. Tension between Index
+(positional) and Retrieval (symbolic) tasks. B. Accuracy in the partial induction task for 1-frequency and 2-frequency
+models. C. Frequency IDs mapped to the log-scaled angle axis.
+
+
+
+
+                                                                                            8
+Partial induction Task. Finally, we present a partial induction task4 with inputs of the form sM IX =
+(σ1 #i1 , σ2 #i2 , . . . , σn−1 #in−1 , σj #) where ik is an integer for every k < n. We assume for this task that σj
+appears at least two times in the sequence, in positions j1 and j2 , and that integers ij1 and ij2 are different. The goal
+for this task is to retrieve the correct symbol-integer pair associated with the last occurrence of σj (notice that the
+case with a single occurrence subsumes the information retrieval task). We denote by fM IX the corresponding solution
+function. The following result (which follows directly from our previous results) show that if a 1-layer transformer
+computes fM IX , then it cannot behave in a purely positional or purely symbolical way.
+Corollary 1. If a simple model MO NE H OT with head H computes fM IX , then for every input sM IX , H does not behave
+positionally (or symbolically) on sM IX .
+
+On the positive side, we demonstrate that a single attention head with two RoPE angles suffices.
+                                                           0,θ2
+Theorem 6. For every n > 0 there exists an attention head HM IX
+                                                                with two RoPE angles such that MO NE H OT = fM IX on
+every sM IX of length n.
+
+Experiments for the partial induction task. Figure 2B, shows that a toy model with 1-RoPE angle can not solve the
+partial induction task. On the other hand, a model with angles θ1 = 0 and θ2 (flexible), can solve it when θ2 is not too
+big. This is expected from the proof of Theorem 6 since bigger angles for θ2 confuse the model’s output. Finally, the
+fact that the 1-RoPE version of this model has a decreasing accuracy as angles get bigger suggests that our version of the
+partial induction task has a more prominent symbolical difficulty. This could be explained by the fact that solving fM IX
+requires to detect only two positions of the input (both occurrences of σj ), but several symbols need to be distinguished
+at the same time.
+
+5           On the relation between frequencies and accuracy shape
+
+  A 100               2=    /n       8 = 0.01     /n
+                                                                        10
+                                                                                 B                                              0 = 2 /n
+                                                                                                                                                    1931222423
+                                                                                                                                                                               C                            L=12, H=0, Frec ID=65
+                                                                        9                  40         Key                       5
+                                                                                                                                      4   3       25 1013 162                                                         28 26 2524
+                                                                                                      Query                                    2                                         1.0                    29       27      23
+                                                                                                                                                                                                            32 3130
+                                                                                                                                                        29 0
+                                                                                                                                                                                                                                      2122 20 1817
+
+
+                                                       Elapsed Epochs
+                                                                        8                                                  6
+                                                                                                                                                 1 0 11 17   4 30
+                                                                        7                                         7                                 27 8 15
+
+ Accuracy
+                                                                                           30                                                                   18                                          33                                    19
+                                                                        6                                   8                                            6526 128
+                                                                                                                                                        20                               0.5                                                     16 15
+             50                                                         5                              9                                              129214 37                                         34
+                                                                                                                                                                                                       35                                           14
+                                                                                           20
+                                                                        4                             10                                                31 30                                          36 37                              0        131211
+                                                                        3                                                                                                                0.0         4038                                         10
+
+
+                                                                                                                                                                           Dimension 2
+                                                                                           10                                                                     29
+
+
+                                                                             Dimension 2
+                                                                        2                       11
+              0                                                         1
+                                                                                                                                                                                                     39                                   231 789
+                                                                                                12                                                                    28                         41                                          456
+                                                                                            0
+            100                                                         10                                                                                                               0.5      42 43
+                                                                        9                        13                                                                   27
+                                                                                           10                                                                                                     44
+
+
+
+                                                       Elapsed Epochs
+                                                                        8                             14                                                         26                              45 46 47
+                                                                                                                                                                                                                               62
+                                                                                                                                                                                                                               63           63
+                                                                        7
+
+ Accuracy
+                                                                                                            15                                                                           1.0       48
+                                                                        6                  20                                                                  25
+             50                                                         5                                        16                                      24                                            50              59 60    61
+                                                                                                                      17                            23                                            49 51
+                                                                        4                  30                                                                                            1.5            52
+                                                                        3                                                  18                  22                                                       53
+                                                                                                                                                                                                        54 55          58
+                                                                        2                                                           19 20 21                                                               56 57
+              0                                                         1                  40                                                                                                                                   Key              Query
+                  0        20    0         20                                                                                                                                            2.0
+                                                                                                40     30         20           10     0   10     20       30      40                           2.0    1.5      1.0      0.5    0.0    0.5        1.0
+                      Position         Position                                                                                Dimension 1                                                                           Dimension 1
+Figure 3: A. Shapes of Accuracy for the Index (in red) and Retrieving (in green) tasks, per Epochs. B. Query (in
+blue) and key (in orange) vectors trajectories during training for the Index Task. C. Query/Key vector projections on a
+rotational plane from a gemma-2-2b-it’s Head for some Binding Task’s input (64 pairs).
+As we have seen, a head required to behave in a certain way needs to access certain frequencies. In this section, we
+are interested in understanding how the performance of a head that is forced to operate with the wrong frequency is
+affected. We thus analyzed the accuracy of our trained 1-layer Transformer on both of our canonical tasks, focusing
+on how it depends on the location of the answer within the prompt. Interestingly, as it can clearly be seen in Figure
+3A (upper graphs), the loss in accuracy when using frequencies that are too low for solving the Index task (red) is
+more severe when the answer lies at the middle of the prompt, and less severe when they closer to the border positions,
+resulting in a U -shaped accuracy pattern. This is reminiscent of a phenomenon that has been reported before as “lost in
+the middle" [Liu et al., 2024]. On the other hand, when solving the Retrieving task (green) using frequencies that are
+not low enough, the opposite phenomenon is observed, and an inverted U -shaped accuracy pattern emerges.
+Figure 3B shows the trajectories of the query (blue) and key (orange) vectors during training. These trajectories reveal
+the emerging mechanism the trained model relies on to solve the task. The query vectors are configured so that their
+angles code the different positions they are querying to, while the key vectors arrange into a single direction, which
+explains why the head behaves positionally. In fact, this is the exact same mechanism the theoretical solution HP OS
+implements. On the other hand, Figure 3C shows the projections of the query (blue) and key (orange) vectors on a
+       4
+            Named as such in allusion to induction heads operations [Olsson et al., 2022].
+
+
+                                                                                                                      9
+selected rotational plane for a frequency where head 12:0 from gemma-2-2b-it behaves positionally. One can see the
+striking resemblance to the toy model.
+By further studying the mechanisms implemented by our theoretical toy models, we are able to provide an explanation
+for the observed accuracy shapes, at least at the attention level pattern. Let us say that a function f : [n] → R is
+u-shaped if it has local maxima at 0 and n and over this interval it is first decreasing and then increasing. Similarly, we
+say it is inverted-u-shaped if −f is u-shaped. Now, for either of our canonical tasks (index and information retrieval)
+let j be the location of the answer within the input prompt, and let wmax (j) be the largest attention weight value of the
+heads HP OS and HS YM from the proofs of Theorem 3 and 5, respectively. For the next Theorem, we consider a modified
+version HSθYM of HS YM where we allow for the use of an angle θ. From the construction of these heads it follows that
+wmax (j) is precisely the weight at position j, which is moreover equal for every such input. Besides our empirical
+findings, in the Appendix we give a rigorous mathematical proof of the following:
+Theorem 7. The function wmax is u-shaped for HP OS and inverted-u-shaped for a simplified version of HSθYM .
+
+6    Conclusions and future directions
+We have carried a thorough analysis of two core abilities that attention heads in Transformers require in order to work
+effectively. By providing a precise definition of positional and symbolic behavior, we came up with a metric to detect
+a working head’s positional or symbolic nature. We were able to disentangle these mechanisms and mathematically
+understand why these two abilities are in tension with each other. By analyzing both real and toy models, we explained
+why heads prefer different frequencies in RoPE depending on the mechanisms they need to implement to process a
+given input, and finally related the resulting accuracy of a model to its ability to employ the appropriate frequencies.
+We believe the characterization of a model by its positional-symbolic profile is a powerful tool to analyze how particular
+models behave on different tasks. Even though in this paper we have concentrated on the Binding Task [Feng and
+Steinhardt, 2023], we foresee a promising strategy in systematically performing similar analyses for a wider set of
+tasks and models. For example, one could use this tool to characterize the nature of models and tasks in terms of the
+“amount" of positional or symbolic mechanisms they tend to implement (for models) or rely on (for tasks).
+In fact, the invariant properties that underlie positional or symbolic behavior can be thought of as inductive biases that
+the model has to learn to solve the task at hand. In other architectures such as CNNs or GNNs for example, these type of
+inductive biases are imposed into the architecture by design, thereby improving generalization properties and learning
+efficiency (Maron et al. [2019], Petrache and Trivedi [2023], Deng et al. [2022]). It is interesting to wonder whether
+a similar strategy could be applied to Transformers, for instance by imposing the appropriate degree of positional
+or symbolic behavior to selected heads. It is tempting to conjecture that these two core abilities constitute in fact
+the fundamental building blocks of any head, in the sense that their action can always be somehow decomposed into
+simpler heads behaving purely either positionally or symbolically. Such a theory could constitute the base for designing
+architectures targeted to specific tasks. We see this as an exciting avenue for future work.
+
+References
+Jorge Pérez, Pablo Barceló, and Javier Marinkovic. Attention is turing-complete. Journal of Machine Learning
+  Research, 22(75):1–35, 2021.
+Amirhossein Kazemnejad, Inkit Padhi, Karthikeyan Natesan Ramamurthy, Payel Das, and Siva Reddy. The impact of
+  positional encoding on length generalization in transformers. Advances in Neural Information Processing Systems,
+  36:24892–24928, 2023.
+Federico Barbero, Alex Vitvitskyi, Christos Perivolaropoulos, Razvan Pascanu, and Petar Veličković. Round and round
+  we go! what makes rotary positional encodings useful? arXiv preprint arXiv:2410.06205, 2024.
+Xiaoran Liu, Hang Yan, Shuo Zhang, Chenxin An, Xipeng Qiu, and Dahua Lin. Scaling laws of rope-based extrapolation.
+  arXiv preprint arXiv:2310.05209, 2023.
+Xin Men, Mingyu Xu, Bingning Wang, Qingyu Zhang, Hongyu Lin, Xianpei Han, and Weipeng Chen. Base of rope
+  bounds context length. arXiv preprint arXiv:2405.14591, 2024.
+Shouyuan Chen, Sherman Wong, Liangjian Chen, and Yuandong Tian. Extending context window of large language
+  models via positional interpolation. arXiv preprint arXiv:2306.15595, 2023.
+Bowen Peng, Jeffrey Quesnelle, Honglu Fan, and Enrico Shippole. Yarn: Efficient context window extension of large
+  language models. arXiv preprint arXiv:2309.00071, 2023.
+
+
+
+                                                            10
+Wenhan Xiong, Jingyu Liu, Igor Molybog, Hejia Zhang, Prajjwal Bhargava, Rui Hou, Louis Martin, Rashi Rungta,
+   Karthik Abinav Sankararaman, Barlas Oguz, et al. Effective long-context scaling of foundation models. arXiv
+   preprint arXiv:2309.16039, 2023.
+Yiran Ding, Li Lyna Zhang, Chengruidong Zhang, Yuanyuan Xu, Ning Shang, Jiahang Xu, Fan Yang, and Mao Yang.
+   Longrope: Extending llm context window beyond 2 million tokens. arXiv preprint arXiv:2402.13753, 2024.
+Bowen Yang, Bharat Venkitesh, Dwarak Talupuru, Hangyu Lin, David Cairuz, Phil Blunsom, and Acyr Locatelli. Rope
+   to nope and back again: A new hybrid attention strategy. arXiv preprint arXiv:2501.18795, 2025.
+Yiting Chen and Junchi Yan. What rotary position embedding can tell us: Identifying query and key weights
+   corresponding to basic syntactic or high-level semantic information. Advances in Neural Information Processing
+   Systems, 37:54507–54528, 2024.
+Ashok Vardhan Makkuva, Marco Bondaschi, Adway Girish, Alliot Nagle, Hyeji Kim, Michael Gastpar, and Chanakya
+   Ekbote. Local to global: Learning dynamics and effect of initialization for transformers. Advances in Neural
+   Information Processing Systems, 37:86243–86308, 2024.
+Ashok Vardhan Makkuva, Marco Bondaschi, Adway Girish, Alliot Nagle, Martin Jaggi, Hyeji Kim, and Michael
+   Gastpar. Attention with markov: A curious case of single-layer transformers. In The Thirteenth International
+   Conference on Learning Representations, 2025.
+Zihao Li, Yuan Cao, Cheng Gao, Yihan He, Han Liu, Jason Klusowski, Jianqing Fan, and Mengdi Wang. One-layer
+   transformer provably learns one-nearest neighbor in context. Advances in Neural Information Processing Systems,
+   37:82166–82204, 2024a.
+Philip Quirke and Fazl Barez. Understanding addition in transformers. arXiv preprint arXiv:2310.13121, 2023.
+Clayton Sanford, Daniel J Hsu, and Matus Telgarsky. Representational strengths and limitations of transformers.
+   Advances in Neural Information Processing Systems, 36:36677–36707, 2023.
+Clayton Sanford, Daniel Hsu, and Matus Telgarsky. One-layer transformers fail to solve the induction heads task. arXiv
+   preprint arXiv:2408.14332, 2024.
+Alexander Kozachinskiy, Felipe Urrutia, Hector Jimenez, Tomasz Steifer, Germán Pizarro, Matías Fuentes, Francisco
+   Meza, Cristian B Calderon, and Cristóbal Rojas. Strassen attention: Unlocking compositional abilities in transformers
+   based on a new lower bound method. arXiv preprint arXiv:2501.19215, 2025.
+Yuandong Tian, Yiping Wang, Beidi Chen, and Simon S Du. Scan and snap: Understanding training dynamics and
+   token composition in 1-layer transformer. Advances in neural information processing systems, 36:71911–71947,
+   2023.
+Yingcong Li, Yixiao Huang, Muhammed E Ildiz, Ankit Singh Rawat, and Samet Oymak. Mechanics of next token
+   prediction with self-attention. In International Conference on Artificial Intelligence and Statistics, pages 685–693.
+   PMLR, 2024b.
+Ruiquan Huang, Yingbin Liang, and Jing Yang. Non-asymptotic convergence of training transformers for next-token
+   prediction. Advances in Neural Information Processing Systems, 37:80634–80673, 2024.
+Tong Yang, Yu Huang, Yingbin Liang, and Yuejie Chi. In-context learning with representations: Contextual generaliza-
+   tion of trained transformers. Advances in Neural Information Processing Systems, 37:85867–85898, 2024.
+Siyu Chen, Heejune Sheen, Tianhao Wang, and Zhuoran Yang. Training dynamics of multi-head softmax attention for
+   in-context learning: Emergence, convergence, and optimality. arXiv preprint arXiv:2402.19442, 2024.
+Riccardo Ali, Francesco Caso, Christopher Irwin, and Pietro Liò. Entropy-lens: The information signature of transformer
+   computations. arXiv preprint arXiv:2502.16570, 2025.
+Mansi Sakarvadia, Arham Khan, Aswathy Ajith, Daniel Grzenda, Nathaniel Hudson, André Bauer, Kyle Chard, and Ian
+   Foster. Attention lens: A tool for mechanistically interpreting the attention head information retrieval mechanism.
+   arXiv preprint arXiv:2310.16270, 2023.
+Javier Ferrando, Gerard I Gállego, Ioannis Tsiamas, and Marta R Costa-Jussà. Explaining how transformers use context
+   to build predictions. arXiv preprint arXiv:2305.12535, 2023.
+Emmanuel Ameisen, Jack Lindsey, Adam Pearce, Wes Gurnee, Nicholas L Turner, Brian Chen, Craig Citro, David
+   Abrahams, Shan Carter, Basil Hosmer, et al. Circuit tracing: Revealing computational graphs in language models.
+   Transformer Circuits Thread, 6, 2025.
+Jiahai Feng and Jacob Steinhardt. How do language models bind entities in context? arXiv preprint arXiv:2310.17191,
+   2023.
+
+
+
+                                                          11
+Catherine Olsson, Nelson Elhage, Neel Nanda, Nicholas Joseph, Nova DasSarma, Tom Henighan, Ben Mann, Amanda
+  Askell, Yuntao Bai, Anna Chen, et al. In-context learning and induction heads. arXiv preprint arXiv:2209.11895,
+  2022.
+Nelson F Liu, Kevin Lin, John Hewitt, Ashwin Paranjape, Michele Bevilacqua, Fabio Petroni, and Percy Liang. Lost in
+  the middle: How language models use long contexts. Transactions of the Association for Computational Linguistics,
+  12:157–173, 2024.
+Haggai Maron, Heli Ben-Hamu, Nadav Shamir, and Yaron Lipman. Invariant and equivariant graph networks, 2019.
+  URL https://arxiv.org/abs/1812.09902.
+Mircea Petrache and Shubhendu Trivedi.           Approximation-generalization trade-offs under (approximate)
+  group equivariance.      In A. Oh, T. Naumann, A. Globerson, K. Saenko, M. Hardt, and S. Levine,
+  editors, Advances in Neural Information Processing Systems, volume 36, pages 61936–61959. Cur-
+  ran Associates, Inc., 2023. URL https://proceedings.neurips.cc/paper_files/paper/2023/file/
+  c35f8e2fc6d81f195009a1d2ae5f6ae9-Paper-Conference.pdf.
+Weijian Deng, Stephen Gould, and Liang Zheng.             On the strong correlation between model invariance
+  and generalization.      In S. Koyejo, S. Mohamed, A. Agarwal, D. Belgrave, K. Cho, and A. Oh,
+  editors, Advances in Neural Information Processing Systems, volume 35, pages 28052–28067. Cur-
+  ran Associates, Inc., 2022. URL https://proceedings.neurips.cc/paper_files/paper/2022/file/
+  b3847cda0c8cc0cfcdacf462dc122214-Paper-Conference.pdf.
+Shunyu Yao, Binghui Peng, Christos Papadimitriou, and Karthik Narasimhan. Self-attention networks can process
+  bounded hierarchical languages. arXiv preprint arXiv:2105.11115, 2021.
+
+
+
+
+                                                       12
+A       Additional illustration and proofs of section 3
+A.1     Illustration of attention head behavior definition
+
+                      Logit Values                                        Invariant Logit Values                                  Equivariant Logit Values
+                                                                                    Same values                                       Consistent transformation
+
+
+    +
+    0
+    -
+                    L(xi,i,xj,j)           L(xi,i,xk,k)                         L(xi,i,xk,j)            L(xi,i,xj,k)                       L(xi,i,xk,j)            L(xi,i,xj,k)
+        x1 x2 xj      …    …       …   xk …       …    xi        x1 x2 xk …            …       …   xj     …    …       xi     x1 x2 xk …          …       …   xj     …    …       xi
+        1   2   j                      k                  i       1   2     j      xj ↔ xk         k                   i      1   2    j       xj ↔ xk        k                   i
+
+Figure 4: Illustration using the same sequence as in Definition 2. Left: Original logit values. Middle: Example of
+invariant logit values after a simple permutation (swapping xj with xk ). Right: Example of equivariant logit values
+under the same permutation.
+
+A.2     Proof of theorem 1
+
+Denote ak,j = L(xn , n, xk , j). Take an index j ∈ [n − 1] and a permutation π ∈ Sn−1 independently and uniformly at
+random. Note that (j, π(j)) is a uniformly random pair from [n − 1]2 (under any fixation of j, the distribution of π(j)
+is uniform). Observe that:
+                                                                           Var(λ) = Var(ajj ),
+                                                                     pos 2
+                                                                   ∥δL,x̄ ∥2
+                                                                                         = E(aπ(j)j − ajj )2 ,
+                                                              (n − 1)! · (n − 1)
+                                                                    sym 2
+                                                                  ∥δL,x̄  ∥2
+                                                                                         = E(ajπ(j) − ajj )2 .
+                                                              (n − 1)! · (n − 1)
+Since (j, π(j)) is a uniformly random pair from [n − 1]2 , the pair (π(j), j) has the same distribution, meaning that:
+                                                                 sym 2
+                                                               ∥δL,x̄ ∥2
+                                                                                     = E(aπ(j)j − aπ(j)π(j) )2 .
+                                                      (n − 1)! · (n − 1)
+
+Using the fact that Var(X) = E(X − Y )2 /2 for any random variable X and its independent copy Y , we get:
+                                                      Var(λ) = Var(ajj ) = E(ajj − aπ(j)π(j) )2 /2.
+Finally, using an inequality (x − y)2 ≤ 2x2 + 2y 2 for x, y ∈ R, we derive the statement of the theorem
+                          Var(λ) = E(ajj − aπ(j)π(j) )2 /2 ≤ E(ajj − aπ(j)j )2 + E(aπ(j)j − aπ(j)π(j) )2
+                                              pos 2       sym 2
+                                            ∥δL,x̄ ∥2 + ∥δL,x̄ ∥2
+                                       =
+                                             (n − 1)! · (n − 1)
+
+A.3     General metric to test positional or symbolic heads
+
+Blocks.     We define a fixed partition of the index set [n] into m contiguous intervals (blocks)
+                               I1 = [a1 , b1 ], I2 = [a2 , b2 ], . . . , Im = [am , bm ],                                   a1 = 1, bm = n,
+with ak+1 = bk + 1. For block Ik define its average attention weights under x by
+                                                         1 X
+                                             dk (x) =           D(x)t .
+                                                        |Ik |
+                                                                                               t∈Ik
+
+We collect these into the block-average vector d(x) = (d1 (x), . . . , dm (x)) ∈ Rm .
+
+
+                                                                                        13
+Block permutations with dynamic intervals. Let the original sequence be partitioned into contiguous blocks
+I1 , . . . , Im as above, with lengths |I1 |, . . . , |Im |. A block permutation π ∈ Sm rearranges these blocks, producing a
+new sequence π(x). We then define new block intervals I1′ , . . . , Im      ′
+                                                                               by preserving the original relative positions but
+adjusting the boundaries according to the lengths of the permuted blocks. More precisely, we let
+                                                |Ik′ | = Iπ−1 (k) ,           Ik′ = [a′k , b′k ],
+where the boundaries are given recursively by
+                                     a′1 = 1,    b′k = a′k + |Iπ−1 (k) | − 1,              a′k+1 = b′k + 1.
+Thus, the k-th block position in the permuted sequence has the same length as the block that was moved into that
+position. The block averages under the permuted sequence are
+                                                      1 X            
+                                         dk π(x) = ′           D π(x) t .
+                                                      |Ik |  ′              t∈Ik
+
+
+Two–dimensional representation. A simple type of permutation π are a swap between block i and block j. We
+represent the relevant attention mass by the vector
+                                                      vij (x) = (di (x), dj (x)),
+and after the permutation by
+                                                vij (π(x)) = (di (π(x)), dj (π(x))).
+
+Permutation weights. Not all block swaps are equally informative: we weight each permutation π according to the
+amount of mass it moves,                                                 
+                                      α(π) = softmax di (x) − dj (x) /τ ,
+where τ > 0 is a temperature parameter controlling how sharply the softmax focuses on high-mass swaps.
+
+Positional and symbolic scores. We can now quantify how the head behaves with respect to block permutations
+using cosine similarity5 . The positional score measures how stable the block averages remain under a permutation:
+                                              X                                  
+                                   sPOS (x) =     α(π) cos sim vij (π(x)), vij (x) .
+                                                     π
+
+The symbolic score instead measures whether the block averages transform exactly as the permutation prescribes:
+                                           X                                  
+                                sSYM (x) =     α(π) cos sim vij (π(x)), vji (x) .
+                                                      π
+
+Scores per frequency. Even though previous definitions are applicable to any logits function L, in the case of RoPE
+we can leverage its frequency decomposition (as a Hadamard attention head) to have a more refined understanding of
+the positional and symbolic behavior of each RoPE’s frequency as single angle attention heads.
+We begin by isolating the contribution of a single attention head at a given layer, and decomposing its logits into
+frequency components induced by RoPE. Consider layer ℓ and head h. The logits between query position n with token
+xn and key position j with token xj are given by
+                                                   D                       E
+                             Lℓh (xn , n, xj , j) = K ℓh xj , RΘn−j Qℓh xn
+                                                              d/2 D                                     E
+                                                              X
+                                                          =            ℓh
+                                                                      K2t,2t+1 xj , Rθn−j
+                                                                                      t
+                                                                                          Qℓh
+                                                                                           2t,2t+1 xn
+                                                              t=1
+                                                              d/2
+                                                              X
+                                                          =         Lℓh
+                                                                     t (xn , n, xj , j).
+                                                              t=1
+
+Here each term
+                                                                             n−j ℓh
+                                        Lℓh                    ℓh
+                                         t (xn , n, xj , j) = K2t,2t+1 xj , Rθt Q2t,2t+1 xn
+corresponds to the logit contribution from frequency θt where the metrics sPOS (x) or sSYM (x) can be measured
+individually.
+   5                      ⟨a,b⟩
+       cos sim(a, b) =   ∥a∥ ∥b∥
+                                 .
+
+
+                                                                       14
+A.4   Template Prompts for Real-world Models on Binding Task
+
+In our template prompts, we consider the span-block format defined as follows:
+
+span_block = "\n".join([f"{name} likes the color {color}"
+for name, color in sequence])
+
+See bellow the template prompts for each model.
+  gemma-2-it
+  <bos><start_of_turn>user
+  You are a helpful assistant that can answer questions about entities and their associated
+  attribute.
+  ---
+  Context:
+  {{span_block}}
+  ---
+  Question: What color does {{entity[j]}} like the most?<end_of_turn>
+  <start_of_turn>model
+  Answer: {{entity[j]} likes the color
+
+
+  llama-3.2-it
+  <|begin_of_text|><|start_header_id|>system<|end_header_id|>
+  You are a helpful assistant that can answer questions about entities and their associated
+  attribute.<|eot_id|>
+  <|start_header_id|>user<|eot_id|>
+  Context:
+  {{span_block}}
+  ---
+  Question: What color does {{entity[j]}} like the most?<|eot_id|>
+  <|start_header_id|>assistant<|eot_id|>
+  Answer: {{entity[j]} likes the color
+
+
+  qwen2-it
+  <|im_start|>system
+  You are a helpful assistant that can answer questions about entities and their associated
+  attribute.<|im_end|>
+  <|im_start|>user
+  Context:
+  {{span_block}}
+  ---
+  Question: What color does {{entity[j]}} like the most?<|im_end|>
+  <|im_start|>assistant
+  Answer: {{entity[j]} likes the color
+
+
+
+A.5   Gemma-2-2B-Instruct on the Binding Task
+
+For the google/gemma-2-2b-it model, we compute global positional and symbolic scores for each attention head,
+and for each head we compute the scores of the projected heads for every frequency. The same analysis is also performed
+for other models, with results deferred to the next sections. Our evaluation is grounded in the binding task, which tests
+whether the model can correctly associate entities with their attributes [Feng and Steinhardt, 2023]. Specifically, we
+construct inputs consisting of n = 256 entity–attribute pairs, where entities are proper names and attributes are colors
+(e.g., Alice likes the color Red; Bob likes the color Blue). At the end of the sequence, a query probes the attribute of one
+entity (e.g., What color does Alice like the most?). The choice of the task is made based on two reasons. First, it is a
+task that can intuitively be approached by a combination positional and a symbolic mechanisms. And second, we have
+complete control of the location of the correct answer the question at the end of the prompt requires the model to find.
+This allows for a clearer comparison of the model behavior’s when we change this location by changing the query.
+We segment each input into 256 blocks, with each block containing exactly one entity–attribute pair. Then we select 9
+uniformly spaced blocks. For a given query targeting the k-th block, we generate alternative inputs by permuting the
+position of i-th block with a different j-th block, for all i, j = 1...9. This procedure yields nine permutations per query,
+and a total of nine queries per input.
+For each attention head, we compute the positional and symbolic scores across RoPE frequencies. Recall that Gemma
+employs RoPE, where frequency identifiers are mapped to angular frequencies according to θt = 10000−2·t/d , with t
+
+
+                                                             15
+the frequency index and d = 256 the head dimension. By convention, lower frequency IDs correspond to higher angular
+frequencies, and conversely, higher frequency IDs correspond to lower angular frequencies. This mapping allows us to
+analyze the contribution of each frequency to the model’s binding behavior.
+We first evaluate the metrics separately for each frequency. Figure 6 shows the location of selected attention heads in
+the positional–symbolic plane, together with their detailed frequency profiles. Since the model uses a head dimension
+of 256, this corresponds to 128 RoPE frequencies. By convention, higher frequency IDs correspond to lower angular
+frequencies, while lower frequency IDs correspond to higher angular frequencies.
+We then aggregate these measurements by summing logits across frequencies, yielding a global positional–symbolic
+profile. The results, presented in Figure 1, 7, provide an overall view across all layers and heads of the model.
+            0:0        1:0       2:0                3:0      4:0         5:0      6:0      7:0      8:0         9:0      10:0      11:0        12:0      13:0      14:0      15:0      16:0        17:0      18:0      19:0      20:0      21:0        22:0      23:0      24:0      25:0
+        1
+Score
+        0
+            0:1        1:1       2:1                3:1      4:1         5:1      6:1      7:1      8:1         9:1      10:1      11:1        12:1      13:1      14:1      15:1      16:1        17:1      18:1      19:1      20:1      21:1        22:1      23:1      24:1      25:1
+        1
+        0
+            0:2        1:2       2:2                3:2      4:2         5:2      6:2      7:2      8:2         9:2      10:2      11:2        12:2      13:2      14:2      15:2      16:2        17:2      18:2      19:2      20:2      21:2        22:2      23:2      24:2      25:2
+        1
+        0
+            0:3        1:3       2:3                3:3      4:3         5:3      6:3      7:3      8:3         9:3      10:3      11:3        12:3      13:3      14:3      15:3      16:3        17:3      18:3      19:3      20:3      21:3        22:3      23:3      24:3      25:3
+        1
+        0
+            0:4        1:4       2:4                3:4      4:4         5:4      6:4      7:4      8:4         9:4      10:4      11:4        12:4      13:4      14:4      15:4      16:4        17:4      18:4      19:4      20:4      21:4        22:4      23:4      24:4      25:4
+        1
+        0
+            0:5        1:5       2:5                3:5      4:5         5:5      6:5      7:5      8:5         9:5      10:5      11:5        12:5      13:5      14:5      15:5      16:5        17:5      18:5      19:5      20:5      21:5        22:5      23:5      24:5      25:5
+        1
+        0
+            0:6        1:6       2:6                3:6      4:6         5:6      6:6      7:6      8:6         9:6      10:6      11:6        12:6      13:6      14:6      15:6      16:6        17:6      18:6      19:6      20:6      21:6        22:6      23:6      24:6      25:6
+        1
+        0
+            0:7        1:7       2:7                3:7      4:7         5:7      6:7      7:7      8:7         9:7      10:7      11:7        12:7      13:7      14:7      15:7      16:7        17:7      18:7      19:7      20:7      21:7        22:7      23:7      24:7      25:7
+        1
+        0
+          0 100 0       100 0          100 0         100 0    100 0       100 0    100 0    100 0       100 0    100 0     100 0     100 0       100 0     100 0     100 0     100 0       100 0     100 0     100 0     100 0     100 0       100 0     100 0     100 0     100 0     100
+        Frequency ID
+
+
+Figure 5: Positional–symbolic profiles of all attention heads in google/gemma-2-2b-it. Each subplot corresponds
+to an attention head, 26 layers, 8 heads per layer.
+
+                                                                                                                                                                                      Positional                    Symbolic
+                                                     Selected Heads in Positional/Symbolic Plane                                                       L=1, H=4                                L=3, H=2                                  L=6, H=0
+                                              1.0                        1:4                                                            1.00                                   1.00                                     1.00
+                                                             15:0
+                                                                                                                                        0.75                                   0.75                                     0.75
+                                              0.8                               23:2                                            Score   0.50                                   0.50                                     0.50
+                                                                                                                                        0.25                                   0.25                                     0.25
+                                                                                                 12:0
+
+
+
+                             Symbolic Score
+                                              0.6                                                                                       0.00                                   0.00                                     0.00
+                                                                                                                                               0          50        100                0           50        100               0          50       100
+                                                                                                                                                      L=12, H=0                               L=15, H=0                                 L=23, H=2
+                                              0.4                                                                                       1.00                                   1.00                                     1.00
+                                                                                                                         6:0
+                                                                                                                                        0.75                                   0.75                                     0.75
+
+                                                                                                                                Score
+                                              0.2                                                                                       0.50                                   0.50                                     0.50
+                                                                                                                                        0.25                                   0.25                                     0.25
+                                                                                                                          3:2
+                                              0.0                                                                                       0.00                                   0.00                                     0.00
+                                                    0.0            0.2          0.4          0.6           0.8           1.0                   0         50     100                    0         50     100                    0           50     100
+                                                                               Positional Score                                                       Frequency ID                            Frequency ID                              Frequency ID
+
+Figure 6: Positional–Symbolic Plane across Frequencies. Visualization of six attention heads from the
+google/gemma-2-2b-it model. (Left) Each point represents a head in the positional–symbolic plane, labeled
+by its layer and head index. (Right) For the same heads, we plot their positional and symbolic scores as a function of
+RoPE frequencies.
+
+
+
+
+                                                                                                                                                16
+                                                        Query block 1/256                          Query block 128/256                   Query block 256/256
+                                       1.00                                           1.00                                       1.00
+                                       0.75                                           0.75                                       0.75
+
+
+                      Symbolic Score
+                                       0.50                                           0.50                                       0.50
+                                       0.25                                           0.25                                       0.25
+                                       0.00                                           0.00                                       0.00
+                                                  0.0              0.5         1.0             0.0           0.5           1.0          0.0           0.5         1.0
+                                                            Positional Score                          Positional Score                         Positional Score
+                                                                                                                                              0.47 =         = 0.77
+                                        80                       0.70
+                                                                   = =
+                                                                     0.50              80                                         80
+                                        60                                             60                  0.60 = = 0.66          60
+                             Count      40                                             40                                         40
+                                        20                                             20                                         20
+                                         0                                                 0                                       0
+                                                  0.0             0.5          1.0             0.0           0.5           1.0          0.0          0.5          1.0
+                                                                 Score                                      Score                                   Score
+
+Figure 7: Heads when the block moves (1 to 9). (Above) Heads in the positional–symbolic plane for each block
+position. (Bellow) Histograms showing how positional and symbolic scores change as the relevant block moves.
+
+B     Additional illustration and proofs of section 4
+                                                                                                                                                                                                    L(xi,i,xj
+B.1    Illustration of canonical tasks                                                                                                                                                  x1 x2 xj      …    …
+
+
+See Figure 8 for an illustration of how the canonical tasks presented in Section 4 should work.                                                                                         1   2   j
+
+                     Index Task                                                                Retrieval Task                                       Partial Induction Task
+             0   1   2                        j              n-1 n                     1       2     3          j        n-1 n                      1   2    3          j       n-1 n
+       In:   a b c                 …          a         …    b     j            In:   a b c                …   a    …      b c                In:   a b c         …     c   …   b c
+                                                                                      4 2 5                …   1    …      3                        4 2 5         …     1   …   3
+      Out:   a                                                                 Out:   c                                                   Out:      c
+                                                                                      5                                                             1
+                                                                       Figure 8: Illustration of the canonical tasks.
+
+B.2    Proof of theorem 2
+
+First, we will prove that whenever a head H = (L, VAL, F ) acts symbolically on input x̄, the output of the model
+ME MB is invariant over permutations of the input.
+Lemma 1. For a fixed vocabulary Σ = {s1 , s2 , ..., s|Σ| } and input s∗ = (si1 , ..., sin ) such that H acts symbolically on
+E MB(s∗ ), then
+                                     ME MB (s∗ ) = ME MB (π(s∗ ))       ∀π ∈ S n−1
+
+Proof. Set E MB(s∗ ) = (x1 , ..., xn ) and fix a position k ≤ n. Now, we have that the attention weight at position k with
+input s∗ is
+                             exp(L(xn , n, xk , k))     exp(L(xn , n, xk , π(k)))
+                 wnk (s∗ ) = X                        =X                              = wnπ(k) (π(s∗ )),
+                               exp(L(xn , n, xl , l))    exp(L(xn , n, xπ(l) , π(l)))
+                                                  l≤n                                                l≤n
+
+because H acts symbolically on s∗ . Now, if we look at the attention vector for the last position with input s∗ we get
+
+
+
+
+                                                                                                         17
+                                        X                              X
+                                              wnj (s∗ )VAL(xj )              wnπ(j) (s∗ )VAL(xπ(j) )
+                                        j≤n                            j≤n
+                           an (s∗ ) =      P             ∗
+                                                                   =         P               ∗
+                                                                                                                        (2)
+                                               j≤n wnj (s )                     j≤n wnπ(j) (s )
+                                                                       X
+                                                                             wnπ(j) (π(s∗ ))VAL(xπ(j) )
+                                                                       j≤n
+                                                                   =         P                ∗
+                                                                                                                        (3)
+                                                                               j≤n wnπ(j) (π(s ))
+                                                                               ∗
+                                                                   =an (π(s )).                                         (4)
+
+Which implies that ME MB has the same output for s∗ and π(s∗ ).
+
+Consider an arbitrary vocabulary Σ and s ∈ Σ∗ such that x̄ = E MB(s) = (x1 , x2 , ..., xn ) is the input where H
+acts symbolically. Since x̄ is not constant, there exists a permutation π ∈ S n−1 such that fP OS (π(s)) ̸= fP OS (s)
+(we just change what is in the position j being asked). Then, from Lemma 1 it follows that ME MB (s) ̸= fP OS (s) or
+ME MB (π(s)) ̸= fP OS (π(s)).
+
+B.3    Proof of theorem 3
+
+The goal is to design an attention head HP OS such that the model MO NE H OT using HP OS returns the symbol σj at position
+j with input sP OS , i.e. it performs an indexing operation.
+We fix a sequence length n > 0, and define the desired inner product condition:
+
+                                 xi K ⊤ Rθn−i Qxn (j) = v ⊤ Rθn−i qn (j) = cos (θ(j − i))
+for i = 0, ..., n.
+In order to achieve this, first we fix a vector v = (1/2, 1/2)⊤ and the rotation angle θ = π/n (so maximum is reached
+just for i = j). We define the query vector as:
+                                                      qn (j) = Rθj−n v
+Therefore, we get a query matrix QP OS such that:
+                                                         QP OS ej = qn (j)
+where ej is the one-hot encoding of the symbol j. For our solution, we use the O NE H OT embedding function. On the
+other hand, we define a constant key matrix KP OS such that for any position i, the key embedding of the symbol at that
+position is:
+                                                   KP OS O NE H OT(σi ) = v.
+With these choices, the result is a one-layer transformer MO NE H OT with attention head HP OS = (KP OS , QP OS , Id, π1 )
+that always maximizes its attention at the right position. Therefore, MO NE H OT perfectly copies the symbol at the position
+asked by an input sP OS , at least when sP OS has length n. Now, by Theorem 3 we know that HP OS can not be a symbolic
+head for any input. We formally state its positional nature in the following lemma.
+Lemma 2. For every input sP OS , HP OS is a positional head on O NE H OT(sP OS ).
+
+Proof. We just apply the definition of a positional head on y, z ∈ {x1 , . . . , xn−1 }, i ∈ [n − 1] then
+                                 L(xn (j), n, y, i) = cos (θ(j − i)) = L(xn (j), n, z, i).
+
+
+Lemma 3. For the head HP OS and any sP OS with |O NE H OT(sP OS )| = n then
+                                                 MO NE H OT (sP OS ) = fP OS (sP OS ).
+
+Proof. First, we see that logits are maximized at position j.
+                             arg max L(xn (j), n, xi , i) = arg max cos(θ(j − i)) = j.
+                                 i∈[n−1]                                 i∈[n−1]
+.
+
+
+                                                                 18
+Therefore, the biggest attention weight is wnj , i.e
+                                                      max{wni }ni=1 = wnj .
+
+Now, given that the value function VAL = id, then we have that
+                                                                  n
+                                                                  X
+                                                         an =           wni xi ,
+                                                                  i=1
+
+
+which implies that arg max S OFTMAX(an )i = O NE H OT−1 (xj ) = σj concluding the proof.
+                         σi ∈Σ
+
+
+B.4   Proof of theorem 4
+
+Suppose there exist an input sS YM = (s1 , ..., sn ), an attention head H = (Q, K, U, id, π1 ) that acts positionally on
+x̄ = O NE H OT(sS YM (H)) and MO NE H OT = fS YM . Now, by defining the function
+                                                             exp(L(xn , n, xj , j))
+                                        D(xn , n, xj , j) = X                         ,
+                                                               exp(L(xn , n, xk , k))
+                                                                 k≤n
+
+we can express the attention vector an (sS YM (H)) as
+                                                                 X
+                                           an (sS YM (H)) =            D(xn , n, xj , j)xj .
+                                                                 j≤n
+
+
+We also have that
+                                 MO NE H OT (sS YM ) = arg max S OFTMAX(π1 (an , xn ))i                                    (5)
+                                                              σi ∈Σ
+
+                                                    =O NE H OT−1 (arg max D(xn , n, xj , j))                               (6)
+                                                                                   xj
+
+                                                    =si∗                                                                   (7)
+by exploiting the fact that {xj }nj=1 is an orthonormal basis and π1 (an , xn ) = an . In this case, i∗ is the position of the
+input sS YM (H) where the answer appears. Since MO NE H OT solves fS YM , there is a unique vector xi∗ that maximizes the
+output distribution. Therefore, there exists a position k < n with k ̸= i∗ such that
+                                             D(xn , n, xk , k) < D(xn , n, xi∗ , i∗ ).
+Now, applying the positional behavior of H, we get that
+                    D(xn , n, xi∗ , i∗ ) = D(xn , n, xk , i∗ )    and      D(xn , n, xk , k) = D(xn , n, xi∗ , k).
+
+Finally, consider a permutation πi∗ →k ∈ S n−1 that just interchange si∗ with sk . We have that
+                                                 X
+                        an (πi∗ →k (sS YM (H)) =     D(xn , n, xj , j)xj + D(xn , n, xk , i∗ )xk ,
+                                                      j̸=i∗
+
+which implies that
+                             MO NE H OT (πi∗ →k (sS YM )) = arg max S OFTMAX(π1 (an , xn ))i                               (8)
+                                                                  σi ∈Σ
+
+                                                         =O NE H OT−1 (arg max D(xn , n, xj , j))                          (9)
+                                                                                        xj
+
+                                                         =sk                                                             (10)
+And therefore,
+                                    MO NE H OT (sS YM (H)) ̸= MO NE H OT (πi∗ →k (sS YM (H))),
+
+but fS YM (sS YM (H)) = fS YM (πi∗ →k (sS YM (H))) which is a contradiction.
+
+
+
+                                                                  19
+B.5    Proof of theorem 5
+
+Fix a sequence length n > 0 and a vocabulary Σ = {σ1 #, σ1 #1, σ1 #2, ..., σm #k} with m, k > 0. We want a matrix
+KS YM such that for each symbol σi there exist a vector
+                                                vσi = KS YM O NE H OT(σi #α)
+for any α ∈ {1, ..., k} and KS YM O NE H OT(σi #) = 0 for any σi .
+On the other hand, we want a matrix QS YM such that
+                                           QS YM xn (σj #) = qn (σj #) = Rθl−n vσj .
+In essence, we want that vectors vσi ∈ R2 codify all symbols s ∈ Σ such that σi appears in s. In general, this can be
+done for θ < 2π
+             m in order to avoid overlapping in the vectors vσi after the rotation with Rθ . For example, we can fix the
+vector vσ1 = (1, 0)⊤ and an angle β = 2π                                                    i
+                                       m . Then, for i ∈ [2, ..., m] we have that vσi = Rβ vσ1 .
+
+Having such matrices for a fixed θ, we get a logits function defined as
+                            L(O NE H OT(σj #), n, O NE H OT(σi #α), t) = xt T KS⊤YM Rθn−t QS YM xn                 (11)
+                                                                             = vσ⊤i Rθn−t qn (σj #)                (12)
+                                                                             = vσ⊤i Rθl−t vσj                      (13)
+for t = 0, . . . , n − 1.
+We refer to the attention head using this logits function as HSθYM . Notice that when θ = 0, HSθYM uses the NoPE (No
+Positional Encoding) since the operator Rθ becomes the identity. In consequence, HS0YM is purely symbolic for any
+input.
+In the case that θ > 0, Rθ introduces a rotation that perturbs the query vectors. To maintain symmetry of the inner
+product structure, the vectors must be centered in the middle of the context. This requirement naturally leads to the
+choice l = n−1                               θ
+             2 . However, in this case the HS YM does not act symbolically given that logits depends on the positions.
+To formalize our construction for θ = 0, we prove the following lemma.
+Lemma 4. For the head HS0YM and any sS YM with |O NE H OT(sS YM )| = n then
+                                                MO NE H OT (sS YM ) = fS YM (sS YM )
+
+Proof. Using the fact that
+                                   arg max L(xn (σj ), n, xi , i) = arg max vσ⊤i vσj = j.
+                                      i∈[n−1]                               i∈[n−1]
+
+
+and the argument follows from the same idea of the proof of Lemma 3.
+
+Finally, by Theorem 4 we know that HS0YM can not be a positional head. Now we proceed to show that it is indeed a
+symbolic one.
+Lemma 5. For every input sS YM , the head HS0YM is symbolic on O NE H OT(sS YM ).
+
+Proof. For i, j ∈ [m], y = O NE H OT(σi #α) and , k1 , k2 ∈ [n − 1]
+                                  L(xn (σj #), n, y, k1 ) = vσ⊤i vσj = L(xn (σj #), n, y, k2 ).
+
+
+
+B.6    A counter example with MLP layer
+
+Counter Example. Fix the sequence length to be n = 3 and consider a vocabulary consisting of symbols {a, b} and
+integers {0, 1}. We take as input a sequence sS YM with associated embedded soft-vectors x,
+                            sS YM = (σ1 #i1 , σ2 #i2 , σ#),      x = O NE H OT(sS YM ) = (y1 , y2 , x).
+
+
+
+
+                                                                20
+Attention Head Construction.         Consider a head H with logit function L satisfying:
+                  L(x, 3, y1 , 1) = cos(2π) = 1,         L(x, 3, y2 , 2) = cos(π) = −1,        L(x, 3, x, 3) = 0.
+This can be achieved by choosing RoPE with θ = π, and matrices Q, K such that
+          Qx = Kyj = (1, 0, 0, 0, 0, 0) (for positions j = 1, 2),             Kx = (0, 0, 0, 0, 0, 0) (at the last token).
+
+With VAL = id, the attention vector at the last position is
+                                                                                         
+                      a3 = γ(a#1, x), γ(a#2, x), γ(b#1, x), γ(b#2, x), γ(a#, x), γ(b#, x) ,
+where γ is defined as follows
+                                                                      e+e−1
+                                                                                    if σj #ij occurs twice,
+                                                                      Σ
+                                                                     
+                                                                     
+               γ(σj #, x) = λ3 · I(σ = σj ),      γ(σj #ij , x) =        0          if σj #ij never occurs,
+                                                                     
+                                                                     
+                                                                     
+                                                                         λj         if σj #ij occurs exactly once.
+                         −1
+where λ1 = Σe , λ2 = eΣ and λ3 = Σ1 , with Σ = e + e−1 + 1.
+
+Final Output Function.        Define the function F (a3 ) ∈ R6 by
+              F (a3 )σj #ij = A ND(E Q(γ(σj #, x), λ3 ), O R(E Q(γ(σj #ij , x), λ1 ), E Q(γ(σj #ij , x), λ2 )))
+and F (a3 )σj # = 0. The logical operations A ND, O R and E Q can be implemented by an MLP with ReLU activations
+and fixed precision with sufficient depth (see Lemma A.1 in Yao et al. [2021]).
+
+B.7   Proof of corollary 1
+
+By Lemma 1 we know that if H acts symbolically on an input sM IX (H) = (σ0 #i0 , σ1 #i1 , . . . , σn−1 #in−1 , σj #),
+then for every permutation of sM IX (H) the answer of the one-head decoder-only transformer model MO NE H OT using H
+is invariant. However, the answer of fM IX must change if we permute both appearances of σj in sM IX (H) which means
+MO NE H OT can not solve fM IX .
+On the other hand, by using the same argument as the proof B.4, we know that if H acts positionally on sM IX , then we
+can force its model’s output to change for permutations of sM IX where fM IX is invariant.
+
+B.8   Proof of Theorem 6
+
+In this case we mix the ideas we used to define heads HP OS and HSθYM , by using a RoPE with 2 frequencies. First, fix the
+vocabulary Σ = {σ1 #, σ1 #1, σ1 #2, ..., σm #k} with m, k > 0. In the same way as we did for HSθYM we can define
+vectors vσi ∈ R2 that codify the presence of σi in a symbol of Σ. On the other hand, as we did for HP OS , we set a
+constant vector v = (1/2, 1/2)⊤ . Now, we define a matrix K ∈ R4×|Σ| such that
+                                             KM IX O NE H OT(σ1 #α) = [vσi , v],
+
+for any α ∈ {1, ..., k}, while O NE H OT(σi #)KM IX = 0 for any i ∈ {1, ..., m}.
+For the query matrix QM IX , we define a query matrix such that
+                                    QM IX O NE H OT(σj #) = qn (σj #) = [Rθl−n vσj , v].
+
+Finally, for angles θ1 , θ2 , we get a logits function
+                                  ⊤
+                 O NE H OT(σi #α)KM     n−i
+                                    IX RΘ   QM IX O NE H OT(σj #) = vσ⊤i Rθn−i
+                                                                           1
+                                                                               qn (σj ) + v ⊤ Rθn−i
+                                                                                                 2
+                                                                                                    v                        (14)
+                                                                              =   vσ⊤i Rθl−i
+                                                                                          1
+                                                                                             vσj + cos (θ2 (n − i))          (15)
+
+If we set θ1 = 0 (NoPE), then our logits function becomes
+
+                        L(O NE H OT(σj #), n, O NE H OT(σi #α), k) = vσ⊤i vσj + cos (θ2 (n − k)) ,
+                                                                       0,θ2
+with 0 < θ2 n < 2π/(n|Σ|) properly chosen to define our solution head HM IX
+                                                                            .
+
+
+                                                                21
+              0,θ2
+Lemma 6. For HM IX
+                   and any sM IX with |O NE H OT(sM IX )| = n then MO NE H OT (sM IX ) = fM IX (sM IX ).
+
+Proof. Notice that:
+                                     θ2 < 2π/(n|Σ|) ⇒ cos(2π/|Σ|) < cos (θ2 n)
+and vσ⊤i vσj < cos(2π/|Σ|) for σi ̸= σj . Then
+
+                             vσ⊤i vσj + cos (θ2 (n − k)) ≤ cos(2π/|Σ|) + cos (θ2 (n − k))
+                                                         < cos (θ2 n) + cos (θ2 (n − k))
+                                                         ≤ cos (θ2 n) + 1
+                                                         ≤ cos (θ2 (n − jp )) + 1
+                                                         = cos (θ2 (n − jp )) + vσ⊤jp vσj
+
+for all k ∈ [n − 1] \ {j1 , j2 } with p = 1, 2, where vσj1 = vσj2 = vσj .
+Using this and j1 < j2 , we can conclude:
+                                                                             vσ⊤i vσj + cos (θ2 (n − i))
+                                                                                                           
+                       arg max L(xn (j), n, xi , i) = arg max
+                           i∈[n−1]                             i∈[n−1]
+
+                                                                              vσ⊤i vσj + cos (θ2 (n − i))
+                                                                                                               
+                                                      = arg max
+                                                               i∈{j1 ,j2 }
+
+                                                      = arg max cos (θ2 (n − i))
+                                                               i∈{j1 ,j2 }
+
+                                                      = j2 .
+
+And the result follows from the fact that the most attended symbol of the input is the output for this architecture as seen
+in the proof of Lemma 3.
+
+
+
+
+                                                            22
+C     Appendix for section 5
+C.1   Specialized heads for index, information retrieval and partial induction tasks
+
+To further disentangle the role of positional and symbolic information, we train from scratch a family of minimal
+transformer models, each consisting of a single layer, a single attention head, and a single RoPE frequency. Each model
+is trained independently with a different frequency choice, and performance is evaluated on two tasks: an index task
+and an information retrieval task (see Section 4 for precise definitions).
+All experiments are carried out on sequences of length n = 32 + 1, where 32 tokens form the context and the additional
+token is the query. Both tasks are defined over mixed symbol–integer sequences. In the information retrieval task, the
+model must retrieve the integer associated with the query symbol, while in the index task, the model must instead return
+the symbol associated with the query integer (which directly encodes a position). We fix a vocabulary of 16 symbols
+and 32 possible integers.
+We sweep over a range of base angles for the RoPE:
+                                 [0.0, 0.01, 0.1, 0.25, 0.4, 0.5, 0.8, 1.0, 1.5, 2.0].
+Here, 0.0 corresponds to a NoPE model (no rotary position encoding), while 2.0 corresponds to a RoPE configuration
+that completes one full angular lap over the n = 33 tokens of the sequence. More generally, the effective frequency is
+given by
+                                                      π
+                                                 θ = · base_angle,
+                                                      n
+and the number of laps is defined as nθ/2π.
+Training is performed for 100 epochs with batch size 64, using 40,960 training samples and 20,480 validation samples.
+Figure 2 reports the resulting accuracies as a function of frequency. The results show a clear tension: index task and
+information retrieval achieve their best performance at different frequency ranges, indicating that the model’s inductive
+bias over RoPE frequencies favors one type of task at the expense of the other.
+
+C.2   Proof of Theorem 7: U-shape and inverted U-shape.
+
+U-shape accuracy. Let us start with the statement wmax is U -shaped for HP OS . As established in the proof of Theorem
+3, the logits of HP OS are of the form:
+                                               L(xn , n, xi , i) = cos(θ(j − i)),
+where θ < 2π n  and  j is the location of the answer.  Thus, we obtain the following expression for wmax (j):
+                                                             exp(1)
+                             wmax (j) =                                                  .
+                                          exp(cos(θ(j − 1)) + . . . + exp(cos(θ(j − n)))
+What happens when we go from wmax (j) to wmax (j + 1)? We add exp(cos(θj)) and delete exp(cos(θ(j − n))) from
+the denumerator. That is, if cos(θj) > cos(θ(j − n)), the value of wmax (j) decreases, and otherwise, it stays the same
+or increases.
+Since θ < 2π
+           n , we have cos(θj) > cos(θ(j − n)) if and only if |j| < |j − n|. Hence, starting from j = 1 when |j| is
+much smaller than |j − n|, the function wmax is decreasing, having a local maximum at j = 1. Wheh j is about n/2,
+the absolute values |j| and |j − n| become equal and then the first one becomes larger, and afterwards the function
+wmax starts increasing, reaching another local maximum at j = n − 1 in the form of a U -shape, as required.
+
+Inverted U-shape accuracy. We consider a simple RoPE head with one angle, equal to π/n, as the one used for the
+empirical results depicted in Figure 3 where the inverted U-shape is observed in the retrieving (symbolic) task. We
+will rigorously prove this is the case in a simplified scenario. The simplified task will be the following: we have two
+possible tokens τ0 , τ1 and we consider prompts x1 . . . xn consisting of n copies of τ0 , except at two positions where it
+has τ1 . These two positions are the query (j = n) and some ℓ ≤ m = n − 1. The task for the attention head is to detect
+the requested token in position ℓ, which means that we expect a distribution of attention wights αj (j = 1, ..., m) with
+small values except for a peak at j = ℓ. This must hold for every prompt of this form.
+As we have empirically demonstrated, RoPE cannot be expected to behave symbolically for this choice of angle (it
+is too big) so we accept a weak solution of the symbolic task: the logit sequence λ1 , ..., λm is negative, except for a
+positive value when we reach the desired token τ1 . We also want that the logits are bounded away from 0 (positive or
+negative) as much as possible. Since the query position is fixed, if q = Qxn ∈ R2 is the query vector, then we can write
+the logit function as
+                                          L(xn , n, x, j) = L(x, j) = xKU j q
+
+
+                                                            23
+(U is the RoPE matrix for angle π/n). For any embedding vector x ∈ Rd let x′ = xK ∈ R2 . Let zi be the embedding
+vector of τi for i = 0, 1. We make the simplifying assumption that q, z0′ and z1′ have norm 1 —the discussion can be
+adapted to a more general case, but we choose to keep the computations simple while still exhibiting the main features
+of the inverted U-shape phenomenon.
+Let γ(x) be the angle between q and the vector x′ = xK for x ∈ Rd . Then the formula for the RoPE logit and the
+assumption ∥q∥ = 1 gives
+                                            L(x, j) = ∥x′ ∥ cos(πj/n − γ(x)).
+In particular, our assumption that this logit function gives an approximate (in the sense of sign) solution to the symbolic
+task described above, with logits bounded away from 0 as much as possible, gives
+                                              γ(z0 ) = −π/2,           γ(z1 ) = π/2
+so that                                                
+                                                           cos(πj/n + π/2)      if i = 0
+                                         L(zi , j) =
+                                                           cos(πj/n − π/2)      if i = 1
+(here we used the simplifying assumption ∥zi′ ∥ = 1). We note the symmetry
+                                                   L(z1 , j) = −L(z0 , j).
+Let
+                                                   νi (j) = exp(L(zi , j))
+and note that ν0 (ℓ)ν1 (ℓ) = 1. Define
+                                                                n−1
+                                                                X
+                                                           S=         ν0 (j).
+                                                                j=1
+
+Recall that the position of the sought token is ℓ. Then the attention weight at j = ℓ is maximal (due to the sign of the
+logits –this is the only positive logit for the given prompt) and it is
+                                                                    ν1 (ℓ)
+                                              wmax (ℓ) =                          .
+                                                              S + ν1 (ℓ) − ν0 (ℓ)
+This is the only peak of the attention weights for the prompt with sought token at position ℓ.
+Finally, we can give a rigorous proof of the inverted U-shape phenomenon in this setting.
+Theorem 8 (Inverted U-shape). Assume n ≥ 5. As a function of ℓ, the sequence wmax (ℓ) is increasing for 0 < ℓ < n/2
+and decreasing for n/2 < ℓ < n.
+
+Proof. We can use the same formula defining wmax (ℓ) on a real variable t instead of the discrete variable ℓ, and then
+restrict back to integers ℓ.
+Let f (t) = 1/wmax (t). It suffices to prove that f ′ (t) is negative for 0 < t < n/2 and positive for n/2 < t < n.
+From the equation ν0 (ℓ)ν1 (ℓ) = 1 we have
+                                               f (t) = 1 + Sν0 (t) − ν0 (t)2 .
+Then
+                                f ′ (t) = Sν0′ (t) − 2ν0′ (t)ν0 (t) = ν0′ (t) (S − 2ν0 (t)) .
+If n ≥ 5 and t = ℓ is an integer, the parenthesis is strictly positive because we are substracting 2 different sumands
+from S (here we use n is odd). On the other hand, we explicitly compute ν0′ (t):
+                                                      π
+                                          ν0′ (t) = − ν0 (t) sin(πt/n + π/2).
+                                                      n
+As ν0 (t) > 0 always, the sign of the previous expression is negative for πt/n ∈ (0, π/2) and positive for πt/n ∈
+(π/2, π). The result follows.
+
+
+
+
+                                                                 24
+D     Additional results for realistic models
+D.1   Llama-3.2-1B-Instruct
+
+                                                                                                                                                        Positional                  Symbolic
+                                    Selected Heads in Positional/Symbolic Plane                                                L=1, H=4                        L=5, H=5                               L=6, H=0
+                              1.0                5:5                                                              1.00                           1.00                                    1.00
+                                                             15:20                                                0.75                           0.75                                    0.75
+                              0.8                                                                         Score   0.50                           0.50                                    0.50
+                                                                                                                  0.25                           0.25                                    0.25
+
+
+
+             Symbolic Score
+                              0.6                                                        12:1                     0.00                           0.00                                    0.00
+                                                                                                                         0             20               0            20                         0           20
+                                                                                                  1:4                          L=12, H=1                       L=15, H=0                             L=15, H=20
+                              0.4                                                                                 1.00                           1.00                                    1.00
+                                                                                                  6:0
+                                                                                                                  0.75                           0.75                                    0.75
+
+                                                                                                          Score
+                              0.2                                                                15:0             0.50                           0.50                                    0.50
+                                                                                                                  0.25                           0.25                                    0.25
+                              0.0                                                                                 0.00                           0.00                                    0.00
+                                    0.0                    0.2        0.4       0.6     0.8       1.0                    0          20                  0            20                         0           20
+                                                                     Positional Score                                        Frequency ID                     Frequency ID                           Frequency ID
+
+(a) Positional–Symbolic Plane across Frequencies.                      Visualization of six attention heads from the
+meta-llama/Llama-3.2-1B-Instruct model. (Left) Each point represents a head in the positional–symbolic plane, la-
+beled by its layer and head index. (Right) For the same heads, we plot their positional and symbolic scores as a function of RoPE
+frequencies.
+
+                                                                             Query block 1/256                                              Positional                         Positional Score
+                                                                                                                                                                                     0
+                                                     1.0                                                                        150
+                                                                                                                                                     = 0.59                         10
+                                                                                                                                                                          Head ID
+                                                                                                                                100
+                                                     0.8
+                                                                                                                                 50                                                 20
+
+
+
+
+                                    Symbolic Score
+                                                     0.6                                                                          0                                                 30
+                                                                                                                                      0.0      0.5            1.0                        0      10
+                                                                                                                                            Symbolic                            Symbolic Score
+                                                     0.4                                                                                                                             0
+                                                                                                                                150
+                                                                                                                                            0.64 =                                  10
+                                                                                                                                                                          Head ID
+                                                     0.2                                                                        100
+                                                                        Layer Depth
+                                                                                                                                 50                                                 20
+                                                     0.0 0               5       10      15
+                                                                                                                                                                                    30
+                                                                                                                                  0
+                                                        0.0            0.2       0.4     0.6        0.8             1.0               0.0      0.5            1.0                        0 10
+                                                                              Positional Score                                                Score                                       Layer ID
+
+(b) All heads, fixed first block. (Left) Each head in the positional–symbolic plane. (Middle) Histogram showing predominance of
+symbolic over positional behavior. (Right) Heatmaps of positional and symbolic scores for each head across layers.
+Figure 9: Positional–Symbolic Plane across Heads. 16 Layers, 32 Heads per layer. Since the model uses a head
+dimension of 64, this corresponds to 32 RoPE frequencies.
+
+
+
+
+                                                                                                                          25
+                                                 Query block 1/256                  Query block 128/256                   Query block 256/256
+                                    1.00                                    1.00                                  1.00
+                                    0.75                                    0.75                                  0.75
+
+
+                   Symbolic Score
+                                    0.50                                    0.50                                  0.50
+                                    0.25                                    0.25                                  0.25
+                                    0.00                                    0.00                                  0.00
+                                           0.0            0.5         1.0          0.0          0.5         1.0          0.0          0.5         1.0
+                                                   Positional Score                      Positional Score                      Positional Score
+                                                                                                                               0.50 =        = 0.77
+                                    200                                     200           0.55 =       = 0.74     200
+                                                       0.64 == 0.59
+                                    150                                     150                                   150
+                     Count          100                                     100                                   100
+
+                                     50                                      50                                    50
+
+                                      0                                       0                                     0
+                                           0.0           0.5          1.0          0.0         0.5          1.0          0.0         0.5          1.0
+                                                        Score                                 Score                                 Score
+
+(c) Heads when the block moves (1 to 9). (Above) Heads in the positional–symbolic plane for each block position. (Below)
+Histograms showing how positional and symbolic scores change as the relevant block moves.
+                                                                            Figure 9 (continued).
+
+
+
+
+                                                                                           26
+D.1.1   Llama-3.2-3B-Instruct
+
+                                                                                                                                                                    Positional                     Symbolic
+                                    Selected Heads in Positional/Symbolic Plane                                                          L=1, H=4                         L=5, H=5                                 L=6, H=0
+                              1.0                                                                                           1.00                             1.00                                     1.00
+                                                     12:1
+                                                                                                                            0.75                             0.75                                     0.75
+                                                                       5:5
+                              0.8                                                                                   Score   0.50                             0.50                                     0.50
+                                                                             15:0
+                                                                                                                            0.25                             0.25                                     0.25
+
+
+
+             Symbolic Score
+                                                                              15:20                                         0.00                             0.00                                     0.00
+                              0.6                                                                       1:4
+                                                                                                  6:0                              0      25          50            0         25              50              0        25   50
+                                                                                                                                         L=12, H=1                        L=15, H=0                               L=15, H=20
+                              0.4                                                                                           1.00                             1.00                                     1.00
+                                                                                                                            0.75                             0.75                                     0.75
+
+                                                                                                                    Score
+                              0.2                                                                                           0.50                             0.50                                     0.50
+                                                                                                                            0.25                             0.25                                     0.25
+                              0.0                                                                                           0.00                             0.00                                     0.00
+                                    0.0                     0.2     0.4        0.6          0.8           1.0                      0      25      50                0       25      50                        0      25      50
+                                                                   Positional Score                                                    Frequency ID                      Frequency ID                             Frequency ID
+
+(a) Positional–Symbolic Plane across Frequencies.                      Visualization of six attention heads from the
+meta-llama/Llama-3.2-3B-Instruct model. (Left) Each point represents a head in the positional–symbolic plane, la-
+beled by its layer and head index. (Right) For the same heads, we plot their positional and symbolic scores as a function of RoPE
+frequencies.
+
+                                                                             Query block 1/256                                                         Positional                                  Positional Score
+                                                                                                                                                                                          0
+                                                     1.0
+                                                                                                                                          200
+
+                                                                                                                                                                               Head ID
+                                                                                                                                                                                         10
+                                                     0.8                                                                                                      = 0.52
+                                                                                                                                          100
+
+
+
+
+                                    Symbolic Score
+                                                                                                                                                                                         20
+                                                     0.6                                                                                    0
+                                                                                                                                                0.0         0.5         1.0                   0        10         20
+                                                                                                                                                       Symbolic                                    Symbolic Score
+                                                     0.4                                                                                                                                  0
+                                                                                                                                          200
+
+                                                                                                                                                                               Head ID
+                                                     0.2                                                                                                                                 10
+                                                                      Layer Depth                                                                          0.75 =
+                                                                                                                                          100
+                                                     0.0       0       10              20                                                                                                20
+                                                                                                                                            0                                                 0        10       20
+                                                            0.0      0.2            0.4      0.6              0.8             1.0               0.0         0.5         1.0
+                                                                             Positional Score                                                              Score                                       Layer ID
+
+(b) All heads, fixed first block. (Left) Each head in the positional–symbolic plane. (Middle) Histogram showing predominance of
+symbolic over positional behavior. (Right) Heatmaps of positional and symbolic scores for each head across layers.
+Figure 10: Positional–Symbolic Plane across Heads. 28 Layers, 24 Heads per layer. Since the model uses a head
+dimension of 128, this corresponds to 64 RoPE frequencies.
+
+
+
+
+                                                                                                                                    27
+                                                 Query block 1/256                  Query block 128/256                     Query block 256/256
+                                    1.00                                    1.00                                    1.00
+                                    0.75                                    0.75                                    0.75
+
+
+                   Symbolic Score
+                                    0.50                                    0.50                                    0.50
+                                    0.25                                    0.25                                    0.25
+                                    0.00                                    0.00                                    0.00
+                                           0.0            0.5         1.0          0.0          0.5           1.0          0.0          0.5         1.0
+                                                   Positional Score                      Positional Score                        Positional Score
+                                                          0.750.52
+                                                           =    =
+                                    250                                     250                                     250
+                                    200                                     200                                     200
+                                                                                                                                    0.61 = = 0.69
+                                    150                                     150               0.67 = = 0.65         150
+                     Count
+                                    100                                     100                                     100
+                                     50                                      50                                      50
+                                      0                                       0                                       0
+                                           0.0           0.5          1.0          0.0         0.5            1.0          0.0         0.5          1.0
+                                                        Score                                 Score                                   Score
+
+(c) Heads when the block moves (1 to 9). (Above) Heads in the positional–symbolic plane for each block position. (Below)
+Histograms showing how positional and symbolic scores change as the relevant block moves.
+                                                                            Figure 10 (continued).
+
+
+
+
+                                                                                           28
+D.2    Qwen2-1.5B-Instruct
+
+                                                                                                                                                Positional                   Symbolic
+                               Selected Heads in Positional/Symbolic Plane                                           L=1, H=4                                 L=3, H=2                         L=6, H=0
+                        1.0                                                                        1.00                                  1.00                                     1.00
+
+                                             23:2                                                  0.75                                  0.75                                     0.75
+                        0.8                                                                Score   0.50                                  0.50                                     0.50
+                                                                                                   0.25                                  0.25                                     0.25
+
+
+
+       Symbolic Score
+                        0.6                                                                        0.00                                  0.00                                     0.00
+                                                                  15:0                                       0        25           50           0              25       50               0       25     50
+                                                                      12:1
+                                                                             6:0                                    L=12, H=1                             L=15, H=0                           L=23, H=2
+                        0.4                                                                        1.00                                  1.00                                     1.00
+                                                                                    3:2            0.75                                  0.75                                     0.75
+
+                                                                                           Score
+                        0.2                                                                        0.50                                  0.50                                     0.50
+                                                                                                   0.25                                  0.25                                     0.25
+                                                                                     1:4
+                        0.0                                                                        0.00                                  0.00                                     0.00
+                              0.0     0.2           0.4    0.6        0.8           1.0                      0        25      50                0            25      50                  0       25      50
+                                               Positional Score                                                    Frequency ID                           Frequency ID                        Frequency ID
+
+(a) Positional–Symbolic Plane across Frequencies. Visualization of six attention heads from the qwen/Qwen2-1.5B-Instruct
+model. (Left) Each point represents a head in the positional–symbolic plane, labeled by its layer and head index. (Right) For the
+same heads, we plot their positional and symbolic scores as a function of RoPE frequencies.
+
+                                             Query block 1/256                                                   Positional                                              Positional Score
+                        1.0                                                                                                                           0
+                                                                                             100                          = 0.52
+
+                                                                                                                                           Head ID
+                                                                                                                                                      5
+                        0.8
+                                                                                              50
+
+
+
+
+      Symbolic Score
+                                                                                                                                                     10
+                        0.6                                                                        0
+                                                                                                       0.0           0.5           1.0                    0         5        10          15     20     25
+                                                                                                                 Symbolic                                                Symbolic Score
+                        0.4                                                                                                                           0
+                                                                                             100                 0.64 =
+
+                                                                                                                                           Head ID
+                        0.2                                                                                                                           5
+                                       Layer Depth                                            50
+                        0.0      0      10         20                                                                                                10
+                                                                                                   0
+                              0.0     0.2       0.4       0.6       0.8            1.0                 0.0          0.5            1.0                    0         5        10        15       20     25
+                                             Positional Score                                                      Score                                                          Layer ID
+
+(b) All heads, fixed first block. (Left) Each head in the positional–symbolic plane. (Middle) Histogram showing predominance of
+symbolic over positional behavior. (Right) Heatmaps of positional and symbolic scores for each head across layers.
+Figure 11: Positional–Symbolic Plane across Heads. 28 Layers, 12 Heads per layer. Since the model uses a head
+dimension of 128, this corresponds to 64 RoPE frequencies.
+
+
+
+
+                                                                                                             29
+                                                 Query block 1/256                  Query block 128/256                   Query block 256/256
+                                    1.00                                    1.00                                  1.00
+                                    0.75                                    0.75                                  0.75
+
+
+                   Symbolic Score
+                                    0.50                                    0.50                                  0.50
+                                    0.25                                    0.25                                  0.25
+                                    0.00                                    0.00                                  0.00
+                                           0.0            0.5         1.0          0.0          0.5         1.0          0.0          0.5         1.0
+                                                   Positional Score                      Positional Score                      Positional Score
+                                                                                                                               0.44 =        = 0.77
+                                    125                0.64==0.52           125                                   125
+                                    100                                     100           0.54 =      = 0.71      100
+
+                     Count           75                                      75                                    75
+                                     50                                      50                                    50
+                                     25                                      25                                    25
+                                      0                                       0                                     0
+                                           0.0           0.5          1.0          0.0         0.5          1.0          0.0         0.5          1.0
+                                                        Score                                 Score                                 Score
+
+(c) Heads when the block moves (1 to 9). (Above) Heads in the positional–symbolic plane for each block position. (Below)
+Histograms showing how positional and symbolic scores change as the relevant block moves.
+                                                                            Figure 11 (continued).
+
+
+
+
+                                                                                           30
+D.3    Qwen2-0.5B-Instruct
+
+                                                                                                                                                  Positional                      Symbolic
+                               Selected Heads in Positional/Symbolic Plane                                            L=1, H=4                             L=3, H=2                                    L=6, H=0
+                        1.0                                                                          1.00                                  1.00                                      1.00
+                                                                                                     0.75                                  0.75                                      0.75
+                        0.8                                                                  Score   0.50                                  0.50                                      0.50
+                                                                                                     0.25                                  0.25                                      0.25
+
+
+
+       Symbolic Score
+                        0.6                                                                          0.00                                  0.00                                      0.00
+                                                                                                               0               20                 0                      20                  0                20
+                                                                       12:1                                           L=12, H=1                           L=15, H=0                                   L=23, H=2
+                        0.4                                                           3:2            1.00                                  1.00                                      1.00
+                                                                              15:0
+
+                                                                                 23:2                0.75                                  0.75                                      0.75
+
+                                                                                             Score
+                        0.2                                                        6:0               0.50                                  0.50                                      0.50
+                                                                                                     0.25                                  0.25                                      0.25
+                                                                                       1:4
+                        0.0                                                                          0.00                                  0.00                                      0.00
+                              0.0     0.2            0.4         0.6    0.8           1.0                      0            20                    0            20                            0               20
+                                                   Positional Score                                                  Frequency ID                       Frequency ID                                  Frequency ID
+
+(a) Positional–Symbolic Plane across Frequencies. Visualization of six attention heads from the qwen/Qwen2-0.5B-Instruct
+model. (Left) Each point represents a head in the positional–symbolic plane, labeled by its layer and head index. (Right) For the
+same heads, we plot their positional and symbolic scores as a function of RoPE frequencies.
+
+                                                 Query block 1/256                                                 Positional                                                 Positional Score
+                        1.0                                                                                                                                      0
+                                                                                               100                          = 0.57
+                                                                                                                                                                 5
+                        0.8                                                                     50                                                    Head ID
+                                                                                                                                                                10
+
+
+
+      Symbolic Score
+                        0.6                                                                          0
+                                                                                                         0.0          0.5            1.0                             0        5      10          15      20
+                                                                                                                   Symbolic                                                   Symbolic Score
+                        0.4                                                                                                                                      0
+                                                                                               100             0.57 =
+                                                                                                                                                                 5
+                                                                                                                                                      Head ID
+                        0.2
+                                       Layer Depth                                              50
+                                                                                                                                                                10
+                        0.0      0          10             20
+                                                                                                     0
+                              0.0     0.2           0.4         0.6    0.8           1.0                 0.0          0.5            1.0                             0        5      10     15           20
+                                                 Positional Score                                                    Score                                                          Layer ID
+
+(b) All heads, fixed first block. (Left) Each head in the positional–symbolic plane. (Middle) Histogram showing predominance of
+symbolic over positional behavior. (Right) Heatmaps of positional and symbolic scores for each head across layers.
+Figure 12: Positional–Symbolic Plane across Heads. 24 Layers, 14 Heads per layer. Since the model uses a head
+dimension of 64, this corresponds to 32 RoPE frequencies.
+
+
+
+
+                                                                                                               31
+                                                 Query block 1/256                  Query block 128/256                   Query block 256/256
+                                    1.00                                    1.00                                  1.00
+                                    0.75                                    0.75                                  0.75
+
+
+                   Symbolic Score
+                                    0.50                                    0.50                                  0.50
+                                    0.25                                    0.25                                  0.25
+                                    0.00                                    0.00                                  0.00
+                                           0.0            0.5         1.0          0.0          0.5         1.0          0.0          0.5           1.0
+                                                   Positional Score                      Positional Score                      Positional Score
+                                                                                                                           0.32 =                 = 0.83
+                                    150                                     150                                   150
+                                                                                         0.43 =        = 0.77
+                                                     0.57 = = 0.57
+                     Count
+                                    100                                     100                                   100
+
+                                     50                                      50                                    50
+
+                                      0                                       0                                     0
+                                           0.0           0.5          1.0          0.0         0.5          1.0          0.0         0.5            1.0
+                                                        Score                                 Score                                 Score
+
+(c) Heads when the block moves (1 to 9). (Above) Heads in the positional–symbolic plane for each block position. (Below)
+Histograms showing how positional and symbolic scores change as the relevant block moves.
+                                                                            Figure 12 (continued).
+
+
+
+
+                                                                                           32
+

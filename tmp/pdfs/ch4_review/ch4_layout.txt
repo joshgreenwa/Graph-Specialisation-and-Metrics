@@ -1,0 +1,608 @@
+Chapter 4
+
+Head Specialisation: Synthetic
+Experiments
+
+
+4.1      Research questions and objectives
+
+
+In Chapter 3, we introduced a new methodology for computing semantic and structural
+attention-head scores in GTs. In this chapter, we demonstrate the usefulness of
+our methodology through a series of synthetic experiments. Firstly, we explore the
+behaviour of global interventions – a core design principle – and show that it improves
+faithfulness of head scores even when applied to sequence Transformers. We then
+compute semantic and structural specialisation scores for a mixed semantic–structural
+toy task, as well as a bipartite-matching algorithmic reasoning task. In particular, we
+aim to answer RQ1: can controlled graph-input interventions yield causally validated
+measures of semantic and tructural attention-head function in GTs? We therefore
+prioritise the application of the causal methodology in Section 3.4 in validating the
+role of joint sensitivity J and head selectivity Drel . The result is strongly affirmative:
+we find that J is strongly correlated with the ablation impact of each head, showing
+it to be a coherent measure of head importance; while Drel is causally validated to
+be a reliable measure of a head’s preference for semantic or structural computation.
+Moreover, we apply the methodology to find toy specialised heads, and characterise
+layerwise behaviour in each task.
+38                                          Head Specialisation: Synthetic Experiments
+
+
+4.2      Validating scoring design principles
+Objective. We implement a simple synthetic experiment to motivate the core design
+principle of global interventions, i.e. applying interventions to the input of a model, in
+contrast to the local key-permutations of prior work (Urrutia et al., 2026). In particular,
+we showcase that using global interventions directly improves upon the methodology
+introduced in Urrutia et al. (2026) even for sequence transformer applications. This
+case study also supports the adoption of transport-based scores in place of pure
+attention-based scores.
+
+Teacher operator task. In this task, given an ordered input sequence X =
+[x1 , . . . , xn ]⊤ ∈ Rn×d , the teacher “model" represents a simple lookup operation read
+out at the final (query) position n,
+
+                                        y = T (X).
+
+where T (·) represents the teacher operation. We consider three lookups,
+
+      Tprev (X) = xn−1 ,      Thalf (X) = x⌊n/2⌋ ,     Tloc (X) = arg max ⟨xn , xk ⟩,
+                                                                     k<n
+
+
+where for Tloc the query duplicates an earlier token, xn := xr with r ∼ U{1, . . . , n − 1},
+so the lookup returns its position r. Thus prev and half return a token selected by
+relative and absolute position, whereas loc returns a position selected by content. See
+Figure 4.1(a) for an example of each teacher operation.
+
+Student model. The student model is an 4-layer, single-head NoPE transformer (Ha-
+viv et al., 2022), i.e. an LLM without explicit positional encoding. Each student fθ is
+distilled to match the teacher at position n, ŷ = fθ (X)n , by minimising
+                                            h          i
+                                L(θ) = EX ℓ ŷ, T (X) ,
+
+with ℓ the squared error for the token lookups (prev,half) and the cross-entropy over
+                                                                           iid
+positions {1, . . . , n − 1} for loc. Input sequences rows are drawn as xi ∼ N (0, Id ),
+simplifying the data distribution and reducing overfitting risk. See Table 4.1 for a
+summary of results.
+
+Scoring methods. We consider three scoring methods: (i) local attention, an exact
+reproduction of the method in (Urrutia et al., 2026); (ii) global attention, directly
+4.2 Validating scoring design principles                                             39
+
+Table 4.1 Training summary for the teacher-student tasks: mean ± std over 6 seeds.
+Steps is the mean number of optimisation steps at early stopping.
+
+         Task                                 Metric        Value        Steps
+         Copy previous token                  MSE ↓ 0.238 ± 0.022 37 500
+         Copy token at ⌊q/2⌋                  MSE ↓ 0.261 ± 0.059 40 000
+         Report position of content match     Acc ↑ 0.999 ± 0.002 35 833
+
+
+replacing local interventions with their global counterparts; and (iii) global transport,
+where scores are computed on head output rather than attention alone. In line
+with Urrutia et al. (2026), we compute the score on the final query. We report
+the positional fraction, being the positional score divied by the semantic score. See
+Figure 4.1(b).
+
+
+Probing residual positional representation. For mechanistic validation, we
+linearly probe each layer’s residual stream for how much position versus content it
+encodes (Alain and Bengio, 2017). Pooling over all positions, we fit a linear probe to
+predict the position index (accuracy a, random chance 1/n) and a linear regression to
+reconstruct the input token (coefficient of determination, R2 ). We report the residual
+positional-representation fraction,
+
+                                    ρ = ã/(ã + R2 )                               (4.1)
+
+where ã = max{0, (a − 1/n)/(1 − 1/n)}. A high ρ indicates that absolute position is
+linearly recoverable from the stream, whereas a low ρ indicates a content-dominated
+representation. See Figure 4.1(c).
+
+
+Global interventions are faithful to residual stream dynamics. In Fig-
+ure 4.1(c), we find that the positional-representation fraction increases with depth for
+all three tasks. This is expected: NoPE models must encode positional information
+into the residual stream (Haviv et al., 2022), and all three tasks are dependent on
+position. Despite this, the local attention score (pink curve) produces positional scores
+that decay with depth. In contrast, the global attention and transport-based scores
+(blue and green curves) correctly measure a positional score that increases with depth.
+This is because global interventions capture residual stream and network dynamics
+more faithfully than local interventions by design.
+40                                                                                Head Specialisation: Synthetic Experiments
+
+
+     Tprev : one step back from the query                 Thalf : a fixed absolute position               Tloc : the earlier token matching the query
+
+                                              query                                               query                                          query
+
+        1      2       3      4        5          n          1       2        3          4    5    n         1        2          3   4     5       n
+
+
+
+
+                                                                                                                      2
+                                  target output                          target output                           target output
+
+
+
+
+                                                      (a) Teacher operation examples.
+
+
+
+
+                                  (b) Positional score / semantic score for each layer.
+
+
+
+
+                                     (c) Residual positional-representation fraction ρ.
+
+Fig. 4.1 Teacher–student operator distillation in LLMs: (a) One example of each
+of the teacher tasks, visualised. (b) The per-layer positional specialisation fraction, by
+scoring method. (c) The positional-representaiton fraction, computed by linear probe.
+
+
+Transport-based scores improve upon attention-based scores. In these ex-
+amples, the attention and transport-based scores largely agree. However, consider the
+Tloc (content match) task, where a source must be selected by content yet return its
+position. The global attention score only sees the selection, so it erroneously measures
+the final layer of the student model as being semantic. The global transport score
+contrastingly measures that the final-layer head retains a significant positional role
+because it better captures the fact that significant positional information is transported
+through the message itself, carried through the residual stream. This differences can
+4.3 Validating semantic and structural scores                                     41
+
+
+become significantly more pronounced when applied to graphs, especially considering
+that many graph transformers inject structural encodings directly into the message
+pathway, not attention alone.
+
+
+4.3     Validating semantic and structural scores
+Beyond principled improvements over prior work, the central methodological con-
+tribution of this dissertation is the development of specialisation metrics for graph
+transformers. In this section, we validate this methodology using a synthetic mixed
+semantic–structural experiment. We show that the scores robustly recover inter-
+pretable, causally meaningful head roles, clearly distinguish semantic from structural
+computation, and remain informative despite substantial functional redundancy.
+
+
+4.3.1    Semantic–structural mixture experiment
+Mixed synthetic task. We construct a paired synthetic task to separate semantic
+payload processing from structural-relation processing. Each example is an even cycle
+graph C16 with a marked query node q and a marked source node s. The location of s
+is uniformly randomly assigned. Each node receives a unique categorical key and an
+independently and uniformly sampled value
+
+                               vi ∼ Uniform{0, . . . , 7}
+
+Examples are divided equally between two modes, marked by a binary task-mode
+indicator. In the semantic mode, the target is to retrieve the value of the marked
+source node,
+                                    ysem = vs
+
+Because s is sampled independently of graph position, RRWP carries no predictive
+information about its value. In the structural mode, the target is the zero-indexed
+shortest-path distance,
+                                    ystr = d − 1
+
+Node keys and values are independent distractors in this mode. Both tasks therefore
+use the same graph family, source marker, query readout, and eight-class output head;
+they differ only in whether the required signal is the source’s semantic value or its
+structural relation to the query. Each task mode is visualised in Figure 4.2, and the
+full task config is available in Appendix A.1.
+42                                                                    Head Specialisation: Synthetic Experiments
+
+
+     Semantic: retrieve the marked source value                           Structural: retrieve the query-source distance
+
+
+                                   source                                                               source
+                                   s
+                                                ysem = vs                                              s           ystr = d − 1
+                                                    2 {0, …, 7}                                                      2 {0, …, 7}
+          retrieve source value
+
+                                                                                             d hops
+
+
+                     q                                                                   q
+               graph distance does not predict vs                                 node keys and values do not predict d
+
+
+
+Fig. 4.2 Mixed synthetic task. Left: The semantic mode retrieves the value of
+the source whose key matches the query. Right: the structural mode retrieves the
+shortest-path distance between the marked source and query nodes.
+
+
+Graph Transformer. We use a 3-layer dense GRIT model (Ma et al., 2023). Graph
+structure is represented by ten random-walk positional encoding channels,
+                                                                  h                     i
+                                             RRWPij = I, P, P 2 , . . . , P 9
+
+where P is the transition matrix of C16 . Pair features comprise RRWP and a pair
+edge-type embedding, while diagonal RRWP features are additionally supplied to
+the node encoder. Predictions are read from the final representation of the marked
+query node. The dense GT was trained to minimise cross-entropy loss across 3 seeds,
+achieving perfect 1.000 ± 0.000 validation accuracy.
+
+
+4.3.2        Recovering semantic and structural head roles
+Intervention-defined head scores. Semantic and structural scores are computed
+following the methodology introduced in Chapter 3. For the semantic intervention,
+only the planted source’s value one-hot is replaced by a different on-manifold value.
+The structural intervention follows from Section 3.2 exactly. For each intervention,
+six counterfactual donors are sampled, and the aggregated scores are estimated using
+G = 96 independently generated graphs per factor and seed. The corresponding
+semantic and structural scores across three seeds are provided in Figure 4.3.
+
+
+Specialisation and head roles. In Figure 4.3, we find strong semantic and structural
+specialists, as well as a diverse range of heads that respond strongly to both semantic
+and structural interventions. There is clear colinearity between the raw semantic and
+4.3 Validating semantic and structural scores                                                                                                               43
+
+
+structural scores in Figure 4.3(a), evidencing that many heads behave as generalists,
+supporting predictions for both the semantic and structural modes of the task.
+
+
+                                    (a) Raw task scores                                                  (b) Sensitivity and selectivity
+
+                           10   1                                                                            structural    generalist      semantic
+
+
+
+
+    Semantic score Ssem
+                                                                                                  100
+
+
+
+
+                                                                           Joint sensitivity J
+                           100
+
+
+
+                          10−1
+                                                                                                 10−1
+
+
+                          10−2
+
+                                                                                                 10−2
+
+                                        10−2     10−1     100        101                            −1.0          −0.5        0.0          0.5        1.0
+                                         Structural score Sstr                                                    Head selectivity Drel
+                            semantic selection      structural selection               L1               L2      L3        seed 0        seed 1    seed 2
+
+
+
+
+Fig. 4.3 Head-level sensitivity and selectivity.Head-level task scores and speciali-
+sation coordinates. (a) Raw semantic and structural scores for heads, coloured rings
+mark the score-selected semantic and structural families. (b) Joint sensitivity J versus
+relative selectivity Drel , where positive values indicate semantic preference and negative
+values structural preference. Colour denotes layer and shape denotes seed.
+
+
+
+Seed consistency. In Figure 4.3(a), we see consistent distributional specialisation
+behaviour across seeds, with heads from different layers forming clear groups. However,
+the precise head-to-head specialisation clearly varies across seeds, reflecting a qualitative
+difference in the specialisation behaviour between models that otherwise perform equally
+well on the task.
+
+
+Specialised heads are interpretable. These observations are confirmed by Fig-
+ure 4.4: the semantic specialist routes attention from the marked source to the query,
+whereas the structural specialist broadcasts an anchor-centred signal across the graph,
+with routing modulated by relative structural position. The high-J generalist shows
+a superposition of both the semantic and structural specialist roles. Although the
+first-layer head is semantic-leaning according to Drel , its small J and nearly diagonal
+attention indicate a residual-like no-op, suggesting redundant capacity rather than
+substantive semantic computation. This head matches the diagonal head identified in
+Gemma-7B in Barbero et al. (2025). This no-op-like behaviour explains the oddities of
+44                                                           Head Specialisation: Synthetic Experiments
+
+
+layer 1 behaviour in Figure 4.5, and is overall a reflection of a high degree of redundancy
+in the synthetic model.
+
+     (a) Semantic specialist                         L2 H1       (b) Structural specialist                             L2 H2
+
+                              1                                                          1
+
+
+                                                                    3
+
+
+
+                              8                                                          8
+
+                                                                                  12
+
+                      11
+           8
+
+                             16                                                         16
+                                  1        8            16                                    1             8             16
+
+
+     (c) High-J generalist                           L3 H4       (d) First-layer head                                  L1 H7
+
+                              1                                                          1
+
+
+
+      4                                                                           14
+
+                              8                                                          8
+
+
+
+
+                9                                                          9
+                             16                                                         16
+                                  1        8            16                                    1             8             16
+                                       Source node                                                      Source node
+                                                                                              Attention weight
+          Query row        Source column
+                                                                                0.0     0.2       0.4     0.6    0.8
+
+
+
+Fig. 4.4 Specialised head examples.Representative attention patterns for a semantic
+specialist, structural specialist, high-J generalist, and first-layer head. Each graph
+colours source nodes by their attention into the query. Outlines mark the query row
+and source column.
+
+
+
+4.3.3          Causal validation of head roles
+Scores predict causal roles. Figure 4.5 directly compares the scores with inde-
+pendent causal measurements. J predicts overall ablation impact (ρ = 0.77; panel a),
+while Drel predicts both task-specific ablation and rescue roles (panels b,c). These
+relationships strengthen when low-J heads are excluded, owing to the exclusion of
+no-op-like heads like the example in Figure 4.4.
+
+Head roles are causal but redundant. Using the tests defined in Section 3.4,
+Figure ?? tests the selected head families jointly. Semantic specialists most strongly
+affect semantic logits, whereas structural specialists and high-J generalists most strongly
+4.4 GraphBench Algorithmic Reasoning                                                                                                                               45
+
+
+                            (a) Sensitivity vs impact                               (b) Selectivity vs ablation                            (c) Selectivity vs rescue
+                                                                              1.0
+                             All heads: ρ = 0.77                                     All heads: ρ = 0.87                                    All heads: ρ = 0.68
+                                                                                     J ≥ 0.5: ρ = 0.93                                      J ≥ 0.5: ρ = 0.89
+                   100
+
+
+
+
+                                                         Ablation contrast
+                                                                                                                                     0.1
+
+
+
+
+Ablation impact                                                                                                   Rescue contrast
+                                                                              0.5
+
+                                                                                                                                     0.0
+                                                                              0.0
+                       −1
+                  10
+                                                                             −0.5                                                   −0.1
+
+
+                                                                             −1.0                                                   −0.2
+                            10−2       10−1      100                                −1          0           1                              −1          0           1
+                                   Joint sensitivity J                                   Selectivity Drel                                       Selectivity Drel
+
+
+
+Fig. 4.5 Head-level causal validation.Causal validation of the head metrics. (a)
+Joint sensitivity J versus cross-mode ablation impact. (b) Selectivity Drel versus
+semantic–structural ablation impact. (c) Selectivity versus semantic–structural rescue
+contrast. Boxes report pooled Spearman correlations for all heads and for reliable
+heads with J ≥ 0.5.
+
+affect structural logits (panel a). Despite these substantial logit changes, accuracy
+remains largely intact, indicating strong functional redundancy. Accordingly, joint
+family ablation reveals no matched necessity effect (panel b). In contrast, clean-head
+patching produces clear matched rescue: semantic heads recover semantic corruption,
+while structural heads recover structural corruption (panel c). Thus, the families carry
+task-specific causal information but are not individually necessary.
+
+
+4.4                          GraphBench Algorithmic Reasoning
+Bipartite matching. We next validate the methodology on GraphBench algorthmic
+reasoning (Stoll et al., 2025). We analyse four independently trained GRIT models
+on held-out n = 16 graphs from the hard bipartite-matching task, using a reduced
+train/val/test split of 40k/4k/4k graphs. Bipartite matching selects the highest-weight
+set of edges connecting two disjoint node groups such that no node is selected more
+than once. The substantive content feature is the scalar weight assigned to each edge,
+which are perturbed by the semantic donor-swap interventions. Structural interventions
+perturb the RRWP pair and node features and degree encoding as usual for a GRIT
+model.
+
+Scores identify important and selective heads. Figure 4.8(a–b) shows broadly
+balanced semantic and structural scores, with high-J generalists alongside some early
+layer selective heads. This distribution is consistent across seeds, although individual
+46                                                                                                 Head Specialisation: Synthetic Experiments
+
+
+                                       (a)                          Semantic task                       (b)                               Structural task
+
+
+
+
+  Functional logit impact
+                             12.5
+
+                             10.0
+
+                                       7.5
+
+                                       5.0
+
+                                       2.5
+
+                                       0.0
+
+                                       (c)                                                              (d)
+
+
+
+
+                  Accuracy drop (pp)
+                                        20
+
+                                        15
+
+                                        10
+
+                                                 5
+
+                                                 0
+                                                      0              1                 2           3                       0               1                 2          3
+                                                                                            Jointly ablated heads
+                                                                               Semantic    Structural    Generalist                     Inert
+
+
+
+
+Fig. 4.6 Joint ablation of head families.Joint ablation of semantic specialists,
+structural specialists, high-J generalists, and low-J heads. Curves show the across-seed
+mean functional impact (top) and accuracy drop (bottom) as progressively more heads
+are ablated on the semantic (left) and structural (right) tasks; bands show the observed
+seed range.
+
+                                                          (a) Necessity                                                          (b) Rescue
+
+
+
+                                                 Semantic       +0.003        +0.052                                       Semantic      +0.154            +0.066
+
+
+
+
+                                Ablated family                                                            Patched family
+                                                 Structural     +0.000        +0.010                                       Structural    +0.006            +0.128
+
+
+
+                                                                Semantic      Structural                                                 Semantic         Structural
+                                                                   Evaluation task                                                               Corruption
+
+
+                                                     -0.060               0.000            0.060                               -0.16                  0.00             0.16
+                                                                     Δ Cross-Entropy                                                            Mediated fraction
+
+
+Fig. 4.7 Role-specific necessity and rescue interventions. (a) Change in cross-
+entropy after ablating each head family on each evaluation task. (b) Fraction of the
+corruption effect mediated by clean-to-corrupt patching of each family. Rows denote
+the intervened family and columns the evaluation task or corruption.
+4.4 GraphBench Algorithmic Reasoning                                                 47
+
+
+head identities vary. Crucially, J strongly predicts the output impact of single-head
+ablation (ρ̄ = 0.76, 95% CI [0.74, 0.78]; panel c). This further validates the causal
+importance of J.
+
+Head scores predict causal behaviour. Figure 4.8(d) shows that head scores
+predict how changing a head affects the model’s output. Restoring a head’s original
+output after an intervention reverses the effect most strongly when the head type
+and intervention match: semantic-scoring heads preferentially reverse edge-weight
+changes, whereas structural-scoring heads preferentially reverse structural-encoding
+changes. The reverse experiment gives the same result: inserting an intervened head
+output into the original graph preferentially reproduces the corresponding intervention
+effect. Notably, the structural heads are found to still respond strongly to the semantic
+interventions. While many heads are semantic specialists, the structural-leaning heads
+still have a substantive semantic score, as shown in Figure 4.8(b–d). Hence, response
+of these heads to the semantic intervention is expected and further validates Drel . We
+also find that removing any single head eliminates only a small proportion of the
+intervention effect, indicating substantial redundancy as was found in Section 4.3.
+Overall, the scores identify which type of information a head preferentially processes,
+even when that head is not individually essential.
+48                                                                                                                                                                                Head Specialisation: Synthetic Experiments
+
+
+
+
+                  Semantic and structural head scores                                                                                                  Joint sensitivity and relative selectivity                                                                                              Joint sensitivity and head-ablation impact
+                                                                                                                                                                                                                                                                                                           16
+
+
+
+
+                                                                                                                                                                                                                                                                       Output change after head ablation
+                  6                                                                                          5                                                                                                   5                                                                                                  Mean seed = 0.76 [0.74, 0.78]                   5
+                                                                                                                                                       2.5                                                                                                                                                 14
+                  5
+                                                                                                             4                                                                                                   4                                                                                         12                                                       4
+
+
+
+                                                                                                                                Joint sensitivity, J
+                                                                                                                                                       2.0
+
+
+ Semantic score
+                  4                                                                                                                                                                                                                                                                                        10
+                                                                                                             3                                                                                                   3                                                                                                                                                  3
+                                                                                                             Layer                                                                                                Layer                                                                                                                                              Layer
+                                                                                                                                                       1.5                                                                                                                                                  8
+                  3
+                                                                                                             2                                                                                                   2                                                                                                                                                  2
+                                                                                                                                                       1.0                                                                                                                                                  6
+                  2
+                                                                                                             1                                                                                                   1                                                                                          4                                                       1
+                  1                                                                                                                                    0.5
+                                                                                                                                                                                                                                                                                                            2
+                                                                                                             0                                                                                                   0                                                                                                                                                  0
+                  0                                                                                                                                    0.0                                                                                                                                                  0
+                      0                                                 2            4            6                                                          1.0        0.5      0.0      0.5         1.0                                                                                                       0             1             2
+                                                                      Structural score                                           Head selectivity, Drel (structural                             0     semantic)                                                                                                            Joint sensitivity, J
+                      Seed 0                                                Seed 1           Seed 2       Seed 3                                             Seed 0           Seed 1        Seed 2             Seed 3                                                                                           Seed 0            Seed 1          Seed 2          Seed 3
+
+
+ (a) Specialisation scores.                                                                                                                                        (b) J vs Drel .                                                                                     (c) Ablation impact vs J.
+
+                                                                        Clean head state in an intervened graph                                                       Intervened head state in a clean graph                                                                                                                   Head necessity
+
+
+
+
+                      Output effect beyond mismatch control                                                                                                                                                                   Intervention effect removed (fraction)
+                                                              0.25                                                                                                                                                                                                     0.125
+                                                                                                                                                         0.15
+                                                              0.20                                                                                                                                                                                                     0.100
+                                                              0.15                                                                                       0.10
+                                                                                                                                                                                                                                                                       0.075
+                                                              0.10                                                                                                                                                                                                     0.050
+                                                                                                                                                         0.05
+                                                              0.05                                                                                                                                                                                                     0.025
+                                                                                                                                                         0.00                                                                                                          0.000
+                                                              0.00
+                                                                     Semantic intervention            Structural intervention                                   Semantic intervention               Structural intervention                                                                                Semantic intervention                Structural intervention
+
+                                                                                                                                                               Mean and 95% bootstrap CI across four seeds
+                                                                                                                     Semantic-scoring heads                                   Structural-scoring heads           J-matched null heads
+
+
+                                                                                             (d) Causal analysis of semantic and structural roles.
+
+Fig. 4.8 Bipartite matching. (a) Semantic and structural head scores. (b) Joint
+sensitivity J and relative selectivity Drel . (c) J predicts the output impact of single-head
+ablation. (d) Left: patching the clean head state into an intervened graph measures
+causal restoration. Middle: patching the intervened head state into a clean graph
+measures causal injection. Right: the fraction of each intervention effect removed with
+the head’s donor-induced response, compared with J-matched null heads. Error bars
+show 95% confidence intervals across four trained seeds.
+

@@ -74,6 +74,7 @@ from .figures import (
     distance_heatmaps,
     distance_support_profile,
     joint_selectivity_plane,
+    multi_seed_score_causal_triptych,
     score_distance_profiles,
     score_plane,
     selectivity_regime_diagnostics,
@@ -4140,6 +4141,130 @@ def _write_run_summaries(
                 "Fewer than three trained seeds: report seed estimates and within-seed "
                 "graph intervals, not a seed-population confidence interval."
             )
+        if any(value.get("causal") is not None for value in task_results):
+            scatter_records = []
+            for value in task_results:
+                scores = value.get("scores")
+                causal_value = value.get("causal")
+                if scores is None or causal_value is None:
+                    continue
+                coordinates = scores["coordinates"]
+                if not all(
+                    hasattr(coordinates, name)
+                    for name in (
+                        "normalized_semantic",
+                        "normalized_structural",
+                        "selectivity",
+                        "joint_sensitivity",
+                    )
+                ):
+                    continue
+                layers, heads = coordinates.joint_sensitivity.shape
+                head_names = [
+                    f"head_L{layer}_H{head}"
+                    for layer in range(int(layers))
+                    for head in range(int(heads))
+                ]
+                clean_ablation = causal_value.get("clean_ablation", {})
+                if not all(name in clean_ablation for name in head_names):
+                    continue
+                scatter_records.append(
+                    {
+                        "seed": int(value["seed"]),
+                        "semantic": coordinates.normalized_semantic.reshape(-1),
+                        "structural": coordinates.normalized_structural.reshape(-1),
+                        "selectivity": coordinates.selectivity.reshape(-1),
+                        "joint": coordinates.joint_sensitivity.reshape(-1),
+                        "clean_ablation_impact": np.asarray(
+                            [
+                                clean_ablation[name]["prediction_movement"]
+                                for name in head_names
+                            ],
+                            dtype=np.float64,
+                        ),
+                        "layer": np.repeat(np.arange(layers), heads),
+                    }
+                )
+            rho_population = None
+            population_interval = task_population.get("population_interval")
+            if population_interval is not None:
+                quantity_order = list(population_interval["quantity_order"])
+                if "rho_J_vs_clean_prediction_movement" in quantity_order:
+                    position = quantity_order.index(
+                        "rho_J_vs_clean_prediction_movement"
+                    )
+                    rho_population = {
+                        "rho": float(population_interval["estimate"][position]),
+                        "low": float(population_interval["low"][position]),
+                        "high": float(population_interval["high"][position]),
+                    }
+            if rho_population is None:
+                rho_values = np.asarray(
+                    [
+                        row["rho_J_vs_clean_prediction_movement"]
+                        for row in seed_rows
+                        if "rho_J_vs_clean_prediction_movement" in row
+                    ],
+                    dtype=np.float64,
+                )
+                if rho_values.size and np.isfinite(rho_values).any():
+                    rho_population = {
+                        "rho": float(np.nanmean(rho_values)),
+                    }
+            if scatter_records:
+                theme_values = config.figure_overrides
+                if task_name in theme_values and isinstance(
+                    theme_values[task_name], Mapping
+                ):
+                    theme_values = theme_values[task_name]
+                theme = FigureTheme().with_overrides(theme_values)
+                composite_theme = theme.with_overrides(
+                    {
+                        "font_size": max(float(theme.font_size), 11.0),
+                        "label_size": max(float(theme.label_size), 12.4),
+                        "title_size": max(float(theme.title_size), 13.5),
+                        "tick_size": max(float(theme.tick_size), 10.2),
+                        "marker_size": max(float(theme.marker_size), 46.0),
+                        "dpi": max(int(theme.dpi), 600),
+                    }
+                )
+                builder = FigureBuilder(
+                    config.root / task_name / "figures",
+                    composite_theme,
+                    common_metadata={
+                        "protocol_version": PROTOCOL_VERSION,
+                        "repository_commit": _repository_commit(),
+                        "protocol_fingerprint": config.fingerprint,
+                        "population_unit": "training seed; heads are not aligned across seeds",
+                    },
+                )
+                fig, axes = multi_seed_score_causal_triptych(
+                    scatter_records,
+                    rho_statistic=rho_population,
+                    clean_impact_ylim=(0.0, 16.0),
+                    theme=composite_theme,
+                )
+                paths = builder.save(
+                    "score_selectivity_clean_ablation_triptych",
+                    fig,
+                    axes,
+                    metadata={
+                        "task": task_name,
+                        "seeds": [int(record["seed"]) for record in scatter_records],
+                        "rho_statistic": rho_population,
+                        "panels": [
+                            "semantic and structural head scores",
+                            "joint sensitivity and relative selectivity",
+                            "joint sensitivity and head-ablation impact",
+                        ],
+                        "clean_ablation_impact_ylim": [0.0, 16.0],
+                    },
+                )
+                task_population["figures"] = {
+                    "score_selectivity_clean_ablation_triptych": [
+                        str(path) for path in paths
+                    ]
+                }
         focused_population: dict[str, Any] = {
             "strongest_candidates": {},
             "confirmed_95": {},
@@ -4281,7 +4406,11 @@ def _write_run_summaries(
                 for key, value in results.items()
             },
             "population": {
-                key: {"path": value["path"]} for key, value in population.items()
+                key: {
+                    "path": value["path"],
+                    "figures": value.get("figures", {}),
+                }
+                for key, value in population.items()
             },
             "audits": str(config.root / "audits.json"),
         },

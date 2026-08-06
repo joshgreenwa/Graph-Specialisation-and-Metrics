@@ -65,6 +65,11 @@ QUAD_SIZE = (TEXT_WIDTH, 4.75)
 HEATMAP_SIZE = (HALF_WIDTH, 2.65)
 ATTENTION_SIZE = (TEXT_WIDTH, 4.75)
 
+# PNGs are review previews. PDFs remain vector-first, while any backend-created
+# raster gradients are emitted at 600 ppi for publication-quality reproduction.
+PNG_DPI = 300
+PDF_RASTER_DPI = 600
+
 
 @dataclass(frozen=True)
 class HeadPoint:
@@ -114,11 +119,17 @@ def configure_matplotlib() -> None:
             "axes.facecolor": PAPER,
             "savefig.facecolor": PAPER,
             "figure.dpi": 160,
-            "savefig.dpi": 300,
+            "savefig.dpi": PDF_RASTER_DPI,
             "savefig.bbox": None,
+            "savefig.transparent": False,
             "pdf.fonttype": 42,
+            "pdf.use14corefonts": False,
+            "pdf.compression": 9,
             "ps.fonttype": 42,
             "svg.fonttype": "none",
+            "path.simplify": False,
+            "agg.path.chunksize": 0,
+            "image.interpolation": "none",
             "axes.unicode_minus": True,
         }
     )
@@ -282,8 +293,14 @@ def save_figure(fig: mpl.figure.Figure, stem: str) -> tuple[Path, Path]:
         "Title": stem,
         "Subject": "Synthetic-data figure redesign mockup",
     }
-    fig.savefig(png, dpi=300, facecolor=PAPER, bbox_inches=None)
-    fig.savefig(pdf, dpi=300, facecolor=PAPER, bbox_inches=None, metadata=metadata)
+    fig.savefig(png, dpi=PNG_DPI, facecolor=PAPER, bbox_inches=None)
+    fig.savefig(
+        pdf,
+        dpi=PDF_RASTER_DPI,
+        facecolor=PAPER,
+        bbox_inches=None,
+        metadata=metadata,
+    )
     plt.close(fig)
     return png, pdf
 
@@ -900,9 +917,8 @@ def figure_7(seed: int = 918) -> tuple[Path, Path]:
             linewidths=0.45,
             zorder=3,
         )
-        # Query uses a charcoal circle; source uses a grey square.  Shape and
+        # Query uses a charcoal circle; source uses a grey square. Shape and
         # line style distinguish the roles without adding another categorical hue.
-        # is allowed to imply semantic/structural task identity elsewhere.
         for selected, colour, marker in ((query, QUERY, "o"), (source, SOURCE, "s")):
             graph_ax.scatter(
                 [positions[selected, 0]],
@@ -935,7 +951,7 @@ def figure_7(seed: int = 918) -> tuple[Path, Path]:
                 str(node + 1),
                 ha="center",
                 va="center",
-                fontsize=7.0,
+                fontsize=6.4,
                 fontweight="semibold",
                 color=INK if luminance > 0.57 else PAPER,
                 zorder=7,
@@ -945,13 +961,25 @@ def figure_7(seed: int = 918) -> tuple[Path, Path]:
         graph_ax.axis("off")
         graph_ax.set_title("")
 
-        matrix_ax.imshow(
+        cell_edges = np.arange(n + 1, dtype=float) - 0.5
+        matrix_ax.pcolormesh(
+            cell_edges,
+            cell_edges,
             matrix,
             cmap=cmap,
             norm=norm,
-            interpolation="none",
-            aspect="equal",
+            shading="flat",
+            # Matching face-colour edges prevent PDF viewers from exposing
+            # antialiasing hairlines between adjacent vector cells.
+            edgecolors="face",
+            linewidth=0.15,
+            antialiased=False,
+            rasterized=False,
+            snap=True,
         )
+        matrix_ax.set_xlim(-0.5, n - 0.5)
+        matrix_ax.set_ylim(n - 0.5, -0.5)
+        matrix_ax.set_aspect("equal")
         for xy, width, height, colour in (
             ((-0.5, query - 0.5), n, 1.0, QUERY),
             ((source - 0.5, -0.5), 1.0, n, SOURCE),
@@ -967,11 +995,7 @@ def figure_7(seed: int = 918) -> tuple[Path, Path]:
             fontsize=7.0,
             labelpad=1.5,
         )
-        matrix_ax.set_ylabel(
-            "Destination node" if index % 2 == 0 else "",
-            fontsize=7.0,
-            labelpad=1.5,
-        )
+        matrix_ax.set_ylabel("")
         matrix_ax.set_title("")
         for spine in matrix_ax.spines.values():
             spine.set_visible(True)
@@ -1016,8 +1040,8 @@ def figure_7(seed: int = 918) -> tuple[Path, Path]:
         cax=colorbar_ax,
         orientation="horizontal",
     )
-    colorbar.ax.tick_params(labelsize=5.9, length=1.8, pad=1.1)
-    colorbar.ax.set_title("Attention weight", fontsize=6.7, color=MUTED, pad=2.5)
+    colorbar.ax.tick_params(labelsize=7.0, length=1.8, pad=1.1)
+    colorbar.ax.set_title("Attention weight", fontsize=7.0, color=MUTED, pad=2.5)
     colorbar.outline.set_linewidth(0.5)
     return save_figure(fig, "fig7_attention_visualisations_redesign")
 
