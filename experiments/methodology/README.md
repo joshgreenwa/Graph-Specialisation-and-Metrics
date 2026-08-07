@@ -22,6 +22,25 @@ as provenance rather than used as cache-validity keys. If a file genuinely belon
 scientific contract or is unreadable, the runner preserves it under `cache/_stale/` and recomputes
 that miss; read-only downstream artifact loaders continue to reject incompatible inputs.
 
+## ZINC checkpoint trajectory
+
+The seed-0 dense/1-hop training trajectory has a dedicated scores-only workflow. Put
+`zinc_dense_1hop_seed0_trajectory.tar` and its `.sha256` companion directly in Drive at
+`multi_seed_models/multiple_checkpoints_zinc/`, then open these two notebooks on separate Colab
+GPUs and run all cells:
+
+- [`zinc_dense_checkpoint_trajectory_colab.ipynb`](zinc_dense_checkpoint_trajectory_colab.ipynb)
+- [`zinc_1hop_checkpoint_trajectory_colab.ipynb`](zinc_1hop_checkpoint_trajectory_colab.ipynb)
+
+Each notebook defaults to `MODE="run"` and processes epochs 10, 100, 250, 500, 1000, and 1990
+sequentially. Every epoch has an isolated canonical scores cache under
+`score_trajectory_outputs/<architecture>/epoch_<epoch>/`; rerunning freshly validates and skips a
+complete epoch or resumes its atomic graph shards. No carriage is computed. After all six epochs,
+the notebook validates the shared split/geometry contract and writes per-head violin plots, a long
+score table, a summary table, and a provenance manifest beneath
+`score_trajectory_plots/<architecture>/`. `MODE="plot"` rebuilds those outputs without loading any
+model, and `MODE="status"` provides a lightweight cache inventory.
+
 The checked-in launcher is configured to complete `scores` and `carriage` for all six QM9 gap
 controls: 1-hop, 1-hop with local-only RRWP, 2-hop, 1-hop+VNode, 2-hop+VNode, and dense. It uses
 eight graphs per runtime batch with automatic CUDA OOM backoff and then validates both atomic
