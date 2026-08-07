@@ -67,6 +67,19 @@ cache/carriage/structural/graph_XXXXXX.pt
 `graph_XXXXXX.pt` files are resumable intermediate shards. Any rejected older artifact is retained
 under the same run's `cache/_stale/` directory.
 
+## Chapter 6 multi-seed analysis
+
+Run `experiments/methodology/chapter6_multiseed_colab.ipynb` with `DATASET = "zinc"` or
+`DATASET = "qm9"`. The two runs are cache-only and write independently to:
+
+```text
+M/chapter6_multiseed_analysis/zinc
+M/chapter6_multiseed_analysis/qm9
+```
+
+Each run reads the five architectures and three seeds listed above; it does not load a checkpoint
+or recompute an intervention.
+
 ## Seed-0 dense/1-hop checkpoint trajectory
 
 The trajectory roots are:
