@@ -504,7 +504,18 @@ def apply_peptides_streaming_rrwp_patch(base: Any, repo_dir: Path) -> None:
     text = path.read_text(encoding="utf-8", errors="replace")
     marker = "def _grit_colab_streaming_get_no_cache("
     if marker in text:
-        base.log("[memory] Streaming RRWP pre-transform patch already present.")
+        legacy_keys = "    for key in sorted(list(data_parts[0].keys), key=_key_bytes, reverse=True):"
+        modern_keys = (
+            "    chunk_keys = data_parts[0].keys\n"
+            "    if callable(chunk_keys):\n"
+            "        chunk_keys = chunk_keys()\n"
+            "    for key in sorted(list(chunk_keys), key=_key_bytes, reverse=True):"
+        )
+        if legacy_keys in text:
+            path.write_text(text.replace(legacy_keys, modern_keys, 1), encoding="utf-8")
+            base.log("[memory] Upgraded streaming RRWP merge for modern PyG Data.keys().")
+        else:
+            base.log("[memory] Streaming RRWP pre-transform patch already present.")
         return
 
     patch = r'''
@@ -573,7 +584,12 @@ def _grit_colab_merge_data_chunks(data_parts):
     # Merge the largest tensors first, then immediately remove them from the
     # chunk objects. This keeps the peak closer to one full collated dataset
     # plus the largest single attribute, instead of two full datasets.
-    for key in sorted(list(data_parts[0].keys), key=_key_bytes, reverse=True):
+    # Data containers may expose keys as either an iterable attribute or a
+    # Data.keys() method. Support both without changing any stored values.
+    chunk_keys = data_parts[0].keys
+    if callable(chunk_keys):
+        chunk_keys = chunk_keys()
+    for key in sorted(list(chunk_keys), key=_key_bytes, reverse=True):
         values = [data[key] for data in data_parts]
         first = values[0]
         if torch.is_tensor(first):
