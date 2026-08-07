@@ -8,6 +8,10 @@ import torch
 
 from graph_specialisation_metrics.chapter6_clean_ablation import (
     SUMMARY_SCHEMA,
+    ensure_completion_manifest,
+)
+from graph_specialisation_metrics.chapter6_clean_ablation import (
+    completion_path as ablation_completion_path,
 )
 from graph_specialisation_metrics.chapter6_clean_ablation import (
     load_rows as load_ablation_rows,
@@ -26,6 +30,16 @@ from graph_specialisation_metrics.chapter6_multiseed import (
     raw_carriage_strength_profile,
     run,
 )
+from graph_specialisation_metrics.chapter6_score_trajectory import (
+    cache_inventory as trajectory_cache_inventory,
+)
+from graph_specialisation_metrics.chapter6_score_trajectory import (
+    load_rows as load_trajectory_rows,
+)
+from graph_specialisation_metrics.chapter6_score_trajectory import (
+    score_cache_path as trajectory_score_cache_path,
+)
+from graph_specialisation_metrics.methodology.protocol import stable_hash
 
 matplotlib.use("Agg")
 
@@ -181,6 +195,32 @@ def _write_ablation(root: Path, task: str, seed: int) -> None:
     )
 
 
+def _write_trajectory(root: Path, architecture: str, epoch: int) -> None:
+    task = "zinc" if architecture == "dense" else "zinc_1hop"
+    path = trajectory_score_cache_path(root, architecture, epoch)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    contract = {
+        "task": task,
+        "train_seed": 0,
+        "checkpoint_sha256": f"{architecture}-{epoch}",
+    }
+    score = _score(vnode=False, seed=0)
+    scale = 1.0 + epoch / 1_000.0 + (0.25 if architecture == "dense" else 0.0)
+    for channel in ("semantic", "structural"):
+        score["channels"][channel]["raw"] = np.asarray(score["channels"][channel]["raw"]) * scale
+    torch.save(
+        {
+            "metadata": {
+                "protocol_version": "donor-swap-specialisation-carriage-v4",
+                "contract": contract,
+                "contract_fingerprint": stable_hash(contract),
+            },
+            "value": score,
+        },
+        path,
+    )
+
+
 @pytest.mark.parametrize("dataset", ("zinc", "qm9"))
 def test_dataset_spec_has_five_models(dataset):
     spec = dataset_spec(dataset)
@@ -245,6 +285,22 @@ def test_clean_ablation_summary_inventory_and_loading(tmp_path):
     rows = load_ablation_rows(root, dataset="zinc", strict=True)
     assert len(rows) == 5 * 3 * 4
     assert {row["clean_ablation_graphs"] for row in rows} == {64}
+    marker = ensure_completion_manifest(root, dataset="zinc")
+    assert marker == ablation_completion_path(root, "zinc")
+    assert json.loads(marker.read_text())["runs"] == 15
+
+
+def test_zinc_checkpoint_trajectory_loads_twelve_cached_epochs(tmp_path):
+    root = tmp_path / "trajectory"
+    for architecture in ("dense", "1hop"):
+        for epoch in (10, 100, 250, 500, 1_000, 1_990):
+            _write_trajectory(root, architecture, epoch)
+    inventory = trajectory_cache_inventory(root)
+    assert len(inventory) == 12
+    assert all(row["score_exists"] for row in inventory)
+    rows = load_trajectory_rows(root, strict=True)
+    assert len(rows) == 12 * 4
+    assert {row["architecture"] for row in rows} == {"dense", "1hop"}
 
 
 @pytest.mark.parametrize("dataset", ("zinc", "qm9"))
@@ -252,10 +308,15 @@ def test_run_builds_dataset_specific_multiseed_suite(tmp_path, dataset):
     spec = dataset_spec(dataset)
     canonical_root = tmp_path / "canonical_outputs"
     ablation_root = tmp_path / "clean_head_ablation"
+    trajectory_root = tmp_path / "trajectory"
     for task in spec.tasks:
         for seed in (0, 1, 2):
             _write_run(canonical_root, task, seed)
             _write_ablation(ablation_root, task, seed)
+    if dataset == "zinc":
+        for architecture in ("dense", "1hop"):
+            for epoch in (10, 100, 250, 500, 1_000, 1_990):
+                _write_trajectory(trajectory_root, architecture, epoch)
 
     inventory_rows = cache_inventory(canonical_root, dataset=dataset)
     assert len(inventory_rows) == 15
@@ -268,16 +329,25 @@ def test_run_builds_dataset_specific_multiseed_suite(tmp_path, dataset):
         dataset=dataset,
         ablation_root=ablation_root,
         strict_ablation=True,
+        trajectory_root=trajectory_root if dataset == "zinc" else None,
+        strict_trajectory=dataset == "zinc",
         verbose=False,
     )
     assert manifest["runs_loaded"] == 15
     assert manifest["dataset"] == dataset
-    assert len([path for path in manifest["figures"] if path.endswith(".png")]) == 10
+    expected_pngs = 12 if dataset == "zinc" else 10
+    assert len([path for path in manifest["figures"] if path.endswith(".png")]) == expected_pngs
     assert (output_dir / "figures/01_spatial_organisation.png").is_file()
     assert (output_dir / "figures/07_score_and_final_state_response.pdf").is_file()
     assert (output_dir / "figures/08_matched_score_and_final_state_response.pdf").is_file()
     assert (output_dir / "figures/09_final_state_response_variants.pdf").is_file()
     assert (output_dir / "figures/10_joint_sensitivity_head_ablation.pdf").is_file()
+    if dataset == "zinc":
+        assert (output_dir / "figures/11a_dense_score_trajectory.pdf").is_file()
+        assert (output_dir / "figures/11b_1hop_score_trajectory.pdf").is_file()
+        assert (output_dir / "zinc_checkpoint_trajectory_heads.csv").is_file()
+    else:
+        assert not (output_dir / "zinc_checkpoint_trajectory_heads.csv").exists()
     assert (output_dir / "final_state_response_variants.csv").is_file()
     assert (output_dir / "joint_sensitivity_head_ablation.csv").is_file()
     assert (output_dir / "head_metrics.csv").is_file()

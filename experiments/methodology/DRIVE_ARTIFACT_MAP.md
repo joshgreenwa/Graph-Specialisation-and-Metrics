@@ -84,9 +84,14 @@ run's `cache/causal/clean_ablation/` directory. Compact plotting summaries are w
 
 ```text
 M/chapter6_clean_head_ablation/<model task>/seed_<seed>.json
+M/chapter6_clean_head_ablation/zinc_complete.json
+M/chapter6_clean_head_ablation/qm9_complete.json
 ```
 
-Use a T4 GPU for the first pass; subsequent figure-only reruns reuse these caches.
+Each dataset completion marker binds all 15 compact summaries by SHA-256. The summaries bind the
+underlying score cache and checkpoint, while the canonical per-head shards retain the 64 graph
+records. Use a T4 GPU for the first pass; subsequent figure-only reruns validate and reuse these
+caches without loading a model.
 
 ## Seed-0 dense/1-hop checkpoint trajectory
 
@@ -136,3 +141,17 @@ T/score_trajectory_plots/1hop/head_scores_long.csv
 T/score_trajectory_plots/1hop/score_summary.csv
 T/score_trajectory_plots/1hop/plot_manifest.json
 ```
+
+The ZINC Chapter 6 frontend reads the twelve `TO` score caches directly and additionally writes:
+
+```text
+M/chapter6_multiseed_analysis/zinc/figures/11a_dense_score_trajectory.png
+M/chapter6_multiseed_analysis/zinc/figures/11a_dense_score_trajectory.pdf
+M/chapter6_multiseed_analysis/zinc/figures/11b_1hop_score_trajectory.png
+M/chapter6_multiseed_analysis/zinc/figures/11b_1hop_score_trajectory.pdf
+M/chapter6_multiseed_analysis/zinc/zinc_checkpoint_trajectory_heads.csv
+```
+
+Each architecture receives a 2x6 figure: raw semantic versus structural scores on the top row and
+`J` versus `D_rel` on the bottom row. Axis limits are computed jointly over both architectures and
+all twelve checkpoints, so the two figures use identical scales. These outputs are ZINC-only.

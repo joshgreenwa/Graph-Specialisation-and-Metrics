@@ -46,6 +46,7 @@ CANONICAL_ROOT = MULTI_SEED_ROOT / "canonical_outputs"
 OUTPUT_ROOT = MULTI_SEED_ROOT / "chapter6_multiseed_analysis"
 OUTPUT_DIR = OUTPUT_ROOT / DATASET.lower()
 ABLATION_ROOT = MULTI_SEED_ROOT / "chapter6_clean_head_ablation"
+TRAJECTORY_ROOT = MULTI_SEED_ROOT / "multiple_checkpoints_zinc"
 
 
 def command(*parts: str) -> None:
@@ -126,6 +127,7 @@ from graph_specialisation_metrics.chapter6_multiseed import (
 )
 from graph_specialisation_metrics.chapter6_clean_ablation import (
     compute_dataset as compute_clean_ablations,
+    ensure_completion_manifest as finalize_clean_ablations,
     missing_runs as missing_ablation_runs,
 )
 
@@ -163,6 +165,12 @@ if missing_ablations:
         seeds=SEEDS,
         verbose=True,
     )
+ablation_completion = finalize_clean_ablations(
+    ABLATION_ROOT,
+    dataset=DATASET,
+    seeds=SEEDS,
+)
+print(f"[ablation] persistent completion manifest: {ablation_completion}", flush=True)
 
 
 print(
@@ -193,6 +201,14 @@ display(
     ]
 )
 
+if DATASET == "zinc":
+    from graph_specialisation_metrics.chapter6_score_trajectory import (
+        cache_inventory as trajectory_cache_inventory,
+    )
+
+    print("\nZINC checkpoint-trajectory cache inventory", flush=True)
+    display(pd.DataFrame(trajectory_cache_inventory(TRAJECTORY_ROOT)))
+
 manifest = run(
     CANONICAL_ROOT,
     OUTPUT_DIR,
@@ -201,6 +217,8 @@ manifest = run(
     strict_inventory=STRICT_CACHE_INVENTORY,
     ablation_root=ABLATION_ROOT,
     strict_ablation=True,
+    trajectory_root=TRAJECTORY_ROOT if DATASET == "zinc" else None,
+    strict_trajectory=DATASET == "zinc",
     activity_quantile=RELIABLE_HEAD_QUANTILE,
     verbose=True,
 )

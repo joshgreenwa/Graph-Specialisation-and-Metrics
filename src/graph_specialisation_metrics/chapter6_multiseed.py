@@ -28,7 +28,7 @@ from .chapter6_spatial_explorer import (
 from .methodology.bootstrap import trimmed_mean
 from .zinc_cached_rrwp_comparison import DISPLAY_BINS
 
-ANALYSIS_VERSION = "chapter6-molecular-multiseed-v2"
+ANALYSIS_VERSION = "chapter6-molecular-multiseed-v3"
 SEEDS = (0, 1, 2)
 CHANNELS = ("semantic", "structural")
 
@@ -1361,6 +1361,8 @@ def run(
     strict_inventory: bool = True,
     ablation_root: Path | None = None,
     strict_ablation: bool = False,
+    trajectory_root: Path | None = None,
+    strict_trajectory: bool = False,
     activity_quantile: float = 0.25,
     verbose: bool = True,
 ) -> dict[str, Any]:
@@ -1414,6 +1416,14 @@ def run(
             seeds=seeds,
             strict=strict_ablation,
         )
+    trajectory_rows: list[dict[str, Any]] = []
+    if spec.name == "zinc" and trajectory_root is not None:
+        from .chapter6_score_trajectory import load_rows as load_trajectory_rows
+
+        trajectory_rows = load_trajectory_rows(
+            Path(trajectory_root),
+            strict=strict_trajectory,
+        )
     tables = {
         "head_metrics.csv": head_rows,
         "layer_spatial_organisation.csv": organisation_rows,
@@ -1424,6 +1434,8 @@ def run(
         "final_state_response_variants.csv": response_variant_rows,
         "joint_sensitivity_head_ablation.csv": ablation_rows,
     }
+    if trajectory_rows:
+        tables["zinc_checkpoint_trajectory_heads.csv"] = trajectory_rows
     for filename, rows in tables.items():
         _write_csv(output_dir / filename, rows)
 
@@ -1464,6 +1476,10 @@ def run(
     figures.extend(_plot_matched_strength_profiles(matched_profile_rows, spec, figures_dir))
     figures.extend(_plot_carriage_response_variants(response_variant_rows, spec, figures_dir))
     figures.extend(_plot_joint_sensitivity_ablation(ablation_rows, spec, figures_dir))
+    if trajectory_rows:
+        from .chapter6_score_trajectory import plot as plot_score_trajectory
+
+        figures.extend(plot_score_trajectory(trajectory_rows, figures_dir))
 
     manifest = {
         "analysis_version": ANALYSIS_VERSION,
@@ -1475,6 +1491,8 @@ def run(
         "strict_inventory": bool(strict_inventory),
         "ablation_root": None if ablation_root is None else str(ablation_root),
         "strict_ablation": bool(strict_ablation),
+        "trajectory_root": None if trajectory_root is None else str(trajectory_root),
+        "strict_trajectory": bool(strict_trajectory),
         "activity_quantile": float(activity_quantile),
         "runs_loaded": len(models),
         "warnings": warnings,
@@ -1509,6 +1527,12 @@ def run(
             "final_state_response": "learned response, not task necessity",
         },
     }
+    if trajectory_rows:
+        manifest["interpretation"]["checkpoint_trajectory"] = (
+            "ZINC seed-0 dense and 1-hop score caches at epochs "
+            "10, 100, 250, 500, 1000, and 1990; plot limits are shared "
+            "across all twelve checkpoints"
+        )
     (output_dir / "manifest.json").write_text(
         json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8"
     )

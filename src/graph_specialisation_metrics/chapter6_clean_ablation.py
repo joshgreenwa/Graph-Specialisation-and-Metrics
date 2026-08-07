@@ -17,13 +17,21 @@ from typing import Any
 import numpy as np
 
 from .chapter6_multiseed import SEEDS, dataset_spec
-from .methodology.cache import atomic_json, load_cache_artifact_file
+from .methodology.cache import (
+    atomic_json,
+    checkpoint_sha256,
+    load_cache_artifact_file,
+)
 
 SUMMARY_SCHEMA = "chapter6-clean-head-ablation-v1"
 
 
 def summary_path(root: Path, task: str, seed: int) -> Path:
     return Path(root) / str(task) / f"seed_{int(seed)}.json"
+
+
+def completion_path(root: Path, dataset: str) -> Path:
+    return Path(root) / f"{str(dataset).strip().lower()}_complete.json"
 
 
 def _coordinate_array(coordinates: Any, name: str) -> np.ndarray:
@@ -314,7 +322,49 @@ def compute_dataset(
                     seed=int(seed),
                 )
             )
+    ensure_completion_manifest(summary_root, dataset=dataset, seeds=seeds)
     return outputs
+
+
+def ensure_completion_manifest(
+    root: Path,
+    *,
+    dataset: str,
+    seeds: Sequence[int] = SEEDS,
+) -> Path:
+    """Write an atomic dataset marker binding every compact ablation summary by SHA-256."""
+
+    missing = missing_runs(root, dataset=dataset, seeds=seeds)
+    if missing:
+        detail = ", ".join(f"{task}/seed_{seed}" for task, seed in missing)
+        raise FileNotFoundError(f"cannot finalize incomplete clean-head ablations: {detail}")
+    spec = dataset_spec(dataset)
+    summaries = []
+    for task in spec.tasks:
+        for seed in seeds:
+            path = summary_path(root, task, int(seed))
+            summaries.append(
+                {
+                    "task": task,
+                    "seed": int(seed),
+                    "path": str(path),
+                    "sha256": checkpoint_sha256(path),
+                }
+            )
+    destination = completion_path(root, spec.name)
+    atomic_json(
+        destination,
+        {
+            "schema": "chapter6-clean-head-ablation-complete-v1",
+            "dataset": spec.name,
+            "summary_schema": SUMMARY_SCHEMA,
+            "tasks": list(spec.tasks),
+            "seeds": [int(seed) for seed in seeds],
+            "runs": len(summaries),
+            "summaries": summaries,
+        },
+    )
+    return destination
 
 
 def load_rows(
