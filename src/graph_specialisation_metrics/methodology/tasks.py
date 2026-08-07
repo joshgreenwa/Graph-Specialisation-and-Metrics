@@ -22,10 +22,18 @@ FIXED_SUPPORT_FIELDS = (
     "y",
 )
 
-ZINC_FROZEN_KHOP_SUPPORT_TASKS = frozenset(
-    {"zinc_2hop", "zinc_1hop_vnode", "zinc_2hop_vnode"}
-)
+ZINC_FROZEN_KHOP_SUPPORT_TASKS = frozenset({"zinc_2hop", "zinc_1hop_vnode", "zinc_2hop_vnode"})
 ZINC_FROZEN_KHOP_ADAPTER_VERSION = "canonical-grit-zinc-frozen-khop-support-v2"
+QM9_FROZEN_KHOP_SUPPORT_TASKS = frozenset(
+    {
+        "qm9_gap_1hop",
+        "qm9_gap_1hop_local",
+        "qm9_gap_2hop",
+        "qm9_gap_1hop_vnode",
+        "qm9_gap_2hop_vnode",
+    }
+)
+QM9_DENSE_ADAPTER_VERSION = "canonical-grit-qm9-dense-full-support-v2"
 
 
 def _mae_per_graph(prediction, target):
@@ -186,17 +194,12 @@ def register(task: CanonicalTask) -> CanonicalTask:
     if task.name in TASKS:
         raise ValueError(f"canonical task {task.name!r} is already registered")
     if not callable(task.metric_fn):
-        raise ValueError(
-            f"canonical task {task.name!r} must register a callable dataset metric"
-        )
+        raise ValueError(f"canonical task {task.name!r} must register a callable dataset metric")
     if not callable(task.loss_per_graph):
-        raise ValueError(
-            f"canonical task {task.name!r} must register a callable per-graph loss"
-        )
+        raise ValueError(f"canonical task {task.name!r} must register a callable per-graph loss")
     if task.raw_score_system not in {"mass", "coherent"}:
         raise ValueError(
-            f"canonical task {task.name!r} has unknown raw score system "
-            f"{task.raw_score_system!r}"
+            f"canonical task {task.name!r} has unknown raw score system {task.raw_score_system!r}"
         )
     TASKS[task.name] = task
     return task
@@ -224,14 +227,11 @@ def _known_grit_task(name: str) -> CanonicalTask:
         loss_per_graph=loss,
         fixed_support_fields=(
             FIXED_SUPPORT_FIELDS
+            + (("pos",) if name.startswith("qm9_") else ())
             + (
-                ("pos", "rrwp_attention_edge_index")
-                if name.startswith("qm9_")
-                else (
-                    ("rrwp_attention_edge_index",)
-                    if name in ZINC_FROZEN_KHOP_SUPPORT_TASKS
-                    else ()
-                )
+                ("rrwp_attention_edge_index",)
+                if name in QM9_FROZEN_KHOP_SUPPORT_TASKS or name in ZINC_FROZEN_KHOP_SUPPORT_TASKS
+                else ()
             )
         ),
         virtual_node=virtual,
@@ -239,7 +239,7 @@ def _known_grit_task(name: str) -> CanonicalTask:
         adapter_version=(
             ZINC_FROZEN_KHOP_ADAPTER_VERSION
             if name in ZINC_FROZEN_KHOP_SUPPORT_TASKS
-            else "canonical-grit-v1"
+            else (QM9_DENSE_ADAPTER_VERSION if name == "qm9_gap_dense" else "canonical-grit-v1")
         ),
     )
 
@@ -347,9 +347,7 @@ for _name, _title, _task_type, _metric in (
             pair_structural_fields=(),
             dense_pair_structural_fields=("rrwp",),
             fixed_support_fields=("edge_index", "target", "spd", "rwse"),
-            carrier_policy=(
-                "readout_edges" if _task_type == "edge_binary" else "real_nodes"
-            ),
+            carrier_policy=("readout_edges" if _task_type == "edge_binary" else "real_nodes"),
             adapter_version="graphbench-official-grit-complete-pe-coherent-v2",
             paired_channel_sources=False,
             semantic_source_kind="edge",
@@ -366,9 +364,11 @@ def get_task(name: str, overrides: Mapping[str, Any] | None = None) -> Canonical
     task = TASKS[name]
     if not overrides:
         return task
-    allowed = {
-        field.name for field in task.__dataclass_fields__.values()
-    } - {"name", "backend_kind", "spec"}
+    allowed = {field.name for field in task.__dataclass_fields__.values()} - {
+        "name",
+        "backend_kind",
+        "spec",
+    }
     unknown = sorted(set(overrides) - allowed)
     if unknown:
         raise ValueError(f"unknown task override fields for {name!r}: {unknown}")

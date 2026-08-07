@@ -131,9 +131,7 @@ def graph(rows, edges):
 def structural_graph():
     n = 3
     rrwp_index = torch.cartesian_prod(torch.arange(n), torch.arange(n)).t()
-    rrwp_val = (
-        torch.arange(n * n, dtype=torch.float32).reshape(n * n, 1)
-    )
+    rrwp_val = torch.arange(n * n, dtype=torch.float32).reshape(n * n, 1)
     return FakeData(
         x=torch.tensor([[1], [2], [3]], dtype=torch.long),
         y=torch.tensor([[0.5]]),
@@ -180,9 +178,7 @@ def test_task_specific_seed_labels_support_mixed_backends():
     config.validate()
     assert config.seeds_for("zinc") == (42, 43)
     assert config.seeds_for("graphormer_pcqm4mv2") == (0,)
-    assert config.scientific_record["task_train_seeds"] == {
-        "graphormer_pcqm4mv2": [0]
-    }
+    assert config.scientific_record["task_train_seeds"] == {"graphormer_pcqm4mv2": [0]}
 
 
 def test_run_summary_handles_an_omitted_causal_phase(tmp_path):
@@ -223,9 +219,7 @@ def test_run_summary_handles_an_omitted_causal_phase(tmp_path):
         {f"{task}:seed42": []},
     )
 
-    assert population[task]["regime_calls"] == [
-        {"seed": 42, "regime": "not_available"}
-    ]
+    assert population[task]["regime_calls"] == [{"seed": 42, "regime": "not_available"}]
     assert (tmp_path / task / "population.json").exists()
     assert (tmp_path / "index.json").exists()
 
@@ -296,9 +290,7 @@ def test_numerical_audits_are_soft_by_default_and_strict_on_request():
     assert config.strict_audits is False
     # Execution policy must not enter the cache/protocol fingerprint.
     assert config.fingerprint == dataclasses.replace(config, strict_audits=True).fingerprint
-    faster = dataclasses.replace(
-        config, execution=ExecutionPolicy(graphs_per_batch=16)
-    )
+    faster = dataclasses.replace(config, execution=ExecutionPolicy(graphs_per_batch=16))
     assert config.fingerprint == faster.fingerprint
     assert config.record()["execution"] == {
         "graphs_per_batch": 4,
@@ -379,9 +371,7 @@ def test_graph_batch_executor_does_not_hide_non_oom_errors():
         execute_graph_batches(
             [1, 2],
             graphs_per_batch=2,
-            execute=lambda _chunk: (_ for _ in ()).throw(
-                RuntimeError("scientific failure")
-            ),
+            execute=lambda _chunk: (_ for _ in ()).throw(RuntimeError("scientific failure")),
             consume=lambda _result: None,
             oom_backoff=True,
         )
@@ -401,9 +391,7 @@ def test_grit_grouped_capture_matches_individual_variable_size_groups():
         L = H = dh = dim_h = 1
 
         def __init__(self):
-            self.model = SimpleNamespace(
-                model=SimpleNamespace(layers=Layers())
-            )
+            self.model = SimpleNamespace(model=SimpleNamespace(layers=Layers()))
 
         def capture(
             self,
@@ -445,9 +433,7 @@ def test_grit_grouped_capture_matches_individual_variable_size_groups():
         [data([1, 2], 1), data([3, 4], 1)],
         [data([5, 6, 7], 2), data([8, 9, 10], 2)],
     ]
-    individual = [
-        backend.capture(group, require_grad=False) for group in groups
-    ]
+    individual = [backend.capture(group, require_grad=False) for group in groups]
     grouped = backend.capture_groups(groups)
 
     assert len(grouped) == len(individual) == 2
@@ -461,9 +447,7 @@ def test_grit_grouped_capture_matches_individual_variable_size_groups():
         backend.clean_jacobians(groups[0][0]),
         backend.clean_jacobians(groups[1][0]),
     ]
-    clean_grouped = backend.clean_jacobians_many(
-        [groups[0][0], groups[1][0]]
-    )
+    clean_grouped = backend.clean_jacobians_many([groups[0][0], groups[1][0]])
     for observed, expected in zip(clean_grouped, clean_individual):
         assert torch.equal(observed.capture.prediction, expected.capture.prediction)
         assert torch.equal(observed.capture.final_state, expected.capture.final_state)
@@ -485,14 +469,10 @@ def test_clean_ablation_reuses_clean_captures_and_batches_each_target(monkeypatc
         def ablate(self, data_list, family):
             if not family:
                 self.clean_batch_sizes.append(len(data_list))
-                prediction = torch.tensor(
-                    [[float(data.value)] for data in data_list]
-                )
+                prediction = torch.tensor([[float(data.value)] for data in data_list])
                 return prediction, prediction, torch.zeros_like(prediction)
             self.ablation_batch_sizes.append(len(data_list))
-            prediction = torch.tensor(
-                [[float(data.value) + 1.0] for data in data_list]
-            )
+            prediction = torch.tensor([[float(data.value) + 1.0] for data in data_list])
             return prediction, prediction, torch.zeros_like(prediction)
 
         @staticmethod
@@ -510,9 +490,7 @@ def test_clean_ablation_reuses_clean_captures_and_batches_each_target(monkeypatc
         ),
         splits=SimpleNamespace(clean_ablation=(0, 1, 2)),
         task=SimpleNamespace(
-            metric_fn=lambda prediction, truth: float(
-                np.mean(np.abs(prediction - truth))
-            )
+            metric_fn=lambda prediction, truth: float(np.mean(np.abs(prediction - truth)))
         ),
     )
     config = SimpleNamespace(
@@ -558,9 +536,7 @@ def test_event_normalised_carriage_is_donorwise_and_bin_additive():
     normalised, metadata = _event_normalised_carriage_rows(rows, config)
 
     first_event = normalised[:5]
-    assert [row["F_sens_event_normalised"] for row in first_event] == pytest.approx(
-        [0.2] * 5
-    )
+    assert [row["F_sens_event_normalised"] for row in first_event] == pytest.approx([0.2] * 5)
     assert [row["B_event_normalised"] for row in first_event] == pytest.approx(
         [-0.25, 0.75, 0.0, 0.0, 0.0]
     )
@@ -619,9 +595,7 @@ def test_empty_replicates_are_missing_not_zero_in_the_interval():
 def test_statistic_caption_reports_rho_with_its_interval_and_permutation_p():
     from graph_specialisation_metrics.methodology.figures import statistic_caption
 
-    caption = statistic_caption(
-        {"rho": 0.8271, "low": 0.74, "high": 0.89, "p": 0.0004, "n": 80}
-    )
+    caption = statistic_caption({"rho": 0.8271, "low": 0.74, "high": 0.89, "p": 0.0004, "n": 80})
     assert caption == "ρ = 0.83 [0.74, 0.89], p < 0.001, n = 80"
     # The permutation floor is 1/(replicates + 1), so an exact p is never claimed below it.
     assert "p < 0.001" in statistic_caption({"rho": 0.5, "p": 0.0})
@@ -672,9 +646,9 @@ def test_saved_figures_keep_content_drawn_outside_the_axes(tmp_path):
     assert b"/Subtype /Type3" not in pdf_bytes
     assert b"/CIDFontType2" in pdf_bytes
     assert b"/FontFile2" in pdf_bytes
-    export_metadata = json.loads(
-        (tmp_path / "controls.metadata.json").read_text(encoding="utf-8")
-    )["pdf_export"]
+    export_metadata = json.loads((tmp_path / "controls.metadata.json").read_text(encoding="utf-8"))[
+        "pdf_export"
+    ]
     assert export_metadata["vector_first"] is True
     assert export_metadata["raster_fallback_dpi"] == 1200
     png = next(path for path in paths if path.suffix == ".png")
@@ -806,9 +780,7 @@ def test_events_without_an_admissible_mismatch_control_are_excluded():
 
     # Distinct payloads but no shared tier: the tier is relaxed, the event is still controlled.
     with audit_scope("mismatch-relaxed") as scope:
-        indices, excluded = _mismatch_indices(
-            [event(0, 0, b"a", 1), event(1, 0, b"c", 2)]
-        )
+        indices, excluded = _mismatch_indices([event(0, 0, b"a", 1), event(1, 0, b"c", 2)])
     assert indices == [1, 0]
     assert excluded == set()
     assert [row["name"] for row in scope.records()] == ["causal.mismatch_control_relaxed"]
@@ -817,9 +789,7 @@ def test_events_without_an_admissible_mismatch_control_are_excluded():
     with audit_scope("mismatch-none") as scope:
         _, excluded = _mismatch_indices([records[0], event(0, 1, b"a", 1)])
     assert excluded == {0, 1}
-    assert [row["name"] for row in scope.records()] == [
-        "causal.mismatch_control_unavailable"
-    ]
+    assert [row["name"] for row in scope.records()] == ["causal.mismatch_control_unavailable"]
 
 
 def test_soft_audit_keeps_a_broken_reconstruction_running():
@@ -863,20 +833,14 @@ def test_registered_grit_geometry_covers_dense_local_khop_and_vnode():
     assert not TASKS["zinc"].virtual_node
     assert not TASKS["zinc_2hop"].virtual_node
     assert TASKS["zinc_1hop_vnode"].virtual_node
-    assert TASKS["zinc_2hop_vnode"].carrier_policy == (
-        "real_nodes_plus_internal_vnode"
-    )
+    assert TASKS["zinc_2hop_vnode"].carrier_policy == ("real_nodes_plus_internal_vnode")
     assert not TASKS["qm9_gap_1hop_local"].virtual_node
     assert TASKS["qm9_gap_1hop_vnode"].virtual_node
-    assert TASKS["qm9_gap_2hop_vnode"].carrier_policy == (
-        "real_nodes_plus_internal_vnode"
-    )
+    assert TASKS["qm9_gap_2hop_vnode"].carrier_policy == ("real_nodes_plus_internal_vnode")
 
 
 def test_output_geometry_uses_fixed_z_space_and_training_only_std():
-    regression = OutputGeometry(
-        "evaluation_regression", None, "training_target_std"
-    )
+    regression = OutputGeometry("evaluation_regression", None, "training_target_std")
     targets = np.asarray([[1.0, 10.0], [3.0, 14.0]])
     sigma = regression.resolve(2, training_targets=targets)
     assert np.allclose(sigma, [1.0, 2.0])
@@ -932,9 +896,7 @@ def test_structural_donor_law_minimum_gap_with_replacement():
 def test_structural_swap_matches_dense_row_column_self_and_fixed_support():
     task = get_task("zinc")
     base = structural_graph()
-    event = structural_donor_swap(
-        base, 0, 2, task=task, duplicate_tolerance=1e-7
-    )
+    event = structural_donor_swap(base, 0, 2, task=task, duplicate_tolerance=1e-7)
     dense = torch.zeros(3, 3)
     dense[base.rrwp_index[0], base.rrwp_index[1]] = base.rrwp_val[:, 0]
     changed = torch.zeros(3, 3)
@@ -987,12 +949,29 @@ def test_qm9_frozen_attention_support_is_registered_and_preserved():
     assert torch.equal(event.pos, base.pos)
 
 
+def test_qm9_dense_uses_full_support_without_a_sparse_support_tensor():
+    task = get_task("qm9_gap_dense")
+    base = structural_graph()
+    base.pos = torch.arange(9, dtype=torch.float32).reshape(3, 3)
+
+    event = structural_donor_swap(
+        base,
+        0,
+        2,
+        task=task,
+        duplicate_tolerance=1e-7,
+    )
+
+    assert "rrwp_attention_edge_index" not in task.fixed_support_fields
+    assert task.adapter_version == "canonical-grit-qm9-dense-full-support-v2"
+    assert torch.equal(event.pos, base.pos)
+    assert torch.equal(event.edge_index, base.edge_index)
+
+
 def test_sparse_duplicates_agree_or_abort():
     index = torch.tensor([[0, 0, 1], [1, 1, 0]])
     value = torch.tensor([[2.0], [2.0 + 1e-9], [3.0]])
-    new_index, new_value = coalesce_equal_sparse(
-        index, value, num_nodes=2, tolerance=1e-7
-    )
+    new_index, new_value = coalesce_equal_sparse(index, value, num_nodes=2, tolerance=1e-7)
     assert new_index.shape[1] == 2
     with pytest.raises(StructuralAuditError, match="conflicting duplicate"):
         coalesce_equal_sparse(
@@ -1008,9 +987,7 @@ def test_unknown_structural_field_is_fatal():
     base = structural_graph()
     base.lap_pe = torch.ones(3, 2)
     with pytest.raises(StructuralAuditError, match="not registered"):
-        structural_donor_swap(
-            base, 0, 2, task=task, duplicate_tolerance=1e-7
-        )
+        structural_donor_swap(base, 0, 2, task=task, duplicate_tolerance=1e-7)
 
 
 def test_transport_projection_event_norm_and_hierarchical_aggregation():
@@ -1062,9 +1039,9 @@ def test_threshold_specialists_exclude_generalists_and_match_j_within_seed():
     assert result["j_matching"]["matched_pair_count"] == 1
     assert result["j_matching"]["pairs"][0]["semantic"] == (0, 3)
     assert result["j_matching"]["pairs"][0]["structural"] == (0, 0)
-    assert result["strength_ranking"]["semantic_candidates"][0][
-        "absolute_D_rel"
-    ] == pytest.approx(0.50)
+    assert result["strength_ranking"]["semantic_candidates"][0]["absolute_D_rel"] == pytest.approx(
+        0.50
+    )
     assert result["candidate_analysis"]["status"] == "not_estimable"
     assert result["confirmed_95_robustness"]["status"] == "available"
 
@@ -1097,24 +1074,26 @@ def test_threshold_specialist_matching_does_not_require_the_same_layer():
 
 def test_strongest_candidate_fallback_keeps_top_six_without_95pct_confirmation():
     selectivity = np.asarray(
-        [[
-            -0.80,
-            -0.70,
-            -0.60,
-            -0.50,
-            -0.40,
-            -0.30,
-            -0.20,
-            -0.15,
-            0.15,
-            0.20,
-            0.30,
-            0.40,
-            0.50,
-            0.60,
-            0.70,
-            0.80,
-        ]]
+        [
+            [
+                -0.80,
+                -0.70,
+                -0.60,
+                -0.50,
+                -0.40,
+                -0.30,
+                -0.20,
+                -0.15,
+                0.15,
+                0.20,
+                0.30,
+                0.40,
+                0.50,
+                0.60,
+                0.70,
+                0.80,
+            ]
+        ]
     )
     coordinates = head_coordinates(
         1.0 + selectivity,
@@ -1170,9 +1149,7 @@ def test_head_coordinates_use_within_model_means_and_gate_only_selectivity():
     )
     assert result.semantic_mean == 2.0
     assert result.structural_mean == 3.0
-    assert np.allclose(result.joint_sensitivity, 0.5 * (
-        semantic / 2.0 + structural / 3.0
-    ))
+    assert np.allclose(result.joint_sensitivity, 0.5 * (semantic / 2.0 + structural / 3.0))
     assert result.joint_sensitivity.shape == result.active.shape
 
 
@@ -1212,18 +1189,9 @@ def test_discovery_diagnostics_can_confirm_a_narrow_generalist_regime():
 
 
 def test_equivalence_requires_interval_containment_not_failure_to_reject_zero():
-    assert (
-        equivalence_decision(0.01, -0.08, 0.09, half_width=0.1)
-        == "equivalent"
-    )
-    assert (
-        equivalence_decision(0.01, -0.08, 0.18, half_width=0.1)
-        == "unresolved"
-    )
-    assert (
-        equivalence_decision(0.35, 0.22, 0.48, half_width=0.1)
-        == "specialised"
-    )
+    assert equivalence_decision(0.01, -0.08, 0.09, half_width=0.1) == "equivalent"
+    assert equivalence_decision(0.01, -0.08, 0.18, half_width=0.1) == "unresolved"
+    assert equivalence_decision(0.35, 0.22, 0.48, half_width=0.1) == "specialised"
 
 
 def test_causal_bootstrap_jointly_estimates_family_interactions(monkeypatch):
@@ -1284,10 +1252,7 @@ def test_causal_bootstrap_jointly_estimates_family_interactions(monkeypatch):
         return {"graph": 0, "source": 0, "donor": 0, **values}
 
     records = {
-        target: {
-            channel: [endpoint_row(target, channel)]
-            for channel in ("semantic", "structural")
-        }
+        target: {channel: [endpoint_row(target, channel)] for channel in ("semantic", "structural")}
         for target in targets
     }
 
@@ -1339,13 +1304,9 @@ def test_distance_accounting_reconstructs_and_divides_inside_graph():
     q = torch.tensor([[[[[3.0], [4.0]]]]])  # [E,L,H,N,T]
     axis = DistanceAxis((0, 1))
     contribution, support = distance_event_contributions(q, [0, 1], axis)
-    graph_c, graph_o = aggregate_distance_events(
-        contribution, support, [9], [2]
-    )
+    graph_c, graph_o = aggregate_distance_events(contribution, support, [9], [2])
     score = {9: np.array([[7.0]])}
-    result = score_heatmaps(
-        graph_c, graph_o, reconstruction_tolerance=1e-8, graph_scores=score
-    )
+    result = score_heatmaps(graph_c, graph_o, reconstruction_tolerance=1e-8, graph_scores=score)
     assert np.allclose(result.exact, [[3.0, 4.0]])
     assert np.allclose(result.per_opportunity, [[3.0, 4.0]])
     # The head-resolved arrays the figures display are what the aggregate views sum over heads.
@@ -1380,9 +1341,7 @@ def test_row_normalisation_uses_the_full_axis_and_keeps_empty_rows_missing():
 
 def test_distance_heatmaps_put_layer_zero_at_the_top_of_head_blocks():
     values = np.arange(2 * 3 * 4, dtype=np.float64).reshape(2, 3, 4)
-    fig, axes = distance_heatmaps(
-        values, values, [0, 1, 2, 3], channel="semantic", title="task"
-    )
+    fig, axes = distance_heatmaps(values, values, [0, 1, 2, 3], channel="semantic", title="task")
     try:
         # One row per head, blocked by layer.
         assert axes[0].get_images()[0].get_array().shape == (6, 4)
@@ -1407,9 +1366,7 @@ def test_distance_heatmaps_put_layer_zero_at_the_top_of_head_blocks():
         plt.close(fig)
 
     with pytest.raises(ValueError, match=r"\[layer,head,distance\]"):
-        distance_heatmaps(
-            values.sum(axis=1), values.sum(axis=1), [0, 1, 2, 3], channel="semantic"
-        )
+        distance_heatmaps(values.sum(axis=1), values.sum(axis=1), [0, 1, 2, 3], channel="semantic")
 
 
 def test_functional_carriage_takes_event_norm_before_donor_mean():
@@ -1526,9 +1483,7 @@ def test_repository_commit_is_provenance_not_cache_validity(tmp_path):
     path = original.save("causal", "validation", {"complete": True})
     original_bytes = path.read_bytes()
 
-    updated_checkout = CanonicalCache(
-        tmp_path, contract(repository_commit="commit-b")
-    )
+    updated_checkout = CanonicalCache(tmp_path, contract(repository_commit="commit-b"))
     assert updated_checkout.contract.fingerprint == original.contract.fingerprint
     assert updated_checkout.load("causal", "validation") == {"complete": True}
     assert path.read_bytes() == original_bytes
@@ -1547,15 +1502,9 @@ def test_resumable_cache_archives_mismatch_then_recomputes(tmp_path):
     assert resumed.load("scores/semantic", "graph_000032") is None
     assert not path.exists()
     archived = list(
-        (
-            tmp_path
-            / "zinc"
-            / "seed_42"
-            / "cache"
-            / "_stale"
-            / "scores"
-            / "semantic"
-        ).glob("graph_000032.stale-*.pt")
+        (tmp_path / "zinc" / "seed_42" / "cache" / "_stale" / "scores" / "semantic").glob(
+            "graph_000032.stale-*.pt"
+        )
     )
     assert len(archived) == 1
     assert archived[0].read_bytes() == original_bytes
@@ -1568,15 +1517,11 @@ def test_cache_accepts_legacy_commit_bound_fingerprint(tmp_path):
     cache = CanonicalCache(tmp_path, contract(repository_commit="commit-a"))
     path = cache.save("scores", "raw", {"legacy": True})
     payload = torch.load(path, map_location="cpu", weights_only=False)
-    payload["metadata"]["contract_fingerprint"] = stable_hash(
-        payload["metadata"]["contract"]
-    )
+    payload["metadata"]["contract_fingerprint"] = stable_hash(payload["metadata"]["contract"])
     payload["metadata"].pop("provenance_fingerprint")
     torch.save(payload, path)
 
-    other_checkout = CanonicalCache(
-        tmp_path, contract(repository_commit="commit-b")
-    )
+    other_checkout = CanonicalCache(tmp_path, contract(repository_commit="commit-b"))
     assert other_checkout.load("scores", "raw") == {"legacy": True}
 
 
@@ -1622,9 +1567,7 @@ def test_modular_causal_and_distance_figure_components_render():
         "necessity",
     )
     values = {key: np.ones((2, 2)) for key in keys}
-    intervals = {
-        key: (np.full((2, 2), 0.5), np.full((2, 2), 1.5)) for key in keys
-    }
+    intervals = {key: (np.full((2, 2), 0.5), np.full((2, 2), 1.5)) for key in keys}
     fig, _ = causal_family_panels(
         ("semantic_leaning", "structural_leaning"),
         values,
@@ -1765,9 +1708,7 @@ def test_modular_causal_and_distance_figure_components_render():
     assert np.asarray(axes).shape == (2, 2)
     fig.canvas.draw()
     fig.clf()
-    fig, _ = attention_distance_profiles(
-        (0, 1), {"semantic_leaning": [0.7, 0.3]}
-    )
+    fig, _ = attention_distance_profiles((0, 1), {"semantic_leaning": [0.7, 0.3]})
     fig.clf()
     fig, _ = distance_support_profile(
         (0, 1, 2, "unreachable"),
