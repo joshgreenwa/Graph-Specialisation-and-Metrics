@@ -1389,10 +1389,15 @@ def test_attention_grid_matches_four_row_graphormer_publication_contract(
             molecule_attention_cmaps.append(cmap.name) or blank_molecule
         ),
     )
+    node_count = 24
     examples = [
         {
             "dataset_index": index,
-            "attention": {"semantic": np.full((3, 3), 1.0 / 3.0)},
+            "attention": {
+                "semantic": np.full(
+                    (node_count, node_count), 1.0 / node_count
+                )
+            },
         }
         for index in range(4)
     ]
@@ -1445,6 +1450,14 @@ def test_attention_grid_matches_four_row_graphormer_publication_contract(
         )
         assert all(axis.xaxis.label.get_fontsize() == 20 for axis in matrix_axes)
         assert all(axis.yaxis.label.get_fontsize() == 20 for axis in matrix_axes)
+        for axis in matrix_axes:
+            x_ticks = axis.get_xticks()
+            y_ticks = axis.get_yticks()
+            np.testing.assert_array_equal(x_ticks, y_ticks)
+            assert len(x_ticks) <= 10
+            assert len(x_ticks) < node_count
+            assert x_ticks[0] == 0
+            assert x_ticks[-1] == node_count - 1
         colorbar_axis = figure.axes[-1]
         assert colorbar_axis.xaxis.label.get_fontsize() == 25
         assert all(
@@ -2014,44 +2027,27 @@ def test_colab_notebook_has_valid_python_cells():
         configuration,
     )
     attention_indices = configuration["ATTENTION_GRID_GRAPH_INDICES"]
+    assert configuration["SEMANTIC_HEAD_OVERRIDES"] == {
+        **{task_name: None for task_name in SUPPORTED_GRIT_FIGURE_TASKS},
+        "zinc": (9, 1),
+        "qm9_gap_dense": (9, 4),
+    }
+    assert configuration["STRUCTURAL_HEAD_OVERRIDES"] == {
+        **{task_name: None for task_name in SUPPORTED_GRIT_FIGURE_TASKS},
+        "zinc": (1, 7),
+        "qm9_gap_dense": (2, 3),
+    }
     zinc_union = [100, 200, 750, 80, 120, 160, 0, 220]
     qm9_union = [
-        0,
-        5,
         80,
-        160,
-        240,
         320,
-        400,
-        480,
         560,
-        640,
-        720,
-        800,
-        16,
-        64,
         112,
         208,
-        304,
-        416,
-        512,
         608,
-        704,
-        816,
-        912,
-        1008,
         24,
         72,
         120,
-        216,
-        312,
-        408,
-        504,
-        600,
-        696,
-        792,
-        888,
-        984,
     ]
     expected_unions = {
         **{task_name: zinc_union for task_name in ZINC_FIGURE_TASKS},
@@ -2122,6 +2118,9 @@ def test_colab_notebook_has_valid_python_cells():
         '#[0, 5, 80, 120, 160, 220, 260, 340], #0, 80, 220,'
         in source
     )
+    assert '"semantic": [80, 320, 560]' in source
+    assert '"structural": [112, 208, 608]' in source
+    assert '"generalist": [24, 72, 120]' in source
     assert 'ATTENTION_FAMILIES = ("semantic", "structural", "generalist")' in source
     assert "def attention_role_family(role):" in source
     assert "Edit semantic, structural, and generalist rows independently" in source

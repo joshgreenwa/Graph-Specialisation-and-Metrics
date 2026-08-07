@@ -44,6 +44,7 @@ MOLECULE_ATOM_FONT_SIZE = 55
 # Backwards-compatible name retained for existing figure metadata consumers.
 MOLECULE_DRAW_DPI = MOLECULE_RENDER_DPI
 CORE_SCATTER_FIGSIZE = (8.0, 5.9)
+ATTENTION_MATRIX_MAX_TICK_LABELS = 10
 HEAD_STYLES = {
     "semantic": {"color": GOLD, "label": "Semantic specialist"},
     "structural": {"color": TEAL, "label": "Structural specialist"},
@@ -445,6 +446,18 @@ def _node_conditioned_attention(attention: np.ndarray) -> np.ndarray:
     return attention / denominator
 
 
+def _attention_matrix_tick_indices(num_nodes: int) -> np.ndarray:
+    """Return readable node-index ticks, including both matrix endpoints."""
+
+    num_nodes = int(num_nodes)
+    if num_nodes < 1:
+        raise ValueError("an attention matrix must contain at least one node")
+    tick_count = min(num_nodes, ATTENTION_MATRIX_MAX_TICK_LABELS)
+    return np.rint(
+        np.linspace(0, num_nodes - 1, num=tick_count)
+    ).astype(int)
+
+
 def _molecule_from_example(example: Mapping[str, Any]):
     from rdkit import Chem, rdBase
 
@@ -687,8 +700,9 @@ def plot_attention_grid(
         )
         axes[row, 2].set_xlabel("Key atom", fontsize=20)
         axes[row, 2].set_ylabel("Query atom", fontsize=20)
-        axes[row, 2].set_xticks(np.arange(matrix.shape[0]))
-        axes[row, 2].set_yticks(np.arange(matrix.shape[0]))
+        tick_indices = _attention_matrix_tick_indices(matrix.shape[0])
+        axes[row, 2].set_xticks(tick_indices)
+        axes[row, 2].set_yticks(tick_indices)
         axes[row, 2].tick_params(labelsize=10, length=2.5)
 
     for column, label in enumerate(
