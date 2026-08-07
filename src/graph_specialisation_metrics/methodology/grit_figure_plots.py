@@ -558,6 +558,7 @@ def plot_attention_grid(
     net_d_rel: float,
     net_joint_sensitivity: float,
     title_label: str | None = None,
+    distance_profiles: Mapping[str, Any] | None = None,
 ):
     """GRIT attention views with aggregate and graph-local coordinates."""
 
@@ -577,8 +578,9 @@ def plot_attention_grid(
         max(float(np.nanpercentile(values, 99)), 1e-6) for values in inbound
     )
     num_rows = len(examples)
+    has_profiles = distance_profiles is not None
     fig = plt.figure(
-        figsize=(13.2, 2.35 + 2.75 * num_rows),
+        figsize=(13.2, 2.35 + 2.75 * num_rows + (2.1 if has_profiles else 0.0)),
         constrained_layout=False,
     )
     grid = fig.add_gridspec(
@@ -586,7 +588,7 @@ def plot_attention_grid(
         3,
         left=0.035,
         right=0.965,
-        bottom=0.15,
+        bottom=0.31 if has_profiles else 0.15,
         top=0.80,
         wspace=0.14,
         hspace=0.20,
@@ -672,17 +674,25 @@ def plot_attention_grid(
     style = HEAD_STYLES.get(role, {"label": role.replace("_", " ").title()})
     fig.text(
         0.5,
-        0.955,
-        f"{_payload_display_title(examples_payload)} — "
-        f"{title_label or style['label']} — {_head_label(head)}",
+        0.972,
+        _payload_display_title(examples_payload),
         ha="center",
         va="center",
-        fontsize=15.5,
+        fontsize=16.5,
         color=NAVY,
     )
     fig.text(
         0.5,
-        0.895,
+        0.930,
+        f"{title_label or style['label']} — {_head_label(head)}",
+        ha="center",
+        va="center",
+        fontsize=13.5,
+        color=NAVY,
+    )
+    fig.text(
+        0.5,
+        0.880,
         rf"Net: $D_{{\rm rel}} = {float(net_d_rel):+.3f};\quad "
         rf"J = {float(net_joint_sensitivity):.3f}$",
         ha="center",
@@ -691,6 +701,48 @@ def plot_attention_grid(
         color=NAVY,
     )
 
+    profile_axis = None
+    if distance_profiles is not None:
+        labels = tuple(str(label) for label in distance_profiles["labels"])
+        profile_axis = fig.add_axes([0.085, 0.045, 0.83, 0.125])
+        styles = (
+            ("semantic", "Semantic score", BLUE, "o"),
+            ("structural", "Structural score", ORANGE, "s"),
+            ("attention", "Attention mass", "#009E73", "^"),
+        )
+        x = np.arange(len(labels), dtype=np.float64)
+        maxima = []
+        for key, label, colour, marker in styles:
+            if key not in distance_profiles:
+                continue
+            values = np.asarray(distance_profiles[key], dtype=np.float64)
+            if values.shape != (len(labels),):
+                raise ValueError(
+                    f"{key} profile has shape {values.shape}; expected {(len(labels),)}"
+                )
+            maxima.append(float(np.nanmax(values)))
+            profile_axis.plot(
+                x,
+                values,
+                color=colour,
+                marker=marker,
+                linewidth=1.8,
+                markersize=5.5,
+                label=label,
+            )
+        profile_axis.set_xticks(x, [label.replace("_", " ") for label in labels])
+        profile_axis.set_xlabel("Graph distance")
+        profile_axis.set_ylabel("Normalised mass")
+        profile_axis.set_ylim(0.0, max(max(maxima, default=0.0) * 1.15, 0.05))
+        profile_axis.set_title(
+            "Head-level distance distributions (normalised separately)",
+            fontsize=11.5,
+            pad=5,
+        )
+        profile_axis.grid(axis="y")
+        profile_axis.set_axisbelow(True)
+        profile_axis.legend(loc="upper right", ncol=3, fontsize=9)
+
     # These panels use different normalisations: molecule colour represents
     # mean inbound attention, whereas the matrix is query-conditioned. Separate
     # compact colour bars keep that distinction explicit without shrinking the
@@ -698,11 +750,12 @@ def plot_attention_grid(
     fig.canvas.draw()
     inbound_position = axes[-1, 1].get_position()
     matrix_position = axes[-1, 2].get_position()
+    colorbar_y = 0.255 if profile_axis is not None else 0.055
     inbound_colorbar_axis = fig.add_axes(
-        [inbound_position.x0, 0.055, inbound_position.width, 0.018]
+        [inbound_position.x0, colorbar_y, inbound_position.width, 0.018]
     )
     matrix_colorbar_axis = fig.add_axes(
-        [matrix_position.x0, 0.055, matrix_position.width, 0.018]
+        [matrix_position.x0, colorbar_y, matrix_position.width, 0.018]
     )
     inbound_colorbar = fig.colorbar(
         plt.cm.ScalarMappable(

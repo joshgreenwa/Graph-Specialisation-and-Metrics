@@ -946,9 +946,53 @@ _FIGURE_IDENTITIES = {
         "dataset_label": "ZINC-subset",
         "model_label": "dense GRIT+RRWP",
     },
+    "zinc_1hop_local": {
+        "dataset_label": "ZINC-subset",
+        "model_label": "1-hop GRIT+RRWP (local RRWP)",
+    },
+    "zinc_1hop_localrrwp": {
+        "dataset_label": "ZINC-subset",
+        "model_label": "1-hop GRIT+RRWP (local RRWP)",
+    },
+    "zinc_1hop": {
+        "dataset_label": "ZINC-subset",
+        "model_label": "1-hop GRIT+RRWP (global RRWP)",
+    },
+    "zinc_1hop_vnode": {
+        "dataset_label": "ZINC-subset",
+        "model_label": "1-hop GRIT+RRWP + VNode",
+    },
+    "zinc_2hop": {
+        "dataset_label": "ZINC-subset",
+        "model_label": "2-hop GRIT+RRWP",
+    },
+    "zinc_2hop_vnode": {
+        "dataset_label": "ZINC-subset",
+        "model_label": "2-hop GRIT+RRWP + VNode",
+    },
     "qm9_gap_dense": {
         "dataset_label": "QM9 HOMO–LUMO gap",
         "model_label": "dense GRIT+RRWP",
+    },
+    "qm9_gap_1hop": {
+        "dataset_label": "QM9 HOMO–LUMO gap",
+        "model_label": "1-hop GRIT+RRWP (global RRWP)",
+    },
+    "qm9_gap_1hop_local": {
+        "dataset_label": "QM9 HOMO–LUMO gap",
+        "model_label": "1-hop GRIT+RRWP (local RRWP)",
+    },
+    "qm9_gap_2hop": {
+        "dataset_label": "QM9 HOMO–LUMO gap",
+        "model_label": "2-hop GRIT+RRWP",
+    },
+    "qm9_gap_1hop_vnode": {
+        "dataset_label": "QM9 HOMO–LUMO gap",
+        "model_label": "1-hop GRIT+RRWP + VNode",
+    },
+    "qm9_gap_2hop_vnode": {
+        "dataset_label": "QM9 HOMO–LUMO gap",
+        "model_label": "2-hop GRIT+RRWP + VNode",
     },
 }
 

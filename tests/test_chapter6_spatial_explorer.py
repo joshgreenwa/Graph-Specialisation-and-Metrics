@@ -382,4 +382,34 @@ def test_head_context_uses_permissive_protocol_runtime():
         encoding="utf-8"
     )
     assert "require_protocol_match=False" in source
+    assert "require_adapter_match=False" in source
     assert "semantic_attention_reach_gap" in source
+
+
+def test_head_context_extracts_normalised_score_and_attention_profiles():
+    from graph_specialisation_metrics.chapter6_head_context import (
+        _head_distance_profiles,
+    )
+
+    semantic = np.zeros((1, 1, 9), dtype=float)
+    structural = np.zeros_like(semantic)
+    attention = np.zeros_like(semantic)
+    semantic[0, 0, [0, 1, 8]] = [1.0, 2.0, 1.0]
+    structural[0, 0, [2, 4, 8]] = [2.0, 1.0, 1.0]
+    attention[0, 0, [1, 3, 8]] = [1.0, 1.0, 2.0]
+    result = _head_distance_profiles(
+        {
+            "axis": tuple(str(index) for index in range(9)),
+            "channels": {
+                "semantic": {"heatmap_exact_head": semantic},
+                "structural": {"heatmap_exact_head": structural},
+            },
+            "clean_attention_distance": attention,
+        },
+        (0, 0),
+    )
+    assert result["labels"] == ("0", "1", "2", "3", "4-7", "8+")
+    assert np.sum(result["semantic"]) == pytest.approx(1.0)
+    assert np.sum(result["structural"]) == pytest.approx(1.0)
+    assert np.sum(result["attention"]) == pytest.approx(1.0)
+    assert result["semantic"][-1] == pytest.approx(0.25)

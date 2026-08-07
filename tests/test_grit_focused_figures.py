@@ -342,6 +342,10 @@ def test_zinc_and_qm9_graphs_reconstruct_as_index_preserving_molecules():
     assert sparse_zinc_payload["smiles"] == "CCO"
     assert graph_node_labels("zinc_1hop_vnode", zinc) == ["C", "C", "O"]
     assert figure_identity("zinc_2hop")["dataset_label"] == "ZINC-subset"
+    assert figure_identity("zinc_2hop")["model_label"] == "2-hop GRIT+RRWP"
+    assert figure_identity("zinc_1hop_vnode")["display_title"] == (
+        "ZINC-subset — 1-hop GRIT+RRWP + VNode"
+    )
 
     qm9 = SimpleNamespace(
         x=np.asarray([[8], [1], [1]], dtype=np.int64),
@@ -420,11 +424,21 @@ def test_grit_plotting_api_accepts_synthetic_payloads():
         per_graph_coordinates={0: {"D_rel": 0.8, "J": 1.3}},
         net_d_rel=0.8,
         net_joint_sensitivity=1.3,
+        distance_profiles={
+            "labels": ("0", "1", "2"),
+            "semantic": np.asarray([0.2, 0.6, 0.2]),
+            "structural": np.asarray([0.4, 0.4, 0.2]),
+            "attention": np.asarray([0.1, 0.7, 0.2]),
+        },
     )
     attention_figure.canvas.draw()
     attention_panel_axes = attention_figure.axes[:3]
     assert all(axis.get_position().width > 0.15 for axis in attention_panel_axes)
     assert all(axis.get_position().height > 0.25 for axis in attention_panel_axes)
+    assert any(
+        axis.get_title().startswith("Head-level distance distributions")
+        for axis in attention_figure.axes
+    )
     figures.append(attention_figure)
     figures.append(
         plot_av_pca(

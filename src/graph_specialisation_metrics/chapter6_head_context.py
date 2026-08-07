@@ -8,6 +8,52 @@ from pathlib import Path
 from typing import Any
 
 
+def _normalise_profile(values: Any) -> Any:
+    import numpy as np
+
+    array = np.asarray(values, dtype=np.float64)
+    array = np.where(np.isfinite(array), np.maximum(array, 0.0), 0.0)
+    total = float(np.sum(array))
+    return array / total if total > 1.0e-12 else np.zeros_like(array)
+
+
+def _head_distance_profiles(
+    scores: Mapping[str, Any], head: tuple[int, int]
+) -> dict[str, Any]:
+    """Extract comparable score and attention distributions for one head."""
+
+    import numpy as np
+
+    from .zinc_cached_rrwp_comparison import group_distance
+
+    layer, index = (int(head[0]), int(head[1]))
+    axis = tuple(scores["axis"])
+    profiles: dict[str, Any] = {}
+    labels: tuple[str, ...] | None = None
+    for channel in ("semantic", "structural"):
+        exact = scores["channels"][channel]["heatmap_exact_head"]
+        if hasattr(exact, "detach"):
+            exact = exact.detach().cpu().numpy()
+        exact = np.asarray(exact, dtype=np.float64)
+        grouped_labels, grouped = group_distance(exact[layer, index], axis)
+        labels = grouped_labels if labels is None else labels
+        if grouped_labels != labels:
+            raise ValueError("semantic and structural distance axes do not agree")
+        profiles[channel] = _normalise_profile(grouped)
+    attention = scores.get("clean_attention_distance")
+    if attention is not None:
+        if hasattr(attention, "detach"):
+            attention = attention.detach().cpu().numpy()
+        attention = np.asarray(attention, dtype=np.float64)
+        grouped_labels, grouped = group_distance(attention[layer, index], axis)
+        if grouped_labels != labels:
+            raise ValueError("attention and score distance axes do not agree")
+        profiles["attention"] = _normalise_profile(grouped)
+    if labels is None:
+        raise ValueError("head score cache has no distance profiles")
+    return {"labels": labels, **profiles}
+
+
 def generate_head_context(
     model_artifacts: Sequence[Mapping[str, Any]],
     representative_rows: Sequence[Mapping[str, Any]],
@@ -30,6 +76,7 @@ def generate_head_context(
         SupplementalCache,
         build_verified_grit_figure_runtime,
         collect_attention_examples,
+        figure_identity,
         load_canonical_model_record,
         load_canonical_score_artifact,
         methodology_config_from_record,
@@ -147,9 +194,11 @@ def generate_head_context(
                     runtime_output_dir=cache_dir / task / "runtime",
                     # Canonical caches from earlier equivalent protocol records
                     # remain scientifically usable here. Checkpoint identity,
-                    # adapter version, model geometry, and parameter count are
-                    # still verified by the runtime builder.
+                    # model geometry and parameter count are still verified by
+                    # the runtime builder; the intervention is rebuilt under
+                    # the current adapter.
                     require_protocol_match=False,
+                    require_adapter_match=False,
                 )
                 return collect_attention_examples(
                     runtime,
@@ -186,6 +235,8 @@ def generate_head_context(
                 )
 
             row_by_role = {f"comparison_{index}": row for index, row in enumerate(rows)}
+            identity = figure_identity(task)
+            display_payload = {**dict(payload), **identity}
             task_record["stage"] = "render attention figures"
             for role, head in heads.items():
                 row = row_by_role[role]
@@ -207,13 +258,14 @@ def generate_head_context(
                         f"structural={float(row['raw_structural_score']):.3g}"
                     )
                 figure = plot_attention_grid(
-                    payload,
+                    display_payload,
                     role=role,
                     head=head,
                     per_graph_coordinates=None,
                     net_d_rel=float(row["selectivity"]),
                     net_joint_sensitivity=float(row["joint_sensitivity"]),
                     title_label=title,
+                    distance_profiles=_head_distance_profiles(artifact.value, head),
                 )
                 stem = (
                     f"{task}_{context_name}_{role}_layer_{head[0]}_head_{head[1]}"
@@ -237,6 +289,9 @@ def generate_head_context(
                         "task": task,
                         "context_name": context_name,
                         "artifact_task": artifact_task,
+                        "dataset_label": identity["dataset_label"],
+                        "model_label": identity["model_label"],
+                        "display_title": identity["display_title"],
                         "role": row["role"],
                         "head": list(head),
                         "overlap": float(row["overlap"]),
@@ -257,6 +312,8 @@ def generate_head_context(
                         "role": row["role"],
                         "layer": head[0],
                         "head": head[1],
+                        "model_label": identity["model_label"],
+                        "display_title": identity["display_title"],
                         "cache": str(cache_path),
                         **{key: str(path) for key, path in paths.items()},
                     }
