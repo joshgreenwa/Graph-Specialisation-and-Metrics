@@ -500,6 +500,7 @@ _RUNTIME_TASK_OVERRIDE_NAMES = {
     "metric_reproduction_tolerance",
     "analysis_split_limits",
     "eval_metric",
+    "disable_metric_abort_guard",
     "expected_grit_commit",
     "split_seed",
     "train_size",
@@ -642,6 +643,7 @@ def prepare_task(
         eval_split=str(task_overrides.get("eval_split", "test")),
         donor_split=str(task_overrides.get("donor_split", "train")),
         eval_metric=bool(task_overrides.get("eval_metric", True)),
+        disable_metric_abort_guard=bool(task_overrides.get("disable_metric_abort_guard", False)),
         analysis_seed=int(config.analysis_seed),
         donors=int(config.sizes.donors_per_source),
         content_adapter=spec.content_adapter,
@@ -728,6 +730,7 @@ def prepare_task(
         "test_metric": grit.test_metric,
         "validation_metric": grit.val_metric,
         "parameter_count": grit.checks.get("num_parameters"),
+        "checkpoint_metric_abort_guard": grit.checks.get("metric_abort_guard"),
         "canonical_audits": audit_checks,
         "runtime": {
             "platform": platform.platform(),

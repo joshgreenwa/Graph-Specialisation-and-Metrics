@@ -79,6 +79,26 @@ def _enable_grit_reregistration() -> None:
     enable_grit_reregistration()
 
 
+def _metric_abort_guard(task, test_metric: float, metric_name: str, *, disabled: bool) -> dict:
+    """Apply the final-model quality guard while permitting explicit trajectory analyses."""
+
+    record = {
+        "enabled": not bool(disabled),
+        "registered_threshold": float(task.metric_abort),
+    }
+    if disabled:
+        return record
+    bad = (test_metric < task.metric_abort) if task.metric_higher_better \
+        else (test_metric > task.metric_abort)
+    if bad:
+        arrow = "below" if task.metric_higher_better else "above"
+        raise RuntimeError(
+            f"Recomputed test {metric_name} {test_metric:.5f} is {arrow} the abort "
+            f"threshold {task.metric_abort}. The checkpoint almost certainly did "
+            f"not load correctly. Refusing to report specialisation scores.")
+    return record
+
+
 @dataclass
 class SpecConfig:
     """Everything the per-head analysis needs for one checkpoint (subset of CarriageConfig)."""
@@ -93,6 +113,9 @@ class SpecConfig:
     eval_split: str = "test"
     donor_split: str = "test"
     eval_metric: bool = True
+    # Early-training checkpoint trajectories retain metric recomputation but cannot use the
+    # final-model quality threshold as a load-failure guard.
+    disable_metric_abort_guard: bool = False
     allow_param_count_drift: bool = False
     tol: float = 1e-4
     float_noise_tol: float = 5e-3
@@ -261,14 +284,15 @@ class GritHeadModel:
             pm = f" (paper {self.task.paper_metric[0]} ~{self.task.paper_metric[1]})" if self.task.paper_metric else ""
             log(f"[verify] test {metric_name} recomputed from checkpoint: {test_metric:.5f}{pm} "
                 f"[{time.perf_counter()-t0:.1f}s]")
-            bad = (test_metric < self.task.metric_abort) if self.task.metric_higher_better \
-                else (test_metric > self.task.metric_abort)
-            if bad:
-                arrow = "below" if self.task.metric_higher_better else "above"
-                raise RuntimeError(
-                    f"Recomputed test {metric_name} {test_metric:.5f} is {arrow} the abort "
-                    f"threshold {self.task.metric_abort}. The checkpoint almost certainly did "
-                    f"not load correctly. Refusing to report specialisation scores.")
+            if sc.disable_metric_abort_guard:
+                log("[verify] final-model metric abort guard disabled by explicit analysis "
+                    "configuration; retaining recomputed metrics")
+            self.checks["metric_abort_guard"] = _metric_abort_guard(
+                self.task,
+                test_metric,
+                metric_name,
+                disabled=sc.disable_metric_abort_guard,
+            )
             self.test_metric = test_metric
             self.checks["test_metric"] = test_metric
             self.test_predictions = preds

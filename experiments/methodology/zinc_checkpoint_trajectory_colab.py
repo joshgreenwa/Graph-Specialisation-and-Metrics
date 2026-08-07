@@ -503,6 +503,9 @@ def build_epoch_config(
             record.task: {
                 "drive_dir": str(prepared.drive_folder / "runtime" / record.architecture),
                 "dataset_dir": str(prepared.dataset_root),
+                # Early checkpoints are expected to perform far below the final-model sanity
+                # threshold. Metrics are still recomputed and recorded; only that abort is off.
+                "disable_metric_abort_guard": True,
             }
         },
         skip_install=True,
@@ -610,6 +613,15 @@ def validate_score_output(
     metrics = np.asarray([model.get("validation_metric"), model.get("test_metric")], dtype=float)
     if not np.isfinite(metrics).all():
         raise RuntimeError("model sidecar has non-finite validation/test metrics")
+    guard = model.get("checkpoint_metric_abort_guard")
+    if (
+        not isinstance(guard, Mapping)
+        or guard.get("enabled") is not False
+        or not np.isfinite(float(guard.get("registered_threshold", np.nan)))
+    ):
+        raise RuntimeError(
+            "trajectory model did not explicitly disable only the metric abort guard"
+        )
     splits = model.get("splits")
     if not isinstance(splits, Mapping) or not isinstance(splits.get("discovery"), Sequence):
         raise TypeError("model sidecar has no discovery split")

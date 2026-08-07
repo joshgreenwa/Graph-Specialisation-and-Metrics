@@ -37,7 +37,10 @@ GPUs and run all cells:
 Each notebook defaults to `MODE="run"` and processes epochs 10, 100, 250, 500, 1000, and 1990
 sequentially. Every epoch has an isolated canonical scores cache under
 `score_trajectory_outputs/<architecture>/epoch_<epoch>/`; rerunning freshly validates and skips a
-complete epoch or resumes its atomic graph shards. No carriage is computed. After all six epochs,
+complete epoch or resumes its atomic graph shards. Because early checkpoints are intentionally
+low-quality, this workflow disables the final-model MAE abort threshold only; strict checkpoint
+loading, parameter-count checks, and recomputed validation/test MAE remain active and recorded.
+No carriage is computed. After all six epochs,
 the notebook validates the shared split/geometry contract and writes per-head violin plots, a long
 score table, a summary table, and a provenance manifest beneath
 `score_trajectory_plots/<architecture>/`. `MODE="plot"` rebuilds those outputs without loading any

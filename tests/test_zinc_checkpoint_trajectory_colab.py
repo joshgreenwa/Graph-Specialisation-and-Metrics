@@ -7,6 +7,7 @@ import json
 import sys
 import tarfile
 from pathlib import Path
+from types import SimpleNamespace
 
 import matplotlib
 import numpy as np
@@ -25,11 +26,22 @@ from graph_specialisation_metrics.methodology.cache import (
     checkpoint_sha256,
 )
 from graph_specialisation_metrics.methodology.tasks import get_task
+from graph_specialisation_metrics.specialisation.model import _metric_abort_guard
 
 NOTEBOOKS = {
     "dense": ROOT / "experiments" / "methodology" / "zinc_dense_checkpoint_trajectory_colab.ipynb",
     "1hop": ROOT / "experiments" / "methodology" / "zinc_1hop_checkpoint_trajectory_colab.ipynb",
 }
+
+
+def test_trajectory_can_disable_only_the_final_model_metric_abort_guard():
+    task = SimpleNamespace(metric_abort=0.15, metric_higher_better=False)
+
+    disabled = _metric_abort_guard(task, 0.52687, "mae", disabled=True)
+    assert disabled == {"enabled": False, "registered_threshold": 0.15}
+    with pytest.raises(RuntimeError, match="above the abort threshold 0.15"):
+        _metric_abort_guard(task, 0.52687, "mae", disabled=False)
+    assert _metric_abort_guard(task, 0.10, "mae", disabled=False)["enabled"] is True
 
 
 def _record(architecture: str, epoch: int, checkpoint: Path) -> trajectory.TrajectoryCheckpoint:
@@ -115,6 +127,10 @@ def test_epoch_configs_are_scores_only_isolated_and_stable_within_architecture(t
     assert all(config.execution.graphs_per_batch == 48 for config in dense_configs)
     assert all(config.sizes.discovery_graphs == 48 for config in dense_configs)
     assert all(config.sizes.bootstrap_replicates == 2_000 for config in dense_configs)
+    assert all(
+        config.task_overrides["zinc"]["disable_metric_abort_guard"] is True
+        for config in dense_configs
+    )
 
     one_hop = trajectory.build_epoch_config(
         prepared, prepared.records[("1hop", 10)], graphs_per_batch=48
@@ -122,6 +138,7 @@ def test_epoch_configs_are_scores_only_isolated_and_stable_within_architecture(t
     assert one_hop.fingerprint != dense_configs[0].fingerprint
     assert one_hop.tasks == ("zinc_1hop",)
     assert list(one_hop.checkpoints) == ["zinc_1hop:0"]
+    assert one_hop.task_overrides["zinc_1hop"]["disable_metric_abort_guard"] is True
 
 
 def _write_valid_score_worker(config, record: trajectory.TrajectoryCheckpoint) -> None:
@@ -173,6 +190,10 @@ def _write_valid_score_worker(config, record: trajectory.TrajectoryCheckpoint) -
             "validation_metric": 0.2,
             "test_metric": 0.3,
             "parameter_count": 123,
+            "checkpoint_metric_abort_guard": {
+                "enabled": False,
+                "registered_threshold": 0.15,
+            },
             "canonical_audits": {"failures": []},
         },
     )
