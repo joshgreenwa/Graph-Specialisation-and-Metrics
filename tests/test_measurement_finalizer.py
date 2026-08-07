@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import weakref
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -11,7 +12,12 @@ import numpy as np
 import pytest
 import torch
 
-from graph_specialisation_metrics.methodology import finalize_measurement_run
+from graph_specialisation_metrics.methodology import (
+    finalize_measurement_run,
+    get_task,
+    validate_measurement_worker,
+)
+from graph_specialisation_metrics.methodology import runner as runner_module
 from graph_specialisation_metrics.methodology.cache import (
     CacheContract,
     CanonicalCache,
@@ -34,7 +40,18 @@ def _measurement_config(
     task_count: int = 1,
     seeds: tuple[int, ...] = (0, 1, 2),
 ) -> MethodologyConfig:
-    tasks = tuple(f"measurement_task_{position}" for position in range(task_count))
+    tasks = (
+        "zinc",
+        "zinc_1hop",
+        "zinc_1hop_vnode",
+        "zinc_2hop",
+        "zinc_2hop_vnode",
+        "qm9_gap_dense",
+        "qm9_gap_1hop",
+        "qm9_gap_1hop_vnode",
+        "qm9_gap_2hop",
+        "qm9_gap_2hop_vnode",
+    )[:task_count]
     checkpoint_dir = root / "checkpoints"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     checkpoints = {}
@@ -72,6 +89,12 @@ def _write_worker(
     output_dir.mkdir(parents=True, exist_ok=True)
     checkpoint = Path(config.checkpoints[f"{task}:{seed}"])
     digest = checkpoint_sha256(checkpoint)
+    adapter_version = str(
+        config.task_overrides.get(task, {}).get(
+            "adapter_version",
+            get_task(task).adapter_version,
+        )
+    )
     geometry = {
         "layers": 1,
         "heads": 2,
@@ -107,7 +130,7 @@ def _write_worker(
             "train_seed": seed,
             "checkpoint": str(checkpoint),
             "checkpoint_sha256": digest,
-            "task_adapter_version": "test-adapter-v1",
+            "task_adapter_version": adapter_version,
             "output_representation": "scalar",
             "sigma": [1.0],
             "model_geometry": geometry,
@@ -135,7 +158,7 @@ def _write_worker(
     common_contract = {
         "protocol_fingerprint": config.fingerprint,
         "task": task,
-        "task_adapter_version": "test-adapter-v1",
+        "task_adapter_version": adapter_version,
         "checkpoint_sha256": digest,
         "train_seed": seed,
         "model_geometry": geometry,
@@ -192,8 +215,7 @@ def _write_worker(
         "protocol_version": PROTOCOL_VERSION,
         "manifest_hash": carriage_manifest,
         "channels": {
-            channel: {"graph_fields": graph_fields}
-            for channel in ("semantic", "structural")
+            channel: {"graph_fields": graph_fields} for channel in ("semantic", "structural")
         },
     }
     CanonicalCache(
@@ -217,6 +239,86 @@ def _write_complete_run(
             )
 
 
+def test_validate_measurement_worker_is_model_free_compact_and_releases_artifacts(
+    tmp_path,
+    monkeypatch,
+):
+    config = _measurement_config(tmp_path, seeds=(0,))
+    task = config.tasks[0]
+    _write_worker(config, task, 0)
+
+    def unexpected_model_load(*_args, **_kwargs):
+        raise AssertionError("worker validation must not prepare a model or dataset")
+
+    real_load = runner_module.load_cache_artifact_file
+    score_reference = {}
+
+    def tracked_load(path):
+        artifact = real_load(path)
+        if Path(path).parent.name == "scores":
+            score_reference["artifact"] = weakref.ref(artifact)
+        elif Path(path).parent.name == "carriage":
+            assert score_reference["artifact"]() is None
+        return artifact
+
+    monkeypatch.setattr(runner_module, "prepare_task", unexpected_model_load)
+    monkeypatch.setattr(runner_module, "load_cache_artifact_file", tracked_load)
+
+    result = validate_measurement_worker(config, task, 0)
+
+    assert result["task"] == task
+    assert result["seed"] == 0
+    assert result["carriage"] is None
+    assert result["causal"] is None
+    assert result["figures"] == {}
+    assert result["graph_counts"] == {
+        "expected": 2,
+        "scores_semantic": 2,
+        "scores_structural": 2,
+        "carriage_semantic": 2,
+        "carriage_structural": 2,
+    }
+    assert set(result["artifacts"]) == {"scores", "carriage"}
+    assert result["checkpoint_verification"]["status"] == "file_sha256_verified"
+    assert score_reference["artifact"]() is None
+
+
+def test_validate_measurement_worker_rejects_stale_current_adapter(
+    tmp_path,
+    monkeypatch,
+):
+    config = _measurement_config(tmp_path, seeds=(0,))
+    task = config.tasks[0]
+    _write_worker(config, task, 0)
+    original_get_task = runner_module.get_task
+
+    def revised_task(name, overrides=None):
+        return dataclasses.replace(
+            original_get_task(name, overrides),
+            adapter_version="adapter-revision-after-worker",
+        )
+
+    monkeypatch.setattr(runner_module, "get_task", revised_task)
+
+    with pytest.raises(RuntimeError, match="current configured adapter"):
+        validate_measurement_worker(config, task, 0)
+
+
+def test_validate_measurement_worker_honours_scientific_task_adapter_override(tmp_path):
+    base = _measurement_config(tmp_path, seeds=(0,))
+    task = base.tasks[0]
+    config = dataclasses.replace(
+        base,
+        task_overrides={task: {"adapter_version": "explicit-scientific-adapter-v9"}},
+    )
+    _write_worker(config, task, 0)
+
+    result = validate_measurement_worker(config, task, 0)
+
+    assert result["task"] == task
+    assert result["carriage"] is None
+
+
 def test_measurement_finalizer_validates_ten_tasks_three_seeds_model_free(
     tmp_path,
     monkeypatch,
@@ -236,7 +338,8 @@ def test_measurement_finalizer_validates_ten_tasks_three_seeds_model_free(
     assert len(results) == 30
     assert all(result["carriage"] is None for result in results.values())
     assert all(
-        set(result["scores"]) <= {
+        set(result["scores"])
+        <= {
             "channels",
             "coordinates",
             "specialisation_diagnostics",

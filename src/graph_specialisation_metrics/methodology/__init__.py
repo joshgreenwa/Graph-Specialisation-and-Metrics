@@ -17,6 +17,7 @@ from .runner import (
     render_cached_figures,
     run_methodology,
     run_worker,
+    validate_measurement_worker,
 )
 from .tasks import (
     CanonicalTask,
@@ -48,4 +49,5 @@ __all__ = [
     "render_cached_figures",
     "run_methodology",
     "run_worker",
+    "validate_measurement_worker",
 ]

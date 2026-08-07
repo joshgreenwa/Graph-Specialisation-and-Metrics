@@ -4,10 +4,10 @@ The public notebook in this directory is the intended entry point.  This module 
 scientific configuration, fixed checkpoint corpus contract, setup locking, worker selection,
 and postflight checks testable without executing a notebook at import time.
 
-One setup run verifies and extracts the archive, warms the two shared PyG datasets, and writes a
-commit-pinned notebook per worker.  Production workers are isolated by ``task/seed`` and request
-non-retained component results from the canonical runner, which releases score/component state
-before carriage while keeping one complete registered ``MethodologyConfig``.
+One setup run verifies and extracts the archive, warms the two shared PyG datasets, and writes both
+single-worker notebooks and four disjoint sequential queues. Production workers are isolated by
+``task/seed`` and request non-retained component results from the canonical runner, which releases
+score/component state before carriage while keeping one complete registered ``MethodologyConfig``.
 """
 
 from __future__ import annotations
@@ -47,9 +47,8 @@ ARCHIVE_BYTES = 177_950_720
 ARCHIVE_ROOT = "zinc_qm9_best_available_20260807_151904"
 EXACT_GLOBAL_BEST = 16
 BEST_AVAILABLE = 14
-DEFAULT_DRIVE_FOLDER = Path(
-    "/content/drive/MyDrive/graph_specialisation_metrics/multi_seed_models"
-)
+DEFAULT_DRIVE_FOLDER = Path("/content/drive/MyDrive/graph_specialisation_metrics/multi_seed_models")
+COMPLETION_SCHEMA = "zinc-qm9-canonical-worker-complete-v2"
 
 TASKS = (
     "zinc",
@@ -65,6 +64,7 @@ TASKS = (
 )
 TRAIN_SEEDS = (0, 1, 2)
 PHASES = ("scores", "carriage")
+QUEUE_LANES = 4
 
 # This is deliberately explicit.  Archive order is never used to decide which architecture a
 # checkpoint belongs to.
@@ -100,6 +100,9 @@ WORKERS = tuple(
 )
 WORKER_BY_KEY = {(worker.task, worker.seed): worker for worker in WORKERS}
 WORKER_BY_RUN_ID = {worker.run_id: worker for worker in WORKERS}
+QUEUE_WORKER_INDICES = tuple(
+    tuple(worker.index for worker in WORKERS[lane::QUEUE_LANES]) for lane in range(QUEUE_LANES)
+)
 
 
 @dataclass(frozen=True)
@@ -196,6 +199,24 @@ def resolve_worker(
     if not 0 <= index < len(WORKERS):
         raise ValueError(f"WORKER_INDEX must be in [0, {len(WORKERS) - 1}], got {index}")
     return WORKERS[index]
+
+
+def resolve_worker_queue(value: str | Sequence[int]) -> tuple[WorkerSpec, ...]:
+    """Resolve a comma/space-separated index queue, rejecting duplicates eagerly."""
+
+    if isinstance(value, str):
+        tokens = value.replace(",", " ").split()
+    else:
+        tokens = list(value)
+    if not tokens:
+        raise ValueError("WORKER_INDICES must contain at least one worker index")
+    try:
+        indices = tuple(int(token) for token in tokens)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"WORKER_INDICES contains a non-integer value: {tokens!r}") from error
+    if len(indices) != len(set(indices)):
+        raise ValueError(f"WORKER_INDICES contains duplicate indices: {indices!r}")
+    return tuple(resolve_worker(index) for index in indices)
 
 
 def _read_sidecar(sidecar: Path) -> tuple[str, str]:
@@ -453,8 +474,8 @@ def drive_lock(
         detail = claim.read_text(encoding="utf-8") if claim.is_file() else "(no claim record)"
         raise RuntimeError(
             f"Drive claim already exists for {name!r}: {lock}\n{detail}\n"
-            "Do not run the same worker twice. If its runtime is gone, set "
-            "RECLAIM_STALE_LOCK=True once."
+            "Do not run the same worker twice. If its runtime is gone, use the "
+            "notebook's exact stale-lock reclaim control once."
         ) from error
     claim = lock / "claim.json"
     claim_record = {
@@ -540,46 +561,114 @@ def validate_shared_datasets(drive_folder: Path) -> Mapping[str, Any]:
     return marker
 
 
+def _render_notebook_copy(
+    payload: Mapping[str, Any],
+    destination: Path,
+    replacements: Mapping[str, str],
+) -> Path:
+    copy = json.loads(json.dumps(payload))
+    counts = {prefix: 0 for prefix in replacements}
+    for cell in copy.get("cells", []):
+        if cell.get("cell_type") != "code":
+            continue
+        lines = cell.get("source", [])
+        for position, line in enumerate(lines):
+            for prefix, replacement in replacements.items():
+                if line.startswith(prefix):
+                    lines[position] = replacement
+                    counts[prefix] += 1
+    if any(count != 1 for count in counts.values()):
+        raise RuntimeError(f"notebook template controls were not unique: {counts}")
+    _atomic_text(destination, json.dumps(copy, indent=1) + "\n")
+    return destination
+
+
 def generate_worker_notebooks(
     template: Path,
     destination: Path,
     *,
     revision: str,
 ) -> tuple[Path, ...]:
-    """Create 30 pre-indexed, production-mode notebook copies on Drive."""
+    """Create 30 pre-indexed, single-worker notebook copies on Drive."""
 
     payload = json.loads(Path(template).read_text(encoding="utf-8"))
     destination = Path(destination)
     destination.mkdir(parents=True, exist_ok=True)
     generated = []
     for worker in WORKERS:
-        copy = json.loads(json.dumps(payload))
-        replacements = {
-            "MODE = ": 'MODE = "worker"  # @param ["setup", "preflight", "smoke", "worker", "status", "finalize"]\n',
-            "WORKER_INDEX = ": f'WORKER_INDEX = {worker.index}  # @param {{type:"integer"}}\n',
-            "REPO_REVISION = ": f'REPO_REVISION = "{revision}"\n',
-        }
-        counts = {prefix: 0 for prefix in replacements}
-        for cell in copy.get("cells", []):
-            if cell.get("cell_type") != "code":
-                continue
-            lines = cell.get("source", [])
-            for position, line in enumerate(lines):
-                for prefix, replacement in replacements.items():
-                    if line.startswith(prefix):
-                        lines[position] = replacement
-                        counts[prefix] += 1
-        if any(count != 1 for count in counts.values()):
-            raise RuntimeError(f"notebook template controls were not unique: {counts}")
         filename = f"worker_{worker.index:02d}_{worker.task}_seed{worker.seed}.ipynb"
-        target = destination / filename
-        _atomic_text(target, json.dumps(copy, indent=1) + "\n")
-        generated.append(target)
+        generated.append(
+            _render_notebook_copy(
+                payload,
+                destination / filename,
+                {
+                    "MODE = ": 'MODE = "worker"  # @param ["setup", "preflight", "smoke", "worker", "queue", "status", "finalize"]\n',
+                    "WORKER_INDEX = ": (
+                        f'WORKER_INDEX = {worker.index}  # @param {{type:"integer"}}\n'
+                    ),
+                    "WORKER_INDICES = ": 'WORKER_INDICES = ""  # @param {type:"string"}\n',
+                    "REPO_REVISION = ": f'REPO_REVISION = "{revision}"\n',
+                },
+            )
+        )
+    return tuple(generated)
+
+
+def generate_queue_notebooks(
+    template: Path,
+    destination: Path,
+    *,
+    revision: str,
+) -> tuple[Path, ...]:
+    """Create four commit-pinned notebooks that cover all workers exactly once."""
+
+    payload = json.loads(Path(template).read_text(encoding="utf-8"))
+    destination = Path(destination)
+    destination.mkdir(parents=True, exist_ok=True)
+    generated = []
+    for lane, indices in enumerate(QUEUE_WORKER_INDICES):
+        queue = ",".join(str(index) for index in indices)
+        generated.append(
+            _render_notebook_copy(
+                payload,
+                destination / f"queue_{lane + 1:02d}_of_{QUEUE_LANES:02d}.ipynb",
+                {
+                    "MODE = ": 'MODE = "queue"  # @param ["setup", "preflight", "smoke", "worker", "queue", "status", "finalize"]\n',
+                    "WORKER_INDEX = ": (
+                        f'WORKER_INDEX = {indices[0]}  # @param {{type:"integer"}}\n'
+                    ),
+                    "WORKER_INDICES = ": (
+                        f'WORKER_INDICES = "{queue}"  # @param {{type:"string"}}\n'
+                    ),
+                    "REPO_REVISION = ": f'REPO_REVISION = "{revision}"\n',
+                },
+            )
+        )
     return tuple(generated)
 
 
 def _setup_marker_path(drive_folder: Path) -> Path:
     return Path(drive_folder) / "setup_ready.json"
+
+
+def _reuse_prepared_setup_assets(
+    drive_folder: Path,
+) -> tuple[PreparedCorpus, Mapping[str, Any]] | None:
+    """Revalidate an existing setup so notebook regeneration does not rewrite it."""
+
+    try:
+        archive = verify_archive_identity(drive_folder)
+        archive_records = read_archive_manifest(archive)
+        corpus = load_prepared_corpus(drive_folder)
+        if dict(corpus.records) != archive_records:
+            raise RuntimeError("prepared corpus records differ from the uploaded archive manifest")
+        _validate_extracted_checkpoints(corpus.corpus_root, corpus.records, hash_all=True)
+        datasets = validate_shared_datasets(drive_folder)
+    except (OSError, RuntimeError, TypeError, ValueError, KeyError, json.JSONDecodeError) as error:
+        print(f"[setup] existing prepared assets need repair: {error}", flush=True)
+        return None
+    print("[setup] reusing validated checkpoint corpus and dataset caches", flush=True)
+    return corpus, datasets
 
 
 def setup_drive(
@@ -591,12 +680,22 @@ def setup_drive(
     drive_folder = Path(drive_folder)
     drive_folder.mkdir(parents=True, exist_ok=True)
     with drive_lock(drive_folder, "dataset_and_corpus_setup", reclaim=reclaim_stale_lock):
-        corpus = prepare_corpus(drive_folder)
-        datasets = warm_shared_datasets(drive_folder)
+        reusable = _reuse_prepared_setup_assets(drive_folder)
+        if reusable is None:
+            corpus = prepare_corpus(drive_folder)
+            ensure_runtime_dependencies()
+            datasets = warm_shared_datasets(drive_folder)
+        else:
+            corpus, datasets = reusable
         commit = repository_commit()
         notebooks = generate_worker_notebooks(
             notebook_template,
             drive_folder / "worker_notebooks",
+            revision=commit,
+        )
+        queue_notebooks = generate_queue_notebooks(
+            notebook_template,
+            drive_folder / "queue_notebooks",
             revision=commit,
         )
         marker = {
@@ -607,6 +706,7 @@ def setup_drive(
             "corpus_root": str(corpus.corpus_root),
             "datasets": datasets["roots"],
             "worker_notebooks": [str(path) for path in notebooks],
+            "queue_notebooks": [str(path) for path in queue_notebooks],
         }
         _atomic_json(_setup_marker_path(drive_folder), marker)
     return marker
@@ -763,54 +863,126 @@ def validate_worker_outputs(
     expected_graphs: int,
     expected_checkpoint_sha256: str,
 ) -> Mapping[str, Any]:
-    from graph_specialisation_metrics.methodology.cache import load_cache_artifact_file
+    from graph_specialisation_metrics.methodology import validate_measurement_worker
+
+    validated = validate_measurement_worker(config, worker.task, worker.seed)
+    try:
+        if validated["task"] != worker.task or int(validated["seed"]) != worker.seed:
+            raise RuntimeError("measurement postflight returned the wrong worker")
+        if validated["checkpoint_sha256"] != expected_checkpoint_sha256:
+            raise RuntimeError(f"{worker.key} checkpoint SHA-256 differs from the uploaded corpus")
+        counts = dict(validated["graph_counts"])
+        expected_counts = {
+            "expected",
+            "scores_semantic",
+            "scores_structural",
+            "carriage_semantic",
+            "carriage_structural",
+        }
+        if set(counts) != expected_counts or any(
+            int(counts[name]) != int(expected_graphs) for name in expected_counts
+        ):
+            raise RuntimeError(f"{worker.key} measurement graph counts are not complete: {counts}")
+        artifact_records = validated["artifacts"]
+        if not isinstance(artifact_records, Mapping) or set(artifact_records) != {
+            "scores",
+            "carriage",
+        }:
+            raise RuntimeError(f"{worker.key} measurement artifact index is incomplete")
+        artifacts = {
+            str(stage): {
+                key: str(record[key])
+                for key in (
+                    "path",
+                    "file_sha256",
+                    "contract_fingerprint",
+                    "event_manifest_hash",
+                )
+            }
+            for stage, record in artifact_records.items()
+        }
+        return {
+            "schema": COMPLETION_SCHEMA,
+            "worker": dataclasses.asdict(worker),
+            "protocol_fingerprint": config.fingerprint,
+            "checkpoint_sha256": expected_checkpoint_sha256,
+            "graphs": int(expected_graphs),
+            "strict_audits": bool(config.strict_audits),
+            "phases": list(config.phases),
+            "artifacts": artifacts,
+            "audit_findings": len(validated["audit_findings"]),
+            "headline_eligible": bool(validated["headline_eligible"]),
+            "completed_at": utc_now(),
+        }
+    finally:
+        del validated
+        gc.collect()
+
+
+def verify_selected_checkpoint(corpus: PreparedCorpus, worker: WorkerSpec) -> str:
+    checkpoint = corpus.checkpoint_path(worker.run_id)
+    expected = str(corpus.records[worker.run_id]["source_checkpoint_sha256"])
+    actual = sha256_file(checkpoint)
+    if actual != expected:
+        raise RuntimeError(
+            f"selected checkpoint SHA-256 mismatch for {worker.run_id}: {actual} != {expected}"
+        )
+    return expected
+
+
+def validated_completion_record(
+    config: MethodologyConfig,
+    worker: WorkerSpec,
+    *,
+    expected_graphs: int,
+    expected_checkpoint_sha256: str,
+) -> Mapping[str, Any] | None:
+    """Return a completion marker only when it still matches this queue contract."""
 
     root = Path(config.output_dir) / worker.task / f"seed_{worker.seed}"
-    paths = {
-        "scores": root / "cache" / "scores" / "raw.pt",
-        "carriage": root / "cache" / "carriage" / "fields.pt",
-    }
-    contract_records: dict[str, dict[str, Any]] = {}
-    for stage, path in paths.items():
-        artifact = load_cache_artifact_file(path)
-        try:
-            contract = artifact.metadata["contract"]
-            if contract["task"] != worker.task or int(contract["train_seed"]) != worker.seed:
-                raise RuntimeError(f"{stage} cache belongs to another worker: {contract}")
-            if contract["protocol_fingerprint"] != config.fingerprint:
-                raise RuntimeError(f"{stage} protocol fingerprint mismatch")
-            if contract["checkpoint_sha256"] != expected_checkpoint_sha256:
-                raise RuntimeError(f"{stage} checkpoint SHA-256 mismatch")
-            for channel in ("semantic", "structural"):
-                field = "graph_scores" if stage == "scores" else "graph_fields"
-                count = len(artifact.value["channels"][channel][field])
-                if count != int(expected_graphs):
-                    raise RuntimeError(
-                        f"{worker.key} {stage}/{channel} has {count} graphs; "
-                        f"expected {expected_graphs}"
-                    )
-            contract_records[stage] = {
-                "protocol_fingerprint": str(contract["protocol_fingerprint"]),
-                "checkpoint_sha256": str(contract["checkpoint_sha256"]),
-            }
-        finally:
-            del artifact
-            gc.collect()
-    if (
-        contract_records["scores"]["protocol_fingerprint"]
-        != contract_records["carriage"]["protocol_fingerprint"]
-    ):
-        raise RuntimeError("score/carriage protocol fingerprints differ")
-    partials = [str(path) for path in root.glob("cache/**/*.partial")]
-    if partials:
-        raise RuntimeError(f"unfinished cache writes remain: {partials}")
-    return {
+    marker_path = root / "worker_complete.json"
+    required = (
+        root / "protocol.json",
+        root / "model.json",
+        root / "audits.json",
+        root / "cache" / "scores" / "raw.pt",
+        root / "cache" / "carriage" / "fields.pt",
+    )
+    if not marker_path.is_file() or any(not path.is_file() for path in required):
+        return None
+    try:
+        marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    expected = {
+        "schema": COMPLETION_SCHEMA,
         "worker": dataclasses.asdict(worker),
         "protocol_fingerprint": config.fingerprint,
         "checkpoint_sha256": expected_checkpoint_sha256,
         "graphs": int(expected_graphs),
-        "completed_at": utc_now(),
+        "strict_audits": bool(config.strict_audits),
+        "phases": list(config.phases),
     }
+    if not isinstance(marker, Mapping) or any(
+        marker.get(key) != value for key, value in expected.items()
+    ):
+        return None
+    try:
+        fresh = validate_worker_outputs(
+            config,
+            worker,
+            expected_graphs=expected_graphs,
+            expected_checkpoint_sha256=expected_checkpoint_sha256,
+        )
+    except Exception as error:  # noqa: BLE001 - invalid completion must be repaired/resumed
+        print(
+            f"[queue] worker {worker.index:02d} completion failed fresh validation; "
+            f"resuming it ({error})",
+            flush=True,
+        )
+        return None
+    _atomic_json(marker_path, fresh)
+    return fresh
 
 
 def _restore_complete_worker_protocol(config: MethodologyConfig, worker: WorkerSpec) -> None:
@@ -828,6 +1000,45 @@ def _restore_complete_worker_protocol(config: MethodologyConfig, worker: WorkerS
     _atomic_json(root / "protocol.json", record)
 
 
+def _run_selected_worker_claimed(
+    config: MethodologyConfig,
+    worker: WorkerSpec,
+    *,
+    expected_graphs: int = 48,
+    checkpoint_digest: str,
+) -> Mapping[str, Any]:
+    """Run a worker while its caller holds the exact task/seed Drive claim."""
+
+    from graph_specialisation_metrics.methodology.runner import run_worker
+
+    completion_path = (
+        Path(config.output_dir) / worker.task / f"seed_{worker.seed}" / "worker_complete.json"
+    )
+    with contextlib.suppress(FileNotFoundError):
+        completion_path.unlink()
+    result = None
+    try:
+        result = run_worker(
+            config,
+            worker.task,
+            worker.seed,
+            retain_results=False,
+        )
+    finally:
+        if result is not None:
+            del result
+        release_component_memory()
+    _restore_complete_worker_protocol(config, worker)
+    completion = validate_worker_outputs(
+        config,
+        worker,
+        expected_graphs=expected_graphs,
+        expected_checkpoint_sha256=checkpoint_digest,
+    )
+    _atomic_json(completion_path, completion)
+    return completion
+
+
 def run_selected_worker(
     config: MethodologyConfig,
     corpus: PreparedCorpus,
@@ -836,36 +1047,137 @@ def run_selected_worker(
     reclaim_stale_lock: bool = False,
     expected_graphs: int = 48,
     lock_prefix: str = "production",
+    checkpoint_digest: str | None = None,
 ) -> Mapping[str, Any]:
-    """Run the complete worker while dropping component results as soon as they are cached."""
+    """Run one complete claimed worker and release each cache-backed component."""
 
-    from graph_specialisation_metrics.methodology.runner import run_worker
-
-    expected_digest = str(corpus.records[worker.run_id]["source_checkpoint_sha256"])
     claim = f"{lock_prefix}_{worker.task}_seed{worker.seed}"
     with drive_lock(corpus.drive_folder, claim, reclaim=reclaim_stale_lock):
-        result = None
-        try:
-            result = run_worker(
-                config,
-                worker.task,
-                worker.seed,
-                retain_results=False,
-            )
-        finally:
-            if result is not None:
-                del result
-            release_component_memory()
-        _restore_complete_worker_protocol(config, worker)
-        completion = validate_worker_outputs(
+        expected_digest = checkpoint_digest or verify_selected_checkpoint(corpus, worker)
+        return _run_selected_worker_claimed(
             config,
             worker,
             expected_graphs=expected_graphs,
-            expected_checkpoint_sha256=expected_digest,
+            checkpoint_digest=expected_digest,
         )
-        root = Path(config.output_dir) / worker.task / f"seed_{worker.seed}"
-        _atomic_json(root / "worker_complete.json", completion)
-    return completion
+
+
+def run_worker_queue(
+    config: MethodologyConfig,
+    corpus: PreparedCorpus,
+    workers: Sequence[WorkerSpec],
+    *,
+    reclaim_worker_index: int = -1,
+) -> Mapping[str, Any]:
+    """Run one disjoint worker lane sequentially, skipping validated completions."""
+
+    workers = tuple(workers)
+    if not workers:
+        raise ValueError("a worker queue cannot be empty")
+    reclaim_worker_index = int(reclaim_worker_index)
+    selected_indices = {worker.index for worker in workers}
+    if reclaim_worker_index >= 0 and reclaim_worker_index not in selected_indices:
+        raise ValueError(
+            f"RECLAIM_WORKER_INDEX={reclaim_worker_index} is not in this queue: "
+            f"{sorted(selected_indices)}"
+        )
+    completed: list[Mapping[str, Any]] = []
+    skipped: list[int] = []
+    total = len(workers)
+    for position, worker in enumerate(workers, start=1):
+        print(
+            f"[queue] {position}/{total}: worker {worker.index:02d} "
+            f"{worker.task}:seed{worker.seed}",
+            flush=True,
+        )
+        claim = f"production_{worker.task}_seed{worker.seed}"
+        with drive_lock(
+            corpus.drive_folder,
+            claim,
+            reclaim=(worker.index == reclaim_worker_index),
+        ):
+            digest = verify_selected_checkpoint(corpus, worker)
+            existing = validated_completion_record(
+                config,
+                worker,
+                expected_graphs=config.sizes.discovery_graphs,
+                expected_checkpoint_sha256=digest,
+            )
+            if existing is not None:
+                print(
+                    f"[queue] worker {worker.index:02d} already validated; skipping",
+                    flush=True,
+                )
+                completed.append(existing)
+                skipped.append(worker.index)
+                continue
+            completed.append(
+                _run_selected_worker_claimed(
+                    config,
+                    worker,
+                    expected_graphs=config.sizes.discovery_graphs,
+                    checkpoint_digest=digest,
+                )
+            )
+        print(f"[queue] worker {worker.index:02d} complete", flush=True)
+    return {
+        "mode": "queue",
+        "worker_indices": [worker.index for worker in workers],
+        "completed": completed,
+        "skipped_indices": skipped,
+        "finished_at": utc_now(),
+    }
+
+
+def _has_current_completion_marker(root: Path, worker: WorkerSpec) -> bool:
+    marker_path = root / "worker_complete.json"
+    cache_paths = {
+        "scores": root / "cache" / "scores" / "raw.pt",
+        "carriage": root / "cache" / "carriage" / "fields.pt",
+    }
+    required = (
+        root / "protocol.json",
+        root / "model.json",
+        root / "audits.json",
+        *cache_paths.values(),
+    )
+    if not marker_path.is_file() or any(not path.is_file() for path in required):
+        return False
+    try:
+        marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    if not isinstance(marker, Mapping):
+        return False
+    try:
+        graph_count = int(marker.get("graphs", -1))
+    except (TypeError, ValueError):
+        return False
+    if (
+        marker.get("schema") != COMPLETION_SCHEMA
+        or marker.get("worker") != dataclasses.asdict(worker)
+        or marker.get("phases") != list(PHASES)
+        or graph_count != 48
+    ):
+        return False
+    for field in ("protocol_fingerprint", "checkpoint_sha256"):
+        digest = str(marker.get(field, ""))
+        if len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest):
+            return False
+    artifacts = marker.get("artifacts")
+    if not isinstance(artifacts, Mapping) or set(artifacts) != set(cache_paths):
+        return False
+    for stage, path in cache_paths.items():
+        record = artifacts[stage]
+        if not isinstance(record, Mapping) or Path(str(record.get("path", ""))) != path:
+            return False
+        for field in ("file_sha256", "contract_fingerprint", "event_manifest_hash"):
+            digest = str(record.get(field, ""))
+            if len(digest) != 64 or any(
+                character not in "0123456789abcdef" for character in digest
+            ):
+                return False
+    return True
 
 
 def completion_status(drive_folder: Path) -> list[dict[str, Any]]:
@@ -880,23 +1192,24 @@ def completion_status(drive_folder: Path) -> list[dict[str, Any]]:
                 "seed": worker.seed,
                 "scores": (root / "cache" / "scores" / "raw.pt").is_file(),
                 "carriage": (root / "cache" / "carriage" / "fields.pt").is_file(),
-                "validated": (root / "worker_complete.json").is_file(),
+                # Queue skipping and finalization still reopen and fully validate artifacts.
+                "complete": _has_current_completion_marker(root, worker),
             }
         )
     return rows
 
 
 def _print_status(rows: Sequence[Mapping[str, Any]]) -> None:
-    print("index  task                   seed  scores  carriage  validated", flush=True)
+    print("index  task                   seed  scores  carriage  complete", flush=True)
     for row in rows:
         print(
             f"{int(row['index']):>5}  {row['task']!s:<21}  {int(row['seed']):>4}  "
             f"{bool(row['scores'])!s:<6}  {bool(row['carriage'])!s:<8}  "
-            f"{bool(row['validated'])}",
+            f"{bool(row['complete'])}",
             flush=True,
         )
-    complete = sum(bool(row["validated"]) for row in rows)
-    print(f"[status] {complete}/{len(rows)} workers validated", flush=True)
+    complete = sum(bool(row["complete"]) for row in rows)
+    print(f"[status] {complete}/{len(rows)} workers have current completion markers", flush=True)
 
 
 def dependency_stack_ready() -> bool:
@@ -988,12 +1301,14 @@ def run_frontend(
     mode: str,
     drive_folder: str | Path = DEFAULT_DRIVE_FOLDER,
     worker_index: int = 0,
+    worker_indices: str | Sequence[int] = "",
     task: str | None = None,
     seed: int | None = None,
     graphs_per_batch: int | None = None,
     accelerator: str = "cuda:0",
     strict_audits: bool = False,
     reclaim_stale_lock: bool = False,
+    reclaim_worker_index: int = -1,
 ) -> Any:
     """Execute a notebook mode after Drive is mounted and this repository is imported."""
 
@@ -1001,17 +1316,17 @@ def run_frontend(
     drive_folder = Path(drive_folder)
     template = Path(__file__).with_name("zinc_qm9_canonical_worker_colab.ipynb")
     if mode == "setup":
-        ensure_runtime_dependencies()
         result = setup_drive(
             drive_folder,
             notebook_template=template,
             reclaim_stale_lock=reclaim_stale_lock,
         )
         print(
-            f"[setup:complete] generated {len(result['worker_notebooks'])} workers under "
-            f"{drive_folder / 'worker_notebooks'}",
+            f"[setup:complete] generated {len(result['worker_notebooks'])} single-worker "
+            f"notebooks and {len(result['queue_notebooks'])} queue notebooks",
             flush=True,
         )
+        print(f"[setup:queues] {drive_folder / 'queue_notebooks'}", flush=True)
         _print_status(completion_status(drive_folder))
         return result
     if mode == "status":
@@ -1019,20 +1334,22 @@ def run_frontend(
         _print_status(rows)
         return rows
 
-    worker = resolve_worker(worker_index, task=task, seed=seed)
-    if mode == "preflight":
-        return preflight(drive_folder, worker, graphs_per_batch=graphs_per_batch)
+    valid_modes = {"preflight", "smoke", "worker", "queue", "finalize"}
+    if mode not in valid_modes:
+        raise ValueError(
+            "MODE must be one of setup, preflight, smoke, worker, queue, status, finalize"
+        )
 
-    require_ready_setup(drive_folder)
-    corpus = load_prepared_corpus(drive_folder, selected=worker)
-    config = build_production_config(
-        drive_folder,
-        corpus,
-        graphs_per_batch=graphs_per_batch,
-        accelerator=accelerator,
-        strict_audits=strict_audits,
-    )
     if mode == "finalize":
+        require_ready_setup(drive_folder)
+        corpus = load_prepared_corpus(drive_folder)
+        config = build_production_config(
+            drive_folder,
+            corpus,
+            graphs_per_batch=graphs_per_batch,
+            accelerator=accelerator,
+            strict_audits=strict_audits,
+        )
         from graph_specialisation_metrics.methodology.runner import (
             finalize_measurement_run,
         )
@@ -1040,8 +1357,50 @@ def run_frontend(
         result = finalize_measurement_run(config)
         _print_status(completion_status(drive_folder))
         return result
-    if mode not in {"smoke", "worker"}:
-        raise ValueError("MODE must be one of setup, preflight, smoke, worker, status, finalize")
+
+    if mode == "queue":
+        if task is not None or seed is not None:
+            raise ValueError("queue mode uses WORKER_INDICES, not TASK/TRAIN_SEED")
+        if reclaim_stale_lock:
+            raise ValueError(
+                "queue mode does not use RECLAIM_STALE_LOCK; after confirming the "
+                "previous runtime is dead, set RECLAIM_WORKER_INDEX to the exact "
+                "blocked worker instead"
+            )
+        workers = resolve_worker_queue(worker_indices)
+        require_ready_setup(drive_folder)
+        corpus = load_prepared_corpus(drive_folder)
+        config = build_production_config(
+            drive_folder,
+            corpus,
+            graphs_per_batch=graphs_per_batch,
+            accelerator=accelerator,
+            strict_audits=strict_audits,
+        )
+        ensure_runtime_dependencies()
+        require_requested_accelerator(config.accelerator)
+        result = run_worker_queue(
+            config,
+            corpus,
+            workers,
+            reclaim_worker_index=reclaim_worker_index,
+        )
+        _print_status(completion_status(drive_folder))
+        return result
+
+    worker = resolve_worker(worker_index, task=task, seed=seed)
+    if mode == "preflight":
+        return preflight(drive_folder, worker, graphs_per_batch=graphs_per_batch)
+
+    require_ready_setup(drive_folder)
+    corpus = load_prepared_corpus(drive_folder)
+    config = build_production_config(
+        drive_folder,
+        corpus,
+        graphs_per_batch=graphs_per_batch,
+        accelerator=accelerator,
+        strict_audits=strict_audits,
+    )
     ensure_runtime_dependencies()
     require_requested_accelerator(config.accelerator)
     if mode == "smoke":
@@ -1072,6 +1431,8 @@ __all__ = [
     "ARCHIVE_SIDECAR_NAME",
     "DEFAULT_DRIVE_FOLDER",
     "PHASES",
+    "QUEUE_LANES",
+    "QUEUE_WORKER_INDICES",
     "TASKS",
     "TRAIN_SEEDS",
     "WORKERS",
@@ -1081,13 +1442,16 @@ __all__ = [
     "build_production_config",
     "build_smoke_config",
     "completion_status",
+    "generate_queue_notebooks",
     "generate_worker_notebooks",
     "load_prepared_corpus",
     "preflight",
     "prepare_corpus",
     "resolve_worker",
+    "resolve_worker_queue",
     "run_frontend",
     "run_selected_worker",
+    "run_worker_queue",
     "setup_drive",
     "validate_archive_manifest",
     "verify_archive_identity",

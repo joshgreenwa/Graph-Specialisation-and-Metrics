@@ -157,17 +157,8 @@ def _model_audits(
 
     base = runtime.eval_ds[0]
     single = backend.capture([base], require_grad=False, include_virtual_transport=True)
-    repeated = backend.capture(
-        [base, base], require_grad=False, include_virtual_transport=True
-    )
-    batch_error = float(
-        torch.max(
-            torch.abs(
-                repeated.z
-                - single.z.expand_as(repeated.z)
-            )
-        ).item()
-    )
+    repeated = backend.capture([base, base], require_grad=False, include_virtual_transport=True)
+    batch_error = float(torch.max(torch.abs(repeated.z - single.z.expand_as(repeated.z))).item())
     within_tolerance(
         batch_error,
         config.numerical.batch_invariance_tolerance,
@@ -191,9 +182,7 @@ def _model_audits(
         semantic_noop, structural_noop = declared_noops(base)
     else:
         rows = task.content_adapter.rows(base)
-        semantic_noop = semantic_donor_swap(
-            base, 0, rows[0], adapter=task.content_adapter
-        )
+        semantic_noop = semantic_donor_swap(base, 0, rows[0], adapter=task.content_adapter)
         structural_noop = structural_donor_swap(
             base,
             0,
@@ -206,9 +195,7 @@ def _model_audits(
         require_grad=False,
         include_virtual_transport=True,
     )
-    no_op_error = float(
-        torch.max(torch.abs(noops.z[1:] - noops.z[0:1])).item()
-    )
+    no_op_error = float(torch.max(torch.abs(noops.z[1:] - noops.z[0:1])).item())
     for layer in noops.transport:
         no_op_error = max(
             no_op_error,
@@ -229,12 +216,8 @@ def _model_audits(
         "attention_normalization_max_error": attention_error,
         "no_op_max_error": no_op_error,
         "jacobian_engine": getattr(backend, "jacobian_engine", "sequential_vjp"),
-        "clean_transport_gradient_norm": float(
-            torch.linalg.vector_norm(clean.transport).item()
-        ),
-        "clean_final_gradient_norm": float(
-            torch.linalg.vector_norm(clean.final_state).item()
-        ),
+        "clean_transport_gradient_norm": float(torch.linalg.vector_norm(clean.transport).item()),
+        "clean_final_gradient_norm": float(torch.linalg.vector_norm(clean.final_state).item()),
     }
 
 
@@ -271,11 +254,7 @@ def _channel_bootstrap_policy(
         return config.bootstrap
     exhaustive = all(
         len(plan[int(graph_id)][channel]["sources"])
-        == len(
-            eligible_source_fn(
-                prepared.grit.eval_ds[int(graph_id)], channel=channel
-            )
-        )
+        == len(eligible_source_fn(prepared.grit.eval_ds[int(graph_id)], channel=channel))
         for graph_id in plan
     )
     return (
@@ -325,10 +304,7 @@ def _prepare_graphormer_task(
         same_index_space=False,
     )
     donor_pool = SemanticDonorPool(
-        [
-            (graph_id, runtime.donor_ds[graph_id])
-            for graph_id in splits.semantic_donor_pool
-        ],
+        [(graph_id, runtime.donor_ds[graph_id]) for graph_id in splits.semantic_donor_pool],
         adapter=task.content_adapter,
     )
     model_record = {
@@ -356,9 +332,7 @@ def _prepare_graphormer_task(
         },
     }
     atomic_json(output_dir / "model.json", model_record)
-    checkpoint_label = Path(
-        checkpoint_descriptor.replace("/", "__").replace("@", "__at__")
-    )
+    checkpoint_label = Path(checkpoint_descriptor.replace("/", "__").replace("@", "__at__"))
     return PreparedTask(
         task,
         runtime,
@@ -421,9 +395,7 @@ def _prepare_graphbench_task(
     if task.spec.task_type == "graph_regression":
         if runtime.target_stats is None:
             raise RuntimeError("GraphBench flow checkpoint has no training target scale")
-        sigma = np.asarray(
-            [max(float(runtime.target_stats["std"]), 1.0e-6)], dtype=np.float64
-        )
+        sigma = np.asarray([max(float(runtime.target_stats["std"]), 1.0e-6)], dtype=np.float64)
     else:
         sigma = np.asarray([1.0], dtype=np.float64)
     backend = GraphBenchGritBackend(
@@ -445,10 +417,7 @@ def _prepare_graphbench_task(
         same_index_space=False,
     )
     donor_pool = GraphBenchEdgeDonorPool(
-        [
-            (graph_id, runtime.donor_ds[graph_id])
-            for graph_id in splits.semantic_donor_pool
-        ]
+        [(graph_id, runtime.donor_ds[graph_id]) for graph_id in splits.semantic_donor_pool]
     )
     model_record = {
         "protocol_version": PROTOCOL_VERSION,
@@ -502,71 +471,65 @@ def _prepare_graphbench_task(
     )
 
 
-def prepare_task(
+_RUNTIME_TASK_OVERRIDE_NAMES = {
+    "grit_repo_dir",
+    "config_file",
+    "drive_dir",
+    "dataset_dir",
+    "eval_split",
+    "donor_split",
+    "sigma",
+    "output_representation",
+    "sigma_policy",
+    "dataset_root",
+    "model_id",
+    "revision",
+    "cache_dir",
+    "local_files_only",
+    "runner_path",
+    "training_output_root",
+    "pe_cache_root",
+    "pe_cache_namespace",
+    "pe_cache_dtype",
+    "pe_workers",
+    "pe_save_every",
+    "require_subset_cache",
+    "require_pe_cache",
+    "build_missing_pe_cache",
+    "force_reload_data",
+    "metric_reproduction_tolerance",
+    "analysis_split_limits",
+    "eval_metric",
+    "expected_grit_commit",
+    "split_seed",
+    "train_size",
+    "val_size",
+    "test_size",
+    "train_node_size",
+    "val_node_size",
+    "test_node_size",
+}
+
+
+def _resolve_configured_task(
     config: MethodologyConfig,
     task_name: str,
-    train_seed: int,
-    *,
-    force_fresh_grit: bool = False,
-) -> PreparedTask:
-    """Rebuild the registered environment and load a cached training checkpoint read-only."""
+) -> tuple[CanonicalTask, Mapping[str, Any]]:
+    """Resolve runtime/scientific overrides identically for workers and postflight."""
 
-    set_strict(bool(config.strict_audits))
     task_overrides = config.task_overrides.get(task_name, {})
-    runtime_override_names = {
-        "grit_repo_dir",
-        "config_file",
-        "drive_dir",
-        "dataset_dir",
-        "eval_split",
-        "donor_split",
-        "sigma",
-        "output_representation",
-        "sigma_policy",
-        "dataset_root",
-        "model_id",
-        "revision",
-        "cache_dir",
-        "local_files_only",
-        "runner_path",
-        "training_output_root",
-        "pe_cache_root",
-        "pe_cache_namespace",
-        "pe_cache_dtype",
-        "pe_workers",
-        "pe_save_every",
-        "require_subset_cache",
-        "require_pe_cache",
-        "build_missing_pe_cache",
-        "force_reload_data",
-        "metric_reproduction_tolerance",
-        "analysis_split_limits",
-        "eval_metric",
-        "expected_grit_commit",
-        "split_seed",
-        "train_size",
-        "val_size",
-        "test_size",
-        "train_node_size",
-        "val_node_size",
-        "test_node_size",
-    }
     canonical_override_names = set(CanonicalTask.__dataclass_fields__) - {
         "name",
         "backend_kind",
         "spec",
     }
     unknown_overrides = sorted(
-        set(task_overrides) - runtime_override_names - canonical_override_names
+        set(task_overrides) - _RUNTIME_TASK_OVERRIDE_NAMES - canonical_override_names
     )
     if unknown_overrides:
-        raise ValueError(
-            f"unknown task overrides for {task_name!r}: {unknown_overrides}"
-        )
+        raise ValueError(f"unknown task overrides for {task_name!r}: {unknown_overrides}")
     scientific_overrides = {
-        key: value
-        for key, value in task_overrides.items()
-        if key in canonical_override_names
+        key: value for key, value in task_overrides.items() if key in canonical_override_names
     }
     task = get_task(task_name, scientific_overrides)
     if {
@@ -587,15 +550,25 @@ def prepare_task(
                     else task.output.sigma
                 ),
                 representation=str(
-                    task_overrides.get(
-                        "output_representation", task.output.representation
-                    )
+                    task_overrides.get("output_representation", task.output.representation)
                 ),
-                sigma_policy=str(
-                    task_overrides.get("sigma_policy", task.output.sigma_policy)
-                ),
+                sigma_policy=str(task_overrides.get("sigma_policy", task.output.sigma_policy)),
             ),
         )
+    return task, task_overrides
+
+
+def prepare_task(
+    config: MethodologyConfig,
+    task_name: str,
+    train_seed: int,
+    *,
+    force_fresh_grit: bool = False,
+) -> PreparedTask:
+    """Rebuild the registered environment and load a cached training checkpoint read-only."""
+
+    set_strict(bool(config.strict_audits))
+    task, task_overrides = _resolve_configured_task(config, task_name)
     if task.backend_kind == "graphormer":
         return _prepare_graphormer_task(
             config,
@@ -652,9 +625,7 @@ def prepare_task(
         task_overrides.get("config_file") or env.resolve_config(spec, repo_dir, output_dir)
     )
     drive_dir = str(task_overrides.get("drive_dir", spec.drive_dir))
-    dataset_dir = str(
-        task_overrides.get("dataset_dir") or resolve_dataset_dir(spec, drive_dir)
-    )
+    dataset_dir = str(task_overrides.get("dataset_dir") or resolve_dataset_dir(spec, drive_dir))
     checkpoint, epoch = env.find_checkpoint(
         Path(drive_dir) / "results",
         _checkpoint_override(config, task_name, int(train_seed)),
@@ -725,8 +696,7 @@ def prepare_task(
         model_scope, header=f"{task_name}:seed{int(train_seed)} model audits"
     )
     same_space = (
-        grit.eval_ds is grit.donor_ds
-        or model_config.eval_split == model_config.donor_split
+        grit.eval_ds is grit.donor_ds or model_config.eval_split == model_config.donor_split
     )
     splits = deterministic_splits(
         len(grit.eval_ds),
@@ -819,9 +789,7 @@ def _stage_plan(
                     raise RuntimeError(
                         f"{prepared.task.name} supplied no eligible analysis sources"
                     )
-                count = min(
-                    int(config.sizes.sources_per_graph), int(eligible.size)
-                )
+                count = min(int(config.sizes.sources_per_graph), int(eligible.size))
                 shared_sources = np.sort(
                     source_rng.choice(eligible, size=count, replace=False)
                 ).astype(np.int64)
@@ -841,9 +809,7 @@ def _stage_plan(
                         f"{prepared.task.name} uses channel-specific sources but its "
                         "backend does not declare eligible_sources(data, channel)"
                     )
-                eligible = np.asarray(
-                    eligible_source_fn(base, channel=channel), dtype=np.int64
-                )
+                eligible = np.asarray(eligible_source_fn(base, channel=channel), dtype=np.int64)
                 if eligible.ndim != 1 or not eligible.size:
                     audit_check(
                         False,
@@ -857,9 +823,7 @@ def _stage_plan(
                     )
                     sources = np.empty(0, dtype=np.int64)
                 else:
-                    count = min(
-                        int(config.sizes.sources_per_graph), int(eligible.size)
-                    )
+                    count = min(int(config.sizes.sources_per_graph), int(eligible.size))
                     if count == int(eligible.size):
                         # Exhaustive source use has no source-sampling uncertainty.
                         sources = np.sort(eligible)
@@ -982,12 +946,10 @@ def _cache(
             repository_commit=_repository_commit(),
             bootstrap_replicates=int(config.bootstrap.replicates),
             raw_score_aggregation=(
-                f"{getattr(prepared.task, 'raw_score_system', 'mass')}"
-                "->donor->source->graph"
+                f"{getattr(prepared.task, 'raw_score_system', 'mass')}->donor->source->graph"
             ),
             semantic_donor_law=(
-                "graph-uniform/edge-uniform/min-endpoint-degree-signature-gap/"
-                "iid-replacement"
+                "graph-uniform/edge-uniform/min-endpoint-degree-signature-gap/iid-replacement"
                 if prepared.task.semantic_source_kind == "edge"
                 else "graph-uniform/node-uniform/min-gap/iid-replacement"
             ),
@@ -1079,9 +1041,7 @@ def _capture_event_groups(prepared: PreparedTask, groups: Sequence[Sequence[Any]
     if callable(capture_groups):
         return capture_groups(groups, include_virtual_transport=True)
     return [
-        prepared.backend.capture(
-            group, require_grad=False, include_virtual_transport=True
-        )
+        prepared.backend.capture(group, require_grad=False, include_virtual_transport=True)
         for group in groups
     ]
 
@@ -1122,9 +1082,7 @@ def _prepare_clean_jacobians(
         clean.capture.prediction = clean.capture.prediction.to(device)
         clean.capture.z = clean.capture.z.to(device)
         clean.capture.target = clean.capture.target.to(device)
-        clean.capture.transport = tuple(
-            value.to(device) for value in clean.capture.transport
-        )
+        clean.capture.transport = tuple(value.to(device) for value in clean.capture.transport)
         clean.capture.final_state = clean.capture.final_state.to(device)
         if clean.capture.real_mask is not None:
             clean.capture.real_mask = clean.capture.real_mask.to(device)
@@ -1286,9 +1244,7 @@ def _score_graph_batch(
         variants, records = _rebuild_graph_events(
             prepared, config, "scores", graph_id, channel, sources
         )
-        if [record.record() for record in records] != list(
-            plan[graph_id][channel]["records"]
-        ):
+        if [record.record() for record in records] != list(plan[graph_id][channel]["records"]):
             raise RuntimeError(
                 "deterministic score-event replay changed its manifest for "
                 f"graph={graph_id} channel={channel}; refusing misaligned results"
@@ -1361,9 +1317,7 @@ def _score_graph_batch(
                     value=np.stack(
                         (
                             contribution[0],
-                            np.broadcast_to(
-                                support[0][None, None, :], contribution[0].shape
-                            ),
+                            np.broadcast_to(support[0][None, None, :], contribution[0].shape),
                         )
                     ),
                 )
@@ -1375,17 +1329,9 @@ def _score_graph_batch(
         attention = None
         if channel == "semantic":
             clean_transport = torch.stack(clean.capture.transport, dim=0)
-            projected_clean = torch.einsum(
-                "lnhd,tlnhd->lhnt", clean_transport, clean.transport
-            )
+            projected_clean = torch.einsum("lnhd,tlnhd->lhnt", clean_transport, clean.transport)
             throughput = (
-                projected_clean.square()
-                .sum(dim=-1)
-                .sqrt()
-                .sum(dim=-1)
-                .detach()
-                .cpu()
-                .numpy()
+                projected_clean.square().sum(dim=-1).sqrt().sum(dim=-1).detach().cpu().numpy()
             )
             attention = _clean_attention_distance(prepared, base, pristine, axis)
         results.append(
@@ -1452,9 +1398,7 @@ def estimate_graph_local_head_coordinates(
         oom_backoff=config.execution.oom_backoff,
     )
 
-    channel_scores: dict[str, dict[int, np.ndarray]] = {
-        channel: {} for channel in CHANNELS
-    }
+    channel_scores: dict[str, dict[int, np.ndarray]] = {channel: {} for channel in CHANNELS}
     for channel in CHANNELS:
 
         def consume_score_batch(results):
@@ -1527,9 +1471,7 @@ def run_scores(
         if cached is not None:
             log(f"[cache] loaded canonical scores for {prepared.task.name}")
             if prepared.progress is not None:
-                prepared.progress.emit(
-                    "cache_hit", phase="scores", cache="consolidated"
-                )
+                prepared.progress.emit("cache_hit", phase="scores", cache="consolidated")
             return cached
     graph_ids = sorted(plan)
     axis = _distance_axis(prepared, graph_ids)
@@ -1545,17 +1487,11 @@ def run_scores(
         "channels": {},
     }
     observations: dict[str, list[Observation]] = {channel: [] for channel in CHANNELS}
-    distance_observations: dict[str, list[Observation]] = {
-        channel: [] for channel in CHANNELS
-    }
+    distance_observations: dict[str, list[Observation]] = {channel: [] for channel in CHANNELS}
     throughput_graph: dict[int, np.ndarray] = {}
     attention_graph: dict[int, np.ndarray] = {}
-    cached_graphs: dict[str, dict[int, Any]] = {
-        channel: {} for channel in CHANNELS
-    }
-    missing_graphs: dict[str, list[int]] = {
-        channel: [] for channel in CHANNELS
-    }
+    cached_graphs: dict[str, dict[int, Any]] = {channel: {} for channel in CHANNELS}
+    missing_graphs: dict[str, list[int]] = {channel: [] for channel in CHANNELS}
     for channel in CHANNELS:
         for graph_id in graph_ids:
             shard = (
@@ -1571,12 +1507,8 @@ def run_scores(
                 missing_graphs[channel].append(int(graph_id))
             else:
                 cached_graphs[channel][int(graph_id)] = shard
-    clean_needed = sorted(
-        set(missing_graphs["semantic"]) | set(missing_graphs["structural"])
-    )
-    clean_by_graph, clean_execution = _prepare_clean_jacobians(
-        prepared, config, clean_needed
-    )
+    clean_needed = sorted(set(missing_graphs["semantic"]) | set(missing_graphs["structural"]))
+    clean_by_graph, clean_execution = _prepare_clean_jacobians(prepared, config, clean_needed)
     execution_reports: dict[str, Any] = {}
     for channel in CHANNELS:
         graph_scores: dict[int, np.ndarray] = {}
@@ -1592,9 +1524,7 @@ def run_scores(
                 graph_support[graph_id] = result["support"]
                 event_rows.extend(result["event_rows"])
                 observations[channel].extend(result["observations"])
-                distance_observations[channel].extend(
-                    result["distance_observations"]
-                )
+                distance_observations[channel].extend(result["distance_observations"])
                 if result["throughput"] is not None:
                     throughput_graph[graph_id] = result["throughput"]
                 if result["attention"] is not None:
@@ -1662,9 +1592,7 @@ def run_scores(
             "heatmap_per_opportunity_head": heatmaps.per_opportunity_head,
             "events": event_rows,
             "resample_source": bool(
-                _channel_bootstrap_policy(
-                    prepared, config, plan, channel
-                ).resample_source
+                _channel_bootstrap_policy(prepared, config, plan, channel).resample_source
             ),
         }
         empty_columns = np.zeros(len(axis.labels), dtype=np.int64)
@@ -1680,17 +1608,12 @@ def run_scores(
 
         output["channels"][channel]["distance_intervals"] = nested_percentile_interval(
             distance_observations[channel],
-            _channel_bootstrap_policy(
-                prepared, config, plan, channel
-            ),
+            _channel_bootstrap_policy(prepared, config, plan, channel),
             graph_reduce=graph_distance_reduce,
         )
         support_graphs, support_pairs = column_support(
             graph_support,
-            {
-                graph_id: len(plan[graph_id][channel]["sources"])
-                for graph_id in graph_ids
-            },
+            {graph_id: len(plan[graph_id][channel]["sources"]) for graph_id in graph_ids},
         )
         reportable = np.asarray(
             [
@@ -1716,9 +1639,7 @@ def run_scores(
             "reduce_calls": int(replicates_seen),
         }
         suppressed = [
-            str(axis.labels[column])
-            for column in range(len(axis.labels))
-            if not reportable[column]
+            str(axis.labels[column]) for column in range(len(axis.labels)) if not reportable[column]
         ]
         if suppressed:
             audit_check(
@@ -1777,14 +1698,10 @@ def run_scores(
                 continue
             exact_graph = {}
             normalized_graph = {}
-            for graph_id, contribution in channel_output[
-                "graph_distance_contribution"
-            ].items():
+            for graph_id, contribution in channel_output["graph_distance_contribution"].items():
                 support = channel_output["graph_distance_support"][graph_id]
                 exact = np.sum(
-                    np.stack(
-                        [np.asarray(contribution)[layer, head] for layer, head in family]
-                    ),
+                    np.stack([np.asarray(contribution)[layer, head] for layer, head in family]),
                     axis=0,
                 )
                 normalized = np.full_like(exact, np.nan, dtype=np.float64)
@@ -1794,13 +1711,9 @@ def run_scores(
             family_profiles[family_name] = {
                 "exact_graph": exact_graph,
                 "per_opportunity_graph": normalized_graph,
-                "exact": np.stack(
-                    [exact_graph[key] for key in sorted(exact_graph)]
-                ).mean(axis=0),
+                "exact": np.stack([exact_graph[key] for key in sorted(exact_graph)]).mean(axis=0),
                 "per_opportunity": supported_mean(
-                    np.stack(
-                        [normalized_graph[key] for key in sorted(normalized_graph)]
-                    ),
+                    np.stack([normalized_graph[key] for key in sorted(normalized_graph)]),
                     axis=0,
                 ),
             }
@@ -1811,10 +1724,7 @@ def run_scores(
                 [
                     np.mean(
                         np.stack(
-                            [
-                                attention_graph[graph_id][layer, head]
-                                for layer, head in family
-                            ]
+                            [attention_graph[graph_id][layer, head] for layer, head in family]
                         ),
                         axis=0,
                     )
@@ -1834,6 +1744,7 @@ def run_scores(
     structural_by_key = {
         (row.graph, row.source, row.donor): row.value for row in observations["structural"]
     }
+
     def transform(value):
         transformed = head_coordinates(
             value[0],
@@ -1954,9 +1865,7 @@ def _carriage_graph_batch(
         variants, records = _rebuild_graph_events(
             prepared, config, "carriage", graph_id, channel, sources
         )
-        if [record.record() for record in records] != list(
-            plan[graph_id][channel]["records"]
-        ):
+        if [record.record() for record in records] != list(plan[graph_id][channel]["records"]):
             raise RuntimeError(
                 "deterministic carriage-event replay changed its manifest for "
                 f"graph={graph_id} channel={channel}; refusing misaligned results"
@@ -1988,21 +1897,17 @@ def _carriage_graph_batch(
         h_clean = captured.final_state[0]
         carriers = int(h_clean.shape[-2])
         donor_counts = tuple(
-            sum(int(record.source) == int(source) for record in records)
-            for source in sources
+            sum(int(record.source) == int(source) for record in records) for source in sources
         )
         if any(count < 1 for count in donor_counts):
-            raise RuntimeError(
-                f"carriage graph {graph_id} has a source without donor events"
-            )
+            raise RuntimeError(f"carriage graph {graph_id} has a source without donor events")
         if sum(donor_counts) != int(captured.final_state.shape[0]) - 1:
             raise RuntimeError(
                 f"carriage graph {graph_id} event count does not align with its manifest"
             )
         flat_h_event = captured.final_state[1:]
         h_event_by_source = tuple(
-            value.unsqueeze(0)
-            for value in torch.split(flat_h_event, donor_counts, dim=0)
+            value.unsqueeze(0) for value in torch.split(flat_h_event, donor_counts, dim=0)
         )
         functional_events = getattr(
             prepared.backend, "functional_carriage_events", functional_carriage_events
@@ -2036,9 +1941,7 @@ def _carriage_graph_batch(
         B = None
         if config.compute_beneficial_carriage:
             target = clean.capture.target.reshape(1, -1)
-            state_loss_factory = getattr(
-                prepared.backend, "loss_from_states", None
-            )
+            state_loss_factory = getattr(prepared.backend, "loss_from_states", None)
             if callable(state_loss_factory):
                 replay_loss = state_loss_factory(base, target)
                 integrated_by_source = tuple(
@@ -2080,12 +1983,8 @@ def _carriage_graph_batch(
                     )
                     for source_events in h_event_by_source
                 )
-                pooled_clean = project_final_states(
-                    h_clean.unsqueeze(0), carrier_weights
-                )
-                pooled_event = project_final_states(
-                    flat_h_event, carrier_weights
-                )
+                pooled_clean = project_final_states(h_clean.unsqueeze(0), carrier_weights)
+                pooled_event = project_final_states(flat_h_event, carrier_weights)
                 with torch.no_grad():
                     replay_clean_loss = replay_loss(pooled_clean)
                     replay_event_loss = replay_loss(pooled_event)
@@ -2130,9 +2029,7 @@ def _carriage_graph_batch(
             "F_sens": F,
             "distance": distance,
             "carrier_kinds": tuple(
-                prepared.backend.carriage_carrier_kind(
-                    base, carrier, channel=channel
-                )
+                prepared.backend.carriage_carrier_kind(base, carrier, channel=channel)
                 for carrier in range(carriers)
             ),
             "event_F_sens": event_f.detach().cpu().numpy(),
@@ -2143,28 +2040,16 @@ def _carriage_graph_batch(
                 tuple(value.event_field[0] for value in integrated_by_source)
             )
             event_loss_tensor = pad_event_values(
-                tuple(
-                    value.event_loss_increase[0, :, None]
-                    for value in integrated_by_source
-                )
+                tuple(value.event_loss_increase[0, :, None] for value in integrated_by_source)
             ).squeeze(-1)
             quadrature_tensor = pad_event_values(
-                tuple(
-                    value.quadrature_error[0, :, None]
-                    for value in integrated_by_source
-                )
+                tuple(value.quadrature_error[0, :, None] for value in integrated_by_source)
             ).squeeze(-1)
             residual_tensor = pad_event_values(
-                tuple(
-                    value.completeness_residual[0, :, None]
-                    for value in integrated_by_source
-                )
+                tuple(value.completeness_residual[0, :, None] for value in integrated_by_source)
             ).squeeze(-1)
             converged_tensor = pad_event_values(
-                tuple(
-                    value.converged[0, :, None]
-                    for value in integrated_by_source
-                ),
+                tuple(value.converged[0, :, None] for value in integrated_by_source),
                 fill=False,
             ).squeeze(-1)
             graph_field.update(
@@ -2196,26 +2081,19 @@ def _carriage_graph_batch(
                             "carrier_kind": prepared.backend.carriage_carrier_kind(
                                 base, carrier, channel=channel
                             ),
-                            "F_sens": float(
-                                event_f_np[source_position, donor, carrier]
-                            ),
+                            "F_sens": float(event_f_np[source_position, donor, carrier]),
                             "channel": channel,
                         }
                     )
                     if event_b is not None:
-                        pair_rows[-1]["B"] = float(
-                            event_b[source_position, donor, carrier]
-                        )
+                        pair_rows[-1]["B"] = float(event_b[source_position, donor, carrier])
         results.append(
             {
                 "graph_id": graph_id,
                 "graph_field": graph_field,
                 "pair_rows": pair_rows,
                 "paths": (
-                    sum(
-                        int(value.converged.numel())
-                        for value in (integrated_by_source or ())
-                    )
+                    sum(int(value.converged.numel()) for value in (integrated_by_source or ()))
                 ),
                 "capped": (
                     sum(
@@ -2243,9 +2121,7 @@ def run_carriage(
         if cached is not None:
             log(f"[cache] loaded canonical carriage for {prepared.task.name}")
             if prepared.progress is not None:
-                prepared.progress.emit(
-                    "cache_hit", phase="carriage", cache="consolidated"
-                )
+                prepared.progress.emit("cache_hit", phase="carriage", cache="consolidated")
             return cached
     output: dict[str, Any] = {
         "protocol_version": PROTOCOL_VERSION,
@@ -2253,12 +2129,8 @@ def run_carriage(
         "channels": {},
     }
     graph_ids = sorted(plan)
-    cached_graphs: dict[str, dict[int, Any]] = {
-        channel: {} for channel in CHANNELS
-    }
-    missing_graphs: dict[str, list[int]] = {
-        channel: [] for channel in CHANNELS
-    }
+    cached_graphs: dict[str, dict[int, Any]] = {channel: {} for channel in CHANNELS}
+    missing_graphs: dict[str, list[int]] = {channel: [] for channel in CHANNELS}
     for channel in CHANNELS:
         for graph_id in graph_ids:
             shard = (
@@ -2274,12 +2146,8 @@ def run_carriage(
                 missing_graphs[channel].append(int(graph_id))
             else:
                 cached_graphs[channel][int(graph_id)] = shard
-    clean_needed = sorted(
-        set(missing_graphs["semantic"]) | set(missing_graphs["structural"])
-    )
-    clean_by_graph, clean_execution = _prepare_clean_jacobians(
-        prepared, config, clean_needed
-    )
+    clean_needed = sorted(set(missing_graphs["semantic"]) | set(missing_graphs["structural"]))
+    clean_by_graph, clean_execution = _prepare_clean_jacobians(prepared, config, clean_needed)
     execution_reports: dict[str, Any] = {}
     for channel in CHANNELS:
         pair_rows: list[dict[str, Any]] = []
@@ -2424,10 +2292,7 @@ def run_carriage(
                             graph=int(graph_id),
                             source=int(source),
                             donor=int(donor),
-                            value=n
-                            * np.asarray(
-                                [*bin_values, *far_values], dtype=np.float64
-                            ),
+                            value=n * np.asarray([*bin_values, *far_values], dtype=np.float64),
                         )
                     )
         additive_interval = (
@@ -2448,9 +2313,7 @@ def run_carriage(
             "distance_bins": bins,
             "far_thresholds": far_thresholds,
             "resample_source": bool(
-                _channel_bootstrap_policy(
-                    prepared, config, plan, channel
-                ).resample_source
+                _channel_bootstrap_policy(prepared, config, plan, channel).resample_source
             ),
         }
         if additive_interval is not None:
@@ -2548,9 +2411,7 @@ def _display_distance(
     graph_support = channel_scores.get("graph_distance_support")
     if not graph_contribution or not graph_support:
         return None
-    contribution = {
-        key: display.group_sum(value) for key, value in graph_contribution.items()
-    }
+    contribution = {key: display.group_sum(value) for key, value in graph_contribution.items()}
     support = {key: display.group_sum(value) for key, value in graph_support.items()}
     heatmaps = score_heatmaps(
         contribution,
@@ -2559,9 +2420,7 @@ def _display_distance(
         graph_scores=channel_scores.get("graph_scores"),
     )
     counts = _sources_per_graph(channel_scores)
-    graphs, pairs = column_support(
-        support, {key: counts.get(int(key), 0) for key in support}
-    )
+    graphs, pairs = column_support(support, {key: counts.get(int(key), 0) for key in support})
     keys = sorted(support)
     reportable = np.asarray(
         [
@@ -2593,9 +2452,7 @@ def _display_distance(
             ],
             dataclasses.replace(
                 config.bootstrap,
-                resample_source=bool(
-                    channel_scores.get("resample_source", True)
-                ),
+                resample_source=bool(channel_scores.get("resample_source", True)),
             ),
             graph_reduce=distance_profile_reduce,
         )
@@ -2605,8 +2462,7 @@ def _display_distance(
     # at unit resolution, and dividing by a width is linear, so the band transforms with the point.
     widths = display.widths
     exact_interval = tuple(
-        np.asarray(value)[0] / widths
-        for value in (interval.estimate, interval.low, interval.high)
+        np.asarray(value)[0] / widths for value in (interval.estimate, interval.low, interval.high)
     )
     return {
         "exact_head": heatmaps.exact_head / widths,
@@ -2623,8 +2479,7 @@ def _display_distance(
         "empty_replicate_fraction": (
             None
             if estimable is None
-            else 1.0 - np.asarray(estimable[1, -1], dtype=np.float64)
-            / float(interval.replicates)
+            else 1.0 - np.asarray(estimable[1, -1], dtype=np.float64) / float(interval.replicates)
         ),
     }
 
@@ -2632,9 +2487,7 @@ def _display_distance(
 def _display_observation(row: Mapping[str, Any], display: DisplayAxis) -> np.ndarray:
     contribution = display.group_sum(np.asarray(row["distance_contribution"]))
     support = display.group_sum(np.asarray(row["distance_support"]))
-    return np.stack(
-        (contribution, np.broadcast_to(support, contribution.shape))
-    )
+    return np.stack((contribution, np.broadcast_to(support, contribution.shape)))
 
 
 def _mask_columns(values: Any, reportable: Any) -> np.ndarray:
@@ -2686,25 +2539,18 @@ def _carriage_profile(
     estimates, lows, highs = [], [], []
     selectors = [
         lambda row, lower=lo, upper=hi: (
-            np.isfinite(row["distance"])
-            and lower <= int(row["distance"]) <= upper
+            np.isfinite(row["distance"]) and lower <= int(row["distance"]) <= upper
         )
         for lo, hi in bins
     ]
     selectors.extend(
-        lambda row, kind=kind: str(row.get("carrier_kind")) == kind
-        for kind in special_kinds
+        lambda row, kind=kind: str(row.get("carrier_kind")) == kind for kind in special_kinds
     )
     for select in selectors:
-        selected = [
-            row
-            for row in rows
-            if select(row) and np.isfinite(float(row[field]))
-        ]
+        selected = [row for row in rows if select(row) and np.isfinite(float(row[field]))]
         graph_ids = {int(row["graph_id"]) for row in selected}
         pairs = {
-            (int(row["graph_id"]), int(row["carrier"]), int(row["source"]))
-            for row in selected
+            (int(row["graph_id"]), int(row["carrier"]), int(row["source"])) for row in selected
         }
         if (
             len(graph_ids) < config.bootstrap.minimum_graphs
@@ -2736,9 +2582,7 @@ def _carriage_profile(
             ]
 
             def graph_reduce(values):
-                return trimmed_mean(
-                    values, config.bootstrap.trim_fraction, axis=0
-                )
+                return trimmed_mean(values, config.bootstrap.trim_fraction, axis=0)
 
         else:
             observations = [
@@ -2754,9 +2598,7 @@ def _carriage_profile(
 
             def graph_reduce(values):
                 graph_pair_means = values[:, 0] / values[:, 1]
-                return trimmed_mean(
-                    graph_pair_means, config.bootstrap.trim_fraction, axis=0
-                )
+                return trimmed_mean(graph_pair_means, config.bootstrap.trim_fraction, axis=0)
 
         interval = nested_percentile_interval(
             observations,
@@ -2796,18 +2638,14 @@ def _event_normalised_carriage_rows(
             [float(result[position]["F_sens"]) for position in positions],
             dtype=np.float64,
         )
-        functional_normalised, functional_eligible, _ = (
-            event_normalise_functional(
-                functional[None, :],
-                effect_floor=functional_floor,
-            )
+        functional_normalised, functional_eligible, _ = event_normalise_functional(
+            functional[None, :],
+            effect_floor=functional_floor,
         )
         functional_ok = bool(functional_eligible[0])
         eligible_functional += int(functional_ok)
         for index, position in enumerate(positions):
-            result[position]["F_sens_event_normalised"] = float(
-                functional_normalised[0, index]
-            )
+            result[position]["F_sens_event_normalised"] = float(functional_normalised[0, index])
 
         if not beneficial_present:
             continue
@@ -2950,9 +2788,7 @@ def make_figures(
             if support is not None
             else np.ones(len(labels), dtype=bool)
         )
-        suppressed_columns = [
-            str(label) for label, keep in zip(labels, reportable) if not keep
-        ]
+        suppressed_columns = [str(label) for label, keep in zip(labels, reportable) if not keep]
         reporting_metadata = {
             "distance_display": {
                 "registered_columns": len(scores["axis"]),
@@ -3075,9 +2911,7 @@ def make_figures(
             rows = carriage_channel["pairs"]
             carriage_bootstrap = dataclasses.replace(
                 config.bootstrap,
-                resample_source=bool(
-                    carriage_channel.get("resample_source", True)
-                ),
+                resample_source=bool(carriage_channel.get("resample_source", True)),
             )
             labels, functional, functional_interval = _carriage_profile(
                 rows,
@@ -3121,9 +2955,7 @@ def make_figures(
             )
             saved[f"{channel}_carriage"] = [str(path) for path in paths]
 
-            normalised_rows, normalisation = _event_normalised_carriage_rows(
-                rows, config
-            )
+            normalised_rows, normalisation = _event_normalised_carriage_rows(rows, config)
             (
                 normalised_labels,
                 normalised_functional,
@@ -3176,9 +3008,7 @@ def make_figures(
                     "normalisation": normalisation,
                 },
             )
-            saved[f"{channel}_carriage_event_normalised"] = [
-                str(path) for path in paths
-            ]
+            saved[f"{channel}_carriage_event_normalised"] = [str(path) for path in paths]
     if scores.get("family_attention_distance"):
         # Attention mass is a fraction of a fixed total, so grouping is an exact sum.
         fig, axes = attention_distance_profiles(
@@ -3214,9 +3044,7 @@ def make_figures(
                 statistics = list(continuous["statistic_order"])
                 continuous_interval = continuous["interval"]
                 contrast_interval = continuous["head_contrast_interval"]
-                contrast_metrics = list(
-                    continuous["head_contrast_metric_order"]
-                )
+                contrast_metrics = list(continuous["head_contrast_metric_order"])
                 coordinates = scores["coordinates"]
                 score_interval = scores["intervals"]
                 D = coordinates.selectivity.reshape(-1)
@@ -3234,30 +3062,14 @@ def make_figures(
                 for metric_position, metric in enumerate(continuous_metrics):
                     contrast_position = contrast_metrics.index(metric)
                     rho_position = statistics.index("spearman_rho")
-                    beta_position = statistics.index(
-                        "J_and_layer_adjusted_standardized_beta"
-                    )
-                    beta = float(
-                        continuous_interval.estimate[
-                            metric_position, beta_position
-                        ]
-                    )
-                    beta_low = float(
-                        continuous_interval.low[
-                            metric_position, beta_position
-                        ]
-                    )
-                    beta_high = float(
-                        continuous_interval.high[
-                            metric_position, beta_position
-                        ]
-                    )
+                    beta_position = statistics.index("J_and_layer_adjusted_standardized_beta")
+                    beta = float(continuous_interval.estimate[metric_position, beta_position])
+                    beta_low = float(continuous_interval.low[metric_position, beta_position])
+                    beta_high = float(continuous_interval.high[metric_position, beta_position])
                     panels.append(
                         {
                             "x": D,
-                            "y": contrast_interval.estimate[
-                                contrast_position
-                            ],
+                            "y": contrast_interval.estimate[contrast_position],
                             "x_interval": (
                                 score_interval.low[5].reshape(-1),
                                 score_interval.high[5].reshape(-1),
@@ -3269,9 +3081,7 @@ def make_figures(
                             "active": active,
                             "layer": layers,
                             "xlabel": r"Raw selectivity $D_{rel}$",
-                            "ylabel": (
-                                "Semantic minus structural causal response"
-                            ),
+                            "ylabel": ("Semantic minus structural causal response"),
                             "title": (
                                 f"{titles[metric]}\n"
                                 f"adjusted β={beta:.2f} "
@@ -3279,19 +3089,13 @@ def make_figures(
                             ),
                             "statistic": {
                                 "rho": float(
-                                    continuous_interval.estimate[
-                                        metric_position, rho_position
-                                    ]
+                                    continuous_interval.estimate[metric_position, rho_position]
                                 ),
                                 "low": float(
-                                    continuous_interval.low[
-                                        metric_position, rho_position
-                                    ]
+                                    continuous_interval.low[metric_position, rho_position]
                                 ),
                                 "high": float(
-                                    continuous_interval.high[
-                                        metric_position, rho_position
-                                    ]
+                                    continuous_interval.high[metric_position, rho_position]
                                 ),
                                 "n": int(np.sum(active)),
                             },
@@ -3310,9 +3114,7 @@ def make_figures(
                         "continuous_analysis": continuous,
                     },
                 )
-                saved["continuous_D_rel_causal"] = [
-                    str(path) for path in paths
-                ]
+                saved["continuous_D_rel_causal"] = [str(path) for path in paths]
             for pair_set in focused["pair_set_order"]:
                 fig, axes = specialist_causal_panels(
                     focused,
@@ -3331,9 +3133,7 @@ def make_figures(
                         "focused_specialists": focused,
                     },
                 )
-                saved[f"{pair_set}_specialist_patching"] = [
-                    str(path) for path in paths
-                ]
+                saved[f"{pair_set}_specialist_patching"] = [str(path) for path in paths]
                 fig, axes = specialist_causal_panels(
                     focused,
                     pair_set=pair_set,
@@ -3354,9 +3154,7 @@ def make_figures(
                         "focused_specialists": focused,
                     },
                 )
-                saved[f"{pair_set}_specialist_necessity"] = [
-                    str(path) for path in paths
-                ]
+                saved[f"{pair_set}_specialist_necessity"] = [str(path) for path in paths]
         if causal.get("regime_evidence"):
             fig, axes = causal_regime_summary(
                 causal["regime_evidence"],
@@ -3426,12 +3224,12 @@ def make_figures(
         raw_low = interval_object.low[:raw_size].reshape(point_raw.shape)
         raw_high = interval_object.high[:raw_size].reshape(point_raw.shape)
         calibrated_size = point_calibrated.size
-        calibrated_low = interval_object.low[
-            raw_size : raw_size + calibrated_size
-        ].reshape(point_calibrated.shape)
-        calibrated_high = interval_object.high[
-            raw_size : raw_size + calibrated_size
-        ].reshape(point_calibrated.shape)
+        calibrated_low = interval_object.low[raw_size : raw_size + calibrated_size].reshape(
+            point_calibrated.shape
+        )
+        calibrated_high = interval_object.high[raw_size : raw_size + calibrated_size].reshape(
+            point_calibrated.shape
+        )
         head_positions = [target_position[name] for name in head_names]
         clean_interval_meta = causal["clean_ablation"]["_intervals"]
         clean_order = {
@@ -3440,10 +3238,7 @@ def make_figures(
         clean_positions = [clean_order[name] for name in head_names]
         clean_interval = clean_interval_meta["interval"]
         clean_point = np.asarray(
-            [
-                causal["clean_ablation"][name]["prediction_movement"]
-                for name in head_names
-            ]
+            [causal["clean_ablation"][name]["prediction_movement"] for name in head_names]
         )
         J = coordinates.joint_sensitivity.reshape(-1)
         D = coordinates.selectivity.reshape(-1)
@@ -3477,12 +3272,8 @@ def make_figures(
             )
 
         gross_total, gross_total_ci = calibrated_column("gross_total_for_J")
-        gross_contrast, gross_contrast_ci = calibrated_column(
-            "gross_contrast_for_D_rel"
-        )
-        necessity_total, necessity_total_ci = calibrated_column(
-            "necessity_total_for_J"
-        )
+        gross_contrast, gross_contrast_ci = calibrated_column("gross_contrast_for_D_rel")
+        necessity_total, necessity_total_ci = calibrated_column("necessity_total_for_J")
         necessity_contrast, necessity_contrast_ci = calibrated_column(
             "necessity_contrast_for_D_rel"
         )
@@ -3521,9 +3312,7 @@ def make_figures(
                 "xlabel": r"Joint sensitivity $J$",
                 "ylabel": "Calibrated total donor-wise necessity",
                 "title": "Donor-wise necessity",
-                "statistic": _association_statistic(
-                    associations, "J_vs_necessity_total"
-                ),
+                "statistic": _association_statistic(associations, "J_vs_necessity_total"),
             },
             {
                 "x": D[active],
@@ -3598,9 +3387,7 @@ def make_figures(
                 {
                     "x": scores["channels"][channel]["raw"].reshape(-1),
                     "y": point_raw[channel_index, head_positions, endpoint],
-                    "x_interval": x_intervals[
-                        "S_sem" if channel == "semantic" else "S_str"
-                    ],
+                    "x_interval": x_intervals["S_sem" if channel == "semantic" else "S_str"],
                     "y_interval": (
                         raw_low[channel_index, head_positions, endpoint],
                         raw_high[channel_index, head_positions, endpoint],
@@ -3674,9 +3461,7 @@ def make_figures(
                 )
                 saved[output_key] = [str(path) for path in family_paths]
 
-            save_family_figure(
-                family_names, "causal_family_endpoints", "causal_families"
-            )
+            save_family_figure(family_names, "causal_family_endpoints", "causal_families")
             # Full-size matched controls only. The `control_prefix_*` ladder is the reference for
             # the cumulative prefix curves, and enumerating it here put one bar category per
             # (control, prefix size) pair — a hundred or so on a ten-layer model.
@@ -3694,11 +3479,7 @@ def make_figures(
             prefix_curves = {}
             for family in ("semantic_leaning", "structural_leaning"):
                 names = sorted(
-                    (
-                        name
-                        for name in target_order
-                        if name.startswith(f"prefix_{family}_")
-                    ),
+                    (name for name in target_order if name.startswith(f"prefix_{family}_")),
                     key=lambda name: int(name.rsplit("_", 1)[1]),
                 )
                 if not names:
@@ -3724,9 +3505,7 @@ def make_figures(
                 }
                 record = {
                     "prefix": [int(name.rsplit("_", 1)[1]) for name in names],
-                    "equivalence_half_width": float(
-                        config.families.causal_equivalence_half_width
-                    ),
+                    "equivalence_half_width": float(config.families.causal_equivalence_half_width),
                 }
                 for endpoint, calibrated_name in endpoint_columns.items():
                     column = calibrated_names.index(calibrated_name)
@@ -3738,9 +3517,7 @@ def make_figures(
                         ),
                         "control": (
                             [
-                                float(np.mean(point_calibrated[group, column]))
-                                if group
-                                else np.nan
+                                float(np.mean(point_calibrated[group, column])) if group else np.nan
                                 for group in control_positions
                             ]
                             if any(control_positions)
@@ -3862,9 +3639,7 @@ def run_prepared(
                     else nullcontext()
                 )
                 with context:
-                    figures = make_figures(
-                        prepared, config, scores, carriage, causal
-                    )
+                    figures = make_figures(prepared, config, scores, carriage, causal)
     finally:
         if prepared.progress is not None:
             prepared.progress.emit("run_stop")
@@ -3949,9 +3724,7 @@ def run_worker(
     if task_name not in config.tasks:
         raise ValueError(f"worker task {task_name!r} is not registered in this run")
     if int(train_seed) not in config.seeds_for(task_name):
-        raise ValueError(
-            f"worker seed {int(train_seed)} is not registered for {task_name!r}"
-        )
+        raise ValueError(f"worker seed {int(train_seed)} is not registered for {task_name!r}")
     if "figures" in config.phases:
         raise ValueError(
             "worker phases must omit figures; use the dependency-gated figures-only "
@@ -4019,9 +3792,7 @@ def _write_run_summaries(
 
     population: dict[str, Any] = {}
     for task_name in config.tasks:
-        task_results = [
-            value for value in results.values() if value["task"] == task_name
-        ]
+        task_results = [value for value in results.values() if value["task"] == task_name]
         seed_rows = []
         for value in task_results:
             scores = value.get("scores")
@@ -4030,9 +3801,7 @@ def _write_run_summaries(
             coordinates = scores["coordinates"]
             row = {
                 "seed": int(value["seed"]),
-                "mean_raw_semantic_score": float(
-                    np.mean(scores["channels"]["semantic"]["raw"])
-                ),
+                "mean_raw_semantic_score": float(np.mean(scores["channels"]["semantic"]["raw"])),
                 "mean_raw_structural_score": float(
                     np.mean(scores["channels"]["structural"]["raw"])
                 ),
@@ -4054,14 +3823,10 @@ def _write_run_summaries(
                             diagnostics["classification_fraction"]["equivalent"]
                         ),
                         "semantic_tail_membership_jaccard": float(
-                            diagnostics["membership"]["semantic_leaning"][
-                                "mean_jaccard"
-                            ]
+                            diagnostics["membership"]["semantic_leaning"]["mean_jaccard"]
                         ),
                         "structural_tail_membership_jaccard": float(
-                            diagnostics["membership"]["structural_leaning"][
-                                "mean_jaccard"
-                            ]
+                            diagnostics["membership"]["structural_leaning"]["mean_jaccard"]
                         ),
                     }
                 )
@@ -4075,9 +3840,7 @@ def _write_run_summaries(
                         "structural_candidate_pool_count": len(
                             specialists["heads"]["structural_candidate_pool"]
                         ),
-                        "semantic_selected_count": len(
-                            specialists["heads"]["semantic_selected"]
-                        ),
+                        "semantic_selected_count": len(specialists["heads"]["semantic_selected"]),
                         "structural_selected_count": len(
                             specialists["heads"]["structural_selected"]
                         ),
@@ -4104,20 +3867,14 @@ def _write_run_summaries(
                     "J_vs_necessity_total",
                 ):
                     if name in association:
-                        row[f"rho_{name}"] = float(
-                            association[name]["pooled"]["rho"]
-                        )
+                        row[f"rho_{name}"] = float(association[name]["pooled"]["rho"])
                 for name in (
                     "D_rel_vs_gross_contrast",
                     "D_rel_vs_necessity_contrast",
                 ):
                     if name in association:
-                        row[f"rho_{name}"] = float(
-                            association[name]["pooled_active"]["rho"]
-                        )
-                for name, record in causal_value.get(
-                    "family_interactions", {}
-                ).items():
+                        row[f"rho_{name}"] = float(association[name]["pooled_active"]["rho"])
+                for name, record in causal_value.get("family_interactions", {}).items():
                     if isinstance(record, Mapping) and "estimate" in record:
                         row[f"interaction_{name}"] = float(record["estimate"])
                 focused = causal_value.get("focused_specialists", {})
@@ -4127,15 +3884,9 @@ def _write_run_summaries(
                         continuous_metrics = list(continuous["metric_order"])
                         statistics = list(continuous["statistic_order"])
                         continuous_interval = continuous["interval"]
-                        for metric_position, metric in enumerate(
-                            continuous_metrics
-                        ):
-                            for statistic_position, statistic in enumerate(
-                                statistics
-                            ):
-                                row[
-                                    f"continuous_{metric}_{statistic}"
-                                ] = float(
+                        for metric_position, metric in enumerate(continuous_metrics):
+                            for statistic_position, statistic in enumerate(statistics):
+                                row[f"continuous_{metric}_{statistic}"] = float(
                                     continuous_interval.estimate[
                                         metric_position,
                                         statistic_position,
@@ -4151,9 +3902,7 @@ def _write_run_summaries(
                         )
                         for metric in metrics:
                             metric_position = metrics.index(metric)
-                            row[
-                                f"{pair_set}_{metric}_double_difference"
-                            ] = float(
+                            row[f"{pair_set}_{metric}_double_difference"] = float(
                                 interval.estimate[
                                     set_position,
                                     metric_position,
@@ -4175,9 +3924,7 @@ def _write_run_summaries(
                 f"{expected_seeds}, observed {observed_seeds}"
             )
         numeric_keys = [
-            key
-            for key in seed_rows[0]
-            if key != "seed" and all(key in row for row in seed_rows)
+            key for key in seed_rows[0] if key != "seed" and all(key in row for row in seed_rows)
         ]
         task_population: dict[str, Any] = {
             "seed_estimates": seed_rows,
@@ -4185,9 +3932,9 @@ def _write_run_summaries(
             "regime_calls": [
                 {
                     "seed": int(value["seed"]),
-                    "regime": (
-                        (value.get("causal") or {}).get("regime_evidence") or {}
-                    ).get("regime", "not_available"),
+                    "regime": ((value.get("causal") or {}).get("regime_evidence") or {}).get(
+                        "regime", "not_available"
+                    ),
                 }
                 for value in task_results
                 if value.get("scores") is not None
@@ -4201,9 +3948,7 @@ def _write_run_summaries(
             rng = np.random.default_rng(config.bootstrap.rng_seed)
             draws = np.stack(
                 [
-                    matrix[
-                        rng.integers(0, len(matrix), size=len(matrix))
-                    ].mean(axis=0)
+                    matrix[rng.integers(0, len(matrix), size=len(matrix))].mean(axis=0)
                     for _ in range(config.bootstrap.replicates)
                 ]
             )
@@ -4257,10 +4002,7 @@ def _write_run_summaries(
                         "selectivity": coordinates.selectivity.reshape(-1),
                         "joint": coordinates.joint_sensitivity.reshape(-1),
                         "clean_ablation_impact": np.asarray(
-                            [
-                                clean_ablation[name]["prediction_movement"]
-                                for name in head_names
-                            ],
+                            [clean_ablation[name]["prediction_movement"] for name in head_names],
                             dtype=np.float64,
                         ),
                         "layer": np.repeat(np.arange(layers), heads),
@@ -4271,9 +4013,7 @@ def _write_run_summaries(
             if population_interval is not None:
                 quantity_order = list(population_interval["quantity_order"])
                 if "rho_J_vs_clean_prediction_movement" in quantity_order:
-                    position = quantity_order.index(
-                        "rho_J_vs_clean_prediction_movement"
-                    )
+                    position = quantity_order.index("rho_J_vs_clean_prediction_movement")
                     rho_population = {
                         "rho": float(population_interval["estimate"][position]),
                         "low": float(population_interval["low"][position]),
@@ -4294,9 +4034,7 @@ def _write_run_summaries(
                     }
             if scatter_records:
                 theme_values = config.figure_overrides
-                if task_name in theme_values and isinstance(
-                    theme_values[task_name], Mapping
-                ):
+                if task_name in theme_values and isinstance(theme_values[task_name], Mapping):
                     theme_values = theme_values[task_name]
                 theme = FigureTheme().with_overrides(theme_values)
                 composite_theme = theme.with_overrides(
@@ -4342,9 +4080,7 @@ def _write_run_summaries(
                     },
                 )
                 task_population["figures"] = {
-                    "score_selectivity_clean_ablation_triptych": [
-                        str(path) for path in paths
-                    ]
+                    "score_selectivity_clean_ablation_triptych": [str(path) for path in paths]
                 }
         focused_population: dict[str, Any] = {
             "strongest_candidates": {},
@@ -4354,9 +4090,7 @@ def _write_run_summaries(
         for pair_set in ("strongest_candidates", "confirmed_95"):
             pair_seed_rows = []
             for value in task_results:
-                focused = (value.get("causal") or {}).get(
-                    "focused_specialists", {}
-                )
+                focused = (value.get("causal") or {}).get("focused_specialists", {})
                 if pair_set not in focused.get("pair_set_order", ()):
                     continue
                 set_position = list(focused["pair_set_order"]).index(pair_set)
@@ -4365,9 +4099,7 @@ def _write_run_summaries(
                 pair_seed_rows.append(
                     {
                         "seed": int(value["seed"]),
-                        "pair_count": int(
-                            focused["pair_sets"][pair_set]["pair_count"]
-                        ),
+                        "pair_count": int(focused["pair_sets"][pair_set]["pair_count"]),
                         "interaction": {
                             metric: {
                                 "estimate": float(
@@ -4421,17 +4153,12 @@ def _write_run_summaries(
                         for value in task_results
                         if value.get("causal")
                         and pair_set
-                        in value["causal"]["focused_specialists"].get(
-                            "pair_set_order", ()
-                        )
+                        in value["causal"]["focused_specialists"].get("pair_set_order", ())
                     )
                 )
                 matrix = np.asarray(
                     [
-                        [
-                            row["interaction"][metric]["estimate"]
-                            for metric in metric_order
-                        ]
+                        [row["interaction"][metric]["estimate"] for metric in metric_order]
                         for row in pair_seed_rows
                     ],
                     dtype=np.float64,
@@ -4517,9 +4244,7 @@ def _write_run_summaries(
     if index_metadata:
         collisions = sorted(set(index_record) & set(index_metadata))
         if collisions:
-            raise ValueError(
-                f"index_metadata cannot replace canonical index keys: {collisions}"
-            )
+            raise ValueError(f"index_metadata cannot replace canonical index keys: {collisions}")
         index_record.update(dict(index_metadata))
     atomic_json(config.root / "index.json", index_record)
     failed = sorted(key for key, value in run_findings.items() if value)
@@ -4592,9 +4317,7 @@ def render_cached_figures(
     model_record = json.loads(model_path.read_text(encoding="utf-8"))
     geometry = model_record.get("model_geometry") or {}
     if not geometry:
-        raise ValueError(
-            f"{model_path} has no model_geometry; rerun model preparation once"
-        )
+        raise ValueError(f"{model_path} has no model_geometry; rerun model preparation once")
 
     def consolidated(stage: str, name: str, *, required: bool):
         path = output_dir / "cache" / stage / f"{name}.pt"
@@ -4690,15 +4413,11 @@ def _validate_worker_sidecars(
     """Validate the model/protocol/audit records without constructing a runtime."""
 
     key = f"{task_name}:seed{int(train_seed)}"
-    worker_protocol = _required_json_record(
-        output_dir / "protocol.json", purpose="worker protocol"
-    )
+    worker_protocol = _required_json_record(output_dir / "protocol.json", purpose="worker protocol")
     if worker_protocol.get("protocol_version") != PROTOCOL_VERSION:
         raise RuntimeError(f"{key} worker protocol version is not canonical")
     if worker_protocol.get("fingerprint") != config.fingerprint:
-        raise RuntimeError(
-            f"{key} worker protocol belongs to another scientific configuration"
-        )
+        raise RuntimeError(f"{key} worker protocol belongs to another scientific configuration")
     if worker_protocol.get("execution_mode") != "isolated-seed-worker":
         raise RuntimeError(f"{key} was not produced by the isolated worker entry point")
     if worker_protocol.get("worker_task") != task_name or int(
@@ -4706,24 +4425,18 @@ def _validate_worker_sidecars(
     ) != int(train_seed):
         raise RuntimeError(f"{key} worker protocol has the wrong task or seed")
     if _measurement_phase_set(worker_protocol.get("phases")) != _MEASUREMENT_PHASES:
-        raise RuntimeError(
-            f"{key} worker protocol did not run phases={_MEASUREMENT_PHASES!r}"
-        )
+        raise RuntimeError(f"{key} worker protocol did not run phases={_MEASUREMENT_PHASES!r}")
 
     model = _required_json_record(output_dir / "model.json", purpose="model audit")
     if model.get("protocol_version") != PROTOCOL_VERSION:
         raise RuntimeError(f"{key} model audit version is not canonical")
-    if model.get("task") != task_name or int(model.get("train_seed", -1)) != int(
-        train_seed
-    ):
+    if model.get("task") != task_name or int(model.get("train_seed", -1)) != int(train_seed):
         raise RuntimeError(f"{key} model audit has the wrong task or seed")
     canonical_audits = model.get("canonical_audits")
     if not isinstance(canonical_audits, Mapping):
         raise RuntimeError(f"{key} model audit has no canonical_audits record")
     model_failures = canonical_audits.get("failures", ())
-    if isinstance(model_failures, (str, bytes)) or not isinstance(
-        model_failures, Sequence
-    ):
+    if isinstance(model_failures, (str, bytes)) or not isinstance(model_failures, Sequence):
         raise RuntimeError(f"{key} model canonical audit failures are malformed")
     geometry = model.get("model_geometry")
     required_geometry = {"layers", "heads", "head_width", "hidden_width", "outputs"}
@@ -4748,18 +4461,14 @@ def _validate_worker_sidecars(
     audit = _required_json_record(output_dir / "audits.json", purpose="worker audit")
     if audit.get("protocol_version") != PROTOCOL_VERSION:
         raise RuntimeError(f"{key} worker audit version is not canonical")
-    if audit.get("task") != task_name or int(audit.get("train_seed", -1)) != int(
-        train_seed
-    ):
+    if audit.get("task") != task_name or int(audit.get("train_seed", -1)) != int(train_seed):
         raise RuntimeError(f"{key} worker audit has the wrong task or seed")
     if _measurement_phase_set(audit.get("phases")) != _MEASUREMENT_PHASES:
         raise RuntimeError(f"{key} worker audit does not cover scores and carriage")
     if bool(audit.get("strict_audits")) != bool(config.strict_audits):
         raise RuntimeError(f"{key} worker audit strictness differs from the finalizer")
     findings_value = audit.get("findings")
-    if isinstance(findings_value, (str, bytes)) or not isinstance(
-        findings_value, Sequence
-    ):
+    if isinstance(findings_value, (str, bytes)) or not isinstance(findings_value, Sequence):
         raise RuntimeError(f"{key} worker audit findings are malformed")
     findings = []
     for position, finding in enumerate(findings_value):
@@ -4804,37 +4513,41 @@ def _mapping_graph_ids(
     return graph_ids, value
 
 
-def _validate_measurement_values(
-    config: MethodologyConfig,
+def _validate_measurement_header(
+    *,
+    key: str,
+    stage: str,
+    payload: Any,
+    contract: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    if not isinstance(payload, Mapping):
+        raise RuntimeError(f"{key} consolidated {stage} payload is malformed")
+    if payload.get("protocol_version") != PROTOCOL_VERSION:
+        raise RuntimeError(f"{key} {stage} payload version is not canonical")
+    if payload.get("manifest_hash") != contract.get("event_manifest_hash"):
+        raise RuntimeError(f"{key} {stage} payload and cache manifest disagree")
+    channels = payload.get("channels")
+    if not isinstance(channels, Mapping) or set(channels) != set(CHANNELS):
+        raise RuntimeError(f"{key} {stage} payload must contain exactly channels={CHANNELS!r}")
+    return channels
+
+
+def _validate_score_measurement_value(
     *,
     key: str,
     scores: Any,
-    carriage: Any,
     expected_graph_ids: set[int],
-    score_contract: Mapping[str, Any],
-    carriage_contract: Mapping[str, Any],
+    contract: Mapping[str, Any],
 ) -> dict[str, int]:
-    """Check consolidated score/carriage payloads and their discovery population."""
-
-    if not isinstance(scores, Mapping) or not isinstance(carriage, Mapping):
-        raise RuntimeError(f"{key} consolidated measurement payload is malformed")
-    for stage, payload, contract in (
-        ("scores", scores, score_contract),
-        ("carriage", carriage, carriage_contract),
-    ):
-        if payload.get("protocol_version") != PROTOCOL_VERSION:
-            raise RuntimeError(f"{key} {stage} payload version is not canonical")
-        if payload.get("manifest_hash") != contract.get("event_manifest_hash"):
-            raise RuntimeError(f"{key} {stage} payload and cache manifest disagree")
-        channels = payload.get("channels")
-        if not isinstance(channels, Mapping) or set(channels) != set(CHANNELS):
-            raise RuntimeError(
-                f"{key} {stage} payload must contain exactly channels={CHANNELS!r}"
-            )
-
+    channels = _validate_measurement_header(
+        key=key,
+        stage="scores",
+        payload=scores,
+        contract=contract,
+    )
     score_ids: dict[str, set[int]] = {}
     for channel in CHANNELS:
-        channel_value = scores["channels"][channel]
+        channel_value = channels[channel]
         if not isinstance(channel_value, Mapping):
             raise RuntimeError(f"{key} scores/{channel} payload is malformed")
         graph_ids, _ = _mapping_graph_ids(
@@ -4849,8 +4562,8 @@ def _validate_measurement_values(
                 f"missing={missing}, unexpected={unexpected}"
             )
         score_ids[channel] = graph_ids
-    semantic_raw = np.asarray(scores["channels"]["semantic"].get("raw"))
-    structural_raw = np.asarray(scores["channels"]["structural"].get("raw"))
+    semantic_raw = np.asarray(channels["semantic"].get("raw"))
+    structural_raw = np.asarray(channels["structural"].get("raw"))
     if (
         semantic_raw.ndim != 2
         or semantic_raw.shape != structural_raw.shape
@@ -4859,7 +4572,7 @@ def _validate_measurement_values(
         or not np.isfinite(structural_raw).all()
     ):
         raise RuntimeError(f"{key} score head matrices are malformed or non-finite")
-    geometry = score_contract.get("model_geometry")
+    geometry = contract.get("model_geometry")
     if isinstance(geometry, Mapping) and {"layers", "heads"} <= set(geometry):
         expected_shape = (int(geometry["layers"]), int(geometry["heads"]))
         if semantic_raw.shape != expected_shape:
@@ -4876,10 +4589,29 @@ def _validate_measurement_values(
         )
         if np.asarray(coordinate).shape != semantic_raw.shape:
             raise RuntimeError(f"{key} score coordinates are incomplete")
+    return {
+        "scores_semantic": len(score_ids["semantic"]),
+        "scores_structural": len(score_ids["structural"]),
+    }
 
+
+def _validate_carriage_measurement_value(
+    config: MethodologyConfig,
+    *,
+    key: str,
+    carriage: Any,
+    expected_graph_ids: set[int],
+    contract: Mapping[str, Any],
+) -> dict[str, int]:
+    channels = _validate_measurement_header(
+        key=key,
+        stage="carriage",
+        payload=carriage,
+        contract=contract,
+    )
     carriage_ids: dict[str, set[int]] = {}
     for channel in CHANNELS:
-        channel_value = carriage["channels"][channel]
+        channel_value = channels[channel]
         if not isinstance(channel_value, Mapping):
             raise RuntimeError(f"{key} carriage/{channel} payload is malformed")
         graph_ids, graph_fields = _mapping_graph_ids(
@@ -4899,21 +4631,72 @@ def _validate_measurement_values(
                 "donor_counts",
                 "F_sens",
             } <= set(field):
-                raise RuntimeError(
-                    f"{key} carriage/{channel} graph {graph_id} field is incomplete"
-                )
+                raise RuntimeError(f"{key} carriage/{channel} graph {graph_id} field is incomplete")
             if config.compute_beneficial_carriage and not {"B", "event_B"} <= set(field):
                 raise RuntimeError(
                     f"{key} carriage/{channel} graph {graph_id} lacks beneficial carriage"
                 )
         carriage_ids[channel] = graph_ids
     return {
-        "expected": len(expected_graph_ids),
-        "scores_semantic": len(score_ids["semantic"]),
-        "scores_structural": len(score_ids["structural"]),
         "carriage_semantic": len(carriage_ids["semantic"]),
         "carriage_structural": len(carriage_ids["structural"]),
     }
+
+
+def _validate_measurement_values(
+    config: MethodologyConfig,
+    *,
+    key: str,
+    scores: Any,
+    carriage: Any,
+    expected_graph_ids: set[int],
+    score_contract: Mapping[str, Any],
+    carriage_contract: Mapping[str, Any],
+) -> dict[str, int]:
+    """Check consolidated score/carriage payloads and their discovery population."""
+
+    return {
+        "expected": len(expected_graph_ids),
+        **_validate_score_measurement_value(
+            key=key,
+            scores=scores,
+            expected_graph_ids=expected_graph_ids,
+            contract=score_contract,
+        ),
+        **_validate_carriage_measurement_value(
+            config,
+            key=key,
+            carriage=carriage,
+            expected_graph_ids=expected_graph_ids,
+            contract=carriage_contract,
+        ),
+    }
+
+
+def _model_discovery_graph_ids(
+    config: MethodologyConfig,
+    *,
+    key: str,
+    model: Mapping[str, Any],
+) -> set[int]:
+    splits = model.get("splits")
+    if not isinstance(splits, Mapping):
+        raise RuntimeError(f"{key} model audit has no split manifest")
+    discovery = splits.get("discovery")
+    if isinstance(discovery, (str, bytes)) or not isinstance(discovery, Sequence):
+        raise RuntimeError(f"{key} discovery split is malformed")
+    try:
+        expected_graph_ids = {int(graph_id) for graph_id in discovery}
+    except (TypeError, ValueError) as error:
+        raise RuntimeError(f"{key} discovery split contains a non-integer ID") from error
+    if len(expected_graph_ids) != len(discovery):
+        raise RuntimeError(f"{key} discovery split contains duplicate graph IDs")
+    if len(expected_graph_ids) != int(config.sizes.discovery_graphs):
+        raise RuntimeError(
+            f"{key} expected {int(config.sizes.discovery_graphs)} discovery graphs, "
+            f"model audit records {len(expected_graph_ids)}"
+        )
+    return expected_graph_ids
 
 
 def _validate_measurement_contracts(
@@ -4930,6 +4713,8 @@ def _validate_measurement_contracts(
         _contract_without_stage_provenance(carriage_contract)
     ):
         raise RuntimeError(f"{key} score and carriage scientific contracts disagree")
+    configured_task, _task_overrides = _resolve_configured_task(config, task_name)
+    expected_adapter = str(configured_task.adapter_version)
     for stage, contract in (
         ("scores", score_contract),
         ("carriage", carriage_contract),
@@ -4940,17 +4725,18 @@ def _validate_measurement_contracts(
             raise RuntimeError(f"{key} {stage} cache has the wrong task or seed contract")
         if contract.get("protocol_fingerprint") != config.fingerprint:
             raise RuntimeError(f"{key} {stage} cache belongs to another configuration")
-        if int(contract.get("donors_per_source", -1)) != int(
-            config.sizes.donors_per_source
-        ):
+        if contract.get("task_adapter_version") != expected_adapter:
+            raise RuntimeError(
+                f"{key} {stage} cache adapter {contract.get('task_adapter_version')!r} "
+                f"differs from current configured adapter {expected_adapter!r}"
+            )
+        if int(contract.get("donors_per_source", -1)) != int(config.sizes.donors_per_source):
             raise RuntimeError(f"{key} {stage} donor count is not canonical for this run")
         if int(contract.get("source_cap", -1)) != int(config.sizes.sources_per_graph):
             raise RuntimeError(f"{key} {stage} source cap is not canonical for this run")
         if int(contract.get("bootstrap_seed", -1)) != int(config.bootstrap.rng_seed):
             raise RuntimeError(f"{key} {stage} bootstrap seed is not canonical for this run")
-        if int(contract.get("bootstrap_replicates", -1)) != int(
-            config.bootstrap.replicates
-        ):
+        if int(contract.get("bootstrap_replicates", -1)) != int(config.bootstrap.replicates):
             raise RuntimeError(
                 f"{key} {stage} bootstrap replicate count is not canonical for this run"
             )
@@ -4981,25 +4767,10 @@ def _validate_measurement_contracts(
     if model_geometry != score_contract.get("model_geometry"):
         raise RuntimeError(f"{key} model and cache geometry disagree")
 
-    splits = model.get("splits")
-    if not isinstance(splits, Mapping):
-        raise RuntimeError(f"{key} model audit has no split manifest")
+    expected_graph_ids = _model_discovery_graph_ids(config, key=key, model=model)
+    splits = model["splits"]
     if stable_hash(dict(splits)) != score_contract.get("split_fingerprint"):
         raise RuntimeError(f"{key} model and cache split fingerprints disagree")
-    discovery = splits.get("discovery")
-    if isinstance(discovery, (str, bytes)) or not isinstance(discovery, Sequence):
-        raise RuntimeError(f"{key} discovery split is malformed")
-    try:
-        expected_graph_ids = {int(graph_id) for graph_id in discovery}
-    except (TypeError, ValueError) as error:
-        raise RuntimeError(f"{key} discovery split contains a non-integer ID") from error
-    if len(expected_graph_ids) != len(discovery):
-        raise RuntimeError(f"{key} discovery split contains duplicate graph IDs")
-    if len(expected_graph_ids) != int(config.sizes.discovery_graphs):
-        raise RuntimeError(
-            f"{key} expected {int(config.sizes.discovery_graphs)} discovery graphs, "
-            f"model audit records {len(expected_graph_ids)}"
-        )
     return checkpoint_digest, expected_graph_ids
 
 
@@ -5043,16 +4814,147 @@ def _population_score_view(scores: Mapping[str, Any]) -> dict[str, Any]:
     """Retain only score fields consumed by the cross-seed summary writer."""
 
     summary = {
-        "channels": {
-            channel: {"raw": scores["channels"][channel]["raw"]}
-            for channel in CHANNELS
-        },
+        "channels": {channel: {"raw": scores["channels"][channel]["raw"]} for channel in CHANNELS},
         "coordinates": scores["coordinates"],
     }
     for optional in ("specialisation_diagnostics", "specialist_classification"):
         if optional in scores:
             summary[optional] = scores[optional]
     return summary
+
+
+def validate_measurement_worker(
+    config: MethodologyConfig,
+    task_name: str,
+    train_seed: int,
+) -> dict[str, Any]:
+    """Validate one isolated score/carriage worker without loading its model or data.
+
+    The returned record is deliberately compact: the score fields needed by population
+    summaries are retained, while the much larger carriage payload is released immediately
+    after validation.  Immutable cache paths and hashes allow downstream consumers to reopen
+    the complete artifacts when needed.
+    """
+
+    config.validate()
+    if tuple(config.phases) != _MEASUREMENT_PHASES:
+        raise ValueError(f"measurement worker validation requires phases={_MEASUREMENT_PHASES!r}")
+    if task_name not in config.tasks:
+        raise ValueError(f"worker task {task_name!r} is not registered in this run")
+    train_seed = int(train_seed)
+    if train_seed not in config.seeds_for(task_name):
+        raise ValueError(f"worker seed {train_seed} is not registered for {task_name!r}")
+
+    key = f"{task_name}:seed{train_seed}"
+    output_dir = config.root / task_name / f"seed_{train_seed}"
+    partials = (
+        sorted(path for path in output_dir.rglob("*.partial") if path.is_file())
+        if output_dir.exists()
+        else []
+    )
+    if partials:
+        preview = ", ".join(str(path) for path in partials[:8])
+        extra = f", +{len(partials) - 8} more" if len(partials) > 8 else ""
+        raise RuntimeError(f"{key} contains incomplete .partial files: {preview}{extra}")
+
+    model, _audit, findings = _validate_worker_sidecars(
+        config,
+        task_name=task_name,
+        train_seed=train_seed,
+        output_dir=output_dir,
+    )
+    expected_graph_ids = _model_discovery_graph_ids(config, key=key, model=model)
+
+    score_path = output_dir / "cache" / "scores" / "raw.pt"
+    score_artifact = load_cache_artifact_file(score_path)
+    try:
+        score_contract = dict(score_artifact.metadata["contract"])
+        score_counts = _validate_score_measurement_value(
+            key=key,
+            scores=score_artifact.value,
+            expected_graph_ids=expected_graph_ids,
+            contract=score_contract,
+        )
+        score_summary = _population_score_view(score_artifact.value)
+        score_index = {
+            "path": str(score_artifact.path),
+            "file_sha256": score_artifact.file_sha256,
+            "contract_fingerprint": str(score_artifact.metadata["contract_fingerprint"]),
+            "event_manifest_hash": str(score_contract["event_manifest_hash"]),
+        }
+    finally:
+        del score_artifact
+        gc.collect()
+
+    carriage_path = output_dir / "cache" / "carriage" / "fields.pt"
+    carriage_artifact = load_cache_artifact_file(carriage_path)
+    try:
+        carriage_contract = dict(carriage_artifact.metadata["contract"])
+        carriage_counts = _validate_carriage_measurement_value(
+            config,
+            key=key,
+            carriage=carriage_artifact.value,
+            expected_graph_ids=expected_graph_ids,
+            contract=carriage_contract,
+        )
+        carriage_index = {
+            "path": str(carriage_artifact.path),
+            "file_sha256": carriage_artifact.file_sha256,
+            "contract_fingerprint": str(carriage_artifact.metadata["contract_fingerprint"]),
+            "event_manifest_hash": str(carriage_contract["event_manifest_hash"]),
+        }
+    finally:
+        del carriage_artifact
+        gc.collect()
+
+    checkpoint_digest, contract_graph_ids = _validate_measurement_contracts(
+        config,
+        key=key,
+        task_name=task_name,
+        train_seed=train_seed,
+        model=model,
+        score_contract=score_contract,
+        carriage_contract=carriage_contract,
+    )
+    if contract_graph_ids != expected_graph_ids:
+        raise RuntimeError(f"{key} model discovery population changed during validation")
+    checkpoint_verification = _checkpoint_file_verification(
+        config,
+        task_name=task_name,
+        train_seed=train_seed,
+        model=model,
+        expected_sha256=checkpoint_digest,
+    )
+    artifacts = {"scores": score_index, "carriage": carriage_index}
+    graph_counts = {
+        "expected": len(expected_graph_ids),
+        **score_counts,
+        **carriage_counts,
+    }
+    source_commits = sorted(
+        {
+            str(score_contract.get("repository_commit", "unknown")),
+            str(carriage_contract.get("repository_commit", "unknown")),
+        }
+    )
+    del model, score_contract, carriage_contract
+    gc.collect()
+    return {
+        "task": task_name,
+        "seed": train_seed,
+        "output_dir": str(output_dir),
+        "scores": score_summary,
+        "carriage": None,
+        "causal": None,
+        "figures": {},
+        "audit_findings": findings,
+        "headline_eligible": not bool(findings),
+        "checkpoint_sha256": checkpoint_digest,
+        "checkpoint_verification": checkpoint_verification,
+        "graph_counts": graph_counts,
+        "artifacts": artifacts,
+        "source_repository_commits": source_commits,
+    }
 
 
 def finalize_measurement_run(config: MethodologyConfig) -> dict[str, Any]:
@@ -5065,17 +4967,13 @@ def finalize_measurement_run(config: MethodologyConfig) -> dict[str, Any]:
 
     config.validate()
     if tuple(config.phases) != _MEASUREMENT_PHASES:
-        raise ValueError(
-            f"measurement finalization requires phases={_MEASUREMENT_PHASES!r}"
-        )
+        raise ValueError(f"measurement finalization requires phases={_MEASUREMENT_PHASES!r}")
     if len(set(config.tasks)) != len(config.tasks):
         raise ValueError("measurement finalization requires unique task names")
     for task_name in config.tasks:
         seeds = config.seeds_for(task_name)
         if len(set(seeds)) != len(seeds):
-            raise ValueError(
-                f"measurement finalization requires unique seeds for {task_name!r}"
-            )
+            raise ValueError(f"measurement finalization requires unique seeds for {task_name!r}")
 
     selected_dirs = [
         config.root / task_name / f"seed_{int(train_seed)}"
@@ -5086,9 +4984,7 @@ def finalize_measurement_run(config: MethodologyConfig) -> dict[str, Any]:
         path
         for scope in (config.root, *selected_dirs)
         if scope.exists()
-        for path in (
-            scope.glob("*.partial") if scope == config.root else scope.rglob("*.partial")
-        )
+        for path in (scope.glob("*.partial") if scope == config.root else scope.rglob("*.partial"))
         if path.is_file()
     }
     if partials:
@@ -5108,102 +5004,34 @@ def finalize_measurement_run(config: MethodologyConfig) -> dict[str, Any]:
     for task_name in config.tasks:
         for train_seed in config.seeds_for(task_name):
             key = f"{task_name}:seed{int(train_seed)}"
-            output_dir = config.root / task_name / f"seed_{int(train_seed)}"
-            model, _audit, findings = _validate_worker_sidecars(
+            validated = validate_measurement_worker(
                 config,
-                task_name=task_name,
-                train_seed=int(train_seed),
-                output_dir=output_dir,
+                task_name,
+                int(train_seed),
             )
-            cache_paths = {
-                "scores": output_dir / "cache" / "scores" / "raw.pt",
-                "carriage": output_dir / "cache" / "carriage" / "fields.pt",
+            artifacts = validated["artifacts"]
+            artifact_fingerprints[key] = {
+                name: str(record["contract_fingerprint"]) for name, record in artifacts.items()
             }
-            artifacts = {
-                name: load_cache_artifact_file(path)
-                for name, path in cache_paths.items()
+            artifact_file_sha256[key] = {
+                name: str(record["file_sha256"]) for name, record in artifacts.items()
             }
-            contracts = {
-                name: artifact.metadata["contract"]
-                for name, artifact in artifacts.items()
-            }
-            checkpoint_digest, expected_graph_ids = _validate_measurement_contracts(
-                config,
-                key=key,
-                task_name=task_name,
-                train_seed=int(train_seed),
-                model=model,
-                score_contract=contracts["scores"],
-                carriage_contract=contracts["carriage"],
-            )
-            graph_counts = _validate_measurement_values(
-                config,
-                key=key,
-                scores=artifacts["scores"].value,
-                carriage=artifacts["carriage"].value,
-                expected_graph_ids=expected_graph_ids,
-                score_contract=contracts["scores"],
-                carriage_contract=contracts["carriage"],
-            )
-            checkpoint_verification = _checkpoint_file_verification(
-                config,
-                task_name=task_name,
-                train_seed=int(train_seed),
-                model=model,
-                expected_sha256=checkpoint_digest,
-            )
-            artifact_fingerprints[key] = {}
-            artifact_file_sha256[key] = {}
-            artifact_index: dict[str, Any] = {}
-            for name, artifact in artifacts.items():
-                contract = contracts[name]
-                artifact_commits.add(str(contract.get("repository_commit", "unknown")))
-                contract_fingerprint = str(
-                    artifact.metadata["contract_fingerprint"]
-                )
-                artifact_fingerprints[key][name] = contract_fingerprint
-                artifact_file_sha256[key][name] = artifact.file_sha256
-                artifact_index[name] = {
-                    "path": str(artifact.path),
-                    "file_sha256": artifact.file_sha256,
-                    "contract_fingerprint": contract_fingerprint,
-                    "event_manifest_hash": str(contract["event_manifest_hash"]),
-                }
-            checkpoint_sha256_by_run[key] = checkpoint_digest
-            score_summary = _population_score_view(artifacts["scores"].value)
-            results[key] = {
-                "task": task_name,
-                "seed": int(train_seed),
-                "output_dir": str(output_dir),
-                "scores": score_summary,
-                # Carriage is validated above but intentionally not accumulated across
-                # thirty workers. Downstream consumers reopen the indexed immutable cache.
-                "carriage": None,
-                "causal": None,
-                "figures": {},
-                "audit_findings": findings,
-                "headline_eligible": not bool(findings),
-                "checkpoint_sha256": checkpoint_digest,
-                "graph_counts": graph_counts,
-                "artifacts": artifact_index,
-            }
-            run_findings[key] = findings
+            artifact_commits.update(validated["source_repository_commits"])
+            checkpoint_sha256_by_run[key] = str(validated["checkpoint_sha256"])
+            results[key] = validated
+            run_findings[key] = validated["audit_findings"]
             postflight_runs[key] = {
                 "task": task_name,
                 "seed": int(train_seed),
-                "checkpoint_sha256": checkpoint_digest,
-                "checkpoint_verification": checkpoint_verification,
-                "graph_counts": graph_counts,
+                "checkpoint_sha256": validated["checkpoint_sha256"],
+                "checkpoint_verification": validated["checkpoint_verification"],
+                "graph_counts": validated["graph_counts"],
                 "channels": list(CHANNELS),
-                "artifacts": artifact_index,
-                "audit_findings": len(findings),
-                "headline_eligible": not bool(findings),
+                "artifacts": artifacts,
+                "audit_findings": len(validated["audit_findings"]),
+                "headline_eligible": validated["headline_eligible"],
             }
             log(f"[measurement-finalize] validated {key}")
-            # The consolidated carriage fields can be much larger than the small population
-            # score view. Ensure loop locals do not retain the just-validated payload.
-            del artifact, artifacts, contracts
-            gc.collect()
 
     source_commits = sorted(artifact_commits)
     postflight_path = config.root / "measurement_postflight.json"
@@ -5212,9 +5040,7 @@ def finalize_measurement_run(config: MethodologyConfig) -> dict[str, Any]:
         {
             "repository_commit": _repository_commit(),
             "execution_mode": "model-free-measurement-finalizer",
-            "source_repository_commit": (
-                source_commits[0] if len(source_commits) == 1 else None
-            ),
+            "source_repository_commit": (source_commits[0] if len(source_commits) == 1 else None),
             "source_repository_commits": source_commits,
             "source_cache_contract_fingerprints": artifact_fingerprints,
             "source_cache_file_sha256": artifact_file_sha256,
@@ -5300,15 +5126,9 @@ def finalize_cached_run(config: MethodologyConfig) -> dict[str, Any]:
                 for name, path in cache_paths.items()
                 if name != "carriage" or path.exists()
             }
-            missing_required = [
-                name
-                for name in ("scores", "causal")
-                if name not in artifacts
-            ]
+            missing_required = [name for name in ("scores", "causal") if name not in artifacts]
             if missing_required:
-                missing_paths = ", ".join(
-                    str(cache_paths[name]) for name in missing_required
-                )
+                missing_paths = ", ".join(str(cache_paths[name]) for name in missing_required)
                 raise FileNotFoundError(
                     "cached causal finalization requires score and causal caches; "
                     f"missing {missing_paths}"
@@ -5316,26 +5136,20 @@ def finalize_cached_run(config: MethodologyConfig) -> dict[str, Any]:
             artifact_fingerprints[key] = {}
             for name, artifact in artifacts.items():
                 contract = artifact.metadata["contract"]
-                if contract.get("task") != task_name or int(
-                    contract.get("train_seed", -1)
-                ) != int(train_seed):
-                    raise RuntimeError(
-                        f"{artifact.path} is not the registered {key} {name} cache"
-                    )
+                if contract.get("task") != task_name or int(contract.get("train_seed", -1)) != int(
+                    train_seed
+                ):
+                    raise RuntimeError(f"{artifact.path} is not the registered {key} {name} cache")
                 if contract.get("protocol_fingerprint") != config.fingerprint:
                     raise RuntimeError(
                         f"{artifact.path} was produced under another scientific "
                         "configuration; use the matching worker/finalizer arguments"
                     )
                 artifact_commits.add(str(contract.get("repository_commit", "unknown")))
-                artifact_fingerprints[key][name] = str(
-                    artifact.metadata["contract_fingerprint"]
-                )
+                artifact_fingerprints[key][name] = str(artifact.metadata["contract_fingerprint"])
             audit_path = output_dir / "audits.json"
             if not audit_path.exists():
-                raise FileNotFoundError(
-                    f"cached finalization requires worker audit {audit_path}"
-                )
+                raise FileNotFoundError(f"cached finalization requires worker audit {audit_path}")
             audit_record = json.loads(audit_path.read_text(encoding="utf-8"))
             findings = list(audit_record.get("findings", ()))
             if task_name == FOCUSED_GRAPHBENCH_TASK:
@@ -5364,11 +5178,7 @@ def finalize_cached_run(config: MethodologyConfig) -> dict[str, Any]:
                 "seed": int(train_seed),
                 "output_dir": str(output_dir),
                 "scores": artifacts["scores"].value,
-                "carriage": (
-                    artifacts["carriage"].value
-                    if "carriage" in artifacts
-                    else None
-                ),
+                "carriage": (artifacts["carriage"].value if "carriage" in artifacts else None),
                 "causal": artifacts["causal"].value,
                 "figures": figures,
                 "audit_findings": findings,
@@ -5383,9 +5193,7 @@ def finalize_cached_run(config: MethodologyConfig) -> dict[str, Any]:
             "execution_mode": "model-free-cache-finalizer",
             # Commits are provenance, not a cache-validity boundary. A resumed run can validly
             # combine artifacts produced by multiple checkouts under one scientific contract.
-            "source_repository_commit": (
-                source_commits[0] if len(source_commits) == 1 else None
-            ),
+            "source_repository_commit": (source_commits[0] if len(source_commits) == 1 else None),
             "source_repository_commits": source_commits,
             "source_cache_contract_fingerprints": artifact_fingerprints,
         }

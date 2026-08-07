@@ -78,9 +78,18 @@ It defaults to the existing Drive project folder
 `/content/drive/MyDrive/graph_specialisation_metrics/multi_seed_models`, where the archive and
 sidecar live.
 Its setup mode verifies and extracts the registered archive, warms the shared datasets, and emits
-30 commit-pinned, pre-indexed worker notebooks. Each worker uses the same complete 10-task/3-seed
-configuration and calls `run_worker(..., retain_results=False)`, leaving durable caches on Drive
-while releasing score and carriage payloads between components.
+both 30 commit-pinned, pre-indexed single-worker notebooks under `worker_notebooks/` and four
+commit-pinned sequential notebooks under `queue_notebooks/`. For four Colab GPUs, open
+`queue_01_of_04.ipynb` through `queue_04_of_04.ipynb` and run all four; their disjoint 8/8/7/7
+round-robin queues cover every checkpoint. Each queue revalidates and skips completed workers on a
+rerun, resumes missing or incomplete work sequentially, and uses the same complete 10-task/3-seed
+configuration. Workers call `run_worker(..., retain_results=False)`, leaving durable caches on Drive
+while releasing score and carriage payloads between components and checkpoints.
+Queue completion checks the current task adapter, sidecars, exact split graph IDs, event manifests,
+cache contracts, checkpoint bytes, and artifact hashes. The finalizer independently repeats this
+model-free postflight over all 30 workers before writing population summaries.
+After an orchestration update, rerunning setup rehashes and reuses an intact prepared corpus and
+dataset inventory, then refreshes the commit-pinned notebooks without re-downloading the datasets.
 
 ## Module boundary
 
