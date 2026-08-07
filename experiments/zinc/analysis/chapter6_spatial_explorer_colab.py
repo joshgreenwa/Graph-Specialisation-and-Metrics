@@ -61,6 +61,14 @@ HEAD_CONTEXT_GRAPH_INDICES = (0, 1)
 HEAD_CONTEXT_COMPUTE_MISSING = True
 FORCE_HEAD_CONTEXT_RECOMPUTE = False
 
+# Tiny causal checks for the architectural interpretation. Each missing task
+# uses four graphs, one source, and one donor, then becomes cache-only.
+RUN_LIGHTWEIGHT_HYPOTHESIS_PILOTS = True
+HYPOTHESIS_PILOT_GRAPHS = 4
+HYPOTHESIS_PILOT_SOURCES = 1
+HYPOTHESIS_PILOT_DONORS = 1
+FORCE_HYPOTHESIS_PILOTS = False
+
 
 def command(*parts: str) -> None:
     shown = [
@@ -132,7 +140,7 @@ def bootstrap() -> None:
 
 bootstrap()
 
-from graph_specialisation_metrics.chapter6_spatial_explorer import inventory, run
+from graph_specialisation_metrics.chapter6_spatial_explorer import inventory, run  # noqa: E402
 
 
 print(
@@ -146,6 +154,7 @@ print(
     "virtual-node allocation, and paired graph-bootstrap width intervals are reported.\n"
     "[scope] Clean attention mass is compared with layerwise score distance whenever it "
     "is present in raw.pt; attention is not treated as a causal score.\n"
+    "[scope] Response-weighted layer is computed directly from cached exact-distance scores.\n"
     "[scope] Final-state carriage is overlaid when fields.pt is present. It measures "
     "learned response, not task necessity.\n"
     "[scope] Cache protocol differences produce warnings only. Missing components skip "
@@ -236,14 +245,44 @@ for path in result["figures"]:
         display(Image(filename=path))
 
 
-if GENERATE_HEAD_CONTEXT or GENERATE_REACH_MISMATCH_CONTEXT:
+needs_model_runtime = (
+    RUN_LIGHTWEIGHT_HYPOTHESIS_PILOTS or GENERATE_HEAD_CONTEXT or GENERATE_REACH_MISMATCH_CONTEXT
+)
+if needs_model_runtime:
     # Optional runtime dependencies are installed only for this explicitly enabled
     # stage. Supplemental cache hits do not invoke another model forward pass.
     command(sys.executable, "-m", "pip", "install", "-q", "pillow", "rdkit")
-    if HEAD_CONTEXT_COMPUTE_MISSING:
+    if HEAD_CONTEXT_COMPUTE_MISSING or RUN_LIGHTWEIGHT_HYPOTHESIS_PILOTS:
         from graph_specialisation_metrics.carriage import env
 
         env.install_dependencies(pyg_version="2.2.0")
+
+
+if RUN_LIGHTWEIGHT_HYPOTHESIS_PILOTS:
+    from graph_specialisation_metrics.chapter6_hypothesis_pilots import (
+        run as run_hypothesis_pilots,
+    )
+
+    pilot_result = run_hypothesis_pilots(
+        CANONICAL_ROOTS,
+        OUTPUT_DIR / "hypothesis_pilots",
+        seed=TRAIN_SEED,
+        graphs=HYPOTHESIS_PILOT_GRAPHS,
+        sources_per_graph=HYPOTHESIS_PILOT_SOURCES,
+        donors_per_source=HYPOTHESIS_PILOT_DONORS,
+        accelerator="cuda:0",
+        force=FORCE_HYPOTHESIS_PILOTS,
+        verbose=True,
+    )
+    for warning in pilot_result["warnings"]:
+        print(f"[hypothesis-pilot:warning] {warning}", flush=True)
+    for path in pilot_result["figures"]:
+        if str(path).endswith(".png") and Path(path).is_file():
+            print(f"\n[display] {Path(path).stem}", flush=True)
+            display(Image(filename=path))
+
+
+if GENERATE_HEAD_CONTEXT or GENERATE_REACH_MISMATCH_CONTEXT:
     from graph_specialisation_metrics.chapter6_head_context import (
         generate_head_context,
     )

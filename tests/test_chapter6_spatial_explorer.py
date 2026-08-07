@@ -17,6 +17,7 @@ from graph_specialisation_metrics.chapter6_spatial_explorer import (
     molecular_scale_relationships,
     reach_mismatch_summary,
     representative_reach_mismatches,
+    response_layer_by_distance,
     run,
     score_organisation_similarity,
     spatial_width_bootstrap,
@@ -175,6 +176,12 @@ def test_head_metrics_keep_width_uncertainty_and_attention_separate(tmp_path):
         "score_mass",
         "per_opportunity",
     }
+    response_rows = response_layer_by_distance(models)
+    semantic_zero = next(
+        row for row in response_rows if row["channel"] == "semantic" and row["distance"] == 0.0
+    )
+    assert semantic_zero["response_weighted_layer"] == pytest.approx(0.0)
+    assert semantic_zero["onset_layer"] == 0
     bootstrap_rows = spatial_width_bootstrap(models, replicates=200, seed=0)
     assert len(bootstrap_rows) == 2
     assert bootstrap_rows[0]["graphs"] == 2
@@ -295,6 +302,7 @@ def test_run_skips_missing_components_and_writes_exploratory_outputs(tmp_path):
         "model_distance_profiles.csv",
         "score_profile_uncertainty.csv",
         "layer_distance_profiles.csv",
+        "response_layer_by_distance.csv",
         "vnode_layer_allocation.csv",
         "spatial_width_graph_bootstrap.csv",
         "width_contributions_by_distance.csv",
@@ -330,6 +338,7 @@ def test_run_skips_missing_components_and_writes_exploratory_outputs(tmp_path):
         "21_attention_vs_score_reach.png",
         "22_head_attention_score_reach_gap.png",
         "23_head_score_landscapes.png",
+        "24_response_layer_by_distance.png",
     }
 
 
@@ -342,6 +351,8 @@ def test_colab_enables_two_reach_mismatch_examples_by_default():
     assert "REACH_MISMATCH_CONTEXT_TASKS = TASKS" in source
     assert "HEAD_CONTEXT_GRAPH_INDICES = (0, 1)" in source
     assert 'context_name="reach_mismatch"' in source
+    assert "RUN_LIGHTWEIGHT_HYPOTHESIS_PILOTS = True" in source
+    assert "HYPOTHESIS_PILOT_GRAPHS = 4" in source
 
 
 def test_head_context_records_missing_representatives(tmp_path):

@@ -340,6 +340,73 @@ def structural_donor_swap(
     return out
 
 
+def rrwp_only_donor_swap(
+    data: Any,
+    source: int,
+    donor: int,
+    *,
+    task: Any,
+    duplicate_tolerance: float,
+) -> Any:
+    """Copy only RRWP node/pair payloads while retaining every other field.
+
+    This deliberately excludes degree and other positional encodings from the
+    canonical structural intervention.  Attention support remains fixed.
+    """
+
+    source, donor = int(source), int(donor)
+    if source < 0 or donor < 0 or source >= int(data.num_nodes) or donor >= int(data.num_nodes):
+        raise IndexError("source/donor is outside the graph")
+    audit_structural_fields(data, task)
+    out = data.clone()
+    if source == donor:
+        return out
+
+    node_fields = tuple(name for name in task.node_structural_fields if "rrwp" in str(name).lower())
+    pair_fields = tuple(
+        pair
+        for pair in task.pair_structural_fields
+        if any("rrwp" in str(name).lower() for name in pair)
+    )
+    dense_fields = tuple(
+        name
+        for name in getattr(task, "dense_pair_structural_fields", ())
+        if "rrwp" in str(name).lower()
+    )
+    if not node_fields and not pair_fields and not dense_fields:
+        raise StructuralAuditError(f"task {task.name!r} declares no RRWP payload")
+
+    for name in node_fields:
+        tensor = getattr(data, name, None)
+        if tensor is None:
+            continue
+        replacement = tensor.clone()
+        replacement[source] = tensor[donor]
+        setattr(out, name, replacement)
+
+    for index_name, value_name in pair_fields:
+        index = getattr(data, index_name, None)
+        value = getattr(data, value_name, None)
+        if index is None:
+            continue
+        new_index, new_value = copy_sparse_pair_footprint(
+            index,
+            value,
+            source,
+            donor,
+            num_nodes=int(data.num_nodes),
+            tolerance=float(duplicate_tolerance),
+        )
+        setattr(out, index_name, new_index)
+        setattr(out, value_name, new_value)
+
+    for name in dense_fields:
+        value = getattr(data, name, None)
+        if value is not None:
+            setattr(out, name, dense_pair_donor_swap(value, source, donor))
+    return out
+
+
 def _dense_from_sparse(index: Any, value: Any, n: int) -> tuple[Any, Any]:
     import torch
 

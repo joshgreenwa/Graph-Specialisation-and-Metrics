@@ -42,7 +42,7 @@ from .zinc_cached_rrwp_comparison import (
     vnode_profile_rows,
 )
 
-ANALYSIS_VERSION = "chapter6-spatial-explorer-v6"
+ANALYSIS_VERSION = "chapter6-spatial-explorer-v7"
 CHANNELS = ("semantic", "structural")
 ORGANISATION_FAMILIES = (
     "semantic_leaning",
@@ -964,6 +964,82 @@ def layer_distance_profiles(
 
     exact_rows = head_profile_distance_decomposition_rows(models)  # type: ignore[arg-type]
     return summarise_layerwise_distance_decomposition(exact_rows)
+
+
+def response_layer_by_distance(
+    models: Sequence[SpatialModel],
+    *,
+    onset_fraction: float = 0.25,
+) -> list[dict[str, Any]]:
+    """Locate when score mass associated with each exact distance appears.
+
+    Raw head-score mass is summed within layers and then normalized over layers
+    separately for each task, intervention channel, and molecular distance.  The
+    response-weighted layer is the stable primary summary; ``onset_layer`` is the
+    first layer containing ``onset_fraction`` of cumulative mass.
+    """
+
+    if not 0.0 < float(onset_fraction) <= 1.0:
+        raise ValueError("onset_fraction must be in (0, 1]")
+    layer_mass: dict[tuple[str, str, float, int], float] = {}
+    for model in models:
+        for channel in CHANNELS:
+            values = _as_numpy(model.score["channels"][channel]["heatmap_exact_head"])
+            reportable = _reportable(model.score, channel)
+            for position, label in enumerate(model.score["axis"]):
+                distance = _numeric_distance(label)
+                if distance is None or not bool(reportable[position]):
+                    continue
+                for layer in range(values.shape[0]):
+                    mass = np.asarray(values[layer, :, position], dtype=np.float64)
+                    mass = np.where(np.isfinite(mass), np.maximum(mass, 0.0), 0.0)
+                    layer_mass[(model.task, channel, float(distance), layer)] = float(np.sum(mass))
+
+    totals_by_channel: dict[tuple[str, str], float] = {}
+    distance_totals: dict[tuple[str, str, float], float] = {}
+    for (task, channel, distance, _layer), mass in layer_mass.items():
+        distance_key = (task, channel, distance)
+        distance_totals[distance_key] = distance_totals.get(distance_key, 0.0) + mass
+        totals_by_channel[(task, channel)] = totals_by_channel.get((task, channel), 0.0) + mass
+
+    output: list[dict[str, Any]] = []
+    for task, channel, distance in sorted(distance_totals):
+        layers = sorted(
+            layer
+            for candidate_task, candidate_channel, candidate_distance, layer in layer_mass
+            if candidate_task == task
+            and candidate_channel == channel
+            and candidate_distance == distance
+        )
+        masses = np.asarray(
+            [layer_mass[(task, channel, distance, layer)] for layer in layers],
+            dtype=np.float64,
+        )
+        total = float(np.sum(masses))
+        if total <= 1.0e-12:
+            continue
+        profile = masses / total
+        cumulative = np.cumsum(profile)
+        onset_index = min(
+            int(np.searchsorted(cumulative, float(onset_fraction), side="left")),
+            len(layers) - 1,
+        )
+        channel_total = totals_by_channel[(task, channel)]
+        output.append(
+            {
+                "task": task,
+                "channel": channel,
+                "distance": float(distance),
+                "response_weighted_layer": float(
+                    np.sum(np.asarray(layers, dtype=np.float64) * profile)
+                ),
+                "onset_layer": int(layers[onset_index]),
+                "onset_fraction": float(onset_fraction),
+                "distance_score_mass": total,
+                "distance_mass_share": total / channel_total,
+            }
+        )
+    return output
 
 
 def vnode_layer_profiles(models: Sequence[SpatialModel]) -> list[dict[str, Any]]:
@@ -3070,6 +3146,66 @@ def _plot_head_score_landscapes(
     return paths
 
 
+def _plot_response_layer_by_distance(
+    rows: Sequence[Mapping[str, Any]], tasks: Sequence[str], figures_dir: Path
+) -> list[Path]:
+    """Plot the layer at which each intervention distance is represented."""
+
+    import matplotlib.pyplot as plt
+
+    tasks = [task for task in tasks if any(str(row["task"]) == task for row in rows)]
+    if not tasks:
+        return []
+    figure, axes = plt.subplots(
+        1,
+        len(tasks),
+        figsize=(3.2 * len(tasks), 3.4),
+        squeeze=False,
+        sharey=True,
+        constrained_layout=True,
+    )
+    styles = {
+        "semantic": ("#0072B2", "o", "semantic"),
+        "structural": ("#D55E00", "s", "structural"),
+    }
+    for column, task in enumerate(tasks):
+        axis = axes[0, column]
+        task_rows = [row for row in rows if str(row["task"]) == task]
+        for channel in CHANNELS:
+            selected = sorted(
+                (
+                    row
+                    for row in task_rows
+                    if str(row["channel"]) == channel and float(row["distance_mass_share"]) >= 0.01
+                ),
+                key=lambda row: float(row["distance"]),
+            )
+            if not selected:
+                continue
+            colour, marker, label = styles[channel]
+            axis.plot(
+                [float(row["distance"]) for row in selected],
+                [float(row["response_weighted_layer"]) for row in selected],
+                color=colour,
+                marker=marker,
+                linewidth=1.8,
+                label=label,
+            )
+        axis.set_title(_task_label(task), fontsize=10)
+        axis.set_xlabel("intervention distance")
+        axis.grid(alpha=0.18)
+        if column == 0:
+            axis.set_ylabel("response-weighted layer")
+            axis.legend(frameon=False, fontsize=8)
+    figure.suptitle(
+        "Does semantic information propagate later with distance? "
+        r"($\geq$1% channel mass)"
+    )
+    paths = _save_figure(figure, figures_dir, "24_response_layer_by_distance")
+    plt.close(figure)
+    return paths
+
+
 def _plot_score_carriage(
     profile_rows: Sequence[Mapping[str, Any]], tasks: Sequence[str], figures_dir: Path
 ) -> list[Path]:
@@ -3170,6 +3306,7 @@ def run(
     profile_rows = model_profiles(models)
     uncertainty_rows = uncertainty_profiles(models)
     distance_rows = layer_distance_profiles(models)
+    response_layer_rows = response_layer_by_distance(models)
     vnode_rows = vnode_layer_profiles(models)
     width_bootstrap_rows = spatial_width_bootstrap(models)
     width_contribution_rows = width_contribution_profiles(models)
@@ -3191,6 +3328,7 @@ def run(
         "model_distance_profiles.csv": profile_rows,
         "score_profile_uncertainty.csv": uncertainty_rows,
         "layer_distance_profiles.csv": distance_rows,
+        "response_layer_by_distance.csv": response_layer_rows,
         "vnode_layer_allocation.csv": vnode_rows,
         "spatial_width_graph_bootstrap.csv": width_bootstrap_rows,
         "width_contributions_by_distance.csv": width_contribution_rows,
@@ -3285,6 +3423,11 @@ def run(
             head_rows, mismatch_rows, available_tasks, figures_dir
         )
     )
+    figures.extend(
+        _plot_response_layer_by_distance(
+            response_layer_rows, available_tasks, figures_dir
+        )
+    )
     summary = {
         "analysis_version": ANALYSIS_VERSION,
         "tasks_requested": list(tasks),
@@ -3355,6 +3498,10 @@ def run(
                 "molecular score expected distance minus clean-attention expected "
                 "distance; virtual-node mass remains separate"
             ),
+            "response_layer": (
+                "raw head-score mass normalized over layers within each exact molecular "
+                "distance; the primary summary is its response-weighted layer"
+            ),
             "attention": "clean attention mass by graph distance, not a causal score",
             "carriage": (
                 "final-state response under the same intervention family, not task "
@@ -3375,6 +3522,7 @@ def run(
         "layer_rows": layer_rows,
         "representative_rows": representative_rows,
         "distance_rows": distance_rows,
+        "response_layer_rows": response_layer_rows,
         "vnode_rows": vnode_rows,
         "width_bootstrap_rows": width_bootstrap_rows,
         "width_contribution_rows": width_contribution_rows,
@@ -3402,6 +3550,7 @@ __all__ = [
     "model_profiles",
     "molecular_scale_relationships",
     "reach_mismatch_summary",
+    "response_layer_by_distance",
     "representative_heads",
     "representative_reach_mismatches",
     "run",

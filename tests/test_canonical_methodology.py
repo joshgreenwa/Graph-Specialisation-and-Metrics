@@ -65,6 +65,7 @@ from graph_specialisation_metrics.methodology.figures import (
 from graph_specialisation_metrics.methodology.interventions import (
     StructuralAuditError,
     coalesce_equal_sparse,
+    rrwp_only_donor_swap,
     semantic_donor_swap,
     structural_donor_swap,
 )
@@ -949,6 +950,19 @@ def test_structural_swap_matches_dense_row_column_self_and_fixed_support():
     assert torch.equal(event.edge_attr, base.edge_attr)
     assert torch.equal(event.rrwp_local_edge_index, base.rrwp_local_edge_index)
     assert torch.equal(event.rrwp[2], base.rrwp[2])  # donor is not transposed
+
+
+def test_rrwp_only_swap_excludes_degree_encodings():
+    task = get_task("zinc")
+    base = structural_graph()
+    base.deg = torch.tensor([[1.0], [2.0], [3.0]])
+    base.log_deg = torch.log1p(base.deg)
+    event = rrwp_only_donor_swap(base, 0, 2, task=task, duplicate_tolerance=1e-7)
+
+    assert torch.equal(event.rrwp[0], base.rrwp[2])
+    assert torch.equal(event.deg, base.deg)
+    assert torch.equal(event.log_deg, base.log_deg)
+    assert torch.equal(event.edge_index, base.edge_index)
 
 
 def test_qm9_frozen_attention_support_is_registered_and_preserved():
