@@ -51,11 +51,12 @@ TASKS = (
 TRAIN_SEED = 42
 REPRESENTATIVE_ACTIVITY_QUANTILE = 0.25
 
-# Optional: two matched heads per selected model, shown on real molecules.
-# The core explorer above remains entirely cache-only. Turning this on reuses an
-# exact supplemental cache and computes only the missing attention examples.
-GENERATE_HEAD_CONTEXT = True
+# Optional molecular examples. The alignment comparison is retained as a
+# switch, while the operator-reach mismatch is the default Chapter 6 view.
+GENERATE_HEAD_CONTEXT = False
 HEAD_CONTEXT_TASKS = ("zinc_1hop_vnode", "zinc_2hop", "zinc")
+GENERATE_REACH_MISMATCH_CONTEXT = True
+REACH_MISMATCH_CONTEXT_TASKS = TASKS
 HEAD_CONTEXT_GRAPH_INDICES = (0, 1)
 HEAD_CONTEXT_COMPUTE_MISSING = True
 FORCE_HEAD_CONTEXT_RECOMPUTE = False
@@ -235,7 +236,7 @@ for path in result["figures"]:
         display(Image(filename=path))
 
 
-if GENERATE_HEAD_CONTEXT:
+if GENERATE_HEAD_CONTEXT or GENERATE_REACH_MISMATCH_CONTEXT:
     # Optional runtime dependencies are installed only for this explicitly enabled
     # stage. Supplemental cache hits do not invoke another model forward pass.
     command(sys.executable, "-m", "pip", "install", "-q", "pillow", "rdkit")
@@ -247,30 +248,53 @@ if GENERATE_HEAD_CONTEXT:
         generate_head_context,
     )
 
-    head_context = generate_head_context(
-        result["model_artifacts"],
-        representative_table.to_dict("records"),
-        OUTPUT_DIR / "head_context",
-        tasks=HEAD_CONTEXT_TASKS,
-        graph_indices=HEAD_CONTEXT_GRAPH_INDICES,
-        accelerator="cuda:0",
-        compute_missing=HEAD_CONTEXT_COMPUTE_MISSING,
-        force=FORCE_HEAD_CONTEXT_RECOMPUTE,
-    )
-    for warning in head_context["warnings"]:
-        print(f"[head-context:warning] {warning}", flush=True)
-    if not head_context["outputs"]:
-        raise RuntimeError(
-            "Head-context generation produced no figures. See the task-stage "
-            f"diagnostics in {head_context['summary_path']} and the warnings above."
+    def render_head_context(
+        rows,
+        *,
+        output_name: str,
+        context_name: str,
+        tasks,
+    ) -> None:
+        head_context = generate_head_context(
+            result["model_artifacts"],
+            rows,
+            OUTPUT_DIR / output_name,
+            tasks=tasks,
+            graph_indices=HEAD_CONTEXT_GRAPH_INDICES,
+            accelerator="cuda:0",
+            compute_missing=HEAD_CONTEXT_COMPUTE_MISSING,
+            force=FORCE_HEAD_CONTEXT_RECOMPUTE,
+            context_name=context_name,
         )
-    for record in head_context["outputs"]:
-        print(
-            f"\n[display] {record['task']} · {record['role']} · "
-            f"L{record['layer']} H{record['head']}",
-            flush=True,
+        for warning in head_context["warnings"]:
+            print(f"[{context_name}:warning] {warning}", flush=True)
+        if not head_context["outputs"]:
+            raise RuntimeError(
+                f"{context_name} head-context generation produced no figures. "
+                f"See {head_context['summary_path']} and the warnings above."
+            )
+        for record in head_context["outputs"]:
+            print(
+                f"\n[display] {record['task']} · {record['role']} · "
+                f"L{record['layer']} H{record['head']}",
+                flush=True,
+            )
+            display(Image(filename=record["png"]))
+
+    if GENERATE_HEAD_CONTEXT:
+        render_head_context(
+            representative_table.to_dict("records"),
+            output_name="head_context",
+            context_name="alignment",
+            tasks=HEAD_CONTEXT_TASKS,
         )
-        display(Image(filename=record["png"]))
+    if GENERATE_REACH_MISMATCH_CONTEXT:
+        render_head_context(
+            result["mismatch_rows"],
+            output_name="reach_mismatch_context",
+            context_name="reach_mismatch",
+            tasks=REACH_MISMATCH_CONTEXT_TASKS,
+        )
 
 
 print(f"\n[done] Chapter 6 exploration saved under {OUTPUT_DIR}", flush=True)

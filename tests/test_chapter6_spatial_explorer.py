@@ -15,6 +15,8 @@ from graph_specialisation_metrics.chapter6_spatial_explorer import (
     layer_summary,
     load_models,
     molecular_scale_relationships,
+    reach_mismatch_summary,
+    representative_reach_mismatches,
     run,
     score_organisation_similarity,
     spatial_width_bootstrap,
@@ -143,6 +145,10 @@ def test_head_metrics_keep_width_uncertainty_and_attention_separate(tmp_path):
     assert first["structural_expected_distance"] == pytest.approx(1.0)
     assert first["semantic_spatial_variance"] == pytest.approx(0.0)
     assert first["attention_expected_distance"] == pytest.approx(1.0)
+    assert first["semantic_attention_reach_gap"] == pytest.approx(-1.0)
+    assert first["structural_attention_reach_gap"] == pytest.approx(0.0)
+    assert first["max_abs_attention_reach_gap"] == pytest.approx(1.0)
+    assert first["dominant_reach_gap_channel"] == "semantic"
     assert first["overlap"] == pytest.approx(0.0)
     assert np.isfinite(first["semantic_expected_distance_sem"])
     assert first["family"] == "semantic_leaning"
@@ -200,6 +206,11 @@ def test_head_metrics_keep_width_uncertainty_and_attention_separate(tmp_path):
     )
     assert similarity_rows[0]["model_wide_similarity"] == pytest.approx(1.0)
     assert similarity_rows[0]["layer_resolved_similarity"] == pytest.approx(1.0)
+    mismatch_summary = reach_mismatch_summary(rows)
+    assert mismatch_summary[0]["heads"] > 0
+    mismatch_rows = representative_reach_mismatches(rows)
+    assert len(mismatch_rows) == 1
+    assert mismatch_rows[0]["role"] == "strongest active reach mismatch"
 
 
 def test_loader_falls_back_to_equivalent_duplicate_carriage(tmp_path):
@@ -277,6 +288,8 @@ def test_run_skips_missing_components_and_writes_exploratory_outputs(tmp_path):
     for name in (
         "cache_inventory.csv",
         "head_spatial_metrics.csv",
+        "head_reach_mismatch_summary.csv",
+        "representative_reach_mismatches.csv",
         "layer_spatial_summary.csv",
         "representative_heads.csv",
         "model_distance_profiles.csv",
@@ -314,16 +327,21 @@ def test_run_skips_missing_components_and_writes_exploratory_outputs(tmp_path):
         "18_layerwise_score_organisation.png",
         "19_head_role_score_allocation.png",
         "20_score_organisation_similarity.png",
+        "21_attention_vs_score_reach.png",
+        "22_head_attention_score_reach_gap.png",
+        "23_head_score_landscapes.png",
     }
 
 
-def test_colab_enables_two_molecular_attention_examples_by_default():
+def test_colab_enables_two_reach_mismatch_examples_by_default():
     source = Path("experiments/zinc/analysis/chapter6_spatial_explorer_colab.py").read_text(
         encoding="utf-8"
     )
-    assert "GENERATE_HEAD_CONTEXT = True" in source
+    assert "GENERATE_HEAD_CONTEXT = False" in source
+    assert "GENERATE_REACH_MISMATCH_CONTEXT = True" in source
+    assert "REACH_MISMATCH_CONTEXT_TASKS = TASKS" in source
     assert "HEAD_CONTEXT_GRAPH_INDICES = (0, 1)" in source
-    assert "if not head_context[\"outputs\"]" in source
+    assert 'context_name="reach_mismatch"' in source
 
 
 def test_head_context_records_missing_representatives(tmp_path):
@@ -337,11 +355,13 @@ def test_head_context_records_missing_representatives(tmp_path):
         tmp_path,
         tasks=("zinc",),
         graph_indices=(0, 1),
+        context_name="reach_mismatch",
         verbose=False,
     )
     assert not result["outputs"]
     assert "no representative head rows" in result["warnings"][0]
     summary = json.loads(Path(result["summary_path"]).read_text(encoding="utf-8"))
+    assert summary["context_name"] == "reach_mismatch"
     assert summary["graph_indices"] == [0, 1]
     assert summary["tasks"][0]["status"] == "skipped"
 
@@ -351,3 +371,4 @@ def test_head_context_uses_permissive_protocol_runtime():
         encoding="utf-8"
     )
     assert "require_protocol_match=False" in source
+    assert "semantic_attention_reach_gap" in source

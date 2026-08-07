@@ -1,4 +1,4 @@
-"""Targeted molecular attention context for Chapter 6 alignment comparisons."""
+"""Targeted molecular attention context for Chapter 6 head comparisons."""
 
 from __future__ import annotations
 
@@ -19,13 +19,9 @@ def generate_head_context(
     compute_missing: bool = True,
     force: bool = False,
     verbose: bool = True,
+    context_name: str = "alignment",
 ) -> dict[str, Any]:
-    """Render a small matched-head comparison using real molecular attention.
-
-    Each task contributes the lower-alignment active head and its sensitivity-
-    matched higher-alignment comparison selected by the spatial explorer. The
-    supplemental attention sweep is cached under the canonical score identity.
-    """
+    """Render selected heads on real molecules using a supplemental exact cache."""
 
     import matplotlib.pyplot as plt
 
@@ -44,6 +40,21 @@ def generate_head_context(
     )
 
     output_dir = Path(output_dir)
+    context_name = str(context_name).strip().lower().replace(" ", "_")
+    if not context_name or not all(
+        character.isalnum() or character in {"_", "-"} for character in context_name
+    ):
+        raise ValueError(f"invalid head-context name: {context_name!r}")
+    cache_name = (
+        "alignment-head-attention"
+        if context_name == "alignment"
+        else f"{context_name}-head-attention"
+    )
+    diagnostic = (
+        "chapter6_alignment_head_context_v1"
+        if context_name == "alignment"
+        else f"chapter6_{context_name}_head_context_v1"
+    )
     figure_dir = output_dir / "figures"
     cache_dir = output_dir / "cache"
     requested = None if tasks is None else {str(task) for task in tasks}
@@ -74,6 +85,7 @@ def generate_head_context(
             "model_path": str(model_path),
             "protocol_path": str(protocol_path),
             "graph_indices": [int(index) for index in graph_indices],
+            "context_name": context_name,
             "status": "started",
         }
         task_records.append(task_record)
@@ -105,7 +117,7 @@ def generate_head_context(
             cache = SupplementalCache(cache_dir / task)
             contract = artifact.metadata["contract"]
             cache_contract = {
-                "diagnostic": "chapter6_alignment_head_context_v1",
+                "diagnostic": diagnostic,
                 "task": artifact_task,
                 "canonical_score_sha256": artifact.file_sha256,
                 "canonical_contract_fingerprint": artifact.metadata["contract_fingerprint"],
@@ -148,14 +160,14 @@ def generate_head_context(
             if compute_missing:
                 task_record["stage"] = "load or compute attention examples"
                 payload, cache_path, cache_hit = cache.load_or_compute(
-                    "alignment-head-attention",
+                    cache_name,
                     cache_contract,
                     compute,
                     force=force,
                 )
             else:
                 task_record["stage"] = "load cached attention examples"
-                cached = cache.load("alignment-head-attention", cache_contract)
+                cached = cache.load(cache_name, cache_contract)
                 if cached is None:
                     message = f"{task}: no cached molecular head context"
                     warnings.append(message)
@@ -178,11 +190,22 @@ def generate_head_context(
             for role, head in heads.items():
                 row = row_by_role[role]
                 role_label = str(row["role"]).capitalize()
-                title = (
-                    f"{role_label}; overlap={float(row['overlap']):.2f}; "
-                    f"semantic={float(row['raw_semantic_score']):.3g}; "
-                    f"structural={float(row['raw_structural_score']):.3g}"
-                )
+                if (
+                    "semantic_attention_reach_gap" in row
+                    and "structural_attention_reach_gap" in row
+                ):
+                    title = (
+                        f"{role_label}; "
+                        f"Δsem={float(row['semantic_attention_reach_gap']):+.2f} hops; "
+                        f"Δstr={float(row['structural_attention_reach_gap']):+.2f} hops; "
+                        f"max|Δ|={float(row['max_abs_attention_reach_gap']):.2f}"
+                    )
+                else:
+                    title = (
+                        f"{role_label}; overlap={float(row['overlap']):.2f}; "
+                        f"semantic={float(row['raw_semantic_score']):.3g}; "
+                        f"structural={float(row['raw_structural_score']):.3g}"
+                    )
                 figure = plot_attention_grid(
                     payload,
                     role=role,
@@ -192,13 +215,27 @@ def generate_head_context(
                     net_joint_sensitivity=float(row["joint_sensitivity"]),
                     title_label=title,
                 )
-                stem = f"{task}_{role}_layer_{head[0]}_head_{head[1]}"
+                stem = (
+                    f"{task}_{context_name}_{role}_layer_{head[0]}_head_{head[1]}"
+                )
+                optional_metadata = {
+                    key: row[key]
+                    for key in (
+                        "semantic_attention_reach_gap",
+                        "structural_attention_reach_gap",
+                        "max_abs_attention_reach_gap",
+                        "dominant_reach_gap_channel",
+                        "dominant_signed_reach_gap",
+                    )
+                    if key in row
+                }
                 paths = save_figure_bundle(
                     figure,
                     figure_dir,
                     stem,
                     metadata={
                         "task": task,
+                        "context_name": context_name,
                         "artifact_task": artifact_task,
                         "role": row["role"],
                         "head": list(head),
@@ -210,6 +247,7 @@ def generate_head_context(
                         "attention_cache": str(cache_path),
                         "cache_hit": bool(cache_hit),
                         "graph_indices": [int(index) for index in graph_indices],
+                        **optional_metadata,
                     },
                 )
                 plt.close(figure)
@@ -246,6 +284,7 @@ def generate_head_context(
         task_records.append({"task": task, "status": "skipped", "error": message})
 
     summary = {
+        "context_name": context_name,
         "requested_tasks": sorted(requested or set(artifacts)),
         "graph_indices": [int(index) for index in graph_indices],
         "outputs": outputs,

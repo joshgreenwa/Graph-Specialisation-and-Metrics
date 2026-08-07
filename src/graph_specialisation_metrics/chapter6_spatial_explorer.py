@@ -42,7 +42,7 @@ from .zinc_cached_rrwp_comparison import (
     vnode_profile_rows,
 )
 
-ANALYSIS_VERSION = "chapter6-spatial-explorer-v5"
+ANALYSIS_VERSION = "chapter6-spatial-explorer-v6"
 CHANNELS = ("semantic", "structural")
 ORGANISATION_FAMILIES = (
     "semantic_leaning",
@@ -562,6 +562,34 @@ def head_metrics(models: Sequence[SpatialModel]) -> list[dict[str, Any]]:
                     if attention_array is not None
                     else {}
                 )
+                attention_reach = float(
+                    attention_stats.get("expected_distance", float("nan"))
+                )
+                semantic_reach = float(
+                    semantic_stats.get("expected_distance", float("nan"))
+                )
+                structural_reach = float(
+                    structural_stats.get("expected_distance", float("nan"))
+                )
+                semantic_gap = semantic_reach - attention_reach
+                structural_gap = structural_reach - attention_reach
+                finite_gaps = {
+                    "semantic": semantic_gap,
+                    "structural": structural_gap,
+                }
+                finite_gaps = {
+                    name: value for name, value in finite_gaps.items() if np.isfinite(value)
+                }
+                dominant_channel = (
+                    max(finite_gaps, key=lambda name: abs(finite_gaps[name]))
+                    if finite_gaps
+                    else ""
+                )
+                dominant_gap = (
+                    float(finite_gaps[dominant_channel])
+                    if dominant_channel
+                    else float("nan")
+                )
                 rows.append(
                     {
                         "task": model.task,
@@ -586,6 +614,13 @@ def head_metrics(models: Sequence[SpatialModel]) -> list[dict[str, Any]]:
                         },
                         **alignment,
                         **{f"attention_{key}": value for key, value in attention_stats.items()},
+                        "semantic_attention_reach_gap": semantic_gap,
+                        "structural_attention_reach_gap": structural_gap,
+                        "max_abs_attention_reach_gap": (
+                            abs(dominant_gap) if np.isfinite(dominant_gap) else float("nan")
+                        ),
+                        "dominant_reach_gap_channel": dominant_channel,
+                        "dominant_signed_reach_gap": dominant_gap,
                         "semantic_expected_distance_sem": (
                             float(uncertainty["semantic"][layer, head])
                             if uncertainty["semantic"] is not None
@@ -599,6 +634,120 @@ def head_metrics(models: Sequence[SpatialModel]) -> list[dict[str, Any]]:
                     }
                 )
     return rows
+
+
+def reach_mismatch_summary(
+    rows: Sequence[Mapping[str, Any]], *, activity_quantile: float = 0.25
+) -> list[dict[str, Any]]:
+    """Summarise attention--score reach mismatch across active heads."""
+
+    by_task: dict[str, list[Mapping[str, Any]]] = {}
+    for row in rows:
+        by_task.setdefault(str(row["task"]), []).append(row)
+    output: list[dict[str, Any]] = []
+    for task, task_rows in by_task.items():
+        active_rows = [
+            row for row in task_rows if str(row.get("family")) != "inactive"
+        ]
+        joint = np.asarray(
+            [float(row["joint_sensitivity"]) for row in active_rows], dtype=np.float64
+        )
+        finite_joint = joint[np.isfinite(joint)]
+        floor = (
+            float(np.quantile(finite_joint, activity_quantile))
+            if finite_joint.size
+            else float("inf")
+        )
+        selected = [
+            row
+            for row in active_rows
+            if np.isfinite(float(row["max_abs_attention_reach_gap"]))
+            and np.isfinite(float(row["joint_sensitivity"]))
+            and float(row["joint_sensitivity"]) >= floor
+        ]
+        if not selected:
+            continue
+        maximum = np.asarray(
+            [float(row["max_abs_attention_reach_gap"]) for row in selected]
+        )
+        weights = np.maximum(
+            np.asarray([float(row["joint_sensitivity"]) for row in selected]), 0.0
+        )
+        semantic = np.asarray(
+            [float(row["semantic_attention_reach_gap"]) for row in selected]
+        )
+        structural = np.asarray(
+            [float(row["structural_attention_reach_gap"]) for row in selected]
+        )
+        denominator = float(np.sum(weights))
+        output.append(
+            {
+                "task": task,
+                "activity_quantile": float(activity_quantile),
+                "activity_floor": floor,
+                "heads": len(selected),
+                "median_max_abs_gap": float(np.median(maximum)),
+                "p90_max_abs_gap": float(np.quantile(maximum, 0.90)),
+                "maximum_abs_gap": float(np.max(maximum)),
+                "fraction_abs_gap_ge_0_5": float(np.mean(maximum >= 0.5)),
+                "fraction_abs_gap_ge_1": float(np.mean(maximum >= 1.0)),
+                "J_weighted_mean_max_abs_gap": (
+                    float(np.sum(weights * maximum) / denominator)
+                    if denominator > 1.0e-12
+                    else float("nan")
+                ),
+                "semantic_gap_median": float(np.median(semantic)),
+                "structural_gap_median": float(np.median(structural)),
+            }
+        )
+    return output
+
+
+def representative_reach_mismatches(
+    rows: Sequence[Mapping[str, Any]], *, activity_quantile: float = 0.25
+) -> list[dict[str, Any]]:
+    """Select the largest active attention--score reach mismatch per model."""
+
+    by_task: dict[str, list[Mapping[str, Any]]] = {}
+    for row in rows:
+        by_task.setdefault(str(row["task"]), []).append(row)
+    output: list[dict[str, Any]] = []
+    for task, task_rows in by_task.items():
+        active_rows = [
+            row for row in task_rows if str(row.get("family")) != "inactive"
+        ]
+        finite_joint = np.asarray(
+            [
+                float(row["joint_sensitivity"])
+                for row in active_rows
+                if np.isfinite(float(row["joint_sensitivity"]))
+            ]
+        )
+        floor = (
+            float(np.quantile(finite_joint, activity_quantile))
+            if finite_joint.size
+            else float("inf")
+        )
+        eligible = [
+            row
+            for row in active_rows
+            if np.isfinite(float(row["max_abs_attention_reach_gap"]))
+            and float(row["joint_sensitivity"]) >= floor
+        ]
+        if not eligible:
+            continue
+        selected = max(
+            eligible, key=lambda row: float(row["max_abs_attention_reach_gap"])
+        )
+        output.append(
+            {
+                **dict(selected),
+                "role": "strongest active reach mismatch",
+                "activity_quantile": float(activity_quantile),
+                "activity_floor": floor,
+            }
+        )
+    return output
 
 
 def layer_summary(rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
@@ -2562,6 +2711,365 @@ def _plot_score_organisation_similarity(
     return paths
 
 
+def _plot_attention_score_reach(
+    rows: Sequence[Mapping[str, Any]],
+    mismatch_rows: Sequence[Mapping[str, Any]],
+    tasks: Sequence[str],
+    figures_dir: Path,
+) -> list[Path]:
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import Normalize
+
+    tasks = [
+        task
+        for task in tasks
+        if any(
+            str(row["task"]) == task
+            and np.isfinite(float(row.get("attention_expected_distance", np.nan)))
+            for row in rows
+        )
+    ]
+    if not tasks:
+        return []
+    mismatch_lookup = {str(row["task"]): row for row in mismatch_rows}
+    finite_reach = np.asarray(
+        [
+            float(row[field])
+            for row in rows
+            for field in (
+                "attention_expected_distance",
+                "semantic_expected_distance",
+                "structural_expected_distance",
+            )
+            if np.isfinite(float(row.get(field, np.nan)))
+        ]
+    )
+    upper = max(float(np.quantile(finite_reach, 0.995)) * 1.06, 1.0)
+    exemplar_reach = np.asarray(
+        [
+            float(row[field])
+            for row in mismatch_rows
+            for field in (
+                "attention_expected_distance",
+                "semantic_expected_distance",
+                "structural_expected_distance",
+            )
+            if np.isfinite(float(row.get(field, np.nan)))
+        ]
+    )
+    if exemplar_reach.size:
+        upper = max(upper, float(np.max(exemplar_reach)) * 1.06)
+    maximum_layer = max(int(row["layer"]) for row in rows)
+    norm = Normalize(vmin=0, vmax=max(maximum_layer, 1))
+    figure, axes = plt.subplots(
+        2,
+        len(tasks),
+        figsize=(3.25 * len(tasks), 7.1),
+        squeeze=False,
+        sharex=True,
+        sharey=True,
+        constrained_layout=True,
+    )
+    scatter = None
+    for column, task in enumerate(tasks):
+        task_rows = [row for row in rows if str(row["task"]) == task]
+        finite_joint = np.asarray(
+            [float(row["joint_sensitivity"]) for row in task_rows], dtype=np.float64
+        )
+        scale = (
+            max(float(np.nanquantile(finite_joint, 0.90)), 1.0e-12)
+            if np.isfinite(finite_joint).any()
+            else 1.0
+        )
+        for row_index, (channel, label) in enumerate(
+            (("semantic", "semantic score"), ("structural", "structural score"))
+        ):
+            axis = axes[row_index, column]
+            selected = [
+                row
+                for row in task_rows
+                if np.isfinite(float(row.get("attention_expected_distance", np.nan)))
+                and np.isfinite(float(row.get(f"{channel}_expected_distance", np.nan)))
+            ]
+            sizes = 14.0 + 52.0 * np.clip(
+                np.asarray([float(row["joint_sensitivity"]) for row in selected]) / scale,
+                0.0,
+                1.5,
+            )
+            scatter = axis.scatter(
+                [float(row["attention_expected_distance"]) for row in selected],
+                [float(row[f"{channel}_expected_distance"]) for row in selected],
+                c=[int(row["layer"]) for row in selected],
+                s=sizes,
+                cmap="viridis",
+                norm=norm,
+                alpha=0.76,
+                edgecolor="white",
+                linewidth=0.35,
+            )
+            exemplar = mismatch_lookup.get(task)
+            if exemplar is not None:
+                axis.scatter(
+                    [float(exemplar["attention_expected_distance"])],
+                    [float(exemplar[f"{channel}_expected_distance"])],
+                    s=120,
+                    marker="*",
+                    facecolor="none",
+                    edgecolor="#C44E52",
+                    linewidth=1.5,
+                    zorder=5,
+                )
+            axis.plot([0.0, upper], [0.0, upper], "--", color="#777777", linewidth=0.8)
+            axis.set_xlim(0.0, upper)
+            axis.set_ylim(0.0, upper)
+            axis.grid(alpha=0.20)
+            if row_index == 0:
+                severity = (
+                    float(exemplar["max_abs_attention_reach_gap"])
+                    if exemplar is not None
+                    else float("nan")
+                )
+                suffix = f"\nmax active |Δ|={severity:.2f} hops" if np.isfinite(severity) else ""
+                axis.set_title(_task_label(task) + suffix, fontsize=9.5)
+            if row_index == 1:
+                axis.set_xlabel("attention reach (hops)")
+            if column == 0:
+                axis.set_ylabel(f"{label} reach (hops)")
+    if scatter is not None:
+        figure.colorbar(
+            scatter,
+            ax=axes,
+            fraction=0.014,
+            pad=0.012,
+            label="layer",
+        )
+    figure.suptitle(
+        "Per-head attention reach versus intervention-defined score reach "
+        "(size: $J$; star: selected mismatch)"
+    )
+    paths = _save_figure(figure, figures_dir, "21_attention_vs_score_reach")
+    plt.close(figure)
+    return paths
+
+
+def _plot_head_reach_gap(
+    rows: Sequence[Mapping[str, Any]],
+    mismatch_rows: Sequence[Mapping[str, Any]],
+    tasks: Sequence[str],
+    figures_dir: Path,
+) -> list[Path]:
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Rectangle
+
+    fields = (
+        ("semantic_attention_reach_gap", "semantic"),
+        ("structural_attention_reach_gap", "structural"),
+    )
+    values = np.asarray(
+        [
+            abs(float(row[field]))
+            for row in rows
+            for field, _label in fields
+            if np.isfinite(float(row.get(field, np.nan)))
+        ]
+    )
+    if not values.size:
+        return []
+    upper = max(float(np.quantile(values, 0.98)), 0.25)
+    mismatch_lookup = {str(row["task"]): row for row in mismatch_rows}
+    figure, axes = plt.subplots(
+        2,
+        len(tasks),
+        figsize=(3.25 * len(tasks), 7.0),
+        squeeze=False,
+        sharex="col",
+        sharey="row",
+        constrained_layout=True,
+    )
+    image = None
+    for column, task in enumerate(tasks):
+        for row_index, (field, label) in enumerate(fields):
+            axis = axes[row_index, column]
+            matrix, layers, heads = _matrix(rows, task, field)
+            image = axis.imshow(
+                matrix,
+                aspect="auto",
+                interpolation="nearest",
+                cmap="coolwarm",
+                vmin=-upper,
+                vmax=upper,
+            )
+            exemplar = mismatch_lookup.get(task)
+            if exemplar is not None:
+                layer = int(exemplar["layer"])
+                head = int(exemplar["head"])
+                if layer in layers and head in heads:
+                    axis.add_patch(
+                        Rectangle(
+                            (heads.index(head) - 0.5, layers.index(layer) - 0.5),
+                            1.0,
+                            1.0,
+                            fill=False,
+                            edgecolor="#111111",
+                            linewidth=1.5,
+                        )
+                    )
+            axis.set_xticks(np.arange(len(heads)), heads, fontsize=7)
+            axis.set_yticks(np.arange(len(layers)), layers, fontsize=8)
+            if row_index == 0:
+                severity = (
+                    float(exemplar["max_abs_attention_reach_gap"])
+                    if exemplar is not None
+                    else float("nan")
+                )
+                suffix = f"\nmax active |Δ|={severity:.2f}" if np.isfinite(severity) else ""
+                axis.set_title(_task_label(task) + suffix, fontsize=9.5)
+            if row_index == 1:
+                axis.set_xlabel("head")
+            if column == 0:
+                axis.set_ylabel(f"{label} gap\nlayer")
+    if image is not None:
+        figure.colorbar(
+            image,
+            ax=axes,
+            fraction=0.014,
+            pad=0.012,
+            label="score reach − attention reach (hops)",
+        )
+    figure.suptitle(
+        "Head-level reach gap (outlined cell: strongest active mismatch per model)"
+    )
+    paths = _save_figure(figure, figures_dir, "22_head_attention_score_reach_gap")
+    plt.close(figure)
+    return paths
+
+
+def _plot_head_score_landscapes(
+    rows: Sequence[Mapping[str, Any]],
+    mismatch_rows: Sequence[Mapping[str, Any]],
+    tasks: Sequence[str],
+    figures_dir: Path,
+) -> list[Path]:
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import Normalize
+
+    if not rows or not tasks:
+        return []
+    mismatch_lookup = {str(row["task"]): row for row in mismatch_rows}
+    score_values = np.asarray(
+        [
+            float(row[field])
+            for row in rows
+            for field in ("normalized_semantic_score", "normalized_structural_score")
+            if np.isfinite(float(row[field]))
+        ]
+    )
+    score_upper = max(float(np.quantile(score_values, 0.995)) * 1.08, 1.0)
+    joint_values = np.asarray(
+        [
+            float(row["joint_sensitivity"])
+            for row in rows
+            if np.isfinite(float(row["joint_sensitivity"]))
+        ]
+    )
+    joint_upper = max(float(np.quantile(joint_values, 0.995)) * 1.08, 1.0)
+    maximum_layer = max(int(row["layer"]) for row in rows)
+    norm = Normalize(vmin=0, vmax=max(maximum_layer, 1))
+    figure, axes = plt.subplots(
+        2,
+        len(tasks),
+        figsize=(3.25 * len(tasks), 7.1),
+        squeeze=False,
+        sharex="row",
+        sharey="row",
+        constrained_layout=True,
+    )
+    scatter = None
+    for column, task in enumerate(tasks):
+        selected = [row for row in rows if str(row["task"]) == task]
+        task_joint = np.asarray([float(row["joint_sensitivity"]) for row in selected])
+        scale = max(float(np.nanquantile(task_joint, 0.90)), 1.0e-12)
+        sizes = 14.0 + 48.0 * np.clip(task_joint / scale, 0.0, 1.5)
+        layers = [int(row["layer"]) for row in selected]
+        scatter = axes[0, column].scatter(
+            [float(row["normalized_semantic_score"]) for row in selected],
+            [float(row["normalized_structural_score"]) for row in selected],
+            c=layers,
+            s=sizes,
+            cmap="viridis",
+            norm=norm,
+            alpha=0.76,
+            edgecolor="white",
+            linewidth=0.35,
+        )
+        axes[0, column].plot(
+            [0.0, score_upper],
+            [0.0, score_upper],
+            "--",
+            color="#777777",
+            linewidth=0.8,
+        )
+        axes[1, column].scatter(
+            [float(row["selectivity"]) for row in selected],
+            [float(row["joint_sensitivity"]) for row in selected],
+            c=layers,
+            s=sizes,
+            cmap="viridis",
+            norm=norm,
+            alpha=0.76,
+            edgecolor="white",
+            linewidth=0.35,
+        )
+        exemplar = mismatch_lookup.get(task)
+        if exemplar is not None:
+            axes[0, column].scatter(
+                [float(exemplar["normalized_semantic_score"])],
+                [float(exemplar["normalized_structural_score"])],
+                s=120,
+                marker="*",
+                facecolor="none",
+                edgecolor="#C44E52",
+                linewidth=1.5,
+                zorder=5,
+            )
+            axes[1, column].scatter(
+                [float(exemplar["selectivity"])],
+                [float(exemplar["joint_sensitivity"])],
+                s=120,
+                marker="*",
+                facecolor="none",
+                edgecolor="#C44E52",
+                linewidth=1.5,
+                zorder=5,
+            )
+        axes[0, column].set_title(_task_label(task), fontsize=10)
+        axes[0, column].set_xlim(0.0, score_upper)
+        axes[0, column].set_ylim(0.0, score_upper)
+        axes[1, column].set_xlim(-1.02, 1.02)
+        axes[1, column].set_ylim(0.0, joint_upper)
+        axes[1, column].axvline(0.0, color="#777777", linestyle="--", linewidth=0.8)
+        axes[0, column].set_xlabel("normalised semantic score")
+        axes[1, column].set_xlabel(r"relative selectivity $D_{\rm rel}$")
+        if column == 0:
+            axes[0, column].set_ylabel("normalised structural score")
+            axes[1, column].set_ylabel(r"joint sensitivity $J$")
+    if scatter is not None:
+        figure.colorbar(
+            scatter,
+            ax=axes,
+            fraction=0.014,
+            pad=0.012,
+            label="layer",
+        )
+    figure.suptitle(
+        "Head score landscapes across architectures "
+        "(size: $J$; star: selected reach mismatch)"
+    )
+    paths = _save_figure(figure, figures_dir, "23_head_score_landscapes")
+    plt.close(figure)
+    return paths
+
+
 def _plot_score_carriage(
     profile_rows: Sequence[Mapping[str, Any]], tasks: Sequence[str], figures_dir: Path
 ) -> list[Path]:
@@ -2651,6 +3159,12 @@ def run(
             flush=True,
         )
     head_rows = head_metrics(models)
+    mismatch_summary_rows = reach_mismatch_summary(
+        head_rows, activity_quantile=activity_quantile
+    )
+    mismatch_rows = representative_reach_mismatches(
+        head_rows, activity_quantile=activity_quantile
+    )
     layer_rows = layer_summary(head_rows)
     representative_rows = representative_heads(head_rows, activity_quantile=activity_quantile)
     profile_rows = model_profiles(models)
@@ -2670,6 +3184,8 @@ def run(
     scale_rows = molecular_scale_relationships(graph_rows)
     tables = {
         "head_spatial_metrics.csv": head_rows,
+        "head_reach_mismatch_summary.csv": mismatch_summary_rows,
+        "representative_reach_mismatches.csv": mismatch_rows,
         "layer_spatial_summary.csv": layer_rows,
         "representative_heads.csv": representative_rows,
         "model_distance_profiles.csv": profile_rows,
@@ -2756,6 +3272,19 @@ def run(
             organisation_similarity_rows, available_tasks, figures_dir
         )
     )
+    figures.extend(
+        _plot_attention_score_reach(
+            head_rows, mismatch_rows, available_tasks, figures_dir
+        )
+    )
+    figures.extend(
+        _plot_head_reach_gap(head_rows, mismatch_rows, available_tasks, figures_dir)
+    )
+    figures.extend(
+        _plot_head_score_landscapes(
+            head_rows, mismatch_rows, available_tasks, figures_dir
+        )
+    )
     summary = {
         "analysis_version": ANALYSIS_VERSION,
         "tasks_requested": list(tasks),
@@ -2822,6 +3351,10 @@ def run(
                 "one minus Jensen--Shannon distance, comparing J-weighted score "
                 "profiles before and after retaining layer identity"
             ),
+            "reach_gap": (
+                "molecular score expected distance minus clean-attention expected "
+                "distance; virtual-node mass remains separate"
+            ),
             "attention": "clean attention mass by graph distance, not a causal score",
             "carriage": (
                 "final-state response under the same intervention family, not task "
@@ -2837,6 +3370,8 @@ def run(
     return {
         **summary,
         "head_rows": head_rows,
+        "mismatch_summary_rows": mismatch_summary_rows,
+        "mismatch_rows": mismatch_rows,
         "layer_rows": layer_rows,
         "representative_rows": representative_rows,
         "distance_rows": distance_rows,
@@ -2866,7 +3401,9 @@ __all__ = [
     "load_models",
     "model_profiles",
     "molecular_scale_relationships",
+    "reach_mismatch_summary",
     "representative_heads",
+    "representative_reach_mismatches",
     "run",
     "score_organisation_similarity",
     "spatial_width_bootstrap",
