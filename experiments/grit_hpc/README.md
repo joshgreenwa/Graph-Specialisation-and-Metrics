@@ -94,6 +94,32 @@ improves, and every 10 epochs. Both stable `latest.ckpt` and `best.ckpt` copies
 are retained alongside GraphGym's resumable checkpoints. Scientific model and
 optimizer settings are unchanged.
 
+## Export validation-selected saved checkpoints
+
+Completed ZINC and QM9 runs can be exported without loading a GPU. The exporter
+joins wrapper-log metrics to checkpoint epochs that still exist, selects by
+validation MAE only, copies the 30 selected files, and records source paths,
+checksums, selected metrics, and whether each file is the exact logged-global
+best or the best available saved snapshot:
+
+```bash
+STAMP="$(date +%Y%m%d_%H%M%S)"
+EXPORT_PARENT=/rds/user/jgg45/hpc-work/grit_exports
+EXPORT_NAME="zinc_qm9_best_available_${STAMP}"
+mkdir -p "$EXPORT_PARENT"
+
+python experiments/grit_hpc/bin/export_best_available.py \
+  --input-root /rds/user/jgg45/hpc-work/grit_checkpoints/grit_all_3seeds \
+  --output-dir "$EXPORT_PARENT/$EXPORT_NAME"
+
+tar -C "$EXPORT_PARENT" -cf "$EXPORT_PARENT/$EXPORT_NAME.tar" "$EXPORT_NAME"
+sha256sum "$EXPORT_PARENT/$EXPORT_NAME.tar" | tee "$EXPORT_PARENT/$EXPORT_NAME.tar.sha256"
+```
+
+Inspect `manifest.tsv` before treating the resulting tar as canonical. The
+archive calls non-exact selections *best available validation-selected saved
+checkpoints* and never represents them as exact global-best snapshots.
+
 If array row 4 is interrupted, resubmit only that model with:
 
 ```bash
