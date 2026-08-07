@@ -23,7 +23,7 @@ from .methodology.interventions import rrwp_only_donor_swap
 from .methodology.runner import _rebuild_graph_events, _stage_plan
 from .zinc_cached_rrwp_comparison import TASK_LABELS
 
-PILOT_VERSION = "chapter6-architectural-hypotheses-v1"
+PILOT_VERSION = "chapter6-architectural-hypotheses-v2"
 CHANNELS = ("semantic", "structural")
 
 
@@ -296,6 +296,7 @@ def _measure_rrwp_reliance(
                     "donor": int(record.draw),
                     "rrwp_output_effect": rrwp_effect,
                     "full_structural_output_effect": full_effect,
+                    "non_rrwp_output_difference": float(abs(full[index] - rrwp[index])),
                     "rrwp_fraction_of_full": (
                         rrwp_effect / full_effect if full_effect > 1.0e-6 else float("nan")
                     ),
@@ -427,28 +428,52 @@ def _plot_rrwp(rows: Sequence[Mapping[str, Any]], output_dir: Path) -> list[Path
     }
     figure, axis = plt.subplots(figsize=(6.0, 3.7), constrained_layout=True)
     x = np.arange(len(tasks), dtype=np.float64)
-    width = 0.34
+    offset_size = 0.09
     for offset, metric, label, colour in (
-        (-width / 2, metrics[0], "RRWP only", "#0072B2"),
-        (width / 2, metrics[1], "full structural swap", "#D55E00"),
+        (-offset_size, metrics[0], "RRWP only", "#0072B2"),
+        (offset_size, metrics[1], "full structural swap", "#D55E00"),
     ):
         selected = [lookup[(metric, task)] for task in tasks]
         mean = np.asarray([float(row["mean"]) for row in selected])
         low = np.asarray([float(row["low"]) for row in selected])
         high = np.asarray([float(row["high"]) for row in selected])
-        axis.bar(x + offset, mean, width, color=colour, label=label)
         axis.errorbar(
             x + offset,
             mean,
             yerr=np.vstack((mean - low, high - mean)),
-            color="#222222",
-            fmt="none",
-            capsize=3,
-            linewidth=0.9,
+            color=colour,
+            marker="o" if metric == metrics[0] else "s",
+            markersize=6,
+            linestyle="none",
+            capsize=4,
+            linewidth=1.2,
+            label=label,
         )
+    for task_index, task in enumerate(tasks):
+        paired_gap = [
+            float(row.get("non_rrwp_output_difference", float("nan")))
+            for row in rows
+            if row["task"] == task
+        ]
+        paired_gap = [value for value in paired_gap if np.isfinite(value)]
+        if paired_gap and max(paired_gap) <= 1.0e-8:
+            top = max(
+                float(lookup[(metric, task)]["high"])
+                for metric in metrics
+            )
+            axis.annotate(
+                "identical response",
+                (task_index, top),
+                xytext=(0, 6),
+                textcoords="offset points",
+                ha="center",
+                va="bottom",
+                fontsize=8,
+                color="#555555",
+            )
     axis.set_xticks(x, [TASK_LABELS.get(task, task.replace("_", " ")) for task in tasks])
-    axis.set_ylabel("absolute output movement")
-    axis.set_title("Does dense attention rely more strongly on RRWP?")
+    axis.set_ylabel("absolute change in model output")
+    axis.set_title("RRWP contribution to the structural response")
     axis.legend(frameon=False)
     return _save_figure(figure, output_dir, "26_rrwp_only_reliance")
 
@@ -536,6 +561,10 @@ def run(
                         context["protocol_config"],
                         runtime_output_dir=output_dir / "runtime" / task,
                         require_protocol_match=False,
+                        # Exploratory pilots rebuild their interventions with
+                        # the current adapter. Equivalent older score-cache
+                        # metadata should identify, rather than block, the model.
+                        require_adapter_match=False,
                     )
                     if kind == "vnode":
                         rows = _measure_vnode(

@@ -851,10 +851,11 @@ def _native_newline(text: str) -> str:
 
 def _replace_exact(path: Path, old: str, new: str, marker: str, label: str) -> bool:
     text = _read_text_preserve_newlines(path)
-    if marker in text:
+    newline = _native_newline(text)
+    marker_native = marker.replace("\n", newline)
+    if marker_native in text:
         log(f"[patch] {label}: already present")
         return False
-    newline = _native_newline(text)
     old_native = old.replace("\n", newline)
     new_native = new.replace("\n", newline)
     if old_native not in text:
@@ -1014,21 +1015,8 @@ def apply_parameter_matched_onehop_patch(repo_dir: Path, drive_dir: Path) -> Non
     )
 
     custom_train = repo_dir / "grit" / "train" / "custom_train.py"
-    _replace_exact(
-        custom_train,
-        old=(
-            "import logging\n"
-            "import time\n"
-        ),
-        new=(
-            "import logging\n"
-            "import os\n"
-            "import shutil\n"
-            "import time\n"
-        ),
-        marker="import os\nimport shutil\nimport time",
-        label="custom train recovery checkpoint import",
-    )
+    # Recover cleanly from an older/partial application that added ``os`` but
+    # not ``shutil`` before the runtime was interrupted.
     _replace_if_present(
         custom_train,
         old=(
@@ -1043,6 +1031,21 @@ def apply_parameter_matched_onehop_patch(repo_dir: Path, drive_dir: Path) -> Non
             "import time\n"
         ),
         label="custom train recovery checkpoint shutil import",
+    )
+    _replace_exact(
+        custom_train,
+        old=(
+            "import logging\n"
+            "import time\n"
+        ),
+        new=(
+            "import logging\n"
+            "import os\n"
+            "import shutil\n"
+            "import time\n"
+        ),
+        marker="import os\nimport shutil\nimport time",
+        label="custom train recovery checkpoint import",
     )
     old_epoch_recovery_block = (
         "\n"

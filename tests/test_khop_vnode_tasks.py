@@ -12,6 +12,7 @@ import pytest
 
 from graph_specialisation_metrics.carriage import env
 from graph_specialisation_metrics.carriage.tasks import get_task
+from graph_specialisation_metrics.grit_patches import zinc_onehop
 from graph_specialisation_metrics.methodology.interventions import (
     StructuralAuditError,
     structural_donor_swap,
@@ -120,6 +121,19 @@ def test_old_khop_encoder_is_upgraded_to_frozen_support(tmp_path):
 def test_khop_patch_verifier_requires_onehop_frozen_support_marker(tmp_path):
     verifier_source = RUNNER_PATH.read_text(encoding="utf-8")
     assert '"self.max_hops is None or self.max_hops == 1"' in verifier_source
+
+
+@pytest.mark.parametrize("patch_module", [khop_zinc, zinc_onehop])
+def test_patch_marker_recognises_crlf_source(tmp_path, patch_module):
+    target = tmp_path / "custom_train.py"
+    target.write_bytes(b"import logging\r\nimport os\r\nimport shutil\r\nimport time\r\n")
+    assert not patch_module._replace_exact(
+        target,
+        old="import logging\nimport time\n",
+        new="unused\n",
+        marker="import os\nimport shutil\nimport time",
+        label="test marker",
+    )
 
 
 @pytest.mark.parametrize("hops", [1, 2])

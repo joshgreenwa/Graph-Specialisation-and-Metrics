@@ -667,6 +667,7 @@ def build_verified_grit_figure_runtime(
     *,
     runtime_output_dir: str | Path,
     require_protocol_match: bool = True,
+    require_adapter_match: bool = True,
 ) -> GritFigureRuntime:
     """Reconstruct GRIT and fail if checkpoint, adapter, or geometry differs."""
 
@@ -690,7 +691,10 @@ def build_verified_grit_figure_runtime(
         raise ValueError(
             f"focused GRIT runtime cannot load backend {task.backend_kind!r}"
         )
-    if contract.get("task_adapter_version") != task.adapter_version:
+    if (
+        require_adapter_match
+        and contract.get("task_adapter_version") != task.adapter_version
+    ):
         raise ValueError(
             "canonical cache adapter version differs from the current GRIT task"
         )

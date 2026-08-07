@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import pytest
 
 from graph_specialisation_metrics.chapter6_hypothesis_pilots import (
     _aligned_fraction,
     _bootstrap_summary,
+    _plot_rrwp,
     run,
 )
 
@@ -43,3 +46,26 @@ def test_missing_pilot_artifacts_skip_without_blocking(tmp_path):
     assert not result["figures"]
     assert len(result["warnings"]) == 5
     assert (tmp_path / "output/summary.json").is_file()
+
+
+def test_rrwp_plot_keeps_equal_paired_responses_distinct(tmp_path):
+    rows = [
+        {
+            "task": "zinc",
+            "graph": graph,
+            "rrwp_output_effect": value,
+            "full_structural_output_effect": value,
+            "non_rrwp_output_difference": 0.0,
+        }
+        for graph, value in enumerate((0.10, 0.12, 0.14, 0.16))
+    ]
+    paths = _plot_rrwp(rows, tmp_path)
+    assert {path.suffix for path in paths} == {".png", ".pdf"}
+    assert all(path.is_file() for path in paths)
+
+
+def test_hypothesis_pilots_accept_equivalent_older_adapter_metadata():
+    source = Path(
+        "src/graph_specialisation_metrics/chapter6_hypothesis_pilots.py"
+    ).read_text(encoding="utf-8")
+    assert "require_adapter_match=False" in source
