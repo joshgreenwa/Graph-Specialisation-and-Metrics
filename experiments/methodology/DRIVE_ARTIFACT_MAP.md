@@ -142,7 +142,10 @@ T/score_trajectory_plots/1hop/score_summary.csv
 T/score_trajectory_plots/1hop/plot_manifest.json
 ```
 
-The ZINC Chapter 6 frontend reads the twelve `TO` score caches directly and additionally writes:
+The ZINC Chapter 6 frontend validates the twelve `TO` score caches before plotting. If any are
+missing, it uses the immutable `TC` checkpoint corpus to resume or compute only the affected
+architecture; completed epochs are validated and skipped. Use a T4 GPU for this first pass.
+Subsequent runs are cache-only. The frontend additionally writes:
 
 ```text
 M/chapter6_multiseed_analysis/zinc/figures/11a_dense_score_trajectory.png

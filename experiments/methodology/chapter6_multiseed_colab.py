@@ -3,8 +3,8 @@
 Set ``DATASET`` to ``"zinc"`` or ``"qm9"`` and run the cell.  The two values
 write to separate Drive directories, so two Colab sessions can run in parallel.
 Score and carriage figures are cache-only.  The first run also computes the focused
-clean single-head ablation endpoint; its per-head shards and compact summaries are
-resumable, so later runs return to cache-only figure generation.
+clean single-head ablation endpoint and, for ZINC, any missing checkpoint-trajectory
+scores.  Both stages are resumable, so later runs return to cache-only figure generation.
 """
 
 # ============================ paste from here ============================
@@ -39,6 +39,7 @@ SEEDS = (0, 1, 2)
 STRICT_CACHE_INVENTORY = True
 RELIABLE_HEAD_QUANTILE = 0.25
 COMPUTE_MISSING_ABLATIONS = True
+COMPUTE_MISSING_TRAJECTORY_SCORES = True
 
 DRIVE_ROOT = Path("/content/drive/MyDrive")
 MULTI_SEED_ROOT = DRIVE_ROOT / "graph_specialisation_metrics/multi_seed_models"
@@ -173,11 +174,70 @@ ablation_completion = finalize_clean_ablations(
 print(f"[ablation] persistent completion manifest: {ablation_completion}", flush=True)
 
 
+trajectory_inventory_rows = []
+if DATASET == "zinc":
+    from graph_specialisation_metrics.chapter6_score_trajectory import (
+        cache_inventory as trajectory_cache_inventory,
+    )
+    from graph_specialisation_metrics.chapter6_score_trajectory import (
+        missing_architectures as missing_trajectory_architectures_from_cache,
+    )
+
+    trajectory_inventory_rows = trajectory_cache_inventory(TRAJECTORY_ROOT)
+    missing_trajectory_architectures = missing_trajectory_architectures_from_cache(
+        TRAJECTORY_ROOT
+    )
+    if missing_trajectory_architectures:
+        if not COMPUTE_MISSING_TRAJECTORY_SCORES:
+            detail = ", ".join(
+                str(row["score_path"])
+                for row in trajectory_inventory_rows
+                if not bool(row["score_exists"])
+            )
+            raise FileNotFoundError(f"missing ZINC trajectory score cache(s): {detail}")
+        print(
+            "[trajectory] missing score caches for "
+            f"{', '.join(missing_trajectory_architectures)}; "
+            "computing or resuming only those architectures.",
+            flush=True,
+        )
+        from experiments.methodology.zinc_checkpoint_trajectory_colab import (
+            run_architecture as run_trajectory_architecture,
+            setup_drive as setup_trajectory_drive,
+        )
+        from experiments.methodology.zinc_qm9_canonical_colab_worker import (
+            ensure_runtime_dependencies,
+            require_requested_accelerator,
+        )
+
+        require_requested_accelerator("cuda:0")
+        ensure_runtime_dependencies()
+        prepared_trajectory = setup_trajectory_drive(TRAJECTORY_ROOT)
+        for architecture in missing_trajectory_architectures:
+            run_trajectory_architecture(
+                prepared_trajectory,
+                architecture,
+                accelerator="cuda:0",
+            )
+        trajectory_inventory_rows = trajectory_cache_inventory(TRAJECTORY_ROOT)
+        still_missing = [
+            str(row["score_path"])
+            for row in trajectory_inventory_rows
+            if not bool(row["score_exists"])
+        ]
+        if still_missing:
+            raise RuntimeError(
+                "trajectory computation returned without all score caches: "
+                + ", ".join(still_missing)
+            )
+
+
 print(
     f"\n[scope] Dataset: {DATASET.upper()}\n"
     f"[scope] Seeds: {SEEDS}\n"
     "[scope] Five models: 1-hop, 1-hop + VNode, 2-hop, 2-hop + VNode, dense.\n"
-    "[scope] Scores/carriage are cache-only; clean head ablations resume or compute once.\n"
+    "[scope] Scores/carriage are cache-only; missing ablations and ZINC trajectory "
+    "scores resume or compute once.\n"
     "[scope] Head identities are never matched or averaged across seeds.\n"
     f"[scope] Output directory: {OUTPUT_DIR}\n",
     flush=True,
@@ -202,12 +262,8 @@ display(
 )
 
 if DATASET == "zinc":
-    from graph_specialisation_metrics.chapter6_score_trajectory import (
-        cache_inventory as trajectory_cache_inventory,
-    )
-
     print("\nZINC checkpoint-trajectory cache inventory", flush=True)
-    display(pd.DataFrame(trajectory_cache_inventory(TRAJECTORY_ROOT)))
+    display(pd.DataFrame(trajectory_inventory_rows))
 
 manifest = run(
     CANONICAL_ROOT,

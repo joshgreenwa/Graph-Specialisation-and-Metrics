@@ -42,6 +42,20 @@ def cache_inventory(root: Path) -> list[dict[str, Any]]:
     ]
 
 
+def missing_architectures(root: Path) -> tuple[str, ...]:
+    """Return architectures with at least one absent trajectory score cache."""
+
+    rows = cache_inventory(root)
+    return tuple(
+        architecture
+        for architecture in ARCHITECTURES
+        if any(
+            row["architecture"] == architecture and not bool(row["score_exists"])
+            for row in rows
+        )
+    )
+
+
 def _field(value: Any, name: str) -> Any:
     if isinstance(value, Mapping):
         return value[name]

@@ -37,6 +37,9 @@ from graph_specialisation_metrics.chapter6_score_trajectory import (
     load_rows as load_trajectory_rows,
 )
 from graph_specialisation_metrics.chapter6_score_trajectory import (
+    missing_architectures as missing_trajectory_architectures,
+)
+from graph_specialisation_metrics.chapter6_score_trajectory import (
     score_cache_path as trajectory_score_cache_path,
 )
 from graph_specialisation_metrics.methodology.protocol import stable_hash
@@ -292,9 +295,12 @@ def test_clean_ablation_summary_inventory_and_loading(tmp_path):
 
 def test_zinc_checkpoint_trajectory_loads_twelve_cached_epochs(tmp_path):
     root = tmp_path / "trajectory"
+    assert missing_trajectory_architectures(root) == ("dense", "1hop")
     for architecture in ("dense", "1hop"):
         for epoch in (10, 100, 250, 500, 1_000, 1_990):
             _write_trajectory(root, architecture, epoch)
+        expected_missing = ("1hop",) if architecture == "dense" else ()
+        assert missing_trajectory_architectures(root) == expected_missing
     inventory = trajectory_cache_inventory(root)
     assert len(inventory) == 12
     assert all(row["score_exists"] for row in inventory)
