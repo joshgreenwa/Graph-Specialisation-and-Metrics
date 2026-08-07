@@ -6,6 +6,18 @@ import numpy as np
 import pytest
 import torch
 
+from graph_specialisation_metrics.chapter6_clean_ablation import (
+    SUMMARY_SCHEMA,
+)
+from graph_specialisation_metrics.chapter6_clean_ablation import (
+    load_rows as load_ablation_rows,
+)
+from graph_specialisation_metrics.chapter6_clean_ablation import (
+    missing_runs as missing_ablation_runs,
+)
+from graph_specialisation_metrics.chapter6_clean_ablation import (
+    summary_path as ablation_summary_path,
+)
 from graph_specialisation_metrics.chapter6_multiseed import (
     alignment_summary_rows,
     cache_inventory,
@@ -140,6 +152,35 @@ def _write_run(root: Path, task: str, seed: int) -> None:
     )
 
 
+def _write_ablation(root: Path, task: str, seed: int) -> None:
+    path = ablation_summary_path(root, task, seed)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "schema": SUMMARY_SCHEMA,
+                "task": task,
+                "seed": seed,
+                "layers": 2,
+                "heads_per_layer": 2,
+                "clean_ablation_graphs": 64,
+                "heads": [
+                    {
+                        "layer": layer,
+                        "head": head,
+                        "joint_sensitivity": float(1 + 2 * layer + head),
+                        "prediction_movement": float(0.1 + 0.2 * layer + 0.05 * head),
+                        "loss_change": 0.0,
+                    }
+                    for layer in range(2)
+                    for head in range(2)
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
 @pytest.mark.parametrize("dataset", ("zinc", "qm9"))
 def test_dataset_spec_has_five_models(dataset):
     spec = dataset_spec(dataset)
@@ -194,27 +235,50 @@ def test_matched_profiles_control_for_opportunity_and_use_raw_carriage():
     np.testing.assert_allclose(raw_carriage[:3], (1.0, 2.0, 1.0))
 
 
+def test_clean_ablation_summary_inventory_and_loading(tmp_path):
+    spec = dataset_spec("zinc")
+    root = tmp_path / "ablations"
+    for task in spec.tasks:
+        for seed in (0, 1, 2):
+            _write_ablation(root, task, seed)
+    assert missing_ablation_runs(root, dataset="zinc") == []
+    rows = load_ablation_rows(root, dataset="zinc", strict=True)
+    assert len(rows) == 5 * 3 * 4
+    assert {row["clean_ablation_graphs"] for row in rows} == {64}
+
+
 @pytest.mark.parametrize("dataset", ("zinc", "qm9"))
 def test_run_builds_dataset_specific_multiseed_suite(tmp_path, dataset):
     spec = dataset_spec(dataset)
     canonical_root = tmp_path / "canonical_outputs"
+    ablation_root = tmp_path / "clean_head_ablation"
     for task in spec.tasks:
         for seed in (0, 1, 2):
             _write_run(canonical_root, task, seed)
+            _write_ablation(ablation_root, task, seed)
 
     inventory_rows = cache_inventory(canonical_root, dataset=dataset)
     assert len(inventory_rows) == 15
     assert all(row["score_exists"] and row["carriage_exists"] for row in inventory_rows)
 
     output_dir = tmp_path / "analysis" / dataset
-    manifest = run(canonical_root, output_dir, dataset=dataset, verbose=False)
+    manifest = run(
+        canonical_root,
+        output_dir,
+        dataset=dataset,
+        ablation_root=ablation_root,
+        strict_ablation=True,
+        verbose=False,
+    )
     assert manifest["runs_loaded"] == 15
     assert manifest["dataset"] == dataset
-    assert len([path for path in manifest["figures"] if path.endswith(".png")]) == 9
+    assert len([path for path in manifest["figures"] if path.endswith(".png")]) == 10
     assert (output_dir / "figures/01_spatial_organisation.png").is_file()
     assert (output_dir / "figures/07_score_and_final_state_response.pdf").is_file()
     assert (output_dir / "figures/08_matched_score_and_final_state_response.pdf").is_file()
     assert (output_dir / "figures/09_final_state_response_variants.pdf").is_file()
+    assert (output_dir / "figures/10_joint_sensitivity_head_ablation.pdf").is_file()
     assert (output_dir / "final_state_response_variants.csv").is_file()
+    assert (output_dir / "joint_sensitivity_head_ablation.csv").is_file()
     assert (output_dir / "head_metrics.csv").is_file()
     assert (output_dir / "manifest.json").is_file()

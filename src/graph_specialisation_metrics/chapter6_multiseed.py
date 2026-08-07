@@ -2,8 +2,9 @@
 
 The analysis deliberately treats independently trained heads as independent
 observations.  Head-level panels retain the seed identity; only layer- and
-model-level summaries are averaged over seeds.  Every figure is derived from
-the consolidated canonical ``scores/raw.pt`` and ``carriage/fields.pt`` files.
+model-level summaries are averaged over seeds.  Spatial figures are derived from
+the consolidated canonical ``scores/raw.pt`` and ``carriage/fields.pt`` files;
+the final validation panel also reads focused clean-head ablation summaries.
 """
 
 from __future__ import annotations
@@ -27,7 +28,7 @@ from .chapter6_spatial_explorer import (
 from .methodology.bootstrap import trimmed_mean
 from .zinc_cached_rrwp_comparison import DISPLAY_BINS
 
-ANALYSIS_VERSION = "chapter6-molecular-multiseed-v1"
+ANALYSIS_VERSION = "chapter6-molecular-multiseed-v2"
 SEEDS = (0, 1, 2)
 CHANNELS = ("semantic", "structural")
 
@@ -1268,6 +1269,89 @@ def _plot_carriage_response_variants(
     return _save_figure(figure, figures_dir, "09_final_state_response_variants")
 
 
+def _spearman(x: Sequence[float], y: Sequence[float]) -> float:
+    from scipy.stats import spearmanr
+
+    left = np.asarray(x, dtype=np.float64)
+    right = np.asarray(y, dtype=np.float64)
+    finite = np.isfinite(left) & np.isfinite(right)
+    if np.count_nonzero(finite) < 3:
+        return float("nan")
+    result = spearmanr(left[finite], right[finite])
+    return float(getattr(result, "statistic", result[0]))
+
+
+def _plot_joint_sensitivity_ablation(
+    rows: Sequence[Mapping[str, Any]], spec: DatasetSpec, figures_dir: Path
+) -> list[Path]:
+    """Plot clean single-head ablation impact against intervention-defined J."""
+
+    if not rows:
+        return []
+    import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
+
+    figure, axes = plt.subplots(1, len(spec.tasks), figsize=(17.2, 3.45), sharey=True)
+    markers = ("o", "s", "^")
+    maximum_layer = max(int(row["layer"]) for row in rows)
+    colour_map = plt.get_cmap("viridis")
+    colour_norm = plt.Normalize(0, maximum_layer)
+    scatter = None
+    for column, task in enumerate(spec.tasks):
+        axis = axes[column]
+        selected = [row for row in rows if str(row["task"]) == task]
+        seed_rhos = []
+        for seed_index, seed in enumerate(sorted({int(row["seed"]) for row in selected})):
+            seed_rows = [row for row in selected if int(row["seed"]) == seed]
+            x = [float(row["joint_sensitivity"]) for row in seed_rows]
+            y = [float(row["prediction_movement"]) for row in seed_rows]
+            seed_rhos.append((seed, _spearman(x, y)))
+            scatter = axis.scatter(
+                x,
+                y,
+                c=[int(row["layer"]) for row in seed_rows],
+                cmap=colour_map,
+                norm=colour_norm,
+                marker=markers[seed_index % len(markers)],
+                s=24,
+                alpha=0.78,
+                linewidths=0,
+            )
+        finite_rhos = _finite([rho for _, rho in seed_rhos])
+        mean_rho = float(np.mean(finite_rhos)) if finite_rhos.size else float("nan")
+        rho_lines = [rf"mean seed $\rho={mean_rho:.2f}$"]
+        rho_lines.append(
+            "  ".join(
+                rf"$\rho_{seed}={rho:.2f}$" if np.isfinite(rho) else rf"$\rho_{seed}=--$"
+                for seed, rho in seed_rhos
+            )
+        )
+        axis.text(
+            0.04,
+            0.96,
+            "\n".join(rho_lines),
+            transform=axis.transAxes,
+            va="top",
+            ha="left",
+            fontsize=7.5,
+            bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.82, "pad": 2.0},
+        )
+        axis.set_title(spec.labels[task])
+        axis.set_xlabel(r"joint sensitivity $J$")
+        axis.grid(alpha=0.18, linewidth=0.6)
+        if column == 0:
+            axis.set_ylabel("output change after head ablation")
+    if scatter is not None:
+        figure.colorbar(scatter, ax=axes, label="layer", shrink=0.82, pad=0.01)
+    seed_handles = [
+        Line2D([], [], marker=markers[index], linestyle="", color="#555555", label=f"seed {seed}")
+        for index, seed in enumerate(sorted({int(row["seed"]) for row in rows}))
+    ]
+    axes[-1].legend(handles=seed_handles, frameon=False, fontsize=7.5, loc="lower right")
+    figure.suptitle(f"{spec.name.upper()}: joint sensitivity and head-ablation impact")
+    return _save_figure(figure, figures_dir, "10_joint_sensitivity_head_ablation")
+
+
 def run(
     canonical_root: Path,
     output_dir: Path,
@@ -1275,6 +1359,8 @@ def run(
     dataset: str,
     seeds: Sequence[int] = SEEDS,
     strict_inventory: bool = True,
+    ablation_root: Path | None = None,
+    strict_ablation: bool = False,
     activity_quantile: float = 0.25,
     verbose: bool = True,
 ) -> dict[str, Any]:
@@ -1318,6 +1404,16 @@ def run(
     profile_rows = population_profile_rows(models)
     matched_profile_rows = matched_strength_profile_rows(models)
     response_variant_rows = carriage_response_variant_rows(models)
+    ablation_rows: list[dict[str, Any]] = []
+    if ablation_root is not None:
+        from .chapter6_clean_ablation import load_rows
+
+        ablation_rows = load_rows(
+            Path(ablation_root),
+            dataset=spec.name,
+            seeds=seeds,
+            strict=strict_ablation,
+        )
     tables = {
         "head_metrics.csv": head_rows,
         "layer_spatial_organisation.csv": organisation_rows,
@@ -1326,6 +1422,7 @@ def run(
         "population_score_carriage_profiles.csv": profile_rows,
         "matched_score_carriage_profiles.csv": matched_profile_rows,
         "final_state_response_variants.csv": response_variant_rows,
+        "joint_sensitivity_head_ablation.csv": ablation_rows,
     }
     for filename, rows in tables.items():
         _write_csv(output_dir / filename, rows)
@@ -1366,6 +1463,7 @@ def run(
     figures.extend(_plot_population_profiles(profile_rows, spec, figures_dir))
     figures.extend(_plot_matched_strength_profiles(matched_profile_rows, spec, figures_dir))
     figures.extend(_plot_carriage_response_variants(response_variant_rows, spec, figures_dir))
+    figures.extend(_plot_joint_sensitivity_ablation(ablation_rows, spec, figures_dir))
 
     manifest = {
         "analysis_version": ANALYSIS_VERSION,
@@ -1375,6 +1473,8 @@ def run(
         "tasks": list(spec.tasks),
         "seeds": [int(seed) for seed in seeds],
         "strict_inventory": bool(strict_inventory),
+        "ablation_root": None if ablation_root is None else str(ablation_root),
+        "strict_ablation": bool(strict_ablation),
         "activity_quantile": float(activity_quantile),
         "runs_loaded": len(models),
         "warnings": warnings,
@@ -1401,6 +1501,10 @@ def run(
             "response_variants": (
                 "graph-balanced mean absolute response per eligible carrier within each shell, "
                 "shown both in raw output units and after within-channel profile normalisation"
+            ),
+            "head_ablation": (
+                "clean single-head ablation prediction movement on 64 held-out graphs; "
+                "Spearman correlations are computed and displayed separately within seed"
             ),
             "final_state_response": "learned response, not task necessity",
         },

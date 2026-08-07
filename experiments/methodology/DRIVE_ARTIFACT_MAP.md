@@ -70,15 +70,23 @@ under the same run's `cache/_stale/` directory.
 ## Chapter 6 multi-seed analysis
 
 Run `experiments/methodology/chapter6_multiseed_colab.ipynb` with `DATASET = "zinc"` or
-`DATASET = "qm9"`. The two runs are cache-only and write independently to:
+`DATASET = "qm9"`. The two runs write independently to:
 
 ```text
 M/chapter6_multiseed_analysis/zinc
 M/chapter6_multiseed_analysis/qm9
 ```
 
-Each run reads the five architectures and three seeds listed above; it does not load a checkpoint
-or recompute an intervention.
+Each run reads the five architectures and three seeds listed above. Score and carriage figures are
+cache-only. On the first run for a dataset, the notebook also computes the clean single-head
+ablation endpoint on 64 held-out graphs and writes resumable per-head shards under each canonical
+run's `cache/causal/clean_ablation/` directory. Compact plotting summaries are written to:
+
+```text
+M/chapter6_clean_head_ablation/<model task>/seed_<seed>.json
+```
+
+Use a T4 GPU for the first pass; subsequent figure-only reruns reuse these caches.
 
 ## Seed-0 dense/1-hop checkpoint trajectory
 

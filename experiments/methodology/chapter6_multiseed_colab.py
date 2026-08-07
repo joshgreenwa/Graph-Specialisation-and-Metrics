@@ -2,8 +2,9 @@
 
 Set ``DATASET`` to ``"zinc"`` or ``"qm9"`` and run the cell.  The two values
 write to separate Drive directories, so two Colab sessions can run in parallel.
-All scientific arrays are read from consolidated canonical caches; no model is
-constructed and no intervention is recomputed.
+Score and carriage figures are cache-only.  The first run also computes the focused
+clean single-head ablation endpoint; its per-head shards and compact summaries are
+resumable, so later runs return to cache-only figure generation.
 """
 
 # ============================ paste from here ============================
@@ -37,12 +38,14 @@ DATASET = os.environ.get("CHAPTER6_DATASET", "zinc").strip().lower()
 SEEDS = (0, 1, 2)
 STRICT_CACHE_INVENTORY = True
 RELIABLE_HEAD_QUANTILE = 0.25
+COMPUTE_MISSING_ABLATIONS = True
 
 DRIVE_ROOT = Path("/content/drive/MyDrive")
 MULTI_SEED_ROOT = DRIVE_ROOT / "graph_specialisation_metrics/multi_seed_models"
 CANONICAL_ROOT = MULTI_SEED_ROOT / "canonical_outputs"
 OUTPUT_ROOT = MULTI_SEED_ROOT / "chapter6_multiseed_analysis"
 OUTPUT_DIR = OUTPUT_ROOT / DATASET.lower()
+ABLATION_ROOT = MULTI_SEED_ROOT / "chapter6_clean_head_ablation"
 
 
 def command(*parts: str) -> None:
@@ -121,13 +124,52 @@ from graph_specialisation_metrics.chapter6_multiseed import (
     cache_inventory,
     run,
 )
+from graph_specialisation_metrics.chapter6_clean_ablation import (
+    compute_dataset as compute_clean_ablations,
+    missing_runs as missing_ablation_runs,
+)
+
+
+missing_ablations = missing_ablation_runs(ABLATION_ROOT, dataset=DATASET, seeds=SEEDS)
+if missing_ablations:
+    if not COMPUTE_MISSING_ABLATIONS:
+        detail = ", ".join(f"{task}/seed_{seed}" for task, seed in missing_ablations)
+        raise FileNotFoundError(f"missing clean-head ablation summaries: {detail}")
+    print(
+        f"[ablation] {len(missing_ablations)} run(s) are missing; "
+        "loading checkpoints and computing only clean single-head ablations.",
+        flush=True,
+    )
+    from experiments.methodology.zinc_qm9_canonical_colab_worker import (
+        build_production_config,
+        ensure_runtime_dependencies,
+        load_prepared_corpus,
+        require_requested_accelerator,
+    )
+
+    require_requested_accelerator("cuda:0")
+    ensure_runtime_dependencies()
+    corpus = load_prepared_corpus(MULTI_SEED_ROOT)
+    methodology_config = build_production_config(
+        MULTI_SEED_ROOT,
+        corpus,
+        accelerator="cuda:0",
+    )
+    compute_clean_ablations(
+        methodology_config,
+        CANONICAL_ROOT,
+        ABLATION_ROOT,
+        dataset=DATASET,
+        seeds=SEEDS,
+        verbose=True,
+    )
 
 
 print(
     f"\n[scope] Dataset: {DATASET.upper()}\n"
     f"[scope] Seeds: {SEEDS}\n"
     "[scope] Five models: 1-hop, 1-hop + VNode, 2-hop, 2-hop + VNode, dense.\n"
-    "[scope] Cache-only: no checkpoints, datasets, model construction, or forward passes.\n"
+    "[scope] Scores/carriage are cache-only; clean head ablations resume or compute once.\n"
     "[scope] Head identities are never matched or averaged across seeds.\n"
     f"[scope] Output directory: {OUTPUT_DIR}\n",
     flush=True,
@@ -157,6 +199,8 @@ manifest = run(
     dataset=DATASET,
     seeds=SEEDS,
     strict_inventory=STRICT_CACHE_INVENTORY,
+    ablation_root=ABLATION_ROOT,
+    strict_ablation=True,
     activity_quantile=RELIABLE_HEAD_QUANTILE,
     verbose=True,
 )
