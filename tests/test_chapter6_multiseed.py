@@ -10,6 +10,8 @@ from graph_specialisation_metrics.chapter6_multiseed import (
     alignment_summary_rows,
     cache_inventory,
     dataset_spec,
+    per_opportunity_head_profile,
+    raw_carriage_strength_profile,
     run,
 )
 
@@ -45,7 +47,18 @@ def _score(*, vnode: bool, seed: int) -> dict:
         return {
             "raw": raw,
             "heatmap_exact_head": values,
-            "distance_support": {"reportable": np.ones(len(axis), dtype=bool)},
+            "heatmap_per_opportunity_head": values,
+            "graph_distance_contribution": {0: values, 1: values * 1.1},
+            "graph_distance_support": {
+                0: np.ones(len(axis), dtype=np.float64),
+                1: np.ones(len(axis), dtype=np.float64),
+            },
+            "events": [{"graph_id": graph, "source": 0, "draw": 0} for graph in (0, 1)],
+            "distance_support": {
+                "reportable": np.ones(len(axis), dtype=bool),
+                "minimum_graphs": 1,
+                "minimum_pairs": 1,
+            },
         }
 
     raw_semantic = semantic.sum(axis=-1)
@@ -85,19 +98,22 @@ def _carriage(seed: int, *, vnode: bool) -> dict:
     ]
     if vnode:
         distances.append((float("nan"), "virtual", 0.5))
-    rows = [
-        {
-            "seed": seed,
-            "graph_id": graph,
-            "source": 0,
-            "donor": 1,
-            "distance": distance,
-            "carrier_kind": kind,
-            "F_sens": value,
-        }
-        for graph in (0, 1)
-        for distance, kind, value in distances
-    ]
+    rows = []
+    for graph in range(10):
+        for source in range(5):
+            for carrier, (distance, kind, value) in enumerate(distances):
+                rows.append(
+                    {
+                        "seed": seed,
+                        "graph_id": graph,
+                        "source": source,
+                        "donor": 1,
+                        "carrier": carrier,
+                        "distance": distance,
+                        "carrier_kind": kind,
+                        "F_sens": value,
+                    }
+                )
     return {"channels": {channel: {"pairs": rows} for channel in ("semantic", "structural")}}
 
 
@@ -152,6 +168,32 @@ def test_alignment_summary_reports_coarse_agreement():
     assert summary[0]["same_or_adjacent_peak_fraction"] == pytest.approx(1.0)
 
 
+def test_matched_profiles_control_for_opportunity_and_use_raw_carriage():
+    score = _score(vnode=False, seed=0)
+    labels, score_profile = per_opportunity_head_profile(score, "semantic")
+    assert labels[:3] == ("0", "1", "2")
+    assert np.nansum(score_profile) == pytest.approx(1.0)
+
+    labels, carriage_profile = raw_carriage_strength_profile(
+        _carriage(0, vnode=False),
+        "semantic",
+        minimum_graphs=1,
+        minimum_pairs=1,
+    )
+    assert labels[:3] == ("0", "1", "2")
+    np.testing.assert_allclose(carriage_profile[:3], (0.25, 0.5, 0.25))
+    assert np.nansum(carriage_profile) == pytest.approx(1.0)
+
+    _, raw_carriage = raw_carriage_strength_profile(
+        _carriage(0, vnode=False),
+        "semantic",
+        minimum_graphs=1,
+        minimum_pairs=1,
+        normalise=False,
+    )
+    np.testing.assert_allclose(raw_carriage[:3], (1.0, 2.0, 1.0))
+
+
 @pytest.mark.parametrize("dataset", ("zinc", "qm9"))
 def test_run_builds_dataset_specific_multiseed_suite(tmp_path, dataset):
     spec = dataset_spec(dataset)
@@ -168,8 +210,11 @@ def test_run_builds_dataset_specific_multiseed_suite(tmp_path, dataset):
     manifest = run(canonical_root, output_dir, dataset=dataset, verbose=False)
     assert manifest["runs_loaded"] == 15
     assert manifest["dataset"] == dataset
-    assert len([path for path in manifest["figures"] if path.endswith(".png")]) == 7
+    assert len([path for path in manifest["figures"] if path.endswith(".png")]) == 9
     assert (output_dir / "figures/01_spatial_organisation.png").is_file()
     assert (output_dir / "figures/07_score_and_final_state_response.pdf").is_file()
+    assert (output_dir / "figures/08_matched_score_and_final_state_response.pdf").is_file()
+    assert (output_dir / "figures/09_final_state_response_variants.pdf").is_file()
+    assert (output_dir / "final_state_response_variants.csv").is_file()
     assert (output_dir / "head_metrics.csv").is_file()
     assert (output_dir / "manifest.json").is_file()

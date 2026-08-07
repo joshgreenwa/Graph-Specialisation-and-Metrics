@@ -24,6 +24,8 @@ from .chapter6_spatial_explorer import (
     load_models,
     model_profiles,
 )
+from .methodology.bootstrap import trimmed_mean
+from .zinc_cached_rrwp_comparison import DISPLAY_BINS
 
 ANALYSIS_VERSION = "chapter6-molecular-multiseed-v1"
 SEEDS = (0, 1, 2)
@@ -363,6 +365,346 @@ def population_profile_rows(models: Sequence[SpatialModel]) -> list[dict[str, An
                 "mass_mean": mean,
                 "mass_min": low,
                 "mass_max": high,
+            }
+        )
+    return output
+
+
+def _distance_groups(axis: Sequence[Any]) -> tuple[tuple[str, tuple[int, ...]], ...]:
+    groups: list[tuple[str, tuple[int, ...]]] = []
+    for label, lower, upper in DISPLAY_BINS:
+        positions = []
+        for index, value in enumerate(axis):
+            try:
+                distance = float(value)
+            except (TypeError, ValueError):
+                continue
+            if np.isfinite(distance) and distance.is_integer() and lower <= int(distance) <= upper:
+                positions.append(index)
+        groups.append((label, tuple(positions)))
+    specials = sorted(
+        {
+            str(value).replace("_", " ")
+            for value in axis
+            if not isinstance(value, (int, float, np.integer, np.floating))
+        }
+    )
+    for special in specials:
+        positions = tuple(
+            index for index, value in enumerate(axis) if str(value).replace("_", " ") == special
+        )
+        groups.append((special, positions))
+    return tuple(groups)
+
+
+def per_opportunity_head_profile(
+    score: Mapping[str, Any], channel: str
+) -> tuple[tuple[str, ...], np.ndarray]:
+    """Return the typical head's score strength after controlling for opportunity.
+
+    Display bins are formed from cached graph-level sufficient statistics before
+    dividing contribution by support.  This avoids both shell-size confounding and
+    the artificial inflation that would result from summing already-normalised
+    exact-distance columns into a wide tail bin.
+    """
+
+    channel_score = score["channels"][channel]
+    axis = tuple(score["axis"])
+    groups = _distance_groups(axis)
+    labels = tuple(label for label, _ in groups)
+    contribution = channel_score.get("graph_distance_contribution")
+    support = channel_score.get("graph_distance_support")
+    grouped: np.ndarray | None = None
+    reportable = np.ones(len(groups), dtype=bool)
+    if isinstance(contribution, Mapping) and isinstance(support, Mapping):
+        keys = sorted(set(contribution).intersection(support), key=lambda value: str(value))
+        graph_profiles = []
+        grouped_support: dict[Any, np.ndarray] = {}
+        for key in keys:
+            graph_contribution = np.asarray(contribution[key], dtype=np.float64)
+            graph_support = np.asarray(support[key], dtype=np.float64)
+            if graph_contribution.ndim != 3 or graph_contribution.shape[-1] != len(axis):
+                continue
+            if graph_support.shape != (len(axis),):
+                continue
+            grouped_contribution = np.stack(
+                [
+                    (
+                        graph_contribution[..., list(positions)].sum(axis=-1)
+                        if positions
+                        else np.zeros(graph_contribution.shape[:2])
+                    )
+                    for _label, positions in groups
+                ],
+                axis=-1,
+            )
+            grouped_opportunity = np.asarray(
+                [
+                    (float(np.sum(graph_support[list(positions)])) if positions else 0.0)
+                    for _label, positions in groups
+                ]
+            )
+            ratio = np.full_like(grouped_contribution, np.nan)
+            np.divide(
+                grouped_contribution,
+                grouped_opportunity[None, None, :],
+                out=ratio,
+                where=grouped_opportunity[None, None, :] > 0,
+            )
+            graph_profiles.append(ratio)
+            grouped_support[key] = grouped_opportunity
+        if graph_profiles:
+            stacked = np.stack(graph_profiles)
+            valid = np.sum(np.isfinite(stacked), axis=0)
+            grouped = np.full(stacked.shape[1:], np.nan)
+            np.divide(
+                np.nansum(stacked, axis=0),
+                valid,
+                out=grouped,
+                where=valid > 0,
+            )
+
+            support_record = channel_score.get("distance_support", {})
+            minimum_graphs = int(
+                support_record.get("minimum_graphs", 1)
+                if isinstance(support_record, Mapping)
+                else 1
+            )
+            minimum_pairs = int(
+                support_record.get("minimum_pairs", 1) if isinstance(support_record, Mapping) else 1
+            )
+            sources: dict[int, set[int]] = {}
+            for row in channel_score.get("events", ()):
+                sources.setdefault(int(row["graph_id"]), set()).add(int(row["source"]))
+            for position in range(len(groups)):
+                supporting = [
+                    key for key, values in grouped_support.items() if values[position] > 0
+                ]
+                pairs = float(
+                    np.sum(
+                        [
+                            grouped_support[key][position] * max(len(sources.get(int(key), ())), 1)
+                            for key in supporting
+                        ]
+                    )
+                )
+                reportable[position] = len(supporting) >= minimum_graphs and pairs >= minimum_pairs
+    if grouped is None:
+        exact = channel_score.get("heatmap_per_opportunity_head")
+        if exact is None:
+            return labels, np.full(len(labels), np.nan)
+        exact = np.asarray(exact, dtype=np.float64)
+        grouped = np.stack(
+            [
+                (
+                    np.nanmean(exact[..., list(positions)], axis=-1)
+                    if positions
+                    else np.full(exact.shape[:2], np.nan)
+                )
+                for _label, positions in groups
+            ],
+            axis=-1,
+        )
+    grouped[..., ~reportable] = np.nan
+    profile = _normalise_last(np.where(np.isfinite(grouped), grouped, 0.0))
+    profile[..., ~reportable] = np.nan
+    flattened = profile.reshape(-1, len(labels))
+    valid = np.sum(np.isfinite(flattened), axis=0)
+    result = np.full(len(labels), np.nan)
+    np.divide(np.nansum(flattened, axis=0), valid, out=result, where=valid > 0)
+    finite = np.isfinite(result)
+    if np.any(finite) and float(np.sum(result[finite])) > 1.0e-12:
+        result[finite] /= float(np.sum(result[finite]))
+    return labels, result
+
+
+def raw_carriage_strength_profile(
+    carriage: Mapping[str, Any],
+    channel: str,
+    *,
+    minimum_graphs: int = 10,
+    minimum_pairs: int = 50,
+    normalise: bool = True,
+) -> tuple[tuple[str, ...], np.ndarray]:
+    """Return graph-balanced raw ``F_sens`` per eligible carrier.
+
+    Donors are averaged within a source, carrier sums and counts are combined
+    across sources within a graph, and graph-level pair means are combined with
+    the canonical 20% trimmed mean.  Missing opportunities remain missing.  When
+    ``normalise`` is true, only the completed vector is normalised, making it a
+    shape comparison without changing the underlying per-carrier estimand.
+    """
+
+    rows = list(carriage["channels"][channel]["pairs"])
+    # Use the fixed display names directly so empty molecular bins remain visible
+    # as missing rather than being silently converted to zero.
+    labels = tuple(label for label, _lower, _upper in DISPLAY_BINS) + tuple(
+        label.replace("_", " ")
+        for label in sorted(
+            {
+                str(row.get("carrier_kind"))
+                for row in rows
+                if not np.isfinite(float(row["distance"]))
+                and str(row.get("carrier_kind", "molecular_node")) != "molecular_node"
+            }
+        )
+    )
+
+    def bin_label(row: Mapping[str, Any]) -> str | None:
+        distance = float(row["distance"])
+        if np.isfinite(distance):
+            for label, lower, upper in DISPLAY_BINS:
+                if lower <= int(distance) <= upper:
+                    return label
+            return None
+        kind = str(row.get("carrier_kind", "molecular_node"))
+        return None if kind == "molecular_node" else kind.replace("_", " ")
+
+    estimates = np.full(len(labels), np.nan)
+    for position, label in enumerate(labels):
+        selected = [
+            row for row in rows if bin_label(row) == label and np.isfinite(float(row["F_sens"]))
+        ]
+        graphs = {int(row["graph_id"]) for row in selected}
+        pairs = {
+            (int(row["graph_id"]), int(row["carrier"]), int(row["source"])) for row in selected
+        }
+        if len(graphs) < int(minimum_graphs) or len(pairs) < int(minimum_pairs):
+            continue
+        events: dict[tuple[int, int, int], list[float]] = {}
+        for row in selected:
+            events.setdefault(
+                (int(row["graph_id"]), int(row["source"]), int(row["donor"])), []
+            ).append(float(row["F_sens"]))
+        by_source: dict[tuple[int, int], list[tuple[float, int]]] = {}
+        for (graph, source, _donor), values in events.items():
+            by_source.setdefault((graph, source), []).append((float(np.sum(values)), len(values)))
+        by_graph: dict[int, list[tuple[float, float]]] = {}
+        for (graph, _source), donor_values in by_source.items():
+            by_graph.setdefault(graph, []).append(
+                (
+                    float(np.mean([value[0] for value in donor_values])),
+                    float(np.mean([value[1] for value in donor_values])),
+                )
+            )
+        graph_means = []
+        for source_values in by_graph.values():
+            total = float(np.sum([value[0] for value in source_values]))
+            count = float(np.sum([value[1] for value in source_values]))
+            if count > 0:
+                graph_means.append(total / count)
+        if graph_means:
+            estimates[position] = float(trimmed_mean(graph_means, 0.20, axis=0))
+    finite = np.isfinite(estimates) & (estimates >= 0.0)
+    if normalise and np.any(finite) and float(np.sum(estimates[finite])) > 1.0e-12:
+        estimates[finite] /= float(np.sum(estimates[finite]))
+    return labels, estimates
+
+
+def matched_strength_profile_rows(models: Sequence[SpatialModel]) -> list[dict[str, Any]]:
+    per_seed: list[dict[str, Any]] = []
+    for model in models:
+        for channel in CHANNELS:
+            labels, score_values = per_opportunity_head_profile(model.score, channel)
+            for label, value in zip(labels, score_values):
+                per_seed.append(
+                    {
+                        "task": model.task,
+                        "seed": int(model.seed),
+                        "source": f"{channel}_score_per_opportunity",
+                        "distance": label,
+                        "value": float(value),
+                    }
+                )
+            if model.carriage is not None:
+                labels, response_values = raw_carriage_strength_profile(model.carriage, channel)
+                for label, value in zip(labels, response_values):
+                    per_seed.append(
+                        {
+                            "task": model.task,
+                            "seed": int(model.seed),
+                            "source": f"{channel}_carriage_per_carrier",
+                            "distance": label,
+                            "value": float(value),
+                        }
+                    )
+    groups: dict[tuple[str, str, str], list[float]] = {}
+    for row in per_seed:
+        groups.setdefault((str(row["task"]), str(row["source"]), str(row["distance"])), []).append(
+            float(row["value"])
+        )
+    output: list[dict[str, Any]] = []
+    for (task, source, distance), values in sorted(groups.items()):
+        mean, low, high = _mean_range(values)
+        output.append(
+            {
+                "task": task,
+                "source": source,
+                "distance": distance,
+                "seeds": int(np.sum(np.isfinite(np.asarray(values, dtype=np.float64)))),
+                "strength_mean": mean,
+                "strength_min": low,
+                "strength_max": high,
+            }
+        )
+    return output
+
+
+def carriage_response_variant_rows(models: Sequence[SpatialModel]) -> list[dict[str, Any]]:
+    """Return normalized shape and raw-magnitude versions of per-carrier ``F_sens``."""
+
+    per_seed: list[dict[str, Any]] = []
+    for model in models:
+        if model.carriage is None:
+            continue
+        for channel in CHANNELS:
+            labels, raw_values = raw_carriage_strength_profile(
+                model.carriage, channel, normalise=False
+            )
+            normalised_values = np.asarray(raw_values, dtype=np.float64).copy()
+            finite = np.isfinite(normalised_values) & (normalised_values >= 0.0)
+            total = float(np.sum(normalised_values[finite])) if np.any(finite) else 0.0
+            if total > 1.0e-12:
+                normalised_values[finite] /= total
+            for variant, values in (
+                ("normalised", normalised_values),
+                ("raw", raw_values),
+            ):
+                for label, value in zip(labels, values):
+                    per_seed.append(
+                        {
+                            "task": model.task,
+                            "seed": int(model.seed),
+                            "channel": channel,
+                            "variant": variant,
+                            "distance": label,
+                            "value": float(value),
+                        }
+                    )
+    groups: dict[tuple[str, str, str, str], list[float]] = {}
+    for row in per_seed:
+        groups.setdefault(
+            (
+                str(row["task"]),
+                str(row["channel"]),
+                str(row["variant"]),
+                str(row["distance"]),
+            ),
+            [],
+        ).append(float(row["value"]))
+    output: list[dict[str, Any]] = []
+    for (task, channel, variant, distance), values in sorted(groups.items()):
+        mean, low, high = _mean_range(values)
+        output.append(
+            {
+                "task": task,
+                "channel": channel,
+                "variant": variant,
+                "distance": distance,
+                "seeds": int(np.sum(np.isfinite(np.asarray(values, dtype=np.float64)))),
+                "response_mean": mean,
+                "response_min": low,
+                "response_max": high,
             }
         )
     return output
@@ -737,7 +1079,12 @@ def _plot_population_profiles(
             x = np.arange(len(labels))
             for source, colour, marker, label in (
                 (f"{channel}_score", "#4C78A8", "o", "mean head score"),
-                (f"{channel}_carriage", "#222222", "s", "final-state response"),
+                (
+                    f"{channel}_carriage",
+                    "#222222",
+                    "s",
+                    "event-normalised allocation",
+                ),
             ):
                 lookup = {
                     str(row["distance"]): row for row in selected if str(row["source"]) == source
@@ -771,8 +1118,154 @@ def _plot_population_profiles(
                 axis.set_ylabel(f"{channel}\nnormalised mass")
             if row_index == 0 and column == 0:
                 axis.legend(frameon=False, fontsize=8)
-    figure.suptitle(f"{spec.name.upper()}: head-score profiles and final-state response")
+    figure.suptitle(
+        f"{spec.name.upper()}: head-score mass and event-normalised final-state allocation"
+    )
     return _save_figure(figure, figures_dir, "07_score_and_final_state_response")
+
+
+def _plot_matched_strength_profiles(
+    rows: Sequence[Mapping[str, Any]], spec: DatasetSpec, figures_dir: Path
+) -> list[Path]:
+    """Match score and final-state curves on a per-opportunity/per-carrier basis."""
+
+    import matplotlib.pyplot as plt
+
+    if not any(str(row["source"]).endswith("_carriage_per_carrier") for row in rows):
+        return []
+    figure, axes = plt.subplots(
+        2,
+        len(spec.tasks),
+        figsize=(3.35 * len(spec.tasks), 6.8),
+        sharey="row",
+        squeeze=False,
+        constrained_layout=True,
+    )
+    for row_index, channel in enumerate(CHANNELS):
+        for column, task in enumerate(spec.tasks):
+            axis = axes[row_index, column]
+            selected = [row for row in rows if str(row["task"]) == task]
+            sources = (
+                f"{channel}_score_per_opportunity",
+                f"{channel}_carriage_per_carrier",
+            )
+            labels = sorted(
+                {str(row["distance"]) for row in selected if str(row["source"]) in sources},
+                key=_distance_order,
+            )
+            x = np.arange(len(labels))
+            for source, colour, marker, label in (
+                (sources[0], "#4C78A8", "o", "per-opportunity head score"),
+                (sources[1], "#222222", "s", r"per-carrier raw $F_{\mathrm{sens}}$"),
+            ):
+                lookup = {
+                    str(row["distance"]): row for row in selected if str(row["source"]) == source
+                }
+                if not lookup:
+                    continue
+                mean = np.asarray(
+                    [
+                        float(lookup[value]["strength_mean"]) if value in lookup else np.nan
+                        for value in labels
+                    ]
+                )
+                low = np.asarray(
+                    [
+                        float(lookup[value]["strength_min"]) if value in lookup else np.nan
+                        for value in labels
+                    ]
+                )
+                high = np.asarray(
+                    [
+                        float(lookup[value]["strength_max"]) if value in lookup else np.nan
+                        for value in labels
+                    ]
+                )
+                axis.plot(x, mean, color=colour, marker=marker, label=label)
+                axis.fill_between(x, low, high, color=colour, alpha=0.14, linewidth=0)
+            axis.set_xticks(x, labels)
+            axis.set_title(spec.labels[task], fontsize=10)
+            axis.set_xlabel("distance")
+            if column == 0:
+                axis.set_ylabel(f"{channel}\nnormalised strength")
+            if row_index == 0 and column == 0:
+                axis.legend(frameon=False, fontsize=8)
+    figure.suptitle(
+        f"{spec.name.upper()}: opportunity-matched head scores and final-state response"
+    )
+    return _save_figure(figure, figures_dir, "08_matched_score_and_final_state_response")
+
+
+def _plot_carriage_response_variants(
+    rows: Sequence[Mapping[str, Any]], spec: DatasetSpec, figures_dir: Path
+) -> list[Path]:
+    """Separate the spatial shape and raw magnitude of per-carrier response."""
+
+    import matplotlib.pyplot as plt
+
+    if not rows:
+        return []
+    figure, axes = plt.subplots(
+        2,
+        len(spec.tasks),
+        figsize=(3.35 * len(spec.tasks), 6.8),
+        sharey="row",
+        squeeze=False,
+        constrained_layout=True,
+    )
+    channel_styles = {
+        "semantic": ("#0072B2", "o", "semantic"),
+        "structural": ("#D55E00", "s", "structural"),
+    }
+    for row_index, variant in enumerate(("normalised", "raw")):
+        for column, task in enumerate(spec.tasks):
+            axis = axes[row_index, column]
+            selected = [
+                row for row in rows if str(row["task"]) == task and str(row["variant"]) == variant
+            ]
+            labels = sorted({str(row["distance"]) for row in selected}, key=_distance_order)
+            x = np.arange(len(labels))
+            for channel, (colour, marker, label) in channel_styles.items():
+                lookup = {
+                    str(row["distance"]): row for row in selected if str(row["channel"]) == channel
+                }
+                if not lookup:
+                    continue
+                mean = np.asarray(
+                    [
+                        float(lookup[value]["response_mean"]) if value in lookup else np.nan
+                        for value in labels
+                    ]
+                )
+                low = np.asarray(
+                    [
+                        float(lookup[value]["response_min"]) if value in lookup else np.nan
+                        for value in labels
+                    ]
+                )
+                high = np.asarray(
+                    [
+                        float(lookup[value]["response_max"]) if value in lookup else np.nan
+                        for value in labels
+                    ]
+                )
+                axis.plot(x, mean, color=colour, marker=marker, label=label)
+                axis.fill_between(x, low, high, color=colour, alpha=0.14, linewidth=0)
+            axis.set_xticks(x, labels)
+            axis.set_title(spec.labels[task], fontsize=10)
+            axis.set_xlabel("distance")
+            if column == 0:
+                axis.set_ylabel(
+                    "normalised per-carrier response"
+                    if variant == "normalised"
+                    else r"mean raw $F_{\mathrm{sens}}$ per carrier"
+                )
+            if row_index == 0 and column == 0:
+                axis.legend(frameon=False, fontsize=8)
+            if variant == "raw":
+                axis.ticklabel_format(axis="y", style="sci", scilimits=(-2, 2))
+    figure.suptitle(f"{spec.name.upper()}: per-carrier final-state response shape and magnitude")
+    return _save_figure(figure, figures_dir, "09_final_state_response_variants")
 
 
 def run(
@@ -823,12 +1316,16 @@ def run(
     alignment_rows = alignment_summary_rows(head_rows, activity_quantile=activity_quantile)
     vnode_rows = vnode_allocation_rows(models)
     profile_rows = population_profile_rows(models)
+    matched_profile_rows = matched_strength_profile_rows(models)
+    response_variant_rows = carriage_response_variant_rows(models)
     tables = {
         "head_metrics.csv": head_rows,
         "layer_spatial_organisation.csv": organisation_rows,
         "semantic_structural_alignment.csv": alignment_rows,
         "vnode_allocation.csv": vnode_rows,
         "population_score_carriage_profiles.csv": profile_rows,
+        "matched_score_carriage_profiles.csv": matched_profile_rows,
+        "final_state_response_variants.csv": response_variant_rows,
     }
     for filename, rows in tables.items():
         _write_csv(output_dir / filename, rows)
@@ -867,6 +1364,8 @@ def run(
     )
     figures.extend(_plot_vnode_allocation(vnode_rows, spec, figures_dir))
     figures.extend(_plot_population_profiles(profile_rows, spec, figures_dir))
+    figures.extend(_plot_matched_strength_profiles(matched_profile_rows, spec, figures_dir))
+    figures.extend(_plot_carriage_response_variants(response_variant_rows, spec, figures_dir))
 
     manifest = {
         "analysis_version": ANALYSIS_VERSION,
@@ -890,6 +1389,18 @@ def run(
                 "Spearman expected-distance co-variation plus coarse peak-bin agreement "
                 f"among the top {100 * (1 - activity_quantile):.0f}% of heads by J "
                 "within each seed"
+            ),
+            "mass_allocation_comparison": (
+                "within-head score mass versus event-normalised F_sens allocation; "
+                "both retain distance-shell opportunity"
+            ),
+            "matched_strength_comparison": (
+                "per-opportunity head score versus graph-balanced raw F_sens per carrier; "
+                "only the completed profiles are normalised for plotting"
+            ),
+            "response_variants": (
+                "graph-balanced mean absolute response per eligible carrier within each shell, "
+                "shown both in raw output units and after within-channel profile normalisation"
             ),
             "final_state_response": "learned response, not task necessity",
         },
