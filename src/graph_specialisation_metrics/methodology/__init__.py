@@ -13,6 +13,7 @@ from .protocol import (
 )
 from .runner import (
     finalize_cached_run,
+    finalize_measurement_run,
     render_cached_figures,
     run_methodology,
     run_worker,
@@ -39,8 +40,9 @@ __all__ = [
     "NumericalPolicy",
     "OutputGeometry",
     "RunSizes",
-    "get_task",
     "finalize_cached_run",
+    "finalize_measurement_run",
+    "get_task",
     "register",
     "register_graphormer_dataset",
     "render_cached_figures",

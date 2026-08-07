@@ -22,6 +22,11 @@ FIXED_SUPPORT_FIELDS = (
     "y",
 )
 
+ZINC_FROZEN_KHOP_SUPPORT_TASKS = frozenset(
+    {"zinc_2hop", "zinc_1hop_vnode", "zinc_2hop_vnode"}
+)
+ZINC_FROZEN_KHOP_ADAPTER_VERSION = "canonical-grit-zinc-frozen-khop-support-v2"
+
 
 def _mae_per_graph(prediction, target):
     import torch
@@ -222,11 +227,20 @@ def _known_grit_task(name: str) -> CanonicalTask:
             + (
                 ("pos", "rrwp_attention_edge_index")
                 if name.startswith("qm9_")
-                else ()
+                else (
+                    ("rrwp_attention_edge_index",)
+                    if name in ZINC_FROZEN_KHOP_SUPPORT_TASKS
+                    else ()
+                )
             )
         ),
         virtual_node=virtual,
         carrier_policy=("real_nodes_plus_internal_vnode" if virtual else "real_nodes"),
+        adapter_version=(
+            ZINC_FROZEN_KHOP_ADAPTER_VERSION
+            if name in ZINC_FROZEN_KHOP_SUPPORT_TASKS
+            else "canonical-grit-v1"
+        ),
     )
 
 

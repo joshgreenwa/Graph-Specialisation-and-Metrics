@@ -72,6 +72,16 @@ run(
 The paste-ready clone/mount/dispatch cell is
 [`../../../experiments/methodology/canonical_methodology_colab.py`](../../../experiments/methodology/canonical_methodology_colab.py).
 
+The manifest-locked emergency workflow for the 30 ZINC/QM9 best-available checkpoints is
+[`../../../experiments/methodology/zinc_qm9_canonical_worker_colab.ipynb`](../../../experiments/methodology/zinc_qm9_canonical_worker_colab.ipynb).
+It defaults to the existing Drive project folder
+`/content/drive/MyDrive/graph_specialisation_metrics/multi_seed_models`, where the archive and
+sidecar live.
+Its setup mode verifies and extracts the registered archive, warms the shared datasets, and emits
+30 commit-pinned, pre-indexed worker notebooks. Each worker uses the same complete 10-task/3-seed
+configuration and calls `run_worker(..., retain_results=False)`, leaving durable caches on Drive
+while releasing score and carriage payloads between components.
+
 ## Module boundary
 
 | Module | Responsibility |
@@ -143,10 +153,13 @@ through `nvidia-smi`.
 
 Independent HPC processes should call `run_worker` with the same complete multi-task/multi-seed
 configuration and one selected task/seed. A worker writes only its `seed_<training-seed>` subtree;
-it never writes shared task or root summaries. After every worker succeeds,
-`finalize_cached_run` performs a model-free completeness and cache-contract check, renders every
-seed, and becomes the sole writer of `population.json`, `protocol.json`, `audits.json`, and
-`index.json`. This worker/finalizer boundary is required when seeds share an output root.
+it never writes shared task or root summaries. For a measurement-only run with phases exactly
+`("scores", "carriage")`, call `finalize_measurement_run` with that same complete configuration
+after every worker succeeds. It performs a model-free cache/sidecar/checkpoint postflight and is
+the sole writer of `population.json`, `protocol.json`, `audits.json`, `index.json`, and
+`measurement_postflight.json`. Figure workflows instead use `finalize_cached_run` after their
+score, carriage, and causal dependencies exist. This worker/finalizer boundary is required when
+seeds share an output root.
 
 To add a future Graphormer dataset such as ZINC, register a `CanonicalTask` with
 `backend_kind="graphormer"` and a `GraphormerTaskSpec`, then register its dataset builder with

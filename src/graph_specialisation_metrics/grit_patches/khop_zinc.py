@@ -908,6 +908,67 @@ def _replace_if_present(path: Path, old: str, new: str, label: str) -> bool:
     return True
 
 
+def _upgrade_onehop_mask_to_explicit_support(rrwp_encoder: Path) -> bool:
+    """Make the 1-hop mask independent of an intervened RRWP payload.
+
+    On a clean molecular graph, non-zero RRWP reachability at lengths zero and one is
+    exactly ``edge_index`` plus the self loops added by the encoder.  Reading the mask from
+    ``edge_index`` is therefore training-equivalent while keeping architectural support fixed
+    when canonical structural interventions transpose ``rrwp_index``/``rrwp_val``.
+    """
+    return _replace_if_present(
+        rrwp_encoder,
+        old=(
+            '        if self.max_hops is None:\n'
+            '            mask_index = batch.get(self.mask_index_name, None)\n'
+            '        else:\n'
+        ),
+        new=(
+            '        # At one hop, edge_index (+ self below) is exactly the trained support.\n'
+            '        # Keeping that architectural mask explicit lets RRWP-only interventions\n'
+            '        # transpose rrwp_index/rrwp_val without silently rewiring attention.\n'
+            '        if self.max_hops is None or self.max_hops == 1:\n'
+            '            mask_index = batch.get(self.mask_index_name, None)\n'
+            '        else:\n'
+        ),
+        label="freeze 1-hop attention support under RRWP interventions",
+    )
+
+
+def _upgrade_khop_mask_to_frozen_support(rrwp_encoder: Path) -> bool:
+    """Read k-hop support saved from the clean RRWP tensor, with a legacy fallback."""
+    return _replace_if_present(
+        rrwp_encoder,
+        old=(
+            '        else:\n'
+            '            needed_channels = self.max_hops + 1  # identity + walks of length 1..k\n'
+            '            if self.max_hops < 1 or needed_channels > raw_rrwp_val.size(1):\n'
+            '                raise ValueError(\n'
+            '                    f"max_hops={self.max_hops} requires {needed_channels} RRWP channels; "\n'
+            '                    f"found {raw_rrwp_val.size(1)}."\n'
+            '                )\n'
+            '            reachable = raw_rrwp_val[:, :needed_channels].abs().sum(dim=-1) > 0\n'
+            '            mask_index = rrwp_idx[:, reachable]\n'
+        ),
+        new=(
+            '        else:\n'
+            '            # Frozen from the clean full RRWP tensor by the dataset transform.\n'
+            '            mask_index = batch.get("rrwp_attention_edge_index", None)\n'
+            '            if mask_index is None:\n'
+            '                # Backward-compatible clean-forward fallback for old prepared data.\n'
+            '                needed_channels = self.max_hops + 1\n'
+            '                if self.max_hops < 1 or needed_channels > raw_rrwp_val.size(1):\n'
+            '                    raise ValueError(\n'
+            '                        f"max_hops={self.max_hops} requires {needed_channels} RRWP channels; "\n'
+            '                        f"found {raw_rrwp_val.size(1)}."\n'
+            '                    )\n'
+            '                reachable = raw_rrwp_val[:, :needed_channels].abs().sum(dim=-1) > 0\n'
+            '                mask_index = rrwp_idx[:, reachable]\n'
+        ),
+        label="freeze k-hop attention support before RRWP interventions",
+    )
+
+
 def apply_khop_patch(repo_dir: Path, drive_dir: Path, args: argparse.Namespace) -> None:
     """Apply configurable dense/k-hop support and optional global-VNode patches."""
     is_dense = args.attention == "dense"
@@ -950,6 +1011,60 @@ def apply_khop_patch(repo_dir: Path, drive_dir: Path, args: argparse.Namespace) 
         ),
         marker='cfg.gt.attn.global_vnode = False',
         label="default k-hop/VNode attention config",
+    )
+
+    rrwp_transform = repo_dir / "grit" / "transform" / "rrwp.py"
+    _replace_exact(
+        rrwp_transform,
+        old=(
+            '                  add_identity=True,\n'
+            '                  spd=False,\n'
+            '                  **kwargs\n'
+            '                  ):\n'
+        ),
+        new=(
+            '                  add_identity=True,\n'
+            '                  spd=False,\n'
+            '                  support_horizon=-1,\n'
+            '                  support_index_attr="rrwp_attention_edge_index",\n'
+            '                  **kwargs\n'
+            '                  ):\n'
+        ),
+        marker='support_index_attr="rrwp_attention_edge_index"',
+        label="RRWP frozen attention-support transform args",
+    )
+    _insert_after(
+        rrwp_transform,
+        anchor="    pe = torch.stack(pe_list, dim=-1) # n x n x k\n",
+        insertion=(
+            "\n"
+            "    support_horizon = int(support_horizon)\n"
+            "    if support_horizon >= 1 and support_index_attr:\n"
+            "        # Save architectural support from the clean complete RRWP tensor.\n"
+            "        # rrwp_index uses [column, row] order. This field is never intervened.\n"
+            "        support_channels = support_horizon + 1 if add_identity else support_horizon\n"
+            "        if support_channels > pe.size(-1):\n"
+            "            raise ValueError(\n"
+            "                f'support_horizon={support_horizon} requires {support_channels} RRWP channels; '\n"
+            "                f'found {pe.size(-1)}.'\n"
+            "            )\n"
+            "        support = pe[..., :support_channels].abs().sum(dim=-1) > 0\n"
+            "        support_row, support_col = support.nonzero(as_tuple=True)\n"
+            "        data[support_index_attr] = torch.stack([support_col, support_row], dim=0)\n"
+        ),
+        marker="data[support_index_attr] = torch.stack([support_col, support_row]",
+        label="freeze exact clean <=k-hop attention support",
+    )
+
+    posenc_stats = repo_dir / "grit" / "transform" / "posenc_stats.py"
+    _insert_after(
+        posenc_stats,
+        anchor="                            spd=param.spd, # by default False\n",
+        insertion=(
+            "                            support_horizon=(cfg.gt.attn.hops if cfg.gt.attn.get('sparsity', 'full') == 'k_hop' else -1),\n"
+        ),
+        marker="support_horizon=(cfg.gt.attn.hops",
+        label="pass frozen attention horizon to RRWP transform",
     )
 
     rrwp_encoder = repo_dir / "grit" / "encoder" / "rrwp_encoder.py"
@@ -1015,6 +1130,12 @@ def apply_khop_patch(repo_dir: Path, drive_dir: Path, args: argparse.Namespace) 
         marker="needed_channels = self.max_hops + 1",
         label="derive exact <=k-hop mask from RRWP",
     )
+    # Fresh checkouts first receive the training-era dynamic implementation above. Existing
+    # Colab clones may already contain it. These migrations are deliberately separate so both
+    # cases converge idempotently on the analysis-safe implementation without changing a clean
+    # forward pass or checkpoint parameters.
+    _upgrade_onehop_mask_to_explicit_support(rrwp_encoder)
+    _upgrade_khop_mask_to_frozen_support(rrwp_encoder)
 
     grit_model = repo_dir / "grit" / "network" / "grit_model.py"
     _replace_exact(
@@ -1353,7 +1474,7 @@ def apply_khop_patch(repo_dir: Path, drive_dir: Path, args: argparse.Namespace) 
             f"global_vnode: {args.global_vnode}",
             f"parameter_count_guard: {expected_param_count(args)}",
             "scientific_change: gt.attn.full_attn=False and gt.attn.sparsity=k_hop",
-            "support: exact shortest-path distance <= k plus self after RRWP encoding",
+            "support: exact clean shortest-path distance <= k plus self, frozen before interventions",
             "vnode: one learned graph token, bidirectional global attention, excluded from pooling",
         ]) + "\n",
         encoding="utf-8",
@@ -1404,8 +1525,18 @@ def verify_khop_attention_patch(repo_dir: Path) -> None:
         ],
         repo_dir / "grit" / "encoder" / "rrwp_encoder.py": [
             "max_hops=None",
+            "self.max_hops is None or self.max_hops == 1",
+            'mask_index = batch.get("rrwp_attention_edge_index", None)',
             "needed_channels = self.max_hops + 1",
             "mask_index = rrwp_idx[:, reachable]",
+        ],
+        repo_dir / "grit" / "transform" / "rrwp.py": [
+            'support_index_attr="rrwp_attention_edge_index"',
+            "support_horizon = int(support_horizon)",
+            "data[support_index_attr] = torch.stack([support_col, support_row]",
+        ],
+        repo_dir / "grit" / "transform" / "posenc_stats.py": [
+            "support_horizon=(cfg.gt.attn.hops",
         ],
         repo_dir / "grit" / "network" / "grit_model.py": [
             'attn_sparsity == "k_hop"',

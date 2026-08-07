@@ -5,13 +5,33 @@ routing to the exact packaged training patch, and the recovery-
 checkpoint discovery fallback that the k-hop runner's Colab-safe layout needs.
 """
 
+import importlib.util
 from pathlib import Path
 
 import pytest
 
 from graph_specialisation_metrics.carriage import env
 from graph_specialisation_metrics.carriage.tasks import get_task
+from graph_specialisation_metrics.methodology.interventions import (
+    StructuralAuditError,
+    structural_donor_swap,
+)
+from graph_specialisation_metrics.methodology.tasks import (
+    TASKS as CANONICAL_TASKS,
+)
+from graph_specialisation_metrics.methodology.tasks import (
+    ZINC_FROZEN_KHOP_ADAPTER_VERSION,
+)
 from graph_specialisation_metrics.specialisation.model import GritHeadModel, _graph_major_order
+
+RUNNER_PATH = (
+    Path(__file__).parents[1]
+    / "src/graph_specialisation_metrics/grit_patches/khop_zinc.py"
+)
+RUNNER_SPEC = importlib.util.spec_from_file_location("grit_khop_zinc", RUNNER_PATH)
+assert RUNNER_SPEC is not None and RUNNER_SPEC.loader is not None
+khop_zinc = importlib.util.module_from_spec(RUNNER_SPEC)
+RUNNER_SPEC.loader.exec_module(khop_zinc)
 
 
 @pytest.mark.parametrize(
@@ -38,6 +58,9 @@ def test_khop_tasks_registered(name, params, drive, clone):
     # ZINC scalar regression uses the default whole-x-row content adapter.
     from graph_specialisation_metrics.carriage.content import FullNodeContentAdapter
     assert isinstance(t.content_adapter, FullNodeContentAdapter)
+    canonical = CANONICAL_TASKS[name]
+    assert "rrwp_attention_edge_index" in canonical.fixed_support_fields
+    assert canonical.adapter_version == ZINC_FROZEN_KHOP_ADAPTER_VERSION
 
 
 @pytest.mark.parametrize(
@@ -65,6 +88,125 @@ def test_khop_hook_routes_to_exact_training_patch(name, hops, vnode, monkeypatch
     )
     get_task(name).env_hooks[0](tmp_path)
     assert calls == [(tmp_path, tmp_path, "khop", hops, vnode, None, None)]
+
+
+def test_old_khop_encoder_is_upgraded_to_frozen_support(tmp_path):
+    encoder = tmp_path / "rrwp_encoder.py"
+    encoder.write_text(
+        """\
+        if self.max_hops is None:
+            mask_index = batch.get(self.mask_index_name, None)
+        else:
+            needed_channels = self.max_hops + 1  # identity + walks of length 1..k
+            if self.max_hops < 1 or needed_channels > raw_rrwp_val.size(1):
+                raise ValueError(
+                    f"max_hops={self.max_hops} requires {needed_channels} RRWP channels; "
+                    f"found {raw_rrwp_val.size(1)}."
+                )
+            reachable = raw_rrwp_val[:, :needed_channels].abs().sum(dim=-1) > 0
+            mask_index = rrwp_idx[:, reachable]
+""",
+        encoding="utf-8",
+    )
+
+    assert khop_zinc._upgrade_onehop_mask_to_explicit_support(encoder)
+    assert khop_zinc._upgrade_khop_mask_to_frozen_support(encoder)
+    upgraded = encoder.read_text(encoding="utf-8")
+    assert "self.max_hops is None or self.max_hops == 1" in upgraded
+    assert 'batch.get("rrwp_attention_edge_index", None)' in upgraded
+    assert "Backward-compatible clean-forward fallback" in upgraded
+
+
+def test_khop_patch_verifier_requires_onehop_frozen_support_marker(tmp_path):
+    verifier_source = RUNNER_PATH.read_text(encoding="utf-8")
+    assert '"self.max_hops is None or self.max_hops == 1"' in verifier_source
+
+
+@pytest.mark.parametrize("hops", [1, 2])
+def test_frozen_support_is_clean_forward_equivalent_to_training_mask(hops):
+    torch = pytest.importorskip("torch")
+    adjacency = torch.tensor(
+        [
+            [0.0, 1.0, 0.0, 0.0],
+            [0.5, 0.0, 0.5, 0.0],
+            [0.0, 0.5, 0.0, 0.5],
+            [0.0, 0.0, 1.0, 0.0],
+        ]
+    )
+    powers = [torch.eye(4), adjacency]
+    for _ in range(2):
+        powers.append(powers[-1] @ adjacency)
+    pe = torch.stack(powers, dim=-1)
+
+    # Training built rrwp_index/rrwp_val from all non-zero RRWP rows, then selected rows
+    # reachable within k. The refined transform selects those same clean coordinates before
+    # an intervention can alter their payload.
+    all_row, all_col = pe.abs().sum(dim=-1).gt(0).nonzero(as_tuple=True)
+    rrwp_index = torch.stack([all_col, all_row])
+    rrwp_val = pe[all_row, all_col]
+    legacy = rrwp_index[:, rrwp_val[:, : hops + 1].abs().sum(dim=-1).gt(0)]
+
+    frozen_mask = pe[..., : hops + 1].abs().sum(dim=-1).gt(0)
+    frozen_row, frozen_col = frozen_mask.nonzero(as_tuple=True)
+    frozen = torch.stack([frozen_col, frozen_row])
+
+    assert torch.equal(frozen, legacy)
+
+
+@pytest.mark.parametrize("name", ["zinc_2hop", "zinc_1hop_vnode", "zinc_2hop_vnode"])
+def test_structural_rrwp_swap_preserves_frozen_zinc_attention_support(name):
+    torch = pytest.importorskip("torch")
+    Data = pytest.importorskip("torch_geometric.data").Data
+    task = CANONICAL_TASKS[name]
+    rrwp_index = torch.tensor(
+        [[0, 0, 1, 1, 2, 2], [0, 1, 0, 2, 1, 2]], dtype=torch.long
+    )
+    base = Data(
+        x=torch.tensor([[1], [2], [3]], dtype=torch.long),
+        edge_index=torch.tensor([[0, 1, 1, 2], [1, 0, 2, 1]], dtype=torch.long),
+        edge_attr=torch.ones(4, 1, dtype=torch.long),
+        rrwp_index=rrwp_index,
+        rrwp_val=torch.tensor([[1.0], [0.2], [0.3], [0.4], [0.5], [1.0]]),
+        rrwp=torch.arange(6, dtype=torch.float32).reshape(3, 2),
+        rrwp_attention_edge_index=torch.tensor(
+            [[0, 0, 1, 1, 1, 2, 2], [0, 1, 0, 1, 2, 1, 2]], dtype=torch.long
+        ),
+        y=torch.tensor([0.0]),
+    )
+
+    event = structural_donor_swap(
+        base, 0, 2, task=task, duplicate_tolerance=1.0e-7
+    )
+
+    assert not torch.equal(event.rrwp_val, base.rrwp_val)
+    assert torch.equal(event.edge_index, base.edge_index)
+    assert torch.equal(
+        event.rrwp_attention_edge_index, base.rrwp_attention_edge_index
+    )
+
+
+@pytest.mark.parametrize("name", ["zinc_2hop", "zinc_1hop_vnode", "zinc_2hop_vnode"])
+def test_zinc_khop_structural_swap_fails_without_frozen_attention_support(name):
+    torch = pytest.importorskip("torch")
+    Data = pytest.importorskip("torch_geometric.data").Data
+    base = Data(
+        x=torch.tensor([[1], [2]], dtype=torch.long),
+        edge_index=torch.tensor([[0, 1], [1, 0]], dtype=torch.long),
+        edge_attr=torch.ones(2, 1, dtype=torch.long),
+        rrwp_index=torch.tensor([[0, 1], [0, 1]], dtype=torch.long),
+        rrwp_val=torch.ones(2, 1),
+        rrwp=torch.ones(2, 1),
+        y=torch.tensor([0.0]),
+    )
+
+    with pytest.raises(StructuralAuditError, match="frozen rrwp_attention_edge_index"):
+        structural_donor_swap(
+            base,
+            0,
+            1,
+            task=CANONICAL_TASKS[name],
+            duplicate_tolerance=1.0e-7,
+        )
 
 
 def test_checkpoint_discovery_prefers_best_recovery_checkpoint(tmp_path):

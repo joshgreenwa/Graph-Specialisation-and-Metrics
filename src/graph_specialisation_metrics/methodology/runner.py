@@ -59,18 +59,17 @@ from .distance import (
 )
 from .events import build_channel_events
 from .execution import execute_graph_batches
-from .interventions import semantic_donor_swap, structural_donor_swap
 from .figures import (
+    TASK_FIGURE_MODIFIERS,
     FigureBuilder,
     FigureTheme,
     HeadPlotData,
-    TASK_FIGURE_MODIFIERS,
     attention_distance_profiles,
+    carriage_profiles,
     causal_family_panels,
     causal_regime_summary,
     causal_scatter_grid,
     cumulative_prefix_curves,
-    carriage_profiles,
     distance_heatmaps,
     distance_support_profile,
     joint_selectivity_plane,
@@ -85,6 +84,8 @@ from .graphbench_population_figures import (
     FOCUSED_GRAPHBENCH_TASK,
     render_graphbench_population_figures,
 )
+from .interventions import semantic_donor_swap, structural_donor_swap
+from .progress import ProgressJournal
 from .protocol import (
     CHANNELS,
     PROTOCOL_VERSION,
@@ -93,7 +94,6 @@ from .protocol import (
     deterministic_splits,
     stable_hash,
 )
-from .progress import ProgressJournal
 from .sampling import SemanticDonorPool, manifest_fingerprint, sample_sources
 from .scores import (
     aggregate_event_scores,
@@ -753,6 +753,7 @@ def prepare_task(
         "sigma": sigma.tolist(),
         "task_adapter_version": task.adapter_version,
         "carrier_policy": task.carrier_policy,
+        "model_geometry": backend.geometry,
         "splits": dataclasses.asdict(splits),
         "test_metric": grit.test_metric,
         "validation_metric": grit.val_metric,
@@ -1985,7 +1986,7 @@ def _carriage_graph_batch(
         clean = context["clean"]
         S = len(sources)
         h_clean = captured.final_state[0]
-        carriers, width = int(h_clean.shape[-2]), int(h_clean.shape[-1])
+        carriers = int(h_clean.shape[-2])
         donor_counts = tuple(
             sum(int(record.source) == int(source) for record in records)
             for source in sources
@@ -2234,8 +2235,6 @@ def run_carriage(
     plan: Mapping[int, Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Compute F_sens and donor-wise signed path-integrated B for both channels."""
-
-    import torch
 
     plan = dict(plan or _stage_plan(prepared, config, "carriage"))
     cache = _cache(prepared, config, plan)
@@ -3765,9 +3764,37 @@ def make_figures(
     return saved
 
 
-def run_prepared(prepared: PreparedTask, config: MethodologyConfig) -> dict[str, Any]:
+def _release_component_memory(component: str) -> None:
+    """Release a completed cache-backed component before the next component starts."""
+
+    gc.collect()
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        log(f"[memory] released in-memory {component} payload")
+    except ImportError:
+        pass
+
+
+def run_prepared(
+    prepared: PreparedTask,
+    config: MethodologyConfig,
+    *,
+    retain_results: bool = True,
+) -> dict[str, Any]:
+    """Run configured components, optionally retaining only their durable caches.
+
+    ``retain_results=False`` is intended for isolated accelerator workers.  A completed
+    component is already atomically cached, so its potentially large Python payload can be
+    discarded before the next component without changing the scientific contract or resume
+    behavior.
+    """
+
     set_strict(bool(config.strict_audits))
     key = f"{prepared.task.name}:seed{int(prepared.grit.sc.seed)}"
+    phases = set(config.phases)
     if prepared.progress is not None:
         prepared.progress.update(
             task=prepared.task.name,
@@ -3778,7 +3805,7 @@ def run_prepared(prepared: PreparedTask, config: MethodologyConfig) -> dict[str,
     try:
         with audit_scope(key) as scope:
             scores = None
-            if {"scores", "causal", "figures"} & set(config.phases):
+            if {"scores", "causal", "figures"} & phases:
                 context = (
                     prepared.progress.component("scores")
                     if prepared.progress is not None
@@ -3787,6 +3814,10 @@ def run_prepared(prepared: PreparedTask, config: MethodologyConfig) -> dict[str,
                 with context:
                     score_plan = _stage_plan(prepared, config, "scores")
                     scores = run_scores(prepared, config, plan=score_plan)
+                del score_plan
+                if not retain_results and not ({"causal", "figures"} & phases):
+                    scores = None
+                    _release_component_memory("scores")
             carriage = None
             if "carriage" in config.phases:
                 context = (
@@ -3796,6 +3827,9 @@ def run_prepared(prepared: PreparedTask, config: MethodologyConfig) -> dict[str,
                 )
                 with context:
                     carriage = run_carriage(prepared, config)
+                if not retain_results and "figures" not in phases:
+                    carriage = None
+                    _release_component_memory("carriage")
             if carriage is None and "figures" in config.phases:
                 carriage_plan = _stage_plan(prepared, config, "carriage")
                 carriage = _cache(prepared, config, carriage_plan).load(
@@ -3812,6 +3846,10 @@ def run_prepared(prepared: PreparedTask, config: MethodologyConfig) -> dict[str,
                 )
                 with context:
                     causal = run_causal_validation(prepared, config, scores)
+                if not retain_results and "figures" not in phases:
+                    causal = None
+                    scores = None
+                    _release_component_memory("causal and prerequisite scores")
             elif "figures" in config.phases:
                 from .validation import load_cached_causal_validation
 
@@ -3899,8 +3937,13 @@ def run_worker(
     train_seed: int,
     *,
     force_fresh_grit: bool = False,
+    retain_results: bool = True,
 ) -> dict[str, Any]:
-    """Run one isolated task/seed without writing shared task/root summaries."""
+    """Run one isolated task/seed without writing shared task/root summaries.
+
+    Set ``retain_results=False`` for long-lived notebook runtimes: score and carriage values
+    remain in their atomic caches but are released from CPU/GPU memory between components.
+    """
 
     config.validate()
     if task_name not in config.tasks:
@@ -3928,14 +3971,24 @@ def run_worker(
     )
     atomic_json(output_dir / "protocol.json", protocol_record)
     log(f"\n[canonical-worker] {key}")
-    with audit_scope(key) as scope:
-        prepared = prepare_task(
-            config,
-            task_name,
-            int(train_seed),
-            force_fresh_grit=force_fresh_grit,
-        )
-        result = run_prepared(prepared, config)
+    prepared = None
+    try:
+        with audit_scope(key) as scope:
+            prepared = prepare_task(
+                config,
+                task_name,
+                int(train_seed),
+                force_fresh_grit=force_fresh_grit,
+            )
+            if retain_results:
+                # Preserve the historical call shape for wrappers that monkeypatch run_prepared.
+                result = run_prepared(prepared, config)
+            else:
+                result = run_prepared(prepared, config, retain_results=False)
+    finally:
+        if prepared is not None:
+            del prepared
+        _release_runtime_memory()
     findings = scope.records()
     result["audit_findings"] = findings
     result["headline_eligible"] = not bool(findings)
@@ -3951,8 +4004,6 @@ def run_worker(
             "headline_eligible": not bool(findings),
         },
     )
-    del prepared
-    _release_runtime_memory()
     return result
 
 
@@ -3962,6 +4013,7 @@ def _write_run_summaries(
     run_findings: Mapping[str, Sequence[Mapping[str, Any]]],
     *,
     require_complete: bool = False,
+    index_metadata: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Write the task-population and root summaries from a complete result set."""
 
@@ -4435,30 +4487,41 @@ def _write_run_summaries(
             "runs": run_findings,
         },
     )
-    atomic_json(
-        config.root / "index.json",
-        {
-            "runs": {
-                key: {
-                    "task": value["task"],
-                    "seed": value["seed"],
-                    "output_dir": value["output_dir"],
-                    "figures": value["figures"],
-                    "audit_failures": len(run_findings.get(key, ())),
-                    "headline_eligible": bool(value["headline_eligible"]),
-                }
-                for key, value in results.items()
-            },
-            "population": {
-                key: {
-                    "path": value["path"],
-                    "figures": value.get("figures", {}),
-                }
-                for key, value in population.items()
-            },
-            "audits": str(config.root / "audits.json"),
+    run_index: dict[str, Any] = {}
+    for key, value in results.items():
+        record = {
+            "task": value["task"],
+            "seed": value["seed"],
+            "output_dir": value["output_dir"],
+            "figures": value["figures"],
+            "audit_failures": len(run_findings.get(key, ())),
+            "headline_eligible": bool(value["headline_eligible"]),
+        }
+        # Additive model-free finalizers expose immutable artifact provenance to
+        # downstream consumers without changing the historical index schema.
+        for optional in ("artifacts", "checkpoint_sha256", "graph_counts"):
+            if optional in value:
+                record[optional] = value[optional]
+        run_index[key] = record
+    index_record: dict[str, Any] = {
+        "runs": run_index,
+        "population": {
+            key: {
+                "path": value["path"],
+                "figures": value.get("figures", {}),
+            }
+            for key, value in population.items()
         },
-    )
+        "audits": str(config.root / "audits.json"),
+    }
+    if index_metadata:
+        collisions = sorted(set(index_record) & set(index_metadata))
+        if collisions:
+            raise ValueError(
+                f"index_metadata cannot replace canonical index keys: {collisions}"
+            )
+        index_record.update(dict(index_metadata))
+    atomic_json(config.root / "index.json", index_record)
     failed = sorted(key for key, value in run_findings.items() if value)
     if failed:
         log(
@@ -4594,6 +4657,621 @@ def _load_complete_figure_manifest(output_dir: Path) -> dict[str, list[str]] | N
             ):
                 return None
     return {str(key): [str(value) for value in paths] for key, paths in payload.items()}
+
+
+_MEASUREMENT_PHASES = ("scores", "carriage")
+
+
+def _required_json_record(path: Path, *, purpose: str) -> Mapping[str, Any]:
+    if not path.is_file():
+        raise FileNotFoundError(f"measurement finalization requires {purpose} {path}")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise RuntimeError(f"measurement finalization cannot read {purpose} {path}") from error
+    if not isinstance(payload, Mapping):
+        raise RuntimeError(f"measurement finalization found malformed {purpose} {path}")
+    return payload
+
+
+def _measurement_phase_set(value: Any) -> tuple[str, ...]:
+    if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
+        return ()
+    return tuple(str(item) for item in value)
+
+
+def _validate_worker_sidecars(
+    config: MethodologyConfig,
+    *,
+    task_name: str,
+    train_seed: int,
+    output_dir: Path,
+) -> tuple[Mapping[str, Any], Mapping[str, Any], list[dict[str, Any]]]:
+    """Validate the model/protocol/audit records without constructing a runtime."""
+
+    key = f"{task_name}:seed{int(train_seed)}"
+    worker_protocol = _required_json_record(
+        output_dir / "protocol.json", purpose="worker protocol"
+    )
+    if worker_protocol.get("protocol_version") != PROTOCOL_VERSION:
+        raise RuntimeError(f"{key} worker protocol version is not canonical")
+    if worker_protocol.get("fingerprint") != config.fingerprint:
+        raise RuntimeError(
+            f"{key} worker protocol belongs to another scientific configuration"
+        )
+    if worker_protocol.get("execution_mode") != "isolated-seed-worker":
+        raise RuntimeError(f"{key} was not produced by the isolated worker entry point")
+    if worker_protocol.get("worker_task") != task_name or int(
+        worker_protocol.get("worker_seed", -1)
+    ) != int(train_seed):
+        raise RuntimeError(f"{key} worker protocol has the wrong task or seed")
+    if _measurement_phase_set(worker_protocol.get("phases")) != _MEASUREMENT_PHASES:
+        raise RuntimeError(
+            f"{key} worker protocol did not run phases={_MEASUREMENT_PHASES!r}"
+        )
+
+    model = _required_json_record(output_dir / "model.json", purpose="model audit")
+    if model.get("protocol_version") != PROTOCOL_VERSION:
+        raise RuntimeError(f"{key} model audit version is not canonical")
+    if model.get("task") != task_name or int(model.get("train_seed", -1)) != int(
+        train_seed
+    ):
+        raise RuntimeError(f"{key} model audit has the wrong task or seed")
+    canonical_audits = model.get("canonical_audits")
+    if not isinstance(canonical_audits, Mapping):
+        raise RuntimeError(f"{key} model audit has no canonical_audits record")
+    model_failures = canonical_audits.get("failures", ())
+    if isinstance(model_failures, (str, bytes)) or not isinstance(
+        model_failures, Sequence
+    ):
+        raise RuntimeError(f"{key} model canonical audit failures are malformed")
+    geometry = model.get("model_geometry")
+    required_geometry = {"layers", "heads", "head_width", "hidden_width", "outputs"}
+    if not isinstance(geometry, Mapping) or not required_geometry <= set(geometry):
+        raise RuntimeError(f"{key} model audit has incomplete model_geometry")
+    try:
+        if any(int(geometry[name]) < 1 for name in required_geometry):
+            raise ValueError
+        if int(model.get("parameter_count", 0)) < 1:
+            raise ValueError
+        metrics = (
+            float(model["validation_metric"]),
+            float(model["test_metric"]),
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise RuntimeError(
+            f"{key} model audit lacks valid geometry, parameter count, or metrics"
+        ) from error
+    if not np.isfinite(metrics).all():
+        raise RuntimeError(f"{key} model audit metrics are non-finite")
+
+    audit = _required_json_record(output_dir / "audits.json", purpose="worker audit")
+    if audit.get("protocol_version") != PROTOCOL_VERSION:
+        raise RuntimeError(f"{key} worker audit version is not canonical")
+    if audit.get("task") != task_name or int(audit.get("train_seed", -1)) != int(
+        train_seed
+    ):
+        raise RuntimeError(f"{key} worker audit has the wrong task or seed")
+    if _measurement_phase_set(audit.get("phases")) != _MEASUREMENT_PHASES:
+        raise RuntimeError(f"{key} worker audit does not cover scores and carriage")
+    if bool(audit.get("strict_audits")) != bool(config.strict_audits):
+        raise RuntimeError(f"{key} worker audit strictness differs from the finalizer")
+    findings_value = audit.get("findings")
+    if isinstance(findings_value, (str, bytes)) or not isinstance(
+        findings_value, Sequence
+    ):
+        raise RuntimeError(f"{key} worker audit findings are malformed")
+    findings = []
+    for position, finding in enumerate(findings_value):
+        if not isinstance(finding, Mapping):
+            raise RuntimeError(f"{key} worker audit finding {position} is malformed")
+        findings.append(dict(finding))
+    if bool(audit.get("headline_eligible")) != (not bool(findings)):
+        raise RuntimeError(f"{key} worker audit headline eligibility is inconsistent")
+    if config.strict_audits and findings:
+        raise RuntimeError(f"{key} has findings despite strict_audits=True")
+    return model, audit, findings
+
+
+def _contract_without_stage_provenance(contract: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        str(key): value
+        for key, value in contract.items()
+        if key not in {"event_manifest_hash", "repository_commit"}
+    }
+
+
+def _validate_sha256(value: Any, *, label: str) -> str:
+    digest = str(value)
+    if len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest):
+        raise RuntimeError(f"{label} is not a lowercase SHA-256 digest")
+    return digest
+
+
+def _mapping_graph_ids(
+    value: Any,
+    *,
+    label: str,
+) -> tuple[set[int], Mapping[Any, Any]]:
+    if not isinstance(value, Mapping):
+        raise RuntimeError(f"{label} is not a graph-keyed mapping")
+    try:
+        graph_ids = {int(graph_id) for graph_id in value}
+    except (TypeError, ValueError) as error:
+        raise RuntimeError(f"{label} contains a non-integer graph ID") from error
+    if len(graph_ids) != len(value):
+        raise RuntimeError(f"{label} contains duplicate integer graph IDs")
+    return graph_ids, value
+
+
+def _validate_measurement_values(
+    config: MethodologyConfig,
+    *,
+    key: str,
+    scores: Any,
+    carriage: Any,
+    expected_graph_ids: set[int],
+    score_contract: Mapping[str, Any],
+    carriage_contract: Mapping[str, Any],
+) -> dict[str, int]:
+    """Check consolidated score/carriage payloads and their discovery population."""
+
+    if not isinstance(scores, Mapping) or not isinstance(carriage, Mapping):
+        raise RuntimeError(f"{key} consolidated measurement payload is malformed")
+    for stage, payload, contract in (
+        ("scores", scores, score_contract),
+        ("carriage", carriage, carriage_contract),
+    ):
+        if payload.get("protocol_version") != PROTOCOL_VERSION:
+            raise RuntimeError(f"{key} {stage} payload version is not canonical")
+        if payload.get("manifest_hash") != contract.get("event_manifest_hash"):
+            raise RuntimeError(f"{key} {stage} payload and cache manifest disagree")
+        channels = payload.get("channels")
+        if not isinstance(channels, Mapping) or set(channels) != set(CHANNELS):
+            raise RuntimeError(
+                f"{key} {stage} payload must contain exactly channels={CHANNELS!r}"
+            )
+
+    score_ids: dict[str, set[int]] = {}
+    for channel in CHANNELS:
+        channel_value = scores["channels"][channel]
+        if not isinstance(channel_value, Mapping):
+            raise RuntimeError(f"{key} scores/{channel} payload is malformed")
+        graph_ids, _ = _mapping_graph_ids(
+            channel_value.get("graph_scores"),
+            label=f"{key} scores/{channel}/graph_scores",
+        )
+        if graph_ids != expected_graph_ids:
+            missing = sorted(expected_graph_ids - graph_ids)
+            unexpected = sorted(graph_ids - expected_graph_ids)
+            raise RuntimeError(
+                f"{key} scores/{channel} graph population is incomplete; "
+                f"missing={missing}, unexpected={unexpected}"
+            )
+        score_ids[channel] = graph_ids
+    semantic_raw = np.asarray(scores["channels"]["semantic"].get("raw"))
+    structural_raw = np.asarray(scores["channels"]["structural"].get("raw"))
+    if (
+        semantic_raw.ndim != 2
+        or semantic_raw.shape != structural_raw.shape
+        or semantic_raw.size == 0
+        or not np.isfinite(semantic_raw).all()
+        or not np.isfinite(structural_raw).all()
+    ):
+        raise RuntimeError(f"{key} score head matrices are malformed or non-finite")
+    geometry = score_contract.get("model_geometry")
+    if isinstance(geometry, Mapping) and {"layers", "heads"} <= set(geometry):
+        expected_shape = (int(geometry["layers"]), int(geometry["heads"]))
+        if semantic_raw.shape != expected_shape:
+            raise RuntimeError(
+                f"{key} score shape {semantic_raw.shape} differs from model geometry "
+                f"{expected_shape}"
+            )
+    coordinates = scores.get("coordinates")
+    for coordinate_name in ("selectivity", "active"):
+        coordinate = (
+            coordinates.get(coordinate_name)
+            if isinstance(coordinates, Mapping)
+            else getattr(coordinates, coordinate_name, None)
+        )
+        if np.asarray(coordinate).shape != semantic_raw.shape:
+            raise RuntimeError(f"{key} score coordinates are incomplete")
+
+    carriage_ids: dict[str, set[int]] = {}
+    for channel in CHANNELS:
+        channel_value = carriage["channels"][channel]
+        if not isinstance(channel_value, Mapping):
+            raise RuntimeError(f"{key} carriage/{channel} payload is malformed")
+        graph_ids, graph_fields = _mapping_graph_ids(
+            channel_value.get("graph_fields"),
+            label=f"{key} carriage/{channel}/graph_fields",
+        )
+        if graph_ids != expected_graph_ids:
+            missing = sorted(expected_graph_ids - graph_ids)
+            unexpected = sorted(graph_ids - expected_graph_ids)
+            raise RuntimeError(
+                f"{key} carriage/{channel} graph population is incomplete; "
+                f"missing={missing}, unexpected={unexpected}"
+            )
+        for graph_id, field in graph_fields.items():
+            if not isinstance(field, Mapping) or not {
+                "sources",
+                "donor_counts",
+                "F_sens",
+            } <= set(field):
+                raise RuntimeError(
+                    f"{key} carriage/{channel} graph {graph_id} field is incomplete"
+                )
+            if config.compute_beneficial_carriage and not {"B", "event_B"} <= set(field):
+                raise RuntimeError(
+                    f"{key} carriage/{channel} graph {graph_id} lacks beneficial carriage"
+                )
+        carriage_ids[channel] = graph_ids
+    return {
+        "expected": len(expected_graph_ids),
+        "scores_semantic": len(score_ids["semantic"]),
+        "scores_structural": len(score_ids["structural"]),
+        "carriage_semantic": len(carriage_ids["semantic"]),
+        "carriage_structural": len(carriage_ids["structural"]),
+    }
+
+
+def _validate_measurement_contracts(
+    config: MethodologyConfig,
+    *,
+    key: str,
+    task_name: str,
+    train_seed: int,
+    model: Mapping[str, Any],
+    score_contract: Mapping[str, Any],
+    carriage_contract: Mapping[str, Any],
+) -> tuple[str, set[int]]:
+    if _contract_without_stage_provenance(score_contract) != (
+        _contract_without_stage_provenance(carriage_contract)
+    ):
+        raise RuntimeError(f"{key} score and carriage scientific contracts disagree")
+    for stage, contract in (
+        ("scores", score_contract),
+        ("carriage", carriage_contract),
+    ):
+        if contract.get("task") != task_name or int(contract.get("train_seed", -1)) != int(
+            train_seed
+        ):
+            raise RuntimeError(f"{key} {stage} cache has the wrong task or seed contract")
+        if contract.get("protocol_fingerprint") != config.fingerprint:
+            raise RuntimeError(f"{key} {stage} cache belongs to another configuration")
+        if int(contract.get("donors_per_source", -1)) != int(
+            config.sizes.donors_per_source
+        ):
+            raise RuntimeError(f"{key} {stage} donor count is not canonical for this run")
+        if int(contract.get("source_cap", -1)) != int(config.sizes.sources_per_graph):
+            raise RuntimeError(f"{key} {stage} source cap is not canonical for this run")
+        if int(contract.get("bootstrap_seed", -1)) != int(config.bootstrap.rng_seed):
+            raise RuntimeError(f"{key} {stage} bootstrap seed is not canonical for this run")
+        if int(contract.get("bootstrap_replicates", -1)) != int(
+            config.bootstrap.replicates
+        ):
+            raise RuntimeError(
+                f"{key} {stage} bootstrap replicate count is not canonical for this run"
+            )
+
+    checkpoint_digest = _validate_sha256(
+        score_contract.get("checkpoint_sha256"),
+        label=f"{key} cache checkpoint_sha256",
+    )
+    if str(carriage_contract.get("checkpoint_sha256")) != checkpoint_digest:
+        raise RuntimeError(f"{key} score and carriage checkpoint SHA-256 differ")
+    if str(model.get("checkpoint_sha256")) != checkpoint_digest:
+        raise RuntimeError(f"{key} model and cache checkpoint SHA-256 differ")
+
+    for model_field, contract_field in (
+        ("task_adapter_version", "task_adapter_version"),
+        ("output_representation", "output_representation"),
+    ):
+        if model.get(model_field) != score_contract.get(contract_field):
+            raise RuntimeError(f"{key} model and cache {model_field} disagree")
+    try:
+        model_sigma = tuple(float(value) for value in model.get("sigma", ()))
+        contract_sigma = tuple(float(value) for value in score_contract.get("sigma", ()))
+    except (TypeError, ValueError) as error:
+        raise RuntimeError(f"{key} model/cache sigma is malformed") from error
+    if model_sigma != contract_sigma or not model_sigma:
+        raise RuntimeError(f"{key} model and cache sigma disagree")
+    model_geometry = model.get("model_geometry")
+    if model_geometry != score_contract.get("model_geometry"):
+        raise RuntimeError(f"{key} model and cache geometry disagree")
+
+    splits = model.get("splits")
+    if not isinstance(splits, Mapping):
+        raise RuntimeError(f"{key} model audit has no split manifest")
+    if stable_hash(dict(splits)) != score_contract.get("split_fingerprint"):
+        raise RuntimeError(f"{key} model and cache split fingerprints disagree")
+    discovery = splits.get("discovery")
+    if isinstance(discovery, (str, bytes)) or not isinstance(discovery, Sequence):
+        raise RuntimeError(f"{key} discovery split is malformed")
+    try:
+        expected_graph_ids = {int(graph_id) for graph_id in discovery}
+    except (TypeError, ValueError) as error:
+        raise RuntimeError(f"{key} discovery split contains a non-integer ID") from error
+    if len(expected_graph_ids) != len(discovery):
+        raise RuntimeError(f"{key} discovery split contains duplicate graph IDs")
+    if len(expected_graph_ids) != int(config.sizes.discovery_graphs):
+        raise RuntimeError(
+            f"{key} expected {int(config.sizes.discovery_graphs)} discovery graphs, "
+            f"model audit records {len(expected_graph_ids)}"
+        )
+    return checkpoint_digest, expected_graph_ids
+
+
+def _checkpoint_file_verification(
+    config: MethodologyConfig,
+    *,
+    task_name: str,
+    train_seed: int,
+    model: Mapping[str, Any],
+    expected_sha256: str,
+) -> dict[str, Any]:
+    """Hash mounted checkpoint bytes when present; metadata remains self-contained otherwise."""
+
+    candidate_values = [
+        _checkpoint_override(config, task_name, int(train_seed)),
+        model.get("checkpoint"),
+    ]
+    verified: list[str] = []
+    seen: set[str] = set()
+    for value in candidate_values:
+        if value in (None, ""):
+            continue
+        path = Path(str(value)).expanduser()
+        label = str(path)
+        if label in seen or not path.is_file():
+            continue
+        seen.add(label)
+        observed = checkpoint_sha256(path)
+        if observed != expected_sha256:
+            raise RuntimeError(
+                f"mounted checkpoint {path} has SHA-256 {observed}, expected {expected_sha256}"
+            )
+        verified.append(label)
+    return {
+        "status": "file_sha256_verified" if verified else "metadata_crosschecked",
+        "verified_paths": verified,
+    }
+
+
+def _population_score_view(scores: Mapping[str, Any]) -> dict[str, Any]:
+    """Retain only score fields consumed by the cross-seed summary writer."""
+
+    summary = {
+        "channels": {
+            channel: {"raw": scores["channels"][channel]["raw"]}
+            for channel in CHANNELS
+        },
+        "coordinates": scores["coordinates"],
+    }
+    for optional in ("specialisation_diagnostics", "specialist_classification"):
+        if optional in scores:
+            summary[optional] = scores[optional]
+    return summary
+
+
+def finalize_measurement_run(config: MethodologyConfig) -> dict[str, Any]:
+    """Postflight a complete isolated score/carriage run without loading models or data.
+
+    The same complete :class:`MethodologyConfig` used by every ``run_worker`` call is the
+    finalization contract.  Only immutable cache files and JSON sidecars are read.  Shared task
+    populations and root summaries are emitted after every configured task/seed has passed.
+    """
+
+    config.validate()
+    if tuple(config.phases) != _MEASUREMENT_PHASES:
+        raise ValueError(
+            f"measurement finalization requires phases={_MEASUREMENT_PHASES!r}"
+        )
+    if len(set(config.tasks)) != len(config.tasks):
+        raise ValueError("measurement finalization requires unique task names")
+    for task_name in config.tasks:
+        seeds = config.seeds_for(task_name)
+        if len(set(seeds)) != len(seeds):
+            raise ValueError(
+                f"measurement finalization requires unique seeds for {task_name!r}"
+            )
+
+    selected_dirs = [
+        config.root / task_name / f"seed_{int(train_seed)}"
+        for task_name in config.tasks
+        for train_seed in config.seeds_for(task_name)
+    ]
+    partials = {
+        path
+        for scope in (config.root, *selected_dirs)
+        if scope.exists()
+        for path in (
+            scope.glob("*.partial") if scope == config.root else scope.rglob("*.partial")
+        )
+        if path.is_file()
+    }
+    if partials:
+        preview = ", ".join(str(path) for path in sorted(partials)[:8])
+        extra = f", +{len(partials) - 8} more" if len(partials) > 8 else ""
+        raise RuntimeError(
+            f"measurement finalization found incomplete .partial files: {preview}{extra}"
+        )
+
+    results: dict[str, Any] = {}
+    run_findings: dict[str, list[dict[str, Any]]] = {}
+    artifact_commits: set[str] = set()
+    artifact_fingerprints: dict[str, dict[str, str]] = {}
+    artifact_file_sha256: dict[str, dict[str, str]] = {}
+    checkpoint_sha256_by_run: dict[str, str] = {}
+    postflight_runs: dict[str, Any] = {}
+    for task_name in config.tasks:
+        for train_seed in config.seeds_for(task_name):
+            key = f"{task_name}:seed{int(train_seed)}"
+            output_dir = config.root / task_name / f"seed_{int(train_seed)}"
+            model, _audit, findings = _validate_worker_sidecars(
+                config,
+                task_name=task_name,
+                train_seed=int(train_seed),
+                output_dir=output_dir,
+            )
+            cache_paths = {
+                "scores": output_dir / "cache" / "scores" / "raw.pt",
+                "carriage": output_dir / "cache" / "carriage" / "fields.pt",
+            }
+            artifacts = {
+                name: load_cache_artifact_file(path)
+                for name, path in cache_paths.items()
+            }
+            contracts = {
+                name: artifact.metadata["contract"]
+                for name, artifact in artifacts.items()
+            }
+            checkpoint_digest, expected_graph_ids = _validate_measurement_contracts(
+                config,
+                key=key,
+                task_name=task_name,
+                train_seed=int(train_seed),
+                model=model,
+                score_contract=contracts["scores"],
+                carriage_contract=contracts["carriage"],
+            )
+            graph_counts = _validate_measurement_values(
+                config,
+                key=key,
+                scores=artifacts["scores"].value,
+                carriage=artifacts["carriage"].value,
+                expected_graph_ids=expected_graph_ids,
+                score_contract=contracts["scores"],
+                carriage_contract=contracts["carriage"],
+            )
+            checkpoint_verification = _checkpoint_file_verification(
+                config,
+                task_name=task_name,
+                train_seed=int(train_seed),
+                model=model,
+                expected_sha256=checkpoint_digest,
+            )
+            artifact_fingerprints[key] = {}
+            artifact_file_sha256[key] = {}
+            artifact_index: dict[str, Any] = {}
+            for name, artifact in artifacts.items():
+                contract = contracts[name]
+                artifact_commits.add(str(contract.get("repository_commit", "unknown")))
+                contract_fingerprint = str(
+                    artifact.metadata["contract_fingerprint"]
+                )
+                artifact_fingerprints[key][name] = contract_fingerprint
+                artifact_file_sha256[key][name] = artifact.file_sha256
+                artifact_index[name] = {
+                    "path": str(artifact.path),
+                    "file_sha256": artifact.file_sha256,
+                    "contract_fingerprint": contract_fingerprint,
+                    "event_manifest_hash": str(contract["event_manifest_hash"]),
+                }
+            checkpoint_sha256_by_run[key] = checkpoint_digest
+            score_summary = _population_score_view(artifacts["scores"].value)
+            results[key] = {
+                "task": task_name,
+                "seed": int(train_seed),
+                "output_dir": str(output_dir),
+                "scores": score_summary,
+                # Carriage is validated above but intentionally not accumulated across
+                # thirty workers. Downstream consumers reopen the indexed immutable cache.
+                "carriage": None,
+                "causal": None,
+                "figures": {},
+                "audit_findings": findings,
+                "headline_eligible": not bool(findings),
+                "checkpoint_sha256": checkpoint_digest,
+                "graph_counts": graph_counts,
+                "artifacts": artifact_index,
+            }
+            run_findings[key] = findings
+            postflight_runs[key] = {
+                "task": task_name,
+                "seed": int(train_seed),
+                "checkpoint_sha256": checkpoint_digest,
+                "checkpoint_verification": checkpoint_verification,
+                "graph_counts": graph_counts,
+                "channels": list(CHANNELS),
+                "artifacts": artifact_index,
+                "audit_findings": len(findings),
+                "headline_eligible": not bool(findings),
+            }
+            log(f"[measurement-finalize] validated {key}")
+            # The consolidated carriage fields can be much larger than the small population
+            # score view. Ensure loop locals do not retain the just-validated payload.
+            del artifact, artifacts, contracts
+            gc.collect()
+
+    source_commits = sorted(artifact_commits)
+    postflight_path = config.root / "measurement_postflight.json"
+    protocol_record = config.record()
+    protocol_record.update(
+        {
+            "repository_commit": _repository_commit(),
+            "execution_mode": "model-free-measurement-finalizer",
+            "source_repository_commit": (
+                source_commits[0] if len(source_commits) == 1 else None
+            ),
+            "source_repository_commits": source_commits,
+            "source_cache_contract_fingerprints": artifact_fingerprints,
+            "source_cache_file_sha256": artifact_file_sha256,
+            "source_checkpoint_sha256": checkpoint_sha256_by_run,
+        }
+    )
+    atomic_json(config.root / "protocol.json", protocol_record)
+    population = _write_run_summaries(
+        config,
+        results,
+        run_findings,
+        require_complete=True,
+        index_metadata={
+            "execution_mode": "model-free-measurement-finalizer",
+            "protocol": str(config.root / "protocol.json"),
+            "postflight": str(postflight_path),
+        },
+    )
+    atomic_json(
+        postflight_path,
+        {
+            "protocol_version": PROTOCOL_VERSION,
+            "protocol_fingerprint": config.fingerprint,
+            "execution_mode": "model-free-measurement-finalizer",
+            "status": "complete",
+            "phases": list(_MEASUREMENT_PHASES),
+            "required_artifacts": ["scores/raw.pt", "carriage/fields.pt"],
+            "expected_run_count": sum(
+                len(config.seeds_for(task_name)) for task_name in config.tasks
+            ),
+            "validated_run_count": len(results),
+            "tasks": {
+                task_name: [int(seed) for seed in config.seeds_for(task_name)]
+                for task_name in config.tasks
+            },
+            "checks": [
+                "cache_internal_contract_fingerprint",
+                "scientific_protocol_fingerprint",
+                "score_carriage_contract_alignment",
+                "checkpoint_sha256",
+                "semantic_structural_channels",
+                "discovery_graph_population",
+                "worker_protocol_and_audits",
+                "no_partial_files",
+            ],
+            "runs": postflight_runs,
+            "summaries": {
+                "index": str(config.root / "index.json"),
+                "audits": str(config.root / "audits.json"),
+                "population": {
+                    task_name: str(config.root / task_name / "population.json")
+                    for task_name in population
+                },
+            },
+        },
+    )
+    return results
 
 
 def finalize_cached_run(config: MethodologyConfig) -> dict[str, Any]:

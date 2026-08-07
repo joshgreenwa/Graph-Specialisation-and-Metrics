@@ -110,6 +110,24 @@ def audit_structural_fields(data: Any, task: Any) -> None:
                 f"dense pair field {name!r} must begin [num_nodes,num_nodes], "
                 f"got {tuple(value.shape)}"
             )
+    if "rrwp_attention_edge_index" in fixed:
+        support = getattr(data, "rrwp_attention_edge_index", None)
+        if support is None:
+            raise StructuralAuditError(
+                "task requires frozen rrwp_attention_edge_index architectural support, "
+                "but the prepared graph does not contain it"
+            )
+        if support.ndim != 2 or int(support.shape[0]) != 2:
+            raise StructuralAuditError(
+                "rrwp_attention_edge_index must be [2,E], "
+                f"got {tuple(support.shape)}"
+            )
+        if support.numel() and bool(
+            ((support < 0) | (support >= int(data.num_nodes))).any()
+        ):
+            raise StructuralAuditError(
+                "rrwp_attention_edge_index contains a node outside the graph"
+            )
     if "edge_index" not in fixed:
         raise StructuralAuditError("edge_index must be registered as fixed architectural support")
 
