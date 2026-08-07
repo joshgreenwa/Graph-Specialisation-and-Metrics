@@ -10,6 +10,8 @@ The normative scientific specification is
 [`../../src/graph_specialisation_metrics/README.md`](../../src/graph_specialisation_metrics/README.md).
 The implementation boundary and output layout are documented in
 [`../../src/graph_specialisation_metrics/methodology/README.md`](../../src/graph_specialisation_metrics/methodology/README.md).
+The exact Drive locations for every multi-seed checkpoint and consolidated cache are listed in
+[`DRIVE_ARTIFACT_MAP.md`](DRIVE_ARTIFACT_MAP.md).
 
 Edit only the task list, training seeds, requested phases, checkpoint overrides, run sizes, and the
 explicitly preregistered `FAMILIES` thresholds in the launcher. Methodological definitions belong
