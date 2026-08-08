@@ -20,6 +20,7 @@ from urllib.parse import quote
 
 import pandas as pd
 from IPython.display import Image, display
+from PIL import Image as PILImage
 
 
 # ------------------------------- repository ---------------------------------
@@ -47,6 +48,7 @@ SPECIAL_HEAD_PCA_GRAPHS = 500
 SPECIAL_HEAD_EXAMPLES_PER_PAGE = 5  # two readable pages = ten molecules/head
 SPECIAL_HEAD_RENDER_GRAPH_INDICES = None  # later choose a subset of the cached ten
 SPECIAL_HEAD_GENERALIST_MAX_ABS_DREL = 0.10
+DISPLAY_ALL_SPECIAL_HEAD_FIGURES = False  # full bundles remain saved in Drive
 
 DRIVE_ROOT = Path("/content/drive/MyDrive")
 MULTI_SEED_ROOT = DRIVE_ROOT / "graph_specialisation_metrics/multi_seed_models"
@@ -350,15 +352,75 @@ for path in pngs:
     display(Image(filename=str(path)))
 
 if special_head_manifest is not None:
-    print("\nControlled special-head figures", flush=True)
-    for record in special_head_manifest["outputs"]:
-        path = Path(record["png"])
+    completion = pd.DataFrame(special_head_manifest["completion"])
+    print("\nControlled special-head completion (all rows must be True)", flush=True)
+    display(
+        completion[
+            [
+                "model_label",
+                "role",
+                "seed",
+                "layer",
+                "head",
+                "attention_pages",
+                "pca_figures",
+                "distance_figures",
+                "complete",
+            ]
+        ]
+    )
+
+    if DISPLAY_ALL_SPECIAL_HEAD_FIGURES:
+        print("\nAll controlled special-head figures", flush=True)
+        for record in special_head_manifest["outputs"]:
+            path = Path(record["png"])
+            print(
+                f"{record['task']} · seed {record['seed']} · {record['role']} · "
+                f"{record['figure']}: {path.name}",
+                flush=True,
+            )
+            display(Image(filename=str(path)))
+    else:
+        # Five compact contact sheets prove that all architectures were rendered
+        # without asking Colab to inline roughly sixty publication-resolution files.
+        preview_dir = OUTPUT_DIR / "special_head_analysis/previews"
+        preview_dir.mkdir(parents=True, exist_ok=True)
+        role_order = ("semantic", "structural", "highest_joint")
+        print("\nSpecial-head attention previews (one sheet per model)", flush=True)
+        for task in special_head_manifest["models"]:
+            panels = []
+            for role in role_order:
+                candidates = [
+                    record
+                    for record in special_head_manifest["outputs"]
+                    if record["task"] == task
+                    and record["role"] == role
+                    and record["figure"] == "attention"
+                ]
+                if not candidates:
+                    raise RuntimeError(f"missing attention preview for {task}/{role}")
+                with PILImage.open(candidates[0]["png"]) as source:
+                    panel = source.convert("RGB")
+                    panel.thumbnail((1200, 900), PILImage.Resampling.LANCZOS)
+                    panels.append(panel.copy())
+            width = max(panel.width for panel in panels)
+            gap = 20
+            height = sum(panel.height for panel in panels) + gap * (len(panels) - 1)
+            sheet = PILImage.new("RGB", (width, height), "white")
+            cursor = 0
+            for panel in panels:
+                sheet.paste(panel, ((width - panel.width) // 2, cursor))
+                cursor += panel.height + gap
+            preview_path = preview_dir / f"{task}_selected_heads.jpg"
+            sheet.save(preview_path, quality=88, optimize=True)
+            sheet.close()
+            print(f"{task}: {preview_path.name}", flush=True)
+            display(Image(filename=str(preview_path), width=900))
         print(
-            f"{record['task']} · seed {record['seed']} · {record['role']} · "
-            f"{record['figure']}: {path.name}",
+            "Full attention, PCA, and distance-profile bundles: "
+            f"{OUTPUT_DIR / 'special_head_analysis/figures'}",
             flush=True,
         )
-        display(Image(filename=str(path)))
 
 print(f"\n[done] {DATASET.upper()} outputs: {OUTPUT_DIR}", flush=True)
 # ============================== paste to here ==============================

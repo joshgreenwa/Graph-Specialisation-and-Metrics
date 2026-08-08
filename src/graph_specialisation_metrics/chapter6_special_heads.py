@@ -348,6 +348,95 @@ def _record_metadata(row: Mapping[str, Any], **extra: Any) -> dict[str, Any]:
     }
 
 
+def validate_special_head_outputs(
+    selected: Sequence[Mapping[str, Any]],
+    outputs: Sequence[Mapping[str, Any]],
+    *,
+    tasks: Sequence[str],
+    render_graph_count: int,
+    examples_per_page: int,
+) -> list[dict[str, Any]]:
+    """Require a complete, readable figure set for every model and role."""
+
+    expected_pages = (
+        int(render_graph_count) + int(examples_per_page) - 1
+    ) // int(examples_per_page)
+    selected_lookup: dict[tuple[str, str], Mapping[str, Any]] = {}
+    for row in selected:
+        key = (str(row["task"]), str(row["role"]))
+        if key in selected_lookup:
+            raise RuntimeError(f"duplicate selected special head: {key}")
+        selected_lookup[key] = row
+
+    expected = {(str(task), role) for task in tasks for role in ROLE_ORDER}
+    if set(selected_lookup) != expected:
+        missing = sorted(expected - set(selected_lookup))
+        extra = sorted(set(selected_lookup) - expected)
+        raise RuntimeError(
+            f"special-head selection is incomplete; missing={missing}, extra={extra}"
+        )
+
+    completion: list[dict[str, Any]] = []
+    for task in tasks:
+        for role in ROLE_ORDER:
+            key = (str(task), role)
+            bundles = [
+                row
+                for row in outputs
+                if (str(row["task"]), str(row["role"])) == key
+            ]
+            by_figure = {
+                figure: [row for row in bundles if str(row["figure"]) == figure]
+                for figure in ("attention", "pca", "distance")
+            }
+            observed = {
+                "attention": len(by_figure["attention"]),
+                "pca": len(by_figure["pca"]),
+                "distance": len(by_figure["distance"]),
+            }
+            required = {
+                "attention": expected_pages,
+                "pca": 1,
+                "distance": 1,
+            }
+            if observed != required:
+                raise RuntimeError(
+                    f"incomplete special-head figures for {task}/{role}: "
+                    f"observed={observed}, required={required}"
+                )
+            missing_files = [
+                str(row[path_type])
+                for row in bundles
+                for path_type in ("png", "pdf", "metadata")
+                if not Path(row[path_type]).is_file()
+            ]
+            if missing_files:
+                raise FileNotFoundError(
+                    f"missing figure bundles for {task}/{role}: {missing_files}"
+                )
+            selection = selected_lookup[key]
+            completion.append(
+                {
+                    "task": str(task),
+                    "model_label": str(selection["model_label"]),
+                    "role": role,
+                    "seed": int(selection["seed"]),
+                    "layer": int(selection["layer"]),
+                    "head": int(selection["head"]),
+                    "attention_pages": observed["attention"],
+                    "pca_figures": observed["pca"],
+                    "distance_figures": observed["distance"],
+                    "attention_pngs": ";".join(
+                        str(row["png"]) for row in by_figure["attention"]
+                    ),
+                    "pca_png": str(by_figure["pca"][0]["png"]),
+                    "distance_png": str(by_figure["distance"][0]["png"]),
+                    "complete": True,
+                }
+            )
+    return completion
+
+
 def generate_special_head_analysis(
     canonical_root: str | Path,
     ablation_root: str | Path,
@@ -566,6 +655,13 @@ def generate_special_head_analysis(
             attention_payload, attention_path = attention_cached
             pca_payload, pca_path = pca_cached
             attention_hit = pca_hit = True
+        if verbose:
+            print(
+                f"[special-heads-cache:{task}/seed_{seed}] "
+                f"attention={'hit' if attention_hit else 'computed'}; "
+                f"pca={'hit' if pca_hit else 'computed'}",
+                flush=True,
+            )
         cache_records.append(
             {
                 "task": task,
@@ -699,6 +795,15 @@ def generate_special_head_analysis(
     _release_figure_runtime(active_runtime.get("value"))
     active_runtime.clear()
 
+    completion = validate_special_head_outputs(
+        selected,
+        outputs,
+        tasks=spec.tasks,
+        render_graph_count=len(render_graph_indices),
+        examples_per_page=int(examples_per_page),
+    )
+    _write_csv(analysis_dir / "completion.csv", completion)
+
     manifest = {
         "analysis_version": ANALYSIS_VERSION,
         "dataset": spec.name,
@@ -717,6 +822,7 @@ def generate_special_head_analysis(
         "selected_heads": selected,
         "caches": cache_records,
         "outputs": outputs,
+        "completion": completion,
         "warnings": warnings,
     }
     manifest_path = analysis_dir / "manifest.json"
@@ -731,4 +837,5 @@ __all__ = [
     "generate_special_head_analysis",
     "head_distance_profiles",
     "select_special_heads_across_seeds",
+    "validate_special_head_outputs",
 ]

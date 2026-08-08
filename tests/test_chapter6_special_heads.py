@@ -9,6 +9,7 @@ matplotlib.use("Agg")
 from graph_specialisation_metrics.chapter6_special_heads import (
     head_distance_profiles,
     select_special_heads_across_seeds,
+    validate_special_head_outputs,
 )
 from graph_specialisation_metrics.methodology.grit_figure_data import (
     _apply_figure_analysis_subset_patch,
@@ -187,6 +188,56 @@ def test_checkpoint_can_be_swapped_without_rebuilding_model(tmp_path):
     for value in model.state_dict().values():
         assert torch.allclose(value, torch.full_like(value, 0.25))
     assert model.training is False
+
+
+def test_special_head_completion_requires_every_role_and_bundle(tmp_path):
+    selected = [
+        {
+            "task": "zinc_1hop",
+            "model_label": "1-hop",
+            "role": role,
+            "seed": index,
+            "layer": index,
+            "head": index,
+        }
+        for index, role in enumerate(("semantic", "structural", "highest_joint"))
+    ]
+    outputs = []
+    for row in selected:
+        for figure, count in (("attention", 2), ("pca", 1), ("distance", 1)):
+            for page in range(count):
+                stem = tmp_path / f"{row['role']}-{figure}-{page}"
+                paths = {}
+                for suffix, key in ((".png", "png"), (".pdf", "pdf"), (".json", "metadata")):
+                    path = stem.with_suffix(suffix)
+                    path.write_text("complete", encoding="utf-8")
+                    paths[key] = str(path)
+                outputs.append(
+                    {
+                        "task": row["task"],
+                        "seed": row["seed"],
+                        "role": row["role"],
+                        "figure": figure,
+                        **paths,
+                    }
+                )
+    completion = validate_special_head_outputs(
+        selected,
+        outputs,
+        tasks=("zinc_1hop",),
+        render_graph_count=10,
+        examples_per_page=5,
+    )
+    assert len(completion) == 3
+    assert all(row["complete"] for row in completion)
+    with pytest.raises(RuntimeError, match="incomplete special-head figures"):
+        validate_special_head_outputs(
+            selected,
+            outputs[:-1],
+            tasks=("zinc_1hop",),
+            render_graph_count=10,
+            examples_per_page=5,
+        )
 
 
 def test_publication_pca_has_fixed_chemistry_legend_and_metrics():
