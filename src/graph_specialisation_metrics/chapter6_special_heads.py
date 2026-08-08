@@ -13,6 +13,7 @@ molecules can be chosen, without loading a checkpoint again.
 from __future__ import annotations
 
 import csv
+import gc
 import json
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -34,6 +35,7 @@ from .methodology.grit_figure_data import (
     load_canonical_model_record,
     load_canonical_score_artifact,
     methodology_config_from_record,
+    retarget_verified_grit_figure_runtime,
 )
 from .methodology.grit_figure_plots import (
     ORANGE,
@@ -251,6 +253,32 @@ def _load_multiseed_models(
     return models, warnings
 
 
+def _release_figure_runtime(figure_runtime: Any | None) -> None:
+    """Drop the transformed dataset/model for one architecture immediately."""
+
+    if figure_runtime is not None:
+        prepared = figure_runtime.prepared
+        runtime = prepared.runtime
+        if runtime is not None:
+            runtime.attn_layers = ()
+            runtime.model = None
+            runtime.loaders = None
+            runtime.eval_ds = None
+            runtime.donor_ds = None
+        prepared.runtime = None
+        prepared.backend = None
+        prepared.donor_pool = None
+    gc.collect()
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+    except (ImportError, RuntimeError):
+        pass
+
+
 def _plot_distance_profiles(
     profiles: Mapping[str, Any],
     *,
@@ -398,7 +426,15 @@ def generate_special_head_analysis(
 
     outputs: list[dict[str, Any]] = []
     cache_records: list[dict[str, Any]] = []
+    # Selection is ordered by architecture.  Keep exactly one live transformed
+    # dataset/model, swap seed checkpoints into it, and destroy it before the
+    # next architecture.  This is load-bearing for standard-RAM QM9 Colab.
+    active_runtime: dict[str, Any] = {}
     for (task, seed), group in grouped.items():
+        if active_runtime.get("task") not in {None, task}:
+            _release_figure_runtime(active_runtime.get("value"))
+            active_runtime.clear()
+        active_runtime["task"] = task
         model = models_by_key[(task, seed)]
         score_path = Path(model.score_path)
         artifact_task = str(model.artifact_task)
@@ -421,23 +457,37 @@ def generate_special_head_analysis(
             "heads": {role: list(head) for role, head in heads.items()},
             "chemistry_focus_version": CHEMISTRY_FOCUS_VERSION,
         }
-        runtime_holder: dict[str, Any] = {}
-
         def runtime(
-            runtime_state=runtime_holder,
+            runtime_state=active_runtime,
             current_task=task,
             current_seed=seed,
             current_artifact=artifact,
             current_model_record=model_record,
             current_protocol=protocol,
         ):
+            target_checkpoint = str(
+                current_artifact.metadata["contract"]["checkpoint_sha256"]
+            )
             if "value" not in runtime_state:
                 if verbose:
                     print(
                         f"[special-heads:{current_task}/seed_{current_seed}] "
-                        "loading verified runtime",
+                        "building one low-memory architecture runtime",
                         flush=True,
                     )
+                overrides = current_protocol.task_overrides.get(
+                    str(current_artifact.metadata["contract"]["task"]), {}
+                )
+                eval_split = str(overrides.get("eval_split", "test"))
+                donor_split = str(overrides.get("donor_split", "train"))
+                retained_eval_graphs = max(
+                    int(n_pca_graphs), max(graph_indices) + 1
+                )
+                split_limits = {"train": 1, "val": 1, "test": 1}
+                split_limits[eval_split] = retained_eval_graphs
+                split_limits[donor_split] = max(
+                    split_limits.get(donor_split, 1), 1
+                )
                 runtime_state["value"] = build_verified_grit_figure_runtime(
                     current_artifact,
                     current_model_record,
@@ -445,9 +495,27 @@ def generate_special_head_analysis(
                     runtime_output_dir=(
                         cache_dir / current_task / f"seed_{current_seed}" / "runtime"
                     ),
+                    analysis_split_limits=split_limits,
                     require_protocol_match=False,
                     require_adapter_match=False,
                 )
+                runtime_state["checkpoint_sha256"] = target_checkpoint
+            elif runtime_state.get("checkpoint_sha256") != target_checkpoint:
+                if verbose:
+                    print(
+                        f"[special-heads:{current_task}/seed_{current_seed}] "
+                        "reusing architecture loaders and swapping checkpoint",
+                        flush=True,
+                    )
+                runtime_state["value"] = retarget_verified_grit_figure_runtime(
+                    runtime_state["value"],
+                    current_artifact,
+                    current_model_record,
+                    current_protocol,
+                    require_protocol_match=False,
+                    require_adapter_match=False,
+                )
+                runtime_state["checkpoint_sha256"] = target_checkpoint
             return runtime_state["value"]
 
         attention_contract = {
@@ -628,7 +696,8 @@ def generate_special_head_analysis(
                     **{key: str(value) for key, value in paths.items()},
                 }
             )
-        runtime_holder.clear()
+    _release_figure_runtime(active_runtime.get("value"))
+    active_runtime.clear()
 
     manifest = {
         "analysis_version": ANALYSIS_VERSION,

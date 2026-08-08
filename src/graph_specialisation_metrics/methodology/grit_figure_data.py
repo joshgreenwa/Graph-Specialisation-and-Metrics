@@ -660,12 +660,91 @@ class GritFigureRuntime:
         return self.prepared.backend
 
 
+_FIGURE_SUBSET_ENV = "GSM_FIGURE_ANALYSIS_SPLIT_LIMITS"
+
+
+def _apply_figure_analysis_subset_patch(repo_dir: Path) -> None:
+    """Subset molecular splits before GRIT materialises RRWP tensors.
+
+    The diagnostic figures use at most a few hundred evaluation molecules and
+    no donor intervention.  Loading every transformed training molecule is
+    therefore pure memory overhead.  The environment-gated patch preserves the
+    leading position of every retained split, so cached evaluation indices keep
+    exactly their canonical meaning; normal training is unchanged.
+    """
+
+    master_loader = repo_dir / "grit" / "loader" / "master_loader.py"
+    text = master_loader.read_text(encoding="utf-8")
+    marker = "def _gsm_figure_analysis_subset(dataset):"
+    if marker not in text:
+        if "import os.path as osp\n" not in text:
+            raise RuntimeError("could not locate GRIT master-loader imports")
+        text = text.replace(
+            "import os.path as osp\n",
+            "import json\nimport os\nimport os.path as osp\n",
+            1,
+        )
+        anchor = "\n\n@register_loader('custom_master_loader')\n"
+        helper = r'''
+
+def _gsm_figure_analysis_subset(dataset):
+    """Retain leading split positions for low-memory figure diagnostics."""
+    subset_spec = os.environ.get('GSM_FIGURE_ANALYSIS_SPLIT_LIMITS', '').strip()
+    if not subset_spec:
+        return dataset
+    if not hasattr(dataset, 'split_idxs'):
+        raise RuntimeError('figure analysis subsetting requires dataset.split_idxs')
+    limits = json.loads(subset_spec)
+    names = ('train', 'val', 'test')
+    original_splits = [torch.as_tensor(values, dtype=torch.long)
+                       for values in dataset.split_idxs]
+    selected = []
+    local_splits = []
+    cursor = 0
+    for name, original in zip(names, original_splits):
+        count = min(int(limits.get(name, 1)), int(original.numel()))
+        if count < 1:
+            raise ValueError(f'figure analysis subset for {name} must be non-empty')
+        chosen = original[:count]
+        selected.append(chosen)
+        local_splits.append(torch.arange(cursor, cursor + count, dtype=torch.long))
+        cursor += count
+    subset = dataset[torch.cat(selected)]
+    data_list = [graph for graph in subset]
+    subset._indices = None
+    subset.data, subset.slices = subset.collate(data_list)
+    subset._data_list = None
+    subset.split_idxs = local_splits
+    subset._gsm_figure_analysis_split_limits = {
+        name: int(len(values)) for name, values in zip(names, local_splits)
+    }
+    logging.info(
+        'Figure analysis subset before PE: train=%d val=%d test=%d',
+        *(len(values) for values in local_splits),
+    )
+    return subset
+'''
+        if anchor not in text:
+            raise RuntimeError("could not locate GRIT custom loader registration")
+        text = text.replace(anchor, helper + anchor, 1)
+        call = "    log_loaded_dataset(dataset, format, name)\n"
+        if call not in text:
+            raise RuntimeError("could not locate GRIT dataset logging call")
+        text = text.replace(
+            call,
+            "    dataset = _gsm_figure_analysis_subset(dataset)\n" + call,
+            1,
+        )
+        master_loader.write_text(text, encoding="utf-8")
+
+
 def build_verified_grit_figure_runtime(
     artifact: ReadOnlyCacheArtifact,
     model_record: Mapping[str, Any],
     protocol_config: MethodologyConfig,
     *,
     runtime_output_dir: str | Path,
+    analysis_split_limits: Mapping[str, int] | None = None,
     require_protocol_match: bool = True,
     require_adapter_match: bool = True,
 ) -> GritFigureRuntime:
@@ -714,6 +793,8 @@ def build_verified_grit_figure_runtime(
     env.clone_grit(repo_dir, spec.grit_repo, spec.grit_commit, force_fresh=False)
     for hook in spec.env_hooks:
         hook(repo_dir)
+    if analysis_split_limits is not None:
+        _apply_figure_analysis_subset_patch(repo_dir)
     env.prepare_inprocess_grit(repo_dir)
     config_file = str(
         overrides.get("config_file")
@@ -736,25 +817,39 @@ def build_verified_grit_figure_runtime(
         )
 
     seed = int(contract["train_seed"])
-    runtime = GritHeadModel(
-        spec,
-        SpecConfig(
-            ckpt=str(checkpoint),
-            out_dir=str(runtime_output_dir),
-            dataset_dir=dataset_dir,
-            config_file=config_file,
-            accelerator=str(protocol_config.accelerator),
-            seed=seed,
-            num_threads=int(protocol_config.num_threads),
-            eval_split=str(overrides.get("eval_split", "test")),
-            donor_split=str(overrides.get("donor_split", "train")),
-            eval_metric=False,
-            analysis_seed=int(protocol_config.analysis_seed),
-            donors=int(contract["donors_per_source"]),
-            content_adapter=spec.content_adapter,
-            resume=True,
-        ),
-    ).load()
+    previous_subset = os.environ.get(_FIGURE_SUBSET_ENV)
+    try:
+        if analysis_split_limits is None:
+            os.environ.pop(_FIGURE_SUBSET_ENV, None)
+        else:
+            os.environ[_FIGURE_SUBSET_ENV] = json.dumps(
+                {str(key): int(value) for key, value in analysis_split_limits.items()},
+                sort_keys=True,
+            )
+        runtime = GritHeadModel(
+            spec,
+            SpecConfig(
+                ckpt=str(checkpoint),
+                out_dir=str(runtime_output_dir),
+                dataset_dir=dataset_dir,
+                config_file=config_file,
+                accelerator=str(protocol_config.accelerator),
+                seed=seed,
+                num_threads=int(protocol_config.num_threads),
+                eval_split=str(overrides.get("eval_split", "test")),
+                donor_split=str(overrides.get("donor_split", "train")),
+                eval_metric=False,
+                analysis_seed=int(protocol_config.analysis_seed),
+                donors=int(contract["donors_per_source"]),
+                content_adapter=spec.content_adapter,
+                resume=True,
+            ),
+        ).load()
+    finally:
+        if previous_subset is None:
+            os.environ.pop(_FIGURE_SUBSET_ENV, None)
+        else:
+            os.environ[_FIGURE_SUBSET_ENV] = previous_subset
     sigma = np.asarray(contract["sigma"], dtype=np.float64)
     backend = CanonicalGritBackend(runtime, task, sigma=sigma)
     expected_geometry = {
@@ -775,18 +870,109 @@ def build_verified_grit_figure_runtime(
             f"canonical {expected_parameters}"
         )
     splits = _split_manifest_from_record(model_record)
-    donor_pool = SemanticDonorPool(
-        [
+    if analysis_split_limits is None:
+        donor_graphs = [
             (graph_id, runtime.donor_ds[graph_id])
             for graph_id in splits.semantic_donor_pool
-        ],
-        adapter=task.content_adapter,
-    )
+        ]
+    else:
+        # Supplemental attention/PCA never draw donors.  Keep PreparedTask's
+        # contract valid without indexing canonical donor positions that were
+        # deliberately omitted from the low-memory dataset.
+        donor_graphs = [(0, runtime.donor_ds[0])]
+    donor_pool = SemanticDonorPool(donor_graphs, adapter=task.content_adapter)
     prepared = PreparedTask(
         task=task,
         runtime=runtime,
         backend=backend,
         output_dir=runtime_output_dir,
+        checkpoint=checkpoint,
+        checkpoint_sha=digest,
+        sigma=sigma,
+        splits=splits,
+        donor_pool=donor_pool,
+        progress=None,
+    )
+    return GritFigureRuntime(
+        prepared=prepared,
+        checkpoint_descriptor=str(checkpoint),
+        checkpoint_sha256=digest,
+        protocol_config=protocol_config,
+    )
+
+
+def retarget_verified_grit_figure_runtime(
+    figure_runtime: GritFigureRuntime,
+    artifact: ReadOnlyCacheArtifact,
+    model_record: Mapping[str, Any],
+    protocol_config: MethodologyConfig,
+    *,
+    require_protocol_match: bool = True,
+    require_adapter_match: bool = True,
+) -> GritFigureRuntime:
+    """Swap a same-architecture seed checkpoint without rebuilding loaders."""
+
+    from ..specialisation.model import load_grit_checkpoint_strict
+
+    contract = artifact.metadata["contract"]
+    task_name = str(contract["task"])
+    if task_name != figure_runtime.prepared.task.name:
+        raise ValueError(
+            "cannot reuse a GRIT figure runtime across architectures: "
+            f"{figure_runtime.prepared.task.name!r} -> {task_name!r}"
+        )
+    if (
+        require_protocol_match
+        and contract.get("protocol_fingerprint") != protocol_config.fingerprint
+    ):
+        raise ValueError("protocol does not match the retargeted score cache")
+    overrides = dict(protocol_config.task_overrides.get(task_name, {}))
+    task = _task_with_protocol_overrides(task_name, overrides)
+    if (
+        require_adapter_match
+        and contract.get("task_adapter_version") != task.adapter_version
+    ):
+        raise ValueError("retargeted cache adapter differs from the GRIT task")
+
+    checkpoint = Path(str(model_record["checkpoint"])).expanduser()
+    if not checkpoint.is_file():
+        raise FileNotFoundError(
+            f"checkpoint recorded by canonical model.json is unavailable: {checkpoint}"
+        )
+    digest = checkpoint_sha256(checkpoint)
+    if digest != str(contract["checkpoint_sha256"]):
+        raise ValueError("retargeted checkpoint does not match the score cache")
+
+    runtime = figure_runtime.runtime
+    how = load_grit_checkpoint_strict(runtime.model, checkpoint)
+    print(
+        f"[ckpt] Reused loaders; loaded {checkpoint} ({how}).",
+        flush=True,
+    )
+    sigma = np.asarray(contract["sigma"], dtype=np.float64)
+    backend = CanonicalGritBackend(runtime, task, sigma=sigma)
+    expected_geometry = {
+        str(key): int(value) for key, value in contract["model_geometry"].items()
+    }
+    if backend.geometry != expected_geometry:
+        raise ValueError(
+            f"retargeted GRIT geometry {backend.geometry} != {expected_geometry}"
+        )
+    expected_parameters = model_record.get("parameter_count")
+    if (
+        expected_parameters is not None
+        and int(runtime.checks.get("num_parameters")) != int(expected_parameters)
+    ):
+        raise ValueError("retargeted checkpoint has a different parameter count")
+    splits = _split_manifest_from_record(model_record)
+    donor_pool = SemanticDonorPool(
+        [(0, runtime.donor_ds[0])], adapter=task.content_adapter
+    )
+    prepared = PreparedTask(
+        task=task,
+        runtime=runtime,
+        backend=backend,
+        output_dir=figure_runtime.prepared.output_dir,
         checkpoint=checkpoint,
         checkpoint_sha=digest,
         sigma=sigma,

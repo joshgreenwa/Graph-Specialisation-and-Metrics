@@ -99,6 +99,57 @@ def _metric_abort_guard(task, test_metric: float, metric_name: str, *, disabled:
     return record
 
 
+def load_grit_checkpoint_strict(model, checkpoint: str | Path) -> str:
+    """Load one trusted GRIT checkpoint, accepting its two historical prefixes.
+
+    Keeping checkpoint loading separate from dataset/model construction lets
+    lightweight diagnostics reuse one transformed dataset and one model per
+    architecture while moving sequentially across independently trained seeds.
+    """
+
+    import torch
+
+    checkpoint = Path(checkpoint)
+    blob = torch.load(str(checkpoint), map_location="cpu")
+    if isinstance(blob, dict) and "model_state" in blob:
+        state = blob["model_state"]
+    elif isinstance(blob, dict) and "state_dict" in blob:
+        state = blob["state_dict"]
+    else:
+        state = blob
+
+    def try_load(candidate):
+        try:
+            model.load_state_dict(candidate, strict=True)
+            return True, "strict"
+        except RuntimeError as error:
+            return False, str(error)
+
+    ok, how = try_load(state)
+    if not ok:
+        stripped = {
+            key[len("model.") :]: value
+            for key, value in state.items()
+            if key.startswith("model.")
+        }
+        prefixed = {f"model.{key}": value for key, value in state.items()}
+        for candidate, label in (
+            (stripped, "stripped 'model.' prefix"),
+            (prefixed, "added 'model.' prefix"),
+        ):
+            if candidate:
+                ok, _ = try_load(candidate)
+                if ok:
+                    how = label
+                    break
+        if not ok:
+            raise RuntimeError(
+                f"Could not load checkpoint state_dict strictly.\n{how}"
+            )
+    model.eval()
+    return str(how)
+
+
 @dataclass
 class SpecConfig:
     """Everything the per-head analysis needs for one checkpoint (subset of CarriageConfig)."""
@@ -223,33 +274,7 @@ class GritHeadModel:
         # checkpoint (strict load, with the same prefix-fixups as grit_runner).
         ckpt_path = Path(sc.ckpt)
         log(f"\n[ckpt] Loading: {ckpt_path}")
-        blob = torch.load(str(ckpt_path), map_location="cpu")
-        if isinstance(blob, dict) and "model_state" in blob:
-            state = blob["model_state"]
-        elif isinstance(blob, dict) and "state_dict" in blob:
-            state = blob["state_dict"]
-        else:
-            state = blob
-
-        def _try_load(sd):
-            try:
-                model.load_state_dict(sd, strict=True)
-                return True, "strict"
-            except RuntimeError as e:
-                return False, str(e)
-
-        ok, how = _try_load(state)
-        if not ok:
-            stripped = {k[len("model."):]: v for k, v in state.items() if k.startswith("model.")}
-            prefixed = {f"model.{k}": v for k, v in state.items()}
-            for cand, label in ((stripped, "stripped 'model.' prefix"), (prefixed, "added 'model.' prefix")):
-                if cand:
-                    ok, _ = _try_load(cand)
-                    if ok:
-                        how = label
-                        break
-            if not ok:
-                raise RuntimeError(f"Could not load checkpoint state_dict strictly.\n{how}")
+        how = load_grit_checkpoint_strict(model, ckpt_path)
         log(f"[ckpt] Loaded strictly (key handling: {how}).")
 
         model.to(device)

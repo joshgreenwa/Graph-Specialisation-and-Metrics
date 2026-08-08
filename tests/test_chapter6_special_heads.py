@@ -10,10 +10,16 @@ from graph_specialisation_metrics.chapter6_special_heads import (
     head_distance_profiles,
     select_special_heads_across_seeds,
 )
+from graph_specialisation_metrics.methodology.grit_figure_data import (
+    _apply_figure_analysis_subset_patch,
+)
 from graph_specialisation_metrics.methodology.grit_figure_plots import (
     attention_cmap_name,
     plot_attention_grid_publication,
     plot_av_pca_publication,
+)
+from graph_specialisation_metrics.specialisation.model import (
+    load_grit_checkpoint_strict,
 )
 
 
@@ -138,6 +144,49 @@ def test_publication_attention_uses_family_colour_and_labels_virtual_node():
     assert "Most semantic head" in title_text
     assert "ablate" in title_text
     assert attention_cmap_name("generalist") == "Purples"
+
+
+def test_figure_subset_patch_runs_before_positional_encoding(tmp_path):
+    loader = tmp_path / "grit/loader/master_loader.py"
+    loader.parent.mkdir(parents=True)
+    loader.write_text(
+        "import logging\n"
+        "import os.path as osp\n"
+        "import torch\n"
+        "\n"
+        "@register_loader('custom_master_loader')\n"
+        "def load_dataset_master(format, name, dataset_dir):\n"
+        "    dataset = object()\n"
+        "    log_loaded_dataset(dataset, format, name)\n"
+        "    return dataset\n",
+        encoding="utf-8",
+    )
+    _apply_figure_analysis_subset_patch(tmp_path)
+    patched = loader.read_text(encoding="utf-8")
+    assert "def _gsm_figure_analysis_subset(dataset):" in patched
+    assert patched.index("dataset = _gsm_figure_analysis_subset(dataset)") < patched.index(
+        "log_loaded_dataset(dataset, format, name)"
+    )
+    # Idempotence matters because Colab reuses patched task clones.
+    _apply_figure_analysis_subset_patch(tmp_path)
+    assert loader.read_text(encoding="utf-8").count(
+        "def _gsm_figure_analysis_subset(dataset):"
+    ) == 1
+
+
+def test_checkpoint_can_be_swapped_without_rebuilding_model(tmp_path):
+    torch = pytest.importorskip("torch")
+    model = torch.nn.Linear(3, 2)
+    checkpoint = tmp_path / "seed.ckpt"
+    expected = {
+        key: torch.full_like(value, 0.25) for key, value in model.state_dict().items()
+    }
+    torch.save({"model_state": expected}, checkpoint)
+    how = load_grit_checkpoint_strict(model, checkpoint)
+    assert how == "strict"
+    for value in model.state_dict().values():
+        assert torch.allclose(value, torch.full_like(value, 0.25))
+    assert model.training is False
 
 
 def test_publication_pca_has_fixed_chemistry_legend_and_metrics():
