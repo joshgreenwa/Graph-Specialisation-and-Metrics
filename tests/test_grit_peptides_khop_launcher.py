@@ -178,3 +178,57 @@ def test_streaming_rrwp_patch_upgrades_legacy_keys_access(tmp_path: Path) -> Non
     assert "chunk_keys = data_parts[0].keys" in patched
     assert "if callable(chunk_keys):" in patched
     assert "list(data_parts[0].keys)" not in patched
+
+
+def test_peptides_func_metric_patch_replaces_legacy_torchmetrics_calls(
+    tmp_path: Path,
+) -> None:
+    logger = tmp_path / "grit/logger.py"
+    logger.parent.mkdir(parents=True)
+    logger.write_text(
+        """\
+class CustomLogger:
+    def classification_multilabel(self):
+        true, pred_score = torch.cat(self._true), torch.cat(self._pred)
+        reformat = lambda x: round(float(x), cfg.round)
+
+        # Send to GPU to speed up TorchMetrics if possible.
+        true = true.to(torch.device(cfg.device))
+        pred_score = pred_score.to(torch.device(cfg.device))
+        acc = MetricWrapper(metric='accuracy',
+                            target_nan_mask='ignore-mean-label',
+                            threshold=0.,
+                            cast_to_int=True)
+        ap = MetricWrapper(metric='averageprecision',
+                           target_nan_mask='ignore-mean-label',
+                           pos_label=1,
+                           cast_to_int=True)
+        auroc = MetricWrapper(metric='auroc',
+                              target_nan_mask='ignore-mean-label',
+                              pos_label=1,
+                              cast_to_int=True)
+        results = {
+            'accuracy': reformat(acc(pred_score, true)),
+            'ap': reformat(ap(pred_score, true)),
+            'auc': reformat(auroc(pred_score, true)),
+        }
+
+        if self.test_scores:
+            pass
+        return results
+""",
+        encoding="utf-8",
+    )
+
+    runner.apply_peptides_multilabel_metric_patch(tmp_path)
+    first = logger.read_text(encoding="utf-8")
+    runner.apply_peptides_multilabel_metric_patch(tmp_path)
+    second = logger.read_text(encoding="utf-8")
+
+    assert first == second
+    assert "GSM_PEPTIDES_FUNC_OGB_METRICS" in first
+    assert "metrics_ogb.eval_acc" in first
+    assert "metrics_ogb.eval_ap" in first
+    assert "metrics_ogb.eval_rocauc" in first
+    assert "MetricWrapper(metric='accuracy'" not in first
+    compile(first, str(logger), "exec")

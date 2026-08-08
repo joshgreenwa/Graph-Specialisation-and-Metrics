@@ -16,6 +16,11 @@ with a global VNode. QM9 and both Peptides tasks also accept local RRWP
 variants. ZINC local RRWP is intentionally rejected because it has not been
 combined with the general ZINC runner.
 
+For Peptides-func, the job-local GRIT checkout uses GRIT's bundled OGB
+accuracy/AP/AUROC implementations directly. This preserves the official
+benchmark metrics while avoiding the obsolete pre-0.10 TorchMetrics functional
+API in the pinned GRIT logger; the shared Python environment is not modified.
+
 ## jgg45 CSD3 launch: 60 GPUs within a 400-hour balance
 
 The prepared CSD3 launcher creates exactly this grid:

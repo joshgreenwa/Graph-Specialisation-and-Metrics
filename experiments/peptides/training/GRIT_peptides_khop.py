@@ -642,6 +642,78 @@ def apply_peptides_pandas_warning_patch(repo_dir: Path) -> None:
             log(f"[dataset-compat] Removed pandas warning hot loop: {path}")
 
 
+def apply_peptides_multilabel_metric_patch(repo_dir: Path) -> None:
+    """Use GRIT's bundled OGB metrics for Peptides-func on modern TorchMetrics.
+
+    The pinned GRIT logger calls the pre-0.10 TorchMetrics functional API. On
+    modern installations every per-label metric call raises because ``task``
+    is now required; GRIT catches those exceptions and subsequently crashes by
+    stacking an empty list. GRIT already bundles the corresponding OGB metric
+    implementations and uses them to cross-check the TorchMetrics results.
+    Calling those implementations directly preserves the benchmark semantics
+    while making the logger independent of the installed TorchMetrics API.
+    """
+    logger = repo_dir / "grit/logger.py"
+    old = """\
+        # Send to GPU to speed up TorchMetrics if possible.
+        true = true.to(torch.device(cfg.device))
+        pred_score = pred_score.to(torch.device(cfg.device))
+        acc = MetricWrapper(metric='accuracy',
+                            target_nan_mask='ignore-mean-label',
+                            threshold=0.,
+                            cast_to_int=True)
+        ap = MetricWrapper(metric='averageprecision',
+                           target_nan_mask='ignore-mean-label',
+                           pos_label=1,
+                           cast_to_int=True)
+        auroc = MetricWrapper(metric='auroc',
+                              target_nan_mask='ignore-mean-label',
+                              pos_label=1,
+                              cast_to_int=True)
+        results = {
+            'accuracy': reformat(acc(pred_score, true)),
+            'ap': reformat(ap(pred_score, true)),
+            'auc': reformat(auroc(pred_score, true)),
+        }
+"""
+    new = """\
+        # GSM_PEPTIDES_FUNC_OGB_METRICS: the pinned TorchMetrics calls below
+        # predate its required `task=` API. GRIT already carries the official
+        # OGB implementations and uses them as its own equivalence check.
+        true_ogb = true.detach().cpu().numpy()
+        pred_ogb = pred_score.detach().cpu().numpy()
+        results = {
+            'accuracy': reformat(metrics_ogb.eval_acc(
+                true_ogb, (pred_ogb > 0.).astype(int))['acc']),
+            'ap': reformat(metrics_ogb.eval_ap(true_ogb, pred_ogb)['ap']),
+            'auc': reformat(
+                metrics_ogb.eval_rocauc(true_ogb, pred_ogb)['rocauc']),
+        }
+"""
+    _replace_exact(
+        logger,
+        old,
+        new,
+        "GSM_PEPTIDES_FUNC_OGB_METRICS",
+        "Peptides-func version-stable OGB metrics",
+    )
+    text = logger.read_text(encoding="utf-8", errors="replace")
+    try:
+        compile(text, str(logger), "exec")
+    except SyntaxError as exc:
+        raise RuntimeError(f"Invalid GRIT logger after Peptides-func metric patch: {exc}") from exc
+    required = (
+        "GSM_PEPTIDES_FUNC_OGB_METRICS",
+        "metrics_ogb.eval_acc",
+        "metrics_ogb.eval_ap",
+        "metrics_ogb.eval_rocauc",
+    )
+    missing = [token for token in required if token not in text]
+    if missing:
+        raise RuntimeError(f"Incomplete Peptides-func metric patch in {logger}: missing {missing}")
+    log("[patch-check] Peptides-func OGB multilabel metrics verified.")
+
+
 def verify_attention_rrwp_vnode_patch(repo_dir: Path) -> None:
     required = {
         "grit/config/gt_config.py": ["cfg.gt.attn.hops = 1", "cfg.gt.attn.global_vnode = False"],
@@ -1092,6 +1164,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     peptides_common.apply_peptides_dataset_compat_patch(base, args.repo_dir)
     apply_peptides_pandas_warning_patch(args.repo_dir)
     peptides_common.apply_peptides_streaming_rrwp_patch(base, args.repo_dir)
+    if args.task == "func":
+        apply_peptides_multilabel_metric_patch(args.repo_dir)
 
     apply_attention_rrwp_vnode_patch(args.repo_dir)
     verify_attention_rrwp_vnode_patch(args.repo_dir)
