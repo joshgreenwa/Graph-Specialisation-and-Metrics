@@ -40,6 +40,13 @@ STRICT_CACHE_INVENTORY = True
 RELIABLE_HEAD_QUANTILE = 0.25
 COMPUTE_MISSING_ABLATIONS = True
 COMPUTE_MISSING_TRAJECTORY_SCORES = True
+GENERATE_SPECIAL_HEAD_ANALYSIS = True
+SPECIAL_HEAD_COMPUTE_MISSING = True
+SPECIAL_HEAD_FORCE = False
+SPECIAL_HEAD_PCA_GRAPHS = 500
+SPECIAL_HEAD_EXAMPLES_PER_PAGE = 5  # two readable pages = ten molecules/head
+SPECIAL_HEAD_RENDER_GRAPH_INDICES = None  # later choose a subset of the cached ten
+SPECIAL_HEAD_GENERALIST_MAX_ABS_DREL = 0.10
 
 DRIVE_ROOT = Path("/content/drive/MyDrive")
 MULTI_SEED_ROOT = DRIVE_ROOT / "graph_specialisation_metrics/multi_seed_models"
@@ -103,7 +110,17 @@ def bootstrap() -> None:
             f"origin/{REPOSITORY_BRANCH}",
         )
     command("git", "-C", str(COLAB_REPOSITORY), "remote", "set-url", "origin", REPOSITORY_URL)
-    command(sys.executable, "-m", "pip", "install", "-q", "-e", str(COLAB_REPOSITORY))
+    command(
+        sys.executable,
+        "-m",
+        "pip",
+        "install",
+        "-q",
+        "-e",
+        str(COLAB_REPOSITORY),
+        "pillow",
+        "rdkit",
+    )
 
     source = str((COLAB_REPOSITORY / "src").resolve())
     sys.path[:] = [entry for entry in sys.path if entry != source]
@@ -279,6 +296,50 @@ manifest = run(
     verbose=True,
 )
 
+special_head_manifest = None
+if GENERATE_SPECIAL_HEAD_ANALYSIS:
+    # Attention and routed-output PCA are the only Chapter 6 multi-seed figures
+    # that require model reconstruction. Contract caches make subsequent runs
+    # checkpoint-free unless the requested heads or analysis settings change.
+    from experiments.methodology.zinc_qm9_canonical_colab_worker import (
+        ensure_runtime_dependencies,
+        require_requested_accelerator,
+    )
+    from graph_specialisation_metrics.chapter6_special_heads import (
+        generate_special_head_analysis,
+    )
+
+    require_requested_accelerator("cuda:0")
+    ensure_runtime_dependencies()
+    special_head_manifest = generate_special_head_analysis(
+        CANONICAL_ROOT,
+        ABLATION_ROOT,
+        OUTPUT_DIR,
+        dataset=DATASET,
+        seeds=SEEDS,
+        render_graph_indices=SPECIAL_HEAD_RENDER_GRAPH_INDICES,
+        n_pca_graphs=SPECIAL_HEAD_PCA_GRAPHS,
+        examples_per_page=SPECIAL_HEAD_EXAMPLES_PER_PAGE,
+        accelerator="cuda:0",
+        compute_missing=SPECIAL_HEAD_COMPUTE_MISSING,
+        force=SPECIAL_HEAD_FORCE,
+        generalist_max_abs_drel=SPECIAL_HEAD_GENERALIST_MAX_ABS_DREL,
+        verbose=True,
+    )
+    print("\nControlled special-head selection", flush=True)
+    selected_columns = [
+        "model_label",
+        "role",
+        "display_family",
+        "seed",
+        "layer",
+        "head",
+        "selectivity",
+        "joint_sensitivity",
+        "head_ablation_impact",
+    ]
+    display(pd.DataFrame(special_head_manifest["selected_heads"])[selected_columns])
+
 print("\nSemantic--structural distance alignment", flush=True)
 display(pd.read_csv(OUTPUT_DIR / "semantic_structural_alignment.csv"))
 
@@ -287,6 +348,17 @@ pngs = [Path(path) for path in manifest["figures"] if str(path).endswith(".png")
 for path in pngs:
     print(path.name, flush=True)
     display(Image(filename=str(path)))
+
+if special_head_manifest is not None:
+    print("\nControlled special-head figures", flush=True)
+    for record in special_head_manifest["outputs"]:
+        path = Path(record["png"])
+        print(
+            f"{record['task']} · seed {record['seed']} · {record['role']} · "
+            f"{record['figure']}: {path.name}",
+            flush=True,
+        )
+        display(Image(filename=str(path)))
 
 print(f"\n[done] {DATASET.upper()} outputs: {OUTPUT_DIR}", flush=True)
 # ============================== paste to here ==============================

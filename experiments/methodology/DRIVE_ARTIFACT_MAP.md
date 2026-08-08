@@ -93,6 +93,30 @@ underlying score cache and checkpoint, while the canonical per-head shards retai
 records. Use a T4 GPU for the first pass; subsequent figure-only reruns validate and reuse these
 caches without loading a model.
 
+### Controlled special-head diagnostics
+
+The same frontend selects three distinct active heads per architecture across the three seeds:
+the largest `D_rel`, the smallest `D_rel`, and the largest remaining `J`. It then caches ten
+controlled molecule examples and a 500-molecule chemistry-labelled routed-output PCA for each
+selected head. Outputs live beneath the dataset analysis root:
+
+```text
+M/chapter6_multiseed_analysis/<dataset>/special_head_analysis/selected_heads.csv
+M/chapter6_multiseed_analysis/<dataset>/special_head_analysis/selected_heads.json
+M/chapter6_multiseed_analysis/<dataset>/special_head_analysis/manifest.json
+M/chapter6_multiseed_analysis/<dataset>/special_head_analysis/cache/<model task>/seed_<seed>/
+M/chapter6_multiseed_analysis/<dataset>/special_head_analysis/figures/
+```
+
+Each selected head receives two five-molecule attention pages (ten examples in total), one
+chemistry-labelled PCA, and one semantic/structural/attention distance-profile figure. The cache
+contracts bind the score-cache SHA, checkpoint SHA, selected heads, graph indices, PCA graph
+count, and chemistry-label version. Virtual-node models preserve the auxiliary node in the
+attention matrix and distance profile; chemistry PCA remains defined over real molecular
+receivers. Once these supplemental caches exist, figures and smaller paper subsets can be
+regenerated without loading a checkpoint by setting `SPECIAL_HEAD_RENDER_GRAPH_INDICES` to any
+subset of the cached ten indices.
+
 ## Seed-0 dense/1-hop checkpoint trajectory
 
 The trajectory roots are:

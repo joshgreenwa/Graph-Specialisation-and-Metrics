@@ -27,14 +27,24 @@ GOLD = "#E6A700"
 ORANGE = "#D97706"
 SLATE = "#607080"
 LIGHT_GRID = "#DCE3E8"
+INDIVIDUAL_PCA_FIGURE_WIDTH = 9.6
+INDIVIDUAL_PCA_BASE_HEIGHT = 6.4
+_PRESERVE_CANVAS_ATTRIBUTE = "_graph_specialisation_preserve_canvas"
 ATTENTION_CMAP = plt.get_cmap("Blues")
+ATTENTION_FAMILY_CMAP_NAMES = {
+    "semantic": "Oranges",
+    "structural": "Blues",
+    "generalist": "Purples",
+}
 SELECTIVITY_CMAP = plt.get_cmap("coolwarm")
 PUBLICATION_PNG_DPI = 600
 PUBLICATION_PDF_RASTER_DPI = 1200
 MOLECULE_RENDER_DPI = 600
+MOLECULE_ATOM_FONT_SIZE = 55
 # Backwards-compatible name retained for existing figure metadata consumers.
 MOLECULE_DRAW_DPI = MOLECULE_RENDER_DPI
 CORE_SCATTER_FIGSIZE = (8.0, 5.9)
+ATTENTION_MATRIX_MAX_TICK_LABELS = 10
 HEAD_STYLES = {
     "semantic": {"color": GOLD, "label": "Semantic specialist"},
     "structural": {"color": TEAL, "label": "Structural specialist"},
@@ -64,7 +74,7 @@ PCA_FOCUS_COLORS = {
     "Branch: degree>=3": "#6B8E23",
     "Charge: +": "#C44E52",
     "Charge: -": "#9C4F96",
-    "H: hydrogen": "#8C9AA5",
+    "H: hydrogen": "#D65F8D",
     "other/diffuse": "#B8C2CA",
     "Other / rare": "#4B5563",
 }
@@ -72,6 +82,22 @@ PCA_FOCUS_COLORS = {
 # Backwards-compatible public name; values now follow the PCQM chemical-group
 # convention rather than element/type-ID labels.
 ELEMENT_COLORS = PCA_FOCUS_COLORS
+
+
+def attention_cmap_name(role: str) -> str:
+    """Return the stable publication colour map for one head family."""
+
+    normalised_role = str(role).strip().lower()
+    for family, cmap_name in ATTENTION_FAMILY_CMAP_NAMES.items():
+        if normalised_role == family or normalised_role.startswith(
+            f"{family}_"
+        ):
+            return cmap_name
+    return ATTENTION_CMAP.name
+
+
+def _attention_cmap(role: str):
+    return plt.get_cmap(attention_cmap_name(role))
 
 
 def apply_publication_style() -> None:
@@ -417,6 +443,18 @@ def _node_conditioned_attention(attention: np.ndarray) -> np.ndarray:
     return attention / denominator
 
 
+def _attention_matrix_tick_indices(num_nodes: int) -> np.ndarray:
+    """Return readable node ticks while retaining both matrix endpoints."""
+
+    num_nodes = int(num_nodes)
+    if num_nodes < 1:
+        raise ValueError("an attention matrix must contain at least one node")
+    tick_count = min(num_nodes, ATTENTION_MATRIX_MAX_TICK_LABELS)
+    return np.unique(
+        np.rint(np.linspace(0, num_nodes - 1, num=tick_count)).astype(int)
+    )
+
+
 def _molecule_from_example(example: Mapping[str, Any]):
     from rdkit import Chem
 
@@ -459,7 +497,7 @@ def _draw_molecule_plain(
     options = drawer.drawOptions()
     options.addAtomIndices = False
     options.bondLineWidth = 5.0
-    options.fixedFontSize = 44
+    options.fixedFontSize = MOLECULE_ATOM_FONT_SIZE
     options.padding = 0.06
     for index in range(molecule.GetNumAtoms()):
         options.atomLabels[index] = str(index)
@@ -473,6 +511,7 @@ def _draw_molecule_attention(
     *,
     inbound: np.ndarray,
     vmax: float,
+    cmap=None,
     figsize: tuple[float, float] = (4.2, 3.7),
     dpi: int = MOLECULE_RENDER_DPI,
 ):
@@ -489,12 +528,13 @@ def _draw_molecule_attention(
             f"{len(inbound)}"
         )
     norm = Normalize(vmin=0.0, vmax=max(float(vmax), 1e-12), clip=True)
+    cmap = ATTENTION_CMAP if cmap is None else cmap
     highlight_atoms = list(range(molecule.GetNumAtoms()))
     highlight_colors = {}
     highlight_radii = {}
     for atom, value in enumerate(inbound):
         scaled = float(norm(value))
-        rgba = ATTENTION_CMAP(0.18 + 0.72 * scaled)
+        rgba = cmap(0.18 + 0.72 * scaled)
         highlight_colors[atom] = tuple(float(channel) for channel in rgba[:3])
         highlight_radii[atom] = 0.20 + 0.30 * np.sqrt(scaled)
 
@@ -505,7 +545,7 @@ def _draw_molecule_attention(
     options.fillHighlights = True
     options.atomHighlightsAreCircles = True
     options.bondLineWidth = 5.0
-    options.fixedFontSize = 44
+    options.fixedFontSize = MOLECULE_ATOM_FONT_SIZE
     options.padding = 0.06
     for index in highlight_atoms:
         options.atomLabels[index] = str(index)
@@ -774,6 +814,177 @@ def plot_attention_grid(
     return fig
 
 
+def plot_attention_grid_publication(
+    examples_payload: Mapping[str, Any],
+    *,
+    attention_key: str,
+    attention_family: str,
+    head: Head,
+    title_label: str,
+    net_d_rel: float,
+    net_joint_sensitivity: float,
+    head_ablation_impact: float,
+):
+    """Established ZINC/QM9 layout with family-specific attention colour.
+
+    Virtual-node models retain the virtual row and column in the attention
+    matrix. Molecular highlights are computed from molecular queries into
+    molecular keys, while the final matrix tick is explicitly labelled ``VN``.
+    """
+
+    apply_publication_style()
+    attention_cmap = _attention_cmap(attention_family)
+    examples = list(examples_payload["examples"])
+    if not examples:
+        raise ValueError("the attention grid requires at least one example")
+    matrices = [
+        _node_conditioned_attention(example["attention"][attention_key])
+        for example in examples
+    ]
+    matrix_max = max(
+        max(float(np.nanpercentile(matrix, 99)), 1e-6)
+        for matrix in matrices
+    )
+    inbound = []
+    for example, matrix in zip(examples, matrices):
+        n_atoms = int(example["n_atoms"])
+        inbound.append(matrix[:n_atoms, :n_atoms].mean(axis=0))
+    inbound_max = max(
+        max(float(np.nanpercentile(values, 99)), 1e-6)
+        for values in inbound
+    )
+    num_rows = len(examples)
+    figure_height = 3.4 + 3.35 * num_rows
+    fig = plt.figure(
+        figsize=(15.5, figure_height),
+        constrained_layout=True,
+    )
+    grid = fig.add_gridspec(
+        num_rows + 2,
+        3,
+        height_ratios=[0.16, *([1.0] * num_rows), 0.11],
+        width_ratios=[1.0, 1.08, 1.12],
+    )
+    title_axis = fig.add_subplot(grid[0, :])
+    title_axis.axis("off")
+    axes = np.asarray(
+        [
+            [fig.add_subplot(grid[row + 1, column]) for column in range(3)]
+            for row in range(num_rows)
+        ],
+        dtype=object,
+    )
+    colorbar_axis = fig.add_subplot(grid[-1, :])
+    dataset_label = str(examples_payload.get("dataset_label", "molecule"))
+    for row, (example, matrix) in enumerate(zip(examples, matrices)):
+        axes[row, 0].imshow(_draw_molecule_plain(example))
+        axes[row, 0].axis("off")
+        caption = f"{dataset_label} eval {int(example['dataset_index'])}"
+        formula = str(example.get("formula") or "").strip()
+        if formula:
+            caption += f" · {formula}"
+        axes[row, 0].text(
+            0.5,
+            0.015,
+            caption,
+            transform=axes[row, 0].transAxes,
+            ha="center",
+            va="bottom",
+            fontsize=15,
+            color=NAVY,
+            bbox={
+                "facecolor": "white",
+                "edgecolor": "none",
+                "alpha": 0.90,
+            },
+        )
+        axes[row, 1].imshow(
+            _draw_molecule_attention(
+                example,
+                inbound=inbound[row],
+                vmax=inbound_max,
+                cmap=attention_cmap,
+            )
+        )
+        axes[row, 1].axis("off")
+        image = axes[row, 2].imshow(
+            matrix,
+            cmap=attention_cmap,
+            vmin=0,
+            vmax=matrix_max,
+            interpolation="nearest",
+            aspect="equal",
+            rasterized=True,
+        )
+        axes[row, 2].set_xlabel("Key atom", fontsize=20)
+        axes[row, 2].set_ylabel("Query atom", fontsize=20)
+        tick_indices = _attention_matrix_tick_indices(matrix.shape[0])
+        tick_labels = [str(index) for index in tick_indices]
+        if (
+            bool(example.get("has_virtual_node"))
+            and matrix.shape[0] - 1 in tick_indices
+        ):
+            tick_labels[
+                list(tick_indices).index(matrix.shape[0] - 1)
+            ] = "VN"
+        axes[row, 2].set_xticks(tick_indices, tick_labels)
+        axes[row, 2].set_yticks(tick_indices, tick_labels)
+        axes[row, 2].tick_params(labelsize=10, length=2.5)
+
+    for column, label in enumerate(
+        [
+            "Molecule",
+            "Attention-weighted molecule",
+            "Node-conditioned attention",
+        ]
+    ):
+        axes[0, column].set_title(label, fontsize=25, pad=10)
+    title_axis.text(
+        0.5,
+        0.84,
+        f"{_payload_display_title(examples_payload)} — "
+        f"{title_label} — {_head_label(head)}",
+        ha="center",
+        va="center",
+        fontsize=29,
+        color=NAVY,
+    )
+    title_axis.text(
+        0.5,
+        0.04,
+        rf"$D_{{\rm rel}} = {float(net_d_rel):+.3f};\quad "
+        rf"J = {float(net_joint_sensitivity):.3f};\quad "
+        rf"\Delta \hat{{y}}_{{\rm ablate}} = "
+        rf"{float(head_ablation_impact):.4g}$",
+        ha="center",
+        va="center",
+        fontsize=25,
+        color=NAVY,
+    )
+    colorbar = fig.colorbar(
+        image,
+        cax=colorbar_axis,
+        orientation="horizontal",
+    )
+    colorbar.set_label("Attention weight", fontsize=25, labelpad=7)
+    colorbar.ax.tick_params(labelsize=25, length=3)
+    for tick_label in colorbar.ax.get_xticklabels():
+        tick_label.set_fontweight("medium")
+
+    fig.canvas.draw()
+    colorbar_position = colorbar_axis.get_position()
+    fig.set_layout_engine("none")
+    colorbar_axis.set_position(
+        [
+            colorbar_position.x0 + 0.08 * colorbar_position.width,
+            colorbar_position.y0 - 0.92 / figure_height,
+            0.84 * colorbar_position.width,
+            colorbar_position.height,
+        ]
+    )
+    return fig
+
+
 def _pca(vectors: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     vectors = np.asarray(vectors, dtype=np.float64)
     centered = vectors - vectors.mean(axis=0, keepdims=True)
@@ -890,6 +1101,91 @@ def plot_av_pca(
         fontsize=9.5,
         markerscale=1.15,
         handletextpad=0.55,
+    )
+    return fig
+
+
+def plot_av_pca_publication(
+    payload: Mapping[str, Any],
+    *,
+    title_label: str,
+    d_rel: float,
+    joint_sensitivity: float,
+    head_ablation_impact: float,
+    maximum_categories: int = 20,
+    minimum_count: int = 1,
+):
+    """Chemistry-labelled routed-output PCA in the established paper layout."""
+
+    apply_publication_style()
+    coordinates, explained = _pca(np.asarray(payload["vectors"]))
+    labels = _group_pca_labels(
+        list(payload["labels"]),
+        maximum_categories=maximum_categories,
+        minimum_count=minimum_count,
+    )
+    categories = _ordered_pca_categories(labels)
+    legend_columns = min(3, max(1, len(categories)))
+    legend_rows = int(np.ceil(len(categories) / legend_columns))
+    legend_space_inches = 0.65 + 0.42 * legend_rows
+    figure_height = INDIVIDUAL_PCA_BASE_HEIGHT + legend_space_inches
+    fig, ax = plt.subplots(
+        figsize=(INDIVIDUAL_PCA_FIGURE_WIDTH, figure_height)
+    )
+    setattr(fig, _PRESERVE_CANVAS_ATTRIBUTE, True)
+    labels_array = np.asarray(labels)
+    for category in categories:
+        mask = labels_array == category
+        ax.scatter(
+            coordinates[mask, 0],
+            coordinates[mask, 1],
+            s=34,
+            color=_pca_focus_color(category),
+            edgecolor="white",
+            linewidth=0.35,
+            alpha=0.78,
+            label=f"{category} (n={int(mask.sum())})",
+        )
+    ax.axhline(0, color=LIGHT_GRID, linewidth=0.8, zorder=0)
+    ax.axvline(0, color=LIGHT_GRID, linewidth=0.8, zorder=0)
+    ax.set_xlabel(f"PC1 ({100 * explained[0]:.1f}% variance)")
+    ax.set_ylabel(f"PC2 ({100 * explained[1]:.1f}% variance)")
+    axis_title_size = 1.25 * float(plt.rcParams["axes.labelsize"])
+    axis_tick_size = 1.25 * float(plt.rcParams["xtick.labelsize"])
+    ax.xaxis.label.set_fontsize(axis_title_size)
+    ax.yaxis.label.set_fontsize(axis_title_size)
+    ax.tick_params(axis="both", labelsize=axis_tick_size)
+    head = tuple(payload["head"])
+    ax.set_title(
+        f"{_payload_display_title(payload)} — {title_label}\n"
+        f"PCA of Head Output - {_head_label(head)} "
+        f"({int(payload['n_used'])} molecules)\n"
+        rf"$D_{{\rm rel}} = {float(d_rel):+.3f};\quad "
+        rf"J = {float(joint_sensitivity):.3f};\quad "
+        rf"\Delta \hat{{y}}_{{\rm ablate}} = "
+        rf"{float(head_ablation_impact):.4g}$",
+        fontsize=15,
+    )
+    ax.grid(False)
+    handles, legend_labels = ax.get_legend_handles_labels()
+    fig.legend(
+        handles,
+        legend_labels,
+        loc="lower center",
+        bbox_to_anchor=(0.5, 0.02),
+        ncol=legend_columns,
+        fontsize=axis_title_size,
+        markerscale=1.25,
+        handletextpad=0.5,
+        columnspacing=1.25,
+        labelspacing=0.75,
+        borderaxespad=0.0,
+    )
+    fig.subplots_adjust(
+        left=0.115,
+        right=0.975,
+        top=1.0 - 1.90 / figure_height,
+        bottom=(legend_space_inches + 0.20) / figure_height,
     )
     return fig
 

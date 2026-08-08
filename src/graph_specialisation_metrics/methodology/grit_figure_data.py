@@ -815,9 +815,15 @@ class GritDiagnosticCapture:
 class GritDiagnosticExtractor:
     """Capture attention, routed output, and GRIT-native raw-logit controls."""
 
-    def __init__(self, figure_runtime: GritFigureRuntime):
+    def __init__(
+        self,
+        figure_runtime: GritFigureRuntime,
+        *,
+        include_virtual_attention: bool = False,
+    ):
         self.figure_runtime = figure_runtime
         self.gm = figure_runtime.runtime
+        self.include_virtual_attention = bool(include_virtual_attention)
 
     def extract(self, data: Any) -> GritDiagnosticCapture:
         import torch
@@ -891,12 +897,24 @@ class GritDiagnosticExtractor:
         if any(any(value is None for value in group) for group in groups):
             raise RuntimeError("one or more GRIT diagnostic hooks did not fire")
         n = int(data.num_nodes)
+        attention_slice = (
+            slice(None) if self.include_virtual_attention else slice(0, n)
+        )
         return GritDiagnosticCapture(
-            node_only_logits=tuple(value[:, :n, :n] for value in node_logits),
-            relation_logits=tuple(
-                value[:, :n, :n] for value in relation_logits
+            node_only_logits=tuple(
+                value[:, attention_slice, attention_slice]
+                for value in node_logits
             ),
-            attention=tuple(value[:, :n, :n] for value in attention),
+            relation_logits=tuple(
+                value[:, attention_slice, attention_slice]
+                for value in relation_logits
+            ),
+            attention=tuple(
+                value[:, attention_slice, attention_slice]
+                for value in attention
+            ),
+            # Chemistry-labelled PCA is intentionally defined over molecular
+            # receiving nodes even when the model has an auxiliary virtual node.
             transport=tuple(value[:n] for value in transport),
         )
 
@@ -1287,8 +1305,12 @@ def collect_attention_examples(
     *,
     graph_indices: Sequence[int],
     heads: Mapping[str, Head],
+    include_virtual_attention: bool = False,
 ) -> dict[str, Any]:
-    extractor = GritDiagnosticExtractor(figure_runtime)
+    extractor = GritDiagnosticExtractor(
+        figure_runtime,
+        include_virtual_attention=include_virtual_attention,
+    )
     runtime = figure_runtime.runtime
     task_name = figure_runtime.prepared.task.name
     examples = []
@@ -1306,10 +1328,17 @@ def collect_attention_examples(
             role: captured.attention[layer][head].float().cpu().numpy()
             for role, (layer, head) in heads.items()
         }
+        matrix_nodes = max(
+            (matrix.shape[0] for matrix in selected.values()), default=0
+        )
         examples.append(
             {
                 "dataset_index": graph_index,
                 "n_atoms": int(graph.num_nodes),
+                "attention_nodes": int(matrix_nodes),
+                "has_virtual_node": bool(
+                    matrix_nodes > int(graph.num_nodes)
+                ),
                 "attention": selected,
                 **chemistry,
             }
@@ -1318,6 +1347,7 @@ def collect_attention_examples(
         "task": task_name,
         "index_space": "GRIT evaluation-split position",
         "heads": dict(heads),
+        "include_virtual_attention": bool(include_virtual_attention),
         "examples": examples,
         **figure_identity(task_name),
     }
