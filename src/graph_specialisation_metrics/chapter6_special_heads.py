@@ -405,7 +405,9 @@ def generate_special_head_analysis(
         artifact = load_canonical_score_artifact(score_path, expected_task=artifact_task)
         model_path = model.model_path or score_path.parents[2] / "model.json"
         model_record = load_canonical_model_record(model_path, artifact)
-        protocol_path = canonical_root / "protocol.json"
+        # Isolated multi-seed workers write their exact protocol beside
+        # model.json inside <task>/seed_<n>/, not at the shared corpus root.
+        protocol_path = score_path.parents[2] / "protocol.json"
         protocol = methodology_config_from_record(protocol_path, accelerator=accelerator)
         heads = {str(row["role"]): (int(row["layer"]), int(row["head"])) for row in group}
         cache = SupplementalCache(cache_dir / task / f"seed_{seed}")
