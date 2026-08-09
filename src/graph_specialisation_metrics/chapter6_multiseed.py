@@ -10,6 +10,7 @@ the final validation panel also reads focused clean-head ablation summaries.
 from __future__ import annotations
 
 import csv
+import gc
 import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -223,6 +224,120 @@ def _head_rows(models: Sequence[SpatialModel]) -> list[dict[str, Any]]:
         for row in head_metrics((model,)):
             rows.append({"seed": int(model.seed), **row})
     return rows
+
+
+def _release_cached_models(models: list[SpatialModel]) -> None:
+    """Release large score/carriage payloads before loading the next seed."""
+
+    models.clear()
+    gc.collect()
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except (ImportError, RuntimeError):
+        pass
+
+
+def _aggregate_streamed_rows(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    keys: Sequence[str],
+    value_field: str,
+    output_field: str,
+) -> list[dict[str, Any]]:
+    """Combine single-seed summaries without retaining their source caches."""
+
+    groups: dict[tuple[Any, ...], list[float]] = {}
+    for row in rows:
+        groups.setdefault(tuple(row[key] for key in keys), []).append(
+            float(row[value_field])
+        )
+    output: list[dict[str, Any]] = []
+    for key, values in sorted(groups.items()):
+        mean, low, high = _mean_range(values)
+        output.append(
+            {
+                **dict(zip(keys, key)),
+                "seeds": int(np.sum(np.isfinite(np.asarray(values, dtype=np.float64)))),
+                f"{output_field}_mean": mean,
+                f"{output_field}_min": low,
+                f"{output_field}_max": high,
+            }
+        )
+    return output
+
+
+def _load_summary_rows_streaming(
+    canonical_root: Path,
+    spec: DatasetSpec,
+    seeds: Sequence[int],
+) -> tuple[
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    list[str],
+    int,
+]:
+    """Derive all cache-only summaries while holding only one seed in RAM."""
+
+    head_rows: list[dict[str, Any]] = []
+    vnode_seed_rows: list[dict[str, Any]] = []
+    profile_seed_rows: list[dict[str, Any]] = []
+    matched_seed_rows: list[dict[str, Any]] = []
+    response_seed_rows: list[dict[str, Any]] = []
+    warnings: list[str] = []
+    runs_loaded = 0
+    for seed in seeds:
+        for task in spec.tasks:
+            models, model_warnings = load_models(
+                (Path(canonical_root),), (task,), seed=int(seed)
+            )
+            warnings.extend(model_warnings)
+            runs_loaded += len(models)
+            head_rows.extend(_head_rows(models))
+            vnode_seed_rows.extend(vnode_allocation_rows(models))
+            profile_seed_rows.extend(population_profile_rows(models))
+            matched_seed_rows.extend(matched_strength_profile_rows(models))
+            response_seed_rows.extend(carriage_response_variant_rows(models))
+            _release_cached_models(models)
+
+    vnode_rows = _aggregate_streamed_rows(
+        vnode_seed_rows,
+        keys=("task", "layer", "source"),
+        value_field="virtual_share_mean",
+        output_field="virtual_share",
+    )
+    profile_rows = _aggregate_streamed_rows(
+        profile_seed_rows,
+        keys=("task", "source", "distance"),
+        value_field="mass_mean",
+        output_field="mass",
+    )
+    matched_rows = _aggregate_streamed_rows(
+        matched_seed_rows,
+        keys=("task", "source", "distance"),
+        value_field="strength_mean",
+        output_field="strength",
+    )
+    response_rows = _aggregate_streamed_rows(
+        response_seed_rows,
+        keys=("task", "channel", "variant", "distance"),
+        value_field="response_mean",
+        output_field="response",
+    )
+    return (
+        head_rows,
+        vnode_rows,
+        profile_rows,
+        matched_rows,
+        response_rows,
+        warnings,
+        runs_loaded,
+    )
 
 
 def layer_organisation_rows(
@@ -1721,27 +1836,30 @@ def run(
         detail = ", ".join(f"{row['task']}/seed_{row['seed']}" for row in missing)
         raise FileNotFoundError(f"missing required consolidated cache(s): {detail}")
 
-    models, warnings = _load_all_models(canonical_root, spec, seeds)
+    (
+        head_rows,
+        vnode_rows,
+        profile_rows,
+        matched_profile_rows,
+        response_variant_rows,
+        warnings,
+        runs_loaded,
+    ) = _load_summary_rows_streaming(canonical_root, spec, seeds)
     expected = len(spec.tasks) * len(tuple(seeds))
-    if strict_inventory and len(models) != expected:
-        raise RuntimeError(f"loaded {len(models)} models; expected {expected}")
-    if not models:
+    if strict_inventory and runs_loaded != expected:
+        raise RuntimeError(f"loaded {runs_loaded} models; expected {expected}")
+    if not head_rows:
         raise FileNotFoundError("no usable score caches were found")
     if verbose:
         for warning in warnings:
             print(f"[chapter6-multiseed:warning] {warning}", flush=True)
         print(
-            f"[chapter6-multiseed] {spec.name}: loaded {len(models)} cached runs",
+            f"[chapter6-multiseed] {spec.name}: streamed {runs_loaded} cached runs",
             flush=True,
         )
 
-    head_rows = _head_rows(models)
     organisation_rows = layer_organisation_rows(head_rows)
     alignment_rows = alignment_summary_rows(head_rows, activity_quantile=activity_quantile)
-    vnode_rows = vnode_allocation_rows(models)
-    profile_rows = population_profile_rows(models)
-    matched_profile_rows = matched_strength_profile_rows(models)
-    response_variant_rows = carriage_response_variant_rows(models)
     ablation_rows: list[dict[str, Any]] = []
     if ablation_root is not None:
         from .chapter6_clean_ablation import load_rows
@@ -1834,7 +1952,7 @@ def run(
         "trajectory_root": None if trajectory_root is None else str(trajectory_root),
         "strict_trajectory": bool(strict_trajectory),
         "activity_quantile": float(activity_quantile),
-        "runs_loaded": len(models),
+        "runs_loaded": runs_loaded,
         "warnings": warnings,
         "figures": [str(path) for path in figures],
         "tables": [str(output_dir / name) for name in tables],

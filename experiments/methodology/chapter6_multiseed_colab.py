@@ -12,6 +12,7 @@ scores.  Both stages are resumable, so later runs return to cache-only figure ge
 from __future__ import annotations
 
 import importlib
+import gc
 import os
 import subprocess
 import sys
@@ -70,6 +71,28 @@ def command(*parts: str) -> None:
     ]
     print(f"[cmd] {' '.join(shown)}", flush=True)
     subprocess.run(list(parts), check=True)
+
+
+def release_memory(label: str) -> None:
+    """Force notebook and CUDA cleanup between independent analysis phases."""
+
+    gc.collect()
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+            allocated = torch.cuda.memory_allocated() / (1024**3)
+            reserved = torch.cuda.memory_reserved() / (1024**3)
+            print(
+                f"[memory:{label}] CUDA allocated={allocated:.2f} GiB; "
+                f"reserved={reserved:.2f} GiB",
+                flush=True,
+            )
+    except (ImportError, RuntimeError):
+        pass
 
 
 def bootstrap() -> None:
@@ -187,12 +210,14 @@ if missing_ablations:
         seeds=SEEDS,
         verbose=True,
     )
+    del corpus, methodology_config
 ablation_completion = finalize_clean_ablations(
     ABLATION_ROOT,
     dataset=DATASET,
     seeds=SEEDS,
 )
 print(f"[ablation] persistent completion manifest: {ablation_completion}", flush=True)
+release_memory("after-ablation")
 
 
 trajectory_inventory_rows = []
@@ -251,6 +276,8 @@ if DATASET == "zinc":
                 "trajectory computation returned without all score caches: "
                 + ", ".join(still_missing)
             )
+        del prepared_trajectory
+release_memory("after-trajectory")
 
 
 print(
@@ -299,6 +326,7 @@ manifest = run(
     activity_quantile=RELIABLE_HEAD_QUANTILE,
     verbose=True,
 )
+release_memory("after-core-figures")
 
 special_head_manifest = None
 if GENERATE_SPECIAL_HEAD_ANALYSIS:
@@ -330,6 +358,7 @@ if GENERATE_SPECIAL_HEAD_ANALYSIS:
         generalist_max_abs_drel=SPECIAL_HEAD_GENERALIST_MAX_ABS_DREL,
         verbose=True,
     )
+    release_memory("after-special-heads")
     print("\nControlled special-head selection", flush=True)
     selected_columns = [
         "model_label",

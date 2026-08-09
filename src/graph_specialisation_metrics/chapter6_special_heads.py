@@ -23,7 +23,7 @@ import numpy as np
 
 from .chapter6_clean_ablation import load_rows as load_ablation_rows
 from .chapter6_multiseed import SEEDS, dataset_spec
-from .chapter6_spatial_explorer import SpatialModel, head_metrics, load_models
+from .chapter6_spatial_explorer import head_metrics, load_models
 from .methodology.cache import checkpoint_sha256
 from .methodology.grit_figure_data import (
     CHEMISTRY_FOCUS_VERSION,
@@ -231,25 +231,49 @@ def select_special_heads_across_seeds(
     return output
 
 
-def _load_multiseed_models(
+def _index_multiseed_models_streaming(
     canonical_root: Path,
     *,
     dataset: str,
     seeds: Sequence[int],
-) -> tuple[list[SpatialModel], list[str]]:
+) -> tuple[list[dict[str, Any]], dict[tuple[str, int], dict[str, Any]], list[str]]:
+    """Index head metrics while retaining no full score or carriage cache."""
+
     spec = dataset_spec(dataset)
-    models: list[SpatialModel] = []
+    rows: list[dict[str, Any]] = []
+    references: dict[tuple[str, int], dict[str, Any]] = {}
     warnings: list[str] = []
     for seed in seeds:
-        values, messages = load_models((Path(canonical_root),), spec.tasks, seed=int(seed))
-        models.extend(values)
-        warnings.extend(messages)
+        for task in spec.tasks:
+            values, messages = load_models(
+                (Path(canonical_root),), (task,), seed=int(seed)
+            )
+            warnings.extend(messages)
+            for model in values:
+                rows.extend(
+                    {"seed": int(model.seed), **row}
+                    for row in head_metrics((model,))
+                )
+                references[(str(model.task), int(model.seed))] = {
+                    "task": str(model.task),
+                    "artifact_task": str(model.artifact_task),
+                    "seed": int(model.seed),
+                    "score_path": str(model.score_path),
+                    "model_path": (
+                        None if model.model_path is None else str(model.model_path)
+                    ),
+                    "score_contract": dict(model.score_metadata.get("contract", {})),
+                }
+            if values:
+                del model
+            values.clear()
+            gc.collect()
     expected = {(task, int(seed)) for task in spec.tasks for seed in seeds}
-    observed = {(model.task, int(model.seed)) for model in models}
+    observed = set(references)
     missing = sorted(expected - observed)
     if missing:
         raise FileNotFoundError(f"missing score caches for selected-head analysis: {missing}")
-    return models, warnings
+    return rows, references, warnings
 
 
 def _release_figure_runtime(figure_runtime: Any | None) -> None:
@@ -274,6 +298,7 @@ def _release_figure_runtime(figure_runtime: Any | None) -> None:
         if torch.cuda.is_available():
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
     except (ImportError, RuntimeError):
         pass
 
@@ -486,10 +511,9 @@ def generate_special_head_analysis(
     if int(examples_per_page) < 1:
         raise ValueError("examples_per_page must be positive")
 
-    models, warnings = _load_multiseed_models(canonical_root, dataset=spec.name, seeds=seeds)
-    rows: list[dict[str, Any]] = []
-    for model in models:
-        rows.extend({"seed": int(model.seed), **row} for row in head_metrics((model,)))
+    rows, model_references, warnings = _index_multiseed_models_streaming(
+        canonical_root, dataset=spec.name, seeds=seeds
+    )
     ablations = load_ablation_rows(Path(ablation_root), dataset=spec.name, seeds=seeds, strict=True)
     selected = select_special_heads_across_seeds(
         rows,
@@ -497,11 +521,10 @@ def generate_special_head_analysis(
         model_labels=spec.labels,
         generalist_max_abs_drel=generalist_max_abs_drel,
     )
-    models_by_key = {(model.task, int(model.seed)): model for model in models}
     for row in selected:
-        model = models_by_key[(str(row["task"]), int(row["seed"]))]
-        contract = model.score_metadata.get("contract", {})
-        row["score_path"] = str(model.score_path)
+        reference = model_references[(str(row["task"]), int(row["seed"]))]
+        contract = reference["score_contract"]
+        row["score_path"] = str(reference["score_path"])
         row["checkpoint_sha256"] = str(contract.get("checkpoint_sha256", ""))
     _write_csv(analysis_dir / "selected_heads.csv", selected)
     (analysis_dir / "selected_heads.json").write_text(
@@ -523,11 +546,15 @@ def generate_special_head_analysis(
             _release_figure_runtime(active_runtime.get("value"))
             active_runtime.clear()
         active_runtime["task"] = task
-        model = models_by_key[(task, seed)]
-        score_path = Path(model.score_path)
-        artifact_task = str(model.artifact_task)
+        reference = model_references[(task, seed)]
+        score_path = Path(str(reference["score_path"]))
+        artifact_task = str(reference["artifact_task"])
         artifact = load_canonical_score_artifact(score_path, expected_task=artifact_task)
-        model_path = model.model_path or score_path.parents[2] / "model.json"
+        model_path = (
+            Path(str(reference["model_path"]))
+            if reference["model_path"] is not None
+            else score_path.parents[2] / "model.json"
+        )
         model_record = load_canonical_model_record(model_path, artifact)
         # Isolated multi-seed workers write their exact protocol beside
         # model.json inside <task>/seed_<n>/, not at the shared corpus root.
@@ -724,8 +751,10 @@ def generate_special_head_analysis(
                     dpi=600,
                     pdf_dpi=1200,
                     supersede_stem_globs=(
-                        f"{task}_seed_*_{role}_L*_H*_attention_"
-                        f"{page_start + 1:02d}_{page_end:02d}.*",
+                        (
+                            f"{task}_seed_*_{role}_L*_H*_attention_"
+                            f"{page_start + 1:02d}_{page_end:02d}.*"
+                        ),
                     ),
                 )
                 plt.close(figure)
@@ -768,7 +797,7 @@ def generate_special_head_analysis(
                 }
             )
 
-            profiles = head_distance_profiles(model.score, head)
+            profiles = head_distance_profiles(artifact.value, head)
             figure = _plot_distance_profiles(
                 profiles,
                 display_title=identity["display_title"],
@@ -801,6 +830,26 @@ def generate_special_head_analysis(
                     **{key: str(value) for key, value in paths.items()},
                 }
             )
+        # Cached arrays and rendered figures can otherwise survive until the
+        # next checkpoint group in notebook runtimes.  Only the reusable model
+        # runtime is intentionally retained across seeds of one architecture.
+        del (
+            attention_compute,
+            pca_compute,
+            runtime,
+            attention_payload,
+            pca_payload,
+            display_attention,
+            artifact,
+        )
+        gc.collect()
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except (ImportError, RuntimeError):
+            pass
     _release_figure_runtime(active_runtime.get("value"))
     active_runtime.clear()
 
