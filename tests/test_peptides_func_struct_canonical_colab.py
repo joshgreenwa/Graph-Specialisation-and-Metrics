@@ -1,4 +1,4 @@
-"""Contracts for the two-lane Peptides canonical Colab controller."""
+"""Contracts for the six-lane Peptides canonical Colab controller."""
 
 from __future__ import annotations
 
@@ -53,7 +53,7 @@ def _corpus(tmp_path: Path) -> controller.PreparedCorpus:
     return controller.PreparedCorpus(tmp_path, tmp_path / controller.ARCHIVE_ROOT, records)
 
 
-def test_archive_identity_and_exact_two_lane_worker_grid():
+def test_archive_identity_and_exact_six_lane_worker_grid():
     assert controller.ARCHIVE_NAME == "peptides_func_struct_best_checkpoints.tar"
     assert controller.ARCHIVE_BYTES == 162_631_680
     assert (
@@ -71,6 +71,14 @@ def test_archive_identity_and_exact_two_lane_worker_grid():
     assert tuple(worker.index for worker in controller.DATASET_WORKERS["struct"]) == tuple(
         range(15, 30)
     )
+    lanes = tuple(controller.SEED_LANE_WORKERS.values())
+    assert len(lanes) == 6
+    assert all(len(lane) == 5 for lane in lanes)
+    assert {worker.index for lane in lanes for worker in lane} == set(range(30))
+    assert sum(len(lane) for lane in lanes) == 30
+    for (dataset, seed), lane in controller.SEED_LANE_WORKERS.items():
+        assert {worker.dataset for worker in lane} == {dataset}
+        assert {worker.seed for worker in lane} == {seed}
 
 
 def test_manifest_is_explicitly_mapped_and_rejects_non_best_checkpoint():
@@ -189,12 +197,25 @@ def test_subset_metric_verification_records_full_split_provenance(tmp_path: Path
 def test_frontend_rejects_cross_lane_stale_lock_reclaim(tmp_path: Path, monkeypatch):
     corpus = _corpus(tmp_path)
     config = controller.build_production_config(tmp_path, corpus, graphs_per_batch=2)
-    with pytest.raises(ValueError, match="not in the func lane"):
+    with pytest.raises(ValueError, match="not in the func/seed0 lane"):
         controller.run_dataset_queue(
             config,
             corpus,
             "func",
+            train_seed=0,
             reclaim_worker_index=20,
+        )
+
+
+def test_frontend_requires_a_valid_seed_before_preparing_the_corpus(tmp_path: Path):
+    with pytest.raises(ValueError, match="TRAIN_SEED is required"):
+        controller.run_frontend(mode="run", dataset="func", drive_folder=tmp_path)
+    with pytest.raises(ValueError, match="TRAIN_SEED must be 0, 1, or 2"):
+        controller.run_frontend(
+            mode="run",
+            dataset="func",
+            train_seed=3,
+            drive_folder=tmp_path,
         )
 
 

@@ -320,6 +320,7 @@ def test_numerical_audits_are_soft_by_default_and_strict_on_request():
 def test_graph_batch_executor_preserves_order_and_retries_without_double_consumption():
     consumed = []
     attempts = []
+    starts = []
 
     def execute(chunk):
         attempts.append(tuple(chunk))
@@ -333,6 +334,7 @@ def test_graph_batch_executor_preserves_order_and_retries_without_double_consump
         execute=execute,
         consume=consumed.extend,
         oom_backoff=True,
+        on_batch_start=lambda done, total, size: starts.append((done, total, size)),
     )
 
     assert consumed == [value * 10 for value in range(7)]
@@ -342,6 +344,13 @@ def test_graph_batch_executor_preserves_order_and_retries_without_double_consump
         (2, 3),
         (4, 5),
         (6,),
+    ]
+    assert starts == [
+        (0, 7, 4),
+        (0, 7, 2),
+        (2, 7, 2),
+        (4, 7, 2),
+        (6, 7, 1),
     ]
     assert report.requested_graphs_per_batch == 4
     assert report.minimum_graphs_per_batch == 1

@@ -105,6 +105,13 @@ DATASET_WORKERS = {
     dataset: tuple(worker for worker in WORKERS if worker.dataset == dataset)
     for dataset in ("func", "struct")
 }
+SEED_LANE_WORKERS = {
+    (dataset, seed): tuple(
+        worker for worker in WORKERS if worker.dataset == dataset and worker.seed == seed
+    )
+    for dataset in ("func", "struct")
+    for seed in TRAIN_SEEDS
+}
 
 
 @dataclass(frozen=True)
@@ -596,14 +603,24 @@ def run_dataset_queue(
     corpus: PreparedCorpus,
     dataset: str,
     *,
+    train_seed: int | None = None,
     reclaim_worker_index: int = -1,
 ) -> tuple[Mapping[str, Any], ...]:
-    workers = DATASET_WORKERS[dataset]
+    if dataset not in DATASET_WORKERS:
+        raise ValueError("DATASET must be 'func' or 'struct'")
+    if train_seed is not None and int(train_seed) not in TRAIN_SEEDS:
+        raise ValueError("TRAIN_SEED must be 0, 1, or 2")
+    workers = (
+        DATASET_WORKERS[dataset]
+        if train_seed is None
+        else SEED_LANE_WORKERS[(dataset, int(train_seed))]
+    )
     selected_indices = {worker.index for worker in workers}
     reclaim_worker_index = int(reclaim_worker_index)
     if reclaim_worker_index >= 0 and reclaim_worker_index not in selected_indices:
         raise ValueError(
-            f"RECLAIM_WORKER_INDEX={reclaim_worker_index} is not in the {dataset} lane"
+            f"RECLAIM_WORKER_INDEX={reclaim_worker_index} is not in the "
+            f"{dataset}/seed{train_seed} lane"
         )
     results = []
     for position, worker in enumerate(workers, start=1):
@@ -682,14 +699,32 @@ def completion_status(drive_folder: Path) -> list[dict[str, Any]]:
     return rows
 
 
-def _print_status(rows: Sequence[Mapping[str, Any]]) -> None:
-    for dataset in ("func", "struct"):
-        selected = [row for row in rows if row["dataset"] == dataset]
+def _print_status(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    dataset: str | None = None,
+    train_seed: int | None = None,
+) -> None:
+    for loop_dataset in ("func", "struct"):
+        selected = [row for row in rows if row["dataset"] == loop_dataset]
         complete = sum(bool(row["complete"]) for row in selected)
         scores = sum(bool(row["scores"]) for row in selected)
         carriage = sum(bool(row["carriage"]) for row in selected)
         print(
-            f"[status:{dataset}] complete={complete}/15 scores={scores}/15 carriage={carriage}/15",
+            f"[status:{loop_dataset}] complete={complete}/15 scores={scores}/15 "
+            f"carriage={carriage}/15",
+            flush=True,
+        )
+    if dataset is not None and train_seed is not None:
+        selected = [
+            row for row in rows if row["dataset"] == dataset and int(row["seed"]) == int(train_seed)
+        ]
+        complete = sum(bool(row["complete"]) for row in selected)
+        scores = sum(bool(row["scores"]) for row in selected)
+        carriage = sum(bool(row["carriage"]) for row in selected)
+        print(
+            f"[status:{dataset}:seed{train_seed}] complete={complete}/5 "
+            f"scores={scores}/5 carriage={carriage}/5",
             flush=True,
         )
 
@@ -698,6 +733,7 @@ def run_frontend(
     *,
     mode: str,
     dataset: str,
+    train_seed: int | None = None,
     drive_folder: str | Path = DEFAULT_DRIVE_FOLDER,
     graphs_per_batch: int | None = None,
     accelerator: str = "cuda:0",
@@ -705,19 +741,25 @@ def run_frontend(
     reclaim_setup_lock: bool = False,
     reclaim_worker_index: int = -1,
 ) -> Any:
-    """Run one complete dataset lane, status, setup, or finalization from Colab."""
+    """Run one five-checkpoint dataset/seed lane, status, setup, or finalization."""
 
     mode = str(mode).strip().lower()
     dataset = str(dataset).strip().lower()
     if dataset not in DATASET_WORKERS:
         raise ValueError("DATASET must be 'func' or 'struct'")
+    if train_seed is not None:
+        train_seed = int(train_seed)
+        if train_seed not in TRAIN_SEEDS:
+            raise ValueError("TRAIN_SEED must be 0, 1, or 2")
     drive_folder = Path(drive_folder)
     if mode == "status":
         rows = completion_status(drive_folder)
-        _print_status(rows)
+        _print_status(rows, dataset=dataset, train_seed=train_seed)
         return rows
     if mode not in {"setup", "run", "finalize"}:
         raise ValueError("MODE must be setup, run, status, or finalize")
+    if mode == "run" and train_seed is None:
+        raise ValueError("TRAIN_SEED is required in run mode; use one of 0, 1, or 2")
 
     corpus = ensure_prepared_corpus(
         drive_folder,
@@ -738,13 +780,17 @@ def run_frontend(
         from graph_specialisation_metrics.methodology.runner import finalize_measurement_run
 
         result = finalize_measurement_run(config)
-        _print_status(completion_status(drive_folder))
+        _print_status(
+            completion_status(drive_folder),
+            dataset=dataset,
+            train_seed=train_seed,
+        )
         return result
 
     ensure_runtime_dependencies()
     gpu = require_requested_accelerator(config.accelerator)
     print(
-        f"[run] dataset={dataset} workers=15 graphs_per_batch="
+        f"[run] dataset={dataset} train_seed={train_seed} workers=5 graphs_per_batch="
         f"{config.execution.graphs_per_batch} gpu={gpu.get('device_name', accelerator)}",
         flush=True,
     )
@@ -752,7 +798,12 @@ def run_frontend(
         config,
         corpus,
         dataset,
+        train_seed=train_seed,
         reclaim_worker_index=reclaim_worker_index,
     )
-    _print_status(completion_status(drive_folder))
+    _print_status(
+        completion_status(drive_folder),
+        dataset=dataset,
+        train_seed=train_seed,
+    )
     return results

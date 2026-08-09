@@ -1147,13 +1147,23 @@ def _prepare_clean_jacobians(
         else min(requested_batch, max(1, int(backend_limit)))
     )
 
+    def on_batch_start(completed, total, batch_size):
+        if prepared.progress is not None:
+            prepared.progress.emit(
+                "clean_jacobian_batch_start",
+                completed_graphs=int(cache_hits + completed),
+                total_graphs=int(cache_hits + total),
+                batch_graphs=int(batch_size),
+                cache_hits=int(cache_hits),
+            )
+
     def on_batch(completed, total, batch_size):
         if prepared.progress is not None:
             prepared.progress.emit(
                 "clean_jacobian_progress",
-                completed=int(completed),
-                total=int(total),
-                batch_size=int(batch_size),
+                completed_graphs=int(cache_hits + completed),
+                total_graphs=int(cache_hits + total),
+                batch_graphs=int(batch_size),
                 cache_hits=int(cache_hits),
             )
 
@@ -1163,6 +1173,7 @@ def _prepare_clean_jacobians(
         execute=execute,
         consume=consume,
         oom_backoff=config.execution.oom_backoff,
+        on_batch_start=on_batch_start,
         on_batch=on_batch,
     )
     execution = dataclasses.asdict(report)
@@ -1208,6 +1219,27 @@ def _progress_batch_callback(
         if prepared.progress is not None:
             prepared.progress.emit(
                 "batch_complete",
+                phase=phase,
+                channel=channel,
+                completed_graphs=int(cached + done),
+                total_graphs=int(cached + total),
+                batch_graphs=int(size),
+            )
+
+    return report
+
+
+def _progress_batch_start_callback(
+    prepared: PreparedTask,
+    *,
+    phase: str,
+    channel: str,
+    cached: int = 0,
+):
+    def report(done: int, total: int, size: int) -> None:
+        if prepared.progress is not None:
+            prepared.progress.emit(
+                "batch_start",
                 phase=phase,
                 channel=channel,
                 completed_graphs=int(cached + done),
@@ -1561,6 +1593,12 @@ def run_scores(
                 prepared, config, plan, int(graph_id), channel
             ),
             max_cost=config.execution.replica_pair_budget,
+            on_batch_start=_progress_batch_start_callback(
+                prepared,
+                phase="scores",
+                channel=channel,
+                cached=len(cached_graphs[channel]),
+            ),
             on_batch=_progress_batch_callback(
                 prepared,
                 phase="scores",
@@ -2194,6 +2232,12 @@ def run_carriage(
                 prepared, config, plan, int(graph_id), channel
             ),
             max_cost=config.execution.replica_pair_budget,
+            on_batch_start=_progress_batch_start_callback(
+                prepared,
+                phase="carriage",
+                channel=channel,
+                cached=len(cached_graphs[channel]),
+            ),
             on_batch=_progress_batch_callback(
                 prepared,
                 phase="carriage",

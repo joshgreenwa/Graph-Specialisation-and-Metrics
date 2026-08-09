@@ -43,6 +43,7 @@ def execute_graph_batches(
     oom_backoff: bool,
     item_cost: Callable[[Any], int] | None = None,
     max_cost: int | None = None,
+    on_batch_start: Callable[[int, int, int], None] | None = None,
     on_batch: Callable[[int, int, int], None] | None = None,
 ) -> BatchExecutionReport:
     """Execute ordered graph groups, halving only the failing batch on CUDA OOM.
@@ -63,12 +64,13 @@ def execute_graph_batches(
         size = min(adaptive_limit, len(values) - cursor)
         if item_cost is not None and max_cost is not None:
             while size > 1 and sum(
-                max(1, int(item_cost(value)))
-                for value in values[cursor : cursor + size]
+                max(1, int(item_cost(value))) for value in values[cursor : cursor + size]
             ) > int(max_cost):
                 size -= 1
         while True:
             chunk = values[cursor : cursor + size]
+            if on_batch_start is not None:
+                on_batch_start(cursor, len(values), size)
             try:
                 result = execute(chunk)
             except RuntimeError as error:
