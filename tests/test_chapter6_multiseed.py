@@ -23,6 +23,7 @@ from graph_specialisation_metrics.chapter6_clean_ablation import (
     summary_path as ablation_summary_path,
 )
 from graph_specialisation_metrics.chapter6_multiseed import (
+    _joint_normalised_response_rows,
     _observed_response_distance_labels,
     alignment_summary_rows,
     cache_inventory,
@@ -302,6 +303,37 @@ def test_response_distance_labels_omit_globally_empty_shells():
         },
     ]
     assert _observed_response_distance_labels(rows, variant="raw") == ["0", "virtual"]
+
+
+def test_response_normalisation_uses_one_denominator_for_both_channels():
+    raw_rows = [
+        {
+            "task": "model",
+            "channel": "semantic",
+            "variant": "raw",
+            "distance": "0",
+            "seeds": 3,
+            "response_mean": 2.0,
+            "response_min": 1.0,
+            "response_max": 3.0,
+        },
+        {
+            "task": "model",
+            "channel": "structural",
+            "variant": "raw",
+            "distance": "0",
+            "seeds": 3,
+            "response_mean": 1.0,
+            "response_min": 0.5,
+            "response_max": 1.5,
+        },
+    ]
+    rows = _joint_normalised_response_rows(raw_rows)
+    assert sum(float(row["response_mean"]) for row in rows) == pytest.approx(1.0)
+    semantic = next(row for row in rows if row["channel"] == "semantic")
+    structural = next(row for row in rows if row["channel"] == "structural")
+    assert semantic["response_mean"] == pytest.approx(2.0 / 3.0)
+    assert structural["response_mean"] == pytest.approx(1.0 / 3.0)
 
 
 def test_clean_ablation_summary_inventory_and_loading(tmp_path):

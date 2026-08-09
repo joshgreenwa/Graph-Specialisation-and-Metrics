@@ -33,7 +33,7 @@ from .zinc_cached_rrwp_comparison import DISPLAY_BINS
 ANALYSIS_VERSION = "chapter6-molecular-multiseed-v5"
 DISTANCE_ALIGNMENT_VERSION = "all-finite-heads-v1"
 SPECIALISATION_LANDSCAPE_VARIANT_VERSION = "j-drel-only-v1"
-PRESENTATION_VARIANTS_VERSION = "seed-mean-reach-and-overlaid-response-v1"
+PRESENTATION_VARIANTS_VERSION = "seed-mean-reach-and-joint-response-v2"
 SEEDS = (0, 1, 2)
 CHANNELS = ("semantic", "structural")
 
@@ -840,7 +840,7 @@ def matched_strength_profile_rows(models: Sequence[SpatialModel]) -> list[dict[s
 
 
 def carriage_response_variant_rows(models: Sequence[SpatialModel]) -> list[dict[str, Any]]:
-    """Return profile-shape and raw-magnitude versions of final-state response."""
+    """Return raw and jointly normalised final-state response profiles."""
 
     per_seed: list[dict[str, Any]] = []
     for model in models:
@@ -850,26 +850,17 @@ def carriage_response_variant_rows(models: Sequence[SpatialModel]) -> list[dict[
             labels, raw_values = raw_carriage_strength_profile(
                 model.carriage, channel, normalise=False
             )
-            normalised_values = np.asarray(raw_values, dtype=np.float64).copy()
-            finite = np.isfinite(normalised_values) & (normalised_values >= 0.0)
-            total = float(np.sum(normalised_values[finite])) if np.any(finite) else 0.0
-            if total > 1.0e-12:
-                normalised_values[finite] /= total
-            for variant, values in (
-                ("normalised", normalised_values),
-                ("raw", raw_values),
-            ):
-                for label, value in zip(labels, values):
-                    per_seed.append(
-                        {
-                            "task": model.task,
-                            "seed": int(model.seed),
-                            "channel": channel,
-                            "variant": variant,
-                            "distance": label,
-                            "value": float(value),
-                        }
-                    )
+            for label, value in zip(labels, raw_values):
+                per_seed.append(
+                    {
+                        "task": model.task,
+                        "seed": int(model.seed),
+                        "channel": channel,
+                        "variant": "raw",
+                        "distance": label,
+                        "value": float(value),
+                    }
+                )
     groups: dict[tuple[str, str, str, str], list[float]] = {}
     for row in per_seed:
         groups.setdefault(
@@ -896,6 +887,42 @@ def carriage_response_variant_rows(models: Sequence[SpatialModel]) -> list[dict[
                 "response_max": high,
             }
         )
+    return output + _joint_normalised_response_rows(output)
+
+
+def _joint_normalised_response_rows(
+    rows: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Normalise each architecture with one denominator shared by both channels."""
+
+    raw_rows = [row for row in rows if str(row.get("variant")) == "raw"]
+    denominators: dict[str, float] = {}
+    for task in {str(row["task"]) for row in raw_rows}:
+        values = np.asarray(
+            [
+                float(row.get("response_mean", np.nan))
+                for row in raw_rows
+                if str(row["task"]) == task
+            ],
+            dtype=np.float64,
+        )
+        finite = np.isfinite(values) & (values >= 0.0)
+        denominators[task] = float(np.sum(values[finite])) if np.any(finite) else 0.0
+
+    output: list[dict[str, Any]] = []
+    for row in raw_rows:
+        task = str(row["task"])
+        denominator = denominators.get(task, 0.0)
+        normalised = dict(row)
+        normalised["variant"] = "normalised"
+        for field in ("response_mean", "response_min", "response_max"):
+            value = float(row.get(field, np.nan))
+            normalised[field] = (
+                value / denominator
+                if denominator > 1.0e-12 and np.isfinite(value)
+                else float("nan")
+            )
+        output.append(normalised)
     return output
 
 
@@ -2130,6 +2157,18 @@ def refresh_presentation_variants(
     if not response_rows:
         raise ValueError(f"saved final-state response table is empty: {response_table}")
 
+    # Older saved tables normalised semantic and structural profiles separately.
+    # Rebuild the presentation rows from their retained raw summaries so the two
+    # channels share one architecture-level denominator; no scientific cache is
+    # needed for this migration.
+    raw_response_rows = [
+        row for row in response_rows if str(row.get("variant")) == "raw"
+    ]
+    response_rows = raw_response_rows + _joint_normalised_response_rows(
+        raw_response_rows
+    )
+    _write_csv(response_table, response_rows)
+
     spec = dataset_spec(dataset)
     figures_dir = output_dir / "figures"
     figures: list[Path] = []
@@ -2188,8 +2227,9 @@ def refresh_presentation_variants(
         "a model-level visual summary, not cross-seed head matching"
     )
     interpretation["overlaid_final_state_response"] = (
-        "architecture means with the observed seed range; globally empty distance "
-        "categories are omitted"
+        "architecture means with the observed seed range; the normalised variant "
+        "uses one denominator shared by semantic and structural channels, and "
+        "globally empty distance categories are omitted"
     )
     manifest["interpretation"] = interpretation
     manifest_path.write_text(
@@ -2503,7 +2543,8 @@ def run(
             ),
             "response_variants": (
                 "graph-balanced mean absolute response per eligible carrier within each shell, "
-                "shown both in raw output units and after within-channel profile normalisation"
+                "shown both in raw output units and after joint semantic--structural "
+                "normalisation within each architecture"
             ),
             "head_ablation": (
                 "clean single-head ablation prediction movement on 64 held-out graphs; "
@@ -2511,8 +2552,9 @@ def run(
             ),
             "final_state_response": "learned response, not task necessity",
             "overlaid_final_state_response": (
-                "architecture means with the observed seed range; globally empty distance "
-                "categories are omitted"
+                "architecture means with the observed seed range; the normalised variant "
+                "uses one denominator shared by semantic and structural channels, and "
+                "globally empty distance categories are omitted"
             ),
         },
     }
