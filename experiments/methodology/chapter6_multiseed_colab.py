@@ -39,6 +39,9 @@ SECRET_NAME = "dissertation_key"  # Optional for a public repository.
 # Run one Colab with "zinc" and another with "qm9". Their outputs never overlap.
 # The environment override is used by the small .ipynb launcher beside this file.
 DATASET = os.environ.get("CHAPTER6_DATASET", "zinc").strip().lower()
+FIGURE_REFRESH_ONLY = os.environ.get(
+    "CHAPTER6_FIGURE_REFRESH_ONLY", "0"
+).strip().lower() in {"1", "true", "yes"}
 SEEDS = (0, 1, 2)
 STRICT_CACHE_INVENTORY = True
 COMPUTE_MISSING_ABLATIONS = True
@@ -195,7 +198,13 @@ from graph_specialisation_metrics.chapter6_clean_ablation import (
 
 
 missing_ablations = missing_ablation_runs(ABLATION_ROOT, dataset=DATASET, seeds=SEEDS)
-if missing_ablations:
+if missing_ablations and FIGURE_REFRESH_ONLY:
+    print(
+        f"[figure-refresh] ignoring {len(missing_ablations)} missing ablation run(s); "
+        "no model-dependent work is permitted",
+        flush=True,
+    )
+elif missing_ablations:
     if not COMPUTE_MISSING_ABLATIONS:
         detail = ", ".join(f"{task}/seed_{seed}" for task, seed in missing_ablations)
         raise FileNotFoundError(f"missing clean-head ablation summaries: {detail}")
@@ -228,12 +237,13 @@ if missing_ablations:
         verbose=True,
     )
     del corpus, methodology_config
-ablation_completion = finalize_clean_ablations(
-    ABLATION_ROOT,
-    dataset=DATASET,
-    seeds=SEEDS,
-)
-print(f"[ablation] persistent completion manifest: {ablation_completion}", flush=True)
+if not FIGURE_REFRESH_ONLY:
+    ablation_completion = finalize_clean_ablations(
+        ABLATION_ROOT,
+        dataset=DATASET,
+        seeds=SEEDS,
+    )
+    print(f"[ablation] persistent completion manifest: {ablation_completion}", flush=True)
 release_memory("after-ablation")
 
 
@@ -250,7 +260,13 @@ if DATASET == "zinc":
     missing_trajectory_architectures = missing_trajectory_architectures_from_cache(
         TRAJECTORY_ROOT
     )
-    if missing_trajectory_architectures:
+    if missing_trajectory_architectures and FIGURE_REFRESH_ONLY:
+        print(
+            "[figure-refresh] ignoring missing ZINC trajectory caches; "
+            "no model-dependent work is permitted",
+            flush=True,
+        )
+    elif missing_trajectory_architectures:
         if not COMPUTE_MISSING_TRAJECTORY_SCORES:
             detail = ", ".join(
                 str(row["score_path"])
@@ -301,6 +317,7 @@ print(
     f"\n[scope] Dataset: {DATASET.upper()}\n"
     f"[scope] Seeds: {SEEDS}\n"
     "[scope] Five models: 1-hop, 1-hop + VNode, 2-hop, 2-hop + VNode, dense.\n"
+    f"[scope] Figure-refresh-only mode: {FIGURE_REFRESH_ONLY}.\n"
     "[scope] Scores/carriage are cache-only; missing ablations and ZINC trajectory "
     "scores resume or compute once.\n"
     "[scope] Head identities are never matched or averaged across seeds.\n"
@@ -332,7 +349,23 @@ if DATASET == "zinc":
 
 core_manifest_path = OUTPUT_DIR / "manifest.json"
 manifest = None
-if REUSE_COMPLETE_CORE_ANALYSIS and core_manifest_path.is_file():
+if FIGURE_REFRESH_ONLY:
+    head_table = OUTPUT_DIR / "head_metrics.csv"
+    if not head_table.is_file():
+        raise FileNotFoundError(
+            "CPU figure-refresh mode requires the existing saved head table: "
+            f"{head_table}"
+        )
+    if core_manifest_path.is_file():
+        manifest = json.loads(core_manifest_path.read_text(encoding="utf-8"))
+    else:
+        manifest = {}
+    print(
+        "[figure-refresh] using saved head_metrics.csv; GPU workers, scientific "
+        "caches, ablations, trajectories, and special-head analysis are disabled",
+        flush=True,
+    )
+elif REUSE_COMPLETE_CORE_ANALYSIS and core_manifest_path.is_file():
     try:
         candidate = json.loads(core_manifest_path.read_text(encoding="utf-8"))
         referenced_files = [
@@ -390,7 +423,7 @@ if (
 release_memory("after-core-figures")
 
 special_head_manifest = None
-if GENERATE_SPECIAL_HEAD_ANALYSIS:
+if GENERATE_SPECIAL_HEAD_ANALYSIS and not FIGURE_REFRESH_ONLY:
     # Attention and routed-output PCA are the only Chapter 6 multi-seed figures
     # that require model reconstruction. Contract caches make subsequent runs
     # checkpoint-free unless the requested heads or analysis settings change.
