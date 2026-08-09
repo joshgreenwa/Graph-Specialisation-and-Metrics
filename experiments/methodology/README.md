@@ -26,24 +26,27 @@ that miss; read-only downstream artifact loaders continue to reject incompatible
 
 ## Peptides-func and Peptides-struct multi-seed corpus
 
-The 30-checkpoint Peptides corpus has two A100 Colab lanes:
+The 30-checkpoint Peptides corpus has six A100 Colab lanes, one per dataset and training seed:
 
-- [`peptides_func_canonical_colab.ipynb`](peptides_func_canonical_colab.ipynb): all 15
-  Peptides-func architecture/seed workers;
-- [`peptides_struct_canonical_colab.ipynb`](peptides_struct_canonical_colab.ipynb): all 15
-  Peptides-struct architecture/seed workers.
+- [`peptides_func_seed0_canonical_colab.ipynb`](peptides_func_seed0_canonical_colab.ipynb)
+- [`peptides_func_seed1_canonical_colab.ipynb`](peptides_func_seed1_canonical_colab.ipynb)
+- [`peptides_func_seed2_canonical_colab.ipynb`](peptides_func_seed2_canonical_colab.ipynb)
+- [`peptides_struct_seed0_canonical_colab.ipynb`](peptides_struct_seed0_canonical_colab.ipynb)
+- [`peptides_struct_seed1_canonical_colab.ipynb`](peptides_struct_seed1_canonical_colab.ipynb)
+- [`peptides_struct_seed2_canonical_colab.ipynb`](peptides_struct_seed2_canonical_colab.ipynb)
 
-Both notebooks require the Colab secret `dissertation_key`. They authenticate through an
+All six notebooks require the Colab secret `dissertation_key`. They authenticate through an
 ephemeral HTTP header, clone the explicit `expansion/carriage_experiments` branch, verify that the
 pinned controller revision belongs to that branch, and persist only the public GitHub URL.
 
 Place `peptides_func_struct_best_checkpoints.tar` and its `.sha256` companion directly in
-`multi_seed_models/peptides_func_struct_checkpoints/`. Open both notebooks in separate A100 80GB
+`multi_seed_models/peptides_func_struct_checkpoints/`. Open the six notebooks in separate A100
 high-RAM runtimes and run all cells with `MODE="run"`. Corpus setup is automatic and locked: if
-both notebooks start together, one extracts while the other waits. Each lane runs dense, 1-hop,
-1-hop+VNode, 2-hop, and 2-hop+VNode for seeds 0, 1, and 2 sequentially. Both lanes retain the same
-complete 30-worker protocol fingerprint. A100-80 starts at 16 graph groups with exact CUDA OOM
-backoff, and completed score/carriage/model state is released between components and checkpoints.
+several notebooks start together, one extracts while the others wait. Each lane runs dense,
+1-hop, 1-hop+VNode, 2-hop, and 2-hop+VNode for one seed sequentially. All six lanes retain the same
+complete 30-worker protocol fingerprint. A100-80 starts at 32 graph groups and A100-40 at 16, with
+exact CUDA OOM backoff. Batch-start and batch-completion records expose live completed/total graph
+counts, and completed score/carriage/model state is released between components and checkpoints.
 Only the 2,000 donor graphs, 136 held-out analysis graphs, and 136 validation graphs needed for
 finite metric verification are materialised with RRWP in each runtime. Recomputed metrics on this
 analysis subset are retained as finite-forward checks; their full-model abort threshold is disabled
@@ -52,9 +55,9 @@ finite-forward checks remain. The archive's separately recorded full-split valid
 remain the checkpoint-selection provenance and are not incorrectly compared to subset metrics.
 
 Rerunning a lane freshly validates and skips completed workers, while partial per-graph shards
-resume. When both notebooks report 15/15 complete, set `MODE="finalize"` in either notebook and
-rerun its last cell to write the model-free population indexes and summaries. Exact Drive paths are
-listed in [`DRIVE_ARTIFACT_MAP.md`](DRIVE_ARTIFACT_MAP.md).
+resume. When all six notebooks report 5/5 complete, set `MODE="finalize"` in any one notebook and
+rerun its last cell to write the model-free population indexes and summaries. Exact Drive paths
+are listed in [`DRIVE_ARTIFACT_MAP.md`](DRIVE_ARTIFACT_MAP.md).
 
 ## ZINC checkpoint trajectory
 

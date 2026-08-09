@@ -14,12 +14,12 @@ from graph_specialisation_metrics.carriage.tasks import get_task as get_grit_tas
 from graph_specialisation_metrics.methodology.tasks import get_task
 
 NOTEBOOKS = {
-    "func": Path(__file__).parents[1]
-    / "experiments/methodology/peptides_func_canonical_colab.ipynb",
-    "struct": Path(__file__).parents[1]
-    / "experiments/methodology/peptides_struct_canonical_colab.ipynb",
+    (dataset, seed): Path(__file__).parents[1]
+    / f"experiments/methodology/peptides_{dataset}_seed{seed}_canonical_colab.ipynb"
+    for dataset in ("func", "struct")
+    for seed in range(3)
 }
-PINNED_REVISION = "296b39b044c7b08f358ff44f178865b43422ad61"
+PINNED_REVISION = "5c3ec0d628490337fac5289029c45ef9d7ca4b3e"
 PINNED_BRANCH = "expansion/carriage_experiments"
 
 
@@ -115,9 +115,10 @@ def test_all_unified_peptides_tasks_replay_expected_geometry_and_support():
         assert grit.config_path.endswith("-GRIT-RRWP-custom.yaml")
 
 
-def test_complete_config_is_shared_by_both_lanes_and_is_a100_optimised(tmp_path: Path):
+def test_complete_config_is_shared_by_all_lanes_and_is_a100_optimised(tmp_path: Path):
     corpus = _corpus(tmp_path)
     config = controller.build_production_config(tmp_path, corpus, graphs_per_batch=16)
+    larger_batch = controller.build_production_config(tmp_path, corpus, graphs_per_batch=32)
 
     assert config.tasks == controller.TASKS
     assert config.train_seeds == (0, 1, 2)
@@ -131,6 +132,7 @@ def test_complete_config_is_shared_by_both_lanes_and_is_a100_optimised(tmp_path:
     assert config.execution.oom_backoff is True
     assert config.execution.jacobian_output_chunk == 11
     assert config.num_threads == 8
+    assert larger_batch.fingerprint == config.fingerprint
     for task in controller.TASKS:
         override = config.task_overrides[task]
         dataset = "func" if task.startswith("peptides_func_") else "struct"
@@ -260,8 +262,9 @@ def test_worker_record_is_json_serializable():
 
 
 @pytest.mark.parametrize("dataset", ["func", "struct"])
-def test_checked_in_notebooks_are_a100_ready_pinned_dataset_lanes(dataset: str):
-    payload = json.loads(NOTEBOOKS[dataset].read_text(encoding="utf-8"))
+@pytest.mark.parametrize("seed", [0, 1, 2])
+def test_checked_in_notebooks_are_a100_ready_pinned_seed_lanes(dataset: str, seed: int):
+    payload = json.loads(NOTEBOOKS[dataset, seed].read_text(encoding="utf-8"))
     code_cells = [
         "".join(cell.get("source", []))
         for cell in payload["cells"]
@@ -274,6 +277,7 @@ def test_checked_in_notebooks_are_a100_ready_pinned_dataset_lanes(dataset: str):
     assert payload["metadata"]["colab"]["gpuType"] == "A100"
     assert 'MODE = "run"' in source
     assert f'DATASET = "{dataset}"' in source
+    assert f"TRAIN_SEED = {seed}" in source
     assert f'REPO_BRANCH = "{PINNED_BRANCH}"' in source
     assert f'REPO_REVISION = "{PINNED_REVISION}"' in source
     assert 'GITHUB_SECRET = "dissertation_key"' in source
@@ -301,8 +305,16 @@ def test_checked_in_notebooks_are_a100_ready_pinned_dataset_lanes(dataset: str):
     assert "name == 'graph_specialisation_metrics'" in source
     assert "controller_path.is_relative_to(repo.resolve())" in source
     assert "run_frontend(" in source
+    assert "train_seed=TRAIN_SEED" in source
     assert "graphs_per_batch=GRAPHS_PER_BATCH or None" in source
     assert "reclaim_setup_lock=RECLAIM_SETUP_LOCK" in source
     assert "vars(methodology_package).pop('peptides_func_struct_canonical_colab'" in source
     for index, cell in enumerate(code_cells):
-        compile(cell, f"{dataset}-cell-{index}", "exec")
+        compile(cell, f"{dataset}-seed{seed}-cell-{index}", "exec")
+
+
+def test_exactly_six_seed_lane_notebooks_are_checked_in():
+    notebook_root = Path(__file__).parents[1] / "experiments/methodology"
+    assert set(notebook_root.glob("peptides_*_seed?_canonical_colab.ipynb")) == set(
+        NOTEBOOKS.values()
+    )
