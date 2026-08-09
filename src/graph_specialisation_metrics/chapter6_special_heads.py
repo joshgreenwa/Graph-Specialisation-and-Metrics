@@ -46,7 +46,7 @@ from .methodology.grit_figure_plots import (
 )
 from .zinc_cached_rrwp_comparison import group_distance
 
-ANALYSIS_VERSION = "chapter6-special-heads-v1"
+ANALYSIS_VERSION = "chapter6-special-heads-v2-all-heads"
 ROLE_ORDER = ("semantic", "structural", "highest_joint")
 ROLE_LABELS = {
     "semantic": "Most semantic head",
@@ -86,7 +86,7 @@ def _normalise_profile(values: Any) -> np.ndarray:
 
 
 def head_distance_profiles(scores: Mapping[str, Any], head: tuple[int, int]) -> dict[str, Any]:
-    """Return separately normalised semantic, structural, and attention profiles."""
+    """Return separate semantic, structural, and attention profile masses."""
 
     layer, index = int(head[0]), int(head[1])
     axis = tuple(scores["axis"])
@@ -125,7 +125,7 @@ def select_special_heads_across_seeds(
     model_labels: Mapping[str, str],
     generalist_max_abs_drel: float = 0.10,
 ) -> list[dict[str, Any]]:
-    """Select three distinct active heads per architecture across all seeds."""
+    """Select three distinct heads per architecture across all finite heads."""
 
     ablations = {
         (
@@ -139,8 +139,7 @@ def select_special_heads_across_seeds(
     by_task: dict[str, list[Mapping[str, Any]]] = {}
     for row in head_rows:
         if (
-            str(row.get("family")) == "inactive"
-            or not np.isfinite(float(row.get("selectivity", np.nan)))
+            not np.isfinite(float(row.get("selectivity", np.nan)))
             or not np.isfinite(float(row.get("joint_sensitivity", np.nan)))
         ):
             continue
@@ -150,7 +149,7 @@ def select_special_heads_across_seeds(
     for task in model_labels:
         candidates = by_task.get(task, [])
         if len(candidates) < 3:
-            raise ValueError(f"{task}: fewer than three active heads are available")
+            raise ValueError(f"{task}: fewer than three finite heads are available")
 
         def identity(row: Mapping[str, Any]) -> tuple[int, int, int]:
             return int(row["seed"]), int(row["layer"]), int(row["head"])
@@ -314,7 +313,7 @@ def _plot_distance_profiles(
         )
     ax.set_xticks(x, [label.replace("_", " ") for label in labels])
     ax.set_xlabel("Graph distance")
-    ax.set_ylabel("Normalised mass")
+    ax.set_ylabel("Profile mass")
     ax.set_ylim(bottom=0)
     ax.set_title(
         f"{display_title} — {role_label} — L{head[0]} H{head[1]}\n"
@@ -722,8 +721,12 @@ def generate_special_head_analysis(
                             render_graph_indices[page_start:page_end]
                         ),
                     },
-                    dpi=300,
-                    pdf_dpi=600,
+                    dpi=600,
+                    pdf_dpi=1200,
+                    supersede_stem_globs=(
+                        f"{task}_seed_*_{role}_L*_H*_attention_"
+                        f"{page_start + 1:02d}_{page_end:02d}.*",
+                    ),
                 )
                 plt.close(figure)
                 outputs.append(
@@ -750,6 +753,9 @@ def generate_special_head_analysis(
                 figures_dir,
                 f"{stem_prefix}_routed_output_pca",
                 metadata={**metadata, "figure": "routed_output_pca"},
+                supersede_stem_globs=(
+                    f"{task}_seed_*_{role}_L*_H*_routed_output_pca.*",
+                ),
             )
             plt.close(figure)
             outputs.append(
@@ -781,6 +787,9 @@ def generate_special_head_analysis(
                     "figure": "distance_profiles",
                     "distance_labels": list(profiles["labels"]),
                 },
+                supersede_stem_globs=(
+                    f"{task}_seed_*_{role}_L*_H*_distance_profiles.*",
+                ),
             )
             plt.close(figure)
             outputs.append(
@@ -814,8 +823,8 @@ def generate_special_head_analysis(
         "n_pca_graphs": int(n_pca_graphs),
         "examples_per_page": int(examples_per_page),
         "selection_rule": {
-            "semantic": "maximum active D_rel across seeds; ties prefer larger J",
-            "structural": "minimum active D_rel across seeds; ties prefer larger J",
+            "semantic": "maximum finite D_rel across all heads and seeds; ties prefer larger J",
+            "structural": "minimum finite D_rel across all heads and seeds; ties prefer larger J",
             "highest_joint": "largest J not already selected",
             "generalist_colour_bound": float(generalist_max_abs_drel),
         },

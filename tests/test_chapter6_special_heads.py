@@ -44,7 +44,7 @@ def test_cross_seed_selection_is_distinct_and_joins_ablation():
         _head_row(1, 1, 1, -0.7, 1.1),
         _head_row(2, 2, 2, 0.03, 2.5),
         _head_row(0, 3, 3, 0.2, 1.4),
-        _head_row(1, 4, 4, 0.9, 9.0, family="inactive"),
+        _head_row(1, 4, 4, 0.9, 0.05, family="inactive"),
     ]
     ablations = [
         {
@@ -70,7 +70,7 @@ def test_cross_seed_selection_is_distinct_and_joins_ablation():
         "highest_joint",
     ]
     assert [(row["seed"], row["layer"], row["head"]) for row in selected] == [
-        (0, 0, 0),
+        (1, 4, 4),
         (1, 1, 1),
         (2, 2, 2),
     ]

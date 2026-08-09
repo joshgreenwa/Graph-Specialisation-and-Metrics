@@ -28,7 +28,7 @@ from .chapter6_spatial_explorer import (
 from .methodology.bootstrap import trimmed_mean
 from .zinc_cached_rrwp_comparison import DISPLAY_BINS
 
-ANALYSIS_VERSION = "chapter6-molecular-multiseed-v3"
+ANALYSIS_VERSION = "chapter6-molecular-multiseed-v4"
 SEEDS = (0, 1, 2)
 CHANNELS = ("semantic", "structural")
 
@@ -97,12 +97,70 @@ def _write_csv(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
 
 
 def _save_figure(figure: Any, figures_dir: Path, stem: str) -> list[Path]:
+    import matplotlib as mpl
+    import matplotlib.pyplot as plt
+
     figures_dir.mkdir(parents=True, exist_ok=True)
     png = figures_dir / f"{stem}.png"
     pdf = figures_dir / f"{stem}.pdf"
-    figure.savefig(png, dpi=240, bbox_inches="tight")
-    figure.savefig(pdf, bbox_inches="tight")
+    metadata = {"Creator": "graph_specialisation_metrics", "Title": stem}
+    with mpl.rc_context({"pdf.fonttype": 42, "ps.fonttype": 42}):
+        figure.savefig(
+            png,
+            dpi=400,
+            bbox_inches="tight",
+            pad_inches=0.04,
+            facecolor="white",
+        )
+        figure.savefig(
+            pdf,
+            dpi=1200,
+            bbox_inches="tight",
+            pad_inches=0.04,
+            facecolor="white",
+            metadata=metadata,
+        )
+    plt.close(figure)
     return [png, pdf]
+
+
+def _scale_figure_text(
+    figure: Any,
+    *,
+    factor: float = 1.25,
+    preserve_tick_axes: Sequence[Any] = (),
+) -> None:
+    """Scale completed figure text once, optionally preserving selected ticks."""
+
+    preserved = {id(axis) for axis in preserve_tick_axes}
+    seen: set[int] = set()
+
+    def scale(text: Any) -> None:
+        if text is None or id(text) in seen:
+            return
+        seen.add(id(text))
+        size = float(text.get_fontsize())
+        if np.isfinite(size) and size > 0:
+            text.set_fontsize(size * float(factor))
+
+    for text in figure.texts:
+        scale(text)
+    for axis in figure.axes:
+        scale(axis.title)
+        scale(axis.xaxis.label)
+        scale(axis.yaxis.label)
+        scale(axis.xaxis.get_offset_text())
+        scale(axis.yaxis.get_offset_text())
+        if id(axis) not in preserved:
+            for text in (*axis.get_xticklabels(), *axis.get_yticklabels()):
+                scale(text)
+        for text in axis.texts:
+            scale(text)
+        legend = axis.get_legend()
+        if legend is not None:
+            scale(legend.get_title())
+            for text in legend.get_texts():
+                scale(text)
 
 
 def _finite(values: Sequence[float]) -> np.ndarray:
@@ -115,6 +173,22 @@ def _mean_range(values: Sequence[float]) -> tuple[float, float, float]:
     if not finite.size:
         return float("nan"), float("nan"), float("nan")
     return float(np.mean(finite)), float(np.min(finite)), float(np.max(finite))
+
+
+def _padded_limits(
+    values: Sequence[float], *, include_zero: bool = False
+) -> tuple[float, float]:
+    finite = _finite(values)
+    if not finite.size:
+        return (0.0, 1.0)
+    lower = float(np.min(finite))
+    upper = float(np.max(finite))
+    if include_zero:
+        lower = min(lower, 0.0)
+        upper = max(upper, 0.0)
+    span = upper - lower
+    pad = 0.04 * span if span > 1.0e-12 else max(abs(upper), 1.0) * 0.04
+    return lower - pad, upper + pad
 
 
 def _normalise_last(values: Any) -> np.ndarray:
@@ -527,7 +601,7 @@ def raw_carriage_strength_profile(
     minimum_pairs: int = 50,
     normalise: bool = True,
 ) -> tuple[tuple[str, ...], np.ndarray]:
-    """Return graph-balanced raw ``F_sens`` per eligible carrier.
+    """Return graph-balanced raw final-state response per eligible carrier.
 
     Donors are averaged within a source, carrier sums and counts are combined
     across sources within a graph, and graph-level pair means are combined with
@@ -652,7 +726,7 @@ def matched_strength_profile_rows(models: Sequence[SpatialModel]) -> list[dict[s
 
 
 def carriage_response_variant_rows(models: Sequence[SpatialModel]) -> list[dict[str, Any]]:
-    """Return normalized shape and raw-magnitude versions of per-carrier ``F_sens``."""
+    """Return profile-shape and raw-magnitude versions of final-state response."""
 
     per_seed: list[dict[str, Any]] = []
     for model in models:
@@ -716,10 +790,11 @@ def _plot_spatial_organisation(
 ) -> list[Path]:
     import matplotlib.pyplot as plt
 
+    outputs: list[Path] = []
     figure, axes = plt.subplots(
         2,
         len(spec.tasks),
-        figsize=(3.35 * len(spec.tasks), 6.8),
+        figsize=(3.65 * len(spec.tasks), 7.4),
         sharey="row",
         squeeze=False,
         constrained_layout=True,
@@ -761,7 +836,57 @@ def _plot_spatial_organisation(
         if column == 0:
             bottom.set_ylabel("structural $-$ semantic\nspatial variance")
     figure.suptitle(f"{spec.name.upper()}: spatial organisation across architectures")
-    return _save_figure(figure, figures_dir, "01_spatial_organisation")
+    _scale_figure_text(figure)
+    outputs.extend(_save_figure(figure, figures_dir, "01_spatial_organisation"))
+    plt.close(figure)
+
+    distance_figure, distance_axes = plt.subplots(
+        1,
+        len(spec.tasks),
+        figsize=(3.65 * len(spec.tasks), 3.9),
+        sharey=True,
+        squeeze=False,
+        constrained_layout=True,
+    )
+    for column, task in enumerate(spec.tasks):
+        selected = sorted(
+            [row for row in rows if str(row["task"]) == task],
+            key=lambda row: int(row["layer"]),
+        )
+        layers = np.asarray([int(row["layer"]) for row in selected])
+        axis = distance_axes[0, column]
+        for source, (colour, marker, label) in source_style.items():
+            mean = np.asarray(
+                [float(row[f"{source}_expected_distance_mean"]) for row in selected]
+            )
+            low = np.asarray(
+                [float(row[f"{source}_expected_distance_min"]) for row in selected]
+            )
+            high = np.asarray(
+                [float(row[f"{source}_expected_distance_max"]) for row in selected]
+            )
+            if not np.isfinite(mean).any():
+                continue
+            axis.plot(layers, mean, color=colour, marker=marker, label=label)
+            axis.fill_between(layers, low, high, color=colour, alpha=0.14, linewidth=0)
+        axis.set_title(spec.labels[task])
+        axis.set_xlabel("layer")
+        if column == 0:
+            axis.set_ylabel("expected graph distance")
+            axis.legend(frameon=False, fontsize=8)
+    distance_figure.suptitle(
+        f"{spec.name.upper()}: expected graph distance across architectures"
+    )
+    _scale_figure_text(distance_figure)
+    outputs.extend(
+        _save_figure(
+            distance_figure,
+            figures_dir,
+            "01b_expected_graph_distance",
+        )
+    )
+    plt.close(distance_figure)
+    return outputs
 
 
 def _plot_specialisation_landscapes(
@@ -773,7 +898,7 @@ def _plot_specialisation_landscapes(
     figure, axes = plt.subplots(
         2,
         len(spec.tasks),
-        figsize=(3.35 * len(spec.tasks), 6.8),
+        figsize=(3.65 * len(spec.tasks), 7.4),
         squeeze=False,
         constrained_layout=True,
     )
@@ -781,6 +906,9 @@ def _plot_specialisation_landscapes(
     maximum_layer = max(int(row["layer"]) for row in rows)
     colour_map = plt.get_cmap("viridis")
     colour_norm = plt.Normalize(0, maximum_layer)
+    joint_limits = _padded_limits(
+        [float(row["joint_sensitivity"]) for row in rows], include_zero=True
+    )
     scatter = None
     for column, task in enumerate(spec.tasks):
         selected = [row for row in rows if str(row["task"]) == task]
@@ -819,11 +947,13 @@ def _plot_specialisation_landscapes(
                 axis.set_ylim(lower, upper)
                 axis.set_aspect("equal", adjustable="box")
                 axis.set_title(spec.labels[task])
-                axis.set_xlabel("normalised semantic score")
+                axis.set_xlabel("semantic score")
                 if column == 0:
-                    axis.set_ylabel("normalised structural score")
+                    axis.set_ylabel("structural score")
             else:
                 axis.axvline(0.0, color="#999999", linewidth=0.8, linestyle="--")
+                axis.set_xlim(-1.04, 1.04)
+                axis.set_ylim(joint_limits)
                 axis.set_xlabel(r"relative selectivity $D_{\mathrm{rel}}$")
                 if column == 0:
                     axis.set_ylabel(r"joint sensitivity $J$")
@@ -835,6 +965,7 @@ def _plot_specialisation_landscapes(
     ]
     axes[1, 0].legend(handles=seed_handles, frameon=False, fontsize=8, loc="upper left")
     figure.suptitle(f"{spec.name.upper()}: head specialisation landscapes")
+    _scale_figure_text(figure)
     return _save_figure(figure, figures_dir, "02_specialisation_landscapes")
 
 
@@ -875,7 +1006,7 @@ def _plot_reach_gap_heatmap(
     figure, axes = plt.subplots(
         len(seeds),
         len(spec.tasks),
-        figsize=(3.25 * len(spec.tasks), 2.45 * len(seeds)),
+        figsize=(3.55 * len(spec.tasks), 2.75 * len(seeds)),
         squeeze=False,
         constrained_layout=True,
     )
@@ -901,8 +1032,19 @@ def _plot_reach_gap_heatmap(
             if column == 0:
                 axis.set_ylabel(f"seed {seed}\nlayer")
     if image is not None:
-        figure.colorbar(image, ax=axes, label="score reach $-$ attention reach (hops)", pad=0.01)
-    figure.suptitle(f"{spec.name.upper()}: {channel} attention--score reach gap")
+        figure.colorbar(
+            image,
+            ax=axes,
+            label="expected score reach $-$ attention reach (hops)",
+            pad=0.01,
+        )
+    figure.suptitle(
+        f"{spec.name.upper()}: expected {channel} score reach minus attention reach"
+    )
+    _scale_figure_text(
+        figure,
+        preserve_tick_axes=tuple(axis for row in axes for axis in row),
+    )
     return _save_figure(figure, figures_dir, stem)
 
 
@@ -920,7 +1062,7 @@ def _plot_distance_alignment(
     figure, axes = plt.subplots(
         1,
         len(spec.tasks),
-        figsize=(3.35 * len(spec.tasks), 3.6),
+        figsize=(3.65 * len(spec.tasks), 4.0),
         squeeze=False,
         constrained_layout=True,
     )
@@ -1001,6 +1143,7 @@ def _plot_distance_alignment(
         f"{spec.name.upper()}: semantic and structural distance alignment "
         f"(top {100 * (1 - activity_quantile):.0f}% by $J$)"
     )
+    _scale_figure_text(figure)
     return _save_figure(figure, figures_dir, "05_semantic_structural_distance_alignment")
 
 
@@ -1060,7 +1203,7 @@ def _plot_population_profiles(
     figure, axes = plt.subplots(
         2,
         len(spec.tasks),
-        figsize=(3.35 * len(spec.tasks), 6.8),
+        figsize=(3.65 * len(spec.tasks), 7.4),
         sharey="row",
         squeeze=False,
         constrained_layout=True,
@@ -1084,7 +1227,7 @@ def _plot_population_profiles(
                     f"{channel}_carriage",
                     "#222222",
                     "s",
-                    "event-normalised allocation",
+                    "final-state response allocation",
                 ),
             ):
                 lookup = {
@@ -1116,12 +1259,13 @@ def _plot_population_profiles(
             axis.set_title(spec.labels[task], fontsize=10)
             axis.set_xlabel("distance")
             if column == 0:
-                axis.set_ylabel(f"{channel}\nnormalised mass")
+                axis.set_ylabel(f"{channel}\nprofile mass")
             if row_index == 0 and column == 0:
                 axis.legend(frameon=False, fontsize=8)
     figure.suptitle(
-        f"{spec.name.upper()}: head-score mass and event-normalised final-state allocation"
+        f"{spec.name.upper()}: head-score mass and final-state response allocation"
     )
+    _scale_figure_text(figure)
     return _save_figure(figure, figures_dir, "07_score_and_final_state_response")
 
 
@@ -1137,7 +1281,7 @@ def _plot_matched_strength_profiles(
     figure, axes = plt.subplots(
         2,
         len(spec.tasks),
-        figsize=(3.35 * len(spec.tasks), 6.8),
+        figsize=(3.65 * len(spec.tasks), 7.4),
         sharey="row",
         squeeze=False,
         constrained_layout=True,
@@ -1157,7 +1301,7 @@ def _plot_matched_strength_profiles(
             x = np.arange(len(labels))
             for source, colour, marker, label in (
                 (sources[0], "#4C78A8", "o", "per-opportunity head score"),
-                (sources[1], "#222222", "s", r"per-carrier raw $F_{\mathrm{sens}}$"),
+                (sources[1], "#222222", "s", "final-state response"),
             ):
                 lookup = {
                     str(row["distance"]): row for row in selected if str(row["source"]) == source
@@ -1188,12 +1332,13 @@ def _plot_matched_strength_profiles(
             axis.set_title(spec.labels[task], fontsize=10)
             axis.set_xlabel("distance")
             if column == 0:
-                axis.set_ylabel(f"{channel}\nnormalised strength")
+                axis.set_ylabel(f"{channel}\nprofile strength")
             if row_index == 0 and column == 0:
                 axis.legend(frameon=False, fontsize=8)
     figure.suptitle(
         f"{spec.name.upper()}: opportunity-matched head scores and final-state response"
     )
+    _scale_figure_text(figure)
     return _save_figure(figure, figures_dir, "08_matched_score_and_final_state_response")
 
 
@@ -1209,7 +1354,7 @@ def _plot_carriage_response_variants(
     figure, axes = plt.subplots(
         2,
         len(spec.tasks),
-        figsize=(3.35 * len(spec.tasks), 6.8),
+        figsize=(3.65 * len(spec.tasks), 7.4),
         sharey="row",
         squeeze=False,
         constrained_layout=True,
@@ -1257,16 +1402,76 @@ def _plot_carriage_response_variants(
             axis.set_xlabel("distance")
             if column == 0:
                 axis.set_ylabel(
-                    "normalised per-carrier response"
+                    "final-state response profile"
                     if variant == "normalised"
-                    else r"mean raw $F_{\mathrm{sens}}$ per carrier"
+                    else "mean final-state response per carrier"
                 )
             if row_index == 0 and column == 0:
                 axis.legend(frameon=False, fontsize=8)
             if variant == "raw":
                 axis.ticklabel_format(axis="y", style="sci", scilimits=(-2, 2))
     figure.suptitle(f"{spec.name.upper()}: per-carrier final-state response shape and magnitude")
+    _scale_figure_text(figure)
     return _save_figure(figure, figures_dir, "09_final_state_response_variants")
+
+
+def _plot_final_state_response(
+    rows: Sequence[Mapping[str, Any]], spec: DatasetSpec, figures_dir: Path
+) -> list[Path]:
+    """Compare raw per-carrier final-state responses across architectures."""
+
+    import matplotlib.pyplot as plt
+
+    selected_rows = [row for row in rows if str(row["variant"]) == "raw"]
+    if not selected_rows:
+        return []
+    figure, axes = plt.subplots(
+        1,
+        len(spec.tasks),
+        figsize=(3.65 * len(spec.tasks), 4.0),
+        sharey=True,
+        squeeze=False,
+        constrained_layout=True,
+    )
+    styles = {
+        "semantic": ("#0072B2", "o", "semantic"),
+        "structural": ("#D55E00", "s", "structural"),
+    }
+    for column, task in enumerate(spec.tasks):
+        axis = axes[0, column]
+        task_rows = [row for row in selected_rows if str(row["task"]) == task]
+        labels = sorted({str(row["distance"]) for row in task_rows}, key=_distance_order)
+        x = np.arange(len(labels))
+        for channel, (colour, marker, label) in styles.items():
+            lookup = {
+                str(row["distance"]): row
+                for row in task_rows
+                if str(row["channel"]) == channel
+            }
+            if not lookup:
+                continue
+            mean = np.asarray(
+                [float(lookup[value]["response_mean"]) if value in lookup else np.nan for value in labels]
+            )
+            low = np.asarray(
+                [float(lookup[value]["response_min"]) if value in lookup else np.nan for value in labels]
+            )
+            high = np.asarray(
+                [float(lookup[value]["response_max"]) if value in lookup else np.nan for value in labels]
+            )
+            axis.plot(x, mean, color=colour, marker=marker, label=label)
+            axis.fill_between(x, low, high, color=colour, alpha=0.14, linewidth=0)
+        axis.set_xticks(x, labels)
+        axis.set_title(spec.labels[task])
+        axis.set_xlabel("distance")
+        axis.grid(axis="y", alpha=0.16, linewidth=0.6)
+        axis.ticklabel_format(axis="y", style="sci", scilimits=(-2, 2))
+        if column == 0:
+            axis.set_ylabel("Final-state response")
+            axis.legend(frameon=False, fontsize=8)
+    figure.suptitle(f"{spec.name.upper()}: final-state response across architectures")
+    _scale_figure_text(figure)
+    return _save_figure(figure, figures_dir, "09b_final_state_response")
 
 
 def _spearman(x: Sequence[float], y: Sequence[float]) -> float:
@@ -1291,7 +1496,7 @@ def _plot_joint_sensitivity_ablation(
     import matplotlib.pyplot as plt
     from matplotlib.lines import Line2D
 
-    figure, axes = plt.subplots(1, len(spec.tasks), figsize=(17.2, 3.45), sharey=True)
+    figure, axes = plt.subplots(1, len(spec.tasks), figsize=(18.25, 4.0), sharey=True)
     markers = ("o", "s", "^")
     maximum_layer = max(int(row["layer"]) for row in rows)
     colour_map = plt.get_cmap("viridis")
@@ -1349,6 +1554,7 @@ def _plot_joint_sensitivity_ablation(
     ]
     axes[-1].legend(handles=seed_handles, frameon=False, fontsize=7.5, loc="lower right")
     figure.suptitle(f"{spec.name.upper()}: joint sensitivity and head-ablation impact")
+    _scale_figure_text(figure)
     return _save_figure(figure, figures_dir, "10_joint_sensitivity_head_ablation")
 
 
@@ -1475,6 +1681,7 @@ def run(
     figures.extend(_plot_population_profiles(profile_rows, spec, figures_dir))
     figures.extend(_plot_matched_strength_profiles(matched_profile_rows, spec, figures_dir))
     figures.extend(_plot_carriage_response_variants(response_variant_rows, spec, figures_dir))
+    figures.extend(_plot_final_state_response(response_variant_rows, spec, figures_dir))
     figures.extend(_plot_joint_sensitivity_ablation(ablation_rows, spec, figures_dir))
     if trajectory_rows:
         from .chapter6_score_trajectory import plot as plot_score_trajectory
@@ -1509,11 +1716,11 @@ def run(
                 "within each seed"
             ),
             "mass_allocation_comparison": (
-                "within-head score mass versus event-normalised F_sens allocation; "
+                "within-head score mass versus final-state response allocation; "
                 "both retain distance-shell opportunity"
             ),
             "matched_strength_comparison": (
-                "per-opportunity head score versus graph-balanced raw F_sens per carrier; "
+                "per-opportunity head score versus graph-balanced final-state response per carrier; "
                 "only the completed profiles are normalised for plotting"
             ),
             "response_variants": (

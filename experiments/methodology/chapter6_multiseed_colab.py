@@ -43,6 +43,8 @@ COMPUTE_MISSING_ABLATIONS = True
 COMPUTE_MISSING_TRAJECTORY_SCORES = True
 GENERATE_SPECIAL_HEAD_ANALYSIS = True
 SPECIAL_HEAD_COMPUTE_MISSING = True
+# The v2 all-head selection contract automatically invalidates the earlier
+# active-head-only supplemental caches once, then resumes ordinary cache reuse.
 SPECIAL_HEAD_FORCE = False
 SPECIAL_HEAD_PCA_GRAPHS = 500
 SPECIAL_HEAD_EXAMPLES_PER_PAGE = 5  # two readable pages = ten molecules/head

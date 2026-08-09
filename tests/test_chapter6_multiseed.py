@@ -307,6 +307,11 @@ def test_zinc_checkpoint_trajectory_loads_twelve_cached_epochs(tmp_path):
     rows = load_trajectory_rows(root, strict=True)
     assert len(rows) == 12 * 4
     assert {row["architecture"] for row in rows} == {"dense", "1hop"}
+    assert all(
+        np.isfinite(row["normalized_semantic"])
+        and np.isfinite(row["normalized_structural"])
+        for row in rows
+    )
 
 
 @pytest.mark.parametrize("dataset", ("zinc", "qm9"))
@@ -341,12 +346,14 @@ def test_run_builds_dataset_specific_multiseed_suite(tmp_path, dataset):
     )
     assert manifest["runs_loaded"] == 15
     assert manifest["dataset"] == dataset
-    expected_pngs = 12 if dataset == "zinc" else 10
+    expected_pngs = 14 if dataset == "zinc" else 12
     assert len([path for path in manifest["figures"] if path.endswith(".png")]) == expected_pngs
     assert (output_dir / "figures/01_spatial_organisation.png").is_file()
+    assert (output_dir / "figures/01b_expected_graph_distance.pdf").is_file()
     assert (output_dir / "figures/07_score_and_final_state_response.pdf").is_file()
     assert (output_dir / "figures/08_matched_score_and_final_state_response.pdf").is_file()
     assert (output_dir / "figures/09_final_state_response_variants.pdf").is_file()
+    assert (output_dir / "figures/09b_final_state_response.pdf").is_file()
     assert (output_dir / "figures/10_joint_sensitivity_head_ablation.pdf").is_file()
     if dataset == "zinc":
         assert (output_dir / "figures/11a_dense_score_trajectory.pdf").is_file()
