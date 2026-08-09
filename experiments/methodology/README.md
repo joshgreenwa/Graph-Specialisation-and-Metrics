@@ -24,6 +24,28 @@ as provenance rather than used as cache-validity keys. If a file genuinely belon
 scientific contract or is unreadable, the runner preserves it under `cache/_stale/` and recomputes
 that miss; read-only downstream artifact loaders continue to reject incompatible inputs.
 
+## Peptides-func and Peptides-struct multi-seed corpus
+
+The 30-checkpoint Peptides corpus has two A100 Colab lanes:
+
+- [`peptides_func_canonical_colab.ipynb`](peptides_func_canonical_colab.ipynb): all 15
+  Peptides-func architecture/seed workers;
+- [`peptides_struct_canonical_colab.ipynb`](peptides_struct_canonical_colab.ipynb): all 15
+  Peptides-struct architecture/seed workers.
+
+Place `peptides_func_struct_best_checkpoints.tar` and its `.sha256` companion directly in
+`multi_seed_models/peptides_func_struct_checkpoints/`. Open both notebooks in separate A100 80GB
+high-RAM runtimes and run all cells with `MODE="run"`. Corpus setup is automatic and locked: if
+both notebooks start together, one extracts while the other waits. Each lane runs dense, 1-hop,
+1-hop+VNode, 2-hop, and 2-hop+VNode for seeds 0, 1, and 2 sequentially. Both lanes retain the same
+complete 30-worker protocol fingerprint. A100-80 starts at 16 graph groups with exact CUDA OOM
+backoff, and completed score/carriage/model state is released between components and checkpoints.
+
+Rerunning a lane freshly validates and skips completed workers, while partial per-graph shards
+resume. When both notebooks report 15/15 complete, set `MODE="finalize"` in either notebook and
+rerun its last cell to write the model-free population indexes and summaries. Exact Drive paths are
+listed in [`DRIVE_ARTIFACT_MAP.md`](DRIVE_ARTIFACT_MAP.md).
+
 ## ZINC checkpoint trajectory
 
 The seed-0 dense/1-hop training trajectory has a dedicated scores-only workflow. Put

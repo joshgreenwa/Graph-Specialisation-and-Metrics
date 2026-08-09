@@ -12,6 +12,14 @@ from experiments.methodology import peptides_func_struct_canonical_colab as cont
 from graph_specialisation_metrics.carriage.tasks import get_task as get_grit_task
 from graph_specialisation_metrics.methodology.tasks import get_task
 
+NOTEBOOKS = {
+    "func": Path(__file__).parents[1]
+    / "experiments/methodology/peptides_func_canonical_colab.ipynb",
+    "struct": Path(__file__).parents[1]
+    / "experiments/methodology/peptides_struct_canonical_colab.ipynb",
+}
+PINNED_REVISION = "80f70a81ab703fe8aac8a7934b31f91522788ee3"
+
 
 def _records():
     rows = []
@@ -202,3 +210,26 @@ def test_completion_status_uses_dataset_specific_cache_paths(tmp_path: Path):
 
 def test_worker_record_is_json_serializable():
     assert json.loads(json.dumps(dataclasses.asdict(controller.WORKERS[0])))["index"] == 0
+
+
+@pytest.mark.parametrize("dataset", ["func", "struct"])
+def test_checked_in_notebooks_are_a100_ready_pinned_dataset_lanes(dataset: str):
+    payload = json.loads(NOTEBOOKS[dataset].read_text(encoding="utf-8"))
+    source = "".join(
+        "".join(cell.get("source", []))
+        for cell in payload["cells"]
+        if cell.get("cell_type") == "code"
+    )
+
+    assert payload["nbformat"] == 4
+    assert payload["metadata"]["accelerator"] == "GPU"
+    assert payload["metadata"]["colab"]["gpuType"] == "A100"
+    assert 'MODE = "run"' in source
+    assert f'DATASET = "{dataset}"' in source
+    assert f'REPO_REVISION = "{PINNED_REVISION}"' in source
+    assert "peptides_func_struct_checkpoints" in source
+    assert "GRAPHS_PER_BATCH = 0" in source
+    assert "RECLAIM_WORKER_INDEX = -1" in source
+    assert "run_frontend(" in source
+    assert "graphs_per_batch=GRAPHS_PER_BATCH or None" in source
+    assert "vars(methodology_package).pop('peptides_func_struct_canonical_colab'" in source

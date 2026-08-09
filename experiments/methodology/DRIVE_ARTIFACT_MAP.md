@@ -182,3 +182,36 @@ M/chapter6_multiseed_analysis/zinc/zinc_checkpoint_trajectory_heads.csv
 Each architecture receives a 2x6 figure: raw semantic versus structural scores on the top row and
 `J` versus `D_rel` on the bottom row. Axis limits are computed jointly over both architectures and
 all twelve checkpoints, so the two figures use identical scales. These outputs are ZINC-only.
+
+## Peptides-func / Peptides-struct, five architectures, three seeds
+
+```text
+P  = M/peptides_func_struct_checkpoints
+PC = P/corpus/d6e5923249326f0d2498d7f5ca996ec2a25c4d213c41cbfdf9c7a28224ad3456/peptides_best_available_20260809_153204
+PO = P/canonical_outputs
+```
+
+For each row below and each seed `s` in `0,1,2`:
+
+```text
+checkpoint = PC/checkpoints/<archive prefix>.s<s>/best_available.ckpt
+scores     = PO/<canonical task>/seed_<s>/cache/scores/raw.pt
+carriage   = PO/<canonical task>/seed_<s>/cache/carriage/fields.pt
+```
+
+| Dataset/model | Archive prefix | Canonical task |
+|---|---|---|
+| Peptides-func dense | `peptides_func.dense` | `peptides_func_dense` |
+| Peptides-func 1-hop | `peptides_func.1hop` | `peptides_func_1hop` |
+| Peptides-func 1-hop + VNode | `peptides_func.1hop_vnode` | `peptides_func_1hop_vnode` |
+| Peptides-func 2-hop | `peptides_func.2hop` | `peptides_func_2hop` |
+| Peptides-func 2-hop + VNode | `peptides_func.2hop_vnode` | `peptides_func_2hop_vnode` |
+| Peptides-struct dense | `peptides_struct.dense` | `peptides_struct_dense` |
+| Peptides-struct 1-hop | `peptides_struct.1hop` | `peptides_struct_1hop` |
+| Peptides-struct 1-hop + VNode | `peptides_struct.1hop_vnode` | `peptides_struct_1hop_vnode` |
+| Peptides-struct 2-hop | `peptides_struct.2hop` | `peptides_struct_2hop` |
+| Peptides-struct 2-hop + VNode | `peptides_struct.2hop_vnode` | `peptides_struct_2hop_vnode` |
+
+Every run directory also contains `protocol.json`, `model.json`, `audits.json`, `progress.jsonl`,
+`worker_complete.json`, clean-Jacobian shards, and per-channel score/carriage graph shards. Rejected
+incompatible artifacts are retained under that run's `cache/_stale/` directory.
