@@ -18,7 +18,7 @@ NOTEBOOKS = {
     "struct": Path(__file__).parents[1]
     / "experiments/methodology/peptides_struct_canonical_colab.ipynb",
 }
-PINNED_REVISION = "80f70a81ab703fe8aac8a7934b31f91522788ee3"
+PINNED_REVISION = "d0bd68ca341afc5829af17069b19292a4bd91942"
 
 
 def _records():

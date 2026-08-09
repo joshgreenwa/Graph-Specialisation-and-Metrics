@@ -40,6 +40,10 @@ both notebooks start together, one extracts while the other waits. Each lane run
 1-hop+VNode, 2-hop, and 2-hop+VNode for seeds 0, 1, and 2 sequentially. Both lanes retain the same
 complete 30-worker protocol fingerprint. A100-80 starts at 16 graph groups with exact CUDA OOM
 backoff, and completed score/carriage/model state is released between components and checkpoints.
+Only the 2,000 donor graphs and 136 held-out graphs required by the registered split contract are
+materialised with RRWP in each runtime. Recomputed metrics on this analysis subset are retained as
+finite-forward checks; the archive's separately recorded full-split validation/test metrics remain
+the checkpoint-selection provenance and are not incorrectly compared to subset metrics.
 
 Rerunning a lane freshly validates and skips completed workers, while partial per-graph shards
 resume. When both notebooks report 15/15 complete, set `MODE="finalize"` in either notebook and
