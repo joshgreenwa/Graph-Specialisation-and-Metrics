@@ -58,6 +58,8 @@ DEFAULT_GRAPH_INDICES = {
     "zinc": (0, 80, 100, 120, 160, 200, 220, 320, 560, 750),
     "qm9": (0, 24, 72, 80, 112, 208, 320, 560, 608, 750),
 }
+SPECIAL_HEAD_PREVIEW_DPI = 150
+SPECIAL_HEAD_PDF_RASTER_DPI = 1200
 
 
 def _json_default(value: Any) -> Any:
@@ -380,6 +382,73 @@ def _record_metadata(row: Mapping[str, Any], **extra: Any) -> dict[str, Any]:
     }
 
 
+def _discover_existing_outputs(
+    selected: Sequence[Mapping[str, Any]],
+    figures_dir: Path,
+    *,
+    render_graph_count: int,
+    examples_per_page: int,
+) -> list[dict[str, Any]]:
+    """Recover complete deterministic bundles after a pre-manifest crash."""
+
+    outputs: list[dict[str, Any]] = []
+    for row in selected:
+        task = str(row["task"])
+        seed = int(row["seed"])
+        role = str(row["role"])
+        layer = int(row["layer"])
+        head = int(row["head"])
+        prefix = f"{task}_seed_{seed}_{role}_L{layer}_H{head}"
+        stems: list[tuple[str, str]] = []
+        for page_start in range(0, int(render_graph_count), int(examples_per_page)):
+            page_end = min(
+                page_start + int(examples_per_page), int(render_graph_count)
+            )
+            stems.append(
+                (
+                    "attention",
+                    f"{prefix}_attention_{page_start + 1:02d}_{page_end:02d}",
+                )
+            )
+        stems.extend(
+            (
+                ("pca", f"{prefix}_routed_output_pca"),
+                ("distance", f"{prefix}_distance_profiles"),
+            )
+        )
+        for figure_type, stem in stems:
+            paths = {
+                "png": figures_dir / f"{stem}.png",
+                "pdf": figures_dir / f"{stem}.pdf",
+                "metadata": figures_dir / f"{stem}.json",
+            }
+            if all(path.is_file() for path in paths.values()):
+                outputs.append(
+                    {
+                        "task": task,
+                        "seed": seed,
+                        "role": role,
+                        "figure": figure_type,
+                        **{key: str(value) for key, value in paths.items()},
+                    }
+                )
+    return outputs
+
+
+def _release_rendered_figure(figure: Any) -> None:
+    """Destroy large Agg buffers and return their pages to the host OS."""
+
+    import matplotlib.pyplot as plt
+
+    figure.clear()
+    plt.close(figure)
+    gc.collect()
+    try:
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except (OSError, AttributeError):
+        pass
+
+
 def validate_special_head_outputs(
     selected: Sequence[Mapping[str, Any]],
     outputs: Sequence[Mapping[str, Any]],
@@ -487,8 +556,6 @@ def generate_special_head_analysis(
     verbose: bool = True,
 ) -> dict[str, Any]:
     """Select, cache, and render controlled diagnostics for fifteen heads."""
-
-    import matplotlib.pyplot as plt
 
     canonical_root = Path(canonical_root)
     output_dir = Path(output_dir)
@@ -675,7 +742,12 @@ def generate_special_head_analysis(
     existing_outputs = (
         list(existing_manifest.get("outputs", ()))
         if existing_manifest is not None
-        else []
+        else _discover_existing_outputs(
+            selected,
+            figures_dir,
+            render_graph_count=len(render_graph_indices),
+            examples_per_page=int(examples_per_page),
+        )
     )
     existing_caches = (
         list(existing_manifest.get("caches", ()))
@@ -892,6 +964,18 @@ def generate_special_head_analysis(
                 "checkpoint_sha256": checkpoint_sha256(model_record["checkpoint"]),
             }
         )
+        profiles_by_role = {
+            str(row["role"]): head_distance_profiles(
+                artifact.value, (int(row["layer"]), int(row["head"]))
+            )
+            for row in group
+        }
+        # Everything required from the canonical score and live model is now
+        # represented by small CPU payloads.  Do not overlap either large
+        # object with high-resolution PDF rendering.
+        del attention_compute, pca_compute, runtime, artifact
+        _release_figure_runtime(active_runtime.get("value"))
+        active_runtime.clear()
         identity = figure_identity(task)
         display_attention = {**dict(attention_payload), **identity}
         for row in group:
@@ -940,8 +1024,8 @@ def generate_special_head_analysis(
                             render_graph_indices[page_start:page_end]
                         ),
                     },
-                    dpi=600,
-                    pdf_dpi=1200,
+                    dpi=SPECIAL_HEAD_PREVIEW_DPI,
+                    pdf_dpi=SPECIAL_HEAD_PDF_RASTER_DPI,
                     supersede_stem_globs=(
                         (
                             f"{task}_seed_*_{role}_L*_H*_attention_"
@@ -949,7 +1033,7 @@ def generate_special_head_analysis(
                         ),
                     ),
                 )
-                plt.close(figure)
+                _release_rendered_figure(figure)
                 outputs.append(
                     {
                         "task": task,
@@ -974,11 +1058,13 @@ def generate_special_head_analysis(
                 figures_dir,
                 f"{stem_prefix}_routed_output_pca",
                 metadata={**metadata, "figure": "routed_output_pca"},
+                dpi=SPECIAL_HEAD_PREVIEW_DPI,
+                pdf_dpi=SPECIAL_HEAD_PDF_RASTER_DPI,
                 supersede_stem_globs=(
                     f"{task}_seed_*_{role}_L*_H*_routed_output_pca.*",
                 ),
             )
-            plt.close(figure)
+            _release_rendered_figure(figure)
             outputs.append(
                 {
                     "task": task,
@@ -989,7 +1075,7 @@ def generate_special_head_analysis(
                 }
             )
 
-            profiles = head_distance_profiles(artifact.value, head)
+            profiles = profiles_by_role[role]
             figure = _plot_distance_profiles(
                 profiles,
                 display_title=identity["display_title"],
@@ -1008,11 +1094,13 @@ def generate_special_head_analysis(
                     "figure": "distance_profiles",
                     "distance_labels": list(profiles["labels"]),
                 },
+                dpi=SPECIAL_HEAD_PREVIEW_DPI,
+                pdf_dpi=SPECIAL_HEAD_PDF_RASTER_DPI,
                 supersede_stem_globs=(
                     f"{task}_seed_*_{role}_L*_H*_distance_profiles.*",
                 ),
             )
-            plt.close(figure)
+            _release_rendered_figure(figure)
             outputs.append(
                 {
                     "task": task,
@@ -1022,17 +1110,24 @@ def generate_special_head_analysis(
                     **{key: str(value) for key, value in paths.items()},
                 }
             )
+            for example in display_attention["examples"]:
+                example["attention"].pop(role, None)
+            pca_payload.pop(f"{head[0]}:{head[1]}", None)
+            profiles_by_role.pop(role, None)
+            del pca_head_payload, examples_by_index, examples, profiles
+            gc.collect()
+            try:
+                ctypes.CDLL("libc.so.6").malloc_trim(0)
+            except (OSError, AttributeError):
+                pass
         # Cached arrays and rendered figures can otherwise survive until the
         # next checkpoint group in notebook runtimes.  Release the complete
         # group, including its model and loaders, before proceeding.
         del (
-            attention_compute,
-            pca_compute,
-            runtime,
             attention_payload,
             pca_payload,
             display_attention,
-            artifact,
+            profiles_by_role,
         )
         gc.collect()
         try:
@@ -1042,8 +1137,6 @@ def generate_special_head_analysis(
                 torch.cuda.empty_cache()
         except (ImportError, RuntimeError):
             pass
-        _release_figure_runtime(active_runtime.get("value"))
-        active_runtime.clear()
     _release_figure_runtime(active_runtime.get("value"))
     active_runtime.clear()
 
