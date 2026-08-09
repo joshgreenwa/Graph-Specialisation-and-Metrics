@@ -232,6 +232,8 @@ def test_checked_in_notebooks_are_a100_ready_pinned_dataset_lanes(dataset: str):
     assert "peptides_func_struct_checkpoints" in source
     assert "GRAPHS_PER_BATCH = 0" in source
     assert "RECLAIM_WORKER_INDEX = -1" in source
+    assert "url = 'https:' + '//github.com/" in source
+    assert "url = 'https://github.com/" not in source
     assert "run_frontend(" in source
     assert "graphs_per_batch=GRAPHS_PER_BATCH or None" in source
     assert "vars(methodology_package).pop('peptides_func_struct_canonical_colab'" in source
