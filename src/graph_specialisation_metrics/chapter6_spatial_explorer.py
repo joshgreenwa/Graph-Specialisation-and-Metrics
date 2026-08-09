@@ -416,6 +416,31 @@ def _profile_statistics(values: Any, axis: Sequence[Any], reportable: Any) -> di
     }
 
 
+def _profile_mass_at_distance(
+    values: Any,
+    axis: Sequence[Any],
+    reportable: Any,
+    *,
+    target: float,
+) -> float:
+    """Return the molecular-profile mass assigned to one graph distance."""
+
+    raw = np.maximum(_as_numpy(values), 0.0)
+    numeric = np.asarray(
+        [
+            float(value) if (value := _numeric_distance(label)) is not None else np.nan
+            for label in axis
+        ],
+        dtype=np.float64,
+    )
+    mask = _as_numpy(reportable, dtype=bool) & np.isfinite(raw) & np.isfinite(numeric)
+    denominator = float(np.sum(raw[mask])) if np.any(mask) else 0.0
+    if denominator <= 1.0e-12:
+        return float("nan")
+    selected = mask & np.isclose(numeric, float(target))
+    return float(np.sum(raw[selected]) / denominator)
+
+
 def _profile_alignment(
     semantic: Any,
     structural: Any,
@@ -562,6 +587,16 @@ def head_metrics(models: Sequence[SpatialModel]) -> list[dict[str, Any]]:
                     if attention_array is not None
                     else {}
                 )
+                attention_hop1_mass = (
+                    _profile_mass_at_distance(
+                        attention_array[layer, head],
+                        axis,
+                        reportable,
+                        target=1.0,
+                    )
+                    if attention_array is not None
+                    else float("nan")
+                )
                 attention_reach = float(
                     attention_stats.get("expected_distance", float("nan"))
                 )
@@ -614,6 +649,7 @@ def head_metrics(models: Sequence[SpatialModel]) -> list[dict[str, Any]]:
                         },
                         **alignment,
                         **{f"attention_{key}": value for key, value in attention_stats.items()},
+                        "attention_hop1_mass": attention_hop1_mass,
                         "semantic_attention_reach_gap": semantic_gap,
                         "structural_attention_reach_gap": structural_gap,
                         "max_abs_attention_reach_gap": (

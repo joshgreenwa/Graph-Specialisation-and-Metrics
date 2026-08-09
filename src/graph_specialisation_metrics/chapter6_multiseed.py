@@ -28,7 +28,7 @@ from .chapter6_spatial_explorer import (
 from .methodology.bootstrap import trimmed_mean
 from .zinc_cached_rrwp_comparison import DISPLAY_BINS
 
-ANALYSIS_VERSION = "chapter6-molecular-multiseed-v4"
+ANALYSIS_VERSION = "chapter6-molecular-multiseed-v5"
 SEEDS = (0, 1, 2)
 CHANNELS = ("semantic", "structural")
 
@@ -969,6 +969,136 @@ def _plot_specialisation_landscapes(
     return _save_figure(figure, figures_dir, "02_specialisation_landscapes")
 
 
+def _plot_dense_one_hop_attention_landscape(
+    rows: Sequence[Mapping[str, Any]],
+    spec: DatasetSpec,
+    figures_dir: Path,
+    *,
+    threshold: float = 0.75,
+) -> list[Path]:
+    """Highlight dense-model heads whose attention is concentrated at one hop."""
+
+    import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
+
+    task = spec.tasks[-1]
+    selected = [
+        row
+        for row in rows
+        if str(row["task"]) == task
+        and np.isfinite(float(row.get("selectivity", np.nan)))
+        and np.isfinite(float(row.get("joint_sensitivity", np.nan)))
+    ]
+    if not selected or not any(
+        np.isfinite(float(row.get("attention_hop1_mass", np.nan))) for row in selected
+    ):
+        return []
+
+    figure, axis = plt.subplots(figsize=(7.2, 5.6), constrained_layout=True)
+    markers = ("o", "s", "^")
+    maximum_layer = max(int(row["layer"]) for row in selected)
+    colour_map = plt.get_cmap("viridis")
+    colour_norm = plt.Normalize(0, maximum_layer)
+    scatter = None
+    seeds = sorted({int(row["seed"]) for row in selected})
+    for seed_index, seed in enumerate(seeds):
+        seed_rows = [row for row in selected if int(row["seed"]) == seed]
+        for focused, alpha, size in ((False, 0.10, 26), (True, 0.90, 34)):
+            subset = [
+                row
+                for row in seed_rows
+                if bool(
+                    np.isfinite(float(row.get("attention_hop1_mass", np.nan)))
+                    and float(row["attention_hop1_mass"]) >= float(threshold)
+                )
+                == focused
+            ]
+            if not subset:
+                continue
+            scatter = axis.scatter(
+                [float(row["selectivity"]) for row in subset],
+                [float(row["joint_sensitivity"]) for row in subset],
+                c=[int(row["layer"]) for row in subset],
+                cmap=colour_map,
+                norm=colour_norm,
+                marker=markers[seed_index % len(markers)],
+                s=size,
+                alpha=alpha,
+                linewidths=0,
+                zorder=3 if focused else 2,
+            )
+    axis.axvline(0.0, color="#999999", linewidth=0.8, linestyle="--", zorder=1)
+    axis.set_xlim(-1.04, 1.04)
+    axis.set_ylim(
+        _padded_limits(
+            [float(row["joint_sensitivity"]) for row in selected],
+            include_zero=True,
+        )
+    )
+    axis.set_xlabel(r"relative selectivity $D_{\mathrm{rel}}$")
+    axis.set_ylabel(r"joint sensitivity $J$")
+    axis.grid(alpha=0.16, linewidth=0.6)
+    focused_count = sum(
+        np.isfinite(float(row.get("attention_hop1_mass", np.nan)))
+        and float(row["attention_hop1_mass"]) >= float(threshold)
+        for row in selected
+    )
+    axis.text(
+        0.97,
+        0.96,
+        f"{focused_count}/{len(selected)} heads at or above {100 * threshold:.0f}%",
+        transform=axis.transAxes,
+        ha="right",
+        va="top",
+        fontsize=9,
+    )
+    handles = [
+        Line2D(
+            [],
+            [],
+            marker=markers[index],
+            linestyle="",
+            color="#555555",
+            label=f"seed {seed}",
+        )
+        for index, seed in enumerate(seeds)
+    ]
+    handles.extend(
+        (
+            Line2D(
+                [],
+                [],
+                marker="o",
+                linestyle="",
+                color="#333333",
+                alpha=0.90,
+                label=rf"$\geq {100 * threshold:.0f}\%$ attention at 1 hop",
+            ),
+            Line2D(
+                [],
+                [],
+                marker="o",
+                linestyle="",
+                color="#999999",
+                alpha=0.25,
+                label=rf"$< {100 * threshold:.0f}\%$ attention at 1 hop",
+            ),
+        )
+    )
+    axis.legend(handles=handles, frameon=False, fontsize=8, loc="upper left")
+    if scatter is not None:
+        figure.colorbar(scatter, ax=axis, label="layer", pad=0.02)
+    figure.suptitle(
+        f"{spec.name.upper()}: dense GRIT one-hop attention in the specialisation landscape"
+    )
+    _scale_figure_text(figure)
+    return _save_figure(
+        figure,
+        figures_dir,
+        "02b_dense_one_hop_attention_specialisation",
+    )
+
+
 def _head_matrix(
     rows: Sequence[Mapping[str, Any]], task: str, seed: int, field: str
 ) -> tuple[np.ndarray, list[int], list[int]]:
@@ -1648,6 +1778,9 @@ def run(
     figures: list[Path] = []
     figures.extend(_plot_spatial_organisation(organisation_rows, spec, figures_dir))
     figures.extend(_plot_specialisation_landscapes(head_rows, spec, figures_dir))
+    figures.extend(
+        _plot_dense_one_hop_attention_landscape(head_rows, spec, figures_dir)
+    )
     figures.extend(
         _plot_reach_gap_heatmap(
             head_rows,
