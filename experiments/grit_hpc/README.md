@@ -125,6 +125,17 @@ Inspect `manifest.tsv` before treating the resulting tar as canonical. The
 archive calls non-exact selections *best available validation-selected saved
 checkpoints* and never represents them as exact global-best snapshots.
 
+The equivalent exporter for all 30 Peptides checkpoints additionally handles
+the task-specific selection directions (maximum validation AP for
+Peptides-func and minimum validation MAE for Peptides-struct) and writes its
+three-seed tables to `performance.md`:
+
+```bash
+python experiments/grit_hpc/bin/export_peptides_best_available.py \
+  --input-root /rds/user/jgg45/hpc-work/grit_checkpoints/grit_all_3seeds \
+  --output-dir /rds/user/jgg45/hpc-work/grit_exports/peptides_best_available_RUN
+```
+
 If array row 4 is interrupted, resubmit only that model with:
 
 ```bash
