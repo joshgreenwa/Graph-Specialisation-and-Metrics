@@ -13,6 +13,7 @@ import csv
 import ctypes
 import gc
 import json
+import os
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -109,14 +110,22 @@ def _save_figure(figure: Any, figures_dir: Path, stem: str) -> list[Path]:
     png = figures_dir / f"{stem}.png"
     pdf = figures_dir / f"{stem}.pdf"
     metadata = {"Creator": "graph_specialisation_metrics", "Title": stem}
+    pdf_only = os.environ.get("CHAPTER6_PDF_ONLY", "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+    outputs: list[Path] = []
     with mpl.rc_context({"pdf.fonttype": 42, "ps.fonttype": 42}):
-        figure.savefig(
-            png,
-            dpi=400,
-            bbox_inches="tight",
-            pad_inches=0.04,
-            facecolor="white",
-        )
+        if not pdf_only:
+            figure.savefig(
+                png,
+                dpi=400,
+                bbox_inches="tight",
+                pad_inches=0.04,
+                facecolor="white",
+            )
+            outputs.append(png)
         figure.savefig(
             pdf,
             dpi=1200,
@@ -125,8 +134,9 @@ def _save_figure(figure: Any, figures_dir: Path, stem: str) -> list[Path]:
             facecolor="white",
             metadata=metadata,
         )
+        outputs.append(pdf)
     plt.close(figure)
-    return [png, pdf]
+    return outputs
 
 
 def _scale_figure_text(
@@ -1030,6 +1040,57 @@ def _plot_spatial_organisation(
     return outputs
 
 
+def _plot_expected_graph_distance(
+    rows: Sequence[Mapping[str, Any]], spec: DatasetSpec, figures_dir: Path
+) -> list[Path]:
+    """Plot only the expected-distance row of the spatial organisation figure."""
+
+    import matplotlib.pyplot as plt
+
+    source_style = {
+        "semantic": ("#0072B2", "o", "semantic score"),
+        "structural": ("#D55E00", "s", "structural score"),
+        "attention": ("#009E73", "^", "attention mass"),
+    }
+    figure, axes = plt.subplots(
+        1,
+        len(spec.tasks),
+        figsize=(3.65 * len(spec.tasks), 3.9),
+        sharey=True,
+        squeeze=False,
+        constrained_layout=True,
+    )
+    for column, task in enumerate(spec.tasks):
+        selected = sorted(
+            [row for row in rows if str(row["task"]) == task],
+            key=lambda row: int(row["layer"]),
+        )
+        layers = np.asarray([int(row["layer"]) for row in selected])
+        axis = axes[0, column]
+        for source, (colour, marker, label) in source_style.items():
+            mean = np.asarray(
+                [float(row[f"{source}_expected_distance_mean"]) for row in selected]
+            )
+            low = np.asarray(
+                [float(row[f"{source}_expected_distance_min"]) for row in selected]
+            )
+            high = np.asarray(
+                [float(row[f"{source}_expected_distance_max"]) for row in selected]
+            )
+            if not np.isfinite(mean).any():
+                continue
+            axis.plot(layers, mean, color=colour, marker=marker, label=label)
+            axis.fill_between(layers, low, high, color=colour, alpha=0.14, linewidth=0)
+        axis.set_title(spec.labels[task])
+        axis.set_xlabel("layer")
+        if column == 0:
+            axis.set_ylabel("expected graph distance")
+            axis.legend(frameon=False, fontsize=8)
+    figure.suptitle(f"{spec.name.upper()}: expected graph distance across architectures")
+    _scale_figure_text(figure)
+    return _save_figure(figure, figures_dir, "01b_expected_graph_distance")
+
+
 def _plot_specialisation_landscapes(
     rows: Sequence[Mapping[str, Any]], spec: DatasetSpec, figures_dir: Path
 ) -> list[Path]:
@@ -1723,8 +1784,20 @@ def _plot_vnode_allocation(
 
 
 def _distance_order(label: str) -> tuple[int, str]:
-    order = {"0": 0, "1": 1, "2": 2, "3": 3, "4-7": 4, "8+": 5, "virtual": 6}
-    return order.get(str(label).lower(), 100), str(label)
+    text = str(label).strip().lower().replace("–", "-")
+    if text == "virtual":
+        return 10_000, text
+    try:
+        return int(float(text)), text
+    except ValueError:
+        pass
+    for separator in ("-", "+"):
+        if separator in text:
+            try:
+                return int(float(text.split(separator, 1)[0])), text
+            except ValueError:
+                break
+    return 20_000, text
 
 
 def _plot_population_profiles(
