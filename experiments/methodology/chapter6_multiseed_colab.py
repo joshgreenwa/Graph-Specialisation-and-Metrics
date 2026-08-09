@@ -13,7 +13,9 @@ from __future__ import annotations
 
 import importlib
 import gc
+import json
 import os
+import ctypes
 import subprocess
 import sys
 from pathlib import Path
@@ -52,6 +54,7 @@ SPECIAL_HEAD_EXAMPLES_PER_PAGE = 5  # two readable pages = ten molecules/head
 SPECIAL_HEAD_RENDER_GRAPH_INDICES = None  # later choose a subset of the cached ten
 SPECIAL_HEAD_GENERALIST_MAX_ABS_DREL = 0.10
 DISPLAY_ALL_SPECIAL_HEAD_FIGURES = False  # full bundles remain saved in Drive
+REUSE_COMPLETE_CORE_ANALYSIS = True  # set False only when restyling core figures
 
 DRIVE_ROOT = Path("/content/drive/MyDrive")
 MULTI_SEED_ROOT = DRIVE_ROOT / "graph_specialisation_metrics/multi_seed_models"
@@ -77,6 +80,16 @@ def release_memory(label: str) -> None:
     """Force notebook and CUDA cleanup between independent analysis phases."""
 
     gc.collect()
+    try:
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except (OSError, AttributeError):
+        pass
+    try:
+        pages = int(Path("/proc/self/statm").read_text().split()[1])
+        rss_gib = pages * os.sysconf("SC_PAGE_SIZE") / (1024**3)
+        print(f"[memory:{label}] process RSS={rss_gib:.2f} GiB", flush=True)
+    except (OSError, ValueError, IndexError):
+        pass
     try:
         import torch
 
@@ -167,6 +180,7 @@ if DATASET.lower() not in {"zinc", "qm9"}:
 bootstrap()
 
 from graph_specialisation_metrics.chapter6_multiseed import (
+    ANALYSIS_VERSION as CORE_ANALYSIS_VERSION,
     cache_inventory,
     run,
 )
@@ -313,19 +327,45 @@ if DATASET == "zinc":
     print("\nZINC checkpoint-trajectory cache inventory", flush=True)
     display(pd.DataFrame(trajectory_inventory_rows))
 
-manifest = run(
-    CANONICAL_ROOT,
-    OUTPUT_DIR,
-    dataset=DATASET,
-    seeds=SEEDS,
-    strict_inventory=STRICT_CACHE_INVENTORY,
-    ablation_root=ABLATION_ROOT,
-    strict_ablation=True,
-    trajectory_root=TRAJECTORY_ROOT if DATASET == "zinc" else None,
-    strict_trajectory=DATASET == "zinc",
-    activity_quantile=RELIABLE_HEAD_QUANTILE,
-    verbose=True,
-)
+core_manifest_path = OUTPUT_DIR / "manifest.json"
+manifest = None
+if REUSE_COMPLETE_CORE_ANALYSIS and core_manifest_path.is_file():
+    try:
+        candidate = json.loads(core_manifest_path.read_text(encoding="utf-8"))
+        referenced_files = [
+            Path(path)
+            for field in ("figures", "tables")
+            for path in candidate.get(field, ())
+        ]
+        if (
+            candidate.get("analysis_version") == CORE_ANALYSIS_VERSION
+            and candidate.get("dataset") == DATASET
+            and candidate.get("seeds") == [int(seed) for seed in SEEDS]
+            and referenced_files
+            and all(path.is_file() for path in referenced_files)
+        ):
+            manifest = candidate
+            print(
+                "[chapter6-multiseed-resume] complete core figures found; "
+                "no score or carriage cache loaded",
+                flush=True,
+            )
+    except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):
+        manifest = None
+if manifest is None:
+    manifest = run(
+        CANONICAL_ROOT,
+        OUTPUT_DIR,
+        dataset=DATASET,
+        seeds=SEEDS,
+        strict_inventory=STRICT_CACHE_INVENTORY,
+        ablation_root=ABLATION_ROOT,
+        strict_ablation=True,
+        trajectory_root=TRAJECTORY_ROOT if DATASET == "zinc" else None,
+        strict_trajectory=DATASET == "zinc",
+        activity_quantile=RELIABLE_HEAD_QUANTILE,
+        verbose=True,
+    )
 release_memory("after-core-figures")
 
 special_head_manifest = None

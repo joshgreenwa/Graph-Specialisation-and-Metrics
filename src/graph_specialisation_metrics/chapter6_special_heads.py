@@ -13,6 +13,7 @@ molecules can be chosen, without loading a checkpoint again.
 from __future__ import annotations
 
 import csv
+import ctypes
 import gc
 import json
 from collections.abc import Mapping, Sequence
@@ -246,7 +247,10 @@ def _index_multiseed_models_streaming(
     for seed in seeds:
         for task in spec.tasks:
             values, messages = load_models(
-                (Path(canonical_root),), (task,), seed=int(seed)
+                (Path(canonical_root),),
+                (task,),
+                seed=int(seed),
+                load_carriage=False,
             )
             warnings.extend(messages)
             for model in values:
@@ -292,6 +296,10 @@ def _release_figure_runtime(figure_runtime: Any | None) -> None:
         prepared.backend = None
         prepared.donor_pool = None
     gc.collect()
+    try:
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except (OSError, AttributeError):
+        pass
     try:
         import torch
 
@@ -511,21 +519,148 @@ def generate_special_head_analysis(
     if int(examples_per_page) < 1:
         raise ValueError("examples_per_page must be positive")
 
-    rows, model_references, warnings = _index_multiseed_models_streaming(
-        canonical_root, dataset=spec.name, seeds=seeds
-    )
-    ablations = load_ablation_rows(Path(ablation_root), dataset=spec.name, seeds=seeds, strict=True)
-    selected = select_special_heads_across_seeds(
-        rows,
-        ablations,
-        model_labels=spec.labels,
-        generalist_max_abs_drel=generalist_max_abs_drel,
-    )
-    for row in selected:
-        reference = model_references[(str(row["task"]), int(row["seed"]))]
-        contract = reference["score_contract"]
-        row["score_path"] = str(reference["score_path"])
-        row["checkpoint_sha256"] = str(contract.get("checkpoint_sha256", ""))
+    manifest_path = analysis_dir / "manifest.json"
+    existing_manifest: dict[str, Any] | None = None
+    if manifest_path.is_file() and not force:
+        try:
+            candidate = json.loads(manifest_path.read_text(encoding="utf-8"))
+            request_matches = (
+                candidate.get("analysis_version") == ANALYSIS_VERSION
+                and candidate.get("dataset") == spec.name
+                and candidate.get("seeds") == [int(seed) for seed in seeds]
+                and candidate.get("models") == list(spec.tasks)
+                and candidate.get("graph_indices") == list(graph_indices)
+                and candidate.get("render_graph_indices") == list(render_graph_indices)
+                and int(candidate.get("n_pca_graphs", -1)) == int(n_pca_graphs)
+                and int(candidate.get("examples_per_page", -1))
+                == int(examples_per_page)
+            )
+            if request_matches:
+                existing_manifest = candidate
+                try:
+                    completion = validate_special_head_outputs(
+                        candidate["selected_heads"],
+                        candidate["outputs"],
+                        tasks=spec.tasks,
+                        render_graph_count=len(render_graph_indices),
+                        examples_per_page=int(examples_per_page),
+                    )
+                except (KeyError, OSError, RuntimeError, FileNotFoundError):
+                    completion = []
+                if completion:
+                    if verbose:
+                        print(
+                            "[special-heads-resume] all requested figures already "
+                            "exist; no score cache or checkpoint loaded",
+                            flush=True,
+                        )
+                    return {
+                        **candidate,
+                        "completion": completion,
+                        "manifest_path": str(manifest_path),
+                    }
+        except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):
+            existing_manifest = None
+
+    persisted_selection: list[dict[str, Any]] | None = None
+    persisted_warnings: list[str] = []
+    if existing_manifest is not None:
+        persisted_selection = [
+            dict(row) for row in existing_manifest["selected_heads"]
+        ]
+        persisted_warnings = list(existing_manifest.get("warnings", ()))
+    elif (analysis_dir / "selected_heads.json").is_file() and not force:
+        try:
+            candidate_selection = json.loads(
+                (analysis_dir / "selected_heads.json").read_text(encoding="utf-8")
+            )
+            expected_selection = {
+                (task, role) for task in spec.tasks for role in ROLE_ORDER
+            }
+            observed_selection = {
+                (str(row["task"]), str(row["role"]))
+                for row in candidate_selection
+            }
+            required_fields = {
+                "task",
+                "seed",
+                "layer",
+                "head",
+                "role",
+                "score_path",
+                "selectivity",
+                "joint_sensitivity",
+            }
+            if (
+                len(candidate_selection) == len(expected_selection)
+                and observed_selection == expected_selection
+                and all(required_fields <= set(row) for row in candidate_selection)
+                and all(
+                    int(row["seed"]) in {int(seed) for seed in seeds}
+                    and Path(str(row["score_path"])).is_file()
+                    for row in candidate_selection
+                )
+            ):
+                persisted_selection = [dict(row) for row in candidate_selection]
+        except (
+            OSError,
+            UnicodeError,
+            json.JSONDecodeError,
+            KeyError,
+            TypeError,
+            ValueError,
+        ):
+            persisted_selection = None
+
+    if persisted_selection is not None:
+        selected = persisted_selection
+        warnings = persisted_warnings
+        for row in selected:
+            if str(row["role"]) == "highest_joint":
+                d_rel = float(row["selectivity"])
+                row["display_family"] = (
+                    "generalist"
+                    if abs(d_rel) <= float(generalist_max_abs_drel)
+                    else ("semantic" if d_rel > 0 else "structural")
+                )
+        model_references: dict[tuple[str, int], dict[str, Any]] = {}
+        for row in selected:
+            score_path = Path(str(row["score_path"]))
+            key = (str(row["task"]), int(row["seed"]))
+            model_references[key] = {
+                "task": key[0],
+                "artifact_task": score_path.parents[3].name,
+                "seed": key[1],
+                "score_path": str(score_path),
+                "model_path": str(score_path.parents[2] / "model.json"),
+                "score_contract": {
+                    "checkpoint_sha256": str(row.get("checkpoint_sha256", ""))
+                },
+            }
+        if verbose:
+            print(
+                "[special-heads-resume] reusing persisted all-head selection; "
+                "no population score scan",
+                flush=True,
+            )
+    else:
+        rows, model_references, warnings = _index_multiseed_models_streaming(
+            canonical_root, dataset=spec.name, seeds=seeds
+        )
+        ablations = load_ablation_rows(
+            Path(ablation_root), dataset=spec.name, seeds=seeds, strict=True
+        )
+        selected = select_special_heads_across_seeds(
+            rows,
+            ablations,
+            model_labels=spec.labels,
+            generalist_max_abs_drel=generalist_max_abs_drel,
+        )
+        for row in selected:
+            reference = model_references[(str(row["task"]), int(row["seed"]))]
+            contract = reference["score_contract"]
+            row["score_path"] = str(reference["score_path"])
+            row["checkpoint_sha256"] = str(contract.get("checkpoint_sha256", ""))
     _write_csv(analysis_dir / "selected_heads.csv", selected)
     (analysis_dir / "selected_heads.json").write_text(
         json.dumps(selected, indent=2, default=_json_default), encoding="utf-8"
@@ -537,11 +672,68 @@ def generate_special_head_analysis(
 
     outputs: list[dict[str, Any]] = []
     cache_records: list[dict[str, Any]] = []
-    # Selection is ordered by architecture.  Keep exactly one live transformed
-    # dataset/model, swap seed checkpoints into it, and destroy it before the
-    # next architecture.  This is load-bearing for standard-RAM QM9 Colab.
+    existing_outputs = (
+        list(existing_manifest.get("outputs", ()))
+        if existing_manifest is not None
+        else []
+    )
+    existing_caches = (
+        list(existing_manifest.get("caches", ()))
+        if existing_manifest is not None
+        else []
+    )
+    # Keep exactly one live transformed dataset/model for each incomplete
+    # task/seed group, reuse it across that group's diagnostics, then destroy it.
+    # This is load-bearing for standard-RAM QM9 Colab.
     active_runtime: dict[str, Any] = {}
     for (task, seed), group in grouped.items():
+        group_roles = {str(row["role"]) for row in group}
+        resumable_outputs = [
+            dict(row)
+            for row in existing_outputs
+            if str(row.get("task")) == task
+            and int(row.get("seed", -1)) == int(seed)
+            and str(row.get("role")) in group_roles
+        ]
+        expected_pages = (
+            len(render_graph_indices) + int(examples_per_page) - 1
+        ) // int(examples_per_page)
+        resumable = True
+        for role in group_roles:
+            role_outputs = [
+                row for row in resumable_outputs if str(row.get("role")) == role
+            ]
+            counts = {
+                figure: sum(
+                    str(row.get("figure")) == figure for row in role_outputs
+                )
+                for figure in ("attention", "pca", "distance")
+            }
+            if counts != {
+                "attention": expected_pages,
+                "pca": 1,
+                "distance": 1,
+            } or any(
+                not Path(str(row.get(field, ""))).is_file()
+                for row in role_outputs
+                for field in ("png", "pdf", "metadata")
+            ):
+                resumable = False
+                break
+        if resumable and resumable_outputs:
+            outputs.extend(resumable_outputs)
+            cache_records.extend(
+                dict(row)
+                for row in existing_caches
+                if str(row.get("task")) == task
+                and int(row.get("seed", -1)) == int(seed)
+            )
+            if verbose:
+                print(
+                    f"[special-heads-resume:{task}/seed_{seed}] complete; skipped",
+                    flush=True,
+                )
+            continue
         if active_runtime.get("task") not in {None, task}:
             _release_figure_runtime(active_runtime.get("value"))
             active_runtime.clear()
@@ -831,8 +1023,8 @@ def generate_special_head_analysis(
                 }
             )
         # Cached arrays and rendered figures can otherwise survive until the
-        # next checkpoint group in notebook runtimes.  Only the reusable model
-        # runtime is intentionally retained across seeds of one architecture.
+        # next checkpoint group in notebook runtimes.  Release the complete
+        # group, including its model and loaders, before proceeding.
         del (
             attention_compute,
             pca_compute,
@@ -850,6 +1042,8 @@ def generate_special_head_analysis(
                 torch.cuda.empty_cache()
         except (ImportError, RuntimeError):
             pass
+        _release_figure_runtime(active_runtime.get("value"))
+        active_runtime.clear()
     _release_figure_runtime(active_runtime.get("value"))
     active_runtime.clear()
 
@@ -883,7 +1077,6 @@ def generate_special_head_analysis(
         "completion": completion,
         "warnings": warnings,
     }
-    manifest_path = analysis_dir / "manifest.json"
     manifest_path.write_text(
         json.dumps(manifest, indent=2, default=_json_default), encoding="utf-8"
     )

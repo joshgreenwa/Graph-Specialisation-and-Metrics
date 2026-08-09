@@ -210,6 +210,7 @@ def load_models(
     tasks: Sequence[str],
     *,
     seed: int,
+    load_carriage: bool = True,
 ) -> tuple[list[SpatialModel], list[str]]:
     """Load every usable task, returning warnings instead of protocol barriers."""
 
@@ -267,11 +268,15 @@ def load_models(
                 )
         carriage = None
         carriage_path = None
-        carriage_candidates = [
-            candidate
-            for candidate, _candidate_score, _candidate_metadata in loaded
-            if candidate["carriage_exists"]
-        ]
+        carriage_candidates = (
+            [
+                candidate
+                for candidate, _candidate_score, _candidate_metadata in loaded
+                if candidate["carriage_exists"]
+            ]
+            if load_carriage
+            else []
+        )
         for carriage_candidate in carriage_candidates:
             candidate_path = Path(carriage_candidate["carriage_path"])
             try:

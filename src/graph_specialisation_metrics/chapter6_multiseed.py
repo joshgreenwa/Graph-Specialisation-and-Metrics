@@ -10,6 +10,7 @@ the final validation panel also reads focused clean-head ablation summaries.
 from __future__ import annotations
 
 import csv
+import ctypes
 import gc
 import json
 from collections.abc import Mapping, Sequence
@@ -231,6 +232,10 @@ def _release_cached_models(models: list[SpatialModel]) -> None:
 
     models.clear()
     gc.collect()
+    try:
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except (OSError, AttributeError):
+        pass
     try:
         import torch
 
