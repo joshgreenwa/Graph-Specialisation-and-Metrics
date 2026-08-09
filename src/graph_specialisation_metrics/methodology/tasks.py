@@ -36,8 +36,12 @@ QM9_FROZEN_KHOP_SUPPORT_TASKS = frozenset(
 QM9_DENSE_ADAPTER_VERSION = "canonical-grit-qm9-dense-full-support-v2"
 PEPTIDES_FROZEN_KHOP_SUPPORT_TASKS = frozenset(
     {
+        "peptides_func_1hop",
+        "peptides_func_1hop_vnode",
         "peptides_func_2hop",
         "peptides_func_2hop_vnode",
+        "peptides_struct_1hop",
+        "peptides_struct_1hop_vnode",
         "peptides_struct_2hop",
         "peptides_struct_2hop_vnode",
     }

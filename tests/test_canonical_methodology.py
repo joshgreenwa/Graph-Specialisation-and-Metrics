@@ -958,6 +958,36 @@ def test_qm9_frozen_attention_support_is_registered_and_preserved():
     assert torch.equal(event.pos, base.pos)
 
 
+@pytest.mark.parametrize(
+    "task_name",
+    (
+        "peptides_func_1hop",
+        "peptides_func_1hop_vnode",
+        "peptides_struct_1hop",
+        "peptides_struct_1hop_vnode",
+    ),
+)
+def test_peptides_onehop_frozen_attention_support_is_registered_and_preserved(task_name):
+    task = get_task(task_name)
+    base = structural_graph()
+    base.rrwp_attention_edge_index = torch.tensor(
+        [[0, 0, 1, 1, 2, 2], [0, 1, 0, 2, 1, 2]],
+        dtype=torch.long,
+    )
+
+    event = structural_donor_swap(
+        base,
+        0,
+        2,
+        task=task,
+        duplicate_tolerance=1e-7,
+    )
+
+    assert "rrwp_attention_edge_index" in task.fixed_support_fields
+    assert task.adapter_version == "canonical-grit-peptides-frozen-khop-support-v1"
+    assert torch.equal(event.rrwp_attention_edge_index, base.rrwp_attention_edge_index)
+
+
 def test_qm9_dense_uses_full_support_without_a_sparse_support_tensor():
     task = get_task("qm9_gap_dense")
     base = structural_graph()

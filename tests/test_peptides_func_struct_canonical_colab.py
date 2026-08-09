@@ -95,13 +95,13 @@ def test_manifest_is_explicitly_mapped_and_rejects_non_best_checkpoint():
 def test_all_unified_peptides_tasks_replay_expected_geometry_and_support():
     expected = {
         "peptides_func_dense": (443_434, False, False),
-        "peptides_func_1hop": (443_434, False, False),
-        "peptides_func_1hop_vnode": (443_530, True, False),
+        "peptides_func_1hop": (443_434, False, True),
+        "peptides_func_1hop_vnode": (443_530, True, True),
         "peptides_func_2hop": (443_434, False, True),
         "peptides_func_2hop_vnode": (443_530, True, True),
         "peptides_struct_dense": (449_579, False, False),
-        "peptides_struct_1hop": (449_579, False, False),
-        "peptides_struct_1hop_vnode": (449_675, True, False),
+        "peptides_struct_1hop": (449_579, False, True),
+        "peptides_struct_1hop_vnode": (449_675, True, True),
         "peptides_struct_2hop": (449_579, False, True),
         "peptides_struct_2hop_vnode": (449_675, True, True),
     }
