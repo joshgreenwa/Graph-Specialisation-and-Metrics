@@ -19,7 +19,7 @@ NOTEBOOKS = {
     for dataset in ("func", "struct")
     for seed in range(3)
 }
-PINNED_REVISION = "5c3ec0d628490337fac5289029c45ef9d7ca4b3e"
+PINNED_REVISION = "a67379fecd6ff7da5eb8a1ce741a9ecbdd596066"
 PINNED_BRANCH = "expansion/carriage_experiments"
 
 
