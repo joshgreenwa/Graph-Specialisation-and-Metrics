@@ -184,9 +184,11 @@ bootstrap()
 from graph_specialisation_metrics.chapter6_multiseed import (
     ANALYSIS_VERSION as CORE_ANALYSIS_VERSION,
     DISTANCE_ALIGNMENT_VERSION,
+    PRESENTATION_VARIANTS_VERSION,
     SPECIALISATION_LANDSCAPE_VARIANT_VERSION,
     cache_inventory,
     refresh_distance_alignment,
+    refresh_presentation_variants,
     refresh_specialisation_landscape_variant,
     run,
 )
@@ -419,6 +421,15 @@ if (
         flush=True,
     )
     refresh_specialisation_landscape_variant(OUTPUT_DIR, dataset=DATASET)
+    manifest = json.loads(core_manifest_path.read_text(encoding="utf-8"))
+if manifest.get("presentation_variants_version") != PRESENTATION_VARIANTS_VERSION:
+    print(
+        "[chapter6-multiseed-refresh] building seed-mean reach-gap and overlaid "
+        "final-state-response companions from saved tables; no model or score "
+        "cache is loaded",
+        flush=True,
+    )
+    refresh_presentation_variants(OUTPUT_DIR, dataset=DATASET, seeds=SEEDS)
     manifest = json.loads(core_manifest_path.read_text(encoding="utf-8"))
 release_memory("after-core-figures")
 

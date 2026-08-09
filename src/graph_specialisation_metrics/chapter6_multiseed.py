@@ -33,6 +33,7 @@ from .zinc_cached_rrwp_comparison import DISPLAY_BINS
 ANALYSIS_VERSION = "chapter6-molecular-multiseed-v5"
 DISTANCE_ALIGNMENT_VERSION = "all-finite-heads-v1"
 SPECIALISATION_LANDSCAPE_VARIANT_VERSION = "j-drel-only-v1"
+PRESENTATION_VARIANTS_VERSION = "seed-mean-reach-and-overlaid-response-v1"
 SEEDS = (0, 1, 2)
 CHANNELS = ("semantic", "structural")
 
@@ -1336,6 +1337,35 @@ def _head_matrix(
     return matrix, layers, heads
 
 
+def _seed_mean_head_matrix(
+    rows: Sequence[Mapping[str, Any]],
+    task: str,
+    seeds: Sequence[int],
+    field: str,
+) -> tuple[np.ndarray, list[int], list[int]]:
+    """Average a head field by layer/head coordinate over independent seeds."""
+
+    requested_seeds = {int(seed) for seed in seeds}
+    selected = [
+        row
+        for row in rows
+        if str(row["task"]) == task and int(row["seed"]) in requested_seeds
+    ]
+    layers = sorted({int(row["layer"]) for row in selected})
+    heads = sorted({int(row["head"]) for row in selected})
+    matrix = np.full((len(layers), len(heads)), np.nan)
+    values: dict[tuple[int, int], list[float]] = {}
+    for row in selected:
+        value = float(row.get(field, np.nan))
+        if np.isfinite(value):
+            values.setdefault((int(row["layer"]), int(row["head"])), []).append(value)
+    layer_index = {value: index for index, value in enumerate(layers)}
+    head_index = {value: index for index, value in enumerate(heads)}
+    for (layer, head), cell_values in values.items():
+        matrix[layer_index[layer], head_index[head]] = float(np.mean(cell_values))
+    return matrix, layers, heads
+
+
 def _plot_reach_gap_heatmap(
     rows: Sequence[Mapping[str, Any]],
     spec: DatasetSpec,
@@ -1391,6 +1421,73 @@ def _plot_reach_gap_heatmap(
         )
     figure.suptitle(
         f"{spec.name.upper()}: expected {channel} score reach minus attention reach"
+    )
+    _scale_figure_text(
+        figure,
+        preserve_tick_axes=tuple(axis for row in axes for axis in row),
+    )
+    return _save_figure(figure, figures_dir, stem)
+
+
+def _plot_seed_mean_reach_gap_heatmap(
+    rows: Sequence[Mapping[str, Any]],
+    spec: DatasetSpec,
+    seeds: Sequence[int],
+    figures_dir: Path,
+    *,
+    channel: str,
+    stem: str,
+) -> list[Path]:
+    """Plot one coordinate-wise seed-mean reach-gap heatmap per architecture."""
+
+    import matplotlib.pyplot as plt
+
+    field = f"{channel}_attention_reach_gap"
+    matrices = [
+        _seed_mean_head_matrix(rows, task, seeds, field)[0] for task in spec.tasks
+    ]
+    finite_parts = [matrix[np.isfinite(matrix)] for matrix in matrices]
+    finite = (
+        np.concatenate([values for values in finite_parts if values.size])
+        if any(values.size for values in finite_parts)
+        else np.asarray([], dtype=np.float64)
+    )
+    limit = float(np.quantile(np.abs(finite), 0.99)) if finite.size else 1.0
+    limit = max(limit, 1.0e-6)
+    figure, axes = plt.subplots(
+        1,
+        len(spec.tasks),
+        figsize=(3.55 * len(spec.tasks), 3.05),
+        squeeze=False,
+        constrained_layout=True,
+    )
+    image = None
+    for column, task in enumerate(spec.tasks):
+        matrix, layers, heads = _seed_mean_head_matrix(rows, task, seeds, field)
+        axis = axes[0, column]
+        image = axis.imshow(
+            matrix,
+            cmap="coolwarm",
+            vmin=-limit,
+            vmax=limit,
+            aspect="auto",
+            interpolation="nearest",
+        )
+        axis.set_xticks(np.arange(len(heads)), heads, fontsize=7)
+        axis.set_yticks(np.arange(len(layers)), layers, fontsize=7)
+        axis.set_title(spec.labels[task], fontsize=10)
+        axis.set_xlabel("head")
+        if column == 0:
+            axis.set_ylabel("layer")
+    if image is not None:
+        figure.colorbar(
+            image,
+            ax=axes,
+            label="expected score reach $-$ attention reach (hops)",
+            pad=0.01,
+        )
+    figure.suptitle(
+        f"{spec.name.upper()}: seed-mean {channel} score reach minus attention reach"
     )
     _scale_figure_text(
         figure,
@@ -1779,7 +1876,7 @@ def _plot_carriage_response_variants(
             selected = [
                 row for row in rows if str(row["task"]) == task and str(row["variant"]) == variant
             ]
-            labels = sorted({str(row["distance"]) for row in selected}, key=_distance_order)
+            labels = _observed_response_distance_labels(rows, variant=variant)
             x = np.arange(len(labels))
             for channel, (colour, marker, label) in channel_styles.items():
                 lookup = {
@@ -1850,7 +1947,7 @@ def _plot_final_state_response(
     for column, task in enumerate(spec.tasks):
         axis = axes[0, column]
         task_rows = [row for row in selected_rows if str(row["task"]) == task]
-        labels = sorted({str(row["distance"]) for row in task_rows}, key=_distance_order)
+        labels = _observed_response_distance_labels(rows, variant="raw")
         x = np.arange(len(labels))
         for channel, (colour, marker, label) in styles.items():
             lookup = {
@@ -1882,6 +1979,226 @@ def _plot_final_state_response(
     figure.suptitle(f"{spec.name.upper()}: final-state response across architectures")
     _scale_figure_text(figure)
     return _save_figure(figure, figures_dir, "09b_final_state_response")
+
+
+def _observed_response_distance_labels(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    variant: str,
+) -> list[str]:
+    """Return only distance categories observed by at least one architecture."""
+
+    selected = [row for row in rows if str(row.get("variant")) == variant]
+    labels = sorted({str(row["distance"]) for row in selected}, key=_distance_order)
+    observed: list[str] = []
+    for label in labels:
+        label_rows = [row for row in selected if str(row["distance"]) == label]
+        available = False
+        for row in label_rows:
+            try:
+                seed_count = int(float(row.get("seeds", 0)))
+            except (TypeError, ValueError):
+                seed_count = 0
+            value = float(row.get("response_mean", np.nan))
+            if np.isfinite(value) and (seed_count > 0 or "seeds" not in row):
+                available = True
+                break
+        if available:
+            observed.append(label)
+    return observed
+
+
+def _plot_overlaid_final_state_response(
+    rows: Sequence[Mapping[str, Any]],
+    spec: DatasetSpec,
+    figures_dir: Path,
+    *,
+    variant: str,
+    stem: str,
+) -> list[Path]:
+    """Overlay architecture curves in separate semantic and structural panels."""
+
+    import matplotlib.pyplot as plt
+
+    selected_rows = [row for row in rows if str(row.get("variant")) == variant]
+    if not selected_rows:
+        return []
+    labels = _observed_response_distance_labels(rows, variant=variant)
+    if not labels:
+        return []
+    x = np.arange(len(labels))
+    colours = plt.get_cmap("tab10")(np.linspace(0.0, 0.8, len(spec.tasks)))
+    markers = ("o", "s", "^", "D", "P")
+    figure, axes = plt.subplots(
+        1,
+        2,
+        figsize=(11.2, 4.4),
+        sharex=True,
+        sharey=True,
+        squeeze=False,
+        constrained_layout=True,
+    )
+    for column, channel in enumerate(CHANNELS):
+        axis = axes[0, column]
+        for task_index, task in enumerate(spec.tasks):
+            lookup = {
+                str(row["distance"]): row
+                for row in selected_rows
+                if str(row["task"]) == task and str(row["channel"]) == channel
+            }
+            if not lookup:
+                continue
+            mean = np.asarray(
+                [
+                    float(lookup[label]["response_mean"])
+                    if label in lookup
+                    else np.nan
+                    for label in labels
+                ]
+            )
+            low = np.asarray(
+                [
+                    float(lookup[label]["response_min"])
+                    if label in lookup
+                    else np.nan
+                    for label in labels
+                ]
+            )
+            high = np.asarray(
+                [
+                    float(lookup[label]["response_max"])
+                    if label in lookup
+                    else np.nan
+                    for label in labels
+                ]
+            )
+            colour = colours[task_index]
+            axis.plot(
+                x,
+                mean,
+                color=colour,
+                marker=markers[task_index % len(markers)],
+                linewidth=1.7,
+                label=spec.labels[task],
+            )
+            axis.fill_between(x, low, high, color=colour, alpha=0.10, linewidth=0)
+        axis.set_xticks(x, labels)
+        axis.set_title(channel.capitalize())
+        axis.set_xlabel("graph distance")
+        axis.grid(axis="y", alpha=0.16, linewidth=0.6)
+        if column == 0:
+            axis.set_ylabel(
+                "Normalised final-state response"
+                if variant == "normalised"
+                else "Final-state response"
+            )
+            axis.legend(frameon=False, fontsize=8)
+        if variant == "raw":
+            axis.ticklabel_format(axis="y", style="sci", scilimits=(-2, 2))
+    if variant == "normalised":
+        figure.suptitle(
+            f"{spec.name.upper()}: normalised final-state response by architecture"
+        )
+    else:
+        figure.suptitle(f"{spec.name.upper()}: final-state response by architecture")
+    _scale_figure_text(figure)
+    return _save_figure(figure, figures_dir, stem)
+
+
+def refresh_presentation_variants(
+    output_dir: Path,
+    *,
+    dataset: str,
+    seeds: Sequence[int] = SEEDS,
+) -> dict[str, Any]:
+    """Build seed-mean and overlaid companions from the saved analysis tables."""
+
+    output_dir = Path(output_dir)
+    head_table = output_dir / "head_metrics.csv"
+    response_table = output_dir / "final_state_response_variants.csv"
+    missing = [path for path in (head_table, response_table) if not path.is_file()]
+    if missing:
+        raise FileNotFoundError(
+            "missing saved Chapter 6 table(s): " + ", ".join(str(path) for path in missing)
+        )
+    with head_table.open("r", encoding="utf-8", newline="") as handle:
+        head_rows = list(csv.DictReader(handle))
+    with response_table.open("r", encoding="utf-8", newline="") as handle:
+        response_rows = list(csv.DictReader(handle))
+    if not head_rows:
+        raise ValueError(f"saved head table is empty: {head_table}")
+    if not response_rows:
+        raise ValueError(f"saved final-state response table is empty: {response_table}")
+
+    spec = dataset_spec(dataset)
+    figures_dir = output_dir / "figures"
+    figures: list[Path] = []
+    figures.extend(
+        _plot_seed_mean_reach_gap_heatmap(
+            head_rows,
+            spec,
+            seeds,
+            figures_dir,
+            channel="semantic",
+            stem="03b_semantic_attention_score_reach_gap_seed_mean",
+        )
+    )
+    figures.extend(
+        _plot_seed_mean_reach_gap_heatmap(
+            head_rows,
+            spec,
+            seeds,
+            figures_dir,
+            channel="structural",
+            stem="04b_structural_attention_score_reach_gap_seed_mean",
+        )
+    )
+    figures.extend(
+        _plot_overlaid_final_state_response(
+            response_rows,
+            spec,
+            figures_dir,
+            variant="raw",
+            stem="09c_final_state_response_by_model",
+        )
+    )
+    figures.extend(
+        _plot_overlaid_final_state_response(
+            response_rows,
+            spec,
+            figures_dir,
+            variant="normalised",
+            stem="09d_normalised_final_state_response_by_model",
+        )
+    )
+
+    manifest_path = output_dir / "manifest.json"
+    manifest: dict[str, Any] = {}
+    if manifest_path.is_file():
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["presentation_variants_version"] = PRESENTATION_VARIANTS_VERSION
+    manifest_figures = [str(path) for path in manifest.get("figures", ())]
+    for path in figures:
+        if str(path) not in manifest_figures:
+            manifest_figures.append(str(path))
+    manifest["figures"] = manifest_figures
+    interpretation = dict(manifest.get("interpretation", {}))
+    interpretation["seed_mean_reach_gap"] = (
+        "coordinate-wise mean over layer/head slots across independent seeds; "
+        "a model-level visual summary, not cross-seed head matching"
+    )
+    interpretation["overlaid_final_state_response"] = (
+        "architecture means with the observed seed range; globally empty distance "
+        "categories are omitted"
+    )
+    manifest["interpretation"] = interpretation
+    manifest_path.write_text(
+        json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8"
+    )
+    return {
+        "presentation_variants_version": PRESENTATION_VARIANTS_VERSION,
+        "figures": [str(path) for path in figures],
+    }
 
 
 def _spearman(x: Sequence[float], y: Sequence[float]) -> float:
@@ -2087,6 +2404,26 @@ def run(
         )
     )
     figures.extend(
+        _plot_seed_mean_reach_gap_heatmap(
+            head_rows,
+            spec,
+            seeds,
+            figures_dir,
+            channel="semantic",
+            stem="03b_semantic_attention_score_reach_gap_seed_mean",
+        )
+    )
+    figures.extend(
+        _plot_seed_mean_reach_gap_heatmap(
+            head_rows,
+            spec,
+            seeds,
+            figures_dir,
+            channel="structural",
+            stem="04b_structural_attention_score_reach_gap_seed_mean",
+        )
+    )
+    figures.extend(
         _plot_distance_alignment(
             head_rows,
             alignment_rows,
@@ -2099,6 +2436,24 @@ def run(
     figures.extend(_plot_matched_strength_profiles(matched_profile_rows, spec, figures_dir))
     figures.extend(_plot_carriage_response_variants(response_variant_rows, spec, figures_dir))
     figures.extend(_plot_final_state_response(response_variant_rows, spec, figures_dir))
+    figures.extend(
+        _plot_overlaid_final_state_response(
+            response_variant_rows,
+            spec,
+            figures_dir,
+            variant="raw",
+            stem="09c_final_state_response_by_model",
+        )
+    )
+    figures.extend(
+        _plot_overlaid_final_state_response(
+            response_variant_rows,
+            spec,
+            figures_dir,
+            variant="normalised",
+            stem="09d_normalised_final_state_response_by_model",
+        )
+    )
     figures.extend(_plot_joint_sensitivity_ablation(ablation_rows, spec, figures_dir))
     if trajectory_rows:
         from .chapter6_score_trajectory import plot as plot_score_trajectory
@@ -2121,12 +2476,16 @@ def run(
         "specialisation_landscape_variant_version": (
             SPECIALISATION_LANDSCAPE_VARIANT_VERSION
         ),
+        "presentation_variants_version": PRESENTATION_VARIANTS_VERSION,
         "runs_loaded": runs_loaded,
         "warnings": warnings,
         "figures": [str(path) for path in figures],
         "tables": [str(output_dir / name) for name in tables],
         "interpretation": {
-            "head_identity": "never aligned or averaged across seeds",
+            "head_identity": (
+                "primary head panels retain seed identity; the seed-mean reach-gap "
+                "companion averages layer/head coordinates as a model-level visual summary"
+            ),
             "seed_bands": "minimum-to-maximum range over independently trained seeds",
             "expected_distance": "molecular graph distance; virtual node is separate",
             "reach_gap": "intervention-defined score reach minus clean-attention reach",
@@ -2151,6 +2510,10 @@ def run(
                 "Spearman correlations are computed and displayed separately within seed"
             ),
             "final_state_response": "learned response, not task necessity",
+            "overlaid_final_state_response": (
+                "architecture means with the observed seed range; globally empty distance "
+                "categories are omitted"
+            ),
         },
     }
     if trajectory_rows:

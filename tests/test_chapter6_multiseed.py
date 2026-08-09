@@ -23,6 +23,7 @@ from graph_specialisation_metrics.chapter6_clean_ablation import (
     summary_path as ablation_summary_path,
 )
 from graph_specialisation_metrics.chapter6_multiseed import (
+    _observed_response_distance_labels,
     alignment_summary_rows,
     cache_inventory,
     dataset_spec,
@@ -279,6 +280,30 @@ def test_matched_profiles_control_for_opportunity_and_use_raw_carriage():
     np.testing.assert_allclose(raw_carriage[:3], (1.0, 2.0, 1.0))
 
 
+def test_response_distance_labels_omit_globally_empty_shells():
+    rows = [
+        {
+            "variant": "raw",
+            "distance": "0",
+            "seeds": 3,
+            "response_mean": 0.2,
+        },
+        {
+            "variant": "raw",
+            "distance": "8+",
+            "seeds": 0,
+            "response_mean": float("nan"),
+        },
+        {
+            "variant": "raw",
+            "distance": "virtual",
+            "seeds": 2,
+            "response_mean": 0.0,
+        },
+    ]
+    assert _observed_response_distance_labels(rows, variant="raw") == ["0", "virtual"]
+
+
 def test_clean_ablation_summary_inventory_and_loading(tmp_path):
     spec = dataset_spec("zinc")
     root = tmp_path / "ablations"
@@ -347,7 +372,7 @@ def test_run_builds_dataset_specific_multiseed_suite(tmp_path, dataset):
     )
     assert manifest["runs_loaded"] == 15
     assert manifest["dataset"] == dataset
-    expected_pngs = 16 if dataset == "zinc" else 14
+    expected_pngs = 20 if dataset == "zinc" else 18
     assert len([path for path in manifest["figures"] if path.endswith(".png")]) == expected_pngs
     assert (
         output_dir / "figures/02b_specialisation_landscapes_selectivity.pdf"
@@ -361,6 +386,16 @@ def test_run_builds_dataset_specific_multiseed_suite(tmp_path, dataset):
     assert (output_dir / "figures/08_matched_score_and_final_state_response.pdf").is_file()
     assert (output_dir / "figures/09_final_state_response_variants.pdf").is_file()
     assert (output_dir / "figures/09b_final_state_response.pdf").is_file()
+    assert (
+        output_dir / "figures/03b_semantic_attention_score_reach_gap_seed_mean.pdf"
+    ).is_file()
+    assert (
+        output_dir / "figures/04b_structural_attention_score_reach_gap_seed_mean.pdf"
+    ).is_file()
+    assert (output_dir / "figures/09c_final_state_response_by_model.pdf").is_file()
+    assert (
+        output_dir / "figures/09d_normalised_final_state_response_by_model.pdf"
+    ).is_file()
     assert (output_dir / "figures/10_joint_sensitivity_head_ablation.pdf").is_file()
     if dataset == "zinc":
         assert (output_dir / "figures/11a_dense_score_trajectory.pdf").is_file()
