@@ -1,0 +1,23 @@
+% Requires \usepackage{booktabs}.
+\begin{table}[t]
+  \centering
+  \footnotesize
+  \setlength{\tabcolsep}{3.5pt}
+  \begin{tabular}{@{}lcrrrrr@{}}
+    \toprule
+    Dataset & Trained models & $G$ & $S$ & $D$ & $P_{\mathrm{sem}}$ & $B$ \\
+    \midrule
+    ZINC             & $5\!\times\!3$ & 48 & 6 & 8 & 2,000 & 2,000 \\
+    QM9--GAP         & $5\!\times\!3$ & 48 & 6 & 8 & 2,000 & 2,000 \\
+    Peptides-func    & $5\!\times\!3$ & 48 & 6 & 8 & 2,000 & 2,000 \\
+    Peptides-struct  & $5\!\times\!3$ & 48 & 6 & 8 & 2,000 & 2,000 \\
+    \bottomrule
+  \end{tabular}
+  \caption{Configuration used to compute semantic and structural scores for each trained
+  checkpoint. The five variants are dense, 1-hop, 1-hop+VN, 2-hop, and 2-hop+VN, each with seeds
+  0--2. $G$ is the number of score graphs, $S$ the sources per graph and channel, $D$ the donors
+  per source, $P_{\mathrm{sem}}$ the semantic donor-graph pool, and $B$ the bootstrap replicates;
+  structural donors are drawn within the scored graph. Analysis/bootstrap RNG seeds are
+  31,415/17,071.}
+  \label{tab:score-computation-config}
+\end{table}
