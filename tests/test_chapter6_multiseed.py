@@ -237,7 +237,7 @@ def test_alignment_summary_reports_coarse_agreement():
         {
             "task": "zinc",
             "seed": seed,
-            "joint_sensitivity": 1.0 + head,
+            "joint_sensitivity": 0.0 if head == 0 else 1.0 + head,
             "semantic_expected_distance": float(head),
             "structural_expected_distance": float(head),
             "semantic_peak_distance": head,
@@ -246,7 +246,8 @@ def test_alignment_summary_reports_coarse_agreement():
         for seed in (0, 1, 2)
         for head in (0, 1, 2)
     ]
-    summary = alignment_summary_rows(rows, activity_quantile=0.0)
+    summary = alignment_summary_rows(rows)
+    assert summary[0]["heads"] == 9
     assert summary[0]["spearman_rho"] == pytest.approx(1.0)
     assert summary[0]["same_peak_fraction"] == pytest.approx(1.0)
     assert summary[0]["same_or_adjacent_peak_fraction"] == pytest.approx(1.0)

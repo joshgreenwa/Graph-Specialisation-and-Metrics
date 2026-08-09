@@ -49,7 +49,6 @@ TASKS = (
     "zinc",
 )
 TRAIN_SEED = 42
-REPRESENTATIVE_ACTIVITY_QUANTILE = 0.25
 
 # Optional molecular examples. The alignment comparison is retained as a
 # switch, while the operator-reach mismatch is the default Chapter 6 view.
@@ -140,7 +139,7 @@ def bootstrap() -> None:
 
 bootstrap()
 
-from graph_specialisation_metrics.chapter6_spatial_explorer import inventory, run  # noqa: E402
+from graph_specialisation_metrics.chapter6_spatial_explorer import inventory, run
 
 
 print(
@@ -172,7 +171,6 @@ result = run(
     OUTPUT_DIR,
     tasks=TASKS,
     seed=TRAIN_SEED,
-    activity_quantile=REPRESENTATIVE_ACTIVITY_QUANTILE,
     verbose=True,
 )
 

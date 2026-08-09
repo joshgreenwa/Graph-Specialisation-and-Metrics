@@ -8,8 +8,8 @@ import torch
 
 from graph_specialisation_metrics.chapter6_spatial_explorer import (
     graph_spatial_metrics,
-    head_role_score_allocation,
     head_metrics,
+    head_role_score_allocation,
     layer_distance_profiles,
     layer_score_organisation,
     layer_summary,
@@ -217,7 +217,7 @@ def test_head_metrics_keep_width_uncertainty_and_attention_separate(tmp_path):
     assert mismatch_summary[0]["heads"] > 0
     mismatch_rows = representative_reach_mismatches(rows)
     assert len(mismatch_rows) == 1
-    assert mismatch_rows[0]["role"] == "strongest active reach mismatch"
+    assert mismatch_rows[0]["role"] == "strongest reach mismatch"
 
 
 def test_loader_falls_back_to_equivalent_duplicate_carriage(tmp_path):

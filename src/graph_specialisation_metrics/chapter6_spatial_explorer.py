@@ -678,41 +678,32 @@ def head_metrics(models: Sequence[SpatialModel]) -> list[dict[str, Any]]:
 
 
 def reach_mismatch_summary(
-    rows: Sequence[Mapping[str, Any]], *, activity_quantile: float = 0.25
+    rows: Sequence[Mapping[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Summarise attention--score reach mismatch across active heads."""
+    """Summarise attention--score reach mismatch across all defined heads."""
 
     by_task: dict[str, list[Mapping[str, Any]]] = {}
     for row in rows:
         by_task.setdefault(str(row["task"]), []).append(row)
     output: list[dict[str, Any]] = []
     for task, task_rows in by_task.items():
-        active_rows = [
-            row for row in task_rows if str(row.get("family")) != "inactive"
-        ]
-        joint = np.asarray(
-            [float(row["joint_sensitivity"]) for row in active_rows], dtype=np.float64
-        )
-        finite_joint = joint[np.isfinite(joint)]
-        floor = (
-            float(np.quantile(finite_joint, activity_quantile))
-            if finite_joint.size
-            else float("inf")
-        )
         selected = [
             row
-            for row in active_rows
+            for row in task_rows
             if np.isfinite(float(row["max_abs_attention_reach_gap"]))
-            and np.isfinite(float(row["joint_sensitivity"]))
-            and float(row["joint_sensitivity"]) >= floor
         ]
         if not selected:
             continue
         maximum = np.asarray(
             [float(row["max_abs_attention_reach_gap"]) for row in selected]
         )
-        weights = np.maximum(
-            np.asarray([float(row["joint_sensitivity"]) for row in selected]), 0.0
+        weights = np.asarray(
+            [
+                max(float(row["joint_sensitivity"]), 0.0)
+                if np.isfinite(float(row["joint_sensitivity"]))
+                else 0.0
+                for row in selected
+            ]
         )
         semantic = np.asarray(
             [float(row["semantic_attention_reach_gap"]) for row in selected]
@@ -724,8 +715,7 @@ def reach_mismatch_summary(
         output.append(
             {
                 "task": task,
-                "activity_quantile": float(activity_quantile),
-                "activity_floor": floor,
+                "eligibility": "finite attention and score reach",
                 "heads": len(selected),
                 "median_max_abs_gap": float(np.median(maximum)),
                 "p90_max_abs_gap": float(np.quantile(maximum, 0.90)),
@@ -745,35 +735,19 @@ def reach_mismatch_summary(
 
 
 def representative_reach_mismatches(
-    rows: Sequence[Mapping[str, Any]], *, activity_quantile: float = 0.25
+    rows: Sequence[Mapping[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Select the largest active attention--score reach mismatch per model."""
+    """Select the largest defined attention--score reach mismatch per model."""
 
     by_task: dict[str, list[Mapping[str, Any]]] = {}
     for row in rows:
         by_task.setdefault(str(row["task"]), []).append(row)
     output: list[dict[str, Any]] = []
-    for task, task_rows in by_task.items():
-        active_rows = [
-            row for row in task_rows if str(row.get("family")) != "inactive"
-        ]
-        finite_joint = np.asarray(
-            [
-                float(row["joint_sensitivity"])
-                for row in active_rows
-                if np.isfinite(float(row["joint_sensitivity"]))
-            ]
-        )
-        floor = (
-            float(np.quantile(finite_joint, activity_quantile))
-            if finite_joint.size
-            else float("inf")
-        )
+    for task_rows in by_task.values():
         eligible = [
             row
-            for row in active_rows
+            for row in task_rows
             if np.isfinite(float(row["max_abs_attention_reach_gap"]))
-            and float(row["joint_sensitivity"]) >= floor
         ]
         if not eligible:
             continue
@@ -783,9 +757,8 @@ def representative_reach_mismatches(
         output.append(
             {
                 **dict(selected),
-                "role": "strongest active reach mismatch",
-                "activity_quantile": float(activity_quantile),
-                "activity_floor": floor,
+                "role": "strongest reach mismatch",
+                "eligibility": "finite attention and score reach",
             }
         )
     return output
@@ -859,27 +832,18 @@ def layer_summary(rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
 
 
 def representative_heads(
-    rows: Sequence[Mapping[str, Any]], *, activity_quantile: float = 0.25
+    rows: Sequence[Mapping[str, Any]],
 ) -> list[dict[str, Any]]:
     by_task: dict[str, list[Mapping[str, Any]]] = {}
     for row in rows:
         by_task.setdefault(str(row["task"]), []).append(row)
     output: list[dict[str, Any]] = []
     for group in by_task.values():
-        finite_joint = np.asarray(
-            [
-                float(row["joint_sensitivity"])
-                for row in group
-                if np.isfinite(float(row["joint_sensitivity"]))
-            ]
-        )
-        floor = (
-            float(np.quantile(finite_joint, activity_quantile)) if finite_joint.size else -np.inf
-        )
         eligible = [
             row
             for row in group
-            if float(row["joint_sensitivity"]) >= floor and np.isfinite(float(row["overlap"]))
+            if np.isfinite(float(row["joint_sensitivity"]))
+            and np.isfinite(float(row["overlap"]))
         ]
         if not eligible:
             continue
@@ -1963,11 +1927,8 @@ def _plot_alignment_head_roles(
             if np.isfinite(float(row["overlap"])) and np.isfinite(float(row["joint_sensitivity"]))
         ]
         if eligible:
-            activity_floor = float(
-                np.quantile([float(row["joint_sensitivity"]) for row in eligible], 0.25)
-            )
             labelled = sorted(
-                [row for row in eligible if float(row["joint_sensitivity"]) >= activity_floor],
+                eligible,
                 key=lambda row: float(row["overlap"]),
             )[:2]
             for row in labelled:
@@ -3305,7 +3266,6 @@ def run(
     *,
     tasks: Sequence[str],
     seed: int = 42,
-    activity_quantile: float = 0.25,
     verbose: bool = True,
 ) -> dict[str, Any]:
     """Build the exploratory tables and figures from every available cache."""
@@ -3336,14 +3296,10 @@ def run(
             flush=True,
         )
     head_rows = head_metrics(models)
-    mismatch_summary_rows = reach_mismatch_summary(
-        head_rows, activity_quantile=activity_quantile
-    )
-    mismatch_rows = representative_reach_mismatches(
-        head_rows, activity_quantile=activity_quantile
-    )
+    mismatch_summary_rows = reach_mismatch_summary(head_rows)
+    mismatch_rows = representative_reach_mismatches(head_rows)
     layer_rows = layer_summary(head_rows)
-    representative_rows = representative_heads(head_rows, activity_quantile=activity_quantile)
+    representative_rows = representative_heads(head_rows)
     profile_rows = model_profiles(models)
     uncertainty_rows = uncertainty_profiles(models)
     distance_rows = layer_distance_profiles(models)
@@ -3591,9 +3547,9 @@ __all__ = [
     "model_profiles",
     "molecular_scale_relationships",
     "reach_mismatch_summary",
-    "response_layer_by_distance",
     "representative_heads",
     "representative_reach_mismatches",
+    "response_layer_by_distance",
     "run",
     "score_organisation_similarity",
     "spatial_width_bootstrap",

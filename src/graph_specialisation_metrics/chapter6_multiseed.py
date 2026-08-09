@@ -31,6 +31,7 @@ from .methodology.bootstrap import trimmed_mean
 from .zinc_cached_rrwp_comparison import DISPLAY_BINS
 
 ANALYSIS_VERSION = "chapter6-molecular-multiseed-v5"
+DISTANCE_ALIGNMENT_VERSION = "all-finite-heads-v1"
 SEEDS = (0, 1, 2)
 CHANNELS = ("semantic", "structural")
 
@@ -419,27 +420,18 @@ def _display_peak(label: Any) -> tuple[str, int | None]:
 
 def alignment_summary_rows(
     rows: Sequence[Mapping[str, Any]],
-    *,
-    activity_quantile: float = 0.25,
 ) -> list[dict[str, Any]]:
-    """Summarise coarse co-variation among reliable heads without matching identities."""
+    """Summarise co-variation across every head with defined distance profiles."""
 
-    by_task_seed: dict[tuple[str, int], list[Mapping[str, Any]]] = {}
+    by_task: dict[str, list[Mapping[str, Any]]] = {}
     for row in rows:
-        by_task_seed.setdefault((str(row["task"]), int(row["seed"])), []).append(row)
-    reliable: dict[str, list[Mapping[str, Any]]] = {}
-    for (task, _seed), group in by_task_seed.items():
-        joint = _finite([float(row.get("joint_sensitivity", np.nan)) for row in group])
-        floor = float(np.quantile(joint, activity_quantile)) if joint.size else float("inf")
-        reliable.setdefault(task, []).extend(
-            row
-            for row in group
-            if np.isfinite(float(row.get("joint_sensitivity", np.nan)))
-            and float(row["joint_sensitivity"]) >= floor
-        )
+        if np.isfinite(float(row.get("semantic_expected_distance", np.nan))) and np.isfinite(
+            float(row.get("structural_expected_distance", np.nan))
+        ):
+            by_task.setdefault(str(row["task"]), []).append(row)
 
     output: list[dict[str, Any]] = []
-    for task, group in sorted(reliable.items()):
+    for task, group in sorted(by_task.items()):
         semantic = np.asarray(
             [float(row.get("semantic_expected_distance", np.nan)) for row in group]
         )
@@ -468,7 +460,7 @@ def alignment_summary_rows(
             {
                 "task": task,
                 "heads": len(group),
-                "activity_quantile": float(activity_quantile),
+                "eligibility": "finite semantic and structural distance profiles",
                 "spearman_rho": rho,
                 "same_peak_fraction": float(np.mean(same)) if same else float("nan"),
                 "same_or_adjacent_peak_fraction": (
@@ -1303,8 +1295,6 @@ def _plot_distance_alignment(
     summary: Sequence[Mapping[str, Any]],
     spec: DatasetSpec,
     figures_dir: Path,
-    *,
-    activity_quantile: float,
 ) -> list[Path]:
     import matplotlib.pyplot as plt
     from matplotlib.lines import Line2D
@@ -1325,19 +1315,23 @@ def _plot_distance_alignment(
         axis = axes[0, column]
         selected = [row for row in rows if str(row["task"]) == task]
         for seed_index, seed in enumerate(sorted({int(row["seed"]) for row in selected})):
-            seed_rows = [row for row in selected if int(row["seed"]) == seed]
-            joint = _finite([float(row["joint_sensitivity"]) for row in seed_rows])
-            floor = float(np.quantile(joint, activity_quantile)) if joint.size else float("inf")
             seed_rows = [
                 row
-                for row in seed_rows
-                if float(row["joint_sensitivity"]) >= floor
+                for row in selected
+                if int(row["seed"]) == seed
                 and np.isfinite(float(row["semantic_expected_distance"]))
                 and np.isfinite(float(row["structural_expected_distance"]))
             ]
             if not seed_rows:
                 continue
-            sizes = np.asarray([max(float(row["joint_sensitivity"]), 0.0) for row in seed_rows])
+            sizes = np.asarray(
+                [
+                    max(float(row["joint_sensitivity"]), 0.0)
+                    if np.isfinite(float(row["joint_sensitivity"]))
+                    else 0.0
+                    for row in seed_rows
+                ]
+            )
             if float(np.max(sizes)) > 0:
                 sizes = 16.0 + 45.0 * np.sqrt(sizes / float(np.max(sizes)))
             else:
@@ -1390,11 +1384,68 @@ def _plot_distance_alignment(
     ]
     axes[0, 0].legend(handles=seed_handles, frameon=False, fontsize=8, loc="lower right")
     figure.suptitle(
-        f"{spec.name.upper()}: semantic and structural distance alignment "
-        f"(top {100 * (1 - activity_quantile):.0f}% by $J$)"
+        f"{spec.name.upper()}: semantic and structural distance alignment"
     )
     _scale_figure_text(figure)
     return _save_figure(figure, figures_dir, "05_semantic_structural_distance_alignment")
+
+
+def refresh_distance_alignment(
+    output_dir: Path,
+    *,
+    dataset: str,
+) -> dict[str, Any]:
+    """Rebuild the all-head distance-alignment outputs from the saved head table."""
+
+    output_dir = Path(output_dir)
+    head_table = output_dir / "head_metrics.csv"
+    if not head_table.is_file():
+        raise FileNotFoundError(f"missing saved head table: {head_table}")
+    with head_table.open("r", encoding="utf-8", newline="") as handle:
+        head_rows = list(csv.DictReader(handle))
+    if not head_rows:
+        raise ValueError(f"saved head table is empty: {head_table}")
+
+    spec = dataset_spec(dataset)
+    alignment_rows = alignment_summary_rows(head_rows)
+    alignment_table = output_dir / "semantic_structural_alignment.csv"
+    _write_csv(alignment_table, alignment_rows)
+    figures = _plot_distance_alignment(
+        head_rows,
+        alignment_rows,
+        spec,
+        output_dir / "figures",
+    )
+
+    manifest_path = output_dir / "manifest.json"
+    manifest: dict[str, Any] = {}
+    if manifest_path.is_file():
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["distance_alignment_version"] = DISTANCE_ALIGNMENT_VERSION
+    manifest_figures = [str(path) for path in manifest.get("figures", ())]
+    for path in figures:
+        if str(path) not in manifest_figures:
+            manifest_figures.append(str(path))
+    manifest["figures"] = manifest_figures
+    manifest_tables = [str(path) for path in manifest.get("tables", ())]
+    if str(alignment_table) not in manifest_tables:
+        manifest_tables.append(str(alignment_table))
+    manifest["tables"] = manifest_tables
+    interpretation = dict(manifest.get("interpretation", {}))
+    interpretation["alignment"] = (
+        "Spearman expected-distance co-variation plus coarse peak-bin agreement "
+        "across every head with finite semantic and structural distance profiles"
+    )
+    manifest["interpretation"] = interpretation
+    manifest_path.write_text(
+        json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8"
+    )
+    return {
+        "distance_alignment_version": DISTANCE_ALIGNMENT_VERSION,
+        "figures": [str(path) for path in figures],
+        "table": str(alignment_table),
+        "heads": sum(int(row["heads"]) for row in alignment_rows),
+    }
 
 
 def _plot_vnode_allocation(
@@ -1819,7 +1870,6 @@ def run(
     strict_ablation: bool = False,
     trajectory_root: Path | None = None,
     strict_trajectory: bool = False,
-    activity_quantile: float = 0.25,
     verbose: bool = True,
 ) -> dict[str, Any]:
     """Generate the focused multi-seed Chapter 6 figure suite."""
@@ -1864,7 +1914,7 @@ def run(
         )
 
     organisation_rows = layer_organisation_rows(head_rows)
-    alignment_rows = alignment_summary_rows(head_rows, activity_quantile=activity_quantile)
+    alignment_rows = alignment_summary_rows(head_rows)
     ablation_rows: list[dict[str, Any]] = []
     if ablation_root is not None:
         from .chapter6_clean_ablation import load_rows
@@ -1930,7 +1980,6 @@ def run(
             alignment_rows,
             spec,
             figures_dir,
-            activity_quantile=activity_quantile,
         )
     )
     figures.extend(_plot_vnode_allocation(vnode_rows, spec, figures_dir))
@@ -1956,7 +2005,7 @@ def run(
         "strict_ablation": bool(strict_ablation),
         "trajectory_root": None if trajectory_root is None else str(trajectory_root),
         "strict_trajectory": bool(strict_trajectory),
-        "activity_quantile": float(activity_quantile),
+        "distance_alignment_version": DISTANCE_ALIGNMENT_VERSION,
         "runs_loaded": runs_loaded,
         "warnings": warnings,
         "figures": [str(path) for path in figures],
@@ -1968,8 +2017,7 @@ def run(
             "reach_gap": "intervention-defined score reach minus clean-attention reach",
             "alignment": (
                 "Spearman expected-distance co-variation plus coarse peak-bin agreement "
-                f"among the top {100 * (1 - activity_quantile):.0f}% of heads by J "
-                "within each seed"
+                "across every head with finite semantic and structural distance profiles"
             ),
             "mass_allocation_comparison": (
                 "within-head score mass versus final-state response allocation; "

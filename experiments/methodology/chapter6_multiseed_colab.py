@@ -41,7 +41,6 @@ SECRET_NAME = "dissertation_key"  # Optional for a public repository.
 DATASET = os.environ.get("CHAPTER6_DATASET", "zinc").strip().lower()
 SEEDS = (0, 1, 2)
 STRICT_CACHE_INVENTORY = True
-RELIABLE_HEAD_QUANTILE = 0.25
 COMPUTE_MISSING_ABLATIONS = True
 COMPUTE_MISSING_TRAJECTORY_SCORES = True
 GENERATE_SPECIAL_HEAD_ANALYSIS = True
@@ -181,7 +180,9 @@ bootstrap()
 
 from graph_specialisation_metrics.chapter6_multiseed import (
     ANALYSIS_VERSION as CORE_ANALYSIS_VERSION,
+    DISTANCE_ALIGNMENT_VERSION,
     cache_inventory,
+    refresh_distance_alignment,
     run,
 )
 from graph_specialisation_metrics.chapter6_clean_ablation import (
@@ -363,9 +364,16 @@ if manifest is None:
         strict_ablation=True,
         trajectory_root=TRAJECTORY_ROOT if DATASET == "zinc" else None,
         strict_trajectory=DATASET == "zinc",
-        activity_quantile=RELIABLE_HEAD_QUANTILE,
         verbose=True,
     )
+elif manifest.get("distance_alignment_version") != DISTANCE_ALIGNMENT_VERSION:
+    print(
+        "[chapter6-multiseed-refresh] rebuilding distance alignment from the saved "
+        "all-head table; no model or score cache is loaded",
+        flush=True,
+    )
+    refresh_distance_alignment(OUTPUT_DIR, dataset=DATASET)
+    manifest = json.loads(core_manifest_path.read_text(encoding="utf-8"))
 release_memory("after-core-figures")
 
 special_head_manifest = None
