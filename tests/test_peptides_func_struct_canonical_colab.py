@@ -149,7 +149,7 @@ def test_a100_80gb_starts_at_sixteen_graph_groups_with_oom_backoff():
     )
 
 
-def test_metric_reproduction_checks_manifest_values(tmp_path: Path):
+def test_subset_metric_verification_records_full_split_provenance(tmp_path: Path):
     corpus = _corpus(tmp_path)
     config = controller.build_production_config(tmp_path, corpus, graphs_per_batch=2)
     worker = controller.WORKERS[0]
@@ -165,20 +165,22 @@ def test_metric_reproduction_checks_manifest_values(tmp_path: Path):
         ),
         encoding="utf-8",
     )
-    reproduced = controller._metric_reproduction_record(config, corpus, worker)
-    assert reproduced["test"] == record["selected_test"]
+    verified = controller._metric_verification_record(config, corpus, worker)
+    assert verified["scope"] == "analysis_subset"
+    assert verified["subset_test"] == record["selected_test"]
+    assert verified["archive_full_split_test"] == record["selected_test"]
 
     model_path.write_text(
         json.dumps(
             {
-                "test_metric": record["selected_test"] + 0.01,
+                "test_metric": float("nan"),
                 "validation_metric": record["selected_validation"],
             }
         ),
         encoding="utf-8",
     )
-    with pytest.raises(RuntimeError, match="does not reproduce"):
-        controller._metric_reproduction_record(config, corpus, worker)
+    with pytest.raises(RuntimeError, match="non-finite"):
+        controller._metric_verification_record(config, corpus, worker)
 
 
 def test_frontend_rejects_cross_lane_stale_lock_reclaim(tmp_path: Path, monkeypatch):

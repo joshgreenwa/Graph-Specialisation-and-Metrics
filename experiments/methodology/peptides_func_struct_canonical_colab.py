@@ -11,6 +11,7 @@ import contextlib
 import dataclasses
 import gc
 import json
+import math
 import os
 import shutil
 import tarfile
@@ -48,7 +49,7 @@ DEFAULT_DRIVE_FOLDER = Path(
     "/content/drive/MyDrive/graph_specialisation_metrics/multi_seed_models/"
     "peptides_func_struct_checkpoints"
 )
-COMPLETION_SCHEMA = "peptides-func-struct-canonical-worker-complete-v1"
+COMPLETION_SCHEMA = "peptides-func-struct-canonical-worker-complete-v2"
 CORPUS_SCHEMA = "peptides-func-struct-checkpoint-corpus-v1"
 
 TASKS = (
@@ -447,34 +448,27 @@ def verify_selected_checkpoint(corpus: PreparedCorpus, worker: WorkerSpec) -> st
     return expected
 
 
-def _metric_reproduction_record(
+def _metric_verification_record(
     config: MethodologyConfig,
     corpus: PreparedCorpus,
     worker: WorkerSpec,
-    *,
-    tolerance: float = 1.0e-3,
-) -> dict[str, float]:
+) -> dict[str, Any]:
+    """Record finite subset metrics without comparing them to full-split archive metrics."""
+
     model_path = _completion_path(config, worker).parent / "model.json"
     model = json.loads(model_path.read_text(encoding="utf-8"))
     record = corpus.records[worker.run_id]
     actual_test = float(model["test_metric"])
     actual_validation = float(model["validation_metric"])
-    expected_test = float(record["selected_test"])
-    expected_validation = float(record["selected_validation"])
-    if abs(actual_test - expected_test) > tolerance:
-        raise RuntimeError(
-            f"{worker.run_id} test metric {actual_test:.6g} does not reproduce "
-            f"manifest value {expected_test:.6g}"
-        )
-    if abs(actual_validation - expected_validation) > tolerance:
-        raise RuntimeError(
-            f"{worker.run_id} validation metric {actual_validation:.6g} does not reproduce "
-            f"manifest value {expected_validation:.6g}"
-        )
+    if not math.isfinite(actual_test) or not math.isfinite(actual_validation):
+        raise RuntimeError(f"{worker.run_id} produced a non-finite subset verification metric")
     return {
-        "test": actual_test,
-        "validation": actual_validation,
-        "tolerance": float(tolerance),
+        "scope": "analysis_subset",
+        "subset_test": actual_test,
+        "subset_validation": actual_validation,
+        "archive_full_split_test": float(record["selected_test"]),
+        "archive_full_split_validation": float(record["selected_validation"]),
+        "selection_metric": str(record["selection_metric"]),
     }
 
 
@@ -523,7 +517,7 @@ def validate_worker_outputs(
             "graphs": 48,
             "strict_audits": bool(config.strict_audits),
             "phases": list(config.phases),
-            "metrics": _metric_reproduction_record(config, corpus, worker),
+            "metrics": _metric_verification_record(config, corpus, worker),
             "artifacts": artifacts,
             "audit_findings": len(validated["audit_findings"]),
             "headline_eligible": bool(validated["headline_eligible"]),
