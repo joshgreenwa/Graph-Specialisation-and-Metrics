@@ -347,8 +347,11 @@ def test_run_builds_dataset_specific_multiseed_suite(tmp_path, dataset):
     )
     assert manifest["runs_loaded"] == 15
     assert manifest["dataset"] == dataset
-    expected_pngs = 15 if dataset == "zinc" else 13
+    expected_pngs = 16 if dataset == "zinc" else 14
     assert len([path for path in manifest["figures"] if path.endswith(".png")]) == expected_pngs
+    assert (
+        output_dir / "figures/02b_specialisation_landscapes_selectivity.pdf"
+    ).is_file()
     assert (output_dir / "figures/01_spatial_organisation.png").is_file()
     assert (output_dir / "figures/01b_expected_graph_distance.pdf").is_file()
     assert (

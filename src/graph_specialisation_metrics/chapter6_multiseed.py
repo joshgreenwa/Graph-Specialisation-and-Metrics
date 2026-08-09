@@ -32,6 +32,7 @@ from .zinc_cached_rrwp_comparison import DISPLAY_BINS
 
 ANALYSIS_VERSION = "chapter6-molecular-multiseed-v5"
 DISTANCE_ALIGNMENT_VERSION = "all-finite-heads-v1"
+SPECIALISATION_LANDSCAPE_VARIANT_VERSION = "j-drel-only-v1"
 SEEDS = (0, 1, 2)
 CHANNELS = ("semantic", "structural")
 
@@ -1081,6 +1082,114 @@ def _plot_specialisation_landscapes(
     return _save_figure(figure, figures_dir, "02_specialisation_landscapes")
 
 
+def _plot_specialisation_selectivity_landscapes(
+    rows: Sequence[Mapping[str, Any]], spec: DatasetSpec, figures_dir: Path
+) -> list[Path]:
+    """Plot the selectivity--sensitivity row of the specialisation landscapes alone."""
+
+    import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
+
+    figure, axes = plt.subplots(
+        1,
+        len(spec.tasks),
+        figsize=(3.65 * len(spec.tasks), 4.0),
+        squeeze=False,
+        sharex=True,
+        sharey=True,
+        constrained_layout=True,
+    )
+    markers = ("o", "s", "^")
+    maximum_layer = max(int(row["layer"]) for row in rows)
+    colour_map = plt.get_cmap("viridis")
+    colour_norm = plt.Normalize(0, maximum_layer)
+    joint_limits = _padded_limits(
+        [float(row["joint_sensitivity"]) for row in rows], include_zero=True
+    )
+    scatter = None
+    for column, task in enumerate(spec.tasks):
+        axis = axes[0, column]
+        selected = [row for row in rows if str(row["task"]) == task]
+        for seed_index, seed in enumerate(sorted({int(row["seed"]) for row in selected})):
+            seed_rows = [row for row in selected if int(row["seed"]) == seed]
+            scatter = axis.scatter(
+                [float(row["selectivity"]) for row in seed_rows],
+                [float(row["joint_sensitivity"]) for row in seed_rows],
+                c=[int(row["layer"]) for row in seed_rows],
+                cmap=colour_map,
+                norm=colour_norm,
+                marker=markers[seed_index % len(markers)],
+                s=24,
+                alpha=0.78,
+                linewidths=0,
+            )
+        axis.axvline(0.0, color="#999999", linewidth=0.8, linestyle="--")
+        axis.set_xlim(-1.04, 1.04)
+        axis.set_ylim(joint_limits)
+        axis.set_title(spec.labels[task])
+        axis.set_xlabel(r"relative selectivity $D_{\mathrm{rel}}$")
+        if column == 0:
+            axis.set_ylabel(r"joint sensitivity $J$")
+    if scatter is not None:
+        figure.colorbar(scatter, ax=axes, label="layer", shrink=0.82, pad=0.01)
+    seed_handles = [
+        Line2D([], [], marker=markers[index], linestyle="", color="#555555", label=f"seed {seed}")
+        for index, seed in enumerate(sorted({int(row["seed"]) for row in rows}))
+    ]
+    axes[0, 0].legend(handles=seed_handles, frameon=False, fontsize=8, loc="upper left")
+    figure.suptitle(f"{spec.name.upper()}: joint sensitivity and relative selectivity")
+    _scale_figure_text(figure)
+    return _save_figure(
+        figure,
+        figures_dir,
+        "02b_specialisation_landscapes_selectivity",
+    )
+
+
+def refresh_specialisation_landscape_variant(
+    output_dir: Path,
+    *,
+    dataset: str,
+) -> dict[str, Any]:
+    """Build the single-row specialisation companion from the saved head table."""
+
+    output_dir = Path(output_dir)
+    head_table = output_dir / "head_metrics.csv"
+    if not head_table.is_file():
+        raise FileNotFoundError(f"missing saved head table: {head_table}")
+    with head_table.open("r", encoding="utf-8", newline="") as handle:
+        head_rows = list(csv.DictReader(handle))
+    if not head_rows:
+        raise ValueError(f"saved head table is empty: {head_table}")
+
+    figures = _plot_specialisation_selectivity_landscapes(
+        head_rows,
+        dataset_spec(dataset),
+        output_dir / "figures",
+    )
+    manifest_path = output_dir / "manifest.json"
+    manifest: dict[str, Any] = {}
+    if manifest_path.is_file():
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["specialisation_landscape_variant_version"] = (
+        SPECIALISATION_LANDSCAPE_VARIANT_VERSION
+    )
+    manifest_figures = [str(path) for path in manifest.get("figures", ())]
+    for path in figures:
+        if str(path) not in manifest_figures:
+            manifest_figures.append(str(path))
+    manifest["figures"] = manifest_figures
+    manifest_path.write_text(
+        json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8"
+    )
+    return {
+        "specialisation_landscape_variant_version": (
+            SPECIALISATION_LANDSCAPE_VARIANT_VERSION
+        ),
+        "figures": [str(path) for path in figures],
+    }
+
+
 def _plot_dense_one_hop_attention_landscape(
     rows: Sequence[Mapping[str, Any]],
     spec: DatasetSpec,
@@ -1952,6 +2061,9 @@ def run(
     figures.extend(_plot_spatial_organisation(organisation_rows, spec, figures_dir))
     figures.extend(_plot_specialisation_landscapes(head_rows, spec, figures_dir))
     figures.extend(
+        _plot_specialisation_selectivity_landscapes(head_rows, spec, figures_dir)
+    )
+    figures.extend(
         _plot_dense_one_hop_attention_landscape(head_rows, spec, figures_dir)
     )
     figures.extend(
@@ -2006,6 +2118,9 @@ def run(
         "trajectory_root": None if trajectory_root is None else str(trajectory_root),
         "strict_trajectory": bool(strict_trajectory),
         "distance_alignment_version": DISTANCE_ALIGNMENT_VERSION,
+        "specialisation_landscape_variant_version": (
+            SPECIALISATION_LANDSCAPE_VARIANT_VERSION
+        ),
         "runs_loaded": runs_loaded,
         "warnings": warnings,
         "figures": [str(path) for path in figures],

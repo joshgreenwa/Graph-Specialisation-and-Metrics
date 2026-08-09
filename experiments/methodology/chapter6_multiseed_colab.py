@@ -181,8 +181,10 @@ bootstrap()
 from graph_specialisation_metrics.chapter6_multiseed import (
     ANALYSIS_VERSION as CORE_ANALYSIS_VERSION,
     DISTANCE_ALIGNMENT_VERSION,
+    SPECIALISATION_LANDSCAPE_VARIANT_VERSION,
     cache_inventory,
     refresh_distance_alignment,
+    refresh_specialisation_landscape_variant,
     run,
 )
 from graph_specialisation_metrics.chapter6_clean_ablation import (
@@ -373,6 +375,17 @@ elif manifest.get("distance_alignment_version") != DISTANCE_ALIGNMENT_VERSION:
         flush=True,
     )
     refresh_distance_alignment(OUTPUT_DIR, dataset=DATASET)
+    manifest = json.loads(core_manifest_path.read_text(encoding="utf-8"))
+if (
+    manifest.get("specialisation_landscape_variant_version")
+    != SPECIALISATION_LANDSCAPE_VARIANT_VERSION
+):
+    print(
+        "[chapter6-multiseed-refresh] building the single-row J--D_rel landscape "
+        "from the saved all-head table; no model or score cache is loaded",
+        flush=True,
+    )
+    refresh_specialisation_landscape_variant(OUTPUT_DIR, dataset=DATASET)
     manifest = json.loads(core_manifest_path.read_text(encoding="utf-8"))
 release_memory("after-core-figures")
 
