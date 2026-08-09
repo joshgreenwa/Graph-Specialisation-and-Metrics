@@ -144,19 +144,19 @@ def test_complete_config_is_shared_by_both_lanes_and_is_a100_optimised(tmp_path:
         assert override["disable_metric_abort_guard"] is True
 
 
-def test_a100_80gb_starts_at_sixteen_graph_groups_with_oom_backoff():
+def test_a100_uses_aggressive_memory_scaled_batches_with_oom_backoff():
     gib = 1024**3
     assert (
         controller.auto_graphs_per_batch(
             device_name="NVIDIA A100-SXM4-80GB", total_memory_bytes=80 * gib
         )
-        == 16
+        == 32
     )
     assert (
         controller.auto_graphs_per_batch(
             device_name="NVIDIA A100-SXM4-40GB", total_memory_bytes=40 * gib
         )
-        == 8
+        == 16
     )
 
 

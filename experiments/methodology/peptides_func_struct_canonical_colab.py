@@ -383,13 +383,15 @@ def auto_graphs_per_batch(
     gib = float(total_memory_bytes) / 1024**3
     name = str(device_name).lower()
     if ("a100" in name or "h100" in name) and gib >= 75:
-        return 16
+        return 32
     if gib >= 70:
-        return 12
+        return 24
+    if ("a100" in name or "h100" in name) and gib >= 38:
+        return 16
     if gib >= 38:
-        return 8
+        return 12
     if gib >= 20:
-        return 4
+        return 6
     return 2
 
 
