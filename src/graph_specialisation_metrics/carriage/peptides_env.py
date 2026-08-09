@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from types import SimpleNamespace
 
 from . import env
 from .env import log, run_cmd
@@ -86,6 +87,48 @@ def apply_peptides_struct_onehop_patch(repo_dir: Path) -> None:
             onehop.ONE_HOP_CFG_TEXT,
         ) = previous
     log("[peptides] applied checkpoint-compatible Peptides-struct 1-hop patch")
+
+
+def apply_peptides_variant_patch(
+    repo_dir: Path,
+    *,
+    dataset: str,
+    attention: str,
+    hops: int,
+    global_vnode: bool,
+) -> None:
+    """Replay the unified Peptides training patch and materialise its exact config."""
+
+    if dataset not in {"func", "struct"}:
+        raise ValueError(f"unsupported Peptides dataset {dataset!r}")
+    if attention not in {"dense", "khop"}:
+        raise ValueError(f"unsupported Peptides attention mode {attention!r}")
+    if int(hops) not in {1, 2}:
+        raise ValueError(f"unsupported Peptides hop count {hops!r}")
+
+    ensure_repo_root_on_path()
+    from experiments.peptides.training import GRIT_peptides_khop as training
+
+    training.apply_peptides_pandas_warning_patch(repo_dir)
+    if dataset == "func":
+        training.apply_peptides_multilabel_metric_patch(repo_dir)
+    training.apply_attention_rrwp_vnode_patch(repo_dir)
+    training.verify_attention_rrwp_vnode_patch(repo_dir)
+    args = SimpleNamespace(
+        task=dataset,
+        attention=attention,
+        hops=int(hops),
+        global_vnode=bool(global_vnode),
+        rrwp_horizon=-1,
+        wandb_project="",
+    )
+    training.make_run_config(repo_dir, args)
+    training.validate_config(repo_dir, args, allow_drift=False)
+    log(
+        "[peptides] applied unified checkpoint-compatible patch: "
+        f"dataset={dataset}, attention={attention}, hops={int(hops)}, "
+        f"global_vnode={bool(global_vnode)}"
+    )
 
 
 def ensure_repo_root_on_path(repo_dir: Path = None) -> None:

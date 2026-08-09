@@ -34,6 +34,18 @@ QM9_FROZEN_KHOP_SUPPORT_TASKS = frozenset(
     }
 )
 QM9_DENSE_ADAPTER_VERSION = "canonical-grit-qm9-dense-full-support-v2"
+PEPTIDES_FROZEN_KHOP_SUPPORT_TASKS = frozenset(
+    {
+        "peptides_func_2hop",
+        "peptides_func_2hop_vnode",
+        "peptides_struct_2hop",
+        "peptides_struct_2hop_vnode",
+    }
+)
+PEPTIDES_ADAPTER_VERSION = "canonical-grit-peptides-unified-v1"
+PEPTIDES_FROZEN_KHOP_ADAPTER_VERSION = (
+    "canonical-grit-peptides-frozen-khop-support-v1"
+)
 
 
 def _mae_per_graph(prediction, target):
@@ -207,10 +219,10 @@ def register(task: CanonicalTask) -> CanonicalTask:
 
 def _known_grit_task(name: str) -> CanonicalTask:
     grit = get_grit_task(name)
-    if name == "peptides_func":
+    if name == "peptides_func" or name.startswith("peptides_func_"):
         output = OutputGeometry("logits", None, "unit")
         loss = _bce_per_graph
-    elif name in {"peptides_struct", "peptides_struct_1hop"}:
+    elif name == "peptides_struct" or name.startswith("peptides_struct_"):
         output = OutputGeometry("evaluation_regression", None, "training_target_std")
         loss = _mae_per_graph
     else:
@@ -230,7 +242,9 @@ def _known_grit_task(name: str) -> CanonicalTask:
             + (("pos",) if name.startswith("qm9_") else ())
             + (
                 ("rrwp_attention_edge_index",)
-                if name in QM9_FROZEN_KHOP_SUPPORT_TASKS or name in ZINC_FROZEN_KHOP_SUPPORT_TASKS
+                if name in QM9_FROZEN_KHOP_SUPPORT_TASKS
+                or name in ZINC_FROZEN_KHOP_SUPPORT_TASKS
+                or name in PEPTIDES_FROZEN_KHOP_SUPPORT_TASKS
                 else ()
             )
         ),
@@ -239,7 +253,19 @@ def _known_grit_task(name: str) -> CanonicalTask:
         adapter_version=(
             ZINC_FROZEN_KHOP_ADAPTER_VERSION
             if name in ZINC_FROZEN_KHOP_SUPPORT_TASKS
-            else (QM9_DENSE_ADAPTER_VERSION if name == "qm9_gap_dense" else "canonical-grit-v1")
+            else (
+                PEPTIDES_FROZEN_KHOP_ADAPTER_VERSION
+                if name in PEPTIDES_FROZEN_KHOP_SUPPORT_TASKS
+                else (
+                    PEPTIDES_ADAPTER_VERSION
+                    if name.startswith(("peptides_func_", "peptides_struct_"))
+                    else (
+                        QM9_DENSE_ADAPTER_VERSION
+                        if name == "qm9_gap_dense"
+                        else "canonical-grit-v1"
+                    )
+                )
+            )
         ),
     )
 
@@ -261,6 +287,15 @@ for _name in (
     "peptides_func",
     "peptides_struct",
     "peptides_struct_1hop",
+    "peptides_func_dense",
+    "peptides_func_1hop",
+    "peptides_func_1hop_vnode",
+    "peptides_func_2hop",
+    "peptides_func_2hop_vnode",
+    "peptides_struct_dense",
+    "peptides_struct_1hop_vnode",
+    "peptides_struct_2hop",
+    "peptides_struct_2hop_vnode",
 ):
     register(_known_grit_task(_name))
 

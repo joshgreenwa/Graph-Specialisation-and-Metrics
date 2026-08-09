@@ -180,6 +180,32 @@ def _peptides_struct_onehop_hooks():
     return (hook,)
 
 
+def _peptides_variant_hooks(
+    dataset: str,
+    attention: str,
+    hops: int,
+    *,
+    global_vnode: bool,
+):
+    """Deferred replay of the unified Peptides dense/k-hop/VNode training patch."""
+
+    from . import peptides_env
+
+    def hook(repo_dir):
+        peptides_env.ensure_repo_root_on_path()
+        peptides_env.install_peptides_deps()
+        peptides_env.apply_peptides_patches(repo_dir)
+        peptides_env.apply_peptides_variant_patch(
+            repo_dir,
+            dataset=dataset,
+            attention=attention,
+            hops=hops,
+            global_vnode=global_vnode,
+        )
+
+    return (hook,)
+
+
 def _qm9_hooks(
     attention: str,
     hops: int = 1,
@@ -493,3 +519,68 @@ register(GritTaskSpec(
     grit_repo_dir="/content/GRIT_peptides_struct_1hop",
     node_content_desc="OGB atom features (9)",
 ))
+
+
+def _register_peptides_variant(
+    *,
+    dataset: str,
+    variant: str,
+    attention: str,
+    hops: int,
+    global_vnode: bool,
+) -> None:
+    task_label = "func" if dataset == "func" else "struct"
+    canonical_name = f"peptides_{task_label}_{variant}"
+    is_func = dataset == "func"
+    expected_params = (
+        (443_530 if global_vnode else 443_434)
+        if is_func
+        else (449_675 if global_vnode else 449_579)
+    )
+    register(GritTaskSpec(
+        name=canonical_name,
+        title=(
+            f"GRIT+RRWP Peptides-{task_label} "
+            f"({variant.replace('_', ' ')} attention)"
+        ),
+        config_path=(
+            "configs/GRIT/peptides-func-GRIT-RRWP-custom.yaml"
+            if is_func
+            else "configs/GRIT/peptides-struct-GRIT-RRWP-custom.yaml"
+        ),
+        expected_params=expected_params,
+        drive_dir=f"/content/drive/MyDrive/grit_peptides_{task_label}_{variant}",
+        dataset_dir=f"/content/drive/MyDrive/grit_peptides_{task_label}_shared_data",
+        paper_metric=None,
+        metric_name="AP" if is_func else "MAE",
+        metric_fn=staticmethod(
+            metrics.multilabel_ap_metric if is_func else metrics.mae_metric
+        ),
+        metric_higher_better=is_func,
+        metric_abort=0.40,
+        env_hooks=_peptides_variant_hooks(
+            dataset,
+            attention,
+            hops,
+            global_vnode=global_vnode,
+        ),
+        grit_repo_dir=f"/content/GRIT_{canonical_name}",
+        node_content_desc="OGB atom features (9)",
+    ))
+
+
+for _peptides_dataset in ("func", "struct"):
+    for _variant, _attention, _hops, _vnode in (
+        ("dense", "dense", 1, False),
+        ("1hop", "khop", 1, False),
+        ("1hop_vnode", "khop", 1, True),
+        ("2hop", "khop", 2, False),
+        ("2hop_vnode", "khop", 2, True),
+    ):
+        _register_peptides_variant(
+            dataset=_peptides_dataset,
+            variant=_variant,
+            attention=_attention,
+            hops=_hops,
+            global_vnode=_vnode,
+        )
