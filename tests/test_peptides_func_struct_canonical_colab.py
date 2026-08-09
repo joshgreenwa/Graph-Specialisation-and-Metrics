@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -127,10 +128,11 @@ def test_complete_config_is_shared_by_both_lanes_and_is_a100_optimised(tmp_path:
         assert override["dataset_dir"] == str(tmp_path / "datasets" / dataset)
         assert override["analysis_split_limits"] == {
             "train": 2_000,
-            "val": 1,
+            "val": 136,
             "test": 136,
             "seed": 31_415,
         }
+        assert override["disable_metric_abort_guard"] is True
 
 
 def test_a100_80gb_starts_at_sixteen_graph_groups_with_oom_backoff():
@@ -193,6 +195,27 @@ def test_frontend_rejects_cross_lane_stale_lock_reclaim(tmp_path: Path, monkeypa
             "func",
             reclaim_worker_index=20,
         )
+
+
+def test_setup_reclaim_is_explicit_and_repairs_under_the_setup_claim(tmp_path: Path, monkeypatch):
+    calls = []
+    prepared = object()
+
+    @contextmanager
+    def fake_lock(root, name, *, reclaim=False):
+        calls.append((root, name, reclaim))
+        yield root
+
+    monkeypatch.setattr(controller, "drive_lock", fake_lock)
+    monkeypatch.setattr(
+        controller,
+        "load_prepared_corpus",
+        lambda _root: (_ for _ in ()).throw(RuntimeError("not ready")),
+    )
+    monkeypatch.setattr(controller, "prepare_corpus", lambda _root: prepared)
+
+    assert controller.ensure_prepared_corpus(tmp_path, reclaim_setup_lock=True) is prepared
+    assert calls == [(tmp_path, "peptides_corpus_setup", True)]
 
 
 def test_completion_status_uses_dataset_specific_cache_paths(tmp_path: Path):

@@ -319,11 +319,18 @@ def ensure_prepared_corpus(
     drive_folder: Path,
     *,
     wait_seconds: int = 1_800,
+    reclaim_setup_lock: bool = False,
 ) -> PreparedCorpus:
     """Prepare once; a concurrently launched second notebook waits for the same corpus."""
 
     deadline = time.monotonic() + int(wait_seconds)
     lock_path = Path(drive_folder) / "_locks" / "peptides_corpus_setup.lock"
+    if reclaim_setup_lock:
+        with drive_lock(drive_folder, "peptides_corpus_setup", reclaim=True):
+            with contextlib.suppress(Exception):
+                return load_prepared_corpus(drive_folder)
+            print("[setup] reclaiming stale setup claim and repairing the corpus", flush=True)
+            return prepare_corpus(drive_folder)
     while True:
         with contextlib.suppress(Exception):
             return load_prepared_corpus(drive_folder)
@@ -388,7 +395,7 @@ def build_production_config(
     strict_audits: bool = False,
 ) -> MethodologyConfig:
     drive_folder = Path(drive_folder)
-    subset = {"train": 2_000, "val": 1, "test": 136, "seed": 31_415}
+    subset = {"train": 2_000, "val": 136, "test": 136, "seed": 31_415}
     task_overrides = {}
     for task in TASKS:
         dataset = "func" if task.startswith("peptides_func_") else "struct"
@@ -397,6 +404,9 @@ def build_production_config(
             "dataset_dir": str(drive_folder / "datasets" / dataset),
             "grit_repo_dir": f"/content/GRIT_gsm_{task}",
             "analysis_split_limits": dict(subset),
+            # Metrics are finite-forward checks on a deterministic analysis subset, not the
+            # archive's full-split selection metrics. Strict load/SHA/parameter checks remain.
+            "disable_metric_abort_guard": True,
         }
     config = MethodologyConfig(
         output_dir=str(drive_folder / "canonical_outputs"),
@@ -692,6 +702,7 @@ def run_frontend(
     graphs_per_batch: int | None = None,
     accelerator: str = "cuda:0",
     strict_audits: bool = False,
+    reclaim_setup_lock: bool = False,
     reclaim_worker_index: int = -1,
 ) -> Any:
     """Run one complete dataset lane, status, setup, or finalization from Colab."""
@@ -708,7 +719,10 @@ def run_frontend(
     if mode not in {"setup", "run", "finalize"}:
         raise ValueError("MODE must be setup, run, status, or finalize")
 
-    corpus = ensure_prepared_corpus(drive_folder)
+    corpus = ensure_prepared_corpus(
+        drive_folder,
+        reclaim_setup_lock=bool(reclaim_setup_lock),
+    )
     if mode == "setup":
         print(f"[setup:complete] corpus={corpus.corpus_root}", flush=True)
         return {"corpus_root": str(corpus.corpus_root), "archive_sha256": ARCHIVE_SHA256}
