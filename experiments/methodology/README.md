@@ -55,9 +55,11 @@ finite-forward checks remain. The archive's separately recorded full-split valid
 remain the checkpoint-selection provenance and are not incorrectly compared to subset metrics.
 
 Rerunning a lane freshly validates and skips completed workers, while partial per-graph shards
-resume. When all six notebooks report 5/5 complete, set `MODE="finalize"` in any one notebook and
-rerun its last cell to write the model-free population indexes and summaries. Exact Drive paths
-are listed in [`DRIVE_ARTIFACT_MAP.md`](DRIVE_ARTIFACT_MAP.md).
+resume. The func-seed0 notebook temporarily defaults its exact worker reclaim to index 0 to clear
+the known stale claim left by the stopped two-lane run; never launch another live copy of that same
+lane. When all six notebooks report 5/5 complete, set `MODE="finalize"` in any one notebook and
+rerun its last cell to write the model-free population indexes and summaries. Exact Drive paths are
+listed in [`DRIVE_ARTIFACT_MAP.md`](DRIVE_ARTIFACT_MAP.md).
 
 ## ZINC checkpoint trajectory
 

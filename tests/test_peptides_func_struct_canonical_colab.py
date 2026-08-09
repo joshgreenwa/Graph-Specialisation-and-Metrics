@@ -287,7 +287,8 @@ def test_checked_in_notebooks_are_a100_ready_pinned_seed_lanes(dataset: str, see
     assert "peptides_func_struct_checkpoints" in source
     assert "GRAPHS_PER_BATCH = 0" in source
     assert "RECLAIM_SETUP_LOCK = False" in source
-    assert "RECLAIM_WORKER_INDEX = -1" in source
+    expected_reclaim = 0 if (dataset, seed) == ("func", 0) else -1
+    assert f"RECLAIM_WORKER_INDEX = {expected_reclaim}" in source
     assert "public_url = 'https:' + '//github.com/" in source
     assert "public_url = 'https://github.com/" not in source
     assert "GIT_CONFIG_VALUE_0" in source
