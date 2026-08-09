@@ -19,7 +19,8 @@ NOTEBOOKS = {
     "struct": Path(__file__).parents[1]
     / "experiments/methodology/peptides_struct_canonical_colab.ipynb",
 }
-PINNED_REVISION = "d0bd68ca341afc5829af17069b19292a4bd91942"
+PINNED_REVISION = "296b39b044c7b08f358ff44f178865b43422ad61"
+PINNED_BRANCH = "expansion/carriage_experiments"
 
 
 def _records():
@@ -240,23 +241,47 @@ def test_worker_record_is_json_serializable():
 @pytest.mark.parametrize("dataset", ["func", "struct"])
 def test_checked_in_notebooks_are_a100_ready_pinned_dataset_lanes(dataset: str):
     payload = json.loads(NOTEBOOKS[dataset].read_text(encoding="utf-8"))
-    source = "".join(
+    code_cells = [
         "".join(cell.get("source", []))
         for cell in payload["cells"]
         if cell.get("cell_type") == "code"
-    )
+    ]
+    source = "".join(code_cells)
 
     assert payload["nbformat"] == 4
     assert payload["metadata"]["accelerator"] == "GPU"
     assert payload["metadata"]["colab"]["gpuType"] == "A100"
     assert 'MODE = "run"' in source
     assert f'DATASET = "{dataset}"' in source
+    assert f'REPO_BRANCH = "{PINNED_BRANCH}"' in source
     assert f'REPO_REVISION = "{PINNED_REVISION}"' in source
+    assert 'GITHUB_SECRET = "dissertation_key"' in source
+    assert "from google.colab import userdata" in source
+    assert "token = userdata.get(GITHUB_SECRET)" in source
+    assert "Colab secret {GITHUB_SECRET!r} is missing or empty" in source
     assert "peptides_func_struct_checkpoints" in source
     assert "GRAPHS_PER_BATCH = 0" in source
+    assert "RECLAIM_SETUP_LOCK = False" in source
     assert "RECLAIM_WORKER_INDEX = -1" in source
-    assert "url = 'https:' + '//github.com/" in source
-    assert "url = 'https://github.com/" not in source
+    assert "public_url = 'https:' + '//github.com/" in source
+    assert "public_url = 'https://github.com/" not in source
+    assert "GIT_CONFIG_VALUE_0" in source
+    assert "Authorization: Basic {credential}" in source
+    assert "'--branch', REPO_BRANCH, '--single-branch', '--no-tags'" in source
+    assert "remote_action = 'set-url' if 'origin' in remotes else 'add'" in source
+    assert "'remote', remote_action, 'origin', public_url" in source
+    assert "'config', '--local', '--unset-all', 'http.https://github.com/.extraheader'" in source
+    assert "f'+refs/heads/{REPO_BRANCH}:{remote_ref}'" in source
+    assert "'merge-base', '--is-ancestor', REPO_REVISION, remote_ref" in source
+    assert "'checkout', '--force', '-B', REPO_BRANCH, REPO_REVISION" in source
+    assert "remote_url != public_url" in source
+    assert "repo.exists() and not (repo / '.git').is_dir()" in source
+    assert "shutil.rmtree(repo)" in source
+    assert "name == 'graph_specialisation_metrics'" in source
+    assert "controller_path.is_relative_to(repo.resolve())" in source
     assert "run_frontend(" in source
     assert "graphs_per_batch=GRAPHS_PER_BATCH or None" in source
+    assert "reclaim_setup_lock=RECLAIM_SETUP_LOCK" in source
     assert "vars(methodology_package).pop('peptides_func_struct_canonical_colab'" in source
+    for index, cell in enumerate(code_cells):
+        compile(cell, f"{dataset}-cell-{index}", "exec")

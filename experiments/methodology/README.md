@@ -33,6 +33,10 @@ The 30-checkpoint Peptides corpus has two A100 Colab lanes:
 - [`peptides_struct_canonical_colab.ipynb`](peptides_struct_canonical_colab.ipynb): all 15
   Peptides-struct architecture/seed workers.
 
+Both notebooks require the Colab secret `dissertation_key`. They authenticate through an
+ephemeral HTTP header, clone the explicit `expansion/carriage_experiments` branch, verify that the
+pinned controller revision belongs to that branch, and persist only the public GitHub URL.
+
 Place `peptides_func_struct_best_checkpoints.tar` and its `.sha256` companion directly in
 `multi_seed_models/peptides_func_struct_checkpoints/`. Open both notebooks in separate A100 80GB
 high-RAM runtimes and run all cells with `MODE="run"`. Corpus setup is automatic and locked: if
