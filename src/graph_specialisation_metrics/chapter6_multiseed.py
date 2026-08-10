@@ -208,6 +208,16 @@ def _add_figure_legend(
     )
 
 
+def _set_layer_axis_ticks(axis: Any) -> None:
+    """Use sparse integer ticks for discrete transformer layers."""
+
+    from matplotlib.ticker import MaxNLocator
+
+    axis.xaxis.set_major_locator(
+        MaxNLocator(nbins=6, integer=True, prune="both")
+    )
+
+
 def _finite(values: Sequence[float]) -> np.ndarray:
     array = np.asarray(values, dtype=np.float64)
     return array[np.isfinite(array)]
@@ -1002,6 +1012,7 @@ def _plot_spatial_organisation(
             top.fill_between(layers, low, high, color=colour, alpha=0.14, linewidth=0)
         top.set_title(spec.labels[task])
         top.set_xlabel("layer")
+        _set_layer_axis_ticks(top)
         if column == 0:
             top.set_ylabel("expected graph distance")
 
@@ -1013,6 +1024,7 @@ def _plot_spatial_organisation(
         bottom.plot(layers, mean, color="#7A5195", marker="o")
         bottom.fill_between(layers, low, high, color="#7A5195", alpha=0.18, linewidth=0)
         bottom.set_xlabel("layer")
+        _set_layer_axis_ticks(bottom)
         if column == 0:
             bottom.set_ylabel("structural $-$ semantic\nspatial variance")
     figure.suptitle(f"{spec.name.upper()}: spatial organisation across architectures")
@@ -1053,6 +1065,7 @@ def _plot_spatial_organisation(
             axis.fill_between(layers, low, high, color=colour, alpha=0.14, linewidth=0)
         axis.set_title(spec.labels[task])
         axis.set_xlabel("layer")
+        _set_layer_axis_ticks(axis)
         if column == 0:
             axis.set_ylabel("expected graph distance")
     distance_figure.suptitle(
@@ -1115,6 +1128,7 @@ def _plot_expected_graph_distance(
             axis.fill_between(layers, low, high, color=colour, alpha=0.14, linewidth=0)
         axis.set_title(spec.labels[task])
         axis.set_xlabel("layer")
+        _set_layer_axis_ticks(axis)
         if column == 0:
             axis.set_ylabel("expected graph distance")
     figure.suptitle(f"{spec.name.upper()}: expected graph distance across architectures")
@@ -1815,6 +1829,7 @@ def _plot_vnode_allocation(
             axis.fill_between(layers, low, high, color=colour, alpha=0.15, linewidth=0)
         axis.set_title(spec.labels[task])
         axis.set_xlabel("layer")
+        _set_layer_axis_ticks(axis)
         if column == 0:
             axis.set_ylabel("fraction assigned to virtual node")
     figure.suptitle(f"{spec.name.upper()}: virtual-node allocation")
