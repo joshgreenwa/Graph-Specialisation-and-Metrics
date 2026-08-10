@@ -1589,7 +1589,7 @@ def _plot_seed_mean_reach_gap_heatmap(
     figure, axes = plt.subplots(
         1,
         len(spec.tasks),
-        figsize=(3.55 * len(spec.tasks), 3.05),
+        figsize=(3.55 * len(spec.tasks), 4.6),
         squeeze=False,
         constrained_layout=True,
     )
@@ -1615,7 +1615,7 @@ def _plot_seed_mean_reach_gap_heatmap(
         figure.colorbar(
             image,
             ax=axes,
-            label="expected score reach $-$ attention reach (hops)",
+            label="score reach $-$ attention reach (hops)",
             pad=0.01,
         )
     figure.suptitle(
