@@ -24,6 +24,7 @@ from .chapter6_multiseed import (
     CHANNELS,
     SEEDS,
     DatasetSpec,
+    _add_figure_legend,
     _joint_normalised_response_rows,
     _plot_distance_alignment,
     _plot_expected_graph_distance,
@@ -443,10 +444,11 @@ def _plot_expected_final_state_response_distance(
     axis.set_ylabel("expected graph distance")
     axis.set_xlabel("architecture")
     axis.grid(axis="y", alpha=0.16, linewidth=0.6)
-    axis.legend(frameon=False)
     figure.suptitle(
         f"{spec.name.upper()}: expected distance of final-state response"
     )
+    handles, labels = axis.get_legend_handles_labels()
+    _add_figure_legend(figure, handles, labels, ncol=2)
     _scale_figure_text(figure)
     return _save_figure(
         figure,

@@ -142,10 +142,15 @@ def _save_figure(figure: Any, figures_dir: Path, stem: str) -> list[Path]:
 def _scale_figure_text(
     figure: Any,
     *,
-    factor: float = 1.25,
+    factor: float = 1.5625,
     preserve_tick_axes: Sequence[Any] = (),
 ) -> None:
-    """Scale completed figure text once, optionally preserving selected ticks."""
+    """Scale completed figure text once, optionally preserving selected ticks.
+
+    Most Chapter 6 figures already used a 1.25 publication scale.  The default
+    is therefore 1.25 * 1.25: a further 25% increase relative to the figures
+    produced before the chapter-wide typography refresh.
+    """
 
     preserved = {id(axis) for axis in preserve_tick_axes}
     seen: set[int] = set()
@@ -160,6 +165,10 @@ def _scale_figure_text(
 
     for text in figure.texts:
         scale(text)
+    for legend in figure.legends:
+        scale(legend.get_title())
+        for text in legend.get_texts():
+            scale(text)
     for axis in figure.axes:
         scale(axis.title)
         scale(axis.xaxis.label)
@@ -176,6 +185,27 @@ def _scale_figure_text(
             scale(legend.get_title())
             for text in legend.get_texts():
                 scale(text)
+
+
+def _add_figure_legend(
+    figure: Any,
+    handles: Sequence[Any],
+    labels: Sequence[str],
+    *,
+    ncol: int,
+) -> None:
+    """Place shared legends below the data so enlarged text cannot hide marks."""
+
+    if not handles:
+        return
+    figure.legend(
+        handles,
+        labels,
+        loc="upper center",
+        bbox_to_anchor=(0.5, -0.015),
+        ncol=max(1, int(ncol)),
+        frameon=False,
+    )
 
 
 def _finite(values: Sequence[float]) -> np.ndarray:
@@ -974,7 +1004,6 @@ def _plot_spatial_organisation(
         top.set_xlabel("layer")
         if column == 0:
             top.set_ylabel("expected graph distance")
-            top.legend(frameon=False, fontsize=8)
 
         bottom = axes[1, column]
         mean = np.asarray([float(row["structural_excess_width_mean"]) for row in selected])
@@ -987,6 +1016,8 @@ def _plot_spatial_organisation(
         if column == 0:
             bottom.set_ylabel("structural $-$ semantic\nspatial variance")
     figure.suptitle(f"{spec.name.upper()}: spatial organisation across architectures")
+    handles, labels = axes[0, 0].get_legend_handles_labels()
+    _add_figure_legend(figure, handles, labels, ncol=3)
     _scale_figure_text(figure)
     outputs.extend(_save_figure(figure, figures_dir, "01_spatial_organisation"))
     plt.close(figure)
@@ -1024,10 +1055,11 @@ def _plot_spatial_organisation(
         axis.set_xlabel("layer")
         if column == 0:
             axis.set_ylabel("expected graph distance")
-            axis.legend(frameon=False, fontsize=8)
     distance_figure.suptitle(
         f"{spec.name.upper()}: expected graph distance across architectures"
     )
+    handles, labels = distance_axes[0, 0].get_legend_handles_labels()
+    _add_figure_legend(distance_figure, handles, labels, ncol=3)
     _scale_figure_text(distance_figure)
     outputs.extend(
         _save_figure(
@@ -1085,8 +1117,9 @@ def _plot_expected_graph_distance(
         axis.set_xlabel("layer")
         if column == 0:
             axis.set_ylabel("expected graph distance")
-            axis.legend(frameon=False, fontsize=8)
     figure.suptitle(f"{spec.name.upper()}: expected graph distance across architectures")
+    handles, labels = axes[0, 0].get_legend_handles_labels()
+    _add_figure_legend(figure, handles, labels, ncol=3)
     _scale_figure_text(figure)
     return _save_figure(figure, figures_dir, "01b_expected_graph_distance")
 
@@ -1165,8 +1198,13 @@ def _plot_specialisation_landscapes(
         Line2D([], [], marker=markers[index], linestyle="", color="#555555", label=f"seed {seed}")
         for index, seed in enumerate(sorted({int(row["seed"]) for row in rows}))
     ]
-    axes[1, 0].legend(handles=seed_handles, frameon=False, fontsize=8, loc="upper left")
     figure.suptitle(f"{spec.name.upper()}: head specialisation landscapes")
+    _add_figure_legend(
+        figure,
+        seed_handles,
+        [handle.get_label() for handle in seed_handles],
+        ncol=len(seed_handles),
+    )
     _scale_figure_text(figure)
     return _save_figure(figure, figures_dir, "02_specialisation_landscapes")
 
@@ -1225,8 +1263,13 @@ def _plot_specialisation_selectivity_landscapes(
         Line2D([], [], marker=markers[index], linestyle="", color="#555555", label=f"seed {seed}")
         for index, seed in enumerate(sorted({int(row["seed"]) for row in rows}))
     ]
-    axes[0, 0].legend(handles=seed_handles, frameon=False, fontsize=8, loc="upper left")
     figure.suptitle(f"{spec.name.upper()}: joint sensitivity and relative selectivity")
+    _add_figure_legend(
+        figure,
+        seed_handles,
+        [handle.get_label() for handle in seed_handles],
+        ncol=len(seed_handles),
+    )
     _scale_figure_text(figure)
     return _save_figure(
         figure,
@@ -1304,7 +1347,7 @@ def _plot_dense_one_hop_attention_landscape(
     ):
         return []
 
-    figure, axis = plt.subplots(figsize=(7.2, 5.6), constrained_layout=True)
+    figure, axis = plt.subplots(figsize=(7.2, 6.0), constrained_layout=True)
     markers = ("o", "s", "^")
     maximum_layer = max(int(row["layer"]) for row in selected)
     colour_map = plt.get_cmap("viridis")
@@ -1353,13 +1396,9 @@ def _plot_dense_one_hop_attention_landscape(
         and float(row["attention_hop1_mass"]) >= float(threshold)
         for row in selected
     )
-    axis.text(
-        0.97,
-        0.96,
-        f"{focused_count}/{len(selected)} heads at or above {100 * threshold:.0f}%",
-        transform=axis.transAxes,
-        ha="right",
-        va="top",
+    axis.set_title(
+        f"{focused_count}/{len(selected)} heads at or above {100 * threshold:.0f}% "
+        "attention at one hop",
         fontsize=9,
     )
     handles = [
@@ -1395,11 +1434,16 @@ def _plot_dense_one_hop_attention_landscape(
             ),
         )
     )
-    axis.legend(handles=handles, frameon=False, fontsize=8, loc="upper left")
     if scatter is not None:
         figure.colorbar(scatter, ax=axis, label="layer", pad=0.02)
     figure.suptitle(
         f"{spec.name.upper()}: dense GRIT one-hop attention in the specialisation landscape"
+    )
+    _add_figure_legend(
+        figure,
+        handles,
+        [handle.get_label() for handle in handles],
+        ncol=2,
     )
     _scale_figure_text(figure)
     return _save_figure(
@@ -1596,7 +1640,7 @@ def _plot_distance_alignment(
     figure, axes = plt.subplots(
         1,
         len(spec.tasks),
-        figsize=(3.65 * len(spec.tasks), 4.0),
+        figsize=(3.65 * len(spec.tasks), 5.8),
         squeeze=False,
         constrained_layout=True,
     )
@@ -1648,37 +1692,32 @@ def _plot_distance_alignment(
         axis.set_xlim(lower, upper)
         axis.set_ylim(lower, upper)
         axis.set_aspect("equal", adjustable="box")
-        axis.set_title(spec.labels[task])
         axis.set_xlabel("semantic expected distance")
         if column == 0:
             axis.set_ylabel("structural expected distance")
         record = summary_lookup.get(task)
+        title = spec.labels[task]
         if record is not None:
-            axis.text(
-                0.04,
-                0.96,
-                (
-                    rf"$\rho$={float(record['spearman_rho']):.2f}"
-                    + "\n"
-                    + f"same peak={100 * float(record['same_peak_fraction']):.0f}%\n"
-                    + "within one bin="
-                    + f"{100 * float(record['same_or_adjacent_peak_fraction']):.0f}%"
-                ),
-                transform=axis.transAxes,
-                ha="left",
-                va="top",
-                fontsize=8,
-                bbox={"facecolor": "white", "alpha": 0.75, "edgecolor": "none"},
+            title += (
+                "\n"
+                + rf"$\rho$={float(record['spearman_rho']):.2f}; peak="
+                + f"{100 * float(record['same_peak_fraction']):.0f}%"
             )
+        axis.set_title(title)
     if scatter is not None:
         figure.colorbar(scatter, ax=axes, label="layer", shrink=0.82, pad=0.01)
     seed_handles = [
         Line2D([], [], marker=markers[index], linestyle="", color="#555555", label=f"seed {seed}")
         for index, seed in enumerate(sorted({int(row["seed"]) for row in rows}))
     ]
-    axes[0, 0].legend(handles=seed_handles, frameon=False, fontsize=8, loc="lower right")
     figure.suptitle(
         f"{spec.name.upper()}: semantic and structural distance alignment"
+    )
+    _add_figure_legend(
+        figure,
+        seed_handles,
+        [handle.get_label() for handle in seed_handles],
+        ncol=len(seed_handles),
     )
     _scale_figure_text(figure)
     return _save_figure(figure, figures_dir, "05_semantic_structural_distance_alignment")
@@ -1778,8 +1817,13 @@ def _plot_vnode_allocation(
         axis.set_xlabel("layer")
         if column == 0:
             axis.set_ylabel("fraction assigned to virtual node")
-            axis.legend(frameon=False, fontsize=8)
     figure.suptitle(f"{spec.name.upper()}: virtual-node allocation")
+    handles, labels = axes[0, 0].get_legend_handles_labels()
+    _add_figure_legend(figure, handles, labels, ncol=3)
+    # This figure previously missed the shared publication scaling pass, so it
+    # receives the requested 25% uplift directly rather than the cumulative
+    # scale used by figures that were already enlarged once.
+    _scale_figure_text(figure, factor=1.25)
     return _save_figure(figure, figures_dir, "06_virtual_node_allocation")
 
 
@@ -1867,11 +1911,11 @@ def _plot_population_profiles(
             axis.set_xlabel("distance")
             if column == 0:
                 axis.set_ylabel(f"{channel}\nprofile mass")
-            if row_index == 0 and column == 0:
-                axis.legend(frameon=False, fontsize=8)
     figure.suptitle(
         f"{spec.name.upper()}: head-score mass and final-state response allocation"
     )
+    handles, labels = axes[0, 0].get_legend_handles_labels()
+    _add_figure_legend(figure, handles, labels, ncol=2)
     _scale_figure_text(figure)
     return _save_figure(figure, figures_dir, "07_score_and_final_state_response")
 
@@ -1940,11 +1984,11 @@ def _plot_matched_strength_profiles(
             axis.set_xlabel("distance")
             if column == 0:
                 axis.set_ylabel(f"{channel}\nprofile strength")
-            if row_index == 0 and column == 0:
-                axis.legend(frameon=False, fontsize=8)
     figure.suptitle(
         f"{spec.name.upper()}: opportunity-matched head scores and final-state response"
     )
+    handles, labels = axes[0, 0].get_legend_handles_labels()
+    _add_figure_legend(figure, handles, labels, ncol=2)
     _scale_figure_text(figure)
     return _save_figure(figure, figures_dir, "08_matched_score_and_final_state_response")
 
@@ -2013,11 +2057,11 @@ def _plot_carriage_response_variants(
                     if variant == "normalised"
                     else "mean final-state response per carrier"
                 )
-            if row_index == 0 and column == 0:
-                axis.legend(frameon=False, fontsize=8)
             if variant == "raw":
                 axis.ticklabel_format(axis="y", style="sci", scilimits=(-2, 2))
     figure.suptitle(f"{spec.name.upper()}: per-carrier final-state response shape and magnitude")
+    handles, labels = axes[0, 0].get_legend_handles_labels()
+    _add_figure_legend(figure, handles, labels, ncol=2)
     _scale_figure_text(figure)
     return _save_figure(figure, figures_dir, "09_final_state_response_variants")
 
@@ -2075,8 +2119,9 @@ def _plot_final_state_response(
         axis.ticklabel_format(axis="y", style="sci", scilimits=(-2, 2))
         if column == 0:
             axis.set_ylabel("Final-state response")
-            axis.legend(frameon=False, fontsize=8)
     figure.suptitle(f"{spec.name.upper()}: final-state response across architectures")
+    handles, labels = axes[0, 0].get_legend_handles_labels()
+    _add_figure_legend(figure, handles, labels, ncol=2)
     _scale_figure_text(figure)
     return _save_figure(figure, figures_dir, "09b_final_state_response")
 
@@ -2183,6 +2228,13 @@ def _plot_overlaid_final_state_response(
             )
             axis.fill_between(x, low, high, color=colour, alpha=0.10, linewidth=0)
         axis.set_xticks(x, labels)
+        if len(labels) > 7:
+            plt.setp(
+                axis.get_xticklabels(),
+                rotation=30,
+                ha="right",
+                rotation_mode="anchor",
+            )
         axis.set_title(channel.capitalize())
         axis.set_xlabel("graph distance")
         axis.grid(axis="y", alpha=0.16, linewidth=0.6)
@@ -2192,7 +2244,6 @@ def _plot_overlaid_final_state_response(
                 if variant == "normalised"
                 else "Final-state response"
             )
-            axis.legend(frameon=False, fontsize=8)
         if variant == "raw":
             axis.ticklabel_format(axis="y", style="sci", scilimits=(-2, 2))
     if variant == "normalised":
@@ -2201,6 +2252,13 @@ def _plot_overlaid_final_state_response(
         )
     else:
         figure.suptitle(f"{spec.name.upper()}: final-state response by architecture")
+    handles, legend_labels = axes[0, 0].get_legend_handles_labels()
+    _add_figure_legend(
+        figure,
+        handles,
+        legend_labels,
+        ncol=min(len(spec.tasks), 5),
+    )
     _scale_figure_text(figure)
     return _save_figure(figure, figures_dir, stem)
 
@@ -2336,7 +2394,13 @@ def _plot_joint_sensitivity_ablation(
     import matplotlib.pyplot as plt
     from matplotlib.lines import Line2D
 
-    figure, axes = plt.subplots(1, len(spec.tasks), figsize=(18.25, 4.0), sharey=True)
+    figure, axes = plt.subplots(
+        1,
+        len(spec.tasks),
+        figsize=(18.25, 4.6),
+        sharey=True,
+        constrained_layout=True,
+    )
     markers = ("o", "s", "^")
     maximum_layer = max(int(row["layer"]) for row in rows)
     colour_map = plt.get_cmap("viridis")
@@ -2364,24 +2428,9 @@ def _plot_joint_sensitivity_ablation(
             )
         finite_rhos = _finite([rho for _, rho in seed_rhos])
         mean_rho = float(np.mean(finite_rhos)) if finite_rhos.size else float("nan")
-        rho_lines = [rf"mean seed $\rho={mean_rho:.2f}$"]
-        rho_lines.append(
-            "  ".join(
-                rf"$\rho_{seed}={rho:.2f}$" if np.isfinite(rho) else rf"$\rho_{seed}=--$"
-                for seed, rho in seed_rhos
-            )
+        axis.set_title(
+            spec.labels[task] + "\n" + rf"mean seed $\rho={mean_rho:.2f}$"
         )
-        axis.text(
-            0.04,
-            0.96,
-            "\n".join(rho_lines),
-            transform=axis.transAxes,
-            va="top",
-            ha="left",
-            fontsize=7.5,
-            bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.82, "pad": 2.0},
-        )
-        axis.set_title(spec.labels[task])
         axis.set_xlabel(r"joint sensitivity $J$")
         axis.grid(alpha=0.18, linewidth=0.6)
         if column == 0:
@@ -2392,8 +2441,13 @@ def _plot_joint_sensitivity_ablation(
         Line2D([], [], marker=markers[index], linestyle="", color="#555555", label=f"seed {seed}")
         for index, seed in enumerate(sorted({int(row["seed"]) for row in rows}))
     ]
-    axes[-1].legend(handles=seed_handles, frameon=False, fontsize=7.5, loc="lower right")
     figure.suptitle(f"{spec.name.upper()}: joint sensitivity and head-ablation impact")
+    _add_figure_legend(
+        figure,
+        seed_handles,
+        [handle.get_label() for handle in seed_handles],
+        ncol=len(seed_handles),
+    )
     _scale_figure_text(figure)
     return _save_figure(figure, figures_dir, "10_joint_sensitivity_head_ablation")
 

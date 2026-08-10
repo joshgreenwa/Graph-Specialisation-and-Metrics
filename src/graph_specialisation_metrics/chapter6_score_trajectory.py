@@ -296,6 +296,11 @@ def plot(
             f"ZINC {LABELS[architecture]}: specialisation across training",
             fontsize=15,
         )
+        # Trajectory figures have their own explicit type sizes rather than the
+        # shared Chapter 6 baseline, so apply the requested uplift once here.
+        from .chapter6_multiseed import _scale_figure_text
+
+        _scale_figure_text(figure, factor=1.25)
         stem = f"11{'a' if architecture == 'dense' else 'b'}_{architecture}_score_trajectory"
         outputs.extend(_save_figure(figure, figures_dir, stem))
         plt.close(figure)

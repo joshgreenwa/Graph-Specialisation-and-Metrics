@@ -23,7 +23,7 @@ from typing import Any
 import numpy as np
 
 from .chapter6_clean_ablation import load_rows as load_ablation_rows
-from .chapter6_multiseed import SEEDS, dataset_spec
+from .chapter6_multiseed import SEEDS, _scale_figure_text, dataset_spec
 from .chapter6_spatial_explorer import head_metrics, load_models
 from .methodology.cache import checkpoint_sha256
 from .methodology.grit_figure_data import (
@@ -48,6 +48,7 @@ from .methodology.grit_figure_plots import (
 from .zinc_cached_rrwp_comparison import group_distance
 
 ANALYSIS_VERSION = "chapter6-special-heads-v2-all-heads"
+FIGURE_STYLE_VERSION = "chapter6-special-heads-text-125-v1"
 ROLE_ORDER = ("semantic", "structural", "highest_joint")
 ROLE_LABELS = {
     "semantic": "Most semantic head",
@@ -326,7 +327,7 @@ def _plot_distance_profiles(
     import matplotlib.pyplot as plt
 
     apply_publication_style()
-    fig, ax = plt.subplots(figsize=(8.8, 5.5), constrained_layout=True)
+    fig, ax = plt.subplots(figsize=(8.8, 5.8), constrained_layout=True)
     labels = tuple(str(value) for value in profiles["labels"])
     x = np.arange(len(labels))
     styles = (
@@ -358,13 +359,22 @@ def _plot_distance_profiles(
         fontsize=15,
     )
     ax.grid(axis="y")
-    ax.legend(ncol=3, loc="upper right")
+    handles, labels = ax.get_legend_handles_labels()
+    fig.legend(
+        handles,
+        labels,
+        loc="upper center",
+        bbox_to_anchor=(0.5, -0.01),
+        ncol=3,
+        frameon=False,
+    )
     return fig
 
 
 def _record_metadata(row: Mapping[str, Any], **extra: Any) -> dict[str, Any]:
     return {
         "analysis_version": ANALYSIS_VERSION,
+        "figure_style_version": FIGURE_STYLE_VERSION,
         "task": str(row["task"]),
         "model_label": str(row["model_label"]),
         "role": str(row["role"]),
@@ -422,7 +432,19 @@ def _discover_existing_outputs(
                 "pdf": figures_dir / f"{stem}.pdf",
                 "metadata": figures_dir / f"{stem}.json",
             }
-            if all(path.is_file() for path in paths.values()):
+            metadata_matches = False
+            if paths["metadata"].is_file():
+                try:
+                    saved_metadata = json.loads(
+                        paths["metadata"].read_text(encoding="utf-8")
+                    )
+                    metadata_matches = (
+                        saved_metadata.get("figure_style_version")
+                        == FIGURE_STYLE_VERSION
+                    )
+                except (OSError, UnicodeError, json.JSONDecodeError):
+                    metadata_matches = False
+            if metadata_matches and all(path.is_file() for path in paths.values()):
                 outputs.append(
                     {
                         "task": task,
@@ -593,6 +615,7 @@ def generate_special_head_analysis(
             candidate = json.loads(manifest_path.read_text(encoding="utf-8"))
             request_matches = (
                 candidate.get("analysis_version") == ANALYSIS_VERSION
+                and candidate.get("figure_style_version") == FIGURE_STYLE_VERSION
                 and candidate.get("dataset") == spec.name
                 and candidate.get("seeds") == [int(seed) for seed in seeds]
                 and candidate.get("models") == list(spec.tasks)
@@ -1013,6 +1036,7 @@ def generate_special_head_analysis(
                     net_joint_sensitivity=float(row["joint_sensitivity"]),
                     head_ablation_impact=float(row["head_ablation_impact"]),
                 )
+                _scale_figure_text(figure, factor=1.25)
                 paths = save_figure_bundle(
                     figure,
                     figures_dir,
@@ -1053,6 +1077,7 @@ def generate_special_head_analysis(
                 joint_sensitivity=float(row["joint_sensitivity"]),
                 head_ablation_impact=float(row["head_ablation_impact"]),
             )
+            _scale_figure_text(figure, factor=1.25)
             paths = save_figure_bundle(
                 figure,
                 figures_dir,
@@ -1085,6 +1110,7 @@ def generate_special_head_analysis(
                 joint_sensitivity=float(row["joint_sensitivity"]),
                 head_ablation_impact=float(row["head_ablation_impact"]),
             )
+            _scale_figure_text(figure, factor=1.25)
             paths = save_figure_bundle(
                 figure,
                 figures_dir,
@@ -1151,6 +1177,7 @@ def generate_special_head_analysis(
 
     manifest = {
         "analysis_version": ANALYSIS_VERSION,
+        "figure_style_version": FIGURE_STYLE_VERSION,
         "dataset": spec.name,
         "seeds": [int(seed) for seed in seeds],
         "models": list(spec.tasks),

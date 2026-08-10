@@ -854,7 +854,9 @@ def plot_attention_grid_publication(
         for values in inbound
     )
     num_rows = len(examples)
-    figure_height = 3.4 + 3.35 * num_rows
+    # The Chapter 6 typography refresh enlarges the title block by 25%.
+    # Reserve a full title band so it remains separate from the column labels.
+    figure_height = 6.4 + 3.35 * num_rows
     fig = plt.figure(
         figsize=(15.5, figure_height),
         constrained_layout=True,
@@ -862,7 +864,7 @@ def plot_attention_grid_publication(
     grid = fig.add_gridspec(
         num_rows + 2,
         3,
-        height_ratios=[0.16, *([1.0] * num_rows), 0.11],
+        height_ratios=[0.95, *([1.0] * num_rows), 0.11],
         width_ratios=[1.0, 1.08, 1.12],
     )
     title_axis = fig.add_subplot(grid[0, :])
@@ -934,16 +936,15 @@ def plot_attention_grid_publication(
     for column, label in enumerate(
         [
             "Molecule",
-            "Attention-weighted molecule",
-            "Node-conditioned attention",
+            "Attention-weighted\nmolecule",
+            "Node-conditioned\nattention",
         ]
     ):
         axes[0, column].set_title(label, fontsize=25, pad=10)
     title_axis.text(
         0.5,
-        0.84,
-        f"{_payload_display_title(examples_payload)} — "
-        f"{title_label} — {_head_label(head)}",
+        0.82,
+        _payload_display_title(examples_payload),
         ha="center",
         va="center",
         fontsize=29,
@@ -951,7 +952,16 @@ def plot_attention_grid_publication(
     )
     title_axis.text(
         0.5,
-        0.04,
+        0.50,
+        f"{title_label} — {_head_label(head)}",
+        ha="center",
+        va="center",
+        fontsize=25,
+        color=NAVY,
+    )
+    title_axis.text(
+        0.5,
+        0.18,
         rf"$D_{{\rm rel}} = {float(net_d_rel):+.3f};\quad "
         rf"J = {float(net_joint_sensitivity):.3f};\quad "
         rf"\Delta \hat{{y}}_{{\rm ablate}} = "
@@ -1127,7 +1137,8 @@ def plot_av_pca_publication(
     categories = _ordered_pca_categories(labels)
     legend_columns = min(3, max(1, len(categories)))
     legend_rows = int(np.ceil(len(categories) / legend_columns))
-    legend_space_inches = 0.65 + 0.42 * legend_rows
+    # Keep up to three rows of the enlarged chemistry legend clear of the PCA.
+    legend_space_inches = 0.80 + 0.55 * legend_rows
     figure_height = INDIVIDUAL_PCA_BASE_HEIGHT + legend_space_inches
     fig, ax = plt.subplots(
         figsize=(INDIVIDUAL_PCA_FIGURE_WIDTH, figure_height)
