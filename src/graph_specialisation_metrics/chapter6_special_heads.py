@@ -48,7 +48,7 @@ from .methodology.grit_figure_plots import (
 from .zinc_cached_rrwp_comparison import group_distance
 
 ANALYSIS_VERSION = "chapter6-special-heads-v2-all-heads"
-FIGURE_STYLE_VERSION = "chapter6-special-heads-text-125-v1"
+FIGURE_STYLE_VERSION = "chapter6-special-heads-paper-attention-v3"
 ROLE_ORDER = ("semantic", "structural", "highest_joint")
 ROLE_LABELS = {
     "semantic": "Most semantic head",
@@ -1036,7 +1036,6 @@ def generate_special_head_analysis(
                     net_joint_sensitivity=float(row["joint_sensitivity"]),
                     head_ablation_impact=float(row["head_ablation_impact"]),
                 )
-                _scale_figure_text(figure, factor=1.25)
                 paths = save_figure_bundle(
                     figure,
                     figures_dir,

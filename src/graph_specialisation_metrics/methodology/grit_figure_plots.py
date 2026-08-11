@@ -44,7 +44,7 @@ MOLECULE_ATOM_FONT_SIZE = 55
 # Backwards-compatible name retained for existing figure metadata consumers.
 MOLECULE_DRAW_DPI = MOLECULE_RENDER_DPI
 CORE_SCATTER_FIGSIZE = (8.0, 5.9)
-ATTENTION_MATRIX_MAX_TICK_LABELS = 10
+ATTENTION_MATRIX_TICK_STEP = 4
 HEAD_STYLES = {
     "semantic": {"color": GOLD, "label": "Semantic specialist"},
     "structural": {"color": TEAL, "label": "Structural specialist"},
@@ -443,16 +443,37 @@ def _node_conditioned_attention(attention: np.ndarray) -> np.ndarray:
     return attention / denominator
 
 
-def _attention_matrix_tick_indices(num_nodes: int) -> np.ndarray:
-    """Return readable node ticks while retaining both matrix endpoints."""
+def _attention_matrix_tick_indices(
+    num_nodes: int, *, has_virtual_node: bool = False
+) -> np.ndarray:
+    """Label every fourth molecular index and, when present, the virtual node."""
 
     num_nodes = int(num_nodes)
     if num_nodes < 1:
         raise ValueError("an attention matrix must contain at least one node")
-    tick_count = min(num_nodes, ATTENTION_MATRIX_MAX_TICK_LABELS)
-    return np.unique(
-        np.rint(np.linspace(0, num_nodes - 1, num=tick_count)).astype(int)
-    )
+    molecular_nodes = num_nodes - 1 if has_virtual_node else num_nodes
+    ticks = list(range(0, molecular_nodes, ATTENTION_MATRIX_TICK_STEP))
+    if has_virtual_node:
+        ticks.append(num_nodes - 1)
+    return np.asarray(ticks, dtype=int)
+
+
+def _paper_model_label(payload: Mapping[str, Any]) -> str:
+    """Return the compact architecture label used by paper attention panels."""
+
+    if payload.get("paper_model_label"):
+        return str(payload["paper_model_label"])
+    task = str(payload.get("task", "")).lower()
+    dataset = "ZINC" if task.startswith("zinc") else "QM9" if task.startswith("qm9") else "GRIT"
+    if "1hop" in task:
+        architecture = "1-hop"
+    elif "2hop" in task:
+        architecture = "2-hop"
+    else:
+        architecture = "dense"
+    if "vnode" in task:
+        architecture += " + VNode"
+    return f"{dataset} {architecture}"
 
 
 def _molecule_from_example(example: Mapping[str, Any]):
@@ -823,7 +844,7 @@ def plot_attention_grid_publication(
     title_label: str,
     net_d_rel: float,
     net_joint_sensitivity: float,
-    head_ablation_impact: float,
+    head_ablation_impact: float | None = None,
 ):
     """Established ZINC/QM9 layout with family-specific attention colour.
 
@@ -853,53 +874,34 @@ def plot_attention_grid_publication(
         max(float(np.nanpercentile(values, 99)), 1e-6)
         for values in inbound
     )
+    del head_ablation_impact  # Retained only for backwards-compatible callers.
     num_rows = len(examples)
-    # The Chapter 6 typography refresh enlarges the title block by 25%.
-    # Reserve a full title band so it remains separate from the column labels.
-    figure_height = 6.4 + 3.35 * num_rows
+    figure_height = 3.0 + 3.0 * num_rows
     fig = plt.figure(
-        figsize=(15.5, figure_height),
-        constrained_layout=True,
+        figsize=(12.2, figure_height),
+        constrained_layout=False,
     )
     grid = fig.add_gridspec(
-        num_rows + 2,
+        num_rows,
         3,
-        height_ratios=[0.95, *([1.0] * num_rows), 0.11],
-        width_ratios=[1.0, 1.08, 1.12],
+        left=0.025,
+        right=0.975,
+        bottom=0.165,
+        top=0.755,
+        wspace=0.10,
+        hspace=0.18,
+        width_ratios=[1.05, 1.05, 0.82],
     )
-    title_axis = fig.add_subplot(grid[0, :])
-    title_axis.axis("off")
     axes = np.asarray(
         [
-            [fig.add_subplot(grid[row + 1, column]) for column in range(3)]
+            [fig.add_subplot(grid[row, column]) for column in range(3)]
             for row in range(num_rows)
         ],
         dtype=object,
     )
-    colorbar_axis = fig.add_subplot(grid[-1, :])
-    dataset_label = str(examples_payload.get("dataset_label", "molecule"))
     for row, (example, matrix) in enumerate(zip(examples, matrices)):
         axes[row, 0].imshow(_draw_molecule_plain(example))
         axes[row, 0].axis("off")
-        caption = f"{dataset_label} eval {int(example['dataset_index'])}"
-        formula = str(example.get("formula") or "").strip()
-        if formula:
-            caption += f" · {formula}"
-        axes[row, 0].text(
-            0.5,
-            0.015,
-            caption,
-            transform=axes[row, 0].transAxes,
-            ha="center",
-            va="bottom",
-            fontsize=15,
-            color=NAVY,
-            bbox={
-                "facecolor": "white",
-                "edgecolor": "none",
-                "alpha": 0.90,
-            },
-        )
         axes[row, 1].imshow(
             _draw_molecule_attention(
                 example,
@@ -918,20 +920,35 @@ def plot_attention_grid_publication(
             aspect="equal",
             rasterized=True,
         )
-        axes[row, 2].set_xlabel("Key atom", fontsize=20)
-        axes[row, 2].set_ylabel("Query atom", fontsize=20)
-        tick_indices = _attention_matrix_tick_indices(matrix.shape[0])
+        axes[row, 2].set_xlabel("Key atom", fontsize=17)
+        axes[row, 2].set_ylabel("Query atom", fontsize=17)
+        has_virtual_node = bool(example.get("has_virtual_node"))
+        tick_indices = _attention_matrix_tick_indices(
+            matrix.shape[0], has_virtual_node=has_virtual_node
+        )
         tick_labels = [str(index) for index in tick_indices]
-        if (
-            bool(example.get("has_virtual_node"))
-            and matrix.shape[0] - 1 in tick_indices
-        ):
+        if has_virtual_node and matrix.shape[0] - 1 in tick_indices:
             tick_labels[
                 list(tick_indices).index(matrix.shape[0] - 1)
             ] = "VN"
         axes[row, 2].set_xticks(tick_indices, tick_labels)
         axes[row, 2].set_yticks(tick_indices, tick_labels)
-        axes[row, 2].tick_params(labelsize=10, length=2.5)
+        axes[row, 2].tick_params(labelsize=12, length=2.5)
+
+        # The matrix is supporting evidence rather than the visual focus.  A
+        # small inset keeps it legible without overpowering the molecules.
+        matrix_position = axes[row, 2].get_position()
+        matrix_scale = 0.90
+        matrix_width = matrix_position.width * matrix_scale
+        matrix_height = matrix_position.height * matrix_scale
+        axes[row, 2].set_position(
+            [
+                matrix_position.x0 + (matrix_position.width - matrix_width) / 2,
+                matrix_position.y0 + (matrix_position.height - matrix_height) / 2,
+                matrix_width,
+                matrix_height,
+            ]
+        )
 
     for column, label in enumerate(
         [
@@ -940,58 +957,41 @@ def plot_attention_grid_publication(
             "Node-conditioned\nattention",
         ]
     ):
-        axes[0, column].set_title(label, fontsize=25, pad=10)
-    title_axis.text(
+        axes[0, column].set_title(label, fontsize=18, pad=9)
+    title_fontsize = 20
+    fig.text(
         0.5,
-        0.82,
-        _payload_display_title(examples_payload),
+        0.955,
+        f"{_paper_model_label(examples_payload)} -- {title_label} "
+        f"(L{head[0]}, H{head[1]})",
         ha="center",
         va="center",
-        fontsize=29,
-        color=NAVY,
+        fontsize=title_fontsize,
+        color="black",
     )
-    title_axis.text(
+    fig.text(
         0.5,
-        0.50,
-        f"{title_label} — {_head_label(head)}",
+        0.900,
+        rf"$D_{{\rm rel}} = {float(net_d_rel):+.3f},\quad "
+        rf"J = {float(net_joint_sensitivity):.3f}$",
         ha="center",
         va="center",
-        fontsize=25,
-        color=NAVY,
+        fontsize=title_fontsize,
+        color="black",
     )
-    title_axis.text(
-        0.5,
-        0.18,
-        rf"$D_{{\rm rel}} = {float(net_d_rel):+.3f};\quad "
-        rf"J = {float(net_joint_sensitivity):.3f};\quad "
-        rf"\Delta \hat{{y}}_{{\rm ablate}} = "
-        rf"{float(head_ablation_impact):.4g}$",
-        ha="center",
-        va="center",
-        fontsize=25,
-        color=NAVY,
-    )
+    # Centre the shared bar on the complete figure and place it below every
+    # panel label so neither the matrices nor their ticks can intersect it.
+    colorbar_axis = fig.add_axes([0.25, 0.050, 0.50, 0.025])
     colorbar = fig.colorbar(
         image,
         cax=colorbar_axis,
         orientation="horizontal",
     )
-    colorbar.set_label("Attention weight", fontsize=25, labelpad=7)
-    colorbar.ax.tick_params(labelsize=25, length=3)
+    colorbar.set_label("Attention weight", fontsize=17, labelpad=5)
+    colorbar.ax.tick_params(labelsize=14, length=3)
     for tick_label in colorbar.ax.get_xticklabels():
         tick_label.set_fontweight("medium")
 
-    fig.canvas.draw()
-    colorbar_position = colorbar_axis.get_position()
-    fig.set_layout_engine("none")
-    colorbar_axis.set_position(
-        [
-            colorbar_position.x0 + 0.08 * colorbar_position.width,
-            colorbar_position.y0 - 0.92 / figure_height,
-            0.84 * colorbar_position.width,
-            colorbar_position.height,
-        ]
-    )
     return fig
 
 

@@ -141,9 +141,32 @@ def test_publication_attention_uses_family_colour_and_labels_virtual_node():
     matrix_axis = next(axis for axis in figure.axes if axis.get_xlabel() == "Key atom")
     assert matrix_axis.images[0].get_cmap().name == "Oranges"
     assert "VN" in [label.get_text() for label in matrix_axis.get_xticklabels()]
-    title_text = " ".join(text.get_text() for axis in figure.axes for text in axis.texts)
+    title_text = " ".join(
+        [text.get_text() for text in figure.texts]
+        + [text.get_text() for axis in figure.axes for text in axis.texts]
+    )
     assert "Most semantic head" in title_text
-    assert "ablate" in title_text
+    assert "ZINC 1-hop" in title_text
+    assert "ablate" not in title_text
+    assert "eval 7" not in title_text
+    assert [label.get_text() for label in matrix_axis.get_xticklabels()] == ["0", "VN"]
+    title_lines = [text for text in figure.texts if "ZINC 1-hop" in text.get_text()]
+    subtitle_lines = [text for text in figure.texts if "D_{\\rm rel}" in text.get_text()]
+    assert len(title_lines) == len(subtitle_lines) == 1
+    assert title_lines[0].get_fontsize() == subtitle_lines[0].get_fontsize()
+    assert title_lines[0].get_color() == subtitle_lines[0].get_color() == "black"
+    figure.canvas.draw()
+    renderer = figure.canvas.get_renderer()
+    colorbar_axis = next(
+        axis for axis in figure.axes if axis.get_xlabel() == "Attention weight"
+    )
+    colorbar_box = colorbar_axis.get_tightbbox(renderer)
+    matrix_box = matrix_axis.get_tightbbox(renderer)
+    assert not colorbar_box.overlaps(matrix_box)
+    colorbar_position = colorbar_axis.get_position()
+    assert colorbar_position.x0 + colorbar_position.width / 2 == pytest.approx(0.5)
+    molecule_axis = figure.axes[0]
+    assert matrix_axis.get_position().width < molecule_axis.get_position().width
     assert attention_cmap_name("generalist") == "Purples"
 
 
