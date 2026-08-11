@@ -885,7 +885,7 @@ def plot_attention_grid_publication(
         num_rows,
         3,
         left=0.025,
-        right=0.975,
+        right=0.950,
         bottom=0.165,
         top=0.755,
         wspace=0.10,
@@ -902,6 +902,7 @@ def plot_attention_grid_publication(
     for row, (example, matrix) in enumerate(zip(examples, matrices)):
         axes[row, 0].imshow(_draw_molecule_plain(example))
         axes[row, 0].axis("off")
+        axes[row, 0].set_anchor((0.80, 0.50))
         axes[row, 1].imshow(
             _draw_molecule_attention(
                 example,
@@ -911,6 +912,7 @@ def plot_attention_grid_publication(
             )
         )
         axes[row, 1].axis("off")
+        axes[row, 1].set_anchor((0.20, 0.50))
         image = axes[row, 2].imshow(
             matrix,
             cmap=attention_cmap,
@@ -981,7 +983,7 @@ def plot_attention_grid_publication(
     )
     # Centre the shared bar on the complete figure and place it below every
     # panel label so neither the matrices nor their ticks can intersect it.
-    colorbar_axis = fig.add_axes([0.25, 0.050, 0.50, 0.025])
+    colorbar_axis = fig.add_axes([0.22, 0.047, 0.56, 0.028])
     colorbar = fig.colorbar(
         image,
         cax=colorbar_axis,

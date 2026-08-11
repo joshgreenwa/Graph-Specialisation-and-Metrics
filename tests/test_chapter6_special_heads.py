@@ -166,7 +166,10 @@ def test_publication_attention_uses_family_colour_and_labels_virtual_node():
     colorbar_position = colorbar_axis.get_position()
     assert colorbar_position.x0 + colorbar_position.width / 2 == pytest.approx(0.5)
     molecule_axis = figure.axes[0]
+    weighted_molecule_axis = figure.axes[1]
     assert matrix_axis.get_position().width < molecule_axis.get_position().width
+    assert weighted_molecule_axis.get_position().x0 - molecule_axis.get_position().x1 < 0.12
+    assert matrix_axis.get_position().x1 <= 0.951
     assert attention_cmap_name("generalist") == "Purples"
 
 

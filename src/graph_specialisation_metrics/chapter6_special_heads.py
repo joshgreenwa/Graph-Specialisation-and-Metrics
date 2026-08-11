@@ -48,7 +48,7 @@ from .methodology.grit_figure_plots import (
 from .zinc_cached_rrwp_comparison import group_distance
 
 ANALYSIS_VERSION = "chapter6-special-heads-v2-all-heads"
-FIGURE_STYLE_VERSION = "chapter6-special-heads-paper-attention-v3"
+FIGURE_STYLE_VERSION = "chapter6-special-heads-paper-attention-v4"
 ROLE_ORDER = ("semantic", "structural", "highest_joint")
 ROLE_LABELS = {
     "semantic": "Most semantic head",
