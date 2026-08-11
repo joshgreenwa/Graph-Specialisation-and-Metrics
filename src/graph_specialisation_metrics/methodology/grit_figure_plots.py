@@ -964,7 +964,7 @@ def plot_attention_grid_publication(
     fig.text(
         0.5,
         0.955,
-        f"{_paper_model_label(examples_payload)} -- {title_label} "
+        f"{_paper_model_label(examples_payload)} - {title_label} "
         f"(L{head[0]}, H{head[1]})",
         ha="center",
         va="center",

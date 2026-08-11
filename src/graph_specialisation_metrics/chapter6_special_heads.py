@@ -48,7 +48,7 @@ from .methodology.grit_figure_plots import (
 from .zinc_cached_rrwp_comparison import group_distance
 
 ANALYSIS_VERSION = "chapter6-special-heads-v2-all-heads"
-FIGURE_STYLE_VERSION = "chapter6-special-heads-paper-attention-v4"
+FIGURE_STYLE_VERSION = "chapter6-special-heads-paper-attention-v5"
 ROLE_ORDER = ("semantic", "structural", "highest_joint")
 ROLE_LABELS = {
     "semantic": "Most semantic head",
@@ -1202,10 +1202,203 @@ def generate_special_head_analysis(
     return {**manifest, "manifest_path": str(manifest_path)}
 
 
+def _load_selected_attention_cache(
+    cache_root: Path,
+    row: Mapping[str, Any],
+    *,
+    graph_indices: Sequence[int],
+) -> tuple[Mapping[str, Any], Path]:
+    """Load the exact precomputed attention cache for one selected head."""
+
+    import torch
+
+    role = str(row["role"])
+    expected_head = [int(row["layer"]), int(row["head"])]
+    expected_graphs = {int(index) for index in graph_indices}
+    candidates = sorted(
+        cache_root.glob("controlled-head-attention-*.pt"),
+        key=lambda path: path.stat().st_mtime_ns,
+        reverse=True,
+    )
+    for path in candidates:
+        payload = torch.load(path, map_location="cpu", weights_only=False)
+        if not isinstance(payload, Mapping):
+            continue
+        if payload.get("schema_version") != SupplementalCache.SCHEMA_VERSION:
+            continue
+        contract = payload.get("contract")
+        if not isinstance(contract, Mapping):
+            continue
+        heads = contract.get("heads")
+        cached_graphs = contract.get("graph_indices")
+        if (
+            contract.get("analysis_version") != ANALYSIS_VERSION
+            or contract.get("diagnostic") != "controlled_attention_examples_v1"
+            or int(contract.get("seed", -1)) != int(row["seed"])
+            or not isinstance(heads, Mapping)
+            or list(heads.get(role, ())) != expected_head
+            or not isinstance(cached_graphs, Sequence)
+            or not expected_graphs <= {int(index) for index in cached_graphs}
+            or "value" not in payload
+        ):
+            continue
+        value = payload["value"]
+        if not isinstance(value, Mapping) or not isinstance(
+            value.get("examples"), Sequence
+        ):
+            raise TypeError(f"malformed controlled-attention cache: {path}")
+        return value, path
+    detail = ", ".join(path.name for path in candidates) or "none"
+    raise FileNotFoundError(
+        "no matching precomputed controlled-attention cache for "
+        f"{row['task']}/seed_{row['seed']}/{role}/"
+        f"L{row['layer']}_H{row['head']}; candidates: {detail}"
+    )
+
+
+def render_cached_zinc_1hop_paper_heads(
+    output_dir: str | Path,
+    *,
+    graph_indices: Sequence[int] = (80, 100),
+    figure_output_dir: str | Path | None = None,
+    verbose: bool = True,
+) -> dict[str, Any]:
+    """Render only the cached cross-seed ZINC 1-hop specialist winners.
+
+    This is deliberately a figure-only CPU path.  It never loads a canonical
+    score artifact, checkpoint, dataset, PCA cache, or model runtime.
+    """
+
+    output_dir = Path(output_dir)
+    analysis_dir = output_dir / "special_head_analysis"
+    selection_path = analysis_dir / "selected_heads.json"
+    if not selection_path.is_file():
+        raise FileNotFoundError(
+            f"missing precomputed cross-seed head selection: {selection_path}"
+        )
+    selected = json.loads(selection_path.read_text(encoding="utf-8"))
+    if not isinstance(selected, list):
+        raise TypeError(f"invalid selected-head table: {selection_path}")
+    task = "zinc_1hop"
+    roles = ("semantic", "structural")
+    selected_by_role: dict[str, dict[str, Any]] = {}
+    for role in roles:
+        matches = [
+            dict(row)
+            for row in selected
+            if str(row.get("task")) == task and str(row.get("role")) == role
+        ]
+        if len(matches) != 1:
+            raise RuntimeError(
+                f"expected exactly one cached {task}/{role} winner, found {len(matches)}"
+            )
+        selected_by_role[role] = matches[0]
+
+    requested_graphs = tuple(int(index) for index in graph_indices)
+    if requested_graphs != (80, 100):
+        raise ValueError("the paper frontend is fixed to ZINC molecules 80 and 100")
+    figures_dir = (
+        Path(figure_output_dir)
+        if figure_output_dir is not None
+        else output_dir / "paper_attention_examples"
+    )
+    figures_dir.mkdir(parents=True, exist_ok=True)
+
+    outputs: list[dict[str, Any]] = []
+    for role in roles:
+        row = selected_by_role[role]
+        seed = int(row["seed"])
+        cache_root = analysis_dir / "cache" / task / f"seed_{seed}"
+        attention_payload, attention_path = _load_selected_attention_cache(
+            cache_root,
+            row,
+            graph_indices=requested_graphs,
+        )
+        examples_by_index = {
+            int(example["dataset_index"]): example
+            for example in attention_payload["examples"]
+        }
+        missing = [index for index in requested_graphs if index not in examples_by_index]
+        if missing:
+            raise RuntimeError(
+                f"cached attention payload {attention_path} lacks molecules {missing}"
+            )
+        examples = [examples_by_index[index] for index in requested_graphs]
+        for example in examples:
+            attention = example.get("attention")
+            if not isinstance(attention, Mapping) or role not in attention:
+                raise RuntimeError(
+                    f"cached attention payload {attention_path} lacks role {role!r}"
+                )
+        page_payload = {
+            **dict(attention_payload),
+            **figure_identity(task),
+            "examples": examples,
+        }
+        head = (int(row["layer"]), int(row["head"]))
+        figure = plot_attention_grid_publication(
+            page_payload,
+            attention_key=role,
+            attention_family=role,
+            head=head,
+            title_label=str(ROLE_LABELS[role]),
+            net_d_rel=float(row["selectivity"]),
+            net_joint_sensitivity=float(row["joint_sensitivity"]),
+        )
+        stem = f"zinc_1hop_most_{role}_head"
+        paths = save_figure_bundle(
+            figure,
+            figures_dir,
+            stem,
+            metadata={
+                **_record_metadata(
+                    row,
+                    attention_cache=str(attention_path),
+                    selected_heads=str(selection_path),
+                    graph_indices=list(requested_graphs),
+                ),
+                "figure": "paper_attention_examples",
+                "cache_only": True,
+            },
+            dpi=SPECIAL_HEAD_PREVIEW_DPI,
+            pdf_dpi=SPECIAL_HEAD_PDF_RASTER_DPI,
+        )
+        _release_rendered_figure(figure)
+        output = {
+            "task": task,
+            "role": role,
+            "seed": seed,
+            "layer": head[0],
+            "head": head[1],
+            "D_rel": float(row["selectivity"]),
+            "J": float(row["joint_sensitivity"]),
+            "attention_cache": str(attention_path),
+            **{key: str(value) for key, value in paths.items()},
+        }
+        outputs.append(output)
+        if verbose:
+            print(
+                f"[paper-attention:{role}] seed={seed}; L{head[0]} H{head[1]}; "
+                f"cache={attention_path.name}; pdf={paths['pdf']}",
+                flush=True,
+            )
+        del attention_payload, page_payload, examples
+        gc.collect()
+
+    return {
+        "task": task,
+        "cache_only": True,
+        "graph_indices": list(requested_graphs),
+        "figures": outputs,
+        "output_dir": str(figures_dir),
+    }
+
+
 __all__ = [
     "DEFAULT_GRAPH_INDICES",
     "generate_special_head_analysis",
     "head_distance_profiles",
+    "render_cached_zinc_1hop_paper_heads",
     "select_special_heads_across_seeds",
     "validate_special_head_outputs",
 ]

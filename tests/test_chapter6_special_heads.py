@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import matplotlib
 import numpy as np
 import pytest
@@ -7,11 +9,15 @@ import pytest
 matplotlib.use("Agg")
 
 from graph_specialisation_metrics.chapter6_special_heads import (
+    ANALYSIS_VERSION,
+    ROLE_LABELS,
     head_distance_profiles,
+    render_cached_zinc_1hop_paper_heads,
     select_special_heads_across_seeds,
     validate_special_head_outputs,
 )
 from graph_specialisation_metrics.methodology.grit_figure_data import (
+    SupplementalCache,
     _apply_figure_analysis_subset_patch,
 )
 from graph_specialisation_metrics.methodology.grit_figure_plots import (
@@ -147,6 +153,7 @@ def test_publication_attention_uses_family_colour_and_labels_virtual_node():
     )
     assert "Most semantic head" in title_text
     assert "ZINC 1-hop" in title_text
+    assert "ZINC 1-hop + VNode - Most semantic head (L3, H4)" in title_text
     assert "ablate" not in title_text
     assert "eval 7" not in title_text
     assert [label.get_text() for label in matrix_axis.get_xticklabels()] == ["0", "VN"]
@@ -171,6 +178,79 @@ def test_publication_attention_uses_family_colour_and_labels_virtual_node():
     assert weighted_molecule_axis.get_position().x0 - molecule_axis.get_position().x1 < 0.12
     assert matrix_axis.get_position().x1 <= 0.951
     assert attention_cmap_name("generalist") == "Purples"
+
+
+def test_cached_paper_frontend_renders_exactly_two_cross_seed_heads(tmp_path):
+    Chem = pytest.importorskip("rdkit.Chem")
+    molecule = Chem.MolFromSmiles("CCO")
+    analysis_dir = tmp_path / "special_head_analysis"
+    cache_dir = analysis_dir / "cache" / "zinc_1hop"
+    analysis_dir.mkdir(parents=True)
+    selected = []
+    for role, seed, layer, head, d_rel in (
+        ("semantic", 2, 7, 6, 0.72),
+        ("structural", 1, 6, 0, -0.68),
+    ):
+        row = {
+            "task": "zinc_1hop",
+            "model_label": "1-hop",
+            "role": role,
+            "role_label": ROLE_LABELS[role],
+            "display_family": role,
+            "seed": seed,
+            "layer": layer,
+            "head": head,
+            "selectivity": d_rel,
+            "joint_sensitivity": 1.4,
+            "raw_semantic_score": 1.0 + d_rel,
+            "raw_structural_score": 1.0 - d_rel,
+            "head_ablation_impact": 0.03,
+            "head_ablation_graphs": 64,
+        }
+        selected.append(row)
+        matrix = np.asarray(
+            [[0.7, 0.2, 0.1], [0.2, 0.7, 0.1], [0.1, 0.2, 0.7]]
+        )
+        examples = [
+            {
+                "dataset_index": index,
+                "n_atoms": 3,
+                "attention_nodes": 3,
+                "has_virtual_node": False,
+                "mol_block": Chem.MolToMolBlock(molecule),
+                "rdkit_sanitized": True,
+                "formula": "C2H6O",
+                "attention": {role: matrix},
+            }
+            for index in (80, 100)
+        ]
+        contract = {
+            "analysis_version": ANALYSIS_VERSION,
+            "task": "zinc_1hop",
+            "seed": seed,
+            "diagnostic": "controlled_attention_examples_v1",
+            "heads": {role: [layer, head]},
+            "graph_indices": [80, 100],
+        }
+        SupplementalCache(cache_dir / f"seed_{seed}").load_or_compute(
+            "controlled-head-attention",
+            contract,
+            lambda value={"examples": examples}: value,
+        )
+    (analysis_dir / "selected_heads.json").write_text(
+        json.dumps(selected), encoding="utf-8"
+    )
+
+    result = render_cached_zinc_1hop_paper_heads(tmp_path, verbose=False)
+    assert [row["role"] for row in result["figures"]] == [
+        "semantic",
+        "structural",
+    ]
+    assert [row["seed"] for row in result["figures"]] == [2, 1]
+    for row in result["figures"]:
+        assert row["attention_cache"].endswith(".pt")
+        assert row["pdf"].endswith(f"most_{row['role']}_head.pdf")
+        assert row["png"].endswith(f"most_{row['role']}_head.png")
 
 
 def test_figure_subset_patch_runs_before_positional_encoding(tmp_path):
