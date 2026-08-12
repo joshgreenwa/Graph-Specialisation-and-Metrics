@@ -128,3 +128,6 @@ only the correlation annotation changed; it is available as the TeX drop-in and 
 clustering visible. Task-specific directories prevent overwriting the originals. The manifest
 binds each result to source paths and SHA-256 hashes, cache contracts, estimator and resampling
 seeds, repository commit, coordinate view, and verified PDF/PNG dimensions.
+
+Both views show the original pooled `rho` first and the corrected within-layer mean `rho` second;
+the molecular corrected line also includes its molecule-bootstrap interval.

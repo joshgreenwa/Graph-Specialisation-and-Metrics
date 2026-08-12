@@ -171,11 +171,21 @@ def _synthetic_style() -> None:
     )
 
 
-def _statistic_label(estimate: float, low: float | None, high: float | None) -> str:
+def _statistic_label(
+    estimate: float,
+    low: float | None,
+    high: float | None,
+    *,
+    pooled_estimate: float | None,
+) -> str:
+    lines = []
+    if pooled_estimate is not None and np.isfinite(pooled_estimate):
+        lines.append(rf"$\rho$ = {float(pooled_estimate):.2f}")
     label = rf"Within-layer $\bar{{\rho}}$ = {float(estimate):.2f}"
     if low is not None and high is not None and np.isfinite((low, high)).all():
         label += rf"  [{float(low):.2f}, {float(high):.2f}]"
-    return label
+    lines.append(label)
+    return "\n".join(lines)
 
 
 def within_stratum_percentile_ranks(
@@ -244,6 +254,7 @@ def build_synthetic_dissertation_panel(
     records: Sequence[Mapping[str, Any]],
     *,
     estimate: float,
+    pooled_estimate: float | None = None,
     coordinate_view: CoordinateView = RAW_COORDINATES,
 ) -> Any:
     """Build Figure 4.5(a) in raw or confound-free rank coordinates."""
@@ -315,7 +326,12 @@ def build_synthetic_dissertation_panel(
         axis.text(
             0.045,
             0.955,
-            _statistic_label(estimate, None, None),
+            _statistic_label(
+                estimate,
+                None,
+                None,
+                pooled_estimate=pooled_estimate,
+            ),
             transform=axis.transAxes,
             ha="left",
             va="top",
@@ -357,6 +373,7 @@ def render_synthetic_dissertation_panel(
     records: Sequence[Mapping[str, Any]],
     *,
     estimate: float,
+    pooled_estimate: float | None = None,
     output_dir: str | Path,
     metadata: Mapping[str, Any],
     coordinate_view: CoordinateView = RAW_COORDINATES,
@@ -368,6 +385,7 @@ def render_synthetic_dissertation_panel(
     figure = build_synthetic_dissertation_panel(
         records,
         estimate=estimate,
+        pooled_estimate=pooled_estimate,
         coordinate_view=view,
     )
     stem = output_stem or (
@@ -393,6 +411,7 @@ def render_synthetic_within_layer_rank_panel(
     records: Sequence[Mapping[str, Any]],
     *,
     estimate: float,
+    pooled_estimate: float | None = None,
     output_dir: str | Path,
     metadata: Mapping[str, Any],
     output_stem: str = "fig2a_sensitivity_impact_within_layer_ranks",
@@ -402,6 +421,7 @@ def render_synthetic_within_layer_rank_panel(
     return render_synthetic_dissertation_panel(
         records,
         estimate=estimate,
+        pooled_estimate=pooled_estimate,
         output_dir=output_dir,
         metadata=metadata,
         coordinate_view=WITHIN_LAYER_PERCENTILE_RANKS,
@@ -420,6 +440,7 @@ def build_molecular_dissertation_panel(
     record: Mapping[str, Any],
     *,
     estimate: float,
+    pooled_estimate: float | None = None,
     low: float | None,
     high: float | None,
     coordinate_view: CoordinateView = RAW_COORDINATES,
@@ -503,7 +524,12 @@ def build_molecular_dissertation_panel(
         axis.text(
             0.025,
             0.975,
-            _statistic_label(estimate, low, high),
+            _statistic_label(
+                estimate,
+                low,
+                high,
+                pooled_estimate=pooled_estimate,
+            ),
             transform=axis.transAxes,
             ha="left",
             va="top",
@@ -546,6 +572,7 @@ def render_molecular_dissertation_panel(
     record: Mapping[str, Any],
     *,
     estimate: float,
+    pooled_estimate: float | None = None,
     low: float | None,
     high: float | None,
     output_dir: str | Path,
@@ -559,6 +586,7 @@ def render_molecular_dissertation_panel(
     figure = build_molecular_dissertation_panel(
         record,
         estimate=estimate,
+        pooled_estimate=pooled_estimate,
         low=low,
         high=high,
         coordinate_view=view,
@@ -585,6 +613,7 @@ def render_molecular_within_layer_rank_panel(
     record: Mapping[str, Any],
     *,
     estimate: float,
+    pooled_estimate: float | None = None,
     low: float | None,
     high: float | None,
     output_dir: str | Path,
@@ -596,6 +625,7 @@ def render_molecular_within_layer_rank_panel(
     return render_molecular_dissertation_panel(
         record,
         estimate=estimate,
+        pooled_estimate=pooled_estimate,
         low=low,
         high=high,
         output_dir=output_dir,

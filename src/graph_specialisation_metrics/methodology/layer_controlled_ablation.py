@@ -1697,12 +1697,14 @@ def run_layer_controlled_correction(
             primary_figure_paths = render_synthetic_within_layer_rank_panel(
                 records,
                 estimate=float(summary["within_layer_mean_rho"]),
+                pooled_estimate=float(summary["pooled_raw_rho"]),
                 output_dir=task_output,
                 metadata=common_figure_metadata,
             )
             raw_figure_paths = render_synthetic_dissertation_panel(
                 records,
                 estimate=float(summary["within_layer_mean_rho"]),
+                pooled_estimate=float(summary["pooled_raw_rho"]),
                 output_dir=task_output,
                 metadata=common_figure_metadata,
             )
@@ -1727,6 +1729,7 @@ def run_layer_controlled_correction(
             primary_figure_paths = render_molecular_within_layer_rank_panel(
                 figure_record,
                 estimate=float(summary["within_layer_mean_rho"]),
+                pooled_estimate=float(summary["pooled_raw_rho"]),
                 low=low,
                 high=high,
                 output_dir=task_output,
@@ -1735,6 +1738,7 @@ def run_layer_controlled_correction(
             raw_figure_paths = render_molecular_dissertation_panel(
                 figure_record,
                 estimate=float(summary["within_layer_mean_rho"]),
+                pooled_estimate=float(summary["pooled_raw_rho"]),
                 low=low,
                 high=high,
                 output_dir=task_output,

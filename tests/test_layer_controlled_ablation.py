@@ -343,21 +343,25 @@ def test_figure_artists_preserve_dissertation_grammar_in_rank_view():
     raw_synthetic = build_synthetic_dissertation_panel(
         _synthetic_records(),
         estimate=0.78,
+        pooled_estimate=0.77,
     )
     rank_synthetic = build_synthetic_dissertation_panel(
         _synthetic_records(),
         estimate=0.78,
+        pooled_estimate=0.77,
         coordinate_view="within_layer_percentile_ranks",
     )
     raw_molecular = build_molecular_dissertation_panel(
         _molecular_record(),
         estimate=0.66,
+        pooled_estimate=0.53,
         low=0.50,
         high=0.78,
     )
     rank_molecular = build_molecular_dissertation_panel(
         _molecular_record(),
         estimate=0.66,
+        pooled_estimate=0.53,
         low=0.50,
         high=0.78,
         coordinate_view="within_layer_percentile_ranks",
@@ -365,6 +369,10 @@ def test_figure_artists_preserve_dissertation_grammar_in_rank_view():
     try:
         raw_axis = raw_synthetic.axes[0]
         rank_axis = rank_synthetic.axes[0]
+        assert rank_axis.texts[0].get_text().splitlines() == [
+            r"$\rho$ = 0.77",
+            r"Within-layer $\bar{\rho}$ = 0.78",
+        ]
         assert (raw_axis.get_xscale(), raw_axis.get_yscale()) == ("log", "log")
         assert (rank_axis.get_xscale(), rank_axis.get_yscale()) == ("linear", "linear")
         assert rank_axis.get_xlim() == pytest.approx((0.0, 1.0))
@@ -386,6 +394,10 @@ def test_figure_artists_preserve_dissertation_grammar_in_rank_view():
 
         raw_molecular_axis = raw_molecular.axes[0]
         rank_molecular_axis = rank_molecular.axes[0]
+        assert rank_molecular_axis.texts[0].get_text().splitlines() == [
+            r"$\rho$ = 0.53",
+            r"Within-layer $\bar{\rho}$ = 0.66  [0.50, 0.78]",
+        ]
         assert raw_molecular_axis.get_xlabel() == r"Joint sensitivity, $J$"
         assert "percentile" in rank_molecular_axis.get_xlabel().lower()
         assert "percentile" in rank_molecular_axis.get_ylabel().lower()
@@ -416,6 +428,7 @@ def test_dissertation_figure_canvases_and_statistic_labels(tmp_path):
     synthetic = render_synthetic_dissertation_panel(
         _synthetic_records(),
         estimate=0.78,
+        pooled_estimate=0.77,
         output_dir=tmp_path / "synthetic",
         metadata={"test": True},
     )
@@ -425,6 +438,7 @@ def test_dissertation_figure_canvases_and_statistic_labels(tmp_path):
     molecular = render_molecular_dissertation_panel(
         _molecular_record(),
         estimate=0.66,
+        pooled_estimate=0.53,
         low=0.50,
         high=0.78,
         output_dir=tmp_path / "zinc",
@@ -445,12 +459,14 @@ def test_rank_figure_exports_are_primary_and_self_describing(tmp_path):
     synthetic = render_synthetic_within_layer_rank_panel(
         _synthetic_records(),
         estimate=0.78,
+        pooled_estimate=0.77,
         output_dir=tmp_path / "synthetic",
         metadata={"test": True},
     )
     molecular = render_molecular_within_layer_rank_panel(
         _molecular_record(),
         estimate=0.66,
+        pooled_estimate=0.53,
         low=0.50,
         high=0.78,
         output_dir=tmp_path / "zinc",
