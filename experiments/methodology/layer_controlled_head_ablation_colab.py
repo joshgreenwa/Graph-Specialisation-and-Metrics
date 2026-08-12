@@ -33,7 +33,7 @@ GITHUB_SECRET = "dissertation_key"  # Optional when the repository is public.
 
 # --------------------------- correction controls -----------------------------
 
-MODE = os.environ.get("LAYER_CONTROL_MODE", "run").strip().lower()
+MODE = os.environ.get("LAYER_CONTROL_MODE", "inventory").strip().lower()
 # "inventory" only lists compatible cache roots; "run" computes and renders;
 # "verify" also recomputes and performs the same strict output checks as "run".
 if MODE not in {"inventory", "run", "verify"}:
