@@ -1,0 +1,26 @@
+experiment: grit
+
+data:
+  name: zinc
+
+model:
+  layers: 10
+  heads: 8
+  hidden_dim: 64
+  rrwp_steps: 21
+  variants: [dense, 1hop, 1hop_vnode, 2hop, 2hop_vnode]
+
+training:
+  seeds: [0, 1, 2]
+  epochs: 2000
+  warmup_epochs: 50
+  batch_size: 32
+  learning_rate: 0.001
+  weight_decay: 0.00001
+
+scoring:
+  graphs: 48
+  sources_per_graph: 6
+  donor_swaps_per_source: 8
+  semantic_pool_graphs: 2000
+  seed: 31415

@@ -1,0 +1,32 @@
+experiment: graphbench
+
+data:
+  train_graphs: 40000
+  validation_graphs: 4000
+
+model:
+  layers: 6
+  heads: 8
+  hidden_dim: 112
+  rrwp_steps: 16
+  dropout: 0.1
+  attention_dropout: 0.1
+
+training:
+  seeds: [0, 1, 2, 3]
+  batch_size: 1024
+  evaluation_batch_size: 32
+  steps: 5000
+  warmup_steps: 500
+  evaluate_every: 500
+  validation_watch_graphs: 1000
+  minimum_checkpoint_step: 2500
+  learning_rate: 0.0002
+  weight_decay: 0.1
+
+scoring:
+  graphs: 48
+  sources_per_graph: 6
+  donor_swaps_per_source: 8
+  semantic_pool_graphs: 2000
+  seed: 31415

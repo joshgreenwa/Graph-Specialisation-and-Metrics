@@ -1,0 +1,71 @@
+diff --git a/grit/loader/master_loader.py b/grit/loader/master_loader.py
+index 527198a..5711b97 100644
+--- a/grit/loader/master_loader.py
++++ b/grit/loader/master_loader.py
+@@ -9,7 +9,7 @@ import torch
+ import torch_geometric.transforms as T
+ from numpy.random import default_rng
+ from ogb.graphproppred import PygGraphPropPredDataset
+-from torch_geometric.datasets import (GNNBenchmarkDataset, Planetoid, TUDataset,
++from torch_geometric.datasets import (GNNBenchmarkDataset, Planetoid, QM9, TUDataset,
+                                       WikipediaNetwork, ZINC)
+ from torch_geometric.graphgym.config import cfg
+ from torch_geometric.graphgym.loader import load_pyg, load_ogb, set_dataset_attr
+@@ -129,6 +129,9 @@ def load_dataset_master(format, name, dataset_dir):
+
+         elif pyg_dataset_id == 'ZINC':
+             dataset = preformat_ZINC(dataset_dir, name)
++
++        elif pyg_dataset_id == 'QM9':
++            dataset = preformat_QM9_gap(dataset_dir, name)
+
+         elif pyg_dataset_id == 'AQSOL':
+             dataset = preformat_AQSOL(dataset_dir, name)
+@@ -348,5 +351,47 @@ def compute_indegree_histogram(dataset):
+     return deg.numpy().tolist()[:max_degree + 1]
+
+
++def preformat_QM9_gap(dataset_dir, name):
++    """Load the QM9 HOMO-LUMO gap target (index 4, eV)."""
++    if name != "gap":
++        raise ValueError(f"QM9 runner only supports dataset.name=gap, got {name!r}")
++    dataset = QM9(dataset_dir)
++    target_index = int(cfg.dataset.qm9_target_index)
++    if target_index != 4 or dataset.data.y.dim() != 2 or dataset.data.y.size(1) <= target_index:
++        raise RuntimeError(
++            f"Unexpected QM9 target layout {tuple(dataset.data.y.shape)}; "
++            "expected PyG target 4 to be the HOMO-LUMO gap in eV."
++        )
++    dataset.data.y = dataset.data.y[:, target_index:target_index + 1].contiguous()
++
++    # Use atomic numbers directly as categorical indices (H=1, C=6, N=7, O=8, F=9).
++    dataset.data.x = dataset.data.z.view(-1, 1).long()
++    if dataset.data.edge_attr.dim() != 2 or dataset.data.edge_attr.size(1) != 4:
++        raise RuntimeError(f"Unexpected QM9 bond features: {tuple(dataset.data.edge_attr.shape)}")
++    dataset.data.edge_attr = dataset.data.edge_attr.argmax(dim=-1).long()
++    dataset._data_list = None
++
++    num_graphs = len(dataset)
++    train_size = int(cfg.dataset.qm9_train_size)
++    val_size = int(cfg.dataset.qm9_val_size)
++    if train_size <= 0 or val_size <= 0 or train_size + val_size >= num_graphs:
++        raise ValueError(
++            f"Invalid QM9 split sizes train={train_size}, val={val_size}, total={num_graphs}"
++        )
++    generator = torch.Generator().manual_seed(int(cfg.dataset.qm9_split_seed))
++    perm = torch.randperm(num_graphs, generator=generator)
++    dataset.split_idxs = [
++        perm[:train_size],
++        perm[train_size:train_size + val_size],
++        perm[train_size + val_size:],
++    ]
++    logging.info(
++        "QM9 single target: HOMO-LUMO gap (column 4, eV); split=%d/%d/%d seed=%d",
++        train_size, val_size, num_graphs - train_size - val_size,
++        int(cfg.dataset.qm9_split_seed),
++    )
++    return dataset
++
++
+ def preformat_GNNBenchmarkDataset(dataset_dir, name):
+     """Load and preformat datasets from PyG's GNNBenchmarkDataset.
