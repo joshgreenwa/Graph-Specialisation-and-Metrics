@@ -263,6 +263,9 @@ separately in every layer, then layers are equally averaged within seed and seed
 averaged. Both intervals use the existing training-seed bootstrap. Historical caches are supported
 because the finalizer recomputes both estimates directly from cached score coordinates and
 per-head clean-ablation means.
+The same two estimates are written into both the standalone ablation panel and
+`score_selectivity_clean_ablation_triptych`, preserving the triptych's original three-panel
+presentation and placing pooled rho before within-layer mean rho in panel (c).
 
 For bipartite matching, the key categorical test selects active heads with point-estimate
 `D_rel > +0.10` or `< -0.10`, keeps at most the six strongest per direction, and optimally matches

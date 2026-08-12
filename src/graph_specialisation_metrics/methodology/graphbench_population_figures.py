@@ -13,7 +13,12 @@ from typing import Any
 import numpy as np
 
 from .cache import atomic_json
-from .figures import FigureBuilder, FigureTheme, publication_style
+from .figures import (
+    FigureBuilder,
+    FigureTheme,
+    multi_seed_score_causal_triptych,
+    publication_style,
+)
 from .protocol import PROTOCOL_VERSION, MethodologyConfig
 
 FOCUSED_GRAPHBENCH_TASK = "graphbench_bipartite_matching_hard"
@@ -314,6 +319,19 @@ def _ablation_correlation_label(
     )
 
 
+def _triptych_rho_statistic(population: Mapping[str, Any]) -> dict[str, float]:
+    """Adapt a one-dimensional seed interval to the historical triptych schema."""
+
+    statistic = {
+        "rho": float(np.asarray(population["estimate"]).reshape(-1)[0]),
+    }
+    low = float(np.asarray(population["low"]).reshape(-1)[0])
+    high = float(np.asarray(population["high"]).reshape(-1)[0])
+    if np.isfinite(low) and np.isfinite(high):
+        statistic.update({"low": low, "high": high})
+    return statistic
+
+
 def build_graphbench_population_figure_data(
     config: MethodologyConfig,
     task_results: Sequence[Mapping[str, Any]],
@@ -423,6 +441,14 @@ def build_graphbench_population_figure_data(
         coordinates = scores["coordinates"]
         raw_semantic = np.asarray(_value(coordinates, "raw_semantic"), dtype=np.float64)
         raw_structural = np.asarray(_value(coordinates, "raw_structural"), dtype=np.float64)
+        normalized_semantic = np.asarray(
+            _value(coordinates, "normalized_semantic"),
+            dtype=np.float64,
+        )
+        normalized_structural = np.asarray(
+            _value(coordinates, "normalized_structural"),
+            dtype=np.float64,
+        )
         joint = np.asarray(_value(coordinates, "joint_sensitivity"), dtype=np.float64)
         selectivity = np.asarray(_value(coordinates, "selectivity"), dtype=np.float64)
         layers, heads = joint.shape
@@ -452,6 +478,8 @@ def build_graphbench_population_figure_data(
                 ).copy(),
                 "raw_semantic": raw_semantic,
                 "raw_structural": raw_structural,
+                "normalized_semantic": normalized_semantic,
+                "normalized_structural": normalized_structural,
                 "joint_sensitivity": joint,
                 "selectivity": selectivity,
                 "clean_ablation": clean,
@@ -1095,6 +1123,94 @@ def render_graphbench_population_figures(
         },
     )
     saved["joint_sensitivity_selectivity"] = [str(path) for path in paths]
+
+    triptych_records = [
+        {
+            "seed": int(row["seed"]),
+            "semantic": row["normalized_semantic"].reshape(-1),
+            "structural": row["normalized_structural"].reshape(-1),
+            "selectivity": row["selectivity"].reshape(-1),
+            "joint": row["joint_sensitivity"].reshape(-1),
+            "clean_ablation_impact": row["clean_ablation"].reshape(-1),
+            "layer": row["layer"].reshape(-1),
+        }
+        for row in data["heads"]
+    ]
+    pooled_triptych_statistic = _triptych_rho_statistic(rho_population)
+    within_layer_triptych_statistic = _triptych_rho_statistic(
+        within_layer_population
+    )
+    triptych_theme_values: Mapping[str, Any] = config.figure_overrides
+    if task_name in triptych_theme_values and isinstance(
+        triptych_theme_values[task_name], Mapping
+    ):
+        triptych_theme_values = triptych_theme_values[task_name]
+    triptych_base_theme = FigureTheme().with_overrides(triptych_theme_values)
+    triptych_theme = triptych_base_theme.with_overrides(
+        {
+            "font_size": max(float(triptych_base_theme.font_size), 11.0),
+            "label_size": max(float(triptych_base_theme.label_size), 12.4),
+            "title_size": max(float(triptych_base_theme.title_size), 13.5),
+            "tick_size": max(float(triptych_base_theme.tick_size), 10.2),
+            "marker_size": max(float(triptych_base_theme.marker_size), 46.0),
+            "dpi": max(int(triptych_base_theme.dpi), 600),
+        }
+    )
+    triptych_builder = FigureBuilder(
+        output_dir,
+        triptych_theme,
+        common_metadata={
+            "protocol_version": PROTOCOL_VERSION,
+            "protocol_fingerprint": config.fingerprint,
+            "task": task_name,
+            "population_unit": "training seed; heads are not aligned across seeds",
+            "seeds": data["seeds"].tolist(),
+        },
+    )
+    fig, axes = multi_seed_score_causal_triptych(
+        triptych_records,
+        rho_statistic=pooled_triptych_statistic,
+        within_layer_rho_statistic=within_layer_triptych_statistic,
+        clean_impact_ylim=(0.0, 16.0),
+        theme=triptych_theme,
+    )
+    paths = triptych_builder.save(
+        "score_selectivity_clean_ablation_triptych",
+        fig,
+        axes,
+        metadata={
+            "data_source": "immutable score and clean-ablation caches",
+            "rho_statistic": pooled_triptych_statistic,
+            "within_layer_rho_statistic": within_layer_triptych_statistic,
+            "rho_population": rho_population,
+            "within_layer_rho_population": within_layer_population,
+            "estimand": {
+                "pooled": (
+                    "Spearman correlation across all heads within each seed, then an "
+                    "equal-weight mean over training seeds"
+                ),
+                "within_layer": (
+                    "Spearman correlation across heads separately within every layer, "
+                    "then equal-weight means over layers within seed and over training "
+                    "seeds"
+                ),
+            },
+            "layer_order": data["clean_ablation"]["layer_order"],
+            "seed_layer_rho": data["clean_ablation"]["seed_layer_rho"],
+            "seed_within_layer_rho": data["clean_ablation"][
+                "seed_within_layer_rho"
+            ],
+            "clean_ablation_impact_ylim": [0.0, 16.0],
+            "panels": [
+                "semantic and structural head scores",
+                "joint sensitivity and relative selectivity",
+                "joint sensitivity and head-ablation impact",
+            ],
+        },
+    )
+    saved["score_selectivity_clean_ablation_triptych"] = [
+        str(path) for path in paths
+    ]
 
     atomic_json(
         output_dir / "population_figures.json",

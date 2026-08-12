@@ -358,7 +358,8 @@ finalizer also recomputes the clean-ablation
 panel's layer-controlled Spearman estimate from the immutable head caches: it calculates one
 correlation per layer, equally averages layers within each seed, and then equally averages the four
 training seeds. The annotation shows the original pooled-head rho first and the within-layer mean
-rho second.
+rho second. The finalizer writes this annotation into both the standalone clean-ablation panel and
+`score_selectivity_clean_ablation_triptych.pdf` under the task's `population_figures/` directory.
 
 ### Selected-head clean-attention figure (CPU only)
 

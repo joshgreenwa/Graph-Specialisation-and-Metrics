@@ -105,8 +105,287 @@ class HeadPlotData:
     selectivity_interval: tuple[np.ndarray, np.ndarray] | None = None
 
 
+SEED_MARKERS = ("o", "s", "^", "D", "P", "X", "v", "<", ">")
+
+
 def _flatten_heads(array: Any) -> np.ndarray:
     return np.asarray(array).reshape(-1)
+
+
+def _valid_rho_statistic(
+    statistic: Mapping[str, Any] | None,
+) -> dict[str, float] | None:
+    if not statistic:
+        return None
+    rho = statistic.get("rho")
+    if rho is None or not np.isfinite(float(rho)):
+        return None
+    out = {"rho": float(rho)}
+    low = statistic.get("low")
+    high = statistic.get("high")
+    if low is not None and high is not None and np.isfinite(low) and np.isfinite(high):
+        out["low"] = float(low)
+        out["high"] = float(high)
+    return out
+
+
+def multi_seed_score_causal_triptych(
+    records: Sequence[Mapping[str, Any]],
+    *,
+    rho_statistic: Mapping[str, Any] | None = None,
+    within_layer_rho_statistic: Mapping[str, Any] | None = None,
+    clean_impact_ylim: tuple[float, float] = (0.0, 16.0),
+    theme: FigureTheme = FigureTheme(),
+):
+    """Task-level score/causal scatter triptych with seed markers and layer colours.
+
+    The plot intentionally keeps the point presentation close to the existing
+    single-seed scatter figures: point colour is layer, point shape is trained
+    seed, and no head-family or activity labels are introduced.
+    """
+
+    import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
+
+    if not records:
+        raise ValueError("multi-seed triptych needs at least one seed record")
+
+    local_theme = theme.with_overrides(
+        {
+            "font_size": max(float(theme.font_size), 11.0),
+            "label_size": max(float(theme.label_size), 12.4),
+            "title_size": max(float(theme.title_size), 13.5),
+            "tick_size": max(float(theme.tick_size), 10.2),
+            "marker_size": max(float(theme.marker_size), 46.0),
+            "dpi": max(int(theme.dpi), 600),
+        }
+    )
+    seeds = sorted({int(record["seed"]) for record in records})
+    marker_by_seed = {
+        seed: SEED_MARKERS[position % len(SEED_MARKERS)]
+        for position, seed in enumerate(seeds)
+    }
+    layer_max = max(
+        int(np.asarray(record["layer"], dtype=int).max(initial=0))
+        for record in records
+    )
+
+    def concatenate(name: str) -> np.ndarray:
+        return np.concatenate(
+            [
+                np.asarray(record[name], dtype=np.float64).reshape(-1)
+                for record in records
+            ]
+        )
+
+    structural = concatenate("structural")
+    semantic = concatenate("semantic")
+    selectivity = concatenate("selectivity")
+    joint = concatenate("joint")
+    clean_impact = concatenate("clean_ablation_impact")
+    layers = np.concatenate(
+        [np.asarray(record["layer"], dtype=int).reshape(-1) for record in records]
+    )
+    point_seeds = np.concatenate(
+        [
+            np.full(
+                np.asarray(record["layer"]).reshape(-1).shape,
+                int(record["seed"]),
+                dtype=int,
+            )
+            for record in records
+        ]
+    )
+
+    with publication_style(local_theme):
+        import matplotlib as mpl
+
+        layer_count = max(1, layer_max + 1)
+        cmap = plt.get_cmap(local_theme.layer_cmap, layer_count)
+        normalizer = mpl.colors.BoundaryNorm(
+            np.arange(-0.5, layer_count + 0.5, 1.0),
+            cmap.N,
+        )
+        colours = cmap(normalizer(layers))
+        fig, axes = plt.subplots(
+            1,
+            3,
+            figsize=(local_theme.width * 3.14, local_theme.height * 1.125),
+            gridspec_kw={"width_ratios": [1, 1, 1]},
+            constrained_layout=False,
+        )
+        fig.subplots_adjust(
+            left=0.055,
+            right=0.905,
+            top=0.86,
+            bottom=0.25,
+            wspace=0.27,
+        )
+        panels = [
+            (
+                structural,
+                semantic,
+                r"$\mathbf{(a)}$ Semantic and structural head scores",
+                r"Structural score $S_{\mathrm{str}}$",
+                r"Semantic score $S_{\mathrm{sem}}$",
+            ),
+            (
+                selectivity,
+                joint,
+                r"$\mathbf{(b)}$ Joint sensitivity and relative selectivity",
+                r"Relative selectivity $D_{\mathrm{rel}}$",
+                r"Joint sensitivity $J$",
+            ),
+            (
+                joint,
+                clean_impact,
+                r"$\mathbf{(c)}$ Joint sensitivity and head-ablation impact",
+                r"Joint sensitivity $J$",
+                "Head-ablation impact",
+            ),
+        ]
+        for ax, (x, y, title, xlabel, ylabel) in zip(axes, panels):
+            for seed in seeds:
+                mask = point_seeds == seed
+                ax.scatter(
+                    x[mask],
+                    y[mask],
+                    c=colours[mask],
+                    marker=marker_by_seed[seed],
+                    s=local_theme.marker_size,
+                    edgecolor="white",
+                    linewidth=0.55,
+                    alpha=1.0,
+                    zorder=3,
+                )
+            ax.set_xlabel(xlabel)
+            ax.set_ylabel(ylabel)
+            ax.set_title(title, loc="left", fontweight="normal", pad=10)
+            ax.grid(alpha=0.38, linewidth=0.62)
+            ax.tick_params(width=0.95, length=3.8, color="#202020")
+            for spine in ax.spines.values():
+                spine.set_visible(True)
+                spine.set_linewidth(1.15)
+                spine.set_color("#202020")
+
+        finite_scores = np.concatenate(
+            (structural[np.isfinite(structural)], semantic[np.isfinite(semantic)])
+        )
+        upper = (
+            max(1.0, float(np.max(finite_scores)) * 1.08)
+            if finite_scores.size
+            else 1.0
+        )
+        axes[0].plot(
+            [0, upper],
+            [0, upper],
+            color="#777777",
+            linestyle="--",
+            linewidth=0.95,
+            zorder=1,
+        )
+        axes[0].set_xlim(0, upper)
+        axes[0].set_ylim(0, upper)
+        axes[1].axvline(
+            0,
+            color="#777777",
+            linestyle="--",
+            linewidth=0.95,
+            zorder=1,
+        )
+        axes[1].set_xlim(-1.03, 1.03)
+        axes[1].set_ylim(bottom=0)
+        finite_joint = joint[np.isfinite(joint)]
+        axes[2].set_xlim(
+            0,
+            max(1.05, float(np.max(finite_joint)) * 1.10)
+            if finite_joint.size
+            else 1.05,
+        )
+        axes[2].set_ylim(*clean_impact_ylim)
+
+        pooled_statistic = _valid_rho_statistic(rho_statistic)
+        within_statistic = _valid_rho_statistic(within_layer_rho_statistic)
+        labels = []
+        if pooled_statistic is not None:
+            label = rf"mean seed $\rho$ = {pooled_statistic['rho']:.2f}"
+            if "low" in pooled_statistic and "high" in pooled_statistic:
+                label += (
+                    rf" [{pooled_statistic['low']:.2f}, "
+                    rf"{pooled_statistic['high']:.2f}]"
+                )
+            labels.append(label)
+        if within_statistic is not None:
+            label = rf"Within-layer $\bar{{\rho}}$ = {within_statistic['rho']:.2f}"
+            if "low" in within_statistic and "high" in within_statistic:
+                label += (
+                    rf" [{within_statistic['low']:.2f}, "
+                    rf"{within_statistic['high']:.2f}]"
+                )
+            labels.append(label)
+        if labels:
+            axes[2].text(
+                0.965,
+                0.055,
+                "\n".join(labels),
+                transform=axes[2].transAxes,
+                ha="right",
+                va="bottom",
+                fontsize=max(10.0, local_theme.tick_size + 0.4),
+                fontweight="normal",
+                color="#111111",
+                bbox={
+                    "boxstyle": "round,pad=0.28",
+                    "facecolor": "white",
+                    "edgecolor": "#555555",
+                    "linewidth": 0.8,
+                    "alpha": 0.96,
+                },
+                zorder=5,
+            )
+
+        color_axis = fig.add_axes([0.922, 0.29, 0.014, 0.52])
+        scalar = mpl.cm.ScalarMappable(norm=normalizer, cmap=cmap)
+        scalar.set_array([])
+        bar = fig.colorbar(scalar, cax=color_axis)
+        bar.set_label(
+            "Layer",
+            fontsize=max(11.5, local_theme.label_size - 0.4),
+            labelpad=8,
+        )
+        bar.set_ticks(np.arange(layer_max + 1))
+        bar.ax.tick_params(
+            labelsize=local_theme.tick_size,
+            width=0.9,
+            length=3.5,
+        )
+        bar.outline.set_linewidth(0.9)
+
+        legend_handles = [
+            Line2D(
+                [],
+                [],
+                linestyle="none",
+                marker=marker_by_seed[seed],
+                markersize=max(7.5, float(np.sqrt(local_theme.marker_size)) * 1.2),
+                markerfacecolor="#6f6f6f",
+                markeredgecolor="white",
+                markeredgewidth=0.65,
+                label=f"Seed {seed}",
+            )
+            for seed in seeds
+        ]
+        fig.legend(
+            handles=legend_handles,
+            frameon=False,
+            loc="lower center",
+            bbox_to_anchor=(0.5, 0.045),
+            ncol=len(legend_handles),
+            fontsize=max(10.8, local_theme.tick_size + 1.0),
+            handletextpad=0.62,
+            columnspacing=2.35,
+        )
+    return fig, axes
 
 
 def _exact_panel_title(grouped: bool) -> str:

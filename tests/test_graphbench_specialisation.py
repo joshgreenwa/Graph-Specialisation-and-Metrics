@@ -71,6 +71,10 @@ from graph_specialisation_metrics.methodology.graphbench_population_figures impo
     render_graphbench_population_figures,
     within_layer_spearman,
 )
+from graph_specialisation_metrics.methodology.figures import (
+    FigureTheme,
+    multi_seed_score_causal_triptych,
+)
 from graph_specialisation_metrics.methodology.protocol import BootstrapPolicy
 from graph_specialisation_metrics.methodology.protocol import (
     MethodologyConfig,
@@ -2418,6 +2422,47 @@ def test_graphbench_ablation_label_lists_plain_then_within_layer_rho():
     ]
 
 
+def test_graphbench_triptych_lists_pooled_then_within_layer_rho_without_clipping():
+    records = [
+        {
+            "seed": seed,
+            "structural": np.asarray([0.4, 1.1, 1.7, 2.2]) + 0.05 * seed,
+            "semantic": np.asarray([0.6, 0.9, 1.8, 2.0]) + 0.04 * seed,
+            "selectivity": np.asarray([-0.4, -0.1, 0.2, 0.6]),
+            "joint": np.asarray([0.5, 0.9, 1.4, 1.8]),
+            "clean_ablation_impact": np.asarray([1.2, 2.4, 4.8, 7.1]),
+            "layer": np.asarray([0, 0, 1, 1]),
+        }
+        for seed in (0, 1)
+    ]
+    figure, axes = multi_seed_score_causal_triptych(
+        records,
+        rho_statistic={"rho": 0.76, "low": 0.74, "high": 0.78},
+        within_layer_rho_statistic={
+            "rho": 0.88,
+            "low": 0.85,
+            "high": 0.90,
+        },
+        theme=FigureTheme(dpi=72),
+    )
+
+    assert axes[2].texts[0].get_text().splitlines() == [
+        r"mean seed $\rho$ = 0.76 [0.74, 0.78]",
+        r"Within-layer $\bar{\rho}$ = 0.88 [0.85, 0.90]",
+    ]
+    figure.canvas.draw()
+    renderer = figure.canvas.get_renderer()
+    text_box = axes[2].texts[0].get_window_extent(renderer=renderer)
+    axes_box = axes[2].get_window_extent(renderer=renderer)
+    assert text_box.x0 >= axes_box.x0
+    assert text_box.x1 <= axes_box.x1
+    assert text_box.y0 >= axes_box.y0
+    assert text_box.y1 <= axes_box.y1
+    from matplotlib import pyplot as plt
+
+    plt.close(figure)
+
+
 def test_matching_population_renderer_uses_all_seed_caches_and_writes_publication_figures(
     tmp_path,
 ):
@@ -2453,6 +2498,8 @@ def test_matching_population_renderer_uses_all_seed_caches_and_writes_publicatio
         coordinates = SimpleNamespace(
             raw_semantic=raw_semantic,
             raw_structural=raw_structural,
+            normalized_semantic=semantic_norm,
+            normalized_structural=structural_norm,
             joint_sensitivity=joint,
             selectivity=selectivity,
             active=joint >= config.families.activity_floor,
@@ -2622,7 +2669,7 @@ def test_matching_population_renderer_uses_all_seed_caches_and_writes_publicatio
     obsolete = population_dir / "03_population_donor_necessity.pdf"
     obsolete.write_text("obsolete", encoding="utf-8")
     saved = render_graphbench_population_figures(config, task, results)
-    assert len(saved) == 5
+    assert len(saved) == 6
     assert "donor_necessity" not in saved
     assert not obsolete.exists()
     assert all(len(paths) == 2 for paths in saved.values())
@@ -2633,7 +2680,7 @@ def test_matching_population_renderer_uses_all_seed_caches_and_writes_publicatio
         for path in paths
         if Path(path).suffix == ".pdf"
     ]
-    assert len(pdf_paths) == 5
+    assert len(pdf_paths) == 6
     for pdf_path in pdf_paths:
         pdf_bytes = pdf_path.read_bytes()
         assert b"/Subtype /Type3" not in pdf_bytes
@@ -2664,6 +2711,30 @@ def test_matching_population_renderer_uses_all_seed_caches_and_writes_publicatio
     assert (
         ablation_metadata["within_layer_rho_population"]["included_seed_count"]
         == 4
+    )
+    triptych_metadata = json.loads(
+        (
+            population_dir
+            / "score_selectivity_clean_ablation_triptych.metadata.json"
+        ).read_text(encoding="utf-8")
+    )
+    expected_pooled = population["clean_ablation"]["rho_population"]
+    expected_within = population["clean_ablation"][
+        "within_layer_rho_population"
+    ]
+    assert triptych_metadata["rho_statistic"] == pytest.approx(
+        {
+            "rho": float(expected_pooled["estimate"][0]),
+            "low": float(expected_pooled["low"][0]),
+            "high": float(expected_pooled["high"][0]),
+        }
+    )
+    assert triptych_metadata["within_layer_rho_statistic"] == pytest.approx(
+        {
+            "rho": float(expected_within["estimate"][0]),
+            "low": float(expected_within["low"][0]),
+            "high": float(expected_within["high"][0]),
+        }
     )
     manifest = json.loads(
         (
