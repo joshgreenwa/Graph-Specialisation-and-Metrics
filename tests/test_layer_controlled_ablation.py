@@ -21,6 +21,7 @@ from graph_specialisation_metrics.methodology.layer_controlled_ablation import (
     association_summary,
     discover_cache_candidates,
     graph_bootstrap_interval,
+    load_candidate,
     mean_within_layer_spearman,
     run_layer_controlled_correction,
     select_cache_candidate,
@@ -188,6 +189,41 @@ def test_discovery_prefers_exact_cache_and_requires_opt_in_for_population(tmp_pa
     )
     assert fallback.family == "population_core"
     assert not fallback.exact_dissertation
+
+
+def test_historical_direct_synthetic_shards_load_without_canonical_wrapper(tmp_path):
+    import torch
+
+    metrics = tmp_path / "graph_specialisation_metrics"
+    analysis = metrics / "causal_specialisation_double_dissociation/cycle_dual_v2/analysis"
+    analysis.mkdir(parents=True)
+    base = np.arange(1, 25, dtype=np.float64).reshape(3, 8)
+    functional = np.repeat(base[..., None], 4, axis=-1)
+    for seed in range(3):
+        torch.save(
+            {
+                "version": ("causal-specialisation-double-dissociation-v2-shared-source-marker"),
+                "analysis_version": "causal-specialisation-matched-donor-swaps-v1",
+                "fingerprint": "training-fingerprint",
+                "analysis_fingerprint": "5a29d56ac5d21586",
+                "seed": seed,
+                "semantic_score": base + seed,
+                "structural_score": base + seed,
+                "ablation_semantic": {"functional": functional + seed},
+                "ablation_structural": {"functional": functional + seed},
+            },
+            analysis / f"seed_{seed}__5a29d56ac5d21586.pt",
+        )
+
+    candidate = select_cache_candidate(
+        "synthetic",
+        discover_cache_candidates(metrics),
+        strict=False,
+    )
+    datasets = load_candidate(candidate, strict=False)
+    assert [data.seed for data in datasets] == [0, 1, 2]
+    assert all(len(data.head_ids) == 24 for data in datasets)
+    assert all(data.cache_contract["validated_shard"] is not None for data in datasets)
 
 
 def test_shallow_discovery_refuses_equally_preferred_exact_roots(tmp_path):

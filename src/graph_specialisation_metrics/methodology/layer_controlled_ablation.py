@@ -319,15 +319,14 @@ def _load_pt(
         if not resolved.is_file():
             raise FileNotFoundError(resolved)
         payload = torch.load(resolved, map_location="cpu", weights_only=False)
-        if not isinstance(payload, Mapping) or {"metadata", "value"}.issubset(payload):
-            value = payload
-            metadata: Mapping[str, Any] = {}
-        else:
+        if isinstance(payload, Mapping) and {"metadata", "value"}.issubset(payload):
             # A malformed canonical wrapper must never escape fingerprint checks by
             # taking the historical path.
             raise StaleCacheError(
                 f"canonical-looking cache did not pass integrity validation: {resolved}"
             )
+        value = payload
+        metadata: Mapping[str, Any] = {}
         return LoadedArtifact(
             path=resolved,
             value=value,
