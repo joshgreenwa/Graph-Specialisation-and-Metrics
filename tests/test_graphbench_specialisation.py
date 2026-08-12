@@ -67,6 +67,7 @@ from graph_specialisation_metrics.methodology.graphbench_population_figures impo
     _spearman,
     _theme,
     build_graphbench_population_figure_data,
+    head_ablation_correlations,
     render_graphbench_population_figures,
     within_layer_spearman,
 )
@@ -2389,6 +2390,12 @@ def test_graphbench_within_layer_rho_removes_layer_offset_confound():
             np.asarray([[0.0, 1.0, 2.0]]),
         )[0]
     )
+    with pytest.raises(ValueError, match=r"layers=\[0\]"):
+        head_ablation_correlations(
+            np.asarray([[1.0, 1.0, 1.0]]),
+            np.asarray([[0.0, 1.0, 2.0]]),
+            context="constant fixture",
+        )
 
 
 def test_graphbench_ablation_label_lists_plain_then_within_layer_rho():

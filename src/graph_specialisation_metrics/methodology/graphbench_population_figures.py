@@ -232,6 +232,30 @@ def within_layer_spearman(
     )
 
 
+def head_ablation_correlations(
+    joint_sensitivity: Any,
+    ablation_impact: Any,
+    *,
+    context: str,
+) -> dict[str, Any]:
+    """Return pooled and equal-layer Spearman effects from cached head arrays."""
+
+    pooled_rho = _spearman(joint_sensitivity, ablation_impact)
+    layer_rho = within_layer_spearman(joint_sensitivity, ablation_impact)
+    invalid_layers = np.flatnonzero(~np.isfinite(layer_rho)).tolist()
+    if not np.isfinite(pooled_rho) or invalid_layers:
+        raise ValueError(
+            f"{context} has non-estimable Spearman correlations: "
+            f"pooled={pooled_rho}, layers={invalid_layers}; the equal-layer "
+            "population estimand requires every layer"
+        )
+    return {
+        "pooled_rho": float(pooled_rho),
+        "layer_rho": layer_rho,
+        "within_layer_mean_rho": float(np.mean(layer_rho)),
+    }
+
+
 def _seed_population_interval(
     values: np.ndarray,
     config: MethodologyConfig,
@@ -411,17 +435,14 @@ def build_graphbench_population_figure_data(
             [causal["clean_ablation"][name]["prediction_movement"] for name in names],
             dtype=np.float64,
         ).reshape(joint.shape)
-        seed_rhos.append(_spearman(joint, clean))
-        layer_rhos = within_layer_spearman(joint, clean)
-        invalid_layers = np.flatnonzero(~np.isfinite(layer_rhos)).tolist()
-        if invalid_layers:
-            raise ValueError(
-                f"seed {int(result['seed'])} has non-estimable within-layer "
-                f"Spearman correlations for layers {invalid_layers}; all layers "
-                "are required for the equal-layer population estimand"
-            )
-        seed_layer_rhos.append(layer_rhos)
-        seed_within_layer_rhos.append(float(np.mean(layer_rhos)))
+        correlations = head_ablation_correlations(
+            joint,
+            clean,
+            context=f"seed {int(result['seed'])}",
+        )
+        seed_rhos.append(correlations["pooled_rho"])
+        seed_layer_rhos.append(correlations["layer_rho"])
+        seed_within_layer_rhos.append(correlations["within_layer_mean_rho"])
         head_rows.append(
             {
                 "seed": int(result["seed"]),

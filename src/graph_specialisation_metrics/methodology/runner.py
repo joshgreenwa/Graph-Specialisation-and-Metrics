@@ -79,8 +79,8 @@ from .figures import (
 )
 from .graphbench_population_figures import (
     FOCUSED_GRAPHBENCH_TASK,
+    head_ablation_correlations,
     render_graphbench_population_figures,
-    within_layer_spearman,
 )
 from .paper_causal_figures import (
     derive_legacy_focused_specialists,
@@ -4115,14 +4115,17 @@ def _write_run_summaries(
                         ],
                         dtype=np.float64,
                     ).reshape(joint.shape)
-                    layer_rhos = within_layer_spearman(joint, clean)
+                    correlations = head_ablation_correlations(
+                        joint,
+                        clean,
+                        context=f"{task_name}:seed{int(value['seed'])}",
+                    )
+                    row["rho_J_vs_clean_prediction_movement"] = correlations[
+                        "pooled_rho"
+                    ]
                     row[
                         "rho_J_vs_clean_prediction_movement_within_layer_mean"
-                    ] = (
-                        float(np.mean(layer_rhos))
-                        if np.isfinite(layer_rhos).all()
-                        else np.nan
-                    )
+                    ] = correlations["within_layer_mean_rho"]
                 for name in (
                     "D_rel_vs_gross_contrast",
                     "D_rel_vs_necessity_contrast",
