@@ -353,7 +353,11 @@ bash graphbench-algoreas-hpc/bin/submit_cached_grit_population_figures.sh
 This launcher scans the GraphBench output area before submission. It requires score, causal, and
 audit caches for seeds 0-3, automatically uses a uniquely complete analysis root, and submits no
 job if no complete root or multiple complete roots are found. This prevents an empty default
-directory from reaching the Slurm queue.
+directory from reaching the Slurm queue. The CPU finalizer also recomputes the clean-ablation
+panel's layer-controlled Spearman estimate from the immutable head caches: it calculates one
+correlation per layer, equally averages layers within each seed, and then equally averages the four
+training seeds. The annotation shows the original pooled-head rho first and the within-layer mean
+rho second.
 
 ### Selected-head clean-attention figure (CPU only)
 

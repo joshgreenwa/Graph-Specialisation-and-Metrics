@@ -80,6 +80,7 @@ from .figures import (
 from .graphbench_population_figures import (
     FOCUSED_GRAPHBENCH_TASK,
     render_graphbench_population_figures,
+    within_layer_spearman,
 )
 from .paper_causal_figures import (
     derive_legacy_focused_specialists,
@@ -4093,6 +4094,35 @@ def _write_run_summaries(
                         row[f"rho_{name}"] = float(
                             association[name]["pooled"]["rho"]
                         )
+                joint_value = (
+                    coordinates.get("joint_sensitivity")
+                    if isinstance(coordinates, Mapping)
+                    else getattr(coordinates, "joint_sensitivity", None)
+                )
+                clean_ablation = causal_value.get("clean_ablation")
+                if (
+                    task_name == FOCUSED_GRAPHBENCH_TASK
+                    and joint_value is not None
+                    and isinstance(clean_ablation, Mapping)
+                ):
+                    joint = np.asarray(joint_value, dtype=np.float64)
+                    clean = np.asarray(
+                        [
+                            clean_ablation[f"head_L{layer}_H{head}"][
+                                "prediction_movement"
+                            ]
+                            for layer, head in np.ndindex(joint.shape)
+                        ],
+                        dtype=np.float64,
+                    ).reshape(joint.shape)
+                    layer_rhos = within_layer_spearman(joint, clean)
+                    row[
+                        "rho_J_vs_clean_prediction_movement_within_layer_mean"
+                    ] = (
+                        float(np.mean(layer_rhos))
+                        if np.isfinite(layer_rhos).all()
+                        else np.nan
+                    )
                 for name in (
                     "D_rel_vs_gross_contrast",
                     "D_rel_vs_necessity_contrast",

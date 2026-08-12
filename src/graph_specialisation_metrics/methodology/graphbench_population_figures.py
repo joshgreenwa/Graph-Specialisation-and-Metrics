@@ -213,6 +213,25 @@ def _spearman(x: Any, y: Any) -> float:
     return float(np.corrcoef(x_rank, y_rank)[0, 1])
 
 
+def within_layer_spearman(
+    joint_sensitivity: Any,
+    ablation_impact: Any,
+) -> np.ndarray:
+    """Spearman correlations across heads, calculated separately per layer."""
+
+    joint = np.asarray(joint_sensitivity, dtype=np.float64)
+    impact = np.asarray(ablation_impact, dtype=np.float64)
+    if joint.shape != impact.shape or joint.ndim != 2:
+        raise ValueError(
+            "within-layer correlations require matching [layer, head] arrays, "
+            f"got {joint.shape} and {impact.shape}"
+        )
+    return np.asarray(
+        [_spearman(joint[layer], impact[layer]) for layer in range(joint.shape[0])],
+        dtype=np.float64,
+    )
+
+
 def _seed_population_interval(
     values: np.ndarray,
     config: MethodologyConfig,
@@ -248,6 +267,29 @@ def _seed_population_interval(
     }
 
 
+def _ablation_correlation_label(
+    rho_population: Mapping[str, Any],
+    within_layer_population: Mapping[str, Any],
+) -> str:
+    """Format the original and corrected population correlations in that order."""
+
+    def line(label: str, population: Mapping[str, Any]) -> str:
+        estimate = float(np.asarray(population["estimate"]).reshape(-1)[0])
+        low = float(np.asarray(population["low"]).reshape(-1)[0])
+        high = float(np.asarray(population["high"]).reshape(-1)[0])
+        result = rf"{label} = {estimate:.2f}"
+        if np.isfinite(low) and np.isfinite(high):
+            result += rf"  [{low:.2f}, {high:.2f}]"
+        return result
+
+    return "\n".join(
+        (
+            line(r"$\rho$", rho_population),
+            line(r"Within-layer $\bar{\rho}$", within_layer_population),
+        )
+    )
+
+
 def build_graphbench_population_figure_data(
     config: MethodologyConfig,
     task_results: Sequence[Mapping[str, Any]],
@@ -266,6 +308,8 @@ def build_graphbench_population_figure_data(
     pair_counts: list[int] = []
     null_matches: list[dict[str, Any]] = []
     seed_rhos: list[float] = []
+    seed_layer_rhos: list[np.ndarray] = []
+    seed_within_layer_rhos: list[float] = []
     for result in ordered:
         scores = result["scores"]
         causal = result["causal"]
@@ -367,13 +411,14 @@ def build_graphbench_population_figure_data(
             [causal["clean_ablation"][name]["prediction_movement"] for name in names],
             dtype=np.float64,
         ).reshape(joint.shape)
-        rho = (
-            causal.get("associations", {})
-            .get("J_vs_clean_prediction_movement", {})
-            .get("pooled", {})
-            .get("rho")
+        seed_rhos.append(_spearman(joint, clean))
+        layer_rhos = within_layer_spearman(joint, clean)
+        seed_layer_rhos.append(layer_rhos)
+        seed_within_layer_rhos.append(
+            float(np.mean(layer_rhos))
+            if np.isfinite(layer_rhos).all()
+            else np.nan
         )
-        seed_rhos.append(float(rho) if rho is not None else _spearman(joint, clean))
         head_rows.append(
             {
                 "seed": int(result["seed"]),
@@ -393,6 +438,14 @@ def build_graphbench_population_figure_data(
     mediation_values = np.asarray(mediation_rows, dtype=np.float64)
     necessity_values = np.asarray(necessity_rows, dtype=np.float64)
     rho_values = np.asarray(seed_rhos, dtype=np.float64)
+    layer_counts = {len(values) for values in seed_layer_rhos}
+    if len(layer_counts) != 1:
+        raise ValueError(
+            "population figures require the same transformer layer count in every seed, "
+            f"got {sorted(layer_counts)}"
+        )
+    layer_rho_values = np.stack(seed_layer_rhos)
+    within_layer_rho_values = np.asarray(seed_within_layer_rhos, dtype=np.float64)
     return {
         "seeds": seeds,
         "pair_counts": np.asarray(pair_counts, dtype=np.int64),
@@ -425,6 +478,12 @@ def build_graphbench_population_figure_data(
             "seed_rho": rho_values,
             "rho_population": _seed_population_interval(
                 rho_values[:, None], config, seed_offset=109
+            ),
+            "layer_order": np.arange(layer_rho_values.shape[1], dtype=np.int64),
+            "seed_layer_rho": layer_rho_values,
+            "seed_within_layer_rho": within_layer_rho_values,
+            "within_layer_rho_population": _seed_population_interval(
+                within_layer_rho_values[:, None], config, seed_offset=113
             ),
         },
         "heads": head_rows,
@@ -916,12 +975,13 @@ def render_graphbench_population_figures(
     saved["preferential_mediation"] = [str(path) for path in paths]
 
     rho_population = data["clean_ablation"]["rho_population"]
-    rho = float(np.asarray(rho_population["estimate"]).reshape(-1)[0])
-    rho_low = float(np.asarray(rho_population["low"]).reshape(-1)[0])
-    rho_high = float(np.asarray(rho_population["high"]).reshape(-1)[0])
-    correlation_label = rf"Mean seed $\rho$ = {rho:.2f}"
-    if np.isfinite(rho_low) and np.isfinite(rho_high):
-        correlation_label += rf"  [{rho_low:.2f}, {rho_high:.2f}]"
+    within_layer_population = data["clean_ablation"][
+        "within_layer_rho_population"
+    ]
+    correlation_label = _ablation_correlation_label(
+        rho_population,
+        within_layer_population,
+    )
     fig, axes = _plot_head_scatter(
         data,
         theme,
@@ -938,9 +998,25 @@ def render_graphbench_population_figures(
         fig,
         axes,
         metadata={
-            "estimand": "within-seed Spearman correlation; seed-level population mean",
+            "estimand": {
+                "pooled": (
+                    "Spearman correlation across all heads within each seed, then an "
+                    "equal-weight mean over training seeds"
+                ),
+                "within_layer": (
+                    "Spearman correlation across heads separately within every layer, "
+                    "then equal-weight means over layers within seed and over training "
+                    "seeds"
+                ),
+            },
             "seed_rho": data["clean_ablation"]["seed_rho"],
             "rho_population": rho_population,
+            "layer_order": data["clean_ablation"]["layer_order"],
+            "seed_layer_rho": data["clean_ablation"]["seed_layer_rho"],
+            "seed_within_layer_rho": data["clean_ablation"][
+                "seed_within_layer_rho"
+            ],
+            "within_layer_rho_population": within_layer_population,
             "point_color": "transformer layer",
             "point_shape": "training seed",
         },

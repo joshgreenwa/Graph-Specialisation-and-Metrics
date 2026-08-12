@@ -257,7 +257,12 @@ python graphbench-algoreas-hpc/bin/grit_specialisation.py \
 
 This requires the four consolidated score and causal caches; carriage is loaded only when present.
 It regenerates figure artifacts and atomically rebuilds the complete four-seed population and root
-indexes.
+indexes. The joint-sensitivity/clean-ablation panel reports the original pooled-head Spearman
+correlation first, followed by the layer-controlled estimate: Spearman is calculated across heads
+separately in every layer, then layers are equally averaged within seed and seeds are equally
+averaged. Both intervals use the existing training-seed bootstrap. Historical caches are supported
+because the finalizer recomputes both estimates directly from cached score coordinates and
+per-head clean-ablation means.
 
 For bipartite matching, the key categorical test selects active heads with point-estimate
 `D_rel > +0.10` or `< -0.10`, keeps at most the six strongest per direction, and optimally matches

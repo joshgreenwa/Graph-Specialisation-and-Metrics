@@ -62,10 +62,13 @@ from graph_specialisation_metrics.methodology.graphbench_pe_refinement import (
     validate_causal_recovery_prerequisites,
 )
 from graph_specialisation_metrics.methodology.graphbench_population_figures import (
+    _ablation_correlation_label,
     _plot_absolute_patching,
+    _spearman,
     _theme,
     build_graphbench_population_figure_data,
     render_graphbench_population_figures,
+    within_layer_spearman,
 )
 from graph_specialisation_metrics.methodology.protocol import BootstrapPolicy
 from graph_specialisation_metrics.methodology.protocol import (
@@ -2361,6 +2364,53 @@ def test_legacy_paper_focused_sidecar_is_derived_only_once(monkeypatch, tmp_path
     assert len(calls) == 1
 
 
+def test_graphbench_within_layer_rho_removes_layer_offset_confound():
+    joint = np.asarray(
+        [
+            [0.0, 1.0, 2.0, 3.0],
+            [100.0, 101.0, 102.0, 103.0],
+        ]
+    )
+    impact = np.asarray(
+        [
+            [3.0, 2.0, 1.0, 0.0],
+            [103.0, 102.0, 101.0, 100.0],
+        ]
+    )
+
+    layer_rho = within_layer_spearman(joint, impact)
+
+    assert _spearman(joint, impact) > 0.5
+    assert layer_rho.tolist() == pytest.approx([-1.0, -1.0])
+    assert float(np.mean(layer_rho)) == pytest.approx(-1.0)
+    assert np.isnan(
+        within_layer_spearman(
+            np.asarray([[1.0, 1.0, 1.0]]),
+            np.asarray([[0.0, 1.0, 2.0]]),
+        )[0]
+    )
+
+
+def test_graphbench_ablation_label_lists_plain_then_within_layer_rho():
+    label = _ablation_correlation_label(
+        {
+            "estimate": np.asarray([0.76]),
+            "low": np.asarray([0.74]),
+            "high": np.asarray([0.78]),
+        },
+        {
+            "estimate": np.asarray([0.41]),
+            "low": np.asarray([0.20]),
+            "high": np.asarray([0.58]),
+        },
+    )
+
+    assert label.splitlines() == [
+        r"$\rho$ = 0.76  [0.74, 0.78]",
+        r"Within-layer $\bar{\rho}$ = 0.41  [0.20, 0.58]",
+    ]
+
+
 def test_matching_population_renderer_uses_all_seed_caches_and_writes_publication_figures(
     tmp_path,
 ):
@@ -2377,14 +2427,14 @@ def test_matching_population_renderer_uses_all_seed_caches_and_writes_publicatio
     for seed in config.train_seeds:
         raw_semantic = np.asarray(
             [
-                [0.8 + 0.1 * seed, 0.4 + 0.05 * seed],
-                [0.7 + 0.03 * seed, 0.5 + 0.02 * seed],
+                [0.8 + 0.1 * seed, 0.4 + 0.05 * seed, 0.6 + 0.04 * seed],
+                [0.7 + 0.03 * seed, 0.5 + 0.02 * seed, 0.45 + 0.01 * seed],
             ]
         )
         raw_structural = np.asarray(
             [
-                [0.3 + 0.04 * seed, 0.9 + 0.08 * seed],
-                [0.6 + 0.02 * seed, 0.55 + 0.02 * seed],
+                [0.3 + 0.04 * seed, 0.9 + 0.08 * seed, 0.5 + 0.03 * seed],
+                [0.6 + 0.02 * seed, 0.55 + 0.02 * seed, 0.8 + 0.04 * seed],
             ]
         )
         semantic_norm = raw_semantic / np.mean(raw_semantic)
@@ -2415,7 +2465,11 @@ def test_matching_population_renderer_uses_all_seed_caches_and_writes_publicatio
         )
         event_records = {}
         for head_position, name in enumerate(
-            ("head_L0_H0", "head_L0_H1", "head_L1_H0", "head_L1_H1")
+            tuple(
+                f"head_L{layer}_H{head}"
+                for layer in range(2)
+                for head in range(3)
+            )
         ):
             event_records[name] = {}
             for channel_position, channel in enumerate(("semantic", "structural")):
@@ -2465,8 +2519,10 @@ def test_matching_population_renderer_uses_all_seed_caches_and_writes_publicatio
         clean = {
             "head_L0_H0": {"prediction_movement": 0.4 + 0.02 * seed},
             "head_L0_H1": {"prediction_movement": 0.2 + 0.01 * seed},
+            "head_L0_H2": {"prediction_movement": 0.3 + 0.01 * seed},
             "head_L1_H0": {"prediction_movement": 0.3 + 0.01 * seed},
             "head_L1_H1": {"prediction_movement": 0.25 + 0.01 * seed},
+            "head_L1_H2": {"prediction_movement": 0.35 + 0.01 * seed},
         }
         results.append(
             {
@@ -2549,6 +2605,10 @@ def test_matching_population_renderer_uses_all_seed_caches_and_writes_publicatio
     assert population["clean_ablation"]["rho_population"][
         "included_seed_count"
     ] == 4
+    assert population["clean_ablation"]["seed_layer_rho"].shape == (4, 2)
+    assert population["clean_ablation"]["within_layer_rho_population"][
+        "included_seed_count"
+    ] == 4
 
     population_dir = tmp_path / task / "population_figures"
     population_dir.mkdir(parents=True)
@@ -2585,6 +2645,19 @@ def test_matching_population_renderer_uses_all_seed_caches_and_writes_publicatio
         "raster_fallback_dpi": 1200,
         "vector_first": True,
     }
+    ablation_metadata = json.loads(
+        (
+            population_dir
+            / "04_population_joint_sensitivity_clean_ablation.metadata.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert ablation_metadata["layer_order"] == [0, 1]
+    assert len(ablation_metadata["seed_layer_rho"]) == 4
+    assert len(ablation_metadata["seed_within_layer_rho"]) == 4
+    assert (
+        ablation_metadata["within_layer_rho_population"]["included_seed_count"]
+        == 4
+    )
     manifest = json.loads(
         (
             tmp_path
