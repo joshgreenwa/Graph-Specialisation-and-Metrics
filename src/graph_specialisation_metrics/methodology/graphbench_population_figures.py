@@ -284,7 +284,7 @@ def _ablation_correlation_label(
 
     return "\n".join(
         (
-            line(r"$\rho$", rho_population),
+            line(r"Mean seed $\rho$", rho_population),
             line(r"Within-layer $\bar{\rho}$", within_layer_population),
         )
     )
@@ -413,12 +413,15 @@ def build_graphbench_population_figure_data(
         ).reshape(joint.shape)
         seed_rhos.append(_spearman(joint, clean))
         layer_rhos = within_layer_spearman(joint, clean)
+        invalid_layers = np.flatnonzero(~np.isfinite(layer_rhos)).tolist()
+        if invalid_layers:
+            raise ValueError(
+                f"seed {int(result['seed'])} has non-estimable within-layer "
+                f"Spearman correlations for layers {invalid_layers}; all layers "
+                "are required for the equal-layer population estimand"
+            )
         seed_layer_rhos.append(layer_rhos)
-        seed_within_layer_rhos.append(
-            float(np.mean(layer_rhos))
-            if np.isfinite(layer_rhos).all()
-            else np.nan
-        )
+        seed_within_layer_rhos.append(float(np.mean(layer_rhos)))
         head_rows.append(
             {
                 "seed": int(result["seed"]),

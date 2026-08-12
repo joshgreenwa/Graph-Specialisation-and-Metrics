@@ -103,3 +103,26 @@ def test_cached_figure_submitter_uses_explicit_complete_root_when_several_exist(
     assert result.returncode == 0, result.stderr
     assert f"analysis_root={second}" in result.stdout
     assert str(first) not in result.stdout
+
+
+def test_cached_figure_submitter_prefers_latest_registered_complete_root(tmp_path):
+    older = tmp_path / "outputs" / "older_analysis"
+    latest = (
+        tmp_path
+        / "outputs"
+        / "grit_specialisation_bipartite_complete_pe_causal_v3"
+    )
+    _complete_cache(older)
+    _complete_cache(latest)
+
+    result = subprocess.run(
+        ["bash", str(SCRIPT)],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=_environment(tmp_path),
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert f"analysis_root={latest}" in result.stdout
+    assert str(older) not in result.stdout

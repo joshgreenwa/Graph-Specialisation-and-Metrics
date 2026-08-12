@@ -2406,7 +2406,7 @@ def test_graphbench_ablation_label_lists_plain_then_within_layer_rho():
     )
 
     assert label.splitlines() == [
-        r"$\rho$ = 0.76  [0.74, 0.78]",
+        r"Mean seed $\rho$ = 0.76  [0.74, 0.78]",
         r"Within-layer $\bar{\rho}$ = 0.41  [0.20, 0.58]",
     ]
 
