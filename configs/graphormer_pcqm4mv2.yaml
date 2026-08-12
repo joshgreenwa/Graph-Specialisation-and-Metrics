@@ -1,0 +1,16 @@
+experiment: graphormer
+
+data:
+  evaluation_split: valid
+  semantic_pool_split: train
+
+model:
+  id: clefourrier/graphormer-base-pcqm4mv2
+  revision: 32563d60ac40dac3053789e3a1016c7da2c4166b
+
+scoring:
+  graphs: 48
+  sources_per_graph: 6
+  donor_swaps_per_source: 8
+  semantic_pool_graphs: 2000
+  seed: 31415

@@ -1,0 +1,31 @@
+experiment: mixed
+
+data:
+  nodes: 16
+  key_vocab: 32
+  classes: 8
+  rrwp_steps: 10
+
+model:
+  layers: 3
+  heads: 8
+  hidden_dim: 96
+  dropout: 0.0
+  attention_dropout: 0.05
+
+training:
+  seeds: [0, 1, 2]
+  batch_size: 64
+  steps: 3000
+  learning_rate: 0.002
+  weight_decay: 0.00001
+  validation_graphs: 512
+  validate_every: 100
+  early_stop_checks: 10
+  early_stop_accuracy: 0.995
+  acceptance_accuracy: 0.90
+
+scoring:
+  graphs: 96
+  donor_swaps_per_source: 6
+  seed: 31415

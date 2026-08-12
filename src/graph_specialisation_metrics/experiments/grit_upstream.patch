@@ -1,0 +1,270 @@
+diff --git a/grit/__init__.py b/grit/__init__.py
+index 5efcef9..bc48ddd 100644
+--- a/grit/__init__.py
++++ b/grit/__init__.py
+@@ -1,13 +1,19 @@
+-from .act import * # noqa
+-from .config import * # noqa
+-from .encoder import * # noqa
+-from .head import * # noqa
+-from .layer import * # noqa
+-from .loader import * # noqa
+-from .loss import * # noqa
+-from .network import * # noqa
+-from .optimizer import * # noqa
+-from .pooling import * # noqa
+-from .stage import * # noqa
+-from .train import * # noqa
+-from .transform import * # noqa
++# Import only the components used by the ZINC and QM9 runs.
++from .config.custom_gnn_config import *  # noqa
++from .config.dataset_config import *  # noqa
++from .config.defaults_config import *  # noqa
++from .config.gt_config import *  # noqa
++from .config.mlflow_config import *  # noqa
++from .config.optimizers_config import *  # noqa
++from .config.posenc_config import *  # noqa
++from .config.pretrained_config import *  # noqa
++from .config.split_config import *  # noqa
++from .config.wandb_config import *  # noqa
++from .encoder.rrwp_encoder import *  # noqa
++from .encoder.type_dict_encoder import *  # noqa
++from .head.san_graph import *  # noqa
++from .layer.grit_layer import *  # noqa
++from .loader.master_loader import *  # noqa
++from .network.grit_model import *  # noqa
++from .optimizer.extra_optimizers import *  # noqa
++from .train.custom_train import *  # noqa
+
+diff --git a/grit/config/gt_config.py b/grit/config/gt_config.py
+index 78df362..4efaa37 100644
+--- a/grit/config/gt_config.py
++++ b/grit/config/gt_config.py
+@@ -82,6 +82,9 @@ def set_cfg_gt(cfg):
+     cfg.gt.attn.clamp = 5.
+     cfg.gt.attn.act = "relu"
+     cfg.gt.attn.full_attn = True
++    cfg.gt.attn.sparsity = "full"
++    cfg.gt.attn.hops = 1
++    cfg.gt.attn.global_vnode = False
+     cfg.gt.attn.norm_e = True
+     cfg.gt.attn.O_e = True
+     cfg.gt.attn.edge_enhance = True
+diff --git a/grit/encoder/rrwp_encoder.py b/grit/encoder/rrwp_encoder.py
+index 4241e8c..5f9f7a4 100644
+--- a/grit/encoder/rrwp_encoder.py
++++ b/grit/encoder/rrwp_encoder.py
+@@ -203,6 +203,7 @@ class RRWPLinearEdgeMaskedEncoder(torch.nn.Module):
+                  add_node_attr_as_self_loop=False,
+                  overwrite_old_attr=False,
+                  mask_index_name="edge_index",
++                 max_hops=None,
+                  ):
+         super().__init__()
+         # note: batchnorm/layernorm might ruin some properties of pe on providing shortest-path distance info
+@@ -219,6 +220,8 @@ class RRWPLinearEdgeMaskedEncoder(torch.nn.Module):
+
+         self.fc = nn.Linear(emb_dim, out_dim, bias=use_bias)
+         torch.nn.init.xavier_uniform_(self.fc.weight)
++        self.pad_to_full_graph = False
++        self.max_hops = None if max_hops is None else int(max_hops)
+         self.fill_value = 0.
+
+         padding = torch.ones(1, out_dim, dtype=torch.float) * fill_value
+@@ -232,11 +235,17 @@ class RRWPLinearEdgeMaskedEncoder(torch.nn.Module):
+
+     def forward(self, batch):
+         rrwp_idx = batch.rrwp_index
+-        rrwp_val = batch.rrwp_val
++        raw_rrwp_val = batch.rrwp_val
+         edge_index = batch.edge_index
+         edge_attr = batch.edge_attr
+-        rrwp_val = self.fc(rrwp_val)
+-        mask_index = batch.get(self.mask_index_name, None)
++        if self.max_hops is None:
++            mask_index = batch.get(self.mask_index_name, None)
++        else:
++            # Attention support is fixed during preprocessing; donor-swaps change only RRWP values.
++            mask_index = batch.get("rrwp_attention_edge_index", None)
++            if mask_index is None:
++                raise RuntimeError("k-hop GRIT input is missing frozen attention support")
++        rrwp_val = self.fc(raw_rrwp_val)
+         num_nodes = batch.num_nodes
+
+         if edge_attr is None:
+diff --git a/grit/network/grit_model.py b/grit/network/grit_model.py
+index 456ac7b..9b8e09f 100644
+--- a/grit/network/grit_model.py
++++ b/grit/network/grit_model.py
+@@ -50,6 +50,53 @@ class FeatureEncoder(torch.nn.Module):
+         return batch
+
+
++class GlobalVNode(torch.nn.Module):
++    """Add one virtual node connected to every real node."""
++
++    def __init__(self, dim):
++        super().__init__()
++        self.embedding = torch.nn.Parameter(torch.zeros(1, dim))
++
++    def forward(self, batch):
++        graph_id = batch.batch
++        num_real = batch.x.size(0)
++        num_graphs = int(graph_id.max().item()) + 1
++        device = batch.x.device
++        vnode_id = torch.arange(num_graphs, device=device) + num_real
++        real_id = torch.arange(num_real, device=device)
++        vnode_for_real = vnode_id[graph_id]
++
++        # source->target convention used by GRIT attention.
++        virtual_edges = torch.cat([
++            torch.stack([real_id, vnode_for_real]),
++            torch.stack([vnode_for_real, real_id]),
++            torch.stack([vnode_id, vnode_id]),
++        ], dim=1)
++        virtual_attr = batch.edge_attr.new_zeros(
++            virtual_edges.size(1), batch.edge_attr.size(1)
++        )
++
++        batch.x = torch.cat([
++            batch.x, self.embedding.to(dtype=batch.x.dtype).expand(num_graphs, -1)
++        ], dim=0)
++        batch.batch = torch.cat([
++            graph_id, torch.arange(num_graphs, device=device, dtype=graph_id.dtype)
++        ], dim=0)
++        batch.edge_index = torch.cat([batch.edge_index, virtual_edges], dim=1)
++        batch.edge_attr = torch.cat([batch.edge_attr, virtual_attr], dim=0)
++        batch.real_node_mask = torch.arange(
++            num_real + num_graphs, device=device
++        ) < num_real
++
++        counts = torch.bincount(graph_id, minlength=num_graphs)
++        if batch.get("log_deg", None) is not None:
++            vnode_log_deg = torch.log(counts.to(batch.log_deg.dtype) + 1)
++            batch.log_deg = torch.cat([batch.log_deg.view(-1), vnode_log_deg])
++        if batch.get("deg", None) is not None:
++            batch.deg = torch.cat([batch.deg.view(-1), counts.to(batch.deg.dtype)])
++        return batch
++
++
+ @register_network('GritTransformer')
+ class GritTransformer(torch.nn.Module):
+     '''
+@@ -68,12 +115,27 @@ class GritTransformer(torch.nn.Module):
+             self.rrwp_abs_encoder = register.node_encoder_dict["rrwp_linear"]\
+                 (cfg.posenc_RRWP.ksteps, cfg.gnn.dim_inner)
+             rel_pe_dim = cfg.posenc_RRWP.ksteps
+-            self.rrwp_rel_encoder = register.edge_encoder_dict["rrwp_linear"] \
+-                (rel_pe_dim, cfg.gnn.dim_edge,
+-                 pad_to_full_graph=cfg.gt.attn.full_attn,
+-                 add_node_attr_as_self_loop=False,
+-                 fill_value=0.
+-                 )
++            attn_sparsity = cfg.gt.attn.get("sparsity", "full")
++            if attn_sparsity == "full":
++                self.rrwp_rel_encoder = register.edge_encoder_dict["rrwp_linear"] \
++                    (rel_pe_dim, cfg.gnn.dim_edge,
++                     pad_to_full_graph=cfg.gt.attn.full_attn,
++                     add_node_attr_as_self_loop=False,
++                     fill_value=0.
++                     )
++            elif attn_sparsity == "k_hop":
++                self.rrwp_rel_encoder = register.edge_encoder_dict["masked_rrwp_linear"] \
++                    (rel_pe_dim, cfg.gnn.dim_edge,
++                     add_node_attr_as_self_loop=False,
++                     fill_value=0.,
++                     mask_index_name="edge_index",
++                     max_hops=cfg.gt.attn.hops,
++                     )
++            else:
++                raise ValueError(
++                    f"Unsupported cfg.gt.attn.sparsity={attn_sparsity!r}; "
++                    "expected 'full' or 'k_hop'."
++                )
+
+
+         if cfg.gnn.layers_pre_mp > 0:
+@@ -81,6 +143,11 @@ class GritTransformer(torch.nn.Module):
+                 dim_in, cfg.gnn.dim_inner, cfg.gnn.layers_pre_mp)
+             dim_in = cfg.gnn.dim_inner
+
++        self.global_vnode = (
++            GlobalVNode(cfg.gnn.dim_inner)
++            if cfg.gt.attn.get("global_vnode", False) else None
++        )
++
+         assert cfg.gt.dim_hidden == cfg.gnn.dim_inner == dim_in, \
+             "The inner and hidden dims must match."
+
+@@ -112,10 +179,20 @@ class GritTransformer(torch.nn.Module):
+         self.post_mp = GNNHead(dim_in=cfg.gnn.dim_inner, dim_out=dim_out)
+
+     def forward(self, batch):
+-        for module in self.children():
+-            batch = module(batch)
+-
+-        return batch
++        batch = self.encoder(batch)
++        if hasattr(self, "rrwp_abs_encoder"):
++            batch = self.rrwp_abs_encoder(batch)
++            batch = self.rrwp_rel_encoder(batch)
++        if hasattr(self, "pre_mp"):
++            batch = self.pre_mp(batch)
++        if self.global_vnode is not None:
++            batch = self.global_vnode(batch)
++        batch = self.layers(batch)
++        if self.global_vnode is not None:
++            # Keep the virtual node out of graph pooling.
++            batch.x = batch.x[batch.real_node_mask]
++            batch.batch = batch.batch[batch.real_node_mask]
++        return self.post_mp(batch)
+
+
+
+diff --git a/grit/transform/posenc_stats.py b/grit/transform/posenc_stats.py
+index 1f510b9..3dd6142 100644
+--- a/grit/transform/posenc_stats.py
++++ b/grit/transform/posenc_stats.py
+@@ -145,6 +145,7 @@ def compute_posenc_stats(data, pe_types, is_undirected, cfg):
+                             attr_name_rel="rrwp",
+                             add_identity=True,
+                             spd=param.spd, # by default False
++                            support_horizon=(cfg.gt.attn.hops if cfg.gt.attn.get('sparsity', 'full') == 'k_hop' else -1),
+                             )
+         data = transform(data)
+
+diff --git a/grit/transform/rrwp.py b/grit/transform/rrwp.py
+index 3755ad7..e846321 100644
+--- a/grit/transform/rrwp.py
++++ b/grit/transform/rrwp.py
+@@ -41,6 +41,8 @@ def add_full_rrwp(data,
+                   attr_name_rel="rrwp", # name: ('rrwp_idx', 'rrwp_val')
+                   add_identity=True,
+                   spd=False,
++                  support_horizon=-1,
++                  support_index_attr="rrwp_attention_edge_index",
+                   **kwargs
+                   ):
+     device=data.edge_index.device
+@@ -72,6 +74,21 @@ def add_full_rrwp(data,
+
+     pe = torch.stack(pe_list, dim=-1) # n x n x k
+
++    support_horizon = int(support_horizon)
++    if support_horizon >= 1 and support_index_attr:
++        support_channels = support_horizon + 1 if add_identity else support_horizon
++        if support_channels > pe.size(-1):
++            raise ValueError(
++                f'support_horizon={support_horizon} requires {support_channels} RRWP channels; '
++                f'found {pe.size(-1)}.'
++            )
++        support = pe[..., :support_channels].abs().sum(dim=-1) > 0
++        support_row, support_col = support.nonzero(as_tuple=True)
++        # GRIT relative-pair indices use [column, row] order.
++        data[support_index_attr] = torch.stack(
++            [support_col, support_row], dim=0
++        )
++
+     abs_pe = pe.diagonal().transpose(0, 1) # n x k
+
+     rel_pe = SparseTensor.from_dense(pe, has_value=True)

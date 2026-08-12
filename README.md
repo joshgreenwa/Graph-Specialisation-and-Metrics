@@ -1,73 +1,46 @@
 # Graph Specialisation and Metrics
 
-This repository explores how graph transformer models process symbolic and structural information, with an emphasis on architecture-specific head specialisation.
+Code for Josh Green's dissertation on semantic and structural head specialisation in graph transformers.
 
-## Canonical methodology
+## Install
 
-The final, task-general scientific specification is
-[`src/graph_specialisation_metrics/README.md`](src/graph_specialisation_metrics/README.md).
-It fixes donor-swaps for both semantic and structural channels, graph-balanced output-projected
-head scores, `F_sens` Functional carriage, and positive-is-beneficial donor-wise path-integrated
-Beneficial carriage.
-The public implementation is
-[`src/graph_specialisation_metrics/methodology/`](src/graph_specialisation_metrics/methodology/README.md),
-exposed through `graph_specialisation_metrics.main()`. The Drive-backed production launcher is
-[`experiments/methodology/canonical_methodology_colab.py`](experiments/methodology/canonical_methodology_colab.py).
-Module-level READMEs document implementations and historical refinement experiments; where their
-older alternatives differ, the canonical methodology takes precedence.
+Python 3.10–3.12 is required. Replace `mixed` with `graphbench`, `graphormer`, or `grit` as needed:
 
-The long-term project scope covers:
-
-- training and evaluation files for Graphormer, GraphGPS, GRIT, CSA, and Exphormer;
-- datasets and preprocessing artifacts for symbolic and structural graph tasks;
-- checkpoints from trained model runs;
-- metrics for quantifying specialisation across attention heads and model layers;
-- visualisations for comparing specialisation patterns across architectures.
-
-## Current Contents
-
-The first component is a ZINC test case with four training notebooks and extracted Python scripts:
-
-- `experiments/zinc/notebooks/grit_ZINC_core.ipynb`
-- `experiments/zinc/notebooks/graphormer_ZINC_core.ipynb`
-- `experiments/zinc/notebooks/CSA_ZINC_core.ipynb`
-- `experiments/zinc/notebooks/graphgps_ZINC_core.ipynb`
-- `experiments/zinc/training/grit_zinc_core.py`
-- `experiments/zinc/training/graphormer_zinc_core.py`
-- `experiments/zinc/training/csa_zinc_core.py`
-- `experiments/zinc/training/graphgps_zinc_core.py`
-
-The repository also includes controlled synthetic graph tasks:
-
-- `experiments/synthetic/training/marked_tree_path_graphgps.py`
-- `experiments/synthetic/training/structural_symbolic_graphgps.py`
-
-## Repository Layout
-
-```text
-.
-├── checkpoints/                 # Model checkpoints, grouped by task/model
-├── data/                        # Dataset notes and optional small metadata files
-├── docs/                        # Project notes and design docs
-├── experiments/
-│   ├── synthetic/
-│   │   └── training/            # Controlled synthetic task runners
-│   └── zinc/
-│       ├── notebooks/           # Original ZINC notebooks
-│       └── training/            # Extracted scripts from the notebooks
-├── metrics/                     # Specialisation metric implementations
-├── src/
-│   └── graph_specialisation_metrics/
-├── tests/
-└── visualisations/              # Plotting and analysis utilities
+```bash
+git clone --branch main --single-branch https://github.com/joshgreenwa/Graph-Specialisation-and-Metrics.git
+cd Graph-Specialisation-and-Metrics
+python -m pip install ".[mixed]"
 ```
 
-Large datasets and checkpoints should stay out of git unless they are intentionally small reproducibility fixtures. Use the directory README files to document where artifacts came from and how to regenerate or download them.
+## Experiments
 
-## Planned Components
+| Config | Experiment |
+| --- | --- |
+| `configs/mixed.yaml` | Mixed semantic–structural synthetic task |
+| `configs/graphbench.yaml` | GraphBench bipartite matching |
+| `configs/graphormer_pcqm4mv2.yaml` | Public Graphormer PCQM4Mv2 checkpoint |
+| `configs/grit_zinc.yaml` | GRIT on ZINC |
+| `configs/grit_qm9.yaml` | GRIT on QM9 |
 
-- Add Exphormer training artifacts for ZINC.
-- Standardise run metadata across model families.
-- Implement attention-head and layer-level specialisation metrics.
-- Add structural and symbolic probing tasks beyond ZINC.
-- Add visualisations for comparing model architectures and training stages.
+```bash
+gsm run   --config configs/mixed.yaml --output-dir results/mixed
+gsm run   --config configs/graphbench.yaml --job-index 0 --output-dir results/graphbench/job_0
+gsm score --config configs/graphormer_pcqm4mv2.yaml --output-dir results/graphormer
+gsm run   --config configs/grit_zinc.yaml --job-index 0 --output-dir results/grit_zinc/job_0
+gsm run   --config configs/grit_qm9.yaml --job-index 0 --output-dir results/grit_qm9/job_0
+```
+
+Use `--fast` for a quick run. GraphBench uses job indices 0–3; each GRIT config uses 0–14. Slurm scripts are in [`slurm/`](slurm/):
+
+```bash
+sbatch slurm/mixed.sbatch
+sbatch slurm/graphbench.sbatch
+sbatch slurm/graphormer_score.sbatch
+sbatch slurm/grit.sbatch
+```
+
+## Notebooks and output
+
+Run the mixed [notebook](notebooks/mixed_demo.ipynb) / [Colab](https://colab.research.google.com/github/joshgreenwa/Graph-Specialisation-and-Metrics/blob/main/notebooks/mixed_demo.ipynb) or Graphormer [notebook](notebooks/graphormer_pcqm4mv2_demo.ipynb) / [Colab](https://colab.research.google.com/github/joshgreenwa/Graph-Specialisation-and-Metrics/blob/main/notebooks/graphormer_pcqm4mv2_demo.ipynb).
+
+Each run writes `scores.npz` with `semantic_scores` ($S_{\mathrm{sem}}$), `structural_scores` ($S_{\mathrm{str}}$), and their distance-resolved score contributions. The notebooks also plot $J$ and $D_{\mathrm{rel}}$.

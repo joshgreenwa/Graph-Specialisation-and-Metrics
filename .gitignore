@@ -2,9 +2,12 @@
 __pycache__/
 *.py[cod]
 *.egg-info/
+build/
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
+.coverage
+htmlcov/
 .venv/
 venv/
 
@@ -17,19 +20,13 @@ venv/
 .vscode/
 
 # Large generated artifacts
-checkpoints/**/*.pt
-checkpoints/**/*.pth
-checkpoints/**/*.ckpt
-checkpoints/**/*.bin
-data/**/raw/
-data/**/processed/
-data/**/*.pt
-data/**/*.pth
+.cache/
+data/
+results/
+checkpoints/
+tmp/
+output/
 outputs/
 runs/
 wandb/
 experiments/**/results/
-
-# Keep documentation placeholders
-!checkpoints/**/README.md
-!data/**/README.md

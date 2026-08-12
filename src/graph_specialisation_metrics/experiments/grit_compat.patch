@@ -1,0 +1,115 @@
+diff --git a/grit/__init__.py b/grit/__init__.py
+index 05dd03f..d1e1c9a 100644
+--- a/grit/__init__.py
++++ b/grit/__init__.py
+@@ -1,2 +1,89 @@
++# Install compatibility shims before importing GRIT modules.
++import sys
++import types
++
++import torch
++from torch_geometric.utils import coalesce as _pyg_coalesce
++from torch_geometric.utils import scatter as _pyg_scatter
++
++
++def _scatter(src, index, dim=0, out=None, dim_size=None, reduce="sum"):
++    reduce = {"add": "sum", "mul": "mul"}.get(reduce, reduce)
++    if out is not None and dim_size is None:
++        dim_size = out.size(dim)
++    value = _pyg_scatter(src, index, dim=dim, dim_size=dim_size, reduce=reduce)
++    if out is not None:
++        out.copy_(value)
++        return out
++    return value
++
++
++def _scatter_max(src, index, dim=0, out=None, dim_size=None):
++    return _scatter(src, index, dim, out, dim_size, "max"), None
++
++
++def _coalesce(index, value, m=None, n=None, op="add", **kwargs):
++    nodes = max(m or 0, n or 0) or None
++    return _pyg_coalesce(
++        index, value, num_nodes=nodes, reduce={"add": "sum"}.get(op, op)
++    )
++
++
++_scatter_module = types.ModuleType("torch_scatter")
++_scatter_module.scatter = _scatter
++
++
++def _scatter_add(src, index, dim=0, out=None, dim_size=None):
++    return _scatter(src, index, dim, out, dim_size, "sum")
++
++
++_scatter_module.scatter_add = _scatter_add
++_scatter_module.scatter_max = _scatter_max
++sys.modules.setdefault("torch_scatter", _scatter_module)
++
++
++class _SparseTensor:
++    def __init__(self, dense):
++        self._dense = dense
++
++    @classmethod
++    def from_edge_index(cls, edge_index, edge_weight=None, sparse_sizes=None):
++        rows, columns = sparse_sizes
++        if edge_weight is None:
++            edge_weight = torch.ones(edge_index.size(1), device=edge_index.device)
++        dense = edge_weight.new_zeros((rows, columns))
++        dense.index_put_((edge_index[0], edge_index[1]), edge_weight, accumulate=True)
++        return cls(dense)
++
++    @classmethod
++    def from_dense(cls, dense, has_value=True):
++        return cls(dense)
++
++    def sum(self, dim):
++        return self._dense.sum(dim=dim)
++
++    def view(self, *shape):
++        return _SparseTensor(self._dense.view(*shape))
++
++    def to_dense(self):
++        return self._dense
++
++    def coo(self):
++        if self._dense.dim() == 2:
++            rows, columns = self._dense.nonzero(as_tuple=True)
++            return rows, columns, self._dense[rows, columns]
++        present = self._dense.abs().sum(dim=-1) != 0
++        rows, columns = present.nonzero(as_tuple=True)
++        return rows, columns, self._dense[rows, columns]
++
++    def __mul__(self, other):
++        return _SparseTensor(self._dense * other)
++
++
++_sparse_module = types.ModuleType("torch_sparse")
++_sparse_module.SparseTensor = _SparseTensor
++_sparse_module.coalesce = _coalesce
++sys.modules.setdefault("torch_sparse", _sparse_module)
++
+ # Import only the components used by the ZINC and QM9 runs.
+ from .config.custom_gnn_config import *  # noqa
+@@ -14,6 +101,7 @@ from .encoder.rrwp_encoder import *  # noqa
+ from .encoder.type_dict_encoder import *  # noqa
+ from .head.san_graph import *  # noqa
+ from .layer.grit_layer import *  # noqa
++from .loss.l1 import *  # noqa
+ from .loader.master_loader import *  # noqa
+ from .network.grit_model import *  # noqa
+ from .optimizer.extra_optimizers import *  # noqa
+diff --git a/grit/logger.py b/grit/logger.py
+index 80cac5a..e14dd9c 100644
+--- a/grit/logger.py
++++ b/grit/logger.py
+@@ -190,7 +190,7 @@ class CustomLogger(Logger):
+             'spearmanr': reformat(eval_spearmanr(true.numpy(),
+                                                  pred.numpy())['spearmanr']),
+             'mse': reformat(mean_squared_error(true, pred)),
+-            'rmse': reformat(mean_squared_error(true, pred, squared=False)),
++            'rmse': reformat(mean_squared_error(true, pred) ** 0.5),
+         }
+
+     def update_stats(self, true, pred, loss, lr, time_used, params,
