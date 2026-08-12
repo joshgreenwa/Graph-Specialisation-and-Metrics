@@ -57,6 +57,7 @@ def test_cached_figure_submitter_replaces_an_empty_requested_root(tmp_path):
     assert f"requested root is incomplete: {requested}" in result.stdout
     assert f"analysis_root={complete}" in result.stdout
     assert "--cpus-per-task=1" in result.stdout
+    assert f"PROJECT_ROOT={SCRIPT.parents[2]}" in result.stdout
     assert "--gres" not in result.stdout
 
 
