@@ -13,6 +13,23 @@ The implementation boundary and output layout are documented in
 The exact Drive locations for every multi-seed checkpoint and consolidated cache are listed in
 [`DRIVE_ARTIFACT_MAP.md`](DRIVE_ARTIFACT_MAP.md).
 
+## Layer-controlled head-ablation correction
+
+[`layer_controlled_head_ablation_colab.ipynb`](layer_controlled_head_ablation_colab.ipynb)
+is the single CPU, cache-only frontend that corrects the layer confound in dissertation
+Figures 4.5(a) and 5.6. It covers the mixed synthetic task, PCQM4Mv2 Graphormer, dense ZINC GRIT,
+and dense QM9 GRIT. GraphBench is deliberately excluded until its HPC caches are revisited.
+
+The headline effect is Spearman correlation computed independently within every layer, averaged
+equally across layers within a trained seed and then equally across trained seeds. Molecular
+intervals resample held-out molecules and recompute the complete statistic. The notebook prefers
+the exact dissertation caches, reports other compatible roots without silently substituting them,
+and emits two views per task: a primary within-layer percentile-rank panel that removes the
+between-layer shifts from the plotted coordinates, plus an exact raw-coordinate dissertation
+companion with only the statistic annotation changed.
+The full cache, estimand, and output contract is in
+[`../../docs/layer_controlled_head_ablation_correction.md`](../../docs/layer_controlled_head_ablation_correction.md).
+
 Edit only the task list, training seeds, requested phases, checkpoint overrides, run sizes, and the
 explicitly preregistered `FAMILIES` thresholds in the launcher. Methodological definitions belong
 in the canonical package, not in the Colab cell. `FAMILIES` exposes separate discovery and causal
